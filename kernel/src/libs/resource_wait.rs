@@ -299,6 +299,15 @@ pub(crate) fn wait_for_resource<R>(
     )
 }
 
+/// Resource-keyed wait that ignores ordinary signals and freezer work.
+pub(crate) fn wait_for_resource_killable<R>(
+    key: usize,
+    condition: impl FnMut() -> Option<R>,
+) -> Result<R, SystemError> {
+    debug_assert_ne!(key, 0);
+    wait(key, WaitMode::Killable, condition)
+}
+
 fn wait<R>(
     resource_key: usize,
     mode: WaitMode,

@@ -45,7 +45,9 @@ use super::protocol::{
     FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
     FUSE_WRITEBACK_CACHE,
 };
-use super::reply::{FuseReadPagesReply, FuseReply};
+#[cfg(any(test, feature = "mm_selftest"))]
+use super::reply::FuseReadPagesReply;
+use super::reply::FuseReply;
 
 #[derive(Debug)]
 struct DaxRangeRetryWait {
@@ -291,6 +293,7 @@ pub struct FusePendingState {
     read_completion: Option<FuseReadCompletion>,
     outcome_unknown: AtomicBool,
     processing_owner: AtomicBool,
+    delivery: AtomicU8,
 }
 
 #[derive(Debug)]
@@ -470,7 +473,7 @@ impl FuseBackgroundState {
         }
         // Only mandatory reads reach this wait. Neither its predicate nor
         // its registration allocates; the Arc borrow pins the key throughout.
-        match resource_wait::wait_for_resource(self.wait_key(), true, || {
+        match resource_wait::wait_for_resource_killable(self.wait_key(), || {
             self.try_acquire(false).transpose()
         }) {
             Ok(result) => result,
@@ -505,12 +508,33 @@ pub(crate) enum FusePendingResult {
     ReadPagesDirect { bytes: usize },
 }
 
+#[derive(Clone, Copy)]
+enum FuseWaitMode {
+    Interruptible,
+    Killable,
+    Uninterruptible,
+}
+
+#[cfg(any(test, feature = "mm_selftest"))]
 enum FuseReadWaitOutcome {
     Complete(Result<FuseReadPagesReply, SystemError>),
     Interrupted,
 }
 
 impl FusePendingState {
+    const SENT: u8 = 1;
+    const INTERRUPTED: u8 = 2;
+
+    // Either the sender or the waiter observes the other bit first. Exactly
+    // that side queues the initial INTERRUPT, after successful delivery.
+    fn mark_sent(&self) -> bool {
+        self.delivery.fetch_or(Self::SENT, Ordering::AcqRel) == Self::INTERRUPTED
+    }
+
+    fn mark_interrupted(&self) -> bool {
+        self.delivery.fetch_or(Self::INTERRUPTED, Ordering::AcqRel) == Self::SENT
+    }
+
     fn belongs_to_page_cache_domain(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
         self.read_completion
             .as_ref()
@@ -535,6 +559,7 @@ impl FusePendingState {
             read_completion,
             outcome_unknown: AtomicBool::new(false),
             processing_owner: AtomicBool::new(false),
+            delivery: AtomicU8::new(0),
         }
     }
 
@@ -658,22 +683,33 @@ impl FusePendingState {
 
     fn wait_terminal(
         &self,
-        interruptible: bool,
+        mode: FuseWaitMode,
     ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
         // Like Linux wait_event, an already published terminal result wins
         // over interruption. The post-error recheck covers concurrent publish.
         if let Some(ready) = self.take_ready() {
             return Ok(ready);
         }
-        match resource_wait::wait_for_resource(self.wait_key(), interruptible, || self.take_ready())
-        {
+        let waited = match mode {
+            FuseWaitMode::Interruptible => {
+                resource_wait::wait_for_resource(self.wait_key(), true, || self.take_ready())
+            }
+            FuseWaitMode::Killable => {
+                resource_wait::wait_for_resource_killable(self.wait_key(), || self.take_ready())
+            }
+            FuseWaitMode::Uninterruptible => {
+                resource_wait::wait_for_resource(self.wait_key(), false, || self.take_ready())
+            }
+        };
+        match waited {
             Ok(ready) => Ok(ready),
             Err(error) => self.take_ready().ok_or(error),
         }
     }
 
+    #[cfg(any(test, feature = "mm_selftest"))]
     fn wait_read_pages_once(&self) -> FuseReadWaitOutcome {
-        match self.wait_terminal(true) {
+        match self.wait_terminal(FuseWaitMode::Interruptible) {
             Ok((result, _)) => FuseReadWaitOutcome::Complete(result.map(|result| match result {
                 FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
                 FusePendingResult::ReadPagesDirect { bytes } => {
@@ -685,21 +721,21 @@ impl FusePendingState {
     }
 
     fn wait_result(&self) -> Result<FusePendingResult, SystemError> {
-        self.wait_terminal(true)?.0
+        self.wait_terminal(FuseWaitMode::Interruptible)?.0
     }
 
     #[cfg(test)]
     pub(crate) fn wait_result_with_kind(
         &self,
     ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
-        self.wait_terminal(true)
+        self.wait_terminal(FuseWaitMode::Interruptible)
     }
 
     pub(crate) fn wait_result_with_kind_uninterruptible(
         &self,
     ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
         // Mapping/DMA lifecycle ownership stays live until a terminal result.
-        self.wait_terminal(false)
+        self.wait_terminal(FuseWaitMode::Uninterruptible)
     }
 }
 
@@ -1475,16 +1511,14 @@ impl FuseConn {
     }
 
     fn wait_initialized(&self) -> Result<(), SystemError> {
-        wait_with_recheck(&self.init_wait, || {
+        self.init_wait.wait_until_killable(|| {
             let g = self.inner.lock();
             if !g.connected {
-                return Err(SystemError::ENOTCONN);
+                Some(Err(SystemError::ENOTCONN))
+            } else {
+                g.initialized.then_some(Ok(()))
             }
-            if g.initialized {
-                return Ok(Some(()));
-            }
-            Ok(None)
-        })
+        })?
     }
 
     fn claim_dax_cleanup(&self) -> Result<bool, SystemError> {

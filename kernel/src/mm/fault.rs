@@ -302,6 +302,12 @@ impl<'a> PageFaultMessage<'a> {
         self.page = Some(page);
     }
 
+    /// Keep the exact cache entry live until PTE/rmap publication or rollback.
+    pub(crate) fn set_page_pinned(&mut self, pin: PageCachePagePin) {
+        self.page = Some(pin.page());
+        self.page_pin = Some(pin);
+    }
+
     /// 缺页所属的地址空间。
     #[inline(always)]
     pub fn mm(&self) -> &Arc<AddressSpace> {
@@ -1487,8 +1493,7 @@ impl PageFaultHandler {
         // 未命中回退完整提交路径（处理 Loading 等待与后端填充），
         // major 记账只在慢路径分支做。
         if let Some(page_pin) = page_cache.manager().peek_page_pinned(backing_pgoff) {
-            pfm.page = Some(page_pin.page());
-            pfm.page_pin = Some(page_pin);
+            pfm.set_page_pinned(page_pin);
         } else {
             if !page_cache.fault_page_state(backing_pgoff).cached {
                 account_major_fault_event(pfm.data_account());
@@ -1501,9 +1506,7 @@ impl PageFaultHandler {
                 &pfm.creator_object,
             ) {
                 Ok(page_pin) => {
-                    let page = page_pin.page();
-                    pfm.page = Some(page);
-                    pfm.page_pin = Some(page_pin);
+                    pfm.set_page_pinned(page_pin);
                 }
                 Err(error) => return pfm.allocation_failure(error),
             }
@@ -1623,9 +1626,7 @@ impl PageFaultHandler {
             &pfm.creator_object,
         ) {
             Ok(page_pin) => {
-                let page = page_pin.page();
-                pfm.page = Some(page);
-                pfm.page_pin = Some(page_pin);
+                pfm.set_page_pinned(page_pin);
                 VmFaultReason::empty()
             }
             Err(error) => pfm.allocation_failure(error),

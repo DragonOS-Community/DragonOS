@@ -247,6 +247,7 @@ impl FuseConn {
         }
         req.stats_mark_external_dequeued();
         self.account_dequeued_request(&req);
+        self.mark_request_sent(req.unique);
         Ok(req.bytes.len())
     }
 
@@ -885,12 +886,12 @@ impl FuseConn {
             if !g.connected || !g.processing.contains_key(&target_unique) {
                 return Err(SystemError::ENOENT);
             }
-            if out_hdr.error == -SystemError::ENOSYS.to_posix_errno() {
+            if out_hdr.error == SystemError::ENOSYS.to_posix_errno() {
                 g.no_interrupt = true;
             }
         }
 
-        if out_hdr.error == -SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() {
+        if out_hdr.error == SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() {
             self.queue_interrupt(target_unique)?;
         }
 

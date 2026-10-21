@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
+#include <vector>
 
 #include "fuse_gtest_common.h"
 
@@ -1935,6 +1936,7 @@ static void ext_sigusr1_handler(int signo) {
 
 struct ext_reader_ctx {
     char path[256];
+    char bytes[64];
     volatile int done;
     ssize_t nread;
     int err;
@@ -1950,8 +1952,7 @@ static void *ext_reader_thread(void *arg) {
         return NULL;
     }
 
-    char buf[64];
-    ssize_t n = read(fd, buf, sizeof(buf));
+    ssize_t n = read(fd, ctx->bytes, sizeof(ctx->bytes));
     if (n < 0) {
         ctx->nread = -1;
         ctx->err = errno;
@@ -1964,7 +1965,81 @@ static void *ext_reader_thread(void *arg) {
     return NULL;
 }
 
-static int ext_test_p3_interrupt() {
+struct ext_interrupt_daemon_context {
+    fuse_daemon_args *args;
+    int first_interrupt_error;
+};
+
+// Keep the original READ outstanding while receiving its INTERRUPT. A normal
+// signal requests cancellation; only the daemon's original reply decides it.
+static void *ext_interrupt_daemon(void *opaque) {
+    auto *context = static_cast<ext_interrupt_daemon_context *>(opaque);
+    auto *args = context->args;
+    bool first_interrupt = true;
+    std::vector<unsigned char> buffer(FUSE_TEST_BUF_SIZE);
+    std::vector<unsigned char> pending;
+    simplefs_init(&args->fs);
+    args->fs.nodes[1].open_out_flags = args->hello_open_out_flags;
+    while (!*args->stop) {
+        if (!pending.empty()) {
+            pollfd ready{args->fd, POLLIN, 0};
+            const int polled = poll(&ready, 1, 2000);
+            if (polled < 0 && errno == EINTR) continue;
+            if (polled < 0 || (ready.revents & (POLLHUP | POLLERR | POLLNVAL))) break;
+            if (polled == 0) {
+                // Bounded failure cleanup if no interrupt ever arrives.
+                fuse_handle_one(args, pending.data(), pending.size());
+                pending.clear();
+                continue;
+            }
+        }
+        const ssize_t size = read(args->fd, buffer.data(), buffer.size());
+        if (size < 0 && errno == EINTR) continue;
+        // Linux returns EPERM until mount binds the already-open /dev/fuse.
+        if (size < 0 && errno == EPERM && !*args->init_done) {
+            usleep(1000);
+            continue;
+        }
+        if (size < ssize_t(sizeof(fuse_in_header))) break;
+        const auto *header = reinterpret_cast<const fuse_in_header *>(buffer.data());
+        if (header->len != size) break;
+        if (header->opcode == FUSE_READ && pending.empty()) {
+            pending.assign(buffer.begin(), buffer.begin() + size);
+            __atomic_store_n(args->blocked_read_unique, header->unique, __ATOMIC_RELEASE);
+            continue;
+        }
+        if (header->opcode == FUSE_INTERRUPT) {
+            if (size < ssize_t(sizeof(fuse_in_header) + sizeof(fuse_interrupt_in))) break;
+            const auto *interrupt = reinterpret_cast<const fuse_interrupt_in *>(
+                buffer.data() + sizeof(fuse_in_header));
+            // The same pending signal can also interrupt later atime/close
+            // requests. Record the original READ's interrupt independently.
+            if (interrupt->unique == *args->blocked_read_unique) {
+                ++*args->interrupt_count;
+                *args->last_interrupt_header_unique = header->unique;
+                *args->last_interrupt_target = interrupt->unique;
+            }
+            const int reply_error = first_interrupt ? context->first_interrupt_error : 0;
+            first_interrupt = false;
+            fuse_write_reply(args->fd, header->unique, -reply_error, nullptr, 0);
+            if (reply_error == EAGAIN) continue;
+            if (!pending.empty()) {
+                const auto *original = reinterpret_cast<const fuse_in_header *>(pending.data());
+                if (interrupt->unique == original->unique) {
+                    fuse_handle_one(args, pending.data(), pending.size());
+                    pending.clear();
+                }
+            }
+            continue;
+        }
+        fuse_handle_one(args, buffer.data(), size);
+    }
+    return nullptr;
+}
+
+static int ext_test_p3_interrupt(bool daemon_eintr = false, bool async_read = false,
+                                 int interrupt_error = 0) {
+    const uint32_t expected_interrupts = interrupt_error == EAGAIN ? 2 : 1;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = ext_sigusr1_handler;
@@ -1995,6 +2070,7 @@ static int ext_test_p3_interrupt() {
     volatile int stop = 0;
     volatile int init_done = 0;
     volatile uint32_t interrupt_count = 0;
+    volatile uint32_t read_count = 0;
     volatile uint64_t blocked_read_unique = 0;
     volatile uint64_t last_interrupt_header_unique = 0;
     volatile uint64_t last_interrupt_target = 0;
@@ -2006,14 +2082,19 @@ static int ext_test_p3_interrupt() {
     args.init_done = &init_done;
     args.enable_write_ops = 0;
     args.stop_on_destroy = 1;
-    args.block_read_until_interrupt = 1000;
+    args.read_count = &read_count;
+    args.init_out_flags_override = FUSE_MAX_PAGES | (async_read ? FUSE_ASYNC_READ : 0);
+    args.has_forced_read_error = daemon_eintr;
+    args.forced_read_errno = EINTR;
+    args.hello_open_out_flags = daemon_eintr ? FOPEN_DIRECT_IO : 0;
     args.interrupt_count = &interrupt_count;
     args.blocked_read_unique = &blocked_read_unique;
     args.last_interrupt_header_unique = &last_interrupt_header_unique;
     args.last_interrupt_target = &last_interrupt_target;
 
+    ext_interrupt_daemon_context context{&args, interrupt_error};
     pthread_t daemon_th;
-    if (pthread_create(&daemon_th, NULL, fuse_daemon_thread, &args) != 0) {
+    if (pthread_create(&daemon_th, NULL, ext_interrupt_daemon, &context) != 0) {
         printf("[FAIL] pthread_create(daemon)\n");
         close(fd);
         rmdir(mp);
@@ -2048,12 +2129,12 @@ static int ext_test_p3_interrupt() {
     }
 
     for (int i = 0; i < 200; i++) {
-        if (blocked_read_unique != 0) {
+        if (__atomic_load_n(&blocked_read_unique, __ATOMIC_ACQUIRE) != 0) {
             break;
         }
         usleep(5 * 1000);
     }
-    if (blocked_read_unique == 0) {
+    if (__atomic_load_n(&blocked_read_unique, __ATOMIC_ACQUIRE) == 0) {
         printf("[FAIL] timed out waiting for blocked read request\n");
         stop = 1;
         pthread_join(reader_th, NULL);
@@ -2068,29 +2149,33 @@ static int ext_test_p3_interrupt() {
     }
     pthread_join(reader_th, NULL);
 
-    if (rctx.nread != -1 || rctx.err != EINTR) {
-        printf("[FAIL] reader expected EINTR, nread=%zd err=%d (%s)\n", rctx.nread, rctx.err,
-               strerror(rctx.err));
+    if ((daemon_eintr && (rctx.nread != -1 || rctx.err != EINTR)) ||
+        (!daemon_eintr && (rctx.nread != ssize_t(strlen("hello from fuse\n")) ||
+                           memcmp(rctx.bytes, "hello from fuse\n", strlen("hello from fuse\n")) ||
+                           rctx.err != 0)) || read_count != 1) {
+        printf("[FAIL] original reply daemon_eintr=%d nread=%zd err=%d reads=%u\n",
+               daemon_eintr, rctx.nread, rctx.err, read_count);
         goto fail;
     }
 
-    for (int i = 0; i < 500; i++) {
+    for (int i = 0; !async_read && i < 500; i++) {
         if (interrupt_count > 0) {
             break;
         }
         usleep(5 * 1000);
     }
 
-    if (interrupt_count == 0) {
-        printf("[FAIL] expected FUSE_INTERRUPT request\n");
+    if (!async_read && interrupt_count != expected_interrupts) {
+        printf("[FAIL] original READ interrupts expected=%u actual=%u\n",
+               expected_interrupts, interrupt_count);
         goto fail;
     }
-    if (last_interrupt_target == 0 || last_interrupt_target != blocked_read_unique) {
+    if (interrupt_count > 0 && (last_interrupt_target == 0 || last_interrupt_target != blocked_read_unique)) {
         printf("[FAIL] interrupt target mismatch: blocked=%llu interrupt_target=%llu\n",
                (unsigned long long)blocked_read_unique, (unsigned long long)last_interrupt_target);
         goto fail;
     }
-    if (last_interrupt_header_unique != (blocked_read_unique | 1ULL)) {
+    if (interrupt_count > 0 && last_interrupt_header_unique != (blocked_read_unique | 1ULL)) {
         printf("[FAIL] interrupt header unique mismatch: blocked=%llu header=%llu\n",
                (unsigned long long)blocked_read_unique,
                (unsigned long long)last_interrupt_header_unique);
@@ -11292,6 +11377,22 @@ TEST(FuseExtended, XattrEnosysIsCached) {
 
 TEST(FuseExtended, InterruptDeliversFuseInterrupt) {
     ASSERT_EQ(0, ext_test_p3_interrupt());
+}
+
+TEST(FuseExtended, InterruptPreservesDaemonEintr) {
+    ASSERT_EQ(0, ext_test_p3_interrupt(true));
+}
+
+TEST(FuseExtended, AsyncReadInterruptWaitsForOriginalReply) {
+    ASSERT_EQ(0, ext_test_p3_interrupt(false, true));
+}
+
+TEST(FuseExtended, InterruptEagainRetriesCancellationWithoutRepeatingRead) {
+    ASSERT_EQ(0, ext_test_p3_interrupt(false, false, EAGAIN));
+}
+
+TEST(FuseExtended, InterruptEnosysPreservesOriginalRead) {
+    ASSERT_EQ(0, ext_test_p3_interrupt(false, false, ENOSYS));
 }
 
 TEST(FuseExtended, NoOpenNoOpendirReaddirplusNotify) {

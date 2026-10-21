@@ -1345,6 +1345,22 @@ impl PageCacheManager {
             .try_get_or_create_page_with(page_index, owner, creator, fill)
     }
 
+    /// Custom-fill counterpart of try_commit_page_pinned. Membership remains
+    /// pinned from the cache-locked lookup/publication through the caller's use.
+    pub(crate) fn try_commit_page_with_pinned<F>(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        fill: F,
+    ) -> Result<PageCachePagePin, MemoryAllocationError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        self.upgrade()?
+            .try_get_or_create_page_with_pinned(page_index, owner, creator, fill)
+    }
+
     pub fn commit_page_for_write_with<F>(
         &self,
         page_index: usize,
@@ -3137,6 +3153,27 @@ impl PageCache {
         prepared_entry: &Arc<PageEntry>,
         creator: &Arc<ObjectAccount>,
     ) -> Result<(Arc<PageEntry>, bool), MemoryAllocationError> {
+        self.publish_prepared_entry_inner(page_index, prepared_entry, creator, false)
+            .map(|(entry, _pin, created)| (entry, created))
+    }
+
+    fn publish_prepared_entry_pinned(
+        &self,
+        page_index: usize,
+        prepared_entry: &Arc<PageEntry>,
+        creator: &Arc<ObjectAccount>,
+    ) -> Result<(Arc<PageEntry>, PageEntryPin, bool), MemoryAllocationError> {
+        self.publish_prepared_entry_inner(page_index, prepared_entry, creator, true)
+            .map(|(entry, pin, created)| (entry, pin.expect("pinned publication"), created))
+    }
+
+    fn publish_prepared_entry_inner(
+        &self,
+        page_index: usize,
+        prepared_entry: &Arc<PageEntry>,
+        creator: &Arc<ObjectAccount>,
+        needs_pin: bool,
+    ) -> Result<(Arc<PageEntry>, Option<PageEntryPin>, bool), MemoryAllocationError> {
         let mut capacity = None;
         loop {
             if capacity.is_none() {
@@ -3150,9 +3187,10 @@ impl PageCache {
             }
             let mut inner = self.inner.lock();
             if let Some(current) = inner.get_entry(page_index) {
+                let pin = needs_pin.then(|| current.pin());
                 drop(inner);
                 self.discard_unlinked_page(&prepared_entry.page);
-                return Ok((current, false));
+                return Ok((current, pin, false));
             }
             let retired = match inner.install_capacity(&mut capacity, 1) {
                 Ok(retired) => retired,
@@ -3163,13 +3201,14 @@ impl PageCache {
                 }
             };
             let inserted = inner.insert_entry(page_index, prepared_entry.clone());
+            let pin = (inserted.is_ok() && needs_pin).then(|| prepared_entry.pin());
             drop(inner);
             drop(retired);
             if let Err(error) = inserted {
                 self.discard_unlinked_page(&prepared_entry.page);
                 return Err(error.into());
             }
-            return Ok((prepared_entry.clone(), true));
+            return Ok((prepared_entry.clone(), pin, true));
         }
     }
 
@@ -3678,59 +3717,46 @@ impl PageCache {
     where
         F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
     {
-        let mut page_cache_ref = None;
-        let mut existing_entry = None;
-        {
-            let guard = self.inner.lock();
-            if let Some(entry) = guard.get_entry(page_index) {
-                existing_entry = Some(entry);
-            } else {
-                page_cache_ref = Some(guard.page_cache_ref.clone());
-            }
-        }
+        self.try_get_or_create_page_with_pinned(page_index, owner, creator, fill)
+            .map(|pin| pin.page())
+    }
 
-        if let Some(entry) = existing_entry {
-            let state = entry.state();
-            if state.is_ready() {
-                self.prepare_subpage_blocks(page_index, &entry, None)?;
-                return Ok(entry.page.clone());
-            }
-            if state == PageState::Error {
-                return Err(SystemError::EIO.into());
-            }
-            let page = entry.wait_ready()?;
-            self.prepare_subpage_blocks(page_index, &entry, None)?;
-            return Ok(page);
-        }
-
-        let (entry, need_populate) = {
+    fn try_get_or_create_page_with_pinned<F>(
+        &self,
+        page_index: usize,
+        owner: &Arc<MemoryAccount>,
+        creator: &Arc<ObjectAccount>,
+        fill: F,
+    ) -> Result<PageCachePagePin, MemoryAllocationError>
+    where
+        F: FnOnce(usize, &mut [u8]) -> Result<usize, SystemError>,
+    {
+        let (existing, page_cache_ref) = {
             let guard = self.inner.lock();
-            if let Some(entry) = guard.get_entry(page_index) {
-                (entry, false)
-            } else {
-                drop(guard);
-                let page = self.allocate_page_with_owner(
-                    page_cache_ref.expect("page_cache_ref should exist"),
-                    page_index,
-                    owner,
-                )?;
+            let existing = guard.get_entry(page_index).map(|entry| {
+                let pin = entry.pin();
+                (entry, pin, false)
+            });
+            (existing, guard.page_cache_ref.clone())
+        };
+        let (entry, entry_pin, need_populate) = match existing {
+            Some(existing) => existing,
+            None => {
+                let page = self.allocate_page_with_owner(page_cache_ref, page_index, owner)?;
                 let prepared = self.prepare_entry(&page, PageState::Loading, creator)?;
-                self.publish_prepared_entry(page_index, &prepared, creator)?
+                self.publish_prepared_entry_pinned(page_index, &prepared, creator)?
             }
         };
-
         if !need_populate {
             let state = entry.state();
-            if state.is_ready() {
-                self.prepare_subpage_blocks(page_index, &entry, None)?;
-                return Ok(entry.page.clone());
-            }
             if state == PageState::Error {
                 return Err(SystemError::EIO.into());
             }
-            let page = entry.wait_ready()?;
+            if !state.is_ready() {
+                entry.wait_ready()?;
+            }
             self.prepare_subpage_blocks(page_index, &entry, None)?;
-            return Ok(page);
+            return Ok(PageCachePagePin::new(entry.page.clone(), entry_pin));
         }
         self.reconcile_entry_unevictable_for_insert(&entry);
 
@@ -3753,7 +3779,7 @@ impl PageCache {
             Ok(()) => {
                 entry.set_state(PageState::UpToDate);
                 entry.notify_waiters();
-                Ok(entry.page.clone())
+                Ok(PageCachePagePin::new(entry.page.clone(), entry_pin))
             }
             Err(e) => {
                 entry.set_state(PageState::Error);

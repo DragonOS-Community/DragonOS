@@ -13,8 +13,8 @@ use crate::{
     exception::workqueue::{schedule_work, Work},
     filesystem::{
         page_cache::{
-            schedule_pagecache_io, PageCache, PageCacheBackend, PageCacheReadDmaReservation,
-            PageCacheWritebackAdmissionOrder,
+            schedule_pagecache_io, PageCache, PageCacheBackend, PageCachePagePin,
+            PageCacheReadDmaReservation, PageCacheWritebackAdmissionOrder,
         },
         vfs::{file::FileFlags, FilePrivateData, FileType, IndexNode, Metadata, SetMetadataMask},
     },
@@ -178,8 +178,7 @@ use super::super::{
         FATTR_ATIME, FATTR_CTIME, FATTR_FH, FATTR_GID, FATTR_LOCKOWNER, FATTR_MODE, FATTR_MTIME,
         FATTR_SIZE, FATTR_UID, FOPEN_KEEP_CACHE, FOPEN_NOFLUSH, FUSE_FLUSH, FUSE_FSYNC,
         FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_HANDLE_KILLPRIV, FUSE_OPEN, FUSE_OPENDIR,
-        FUSE_READ, FUSE_READ_LOCKOWNER, FUSE_SETATTR, FUSE_WRITE, FUSE_WRITEBACK_CACHE,
-        FUSE_WRITE_CACHE,
+        FUSE_READ, FUSE_READ_LOCKOWNER, FUSE_SETATTR, FUSE_WRITEBACK_CACHE, FUSE_WRITE_CACHE,
     },
     reply::FuseReadPagesReply,
 };
@@ -1108,8 +1107,7 @@ impl FuseNode {
             let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
             payload_in.extend_from_slice(fuse_pack_struct(&write_in));
             payload_in.extend_from_slice(&buf[total..total + chunk]);
-            let payload = self.conn().request_with_cred(
-                FUSE_WRITE,
+            let payload = self.conn().request_forced_writeback(
                 self.nodeid,
                 &payload_in,
                 handle.open_context.request_cred,
@@ -1531,7 +1529,6 @@ impl FuseNode {
         let truncate_eof = None;
         let mut pending_reads = Vec::new();
         let mut first_error = None;
-        let mut interrupted = false;
         let observed_attr_version = self.attr_version();
         let mut submitted_requests = 0usize;
         let async_read = file_ctx.io_config.async_read;
@@ -1677,8 +1674,7 @@ impl FuseNode {
             };
             submitted_requests += 1;
             if !async_read {
-                let (result, was_interrupted) = self.conn().wait_background_read_pages(&pending);
-                interrupted |= was_interrupted;
+                let result = self.conn().wait_background_read_pages(&pending);
                 match result {
                     Ok(FuseReadPagesReply::Direct { bytes }) if bytes <= read_len => {
                         total_read += bytes.div_ceil(MMArch::PAGE_SIZE);
@@ -1697,9 +1693,6 @@ impl FuseNode {
                         break;
                     }
                 }
-                if interrupted {
-                    break;
-                }
             } else if !speculative {
                 pending_reads.push((read_len, pending));
             }
@@ -1711,16 +1704,12 @@ impl FuseNode {
             submitted_requests,
         );
         for (read_len, pending) in pending_reads {
-            let (result, was_interrupted) = self.conn().wait_background_read_pages(&pending);
-            interrupted |= was_interrupted;
+            let result = self.conn().wait_background_read_pages(&pending);
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
-                    }
-                    if interrupted {
-                        break;
                     }
                     continue;
                 }
@@ -1740,12 +1729,6 @@ impl FuseNode {
                 return Ok((total_read, truncate_eof, Some(error)));
             }
             return Err(error.into());
-        }
-        if interrupted {
-            if should_defer_foreground_read_error(async_read, total_read) {
-                return Ok((total_read, truncate_eof, Some(SystemError::EINTR)));
-            }
-            return Err(SystemError::EINTR.into());
         }
 
         Ok((total_read, truncate_eof, None))
@@ -1948,7 +1931,7 @@ impl FuseNode {
         file_flags: u32,
         owner: &Arc<MemoryAccount>,
         creator: &Arc<ObjectAccount>,
-    ) -> Result<Arc<crate::mm::page::Page>, MemoryAllocationError> {
+    ) -> Result<PageCachePagePin, MemoryAllocationError> {
         let md = self.cached_metadata_snapshot().ok_or(SystemError::EIO)?;
         let file_size = md.size.max(0) as usize;
         self.resolve_pending_short_read_truncate(file_size)?;
@@ -1958,14 +1941,16 @@ impl FuseNode {
         let page_cache = self.ensure_page_cache()?;
         let observed_attr_version = self.attr_version();
         let mut filled_len = None;
-        let page =
-            page_cache
-                .manager()
-                .try_commit_page_with(page_index, owner, creator, |idx, dst| {
-                    let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
-                    filled_len = Some(read_len);
-                    Ok(read_len)
-                })?;
+        let page = page_cache.manager().try_commit_page_with_pinned(
+            page_index,
+            owner,
+            creator,
+            |idx, dst| {
+                let read_len = self.read_page_with_open(idx, dst, fh, file_flags)?;
+                filled_len = Some(read_len);
+                Ok(read_len)
+            },
+        )?;
         if let Some(read_len) = filled_len {
             if read_len < MMArch::PAGE_SIZE {
                 let (eof, _) = self.note_short_read_eof(

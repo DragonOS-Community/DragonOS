@@ -14,6 +14,7 @@ normal/mount_limit
 normal/threads_max
 normal/open_dangling_symlink
 normal/openat2_semantics
+normal/retained_dirfd_mount
 normal/utimensat_symlink
 normal/rtnetlink_link_semantics
 normal/rtnetlink_permission_semantics

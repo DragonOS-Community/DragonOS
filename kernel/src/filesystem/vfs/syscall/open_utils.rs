@@ -24,7 +24,8 @@ pub(super) fn do_open(path: *const u8, o_flags: u32, mode: u32) -> Result<usize,
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
-    let open_flags: FileFlags = FileFlags::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+    // Linux语义(fs/open.c build_open_flags)：未定义的flag位被静默忽略而非报EINVAL
+    let open_flags: FileFlags = FileFlags::from_bits_truncate(o_flags);
     let mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
     return do_sys_open(AtFlags::AT_FDCWD.bits(), &path, open_flags, mode);
 }

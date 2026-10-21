@@ -298,22 +298,28 @@ unsafe fn raw_probe_read_user_str(dst: *mut c_void, size: u32, unsafe_ptr: *cons
 }
 
 pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
-    // A BPF program may pass any pointer. Route the copy through the
-    // exception-table protected path so every fault surfaces as -EFAULT to
-    // the program, never as a kernel panic.
+    // A BPF program may pass any pointer. Match Linux strncpy_from_user
+    // semantics: stop at the first NUL (or at size-1), and stop cleanly at
+    // the first unreadable byte instead of faulting. A whole-buffer copy
+    // would fault past short strings that end near a page boundary and
+    // discard the readable prefix.
     if dst.is_empty() {
         return Err(SystemError::EFAULT);
     }
-    let mut scratch = alloc::vec![0u8; dst.len()];
-    let copied = unsafe { copy_from_user_protected(&mut scratch, VirtAddr::new(src as usize)) }
-        .map_err(|_| SystemError::EFAULT)?;
-    // Truncate at the first NUL, bounded by both the copy and dst.
-    let end = scratch[..copied]
-        .iter()
-        .position(|b| *b == 0)
-        .unwrap_or(copied)
-        .min(dst.len() - 1);
-    dst[..end].copy_from_slice(&scratch[..end]);
+    let mut end = 0usize;
+    let limit = dst.len() - 1;
+    while end < limit {
+        let mut byte = [0u8; 1];
+        let ok = unsafe {
+            copy_from_user_protected(&mut byte, VirtAddr::new(src as usize + end))
+        }
+        .is_ok();
+        if !ok || byte[0] == 0 {
+            break;
+        }
+        dst[end] = byte[0];
+        end += 1;
+    }
     dst[end] = 0;
     Ok(end + 1)
 }

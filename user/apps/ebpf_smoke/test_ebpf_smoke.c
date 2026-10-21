@@ -1251,6 +1251,13 @@ static void test_ringbuf(void)
 
 int main(int argc, char **argv)
 {
+    /* The DragonOS tty intermittently eats output; mirror everything to a
+     * file so results survive console drops. */
+    int logfd = open("/tmp/smoke.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (logfd >= 0) {
+        dup2(logfd, 1);
+        dup2(logfd, 2);
+    }
     /* Optional section selector: run only part of the suite when argv[1] is
      * given ("t6", "t7", "t8", or anything else = all). */
     const char *only = argc > 1 ? argv[1] : NULL;

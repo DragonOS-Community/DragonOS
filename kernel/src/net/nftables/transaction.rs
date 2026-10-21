@@ -883,6 +883,10 @@ impl NftTransaction<'_> {
                 NftExpressionInput::XtTcp(info) if family == 2 => {
                     NftExpression::XtTcp(NftXtTcp::from_info(info)?)
                 }
+                NftExpressionInput::XtUdp(info) if family == 2 => {
+                    NftExpression::XtUdp(NftXtUdp::from_info(info)?)
+                }
+                NftExpressionInput::XtUdp(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                 NftExpressionInput::XtAddrtype(info) => {
                     if !matches!(family, 2 | 10) {
                         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);

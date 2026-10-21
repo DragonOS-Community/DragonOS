@@ -4975,6 +4975,173 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
   reject("range", BadMatch::RevisionAboveLimit, ERANGE);
 }
 
+TEST(NetlinkNetfilter, NftCompatUdpMatchDnatProgramsInsideChildNetns) {
+  // dockerd sets up the embedded-DNS redirect from inside the container's
+  // network namespace with exactly this rule shape:
+  //   -t nat -I DOCKER_OUTPUT -d 127.0.0.11 -p udp --dport 53
+  //   -j DNAT --to-destination 127.0.0.11:39139
+  // The fresh namespace owns an empty ruleset, so the whole sequence
+  // (GETGEN, table, user chain, xt udp match + xt DNAT target) must run
+  // against that namespace's own nftables state.
+  Child([]() {
+    if (unshare(CLONE_NEWNET) < 0) return 1;
+    if (!NetAdmin()) return 2;
+    Fd nft(Open());
+    if (nft.get() < 0) return 3;
+    if (Bind(nft.get()) < 0) return 4;
+
+    constexpr uint32_t seq = 970;
+    auto generation = Request(kNftGetgen, seq);
+    {
+      nlmsghdr request_header{};
+      std::memcpy(&request_header, generation.data(), sizeof(request_header));
+      request_header.nlmsg_flags &= ~NLM_F_ACK;
+      std::memcpy(generation.data(), &request_header, sizeof(request_header));
+    }
+    if (Send(nft.get(), generation) != static_cast<ssize_t>(generation.size()))
+      return 5;
+    {
+      pollfd ready{nft.get(), POLLIN, 0};
+      if (poll(&ready, 1, 2000) != 1) return 6;
+      std::array<uint8_t, 512> bytes{};
+      const ssize_t count = recv(nft.get(), bytes.data(), bytes.size(), 0);
+      nlmsghdr reply{};
+      if (count < static_cast<ssize_t>(NLMSG_HDRLEN)) return 7;
+      std::memcpy(&reply, bytes.data(), sizeof(reply));
+      if (reply.nlmsg_type != kNftNewgen || reply.nlmsg_seq != seq) return 8;
+    }
+
+    xt_udp udp{};
+    udp.spts[0] = 0;
+    udp.spts[1] = UINT16_MAX;
+    udp.dpts[0] = 53;
+    udp.dpts[1] = 53;
+    // iptables-nft serializes XT_ALIGN(sizeof(xt_udp)) bytes of match info.
+    std::array<uint8_t, 12> udp_info{};
+    std::memcpy(udp_info.data(), &udp, sizeof(udp));
+    std::vector<uint8_t> match;
+    AppendNla(&match, NFTA_MATCH_NAME,
+              reinterpret_cast<const uint8_t*>("udp"), sizeof("udp"));
+    const uint32_t revision = htonl(0);
+    AppendNla(&match, NFTA_MATCH_REV,
+              reinterpret_cast<const uint8_t*>(&revision), sizeof(revision));
+    AppendNla(&match, NFTA_MATCH_INFO, udp_info.data(), udp_info.size());
+    std::vector<uint8_t> expressions;
+    const uint32_t resolver = htonl(0x7f00000b);  // 127.0.0.11
+    AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 16,
+                       reinterpret_cast<const uint8_t*>(&resolver), 4);
+    AppendExpr(&expressions, "match", match);
+    nf_nat_ipv4_multi_range_compat range{};
+    range.rangesize = 1;
+    range.range[0].flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
+    range.range[0].min_ip = range.range[0].max_ip = resolver;
+    range.range[0].min.tcp.port = range.range[0].max.tcp.port = htons(39139);
+    std::vector<uint8_t> target;
+    AppendNla(&target, NFTA_TARGET_NAME,
+              reinterpret_cast<const uint8_t*>("DNAT"), sizeof("DNAT"));
+    AppendNla(&target, NFTA_TARGET_REV,
+              reinterpret_cast<const uint8_t*>(&revision), sizeof(revision));
+    AppendNla(&target, NFTA_TARGET_INFO,
+              reinterpret_cast<const uint8_t*>(&range), sizeof(range));
+    AppendExpr(&expressions, "target", target);
+    auto rule = RuleWithExpressions(seq + 13, "nat", "DOCKER_OUTPUT", expressions);
+    std::vector<uint8_t> compat;
+    const uint32_t protocol = htonl(IPPROTO_UDP), flags = 0;
+    AppendNla(&compat, NFTA_RULE_COMPAT_PROTO,
+              reinterpret_cast<const uint8_t*>(&protocol), sizeof(protocol));
+    AppendNla(&compat, NFTA_RULE_COMPAT_FLAGS,
+              reinterpret_cast<const uint8_t*>(&flags), sizeof(flags));
+    AppendRawAttr(&rule, NFTA_RULE_COMPAT | NLA_F_NESTED,
+                  compat.data(), compat.size());
+
+    auto batch = TableBatch(kNftNewtable, seq + 10, "nat");
+    batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+    auto chain = NewChain(seq + 12, "nat", "DOCKER_OUTPUT");
+    batch.insert(batch.end(), chain.begin(), chain.end());
+    batch.insert(batch.end(), rule.begin(), rule.end());
+    auto end = Request(NFNL_MSG_BATCH_END, seq + 14);
+    batch.insert(batch.end(), end.begin(), end.end());
+    if (Send(nft.get(), batch) != static_cast<ssize_t>(batch.size())) return 9;
+
+    auto ack_ok = [&](uint32_t sequence, uint16_t type) {
+      pollfd ready{nft.get(), POLLIN, 0};
+      if (poll(&ready, 1, 2000) != 1) return false;
+      std::array<uint8_t, 512> bytes{};
+      const ssize_t count = recv(nft.get(), bytes.data(), bytes.size(), 0);
+      if (count < static_cast<ssize_t>(NLMSG_LENGTH(sizeof(nlmsgerr)))) return false;
+      nlmsghdr header{};
+      nlmsgerr error{};
+      std::memcpy(&header, bytes.data(), sizeof(header));
+      std::memcpy(&error, bytes.data() + NLMSG_HDRLEN, sizeof(error));
+      return header.nlmsg_type == NLMSG_ERROR && header.nlmsg_seq == sequence &&
+             error.error == 0 && error.msg.nlmsg_type == type;
+    };
+    if (!ack_ok(seq + 11, kNftNewtable)) return 10;
+    if (!ack_ok(seq + 12, kNftNewchain)) return 11;
+    if (!ack_ok(seq + 13, kNftNewrule)) return 12;
+
+    // The udp match must round-trip through the child namespace's dump.
+    auto dump = Request(kNftGetrule, seq + 20);
+    dump[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    nlmsghdr header{};
+    std::memcpy(&header, dump.data(), sizeof(header));
+    header.nlmsg_flags |= NLM_F_DUMP;
+    std::memcpy(dump.data(), &header, sizeof(header));
+    AppendAttr(&dump, NFTA_RULE_TABLE, "nat");
+    AppendAttr(&dump, NFTA_RULE_CHAIN, "DOCKER_OUTPUT");
+    if (Send(nft.get(), dump) != static_cast<ssize_t>(dump.size())) return 13;
+    bool saw_udp = false;
+    bool done = false;
+    for (int attempt = 0; attempt < 8 && !done; ++attempt) {
+      pollfd ready{nft.get(), POLLIN, 0};
+      if (poll(&ready, 1, 2000) != 1) return 14;
+      std::array<uint8_t, 4096> bytes{};
+      const ssize_t count = recv(nft.get(), bytes.data(), bytes.size(), 0);
+      if (count < static_cast<ssize_t>(NLMSG_HDRLEN)) return 15;
+      int remaining = count;
+      for (auto* reply = reinterpret_cast<nlmsghdr*>(bytes.data());
+           NLMSG_OK(reply, remaining); reply = NLMSG_NEXT(reply, remaining)) {
+        if (reply->nlmsg_seq != seq + 20) continue;
+        if (reply->nlmsg_type == NLMSG_DONE) {
+          done = true;
+          break;
+        }
+        if (reply->nlmsg_type != kNftNewrule) continue;
+        const auto* raw = reinterpret_cast<const uint8_t*>(reply);
+        const auto attrs = NlaSpan{raw + NLMSG_HDRLEN + sizeof(nfgenmsg),
+                                   reply->nlmsg_len - NLMSG_HDRLEN -
+                                       sizeof(nfgenmsg)};
+        const auto list = FindNla(attrs, NFTA_RULE_EXPRESSIONS);
+        for (size_t offset = 0; offset + sizeof(nlattr) <= list.length;) {
+          nlattr element{};
+          std::memcpy(&element, list.data + offset, sizeof(element));
+          if (element.nla_len < sizeof(element) ||
+              offset + element.nla_len > list.length)
+            return 16;
+          const auto expression = NlaSpan{list.data + offset + sizeof(element),
+                                          element.nla_len - sizeof(element)};
+          const auto name = FindNla(expression, NFTA_EXPR_NAME);
+          if (name.length == sizeof("match") &&
+              std::memcmp(name.data, "match", name.length) == 0) {
+            const auto attributes = FindNla(expression, NFTA_EXPR_DATA);
+            const auto match_name = FindNla(attributes, NFTA_MATCH_NAME);
+            if (match_name.length == sizeof("udp") &&
+                std::memcmp(match_name.data, "udp", match_name.length) == 0)
+              saw_udp = true;
+          }
+          offset += NLA_ALIGN(element.nla_len);
+        }
+      }
+    }
+    if (!done || !saw_udp) return 17;
+
+    auto remove = TableBatch(kNftDeltable, seq + 30, "nat");
+    if (Send(nft.get(), remove) != static_cast<ssize_t>(remove.size())) return 18;
+    if (!ack_ok(seq + 31, kNftDeltable)) return 19;
+    return 0;
+  });
+}
+
 TEST(NetlinkNetfilter, NativeTransportPayloadDropsOnlyMatchingUdpPort) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());

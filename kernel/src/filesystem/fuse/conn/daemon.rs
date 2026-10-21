@@ -38,7 +38,7 @@ impl FuseConn {
     where
         F: FnOnce(&mut FuseConnInner),
     {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         if !g.connected || (g.teardown_started && pending.opcode != FUSE_DESTROY) {
             return Err(SystemError::ENOENT);
         }
@@ -91,7 +91,7 @@ impl FuseConn {
 
     pub fn poll_mask(&self, have_pending: bool) -> EPollEventType {
         let mut events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         if !g.connected {
             return EPollEventType::EPOLLERR;
         }
@@ -102,7 +102,7 @@ impl FuseConn {
     }
 
     pub fn poll(&self) -> EPollEventType {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         let have_pending = !g.hiprio_pending.is_empty() || !g.pending.is_empty();
         drop(g);
         self.poll_mask(have_pending)
@@ -125,12 +125,12 @@ impl FuseConn {
     }
 
     fn min_read_buffer(&self) -> usize {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         Self::calc_min_read_buffer(g.init.max_write as usize)
     }
 
     fn pop_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         if !g.connected {
             return Err(SystemError::ENOTCONN);
         }
@@ -139,7 +139,7 @@ impl FuseConn {
 
     fn pop_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
         wait_with_recheck(&self.read_wait, || {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
@@ -151,7 +151,7 @@ impl FuseConn {
     }
 
     fn pop_ordinary_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         if !g.connected {
             return Err(SystemError::ENOTCONN);
         }
@@ -162,7 +162,7 @@ impl FuseConn {
 
     fn pop_ordinary_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
         wait_with_recheck(&self.read_wait, || {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
@@ -203,7 +203,7 @@ impl FuseConn {
         // Retain the exact pending owner across a sleeping userspace copy.
         // Abort/reply may win while no connection lock is held.
         let pending = {
-            let inner = self.inner.lock();
+            let inner = self.lock_inner();
             if !inner.connected {
                 return Err(SystemError::ENOTCONN);
             }
@@ -214,7 +214,7 @@ impl FuseConn {
         };
         let copied = copy(&req.bytes);
         let failed_pending = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             if !inner.connected {
                 return Err(SystemError::ENOTCONN);
             }
@@ -293,7 +293,7 @@ impl FuseConn {
         max_message_size: usize,
     ) -> Result<Arc<FuseRequest>, SystemError> {
         self.dequeue_for_kernel_transport(max_message_size, || {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
@@ -413,7 +413,7 @@ impl FuseConn {
             out.len(),
             "high-priority request",
             || {
-                let mut g = self.inner.lock();
+                let mut g = self.lock_inner();
                 if !g.connected {
                     return Err(SystemError::ENOTCONN);
                 }
@@ -435,7 +435,7 @@ impl FuseConn {
             SystemError::EIO
         };
         let pending = {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             g.processing.remove(&req.unique)
         };
 
@@ -541,7 +541,7 @@ impl FuseConn {
         }
 
         let (pending, negotiated_minor) = {
-            let g = self.inner.lock();
+            let g = self.lock_inner();
             if !g.connected {
                 return Err(SystemError::ENOENT);
             }
@@ -620,7 +620,7 @@ impl FuseConn {
             if (negotiated_flags & FUSE_INIT_EXT) != 0 {
                 negotiated_flags |= (init_out.flags2 as u64) << 32;
             }
-            let requested_flags = self.inner.lock().init_flags;
+            let requested_flags = self.lock_inner().init_flags;
             let enabled_flags = negotiated_flags & requested_flags;
             if !Self::dax_map_alignment_valid(enabled_flags, init_out.map_alignment) {
                 let error = -SystemError::EINVAL.to_posix_errno();
@@ -644,7 +644,7 @@ impl FuseConn {
             let negotiated_max_write =
                 core::cmp::max(Self::MIN_MAX_WRITE, init_out.max_write as usize);
             let (max_write_cap, max_pages_limit) = {
-                let g = self.inner.lock();
+                let g = self.lock_inner();
                 (
                     core::cmp::max(Self::MIN_MAX_WRITE, g.max_write_cap),
                     g.max_pages_limit,
@@ -819,7 +819,7 @@ impl FuseConn {
     /// semantic without relaxing validation for any other opcode.
     pub(crate) fn complete_destroy_without_reply(&self, unique: u64) -> Result<(), SystemError> {
         let pending = {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             if !g.connected {
                 return Err(SystemError::ENOENT);
             }
@@ -846,7 +846,7 @@ impl FuseConn {
         payload_len: usize,
     ) -> Result<(), SystemError> {
         let pending = {
-            let g = self.inner.lock();
+            let g = self.lock_inner();
             if !g.connected || g.teardown_started {
                 return Err(SystemError::ENOENT);
             }
@@ -882,7 +882,7 @@ impl FuseConn {
 
         let target_unique = out_hdr.unique & !Self::FUSE_INT_REQ_BIT;
         {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             if !g.connected || !g.processing.contains_key(&target_unique) {
                 return Err(SystemError::ENOENT);
             }

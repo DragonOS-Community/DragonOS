@@ -76,12 +76,12 @@ impl FuseConn {
         opcode: u32,
     ) -> Arc<FusePendingState> {
         let pending = Arc::new(FusePendingState::new(unique, opcode));
-        self.inner.lock().processing.insert(unique, pending.clone());
+        self.lock_inner().processing.insert(unique, pending.clone());
         pending
     }
 
     pub(crate) fn mark_pending_outcome_unknown(&self, unique: u64) {
-        if let Some(pending) = self.inner.lock().processing.get(&unique).cloned() {
+        if let Some(pending) = self.lock_inner().processing.get(&unique).cloned() {
             pending.mark_outcome_unknown();
         }
     }
@@ -92,8 +92,7 @@ impl FuseConn {
         error: SystemError,
     ) -> Result<(), SystemError> {
         let pending = self
-            .inner
-            .lock()
+            .lock_inner()
             .processing
             .remove(&unique)
             .ok_or(SystemError::ENOENT)?;
@@ -166,7 +165,7 @@ impl FuseConn {
             return Ok(());
         }
         let can_send = {
-            let g = self.inner.lock();
+            let g = self.lock_inner();
             g.connected && g.mounted && g.initialized
         };
         if !can_send {
@@ -181,7 +180,7 @@ impl FuseConn {
             return Ok(());
         }
         let can_send = {
-            let g = self.inner.lock();
+            let g = self.lock_inner();
             g.connected
                 && g.mounted
                 && g.initialized
@@ -206,7 +205,7 @@ impl FuseConn {
         self.push_request(req, None, unique | Self::FUSE_INT_REQ_BIT)
     }
     pub fn enqueue_init(&self) -> Result<(), SystemError> {
-        let flags = self.inner.lock().init_flags;
+        let flags = self.lock_inner().init_flags;
         let init_in = FuseInitIn {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
@@ -313,7 +312,7 @@ impl FuseConn {
             None => None,
         };
         let unique = self.alloc_unique();
-        let pending = Arc::new(FusePendingState::new_with_credit(
+        let pending = Arc::try_new(FusePendingState::new_with_credit(
             unique,
             FUSE_READ,
             credit,
@@ -327,7 +326,8 @@ impl FuseConn {
                 open_pin: crate::libs::spinlock::SpinLock::new(Some(ctx.open_pin)),
                 domain_io: crate::libs::spinlock::SpinLock::new(ctx.domain_io),
             }),
-        ));
+        ))
+        .map_err(|_| SystemError::ENOMEM)?;
         let req = self.build_request(
             unique,
             FUSE_READ,
@@ -362,10 +362,12 @@ impl FuseConn {
         if opcode != FUSE_INIT {
             self.wait_initialized()?;
         }
-        let pending =
-            self.enqueue_request_with_cred(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
+        let (req, pending) =
+            self.prepare_request(opcode, nodeid, payload, FuseRequestCred::nocreds())?;
+        let unique = pending.unique();
+        let published_pending = pending.clone();
         let conn = self.clone();
-        schedule_work(Work::new(move || {
+        let work = Work::try_new(move || {
             if let Err(err) = conn.wait_request_complete(opcode, pending.clone()) {
                 if matches!(err, SystemError::ENOTCONN | SystemError::ENOENT) {
                     log::debug!(
@@ -383,7 +385,9 @@ impl FuseConn {
                     );
                 }
             }
-        }));
+        })?;
+        self.push_request(req, Some(published_pending), unique)?;
+        schedule_work(work);
         Ok(())
     }
 
@@ -406,7 +410,7 @@ impl FuseConn {
         pending: &Arc<FusePendingState>,
         forced: bool,
     ) -> Result<FusePendingResult, SystemError> {
-        let no_interrupt = self.inner.lock().no_interrupt;
+        let no_interrupt = self.lock_inner().no_interrupt;
         if !no_interrupt {
             match pending.wait_terminal(FuseWaitMode::Interruptible) {
                 Ok((result, _)) => return result,
@@ -431,7 +435,7 @@ impl FuseConn {
     /// Called only after successful userspace delivery or virtqueue submission.
     /// Never hold conn.inner while queuing the matching interrupt.
     pub(crate) fn mark_request_sent(&self, unique: u64) {
-        let pending = self.inner.lock().processing.get(&unique).cloned();
+        let pending = self.lock_inner().processing.get(&unique).cloned();
         if pending.is_some_and(|pending| pending.mark_sent()) {
             let _ = self.queue_interrupt(unique);
         }
@@ -439,7 +443,7 @@ impl FuseConn {
 
     fn cancel_queued_request(&self, expected: &Arc<FusePendingState>) {
         let retired = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             if !inner
                 .processing
                 .get(&expected.unique())
@@ -516,9 +520,22 @@ impl FuseConn {
         payload: &[u8],
         req_cred: FuseRequestCred,
     ) -> Result<Arc<FusePendingState>, SystemError> {
-        let unique = self.alloc_unique();
-        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
+        let (req, pending_state) = self.prepare_request(opcode, nodeid, payload, req_cred)?;
+        self.push_request(req, Some(pending_state.clone()), pending_state.unique())?;
+        Ok(pending_state)
+    }
 
+    /// Prepare the complete local owners before any daemon can observe them.
+    fn prepare_request(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        payload: &[u8],
+        req_cred: FuseRequestCred,
+    ) -> Result<(Arc<FuseRequest>, Arc<FusePendingState>), SystemError> {
+        let unique = self.alloc_unique();
+        let pending_state =
+            Arc::try_new(FusePendingState::new(unique, opcode)).map_err(|_| SystemError::ENOMEM)?;
         let req = self.build_request(
             unique,
             opcode,
@@ -527,8 +544,7 @@ impl FuseConn {
             req_cred,
             FuseReplyRouting::Normal,
         )?;
-        self.push_request(req, Some(pending_state.clone()), unique)?;
-        Ok(pending_state)
+        Ok((req, pending_state))
     }
 
     fn reply_capacity(
@@ -601,7 +617,7 @@ impl FuseConn {
                 let read_in: FuseReadIn = fuse_read_struct(payload)?;
                 let requested = read_in.size as usize;
                 let (max_read, max_pages) = {
-                    let g = self.inner.lock();
+                    let g = self.lock_inner();
                     (g.max_read as usize, g.init.max_pages as usize)
                 };
                 let max_pages_bytes = max_pages
@@ -695,13 +711,16 @@ impl FuseConn {
             padding: 0,
         };
 
-        let mut bytes = Vec::with_capacity(hdr.len as usize);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(hdr.len as usize)
+            .map_err(|_| SystemError::ENOMEM)?;
         bytes.extend_from_slice(fuse_pack_struct(&hdr));
         bytes.extend_from_slice(payload);
         let track_direct_read_stats = read_pages_destination
             .as_ref()
             .is_some_and(|target| target.tracks_direct_read_stats());
-        Ok(Arc::new(FuseRequest {
+        Arc::try_new(FuseRequest {
             bytes,
             unique,
             opcode,
@@ -709,7 +728,8 @@ impl FuseConn {
             read_pages_destination,
             track_direct_read_stats,
             stats_owner: Default::default(),
-        }))
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     fn push_request(
@@ -726,12 +746,26 @@ impl FuseConn {
             pending_state.is_none() && opcode != FUSE_INTERRUPT
         );
         {
-            let mut g = self.inner.lock();
+            let mut g = self.lock_inner();
             if !g.connected {
                 return Err(SystemError::ENOTCONN);
             }
             if g.teardown_started && opcode != FUSE_DESTROY {
                 return Err(SystemError::ENOTCONN);
+            }
+            // Reserve every fallible container before publishing either owner.
+            // An error may retain spare capacity, but never a visible request.
+            if g.separate_hiprio_pending && Self::is_high_priority_opcode(opcode) {
+                g.hiprio_pending
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+            } else {
+                g.pending.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            }
+            if pending_state.is_some() {
+                g.processing
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
             }
             // Publish under the dequeue lock so a fast consumer cannot retire
             // an owner before its acquisition is observable.
@@ -826,7 +860,7 @@ mod tests {
     fn interrupted_request_is_not_announced_until_transport_delivery() {
         let conn = FuseConn::new_for_virtiofs(8192, 8192);
         {
-            let mut inner = conn.inner.lock();
+            let mut inner = conn.lock_inner();
             inner.mounted = true;
             inner.initialized = true;
         }
@@ -838,16 +872,16 @@ mod tests {
             unique: unique | FuseConn::FUSE_INT_REQ_BIT,
         };
         conn.write_reply(fuse_pack_struct(&retry)).unwrap();
-        assert!(conn.inner.lock().hiprio_pending.is_empty());
+        assert!(conn.lock_inner().hiprio_pending.is_empty());
         assert!(!pending.mark_interrupted());
         conn.queue_interrupt(unique).unwrap();
-        assert!(conn.inner.lock().hiprio_pending.is_empty());
+        assert!(conn.lock_inner().hiprio_pending.is_empty());
         let request = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
-        assert!(conn.inner.lock().hiprio_pending.is_empty());
+        assert!(conn.lock_inner().hiprio_pending.is_empty());
         conn.mark_request_sent(unique);
         conn.mark_request_sent(unique);
         {
-            let inner = conn.inner.lock();
+            let inner = conn.lock_inner();
             assert_eq!(inner.hiprio_pending.len(), 1);
             let interrupt = inner.hiprio_pending.front().unwrap();
             assert_eq!(interrupt.opcode, FUSE_INTERRUPT);
@@ -905,11 +939,11 @@ mod tests {
             Err(SystemError::EINTR)
         ));
         assert_eq!(pending.delivery.load(Ordering::Acquire), 0);
-        assert!(conn.inner.lock().pending.is_empty());
+        assert!(conn.lock_inner().pending.is_empty());
     }
 
     fn set_minor(conn: &FuseConn, minor: u32) {
-        conn.inner.lock().init.minor = minor;
+        conn.lock_inner().init.minor = minor;
         conn.reply_layout_minor.store(minor, Ordering::Release);
     }
 
@@ -1100,4 +1134,13 @@ mod tests {
             ));
         }
     }
+}
+
+#[cfg(feature = "mm_selftest")]
+#[path = "selftest_birth.rs"]
+mod selftest_birth;
+
+#[cfg(feature = "mm_selftest")]
+pub(super) fn heap_denied_birth_selftest() -> Result<bool, SystemError> {
+    selftest_birth::run()
 }

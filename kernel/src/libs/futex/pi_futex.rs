@@ -97,7 +97,7 @@ impl Futex {
             let (waiter, waker) = Waiter::new_pair();
             let futex_q = Arc::new(FutexObj {
                 waker: waker.clone(),
-                key: key.clone(),
+                key: crate::libs::spinlock::SpinLock::new(key.clone()),
                 bitset: FUTEX_BITSET_MATCH_ANY,
                 tid: current_tid,
             });

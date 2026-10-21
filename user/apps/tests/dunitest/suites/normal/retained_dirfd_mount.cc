@@ -303,6 +303,64 @@ TEST_F(RetainedDirfdMount, ScopedAbsoluteSymlinkUsesOriginalScopeRoot) {
     ExpectContents(OpenAt2(fd_, "absolute", kInRoot), "original");
 }
 
+TEST_F(RetainedDirfdMount, CachedInRootDotDotClampsWithoutTopology) {
+    for (const char* path : {"..", "../..", "../../.."}) {
+        ExpectSame(OpenAt2(fd_, path, kInRoot | kCached), fd_);
+        ExpectSame(OpenAt2(fd_, path, kInRoot | kCached | kNoXdev), fd_);
+    }
+}
+
+TEST_F(RetainedDirfdMount, CachedBeneathDotDotRequiresRefWalk) {
+    ExpectError(OpenAt2(fd_, "..", kBeneath | kCached), EAGAIN);
+    ExpectError(OpenAt2(fd_, "..", kBeneath | kCached | kNoXdev), EAGAIN);
+    ExpectError(OpenAt2(fd_, "..", kBeneath), EXDEV);
+    ExpectSame(OpenAt2(fd_, ".", kBeneath | kCached), fd_);
+}
+
+TEST_F(RetainedDirfdMount, CachedProcessRootDotDotClamps) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (fchdir(fd_) != 0 || chroot(".") != 0 || chdir("/") != 0) _exit(1);
+        for (auto resolve : {kCached, kCached | kNoXdev}) {
+            const int opened = OpenAt2(AT_FDCWD, "/../../..", resolve);
+            if (opened < 0) _exit(2);
+            struct stat actual{}, expected{};
+            const bool same = fstat(opened, &actual) == 0 && fstat(fd_, &expected) == 0 &&
+                              actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino;
+            if (close(opened) != 0 || !same) _exit(3);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(child, waited) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST_F(RetainedDirfdMount, CachedClampedRootStillChecksCoverMount) {
+    Cover();
+    ASSERT_FALSE(HasFatalFailure());
+    const int coverfd = Hold(anchor_);
+    ASSERT_GE(coverfd, 0) << strerror(errno);
+    // Linux may follow an already cached cover. A try-only implementation may
+    // return EAGAIN; success must still select the cover, never the lower root.
+    const int cached_parent = OpenAt2(fd_, "..", kInRoot | kCached);
+    if (cached_parent >= 0) ExpectSame(cached_parent, coverfd);
+    else EXPECT_EQ(EAGAIN, errno);
+    const int cached_file = OpenAt2(fd_, "../marker", kInRoot | kCached);
+    if (cached_file >= 0) ExpectContents(cached_file, "cover");
+    else EXPECT_EQ(EAGAIN, errno);
+    ExpectError(OpenAt2(fd_, "..", kInRoot | kCached | kNoXdev), EAGAIN);
+    ExpectSame(OpenAt2(fd_, "..", kInRoot), coverfd);
+    ExpectError(OpenAt2(fd_, "..", kInRoot | kNoXdev), EXDEV);
+    ExpectSame(OpenAt2(fd_, ".", kInRoot | kCached), fd_);
+}
+
 TEST_F(RetainedDirfdMount, CachedWarmLookupDoesNotReenterCover) {
     ASSERT_TRUE(Write(anchor_ + "/marker", "original"));
     ExpectContents(openat(fd_, "marker", O_RDONLY), "original");
@@ -313,6 +371,57 @@ TEST_F(RetainedDirfdMount, CachedWarmLookupDoesNotReenterCover) {
     ExpectContents(OpenAt2(fd_, "marker", kCached), "original");
     ExpectSame(OpenAt2(fd_, ".", kCached), fd_);
     ExpectContents(OpenAt2(fd_, "marker", kCached | kNoXdev), "original");
+}
+
+TEST_F(RetainedDirfdMount, UnmountDotSelectsTopCoverWithoutChangingCwd) {
+    ASSERT_EQ(0, fchdir(fd_)) << strerror(errno);
+    ASSERT_TRUE(Mount(anchor_)) << strerror(errno);
+    const int lower = Hold(anchor_);
+    ASSERT_GE(lower, 0) << strerror(errno);
+    ASSERT_TRUE(Mount(anchor_)) << strerror(errno);
+    const int upper = Hold(anchor_);
+    ASSERT_GE(upper, 0) << strerror(errno);
+
+    ExpectSame(open(".", O_PATH | O_DIRECTORY), fd_);
+    ExpectSame(open(anchor_.c_str(), O_PATH | O_DIRECTORY), upper);
+    ASSERT_EQ(0, umount2(".", MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectSame(open(anchor_.c_str(), O_PATH | O_DIRECTORY), lower);
+    ExpectSame(open(".", O_PATH | O_DIRECTORY), fd_);
+    ASSERT_EQ(0, umount2("././//", MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectSame(open(anchor_.c_str(), O_PATH | O_DIRECTORY), fd_);
+    ExpectSame(open(".", O_PATH | O_DIRECTORY), fd_);
+    EXPECT_EQ(-1, umount2(".", MNT_DETACH));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(RetainedDirfdMount, UnmountNoFollowRejectsFinalSymlinkToCover) {
+    const std::string link = root_ + "/cover-link";
+    ASSERT_EQ(0, symlink(anchor_.c_str(), link.c_str())) << strerror(errno);
+    Cover();
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(-1, umount2(link.c_str(), MNT_DETACH | UMOUNT_NOFOLLOW));
+    EXPECT_EQ(EINVAL, errno);
+    ExpectContents(open((anchor_ + "/marker").c_str(), O_RDONLY), "cover");
+    ASSERT_EQ(0, umount2(link.c_str(), MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectContents(open((anchor_ + "/marker").c_str(), O_RDONLY), "original");
+    EXPECT_EQ(0, unlink(link.c_str()));
+}
+
+TEST_F(RetainedDirfdMount, UnmountAcceptsFileBindTarget) {
+    const std::string source = root_ + "/source";
+    const std::string target = root_ + "/target";
+    ASSERT_TRUE(Write(source, "bound"));
+    ASSERT_TRUE(Write(target, "original"));
+    ASSERT_EQ(0, mount(source.c_str(), target.c_str(), nullptr, MS_BIND, nullptr))
+        << strerror(errno);
+    mounts_.push_back(target);
+    ExpectContents(open(target.c_str(), O_RDONLY), "bound");
+    ASSERT_EQ(0, umount2(target.c_str(), MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectContents(open(target.c_str(), O_RDONLY), "original");
 }
 
 }  // namespace

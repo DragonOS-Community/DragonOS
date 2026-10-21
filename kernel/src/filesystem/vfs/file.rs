@@ -844,6 +844,9 @@ pub struct FileData {
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
+    /// Stable identity of the final operation inode, including its mounted device.
+    /// Shared futex lookup must not call filesystem metadata under MM/VMA locks.
+    mapped_file_identity: (usize, InodeId),
     /// Internal filesystem domain for serializing atomic append operations.
     /// Only regular, non-O_PATH files retain one; the inode key is resolved
     /// from current metadata when an append starts.
@@ -1777,6 +1780,7 @@ impl File {
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
+            mapped_file_identity: (metadata.dev_id, metadata.inode_id),
             append_lock_domain,
             ra_state: Mutex::new(FileReadaheadState::new()),
             wb_error_seq: Mutex::new(wb_error_seq),
@@ -3694,6 +3698,7 @@ impl File {
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
+            mapped_file_identity: self.mapped_file_identity,
             append_lock_domain: self.append_lock_domain.clone(),
             ra_state: Mutex::new(self.ra_state.lock().clone()),
             wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
@@ -3723,6 +3728,12 @@ impl File {
     #[inline]
     pub fn posix_lock_key(&self) -> (usize, InodeId) {
         self.posix_lock_key
+    }
+
+    /// Immutable mapping identity; no filesystem operation or allocation.
+    #[inline]
+    pub(crate) fn mapped_file_identity(&self) -> (usize, InodeId) {
+        self.mapped_file_identity
     }
 
     /// 获取当前文件偏移（等价于用户态的 file position）。

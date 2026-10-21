@@ -134,6 +134,32 @@ enum PageEntryAccounting {
     Shmem = 2,
 }
 
+impl PageEntryAccounting {
+    const KIND_MASK: u8 = 0b11;
+    const DIRTY_ACCOUNTED: u8 = 0b100;
+
+    fn decode(value: u8) -> Self {
+        match value & Self::KIND_MASK {
+            1 => Self::File,
+            2 => Self::Shmem,
+            _ => Self::Unaccounted,
+        }
+    }
+
+    fn encode(self, account_dirty: bool) -> u8 {
+        self as u8
+            | if account_dirty {
+                Self::DIRTY_ACCOUNTED
+            } else {
+                0
+            }
+    }
+
+    fn accounts_dirty(value: u8) -> bool {
+        value & Self::DIRTY_ACCOUNTED != 0
+    }
+}
+
 /// How a file-backed page joined the currently visible dirty incarnation.
 ///
 /// A writeback descriptor generation identifies one later Dirty -> Writeback
@@ -2058,22 +2084,21 @@ impl PageEntry {
     }
 
     fn accounting(&self) -> PageEntryAccounting {
-        match self.accounting.load(Ordering::Acquire) {
-            1 => PageEntryAccounting::File,
-            2 => PageEntryAccounting::Shmem,
-            _ => PageEntryAccounting::Unaccounted,
-        }
+        PageEntryAccounting::decode(self.accounting.load(Ordering::Acquire))
     }
 
-    fn account_insert(&self, kind: PageCacheKind, mapping_unevictable: bool) {
+    fn account_insert(&self, kind: PageCacheKind, mapping_unevictable: bool, account_dirty: bool) {
         let accounting = match kind {
             PageCacheKind::File => PageEntryAccounting::File,
             PageCacheKind::Shmem => PageEntryAccounting::Shmem,
         };
+        // Dirty accounting describes backing writeback capability, not the
+        // internal dirty bit: RAM backings retain their dirty data. Capture
+        // the capability with membership so retirement uses the same rule.
         self.accounting
             .compare_exchange(
                 PageEntryAccounting::Unaccounted as u8,
-                accounting as u8,
+                accounting.encode(account_dirty),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -2088,14 +2113,10 @@ impl PageEntry {
     }
 
     fn account_remove(&self) -> PageEntryAccounting {
-        let accounting = match self
+        let previous = self
             .accounting
-            .swap(PageEntryAccounting::Unaccounted as u8, Ordering::AcqRel)
-        {
-            1 => PageEntryAccounting::File,
-            2 => PageEntryAccounting::Shmem,
-            _ => PageEntryAccounting::Unaccounted,
-        };
+            .swap(PageEntryAccounting::Unaccounted as u8, Ordering::AcqRel);
+        let accounting = PageEntryAccounting::decode(previous);
         if accounting == PageEntryAccounting::Unaccounted {
             return accounting;
         }
@@ -2106,7 +2127,9 @@ impl PageEntry {
         }
         self.unaccount_unevictable_if_needed();
         match self.state() {
-            PageState::Dirty => pc_stats::dec_file_dirty(),
+            PageState::Dirty if PageEntryAccounting::accounts_dirty(previous) => {
+                pc_stats::dec_file_dirty();
+            }
             PageState::Writeback => {
                 log::error!("detaching a page-cache entry while writeback is active");
                 pc_stats::dec_file_writeback();
@@ -2117,16 +2140,19 @@ impl PageEntry {
     }
 
     fn account_state_transition(&self, old: PageState, new: PageState) {
-        if old == new || self.accounting() == PageEntryAccounting::Unaccounted {
+        let accounting = self.accounting.load(Ordering::Acquire);
+        if old == new || PageEntryAccounting::decode(accounting) == PageEntryAccounting::Unaccounted
+        {
             return;
         }
+        let account_dirty = PageEntryAccounting::accounts_dirty(accounting);
         match old {
-            PageState::Dirty => pc_stats::dec_file_dirty(),
+            PageState::Dirty if account_dirty => pc_stats::dec_file_dirty(),
             PageState::Writeback => pc_stats::dec_file_writeback(),
             _ => {}
         }
         match new {
-            PageState::Dirty => pc_stats::inc_file_dirty(),
+            PageState::Dirty if account_dirty => pc_stats::inc_file_dirty(),
             PageState::Writeback => pc_stats::inc_file_writeback(),
             _ => {}
         }
@@ -2474,13 +2500,16 @@ impl InnerPageCache {
     /// The caller owns an unpublished backend permit and has prepared table
     /// capacity. No admission or metadata allocation can fail in this commit.
     fn insert_entry_reserved(&mut self, offset: usize, entry: Arc<PageEntry>) {
-        let mapping_unevictable = self
-            .page_cache_ref
-            .upgrade()
+        let cache = self.page_cache_ref.upgrade();
+        let mapping_unevictable = cache
+            .as_ref()
             .is_some_and(|cache| cache.mapping_unevictable());
+        let account_dirty = cache
+            .as_ref()
+            .is_none_or(|cache| cache.supports_writeback());
         match self.pages.entry(offset) {
             Entry::Vacant(slot) => {
-                entry.account_insert(self.kind, mapping_unevictable);
+                entry.account_insert(self.kind, mapping_unevictable, account_dirty);
                 slot.insert(entry);
             }
             Entry::Occupied(_) => panic!("page-cache insert requires a vacant slot"),
@@ -2497,12 +2526,16 @@ impl InnerPageCache {
         offset: usize,
         entry: Arc<PageEntry>,
     ) -> Result<(), SystemError> {
+        let account_dirty = self
+            .page_cache_ref
+            .upgrade()
+            .is_none_or(|cache| cache.supports_writeback());
         match self.pages.entry(offset) {
             Entry::Vacant(slot) => {
                 if let Some(backend) = self.accounting_backend.as_ref() {
                     backend.reserve_page()?;
                 }
-                entry.account_insert(self.kind, true);
+                entry.account_insert(self.kind, true, account_dirty);
                 slot.insert(entry);
                 Ok(())
             }
@@ -2845,7 +2878,10 @@ impl PageCache {
     }
 
     pub fn set_backend(&self, backend: Arc<dyn PageCacheBackend>) -> Result<(), SystemError> {
-        if self.backend.initialized() {
+        // Serialize initialization with entry birth. Live entries already own
+        // their fixed Dirty accounting capability and must not be reclassified.
+        let inner = self.inner.lock();
+        if self.backend.initialized() || !inner.pages.is_empty() {
             return Err(SystemError::EINVAL);
         }
         self.backend.init(backend);
@@ -4369,7 +4405,7 @@ impl PageCache {
                 }
             };
             for (index, entry) in (start_page_index..end_page_index).zip(&entries) {
-                entry.account_insert(guard.kind, true);
+                entry.account_insert(guard.kind, true, self.supports_writeback());
                 guard.pages.insert(index, entry.clone());
             }
             drop(guard);

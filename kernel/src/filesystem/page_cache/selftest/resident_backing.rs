@@ -103,9 +103,13 @@ fn populate(
 fn resident(cache: &PageCache, owner: &MemoryAccount) -> Result<bool, SystemError> {
     let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
     let mut bytes = vec![0; MMArch::PAGE_SIZE];
+    let stats = owner.snapshot();
     Ok(cache.read(0, &mut bytes)? == bytes.len()
         && bytes.iter().all(|byte| *byte == 0x6d)
         && entry.state() == PageState::Dirty
+        && !PageEntryAccounting::accounts_dirty(entry.accounting.load(Ordering::Acquire))
+        && stats.stats[crate::cgroup::memory::accounting::MemoryStat::FileDirty as usize] == 0
+        && stats.stats[crate::cgroup::memory::accounting::MemoryStat::FileWriteback as usize] == 0
         && entry.writeback_tag() == 0
         && entry.page.read().flags().contains(PageFlags::PG_DIRTY)
         && cache.inner.lock().dirty_pages.contains(&0)

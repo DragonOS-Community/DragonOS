@@ -844,6 +844,7 @@ struct fuse_daemon_args {
     uint64_t create_reuse_nodeid;
     uint64_t create_generation_override;
     uint64_t create_open_fh_override;
+    uint32_t create_open_out_flags;
     uint32_t create_reply_mode_override;
     uint64_t link_generation_override;
     uint64_t hello_generation_override;
@@ -1791,6 +1792,7 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
             out.entry.attr.mode = a->create_reply_mode_override;
         }
         out.open_out.fh = nnode->open_fh;
+        out.open_out.open_flags = a->create_open_out_flags;
         return fuse_write_reply(a->fd, h->unique, 0, &out, sizeof(out));
     }
     case FUSE_SYMLINK: {

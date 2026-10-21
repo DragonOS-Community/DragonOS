@@ -2884,6 +2884,8 @@ static int ext_test_open_release_flags_match_linux() {
     volatile int init_done = 0;
     volatile uint32_t last_open_flags = 0;
     volatile uint32_t last_release_flags = 0;
+    volatile uint32_t last_read_flags = 0, last_write_flags = 0;
+    char data = 0;
 
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -2891,9 +2893,13 @@ static int ext_test_open_release_flags_match_linux() {
     args.stop = &stop;
     args.init_done = &init_done;
     args.enable_write_ops = 1;
+    // Force wire I/O: a page-cache hit would not observe READ flags.
+    args.hello_open_out_flags = FOPEN_DIRECT_IO;
     args.stop_on_destroy = 1;
     args.last_open_in_flags = &last_open_flags;
     args.last_release_in_flags = &last_release_flags;
+    args.last_read_open_flags = &last_read_flags;
+    args.last_write_open_flags = &last_write_flags;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ATOMIC_O_TRUNC;
 
     pthread_t th;
@@ -2927,7 +2933,8 @@ static int ext_test_open_release_flags_match_linux() {
         goto fail;
     }
     ofd_flags = fcntl(f, F_GETFL);
-    if (ofd_flags < 0 || (ofd_flags & persistent) != (requested & persistent)) {
+    if (ofd_flags < 0 || (ofd_flags & persistent) != (requested & persistent)
+        || (ofd_flags & (O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC)) != 0) {
         printf("[FAIL] open OFD flags=0%o requested=0%o errno=%d\n", ofd_flags,
                requested, errno);
         goto fail;
@@ -2936,12 +2943,18 @@ static int ext_test_open_release_flags_match_linux() {
     // sees the resulting OFD. Include environment-provided flags such as LARGEFILE.
     expected_open = (uint32_t)((ofd_flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_CLOEXEC | O_TRUNC))
                                | (requested & O_TRUNC));
+    if (write(f, "x", 1) != 1 || pread(f, &data, 1, 0) != 1 || data != 'x') goto fail;
     close(f);
     f = -1;
 
     usleep(100 * 1000);
     if (last_open_flags != expected_open) {
         printf("[FAIL] open flags got=0%o expected=0%o\n", last_open_flags, expected_open);
+        goto fail;
+    }
+    if (last_read_flags != (uint32_t)ofd_flags || last_write_flags != (uint32_t)ofd_flags) {
+        printf("[FAIL] post-open I/O flags read=0%o write=0%o expected=0%o\n",
+               last_read_flags, last_write_flags, (uint32_t)ofd_flags);
         goto fail;
     }
     if (last_release_flags != (uint32_t)ofd_flags) {
@@ -2971,10 +2984,11 @@ fail_no_umount:
     return -1;
 }
 
-static int ext_test_create_reuses_fuse_handle() {
+static int ext_test_create_reuses_fuse_handle(bool exclusive) {
     const char *mp = "/tmp/test_fuse_create_handle";
     const uint64_t create_fh = 0xcafe2019ULL;
     int requested = O_CREAT | O_RDWR | O_TRUNC | O_APPEND | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
+    if (exclusive) requested |= O_EXCL;
     uint32_t expected_create = 0;
     int ofd_flags = -1;
     const int persistent = O_ACCMODE | O_APPEND | O_NONBLOCK;
@@ -2989,6 +3003,8 @@ static int ext_test_create_reuses_fuse_handle() {
     volatile int stop = 0, init_done = 0;
     volatile uint32_t create_count = 0, open_count = 0, write_count = 0;
     volatile uint32_t flush_count = 0, release_count = 0, setattr_count = 0, create_flags = 0;
+    volatile uint32_t read_flags = 0, write_flags = 0, release_flags = 0;
+    char data = 0;
     volatile uint64_t write_fh = 0, flush_fh = 0, release_fh = 0;
     struct fuse_daemon_args args;
     memset(&args, 0, sizeof(args));
@@ -3004,10 +3020,14 @@ static int ext_test_create_reuses_fuse_handle() {
     args.release_count = &release_count;
     args.setattr_count = &setattr_count;
     args.last_create_in_flags = &create_flags;
+    args.last_read_open_flags = &read_flags;
+    args.last_write_open_flags = &write_flags;
+    args.last_release_in_flags = &release_flags;
     args.last_write_fh = &write_fh;
     args.last_flush_fh = &flush_fh;
     args.last_release_fh = &release_fh;
     args.create_open_fh_override = create_fh;
+    args.create_open_out_flags = FOPEN_DIRECT_IO;
     args.init_out_flags_override = FUSE_INIT_EXT | FUSE_MAX_PAGES | FUSE_ATOMIC_O_TRUNC;
 
     pthread_t th;
@@ -3021,12 +3041,18 @@ static int ext_test_create_reuses_fuse_handle() {
     if (f < 0) goto fail;
     ofd_flags = fcntl(f, F_GETFL);
     if (ofd_flags < 0 || (ofd_flags & persistent) != (requested & persistent)
-        || fcntl(f, F_GETFD) != FD_CLOEXEC) goto fail;
+        || fcntl(f, F_GETFD) != FD_CLOEXEC
+        || (ofd_flags & (O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC)) != 0) goto fail;
     // CREATE receives creation flags before post-open normalization. NOCTTY
     // and the per-descriptor CLOEXEC flag never belong in its wire flags.
     expected_create = (uint32_t)((ofd_flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_CLOEXEC | O_TRUNC))
-                                | (requested & (O_CREAT | O_EXCL | O_TRUNC)));
-    if (write(f, "x", 1) != 1) goto fail;
+                                | (requested & (O_CREAT | O_EXCL)));
+    // Exclusive creation has no existing contents to truncate (namei semantics).
+    if ((requested & O_EXCL) == 0) expected_create |= requested & O_TRUNC;
+    // CREATE/open must not issue an additional truncate. Check before direct
+    // WRITE, whose independent privilege update may legitimately use SETATTR.
+    if (setattr_count != 0) goto fail;
+    if (write(f, "x", 1) != 1 || pread(f, &data, 1, 0) != 1 || data != 'x') goto fail;
     close(f);
     f = -1;
     for (int i = 0; i < 200 && release_count < 1; i++) {
@@ -3034,13 +3060,15 @@ static int ext_test_create_reuses_fuse_handle() {
     }
 
     if (create_count != 1 || open_count != 0 || write_count != 1 || flush_count != 1 ||
-        release_count != 1 || setattr_count != 0 || create_flags != expected_create ||
-        write_fh != create_fh || flush_fh != create_fh || release_fh != create_fh) {
+        release_count != 1 || create_flags != expected_create ||
+        write_fh != create_fh || flush_fh != create_fh || release_fh != create_fh
+        || read_flags != (uint32_t)ofd_flags || write_flags != (uint32_t)ofd_flags
+        || release_flags != (uint32_t)ofd_flags) {
         printf("[FAIL] create handle reuse create=%u open=%u write=%u flush=%u release=%u "
-               "flags=0%o expected=0%o fhs=%llx/%llx/%llx\n",
+               "flags=0%o expected=0%o fhs=%llx/%llx/%llx setattr=%u io=0%o/0%o/0%o ofd=0%o\n",
                create_count, open_count, write_count, flush_count, release_count, create_flags,
                expected_create, (unsigned long long)write_fh, (unsigned long long)flush_fh,
-               (unsigned long long)release_fh);
+               (unsigned long long)release_fh, setattr_count, read_flags, write_flags, release_flags, ofd_flags);
         goto fail;
     }
     if (unlink(path) != 0) goto fail;
@@ -11634,7 +11662,11 @@ TEST(FuseExtended, OpenFlagsMatchLinuxMask) {
 }
 
 TEST(FuseExtended, CreateReusesFuseHandleWithoutOpen) {
-    ASSERT_EQ(0, ext_test_create_reuses_fuse_handle());
+    ASSERT_EQ(0, ext_test_create_reuses_fuse_handle(false));
+}
+
+TEST(FuseExtended, ExclusiveCreateConsumesFlagsWithoutReopening) {
+    ASSERT_EQ(0, ext_test_create_reuses_fuse_handle(true));
 }
 
 TEST(FuseExtended, CreateEnosysFallsBackAndCaches) {

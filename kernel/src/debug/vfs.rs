@@ -16,6 +16,8 @@ enum VfsSelftestCallback {
     MountWrapperCache,
     #[cfg(feature = "mm_selftest")]
     ForcedReadonly,
+    #[cfg(feature = "mm_selftest")]
+    CachedLookup,
 }
 
 impl KernFSCallback for VfsSelftestCallback {
@@ -27,6 +29,10 @@ impl KernFSCallback for VfsSelftestCallback {
             #[cfg(feature = "mm_selftest")]
             Self::ForcedReadonly => {
                 crate::filesystem::vfs::mount::run_forced_readonly_debug_selftest()?
+            }
+            #[cfg(feature = "mm_selftest")]
+            Self::CachedLookup => {
+                crate::filesystem::vfs::mount::run_cached_lookup_debug_selftest()?
             }
         };
         data.file_private_data_mut()
@@ -90,6 +96,14 @@ pub fn init_debugfs_vfs() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&VfsSelftestCallback::ForcedReadonly),
+    )?;
+    #[cfg(feature = "mm_selftest")]
+    vfs.add_file(
+        "cached_lookup_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&VfsSelftestCallback::CachedLookup),
     )?;
     Ok(())
 }

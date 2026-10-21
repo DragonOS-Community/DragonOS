@@ -401,16 +401,15 @@ impl Ext4 {
             self.map_validated_journal_inode(&journal_inode, journal_len, ext4_sb.block_count())?;
 
         let needs_recovery = ext4_sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER);
-        if journal_sb.start != 0 && !needs_recovery {
-            return Err(Ext4Error::new(ErrCode::EIO));
-        }
+        let io = RecoveryDevice {
+            device: self.block_device.as_ref(),
+            journal_blocks: &mapping,
+            journal_block_set: &journal_blocks,
+            filesystem_blocks: ext4_sb.block_count(),
+        };
+        // Linux ext4_load_journal wipes old transactions before journal_load
+        // when RECOVER is clear. Only a dirty ext4 superblock authorizes replay.
         if needs_recovery {
-            let io = RecoveryDevice {
-                device: self.block_device.as_ref(),
-                journal_blocks: &mapping,
-                journal_block_set: &journal_blocks,
-                filesystem_blocks: ext4_sb.block_count(),
-            };
             journal_recovery::recover(&io)?;
             let recovered_block0 = self.block_device.read_block(0)?;
             let recovered_sb: SuperBlock =
@@ -449,6 +448,10 @@ impl Ext4 {
             let refreshed = self.block_device.read_block(mapping[0])?;
             journal_sb = JournalSuperblock::parse(&refreshed.data[..], BLOCK_SIZE as u32)?;
             self.inode_cache.lock().entries.clear();
+        } else if journal_sb.start != 0 {
+            journal_recovery::discard(&io)?;
+            let refreshed = self.block_device.read_block(mapping[0])?;
+            journal_sb = JournalSuperblock::parse(&refreshed.data[..], BLOCK_SIZE as u32)?;
         }
 
         let mut image = try_filled_bytes::<1024>(0)?;

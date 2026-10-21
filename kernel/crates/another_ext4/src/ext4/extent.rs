@@ -1982,18 +1982,33 @@ impl Ext4 {
     /// may include tree metadata blocks.
     pub(super) fn extent_next_data_lblock(&self, inode_ref: &InodeRef) -> Result<LBlockId> {
         let ex_node = inode_ref.inode.extent_root();
+        self.validate_extent_node(inode_ref.id, &ex_node)?;
         if ex_node.header().entries_count() == 0 {
             return Ok(0);
         }
-        self.extent_last_lblock_recursive(inode_ref, &ex_node)
+        self.extent_last_lblock_recursive(inode_ref, &ex_node, ex_node.header().depth())
     }
 
     fn extent_last_lblock_recursive(
         &self,
         inode_ref: &InodeRef,
         ex_node: &ExtentNode,
+        expected_depth: u16,
     ) -> Result<LBlockId> {
-        let last = ex_node.header().entries_count() as usize - 1;
+        // 深度链必须逐层递减：脏数据里的环状 extent 树在此被拒绝，而不是
+        // 无限递归耗尽内核栈（Linux ext4_ext_check 同样强制 eh_depth 链）。
+        if ex_node.header().depth() != expected_depth {
+            return Err(format_error!(
+                ErrCode::EIO,
+                "extent depth chain broken on inode {}",
+                inode_ref.id
+            ));
+        }
+        let last = (ex_node.header().entries_count() as usize)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                format_error!(ErrCode::EIO, "empty extent child on inode {}", inode_ref.id)
+            })?;
         if ex_node.header().depth() == 0 {
             // Leaf: return start_lblock + block_count of the last extent
             let ex = ex_node.extent_at(last);
@@ -2003,7 +2018,16 @@ impl Ext4 {
             let ex_idx = ex_node.extent_index_at(last);
             let child_block = self.read_extent_block(inode_ref, ex_idx.leaf())?;
             let child_node = ExtentNode::from_bytes(&*child_block.data);
-            self.extent_last_lblock_recursive(inode_ref, &child_node)
+            self.validate_extent_node(inode_ref.id, &child_node)?;
+            if child_node.header().depth() + 1 != ex_node.header().depth() {
+                return Err(format_error!(
+                    ErrCode::EIO,
+                    "extent depth mismatch on inode {} at block {}",
+                    inode_ref.id,
+                    ex_idx.leaf()
+                ));
+            }
+            self.extent_last_lblock_recursive(inode_ref, &child_node, expected_depth - 1)
         }
     }
 
@@ -2011,7 +2035,15 @@ impl Ext4 {
     pub(super) fn extent_all_data_blocks(&self, inode_ref: &InodeRef) -> Result<Vec<PBlockId>> {
         let mut pblocks = Vec::new();
         let ex_node = inode_ref.inode.extent_root();
-        self.get_all_pblocks_recursive(inode_ref, &ex_node, &mut pblocks)?;
+        self.validate_extent_node(inode_ref.id, &ex_node)?;
+        let mut visited = BTreeSet::new();
+        self.get_all_pblocks_recursive(
+            inode_ref,
+            &ex_node,
+            ex_node.header().depth(),
+            &mut visited,
+            &mut pblocks,
+        )?;
         Ok(pblocks)
     }
 
@@ -2019,7 +2051,15 @@ impl Ext4 {
     pub(super) fn extent_all_tree_blocks(&self, inode_ref: &InodeRef) -> Result<Vec<PBlockId>> {
         let mut pblocks = Vec::new();
         let ex_node = inode_ref.inode.extent_root();
-        self.get_all_nodes_recursive(inode_ref, &ex_node, &mut pblocks)?;
+        self.validate_extent_node(inode_ref.id, &ex_node)?;
+        let mut visited = BTreeSet::new();
+        self.get_all_nodes_recursive(
+            inode_ref,
+            &ex_node,
+            ex_node.header().depth(),
+            &mut visited,
+            &mut pblocks,
+        )?;
         Ok(pblocks)
     }
 
@@ -2068,8 +2108,20 @@ impl Ext4 {
         &self,
         inode_ref: &InodeRef,
         ex_node: &ExtentNode,
+        expected_depth: u16,
+        visited: &mut BTreeSet<PBlockId>,
         pblocks: &mut Vec<PBlockId>,
     ) -> Result<()> {
+        // 与 validate_extent_subtree 相同的两重保护：深度链逐层递减 +
+        // 已访问节点集合。脏盘上环状/跳变的 extent 树在此以 EIO 拒绝，
+        // 而不是无限递归耗尽内核栈（Linux ext4_ext_check 亦强制 eh_depth 链）。
+        if ex_node.header().depth() != expected_depth {
+            return Err(format_error!(
+                ErrCode::EIO,
+                "extent depth chain broken on inode {}",
+                inode_ref.id
+            ));
+        }
         if ex_node.header().depth() == 0 {
             // Leaf
             for i in 0..ex_node.header().entries_count() as usize {
@@ -2082,10 +2134,32 @@ impl Ext4 {
             // Non-leaf
             for i in 0..ex_node.header().entries_count() as usize {
                 let ex_idx = ex_node.extent_index_at(i);
+                if !visited.insert(ex_idx.leaf()) {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "duplicate or cyclic extent node on inode {} at block {}",
+                        inode_ref.id,
+                        ex_idx.leaf()
+                    ));
+                }
                 let child_block = self.read_extent_block(inode_ref, ex_idx.leaf())?;
                 let child_node = ExtentNode::from_bytes(&*child_block.data);
                 self.validate_extent_node(inode_ref.id, &child_node)?;
-                self.get_all_pblocks_recursive(inode_ref, &child_node, pblocks)?;
+                if child_node.header().depth() + 1 != ex_node.header().depth() {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "extent depth mismatch on inode {} at block {}",
+                        inode_ref.id,
+                        ex_idx.leaf()
+                    ));
+                }
+                self.get_all_pblocks_recursive(
+                    inode_ref,
+                    &child_node,
+                    expected_depth - 1,
+                    visited,
+                    pblocks,
+                )?;
             }
         }
         Ok(())
@@ -2095,17 +2169,51 @@ impl Ext4 {
         &self,
         inode_ref: &InodeRef,
         ex_node: &ExtentNode,
+        expected_depth: u16,
+        visited: &mut BTreeSet<PBlockId>,
         pblocks: &mut Vec<PBlockId>,
     ) -> Result<()> {
+        // 同上：深度链 + 环/重复检测。本函数位于挂载期 journal inode 映射
+        // 路径（map_validated_journal_inode → extent_all_tree_blocks），
+        // 未净关机的脏盘曾在此出现环状 extent 树导致栈溢出。
+        if ex_node.header().depth() != expected_depth {
+            return Err(format_error!(
+                ErrCode::EIO,
+                "extent depth chain broken on inode {}",
+                inode_ref.id
+            ));
+        }
         if ex_node.header().depth() != 0 {
             // Non-leaf
             for i in 0..ex_node.header().entries_count() as usize {
                 let ex_idx = ex_node.extent_index_at(i);
+                if !visited.insert(ex_idx.leaf()) {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "duplicate or cyclic extent node on inode {} at block {}",
+                        inode_ref.id,
+                        ex_idx.leaf()
+                    ));
+                }
                 pblocks.push(ex_idx.leaf());
                 let child_block = self.read_extent_block(inode_ref, ex_idx.leaf())?;
                 let child_node = ExtentNode::from_bytes(&*child_block.data);
                 self.validate_extent_node(inode_ref.id, &child_node)?;
-                self.get_all_nodes_recursive(inode_ref, &child_node, pblocks)?;
+                if child_node.header().depth() + 1 != ex_node.header().depth() {
+                    return Err(format_error!(
+                        ErrCode::EIO,
+                        "extent depth mismatch on inode {} at block {}",
+                        inode_ref.id,
+                        ex_idx.leaf()
+                    ));
+                }
+                self.get_all_nodes_recursive(
+                    inode_ref,
+                    &child_node,
+                    expected_depth - 1,
+                    visited,
+                    pblocks,
+                )?;
             }
         }
         Ok(())
@@ -2123,6 +2231,7 @@ impl Ext4 {
         let mut pblock = 0;
         let mut block_data: Block;
         self.validate_extent_node(inode_ref.id, &ex_node)?;
+        let mut depth = ex_node.header().depth();
 
         // Go until leaf
         while ex_node.header().depth() > 0 {
@@ -2145,6 +2254,16 @@ impl Ext4 {
             // Load the next extent header
             ex_node = ExtentNode::from_bytes(&*block_data.data);
             self.validate_extent_node(inode_ref.id, &ex_node)?;
+            // 深度必须逐层递减：脏数据里不递减的树会让此循环永不终止。
+            if ex_node.header().depth() + 1 != depth {
+                return Err(format_error!(
+                    ErrCode::EIO,
+                    "extent depth mismatch on inode {} at block {}",
+                    inode_ref.id,
+                    next
+                ));
+            }
+            depth = ex_node.header().depth();
             pblock = next;
         }
         // Leaf
@@ -2853,6 +2972,53 @@ impl Ext4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cyclic_extent_children_fail_all_tree_walks() {
+        let mut node_data = [0u8; BLOCK_SIZE];
+        let mut node = ExtentNodeMut::from_bytes(&mut node_data);
+        node.init(1, 0);
+        node.insert_extent_index(&ExtentIndex::new(0, 10), 0)
+            .unwrap();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(10, Block::new(10, Box::new(node_data)));
+        let fs = make_test_fs_with_device(Arc::new(PlanBlockDevice {
+            base: StubBlockDevice::with_block_count(100),
+            blocks,
+        }));
+        let mut inode = make_read_inode(BLOCK_SIZE as u64, &[]);
+        let mut root = inode.inode.extent_root_mut();
+        root.init(2, 0);
+        root.insert_extent_index(&ExtentIndex::new(0, 10), 0)
+            .unwrap();
+        assert_eq!(
+            fs.extent_next_data_lblock(&inode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+        assert_eq!(
+            fs.extent_all_data_blocks(&inode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+        assert_eq!(
+            fs.extent_all_tree_blocks(&inode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+        assert_eq!(fs.extent_query(&inode, 0).unwrap_err().code(), ErrCode::EIO);
+    }
+
+    #[test]
+    fn rightmost_empty_child_is_rejected_without_underflow() {
+        let fs = make_test_fs(100);
+        let inode = make_read_inode(0, &[]);
+        let node = inode.inode.extent_root();
+        assert_eq!(
+            fs.extent_last_lblock_recursive(&inode, &node, 0)
+                .unwrap_err()
+                .code(),
+            ErrCode::EIO
+        );
+        assert_eq!(fs.extent_next_data_lblock(&inode).unwrap(), 0);
+    }
 
     #[test]
     fn range_edit_trace_is_explicit_bounded_and_deduplicated() {

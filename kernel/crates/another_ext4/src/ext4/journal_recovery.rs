@@ -36,7 +36,7 @@ struct Tag {
     checksum: Option<u32>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Pass {
     Scan,
     Revoke,
@@ -48,6 +48,16 @@ enum Pass {
 /// An empty (`s_start == 0`) journal is left untouched. On any error the
 /// journal superblock is not changed, so a later mount can retry recovery.
 pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
+    process_journal(io, true)
+}
+
+/// Clean ext4 filesystems must discard old transactions, never replay them.
+/// Scan only to advance the transaction sequence before clearing the tail.
+pub(super) fn discard<I: JournalRecoveryIo>(io: &I) -> Result<()> {
+    process_journal(io, false).map(|_| ())
+}
+
+fn process_journal<I: JournalRecoveryIo>(io: &I, replay: bool) -> Result<RecoveryStats> {
     let mut raw_sb = io.read_journal(0)?;
     if raw_sb.len() != io.block_size() {
         return Err(Ext4Error::new(ErrCode::EIO));
@@ -59,6 +69,15 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
     if sb.start == 0 {
         return Ok(RecoveryStats::default());
     }
+    // 进度日志：脏日志重放可能持续数十秒（取决于日志长度与内容），
+    // 启动现场需要区分“慢”与“卡死”。
+    log::warn!(
+        "ext4: journal scan begins: start={}, first={}, max_len={}, sequence={}",
+        sb.start,
+        sb.first,
+        sb.max_len,
+        sb.sequence
+    );
 
     let seed = jbd2::checksum_seed(&sb.uuid);
     let end_sequence = walk(
@@ -70,31 +89,33 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
         None,
         &mut RecoveryStats::default(),
     )?;
-    let mut revokes = BTreeMap::<u64, u32>::new();
-    walk(
-        io,
-        &sb,
-        seed,
-        Pass::Revoke,
-        Some(end_sequence),
-        Some(&mut revokes),
-        &mut RecoveryStats::default(),
-    )?;
     let mut stats = RecoveryStats::default();
-    walk(
-        io,
-        &sb,
-        seed,
-        Pass::Replay,
-        Some(end_sequence),
-        Some(&mut revokes),
-        &mut stats,
-    )?;
+    if replay {
+        let mut revokes = BTreeMap::<u64, u32>::new();
+        walk(
+            io,
+            &sb,
+            seed,
+            Pass::Revoke,
+            Some(end_sequence),
+            Some(&mut revokes),
+            &mut RecoveryStats::default(),
+        )?;
+        walk(
+            io,
+            &sb,
+            seed,
+            Pass::Replay,
+            Some(end_sequence),
+            Some(&mut revokes),
+            &mut stats,
+        )?;
 
-    // Linux orders recovered home blocks before invalidating the log. Never
-    // advertise a clean journal if a home write or its durability barrier
-    // failed.
-    io.flush_home()?;
+        // Linux orders recovered home blocks before invalidating the log. Never
+        // advertise a clean journal if a home write or its durability barrier
+        // failed.
+        io.flush_home()?;
+    }
     put_be32(&mut raw_sb, 24, end_sequence.wrapping_add(1))?;
     put_be32(&mut raw_sb, 28, 0)?;
     if sb.features.checksum == ChecksumMode::V3 {
@@ -105,6 +126,13 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
     io.write_journal(0, &raw_sb)?;
     io.flush_journal()?;
     stats.transactions = end_sequence.wrapping_sub(sb.sequence);
+    log::warn!(
+        "ext4: journal {} done: {} transactions, {} blocks replayed, {} revoke hits",
+        if replay { "recovery" } else { "discard" },
+        stats.transactions,
+        stats.replayed,
+        stats.revoke_hits
+    );
     Ok(stats)
 }
 
@@ -126,6 +154,9 @@ fn walk<I: JournalRecoveryIo>(
         if stop == Some(sequence) {
             return Ok(sequence);
         }
+        // 周期性进度日志（每 8192 个日志块 ≈ 32MB）：用于在启动现场区分
+        // 重放“仍在推进”与“已卡死”，并记录卡死发生在哪一遍扫描的哪个位置。
+        // 检查点在下方内层逐块循环里，事务边界不一定落在 8192 的倍数上。
         let tx_start = pos;
         let mut committed = false;
         let mut transaction_checksum_invalid = false;
@@ -139,6 +170,15 @@ fn walk<I: JournalRecoveryIo>(
             };
             pos = advance(sb, pos);
             consumed += 1;
+            if consumed.is_multiple_of(8192) {
+                log::warn!(
+                    "ext4: journal recovery {:?} pass: consumed {}/{} blocks, sequence {}",
+                    pass,
+                    consumed,
+                    ring_len,
+                    sequence
+                );
+            }
             match header.block_type {
                 BlockType::Descriptor => {
                     if sb.features.checksum == ChecksumMode::V3 {
@@ -450,6 +490,31 @@ mod tests {
             journal_physical: 900,
             events: RefCell::new(Vec::new()),
         }
+    }
+
+    #[test]
+    fn discarding_stale_transactions_preserves_newer_home_metadata() {
+        let mut blocks = vec![vec![0; 1024]; 8];
+        blocks[0] = superblock(8, 7, 42);
+        blocks[7] = descriptor(42, 77, false);
+        blocks[1] = vec![0x33; 1024];
+        blocks[2] = commit(42);
+        let io = memory(blocks);
+        io.home.borrow_mut().insert(77, vec![0x77; 1024]);
+        discard(&io).unwrap();
+        assert_eq!(io.home.borrow()[&77], vec![0x77; 1024]);
+        assert_eq!(&*io.events.borrow(), &["journal-write", "journal-flush"]);
+        assert_eq!(be32(&io.journal.borrow()[0], 28).unwrap(), 0);
+        assert_eq!(be32(&io.journal.borrow()[0], 24).unwrap(), 44);
+    }
+
+    #[test]
+    fn discarding_an_empty_journal_does_not_write() {
+        let mut blocks = vec![vec![0; 1024]; 8];
+        blocks[0] = superblock(8, 0, 42);
+        let io = memory(blocks);
+        discard(&io).unwrap();
+        assert!(io.events.borrow().is_empty());
     }
 
     #[test]

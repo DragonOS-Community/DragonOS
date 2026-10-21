@@ -13,7 +13,7 @@ use unified_init::macros::unified_init;
 use super::page_lru::{PageLru, PreparedPageLruCapacity};
 pub(crate) use super::page_rmap::PageMapping;
 use super::page_rmap::PageVmaSet;
-use crate::libs::resource_wait::ResourceMutexGuard;
+use crate::libs::resource_wait::{ResourceMutex, ResourceMutexGuard};
 use alloc::sync::{Arc, Weak};
 use hashbrown::HashMap;
 use log::{error, info};
@@ -69,12 +69,12 @@ pub const PAGE_4K_SIZE: usize = 1 << PAGE_4K_SHIFT;
 pub const PAGE_2M_SIZE: usize = 1 << PAGE_2M_SHIFT;
 
 /// 全局物理页信息管理器
-pub static mut PAGE_MANAGER: Option<Mutex<PageManager>> = None;
+pub static mut PAGE_MANAGER: Option<ResourceMutex<PageManager>> = None;
 
 /// 初始化PAGE_MANAGER
 pub fn page_manager_init() {
     info!("page_manager_init");
-    let page_manager = Mutex::new(PageManager::new());
+    let page_manager = ResourceMutex::new(PageManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_MANAGER = Some(page_manager) };
@@ -953,11 +953,11 @@ impl PageManager {
     }
 }
 
-pub static mut PAGE_RECLAIMER: Option<Mutex<PageReclaimer>> = None;
+pub static mut PAGE_RECLAIMER: Option<ResourceMutex<PageReclaimer>> = None;
 
 pub fn page_reclaimer_init() {
     info!("page_reclaimer_init");
-    let page_reclaimer = Mutex::new(PageReclaimer::new());
+    let page_reclaimer = ResourceMutex::new(PageReclaimer::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };

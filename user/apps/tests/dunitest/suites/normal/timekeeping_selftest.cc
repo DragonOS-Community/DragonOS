@@ -48,6 +48,11 @@ TEST(TimekeepingSelftest, KernelPureAndTransactionalChecksPass) {
     EXPECT_NE(std::string::npos,
               report.find("kvm_allocator.mapping_failure_releases_frame=ok\n"))
         << report;
+    // The isolated timer queue fixture is compiled only for mm_selftest.
+    // Regular production kernels retain the existing selftest report shape.
+    if (report.find("timer.queue_frontier=") != std::string::npos) {
+        EXPECT_NE(std::string::npos, report.find("timer.queue_frontier=ok\n")) << report;
+    }
     EXPECT_NE(std::string::npos, report.find("summary_fail=0\n")) << report;
 }
 

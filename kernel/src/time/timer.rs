@@ -266,15 +266,11 @@ impl SoftirqVec for DoTimerSoftirq {
             }
             let mut timer_list = timer_list.unwrap();
 
-            let Some((&(front_jiffies, _), _)) = timer_list.get_first() else {
+            let Some(timer_list_front) =
+                pop_expired(&mut timer_list, TIMER_JIFFIES.load(Ordering::SeqCst))
+            else {
                 break;
             };
-            // debug!("to lock timer_list_front");
-
-            if front_jiffies >= TIMER_JIFFIES.load(Ordering::SeqCst) {
-                break;
-            }
-            let (_, timer_list_front) = timer_list.pop_first().unwrap();
             drop(timer_list);
             timer_list_front.run();
         }
@@ -297,14 +293,23 @@ pub fn timer_init() {
 /// 计算接下来n毫秒对应的定时器时间片
 #[allow(dead_code)]
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
-    return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_ms * 1000000 / NSEC_PER_JIFFY as u64;
+    relative_timer_jiffies(clock(), u128::from(expire_ms) * 1_000_000)
 }
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
-    let now = TIMER_JIFFIES.load(Ordering::SeqCst);
-    let jiffies =
-        ((expire_us as u128 * 1000).div_ceil(NSEC_PER_JIFFY as u128)).min(u64::MAX as u128) as u64;
-    now.saturating_add(jiffies)
+    relative_timer_jiffies(clock(), u128::from(expire_us) * 1_000)
+}
+
+fn relative_timer_jiffies(now: u64, duration_ns: u128) -> u64 {
+    if duration_ns == 0 {
+        return now;
+    }
+    let ticks = duration_ns
+        .div_ceil(NSEC_PER_JIFFY as u128)
+        .min(u64::MAX as u128) as u64;
+    // `now` identifies a tick already in progress. Include that partial tick
+    // so a positive real duration cannot expire before its requested deadline.
+    now.saturating_add(ticks.saturating_add(1))
 }
 
 /// @brief 让pcb休眠timeout个jiffies
@@ -356,20 +361,29 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     }
 }
 
-pub fn timer_get_first_expire() -> Result<u64, SystemError> {
-    // FIXME
-    // debug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
+/// Return the earliest deadline, distinguishing an empty queue from deadline 0.
+/// Contention remains bounded because the caller runs in timer IRQ context.
+pub fn timer_get_first_expire() -> Result<Option<u64>, SystemError> {
+    first_expire_in(&TIMER_LIST)
+}
+
+fn first_expire_in(
+    timers: &SpinLock<RBTree<(u64, usize), Arc<Timer>>>,
+) -> Result<Option<u64>, SystemError> {
     for _ in 0..10 {
-        match TIMER_LIST.try_lock_irqsave() {
-            Ok(timer_list) => {
-                // debug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
-                return Ok(timer_list.get_first().map(|(key, _)| key.0).unwrap_or(0));
-            }
-            // 加锁失败返回啥？？
-            Err(_) => continue,
+        if let Ok(timer_list) = timers.try_lock_irqsave() {
+            return Ok(timer_list.get_first().map(|(key, _)| key.0));
         }
     }
-    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+}
+
+/// Select and retire one due timer while the caller holds the queue lock.
+fn pop_expired(timers: &mut RBTree<(u64, usize), Arc<Timer>>, now: u64) -> Option<Arc<Timer>> {
+    if timers.get_first().is_none_or(|(key, _)| key.0 > now) {
+        return None;
+    }
+    timers.pop_first().map(|(_, timer)| timer)
 }
 
 /// 检查是否需要触发定时器软中断，如果需要则触发
@@ -378,7 +392,7 @@ pub fn try_raise_timer_softirq() {
         softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
         return;
     }
-    if let Ok(first_expire) = timer_get_first_expire() {
+    if let Ok(Some(first_expire)) = timer_get_first_expire() {
         if first_expire <= clock() {
             softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
         }
@@ -436,4 +450,87 @@ pub(crate) fn heap_denied_activation_selftest() -> Result<bool, SystemError> {
     timer.cancel();
     let removed = TIMER_LIST.lock_irqsave().get(&timer.queue_key()).is_none();
     Ok(before && rejected && registered && removed && denial::probe_denied())
+}
+
+/// Isolated queue checks invoked only by the existing feature selftest report.
+/// No production queue membership, jiffies, pending bits or callbacks are changed.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn queue_frontier_selftest() -> Result<bool, SystemError> {
+    #[derive(Debug)]
+    struct Noop;
+    impl TimerFunction for Noop {
+        fn run(&mut self) -> Result<(), SystemError> {
+            Ok(())
+        }
+    }
+
+    let tick_ns = NSEC_PER_JIFFY as u128;
+    let now = 7;
+    if relative_timer_jiffies(now, 0) != now
+        || relative_timer_jiffies(now, 1) != now + 2
+        || relative_timer_jiffies(now, tick_ns - 1) != now + 2
+        || relative_timer_jiffies(now, tick_ns) != now + 2
+        || relative_timer_jiffies(now, tick_ns + 1) != now + 3
+        || relative_timer_jiffies(u64::MAX - 1, 1) != u64::MAX
+        || relative_timer_jiffies(now, u128::MAX) != u64::MAX
+    {
+        return Ok(false);
+    }
+    // Convert wide before multiplication: saturating a millisecond value to
+    // u64 microseconds first would silently shorten a large legal timeout.
+    let max_us = relative_timer_jiffies(now, u128::from(u64::MAX) * 1_000);
+    let max_ms = relative_timer_jiffies(now, u128::from(u64::MAX) * 1_000_000);
+    if max_us <= now || max_ms <= max_us || max_ms == u64::MAX {
+        return Ok(false);
+    }
+
+    let timers = SpinLock::new(RBTree::new());
+    if first_expire_in(&timers) != Ok(None) {
+        return Ok(false);
+    }
+    let mut owners = alloc::vec::Vec::new();
+    owners
+        .try_reserve_exact(5)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for deadline in [20, 10, 10, 0, u64::MAX] {
+        let callback = Box::try_new(Noop).map_err(|_| SystemError::ENOMEM)?;
+        let timer = Timer::try_new(callback, deadline)?;
+        let node = PreparedNode::try_new(timer.queue_key(), timer.clone())
+            .map_err(|_| SystemError::ENOMEM)?;
+        timers.lock_irqsave().insert_prepared(node);
+        owners.push(timer);
+    }
+    if first_expire_in(&timers) != Ok(Some(0)) {
+        return Ok(false);
+    }
+    {
+        let mut queue = timers.lock_irqsave();
+        if first_expire_in(&timers) != Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            || !pop_expired(&mut queue, 0).is_some_and(|timer| Arc::ptr_eq(&timer, &owners[3]))
+            || pop_expired(&mut queue, 9).is_some()
+        {
+            return Ok(false);
+        }
+        // Cancellation exposes the other timer at the same deadline.
+        queue.remove(&owners[1].queue_key());
+    }
+    if first_expire_in(&timers) != Ok(Some(10)) {
+        return Ok(false);
+    }
+    {
+        let mut queue = timers.lock_irqsave();
+        if !pop_expired(&mut queue, 10).is_some_and(|timer| Arc::ptr_eq(&timer, &owners[2]))
+            || pop_expired(&mut queue, 19).is_some()
+            || !pop_expired(&mut queue, 20).is_some_and(|timer| Arc::ptr_eq(&timer, &owners[0]))
+            || pop_expired(&mut queue, u64::MAX - 1).is_some()
+        {
+            return Ok(false);
+        }
+    }
+    if first_expire_in(&timers) != Ok(Some(u64::MAX)) {
+        return Ok(false);
+    }
+    let last = pop_expired(&mut timers.lock_irqsave(), u64::MAX);
+    Ok(last.is_some_and(|timer| Arc::ptr_eq(&timer, &owners[4]))
+        && first_expire_in(&timers) == Ok(None))
 }

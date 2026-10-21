@@ -98,11 +98,27 @@ fn run_selftests() -> String {
     let (kvm_passed, kvm_failed, kvm_body) = run_kvm_clock_allocator_selftests();
     #[cfg(not(target_arch = "x86_64"))]
     let (kvm_passed, kvm_failed, kvm_body) = (0, 0, String::new());
-    let passed = timekeeping_passed + clocksource_passed + rwlock_passed + kvm_passed;
-    let failed = timekeeping_failed + clocksource_failed + rwlock_failed + kvm_failed;
+    #[cfg(feature = "mm_selftest")]
+    let (timer_passed, timer_failed, timer_body) = {
+        let passed = crate::time::timer::queue_frontier_selftest() == Ok(true);
+        (
+            usize::from(passed),
+            usize::from(!passed),
+            format!(
+                "timer.queue_frontier={}\n",
+                if passed { "ok" } else { "fail" }
+            ),
+        )
+    };
+    #[cfg(not(feature = "mm_selftest"))]
+    let (timer_passed, timer_failed, timer_body) = (0, 0, String::new());
+    let passed =
+        timekeeping_passed + clocksource_passed + rwlock_passed + kvm_passed + timer_passed;
+    let failed =
+        timekeeping_failed + clocksource_failed + rwlock_failed + kvm_failed + timer_failed;
     let status = if failed == 0 { "ok" } else { "fail" };
     format!(
-        "status={status}\n{timekeeping_body}{clocksource_body}{rwlock_body}{kvm_body}summary_pass={passed}\nsummary_fail={failed}\n"
+        "status={status}\n{timekeeping_body}{clocksource_body}{rwlock_body}{kvm_body}{timer_body}summary_pass={passed}\nsummary_fail={failed}\n"
     )
 }
 

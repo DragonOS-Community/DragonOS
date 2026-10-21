@@ -11,11 +11,11 @@ use alloc::{
 };
 use system_error::SystemError;
 
-use crate::libs::{mutex::Mutex, resource_wait::ResourceMutexGuard};
+use crate::libs::resource_wait::{ResourceMutex, ResourceMutexGuard};
 
 use super::MemoryAccount;
 
-static ACCOUNTS: Mutex<Vec<Weak<MemoryAccount>>> = Mutex::new(Vec::new());
+static ACCOUNTS: ResourceMutex<Vec<Weak<MemoryAccount>>> = ResourceMutex::new(Vec::new());
 
 /// The initial root is the uncontended bootstrap exception; other callers must
 /// be in sleepable topology preparation, outside accounting/IRQ/resource locks.

@@ -527,7 +527,9 @@ impl From<RespStatus> for Result {
             RespStatus::OK => Ok(()),
             RespStatus::IO_ERR => Err(Error::IoError),
             RespStatus::UNSUPPORTED => Err(Error::Unsupported),
-            RespStatus::NOT_READY => Err(Error::NotReady),
+            // NOT_READY is only the initial response sentinel. Once a used
+            // entry has been consumed it is an invalid terminal response, not
+            // evidence that the descriptor is still owned by the device.
             _ => Err(Error::IoError),
         }
     }
@@ -716,6 +718,67 @@ mod tests {
         assert_eq!(&buffer[0..9], b"Test data");
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn used_response_sentinel_is_terminal_io_error() {
+        let mut config_space = BlkConfig {
+            capacity_low: Volatile::new(66),
+            capacity_high: Volatile::new(0),
+            size_max: Volatile::new(0),
+            seg_max: Volatile::new(0),
+            cylinders: Volatile::new(0),
+            heads: Volatile::new(0),
+            sectors: Volatile::new(0),
+            blk_size: Volatile::new(0),
+            physical_block_exp: Volatile::new(0),
+            alignment_offset: Volatile::new(0),
+            min_io_size: Volatile::new(0),
+            opt_io_size: Volatile::new(0),
+        };
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default()],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: QUEUE_SIZE.into(),
+            device_features: BlkFeature::RING_INDIRECT_DESC.bits(),
+            config_space: NonNull::from(&mut config_space),
+            state: state.clone(),
+        };
+        let mut blk = VirtIOBlk::<FakeHal, FakeTransport<BlkConfig>>::new(transport).unwrap();
+
+        let mut request = BlkReq::default();
+        let mut response = BlkResp::default();
+        let mut buffer = [0; SECTOR_SIZE];
+        for status in [RespStatus::NOT_READY, RespStatus::OK] {
+            let token =
+                unsafe { blk.read_blocks_nb(0, &mut request, &mut buffer, &mut response) }.unwrap();
+            state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |_| {
+                    let mut output = vec![0x5a; SECTOR_SIZE];
+                    output.extend_from_slice(BlkResp { status }.as_bytes());
+                    output
+                });
+            assert_eq!(blk.peek_used(), Some(token));
+            let result =
+                unsafe { blk.complete_read_blocks(token, &request, &mut buffer, &mut response) };
+            assert_eq!(
+                result,
+                if status == RespStatus::OK {
+                    Ok(())
+                } else {
+                    Err(Error::IoError)
+                }
+            );
+            // Even an invalid response consumed the used descriptor. It must
+            // never be treated as a still-owned NotReady request and retried.
+            assert_eq!(blk.peek_used(), None);
+            assert_eq!(buffer, [0x5a; SECTOR_SIZE]);
+        }
     }
 
     #[test]

@@ -7,8 +7,8 @@ use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     sync::atomic::{
-        AtomicUsize,
-        Ordering::{AcqRel, Acquire, Relaxed, Release},
+        fence, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
     },
 };
 
@@ -130,6 +130,13 @@ impl<T: ?Sized> RwSem<T> {
 
     fn wake_waiters(&self) {
         if self.resource_wait {
+            // Pair the released lock/preference state with the waiter's
+            // register -> SeqCst fence -> final predicate check. Neither side
+            // may miss both the waiter count and the newly available resource.
+            fence(SeqCst);
+            if self.waiters.load(Acquire) == 0 {
+                return;
+            }
             super::resource_wait::notify_resource_all(self.resource_key());
         } else {
             self.queue.wake_all();

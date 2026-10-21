@@ -11,7 +11,7 @@ use alloc::{
 use core::arch::asm;
 use core::{
     hash::{Hash, Hasher},
-    intrinsics::{likely, unlikely},
+    intrinsics::unlikely,
     mem,
     ops::{Deref, DerefMut},
 };
@@ -25,6 +25,7 @@ use crate::{
     libs::{
         mutex::Mutex,
         resource_wait::ResourceMutexGuard,
+        spinlock::SpinLock,
         wait_queue::{Waiter, Waker},
     },
     mm::{
@@ -47,6 +48,10 @@ use super::constant::*;
 #[path = "wake_selftest.rs"]
 mod selftest;
 
+#[cfg(feature = "mm_selftest")]
+#[path = "registration_selftest.rs"]
+mod registration_selftest;
+
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
@@ -58,16 +63,22 @@ impl FutexData {
         unsafe { ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data) }
     }
 
+    fn remove_empty_locked(
+        map: &mut HashMap<FutexKey, FutexHashBucket>,
+        key: &FutexKey,
+    ) -> Option<FutexHashBucket> {
+        if map.get(key).is_some_and(FutexHashBucket::is_empty) {
+            map.remove(key)
+        } else {
+            None
+        }
+    }
+
     pub fn try_remove(key: &FutexKey) -> Option<FutexHashBucket> {
         unsafe {
             let mut guard = ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data);
-            if let Some(futex) = guard.get(key) {
-                if futex.chain.is_empty() && futex.pi_waiters.is_empty() && futex.pi_owner == 0 {
-                    return guard.remove(key);
-                }
-            }
+            return Self::remove_empty_locked(&mut guard, key);
         }
-        None
     }
 }
 
@@ -91,14 +102,8 @@ impl FutexHashBucket {
         }
     }
 
-    /// ## 判断是否在bucket里
-    #[allow(dead_code)]
-    pub fn contains(&self, futex_q: &FutexObj) -> bool {
-        self.chain
-            .iter()
-            .filter(|x| Arc::ptr_eq(&x.waker, &futex_q.waker) && x.key == futex_q.key)
-            .count()
-            != 0
+    fn is_empty(&self) -> bool {
+        self.chain.is_empty() && self.pi_waiters.is_empty() && self.pi_owner == 0
     }
 
     #[inline(always)]
@@ -119,7 +124,8 @@ impl FutexHashBucket {
         // Leave nonmatching nodes in place: pop/push would allocate a fresh
         // LinkedList node on this wake-only path.
         let mut matching = self.chain.extract_if(|waiter| {
-            waiter.key == key && bitset.is_none_or(|mask| waiter.bitset & mask != 0)
+            let matches = *waiter.key.lock() == key;
+            matches && bitset.is_none_or(|mask| waiter.bitset & mask != 0)
         });
         while count < nr_wake {
             let Some(waiter) = matching.next() else { break };
@@ -147,7 +153,8 @@ impl FutexHashBucket {
 #[derive(Debug)]
 pub struct FutexObj {
     pub(super) waker: Arc<Waker>,
-    pub(super) key: FutexKey,
+    // The map lock precedes this lock. Requeue updates the cancellation location.
+    pub(super) key: SpinLock<FutexKey>,
     pub(super) bitset: u32,
     pub(super) tid: u32,
     // TODO: 优先级继承
@@ -352,56 +359,59 @@ impl Futex {
             return Err(SystemError::EINVAL);
         }
 
-        // 获取全局hash表的key值
-        let key = Self::get_futex_key(
-            uaddr,
-            flags.contains(FutexFlag::FLAGS_SHARED),
-            FutexAccess::FutexRead,
-        )?;
-
-        let mut futex_map_guard = FutexData::futex_map();
-        let bucket = futex_map_guard.get_mut(&key);
-        let bucket_mut = match bucket {
-            Some(bucket) => bucket,
-            None => {
-                let bucket = FutexHashBucket::new();
-                futex_map_guard.insert(key.clone(), bucket);
-                futex_map_guard.get_mut(&key).unwrap()
+        // Capture the expiry once: refault retries consume the original budget.
+        // Keep validation/error precedence below the locked value comparison.
+        let timer_deadline = abs_time
+            .filter(PosixTimeSpec::is_valid_timeout)
+            .map(|time| next_n_us_timer_jiffies(time.to_ktime_ns().div_ceil(1000)));
+        let (key, mut futex_map_guard, uval) = loop {
+            let key = Self::get_futex_key(
+                uaddr,
+                flags.contains(FutexFlag::FLAGS_SHARED),
+                FutexAccess::FutexRead,
+            )?;
+            let map = FutexData::futex_map();
+            match Self::read_user_u32_nofault(uaddr) {
+                Ok(value) => break (key, map, value),
+                Err(SystemError::EFAULT) => {
+                    drop(map);
+                    // Faulting and charge recovery must never hold the map lock.
+                    // This value only faults the page in; retry both identity and
+                    // the final comparison after reacquiring the map lock.
+                    let reader = UserBufferReader::new(
+                        uaddr.as_ptr::<u32>(),
+                        core::mem::size_of::<u32>(),
+                        true,
+                    )?;
+                    let _ = reader.read_one_from_user::<u32>(0)?;
+                }
+                Err(error) => return Err(error),
             }
         };
-
-        // 使用UserBuffer读取futex
-        let user_reader =
-            UserBufferReader::new(uaddr.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
-
-        // 从用户空间读取到futex的val
-        let mut uval = 0;
-
-        // 读取
-        // 这里只尝试一种方式去读取用户空间，与linux不太一致
-        // 对于linux，如果bucket被锁住时读取失败，将会将bucket解锁后重新读取
-        user_reader.copy_one_from_user::<u32>(&mut uval, 0)?;
 
         // 不满足wait条件，返回错误
         if uval != val {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let (waiter, waker) = Waiter::new_pair();
-        // 创建超时计时器任务
-        let mut timer = None;
+        // Validate before creating either a waiter or a bucket.
         if let Some(time) = abs_time {
             if !time.is_valid_timeout() {
                 return Err(SystemError::EINVAL);
             }
-            let total_us = time.to_ktime_ns().div_ceil(1000);
-
-            // 如果超时时间为0，直接返回ETIMEDOUT
-            if total_us == 0 {
+            if timer_deadline.is_some_and(|deadline| deadline <= crate::time::timer::clock()) {
                 return Err(SystemError::ETIMEDOUT);
             }
-
-            let jiffies = next_n_us_timer_jiffies(total_us);
+        }
+        if !futex_map_guard.contains_key(&key) {
+            futex_map_guard
+                .try_reserve(1)
+                .map_err(|_| SystemError::ENOMEM)?;
+        }
+        let (waiter, waker) = Waiter::new_pair();
+        // 创建超时计时器任务
+        let mut timer = None;
+        if let Some(jiffies) = timer_deadline {
             let wake_up = Timer::new(
                 Box::new(WakerTimer {
                     waker: waker.clone(),
@@ -413,11 +423,14 @@ impl Futex {
 
         let futex_q = Arc::new(FutexObj {
             waker: waker.clone(),
-            key: key.clone(),
+            key: SpinLock::new(key.clone()),
             bitset,
             tid: 0,
         });
-        bucket_mut.enqueue(futex_q.clone());
+        futex_map_guard
+            .entry(key.clone())
+            .or_insert_with(FutexHashBucket::new)
+            .enqueue(futex_q.clone());
 
         // 在入队后激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
         if let Some(ref t) = timer {
@@ -441,12 +454,15 @@ impl Futex {
         let is_timeout = timer.as_ref().is_some_and(|t| t.timeout());
 
         // 从队列中移除自身（如果仍在队列）
+        let current_key = futex_q.key.lock().clone();
         let in_queue = futex_map_guard
-            .get_mut(&key)
+            .get_mut(&current_key)
             .map(|bucket| bucket.remove_by_waker(&waker))
             .unwrap_or(false);
+        let retired = FutexData::remove_empty_locked(&mut futex_map_guard, &current_key);
 
         drop(futex_map_guard);
+        drop(retired);
 
         // 取消定时器
         if let Some(timer) = timer {
@@ -498,9 +514,9 @@ impl Futex {
             return Ok(0);
         };
 
+        let retired = FutexData::remove_empty_locked(&mut binding, &key);
         drop(binding);
-
-        FutexData::try_remove(&key);
+        drop(retired);
 
         Ok(count)
     }
@@ -529,6 +545,11 @@ impl Futex {
         selftest::run()
     }
 
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn failed_registration_selftest() -> Result<bool, SystemError> {
+        registration_selftest::run()
+    }
+
     /// ### 唤醒制定uaddr1上的最多nr_wake个进程，然后将uaddr1最多nr_requeue个进程移动到uaddr2绑定的futex上
     pub fn futex_requeue(
         uaddr1: VirtAddr,
@@ -548,62 +569,87 @@ impl Futex {
             return Err(SystemError::ENOSYS);
         }
 
-        let key1 = Self::get_futex_key(
-            uaddr1,
-            flags.contains(FutexFlag::FLAGS_SHARED),
-            FutexAccess::FutexRead,
-        )?;
-        let key2 = Self::get_futex_key(uaddr2, flags.contains(FutexFlag::FLAGS_SHARED), {
-            match requeue_pi {
-                true => FutexAccess::FutexWrite,
-                false => FutexAccess::FutexRead,
-            }
-        })?;
-
-        if requeue_pi && key1 == key2 {
-            return Err(SystemError::EINVAL);
-        }
-
-        if likely(cmpval.is_some()) {
-            let uval_reader =
-                UserBufferReader::new(uaddr1.as_ptr::<u32>(), core::mem::size_of::<u32>(), true)?;
-            let curval = uval_reader.read_one_from_user::<u32>(0)?;
-
-            // 判断是否满足条件
-            if curval != cmpval.unwrap() {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-        }
-
-        let mut futex_data_guard = FutexData::futex_map();
-        if !requeue_pi {
-            // 唤醒nr_wake个进程
-            let bucket_1_mut = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
-            let ret = bucket_1_mut.wake_up(key1.clone(), None, nr_wake as u32)?;
-            // 将bucket1中最多nr_requeue个任务转移到bucket2
-            for _ in 0..nr_requeue {
-                let bucket_1_mut = futex_data_guard.get_mut(&key1).ok_or(SystemError::EINVAL)?;
-                let futex_q = bucket_1_mut.chain.pop_front();
-                match futex_q {
-                    Some(futex_q) => {
-                        let bucket_2_mut =
-                            futex_data_guard.get_mut(&key2).ok_or(SystemError::EINVAL)?;
-                        bucket_2_mut.chain.push_back(futex_q);
+        let (key1, key2, mut map) = loop {
+            let key1 = Self::get_futex_key(
+                uaddr1,
+                flags.contains(FutexFlag::FLAGS_SHARED),
+                FutexAccess::FutexRead,
+            )?;
+            let key2 = Self::get_futex_key(
+                uaddr2,
+                flags.contains(FutexFlag::FLAGS_SHARED),
+                FutexAccess::FutexRead,
+            )?;
+            let map = FutexData::futex_map();
+            if let Some(expected) = cmpval {
+                match Self::read_user_u32_nofault(uaddr1) {
+                    Ok(value) if value != expected => {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                     }
-                    None => {
-                        break;
+                    Ok(_) => {}
+                    Err(SystemError::EFAULT) => {
+                        drop(map);
+                        let reader = UserBufferReader::new(
+                            uaddr1.as_ptr::<u32>(),
+                            core::mem::size_of::<u32>(),
+                            true,
+                        )?;
+                        let _ = reader.read_one_from_user::<u32>(0)?;
+                        // Both shared mappings may have changed during fault-in.
+                        continue;
                     }
+                    Err(error) => return Err(error),
                 }
             }
-
-            return Ok(ret);
-        } else {
-            // 暂时不支持优先级继承
-            todo!()
-        }
+            break (key1, key2, map);
+        };
+        let (count, retired) = Self::requeue_existing(
+            &mut map,
+            &key1,
+            &key2,
+            nr_wake as usize,
+            nr_requeue as usize,
+        )?;
+        drop(map);
+        drop(retired);
+        Ok(count)
     }
 
-    /// ### 唤醒futex上的进程的同时进行一些操作
+    /// Transfer existing queue nodes under the same map lock as registration.
+    /// The caller retires the returned empty source after releasing that lock.
+    fn requeue_existing(
+        map: &mut HashMap<FutexKey, FutexHashBucket>,
+        key1: &FutexKey,
+        key2: &FutexKey,
+        nr_wake: usize,
+        nr_requeue: usize,
+    ) -> Result<(usize, Option<FutexHashBucket>), SystemError> {
+        let Some(source) = map.get(key1) else {
+            return Ok((0, None));
+        };
+        // Reserve before waking anyone: ENOMEM must leave all waiters intact.
+        let may_move = nr_requeue > 0 && source.chain.len() > nr_wake;
+        if key1 != key2 && may_move && !map.contains_key(key2) {
+            map.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        }
+        let source = map.get_mut(key1).unwrap();
+        let woken = source.wake_up(key1.clone(), None, nr_wake as u32)?;
+        let count = source.chain.len().min(nr_requeue);
+        if key1 != key2 && count > 0 {
+            let rest = source.chain.split_off(count);
+            let mut moved = mem::replace(&mut source.chain, rest);
+            for waiter in &moved {
+                *waiter.key.lock() = key2.clone();
+            }
+            map.entry(key2.clone())
+                .or_insert_with(FutexHashBucket::new)
+                .chain
+                .append(&mut moved);
+        }
+        let retired = FutexData::remove_empty_locked(map, key1);
+        Ok((woken + count, retired))
+    }
+
     pub fn futex_wake_op(
         uaddr1: VirtAddr,
         flags: FutexFlag,
@@ -649,10 +695,14 @@ impl Futex {
             if op_ret {
                 // If uaddr2 has no associated waiters, skip the wake instead of returning EINVAL per Linux behavior.
                 if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
-                    wake_count += bucket2.wake_up(key2, None, nr_wake2)?;
+                    wake_count += bucket2.wake_up(key2.clone(), None, nr_wake2)?;
                 }
             }
 
+            let retired1 = FutexData::remove_empty_locked(&mut futex_data_guard, &key1);
+            let retired2 = FutexData::remove_empty_locked(&mut futex_data_guard, &key2);
+            drop(futex_data_guard);
+            drop((retired1, retired2));
             return Ok(wake_count);
         }
     }
@@ -715,9 +765,9 @@ impl Futex {
         }
         if let Some(file) = file.filter(|_| !anonymous_pages) {
             // 共享文件映射：使用 inode 唯一标识 + 文件页偏移
-            let md = file.metadata()?;
-            let dev = md.dev_id as u64;
-            let ino = md.inode_id.into() as u64;
+            let (dev, ino) = file.mapped_file_identity();
+            let dev = dev as u64;
+            let ino = ino.into() as u64;
             let base_pgoff = vma_guard.backing_page_offset().unwrap_or(0) as u64;
             let shared = SharedKey {
                 kind: SharedKeyKind::File { dev, ino },
@@ -839,6 +889,109 @@ impl Futex {
 
         let _pagefault_guard = PageFaultDisabledGuard::new();
         unsafe { Self::arch_futex_atomic_op_inuser_nofault(op, oparg, uaddr.as_ptr::<u32>()) }
+    }
+
+    /// One aligned value load, with no prefault or sleeping fault under map.
+    fn read_user_u32_nofault(uaddr: VirtAddr) -> Result<u32, SystemError> {
+        if uaddr.data() & (core::mem::align_of::<u32>() - 1) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        access_ok(uaddr, core::mem::size_of::<u32>()).map_err(|_| SystemError::EFAULT)?;
+        let _pagefault_guard = PageFaultDisabledGuard::new();
+        unsafe { Self::arch_read_user_u32_nofault(uaddr.as_ptr::<u32>()) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn arch_read_user_u32_nofault(uaddr: *const u32) -> Result<u32, SystemError> {
+        let mut value = 0usize;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "mov {value:e}, dword ptr [{ptr}]",
+            "jmp 3f",
+            "4:",
+            "mov {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = inout(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(value as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe fn arch_read_user_u32_nofault(uaddr: *const u32) -> Result<u32, SystemError> {
+        let mut value = 0usize;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "lw {value}, 0({ptr})",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = inout(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(value as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe fn arch_read_user_u32_nofault(uaddr: *const u32) -> Result<u32, SystemError> {
+        let mut value = 0usize;
+        let mut fault = 0usize;
+        asm!(
+            "2:",
+            "ld.wu {value}, {ptr}, 0",
+            "b 3f",
+            "4:",
+            "ori {fault}, $zero, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".dword 2b - .",
+            ".dword 4b - . + 8",
+            ".popsection",
+            ptr = in(reg) uaddr,
+            value = inout(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+        if fault == 0 {
+            Ok(value as u32)
+        } else {
+            Err(SystemError::EFAULT)
+        }
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    )))]
+    unsafe fn arch_read_user_u32_nofault(_uaddr: *const u32) -> Result<u32, SystemError> {
+        Err(SystemError::ENOSYS)
     }
 
     fn futex_cmpxchg_user(uaddr: VirtAddr, expected: u32, new: u32) -> Result<u32, SystemError> {

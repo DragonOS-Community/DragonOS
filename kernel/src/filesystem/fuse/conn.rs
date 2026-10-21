@@ -9,6 +9,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
+use hashbrown::HashMap;
 use system_error::SystemError;
 
 use crate::filesystem::page_cache::{
@@ -795,7 +796,7 @@ struct FuseConnInner {
     teardown_started: bool,
     hiprio_pending: VecDeque<Arc<FuseRequest>>,
     pending: VecDeque<Arc<FuseRequest>>,
-    processing: BTreeMap<u64, Arc<FusePendingState>>,
+    processing: HashMap<u64, Arc<FusePendingState>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,6 +838,12 @@ pub struct FuseConn {
 }
 
 impl FuseConn {
+    /// Every acquisition must use this guard so contended lifecycle waits
+    /// can sleep without allocating and every unlock notifies them.
+    fn lock_inner(&self) -> resource_wait::ResourceMutexGuard<'_, FuseConnInner> {
+        resource_wait::ResourceMutexGuard::lock(&self.inner)
+    }
+
     const FUSE_INT_REQ_BIT: u64 = 1;
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
@@ -956,7 +963,7 @@ impl FuseConn {
                 teardown_started: false,
                 hiprio_pending: VecDeque::new(),
                 pending: VecDeque::new(),
-                processing: BTreeMap::new(),
+                processing: HashMap::new(),
             }),
             // Use non-zero unique, keep even IDs for "ordinary" requests as Linux does.
             next_unique: AtomicU64::new(2),
@@ -1220,7 +1227,7 @@ impl FuseConn {
 
     pub(crate) fn dax_map_alignment(&self) -> Option<u16> {
         self.dax_allocator.as_ref()?;
-        Some(self.inner.lock().init.map_alignment)
+        Some(self.lock_inner().init.map_alignment)
     }
 
     fn dax_map_alignment_valid(enabled_flags: u64, map_alignment: u16) -> bool {
@@ -1257,11 +1264,11 @@ impl FuseConn {
 
     #[allow(dead_code)]
     pub fn is_mounted(&self) -> bool {
-        self.inner.lock().mounted
+        self.lock_inner().mounted
     }
 
     pub fn is_connected(&self) -> bool {
-        self.inner.lock().connected
+        self.lock_inner().connected
     }
 
     pub(crate) fn sample_attr_epoch(&self) -> u64 {
@@ -1275,20 +1282,20 @@ impl FuseConn {
     }
 
     pub fn has_pending_requests(&self) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         !g.hiprio_pending.is_empty() || !g.pending.is_empty()
     }
 
     pub fn has_pending_high_priority_requests(&self) -> bool {
-        !self.inner.lock().hiprio_pending.is_empty()
+        !self.lock_inner().hiprio_pending.is_empty()
     }
 
     pub fn has_pending_ordinary_requests(&self) -> bool {
-        !self.inner.lock().pending.is_empty()
+        !self.lock_inner().pending.is_empty()
     }
 
     pub fn has_processing_request(&self, unique: u64) -> bool {
-        self.inner.lock().processing.contains_key(&unique)
+        self.lock_inner().processing.contains_key(&unique)
     }
 
     pub fn interrupt_target_unique(unique: u64) -> u64 {
@@ -1327,7 +1334,7 @@ impl FuseConn {
     }
 
     pub fn mark_mounted(&self) -> Result<(), SystemError> {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         if !g.connected {
             return Err(SystemError::ENOTCONN);
         }
@@ -1342,12 +1349,12 @@ impl FuseConn {
     /// Roll back a mount reservation when mount setup fails before
     /// the filesystem is actually attached to the mount tree.
     pub fn rollback_mount_setup(&self) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         g.mounted = false;
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.inner.lock().initialized
+        self.lock_inner().initialized
     }
 
     pub fn configure_mount(
@@ -1357,7 +1364,7 @@ impl FuseConn {
         allow_other: bool,
         max_read: u32,
     ) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         g.owner_uid = owner_uid;
         g.owner_gid = owner_gid;
         g.allow_other = allow_other;
@@ -1365,12 +1372,12 @@ impl FuseConn {
     }
 
     pub(crate) fn has_init_flag(&self, flag: u64) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         (g.init.flags & flag) != 0
     }
 
     pub fn should_skip_open(&self, opcode: u32) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         match opcode {
             super::protocol::FUSE_OPEN => g.no_open,
             super::protocol::FUSE_OPENDIR => g.no_opendir,
@@ -1387,7 +1394,7 @@ impl FuseConn {
     }
 
     pub fn mark_no_open(&self, opcode: u32) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         match opcode {
             super::protocol::FUSE_OPEN => g.no_open = true,
             super::protocol::FUSE_OPENDIR => g.no_opendir = true,
@@ -1396,48 +1403,48 @@ impl FuseConn {
     }
 
     pub fn no_create(&self) -> bool {
-        self.inner.lock().no_create
+        self.lock_inner().no_create
     }
 
     pub fn mark_no_create(&self) {
-        self.inner.lock().no_create = true;
+        self.lock_inner().no_create = true;
     }
 
     pub fn use_readdirplus(&self) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         !g.no_readdirplus && (g.init.flags & FUSE_DO_READDIRPLUS) != 0
     }
 
     pub fn readdirplus_auto(&self) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         !g.no_readdirplus
             && (g.init.flags & (FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO))
                 == (FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO)
     }
 
     pub fn disable_readdirplus(&self) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         g.no_readdirplus = true;
     }
 
     pub fn no_fallocate(&self) -> bool {
-        self.inner.lock().no_fallocate
+        self.lock_inner().no_fallocate
     }
 
     pub fn mark_no_fallocate(&self) {
-        self.inner.lock().no_fallocate = true;
+        self.lock_inner().no_fallocate = true;
     }
 
     pub fn no_flush(&self) -> bool {
-        self.inner.lock().no_flush
+        self.lock_inner().no_flush
     }
 
     pub fn mark_no_flush(&self) {
-        self.inner.lock().no_flush = true;
+        self.lock_inner().no_flush = true;
     }
 
     pub fn no_fsync(&self, opcode: u32) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         match opcode {
             FUSE_FSYNC => g.no_fsync,
             FUSE_FSYNCDIR => g.no_fsyncdir,
@@ -1446,7 +1453,7 @@ impl FuseConn {
     }
 
     pub fn mark_no_fsync(&self, opcode: u32) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         match opcode {
             FUSE_FSYNC => g.no_fsync = true,
             FUSE_FSYNCDIR => g.no_fsyncdir = true,
@@ -1455,7 +1462,7 @@ impl FuseConn {
     }
 
     pub fn no_xattr(&self, opcode: u32) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         match opcode {
             FUSE_GETXATTR => g.no_getxattr,
             FUSE_SETXATTR => g.no_setxattr,
@@ -1466,7 +1473,7 @@ impl FuseConn {
     }
 
     pub fn mark_no_xattr(&self, opcode: u32) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         match opcode {
             FUSE_GETXATTR => g.no_getxattr = true,
             FUSE_SETXATTR => g.no_setxattr = true,
@@ -1477,7 +1484,7 @@ impl FuseConn {
     }
 
     fn allow_current_process(&self, cred: &crate::process::cred::Cred) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
 
         if !g.mounted {
             return true;
@@ -1512,7 +1519,7 @@ impl FuseConn {
 
     fn wait_initialized(&self) -> Result<(), SystemError> {
         self.init_wait.wait_until_killable(|| {
-            let g = self.inner.lock();
+            let g = self.lock_inner();
             if !g.connected {
                 Some(Err(SystemError::ENOTCONN))
             } else {
@@ -1546,32 +1553,33 @@ impl FuseConn {
     fn disconnect_requests(&self) {
         self.begin_dax_quiesce();
         self.background.disconnect();
-        let (processing, pending_noreply_count): (Vec<Arc<FusePendingState>>, usize) = {
-            let mut g = self.inner.lock();
+        let (processing, pending, hiprio_pending, pending_noreply_count) = {
+            let mut g = self.lock_inner();
             if !g.connected {
-                (Vec::new(), 0)
-            } else {
-                g.connected = false;
-                g.mounted = false;
-                // Close allocator acquisition before releasing the connection lock,
-                // so no observer can see a disconnected connection while DAX get()
-                // still accepts a new reference.
-                self.begin_shutdown_dax_allocator();
-                let pending_noreply_count = g
-                    .pending
-                    .iter()
-                    .chain(g.hiprio_pending.iter())
-                    .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
-                    .count();
-                g.hiprio_pending.clear();
-                g.pending.clear();
-                let processing = g.processing.values().cloned().collect();
-                g.processing.clear();
-                (processing, pending_noreply_count)
+                return;
             }
+            g.connected = false;
+            g.mounted = false;
+            // Close allocator acquisition before releasing the connection lock.
+            self.begin_shutdown_dax_allocator();
+            let pending_noreply_count = g
+                .pending
+                .iter()
+                .chain(g.hiprio_pending.iter())
+                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
+                .count();
+            (
+                core::mem::take(&mut g.processing),
+                core::mem::take(&mut g.pending),
+                core::mem::take(&mut g.hiprio_pending),
+                pending_noreply_count,
+            )
         };
         stats::on_fuse_requests_aborted(processing.len() + pending_noreply_count);
-        for p in processing {
+        // Release queued bytes and complete complex DMA/page-cache owners only
+        // after releasing the connection lock, without a temporary allocation.
+        drop((pending, hiprio_pending));
+        for (_, p) in processing {
             p.complete_disconnected(SystemError::ENOTCONN);
         }
         self.read_wait.wakeup(None);
@@ -1634,25 +1642,18 @@ impl FuseConn {
     pub fn on_umount(&self) {
         self.begin_dax_quiesce();
         self.background.disconnect();
-        let processing: Vec<Arc<FusePendingState>>;
-        let dropped_processing: Vec<Arc<FusePendingState>>;
-        let should_destroy: bool;
-        let dropped_pending: usize;
-        {
-            let mut g = self.inner.lock();
+        let (processing, should_destroy, dropped_pending, queued_reply_count) = {
+            let mut g = self.lock_inner();
             if g.teardown_started {
                 return;
             }
             g.teardown_started = true;
-            should_destroy = g.connected && g.initialized;
+            let should_destroy = g.connected && g.initialized;
             g.mounted = false;
-            // Filesystem teardown queues accumulated FORGET requests before
-            // the connection enters on_umount().  Preserve those no-reply
-            // requests so the daemon can release lookup references before
-            // it receives DESTROY; drop ordinary requests that can no longer
-            // complete after unmount.
+            // Keep FORGET in the original queues: neither order nor reserved
+            // capacity changes before the later DESTROY publication.
             let mut dropped_noreply = 0usize;
-            let mut dropped_reply_unique = Vec::new();
+            let mut queued_reply_count = 0usize;
             for req in g.hiprio_pending.iter().chain(g.pending.iter()) {
                 if req.opcode == FUSE_FORGET {
                     continue;
@@ -1660,26 +1661,21 @@ impl FuseConn {
                 if matches!(req.opcode, FUSE_DESTROY | FUSE_INTERRUPT) {
                     dropped_noreply += 1;
                 } else if g.processing.contains_key(&req.unique) {
-                    dropped_reply_unique.push(req.unique);
+                    queued_reply_count += 1;
                 }
             }
             g.hiprio_pending.retain(|req| req.opcode == FUSE_FORGET);
             g.pending.retain(|req| req.opcode == FUSE_FORGET);
-            dropped_processing = dropped_reply_unique
-                .into_iter()
-                .filter_map(|unique| g.processing.remove(&unique))
-                .collect();
-            dropped_pending = dropped_noreply + dropped_processing.len();
-            processing = g.processing.values().cloned().collect();
-            g.processing.clear();
-        }
-
+            (
+                core::mem::take(&mut g.processing),
+                should_destroy,
+                dropped_noreply + queued_reply_count,
+                queued_reply_count,
+            )
+        };
         stats::on_fuse_requests_dropped_umount(dropped_pending);
-        stats::on_fuse_requests_aborted(processing.len());
-        for p in processing {
-            p.complete(Err(SystemError::ENOTCONN));
-        }
-        for p in dropped_processing {
+        stats::on_fuse_requests_aborted(processing.len().saturating_sub(queued_reply_count));
+        for (_, p) in processing {
             p.complete(Err(SystemError::ENOTCONN));
         }
         self.wait_dax_drained();
@@ -1711,7 +1707,7 @@ impl FuseConn {
     /// request from being published after the cancellation snapshot.
     pub(crate) fn cancel_page_cache_reads(&self, domain: &Arc<PageCacheWritebackDomain>) {
         let (pending_reads, queued_count) = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             let read_uniques = inner
                 .processing
                 .iter()
@@ -1774,7 +1770,7 @@ impl FuseConn {
         if max_pages_limit == 0 {
             return Err(SystemError::EINVAL);
         }
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         if g.initialized {
             return Err(SystemError::EBUSY);
         }
@@ -1817,7 +1813,7 @@ impl FuseConn {
 
     #[allow(dead_code)]
     pub fn negotiated_state(&self) -> (u32, u32, u32, u32, u16, u64) {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         (
             g.init.minor,
             g.init.max_readahead,
@@ -1829,17 +1825,17 @@ impl FuseConn {
     }
 
     pub fn max_write(&self) -> usize {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         core::cmp::max(4096usize, g.init.max_write as usize)
     }
 
     pub fn max_read(&self) -> usize {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize)
     }
 
     pub fn max_pages(&self) -> usize {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         core::cmp::max(1, g.init.max_pages as usize)
     }
 
@@ -1853,7 +1849,7 @@ impl FuseConn {
     }
 
     pub fn max_readahead_pages(&self) -> usize {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         let bytes = if g.init.max_readahead == 0 {
             Self::DEFAULT_MAX_READAHEAD
         } else {
@@ -1865,7 +1861,7 @@ impl FuseConn {
     /// Snapshot immutable FUSE_INIT read capabilities under one connection
     /// lock acquisition for use by an open file's cached-I/O hot path.
     pub(crate) fn open_io_config(&self) -> super::private_data::FuseOpenIoConfig {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         let max_readahead = if g.init.max_readahead == 0 {
             Self::DEFAULT_MAX_READAHEAD
         } else {
@@ -1886,7 +1882,7 @@ impl FuseConn {
         speculative: bool,
     ) -> Result<Option<FuseBackgroundCredit>, SystemError> {
         {
-            let inner = self.inner.lock();
+            let inner = self.lock_inner();
             if !inner.connected || inner.teardown_started {
                 return Err(SystemError::ENOTCONN);
             }
@@ -1909,6 +1905,7 @@ mod tests {
     use alloc::vec;
     use core::{mem::size_of, sync::atomic::Ordering};
 
+    use hashbrown::HashMap;
     use system_error::SystemError;
 
     use crate::arch::{MMArch, MemoryManagementArch};
@@ -1978,7 +1975,7 @@ mod tests {
     }
 
     fn set_minor(conn: &FuseConn, minor: u32) {
-        conn.inner.lock().init.minor = minor;
+        conn.lock_inner().init.minor = minor;
         conn.reply_layout_minor.store(minor, Ordering::Release);
     }
 
@@ -1986,14 +1983,14 @@ mod tests {
     fn effective_read_payload_limit_applies_byte_and_page_caps() {
         let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
         {
-            let mut inner = conn.inner.lock();
+            let mut inner = conn.lock_inner();
             inner.max_read = 64 * 1024;
             inner.init.max_pages = 4;
         }
         assert_eq!(conn.effective_read_payload_limit(), 4 * MMArch::PAGE_SIZE);
 
         {
-            let mut inner = conn.inner.lock();
+            let mut inner = conn.lock_inner();
             inner.max_read = 8 * 1024;
             inner.init.max_pages = 64;
         }
@@ -2016,7 +2013,7 @@ mod tests {
             DaxMountMode::Never,
         );
         assert!(never.dax_allocator().is_none());
-        assert_eq!(never.inner.lock().init_flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_eq!(never.lock_inner().init_flags & FUSE_MAP_ALIGNMENT, 0);
 
         let always = FuseConn::new_for_virtiofs_with_dax(
             8192,
@@ -2025,8 +2022,8 @@ mod tests {
             DaxMountMode::Always,
         );
         assert!(always.dax_allocator().is_some());
-        assert_ne!(always.inner.lock().init_flags & FUSE_MAP_ALIGNMENT, 0);
-        assert_eq!(always.inner.lock().init_flags & FUSE_HAS_INODE_DAX, 0);
+        assert_ne!(always.lock_inner().init_flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_eq!(always.lock_inner().init_flags & FUSE_HAS_INODE_DAX, 0);
 
         let inode = FuseConn::new_for_virtiofs_with_dax(
             8192,
@@ -2034,17 +2031,17 @@ mod tests {
             Some(DAX_RANGE_SIZE),
             DaxMountMode::Inode,
         );
-        let flags = inode.inner.lock().init_flags;
+        let flags = inode.lock_inner().init_flags;
         assert_ne!(flags & FUSE_MAP_ALIGNMENT, 0);
         assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
 
         let no_window = FuseConn::new_for_virtiofs_with_dax(8192, 8192, None, DaxMountMode::Always);
         assert!(no_window.dax_allocator().is_none());
-        assert_eq!(no_window.inner.lock().init_flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_eq!(no_window.lock_inner().init_flags & FUSE_MAP_ALIGNMENT, 0);
 
         let inode_without_window =
             FuseConn::new_for_virtiofs_with_dax(8192, 8192, None, DaxMountMode::Inode);
-        let flags = inode_without_window.inner.lock().init_flags;
+        let flags = inode_without_window.lock_inner().init_flags;
         assert_eq!(flags & FUSE_MAP_ALIGNMENT, 0);
         assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
     }
@@ -2156,7 +2153,7 @@ mod tests {
     fn teardown_gate_is_idempotent_and_rejects_late_business_requests() {
         let conn = FuseConn::new_for_virtiofs(8192, 8192);
         {
-            let mut g = conn.inner.lock();
+            let mut g = conn.lock_inner();
             g.initialized = true;
             g.mounted = true;
         }
@@ -2164,7 +2161,7 @@ mod tests {
         conn.on_umount();
         conn.on_umount();
         {
-            let g = conn.inner.lock();
+            let g = conn.lock_inner();
             assert!(g.teardown_started);
             assert_eq!(
                 g.pending
@@ -2233,4 +2230,9 @@ mod tests {
         assert!(pending.complete_read_pages_direct(1));
         assert_eq!(pending.wait_complete(), Err(SystemError::EIO));
     }
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_fuse_birth_selftest() -> Result<bool, SystemError> {
+    request::heap_denied_birth_selftest()
 }

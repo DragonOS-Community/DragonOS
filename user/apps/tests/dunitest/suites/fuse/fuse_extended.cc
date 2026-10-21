@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <linux/falloc.h>
+#include <linux/futex.h>
 #include <sys/ioctl.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
@@ -2863,7 +2864,9 @@ fail_no_umount:
 static int ext_test_open_release_flags_match_linux() {
     const char *mp = "/tmp/test_fuse_open_flags";
     int requested = O_RDWR | O_NOCTTY | O_TRUNC | O_APPEND | O_NONBLOCK;
-    uint32_t expected_open = (uint32_t)(requested & ~(O_CREAT | O_EXCL | O_NOCTTY));
+    int ofd_flags = -1;
+    uint32_t expected_open = 0;
+    const int persistent = O_ACCMODE | O_APPEND | O_NONBLOCK;
     int f = -1;
     if (ensure_dir(mp) != 0) {
         printf("[FAIL] ensure_dir(%s): %s (errno=%d)\n", mp, strerror(errno), errno);
@@ -2923,16 +2926,27 @@ static int ext_test_open_release_flags_match_linux() {
         printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
         goto fail;
     }
+    ofd_flags = fcntl(f, F_GETFL);
+    if (ofd_flags < 0 || (ofd_flags & persistent) != (requested & persistent)) {
+        printf("[FAIL] open OFD flags=0%o requested=0%o errno=%d\n", ofd_flags,
+               requested, errno);
+        goto fail;
+    }
+    // OPEN sees transient O_TRUNC before VFS post-open normalization; RELEASE
+    // sees the resulting OFD. Include environment-provided flags such as LARGEFILE.
+    expected_open = (uint32_t)((ofd_flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_CLOEXEC | O_TRUNC))
+                               | (requested & O_TRUNC));
     close(f);
+    f = -1;
 
     usleep(100 * 1000);
     if (last_open_flags != expected_open) {
         printf("[FAIL] open flags got=0%o expected=0%o\n", last_open_flags, expected_open);
         goto fail;
     }
-    if (last_release_flags != (uint32_t)requested) {
+    if (last_release_flags != (uint32_t)ofd_flags) {
         printf("[FAIL] release flags got=0%o expected=0%o\n", last_release_flags,
-               (uint32_t)requested);
+               (uint32_t)ofd_flags);
         goto fail;
     }
 
@@ -2947,6 +2961,7 @@ static int ext_test_open_release_flags_match_linux() {
     return 0;
 
 fail:
+    if (f >= 0) close(f);
     umount(mp);
 fail_no_umount:
     stop = 1;
@@ -2960,7 +2975,9 @@ static int ext_test_create_reuses_fuse_handle() {
     const char *mp = "/tmp/test_fuse_create_handle";
     const uint64_t create_fh = 0xcafe2019ULL;
     int requested = O_CREAT | O_RDWR | O_TRUNC | O_APPEND | O_NONBLOCK | O_NOCTTY | O_CLOEXEC;
-    uint32_t expected_create = (uint32_t)(requested & ~(O_NOCTTY | O_CLOEXEC));
+    uint32_t expected_create = 0;
+    int ofd_flags = -1;
+    const int persistent = O_ACCMODE | O_APPEND | O_NONBLOCK;
     int f = -1;
     if (ensure_dir(mp) != 0) return -1;
     int fd = open("/dev/fuse", O_RDWR);
@@ -3001,7 +3018,15 @@ static int ext_test_create_reuses_fuse_handle() {
     if (fuseg_wait_init(&init_done) != 0) goto fail;
     snprintf(path, sizeof(path), "%s/new.txt", mp);
     f = open(path, requested, 0644);
-    if (f < 0 || write(f, "x", 1) != 1) goto fail;
+    if (f < 0) goto fail;
+    ofd_flags = fcntl(f, F_GETFL);
+    if (ofd_flags < 0 || (ofd_flags & persistent) != (requested & persistent)
+        || fcntl(f, F_GETFD) != FD_CLOEXEC) goto fail;
+    // CREATE receives creation flags before post-open normalization. NOCTTY
+    // and the per-descriptor CLOEXEC flag never belong in its wire flags.
+    expected_create = (uint32_t)((ofd_flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_CLOEXEC | O_TRUNC))
+                                | (requested & (O_CREAT | O_EXCL | O_TRUNC)));
+    if (write(f, "x", 1) != 1) goto fail;
     close(f);
     f = -1;
     for (int i = 0; i < 200 && release_count < 1; i++) {
@@ -3184,7 +3209,8 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
     int requested = O_RDWR;
     int f = -1;
     int old_flags = -1;
-    uint32_t expected_open = (uint32_t)requested;
+    uint32_t expected_open = 0;
+    int updated_flags = -1;
     uint32_t expected_setfl = 0;
     char buf[8];
     if (ensure_dir(mp) != 0) {
@@ -3276,11 +3302,20 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
         printf("[FAIL] fcntl(F_GETFL): %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }
+    if ((old_flags & O_ACCMODE) != requested) goto fail;
+    expected_open = (uint32_t)old_flags;
     if (fcntl(f, F_SETFL, old_flags | O_NONBLOCK) != 0) {
         printf("[FAIL] fcntl(F_SETFL): %s (errno=%d)\n", strerror(errno), errno);
         goto fail;
     }
 
+    updated_flags = fcntl(f, F_GETFL);
+    if (updated_flags < 0 || updated_flags != (old_flags | O_NONBLOCK)) {
+        printf("[FAIL] updated OFD flags=0%o expected=0%o errno=%d\n",
+               updated_flags, old_flags | O_NONBLOCK, errno);
+        goto fail;
+    }
+    expected_setfl = (uint32_t)updated_flags;
     memset(buf, 0, sizeof(buf));
     if (read(f, buf, 5) != 5 || memcmp(buf, "hello", 5) != 0) {
         printf("[FAIL] read after F_SETFL got='%.*s' errno=%d\n", 5, buf, errno);
@@ -3294,7 +3329,6 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
     f = -1;
     usleep(100 * 1000);
 
-    expected_setfl = (uint32_t)(old_flags | O_NONBLOCK);
     if (open_count != 1 || read_count != 1 || write_count != 1 || flush_count != 1 ||
         release_count != 1) {
         printf("[FAIL] counters open=%u read=%u write=%u flush=%u release=%u\n", open_count,
@@ -3305,7 +3339,7 @@ static int ext_test_fsetfl_updates_fuse_io_flags() {
         printf("[FAIL] open flags got=0%o expected=0%o\n", last_open_flags, expected_open);
         goto fail;
     }
-    if ((last_read_flags & O_NONBLOCK) == 0 || last_write_flags != expected_setfl ||
+    if (last_read_flags != expected_setfl || last_write_flags != expected_setfl ||
         last_release_flags != expected_setfl) {
         printf("[FAIL] updated flags read=0%o write=0%o release=0%o expected=0%o\n",
                last_read_flags, last_write_flags, last_release_flags, expected_setfl);
@@ -7845,7 +7879,8 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
     // is therefore an ordinary cached write; only later page writeback carries
     // FUSE_WRITE_CACHE.
     const uint32_t expected_cached_write_flags = 0;
-    const uint32_t expected_cached_write_open_flags = O_RDWR | O_SYNC;
+    uint32_t expected_cached_write_open_flags = 0;
+    int ofd_flags = -1;
     const size_t page_size = 4096;
     const size_t map_len = page_size * 2;
     const char marker = 'Z';
@@ -7952,6 +7987,13 @@ static int ext_test_shared_writable_mmap_osync_writeback() {
         printf("[FAIL] open(%s): %s (errno=%d)\n", path, strerror(errno), errno);
         goto fail;
     }
+    ofd_flags = fcntl(f, F_GETFL);
+    if (ofd_flags < 0 || (ofd_flags & O_ACCMODE) != O_RDWR
+        || (ofd_flags & O_SYNC) != O_SYNC) {
+        printf("[FAIL] O_SYNC OFD flags=0%o errno=%d\n", ofd_flags, errno);
+        goto fail;
+    }
+    expected_cached_write_open_flags = (uint32_t)ofd_flags;
     addr = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
     if (addr == MAP_FAILED) {
         printf("[FAIL] mmap(%s): %s (errno=%d)\n", path, strerror(errno), errno);
@@ -11820,6 +11862,178 @@ TEST(FuseExtended, CachedReadWithoutAsyncIsSerial) {
 
 TEST(FuseExtended, CachedReadSyncErrorSemantics) {
     ASSERT_EQ(0, ext_test_cached_read_sync_error_semantics());
+}
+
+// A cold userspace load must fault outside the global futex map lock. The
+// daemon deliberately needs that same lock before it can answer the READ.
+struct fuse_futex_fault_shared {
+    volatile int child_done;
+    long result;
+    int error;
+};
+
+struct fuse_futex_fault_daemon {
+    fuse_daemon_args common;
+    volatile int stop;
+    volatile int initialized;
+    volatile int read_entered;
+    volatile int wake_done;
+    volatile int done;
+    int resident_word;
+    long wake_result;
+};
+
+static void *fuse_futex_fault_serve(void *opaque) {
+    auto *context = static_cast<fuse_futex_fault_daemon *>(opaque);
+    auto *args = &context->common;
+    std::vector<unsigned char> buffer(FUSE_TEST_BUF_SIZE);
+    simplefs_init(&args->fs);
+    while (!__atomic_load_n(&context->stop, __ATOMIC_ACQUIRE)) {
+        const ssize_t size = read(args->fd, buffer.data(), buffer.size());
+        if (size < 0 && errno == EINTR) continue;
+        if (size < 0 && errno == EPERM && !context->initialized) {
+            usleep(1000);
+            continue;
+        }
+        if (size < static_cast<ssize_t>(sizeof(fuse_in_header))) break;
+        const auto *header = reinterpret_cast<const fuse_in_header *>(buffer.data());
+        if (header->len != size) break;
+        if (header->opcode == FUSE_READ) {
+            __atomic_store_n(&context->read_entered, 1, __ATOMIC_RELEASE);
+            context->wake_result = syscall(SYS_futex, &context->resident_word,
+                                           FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+            __atomic_store_n(&context->wake_done, 1, __ATOMIC_RELEASE);
+        }
+        if (fuse_handle_one(args, buffer.data(), static_cast<size_t>(size)) != 0) break;
+    }
+    __atomic_store_n(&context->done, 1, __ATOMIC_RELEASE);
+    return nullptr;
+}
+
+static int ext_test_futex_cold_fault(bool compare_requeue) {
+    char mount_point[128];
+    snprintf(mount_point, sizeof(mount_point), "/tmp/test_fuse_futex_fault_%d_%d",
+             getpid(), compare_requeue);
+    auto *context = static_cast<fuse_futex_fault_daemon *>(calloc(1, sizeof(fuse_futex_fault_daemon)));
+    auto *shared = static_cast<fuse_futex_fault_shared *>(mmap(
+        nullptr, sizeof(fuse_futex_fault_shared), PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    if (!context || shared == MAP_FAILED) {
+        free(context);
+        if (shared != MAP_FAILED) munmap(shared, sizeof(*shared));
+        return -1;
+    }
+    memset(shared, 0, sizeof(*shared));
+    context->resident_word = 0;  // Prefault before the daemon enters FUTEX_WAKE.
+    context->wake_result = -1;
+    int fuse_fd = -1;
+    int file_fd = -1;
+    void *mapping = MAP_FAILED;
+    bool mounted = false;
+    bool daemon_started = false;
+    bool passed = false;
+    pid_t child = -1;
+    pthread_t daemon;
+    if (ensure_dir(mount_point) != 0) goto cleanup;
+    fuse_fd = open("/dev/fuse", O_RDWR);
+    if (fuse_fd < 0) goto cleanup;
+    context->common.fd = fuse_fd;
+    context->common.stop = &context->stop;
+    context->common.init_done = &context->initialized;
+    context->common.stop_on_destroy = 1;
+    if (pthread_create(&daemon, nullptr, fuse_futex_fault_serve, context) != 0) goto cleanup;
+    daemon_started = true;
+    {
+        char options[256];
+        snprintf(options, sizeof(options),
+                 "fd=%d,rootmode=040755,user_id=0,group_id=0,max_read=4096", fuse_fd);
+        if (mount("none", mount_point, "fuse", 0, options) != 0) goto cleanup;
+    }
+    mounted = true;
+    if (fuse_wait_flag(&context->initialized, 2000) != 0) goto cleanup;
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/hello.txt", mount_point);
+        file_fd = open(path, O_RDONLY);
+    }
+    if (file_fd < 0) goto cleanup;
+    mapping = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, file_fd, 0);
+    if (mapping == MAP_FAILED) goto cleanup;
+    // No access to mapping before the syscall: only FUSE_READ can make it resident.
+    child = fork();
+    if (child < 0) goto cleanup;
+    if (child == 0) {
+        // The parent must own the last /dev/fuse handle so abort can break the
+        // READ -> daemon WAKE -> map lock cycle on a failing kernel.
+        close(fuse_fd);
+        close(file_fd);
+        uint32_t expected = 0;
+        memcpy(&expected, "hell", sizeof(expected));
+        int target = 0;
+        const long result = compare_requeue
+            ? syscall(SYS_futex, mapping, FUTEX_CMP_REQUEUE_PRIVATE, 0,
+                      reinterpret_cast<void *>(0), &target, expected)
+            : syscall(SYS_futex, mapping, FUTEX_WAIT_PRIVATE, expected ^ 1,
+                      nullptr, nullptr, 0);
+        shared->result = result;
+        shared->error = errno;
+        __atomic_store_n(&shared->child_done, 1, __ATOMIC_RELEASE);
+        _exit(0);
+    }
+    if (fuse_wait_flag(&shared->child_done, 3000) == 0) {
+        passed = __atomic_load_n(&context->read_entered, __ATOMIC_ACQUIRE)
+            && __atomic_load_n(&context->wake_done, __ATOMIC_ACQUIRE)
+            && context->wake_result == 0
+            && (compare_requeue ? shared->result == 0
+                                : shared->result == -1 && shared->error == EAGAIN);
+    }
+
+cleanup:
+    if (!passed) {
+        fprintf(stderr, "[FAIL] cold FUSE futex %s read=%d wake=%d child=%d result=%ld/%d\n",
+                compare_requeue ? "CMP_REQUEUE" : "WAIT", context->read_entered,
+                context->wake_done, shared->child_done, shared->result, shared->error);
+        // At the tested deadlock the daemon is in futex, not read(/dev/fuse),
+        // so closing this final handle immediately aborts the outstanding READ.
+        if (context->read_entered && !context->wake_done && fuse_fd >= 0) {
+            close(fuse_fd);
+            fuse_fd = -1;
+        }
+    }
+    if (child > 0) {
+        if (fuse_wait_flag(&shared->child_done, 3000) != 0) {
+            // Do not replace a bounded diagnostic with an unbounded join or
+            // waitpid if a different kernel regression prevents abort progress.
+            fprintf(stderr, "[FAIL] cold FUSE futex child did not finish after abort\n");
+            _exit(125);
+        }
+        int status = 0;
+        if (waitpid(child, &status, 0) != child || !WIFEXITED(status)
+            || WEXITSTATUS(status) != 0) passed = false;
+    }
+    if (mapping != MAP_FAILED) munmap(mapping, 4096);
+    if (file_fd >= 0) close(file_fd);
+    if (mounted && umount2(mount_point, MNT_DETACH) != 0) passed = false;
+    if (daemon_started) {
+        if (fuse_wait_flag(&context->done, 3000) != 0) {
+            fprintf(stderr, "[FAIL] cold FUSE futex daemon did not finish\n");
+            _exit(126);
+        }
+        pthread_join(daemon, nullptr);
+    }
+    if (fuse_fd >= 0) close(fuse_fd);
+    if (rmdir(mount_point) != 0 && errno != ENOENT) passed = false;
+    munmap(shared, sizeof(*shared));
+    free(context);
+    return passed ? 0 : -1;
+}
+
+TEST(FuseExtended, FutexWaitFaultAllowsDaemonFutex) {
+    ASSERT_EQ(0, ext_test_futex_cold_fault(false));
+}
+
+TEST(FuseExtended, FutexCompareRequeueFaultAllowsDaemonFutex) {
+    ASSERT_EQ(0, ext_test_futex_cold_fault(true));
 }
 
 int main(int argc, char **argv) {

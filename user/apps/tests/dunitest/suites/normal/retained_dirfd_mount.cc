@@ -303,6 +303,64 @@ TEST_F(RetainedDirfdMount, ScopedAbsoluteSymlinkUsesOriginalScopeRoot) {
     ExpectContents(OpenAt2(fd_, "absolute", kInRoot), "original");
 }
 
+TEST_F(RetainedDirfdMount, CachedInRootDotDotClampsWithoutTopology) {
+    for (const char* path : {"..", "../..", "../../.."}) {
+        ExpectSame(OpenAt2(fd_, path, kInRoot | kCached), fd_);
+        ExpectSame(OpenAt2(fd_, path, kInRoot | kCached | kNoXdev), fd_);
+    }
+}
+
+TEST_F(RetainedDirfdMount, CachedBeneathDotDotRequiresRefWalk) {
+    ExpectError(OpenAt2(fd_, "..", kBeneath | kCached), EAGAIN);
+    ExpectError(OpenAt2(fd_, "..", kBeneath | kCached | kNoXdev), EAGAIN);
+    ExpectError(OpenAt2(fd_, "..", kBeneath), EXDEV);
+    ExpectSame(OpenAt2(fd_, ".", kBeneath | kCached), fd_);
+}
+
+TEST_F(RetainedDirfdMount, CachedProcessRootDotDotClamps) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (fchdir(fd_) != 0 || chroot(".") != 0 || chdir("/") != 0) _exit(1);
+        for (auto resolve : {kCached, kCached | kNoXdev}) {
+            const int opened = OpenAt2(AT_FDCWD, "/../../..", resolve);
+            if (opened < 0) _exit(2);
+            struct stat actual{}, expected{};
+            const bool same = fstat(opened, &actual) == 0 && fstat(fd_, &expected) == 0 &&
+                              actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino;
+            if (close(opened) != 0 || !same) _exit(3);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(child, waited) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST_F(RetainedDirfdMount, CachedClampedRootStillChecksCoverMount) {
+    Cover();
+    ASSERT_FALSE(HasFatalFailure());
+    const int coverfd = Hold(anchor_);
+    ASSERT_GE(coverfd, 0) << strerror(errno);
+    // Linux may follow an already cached cover. A try-only implementation may
+    // return EAGAIN; success must still select the cover, never the lower root.
+    const int cached_parent = OpenAt2(fd_, "..", kInRoot | kCached);
+    if (cached_parent >= 0) ExpectSame(cached_parent, coverfd);
+    else EXPECT_EQ(EAGAIN, errno);
+    const int cached_file = OpenAt2(fd_, "../marker", kInRoot | kCached);
+    if (cached_file >= 0) ExpectContents(cached_file, "cover");
+    else EXPECT_EQ(EAGAIN, errno);
+    ExpectError(OpenAt2(fd_, "..", kInRoot | kCached | kNoXdev), EAGAIN);
+    ExpectSame(OpenAt2(fd_, "..", kInRoot), coverfd);
+    ExpectError(OpenAt2(fd_, "..", kInRoot | kNoXdev), EXDEV);
+    ExpectSame(OpenAt2(fd_, ".", kInRoot | kCached), fd_);
+}
+
 TEST_F(RetainedDirfdMount, CachedWarmLookupDoesNotReenterCover) {
     ASSERT_TRUE(Write(anchor_ + "/marker", "original"));
     ExpectContents(openat(fd_, "marker", O_RDONLY), "original");

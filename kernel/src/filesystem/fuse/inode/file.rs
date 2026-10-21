@@ -1329,8 +1329,8 @@ impl FuseNode {
             lock_owner,
         };
         let conn = self.conn.clone();
-        let payload = fuse_pack_struct(&inarg).to_vec();
-        if let Err(err) = conn.request_nocreds_background(opcode, nodeid, &payload) {
+        let payload = fuse_pack_struct(&inarg);
+        if let Err(err) = conn.request_nocreds_background(opcode, nodeid, payload) {
             log::warn!(
                 "fuse: queue async release failed opcode={} nodeid={} fh={} err={:?}",
                 opcode,

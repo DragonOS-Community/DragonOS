@@ -112,7 +112,7 @@ fn case(
     let conn = FuseConn::new_for_virtiofs(8192, 8192);
     let (pending, dispatched) = if kind.request() {
         {
-            let mut inner = conn.inner.lock();
+            let mut inner = conn.lock_inner();
             inner.mounted = true;
             inner.initialized = true;
         }
@@ -132,7 +132,7 @@ fn case(
             unique: pending.unique() | FuseConn::FUSE_INT_REQ_BIT,
         };
         conn.write_reply(super::super::protocol::fuse_pack_struct(&retry))?;
-        let early_interrupt = !conn.inner.lock().hiprio_pending.is_empty();
+        let early_interrupt = !conn.lock_inner().hiprio_pending.is_empty();
         if early_interrupt {
             conn.disconnect_requests();
             return Ok(false);
@@ -330,7 +330,7 @@ fn case(
                         if !still_waiting || publisher_done.load(Ordering::Acquire) {
                             publisher_rescued.store(true, Ordering::Release);
                         }
-                        publisher_conn.inner.lock().initialized = true;
+                        publisher_conn.lock_inner().initialized = true;
                         publisher_conn.init_wait.wakeup(None);
                     }
                     Case::RequestInterrupted
@@ -369,8 +369,7 @@ fn case(
                                 publisher_conn.disconnect_requests();
                             } else {
                                 let owned = publisher_conn
-                                    .inner
-                                    .lock()
+                                    .lock_inner()
                                     .processing
                                     .remove(&publisher_pending.unique());
                                 if owned.is_none() {
@@ -475,7 +474,7 @@ fn interrupt_reply_protocol() -> Result<bool, SystemError> {
     use super::super::protocol::{fuse_pack_struct, FuseOutHeader, FUSE_LOOKUP};
     let conn = FuseConn::new_for_virtiofs(8192, 8192);
     {
-        let mut inner = conn.inner.lock();
+        let mut inner = conn.lock_inner();
         inner.mounted = true;
         inner.initialized = true;
     }
@@ -509,7 +508,7 @@ fn interrupt_reply_protocol() -> Result<bool, SystemError> {
         let retry = conn.dequeue_virtiofs_high_priority_request(8192)?;
         reply(SystemError::ENOSYS.to_posix_errno())?;
         reply(SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno())?;
-        let no_interrupt = conn.inner.lock().no_interrupt;
+        let no_interrupt = conn.lock_inner().no_interrupt;
         let passed = first.unique() == (unique | FuseConn::FUSE_INT_REQ_BIT)
             && retry.unique() == first.unique()
             && no_interrupt

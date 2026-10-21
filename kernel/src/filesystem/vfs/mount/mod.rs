@@ -5709,8 +5709,17 @@ impl MountFSInode {
                 .map(|inode| inode as Arc<dyn IndexNode>)
                 .ok_or(SystemError::ENOENT),
             ".." => {
-                // Parent traversal needs mount topology and namespace locks.
                 if cache_only {
+                    // Exact-root clamping needs no parent topology lookup.
+                    // BENEATH still needs ref-walk to reject an escape, and a
+                    // clamped result must retain ordinary overmount checks.
+                    if root
+                        .is_some_and(|root| !root.reject_parent && self.same_path_ref(root.inode))
+                    {
+                        return self
+                            .follow_component_mounts(no_xdev, true)
+                            .map(|inode| inode as Arc<dyn IndexNode>);
+                    }
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 self.do_parent_with_root(root, no_xdev)?

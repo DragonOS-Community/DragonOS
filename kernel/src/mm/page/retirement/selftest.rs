@@ -1036,6 +1036,10 @@ pub(crate) fn report() -> String {
             crate::rcu::heap_denied_slot_drop_selftest,
         ),
         (
+            "heap_denied_fuse_birth",
+            crate::filesystem::fuse::conn::heap_denied_fuse_birth_selftest,
+        ),
+        (
             "heap_denied_fuse_wait",
             crate::filesystem::fuse::conn::heap_denied_fuse_wait_selftest,
         ),
@@ -1091,6 +1095,10 @@ pub(crate) fn report() -> String {
         (
             "heap_denied_page_entry_wait",
             crate::filesystem::page_cache::heap_denied_entry_wait_selftest,
+        ),
+        (
+            "heap_denied_futex_registration",
+            crate::libs::futex::futex::Futex::failed_registration_selftest,
         ),
         (
             "heap_denied_futex_wake",

@@ -2963,14 +2963,10 @@ impl dyn IndexNode {
         // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
         // walk. A symlink chain must not amplify allocator work per hop.
         let mut symlink_buffer: Option<Vec<u8>> = None;
-        // Set when the walk jumped through a magic link (e.g. /proc/self/fd/N).
-        // Linux's nd_jump_link() anchors the target's {mount, dentry} pair, so
-        // the component resolved right after the jump must NOT re-follow an
-        // overmount stacked on the jump target itself (that would recurse into
-        // a FUSE daemon that opened the fd precisely to bypass its own mount).
-        // The anchor applies exactly once, to the jump target itself; deeper
-        // components follow mounts normally.
-        let mut magic_jump_anchored = false;
+        // Magic links provide a retained mount/dentry cursor. Preserve that
+        // base for subsequent steps, including relative-symlink expansion;
+        // only newly selected components may cross mounts.
+        let mut retained_mount_path = false;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
@@ -3039,18 +3035,20 @@ impl dyn IndexNode {
                     .resolve
                     .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
             });
-            let lookup = if magic_jump_anchored {
-                // Consume the anchor: resolve this one component against the
-                // jump target's own mount without following an overmount on
-                // the target dentry. `cache_only` must stay nonblocking, and
-                // the backing lookup takes blocking locks — report EAGAIN so
-                // the caller retries without RESOLVE_CACHED.
-                magic_jump_anchored = false;
+            let lookup = if retained_mount_path {
+                // Magic-link resolution already rejects RESOLVE_CACHED. Keep
+                // this guard so this path never acquires blocking lookup locks.
                 if cache_only {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
                 }
                 if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
-                    mounted.lookup_backing(&name)
+                    mounted.lookup_from_resolved(
+                        &name,
+                        no_xdev,
+                        !has_more_components
+                            && !trailing_slash
+                            && options.is_some_and(|options| options.no_automount),
+                    )
                 } else {
                     result.find(&name)
                 }
@@ -3205,11 +3203,7 @@ impl dyn IndexNode {
                     if rest_path.is_empty() {
                         return Ok(PathWalkOutcome::Found(target_inode, ownership));
                     } else {
-                        // 将 result 设为 magic link 的目标 inode，继续迭代。
-                        // Anchor the next component lookup to the target's own
-                        // mount (see `magic_jump_anchored`): a stacked
-                        // overmount on the target must not be re-followed.
-                        magic_jump_anchored = true;
+                        retained_mount_path = true;
                         result = target_inode;
                         continue;
                     }
@@ -3281,6 +3275,7 @@ impl dyn IndexNode {
                             return Err(SystemError::EXDEV.into());
                         }
                     }
+                    retained_mount_path = false;
                     result = process_root_inode.clone();
                     if ownership.is_some() {
                         ownership = Some(

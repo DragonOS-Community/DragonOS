@@ -55,24 +55,16 @@ pub(super) fn find(
     inode: &OvlInode,
     name: &str,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
-    // Linux 在 VFS 路径走查（namei.c）中自行消化 "."/".."，从不将其下传给文件
-    // 系统；而 DragonOS 的相对路径走查以 find(".") 锚定起始目录、以 find("..")
-    // 解析父目录分量（ramfs/MountFSInode 均遵循此约定）。合并目录必须同样在
-    // overlay 层回答点号：若把 "."/".." 透传给底层层（upper/lower inode），会经
-    // MountFSInode::lookup_backing 被 -EACCES 拒绝（与 Linux
-    // lookup_one_unlocked 拒绝点号的名字语义一致）。
-    //
-    // "." 返回该合并目录自身（按 redirect 从 overlay 根重新解析，与 parent()
-    // 的既有设计一致；根目录直接返回自身），".." 返回父合并目录。
+    // Dot denotes this object, including after its old pathname is replaced.
+    // Never recover inode identity by walking the historical redirect path.
     if inode.is_dir() {
         match name {
             "" | "." => {
-                let fs = inode.overlay_fs()?;
-                if inode.redirect.is_empty() {
-                    return Ok(fs.root_inode.clone());
-                }
-                let root: Arc<dyn IndexNode> = fs.root_inode.clone();
-                return root.lookup(&inode.redirect);
+                return inode
+                    .self_ref
+                    .upgrade()
+                    .map(|inode| inode as Arc<dyn IndexNode>)
+                    .ok_or(SystemError::ESTALE)
             }
             ".." => return inode.parent(),
             _ => {}
@@ -243,4 +235,32 @@ fn same_inode(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> Result<b
     let left = left.metadata()?;
     let right = right.metadata()?;
     Ok(left.dev_id == right.dev_id && left.inode_id == right.inode_id)
+}
+
+#[cfg(test)]
+mod dot_lookup_tests {
+    use super::*;
+    use crate::filesystem::vfs::LinkMutationCoordinator;
+
+    #[test]
+    fn dot_keeps_object_identity_without_resolving_an_old_path() {
+        let inode = OvlInode::new(
+            "old/name".into(),
+            FileType::Dir,
+            None,
+            Vec::new(),
+            None,
+            Arc::new(LinkMutationCoordinator::new()),
+            None,
+        );
+        let weak = Arc::downgrade(&inode);
+        let expected: Arc<dyn IndexNode> = inode.clone();
+        for name in [".", ""] {
+            let dot = find(&inode, name).unwrap();
+            assert!(Arc::ptr_eq(&dot, &expected));
+        }
+        drop(expected);
+        drop(inode);
+        assert!(weak.upgrade().is_none());
+    }
 }

@@ -65,6 +65,7 @@ impl Drop for OvlLinkMutation<'_> {
 
 #[derive(Debug)]
 pub struct OvlInode {
+    pub(super) self_ref: Weak<OvlInode>,
     pub(super) redirect: String, // Redirect path
     pub(super) file_type: FileType,
     /// Logical FIFO identity belongs to the overlay, independently of backing
@@ -263,14 +264,15 @@ impl OvlInode {
         overlay_inode_id: Option<InodeId>,
         link_mutation_coordinator: Arc<LinkMutationCoordinator>,
         fifo: Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
-    ) -> Self {
+    ) -> Arc<Self> {
         let backing_retentions = upper
             .iter()
             .chain(lower_inodes.iter())
             .map(|inode| InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache))
             .collect::<Result<Vec<_>, _>>()
             .expect("new overlay inode backing must remain retainable");
-        Self {
+        Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
             redirect,
             file_type,
             fifo,
@@ -286,7 +288,7 @@ impl OvlInode {
             dir_state: Mutex::new(None),
             oe: Arc::new(OvlEntry::new()),
             fs: Mutex::new(Weak::default()),
-        }
+        })
     }
 
     pub(super) fn install_link_seed(&self, identity: OvlLinkIdentity, initial_nlinks: usize) {

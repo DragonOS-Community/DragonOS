@@ -1,7 +1,10 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::{libs::spinlock::SpinLock, mm::dma::DmaBuffer, sched::completion::Completion};
+use crate::{
+    libs::{resource_wait, spinlock::SpinLock},
+    mm::dma::DmaBuffer,
+};
 
 use super::block_device::{BlockId, LBA_SIZE};
 
@@ -33,7 +36,6 @@ struct InnerBioRequest {
     count: usize,
     buffer: DmaBuffer,
     state: BioState,
-    completion: Arc<Completion>,
     result: Option<Result<usize, SystemError>>,
     complete_callbacks: Vec<BioCompleteCallback>,
     /// virtio-drivers返回的token，用于中断时匹配
@@ -96,17 +98,6 @@ impl BioRequest {
         count: usize,
         buffer: DmaBuffer,
     ) -> Result<Arc<Self>, SystemError> {
-        let completion = Arc::try_new(Completion::new()).map_err(|_| SystemError::ENOMEM)?;
-        Self::try_from_parts(bio_type, lba_start, count, buffer, completion)
-    }
-
-    fn try_from_parts(
-        bio_type: BioType,
-        lba_start: BlockId,
-        count: usize,
-        buffer: DmaBuffer,
-        completion: Arc<Completion>,
-    ) -> Result<Arc<Self>, SystemError> {
         Arc::try_new(Self {
             inner: SpinLock::new(InnerBioRequest {
                 bio_type,
@@ -114,7 +105,6 @@ impl BioRequest {
                 count,
                 buffer,
                 state: BioState::Init,
-                completion,
                 result: None,
                 complete_callbacks: Vec::new(),
                 token: None,
@@ -197,7 +187,7 @@ impl BioRequest {
 
     /// 完成BIO请求
     pub fn complete(&self, result: Result<usize, SystemError>) {
-        let (completion, callbacks) = {
+        let callbacks = {
             let mut inner = self.inner.lock_irqsave();
             if matches!(inner.state, BioState::Completed | BioState::Failed) {
                 return;
@@ -208,28 +198,38 @@ impl BioRequest {
                 BioState::Failed
             };
             inner.result = Some(result.clone());
-            let callbacks = core::mem::take(&mut inner.complete_callbacks);
-            (inner.completion.clone(), callbacks)
+            core::mem::take(&mut inner.complete_callbacks)
         };
         // Publish the completion predicate before invoking callbacks. A
         // callback may re-enter `wait*()` on this BIO; signaling afterwards
         // would deadlock that callback and every callback behind it.
-        completion.complete();
+        resource_wait::notify_resource_all(self.wait_key());
         for cb in callbacks {
             cb(result.clone());
         }
     }
 
-    pub fn on_complete<F>(&self, callback: F)
+    /// Register a terminal observer atomically, or leave the callback list unchanged.
+    pub fn try_on_complete<F>(&self, callback: F) -> Result<(), SystemError>
     where
         F: Fn(Result<usize, SystemError>) + Send + Sync + 'static,
     {
-        let mut callback = Some(Box::new(callback) as BioCompleteCallback);
+        let callback =
+            Box::try_new(callback).map_err(|_| SystemError::ENOMEM)? as BioCompleteCallback;
+        self.register_callback(callback)
+    }
+
+    fn register_callback(&self, callback: BioCompleteCallback) -> Result<(), SystemError> {
+        let mut callback = Some(callback);
         let completed = {
             let mut inner = self.inner.lock_irqsave();
             if let Some(result) = inner.result.clone() {
                 Some(result)
             } else {
+                inner
+                    .complete_callbacks
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
                 inner.complete_callbacks.push(
                     callback
                         .take()
@@ -245,33 +245,47 @@ impl BioRequest {
                 .take()
                 .expect("completed callback was not registered")(result);
         }
+        Ok(())
+    }
+
+    fn wait_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// Observe a durable terminal result; waiting never cancels the device request.
+    fn wait_terminal(&self) -> Result<usize, SystemError> {
+        let result = resource_wait::wait_for_resource(self.wait_key(), false, || {
+            self.inner.lock_irqsave().result.clone()
+        })?;
+        let completed = result?;
+        if completed != Self::expected_len(&self.inner.lock_irqsave()) {
+            return Err(SystemError::EIO);
+        }
+        Ok(completed)
     }
 
     /// 等待BIO完成并返回结果
     pub fn wait(&self) -> Result<Vec<u8>, SystemError> {
-        let completion = self.inner.lock_irqsave().completion.clone();
-
-        // 等待完成
-        completion.wait_for_completion()?;
-
-        // 获取结果
-        let inner = self.inner.lock_irqsave();
-        match inner.result.as_ref() {
-            Some(Ok(completed)) if *completed == Self::expected_len(&inner) => {
-                Ok(inner.buffer.to_vec())
-            }
-            Some(Ok(_)) => Err(SystemError::EIO),
-            Some(Err(e)) => Err(e.clone()),
-            None => Err(SystemError::EIO),
-        }
+        self.wait_terminal()?;
+        let (source, length) = {
+            let inner = self.inner.lock_irqsave();
+            (inner.buffer.as_slice().as_ptr(), inner.buffer.len())
+        };
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(length)
+            .map_err(|_| SystemError::ENOMEM)?;
+        // The terminal result retires device access. `&self` pins the immutable
+        // buffer while allocation and copying happen with interrupts enabled.
+        result.extend_from_slice(unsafe { core::slice::from_raw_parts(source, length) });
+        Ok(result)
     }
 
     /// Wait for an exact read completion and copy the DMA payload directly
     /// into the caller's buffer. This avoids the intermediate `Vec` allocated
     /// by [`Self::wait`] and never exposes the DMA buffer pointer after submit.
     pub fn wait_read_into(&self, dst: &mut [u8]) -> Result<usize, SystemError> {
-        let completion = self.inner.lock_irqsave().completion.clone();
-        completion.wait_for_completion()?;
+        self.wait_terminal()?;
 
         let (source, expected) = {
             let inner = self.inner.lock_irqsave();
@@ -279,16 +293,9 @@ impl BioRequest {
             if inner.bio_type != BioType::Read || dst.len() != expected {
                 return Err(SystemError::EINVAL);
             }
-            match inner.result.as_ref() {
-                Some(Ok(completed)) if *completed == expected => {
-                    (inner.buffer.as_slice().as_ptr(), expected)
-                }
-                Some(Ok(_)) => return Err(SystemError::EIO),
-                Some(Err(error)) => return Err(error.clone()),
-                None => return Err(SystemError::EIO),
-            }
+            (inner.buffer.as_slice().as_ptr(), expected)
         };
-        // Completion retires device ownership before it wakes us. BioRequest
+        // Publishing the terminal result retires device access. BioRequest
         // owns a fixed-size DMA buffer for its whole lifetime, so the pointer
         // remains stable and read-only while `&self` is alive. Keep the 64 KiB
         // worst-case copy outside the IRQ-disabled spin-lock section.
@@ -299,16 +306,7 @@ impl BioRequest {
     /// Wait for completion without copying the DMA payload. This is the
     /// completion path for writes and flushes.
     pub fn wait_status(&self) -> Result<usize, SystemError> {
-        let completion = self.inner.lock_irqsave().completion.clone();
-        completion.wait_for_completion()?;
-
-        let inner = self.inner.lock_irqsave();
-        match inner.result.as_ref() {
-            Some(Ok(completed)) if *completed == Self::expected_len(&inner) => Ok(*completed),
-            Some(Ok(_)) => Err(SystemError::EIO),
-            Some(Err(e)) => Err(e.clone()),
-            None => Err(SystemError::EIO),
-        }
+        self.wait_terminal()
     }
 
     fn validate_request(lba_start: BlockId, count: usize) -> Result<usize, SystemError> {
@@ -327,40 +325,7 @@ impl BioRequest {
     }
 }
 
-/// Exercise both Arc allocation boundaries through the production constructors.
 #[cfg(feature = "mm_selftest")]
-pub(crate) fn heap_denied_bio_birth() -> Result<bool, SystemError> {
-    use crate::mm::oom::denial;
-    let first = DmaBuffer::try_alloc_bytes(LBA_SIZE, Default::default())?;
-    let second = DmaBuffer::try_alloc_bytes(LBA_SIZE, Default::default())?;
-    let completion = Arc::try_new(Completion::new()).map_err(|_| SystemError::ENOMEM)?;
-    let rejected = {
-        let _denied = denial::Scope::enter(true);
-        let before = denial::rejected_count();
-        let first_failed = matches!(
-            BioRequest::try_from_buffer(BioType::Read, 0, 1, first),
-            Err(SystemError::ENOMEM)
-        );
-        let second_failed = matches!(
-            BioRequest::try_from_parts(BioType::Read, 0, 1, second, completion.clone()),
-            Err(SystemError::ENOMEM)
-        );
-        let read = matches!(BioRequest::try_new_read(0, 1), Err(SystemError::ENOMEM));
-        let write = matches!(
-            BioRequest::try_new_write(0, 1, &[0; LBA_SIZE]),
-            Err(SystemError::ENOMEM)
-        );
-        let flush = matches!(BioRequest::try_new_flush(), Err(SystemError::ENOMEM));
-        first_failed
-            && second_failed
-            && read
-            && write
-            && flush
-            && Arc::strong_count(&completion) == 1
-            && denial::rejected_count() >= before + 2
-    };
-    // Removing denial must leave a reusable request lifecycle, without device ownership.
-    let bio = BioRequest::try_new_flush()?;
-    bio.complete(Ok(0));
-    Ok(rejected && bio.wait_status()? == 0)
-}
+mod selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::{bio_terminal_protocol, heap_denied_bio_birth, heap_denied_bio_wait};

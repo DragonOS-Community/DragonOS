@@ -280,7 +280,8 @@ fn last_owner_cache_contention() -> Result<bool, SystemError> {
                 && worker.sched_info().state().is_blocked()
                 && !worker.sched_info().is_running()
         });
-    let connection_free = blocked && conn.inner.try_lock().is_ok();
+    let connection_free =
+        blocked && crate::libs::resource_wait::ResourceMutexGuard::try_lock(&conn.inner).is_some();
     drop(cache_lock);
     let finished = poll(|| done.load(Ordering::Acquire));
     if !finished {

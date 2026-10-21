@@ -11,7 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     libs::{
-        mutex::Mutex,
+        resource_wait::ResourceMutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
@@ -200,7 +200,7 @@ pub(super) static mut __PROCESS_MANAGEMENT_INIT_DONE: bool = false;
 /// This mirrors Linux's `oom_adj_mutex` responsibility: a process sharing an
 /// mm with another thread group must not miss a concurrent oom_score_adj update
 /// while it is becoming visible.
-static OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
+static OOM_SCORE_ADJ_LOCK: ResourceMutex<()> = ResourceMutex::new(());
 
 /// The adjustment lock shares the allocation-free memory-resource protocol.
 pub(crate) type OomScoreAdjGuard = crate::libs::resource_wait::ResourceMutexGuard<'static, ()>;

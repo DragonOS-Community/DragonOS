@@ -760,6 +760,8 @@ struct fuse_daemon_args {
     volatile uint32_t *removexattr_count;
     volatile uint32_t *last_setxattr_flags;
     volatile uint32_t *last_setattr_valid;
+    struct fuse_setattr_in *last_setattr_request;
+    int setattr_error;
     volatile uint64_t *last_setattr_fh;
     volatile uint64_t *last_setattr_size;
     volatile uint64_t *last_setattr_lock_owner;
@@ -2014,6 +2016,12 @@ static inline int fuse_handle_one(struct fuse_daemon_args *a, const unsigned cha
         const struct fuse_setattr_in *in = (const struct fuse_setattr_in *)payload;
         if (a->last_setattr_valid) {
             *a->last_setattr_valid = in->valid;
+        }
+        if (a->last_setattr_request) {
+            *a->last_setattr_request = *in;
+        }
+        if (a->setattr_error) {
+            return fuse_write_reply(a->fd, h->unique, -a->setattr_error, NULL, 0);
         }
         if (a->last_setattr_fh) {
             *a->last_setattr_fh = in->fh;

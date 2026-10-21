@@ -6,7 +6,7 @@ use super::{
     PageEntry, PageFlags, PageIoWaiter, PageState, SystemError, Vec, VecDeque, WaitQueue, Weak,
     Work, WorkQueue, WritebackControl, PAGECACHE_IO_WORKERS,
 };
-use crate::libs::resource_wait::ResourceMutexGuard;
+use crate::libs::resource_wait::{ResourceMutex, ResourceMutexGuard};
 
 static PAGE_CACHE_WRITEBACK_TAG_EPOCH: AtomicU64 = AtomicU64::new(1);
 const MAX_ASYNC_WRITEBACK_BATCHES: usize = PAGECACHE_IO_WORKERS * 2;
@@ -69,7 +69,7 @@ static ASYNC_WRITEBACK_WAIT: WaitQueue = WaitQueue::default();
 #[derive(Debug)]
 pub(crate) struct WritebackExecutor {
     queue: Arc<WorkQueue>,
-    budget: Mutex<WritebackBudget>,
+    budget: ResourceMutex<WritebackBudget>,
 }
 
 #[derive(Debug)]
@@ -82,7 +82,7 @@ impl WritebackExecutor {
     pub(super) fn try_new() -> Result<Arc<Self>, SystemError> {
         Arc::try_new(Self {
             queue: WorkQueue::try_new_owned("pagecache-wb")?,
-            budget: Mutex::new(WritebackBudget {
+            budget: ResourceMutex::new(WritebackBudget {
                 in_flight: 0,
                 retries: VecDeque::new(),
             }),

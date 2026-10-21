@@ -23,8 +23,7 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     libs::{
-        mutex::Mutex,
-        resource_wait::ResourceMutexGuard,
+        resource_wait::{ResourceMutex, ResourceMutexGuard},
         spinlock::SpinLock,
         wait_queue::{Waiter, Waker},
     },
@@ -59,7 +58,7 @@ mod registration_selftest;
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
-    data: Mutex<HashMap<FutexKey, FutexHashBucket>>,
+    data: ResourceMutex<HashMap<FutexKey, FutexHashBucket>>,
 }
 
 impl FutexData {
@@ -262,7 +261,7 @@ impl Futex {
     pub fn init() {
         unsafe {
             FUTEX_DATA = Some(FutexData {
-                data: Mutex::new(HashMap::new()),
+                data: ResourceMutex::new(HashMap::new()),
             })
         };
     }

@@ -373,53 +373,89 @@ pub(crate) fn notify_resource_all(key: usize) {
     }
 }
 
-/// Narrow wrapper for lifecycle mutexes with an owner-stable address. All acquisitions,
-/// including try-only ones, must return this guard so every unlock can notify.
+/// Lifecycle mutex whose contention must not allocate a waiter. The private
+/// owner ensures every acquisition uses the resource notification protocol.
+#[derive(Debug)]
+pub struct ResourceMutex<T> {
+    inner: crate::libs::mutex::Mutex<T>,
+    waiters: AtomicUsize,
+}
+
+impl<T> ResourceMutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: crate::libs::mutex::Mutex::new(value),
+            waiters: AtomicUsize::new(0),
+        }
+    }
+
+    fn resource_key(&self) -> usize {
+        self as *const Self as usize
+    }
+}
+
+struct MutexWaitCount<'a>(&'a AtomicUsize);
+
+impl<'a> MutexWaitCount<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for MutexWaitCount<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// A resource borrow pins the owner address throughout registration and unlock.
 #[must_use]
 #[derive(Debug)]
 pub struct ResourceMutexGuard<'a, T> {
     inner: Option<crate::libs::mutex::MutexGuard<'a, T>>,
-    resource_key: usize,
+    owner: &'a ResourceMutex<T>,
 }
 
 impl<'a, T> ResourceMutexGuard<'a, T> {
     #[cfg(feature = "mm_selftest")]
     pub(crate) fn resource_key_for_test(&self) -> usize {
-        self.resource_key
+        self.owner.resource_key()
     }
 
-    fn wrap(
-        lock: &'a crate::libs::mutex::Mutex<T>,
-        inner: crate::libs::mutex::MutexGuard<'a, T>,
-    ) -> Self {
+    fn wrap(lock: &'a ResourceMutex<T>, inner: crate::libs::mutex::MutexGuard<'a, T>) -> Self {
         Self {
             inner: Some(inner),
-            resource_key: lock as *const _ as usize,
+            owner: lock,
         }
     }
 
-    pub(crate) fn try_lock(lock: &'a crate::libs::mutex::Mutex<T>) -> Option<Self> {
-        lock.try_lock().ok().map(|inner| Self::wrap(lock, inner))
+    pub(crate) fn try_lock(lock: &'a ResourceMutex<T>) -> Option<Self> {
+        lock.inner
+            .try_lock()
+            .ok()
+            .map(|inner| Self::wrap(lock, inner))
     }
 
-    pub(crate) fn lock(lock: &'a crate::libs::mutex::Mutex<T>) -> Self {
+    fn acquire_slow(lock: &'a ResourceMutex<T>, mode: WaitMode) -> Result<Self, SystemError> {
+        // `wait` retires registration and transfers cancelled notifications
+        // before returning, so the count covers every waiter that can sleep.
+        let _count = MutexWaitCount::new(&lock.waiters);
+        let inner = wait(lock.resource_key(), mode, || lock.inner.try_lock().ok())?;
+        Ok(Self::wrap(lock, inner))
+    }
+
+    pub(crate) fn lock(lock: &'a ResourceMutex<T>) -> Self {
         if let Some(guard) = Self::try_lock(lock) {
             return guard;
         }
-        let key = lock as *const _ as usize;
-        let inner = wait(key, WaitMode::Uninterruptible, || lock.try_lock().ok())
-            .expect("exited task cannot wait for a memory resource");
-        Self::wrap(lock, inner)
+        Self::acquire_slow(lock, WaitMode::Uninterruptible)
+            .expect("exited task cannot wait for a memory resource")
     }
 
-    pub(crate) fn lock_killable(
-        lock: &'a crate::libs::mutex::Mutex<T>,
-    ) -> Result<Self, SystemError> {
+    pub(crate) fn lock_killable(lock: &'a ResourceMutex<T>) -> Result<Self, SystemError> {
         // Preserve fatal-signal admission even when the mutex is free.
-        let inner = wait(lock as *const _ as usize, WaitMode::Killable, || {
-            lock.try_lock().ok()
-        })?;
-        Ok(Self::wrap(lock, inner))
+        Self::acquire_slow(lock, WaitMode::Killable)
     }
 }
 
@@ -439,11 +475,13 @@ impl<T> core::ops::DerefMut for ResourceMutexGuard<'_, T> {
 impl<T> Drop for ResourceMutexGuard<'_, T> {
     fn drop(&mut self) {
         drop(self.inner.take());
-        // Pair the unlock store with register-before-predicate's full barrier.
-        // An Acquire empty check alone would permit both sides to miss progress.
+        // Pair unlock -> count with register -> full barrier -> predicate.
+        // A local zero excludes this mutex's waiters, not unrelated resources.
         fence(Ordering::SeqCst);
-        if has_waiters() {
-            let pending = QUEUE.lock_irqsave().notifications(self.resource_key, false);
+        if self.owner.waiters.load(Ordering::Acquire) != 0 {
+            let pending = QUEUE
+                .lock_irqsave()
+                .notifications(self.owner.resource_key(), false);
             dispatch_notifications(pending);
         }
     }
@@ -481,3 +519,10 @@ pub(crate) fn is_waiting_for_resource_for_test(
     let link = task.resource_wait_link.lock();
     link.registered && link.resource_key == key
 }
+
+#[cfg(feature = "mm_selftest")]
+#[path = "resource_wait_selftest.rs"]
+mod selftest;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::mutex_protocol as resource_mutex_protocol;

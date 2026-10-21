@@ -1,6 +1,7 @@
 use super::*;
 use crate::cgroup::memory::{accounting::KernelByteKind, owned::OwnedBox};
 use crate::filesystem::vfs::VmaOpenRollback;
+use crate::libs::resource_wait::ResourceMutex;
 use crate::mm::mmu_gather::PAGE_BATCH;
 
 const UNMAP_SCAN_BATCH: usize = 256;
@@ -26,7 +27,7 @@ pub struct LockedVMA {
     /// Stable identity of the logical mapping across VMA splits.
     lineage_id: u64,
     state_seq: AtomicU64,
-    vma: OwnedBox<Mutex<VMA>>,
+    vma: OwnedBox<ResourceMutex<VMA>>,
 }
 
 impl core::hash::Hash for LockedVMA {
@@ -64,7 +65,7 @@ impl LockedVMA {
         let weak = Arc::downgrade(&vma);
         let before = account.snapshot();
         let bytes = crate::mm::allocator::kernel_allocator::allocation_footprint(
-            core::alloc::Layout::new::<Mutex<VMA>>(),
+            core::alloc::Layout::new::<ResourceMutex<VMA>>(),
         );
         let mut ok = before.current == bytes.div_ceil(MMArch::PAGE_SIZE as u64)
             && before.kernel_object == before.current
@@ -121,7 +122,7 @@ impl LockedVMA {
             .map_err(|_| SystemError::EOVERFLOW)?;
         let vma = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)
             .map_err(MemoryAllocationError::Charge)?
-            .try_init(Mutex::new(vma))
+            .try_init(ResourceMutex::new(vma))
             .map_err(|_| SystemError::ENOMEM)?;
         let r = Arc::try_new(Self {
             id,

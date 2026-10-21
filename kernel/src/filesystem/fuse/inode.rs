@@ -354,20 +354,14 @@ impl FuseNode {
         nodeid: u64,
         parent_nodeid: u64,
         parent: Option<Arc<FuseNode>>,
-        mut cached: Option<Metadata>,
+        cached: Option<Metadata>,
         attr_flags: u32,
     ) -> Arc<Self> {
         let regular = cached
             .as_ref()
             .is_some_and(|md| md.file_type == FileType::File);
         let dax_active = conn.dax_inode_active(attr_flags, regular);
-        if let Some(md) = cached.as_mut() {
-            if dax_active {
-                md.flags.insert(InodeFlags::S_DAX);
-            } else {
-                md.flags.remove(InodeFlags::S_DAX);
-            }
-        }
+        let cached = cached.map(|md| Self::metadata_with_inode_flags(md, dax_active));
         let has_cached = cached.is_some();
         let initial_attr_epoch = conn.sample_attr_epoch();
         let node_incarnation = NEXT_NODE_INCARNATION.fetch_add(1, Ordering::Relaxed);
@@ -443,8 +437,11 @@ impl FuseNode {
         self.lookup_attr_flags.store(flags, Ordering::Relaxed);
     }
 
-    fn metadata_with_dax_state(&self, mut md: Metadata) -> Metadata {
-        if self.dax_active {
+    fn metadata_with_inode_flags(mut md: Metadata, dax_active: bool) -> Metadata {
+        // Linux fuse_iget(): access times are maintained by the daemon, not
+        // by additional client SETATTR requests on ordinary file access.
+        md.flags.insert(InodeFlags::S_NOATIME);
+        if dax_active {
             md.flags.insert(InodeFlags::S_DAX);
         } else {
             md.flags.remove(InodeFlags::S_DAX);
@@ -1273,7 +1270,7 @@ impl FuseNode {
         valid_nsec: u32,
         attr_flags: u32,
     ) {
-        let md = self.metadata_with_dax_state(md);
+        let md = Self::metadata_with_inode_flags(md, self.dax_active);
         let mut metadata = self.cached_metadata.lock();
         *metadata = Some(md);
         self.bump_attr_version();
@@ -1294,7 +1291,7 @@ impl FuseNode {
         request_epoch: u64,
         attr_flags: u32,
     ) -> Metadata {
-        md = self.metadata_with_dax_state(md);
+        md = Self::metadata_with_inode_flags(md, self.dax_active);
         let mut metadata = self.cached_metadata.lock();
         let stale_reply = self.attr_version() > request_epoch;
         if stale_reply {
@@ -1552,7 +1549,7 @@ impl FuseNode {
             btime: PosixTimeSpec::default(),
             file_type,
             mode,
-            flags: InodeFlags::empty(),
+            flags: InodeFlags::S_NOATIME,
             nlinks: attr.nlink as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,

@@ -1043,6 +1043,14 @@ pub(crate) fn report() -> String {
             "heap_denied_bio_birth",
             crate::driver::base::block::bio::heap_denied_bio_birth,
         ),
+        (
+            "bio_terminal_protocol",
+            crate::driver::base::block::bio::bio_terminal_protocol,
+        ),
+        (
+            "heap_denied_bio_wait",
+            crate::driver::base::block::bio::heap_denied_bio_wait,
+        ),
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         (
             "heap_denied_virtio_share",
@@ -1109,6 +1117,10 @@ pub(crate) fn report() -> String {
         ("heap_denied_rwsem_mixed_broadcast", || {
             heap_denied_resource_contention(ContendedResource::MixedBroadcast)
         }),
+        (
+            "heap_denied_resource_mutex_protocol",
+            resource_wait::resource_mutex_protocol,
+        ),
         (
             "heap_denied_page_entry_wait",
             crate::filesystem::page_cache::heap_denied_entry_wait_selftest,

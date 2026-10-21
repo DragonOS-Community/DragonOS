@@ -822,7 +822,7 @@ struct DaxCleanup {
 /// FUSE connection object (roughly equivalent to Linux `struct fuse_conn`).
 #[derive(Debug)]
 pub struct FuseConn {
-    inner: Mutex<FuseConnInner>,
+    inner: resource_wait::ResourceMutex<FuseConnInner>,
     next_unique: AtomicU64,
     attr_epoch: AtomicU64,
     dev_count: AtomicUsize,
@@ -939,7 +939,7 @@ impl FuseConn {
         dax_mode: DaxMountMode,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(FuseConnInner {
+            inner: resource_wait::ResourceMutex::new(FuseConnInner {
                 connected: true,
                 mounted: false,
                 initialized: false,

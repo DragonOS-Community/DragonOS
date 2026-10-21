@@ -1,4 +1,5 @@
 use super::*;
+use crate::libs::resource_wait::ResourceMutex;
 use crate::process::ProcessControlBlock;
 use core::sync::atomic::{AtomicBool, AtomicU8};
 
@@ -78,7 +79,7 @@ pub struct AddressSpaceData {
     /// file-rmap walkers need to edit remote PTEs under `mapping->i_mmap.read()`
     /// without taking `mm.write()`, while fault/munmap/mprotect/mremap paths must
     /// still synchronize with those edits.
-    page_table_edit_lock: Mutex<()>,
+    page_table_edit_lock: ResourceMutex<()>,
     /// Per-mm resident user pages, counted by present user PTEs.
     resident_user_pages: AtomicUsize,
     /// Peak resident user pages over this address space's lifetime.
@@ -504,7 +505,7 @@ impl AddressSpace {
             #[cfg(target_arch = "riscv64")]
             icache_stale_cpus: SpinLock::new(icache_stale_cpus),
             tlb_gen: AtomicU64::new(0),
-            page_table_edit_lock: Mutex::new(()),
+            page_table_edit_lock: ResourceMutex::new(()),
             resident_user_pages: AtomicUsize::new(0),
             peak_resident_user_pages: AtomicUsize::new(0),
             oom_reclaim_generation: AtomicU64::new(0),

@@ -978,42 +978,10 @@ impl IndexNode for FuseNode {
         Ok(())
     }
 
-    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
-        self.check_not_stale()?;
-        let _setattr_guard = self.setattr_lock.lock();
-        let mut metadata = self.cached_or_fetch_metadata()?;
-        if !crate::filesystem::vfs::update_atime_locked(&mut metadata, now, relatime) {
-            return Ok(());
-        }
-
-        let inarg = FuseSetattrIn {
-            valid: FATTR_ATIME,
-            padding: 0,
-            fh: 0,
-            size: 0,
-            lock_owner: 0,
-            atime: now.tv_sec as u64,
-            mtime: 0,
-            ctime: 0,
-            atimensec: now.tv_nsec as u32,
-            mtimensec: 0,
-            ctimensec: 0,
-            mode: 0,
-            unused4: 0,
-            uid: 0,
-            gid: 0,
-            unused5: 0,
-        };
-        let payload = self
-            .conn()
-            .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
-        let out: FuseAttrOut = fuse_read_struct(&payload)?;
-        self.set_cached_metadata_with_valid(
-            Self::attr_to_metadata(&out.attr),
-            out.attr_valid,
-            out.attr_valid_nsec,
-            out.attr.flags,
-        );
+    fn update_atime(&self, _now: PosixTimeSpec, _relatime: bool) -> Result<(), SystemError> {
+        // Every FUSE inode has S_NOATIME, as in Linux fuse_iget(). The daemon
+        // owns implicit access-time updates; explicit utimensat still uses
+        // set_metadata and must retain its normal SETATTR/error semantics.
         Ok(())
     }
 

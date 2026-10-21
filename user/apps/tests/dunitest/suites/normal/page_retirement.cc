@@ -36,9 +36,9 @@ TEST(PageRetirement, OwnershipAndLifecycle) {
             "heap_denied_manager_contention", "heap_denied_reclaimer_contention",
             "heap_denied_mm_write_contention", "heap_denied_pt_edit_contention",
             "heap_denied_page_write_contention", "heap_denied_vma_contention",
-            "heap_denied_rwsem_mixed_broadcast",
+            "heap_denied_rwsem_mixed_broadcast", "heap_denied_resource_mutex_protocol",
             "heap_denied_lazy_mm_queue", "heap_denied_futex_registration", "heap_denied_futex_wake",
-            "heap_denied_page_entry_wait", "heap_denied_bio_birth",
+            "heap_denied_page_entry_wait", "heap_denied_bio_birth", "heap_denied_bio_wait", "bio_terminal_protocol",
 #if defined(__x86_64__)
             "socket_scratch_birth", "elf_scratch_birth",
 #endif

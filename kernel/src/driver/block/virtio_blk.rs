@@ -275,10 +275,6 @@ impl BioTokenMap {
         Ok(())
     }
 
-    pub fn remove(&self, token: u16) -> Option<BioContext> {
-        self.inner.lock_irqsave().remove(&token)
-    }
-
     pub fn drain_all(&self) -> Vec<BioContext> {
         self.inner
             .lock_irqsave()
@@ -362,7 +358,10 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
             None => break,
         };
 
-        let ctx = match token_map.remove(token) {
+        // Keep the DMA owner registered until the used descriptor is retired.
+        // NotReady must leave the context in place without a remove/reinsert.
+        let mut contexts = token_map.inner.lock_irqsave();
+        let ctx = match contexts.get_mut(&token) {
             Some(ctx) => ctx,
             None => {
                 error!("VirtIOBlk: token {} not found in token_map", token);
@@ -370,7 +369,6 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
             }
         };
 
-        let mut ctx = ctx;
         let bio = ctx.bio.clone();
         let count = bio.count();
         let result = match bio.bio_type() {
@@ -387,11 +385,6 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                 } {
                     Ok(_) => Ok(count * LBA_SIZE),
                     Err(VirtioError::NotReady) => {
-                        if token_map.insert(token, ctx).is_err() {
-                            error!("VirtIOBlk: token {} reinsert failed", token);
-                            drop(inner);
-                            device.complete_accounted_bio(&bio, Err(SystemError::EIO));
-                        }
                         break;
                     }
                     Err(e) => {
@@ -413,11 +406,6 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                 } {
                     Ok(_) => Ok(count * LBA_SIZE),
                     Err(VirtioError::NotReady) => {
-                        if token_map.insert(token, ctx).is_err() {
-                            error!("VirtIOBlk: token {} reinsert failed", token);
-                            drop(inner);
-                            device.complete_accounted_bio(&bio, Err(SystemError::EIO));
-                        }
                         break;
                     }
                     Err(e) => {
@@ -430,11 +418,6 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                 match unsafe { device_inner.complete_flush(token, &ctx.req, &mut ctx.resp) } {
                     Ok(_) => Ok(0),
                     Err(VirtioError::NotReady) => {
-                        if token_map.insert(token, ctx).is_err() {
-                            error!("VirtIOBlk: token {} reinsert failed", token);
-                            drop(inner);
-                            device.complete_accounted_bio(&bio, Err(SystemError::EIO));
-                        }
                         break;
                     }
                     Err(e) => {
@@ -444,6 +427,10 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                 }
             }
         };
+        let _ctx = contexts
+            .remove(&token)
+            .expect("completed context stays registered");
+        drop(contexts);
         drop(inner);
         // Wake before callbacks: a callback may itself need another BIO to
         // progress. Descriptor reclamation, not a timer, drives backpressure.
@@ -976,10 +963,8 @@ impl BlockDevice for VirtIOBlkDevice {
             return Err(SystemError::EINVAL);
         }
         let bio = self.submit_bio_read(lba_id_start, count)?;
-        let data = bio
-            .wait()
+        bio.wait_read_into(&mut buf[..expected])
             .inspect_err(|e| log::error!("VirtIOBlkDevice read_at_sync error: {:?}", e))?;
-        buf[..expected].copy_from_slice(&data);
         Ok(expected)
     }
 
@@ -1298,10 +1283,18 @@ impl KObject for VirtIOBlkDevice {
 
 impl Drop for VirtIOBlkDevice {
     fn drop(&mut self) {
-        let (bio_queue, bio_token_map) = {
-            let inner = self.inner.lock_irqsave();
-            (inner.bio_queue.clone(), inner.bio_token_map.clone())
+        let (device_inner, bio_queue, bio_token_map) = {
+            let mut inner = self.inner.lock_irqsave();
+            inner.state = VirtIOBlkState::Reset;
+            (
+                inner.device_inner.take(),
+                inner.bio_queue.clone(),
+                inner.bio_token_map.clone(),
+            )
         };
+        // Reset the transport before publishing terminal results or releasing
+        // request/response storage which can still be visible to the device.
+        drop(device_inner);
 
         if let Some(bio_queue) = bio_queue {
             loop {

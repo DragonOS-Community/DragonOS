@@ -268,8 +268,36 @@ fn contended_connection() -> Result<bool, SystemError> {
     Ok(completed && joined && passed.load(Ordering::Acquire))
 }
 
+fn rejected_dax_abort_preflight() -> Result<bool, SystemError> {
+    let conn = connection();
+    let owners = Arc::strong_count(&conn);
+    let input = super::super::super::protocol::FuseSetupMappingIn {
+        fh: 0,
+        foffset: 0,
+        len: super::super::super::virtiofs::dax::DAX_RANGE_SIZE as u64,
+        flags: 1,
+        moffset: 0,
+    };
+    let passed = {
+        let _deny = denial::Scope::enter(true);
+        let probe = denial::probe_denied();
+        let result = conn.request_dax_mapping(FUSE_SETUPMAPPING, 1, fuse_pack_struct(&input));
+        probe
+            && matches!(
+                result,
+                FuseDaxRequestOutcome::NeverSubmitted(SystemError::ENOMEM)
+            )
+            && unpublished(&conn)
+            && Arc::strong_count(&conn) == owners
+            && denial::probe_denied()
+    };
+    conn.disconnect_requests();
+    Ok(passed)
+}
+
 pub(super) fn run() -> Result<bool, SystemError> {
-    Ok(rejected_birth()?
+    Ok(rejected_dax_abort_preflight()?
+        && rejected_birth()?
         && rejected_publication(false)?
         && rejected_publication(true)?
         && prepared_publication_without_heap()?

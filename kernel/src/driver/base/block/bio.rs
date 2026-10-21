@@ -54,20 +54,7 @@ impl BioRequest {
     pub fn try_new_read(lba_start: BlockId, count: usize) -> Result<Arc<Self>, SystemError> {
         let len = Self::validate_request(lba_start, count)?;
         let buffer = DmaBuffer::try_alloc_bytes(len, Default::default())?;
-        Ok(Arc::new(Self {
-            inner: SpinLock::new(InnerBioRequest {
-                bio_type: BioType::Read,
-                lba_start,
-                count,
-                buffer,
-                state: BioState::Init,
-                completion: Arc::new(Completion::new()),
-                result: None,
-                complete_callbacks: Vec::new(),
-                token: None,
-                stats_submit_cycle: 0,
-            }),
-        }))
+        Self::try_from_buffer(BioType::Read, lba_start, count, buffer)
     }
 
     /// 创建一个写请求
@@ -89,38 +76,52 @@ impl BioRequest {
         let mut buffer = DmaBuffer::try_alloc_bytes(len, Default::default())?;
         buffer.as_mut_slice().copy_from_slice(data);
 
-        Ok(Arc::new(Self {
-            inner: SpinLock::new(InnerBioRequest {
-                bio_type: BioType::Write,
-                lba_start,
-                count,
-                buffer,
-                state: BioState::Init,
-                completion: Arc::new(Completion::new()),
-                result: None,
-                complete_callbacks: Vec::new(),
-                token: None,
-                stats_submit_cycle: 0,
-            }),
-        }))
+        Self::try_from_buffer(BioType::Write, lba_start, count, buffer)
     }
 
     /// Create a new flush request.
     pub fn new_flush() -> Arc<Self> {
-        Arc::new(Self {
+        Self::try_new_flush().expect("bio flush allocation failed")
+    }
+
+    /// Prepare all request owners before publishing a flush to the device.
+    pub fn try_new_flush() -> Result<Arc<Self>, SystemError> {
+        let buffer = DmaBuffer::try_alloc_bytes(1, Default::default())?;
+        Self::try_from_buffer(BioType::Flush, 0, 0, buffer)
+    }
+
+    fn try_from_buffer(
+        bio_type: BioType,
+        lba_start: BlockId,
+        count: usize,
+        buffer: DmaBuffer,
+    ) -> Result<Arc<Self>, SystemError> {
+        let completion = Arc::try_new(Completion::new()).map_err(|_| SystemError::ENOMEM)?;
+        Self::try_from_parts(bio_type, lba_start, count, buffer, completion)
+    }
+
+    fn try_from_parts(
+        bio_type: BioType,
+        lba_start: BlockId,
+        count: usize,
+        buffer: DmaBuffer,
+        completion: Arc<Completion>,
+    ) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
             inner: SpinLock::new(InnerBioRequest {
-                bio_type: BioType::Flush,
-                lba_start: 0,
-                count: 0,
-                buffer: DmaBuffer::alloc_bytes(1, Default::default()),
+                bio_type,
+                lba_start,
+                count,
+                buffer,
                 state: BioState::Init,
-                completion: Arc::new(Completion::new()),
+                completion,
                 result: None,
                 complete_callbacks: Vec::new(),
                 token: None,
                 stats_submit_cycle: 0,
             }),
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     /// 标记为已提交，设置token
@@ -324,4 +325,42 @@ impl BioRequest {
             BioType::Flush => 0,
         }
     }
+}
+
+/// Exercise both Arc allocation boundaries through the production constructors.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_bio_birth() -> Result<bool, SystemError> {
+    use crate::mm::oom::denial;
+    let first = DmaBuffer::try_alloc_bytes(LBA_SIZE, Default::default())?;
+    let second = DmaBuffer::try_alloc_bytes(LBA_SIZE, Default::default())?;
+    let completion = Arc::try_new(Completion::new()).map_err(|_| SystemError::ENOMEM)?;
+    let rejected = {
+        let _denied = denial::Scope::enter(true);
+        let before = denial::rejected_count();
+        let first_failed = matches!(
+            BioRequest::try_from_buffer(BioType::Read, 0, 1, first),
+            Err(SystemError::ENOMEM)
+        );
+        let second_failed = matches!(
+            BioRequest::try_from_parts(BioType::Read, 0, 1, second, completion.clone()),
+            Err(SystemError::ENOMEM)
+        );
+        let read = matches!(BioRequest::try_new_read(0, 1), Err(SystemError::ENOMEM));
+        let write = matches!(
+            BioRequest::try_new_write(0, 1, &[0; LBA_SIZE]),
+            Err(SystemError::ENOMEM)
+        );
+        let flush = matches!(BioRequest::try_new_flush(), Err(SystemError::ENOMEM));
+        first_failed
+            && second_failed
+            && read
+            && write
+            && flush
+            && Arc::strong_count(&completion) == 1
+            && denial::rejected_count() >= before + 2
+    };
+    // Removing denial must leave a reusable request lifecycle, without device ownership.
+    let bio = BioRequest::try_new_flush()?;
+    bio.complete(Ok(0));
+    Ok(rejected && bio.wait_status()? == 0)
 }

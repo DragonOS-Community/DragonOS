@@ -39,7 +39,7 @@ use crate::filesystem::{
 /// destination into a single value so the two can never disagree: a
 /// [`FuseReplyRouting::ReadPages`] request is always a reply-bearing
 /// `FUSE_READ`, validated in [`FuseConn::build_request`].
-enum FuseReplyRouting {
+pub(super) enum FuseReplyRouting {
     /// Deliver the reply into the connection's reply buffer.
     Normal,
     /// No reply is expected (e.g. `FUSE_FORGET`).
@@ -117,6 +117,12 @@ impl FuseConn {
         if let Err(error) = self.wait_initialized() {
             return FuseDaxRequestOutcome::NeverSubmitted(error);
         }
+        // Abort cannot wait synchronously for the caller's own DAX admission.
+        // Prepare its owner before publishing a request which may need cleanup.
+        let abort_work = match self.prepare_dax_abort() {
+            Ok(work) => work,
+            Err(error) => return FuseDaxRequestOutcome::NeverSubmitted(error),
+        };
         let pending = match self.enqueue_request(opcode, nodeid, payload) {
             Ok(pending) => pending,
             Err(error) => return FuseDaxRequestOutcome::NeverSubmitted(error),
@@ -127,8 +133,7 @@ impl FuseConn {
                 // The DAX caller still owns an admission guard. Synchronous
                 // abort would wait for that same guard and self-deadlock, so
                 // defer connection teardown until this stack has unwound.
-                let conn = self.clone();
-                schedule_work(Work::new(move || conn.abort()));
+                schedule_work(abort_work);
                 return FuseDaxRequestOutcome::Disconnected(SystemError::ENOTCONN);
             }
         };
@@ -150,6 +155,11 @@ impl FuseConn {
             }
             _ => FuseDaxRequestOutcome::OutcomeUnknown(SystemError::EIO),
         }
+    }
+
+    fn prepare_dax_abort(self: &Arc<Self>) -> Result<Arc<Work>, SystemError> {
+        let conn = self.clone();
+        Work::try_new(move || conn.abort())
     }
 
     fn is_high_priority_opcode(opcode: u32) -> bool {
@@ -669,7 +679,7 @@ impl FuseConn {
         }))
     }
 
-    fn build_request(
+    pub(super) fn build_request(
         &self,
         unique: u64,
         opcode: u32,
@@ -728,11 +738,12 @@ impl FuseConn {
             read_pages_destination,
             track_direct_read_stats,
             stats_owner: Default::default(),
+            retired_next: crate::libs::spinlock::SpinLock::new(None),
         })
         .map_err(|_| SystemError::ENOMEM)
     }
 
-    fn push_request(
+    pub(super) fn push_request(
         &self,
         req: Arc<FuseRequest>,
         pending_state: Option<Arc<FusePendingState>>,

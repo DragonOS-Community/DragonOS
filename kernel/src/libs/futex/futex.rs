@@ -44,6 +44,10 @@ use crate::{
 
 use super::constant::*;
 
+#[path = "queue.rs"]
+mod queue;
+use queue::{Node as WaitNode, Queue as WaitQueueNodes};
+
 #[cfg(feature = "mm_selftest")]
 #[path = "wake_selftest.rs"]
 mod selftest;
@@ -87,7 +91,7 @@ pub struct Futex;
 // 对于同一个futex的进程或线程将会在这个bucket等待
 pub struct FutexHashBucket {
     // 该futex维护的等待队列
-    pub(super) chain: LinkedList<Arc<FutexObj>>,
+    pub(super) chain: WaitQueueNodes<Arc<FutexObj>>,
     // PI futex state
     pub(super) pi_owner: u32,
     pub(super) pi_waiters: LinkedList<Arc<FutexObj>>,
@@ -96,7 +100,7 @@ pub struct FutexHashBucket {
 impl FutexHashBucket {
     pub fn new() -> Self {
         Self {
-            chain: LinkedList::new(),
+            chain: WaitQueueNodes::new(),
             pi_owner: 0,
             pi_waiters: LinkedList::new(),
         }
@@ -106,9 +110,11 @@ impl FutexHashBucket {
         self.chain.is_empty() && self.pi_waiters.is_empty() && self.pi_owner == 0
     }
 
+    #[cfg(feature = "mm_selftest")]
     #[inline(always)]
     pub fn enqueue(&mut self, futex_q: Arc<FutexObj>) {
-        self.chain.push_back(futex_q);
+        self.chain
+            .push_node(WaitNode::try_new(futex_q).expect("futex test node allocation failed"));
     }
 
     /// ## 唤醒队列中的最多nr_wake个进程
@@ -121,21 +127,27 @@ impl FutexHashBucket {
         nr_wake: u32,
     ) -> Result<usize, SystemError> {
         let mut count = 0;
-        // Leave nonmatching nodes in place: pop/push would allocate a fresh
-        // LinkedList node on this wake-only path.
-        let mut matching = self.chain.extract_if(|waiter| {
-            let matches = *waiter.key.lock() == key;
-            matches && bitset.is_none_or(|mask| waiter.bitset & mask != 0)
-        });
+        // Keep only the visited prefix separately. Stop at the wake budget,
+        // then splice the untouched suffix back in O(1), preserving FIFO and
+        // avoiding a full-bucket scan when the first waiter can be woken.
+        let mut retained = WaitQueueNodes::new();
         while count < nr_wake {
-            let Some(waiter) = matching.next() else { break };
-            // A stale/notified waker is removed but does not consume the
-            // successful-wakeup budget. Dropping the iterator preserves the
-            // remaining nodes and their original order.
-            if waiter.waker.wake() {
-                count += 1;
+            let Some(node) = self.chain.pop_node() else {
+                break;
+            };
+            let waiter = node.value();
+            let matches =
+                *waiter.key.lock() == key && bitset.is_none_or(|mask| waiter.bitset & mask != 0);
+            if matches {
+                if waiter.waker.wake() {
+                    count += 1;
+                }
+            } else {
+                retained.push_node(node);
             }
         }
+        retained.append(&mut self.chain);
+        self.chain = retained;
 
         Ok(count as usize)
     }
@@ -143,9 +155,12 @@ impl FutexHashBucket {
     /// 将FutexObj从bucket中删除
     pub fn remove_by_waker(&mut self, waker: &Arc<Waker>) -> bool {
         let before = self.chain.len();
-        self.chain
-            .extract_if(|x| Arc::ptr_eq(&x.waker, waker))
-            .for_each(drop);
+        for _ in 0..before {
+            let node = self.chain.pop_node().unwrap();
+            if !Arc::ptr_eq(&node.value().waker, waker) {
+                self.chain.push_node(node);
+            }
+        }
         before != self.chain.len()
     }
 }
@@ -364,7 +379,7 @@ impl Futex {
         let timer_deadline = abs_time
             .filter(PosixTimeSpec::is_valid_timeout)
             .map(|time| next_n_us_timer_jiffies(time.to_ktime_ns().div_ceil(1000)));
-        let (key, mut futex_map_guard, uval) = loop {
+        let (key, futex_map_guard, uval) = loop {
             let key = Self::get_futex_key(
                 uaddr,
                 flags.contains(FutexFlag::FLAGS_SHARED),
@@ -403,40 +418,71 @@ impl Futex {
                 return Err(SystemError::ETIMEDOUT);
             }
         }
+        // Preparation may allocate, so release the resource lock and keep all
+        // unpublished owners outside the final registration guard's lifetime.
+        drop(futex_map_guard);
+        let (waiter, waker) = Waiter::try_new_pair()?;
+        let prepared_timer = if let Some(jiffies) = timer_deadline {
+            let callback = Box::try_new(WakerTimer {
+                waker: waker.clone(),
+            })
+            .map_err(|_| SystemError::ENOMEM)?;
+            Some(Timer::try_prepare(callback, jiffies)?)
+        } else {
+            None
+        };
+        let timer = prepared_timer.as_ref().map(|prepared| prepared.timer());
+        let futex_q = Arc::try_new(FutexObj {
+            waker: waker.clone(),
+            key: SpinLock::new(key),
+            bitset,
+            tid: 0,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        let node = WaitNode::try_new(futex_q.clone())?;
+
+        // Both the shared mapping identity and the value may have changed while
+        // preparing. Refault without the map guard, then resolve both anew.
+        let (key, mut futex_map_guard) = loop {
+            let key = Self::get_futex_key(
+                uaddr,
+                flags.contains(FutexFlag::FLAGS_SHARED),
+                FutexAccess::FutexRead,
+            )?;
+            let map = FutexData::futex_map();
+            match Self::read_user_u32_nofault(uaddr) {
+                Ok(value) if value != val => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+                Ok(_) => break (key, map),
+                Err(SystemError::EFAULT) => {
+                    drop(map);
+                    let reader = UserBufferReader::new(
+                        uaddr.as_ptr::<u32>(),
+                        core::mem::size_of::<u32>(),
+                        true,
+                    )?;
+                    let _ = reader.read_one_from_user::<u32>(0)?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if timer_deadline.is_some_and(|deadline| deadline <= crate::time::timer::clock()) {
+            return Err(SystemError::ETIMEDOUT);
+        }
         if !futex_map_guard.contains_key(&key) {
             futex_map_guard
                 .try_reserve(1)
                 .map_err(|_| SystemError::ENOMEM)?;
         }
-        let (waiter, waker) = Waiter::new_pair();
-        // 创建超时计时器任务
-        let mut timer = None;
-        if let Some(jiffies) = timer_deadline {
-            let wake_up = Timer::new(
-                Box::new(WakerTimer {
-                    waker: waker.clone(),
-                }),
-                jiffies,
-            );
-            timer = Some(wake_up);
-        }
-
-        let futex_q = Arc::new(FutexObj {
-            waker: waker.clone(),
-            key: SpinLock::new(key.clone()),
-            bitset,
-            tid: 0,
-        });
+        *futex_q.key.lock() = key.clone();
         futex_map_guard
-            .entry(key.clone())
+            .entry(key)
             .or_insert_with(FutexHashBucket::new)
-            .enqueue(futex_q.clone());
-
-        // 在入队后激活定时器，避免短超时在阻塞之前触发造成唤醒丢失
-        if let Some(ref t) = timer {
-            t.activate();
+            .chain
+            .push_node(node);
+        // Queue publication and timer activation are now allocation-free.
+        if let Some(prepared) = prepared_timer {
+            prepared.activate();
         }
-
         drop(futex_map_guard);
         // 阻塞等待
         let wait_res = waiter.wait(true);
@@ -467,6 +513,12 @@ impl Futex {
         // 取消定时器
         if let Some(timer) = timer {
             timer.cancel();
+        }
+
+        // Linux gives successful unqueue by WAKE priority over a racing timer
+        // or signal. Only a waiter still queued can report either interruption.
+        if !in_queue {
+            return Ok(0);
         }
 
         // 处理等待结果

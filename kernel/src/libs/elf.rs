@@ -389,10 +389,7 @@ impl ElfLoader {
                     elf_type,
                     total_size,
                 )
-                .map_err(|e| {
-                    log::error!("Failed to load elf interpreter :{:?}", e);
-                    return ExecError::InvalidParemeter;
-                })?;
+                .map_err(ExecError::SystemError)?;
                 total_size = 0;
                 if !load_addr_set && interp_hdr.e_type == ET_DYN {
                     load_addr =
@@ -466,17 +463,40 @@ impl ElfLoader {
     /// - `offset_in_file`：在文件内的偏移量
     /// - `param`：执行参数
     fn do_load_file(
-        mut vaddr: VirtAddr,
+        vaddr: VirtAddr,
         size: usize,
         offset_in_file: usize,
         param: &mut ExecParam,
     ) -> Result<(), SystemError> {
-        let file = param.file_ref();
+        Self::do_load_file_with(vaddr, size, offset_in_file, param.file_ref(), |buf_size| {
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+            {
+                crate::mm::kernel_buffer::KernelBuffer::new_zeroed_recovering(buf_size)
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+            {
+                let mut buffer = Vec::new();
+                buffer
+                    .try_reserve_exact(buf_size)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                buffer.resize(buf_size, 0);
+                Ok(buffer)
+            }
+        })
+    }
+
+    fn do_load_file_with<B: core::ops::DerefMut<Target = [u8]>>(
+        mut vaddr: VirtAddr,
+        size: usize,
+        offset_in_file: usize,
+        file: &crate::filesystem::vfs::file::File,
+        allocate: impl FnOnce(usize) -> Result<B, SystemError>,
+    ) -> Result<(), SystemError> {
         if (file.metadata()?.size as usize) < offset_in_file + size {
             return Err(SystemError::ENOEXEC);
         }
         let buf_size = min(size, Self::FILE_READ_BUF_SIZE);
-        let mut buf = vec![0u8; buf_size];
+        let mut buf = allocate(buf_size)?;
 
         let mut remain = size;
 
@@ -1189,3 +1209,8 @@ impl<'data> ReadBytesExt<'data> for &'data [u8] {
             .ok_or(elf::ParseError::SliceReadError((start, end)))
     }
 }
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+mod scratch_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) use scratch_selftest::run as scratch_birth_selftest;

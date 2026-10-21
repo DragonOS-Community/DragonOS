@@ -1031,6 +1031,23 @@ pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     type Check = fn() -> Result<bool, SystemError>;
     let tests: &[(&str, Check)] = &[
+        #[cfg(target_arch = "x86_64")]
+        ("socket_scratch_birth", || {
+            Ok(crate::net::socket::scratch_birth_selftest())
+        }),
+        #[cfg(target_arch = "x86_64")]
+        ("elf_scratch_birth", || {
+            Ok(crate::libs::elf::scratch_birth_selftest())
+        }),
+        (
+            "heap_denied_bio_birth",
+            crate::driver::base::block::bio::heap_denied_bio_birth,
+        ),
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        (
+            "heap_denied_virtio_share",
+            crate::driver::virtio::virtio_impl::heap_denied_virtio_share,
+        ),
         (
             "heap_denied_rcu_slot_drop",
             crate::rcu::heap_denied_slot_drop_selftest,

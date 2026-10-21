@@ -389,12 +389,38 @@ pub(crate) fn read_to_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
     user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     kernel_buf_len: usize,
 ) -> Result<usize, SystemError> {
+    read_to_user_buffer_with(socket, user_buffer, kernel_buf_len, |scratch_len| {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            crate::mm::kernel_buffer::KernelBuffer::new_zeroed_recovering(scratch_len)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(scratch_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            buffer.resize(scratch_len, 0);
+            Ok(buffer)
+        }
+    })
+}
+
+fn read_to_user_buffer_with<S, B>(
+    socket: &S,
+    user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    kernel_buf_len: usize,
+    allocate: impl FnOnce(usize) -> Result<B, SystemError>,
+) -> Result<usize, SystemError>
+where
+    S: Socket + ?Sized,
+    B: core::ops::DerefMut<Target = [u8]>,
+{
     if user_buffer.is_empty() {
         return Ok(0);
     }
-
     let scratch_len = core::cmp::min(kernel_buf_len.max(1), user_buffer.len());
-    let mut kbuf = alloc::vec![0u8; scratch_len];
+    let mut kbuf = allocate(scratch_len)?;
     let n = socket.read(&mut kbuf)?;
     user_buffer.write_to_user(0, &kbuf[..n])?;
     Ok(n)
@@ -470,3 +496,8 @@ pub(crate) fn send_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
 
     Ok(total_sent)
 }
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+mod scratch_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) use scratch_selftest::run as scratch_birth_selftest;

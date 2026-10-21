@@ -40,3 +40,6 @@ pub use posix::PSO;
 pub use posix::PSOCK;
 pub use posix::PSOL;
 pub use utils::create_socket;
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) use base::scratch_birth_selftest;

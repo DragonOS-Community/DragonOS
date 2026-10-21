@@ -1003,7 +1003,7 @@ impl BlockDevice for VirtIOBlkDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        let bio = BioRequest::new_flush();
+        let bio = BioRequest::try_new_flush()?;
         self.submit_bio(bio.clone())?;
         bio.wait_status()
             .inspect_err(|e| log::error!("VirtIOBlkDevice sync flush error: {:?}", e))?;

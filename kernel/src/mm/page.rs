@@ -1496,6 +1496,9 @@ impl PageReclaimer {
                 return;
             }
         };
+        if !page_cache.supports_writeback() {
+            return;
+        }
         let paddr = guard.phys_address();
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
         let backend = page_cache.backend();

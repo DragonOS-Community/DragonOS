@@ -1,118 +1,96 @@
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
+use system_error::SystemError;
 
-use crate::libs::{spinlock::SpinLock, wait_queue::WaitQueue};
+use crate::libs::{
+    prepared_queue::{Node, Queue},
+    resource_wait::ResourceWaitQueue,
+    spinlock::SpinLock,
+};
 
 use super::bio::BioRequest;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BioQueueState {
     Running,
-    Quiescing,
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BioQueueWake {
     WorkAvailable,
     Stopping,
 }
 
-/// 简单的FIFO BIO队列
+/// FIFO admission is allocation-free once the caller has prepared its node.
+/// The worker and teardown transfer owners without allocating temporary batches.
 pub struct BioQueue {
     inner: SpinLock<InnerBioQueue>,
-    wait_queue: WaitQueue,
-    batch_size: usize,
+    wait_queue: ResourceWaitQueue,
 }
-
 struct InnerBioQueue {
-    queue: VecDeque<Arc<BioRequest>>,
+    queue: Queue<Arc<BioRequest>>,
     state: BioQueueState,
 }
 
-impl BioQueue {
-    pub const DEFAULT_BATCH_SIZE: usize = 16;
+pub(crate) type PreparedBio = Box<Node<Arc<BioRequest>>>;
 
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+impl BioQueue {
+    pub(crate) fn try_new() -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
             inner: SpinLock::new(InnerBioQueue {
-                queue: VecDeque::new(),
+                queue: Queue::new(),
                 state: BioQueueState::Running,
             }),
-            wait_queue: WaitQueue::default(),
-            batch_size: Self::DEFAULT_BATCH_SIZE,
+            wait_queue: ResourceWaitQueue::new(),
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
-    /// 提交BIO请求（非阻塞）
-    pub fn submit(&self, bio: Arc<BioRequest>) -> Result<(), system_error::SystemError> {
-        let should_wakeup = {
-            let mut inner = self.inner.lock_irqsave();
-            if inner.state != BioQueueState::Running {
-                return Err(system_error::SystemError::ESHUTDOWN);
-            }
-            let was_empty = inner.queue.is_empty();
-            inner.queue.push_back(bio);
-            was_empty
-        };
+    /// Call before taking the device admission lock.
+    pub(crate) fn prepare(bio: Arc<BioRequest>) -> Result<PreparedBio, SystemError> {
+        Node::try_new(bio)
+    }
 
-        if should_wakeup {
-            self.wait_queue.wakeup(None);
+    pub(crate) fn submit(&self, node: PreparedBio) -> Result<(), PreparedBio> {
+        let mut inner = self.inner.lock_irqsave();
+        if inner.state != BioQueueState::Running {
+            return Err(node);
         }
-
+        let was_empty = inner.queue.is_empty();
+        inner.queue.push_node(node);
+        drop(inner);
+        if was_empty {
+            self.wait_queue.notify_one();
+        }
         Ok(())
     }
 
-    /// 批量取出请求（用于worker线程）
-    pub fn drain_batch(&self, limit: usize) -> Vec<Arc<BioRequest>> {
-        let mut inner = self.inner.lock_irqsave();
-        // Transfer only requests that the caller can retain and process. A
-        // budget boundary must never discard the tail of an already drained Vec.
-        let batch_size = self.batch_size.min(limit).min(inner.queue.len());
-        if batch_size == 0 {
-            return Vec::new();
-        }
-        inner.queue.drain(..batch_size).collect()
+    pub(crate) fn pop(&self) -> Option<Arc<BioRequest>> {
+        let node = self.inner.lock_irqsave().queue.pop_node();
+        node.map(|node| node.into_value())
     }
 
-    /// Worker waits for new requests or a stop signal.
-    ///
-    /// The BIO worker is a kernel thread and should not be interrupted by normal signals to avoid ERESTARTSYS log storms.
     pub fn wait_for_work_or_stop(&self) -> BioQueueWake {
-        let _ = self.wait_queue.wait_event_uninterruptible(
-            || {
+        self.wait_queue
+            .wait_uninterruptible(|| {
                 let inner = self.inner.lock_irqsave();
-                !inner.queue.is_empty() || inner.state != BioQueueState::Running
-            },
-            None::<fn()>,
-        );
-
-        let inner = self.inner.lock_irqsave();
-        if inner.queue.is_empty() && inner.state != BioQueueState::Running {
-            BioQueueWake::Stopping
-        } else {
-            BioQueueWake::WorkAvailable
-        }
+                if !inner.queue.is_empty() {
+                    Some(BioQueueWake::WorkAvailable)
+                } else if inner.state == BioQueueState::Stopped {
+                    Some(BioQueueWake::Stopping)
+                } else {
+                    None
+                }
+            })
+            .expect("BIO worker resource wait")
     }
 
-    /// Begin stopping: stop accepting new BIOs and wake up the worker to drain the queue.
-    pub fn begin_quiesce(&self) {
-        {
-            let mut inner = self.inner.lock_irqsave();
-            if inner.state == BioQueueState::Running {
-                inner.state = BioQueueState::Quiescing;
-            }
-        }
-        self.wait_queue.wakeup_all(None);
-    }
-
-    /// Stop the queue and drain any BIOs that have not been submitted to the underlying device.
-    pub fn stop_and_drain(&self) -> Vec<Arc<BioRequest>> {
+    pub(crate) fn stop_and_drain(&self) -> Queue<Arc<BioRequest>> {
         let pending = {
             let mut inner = self.inner.lock_irqsave();
             inner.state = BioQueueState::Stopped;
-            inner.queue.drain(..).collect()
+            core::mem::replace(&mut inner.queue, Queue::new())
         };
-        self.wait_queue.wakeup_all(None);
+        self.wait_queue.notify_all();
         pending
     }
 }

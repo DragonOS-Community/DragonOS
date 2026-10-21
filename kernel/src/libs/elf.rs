@@ -5,31 +5,30 @@ use core::{
     ops::Range,
 };
 
-use alloc::{ffi::CString, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use elf::{
     abi::{ET_DYN, ET_EXEC, PT_GNU_PROPERTY, PT_INTERP, PT_LOAD},
     endian::AnyEndian,
     file::FileHeader,
     segment::{ProgramHeader, SegmentTable},
 };
-use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
-    filesystem::vfs::{fcntl::AtFlags, open::do_open_execat},
+    filesystem::vfs::{
+        fcntl::AtFlags, file::File, open::do_open_execat, write_access::InodeWriteGuard,
+    },
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
         syscall::{MapFlags, ProtFlags},
+        ucontext::AddressSpace,
         MemoryManagementArch, VirtAddr,
     },
     process::{
         abi::AtType,
-        exec::{
-            BinaryLoader, BinaryLoaderResult, ExecError, ExecInterpFlags, ExecLoadMode, ExecParam,
-            ExecParamFlags,
-        },
+        exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
         ProcessFlags, ProcessManager,
     },
     syscall::user_access::{clear_user_protected, copy_to_user_protected},
@@ -45,6 +44,71 @@ pub trait ElfArch: Clone + Copy + Debug {
 pub struct ElfLoader;
 
 pub const ELF_LOADER: ElfLoader = ElfLoader::new();
+
+/// Per-exec metadata, prepared before the old image is committed. The table is
+/// borrowed on demand so this owner never contains a self-reference.
+struct PreparedElf {
+    header: FileHeader<AnyEndian>,
+    headers: Vec<u8>,
+}
+
+impl PreparedElf {
+    fn prepare(file: &File, header: FileHeader<AnyEndian>) -> Result<Self, SystemError> {
+        let headers = ElfLoader::read_program_headers(file, &header)?;
+        Ok(Self { header, headers })
+    }
+
+    fn segments(&self) -> SegmentTable<'_, AnyEndian> {
+        SegmentTable::new(self.header.endianness, self.header.class, &self.headers)
+    }
+}
+
+/// The interpreter needs an executable file and metadata, not another process
+/// argument/auxv builder. Release write exclusion before the file mount pin.
+struct PreparedInterpreter {
+    _write_guard: Arc<InodeWriteGuard>,
+    file: Arc<File>,
+    elf: PreparedElf,
+}
+
+impl PreparedInterpreter {
+    fn prepare(file: Arc<File>, vm: &Arc<AddressSpace>) -> Result<Self, ExecError> {
+        let guard = InodeWriteGuard::deny_write(file.inode()).map_err(ExecError::SystemError)?;
+        ExecParam::would_dump_file(&file, vm).map_err(ExecError::SystemError)?;
+        let mut bytes = [0; 64];
+        if file
+            .pread(0, bytes.len(), &mut bytes)
+            .map_err(ExecError::SystemError)?
+            != bytes.len()
+        {
+            return Err(ExecError::SystemError(SystemError::EIO));
+        }
+        let bad = || ExecError::SystemError(SystemError::ELIBBAD);
+        let header = ElfLoader::parse_ehdr(&bytes).map_err(|_| bad())?;
+        // Interpreter validation is complete before begin_new_exec(), as in
+        // Linux load_elf_binary(), rather than in the mapping phase.
+        #[cfg(target_arch = "x86_64")]
+        let arch_matches = ElfMachine::from(header.e_machine) == ElfMachine::X86_64;
+        #[cfg(target_arch = "riscv64")]
+        let arch_matches = ElfMachine::from(header.e_machine) == ElfMachine::RiscV;
+        #[cfg(target_arch = "loongarch64")]
+        let arch_matches = ElfMachine::from(header.e_machine) == ElfMachine::LoongArch;
+        if header.class != elf::file::Class::ELF64
+            || !arch_matches
+            || (header.e_type != ET_EXEC && header.e_type != ET_DYN)
+        {
+            return Err(bad());
+        }
+        // Linux load_elf_phdrs folds allocation/read failures into ELIBBAD for
+        // an interpreter (and ENOEXEC for the main executable).
+        let elf = PreparedElf::prepare(&file, header).map_err(|_| bad())?;
+        Ok(Self {
+            _write_guard: guard,
+            file,
+            elf,
+        })
+    }
+}
 
 impl ElfLoader {
     /// 读取文件的缓冲区大小
@@ -204,7 +268,8 @@ impl ElfLoader {
     /// not hold the address-space lock: mmap hooks, population and BSS writes
     /// can fault or acquire that lock themselves.
     fn load_elf_segment(
-        param: &mut ExecParam,
+        file: &Arc<File>,
+        vm: &Arc<AddressSpace>,
         phent: &ProgramHeader,
         addr_to_map: VirtAddr,
         prot: ProtFlags,
@@ -250,7 +315,6 @@ impl ElfLoader {
         if map_len == 0 {
             return Ok(addr_to_map);
         }
-        let vm = param.vm().clone();
         let mapped = if phent.p_filesz == 0 {
             vm.map_anonymous_wait(
                 addr_to_map,
@@ -279,7 +343,7 @@ impl ElfLoader {
             };
             let mapped = vm
                 .file_mapping_with_file(
-                    param.file(),
+                    file.clone(),
                     addr_to_map,
                     map_len,
                     load_prot,
@@ -293,9 +357,9 @@ impl ElfLoader {
             // population. Copy the file-mapped prefix/tail too, not just the
             // segment bytes; zeroed allocation supplies bytes past EOF.
             if !MMArch::PAGE_FAULT_ENABLED {
-                let file_size = param.file_ref().metadata()?.size.max(0) as usize;
+                let file_size = file.metadata()?.size.max(0) as usize;
                 let read_len = min(map_size, file_size.saturating_sub(file_offset));
-                Self::do_load_file(mapped, read_len, file_offset, param)?;
+                Self::do_load_file(mapped, read_len, file_offset, file)?;
                 if load_prot != prot {
                     vm.mprotect_wait(
                         VirtPageFrame::new(mapped),
@@ -322,41 +386,19 @@ impl ElfLoader {
     ///
     /// ## 参数
     ///
-    /// - `interp_elf_ex`:动态链接器
+    /// - `interpreter`:已准备的动态链接器文件及元数据
     /// - `load_bias`偏移量
     ///
     /// ## TODO
     ///
     /// 添加一个Arch state抽象，描述架构相关的elf state(参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#592)
     fn load_elf_interp(
-        interp_elf_ex: &mut ExecParam,
+        interpreter: &PreparedInterpreter,
+        vm: &Arc<AddressSpace>,
         load_bias: usize,
     ) -> Result<(BinaryLoaderResult, VirtAddr), ExecError> {
-        interp_elf_ex
-            .would_dump_current_file()
-            .map_err(ExecError::SystemError)?;
-        // log::debug!("loading elf interp");
-        // defer!({
-        //     log::debug!("load_elf_interp done");
-        // });
-        let mut head_buf = [0u8; 512];
-        interp_elf_ex
-            .file_ref()
-            .lseek(SeekFrom::SeekSet(0))
-            .map_err(|_| ExecError::NotSupported)?;
-        let _bytes = interp_elf_ex
-            .file_ref()
-            .read(512, &mut head_buf)
-            .map_err(|_| ExecError::NotSupported)?;
-        let interp_hdr =
-            Self::parse_ehdr(head_buf.as_ref()).map_err(|_| ExecError::NotExecutable)?;
-        if interp_hdr.e_type != ET_EXEC && interp_hdr.e_type != ET_DYN {
-            return Err(ExecError::NotExecutable);
-        }
-        let mut phdr_buf = Vec::new();
-        let phdr_table = Self::parse_segments(interp_elf_ex, &interp_hdr, &mut phdr_buf)
-            .map_err(|_| ExecError::ParseError)?
-            .ok_or(ExecError::ParseError)?;
+        let interp_hdr = &interpreter.elf.header;
+        let phdr_table = interpreter.elf.segments();
         //TODO 架构相关检查 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#610
         let mut total_size = Self::total_mapping_size(&phdr_table);
 
@@ -382,7 +424,8 @@ impl ElfLoader {
                     addr_to_map = VirtAddr::new(0);
                 }
                 let map_addr = Self::load_elf_segment(
-                    interp_elf_ex,
+                    &interpreter.file,
+                    vm,
                     &section,
                     addr_to_map,
                     elf_prot,
@@ -432,18 +475,15 @@ impl ElfLoader {
                 return Err(ExecError::InvalidParemeter);
             }
             let bss_prot = Self::elf_brk_prot_flags(bss_prot.unwrap());
-            interp_elf_ex
-                .vm()
-                .clone()
-                .map_anonymous_wait(
-                    elf_bss,
-                    last_bss - elf_bss,
-                    bss_prot,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
-                    false,
-                    true,
-                )
-                .map_err(ExecError::SystemError)?;
+            vm.map_anonymous_wait(
+                elf_bss,
+                last_bss - elf_bss,
+                bss_prot,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
+                false,
+                true,
+            )
+            .map_err(ExecError::SystemError)?;
         }
         let interp_base = load_addr;
         let entry = load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
@@ -461,14 +501,14 @@ impl ElfLoader {
     /// - `vaddr`：要加载到的虚拟地址
     /// - `size`：要加载的大小
     /// - `offset_in_file`：在文件内的偏移量
-    /// - `param`：执行参数
+    /// - `file`：待填充映射对应的文件
     fn do_load_file(
         vaddr: VirtAddr,
         size: usize,
         offset_in_file: usize,
-        param: &mut ExecParam,
+        file: &File,
     ) -> Result<(), SystemError> {
-        Self::do_load_file_with(vaddr, size, offset_in_file, param.file_ref(), |buf_size| {
+        Self::do_load_file_with(vaddr, size, offset_in_file, file, |buf_size| {
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
             {
                 crate::mm::kernel_buffer::KernelBuffer::new_zeroed_recovering(buf_size)
@@ -637,91 +677,49 @@ impl ElfLoader {
         return Ok(ehdr);
     }
 
-    /// 解析文件的program header table
-    ///
-    /// ## 参数
-    ///
-    /// - `param`：执行参数
-    /// - `ehdr`：文件头
-    /// - `data_buf`：用于缓存SegmentTable的Vec。
-    ///   这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
-    ///
-    /// ## 说明
-    ///
-    /// 这个函数由elf库的`elf::elf_bytes::find_phdrs`修改而来。
-    fn parse_segments<'a>(
-        param: &mut ExecParam,
-        ehdr: &FileHeader<AnyEndian>,
-        data_buf: &'a mut Vec<u8>,
-    ) -> Result<Option<elf::segment::SegmentTable<'a, AnyEndian>>, elf::ParseError> {
-        // It's Ok to have no program headers
-        if ehdr.e_phoff == 0 {
-            return Ok(None);
-        }
-        let file = param.file_ref();
-        // If the number of segments is greater than or equal to PN_XNUM (0xffff),
-        // e_phnum is set to PN_XNUM, and the actual number of program header table
-        // entries is contained in the sh_info field of the section header at index 0.
-        let mut phnum = ehdr.e_phnum as usize;
-        if phnum == elf::abi::PN_XNUM as usize {
-            let shoff: usize = ehdr.e_shoff.try_into()?;
-
-            // 从磁盘读取shdr的前2个entry
-            file.lseek(SeekFrom::SeekSet(shoff as i64))
-                .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
-            let shdr_buf_size = ehdr.e_shentsize * 2;
-            let mut shdr_buf = vec![0u8; shdr_buf_size as usize];
-            file.read(shdr_buf_size as usize, &mut shdr_buf)
-                .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
-
-            let mut offset = 0;
-            let shdr0 = <elf::section::SectionHeader as elf::parse::ParseAt>::parse_at(
-                ehdr.endianness,
-                ehdr.class,
-                &mut offset,
-                &shdr_buf,
-            )?;
-            phnum = shdr0.sh_info.try_into()?;
-        }
-
-        // Validate phentsize before trying to read the table so that we can error early for corrupted files
-        let entsize = <ProgramHeader as elf::parse::ParseAt>::validate_entsize(
+    /// Linux executable program-header tables fit in one ELF alignment unit
+    /// and at most 64 KiB. PN_XNUM is a core-file convention, not exec input.
+    fn program_headers_size(ehdr: &FileHeader<AnyEndian>) -> Result<usize, SystemError> {
+        let entry = <ProgramHeader as elf::parse::ParseAt>::validate_entsize(
             ehdr.class,
             ehdr.e_phentsize as usize,
-        )?;
-        let phoff: usize = ehdr.e_phoff.try_into()?;
-        let size = entsize
-            .checked_mul(phnum)
-            .ok_or(elf::ParseError::IntegerOverflow)?;
-        phoff
-            .checked_add(size)
-            .ok_or(elf::ParseError::IntegerOverflow)?;
-
-        // 读取program header table
-
-        file.lseek(SeekFrom::SeekSet(phoff as i64))
-            .map_err(|_| elf::ParseError::BadOffset(phoff as u64))?;
-        data_buf.clear();
-        data_buf.resize(size, 0);
-
-        let read_len = file.read(size, data_buf).map_err(|e| {
-            error!("read program header table failed: {:?}", e);
-            elf::ParseError::BadOffset(phoff as u64)
-        })?;
-        if read_len != size {
-            error!(
-                "short read program header table: expected {}, got {}",
-                size, read_len
-            );
-            return Err(elf::ParseError::BadOffset(phoff as u64));
+        )
+        .map_err(|_| SystemError::ENOEXEC)?;
+        let size = entry
+            .checked_mul(ehdr.e_phnum as usize)
+            .ok_or(SystemError::ENOEXEC)?;
+        if size == 0 || size > min(65536, CurrentElfArch::ELF_PAGE_SIZE) {
+            return Err(SystemError::ENOEXEC);
         }
-        let buf = data_buf.get_bytes(0..size)?;
+        let offset = usize::try_from(ehdr.e_phoff).map_err(|_| SystemError::ENOEXEC)?;
+        if offset
+            .checked_add(size)
+            .is_none_or(|end| end > isize::MAX as usize)
+        {
+            return Err(SystemError::ENOEXEC);
+        }
+        Ok(size)
+    }
 
-        return Ok(Some(elf::segment::SegmentTable::new(
-            ehdr.endianness,
-            ehdr.class,
-            buf,
-        )));
+    fn zeroed_metadata(size: usize) -> Result<Vec<u8>, SystemError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| SystemError::ENOMEM)?;
+        bytes.resize(size, 0);
+        Ok(bytes)
+    }
+
+    fn read_program_headers(
+        file: &File,
+        ehdr: &FileHeader<AnyEndian>,
+    ) -> Result<Vec<u8>, SystemError> {
+        let size = Self::program_headers_size(ehdr)?;
+        let mut bytes = Self::zeroed_metadata(size)?;
+        if file.pread(ehdr.e_phoff as usize, size, &mut bytes)? != size {
+            return Err(SystemError::ENOEXEC);
+        }
+        Ok(bytes)
     }
 
     // 解析 PT_GNU_PROPERTY 类型的段
@@ -775,12 +773,12 @@ impl BinaryLoader for ElfLoader {
 
         // debug!("to parse segments");
         // 加载ELF文件并映射到用户空间
-        let mut phdr_buf = Vec::new();
-        let phdr_table = Self::parse_segments(param, &ehdr, &mut phdr_buf)
-            .map_err(|_| ExecError::ParseError)?
-            .ok_or(ExecError::ParseError)?;
+        let prepared =
+            PreparedElf::prepare(param.file_ref(), ehdr).map_err(|_| ExecError::NotExecutable)?;
+        let ehdr = &prepared.header;
+        let phdr_table = prepared.segments();
         let mut _gnu_property_data: Option<ProgramHeader> = None;
-        let mut interpreter: Option<ExecParam> = None;
+        let mut interpreter = None;
         for seg in phdr_table {
             if seg.p_type == PT_GNU_PROPERTY {
                 _gnu_property_data = Some(seg);
@@ -789,67 +787,37 @@ impl BinaryLoader for ElfLoader {
             if seg.p_type != PT_INTERP {
                 continue;
             }
-
-            // 接下来处理这个 .interpreter 段以及动态链接器
-            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#881
-
             if seg.p_filesz > 4096 || seg.p_filesz < 2 {
                 return Err(ExecError::NotExecutable);
             }
-            let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
-            let r = param
-                .file_ref()
-                .pread(
-                    seg.p_offset.try_into().unwrap(),
-                    seg.p_filesz.try_into().unwrap(),
-                    buffer.as_mut_slice(),
-                )
-                .map_err(|e| {
-                    log::error!("Failed to load interpreter :{:?}", e);
-                    return ExecError::NotSupported;
-                })?;
-            if r != seg.p_filesz.try_into().unwrap() {
-                log::error!("Failed to load interpreter ");
-                return Err(ExecError::NotSupported);
+            let size = seg.p_filesz as usize;
+            let offset = usize::try_from(seg.p_offset).map_err(|_| ExecError::NotExecutable)?;
+            if offset
+                .checked_add(size)
+                .is_none_or(|end| end > isize::MAX as usize)
+            {
+                return Err(ExecError::NotExecutable);
             }
-            let interpreter_path = core::str::from_utf8(
-                &buffer[0..TryInto::<usize>::try_into(seg.p_filesz).unwrap() - 1],
-            )
-            .map_err(|e| {
-                ExecError::Other(format!(
-                    "Failed to parse the path of dynamic linker with error {}",
-                    e
-                ))
-            })?;
-            // 使用 do_open_execat 打开解释器文件
-            let interpreter_file = do_open_execat(AtFlags::AT_FDCWD.bits(), interpreter_path)
-                .map_err(|e| {
-                    // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
-                    log::error!(
-                        "Failed to open interpreter file: {} (err={:?})",
-                        interpreter_path,
-                        e
-                    );
-                    ExecError::SystemError(SystemError::ENOENT)
-                })?;
-            // log::debug!("opening interpreter at :{}", interpreter_path);
-            interpreter = Some(
-                ExecParam::new(
-                    interpreter_file,
-                    param.vm().clone(),
-                    ExecParamFlags::EXEC,
-                    CString::new(interpreter_path).map_err(|_| ExecError::InvalidParemeter)?,
-                    param.execfn().clone(),
-                    ExecInterpFlags::empty(),
-                )
-                .map_err(ExecError::SystemError)?,
-            );
-        }
-        //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931
-
-        if interpreter.is_some() {
-            /* Some simple consistency checks for the interpreter */
-            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#950
+            let mut buffer = Self::zeroed_metadata(size).map_err(ExecError::SystemError)?;
+            if param
+                .file_ref()
+                .pread(offset, size, &mut buffer)
+                .map_err(ExecError::SystemError)?
+                != size
+            {
+                return Err(ExecError::SystemError(SystemError::EIO));
+            }
+            if buffer[size - 1] != 0 {
+                return Err(ExecError::NotExecutable);
+            }
+            let end = buffer.iter().position(|byte| *byte == 0).unwrap();
+            let path =
+                core::str::from_utf8(&buffer[..end]).map_err(|_| ExecError::NotExecutable)?;
+            let file =
+                do_open_execat(AtFlags::AT_FDCWD.bits(), path).map_err(ExecError::SystemError)?;
+            interpreter = Some(PreparedInterpreter::prepare(file, param.vm())?);
+            // Linux uses the first PT_INTERP; later entries are not reopened.
+            break;
         }
         Self::parse_gnu_property()?;
 
@@ -989,7 +957,8 @@ impl BinaryLoader for ElfLoader {
             // log::debug!("bias: {load_bias}");
             drop(user_vm);
             let mapped = Self::load_elf_segment(
-                param,
+                &param.file(),
+                param.vm(),
                 &seg_to_load,
                 vaddr + load_bias,
                 elf_prot_flags,
@@ -1108,9 +1077,9 @@ impl BinaryLoader for ElfLoader {
             user_vm = binding.write();
         }
         drop(user_vm);
-        if let Some(mut interpreter) = interpreter {
+        if let Some(interpreter) = interpreter {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
-            let interp = Self::load_elf_interp(&mut interpreter, load_bias)?;
+            let interp = Self::load_elf_interp(&interpreter, param.vm(), load_bias)?;
             let elf_entry = interp.0.entry_point();
             interp_load_addr = Some(elf_entry);
             interpreter_base = Some(interp.1);
@@ -1125,7 +1094,7 @@ impl BinaryLoader for ElfLoader {
             program_entrypoint,
             phdr_vaddr,
             interpreter_base,
-            &ehdr,
+            ehdr,
         )?;
 
         // debug!("auxv create ok");

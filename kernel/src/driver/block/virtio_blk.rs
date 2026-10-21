@@ -11,7 +11,6 @@ use alloc::{
     vec::Vec,
 };
 use bitmap::{static_bitmap, traits::BitMapOps};
-use hashbrown::HashMap;
 use log::error;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -21,7 +20,7 @@ use virtio_drivers::{
 };
 
 use crate::{
-    arch::{CurrentIrqArch, CurrentTimeArch},
+    arch::CurrentTimeArch,
     driver::{
         base::{
             block::{
@@ -52,7 +51,7 @@ use crate::{
     exception::{
         irqdesc::IrqReturn,
         tasklet::{tasklet_schedule, Tasklet},
-        InterruptArch, IrqNumber,
+        IrqNumber,
     },
     filesystem::{
         devfs::{DevFS, DeviceINode, LockedDevFSInode},
@@ -63,25 +62,27 @@ use crate::{
     init::initcall::INITCALL_POSTCORE,
     libs::{
         mutex::MutexGuard,
+        resource_wait::ResourceWaitQueue,
         rwlock::RwLock,
         rwsem::{RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::WaitQueue,
     },
     process::{
         kthread::{KernelThreadClosure, KernelThreadMechanism},
         ProcessControlBlock,
     },
     sched::cond_resched,
-    time::{sleep::nanosleep, PosixTimeSpec, TimeArch},
+    time::{
+        timer::{next_n_ms_timer_jiffies, Timer, TimerFunction},
+        TimeArch,
+    },
 };
 
 const VIRTIO_BLK_BASENAME: &str = "virtio_blk";
 
 // IO线程的budget配置
 const IO_BUDGET: usize = 32; // 每次最多处理32个请求
-const SHUTDOWN_DRAIN_RETRIES: usize = 32;
-const SHUTDOWN_DRAIN_INTERVAL_NS: i64 = 1_000_000;
+const SHUTDOWN_GRACE_MS: u64 = 32;
 const P6_2_STATS_ENABLED: bool = option_env!("DRAGONOS_P6_2_STATS").is_some();
 const BIO_LATENCY_CYCLES_SHORT: usize = 10_000;
 const BIO_LATENCY_CYCLES_MEDIUM: usize = 100_000;
@@ -255,36 +256,61 @@ struct BioContext {
     resp: Box<BlkResp>,
 }
 
+impl BioContext {
+    fn try_new(bio: Arc<BioRequest>) -> Result<Self, SystemError> {
+        let req = Box::try_new(BlkReq::default()).map_err(|_| SystemError::ENOMEM)?;
+        let resp = Box::try_new(BlkResp::default()).map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self { bio, req, resp })
+    }
+}
+
+/// Hardware tokens index a fixed descriptor table. All slots exist before the
+/// device is published; registration after avail publication cannot allocate.
 struct BioTokenMap {
-    inner: SpinLock<HashMap<u16, BioContext>>,
+    inner: SpinLock<Vec<Option<BioContext>>>,
 }
 
 impl BioTokenMap {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: SpinLock::new(HashMap::new()),
+    fn try_new(size: u16) -> Result<Arc<Self>, SystemError> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(usize::from(size))
+            .map_err(|_| SystemError::ENOMEM)?;
+        slots.resize_with(usize::from(size), || None);
+        Arc::try_new(Self {
+            inner: SpinLock::new(slots),
         })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
-    pub fn insert(&self, token: u16, ctx: BioContext) -> Result<(), BioContext> {
-        let mut inner = self.inner.lock_irqsave();
-        if inner.contains_key(&token) {
-            return Err(ctx);
+    fn insert(&self, token: u16, ctx: BioContext) -> Result<(), BioContext> {
+        let mut slots = self.inner.lock_irqsave();
+        match slots.get_mut(usize::from(token)) {
+            Some(slot) if slot.is_none() => {
+                *slot = Some(ctx);
+                Ok(())
+            }
+            _ => Err(ctx),
         }
-        inner.insert(token, ctx);
+    }
+
+    fn pop(&self) -> Option<BioContext> {
+        self.inner.lock_irqsave().iter_mut().find_map(Option::take)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.lock_irqsave().iter().all(Option::is_none)
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownWake(Weak<VirtIOBlkDevice>);
+impl TimerFunction for ShutdownWake {
+    fn run(&mut self) -> Result<(), SystemError> {
+        if let Some(device) = self.0.upgrade() {
+            device.submission_wait.notify_all();
+        }
         Ok(())
-    }
-
-    pub fn drain_all(&self) -> Vec<BioContext> {
-        self.inner
-            .lock_irqsave()
-            .drain()
-            .map(|(_, ctx)| ctx)
-            .collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock_irqsave().is_empty()
     }
 }
 
@@ -361,7 +387,10 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
         // Keep the DMA owner registered until the used descriptor is retired.
         // NotReady must leave the context in place without a remove/reinsert.
         let mut contexts = token_map.inner.lock_irqsave();
-        let ctx = match contexts.get_mut(&token) {
+        let ctx = match contexts
+            .get_mut(usize::from(token))
+            .and_then(Option::as_mut)
+        {
             Some(ctx) => ctx,
             None => {
                 error!("VirtIOBlk: token {} not found in token_map", token);
@@ -427,14 +456,14 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
                 }
             }
         };
-        let _ctx = contexts
-            .remove(&token)
+        let _ctx = contexts[usize::from(token)]
+            .take()
             .expect("completed context stays registered");
         drop(contexts);
         drop(inner);
         // Wake before callbacks: a callback may itself need another BIO to
         // progress. Descriptor reclamation, not a timer, drives backpressure.
-        device.submission_wait.wakeup(None);
+        device.submission_wait.notify_all();
         device.complete_accounted_bio(&bio, result);
         completed += 1;
     }
@@ -610,7 +639,7 @@ pub struct VirtIOBlkDevice {
     metadata: Metadata,
     stats: VirtIOBlkStats,
     /// Descriptor reclamation or shutdown makes a blocked submission retryable.
-    submission_wait: WaitQueue,
+    submission_wait: ResourceWaitQueue,
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -645,6 +674,7 @@ impl VirtIOBlkDevice {
         let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
             error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
+            virtioblk_manager().free_id(devname.id());
             return None;
         }
 
@@ -653,8 +683,17 @@ impl VirtIOBlkDevice {
         let capacity_blocks = device_inner.capacity() as usize * SECTOR_SIZE / LBA_SIZE;
 
         // 创建BIO队列和token映射表
-        let bio_queue = BioQueue::new();
-        let bio_token_map = BioTokenMap::new();
+        let resources = BioQueue::try_new().and_then(|queue| {
+            BioTokenMap::try_new(device_inner.virt_queue_size()).map(|tokens| (queue, tokens))
+        });
+        let (bio_queue, bio_token_map) = match resources {
+            Ok(resources) => resources,
+            Err(error) => {
+                error!("VirtIOBlk queue preparation failed: {:?}", error);
+                virtioblk_manager().free_id(devname.id());
+                return None;
+            }
+        };
 
         let dev = Arc::new_cyclic(|self_ref| Self {
             blkdev_meta: BlockDevMeta::new(devname.clone(), Major::VIRTIO_BLK_MAJOR),
@@ -683,7 +722,7 @@ impl VirtIOBlkDevice {
                 InodeMode::from_bits_truncate(0o755),
             ),
             stats: VirtIOBlkStats::new(),
-            submission_wait: WaitQueue::default(),
+            submission_wait: ResourceWaitQueue::new(),
         });
 
         let device_weak = Arc::downgrade(&dev);
@@ -752,6 +791,14 @@ impl VirtIOBlkDevice {
     }
 
     fn shutdown(self: &Arc<Self>) -> Result<(), SystemError> {
+        // Optional graceful drain resources must be born before quiescing.
+        // OOM falls back to transport reset, which legally cancels in-flight IO.
+        let grace = Box::try_new(ShutdownWake(Arc::downgrade(self)))
+            .map_err(|_| SystemError::ENOMEM)
+            .and_then(|callback| {
+                Timer::try_prepare(callback, next_n_ms_timer_jiffies(SHUTDOWN_GRACE_MS))
+            })
+            .ok();
         let (bio_queue, bio_token_map, io_thread_pcb) = {
             let mut inner = self.inner();
             if inner.state >= VirtIOBlkState::Quiescing {
@@ -759,10 +806,6 @@ impl VirtIOBlkDevice {
             }
 
             inner.state = VirtIOBlkState::Quiescing;
-            if let Some(device_inner) = inner.device_inner.as_mut() {
-                device_inner.disable_interrupts();
-            }
-
             (
                 inner.bio_queue.clone(),
                 inner.bio_token_map.clone(),
@@ -772,14 +815,11 @@ impl VirtIOBlkDevice {
 
         // Publish non-Online before waking submissions, and wake before joining
         // the worker: it may be waiting for descriptors rather than new BIOs.
-        self.submission_wait.wakeup_all(None);
+        self.submission_wait.notify_all();
         if let Some(bio_queue) = &bio_queue {
-            bio_queue.begin_quiesce();
-        }
-
-        if let Some(bio_queue) = &bio_queue {
-            for bio in bio_queue.stop_and_drain() {
-                self.complete_accounted_bio(&bio, Err(SystemError::ESHUTDOWN));
+            let mut pending = bio_queue.stop_and_drain();
+            while let Some(node) = pending.pop_node() {
+                self.complete_accounted_bio(&node.into_value(), Err(SystemError::ESHUTDOWN));
             }
         }
 
@@ -794,35 +834,31 @@ impl VirtIOBlkDevice {
             }
         }
 
-        if let Some(bio_token_map) = &bio_token_map {
-            for _ in 0..SHUTDOWN_DRAIN_RETRIES {
-                complete_used_requests(self, bio_token_map);
-                if bio_token_map.is_empty() {
-                    break;
-                }
-
-                let sleep_time = PosixTimeSpec::new(0, SHUTDOWN_DRAIN_INTERVAL_NS);
-                let _ = nanosleep(sleep_time);
+        if let Some(tokens) = &bio_token_map {
+            complete_used_requests(self, tokens);
+            if let Some(grace) = grace {
+                let timer = grace.timer();
+                grace.activate();
+                let _ = self
+                    .submission_wait
+                    .wait_uninterruptible(|| (tokens.is_empty() || timer.timeout()).then_some(()));
+                timer.cancel();
+                complete_used_requests(self, tokens);
             }
         }
 
         let device_inner = {
             let mut inner = self.inner();
             inner.state = VirtIOBlkState::Reset;
+            if let Some(device) = inner.device_inner.as_mut() {
+                device.disable_interrupts();
+            }
             inner.device_inner.take()
         };
         drop(device_inner);
 
-        if let Some(bio_token_map) = &bio_token_map {
-            let pending = bio_token_map.drain_all();
-            if !pending.is_empty() {
-                log::warn!(
-                    "VirtIOBlkDevice '{:?}' reset with {} in-flight BIO(s)",
-                    self.dev_id.id(),
-                    pending.len()
-                );
-            }
-            for ctx in pending {
+        if let Some(tokens) = &bio_token_map {
+            while let Some(ctx) = tokens.pop() {
                 self.complete_accounted_bio(&ctx.bio, Err(SystemError::ESHUTDOWN));
             }
         }
@@ -1027,6 +1063,7 @@ impl BlockDevice for VirtIOBlkDevice {
 
     /// 提交异步BIO请求
     fn submit_bio(&self, bio: Arc<BioRequest>) -> Result<(), SystemError> {
+        let node = BioQueue::prepare(bio.clone())?;
         let inner = self.inner();
         if inner.state != VirtIOBlkState::Online {
             return Err(SystemError::ESHUTDOWN);
@@ -1047,7 +1084,10 @@ impl BlockDevice for VirtIOBlkDevice {
             } else {
                 (0, 0)
             };
-            if let Err(error) = bio_queue.submit(bio) {
+            if let Err(node) = bio_queue.submit(node) {
+                drop(inner);
+                drop(node);
+                let error = SystemError::ESHUTDOWN;
                 if P6_2_STATS_ENABLED {
                     self.stats.finish(
                         &Err(error.clone()),
@@ -1296,26 +1336,14 @@ impl Drop for VirtIOBlkDevice {
         // request/response storage which can still be visible to the device.
         drop(device_inner);
 
-        if let Some(bio_queue) = bio_queue {
-            loop {
-                let batch = bio_queue.drain_batch(BioQueue::DEFAULT_BATCH_SIZE);
-                if batch.is_empty() {
-                    break;
-                }
-                for bio in batch {
-                    self.complete_accounted_bio(&bio, Err(SystemError::ENODEV));
-                }
+        if let Some(queue) = bio_queue {
+            let mut pending = queue.stop_and_drain();
+            while let Some(node) = pending.pop_node() {
+                self.complete_accounted_bio(&node.into_value(), Err(SystemError::ENODEV));
             }
         }
-
-        if let Some(token_map) = bio_token_map {
-            let pending: Vec<BioContext> = token_map
-                .inner
-                .lock_irqsave()
-                .drain()
-                .map(|(_, v)| v)
-                .collect();
-            for ctx in pending {
+        if let Some(tokens) = bio_token_map {
+            while let Some(ctx) = tokens.pop() {
                 self.complete_accounted_bio(&ctx.bio, Err(SystemError::ENODEV));
             }
         }
@@ -1551,19 +1579,13 @@ fn bio_io_thread_loop(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
 
             // 批量提交新请求，遵守budget限制
             while processed < IO_BUDGET {
-                let batch = bio_queue.drain_batch(IO_BUDGET - processed);
-                if batch.is_empty() {
-                    break; // 队列空了，退出
+                let Some(bio) = bio_queue.pop() else {
+                    break;
+                };
+                if let Err(error) = submit_bio_wait(&device, &bio) {
+                    device.complete_accounted_bio(&bio, Err(error));
                 }
-
-                for bio in batch {
-                    if let Err(e) = submit_bio_wait(&device, &bio) {
-                        log::error!("virtio submit_bio_to_virtio failed: {:?}", e);
-                        // 失败时立即完成BIO
-                        device.complete_accounted_bio(&bio, Err(e));
-                    }
-                    processed += 1;
-                }
+                processed += 1;
             }
 
             // Bound one work round without imposing a device-wide rate limit.
@@ -1585,157 +1607,114 @@ fn bio_io_thread_loop(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
     0
 }
 
-/// Retry only unpublished QueueFull submissions. The current BIO remains ahead
-/// of the rest of the worker's batch. WaitQueue registers and rechecks before
-/// sleeping, closing the completion-before-sleep race without a second resource
-/// counter. Shutdown wakes this same queue and causes ESHUTDOWN on retry.
+/// Prepare once; QueueFull retries retain the exact same owners. Submission
+/// may allocate descriptors/DMA and therefore never runs in a wait predicate.
 fn submit_bio_wait(
     device: &Arc<VirtIOBlkDevice>,
     bio: &Arc<BioRequest>,
 ) -> Result<(), SystemError> {
-    let mut result = None;
-    device.submission_wait.wait_event_uninterruptible(
-        || {
-            if result.is_some() {
-                return true;
-            }
-            match submit_bio_to_virtio(device, bio.clone()) {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    if P6_2_STATS_ENABLED {
-                        device
-                            .stats
-                            .queue_full_retries
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    false
+    let mut context = Some(BioContext::try_new(bio.clone())?);
+    loop {
+        match submit_bio_to_virtio(device, &mut context) {
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                if P6_2_STATS_ENABLED {
+                    device
+                        .stats
+                        .queue_full_retries
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-                terminal => {
-                    result = Some(terminal);
-                    true
-                }
+                device.submission_wait.wait_uninterruptible(|| {
+                    let inner = device.inner();
+                    let ready = inner.state != VirtIOBlkState::Online
+                        || inner.device_inner.as_ref().is_none_or(|device| {
+                            device.can_submit(bio.bio_type() == BioType::Flush)
+                        });
+                    ready.then_some(())
+                })?;
             }
-        },
-        None::<fn()>,
-    )?;
-    result.expect("submission wait completed without a terminal result")
-}
-
-fn submission_error(error: VirtioError) -> SystemError {
-    if matches!(error, VirtioError::QueueFull) {
-        // queue.add() has not published any descriptors in this case.
-        SystemError::EAGAIN_OR_EWOULDBLOCK
-    } else {
-        error!("VirtIOBlk asynchronous submission failed: {:?}", error);
-        SystemError::EIO
+            result => return result,
+        }
     }
 }
 
-/// 将BIO请求提交到VirtIO设备（异步）
+fn submission_error(error: VirtioError) -> SystemError {
+    match error {
+        VirtioError::QueueFull => SystemError::EAGAIN_OR_EWOULDBLOCK,
+        VirtioError::DmaError => SystemError::ENOMEM,
+        _ => SystemError::EIO,
+    }
+}
+
+/// On error no descriptors were published and `context` remains owned by the
+/// caller. Successful publication transfers it into a preallocated token slot.
 fn submit_bio_to_virtio(
     device: &Arc<VirtIOBlkDevice>,
-    bio: Arc<BioRequest>,
+    context: &mut Option<BioContext>,
 ) -> Result<(), SystemError> {
-    // 获取BIO信息
-    let lba_start = bio.lba_start();
-    let count = bio.count();
-    let bio_type = bio.bio_type();
-
-    // 获取token_map（clone以避免借用冲突）
-    let token_map = {
-        let inner = device.inner();
-        if inner.state != VirtIOBlkState::Online {
-            return Err(SystemError::ESHUTDOWN);
-        }
-        inner
-            .bio_token_map
-            .as_ref()
-            .ok_or(SystemError::EINVAL)?
-            .clone()
-    };
-
-    // 创建请求和响应结构
-    let mut req = Box::new(BlkReq::default());
-    let mut resp = Box::new(BlkResp::default());
-
-    // 获取buffer指针（在整个异步操作期间，bio会被BioContext持有，保证buffer有效）
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-    // Serialize hardware publication with completion on every CPU, not just
-    // the local IRQ handler. The token's context must exist before peek_used.
+    let ctx = context.as_mut().expect("unpublished BIO context");
+    let bio = &ctx.bio;
     let mut inner = device.inner();
     if inner.state != VirtIOBlkState::Online {
         return Err(SystemError::ESHUTDOWN);
     }
-
-    let token = {
-        let device_inner = inner.device_inner.as_mut().ok_or(SystemError::ENODEV)?;
-        match bio_type {
-            BioType::Read => {
-                let buf_ptr = unsafe { bio.buffer_mut() };
-                let buf = unsafe { &mut *buf_ptr };
-                Some(
-                    unsafe {
-                        device_inner.read_blocks_nb(
-                            lba_start,
-                            &mut req,
-                            &mut buf[..count * LBA_SIZE],
-                            &mut resp,
-                        )
-                    }
-                    .map_err(submission_error)?,
-                )
-            }
-            BioType::Write => {
-                let buf_ptr = bio.buffer();
-                let buf = unsafe { &*buf_ptr };
-                Some(
-                    unsafe {
-                        device_inner.write_blocks_nb(
-                            lba_start,
-                            &mut req,
-                            &buf[..count * LBA_SIZE],
-                            &mut resp,
-                        )
-                    }
-                    .map_err(submission_error)?,
-                )
-            }
-            BioType::Flush => {
-                unsafe { device_inner.flush_nb(&mut req, &mut resp) }.map_err(submission_error)?
-            }
+    let token_map = inner
+        .bio_token_map
+        .as_ref()
+        .ok_or(SystemError::ENODEV)?
+        .clone();
+    let hardware = inner.device_inner.as_mut().ok_or(SystemError::ENODEV)?;
+    let token = match bio.bio_type() {
+        BioType::Read => {
+            let buffer = unsafe { &mut *bio.buffer_mut() };
+            Some(
+                unsafe {
+                    hardware.read_blocks_nb(
+                        bio.lba_start(),
+                        &mut ctx.req,
+                        &mut buffer[..bio.count() * LBA_SIZE],
+                        &mut ctx.resp,
+                    )
+                }
+                .map_err(submission_error)?,
+            )
+        }
+        BioType::Write => {
+            let buffer = unsafe { &*bio.buffer() };
+            Some(
+                unsafe {
+                    hardware.write_blocks_nb(
+                        bio.lba_start(),
+                        &mut ctx.req,
+                        &buffer[..bio.count() * LBA_SIZE],
+                        &mut ctx.resp,
+                    )
+                }
+                .map_err(submission_error)?,
+            )
+        }
+        BioType::Flush => {
+            unsafe { hardware.flush_nb(&mut ctx.req, &mut ctx.resp) }.map_err(submission_error)?
         }
     };
-
-    let token = match token {
-        Some(token) => token,
-        None => {
-            drop(inner);
-            drop(irq_guard);
-            device.complete_accounted_bio(&bio, Ok(0));
-            return Ok(());
-        }
+    let Some(token) = token else {
+        drop(inner);
+        device.complete_accounted_bio(&context.take().unwrap().bio, Ok(0));
+        return Ok(());
     };
-
-    // 保存上下文到token_map
-    let ctx = BioContext {
-        bio: bio.clone(),
-        req,
-        resp,
-    };
-    // These are ownership invariants after successful hardware publication,
-    // not recoverable submission errors: req/resp must remain alive until used.
+    let bio = bio.clone();
+    let ctx = context.take().unwrap();
     if let Err(ctx) = token_map.insert(token, ctx) {
-        // A broken token invariant offers no safe completion owner. Panic can
-        // unwind in DragonOS, so retain the DMA context rather than freeing
-        // memory still exposed to the device on this fatal path.
+        // Preserve DMA storage if a protocol invariant is broken, including
+        // when a kernel panic unwinds. Never replace the existing owner.
         core::mem::forget(ctx);
-        panic!("VirtIOBlk reused an in-flight token");
+        panic!("VirtIOBlk invalid or reused in-flight token");
     }
     bio.mark_submitted(token)
         .expect("VirtIOBlk submitted a BIO more than once");
-
-    drop(inner);
-    drop(irq_guard);
-
     Ok(())
 }
+
+#[cfg(feature = "mm_selftest")]
+mod selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::submission_birth as submission_birth_selftest;

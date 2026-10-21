@@ -76,12 +76,12 @@ pub(crate) fn mutex_protocol() -> Result<bool, SystemError> {
         let held = ResourceMutexGuard::try_lock(&lock).ok_or(SystemError::EBUSY)?;
         let key = held.resource_key_for_test();
         let mut registered = ResourceMutexGuard::try_lock(&lock).is_none()
-            && lock.waiters.load(Ordering::Acquire) == 0;
+            && lock.wait_queue.waiters.load(Ordering::Acquire) == 0;
         for worker in &workers {
             registered &= ProcessManager::wakeup(worker).is_ok()
                 && bounded_poll(|| is_waiting_for_resource_for_test(worker, key));
         }
-        registered &= lock.waiters.load(Ordering::Acquire) == 2;
+        registered &= lock.wait_queue.waiters.load(Ordering::Acquire) == 2;
         drop(held);
         let completed = registered && bounded_poll(|| done.load(Ordering::Acquire) == 2);
         if !completed {
@@ -104,7 +104,7 @@ pub(crate) fn mutex_protocol() -> Result<bool, SystemError> {
         if !completed
             || !joined
             || !passed.load(Ordering::Acquire)
-            || lock.waiters.load(Ordering::Acquire) != 0
+            || lock.wait_queue.waiters.load(Ordering::Acquire) != 0
             || *ResourceMutexGuard::lock(&lock) != (round + 1) * 2
         {
             return Ok(false);
@@ -115,6 +115,6 @@ pub(crate) fn mutex_protocol() -> Result<bool, SystemError> {
     let mut held = ResourceMutexGuard::lock_killable(&lock)?;
     *held += 1;
     drop(held);
-    Ok(lock.waiters.load(Ordering::Acquire) == 0
+    Ok(lock.wait_queue.waiters.load(Ordering::Acquire) == 0
         && ResourceMutexGuard::try_lock(&lock).is_some_and(|held| *held == 7))
 }

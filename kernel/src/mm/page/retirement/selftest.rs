@@ -1031,6 +1031,14 @@ pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     type Check = fn() -> Result<bool, SystemError>;
     let tests: &[(&str, Check)] = &[
+        (
+            "heap_denied_pi_futex_registration",
+            crate::libs::futex::futex::Futex::failed_pi_registration_selftest,
+        ),
+        (
+            "heap_denied_completion_wait",
+            crate::sched::completion::wait_protocol_selftest,
+        ),
         #[cfg(target_arch = "x86_64")]
         ("socket_scratch_birth", || {
             Ok(crate::net::socket::scratch_birth_selftest())
@@ -1039,6 +1047,14 @@ pub(crate) fn report() -> String {
         ("elf_scratch_birth", || {
             Ok(crate::libs::elf::scratch_birth_selftest())
         }),
+        (
+            "heap_denied_bpf_program_birth",
+            crate::bpf::prog::program_birth_selftest,
+        ),
+        (
+            "heap_denied_virtio_submission_birth",
+            crate::driver::block::virtio_blk::submission_birth_selftest,
+        ),
         (
             "heap_denied_bio_birth",
             crate::driver::base::block::bio::heap_denied_bio_birth,

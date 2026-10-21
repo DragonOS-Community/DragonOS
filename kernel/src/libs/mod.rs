@@ -35,3 +35,5 @@ pub mod decompress;
 
 pub mod pod;
 pub mod ranges;
+
+pub(crate) mod prepared_queue;

@@ -5,8 +5,10 @@ use super::sys_mount::may_mount;
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
     filesystem::vfs::{
-        fcntl::AtFlags, mount::is_mountpoint_root, utils::user_path_at, FileSystem, MountFS,
-        MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags,
+        mount::{is_mountpoint_root, MountFSInode},
+        utils::user_path_at,
+        FileSystem, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::ProcessManager,
@@ -16,6 +18,7 @@ use crate::{
     },
 };
 use alloc::{sync::Arc, vec::Vec};
+use core::any::Any;
 use system_error::SystemError;
 
 /// src/linux/mount.c `umount` & `umount2`
@@ -104,6 +107,16 @@ pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<Moun
             !flag.contains(UmountFlag::UMOUNT_NOFOLLOW),
         )
     })?;
+    // Linux LOOKUP_MOUNTPOINT follows mounts on the final resolved path,
+    // including a retained cwd selected by ".". Ordinary pathname lookup
+    // deliberately preserves that cursor. Do not require a directory here:
+    // bind-mounted files are valid unmount targets too.
+    let target_inode =
+        if let Some(mounted) = (target_inode.as_ref() as &dyn Any).downcast_ref::<MountFSInode>() {
+            mounted.follow_component_mounts(false, false)?
+        } else {
+            target_inode
+        };
     if !may_mount() {
         return Err(SystemError::EPERM);
     }

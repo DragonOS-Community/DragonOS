@@ -373,6 +373,57 @@ TEST_F(RetainedDirfdMount, CachedWarmLookupDoesNotReenterCover) {
     ExpectContents(OpenAt2(fd_, "marker", kCached | kNoXdev), "original");
 }
 
+TEST_F(RetainedDirfdMount, UnmountDotSelectsTopCoverWithoutChangingCwd) {
+    ASSERT_EQ(0, fchdir(fd_)) << strerror(errno);
+    ASSERT_TRUE(Mount(anchor_)) << strerror(errno);
+    const int lower = Hold(anchor_);
+    ASSERT_GE(lower, 0) << strerror(errno);
+    ASSERT_TRUE(Mount(anchor_)) << strerror(errno);
+    const int upper = Hold(anchor_);
+    ASSERT_GE(upper, 0) << strerror(errno);
+
+    ExpectSame(open(".", O_PATH | O_DIRECTORY), fd_);
+    ExpectSame(open(anchor_.c_str(), O_PATH | O_DIRECTORY), upper);
+    ASSERT_EQ(0, umount2(".", MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectSame(open(anchor_.c_str(), O_PATH | O_DIRECTORY), lower);
+    ExpectSame(open(".", O_PATH | O_DIRECTORY), fd_);
+    ASSERT_EQ(0, umount2("././//", MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectSame(open(anchor_.c_str(), O_PATH | O_DIRECTORY), fd_);
+    ExpectSame(open(".", O_PATH | O_DIRECTORY), fd_);
+    EXPECT_EQ(-1, umount2(".", MNT_DETACH));
+    EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(RetainedDirfdMount, UnmountNoFollowRejectsFinalSymlinkToCover) {
+    const std::string link = root_ + "/cover-link";
+    ASSERT_EQ(0, symlink(anchor_.c_str(), link.c_str())) << strerror(errno);
+    Cover();
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(-1, umount2(link.c_str(), MNT_DETACH | UMOUNT_NOFOLLOW));
+    EXPECT_EQ(EINVAL, errno);
+    ExpectContents(open((anchor_ + "/marker").c_str(), O_RDONLY), "cover");
+    ASSERT_EQ(0, umount2(link.c_str(), MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectContents(open((anchor_ + "/marker").c_str(), O_RDONLY), "original");
+    EXPECT_EQ(0, unlink(link.c_str()));
+}
+
+TEST_F(RetainedDirfdMount, UnmountAcceptsFileBindTarget) {
+    const std::string source = root_ + "/source";
+    const std::string target = root_ + "/target";
+    ASSERT_TRUE(Write(source, "bound"));
+    ASSERT_TRUE(Write(target, "original"));
+    ASSERT_EQ(0, mount(source.c_str(), target.c_str(), nullptr, MS_BIND, nullptr))
+        << strerror(errno);
+    mounts_.push_back(target);
+    ExpectContents(open(target.c_str(), O_RDONLY), "bound");
+    ASSERT_EQ(0, umount2(target.c_str(), MNT_DETACH)) << strerror(errno);
+    mounts_.pop_back();
+    ExpectContents(open(target.c_str(), O_RDONLY), "original");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

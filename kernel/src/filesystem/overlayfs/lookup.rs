@@ -55,6 +55,29 @@ pub(super) fn find(
     inode: &OvlInode,
     name: &str,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    // Linux 在 VFS 路径走查（namei.c）中自行消化 "."/".."，从不将其下传给文件
+    // 系统；而 DragonOS 的相对路径走查以 find(".") 锚定起始目录、以 find("..")
+    // 解析父目录分量（ramfs/MountFSInode 均遵循此约定）。合并目录必须同样在
+    // overlay 层回答点号：若把 "."/".." 透传给底层层（upper/lower inode），会经
+    // MountFSInode::lookup_backing 被 -EACCES 拒绝（与 Linux
+    // lookup_one_unlocked 拒绝点号的名字语义一致）。
+    //
+    // "." 返回该合并目录自身（按 redirect 从 overlay 根重新解析，与 parent()
+    // 的既有设计一致；根目录直接返回自身），".." 返回父合并目录。
+    if inode.is_dir() {
+        match name {
+            "" | "." => {
+                let fs = inode.overlay_fs()?;
+                if inode.redirect.is_empty() {
+                    return Ok(fs.root_inode.clone());
+                }
+                let root: Arc<dyn IndexNode> = fs.root_inode.clone();
+                return root.lookup(&inode.redirect);
+            }
+            ".." => return inode.parent(),
+            _ => {}
+        }
+    }
     let state = inode.dir_state()?;
     let _dir_guard = state.mutation_lock.lock();
     find_locked(inode, name, &state)

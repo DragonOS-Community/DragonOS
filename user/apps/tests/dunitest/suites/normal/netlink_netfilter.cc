@@ -4892,7 +4892,7 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
   }
 }
 
-TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
+static void CheckMalformedTransportMatch(bool is_udp) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   ASSERT_GE(nft.get(), 0);
@@ -4908,13 +4908,20 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
     tcp.spts[1] = UINT16_MAX;
     tcp.dpts[1] = UINT16_MAX;
     tcp.invflags = issue == BadMatch::InvalidInverse ? 0x80 : 0;
-    const size_t info_length = issue == BadMatch::ShortInfo ? sizeof(tcp) - 1 :
-                               issue == BadMatch::LongInfo ? 17 : sizeof(tcp);
+    xt_udp udp{};
+    udp.spts[1] = UINT16_MAX;
+    udp.dpts[1] = UINT16_MAX;
+    udp.invflags = issue == BadMatch::InvalidInverse ? 0x80 : 0;
+    const size_t structure_size = is_udp ? sizeof(udp) : sizeof(tcp);
+    const size_t info_length = issue == BadMatch::ShortInfo ? structure_size - 1 :
+                               issue == BadMatch::LongInfo ? 17 : structure_size;
     std::vector<uint8_t> info(info_length, 0);
-    std::memcpy(info.data(), &tcp, std::min(info_length, sizeof(tcp)));
+    const void* structure = is_udp ? static_cast<const void*>(&udp) : &tcp;
+    std::memcpy(info.data(), structure, std::min(info_length, structure_size));
     std::vector<uint8_t> match;
     if (issue != BadMatch::MissingName) {
-      const char* name = issue == BadMatch::UnknownName ? "no_such_xt" : "tcp";
+      const char* name = issue == BadMatch::UnknownName ? "no_such_xt" :
+                         is_udp ? "udp" : "tcp";
       AppendNla(&match, NFTA_MATCH_NAME,
                 reinterpret_cast<const uint8_t*>(name), std::strlen(name) + 1);
     }
@@ -4930,8 +4937,9 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
     AppendExpr(&expressions, "match", match);
     auto rule = RuleWithExpressions(seq + 3, table.c_str(), "input", expressions);
     std::vector<uint8_t> compat;
+    const int protocol = is_udp ? IPPROTO_UDP : IPPROTO_TCP;
     const uint32_t be_protocol = htonl(issue == BadMatch::WrongProtocol ?
-                                        IPPROTO_UDP : IPPROTO_TCP);
+                                        (is_udp ? IPPROTO_TCP : IPPROTO_UDP) : protocol);
     AppendNla(&compat, NFTA_RULE_COMPAT_PROTO,
               reinterpret_cast<const uint8_t*>(&be_protocol), sizeof(be_protocol));
     if (issue != BadMatch::MissingFlags) {
@@ -4973,6 +4981,14 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
   reject("name", BadMatch::UnknownName, ENOENT);
   reject("rev", BadMatch::UnknownRevision, ENOENT);
   reject("range", BadMatch::RevisionAboveLimit, ERANGE);
+}
+
+TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
+  CheckMalformedTransportMatch(false);
+}
+
+TEST(NetlinkNetfilter, NftCompatUdpMatchRejectsMalformedInfoAndProtocol) {
+  CheckMalformedTransportMatch(true);
 }
 
 TEST(NetlinkNetfilter, NftCompatUdpMatchDnatProgramsInsideChildNetns) {

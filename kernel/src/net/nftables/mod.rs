@@ -42,8 +42,7 @@ pub(crate) use packet::{NftDeviceNames, NftNatPacket, NftPacket};
 pub(crate) use rule::{
     NftBitwiseOperation, NftByteorderOp, NftCmpOp, NftCounter, NftExpression, NftExpressionInput,
     NftMetaKey, NftNatAction, NftNatEvent, NftNatProgress, NftPayloadBase, NftRangeOp, NftRule,
-    NftRuleInput, NftRuleVerdict, NftVerdict, NftXtAddrtype, NftXtConntrack, NftXtTcp,
-    NftXtUdp,
+    NftRuleInput, NftRuleVerdict, NftVerdict, NftXtAddrtype, NftXtConntrack, NftXtTcp, NftXtUdp,
 };
 pub(crate) use transaction::{NewSetSpec, NftNamespaceState};
 

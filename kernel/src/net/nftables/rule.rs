@@ -1189,10 +1189,10 @@ pub(crate) struct NftXtUdp {
 impl NftXtUdp {
     pub(super) fn from_info(info: &[u8]) -> Result<Self, SystemError> {
         // xt_check_match compares XT_ALIGN(user length) with the aligned
-        // 12-byte xt_udp matchsize: any length from the 9-byte struct up to
+        // 10-byte xt_udp matchsize: any length from the 10-byte struct up to
         // the NLA-padded tail is accepted, like Linux's aligned compare.
         // Its four port bounds are host-endian, like xt_tcp's.
-        if !(9..=16).contains(&info.len()) {
+        if !(10..=16).contains(&info.len()) {
             return Err(SystemError::EINVAL);
         }
         if info[8] & !0x03 != 0 {
@@ -1238,11 +1238,7 @@ impl NftXtUdp {
         };
         let fragment = u16::from_be_bytes(fragment_bytes.try_into().unwrap()) & 0x1fff;
         if fragment != 0 {
-            return if fragment == 1 {
-                RuleResult::Verdict(NftRuleVerdict::Drop)
-            } else {
-                RuleResult::Break
-            };
+            return RuleResult::Break;
         }
         let Some(udp) = packet.get(header_len..header_len + 8) else {
             return RuleResult::Verdict(NftRuleVerdict::Drop);
@@ -1257,6 +1253,74 @@ impl NftXtUdp {
             }
         }
         RuleResult::Continue
+    }
+}
+
+#[cfg(test)]
+mod xt_udp_tests {
+    use super::*;
+
+    fn matcher() -> NftXtUdp {
+        let mut info = [0u8; 16];
+        info[2..4].copy_from_slice(&u16::MAX.to_ne_bytes());
+        info[4..6].copy_from_slice(&53u16.to_ne_bytes());
+        info[6..8].copy_from_slice(&53u16.to_ne_bytes());
+        NftXtUdp::from_info(&info).unwrap()
+    }
+
+    fn packet(fragment: u16, port: u16, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; length];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+        bytes[6..8].copy_from_slice(&fragment.to_be_bytes());
+        bytes[9] = 17;
+        if length >= 24 {
+            bytes[22..24].copy_from_slice(&port.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn nonfirst_fragments_break_without_hotdrop() {
+        for offset in [1, 2, 8191] {
+            assert!(matches!(
+                matcher().evaluate(&packet(offset, 53, 28)),
+                RuleResult::Break
+            ));
+        }
+        assert!(matches!(
+            matcher().evaluate(&packet(0x2000, 53, 28)),
+            RuleResult::Continue
+        ));
+        assert!(matches!(
+            matcher().evaluate(&packet(0, 54, 28)),
+            RuleResult::Break
+        ));
+        assert!(matches!(
+            matcher().evaluate(&packet(0, 53, 24)),
+            RuleResult::Verdict(NftRuleVerdict::Drop)
+        ));
+        let mut inverted = matcher();
+        inverted.invert = 2;
+        assert!(matches!(
+            inverted.evaluate(&packet(0, 54, 28)),
+            RuleResult::Continue
+        ));
+        assert!(matches!(
+            inverted.evaluate(&packet(0, 53, 28)),
+            RuleResult::Break
+        ));
+    }
+
+    #[test]
+    fn match_info_respects_struct_and_aligned_size() {
+        assert!(NftXtUdp::from_info(&[0; 9]).is_err());
+        assert!(NftXtUdp::from_info(&[0; 10]).is_ok());
+        assert!(NftXtUdp::from_info(&[0; 16]).is_ok());
+        assert!(NftXtUdp::from_info(&[0; 17]).is_err());
+        let mut bad = [0; 16];
+        bad[8] = 4;
+        assert!(NftXtUdp::from_info(&bad).is_err());
     }
 }
 

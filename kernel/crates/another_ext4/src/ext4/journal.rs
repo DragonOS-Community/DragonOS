@@ -401,10 +401,25 @@ impl Ext4 {
             self.map_validated_journal_inode(&journal_inode, journal_len, ext4_sb.block_count())?;
 
         let needs_recovery = ext4_sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER);
-        if journal_sb.start != 0 && !needs_recovery {
-            return Err(Ext4Error::new(ErrCode::EIO));
+        // Linux jbd2 语义（jbd2_journal_load/jbd2_journal_recover）：只要日志尾
+        // 非空（s_start != 0）就执行恢复，而不以 ext4 超级块的 RECOVER 特性位为
+        // 前提；RECOVER 位是给 e2fsck 与只读挂载路径的提示。由于清 RECOVER 的
+        // 超块写与最后一笔事务“清空日志尾”的写不是原子的（异常掉电、宿主机写
+        // 缓存丢失都可能只保留两者之一），盘面上合法地存在“RECOVER 已清、日志
+        // 尾仍非空”的状态。旧实现将其按 EIO 拒绝，会使这样的 rootfs 永远无法
+        // 挂载。这里改为一律重放并复位日志尾：按序重放到最后一条完整事务是幂
+        // 等的（journal 模式下没有旁路元数据写入者，重放必然收敛到最新状态）。
+        let dirty_log_tail = journal_sb.start != 0;
+        if dirty_log_tail && !needs_recovery {
+            log::warn!(
+                "ext4: non-empty journal tail without the RECOVER feature; replaying it like Linux jbd2"
+            );
         }
-        if needs_recovery {
+        if needs_recovery || dirty_log_tail {
+            log::info!(
+                "ext4: dirty journal detected (RECOVER feature: {}), replaying now",
+                needs_recovery
+            );
             let io = RecoveryDevice {
                 device: self.block_device.as_ref(),
                 journal_blocks: &mapping,

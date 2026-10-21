@@ -50,10 +50,22 @@ impl Kmsg {
         }
     }
 
-    /// 添加日志消息
-    pub fn push(&mut self, msg: LogMessage) {
+    /// 添加日志消息，返回被驱逐的最旧消息。
+    ///
+    /// 调用方在 KMSG 锁外 drop 返回值：日志缓冲在持锁且关中断的
+    /// printk 路径上，锁内任何堆分配/释放都可能进入分配器慢路径
+    /// （buddy/direct reclaim）睡眠，造成持有自旋锁的永久楔死
+    /// （脏盘重放现场的 slab deallocate 帧即来源于此）。
+    #[must_use = "evicted message must be dropped outside the KMSG lock"]
+    pub fn push(&mut self, msg: LogMessage) -> Option<LogMessage> {
+        let evicted = if self.buffer.is_full() {
+            self.buffer.dequeue()
+        } else {
+            None
+        };
         self.buffer.push(msg);
         self.is_changed = true;
+        evicted
     }
 
     /// 读取缓冲区

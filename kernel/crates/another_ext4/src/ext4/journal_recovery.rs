@@ -36,7 +36,7 @@ struct Tag {
     checksum: Option<u32>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Pass {
     Scan,
     Revoke,
@@ -59,6 +59,16 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
     if sb.start == 0 {
         return Ok(RecoveryStats::default());
     }
+    // 进度日志：脏日志重放可能持续数十秒（取决于日志长度与内容），
+    // 启动现场需要区分“慢”与“卡死”。
+    log::warn!(
+        "ext4: journal recovery begins: start={}, first={}, max_len={}, sequence={}",
+        sb.start,
+        sb.first,
+        sb.max_len,
+        sb.sequence
+    );
+
 
     let seed = jbd2::checksum_seed(&sb.uuid);
     let end_sequence = walk(
@@ -105,6 +115,12 @@ pub(super) fn recover<I: JournalRecoveryIo>(io: &I) -> Result<RecoveryStats> {
     io.write_journal(0, &raw_sb)?;
     io.flush_journal()?;
     stats.transactions = end_sequence.wrapping_sub(sb.sequence);
+    log::warn!(
+        "ext4: journal recovery done: {} transactions, {} blocks replayed, {} revoke hits",
+        stats.transactions,
+        stats.replayed,
+        stats.revoke_hits
+    );
     Ok(stats)
 }
 
@@ -126,6 +142,9 @@ fn walk<I: JournalRecoveryIo>(
         if stop == Some(sequence) {
             return Ok(sequence);
         }
+        // 周期性进度日志（每 8192 个日志块 ≈ 32MB）：用于在启动现场区分
+        // 重放“仍在推进”与“已卡死”，并记录卡死发生在哪一遍扫描的哪个位置。
+        // 检查点在下方内层逐块循环里，事务边界不一定落在 8192 的倍数上。
         let tx_start = pos;
         let mut committed = false;
         let mut transaction_checksum_invalid = false;
@@ -139,6 +158,15 @@ fn walk<I: JournalRecoveryIo>(
             };
             pos = advance(sb, pos);
             consumed += 1;
+            if consumed.is_multiple_of(8192) {
+                log::warn!(
+                    "ext4: journal recovery {:?} pass: consumed {}/{} blocks, sequence {}",
+                    pass,
+                    consumed,
+                    ring_len,
+                    sequence
+                );
+            }
             match header.block_type {
                 BlockType::Descriptor => {
                     if sb.features.checksum == ChecksumMode::V3 {

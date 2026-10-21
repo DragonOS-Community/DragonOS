@@ -93,6 +93,7 @@ struct Shared {
   int create_error = 0;
   unsigned exec_ready = 0;
   unsigned exec_request = 0;
+  int exec_error = 0;
 };
 
 Shared* signal_shared;
@@ -123,6 +124,7 @@ void* NonLeaderExecThread(void* data) {
   while (!__atomic_load_n(&args->shared->exec_request, __ATOMIC_ACQUIRE)) sched_yield();
   execl("/proc/self/exe", "cgroup_freezer_test", "--freezer-exec-worker",
         args->descriptor, static_cast<char*>(nullptr));
+  __atomic_store_n(&args->shared->exec_error, errno, __ATOMIC_RELEASE);
   _exit(92);
 }
 
@@ -871,6 +873,7 @@ TEST_F(Freezer, NonLeaderExecRacingFreezeCannotEscapeAfterAcknowledgement) {
   for (unsigned iteration = 0; iteration < 32; ++iteration) {
     __atomic_store_n(&shared_->exec_ready, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&shared_->exec_request, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&shared_->exec_error, 0, __ATOMIC_RELEASE);
     int pipefd[2];
     ASSERT_EQ(0, pipe(pipefd));
     ScopedFd reader(pipefd[0]), writer(pipefd[1]);
@@ -917,9 +920,19 @@ TEST_F(Freezer, NonLeaderExecRacingFreezeCannotEscapeAfterAcknowledgement) {
     Frozen(root_, false);
     ASSERT_EQ(1, poll(&ready, 1, 5000));
     const ssize_t resumed = read(reader.value, bytes, sizeof(bytes));
-    const int read_error = errno;
+    const int read_error = resumed < 0 ? errno : 0;
+    int worker_status = -1;
+    if (resumed <= 0) {
+      int status = 0;
+      if (waitpid(worker_, &status, WNOHANG) == worker_) {
+        worker_status = status;
+        worker_ = -1;
+      }
+    }
     ASSERT_GT(resumed, 0) << "iteration=" << iteration << " revents=" << ready.revents
-                          << " errno=" << read_error << " (" << strerror(read_error) << ")";
+                          << " read_errno=" << read_error << " worker_status=" << worker_status
+                          << " exec_errno="
+                          << __atomic_load_n(&shared_->exec_error, __ATOMIC_ACQUIRE);
     ASSERT_EQ(0, kill(worker_, SIGKILL));
     int status = 0;
     ASSERT_TRUE(Until([&] {

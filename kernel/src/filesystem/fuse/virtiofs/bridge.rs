@@ -1139,6 +1139,7 @@ impl VirtioFsBridgeContext {
             token,
             req_len as u64,
         );
+        self.conn.mark_request_sent(trace_unique);
         Ok(true)
     }
 

@@ -876,8 +876,8 @@ impl FileSystem for FuseFS {
             pfm.data_account(),
             pfm.creator_object(),
         ) {
-            Ok(page) => {
-                pfm.set_page(page);
+            Ok(pin) => {
+                pfm.set_page_pinned(pin);
                 major_reason
             }
             Err(error) => major_reason | pfm.allocation_failure(error),

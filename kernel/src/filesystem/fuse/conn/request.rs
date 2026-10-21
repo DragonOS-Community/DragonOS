@@ -25,6 +25,7 @@ use super::super::protocol::{
 use super::{
     stats, trace, FuseCompletionKind, FuseConn, FusePendingResult, FusePendingState,
     FuseReplyCapacity, FuseReplyCapacitySource, FuseReplyContract, FuseRequest, FuseRequestCred,
+    FuseWaitMode,
 };
 use crate::filesystem::fuse::reply::FuseReply;
 use crate::filesystem::{
@@ -185,7 +186,10 @@ impl FuseConn {
                 && g.mounted
                 && g.initialized
                 && !g.no_interrupt
-                && g.processing.contains_key(&unique)
+                && g.processing.get(&unique).is_some_and(|pending| {
+                    pending.delivery.load(Ordering::Acquire)
+                        == (FusePendingState::SENT | FusePendingState::INTERRUPTED)
+                })
         };
         if !can_send {
             return Ok(());
@@ -246,18 +250,19 @@ impl FuseConn {
         self.wait_request_complete(opcode, pending)
     }
 
-    pub(crate) fn request_with_cred(
+    /// Writeback owns dirty data until the daemon publishes a terminal result.
+    pub(crate) fn request_forced_writeback(
         &self,
-        opcode: u32,
         nodeid: u64,
         payload: &[u8],
         req_cred: FuseRequestCred,
     ) -> Result<FuseReply, SystemError> {
-        if opcode != FUSE_INIT {
-            self.wait_initialized()?;
+        self.wait_initialized()?;
+        let pending = self.enqueue_request_with_cred(FUSE_WRITE, nodeid, payload, req_cred)?;
+        match self.wait_request_result(&pending, true)? {
+            FusePendingResult::Reply(reply) => Ok(reply),
+            FusePendingResult::ReadPagesDirect { .. } => Err(SystemError::EIO),
         }
-        let pending = self.enqueue_request_with_cred(opcode, nodeid, payload, req_cred)?;
-        self.wait_request_complete(opcode, pending)
     }
 
     /// Enqueue a cache READ without waiting so one caller can build a bounded
@@ -338,14 +343,14 @@ impl FuseConn {
     pub(crate) fn wait_background_read_pages(
         &self,
         pending: &Arc<FusePendingState>,
-    ) -> (Result<FuseReadPagesReply, SystemError>, bool) {
-        match pending.wait_read_pages_once() {
-            super::FuseReadWaitOutcome::Interrupted => {
-                let _ = self.queue_interrupt(pending.unique());
-                (Err(SystemError::EINTR), true)
-            }
-            super::FuseReadWaitOutcome::Complete(result) => (result, false),
-        }
+    ) -> Result<FuseReadPagesReply, SystemError> {
+        self.wait_request_result(pending, false)
+            .map(|result| match result {
+                FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
+                FusePendingResult::ReadPagesDirect { bytes } => {
+                    FuseReadPagesReply::Direct { bytes }
+                }
+            })
     }
 
     pub fn request_nocreds_background(
@@ -387,15 +392,88 @@ impl FuseConn {
         opcode: u32,
         pending: Arc<FusePendingState>,
     ) -> Result<FuseReply, SystemError> {
-        match pending.wait_complete() {
-            Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
-                if opcode != FUSE_INTERRUPT {
-                    let _ = self.queue_interrupt(pending.unique());
-                }
-                Err(SystemError::EINTR)
-            }
-            x => x,
+        let forced = matches!(opcode, FUSE_FLUSH | FUSE_RELEASE | FUSE_RELEASEDIR);
+        match self.wait_request_result(&pending, forced)? {
+            FusePendingResult::Reply(reply) => Ok(reply),
+            FusePendingResult::ReadPagesDirect { .. } => Err(SystemError::EIO),
         }
+    }
+
+    /// Linux request_wait_answer(): interruption requests cancellation; only
+    /// the original request's terminal result establishes its actual outcome.
+    pub(super) fn wait_request_result(
+        &self,
+        pending: &Arc<FusePendingState>,
+        forced: bool,
+    ) -> Result<FusePendingResult, SystemError> {
+        let no_interrupt = self.inner.lock().no_interrupt;
+        if !no_interrupt {
+            match pending.wait_terminal(FuseWaitMode::Interruptible) {
+                Ok((result, _)) => return result,
+                Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {}
+                Err(error) => return Err(error),
+            }
+            if pending.mark_interrupted() {
+                let _ = self.queue_interrupt(pending.unique());
+            }
+        }
+        if !forced {
+            match pending.wait_terminal(FuseWaitMode::Killable) {
+                Ok((result, _)) => return result,
+                Err(SystemError::EINTR | SystemError::ERESTARTSYS) => {}
+                Err(error) => return Err(error),
+            }
+            self.cancel_queued_request(pending);
+        }
+        pending.wait_terminal(FuseWaitMode::Uninterruptible)?.0
+    }
+
+    /// Called only after successful userspace delivery or virtqueue submission.
+    /// Never hold conn.inner while queuing the matching interrupt.
+    pub(crate) fn mark_request_sent(&self, unique: u64) {
+        let pending = self.inner.lock().processing.get(&unique).cloned();
+        if pending.is_some_and(|pending| pending.mark_sent()) {
+            let _ = self.queue_interrupt(unique);
+        }
+    }
+
+    fn cancel_queued_request(&self, expected: &Arc<FusePendingState>) {
+        let retired = {
+            let mut inner = self.inner.lock();
+            if !inner
+                .processing
+                .get(&expected.unique())
+                .is_some_and(|pending| Arc::ptr_eq(pending, expected))
+            {
+                return;
+            }
+            let Some(position) = inner
+                .pending
+                .iter()
+                .position(|req| req.unique == expected.unique())
+            else {
+                // Dequeue transfers ownership to the transport, including
+                // virtiofs QueueFull retries before descriptor submission.
+                // Like Linux FR_PENDING, connection-side cancellation ends
+                // here; only the transport may retire the request.
+                return;
+            };
+            let request = inner.pending.remove(position).unwrap();
+            let pending = inner.processing.remove(&expected.unique()).unwrap();
+            (request, pending)
+        };
+        // Retire data/DMA pins and accounting outside the connection lock.
+        let (request, pending) = retired;
+        if pending.complete_never_submitted(SystemError::EINTR) {
+            stats::on_fuse_reply_complete(pending.opcode, SystemError::EINTR.to_posix_errno(), 0);
+            trace::trace_fuse_reply_complete(
+                pending.unique(),
+                pending.opcode,
+                SystemError::EINTR.to_posix_errno(),
+                0,
+            );
+        }
+        drop(request);
     }
 
     fn enqueue_noreply(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<(), SystemError> {
@@ -689,7 +767,7 @@ pub(super) fn reply_capacity_for_test(
     conn.reply_capacity(opcode, payload)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "mm_selftest"))]
 pub(super) fn queue_test_request(
     conn: &Arc<FuseConn>,
     opcode: u32,
@@ -726,6 +804,109 @@ mod tests {
     use system_error::SystemError;
 
     use super::*;
+
+    #[test]
+    fn delivery_interruption_handshake_queues_initial_interrupt_exactly_once() {
+        for sent_first in [false, true] {
+            let pending = FusePendingState::new(2, FUSE_LOOKUP);
+            let initial = if sent_first {
+                assert!(!pending.mark_sent());
+                pending.mark_interrupted()
+            } else {
+                assert!(!pending.mark_interrupted());
+                pending.mark_sent()
+            };
+            assert!(initial);
+            assert!(!pending.mark_sent());
+            assert!(!pending.mark_interrupted());
+        }
+    }
+
+    #[test]
+    fn interrupted_request_is_not_announced_until_transport_delivery() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        {
+            let mut inner = conn.inner.lock();
+            inner.mounted = true;
+            inner.initialized = true;
+        }
+        let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, b"name\0", true);
+        let pending = pending.unwrap();
+        let retry = FuseOutHeader {
+            len: size_of::<FuseOutHeader>() as u32,
+            error: SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno(),
+            unique: unique | FuseConn::FUSE_INT_REQ_BIT,
+        };
+        conn.write_reply(fuse_pack_struct(&retry)).unwrap();
+        assert!(conn.inner.lock().hiprio_pending.is_empty());
+        assert!(!pending.mark_interrupted());
+        conn.queue_interrupt(unique).unwrap();
+        assert!(conn.inner.lock().hiprio_pending.is_empty());
+        let request = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
+        assert!(conn.inner.lock().hiprio_pending.is_empty());
+        conn.mark_request_sent(unique);
+        conn.mark_request_sent(unique);
+        {
+            let inner = conn.inner.lock();
+            assert_eq!(inner.hiprio_pending.len(), 1);
+            let interrupt = inner.hiprio_pending.front().unwrap();
+            assert_eq!(interrupt.opcode, FUSE_INTERRUPT);
+            assert_eq!(FuseConn::interrupt_target_unique(interrupt.unique), unique);
+        }
+        conn.disconnect_requests();
+        drop(request);
+    }
+
+    #[test]
+    fn queued_cancellation_retires_only_the_original_owner() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, b"name\0", true);
+        let pending = pending.unwrap();
+        conn.cancel_queued_request(&pending);
+        assert!(!conn.has_pending_ordinary_requests());
+        assert!(!conn.has_processing_request(unique));
+        let (result, kind) = pending
+            .wait_terminal(FuseWaitMode::Uninterruptible)
+            .unwrap();
+        assert!(matches!(result, Err(SystemError::EINTR)));
+        assert_eq!(kind, FuseCompletionKind::NeverSubmitted);
+        conn.cancel_queued_request(&pending);
+        assert!(!pending.complete(Ok(FuseReply::from_bytes(Vec::new()))));
+    }
+
+    #[test]
+    fn transport_owned_unsent_request_survives_queued_cancellation() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, b"name\0", true);
+        let pending = pending.unwrap();
+        let request = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
+        assert_eq!(
+            pending.delivery.load(Ordering::Acquire) & FusePendingState::SENT,
+            0
+        );
+        conn.cancel_queued_request(&pending);
+        assert!(conn.has_processing_request(unique));
+        assert!(pending.take_ready().is_none());
+        conn.disconnect_requests();
+        assert!(matches!(
+            conn.wait_request_result(&pending, false),
+            Err(SystemError::ENOTCONN)
+        ));
+        drop(request);
+    }
+
+    #[test]
+    fn terminal_daemon_interruption_does_not_enqueue_an_interrupt() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        let pending = Arc::new(FusePendingState::new(2, FUSE_LOOKUP));
+        pending.complete_daemon_error(SystemError::EINTR);
+        assert!(matches!(
+            conn.wait_request_result(&pending, false),
+            Err(SystemError::EINTR)
+        ));
+        assert_eq!(pending.delivery.load(Ordering::Acquire), 0);
+        assert!(conn.inner.lock().pending.is_empty());
+    }
 
     fn set_minor(conn: &FuseConn, minor: u32) {
         conn.inner.lock().init.minor = minor;

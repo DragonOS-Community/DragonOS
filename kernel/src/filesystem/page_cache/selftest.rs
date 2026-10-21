@@ -2864,6 +2864,119 @@ impl Drop for MemcgReclaimFixture {
     }
 }
 
+/// A Page Arc protects its bytes, but only an entry pin protects membership
+/// until a fault can publish its PTE/rmap. Exercise both sides without ever
+/// installing a stale PTE or relying on a timing-sensitive reclaimer race.
+fn run_custom_fill_fault_pin_selftest() -> Result<bool, SystemError> {
+    let task = crate::process::ProcessManager::current_pcb();
+    let owner = crate::cgroup::memory::account_for_task(&task);
+    let creator = crate::cgroup::memory::object_for_task(&task);
+    let cache = PageCache::new_unowned(None, None);
+    let mut ok = true;
+
+    let bare = cache
+        .manager
+        .try_commit_page_with(0, &owner, &creator, |_, dst| {
+            dst.fill(0x5a);
+            Ok(dst.len())
+        })
+        .map_err(PageCache::legacy_allocation_error)?;
+    let bare_phys = bare.phys_address();
+    cache.drop_clean_pages();
+    ok &= !page_manager_lock().contains(&bare_phys)
+        && page_reclaimer_lock().get(&bare_phys).is_none()
+        && unsafe { bare.read().as_slice()[0] == 0x5a };
+    drop(bare);
+
+    let mut protected_during_fill = false;
+    let pin = cache
+        .manager
+        .try_commit_page_with_pinned(0, &owner, &creator, |index, dst| {
+            let entry = cache
+                .inner
+                .lock()
+                .get_entry(index)
+                .ok_or(SystemError::EIO)?;
+            protected_during_fill =
+                entry.active_users() != 0 && cache.manager.remove_page(index)?.is_none();
+            dst.fill(0xa7);
+            Ok(dst.len())
+        })
+        .map_err(PageCache::legacy_allocation_error)?;
+    let page = pin.page();
+    let physical = page.phys_address();
+    let mut replayed_fill = false;
+    let hot_pin = cache
+        .manager
+        .try_commit_page_with_pinned(0, &owner, &creator, |_, _| {
+            replayed_fill = true;
+            Err(SystemError::EIO)
+        })
+        .map_err(PageCache::legacy_allocation_error)?;
+    ok &= protected_during_fill
+        && !replayed_fill
+        && Arc::ptr_eq(&hot_pin.page(), &page)
+        && cache
+            .manager
+            .remove_clean_page_for_reclaim(0, &page)?
+            .is_none()
+        && cache.drop_clean_pages() == 0
+        && page_manager_lock().contains(&physical)
+        && page_reclaimer_lock().get(&physical).is_some();
+
+    // Force the actual publication-loser branch deterministically: the winner
+    // must be pinned while membership is locked, and the unused prepared page
+    // must leave the registries without replacing that winner.
+    let prepared_page = cache
+        .allocate_page_with_owner(Arc::downgrade(&cache), 0, &owner)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let prepared_phys = prepared_page.phys_address();
+    let prepared = cache
+        .prepare_entry(&prepared_page, PageState::Loading, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let (winner, winner_pin, inserted) = cache
+        .publish_prepared_entry_pinned(0, &prepared, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    drop(pin);
+    drop(hot_pin);
+    ok &= !inserted
+        && Arc::ptr_eq(&winner.page, &page)
+        && winner.active_users() == 1
+        && !page_manager_lock().contains(&prepared_phys)
+        && page_reclaimer_lock().get(&prepared_phys).is_none()
+        && cache.drop_clean_pages() == 0;
+    drop(prepared);
+    drop(prepared_page);
+    drop(winner_pin);
+    drop(winner);
+    cache.drop_clean_pages();
+    ok &=
+        !page_manager_lock().contains(&physical) && page_reclaimer_lock().get(&physical).is_none();
+    drop(page);
+
+    let mut failed_identity = None;
+    let mut fill_calls = 0;
+    let failed = cache
+        .manager
+        .try_commit_page_with_pinned(1, &owner, &creator, |index, _| {
+            let entry = cache
+                .inner
+                .lock()
+                .get_entry(index)
+                .ok_or(SystemError::EIO)?;
+            failed_identity = Some(Arc::downgrade(&entry.page));
+            fill_calls += 1;
+            Err(SystemError::EIO)
+        });
+    ok &= matches!(failed, Err(MemoryAllocationError::System(SystemError::EIO)))
+        && fill_calls == 1
+        && !cache.fault_page_state(1).cached;
+    // Check the failed identity rather than a PFN another CPU may reuse after
+    // the successful rollback. Either registry retaining it keeps Weak live.
+    ok &= failed_identity.ok_or(SystemError::EIO)?.upgrade().is_none();
+    Ok(ok)
+}
+
 fn run_page_fault_cache_snapshot_selftest() -> Result<bool, SystemError> {
     let root = crate::cgroup::memory::MemoryAccount::new(0, None)?;
     let mut ok = true;
@@ -3661,6 +3774,10 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
 
     if !run_memcg_noio_reclaim_selftest()? {
         return Ok("status=fail stage=memcg_noio_reclaim\n".into());
+    }
+
+    if !run_custom_fill_fault_pin_selftest()? {
+        return Ok("status=fail stage=custom_fill_fault_pin\n".into());
     }
 
     if !run_page_fault_cache_snapshot_selftest()? {
@@ -5759,7 +5876,7 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
     }
 
     Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
-        "status=ok\nsubpage_buffers=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nramfs_truncate_metadata=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+        "status=ok\nsubpage_buffers=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\ncustom_fill_fault_pin=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nramfs_truncate_metadata=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }
 

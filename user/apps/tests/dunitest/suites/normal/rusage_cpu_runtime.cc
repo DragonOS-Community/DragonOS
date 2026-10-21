@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/times.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -67,6 +68,54 @@ void Isolated(const std::function<int()>& body) {
     usleep(1000);
   }
   FAIL() << "CPU accounting case exceeded its wall-clock watchdog";
+}
+
+TEST(RusageCpuRuntime, TimesNullElapsedAndBadPointer) {
+  const long before = syscall(SYS_times, nullptr);
+  ASSERT_GE(before, 0) << errno;
+  usleep(30000);
+  const long after = syscall(SYS_times, nullptr);
+  EXPECT_GT(after, before);
+  errno = 0;
+  EXPECT_EQ(-1, syscall(SYS_times, reinterpret_cast<tms*>(1)));
+  EXPECT_EQ(EFAULT, errno);
+}
+
+TEST(RusageCpuRuntime, TimesIncludesThreadGroupCpuInClockTicks) {
+  Isolated([]() {
+    bool ran = false;
+    std::thread worker([&] { ran = SpinCpu(30000000); });
+    worker.join();
+    if (!ran) return 1;
+    rusage before{}, after{};
+    tms value{};
+    if (getrusage(RUSAGE_SELF, &before) != 0 || syscall(SYS_times, &value) < 0 ||
+        getrusage(RUSAGE_SELF, &after) != 0) return 2;
+    const auto ticks = [](timeval v) { return Ns(v) / 10000000ULL; };
+    if (value.tms_utime < static_cast<clock_t>(ticks(before.ru_utime)) ||
+        value.tms_utime > static_cast<clock_t>(ticks(after.ru_utime)) ||
+        value.tms_stime < static_cast<clock_t>(ticks(before.ru_stime)) ||
+        value.tms_stime > static_cast<clock_t>(ticks(after.ru_stime))) return 3;
+    return value.tms_utime + value.tms_stime > 0 ? 0 : 4;
+  });
+}
+
+TEST(RusageCpuRuntime, TimesIncludesChildrenOnlyAfterWait) {
+  Isolated([]() {
+    const pid_t child = fork();
+    if (child < 0) return 1;
+    if (child == 0) _exit(SpinCpu(30000000) ? 0 : 1);
+    tms before{}, after{};
+    const long sampled = syscall(SYS_times, &before);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 2;
+    rusage usage{};
+    if (sampled < 0 || syscall(SYS_times, &after) < 0 || getrusage(RUSAGE_CHILDREN, &usage)) return 3;
+    if (before.tms_cutime != 0 || before.tms_cstime != 0) return 4;
+    if (after.tms_cutime != static_cast<clock_t>(Ns(usage.ru_utime) / 10000000ULL) ||
+        after.tms_cstime != static_cast<clock_t>(Ns(usage.ru_stime) / 10000000ULL)) return 5;
+    return after.tms_cutime + after.tms_cstime > 0 ? 0 : 6;
+  });
 }
 
 TEST(RusageCpuRuntime, SubTickThreadAndProcessUsageMatchesRuntime) {

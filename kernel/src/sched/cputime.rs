@@ -106,8 +106,18 @@ pub(crate) fn task_sched_runtime(task: &ProcessControlBlock) -> u64 {
 /// 将纳秒转换为 USER_HZ 单位的 ticks
 #[inline]
 pub const fn ns_to_clock_t(ns: u64) -> u64 {
-    ns * USER_HZ / 1_000_000_000
+    // USER_HZ is 100, an exact divisor of nanoseconds per second.
+    ns / (1_000_000_000 / USER_HZ)
 }
+
+// Keep accumulated multi-thread CPU time monotonic beyond the old ns*HZ
+// overflow boundary. These checks execute at compile time on every platform.
+const _: () = {
+    assert!(ns_to_clock_t(9_999_999) == 0);
+    assert!(ns_to_clock_t(10_000_000) == 1);
+    assert!(ns_to_clock_t(u64::MAX / USER_HZ + 1) == (u64::MAX / USER_HZ + 1) / 10_000_000);
+    assert!(ns_to_clock_t(u64::MAX) == u64::MAX / 10_000_000);
+};
 
 /// per-CPU 的内核 CPU 统计（对齐 Linux kernel_cpustat）
 #[derive(Debug)]

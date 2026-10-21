@@ -55,6 +55,21 @@ pub(super) fn find(
     inode: &OvlInode,
     name: &str,
 ) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+    // Dot denotes this object, including after its old pathname is replaced.
+    // Never recover inode identity by walking the historical redirect path.
+    if inode.is_dir() {
+        match name {
+            "" | "." => {
+                return inode
+                    .self_ref
+                    .upgrade()
+                    .map(|inode| inode as Arc<dyn IndexNode>)
+                    .ok_or(SystemError::ESTALE)
+            }
+            ".." => return inode.parent(),
+            _ => {}
+        }
+    }
     let state = inode.dir_state()?;
     let _dir_guard = state.mutation_lock.lock();
     find_locked(inode, name, &state)
@@ -220,4 +235,32 @@ fn same_inode(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> Result<b
     let left = left.metadata()?;
     let right = right.metadata()?;
     Ok(left.dev_id == right.dev_id && left.inode_id == right.inode_id)
+}
+
+#[cfg(test)]
+mod dot_lookup_tests {
+    use super::*;
+    use crate::filesystem::vfs::LinkMutationCoordinator;
+
+    #[test]
+    fn dot_keeps_object_identity_without_resolving_an_old_path() {
+        let inode = OvlInode::new(
+            "old/name".into(),
+            FileType::Dir,
+            None,
+            Vec::new(),
+            None,
+            Arc::new(LinkMutationCoordinator::new()),
+            None,
+        );
+        let weak = Arc::downgrade(&inode);
+        let expected: Arc<dyn IndexNode> = inode.clone();
+        for name in [".", ""] {
+            let dot = find(&inode, name).unwrap();
+            assert!(Arc::ptr_eq(&dot, &expected));
+        }
+        drop(expected);
+        drop(inode);
+        assert!(weak.upgrade().is_none());
+    }
 }

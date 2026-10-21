@@ -585,6 +585,48 @@ TEST(OverlayFsSemantics, CreateOverWhiteoutAfterLowerUnlink) {
     remove_tree(root);
 }
 
+TEST(OverlayFsSemantics, DirectoryDotAndParentKeepIdentityAfterRename) {
+    ScopedOverlayEnv scoped("overlay_dot_identity");
+    const auto& env = scoped.env;
+    ASSERT_TRUE(setup_overlay_env(env)) << strerror(errno);
+    const std::string original = join_path(env.merged, "original");
+    const std::string renamed = join_path(env.merged, "renamed");
+    ASSERT_EQ(0, mkdir(original.c_str(), 0755)) << strerror(errno);
+    struct DirectoryFd {
+        int value;
+        ~DirectoryFd() { if (value >= 0) close(value); }
+    } fd {open(original.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    ASSERT_GE(fd.value, 0) << strerror(errno);
+    struct stat before {}, dot {}, parent {}, root {}, replacement {};
+    ASSERT_EQ(0, fstat(fd.value, &before));
+    ASSERT_EQ(0, stat(env.merged.c_str(), &root));
+    ASSERT_EQ(0, rename(original.c_str(), renamed.c_str()));
+    ASSERT_EQ(0, mkdir(original.c_str(), 0755));
+    ASSERT_EQ(0, stat(original.c_str(), &replacement));
+    ASSERT_EQ(0, fstatat(fd.value, ".", &dot, 0)) << strerror(errno);
+    EXPECT_EQ(before.st_dev, dot.st_dev);
+    EXPECT_EQ(before.st_ino, dot.st_ino);
+    EXPECT_NE(replacement.st_ino, dot.st_ino);
+    ASSERT_EQ(0, fstatat(fd.value, "..", &parent, 0)) << strerror(errno);
+    EXPECT_EQ(root.st_dev, parent.st_dev);
+    EXPECT_EQ(root.st_ino, parent.st_ino);
+    DIR* stream = fdopendir(dup(fd.value));
+    ASSERT_NE(nullptr, stream) << strerror(errno);
+    bool saw_dot = false, saw_parent = false;
+    while (dirent* entry = readdir(stream)) {
+        if (strcmp(entry->d_name, ".") == 0) {
+            saw_dot = true;
+            EXPECT_EQ(before.st_ino, entry->d_ino);
+        } else if (strcmp(entry->d_name, "..") == 0) {
+            saw_parent = true;
+            EXPECT_EQ(root.st_ino, entry->d_ino);
+        }
+    }
+    EXPECT_EQ(0, closedir(stream));
+    EXPECT_TRUE(saw_dot);
+    EXPECT_TRUE(saw_parent);
+}
+
 TEST(OverlayFsSemantics, SymlinkCreatesRealUpperLink) {
     ScopedOverlayEnv scoped("overlay_symlink_create");
     const auto& env = scoped.env;

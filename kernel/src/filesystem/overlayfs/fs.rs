@@ -671,7 +671,7 @@ impl OverlayFS {
                         None,
                     ),
                 };
-                let inode = Arc::new(OvlInode::new(
+                let inode = OvlInode::new(
                     redirect.clone(),
                     file_type,
                     upper_inode.clone(),
@@ -679,7 +679,7 @@ impl OverlayFS {
                     fallback_id,
                     link_coordinator,
                     fifo,
-                ));
+                );
                 inode.set_fs(Arc::downgrade(self));
                 inode
             };
@@ -1112,7 +1112,7 @@ impl MountableFileSystem for OverlayFS {
                     return Err(SystemError::EINVAL);
                 }
                 Some(OvlLayer {
-                    mnt: Arc::new(OvlInode::new(
+                    mnt: OvlInode::new(
                         name.clone(),
                         FileType::Dir,
                         Some(inode.clone()),
@@ -1121,7 +1121,7 @@ impl MountableFileSystem for OverlayFS {
                         Arc::try_new(LinkMutationCoordinator::new())
                             .map_err(|_| SystemError::ENOMEM)?,
                         None,
-                    )),
+                    ),
                     index: 0,
                     fsid: 0,
                 })
@@ -1158,7 +1158,7 @@ impl MountableFileSystem for OverlayFS {
             .map(|(i, (dir, lower_inode))| {
                 let lower_file_type = lower_inode.metadata()?.file_type;
                 Ok(OvlLayer {
-                    mnt: Arc::new(OvlInode::new(
+                    mnt: OvlInode::new(
                         dir.clone(),
                         lower_file_type,
                         None,
@@ -1167,7 +1167,7 @@ impl MountableFileSystem for OverlayFS {
                         Arc::try_new(LinkMutationCoordinator::new())
                             .map_err(|_| SystemError::ENOMEM)?,
                         None,
-                    )),
+                    ),
                     index: (i + 1) as u32,
                     fsid: (i + 1) as u32,
                 })
@@ -1233,7 +1233,7 @@ impl MountableFileSystem for OverlayFS {
             .and_then(|upper| upper.fs().downcast_arc::<MountFS>())
             .map(|mount| mount.try_pin_external())
             .transpose()?;
-        let root_inode = Arc::new(OvlInode::new(
+        let root_inode = OvlInode::new(
             String::new(),
             FileType::Dir,
             upper_inode,
@@ -1244,7 +1244,7 @@ impl MountableFileSystem for OverlayFS {
             (!samefs).then(generate_inode_id),
             Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?,
             None,
-        ));
+        );
 
         let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
         let backing_cred = context.cred.clone();

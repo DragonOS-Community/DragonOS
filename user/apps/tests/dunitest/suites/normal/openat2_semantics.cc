@@ -69,6 +69,28 @@ protected:
     int dirfd_ = -1;
 };
 
+TEST_F(OpenAt2Test, LegacyOpenIgnoresUnknownFlagsButOpenat2RejectsThem) {
+    for (uint32_t unknown : {1U << 23, 1U << 30, 1U << 31}) {
+        const uint32_t flags = O_RDONLY | O_CLOEXEC | unknown;
+        int fd = static_cast<int>(syscall(SYS_openat, dirfd_, "inside", flags, 0));
+        EXPECT_GE(fd, 0) << strerror(errno);
+        if (fd >= 0) {
+            EXPECT_EQ(FD_CLOEXEC, fcntl(fd, F_GETFD));
+            EXPECT_EQ(0, close(fd));
+        }
+#ifdef SYS_open
+        fd = static_cast<int>(syscall(SYS_open, (dir_ + "/inside").c_str(), flags, 0));
+        EXPECT_GE(fd, 0) << strerror(errno);
+        if (fd >= 0) {
+            EXPECT_EQ(FD_CLOEXEC, fcntl(fd, F_GETFD));
+            EXPECT_EQ(0, close(fd));
+        }
+#endif
+        OpenHow how = {flags, 0, 0};
+        ExpectFailure(dirfd_, "inside", how, EINVAL);
+    }
+}
+
 TEST_F(OpenAt2Test, ValidRequestAndStructExtension) {
     OpenHow how = {};
     int fd = OpenAt2(dirfd_, "inside", how);

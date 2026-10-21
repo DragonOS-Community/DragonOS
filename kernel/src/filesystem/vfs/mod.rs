@@ -2963,6 +2963,10 @@ impl dyn IndexNode {
         // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
         // walk. A symlink chain must not amplify allocator work per hop.
         let mut symlink_buffer: Option<Vec<u8>> = None;
+        // Magic links provide a retained mount/dentry cursor. Preserve that
+        // base for subsequent steps, including relative-symlink expansion;
+        // only newly selected components may cross mounts.
+        let mut retained_mount_path = false;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
@@ -3031,7 +3035,24 @@ impl dyn IndexNode {
                     .resolve
                     .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
             });
-            let lookup = if no_xdev {
+            let lookup = if retained_mount_path {
+                // Magic-link resolution already rejects RESOLVE_CACHED. Keep
+                // this guard so this path never acquires blocking lookup locks.
+                if cache_only {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+                }
+                if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
+                    mounted.lookup_from_resolved(
+                        &name,
+                        no_xdev,
+                        !has_more_components
+                            && !trailing_slash
+                            && options.is_some_and(|options| options.no_automount),
+                    )
+                } else {
+                    result.find(&name)
+                }
+            } else if no_xdev {
                 if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
                     if cache_only {
                         mounted.cached_find_no_xdev(&name)
@@ -3182,7 +3203,7 @@ impl dyn IndexNode {
                     if rest_path.is_empty() {
                         return Ok(PathWalkOutcome::Found(target_inode, ownership));
                     } else {
-                        // 将 result 设为 magic link 的目标 inode，继续迭代
+                        retained_mount_path = true;
                         result = target_inode;
                         continue;
                     }
@@ -3254,6 +3275,7 @@ impl dyn IndexNode {
                             return Err(SystemError::EXDEV.into());
                         }
                     }
+                    retained_mount_path = false;
                     result = process_root_inode.clone();
                     if ownership.is_some() {
                         ownership = Some(

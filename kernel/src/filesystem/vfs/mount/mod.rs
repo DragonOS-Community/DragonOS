@@ -5741,13 +5741,61 @@ impl MountFSInode {
             .map(|inode| inode as Arc<dyn IndexNode>)
     }
 
+    /// Resolve a component from an already selected mount/dentry, as after a
+    /// magic-link jump. Only the base is fixed: mounts on the result still
+    /// follow the ordinary pathname policy.
+    pub(crate) fn lookup_from_resolved(
+        &self,
+        name: &str,
+        no_xdev: bool,
+        no_automount: bool,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        match name {
+            "" | "." => self
+                .self_ref
+                .upgrade()
+                .map(|inode| inode as Arc<dyn IndexNode>)
+                .ok_or(SystemError::ENOENT),
+            ".." => {
+                if no_xdev
+                    && self.is_mountpoint_root()?
+                    && self.mount_fs.self_mountpoint().is_some()
+                {
+                    return Err(SystemError::EXDEV);
+                }
+                let parent = self.do_parent()?;
+                let parent = if no_xdev {
+                    parent.overlaid_inode_no_xdev()?
+                } else {
+                    parent.overlaid_inode()
+                };
+                Ok(parent)
+            }
+            _ => {
+                let policy = if no_xdev {
+                    MountLookupPolicy::Reject
+                } else if no_automount {
+                    MountLookupPolicy::FollowNoAutomount
+                } else {
+                    MountLookupPolicy::Follow
+                };
+                Self::find_child_from_base(
+                    self.self_ref.upgrade().ok_or(SystemError::ENOENT)?,
+                    name,
+                    policy,
+                    false,
+                )
+                .map(|inode| inode as Arc<dyn IndexNode>)
+            }
+        }
+    }
+
     fn do_find_with_policy(
         &self,
         name: &str,
         policy: MountLookupPolicy,
         cache_only: bool,
     ) -> Result<Arc<MountFSInode>, SystemError> {
-        let no_xdev = policy == MountLookupPolicy::Reject;
         let base = if matches!(
             policy,
             MountLookupPolicy::Follow | MountLookupPolicy::FollowNoAutomount
@@ -5756,6 +5804,16 @@ impl MountFSInode {
         } else {
             self.self_ref.upgrade().ok_or(SystemError::ENOENT)?
         };
+        Self::find_child_from_base(base, name, policy, cache_only)
+    }
+
+    fn find_child_from_base(
+        base: Arc<MountFSInode>,
+        name: &str,
+        policy: MountLookupPolicy,
+        cache_only: bool,
+    ) -> Result<Arc<MountFSInode>, SystemError> {
+        let no_xdev = policy == MountLookupPolicy::Reject;
         let (inner_inode, mount_inode) = {
             let _children_guard = if cache_only {
                 base.dentry

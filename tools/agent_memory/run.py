@@ -288,13 +288,16 @@ class GuestVM:
                      "echo '+memory +cpu' > /sys/fs/cgroup/cgroup.subtree_control", 60)
         return self
 
-    def receive(self, timeout):
+    def _check_health(self):
         if CANCELLED.is_set():
             raise InterruptedError('run cancelled')
         if self.sampler.failure:
             raise RuntimeError('host sampling failed: ' + self.sampler.failure)
         if self.overlay.stat().st_blocks * 512 > self.config.get('overlay_budget_mib', 256) * 1024**2:
             raise RuntimeError('private overlay exceeded disk budget')
+
+    def receive(self, timeout):
+        self._check_health()
         sockets = [self.console] + ([self.completion] if self.completion else [])
         poll_timeout = max(0, min(timeout, 1))
         drain_deadline = time.monotonic() + poll_timeout
@@ -314,6 +317,17 @@ class GuestVM:
             self.completion_buffer += block
             if len(self.completion_buffer) > 64:
                 raise RuntimeError('completion frame exceeded bounded buffer')
+
+    def _drain_console(self, deadline):
+        # A completion event can precede console readiness in the first select.
+        # Poll afresh before accepting it; a bounded, unfinished drain is not success.
+        until = min(deadline, time.monotonic() + 1)
+        while select.select([self.console], [], [], 0)[0]:
+            self._check_health()
+            if time.monotonic() >= until:
+                return False
+            self._receive_console()
+        return True
 
     def _receive_console(self):
         block = self.console.recv(65536)
@@ -373,11 +387,19 @@ class GuestVM:
         self._send_shell(wire)
         deadline = time.monotonic() + timeout
         while True:
+            self._check_health()
+            if time.monotonic() >= deadline:
+                raise TimeoutError('guest command timeout')
             if b'\n' in self.completion_buffer:
                 match = re.fullmatch(re.escape(token) + rb':([0-9]{1,3})\r?\n',
                                      self.completion_buffer)
                 if match is None or int(match.group(1)) > 255:
                     raise RuntimeError('invalid completion frame')
+                if not self._drain_console(deadline):
+                    continue
+                self._check_health()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('guest command timeout')
                 code = int(match.group(1))
                 self.completion_buffer = b''
                 # command() returns status only; expect() is used for boot prompts.

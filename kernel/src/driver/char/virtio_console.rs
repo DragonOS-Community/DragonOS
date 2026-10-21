@@ -586,14 +586,6 @@ impl InnerVirtIOConsoleDevice {
         self.flush_pending = !self.outbuf.is_empty() || self.device_inner.pending_tx_len() != 0;
         Ok(total)
     }
-
-    fn discard_unsubmitted_output_locked(&mut self) {
-        let keep_inflight = self.device_inner.pending_tx_len().min(self.outbuf.len());
-        if self.outbuf.len() > keep_inflight {
-            self.outbuf.truncate(keep_inflight);
-        }
-        self.flush_pending = keep_inflight != 0;
-    }
 }
 
 impl KObject for VirtIOConsoleDevice {
@@ -998,22 +990,12 @@ impl TtyOperation for VirtIOConsoleDriver {
         tty.ldisc().flush_buffer(tty.clone())?;
 
         if let Some(dev) = dev {
-            match dev.flush_output_budget(VIRTIO_CONSOLE_TX_FLUSH_BUDGET) {
-                Ok((_, wake_tty)) => {
-                    let close_wake = {
-                        let mut inner = dev.inner();
-                        inner.discard_unsubmitted_output_locked();
-                        inner.output_tty.upgrade()
-                    };
-                    VirtIOConsoleDevice::wake_output_tty(wake_tty.or(close_wake));
-                }
-                Err(_) => {
-                    let mut inner = dev.inner();
-                    inner.discard_unsubmitted_output_locked();
-                    let wake_tty = inner.output_tty.upgrade();
-                    drop(inner);
-                    VirtIOConsoleDevice::wake_output_tty(wake_tty);
-                }
+            // Accepted output belongs to the device, not the closing file.
+            // A normal close must not truncate the unsubmitted tail: IRQs
+            // continue draining it, including across a subsequent reopen.
+            // Close is not a synchronous drain or a reason to abort DMA.
+            if let Ok((_, wake_tty)) = dev.flush_output_budget(VIRTIO_CONSOLE_TX_FLUSH_BUDGET) {
+                VirtIOConsoleDevice::wake_output_tty(wake_tty);
             }
         }
 

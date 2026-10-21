@@ -581,6 +581,14 @@ impl MountId {
     }
 }
 
+/// Root boundary for a parent step, including mount-root ascent. This is a
+/// borrowed pathname-walk policy, not a new owner of the mount or dentry.
+#[derive(Clone, Copy)]
+pub(crate) struct MountWalkRoot<'a> {
+    pub inode: &'a MountFSInode,
+    pub reject_parent: bool,
+}
+
 /// @brief Mount filesystem
 /// When mounting a filesystem, a MountFS wrapper layer is applied to support recursive mounting.
 pub struct MountFS {
@@ -5653,47 +5661,6 @@ impl MountFSInode {
         }
     }
 
-    /// One pathname step which must not enter or leave a mount, including an
-    /// automount. Checking here matters: ordinary `find` folds mount stacks
-    /// before the generic path walker can inspect the result.
-    pub(crate) fn find_no_xdev(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        match name {
-            "" | "." => self
-                .self_ref
-                .upgrade()
-                .map(|inode| inode as Arc<dyn IndexNode>)
-                .ok_or(SystemError::ENOENT),
-            ".." => {
-                if self.is_mountpoint_root()? && self.mount_fs.self_mountpoint().is_some() {
-                    return Err(SystemError::EXDEV);
-                }
-                self.do_parent().map(|inode| inode as Arc<dyn IndexNode>)
-            }
-            _ => self
-                .do_find_with_no_xdev(name, true, false)
-                .map(|inode| inode as Arc<dyn IndexNode>),
-        }
-    }
-
-    pub(crate) fn cached_find_no_xdev(
-        &self,
-        name: &str,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        match name {
-            "" | "." => self
-                .self_ref
-                .upgrade()
-                .map(|inode| inode as Arc<dyn IndexNode>)
-                .ok_or(SystemError::ENOENT),
-            // Parent traversal currently needs mount-topology/namespace locks
-            // that can be held across slow work. Retry by ref-walking instead.
-            ".." => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-            _ => self
-                .do_find_with_no_xdev(name, true, true)
-                .map(|inode| inode as Arc<dyn IndexNode>),
-        }
-    }
-
     fn overlaid_inode_no_xdev(&self) -> Result<Arc<MountFSInode>, SystemError> {
         let current = self.self_ref.upgrade().ok_or(SystemError::ENOENT)?;
         if current.mount_fs.lookup_top(&current).is_some() {
@@ -5703,28 +5670,11 @@ impl MountFSInode {
     }
 
     fn do_find(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
-        self.do_find_with_no_xdev(name, false, false)
+        self.do_find_with_policy(name, MountLookupPolicy::Follow, false)
     }
 
     fn do_find_cached(&self, name: &str) -> Result<Arc<MountFSInode>, SystemError> {
-        self.do_find_with_no_xdev(name, false, true)
-    }
-
-    fn do_find_with_no_xdev(
-        &self,
-        name: &str,
-        no_xdev: bool,
-        cache_only: bool,
-    ) -> Result<Arc<MountFSInode>, SystemError> {
-        self.do_find_with_policy(
-            name,
-            if no_xdev {
-                MountLookupPolicy::Reject
-            } else {
-                MountLookupPolicy::Follow
-            },
-            cache_only,
-        )
+        self.do_find_with_policy(name, MountLookupPolicy::Follow, true)
     }
 
     /// Filesystem backing lookup, like Linux lookup_one_unlocked: obtain a
@@ -5741,14 +5691,16 @@ impl MountFSInode {
             .map(|inode| inode as Arc<dyn IndexNode>)
     }
 
-    /// Resolve a component from an already selected mount/dentry, as after a
-    /// magic-link jump. Only the base is fixed: mounts on the result still
+    /// Resolve a component from an already selected mount/dentry (dirfd, cwd,
+    /// root, or magic-link target). Only the base is fixed: mounts on the result still
     /// follow the ordinary pathname policy.
     pub(crate) fn lookup_from_resolved(
         &self,
         name: &str,
         no_xdev: bool,
         no_automount: bool,
+        cache_only: bool,
+        root: Option<MountWalkRoot<'_>>,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
             "" | "." => self
@@ -5757,19 +5709,13 @@ impl MountFSInode {
                 .map(|inode| inode as Arc<dyn IndexNode>)
                 .ok_or(SystemError::ENOENT),
             ".." => {
-                if no_xdev
-                    && self.is_mountpoint_root()?
-                    && self.mount_fs.self_mountpoint().is_some()
-                {
-                    return Err(SystemError::EXDEV);
+                // Parent traversal needs mount topology and namespace locks.
+                if cache_only {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
-                let parent = self.do_parent()?;
-                let parent = if no_xdev {
-                    parent.overlaid_inode_no_xdev()?
-                } else {
-                    parent.overlaid_inode()
-                };
-                Ok(parent)
+                self.do_parent_with_root(root, no_xdev)?
+                    .follow_component_mounts(no_xdev, cache_only)
+                    .map(|inode| inode as Arc<dyn IndexNode>)
             }
             _ => {
                 let policy = if no_xdev {
@@ -5783,7 +5729,7 @@ impl MountFSInode {
                     self.self_ref.upgrade().ok_or(SystemError::ENOENT)?,
                     name,
                     policy,
-                    false,
+                    cache_only,
                 )
                 .map(|inode| inode as Arc<dyn IndexNode>)
             }
@@ -5875,10 +5821,28 @@ impl MountFSInode {
                 crate::filesystem::fuse::fs::fuse_try_automount_submount(&fuse_node, &mount_inode)?;
             }
         }
+        mount_inode.follow_component_mounts(no_xdev, cache_only)
+    }
+
+    /// Apply mount traversal only after selecting a pathname component. A
+    /// clamped root parent is also a component result; a starting cursor is not.
+    pub(crate) fn follow_component_mounts(
+        &self,
+        no_xdev: bool,
+        cache_only: bool,
+    ) -> Result<Arc<MountFSInode>, SystemError> {
+        if cache_only {
+            // Following a mount may block on topology locks or allocate its
+            // root wrapper. Ref-walk that work, but retain warm no-mount hits.
+            if self.dentry.mount_edges.load(Ordering::Acquire) != 0 {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            return self.self_ref.upgrade().ok_or(SystemError::ENOENT);
+        }
         if no_xdev {
-            mount_inode.overlaid_inode_no_xdev()
+            self.overlaid_inode_no_xdev()
         } else {
-            Ok(mount_inode.overlaid_inode())
+            Ok(self.overlaid_inode())
         }
     }
 
@@ -5888,10 +5852,24 @@ impl MountFSInode {
     /// choosing a dentry name or parent. Keep this iterative because mount
     /// propagation can build deep stacks.
     fn visible_mountpoint(&self) -> Result<Arc<MountFSInode>, SystemError> {
+        self.visible_mountpoint_with_root(None)
+    }
+
+    fn visible_mountpoint_with_root(
+        &self,
+        root: Option<MountWalkRoot<'_>>,
+    ) -> Result<Arc<MountFSInode>, SystemError> {
         // A propagation transaction can construct a very deep stack of mounts.
         let mut current = self.self_ref.upgrade().unwrap();
         let mut fast = Some(current.clone());
         loop {
+            if let Some(root) = root.filter(|root| current.same_path_ref(root.inode)) {
+                return if root.reject_parent {
+                    Err(SystemError::EXDEV)
+                } else {
+                    Ok(current)
+                };
+            }
             if current.is_mountpoint_root()? {
                 let Some(mountpoint) = current.mount_fs.self_mountpoint() else {
                     return Ok(current);
@@ -5901,7 +5879,9 @@ impl MountFSInode {
                 if let Some(mut cursor) = fast.take() {
                     let mut exhausted = false;
                     for _ in 0..2 {
-                        if !cursor.is_mountpoint_root()? {
+                        if root.is_some_and(|root| cursor.same_path_ref(root.inode))
+                            || !cursor.is_mountpoint_root()?
+                        {
                             exhausted = true;
                             break;
                         }
@@ -5925,7 +5905,23 @@ impl MountFSInode {
     }
 
     pub(super) fn do_parent(&self) -> Result<Arc<MountFSInode>, SystemError> {
-        let current = self.visible_mountpoint()?;
+        self.do_parent_with_root(None, false)
+    }
+
+    fn do_parent_with_root(
+        &self,
+        root: Option<MountWalkRoot<'_>>,
+        no_xdev: bool,
+    ) -> Result<Arc<MountFSInode>, SystemError> {
+        let current = self.visible_mountpoint_with_root(root)?;
+        if root.is_some_and(|root| current.same_path_ref(root.inode)) {
+            // Linux choose_mountpoint leaves nd.path unchanged when root is
+            // reached during mount ascent. No mount crossing was committed.
+            return self.self_ref.upgrade().ok_or(SystemError::ENOENT);
+        }
+        if no_xdev && !self.same_mount_ref(&current) {
+            return Err(SystemError::EXDEV);
+        }
         if current.is_mountpoint_root()? {
             return Ok(current);
         }

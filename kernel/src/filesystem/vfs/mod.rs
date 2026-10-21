@@ -2927,6 +2927,18 @@ impl dyn IndexNode {
             .as_ref()
             .map(|path| path.inode())
             .unwrap_or_else(|| fs_struct.root());
+        // IndexNode::as_any_ref may expose a backing inode. Upcast the
+        // actual object here: the root boundary belongs to its mount wrapper.
+        let mount_walk_root = (process_root_inode.as_ref() as &dyn Any)
+            .downcast_ref::<mount::MountFSInode>()
+            .map(|inode| mount::MountWalkRoot {
+                inode,
+                reject_parent: options.is_some_and(|options| {
+                    options
+                        .resolve
+                        .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                }),
+            });
         let mut trailing_slash = path.ends_with('/');
 
         // 处理绝对路径
@@ -2951,8 +2963,10 @@ impl dyn IndexNode {
             (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
-            let start = if options.is_some() {
-                ownership.as_ref().ok_or(SystemError::ESTALE)?.inode()
+            let start = if let Some(owner) = ownership.as_ref() {
+                owner.inode()
+            } else if let Some(mounted) = (self as &dyn Any).downcast_ref::<mount::MountFSInode>() {
+                mounted.lookup_from_resolved(".", false, false, cache_only, None)?
             } else {
                 self.find(".")?
             };
@@ -2963,10 +2977,6 @@ impl dyn IndexNode {
         // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
         // walk. A symlink chain must not amplify allocator work per hop.
         let mut symlink_buffer: Option<Vec<u8>> = None;
-        // Magic links provide a retained mount/dentry cursor. Preserve that
-        // base for subsequent steps, including relative-symlink expansion;
-        // only newly selected components may cross mounts.
-        let mut retained_mount_path = false;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
@@ -2998,29 +3008,11 @@ impl dyn IndexNode {
                 continue;
             }
 
-            // 进程 root 边界：当解析到进程 root 时，".." 不允许逃逸，应当停留在 root。
-            // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
+            // Validate a scoped cursor before parent traversal. MountFS
+            // applies the root boundary at every mount-up step, not only here.
             if name == ".." {
-                if let Some(options) = options {
-                    if options.scope_root.is_some() {
-                        options.validate_inode(&result)?;
-                        if options.is_scope_root(&result) {
-                            if options
-                                .resolve
-                                .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
-                            {
-                                return Err(SystemError::EXDEV.into());
-                            }
-                            continue;
-                        }
-                    }
-                }
-                if options.is_none_or(|options| options.scope_root.is_none()) {
-                    let cur_md = lookup_metadata(&result)?;
-                    let root_md = lookup_metadata(&process_root_inode)?;
-                    if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
-                        continue;
-                    }
+                if let Some(options) = options.filter(|options| options.scope_root.is_some()) {
+                    options.validate_inode(&result)?;
                 }
             }
 
@@ -3035,37 +3027,27 @@ impl dyn IndexNode {
                     .resolve
                     .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
             });
-            let lookup = if retained_mount_path {
-                // Magic-link resolution already rejects RESOLVE_CACHED. Keep
-                // this guard so this path never acquires blocking lookup locks.
-                if cache_only {
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
-                }
-                if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
-                    mounted.lookup_from_resolved(
-                        &name,
-                        no_xdev,
-                        !has_more_components
-                            && !trailing_slash
-                            && options.is_some_and(|options| options.no_automount),
-                    )
-                } else {
-                    result.find(&name)
-                }
-            } else if no_xdev {
-                if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>() {
-                    if cache_only {
-                        mounted.cached_find_no_xdev(&name)
-                    } else {
-                        mounted.find_no_xdev(&name)
-                    }
-                } else {
-                    if cache_only {
-                        result.cached_find(&name)
-                    } else {
-                        result.find(&name)
-                    }
-                }
+            // The current mount/dentry was already selected. Only the new
+            // component may follow mounts; never re-follow an overmount on
+            // a retained dirfd, cwd, scope root, or symlink parent cursor.
+            let lookup = if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>()
+            {
+                mounted.lookup_from_resolved(
+                    &name,
+                    no_xdev,
+                    !has_more_components
+                        && !trailing_slash
+                        && options.is_some_and(|options| options.no_automount),
+                    cache_only,
+                    mount_walk_root,
+                )
+            } else if name == ".." && {
+                // Preserve the legacy non-MountFS root boundary as well.
+                let current = lookup_metadata(&result)?;
+                let root = lookup_metadata(&process_root_inode)?;
+                current.dev_id == root.dev_id && current.inode_id == root.inode_id
+            } {
+                Ok(result.clone())
             } else if cache_only {
                 result.cached_find(&name)
             } else if !has_more_components
@@ -3203,7 +3185,6 @@ impl dyn IndexNode {
                     if rest_path.is_empty() {
                         return Ok(PathWalkOutcome::Found(target_inode, ownership));
                     } else {
-                        retained_mount_path = true;
                         result = target_inode;
                         continue;
                     }
@@ -3275,7 +3256,6 @@ impl dyn IndexNode {
                             return Err(SystemError::EXDEV.into());
                         }
                     }
-                    retained_mount_path = false;
                     result = process_root_inode.clone();
                     if ownership.is_some() {
                         ownership = Some(

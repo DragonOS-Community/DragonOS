@@ -21,7 +21,7 @@ mod sys_timer_delete;
 mod sys_timer_getoverrun;
 mod sys_timer_gettime;
 mod sys_timer_settime;
-
+mod sys_times;
 pub(crate) use posix_clock::{posix_clock_now, posix_clock_res};
 
 pub type PosixTimeT = c_longlong;

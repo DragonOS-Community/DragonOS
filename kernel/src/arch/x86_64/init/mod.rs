@@ -135,15 +135,26 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
             false
         }
     };
-    if !kvmclock_ok && !hpet_ok {
-        if let Err(error) = init_acpi_pm_clocksource() {
+    // ACPI PM Timer 无条件注册（对齐 Linux：kvmclock/hpet/pmtmr 全部可用
+    // 时并存注册）。此前仅在前两者皆失败时才初始化，导致 kvm-clock 存在
+    // 时系统没有任何独立参考源——watchdog 无法比对（R9/R10 实测：PMTMR
+    // 未初始化→kvm-clock 以 25% 速率慢走且无处可切，容器负载下楔死）。
+    // PM Timer 同时是 clocksource watchdog 的参考源与重选目标。
+    if let Err(error) = init_acpi_pm_clocksource() {
+        if !kvmclock_ok && !hpet_ok {
             // jiffies is already registered and installed by timekeeping_init.
             warn!(
                 "ACPI PM timer unavailable, continuing with jiffies: {:?}",
                 error
             );
+        } else {
+            debug!("ACPI PM timer unavailable: {:?}", error);
         }
     }
+    // BSP 的 APIC 定时器在 PMTMR 可用前完成启动期标定（标定形态与运行
+    // 形态不一致导致计数率误差，见 recalibrate_apic_count_runtime 注释）：
+    // PMTMR 就绪后按运行形态重标定并刷新 periodic_count。
+    crate::arch::x86_64::driver::apic::apic_timer::recalibrate_apic_count_runtime();
     if let Err(error) = TSCManager::init() {
         if TSCManager::cpu_khz() == 0 {
             // The scheduler clock and APIC timer still require CPU_KHZ even

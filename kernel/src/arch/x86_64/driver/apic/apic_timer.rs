@@ -24,7 +24,7 @@ use crate::time::clocksource::HZ;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
-use log::debug;
+use log::{debug, info};
 use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
@@ -140,7 +140,74 @@ fn init_ap_apic_timer() {
         initial_count,
         LocalApicTimer::DIVISOR as u32,
     );
+    // 释放 RefCell 借用后按运行形态重标定（recalibrate 内部会再次取可变
+    // 借用；AP 上线晚于 setup_arch_post，PMTMR 已可用）。
+    drop(local_apic_timer);
+    recalibrate_apic_count_runtime();
     debug!("init_ap_apic_timer done");
+}
+
+/// 运行形态下的 APIC 计数率重标定（PMTMR 独立参考）。
+///
+/// 启动期 `calibrate_initial_count` 以“周期模式 + LVT 屏蔽 + u32::MAX”
+/// 测量，在 KVM 上测得的计数率与运行形态（单次模式 + LVT 解屏蔽）相差
+/// 可达数倍，导致单次武装提前触发（tick 期限提前到期，中断风暴）。
+/// 虚拟化平台对屏蔽期计数器推进的语义与真实硬件不一致，且以 TSC 为
+/// 窗口参考在启动早期不可用。这里复用与 `program_deadline_delta` 完全
+/// 一致的武装形态（单次 + 解屏蔽），窗口由 PMTMR（宿主保证真实速率）
+/// 计量。
+///
+/// 调用条件：本 CPU 已完成常规初始化，PMTMR 已可用；调用期间本端中断
+/// 关闭。完成后恢复周期 tick。
+pub(crate) fn recalibrate_apic_count_runtime() {
+    if PMTMR_IO_PORT.load(Ordering::SeqCst) == 0 {
+        return; // 无独立参考源，保留启动期标定
+    }
+    let cpu = smp_get_processor_id();
+    let irq_guard = unsafe {
+        <crate::arch::x86_64::interrupt::X86_64InterruptArch as crate::exception::InterruptArch>::save_and_disable_irq()
+    };
+    let mut timer = local_apic_timer_instance_mut(cpu);
+    // 与运行形态一致的武装：oneshot、LVT 解屏蔽、计数器满量程。
+    // 40ms 窗口内计数器远未耗尽（u32::MAX ≈ 2.2s），不会触发中断。
+    timer.stop_current();
+    timer.set_divisor(LocalApicTimer::DIVISOR as u32);
+    timer.setup_lvt(
+        APIC_TIMER_IRQ_NUM.data() as u8,
+        false,
+        LocalApicTimerMode::Oneshot,
+    );
+    timer.set_initial_cnt(u32::MAX as u64);
+
+    let pm_start = acpi_pm_read_early() as u64;
+    let target = PMTMR_TICKS_PER_SEC * 40 / 1000; // 40ms
+    while ((acpi_pm_read_early() as u64).wrapping_sub(pm_start) & ACPI_PM_MASK) < target {
+        spin_loop();
+    }
+    let cur = CurrentApic.read_timer_current_count() as u64;
+    timer.stop_current();
+    let elapsed = (u32::MAX as u64).saturating_sub(cur);
+    let rate_per_sec = elapsed.saturating_mul(25); // elapsed / 40ms
+    if rate_per_sec == 0 {
+        drop(timer);
+        drop(irq_guard);
+        return;
+    }
+    let new_pcount = rate_per_sec * LocalApicTimer::INTERVAL_MS / 1000;
+    info!(
+        "apic timer: runtime recalibration on cpu {}: rate={}Hz old_pcount={} new_pcount={}",
+        cpu.data(),
+        rate_per_sec,
+        timer.periodic_count,
+        new_pcount
+    );
+    timer.periodic_count = new_pcount;
+    timer.hres_calibrated = true;
+    let divisor = timer.divisor;
+    timer.init(LocalApicTimerMode::Periodic, new_pcount, divisor);
+    timer.start_current();
+    drop(timer);
+    drop(irq_guard);
 }
 
 pub(super) struct LocalApicTimerIntrController;

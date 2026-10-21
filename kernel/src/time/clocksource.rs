@@ -9,7 +9,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -444,8 +444,38 @@ fn select_watchdog_replacement(
                     | ClocksourceFlags::CLOCK_SOURCE_UNSTABLE,
             )
         })
-        .max_by_key(|candidate| candidate.clocksource_data().rating)
+        .max_by_key(|candidate| {
+            let data = candidate.clocksource_data();
+            (
+                independent_watchdog_preferred(&data.name) as i32,
+                data.rating,
+            )
+        })
         .cloned()
+}
+
+/// watchdog 参考源是否为独立硬件时基。参考源被无条件信任，必须是
+/// 不依赖虚拟化平台行为的硬件计数器（HPET / ACPI PM Timer）；若让
+/// paravirt 时钟（kvm-clock）凭 rating 当参考，宿主侧 pvti 配置失谐
+/// （R11 实测 kvm-clock 以 26% 速率慢走）会把健康硬件源反向判为
+/// "偏快" 并错误标记 unstable。对齐 Linux 对 watchdog 参考的选择意图。
+fn independent_watchdog_preferred(name: &str) -> bool {
+    name == "hpet" || name == "acpi-pm" || name == "acpi_pm"
+}
+
+/// 参考源替换判定：独立硬件源优先于 paravirt 源；同类内按 rating。
+fn watchdog_reference_better(
+    new_name: &str,
+    new_rating: i32,
+    cur_name: &str,
+    cur_rating: i32,
+) -> bool {
+    let new_indep = independent_watchdog_preferred(new_name);
+    let cur_indep = independent_watchdog_preferred(cur_name);
+    if new_indep != cur_indep {
+        return new_indep;
+    }
+    new_rating > cur_rating
 }
 
 fn reset_watchdog_state(list: &LinkedList<Arc<dyn Clocksource>>) -> Result<(), SystemError> {
@@ -735,12 +765,18 @@ impl dyn Clocksource {
             // 对比当前注册的时间源的精度和监视器的精度
             let mut replaced = false;
             if cs_watchdog.watchdog.is_none()
-                || cs_watchdog
-                    .watchdog
-                    .as_ref()
-                    .is_some_and(|watchdog| cs_data.rating > watchdog.clocksource_data().rating)
+                || cs_watchdog.watchdog.as_ref().is_some_and(|watchdog| {
+                    let wd_data = watchdog.clocksource_data();
+                    watchdog_reference_better(
+                        &cs_data.name,
+                        cs_data.rating,
+                        &wd_data.name,
+                        wd_data.rating,
+                    )
+                })
             {
-                // 当前注册的时间源的精度更高或者没有监视器，替换监视器
+                // 参考源替换：独立硬件时基（hpet/acpi_pm）优先于 paravirt
+                // 源，同类内按 rating（见 independent_watchdog_preferred）。
                 cs_watchdog.watchdog.replace(cs);
                 replaced = true;
             }
@@ -1074,8 +1110,8 @@ fn sample_watchdog(
 
         let cs_dev_nsec = clocksource_cyc2ns(
             CycleNum(cs_now_clock.data().wrapping_sub(cs_data.cs_last.data()) & cs_data.mask.bits),
-            cs_data.mult,  // 2343484437
-            cs_data.shift, // 23
+            cs_data.mult,
+            cs_data.shift,
         );
         // 记录此次检查的时刻
         cs.update_clocksource_data(ClocksourceUpdate::UpdateWatchdogSamples {
@@ -1083,18 +1119,22 @@ fn sample_watchdog(
             cs_last: cs_now_clock,
         })?;
 
-        // 判断是否有误差。长间隔判断只能基于可信 watchdog 的读数；
-        // 被监视 clocksource 单侧跳变必须继续进入 skew 检测。
-        if wd_dev_nsec > WATCHDOG_INTERVAL_MAX_NS {
-            if FINISHED_BOOTING.load(Ordering::Relaxed)
-                && should_report_long_watchdog_interval(wd_dev_nsec)
-            {
-                Logger.try_log_fmt(LogLevel::WARN, format_args!(
-                    "clocksource watchdog: long readout interval, skip check: cs_nsec={} wd_nsec={}",
+        // 判断是否有误差。Linux 6.6 的 watchdog 没有长间隔豁免：watchdog
+        // tick 被延迟时（系统降级本身就会延迟它），两侧 delta 同步变大，
+        // 健康源差值仍≈0，慢速/倒走源的差值只会更醒目。保留告警但必须
+        // 继续比对——否则恰好在本该抓到病灶的降级场景自我失明（实测
+        // kvm-clock 慢走形态可被此分支放过，tick 空转风暴因此不被纠正）。
+        if wd_dev_nsec > WATCHDOG_INTERVAL_MAX_NS
+            && FINISHED_BOOTING.load(Ordering::Relaxed)
+            && should_report_long_watchdog_interval(wd_dev_nsec)
+        {
+            Logger.try_log_fmt(
+                LogLevel::WARN,
+                format_args!(
+                    "clocksource watchdog: long readout interval: cs_nsec={} wd_nsec={}",
                     cs_dev_nsec, wd_dev_nsec
-                ));
-            }
-            continue;
+                ),
+            );
         }
 
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
@@ -1134,11 +1174,64 @@ fn sample_watchdog(
     Ok(())
 }
 
+/// 活跃时钟源健康自检：间隔 ~1ms 读取两次单调钟，倒退或完全冻结都判为
+/// 不可信。仅 x86_64（本缺陷路径），其他架构恒为健康。
+#[cfg(target_arch = "x86_64")]
+fn active_clocksource_regressed() -> bool {
+    let khz = crate::arch::driver::tsc::TSCManager::cpu_khz();
+    if khz == 0 {
+        return false;
+    }
+    // 交叉验证（对齐 Linux watchdog 的“独立参考”原则）：受检的是单调钟
+    // 自身，倒走时它的两次读数依然“自洽”，自一致性检查恒过（R7 实测）。
+    // 改用独立硬件参考：rdtsc 是纯硬件单调计数器，不受 pvclock 倒走影响。
+    // 1ms 内 TSC 前进 ≥0.9ms，而单调钟停滞（≤50µs 推进）、倒退或慢速
+    // （<75% 参考速率）→ 不可信。
+    let tsc0 = unsafe { x86::time::rdtsc() };
+    let a = crate::time::deadline::now_ns();
+    let span = khz.saturating_mul(1000);
+    while unsafe { x86::time::rdtsc() }.wrapping_sub(tsc0) < span {
+        core::hint::spin_loop();
+    }
+    let tsc1 = unsafe { x86::time::rdtsc() };
+    let b = crate::time::deadline::now_ns();
+    let tsc_cycles = tsc1.wrapping_sub(tsc0);
+    // TSC 参考间隔换算为纳秒（~1ms 窗口，u64 不会溢出）。
+    let tsc_ns = tsc_cycles / khz * 1_000_000;
+    let mono_ns = b.saturating_sub(a);
+    // 倒退/冻结（≤50µs 推进）或慢速（<75% TSC 参考速率）都判不可信：
+    // pvclock 平滑倒走被单调钳制后的典型形态是"慢速"而非冻结（R9 实测
+    // kvm-clock 以 ~20% 速率慢走），仅冻结检测对它失明。
+    tsc_cycles >= khz.saturating_mul(900)
+        && (b.saturating_add(50_000) <= a || mono_ns * 4 < tsc_ns * 3)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn active_clocksource_regressed() -> bool {
+    false
+}
+
 fn __clocksource_watchdog_kthread() {
     // Registration and removal use control -> watchdog -> list. Keep the
     // unstable-source cleanup in the same transaction so unregister cannot
     // remove a source after it leaves WATCHDOG_LIST and before it is rerated.
-    let _control_guard = CLOCKSOURCE_CONTROL_LOCK.lock_irqsave();
+    // 活跃时钟源倒走/冻结自检：tick 驱动的常规 watchdog 比对在系统降级
+    // （定时器风暴/调度异常）时可能不再运行，这里在 kthread 唤醒时直接
+    // 检查 timekeeper 当前源的健康度。倒走或冻结 → 标记 unstable 并把
+    // rating 降到 0，随后的重选会切换到健康源（TSC/HPET/jiffies）。
+    // 这对齐 Linux clocksource watchdog 对不可信源的处理语义。
+    if active_clocksource_regressed() {
+        if let Some(active) = crate::time::timekeeping::timekeeper().current_clocksource() {
+            error!(
+                "clocksource: active source '{}' is running backward or frozen; forcing reselection",
+                active.clocksource_data().name
+            );
+            let _ = active.update_clocksource_data(ClocksourceUpdate::MarkUnstable);
+            if let Err(error) = active.clocksource_change_rating_locked(0) {
+                error!("clocksource: forced rerating failed: {:?}", error);
+            }
+        }
+    }
     let mut watchdog = CLOCKSOURCE_WATCHDOG.lock_irqsave();
     let mut wd_list = WATCHDOG_LIST.lock_irqsave();
     let del_clocks = remove_unstable_clocksources(&mut wd_list);
@@ -1274,7 +1367,7 @@ pub fn clocksource_boot_finish() {
     debug!("clocksource_boot_finish");
 }
 
-fn run_watchdog_kthread() {
+pub(crate) fn run_watchdog_kthread() {
     if let Some(watchdog_kthread) = unsafe { WATCHDOG_KTHREAD.clone() } {
         ProcessManager::wakeup(&watchdog_kthread).ok();
     }

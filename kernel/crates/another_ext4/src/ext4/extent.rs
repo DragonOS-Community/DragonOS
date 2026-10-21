@@ -2985,7 +2985,7 @@ mod tests {
         Ext4 {
             block_device,
             metadata_cache: crate::ext4::MetadataBlockCache::new(16),
-            cached_super_block: spin::Mutex::new(sb),
+            cached_super_block: Box::new(spin::Mutex::new(sb)),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),
             inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),
@@ -3034,7 +3034,7 @@ mod tests {
         Ext4 {
             block_device,
             metadata_cache: crate::ext4::MetadataBlockCache::new(16),
-            cached_super_block: spin::Mutex::new(sb),
+            cached_super_block: Box::new(spin::Mutex::new(sb)),
             cached_block_groups: Vec::new(),
             system_metadata_ranges: Vec::new(),
             inode_cache: spin::Mutex::new(crate::ext4::InodeCache::new(16)),

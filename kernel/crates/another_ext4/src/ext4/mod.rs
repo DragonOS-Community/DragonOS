@@ -359,7 +359,8 @@ pub struct Ext4 {
     /// Cached superblock to avoid repeated disk reads.
     /// The superblock is loaded once at mount time and updated
     /// in memory whenever it is written to disk.
-    cached_super_block: spin::Mutex<SuperBlock>,
+    // Keep the 1 KiB image out of Ext4 values moved through mount/recovery.
+    cached_super_block: Box<spin::Mutex<SuperBlock>>,
     /// Cached block group descriptors. Loaded at mount time.
     /// Index is block group id.
     cached_block_groups: Vec<spin::Mutex<BlockGroupDesc>>,
@@ -818,6 +819,8 @@ impl Ext4 {
         if !sb.check_magic() {
             return_error!(ErrCode::EINVAL, "Can't find ext4 filesystem");
         }
+        let cached_super_block =
+            Box::try_new(spin::Mutex::new(sb)).map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
         log::debug!("Load Ext4 Superblock: {:?}", sb);
         let cached_block_groups = Self::read_validated_block_groups(block_device.as_ref(), &sb)?;
         let system_metadata_ranges = Self::build_system_metadata_ranges(&sb, &cached_block_groups)?;
@@ -830,7 +833,7 @@ impl Ext4 {
         Ok(Self {
             block_device,
             metadata_cache: MetadataBlockCache::new(0),
-            cached_super_block: spin::Mutex::new(sb),
+            cached_super_block,
             cached_block_groups,
             system_metadata_ranges,
             inode_cache: spin::Mutex::new(InodeCache::new(INODE_CACHE_SIZE)),
@@ -1100,6 +1103,7 @@ mod validation_tests {
 
     struct ValidationDevice {
         blocks: BTreeMap<PBlockId, Block>,
+        writes: core::sync::atomic::AtomicUsize,
     }
 
     impl BlockDevice for ValidationDevice {
@@ -1111,6 +1115,7 @@ mod validation_tests {
         }
 
         fn write_block(&self, _block: &Block) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
             Err(Ext4Error::new(ErrCode::EIO))
         }
 
@@ -1136,11 +1141,28 @@ mod validation_tests {
         block1.write_offset_as(0, &desc);
         Arc::new(ValidationDevice {
             blocks: BTreeMap::from([(0, block0), (1, block1)]),
+            writes: core::sync::atomic::AtomicUsize::new(0),
         })
     }
 
     fn system_zone_test_fs() -> Ext4 {
         Ext4::load(validation_device(SuperBlock::validation_fixture())).unwrap()
+    }
+
+    #[test]
+    fn superblock_cache_allocation_failure_precedes_recovery_writes() {
+        let device = validation_device(SuperBlock::validation_fixture());
+        let backing: Arc<dyn BlockDevice> = device.clone();
+        // The first allocation clones the initial disk block. Reject the
+        // following cache allocation before geometry loading or recovery.
+        let scope = crate::test_allocator::FailureScope::new(1);
+        let result = Ext4::load_writable(backing);
+        drop(scope);
+        assert_eq!(
+            result.err().expect("cache allocation must fail").code(),
+            ErrCode::ENOMEM
+        );
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1160,6 +1182,7 @@ mod validation_tests {
     fn superblock_read_error_keeps_device_errno() {
         let device = Arc::new(ValidationDevice {
             blocks: BTreeMap::new(),
+            writes: core::sync::atomic::AtomicUsize::new(0),
         });
         let error = Ext4::load(device).err().expect("device read must fail");
         assert_eq!(error.code(), ErrCode::EIO);

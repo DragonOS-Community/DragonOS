@@ -452,8 +452,10 @@ impl FuseConn {
                 .iter()
                 .position(|req| req.unique == expected.unique())
             else {
-                // The transport may already have executed it. Wait for its
-                // reply (or disconnect), even if delivery is still in flight.
+                // Dequeue transfers ownership to the transport, including
+                // virtiofs QueueFull retries before descriptor submission.
+                // Like Linux FR_PENDING, connection-side cancellation ends
+                // here; only the transport may retire the request.
                 return;
             };
             let request = inner.pending.remove(position).unwrap();
@@ -873,11 +875,15 @@ mod tests {
     }
 
     #[test]
-    fn dequeued_request_cannot_be_canceled_as_unsubmitted() {
+    fn transport_owned_unsent_request_survives_queued_cancellation() {
         let conn = FuseConn::new_for_virtiofs(8192, 8192);
         let (unique, _, pending) = queue_test_request(&conn, FUSE_LOOKUP, 1, b"name\0", true);
         let pending = pending.unwrap();
         let request = conn.dequeue_virtiofs_ordinary_request(8192).unwrap();
+        assert_eq!(
+            pending.delivery.load(Ordering::Acquire) & FusePendingState::SENT,
+            0
+        );
         conn.cancel_queued_request(&pending);
         assert!(conn.has_processing_request(unique));
         assert!(pending.take_ready().is_none());

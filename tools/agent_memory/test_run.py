@@ -5,6 +5,7 @@ import errno
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -256,6 +257,11 @@ class VMTests(unittest.TestCase):
                 self.assertFalse(any("file=/base.raw" in arg for arg in argv))
                 self.assertTrue(any(str(vm.socket_root / "console") in arg for arg in argv))
                 self.assertTrue(any("queue-size=512" in arg for arg in argv))
+                self.assertIn('virtio-serial,id=completion-bus', argv)
+                self.assertIn('virtconsole,bus=completion-bus.0,chardev=completion', argv)
+                self.assertTrue(any(str(vm.socket_root / 'completion') in arg for arg in argv))
+                sent = b''.join(c.args[0] for c in vm.console.sendall.call_args_list)
+                self.assertEqual(sent, b'\nexec 9>/dev/hvc1\n')
             finally:
                 with mock.patch.object(RUN.subprocess, "run"):
                     vm.close()
@@ -523,6 +529,196 @@ class VMTests(unittest.TestCase):
             self.assertTrue(backend.wait.called, "QEMU cleanup failure must not orphan backend")
             self.assertTrue(vm.serial.closed)
             self.assertEqual(sampler.unregister.call_count, 2)
+
+
+class CommandTransportTests(unittest.TestCase):
+    """Replay separate log/control streams through the real command reader."""
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory(prefix='am-control-')
+        self.vm = RUN.GuestVM({}, Path(self.root.name) / 'vm',
+                              mock.Mock(failure=None), 512)
+        self.vm.overlay.touch()
+        self.vm.console = mock.Mock()
+        self.vm.completion = mock.Mock()
+        self.nonce = 'a' * 32
+        self.token = ('AM_' + self.nonce).encode()
+        self.uuid = mock.patch.object(RUN.uuid, 'uuid4', return_value=mock.Mock(hex=self.nonce))
+        self.sleep = mock.patch.object(RUN.time, 'sleep')
+        self.uuid.start()
+        self.sleep.start()
+
+    def tearDown(self):
+        RUN.CANCELLED.clear()
+        self.uuid.stop()
+        self.sleep.stop()
+        self.vm.close()
+        self.root.cleanup()
+
+    def replay(self, logs=(), control=None, **kwargs):
+        if control is None:
+            control = [self.token + b':0\n']
+        self.vm.console.recv.side_effect = list(logs)
+        self.vm.completion.recv.side_effect = control
+        events = [event for _ in logs for event in ([self.vm.console], [])] + [
+            [self.vm.completion] for _ in control]
+        with mock.patch.object(RUN.select, 'select', side_effect=[(e, [], []) for e in events]):
+            return self.vm.command('true', **kwargs)
+
+    def test_log_interleaving_and_echo_cannot_complete_or_corrupt_control(self):
+        logs = [b'errno=' + self.token + b':0\n# ',
+                self.token + b':0(src/log)\n# ',
+                self.token[:12] + b'WARN' + self.token[12:] + b':2WARN55\n',
+                b"printf '" + self.token + b":%s\n' \"$?\"\n"]
+        # Single byte recv fragmentation, including CR/LF splitting.
+        frame = self.token + b':0\r\n'
+        self.assertEqual(self.replay(logs, [bytes([x]) for x in frame]), 0)
+        self.assertEqual(self.vm.buffer, b'')
+        self.vm.serial.flush()
+        self.assertEqual((self.vm.directory / 'serial.log').read_bytes(), b''.join(logs))
+        wire = b''.join(c.args[0] for c in self.vm.console.sendall.call_args_list)
+        self.assertIn(b'; } 9>&-; printf ', wire)
+        self.assertTrue(wire.endswith(b' >&9\n'))
+        self.assertNotIn(b'\n' + self.token, wire)
+
+    def test_all_exit_statuses_preserve_allow_failure(self):
+        for code in (0, 1, 127, 137, 255):
+            with self.subTest(code=code):
+                self.assertEqual(self.replay(control=[self.token + f':{code}\n'.encode()],
+                                             allow_failure=True), code)
+        with self.assertRaisesRegex(RuntimeError, 'exit=7'):
+            self.replay(control=[self.token + b':7\n'])
+        self.assertTrue(self.vm.command_ready)
+        self.assertEqual(self.replay(), 0)
+
+    def test_malformed_stale_and_oversized_frames_quarantine_before_send(self):
+        for frame in (self.token + b':256\n', self.token + b':-1\n',
+                      self.token + b':x\n', self.token + b':0junk\n',
+                      b'AM_other:0\n', self.token + b':0\nextra', b'x' * 65):
+            with self.subTest(frame=frame):
+                self.vm.command_ready = True
+                self.vm.completion_buffer = b''
+                with self.assertRaisesRegex(RuntimeError, 'completion frame'):
+                    self.replay(control=[frame])
+                self.assert_quarantined()
+
+    def assert_quarantined(self):
+        self.vm.console.sendall.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, 'create a new VM'):
+            self.vm.command('never execute')
+        self.vm.console.sendall.assert_not_called()
+
+    def test_console_marker_alone_cannot_report_success(self):
+        self.vm.buffer = self.token + b':0\n# '
+        with self.assertRaises(TimeoutError):
+            self.vm.command('true', timeout=0)
+        self.assert_quarantined()
+
+    def test_partial_frame_timeout_cannot_be_reused(self):
+        self.vm.completion_buffer = self.token + b':0'
+        with self.assertRaises(TimeoutError):
+            self.vm.command('true', timeout=0)
+        self.assert_quarantined()
+
+    def test_console_and_completion_eof(self):
+        for logs, control in (([b''], []), ([], [b''])):
+            with self.subTest(logs=logs):
+                self.vm.command_ready = True
+                with self.assertRaisesRegex(RuntimeError, 'disconnected'):
+                    self.replay(logs, control)
+                self.assert_quarantined()
+
+    def test_panic_split_across_reads_precedes_ready_completion(self):
+        self.vm.console.recv.side_effect = [b'Kernel Panic Occ', b'urred', b'backtrace', b'']
+        self.vm.completion.recv.return_value = self.token + b':0\n'
+        with mock.patch.object(RUN.select, 'select', side_effect=[
+                ([self.vm.console], [], []), ([], [], []),
+                ([self.vm.console, self.vm.completion], [], [])]):
+            with self.assertRaisesRegex(RuntimeError, 'kernel panic'):
+                self.vm.command('true')
+        self.assert_quarantined()
+        self.vm.serial.flush()
+        self.assertIn(b'backtrace', (self.vm.directory / 'serial.log').read_bytes())
+
+    def test_queued_panic_beyond_first_console_block_precedes_completion(self):
+        self.vm.console.recv.side_effect = [b'x' * 65536, b'Kernel Panic Occurred', b'']
+        self.vm.completion.recv.return_value = self.token + b':0\n'
+        with mock.patch.object(RUN.select, 'select', side_effect=[
+                ([self.vm.console, self.vm.completion], [], []),
+                ([self.vm.console], [], [])]):
+            with self.assertRaisesRegex(RuntimeError, 'kernel panic'):
+                self.vm.command('true')
+        self.vm.completion.recv.assert_not_called()
+
+    def test_panic_prefix_survives_command_log_consumption(self):
+        self.assertEqual(self.replay([b'Kernel Panic Occ']), 0)
+        self.assertEqual(self.vm.buffer, b'')
+        self.vm.console.recv.side_effect = [b'urred', b'']
+        with mock.patch.object(RUN.select, 'select', return_value=([self.vm.console], [], [])):
+            with self.assertRaisesRegex(RuntimeError, 'kernel panic'):
+                self.vm.command('true')
+
+    def test_host_health_checks_still_fail_even_when_completion_is_ready(self):
+        for kind in ('cancel', 'sampler', 'overlay'):
+            with self.subTest(kind=kind):
+                self.vm.command_ready = True
+                RUN.CANCELLED.clear()
+                self.vm.sampler.failure = None
+                self.vm.config['overlay_budget_mib'] = 256
+                if kind == 'cancel':
+                    RUN.CANCELLED.set()
+                elif kind == 'sampler':
+                    self.vm.sampler.failure = 'fixture'
+                else:
+                    self.vm.config['overlay_budget_mib'] = -1
+                with self.assertRaises((InterruptedError, RuntimeError)):
+                    self.replay()
+                self.assert_quarantined()
+
+    def test_log_limit_is_per_command_and_cleanup_closes_both_sockets(self):
+        block = b'x' * (3 * 1024**2)
+        for _ in range(2):
+            self.assertEqual(self.replay([block]), 0)
+        with self.assertRaisesRegex(RuntimeError, 'console output exceeded'):
+            self.replay([block, block])
+        console, completion = self.vm.console, self.vm.completion
+        self.vm.close()
+        console.close.assert_called_once()
+        completion.close.assert_called_once()
+
+    def test_continuous_logs_cannot_extend_command_deadline(self):
+        self.vm.console.recv.return_value = b'ongoing log'
+        with mock.patch.object(RUN.time, 'monotonic', side_effect=[100, 100, 100, 100, 102, 102]), \
+             mock.patch.object(RUN.select, 'select', side_effect=[
+                 ([self.vm.console, self.vm.completion], [], []),
+                 ([self.vm.console], [], [])]):
+            with self.assertRaises(TimeoutError):
+                self.vm.command('true', timeout=1)
+        self.vm.completion.recv.assert_not_called()
+        self.assert_quarantined()
+
+    def test_shell_state_and_child_fd_isolation(self):
+        # Execute the exact generated wire with a normal Linux shell as a semantic check.
+        def wire(command):
+            self.vm.console.sendall.reset_mock()
+            with mock.patch.object(self.vm, 'receive', side_effect=lambda _: setattr(
+                    self.vm, 'completion_buffer', self.token + b':0\n')):
+                self.vm.command(command)
+            return b''.join(c.args[0] for c in self.vm.console.sendall.call_args_list).decode()
+        first = wire('MM191_STATE=ready; cd /')
+        second = wire("/bin/sh -c 'test ! -e /proc/self/fd/9' && "
+                      'test "$MM191_STATE" = ready && test "$PWD" = /')
+        target = Path(self.root.name) / 'control'
+        subprocess.run(['/bin/bash', '-c', 'exec 9>' + shlex.quote(str(target)) + '\n' + first + second],
+                       check=True, timeout=5, capture_output=True)
+        self.assertEqual(target.read_bytes(), (self.token + b':0\n') * 2)
+
+    def test_longest_unix_socket_path_is_checked(self):
+        base = Path(self.root.name)
+        parent = base / ('x' * (103 - len(str(base / 'vm' / 'sockets' / 'console'))))
+        parent.mkdir()
+        # console would fit; completion must also fit.
+        with self.assertRaisesRegex(ValueError, 'AF_UNIX'):
+            RUN.GuestVM({}, parent / 'vm', mock.Mock(), 512)
 
 
 class DiskAdmissionTests(unittest.TestCase):

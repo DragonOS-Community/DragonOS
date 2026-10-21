@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -177,7 +178,7 @@ class Budget:
 
 
 class GuestVM:
-    """Own precisely two child processes, their console, share and disk overlay."""
+    """Own precisely two child processes, their console/control sockets, share and disk overlay."""
     def __init__(self, config, directory, sampler, ram_mib, overlay=None):
         self.config, self.directory, self.sampler = config, directory, sampler
         directory.mkdir(mode=0o700)
@@ -188,14 +189,18 @@ class GuestVM:
         self.ram_mib = ram_mib
         self.processes = []
         self.console = None
+        self.completion = None
+        self.completion_buffer = b''
+        self.command_ready = True
         self.buffer = b''
-        self.serial = open(directory / 'serial.log', 'xb')
+        self.panic_tail = b''
         self.identity = uuid.uuid4().hex
         self.socket_root = directory / 'sockets'
         # AF_UNIX paths have a 108 byte limit. Fail before launching anything.
-        if len(os.fsencode(self.socket_root / 'console')) >= 104:
+        if len(os.fsencode(self.socket_root / 'completion')) >= 104:
             raise ValueError('output path too long for AF_UNIX sockets')
         self.socket_root.mkdir()
+        self.serial = open(directory / 'serial.log', 'xb')
         self.payload = '/mnt/agent-memory/payload'
         self.payload_mounted = False
 
@@ -240,6 +245,7 @@ class GuestVM:
                                '--shared-dir', str(self.share), '--sandbox', 'none'], 'virtiofsd')
         self.wait_socket(fs_socket, backend)
         serial_socket = self.socket_root / 'console'
+        completion_socket = self.socket_root / 'completion'
         argv = [c['qemu'], '-display', 'none', '-monitor', 'none', '-serial', 'none',
                 '-kernel', c['kernel'], '-append',
                 'console=/dev/hvc0 rw init=/bin/busybox init AUTO_TEST=none',
@@ -249,7 +255,12 @@ class GuestVM:
                 '-object', f'memory-backend-memfd,id=mem,size={self.ram_mib}M,share=on',
                 '-numa', 'node,memdev=mem',
                 '-chardev', f'socket,id=console,path={serial_socket},server=on,wait=on',
-                '-device', 'virtio-serial', '-device', 'virtconsole,chardev=console',
+                '-device', 'virtio-serial,id=console-bus',
+                '-device', 'virtconsole,bus=console-bus.0,chardev=console',
+                # DragonOS supports port 0 per device, so use a second controller.
+                '-chardev', f'socket,id=completion,path={completion_socket},server=on,wait=off',
+                '-device', 'virtio-serial,id=completion-bus',
+                '-device', 'virtconsole,bus=completion-bus.0,chardev=completion',
                 '-drive', f'id=disk,file={self.overlay},if=none,format=qcow2',
                 '-device', 'virtio-blk-pci,drive=disk', '-device', 'virtio-rng-pci',
                 '-netdev', 'user,id=net', '-device', 'virtio-net-pci,vectors=5,netdev=net',
@@ -262,9 +273,15 @@ class GuestVM:
         self.console = socket.socket(socket.AF_UNIX)
         self.console.connect(str(serial_socket))
         self.console.settimeout(1)
+        self.wait_socket(completion_socket, qemu)
+        self.completion = socket.socket(socket.AF_UNIX)
+        self.completion.connect(str(completion_socket))
+        self.completion.settimeout(1)
         self.expect(b'Please press Enter to activate this console.', 180)
         self.console.sendall(b'\n')
         self.expect(b'# ', 30)
+        # Keep the control TTY open for the shell lifetime, like the console.
+        self._send_shell(b'exec 9>/dev/hvc1\n')
         self.command('true', 30)
         self.command('mkdir -p /mnt/agent-memory /root/agent-memory && '
                      'mount -t virtiofs hostshare /mnt/agent-memory && '
@@ -278,14 +295,34 @@ class GuestVM:
             raise RuntimeError('host sampling failed: ' + self.sampler.failure)
         if self.overlay.stat().st_blocks * 512 > self.config.get('overlay_budget_mib', 256) * 1024**2:
             raise RuntimeError('private overlay exceeded disk budget')
-        self.console.settimeout(max(.01, min(timeout, 1)))
-        try:
-            block = self.console.recv(65536)
-        except socket.timeout:
-            return
+        sockets = [self.console] + ([self.completion] if self.completion else [])
+        poll_timeout = max(0, min(timeout, 1))
+        drain_deadline = time.monotonic() + poll_timeout
+        readable, _, _ = select.select(sockets, [], [], poll_timeout)
+        # Drain logs first so a ready result cannot hide an already queued panic.
+        if self.console in readable:
+            self._receive_console()
+            while select.select([self.console], [], [], 0)[0]:
+                # Continuous logging must not postpone cancellation or the command deadline.
+                if time.monotonic() >= drain_deadline:
+                    return
+                self._receive_console()
+        if self.completion in readable:
+            block = self.completion.recv(65)
+            if not block:
+                raise RuntimeError('completion channel disconnected')
+            self.completion_buffer += block
+            if len(self.completion_buffer) > 64:
+                raise RuntimeError('completion frame exceeded bounded buffer')
+
+    def _receive_console(self):
+        block = self.console.recv(65536)
         if not block:
             raise RuntimeError('console disconnected')
-        if b'Kernel Panic Occurred' in block:
+        marker = b'Kernel Panic Occurred'
+        panic = marker in self.panic_tail + block
+        self.panic_tail = (self.panic_tail + block)[-(len(marker) - 1):]
+        if panic:
             self.serial.write(block)
             self.serial.flush()
             # Capture the bounded trailing backtrace before destroying this VM.
@@ -319,19 +356,34 @@ class GuestVM:
         result, self.buffer = self.buffer[:end], self.buffer[end:]
         return result
 
-    def command(self, command, timeout=300, allow_failure=False):
-        token = ('AM_' + uuid.uuid4().hex).encode()
-        wire = (command + "; printf '\\n" + token.decode() + ":%s\\n' \"$?\"\n").encode()
+    def _send_shell(self, wire):
         for start in range(0, len(wire), 8):
             self.console.sendall(wire[start:start + 8])
             time.sleep(.025)
-        pattern = re.compile(rb'(?:^|\n)' + token + rb':([0-9]+)\n')
+
+    def command(self, command, timeout=300, allow_failure=False):
+        if not self.command_ready:
+            raise RuntimeError('command transport failed; create a new VM')
+        # A timeout leaves the shell running. Never submit another command to it.
+        # Only a complete, validated response makes this connection reusable.
+        self.command_ready = False
+        token = ('AM_' + uuid.uuid4().hex).encode()
+        # A brace group preserves shell state, but hides the control fd from workloads.
+        wire = ("{ " + command + "; } 9>&-; printf '" + token.decode() + ":%s\\n' \"$?\" >&9\n").encode()
+        self._send_shell(wire)
         deadline = time.monotonic() + timeout
         while True:
-            match = pattern.search(self.buffer)
-            if match:
-                self.buffer = self.buffer[match.end():]
+            if b'\n' in self.completion_buffer:
+                match = re.fullmatch(re.escape(token) + rb':([0-9]{1,3})\r?\n',
+                                     self.completion_buffer)
+                if match is None or int(match.group(1)) > 255:
+                    raise RuntimeError('invalid completion frame')
                 code = int(match.group(1))
+                self.completion_buffer = b''
+                # command() returns status only; expect() is used for boot prompts.
+                # Keep the original per-command bound without accumulating old logs.
+                self.buffer = b''
+                self.command_ready = True
                 if code and not allow_failure:
                     raise RuntimeError('guest command failed, exit=' + str(code))
                 return code
@@ -502,6 +554,9 @@ class GuestVM:
 
     def close(self):
         failures = []
+        if self.completion:
+            self.completion.close()
+            self.completion = None
         if self.console:
             self.console.close()
             self.console = None

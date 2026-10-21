@@ -11,12 +11,20 @@ use system_error::SystemError;
 cfg_if! {
     if #[cfg(target_os = "none")] {
         use core::panic::PanicInfo;
-        use core::sync::atomic::AtomicU8;
+        use core::sync::atomic::{AtomicBool, AtomicU8};
 
         static PANIC_COUNTER: AtomicU8 = AtomicU8::new(0);
+
+        /// 嵌套 panic 守卫。
+        ///
+        /// 常规 panic 打印路径（error!/println!/Box::new/print_stack_trace）自身
+        /// 需要堆分配；当 panic 由堆耗尽触发时，打印会再次分配失败并级联出
+        /// 嵌套 panic，最终 "Panic Counter too many" 整机 halt。
+        /// 二次进入时只走零分配紧急串口通道并进入可中断休眠，保住内核其余部分。
+        /// （panic 可被 kernel_catch_unwind 捕获返回，故在 PanicGuard::drop 中复位。）
+        static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
     }
 }
-
 const MAX_PANIC_COUNT: u8 = 2;
 
 #[derive(Debug)]
@@ -31,6 +39,11 @@ impl PanicGuard {
 
 impl Drop for PanicGuard {
     fn drop(&mut self) {
+        #[cfg(target_os = "none")]
+        {
+            // 允许被捕获（unwind）返回的 panic 之后再次进入 panic 处理。
+            PANIC_IN_PROGRESS.store(false, core::sync::atomic::Ordering::Release);
+        }
         crate::arch::panic_post_work();
     }
 }
@@ -40,11 +53,30 @@ impl Drop for PanicGuard {
 #[cfg(target_os = "none")]
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
+    if PANIC_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // 嵌套 panic：绝不触碰任何会分配的打印/日志路径（report 为
+        // 栈上格式化 + 限时轮询串口，无堆分配）。
+        crate::mm::oom::report::report(format_args!(
+            "\n[nested-panic] printing skipped to avoid alloc cascade; parking\n"
+        ));
+        loop {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm!("sti; hlt", options(nomem, nostack, preserves_flags))
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            spin_loop();
+        }
+    }
     PANIC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    error!(
-        "Kernel Panic Occurred. raw_pid: {}",
-        process::ProcessManager::current_pid().data()
-    );
 
     match info.location() {
         Some(loc) => {

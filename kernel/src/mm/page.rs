@@ -5,7 +5,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -1033,6 +1033,71 @@ pub fn page_reclaimer_lock() -> ResourceMutexGuard<'static, PageReclaimer> {
 
 pub(crate) fn try_page_reclaimer_lock() -> Option<ResourceMutexGuard<'static, PageReclaimer>> {
     unsafe { ResourceMutexGuard::try_lock(PAGE_RECLAIMER.as_ref()?) }
+}
+
+/// 直接回收（direct reclaim）并发/递归守卫。
+///
+/// 回收路径自身（shrink、写回调度、OOM 选victim等）也会分配内存；这些分配失败后
+/// 若再次进入同步回收会形成递归。用全局原子标志保证同一时刻只有一个直接回收
+/// 在执行：递归或并发进入者直接返回 false，由上层按普通失败处理。
+static DIRECT_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 同步直接回收：唤醒后台回收线程，并在当前上下文同步 shrink 若干轮。
+///
+/// 对齐 Linux `__alloc_pages_slowpath` 的语义：页分配失败后先回收再重试，
+/// 而不是立刻把失败上抛（否则用户缺页走 OOM、内核堆走 alloc_error panic）。
+///
+/// 调用方必须不持有页表锁/分配器锁（slab 的 buddy 回填路径在调用前已经释放
+/// SLABALLOCATOR 锁；alloc_in_buddy 失败时 buddy 锁也已释放）。
+///
+/// - `target_pages`: 每轮期望回收的页数。
+/// - `rounds`: 最多同步 shrink 的轮数。
+/// - `wait_writeback`: 是否允许睡眠等待异步写回取得进展。缺页路径可等待；
+///   内核堆分配失败路径可能持锁/关中断，必须传 false。
+///
+/// 返回 true 表示至少一轮回收有进展（回收了页或调度了写回）。
+pub fn try_direct_reclaim(target_pages: usize, rounds: usize, wait_writeback: bool) -> bool {
+    if DIRECT_RECLAIM_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // 已有直接回收在执行（可能是当前调用链的递归进入），直接放弃。
+        return false;
+    }
+
+    struct ReclaimGuard;
+    impl Drop for ReclaimGuard {
+        fn drop(&mut self) {
+            DIRECT_RECLAIM_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    let _guard = ReclaimGuard;
+
+    // 先唤醒后台回收线程，让它并行处理脏页写回与回收。
+    if let Some(thread) = unsafe { PAGE_RECLAIMER_THREAD.as_ref() } {
+        let _ = ProcessManager::wakeup(thread);
+    }
+
+    let waits = reclaim_wait::ReclaimWait::new();
+    let mut any_progress = false;
+    for _ in 0..rounds {
+        let writeback_generation = async_writeback_progress_snapshot();
+        let progress = PageReclaimer::shrink_list(PageFrameCount::new(target_pages));
+        any_progress |= progress.reclaimed > 0 || progress.writeback_scheduled > 0;
+
+        if progress.reclaimed == 0 {
+            if wait_writeback && progress.dirty_seen > 0 {
+                // 没有干净页可回收、但存在脏页：等待异步写回取得进展后再扫。
+                if !waits.wait_for_writeback_progress(writeback_generation) {
+                    break;
+                }
+            } else {
+                // 无进展且没有写回可等：重复扫描同样的 LRU 不会有结果。
+                break;
+            }
+        }
+    }
+    any_progress
 }
 
 /// 页面回收器

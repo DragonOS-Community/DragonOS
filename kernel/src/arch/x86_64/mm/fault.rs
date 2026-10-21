@@ -202,17 +202,28 @@ impl X86_64MMArch {
                 );
             }
         }
-        panic!(
-            "do_kern_addr_fault has not yet been implemented, 
-        fault address: {:#x},
-        rip: {:#x},
-        error_code: {:#b}, 
-        pid: {}\n",
-            address.data(),
-            regs.rip,
-            error_code,
+        if crate::exception::in_interrupt() {
+            // 中断上下文无法安全终止任务：保持 panic 语义。
+            panic!(
+                "kernel page fault in interrupt context,
+            fault address: {:#x},
+            rip: {:#x},
+            error_code: {:#b},
+            pid: {}\n",
+                address.data(),
+                regs.rip,
+                error_code,
+                pcb.raw_pid().data()
+            );
+        }
+        // 进程/线程上下文：完整打印现场后终止当前任务，系统继续运行，
+        // 避免一次任务级错误变成全局 panic 循环（此前 84 次嵌套 panic 即
+        // 源于这里无条件 panic，而 panic 路径又再次触发同一缺页）。
+        error!(
+            "kernel page fault (oops): killing task pid {}",
             pcb.raw_pid().data()
         );
+        crate::process::ProcessManager::exit(usize::MAX);
         //TODO https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/mm/fault.c#do_kern_addr_fault
     }
 
@@ -728,9 +739,10 @@ impl X86_64MMArch {
                     {
                         tried_direct_reclaim = true;
                         drop(space_guard);
-                        crate::mm::page::PageReclaimer::shrink_list(
-                            <crate::mm::allocator::page_frame::PageFrameCount>::new(64),
-                        );
+                        // 缺页上下文允许睡眠：按需多轮迭代回收，且可等待异步写回
+                        // 取得进展（脏页需写回后才能变成可回收页），而不是一次性
+                        // 只回收 64 页就放弃进入 OOM。
+                        crate::mm::page::try_direct_reclaim(1024, 16, true);
                         continue;
                     }
 
@@ -759,13 +771,15 @@ impl X86_64MMArch {
                             return;
                         }
                         OomOutcome::NoVictim => {
-                            panic!(
-                                "fatal user page-fault OOM: pid={:?}, tgid={:?}, addr={:#x}, rip={:#x}",
-                                ProcessManager::current_pid(),
-                                ProcessManager::current_pcb().raw_tgid(),
-                                address.data(),
-                                regs.rip
+                            // 理论上不可达：oom.rs 的失败路径已带“杀触发进程”
+                            // 兜底。作为最后防线，再对当前线程置位一次零分配的
+                            // private SIGKILL（仅位图操作与致命唤醒），然后按
+                            // 致命信号交付路径返回——绝不 panic（panic 打印自身
+                            // 会分配，堆耗尽下级联崩内核）。
+                            crate::arch::ipc::signal::Signal::queue_private_sigkill_to_thread(
+                                &ProcessManager::current_pcb(),
                             );
+                            return;
                         }
                     }
                 } else if fault.contains(VmFaultReason::VM_FAULT_SIGBUS)

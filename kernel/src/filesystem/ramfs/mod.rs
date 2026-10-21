@@ -309,6 +309,10 @@ impl RamFSInode {
 struct RamFSPageCacheBackend(Weak<dyn IndexNode>);
 
 impl PageCacheBackend for RamFSPageCacheBackend {
+    fn supports_writeback(&self) -> bool {
+        false
+    }
+
     fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
         Ok(0)
     }

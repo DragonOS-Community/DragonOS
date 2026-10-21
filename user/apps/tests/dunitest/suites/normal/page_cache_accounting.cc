@@ -77,6 +77,7 @@ private:
 TEST(PageCacheAccounting, MembershipLifecycleIsBalanced) {
     const std::string report = ReadAll(kSelftestPath);
     ASSERT_FALSE(report.empty());
+    EXPECT_NE(std::string::npos, report.find("resident_backing_writeback=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("registry_churn=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("registry_batch_retire=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("registry_snapshot_lifetime=ok\n")) << report;

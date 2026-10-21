@@ -818,6 +818,13 @@ pub trait PageCacheWritebackSubmission: Send {
 }
 
 pub trait PageCacheBackend: Send + Sync + core::fmt::Debug + 'static {
+    /// Whether ordinary page-cache writeback has a backing destination.
+    /// This capability must be fixed before the mapping is published. Resident
+    /// RAM backends keep their dirty pages without creating backing I/O.
+    fn supports_writeback(&self) -> bool {
+        true
+    }
+
     /// Buffer validity/dirty granule. Normal files retain whole-page I/O.
     fn cache_block_size(&self) -> usize {
         MMArch::PAGE_SIZE
@@ -1542,6 +1549,9 @@ impl PageCacheManager {
         bind_submission: bool,
         admitted: Option<&super::PageCacheDomainIoPermit>,
     ) -> Result<WritebackClaimOutcome, SystemError> {
+        if !cache.supports_writeback() {
+            return Ok(WritebackClaimOutcome::NoBatch);
+        }
         let domain_io = match admitted {
             Some(permit) => Some(permit.derive()),
             None => cache.try_acquire_domain_io()?,
@@ -2911,6 +2921,9 @@ impl PageCacheManager {
         file_size: usize,
     ) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
+        if !cache.supports_writeback() {
+            return Ok(());
+        }
         loop {
             while Self::writeback_next_batch_with_stable_size(
                 &cache,
@@ -2935,6 +2948,9 @@ impl PageCacheManager {
 
     fn sync_data(&self, start_index: usize, end_index: usize) -> Result<(), SystemError> {
         let cache = self.upgrade()?;
+        if !cache.supports_writeback() {
+            return Ok(());
+        }
         let inode = cache
             .inode()
             .and_then(|inode| inode.upgrade())
@@ -3110,6 +3126,9 @@ impl PageCacheManager {
             return Ok(());
         }
         let cache = self.upgrade()?;
+        if !cache.supports_writeback() {
+            return Ok(());
+        }
         let claims_in_worker = Self::claims_in_worker(&cache)?;
         let mut first_error = None;
         loop {
@@ -4453,7 +4472,7 @@ impl PageCacheManager {
         let _tag_scan = cache.writeback_tag_scan_lock.lock();
         let mut invalidate = cache.invalidate_write();
         let frozen_filesystem_state = freeze()?;
-        if start_index > end_index {
+        if start_index > end_index || !cache.supports_writeback() {
             return Ok(StartedWriteback {
                 frozen: frozen_filesystem_state,
                 range: PageCacheWritebackRange {
@@ -4862,6 +4881,9 @@ impl PageCacheManager {
         end_index: usize,
     ) -> Result<bool, SystemError> {
         let cache = self.upgrade()?;
+        if !cache.supports_writeback() {
+            return Ok(false);
+        }
         let domain_io = match cache.try_acquire_domain_io() {
             Ok(permit) => permit,
             Err(SystemError::ESTALE) => return Ok(false),

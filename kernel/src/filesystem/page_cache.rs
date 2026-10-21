@@ -2852,6 +2852,14 @@ impl PageCache {
         Ok(())
     }
 
+    /// No backend preserves the established inode.write_direct fallback.
+    /// Production backends are initialized before exposing their mapping.
+    pub(crate) fn supports_writeback(&self) -> bool {
+        self.backend
+            .try_get()
+            .is_none_or(|backend| backend.supports_writeback())
+    }
+
     pub fn backend(&self) -> Option<Arc<dyn PageCacheBackend>> {
         self.backend.try_get().cloned()
     }
@@ -5094,7 +5102,7 @@ impl PageCache {
 
 impl PageCacheDomainMember for PageCache {
     fn has_dirty_or_writeback_work(&self) -> bool {
-        self.has_dirty_or_writeback_pages()
+        self.supports_writeback() && self.has_dirty_or_writeback_pages()
     }
 
     fn start_sync_for_domain(&self) -> Result<PageCacheDomainWriteback, SystemError> {

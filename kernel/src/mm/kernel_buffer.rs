@@ -50,6 +50,18 @@ pub(crate) struct KernelBuffer {
 }
 
 impl KernelBuffer {
+    /// Prepare local scratch at a resource-lock-free task boundary. Only the
+    /// unpublished allocation is retried; callers must perform I/O afterwards.
+    pub(crate) fn new_zeroed_recovering(len: usize) -> Result<Self, SystemError> {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        loop {
+            match Self::try_new_zeroed(len) {
+                Ok(buffer) => return Ok(buffer),
+                Err(error) => error.recover(&mut recovery)?,
+            }
+        }
+    }
+
     pub(crate) fn try_new_zeroed(len: usize) -> Result<Self, MemoryAllocationError> {
         if !vmalloc::task_context() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());

@@ -66,8 +66,10 @@ use super::{stats, trace};
 
 mod daemon;
 mod request;
+mod retirement;
 pub(crate) use request::BackgroundReadPagesCtx;
 pub(crate) use request::FuseDaxRequestOutcome;
+use retirement::{remove_requests, Retired};
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
 where
@@ -158,6 +160,7 @@ pub struct FuseRequest {
     /// Tracks which observable pipeline gauge currently owns this request:
     /// 0 untracked, 1 connection queue, 2 bridge dispatch, 3 retired/transport.
     stats_owner: AtomicU8,
+    retired_next: SpinLock<Option<Arc<FuseRequest>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +298,7 @@ pub struct FusePendingState {
     outcome_unknown: AtomicBool,
     processing_owner: AtomicBool,
     delivery: AtomicU8,
+    retired_next: SpinLock<Option<Arc<FusePendingState>>>,
 }
 
 #[derive(Debug)]
@@ -561,6 +565,7 @@ impl FusePendingState {
             outcome_unknown: AtomicBool::new(false),
             processing_owner: AtomicBool::new(false),
             delivery: AtomicU8::new(0),
+            retired_next: SpinLock::new(None),
         }
     }
 
@@ -1642,6 +1647,7 @@ impl FuseConn {
     pub fn on_umount(&self) {
         self.begin_dax_quiesce();
         self.background.disconnect();
+        let mut retired_requests = Retired::new();
         let (processing, should_destroy, dropped_pending, queued_reply_count) = {
             let mut g = self.lock_inner();
             if g.teardown_started {
@@ -1664,8 +1670,12 @@ impl FuseConn {
                     queued_reply_count += 1;
                 }
             }
-            g.hiprio_pending.retain(|req| req.opcode == FUSE_FORGET);
-            g.pending.retain(|req| req.opcode == FUSE_FORGET);
+            remove_requests(&mut g.hiprio_pending, &mut retired_requests, |req| {
+                req.opcode != FUSE_FORGET
+            });
+            remove_requests(&mut g.pending, &mut retired_requests, |req| {
+                req.opcode != FUSE_FORGET
+            });
             (
                 core::mem::take(&mut g.processing),
                 should_destroy,
@@ -1673,6 +1683,7 @@ impl FuseConn {
                 queued_reply_count,
             )
         };
+        drop(retired_requests);
         stats::on_fuse_requests_dropped_umount(dropped_pending);
         stats::on_fuse_requests_aborted(processing.len().saturating_sub(queued_reply_count));
         for (_, p) in processing {
@@ -1706,40 +1717,44 @@ impl FuseConn {
     /// closed by the caller before this scan, which prevents a new matching
     /// request from being published after the cancellation snapshot.
     pub(crate) fn cancel_page_cache_reads(&self, domain: &Arc<PageCacheWritebackDomain>) {
-        let (pending_reads, queued_count) = {
+        let mut pending_reads = Retired::new();
+        let mut retired_requests = Retired::new();
+        let (queued_count, cancelled_count) = {
             let mut inner = self.lock_inner();
-            let read_uniques = inner
-                .processing
-                .iter()
-                .filter_map(|(unique, pending)| {
-                    pending
-                        .belongs_to_page_cache_domain(domain)
-                        .then_some(*unique)
-                })
-                .collect::<Vec<_>>();
-
-            let queued_count = inner
-                .hiprio_pending
-                .iter()
-                .chain(inner.pending.iter())
-                .filter(|request| read_uniques.contains(&request.unique))
-                .count();
-            inner
-                .hiprio_pending
-                .retain(|request| !read_uniques.contains(&request.unique));
-            inner
-                .pending
-                .retain(|request| !read_uniques.contains(&request.unique));
-            let pending_reads = read_uniques
-                .into_iter()
-                .filter_map(|unique| inner.processing.remove(&unique))
-                .collect::<Vec<_>>();
-            (pending_reads, queued_count)
+            let FuseConnInner {
+                hiprio_pending,
+                pending,
+                processing,
+                ..
+            } = &mut *inner;
+            // Match against the still-published pending table before extracting
+            // it. One expected O(1) hash lookup per queued request replaces the
+            // former quadratic unique-vector membership checks.
+            let belongs = |request: &FuseRequest| {
+                processing
+                    .get(&request.unique)
+                    .is_some_and(|pending| pending.belongs_to_page_cache_domain(domain))
+            };
+            let queued_count = remove_requests(hiprio_pending, &mut retired_requests, belongs)
+                + remove_requests(pending, &mut retired_requests, belongs);
+            let mut cancelled_count = 0usize;
+            processing.retain(|_, pending| {
+                if pending.belongs_to_page_cache_domain(domain) {
+                    // Pin before retain drops the table's owner under the lock.
+                    pending_reads.push(pending.clone());
+                    cancelled_count += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            (queued_count, cancelled_count)
         };
 
+        drop(retired_requests);
         stats::on_fuse_requests_dropped_umount(queued_count);
-        stats::on_fuse_requests_aborted(pending_reads.len().saturating_sub(queued_count));
-        for pending in pending_reads {
+        stats::on_fuse_requests_aborted(cancelled_count.saturating_sub(queued_count));
+        while let Some(pending) = pending_reads.pop() {
             pending.complete_disconnected(SystemError::ENOTCONN);
         }
     }
@@ -1935,6 +1950,7 @@ mod tests {
             read_pages_destination: None,
             track_direct_read_stats: false,
             stats_owner: Default::default(),
+            retired_next: SpinLock::new(None),
         };
         request.stats_mark_queued();
         assert_eq!(request.stats_owner.load(Ordering::Acquire), 1);
@@ -2233,6 +2249,10 @@ mod tests {
 }
 
 #[cfg(feature = "mm_selftest")]
+#[path = "conn/selftest_retirement.rs"]
+mod selftest_retirement;
+
+#[cfg(feature = "mm_selftest")]
 pub(crate) fn heap_denied_fuse_birth_selftest() -> Result<bool, SystemError> {
-    request::heap_denied_birth_selftest()
+    Ok(request::heap_denied_birth_selftest()? && selftest_retirement::run()?)
 }

@@ -57,6 +57,29 @@ where
     }
 }
 
+/// An unpublished tree node. Allocation is separated from insertion so callers
+/// can prepare ownership before taking resource/IRQ locks.
+#[derive(Debug)]
+pub struct PreparedNode<K: Ord + Debug, V: Debug>(Box<RBTreeNode<K, V>>);
+
+impl<K: Ord + Debug, V: Debug> PreparedNode<K, V> {
+    pub fn try_new(key: K, value: V) -> Result<Self, core::alloc::AllocError> {
+        Box::try_new(RBTreeNode {
+            color: Color::Black,
+            left: NodePtr::null(),
+            right: NodePtr::null(),
+            parent: NodePtr::null(),
+            key,
+            value,
+        })
+        .map(Self)
+    }
+}
+
+// Prepared nodes are detached: their links are null and ownership is unique.
+unsafe impl<K: Ord + Debug + Send, V: Debug + Send> Send for PreparedNode<K, V> {}
+unsafe impl<K: Ord + Debug + Sync, V: Debug + Sync> Sync for PreparedNode<K, V> {}
+
 /*****************NodePtr***************************/
 #[derive(Debug)]
 struct NodePtr<K: Ord + Debug, V: Debug>(*mut RBTreeNode<K, V>);
@@ -1015,8 +1038,17 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     #[inline]
     pub fn insert(&mut self, k: K, v: V) {
+        self.insert_node(NodePtr::new(k, v));
+    }
+
+    /// Transfer a previously allocated node without allocating. As with
+    /// `insert`, equal keys are allowed; map-like users must check uniqueness.
+    pub fn insert_prepared(&mut self, node: PreparedNode<K, V>) {
+        self.insert_node(NodePtr(Box::into_raw(node.0)));
+    }
+
+    fn insert_node(&mut self, mut node: NodePtr<K, V>) {
         self.len += 1;
-        let mut node = NodePtr::new(k, v);
         let mut y = NodePtr::null();
         let mut x = self.root;
 
@@ -1838,5 +1870,25 @@ mod tests {
             cache.push(*e.0);
         }
         assert_eq!(&cache, &vec![3, 2, 1]);
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_insert_uses_normal_balancing_and_removal() {
+        let mut tree = RBTree::new();
+        for key in (0..1024).rev() {
+            tree.insert_prepared(PreparedNode::try_new(key, key * 2).unwrap());
+        }
+        for key in (0..1024).step_by(3) {
+            assert_eq!(tree.remove(&key), Some(key * 2));
+        }
+        for key in (0..1024).filter(|key| key % 3 != 0) {
+            assert_eq!(tree.pop_first(), Some((key, key * 2)));
+        }
+        assert!(tree.pop_first().is_none());
     }
 }

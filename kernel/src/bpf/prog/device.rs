@@ -5,7 +5,6 @@
 //! program types: a device filter is invoked from the VFS permission path and
 //! must never turn an untrusted register into a kernel pointer.
 
-use alloc::vec;
 use alloc::vec::Vec;
 use rbpf::ebpf;
 use system_error::SystemError;
@@ -116,14 +115,21 @@ impl DeviceProgram {
             return Err(SystemError::E2BIG);
         }
 
-        let mut instructions = Vec::with_capacity(count);
+        let mut instructions = Vec::new();
+        instructions
+            .try_reserve_exact(count)
+            .map_err(|_| SystemError::ENOMEM)?;
         for (pc, raw) in insns.chunks_exact(INSN_SIZE).enumerate() {
             instructions.push(decode(raw, pc, count)?);
         }
 
         // All branch edges are strictly forward. A single increasing-PC pass
         // therefore sees every predecessor before checking a join point.
-        let mut incoming: Vec<Option<State>> = vec![None; count];
+        let mut incoming: Vec<Option<State>> = Vec::new();
+        incoming
+            .try_reserve_exact(count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        incoming.resize(count, None);
         let mut initial = [RegisterKind::Uninitialized; REGISTER_COUNT];
         initial[1] = RegisterKind::Context;
         incoming[0] = Some(initial);
@@ -564,5 +570,34 @@ mod tests {
         ] {
             assert!(DeviceProgram::verify(&bad).is_err());
         }
+    }
+
+    #[test]
+    fn instruction_limit_keeps_validation_and_execution_contract() {
+        let mut bytes = Vec::new();
+        for _ in 0..MAX_INSNS - 1 {
+            bytes.extend_from_slice(&insn(ebpf::MOV32_IMM, 0, 0, 0, 1));
+        }
+        bytes.extend_from_slice(&insn(ebpf::EXIT, 0, 0, 0, 0));
+        let program = DeviceProgram::verify(&bytes).unwrap();
+        assert!(program.run(DeviceAccess {
+            access_type: 0,
+            major: 0,
+            minor: 0,
+        }));
+
+        bytes.extend_from_slice(&insn(ebpf::EXIT, 0, 0, 0, 0));
+        assert!(matches!(
+            DeviceProgram::verify(&bytes),
+            Err(SystemError::E2BIG)
+        ));
+        assert!(matches!(
+            DeviceProgram::verify(&[]),
+            Err(SystemError::EINVAL)
+        ));
+        assert!(matches!(
+            DeviceProgram::verify(&bytes[..1]),
+            Err(SystemError::EINVAL)
+        ));
     }
 }

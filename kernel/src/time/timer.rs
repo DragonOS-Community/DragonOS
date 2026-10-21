@@ -5,7 +5,7 @@ use core::{
     time::Duration,
 };
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 use log::{error, info, warn};
 use system_error::SystemError;
 
@@ -15,7 +15,10 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{
+        rbtree::{PreparedNode, RBTree},
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     process::{ProcessControlBlock, ProcessManager},
     sched::{schedule, SchedMode},
 };
@@ -27,8 +30,8 @@ const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
 static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
-    pub static ref TIMER_LIST: SpinLock<BTreeMap<(u64, usize), Arc<Timer>>> =
-        SpinLock::new(BTreeMap::new());
+    pub static ref TIMER_LIST: SpinLock<RBTree<(u64, usize), Arc<Timer>>> =
+        SpinLock::new(RBTree::new());
 }
 
 /// 定时器要执行的函数的特征
@@ -106,6 +109,27 @@ pub struct Timer {
     inner: SpinLock<InnerTimer>,
 }
 
+/// Owns every allocation required to publish a timer. Kept outside Timer to
+/// avoid a self-cycle; dropping an unpublished activation releases everything.
+#[derive(Debug)]
+pub(crate) struct PreparedTimer {
+    timer: Arc<Timer>,
+    node: PreparedNode<(u64, usize), Arc<Timer>>,
+}
+
+impl PreparedTimer {
+    pub(crate) fn timer(&self) -> Arc<Timer> {
+        self.timer.clone()
+    }
+
+    pub(crate) fn activate(self) {
+        let mut timers = TIMER_LIST.lock_irqsave();
+        // This token exclusively owns the unpublished activation.
+        debug_assert!(timers.get(&self.timer.queue_key()).is_none());
+        timers.insert_prepared(self.node);
+    }
+}
+
 impl Timer {
     /// @brief 创建一个定时器（单位：ms）
     ///
@@ -115,15 +139,31 @@ impl Timer {
     ///
     /// @return 定时器结构体
     pub fn new(timer_func: Box<dyn TimerFunction>, expire_jiffies: u64) -> Arc<Self> {
-        let result: Arc<Timer> = Arc::new(Timer {
+        Self::try_new(timer_func, expire_jiffies).expect("timer allocation failed")
+    }
+
+    fn try_new(
+        timer_func: Box<dyn TimerFunction>,
+        expire_jiffies: u64,
+    ) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Timer {
             expire_jiffies,
             inner: SpinLock::new(InnerTimer {
                 timer_func: Some(timer_func),
                 triggered: false,
             }),
-        });
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
 
-        return result;
+    pub(crate) fn try_prepare(
+        timer_func: Box<dyn TimerFunction>,
+        expire_jiffies: u64,
+    ) -> Result<PreparedTimer, SystemError> {
+        let timer = Self::try_new(timer_func, expire_jiffies)?;
+        let node = PreparedNode::try_new(timer.queue_key(), timer.clone())
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(PreparedTimer { timer, node })
     }
 
     pub fn inner(&self) -> SpinLockGuard<'_, InnerTimer> {
@@ -140,12 +180,15 @@ impl Timer {
 
     /// @brief 将定时器插入到定时器队列中
     pub fn activate(self: &Arc<Self>) {
-        let replaced = TIMER_LIST
-            .lock_irqsave()
-            .insert(self.queue_key(), self.clone());
-        if replaced.is_some() {
+        let node = PreparedNode::try_new(self.queue_key(), self.clone())
+            .expect("timer queue allocation failed");
+        let mut timers = TIMER_LIST.lock_irqsave();
+        if timers.get(&self.queue_key()).is_some() {
+            drop(timers);
             warn!("Timer already in list");
+            return;
         }
+        timers.insert_prepared(node);
     }
 
     #[inline]
@@ -223,7 +266,7 @@ impl SoftirqVec for DoTimerSoftirq {
             }
             let mut timer_list = timer_list.unwrap();
 
-            let Some((&(front_jiffies, _), _)) = timer_list.first_key_value() else {
+            let Some((&(front_jiffies, _), _)) = timer_list.get_first() else {
                 break;
             };
             // debug!("to lock timer_list_front");
@@ -320,10 +363,7 @@ pub fn timer_get_first_expire() -> Result<u64, SystemError> {
         match TIMER_LIST.try_lock_irqsave() {
             Ok(timer_list) => {
                 // debug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
-                return Ok(timer_list
-                    .first_key_value()
-                    .map(|(key, _)| key.0)
-                    .unwrap_or(0));
+                return Ok(timer_list.get_first().map(|(key, _)| key.0).unwrap_or(0));
             }
             // 加锁失败返回啥？？
             Err(_) => continue,
@@ -365,4 +405,35 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
 
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_activation_selftest() -> Result<bool, SystemError> {
+    use crate::mm::oom::denial;
+    #[derive(Debug)]
+    struct Noop;
+    impl TimerFunction for Noop {
+        fn run(&mut self) -> Result<(), SystemError> {
+            Ok(())
+        }
+    }
+    let callback = Box::try_new(Noop).map_err(|_| SystemError::ENOMEM)?;
+    let timer = Timer::try_new(callback, clock().saturating_add(u64::MAX / 2))?;
+    let prepared =
+        PreparedNode::try_new(timer.queue_key(), timer.clone()).map_err(|_| SystemError::ENOMEM)?;
+    let rejected = {
+        let _deny = denial::Scope::enter(true);
+        PreparedNode::try_new(timer.queue_key(), timer.clone()).is_err()
+    };
+    let token = PreparedTimer {
+        timer: timer.clone(),
+        node: prepared,
+    };
+    let _deny = denial::Scope::enter(true);
+    let before = denial::probe_denied();
+    token.activate();
+    let registered = TIMER_LIST.lock_irqsave().get(&timer.queue_key()).is_some();
+    timer.cancel();
+    let removed = TIMER_LIST.lock_irqsave().get(&timer.queue_key()).is_none();
+    Ok(before && rejected && registered && removed && denial::probe_denied())
 }

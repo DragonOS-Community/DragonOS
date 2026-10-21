@@ -30,6 +30,25 @@ pub(super) fn run() -> Result<bool, SystemError> {
         if !denial::probe_denied() {
             return Ok(false);
         }
+        // Real WAIT values, unlike mismatch/expired prechecks, reach the
+        // fallible preparation path. No bucket or timer may become visible.
+        for timeout in [
+            None,
+            Some(PosixTimeSpec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            }),
+        ] {
+            if Futex::futex_wait(address, FutexFlag::empty(), 0, timeout, u32::MAX)
+                != Err(SystemError::ENOMEM)
+            {
+                return Ok(false);
+            }
+            let key = Futex::get_futex_key(address, false, FutexAccess::FutexRead)?;
+            if FutexData::futex_map().contains_key(&key) {
+                return Ok(false);
+            }
+        }
         for offset in (0..size).step_by(4) {
             let uaddr = address + offset;
             if Futex::futex_wait(uaddr, FutexFlag::empty(), 1, None, u32::MAX)
@@ -87,5 +106,46 @@ pub(super) fn run() -> Result<bool, SystemError> {
     let unmapped = mm
         .munmap_wait(VirtPageFrame::new(address), PageFrameCount::new(4))
         .is_ok();
-    result.map(|passed| passed && unmapped)
+    result.and_then(|passed| Ok(passed && unmapped && prepared_stages()?))
+}
+
+/// Cover failures after earlier owners already exist, using the same factories
+/// as WAIT. A first-Waker rejection alone cannot prove the later boundaries.
+fn prepared_stages() -> Result<bool, SystemError> {
+    let (_, waker) = Waiter::try_new_pair()?;
+    let object = Arc::try_new(FutexObj {
+        waker: waker.clone(),
+        key: SpinLock::new(FutexKey {
+            ptr: 0,
+            word: 0,
+            offset: 0,
+            key: InnerFutexKey::Private(PrivateKey {
+                address_space: None,
+                address: 0,
+            }),
+        }),
+        bitset: u32::MAX,
+        tid: 0,
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    let callback = Box::try_new(WakerTimer {
+        waker: waker.clone(),
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    let stages = {
+        let _deny = denial::Scope::enter(true);
+        denial::probe_denied()
+            && Box::try_new(WakerTimer { waker }).is_err()
+            && Arc::try_new(FutexObj {
+                waker: object.waker.clone(),
+                key: SpinLock::new(object.key.lock().clone()),
+                bitset: u32::MAX,
+                tid: 0,
+            })
+            .is_err()
+            && WaitNode::try_new(object).is_err()
+            && Timer::try_prepare(callback, crate::time::timer::clock() + 100).is_err()
+            && denial::probe_denied()
+    };
+    Ok(stages && crate::time::timer::heap_denied_activation_selftest()?)
 }

@@ -1,26 +1,8 @@
 use crate::arch::MMArch;
-use crate::libs::spinlock::SpinLock;
 use crate::mm::dma::{dma_alloc_pages_raw, dma_dealloc_pages_raw, DmaAllocOptions, DmaDirection};
 use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
-use alloc::collections::BTreeMap;
-use core::cmp;
 use core::ptr::NonNull;
 use virtio_drivers::{BufferDirection, Hal};
-
-/// `share` 在 `virt_2_phys` 失败时使用的 bounce buffer 元信息。
-struct SharedBounceBuffer {
-    vaddr: NonNull<u8>,
-    pages: usize,
-}
-
-// SAFETY: `SharedBounceBuffer` 仅保存 DMA 分配返回的地址元数据，
-// 所有读写都在 `SHARED_BOUNCE_BUFFERS` 自旋锁保护下进行，不会发生并发可变访问。
-unsafe impl Send for SharedBounceBuffer {}
-
-/// 记录通过 bounce buffer 共享的 DMA 映射：
-/// key = 共享给设备的物理地址（`paddr`）。
-static SHARED_BOUNCE_BUFFERS: SpinLock<BTreeMap<usize, SharedBounceBuffer>> =
-    SpinLock::new(BTreeMap::new());
 
 pub struct HalImpl;
 unsafe impl Hal for HalImpl {
@@ -66,74 +48,81 @@ unsafe impl Hal for HalImpl {
         buffer: NonNull<[u8]>,
         dma_direction: BufferDirection,
     ) -> virtio_drivers::PhysAddr {
+        Self::try_share(buffer, dma_direction).expect("virtio buffer sharing failed")
+    }
+
+    unsafe fn try_share(
+        buffer: NonNull<[u8]>,
+        dma_direction: BufferDirection,
+    ) -> virtio_drivers::Result<usize> {
         let buf_ptr = buffer.as_ptr() as *mut u8;
         let buf_len = buffer.len();
-        let vaddr = VirtAddr::new(buf_ptr as usize);
-
-        // 直接映射区地址可直接转物理地址。
-        if let Some(paddr) = MMArch::virt_2_phys(vaddr) {
-            return paddr.data();
+        if buf_len == 0 {
+            return Err(virtio_drivers::Error::InvalidParam);
         }
-
-        // 非直接映射地址（例如部分堆/栈对象）走 bounce buffer，避免 `unwrap()` panic。
-        let pages = buf_len.div_ceil(MMArch::PAGE_SIZE).max(1);
-        let buf_direction = match dma_direction {
+        // This is the fixed direct map, not a translation of arbitrary vmalloc pages.
+        if let Some(paddr) = MMArch::virt_2_phys(VirtAddr::new(buf_ptr as usize)) {
+            return Ok(paddr.data());
+        }
+        let pages = buf_len.div_ceil(MMArch::PAGE_SIZE);
+        let direction = match dma_direction {
             BufferDirection::DriverToDevice => DmaDirection::ToDevice,
             BufferDirection::DeviceToDriver => DmaDirection::FromDevice,
             BufferDirection::Both => DmaDirection::Bidirectional,
         };
-        let options = DmaAllocOptions {
-            direction: buf_direction,
-            use_pool: false,
-            ..Default::default()
-        };
-        let (paddr, bounce_vaddr) = dma_alloc_pages_raw(pages, options);
-
-        // Driver->Device 方向需先把原 buffer 内容拷入 bounce buffer。
+        let (paddr, bounce_vaddr) = crate::mm::dma::try_dma_alloc_pages_raw(
+            pages,
+            DmaAllocOptions {
+                direction,
+                use_pool: false,
+                ..Default::default()
+            },
+        )
+        .map_err(|_| virtio_drivers::Error::DmaError)?;
         if matches!(
             dma_direction,
             BufferDirection::DriverToDevice | BufferDirection::Both
         ) {
-            core::ptr::copy_nonoverlapping(buf_ptr as *const u8, bounce_vaddr.as_ptr(), buf_len);
+            core::ptr::copy_nonoverlapping(buf_ptr, bounce_vaddr.as_ptr(), buf_len);
         }
-
-        SHARED_BOUNCE_BUFFERS.lock_irqsave().insert(
-            paddr,
-            SharedBounceBuffer {
-                vaddr: bounce_vaddr,
-                pages,
-            },
-        );
-        paddr
+        Ok(paddr)
     }
-    /// @brief 停止共享
-    /// @param _paddr share阶段返回的物理地址
-    /// @param _buffer 原始buffer
-    /// @param _direction buffer方向
-    /// @details
-    /// - 直通映射路径：无额外状态，直接返回
-    /// - bounce路径：按方向执行回拷，并释放DMA页
-    unsafe fn unshare(
-        _paddr: virtio_drivers::PhysAddr,
-        _buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
+
+    unsafe fn unshare(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        Self::release_share(paddr, buffer, direction, true);
+    }
+
+    unsafe fn cancel_share(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        Self::release_share(paddr, buffer, direction, false);
+    }
+}
+
+impl HalImpl {
+    /// The original buffer and mapping stay stable throughout the HAL share contract.
+    /// Raw DMA allocations are direct-mapped and use symmetric page-count rounding, so
+    /// the caller's original buffer identifies bounce ownership without a global registry.
+    unsafe fn release_share(
+        paddr: usize,
+        buffer: NonNull<[u8]>,
+        direction: BufferDirection,
+        copy_back: bool,
     ) {
-        let Some(bounce) = SHARED_BOUNCE_BUFFERS.lock_irqsave().remove(&_paddr) else {
-            // 直接映射路径未使用 bounce buffer，无需处理。
+        let original = buffer.as_ptr() as *mut u8;
+        if MMArch::virt_2_phys(VirtAddr::new(original as usize)).is_some() {
             return;
-        };
-
-        if matches!(
-            _direction,
-            BufferDirection::DeviceToDriver | BufferDirection::Both
-        ) {
-            let dst = _buffer.as_ptr() as *mut u8;
-            let max_len = bounce.pages * MMArch::PAGE_SIZE;
-            let copy_len = cmp::min(_buffer.len(), max_len);
-            core::ptr::copy_nonoverlapping(bounce.vaddr.as_ptr(), dst, copy_len);
         }
-
-        dma_dealloc_pages_raw(_paddr, bounce.vaddr, bounce.pages);
+        let bounce = MMArch::phys_2_virt(PhysAddr::new(paddr))
+            .expect("raw DMA allocation must be direct mapped");
+        let bounce = NonNull::new(bounce.as_ptr::<u8>()).expect("raw DMA allocation is non-null");
+        if copy_back
+            && matches!(
+                direction,
+                BufferDirection::DeviceToDriver | BufferDirection::Both
+            )
+        {
+            core::ptr::copy_nonoverlapping(bounce.as_ptr(), original, buffer.len());
+        }
+        dma_dealloc_pages_raw(paddr, bounce, buffer.len().div_ceil(MMArch::PAGE_SIZE));
     }
 }
 
@@ -182,7 +171,83 @@ unsafe impl Hal for VirtioFsQueueHal {
         HalImpl::share(buffer, direction)
     }
 
+    unsafe fn try_share(
+        buffer: NonNull<[u8]>,
+        direction: BufferDirection,
+    ) -> virtio_drivers::Result<usize> {
+        HalImpl::try_share(buffer, direction)
+    }
+
+    unsafe fn cancel_share(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        HalImpl::cancel_share(paddr, buffer, direction)
+    }
+
     unsafe fn unshare(paddr: usize, buffer: NonNull<[u8]>, direction: BufferDirection) {
         HalImpl::unshare(paddr, buffer, direction)
     }
+}
+
+/// Direct and vmalloc buffers exercise the real HAL under allocator denial.
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) fn heap_denied_virtio_share() -> Result<bool, system_error::SystemError> {
+    use crate::mm::{kernel_buffer::KernelBuffer, oom::denial};
+    let mut direct =
+        crate::mm::dma::DmaBuffer::try_alloc_bytes(2 * MMArch::PAGE_SIZE, Default::default())?;
+    direct.as_mut_slice().fill(0x5a);
+    {
+        let _denied = denial::Scope::enter(true);
+        let buffer = NonNull::from(direct.as_mut_slice());
+        let address = unsafe { HalImpl::try_share(buffer, BufferDirection::Both) }
+            .map_err(|_| system_error::SystemError::ENOMEM)?;
+        unsafe { HalImpl::unshare(address, buffer, BufferDirection::Both) };
+    }
+    if direct.as_slice().iter().any(|byte| *byte != 0x5a) {
+        return Ok(false);
+    }
+    let mut storage = KernelBuffer::new_zeroed_recovering(3 * MMArch::PAGE_SIZE)?;
+    storage.fill(0xa5);
+    let buffer = NonNull::from(&mut storage[..]);
+    if unsafe { MMArch::virt_2_phys(VirtAddr::new(buffer.as_ptr() as *mut u8 as usize)) }.is_some()
+    {
+        return Ok(false);
+    }
+    let _denied = denial::Scope::enter(true);
+    let denied = denial::probe_denied();
+    for direction in [
+        BufferDirection::DriverToDevice,
+        BufferDirection::DeviceToDriver,
+        BufferDirection::Both,
+    ] {
+        let address = unsafe { HalImpl::try_share(buffer, direction) }
+            .map_err(|_| system_error::SystemError::ENOMEM)?;
+        let bounce = unsafe { MMArch::phys_2_virt(PhysAddr::new(address)) }
+            .ok_or(system_error::SystemError::EFAULT)?;
+        if !matches!(direction, BufferDirection::DeviceToDriver)
+            && unsafe { core::slice::from_raw_parts(bounce.as_ptr::<u8>(), storage.len()) }
+                .iter()
+                .any(|byte| *byte != 0xa5)
+        {
+            unsafe { HalImpl::cancel_share(address, buffer, direction) };
+            return Ok(false);
+        }
+        unsafe {
+            core::ptr::write_bytes(bounce.as_ptr::<u8>(), 0x3c, storage.len());
+        }
+        unsafe { HalImpl::cancel_share(address, buffer, direction) };
+        if storage.iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+    }
+    let address = unsafe { HalImpl::try_share(buffer, BufferDirection::DeviceToDriver) }
+        .map_err(|_| system_error::SystemError::ENOMEM)?;
+    let bounce = unsafe { MMArch::phys_2_virt(PhysAddr::new(address)) }
+        .ok_or(system_error::SystemError::EFAULT)?;
+    unsafe {
+        core::ptr::write_bytes(bounce.as_ptr::<u8>(), 0x3c, storage.len());
+        HalImpl::unshare(address, buffer, BufferDirection::DeviceToDriver);
+    }
+    Ok(storage.iter().all(|byte| *byte == 0x3c) && denied && denial::probe_denied())
 }

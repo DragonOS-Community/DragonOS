@@ -133,6 +133,29 @@ pub unsafe trait Hal {
     /// any other thread for the duration of this method call.
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr;
 
+    /// Fallibly shares a buffer. An error creates no mapping and transfers no ownership.
+    ///
+    /// The default preserves legacy HAL implementations; fallible platforms should override it.
+    ///
+    /// # Safety
+    ///
+    /// The same buffer validity and lifetime requirements as [`Self::share`] apply.
+    unsafe fn try_share(buffer: NonNull<[u8]>, direction: BufferDirection) -> Result<PhysAddr> {
+        Ok(unsafe { Self::share(buffer, direction) })
+    }
+
+    /// Revokes a successful mapping which was never published to the device.
+    ///
+    /// The default delegates to legacy unsharing. HALs with bounce buffers must override this
+    /// method to avoid copying unproduced device output over the original buffer.
+    ///
+    /// # Safety
+    ///
+    /// Arguments must match a successful share, and the device must never have seen this mapping.
+    unsafe fn cancel_share(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
+        unsafe { Self::unshare(paddr, buffer, direction) }
+    }
+
     /// Unshares the given memory range from the device and (if necessary) copies it back to the
     /// original buffer.
     ///

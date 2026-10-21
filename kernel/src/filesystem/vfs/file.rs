@@ -1842,7 +1842,20 @@ impl File {
         // The open hook has transferred its handle. Record that ownership
         // before any later fallible validation so cancellation closes it once.
         *self.mode.write() = mode;
-        if self.flags().contains(FileFlags::O_DIRECT)
+        // Like Linux do_dentry_open(), consume creation-time input only after
+        // the open hook has succeeded. In particular, FUSE OPEN must still see
+        // O_TRUNC for atomic truncation, while later I/O and RELEASE use the
+        // completed OFD flags. This cannot call update_flags(): propagating a
+        // status change to an Overlay backing file is a separate, fallible op.
+        let mut flags = self.flags();
+        flags.remove(
+            FileFlags::O_CREAT | FileFlags::O_EXCL | FileFlags::O_NOCTTY | FileFlags::O_TRUNC,
+        );
+        if let FilePrivateData::Fuse(private) = &mut *self.private_data.lock() {
+            private.set_flags(flags);
+        }
+        *self.flags.write() = flags;
+        if flags.contains(FileFlags::O_DIRECT)
             && !(self.internal_pseudo && self.file_type == FileType::Pipe)
             && behavior.direct_io == DirectIoPolicy::Unsupported
         {

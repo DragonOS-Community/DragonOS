@@ -91,6 +91,77 @@ TEST_F(OpenAt2Test, LegacyOpenIgnoresUnknownFlagsButOpenat2RejectsThem) {
     }
 }
 
+// Creation flags are inputs to open, never persistent OFD status flags.
+TEST_F(OpenAt2Test, SuccessfulOpenConsumesCreationFlags) {
+    constexpr int transient = O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC;
+    constexpr int persistent = O_RDWR | O_APPEND | O_NONBLOCK | O_SYNC;
+    const std::string path = dir_ + "/inside";
+    for (int api = 0; api < 3; ++api) {
+        int seed = open(path.c_str(), O_WRONLY);
+        ASSERT_GE(seed, 0);
+        ASSERT_EQ(4, write(seed, "data", 4));
+        ASSERT_EQ(0, close(seed));
+        const int requested = persistent | O_CREAT | O_NOCTTY | O_TRUNC | O_CLOEXEC;
+        int fd;
+#ifdef SYS_open
+        if (api == 0) {
+            fd = static_cast<int>(syscall(SYS_open, path.c_str(), requested, 0600));
+        } else
+#endif
+        if (api < 2) {
+            fd = openat(dirfd_, "inside", requested, 0600);
+        } else {
+            fd = OpenAt2(dirfd_, "inside", OpenHow{requested, 0600, 0});
+        }
+        ASSERT_GE(fd, 0) << strerror(errno);
+        const int flags = fcntl(fd, F_GETFL);
+        EXPECT_EQ(0, flags & transient);
+        EXPECT_EQ(persistent, flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_SYNC));
+        EXPECT_EQ(FD_CLOEXEC, fcntl(fd, F_GETFD));
+        struct stat st = {};
+        ASSERT_EQ(0, fstat(fd, &st));
+        EXPECT_EQ(0, st.st_size);  // Clearing O_TRUNC must not skip truncation.
+        int alias = dup(fd);
+        ASSERT_GE(alias, 0);
+        EXPECT_EQ(0, fcntl(alias, F_GETFD));
+        ASSERT_EQ(0, fcntl(alias, F_SETFL, (flags & ~O_NONBLOCK) | transient));
+        EXPECT_EQ(flags & ~O_NONBLOCK, fcntl(fd, F_GETFL));
+        EXPECT_EQ(0, close(alias));
+        EXPECT_EQ(0, close(fd));
+    }
+}
+
+TEST_F(OpenAt2Test, ExclusiveCreateConsumesCreationFlags) {
+    ASSERT_EQ(0, unlink((dir_ + "/inside").c_str()));
+    constexpr int transient = O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC;
+    const int requested = O_RDWR | transient | O_CLOEXEC;
+    int fd = OpenAt2(dirfd_, "inside", OpenHow{requested, 0600, 0});
+    ASSERT_GE(fd, 0) << strerror(errno);
+    EXPECT_EQ(0, fcntl(fd, F_GETFL) & transient);
+    EXPECT_EQ(O_RDWR, fcntl(fd, F_GETFL) & O_ACCMODE);
+    EXPECT_EQ(FD_CLOEXEC, fcntl(fd, F_GETFD));
+    errno = 0;
+    EXPECT_EQ(-1, openat(dirfd_, "inside", requested, 0600));
+    EXPECT_EQ(EEXIST, errno);
+    EXPECT_EQ(0, close(fd));
+}
+
+TEST_F(OpenAt2Test, CachedAndPathOpenKeepTheirStatusFlags) {
+    int warm = openat(dirfd_, "inside", O_RDONLY);
+    ASSERT_GE(warm, 0);
+    int fd = OpenAt2(dirfd_, "inside", OpenHow{O_RDONLY | O_NOCTTY | O_NONBLOCK, 0, kCached});
+    ASSERT_GE(fd, 0) << strerror(errno);
+    EXPECT_EQ(0, fcntl(fd, F_GETFL) & (O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC));
+    EXPECT_NE(0, fcntl(fd, F_GETFL) & O_NONBLOCK);
+    EXPECT_EQ(0, close(fd));
+    EXPECT_EQ(0, close(warm));
+    fd = openat(dirfd_, "inside", O_PATH | O_NOFOLLOW | O_TRUNC | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    EXPECT_EQ(O_PATH | O_NOFOLLOW, fcntl(fd, F_GETFL));
+    EXPECT_EQ(FD_CLOEXEC, fcntl(fd, F_GETFD));
+    EXPECT_EQ(0, close(fd));
+}
+
 TEST_F(OpenAt2Test, ValidRequestAndStructExtension) {
     OpenHow how = {};
     int fd = OpenAt2(dirfd_, "inside", how);
@@ -405,8 +476,12 @@ TEST_F(OpenAt2Test, TmpfileRequiresDirectoryAndCreatesUnnamedFile) {
     EXPECT_EQ(ENOTDIR, errno);
 
     errno = 0;
-    fd = OpenAt2(dirfd_, ".", OpenHow{O_TMPFILE | O_RDWR, 0600, 0});
+    fd = OpenAt2(dirfd_, ".",
+                 OpenHow{O_TMPFILE | O_RDWR | O_EXCL | O_TRUNC | O_NOCTTY, 0600, 0});
     ASSERT_GE(fd, 0) << strerror(errno);
+    const int flags = fcntl(fd, F_GETFL);
+    EXPECT_EQ(O_TMPFILE | O_RDWR, flags & (O_TMPFILE | O_ACCMODE));
+    EXPECT_EQ(0, flags & (O_CREAT | O_EXCL | O_TRUNC | O_NOCTTY));
     struct stat st = {};
     ASSERT_EQ(0, fstat(fd, &st));
     EXPECT_TRUE(S_ISREG(st.st_mode));

@@ -62,9 +62,9 @@ pub mod idmap;
 mod operations;
 mod selftest;
 pub mod writer;
-#[cfg(feature = "mm_selftest")]
-pub(crate) use selftest::run_forced_readonly_debug_selftest;
 pub(crate) use selftest::run_mount_wrapper_cache_debug_selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::{run_cached_lookup_debug_selftest, run_forced_readonly_debug_selftest};
 
 /// Serializes mount pin admission against multi-mount busy preflight and
 /// detach, including propagation peers in other namespaces.
@@ -589,6 +589,46 @@ pub(crate) struct MountWalkRoot<'a> {
     pub reject_parent: bool,
 }
 
+/// Cache-only path walking must not fall back to waiting on identity locks.
+#[derive(Clone, Copy)]
+enum LookupLockPolicy {
+    Wait,
+    Cached,
+}
+
+impl LookupLockPolicy {
+    fn lock<'a, T>(&self, lock: &'a Mutex<T>) -> Result<MutexGuard<'a, T>, SystemError> {
+        match self {
+            Self::Wait => Ok(lock.lock()),
+            Self::Cached => lock
+                .try_lock()
+                .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK),
+        }
+    }
+}
+
+/// Dead weak entries can outlive a contended last drop. Sweep periodically on
+/// births, including replacement births, to avoid unbounded lookup churn.
+/// A sweep is O(entries), not a constant-work incremental collector.
+#[derive(Default)]
+struct MountWrapperCache {
+    entries: BTreeMap<DentryId, Weak<MountFSInode>>,
+    births_since_sweep: usize,
+}
+
+impl MountWrapperCache {
+    const SWEEP_INTERVAL: usize = 64;
+
+    fn insert(&mut self, id: DentryId, inode: Weak<MountFSInode>) {
+        self.births_since_sweep += 1;
+        if self.births_since_sweep == Self::SWEEP_INTERVAL {
+            self.entries.retain(|_, inode| inode.strong_count() != 0);
+            self.births_since_sweep = 0;
+        }
+        self.entries.insert(id, inode);
+    }
+}
+
 /// @brief Mount filesystem
 /// When mounting a filesystem, a MountFS wrapper layer is applied to support recursive mounting.
 pub struct MountFS {
@@ -606,7 +646,7 @@ pub struct MountFS {
     root_inode: Mutex<Weak<MountFSInode>>,
     /// Per-mount projections of shared dentries. The values are weak because
     /// paths and topology edges own the semantic references.
-    wrapper_cache: Mutex<BTreeMap<DentryId, Weak<MountFSInode>>>,
+    wrapper_cache: Mutex<MountWrapperCache>,
     /// Ordered shadow stack for every exact `(parent mount, dentry)` edge.
     /// The last element is the visible/top mount.
     mountpoints: Mutex<HashMap<DentryId, Vec<Arc<MountFS>>>>,
@@ -1502,6 +1542,17 @@ impl SuperBlockState {
         name: Option<DName>,
         metadata: &super::Metadata,
     ) -> Result<Arc<VfsDentry>, SystemError> {
+        self.get_or_create_dentry_with_policy(parent, inode, name, metadata, LookupLockPolicy::Wait)
+    }
+
+    fn get_or_create_dentry_with_policy(
+        &self,
+        parent: Option<&Arc<VfsDentry>>,
+        inode: Arc<dyn IndexNode>,
+        name: Option<DName>,
+        metadata: &super::Metadata,
+        policy: LookupLockPolicy,
+    ) -> Result<Arc<VfsDentry>, SystemError> {
         let child = metadata.inode_id;
         let child_generation = inode.inode_generation();
         let key = DentryRegistryKey {
@@ -1511,9 +1562,10 @@ impl SuperBlockState {
             name: name.clone(),
         };
         {
-            let registry = self.dentry_registry.lock();
+            let registry = policy.lock(&self.dentry_registry)?;
             if let Some(dentry) = registry.get(&key).and_then(Weak::upgrade) {
-                if !dentry.is_disconnected() {
+                let connected = !policy.lock(&dentry.state)?.disconnected;
+                if connected {
                     return Ok(dentry);
                 }
             }
@@ -1523,10 +1575,14 @@ impl SuperBlockState {
         // already participated in a link-count mutation or has a watch, the
         // new alias inherits that shared lifecycle fact.
         let checked_epoch = self.fsnotify_object_epoch.load(Ordering::Acquire);
-        let object_state = self.fsnotify_object_state(child, child_generation);
-        let mut registry = self.dentry_registry.lock();
+        let object_state = policy
+            .lock(&self.fsnotify_object_locks)?
+            .get(&(child, child_generation))
+            .and_then(Weak::upgrade);
+        let mut registry = policy.lock(&self.dentry_registry)?;
         if let Some(dentry) = registry.get(&key).and_then(Weak::upgrade) {
-            if !dentry.is_disconnected() {
+            let connected = !policy.lock(&dentry.state)?.disconnected;
+            if connected {
                 return Ok(dentry);
             }
         }
@@ -1884,15 +1940,20 @@ impl CwdCursor {
 
 impl Drop for MountFSInode {
     fn drop(&mut self) {
-        let mut cache = self.mount_fs.wrapper_cache.lock();
+        // The final reference may retire during a cache-only lookup's error
+        // unwind. A missed cleanup retains only a dead Weak, swept on births.
+        let Ok(mut cache) = self.mount_fs.wrapper_cache.try_lock() else {
+            return;
+        };
         // Another lookup can replace this dead weak entry before its final
         // strong owner's destructor obtains the lock. Remove only our own
         // projection, never the concurrently created replacement.
         if cache
+            .entries
             .get(&self.dentry.id)
             .is_some_and(|entry| Weak::ptr_eq(entry, &self.self_ref))
         {
-            cache.remove(&self.dentry.id);
+            cache.entries.remove(&self.dentry.id);
         }
     }
 }
@@ -1989,7 +2050,7 @@ impl MountFS {
             root_inner_inode,
             root_dentry,
             root_inode: Mutex::new(Weak::new()),
-            wrapper_cache: Mutex::new(BTreeMap::new()),
+            wrapper_cache: Mutex::new(MountWrapperCache::default()),
             mountpoints: Mutex::new(HashMap::new()),
             tucked_under: AtomicBool::new(false),
             self_mountpoint: RwSem::new(self_mountpoint),
@@ -2053,7 +2114,7 @@ impl MountFS {
             root_inner_inode,
             root_dentry,
             root_inode: Mutex::new(Weak::new()),
-            wrapper_cache: Mutex::new(BTreeMap::new()),
+            wrapper_cache: Mutex::new(MountWrapperCache::default()),
             mountpoints: Mutex::new(HashMap::new()),
             tucked_under: AtomicBool::new(self.tucked_under.load(Ordering::Acquire)),
             self_mountpoint: RwSem::new(self_mountpoint),
@@ -5126,9 +5187,18 @@ impl MountFSInode {
     }
 
     fn from_dentry(dentry: Arc<VfsDentry>, mount_fs: Arc<MountFS>) -> Arc<Self> {
-        let mut cache = mount_fs.wrapper_cache.lock();
-        if let Some(cached) = cache.get(&dentry.id).and_then(Weak::upgrade) {
-            return cached;
+        Self::from_dentry_with_policy(dentry, mount_fs, LookupLockPolicy::Wait)
+            .expect("ordinary wrapper publication waits for its cache")
+    }
+
+    fn from_dentry_with_policy(
+        dentry: Arc<VfsDentry>,
+        mount_fs: Arc<MountFS>,
+        policy: LookupLockPolicy,
+    ) -> Result<Arc<Self>, SystemError> {
+        let mut cache = policy.lock(&mount_fs.wrapper_cache)?;
+        if let Some(cached) = cache.entries.get(&dentry.id).and_then(Weak::upgrade) {
+            return Ok(cached);
         }
         let inode = Arc::new_cyclic(|self_ref| Self {
             dentry: dentry.clone(),
@@ -5136,7 +5206,7 @@ impl MountFSInode {
             self_ref: self_ref.clone(),
         });
         cache.insert(dentry.id, Arc::downgrade(&inode));
-        inode
+        Ok(inode)
     }
 
     fn new_child(
@@ -5162,13 +5232,17 @@ impl MountFSInode {
         let metadata = inner_inode.cached_metadata()?;
         let dentry = mount_fs
             .super_block_state
-            .get_or_create_dentry_with_metadata(
+            .get_or_create_dentry_with_policy(
                 Some(&parent.dentry),
                 inner_inode,
                 Some(name),
                 &metadata,
+                LookupLockPolicy::Cached,
             )?;
-        Ok(Self::from_dentry(dentry, mount_fs))
+        // The base remains pinned by the caller while a connected temporary
+        // alias is retired on publication failure; no detached notification or
+        // last-parent destruction can be introduced by this cached birth.
+        Self::from_dentry_with_policy(dentry, mount_fs, LookupLockPolicy::Cached)
     }
 
     fn new_anonymous(
@@ -5755,7 +5829,11 @@ impl MountFSInode {
             policy,
             MountLookupPolicy::Follow | MountLookupPolicy::FollowNoAutomount
         ) {
-            self.overlaid_inode()
+            if cache_only {
+                self.follow_component_mounts(false, true)?
+            } else {
+                self.overlaid_inode()
+            }
         } else {
             self.self_ref.upgrade().ok_or(SystemError::ENOENT)?
         };
@@ -6696,9 +6774,27 @@ impl IndexNode for MountFSInode {
     fn cached_metadata(&self) -> Result<super::Metadata, SystemError> {
         let mut md = self.dentry.inode.cached_metadata()?;
         if md.dev_id == 0 {
-            md.dev_id = self.mount_fs.super_block_state.unnamed_dev()?.data() as usize;
+            let minor = self
+                .mount_fs
+                .super_block_state
+                .unnamed_dev_minor
+                .try_lock()
+                .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            let minor = (*minor).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+            md.dev_id = DeviceNumber::new(Major::UNNAMED_MAJOR, minor).data() as usize;
         }
-        Ok(self.op_context().view_metadata(&md))
+        let idmap = self
+            .mount_fs
+            .mount_idmap
+            .try_read()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .clone();
+        let context = super::permission::InodeOpContext {
+            cred: ProcessManager::initialized().then(|| ProcessManager::current_pcb().cred()),
+            idmap,
+            fs_userns: self.mount_fs.super_block_state.owner_user_ns().clone(),
+        };
+        Ok(context.view_metadata(&md))
     }
 
     fn cached_symlink_target(&self) -> Result<String, SystemError> {

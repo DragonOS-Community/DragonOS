@@ -24,7 +24,7 @@ use crate::time::clocksource::HZ;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
-use log::debug;
+use log::{debug, warn};
 use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
@@ -369,9 +369,18 @@ impl LocalApicTimer {
 /// this RefCell borrow alive while dispatching a deadline callback.
 pub(crate) fn program_deadline_delta(delta_ns: u64) {
     let mut timer = local_apic_timer_instance_mut(smp_get_processor_id());
-    let count = ((delta_ns as u128 * timer.periodic_count as u128)
-        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
-    .clamp(1, u32::MAX as u128) as u64;
+    let raw = (delta_ns as u128 * timer.periodic_count as u128)
+        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000);
+    if raw > u32::MAX as u128 {
+        // 请求的 delta 超出计数器范围说明 tick 期限已被毒化（正常路径
+        // delta <= 1 tick）。此前这里静默截断，会把下一次 tick 推迟数秒
+        // 到数分钟；告警以便定位上游时间读数异常。
+        warn!(
+            "apic timer: one-shot delta {}ns exceeds counter range, clamped",
+            delta_ns
+        );
+    }
+    let count = raw.clamp(1, u32::MAX as u128) as u64;
     let divisor = timer.divisor;
     timer.init(LocalApicTimerMode::Oneshot, count, divisor);
     timer.start_current();

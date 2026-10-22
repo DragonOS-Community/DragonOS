@@ -153,7 +153,10 @@ impl UprobeParticipantNode {
     }
 
     /// Visit the live uretprobe participants in one pinned snapshot.
-    pub(crate) fn for_each_active_ret(&self, mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot)) {
+    pub(crate) fn for_each_active_ret(
+        &self,
+        mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot),
+    ) {
         self.for_each_matching(true, visit);
     }
 

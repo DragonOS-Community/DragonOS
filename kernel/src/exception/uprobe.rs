@@ -25,9 +25,9 @@ use crate::arch::CurrentIrqArch;
 use crate::exception::InterruptArch;
 use crate::ipc::signal::force_sig_fault_to_current;
 use crate::mm::VirtAddr;
-use crate::syscall::user_access::{copy_from_user_protected, copy_to_user_protected};
 use crate::process::uprobe::{ActiveXol, TaskXolPhase};
 use crate::process::{ProcessControlBlock, ProcessFlags, ProcessManager};
+use crate::syscall::user_access::{copy_from_user_protected, copy_to_user_protected};
 use kprobe::ProbeArgs;
 use log::{debug, warn};
 use system_error::SystemError;
@@ -162,10 +162,7 @@ fn prepare_uretprobe(
     }
     let tramp_bytes = trampoline.to_ne_bytes();
     if unsafe { copy_to_user_protected(sp, &tramp_bytes) }.is_err() {
-        warn!(
-            "uretprobe: failed to write trampoline at {:#x}",
-            sp.data()
-        );
+        warn!("uretprobe: failed to write trampoline at {:#x}", sp.data());
         return;
     }
     pcb.uprobe.push_uret(crate::process::uprobe::ActiveUret {
@@ -190,8 +187,12 @@ fn handle_uretprobe_trampoline(
             ProcessManager::current_pid()
         );
         unsafe { CurrentIrqArch::interrupt_enable() };
-        force_sig_fault_to_current(Signal::SIGSEGV, 1 /* SEGV_MAPERR */, VirtAddr::new(frame.rip as usize))
-            .ok();
+        force_sig_fault_to_current(
+            Signal::SIGSEGV,
+            1, /* SEGV_MAPERR */
+            VirtAddr::new(frame.rip as usize),
+        )
+        .ok();
         return Ok(());
     };
     // Interrupts are still disabled from the #BP entry; the delivery gate and

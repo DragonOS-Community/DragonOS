@@ -7,7 +7,6 @@ pub(super) mod util;
 
 use super::Result;
 use crate::arch::MMArch;
-use crate::mm::MemoryManagementArch;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
@@ -20,6 +19,7 @@ use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
+use crate::mm::MemoryManagementArch;
 
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -156,7 +156,6 @@ impl BpfMap {
             .downcast_ref::<ringbuf::RingBufMap>()
             .map(|m| m.page_cache())
     }
-
 
     pub fn key_size(&self) -> usize {
         self.meta.key_size as usize

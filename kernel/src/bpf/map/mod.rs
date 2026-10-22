@@ -210,7 +210,15 @@ impl IndexNode for BpfMap {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+        let mut meta = anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR);
+        // The generic filemap fault path bounds-checks a faulting pgoff
+        // against the inode size, so a RINGBUF map reports its mappable
+        // length: the consumer page, the producer-pos page, and the data
+        // ring.
+        if let Some(ring) = self.ringbuf_core() {
+            meta.size = (2 * MMArch::PAGE_SIZE + ring.data_size()) as i64;
+        }
+        Ok(meta)
     }
 
     fn stat_mode(&self, metadata: &Metadata) -> InodeMode {

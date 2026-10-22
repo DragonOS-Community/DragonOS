@@ -171,7 +171,7 @@ impl XolPool {
         }
     }
 
-    pub(super) fn alloc_slot_in(
+    pub(crate) fn alloc_slot_in(
         &self,
         reachable: &core::ops::RangeInclusive<usize>,
     ) -> Option<Arc<XolSlotLease>> {

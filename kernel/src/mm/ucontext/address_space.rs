@@ -130,9 +130,48 @@ pub struct AddressSpaceData {
     /// Per-mm XOL page pool (grown lazily by uprobe registration).
     #[cfg(target_arch = "x86_64")]
     pub xol_pool: XolPool,
+    /// Per-mm uretprobe trampoline slot (one XOL slot holding a lone INT3,
+    /// allocated lazily on the first uretprobe hit). Shared by every task in
+    /// this mm; each task's hijacked stack slots all point here.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uret_trampoline: SpinLock<Option<Arc<XolSlotLease>>>,
     /// Per-page breakpoint state (tracks the COW copy + refcount, used by unregister to restore the original page).
     #[cfg(target_arch = "x86_64")]
     pub(crate) uprobe_page_state: SpinLock<BTreeMap<usize, UprobePageState>>,
+}
+
+impl AddressSpace {
+    /// Lazily allocate this mm's uretprobe trampoline and return its user
+    /// address. Called from process context (entry hit with interrupts
+    /// enabled); the trampoline is a lone INT3 in an XOL slot, so any slot in
+    /// any pool page works (unlike site slots it never needs a disp32 jump
+    /// back). Idempotent; returns `None` when the pool has no free slot.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn ensure_uret_trampoline(&self) -> Option<usize> {
+        let mut slot = self.uret_trampoline.lock_irqsave();
+        if let Some(lease) = slot.as_ref() {
+            return Some(lease.slot_vaddr().data());
+        }
+        let lease = self.xol_pool.alloc_slot_in(&(0..=usize::MAX))?;
+        // Write INT3 through the kernel direct map of the XOL page, exactly
+        // like the site XOL relocation path: no user page-table edit needed.
+        let phys = lease.page_paddr() + lease.offset();
+        let insn_addr = unsafe { crate::arch::MMArch::phys_2_virt(phys) }?;
+        unsafe { core::ptr::write_volatile(insn_addr.as_ptr::<u8>(), 0xCC) };
+        let vaddr = lease.slot_vaddr().data();
+        *slot = Some(lease);
+        Some(vaddr)
+    }
+
+    /// Fast read of the trampoline address for the #BP discriminator, or
+    /// `None` when no uretprobe has ever hijacked in this mm.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn uret_trampoline_vaddr(&self) -> Option<usize> {
+        self.uret_trampoline
+            .lock_irqsave()
+            .as_ref()
+            .map(|lease| lease.slot_vaddr().data())
+    }
 }
 
 impl AddressSpace {
@@ -527,6 +566,8 @@ impl AddressSpace {
             uprobe_list,
             #[cfg(target_arch = "x86_64")]
             xol_pool: XolPool::new(),
+            #[cfg(target_arch = "x86_64")]
+            uret_trampoline: SpinLock::new(None),
             #[cfg(target_arch = "x86_64")]
             uprobe_page_state: SpinLock::new(BTreeMap::new()),
         };

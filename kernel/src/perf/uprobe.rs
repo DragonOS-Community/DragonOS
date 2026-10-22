@@ -396,9 +396,13 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
     if args.read_format != 0 {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    if args.config != PerfProbeConfig::Raw(0) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
+    // Linux uprobe PMU ABI: `config` bit 0 selects a uretprobe; the rest must
+    // be zero (config1 carries the pathname, config2 the offset).
+    let is_retprobe = match args.config {
+        PerfProbeConfig::Raw(0) => false,
+        PerfProbeConfig::Raw(1) => true,
+        _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+    };
 
     // Linux uprobe PMU ABI uses config1 exclusively for the pathname and
     // config2 exclusively for the file offset.  Do not reinterpret ':' in a
@@ -473,6 +477,7 @@ pub fn perf_event_open_uprobe(args: PerfProbeArgs) -> Result<UprobePerfEvent> {
             // Initial activation uses the same scope-aware path as ioctl
             // ENABLE, so task events never need a global file-rmap scan.
             enabled: false,
+            is_retprobe,
         }),
     );
 

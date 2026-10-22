@@ -51,6 +51,22 @@ impl core::fmt::Debug for ActiveXol {
     }
 }
 
+/// One live uretprobe hijack owned by this task: the original return address
+/// that was replaced on the user stack by the mm-wide trampoline, together
+/// with the retprobe participants snapshot to deliver on return.
+pub struct ActiveUret {
+    pub orig_ret_addr: usize,
+    pub participants: Arc<crate::mm::ucontext::UprobeParticipantNode>,
+}
+
+impl core::fmt::Debug for ActiveUret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ActiveUret")
+            .field("orig_ret_addr", &self.orig_ret_addr)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Single source of truth for one task's XOL state.
 ///
 /// `phase` is the lock-free exception-routing discriminator. `payload` owns
@@ -59,6 +75,9 @@ impl core::fmt::Debug for ActiveXol {
 pub struct TaskXolState {
     phase: AtomicU8,
     payload: SpinLock<Option<ActiveXol>>,
+    /// Live uretprobe return instances, innermost last. LIFO on the trampoline
+    /// hit keeps nested hijacks of the same function correct.
+    ret_stack: SpinLock<alloc::vec::Vec<ActiveUret>>,
 }
 
 impl core::fmt::Debug for TaskXolState {
@@ -74,7 +93,29 @@ impl TaskXolState {
         Self {
             phase: AtomicU8::new(TaskXolPhase::Idle as u8),
             payload: SpinLock::new(None),
+            ret_stack: SpinLock::new(alloc::vec::Vec::new()),
         }
+    }
+
+    /// Record one uretprobe hijack. Called from process context on the
+    /// entry-path after the user stack slot has been rewritten.
+    pub fn push_uret(&self, instance: ActiveUret) {
+        let mut stack = self.ret_stack.lock_irqsave();
+        let _ = stack.try_reserve_exact(1);
+        stack.push(instance);
+    }
+
+    /// Pop the innermost uretprobe hijack on the trampoline hit. Returns the
+    /// instance so the handler can restore its original return address.
+    pub fn pop_uret(&self) -> Option<ActiveUret> {
+        self.ret_stack.lock_irqsave().pop()
+    }
+
+    /// Drop every live hijack without unwinding user stacks: used when the
+    /// old user context is being discarded (exec) so stale trampoline
+    /// addresses never reference a freed address space.
+    pub fn clear_urets(&self) {
+        self.ret_stack.lock_irqsave().clear();
     }
 
     #[inline]

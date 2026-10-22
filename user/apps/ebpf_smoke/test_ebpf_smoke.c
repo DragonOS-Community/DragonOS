@@ -1378,6 +1378,105 @@ static void test_ringbuf(void)
     close(mfd);
 }
 
+/* ---------------- T9: uretprobe (return-value capture) ---------------- */
+
+__attribute__((noinline, used)) static long uret_target(long x)
+{
+    /* keep the frame real; return a value the BPF side can assert on */
+    volatile long y = x + 7;
+    return y * 3 + 0x1000;
+}
+
+static void test_uretprobe(void)
+{
+    printf("T9: uretprobe (perf config bit0, trampoline return capture)\n");
+
+    uint64_t uprobe_type;
+    if (read_file_u64("/sys/bus/event_source/devices/uprobe/type",
+                      &uprobe_type) != 0) {
+        report(0, "read uprobe PMU type", NULL);
+        return;
+    }
+    uint64_t file_off;
+    if (func_addr_to_file_off((uintptr_t)&uret_target, &file_off) != 0) {
+        report(0, "resolve uret_target file offset", NULL);
+        return;
+    }
+    printf("    uret_target at file offset %#lx\n", (unsigned long)file_off);
+
+    /* map[0] = retval (rax); map[1] = rip seen by BPF (trampoline) */
+    int mfd = map_create(BPF_MAP_TYPE_ARRAY, 4, 8, 2);
+    if (mfd < 0) {
+        report(0, "uret map", NULL);
+        return;
+    }
+
+    struct bpf_insn prog[] = {
+        { .code = BPF_MOV64_X, .dst_reg = 6, .src_reg = 1 },
+        { .code = BPF_LDX_DW, .dst_reg = 7, .src_reg = 6, .off = PT_REGS_RC_OFF },
+        { .code = BPF_ST_DW, .dst_reg = 10, .off = -8, .imm = 0 },
+        LD_MAP_FD(1, mfd),
+        { .code = BPF_MOV64_X, .dst_reg = 2, .src_reg = 10 },
+        { .code = BPF_ALU64_ADD_K, .dst_reg = 2, .imm = -8 },
+        { .code = BPF_CALL, .imm = 1 },
+        { .code = BPF_JEQ_K, .dst_reg = 0, .imm = 0, .off = 2 },
+        { .code = BPF_STX_DW, .dst_reg = 0, .src_reg = 7, .off = 0 },
+        { .code = BPF_MOV64_K, .dst_reg = 0, .imm = 0 },
+        { .code = BPF_EXIT },
+    };
+
+    int pfd = prog_load_kprobe(prog, sizeof(prog) / sizeof(prog[0]));
+    if (pfd < 0) {
+        report(0, "uret prog load", NULL);
+        close(mfd);
+        return;
+    }
+
+    struct perf_event_attr_x attr = {0};
+    attr.type_ = (uint32_t)uprobe_type;
+    attr.size = sizeof(attr);
+    attr.config = 1; /* bit0: uretprobe */
+    attr.config1 = (uint64_t)(uintptr_t) "/proc/self/exe";
+    attr.config2 = file_off;
+    attr.bits1 = 1; /* disabled */
+
+    int evfd = perf_event_open_x(&attr, 0, -1, -1, 0);
+    if (evfd < 0) {
+        report(0, "perf_event_open(uretprobe)", NULL);
+        close(pfd);
+        close(mfd);
+        return;
+    }
+    report(1, "perf_event_open(uretprobe)", NULL);
+
+    if (ioctl(evfd, PERF_IOC_SET_BPF, pfd) != 0) {
+        report(0, "uretprobe PERF_EVENT_IOC_SET_BPF", NULL);
+        close(evfd);
+        close(pfd);
+        close(mfd);
+        return;
+    }
+    report(1, "uretprobe PERF_EVENT_IOC_SET_BPF", NULL);
+    ioctl(evfd, PERF_IOC_ENABLE, 0);
+
+    /* first call: entry hijack + return through the trampoline */
+    long r1 = uret_target(100);
+    uint32_t key = 0;
+    uint64_t retval = 0;
+    map_lookup(mfd, &key, &retval);
+    report(r1 == 4417 && retval == 4417, "uretprobe captured retval (rax)",
+           NULL);
+
+    /* second call exercises the LIFO reuse of the shared trampoline */
+    long r2 = uret_target(200);
+    map_lookup(mfd, &key, &retval);
+    report(r2 == 4717 && retval == 4717, "uretprobe second hit", NULL);
+
+    ioctl(evfd, PERF_IOC_DISABLE, 0);
+    close(evfd);
+    close(pfd);
+    close(mfd);
+}
 
 
 int main(int argc, char **argv)
@@ -1400,6 +1499,8 @@ int main(int argc, char **argv)
             test_new_tracepoints();
         } else if (strcmp(only, "t8") == 0) {
             test_ringbuf();
+        } else if (strcmp(only, "t9") == 0) {
+            test_uretprobe();
         }
         printf("=== smoke(section %s): %d passed, %d failed ===\n", only,
                g_passes, g_failures);
@@ -1413,6 +1514,7 @@ int main(int argc, char **argv)
     test_current_helpers();
     test_new_tracepoints();
     test_ringbuf();
+    test_uretprobe();
     printf("=== smoke: %d passed, %d failed ===\n", g_passes, g_failures);
     return g_failures ? 1 : 0;
 }

@@ -12,7 +12,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read_snapshot,
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -347,13 +347,14 @@ impl FileOps for StatFileOps {
         false
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        proc_read_snapshot(offset, len, buf, &mut data, || self.generate_content())
+        proc_snapshot_operation(operation, data, || self.generate_content())
     }
 }

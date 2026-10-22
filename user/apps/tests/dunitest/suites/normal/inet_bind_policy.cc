@@ -419,6 +419,10 @@ TEST(InetBindPolicy, OrdinarySysctlDescriptorsDoNotKeepNamespaceAlive) {
       EXPECT_EQ(errno, ENOENT);
       EXPECT_EQ(lseek(fd, 0, SEEK_SET), 0);
       EXPECT_EQ(lseek(fd, 0, SEEK_CUR), 0);
+      // llseek uses the size-zero proc inode even after the sysctl table
+      // retires; it must not revalidate that table through metadata().
+      EXPECT_EQ(lseek(fd, 7, SEEK_END), 7);
+      EXPECT_EQ(lseek(fd, 0, SEEK_END), 0);
     }
   });
 }

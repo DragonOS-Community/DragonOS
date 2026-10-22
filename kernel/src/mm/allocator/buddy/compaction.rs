@@ -165,8 +165,26 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         Ok(None)
     }
 
-    /// Validate and prepay a read-only scan, then remove intersecting blocks
-    /// in a second pass under the same buddy lock. No allocation is needed.
+    /// Reserve one complete scan before changing ownership. Non-head metadata
+    /// pages contain at least BUDDY_ENTRIES - 1 entries: a new head replaces a
+    /// full head, possibly after consuming one old entry for its own metadata.
+    /// Removal replaces non-head slots from the head, preserving their density.
+    /// Thus the exact free-block counters also bound metadata visits without
+    /// walking the chains just to decide whether the scan is affordable.
+    fn isolation_work_bound(&self, zone: BuddyZone, target_order: usize) -> Option<usize> {
+        let mut work = MAX_ORDER - MIN_ORDER;
+        for &blocks in &self.diagnostics.zones[zone.index()].free_blocks {
+            let metadata = blocks.div_ceil(Self::BUDDY_ENTRIES - 1);
+            work = work.checked_add(blocks)?.checked_add(metadata)?;
+        }
+        // At most one free block per target page is removed. A containing
+        // larger block needs at most this many outside-half insertions.
+        work.checked_add(1 << (target_order - MIN_ORDER))?
+            .checked_add(MAX_ORDER - 1 - target_order)
+    }
+
+    /// Prepay a conservative bound, then remove intersecting blocks in one
+    /// pass under the same buddy lock. Budget failure cannot change ownership.
     pub(crate) fn begin_isolation(
         &mut self,
         start: PhysAddr,
@@ -186,50 +204,16 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             .next_isolation_id
             .checked_add(1)
             .ok_or(RangeError::Invalid)?;
-        let before_scan = *remaining_scan;
+        let work = self
+            .isolation_work_bound(zone, MIN_ORDER + order)
+            .ok_or(RangeError::Invalid)?;
+        charge(remaining_scan, work)?;
+        // The reservation is deliberately conservative and is not refunded.
+        // From here onward all fallible request checks are complete. Free-list
+        // corruption is an allocator invariant violation, not a recoverable
+        // error which could abandon frames already removed into local state.
         let mut blocks = 0;
         let mut containing = None;
-        for current in MIN_ORDER..MAX_ORDER {
-            charge(remaining_scan, 1)?;
-            let mut metadata = self.free_area(zone, current as u8);
-            while !metadata.is_null() {
-                charge(remaining_scan, 1)?;
-                let list: PageList<A> = Self::read_page(metadata);
-                for index in (0..list.entry_num).rev() {
-                    charge(remaining_scan, 1)?;
-                    let base: PhysAddr = unsafe { A::read(Self::entry_virt_addr(metadata, index)) };
-                    let block_end = base
-                        .data()
-                        .checked_add(1 << current)
-                        .ok_or(RangeError::Invalid)?;
-                    if base.data() < end && block_end > start.data() {
-                        if blocks == pages {
-                            return Err(RangeError::Invalid);
-                        }
-                        blocks += 1;
-                        // Aligned power-of-two intervals are either disjoint
-                        // or nested. A larger free block contains the entire
-                        // target, and disjoint free blocks permit at most one.
-                        if current > MIN_ORDER + order {
-                            if containing.is_some() || base > start || block_end < end {
-                                return Err(RangeError::Invalid);
-                            }
-                            containing = Some((base, current));
-                        }
-                    }
-                }
-                metadata = list.next_page;
-            }
-        }
-        let scan_cost = before_scan - *remaining_scan;
-        let splits = containing.map_or(0, |(_, current)| current - (MIN_ORDER + order));
-        // Pay for every visit and mutation before changing any ownership.
-        // Removal can shorten metadata chains, never add another scan entry.
-        let commit_cost = scan_cost
-            .checked_add(blocks)
-            .and_then(|cost| cost.checked_add(splits))
-            .ok_or(RangeError::Invalid)?;
-        charge(remaining_scan, commit_cost)?;
         let mut state = IsolationState {
             id: self.next_isolation_id,
             start,
@@ -249,10 +233,22 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 let next = list.next_page;
                 for index in (0..list.entry_num).rev() {
                     let base: PhysAddr = unsafe { A::read(Self::entry_virt_addr(metadata, index)) };
-                    // Every original block, including replacement donors,
-                    // was checked in the read-only pass under this same lock.
-                    let block_end = base.data() + (1 << current);
+                    let block_end = base
+                        .data()
+                        .checked_add(1 << current)
+                        .expect("buddy free block address overflow");
                     if base.data() < end && block_end > start.data() {
+                        assert!(blocks < pages, "overlapping buddy free blocks");
+                        blocks += 1;
+                        // Aligned power-of-two intervals are disjoint or
+                        // nested. Only one larger block can contain a target.
+                        if current > MIN_ORDER + order {
+                            assert!(
+                                containing.is_none() && base <= start && block_end >= end,
+                                "invalid containing buddy free block"
+                            );
+                            containing = Some((base, current));
+                        }
                         let removed = self.remove_entry(zone, current as u8, metadata, index);
                         assert_eq!(removed, base, "isolation removal slot changed");
                         let first = start.data().max(base.data());

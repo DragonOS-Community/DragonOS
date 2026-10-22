@@ -11,7 +11,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read_seq,
+            utils::proc_seq_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -134,7 +134,7 @@ fn format_dev_inode_and_path(
 /// Rendering one slice at a time is what keeps an open fd from buffering a copy
 /// of the whole mapping table: Linux `seq_file` likewise holds one buffer, not
 /// the record. `budget` bounds the slice and is capped a page at a time by
-/// [`proc_read_seq()`], so an fd holds at most one page of the table plus the
+/// [`proc_seq_operation()`], so an fd holds at most one page of the table plus the
 /// one line that crossed the bound.
 fn render_maps_slice(
     target: &ProcPidTarget,
@@ -275,26 +275,27 @@ impl FileOps for MapsFileOps {
         Ok(())
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // The table to stream comes from the address space `open()` took; a
         // continuation read must not resolve it again. A read that arrives
         // without that state did not come through the procfs `open()` hook and
         // has no address space to stream: reporting an empty record for it would
         // claim the target maps nothing.
-        let FilePrivateData::Procfs(pdata) = &*data else {
+        let FilePrivateData::Procfs(pdata) = &**data else {
             return Err(SystemError::EINVAL);
         };
         let vm = pdata.pinned_vm.clone();
         // One mapping is rendered per slice, so an fd holds at most one line of
         // the table no matter how many mappings the target has; the cursor keeps
         // a mapping that appears mid-stream from tearing the byte stream.
-        proc_read_seq(offset, len, buf, &mut data, |cursor, budget, out| {
+        proc_seq_operation(operation, data, |cursor, budget, out| {
             render_maps_slice(&self.target, vm.as_ref(), cursor, budget, out)
         })
     }

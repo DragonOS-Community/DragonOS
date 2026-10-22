@@ -67,7 +67,7 @@ pub struct ProcfsFilePrivateData {
     /// learn that there is nothing left to serve.
     pub(crate) pinned_vm: Option<Arc<AddressSpace>>,
     /// Streaming state of a seq-style record (Linux `struct seq_file`). Only
-    /// `utils::proc_read_seq()` and `utils::proc_read_snapshot()` touch it.
+    /// `utils::proc_seq_operation()` and `utils::proc_snapshot_operation()` touch it.
     pub(crate) seq: utils::ProcfsSeq,
     /// Mount namespace and root directory pinned by `open()` for
     /// `/proc/[pid]/{mounts,mountinfo,mountstats}`, as `mounts_open_common()`

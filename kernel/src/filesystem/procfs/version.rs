@@ -9,7 +9,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read_snapshot,
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -58,16 +58,15 @@ impl FileOps for VersionFileOps {
         configure_seq_file(behavior);
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // `single_open()`: one fd sees one version record.
-        proc_read_snapshot(offset, len, buf, &mut data, || {
-            Ok(Self::generate_version_content())
-        })
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_version_content()))
     }
 }

@@ -46,6 +46,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -685,14 +686,166 @@ TEST(ProcfsTaskSemantics, SeekIntoRecordServesRecordBytes) {
     }
 }
 
-// Guard for the VFS-level behaviour the fix relies on: a procfs lseek(SEEK_END)
-// is EINVAL, like seq_lseek().
+// /proc/self/status uses seq_lseek, which rejects SEEK_END. Generic and
+// default proc seek operations are checked separately below.
 TEST(ProcfsTaskSemantics, SeekEndIsEinval) {
     UniqueFd fd(open("/proc/self/status", O_RDONLY));
     ASSERT_TRUE(fd.valid()) << "cannot open /proc/self/status: errno=" << errno;
     errno = 0;
     EXPECT_EQ(-1, lseek(fd.get(), 0, SEEK_END));
     EXPECT_EQ(EINVAL, errno);
+}
+
+// seq_lseek samples the record during a nonzero seek, not at the next
+// read. Rewind only resets the iterator and must defer sampling until read.
+TEST(ProcfsTaskSemantics, SeqSeekSamplesBeforeTheNextRead) {
+    CommGuard guard("seq_seek_old");
+    UniqueFd fd(open("/proc/self/status", O_RDONLY));
+    ASSERT_TRUE(fd.valid());
+    ASSERT_EQ(1, lseek(fd.get(), 1, SEEK_SET));
+    ASSERT_TRUE(CommGuard::Set("seq_seek_new"));
+    std::string tail;
+    ASSERT_EQ(0, ReadToEof(fd.get(), kReadChunk, &tail));
+    EXPECT_NE(std::string::npos, tail.find("seq_seek_old"));
+    EXPECT_EQ(std::string::npos, tail.find("seq_seek_new"));
+
+    ASSERT_EQ(0, lseek(fd.get(), 0, SEEK_SET));
+    ASSERT_TRUE(CommGuard::Set("seq_seek_latest"));
+    std::string fresh;
+    ASSERT_EQ(0, ReadToEof(fd.get(), kReadChunk, &fresh));
+    EXPECT_EQ("seq_seek_latest", Field(ParseStatus(fresh), "Name"));
+}
+
+// Rejected seeks and a seek to read_pos preserve the buffered record. This
+// also covers signed SEEK_CUR overflow without changing the cached bytes.
+TEST(ProcfsTaskSemantics, SeqSeekInvalidAndSamePositionKeepTheRecord) {
+    CommGuard guard("seq_keep_old");
+    UniqueFd fd(open("/proc/self/status", O_RDONLY));
+    ASSERT_TRUE(fd.valid());
+    char byte = 0;
+    ASSERT_EQ(1, ReadByte(fd.get(), &byte));
+    ASSERT_TRUE(CommGuard::Set("seq_keep_new"));
+    ASSERT_EQ(1, lseek(fd.get(), 0, SEEK_CUR));
+    ASSERT_EQ(1, lseek(fd.get(), 1, SEEK_SET));
+    const struct {
+        off_t offset;
+        int origin;
+    } invalid[] = {{-1, SEEK_SET}, {-2, SEEK_CUR}, {0, SEEK_END},
+                   {0, SEEK_DATA}, {0, SEEK_HOLE},
+                   {std::numeric_limits<off_t>::max(), SEEK_CUR}};
+    for (const auto& request : invalid) {
+        errno = 0;
+        EXPECT_EQ(-1, lseek(fd.get(), request.offset, request.origin));
+        EXPECT_EQ(EINVAL, errno);
+        EXPECT_EQ(1, lseek(fd.get(), 0, SEEK_CUR));
+    }
+    std::string tail;
+    ASSERT_EQ(0, ReadToEof(fd.get(), kReadChunk, &tail));
+    EXPECT_NE(std::string::npos, tail.find("seq_keep_old"));
+    EXPECT_EQ(std::string::npos, tail.find("seq_keep_new"));
+}
+
+// A seek can acquire a task's record while it is alive. A different seek
+// after reap must fail immediately and reset f_pos, whereas zero/same-position
+// seeks do not resolve the task again.
+TEST(ProcfsTaskSemantics, SeqSeekCachesBeforeReapAndResetsOnTraversalError) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        for (;;) {
+            pause();
+        }
+    }
+    ReapedChild child_guard(child);
+    const std::string path = StatusPath(child, "stat");
+    UniqueFd cached(open(path.c_str(), O_RDONLY));
+    UniqueFd failing(open(path.c_str(), O_RDONLY));
+    UniqueFd past_end(open(path.c_str(), O_RDONLY));
+    ASSERT_TRUE(cached.valid());
+    ASSERT_TRUE(failing.valid());
+    ASSERT_TRUE(past_end.valid());
+    ASSERT_EQ(1, lseek(cached.get(), 1, SEEK_SET));
+    char byte = 0;
+    ASSERT_EQ(1, ReadByte(failing.get(), &byte));
+    const off_t far = 1 << 20;
+    ASSERT_EQ(far, lseek(past_end.get(), far, SEEK_SET));
+    ASSERT_EQ(0, kill(child, SIGKILL));
+    ASSERT_TRUE(WaitForExit(child));
+    child_guard.Disarm();
+
+    EXPECT_EQ(1, lseek(cached.get(), 1, SEEK_SET));
+    char bytes[64];
+    EXPECT_GT(read(cached.get(), bytes, sizeof(bytes)), 0) << "seek did not retain the record";
+    errno = 0;
+    EXPECT_EQ(-1, lseek(failing.get(), 2, SEEK_SET));
+    EXPECT_EQ(ESRCH, errno);
+    EXPECT_EQ(0, lseek(failing.get(), 0, SEEK_CUR));
+    EXPECT_EQ(0, lseek(failing.get(), 0, SEEK_SET));
+    errno = 0;
+    EXPECT_EQ(-1, ReadByte(failing.get(), &byte));
+    EXPECT_EQ(ESRCH, errno);
+
+    EXPECT_EQ(far, lseek(past_end.get(), far, SEEK_SET));
+    EXPECT_EQ(0, ReadByte(past_end.get(), &byte));
+    EXPECT_EQ(0, lseek(past_end.get(), 0, SEEK_SET));
+    errno = 0;
+    EXPECT_EQ(-1, ReadByte(past_end.get(), &byte));
+    EXPECT_EQ(ESRCH, errno);
+}
+
+// pread moves seq_file.read_pos without moving f_pos. A following seek to
+// f_pos must traverse if it differs from read_pos; dup shares both states,
+// while a separate open has its own record.
+TEST(ProcfsTaskSemantics, SeqSeekUsesReadPositionAfterPreadAndSharesDupState) {
+    CommGuard guard("seq_pread_old");
+    UniqueFd fd(open("/proc/self/status", O_RDONLY));
+    UniqueFd independent(open("/proc/self/status", O_RDONLY));
+    ASSERT_TRUE(fd.valid());
+    ASSERT_TRUE(independent.valid());
+    UniqueFd alias(dup(fd.get()));
+    ASSERT_TRUE(alias.valid());
+    char byte = 0;
+    ASSERT_EQ(1, ReadByte(fd.get(), &byte));
+    ASSERT_TRUE(CommGuard::Set("seq_pread_mid"));
+    char prefix[2];
+    ASSERT_EQ(2, pread(fd.get(), prefix, sizeof(prefix), 0));
+    ASSERT_TRUE(CommGuard::Set("seq_pread_last"));
+    ASSERT_EQ(1, lseek(alias.get(), 1, SEEK_SET));
+    std::string tail;
+    ASSERT_EQ(0, ReadToEof(alias.get(), kReadChunk, &tail));
+    EXPECT_NE(std::string::npos, tail.find("seq_pread_last"));
+    EXPECT_EQ(std::string::npos, tail.find("seq_pread_mid"));
+    EXPECT_EQ(lseek(alias.get(), 0, SEEK_CUR), lseek(fd.get(), 0, SEEK_CUR));
+    EXPECT_EQ(0, lseek(independent.get(), 0, SEEK_CUR));
+    ASSERT_TRUE(CommGuard::Set("seq_independent"));
+    std::string own;
+    ASSERT_EQ(0, ReadToEof(independent.get(), kReadChunk, &own));
+    EXPECT_EQ("seq_independent", Field(ParseStatus(own), "Name"));
+}
+
+// These real operation tables use default/generic llseek rather than
+// seq_lseek. Their zero-sized inode permits SEEK_END even though reads are
+// generated dynamically; a blanket procfs seq rule would reject it.
+TEST(ProcfsTaskSemantics, GenericProcAndCgroupSeekDoNotTraverseRecords) {
+    for (const char* path : {"/proc/self/oom_score_adj", "/proc/self/cmdline",
+                             "/sys/fs/cgroup/cgroup.procs"}) {
+        UniqueFd fd(open(path, O_RDONLY));
+        ASSERT_TRUE(fd.valid()) << path << ": errno=" << errno;
+        EXPECT_EQ(0, lseek(fd.get(), 0, SEEK_END)) << path << ": errno=" << errno;
+        EXPECT_EQ(0, lseek(fd.get(), 0, SEEK_CUR)) << path;
+        const bool default_seek = strcmp(path, "/proc/self/oom_score_adj") == 0;
+        ASSERT_EQ(7, lseek(fd.get(), 7, SEEK_SET)) << path;
+        errno = 0;
+        EXPECT_EQ(-1, lseek(fd.get(), -1, SEEK_DATA)) << path;
+        EXPECT_EQ(default_seek ? EINVAL : ENXIO, errno) << path;
+        EXPECT_EQ(7, lseek(fd.get(), 0, SEEK_CUR)) << path;
+        errno = 0;
+        EXPECT_EQ(default_seek ? 0 : -1, lseek(fd.get(), -1, SEEK_HOLE)) << path;
+        if (!default_seek) {
+            EXPECT_EQ(ENXIO, errno) << path;
+        }
+        EXPECT_EQ(default_seek ? 0 : 7, lseek(fd.get(), 0, SEEK_CUR)) << path;
+    }
 }
 
 // Every file the fix converted to snapshot reads must survive a chunked read:
@@ -1117,37 +1270,62 @@ TEST(ProcfsTaskSemantics, TaskSubtreeSurvivesLeaderExit) {
 // Guardrails for the read paths that changed shape in the same fix
 // ---------------------------------------------------------------------------
 
-// /proc/<pid>/maps keeps streaming the mappings that exist when the reader asks
-// for the next line, the way Linux m_start()/m_next() re-enter the iteration,
-// while the fd still holds one line instead of a copy of the whole table: a
-// mapping created after the first read shows up in the rest of the stream.
+// Linux remembers the next existing VMA address after rendering a line. A
+// mapping inserted below that cursor is skipped, while one inserted ahead is
+// visible. Control both addresses: mmap(nullptr) placement is not an ABI.
 TEST(ProcfsTaskSemantics, MapsStreamsMappingsAddedAfterFirstRead) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    const size_t page = static_cast<size_t>(page_size);
+    void* arena = mmap(nullptr, 7 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, arena) << "errno=" << errno;
+    struct ArenaGuard {
+        void* base;
+        size_t len;
+        ~ArenaGuard() { munmap(base, len); }
+    } arena_guard{arena, 7 * page};
+    auto* base = static_cast<char*>(arena);
+    const unsigned long before_cursor = reinterpret_cast<unsigned long>(base + page);
+    const unsigned long after_cursor = reinterpret_cast<unsigned long>(base + 4 * page);
+
+    // Reserve before opening holes so reading a line cannot ask malloc for a
+    // mapping that would consume one of the two test slots.
+    std::string line;
+    line.reserve(4097);
+    ASSERT_EQ(0, mprotect(base + 2 * page, page, PROT_READ));
+    ASSERT_EQ(0, munmap(base + page, page));
+    ASSERT_EQ(0, munmap(base + 4 * page, page));
     UniqueFd fd(open("/proc/self/maps", O_RDONLY));
-    ASSERT_TRUE(fd.valid()) << "cannot open /proc/self/maps: errno=" << errno;
+    ASSERT_TRUE(fd.valid()) << "errno=" << errno;
+    for (;;) {
+        ASSERT_TRUE(ReadLine(fd.get(), &line)) << "arena anchor missing";
+        unsigned long start = 0;
+        unsigned long end = 0;
+        ASSERT_EQ(2, sscanf(line.c_str(), "%lx-%lx", &start, &end));
+        if (start <= reinterpret_cast<unsigned long>(base) &&
+            reinterpret_cast<unsigned long>(base) < end) {
+            break;
+        }
+    }
 
-    std::string first;
-    ASSERT_TRUE(ReadLine(fd.get(), &first)) << "cannot read the first mapping";
-    std::string second;
-    ASSERT_TRUE(ReadLine(fd.get(), &second)) << "cannot read the second mapping";
-
-    const size_t kLen = 1u << 20;
-    void* added = mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ASSERT_NE(MAP_FAILED, added) << "mmap failed: errno=" << errno;
-    const unsigned long added_start = reinterpret_cast<unsigned long>(added);
+    // The next existing mapping is the READ anchor on page 2. Neither new RW
+    // page can merge with its PROT_NONE neighbours or with that anchor.
+    ASSERT_EQ(base + page, mmap(base + page, page, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0))
+        << "errno=" << errno;
+    ASSERT_EQ(base + 4 * page, mmap(base + 4 * page, page, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0))
+        << "errno=" << errno;
 
     std::string rest;
-    EXPECT_EQ(0, ReadToEof(fd.get(), kReadChunk, &rest)) << "draining /proc/self/maps failed";
-
+    ASSERT_EQ(0, ReadToEof(fd.get(), kReadChunk, &rest));
     std::string fresh;
     int err = 0;
-    EXPECT_TRUE(ReadWholePath("/proc/self/maps", &fresh, &err)) << "errno=" << err;
-
-    EXPECT_TRUE(MapsCover(fresh, added_start)) << "/proc/self/maps lost the mapping the test created";
-    EXPECT_TRUE(MapsCover(rest, added_start))
-        << "a mapping created after the first read never showed up in the stream: the fd "
-           "served a record that was frozen before it existed";
-
-    munmap(added, kLen);
+    ASSERT_TRUE(ReadWholePath("/proc/self/maps", &fresh, &err)) << "errno=" << err;
+    EXPECT_TRUE(MapsCover(fresh, before_cursor));
+    EXPECT_TRUE(MapsCover(fresh, after_cursor));
+    EXPECT_FALSE(MapsCover(rest, before_cursor)) << "stream revisited an address below its cursor";
+    EXPECT_TRUE(MapsCover(rest, after_cursor)) << "stream froze mappings ahead of its cursor";
 }
 
 // The length of a read must not change the record it returns. /proc/<pid>/maps

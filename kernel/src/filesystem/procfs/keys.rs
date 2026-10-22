@@ -20,7 +20,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read_seq,
+            utils::proc_seq_operation,
             ProcfsFilePrivateData,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
@@ -263,15 +263,16 @@ impl FileOps for KeysFileOps {
         configure_seq_file(behavior);
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let cred = opener(&data)?;
-        proc_read_seq(offset, len, buf, &mut data, |cursor, budget, out| {
+        let cred = opener(data)?;
+        proc_seq_operation(operation, data, |cursor, budget, out| {
             render_keys_slice(&cred, cursor, budget, out)
         })
     }
@@ -342,15 +343,16 @@ impl FileOps for KeyUsersFileOps {
         configure_seq_file(behavior);
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let cred = opener(&data)?;
-        proc_read_seq(offset, len, buf, &mut data, |cursor, budget, out| {
+        let cred = opener(data)?;
+        proc_seq_operation(operation, data, |cursor, budget, out| {
             Ok(render_users_slice(&cred.user_ns, cursor, budget, out))
         })
     }

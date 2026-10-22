@@ -88,6 +88,9 @@ impl MountMaxFileOps {
 }
 
 impl FileOps for MountMaxFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)
@@ -157,6 +160,9 @@ impl NrOpenFileOps {
 }
 
 impl FileOps for NrOpenFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)
@@ -217,6 +223,9 @@ impl SuidDumpableFileOps {
 }
 
 impl FileOps for SuidDumpableFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)

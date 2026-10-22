@@ -75,6 +75,8 @@ const FAILURE_REASONS: [(&str, AllocationFailure); 6] = [
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ZoneDiagnostics {
+    // Exact ownership counts, also used to prepay bounded range isolation.
+    // These must remain unconditional and must not saturate like event totals.
     free_blocks: [usize; BUDDY_ORDER_COUNT],
     attempts: [u64; BUDDY_ORDER_COUNT],
     misses: [u64; BUDDY_ORDER_COUNT],

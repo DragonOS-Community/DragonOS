@@ -6,7 +6,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read_snapshot, trim_string},
+            utils::{proc_snapshot_operation, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -136,17 +136,16 @@ impl FileOps for StatFileOps {
         configure_seq_file(behavior);
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // `seq_file`: Linux opens `/proc/stat` through `single_open_size()`
         // (`fs/proc/stat.c`), so one fd sees one rendered record.
-        proc_read_snapshot(offset, len, buf, &mut data, || {
-            Ok(Self::generate_stat_content())
-        })
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_stat_content()))
     }
 }

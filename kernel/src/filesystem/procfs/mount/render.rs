@@ -93,7 +93,7 @@ fn minimum_line_len(mount: &VisibleMount, kind: ProcMountRenderKind) -> usize {
 /// after the record that crossed the bound, so the result is one page plus at
 /// most one record, the same way `seq_read_iter()` refills `m->buf` and grows it
 /// only for a single record that cannot fit. The driver also bounds the slice by
-/// what the reader asked for (`proc_read_seq()`), so a reader that asks for one
+/// what the reader asked for (`proc_seq_operation()`), so a reader that asks for one
 /// byte takes a one-record slice and pays one enumeration per record, while one
 /// that asks for a page or more pays one per output block.
 ///

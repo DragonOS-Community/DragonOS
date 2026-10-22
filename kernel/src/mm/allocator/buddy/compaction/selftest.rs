@@ -391,6 +391,207 @@ fn zone_models_and_reuse(backing: PhysAddr) -> bool {
         && counts(&allocator)
 }
 
+// Model distant free PFNs without touching their contents, as in zone_models.
+// Only metadata and the selected target use the exclusively owned backing.
+fn foreign_address(base: PhysAddr, ordinal: usize, target: PhysAddr) -> PhysAddr {
+    let address = base + (ordinal << (MIN_ORDER + 1));
+    if address >= target && address < target + (TARGET_PAGES << MIN_ORDER) {
+        address + (1 << 28)
+    } else {
+        address
+    }
+}
+
+fn large_single_scan(backing: PhysAddr) -> bool {
+    const NODES: usize = 18;
+    let mut allocator = unsafe { empty(backing) };
+    let target = backing + (TARGET_OFFSET << MIN_ORDER);
+    let zone = BuddyAllocator::<MMArch>::zone_for(target, MIN_ORDER + 3);
+    let foreign_base = PhysAddr::new(if zone == BuddyZone::Normal {
+        (1usize << 32) + (1 << 28)
+    } else {
+        1 << 28
+    });
+    let capacity = BuddyAllocator::<MMArch>::BUDDY_ENTRIES;
+    // A partial head and E-1 entries in every non-head exercise the tight
+    // metadata bound, including head recycling during replacement donations.
+    let entries = 4 + (NODES - 1) * (capacity - 1);
+    let selected = [1, 3, 4 + 7 * (capacity - 1), entries - (capacity - 1)];
+    let mut ordinal = 0;
+    for node in 0..NODES {
+        let metadata = backing + ((64 + node) << MIN_ORDER);
+        let next = if node + 1 == NODES {
+            PhysAddr::new(0)
+        } else {
+            metadata + (1 << MIN_ORDER)
+        };
+        let length = if node == 0 { 4 } else { capacity - 1 };
+        BuddyAllocator::<MMArch>::write_page(metadata, PageList::new(length, next));
+        for index in 0..length {
+            let address = if let Some(page) = selected.iter().position(|&slot| slot == ordinal) {
+                target + ((2 * page) << MIN_ORDER)
+            } else {
+                foreign_address(foreign_base, ordinal, target)
+            };
+            unsafe {
+                MMArch::write(
+                    BuddyAllocator::<MMArch>::entry_virt_addr(metadata, index),
+                    address,
+                )
+            };
+            ordinal += 1;
+        }
+    }
+    allocator.set_free_area(zone, MIN_ORDER as u8, backing + (64 << MIN_ORDER));
+    allocator.diagnostics.zones[zone.index()].free_blocks[0] = entries;
+    allocator.adjust_free_pages(zone, entries, true);
+    let required = allocator.isolation_work_bound(zone, MIN_ORDER + 3).unwrap();
+    // The former two complete scans cannot fit, but one bounded scan can.
+    let old_minimum = 2 * ((MAX_ORDER - MIN_ORDER) + entries + NODES) + selected.len();
+    if entries <= 8192 || old_minimum <= 16384 || required > 16384 {
+        return false;
+    }
+    unsafe {
+        core::ptr::write_bytes(
+            MMArch::phys_2_virt(target).unwrap().as_ptr::<u8>(),
+            0x5a,
+            8 << MIN_ORDER,
+        )
+    };
+    let before = allocator.diagnostic_snapshot();
+    let heads = (allocator.dma32_free_area, allocator.normal_free_area);
+    let id = allocator.next_isolation_id;
+    let mut short = required - 1;
+    let rejected = matches!(
+        allocator.begin_isolation(target, 3, &mut short),
+        Err(RangeError::Budget)
+    );
+    let after = allocator.diagnostic_snapshot();
+    let untouched = rejected
+        && short == 0
+        && allocator.isolation.is_none()
+        && allocator.next_isolation_id == id
+        && heads == (allocator.dma32_free_area, allocator.normal_free_area)
+        && before.free_pages == after.free_pages
+        && before
+            .diagnostics
+            .zones
+            .iter()
+            .zip(after.diagnostics.zones.iter())
+            .all(|(left, right)| left.free_blocks == right.free_blocks)
+        && unsafe {
+            core::slice::from_raw_parts(
+                MMArch::phys_2_virt(target).unwrap().as_ptr::<u8>(),
+                8 << MIN_ORDER,
+            )
+        }
+        .iter()
+        .all(|&byte| byte == 0x5a);
+    let mut exact = required;
+    let Ok(key) = allocator.begin_isolation(target, 3, &mut exact) else {
+        return false;
+    };
+    let bitmap = exact == 0
+        && (0..8).all(|page| {
+            allocator.isolated_free(&key, target + (page << MIN_ORDER)) == page.is_multiple_of(2)
+        });
+    for page in (1..8).step_by(2) {
+        unsafe { allocator.free(target + (page << MIN_ORDER), PageFrameCount::ONE) };
+    }
+    let captured = allocator.capture_isolation(&key) == Some(target);
+    let mut seen = vec![false; entries];
+    for &slot in &selected {
+        seen[slot] = true;
+    }
+    let mut drained = 0;
+    while let Some(address) = allocator.pop_front(zone, MIN_ORDER as u8) {
+        if address < foreign_base {
+            return false;
+        }
+        let mut offset = address.data() - foreign_base.data();
+        if offset >= 1 << 28 {
+            offset -= 1 << 28;
+        }
+        let index = offset >> (MIN_ORDER + 1);
+        if index >= entries
+            || seen[index]
+            || foreign_address(foreign_base, index, target) != address
+        {
+            return false;
+        }
+        seen[index] = true;
+        drained += 1;
+    }
+    untouched
+        && bitmap
+        && captured
+        && drained == entries - selected.len()
+        && seen.iter().all(|&value| value)
+        && counts(&allocator)
+        && allocator
+            .diagnostic_snapshot()
+            .free_pages
+            .iter()
+            .sum::<usize>()
+            == 0
+}
+
+fn split_without_spare_metadata(backing: PhysAddr) -> bool {
+    let mut allocator = unsafe { empty(backing) };
+    let target = backing + (TARGET_OFFSET << MIN_ORDER);
+    let zone = BuddyAllocator::<MMArch>::zone_for(target, MIN_ORDER + 2);
+    let capacity = BuddyAllocator::<MMArch>::BUDDY_ENTRIES;
+    let foreign_base = PhysAddr::new(if zone == BuddyZone::Normal {
+        (1usize << 32) + (1 << 28)
+    } else {
+        1 << 28
+    });
+    let metadata = backing + (64 << MIN_ORDER);
+    let metadata_source = backing + (128 << MIN_ORDER);
+    BuddyAllocator::<MMArch>::write_page(metadata, PageList::new(capacity, PhysAddr::new(0)));
+    for index in 0..capacity {
+        let address = if index + 1 == capacity {
+            metadata_source
+        } else {
+            foreign_address(foreign_base, 2 * index, target)
+        };
+        unsafe {
+            MMArch::write(
+                BuddyAllocator::<MMArch>::entry_virt_addr(metadata, index),
+                address,
+            )
+        };
+    }
+    allocator.set_free_area(zone, (MIN_ORDER + 1) as u8, metadata);
+    allocator.set_empty_area(zone, (MIN_ORDER + 1) as u8, PhysAddr::new(0));
+    allocator.diagnostics.zones[zone.index()].free_blocks[1] = capacity;
+    allocator.adjust_free_pages(zone, 2 * capacity, true);
+    unsafe { allocator.free(target, PageFrameCount::new(4)) };
+    let mut budget = 16384;
+    let Ok(key) = allocator.begin_isolation(target, 1, &mut budget) else {
+        return false;
+    };
+    // Returning the outside half fills a full order with no spare metadata:
+    // one real two-page block becomes metadata plus an order-0 remainder.
+    let accounted = allocator.isolated_free_pages(&key) == 2
+        && allocator.free_area(zone, (MIN_ORDER + 1) as u8) == metadata_source
+        && allocator
+            .diagnostic_snapshot()
+            .free_pages
+            .iter()
+            .sum::<usize>()
+            == 2 * capacity + 1
+        && counts(&allocator);
+    let captured = allocator.capture_isolation(&key) == Some(target);
+    let outside = target + (2 << MIN_ORDER);
+    accounted
+        && captured
+        && allocator
+            .allocate_in_range(1, outside, outside + (2 << MIN_ORDER), &mut budget)
+            .is_ok_and(|block| block == Some(outside))
+        && counts(&allocator)
+}
+
 pub(crate) fn checks() -> Vec<(&'static str, bool)> {
     let Some((base, count)) = (unsafe {
         LockedFrameAllocator.allocate_below(
@@ -405,6 +606,11 @@ pub(crate) fn checks() -> Vec<(&'static str, bool)> {
     vec![
         ("buddy_compaction_split_capture", split_and_capture(base)),
         ("buddy_compaction_metadata_slots", many_metadata_slots(base)),
+        ("buddy_compaction_single_scan", large_single_scan(base)),
+        (
+            "buddy_compaction_split_metadata",
+            split_without_spare_metadata(base),
+        ),
         (
             "buddy_compaction_abort_stale",
             partial_abort_and_stale(base),

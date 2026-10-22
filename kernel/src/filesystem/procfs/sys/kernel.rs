@@ -186,6 +186,9 @@ impl CapLastCapFileOps {
 }
 
 impl FileOps for CapLastCapFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn supports_write_iter_flags(&self) -> bool {
         true
     }
@@ -221,6 +224,9 @@ impl ThreadsMaxFileOps {
 }
 
 impl FileOps for ThreadsMaxFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)
@@ -285,6 +291,9 @@ impl PidMaxFileOps {
 }
 
 impl FileOps for PidMaxFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)
@@ -398,6 +407,9 @@ impl UtsStringFileOps {
 }
 
 impl FileOps for UtsStringFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(Self::write_at_with_position)
     }
@@ -483,6 +495,9 @@ impl PrintkFileOps {
 }
 
 impl FileOps for PrintkFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)
@@ -539,6 +554,9 @@ impl OverflowIdFileOps {
 }
 
 impl FileOps for OverflowIdFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)

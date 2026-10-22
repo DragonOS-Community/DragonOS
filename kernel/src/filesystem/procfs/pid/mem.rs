@@ -55,6 +55,19 @@ impl MemFileOps {
 }
 
 impl FileOps for MemFileOps {
+    fn seek(
+        &self,
+        _position: &mut usize,
+        origin: &crate::driver::base::block::SeekFrom,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        use crate::driver::base::block::SeekFrom;
+        match origin {
+            SeekFrom::SeekSet(_) | SeekFrom::SeekCurrent(_) => None,
+            _ => Some(Err(SystemError::EINVAL)),
+        }
+    }
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)

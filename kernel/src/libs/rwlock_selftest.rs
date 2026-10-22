@@ -59,7 +59,10 @@ fn concurrent_reader_flood_writer_progress() -> bool {
 
     let lock = Arc::new(RwLock::new(0usize));
     let ready = Arc::new(Completion::new());
-    let start = Arc::new(Completion::new());
+    let registered = Arc::new(Completion::new());
+    let observed = Arc::new(Completion::new());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let pending_rejections = Arc::new(AtomicUsize::new(0));
     let writer_acquired = Arc::new(AtomicBool::new(false));
     let invalid_read = Arc::new(AtomicBool::new(false));
     let read_count = Arc::new(AtomicUsize::new(0));
@@ -68,22 +71,45 @@ fn concurrent_reader_flood_writer_progress() -> bool {
     for _ in 0..READER_THREADS {
         let lock = lock.clone();
         let ready = ready.clone();
-        let reader_start = start.clone();
+        let reader_registered = registered.clone();
+        let observed = observed.clone();
+        let reader_cancelled = cancelled.clone();
+        let pending_rejections = pending_rejections.clone();
         let writer_acquired = writer_acquired.clone();
         let invalid_read = invalid_read.clone();
         let read_count = read_count.clone();
         let closure = KernelThreadClosure::EmptyClosure((
             Box::new(move || {
+                // Establish a real reader before announcing readiness. No
+                // guard may survive a completion wait or scheduler call.
+                let initial = *lock.read();
+                if initial != 0 {
+                    invalid_read.store(true, Ordering::Release);
+                }
+                read_count.fetch_add(1, Ordering::Relaxed);
                 ready.complete();
-                if reader_start.wait_for_completion().is_err() {
+                let registration_ok = reader_registered.wait_for_completion().is_ok();
+                if reader_cancelled.load(Ordering::Acquire) {
                     return 1;
                 }
+                let rejected = lock.try_read().is_none();
+                if registration_ok && rejected {
+                    pending_rejections.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    invalid_read.store(true, Ordering::Release);
+                }
+                observed.complete();
+
+                // Keep failed admission observable and yield explicitly while
+                // the registered writer is waiting for the reader observations.
+                // No read guard may be carried across that scheduler call.
                 for iteration in 0..READS_PER_THREAD {
-                    let value = *lock.read();
-                    if value > 1 {
-                        invalid_read.store(true, Ordering::Release);
+                    if let Some(guard) = lock.try_read() {
+                        if *guard > 1 {
+                            invalid_read.store(true, Ordering::Release);
+                        }
+                        read_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    read_count.fetch_add(1, Ordering::Relaxed);
                     if writer_acquired.load(Ordering::Acquire) {
                         break;
                     }
@@ -91,14 +117,15 @@ fn concurrent_reader_flood_writer_progress() -> bool {
                         schedule(SchedMode::SM_NONE);
                     }
                 }
-                0
+                i32::from(!registration_ok)
             }),
             (),
         ));
         let Some(reader) =
             KernelThreadMechanism::create_and_run(closure, "rwlock-reader-flood-selftest".into())
         else {
-            start.complete_all();
+            cancelled.store(true, Ordering::Release);
+            registered.complete_all();
             for reader in &readers {
                 let _ = KernelThreadMechanism::stop(reader);
             }
@@ -109,18 +136,44 @@ fn concurrent_reader_flood_writer_progress() -> bool {
 
     let writer_lock = lock.clone();
     let writer_ready = ready.clone();
-    let writer_start = start.clone();
+    let writer_registered = registered.clone();
+    let writer_observed = observed.clone();
+    let writer_cancelled = cancelled.clone();
     let writer_done = writer_acquired.clone();
     let writer_closure = KernelThreadClosure::EmptyClosure((
         Box::new(move || {
-            writer_ready.complete();
-            if writer_start.wait_for_completion().is_err() {
+            let mut stages_ok = true;
+            for _ in 0..READER_THREADS {
+                stages_ok &= writer_ready.wait_for_completion().is_ok();
+            }
+            if !stages_ok || writer_cancelled.load(Ordering::Acquire) {
+                writer_cancelled.store(true, Ordering::Release);
+                writer_registered.complete_all();
                 return 1;
             }
-            let mut guard = writer_lock.write();
-            *guard = 1;
-            writer_done.store(true, Ordering::Release);
-            0
+            let Ok(ticket) = writer_lock.register_waiting_writer() else {
+                writer_cancelled.store(true, Ordering::Release);
+                writer_registered.complete_all();
+                return 1;
+            };
+            writer_registered.complete_all();
+            for _ in 0..READER_THREADS {
+                stages_ok &= writer_observed.wait_for_completion().is_ok();
+            }
+            // Once registered, every exit must consume and finish this turn.
+            // Failed try-locks restore preemption before yielding.
+            loop {
+                if writer_lock.writer_turn(ticket) {
+                    if let Some(mut guard) = try_write_registered(&writer_lock) {
+                        writer_lock.finish_writer_turn(ticket);
+                        *guard = 1;
+                        writer_done.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                schedule(SchedMode::SM_NONE);
+            }
+            i32::from(!stages_ok)
         }),
         (),
     ));
@@ -128,32 +181,41 @@ fn concurrent_reader_flood_writer_progress() -> bool {
         writer_closure,
         "rwlock-writer-progress-selftest".into(),
     ) else {
-        start.complete_all();
+        cancelled.store(true, Ordering::Release);
+        registered.complete_all();
         for reader in &readers {
             let _ = KernelThreadMechanism::stop(reader);
         }
         return false;
     };
 
-    let mut all_ready = true;
-    for _ in 0..=READER_THREADS {
-        all_ready &= ready.wait_for_completion().is_ok();
+    // stop() may prevent a not-yet-started closure from running. Wait until
+    // the writer has started and published registration (or cancellation).
+    let registration_published = registered.wait_for_completion().is_ok();
+    if !registration_published {
+        cancelled.store(true, Ordering::Release);
+        ready.complete_all();
+        registered.complete_all();
+        observed.complete_all();
     }
-    start.complete_all();
-
-    let writer_stopped = KernelThreadMechanism::stop(&writer).is_ok();
-    let readers_stopped = readers
-        .iter()
-        .all(|reader| KernelThreadMechanism::stop(reader).is_ok());
+    let writer_stopped = matches!(KernelThreadMechanism::stop(&writer), Ok(0));
+    let mut readers_stopped = true;
+    for reader in &readers {
+        readers_stopped &= matches!(KernelThreadMechanism::stop(reader), Ok(0));
+    }
     let final_value = *lock.read();
 
-    all_ready
+    registration_published
+        && !cancelled.load(Ordering::Acquire)
         && writer_stopped
         && readers_stopped
+        && pending_rejections.load(Ordering::Acquire) == READER_THREADS
         && writer_acquired.load(Ordering::Acquire)
-        && read_count.load(Ordering::Acquire) != 0
-        && read_count.load(Ordering::Acquire) < READER_THREADS * READS_PER_THREAD
+        && read_count.load(Ordering::Acquire) >= READER_THREADS
         && !invalid_read.load(Ordering::Acquire)
+        && lock.lock.load(Ordering::Acquire) == 0
+        && lock.writer_tickets.next.load(Ordering::Acquire)
+            == lock.writer_tickets.serving.load(Ordering::Acquire)
         && final_value == 1
 }
 

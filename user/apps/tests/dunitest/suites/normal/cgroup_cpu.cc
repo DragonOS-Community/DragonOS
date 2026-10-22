@@ -73,7 +73,12 @@ struct Sample {
 // or an assertion failure. Its own safety deadline is independent of CPU time.
 class BusyWorker {
  public:
-  BusyWorker(const std::string& group, unsigned workers, int cpu) {
+  BusyWorker(const std::string& group, unsigned workers, int cpu,
+             uint64_t cpu_slice_ns = 0) {
+    if (cpu_slice_ns != 0 && workers != 1) {
+      ADD_FAILURE() << "A self-stopping CPU slice requires one worker";
+      return;
+    }
     int gate[2];
     if (pipe(gate) != 0) {
       ADD_FAILURE() << strerror(errno);
@@ -91,17 +96,30 @@ class BusyWorker {
       close(gate[0]);
       if (count != 1) _exit(3);
       if (sched_setaffinity(0, sizeof(mask), &mask) != 0) _exit(2);
-      const uint64_t end = Clock(CLOCK_MONOTONIC) + 10000000000ULL;
-      auto busy = [end]() {
+      auto checked_clock = [](clockid_t id) {
+        timespec value{};
+        if (clock_gettime(id, &value) != 0) _exit(4);
+        return uint64_t(value.tv_sec) * 1000000000ULL + value.tv_nsec;
+      };
+      const uint64_t end = checked_clock(CLOCK_MONOTONIC) + 10000000000ULL;
+      auto busy = [end, cpu_slice_ns, checked_clock]() {
+        const uint64_t start_cpu = cpu_slice_ns ? checked_clock(CLOCK_THREAD_CPUTIME_ID) : 0;
         volatile unsigned long work = 0;
-        do {
+        for (;;) {
           for (unsigned i = 0; i < 10000; ++i) work = work * 33 + i;
-        } while (Clock(CLOCK_MONOTONIC) < end);
+          if (checked_clock(CLOCK_MONOTONIC) >= end) return cpu_slice_ns == 0;
+          if (cpu_slice_ns &&
+              checked_clock(CLOCK_THREAD_CPUTIME_ID) - start_cpu >= cpu_slice_ns) return true;
+        }
       };
       std::vector<std::thread> threads;
       for (unsigned i = 1; i < workers; ++i) threads.emplace_back(busy);
-      busy();
+      const bool completed = busy();
       for (auto& thread : threads) thread.join();
+      if (!completed) _exit(4);
+      // A bounded probe stops itself before the parent can add scheduling
+      // latency to its CPU workload. Ordinary workers remain parent-controlled.
+      if (cpu_slice_ns && raise(SIGSTOP) != 0) _exit(5);
       _exit(0);
     }
     close(gate[0]);
@@ -124,12 +142,26 @@ class BusyWorker {
 
   bool Pause() {
     if (pid_ <= 0 || kill(pid_, SIGSTOP) != 0) return false;
+    return WaitPaused();
+  }
+
+  bool WaitPaused() {
+    if (pid_ <= 0) return false;
     const uint64_t deadline = Clock(CLOCK_MONOTONIC) + 1000000000ULL;
     do {
       int status;
       pid_t result = waitpid(pid_, &status, WUNTRACED | WNOHANG);
-      if (result == pid_) return WIFSTOPPED(status);
-      if (result < 0 && errno != EINTR) return false;
+      if (result == pid_) {
+        if (WIFSTOPPED(status)) return true;
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+          pid_ = -1;
+          return false;
+        }
+      }
+      if (result < 0 && errno != EINTR) {
+        if (errno == ECHILD) pid_ = -1;
+        return false;
+      }
       usleep(1000);
     } while (Clock(CLOCK_MONOTONIC) < deadline);
     return false;
@@ -156,6 +188,20 @@ class BusyWorker {
  private:
   pid_t pid_ = -1;
 };
+
+// Burst accounting is committed by the production period refill, including
+// when the worker has already stopped. Read a post-refill snapshot.
+std::string WaitForCpuPeriod(const std::string& group, uint64_t previous) {
+  const uint64_t deadline = Clock(CLOCK_MONOTONIC) + 600000000ULL;
+  std::string snapshot;
+  do {
+    snapshot = Read(group + "/cpu.stat");
+    const uint64_t period = Stat(snapshot, "nr_periods");
+    if (period != UINT64_MAX && period > previous) return snapshot;
+    usleep(1000);
+  } while (Clock(CLOCK_MONOTONIC) < deadline);
+  return snapshot;
+}
 
 class CgroupCpuTest : public ::testing::Test {
  protected:
@@ -641,21 +687,15 @@ TEST_F(CgroupCpuTest, BurstAccumulatesIdleCreditAndRecordsActualConsumption) {
   for (unsigned round = 0; round < 2; ++round) {
     // Cover the idle timer shutdown interval to build a full credit bank.
     usleep(700000);
-    // Restart the production period event with a short runnable pulse, then
-    // observe its next refill while stopped. The actual burst sample starts
-    // just after that boundary; it cannot borrow from two ordinary quotas.
+    // Restart the production timer, then let it refill the idle bank.
+    // Keep this credit-building worker stopped throughout the actual probe.
     ASSERT_TRUE(worker.Resume());
     usleep(10000);
     ASSERT_TRUE(worker.Pause());
     uint64_t period_before = Stat(Read(node_ + "/cpu.stat"), "nr_periods");
     ASSERT_NE(UINT64_MAX, period_before);
-    uint64_t period = period_before;
-    uint64_t boundary_deadline = Clock(CLOCK_MONOTONIC) + 600000000ULL;
-    do {
-      period = Stat(Read(node_ + "/cpu.stat"), "nr_periods");
-      if (period != UINT64_MAX && period > period_before) break;
-      usleep(1000);
-    } while (Clock(CLOCK_MONOTONIC) < boundary_deadline);
+    std::string boundary = WaitForCpuPeriod(node_, period_before);
+    uint64_t period = Stat(boundary, "nr_periods");
     ASSERT_NE(UINT64_MAX, period);
     ASSERT_GT(period, period_before) << "idle/runnable pulse did not arm a period event";
     uint64_t usage_before = Usage(node_);
@@ -664,26 +704,61 @@ TEST_F(CgroupCpuTest, BurstAccumulatesIdleCreditAndRecordsActualConsumption) {
     uint64_t burst_time_before = Stat(before, "burst_usec");
     ASSERT_NE(UINT64_MAX, bursts_before);
     ASSERT_NE(UINT64_MAX, burst_time_before);
-    ASSERT_TRUE(worker.Resume());
-    usleep(90000);
-    ASSERT_TRUE(worker.Pause());
+    BusyWorker probe(node_, 1, cpu, 90000000ULL);
+    ASSERT_GT(probe.pid(), 0);
+    ASSERT_TRUE(probe.WaitPaused());
     uint64_t consumed = Usage(node_) - usage_before;
-    EXPECT_EQ(period, Stat(Read(node_ + "/cpu.stat"), "nr_periods"))
-        << "burst measurement crossed an ordinary quota refill";
-    std::printf("CPU_BURST round=%u usage_usec=%llu\n", round,
-                static_cast<unsigned long long>(consumed));
-    // Without accumulated burst a 50ms quota cannot sustain this interval.
+    std::string stopped = Read(node_ + "/cpu.stat");
+    uint64_t stopped_period = Stat(stopped, "nr_periods");
+    ASSERT_NE(UINT64_MAX, stopped_period);
+    std::printf("CPU_BURST round=%u usage_usec=%llu periods=%llu->%llu\n", round,
+                static_cast<unsigned long long>(consumed),
+                static_cast<unsigned long long>(period),
+                static_cast<unsigned long long>(stopped_period));
     EXPECT_GT(consumed, 70000U);
     EXPECT_LT(consumed, 115000U);
-    usleep(300000);
-    std::string after = Read(node_ + "/cpu.stat");
+    std::string after = WaitForCpuPeriod(node_, stopped_period);
+    uint64_t after_period = Stat(after, "nr_periods");
+    ASSERT_NE(UINT64_MAX, after_period);
+    ASSERT_GT(after_period, stopped_period);
     uint64_t bursts_after = Stat(after, "nr_bursts");
     uint64_t burst_time_after = Stat(after, "burst_usec");
     ASSERT_NE(UINT64_MAX, bursts_after);
     ASSERT_NE(UINT64_MAX, burst_time_after);
+    // CPU time alone may span ordinary quota refills. These production
+    // counters prove that accumulated burst credit was actually consumed.
     EXPECT_GT(bursts_after, bursts_before);
-    EXPECT_GT(burst_time_after, burst_time_before + 20000U);
+    ASSERT_GE(burst_time_after, burst_time_before);
+    EXPECT_GT(burst_time_after - burst_time_before, 20000U);
   }
+}
+
+TEST_F(CgroupCpuTest, OrdinaryQuotaRefillsDoNotReportBurstConsumption) {
+  ASSERT_EQ(0, Write(node_ + "/cpu.max", "50000 200000"));
+  ASSERT_EQ(0, Write(node_ + "/cpu.max.burst", "0"));
+  int cpu = OneCpu(); ASSERT_GE(cpu, 0);
+  std::string before = Read(node_ + "/cpu.stat");
+  uint64_t period_before = Stat(before, "nr_periods");
+  ASSERT_NE(UINT64_MAX, period_before);
+  ASSERT_EQ(0U, Stat(before, "nr_bursts"));
+  ASSERT_EQ(0U, Stat(before, "burst_usec"));
+  uint64_t usage_before = Usage(node_);
+  BusyWorker probe(node_, 1, cpu, 90000000ULL);
+  ASSERT_GT(probe.pid(), 0);
+  ASSERT_TRUE(probe.WaitPaused());
+  uint64_t consumed = Usage(node_) - usage_before;
+  EXPECT_GT(consumed, 70000U);
+  EXPECT_LT(consumed, 115000U);
+  uint64_t stopped_period = Stat(Read(node_ + "/cpu.stat"), "nr_periods");
+  ASSERT_NE(UINT64_MAX, stopped_period);
+  EXPECT_GT(stopped_period, period_before)
+      << "a 90ms CPU workload needs an ordinary refill of its 50ms quota";
+  std::string after = WaitForCpuPeriod(node_, stopped_period);
+  uint64_t after_period = Stat(after, "nr_periods");
+  ASSERT_NE(UINT64_MAX, after_period);
+  ASSERT_GT(after_period, stopped_period);
+  EXPECT_EQ(0U, Stat(after, "nr_bursts"));
+  EXPECT_EQ(0U, Stat(after, "burst_usec"));
 }
 
 TEST_F(CgroupCpuTest, FiniteQuotaAndPeriodUpdatesResetRunningCredits) {

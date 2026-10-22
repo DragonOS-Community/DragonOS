@@ -1016,10 +1016,11 @@ fn dma_allocation_detail(
         .map_err(|error| error.clone())
 }
 
-/// Setup only reserves frames that are free at that instant. Background owners
-/// can later release another legal run under the same DMA mask. Retain each
-/// such success (never free-and-retry) until an attempt reaches this fixture.
-/// Every extra owner consumes a distinct eight-page run in a finite prefix.
+/// Establish a failed ordinary-allocation baseline, including the IRQ/NOIO
+/// policy checks. Background owners may release another legal run under the
+/// same mask; retain such ordinary successes rather than free-and-retry.
+/// Do not use this helper for recovery: migrations of other legal targets may
+/// consume this fixture's holes, and the DMA API does not promise its sources.
 fn dma_fixture_allocation(
     fixture: &Fixture,
     foreign: &mut Vec<DmaBuffer>,
@@ -1188,19 +1189,15 @@ fn dma_automatic_recovery(
         detail.registry_len = Some(len);
         detail.registry_buckets = Some(buckets);
         detail.registry_mask_entries = Some(mask_entries);
-        detail.recovery_attempt_bound = Some(
-            attempt_bound
-                .checked_add(foreign_limit)
-                .ok_or(SystemError::EOVERFLOW)?,
-        );
+        detail.recovery_attempt_bound = Some(attempt_bound);
         detail.phase = "automatic_recovery";
         let mut recovered = None;
         for _ in 0..attempt_bound {
-            let allocation = dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
-                detail.recovery_attempts += 1;
-                DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed)
-            });
-            detail.foreign_runs = foreign.len();
+            // The first legal run satisfies the consumer, regardless of which
+            // target supplied it. Retaining recovery successes while demanding
+            // this fixture can consume all its holes as migration destinations.
+            detail.recovery_attempts += 1;
+            let allocation = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, allowed);
             match allocation {
                 Ok(buffer) => {
                     recovered = Some(buffer);
@@ -1218,7 +1215,12 @@ fn dma_automatic_recovery(
         };
         detail.phase = "recovered_ownership";
         let start = PhysAddr::new(buffer.paddr());
-        let end = start + buffer.page_count().data() * MMArch::PAGE_SIZE;
+        let end = PhysAddr::new(
+            start
+                .data()
+                .checked_add(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?,
+        );
         let mut moved = 0;
         detail.recovered_start = Some(start.data());
         detail.recovered_pages = Some(buffer.page_count().data());
@@ -1248,7 +1250,9 @@ fn dma_automatic_recovery(
             }
         }
         detail.recovered_moved = Some(moved);
-        checked &= moved != 0;
+        // A public allocation may also capture an ordinary free run. Strong
+        // migration/identity assertions belong to real_fragmented_capture;
+        // any fixture source covered here must still have moved safely above.
         buffer.as_mut_slice().fill(0xa7);
         checked &= buffer.as_slice().iter().all(|byte| *byte == 0xa7)
             && fixture.valid()

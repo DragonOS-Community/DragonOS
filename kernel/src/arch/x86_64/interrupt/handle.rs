@@ -9,15 +9,8 @@ use crate::{
 
 use super::TrapFrame;
 
-/// IRQ 投递追踪：按外部中断向量计数（含 32 起的系统向量区）。
-/// 纯计数、无锁、无分配；楔死后由 host 侧 gdb 轮询本数组判断哪些向量停止投递。
-#[no_mangle]
-pub static IRQ_VECTOR_COUNTS: [core::sync::atomic::AtomicU64; 256] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 256];
-
 #[no_mangle]
 unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
-    IRQ_VECTOR_COUNTS[(vector as usize) & 0xff].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // swapgs
 
     if trap_frame.is_from_user() {

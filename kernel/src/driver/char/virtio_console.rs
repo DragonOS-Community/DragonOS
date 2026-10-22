@@ -297,72 +297,6 @@ impl Drop for DragonVirtIOConsole {
     }
 }
 
-/// 关键日志（error/warn/panic）的同步输出设备注册表。
-///
-/// printk 的 tty 路径经 outbuf 由 TX 中断驱动排水，在突发输出下会静默丢
-/// 字节——panic/error 的消息体因此经常只剩级别前缀。关键路径改由本通道
-/// 直接轮询完成环并同步提交，绕过背压丢弃。
-static CRITICAL_OUTPUT_DEVICE: SpinLock<Option<Weak<VirtIOConsoleDevice>>> = SpinLock::new(None);
-
-fn register_critical_output_device(dev: &Arc<VirtIOConsoleDevice>) {
-    *CRITICAL_OUTPUT_DEVICE.lock_irqsave() = Some(Arc::downgrade(dev));
-}
-
-/// 是否存在已注册的关键输出通道。
-pub fn critical_output_available() -> bool {
-    CRITICAL_OUTPUT_DEVICE
-        .lock_irqsave()
-        .as_ref()
-        .is_some_and(|weak| weak.upgrade().is_some())
-}
-
-/// 尽力而为的同步关键输出。
-///
-/// 逐块等待前一个 TX 块完成（直接轮询 used 环，不依赖中断），再提交下一
-/// 块。所有等待都有界：拿不到设备锁或设备无响应时丢弃剩余字节，绝不阻
-/// 塞、绝不递归打印——printk 关键路径不能因控制台而引入新的死锁。
-pub fn virtio_console_critical_output(bytes: &[u8]) {
-    let Some(dev) = CRITICAL_OUTPUT_DEVICE
-        .lock_irqsave()
-        .as_ref()
-        .and_then(Weak::upgrade)
-    else {
-        return;
-    };
-    // 设备锁可能正被正常输出/中断路径持有；短暂重试后放弃。
-    let mut inner = None;
-    for _ in 0..1024 {
-        if let Ok(guard) = dev.inner.try_lock_irqsave() {
-            inner = Some(guard);
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    let Some(mut inner) = inner else {
-        return;
-    };
-    for chunk in bytes.chunks(VIRTIO_CONSOLE_TX_CHUNK) {
-        let mut spins: u32 = 0;
-        loop {
-            if inner.device_inner.complete_tx().is_err() {
-                return;
-            }
-            if inner.device_inner.pending_tx_len() == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 8_000_000 {
-                // 设备长时间不完成（异常状态）：丢弃剩余，避免长期关中断自旋。
-                return;
-            }
-            core::hint::spin_loop();
-        }
-        if inner.device_inner.submit_tx(chunk).is_err() {
-            return;
-        }
-    }
-}
-
 pub fn virtio_console(
     transport: VirtIOTransport,
     dev_id: Arc<DeviceId>,
@@ -390,7 +324,6 @@ pub fn virtio_console(
             return;
         }
     }
-    register_critical_output_device(&device);
     virtio_device_manager()
         .device_add(device.clone() as Arc<dyn VirtIODevice>)
         .expect("Add virtio console failed");
@@ -521,13 +454,6 @@ impl VirtIOConsoleDevice {
             };
 
             if tty_input_target_room(&target) == 0 {
-                // 控制台积压（tty 队列满）：输入无人消费，普通字节直接丢弃，
-                // 但热键 'D' 必须放行——积压正是需要任务转储的场景。
-                while let Ok(Some(c)) = inner.device_inner.recv(false) {
-                    if c == b'D' {
-                        crate::debug::task_dump::dump_all_tasks();
-                    }
-                }
                 inner.input_rx_paused = true;
                 break;
             }
@@ -543,14 +469,6 @@ impl VirtIOConsoleDevice {
                     return Err(virtio_drivers_error_to_system_error(err));
                 }
             };
-
-            // 调试热键：收到 'D'(0x44) 时无条件转储全部任务状态（关键通道）。
-            // 必须在 enqueue 之前检查：控制台积压时 tty 队列满，enqueue 失败
-            // 走 break 分支，热键将永不可达——而这恰是最需要转储的场景
-            // （dockerd B+ 阻塞取证实测触发失败）。
-            if c == b'D' {
-                crate::debug::task_dump::dump_all_tasks();
-            }
 
             if enqueue_tty_rx_to_target_from_irq(&target, &[c]) != 1 {
                 inner.input_rx_paused = true;

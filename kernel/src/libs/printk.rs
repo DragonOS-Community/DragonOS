@@ -25,18 +25,6 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
-/// 关键路径打印：绕过 tty 背压，直接同步送入控制台设备。
-#[macro_export]
-macro_rules! print_critical {
-    ($($arg:tt)*) => ($crate::libs::printk::__printk_critical(format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! println_critical {
-    () => ($crate::print_critical!("\n"));
-    ($($arg:tt)*) => ($crate::print_critical!("{}\n", format_args!($($arg)*)));
-}
-
 pub struct PrintkWriter;
 
 impl PrintkWriter {
@@ -118,33 +106,6 @@ impl Write for BoundedLogRecord {
     }
 }
 
-/// 关键路径写入器：优先使用不受 tty 背压影响的同步控制台通道；
-/// 通道不存在（如 virtio-console 尚未探测、或使用其他控制台）时退回
-/// 普通 printk 路径。用于 error/warn/panic 输出，保证消息体不被丢弃。
-pub struct CriticalPrintkWriter;
-
-impl CriticalPrintkWriter {
-    pub fn write_critical_string(&mut self, s: &str) {
-        if crate::driver::char::virtio_console::critical_output_available() {
-            crate::driver::char::virtio_console::virtio_console_critical_output(s.as_bytes());
-        } else {
-            PrintkWriter.__write_string(s);
-        }
-    }
-}
-
-impl fmt::Write for CriticalPrintkWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.write_critical_string(s);
-        Ok(())
-    }
-}
-
-#[doc(hidden)]
-pub fn __printk_critical(args: fmt::Arguments) {
-    CriticalPrintkWriter.write_fmt(args).ok();
-}
-
 pub struct Logger;
 
 impl Logger {
@@ -180,10 +141,10 @@ impl Logger {
         if unsafe { KMSG.is_some() } {
             let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
 
-            // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
-            // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 
+            // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
+            // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。
             let evicted = unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
             drop(evicted);
         }
@@ -203,10 +164,10 @@ impl Log for KernelLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            // 先输出到控制台再记录 kmsg：记录路径（锁+缓冲驱逐）一旦
-            // 异常，现场仍然已经上了串口，不会被记录路径吞掉。
-            Self::iodisplay(record);
+            // 记录到 kmsg 缓冲区
             Self::kernel_log(record);
+            // 输出到控制台
+            Self::iodisplay(record)
         }
     }
 
@@ -217,25 +178,18 @@ impl Log for KernelLogger {
 
 impl KernelLogger {
     fn iodisplay(record: &log::Record) {
-        // Error/Warn 走关键同步通道：消息体不得被 tty 背压丢弃，否则
-        // panic/IO 错误只剩级别前缀，现场无法排障。关键路径经
-        // CriticalPrintkWriter 流式输出，不额外分配内存。
-        if matches!(record.level(), Level::Error | Level::Warn) {
-            let prefix = if matches!(record.level(), Level::Error) {
-                "\x1B[41m[ ERROR ] \x1B[0m"
-            } else {
-                "\x1B[1;33m[ WARN ] \x1B[0m"
-            };
-            CriticalPrintkWriter.write_critical_string(prefix);
-            let _ = CriticalPrintkWriter.write_fmt(format_args!(
-                "({}:{})\t {}\n",
-                record.file().unwrap_or(""),
-                record.line().unwrap_or(0),
-                record.args()
-            ));
-            return;
+        match record.level() {
+            Level::Debug | Level::Info | Level::Trace => {
+                write!(PrintkWriter, "[ {} ] ", record.level(),)
+            }
+            Level::Error => {
+                write!(PrintkWriter, "\x1B[41m[ ERROR ] \x1B[0m",)
+            }
+            Level::Warn => {
+                write!(PrintkWriter, "\x1B[1;33m[ WARN ] \x1B[0m",)
+            }
         }
-        write!(PrintkWriter, "[ {} ] ", record.level(),).unwrap();
+        .unwrap();
         writeln!(
             PrintkWriter,
             "({}:{})\t {}",

@@ -4,12 +4,11 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{
     alloc::AllocError,
     fmt::Debug,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[path = "deadline_queue.rs"]
 mod queue;
-use log::warn;
 use queue::{DeadlineQueue, Node};
 use system_error::SystemError;
 
@@ -23,9 +22,6 @@ use crate::{
 };
 
 const TICK_NS: u64 = 1_000_000_000 / HZ;
-/// 每 CPU 见过的最大 now_ns（单调钟倒走检测）。
-static LAST_NOW: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
-    [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
 const MAX_CALLBACKS: usize = 32;
 static CONTINUOUS: AtomicBool = AtomicBool::new(false);
 static CAPABLE: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
@@ -278,28 +274,7 @@ pub fn handle_irq(frame: &TrapFrame) {
     let tick = {
         let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
         let now = now_ns();
-        // 时钟倒走检测：now 比本 CPU 见过的最大值倒退超过一个 tick，
-        // 说明单调钟正在持续回退（如 KVM 负载下 pvclock 倒走）。此时
-        // next_tick（按旧时刻排的）相对 now 恒在“未来”，正常分支与远期
-        // 重锚分支都覆盖不了“next_tick 合理而 now 在退”的形态。以当前
-        // （倒走中的）now 重锚并继续服务 tick，保证 jiffies 与 timer
-        // wheel 在时钟源切换（watchdog 强制重选）落地前保持存活。
-        let last = LAST_NOW[cpu.data() as usize].load(Ordering::Relaxed);
-        let regressed = now.saturating_add(TICK_NS) < last;
-        LAST_NOW[cpu.data() as usize].store(now.max(last), Ordering::Relaxed);
-        if regressed {
-            warn!(
-                "deadline tick on cpu{}: monotonic clock regressed (now={}, last={}); re-anchoring",
-                cpu.data(),
-                now,
-                last
-            );
-            // 双路唤醒保障：delta 守卫路径之外，deadline 层（本层在风暴中
-            // 实测仍在运行）直接唤醒 clocksource watchdog 执行强制重选。
-            crate::time::clocksource::run_watchdog_kthread();
-            queue.next_tick = now.saturating_add(TICK_NS);
-            true
-        } else if fallback {
+        if fallback {
             true
         } else if now >= queue.next_tick {
             // Tick classification is sampled once, not guessed for the missed
@@ -308,21 +283,6 @@ pub fn handle_irq(frame: &TrapFrame) {
             queue.next_tick = queue
                 .next_tick
                 .saturating_add(periods.saturating_mul(TICK_NS));
-            true
-        } else if queue.next_tick > now.saturating_add(TICK_NS) {
-            // 正常路径下每次服务后 next_tick 总落在 (now, now+TICK_NS] 内，
-            // 出现远期期限只能是单调时钟读数异常（一次前跳读数）留下的过期
-            // 绝对期限。继续等待会以 u32::MAX 计数反复重编 one-shot，tick
-            // 永停（jiffies 冻结、timer wheel 全灭）。对标 Linux
-            // tick_sched_timer/hrtimer_forward(now, period) 的锚定语义：以
-            // 当前时间为锚点重新排程并立即服务一个 tick。
-            warn!(
-                "deadline tick on cpu{}: stale next_tick {}ns is far beyond now {}ns; re-anchoring",
-                cpu.data(),
-                queue.next_tick,
-                now
-            );
-            queue.next_tick = now.saturating_add(TICK_NS);
             true
         } else {
             false

@@ -807,19 +807,8 @@ impl Serial8250PIOPort {
         // Linux serial8250_rx_chars also keeps a 256-byte bound to avoid
         // unbounded RX IRQ/softirq CPU occupation.
         let mut received = 0;
-        // 调试热键 'D'（与 virtio_console.rs 的热键等价）：本平台 stdin 经
-        // QEMU mux 路由到 8250 串口（非 virtconsole），任务转储热键必须
-        // 装在此处。字节经 producer 拉取，闭包捕获后统一判定，保证 tty
-        // 积压（NoRoom）时热键依然可达——那正是需要转储的场景。
-        let mut last_byte: Option<u8> = None;
         for _ in 0..SERIAL_8250_RX_IRQ_LIMIT {
-            let mut producer = || {
-                let b = self.read_one_byte();
-                if b.is_some() {
-                    last_byte = b;
-                }
-                b
-            };
+            let mut producer = || self.read_one_byte();
             match enqueue_tty_rx_byte_to_target_from_irq(&target, &mut producer) {
                 TtyInputByteResult::Enqueued => {
                     received += 1;
@@ -834,9 +823,6 @@ impl Serial8250PIOPort {
                     break;
                 }
             }
-        }
-        if last_byte == Some(b'D') {
-            crate::debug::task_dump::dump_all_tasks();
         }
         if received == SERIAL_8250_RX_IRQ_LIMIT {
             self.pause_rx_locked(&mut rx_state);

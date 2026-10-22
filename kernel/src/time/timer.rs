@@ -23,7 +23,11 @@ use crate::{
     sched::{schedule, SchedMode},
 };
 
-use super::{jiffies::NSEC_PER_JIFFY, timekeeping::update_wall_time};
+use super::{
+    absolute_timer::{self, AbsoluteClock},
+    jiffies::NSEC_PER_JIFFY,
+    timekeeping::update_wall_time,
+};
 
 const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
@@ -257,25 +261,29 @@ impl SoftirqVec for DoTimerSoftirq {
             return;
         }
         super::clocksource::run_due_watchdog();
-        // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
-        for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
-            // debug!("DoTimerSoftirq run");
-            let timer_list = TIMER_LIST.try_lock_irqsave();
-            if timer_list.is_err() {
-                continue;
-            }
-            let mut timer_list = timer_list.unwrap();
-
-            let Some(timer_list_front) =
-                pop_expired(&mut timer_list, TIMER_JIFFIES.load(Ordering::SeqCst))
-            else {
-                break;
+        // Round-robin all three domains. An empty ordinary queue must not
+        // suppress absolute timers, and one busy domain must not starve others.
+        let mut completed = 0;
+        let mut idle = 0;
+        let mut domain = 0;
+        while completed < TIMER_RUN_CYCLE_THRESHOLD && idle < 3 {
+            let ran = match domain {
+                0 => run_one_jiffies_timer(),
+                1 => absolute_timer::run_one_due(AbsoluteClock::Monotonic),
+                _ => absolute_timer::run_one_due(AbsoluteClock::Realtime),
             };
-            drop(timer_list);
-            timer_list_front.run();
+            domain = (domain + 1) % 3;
+            if ran {
+                completed += 1;
+                idle = 0;
+            } else {
+                idle += 1;
+            }
         }
-
         self.clear_run();
+        if completed == TIMER_RUN_CYCLE_THRESHOLD {
+            try_raise_timer_softirq();
+        }
     }
 }
 
@@ -300,7 +308,7 @@ pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
     relative_timer_jiffies(clock(), u128::from(expire_us) * 1_000)
 }
 
-fn relative_timer_jiffies(now: u64, duration_ns: u128) -> u64 {
+pub(super) fn relative_timer_jiffies(now: u64, duration_ns: u128) -> u64 {
     if duration_ns == 0 {
         return now;
     }
@@ -364,7 +372,45 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
 /// Return the earliest deadline, distinguishing an empty queue from deadline 0.
 /// Contention remains bounded because the caller runs in timer IRQ context.
 pub fn timer_get_first_expire() -> Result<Option<u64>, SystemError> {
-    first_expire_in(&TIMER_LIST)
+    earliest_expire([
+        first_expire_in(&TIMER_LIST),
+        absolute_timer::first_expire(AbsoluteClock::Monotonic),
+        absolute_timer::first_expire(AbsoluteClock::Realtime),
+    ])
+}
+
+fn earliest_expire(
+    candidates: [Result<Option<u64>, SystemError>; 3],
+) -> Result<Option<u64>, SystemError> {
+    let mut earliest: Option<u64> = None;
+    let mut contended = false;
+    for candidate in candidates {
+        match candidate {
+            Ok(Some(deadline)) => {
+                earliest = Some(earliest.map_or(deadline, |old| old.min(deadline)));
+            }
+            Ok(None) => {}
+            Err(_) => contended = true,
+        }
+    }
+    if earliest.is_none() && contended {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    } else {
+        Ok(earliest)
+    }
+}
+
+fn run_one_jiffies_timer() -> bool {
+    let Ok(mut queue) = TIMER_LIST.try_lock_irqsave() else {
+        return false;
+    };
+    let timer = pop_expired(&mut queue, clock());
+    drop(queue);
+    let Some(timer) = timer else {
+        return false;
+    };
+    timer.run();
+    true
 }
 
 fn first_expire_in(
@@ -456,6 +502,16 @@ pub(crate) fn heap_denied_activation_selftest() -> Result<bool, SystemError> {
 /// No production queue membership, jiffies, pending bits or callbacks are changed.
 #[cfg(feature = "mm_selftest")]
 pub(crate) fn queue_frontier_selftest() -> Result<bool, SystemError> {
+    if earliest_expire([Ok(None), Ok(None), Ok(Some(0))]) != Ok(Some(0))
+        || earliest_expire([
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            Ok(Some(0)),
+            Ok(None),
+        ]) != Ok(Some(0))
+        || !absolute_timer::queue_selftest()?
+    {
+        return Ok(false);
+    }
     #[derive(Debug)]
     struct Noop;
     impl TimerFunction for Noop {

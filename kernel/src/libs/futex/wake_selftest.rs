@@ -131,9 +131,9 @@ fn requeue() -> Result<bool, SystemError> {
         let bucket = map.get_mut(&final_key).unwrap();
         let removed = pairs.iter().all(|(_, waker)| bucket.remove_by_waker(waker));
         // A PI owner, even without either waiter chain, keeps its bucket live.
-        bucket.pi_owner = 1;
+        bucket.pi_refs = 1;
         let pi_retained = FutexData::remove_empty_locked(&mut map, &final_key).is_none();
-        map.get_mut(&final_key).unwrap().pi_owner = 0;
+        map.get_mut(&final_key).unwrap().pi_refs = 0;
         let last = FutexData::remove_empty_locked(&mut map, &final_key);
         same.0 == 2
             && same.1.is_none()

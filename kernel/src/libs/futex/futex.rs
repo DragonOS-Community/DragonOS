@@ -22,7 +22,7 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     libs::{
-        resource_wait::{ResourceMutex, ResourceMutexGuard},
+        resource_wait::{NonPreemptibleResourceGuard, ResourceMutex},
         spinlock::SpinLock,
         wait_queue::{Waiter, Waker},
     },
@@ -55,12 +55,18 @@ mod registration_selftest;
 static mut FUTEX_DATA: Option<FutexData> = None;
 
 pub struct FutexData {
-    data: ResourceMutex<HashMap<FutexKey, FutexHashBucket>>,
+    data: ResourceMutex<super::pi_futex::FutexRegistry>,
 }
 
 impl FutexData {
-    pub fn futex_map() -> ResourceMutexGuard<'static, HashMap<FutexKey, FutexHashBucket>> {
-        unsafe { ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data) }
+    pub(crate) fn futex_map() -> FutexRegistryGuard {
+        FutexRegistryGuard(Some(unsafe {
+            NonPreemptibleResourceGuard::lock(&FUTEX_DATA.as_ref().unwrap().data)
+        }))
+    }
+
+    pub(crate) fn initialized() -> bool {
+        unsafe { FUTEX_DATA.is_some() }
     }
 
     pub(super) fn remove_empty_locked(
@@ -75,10 +81,32 @@ impl FutexData {
     }
 
     pub fn try_remove(key: &FutexKey) -> Option<FutexHashBucket> {
-        unsafe {
-            let mut guard = ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data);
-            return Self::remove_empty_locked(&mut guard, key);
-        }
+        Self::remove_empty_locked(&mut Self::futex_map(), key)
+    }
+}
+
+/// Registry entries retired in a transaction keep tasks pinned until after the
+/// mutex and its preemption guard have been released.
+pub(crate) struct FutexRegistryGuard(
+    Option<NonPreemptibleResourceGuard<'static, super::pi_futex::FutexRegistry>>,
+);
+impl Deref for FutexRegistryGuard {
+    type Target = super::pi_futex::FutexRegistry;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl DerefMut for FutexRegistryGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for FutexRegistryGuard {
+    fn drop(&mut self) {
+        let retired =
+            core::mem::replace(&mut self.0.as_mut().unwrap().retired, WaitQueueNodes::new());
+        drop(self.0.take());
+        drop(retired);
     }
 }
 
@@ -89,7 +117,9 @@ pub struct FutexHashBucket {
     // 该futex维护的等待队列
     pub(super) chain: WaitQueueNodes<Arc<FutexObj>>,
     // PI futex state
-    pub(super) pi_owner: u32,
+    pub(super) pi_owner: Option<Arc<ProcessControlBlock>>,
+    pub(super) pi_refs: usize,
+    pub(super) pi_top: Option<(usize, i32)>,
     pub(super) pi_waiters: WaitQueueNodes<Arc<super::pi_futex::PiWaiter>>,
 }
 
@@ -97,13 +127,18 @@ impl FutexHashBucket {
     pub fn new() -> Self {
         Self {
             chain: WaitQueueNodes::new(),
-            pi_owner: 0,
+            pi_owner: None,
+            pi_refs: 0,
+            pi_top: None,
             pi_waiters: WaitQueueNodes::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.chain.is_empty() && self.pi_waiters.is_empty() && self.pi_owner == 0
+        self.chain.is_empty()
+            && self.pi_waiters.is_empty()
+            && self.pi_owner.is_none()
+            && self.pi_refs == 0
     }
 
     #[cfg(feature = "mm_selftest")]
@@ -122,6 +157,9 @@ impl FutexHashBucket {
         bitset: Option<u32>,
         nr_wake: u32,
     ) -> Result<usize, SystemError> {
+        if self.pi_refs != 0 {
+            return Err(SystemError::EINVAL);
+        }
         let mut count = 0;
         // Keep only the visited prefix separately. Stop at the wake budget,
         // then splice the untouched suffix back in O(1), preserving FIFO and
@@ -258,7 +296,7 @@ impl Futex {
     pub fn init() {
         unsafe {
             FUTEX_DATA = Some(FutexData {
-                data: ResourceMutex::new(HashMap::new()),
+                data: ResourceMutex::new(super::pi_futex::FutexRegistry::new()),
             })
         };
     }
@@ -469,6 +507,12 @@ impl Futex {
                 .try_reserve(1)
                 .map_err(|_| SystemError::ENOMEM)?;
         }
+        if futex_map_guard
+            .get(&key)
+            .is_some_and(|bucket| bucket.pi_refs != 0)
+        {
+            return Err(SystemError::EINVAL);
+        }
         *futex_q.key.lock() = key.clone();
         futex_map_guard
             .entry(key)
@@ -675,6 +719,9 @@ impl Futex {
         let Some(source) = map.get(key1) else {
             return Ok((0, None));
         };
+        if source.pi_refs != 0 || map.get(key2).is_some_and(|bucket| bucket.pi_refs != 0) {
+            return Err(SystemError::EINVAL);
+        }
         // Reserve before waking anyone: ENOMEM must leave all waiters intact.
         let may_move = nr_requeue > 0 && source.chain.len() > nr_wake;
         if key1 != key2 && may_move && !map.contains_key(key2) {
@@ -758,7 +805,7 @@ impl Futex {
     pub(super) fn get_futex_key(
         uaddr: VirtAddr,
         fshared: bool,
-        _access: FutexAccess,
+        access: FutexAccess,
     ) -> Result<FutexKey, SystemError> {
         let mut address = uaddr.data();
 
@@ -768,6 +815,8 @@ impl Futex {
         if uaddr.data() & (core::mem::size_of::<u32>() - 1) != 0 {
             return Err(SystemError::EINVAL);
         }
+
+        access_ok(uaddr, core::mem::size_of::<u32>())?;
 
         // 目前address指向所在页面的起始地址
         address -= offset;
@@ -795,18 +844,30 @@ impl Futex {
         let vma = as_guard
             .mappings
             .contains(uaddr)
-            .ok_or(SystemError::EINVAL)?;
+            .ok_or(SystemError::EFAULT)?;
         let vma_guard = vma.lock();
+        if matches!(access, FutexAccess::FutexWrite)
+            && !vma_guard.vm_flags().contains(VmFlags::VM_WRITE)
+        {
+            return Err(SystemError::EFAULT);
+        }
 
         // 页内索引（相对VMA起始地址）
         let page_index =
             ((uaddr.data() - vma_guard.region().start().data()) >> MMArch::PAGE_SHIFT) as u64;
 
+        if !vma_guard
+            .vm_flags()
+            .intersects(VmFlags::VM_READ | VmFlags::VM_WRITE)
+        {
+            return Err(SystemError::EFAULT);
+        }
         let file = vma_guard.vm_file();
         let anonymous_pages = file
             .as_ref()
             .is_some_and(|file| file.inode().mmap_uses_anonymous_pages());
-        if anonymous_pages && !vma_guard.vm_flags().contains(VmFlags::VM_WRITE) {
+        if (anonymous_pages || file.is_none()) && !vma_guard.vm_flags().contains(VmFlags::VM_WRITE)
+        {
             // Read-only anonymous pages cannot participate in shared futexes.
             // In particular, a retained /dev/zero file is not their identity.
             return Err(SystemError::EFAULT);
@@ -2053,124 +2114,18 @@ impl RobustListHead {
     /// 返回值：
     /// - Ok(true): 已处理为 PI futex
     /// - Ok(false): 不是 PI futex（或不需要处理）
-    fn handle_pi_futex_death(futex_uaddr: VirtAddr, pid: u32) -> Result<bool, SystemError> {
-        let futex_val = match Self::safe_read_u32(futex_uaddr) {
-            Some(val) => val,
-            None => return Err(SystemError::EFAULT),
-        };
-
-        let mut uval = futex_val;
-        let key_private = Futex::get_futex_key(futex_uaddr, false, FutexAccess::FutexWrite).ok();
-        let key_shared = Futex::get_futex_key(futex_uaddr, true, FutexAccess::FutexWrite).ok();
-
-        let key = {
-            let guard = FutexData::futex_map();
-            let mut chosen = None;
-            if let Some(k) = key_private.as_ref() {
-                if guard.get(k).is_some() {
-                    chosen = Some(k.clone());
-                }
-            }
-            if chosen.is_none() {
-                if let Some(k) = key_shared.as_ref() {
-                    if guard.get(k).is_some() {
-                        chosen = Some(k.clone());
-                    }
-                }
-            }
-            drop(guard);
-            chosen
-        };
-
+    fn handle_pi_futex_death(uaddr: VirtAddr, pid: u32) -> Result<bool, SystemError> {
+        // Robust userspace cleanup marks the word. The task lifecycle pass
+        // hands over every attached PI state, including non-robust locks.
         loop {
-            let owner = uval & FUTEX_TID_MASK;
-            if owner != pid {
+            let value = Futex::read_user_u32_nofault(uaddr)?;
+            if value & FUTEX_TID_MASK != pid {
                 return Ok(false);
             }
-
-            if let Some(ref key) = key {
-                let mut futex_map_guard = FutexData::futex_map();
-                let bucket = match futex_map_guard.get_mut(key) {
-                    Some(bucket) => bucket,
-                    None => {
-                        drop(futex_map_guard);
-                        let mval = FUTEX_OWNER_DIED;
-                        match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
-                            Ok(observed) if observed == uval => return Ok(true),
-                            Ok(observed) => {
-                                uval = observed;
-                                continue;
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
-                };
-
-                if bucket.pi_owner == 0 && bucket.pi_waiters.is_empty() {
-                    drop(futex_map_guard);
-                    return Ok(false);
-                }
-
-                if bucket.pi_waiters.is_empty() {
-                    let mval = FUTEX_OWNER_DIED;
-                    match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
-                        Ok(observed) if observed == uval => {
-                            bucket.pi_owner = 0;
-                            drop(futex_map_guard);
-                            FutexData::try_remove(key);
-                            return Ok(true);
-                        }
-                        Ok(observed) => {
-                            uval = observed;
-                            continue;
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-
-                let next_waiter = bucket.pi_waiters.front().cloned();
-                if let Some(next_waiter) = next_waiter {
-                    // Keep the list node until the user-word transition is
-                    // committed; a CAS retry must not allocate a replacement.
-                    let has_more = bucket.pi_waiters.len() > 1;
-                    let new_val = next_waiter.tid
-                        | FUTEX_OWNER_DIED
-                        | if has_more { FUTEX_WAITERS } else { 0 };
-                    match Futex::futex_cmpxchg_user(futex_uaddr, uval, new_val) {
-                        Ok(observed) if observed == uval => {
-                            let removed = bucket
-                                .pi_waiters
-                                .pop_node()
-                                .expect("observed PI waiter")
-                                .into_value();
-                            assert!(Arc::ptr_eq(&removed, &next_waiter));
-                            bucket.pi_owner = next_waiter.tid;
-                            next_waiter.hand_off(FUTEX_OWNER_DIED);
-                            drop(futex_map_guard);
-                            next_waiter.waker.wake();
-                            return Ok(true);
-                        }
-                        Ok(observed) => {
-                            drop(futex_map_guard);
-                            uval = observed;
-                            continue;
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-
-                drop(futex_map_guard);
-                continue;
-            }
-
-            let mval = FUTEX_OWNER_DIED;
-            match Futex::futex_cmpxchg_user(futex_uaddr, uval, mval) {
-                Ok(observed) if observed == uval => return Ok(true),
-                Ok(observed) => {
-                    uval = observed;
-                    continue;
-                }
-                Err(err) => return Err(err),
+            let desired = (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+            match Futex::futex_cmpxchg_user(uaddr, value, desired)? {
+                observed if observed == value => return Ok(true),
+                _ => continue,
             }
         }
     }

@@ -19,6 +19,10 @@ impl<T> Node<T> {
         self.value
     }
 
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
     pub(crate) fn value(&self) -> &T {
         &self.value
     }

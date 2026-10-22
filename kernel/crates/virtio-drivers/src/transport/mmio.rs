@@ -506,6 +506,6 @@ impl Transport for MmioTransport {
 impl Drop for MmioTransport {
     fn drop(&mut self) {
         // Reset the device when the transport is dropped.
-        self.set_status(DeviceStatus::empty())
+        let _ = self.reset();
     }
 }

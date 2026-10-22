@@ -53,6 +53,11 @@ enum SchedulerUpdate {
     Nice {
         nice: i32,
     },
+    /// Registry-owned PI updates must not reacquire the registry or change
+    /// any userspace base parameters.
+    Inheritance {
+        priority: Option<i32>,
+    },
 }
 
 impl ProcessManager {
@@ -210,6 +215,33 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         update: SchedulerUpdate,
     ) -> Result<bool, SystemError> {
+        crate::libs::futex::pi_futex::with_pi_registry(|registry| {
+            let changed = Self::update_scheduler_locked(pcb, update)?;
+            if changed {
+                if let Some(registry) = registry {
+                    crate::libs::futex::pi_futex::refresh_priority_locked(registry, pcb);
+                }
+            }
+            Ok(changed)
+        })
+    }
+
+    /// Apply a PI donation while the caller keeps the PI registry stable.
+    /// This only takes task.pi_lock -> rq, and never traverses the PI graph.
+    pub(crate) fn set_pi_priority(
+        pcb: &Arc<ProcessControlBlock>,
+        priority: Option<i32>,
+    ) -> Result<(), SystemError> {
+        if priority.is_some_and(|prio| !(0..crate::sched::prio::MAX_PRIO).contains(&prio)) {
+            return Err(SystemError::EINVAL);
+        }
+        Self::update_scheduler_locked(pcb, SchedulerUpdate::Inheritance { priority }).map(|_| ())
+    }
+
+    fn update_scheduler_locked(
+        pcb: &Arc<ProcessControlBlock>,
+        update: SchedulerUpdate,
+    ) -> Result<bool, SystemError> {
         let rt_priority = match update {
             SchedulerUpdate::Replace(SchedChangeRequest::Fifo { priority, .. })
             | SchedulerUpdate::Replace(SchedChangeRequest::Rr { priority, .. }) => Some(priority),
@@ -227,7 +259,7 @@ impl ProcessManager {
             } => None,
             // Changing the nice value never implies a realtime priority, and
             // it leaves the target's base policy alone.
-            SchedulerUpdate::Nice { .. } => None,
+            SchedulerUpdate::Nice { .. } | SchedulerUpdate::Inheritance { .. } => None,
             SchedulerUpdate::Parameters { .. } => return Err(SystemError::EINVAL),
         };
         if rt_priority
@@ -262,7 +294,15 @@ impl ProcessManager {
                     // would have provided, so the commit below runs without a
                     // runqueue.
                     if let SchedulerUpdate::Nice { nice } = update {
-                        return Self::commit_nice(pcb, None, nice).map(|_| true);
+                        return Self::commit_nice(pcb, None, nice, pi_guard.inherited_priority())
+                            .map(|_| true);
+                    }
+                    if let SchedulerUpdate::Inheritance { priority } = update {
+                        pi_guard.set_inherited_priority(priority);
+                        pcb.sched_info().set_effective_priority(
+                            pi_guard.effective_priority(pcb.sched_info().normal_prio()),
+                        );
+                        return Ok(true);
                     }
                     return Err(SystemError::EINVAL);
                 }
@@ -298,7 +338,8 @@ impl ProcessManager {
             // acquisition and the migration-stability loop in exactly one
             // place instead of duplicating them.
             if let SchedulerUpdate::Nice { nice } = update {
-                return Self::commit_nice(pcb, Some(rq), nice).map(|_| true);
+                return Self::commit_nice(pcb, Some(rq), nice, pi_guard.inherited_priority())
+                    .map(|_| true);
             }
 
             let old_policy = pcb.sched_info().policy();
@@ -344,15 +385,27 @@ impl ProcessManager {
                 SchedulerUpdate::Nice { .. } => {
                     unreachable!("nice updates are committed before the policy triple")
                 }
+                SchedulerUpdate::Inheritance { .. } => (old_policy, old_normal_prio, old_reset),
             };
-            let new_class = new_policy.base_sched_class();
+            let new_normal_prio = new_prio;
+            let inherited = match update {
+                SchedulerUpdate::Inheritance { priority } => priority,
+                _ => pi_guard.inherited_priority(),
+            };
+            let new_prio = inherited.map_or(new_normal_prio, |donor| new_normal_prio.min(donor));
+            let new_class = if PrioUtil::rt_prio(new_prio) {
+                SchedClass::Realtime
+            } else {
+                SchedClass::Fair
+            };
 
             // Linux treats a reset-on-fork-only update as a parameter fast
             // path: it must not disturb the task's position in its queue.
-            if old_policy == new_policy && old_normal_prio == new_prio {
-                if old_reset != new_reset {
-                    pi_guard.set_sched_reset_on_fork(new_reset);
-                }
+            if old_prio == new_prio && old_class == new_class {
+                pcb.sched_info().set_policy(new_policy);
+                pcb.sched_info().set_normal_prio(new_normal_prio);
+                pi_guard.set_inherited_priority(inherited);
+                pi_guard.set_sched_reset_on_fork(new_reset);
                 drop(rq_guard);
                 drop(pi_guard);
                 return Ok(true);
@@ -385,8 +438,9 @@ impl ProcessManager {
             }
 
             pcb.sched_info().set_policy(new_policy);
-            pcb.sched_info().set_prio(new_prio);
-            pcb.sched_info().set_normal_prio(new_prio);
+            pcb.sched_info().set_effective_priority(new_prio);
+            pcb.sched_info().set_normal_prio(new_normal_prio);
+            pi_guard.set_inherited_priority(inherited);
             pi_guard.set_sched_reset_on_fork(new_reset);
 
             if old_class != SchedClass::Fair && new_class == SchedClass::Fair {
@@ -443,6 +497,7 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         rq: Option<&mut CpuRunQueue>,
         nice: i32,
+        inherited: Option<i32>,
     ) -> Result<(), SystemError> {
         // An out-of-range nice is clamped, never rejected. Linux behaves the
         // same way; only a bad `which` selector is an error.
@@ -455,7 +510,7 @@ impl ProcessManager {
         }
 
         let class = pcb.sched_info().sched_class();
-        if class != SchedClass::Fair {
+        if pcb.sched_info().policy().is_realtime() {
             // `update_scheduler` rejects the idle class before reaching here,
             // so this is the realtime case. Linux takes its `rt`/`dl` early
             // return here: it records the nice value and stops, because a
@@ -464,6 +519,20 @@ impl ProcessManager {
             // is also why the load weight is not touched: an RT entity is
             // never on a fair runqueue.
             pcb.sched_info().set_static_prio(new_static_prio);
+            return Ok(());
+        }
+
+        if class == SchedClass::Realtime {
+            // A Normal task temporarily running in RT still changes its fair
+            // base nice. Its CFS entity is detached until deboost, so update
+            // only entity-local weight, never rq PELT or its effective boost.
+            pcb.sched_info().set_static_prio(new_static_prio);
+            pcb.sched_info().set_normal_prio(new_static_prio);
+            pcb.sched_info()
+                .sched_entity()
+                .force_mut()
+                .load
+                .set_load_weight_from_prio(new_static_prio);
             return Ok(());
         }
 
@@ -494,10 +563,9 @@ impl ProcessManager {
                 / divider;
 
             pcb.sched_info().set_static_prio(new_static_prio);
-            // DragonOS has neither realtime boosting nor priority inheritance,
-            // so Linux's `effective_prio()` degenerates to `static_prio` here.
             pcb.sched_info().set_normal_prio(new_static_prio);
-            pcb.sched_info().set_prio(new_static_prio);
+            pcb.sched_info()
+                .set_prio(inherited.map_or(new_static_prio, |donor| new_static_prio.min(donor)));
             return Ok(());
         };
 
@@ -526,10 +594,9 @@ impl ProcessManager {
 
         let old_prio = pcb.sched_info().prio();
         pcb.sched_info().set_static_prio(new_static_prio);
-        // DragonOS has neither realtime boosting nor priority inheritance, so
-        // Linux's `effective_prio()` degenerates to `static_prio` here.
         pcb.sched_info().set_normal_prio(new_static_prio);
-        pcb.sched_info().set_prio(new_static_prio);
+        pcb.sched_info()
+            .set_prio(inherited.map_or(new_static_prio, |donor| new_static_prio.min(donor)));
 
         if reweight {
             let se = pcb.sched_info().sched_entity();

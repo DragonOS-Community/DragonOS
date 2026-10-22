@@ -1,7 +1,7 @@
 use core::{
     any::Any,
     fmt::{Debug, Formatter, Write},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -320,6 +320,7 @@ enum VirtIOBlkState {
     Quiescing,
     Draining,
     Reset,
+    ResetFailed,
     Dead,
 }
 
@@ -370,7 +371,10 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
     let mut completed = 0;
     loop {
         let mut inner = device.inner();
-        if inner.state >= VirtIOBlkState::Reset {
+        if !matches!(
+            inner.state,
+            VirtIOBlkState::Online | VirtIOBlkState::Quiescing | VirtIOBlkState::Draining
+        ) {
             break;
         }
 
@@ -640,6 +644,16 @@ pub struct VirtIOBlkDevice {
     stats: VirtIOBlkStats,
     /// Descriptor reclamation or shutdown makes a blocked submission retryable.
     submission_wait: ResourceWaitQueue,
+    shutdown_running: AtomicBool,
+}
+
+// Closing callbacks may reenter shutdown. Report contention rather than
+// sleeping on a lock held by the callback's own caller.
+struct ShutdownGuard<'a>(&'a AtomicBool);
+impl Drop for ShutdownGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Debug for VirtIOBlkDevice {
@@ -723,6 +737,7 @@ impl VirtIOBlkDevice {
             ),
             stats: VirtIOBlkStats::new(),
             submission_wait: ResourceWaitQueue::new(),
+            shutdown_running: AtomicBool::new(false),
         });
 
         let device_weak = Arc::downgrade(&dev);
@@ -790,22 +805,80 @@ impl VirtIOBlkDevice {
         virtioblk_manager().free_id(devname_id);
     }
 
-    fn shutdown(self: &Arc<Self>) -> Result<(), SystemError> {
-        // Optional graceful drain resources must be born before quiescing.
-        // OOM falls back to transport reset, which legally cancels in-flight IO.
-        let grace = Box::try_new(ShutdownWake(Arc::downgrade(self)))
-            .map_err(|_| SystemError::ENOMEM)
-            .and_then(|callback| {
-                Timer::try_prepare(callback, next_n_ms_timer_jiffies(SHUTDOWN_GRACE_MS))
-            })
-            .ok();
-        let (bio_queue, bio_token_map, io_thread_pcb) = {
+    /// Reset acknowledgement precedes detach, and detach precedes terminal
+    /// publication. Preserve an invalid slot on error rather than dropping DMA.
+    fn retire_reset_requests(
+        &self,
+        tokens: &BioTokenMap,
+        error: SystemError,
+    ) -> Result<(), SystemError> {
+        loop {
             let mut inner = self.inner();
-            if inner.state >= VirtIOBlkState::Quiescing {
+            let mut slots = tokens.inner.lock_irqsave();
+            let Some((token, ctx)) = slots
+                .iter_mut()
+                .enumerate()
+                .find_map(|(token, slot)| slot.as_mut().map(|ctx| (token, ctx)))
+            else {
+                return Ok(());
+            };
+            let hardware = inner.device_inner.as_mut().ok_or(SystemError::ENODEV)?;
+            let result = unsafe {
+                match ctx.bio.bio_type() {
+                    BioType::Read => hardware.cancel_read_blocks(
+                        token as u16,
+                        &ctx.req,
+                        &mut (&mut *ctx.bio.buffer_mut())[..ctx.bio.count() * LBA_SIZE],
+                        &mut ctx.resp,
+                    ),
+                    BioType::Write => hardware.cancel_write_blocks(
+                        token as u16,
+                        &ctx.req,
+                        &(&*ctx.bio.buffer())[..ctx.bio.count() * LBA_SIZE],
+                        &mut ctx.resp,
+                    ),
+                    BioType::Flush => hardware.cancel_flush(token as u16, &ctx.req, &mut ctx.resp),
+                }
+            };
+            result.map_err(|_| SystemError::EIO)?;
+            let ctx = slots[token]
+                .take()
+                .expect("reset context remains registered");
+            drop(slots);
+            drop(inner);
+            self.complete_accounted_bio(&ctx.bio, Err(error.clone()));
+        }
+    }
+
+    fn shutdown(self: &Arc<Self>) -> Result<(), SystemError> {
+        self.shutdown_running
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| SystemError::EBUSY)?;
+        let _guard = ShutdownGuard(&self.shutdown_running);
+        let retry = {
+            let inner = self.inner();
+            if inner.state == VirtIOBlkState::Dead {
                 return Ok(());
             }
-
-            inner.state = VirtIOBlkState::Quiescing;
+            inner.state == VirtIOBlkState::ResetFailed
+        };
+        // Optional graceful drain resources must be born before quiescing.
+        // OOM falls back to transport reset, which legally cancels in-flight IO.
+        let grace = (!retry)
+            .then(|| {
+                Box::try_new(ShutdownWake(Arc::downgrade(self)))
+                    .map_err(|_| SystemError::ENOMEM)
+                    .and_then(|callback| {
+                        Timer::try_prepare(callback, next_n_ms_timer_jiffies(SHUTDOWN_GRACE_MS))
+                    })
+                    .ok()
+            })
+            .flatten();
+        let (bio_queue, bio_token_map, io_thread_pcb) = {
+            let mut inner = self.inner();
+            if !retry {
+                inner.state = VirtIOBlkState::Quiescing;
+            }
             (
                 inner.bio_queue.clone(),
                 inner.bio_token_map.clone(),
@@ -813,55 +886,65 @@ impl VirtIOBlkDevice {
             )
         };
 
-        // Publish non-Online before waking submissions, and wake before joining
-        // the worker: it may be waiting for descriptors rather than new BIOs.
-        self.submission_wait.notify_all();
-        if let Some(bio_queue) = &bio_queue {
-            let mut pending = bio_queue.stop_and_drain();
-            while let Some(node) = pending.pop_node() {
-                self.complete_accounted_bio(&node.into_value(), Err(SystemError::ESHUTDOWN));
+        if !retry {
+            // Publish non-Online before waking submissions, and wake before joining
+            // the worker: it may be waiting for descriptors rather than new BIOs.
+            self.submission_wait.notify_all();
+            if let Some(bio_queue) = &bio_queue {
+                let mut pending = bio_queue.stop_and_drain();
+                while let Some(node) = pending.pop_node() {
+                    self.complete_accounted_bio(&node.into_value(), Err(SystemError::ESHUTDOWN));
+                }
             }
-        }
 
-        if let Some(io_thread_pcb) = &io_thread_pcb {
-            KernelThreadMechanism::stop(io_thread_pcb)?;
+            if let Some(io_thread_pcb) = &io_thread_pcb {
+                KernelThreadMechanism::stop(io_thread_pcb)?;
+            }
+
+            {
+                let mut inner = self.inner();
+                if inner.state < VirtIOBlkState::Draining {
+                    inner.state = VirtIOBlkState::Draining;
+                }
+            }
+
+            if let Some(tokens) = &bio_token_map {
+                complete_used_requests(self, tokens);
+                if let Some(grace) = grace {
+                    let timer = grace.timer();
+                    grace.activate();
+                    let _ = self.submission_wait.wait_uninterruptible(|| {
+                        (tokens.is_empty() || timer.timeout()).then_some(())
+                    });
+                    timer.cancel();
+                    complete_used_requests(self, tokens);
+                }
+            }
         }
 
         {
             let mut inner = self.inner();
-            if inner.state < VirtIOBlkState::Draining {
-                inner.state = VirtIOBlkState::Draining;
-            }
-        }
-
-        if let Some(tokens) = &bio_token_map {
-            complete_used_requests(self, tokens);
-            if let Some(grace) = grace {
-                let timer = grace.timer();
-                grace.activate();
-                let _ = self
-                    .submission_wait
-                    .wait_uninterruptible(|| (tokens.is_empty() || timer.timeout()).then_some(()));
-                timer.cancel();
-                complete_used_requests(self, tokens);
-            }
-        }
-
-        let device_inner = {
-            let mut inner = self.inner();
             inner.state = VirtIOBlkState::Reset;
-            if let Some(device) = inner.device_inner.as_mut() {
-                device.disable_interrupts();
-            }
-            inner.device_inner.take()
-        };
-        drop(device_inner);
-
-        if let Some(tokens) = &bio_token_map {
-            while let Some(ctx) = tokens.pop() {
-                self.complete_accounted_bio(&ctx.bio, Err(SystemError::ESHUTDOWN));
+            if let Some(hardware) = inner.device_inner.as_mut() {
+                hardware.disable_interrupts();
+                if let Err(error) = hardware.reset() {
+                    inner.state = VirtIOBlkState::ResetFailed;
+                    error!(
+                        "VirtIOBlk reset failed; retaining in-flight DMA for retry: {:?}",
+                        error
+                    );
+                    return Err(SystemError::ETIMEDOUT);
+                }
             }
         }
+        if let Some(tokens) = &bio_token_map {
+            if let Err(error) = self.retire_reset_requests(tokens, SystemError::ESHUTDOWN) {
+                self.inner().state = VirtIOBlkState::ResetFailed;
+                return Err(error);
+            }
+        }
+        let hardware = self.inner().device_inner.take();
+        drop(hardware);
 
         let mut inner = self.inner();
         inner.state = VirtIOBlkState::Dead;
@@ -1137,7 +1220,10 @@ impl VirtIODevice for VirtIOBlkDevice {
         _irq: crate::exception::IrqNumber,
     ) -> Result<IrqReturn, system_error::SystemError> {
         let mut inner = self.inner();
-        if inner.state >= VirtIOBlkState::Reset {
+        if !matches!(
+            inner.state,
+            VirtIOBlkState::Online | VirtIOBlkState::Quiescing | VirtIOBlkState::Draining
+        ) {
             return Ok(crate::exception::irqdesc::IrqReturn::NotHandled);
         }
 
@@ -1323,28 +1409,37 @@ impl KObject for VirtIOBlkDevice {
 
 impl Drop for VirtIOBlkDevice {
     fn drop(&mut self) {
-        let (device_inner, bio_queue, bio_token_map) = {
+        let (queue, tokens, reset) = {
             let mut inner = self.inner.lock_irqsave();
             inner.state = VirtIOBlkState::Reset;
-            (
-                inner.device_inner.take(),
-                inner.bio_queue.clone(),
-                inner.bio_token_map.clone(),
-            )
+            let reset = inner
+                .device_inner
+                .as_mut()
+                .map_or(Ok(()), |hardware| hardware.reset());
+            (inner.bio_queue.take(), inner.bio_token_map.clone(), reset)
         };
-        // Reset the transport before publishing terminal results or releasing
-        // request/response storage which can still be visible to the device.
-        drop(device_inner);
-
-        if let Some(queue) = bio_queue {
+        let retired = reset.is_ok()
+            && tokens.as_ref().is_none_or(|tokens| {
+                self.retire_reset_requests(tokens, SystemError::ENODEV)
+                    .is_ok()
+            });
+        let mut inner = self.inner.lock_irqsave();
+        let hardware = inner.device_inner.take();
+        let retained_tokens = inner.bio_token_map.take();
+        drop(inner);
+        if retired {
+            drop(hardware);
+        } else {
+            // The final owner cannot return an error. Keep the complete DMA
+            // graph, including BIO data, and report a device requiring reboot.
+            error!("VirtIOBlk: final reset/retirement failed; retaining device and BIO DMA owners; reboot required");
+            core::mem::forget(hardware);
+            core::mem::forget(retained_tokens);
+        }
+        if let Some(queue) = queue {
             let mut pending = queue.stop_and_drain();
             while let Some(node) = pending.pop_node() {
                 self.complete_accounted_bio(&node.into_value(), Err(SystemError::ENODEV));
-            }
-        }
-        if let Some(tokens) = bio_token_map {
-            while let Some(ctx) = tokens.pop() {
-                self.complete_accounted_bio(&ctx.bio, Err(SystemError::ENODEV));
             }
         }
     }

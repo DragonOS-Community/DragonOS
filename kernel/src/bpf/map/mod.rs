@@ -2,21 +2,25 @@ pub(super) mod array_map;
 mod hash_map;
 mod lru;
 mod queue;
+pub(super) mod ringbuf;
 pub(super) mod util;
 
 use super::Result;
+use crate::arch::MMArch;
 use crate::bpf::map::array_map::{ArrayMap, PerCpuArrayMap, PerfEventArrayMap};
 use crate::bpf::map::hash_map::PerCpuHashMap;
 use crate::bpf::map::util::{BpfMapGetNextKeyArg, BpfMapMeta, BpfMapUpdateArg};
 use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
+use crate::filesystem::epoll::EPollItem;
 use crate::filesystem::vfs::fdtable::FileDescriptorTable;
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
-use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, Metadata};
+use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, Metadata, PollableInode};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_map_type};
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::SpinLock;
+use crate::mm::{MemoryManagementArch, VmFlags};
 
 use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -34,6 +38,42 @@ use system_error::SystemError;
 pub struct BpfMap {
     inner_map: SpinLock<Box<dyn BpfMapCommonOps>>,
     meta: BpfMapMeta,
+}
+
+/// Match bpf_map_mmap: shared mappings only, and a read-only mapping must
+/// never acquire write permission later through mprotect.
+fn bpf_mmap_flags(mut flags: VmFlags) -> Result<VmFlags> {
+    if !flags.contains(VmFlags::VM_SHARED) {
+        return Err(SystemError::EINVAL);
+    }
+    // remap_vmalloc_range sets these on Linux. In particular, expanding a
+    // writable consumer VMA must not expose the adjacent producer page.
+    // DragonOS driver-owned PFN contract: the VMA's File pins the fixed
+    // backing until PTE teardown and its TLB barrier. Such mappings deliberately
+    // have no ordinary page rmap/RSS membership, allowing both ring aliases.
+    // Linux uses vm_insert_page/MIXEDMAP here; this is our explicit PFN model.
+    flags.insert(VmFlags::VM_DONTEXPAND | VmFlags::VM_DONTDUMP | VmFlags::VM_PFNMAP);
+    flags.remove(VmFlags::VM_MAYEXEC);
+    if !flags.contains(VmFlags::VM_WRITE) {
+        flags.remove(VmFlags::VM_MAYWRITE);
+    }
+    Ok(flags)
+}
+
+fn check_ringbuf_mmap(data_size: usize, len: usize, offset: usize, flags: VmFlags) -> Result<()> {
+    bpf_mmap_flags(flags)?;
+    let page = MMArch::PAGE_SIZE;
+    // Only the consumer position belongs to userspace. Neither the
+    // producer position nor record headers/payload may be mapped writable.
+    if flags.contains(VmFlags::VM_WRITE) && (offset != 0 || len != page) {
+        return Err(SystemError::EPERM);
+    }
+    let valid = (offset == 0 && len == page)
+        || (offset == page && (len == page + data_size || len == page + 2 * data_size));
+    if !valid {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
 }
 
 pub type BpfCallBackFn = fn(key: &[u8], value: &[u8], ctx: *const u8) -> i32;
@@ -119,7 +159,11 @@ impl DowncastArc for dyn BpfMapCommonOps {
 }
 impl BpfMap {
     pub fn new(map: Box<dyn BpfMapCommonOps>, meta: BpfMapMeta) -> Self {
-        assert_ne!(meta.key_size, 0);
+        // Linux ring buffers are key-less maps; every other map type keys
+        // its elements and must state a non-zero key size.
+        if meta.map_type != bpf_map_type::BPF_MAP_TYPE_RINGBUF {
+            assert_ne!(meta.key_size, 0);
+        }
         BpfMap {
             inner_map: SpinLock::new(map),
             meta,
@@ -128,6 +172,26 @@ impl BpfMap {
 
     pub fn inner_map(&self) -> &SpinLock<Box<dyn BpfMapCommonOps>> {
         &self.inner_map
+    }
+
+    /// The ring-buffer core, when this map is a RINGBUF map.
+    pub fn ringbuf_core(&self) -> Option<alloc::sync::Arc<ringbuf::RingBufCore>> {
+        let inner = self.inner_map.lock();
+        (**inner)
+            .ref_any()
+            .downcast_ref::<ringbuf::RingBufMap>()
+            .map(|m| m.core().clone())
+    }
+
+    /// The ring-buffer page cache, when this map is a RINGBUF map.
+    pub fn ringbuf_page_cache(
+        &self,
+    ) -> Option<alloc::sync::Arc<crate::filesystem::page_cache::PageCache>> {
+        let inner = self.inner_map.lock();
+        (**inner)
+            .ref_any()
+            .downcast_ref::<ringbuf::RingBufMap>()
+            .map(|m| m.page_cache())
     }
 
     pub fn key_size(&self) -> usize {
@@ -182,11 +246,52 @@ impl IndexNode for BpfMap {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
+        let mut meta = anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR);
+        // The generic filemap fault path bounds-checks a faulting pgoff
+        // against the inode size, so a RINGBUF map reports its mappable
+        // length: the consumer page, the producer-pos page, and the data
+        // ring mapped twice so a record may cross the ring boundary.
+        if let Some(ring) = self.ringbuf_core() {
+            meta.size = (2 * MMArch::PAGE_SIZE + 2 * ring.data_size()) as i64;
+        }
+        Ok(meta)
     }
 
     fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
         metadata.mode
+    }
+
+    fn mmap(&self, _start: usize, len: usize, offset: usize) -> Result<()> {
+        // Only RINGBUF maps are mappable. Layout (page-cache indices):
+        // 0 = consumer page, 1 = producer-pos page, 2.. = data ring.
+        let ring = self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        check_ringbuf_mmap(ring.data_size(), len, offset, VmFlags::VM_SHARED)
+    }
+
+    fn mmap_vm_flags(&self, _file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags> {
+        self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        bpf_mmap_flags(vm_flags)
+    }
+
+    fn check_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let ring = self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        // This hook runs before MAP_FIXED can remove an existing VMA.
+        check_ringbuf_mmap(ring.data_size(), len, offset, vm_flags).map_err(Into::into)
+    }
+
+    fn page_cache(&self) -> Option<Arc<crate::filesystem::page_cache::PageCache>> {
+        self.ringbuf_page_cache()
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {
+        self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        Ok(self)
     }
 
     fn resize(
@@ -211,6 +316,28 @@ impl IndexNode for BpfMap {
 
     fn absolute_path(&self) -> core::result::Result<String, SystemError> {
         Ok(anon_inode_path("bpf-map"))
+    }
+}
+
+impl PollableInode for BpfMap {
+    fn poll(&self, _private_data: &FilePrivateData) -> Result<usize> {
+        let ring = self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        Ok(ring.poll_events())
+    }
+
+    fn add_epitem(&self, epitem: Arc<EPollItem>, _private_data: &FilePrivateData) -> Result<()> {
+        let ring = self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        ring.add_epitem(epitem);
+        Ok(())
+    }
+
+    fn remove_epitem(
+        &self,
+        epitem: &Arc<EPollItem>,
+        _private_data: &FilePrivateData,
+    ) -> Result<()> {
+        let ring = self.ringbuf_core().ok_or(SystemError::ENOSYS)?;
+        ring.remove_epitem(epitem)
     }
 }
 
@@ -264,6 +391,10 @@ pub fn bpf_map_create(attr: &bpf_attr) -> Result<usize> {
         bpf_map_type::BPF_MAP_TYPE_LRU_PERCPU_HASH => {
             let lru_per_cpu_hash_map = lru::PerCpuLruMap::new(&map_meta)?;
             Box::new(lru_per_cpu_hash_map)
+        }
+        bpf_map_type::BPF_MAP_TYPE_RINGBUF => {
+            let ringbuf_map = ringbuf::RingBufMap::new(&map_meta)?;
+            Box::new(ringbuf_map)
         }
         _ => {
             // Linux map_create rejects map types without available map ops.
@@ -451,4 +582,66 @@ pub(crate) fn map_by_fd(fd_table: &Arc<FileDescriptorTable>, fd: i32) -> Result<
         .downcast_arc::<BpfMap>()
         .ok_or(SystemError::EINVAL)?;
     Ok(map)
+}
+
+#[cfg(test)]
+mod mmap_tests {
+    use super::{bpf_mmap_flags, check_ringbuf_mmap, MMArch, VmFlags};
+    use crate::mm::MemoryManagementArch;
+    use system_error::SystemError;
+
+    #[test]
+    fn ringbuf_consumer_is_the_only_writable_region() {
+        let page = MMArch::PAGE_SIZE;
+        let shared_read = VmFlags::VM_SHARED | VmFlags::VM_READ | VmFlags::VM_MAYWRITE;
+        let shared_write = shared_read | VmFlags::VM_WRITE;
+
+        assert_eq!(check_ringbuf_mmap(page, page, 0, shared_write), Ok(()));
+        for len in [2 * page, 3 * page] {
+            assert_eq!(check_ringbuf_mmap(page, len, page, shared_read), Ok(()));
+            assert_eq!(
+                check_ringbuf_mmap(page, len, page, shared_write),
+                Err(SystemError::EPERM)
+            );
+        }
+    }
+
+    #[test]
+    fn ringbuf_rejects_private_and_invalid_layout_mappings() {
+        let page = MMArch::PAGE_SIZE;
+        for flags in [VmFlags::VM_READ, VmFlags::VM_READ | VmFlags::VM_WRITE] {
+            assert_eq!(
+                check_ringbuf_mmap(page, page, 0, flags),
+                Err(SystemError::EINVAL)
+            );
+        }
+        let shared = VmFlags::VM_SHARED | VmFlags::VM_READ;
+        assert_eq!(
+            check_ringbuf_mmap(page, 2 * page, 0, shared),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(
+            check_ringbuf_mmap(page, page, 2 * page, shared),
+            Err(SystemError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn read_only_bpf_mapping_cannot_gain_write_permission() {
+        let flags = VmFlags::VM_SHARED
+            | VmFlags::VM_READ
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYEXEC;
+        let read_only = bpf_mmap_flags(flags).unwrap();
+        // mprotect requires VM_MAYWRITE before granting PROT_WRITE.
+        assert!(!read_only.contains(VmFlags::VM_MAYWRITE));
+        assert!(read_only.contains(VmFlags::VM_READ | VmFlags::VM_MAYREAD));
+        assert!(!read_only.contains(VmFlags::VM_MAYEXEC));
+
+        let writable = bpf_mmap_flags(flags | VmFlags::VM_WRITE).unwrap();
+        assert!(writable.contains(VmFlags::VM_WRITE | VmFlags::VM_MAYWRITE));
+        // mremap checks DONTEXPAND before extending a file-backed VMA.
+        assert!(writable.contains(VmFlags::VM_DONTEXPAND | VmFlags::VM_PFNMAP));
+    }
 }

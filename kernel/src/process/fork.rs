@@ -506,6 +506,16 @@ impl ProcessManager {
     ) -> Result<(), MemoryAllocationError> {
         let old_address_space = current_pcb.basic().user_vm().ok_or(SystemError::ENOMEM)?;
 
+        // Match Linux uprobe_copy_process: a new-stack CLONE_VM thread must
+        // not inherit its parent's returns; fork and vfork retain the user
+        // stack and need the matching instances before the child is published.
+        #[cfg(target_arch = "x86_64")]
+        if !clone_flags.contains(CloneFlags::CLONE_VM)
+            || clone_flags.contains(CloneFlags::CLONE_VFORK)
+        {
+            new_pcb.uprobe.inherit_urets(&current_pcb.uprobe)?;
+        }
+
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());

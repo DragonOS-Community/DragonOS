@@ -7,8 +7,10 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::mm::ucontext::XolSlotLease;
+use system_error::SystemError;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +53,25 @@ impl core::fmt::Debug for ActiveXol {
     }
 }
 
+/// One live uretprobe hijack owned by this task: the original return address
+/// that was replaced on the user stack by the mm-wide trampoline, together
+/// with the retprobe participants snapshot to deliver on return.
+#[derive(Clone)]
+pub struct ActiveUret {
+    pub stack_ptr: usize,
+    pub chained: bool,
+    pub orig_ret_addr: usize,
+    pub participants: Arc<crate::mm::ucontext::UprobeParticipantNode>,
+}
+
+impl core::fmt::Debug for ActiveUret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ActiveUret")
+            .field("orig_ret_addr", &self.orig_ret_addr)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Single source of truth for one task's XOL state.
 ///
 /// `phase` is the lock-free exception-routing discriminator. `payload` owns
@@ -59,6 +80,9 @@ impl core::fmt::Debug for ActiveXol {
 pub struct TaskXolState {
     phase: AtomicU8,
     payload: SpinLock<Option<ActiveXol>>,
+    /// Live uretprobe return instances, innermost last. LIFO on the trampoline
+    /// hit keeps nested hijacks of the same function correct.
+    ret_stack: Mutex<alloc::vec::Vec<ActiveUret>>,
 }
 
 impl core::fmt::Debug for TaskXolState {
@@ -74,7 +98,33 @@ impl TaskXolState {
         Self {
             phase: AtomicU8::new(TaskXolPhase::Idle as u8),
             payload: SpinLock::new(None),
+            ret_stack: Mutex::new(alloc::vec::Vec::new()),
         }
+    }
+
+    /// Return instances are only accessed from process context with IRQs enabled.
+    /// A sleeping lock permits fallible reservation before changing the user stack.
+    pub(crate) fn uret_stack(&self) -> MutexGuard<'_, alloc::vec::Vec<ActiveUret>> {
+        self.ret_stack.lock()
+    }
+
+    /// Copy live return instances into an unpublished fork/vfork child.
+    pub(crate) fn inherit_urets(&self, parent: &Self) -> Result<(), SystemError> {
+        let source = parent.ret_stack.lock();
+        let mut inherited = alloc::vec::Vec::new();
+        inherited
+            .try_reserve_exact(source.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        inherited.extend(source.iter().cloned());
+        drop(source);
+        *self.ret_stack.lock() = inherited;
+        Ok(())
+    }
+
+    /// The old user context is being discarded by exec.
+    pub fn clear_urets(&self) {
+        let retired = core::mem::take(&mut *self.ret_stack.lock());
+        drop(retired);
     }
 
     #[inline]

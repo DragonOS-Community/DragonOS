@@ -136,20 +136,48 @@ struct UprobeParticipantControl {
 struct UprobeSiteParticipant {
     target: UprobeConsumerRuntimeSnapshot,
     active: AtomicBool,
+    is_ret: bool,
 }
 
-pub(crate) struct UprobeParticipantNode {
+pub struct UprobeParticipantNode {
     participant: Arc<UprobeSiteParticipant>,
     next: Option<Arc<UprobeParticipantNode>>,
 }
 
 impl UprobeParticipantNode {
-    /// Visit the live participants in one pinned snapshot. Entries are never
-    /// reactivated, so observing `false` cannot hide a later membership.
+    /// Visit the live entry (non-retprobe) participants in one pinned
+    /// snapshot. Entries are never reactivated, so observing `false` cannot
+    /// hide a later membership.
     pub(crate) fn for_each_active(&self, mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot)) {
+        self.for_each_matching(false, visit);
+    }
+
+    /// Visit the live uretprobe participants in one pinned snapshot.
+    pub(crate) fn for_each_active_ret(
+        &self,
+        mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot),
+    ) {
+        self.for_each_matching(true, visit);
+    }
+
+    /// Whether at least one live uretprobe participates at this site: the
+    /// entry hit must hijack the user return address.
+    pub(crate) fn has_ret_participant(&self) -> bool {
+        let mut found = false;
+        self.for_each_active_ret(|_| found = true);
+        found
+    }
+
+    fn for_each_matching(
+        &self,
+        want_ret: bool,
+        mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot),
+    ) {
         let mut node = Some(self);
         while let Some(current) = node {
-            if current.participant.active.load(Ordering::Acquire) {
+            if current.participant.active.load(Ordering::Acquire)
+                && current.participant.is_ret == want_ret
+            {
                 visit(&current.participant.target);
             }
             node = current.next.as_deref();
@@ -195,6 +223,7 @@ impl UprobeSite {
         target: UprobeConsumerRuntimeSnapshot,
     ) -> bool {
         let participant = Arc::new(UprobeSiteParticipant {
+            is_ret: target.is_retprobe(),
             target,
             active: AtomicBool::new(true),
         });

@@ -372,6 +372,23 @@ impl ProcessManager {
             }
         }
 
+        // Linux fires trace_sched_process_exit(tsk) early in do_exit() for
+        // every exiting task; BPF consumers filter main threads themselves.
+        // basic() disables IRQs and preemption. Release it before callbacks
+        // run, since BPF user-memory reads may need to resolve a page fault.
+        let mut comm = [0u8; 16];
+        {
+            let basic = current_pcb.basic();
+            let name = basic.name().as_bytes();
+            let len = name.len().min(comm.len() - 1);
+            comm[..len].copy_from_slice(&name[..len]);
+        }
+        crate::process::trace::trace_sched_process_exit(
+            &comm,
+            current_pcb.raw_pid().data() as i32,
+            current_pcb.sched_info().prio(),
+        );
+
         current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
 
         // Exit will not return to the old user context; release ActiveXol's strong

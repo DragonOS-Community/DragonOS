@@ -1113,6 +1113,12 @@ impl PageFaultHandler {
         let Some((old_paddr, _old_flags)) = pfm.mapper.translate(address) else {
             return VmFaultReason::VM_FAULT_NOPAGE;
         };
+        // Driver PFNs may be registered Normal pages, so this must precede
+        // PageManager lookup. The specialized path revalidates backing/PFN,
+        // current shared/write permissions and the installed PTE identity.
+        if vma.lock().vm_flags().contains(VmFlags::VM_PFNMAP) {
+            return Self::filemap_pfnmap_fault(pfm, Some(old_paddr));
+        }
         let mut page_manager = page_manager_lock();
         let old_page = page_manager.get(&old_paddr);
         if old_page.is_none() {
@@ -1429,6 +1435,114 @@ impl PageFaultHandler {
             }
         }
         VmFaultReason::empty()
+    }
+
+    /// Install or upgrade one driver-owned PFN from a fixed anonymous-inode
+    /// backing. DragonOS uses VM_PFNMAP for these mappings; unlike Linux's
+    /// vm_insert_page/MIXEDMAP route, they have no ordinary rmap/RSS membership.
+    ///
+    /// The VMA's File owns this immutable cache through PTE teardown and the
+    /// TLB barrier (including split, fork and mremap rollback). Only registered,
+    /// intrinsically unevictable Normal pages of a backend-free cache qualify.
+    /// `expected` is required for a write-protection upgrade, so a changed PFN
+    /// can never be silently made writable.
+    pub unsafe fn filemap_pfnmap_fault(
+        pfm: &mut PageFaultMessage,
+        expected: Option<PhysAddr>,
+    ) -> VmFaultReason {
+        let vma = pfm.vma();
+        let (vm_flags, pte_flags, file) = {
+            let guard = vma.lock();
+            (*guard.vm_flags(), guard.flags(), guard.vm_file())
+        };
+        let write = pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE);
+        if !vm_flags.contains(VmFlags::VM_PFNMAP | VmFlags::VM_SHARED)
+            || vm_flags.contains(VmFlags::VM_MIXEDMAP)
+            || (write && !vm_flags.contains(VmFlags::VM_WRITE))
+            || (expected.is_some() && !write)
+        {
+            return VmFaultReason::VM_FAULT_SIGSEGV;
+        }
+        let (Some(file), Some(index)) = (file, pfm.backing_pgoff()) else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let Some(cache) = file.inode().page_cache() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        if cache.backend().is_some() {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let size = match file.inode().metadata() {
+            Ok(metadata) => metadata.size.max(0) as usize,
+            Err(_) => return VmFaultReason::VM_FAULT_SIGBUS,
+        };
+        if index.saturating_mul(MMArch::PAGE_SIZE) >= size {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        // Never allocate a missing driver page: only the backing owner may
+        // create these pages, establish aliases or retire their registrations.
+        let Some(pin) = cache.manager().peek_page_pinned(index) else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let page = pin.page();
+        let page_guard = page.read();
+        if !page_guard.intrinsic_unevictable()
+            || !page_guard
+                .flags()
+                .contains(PageFlags::PG_UNEVICTABLE | PageFlags::PG_UPTODATE)
+            || !matches!(page_guard.page_type(), PageType::Normal)
+        {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let paddr = page.phys_address();
+        drop(page_guard);
+        let registered = page_manager_lock()
+            .get(&paddr)
+            .is_some_and(|registered| Arc::ptr_eq(&registered, &page));
+        if !registered {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        let address = pfm.address_aligned_down();
+        let mm = pfm.mm().clone();
+        let _pt_edit = mm.page_table_edit();
+        let writable = vm_flags.contains(VmFlags::VM_WRITE);
+        if let Some(expected) = expected {
+            if expected != paddr {
+                return VmFaultReason::VM_FAULT_SIGBUS;
+            }
+            let Some(mut entry) = pfm.mapper.get_entry(address, 0) else {
+                return VmFaultReason::VM_FAULT_NOPAGE;
+            };
+            if entry.address() != Ok(expected) {
+                return VmFaultReason::VM_FAULT_NOPAGE;
+            }
+            let table = pfm.mapper.get_table(address, 0).unwrap();
+            let index = table.index_of(address).unwrap();
+            entry.set_flags(pte_flags.set_write(writable).set_dirty(writable));
+            table.set_entry(index, entry);
+            mm.flush_tlb_range(
+                address,
+                VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
+                MMArch::PAGE_SHIFT as u8,
+                false,
+            );
+        } else {
+            if pfm.mapper.get_entry(address, 0).is_some() {
+                return VmFaultReason::VM_FAULT_NOPAGE;
+            }
+            match pfm.mapper.try_map_phys(
+                address,
+                paddr,
+                pte_flags.set_write(writable),
+                Some(&pfm.creator_object),
+            ) {
+                Ok(Some(flush)) => flush.flush(),
+                Ok(None) => return VmFaultReason::VM_FAULT_OOM,
+                Err(failure) => return pfm.fail_charge(failure),
+            }
+        }
+        vma.lock().set_mapped(true);
+        VmFaultReason::VM_FAULT_COMPLETED
     }
 
     /// 通用的VMA文件映射错误处理函数

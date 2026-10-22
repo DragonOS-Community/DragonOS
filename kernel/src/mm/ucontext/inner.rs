@@ -199,17 +199,17 @@ impl InnerAddressSpace {
                         if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
                             unsafe {
                                 if is_shared {
-                                    let child_flags =
-                                        if page_manager_guard.get(&phys_addr).is_none()
-                                            && vm_flags.contains(VmFlags::VM_MIXEDMAP)
-                                        {
-                                            // Preserve the actual external PTE permission. Using
-                                            // VMA page flags here could make a deliberately RO DAX
-                                            // PFN writable in the child without pfn_mkwrite.
-                                            old_flags
-                                        } else {
-                                            page_flags
-                                        };
+                                    let child_flags = if vm_flags.contains(VmFlags::VM_PFNMAP)
+                                        || (page_manager_guard.get(&phys_addr).is_none()
+                                            && vm_flags.contains(VmFlags::VM_MIXEDMAP))
+                                    {
+                                        // Preserve the actual external PTE permission. Using
+                                        // VMA page flags here could make a deliberately RO DAX
+                                        // PFN writable in the child without pfn_mkwrite.
+                                        old_flags
+                                    } else {
+                                        page_flags
+                                    };
                                     if new_mapper
                                         .try_map_phys(
                                             current_page,
@@ -244,7 +244,11 @@ impl InnerAddressSpace {
                                         return Err(SystemError::ENOMEM.into());
                                     }
                                 }
-                                if let Some(page) = page_manager_guard.get(&phys_addr) {
+                                if let PresentPfn::Managed(page) = LockedVMA::classify_present_pfn(
+                                    &mut page_manager_guard,
+                                    phys_addr,
+                                    vm_flags,
+                                ) {
                                     page.write().insert_vma(
                                         new_vma.clone(),
                                         current_page,

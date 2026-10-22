@@ -905,7 +905,9 @@ impl InnerAddressSpace {
                         unsafe { flush.ignore() };
                         tlb.accumulate_range(dst);
                     }
-                    if let Some(page) = page_manager_guard.get(&paddr) {
+                    if let PresentPfn::Managed(page) =
+                        LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                    {
                         page.write().remove_vma(new_vma.as_ref());
                     }
                 }

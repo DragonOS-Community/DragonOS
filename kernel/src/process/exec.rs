@@ -425,7 +425,12 @@ impl ExecParam {
         // XOL transaction before the old mm can be replaced so its site and
         // slot lease cannot survive into the new image.
         #[cfg(target_arch = "x86_64")]
-        crate::exception::uprobe::cleanup_task_active_xol(&me);
+        {
+            crate::exception::uprobe::cleanup_task_active_xol(&me);
+            // Live uretprobe hijacks reference the old address space's
+            // trampoline; their user stacks are discarded with the image.
+            me.uprobe.clear_urets();
+        }
 
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 

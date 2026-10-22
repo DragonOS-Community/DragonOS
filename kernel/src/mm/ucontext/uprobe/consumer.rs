@@ -90,6 +90,9 @@ impl UprobeConsumerScope {
 
 pub struct UprobeConsumerRuntime {
     pub event_callback: Option<Arc<dyn uprobe::CallBackFunc>>,
+    /// True for uretprobes (perf `config` bit 0): the site's entry hit only
+    /// hijacks the user return address; the callback runs on the trampoline.
+    pub is_retprobe: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +101,12 @@ pub struct UprobeConsumerRuntimeSnapshot {
 }
 
 impl UprobeConsumerRuntimeSnapshot {
+    /// Whether this consumer is a uretprobe: delivers on the trampoline hit
+    /// instead of the entry hit.
+    pub fn is_retprobe(&self) -> bool {
+        self.endpoint.is_retprobe
+    }
+
     pub fn deliver(&self, current: &Arc<ProcessControlBlock>, args: &dyn uprobe::ProbeArgs) {
         if !self
             .endpoint
@@ -225,6 +234,7 @@ struct UprobeDeliveryEndpoint {
     gate: UprobeAdmissionGate,
     callback: Option<Weak<dyn uprobe::CallBackFunc>>,
     task_scope: Option<UprobeTaskScope>,
+    is_retprobe: bool,
 }
 
 struct UprobeConsumerEpoch {
@@ -240,6 +250,7 @@ impl UprobeConsumerEpoch {
                 gate: UprobeAdmissionGate::pending(),
                 callback: runtime.event_callback.as_ref().map(Arc::downgrade),
                 task_scope,
+                is_retprobe: runtime.is_retprobe,
             }),
         })
     }
@@ -402,6 +413,8 @@ pub struct UprobeConsumerReg {
     pub scope: UprobeConsumerScope,
     pub event_callback: Option<Arc<dyn uprobe::CallBackFunc>>,
     pub enabled: bool,
+    /// perf `config` bit 0: install as a uretprobe.
+    pub is_retprobe: bool,
 }
 
 /// Global registry: inode id -> file offset -> (consumer id, callback).
@@ -535,6 +548,7 @@ pub fn uprobe_registry_add(
         },
         UprobeConsumerRuntime {
             event_callback: reg.event_callback.clone(),
+            is_retprobe: reg.is_retprobe,
         },
         reg.enabled,
     );

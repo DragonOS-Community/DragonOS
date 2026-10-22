@@ -4417,6 +4417,59 @@ impl PageCache {
         Ok(())
     }
 
+    /// Add a fixed alias of an intrinsically unevictable private ring page.
+    ///
+    /// Both indices share one entry (including pins and accounting), so aliases
+    /// do not charge another physical page. Such unowned caches have no resize,
+    /// writeback or independent alias removal; all indices retire together.
+    pub(crate) fn alias_preallocated_unevictable_page(
+        &self,
+        source_index: usize,
+        alias_index: usize,
+    ) -> Result<(), SystemError> {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        loop {
+            let mut capacity = self
+                .prepare_table_capacity(1, &creator)
+                .map_err(Self::legacy_allocation_error)?;
+            let reclassify = self.reclassify_lock.lock();
+            let mut guard = self.inner.lock();
+            if guard.accounting_backend.is_some() || self.backend().is_some() {
+                return Err(SystemError::EINVAL);
+            }
+            if guard.pages.contains_key(&alias_index) {
+                return Err(SystemError::EEXIST);
+            }
+            let entry = guard.get_entry(source_index).ok_or(SystemError::ENOENT)?;
+            let page = entry.page.read();
+            if !entry.is_read_ready()
+                || !page.intrinsic_unevictable()
+                || !page.flags().contains(PageFlags::PG_UNEVICTABLE)
+                || !matches!(page.page_type(), PageType::Normal)
+            {
+                return Err(SystemError::EINVAL);
+            }
+            drop(page);
+            let retired = match guard.install_capacity(&mut capacity, 1) {
+                Ok(retired) => retired,
+                Err(()) => {
+                    drop(guard);
+                    drop(reclassify);
+                    drop(capacity);
+                    continue;
+                }
+            };
+            // Do not call insert_preallocated_entry/account_insert: this exact
+            // entry already owns the one physical-page accounting membership.
+            guard.pages.insert(alias_index, entry);
+            drop(guard);
+            drop(reclassify);
+            drop(retired);
+            return Ok(());
+        }
+    }
+
     /// Insert a pre-allocated page into page cache and mark it ready.
     /// This is for special in-kernel users (e.g. perf ring buffers).
     pub fn insert_preallocated_unevictable_page(

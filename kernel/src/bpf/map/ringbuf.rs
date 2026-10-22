@@ -35,8 +35,8 @@ use crate::mm::allocator::page_frame::PageFrameCount;
 use crate::mm::page::allocate_registered_intrinsic_unevictable_pages_exact;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 
-use super::BpfMapCommonOps;
 use super::util::BpfMapMeta;
+use super::BpfMapCommonOps;
 
 const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 /// 8-byte record header: u32 len|flags + u32 owner tag.
@@ -154,13 +154,22 @@ impl RingBufCore {
         if off + need > self.data_sz {
             pad = self.data_sz - off - REC_HDR_SIZE;
         }
-        let total_need = need + if pad > 0 { REC_HDR_SIZE + round_up(pad, 8) } else { 0 };
+        let total_need = need
+            + if pad > 0 {
+                REC_HDR_SIZE + round_up(pad, 8)
+            } else {
+                0
+            };
         if self.data_sz as u64 - used < total_need as u64 {
             return core::ptr::null_mut();
         }
 
         if pad > 0 {
-            self.write_hdr(off, ((pad as u32) << 2) | HDR_BUSY_BIT | HDR_DISCARD_BIT, self.id);
+            self.write_hdr(
+                off,
+                ((pad as u32) << 2) | HDR_BUSY_BIT | HDR_DISCARD_BIT,
+                self.id,
+            );
             prod += (REC_HDR_SIZE + round_up(pad, 8)) as u64;
             off = 0;
         }
@@ -232,7 +241,8 @@ impl RingBufMap {
         ))?;
         let phy_addr = batch.start_paddr();
         for page in batch.pages() {
-            page.write().add_flags(crate::mm::page::PageFlags::PG_UPTODATE);
+            page.write()
+                .add_flags(crate::mm::page::PageFlags::PG_UPTODATE);
         }
         let virt = unsafe { MMArch::phys_2_virt(phy_addr) }.ok_or(SystemError::ENOMEM)?;
 

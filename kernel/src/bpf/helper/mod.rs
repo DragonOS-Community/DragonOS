@@ -8,11 +8,11 @@ use crate::bpf::map::ringbuf::{ringbuf_discard, ringbuf_reserve, ringbuf_submit}
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
+use crate::mm::VirtAddr;
+use crate::process::ProcessManager;
 use crate::smp::core::smp_get_processor_id;
 use crate::syscall::user_access::copy_from_user_protected;
 use crate::time::Instant;
-use crate::mm::VirtAddr;
-use crate::process::ProcessManager;
 use alloc::collections::BTreeMap;
 use core::ffi::c_void;
 use system_error::SystemError;
@@ -310,10 +310,8 @@ pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
     let limit = dst.len() - 1;
     while end < limit {
         let mut byte = [0u8; 1];
-        let ok = unsafe {
-            copy_from_user_protected(&mut byte, VirtAddr::new(src as usize + end))
-        }
-        .is_ok();
+        let ok = unsafe { copy_from_user_protected(&mut byte, VirtAddr::new(src as usize + end)) }
+            .is_ok();
         if !ok || byte[0] == 0 {
             break;
         }
@@ -403,12 +401,7 @@ unsafe fn raw_ringbuf_discard(data: *mut c_void, flags: u64) -> u64 {
 }
 
 /// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_output/
-unsafe fn raw_ringbuf_output(
-    map: *mut c_void,
-    data: *mut c_void,
-    size: u64,
-    _flags: u64,
-) -> u64 {
+unsafe fn raw_ringbuf_output(map: *mut c_void, data: *mut c_void, size: u64, _flags: u64) -> u64 {
     let map = unsafe { &*(map as *const BpfMap) };
     let dst = ringbuf_reserve(map, size, 0);
     if dst.is_null() {

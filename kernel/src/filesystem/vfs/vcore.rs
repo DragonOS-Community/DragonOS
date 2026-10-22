@@ -1,4 +1,4 @@
-use core::{hint::spin_loop, sync::atomic::Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
@@ -459,10 +459,12 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
     let rootfs = match rootfs {
         Ok(fs) => fs,
         Err(e) => {
-            error!("Failed to initialize rootfs filesystem: {:?}", e);
-            loop {
-                spin_loop();
-            }
+            // Linux 语义（VFS: panic("VFS: Unable to mount root fs on ...")）：
+            // 根文件系统挂载失败是致命错误。这里必须把错误向上传递，让
+            // initial_kernel_thread 以带错误码的 panic 终止；不得静默忙转，
+            // 否则一个可诊断的挂载错误会变成“无输出挂死”，且 panic 输出
+            // 路径（含错误码）也会被跳过。
+            return Err(e);
         }
     };
 
@@ -477,9 +479,8 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             "Failed to migrate virtual filesystem to rootfs ({}).",
             fs_name
         );
-        loop {
-            spin_loop();
-        }
+        // 与 Linux 一致：根文件系统就位失败必须显式失败，不能静默忙转。
+        return r;
     }
     info!("Successfully migrate rootfs to {}!", fs_name);
 
@@ -498,9 +499,8 @@ pub fn change_root_fs() -> Result<(), SystemError> {
 
     if r.is_err() {
         error!("Failed to migrate virtual filesystem to initramfs!");
-        loop {
-            spin_loop();
-        }
+        // 与 mount_root_fs 一致：显式失败，不能静默忙转。
+        return r;
     }
     info!("Successfully migrate rootfs to initramfs!");
 

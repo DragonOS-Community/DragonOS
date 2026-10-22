@@ -1559,6 +1559,14 @@ pub fn enqueue_task_on_cpu(
 
     if was_idle && !rq_is_idle_cpu(rq) {
         IDLE_CPUS.clear(target_cpu);
+        // 对齐 Linux ttwu_queue_wakable→check_preempt_curr 的关键不变式：
+        // idle CPU 大概率已 halt，仅置 NEED_SCHEDULE 无法唤醒它——远端
+        // 入队后必须无条件 kick 该 CPU，否则任务躺在 runqueue 等
+        // 自然调度点（futex wake-probe 实测：wake 返回 1 但 worker
+        // 1 秒不跑，直到下一次调度点才被捞起）。
+        if target_cpu != smp_get_processor_id() {
+            send_resched_ipi(target_cpu);
+        }
     }
 
     rq.check_preempt_current(pcb, wake_flags);

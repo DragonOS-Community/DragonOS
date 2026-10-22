@@ -6,6 +6,7 @@
   target,
   buildDir,
   testOpt,
+  nightlyRustPlatform,
   rootfsType ? "vfat",
   diskPath,
   partitionType ? "mbr",
@@ -20,6 +21,7 @@ let
       system
       target
       testOpt
+      nightlyRustPlatform
       ;
   };
 

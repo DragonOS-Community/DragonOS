@@ -89,6 +89,12 @@
             '';
           };
 
+          # 与内核相同的 nightly 工具链，供需要 nightly 特性的宿主辅助程序使用
+          rust-nightly-platform = pkgs.makeRustPlatform {
+            cargo = rust-toolchain-raw;
+            rustc = rust-toolchain-raw;
+          };
+
           # 编译内核所需的工具，devShell 与 yolo 共用，避免依赖宿主机工具链
           kernelBuildInputs = with pkgs; [
             git
@@ -175,6 +181,7 @@
                   buildDir
                   diskPath
                   ;
+                nightlyRustPlatform = rust-nightly-platform;
               };
 
               gdbBin = if target == "x86_64" then "rust-gdb" else "gdb-multiarch";

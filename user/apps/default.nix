@@ -5,6 +5,7 @@
   system,
   target,
   testOpt,
+  nightlyRustPlatform,
 }:
 
 # Return a list of app derivations to be copied into the rootfs.
@@ -56,6 +57,7 @@ let
 
   dunitest = (
     pkgs.callPackage ./tests/dunitest {
+      inherit nightlyRustPlatform;
       installDir = testOpt.dunitest.testDir;
     }
   );

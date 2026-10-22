@@ -5,6 +5,7 @@
   system,
   target,
   testOpt,
+  nightlyRustPlatform,
 }:
 
 # 产物是一个未压缩的 docker 镜像 tar，其中的 layer.tar 即 rootfs 内容
@@ -17,6 +18,7 @@ let
       system
       target
       testOpt
+      nightlyRustPlatform
       ;
   };
 

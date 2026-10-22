@@ -1,6 +1,5 @@
 use alloc::{
     boxed::Box,
-    collections::LinkedList,
     sync::{Arc, Weak},
 };
 #[cfg(any(
@@ -43,9 +42,7 @@ use crate::{
 
 use super::constant::*;
 
-#[path = "queue.rs"]
-mod queue;
-use queue::{Node as WaitNode, Queue as WaitQueueNodes};
+use crate::libs::prepared_queue::{Node as WaitNode, Queue as WaitQueueNodes};
 
 #[cfg(feature = "mm_selftest")]
 #[path = "wake_selftest.rs"]
@@ -66,7 +63,7 @@ impl FutexData {
         unsafe { ResourceMutexGuard::lock(&FUTEX_DATA.as_ref().unwrap().data) }
     }
 
-    fn remove_empty_locked(
+    pub(super) fn remove_empty_locked(
         map: &mut HashMap<FutexKey, FutexHashBucket>,
         key: &FutexKey,
     ) -> Option<FutexHashBucket> {
@@ -93,7 +90,7 @@ pub struct FutexHashBucket {
     pub(super) chain: WaitQueueNodes<Arc<FutexObj>>,
     // PI futex state
     pub(super) pi_owner: u32,
-    pub(super) pi_waiters: LinkedList<Arc<FutexObj>>,
+    pub(super) pi_waiters: WaitQueueNodes<Arc<super::pi_futex::PiWaiter>>,
 }
 
 impl FutexHashBucket {
@@ -101,7 +98,7 @@ impl FutexHashBucket {
         Self {
             chain: WaitQueueNodes::new(),
             pi_owner: 0,
-            pi_waiters: LinkedList::new(),
+            pi_waiters: WaitQueueNodes::new(),
         }
     }
 
@@ -266,7 +263,7 @@ impl Futex {
         };
     }
 
-    fn fault_in_user_writeable_u32(uaddr: VirtAddr) -> Result<(), SystemError> {
+    pub(super) fn fault_in_user_writeable_u32(uaddr: VirtAddr) -> Result<(), SystemError> {
         access_ok(uaddr, core::mem::size_of::<u32>()).map_err(|_| SystemError::EFAULT)?;
 
         let fault_region = VirtRegion::new(
@@ -943,7 +940,7 @@ impl Futex {
     }
 
     /// One aligned value load, with no prefault or sleeping fault under map.
-    fn read_user_u32_nofault(uaddr: VirtAddr) -> Result<u32, SystemError> {
+    pub(super) fn read_user_u32_nofault(uaddr: VirtAddr) -> Result<u32, SystemError> {
         if uaddr.data() & (core::mem::align_of::<u32>() - 1) != 0 {
             return Err(SystemError::EINVAL);
         }
@@ -1045,7 +1042,11 @@ impl Futex {
         Err(SystemError::ENOSYS)
     }
 
-    fn futex_cmpxchg_user(uaddr: VirtAddr, expected: u32, new: u32) -> Result<u32, SystemError> {
+    pub(super) fn futex_cmpxchg_user(
+        uaddr: VirtAddr,
+        expected: u32,
+        new: u32,
+    ) -> Result<u32, SystemError> {
         if uaddr.data() & (core::mem::align_of::<u32>() - 1) != 0 {
             return Err(SystemError::EINVAL);
         }
@@ -2137,10 +2138,14 @@ impl RobustListHead {
                         | if has_more { FUTEX_WAITERS } else { 0 };
                     match Futex::futex_cmpxchg_user(futex_uaddr, uval, new_val) {
                         Ok(observed) if observed == uval => {
-                            let removed =
-                                bucket.pi_waiters.pop_front().expect("observed PI waiter");
+                            let removed = bucket
+                                .pi_waiters
+                                .pop_node()
+                                .expect("observed PI waiter")
+                                .into_value();
                             assert!(Arc::ptr_eq(&removed, &next_waiter));
                             bucket.pi_owner = next_waiter.tid;
+                            next_waiter.hand_off(FUTEX_OWNER_DIED);
                             drop(futex_map_guard);
                             next_waiter.waker.wake();
                             return Ok(true);

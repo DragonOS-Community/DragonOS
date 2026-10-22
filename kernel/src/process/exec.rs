@@ -314,16 +314,23 @@ impl ExecParam {
     }
 
     /// Apply Linux `would_dump()` semantics to this executable or interpreter.
-    /// All recursive ELF ExecParams share the same prospective AddressSpace,
-    /// so the namespace promotion naturally converges without a second builder.
+    /// Main executables and interpreters share the prospective AddressSpace,
+    /// so namespace promotion converges without another process-init builder.
     pub(crate) fn would_dump_current_file(&self) -> Result<(), SystemError> {
-        let inode = self.file.inode();
-        let metadata = self.file.metadata()?;
+        Self::would_dump_file(&self.file, &self.vm)
+    }
+
+    pub(crate) fn would_dump_file(
+        file: &Arc<File>,
+        vm: &Arc<AddressSpace>,
+    ) -> Result<(), SystemError> {
+        let inode = file.inode();
+        let metadata = file.metadata()?;
         if check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ).is_ok() {
             return Ok(());
         }
 
-        let mut user_ns = self.vm.user_ns();
+        let mut user_ns = vm.user_ns();
         loop {
             let maps_ids = {
                 let inner = user_ns.inner.lock();
@@ -338,7 +345,7 @@ impl ExecParam {
             };
             user_ns = parent;
         }
-        self.vm.enforce_exec_nondump_in(user_ns);
+        vm.enforce_exec_nondump_in(user_ns);
         Ok(())
     }
 

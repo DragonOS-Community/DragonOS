@@ -55,5 +55,58 @@ pub(crate) fn run() -> bool {
                 .iter()
                 .all(|bytes| *bytes == 0))
     })();
+    matches!(result, Ok(true)) && metadata_birth()
+}
+
+/// Exercise the actual parser allocation and cached-table consumer. The
+/// existing scratch test entry covers this metadata boundary as well.
+fn metadata_birth() -> bool {
+    use crate::mm::oom::denial;
+    let result = (|| -> Result<bool, SystemError> {
+        let fs = RamFS::new();
+        let inode = File::recover_io(|| {
+            fs.root_inode()
+                .create("metadata", FileType::File, InodeMode::S_IRWXU)
+        })?;
+        File::recover_io(|| inode.resize(128))?;
+        let file = File::recover_io(|| File::new(inode.clone(), FileFlags::O_RDONLY))?;
+        file.lseek(SeekFrom::SeekSet(7))?;
+        let mut bytes = [0; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[32] = 64; // e_phoff
+        bytes[54] = 56; // e_phentsize
+        bytes[56] = 1; // e_phnum
+        let header = ElfLoader::parse_ehdr(&bytes).map_err(|_| SystemError::ENOEXEC)?;
+        let denied = {
+            let _scope = denial::Scope::enter(true);
+            let before = denial::rejected_count();
+            let table = matches!(
+                PreparedElf::prepare(&file, header),
+                Err(SystemError::ENOMEM)
+            );
+            let path = matches!(ElfLoader::zeroed_metadata(32), Err(SystemError::ENOMEM));
+            table && path && denial::rejected_count() >= before + 2
+        };
+        let header = ElfLoader::parse_ehdr(&bytes).map_err(|_| SystemError::ENOEXEC)?;
+        let prepared = PreparedElf::prepare(&file, header)?;
+        let cached = {
+            let _scope = denial::Scope::enter(true);
+            let before = denial::rejected_count();
+            prepared.segments().into_iter().count() == 1 && before == denial::rejected_count()
+        };
+        bytes[56] = 0xff;
+        bytes[57] = 0xff;
+        let extended = ElfLoader::parse_ehdr(&bytes).map_err(|_| SystemError::ENOEXEC)?;
+        let bounded = {
+            let _scope = denial::Scope::enter(true);
+            let before = denial::rejected_count();
+            ElfLoader::program_headers_size(&extended) == Err(SystemError::ENOEXEC)
+                && denial::rejected_count() == before
+        };
+        Ok(denied && cached && bounded && file.pos() == 7)
+    })();
     matches!(result, Ok(true))
 }

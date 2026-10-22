@@ -1,25 +1,30 @@
-//! Owning FIFO nodes prepared before publishing a normal futex wait. Nodes can
-//! move between buckets without allocation. PI queues retain their own policy.
+//! Owning FIFO with fallibly prepared nodes. Publication, transfer and retirement
+//! do not allocate; policy and synchronization belong to the caller.
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 use system_error::SystemError;
 
-pub(super) struct Node<T> {
+pub(crate) struct Node<T> {
     value: T,
     next: Option<Box<Node<T>>>,
 }
 
 impl<T> Node<T> {
-    pub(super) fn try_new(value: T) -> Result<Box<Self>, SystemError> {
+    pub(crate) fn try_new(value: T) -> Result<Box<Self>, SystemError> {
         Box::try_new(Self { value, next: None }).map_err(|_| SystemError::ENOMEM)
     }
 
-    pub(super) fn value(&self) -> &T {
+    pub(crate) fn into_value(self) -> T {
+        debug_assert!(self.next.is_none());
+        self.value
+    }
+
+    pub(crate) fn value(&self) -> &T {
         &self.value
     }
 }
 
-pub(super) struct Queue<T> {
+pub(crate) struct Queue<T> {
     head: Option<Box<Node<T>>>,
     // Non-owning pointer into head's uniquely owned chain; null iff empty.
     tail: Option<NonNull<Node<T>>>,
@@ -31,24 +36,24 @@ unsafe impl<T: Send> Send for Queue<T> {}
 unsafe impl<T: Sync> Sync for Queue<T> {}
 
 impl<T> Queue<T> {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             head: None,
             tail: None,
             len: 0,
         }
     }
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
-    pub(super) fn front(&self) -> Option<&T> {
+    pub(crate) fn front(&self) -> Option<&T> {
         self.head.as_ref().map(|n| &n.value)
     }
 
-    pub(super) fn push_node(&mut self, mut node: Box<Node<T>>) {
+    pub(crate) fn push_node(&mut self, mut node: Box<Node<T>>) {
         debug_assert!(node.next.is_none());
         let new_tail = NonNull::from(node.as_mut());
         if let Some(mut tail) = self.tail {
@@ -64,7 +69,7 @@ impl<T> Queue<T> {
         self.len += 1;
     }
 
-    pub(super) fn pop_node(&mut self) -> Option<Box<Node<T>>> {
+    pub(crate) fn pop_node(&mut self) -> Option<Box<Node<T>>> {
         let mut node = self.head.take()?;
         self.head = node.next.take();
         self.len -= 1;
@@ -74,11 +79,27 @@ impl<T> Queue<T> {
         Some(node)
     }
 
-    pub(super) fn iter(&self) -> Iter<'_, T> {
+    /// Detach matching nodes for retirement after the caller releases its lock.
+    /// Both partitions retain FIFO order; no values are dropped during transfer.
+    pub(crate) fn extract_if(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Self {
+        let mut retained = Self::new();
+        let mut extracted = Self::new();
+        while let Some(node) = self.pop_node() {
+            if predicate(node.value()) {
+                extracted.push_node(node);
+            } else {
+                retained.push_node(node);
+            }
+        }
+        *self = retained;
+        extracted
+    }
+
+    pub(crate) fn iter(&self) -> Iter<'_, T> {
         Iter(self.head.as_deref())
     }
 
-    pub(super) fn split_off(&mut self, at: usize) -> Self {
+    pub(crate) fn split_off(&mut self, at: usize) -> Self {
         assert!(at <= self.len);
         if at == 0 {
             return core::mem::replace(self, Self::new());
@@ -102,7 +123,7 @@ impl<T> Queue<T> {
         }
     }
 
-    pub(super) fn append(&mut self, other: &mut Self) {
+    pub(crate) fn append(&mut self, other: &mut Self) {
         if other.is_empty() {
             return;
         }
@@ -127,7 +148,7 @@ impl<T> Drop for Queue<T> {
     }
 }
 
-pub(super) struct Iter<'a, T>(Option<&'a Node<T>>);
+pub(crate) struct Iter<'a, T>(Option<&'a Node<T>>);
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
@@ -168,6 +189,24 @@ mod tests {
         source.append(&mut all);
         source.push_node(Node::try_new(9).unwrap());
         assert_eq!(source.front(), Some(&9));
+    }
+
+    #[test]
+    fn extraction_preserves_order_and_tail_for_reuse() {
+        let mut queue = Queue::new();
+        for value in 0..100 {
+            queue.push_node(Node::try_new(value).unwrap());
+        }
+        let mut even = queue.extract_if(|value| value % 2 == 0);
+        assert!(queue.iter().copied().eq((0..100).filter(|v| v % 2 != 0)));
+        assert!(even.iter().copied().eq((0..100).filter(|v| v % 2 == 0)));
+        let mut all = queue.extract_if(|_| true);
+        assert!(queue.is_empty());
+        queue.push_node(Node::try_new(101).unwrap());
+        assert_eq!(queue.pop_node().unwrap().into_value(), 101);
+        all.append(&mut even);
+        assert_eq!(all.len(), 100);
+        assert!(even.is_empty());
     }
 
     #[test]

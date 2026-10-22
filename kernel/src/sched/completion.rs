@@ -1,168 +1,171 @@
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
 use system_error::SystemError;
 
 use crate::{
-    arch::ipc::signal::Signal,
     libs::{
+        resource_wait::{self, ResourceWaitOutcome, ResourceWaitQueue, WaitMode},
         spinlock::SpinLock,
-        wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
-    time::timer::{clock, Timer},
+    time::timer::{clock, Timer, TimerFunction},
 };
 
 const COMPLETE_ALL: u32 = u32::MAX;
 const MAX_TIMEOUT: i64 = i64::MAX;
 
-/// Signal response mode used while waiting on a completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitMode {
-    /// Uninterruptible sleep: ignores all signals.
-    Uninterruptible,
-    /// Interruptible by any pending signal.
-    Interruptible,
-    /// Interruptible only by fatal signals.
-    Killable,
-}
-
+/// A counted completion. A resource borrow pins its allocation-free wait key.
 #[derive(Debug)]
 pub struct Completion {
     inner: SpinLock<InnerCompletion>,
+    wait_queue: ResourceWaitQueue,
+}
+
+/// The callback never dereferences the completion: cancellation can race a
+/// running timer, whose late notification must remain safe after wait returns.
+#[derive(Debug)]
+struct CompletionTimeout(usize);
+impl TimerFunction for CompletionTimeout {
+    fn run(&mut self) -> Result<(), SystemError> {
+        resource_wait::notify_resource_all(self.0);
+        Ok(())
+    }
 }
 
 impl Completion {
     pub const fn new() -> Self {
         Self {
             inner: SpinLock::new(InnerCompletion::new()),
+            wait_queue: ResourceWaitQueue::new(),
         }
     }
 
-    /// @brief 基本函数：通用的处理wait命令的函数(即所有wait_for_completion函数最核心部分在这里)
-    ///
-    /// @param timeout jiffies
-    /// @param mode the signal response mode of the sleep
-    /// @return 返回剩余时间或者SystemError
-    fn do_wait_for_common(&self, timeout: i64, mode: WaitMode) -> Result<i64, SystemError> {
-        let pcb = ProcessManager::current_pcb();
+    fn consume(&self) -> bool {
+        self.inner.lock_irqsave().consume()
+    }
 
-        // Timer consumes an absolute expiry, whereas this API accepts a duration.
-        // Keep one deadline across spurious wakeups instead of restarting the timeout.
+    fn completed_result(deadline: Option<u64>) -> i64 {
+        deadline.map_or(MAX_TIMEOUT, |end| {
+            end.saturating_sub(clock()).min(i64::MAX as u64).max(1) as i64
+        })
+    }
+
+    /// Completion wins over a simultaneous timeout, as in Linux's swait loop.
+    fn outcome(&self, deadline: Option<u64>) -> Option<ResourceWaitOutcome<i64>> {
+        let mut inner = self.inner.lock_irqsave();
+        if inner.consume() {
+            Some(ResourceWaitOutcome::Acquired(Self::completed_result(
+                deadline,
+            )))
+        } else if deadline.is_some_and(|end| clock() >= end) {
+            Some(ResourceWaitOutcome::Cancelled(0))
+        } else {
+            None
+        }
+    }
+
+    fn do_wait_for_common(&self, timeout: i64, mode: WaitMode) -> Result<i64, SystemError> {
+        self.finish_wait(self.wait_inner(timeout, mode))
+    }
+
+    fn finish_wait(&self, result: Result<i64, SystemError>) -> Result<i64, SystemError> {
+        // A counter can receive several releases before its first notified
+        // waiter runs. Relay a remaining ticket only after wait_inner retired
+        // that waiter's Registration and local count, so it cannot select
+        // itself again. COMPLETE_ALL already broadcast to every waiter.
+        if result.as_ref().is_ok_and(|left| *left > 0) {
+            let remaining = {
+                let inner = self.inner.lock_irqsave();
+                inner.done != 0 && inner.done != COMPLETE_ALL
+            };
+            if remaining {
+                self.wait_queue.notify_one();
+            }
+        }
+        result
+    }
+
+    fn wait_inner(&self, timeout: i64, mode: WaitMode) -> Result<i64, SystemError> {
         let deadline =
             (timeout != MAX_TIMEOUT).then(|| clock().saturating_add(timeout.max(0) as u64));
-
-        let mut wait_error = None;
-        loop {
-            let remaining =
-                deadline.map(|end| end.saturating_sub(clock()).min(i64::MAX as u64) as i64);
-            // 快路径：已完成直接消费
-            {
-                let mut inner = self.inner.lock_irqsave();
-                if inner.done != 0 {
-                    if inner.done != COMPLETE_ALL {
-                        inner.done = inner.done.saturating_sub(1);
-                    }
-                    return Ok(match remaining {
-                        Some(r) if r > 0 => r,
-                        Some(_) => 1,
-                        None => MAX_TIMEOUT,
-                    });
-                }
-            }
-
-            if let Some(error) = wait_error.take() {
-                return Err(error);
-            }
-
-            // Interruptible mode checks any pending signal; killable only fatal ones; uninterruptible ignores signals.
-            let has_pending = match mode {
-                WaitMode::Uninterruptible => false,
-                WaitMode::Interruptible => pcb.sig_info_irqsave().sig_pending().has_pending(),
-                WaitMode::Killable => Signal::signal_pending_state(false, true, &pcb),
+        if self.consume() {
+            return Ok(Self::completed_result(deadline));
+        }
+        // Match resource_wait admission before preparing a timed wait. A
+        // pending signal must not be hidden by timer ENOMEM or timeout zero.
+        let task = ProcessManager::current_pcb();
+        if mode.interrupted(&task) {
+            return if self.consume() {
+                Ok(Self::completed_result(deadline))
+            } else {
+                Err(SystemError::ERESTARTSYS)
             };
-            if has_pending {
-                return Err(SystemError::ERESTARTSYS);
-            }
+        }
 
-            if remaining.is_some_and(|r| r <= 0) {
-                return Ok(0);
-            }
-
-            // 构造一次等待 + 可选超时定时器
-            let (waiter, waker) = Waiter::new_pair();
-
-            // 注册 waker，并在注册前后都检查 done 以避免丢唤醒
-            {
-                let mut inner = self.inner.lock_irqsave();
-                if inner.done != 0 {
-                    if inner.done != COMPLETE_ALL {
-                        inner.done = inner.done.saturating_sub(1);
-                    }
-                    return Ok(match remaining {
-                        Some(r) if r > 0 => r,
-                        Some(_) => 1,
-                        None => MAX_TIMEOUT,
-                    });
+        // All timer storage is born before registration/prepare_sleep. An
+        // untimed wait, including kthread join, never needs heap storage.
+        let timer = if let Some(expiry) = deadline.filter(|end| *end > clock()) {
+            let prepared = Box::try_new(CompletionTimeout(self.wait_queue.key()))
+                .map_err(|_| SystemError::ENOMEM)
+                .and_then(|callback| Timer::try_prepare(callback, expiry));
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // A completion that arrived during preparation owns the
+                    // result, even if timer allocation concurrently failed.
+                    return if self.consume() {
+                        Ok(Self::completed_result(deadline))
+                    } else {
+                        Err(error)
+                    };
                 }
-                inner.wait_queue.register_waker(waker.clone())?;
-            }
-
-            // 可选定时器
-            let mut timer = None;
-            if let Some(expiry) = deadline {
-                let t = Timer::new(TimeoutWaker::new(waker.clone()), expiry);
-                t.activate();
-                timer = Some(t);
-            }
-
-            // 阻塞等待
-            let wait_res = match mode {
-                WaitMode::Uninterruptible => waiter.wait(false),
-                WaitMode::Interruptible => waiter.wait(true),
-                WaitMode::Killable => waiter.wait_killable(),
             };
+            let timer = prepared.timer();
+            prepared.activate();
+            Some(timer)
+        } else {
+            None
+        };
 
-            // 取消定时器（如果还没超时）
-            if let Some(t) = &timer {
-                if !t.timeout() {
-                    t.cancel();
+        let result = self
+            .wait_queue
+            .wait_with_outcome(mode, || self.outcome(deadline));
+        // Timer retirement/callback destruction never holds the done lock.
+        if let Some(timer) = timer {
+            timer.cancel();
+        }
+        match result {
+            // Resource waits check signals before their predicate. Restore
+            // completion's done-first contract on the cancellation path.
+            Err(error) => {
+                if self.consume() {
+                    Ok(Self::completed_result(deadline))
+                } else {
+                    Err(error)
                 }
             }
-
-            // 从队列摘除自身（若还在）
-            {
-                let inner = self.inner.lock_irqsave();
-                inner.wait_queue.remove_waker(&waiter.waker());
-            }
-
-            // Recheck done under the completion lock before reporting expiry.
-            // A completion racing its timer still consumes the event and returns >= 1.
-            wait_error = wait_res.err();
+            success => success,
         }
     }
 
-    /// @brief 等待指定时间，超时后就返回, 同时设置pcb state为uninteruptible.
-    /// @param timeout 非负整数，等待指定时间，超时后就返回/或者提前done
+    /// Returns zero on expiry, otherwise remaining jiffies (at least one).
     pub fn wait_for_completion_timeout(&self, timeout: i64) -> Result<i64, SystemError> {
         self.do_wait_for_common(timeout, WaitMode::Uninterruptible)
     }
 
-    /// @brief 等待completion命令唤醒进程, 同时设置pcb state 为uninteruptible.
     pub fn wait_for_completion(&self) -> Result<i64, SystemError> {
         self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Uninterruptible)
     }
 
-    /// @brief Wait for the completion to be done, but can be interrupted by any signal
     pub fn wait_for_completion_interruptible(&self) -> Result<i64, SystemError> {
         self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Interruptible)
     }
 
-    /// @brief Wait for the completion to be done, interruptible only by fatal signals.
     pub fn wait_for_completion_killable(&self) -> Result<i64, SystemError> {
         self.do_wait_for_common(MAX_TIMEOUT, WaitMode::Killable)
     }
 
-    /// @brief Wait for the completion to be done, interruptible by any signal, with a timeout
     pub fn wait_for_completion_interruptible_timeout(
         &mut self,
         timeout: i64,
@@ -171,68 +174,58 @@ impl Completion {
         self.do_wait_for_common(timeout, WaitMode::Interruptible)
     }
 
-    /// @brief 唤醒一个wait_queue中的节点
     pub fn complete(&self) {
-        let mut inner = self.inner.lock_irqsave();
-        if inner.done != COMPLETE_ALL {
-            inner.done = inner.done.saturating_add(1);
+        let all = {
+            let mut inner = self.inner.lock_irqsave();
+            if inner.done != COMPLETE_ALL {
+                inner.done = inner.done.saturating_add(1);
+            }
+            inner.done == COMPLETE_ALL
+        };
+        // Saturation publishes the same permanent state as complete_all.
+        if all {
+            self.wait_queue.notify_all();
+        } else {
+            self.wait_queue.notify_one();
         }
-        inner.wait_queue.wakeup(None);
-        // 脱离生命周期，自动释放guard
     }
 
-    /// @brief 永久标记done为Complete_All，并从wait_queue中删除所有节点
     pub fn complete_all(&self) {
-        let mut inner = self.inner.lock_irqsave();
-        inner.done = COMPLETE_ALL;
-        inner.wait_queue.wakeup_all(None);
-        // 脱离生命周期，自动释放guard
+        self.inner.lock_irqsave().done = COMPLETE_ALL;
+        self.wait_queue.notify_all();
     }
 
-    /// @brief @brief 尝试获取completion的一个done！如果您在wait之前加上这个函数作为判断，说不定会加快运行速度。
-    ///
-    /// @return true - 表示不需要wait_for_completion，并且已经获取到了一个completion(即返回true意味着done已经被 减1 )
-    /// @return false - 表示当前done=0，您需要进入等待，即wait_for_completion
     pub fn try_wait_for_completion(&mut self) -> bool {
-        let mut inner = self.inner.lock_irqsave();
-        if inner.done == 0 {
-            return false;
-        }
-
-        if inner.done != 0 {
-            return false;
-        } else if inner.done != COMPLETE_ALL {
-            inner.done -= 1;
-        }
-        return true;
-        // 脱离生命周期，自动释放guard
+        self.consume()
     }
 
-    // @brief 测试一个completion是否有waiter。（即done是不是等于0）
     pub fn completion_done(&self) -> bool {
-        let inner = self.inner.lock_irqsave();
-        if inner.done == 0 {
-            return false;
-        }
-
-        if inner.done == 0 {
-            return false;
-        }
-        return true;
-        // 脱离生命周期，自动释放guard
+        self.inner.lock_irqsave().done != 0
     }
 }
+
 #[derive(Debug)]
 pub struct InnerCompletion {
     done: u32,
-    wait_queue: WaitQueue,
 }
 
 impl InnerCompletion {
-    pub const fn new() -> Self {
-        Self {
-            done: 0,
-            wait_queue: WaitQueue::default(),
+    fn consume(&mut self) -> bool {
+        if self.done == 0 {
+            return false;
         }
+        if self.done != COMPLETE_ALL {
+            self.done -= 1;
+        }
+        true
+    }
+
+    pub const fn new() -> Self {
+        Self { done: 0 }
     }
 }
+
+#[cfg(feature = "mm_selftest")]
+mod selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::wait_protocol_selftest;

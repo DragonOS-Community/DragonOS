@@ -425,9 +425,12 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         self.queue.peek_used()
     }
 
+    /// Read-only backpressure check; submission still rechecks under its lock.
+    pub fn can_submit(&self, flush: bool) -> bool {
+        self.queue.available_desc() >= if flush { 2 } else { 3 }
+    }
+
     /// Returns the size of the device's VirtQueue.
-    ///
-    /// This can be used to tell the caller how many channels to monitor on.
     pub fn virt_queue_size(&self) -> u16 {
         QUEUE_SIZE
     }

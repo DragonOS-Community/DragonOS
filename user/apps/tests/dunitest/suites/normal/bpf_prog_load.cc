@@ -11,8 +11,11 @@
 #include <linux/bpf.h>
 #include <linux/capability.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -82,6 +85,19 @@ bpf_insn Exit() { return Insn(BPF_JMP | BPF_EXIT, 0); }
 
 bpf_insn MovR0(int32_t imm) { return Insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, imm); }
 
+int LoadNamedProgram(const char* name, const void* license) {
+  const bpf_insn instructions[] = {MovR0(0), Exit()};
+  union bpf_attr attr{};
+  attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+  attr.insn_cnt = 2;
+  attr.insns = reinterpret_cast<uintptr_t>(instructions);
+  attr.license = reinterpret_cast<uintptr_t>(license);
+  if (name != nullptr) {
+    std::memcpy(attr.prog_name, name, std::min(std::strlen(name) + 1, sizeof(attr.prog_name)));
+  }
+  return syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+}
+
 // A load result: the returned fd (or -1) and the errno the kernel reported.
 class LoadedProgram {
  public:
@@ -144,6 +160,88 @@ template <typename T>
 void ExpectFailure(const T& result, int expected_errno) {
   EXPECT_FALSE(result.ok());
   EXPECT_EQ(result.err(), expected_errno);
+}
+
+TEST_F(BpfProgLoadTest, ProgramNameUsesLinuxIdentifierAlphabet) {
+  for (const char* name : {"a_b.c1", "", "abcdefghijklmno"}) {
+    ScopedFd fd(LoadNamedProgram(name, "GPL"));
+    EXPECT_GE(fd.get(), 0) << name << " errno=" << errno;
+  }
+  for (const char* name : {"space name", "slash/name", "\xc3\xa9", "abcdefghijklmnop"}) {
+    errno = 0;
+    ScopedFd fd(LoadNamedProgram(name, "GPL"));
+    EXPECT_EQ(fd.get(), -1) << name;
+    EXPECT_EQ(errno, EINVAL) << name;
+  }
+}
+
+TEST_F(BpfProgLoadTest, LicenseIsBoundedRawBytes) {
+  const unsigned char license[] = {0xff, 0};
+  ScopedFd raw(LoadNamedProgram(nullptr, license));
+  EXPECT_GE(raw.get(), 0) << "errno=" << errno;
+  errno = 0;
+  ScopedFd invalid(LoadNamedProgram(nullptr, nullptr));
+  EXPECT_EQ(invalid.get(), -1);
+  EXPECT_EQ(errno, EFAULT);
+}
+
+TEST_F(BpfProgLoadTest, LicenseTruncatesBeforeInaccessiblePage) {
+  const long page_size = sysconf(_SC_PAGESIZE);
+  ASSERT_GT(page_size, 127);
+  void* region = mmap(nullptr, static_cast<size_t>(page_size) * 2,
+                      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(region, MAP_FAILED);
+  char* boundary = static_cast<char*>(region) + page_size;
+  int protected_result = mprotect(boundary, static_cast<size_t>(page_size), PROT_NONE);
+  if (protected_result == 0) {
+    std::memset(boundary - 127, 'X', 127);
+    ScopedFd truncated(LoadNamedProgram(nullptr, boundary - 127));
+    EXPECT_GE(truncated.get(), 0) << "errno=" << errno;
+    boundary[-1] = '\0';
+    ScopedFd early_nul(LoadNamedProgram(nullptr, boundary - 1));
+    EXPECT_GE(early_nul.get(), 0) << "errno=" << errno;
+  }
+  EXPECT_EQ(munmap(region, static_cast<size_t>(page_size) * 2), 0);
+  ASSERT_EQ(protected_result, 0);
+}
+
+TEST_F(BpfProgLoadTest, DescriptorLimitFailureCanRetryAndRetireIdentity) {
+  struct rlimit original {};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  struct rlimit limited = original;
+  limited.rlim_cur = 0;
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &limited), 0);
+  errno = 0;
+  int fd = LoadNamedProgram("retry", "GPL");
+  const int load_errno = errno;
+  const int restored = setrlimit(RLIMIT_NOFILE, &original);
+  ScopedFd unexpected(fd);
+  ASSERT_EQ(restored, 0);
+  EXPECT_EQ(fd, -1);
+  EXPECT_EQ(load_errno, EMFILE);
+  ScopedFd loaded(LoadNamedProgram("retry", "GPL"));
+  ASSERT_GE(loaded.get(), 0) << "errno=" << errno;
+  struct bpf_prog_info info {};
+  union bpf_attr attr {};
+  attr.info.bpf_fd = loaded.get();
+  attr.info.info_len = sizeof(info);
+  attr.info.info = reinterpret_cast<uintptr_t>(&info);
+  ASSERT_EQ(syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)), 0);
+  ASSERT_GT(info.id, 0u);
+  if (!HasCapability(CAP_SYS_ADMIN)) return;
+  attr = {};
+  attr.prog_id = info.id;
+  ScopedFd observer(syscall(SYS_bpf, BPF_PROG_GET_FD_BY_ID, &attr, sizeof(attr)));
+  ASSERT_GE(observer.get(), 0) << "errno=" << errno;
+  loaded.Reset();
+  ScopedFd second(syscall(SYS_bpf, BPF_PROG_GET_FD_BY_ID, &attr, sizeof(attr)));
+  ASSERT_GE(second.get(), 0) << "errno=" << errno;
+  second.Reset();
+  observer.Reset();
+  errno = 0;
+  ScopedFd retired(syscall(SYS_bpf, BPF_PROG_GET_FD_BY_ID, &attr, sizeof(attr)));
+  EXPECT_EQ(retired.get(), -1);
+  EXPECT_EQ(errno, ENOENT);
 }
 
 TEST_F(BpfProgLoadTest, TrailingLdImm64FailsClosed) {

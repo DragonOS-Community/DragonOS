@@ -61,6 +61,7 @@ impl Syscall for SysFutexHandle {
         let (timespec, val2): (Option<PosixTimeSpec>, u32) = match cmd {
             // 与 Linux 语义一致：WAIT 使用相对超时；WAIT_BITSET/LOCK_PI2/WAIT_REQUEUE_PI 使用绝对时间（若带 CLOCKRT）
             FutexArg::FUTEX_WAIT
+            | FutexArg::FUTEX_LOCK_PI
             | FutexArg::FUTEX_WAIT_BITSET
             | FutexArg::FUTEX_WAIT_REQUEUE_PI
             | FutexArg::FUTEX_LOCK_PI2 => {
@@ -267,11 +268,11 @@ pub(super) fn do_futex(
             );
         }
         FutexArg::FUTEX_LOCK_PI => {
-            return Futex::futex_lock_pi(uaddr, flags, timeout);
+            return Futex::futex_lock_pi(uaddr, flags | FutexFlag::FLAGS_CLOCKRT, timeout);
         }
         FutexArg::FUTEX_LOCK_PI2 => {
-            // FUTEX_LOCK_PI2 与 FUTEX_LOCK_PI 行为相同，只是支持 FUTEX_CLOCK_REALTIME
-            // 超时处理已在上层完成，这里直接调用 futex_lock_pi
+            // PI2 defaults to absolute CLOCK_MONOTONIC; the explicit flag
+            // selects absolute CLOCK_REALTIME. LOCK_PI always uses realtime.
             return Futex::futex_lock_pi(uaddr, flags, timeout);
         }
         FutexArg::FUTEX_UNLOCK_PI => {

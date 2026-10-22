@@ -17,6 +17,7 @@ use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{FilePrivateData, FileSystem, IndexNode, Metadata};
 use crate::include::bindings::linux_bpf::{bpf_attr, bpf_prog_type, BPF_F_SLEEPABLE};
 use crate::libs::mutex::MutexGuard;
+use crate::libs::rbtree::{PreparedNode, RBTree};
 use crate::libs::spinlock::SpinLock;
 use crate::process::ProcessManager;
 use alloc::string::String;
@@ -24,7 +25,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, Ordering};
-use hashbrown::HashMap;
 use system_error::SystemError;
 
 #[derive(Debug)]
@@ -46,8 +46,7 @@ const MAX_USED_MAPS: usize = 64;
 
 static NEXT_PROG_ID: AtomicU32 = AtomicU32::new(1);
 lazy_static! {
-    static ref PROGRAMS_BY_ID: SpinLock<HashMap<u32, Weak<BpfProg>>> =
-        SpinLock::new(HashMap::new());
+    static ref PROGRAMS_BY_ID: SpinLock<RBTree<u32, Weak<BpfProg>>> = SpinLock::new(RBTree::new());
 }
 
 impl BpfProg {
@@ -111,6 +110,7 @@ impl BpfProg {
         if self.maps.len() >= MAX_USED_MAPS {
             return Err(SystemError::E2BIG);
         }
+        self.maps.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
         self.maps.push(map);
         Ok(())
     }
@@ -218,20 +218,33 @@ pub fn bpf_prog_load(attr: &bpf_attr) -> Result<usize> {
         BpfProgVerifier::new(prog, log_info.log_level, &mut []).verify(&fd_table)?
     };
     let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
-    let prog = Arc::new(prog);
+    let prog = Arc::try_new(prog).map_err(|_| SystemError::ENOMEM)?;
     let file = File::new_prepared_recovering(prog.clone(), FileFlags::O_RDWR, storage)?;
     let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
-    let fd = File::recover_io(|| {
-        fd_table.alloc_fd_arc(
-            file.clone(),
-            false,
+    // Prepare both registries before the first externally visible insertion.
+    // Unlike a HashMap reserve followed by an unlocked insert, a detached
+    // tree node cannot have its capacity consumed by a concurrent loader.
+    let node = PreparedNode::try_new(id, Arc::downgrade(&prog)).map_err(|_| SystemError::ENOMEM)?;
+    let reservation = File::recover_io(|| {
+        fd_table.reserve::<1>(
             current.nofile_soft_limit(),
+            0,
+            false,
             &crate::cgroup::memory::object_for_task(&current),
         )
-    })
-    .map(|x| x as usize)?;
-    PROGRAMS_BY_ID.lock().insert(id, Arc::downgrade(&prog));
-    Ok(fd)
+    })?;
+    Ok(publish_program(node, reservation, file))
+}
+
+fn publish_program(
+    node: PreparedNode<u32, Weak<BpfProg>>,
+    reservation: crate::filesystem::vfs::fdtable::FdReservation<1>,
+    file: Arc<File>,
+) -> usize {
+    // IDs are unique, monotonic, and never wrap. ID visibility before the fd
+    // matches Linux bpf_prog_alloc_id(); every fallible step is already done.
+    PROGRAMS_BY_ID.lock().insert_prepared(node);
+    reservation.commit_arc(file) as usize
 }
 
 pub fn program_by_id(id: u32) -> Option<Arc<BpfProg>> {
@@ -241,3 +254,6 @@ pub fn program_by_id(id: u32) -> Option<Arc<BpfProg>> {
 pub(in crate::bpf) use info::{get_fd_by_id, get_info_by_fd};
 
 pub(crate) use selftest::run_map_lifetime_selftests;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::program_birth_selftest;

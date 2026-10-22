@@ -7,7 +7,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read_snapshot,
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -35,16 +35,17 @@ impl FileOps for CpuInfoFileOps {
         configure_seq_file(behavior);
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut crate::libs::mutex::MutexGuard<crate::filesystem::vfs::FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // `seq_file` (Linux `seq_open(&cpuinfo_op)`, `fs/proc/cpuinfo.c`): one
         // fd sees one rendered record.
-        proc_read_snapshot(offset, len, buf, &mut data, || {
+        proc_snapshot_operation(operation, data, || {
             let mut content: Vec<u8> = vec![];
             let cpu_manager = smp_cpu_manager();
 

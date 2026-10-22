@@ -38,7 +38,7 @@ pub(super) fn proc_read(
 ///
 /// The fd keeps the bytes a record source produced but the reader has not
 /// drained yet, where those bytes sit in the file, and the cursor the source
-/// resumes from. See [`proc_read_seq()`].
+/// resumes from. See [`proc_seq_operation()`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcfsSeq {
     /// Slice produced by the record source that the reader has not drained.
@@ -54,6 +54,14 @@ pub(crate) struct ProcfsSeq {
 }
 
 impl ProcfsSeq {
+    pub(super) fn read_position(&self) -> usize {
+        self.offset
+    }
+
+    pub(super) fn rewind(&mut self) {
+        self.reset();
+    }
+
     /// Bytes of the current slice that are still to be copied out.
     fn available(&self) -> usize {
         self.rendered.len() - self.taken
@@ -98,157 +106,140 @@ impl ProcfsSeq {
 /// mount table of `/proc/[pid]/mountinfo`.
 ///
 /// Only an incremental source is held to it: the sources that render one whole
-/// record ([`proc_read_snapshot()`], i.e. Linux `single_open()`) put that record
+/// record ([`proc_snapshot_operation()`], i.e. Linux `single_open()`) put that record
 /// in the fd's buffer in one piece, which is what makes an fd a snapshot of it.
 const SEQ_SLICE_MAX: usize = MMArch::PAGE_SIZE;
 
-/// Serves one procfs record the way Linux `seq_read_iter()` does.
-///
-/// The fd holds the bytes of the slice the source produced plus an opaque resume
-/// cursor, and the source is entered only when that buffer runs dry. A record
-/// that changes in between therefore cannot tear the byte stream, and once the
-/// source reports the end of the record the fd keeps reporting EOF.
-///
-/// `source` is handed the cursor of the previous slice (`None` for the first
-/// slice of a record), how many bytes the reader still wants, and an empty
-/// buffer to render into. The wanted byte count is a budget, never more than
-/// [`SEQ_SLICE_MAX`]: an incremental source stops after roughly that much and is
-/// entered again for the next slice, so one read may need several slices, while
-/// a source that renders one whole record ignores the budget on purpose. The
-/// source returns the cursor to resume from, or `None` when the record ends
-/// after this slice.
-///
-/// Position rules mirror `seq_read_iter()`/`seq_lseek()`:
-/// - `offset == 0`: rewind, so the record is rendered again;
-/// - `offset == seq.offset`: continue; the source is not entered while buffered
-///   bytes remain, even when the target is already gone;
-/// - any other offset: seek, so the record is rendered again from the start and
-///   the first `offset` bytes are dropped.
-/// - a seek past the end of the record parks the fd at the requested offset, so
-///   reading there reports EOF instead of rendering the record again.
-///
-/// An empty request (`len == 0`, or a full buffer) returns 0 without rendering
-/// anything, and a source that fails after this call already copied bytes out
-/// still reports those bytes, as `seq_read_iter()` returns `copied` and discards
-/// the error once it copied something.
-pub(super) fn proc_read_seq<F>(
-    offset: usize,
-    len: usize,
-    buf: &mut [u8],
+/// A provider supplies the same record source for reads and real seq seeks.
+/// `Seek` is a byte position; the provider cursor remains opaque.
+pub enum ProcfsSeqOperation<'a> {
+    Read {
+        offset: usize,
+        len: usize,
+        buf: &'a mut [u8],
+    },
+    Seek {
+        target: usize,
+    },
+}
+
+impl ProcfsSeq {
+    /// Produce one slice. A failed slice must never leave partially rendered
+    /// bytes visible; the source cursor remains at the failed record.
+    fn fill<F>(&mut self, budget: usize, source: &mut F) -> Result<(), SystemError>
+    where
+        F: FnMut(Option<usize>, usize, &mut Vec<u8>) -> Result<Option<usize>, SystemError>,
+    {
+        self.rendered.clear();
+        self.taken = 0;
+        match source(self.cursor, budget, &mut self.rendered) {
+            Ok(resume) => {
+                self.cursor = resume;
+                self.exhausted = resume.is_none() || self.rendered.is_empty();
+                Ok(())
+            }
+            Err(err) => {
+                self.rendered.clear();
+                Err(err)
+            }
+        }
+    }
+
+    /// Linux traverse(): start over and stop in the record containing target,
+    /// or exactly at a record boundary without prefetching another record.
+    /// Budget one asks incremental providers for one record, while single-open
+    /// providers naturally render their one complete record.
+    fn traverse<F>(&mut self, target: usize, source: &mut F) -> Result<(), SystemError>
+    where
+        F: FnMut(Option<usize>, usize, &mut Vec<u8>) -> Result<Option<usize>, SystemError>,
+    {
+        self.reset();
+        while self.offset < target {
+            if self.available() == 0 {
+                if self.exhausted {
+                    self.offset = target;
+                    break;
+                }
+                if let Err(err) = self.fill(1, source) {
+                    self.reset();
+                    return Err(err);
+                }
+                if self.available() == 0 {
+                    self.offset = target;
+                    break;
+                }
+            }
+            self.discard((target - self.offset).min(self.available()));
+        }
+        Ok(())
+    }
+}
+
+/// Serve the provider's record source with per-open seq state. Reads preserve
+/// the ordinary demand bound; seeks traverse one record at a time and capture
+/// the bytes at the seek syscall, rather than delaying work until the read.
+pub(super) fn proc_seq_operation<F>(
+    operation: ProcfsSeqOperation<'_>,
     data: &mut MutexGuard<FilePrivateData>,
     mut source: F,
 ) -> Result<usize, SystemError>
 where
     F: FnMut(Option<usize>, usize, &mut Vec<u8>) -> Result<Option<usize>, SystemError>,
 {
-    // A read that reaches `read_at()` without the state `ProcFile::open()` left
-    // behind is not a procfs read. Serving it from state that lives no longer
-    // than this call would render and slice the record per read, which is the
-    // tear this driver exists to prevent, so it is refused instead.
     let FilePrivateData::Procfs(pdata) = &mut **data else {
         return Err(SystemError::EINVAL);
     };
     let seq = &mut pdata.seq;
-
-    // `seq_read_iter()` returns before it touches the iterator when the request
-    // is empty, and `copy_to_iter()` never copies more than the iovec holds.
-    let len = len.min(buf.len());
+    let (offset, len, buf) = match operation {
+        ProcfsSeqOperation::Seek { target } => {
+            if target != seq.offset {
+                seq.traverse(target, &mut source)?;
+            }
+            return Ok(target);
+        }
+        ProcfsSeqOperation::Read { offset, len, buf } => (offset, len.min(buf.len()), buf),
+    };
+    // Empty reads do not sample the provider or move its cursor.
     if len == 0 {
         return Ok(0);
     }
-
-    let mut skip = 0;
-    // A read at offset 0 rewinds even when the fd already sits there, because
-    // `seq_read_iter()` resets `m->index`/`m->count` on every `ki_pos == 0`
-    // read: a record that was empty when the fd was first read has to be
-    // rendered again rather than replaying that EOF forever.
-    if offset == 0 || seq.offset != offset {
+    if offset == 0 {
+        // seq_read_iter resets even at a previously observed empty record.
         seq.reset();
-        skip = offset;
+    } else if offset != seq.offset {
+        seq.traverse(offset, &mut source)?;
     }
-
     let mut written = 0;
-    loop {
-        if written >= len {
-            // The reader is satisfied, and `seq_read_iter()` likewise stops
-            // filling once the iterator has no room left.
-            break;
-        }
+    while written < len {
         if seq.available() == 0 {
             if seq.exhausted {
                 break;
             }
-            seq.rendered.clear();
-            seq.taken = 0;
-            let want = (len - written).min(SEQ_SLICE_MAX);
-            let resume = match source(seq.cursor, want, &mut seq.rendered) {
-                Ok(resume) => resume,
-                Err(err) => {
-                    // A slice that could not be produced is not part of the
-                    // record: drop whatever it wrote and keep the cursor, so a
-                    // later read retries that record. Bytes this call already
-                    // copied out still count, the way `seq_read_iter()` returns
-                    // `copied` and drops `err` once it copied something.
-                    seq.rendered.clear();
-                    seq.taken = 0;
-                    if written == 0 {
-                        return Err(err);
-                    }
-                    return Ok(written);
-                }
-            };
-            seq.cursor = resume;
-            // A source that produced nothing cannot make progress, so its slice
-            // is treated as the end of the record instead of being re-entered.
-            seq.exhausted = resume.is_none() || seq.rendered.is_empty();
+            if let Err(err) = seq.fill((len - written).min(SEQ_SLICE_MAX), &mut source) {
+                return if written == 0 { Err(err) } else { Ok(written) };
+            }
             if seq.available() == 0 {
                 break;
             }
         }
-
-        if skip > 0 {
-            let dropped = skip.min(seq.available());
-            seq.discard(dropped);
-            skip -= dropped;
-            continue;
-        }
-
-        // `available() > 0` and `written < len <= buf.len()`, so this slice is
-        // in bounds and never empty.
         let take = seq.available().min(len - written);
         seq.take_into(&mut buf[written..written + take]);
         written += take;
     }
-
-    if skip > 0 {
-        // The seek ran off the end of the record, so no byte of it is pending.
-        // Linux `traverse()` still records `m->read_pos = iocb->ki_pos`, which is
-        // what keeps a later read at that position from rendering again.
-        seq.offset = offset;
-    }
-    return Ok(written);
+    Ok(written)
 }
 
-/// Serves a procfs record that a file renders in one piece, the way Linux
-/// `single_open()` files are read.
-///
-/// `render` is entered on the first read of an fd and again only when that fd is
-/// rewound or seeked. While the fd still holds bytes of its record, a later
-/// `read()` replays them, so content that grows in between neither tears the
-/// byte stream nor revives EOF.
-pub(super) fn proc_read_snapshot<F>(
-    offset: usize,
-    len: usize,
-    buf: &mut [u8],
+/// Single-open providers render their one record in full. The operation and
+/// buffering rules remain shared with incremental seq providers.
+pub(super) fn proc_snapshot_operation<F>(
+    operation: ProcfsSeqOperation<'_>,
     data: &mut MutexGuard<FilePrivateData>,
     mut render: F,
 ) -> Result<usize, SystemError>
 where
     F: FnMut() -> Result<Vec<u8>, SystemError>,
 {
-    proc_read_seq(offset, len, buf, data, move |cursor, _want, out| {
-        // `None` is the start of a record: first read, rewind or seek. Any other
-        // cursor means the whole record already went out in the first slice.
+    proc_seq_operation(operation, data, move |cursor, _want, out| {
         if cursor.is_none() {
             *out = render()?;
         }

@@ -960,6 +960,19 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         }
     }
 
+    /// Optional filesystem-owned seek. Called under the file position lock.
+    /// A handler may update position even on error (seq_lseek resets it after
+    /// a failed traversal). None leaves position unchanged and selects the
+    /// generic VFS implementation. This hook must not call File::lseek again.
+    fn seek(
+        &self,
+        _position: &mut usize,
+        _origin: &crate::driver::base::block::SeekFrom,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        None
+    }
+
     /// Linux `noop_llseek`: ignore offset/whence and return the current f_pos.
     ///
     /// This is distinct from random-access support. Anonymous stream-like

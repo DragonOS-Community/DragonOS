@@ -10,7 +10,7 @@ use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_read_seq,
+        utils::proc_seq_operation,
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -144,23 +144,24 @@ impl FileOps for ArpFileOps {
         Ok(())
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // `seq_file` (`proc_create_net("arp", 0444, net->proc_net,
         // &arp_seq_ops, ...)`, `net/ipv4/arp.c`): one fd holds the block it has
         // not drained yet, never the whole table.
         let netns = {
-            let FilePrivateData::Procfs(pdata) = &*data else {
+            let FilePrivateData::Procfs(pdata) = &**data else {
                 return Err(SystemError::EINVAL);
             };
             pdata.net_ns.clone().ok_or(SystemError::EINVAL)?
         };
-        proc_read_seq(offset, len, buf, &mut data, |cursor, want, out| {
+        proc_seq_operation(operation, data, |cursor, want, out| {
             Ok(render_arp_slice(&netns, cursor, want, out))
         })
     }

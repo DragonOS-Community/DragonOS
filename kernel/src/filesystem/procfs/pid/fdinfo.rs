@@ -168,17 +168,22 @@ impl FileOps for FdInfoFileOps {
         }
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if self.is_current() {
-            Ok(0)
-        } else {
-            Err(SystemError::ENOENT)
-        }
+        crate::filesystem::procfs::utils::proc_snapshot_operation(operation, data, || {
+            if self.is_current() {
+                // Existing fdinfo output is empty; preserve its independent
+                // limitation while using the real single_open seek lifecycle.
+                Ok(alloc::vec::Vec::new())
+            } else {
+                Err(SystemError::ENOENT)
+            }
+        })
     }
 }

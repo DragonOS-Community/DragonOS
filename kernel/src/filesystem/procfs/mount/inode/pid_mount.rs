@@ -7,7 +7,7 @@ use crate::filesystem::{
         mount::{render_mount_slice, MountView, ProcMountRenderKind},
         pid::ProcPidTarget,
         template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_read_seq,
+        utils::proc_seq_operation,
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -72,12 +72,13 @@ impl FileOps for MountProcFileOps {
         Ok(())
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // The view is taken once, by `open()`: rendering resolves neither the
         // target nor its root again, so a reader that already took the first
@@ -86,7 +87,7 @@ impl FileOps for MountProcFileOps {
         // without that state did not come through the procfs `open()` hook and
         // has no view to render from.
         let view = {
-            let FilePrivateData::Procfs(pdata) = &*data else {
+            let FilePrivateData::Procfs(pdata) = &**data else {
                 return Err(SystemError::EINVAL);
             };
             pdata.mount_view.clone().ok_or(SystemError::EINVAL)?
@@ -101,7 +102,7 @@ impl FileOps for MountProcFileOps {
         // the way `seq_read_iter()` re-enters `show()` per record, while a mount
         // the topology took out of the pinned root in between is not reported at
         // all.
-        proc_read_seq(offset, len, buf, &mut data, |cursor, budget, out| {
+        proc_seq_operation(operation, data, |cursor, budget, out| {
             render_mount_slice(&view, self.kind, cursor, budget, out)
         })
     }

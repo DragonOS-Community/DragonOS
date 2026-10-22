@@ -11,7 +11,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read_snapshot,
+            utils::proc_snapshot_operation,
             ProcfsFilePrivateData,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
@@ -457,22 +457,23 @@ impl FileOps for IdMapFileOps {
         Self::pin_user_ns(data, self.get_user_ns()?)
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         // Read the opener credential before `data` is mutably borrowed by the
         // snapshot helper. The target namespace is resolved by the renderer, so
         // a continuation read never touches the target task.
-        let opener_cred = Self::open_cred_from_data(&data)?;
-        let user_ns = Self::pinned_user_ns(&data)?;
+        let opener_cred = Self::open_cred_from_data(data)?;
+        let user_ns = Self::pinned_user_ns(data)?;
 
         // Linux serves uid_map/gid_map through `seq_read()` (`fs/proc/base.c`), so
         // the map text is frozen for the lifetime of the fd.
-        proc_read_snapshot(offset, len, buf, &mut data, || {
+        proc_snapshot_operation(operation, data, || {
             let (map, ctx) = {
                 let inner = user_ns.inner.lock();
                 let ctx = IdMapWriteContext {
@@ -604,17 +605,18 @@ impl FileOps for SetgroupsFileOps {
         IdMapFileOps::pin_user_ns(data, user_ns)
     }
 
-    fn read_at(
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        mut data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let user_ns = IdMapFileOps::pinned_user_ns(&data)?;
+        let user_ns = IdMapFileOps::pinned_user_ns(data)?;
         // Linux `proc_setgroups_operations` reads through `seq_read()`
         // (`fs/proc/base.c:3219`), so one fd sees one `allow`/`deny` record.
-        proc_read_snapshot(offset, len, buf, &mut data, || {
+        proc_snapshot_operation(operation, data, || {
             let allowed = {
                 let inner = user_ns.inner.lock();
                 (inner.flags & USERNS_SETGROUPS_ALLOWED) != 0

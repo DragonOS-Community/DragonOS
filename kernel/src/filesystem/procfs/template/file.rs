@@ -94,8 +94,38 @@ pub type ProcWriteCallback<F> = fn(
     MutexGuard<'_, FilePrivateData>,
 ) -> Result<PrimaryWriteResult, SystemError>;
 
+/// Linux operation-table selection. Default and generic llseek differ for
+/// negative SEEK_DATA/HOLE positions even on zero-sized proc inodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcfsSeekKind {
+    Generic,
+    Default,
+    Seq,
+}
+
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    /// Selected from the real Linux operation table, not inferred from the
+    /// inode's private data or positional-write capability.
+    const SEEK_KIND: ProcfsSeekKind = ProcfsSeekKind::Generic;
+
+    fn seq_operation(
+        &self,
+        _operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        _data: &mut MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    fn seek(
+        &self,
+        _position: &mut usize,
+        _origin: &crate::driver::base::block::SeekFrom,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        None
+    }
+
     /// Apply provider-specific operation capabilities after the common open
     /// defaults have been established.
     fn configure_open_file(&self, _data: &FilePrivateData, _behavior: &mut OpenFileBehavior) {}
@@ -134,8 +164,13 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError>;
+        mut data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        self.seq_operation(
+            crate::filesystem::procfs::utils::ProcfsSeqOperation::Read { offset, len, buf },
+            &mut data,
+        )
+    }
 
     /// Return the real proc handler before any userspace payload staging.
     /// An absent callback still leaves the wrapper's CAN_WRITE capability set,
@@ -168,6 +203,91 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn seek(
+        &self,
+        position: &mut usize,
+        origin: &crate::driver::base::block::SeekFrom,
+        mut data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        use crate::driver::base::block::SeekFrom;
+        use crate::filesystem::procfs::utils::ProcfsSeqOperation;
+        if F::SEEK_KIND != ProcfsSeekKind::Seq {
+            if let Some(result) = self.inner.seek(position, origin, data) {
+                return Some(result);
+            }
+            // ProcFile::new_with_data creates size-zero pseudo inodes; writes
+            // do not change that size. Position-only operations must not call
+            // validate_inode or revive an unregistered sysctl provider.
+            return match origin {
+                SeekFrom::SeekEnd(offset) => {
+                    if *offset < 0 {
+                        Some(Err(SystemError::EINVAL))
+                    } else {
+                        *position = *offset as usize;
+                        Some(Ok(()))
+                    }
+                }
+                SeekFrom::SeekData(offset)
+                    if *offset < 0 && F::SEEK_KIND == ProcfsSeekKind::Default =>
+                {
+                    Some(Err(SystemError::EINVAL))
+                }
+                SeekFrom::SeekHole(offset)
+                    if *offset < 0 && F::SEEK_KIND == ProcfsSeekKind::Default =>
+                {
+                    *position = 0;
+                    Some(Ok(()))
+                }
+                SeekFrom::SeekData(_) | SeekFrom::SeekHole(_) => Some(Err(SystemError::ENXIO)),
+                // Reuse the VFS checked position arithmetic for SET and CUR.
+                _ => None,
+            };
+        }
+        let target = match origin {
+            SeekFrom::SeekSet(offset) => *offset,
+            SeekFrom::SeekCurrent(offset) => match (*position as i64).checked_add(*offset) {
+                Some(target) => target,
+                None => return Some(Err(SystemError::EINVAL)),
+            },
+            _ => return Some(Err(SystemError::EINVAL)),
+        };
+        if target < 0 {
+            return Some(Err(SystemError::EINVAL));
+        }
+        let target = target as usize;
+        let FilePrivateData::Procfs(pdata) = &mut *data else {
+            return Some(Err(SystemError::EINVAL));
+        };
+        // These cases do not enter the provider, even after its task died.
+        if target == pdata.seq.read_position() {
+            *position = target;
+            return Some(Ok(()));
+        }
+        if target == 0 {
+            pdata.seq.rewind();
+            *position = 0;
+            return Some(Ok(()));
+        }
+        let result = self
+            .inner
+            .seq_operation(ProcfsSeqOperation::Seek { target }, &mut data);
+        match result {
+            Ok(_) => {
+                *position = target;
+                Some(Ok(()))
+            }
+            Err(err) => {
+                // Linux seq_lseek's traversal error resets both read_pos and
+                // f_pos. Also cover provider context acquisition failures.
+                if let FilePrivateData::Procfs(pdata) = &mut *data {
+                    pdata.seq.rewind();
+                }
+                *position = 0;
+                Some(Err(err))
+            }
+        }
+    }
+
     fn supports_read_iter_flags(&self) -> bool {
         self.inner.supports_read_iter_flags()
     }
@@ -295,7 +415,7 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         mut data: MutexGuard<FilePrivateData>,
         flags: &FileFlags,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
+        // Each open owns its record state and provider-specific pinned context.
         *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
         self.inner.open(&mut data, flags).map_err(Into::into)
     }

@@ -6270,6 +6270,15 @@ impl MountFSInode {
 }
 
 impl IndexNode for MountFSInode {
+    fn seek(
+        &self,
+        position: &mut usize,
+        origin: &crate::driver::base::block::SeekFrom,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        self.dentry.inode.seek(position, origin, data)
+    }
+
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         self.dentry.inode.sysctl_access_bits()
     }

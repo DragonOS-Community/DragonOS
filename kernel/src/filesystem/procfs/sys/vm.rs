@@ -122,6 +122,9 @@ impl DropCachesFileOps {
 }
 
 impl FileOps for DropCachesFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)
@@ -173,6 +176,9 @@ impl OomFaultInjectFileOps {
 }
 
 impl FileOps for OomFaultInjectFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, len, buf, data| {
             ops.write_at(offset, len, buf, data)

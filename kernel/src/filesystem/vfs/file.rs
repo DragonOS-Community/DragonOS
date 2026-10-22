@@ -3338,28 +3338,22 @@ impl File {
         // sysctl llseek remains usable after its table has been unregistered;
         // attributes are needed only for size-dependent regular-file seeks.
         let file_type = self.file_type();
-        // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
-        // and other unsupported seek modes.
+        let mut custom_position = self.offset.load(Ordering::SeqCst);
+        if let Some(result) =
+            self.inode
+                .seek(&mut custom_position, &origin, self.private_data.lock())
         {
-            let pdata = self.private_data.lock();
-            if matches!(&*pdata, FilePrivateData::Procfs(_)) {
-                match origin {
-                    SeekFrom::SeekEnd(_)
-                    | SeekFrom::SeekData(_)
-                    | SeekFrom::SeekHole(_)
-                    | SeekFrom::Invalid => {
-                        return Err(SystemError::EINVAL);
-                    }
-                    _ => {}
-                }
-            }
+            self.offset.store(custom_position, Ordering::SeqCst);
+            return result.map(|()| custom_position);
         }
         if file_type == FileType::Dir {
             let mut state = position.unwrap_or_else(|| self.position_state.lock());
             let pos = match origin {
                 SeekFrom::SeekSet(offset) => offset,
                 SeekFrom::SeekCurrent(0) => return Ok(self.offset.load(Ordering::SeqCst)),
-                SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
+                SeekFrom::SeekCurrent(offset) => (self.offset.load(Ordering::SeqCst) as i64)
+                    .checked_add(offset)
+                    .ok_or(SystemError::EINVAL)?,
                 SeekFrom::SeekEnd(_) => {
                     // Preserve the existing directory SEEK_END behavior.
                     return Ok(MAX_LFS_FILESIZE as usize);
@@ -3384,8 +3378,15 @@ impl File {
 
         let pos: i64 = match origin {
             SeekFrom::SeekSet(offset) => offset,
-            SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
-            SeekFrom::SeekEnd(offset) => self.inode.metadata()?.size + offset,
+            SeekFrom::SeekCurrent(offset) => (self.offset.load(Ordering::SeqCst) as i64)
+                .checked_add(offset)
+                .ok_or(SystemError::EINVAL)?,
+            SeekFrom::SeekEnd(offset) => self
+                .inode
+                .metadata()?
+                .size
+                .checked_add(offset)
+                .ok_or(SystemError::EINVAL)?,
             SeekFrom::SeekData(offset) => {
                 let metadata = self.inode.metadata()?;
                 if file_type != FileType::File {

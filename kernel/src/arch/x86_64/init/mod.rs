@@ -113,7 +113,7 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     // ============= 初始化时钟源硬件 =============
     // 1.先尝试初始化 kvm-clock（如果在 KVM 虚拟机中运行且 kvm-clock 可用的话）
     // 2.再尝试初始化 HPET（如果硬件支持的话）
-    // 3.如果 kvm-clock 和 HPET 都不可用，则回退到 ACPI PM Timer
+    // 3.独立尝试注册 ACPI PM Timer，保留可用的备用时钟源
     // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
     let hpet_ok = match hpet_init() {
@@ -135,14 +135,10 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
             false
         }
     };
-    // ACPI PM Timer 无条件注册（对齐 Linux：kvmclock/hpet/pmtmr 全部可用
-    // 时并存注册）。此前仅在前两者皆失败时才初始化，导致 kvm-clock 存在
-    // 时系统没有任何独立参考源——watchdog 无法比对（R9/R10 实测：PMTMR
-    // 未初始化→kvm-clock 以 25% 速率慢走且无处可切，容器负载下楔死）。
-    // PM Timer 同时是 clocksource watchdog 的参考源与重选目标。
+    // Register available fallback devices even when a higher-rated source is
+    // already working. The normal clocksource policy still chooses the source.
     if let Err(error) = init_acpi_pm_clocksource() {
         if !kvmclock_ok && !hpet_ok {
-            // jiffies is already registered and installed by timekeeping_init.
             warn!(
                 "ACPI PM timer unavailable, continuing with jiffies: {:?}",
                 error
@@ -151,10 +147,6 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
             debug!("ACPI PM timer unavailable: {:?}", error);
         }
     }
-    // BSP 的 APIC 定时器在 PMTMR 可用前完成启动期标定（标定形态与运行
-    // 形态不一致导致计数率误差，见 recalibrate_apic_count_runtime 注释）：
-    // PMTMR 就绪后按运行形态重标定并刷新 periodic_count。
-    crate::arch::x86_64::driver::apic::apic_timer::recalibrate_apic_count_runtime();
     if let Err(error) = TSCManager::init() {
         if TSCManager::cpu_khz() == 0 {
             // The scheduler clock and APIC timer still require CPU_KHZ even

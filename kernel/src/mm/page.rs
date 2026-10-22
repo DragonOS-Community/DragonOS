@@ -1093,9 +1093,11 @@ impl PageReclaimer {
     /// 2) 释放回收器锁后，逐个执行写回与回收，避免锁顺序反转。
     pub fn shrink_list(count: PageFrameCount) -> ReclaimProgress {
         // Both production callers run after task/cgroup initialization and
-        // outside MM/resource locks. Snapshot failure must not disable min.
+        // outside MM/resource locks. Registration preallocates this snapshot,
+        // so exhausted heap capacity cannot silently disable global reclaim.
         let root = crate::cgroup::cgroup_root_node().memory_account();
-        Self::shrink_protected(&root, count, true, false).unwrap_or_default()
+        let mut lease = crate::cgroup::memory::protection::global_snapshot(&root);
+        Self::shrink_with_protection(lease.get_mut(), count, true, false)
     }
 
     /// Protection/topology preparation happens before taking any resource
@@ -1123,18 +1125,31 @@ impl PageReclaimer {
         noio: bool,
     ) -> Result<ReclaimProgress, SystemError> {
         let mut protection = ProtectionSnapshot::new(account)?;
-        let mut progress =
-            Self::shrink_pass(count.data(), &mut protection, false, allow_unowned, noio);
+        Ok(Self::shrink_with_protection(
+            &mut protection,
+            count,
+            allow_unowned,
+            noio,
+        ))
+    }
+
+    fn shrink_with_protection(
+        protection: &mut ProtectionSnapshot,
+        count: PageFrameCount,
+        allow_unowned: bool,
+        noio: bool,
+    ) -> ReclaimProgress {
+        let mut progress = Self::shrink_pass(count.data(), protection, false, allow_unowned, noio);
         if progress.reclaimed < count.data() && protection.low_skipped() {
             progress.accumulate(Self::shrink_pass(
                 count.data() - progress.reclaimed,
-                &mut protection,
+                protection,
                 true,
                 allow_unowned,
                 noio,
             ));
         }
-        Ok(progress)
+        progress
     }
 
     /// Keep the original LRU node until clean retirement commits. pop_lru +

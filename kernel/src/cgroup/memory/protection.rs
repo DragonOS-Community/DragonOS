@@ -30,26 +30,84 @@ struct ProtectionEntry {
 /// A single reclaim pass's top-down, non-recursive protection budgets. Account
 /// identity, not a reused directory ID, distinguishes historical generations.
 pub(crate) struct ProtectionSnapshot {
+    accounts: Vec<Arc<MemoryAccount>>,
     entries: Vec<ProtectionEntry>,
     indices: HashMap<usize, usize>,
     low_skipped: bool,
     unowned_remaining: u64,
 }
 
+pub(crate) use super::registry::global_snapshot;
+
 impl ProtectionSnapshot {
     pub fn new(root: &Arc<MemoryAccount>) -> Result<Self, SystemError> {
         let accounts = super::registry::snapshot()?;
-        let mut entries: Vec<ProtectionEntry> = Vec::new();
-        let mut indices: HashMap<usize, usize> = HashMap::new();
+        let mut snapshot = Self::with_accounts(accounts)?;
+        snapshot.populate(root);
+        Ok(snapshot)
+    }
+
+    /// Reserve the entire global recovery dependency chain before publication.
+    pub(super) fn with_capacity(capacity: usize) -> Result<Self, SystemError> {
+        let mut accounts = Vec::new();
+        accounts
+            .try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        Self::with_accounts(accounts)
+    }
+
+    fn with_accounts(accounts: Vec<Arc<MemoryAccount>>) -> Result<Self, SystemError> {
+        let mut entries = Vec::new();
+        let mut indices = HashMap::new();
         entries
-            .try_reserve(accounts.len())
+            .try_reserve_exact(accounts.capacity())
             .map_err(|_| SystemError::ENOMEM)?;
         indices
-            .try_reserve(accounts.len())
+            .try_reserve(accounts.capacity())
             .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self {
+            accounts,
+            entries,
+            indices,
+            low_skipped: false,
+            unowned_remaining: 0,
+        })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.accounts.is_empty() && self.entries.is_empty() && self.indices.is_empty()
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.accounts
+            .capacity()
+            .min(self.entries.capacity())
+            .min(self.indices.capacity())
+    }
+
+    /// Called under the registry lock, only after checking the complete stock.
+    pub(super) fn push_account(&mut self, account: Arc<MemoryAccount>) {
+        assert!(self.accounts.len() < self.capacity());
+        self.accounts.push(account);
+    }
+
+    /// Retain backing storage, but never pin an old controller generation.
+    pub(super) fn clear(&mut self) {
+        self.accounts.clear();
+        self.entries.clear();
+        self.indices.clear();
+        self.low_skipped = false;
+        self.unowned_remaining = 0;
+    }
+
+    pub(super) fn populate(&mut self, root: &Arc<MemoryAccount>) {
+        assert!(self.entries.is_empty() && self.indices.is_empty());
+        assert!(self.accounts.len() <= self.capacity());
+        let entries = &mut self.entries;
+        let indices = &mut self.indices;
         // Registry order is parent-before-child. Thus testing membership needs
         // one parent lookup, not an O(depth) walk for every inventory entry.
-        for account in accounts {
+        for account in self.accounts.drain(..) {
             let parent = if Arc::ptr_eq(&account, root) {
                 None
             } else {
@@ -120,12 +178,6 @@ impl ProtectionSnapshot {
             entries[index].effective_min = min;
             entries[index].effective_low = low;
         }
-        Ok(Self {
-            entries,
-            indices,
-            low_skipped: false,
-            unowned_remaining: 0,
-        })
     }
 
     /// Once per priority, outside all page/LRU locks. Hierarchical vmstats
@@ -539,7 +591,12 @@ mod tests {
         drop(old);
         assert!(old_weak.upgrade().is_some());
         drop(pages);
-        assert!(old_weak.upgrade().is_none());
+        // Another concurrent registry snapshot may transiently pin the retired
+        // account. The charge must be gone even while that reader still owns it.
+        if let Some(retained) = old_weak.upgrade() {
+            assert_eq!(retained.current_pages(), 0);
+            assert!(!retained.is_online());
+        }
     }
 
     #[test]

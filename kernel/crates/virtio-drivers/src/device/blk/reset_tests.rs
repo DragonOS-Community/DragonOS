@@ -6,6 +6,8 @@ std::thread_local! {
     static DMA_LIVE: Cell<usize> = const { Cell::new(0) };
     static SHARES: Cell<usize> = const { Cell::new(0) };
     static EARLY_RETIRE: Cell<usize> = const { Cell::new(0) };
+    // A successful used completion may retire only its own mappings before reset.
+    static USED_RETIRE_BUDGET: Cell<usize> = const { Cell::new(0) };
     static DEVICE: RefCell<Option<Arc<Mutex<State>>>> = const { RefCell::new(None) };
 }
 
@@ -16,7 +18,13 @@ fn observe_retirement() {
             .as_ref()
             .is_some_and(|state| state.lock().unwrap().reset_acks == 0)
         {
-            EARLY_RETIRE.with(|count| count.set(count.get() + 1));
+            USED_RETIRE_BUDGET.with(|budget| {
+                if budget.get() > 0 {
+                    budget.set(budget.get() - 1);
+                } else {
+                    EARLY_RETIRE.with(|count| count.set(count.get() + 1));
+                }
+            });
         }
     });
 }
@@ -53,6 +61,7 @@ fn transport_fixture(
     DMA_LIVE.with(|count| count.set(0));
     SHARES.with(|count| count.set(0));
     EARLY_RETIRE.with(|count| count.set(0));
+    USED_RETIRE_BUDGET.with(|budget| budget.set(0));
     let mut config = Box::new(BlkConfig {
         capacity_low: Volatile::new(66),
         capacity_high: Volatile::new(0),
@@ -304,4 +313,151 @@ fn drop_of_initialized_empty_device_waits_for_ack() {
     let state = state.lock().unwrap();
     assert_eq!(state.reset_acks, 1);
     assert_eq!(state.transport_drops, 1);
+}
+
+#[test]
+fn queue_full_retry_and_mixed_requests_survive_failed_reset() {
+    struct Request {
+        req: BlkReq,
+        resp: BlkResp,
+        buffer: [u8; SECTOR_SIZE],
+        operation: usize,
+    }
+
+    impl Request {
+        // The caller retains the boxed owner until used completion or confirmed reset/cancel.
+        unsafe fn submit(
+            &mut self,
+            blk: &mut VirtIOBlk<TrackedHal, FakeTransport<BlkConfig>>,
+        ) -> Result<u16> {
+            match self.operation {
+                0 => unsafe {
+                    blk.read_blocks_nb(0, &mut self.req, &mut self.buffer, &mut self.resp)
+                },
+                1 => unsafe { blk.write_blocks_nb(0, &mut self.req, &self.buffer, &mut self.resp) },
+                _ => unsafe { blk.flush_nb(&mut self.req, &mut self.resp) }
+                    .map(|token| token.expect("fixture negotiates flush")),
+            }
+        }
+
+        // Use original buffers of an outstanding token; retire it only once after reset.
+        unsafe fn cancel(
+            &mut self,
+            blk: &mut VirtIOBlk<TrackedHal, FakeTransport<BlkConfig>>,
+            token: u16,
+        ) -> Result<()> {
+            match self.operation {
+                0 => unsafe {
+                    blk.cancel_read_blocks(token, &self.req, &mut self.buffer, &mut self.resp)
+                },
+                1 => unsafe {
+                    blk.cancel_write_blocks(token, &self.req, &self.buffer, &mut self.resp)
+                },
+                _ => unsafe { blk.cancel_flush(token, &self.req, &mut self.resp) },
+            }
+        }
+    }
+
+    for indirect in [false, true] {
+        let (mut blk, state, _config) = fixture(indirect);
+        // Moving a Box in this vector never moves a buffer shared with the device.
+        let mut requests: Vec<_> = (0..=QUEUE_SIZE)
+            .map(|index| {
+                Box::new(Request {
+                    req: BlkReq::default(),
+                    resp: BlkResp::default(),
+                    buffer: [0x5a; SECTOR_SIZE],
+                    operation: usize::from(index) % 3,
+                })
+            })
+            .collect();
+        let mut outstanding = Vec::new();
+        let mut rejected = None;
+        for (index, request) in requests.iter_mut().enumerate() {
+            let shares = SHARES.with(Cell::get);
+            // SAFETY: Every successful submission has a distinct, stable boxed owner.
+            match unsafe { request.submit(&mut blk) } {
+                Ok(token) => outstanding.push((index, token)),
+                Err(Error::QueueFull) => {
+                    assert_eq!(SHARES.with(Cell::get), shares);
+                    rejected = Some(index);
+                    break;
+                }
+                result => panic!("unexpected submission result: {:?}", result),
+            }
+        }
+        let rejected = rejected.expect("bounded queue must fill before owners run out");
+        assert!(outstanding.len() >= 3); // Read, write and flush are all outstanding.
+        assert!(blk.peek_used().is_none());
+
+        // The fake device completes exactly the first read; every other request remains pending.
+        state
+            .lock()
+            .unwrap()
+            .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |input| {
+                assert_eq!(input.len(), core::mem::size_of::<BlkReq>());
+                let mut response = vec![0xa6; SECTOR_SIZE];
+                response.extend_from_slice(
+                    BlkResp {
+                        status: RespStatus::OK,
+                    }
+                    .as_bytes(),
+                );
+                response
+            });
+        let (first_index, first_token) = outstanding.remove(0);
+        assert_eq!(blk.peek_used(), Some(first_token));
+        let first = &mut requests[first_index];
+        let completed_shares = 3 + usize::from(indirect);
+        let shares_before = SHARES.with(Cell::get);
+        USED_RETIRE_BUDGET.with(|budget| budget.set(completed_shares));
+        // SAFETY: The device wrote used for this token; these are the exact original buffers.
+        unsafe {
+            blk.complete_read_blocks(first_token, &first.req, &mut first.buffer, &mut first.resp)
+        }
+        .unwrap();
+        assert_eq!(first.buffer, [0xa6; SECTOR_SIZE]);
+        assert_eq!(USED_RETIRE_BUDGET.with(Cell::get), 0);
+        assert_eq!(SHARES.with(Cell::get), shares_before - completed_shares);
+        assert_eq!(EARLY_RETIRE.with(Cell::get), 0);
+
+        // Reuse the owner rejected above, rather than allocating a replacement request or buffer.
+        // SAFETY: QueueFull published nothing for this owner; its allocation has not moved.
+        let retry_token = unsafe { requests[rejected].submit(&mut blk) }.unwrap();
+        outstanding.push((rejected, retry_token));
+        assert!(blk.peek_used().is_none());
+        let live = DMA_LIVE.with(Cell::get);
+        let shares = SHARES.with(Cell::get);
+        state.lock().unwrap().reset_delay = Some(usize::MAX);
+        assert_eq!(blk.reset(), Err(Error::ResetTimeout));
+        assert_eq!(state.lock().unwrap().reset_acks, 0);
+        assert_eq!(DMA_LIVE.with(Cell::get), live);
+        assert_eq!(SHARES.with(Cell::get), shares);
+        for &(index, token) in &outstanding {
+            // SAFETY: Each token is still outstanding; unsuccessful cancel does not retire it.
+            assert_eq!(
+                unsafe { requests[index].cancel(&mut blk, token) },
+                Err(Error::NotReady)
+            );
+        }
+        assert_eq!(DMA_LIVE.with(Cell::get), live);
+        assert_eq!(SHARES.with(Cell::get), shares);
+        assert_eq!(EARLY_RETIRE.with(Cell::get), 0);
+
+        state.lock().unwrap().reset_delay = Some(2);
+        blk.reset().unwrap();
+        assert_eq!(state.lock().unwrap().reset_acks, 1);
+        assert_eq!(SHARES.with(Cell::get), shares);
+        for (index, token) in outstanding {
+            // SAFETY: Reset is confirmed; retire each still-outstanding owner exactly once.
+            unsafe { requests[index].cancel(&mut blk, token) }.unwrap();
+        }
+        assert_eq!(SHARES.with(Cell::get), 0);
+        drop(blk);
+        assert_eq!(DMA_LIVE.with(Cell::get), 0);
+        assert_eq!(EARLY_RETIRE.with(Cell::get), 0);
+        let state = state.lock().unwrap();
+        assert_eq!(state.reset_requests, 2);
+        assert_eq!(state.transport_drops, 1);
+    }
 }

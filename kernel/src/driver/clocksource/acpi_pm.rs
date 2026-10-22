@@ -13,7 +13,7 @@ use crate::{
         PIT_TICK_RATE,
     },
 };
-use acpi::fadt::Fadt;
+use acpi::{address::AddressSpace, fadt::Fadt};
 use alloc::sync::{Arc, Weak};
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -199,14 +199,21 @@ const ACPI_PM_READ_CHECKS: u32 = 10000;
 fn find_acpi_pm_clock() -> Result<(), SystemError> {
     let fadt = acpi_manager()
         .tables()
-        .unwrap()
+        .ok_or(SystemError::ENODEV)?
         .find_table::<Fadt>()
-        .expect("failed to find FADT table");
+        .map_err(|_| SystemError::ENODEV)?;
     let pm_timer_block = fadt.pm_timer_block().map_err(|_| SystemError::ENODEV)?;
     let pm_timer_block = pm_timer_block.ok_or(SystemError::ENODEV)?;
-    let pmtmr_addr = pm_timer_block.address;
-
-    PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
+    // This driver uses port I/O; never truncate an MMIO or oversized GAS
+    // address into a port. Optional firmware absence must not stop boot.
+    if pm_timer_block.address_space != AddressSpace::SystemIo
+        || pm_timer_block.bit_offset != 0
+        || pm_timer_block.address == 0
+        || pm_timer_block.address > u16::MAX as u64
+    {
+        return Err(SystemError::ENODEV);
+    }
+    PMTMR_IO_PORT.store(pm_timer_block.address as u32, Ordering::SeqCst);
 
     info!(
         "apic_pmtmr I/O port: {}",
@@ -273,6 +280,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     // 检查ACPI PM Timer的频率是否正确
     if !verify_pmtmr_rate() {
         PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+        return Err(SystemError::ENODEV);
     }
 
     // 检查TSC时钟源的监视器是否被禁用，如果被禁用则将时钟源的标志设置为CLOCK_SOURCE_MUST_VERIFY

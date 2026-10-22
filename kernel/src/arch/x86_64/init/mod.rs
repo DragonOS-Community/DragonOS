@@ -113,7 +113,7 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     // ============= 初始化时钟源硬件 =============
     // 1.先尝试初始化 kvm-clock（如果在 KVM 虚拟机中运行且 kvm-clock 可用的话）
     // 2.再尝试初始化 HPET（如果硬件支持的话）
-    // 3.如果 kvm-clock 和 HPET 都不可用，则回退到 ACPI PM Timer
+    // 3.独立尝试注册 ACPI PM Timer，保留可用的备用时钟源
     // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
     let hpet_ok = match hpet_init() {
@@ -135,13 +135,16 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
             false
         }
     };
-    if !kvmclock_ok && !hpet_ok {
-        if let Err(error) = init_acpi_pm_clocksource() {
-            // jiffies is already registered and installed by timekeeping_init.
+    // Register available fallback devices even when a higher-rated source is
+    // already working. The normal clocksource policy still chooses the source.
+    if let Err(error) = init_acpi_pm_clocksource() {
+        if !kvmclock_ok && !hpet_ok {
             warn!(
                 "ACPI PM timer unavailable, continuing with jiffies: {:?}",
                 error
             );
+        } else {
+            debug!("ACPI PM timer unavailable: {:?}", error);
         }
     }
     if let Err(error) = TSCManager::init() {

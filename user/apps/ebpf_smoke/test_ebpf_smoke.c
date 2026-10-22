@@ -158,6 +158,9 @@ static void report(int ok, const char *name, const char *detail)
             (void)rc;
         }
     }
+    /* The file sideband is block-buffered; flush so a kernel panic cannot
+     * eat the last reported step. */
+    fflush(stdout);
     if (ok) {
         g_passes++;
         printf("  [PASS] %s%s%s\n", name, detail ? ": " : "", detail ? detail : "");
@@ -805,29 +808,25 @@ static void test_current_helpers(void)
         { .code = BPF_ALU64_ADD_K, .dst_reg = 3, .imm = -24 },
         { .code = BPF_CALL, .imm = 2 },
         /* r7 = m[3] (user src addr); r1 = m[2] dst; r2 = 8; r3 = r7;
-         * call bpf_probe_read_user(112); if 0 -> m[2] validated by user */
+         * call bpf_probe_read_user(112), then fall through to the comm path */
         { .code = BPF_ST_DW, .dst_reg = 10, .off = -8, .imm = 3 },
         LD_MAP_FD(1, mfd),
         { .code = BPF_MOV64_X, .dst_reg = 2, .src_reg = 10 },
         { .code = BPF_ALU64_ADD_K, .dst_reg = 2, .imm = -8 },
         { .code = BPF_CALL, .imm = 1 },
-        { .code = BPF_JNE_K, .dst_reg = 0, .imm = 0, .off = 1 },
-        { .code = BPF_EXIT },
+        { .code = BPF_JEQ_K, .dst_reg = 0, .imm = 0, .off = 12 },
         { .code = BPF_LDX_DW, .dst_reg = 7, .src_reg = 0, .off = 0 },
-        /* r1 = dst of m[2] (16-byte value slot) */
         { .code = BPF_ST_DW, .dst_reg = 10, .off = -8, .imm = 2 },
         LD_MAP_FD(1, mfd),
         { .code = BPF_MOV64_X, .dst_reg = 2, .src_reg = 10 },
         { .code = BPF_ALU64_ADD_K, .dst_reg = 2, .imm = -8 },
         { .code = BPF_CALL, .imm = 1 },
-        { .code = BPF_JEQ_K, .dst_reg = 0, .imm = 0, .off = 6 },
+        { .code = BPF_JEQ_K, .dst_reg = 0, .imm = 0, .off = 4 },
         /* bpf_probe_read_user(dst=r0, size=8, src=r7) */
         { .code = BPF_MOV64_X, .dst_reg = 1, .src_reg = 0 },
         { .code = BPF_MOV64_K, .dst_reg = 2, .imm = 8 },
         { .code = BPF_MOV64_X, .dst_reg = 3, .src_reg = 7 },
         { .code = BPF_CALL, .imm = 112 },
-        { .code = BPF_MOV64_K, .dst_reg = 0, .imm = 0 },
-        { .code = BPF_EXIT },
         /* comm path: m[4] slot as dst */
         { .code = BPF_ST_DW, .dst_reg = 10, .off = -8, .imm = 4 },
         LD_MAP_FD(1, mfd),
@@ -939,7 +938,9 @@ static void test_new_tracepoints(void)
     /* enter_execve: m[4] = ctx->id; m[0] = string at ctx->args[0] via
      * bpf_probe_read_user_str (helper 114) */
     struct bpf_insn p_enter[] = {
-        /* m[4] = ctx->id (i32 @8). value at r10-24, key 4 at r10-8 */
+        /* BPF r1-r5 are clobbered by every helper call; the ctx must be
+         * saved to a callee-saved register before reading fields later. */
+        { .code = BPF_MOV64_X, .dst_reg = 8, .src_reg = 1 },
         { .code = 0x61 /* BPF_LDX|BPF_MEM|BPF_W */, .dst_reg = 7,
           .src_reg = 1, .off = 8 },
         { .code = BPF_STX_DW, .dst_reg = 10, .src_reg = 7, .off = -24 },
@@ -950,9 +951,8 @@ static void test_new_tracepoints(void)
         { .code = BPF_MOV64_X, .dst_reg = 3, .src_reg = 10 },
         { .code = BPF_ALU64_ADD_K, .dst_reg = 3, .imm = -24 },
         { .code = BPF_CALL, .imm = 2 },
-        /* filename ptr = ctx->args[0] @16 */
-        { .code = BPF_LDX_DW, .dst_reg = 7, .src_reg = 1, .off = 16 },
-        /* dst = m[0] value */
+        /* filename ptr = ctx->args[0] @16, via the saved ctx in r8 */
+        { .code = BPF_LDX_DW, .dst_reg = 7, .src_reg = 8, .off = 16 },
         { .code = BPF_ST_DW, .dst_reg = 10, .off = -8, .imm = 0 },
         LD_MAP_FD(1, mfd),
         { .code = BPF_MOV64_X, .dst_reg = 2, .src_reg = 10 },
@@ -994,7 +994,9 @@ static void test_new_tracepoints(void)
         { .code = BPF_MOV64_K, .dst_reg = 0, .imm = 0 },
         { .code = BPF_EXIT },
     };
-    /* sched_process_exit: m[3] = ctx->pid (i32 @24) */
+
+    /* sched_process_exit (fixed layout: comm[16]@8, pid i32@24, prio@28):
+     * m[3] = ctx->pid */
     struct bpf_insn p_exit_ev[] = {
         { .code = 0x61 /* LDX W */, .dst_reg = 7, .src_reg = 1, .off = 24 },
         { .code = BPF_STX_DW, .dst_reg = 10, .src_reg = 7, .off = -24 },
@@ -1009,33 +1011,133 @@ static void test_new_tracepoints(void)
         { .code = BPF_EXIT },
     };
 
-    struct {
-        const char *path;
-        const struct bpf_insn *insns;
-        size_t cnt;
-    } evs[] = {
-        { "/sys/kernel/debug/tracing/events/syscalls/sys_enter_execve/id",
-          p_enter, sizeof(p_enter) / sizeof(p_enter[0]) },
-        { "/sys/kernel/debug/tracing/events/syscalls/sys_exit_execve/id",
-          p_exit, sizeof(p_exit) / sizeof(p_exit[0]) },
-        { "/sys/kernel/debug/tracing/events/syscalls/sys_enter_write/id",
-          p_write, sizeof(p_write) / sizeof(p_write[0]) },
-        /* sched_process_exit attach temporarily isolated: its __string
-         * entry variant panics the kernel on trigger (ctx=NULL fault at
-         * 0x10); re-enable after fixing the string-entry callback path. */
-        // { "/sys/kernel/debug/tracing/events/sched/sched_process_exit/id",
-        //   p_exit_ev, sizeof(p_exit_ev) / sizeof(p_exit_ev[0]) },
+    /* Staged attach: each program is attached, triggered, and checked alone
+     * so that a kernel panic names the offending program in the sideband
+     * log, then all three run concurrently. */
+    static const char *id_paths[3] = {
+        "/sys/kernel/debug/tracing/events/syscalls/sys_enter_execve/id",
+        "/sys/kernel/debug/tracing/events/syscalls/sys_exit_execve/id",
+        "/sys/kernel/debug/tracing/events/syscalls/sys_enter_write/id",
     };
-    int evfds[4] = {-1, -1, -1, -1};
+    const struct bpf_insn *progs[3] = { p_enter, p_exit, p_write };
+    size_t cnts[3] = {
+        sizeof(p_enter) / sizeof(p_enter[0]),
+        sizeof(p_exit) / sizeof(p_exit[0]),
+        sizeof(p_write) / sizeof(p_write[0]),
+    };
+
+    int evfds[3] = {-1, -1, -1};
+    for (int i = 0; i < 3; i++) {
+        uint64_t id;
+        if (read_file_u64(id_paths[i], &id) != 0) {
+            printf("    missing event: %s\n", id_paths[i]);
+            evfds[i] = -1;
+            continue;
+        }
+        int pfd = prog_load_kprobe(progs[i], cnts[i]);
+        if (pfd < 0) {
+            evfds[i] = -1;
+            continue;
+        }
+        struct perf_event_attr_x attr = {0};
+        attr.type_ = 2;
+        attr.size = sizeof(attr);
+        attr.config = id;
+        attr.bits1 = 1;
+        int evfd = perf_event_open_x(&attr, -1, 0, -1, 0);
+        if (evfd < 0 || ioctl(evfd, PERF_IOC_SET_BPF, pfd) != 0) {
+            close(pfd);
+            evfds[i] = -1;
+            continue;
+        }
+        /* Enable per-stage so each program runs strictly alone first. */
+        evfds[i] = evfd;
+        close(pfd);
+    }
+
+    uint8_t val[128];
+    uint32_t k;
+    char wbuf[777];
+
+    /* ---- Stage A: write tp alone ---- */
+    if (evfds[2] < 0) {
+        report(0, "stageA attach sys_enter_write", NULL);
+    } else {
+        ioctl(evfds[2], PERF_IOC_ENABLE, 0);
+        memset(wbuf, 'x', sizeof(wbuf));
+        ssize_t wr = write(2, wbuf, 777);
+        (void)wr;
+        k = 2;
+        uint64_t wcount = 0;
+        map_lookup(mfd, &k, val);
+        memcpy(&wcount, val, 8);
+        report(wcount == 777, "stageA sys_enter_write count", NULL);
+        ioctl(evfds[2], PERF_IOC_DISABLE, 0);
+        close(evfds[2]);
+        evfds[2] = -1;
+    }
+
+    /* ---- Stage B: exit_execve tp alone ---- */
+    if (evfds[1] < 0) {
+        report(0, "stageB attach sys_exit_execve", NULL);
+    } else {
+        ioctl(evfds[1], PERF_IOC_ENABLE, 0);
+        pid_t child = fork();
+        if (child == 0) {
+            char *argv[] = {"/bin/busybox", NULL};
+            execve("/bin/busybox", argv, NULL);
+            _exit(127);
+        }
+        int wstatus = 0;
+        waitpid(child, &wstatus, 0);
+        k = 1;
+        int64_t execve_ret = -99;
+        map_lookup(mfd, &k, val);
+        memcpy(&execve_ret, val, 8);
+        report(execve_ret == 0, "stageB sys_exit_execve ret==0", NULL);
+        ioctl(evfds[1], PERF_IOC_DISABLE, 0);
+        close(evfds[1]);
+        evfds[1] = -1;
+    }
+
+    /* ---- Stage C: enter_execve tp alone ---- */
+    if (evfds[0] < 0) {
+        report(0, "stageC attach sys_enter_execve", NULL);
+    } else {
+        ioctl(evfds[0], PERF_IOC_ENABLE, 0);
+        pid_t child = fork();
+        if (child == 0) {
+            char *argv[] = {"/bin/busybox", NULL};
+            execve("/bin/busybox", argv, NULL);
+            _exit(127);
+        }
+        int wstatus = 0;
+        waitpid(child, &wstatus, 0);
+        k = 4;
+        int32_t enter_id = 0;
+        map_lookup(mfd, &k, val);
+        memcpy(&enter_id, val, 4);
+        report(enter_id == __NR_execve, "stageC sys_enter_execve id field", NULL);
+        k = 0;
+        char fname[65] = {0};
+        map_lookup(mfd, &k, val);
+        memcpy(fname, val, 64);
+        report(strncmp(fname, "/bin/busybox", 12) == 0,
+               "stageC sys_enter_execve filename", fname);
+        ioctl(evfds[0], PERF_IOC_DISABLE, 0);
+        close(evfds[0]);
+        evfds[0] = -1;
+    }
+
+    /* ---- Stage D: all three concurrently ---- */
     int ok = 1;
     for (int i = 0; i < 3; i++) {
         uint64_t id;
-        if (read_file_u64(evs[i].path, &id) != 0) {
-            printf("    missing event: %s\n", evs[i].path);
+        if (read_file_u64(id_paths[i], &id) != 0) {
             ok = 0;
             continue;
         }
-        int pfd = prog_load_kprobe(evs[i].insns, evs[i].cnt);
+        int pfd = prog_load_kprobe(progs[i], cnts[i]);
         if (pfd < 0) {
             ok = 0;
             continue;
@@ -1055,70 +1157,97 @@ static void test_new_tracepoints(void)
         evfds[i] = evfd;
         close(pfd);
     }
-    report(ok, "attach 3 syscall tracepoints", NULL);
-    if (!ok) {
-        for (int i = 0; i < 4; i++)
-            if (evfds[i] >= 0)
-                close(evfds[i]);
+    report(ok, "stageD attach all 3 concurrently", NULL);
+    if (ok) {
+        pid_t child = fork();
+        if (child == 0) {
+            char *argv[] = {"/bin/busybox", NULL};
+            execve("/bin/busybox", argv, NULL);
+            _exit(127);
+        }
+        int wstatus = 0;
+        waitpid(child, &wstatus, 0);
+
+        /* Write last: the write tp is system-wide, and the child's own
+         * writes would overwrite m[2] if ours came first. */
+        memset(wbuf, 'w', sizeof(wbuf));
+        ssize_t wr = write(2, wbuf, 777);
+        (void)wr;
+
+
+        k = 4;
+        int32_t enter_id = 0;
+        map_lookup(mfd, &k, val);
+        memcpy(&enter_id, val, 4);
+        report(enter_id == __NR_execve, "stageD sys_enter_execve id field", NULL);
+
+        k = 1;
+        int64_t execve_ret = -99;
+        map_lookup(mfd, &k, val);
+        memcpy(&execve_ret, val, 8);
+        report(execve_ret == 0, "stageD sys_exit_execve ret==0", NULL);
+
+        k = 2;
+        uint64_t wcount = 0;
+        map_lookup(mfd, &k, val);
+        memcpy(&wcount, val, 8);
+        report(wcount == 777, "stageD sys_enter_write count", NULL);
+    }
+    for (int i = 0; i < 3; i++) {
+        if (evfds[i] >= 0) {
+            ioctl(evfds[i], PERF_IOC_DISABLE, 0);
+            close(evfds[i]);
+        }
+    }
+
+    /* ---- Stage E: sched_process_exit (fixed-layout comm[16]@8, pid@24) ---- */
+    uint64_t sched_id;
+    if (read_file_u64(
+            "/sys/kernel/debug/tracing/events/sched/sched_process_exit/id",
+            &sched_id) != 0) {
+        report(0, "stageE read sched_process_exit id", NULL);
         close(mfd);
         return;
     }
-
-    /* trigger: fork+execve+waitpid, and a distinctive write */
-    char wbuf[777];
-    memset(wbuf, 'w', sizeof(wbuf));
-    ssize_t wr = write(1, wbuf, 0); /* count 0, harmless warm-up */
-    (void)wr;
-    pid_t child = fork();
-    if (child == 0) {
+    int pfd5 = prog_load_kprobe(p_exit_ev,
+                                sizeof(p_exit_ev) / sizeof(p_exit_ev[0]));
+    if (pfd5 < 0) {
+        report(0, "stageE prog load", NULL);
+        close(mfd);
+        return;
+    }
+    struct perf_event_attr_x attr5 = {0};
+    attr5.type_ = 2;
+    attr5.size = sizeof(attr5);
+    attr5.config = sched_id;
+    attr5.bits1 = 1;
+    int evfd5 = perf_event_open_x(&attr5, -1, 0, -1, 0);
+    if (evfd5 < 0 || ioctl(evfd5, PERF_IOC_SET_BPF, pfd5) != 0) {
+        report(0, "stageE attach sched_process_exit", NULL);
+        if (evfd5 >= 0)
+            close(evfd5);
+        close(pfd5);
+        close(mfd);
+        return;
+    }
+    ioctl(evfd5, PERF_IOC_ENABLE, 0);
+    pid_t child5 = fork();
+    if (child5 == 0) {
         char *argv[] = {"/bin/busybox", NULL};
         execve("/bin/busybox", argv, NULL);
         _exit(127);
     }
-    int wstatus = 0;
-    waitpid(child, &wstatus, 0);
-
-    uint8_t val[128];
-    uint32_t k;
-    k = 4;
-    map_lookup(mfd, &k, val);
-    int32_t enter_id = 0;
-    memcpy(&enter_id, val, 4);
-    report(enter_id == __NR_execve, "sys_enter_execve id field", NULL);
-
-    k = 0;
-    char fname[65] = {0};
-    map_lookup(mfd, &k, val);
-    memcpy(fname, val, 64);
-    report(strncmp(fname, "/bin/busybox", 12) == 0,
-           "sys_enter_execve args[0] filename", fname);
-
-    k = 1;
-    int64_t execve_ret = -99;
-    map_lookup(mfd, &k, val);
-    memcpy(&execve_ret, val, 8);
-    report(execve_ret == 0, "sys_exit_execve ret==0", NULL);
-
+    int ws5 = 0;
+    waitpid(child5, &ws5, 0);
+    ioctl(evfd5, PERF_IOC_DISABLE, 0);
+    close(evfd5);
+    close(pfd5);
     k = 3;
     int32_t exit_pid = 0;
     map_lookup(mfd, &k, val);
     memcpy(&exit_pid, val, 4);
-    report(exit_pid == child, "sched_process_exit pid", NULL);
+    report(exit_pid == child5, "stageE sched_process_exit pid", NULL);
 
-    /* write test last (so map[2] is from OUR write, not children's) */
-    memset(wbuf, 'x', sizeof(wbuf));
-    wr = write(2, wbuf, 777);
-    (void)wr;
-    k = 2;
-    uint64_t wcount = 0;
-    map_lookup(mfd, &k, val);
-    memcpy(&wcount, val, 8);
-    report(wcount == 777, "sys_enter_write count", NULL);
-
-    for (int i = 0; i < 3; i++) {
-        ioctl(evfds[i], PERF_IOC_DISABLE, 0);
-        close(evfds[i]);
-    }
     close(mfd);
 }
 
@@ -1248,6 +1377,8 @@ static void test_ringbuf(void)
     report(ok, "ringbuf record received and consumed", NULL);
     close(mfd);
 }
+
+
 
 int main(int argc, char **argv)
 {

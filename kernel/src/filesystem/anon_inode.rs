@@ -14,7 +14,10 @@ use crate::{
         InodeMode, Magic, Metadata, SuperBlock,
     },
     libs::mutex::MutexGuard,
-    mm::MemoryManagementArch,
+    mm::{
+        fault::{PageFaultHandler, PageFaultMessage},
+        MemoryManagementArch, VmFaultReason,
+    },
 };
 use system_error::SystemError;
 
@@ -37,6 +40,31 @@ impl FileSystem for AnonInodeFs {
         &self,
     ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
         None
+    }
+
+    // Anonymous descriptors that expose a `page_cache()` (perf rings, BPF
+    // ringbuf maps) are pure page-cache backends like tmpfs: satisfy faults
+    // from the generic filemap helpers. Inodes without a page cache keep the
+    // default SIGBUS.
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        PageFaultHandler::filemap_fault(pfm)
+    }
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        // Anonymous descriptor pages (perf rings, BPF ringbuf maps) are
+        // intrinsically registered unevictable pages kept as PageType::Normal
+        // with no writeback domain: a shared writable mapping needs no dirty
+        // accounting, so let the generic fault install the writable PTE
+        // directly.
+        VmFaultReason::empty()
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 
     fn root_inode(&self) -> Arc<dyn IndexNode> {

@@ -1,0 +1,28 @@
+[package]
+name = "dadk-config"
+version = "0.6.1"
+edition = "2021"
+authors = [
+    "longjin <longjin@DragonOS.org>",
+    "chikejian <chikejian@DragonOS.org>",
+    "xuzihao <xuzihao@DragonOS.org>"
+]
+description = "DragonOS Application Development Kit - Config"
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["std", "backtrace"] }
+cfg-if = "1.0.0"
+env_logger = { workspace = true }
+indexmap = "2.6.0"
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shlex = "1.3.0"
+toml = "0.8.12"
+regex = "1.10"
+
+# 只有在test的情况下才会引入下列库
+[dev-dependencies]
+tempfile = "3.13.0"
+test_base = { path = "../crates/test_base" }

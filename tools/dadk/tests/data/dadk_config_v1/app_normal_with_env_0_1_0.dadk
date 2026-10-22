@@ -1,0 +1,29 @@
+{
+  "name": "app_normal_with_env",
+  "version": "0.1.0",
+  "description": "A normal app with env",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "tests/data/apps/app_normal_with_env"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "bash build.sh"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": null
+  },
+  "envs": [
+    {
+      "key": "CC",
+      "value": "abc-gcc"
+    }
+  ],
+  "build_once": false
+}

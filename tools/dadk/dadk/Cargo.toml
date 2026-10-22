@@ -1,0 +1,51 @@
+[package]
+name = "dadk"
+authors = [
+    "longjin <longjin@DragonOS.org>",
+    "chikejian <chikejian@DragonOS.org>",
+    "xuzihao <xuzihao@DragonOS.org>"
+]
+
+version = "0.6.1"
+edition = "2021"
+description = "DragonOS Application Development Kit\nDragonOS应用开发工具"
+license = "GPL-2.0-only"
+repository = "https://github.com/DragonOS-Community/DragonOS.git"
+readme = "README.md"
+
+
+[[bin]]
+name = "dadk"
+path = "src/main.rs"
+
+# 这个target与上面的内容一样，
+# 只是为了方便在开发，测试时使用（不会跟正式版本的dadk冲突）
+[[bin]]
+name = "dadk-insiders"
+path = "src/main.rs"
+required-features = ["insiders"]
+
+
+[features]
+insiders = []
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["std", "backtrace"] }
+clap = { version = "4.5.20", features = ["derive"] }
+crossbeam = "0.8.4"
+dadk-config = { version = "0.6.1", path = "../dadk-config" }
+dadk-user = { version = "0.6.1", path = "../dadk-user" }
+derive_builder = "0.20.0"
+env_logger = { workspace = true }
+humantime = "2.1.0"
+indicatif = "0.17.9"
+inferno = "0.12.0"
+lazy_static = "1.4.0"
+log = { workspace = true }
+rayon = "1.10.0"
+regex = "1.9.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.13.0"

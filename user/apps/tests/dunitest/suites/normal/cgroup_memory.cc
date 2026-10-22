@@ -113,6 +113,72 @@ bool Reap(pid_t pid, int* status, uint64_t deadline) {
   }
 }
 
+// An open proc fd does not pin its target task. Linux may return ESRCH when
+// the first read races with reaping, just as opening the path may fail.
+bool ReadGoneOrZombie(int fd, const std::string& path) {
+  char data[4096];
+  ssize_t length;
+  do {
+    length = read(fd, data, sizeof(data));
+  } while (length < 0 && errno == EINTR);
+  const int error = length < 0 ? errno : 0;
+  if (length < 0 && (error == ENOENT || error == ESRCH)) return true;
+  if (length <= 0) {
+    ADD_FAILURE() << "invalid " << path << ": read length=" << length
+                  << " errno=" << error << " (" << strerror(error) << ")";
+    return false;
+  }
+  const std::string text(data, length);
+  const size_t end = text.rfind(')');
+  if (end == std::string::npos || end + 2 >= text.size()) {
+    ADD_FAILURE() << "invalid " << path;
+    return false;
+  }
+  return text[end + 2] == 'Z';
+}
+
+TEST(ProcStatLifecycle, GoneOrZombieAcceptsFirstReadAfterReap) {
+  // Keep the child alive until stat is open, without reading and caching its
+  // contents. Reaping before the first read makes the helper's race stable.
+  struct Cleanup {
+    pid_t child = -1;
+    int gate[2] = {-1, -1};
+    int stat = -1;
+    ~Cleanup() {
+      for (int fd : {gate[0], gate[1], stat}) if (fd >= 0) close(fd);
+      if (child > 0) {
+        kill(child, SIGKILL);
+        int status;
+        EXPECT_TRUE(Reap(child, &status, Now() + 2 * kSecond));
+      }
+    }
+  } cleanup;
+  ASSERT_EQ(0, pipe(cleanup.gate)) << strerror(errno);
+  cleanup.child = fork();
+  ASSERT_GE(cleanup.child, 0) << strerror(errno);
+  if (cleanup.child == 0) {
+    close(cleanup.gate[1]);
+    char token;
+    ssize_t count;
+    do { count = read(cleanup.gate[0], &token, 1); }
+    while (count < 0 && errno == EINTR);
+    _exit(count == 0 ? 0 : 1);
+  }
+  close(cleanup.gate[0]);
+  cleanup.gate[0] = -1;
+  const std::string path = "/proc/" + std::to_string(cleanup.child) + "/stat";
+  cleanup.stat = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(cleanup.stat, 0) << strerror(errno);
+  close(cleanup.gate[1]);
+  cleanup.gate[1] = -1;
+  int status;
+  ASSERT_TRUE(Reap(cleanup.child, &status, Now() + 2 * kSecond));
+  cleanup.child = -1;
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(0, WEXITSTATUS(status));
+  EXPECT_TRUE(ReadGoneOrZombie(cleanup.stat, path));
+}
+
 int Write(const std::string& path, const std::string& text) {
   int fd = open(path.c_str(), O_WRONLY | O_CLOEXEC);
   if (fd < 0) return errno;
@@ -1015,16 +1081,9 @@ class CgroupMemory : public ::testing::Test {
       ADD_FAILURE() << path << ": " << strerror(errno);
       return false;
     }
-    char data[4096];
-    ssize_t length = read(fd, data, sizeof(data));
+    const bool gone = ReadGoneOrZombie(fd, path);
     close(fd);
-    if (length <= 0) { ADD_FAILURE() << "invalid " << path; return false; }
-    std::string text(data, length);
-    size_t end = text.rfind(')');
-    if (end == std::string::npos || end + 2 >= text.size()) {
-      ADD_FAILURE() << "invalid " << path; return false;
-    }
-    return text[end + 2] == 'Z';
+    return gone;
   }
   bool Sleeping(pid_t pid) {
     const std::string text = Read("/proc/" + std::to_string(pid) + "/stat");

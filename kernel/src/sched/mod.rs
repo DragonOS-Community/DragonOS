@@ -1560,7 +1560,16 @@ pub fn enqueue_task_on_cpu(
         IDLE_CPUS.clear(target_cpu);
     }
 
-    rq.check_preempt_current(pcb, wake_flags);
+    // 唤醒入队后必须做抢占评估（对齐 Linux ttwu_do_activate→wakeup_preempt）：
+    // check_preempt_current 对 idle current 走 resched_current()，由它置
+    // NEED_SCHEDULE 并在远端场景发送 resched IPI；对非 idle current 比较
+    // vruntime 决定是否抢占。被唤醒的是 current 自身时跳过（自检无意义）。
+    // 此前缺失该评估时：本地唤醒到 idle rq（target==self 不发 IPI）
+    // NEED_SCHEDULE 从不置位；远端非 idle rq 的任务只能等 tick——
+    // 两类形态都表现为已入队任务长期不被调度（饥饿）。
+    if !Arc::ptr_eq(&rq.current(), pcb) {
+        rq.check_preempt_current(pcb, wake_flags);
+    }
 }
 
 pub fn request_task_migration(

@@ -1274,7 +1274,7 @@ pub fn clocksource_boot_finish() {
     debug!("clocksource_boot_finish");
 }
 
-fn run_watchdog_kthread() {
+pub(crate) fn run_watchdog_kthread() {
     if let Some(watchdog_kthread) = unsafe { WATCHDOG_KTHREAD.clone() } {
         ProcessManager::wakeup(&watchdog_kthread).ok();
     }

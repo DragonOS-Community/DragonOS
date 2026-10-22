@@ -67,6 +67,9 @@ macro_rules! syscall_return {
 pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
     // 系统调用进入时，把系统调用号存入errcode字段，以便在syscall_handler退出后，仍能获取到系统调用号
     frame.errcode = frame.rax;
+    ProcessManager::current_pcb()
+        .last_syscall
+        .store(frame.rax, core::sync::atomic::Ordering::Relaxed);
     let syscall_num = frame.rax as usize;
     // The syscall entry unconditionally sets pt_regs->ax to -ENOSYS (the errcode field has already saved the syscall number).
     // This happens before any ptrace/seccomp checks. Neither the SYSEMU skip nor normal dispatch relies on frame.rax as input.

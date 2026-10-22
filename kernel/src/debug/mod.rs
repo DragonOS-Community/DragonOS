@@ -14,6 +14,7 @@ pub mod panic;
 pub mod rcu;
 pub mod rng;
 pub mod sysfs;
+pub mod task_dump;
 pub mod timekeeping;
 pub mod traceback;
 pub mod tracing;

@@ -34,6 +34,7 @@ mod self_;
 mod stat;
 mod sys;
 mod syscall;
+mod sysrq;
 pub(super) mod template;
 mod thread_self;
 mod utils;

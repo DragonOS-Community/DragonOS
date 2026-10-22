@@ -103,6 +103,7 @@ impl RootDirOps {
         ("self", SelfSymOps::new_inode),
         ("stat", StatFileOps::new_inode),
         ("sys", SysDirOps::new_inode),
+        ("sysrq-trigger", super::sysrq::SysrqFileOps::new_inode),
         ("thread-self", ThreadSelfSymOps::new_inode),
         ("version", VersionFileOps::new_inode),
         ("version_signature", VersionSignatureFileOps::new_inode),

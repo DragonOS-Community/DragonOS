@@ -152,56 +152,90 @@ fn prepare_uretprobe(
         return;
     };
     let sp = VirtAddr::new(frame.rsp as usize);
+    let mut stack = pcb.uprobe.uret_stack();
+    // Match Linux's bounded nesting; reservation must succeed before hijacking.
+    if stack.len() >= 64 || stack.try_reserve(1).is_err() {
+        return;
+    }
     let mut orig_bytes = [0u8; 8];
     if unsafe { copy_from_user_protected(&mut orig_bytes, sp) }.is_err() {
-        warn!(
-            "uretprobe: failed to read return address at {:#x}",
-            sp.data()
-        );
         return;
     }
-    let tramp_bytes = trampoline.to_ne_bytes();
-    if unsafe { copy_to_user_protected(sp, &tramp_bytes) }.is_err() {
-        warn!("uretprobe: failed to write trampoline at {:#x}", sp.data());
+    let mut orig_ret_addr = u64::from_ne_bytes(orig_bytes) as usize;
+    let chained = orig_ret_addr == trampoline;
+    // RP_CHECK_CALL uses < (CALL has pushed a return address), whereas a
+    // tail call reuses its caller's stack slot and uses <=.
+    let live_len = stack
+        .iter()
+        .rposition(|instance| {
+            if chained {
+                sp.data() <= instance.stack_ptr
+            } else {
+                sp.data() < instance.stack_ptr
+            }
+        })
+        .map_or(0, |index| index + 1);
+    if chained {
+        let Some(previous) = live_len.checked_sub(1).and_then(|index| stack.get(index)) else {
+            return;
+        };
+        orig_ret_addr = previous.orig_ret_addr;
+    }
+    if unsafe { copy_to_user_protected(sp, &trampoline.to_ne_bytes()) }.is_err() {
         return;
     }
-    pcb.uprobe.push_uret(crate::process::uprobe::ActiveUret {
-        orig_ret_addr: u64::from_ne_bytes(orig_bytes) as usize,
+    stack.truncate(live_len);
+    stack.push(crate::process::uprobe::ActiveUret {
+        stack_ptr: sp.data(),
+        chained,
+        orig_ret_addr,
         participants: participants.clone(),
     });
 }
 
 /// Trampoline hit: the hijacked function returned. Pop the innermost hijack,
-/// deliver the retprobe callbacks (the trap frame still carries the return
-/// value in rax; `break_address()` reports the trampoline address, matching
-/// the Linux uretprobe context ip), then resume at the original return
-/// address. An empty stack means a stale trampoline address (e.g. forked from
-/// inside an instrumented call): Linux kills such a task with SIGSEGV.
+/// deliver the retprobe callbacks with the return value in rax and the
+/// original return IP, then resume at that original return
+/// address. Invalidated frames are discarded using the Linux stack-liveness
+/// checks; a trampoline hit without a return instance receives SIGILL.
 fn handle_uretprobe_trampoline(
     frame: &mut TrapFrame,
     pcb: &Arc<ProcessControlBlock>,
 ) -> Result<(), SystemError> {
-    let Some(instance) = pcb.uprobe.pop_uret() else {
-        warn!(
-            "uretprobe: trampoline hit with no hijack on the stack, pid {:?}; SIGSEGV",
-            ProcessManager::current_pid()
-        );
-        unsafe { CurrentIrqArch::interrupt_enable() };
-        force_sig_fault_to_current(
-            Signal::SIGSEGV,
-            1, /* SEGV_MAPERR */
-            VirtAddr::new(frame.rip as usize),
-        )
-        .ok();
-        return Ok(());
-    };
-    // Interrupts are still disabled from the #BP entry; the delivery gate and
-    // BPF execution expect user-exception semantics (same as Phase 1.5).
+    // Return-instance storage can sleep. Never take it with #BP's IRQ state.
     unsafe { CurrentIrqArch::interrupt_enable() };
-    instance
-        .participants
-        .for_each_active_ret(|participant| participant.deliver(pcb, frame));
-    frame.set_rip(instance.orig_ret_addr);
+    let mut stack = pcb.uprobe.uret_stack();
+    while let Some(top) = stack.last() {
+        let orig_ret_addr = top.orig_ret_addr;
+        // Locate the whole tail-call chain before checking the older frame.
+        let mut first = stack.len() - 1;
+        while stack[first].chained && first > 0 {
+            first -= 1;
+        }
+        let valid = first == 0 || frame.rsp as usize <= stack[first - 1].stack_ptr;
+        while stack.len() > first {
+            let instance = stack.pop().expect("return chain bounds checked");
+            if valid {
+                // Entry callbacks normalize RIP through break_address() = RIP-1.
+                // Linux delivers the original return IP, never the trampoline.
+                frame.set_rip(orig_ret_addr.wrapping_add(1));
+                instance
+                    .participants
+                    .for_each_active_ret(|participant| participant.deliver(pcb, frame));
+            }
+        }
+        if valid {
+            frame.set_rip(orig_ret_addr);
+            return Ok(());
+        }
+    }
+    drop(stack);
+    force_sig_fault_to_current(
+        Signal::SIGILL,
+        1, /* ILL_ILLOPC, matching Linux's invalid trampoline handling */
+        VirtAddr::new(frame.rip as usize),
+    )
+    .ok();
     Ok(())
 }
 

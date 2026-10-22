@@ -57,7 +57,7 @@ pub struct XolPage {
 }
 
 impl XolPage {
-    pub(super) fn new(page_base: VirtAddr, access: PageAccessPin) -> Arc<Self> {
+    pub(in crate::mm::ucontext) fn new(page_base: VirtAddr, access: PageAccessPin) -> Arc<Self> {
         Arc::new(Self {
             page_base,
             access,
@@ -66,7 +66,7 @@ impl XolPage {
         })
     }
 
-    pub(super) fn alloc_slot_in(
+    pub(in crate::mm::ucontext) fn alloc_slot_in(
         self: &Arc<Self>,
         reachable: &core::ops::RangeInclusive<usize>,
     ) -> Option<XolSlotLease> {
@@ -193,14 +193,14 @@ impl XolPool {
     /// Reserve the collection entry before mapping a new page. Registration
     /// is serialized by mm.write, so this capacity cannot be consumed by a
     /// competing grow operation before [`Self::add_page`] is called.
-    pub(super) fn reserve_page(&self) -> Result<(), SystemError> {
+    pub(in crate::mm::ucontext) fn reserve_page(&self) -> Result<(), SystemError> {
         self.pages
             .lock()
             .try_reserve(1)
             .map_err(|_| SystemError::ENOMEM)
     }
 
-    pub(super) fn add_page(&self, page: Arc<XolPage>) {
+    pub(in crate::mm::ucontext) fn add_page(&self, page: Arc<XolPage>) {
         let mut pages = self.pages.lock();
         debug_assert!(pages.len() < pages.capacity());
         let index = pages

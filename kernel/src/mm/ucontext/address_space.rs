@@ -148,19 +148,86 @@ impl AddressSpace {
     /// back). Idempotent; returns `None` when the pool has no free slot.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn ensure_uret_trampoline(&self) -> Option<usize> {
-        let mut slot = self.uret_trampoline.lock_irqsave();
-        if let Some(lease) = slot.as_ref() {
-            return Some(lease.slot_vaddr().data());
+        if let Some(vaddr) = self.uret_trampoline_vaddr() {
+            return Some(vaddr);
         }
+        // The pool takes a sleeping mutex: allocate before the IRQ-safe
+        // publication lock and discard a racing candidate after unlocking.
         let lease = self.xol_pool.alloc_slot_in(&(0..=usize::MAX))?;
-        // Write INT3 through the kernel direct map of the XOL page, exactly
-        // like the site XOL relocation path: no user page-table edit needed.
         let phys = lease.page_paddr() + lease.offset();
         let insn_addr = unsafe { crate::arch::MMArch::phys_2_virt(phys) }?;
         unsafe { core::ptr::write_volatile(insn_addr.as_ptr::<u8>(), 0xCC) };
         let vaddr = lease.slot_vaddr().data();
+        let mut slot = self.uret_trampoline.lock_irqsave();
+        if let Some(existing) = slot.as_ref() {
+            let existing_vaddr = existing.slot_vaddr().data();
+            drop(slot);
+            drop(lease);
+            return Some(existing_vaddr);
+        }
         *slot = Some(lease);
         Some(vaddr)
+    }
+
+    /// Recreate the parent's trampoline at the exact inherited return address.
+    /// XOL VMAs are DONTCOPY, so an independent child must own a fresh page.
+    /// Register it in the normal pool to retain all XOL mutation protections.
+    #[cfg(target_arch = "x86_64")]
+    fn inherit_uret_trampoline(
+        self: &Arc<Self>,
+        vaddr: usize,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        let mut inner = self.write();
+        self.xol_pool.reserve_page()?;
+        let base = vaddr & !(MMArch::PAGE_SIZE - 1);
+        let page = inner.map_anonymous(
+            VirtAddr::new(base),
+            MMArch::PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
+            true,
+            true,
+            Some(creator),
+            data_account,
+        )?;
+        let mapping = inner
+            .mappings
+            .contains(page.virt_address())
+            .expect("fresh inherited trampoline mapping disappeared");
+        {
+            let mut mapping = mapping.lock();
+            let special = VmFlags::VM_DONTCOPY
+                | VmFlags::VM_IO
+                | VmFlags::VM_DONTEXPAND
+                | VmFlags::VM_DONTDUMP;
+            let flags = *mapping.vm_flags() | special;
+            mapping.set_vm_flags(flags);
+        }
+        let paddr = inner
+            .user_mapper
+            .utable
+            .translate(page.virt_address())
+            .expect("eager trampoline mapping has no PTE")
+            .0;
+        let owned_page = crate::mm::page::page_manager_lock()
+            .get(&paddr)
+            .expect("fresh trampoline page absent from page manager");
+        let access = owned_page
+            .try_pin_access()
+            .expect("fresh trampoline page protected by child mm.write");
+        let xol_page = super::uprobe::XolPage::new(page.virt_address(), access);
+        let lease = xol_page
+            .alloc_slot_in(&(vaddr..=vaddr))
+            .map(Arc::new)
+            .expect("inherited trampoline slot must fit its page");
+        let kernel = unsafe { MMArch::phys_2_virt(paddr + lease.offset()) }
+            .expect("allocated trampoline page has no direct mapping");
+        unsafe { core::ptr::write_volatile(kernel.as_ptr::<u8>(), 0xCC) };
+        self.xol_pool.add_page(xol_page);
+        *self.uret_trampoline.lock_irqsave() = Some(lease);
+        Ok(())
     }
 
     /// Fast read of the trampoline address for the #BP discriminator, or
@@ -2557,6 +2624,10 @@ impl AddressSpace {
             drop(guard);
             match result {
                 Ok(()) => {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(vaddr) = self.uret_trampoline_vaddr() {
+                        child.inherit_uret_trampoline(vaddr, &creator, &child_data_account)?;
+                    }
                     #[cfg(target_arch = "x86_64")]
                     super::uprobe::fork_inherit_uprobes(&child);
                     return Ok(child);

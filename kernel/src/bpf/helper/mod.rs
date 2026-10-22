@@ -332,13 +332,13 @@ unsafe fn raw_get_current_pid_tgid() -> u64 {
     ((pcb.raw_tgid().data() as u64) << 32) | (pcb.raw_pid().data() as u64)
 }
 
-/// A helper function that returns the real UID (upper 32 bits) and the real
-/// GID (lower 32 bits) of the current task.
+/// A helper function that returns the UID (lower 32 bits) and GID
+/// (upper 32 bits) of the current task.
 ///
 /// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_uid_gid/
 unsafe fn raw_get_current_uid_gid() -> u64 {
     let cred = ProcessManager::current_pcb().cred();
-    ((cred.uid.data() as u64) << 32) | (cred.gid.data() as u64)
+    ((cred.gid.data() as u64) << 32) | (cred.uid.data() as u64)
 }
 
 /// Copy the comm attribute of the current task into buf (of size min(size,
@@ -347,10 +347,11 @@ unsafe fn raw_get_current_uid_gid() -> u64 {
 /// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_comm/
 unsafe fn raw_get_current_comm(buf: *mut c_void, size: u64) -> i64 {
     if size == 0 {
-        return 0;
+        return SystemError::EINVAL.to_posix_errno() as i64;
     }
     let pcb = ProcessManager::current_pcb();
     let dst = core::slice::from_raw_parts_mut(buf as *mut u8, size as usize);
+    dst.fill(0);
     let basic = pcb.basic();
     let name = basic.name().as_bytes();
     // Linux comm is the basename of argv[0], truncated to TASK_COMM_LEN-1;
@@ -375,10 +376,14 @@ unsafe fn raw_probe_read_user(dst: *mut c_void, size: u32, unsafe_ptr: *const c_
         return 0;
     }
     let dst = core::slice::from_raw_parts_mut(dst as *mut u8, size as usize);
+    let _no_fault = crate::process::preempt::PageFaultDisabledGuard::new();
     let res = copy_from_user_protected(dst, VirtAddr::new(unsafe_ptr as usize));
     match res {
         Ok(_) => 0,
-        Err(e) => e as i64,
+        Err(e) => {
+            dst.fill(0);
+            e.to_posix_errno() as i64
+        }
     }
 }
 
@@ -401,17 +406,20 @@ unsafe fn raw_ringbuf_discard(data: *mut c_void, flags: u64) -> u64 {
 }
 
 /// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_output/
-unsafe fn raw_ringbuf_output(map: *mut c_void, data: *mut c_void, size: u64, _flags: u64) -> u64 {
+unsafe fn raw_ringbuf_output(map: *mut c_void, data: *mut c_void, size: u64, flags: u64) -> u64 {
+    if flags & !3 != 0 {
+        return SystemError::EINVAL.to_posix_errno() as u64;
+    }
     let map = unsafe { &*(map as *const BpfMap) };
     let dst = ringbuf_reserve(map, size, 0);
     if dst.is_null() {
-        return u64::MAX; // -EINVAL
+        return SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() as u64;
     }
     let src = unsafe { core::slice::from_raw_parts(data as *const u8, size as usize) };
     unsafe {
         core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
     }
-    ringbuf_submit(dst, 0);
+    ringbuf_submit(dst, flags);
     0
 }
 

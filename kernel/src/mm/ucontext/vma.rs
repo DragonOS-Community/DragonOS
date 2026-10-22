@@ -8,9 +8,10 @@ const UNMAP_SCAN_BATCH: usize = 256;
 
 /// Classification of a present user PTE in a VMA.
 ///
-/// A missing `Page` is accepted only for VM_MIXEDMAP. Keeping this check in one
-/// place prevents device PFNs from accidentally reaching rmap, LRU, mlock, or
-/// the frame allocator.
+/// VM_PFNMAP is explicitly driver-owned and pinned by its VMA backing; it
+/// bypasses ordinary Page bookkeeping even for registered physical pages.
+/// Otherwise, a missing Page is accepted only for VM_MIXEDMAP (external PFNs).
+/// This classification is shared by split, fork, unmap, mlock and mremap.
 #[derive(Debug)]
 pub enum PresentPfn {
     Managed(Arc<Page>),
@@ -86,6 +87,12 @@ impl LockedVMA {
         paddr: PhysAddr,
         vm_flags: VmFlags,
     ) -> PresentPfn {
+        // An explicit driver-owned PFN VMA is pinned by its File backing,
+        // even when the physical frame has a PageManager registration. It
+        // never participates in ordinary rmap, RSS, mlock or frame retirement.
+        if vm_flags.contains(VmFlags::VM_PFNMAP) {
+            return PresentPfn::External;
+        }
         if let Some(page) = page_manager.get(&paddr) {
             return PresentPfn::Managed(page);
         }
@@ -585,11 +592,13 @@ impl LockedVMA {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    if let Some(page) = page_manager_guard.get(&paddr) {
+                    if let PresentPfn::Managed(page) = Self::classify_present_pfn(
+                        &mut page_manager_guard,
+                        paddr,
+                        *guard.vm_flags(),
+                    ) {
                         let mut page_guard = page.write();
                         page_guard.replace_vma_for_split(self, before.clone());
-                    } else {
-                        assert!(guard.vm_flags().contains(VmFlags::VM_MIXEDMAP));
                     }
                     before.lock().mapped = true;
                 }
@@ -599,11 +608,13 @@ impl LockedVMA {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    if let Some(page) = page_manager_guard.get(&paddr) {
+                    if let PresentPfn::Managed(page) = Self::classify_present_pfn(
+                        &mut page_manager_guard,
+                        paddr,
+                        *guard.vm_flags(),
+                    ) {
                         let mut page_guard = page.write();
                         page_guard.replace_vma_for_split(self, after.clone());
-                    } else {
-                        assert!(guard.vm_flags().contains(VmFlags::VM_MIXEDMAP));
                     }
                     after.lock().mapped = true;
                 }

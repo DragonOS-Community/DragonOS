@@ -176,7 +176,7 @@ impl Syscall {
                     Ok(v) => (v, v as i64),
                     Err(e) => {
                         let errno = e.to_posix_errno() as i64;
-                        (errno as u64 as usize, -errno)
+                        (errno as u64 as usize, errno)
                     }
                 };
                 frame.set_return_value(rax_value);

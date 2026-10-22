@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <setjmp.h>
+#include <sys/epoll.h>
 #include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -898,7 +900,8 @@ static void test_current_helpers(void)
     uint64_t uid_gid = 0;
     map_lookup(mfd, &k, val);
     memcpy(&uid_gid, val, 8);
-    report((uid_gid >> 32) == (uint64_t)getuid(), "bpf_get_current_uid_gid",
+    report((uint32_t)uid_gid == (uint32_t)getuid() &&
+           (uid_gid >> 32) == (uint64_t)getgid(), "bpf_get_current_uid_gid",
            NULL);
 
     k = 2;
@@ -1267,6 +1270,13 @@ static void test_ringbuf(void)
     }
     report(1, "BPF_MAP_TYPE_RINGBUF create", NULL);
 
+    void *bad = mmap(NULL, 4096 + 2 * data_sz, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 4096);
+    report(bad == MAP_FAILED, "ringbuf producer rejects writable mmap", NULL);
+    if (bad != MAP_FAILED) munmap(bad, 4096 + 2 * data_sz);
+    bad = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, mfd, 0);
+    report(bad == MAP_FAILED, "ringbuf rejects private mmap", NULL);
+    if (bad != MAP_FAILED) munmap(bad, 4096);
+
     /* mmap consumer page at offset 0 */
     volatile uint64_t *consumer = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                                        MAP_SHARED, mfd, 0);
@@ -1279,6 +1289,15 @@ static void test_ringbuf(void)
         return;
     }
     report(1, "ringbuf mmap (consumer + producer areas)", NULL);
+    report(mprotect((void *)producer_area, 4096, PROT_READ | PROT_WRITE) == -1,
+           "ringbuf producer rejects mprotect upgrade", NULL);
+    void *expanded = mremap((void *)consumer, 4096, 8192, MREMAP_MAYMOVE);
+    report(expanded == MAP_FAILED, "ringbuf consumer rejects mremap expansion", NULL);
+    if (expanded != MAP_FAILED) consumer = expanded;
+    int epfd = epoll_create1(0);
+    struct epoll_event interest = { .events = EPOLLIN, .data.fd = mfd };
+    int epoll_ok = epfd >= 0 && epoll_ctl(epfd, EPOLL_CTL_ADD, mfd, &interest) == 0;
+    report(epoll_ok, "ringbuf supports epoll registration", NULL);
     volatile uint64_t *producer_pos = (volatile uint64_t *)producer_area;
     const uint8_t *data = (const uint8_t *)producer_area + 4096;
 
@@ -1345,6 +1364,15 @@ static void test_ringbuf(void)
     close(evfd);
     close(pfd);
 
+    if (epoll_ok) {
+        struct epoll_event event;
+        report(epoll_wait(epfd, &event, 1, 0) == 1 && (event.events & EPOLLIN),
+               "ringbuf epoll reports committed events", NULL);
+    }
+    if (epfd >= 0) close(epfd);
+    report(memcmp((const void *)data, (const void *)(data + data_sz), data_sz) == 0,
+           "ringbuf second data half aliases the first", NULL);
+
     /* consume: walk records from consumer_pos to producer_pos */
     uint64_t cons = *consumer;
     uint64_t prod = *producer_pos;
@@ -1356,14 +1384,14 @@ static void test_ringbuf(void)
     while (cons < prod && seen < 64) {
         uint64_t off = cons % data_sz;
         uint32_t hdr = *(const uint32_t *)(data + off);
-        uint32_t len = hdr >> 2;
-        if (hdr & 1 /* BUSY */) {
+        uint32_t len = hdr & ((1u << 30) - 1);
+        if (hdr & (1u << 31) /* BUSY */) {
             printf("    stuck on BUSY record at off=%llu\n",
                    (unsigned long long)off);
             break;
         }
         uint64_t total = 8 + ((len + 7) & ~7u);
-        if (!(hdr & 2 /* DISCARD */) && len == 16) {
+        if (!(hdr & (1u << 30) /* DISCARD */) && len == 16) {
             uint64_t m0 = *(const uint64_t *)(data + off + 8);
             uint64_t m1 = *(const uint64_t *)(data + off + 16);
             if (m0 == 0x9e37beefULL && m1 == expect_pid) {
@@ -1375,13 +1403,52 @@ static void test_ringbuf(void)
         *consumer = cons; /* publish consumed position */
     }
     report(ok, "ringbuf record received and consumed", NULL);
+    size_t mapped_len = 4096 + 2 * data_sz;
+    void *destination = mmap(NULL, mapped_len, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *moved = destination == MAP_FAILED ? MAP_FAILED :
+        mremap((void *)producer_area, mapped_len, mapped_len,
+               MREMAP_MAYMOVE | MREMAP_FIXED, destination);
+    report(moved != MAP_FAILED, "ringbuf equal-size mremap preserves backing", NULL);
+    if (moved != MAP_FAILED) {
+        producer_area = moved;
+        data = (const uint8_t *)producer_area + 4096;
+    } else if (destination != MAP_FAILED) {
+        munmap(destination, mapped_len);
+    }
+    void *middle = (void *)(producer_area + 4096);
+    int split_ok = mprotect(middle, 4096, PROT_NONE) == 0 &&
+                   mprotect(middle, 4096, PROT_READ) == 0;
+    report(split_ok, "ringbuf mprotect split preserves aliases", NULL);
     close(mfd);
+    pid_t alias_child = fork();
+    if (alias_child == 0) {
+        _exit(memcmp((const void *)data, (const void *)(data + data_sz), data_sz) == 0
+                  ? 0 : 72);
+    }
+    int alias_status = 0;
+    pid_t alias_wait = alias_child > 0 ? waitpid(alias_child, &alias_status, 0) : -1;
+    report(alias_wait > 0 && WIFEXITED(alias_status) && WEXITSTATUS(alias_status) == 0,
+           "ringbuf fork preserves aliases after fd close", NULL);
+    report(munmap((void *)(data + data_sz), data_sz) == 0 && data[8] == 0xef,
+           "ringbuf partial unmap retains the other alias", NULL);
+    munmap((void *)consumer, expanded == MAP_FAILED ? 4096 : 8192);
+    munmap((void *)producer_area, 4096 + data_sz);
 }
 
 /* ---------------- T9: uretprobe (return-value capture) ---------------- */
 
+static volatile int uret_test_mode;
+static volatile pid_t uret_forked;
+static jmp_buf uret_jump;
+
 __attribute__((noinline, used)) static long uret_target(long x)
 {
+    if (uret_test_mode == 1) uret_forked = fork();
+    if (uret_test_mode == 2) {
+        if (x == 200) longjmp(uret_jump, 1);
+        if (setjmp(uret_jump) == 0) (void)uret_target(200);
+    }
     /* keep the frame real; return a value the BPF side can assert on */
     volatile long y = x + 7;
     return y * 3 + 0x1000;
@@ -1471,6 +1538,22 @@ static void test_uretprobe(void)
     long r2 = uret_target(200);
     map_lookup(mfd, &key, &retval);
     report(r2 == 4717 && retval == 4717, "uretprobe second hit", NULL);
+
+    pid_t parent = getpid();
+    uret_test_mode = 1;
+    long fork_result = uret_target(100);
+    if (getpid() != parent) _exit(fork_result == 4417 ? 0 : 71);
+    uret_test_mode = 0;
+    int child_status = 0;
+    pid_t waited = uret_forked > 0 ? waitpid(uret_forked, &child_status, 0) : -1;
+    report(waited > 0 && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
+           "uretprobe fork child preserves return context", NULL);
+    uret_test_mode = 2;
+    long jump_result = uret_target(100);
+    uret_test_mode = 0;
+    map_lookup(mfd, &key, &retval);
+    report(jump_result == 4417 && retval == 4417,
+           "uretprobe prunes longjmp-abandoned inner call", NULL);
 
     ioctl(evfd, PERF_IOC_DISABLE, 0);
     close(evfd);

@@ -7,8 +7,10 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use crate::libs::mutex::{Mutex, MutexGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::mm::ucontext::XolSlotLease;
+use system_error::SystemError;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +56,10 @@ impl core::fmt::Debug for ActiveXol {
 /// One live uretprobe hijack owned by this task: the original return address
 /// that was replaced on the user stack by the mm-wide trampoline, together
 /// with the retprobe participants snapshot to deliver on return.
+#[derive(Clone)]
 pub struct ActiveUret {
+    pub stack_ptr: usize,
+    pub chained: bool,
     pub orig_ret_addr: usize,
     pub participants: Arc<crate::mm::ucontext::UprobeParticipantNode>,
 }
@@ -77,7 +82,7 @@ pub struct TaskXolState {
     payload: SpinLock<Option<ActiveXol>>,
     /// Live uretprobe return instances, innermost last. LIFO on the trampoline
     /// hit keeps nested hijacks of the same function correct.
-    ret_stack: SpinLock<alloc::vec::Vec<ActiveUret>>,
+    ret_stack: Mutex<alloc::vec::Vec<ActiveUret>>,
 }
 
 impl core::fmt::Debug for TaskXolState {
@@ -93,29 +98,33 @@ impl TaskXolState {
         Self {
             phase: AtomicU8::new(TaskXolPhase::Idle as u8),
             payload: SpinLock::new(None),
-            ret_stack: SpinLock::new(alloc::vec::Vec::new()),
+            ret_stack: Mutex::new(alloc::vec::Vec::new()),
         }
     }
 
-    /// Record one uretprobe hijack. Called from process context on the
-    /// entry-path after the user stack slot has been rewritten.
-    pub fn push_uret(&self, instance: ActiveUret) {
-        let mut stack = self.ret_stack.lock_irqsave();
-        let _ = stack.try_reserve_exact(1);
-        stack.push(instance);
+    /// Return instances are only accessed from process context with IRQs enabled.
+    /// A sleeping lock permits fallible reservation before changing the user stack.
+    pub(crate) fn uret_stack(&self) -> MutexGuard<'_, alloc::vec::Vec<ActiveUret>> {
+        self.ret_stack.lock()
     }
 
-    /// Pop the innermost uretprobe hijack on the trampoline hit. Returns the
-    /// instance so the handler can restore its original return address.
-    pub fn pop_uret(&self) -> Option<ActiveUret> {
-        self.ret_stack.lock_irqsave().pop()
+    /// Copy live return instances into an unpublished fork/vfork child.
+    pub(crate) fn inherit_urets(&self, parent: &Self) -> Result<(), SystemError> {
+        let source = parent.ret_stack.lock();
+        let mut inherited = alloc::vec::Vec::new();
+        inherited
+            .try_reserve_exact(source.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        inherited.extend(source.iter().cloned());
+        drop(source);
+        *self.ret_stack.lock() = inherited;
+        Ok(())
     }
 
-    /// Drop every live hijack without unwinding user stacks: used when the
-    /// old user context is being discarded (exec) so stale trampoline
-    /// addresses never reference a freed address space.
+    /// The old user context is being discarded by exec.
     pub fn clear_urets(&self) {
-        self.ret_stack.lock_irqsave().clear();
+        let retired = core::mem::take(&mut *self.ret_stack.lock());
+        drop(retired);
     }
 
     #[inline]

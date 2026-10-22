@@ -16,7 +16,7 @@ use crate::{
     libs::mutex::MutexGuard,
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
-        MemoryManagementArch, VmFaultReason,
+        MemoryManagementArch, VmFaultReason, VmFlags,
     },
 };
 use system_error::SystemError;
@@ -47,6 +47,9 @@ impl FileSystem for AnonInodeFs {
     // from the generic filemap helpers. Inodes without a page cache keep the
     // default SIGBUS.
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if pfm.vm_flags().contains(VmFlags::VM_PFNMAP) {
+            return PageFaultHandler::filemap_pfnmap_fault(pfm, None);
+        }
         PageFaultHandler::filemap_fault(pfm)
     }
     unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
@@ -64,6 +67,11 @@ impl FileSystem for AnonInodeFs {
         start_pgoff: usize,
         end_pgoff: usize,
     ) -> VmFaultReason {
+        // Ordinary fault-around would attach both aliases to one managed
+        // rmap. The explicit driver PFN fault installs one validated PTE.
+        if pfm.vm_flags().contains(VmFlags::VM_PFNMAP) {
+            return VmFaultReason::empty();
+        }
         PageFaultHandler::filemap_map_pages(pfm, start_pgoff, end_pgoff)
     }
 

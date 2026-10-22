@@ -3,9 +3,9 @@ use alloc::{
     collections::{BTreeMap, VecDeque},
     string::String,
     sync::Arc,
-    vec,
     vec::Vec,
 };
+use core::mem::MaybeUninit;
 
 use device_output_buffer::{BufferError, DeviceOutputBuffer};
 use log::{debug, info, warn};
@@ -115,6 +115,49 @@ enum VirtioFsOutput {
     },
 }
 
+/// One bridge-thread-local descriptor-list backing, prepared before activation.
+/// The backing is never read as static references. Each operation initializes
+/// and borrows only a short-lived prefix tied to its exact output owner.
+struct OutputDmaSlices {
+    slots: Vec<MaybeUninit<&'static mut [u8]>>,
+}
+
+impl OutputDmaSlices {
+    fn try_new(max_pages: usize) -> Result<Self, SystemError> {
+        if max_pages == 0 || max_pages > FUSE_MAX_MAX_PAGES {
+            return Err(SystemError::EINVAL);
+        }
+        let count = max_pages + 1; // Response header followed by candidate pages.
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(count)
+            .map_err(|_| SystemError::ENOMEM)?;
+        slots.resize_with(count, MaybeUninit::uninit);
+        Ok(Self { slots })
+    }
+
+    fn max_pages(&self) -> usize {
+        self.slots.len() - 1
+    }
+
+    fn borrow_slots(&mut self) -> &mut [MaybeUninit<&mut [u8]>] {
+        // SAFETY: MaybeUninit has the same layout for both reference lifetimes.
+        // No old contents are read, and no static reference is ever constructed.
+        // Exclusive access to the backing lasts until the returned view ends.
+        unsafe { core::slice::from_raw_parts_mut(self.slots.as_mut_ptr().cast(), self.slots.len()) }
+    }
+}
+
+/// # Safety
+/// Every slot must contain a valid, distinct slice borrowed for this view.
+unsafe fn initialized_output_slices<'a>(
+    slots: &'a mut [MaybeUninit<&'a mut [u8]>],
+) -> &'a mut [&'a mut [u8]] {
+    // SAFETY: The caller initialized this complete prefix. MaybeUninit has the
+    // same layout as its payload; the backing cannot be reused during the view.
+    unsafe { core::slice::from_raw_parts_mut(slots.as_mut_ptr().cast(), slots.len()) }
+}
+
 impl VirtioFsOutput {
     fn writable_len(&self) -> usize {
         match self {
@@ -123,7 +166,22 @@ impl VirtioFsOutput {
         }
     }
 
-    unsafe fn dma_slices(&mut self, submission: bool) -> Result<Vec<&mut [u8]>, SystemError> {
+    unsafe fn dma_slices<'a>(
+        &'a mut self,
+        scratch: &'a mut OutputDmaSlices,
+        submission: bool,
+    ) -> Result<&'a mut [&'a mut [u8]], SystemError> {
+        let count = match self {
+            Self::Contiguous(_) => 1,
+            Self::ReadPages { target, .. } => target
+                .page_count()
+                .checked_add(1)
+                .ok_or(SystemError::EINVAL)?,
+        };
+        if count > scratch.slots.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let slots = scratch.borrow_slots();
         match self {
             Self::Contiguous(rsp) => {
                 let slice = if submission {
@@ -132,31 +190,37 @@ impl VirtioFsOutput {
                     unsafe { rsp.retirement_dma_slice(response_buffer_virt_to_phys) }
                 }
                 .map_err(|_| SystemError::EIO)?;
-                Ok(vec![slice])
+                slots[0].write(slice);
             }
             Self::ReadPages { header, target } => {
+                let descriptors = target.descriptors();
+                if descriptors.len() != count - 1 {
+                    return Err(SystemError::EIO);
+                }
                 let header = if submission {
                     unsafe { header.submission_dma_slice(response_buffer_virt_to_phys) }
                 } else {
                     unsafe { header.retirement_dma_slice(response_buffer_virt_to_phys) }
                 }
                 .map_err(|_| SystemError::EIO)?;
-                let mut outputs = Vec::with_capacity(1 + target.page_count());
-                outputs.push(header);
-                for descriptor in target.descriptors() {
+                slots[0].write(header);
+                for (slot, descriptor) in slots[1..count].iter_mut().zip(descriptors) {
                     // SAFETY: the reservation exclusively owns mapping-invisible candidate pages;
                     // their recorded direct-map address and full-page length remain fixed until
                     // this exact descriptor is retired.
-                    outputs.push(unsafe {
+                    slot.write(unsafe {
                         core::slice::from_raw_parts_mut(
                             descriptor.vaddr().data() as *mut u8,
                             descriptor.len(),
                         )
                     });
                 }
-                Ok(outputs)
             }
         }
+        // SAFETY: Every member of this prefix was initialized above, and each
+        // reference remains borrowed from the exact output owner for 'a. The
+        // shared lifetime also prevents scratch reuse until queue access ends.
+        Ok(unsafe { initialized_output_slices(&mut slots[..count]) })
     }
 }
 
@@ -351,6 +415,7 @@ struct VirtioFsBridgeContext {
     hiprio_inflight: BTreeMap<u16, InflightReq>,
     request_inflight: Vec<BTreeMap<u16, InflightReq>>,
     response_pool: ResponseBufferPool,
+    output_slices: OutputDmaSlices,
     next_request_slot: usize,
     next_completion_slot: usize,
     hiprio_blocked: QueueBlockState,
@@ -926,9 +991,10 @@ impl VirtioFsBridgeContext {
                 .size(),
         };
         let direct_target = pending.req.read_pages_destination().filter(|target| {
-            2usize
-                .checked_add(target.page_count())
-                .is_some_and(|descriptors| descriptors <= queue_size)
+            target.page_count() <= self.output_slices.max_pages()
+                && 2usize
+                    .checked_add(target.page_count())
+                    .is_some_and(|descriptors| descriptors <= queue_size)
         });
         let direct_selected = direct_target.is_some();
         let track_direct_read_stats = pending.req.tracks_direct_read_stats();
@@ -974,68 +1040,69 @@ impl VirtioFsBridgeContext {
             }
         };
 
-        let mut dma_outputs = if let Some(output_ref) = output.as_mut() {
-            match unsafe { output_ref.dma_slices(true) } {
-                Ok(outputs) => Some(outputs),
-                Err(error) => {
-                    Self::release_unsubmitted_output(&self.response_pool, output.take());
-                    self.terminate_pending_not_submitted(&pending, error);
-                    return Ok(true);
+        let (token, should_notify) = {
+            let mut dma_outputs = if let Some(output_ref) = output.as_mut() {
+                match unsafe { output_ref.dma_slices(&mut self.output_slices, true) } {
+                    Ok(outputs) => Some(outputs),
+                    Err(error) => {
+                        Self::release_unsubmitted_output(&self.response_pool, output.take());
+                        self.terminate_pending_not_submitted(&pending, error);
+                        return Ok(true);
+                    }
+                }
+            } else {
+                None
+            };
+
+            match kind {
+                QueueKind::Hiprio => {
+                    let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
+                    let token = if let Some(outputs) = dma_outputs.as_mut() {
+                        let inputs = [pending.req.bytes()];
+                        // SAFETY: The request contains a non-empty FuseInHeader, and the reply
+                        // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
+                        // only their owners and independent metadata are moved/read before notification;
+                        // neither buffer's contents are accessed again until `pop_used` succeeds or
+                        // reset completes and `detach_unused` succeeds. On error no descriptor was
+                        // accepted.
+                        unsafe { queue.add(&inputs, outputs) }
+                    } else {
+                        let inputs = [pending.req.bytes()];
+                        let mut outputs: [&mut [u8]; 0] = [];
+                        // SAFETY: The request contains a non-empty FuseInHeader; the output slice
+                        // list is empty for this no-reply request. On success, only its owner and
+                        // independent metadata are moved/read before notification; the request contents
+                        // are not accessed again until `pop_used` succeeds or reset completes and
+                        // `detach_unused` succeeds. On error no descriptor was accepted.
+                        unsafe { queue.add(&inputs, &mut outputs) }
+                    };
+                    (token, queue.should_notify())
+                }
+                QueueKind::Request(slot) => {
+                    let queue = self.request_vqs.get_mut(slot).ok_or(SystemError::EINVAL)?;
+                    let token = if let Some(outputs) = dma_outputs.as_mut() {
+                        let inputs = [pending.req.bytes()];
+                        // SAFETY: The request contains a non-empty FuseInHeader, and the reply
+                        // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
+                        // only their owners and independent metadata are moved/read before notification;
+                        // neither buffer's contents are accessed again until `pop_used` succeeds or
+                        // reset completes and `detach_unused` succeeds. On error no descriptor was
+                        // accepted.
+                        unsafe { queue.add(&inputs, outputs) }
+                    } else {
+                        let inputs = [pending.req.bytes()];
+                        let mut outputs: [&mut [u8]; 0] = [];
+                        // SAFETY: The request contains a non-empty FuseInHeader; the output slice
+                        // list is empty for this no-reply request. On success, only its owner and
+                        // independent metadata are moved/read before notification; the request contents
+                        // are not accessed again until `pop_used` succeeds or reset completes and
+                        // `detach_unused` succeeds. On error no descriptor was accepted.
+                        unsafe { queue.add(&inputs, &mut outputs) }
+                    };
+                    (token, queue.should_notify())
                 }
             }
-        } else {
-            None
         };
-
-        let (token, should_notify) = match kind {
-            QueueKind::Hiprio => {
-                let queue = self.hiprio_vq.as_mut().ok_or(SystemError::EIO)?;
-                let token = if let Some(outputs) = dma_outputs.as_mut() {
-                    let inputs = [pending.req.bytes()];
-                    // SAFETY: The request contains a non-empty FuseInHeader, and the reply
-                    // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
-                    // only their owners and independent metadata are moved/read before notification;
-                    // neither buffer's contents are accessed again until `pop_used` succeeds or
-                    // reset completes and `detach_unused` succeeds. On error no descriptor was
-                    // accepted.
-                    unsafe { queue.add(&inputs, outputs) }
-                } else {
-                    let inputs = [pending.req.bytes()];
-                    let mut outputs: [&mut [u8]; 0] = [];
-                    // SAFETY: The request contains a non-empty FuseInHeader; the output slice
-                    // list is empty for this no-reply request. On success, only its owner and
-                    // independent metadata are moved/read before notification; the request contents
-                    // are not accessed again until `pop_used` succeeds or reset completes and
-                    // `detach_unused` succeeds. On error no descriptor was accepted.
-                    unsafe { queue.add(&inputs, &mut outputs) }
-                };
-                (token, queue.should_notify())
-            }
-            QueueKind::Request(slot) => {
-                let queue = self.request_vqs.get_mut(slot).ok_or(SystemError::EINVAL)?;
-                let token = if let Some(outputs) = dma_outputs.as_mut() {
-                    let inputs = [pending.req.bytes()];
-                    // SAFETY: The request contains a non-empty FuseInHeader, and the reply
-                    // contract makes `rsp_buf` at least a non-empty FuseOutHeader. On success,
-                    // only their owners and independent metadata are moved/read before notification;
-                    // neither buffer's contents are accessed again until `pop_used` succeeds or
-                    // reset completes and `detach_unused` succeeds. On error no descriptor was
-                    // accepted.
-                    unsafe { queue.add(&inputs, outputs) }
-                } else {
-                    let inputs = [pending.req.bytes()];
-                    let mut outputs: [&mut [u8]; 0] = [];
-                    // SAFETY: The request contains a non-empty FuseInHeader; the output slice
-                    // list is empty for this no-reply request. On success, only its owner and
-                    // independent metadata are moved/read before notification; the request contents
-                    // are not accessed again until `pop_used` succeeds or reset completes and
-                    // `detach_unused` succeeds. On error no descriptor was accepted.
-                    unsafe { queue.add(&inputs, &mut outputs) }
-                };
-                (token, queue.should_notify())
-            }
-        };
-        drop(dma_outputs);
 
         let token = match token {
             Ok(token) => token,
@@ -1235,7 +1302,7 @@ impl VirtioFsBridgeContext {
             .expect("inflight request must own pending metadata");
         let inputs = [pending.req.bytes()];
         let used_len_res = if let Some(output) = inflight.output.as_mut() {
-            let mut outputs = match unsafe { output.dma_slices(false) } {
+            let outputs = match unsafe { output.dma_slices(&mut self.output_slices, false) } {
                 Ok(outputs) => outputs,
                 Err(_) => {
                     let unique = pending.unique;
@@ -1256,13 +1323,13 @@ impl VirtioFsBridgeContext {
                     self.hiprio_vq
                         .as_mut()
                         .expect("hiprio queue was validated before taking its inflight owner")
-                        .pop_used(token, &inputs, &mut outputs)
+                        .pop_used(token, &inputs, outputs)
                 },
                 QueueKind::Request(slot) => unsafe {
                     self.request_vqs
                         .get_mut(slot)
                         .expect("request queue was validated before taking its inflight owner")
-                        .pop_used(token, &inputs, &mut outputs)
+                        .pop_used(token, &inputs, outputs)
                 },
             }
             .map_err(virtio_drivers_error_to_system_error)
@@ -1685,13 +1752,14 @@ impl VirtioFsBridgeContext {
         queue: &mut VirtioFsQueue,
         inflight: &mut BTreeMap<u16, InflightReq>,
         kind: QueueKind,
+        scratch: &mut OutputDmaSlices,
     ) -> bool {
         let mut all_detached = true;
         for (token, req) in inflight.iter_mut() {
             let req_owner = req.pending().req.clone();
             let inputs = [req_owner.bytes()];
             let result = if let Some(output) = req.output.as_mut() {
-                let mut outputs = match unsafe { output.dma_slices(false) } {
+                let outputs = match unsafe { output.dma_slices(scratch, false) } {
                     Ok(outputs) => outputs,
                     Err(_) => {
                         all_detached = false;
@@ -1708,7 +1776,7 @@ impl VirtioFsBridgeContext {
                 // SAFETY: The caller invokes this only after the device reset completed, so the
                 // device can no longer access the queue. The stateful buffer reconstructed the
                 // exact virtual address and length recorded for this token.
-                unsafe { queue.detach_unused(*token, &inputs, &mut outputs) }
+                unsafe { queue.detach_unused(*token, &inputs, outputs) }
             } else {
                 let mut outputs: [&mut [u8]; 0] = [];
                 // SAFETY: Same as above; this request had no device-writable response buffer.
@@ -1747,6 +1815,7 @@ impl VirtioFsBridgeContext {
                 queue,
                 &mut self.hiprio_inflight,
                 QueueKind::Hiprio,
+                &mut self.output_slices,
             );
         }
 
@@ -1756,6 +1825,7 @@ impl VirtioFsBridgeContext {
                     &mut self.request_vqs[slot],
                     inflight,
                     QueueKind::Request(slot),
+                    &mut self.output_slices,
                 );
             }
         }
@@ -2093,6 +2163,22 @@ pub(super) fn start_bridge(
         return Err(e);
     }
 
+    let output_slices = match OutputDmaSlices::try_new(max_pages_limit) {
+        Ok(slices) => slices,
+        Err(error) => {
+            put_transport_after_start_failure(
+                &instance,
+                session_id,
+                transport,
+                hiprio_vq,
+                request_vqs,
+                instance.hiprio_queue_index(),
+                &request_indices,
+            );
+            return Err(error);
+        }
+    };
+
     stats::on_virtiofs_queue_configured(
         device_queue_depth_max,
         hiprio_size,
@@ -2136,6 +2222,7 @@ pub(super) fn start_bridge(
         hiprio_pending: VecDeque::new(),
         hiprio_inflight: BTreeMap::new(),
         response_pool,
+        output_slices,
         next_request_slot: 0,
         next_completion_slot: 0,
         hiprio_blocked: QueueBlockState::default(),
@@ -2182,7 +2269,47 @@ mod tests {
         protocol::{FUSE_REMOVEMAPPING, FUSE_SETUPMAPPING},
     };
 
-    use super::{QueueBlockState, VirtioFsBridgeContext};
+    use super::{
+        initialized_output_slices, OutputDmaSlices, QueueBlockState, VirtioFsBridgeContext,
+        FUSE_MAX_MAX_PAGES,
+    };
+
+    #[test]
+    fn output_slice_backing_reuses_maximum_shape_for_a_different_owner() {
+        let mut scratch = OutputDmaSlices::try_new(FUSE_MAX_MAX_PAGES).unwrap();
+        let backing = scratch.slots.as_ptr();
+        let capacity = scratch.slots.capacity();
+        let mut pages = vec![[0u8; 1]; FUSE_MAX_MAX_PAGES + 1];
+        {
+            let slots = scratch.borrow_slots();
+            for (slot, page) in slots.iter_mut().zip(pages.iter_mut()) {
+                slot.write(&mut page[..]);
+            }
+            // SAFETY: The whole maximum-sized list contains disjoint live pages.
+            let outputs = unsafe { initialized_output_slices(slots) };
+            assert_eq!(outputs.len(), FUSE_MAX_MAX_PAGES + 1);
+            for output in outputs {
+                output[0] = 37;
+            }
+        }
+        // A later one-slice response replaces only its initialized prefix. Old
+        // entries are never read or dropped as references to the previous owner.
+        let mut response = [0u8; 16];
+        {
+            let slots = &mut scratch.borrow_slots()[..1];
+            slots[0].write(&mut response);
+            // SAFETY: The returned prefix was initialized from this response.
+            let outputs = unsafe { initialized_output_slices(slots) };
+            assert_eq!(outputs.len(), 1);
+            outputs[0][0] = 19;
+        }
+        assert_eq!(response[0], 19);
+        assert!(pages.iter().all(|page| page[0] == 37));
+        assert_eq!(scratch.slots.as_ptr(), backing);
+        assert_eq!(scratch.slots.capacity(), capacity);
+        assert!(OutputDmaSlices::try_new(0).is_err());
+        assert!(OutputDmaSlices::try_new(FUSE_MAX_MAX_PAGES + 1).is_err());
+    }
 
     fn block_state(blocked: bool, completion_seen: bool) -> QueueBlockState {
         QueueBlockState {

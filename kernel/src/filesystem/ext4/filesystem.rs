@@ -657,9 +657,26 @@ impl Ext4FileSystem {
 
     pub(super) fn terminalize_idle_delalloc_after_fail_stop(&self) {
         loop {
-            let owners: Vec<_> = self.delalloc_inodes.lock().values().cloned().collect();
             let mut progressed = false;
-            for inode in owners {
+            let mut previous = None;
+            loop {
+                // Fail-stop closes admission under this same registry lock,
+                // so no new owner can appear behind the cursor. Hold only
+                // one existing Arc while entering inode locks; a full Vec
+                // snapshot could fail precisely when retiring after ENOMEM.
+                let next = {
+                    use core::ops::Bound::{Excluded, Unbounded};
+                    let owners = self.delalloc_inodes.lock();
+                    match previous {
+                        Some(previous) => owners.range((Excluded(previous), Unbounded)).next(),
+                        None => owners.first_key_value(),
+                    }
+                    .map(|(&inode_num, inode)| (inode_num, inode.clone()))
+                };
+                let Some((inode_num, inode)) = next else {
+                    break;
+                };
+                previous = Some(inode_num);
                 progressed |= inode.terminalize_idle_delalloc_after_fail_stop(self);
             }
             if !progressed {

@@ -1,25 +1,11 @@
 {
   lib,
   pkgs,
-  fenix,
-  system,
+  rustPlatform,
   installDir,
 }:
 
 let
-  fenixPkgs = fenix.packages.${system};
-  toolchain = fenixPkgs.combine (
-    with fenixPkgs;
-    [
-      minimal.rustc
-      minimal.cargo
-    ]
-  );
-  rustPlatform = pkgs.makeRustPlatform {
-    cargo = toolchain;
-    rustc = toolchain;
-  };
-
   gtest = pkgs.fetchgit {
     url = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest";
     rev = "v1.17.0";

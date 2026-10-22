@@ -6,11 +6,13 @@
   testOpt,
   debug ? false,
   enableVsock ? true,
-  vsockGuestCid ? "random",
+  vsockGuestCid ? 3,
   vsockDeviceModel ? "vhost-vsock-pci-non-transitional",
   vmstateDir ? null,
   preferSystemQemu ? false,
 }:
+
+assert lib.assertMsg (vsockGuestCid > 2) "vsockGuestCid must be > 2 (host CID = 2)";
 
 let
   qemuFirmware = if preferSystemQemu then null else pkgs.callPackage ./qemu-firmware.nix { };
@@ -29,8 +31,8 @@ let
     filesToInstall = [ "u-boot.bin" ];
   };
 
-  # 3. 参数生成器 (Nix List -> Nix List)
-  # 注意：网络配置中的端口现在使用 $HOST_PORT 变量，在运行时动态替换
+  # 参数生成器 (Nix List -> Nix List)
+  # 注意：网络配置中的端口使用 $HOST_PORT 变量，在运行时动态替换
   mkQemuArgs =
     { arch, isNographic }:
     let
@@ -39,8 +41,6 @@ let
         baseConfig.memory
         "-smp"
         "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
-        "-object"
-        "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
         "-usb"
         "-device"
         "qemu-xhci,id=xhci,p2=8,p3=4"
@@ -52,7 +52,9 @@ let
         "order=d"
         "-rtc"
         "clock=host,base=localtime"
-        # Trace events
+      ];
+      # Trace events 会显著放大 qemu.log 并拖慢 virtio，仅调试时开启
+      traceArgs = lib.optionals debug [
         "-d"
         "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
         "-trace"
@@ -88,11 +90,11 @@ let
       kernelCmdlinePart = if isNographic then "console=/dev/hvc0" else "";
     in
     {
-      flags = baseArgs ++ nographicArgs;
+      flags = baseArgs ++ traceArgs ++ nographicArgs;
       cmdlineExtra = kernelCmdlinePart;
     };
 
-  # 4. 运行脚本生成器
+  # 运行脚本生成器
   mkRunScript =
     {
       name,
@@ -106,7 +108,6 @@ let
 
       initProgram = if arch == "riscv64" then "/bin/riscv_rust_init" else "/bin/busybox init";
 
-      # Define static parts of arguments using Nix lists
       commonArchArgs =
         if arch == "x86_64" then
           [
@@ -133,17 +134,16 @@ let
             "-device"
             "pcie-root-port"
             "-drive"
-            "id=disk,file=${diskPath},if=none"
+            "id=disk,file=${diskPath},if=none,format=raw"
           ]
         else
           [
             "-device"
             "virtio-blk-device,drive=disk"
             "-drive"
-            "id=disk,file=${diskPath},if=none"
+            "id=disk,file=${diskPath},if=none,format=raw"
           ];
 
-      # Generate bash code for dynamic parts
       archSpecificBash =
         if arch == "x86_64" then
           ''
@@ -158,195 +158,100 @@ let
             ARCH_FLAGS+=( "-machine" "virt,accel=$ACCEL,memory-backend=${baseConfig.shmId}" )
           '';
 
-      # VM 状态目录配置
-      vmstateDirStr = if vmstateDir != null then vmstateDir else "";
       hasVmstateDir = vmstateDir != null;
-      preferSystemQemuStr = if preferSystemQemu then "true" else "false";
-      enableVsockStr = if enableVsock then "true" else "false";
-      vsockGuestCidStr = builtins.toString vsockGuestCid;
-      vsockDeviceModelStr = vsockDeviceModel;
+      useVsock = enableVsock && arch == "x86_64";
+      vsockCid = toString vsockGuestCid;
 
     in
     pkgs.writeScriptBin name ''
       #!${pkgs.runtimeShell}
+      # 宿主的 LD_LIBRARY_PATH 可能与 nix 构建的 QEMU 的 glibc 不兼容
+      unset LD_LIBRARY_PATH
 
       if [ ! -d "bin" ]; then echo "Error: Please run from project root (bin/ missing)."; exit 1; fi
+      if [ ! -f "${diskPath}" ]; then echo "Error: ${diskPath} not found, run 'nix run .#rootfs-${arch}' first."; exit 1; fi
 
-      if [ "${preferSystemQemuStr}" = "true" ]; then
+      ${lib.optionalString preferSystemQemu ''
         if ! command -v "${qemuBin}" >/dev/null 2>&1; then
           echo "Error: 系统未找到 ${qemuBin}，请安装 QEMU 或改用 nix 提供的 start 目标。"
           exit 1
         fi
-      fi
+      ''}
 
       # 端口查找函数：从指定端口开始查找可用端口
       find_available_port() {
-        local start_port=$1
-        local port=$start_port
-        while [ $port -lt 65535 ]; do
+        local port=$1
+        while [ "$port" -lt 65535 ]; do
           if ! ${pkgs.iproute2}/bin/ss -tuln | grep -q ":$port "; then
-            echo $port
+            echo "$port"
             return 0
           fi
           port=$((port + 1))
         done
-        echo $start_port
+        echo "$1"
       }
 
-      # 动态分配端口
       HOST_PORT=$(find_available_port 12580)
       GDB_PORT=$(find_available_port $((HOST_PORT + 1)))
 
-      ACCEL="tcg"
-      if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
-
-      VSOCK_CID_REGISTRY="/tmp/dragonos-vsock-cid-registry"
-      VSOCK_CID_LOCKDIR="/tmp/dragonos-vsock-cid-lock"
-
-      acquire_vsock_lock() {
-        local retries=200
-        local i=0
-        while ! mkdir "$VSOCK_CID_LOCKDIR" 2>/dev/null; do
-          i=$((i + 1))
-          if [ "$i" -ge "$retries" ]; then
-            echo "[WARN] failed to acquire vsock CID lock; skip vsock device"
-            return 1
-          fi
-          sleep 0.05
-        done
-        return 0
-      }
-
-      release_vsock_lock() {
-        rmdir "$VSOCK_CID_LOCKDIR" 2>/dev/null || true
-      }
-
-      cleanup_stale_vsock_registry() {
-        local tmp_file
-        tmp_file=$(mktemp)
-        if [ -f "$VSOCK_CID_REGISTRY" ]; then
-          while IFS=' ' read -r cid owner_pid owner_vmstate; do
-            if [ -z "$cid" ] || [ -z "$owner_pid" ]; then
-              continue
-            fi
-            if kill -0 "$owner_pid" 2>/dev/null; then
-              printf '%s %s %s\n' "$cid" "$owner_pid" "$owner_vmstate" >> "$tmp_file"
-            fi
-          done < "$VSOCK_CID_REGISTRY"
-        fi
-        mv "$tmp_file" "$VSOCK_CID_REGISTRY"
-      }
-
-      is_vsock_cid_in_registry() {
-        local cid="$1"
-        grep -q "^$cid " "$VSOCK_CID_REGISTRY" 2>/dev/null
-      }
-
-      generate_random_vsock_cid() {
-        # 有效CID范围: [3, 2147483647]
-        echo $(( (RANDOM << 16 | RANDOM) % 2147483645 + 3 ))
-      }
-
-      resolve_vsock_guest_cid() {
-        local requested="$1"
-        local chosen=""
-        local attempts=128
-        local i=0
-
-        if ! acquire_vsock_lock; then
-          return 1
-        fi
-
-        cleanup_stale_vsock_registry
-
-        if [ -z "$requested" ] || [ "$requested" = "random" ]; then
-          while [ "$i" -lt "$attempts" ]; do
-            chosen=$(generate_random_vsock_cid)
-            if [ "$chosen" != "2" ] && ! is_vsock_cid_in_registry "$chosen"; then
-              break
-            fi
-            i=$((i + 1))
-          done
-          if [ "$i" -ge "$attempts" ]; then
-            release_vsock_lock
-            echo "[WARN] failed to allocate unique random vsock CID; skip vsock device"
-            return 1
-          fi
-        else
-          if ! [[ "$requested" =~ ^[0-9]+$ ]]; then
-            release_vsock_lock
-            echo "[WARN] invalid vsockGuestCid='$requested'; skip vsock device"
-            return 1
-          fi
-          if [ "$requested" -le 2 ]; then
-            release_vsock_lock
-            echo "[WARN] vsock guest CID must be > 2 (host CID=2); skip"
-            return 1
-          fi
-          if is_vsock_cid_in_registry "$requested"; then
-            release_vsock_lock
-            echo "[WARN] vsock guest CID=$requested already in use by another DragonOS instance; skip"
-            return 1
-          fi
-          chosen="$requested"
-        fi
-
-        VSOCK_GUEST_CID="$chosen"
-        printf '%s %s %s\n' "$VSOCK_GUEST_CID" "$$" "$VMSTATE_DIR" >> "$VSOCK_CID_REGISTRY"
-        release_vsock_lock
-        return 0
-      }
-
-      VSOCK_ARGS=()
-      VSOCK_GUEST_CID=""
-      # 默认启用 vsock；若条件不满足则自动降级为跳过该设备。
-      if [ "${enableVsockStr}" = "true" ]; then
-        if [ "${arch}" != "x86_64" ]; then
-          echo "[WARN] vsock enabled but unsupported arch (${arch}); skip"
-        elif [ ! -e /dev/vhost-vsock ]; then
-          echo "[WARN] /dev/vhost-vsock not found; skip vsock device"
-          echo "[WARN] Hint: sudo modprobe vhost_vsock"
-        elif ! ${qemuBin} -device help 2>/dev/null | grep -q "${vsockDeviceModelStr}"; then
-          echo "[WARN] QEMU device model '${vsockDeviceModelStr}' not supported; skip vsock device"
-        elif ! resolve_vsock_guest_cid "${vsockGuestCidStr}"; then
-          :
-        else
-          VSOCK_ARGS=( "-device" "${vsockDeviceModelStr},guest-cid=$VSOCK_GUEST_CID" )
-          echo "[INFO] enable vsock device: ${vsockDeviceModelStr},guest-cid=$VSOCK_GUEST_CID"
-        fi
+      # 加速方式：QEMU_ACCEL 可显式指定 kvm / tcg
+      if [ -n "''${QEMU_ACCEL:-}" ]; then
+        ACCEL="$QEMU_ACCEL"
+      elif [ -w /dev/kvm ]; then
+        ACCEL="kvm"
       else
-        echo "[INFO] vsock disabled by nix config (enableVsock=false)"
+        ACCEL="tcg"
+        echo "[WARN] /dev/kvm is not writable, falling back to TCG (slow)."
+        echo "[WARN] Hint: add yourself to the kvm group: sudo usermod -aG kvm \$USER"
       fi
 
+      VSOCK_ARGS=()
       ${
-        if hasVmstateDir then
+        if useVsock then
           ''
-            VMSTATE_DIR="${vmstateDirStr}"
-            mkdir -p "$VMSTATE_DIR"
-            rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid"
-            echo "$HOST_PORT" > "$VMSTATE_DIR/port"
-            echo "$GDB_PORT" > "$VMSTATE_DIR/gdb"
-            if [ -n "$VSOCK_GUEST_CID" ]; then
-              echo "$VSOCK_GUEST_CID" > "$VMSTATE_DIR/vsock_cid"
+            # 同一 CID 只能被一个 QEMU 实例占用，已被占用时跳过 vsock 设备
+            vsock_cid_in_use() {
+              # cmdline 以 NUL 分隔参数；[,] 避免匹配到 grep 自身的参数
+              grep -qsaxz ".*[,]guest-cid=$1" /proc/[0-9]*/cmdline
+            }
+            if [ ! -w /dev/vhost-vsock ]; then
+              echo "[WARN] /dev/vhost-vsock not accessible; skip vsock device"
+              echo "[WARN] Hint: sudo modprobe vhost_vsock, and make sure you are in the kvm group"
+            elif ! ${qemuBin} -device help 2>/dev/null | grep -q "${vsockDeviceModel}"; then
+              echo "[WARN] QEMU device model '${vsockDeviceModel}' not supported; skip vsock device"
+            elif vsock_cid_in_use ${vsockCid}; then
+              echo "[WARN] vsock guest CID=${vsockCid} already in use by another QEMU instance; skip vsock device"
+            else
+              VSOCK_ARGS=( "-device" "${vsockDeviceModel},guest-cid=${vsockCid}" )
+              echo "[INFO] enable vsock device: ${vsockDeviceModel},guest-cid=${vsockCid}"
             fi
           ''
         else
-          ""
+          ''
+            echo "[INFO] vsock disabled for ${arch}"
+          ''
       }
 
+      ${lib.optionalString hasVmstateDir ''
+        VMSTATE_DIR="${vmstateDir}"
+        mkdir -p "$VMSTATE_DIR"
+        rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid"
+        echo "$HOST_PORT" > "$VMSTATE_DIR/port"
+        echo "$GDB_PORT" > "$VMSTATE_DIR/gdb"
+        if [ ''${#VSOCK_ARGS[@]} -gt 0 ]; then
+          echo "${vsockCid}" > "$VMSTATE_DIR/vsock_cid"
+        fi
+      ''}
+
+      # 每个实例使用独立的共享内存文件，避免多个实例共享同一块 guest 内存
+      SHM_PATH="/dev/shm/dragonos-qemu-$$.ram"
+      MEM_ARGS=( "-object" "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=$SHM_PATH,share=on" )
+
       cleanup() {
-        sudo rm -f /dev/shm/${baseConfig.shmId}
-        ${
-          if hasVmstateDir then
-            ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid" "$VMSTATE_DIR/port" "$VMSTATE_DIR/gdb"''
-          else
-            ""
-        }
+        rm -f "$SHM_PATH"
+        ${lib.optionalString hasVmstateDir ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid" "$VMSTATE_DIR/port" "$VMSTATE_DIR/gdb"''}
       }
       trap cleanup EXIT
-      # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
-      # 但实际上 qemu 会自己创建，这里只需要保证清理。
-      # 原脚本是 rm -rf ... -> qemu -> rm -rf ...
 
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
       CONSOLE_TERM_CMDLINE=""
@@ -367,64 +272,52 @@ let
         fi
       ''}
 
-      # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="rw init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} ${lib.optionalString (testOpt.autotest == "dunit") "dragonos.net_test_fixtures"} $EXTRA_CMDLINE $CONSOLE_TERM_CMDLINE"
+      # AUTO_TEST 可在运行时通过环境变量覆盖；测试目录由 nix 构建的 rootfs 布局决定
+      AUTO_TEST="''${AUTO_TEST:-${testOpt.autotest}}"
+      TEST_FIXTURE_CMDLINE=""
+      if [ "$AUTO_TEST" = "dunit" ]; then
+        TEST_FIXTURE_CMDLINE="dragonos.net_test_fixtures"
+      fi
+      FINAL_CMDLINE="rw init=${initProgram} AUTO_TEST=$AUTO_TEST SYSCALL_TEST_DIR=${testOpt.syscall.testDir} DUNITEST_DIR=${testOpt.dunitest.testDir} $TEST_FIXTURE_CMDLINE $EXTRA_CMDLINE $CONSOLE_TERM_CMDLINE"
 
       ARCH_FLAGS=( ${lib.escapeShellArgs commonArchArgs} )
       ${archSpecificBash}
 
       BOOT_ARGS=( "-kernel" "${kernelPath}" "-append" "$FINAL_CMDLINE" )
-
       DISK_ARGS=( ${lib.escapeShellArgs diskArgs} )
-
-      # 动态网络配置（使用动态分配的端口）
       NET_ARGS=( "-netdev" "user,id=hostnet0,hostfwd=tcp::$HOST_PORT-:12580" "-device" "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0" )
       RNG_ARGS=( "-device" "${if arch == "riscv64" then "virtio-rng-device" else "virtio-rng-pci"}" )
+      FIRMWARE_ARGS=( ${lib.optionalString (qemuFirmware != null) "-L ${qemuFirmware}"} )
+      GDB_ARGS=()
+      ${lib.optionalString debug ''
+        GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
+        if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
+          GDB_ARGS+=( "-S" )
+        fi
+      ''}
 
-      echo -e "================== DragonOS QEMU Command Preview =================="
-      echo -e "Binary: sudo ${qemuBin}"
-      echo -e "Base Flags: ${qemuFlagsStr}"
-      echo -e "Arch Flags: ''${ARCH_FLAGS[*]}"
-      echo -e "Boot Args: ''${BOOT_ARGS[*]}"
-      echo -e "Disk Args: ''${DISK_ARGS[*]}"
-      echo -e "Net Args: ''${NET_ARGS[*]}"
-      echo -e "Rng Args: ''${RNG_ARGS[*]}"
-      echo -e "Vsock Args: ''${VSOCK_ARGS[*]}"
-      echo -e "Host Port: $HOST_PORT"
-      echo -e "=================================================================="
+      echo "================== DragonOS QEMU Command Preview =================="
+      echo "Binary: ${qemuBin}"
+      echo "Base Flags: ${qemuFlagsStr}"
+      echo "Mem Args: ''${MEM_ARGS[*]}"
+      echo "Arch Flags: ''${ARCH_FLAGS[*]}"
+      echo "Boot Args: ''${BOOT_ARGS[*]}"
+      echo "Disk Args: ''${DISK_ARGS[*]}"
+      echo "Net Args: ''${NET_ARGS[*]}"
+      echo "Rng Args: ''${RNG_ARGS[*]}"
+      echo "Vsock Args: ''${VSOCK_ARGS[*]}"
+      echo "Gdb Args: ''${GDB_ARGS[*]}"
+      echo "Host Port: $HOST_PORT"
+      echo "=================================================================="
       echo ""
 
-      # --- 3. 执行 ---
       ${qemuBin} --version
 
-      # 使用 exec 方式启动 QEMU，保持交互能力并记录 PID
-      # 参考 tools/run-qemu.sh 的 launch_qemu 函数实现
-      ${
-        if hasVmstateDir then
-          ''
-            ${lib.optionalString debug ''
-              GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
-              if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
-                GDB_ARGS+=( "-S" )
-              fi
-            ''}
-            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" "''${RNG_ARGS[@]}" ${
-              if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
-          ''
-        else
-          ''
-            ${lib.optionalString debug ''
-              GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
-              if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
-                GDB_ARGS+=( "-S" )
-              fi
-            ''}
-            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" "''${RNG_ARGS[@]}" ${
-              if qemuFirmware != null then "-L ${qemuFirmware}" else ""
-            } "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
-          ''
-      }
+      # 不对脚本本身 exec，保证退出后 trap 能清理共享内存与 vmstate；
+      # pid 文件记录的是 QEMU 进程本身（测试监控脚本会用它终止 QEMU）
+      ${pkgs.runtimeShell} -c 'pidfile="$1"; shift; [ -n "$pidfile" ] && echo $$ > "$pidfile"; exec "$@"' \
+        bash "${lib.optionalString hasVmstateDir "$VMSTATE_DIR/pid"}" \
+        ${qemuBin} ${qemuFlagsStr} "''${MEM_ARGS[@]}" "''${NET_ARGS[@]}" "''${RNG_ARGS[@]}" "''${FIRMWARE_ARGS[@]}" "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" "''${GDB_ARGS[@]}" "$@"
     '';
 
   script = lib.genAttrs [ "x86_64" "riscv64" ] (

@@ -4,7 +4,6 @@
   nixpkgs,
   system,
   target,
-  fenix,
   testOpt,
 }:
 
@@ -50,7 +49,6 @@ let
 
   gvisor-syscall-tests = (
     pkgs.callPackage ./tests/syscall/gvisor {
-      inherit fenix system;
       installDir = testOpt.syscall.testDir;
       version = testOpt.syscall.version;
     }
@@ -58,7 +56,6 @@ let
 
   dunitest = (
     pkgs.callPackage ./tests/dunitest {
-      inherit fenix system;
       installDir = testOpt.dunitest.testDir;
     }
   );

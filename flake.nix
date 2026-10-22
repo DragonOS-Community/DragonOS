@@ -1,16 +1,5 @@
 {
-  description = "RootFS";
-
-  nixConfig = {
-    # 国内镜像优先，保留官方缓存作为回退
-    extra-substituters = [
-      "https://mirrors.tuna.tsinghua.edu.cn/nix-channels/store"
-      "https://mirrors.ustc.edu.cn/nix-channels/store"
-    ];
-    extra-trusted-public-keys = [
-      "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-    ];
-  };
+  description = "DragonOS development environment, rootfs and QEMU runner";
 
   inputs = {
     fenix = {
@@ -67,20 +56,13 @@
             else
               builtins.elemAt rust-channel-match 2;
           rust-components-from-toml = rust-toolchain-toml.toolchain.components or [ ];
+          # rust-toolchain.toml 只列出额外组件，构建必需的组件在此补齐
           rust-required-components = [
             "cargo"
             "rustc"
             "rust-std"
           ];
-          rust-missing-required = builtins.filter (
-            component: !(builtins.elem component rust-components-from-toml)
-          ) rust-required-components;
-          rust-components-effective = lib.unique (rust-components-from-toml ++ rust-required-components);
-          rust-components-selected =
-            if rust-missing-required == [ ] then
-              rust-components-effective
-            else
-              builtins.trace "Warning: kernel/rust-toolchain.toml is missing required Rust components: ${lib.concatStringsSep ", " rust-missing-required}. DragonOS Nix build will auto-add them. Recommended: add them to kernel/rust-toolchain.toml to keep one explicit source of truth." rust-components-effective;
+          rust-components-selected = lib.unique (rust-components-from-toml ++ rust-required-components);
           rust-dist-root = "https://rsproxy.cn/dist";
           rust-toolchain-base = fenix.packages.${system}.toolchainOf {
             root = rust-dist-root;
@@ -105,6 +87,23 @@
                 fi
               done
             '';
+          };
+
+          # 编译内核所需的工具，devShell 与 yolo 共用，避免依赖宿主机工具链
+          kernelBuildInputs = with pkgs; [
+            git
+            llvm
+            libclang
+            gcc
+            rust-toolchain
+            zlib
+            gnumake
+            meson
+            ninja
+          ];
+          kernelBuildEnv = {
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+            USING_DRAGONOS_NIX_ENV = "1";
           };
 
           testOpt = {
@@ -138,72 +137,37 @@
                 guestCid = 3;
                 deviceModel = "vhost-vsock-pci-non-transitional";
               };
-              qemuScripts = import ./tools/qemu/default.nix {
-                inherit
-                  lib
-                  pkgs
-                  testOpt
-                  diskPath
-                  ;
-                # QEMU 相关参数：
-                # 内核位置
-                kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # 不开 GDB stub，普通启动
-                debug = false;
-                enableVsock = vsockConfig.enable;
-                vsockGuestCid = vsockConfig.guestCid;
-                vsockDeviceModel = vsockConfig.deviceModel;
-                # 启用 VM 状态管理，与 make qemu 行为保持一致
-                vmstateDir = "${buildDir}/vmstate";
-              };
-              qemuScriptsSystem = import ./tools/qemu/default.nix {
-                inherit
-                  lib
-                  pkgs
-                  testOpt
-                  diskPath
-                  ;
-                # QEMU 相关参数：
-                # 内核位置
-                kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # -s -S
-                debug = false;
-                enableVsock = vsockConfig.enable;
-                vsockGuestCid = vsockConfig.guestCid;
-                vsockDeviceModel = vsockConfig.deviceModel;
-                # 启用 VM 状态管理，与 make qemu 行为保持一致
-                vmstateDir = "${buildDir}/vmstate";
-                # 优先使用系统 QEMU，避免 Nix 下载 QEMU 依赖
-                preferSystemQemu = true;
-              };
-              qemuScriptsDebug = import ./tools/qemu/default.nix {
-                inherit
-                  lib
-                  pkgs
-                  testOpt
-                  diskPath
-                  ;
-                # QEMU 相关参数：
-                # 内核位置
-                kernel = "${buildDir}/kernel/kernel.elf";
-                # 开启 GDB stub，用于调试
-                debug = true;
-                enableVsock = vsockConfig.enable;
-                vsockGuestCid = vsockConfig.guestCid;
-                vsockDeviceModel = vsockConfig.deviceModel;
-                # 启用 VM 状态管理，与 make qemu 行为保持一致
-                vmstateDir = "${buildDir}/vmstate";
-              };
+              mkStart =
+                extra:
+                (import ./tools/qemu/default.nix (
+                  {
+                    inherit
+                      lib
+                      pkgs
+                      testOpt
+                      diskPath
+                      ;
+                    # 内核位置
+                    kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
+                    enableVsock = vsockConfig.enable;
+                    vsockGuestCid = vsockConfig.guestCid;
+                    vsockDeviceModel = vsockConfig.deviceModel;
+                    # 启用 VM 状态管理，与 make qemu 行为保持一致
+                    vmstateDir = "${buildDir}/vmstate";
+                  }
+                  // extra
+                )).${target};
 
-              startPkg = qemuScripts.${target};
-              startSystemPkg = qemuScriptsSystem.${target};
-              startDebugPkg = qemuScriptsDebug.${target};
+              startPkg = mkStart { };
+              # 优先使用系统 QEMU，避免 Nix 下载 QEMU 依赖
+              startSystemPkg = mkStart { preferSystemQemu = true; };
+              # 开启 GDB stub 与 QEMU trace，用于调试
+              startDebugPkg = mkStart { debug = true; };
               rootfsPkg = pkgs.callPackage ./user/default.nix {
                 inherit
                   lib
                   pkgs
                   nixpkgs
-                  fenix
                   system
                   target
                   testOpt
@@ -231,21 +195,25 @@
               '';
 
               # 一键化构建启动脚本 (yolo: You Only Live Once - 一条命令跑通全部)
-              runApp = pkgs.writeScriptBin "dragonos-yolo" ''
-                #!${pkgs.runtimeShell}
-                set -e
-                export USING_DRAGONOS_NIX_ENV=1
-                export PATH=${rust-toolchain}/bin:$PATH
+              runApp = pkgs.writeShellApplication {
+                name = "dragonos-yolo";
+                # stdenv.initialPath 提供 mkShell 默认带有的基础工具（coreutils、bash 等）
+                runtimeInputs = kernelBuildInputs ++ pkgs.stdenv.initialPath;
+                text = ''
+                  # 宿主的 LD_LIBRARY_PATH 可能与 nix 构建的工具不兼容
+                  unset LD_LIBRARY_PATH
+                  ${lib.concatStringsSep "\n" (lib.mapAttrsToList (k: v: "export ${k}=${v}") kernelBuildEnv)}
 
-                echo "==> Step 1: Building kernel with make kernel..."
-                ${pkgs.gnumake}/bin/make kernel
+                  echo "==> Step 1: Building kernel with make kernel..."
+                  make kernel
 
-                echo "==> Step 2: Building rootfs (re-evaluating userland packages)..."
-                ${pkgs.nix}/bin/nix run .#rootfs-${target}
+                  echo "==> Step 2: Preparing rootfs disk image..."
+                  ${rootfsPkg}/bin/dragonos-rootfs
 
-                echo "==> Step 3: Starting DragonOS..."
-                exec ${pkgs.nix}/bin/nix run .#start-${target} -- "$@"
-              '';
+                  echo "==> Step 3: Starting DragonOS..."
+                  exec ${startPkg}/bin/dragonos-run "$@"
+                '';
+              };
             in
             {
               apps = {
@@ -331,45 +299,13 @@
           };
 
           devShells.default = pkgs.mkShell {
-            # 基础工具链
-            buildInputs = with pkgs; [
-              git
-              llvm
-              libclang
-              gcc
-              rust-toolchain
-              zlib
-              gnumake
-              qemu_kvm
-              meson
-              ninja
-            ];
+            buildInputs = kernelBuildInputs ++ [ pkgs.qemu_kvm ];
 
-            env = {
-              LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-              USING_DRAGONOS_NIX_ENV = 1;
-            };
+            env = kernelBuildEnv;
 
-            # Shell启动脚本
             shellHook = ''
-              export PATH=${rust-toolchain}/bin:$PATH
-              # 自动创建 GC root，避免 nix store gc 清理开发环境
-              if [ -z "''${DRAGONOS_NIX_GC_ROOT:-}" ]; then
-                if [ ! -e ".nix-gc-root" ]; then
-                  echo "创建 Nix GC root: .nix-gc-root"
-                  ${pkgs.nix}/bin/nix build .#devShells.${system}.default -o ./.nix-gc-root >/dev/null 2>&1 || true
-                fi
-              fi
-              echo "欢迎进入 DragonOS Nix 开发环境!"
+              echo "欢迎进入 DragonOS Nix 开发环境! ($(rustc -V))"
               echo ""
-              echo "  Rust toolchain:"
-              echo "    rustc: $(rustc -V)"
-              echo "    cargo: $(cargo -V)"
-              echo "    path : ${rust-toolchain}/bin (prepended)"
-              echo ""
-              echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
-              echo ""
-              echo "  以下命令都会沿用当前 shell 的 Rust/Cargo 工具链："
               echo "  一键运行:    nix run .#yolo-x86_64"
               echo "  构建内核:    make kernel"
               echo "  构建 rootfs: nix run .#rootfs-x86_64"
@@ -378,6 +314,14 @@
               echo "  文档：       https://docs.dragonos.org.cn/"
             '';
           };
+
+          checks.rootfs-image-x86_64 = pkgs.runCommand "check-rootfs-image-x86_64" {
+            nativeBuildInputs = with pkgs; [
+              util-linux
+              e2fsprogs
+            ];
+            img = "${self'.packages.rootfs-x86_64.diskImage}/disk.img";
+          } (builtins.readFile ./user/check-disk-image.sh);
         };
     };
 }

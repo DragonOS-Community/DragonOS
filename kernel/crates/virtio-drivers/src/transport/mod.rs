@@ -6,7 +6,7 @@ pub mod fake;
 pub mod mmio;
 pub mod pci;
 
-use crate::{PhysAddr, Result, PAGE_SIZE};
+use crate::{Error, PhysAddr, Result, PAGE_SIZE};
 use bitflags::{bitflags, Flags};
 use core::{fmt::Debug, ops::BitAnd, ptr::NonNull};
 use log::debug;
@@ -33,6 +33,25 @@ pub trait Transport {
 
     /// Sets the device status.
     fn set_status(&mut self, status: DeviceStatus);
+
+    /// Resets the device and confirms that it has stopped accessing its queues.
+    ///
+    /// Polling is bounded by register reads, not elapsed time, and needs neither
+    /// allocation nor a running timer. Failure leaves all DMA owners with the caller.
+    fn reset(&mut self) -> Result<()> {
+        const RESET_POLL_LIMIT: usize = 100_000;
+        if self.get_status().is_empty() {
+            return Ok(());
+        }
+        self.set_status(DeviceStatus::empty());
+        for _ in 0..RESET_POLL_LIMIT {
+            if self.get_status().is_empty() {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(Error::ResetTimeout)
+    }
 
     /// Sets the guest page size.
     fn set_guest_page_size(&mut self, guest_page_size: u32);
@@ -72,7 +91,11 @@ pub trait Transport {
         &mut self,
         supported_features: F,
     ) -> F {
-        self.set_status(DeviceStatus::empty());
+        // A caller with a fallible initialization path can confirm reset
+        // first. Do not start another, unconfirmed reset after that barrier.
+        if !self.get_status().is_empty() {
+            self.set_status(DeviceStatus::empty());
+        }
         self.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
         let device_features = F::from_bits_truncate(self.read_device_features());

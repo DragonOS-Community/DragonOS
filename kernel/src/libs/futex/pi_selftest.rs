@@ -3,7 +3,6 @@
 use super::*;
 use crate::{
     arch::MMArch,
-    libs::futex::futex::FutexKey,
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
         oom::denial,
@@ -68,74 +67,88 @@ pub(super) fn run() -> Result<bool, SystemError> {
                 return Ok(false);
             }
         }
-        // Test each later factory boundary with earlier owners already alive.
-        // First-Waker failure alone cannot validate these allocation sites.
-        let (_, waker) = Waiter::try_new_pair()?;
-        let object = Arc::try_new(PiWaiter {
-            waker: waker.clone(),
-            tid: current_tid,
-            handoff: AtomicU32::new(0),
-        })
-        .map_err(|_| SystemError::ENOMEM)?;
-        let callback = Box::try_new(WakerTimer {
-            waker: waker.clone(),
-        })
-        .map_err(|_| SystemError::ENOMEM)?;
-        let mut registry =
-            hashbrown::HashMap::<FutexKey, super::super::futex::FutexHashBucket>::new();
-        let denied = {
-            let _scope = denial::Scope::enter(true);
-            Arc::try_new(PiWaiter {
-                waker: waker.clone(),
-                tid: current_tid,
-                handoff: AtomicU32::new(0),
-            })
-            .is_err()
-                && Node::try_new(object.clone()).is_err()
-                && Box::try_new(WakerTimer { waker }).is_err()
-                && Timer::try_prepare(callback, clock().saturating_add(100)).is_err()
-                && registry.try_reserve(1).is_err()
-                && denial::probe_denied()
-        };
-        // The real publication method consumes its prepared node and timer
-        // under heap denial. Keep the fixture bucket isolated from live futexes.
-        let mut prepared = PreparedPiWait::try_new(current_tid, Some(clock().saturating_add(100)))?;
-        let mut bucket = super::super::futex::FutexHashBucket::new();
-        let died = Arc::try_new(PiWaiter {
-            waker: object.waker.clone(),
-            tid: current_tid,
-            handoff: AtomicU32::new(0),
-        })
-        .map_err(|_| SystemError::ENOMEM)?;
+        // Prepared resources must publish, expire and retire without any
+        // allocator dependency. Use a private graph so no live task is boosted.
+        let key = Futex::get_futex_key(address, false, FutexAccess::FutexWrite)?;
+        let task = ProcessManager::current_pcb();
+        let mut prepared = PreparedPiWait::try_new(
+            task.clone(),
+            owner.clone(),
+            &key,
+            AbsoluteClock::Realtime,
+            Some(future),
+        )?;
+        let mut graph = FutexRegistry::new();
+        graph
+            .tasks
+            .try_reserve(2)
+            .map_err(|_| SystemError::ENOMEM)?;
+        graph
+            .buckets
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
         let published = {
             let _scope = denial::Scope::enter(true);
-            prepared.publish(&mut bucket, owner_tid);
-            let published = bucket.pi_owner == owner_tid
-                && bucket.pi_waiters.len() == 1
-                && bucket
-                    .pi_waiters
-                    .front()
-                    .is_some_and(|object| Arc::ptr_eq(object, &prepared.object))
-                && prepared.node.is_none()
-                && prepared.activation.is_none();
-            if let Some(timer) = &prepared.timer {
-                timer.cancel();
-            }
-            let retired = bucket
+            graph
+                .tasks
+                .insert(identity(&owner), prepared.owner_node.take().unwrap());
+            graph
+                .tasks
+                .insert(identity(&task), prepared.task_node.take().unwrap());
+            let mut bucket = super::super::futex::FutexHashBucket::new();
+            bucket.pi_owner = Some(owner.clone());
+            bucket.pi_refs = 1;
+            bucket.pi_waiters.push_node(prepared.node.take().unwrap());
+            graph.buckets.insert(key.clone(), bucket);
+            graph
+                .task_mut(&owner)
+                .unwrap()
+                .owned
+                .push_node(prepared.owned_node.take().unwrap());
+            graph.task_mut(&task).unwrap().blocked = Some(key.clone());
+            prepared.activation.take().unwrap().activate();
+            let published = graph
+                .top(&key)
+                .is_some_and(|waiter| Arc::ptr_eq(&waiter, &prepared.object))
+                && graph.donor(&owner) == Some(task.sched_info().prio());
+            prepared.timer.as_ref().unwrap().cancel();
+            let retired = graph
+                .buckets
+                .get_mut(&key)
+                .unwrap()
                 .pi_waiters
-                .extract_if(|object| Arc::ptr_eq(object, &prepared.object));
-            let pending = prepared.object.acquired().is_none() && died.acquired().is_none();
-            prepared.object.hand_off(0);
-            died.hand_off(FUTEX_OWNER_DIED);
-            published
-                && pending
-                && prepared.object.acquired() == Some(Ok(0))
-                && died.acquired() == Some(Err(SystemError::EOWNERDEAD))
-                && bucket.pi_waiters.is_empty()
-                && retired.len() == 1
-                && denial::probe_denied()
+                .extract_if(|waiter| Arc::ptr_eq(waiter, &prepared.object));
+            published && retired.len() == 1 && denial::probe_denied()
         };
-        Ok(denied && published && crate::time::timer::heap_denied_activation_selftest()?)
+        // A compressed incoming prefix exercises the tail-extension boundary:
+        // checking only the new owner's suffix would incorrectly allow it.
+        // This private graph never schedules or mutates any of these tasks.
+        let tail = crate::process::snapshot_all_processes()?
+            .into_iter()
+            .find(|candidate| !Arc::ptr_eq(candidate, &task) && !Arc::ptr_eq(candidate, &owner))
+            .ok_or(SystemError::ESRCH)?;
+        let incoming = Node::try_new(prepared.object.clone())?;
+        graph
+            .buckets
+            .get_mut(&key)
+            .unwrap()
+            .pi_waiters
+            .push_node(incoming);
+        graph.task_mut(&task).unwrap().upstream_depth = MAX_CHAIN - 1;
+        graph.refresh_depth(&owner);
+        let rejected = graph.task(&owner).unwrap().upstream_depth == MAX_CHAIN
+            && graph.validate_chain(&owner, tail.clone()) == Err(SystemError::EDEADLK_OR_EDEADLOCK);
+        graph.task_mut(&task).unwrap().upstream_depth -= 1;
+        graph.refresh_depth(&owner);
+        let accepted = graph.validate_chain(&owner, tail).is_ok();
+        let removed = graph.buckets.get_mut(&key).unwrap().pi_waiters.pop_node();
+        graph.refresh_depth(&owner);
+        Ok(published
+            && rejected
+            && accepted
+            && removed.is_some()
+            && graph.task(&owner).unwrap().upstream_depth == 0
+            && crate::time::timer::heap_denied_activation_selftest()?)
     })();
     let unmapped = mm
         .munmap_wait(VirtPageFrame::new(address), PageFrameCount::new(1))

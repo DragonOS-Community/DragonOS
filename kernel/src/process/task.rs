@@ -208,6 +208,8 @@ pub struct ProcessControlBlockData {
     /// such as `cred`, `nsproxy`, and `sighand`.
     pub(super) task_lock: SpinLock<()>,
     /// Intrusive allocation-free global OOM wait registration.
+    pub(crate) futex_lifecycle: core::sync::atomic::AtomicU8,
+    pub(crate) futex_cleanup_wait: crate::libs::resource_wait::ResourceWaitQueue,
     pub(crate) resource_wait_link: SpinLock<crate::libs::resource_wait::ResourceWaitLink>,
     pub(super) worker_private: SpinLock<Option<WorkerPrivate>>,
     /// Kernel stack of the process.
@@ -910,6 +912,8 @@ impl ProcessControlBlock {
                 flags,
                 visible_thread_accounted: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
+                futex_lifecycle: core::sync::atomic::AtomicU8::new(0),
+                futex_cleanup_wait: crate::libs::resource_wait::ResourceWaitQueue::new(),
                 resource_wait_link: SpinLock::new(Default::default()),
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(syscall_stack),

@@ -549,7 +549,7 @@ impl Transport for PciTransport {
     fn get_status(&self) -> DeviceStatus {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
-        unsafe { DeviceStatus::from_bits_truncate(volread!(self.common_cfg, device_status).into()) }
+        unsafe { DeviceStatus::from_bits_retain(volread!(self.common_cfg, device_status).into()) }
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {
@@ -655,7 +655,7 @@ impl Transport for PciTransport {
 impl Drop for PciTransport {
     fn drop(&mut self) {
         // Reset the device when the transport is dropped.
-        self.set_status(DeviceStatus::empty());
+        let _ = self.reset();
 
         // TODO: Call the PCI interrupt release function and remove the corresponding device
         // interrupt from virtio_irq_manager

@@ -258,7 +258,7 @@ impl Transport for PciTransport {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
         let status = unsafe { volread!(self.common_cfg, device_status) };
-        DeviceStatus::from_bits_truncate(status.into())
+        DeviceStatus::from_bits_retain(status.into())
     }
 
     fn set_status(&mut self, status: DeviceStatus) {
@@ -343,9 +343,17 @@ impl Transport for PciTransport {
 
 impl Drop for PciTransport {
     fn drop(&mut self) {
-        // Reset the device when the transport is dropped.
-        self.set_status(DeviceStatus::empty());
-        while self.get_status() != DeviceStatus::empty() {}
+        // Other devices still rely on transport-first field destruction as
+        // their DMA retirement barrier. Unlike reset(), Drop cannot return an
+        // error with their queue owners intact: do not return before ack.
+        // VirtIOBlk handles timeout with its own ManuallyDrop owners and only
+        // reaches this destructor after reset has already been confirmed.
+        if !self.get_status().is_empty() {
+            self.set_status(DeviceStatus::empty());
+            while !self.get_status().is_empty() {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
 

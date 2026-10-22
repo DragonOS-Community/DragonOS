@@ -484,4 +484,5 @@ fn commit_exec_futex_state(
     let replaced = do_execve_switch_user_vm(new_vm.clone())
         .expect("futex cleanup must leave the old address space installed");
     assert!(Arc::ptr_eq(&replaced, old_vm));
+    crate::libs::futex::pi_futex::resume_after_exec(pcb);
 }

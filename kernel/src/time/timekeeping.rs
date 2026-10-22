@@ -398,10 +398,11 @@ pub fn do_settimeofday64(time: PosixTimeSpec) -> Result<(), SystemError> {
     // timerfd may read the timekeeper while rebasing its monotonic backend;
     // never call into it while holding the timekeeper write lock.
     crate::filesystem::timerfd::timerfd_clock_was_set();
+    super::absolute_timer::clock_was_set();
     Ok(())
 }
 
-fn validate_settimeofday(time: PosixTimeSpec) -> Result<i128, SystemError> {
+pub(super) fn validate_settimeofday(time: PosixTimeSpec) -> Result<i128, SystemError> {
     if time.tv_sec < 0
         || time.tv_sec >= TIME_SETTOD_SEC_MAX
         || time.tv_nsec < 0

@@ -43,8 +43,10 @@ const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
 /// # }
 /// ```
 pub struct VirtIOBlk<H: Hal, T: Transport> {
-    transport: T,
-    queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
+    transport: core::mem::ManuallyDrop<T>,
+    queue: core::mem::ManuallyDrop<VirtQueue<H, { QUEUE_SIZE as usize }>>,
+    teardown_started: bool,
+    reset_confirmed: bool,
     capacity: u64,
     negotiated_features: BlkFeature,
 }
@@ -52,31 +54,137 @@ pub struct VirtIOBlk<H: Hal, T: Transport> {
 impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// Create a new VirtIO-Blk driver.
     pub fn new(mut transport: T) -> Result<Self> {
-        let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
+        // Every fallible construction step is before queue publication, or
+        // constructs the complete queue owner. An error must also retain the
+        // transport if bounded cleanup cannot confirm reset: its destructor
+        // may otherwise wait indefinitely for reset acknowledgement.
+        let prepared: Result<_> = (|| {
+            // A previous driver may have left the device running. Confirm reset
+            // before negotiating or publishing any queue owned by this instance.
+            transport.reset()?;
+            let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
 
-        // Read configuration space.
-        let config = transport.config_space::<BlkConfig>()?;
-        info!("config: {:?}", config);
-        // Safe because config is a valid pointer to the device configuration space.
-        let capacity = unsafe {
-            volread!(config, capacity_low) as u64 | (volread!(config, capacity_high) as u64) << 32
+            // Read configuration space.
+            let config = transport.config_space::<BlkConfig>()?;
+            info!("config: {:?}", config);
+            // Safe because config is a valid pointer to the device configuration space.
+            let capacity = unsafe {
+                volread!(config, capacity_low) as u64
+                    | (volread!(config, capacity_high) as u64) << 32
+            };
+            info!("found a block device of size {}KB", capacity / 2);
+
+            let queue = VirtQueue::new(
+                &mut transport,
+                QUEUE,
+                negotiated_features.contains(BlkFeature::RING_INDIRECT_DESC),
+                negotiated_features.contains(BlkFeature::RING_EVENT_IDX),
+            )?;
+            transport.finish_init();
+            Ok((queue, capacity, negotiated_features))
+        })();
+        let (queue, capacity, negotiated_features) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if transport.reset().is_err() {
+                    log::error!(
+                        "VirtIOBlk initialization cleanup reset failed; retaining transport"
+                    );
+                    core::mem::forget(transport);
+                }
+                return Err(error);
+            }
         };
-        info!("found a block device of size {}KB", capacity / 2);
-
-        let queue = VirtQueue::new(
-            &mut transport,
-            QUEUE,
-            negotiated_features.contains(BlkFeature::RING_INDIRECT_DESC),
-            negotiated_features.contains(BlkFeature::RING_EVENT_IDX),
-        )?;
-        transport.finish_init();
 
         Ok(VirtIOBlk {
-            transport,
-            queue,
+            transport: core::mem::ManuallyDrop::new(transport),
+            queue: core::mem::ManuallyDrop::new(queue),
+            teardown_started: false,
+            reset_confirmed: false,
             capacity,
             negotiated_features,
         })
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.teardown_started {
+            Err(crate::Error::NotReady)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Stops DMA and confirms reset before request owners may be retired.
+    /// On failure all queues and request buffers must remain owned for retry.
+    pub fn reset(&mut self) -> Result<()> {
+        self.teardown_started = true;
+        if !self.reset_confirmed {
+            self.transport.reset()?;
+            self.reset_confirmed = true;
+        }
+        Ok(())
+    }
+
+    /// Retires an in-flight read after successful reset.
+    ///
+    /// # Safety
+    /// Buffers must be exactly those supplied with this still-in-flight token
+    /// at submission. The token must not have been completed or cancelled.
+    pub unsafe fn cancel_read_blocks(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        buf: &mut [u8],
+        resp: &mut BlkResp,
+    ) -> Result<()> {
+        if !self.reset_confirmed {
+            return Err(crate::Error::NotReady);
+        }
+        unsafe {
+            self.queue
+                .detach_unused(token, &[req.as_bytes()], &mut [buf, resp.as_bytes_mut()])
+        }
+    }
+
+    /// Retires an in-flight write after successful reset.
+    ///
+    /// # Safety
+    /// Buffers must be exactly those supplied with this still-in-flight token
+    /// at submission. The token must not have been completed or cancelled.
+    pub unsafe fn cancel_write_blocks(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        buf: &[u8],
+        resp: &mut BlkResp,
+    ) -> Result<()> {
+        if !self.reset_confirmed {
+            return Err(crate::Error::NotReady);
+        }
+        unsafe {
+            self.queue
+                .detach_unused(token, &[req.as_bytes(), buf], &mut [resp.as_bytes_mut()])
+        }
+    }
+
+    /// Retires an in-flight flush after successful reset.
+    ///
+    /// # Safety
+    /// Buffers must be exactly those supplied with this still-in-flight token
+    /// at submission. The token must not have been completed or cancelled.
+    pub unsafe fn cancel_flush(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        resp: &mut BlkResp,
+    ) -> Result<()> {
+        if !self.reset_confirmed {
+            return Err(crate::Error::NotReady);
+        }
+        unsafe {
+            self.queue
+                .detach_unused(token, &[req.as_bytes()], &mut [resp.as_bytes_mut()])
+        }
     }
 
     /// Gets the capacity of the block device, in 512 byte ([`SECTOR_SIZE`]) sectors.
@@ -108,33 +216,36 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
     /// Sends the given request to the device and waits for a response, with no extra data.
     fn request(&mut self, request: BlkReq) -> Result {
+        self.ensure_active()?;
         let mut resp = BlkResp::default();
         self.queue.add_notify_wait_pop(
             &[request.as_bytes()],
             &mut [resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
         resp.status.into()
     }
 
     /// Sends the given request to the device and waits for a response, including the given data.
     fn request_read(&mut self, request: BlkReq, data: &mut [u8]) -> Result {
+        self.ensure_active()?;
         let mut resp = BlkResp::default();
         self.queue.add_notify_wait_pop(
             &[request.as_bytes()],
             &mut [data, resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
         resp.status.into()
     }
 
     /// Sends the given request and data to the device and waits for a response.
     fn request_write(&mut self, request: BlkReq, data: &[u8]) -> Result {
+        self.ensure_active()?;
         let mut resp = BlkResp::default();
         self.queue.add_notify_wait_pop(
             &[request.as_bytes(), data],
             &mut [resp.as_bytes_mut()],
-            &mut self.transport,
+            &mut *self.transport,
         )?;
         resp.status.into()
     }
@@ -169,6 +280,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// method returns `Some(token)`. Thus, it is the caller's responsibility to guarantee that they
     /// are not accessed before the request is completed in order to avoid data races.
     pub unsafe fn flush_nb(&mut self, req: &mut BlkReq, resp: &mut BlkResp) -> Result<Option<u16>> {
+        self.ensure_active()?;
         if !self.supports_flush() {
             return Ok(None);
         }
@@ -303,6 +415,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buf: &mut [u8],
         resp: &mut BlkResp,
     ) -> Result<u16> {
+        self.ensure_active()?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         *req = BlkReq {
@@ -385,6 +498,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buf: &[u8],
         resp: &mut BlkResp,
     ) -> Result<u16> {
+        self.ensure_active()?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         *req = BlkReq {
@@ -427,7 +541,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
     /// Read-only backpressure check; submission still rechecks under its lock.
     pub fn can_submit(&self, flush: bool) -> bool {
-        self.queue.available_desc() >= if flush { 2 } else { 3 }
+        !self.teardown_started && self.queue.available_desc() >= if flush { 2 } else { 3 }
     }
 
     /// Returns the size of the device's VirtQueue.
@@ -438,9 +552,17 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
 impl<H: Hal, T: Transport> Drop for VirtIOBlk<H, T> {
     fn drop(&mut self) {
-        // Clear any pointers pointing to DMA regions, so the device doesn't try to access them
-        // after they have been freed.
-        self.transport.queue_unset(QUEUE);
+        if self.reset().is_ok() {
+            // The device acknowledged reset. Queue DMA can now be released.
+            unsafe {
+                core::mem::ManuallyDrop::drop(&mut self.queue);
+                core::mem::ManuallyDrop::drop(&mut self.transport);
+            }
+        } else {
+            // Final-reference failure cannot return ownership. Retain both the
+            // transport and queue; dropping either can free DMA or retry forever.
+            log::error!("VirtIOBlk: reset failed during drop; retaining DMA owners");
+        }
     }
 }
 
@@ -619,6 +741,10 @@ mod tests {
     use alloc::{sync::Arc, vec};
     use core::{mem::size_of, ptr::NonNull};
     use std::{sync::Mutex, thread};
+
+    mod reset_tests {
+        include!("blk/reset_tests.rs");
+    }
 
     #[test]
     fn config() {

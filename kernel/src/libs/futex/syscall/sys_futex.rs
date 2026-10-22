@@ -6,7 +6,7 @@ use crate::libs::futex::{constant::*, futex::Futex};
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_FUTEX},
-    mm::{access_ok, VirtAddr},
+    mm::VirtAddr,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferReader,
@@ -159,18 +159,6 @@ pub(super) fn do_futex(
     let cmd = FutexArg::from_bits(operation & FutexFlag::FUTEX_CMD_MASK.bits())
         .ok_or(SystemError::ENOSYS)?;
 
-    // 仅在需要 uaddr2 的操作中校验它
-    match cmd {
-        FutexArg::FUTEX_REQUEUE
-        | FutexArg::FUTEX_CMP_REQUEUE
-        | FutexArg::FUTEX_WAKE_OP
-        | FutexArg::FUTEX_WAIT_REQUEUE_PI
-        | FutexArg::FUTEX_CMP_REQUEUE_PI => {
-            access_ok(uaddr2, core::mem::size_of::<u32>())?;
-        }
-        _ => {}
-    }
-
     let mut flags = FutexFlag::FLAGS_MATCH_NONE;
 
     if (operation & FutexFlag::FUTEX_PRIVATE_FLAG.bits()) == 0 {
@@ -187,16 +175,8 @@ pub(super) fn do_futex(
         }
     }
 
-    // 对于 FUTEX_WAKE_OP 的私有 futex，允许 uaddr 为 NULL（Linux 兼容行为）。
-    // 仅在不满足该例外时才校验 uaddr。
-    let skip_uaddr_check = cmd == FutexArg::FUTEX_WAKE_OP
-        && (operation & FutexFlag::FUTEX_PRIVATE_FLAG.bits()) != 0
-        && uaddr.data() == 0;
-
-    if !skip_uaddr_check {
-        access_ok(uaddr, core::mem::size_of::<u32>())?;
-    }
-
+    // Each implemented operation resolves its key before touching a futex
+    // word. Keep alignment, range and mapping checks there, in Linux order.
     match cmd {
         FutexArg::FUTEX_WAIT => {
             return Futex::futex_wait(uaddr, flags, val, timeout, FUTEX_BITSET_MATCH_ANY);
@@ -281,11 +261,8 @@ pub(super) fn do_futex(
         FutexArg::FUTEX_TRYLOCK_PI => {
             return Futex::futex_trylock_pi(uaddr, flags);
         }
-        FutexArg::FUTEX_WAIT_REQUEUE_PI => {
-            todo!()
-        }
-        FutexArg::FUTEX_CMP_REQUEUE_PI => {
-            todo!()
+        FutexArg::FUTEX_WAIT_REQUEUE_PI | FutexArg::FUTEX_CMP_REQUEUE_PI => {
+            Err(SystemError::ENOSYS)
         }
         _ => {
             return Err(SystemError::ENOSYS);

@@ -99,6 +99,9 @@ pub struct PiProtected {
     /// Original userspace affinity request, separate from cpuset placement.
     pub(crate) user_cpus_allowed: Option<CpuMask>,
     sched_reset_on_fork: bool,
+    /// Effective priority of the top PI donor. Registry mutations take
+    /// pi_lock before publishing this cache and changing the task's rq.
+    inherited_priority: Option<i32>,
 }
 
 impl PiProtected {
@@ -109,6 +112,7 @@ impl PiProtected {
             nr_cpus_allowed,
             user_cpus_allowed: None,
             sched_reset_on_fork: false,
+            inherited_priority: None,
         }
     }
 
@@ -125,6 +129,19 @@ impl PiProtected {
     #[inline]
     pub fn set_sched_reset_on_fork(&mut self, reset: bool) {
         self.sched_reset_on_fork = reset;
+    }
+
+    pub(crate) fn inherited_priority(&self) -> Option<i32> {
+        self.inherited_priority
+    }
+
+    pub(crate) fn set_inherited_priority(&mut self, priority: Option<i32>) {
+        self.inherited_priority = priority;
+    }
+
+    pub(crate) fn effective_priority(&self, normal: i32) -> i32 {
+        self.inherited_priority
+            .map_or(normal, |donor| normal.min(donor))
     }
 }
 
@@ -412,17 +429,27 @@ impl ProcessSchedulerInfo {
         LinuxSchedPolicy::from_u8(self.sched_policy.load(Ordering::Relaxed))
     }
 
-    /// Set the Linux base policy and its effective base class.
+    /// Set the Linux base policy without disturbing a PI class override.
     ///
     /// The task must either be unpublished or protected by the existing
     /// scheduler policy-change lock domain (`pi_lock` and, when applicable,
-    /// its runqueue lock). A future priority-inheritance path may override the
-    /// effective class separately.
+    /// its runqueue lock). The effective class is committed separately by
+    /// set_effective_priority(), after dequeuing from the old class.
     #[inline]
     pub(crate) fn set_policy(&self, policy: LinuxSchedPolicy) {
-        self.sched_class
-            .store(policy.base_sched_class().to_u8(), Ordering::Relaxed);
         self.sched_policy.store(policy.to_u8(), Ordering::Relaxed);
+    }
+
+    /// Publish the scheduler's effective class and priority under pi_lock and
+    /// the stable owner rq lock (or before the task's first placement).
+    pub(crate) fn set_effective_priority(&self, priority: i32) {
+        let class = if PrioUtil::rt_prio(priority) {
+            SchedClass::Realtime
+        } else {
+            SchedClass::Fair
+        };
+        self.sched_class.store(class.to_u8(), Ordering::Relaxed);
+        self.set_prio(priority);
     }
 
     /// Read the scheduler class currently responsible for this task.

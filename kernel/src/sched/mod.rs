@@ -1476,6 +1476,7 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         "fork policy and inherited normal priority disagree"
     );
     pcb.sched_info().set_policy(fork_policy);
+    pcb.sched_info().set_effective_priority(fork_prio);
 
     pcb.sched_info()
         .sched_entity()

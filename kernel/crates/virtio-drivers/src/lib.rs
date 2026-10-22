@@ -76,6 +76,8 @@ pub enum Error {
     QueueFull,
     /// The device is not ready.
     NotReady,
+    /// The device did not acknowledge reset within the bounded poll budget.
+    ResetTimeout,
     /// The device used a different descriptor chain to the one we were expecting.
     WrongToken,
     /// The queue is already in use.
@@ -101,6 +103,7 @@ impl Display for Error {
         match self {
             Self::QueueFull => write!(f, "Virtqueue is full"),
             Self::NotReady => write!(f, "Device not ready"),
+            Self::ResetTimeout => write!(f, "Device reset acknowledgement timed out"),
             Self::WrongToken => write!(
                 f,
                 "Device used a different descriptor chain to the one we were expecting"

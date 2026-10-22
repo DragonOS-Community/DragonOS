@@ -3,12 +3,14 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_CLOCK_SETTIME},
+    process::cred::{capable, CAPFlags},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferReader,
     },
     time::{
         cpu_clock::{CpuClockOperation, CpuClockTarget},
+        timekeeping::{do_settimeofday64, validate_settimeofday},
         PosixTimeSpec,
     },
 };
@@ -29,16 +31,31 @@ impl Syscall for SysClockSettime {
             PosixClockID::ProcessCPUTimeID | PosixClockID::ThreadCPUTimeID => {
                 return Err(SystemError::EINVAL)
             }
-            PosixClockID::DynamicCpuClock(_) => {}
-            // Setting wall clocks is not implemented by this CPU-clock entry.
-            _ => return Err(SystemError::ENOSYS),
+            PosixClockID::Realtime | PosixClockID::DynamicCpuClock(_) => {}
+            // Linux clocks without a setter reject the ID before user access.
+            _ => return Err(SystemError::EINVAL),
         }
         let reader = UserBufferReader::new(
             args[1] as *const PosixTimeSpec,
             core::mem::size_of::<PosixTimeSpec>(),
             true,
         )?;
-        let _requested = reader.buffer_protected(0)?.read_one::<PosixTimeSpec>(0)?;
+        let requested = reader.buffer_protected(0)?.read_one::<PosixTimeSpec>(0)?;
+        if clock == PosixClockID::Realtime {
+            // Match do_sys_settimeofday64(): formatted-value validation precedes
+            // privilege checks, while the REALTIME >= MONOTONIC check belongs
+            // to the authorized low-level update under the timekeeper lock.
+            validate_settimeofday(requested)?;
+            // The wall clock is global. A capability in a child user namespace
+            // must not authorize changing it, even for that namespace's root.
+            if !capable(CAPFlags::CAP_SYS_TIME) {
+                return Err(SystemError::EPERM);
+            }
+            do_settimeofday64(requested)?;
+            return Ok(0);
+        }
+        // Dynamic CPU clocks validate the target but never permit resetting it;
+        // their setter deliberately does not validate the timespec's value.
         CpuClockTarget::resolve(clock, CpuClockOperation::Validate)?;
         Err(SystemError::EPERM)
     }

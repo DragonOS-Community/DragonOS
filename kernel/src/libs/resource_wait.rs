@@ -561,6 +561,43 @@ impl<T> Drop for ResourceMutexGuard<'_, T> {
     }
 }
 
+/// Keeps ownership and preemption suppression indivisible. A failed attempt
+/// restores preemption before the resource waiter may sleep.
+pub(crate) struct NonPreemptibleResourceGuard<'a, T> {
+    inner: ResourceMutexGuard<'a, T>,
+    _preempt: crate::process::preempt::PreemptGuard,
+}
+
+impl<'a, T> NonPreemptibleResourceGuard<'a, T> {
+    pub(crate) fn lock(lock: &'a ResourceMutex<T>) -> Self {
+        let acquire = || {
+            let preempt = crate::process::preempt::PreemptGuard::new();
+            ResourceMutexGuard::try_lock(lock).map(|inner| Self {
+                inner,
+                _preempt: preempt,
+            })
+        };
+        if let Some(guard) = acquire() {
+            return guard;
+        }
+        lock.wait_queue
+            .wait(WaitMode::Uninterruptible, acquire)
+            .expect("exited task cannot wait for registry")
+    }
+}
+
+impl<T> core::ops::Deref for NonPreemptibleResourceGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+impl<T> core::ops::DerefMut for NonPreemptibleResourceGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
 pub(crate) fn has_waiters() -> bool {
     REGISTERED.load(Ordering::Acquire) != 0
 }

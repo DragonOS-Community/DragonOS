@@ -46,10 +46,21 @@ pub(crate) fn mutex_protocol() -> Result<bool, SystemError> {
                     let ok = {
                         let _deny = denial::Scope::enter(true);
                         let before = denial::probe_denied();
-                        let mut held = ResourceMutexGuard::lock(&worker_lock);
-                        *held += 1;
-                        drop(held);
-                        before && denial::probe_denied()
+                        let nonpreemptible = if round == 2 {
+                            let task = ProcessManager::current_pcb();
+                            let count = task.preempt_count();
+                            let mut held = NonPreemptibleResourceGuard::lock(&worker_lock);
+                            let suppressed = task.preempt_count() == count + 1;
+                            *held += 1;
+                            drop(held);
+                            suppressed && task.preempt_count() == count
+                        } else {
+                            let mut held = ResourceMutexGuard::lock(&worker_lock);
+                            *held += 1;
+                            drop(held);
+                            true
+                        };
+                        before && nonpreemptible && denial::probe_denied()
                     };
                     if !ok || denial::is_current_denied() != original {
                         worker_passed.store(false, Ordering::Release);

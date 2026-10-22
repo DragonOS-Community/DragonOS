@@ -666,7 +666,9 @@ impl ProcessManager {
     /// and retain its user reference until this returns. Like Linux's
     /// exit_mm_release/exec_mm_release, robust cleanup precedes clear_child_tid.
     pub(crate) fn release_task_futex_state(pcb: &Arc<ProcessControlBlock>) {
+        crate::libs::futex::pi_futex::begin_task_cleanup(pcb);
         RobustListHead::cleanup_robust_list(pcb);
+        crate::libs::futex::pi_futex::finish_task_cleanup(pcb);
 
         // Consume the registration even when no user access is needed. In
         // particular, an exec must not carry this address into the new mm.

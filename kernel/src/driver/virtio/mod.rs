@@ -100,6 +100,7 @@ pub fn virtio_drivers_error_to_system_error(error: virtio_drivers::Error) -> Sys
         virtio_drivers::Error::Unsupported => SystemError::ENOSYS,
         virtio_drivers::Error::ConfigSpaceTooSmall => SystemError::EINVAL,
         virtio_drivers::Error::ConfigSpaceMissing => SystemError::EINVAL,
+        virtio_drivers::Error::ResetTimeout => SystemError::ETIMEDOUT,
         virtio_drivers::Error::SocketDeviceError(_) => SystemError::EIO,
     }
 }

@@ -1017,21 +1017,16 @@ impl Ext4DelayedSubmission {
             return core::ops::ControlFlow::Break(entries);
         }
         for claimed in entries {
-            let offset = claimed.pending.offset;
-            let removed = guard.delalloc.production.entries.remove(&offset);
-            debug_assert!(removed.is_some());
-            assert!(guard
+            // The all-or-nothing preflight above established that this exact
+            // claim still occupies its node. Restore it in place: removing
+            // and reinserting can allocate while unwinding ENOMEM.
+            let entry = guard
                 .delalloc
                 .production
                 .entries
-                .insert(
-                    offset,
-                    ProductionDelallocEntry {
-                        sequence: claimed.sequence,
-                        state: ProductionDelallocEntryState::Ready(claimed.pending),
-                    },
-                )
-                .is_none());
+                .get_mut(&claimed.pending.offset)
+                .expect("validated delayed-allocation claim");
+            entry.state = ProductionDelallocEntryState::Ready(claimed.pending);
         }
         core::ops::ControlFlow::Continue(())
     }
@@ -1136,19 +1131,12 @@ impl Ext4DelayedSubmission {
 
     fn finish_terminal(&mut self) {
         let mut claimed = core::mem::take(&mut self.entries);
-        let mut idle = Vec::new();
-        let (inode_num, owner) = {
+        let (inode_num, idle, owner) = {
             let _io = self.inode.io_lock.lock();
             let mut guard = self.inode.inner.lock();
-            for (_, entry) in core::mem::take(&mut guard.delalloc.production.entries) {
-                match entry.state {
-                    ProductionDelallocEntryState::Prepared(pending)
-                    | ProductionDelallocEntryState::Ready(pending) => idle.push(pending),
-                    ProductionDelallocEntryState::Claimed { .. } => {}
-                }
-            }
             (
                 guard.inner_inode_num,
+                core::mem::take(&mut guard.delalloc.production.entries),
                 guard.delalloc.production.queue_operation.take(),
             )
         };
@@ -1163,7 +1151,14 @@ impl Ext4DelayedSubmission {
                         &mut entry.pending.reservation,
                     );
             }
-            for mut pending in idle {
+            // Consume the detached nodes directly. Terminal retirement must
+            // also work when no allocation can succeed.
+            for (_, entry) in idle {
+                let mut pending = match entry.state {
+                    ProductionDelallocEntryState::Prepared(pending)
+                    | ProductionDelallocEntryState::Ready(pending) => pending,
+                    ProductionDelallocEntryState::Claimed { .. } => continue,
+                };
                 let _ = self
                     .fs
                     .fs
@@ -6279,19 +6274,17 @@ impl LockedExt4Inode {
                 }) {
                     return false;
                 }
-                let mut pending = Vec::new();
-                for (_, entry) in core::mem::take(&mut guard.delalloc.production.entries) {
-                    match entry.state {
-                        ProductionDelallocEntryState::Prepared(entry)
-                        | ProductionDelallocEntryState::Ready(entry) => pending.push(entry),
-                        ProductionDelallocEntryState::Claimed { .. } => unreachable!(),
-                    }
-                }
+                let pending = core::mem::take(&mut guard.delalloc.production.entries);
                 let owner = guard.delalloc.production.queue_operation.take();
                 (inode_num, pending, owner)
             };
         if let Some(authority) = fs.delalloc_mapper_authority.as_ref() {
-            for mut pending in pending {
+            for (_, entry) in pending {
+                let mut pending = match entry.state {
+                    ProductionDelallocEntryState::Prepared(pending)
+                    | ProductionDelallocEntryState::Ready(pending) => pending,
+                    ProductionDelallocEntryState::Claimed { .. } => unreachable!(),
+                };
                 let _terminalized = fs
                     .fs
                     .terminalize_delalloc_append_block_authorized_after_fail_stop(

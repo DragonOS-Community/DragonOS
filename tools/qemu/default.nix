@@ -20,7 +20,8 @@ let
 
   baseConfig = {
     nographic = true;
-    memory = "512M";
+    # 与 tools/run-qemu.sh 保持一致（部分 dunitest 用例在 512M 下会耗尽内核堆）
+    memory = "2G";
     cores = "2";
     shmId = "dragonos-qemu-shm.ram";
   };

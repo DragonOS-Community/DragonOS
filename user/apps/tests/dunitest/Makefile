@@ -110,15 +110,17 @@ $(FAT32_STAT_FIXTURE):
 	@truncate -s 40M "$@"
 	@mkfs.fat -F 32 -S 512 -s 1 "$@"
 
+# another_ext4 supports 4 KiB blocks; upstream mke2fs defaults give small
+# filesystems 1 KiB blocks unless the host mke2fs.conf (e.g. Debian) overrides it.
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
 	@truncate -s 8M "$@"
-	@output=$$(mke2fs -q -t ext4 -F -O ^orphan_file "$@" 2>&1) || { \
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -O ^orphan_file "$@" 2>&1) || { \
 		case "$$output" in \
 			*"Invalid filesystem option set: ^orphan_file"*) \
 				rm -f "$@"; \
 				truncate -s 8M "$@"; \
-				mke2fs -q -t ext4 -F "$@" ;; \
+				mke2fs -q -t ext4 -F -b 4096 "$@" ;; \
 			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
 		esac; \
 	}

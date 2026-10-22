@@ -59,28 +59,30 @@ TEST(GlobalReclaim, CleanCacheRemainsReclaimableWhenPreparationCannotAllocate) {
   ASSERT_NE(total, 0u);
   if (total < 960 * 1024 || total > 1024 * 1024)
     GTEST_SKIP() << "requires a 1 GiB guest";
-  char path[] = "/var/tmp/global-reclaim-XXXXXX";
-  int fd = mkstemp(path);
+  const char* directory = getenv("DUNITEST_MEMORY_FILE_DIR");
+  if (directory == nullptr || directory[0] == '\0') directory = "/var/tmp";
+  std::string path = std::string(directory) + "/global-reclaim-XXXXXX";
+  int fd = mkstemp(path.data());
   ASSERT_GE(fd, 0);
   struct statfs fs;
   int stat_result = fstatfs(fd, &fs);
   if (stat_result != 0) {
     const int error = errno;
     close(fd);
-    unlink(path);
+    unlink(path.c_str());
     FAIL() << "fstatfs failed: " << error;
   }
   // Keep an ordinary filesystem cache; tmpfs data cannot be discarded.
   if (fs.f_type != 0xef53) {
     close(fd);
-    unlink(path);
+    unlink(path.c_str());
     GTEST_SKIP() << "requires ext4 scratch storage";
   }
   pid_t child = fork();
   if (child == 0) _exit(ExerciseCleanReclaim(fd));
   if (child < 0) {
     close(fd);
-    unlink(path);
+    unlink(path.c_str());
     FAIL() << "fork failed: " << errno;
   }
   int status = 0;
@@ -95,7 +97,7 @@ TEST(GlobalReclaim, CleanCacheRemainsReclaimableWhenPreparationCannotAllocate) {
     while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
   }
   close(fd);
-  unlink(path);
+  unlink(path.c_str());
   ASSERT_EQ(result, child) << "reclaim child failed to finish within 120s";
   ASSERT_TRUE(WIFEXITED(status)) << "unexpected signal: " << status;
   EXPECT_EQ(WEXITSTATUS(status), 0);

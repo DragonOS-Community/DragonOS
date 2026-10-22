@@ -301,3 +301,4 @@ normal/page_migration
 normal/page_retirement
 normal/shared_page_migration
 normal/page_compaction
+normal/global_reclaim

@@ -3,7 +3,6 @@
 use super::xattr_utils::path_removexattr;
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_REMOVEXATTR},
-    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::vec::Vec;
@@ -17,11 +16,7 @@ impl Syscall for SysRemovexattrHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        path_removexattr(
-            Self::path(args),
-            Self::name(args),
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        )
+        path_removexattr(Self::path(args), Self::name(args), true)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

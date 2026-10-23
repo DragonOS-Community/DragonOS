@@ -3,6 +3,8 @@
 #include <array>
 #include <cerrno>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <string>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -51,6 +53,26 @@ TEST_F(XattrUnsupported, EmptyListDoesNotAccessOutput) {
         for (const auto byte : output) EXPECT_EQ('x', byte);
         EXPECT_EQ(0, syscall(list[i], target, nullptr, output.size()));
     }
+}
+TEST_F(XattrUnsupported, NoFollowListsDanglingFinalSymlink) {
+    char directory[] = "/tmp/dunitest_xattr_link_XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(directory));
+    const std::string link = std::string(directory) + "/link";
+    const int linked = symlink("missing", link.c_str());
+    if (linked != 0) {
+        rmdir(directory);
+        FAIL() << "symlink failed: " << errno;
+    }
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_listxattr, link.c_str(), nullptr, 0));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(0, syscall(SYS_llistxattr, link.c_str(), nullptr, 0));
+    std::array<char, 16> output;
+    output.fill('x');
+    EXPECT_EQ(0, syscall(SYS_llistxattr, link.c_str(), output.data(), output.size()));
+    for (const auto byte : output) EXPECT_EQ('x', byte);
+    EXPECT_EQ(0, unlink(link.c_str()));
+    EXPECT_EQ(0, rmdir(directory));
 }
 }  // namespace
 

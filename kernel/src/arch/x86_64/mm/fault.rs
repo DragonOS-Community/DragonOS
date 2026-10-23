@@ -547,12 +547,22 @@ impl X86_64MMArch {
                             return;
                         }
 
+                        // 定位信息：进程名 + fault 时刻的通用寄存器/栈指针。
+                        // 用户态 #PF 的 TrapFrame 没有原 syscall 号（errcode 是
+                        // 硬件错误码），因此把 rax/rdi/rsi/rdx 一并打印——它们
+                        // 通常仍是该 syscall 的号与入参，足以判断崩在哪次调用。
                         log::error!(
-                            "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
+                            "pid: {} ({}) No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, flags: {:?}",
                             ProcessManager::current_pid().data(),
+                            ProcessManager::current_pcb().basic().name(),
                             error_code,
                             regs.rip,
                             address.data(),
+                            regs.rax,
+                            regs.rdi,
+                            regs.rsi,
+                            regs.rdx,
+                            regs.rsp,
                             flags
                         );
 

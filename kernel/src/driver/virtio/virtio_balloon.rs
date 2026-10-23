@@ -26,7 +26,7 @@ use crate::{
     exception::{irqdesc::IrqReturn, IrqNumber},
     libs::{
         mutex::Mutex,
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
         wait_queue::{Waiter, Waker},
     },
     mm::{
@@ -128,8 +128,25 @@ struct ReportRequest {
     block: ReportingBlock,
 }
 
+/// Shared register access is always serialized, including interrupt handlers.
+/// Keep this guarantee local rather than making every transport user Send.
+struct BalloonTransport(SpinLock<VirtIOTransport>);
+
+// SAFETY: the owned transport pins its kernel MMIO mappings, which are not
+// thread-local. Its only access path holds the same IRQ-saving lock; neither
+// the worker nor an IRQ callback can access registers or retire mappings
+// concurrently. Arc keeps this owner alive for every callback invocation.
+unsafe impl Send for BalloonTransport {}
+unsafe impl Sync for BalloonTransport {}
+
+impl BalloonTransport {
+    fn lock_irqsave(&self) -> SpinLockGuard<'_, VirtIOTransport> {
+        self.0.lock_irqsave()
+    }
+}
+
 struct Device {
-    transport: Arc<SpinLock<VirtIOTransport>>,
+    transport: Arc<BalloonTransport>,
     features: Features,
     inflate: Option<Queue>,
     deflate: Option<Queue>,
@@ -155,13 +172,9 @@ struct Balloon {
     next: Option<Arc<Balloon>>,
 }
 struct Interrupt {
-    transport: Arc<SpinLock<VirtIOTransport>>,
+    transport: Arc<BalloonTransport>,
     dedicated: bool,
 }
-// SAFETY: the transport mappings remain pinned for this permanent device;
-// every register access is serialized by the same IRQ-saving transport lock.
-unsafe impl Send for Interrupt {}
-unsafe impl Sync for Interrupt {}
 impl VirtioIrqCallback for Interrupt {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
         // MSI/MSI-X delivery identifies this device even when the legacy
@@ -658,7 +671,7 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
         .map(|setup| setup.into_parts())
         .unwrap_or((None, None));
     let dedicated_irq = irq_lease.is_some();
-    let transport = Arc::new(SpinLock::new(transport));
+    let transport = Arc::new(BalloonTransport(SpinLock::new(transport)));
     let mut device = Device {
         transport: transport.clone(),
         features,

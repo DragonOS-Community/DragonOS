@@ -1066,6 +1066,7 @@ impl AddressSpace {
     ///
     /// See `crate::mm::tlb::flush_tlb_mm_range` for constraints.
     #[inline]
+    #[track_caller]
     pub fn flush_tlb_range(
         self: &Arc<Self>,
         start: VirtAddr,
@@ -1078,6 +1079,7 @@ impl AddressSpace {
 
     /// Issue a full-mm TLB flush.
     #[inline]
+    #[track_caller]
     pub fn flush_tlb_all(self: &Arc<Self>) {
         crate::mm::tlb::flush_tlb_mm(self);
     }

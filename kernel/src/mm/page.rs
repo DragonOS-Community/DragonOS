@@ -1157,6 +1157,32 @@ pub(crate) fn try_page_reclaimer_lock() -> Option<ResourceMutexGuard<'static, Pa
     unsafe { ResourceMutexGuard::try_lock(PAGE_RECLAIMER.as_ref()?) }
 }
 
+/// Physical eligibility for one reclaim operation. Ordinary reclaim accepts
+/// all RAM; constrained allocations count only whole pages they can reach.
+/// This is separate from protection quotas and the visited-candidate budget.
+#[derive(Clone, Copy)]
+struct ReclaimFilter {
+    zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+    max: PhysAddr,
+}
+
+impl ReclaimFilter {
+    const fn all() -> Self {
+        Self {
+            zones: None,
+            max: PhysAddr::MAX,
+        }
+    }
+
+    fn allows(self, physical: PhysAddr) -> bool {
+        physical
+            .data()
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .is_some_and(|last| last <= self.max.data())
+            && self.zones.is_none_or(|zones| zones.needs_reclaim(physical))
+    }
+}
+
 /// 页面回收器
 pub struct PageReclaimer {
     lru: PageLru,
@@ -1271,7 +1297,14 @@ impl PageReclaimer {
         let root = crate::cgroup::cgroup_root_node().memory_account();
         let mut lease = crate::cgroup::memory::protection::global_snapshot(&root);
         crate::mm::allocator::reserve::with_reclaim_reserve(|| {
-            Self::shrink_with_protection(lease.get_mut(), count, true, false, usize::MAX, None)
+            Self::shrink_with_protection(
+                lease.get_mut(),
+                count,
+                true,
+                false,
+                usize::MAX,
+                ReclaimFilter::all(),
+            )
         })
     }
 
@@ -1283,10 +1316,23 @@ impl PageReclaimer {
         visits: usize,
         zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
     ) -> Option<ReclaimProgress> {
+        Self::try_shrink_global_below(count, visits, zones, PhysAddr::MAX)
+    }
+
+    /// As above, but only reclaim complete pages below an inclusive physical
+    /// limit. Unreachable candidates still consume the shared visit budget;
+    /// they cannot satisfy the goal or trigger unrelated writeback.
+    pub(crate) fn try_shrink_global_below(
+        count: PageFrameCount,
+        visits: usize,
+        zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+        max: PhysAddr,
+    ) -> Option<ReclaimProgress> {
         let root = crate::cgroup::cgroup_root_node().memory_account();
         let mut lease = crate::cgroup::memory::protection::try_global_snapshot(&root)?;
+        let filter = ReclaimFilter { zones, max };
         Some(crate::mm::allocator::reserve::with_reclaim_reserve(|| {
-            Self::shrink_with_protection(lease.get_mut(), count, true, false, visits, zones)
+            Self::shrink_with_protection(lease.get_mut(), count, true, false, visits, filter)
         }))
     }
 
@@ -1322,7 +1368,7 @@ impl PageReclaimer {
                 allow_unowned,
                 noio,
                 usize::MAX,
-                None,
+                ReclaimFilter::all(),
             )
         };
         // NOIO retains an unrelated caller's resources and is not itself an
@@ -1340,7 +1386,7 @@ impl PageReclaimer {
         allow_unowned: bool,
         noio: bool,
         visits: usize,
-        zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+        filter: ReclaimFilter,
     ) -> ReclaimProgress {
         let inventory = if noio {
             let Some(reclaimer) = try_page_reclaimer_lock() else {
@@ -1369,7 +1415,7 @@ impl PageReclaimer {
             allow_unowned,
             noio,
             &mut budget,
-            zones.as_ref(),
+            filter,
         );
         if progress.reclaimed < count.data() && protection.low_skipped() {
             budget.remaining = visits.saturating_sub(first_budget.saturating_sub(budget.remaining));
@@ -1380,7 +1426,7 @@ impl PageReclaimer {
                 allow_unowned,
                 noio,
                 &mut budget,
-                zones.as_ref(),
+                filter,
             ));
         }
         progress.inventory = inventory;
@@ -1411,7 +1457,7 @@ impl PageReclaimer {
         allow_unowned: bool,
         noio: bool,
         budget: &mut ReclaimVisitBudget,
-        zones: Option<&crate::mm::allocator::watermark::ZonePressureSnapshot>,
+        filter: ReclaimFilter,
     ) -> ReclaimProgress {
         let mut progress = ReclaimProgress::default();
         for priority in (0..=12).rev() {
@@ -1448,7 +1494,7 @@ impl PageReclaimer {
                 low_reclaim,
                 noio,
                 &mut priority_remaining,
-                zones,
+                filter,
             ));
             budget.remaining = budget
                 .remaining
@@ -1464,7 +1510,7 @@ impl PageReclaimer {
         low_reclaim: bool,
         noio: bool,
         remaining_visits: &mut usize,
-        zones: Option<&crate::mm::allocator::watermark::ZonePressureSnapshot>,
+        filter: ReclaimFilter,
     ) -> ReclaimProgress {
         let mut progress = ReclaimProgress::default();
         let mut remaining = if noio {
@@ -1494,9 +1540,7 @@ impl PageReclaimer {
                 *remaining_visits -= 1;
                 // Unprocessed slots only release their snapshot Arc; the
                 // original LRU nodes never left the list.
-                if progress.reclaimed < goal
-                    && zones.is_none_or(|zones| zones.needs_reclaim(page.phys_address()))
-                {
+                if progress.reclaimed < goal && filter.allows(page.phys_address()) {
                     progress.accumulate(if noio {
                         Self::evict_page_noio(page, protection, low_reclaim)
                     } else {

@@ -43,7 +43,7 @@ use crate::{
         virtio::{
             sysfs::{virtio_bus, virtio_device_manager, virtio_driver_manager},
             transport::{DeferredVirtioIrq, VirtIOTransport},
-            virtio_impl::HalImpl,
+            virtio_impl::VirtioQueueHal,
             VirtIODevice, VirtIODeviceIndex, VirtIODriver, VirtIODriverCommonData, VirtioDeviceId,
             VIRTIO_VENDOR_ID,
         },
@@ -712,14 +712,14 @@ impl VirtIOBlkDevice {
         let devname = virtioblk_manager().alloc_id()?;
         let irq = Some(transport.irq());
         let irq_is_msix = transport.irq_is_msix();
-        let device_inner = VirtIOBlk::<HalImpl, VirtIOTransport>::new(transport);
+        let device_inner = VirtIOBlk::<VirtioQueueHal, VirtIOTransport>::new(transport);
         if let Err(e) = device_inner {
             error!("VirtIOBlkDevice '{dev_id:?}' create failed: {:?}", e);
             virtioblk_manager().free_id(devname.id());
             return None;
         }
 
-        let mut device_inner: VirtIOBlk<HalImpl, VirtIOTransport> = device_inner.unwrap();
+        let mut device_inner: VirtIOBlk<VirtioQueueHal, VirtIOTransport> = device_inner.unwrap();
         device_inner.enable_interrupts();
         let capacity_blocks = device_inner.capacity() as usize * SECTOR_SIZE / LBA_SIZE;
 
@@ -1216,7 +1216,7 @@ impl BlockDevice for VirtIOBlkDevice {
 }
 
 struct InnerVirtIOBlkDevice {
-    device_inner: Option<VirtIOBlk<HalImpl, VirtIOTransport>>,
+    device_inner: Option<VirtIOBlk<VirtioQueueHal, VirtIOTransport>>,
     state: VirtIOBlkState,
     capacity_blocks: usize,
     name: Option<String>,

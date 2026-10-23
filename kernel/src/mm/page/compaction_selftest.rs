@@ -289,6 +289,7 @@ impl Fixture {
             end: start + BACKING * MMArch::PAGE_SIZE,
             order: ORDER,
             start_at: None,
+            deadline: None,
             limits: Limits::default(),
         }
     }
@@ -680,6 +681,7 @@ fn atomic_rejected() -> bool {
         end: PhysAddr::new(32 * MMArch::PAGE_SIZE),
         order: ORDER,
         start_at: None,
+        deadline: None,
         limits: Limits::default(),
     };
     let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -690,6 +692,186 @@ fn atomic_rejected() -> bool {
         && attempt.stats.entries == 0
         && attempt.stats.pages == 0
         && attempt.stats.migrations == 0
+}
+
+// An expired real deadline must not consume ownership or install backoff.
+fn deadline_rollback() -> Result<bool, SystemError> {
+    let mut fixture = Fixture::new(false, false)?;
+    fixture.release_holes();
+    let mut compactor = Compactor::new();
+    let mut request = fixture.request();
+    request.deadline = Some(crate::time::timer::clock());
+    let expired = compactor.allocate(request);
+    let untouched = matches!(expired.outcome, Err(Stop::Timeout))
+        && expired.stats.targets == 0
+        && expired.stats.entries == 0
+        && expired.stats.migrations == 0
+        && fixture.valid()
+        && fixture
+            .sources
+            .iter()
+            .all(|source| source.weak.upgrade().is_some());
+    // Same owner/domain must still work immediately, without failure deferral.
+    request.deadline = None;
+    let captured = compactor.allocate(request);
+    let recovered = captured.outcome.is_ok() && fixture.valid();
+    drop(captured);
+    Ok(fixture.finish(untouched && recovered))
+}
+
+fn dma_recovery_reserve_guard() -> bool {
+    use crate::mm::allocator::reserve::{kernel_level, with_reclaim_reserve, ReserveLevel};
+    let before = kernel_level();
+    let ordinary = crate::mm::compaction::recovery::context_allowed();
+    let denied = with_reclaim_reserve(|| !crate::mm::compaction::recovery::context_allowed());
+    before == ReserveLevel::Kernel && ordinary && denied && kernel_level() == before
+}
+
+// Isolate the capacity contract with an order-0 DMA request, as used by
+// modern virtio-blk rings. Any reclaimed reachable page suffices; high-order
+// adjacency and migration are covered by the independent fragmented fixtures.
+// The finite prefix denies the baseline without starving the whole guest.
+fn dma_capacity_recovery() -> (bool, alloc::string::String) {
+    let mut detail = alloc::string::String::new();
+    let mut phase = "headroom";
+    let result = (|| -> Result<bool, SystemError> {
+        struct CleanPages(Vec<Weak<Page>>);
+        impl Drop for CleanPages {
+            fn drop(&mut self) {
+                for weak in &self.0 {
+                    if let Some(page) = weak.upgrade() {
+                        let lru = page_reclaimer_lock().remove_page_if_same(&page);
+                        drop(lru);
+                        let manager = page_manager_lock().remove_page_if_same(&page);
+                        drop(manager);
+                    }
+                }
+            }
+        }
+        let free = unsafe { LockedFrameAllocator.usage() }.free().data();
+        if free < 2 * DMA_HEADROOM_PAGES {
+            return Err(SystemError::ENOMEM);
+        }
+        let end = ((free / 2).min(16384) * MMArch::PAGE_SIZE).min(DMA32_END);
+        let mut entries = 65536;
+        phase = "fixture_run";
+        // The range/isolation helper handles high-order runs. Donate its two
+        // frames as independent clean owners; the DMA request below is one page.
+        let run = try_allocate_in_range(PhysAddr::new(0), PhysAddr::new(end), 1, &mut entries)
+            .map_err(|_| SystemError::ENOMEM)?
+            .ok_or(SystemError::ENOMEM)?;
+        let (base, count) = run.into_raw_parts();
+        let _ = writeln!(
+            detail,
+            "base={base:?} pages={} free_before={free}",
+            count.data()
+        );
+        phase = "clean_page_registration";
+        let mut raw = RawFrameExtent {
+            next: base,
+            remaining: count.data(),
+        };
+        let mut pages = CleanPages(Vec::new());
+        pages
+            .0
+            .try_reserve_exact(count.data())
+            .map_err(|_| SystemError::ENOMEM)?;
+        // Keep ordinary pins until every source is registered and the prefix owner
+        // is born. Their release leaves only the production manager/LRU owners.
+        let mut pins = Vec::new();
+        pins.try_reserve_exact(count.data())
+            .map_err(|_| SystemError::ENOMEM)?;
+        while raw.remaining != 0 {
+            let physical = raw.next;
+            raw.next += MMArch::PAGE_SIZE;
+            raw.remaining -= 1;
+            let page = Page::try_new(
+                physical,
+                PageType::File(FileMapInfo {
+                    page_cache: Weak::new(),
+                    index: pins.len(),
+                }),
+                PageFlags::PG_LRU,
+            )?;
+            pages.0.push(Arc::downgrade(&page));
+            register(&page)?;
+            pins.push(page);
+        }
+        // Only the first donated page is device-reachable. The second is a
+        // clean negative control which must survive the constrained scan.
+        let mask_end = base.data() + MMArch::PAGE_SIZE;
+        let mut prefix = PrefixReservations::new(mask_end)?;
+        phase = "prefix_hold";
+        prefix.hold_remaining()?;
+        let _ = writeln!(detail, "mask_end={mask_end} held_pages={}", prefix.pages);
+        let options = DmaAllocOptions {
+            dma_mask: Some((mask_end - 1) as u64),
+            use_pool: false,
+            ..DmaAllocOptions::default()
+        };
+        phase = "baseline";
+        let baseline = DmaBuffer::try_alloc_pages(1, options);
+        let unavailable = matches!(baseline, Err(SystemError::ENOMEM));
+        let _ = writeln!(
+            detail,
+            "baseline={:?} own_live={}",
+            baseline.as_ref().err(),
+            pages
+                .0
+                .iter()
+                .filter(|page| page.strong_count() != 0)
+                .count()
+        );
+        drop(baseline);
+        phase = "fixture_recency";
+        // Put the outside page before the inside page in cold-to-hot order.
+        // This controls the input without scanning or retiring unrelated pages,
+        // so the real request remains meaningful even with a large global LRU.
+        let placed = {
+            let mut reclaimer = page_reclaimer_lock();
+            reclaimer.lru.place_cold_for_selftest(&pins[0])
+                && reclaimer.lru.place_cold_for_selftest(&pins[1])
+        };
+        if !placed {
+            return Err(SystemError::EBUSY);
+        }
+        drop(pins);
+        phase = "allowed_attempt";
+        let before = unsafe { LockedFrameAllocator.usage() }.free().data();
+        let recovered = DmaBuffer::try_alloc_pages(
+            1,
+            DmaAllocOptions {
+                compaction: DmaCompaction::Allowed,
+                ..options
+            },
+        );
+        let after = unsafe { LockedFrameAllocator.usage() }.free().data();
+        let _ = writeln!(
+            detail,
+            "allowed={:?} free_before={before} free_after={after} own_live={}",
+            recovered.as_ref().err(),
+            pages
+                .0
+                .iter()
+                .filter(|page| page.strong_count() != 0)
+                .count()
+        );
+        let passed = unavailable
+            && pages.0[0].strong_count() == 0
+            && pages.0[1].strong_count() != 0
+            && recovered.as_ref().is_ok_and(|buffer| {
+                buffer.page_count() == PageFrameCount::ONE
+                    && buffer.paddr() + MMArch::PAGE_SIZE <= mask_end
+                    && buffer.as_slice().iter().all(|byte| *byte == 0)
+            });
+        drop(recovered);
+        drop(prefix);
+        drop(pages);
+        phase = "complete";
+        Ok(passed)
+    })();
+    let _ = writeln!(detail, "phase={phase} error={:?}", result.as_ref().err());
+    (result.unwrap_or(false), detail)
 }
 
 fn invalid_seeds() -> bool {
@@ -711,6 +893,7 @@ fn invalid_seeds() -> bool {
             end,
             order: ORDER,
             start_at: Some(seed),
+            deadline: None,
             limits: Limits::default(),
         });
         matches!(attempt.outcome, Err(Stop::Invalid))
@@ -752,6 +935,7 @@ fn cold_workspace_outside_target() -> Result<(bool, alloc::string::String), Syst
         end: base + COLD_PAGES * MMArch::PAGE_SIZE,
         order: COLD_ORDER,
         start_at: None,
+        deadline: None,
         limits: Limits {
             targets: 1,
             no_progress: 1,
@@ -1363,6 +1547,7 @@ fn dma_occupied_layout() -> ((bool, bool, bool, bool, bool), alloc::string::Stri
 pub(crate) fn report() -> alloc::string::String {
     let _serial = TEST_LOCK.lock();
     let mut deferred_detail = alloc::string::String::new();
+    let (capacity_recovery, capacity_detail) = dma_capacity_recovery();
     let mut checks = alloc::vec![
         (
             "real_fragmented_capture",
@@ -1397,6 +1582,9 @@ pub(crate) fn report() -> alloc::string::String {
             isolation_allocation_free_window().unwrap_or(false),
         ),
         ("atomic_rejected", atomic_rejected()),
+        ("deadline_rollback", deadline_rollback().unwrap_or(false)),
+        ("dma_recovery_reserve_guard", dma_recovery_reserve_guard()),
+        ("dma_capacity_recovery", capacity_recovery,),
         ("seed_boundaries_no_mutation", invalid_seeds()),
         (
             "repeated_capture",
@@ -1435,6 +1623,7 @@ pub(crate) fn report() -> alloc::string::String {
         let _ = writeln!(output, "{name}={}", if passed { "ok" } else { "fail" });
     }
     let _ = writeln!(output, "deferred_free_detail={deferred_detail}");
+    let _ = writeln!(output, "dma_capacity_recovery_detail=[{capacity_detail}]");
     let _ = writeln!(output, "cold_workspace_detail={cold_detail}");
     let _ = writeln!(output, "dma_recovery_detail={dma_detail}");
     let _ = writeln!(output, "dma_occupied_layout_detail={layout_detail}");

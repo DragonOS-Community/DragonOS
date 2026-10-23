@@ -22,6 +22,13 @@ use crate::{
     syscall::user_access::copy_to_user_protected,
 };
 
+// Keep unsupported architectures on their existing fallible heap path; this
+// consumer does not imply a vmalloc port for those platforms.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+type ExecPointers = crate::mm::kernel_buffer::KernelSlice<VirtAddr>;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+type ExecPointers = Vec<VirtAddr>;
+
 use super::{
     namespace::{nsproxy::exec_task_namespaces, user_namespace::map_id_up},
     pid::PidType,
@@ -839,6 +846,40 @@ pub fn load_binary_file_with_context(
     Ok(LoadBinaryResult::Loaded(result))
 }
 
+/// Per-exec CPU pointer storage prepared before acquiring exec_update. Its
+/// admission may reclaim/wait; stack population must only borrow this owner.
+/// Keep it outside ExecParam so final vmalloc release also occurs after the
+/// exec transaction guard, including every early error and shebang restart.
+pub(crate) struct ExecStackPointers {
+    args: ExecPointers,
+    envs: ExecPointers,
+}
+
+impl ExecStackPointers {
+    pub(crate) fn prepare(argc: usize, envc: usize) -> Result<Self, SystemError> {
+        Ok(Self {
+            args: Self::allocate(argc)?,
+            envs: Self::allocate(envc)?,
+        })
+    }
+
+    fn allocate(len: usize) -> Result<ExecPointers, SystemError> {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            File::recover_io(|| ExecPointers::try_filled(len, VirtAddr::new(0)))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let mut storage = Vec::new();
+            storage
+                .try_reserve_exact(len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            storage.resize(len, VirtAddr::new(0));
+            Ok(storage)
+        }
+    }
+}
+
 /// Program initialization information. These values are pushed onto the user
 /// stack.
 #[derive(Debug)]
@@ -871,18 +912,26 @@ impl ProcInitInfo {
     ///
     /// A tuple where the first element is the final user stack pointer and the
     /// second element is the starting address of the `argv` pointer array.
-    pub unsafe fn push_at(
+    pub(crate) unsafe fn push_at(
         &mut self,
         ustack: &mut UserStack,
+        pointers: &mut ExecStackPointers,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
+        // Reject a stale preparation before any stack write. A script restarts
+        // exec with its final argument list and prepares fresh storage there.
+        if pointers.args.len() != self.args.len() || pointers.envs.len() != self.envs.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let envps = &mut pointers.envs;
+        let argps = &mut pointers.args;
         // First, push the program name onto the stack.
         self.push_str(ustack, &self.proc_name)?;
 
         // Then push the environment variables onto the stack.
-        let envps = self.push_strings(ustack, &self.envs)?;
+        self.push_strings(ustack, &self.envs, envps)?;
 
         // Then push the arguments onto the stack.
-        let argps = self.push_strings(ustack, &self.args)?;
+        self.push_strings(ustack, &self.args, argps)?;
 
         // Push the random number and store its pointer in auxv.
         self.push_slice(ustack, &[self.rand_num])?;
@@ -906,10 +955,8 @@ impl ProcInitInfo {
         // - argc: 1 word
         let length_to_push =
             self.remaining_stack_words(envps.len(), argps.len()) * core::mem::size_of::<usize>();
-        self.push_slice(
-            ustack,
-            &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
-        )?;
+        let padding = (ustack.sp().data() - length_to_push) & 0xF;
+        self.push_slice(ustack, &[0u8; 15][..padding])?;
 
         // Push auxv.
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
@@ -919,11 +966,11 @@ impl ProcInitInfo {
 
         // Push the environment variable pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
-        self.push_slice(ustack, envps.as_slice())?;
+        self.push_slice(ustack, envps)?;
 
         // Push the argument pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
-        self.push_slice(ustack, argps.as_slice())?;
+        self.push_slice(ustack, argps)?;
         let argv_ptr = ustack.sp();
 
         // Push argc onto the stack.
@@ -935,22 +982,20 @@ impl ProcInitInfo {
     /// Copy strings in reverse onto the downward-growing stack, matching Linux's
     /// contiguous, ascending-address string layout. Process-title implementations
     /// rely on this layout when computing the writable argument string span.
-    /// Return pointers in the original logical order, not the copy order.
+    /// Record pointers in the original logical order, not the copy order.
     fn push_strings(
         &self,
         ustack: &mut UserStack,
         strings: &[CString],
-    ) -> Result<Vec<VirtAddr>, SystemError> {
-        let mut pointers = Vec::new();
-        pointers
-            .try_reserve_exact(strings.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        for string in strings.iter().rev() {
+        pointers: &mut [VirtAddr],
+    ) -> Result<(), SystemError> {
+        // Lengths were validated together before push_at made any stack write.
+        // No allocation or admission recovery runs under the exec-update lock.
+        for (index, string) in strings.iter().enumerate().rev() {
             self.push_str(ustack, string)?;
-            pointers.push(ustack.sp());
+            pointers[index] = ustack.sp();
         }
-        pointers.reverse();
-        Ok(pointers)
+        Ok(())
     }
 
     fn remaining_stack_words(&self, envc: usize, argc: usize) -> usize {

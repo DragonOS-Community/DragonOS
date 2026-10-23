@@ -70,7 +70,11 @@ TEST_F(KernelBufferSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
                                   "failure_fallback_admission=ok\n",
                                   "unsupported_virtual_heap=ok\n",
                                   "context_size_rejection=ok\n",
-                                  "fragmented_arena_buffer=ok\n"}) {
+                                  "fragmented_arena_buffer=ok\n",
+                                  "typed_values_accounting=ok\n",
+                                  "typed_alignment_limits=ok\n",
+                                  "typed_failure_rollback=ok\n",
+                                  "typed_fragmented_arena=ok\n"}) {
             EXPECT_NE(std::string::npos, complete.find(check)) << complete;
         }
     }

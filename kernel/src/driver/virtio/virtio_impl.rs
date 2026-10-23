@@ -126,14 +126,14 @@ impl HalImpl {
     }
 }
 
-/// Coherent ring allocation for virtio-fs queue construction, before the bridge
-/// starts. Runtime sharing delegates to HalImpl and never opts into compaction.
+/// Coherent ring allocation for audited virtio-fs/blk queue construction, before
+/// publishing the device. Runtime sharing delegates to HalImpl without recovery.
 /// Other drivers must audit their construction lock chain before using this HAL.
-pub struct VirtioFsQueueHal;
+pub struct VirtioQueueHal;
 
 // SAFETY: successful coherent allocations are exclusive, zeroed and page
 // aligned; failure returns no pointer. All other contracts delegate unchanged.
-unsafe impl Hal for VirtioFsQueueHal {
+unsafe impl Hal for VirtioQueueHal {
     fn dma_alloc(pages: usize, direction: BufferDirection) -> (usize, NonNull<u8>) {
         HalImpl::dma_alloc(pages, direction)
     }

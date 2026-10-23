@@ -45,6 +45,12 @@ Input input_for(const std::string& mode, const std::string& script = {}) {
             input.args.push_back("arg-" + std::to_string(i));
             input.env.push_back("ENV_" + std::to_string(i) + "=value");
         }
+    } else if (mode == "many-entries") {
+        // Each kernel pointer array exceeds two pages on 64-bit guests.
+        for (int i = 0; i < 1537; ++i) {
+            input.args.push_back("arg-" + std::to_string(i));
+            input.env.push_back("ENV_" + std::to_string(i) + "=value");
+        }
     } else if (mode == "empty-argv") {
         // Linux normalizes argv={NULL} to argc=1, argv[0]="".
         input.args = {""};
@@ -188,6 +194,7 @@ TEST(ExecStringLayout, EmptyStrings) { run_case("empty-strings"); }
 TEST(ExecStringLayout, EmptyEnvironment) { run_case("empty-env"); }
 TEST(ExecStringLayout, SingleArgument) { run_case("single"); }
 TEST(ExecStringLayout, CrossPageStringsAndManyEntries) { run_case("large"); }
+TEST(ExecStringLayout, ManyArgumentAndEnvironmentPointers) { run_case("many-entries"); }
 TEST(ExecStringLayout, EmptyArgumentVector) { run_case("empty-argv"); }
 
 TEST(ExecStringLayout, ShebangInterpreterArguments) {

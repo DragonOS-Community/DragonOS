@@ -10,7 +10,7 @@ use core::{
 use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
-use log::{error, info, warn};
+use log::{error, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
@@ -1036,15 +1036,12 @@ pub(crate) fn stop_this_cpu() -> ! {
     CurrentApic.disable_local_apic();
     smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 
+    // The halt loop must be instruction-only: this function may be entered
+    // from the panic path, including memory exhaustion with interrupts
+    // disabled. Every wakeup must not print or allocate memory again.
     loop {
-        native_halt();
-    }
-}
-
-#[inline(always)]
-fn native_halt() {
-    info!("Starting System Halt...");
-    unsafe {
-        asm!("hlt", options(nomem, nostack, preserves_flags));
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }

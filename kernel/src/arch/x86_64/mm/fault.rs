@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::{intrinsics::unlikely, panic};
+use core::{fmt::Write, intrinsics::unlikely, panic};
 use log::error;
 use system_error::SystemError;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
@@ -16,6 +16,7 @@ use crate::{
         signal::force_sig_fault_to_current,
         signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     },
+    libs::printk::BoundedLogRecord,
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         oom::{OomContext, OomOutcome},
@@ -31,6 +32,44 @@ pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
 impl X86_64MMArch {
+    /// Called only after releasing the address-space guard on terminal unmapped
+    /// user faults. Logging may allocate or enter the console path.
+    fn report_unmapped_fault(
+        regs: &TrapFrame,
+        error_code: X86PfErrorCode,
+        address: VirtAddr,
+        flags: FaultFlags,
+    ) {
+        let pcb = ProcessManager::current_pcb();
+        let mut name = BoundedLogRecord::new();
+        if let Some(basic) = pcb.try_basic() {
+            let source = basic.name();
+            let mut end = source.len().min(64);
+            while !source.is_char_boundary(end) {
+                end -= 1;
+            }
+            let _ = name.write_str(&source[..end]);
+        } else {
+            let _ = name.write_str("<unavailable>");
+        }
+        // The nonblocking basic-info guard is gone before formatting or logging.
+        // Registers are the faulting instruction's snapshot, not syscall args.
+        log::error!(
+            "pid: {} ({}) No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, flags: {:?}",
+            ProcessManager::current_pid().data(),
+            name.as_str(),
+            error_code,
+            regs.rip,
+            address.data(),
+            regs.rax,
+            regs.rdi,
+            regs.rsi,
+            regs.rdx,
+            regs.rsp,
+            flags
+        );
+    }
+
     /// A protection fault can block behind the address-space write lock while
     /// mprotect/mremap publishes a new leaf PTE. The hardware error code then
     /// describes the old PTE, so revalidate write/instruction permission from
@@ -399,13 +438,8 @@ impl X86_64MMArch {
                             return;
                         }
 
-                        log::error!(
-                            "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
-                            ProcessManager::current_pid().data(),
-                            error_code,
-                            address.data(),
-                            regs.rip,
-                        );
+                        drop(space_guard);
+                        Self::report_unmapped_fault(regs, error_code, address, flags);
 
                         send_segv_maperr();
                         return;
@@ -547,23 +581,8 @@ impl X86_64MMArch {
                             return;
                         }
 
-                        // 定位信息：进程名 + fault 时刻的通用寄存器/栈指针。
-                        // 这些值是 fault 指令的现场快照，辅助分析访存操作数；
-                        // 不能将其解释为原 syscall 号或入参（errcode 是硬件错误码）。
-                        log::error!(
-                            "pid: {} ({}) No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, flags: {:?}",
-                            ProcessManager::current_pid().data(),
-                            ProcessManager::current_pcb().basic().name(),
-                            error_code,
-                            regs.rip,
-                            address.data(),
-                            regs.rax,
-                            regs.rdi,
-                            regs.rsi,
-                            regs.rdx,
-                            regs.rsp,
-                            flags
-                        );
+                        drop(space_guard);
+                        Self::report_unmapped_fault(regs, error_code, address, flags);
 
                         send_segv_maperr();
                         return;

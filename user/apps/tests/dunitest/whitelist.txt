@@ -130,6 +130,7 @@ normal/tty_console_device
 normal/hvc_console_backpressure
 normal/signal_fpstate_sigreturn
 normal/general_protection_signal
+normal/unmapped_fault_signal
 normal/ioperm_semantics
 normal/seccomp
 normal/signal_sigqueueinfo

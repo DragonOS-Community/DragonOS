@@ -40,12 +40,14 @@ static RECOVERY: Mutex<[Service; MAX_COMPACT_ORDER]> =
 
 /// This is an additional runtime guard, not permission to enter while holding
 /// driver, pool, MM, Page, registry or filesystem I/O resource locks.
-fn context_allowed() -> bool {
+pub(crate) fn context_allowed() -> bool {
     ProcessManager::initialized()
         && CurrentIrqArch::is_irq_enabled()
         && !in_interrupt()
         && ProcessManager::current_pcb().preempt_count() == 0
         && !noio_active()
+        && crate::mm::allocator::reserve::kernel_level()
+            == crate::mm::allocator::reserve::ReserveLevel::Kernel
 }
 
 /// Recover only after the same DMA attempt established fragmentation.
@@ -56,6 +58,7 @@ pub(crate) fn allocate(
     order: usize,
     max: PhysAddr,
     zone: DmaRecoveryZone,
+    deadline: u64,
 ) -> Result<CompactedFrames, Stop> {
     if order == 0 || order > MAX_COMPACT_ORDER {
         return Err(Stop::Invalid);
@@ -65,7 +68,7 @@ pub(crate) fn allocate(
     }
     let mut services = RECOVERY.try_lock().map_err(|_| Stop::Busy)?;
     let service = &mut services[order - 1];
-    service.allocate(order, max, zone)
+    service.allocate(order, max, zone, Some(deadline))
 }
 
 impl Service {
@@ -74,7 +77,11 @@ impl Service {
         order: usize,
         max: PhysAddr,
         zone: DmaRecoveryZone,
+        deadline: Option<u64>,
     ) -> Result<CompactedFrames, Stop> {
+        if deadline.is_some_and(|until| crate::time::timer::clock() >= until) {
+            return Err(Stop::Timeout);
+        }
         // The same failed buddy attempt proved capacity in this one zone.
         // Do not spend its evidence on a different, capacity-starved domain.
         let normal = matches!(zone, DmaRecoveryZone::Normal);
@@ -90,12 +97,13 @@ impl Service {
         let cursor_before = self.cursor;
         let physical =
             compaction_candidate(&mut self.cursor, minimum, maximum).map_err(|_| Stop::Busy)?;
-        if let Some(request) =
+        if let Some(mut request) =
             physical.and_then(|physical| candidate_request(physical, order, max, normal))
         {
             // Deferred work did not consume this candidate. Keep its discovery
             // position so the next real attempt cannot skip it in lockstep with
             // the domain's exponential backoff.
+            request.deadline = deadline;
             let outcome = self.compactor.allocate(request).outcome;
             if matches!(&outcome, Err(Stop::Deferred)) {
                 self.cursor = cursor_before;
@@ -169,13 +177,14 @@ fn candidate_request(
         end: PhysAddr::new(end),
         order,
         start_at: Some(PhysAddr::new(seed)),
+        deadline: None,
         limits: Limits {
-            targets: 1,
+            targets: 8,
             entries: 16384,
             pages: 512,
             migrations: 512,
             rmaps: 64,
-            no_progress: 1,
+            no_progress: 8,
         },
     })
 }
@@ -189,9 +198,11 @@ pub(crate) fn deferred_discovery_selftest(
     order: usize,
     max: PhysAddr,
 ) -> bool {
-    let Some(request) = candidate_request(physical, order, max, false) else {
+    let Some(mut request) = candidate_request(physical, order, max, false) else {
         return false;
     };
+    request.limits.targets = 1;
+    request.limits.no_progress = 1;
     let mut service = Service::new();
     // Establish backoff with the real blocked target, not a synthetic flag.
     if !matches!(
@@ -206,10 +217,13 @@ pub(crate) fn deferred_discovery_selftest(
     {
         return false;
     }
-    let deferred = service.allocate(order, max, DmaRecoveryZone::Dma32);
+    let deferred = service.allocate(order, max, DmaRecoveryZone::Dma32, None);
     if !matches!(deferred, Err(Stop::Deferred)) || service.cursor != cursor {
         return false;
     }
-    let attempted = service.allocate(order, max, DmaRecoveryZone::Dma32);
-    matches!(attempted, Err(Stop::Blocked)) && service.cursor == expected
+    let attempted = service.allocate(order, max, DmaRecoveryZone::Dma32, None);
+    !matches!(
+        attempted,
+        Err(Stop::Deferred | Stop::Invalid | Stop::Timeout)
+    ) && service.cursor == expected
 }

@@ -42,7 +42,7 @@ pub enum DmaCachePolicy {
     Cached,
 }
 
-/// Permission for bounded synchronous compaction after a fragmented allocation.
+/// Permission for bounded reclaim and synchronous compaction after a failed allocation.
 /// The caller must be in a sleepable task, outside MM, page/cache, allocator and
 /// device locks. This permission never applies to streaming share/bounce paths.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -363,24 +363,67 @@ impl DmaAllocator {
             }
         }
         #[cfg(target_arch = "x86_64")]
-        if options.compaction == DmaCompaction::Allowed {
+        if options.compaction == DmaCompaction::Allowed
+            && super::compaction::recovery::context_allowed()
+        {
+            let mut failure = failure;
+            // This deadline is never renewed by reclamation or migration progress.
+            // No pool, recovery-service or allocator lock crosses the reclaim scan.
+            let deadline = crate::time::timer::next_n_us_timer_jiffies(50_000);
+            let max = PhysAddr::new(
+                options
+                    .dma_mask
+                    .and_then(|mask| usize::try_from(mask).ok())
+                    .unwrap_or(usize::MAX),
+            );
+            if let RawAllocationFailure::Frame(evidence) = &failure {
+                use super::allocator::buddy::AllocationFailure;
+                if matches!(
+                    evidence.reason,
+                    AllocationFailure::Capacity
+                        | AllocationFailure::Reserve
+                        | AllocationFailure::ZoneLimit
+                        | AllocationFailure::AddressLimit
+                ) {
+                    // Only complete pages reachable through this DMA mask may
+                    // satisfy the reclaim goal. The next typed attempt still
+                    // independently proves the requested zone's free capacity.
+                    let zones = super::allocator::watermark::ZonePressureSnapshot {
+                        dma32_deficit: 1,
+                        normal_deficit: usize::from(max.data() > u32::MAX as usize),
+                    };
+                    if crate::time::timer::clock() >= deadline {
+                        return Err(failure.errno());
+                    }
+                    let _ = super::page::PageReclaimer::try_shrink_global_below(
+                        page_count,
+                        4096,
+                        Some(zones),
+                        max,
+                    );
+                    if crate::time::timer::clock() >= deadline {
+                        return Err(failure.errno());
+                    }
+                    failure = match self.try_alloc_raw_attempt(page_count, options) {
+                        Ok(raw) => return Ok(raw),
+                        Err(failure) => failure,
+                    };
+                }
+            }
             if let RawAllocationFailure::Frame(evidence) = &failure {
                 if let Some(zone) = evidence.zone.filter(|_| {
                     evidence.reason == super::allocator::buddy::AllocationFailure::Fragmentation
                 }) {
                     let order = page_count.data().trailing_zeros() as usize;
-                    let max = PhysAddr::new(
-                        options
-                            .dma_mask
-                            .and_then(|mask| usize::try_from(mask).ok())
-                            .unwrap_or(usize::MAX),
-                    );
-                    if let Ok(run) = super::compaction::recovery::allocate(order, max, zone) {
+                    if let Ok(run) =
+                        super::compaction::recovery::allocate(order, max, zone, deadline)
+                    {
                         let (physical, count) = run.into_raw_parts();
                         return self.finish_raw(physical, count, options);
                     }
                 }
             }
+            return Err(failure.errno());
         }
         Err(failure.errno())
     }

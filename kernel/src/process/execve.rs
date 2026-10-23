@@ -12,7 +12,7 @@ use crate::{
         cred::{SUID_DUMPABLE, SUID_DUMP_DISABLE, SUID_DUMP_USER},
         exec::{
             load_binary_file_with_context, ExecContext, ExecInterpFlags, ExecParam, ExecParamFlags,
-            ExecStartInfo, LoadBinaryResult,
+            ExecStackPointers, ExecStartInfo, LoadBinaryResult,
         },
         pid::PidType,
         ptrace, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid,
@@ -156,6 +156,10 @@ fn do_execve_internal(
 ) -> Result<(), ExecFailure> {
     let exec_pcb = ProcessManager::current_pcb();
     crate::cgroup::memory::high::prepare_for_task(&exec_pcb)?;
+    // The final strings for this loader iteration are already known. Prepare
+    // recoverable CPU metadata before any exec-update transaction is held.
+    // Declaration order also releases exec_guard before this owner on errors.
+    let mut stack_pointers = ExecStackPointers::prepare(argv.len(), envp.len())?;
     // Prospective MM admission may reclaim or wait. Never do it while the
     // exec-update lock protects the irreversible exec transaction.
     let (address_space, exec_guard) = loop {
@@ -224,7 +228,11 @@ fn do_execve_internal(
                     .expect("No user stack found")
                     .clone_info_only()
             };
-            let stack_result = unsafe { param.init_info_mut().push_at(&mut ustack_message) };
+            let stack_result = unsafe {
+                param
+                    .init_info_mut()
+                    .push_at(&mut ustack_message, &mut stack_pointers)
+            };
             let (user_sp, argv_ptr) = match stack_result {
                 Ok(stack) => stack,
                 Err(err) => return finish_exec_error(&param, old_vm.as_ref(), err),
@@ -306,6 +314,8 @@ fn do_execve_internal(
             // The exec_update lock covers the whole commit phase; drop it before publishing
             // trace/ptrace events so tracer callbacks and exec state updates never wait on each other.
             drop(exec_guard);
+            // No exec/ptrace stop may retain task-local mapping teardown.
+            drop(stack_pointers);
             // Linux keeps bprm->filename as the original exec-visible name
             // across shebang/interpreter rewrites. Complete vfork first so
             // trace callbacks cannot delay the parent after exec committed.
@@ -350,6 +360,7 @@ fn do_execve_internal(
             drop(exec_guard);
             // Release the script's temporary deny before loading its interpreter.
             drop(param);
+            drop(stack_pointers);
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 

@@ -81,8 +81,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 if max.data() == usize::MAX
                     && self.has_normal_memory
                     && self.normal_free_pages >= count.data()
-                    && (MIN_ORDER + log2(count.data())..MAX_ORDER)
-                        .all(|order| self.free_area(BuddyZone::Normal, order as u8).is_null()) =>
+                    && (MIN_ORDER + log2(count.data())..MAX_ORDER).all(|order| {
+                        placement::classes(order).iter().all(|&class| {
+                            self.class_area(BuddyZone::Normal, order as u8, class)
+                                .is_null()
+                        })
+                    }) =>
             {
                 if self.admits(BuddyZone::Normal, count.data(), 0, level) {
                     Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Normal))
@@ -127,34 +131,36 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             }
             let mut found = 0usize;
             for order in MIN_ORDER..MAX_ORDER {
-                let mut address = self.free_area(zone, order as u8);
-                while !address.is_null() {
-                    if budget == 0 {
-                        return None;
-                    }
-                    budget -= 1;
-                    let list: PageList<A> = Self::read_page(address);
-                    for index in 0..list.entry_num {
+                for &class in placement::classes(order) {
+                    let mut address = self.class_area(zone, order as u8, class);
+                    while !address.is_null() {
                         if budget == 0 {
                             return None;
                         }
                         budget -= 1;
-                        let base: PhysAddr =
-                            unsafe { A::read(Self::entry_virt_addr(address, index)) };
-                        if let Some(last_offset) = max.data().checked_sub(base.data()) {
-                            // max is finite here, hence this saturating add
-                            // also safely handles a maximal suffix in tests.
-                            let bytes = last_offset.saturating_add(1).min(1usize << order);
-                            found += bytes / A::PAGE_SIZE;
-                            if found >= needed {
-                                return Some(match zone {
-                                    BuddyZone::Normal => DmaRecoveryZone::Normal,
-                                    BuddyZone::Dma32 => DmaRecoveryZone::Dma32,
-                                });
+                        let list: PageList<A> = Self::read_page(address);
+                        for index in 0..list.entry_num {
+                            if budget == 0 {
+                                return None;
+                            }
+                            budget -= 1;
+                            let base: PhysAddr =
+                                unsafe { A::read(Self::entry_virt_addr(address, index)) };
+                            if let Some(last_offset) = max.data().checked_sub(base.data()) {
+                                // max is finite here, hence this saturating add
+                                // also safely handles a maximal suffix in tests.
+                                let bytes = last_offset.saturating_add(1).min(1usize << order);
+                                found += bytes / A::PAGE_SIZE;
+                                if found >= needed {
+                                    return Some(match zone {
+                                        BuddyZone::Normal => DmaRecoveryZone::Normal,
+                                        BuddyZone::Dma32 => DmaRecoveryZone::Dma32,
+                                    });
+                                }
                             }
                         }
+                        address = list.next_page;
                     }
-                    address = list.next_page;
                 }
             }
         }

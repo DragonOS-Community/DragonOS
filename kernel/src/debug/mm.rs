@@ -18,6 +18,8 @@ enum MmReportCallback {
     AllocationStats,
     #[cfg(feature = "mm_selftest")]
     AllocationSelftest,
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    PlacementSelftest,
     #[cfg(feature = "mm_selftest")]
     PageAccessSelftest,
     #[cfg(feature = "mm_selftest")]
@@ -80,6 +82,8 @@ impl KernFSCallback for MmReportCallback {
             Self::AllocationSelftest => {
                 crate::mm::allocator::buddy::allocation_diagnostics_selftest_report()
             }
+            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+            Self::PlacementSelftest => crate::mm::allocator::buddy::placement_selftest_report(),
             #[cfg(feature = "mm_selftest")]
             Self::VmallocSelftest => crate::mm::vmalloc::selftest_report(),
             #[cfg(all(
@@ -198,6 +202,14 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         Some(4096),
         None,
         Some(&MmReportCallback::PageAccessSelftest),
+    )?;
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    mm.add_file(
+        "placement_selftest".to_string(),
+        InodeMode::S_IRUSR,
+        Some(4096),
+        None,
+        Some(&MmReportCallback::PlacementSelftest),
     )?;
     #[cfg(feature = "mm_selftest")]
     mm.add_file(

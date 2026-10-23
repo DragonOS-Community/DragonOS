@@ -312,11 +312,22 @@ pub enum FrameAllocationClass {
     User,
 }
 
+/// Placement groups similar physical lifetimes. It grants neither migration
+/// eligibility nor access to protected reserves; those contracts stay separate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FramePlacement {
+    #[default]
+    Unmovable,
+    Movable,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FrameAllocationRequest {
     pub count: PageFrameCount,
     pub max_phys_addr: PhysAddr,
     pub class: FrameAllocationClass,
+    pub placement: FramePlacement,
 }
 
 impl FrameAllocationRequest {
@@ -325,6 +336,7 @@ impl FrameAllocationRequest {
             count,
             max_phys_addr,
             class: FrameAllocationClass::Kernel,
+            placement: FramePlacement::Unmovable,
         }
     }
     pub fn user(count: PageFrameCount, max_phys_addr: PhysAddr) -> Self {
@@ -332,7 +344,12 @@ impl FrameAllocationRequest {
             count,
             max_phys_addr,
             class: FrameAllocationClass::User,
+            placement: FramePlacement::Unmovable,
         }
+    }
+    pub fn with_placement(mut self, placement: FramePlacement) -> Self {
+        self.placement = placement;
+        self
     }
     pub(crate) fn normalized(self) -> Option<Self> {
         if self.count.data() == 0 {

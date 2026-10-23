@@ -404,7 +404,8 @@ fn relocate(
     let mut prepared_pt = Vec::new();
     prepared_pt.try_reserve(mms.len()).map_err(|_| NoMemory)?;
     prepare_registries(was_lru)?;
-    let frame = unsafe { LockedFrameAllocator::allocate_one_no_reclaim() }.ok_or(NoMemory)?;
+    let frame =
+        unsafe { LockedFrameAllocator::allocate_migration_target_no_reclaim() }.ok_or(NoMemory)?;
     let mut raw = RawFrameExtent {
         next: frame,
         remaining: 1,

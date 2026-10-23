@@ -120,6 +120,14 @@ struct VirtIOBlkStats {
     size_large: AtomicUsize,
     budget_hits: AtomicUsize,
     queue_full_retries: AtomicUsize,
+    // Optional per-device completion-chain diagnostics. These are approximate
+    // independent counters, not a coherent snapshot or automatic stall verdict.
+    irq_entries: AtomicUsize,
+    tasklet_schedules: AtomicUsize,
+    tasklet_runs: AtomicUsize,
+    used_reclaims: AtomicUsize,
+    // Ring-space waiters only; accepted BIOs are tracked by inflight instead.
+    submission_waiters: AtomicUsize,
     latency_short: AtomicUsize,
     latency_medium: AtomicUsize,
     latency_long: AtomicUsize,
@@ -152,6 +160,11 @@ impl VirtIOBlkStats {
             size_large: AtomicUsize::new(0),
             budget_hits: AtomicUsize::new(0),
             queue_full_retries: AtomicUsize::new(0),
+            irq_entries: AtomicUsize::new(0),
+            tasklet_schedules: AtomicUsize::new(0),
+            tasklet_runs: AtomicUsize::new(0),
+            used_reclaims: AtomicUsize::new(0),
+            submission_waiters: AtomicUsize::new(0),
             latency_short: AtomicUsize::new(0),
             latency_medium: AtomicUsize::new(0),
             latency_long: AtomicUsize::new(0),
@@ -363,6 +376,9 @@ impl BioCompletionTasklet {
             Some(dev) => dev,
             None => return,
         };
+        if P6_2_STATS_ENABLED {
+            device.stats.tasklet_runs.fetch_add(1, Ordering::Relaxed);
+        }
         complete_used_requests(&device, &self.token_map);
     }
 }
@@ -463,6 +479,9 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
         let _ctx = contexts[usize::from(token)]
             .take()
             .expect("completed context stays registered");
+        if P6_2_STATS_ENABLED {
+            device.stats.used_reclaims.fetch_add(1, Ordering::Relaxed);
+        }
         drop(contexts);
         drop(inner);
         // Wake before callbacks: a callback may itself need another BIO to
@@ -498,10 +517,13 @@ pub fn virtio_blk_stats_report() -> String {
             continue;
         };
         let stats = &device.stats;
-        let timing = stats.timing.lock_irqsave();
+        let (weighted_cycles, observed_cycles) = {
+            let timing = stats.timing.lock_irqsave();
+            (timing.weighted_cycles, timing.observed_cycles)
+        };
         let _ = writeln!(
             report,
-            "device={} generation={} enabled={} submits={} completes={} reads={} writes={} flushes={} bytes={} errors={} short={} inflight={} peak_inflight={} depth_1={} depth_2_4={} depth_5_16={} depth_17_plus={} size_4k={} size_16k={} size_32k={} size_64k={} size_large={} budget_hits={} latency_le_10k={} latency_le_100k={} latency_le_1m={} latency_gt_1m={} weighted_inflight_cycles={} observed_cycles={} queue_full_retries={}",
+            "device={} generation={} enabled={} submits={} completes={} reads={} writes={} flushes={} bytes={} errors={} short={} inflight={} peak_inflight={} depth_1={} depth_2_4={} depth_5_16={} depth_17_plus={} size_4k={} size_16k={} size_32k={} size_64k={} size_large={} budget_hits={} latency_le_10k={} latency_le_100k={} latency_le_1m={} latency_gt_1m={} weighted_inflight_cycles={} observed_cycles={} queue_full_retries={} irq_entries={} tasklet_schedules={} tasklet_runs={} used_reclaims={} submission_waiters={}",
             device.blkdev_meta.devname.name(),
             stats.generation,
             P6_2_STATS_ENABLED as usize,
@@ -529,9 +551,14 @@ pub fn virtio_blk_stats_report() -> String {
             stats.latency_medium.load(Ordering::Relaxed),
             stats.latency_long.load(Ordering::Relaxed),
             stats.latency_very_long.load(Ordering::Relaxed),
-            timing.weighted_cycles,
-            timing.observed_cycles,
+            weighted_cycles,
+            observed_cycles,
             stats.queue_full_retries.load(Ordering::Relaxed),
+            stats.irq_entries.load(Ordering::Relaxed),
+            stats.tasklet_schedules.load(Ordering::Relaxed),
+            stats.tasklet_runs.load(Ordering::Relaxed),
+            stats.used_reclaims.load(Ordering::Relaxed),
+            stats.submission_waiters.load(Ordering::Relaxed),
         );
     }
     report
@@ -1232,6 +1259,9 @@ impl VirtIODevice for VirtIOBlkDevice {
             None => return Ok(crate::exception::irqdesc::IrqReturn::NotHandled),
         };
 
+        if P6_2_STATS_ENABLED {
+            self.stats.irq_entries.fetch_add(1, Ordering::Relaxed);
+        }
         let acked = device_inner.ack_interrupt();
         if !acked && !inner.irq_is_msix {
             log::debug!(
@@ -1242,6 +1272,9 @@ impl VirtIODevice for VirtIOBlkDevice {
         }
         let tasklet = inner.completion_tasklet.clone();
         if let Some(tasklet) = tasklet {
+            if P6_2_STATS_ENABLED {
+                self.stats.tasklet_schedules.fetch_add(1, Ordering::Relaxed);
+            }
             tasklet.schedule();
         }
         Ok(crate::exception::irqdesc::IrqReturn::Handled)
@@ -1718,14 +1751,27 @@ fn submit_bio_wait(
                         .queue_full_retries
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                device.submission_wait.wait_uninterruptible(|| {
+                if P6_2_STATS_ENABLED {
+                    device
+                        .stats
+                        .submission_waiters
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let waited = device.submission_wait.wait_uninterruptible(|| {
                     let inner = device.inner();
                     let ready = inner.state != VirtIOBlkState::Online
                         || inner.device_inner.as_ref().is_none_or(|device| {
                             device.can_submit(bio.bio_type() == BioType::Flush)
                         });
                     ready.then_some(())
-                })?;
+                });
+                if P6_2_STATS_ENABLED {
+                    device
+                        .stats
+                        .submission_waiters
+                        .fetch_sub(1, Ordering::Relaxed);
+                }
+                waited?;
             }
             result => return result,
         }

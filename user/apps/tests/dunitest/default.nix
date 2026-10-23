@@ -1,25 +1,13 @@
 {
   lib,
   pkgs,
-  fenix,
-  system,
+  rustPlatform,
+  # another_ext4 依赖 nightly 特性，与内核使用同一套工具链
+  nightlyRustPlatform,
   installDir,
 }:
 
 let
-  fenixPkgs = fenix.packages.${system};
-  toolchain = fenixPkgs.combine (
-    with fenixPkgs;
-    [
-      minimal.rustc
-      minimal.cargo
-    ]
-  );
-  rustPlatform = pkgs.makeRustPlatform {
-    cargo = toolchain;
-    rustc = toolchain;
-  };
-
   gtest = pkgs.fetchgit {
     url = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest";
     rev = "v1.17.0";
@@ -48,6 +36,28 @@ let
     '';
   };
 
+  # Host helpers that seed the ext4 fixtures. The Makefile would otherwise
+  # `cargo run` them from the kernel tree, which the sandbox cannot do.
+  ext4HostTools = nightlyRustPlatform.buildRustPackage {
+    pname = "dunitest-ext4-host-tools";
+    version = "0.1.0";
+
+    # ext4_test depends on its parent crate through `path = ".."`
+    src = ../../../../kernel/crates/another_ext4;
+    cargoRoot = "ext4_test";
+    buildAndTestSubdir = "ext4_test";
+    cargoLock = {
+      lockFile = ../../../../kernel/crates/another_ext4/ext4_test/Cargo.lock;
+    };
+    cargoBuildFlags = [
+      "--bin"
+      "shared_xattr"
+      "--bin"
+      "orphan_recovery_fixture"
+    ];
+    doCheck = false;
+  };
+
   # 2. Build the C++ test suites
   # This derivation handles compiling the gtest-based test cases.
   testSuites = pkgs.stdenv.mkDerivation {
@@ -69,6 +79,7 @@ let
     nativeBuildInputs = [
       pkgs.autoPatchelfHook
       pkgs.e2fsprogs
+      pkgs.dosfstools
     ];
 
     buildInputs = [ pkgs.stdenv.cc.cc.lib ];
@@ -78,6 +89,7 @@ let
 
       make -j"''${NIX_BUILD_CORES:-1}" build-suites \
         GTEST_ROOT=${gtest} \
+        EXT4_HOST_TOOL_BIN_DIR=${ext4HostTools}/bin \
         CXX="$CXX" \
         CXXFLAGS="-Wall -O2 -std=c++17 -pthread"
 

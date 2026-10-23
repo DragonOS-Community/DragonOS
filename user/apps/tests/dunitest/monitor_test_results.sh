@@ -12,6 +12,17 @@ if [ -z "${VMSTATE_DIR:-}" ]; then
     exit 1
 fi
 
+# QEMU 可能以 root（tools/run-qemu.sh）或当前用户（nix）身份运行，仅当进程不属于当前用户时才使用 sudo
+qemu_kill() {
+    for _pid in "$@"; do :; done
+    [ -d "/proc/$_pid" ] || return 1
+    if [ "$(stat -c %u "/proc/$_pid")" = "$(id -u)" ]; then
+        kill "$@"
+    else
+        sudo kill "$@"
+    fi
+}
+
 SERIAL_FILE="serial_opt.txt"
 BOOT_TIMEOUT=300
 TEST_START_TIMEOUT=600
@@ -30,13 +41,13 @@ cleanup() {
     local qemu_pid
     qemu_pid="$(get_qemu_pid)"
 
-    if [ -n "$qemu_pid" ] && sudo kill -0 "$qemu_pid" 2>/dev/null; then
+    if [ -n "$qemu_pid" ] && qemu_kill -0 "$qemu_pid" 2>/dev/null; then
         echo "[dunit-monitor] 终止QEMU进程 (PID: $qemu_pid)"
-        sudo kill -TERM "$qemu_pid" 2>/dev/null || true
+        qemu_kill -TERM "$qemu_pid" 2>/dev/null || true
         sleep 3
-        if sudo kill -0 "$qemu_pid" 2>/dev/null; then
+        if qemu_kill -0 "$qemu_pid" 2>/dev/null; then
             echo "[dunit-monitor] 强制终止QEMU进程 (PID: $qemu_pid)"
-            sudo kill -9 "$qemu_pid" 2>/dev/null || true
+            qemu_kill -9 "$qemu_pid" 2>/dev/null || true
         fi
     fi
 
@@ -48,7 +59,7 @@ cleanup() {
 check_qemu_alive() {
     local qemu_pid
     qemu_pid="$(get_qemu_pid)"
-    [ -n "$qemu_pid" ] && sudo kill -0 "$qemu_pid" 2>/dev/null
+    [ -n "$qemu_pid" ] && qemu_kill -0 "$qemu_pid" 2>/dev/null
 }
 
 echo "[dunit-monitor] 等待QEMU进程启动..."
@@ -66,7 +77,7 @@ if [ -z "$qemu_pid" ]; then
     exit 1
 fi
 
-if ! sudo kill -0 "$qemu_pid" 2>/dev/null; then
+if ! qemu_kill -0 "$qemu_pid" 2>/dev/null; then
     echo "[dunit-monitor] 错误: QEMU进程不存在 (PID: $qemu_pid)"
     exit 1
 fi

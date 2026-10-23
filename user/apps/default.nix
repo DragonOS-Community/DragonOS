@@ -4,8 +4,8 @@
   nixpkgs,
   system,
   target,
-  fenix,
   testOpt,
+  nightlyRustPlatform,
 }:
 
 # Return a list of app derivations to be copied into the rootfs.
@@ -50,7 +50,6 @@ let
 
   gvisor-syscall-tests = (
     pkgs.callPackage ./tests/syscall/gvisor {
-      inherit fenix system;
       installDir = testOpt.syscall.testDir;
       version = testOpt.syscall.version;
     }
@@ -58,18 +57,18 @@ let
 
   dunitest = (
     pkgs.callPackage ./tests/dunitest {
-      inherit fenix system;
+      inherit nightlyRustPlatform;
       installDir = testOpt.dunitest.testDir;
     }
   );
 in
 [
-	  (static.busybox.override {
-	    extraConfig = ''
-	      CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
-	      CONFIG_FEATURE_EDITING_MAX_LEN 8192
-	    '';
-	  })
+  (static.busybox.override {
+    extraConfig = ''
+      CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
+      CONFIG_FEATURE_EDITING_MAX_LEN 8192
+    '';
+  })
   static.curl
   static.dropbear
   cross.glibc

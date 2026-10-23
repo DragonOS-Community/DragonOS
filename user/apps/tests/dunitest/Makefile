@@ -23,6 +23,15 @@ EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
 EXT4_ORPHAN_FIXTURE = $(BUILD_DIR)/fixtures/ext4_orphan_recovery.img
 EXT4_SHARED_XATTR_FIXTURE = $(BUILD_DIR)/fixtures/ext4_shared_xattr.img
 EXT4_HOST_TEST_DIR = ../../../../kernel/crates/another_ext4/ext4_test
+# 生成 ext4 fixture 的宿主辅助程序。默认通过 cargo 现场构建运行；
+# 无法在构建期运行 cargo 的环境（如 nix 沙箱）可通过 EXT4_HOST_TOOL_BIN_DIR 指定预先构建好的程序目录。
+ifdef EXT4_HOST_TOOL_BIN_DIR
+ext4_host_tool = $(EXT4_HOST_TOOL_BIN_DIR)/$(1)
+ext4_host_tool_deps =
+else
+ext4_host_tool = cargo $(TOOLCHAIN) run --quiet --release --manifest-path $(EXT4_HOST_TEST_DIR)/Cargo.toml --bin $(1) --
+ext4_host_tool_deps = $(EXT4_HOST_TEST_DIR)/src/bin/$(1).rs $(EXT4_HOST_TEST_DIR)/src/block_file.rs $(EXT4_HOST_TEST_DIR)/Cargo.toml $(EXT4_HOST_TEST_DIR)/Cargo.lock $(EXT4_HOST_TEST_DIR)/../Cargo.toml $(wildcard $(EXT4_HOST_TEST_DIR)/../src/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*/*.rs)
+endif
 EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
 FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
@@ -101,15 +110,17 @@ $(FAT32_STAT_FIXTURE):
 	@truncate -s 40M "$@"
 	@mkfs.fat -F 32 -S 512 -s 1 "$@"
 
+# another_ext4 supports 4 KiB blocks; upstream mke2fs defaults give small
+# filesystems 1 KiB blocks unless the host mke2fs.conf (e.g. Debian) overrides it.
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
 	@truncate -s 8M "$@"
-	@output=$$(mke2fs -q -t ext4 -F -O ^orphan_file "$@" 2>&1) || { \
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -O ^orphan_file "$@" 2>&1) || { \
 		case "$$output" in \
 			*"Invalid filesystem option set: ^orphan_file"*) \
 				rm -f "$@"; \
 				truncate -s 8M "$@"; \
-				mke2fs -q -t ext4 -F "$@" ;; \
+				mke2fs -q -t ext4 -F -b 4096 "$@" ;; \
 			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
 		esac; \
 	}
@@ -117,14 +128,14 @@ $(EXT4_FIXTURE):
 # e2fsprogs independently encodes the shared xattr image; the host helper only
 # establishes its three references and verifies checksums and peer isolation.
 .DELETE_ON_ERROR: $(EXT4_SHARED_XATTR_FIXTURE)
-$(EXT4_SHARED_XATTR_FIXTURE): $(EXT4_HOST_TEST_DIR)/src/bin/shared_xattr.rs $(EXT4_HOST_TEST_DIR)/src/block_file.rs $(EXT4_HOST_TEST_DIR)/Cargo.toml $(EXT4_HOST_TEST_DIR)/Cargo.lock $(EXT4_HOST_TEST_DIR)/../Cargo.toml $(wildcard $(EXT4_HOST_TEST_DIR)/../src/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*/*.rs)
+$(EXT4_SHARED_XATTR_FIXTURE): $(call ext4_host_tool_deps,shared_xattr)
 	@mkdir -p "$(dir $@)"
-	@cargo $(TOOLCHAIN) run --quiet --release --manifest-path $(EXT4_HOST_TEST_DIR)/Cargo.toml --bin shared_xattr -- --seed "$(abspath $@)"
+	@$(call ext4_host_tool,shared_xattr) --seed "$(abspath $@)"
 
 # Use production journaled unlink, retaining the orphan lifetime across a crash.
 # another_ext4 supports 4 KiB blocks; do not inherit mke2fs host defaults.
 .DELETE_ON_ERROR: $(EXT4_ORPHAN_FIXTURE)
-$(EXT4_ORPHAN_FIXTURE): $(EXT4_HOST_TEST_DIR)/src/bin/orphan_recovery_fixture.rs $(EXT4_HOST_TEST_DIR)/src/block_file.rs $(EXT4_HOST_TEST_DIR)/Cargo.toml $(EXT4_HOST_TEST_DIR)/Cargo.lock $(EXT4_HOST_TEST_DIR)/../Cargo.toml $(wildcard $(EXT4_HOST_TEST_DIR)/../src/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*/*.rs)
+$(EXT4_ORPHAN_FIXTURE): $(call ext4_host_tool_deps,orphan_recovery_fixture)
 	@mkdir -p "$(dir $@)"
 	@truncate -s 8M "$@"
 	@output=$$(mke2fs -q -t ext4 -F -b 4096 -I 256 -O ^orphan_file "$@" 2>&1) || { \
@@ -134,7 +145,7 @@ $(EXT4_ORPHAN_FIXTURE): $(EXT4_HOST_TEST_DIR)/src/bin/orphan_recovery_fixture.rs
 			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
 		esac; \
 	}
-	@cargo $(TOOLCHAIN) run --quiet --release --manifest-path $(EXT4_HOST_TEST_DIR)/Cargo.toml --bin orphan_recovery_fixture -- --in-place "$@"
+	@$(call ext4_host_tool,orphan_recovery_fixture) --in-place "$@"
 
 # Small block groups force a modest payload into legal BLOCK_UNINIT groups.
 # Keep lazy bitmap initialization enabled; never pre-mount this source image.

@@ -32,42 +32,11 @@ description: 专用于按照 docs/introduction/develop_nix.md 的流程，通过
    - `nix run .#start-x86_64`
    - 以及一键命令 `nix run .#yolo-x86_64`
 2. 先看 `git status --short`，记住当前工作树是脏还是干净。
-3. 如果写磁盘镜像会触发 `sudo`，而用户已经给了密码，可以先预热 sudo；如果没有给密码，要先向用户说明会卡在提权步骤。
-4. 注意 `yolo` 的 `rootfs`/QEMU 阶段都可能在较晚时再次调用 `sudo`。单次 `sudo -v` 可能在长时间依赖下载或 rootfs 构建后过期，不要假设一次预热就够。
+3. 确认当前用户可以访问 `/dev/kvm`（`[ -w /dev/kvm ]`）。整个流程不需要 `sudo`；`/dev/kvm` 不可写时脚本会提示并回退到 TCG（很慢），应先告诉用户加入 `kvm` 组。
 
 ## 推荐执行顺序
 
-### 1) 预热 sudo，并优先使用 keepalive
-
-如果用户已经提供密码，优先在和 `yolo` 相同的 PTY 会话里维持 sudo 时间戳：
-
-```bash
-sudo -v
-while true; do sudo -n true; sleep 60; done 2>/dev/null &
-keeper=$!
-trap 'kill $keeper' EXIT
-nix run .#yolo-x86_64 -- -nographic
-```
-
-如果只是单独预热：
-
-```bash
-printf '%s\n' "$PASSWORD" | sudo -S -v
-```
-
-也不要把它当成足够稳妥的方案，因为 `rootfs` 写盘和 `start-x86_64` 往往会在较晚阶段再次触发 `sudo`。
-
-如果没有密码，不要假设；直接告诉用户这一步会阻塞在提权提示。
-
-如果在沙箱里看到类似：
-
-```text
-sudo: The "no new privileges" flag is set
-```
-
-这说明是宿主机/沙箱权限边界，不是 DragonOS 回归；应改为在沙箱外执行同一命令。
-
-### 2) 用 PTY 启动 yolo
+### 1) 用 PTY 启动 yolo
 
 必须用带 TTY 的终端会话运行：
 
@@ -78,14 +47,13 @@ nix run .#yolo-x86_64 -- -nographic
 要点：
 
 - 必须使用交互式 PTY，否则后续无法和 QEMU 串口交互。
-- 如果用户提供了密码且预期会构建较久，优先使用“同 PTY 的 sudo keepalive + yolo”这一条组合命令，而不是裸跑 `nix run .#yolo-x86_64 -- -nographic`。
 - 这条命令会顺序执行：
   - `make kernel`
-  - `nix run .#rootfs-x86_64`
-  - `nix run .#start-x86_64 -- -nographic`
+  - 准备 rootfs 磁盘镜像（userland 无变化时输出 `Disk image unchanged, skip`）
+  - 启动 QEMU（参数透传给 `dragonos-run`）
 - 允许出现 host CPU / KVM feature warning，只要系统继续启动，不把这些 warning 当成失败。
 
-### 3) 如果用户要求实时输出，持续轮询并回贴原始输出块
+### 2) 如果用户要求实时输出，持续轮询并回贴原始输出块
 
 如果用户明确要求“边跑边轮询”“实时输出”“一边跑一边给我看”，不要只在最后总结；应在整个过程中轮询 PTY 并回贴最新输出。
 
@@ -98,12 +66,12 @@ nix run .#yolo-x86_64 -- -nographic
 - 如果是大段宿主机构建日志，抓关键窗口即可；如果是 guest 串口异常，优先贴第一处异常附近的原始日志。
 - 如果用户没有要求实时输出，仍然要在关键阶段给出简洁进度，但不必高频贴日志。
 
-### 4) 观察启动阶段的关键成功信号
+### 3) 观察启动阶段的关键成功信号
 
 重点盯以下日志：
 
 - `Kernel Build Done.`
-- `Build complete!`
+- `Disk image unchanged, skip` 或 `Build complete!`
 - `Step 3: Starting DragonOS...`
 - `DragonOS release ...`
 - `ProcFS mounted at /proc`
@@ -115,7 +83,7 @@ nix run .#yolo-x86_64 -- -nographic
 
 如果看到 panic、`init` 启动失败、mount 失败、卡死在早期阶段，要把原始日志摘出来。
 
-### 5) 激活 guest 控制台
+### 4) 激活 guest 控制台
 
 有些镜像会提示：
 
@@ -131,7 +99,7 @@ Please press Enter to activate this console.
 
 直到出现 shell prompt。
 
-### 6) guest 内最小烟雾检查
+### 5) guest 内最小烟雾检查
 
 默认执行下面几条，逐条记录结果：
 
@@ -156,7 +124,7 @@ cat /sys/fs/cgroup/testcg/cgroup.procs
 - 如果写文件时报 `Function not implemented`、`Permission denied`、`No such file or directory`，要原样记录。
 - 如果 shell 卡住，先看是不是命令本身阻塞，不要立即判成内核 panic。
 
-### 7) 退出 QEMU
+### 6) 退出 QEMU
 
 在 nographic 模式下，退出序列是：
 
@@ -209,8 +177,7 @@ Ctrl+A 然后 x
 
 ## 失败处理
 
-- 如果失败发生在 `sudo` 提权：明确说明是宿主机权限问题，不是内核回归。
-- 如果失败是 `sudo: timed out reading password`，且位置在 rootfs 写盘或 QEMU 启动之前/之中，优先判定为“长流程中的 sudo 交互超时”；应改为“同 PTY keepalive + 重跑”，不要误判成 rootfs 或内核 bug。
+- 如果出现 `/dev/kvm is not writable` 或 vsock 相关 WARN：属于宿主机权限/模块配置问题，不是内核回归。
 - 如果失败发生在 `make kernel`：返回编译错误摘要和首个真正报错点。
 - 如果失败发生在 `rootfs` / 磁盘镜像：返回宿主机构建错误，不要误判为 guest 启动失败。
 - 如果失败发生在 QEMU 内：优先保留串口日志里的第一处异常。

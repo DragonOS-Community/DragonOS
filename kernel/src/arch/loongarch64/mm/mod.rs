@@ -247,7 +247,20 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> Ent
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
 
+impl LockedFrameAllocator {
+    pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
+        crate::mm::allocator::watermark::ZonePressureSnapshot::default()
+    }
+}
+
 impl FrameAllocator for LockedFrameAllocator {
+    unsafe fn allocate_request(
+        &mut self,
+        _request: crate::mm::allocator::page_frame::FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        // This architecture has no global physical allocator implementation yet.
+        todo!("LockedFrameAllocator::allocate_request")
+    }
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         todo!("LockedFrameAllocator::allocate")
     }

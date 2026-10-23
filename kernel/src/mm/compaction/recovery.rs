@@ -101,9 +101,13 @@ impl Service {
                 self.cursor = cursor_before;
             }
             let run = outcome?;
-            if matches!(zone, DmaRecoveryZone::Dma32Fallback)
-                && !LockedFrameAllocator::with_buddy(|buddy| buddy.dma32_fallback_allowed(0))
-                    .unwrap_or(false)
+            let level = crate::mm::allocator::reserve::kernel_level();
+            if !LockedFrameAllocator::with_buddy(|buddy| {
+                buddy.held_handoff_allowed(run.start(), level)
+                    && (!matches!(zone, DmaRecoveryZone::Dma32Fallback)
+                        || buddy.dma32_fallback_allowed(0))
+            })
+            .unwrap_or(false)
             {
                 drop(run);
                 return Err(Stop::Busy);

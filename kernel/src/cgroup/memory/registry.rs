@@ -170,6 +170,29 @@ pub(crate) fn global_snapshot(root: &Arc<MemoryAccount>) -> GlobalSnapshot {
     lease
 }
 
+/// A fault must not wait behind another global scan which may itself need
+/// writeback or this task's MM. Storage is still prepared at registration.
+pub(crate) fn try_global_snapshot(root: &Arc<MemoryAccount>) -> Option<GlobalSnapshot> {
+    let scan = ResourceMutexGuard::try_lock(&GLOBAL_SCAN)?;
+    let snapshot = {
+        let mut registry = ResourceMutexGuard::try_lock(&ACCOUNTS)?;
+        let mut snapshot = registry.idle.take()?;
+        assert!(snapshot.is_empty() && snapshot.capacity() >= registry.accounts.len());
+        for account in &registry.accounts {
+            if let Some(account) = account.upgrade() {
+                snapshot.push_account(account);
+            }
+        }
+        snapshot
+    };
+    let mut lease = GlobalSnapshot {
+        snapshot: Some(snapshot),
+        _scan: scan,
+    };
+    lease.get_mut().populate(root);
+    Some(lease)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -460,6 +460,7 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     compiler_fence(Ordering::SeqCst);
     let now = prev + add_jiffies;
     crate::mm::page::reclaim_wait::tick(now);
+    crate::mm::fault_recovery::tick();
     return now;
 }
 

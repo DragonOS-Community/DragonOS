@@ -203,10 +203,10 @@ impl X86_64MMArch {
             }
         }
         panic!(
-            "do_kern_addr_fault has not yet been implemented, 
+            "do_kern_addr_fault has not yet been implemented,
         fault address: {:#x},
         rip: {:#x},
-        error_code: {:#b}, 
+        error_code: {:#b},
         pid: {}\n",
             address.data(),
             regs.rip,
@@ -368,7 +368,7 @@ impl X86_64MMArch {
         );
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
 
-        let mut tried_direct_reclaim = false;
+        let mut global_recovery = crate::mm::fault_recovery::GlobalFaultRecoveryState::new();
         let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
 
         'fault_retry: loop {
@@ -723,18 +723,15 @@ impl X86_64MMArch {
                     // Skip direct reclaim for fault-injection OOM: the injection
                     // consumes a fail count on the first fault, so reclaiming
                     // then retrying would bypass the killer entirely.
-                    if !tried_direct_reclaim
-                        && !fault.contains(VmFaultReason::VM_FAULT_OOM_INJECTED)
-                    {
-                        tried_direct_reclaim = true;
-                        drop(space_guard);
-                        crate::mm::page::PageReclaimer::shrink_list(
-                            <crate::mm::allocator::page_frame::PageFrameCount>::new(64),
-                        );
-                        continue;
-                    }
-
                     drop(space_guard);
+                    if !fault.contains(VmFaultReason::VM_FAULT_OOM_INJECTED) {
+                        match global_recovery.retry() {
+                            Ok(true) => continue 'fault_retry,
+                            Ok(false) => {}
+                            Err(SystemError::EINTR | SystemError::ERESTARTSYS) => return,
+                            Err(_) => {}
+                        }
+                    }
                     crate::mm::oom::report::report(format_args!(
                         "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}\n",
                         ProcessManager::current_pid(),

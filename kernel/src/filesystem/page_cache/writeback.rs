@@ -213,6 +213,7 @@ impl Drop for AsyncWritebackPermit {
             next
         };
         ASYNC_WRITEBACK_COMPLETIONS.fetch_add(1, Ordering::AcqRel);
+        crate::mm::memory_notify::request_oom_progress();
         ASYNC_WRITEBACK_WAIT.wake_all();
         crate::mm::page::reclaim_wait::request_writeback_progress();
         if let Some(retry) = retry {
@@ -4909,72 +4910,74 @@ impl PageCacheManager {
             else {
                 return;
             };
-            let _runner = runner;
-            let _permit = permit;
-            let _domain_io: Option<super::PageCacheDomainIoPermit> = domain_io;
-            // Drain the caller's bounded scan range in file-offset order.
-            // Keeping one runner per cache prevents overlapping reclaimer
-            // workers, while advancing after each submitted batch avoids the
-            // former one-batch-per-5-second throughput ceiling. A page dirtied
-            // again behind the cursor is intentionally left for a later scan.
-            let mut cursor = start_index;
-            while cursor <= end_index {
-                let claim = match manager.try_claim_next_batch_with_admission(
-                    &cache,
-                    &inode,
-                    cursor,
-                    end_index,
-                    _domain_io.as_ref(),
-                ) {
-                    Ok(claim) => claim,
-                    Err(_) => break,
-                };
-                let batch = match claim {
-                    WritebackClaimOutcome::Claimed(batch) => batch,
-                    WritebackClaimOutcome::NoBatch => break,
-                    WritebackClaimOutcome::Deferred(progress) => {
-                        // Reclaim must not wait, but it must not discard the
-                        // producer edge either.  Re-enter this try-only path
-                        // after progress so WRITE-only users are not reliant
-                        // on an unrelated future reclaim round.
-                        Self::schedule_reclaimer_deferred_retry(
-                            progress,
-                            manager.clone(),
-                            start_index,
-                            end_index,
-                        );
+            crate::mm::allocator::reserve::with_reclaim_reserve(|| {
+                let _runner = runner;
+                let _permit = permit;
+                let _domain_io: Option<super::PageCacheDomainIoPermit> = domain_io;
+                // Drain the caller's bounded scan range in file-offset order.
+                // Keeping one runner per cache prevents overlapping reclaimer
+                // workers, while advancing after each submitted batch avoids the
+                // former one-batch-per-5-second throughput ceiling. A page dirtied
+                // again behind the cursor is intentionally left for a later scan.
+                let mut cursor = start_index;
+                while cursor <= end_index {
+                    let claim = match manager.try_claim_next_batch_with_admission(
+                        &cache,
+                        &inode,
+                        cursor,
+                        end_index,
+                        _domain_io.as_ref(),
+                    ) {
+                        Ok(claim) => claim,
+                        Err(_) => break,
+                    };
+                    let batch = match claim {
+                        WritebackClaimOutcome::Claimed(batch) => batch,
+                        WritebackClaimOutcome::NoBatch => break,
+                        WritebackClaimOutcome::Deferred(progress) => {
+                            // Reclaim must not wait, but it must not discard the
+                            // producer edge either.  Re-enter this try-only path
+                            // after progress so WRITE-only users are not reliant
+                            // on an unrelated future reclaim round.
+                            Self::schedule_reclaimer_deferred_retry(
+                                progress,
+                                manager.clone(),
+                                start_index,
+                                end_index,
+                            );
+                            break;
+                        }
+                        // The failure was already published and the claimed
+                        // pages returned to Dirty; reclaim has no additional
+                        // completion or errseq work to perform.
+                        WritebackClaimOutcome::FailedRecorded(_) => break,
+                    };
+                    let Some(last_index) = batch.entries.last().map(|(index, _, _)| *index) else {
                         break;
+                    };
+                    match Self::submit_writeback_batch(batch) {
+                        Ok(
+                            WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted,
+                        ) if last_index != usize::MAX => {
+                            cursor = last_index + 1;
+                        }
+                        Ok(
+                            WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted,
+                        ) => break,
+                        Ok(WritebackSubmitOutcome::Failed(_)) => break,
+                        Ok(WritebackSubmitOutcome::Deferred(progress)) => {
+                            Self::schedule_reclaimer_deferred_retry(
+                                progress,
+                                manager.clone(),
+                                start_index,
+                                end_index,
+                            );
+                            break;
+                        }
+                        Err(_) => break,
                     }
-                    // The failure was already published and the claimed
-                    // pages returned to Dirty; reclaim has no additional
-                    // completion or errseq work to perform.
-                    WritebackClaimOutcome::FailedRecorded(_) => break,
-                };
-                let Some(last_index) = batch.entries.last().map(|(index, _, _)| *index) else {
-                    break;
-                };
-                match Self::submit_writeback_batch(batch) {
-                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted)
-                        if last_index != usize::MAX =>
-                    {
-                        cursor = last_index + 1;
-                    }
-                    Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted) => {
-                        break
-                    }
-                    Ok(WritebackSubmitOutcome::Failed(_)) => break,
-                    Ok(WritebackSubmitOutcome::Deferred(progress)) => {
-                        Self::schedule_reclaimer_deferred_retry(
-                            progress,
-                            manager.clone(),
-                            start_index,
-                            end_index,
-                        );
-                        break;
-                    }
-                    Err(_) => break,
                 }
-            }
+            });
         })?;
         let Some(permit) = AsyncWritebackPermit::try_acquire(&executor) else {
             return Ok(false);

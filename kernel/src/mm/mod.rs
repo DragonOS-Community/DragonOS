@@ -29,6 +29,7 @@ pub mod device_linear;
 pub mod dma;
 pub mod early_ioremap;
 pub mod fault;
+pub(crate) mod fault_recovery;
 pub mod ident_map;
 pub mod init;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]

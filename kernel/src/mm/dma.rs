@@ -412,8 +412,9 @@ impl DmaAllocator {
                     .and_then(|mask| usize::try_from(mask).ok())
                     .unwrap_or(usize::MAX),
             );
+            let level = crate::mm::allocator::reserve::kernel_level();
             let (physical, count) = crate::arch::mm::LockedFrameAllocator::with_buddy(|buddy| {
-                buddy.try_allocate_for_dma(page_count, max)
+                buddy.try_allocate_for_dma_at_level(page_count, max, level)
             })
             .ok_or(RawAllocationFailure::System(SystemError::ENOMEM))?
             .map_err(RawAllocationFailure::Frame)?;

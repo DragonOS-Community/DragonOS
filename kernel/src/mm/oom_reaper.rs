@@ -235,7 +235,9 @@ impl OomReapJob {
             return slot.finish(ReapFinish::CollisionLimit);
         }
         let mm = self.mm.as_ref().expect("claimed job has an MM");
-        match mm.try_oom_reap_batch(Some(authorization), self.cursor, self.expected_gen) {
+        match crate::mm::allocator::reserve::with_reclaim_reserve(|| {
+            mm.try_oom_reap_batch(Some(authorization), self.cursor, self.expected_gen)
+        }) {
             OomReapBatchResult::Continue {
                 next, expected_gen, ..
             } => {

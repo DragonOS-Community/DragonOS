@@ -19,6 +19,7 @@ use crate::{
         ucontext::{AddressSpace, UserStack},
         VirtAddr,
     },
+    syscall::user_access::copy_to_user_protected,
 };
 
 use super::{
@@ -961,12 +962,20 @@ impl ProcInitInfo {
     }
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {
-        let mut sp = ustack.sp();
-        sp -= core::mem::size_of_val(slice);
-        sp -= sp.data() % core::mem::align_of::<T>();
+        let len = core::mem::size_of_val(slice);
+        let address = ustack
+            .sp()
+            .data()
+            .checked_sub(len)
+            .ok_or(SystemError::E2BIG)?;
+        let sp = VirtAddr::new(address - address % core::mem::align_of::<T>());
 
-        unsafe { core::slice::from_raw_parts_mut(sp.data() as *mut T, slice.len()) }
-            .copy_from_slice(slice);
+        // The stack VMA is lazy: even a valid address may fail to acquire a
+        // physical page. Never turn userspace into a Rust slice and memcpy
+        // through an unprotected kernel fault. Exec's existing error path
+        // retires the failed image after these owners have unwound normally.
+        let bytes = unsafe { core::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), len) };
+        unsafe { copy_to_user_protected(sp, bytes)? };
         unsafe {
             ustack.set_sp(sp);
         }

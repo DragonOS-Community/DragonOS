@@ -18,7 +18,7 @@ use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{
-    retry_oom_victim_page_frame_alloc, FrameAllocator, PageFrameCount, PageFrameUsage,
+    FrameAllocationRequest, FrameAllocator, PageFrameCount, PageFrameUsage,
 };
 use crate::mm::memblock::mem_block_manager;
 use crate::mm::ucontext::LockedVMA;
@@ -801,7 +801,13 @@ impl LockedFrameAllocator {
 
     /// Relocation must not start reclaim or retry through the OOM victim path.
     pub(crate) unsafe fn allocate_one_no_reclaim() -> Option<PhysAddr> {
-        Self::allocate_inner(PageFrameCount::ONE).map(|(physical, _)| physical)
+        let request =
+            FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX));
+        Self::with_buddy(|buddy| {
+            buddy.allocate_admitted(request, crate::mm::allocator::reserve::ReserveLevel::Kernel)
+        })
+        .flatten()
+        .map(|(physical, _)| physical)
     }
 
     pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
@@ -811,36 +817,34 @@ impl LockedFrameAllocator {
             .map(BuddyAllocator::diagnostic_snapshot)
     }
 
-    unsafe fn allocate_inner(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
-        } else {
-            return None;
-        }
+    pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
+        Self::with_buddy(|buddy| buddy.pressure_snapshot()).unwrap_or_default()
     }
 }
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        count = count.next_power_of_two();
-        if let Some(frame) = unsafe { Self::allocate_inner(count) } {
-            return Some(frame);
-        }
+    unsafe fn allocate_request(
+        &mut self,
+        request: FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        let request = request.normalized()?;
+        let level = request.reserve_level();
+        Self::with_buddy(|buddy| buddy.allocate_admitted(request, level)).flatten()
+    }
 
-        retry_oom_victim_page_frame_alloc(|| unsafe { Self::allocate_inner(count) })
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        self.allocate_request(FrameAllocationRequest::kernel(
+            count,
+            PhysAddr::new(usize::MAX),
+        ))
     }
 
     unsafe fn allocate_below(
         &mut self,
-        mut count: PageFrameCount,
+        count: PageFrameCount,
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
-        count = count.next_power_of_two();
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            allocator.buddy_alloc_below(count, max_phys_addr)
-        } else {
-            None
-        }
+        self.allocate_request(FrameAllocationRequest::kernel(count, max_phys_addr))
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {

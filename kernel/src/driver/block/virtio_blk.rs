@@ -1,7 +1,7 @@
 use core::{
     any::Any,
     fmt::{Debug, Formatter, Write},
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -120,6 +120,14 @@ struct VirtIOBlkStats {
     size_large: AtomicUsize,
     budget_hits: AtomicUsize,
     queue_full_retries: AtomicUsize,
+    // Optional per-device completion-chain diagnostics. These are approximate
+    // independent counters, not a coherent snapshot or automatic stall verdict.
+    irq_entries: AtomicUsize,
+    tasklet_schedules: AtomicUsize,
+    tasklet_runs: AtomicUsize,
+    used_reclaims: AtomicUsize,
+    // Ring-space waiters only; accepted BIOs are tracked by inflight instead.
+    submission_waiters: AtomicUsize,
     latency_short: AtomicUsize,
     latency_medium: AtomicUsize,
     latency_long: AtomicUsize,
@@ -152,6 +160,11 @@ impl VirtIOBlkStats {
             size_large: AtomicUsize::new(0),
             budget_hits: AtomicUsize::new(0),
             queue_full_retries: AtomicUsize::new(0),
+            irq_entries: AtomicUsize::new(0),
+            tasklet_schedules: AtomicUsize::new(0),
+            tasklet_runs: AtomicUsize::new(0),
+            used_reclaims: AtomicUsize::new(0),
+            submission_waiters: AtomicUsize::new(0),
             latency_short: AtomicUsize::new(0),
             latency_medium: AtomicUsize::new(0),
             latency_long: AtomicUsize::new(0),
@@ -326,21 +339,6 @@ enum VirtIOBlkState {
 
 static mut VIRTIO_BLK_DRIVER: Option<Arc<VirtIOBlkDriver>> = None;
 
-// 块 IO 停顿诊断计数。全部是普通原子加，**只在进程上下文**（提交方的
-// 1s 超时自检）打印，绝不在 IRQ/tasklet 上下文做 console 输出。
-/// IRQ 进入次数（设备确实中断过）。
-static VBLK_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
-/// completion tasklet 被调度次数。
-static VBLK_TASKLET_SCHED: AtomicU64 = AtomicU64::new(0);
-/// completion tasklet 实际执行次数。
-static VBLK_TASKLET_RUN: AtomicU64 = AtomicU64::new(0);
-/// 从 used ring 回收完成的请求数。
-static VBLK_COMPLETED: AtomicU64 = AtomicU64::new(0);
-/// 已打印的停顿报告数（上限 8，避免自检本身变成噪声源）。
-static VBLK_STALL_REPORTS: AtomicU64 = AtomicU64::new(0);
-/// 当前正在等待环空间的提交方数量（>0 表示有提交被阻塞）。
-static VBLK_WAITERS: AtomicU64 = AtomicU64::new(0);
-
 /// 中断下半部：完成 BIO 请求
 struct BioCompletionTasklet {
     token_map: Arc<BioTokenMap>,
@@ -370,20 +368,18 @@ impl BioCompletionTasklet {
     }
 
     fn schedule(&self) {
-        VBLK_TASKLET_SCHED.fetch_add(1, Ordering::Relaxed);
         tasklet_schedule(&self.tasklet);
     }
 
     fn run(&self) {
-        VBLK_TASKLET_RUN.fetch_add(1, Ordering::Relaxed);
         let device = match self.device.upgrade() {
             Some(dev) => dev,
             None => return,
         };
-        let completed = complete_used_requests(&device, &self.token_map);
-        if completed > 0 {
-            VBLK_COMPLETED.fetch_add(completed as u64, Ordering::Relaxed);
+        if P6_2_STATS_ENABLED {
+            device.stats.tasklet_runs.fetch_add(1, Ordering::Relaxed);
         }
+        complete_used_requests(&device, &self.token_map);
     }
 }
 
@@ -483,6 +479,9 @@ fn complete_used_requests(device: &Arc<VirtIOBlkDevice>, token_map: &Arc<BioToke
         let _ctx = contexts[usize::from(token)]
             .take()
             .expect("completed context stays registered");
+        if P6_2_STATS_ENABLED {
+            device.stats.used_reclaims.fetch_add(1, Ordering::Relaxed);
+        }
         drop(contexts);
         drop(inner);
         // Wake before callbacks: a callback may itself need another BIO to
@@ -518,10 +517,13 @@ pub fn virtio_blk_stats_report() -> String {
             continue;
         };
         let stats = &device.stats;
-        let timing = stats.timing.lock_irqsave();
+        let (weighted_cycles, observed_cycles) = {
+            let timing = stats.timing.lock_irqsave();
+            (timing.weighted_cycles, timing.observed_cycles)
+        };
         let _ = writeln!(
             report,
-            "device={} generation={} enabled={} submits={} completes={} reads={} writes={} flushes={} bytes={} errors={} short={} inflight={} peak_inflight={} depth_1={} depth_2_4={} depth_5_16={} depth_17_plus={} size_4k={} size_16k={} size_32k={} size_64k={} size_large={} budget_hits={} latency_le_10k={} latency_le_100k={} latency_le_1m={} latency_gt_1m={} weighted_inflight_cycles={} observed_cycles={} queue_full_retries={}",
+            "device={} generation={} enabled={} submits={} completes={} reads={} writes={} flushes={} bytes={} errors={} short={} inflight={} peak_inflight={} depth_1={} depth_2_4={} depth_5_16={} depth_17_plus={} size_4k={} size_16k={} size_32k={} size_64k={} size_large={} budget_hits={} latency_le_10k={} latency_le_100k={} latency_le_1m={} latency_gt_1m={} weighted_inflight_cycles={} observed_cycles={} queue_full_retries={} irq_entries={} tasklet_schedules={} tasklet_runs={} used_reclaims={} submission_waiters={}",
             device.blkdev_meta.devname.name(),
             stats.generation,
             P6_2_STATS_ENABLED as usize,
@@ -549,9 +551,14 @@ pub fn virtio_blk_stats_report() -> String {
             stats.latency_medium.load(Ordering::Relaxed),
             stats.latency_long.load(Ordering::Relaxed),
             stats.latency_very_long.load(Ordering::Relaxed),
-            timing.weighted_cycles,
-            timing.observed_cycles,
+            weighted_cycles,
+            observed_cycles,
             stats.queue_full_retries.load(Ordering::Relaxed),
+            stats.irq_entries.load(Ordering::Relaxed),
+            stats.tasklet_schedules.load(Ordering::Relaxed),
+            stats.tasklet_runs.load(Ordering::Relaxed),
+            stats.used_reclaims.load(Ordering::Relaxed),
+            stats.submission_waiters.load(Ordering::Relaxed),
         );
     }
     report
@@ -768,10 +775,9 @@ impl VirtIOBlkDevice {
 
         // 创建IO线程
         let thread_name = format!("virtio_blk_io_{}", devname.id());
-        let io_weak = device_weak.clone();
         let io_thread = KernelThreadMechanism::create_and_run(
             KernelThreadClosure::EmptyClosure((
-                alloc::boxed::Box::new(move || bio_io_thread_loop(io_weak.clone())),
+                alloc::boxed::Box::new(move || bio_io_thread_loop(device_weak.clone())),
                 (),
             )),
             thread_name.clone(),
@@ -786,26 +792,6 @@ impl VirtIOBlkDevice {
             error!("Failed to create IO thread for {}", thread_name);
             virtioblk_manager().free_id(devname.id());
             return None;
-        }
-
-        // 停顿自检线程：1s 采样一次，仅在"提交方正在等环空间且完成链计数
-        // 全部不变"时告警。放在独立线程里是为了让打印始终发生在**进程
-        // 上下文**（提交方此时正阻塞在等待队列里，无法自己打印）。
-        let watchdog_name = format!("vblk_stall_{}", devname.id());
-        let watchdog_weak = device_weak.clone();
-        if KernelThreadMechanism::create_and_run(
-            KernelThreadClosure::EmptyClosure((
-                alloc::boxed::Box::new(move || vblk_stall_watchdog_thread(watchdog_weak.clone())),
-                (),
-            )),
-            watchdog_name.clone(),
-        )
-        .is_none()
-        {
-            error!(
-                "Failed to create stall watchdog thread for {}",
-                watchdog_name
-            );
         }
 
         Some((dev, irq_setup.into_deferred()))
@@ -1273,7 +1259,9 @@ impl VirtIODevice for VirtIOBlkDevice {
             None => return Ok(crate::exception::irqdesc::IrqReturn::NotHandled),
         };
 
-        VBLK_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        if P6_2_STATS_ENABLED {
+            self.stats.irq_entries.fetch_add(1, Ordering::Relaxed);
+        }
         let acked = device_inner.ack_interrupt();
         if !acked && !inner.irq_is_msix {
             log::debug!(
@@ -1284,6 +1272,9 @@ impl VirtIODevice for VirtIOBlkDevice {
         }
         let tasklet = inner.completion_tasklet.clone();
         if let Some(tasklet) = tasklet {
+            if P6_2_STATS_ENABLED {
+                self.stats.tasklet_schedules.fetch_add(1, Ordering::Relaxed);
+            }
             tasklet.schedule();
         }
         Ok(crate::exception::irqdesc::IrqReturn::Handled)
@@ -1690,69 +1681,6 @@ impl KObject for VirtIOBlkDriver {
     }
 }
 
-/// 块 IO 停顿自检线程。
-///
-/// 每 1s 采样一次：只有当"存在正在等待环空间的提交方"（`VBLK_WAITERS > 0`）
-/// 且 IRQ / tasklet 调度 / tasklet 执行 / 完成回收这四个计数**全部不变**时，
-/// 才判定完成链已停止（设备不再中断，或 tasklet 不再运行，或 used ring 不再
-/// 回收），并按秒数报告。正常空闲时 `VBLK_WAITERS == 0`，不做任何输出。
-///
-/// 打印始终发生在本线程（进程上下文），绝不在 IRQ/tasklet 上下文输出。
-fn vblk_stall_watchdog_thread(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
-    let mut last_irq = 0u64;
-    let mut last_sched = 0u64;
-    let mut last_run = 0u64;
-    let mut last_done = 0u64;
-    let mut stalled_secs: u64 = 0;
-
-    loop {
-        if crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(1, 0)).is_err() {
-            // 睡眠失败（极端降级）：退化为一次调度点，避免本线程空转。
-            crate::sched::cond_resched();
-        }
-        if device_weak.strong_count() == 0 {
-            // 设备已销毁，线程退出。
-            break;
-        }
-
-        let irq = VBLK_IRQ_COUNT.load(Ordering::Relaxed);
-        let sched = VBLK_TASKLET_SCHED.load(Ordering::Relaxed);
-        let run = VBLK_TASKLET_RUN.load(Ordering::Relaxed);
-        let done = VBLK_COMPLETED.load(Ordering::Relaxed);
-        let waiters = VBLK_WAITERS.load(Ordering::Relaxed);
-
-        let progressed =
-            irq != last_irq || sched != last_sched || run != last_run || done != last_done;
-        last_irq = irq;
-        last_sched = sched;
-        last_run = run;
-        last_done = done;
-
-        if progressed || waiters == 0 {
-            stalled_secs = 0;
-            continue;
-        }
-
-        // 1s 内四个计数全部不变，且仍有提交方在等环空间。
-        stalled_secs = stalled_secs.saturating_add(1);
-        if stalled_secs.is_multiple_of(5) {
-            let reported = VBLK_STALL_REPORTS.fetch_add(1, Ordering::Relaxed);
-            if reported < 8 {
-                log::warn!(
-                    "vblk stall {}s: waiters={} irq={} sched={} run={} completed={}",
-                    stalled_secs,
-                    waiters,
-                    irq,
-                    sched,
-                    run,
-                    done
-                );
-            }
-        }
-    }
-    0
-}
-
 /// IO线程入口函数
 fn bio_io_thread_loop(device_weak: Weak<VirtIOBlkDevice>) -> i32 {
     loop {
@@ -1823,9 +1751,12 @@ fn submit_bio_wait(
                         .queue_full_retries
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                // 登记"有提交方在等环空间"。停顿自检线程据此区分"空闲"与
-                // "提交阻塞且完成链停止"（见 vblk_stall_watchdog_thread）。
-                VBLK_WAITERS.fetch_add(1, Ordering::Relaxed);
+                if P6_2_STATS_ENABLED {
+                    device
+                        .stats
+                        .submission_waiters
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let waited = device.submission_wait.wait_uninterruptible(|| {
                     let inner = device.inner();
                     let ready = inner.state != VirtIOBlkState::Online
@@ -1834,7 +1765,12 @@ fn submit_bio_wait(
                         });
                     ready.then_some(())
                 });
-                VBLK_WAITERS.fetch_sub(1, Ordering::Relaxed);
+                if P6_2_STATS_ENABLED {
+                    device
+                        .stats
+                        .submission_waiters
+                        .fetch_sub(1, Ordering::Relaxed);
+                }
                 waited?;
             }
             result => return result,

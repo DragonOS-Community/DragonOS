@@ -79,6 +79,17 @@ pub fn panic(info: &PanicInfo) -> ! {
         let current_pid = process::ProcessManager::current_pid();
         if current_pid.data() == 0 {
             println!("Current PCB:\n\t<idle task pid=0, cannot exit>");
+            // 对齐 Linux 的 panic 语义：出事的 CPU 必须发布自己的终态并停止
+            // 再取中断，不能留下一个"IF=1 空转"的僵尸核。
+            //
+            // 僵尸核的危害：它不再执行任何内存访问，因此本次 shootdown 对它
+            // 已无意义，但只要它仍被视作 Online，其它核发来的 TLB IPI 就永远
+            // 等不到 ack（发起核在关抢占的等待环里），局部故障直接放大成整机
+            // 死锁。`stop_this_cpu()` 会走 Online→Dying→Dead，把本核从 RCU 与
+            // shootdown 目标集中摘除，然后 halt。
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::process::stop_this_cpu();
+            #[cfg(not(target_arch = "x86_64"))]
             loop {
                 spin_loop();
             }

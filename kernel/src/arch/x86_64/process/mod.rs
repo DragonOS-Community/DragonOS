@@ -10,7 +10,7 @@ use core::{
 use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
-use log::{error, info, warn};
+use log::{error, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
@@ -1036,15 +1036,12 @@ pub(crate) fn stop_this_cpu() -> ! {
     CurrentApic.disable_local_apic();
     smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 
+    // 停机循环必须是纯指令。本函数也会从 panic 路径进入（可能由内存耗尽
+    // 触发，且已关中断），每次被 NMI/wakeup 唤醒都不得再打印或分配，否则
+    // 就是 console-in-IF=0 类缺陷，并可能在 OOM panic 上二次级联。
     loop {
-        native_halt();
-    }
-}
-
-#[inline(always)]
-fn native_halt() {
-    info!("Starting System Halt...");
-    unsafe {
-        asm!("hlt", options(nomem, nostack, preserves_flags));
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }

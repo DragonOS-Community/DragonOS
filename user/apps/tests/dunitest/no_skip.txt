@@ -63,3 +63,4 @@ normal/cgroup_threaded
 normal/udp_source_route
 fuse/stat_blocks
 normal/socket_address_output
+normal/balloon_memory_integrity

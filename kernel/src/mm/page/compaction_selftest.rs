@@ -1083,14 +1083,26 @@ fn dma_recovery_inventory(max: PhysAddr) -> Result<(usize, usize, usize, usize),
     Ok((len, buckets, mask_entries, bound))
 }
 
+/// Both pressure fixtures must leave headroom in the DMA-addressable zone,
+/// not merely in Normal memory which cannot satisfy their bounded requests.
+fn dma_fixture_budget(free: usize, reservation_limit: Option<usize>) -> Result<usize, SystemError> {
+    if free < 2 * DMA_HEADROOM_PAGES {
+        return Err(SystemError::ENOMEM);
+    }
+    let dma32_free = LockedFrameAllocator::diagnostic_snapshot()
+        .ok_or(SystemError::ENOMEM)?
+        .dma32_free_pages();
+    Ok((free / 2)
+        .min(dma32_free / 2)
+        .min(free - DMA_HEADROOM_PAGES)
+        .min(reservation_limit.unwrap_or(usize::MAX)))
+}
+
 /// Exercise actual registry discovery and the real Service implementation with
 /// a private owner. The global DMA consumer's cursor/backoff is never changed.
 fn dma_discovery_deferral_progress() -> Result<bool, SystemError> {
     let free = unsafe { LockedFrameAllocator.usage() }.free().data();
-    if free < 2 * DMA_HEADROOM_PAGES {
-        return Err(SystemError::ENOMEM);
-    }
-    let end = (free / 2)
+    let end = dma_fixture_budget(free, None)?
         .checked_mul(MMArch::PAGE_SIZE)
         .ok_or(SystemError::ENOMEM)?
         .min(DMA32_END);
@@ -1273,14 +1285,8 @@ fn dma_automatic_recovery(
     let result = (|| -> Result<(bool, bool, bool, bool), SystemError> {
         detail.phase = "initial_headroom";
         detail.free_before = unsafe { LockedFrameAllocator.usage() }.free().data();
-        // This is a controlled pressure fixture, not permission to consume
-        // arbitrary low memory. Include external layout owners in its limit.
-        if detail.free_before < 2 * DMA_HEADROOM_PAGES {
-            return Err(SystemError::ENOMEM);
-        }
-        let budget = (detail.free_before / 2)
-            .min(detail.free_before - DMA_HEADROOM_PAGES)
-            .min(reservation_limit.unwrap_or(usize::MAX));
+        // Include external layout owners while preserving real DMA32 headroom.
+        let budget = dma_fixture_budget(detail.free_before, reservation_limit)?;
         detail.search_end = budget
             .checked_mul(MMArch::PAGE_SIZE)
             .ok_or(SystemError::ENOMEM)?

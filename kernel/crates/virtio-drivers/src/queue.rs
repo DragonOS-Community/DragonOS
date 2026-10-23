@@ -1709,3 +1709,7 @@ mod tests {
         assert_eq!(queue.should_notify(), true);
     }
 }
+
+#[cfg(test)]
+#[path = "queue_balloon_tests.rs"]
+mod balloon_tests;

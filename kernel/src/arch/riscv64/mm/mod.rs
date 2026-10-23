@@ -492,6 +492,11 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> Ent
 pub struct LockedFrameAllocator;
 
 impl LockedFrameAllocator {
+    pub(crate) fn with_buddy<T>(
+        operation: impl FnOnce(&mut BuddyAllocator<MMArch>) -> T,
+    ) -> Option<T> {
+        INNER_ALLOCATOR.lock_irqsave().as_mut().map(operation)
+    }
     pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
         INNER_ALLOCATOR
             .lock_irqsave()

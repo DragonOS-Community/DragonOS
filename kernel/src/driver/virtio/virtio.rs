@@ -71,6 +71,9 @@ pub(super) fn virtio_device_init(
     dev_parent: Option<Arc<dyn Device>>,
 ) {
     match transport.device_type() {
+        DeviceType::MemoryBalloon | DeviceType::MemoryBallooning => {
+            super::virtio_balloon::virtio_balloon(transport, dev_id)
+        }
         DeviceType::Block => virtio_blk(transport, dev_id, dev_parent),
         DeviceType::GPU => {
             warn!("Not support virtio_gpu device for now");

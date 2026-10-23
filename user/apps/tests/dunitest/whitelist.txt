@@ -305,3 +305,5 @@ normal/shared_page_migration
 normal/page_compaction
 normal/global_reclaim
 normal/riscv_signal_semantics
+normal/page_reporting
+normal/balloon_memory_integrity

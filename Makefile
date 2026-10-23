@@ -303,7 +303,7 @@ test-syscall: prepare_rootfs_manifest
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
 		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi
-	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
+	SKIP_GRUB=1 $(MAKE) write_diskimage AUTO_TEST=syscall || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
 	sleep 5
 	@{ \
@@ -320,7 +320,7 @@ test-dunit: prepare_rootfs_manifest
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
 		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi
-	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
+	SKIP_GRUB=1 $(MAKE) write_diskimage AUTO_TEST=dunit || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=dunit DUNITEST_DIR=/opt/tests/dunitest &
 	sleep 5
 	@bash user/apps/tests/dunitest/monitor_test_results.sh

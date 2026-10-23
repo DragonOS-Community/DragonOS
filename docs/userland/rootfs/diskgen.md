@@ -24,7 +24,7 @@ The disk image is an ordinary Nix derivation cached in /nix/store: it is not reg
 
 hint: To free up disk space, run `nix store gc`
 
-The script run by `nix run .#rootfs-${target}` (`user/default.nix`) only copies the image from the store to the writable `bin/disk-image-${target}.img` when it has changed, recording its source in `bin/.disk-image-${target}.src`. When the image is unchanged the copy is skipped, so changes made to the disk inside DragonOS are kept; `-- --force` restores a clean image.
+For interactive runs, the script run by `nix run .#rootfs-${target}` (`user/default.nix`) only copies the image from the store to the writable `bin/disk-image-${target}.img` when it has changed, recording its source in `bin/.disk-image-${target}.src`. When the image is unchanged the copy is skipped, so changes made to the disk inside DragonOS are kept; `-- --force` restores a clean image. When image preparation selects `AUTO_TEST=dunit` or `AUTO_TEST=syscall` (including `make test-dunit` and `make test-syscall`), it always restores the clean image and discards guest disk changes.
 
 <<< ../../../user/default.nix{nix}
 

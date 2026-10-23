@@ -42,7 +42,9 @@ pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WM
 #[allow(unused_imports)]
 pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
-pub(crate) use loopback::{snapshot_raw_ingress_sockets, RawIngressWork};
+pub(crate) use loopback::{
+    snapshot_raw_ingress_sockets, RawIngressBatch, RawIngressQueue, RawIngressWork,
+};
 pub(crate) use pmtu::handle_icmp_feedback;
 
 /// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现

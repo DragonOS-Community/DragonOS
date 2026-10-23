@@ -12,7 +12,7 @@ use super::{
         NftPacket, RulesetSnapshot,
     },
     route::{OutputRouteGuard, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST},
-    socket::inet::raw::RawIngressWork,
+    socket::inet::raw::{RawIngressBatch, RawIngressWork},
 };
 use crate::driver::net::{
     inject_owned_local_ip_packet_if_epoch, types::InterfaceFlags, veth::VethInterface, Iface,
@@ -65,6 +65,8 @@ pub(crate) struct NetIngressFilter<'a> {
     routes: Option<&'a OutputRouteGuard<'a>>,
     fib_routes: Option<&'a OutputRouteGuard<'a>>,
     work: &'a mut Vec<RoutedIngressWork>,
+    raw_batch: Option<&'a mut RawIngressBatch>,
+    raw_retirement: &'a mut Vec<RawIngressWork>,
     icmp_error_items: usize,
     icmp_error_bytes: usize,
 }
@@ -84,13 +86,14 @@ pub(crate) struct NetIngressFilterInit<'a> {
     pub(crate) routes: Option<&'a OutputRouteGuard<'a>>,
     pub(crate) fib_routes: Option<&'a OutputRouteGuard<'a>>,
     pub(crate) work: &'a mut Vec<RoutedIngressWork>,
+    pub(crate) raw_batch: Option<&'a mut RawIngressBatch>,
+    pub(crate) raw_retirement: &'a mut Vec<RawIngressWork>,
 }
 
 /// A route decision and owned datagram are transferred out of the receive
 /// callback together. No target interface is entered while the source's
 /// smoltcp, socket-set, or FIB locks are held.
 pub(crate) enum RoutedIngressWork {
-    Raw(RawIngressWork),
     IcmpError {
         netns: Arc<NetNamespace>,
         feedback: super::icmp_error::IcmpErrorFeedback,
@@ -137,10 +140,6 @@ impl RoutedIngressWork {
         let result = match self {
             Self::IcmpError { netns, feedback } => {
                 super::icmp_error::execute(&netns, feedback);
-                return;
-            }
-            Self::Raw(work) => {
-                work.execute();
                 return;
             }
             Self::Defrag { netns, fragment } => {
@@ -284,6 +283,8 @@ impl<'a> NetIngressFilter<'a> {
             routes,
             fib_routes,
             work,
+            raw_batch,
+            raw_retirement,
         } = init;
         Self {
             ruleset,
@@ -300,6 +301,8 @@ impl<'a> NetIngressFilter<'a> {
             routes,
             fib_routes,
             work,
+            raw_batch,
+            raw_retirement,
             icmp_error_items: 0,
             icmp_error_bytes: 0,
         }
@@ -1396,7 +1399,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         // Allocate retirement work before upgrading any socket reference.
         // A poll-start listener snapshot can miss sockets registered before
         // this actual packet arrived, even when the packet was sent by one.
-        if self.work.try_reserve(1).is_err() {
+        if self.raw_retirement.try_reserve(1).is_err() {
             return LocalInputVerdict::Drop;
         }
         let Ok(mut sockets) = super::socket::inet::raw::snapshot_raw_ingress_sockets(self.netns)
@@ -1419,22 +1422,29 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             }
         }
         if !sockets.is_empty() {
-            let mut bytes = Vec::new();
-            if matched != 0 && bytes.try_reserve_exact(packet.len()).is_ok() {
-                bytes.extend_from_slice(packet);
-            }
-            // Include nonmatching candidates and copy-failure paths: their
-            // final strong references must not die under interface locks.
-            self.work.push(RoutedIngressWork::Raw(RawIngressWork {
+            let work = RawIngressWork {
                 sockets,
                 matched,
-                packet: bytes,
+                packet: Vec::new(),
                 source,
                 destination,
                 protocol,
                 ingress_ifindex,
                 netns: self.netns.clone(),
-            }));
+            };
+            // Nonmatching candidates and all resource-pressure paths retain
+            // their pins locally until the interface and poll guards are gone.
+            let retirement = if matched != 0 {
+                match self.raw_batch.as_mut() {
+                    Some(batch) => batch.record(work, packet, &self.netns.raw_ingress).err(),
+                    None => Some(work),
+                }
+            } else {
+                Some(work)
+            };
+            if let Some(work) = retirement {
+                self.raw_retirement.push(work);
+            }
         }
         // Linux considers a raw protocol matched even when allocation or the
         // receive queue fails; an unknown protocol must not emit ICMP then.

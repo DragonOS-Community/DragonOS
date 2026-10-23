@@ -40,6 +40,12 @@ let
     ]
     ++ apps;
     keepContentsDirlinks = false;
+    # Create writable runtime directories in the layer, after Nix store
+    # permission normalization. /var/tmp must remain disk-backed for tests.
+    extraCommands = ''
+      mkdir -p var/tmp
+      chmod 1777 var/tmp
+    '';
     # 仅作为 disk-image.nix 的中间产物，不需要压缩
     compressor = "none";
   };

@@ -215,12 +215,34 @@ let
               # cmdline 以 NUL 分隔参数；[,] 避免匹配到 grep 自身的参数
               grep -qsaxz ".*[,]guest-cid=$1" /proc/[0-9]*/cmdline
             }
+            acquire_vsock_cid() {
+              local lockfile="/tmp/dragonos-vsock-cid-$1.lock"
+              # Keep one stable inode for all users. Never truncate or unlink
+              # it: a replacement inode would allow two independent leases.
+              [ ! -L "$lockfile" ] || return 1
+              if [ ! -e "$lockfile" ]; then
+                (umask 022; set -C; : > "$lockfile") 2>/dev/null || true
+              fi
+              [ -f "$lockfile" ] && [ ! -L "$lockfile" ] || return 1
+              # A read-only descriptor permits coordination across UIDs. The
+              # launcher retains it until its foreground QEMU has exited.
+              if ! exec {VSOCK_CID_LOCK_FD}< "$lockfile"; then
+                return 1
+              fi
+              if ! ${pkgs.util-linux}/bin/flock -n "$VSOCK_CID_LOCK_FD"; then
+                exec {VSOCK_CID_LOCK_FD}<&-
+                return 1
+              fi
+            }
             if [ ! -w /dev/vhost-vsock ]; then
               echo "[WARN] /dev/vhost-vsock not accessible; skip vsock device"
               echo "[WARN] Hint: sudo modprobe vhost_vsock, and make sure you are in the kvm group"
             elif ! ${qemuBin} -device help 2>/dev/null | grep -q "${vsockDeviceModel}"; then
               echo "[WARN] QEMU device model '${vsockDeviceModel}' not supported; skip vsock device"
+            elif ! acquire_vsock_cid ${vsockCid}; then
+              echo "[WARN] cannot acquire vsock guest CID=${vsockCid} lease; skip vsock device"
             elif vsock_cid_in_use ${vsockCid}; then
+              exec {VSOCK_CID_LOCK_FD}<&-
               echo "[WARN] vsock guest CID=${vsockCid} already in use by another QEMU instance; skip vsock device"
             else
               VSOCK_ARGS=( "-device" "${vsockDeviceModel},guest-cid=${vsockCid}" )

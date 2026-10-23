@@ -73,9 +73,9 @@ make kernel
 nix run .#rootfs-x86_64
 ```
 
-磁盘镜像在 nix store 中构建并缓存，该命令只在镜像发生变化时把它拷贝为 `./bin/disk-image-x86_64.img`。
+磁盘镜像在 nix store 中构建并缓存，交互模式下，该命令只在镜像发生变化时把它拷贝为 `./bin/disk-image-x86_64.img`。
 
-`user/` 下的软件包没有变化时会直接跳过，从而保留你在 DragonOS 中对磁盘所做的修改；如需丢弃这些修改、恢复为干净镜像，执行 `nix run .#rootfs-x86_64 -- --force`。
+`user/` 下的软件包没有变化时会直接跳过，从而保留你在 DragonOS 中对磁盘所做的修改；如需丢弃这些修改、恢复为干净镜像，执行 `nix run .#rootfs-x86_64 -- --force`。 镜像准备选择 `AUTO_TEST=dunit` 或 `AUTO_TEST=syscall` 时（包括 `make test-dunit` 和 `make test-syscall`），始终恢复干净镜像，并丢弃 guest 内的磁盘修改。
 
 ## 启动内核
 

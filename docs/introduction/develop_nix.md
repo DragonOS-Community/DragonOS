@@ -75,7 +75,7 @@ nix run .#rootfs-x86_64
 
 The disk image is built and cached in the Nix store; this command only copies it to `./bin/disk-image-x86_64.img` when the image has changed.
 
-If nothing under `user/` has changed, the copy is skipped so that changes you made to the disk inside DragonOS are kept. To discard them and restore a clean image, run `nix run .#rootfs-x86_64 -- --force`.
+For interactive runs, if nothing under `user/` has changed, the copy is skipped so that changes you made to the disk inside DragonOS are kept. To discard them and restore a clean image, run `nix run .#rootfs-x86_64 -- --force`. When image preparation selects `AUTO_TEST=dunit` or `AUTO_TEST=syscall` (including `make test-dunit` and `make test-syscall`), it always restores the clean image and discards guest disk changes.
 
 ## Starting the Kernel
 

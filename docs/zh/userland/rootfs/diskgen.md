@@ -25,13 +25,13 @@
 ## nix script 的背后
 
 磁盘镜像是一个普通的 nix derivation，会作为构建产物缓存在 /nix/store 中：`user/` 没有变化时不会重新生成。
-多次修改 `user/` 后旧的镜像副本仍会保留，可能占用较多硬盘。
+多次修改 `user/` 后旧的镜像副本仍会保留，可能占用较多硬盘。 镜像准备选择 `AUTO_TEST=dunit` 或 `AUTO_TEST=syscall` 时（包括 `make test-dunit` 和 `make test-syscall`），始终恢复干净镜像，并丢弃 guest 内的磁盘修改。
 
 hint: 要想释放磁盘空间，执行 `nix store gc`
 
 `nix run .#rootfs-${target}` 运行的脚本（`user/default.nix`）只做一件事：当 store 中的镜像发生变化时，
 把它拷贝为可写的 `bin/disk-image-${target}.img`，并在 `bin/.disk-image-${target}.src` 中记录来源。
-镜像没有变化时会跳过拷贝，以保留在 DragonOS 中对磁盘所做的修改；`-- --force` 可强制恢复为干净镜像。
+交互模式下，镜像没有变化时会跳过拷贝，以保留在 DragonOS 中对磁盘所做的修改；`-- --force` 可强制恢复为干净镜像。
 
 <<< ../../../../user/default.nix{nix}
 

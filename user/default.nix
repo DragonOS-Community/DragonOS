@@ -51,6 +51,11 @@ let
       if [ "''${1:-}" = "-f" ] || [ "''${1:-}" = "--force" ]; then
         FORCE=1
       fi
+      # Test runs require a fresh immutable baseline; interactive runs retain
+      # guest changes. Match the runner's runtime/configured AUTO_TEST choice.
+      case "''${AUTO_TEST:-${testOpt.autotest}}" in
+        dunit|syscall) FORCE=1 ;;
+      esac
 
       mkdir -p "${buildDir}" "$(dirname "$DST_IMG")"
       # Keep the lock file: unlinking it would allow callers to lock different

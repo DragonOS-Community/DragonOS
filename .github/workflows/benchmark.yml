@@ -1,0 +1,64 @@
+name: LMbench Benchmark x86_64
+
+# MVP scope: build DragonOS, run the lmbench performance suite under QEMU, and
+# archive the per-run result JSON + serial log. No regression gating / charts yet.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["feat/lmbench*", "feat-lmbench*"]
+
+env:
+  ARCH: x86_64
+  HOME: /root
+  RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+  RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
+
+jobs:
+  benchmark:
+    name: LMbench
+    runs-on: ubuntu-latest
+    # Benchmarks are slow: monitor allows up to a 60-minute run, plus build/cleanup.
+    timeout-minutes: 90
+    container:
+      image: dragonos/dragonos-dev:v1.23
+      options: --privileged -v /dev:/dev
+    steps:
+      - name: Checkout DragonOS code
+        uses: actions/checkout@v4
+
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
+      - name: Ensure jsonschema for the result collector
+        run: pip3 install --quiet jsonschema || true
+
+      - name: Build DragonOS
+        shell: bash -ileo pipefail {0}
+        run: |
+          make clean
+          make -j$(nproc) all
+
+      - name: Run lmbench benchmark
+        shell: bash -ileo pipefail {0}
+        env:
+          DISK_SAVE_MODE: "1"
+        run: |
+          make test-benchmark
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lmbench-results-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            user/apps/tests/benchmark/lmbench/results/**
+          if-no-files-found: warn
+
+      - name: Preserve benchmark serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lmbench-serial-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: serial_opt.txt
+          if-no-files-found: error

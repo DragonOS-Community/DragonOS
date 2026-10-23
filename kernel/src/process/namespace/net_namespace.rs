@@ -273,6 +273,8 @@ pub struct NetNamespace {
     ipv6_fragment_identification: AtomicU32,
     tcp_ports: Arc<crate::net::socket::inet::common::PortManager>,
     tcp_stack: Arc<crate::net::tcp_stack::TcpStack>,
+    pub(crate) raw_ingress:
+        crate::libs::spinlock::SpinLock<crate::net::socket::inet::raw::RawIngressQueue>,
     /// Lock-free read-side snapshot for AF_PACKET delivery from NAPI context.
     packet_sockets: RcuArcSlot<PacketSocketRegistrySnapshot>,
     /// Serializes all plain/fanout topology updates and owns group IDs.
@@ -1273,6 +1275,9 @@ impl NetNamespace {
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             nftables: Some(Box::new(NftNamespaceState::new())),
+            raw_ingress: crate::libs::spinlock::SpinLock::new(
+                crate::net::socket::inet::raw::RawIngressQueue::default(),
+            ),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
@@ -1327,6 +1332,9 @@ impl NetNamespace {
             bridge_list: RwSem::new(BTreeMap::new()),
             netlink_socket_table: NetlinkSocketTable::default(),
             nftables: Some(Box::new(NftNamespaceState::new())),
+            raw_ingress: crate::libs::spinlock::SpinLock::new(
+                crate::net::socket::inet::raw::RawIngressQueue::default(),
+            ),
             netlink_kernel_socket: RwSem::new(generate_supported_netlink_kernel_sockets()),
             unix_abstract_table: unix_abstract_table.clone(),
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),

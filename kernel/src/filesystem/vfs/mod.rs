@@ -2543,11 +2543,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok(属性值的实际长度)
     ///         失败：Err(错误码)
     fn getxattr(&self, _name: &[u8], _buf: &mut [u8]) -> Result<usize, SystemError> {
-        log::warn!(
-            "getxattr not implemented for {}",
+        log::debug!(
+            "getxattr unsupported for {}",
             crate::libs::name::get_type_name(&self)
         );
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     /// @brief 按文件名设置扩展属性
@@ -2564,20 +2564,20 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _value: &[u8],
         _flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        log::warn!(
-            "setxattr not implemented for {}",
+        log::debug!(
+            "setxattr unsupported for {}",
             crate::libs::name::get_type_name(&self)
         );
-        return Err(SystemError::ENOSYS.into());
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
 
     /// @brief 列出扩展属性名，返回实际列表长度。
     fn listxattr(&self, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        log::warn!(
-            "listxattr not implemented for {}",
+        log::debug!(
+            "listxattr unsupported for {}",
             crate::libs::name::get_type_name(&self)
         );
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     /// @brief 删除指定扩展属性。
@@ -2585,11 +2585,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        log::warn!(
-            "removexattr not implemented for {}",
+        log::debug!(
+            "removexattr unsupported for {}",
             crate::libs::name::get_type_name(&self)
         );
-        return Err(SystemError::ENOSYS.into());
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
 
     /// Internal privilege removal after a content/ownership mutation has been

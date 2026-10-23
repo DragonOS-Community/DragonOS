@@ -1,4 +1,5 @@
 use super::bridge::BridgeEnableDevice;
+use super::PacketBuffer;
 use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope, MtuBounds, ETHERNET_MAX_IP_MTU};
 use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
@@ -17,17 +18,17 @@ use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
 use crate::libs::mutex::Mutex;
+use crate::libs::prepared_queue::{Node, Queue};
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::generate_iface_id;
 use crate::net::route::{RTN_UNICAST, RTPROT_BOOT, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN};
 use crate::net::routing::RouterEnableDevice;
 use crate::process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE};
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::phy::{self, RxToken};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, HardwareAddress, IpAddress, IpCidr};
@@ -37,15 +38,20 @@ use unified_init::macros::unified_init;
 const VETH_IP_MTU: usize = 1500;
 const VETH_MAX_FRAME_SIZE: usize = ETHERNET_MAX_IP_MTU + 14;
 const VETH_MAX_PENDING_FRAMES: usize = 1024;
+const VETH_MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct Veth {
     name: String,
     /// Frames awaiting bridge/routing classification. Classification may
     /// consult the authoritative FIB and therefore must run outside smoltcp's
     /// interface lock.
-    pending_rx_queue: VecDeque<PendingVethFrame>,
+    pending_rx_queue: Queue<PendingVethFrame>,
     /// Frames classified for local smoltcp delivery.
-    local_rx_queue: VecDeque<Vec<u8>>,
+    local_rx_queue: Queue<PendingVethFrame>,
+    queued_frames: usize,
+    queued_bytes: usize,
+    reserved_frames: usize,
+    reserved_bytes: usize,
     /// Serialized with peer enqueue so DOWN both rejects new external ingress
     /// and drains everything accepted before the transition.
     peer_ingress_enabled: bool,
@@ -59,8 +65,12 @@ impl Veth {
     pub fn new(name: String) -> Self {
         Veth {
             name,
-            pending_rx_queue: VecDeque::new(),
-            local_rx_queue: VecDeque::new(),
+            pending_rx_queue: Queue::new(),
+            local_rx_queue: Queue::new(),
+            queued_frames: 0,
+            queued_bytes: 0,
+            reserved_frames: 0,
+            reserved_bytes: 0,
             peer_ingress_enabled: true,
             ingress_generation: 0,
             peer: Weak::new(),
@@ -72,62 +82,6 @@ impl Veth {
         self.peer = Arc::downgrade(peer);
     }
 
-    fn to_peer_owned(peer: &Arc<VethInterface>, data: Vec<u8>) -> Result<(), SystemError> {
-        let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
-        let mut peer_veth = peer.driver.inner.lock();
-        if !peer_veth.peer_ingress_enabled {
-            return Err(SystemError::ENETDOWN);
-        }
-        if peer_veth.pending_rx_queue.len() >= VETH_MAX_PENDING_FRAMES {
-            return Err(SystemError::ENOBUFS);
-        }
-        peer_veth
-            .pending_rx_queue
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        let generation = peer_veth.ingress_generation;
-        peer_veth
-            .pending_rx_queue
-            .push_back(PendingVethFrame { generation, data });
-
-        // {
-        //     let ether = EthernetFrame::new_checked(data).unwrap();
-        //     if ether.ethertype() == smoltcp::wire::EthernetProtocol::Ipv4 {
-        //         if let Some(ipv4_packet) =
-        //             smoltcp::wire::Ipv4Packet::new_checked(ether.payload()).ok()
-        //         {
-        //             log::info!(
-        //                 "Veth {} sending IPv4 packet to peer: {} -> {}",
-        //                 peer.name,
-        //                 ipv4_packet.src_addr(),
-        //                 ipv4_packet.dst_addr()
-        //             );
-        //         }
-        //     } else if ether.ethertype() == smoltcp::wire::EthernetProtocol::Ipv6 {
-        //         if let Some(ipv6_packet) =
-        //             smoltcp::wire::Ipv6Packet::new_checked(ether.payload()).ok()
-        //         {
-        //             log::info!(
-        //                 "Veth {} sending IPv6 packet to peer: {} -> {}",
-        //                 peer.name,
-        //                 ipv6_packet.src_addr(),
-        //                 ipv6_packet.dst_addr()
-        //             );
-        //         }
-        //     } else {
-        //         log::info!(
-        //             "Veth {} sending non-IP packet to peer: ethertype={:?}",
-        //             peer.name,
-        //             ether.ethertype()
-        //         );
-        //     }
-        // }
-
-        drop(peer_veth);
-        napi_schedule(napi);
-        Ok(())
-    }
-
     fn to_bridge(bridge_data: &BridgeCommonData, data: &[u8]) {
         // log::info!("Veth {} sending data to bridge", self.name);
         let Some(bridge) = bridge_data.bridge_driver_ref.upgrade() else {
@@ -137,8 +91,11 @@ impl Veth {
         bridge.handle_frame(bridge_data.id, data);
     }
 
-    pub fn recv_local(&mut self) -> Option<Vec<u8>> {
-        self.local_rx_queue.pop_front()
+    fn recv_local(&mut self) -> Option<PacketBuffer> {
+        let frame = self.local_rx_queue.pop_node()?.into_value();
+        self.queued_frames -= 1;
+        self.queued_bytes -= frame.data.capacity();
+        Some(frame.data)
     }
 
     pub fn name(&self) -> &str {
@@ -172,7 +129,7 @@ enum IngressDisposition {
 
 struct PendingVethFrame {
     generation: u64,
-    data: Vec<u8>,
+    data: PacketBuffer,
 }
 
 impl VethDriver {
@@ -185,25 +142,29 @@ impl VethDriver {
         for _ in 0..scan_budget {
             let frame = {
                 let mut veth = self.inner.lock();
-                veth.pending_rx_queue.pop_front()
+                veth.pending_rx_queue.pop_node()
             };
             let Some(frame) = frame else {
                 break;
             };
             scanned += 1;
 
-            match self.classify_and_consume(&frame.data) {
-                IngressDisposition::Consumed => {}
-                IngressDisposition::Local => {
-                    let mut inner = self.inner.lock();
-                    if inner.peer_ingress_enabled
-                        && inner.ingress_generation == frame.generation
-                        && inner.local_rx_queue.len() < VETH_MAX_PENDING_FRAMES
-                        && inner.local_rx_queue.try_reserve(1).is_ok()
-                    {
-                        inner.local_rx_queue.push_back(frame.data);
-                    }
-                }
+            let local = matches!(
+                self.classify_and_consume(&frame.value().data),
+                IngressDisposition::Local
+            );
+            let mut inner = self.inner.lock();
+            if local
+                && inner.peer_ingress_enabled
+                && inner.ingress_generation == frame.value().generation
+            {
+                // Keep the exact prepared node and its accepted byte budget.
+                inner.local_rx_queue.push_node(frame);
+            } else {
+                inner.queued_frames -= 1;
+                inner.queued_bytes -= frame.value().data.capacity();
+                drop(inner);
+                drop(frame);
             }
         }
         scanned
@@ -308,48 +269,170 @@ impl VethDriver {
         self.iface.lock().upgrade()
     }
 
-    fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
-        self.validate_frame_len(&frame)?;
-        if let Some(iface) = self.iface() {
-            crate::net::socket::packet::deliver_to_packet_sockets(
-                &iface,
-                &frame,
-                crate::net::socket::packet::PacketType::Outgoing,
-            );
+    fn reserve_slot(&self, len: usize) -> Result<VethReservation, SystemError> {
+        self.reserve_storage(len, len)
+    }
+
+    fn reserve_storage(
+        &self,
+        wire_len: usize,
+        bytes: usize,
+    ) -> Result<VethReservation, SystemError> {
+        // The exact VLAN bytes are checked at commit. Bound unknown bytes by
+        // the largest frame this device can accept before preparing storage.
+        let mtu = self.iface().map_or(VETH_IP_MTU, |iface| iface.mtu());
+        if wire_len > mtu + 18 {
+            return Err(SystemError::EMSGSIZE);
         }
+        let mut node = Node::try_new(PendingVethFrame {
+            generation: 0,
+            data: PacketBuffer::new(),
+        })?;
         let peer = self
             .inner
             .lock()
             .peer
             .upgrade()
             .ok_or(SystemError::ENOBUFS)?;
-        Veth::to_peer_owned(&peer, frame)
+        let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
+        let mut inner = peer.driver.inner.lock();
+        if !inner.peer_ingress_enabled {
+            return Err(SystemError::ENETDOWN);
+        }
+        if inner.queued_frames + inner.reserved_frames >= VETH_MAX_PENDING_FRAMES
+            || bytes
+                > VETH_MAX_PENDING_BYTES.saturating_sub(inner.queued_bytes + inner.reserved_bytes)
+        {
+            return Err(SystemError::ENOBUFS);
+        }
+        node.value_mut().generation = inner.ingress_generation;
+        inner.reserved_frames += 1;
+        inner.reserved_bytes += bytes;
+        drop(inner);
+        Ok(VethReservation {
+            source: self.clone(),
+            peer,
+            napi,
+            node: Some(node),
+            bytes,
+        })
+    }
+
+    fn submit_frame(&self, frame: PacketBuffer) -> Result<(), SystemError> {
+        self.validate_frame_len(&frame)?;
+        let mut prepared = self.reserve_storage(frame.len(), frame.capacity())?;
+        prepared.node.as_mut().unwrap().value_mut().data = frame;
+        prepared.commit()
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
         self.validate_frame_len(frame)?;
-        self.submit_frame(frame.to_vec())
+        let mut prepared = self.reserve_slot(frame.len())?;
+        prepared.node.as_mut().unwrap().value_mut().data = PacketBuffer::try_from_slice(frame)?;
+        prepared.commit()
+    }
+}
+
+struct VethReservation {
+    source: VethDriver,
+    peer: Arc<VethInterface>,
+    napi: Arc<NapiStruct>,
+    node: Option<Box<Node<PendingVethFrame>>>,
+    bytes: usize,
+}
+
+impl VethReservation {
+    fn commit(mut self) -> Result<(), SystemError> {
+        self.source
+            .validate_frame_len(&self.node.as_ref().unwrap().value().data)?;
+        if let Some(iface) = self.source.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &self.node.as_ref().unwrap().value().data,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        debug_assert_eq!(
+            self.node.as_ref().unwrap().value().data.capacity(),
+            self.bytes
+        );
+        let node = self.node.take().unwrap();
+        let mut inner = self.peer.driver.inner.lock();
+        inner.reserved_frames -= 1;
+        inner.reserved_bytes -= self.bytes;
+        if !inner.peer_ingress_enabled || inner.ingress_generation != node.value().generation {
+            return Err(SystemError::ENETDOWN);
+        }
+        inner.queued_frames += 1;
+        inner.queued_bytes += self.bytes;
+        inner.pending_rx_queue.push_node(node);
+        drop(inner);
+        napi_schedule(self.napi.clone());
+        Ok(())
+    }
+}
+
+impl Drop for VethReservation {
+    fn drop(&mut self) {
+        if self.node.is_some() {
+            let mut inner = self.peer.driver.inner.lock();
+            inner.reserved_frames -= 1;
+            inner.reserved_bytes -= self.bytes;
+        }
     }
 }
 
 pub struct VethTxToken {
     driver: VethDriver,
+    prepared: Option<VethReservation>,
 }
 
 impl phy::TxToken for VethTxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes == len)
+        {
+            return Ok(());
+        }
+        // Keep any earlier valid preparation until its replacement succeeds.
+        let mut prepared = self
+            .driver
+            .reserve_slot(len)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        let mut buffer =
+            PacketBuffer::try_with_capacity(len).map_err(|_| phy::TxEgressError::Exhausted)?;
+        buffer
+            .resize(len, 0)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        prepared.node.as_mut().unwrap().value_mut().data = buffer;
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0; len];
-        let result = f(&mut buf);
-        let _ = self.driver.submit_frame(buf);
+        let mut prepared = self
+            .prepared
+            .take()
+            .expect("veth TX requires exact preparation");
+        assert_eq!(prepared.bytes, len);
+        let result = f(prepared
+            .node
+            .as_mut()
+            .unwrap()
+            .value_mut()
+            .data
+            .as_mut_slice());
+        let _ = prepared.commit();
         result
     }
 }
 
 pub struct VethRxToken {
-    buffer: Vec<u8>,
+    buffer: PacketBuffer,
 }
 
 impl RxToken for VethRxToken {
@@ -384,6 +467,7 @@ impl phy::Device for VethDriver {
                 VethRxToken { buffer: buf },
                 VethTxToken {
                     driver: self.clone(),
+                    prepared: None,
                 },
             )
         })
@@ -392,6 +476,7 @@ impl phy::Device for VethDriver {
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(VethTxToken {
             driver: self.clone(),
+            prepared: None,
         })
     }
 }
@@ -822,7 +907,7 @@ impl Iface for VethInterface {
         self.driver.try_raw_transmit(frame)
     }
 
-    fn raw_transmit_owned(&self, frame: Vec<u8>) -> Result<(), SystemError> {
+    fn raw_transmit_owned(&self, frame: PacketBuffer) -> Result<(), SystemError> {
         self.driver.submit_frame(frame)
     }
 
@@ -890,6 +975,10 @@ impl Iface for VethInterface {
         let mut driver = self.driver.inner.lock();
         let pending = core::mem::take(&mut driver.pending_rx_queue);
         let local = core::mem::take(&mut driver.local_rx_queue);
+        driver.queued_frames = 0;
+        driver.queued_bytes = 0;
+        // Existing unpublished reservations release their own counters, even
+        // across DOWN/UP. Generation rejects their stale commit.
         drop(driver);
         drop(classification_guard);
         drop(pending);
@@ -1039,4 +1128,132 @@ pub fn veth_init() -> Result<(), SystemError> {
         log::info!("Veth test fixtures initialized.");
     }
     Ok(())
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn buffer_selftest() -> bool {
+    fn run() -> Result<bool, SystemError> {
+        // Private, unregistered interfaces exercise production admission and
+        // generation rollback without scheduling synthetic packets globally.
+        let (source, peer) = VethInterface::new_pair("mm262-source", "mm262-peer");
+        *source.common.napi_struct.write() = Some(NapiStruct::new_disabled(source.clone(), 10));
+        *peer.common.napi_struct.write() = Some(NapiStruct::new_disabled(peer.clone(), 10));
+        let mut driver = source.driver.clone();
+        let mut tx = <VethDriver as phy::Device>::transmit(
+            &mut driver,
+            smoltcp::time::Instant::from_millis(0),
+        )
+        .unwrap();
+        phy::TxToken::prepare_buffer(&mut tx, 64).map_err(|_| SystemError::ENOMEM)?;
+        phy::TxToken::prepare_buffer(&mut tx, 64).map_err(|_| SystemError::ENOMEM)?;
+        if phy::TxToken::prepare_buffer(&mut tx, usize::MAX).is_ok() {
+            return Ok(false);
+        }
+        {
+            let inner = peer.driver.inner.lock();
+            if inner.reserved_frames != 1 || inner.reserved_bytes != 64 {
+                return Ok(false);
+            }
+        }
+        phy::TxToken::consume(tx, 64, |frame| {
+            frame.fill(0xa5);
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        });
+        {
+            let inner = peer.driver.inner.lock();
+            if inner.queued_frames != 1
+                || inner.queued_bytes != 64
+                || inner.reserved_frames != 0
+                || inner.reserved_bytes != 0
+            {
+                return Ok(false);
+            }
+        }
+        if peer.driver.prepare_ingress(1) != 1 {
+            return Ok(false);
+        }
+        let frame = peer
+            .driver
+            .inner
+            .lock()
+            .recv_local()
+            .ok_or(SystemError::EIO)?;
+        if frame.len() != 64
+            || frame[..12].iter().any(|byte| *byte != 0xa5)
+            || frame[12..14] != 0x0800u16.to_be_bytes()
+            || frame[14..].iter().any(|byte| *byte != 0xa5)
+        {
+            return Ok(false);
+        }
+        drop(frame);
+        if !super::local_output::native_output_selftest(&mut driver, true)?
+            || peer.driver.prepare_ingress(1) != 1
+        {
+            return Ok(false);
+        }
+        let native = peer
+            .driver
+            .inner
+            .lock()
+            .recv_local()
+            .ok_or(SystemError::EIO)?;
+        if native.len() != 64 || native[14..].iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+        drop(native);
+        let mut reservations = Queue::new();
+        for _ in 0..VETH_MAX_PENDING_FRAMES {
+            reservations.push_node(Node::try_new(driver.reserve_slot(1)?)?);
+        }
+        if !matches!(driver.reserve_slot(1), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        if !super::local_output::native_output_selftest(&mut driver, false)? {
+            return Ok(false);
+        }
+        drop(reservations.pop_node());
+        drop(driver.reserve_slot(1)?);
+        drop(reservations);
+
+        source.common.set_mtu(ETHERNET_MAX_IP_MTU);
+        let bytes = VETH_MAX_FRAME_SIZE;
+        let count = VETH_MAX_PENDING_BYTES / bytes;
+        let mut reservations = Queue::new();
+        for _ in 0..count {
+            reservations.push_node(Node::try_new(driver.reserve_slot(bytes)?)?);
+        }
+        {
+            let inner = peer.driver.inner.lock();
+            if inner.reserved_frames != count
+                || inner.reserved_bytes != count * bytes
+                || count >= VETH_MAX_PENDING_FRAMES
+            {
+                return Ok(false);
+            }
+        }
+        if !matches!(driver.reserve_slot(bytes), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        drop(reservations);
+        source.common.set_mtu(VETH_IP_MTU);
+
+        let mut old = driver.reserve_slot(64)?;
+        let mut frame = PacketBuffer::try_with_capacity(64)?;
+        frame.resize(64, 0)?;
+        old.node.as_mut().unwrap().value_mut().data = frame;
+        peer.begin_admin_down();
+        peer.quiesce_admin_down();
+        peer.publish_admin_state(true);
+        if !matches!(old.commit(), Err(SystemError::ENETDOWN)) {
+            return Ok(false);
+        }
+        let inner = peer.driver.inner.lock();
+        Ok(inner.pending_rx_queue.is_empty()
+            && inner.local_rx_queue.is_empty()
+            && inner.queued_frames == 0
+            && inner.queued_bytes == 0
+            && inner.reserved_frames == 0
+            && inner.reserved_bytes == 0)
+    }
+    run().unwrap_or(false)
 }

@@ -49,7 +49,18 @@ pub enum DmaCachePolicy {
 pub enum DmaCompaction {
     #[default]
     Disabled,
+    /// Recover only within this call's bounded synchronous budget.
     Allowed,
+    /// Also authorize one background round after a real high-order fragmented
+    /// failure. This is best effort work, not an asynchronous allocation promise.
+    DirectAndBackground,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DmaCompaction {
+    fn direct_allowed(self) -> bool {
+        matches!(self, Self::Allowed | Self::DirectAndBackground)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -363,9 +374,7 @@ impl DmaAllocator {
             }
         }
         #[cfg(target_arch = "x86_64")]
-        if options.compaction == DmaCompaction::Allowed
-            && super::compaction::recovery::context_allowed()
-        {
+        if options.compaction.direct_allowed() && super::compaction::recovery::context_allowed() {
             let mut failure = failure;
             // This deadline is never renewed by reclamation or migration progress.
             // No pool, recovery-service or allocator lock crosses the reclaim scan.
@@ -421,6 +430,11 @@ impl DmaAllocator {
                         let (physical, count) = run.into_raw_parts();
                         return self.finish_raw(physical, count, options);
                     }
+                    // The synchronous attempt consumed only its own budget.
+                    // A real fragmented failure authorizes one background round.
+                    if options.compaction == DmaCompaction::DirectAndBackground {
+                        super::compaction::background::request(order, max, zone);
+                    }
                 }
             }
             return Err(failure.errno());
@@ -448,7 +462,7 @@ impl DmaAllocator {
     ) -> Result<DmaRawAllocation, RawAllocationFailure> {
         validate_cache_policy(options.cache_policy).map_err(RawAllocationFailure::System)?;
         #[cfg(target_arch = "x86_64")]
-        if options.compaction == DmaCompaction::Allowed {
+        if options.compaction.direct_allowed() {
             let max = PhysAddr::new(
                 options
                     .dma_mask

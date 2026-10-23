@@ -17,6 +17,7 @@ use crate::{
     process::ProcessManager,
 };
 
+pub(crate) mod background;
 pub(crate) mod recovery;
 
 static EXECUTION: Mutex<()> = Mutex::new(());

@@ -1,6 +1,6 @@
 use crate::driver::net::bridge::BridgeDriver;
 use crate::driver::net::loopback::LoopbackInterface;
-use crate::driver::net::IfacePollScope;
+use crate::driver::net::{IfacePollScope, PacketBuffer};
 use crate::exception::workqueue::{Work, WorkQueue};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::mutex::Mutex;
@@ -833,6 +833,9 @@ impl NetnsPoller {
             DefragSource::LocalInput => Some(CtPacketContext::Untracked),
             DefragSource::LinkIngress => None,
         };
+        // Preserve the already accepted legacy reassembly owner without an
+        // additional allocation or a new local-delivery failure condition.
+        let packet = PacketBuffer::from_existing_heap(packet);
         if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch_with_fragment(
             owner.as_ref(),
             completion.ingress_ifindex,

@@ -755,6 +755,11 @@ pub(crate) fn compaction_candidate(
         if *physical < min || *physical > max {
             continue;
         }
+        // A fixed-frame access owner already prevents isolation. This is only
+        // a discovery hint; migration must still win its atomic admission CAS.
+        if page.access_state.load(Ordering::Acquire) != 0 {
+            continue;
+        }
         let Some(data) = page.try_read() else {
             continue;
         };

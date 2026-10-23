@@ -4,7 +4,7 @@
 //! synchronously with sendto(2). The output owner retains the packet after
 //! those verdicts and handles device/neighbour backpressure asynchronously.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc};
 use core::cell::{Cell, RefCell};
 
 use smoltcp::wire::{IpAddress, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet};
@@ -13,7 +13,7 @@ use system_error::SystemError;
 use crate::{
     driver::net::{
         local_output::PreparedIpOutputReservation, local_queue::OutputCtContext,
-        types::InterfaceFlags, Iface, LocalPacketOrigin,
+        types::InterfaceFlags, Iface, LocalPacketOrigin, PacketBuffer,
     },
     process::namespace::net_namespace::NetNamespace,
 };
@@ -769,9 +769,7 @@ fn submit_ipv4(
     if clone_local {
         // A failed clone allocation/delivery must not cancel the original.
         // Copying precedes the clone's POST hook, matching skb_clone failure.
-        let mut clone = Vec::new();
-        if clone.try_reserve_exact(reservation.bytes().len()).is_ok() {
-            clone.extend_from_slice(reservation.bytes());
+        if let Ok(mut clone) = PacketBuffer::try_from_slice(reservation.bytes()) {
             let copy_ct = ct.fork();
             if matches!(
                 copy_ct.evaluate_ipv4(

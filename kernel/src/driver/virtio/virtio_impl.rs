@@ -152,7 +152,7 @@ unsafe impl Hal for VirtioQueueHal {
             DmaAllocOptions {
                 direction,
                 use_pool: false,
-                compaction: crate::mm::dma::DmaCompaction::Allowed,
+                compaction: crate::mm::dma::DmaCompaction::DirectAndBackground,
                 ..Default::default()
             },
         )

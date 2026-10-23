@@ -33,6 +33,8 @@ pub(crate) static RECOVERY_WAITERS: OomWaitQueue = OomWaitQueue::new();
 static READY: AtomicBool = AtomicBool::new(false);
 static WORK_PENDING: AtomicBool = AtomicBool::new(false);
 static RECLAIM_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+static COMPACTION_PENDING: AtomicBool = AtomicBool::new(false);
 static HIGH_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_EVENTS_PENDING: AtomicBool = AtomicBool::new(false);
 static STARTED: Completion = Completion::new();
@@ -65,9 +67,9 @@ pub(crate) fn request_oom_progress() {
     softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
 }
 
-/// Lazy-MM retirement is work even without OOM/event waiters. Keep pending
+/// Deferred MM/CPU-buffer retirement is work without OOM/event waiters. Keep pending
 /// before bootstrap readiness so the first worker round drains early owners.
-pub(crate) fn request_lazy_mm_drop() {
+pub(crate) fn request_deferred_drop() {
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
         softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
@@ -89,6 +91,16 @@ pub(crate) fn request_high_deadline() {
 /// Retain an early deadline until bootstrap, just like lazy-MM retirement.
 pub(crate) fn request_reclaim_deadline() {
     RECLAIM_PENDING.store(true, Ordering::Release);
+    WORK_PENDING.store(true, Ordering::Release);
+    if is_ready() {
+        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    }
+}
+
+/// Preserve early work before readiness, as with reclaim deadlines.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn request_compaction() {
+    COMPACTION_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
         softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
@@ -176,12 +188,21 @@ fn notification_loop() -> i32 {
             if HIGH_PENDING.swap(false, Ordering::AcqRel) {
                 crate::cgroup::memory::high::notify_deadlines();
             }
-            crate::mm::lazy_mm_drop::drain();
+            #[cfg(target_arch = "x86_64")]
+            if COMPACTION_PENDING.swap(false, Ordering::AcqRel) {
+                crate::mm::compaction::background::notify();
+            }
             RECOVERY_WAITERS.wake_all();
             crate::libs::resource_wait::wake_all();
             crate::filesystem::cgroup2::events::notify();
             if FILE_EVENTS_PENDING.swap(false, Ordering::AcqRel) {
                 crate::filesystem::cgroup2::event_notify::notify();
+            }
+            // Retire mapped owners only after progress/event waiters have had
+            // their wakeups. Finite batches cannot starve recovery delivery.
+            crate::mm::lazy_mm_drop::drain();
+            if crate::mm::cpu_buffer::drain_retired() {
+                WORK_PENDING.store(true, Ordering::Release);
             }
         }
         // Producers store pending before notifying this permanent waiter.

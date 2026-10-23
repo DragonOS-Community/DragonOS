@@ -604,6 +604,7 @@ fn typed_fragmented_arena() -> bool {
 pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     let cases = [
+        ("paged_header_storage", crate::libs::paged_vec::selftest()),
         ("strategy_zero_data_accounting", boundaries()),
         ("failure_fallback_admission", failure_policy()),
         ("unsupported_virtual_heap", unsupported_virtual()),
@@ -613,6 +614,22 @@ pub(crate) fn report() -> String {
         ("typed_alignment_limits", typed_alignment_and_limits()),
         ("typed_failure_rollback", typed_failure_rollback()),
         ("typed_fragmented_arena", typed_fragmented_arena()),
+        (
+            "cpu_buffer_deferred_retirement",
+            crate::mm::cpu_buffer::selftest(),
+        ),
+        (
+            "loopback_buffer_admission",
+            crate::driver::net::loopback::buffer_selftest(),
+        ),
+        (
+            "veth_buffer_admission",
+            crate::driver::net::veth::buffer_selftest(),
+        ),
+        (
+            "local_input_resident_capacity",
+            crate::driver::net::local_queue::input_residency_selftest(),
+        ),
     ];
     let failures = cases.iter().filter(|(_, ok)| !ok).count();
     let mut report = String::new();

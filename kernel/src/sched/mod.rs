@@ -1561,12 +1561,7 @@ pub fn enqueue_task_on_cpu(
         IDLE_CPUS.clear(target_cpu);
     }
 
-    // 对齐 Linux ttwu_do_activate() 的 wakeup_preempt()：activate_task 之后必须
-    // 对新任务做唤醒抢占检查（否则唤醒后的任务只能等下一个自然调度点）。
-    // 若被入队的正是该 rq 上的 current（例如自唤醒路径），无需再评估抢占自己。
-    if !Arc::ptr_eq(&rq.current(), pcb) {
-        rq.check_preempt_current(pcb, wake_flags);
-    }
+    rq.check_preempt_current(pcb, wake_flags);
 }
 
 pub fn request_task_migration(

@@ -547,12 +547,21 @@ impl X86_64MMArch {
                             return;
                         }
 
+                        // 定位信息：进程名 + fault 时刻的通用寄存器/栈指针。
+                        // 这些值是 fault 指令的现场快照，辅助分析访存操作数；
+                        // 不能将其解释为原 syscall 号或入参（errcode 是硬件错误码）。
                         log::error!(
-                            "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
+                            "pid: {} ({}) No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, flags: {:?}",
                             ProcessManager::current_pid().data(),
+                            ProcessManager::current_pcb().basic().name(),
                             error_code,
                             regs.rip,
                             address.data(),
+                            regs.rax,
+                            regs.rdi,
+                            regs.rsi,
+                            regs.rdx,
+                            regs.rsp,
                             flags
                         );
 

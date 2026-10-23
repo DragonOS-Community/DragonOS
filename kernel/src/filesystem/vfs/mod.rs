@@ -2543,10 +2543,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @return 成功：Ok(属性值的实际长度)
     ///         失败：Err(错误码)
     fn getxattr(&self, _name: &[u8], _buf: &mut [u8]) -> Result<usize, SystemError> {
-        log::debug!(
-            "getxattr unsupported for {}",
-            crate::libs::name::get_type_name(&self)
-        );
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
@@ -2564,20 +2560,14 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _value: &[u8],
         _flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        log::debug!(
-            "setxattr unsupported for {}",
-            crate::libs::name::get_type_name(&self)
-        );
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
 
     /// @brief 列出扩展属性名，返回实际列表长度。
     fn listxattr(&self, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        log::debug!(
-            "listxattr unsupported for {}",
-            crate::libs::name::get_type_name(&self)
-        );
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        // Linux vfs_listxattr() falls back to the security label list when
+        // the inode has no list method. No labels are provided by default.
+        Ok(0)
     }
 
     /// @brief 删除指定扩展属性。
@@ -2585,10 +2575,6 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        log::debug!(
-            "removexattr unsupported for {}",
-            crate::libs::name::get_type_name(&self)
-        );
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
     }
 

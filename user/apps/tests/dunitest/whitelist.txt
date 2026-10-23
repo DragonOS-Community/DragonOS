@@ -155,6 +155,7 @@ normal/kernel_buffer_selftest
 normal/overlay_xattr_selftest
 normal/xattr_syscall_selftest
 normal/xattr_syscall
+normal/xattr_unsupported
 normal/virtio_blk_backpressure
 normal/mknod_socket
 normal/pmem_block

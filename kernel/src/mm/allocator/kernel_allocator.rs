@@ -62,25 +62,10 @@ impl KernelAllocator {
     ) -> Result<NonNull<[u8]>, AllocError> {
         let page_frame_count = buddy_frame_count(layout);
         let allocation = if no_retry {
-            // 显式 no-retry 上下文（如 CPU buffer 分配）保持原语义：
-            // 不触发回收，立即把失败上抛给调用方的回退路径。
             LockedFrameAllocator
                 .allocate_below(page_frame_count, crate::mm::PhysAddr::new(usize::MAX))
         } else {
-            let allocation = LockedFrameAllocator.allocate(page_frame_count);
-            if allocation.is_none() {
-                // 对齐 Linux __alloc_pages_slowpath：分配失败先做同步直接回收
-                // 再重试，而不是立刻上抛（上抛后用户路径变成 OOM、内核堆路径
-                // 变成 alloc_error panic）。回收量按需求量放大，保证重试成功后
-                // 留有余量。
-                //
-                // 这里不能睡眠等待写回：调用方可能持有任意内核锁。回收路径自身
-                // 的分配失败由 try_direct_reclaim 的递归守卫挡住，不会重入。
-                crate::mm::page::try_direct_reclaim(page_frame_count.data().max(256) * 8, 4, false);
-                LockedFrameAllocator.allocate(page_frame_count)
-            } else {
-                allocation
-            }
+            LockedFrameAllocator.allocate(page_frame_count)
         };
         let (phy_addr, allocated_frame_count) = allocation.ok_or(AllocError)?;
         if allocated_frame_count != page_frame_count {
@@ -279,30 +264,8 @@ fn dealloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
 // }
 
 /// 内存分配错误处理函数
-///
-/// 到达这里说明 alloc_in_buddy 内的“直接回收后重试”也已经失败。alloc_error_handler
-/// 的签名是 `-> !`，无法把内存交还触发分配的调用点；此时也绝不能再 panic：
-/// panic 打印路径（error!/println!/Box）自身需要堆分配，堆耗尽时会级联触发
-/// 嵌套 panic 直至整机 halt。
-///
-/// 策略：再回收一次 → 零分配紧急串口输出现场 → 当前线程进入可中断的休眠循环
-/// （周期性再回收），把内核与其余 CPU 留给回收线程/OOM 杀进程路径去恢复内存。
 #[cfg(target_os = "none")]
 #[alloc_error_handler]
 pub fn global_alloc_err_handler(layout: Layout) -> ! {
-    crate::mm::page::try_direct_reclaim(layout.size().div_ceil(4096).max(256) * 8, 4, false);
-    crate::mm::oom::report::report(format_args!(
-        "[alloc-exhausted] size={} align={}; parking task, kernel alive\n",
-        layout.size(),
-        layout.align()
-    ));
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("sti; hlt", options(nomem, nostack, preserves_flags))
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        core::hint::spin_loop();
-        crate::mm::page::try_direct_reclaim(256, 1, false);
-    }
+    crate::debug::fatal::allocation_failure(layout)
 }

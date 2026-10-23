@@ -5,7 +5,7 @@ use core::{
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -44,7 +44,8 @@ use crate::{
 
 use super::{
     allocator::page_frame::{
-        deallocate_page_frames, FrameAllocator, PageFrameCount, PhysPageFrame,
+        deallocate_page_frames, FrameAllocationRequest, FrameAllocator, PageFrameCount,
+        PhysPageFrame,
     },
     syscall::ProtFlags,
     ucontext::LockedVMA,
@@ -269,7 +270,10 @@ fn allocate_registered_intrinsic_unevictable_pages_exact_inner(
 
     let (start_paddr, actual) = unsafe {
         LockedFrameAllocator
-            .allocate(PageFrameCount::new(allocator_pages))
+            .allocate_request(data_frame_request(
+                PageFrameCount::new(allocator_pages),
+                charge.as_ref(),
+            ))
             .ok_or(SystemError::ENOMEM)?
     };
     let mut raw = RawFrameExtent {
@@ -430,6 +434,22 @@ fn finish_lru_retirement(page: Arc<Page>) {
 // 物理页管理器
 /// Allocate and publish one ordinary data page with no allocation or physical
 /// OOM retry under either registry mutex. Cache membership is a later commit.
+fn data_frame_request(
+    count: PageFrameCount,
+    charge: Option<&MemoryCharge>,
+) -> FrameAllocationRequest {
+    if charge.is_some_and(|receipt| {
+        matches!(
+            receipt.kind(),
+            MemoryKind::Anon | MemoryKind::File | MemoryKind::Shmem
+        )
+    }) {
+        FrameAllocationRequest::user(count, PhysAddr::new(usize::MAX))
+    } else {
+        FrameAllocationRequest::kernel(count, PhysAddr::new(usize::MAX))
+    }
+}
+
 pub(crate) fn allocate_registered_data_page(
     page_type: PageType,
     flags: PageFlags,
@@ -468,15 +488,104 @@ pub(crate) fn allocate_registered_data_page_initialized(
     charge: Option<MemoryCharge>,
     initialize: impl FnOnce(PhysAddr) -> Result<(), SystemError>,
 ) -> Result<Arc<Page>, SystemError> {
+    let request = data_frame_request(PageFrameCount::ONE, charge.as_ref());
+    allocate_registered_data_page_initialized_with_request(
+        page_type, flags, charge, initialize, request,
+    )
+}
+
+fn reclaim_io_backing(
+    kind: MemoryKind,
+    noio: bool,
+    level: super::allocator::reserve::ReserveLevel,
+) -> bool {
+    kind == MemoryKind::File
+        && noio
+        && matches!(level, super::allocator::reserve::ReserveLevel::Reclaim)
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn reclaim_io_admission_selftest() -> bool {
+    use super::allocator::reserve::{kernel_level, with_reclaim_reserve, ReserveLevel};
+    let initial = kernel_level();
+    let noio_only = {
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        !reclaim_io_backing(
+            MemoryKind::File,
+            crate::cgroup::memory::io::noio_active(),
+            kernel_level(),
+        )
+    };
+    let scoped = with_reclaim_reserve(|| {
+        let without_io = !reclaim_io_backing(MemoryKind::File, false, kernel_level());
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        without_io
+            && reclaim_io_backing(
+                MemoryKind::File,
+                crate::cgroup::memory::io::noio_active(),
+                kernel_level(),
+            )
+            && !reclaim_io_backing(MemoryKind::Anon, true, kernel_level())
+            && !reclaim_io_backing(MemoryKind::Shmem, true, kernel_level())
+    });
+    matches!(initial, ReserveLevel::Kernel)
+        && noio_only
+        && scoped
+        && matches!(kernel_level(), ReserveLevel::Kernel)
+        && !reclaim_io_backing(MemoryKind::File, true, ReserveLevel::OomExit)
+        && scan_visit_budget_selftest()
+        && crate::mm::fault_recovery::budget_selftest()
+}
+
+/// Only PageCache's File path may identify a necessary stacked-I/O backing
+/// page. Ordinary data births (including nested anonymous faults) never use
+/// this exception; charging and the physical publication transaction are shared.
+pub(crate) fn allocate_registered_file_cache_page(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: MemoryCharge,
+) -> Result<Arc<Page>, SystemError> {
+    if !matches!(&page_type, PageType::File(_)) || charge.kind() != MemoryKind::File {
+        return Err(SystemError::EINVAL);
+    }
+    let request = if reclaim_io_backing(
+        charge.kind(),
+        crate::cgroup::memory::io::noio_active(),
+        super::allocator::reserve::kernel_level(),
+    ) {
+        FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+    } else {
+        FrameAllocationRequest::user(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+    };
+    allocate_registered_data_page_initialized_with_request(
+        page_type,
+        flags,
+        Some(charge),
+        |_| Ok(()),
+        request,
+    )
+}
+
+fn allocate_registered_data_page_initialized_with_request(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: Option<MemoryCharge>,
+    initialize: impl FnOnce(PhysAddr) -> Result<(), SystemError>,
+    request: FrameAllocationRequest,
+) -> Result<Arc<Page>, SystemError> {
     if charge
         .as_ref()
         .is_some_and(|charge| charge.pages() != 1 || !page_type.accepts_memory_kind(charge.kind()))
     {
         return Err(SystemError::EINVAL);
     }
+    // Production anonymous/COW/uprobe-private and file/shmem cache births
+    // carry their data receipt. Uncharged permanent/selftest pages and kernel
+    // backing keep Kernel admission; reserve authority never upgrades User.
     let paddr = unsafe {
         LockedFrameAllocator
-            .allocate_one()
+            .allocate_request(request)
+            .map(|(paddr, _)| paddr)
             .ok_or(SystemError::ENOMEM)?
     };
     let mut raw = RawFrameExtent {
@@ -822,7 +931,11 @@ impl PageManager {
             return Err(SystemError::EINVAL);
         }
         compiler_fence(Ordering::SeqCst);
-        let (start_paddr, count) = unsafe { allocator.allocate(count).ok_or(SystemError::ENOMEM)? };
+        let (start_paddr, count) = unsafe {
+            allocator
+                .allocate_request(data_frame_request(count, charge.as_ref()))
+                .ok_or(SystemError::ENOMEM)?
+        };
         compiler_fence(Ordering::SeqCst);
         let mut frames = PendingPageFrames {
             allocator,
@@ -935,7 +1048,12 @@ impl PageManager {
         self.phys2page
             .try_reserve(1)
             .map_err(|_| SystemError::ENOMEM)?;
-        let paddr = unsafe { allocator.allocate_one().ok_or(SystemError::ENOMEM)? };
+        let paddr = unsafe {
+            allocator
+                .allocate_request(data_frame_request(PageFrameCount::ONE, charge.as_ref()))
+                .map(|(paddr, _)| paddr)
+                .ok_or(SystemError::ENOMEM)?
+        };
 
         assert!(!self.contains(&paddr), "phys page: {paddr:?} already exist");
 
@@ -992,16 +1110,20 @@ fn page_reclaimer_thread_init() -> Result<(), SystemError> {
 fn page_reclaim_thread() -> i32 {
     let waits = reclaim_wait::ReclaimWait::new();
     loop {
-        let usage = unsafe { LockedFrameAllocator.usage() };
-        // log::info!("usage{:?}", usage);
-
-        // 保留4096个页面，总计16MB的空闲空间
-        if usage.free().data() < 4096 {
-            let page_to_free = 4096;
+        // Observe pressure before capacity so a concurrent edge prevents sleep.
+        let pressure_epoch = reclaim_wait::pressure_epoch();
+        let pressure = LockedFrameAllocator::pressure_snapshot();
+        let page_to_free = pressure.total_deficit();
+        if page_to_free != 0 {
             let writeback_generation = async_writeback_progress_snapshot();
             // 分离选择和回收阶段，避免长时间持有页面回收器锁导致与
             // page_manager/page_cache 的锁顺序反转。
-            let progress = PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
+            let progress = PageReclaimer::try_shrink_global(
+                PageFrameCount::new(page_to_free),
+                4096,
+                Some(pressure),
+            )
+            .unwrap_or_default();
             if progress.reclaimed == 0 {
                 // Any no-progress pass must yield: dirty pages may need an
                 // asynchronous writeback completion, while mapped,
@@ -1011,17 +1133,17 @@ fn page_reclaim_thread() -> i32 {
                 if progress.dirty_seen == 0
                     || !waits.wait_for_writeback_progress(writeback_generation)
                 {
-                    waits.pause_us(1_000);
+                    waits.pause_us(1_000, pressure_epoch);
                 }
             }
         } else {
             //TODO Temporarily let page reclaim thread handle dirty page writeback; should be separated later.
-            PageReclaimer::flush_dirty_pages();
+            crate::mm::allocator::reserve::with_reclaim_reserve(PageReclaimer::flush_dirty_pages);
 
             // Sleep 5 seconds, matching the Linux dirty_writeback_centisecs default.
             // Metadata writeback is handled by the VFS writeback thread. Keeping
             // sync_fs out of reclaim avoids coupling page reclaim to umount_lock.
-            waits.pause_us(5_000_000);
+            waits.pause_us(5_000_000, pressure_epoch);
         }
     }
 }
@@ -1033,71 +1155,6 @@ pub fn page_reclaimer_lock() -> ResourceMutexGuard<'static, PageReclaimer> {
 
 pub(crate) fn try_page_reclaimer_lock() -> Option<ResourceMutexGuard<'static, PageReclaimer>> {
     unsafe { ResourceMutexGuard::try_lock(PAGE_RECLAIMER.as_ref()?) }
-}
-
-/// 直接回收（direct reclaim）并发/递归守卫。
-///
-/// 回收路径自身（shrink、写回调度、OOM 选victim等）也会分配内存；这些分配失败后
-/// 若再次进入同步回收会形成递归。用全局原子标志保证同一时刻只有一个直接回收
-/// 在执行：递归或并发进入者直接返回 false，由上层按普通失败处理。
-static DIRECT_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// 同步直接回收：唤醒后台回收线程，并在当前上下文同步 shrink 若干轮。
-///
-/// 对齐 Linux `__alloc_pages_slowpath` 的语义：页分配失败后先回收再重试，
-/// 而不是立刻把失败上抛（否则用户缺页走 OOM、内核堆走 alloc_error panic）。
-///
-/// 调用方必须不持有页表锁/分配器锁（slab 的 buddy 回填路径在调用前已经释放
-/// SLABALLOCATOR 锁；alloc_in_buddy 失败时 buddy 锁也已释放）。
-///
-/// - `target_pages`: 每轮期望回收的页数。
-/// - `rounds`: 最多同步 shrink 的轮数。
-/// - `wait_writeback`: 是否允许睡眠等待异步写回取得进展。缺页路径可等待；
-///   内核堆分配失败路径可能持锁/关中断，必须传 false。
-///
-/// 返回 true 表示至少一轮回收有进展（回收了页或调度了写回）。
-pub fn try_direct_reclaim(target_pages: usize, rounds: usize, wait_writeback: bool) -> bool {
-    if DIRECT_RECLAIM_ACTIVE
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // 已有直接回收在执行（可能是当前调用链的递归进入），直接放弃。
-        return false;
-    }
-
-    struct ReclaimGuard;
-    impl Drop for ReclaimGuard {
-        fn drop(&mut self) {
-            DIRECT_RECLAIM_ACTIVE.store(false, Ordering::Release);
-        }
-    }
-    let _guard = ReclaimGuard;
-
-    // 先唤醒后台回收线程，让它并行处理脏页写回与回收。
-    if let Some(thread) = unsafe { PAGE_RECLAIMER_THREAD.as_ref() } {
-        let _ = ProcessManager::wakeup(thread);
-    }
-
-    let waits = reclaim_wait::ReclaimWait::new();
-    let mut any_progress = false;
-    for _ in 0..rounds {
-        let writeback_generation = async_writeback_progress_snapshot();
-        let progress = PageReclaimer::shrink_list(PageFrameCount::new(target_pages));
-        any_progress |= progress.reclaimed > 0 || progress.writeback_scheduled > 0;
-
-        if progress.reclaimed == 0 {
-            if wait_writeback && progress.dirty_seen > 0 {
-                // 没有干净页可回收、但存在脏页：等待异步写回取得进展后再扫。
-                if !waits.wait_for_writeback_progress(writeback_generation) {
-                    break;
-                }
-            } else {
-                // 无进展且没有写回可等：重复扫描同样的 LRU 不会有结果。
-                break;
-            }
-        }
-    }
-    any_progress
 }
 
 /// 页面回收器
@@ -1113,6 +1170,56 @@ pub struct ReclaimProgress {
     pub scanned: usize,
     pub dirty_seen: usize,
     pub writeback_scheduled: usize,
+    /// Candidate slots examined, including busy and ineligible pages.
+    pub visited: usize,
+    /// LRU size at this scan's start; never summed across passes/batches.
+    pub inventory: usize,
+}
+
+/// One pass owns both its remaining visits and whether per-priority quotas
+/// apply. An unlimited pass stays unlimited after consuming candidate slots.
+struct ReclaimVisitBudget {
+    remaining: usize,
+    finite: bool,
+}
+
+fn priority_visit_budget(remaining: usize, inventory: usize, priority: u32, finite: bool) -> usize {
+    if finite {
+        remaining.min((inventory >> priority).max(1))
+    } else {
+        remaining
+    }
+}
+
+#[cfg(feature = "mm_selftest")]
+fn scan_visit_budget_selftest() -> bool {
+    // Use the production quota calculation on the formerly starving 49K LRU.
+    let mut remaining = 2048usize;
+    let mut deepest = 12;
+    for priority in (0..=12).rev() {
+        let quota = priority_visit_budget(remaining, 49_152, priority, true);
+        if quota != 0 {
+            deepest = priority;
+        }
+        remaining = remaining.saturating_sub(quota);
+    }
+    let mut progress = ReclaimProgress {
+        visited: 2,
+        inventory: 49_152,
+        ..Default::default()
+    };
+    progress.accumulate(ReclaimProgress {
+        visited: 3,
+        inventory: usize::MAX,
+        ..Default::default()
+    });
+    deepest < 12
+        && remaining == 0
+        && progress.visited == 5
+        && progress.inventory == 49_152
+        && priority_visit_budget(usize::MAX, 49_152, 12, false) == usize::MAX
+        && priority_visit_budget(1, 0, 12, true) == 1
+        && priority_visit_budget(0, usize::MAX, 0, true) == 0
 }
 
 impl ReclaimProgress {
@@ -1120,6 +1227,7 @@ impl ReclaimProgress {
         self.reclaimed = self.reclaimed.saturating_add(other.reclaimed);
         self.detached = self.detached.saturating_add(other.detached);
         self.scanned = self.scanned.saturating_add(other.scanned);
+        self.visited = self.visited.saturating_add(other.visited);
         self.dirty_seen = self.dirty_seen.saturating_add(other.dirty_seen);
         self.writeback_scheduled = self
             .writeback_scheduled
@@ -1162,7 +1270,24 @@ impl PageReclaimer {
         // so exhausted heap capacity cannot silently disable global reclaim.
         let root = crate::cgroup::cgroup_root_node().memory_account();
         let mut lease = crate::cgroup::memory::protection::global_snapshot(&root);
-        Self::shrink_with_protection(lease.get_mut(), count, true, false)
+        crate::mm::allocator::reserve::with_reclaim_reserve(|| {
+            Self::shrink_with_protection(lease.get_mut(), count, true, false, usize::MAX, None)
+        })
+    }
+
+    /// Global physical pressure uses a shared visited-candidate budget across
+    /// all priorities and the memory.low retry, independently of pages freed.
+    /// None means another scan owns the preallocated workspace.
+    pub(crate) fn try_shrink_global(
+        count: PageFrameCount,
+        visits: usize,
+        zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+    ) -> Option<ReclaimProgress> {
+        let root = crate::cgroup::cgroup_root_node().memory_account();
+        let mut lease = crate::cgroup::memory::protection::try_global_snapshot(&root)?;
+        Some(crate::mm::allocator::reserve::with_reclaim_reserve(|| {
+            Self::shrink_with_protection(lease.get_mut(), count, true, false, visits, zones)
+        }))
     }
 
     /// Protection/topology preparation happens before taking any resource
@@ -1190,12 +1315,23 @@ impl PageReclaimer {
         noio: bool,
     ) -> Result<ReclaimProgress, SystemError> {
         let mut protection = ProtectionSnapshot::new(account)?;
-        Ok(Self::shrink_with_protection(
-            &mut protection,
-            count,
-            allow_unowned,
-            noio,
-        ))
+        let mut scan = || {
+            Self::shrink_with_protection(
+                &mut protection,
+                count,
+                allow_unowned,
+                noio,
+                usize::MAX,
+                None,
+            )
+        };
+        // NOIO retains an unrelated caller's resources and is not itself an
+        // authorization to spend reserves. Only the ordinary reclaim scan is.
+        Ok(if noio {
+            scan()
+        } else {
+            crate::mm::allocator::reserve::with_reclaim_reserve(scan)
+        })
     }
 
     fn shrink_with_protection(
@@ -1203,17 +1339,51 @@ impl PageReclaimer {
         count: PageFrameCount,
         allow_unowned: bool,
         noio: bool,
+        visits: usize,
+        zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
     ) -> ReclaimProgress {
-        let mut progress = Self::shrink_pass(count.data(), protection, false, allow_unowned, noio);
+        let inventory = if noio {
+            let Some(reclaimer) = try_page_reclaimer_lock() else {
+                return ReclaimProgress::default();
+            };
+            reclaimer.lru.len()
+        } else {
+            page_reclaimer_lock().lru.len()
+        };
+        // A bounded scan must leave the low-protection fallback reachable.
+        // Otherwise protected inventories larger than the entire visit budget
+        // exhaust every retry in the first pass and falsely trigger OOM.
+        let first_budget = if visits == usize::MAX {
+            visits
+        } else {
+            visits.div_ceil(2)
+        };
+        let mut budget = ReclaimVisitBudget {
+            remaining: first_budget,
+            finite: visits != usize::MAX,
+        };
+        let mut progress = Self::shrink_pass(
+            count.data(),
+            protection,
+            false,
+            allow_unowned,
+            noio,
+            &mut budget,
+            zones.as_ref(),
+        );
         if progress.reclaimed < count.data() && protection.low_skipped() {
+            budget.remaining = visits.saturating_sub(first_budget.saturating_sub(budget.remaining));
             progress.accumulate(Self::shrink_pass(
                 count.data() - progress.reclaimed,
                 protection,
                 true,
                 allow_unowned,
                 noio,
+                &mut budget,
+                zones.as_ref(),
             ));
         }
+        progress.inventory = inventory;
         progress
     }
 
@@ -1240,10 +1410,12 @@ impl PageReclaimer {
         low_reclaim: bool,
         allow_unowned: bool,
         noio: bool,
+        budget: &mut ReclaimVisitBudget,
+        zones: Option<&crate::mm::allocator::watermark::ZonePressureSnapshot>,
     ) -> ReclaimProgress {
         let mut progress = ReclaimProgress::default();
         for priority in (0..=12).rev() {
-            if progress.reclaimed >= goal {
+            if progress.reclaimed >= goal || budget.remaining == 0 {
                 break;
             }
             let lru_len = if noio {
@@ -1264,12 +1436,23 @@ impl PageReclaimer {
             if !protection.has_scan_budget() {
                 continue;
             }
+            // A non-consumable unowned protection stock must not trap a
+            // finite scan at priority 12. Each priority gets only its share
+            // of visited candidates, not the entire outer scan's allowance.
+            let priority_limit =
+                priority_visit_budget(budget.remaining, lru_len, priority, budget.finite);
+            let mut priority_remaining = priority_limit;
             progress.accumulate(Self::shrink_priority(
                 goal - progress.reclaimed,
                 protection,
                 low_reclaim,
                 noio,
+                &mut priority_remaining,
+                zones,
             ));
+            budget.remaining = budget
+                .remaining
+                .saturating_sub(priority_limit.saturating_sub(priority_remaining));
             crate::sched::cond_resched();
         }
         progress
@@ -1280,6 +1463,8 @@ impl PageReclaimer {
         protection: &mut ProtectionSnapshot,
         low_reclaim: bool,
         noio: bool,
+        remaining_visits: &mut usize,
+        zones: Option<&crate::mm::allocator::watermark::ZonePressureSnapshot>,
     ) -> ReclaimProgress {
         let mut progress = ReclaimProgress::default();
         let mut remaining = if noio {
@@ -1293,21 +1478,25 @@ impl PageReclaimer {
         } else {
             page_reclaimer_lock().lru.len()
         };
-        while remaining != 0 && progress.reclaimed < goal {
+        while remaining != 0 && progress.reclaimed < goal && *remaining_visits != 0 {
+            let snapshot_count = remaining.min(*remaining_visits);
             let slots = if noio {
                 let Some(mut reclaimer) = try_page_reclaimer_lock() else {
                     break;
                 };
-                reclaimer.reclaim_snapshot(remaining)
+                reclaimer.reclaim_snapshot(snapshot_count)
             } else {
-                page_reclaimer_lock().reclaim_snapshot(remaining)
+                page_reclaimer_lock().reclaim_snapshot(snapshot_count)
             };
             let mut visited = 0;
             for page in slots.into_iter().flatten() {
                 visited += 1;
+                *remaining_visits -= 1;
                 // Unprocessed slots only release their snapshot Arc; the
                 // original LRU nodes never left the list.
-                if progress.reclaimed < goal {
+                if progress.reclaimed < goal
+                    && zones.is_none_or(|zones| zones.needs_reclaim(page.phys_address()))
+                {
                     progress.accumulate(if noio {
                         Self::evict_page_noio(page, protection, low_reclaim)
                     } else {
@@ -1318,6 +1507,7 @@ impl PageReclaimer {
             if visited == 0 {
                 break;
             }
+            progress.visited = progress.visited.saturating_add(visited);
             remaining = remaining.saturating_sub(visited);
             // All candidate and backend pins have left their guard scopes.
             crate::sched::cond_resched();

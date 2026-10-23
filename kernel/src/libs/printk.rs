@@ -141,10 +141,10 @@ impl Logger {
         if unsafe { KMSG.is_some() } {
             let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
 
-            // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
-            // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。
             let log_message = LogMessage::new(timestamp, log_level, message.to_string());
 
+            // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
+            // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。
             let evicted = unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
             drop(evicted);
         }
@@ -164,10 +164,10 @@ impl Log for KernelLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            // 先输出到控制台再记录 kmsg：记录路径（锁+缓冲驱逐）一旦
-            // 异常，现场仍然已经上了串口，不会被记录路径吞掉。
-            Self::iodisplay(record);
+            // 记录到 kmsg 缓冲区
             Self::kernel_log(record);
+            // 输出到控制台
+            Self::iodisplay(record)
         }
     }
 
@@ -179,21 +179,15 @@ impl Log for KernelLogger {
 impl KernelLogger {
     fn iodisplay(record: &log::Record) {
         match record.level() {
-            Level::Error => writeln!(
-                PrintkWriter,
-                "\x1B[41m[ ERROR ] \x1B[0m({}:{})\t {}",
-                record.file().unwrap_or(""),
-                record.line().unwrap_or(0),
-                record.args()
-            ),
-            Level::Warn => writeln!(
-                PrintkWriter,
-                "\x1B[1;33m[ WARN ] \x1B[0m({}:{})\t {}",
-                record.file().unwrap_or(""),
-                record.line().unwrap_or(0),
-                record.args()
-            ),
-            _ => write!(PrintkWriter, "[ {} ] ", record.level(),),
+            Level::Debug | Level::Info | Level::Trace => {
+                write!(PrintkWriter, "[ {} ] ", record.level(),)
+            }
+            Level::Error => {
+                write!(PrintkWriter, "\x1B[41m[ ERROR ] \x1B[0m",)
+            }
+            Level::Warn => {
+                write!(PrintkWriter, "\x1B[1;33m[ WARN ] \x1B[0m",)
+            }
         }
         .unwrap();
         writeln!(

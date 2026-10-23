@@ -47,6 +47,7 @@ unsafe fn empty(backing: PhysAddr) -> BuddyAllocator<MMArch> {
         normal_empty_area,
         dma32_free_pages: 0,
         normal_free_pages: 0,
+        watermarks: [crate::mm::allocator::watermark::ZoneWatermarks::default(); 2],
         diagnostics: super::super::BuddyDiagnostics::default(),
         isolation: None,
         next_isolation_id: 1,

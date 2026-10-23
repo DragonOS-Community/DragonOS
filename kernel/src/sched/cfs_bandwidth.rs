@@ -1,7 +1,7 @@
 //! Shared CFS bandwidth. Runtime belongs to a task group, not to each CPU.
 //! Lock order is rq -> budget. Deadline callbacks release budget before rq.
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
 use super::fair::FairSchedEntity;
@@ -22,10 +22,6 @@ const CPUS: usize = PerCpu::MAX_CPU_NUM as usize;
 static RUNTIME_EVENTS: [SpinLock<Option<Arc<DeadlineEvent>>>; CPUS] =
     [const { SpinLock::new(None) }; CPUS];
 
-/// 每 CPU 最近一次武装 runtime 耗尽事件时的本地预算余额。expire 用它与
-/// 到期时的余额比较：预算没有减少就说明武装窗口内没有真实消耗在发生。
-static ARMED_REMAIN: [AtomicI64; CPUS] = [const { AtomicI64::new(0) }; CPUS];
-
 #[derive(Debug)]
 struct RuntimeDeadline {
     cpu: ProcessorId,
@@ -39,34 +35,13 @@ impl DeadlineCallback for RuntimeDeadline {
         if current.sched_info().sched_class() != SchedClass::Fair {
             return None;
         }
-        // 续排门控：预算域而非计费域。比较武装时的本地余额（ARMED_REMAIN）
-        // 与到期时的余额——预算没有减少，就说明这份预算没有在被真实消耗。
-        //
-        // 计费（sum_exec_runtime）可以在涨而预算不动：任务以亚毫秒周期
-        // sleep/wake 时，每次阻塞 return_slack() 都把本地余额钉回 RETAIN_NS
-        // 地板；到期时读到的还是同一个常量，计费却在别处推进。此时以
-        // now+remaining 自续，等于把一个不变的常量反复排成墙钟期限——
-        // 固定周期永久自续的定时器风暴（实测 TMICT 恒为 0x2fbaf、0.78ms
-        // 一次、注入 2000+/s，块提交管道被饿死）。
-        //
-        // 对齐 Linux：runtime 只随真实执行推进（update_curr 同点计费并扣
-        // runtime_remaining），无消耗就没有新的到期点。不续排时，超限检测
-        // 退回 tick/切换计费点粒度（Linux 粒度），下次真实计费后的 refresh
-        // 会重新武装精确期限。
         let mut se = current.sched_info().sched_entity();
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             se.cfs_rq().force_mut().update_current();
             (true, true)
         });
-        let armed = ARMED_REMAIN[self.cpu.data() as usize].load(Ordering::Relaxed);
         match remaining_runtime(&current) {
-            Some(remaining) if remaining > 0 => {
-                if remaining >= armed {
-                    return None;
-                }
-                ARMED_REMAIN[self.cpu.data() as usize].store(remaining, Ordering::Relaxed);
-                Some(now.saturating_add(remaining as u64))
-            }
+            Some(remaining) if remaining > 0 => Some(now.saturating_add(remaining as u64)),
             Some(_) => {
                 rq.resched_current();
                 None
@@ -95,11 +70,6 @@ fn remaining_runtime(task: &Arc<ProcessControlBlock>) -> Option<i64> {
 
 /// Exactly one exhaustion event per CPU, not one timer for every runnable
 /// task. Caller holds rq and passes the next task when rq.current is still old.
-///
-/// 注意：本函数只应在真实计费点之后调用（SchedClass::tick 的 entity_tick
-/// 计费后）。不要在 set_next_task 等切换入口无条件调用：I/O 密集任务以亚
-/// 毫秒周期 sleep/wake 时，每次唤醒都会把 RETAIN_NS 地板余额武装成一个
-/// 墙钟期限——每次切换一个定时器中断（实测 2000+/s 武装风暴）。
 pub(crate) fn refresh_runtime_event(rq: &mut CpuRunQueue, task: &Arc<ProcessControlBlock>) {
     let remaining = remaining_runtime(task);
     let slot = RUNTIME_EVENTS[rq.cpu().data() as usize].lock_irqsave();
@@ -108,7 +78,6 @@ pub(crate) fn refresh_runtime_event(rq: &mut CpuRunQueue, task: &Arc<ProcessCont
         .expect("runtime deadline events not initialized");
     match remaining {
         Some(remaining) if remaining > 0 => {
-            ARMED_REMAIN[rq.cpu().data() as usize].store(remaining, Ordering::Relaxed);
             let _ = event.arm(deadline::now_ns().saturating_add(remaining as u64));
         }
         Some(_) => {

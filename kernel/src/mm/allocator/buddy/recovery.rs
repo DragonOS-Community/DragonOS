@@ -40,29 +40,63 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         count: PageFrameCount,
         max: PhysAddr,
     ) -> Result<(PhysAddr, PageFrameCount), DmaAllocationFailure> {
+        self.try_allocate_for_dma_at_level(count, max, ReserveLevel::Kernel)
+    }
+
+    pub(crate) fn try_allocate_for_dma_at_level(
+        &mut self,
+        count: PageFrameCount,
+        max: PhysAddr,
+        level: ReserveLevel,
+    ) -> Result<(PhysAddr, PageFrameCount), DmaAllocationFailure> {
         if !count.data().is_power_of_two() || log2(count.data()) >= BUDDY_ORDER_COUNT {
             self.record_failure(None, AllocationFailure::InvalidOrder);
             return Err(DmaAllocationFailure::plain(AllocationFailure::InvalidOrder));
         }
-        match self.buddy_alloc_below_result(count, max) {
-            Err(AllocationFailure::AddressLimit) => Err(self
-                .reachable_capacity(count.data(), max, CAPACITY_SCAN_BUDGET)
-                .map(DmaAllocationFailure::fragmented)
-                .unwrap_or_else(|| DmaAllocationFailure::plain(AllocationFailure::AddressLimit))),
+        let result = self.buddy_alloc_below_with_level(count, max, level);
+        self.request_pressure_if_needed(result.is_err());
+        match result {
+            Err(AllocationFailure::AddressLimit) => Err(
+                match self.reachable_capacity(count.data(), max, CAPACITY_SCAN_BUDGET) {
+                    Some(zone)
+                        if self.admits(
+                            match zone {
+                                DmaRecoveryZone::Normal => BuddyZone::Normal,
+                                _ => BuddyZone::Dma32,
+                            },
+                            count.data(),
+                            0,
+                            level,
+                        ) =>
+                    {
+                        DmaAllocationFailure::fragmented(zone)
+                    }
+                    Some(_) => DmaAllocationFailure::plain(AllocationFailure::Reserve),
+                    None => DmaAllocationFailure::plain(AllocationFailure::AddressLimit),
+                },
+            ),
             // A protected low zone does not prevent compacting sufficient
             // Normal free capacity. Historical diagnostics stay unchanged.
             Err(AllocationFailure::Reserve)
                 if max.data() == usize::MAX
                     && self.has_normal_memory
-                    && self.normal_free_pages >= count.data() =>
+                    && self.normal_free_pages >= count.data()
+                    && (MIN_ORDER + log2(count.data())..MAX_ORDER)
+                        .all(|order| self.free_area(BuddyZone::Normal, order as u8).is_null()) =>
             {
-                Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Normal))
+                if self.admits(BuddyZone::Normal, count.data(), 0, level) {
+                    Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Normal))
+                } else {
+                    Err(DmaAllocationFailure::plain(AllocationFailure::Reserve))
+                }
             }
             Err(AllocationFailure::Fragmentation) => {
                 if max.data() == usize::MAX && self.has_normal_memory {
-                    if self.normal_free_pages >= count.data() {
+                    if self.admits(BuddyZone::Normal, count.data(), 0, level) {
                         Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Normal))
-                    } else if self.dma32_fallback_allowed(count.data()) {
+                    } else if self.dma32_fallback_allowed(count.data())
+                        && self.admits(BuddyZone::Dma32, count.data(), 0, level)
+                    {
                         Err(DmaAllocationFailure::fragmented(
                             DmaRecoveryZone::Dma32Fallback,
                         ))
@@ -135,7 +169,26 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 pub(super) fn typed_allocation_selftest(fresh: impl Fn() -> BuddyAllocator<MMArch>) -> bool {
     // Sibling calls keep each fixture's allocator locals out of the other's
     // stack frame. Do not call the fallback case from inside the base case.
-    typed_base_allocation_selftest(&fresh) && fallback_allocation_selftest(&fresh)
+    typed_base_allocation_selftest(&fresh)
+        && evidence_budget_selftest(&fresh)
+        && reserve_domain_selftest(&fresh)
+        && floor_classification_selftest(&fresh)
+        && finite_zone_proof_selftest(&fresh)
+        && fallback_allocation_selftest(&fresh)
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn attempt(
+    allocator: &mut BuddyAllocator<MMArch>,
+    count: PageFrameCount,
+    max: PhysAddr,
+) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
+    allocator
+        .try_allocate_for_dma(count, max)
+        .map_err(|failure| failure.reason)
 }
 
 #[cfg(all(
@@ -144,15 +197,6 @@ pub(super) fn typed_allocation_selftest(fresh: impl Fn() -> BuddyAllocator<MMArc
 ))]
 #[inline(never)]
 fn typed_base_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
-    fn attempt(
-        allocator: &mut BuddyAllocator<MMArch>,
-        count: PageFrameCount,
-        max: PhysAddr,
-    ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
-        allocator
-            .try_allocate_for_dma(count, max)
-            .map_err(|failure| failure.reason)
-    }
     let page = MMArch::PAGE_SIZE;
     let low = PhysAddr::new(0x0200_0000);
     let high = PhysAddr::new(1usize << 32);
@@ -194,6 +238,26 @@ fn typed_base_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -
     let dma32_fragment = attempt(&mut allocator, eight, PhysAddr::new(DMA32_LIMIT))
         == Err(AllocationFailure::Fragmentation);
 
+    invalid
+        && empty
+        && zone
+        && max_normalized
+        && bounded
+        && fragment
+        && diagnostic
+        && partial_page
+        && dma32_fragment
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn evidence_budget_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    let page = MMArch::PAGE_SIZE;
+    let low = PhysAddr::new(0x0200_0000);
+
     // More entries than the evidence budget: ordinary allocation sees no
     // high-order blocks, but must not label the partial capacity scan as
     // proven fragmentation. Metadata uses real private-fixture RAM; the
@@ -224,11 +288,23 @@ fn typed_base_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -
     budget_allocator.dma32_free_area[0] = metadata + 38 * page;
     budget_allocator.dma32_free_pages = blocks;
     budget_allocator.diagnostics.zones[0].free_blocks[0] = blocks;
-    let evidence_exhausted = attempt(
+    attempt(
         &mut budget_allocator,
         PageFrameCount::new(CAPACITY_SCAN_BUDGET),
         low + blocks * 2 * page - 1,
-    ) == Err(AllocationFailure::AddressLimit);
+    ) == Err(AllocationFailure::AddressLimit)
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn reserve_domain_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    let page = MMArch::PAGE_SIZE;
+    let low = PhysAddr::new(0x0200_0000);
+    let high = PhysAddr::new(1usize << 32);
+    let eight = PageFrameCount::new(8);
 
     let mut allocator = fresh();
     unsafe {
@@ -265,6 +341,58 @@ fn typed_base_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -
         == Err(AllocationFailure::ZoneLimit);
     let finite_cross_zone =
         attempt(&mut allocator, eight, high + 4 * page - 1) == Err(AllocationFailure::AddressLimit);
+
+    normal && reserve && normal_fragment_despite_reserve && combined_not_domain && finite_cross_zone
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn floor_classification_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    let low = PhysAddr::new(0x0200_0000);
+    let high = PhysAddr::new(1usize << 32);
+    let eight = PageFrameCount::new(8);
+
+    // Nonzero floors do not turn an undersized placement domain into a
+    // reserve denial, and real reserve denials must carry no compaction proof.
+    let mut allocator = fresh();
+    unsafe {
+        allocator.free(high, PageFrameCount::new(4));
+        allocator.free(low, PageFrameCount::new(4));
+    }
+    allocator.watermarks = [ZoneWatermarks {
+        min: 1,
+        low: 2,
+        high: 3,
+    }; 2];
+    let capacity_with_floor = allocator.try_allocate_for_dma(eight, PhysAddr::new(usize::MAX))
+        == Err(DmaAllocationFailure::plain(AllocationFailure::ZoneLimit));
+    let mut allocator = fresh();
+    unsafe { allocator.free(high, eight) };
+    allocator.watermarks[BuddyZone::Normal.index()] = ZoneWatermarks {
+        min: 1,
+        low: 2,
+        high: 3,
+    };
+    let reserve_with_capacity = allocator.try_allocate_for_dma(eight, PhysAddr::new(usize::MAX))
+        == Err(DmaAllocationFailure::plain(AllocationFailure::Reserve))
+        && allocator.normal_free_pages == eight.data();
+
+    capacity_with_floor && reserve_with_capacity
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn finite_zone_proof_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    let page = MMArch::PAGE_SIZE;
+    let low = PhysAddr::new(0x0200_0000);
+    let high = PhysAddr::new(1usize << 32);
+    let eight = PageFrameCount::new(8);
     // Preserve which finite-mask zone supplied the proof. A candidate in the
     // other zone would be capacity evacuation, not pure fragmentation recovery.
     let mut allocator = fresh();
@@ -283,23 +411,7 @@ fn typed_base_allocation_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -
     let finite_normal_proof = allocator.try_allocate_for_dma(eight, high + 16 * page - 1)
         == Err(DmaAllocationFailure::fragmented(DmaRecoveryZone::Normal));
 
-    invalid
-        && empty
-        && zone
-        && max_normalized
-        && bounded
-        && fragment
-        && diagnostic
-        && evidence_exhausted
-        && partial_page
-        && dma32_fragment
-        && normal
-        && reserve
-        && normal_fragment_despite_reserve
-        && combined_not_domain
-        && finite_cross_zone
-        && finite_low_proof
-        && finite_normal_proof
+    finite_low_proof && finite_normal_proof
 }
 
 #[cfg(all(

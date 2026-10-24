@@ -1,174 +1,233 @@
-use core::sync::atomic::{compiler_fence, Ordering};
-
 use super::klog::LogMessage;
-
-use crate::{debug::klog::loglevel::LogLevel, libs::spinlock::SpinLock};
-
-use alloc::{borrow::ToOwned, string::ToString, vec::Vec};
-
+use crate::{
+    debug::klog::loglevel::LogLevel,
+    libs::{paged_vec::PagedVec, spinlock::SpinLock},
+};
+use alloc::sync::Arc;
+use core::{
+    fmt::{self, Write},
+    sync::atomic::{compiler_fence, Ordering},
+};
 use kdepends::ringbuffer::{AllocRingBuffer, RingBuffer};
-
 use log::info;
 use system_error::SystemError;
 
-/// 缓冲区容量
 const KMSG_BUFFER_CAPACITY: usize = 1024;
-
-/// 全局环形缓冲区
 pub static mut KMSG: Option<SpinLock<Kmsg>> = None;
 
-/// 初始化KMSG
 pub fn kmsg_init() {
     info!("kmsg_init");
     let kmsg = SpinLock::new(Kmsg::new());
-
     compiler_fence(Ordering::SeqCst);
     unsafe { KMSG = Some(kmsg) };
     compiler_fence(Ordering::SeqCst);
     info!("kmsg_init done");
 }
 
-/// 日志
 pub struct Kmsg {
-    /// 环形缓冲区
-    buffer: AllocRingBuffer<LogMessage>,
-    /// 缓冲区字节数组
-    data: Vec<u8>,
-    /// 能够输出到控制台的日志级别，当console_loglevel为DEFAULT时，表示可以打印所有级别的日志消息到控制台
+    buffer: AllocRingBuffer<Arc<LogMessage>>,
     console_loglevel: LogLevel,
-    /// 判断buffer在上一次转成字节数组之后是否发生变动
-    is_changed: bool,
+    // Monotonic record identifiers, independent of ring indices. Exhausting
+    // u64 would require over 584 years at one billion records per second.
+    next_seq: u64,
+    clear_seq: u64,
 }
 
 impl Kmsg {
     pub fn new() -> Self {
-        Kmsg {
+        Self {
             buffer: AllocRingBuffer::new(KMSG_BUFFER_CAPACITY),
-            data: Vec::new(),
             console_loglevel: LogLevel::DEFAULT,
-            is_changed: false,
+            next_seq: 0,
+            clear_seq: 0,
         }
     }
 
-    /// 添加日志消息，返回被驱逐的最旧消息。
-    ///
-    /// 调用方在 KMSG 锁外 drop 返回值：日志缓冲在持锁且关中断的
-    /// printk 路径上，锁内任何堆分配/释放都可能进入分配器慢路径
-    /// （buddy/direct reclaim）睡眠，造成持有自旋锁的永久楔死
-    /// （脏盘重放现场的 slab deallocate 帧即来源于此）。
+    /// Both the new record allocation and eviction destruction belong outside
+    /// the IRQ-safe ring lock. Readers only clone the immutable record owner.
     #[must_use = "evicted message must be dropped outside the KMSG lock"]
-    pub fn push(&mut self, msg: LogMessage) -> Option<LogMessage> {
+    pub fn push(&mut self, msg: Arc<LogMessage>) -> Option<Arc<LogMessage>> {
         let evicted = if self.buffer.is_full() {
             self.buffer.dequeue()
         } else {
             None
         };
         self.buffer.push(msg);
-        self.is_changed = true;
+        self.next_seq += 1;
         evicted
     }
 
-    /// 读取缓冲区
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.tobytes();
-
-        match self.console_loglevel {
-            LogLevel::DEFAULT => self.read_all(buf),
-            _ => self.read_level(buf),
+    /// The caller reserves the complete bounded snapshot before taking the
+    /// ring lock. This method only clones owners into already prepared slots.
+    pub(super) fn capture(&mut self, snapshot: &mut LogSnapshot, kind: SnapshotKind) {
+        assert!(snapshot.records.is_empty());
+        let first_seq = self.next_seq - self.buffer.len() as u64;
+        let start_seq = if matches!(kind, SnapshotKind::Visible) {
+            first_seq.max(self.clear_seq)
+        } else {
+            first_seq
+        };
+        snapshot.first_seq = start_seq;
+        snapshot.end_seq = self.next_seq;
+        if matches!(kind, SnapshotKind::Prefix) {
+            snapshot.level = self.console_loglevel.clone();
+            self.console_loglevel = LogLevel::DEFAULT;
+        }
+        for msg in self.buffer.iter().skip((start_seq - first_seq) as usize) {
+            snapshot.records.push(msg.clone());
         }
     }
 
-    /// 读取缓冲区所有日志消息
-    pub fn read_all(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let len = self.data.len().min(buf.len());
-
-        // 拷贝数据
-        let src = &self.data[0..len];
-        buf[0..len].copy_from_slice(src);
-
-        return Ok(len);
+    pub fn clear(&mut self) {
+        self.clear_through(self.next_seq);
     }
 
-    /// 读取缓冲区特定level的日志消息
-    fn read_level(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let mut data_level: Vec<u8> = Vec::new();
-
-        for msg in self.buffer.iter() {
-            if msg.level() == self.console_loglevel {
-                data_level.append(&mut msg.to_string().as_bytes().to_owned());
-            }
-        }
-
-        let len = data_level.len().min(buf.len());
-
-        // 拷贝数据
-        let src = &data_level[0..len];
-        buf[0..len].copy_from_slice(src);
-
-        // 将控制台输出日志level改回默认，否则之后都是打印特定level的日志消息
-        self.console_loglevel = LogLevel::DEFAULT;
-
-        return Ok(data_level.len());
+    pub fn clear_through(&mut self, seq: u64) {
+        self.clear_seq = self.clear_seq.max(seq.min(self.next_seq));
     }
 
-    /// 读取并清空缓冲区
-    pub fn read_clear(&mut self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let r = self.read_all(buf);
-        self.clear()?;
-
-        return r;
-    }
-
-    /// 清空缓冲区
-    pub fn clear(&mut self) -> Result<usize, SystemError> {
-        self.buffer.clear();
-        self.data.clear();
-
-        return Ok(0);
-    }
-
-    /// 设置输出到控制台的日志级别
     pub fn set_level(&mut self, log_level: usize) -> Result<usize, SystemError> {
-        if !(1..=8).contains(&log_level) {
-            return Err(SystemError::EINVAL);
-        }
-        let log_level = log_level - 1;
-
         self.console_loglevel = match log_level {
-            0 => LogLevel::EMERG,
-            1 => LogLevel::ALERT,
-            2 => LogLevel::CRIT,
-            3 => LogLevel::ERR,
-            4 => LogLevel::WARN,
-            5 => LogLevel::NOTICE,
-            6 => LogLevel::INFO,
-            7 => LogLevel::DEBUG,
-            8 => LogLevel::DEFAULT,
+            1 => LogLevel::EMERG,
+            2 => LogLevel::ALERT,
+            3 => LogLevel::CRIT,
+            4 => LogLevel::ERR,
+            5 => LogLevel::WARN,
+            6 => LogLevel::NOTICE,
+            7 => LogLevel::INFO,
+            8 => LogLevel::DEBUG,
             _ => return Err(SystemError::EINVAL),
         };
+        Ok(0)
+    }
+}
 
-        return Ok(0);
+pub(super) enum SnapshotKind {
+    Prefix,
+    Visible,
+    Retained,
+}
+
+pub(super) struct LogSnapshot {
+    records: PagedVec<Arc<LogMessage>, KMSG_BUFFER_CAPACITY>,
+    first_seq: u64,
+    end_seq: u64,
+    level: LogLevel,
+}
+
+impl LogSnapshot {
+    pub fn try_new() -> Result<Self, SystemError> {
+        let mut records = PagedVec::new();
+        records.try_reserve(KMSG_BUFFER_CAPACITY)?;
+        Ok(Self {
+            records,
+            first_seq: 0,
+            end_seq: 0,
+            level: LogLevel::DEFAULT,
+        })
     }
 
-    /// 将环形缓冲区的日志消息转成字节数组以拷入用户buf
-    fn tobytes(&mut self) -> usize {
-        if self.is_changed {
-            self.data.clear();
+    pub fn byte_len(&self) -> usize {
+        self.records
+            .iter()
+            .map(|record| formatted_len(record))
+            .sum()
+    }
 
-            if self.console_loglevel == LogLevel::DEFAULT {
-                for msg in self.buffer.iter() {
-                    self.data.append(&mut msg.to_string().as_bytes().to_owned());
-                }
+    /// Linux READ_ALL returns the newest complete records that fit. The
+    /// returned cutoff includes skipped prefix and complete copied records,
+    /// but never a record whose copy faults partway through.
+    pub fn read_all(
+        &self,
+        limit: usize,
+        mut copy: impl FnMut(&[u8]) -> Result<(), SystemError>,
+    ) -> (Result<usize, SystemError>, u64) {
+        let mut remaining = self.byte_len();
+        let mut skip = 0;
+        for record in self.records.iter() {
+            if remaining <= limit {
+                break;
             }
-
-            self.is_changed = false;
+            remaining -= formatted_len(record);
+            skip += 1;
         }
-
-        return self.data.len();
+        let mut cutoff = self.first_seq + skip as u64;
+        let mut sink = CopySink {
+            copy: &mut copy,
+            copied: 0,
+            limit,
+            error: None,
+        };
+        for record in self.records.iter().skip(skip) {
+            if write!(&mut sink, "{}", record).is_err() {
+                return (Err(sink.error.unwrap_or(SystemError::EFAULT)), cutoff);
+            }
+            cutoff += 1;
+        }
+        debug_assert_eq!(cutoff, self.end_seq);
+        (Ok(sink.copied), cutoff)
     }
 
-    // 返回内核缓冲区所占字节数
-    pub fn data_size(&mut self) -> Result<usize, SystemError> {
-        return Ok(self.tobytes());
+    /// Preserve the existing READ/proc prefix policy and one-shot level
+    /// filtering; snapshot ownership and formatting are shared, not cursors.
+    pub fn read_prefix(
+        &self,
+        limit: usize,
+        mut copy: impl FnMut(&[u8]) -> Result<(), SystemError>,
+    ) -> Result<usize, SystemError> {
+        let mut sink = CopySink {
+            copy: &mut copy,
+            copied: 0,
+            limit,
+            error: None,
+        };
+        for record in self.records.iter() {
+            if (self.level == LogLevel::DEFAULT || record.level() == self.level)
+                && write!(&mut sink, "{}", record).is_err()
+            {
+                break;
+            }
+        }
+        match sink.error {
+            Some(error) => Err(error),
+            None => Ok(sink.copied),
+        }
+    }
+}
+
+fn formatted_len(record: &LogMessage) -> usize {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0 += text.len();
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = write!(&mut counter, "{}", record);
+    counter.0
+}
+
+struct CopySink<'a, F> {
+    copy: &'a mut F,
+    copied: usize,
+    limit: usize,
+    error: Option<SystemError>,
+}
+impl<F: FnMut(&[u8]) -> Result<(), SystemError>> Write for CopySink<'_, F> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let count = text.len().min(self.limit - self.copied);
+        if count != 0 {
+            if let Err(error) = (self.copy)(&text.as_bytes()[..count]) {
+                self.error = Some(error);
+                return Err(fmt::Error);
+            }
+            self.copied += count;
+        }
+        if count == text.len() {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
     }
 }

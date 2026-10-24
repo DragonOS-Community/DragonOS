@@ -127,7 +127,13 @@ impl Logger {
             return;
         }
         message.push_str(text);
-        let record = LogMessage::new(PosixTimeSpec::now_cpu_time(), level, message);
+        let Ok(record) = alloc::sync::Arc::try_new(LogMessage::new(
+            PosixTimeSpec::now_cpu_time(),
+            level,
+            message,
+        )) else {
+            return;
+        };
         // Kmsg::push 返回被驱逐消息，必须在锁外 drop：锁内释放堆内存可能
         // 进入分配器慢路径而睡眠（持自旋锁睡眠 = 永久楔死）。
         let evicted = match kmsg.try_lock_irqsave() {
@@ -141,7 +147,8 @@ impl Logger {
         if unsafe { KMSG.is_some() } {
             let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
 
-            let log_message = LogMessage::new(timestamp, log_level, message.to_string());
+            let log_message =
+                alloc::sync::Arc::new(LogMessage::new(timestamp, log_level, message.to_string()));
 
             // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
             // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。

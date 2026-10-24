@@ -7,7 +7,7 @@ use crate::{
         fcntl::AtFlags,
         open::{do_open_execat, do_open_execat_with_flags},
     },
-    libs::rand::rand_bytes,
+    libs::rand::fill_random_bytes,
     mm::ucontext::AddressSpace,
     process::{
         cred::{SUID_DUMPABLE, SUID_DUMP_DISABLE, SUID_DUMP_USER},
@@ -211,7 +211,7 @@ fn do_execve_internal(
         Ok(LoadBinaryResult::Loaded(result)) => {
             // 正常ELF加载流程
             // 生成16字节随机数
-            param.init_info_mut().rand_num = rand_bytes::<16>();
+            fill_random_bytes(&mut param.init_info_mut().rand_num);
 
             // 把proc_init_info写到用户栈上
             let mut ustack_message = unsafe {

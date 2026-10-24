@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, sync::Arc};
 use system_error::SystemError;
 use virtio_drivers::queue::VirtQueue;
-use virtio_drivers::transport::Transport;
+use virtio_drivers::transport::{DeviceStatus, Transport};
 
 use crate::driver::virtio::transport::VirtIOTransport;
 use crate::driver::virtio::virtio_drivers_error_to_system_error;
@@ -21,7 +21,7 @@ const POLL_INTERVAL_NS: i64 = 1_000_000;
 bitflags2::bitflags! {
     #[derive(Debug)]
     struct RngFeatures: u64 {
-        const NONE = 0;
+        const VERSION_1 = 1 << 32;
     }
 }
 
@@ -119,7 +119,10 @@ impl SecureEntropySource for VirtioEntropy {
 }
 
 pub(super) fn virtio_rng(mut transport: VirtIOTransport) {
-    transport.begin_init(RngFeatures::empty());
+    if let Err(error) = transport.try_begin_init(RngFeatures::VERSION_1) {
+        log::warn!("virtio-rng feature negotiation failed: {error}");
+        return;
+    }
     let queue = match VirtQueue::<HalImpl, QUEUE_SIZE>::new(&mut transport, 0, false, false) {
         Ok(queue) => queue,
         Err(error) => {
@@ -127,7 +130,7 @@ pub(super) fn virtio_rng(mut transport: VirtIOTransport) {
             return;
         }
     };
-    transport.finish_init();
+    transport.set_status(transport.get_status() | DeviceStatus::DRIVER_OK);
 
     let source = Arc::new(VirtioEntropy {
         device: Mutex::new(RngDevice {

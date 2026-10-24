@@ -40,7 +40,10 @@ impl<C> Transport for FakeTransport<C> {
         self.state.lock().unwrap().driver_features = driver_features;
     }
 
-    fn max_queue_size(&mut self, _queue: u16) -> u32 {
+    fn max_queue_size(&mut self, queue: u16) -> u32 {
+        if self.state.lock().unwrap().unavailable_queue == Some(queue) {
+            return 0;
+        }
         self.max_queue_size
     }
 
@@ -80,7 +83,11 @@ impl<C> Transport for FakeTransport<C> {
             }
             state.reset_acks += 1;
         }
-        state.status = status;
+        state.status = if state.reject_features && status.contains(DeviceStatus::FEATURES_OK) {
+            status - DeviceStatus::FEATURES_OK
+        } else {
+            status
+        };
     }
 
     fn set_guest_page_size(&mut self, guest_page_size: u32) {
@@ -88,7 +95,7 @@ impl<C> Transport for FakeTransport<C> {
     }
 
     fn requires_legacy_layout(&self) -> bool {
-        false
+        self.state.lock().unwrap().legacy
     }
 
     fn queue_set(
@@ -155,6 +162,12 @@ impl<C: 'static> Drop for FakeTransport<C> {
 /// Device state observed and updated by the driver and simulated device.
 #[derive(Debug, Default)]
 pub struct State {
+    /// Simulate a legacy MMIO interface rather than a modern transport.
+    pub legacy: bool,
+    /// Simulate feature negotiation rejection.
+    pub reject_features: bool,
+    /// A queue whose reported maximum size is zero.
+    pub unavailable_queue: Option<u16>,
     /// Most recently written device status.
     pub status: DeviceStatus,
     /// Optional number of reads before a requested reset is acknowledged.

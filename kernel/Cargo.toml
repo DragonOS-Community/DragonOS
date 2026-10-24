@@ -59,6 +59,9 @@ intertrait = { path = "crates/intertrait" }
 kcmdline_macros = { path = "crates/kcmdline_macros" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
+net-gso = { path = "crates/net-gso" }
+kernel-rng = { path = "crates/kernel-rng" }
+zeroize = { version = "=1.8.2", default-features = false }
 napi-state = { path = "crates/napi-state" }
 net-poll-state = { path = "crates/net-poll-state" }
 linkme = "=0.3.27"

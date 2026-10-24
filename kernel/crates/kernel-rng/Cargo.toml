@@ -1,0 +1,10 @@
+[package]
+name = "kernel-rng"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake2 = { version = "=0.10.6", default-features = false }
+rand_chacha = { version = "=0.3.1", default-features = false }
+rand_core = { version = "=0.6.4", default-features = false }
+zeroize = { version = "=1.8.2", default-features = false }

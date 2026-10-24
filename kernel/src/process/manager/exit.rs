@@ -43,6 +43,15 @@ struct ChildExitSiginfoSnapshot {
     stime: i64,
 }
 
+/// A reparent transaction freezes identity under the relation lock; delivery
+/// and release run after unlocking. Pending producer ownership is not duplicated.
+pub(in crate::process) struct ReparentedZombieNotification {
+    child: Arc<ProcessControlBlock>,
+    parent: Arc<ProcessControlBlock>,
+    snapshot: Option<ChildExitSiginfoSnapshot>,
+    reaped: bool,
+}
+
 impl ChildExitSiginfoSnapshot {
     fn into_siginfo(self, signal: Signal) -> SigInfo {
         SigInfo::new(
@@ -246,57 +255,61 @@ impl ProcessManager {
         child: &Arc<ProcessControlBlock>,
         token: NaturalParentNotifyToken,
     ) {
-        let Some(parent) = child.real_parent_pcb() else {
-            child.process_signal().complete_natural_parent_notify(token);
-            return;
+        let (parent, notification, autoreap) = {
+            // Select parent/disposition and claim autoreap in the same relation
+            // transaction. Reparent must not invalidate a sampled SIG_IGN.
+            let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+            let Some(parent) = child.real_parent_pcb() else {
+                child.process_signal().complete_natural_parent_notify(token);
+                return;
+            };
+            let exit_signal = child.exit_signal.load(Ordering::SeqCst);
+            let disposition = parent.sighand().handler(Signal::SIGCHLD);
+            let ignored = disposition
+                .as_ref()
+                .is_some_and(|action| action.is_ignore());
+            let no_cldwait = disposition
+                .as_ref()
+                .is_some_and(|action| action.flags().contains(SigFlags::SA_NOCLDWAIT));
+            let autoreap = exit_signal == Signal::SIGCHLD as i32 && (ignored || no_cldwait);
+            let notification = if exit_signal > 0 && !(autoreap && ignored) {
+                let signal = Signal::from(exit_signal);
+                Some((
+                    signal,
+                    Self::child_exit_siginfo_snapshot(child, &parent).into_siginfo(signal),
+                ))
+            } else {
+                None
+            };
+            if autoreap {
+                assert_eq!(
+                    child
+                        .process_signal()
+                        .try_reap_natural_child_as_notify_owner(child, &token),
+                    ReapTransition::Reaped,
+                    "natural-parent notification owner failed to autoreap"
+                );
+            }
+            (parent, notification, autoreap)
         };
-        let exit_signal = child.exit_signal.load(Ordering::SeqCst);
-        let disposition = parent.sighand().handler(Signal::SIGCHLD);
-        let ignored = disposition
-            .as_ref()
-            .map(|sa| sa.is_ignore())
-            .unwrap_or(false);
-        let no_cldwait = disposition
-            .as_ref()
-            .map(|sa| sa.flags().contains(SigFlags::SA_NOCLDWAIT))
-            .unwrap_or(false);
-        let autoreap = exit_signal == Signal::SIGCHLD as i32 && (ignored || no_cldwait);
-
-        // Snapshot every field before autoreap can unhash the child's PID.
-        let notification = if exit_signal > 0 && !(autoreap && ignored) {
-            let signal = Signal::from(exit_signal);
-            Some((
-                signal,
-                Self::child_exit_siginfo_snapshot(child, &parent).into_siginfo(signal),
-            ))
-        } else {
-            None
-        };
-
         if autoreap {
-            let transition = child
-                .process_signal()
-                .try_reap_natural_child_as_notify_owner(child, &token);
-            assert_eq!(
-                transition,
-                ReapTransition::Reaped,
-                "natural-parent notification owner failed to autoreap"
-            );
-            unsafe { ProcessManager::release(child.raw_pid()) };
+            unsafe {
+                Self::release(child.raw_pid());
+            }
         }
 
-        assert!(
-            child.process_signal().complete_natural_parent_notify(token),
-            "natural-parent notification ownership changed"
-        );
-        // Reparenting is serialized by PTRACE_RELATION_LOCK. If it completed
-        // before this snapshot, wake the new wait owner after publishing Done;
-        // if it happens later, the reparent path wakes after Done is visible
-        // to the waiter. This closes the Pending -> reparent lost-wakeup
-        // window without holding the relation lock across signal delivery.
-        let completion_parent = {
+        let (completion_parent, reparented) = {
             let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
-            child.real_parent_pcb()
+            assert!(
+                child.process_signal().complete_natural_parent_notify(token),
+                "natural-parent notification ownership changed"
+            );
+            let completion_parent = child.real_parent_pcb();
+            let reparented = completion_parent
+                .as_ref()
+                .filter(|new_parent| !Arc::ptr_eq(new_parent, &parent))
+                .and_then(|_| Self::prepare_reparented_zombie_locked(child));
+            (completion_parent, reparented)
         };
 
         if let Some((signal, mut info)) = notification {
@@ -319,9 +332,67 @@ impl ProcessManager {
             }
         }
 
+        if let Some(reparented) = reparented {
+            Self::finish_reparented_zombie(reparented);
+        }
+
         if child.is_kthread() {
             KernelThreadMechanism::notify_daemon();
         }
+    }
+
+    /// Caller holds PTRACE_RELATION_LOCK. Pair this decision with the Pending
+    /// -> Done transition under that same lock: exactly one side owns the new
+    /// parent's notification when exit races reparenting.
+    pub(in crate::process) fn prepare_reparented_zombie_locked(
+        child: &Arc<ProcessControlBlock>,
+    ) -> Option<ReparentedZombieNotification> {
+        if !child.is_zombie()
+            || ptrace::ptracer_of_locked(child).is_some()
+            || child.process_signal().natural_reap_blocked(child)
+            || child
+                .threads_read_irqsave()
+                .group_tasks
+                .iter()
+                .any(|task| task.upgrade().is_some())
+        {
+            return None;
+        }
+        let parent = child.real_parent_pcb()?;
+        let disposition = parent.sighand().handler(Signal::SIGCHLD);
+        let ignored = disposition
+            .as_ref()
+            .is_some_and(|action| action.is_ignore());
+        let autoreap = ignored
+            || disposition
+                .as_ref()
+                .is_some_and(|action| action.flags().contains(SigFlags::SA_NOCLDWAIT));
+        let snapshot = (!ignored).then(|| Self::child_exit_siginfo_snapshot(child, &parent));
+        let reaped = autoreap
+            && child.process_signal().try_reap_natural_child(child, true) == ReapTransition::Reaped;
+        Some(ReparentedZombieNotification {
+            child: child.clone(),
+            parent,
+            snapshot,
+            reaped,
+        })
+    }
+
+    pub(in crate::process) fn finish_reparented_zombie(event: ReparentedZombieNotification) {
+        if event.reaped {
+            unsafe {
+                Self::release(event.child.raw_pid());
+            }
+        }
+        if let Some(snapshot) = event.snapshot {
+            let mut info = snapshot.into_siginfo(Signal::SIGCHLD);
+            let _ = Signal::SIGCHLD.send_signal_info_to_pcb(
+                Some(&mut info),
+                event.parent.clone(),
+                PidType::TGID,
+            );
+        }
+        Self::wake_wait_parent(&event.parent);
     }
 
     fn wake_pidfd_pollers_for_task_exit(task: &Arc<ProcessControlBlock>) {
@@ -407,7 +478,7 @@ impl ProcessManager {
             // log::debug!("[exit: {}]", raw_pid.data());
             {
                 let pcb = current_pcb.clone();
-                let (group_leader, group_dead) = {
+                let (group_leader, group_dead, namespace_shutdown) = {
                     let _membership_guard = crate::process::pid::pid_membership_lock();
                     pcb.mark_exiting();
                     let thread = pcb.threads_read_irqsave();
@@ -420,7 +491,9 @@ impl ProcessManager {
                     // thread-group finalization without scanning group_tasks.
                     let previous = live.fetch_sub(1, Ordering::AcqRel);
                     assert_ne!(previous, 0, "thread-group live count underflow");
-                    (group_leader, previous == 1)
+                    let group_dead = previous == 1;
+                    let namespace_shutdown = pcb.prepare_pid_namespace_exit(group_dead);
+                    (group_leader, group_dead, namespace_shutdown)
                 };
                 ptrace::settle_exiting_group_stop(&pcb);
                 // Match Linux perf_event_exit_task(): terminal task events must be
@@ -428,10 +501,6 @@ impl ProcessManager {
                 // are still available. The perf fd retains its final count.
                 #[cfg(target_arch = "x86_64")]
                 crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
-                let pid = pcb.pid();
-                if pid.is_child_reaper() {
-                    pid.ns_of_pid().disable_pid_allocation();
-                }
                 pcb.wait_queue.mark_dead();
 
                 // Perform post-exit work for the process.
@@ -487,6 +556,13 @@ impl ProcessManager {
                 // chrooted child can make an unrelated umount report EBUSY.
                 pcb.exit_fs();
                 pcb.exit_timers(group_dead);
+
+                if let Some(namespace) = namespace_shutdown {
+                    // Detach this init's tracees before waiting for them. This
+                    // still runs with a schedulable task and interrupts enabled.
+                    Self::exit_ptrace(&pcb);
+                    namespace.shutdown(&pcb);
+                }
 
                 // Linux releases task namespaces before publishing Zombie, not
                 // when the parent eventually reaps the PCB. In particular, a

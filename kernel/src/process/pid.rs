@@ -712,9 +712,9 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
             }
         }
         retired.push(ns_guard.do_release_pid_in_ns(upid.nr));
-        let dead = ns_guard.dead();
+        let empty = ns_guard.do_pid_allocated() == 0;
         drop(ns_guard);
-        if dead {
+        if empty {
             // log::debug!("Releasing pid namespace with level {}", level);
             dead_namespaces.push(upid.ns);
         }
@@ -722,7 +722,7 @@ pub(super) fn free_pid(pid: Arc<Pid>) {
     }
     drop(transaction);
     for reaper in reapers {
-        ProcessManager::wakeup(&reaper).ok();
+        ProcessManager::wake_wait_parent(&reaper);
     }
     for namespace in dead_namespaces {
         namespace.delete_current_pidns_in_parent();

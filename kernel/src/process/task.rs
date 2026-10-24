@@ -1688,6 +1688,35 @@ impl ProcessControlBlock {
             })
     }
 
+    /// Called with PID_MEMBERSHIP_LOCK after consuming this task's live token.
+    /// Keep namespace reaper handoff ordered with fork publication and other
+    /// init threads entering exit; the final live thread alone owns shutdown.
+    pub(super) fn prepare_pid_namespace_exit(
+        self: &Arc<Self>,
+        group_dead: bool,
+    ) -> Option<Arc<crate::process::namespace::pid_namespace::PidNamespace>> {
+        if !self.task_pid_ptr(PidType::TGID)?.is_child_reaper() {
+            return None;
+        }
+        let namespace = self.active_pid_ns();
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        if group_dead {
+            namespace.set_child_reaper(Arc::downgrade(self));
+            namespace.disable_pid_allocation();
+            return Some(namespace);
+        }
+        let owns_reaper = namespace
+            .child_reaper()
+            .and_then(|reaper| reaper.upgrade())
+            .is_some_and(|reaper| Arc::ptr_eq(&reaper, self));
+        if owns_reaper {
+            let next = Self::find_alive_thread_reaper(self)
+                .expect("non-final namespace init exit must have a live sibling");
+            namespace.set_child_reaper(Arc::downgrade(&next));
+        }
+        None
+    }
+
     fn child_wait_parent_is(
         child: &Arc<ProcessControlBlock>,
         parent: &Arc<ProcessControlBlock>,
@@ -1890,28 +1919,10 @@ impl ProcessControlBlock {
         }
 
         let exiting_ns = exiting.active_pid_ns();
-        let init_pcb = ProcessManager::find_task_by_pid_ns(RawPid(1), &exiting_ns)
+        let init_pcb = exiting_ns
+            .child_reaper()
+            .and_then(|reaper| reaper.upgrade())
             .ok_or(SystemError::ECHILD)?;
-
-        // If the current process is the namespace init, children are adopted by
-        // the init of the parent's pidns.
-        if Arc::ptr_eq(&exiting, &init_pcb) {
-            if let Some(parent_pcb) = self.real_parent_pcb() {
-                assert!(
-                    !Arc::ptr_eq(&parent_pcb, &init_pcb),
-                    "adopt_childen: parent_pcb is init_pcb, pid: {}",
-                    self.raw_pid()
-                );
-                let parent_init =
-                    ProcessManager::find_task_by_pid_ns(RawPid(1), &parent_pcb.active_pid_ns());
-                if let Some(parent_init) = parent_init {
-                    for child in children {
-                        ProcessControlBlock::reparent_child_to_locked(&child, &parent_init);
-                    }
-                }
-            }
-            return Ok(());
-        }
 
         // Normal case: preferentially reparent to the “nearest ancestor
         // subreaper,” otherwise reparent to init.
@@ -1949,8 +1960,22 @@ impl ProcessControlBlock {
             cursor = leader.real_parent_pcb();
         }
 
-        for child in children {
-            ProcessControlBlock::reparent_child_to_locked(&child, &reaper);
+        let mut notifications = Vec::new();
+        for child in &children {
+            // Reparenting across thread groups always changes the exit signal
+            // to SIGCHLD, including children originally created as clones.
+            child
+                .exit_signal
+                .store(Signal::SIGCHLD as i32, Ordering::Release);
+            ProcessControlBlock::reparent_child_to_locked(child, &reaper);
+            if let Some(event) = ProcessManager::prepare_reparented_zombie_locked(child) {
+                notifications.push(event);
+            }
+        }
+
+        drop(_relation_guard);
+        for event in notifications {
+            ProcessManager::finish_reparented_zombie(event);
         }
 
         Ok(())

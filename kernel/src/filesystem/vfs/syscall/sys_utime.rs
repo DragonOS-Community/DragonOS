@@ -11,7 +11,7 @@ use crate::{
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-/// Linux `struct utimbuf`：两个 64 位 time_t（秒级精度）。
+/// Linux `struct utimbuf`: two 64-bit time_t fields with second precision.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct UtimeBuf {
@@ -19,12 +19,12 @@ struct UtimeBuf {
     modtime: i64,
 }
 
-/// `utime(2)`: 以秒级精度设置文件的访问/修改时间。
+/// Set file access and modification timestamps with second precision.
 ///
-/// 语义与 Linux 对齐（fs/utimes.c）：
-/// - `times == NULL`：两者均设为当前时间（等价 UTIME_NOW）；
-/// - 跟随符号链接；
-/// - 复用 `utimensat` 的路径解析与权限检查路径。
+/// Match Linux utime(2) semantics (fs/utimes.c):
+/// - A null times pointer sets both timestamps to the current time (UTIME_NOW).
+/// - Follow symbolic links.
+/// - Reuse the utimensat path resolution and permission checks.
 pub struct SysUtimeHandle;
 
 impl Syscall for SysUtimeHandle {

@@ -48,10 +48,10 @@ impl Display for LogMessage {
 
         let message = &self.message;
 
-        let res = format!(
-            "<{}>[{}.{}] : {}\n",
+        writeln!(
+            f,
+            "<{}>[{}.{}] : {}",
             level, timestamp.tv_sec, timestamp.tv_nsec, message
-        );
-        return write!(f, "{}", res);
+        )
     }
 }

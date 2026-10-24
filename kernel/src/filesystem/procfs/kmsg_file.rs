@@ -4,7 +4,7 @@
 
 use crate::filesystem::{
     procfs::{
-        kmsg::KMSG,
+        kmsg::{LogSnapshot, SnapshotKind, KMSG},
         template::{Builder, FileOps, ProcFileBuilder},
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
@@ -40,9 +40,14 @@ impl FileOps for KmsgFileOps {
     ) -> Result<usize, SystemError> {
         // 访问全局 KMSG 缓冲区
         let kmsg = unsafe { KMSG.as_ref().ok_or(SystemError::ENODEV)? };
-        let mut kmsg_guard = kmsg.lock();
-
-        // 读取 kmsg 内容
-        kmsg_guard.read(buf)
+        let mut snapshot = LogSnapshot::try_new()?;
+        kmsg.lock_irqsave()
+            .capture(&mut snapshot, SnapshotKind::Prefix);
+        let mut offset = 0;
+        snapshot.read_prefix(buf.len(), |bytes| {
+            buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len();
+            Ok(())
+        })
     }
 }

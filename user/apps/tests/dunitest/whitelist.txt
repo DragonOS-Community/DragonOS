@@ -308,3 +308,4 @@ normal/global_reclaim
 normal/riscv_signal_semantics
 normal/page_reporting
 normal/balloon_memory_integrity
+normal/syslog_snapshot

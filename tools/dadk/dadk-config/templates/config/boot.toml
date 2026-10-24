@@ -1,0 +1,90 @@
+[metadata]
+
+# Optional values: "grub-legacy", "grub-efi", "direct", "dragon-stub"
+# Note: "dragon-stub" can only be used with the riscv64 architecture
+boot-protocol = "grub-legacy"
+
+# Optional values: "graphic", "graphic-vnc", "no-graphic"
+boot-mode = "graphic"
+
+# Optional values: "qemu"
+hypervisor = "qemu"
+
+# Kernel command line arguments
+kcmd-args = [
+    "console=ttyS0",
+    "root=/dev/vda"
+]
+
+# Arguments passed to the init process
+init-args = []
+
+
+# (Optional) Grub2 configuration 
+[grub]
+# Time in seconds before the default entry is booted
+timeout = 10
+
+# (Optional) Grub2 i386-legacy configuration 
+[grub.i386-legacy]
+grub-file = "/opt/dragonos-grub/arch/i386/legacy/grub/bin/grub-file"
+grub-install = "/opt/dragonos-grub/arch/i386/legacy/grub/sbin/grub-install"
+
+# (Optional) Grub2 i386-efi configuration
+[grub.i386-efi]
+grub-file = "/opt/dragonos-grub/arch/i386/efi/grub/bin/grub-file"
+grub-install = "/opt/dragonos-grub/arch/i386/efi/grub/sbin/grub-install"
+
+# (Optional) Grub2 x86_64-efi configuration
+[grub.x86_64-efi]
+grub-file = "/opt/dragonos-grub/arch/x86_64/efi/grub/bin/grub-file"
+grub-install = "/opt/dragonos-grub/arch/x86_64/efi/grub/sbin/grub-install"
+
+
+# (Optional) DragonStub Bootloader configuration (Only for riscv64)
+[dragonstub]
+# The path to the source code of the DragonStub project.
+src-path = "kernel/submodules/DragonStub"
+
+
+[uboot]
+# URL to download U-Boot binary file
+#
+# If the URL is `https://mirrors.dragonos.org.cn/pub/third_party/u-boot`,
+# then the final download URL will be `https://mirrors.dragonos.org.cn/pub/third_party/u-boot/u-boot-{version}-{arch}.tar.xz`
+download-url = "https://mirrors.dragonos.org.cn/pub/third_party/u-boot"
+
+# U-Boot version
+version = "v2023.10"
+
+# Prefix directory for U-Boot binary file
+#
+# Example:
+# If the current architecture is `riscv64` and the version is `v2023.10`,
+# `path_prefix` is `bin/uboot/`,
+# then the path to locate the U-Boot binary file would be: `bin/uboot/riscv64/v2023.10/uboot.bin`
+path-prefix = "bin/uboot"
+
+
+[qemu]
+
+# (Optional) Path prefix for qemu binary.
+#
+# If not set, the default path will be used.
+#
+# Example:
+# Fill in `/usr/bin/qemu-system-`,
+# then for the `x86_64` architecture, `/usr/bin/qemu-system-x86_64` will be used.
+path-prefix = "qemu-system-"
+
+# Arguments to pass to qemu.
+args = """\
+    -machine virt \
+"""
+
+# Parameters to apply when no-graphic is enabled
+no-graphic-args = ""
+
+# (Optional) Hardware acceleration
+# 可选值："kvm", "tcg", "hvf", "none". 不填写时，默认为none
+accelerate = "kvm"

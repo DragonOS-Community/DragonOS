@@ -1,0 +1,24 @@
+{
+  "name": "app_normal",
+  "version": "0.1.0",
+  "description": "A normal app",
+  "task_type": {
+    "BuildFromSource": {
+      "Local": {
+        "path": "tests/data/apps/app_normal"
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "bash build.sh"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": null
+  },
+  "envs": [],
+  "build_once": false
+}

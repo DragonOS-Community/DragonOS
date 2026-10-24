@@ -26,7 +26,7 @@ cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-Ap
 ```
 
 4. Use `cargo run` to run the project.
-5. In the `user/dadk/config` directory of DragonOS, refer to the template [userapp_config.toml](https://github.com/DragonOS-Community/DADK/blob/main/dadk-config/templates/config/userapp_config.toml) to create a compilation configuration, and install it to the `/` directory of DragonOS.
+5. In the `user/dadk/config` directory of DragonOS, refer to the template `tools/dadk/dadk-config/templates/config/userapp_config.toml` to create a compilation configuration, and install it to the `/` directory of DragonOS.
 (When using the compilation command options of dadk, please use the `make install` configuration in the Makefile for compilation and installation)
 6. Compile DragonOS to install.
 

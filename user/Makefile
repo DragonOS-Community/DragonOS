@@ -27,13 +27,11 @@ install_dadk:
 ifeq ("$(DADK_VERSION)", "")
 	@echo "\ndadk is not installed."
 	@echo "Please install dadk $(MIN_DADK_VERSION) or higher version"
-	@echo "\nYou can install dadk by running the following command:"
-	@echo "\n\tcargo install dadk"
-	@echo "\nOr you can install dadk from source by running the following command:"
-	@echo "\n\tcargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) --locked"
+	@echo "\nYou can install dadk from this repository by running the following command:"
+	@echo "\n\tcargo install --path $(ROOT_PATH)/tools/dadk/dadk --locked"
 	@echo "\n"
 	@echo "Auto installing dadk..."
-	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) --locked
+	cargo install --path $(ROOT_PATH)/tools/dadk/dadk --locked
 else
 # 如果DADK版本过低，则自动更新
 	@echo "dadk version $(DADK_VERSION) installed"
@@ -41,7 +39,7 @@ else
 ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V | head -n1), $(MIN_DADK_VERSION))
 	@echo "dadk version is too low, please update to $(MIN_DADK_VERSION) or higher version"
 	@echo "Updating dadk..."
-	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) --locked || (echo "dadk update failed" && exit 1)
+	cargo install --path $(ROOT_PATH)/tools/dadk/dadk --locked || (echo "dadk update failed" && exit 1)
 	@echo "dadk updated"
 endif
 endif

@@ -1,0 +1,38 @@
+name: DADK
+
+on:
+  push:
+    branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "tools/dadk/**"
+      - ".github/workflows/dadk.yml"
+  pull_request:
+    branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "tools/dadk/**"
+      - ".github/workflows/dadk.yml"
+
+jobs:
+  build-test:
+    name: Build, test, and format
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/dadk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native TLS build dependencies
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check formatting
+        run: cargo fmt --check

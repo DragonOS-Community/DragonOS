@@ -1082,9 +1082,7 @@ TEST(SysvShmSemantics, MapFixedReplacementUsesNetRlimitAsGrowth) {
     ScopedAddressSpaceLimit lim;
     ASSERT_TRUE(lim.valid());
     const size_t current_vm = CurrentVmSizeBytes();
-    if (current_vm == 0) {
-        GTEST_SKIP() << "cannot read VmSize from /proc/self/status";
-    }
+    ASSERT_GT(current_vm, 0u) << "cannot read VmSize from /proc/self/status";
     if (!lim.set_bytes(current_vm)) {
         GTEST_SKIP() << "cannot lower RLIMIT_AS";
     }

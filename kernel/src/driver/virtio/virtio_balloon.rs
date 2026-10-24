@@ -605,9 +605,9 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
         .reset()
         .map_err(super::virtio_drivers_error_to_system_error)?;
     let mut supported = Features::all();
-    // The global OOM notifier is currently reached through user page faults.
-    // Eager-allocation architectures cannot yet return balloon pages on OOM.
-    if !MMArch::PAGE_FAULT_ENABLED {
+    // These architectures route user fault OOM through the global notifier.
+    // Eager versus lazy allocation is independent of that recovery capability.
+    if !cfg!(any(target_arch = "x86_64", target_arch = "riscv64")) {
         supported.remove(Features::DEFLATE_ON_OOM);
     }
     let features = transport.begin_init(supported);

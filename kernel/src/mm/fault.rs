@@ -454,12 +454,10 @@ impl<'a> PageFaultMessage<'a> {
         let index = table.index_of(address).unwrap();
         entry.set_flags(entry.flags().set_write(true).set_dirty(true));
         table.set_entry(index, entry);
-        mm.flush_tlb_range(
-            address,
-            VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
-            MMArch::PAGE_SHIFT as u8,
-            false,
-        );
+        // 与 do_wp_page 相同：shootdown 会等待远端 ACK，不能在页表编辑临界区
+        // （且持有 rmap/页表锁）内发起，守卫释放后统一执行。
+        drop(_pt_edit);
+        flush_tlb_after_unlock(&mm, address);
         VmFaultReason::VM_FAULT_COMPLETED
     }
 

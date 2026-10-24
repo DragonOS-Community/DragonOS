@@ -66,10 +66,36 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
                 CurrentIrqArch::interrupt_disable();
                 process_flags_work = ProcessManager::current_pcb().flags().load();
             }
+            // Deferred CLONE_CHILD_SETTID write for a first-run child. The
+            // address is in user memory and may fault (COW); write it with
+            // interrupts enabled so a fault-time TLB shootdown is safe.
+            if process_flags_work.contains(ProcessFlags::NEED_CHILD_TID) {
+                let pcb = ProcessManager::current_pcb();
+                pcb.flags().remove(ProcessFlags::NEED_CHILD_TID);
+                if let Some(addr) = pcb.take_set_child_tid() {
+                    let child_tid = pcb.task_pid_vnr().data() as i32;
+                    CurrentIrqArch::interrupt_enable();
+                    let _ = unsafe {
+                        crate::syscall::user_access::write_one_to_user_protected(addr, &child_tid)
+                    };
+                    CurrentIrqArch::interrupt_disable();
+                }
+                process_flags_work = pcb.flags().load();
+            }
+
             // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
             // rseq 的 IP fixup 必须在信号递送之前完成
             if process_flags_work.contains(ProcessFlags::NEED_RSEQ) {
+                // Rseq writes the CPU id back to the registered user structure
+                // with `copy_to_user`. On a COW address space (e.g. after fork)
+                // that write can fault and must be able to issue a synchronous
+                // TLB shootdown; a shootdown initiated with IRQs disabled can
+                // deadlock against another IRQ-disabled initiator. Run the
+                // resume work with interrupts enabled, like Linux's
+                // `resume_user_mode_work()`.
+                CurrentIrqArch::interrupt_enable();
                 let _ = Rseq::handle_notify_resume(Some(frame));
+                CurrentIrqArch::interrupt_disable();
                 process_flags_work = ProcessManager::current_pcb().flags().load();
             }
 

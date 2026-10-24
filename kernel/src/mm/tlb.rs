@@ -384,7 +384,12 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
     let active = AtomicCpuMask::new();
     let my_cpu = smp_get_processor_id();
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
-        if cpu != my_cpu && target_cpus.get(cpu) && smp_cpu_manager().is_online_cpu(cpu) {
+        if cpu != my_cpu
+            && target_cpus.get(cpu)
+            && (smp_cpu_manager().is_online_cpu(cpu) || smp_cpu_manager().is_dying_cpu(cpu))
+        {
+            // `Dying` CPUs may still execute and access this mm until they are
+            // `Dead`, so they must be invalidated too (and waited for).
             active.set(cpu);
         }
     }
@@ -423,7 +428,14 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             }
         }
 
-        // Poll for done
+        // Poll for done.
+        //
+        // Liveness: a `Dead` CPU will never execute `remote_flush_tlb_on_ipi`
+        // again, so it can never acknowledge. It also performs no further memory
+        // accesses, which means the shootdown it was asked to perform is moot —
+        // continuing to wait would pin the initiator (preemption is disabled and
+        // the caller may hold locks) forever. A `Dying` CPU is still running and
+        // must acknowledge, so only `Dead` ends the wait.
         for cpu in active.iter_cpu() {
             if cpu == my_cpu {
                 continue;
@@ -431,7 +443,18 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             let csd = unsafe { csd_flush_tlb().force_get(cpu) };
             #[cfg(feature = "mm_selftest")]
             let mut test_spins = 0usize;
+            let mut spins = 0u64;
             while !csd.done.load(Ordering::Acquire) {
+                spins += 1;
+                // Checking the (cross-CPU) hotplug state on every iteration would
+                // add pointless global traffic to the normal microsecond-scale
+                // acknowledgement window; a target that goes away stays away.
+                if spins & 1023 == 0 && smp_cpu_manager().is_dead_cpu(cpu) {
+                    // Only `Dead` CPUs are guaranteed never to run again. A
+                    // `Dying` CPU may still execute (and access the page tables)
+                    // until it parks, so it must still acknowledge.
+                    break;
+                }
                 #[cfg(feature = "mm_selftest")]
                 if let Some(observer) = &info.observer {
                     if !observer.skip_ack() {
@@ -470,6 +493,33 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
     }
 }
 
+/// Verify the context required to *initiate* a synchronous cross-CPU shootdown.
+///
+/// The initiator must run with interrupts enabled, exactly like Linux
+/// `flush_tlb_mm_range()` (which is entered from process context and waits for
+/// acknowledgements in a preemption-disabled but interruptible region):
+///
+/// - While waiting for acknowledgements the initiator itself must be able to
+///   take another CPU's `FlushTLB` IPI; otherwise two initiators that both want
+///   the (target-owned) CSD slots can wait on each other.
+/// - An IRQ taken inside the caller's atomic region can re-enter
+///   `__schedule_inner()` and try to take the runqueue lock that the interrupted
+///   frame already holds — a self-deadlock that ends in a `self_lock` spinout
+///   panic. Callers must not initiate a shootdown from such a region.
+///
+/// This is a caller contract, checked in debug builds. The return-to-user
+/// boundary and the page-fault COW paths enable interrupts before any potential
+/// user-memory write (see `exit_to_user_mode_loop` and the deferral of
+/// `CLONE_CHILD_SETTID`).
+#[inline]
+fn check_shootdown_context() {
+    #[cfg(target_arch = "x86_64")]
+    debug_assert!(
+        CurrentIrqArch::is_irq_enabled(),
+        "TLB shootdown must be initiated with interrupts enabled"
+    );
+}
+
 /// Range-based TLB flush for the specified mm.
 ///
 /// - `start`: start virtual address
@@ -483,22 +533,16 @@ pub fn flush_tlb_mm_range(
     stride_shift: u8,
     freed_tables: bool,
 ) {
-    // Serialize before disabling local interrupts. If a CPU spins for the
-    // shootdown CSD slots with IRQs disabled, it cannot service another CPU's
-    // TLB IPI, and two concurrent flush initiators can deadlock.
-    #[cfg(target_arch = "x86_64")]
-    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-    }
+    check_shootdown_context();
+
+    // Serialize initiators: the per-target CSD slot can only carry one in-flight
+    // request. This lock is acquired with interrupts enabled (see
+    // `check_shootdown_context`) and disables preemption, so a CPU parked on it
+    // can still acknowledge a shootdown addressed to it. Holding it also keeps
+    // `info` (a stack object) alive and this CPU pinned for the whole protocol —
+    // which is why interrupts no longer need to be disabled here.
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
-
-    // Disable interrupts to protect the entire initiation process:
-    // - Prevent migration during inc_tlb_gen and snapshot of active_cpus;
-    // - Prevent being scheduled out while waiting for IPI ack.
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // Publish barrier: ensure page table writes are visible to other CPUs before the generation increment.
     compiler_fence(Ordering::SeqCst);
@@ -550,12 +594,6 @@ pub fn flush_tlb_mm_range(
         observer.flush_returned();
     }
     compiler_fence(Ordering::SeqCst);
-    drop(irq_guard);
-
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_disable() };
-    }
 }
 
 /// Synchronously invalidate a kernel address-space range on every online CPU.
@@ -592,16 +630,11 @@ fn flush_tlb_kernel_range_inner(
         Arc<selftest::Observer>,
     >,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-    }
+    check_shootdown_context();
+
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
 
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     compiler_fence(Ordering::SeqCst);
     let this_cpu = smp_get_processor_id();
     let info = FlushTlbInfo {
@@ -630,12 +663,6 @@ fn flush_tlb_kernel_range_inner(
         observer.flush_returned();
     }
     compiler_fence(Ordering::SeqCst);
-    drop(irq_guard);
-
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_disable() };
-    }
 }
 
 /// Convenience wrapper for full-mm flush

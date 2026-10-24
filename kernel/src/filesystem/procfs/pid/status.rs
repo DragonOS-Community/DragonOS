@@ -54,13 +54,9 @@ impl StatusFileOps {
         let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 
-        let (name, user_vm, fd_table) = {
+        let (name, fd_table) = {
             let basic = pcb.basic();
-            (
-                basic.name().to_string(),
-                basic.user_vm(),
-                basic.try_fd_table(),
-            )
+            (basic.name().to_string(), basic.try_fd_table())
         };
 
         let sched_info_guard = pcb.sched_info();
@@ -176,8 +172,13 @@ impl StatusFileOps {
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 
-        if let Some(user_vm) = user_vm {
-            let address_space_guard = user_vm.read();
+        // Like Linux get_task_mm(), pin the mm's users, not just its Arc:
+        // exit/exec must not tear down mappings while this snapshot is taken.
+        if let Some(user_vm) = pcb.active_vm() {
+            let address_space_guard = user_vm.vm().read_guard_no_reservations();
+            // Match stat/statm: count committed virtual mappings, including
+            // untouched/PROT_NONE ranges, rather than resident physical pages.
+            let size = address_space_guard.vma_usage_bytes() / 1024;
             // todo: 当前进程运行过程中占用内存的峰值
             let hiwater_vm: u64 = 0;
             // 进程代码段的大小
@@ -185,11 +186,14 @@ impl StatusFileOps {
             // 进程数据段的大小
             let data = (address_space_guard.end_data - address_space_guard.start_data) / 1024;
             drop(address_space_guard);
+            // The last mmput can take the mm write lock during teardown.
+            drop(user_vm);
             pdata.append(
                 &mut format!("\nVmPeak:\t{} kB", hiwater_vm)
                     .as_bytes()
                     .to_owned(),
             );
+            pdata.append(&mut format!("\nVmSize:\t{} kB", size).as_bytes().to_owned());
             pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
             pdata.append(&mut format!("\nVmExe:\t{} kB", text).as_bytes().to_owned());
         }

@@ -604,7 +604,13 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
     transport
         .reset()
         .map_err(super::virtio_drivers_error_to_system_error)?;
-    let features = transport.begin_init(Features::all());
+    let mut supported = Features::all();
+    // The global OOM notifier is currently reached through user page faults.
+    // Eager-allocation architectures cannot yet return balloon pages on OOM.
+    if !MMArch::PAGE_FAULT_ENABLED {
+        supported.remove(Features::DEFLATE_ON_OOM);
+    }
+    let features = transport.begin_init(supported);
     // Read raw offered bits after ACKNOWLEDGE/DRIVER. Declining stats/hint
     // does not remove their existing slots from the host's queue topology.
     let offered = transport.read_device_features();
@@ -619,7 +625,7 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
         .map_err(super::virtio_drivers_error_to_system_error)?;
     // IRQ reservation/installation may allocate; use the still-private
     // transport without an IRQ-save register lock. DRIVER_OK is not set.
-    let setup = match transport.setup_irq(dev_id.clone()) {
+    let mut setup = match transport.setup_irq(dev_id.clone()) {
         Ok(setup) => Some(setup),
         Err(error) => {
             // MSI/MSI-X is optional for PCI balloon devices. A safe fallback
@@ -657,6 +663,18 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
             mem::forget((inflate, deflate, reporting, transport, setup));
         }
         return Err(super::virtio_drivers_error_to_system_error(error));
+    }
+    if setup.is_some() && !transport.config_irq_valid() {
+        // DRIVER_OK is still clear and no buffers have been submitted. Release
+        // the IRQ before checking that polling can safely own this transport.
+        drop(setup.take());
+        if let Err(error) = transport.prepare_polling() {
+            if transport.reset().is_err() {
+                mem::forget((inflate, deflate, reporting, transport));
+            }
+            return Err(error);
+        }
+        log::warn!("virtio-balloon: configuration IRQ vector rejected, using polling");
     }
     if setup.is_none() {
         for queue in [&mut inflate, &mut deflate, &mut reporting]
@@ -700,22 +718,10 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
         }
         return Err(error);
     }
-    let irq_result = if let Some(deferred) = deferred_irq {
-        deferred.install(dev_id.clone())
-    } else {
-        Ok(())
-    };
-    if let Err(error) = irq_result {
-        if transport.lock_irqsave().reset().is_err() {
-            // The callback/IRQ lease must also remain live on unconfirmed reset.
-            mem::forget(device);
-        } else {
-            virtio_irq_manager().unregister_callback(&dev_id);
-        }
-        return Err(error);
-    }
     // Probe is serial. Bootstrap before publishing this device so failed
     // worker creation can roll back the complete unpublished resource owner.
+    // Install the deferred MMIO IRQ only after this last fallible bootstrap;
+    // a failed worker must not leave an IRQ action without its callback.
     let worker_result = if WORKER.lock_irqsave().is_none() {
         let closure = KernelThreadClosure::StaticEmptyClosure((&(worker_loop as fn() -> i32), ()));
         match KernelThreadMechanism::create_on_cpu(
@@ -733,6 +739,20 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
         Ok(())
     };
     if let Err(error) = worker_result {
+        if transport.lock_irqsave().reset().is_err() {
+            // The callback/IRQ lease must also remain live on unconfirmed reset.
+            mem::forget(device);
+        } else {
+            virtio_irq_manager().unregister_callback(&dev_id);
+        }
+        return Err(error);
+    }
+    let irq_result = if let Some(deferred) = deferred_irq {
+        deferred.install(dev_id.clone())
+    } else {
+        Ok(())
+    };
+    if let Err(error) = irq_result {
         if transport.lock_irqsave().reset().is_err() {
             // The callback/IRQ lease must also remain live on unconfirmed reset.
             mem::forget(device);

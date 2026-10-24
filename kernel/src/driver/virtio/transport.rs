@@ -175,6 +175,13 @@ pub enum VirtIOTransport {
 }
 
 impl VirtIOTransport {
+    pub(crate) fn config_irq_valid(&self) -> bool {
+        match self {
+            Self::Pci(transport) => transport.config_irq_valid(),
+            Self::Mmio(_) => true,
+        }
+    }
+
     pub fn irq(&self) -> IrqNumber {
         match self {
             VirtIOTransport::Pci(transport) => transport.irq(),

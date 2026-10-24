@@ -432,7 +432,8 @@ impl MetadataBlockCache {
                     (index, true)
                 }
                 // Every way is pinned by a Loading or Dirty entry. Skipping
-                // admission is safe; the next read will load from disk.
+                // admission is safe: accepted reads use the batch overlay,
+                // while home-current reads can load from the device.
                 None => return false,
             },
         };

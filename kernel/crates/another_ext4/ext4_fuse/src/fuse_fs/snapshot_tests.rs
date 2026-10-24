@@ -266,3 +266,59 @@ fn ioctl_keys_are_sized_and_epochs_cannot_wrap() {
         }
     }
 }
+
+#[test]
+fn direct_directory_updates_and_reused_payload_stay_coherent() {
+    let device = Arc::new(image_with_features("64bit,^has_journal"));
+    let mut owner = StateExt4FuseFs::new(device.clone(), true);
+    assert_eq!(owner.fs.lookup(1, ".").unwrap(), 1);
+    assert_eq!(owner.fs.lookup(1, "..").unwrap(), 1);
+    for round in 0..4 {
+        let directory = owner.fs.mkdir(1, "directory", InodeMode::ALL_RWX).unwrap();
+        assert_eq!(owner.fs.lookup(directory, ".").unwrap(), directory);
+        assert_eq!(owner.fs.lookup(directory, "..").unwrap(), 1);
+        let child = owner
+            .fs
+            .create(directory, "child", InodeMode::FILE | InodeMode::ALL_RW)
+            .unwrap();
+        assert_eq!(owner.fs.lookup(directory, "child").unwrap(), child);
+        let reclaim = owner.fs.unlink(directory, "child").unwrap().unwrap();
+        owner.queue_reclaim(reclaim).unwrap();
+        assert!(owner.fs.lookup(directory, "child").is_err());
+        let reclaim = owner.fs.rmdir(1, "directory").unwrap().unwrap();
+        owner.queue_reclaim(reclaim).unwrap();
+
+        // Reuse freed directory storage for ordinary file payload. The
+        // payload-only write path bypasses metadata publication, so both
+        // full-block and partial updates must still read back from disk.
+        let inode = file(&owner, "payload", &vec![round as u8; 2 * BLOCK_SIZE]);
+        let full = vec![0x70 + round as u8; BLOCK_SIZE];
+        assert_eq!(
+            owner.fs.write_data_only(inode, 0, &full).unwrap(),
+            full.len()
+        );
+        assert_eq!(
+            owner
+                .fs
+                .write_data_only(inode, BLOCK_SIZE + 13, b"tail")
+                .unwrap(),
+            4
+        );
+        let mut data = vec![0; 2 * BLOCK_SIZE];
+        assert_eq!(owner.fs.read(inode, 0, &mut data).unwrap(), data.len());
+        assert_eq!(&data[..BLOCK_SIZE], full.as_slice());
+        assert_eq!(&data[BLOCK_SIZE + 13..BLOCK_SIZE + 17], b"tail");
+        let reclaim = owner.fs.unlink(1, "payload").unwrap().unwrap();
+        owner.queue_reclaim(reclaim).unwrap();
+        assert!(owner.pending_reclaims.is_empty());
+    }
+    let directory = owner.fs.mkdir(1, "retained", InodeMode::ALL_RWX).unwrap();
+    let child = owner
+        .fs
+        .create(directory, "child", InodeMode::FILE | InodeMode::ALL_RW)
+        .unwrap();
+    owner.fs.shutdown_writable().unwrap();
+    let remount = Ext4::load_read_only_checked(device).unwrap();
+    assert_eq!(remount.lookup(1, "retained").unwrap(), directory);
+    assert_eq!(remount.lookup(directory, "child").unwrap(), child);
+}

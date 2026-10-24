@@ -281,19 +281,25 @@ impl Ext4 {
         self.block_device.write_block(block)?;
         // Direct-mode writes bypass transactions. Publish their home-current
         // image so later metadata reads observe the new block instead of a
-        // stale cache entry (and so a block just written by one operation is
-        // not read back from the device by the next one). Only system
-        // metadata belongs in this cache: admitting file payload blocks would
+        // stale cache entry. Directory and extent-tree blocks are also cached
+        // by metadata reads and must be refreshed when already resident.
+        // Only admit cold system metadata: admitting file payload blocks would
         // evict the bitmaps/inode tables that the next operation needs and
         // make large writes pay a pointless 4 KiB copy.
-        if matches!(self.metadata_mode, super::MetadataMutationMode::Direct(_))
-            && self.is_system_metadata_block(block.id)
-        {
-            let notify = self.metadata_cache.publish_or_admit(
-                block.id,
-                &block.data,
-                super::metadata_cache::PublicationPoint::HomeCurrent,
-            );
+        if matches!(self.metadata_mode, super::MetadataMutationMode::Direct(_)) {
+            let notify = if self.is_system_metadata_block(block.id) {
+                self.metadata_cache.publish_or_admit(
+                    block.id,
+                    &block.data,
+                    super::metadata_cache::PublicationPoint::HomeCurrent,
+                )
+            } else {
+                self.metadata_cache.publish_existing(
+                    block.id,
+                    &block.data,
+                    super::metadata_cache::PublicationPoint::HomeCurrent,
+                )
+            };
             if notify {
                 self.metadata_mutation_barrier.notify_progress();
             }

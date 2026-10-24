@@ -2979,9 +2979,9 @@ impl dyn IndexNode {
 
         // 逐级查找文件
         while !rest_path.is_empty() {
-            // 当前这一级不是文件夹。metadata 只取一次：对 attr_valid=0 的
-            // FUSE/virtiofs 后端，重复调用会把同一次路径遍历的 GETATTR
-            // 翻倍。
+            // Reuse one metadata snapshot for the directory and permission
+            // checks. Uncached FUSE/virtiofs attributes otherwise require
+            // two GETATTR round trips for this path component.
             let metadata = lookup_metadata(&result)?;
             if metadata.file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR.into());

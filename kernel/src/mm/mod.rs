@@ -143,6 +143,13 @@ bitflags! {
 }
 
 impl VmFlags {
+    /// Linux is_data_mapping(): private writable memory, excluding grow-down
+    /// stacks. Executable writable mappings still consume RLIMIT_DATA.
+    #[inline]
+    pub fn is_data_mapping(self) -> bool {
+        (self & (Self::VM_WRITE | Self::VM_SHARED | Self::VM_GROWSDOWN)) == Self::VM_WRITE
+    }
+
     /// VMAs which Linux mlock_fixup() leaves unlocked and unaccounted.
     #[inline]
     pub fn is_mlock_flag_unsupported(self) -> bool {

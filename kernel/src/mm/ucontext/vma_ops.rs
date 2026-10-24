@@ -39,6 +39,7 @@ impl PreparedMunmap {
 pub(super) struct PreparedMprotect {
     plans: Vec<MprotectVmaPlan>,
     rollback_notifications: VmaCloseNotifications,
+    terminal_error: Option<SystemError>,
 }
 
 impl PreparedMprotect {
@@ -579,7 +580,7 @@ impl InnerAddressSpace {
         creator: &Arc<ObjectAccount>,
     ) -> Result<(), VmaOpFailure> {
         let prepared = self.prepare_mprotect(start_page, page_count, prot_flags, creator)?;
-        let deferred_execute = self.commit_mprotect(prepared);
+        let (deferred_execute, notifications, terminal_error) = self.commit_mprotect(prepared);
         #[cfg(target_arch = "x86_64")]
         {
             let mm = self
@@ -589,7 +590,17 @@ impl InnerAddressSpace {
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = deferred_execute;
-        Ok(())
+        match terminal_error {
+            Some(err) => Err(VmaOpFailure {
+                err: err.into(),
+                notifications,
+            }),
+            None => {
+                // Only a failed split contributes deferred retirement here.
+                debug_assert!(notifications.is_empty());
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn prepare_mprotect(
@@ -604,55 +615,64 @@ impl InnerAddressSpace {
         let mm = self
             .outer_addr_space()
             .expect("live mprotect transaction lost its AddressSpace");
-        // debug!(
-        //     "mprotect: start_page: {:?}, page_count: {:?}, prot_flags:{prot_flags:?}",
-        //     start_page,
-        //     page_count
-        // );
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
-        // debug!("mprotect: region: {:?}", region);
-
-        let (regions, has_unmapped) = self.mappings.conflicts_with_unmapped(region);
-        if has_unmapped {
-            return Err(SystemError::ENOMEM.into());
-        }
-        // debug!("mprotect: regions: {:?}", regions);
-
+        let regions = self.mappings.conflicts(region);
+        let limits = super::limits::VmExpansionLimits::current();
+        let used_bytes = self.vma_usage_bytes();
+        let mut projected_data = self.mappings.data_usage_bytes();
+        let mut cursor = region.start();
+        let mut terminal_error = None;
         let mut plans: Vec<MprotectVmaPlan> = Vec::with_capacity(regions.len());
         let mut rollback_notifications = VmaCloseNotifications::default();
         rollback_notifications.prepare_split_retirement(regions.len())?;
+        // Linux commits each VMA in address order before inspecting the next.
+        // Prepare that successful prefix first, including its projected DATA
+        // usage, then publish it under the same mm write guard.
         for r in &regions {
-            // debug!("mprotect: r: {:?}", r);
             let (original_region, old_vm_flags, new_vm_flags, defer_uprobe_execute) = {
                 let guard = r.lock();
+                let intersection = guard.region().intersect(&region).unwrap();
+                if intersection.start() != cursor {
+                    terminal_error = Some(SystemError::ENOMEM);
+                    break;
+                }
                 if !guard.can_have_flags(prot_flags) {
-                    for plan in plans {
-                        plan.split_lifecycle
-                            .rollback_into(&mut rollback_notifications);
-                    }
-                    return Err(VmaOpFailure {
-                        err: SystemError::EACCES.into(),
-                        notifications: rollback_notifications,
-                    });
+                    terminal_error = Some(SystemError::EACCES);
+                    break;
                 }
                 let old_vm_flags = *guard.vm_flags();
                 let access_flags = VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC;
                 let new_vm_flags = (old_vm_flags & !access_flags) | VmFlags::from(prot_flags);
                 if new_vm_flags == old_vm_flags {
+                    cursor = intersection.end();
                     continue;
                 }
                 if let Some(file) = guard.vm_file() {
                     if let Err(err) = file.with_io_fs(|fs| fs.mprotect(old_vm_flags, new_vm_flags))
                     {
-                        for plan in plans {
-                            plan.split_lifecycle
-                                .rollback_into(&mut rollback_notifications);
-                        }
-                        return Err(VmaOpFailure {
-                            err: err.into(),
-                            notifications: rollback_notifications,
-                        });
+                        terminal_error = Some(err);
+                        break;
                     }
+                }
+                // Check the old and new flags with identical AS usage. A
+                // protection change cannot itself expand AS, even after its
+                // limit was lowered below the already mapped virtual size.
+                if new_vm_flags.contains(VmFlags::VM_WRITE)
+                    && !limits.allows(
+                        used_bytes,
+                        projected_data,
+                        new_vm_flags,
+                        intersection.size(),
+                    )
+                    && limits.allows(
+                        used_bytes,
+                        projected_data,
+                        old_vm_flags,
+                        intersection.size(),
+                    )
+                {
+                    terminal_error = Some(SystemError::ENOMEM);
+                    break;
                 }
                 #[cfg(target_arch = "x86_64")]
                 let defer_uprobe_execute = {
@@ -694,23 +714,35 @@ impl InnerAddressSpace {
                     defer_uprobe_execute,
                 )
             };
-            #[cfg(not(target_arch = "x86_64"))]
-            let _ = old_vm_flags;
             let intersection = original_region.intersect(&region).unwrap();
             let split_lifecycle = match r.prepare_split_lifecycle(intersection, creator) {
                 Ok(lifecycle) => lifecycle,
                 Err(failure) => {
-                    for plan in plans {
-                        plan.split_lifecycle
-                            .rollback_into(&mut rollback_notifications);
-                    }
                     let err = failure.rollback_into(&mut rollback_notifications);
-                    return Err(VmaOpFailure {
-                        err,
-                        notifications: rollback_notifications,
+                    if plans.is_empty() {
+                        return Err(VmaOpFailure {
+                            err,
+                            notifications: rollback_notifications,
+                        });
+                    }
+                    terminal_error = Some(match err {
+                        MemoryAllocationError::System(err) => err,
+                        MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
                     });
+                    break;
                 }
             };
+            if old_vm_flags.is_data_mapping() {
+                projected_data = projected_data
+                    .checked_sub(intersection.size())
+                    .expect("mprotect DATA projection underflow");
+            }
+            if new_vm_flags.is_data_mapping() {
+                projected_data = projected_data
+                    .checked_add(intersection.size())
+                    .expect("mprotect DATA projection exceeds address space");
+            }
+            cursor = intersection.end();
             plans.push(MprotectVmaPlan {
                 original_region,
                 intersection,
@@ -723,13 +755,24 @@ impl InnerAddressSpace {
             });
         }
 
+        if terminal_error.is_none() && cursor != region.end() {
+            terminal_error = Some(SystemError::ENOMEM);
+        }
         Ok(PreparedMprotect {
             plans,
             rollback_notifications,
+            terminal_error,
         })
     }
 
-    pub(super) fn commit_mprotect(&mut self, prepared: PreparedMprotect) -> Vec<Arc<LockedVMA>> {
+    pub(super) fn commit_mprotect(
+        &mut self,
+        prepared: PreparedMprotect,
+    ) -> (
+        Vec<Arc<LockedVMA>>,
+        VmaCloseNotifications,
+        Option<SystemError>,
+    ) {
         let mm = self
             .outer_addr_space()
             .expect("live mprotect transaction lost its AddressSpace");
@@ -779,7 +822,11 @@ impl InnerAddressSpace {
 
         // Unified shootdown. mprotect does not free physical pages; tlb.finish() mainly flushes the TLB.
         tlb.finish();
-        deferred_execute
+        (
+            deferred_execute,
+            prepared.rollback_notifications,
+            prepared.terminal_error,
+        )
     }
 
     /// Publish final PTE permissions only after every matching uprobe has been
@@ -1546,12 +1593,7 @@ impl InnerAddressSpace {
 
     /// Linux checks the exact data+heap bytes even for a same-page break
     /// change, and may_expand_vm additionally checks data pages on growth.
-    fn check_brk_data_limit(
-        &self,
-        requested: VirtAddr,
-        change: &BrkChange,
-        limit: usize,
-    ) -> Result<(), SystemError> {
+    fn check_brk_data_limit(&self, requested: VirtAddr, limit: usize) -> Result<(), SystemError> {
         if limit == usize::MAX {
             return Ok(());
         }
@@ -1567,30 +1609,6 @@ impl InnerAddressSpace {
         if heap.checked_add(data).is_none_or(|bytes| bytes > limit) {
             return Err(SystemError::ENOMEM);
         }
-        if change.new_end > change.old_end {
-            // Linux is_data_mapping(): private, writable and non-stack. RWX
-            // mappings count too. Only finite DATA limits require this scan.
-            let data_bytes = self.mappings.iter_vmas().try_fold(0usize, |total, vma| {
-                let vma = vma.lock();
-                let flags = *vma.vm_flags();
-                if (flags & (VmFlags::VM_WRITE | VmFlags::VM_SHARED | VmFlags::VM_GROWSDOWN))
-                    == VmFlags::VM_WRITE
-                {
-                    total
-                        .checked_add(vma.region().size())
-                        .ok_or(SystemError::ENOMEM)
-                } else {
-                    Ok(total)
-                }
-            })?;
-            let growth = change.new_end - change.old_end;
-            if data_bytes
-                .checked_add(growth)
-                .is_none_or(|bytes| (bytes >> MMArch::PAGE_SHIFT) > (limit >> MMArch::PAGE_SHIFT))
-            {
-                return Err(SystemError::ENOMEM);
-            }
-        }
         Ok(())
     }
 
@@ -1604,7 +1622,7 @@ impl InnerAddressSpace {
         data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
     ) -> Result<BrkOutcome, MmapFailure> {
         let change = self.brk_change(requested)?;
-        self.check_brk_data_limit(requested, &change, data_limit)?;
+        self.check_brk_data_limit(requested, data_limit)?;
         let old_brk = self.brk;
         let mut notifications = VmaCloseNotifications::default();
         let mut post_commit_population = None;

@@ -5,6 +5,7 @@ use super::*;
 pub(super) struct MmapReservation {
     id: MmapReservationId,
     region: VirtRegion,
+    is_data: bool,
 }
 
 #[derive(Debug)]
@@ -20,6 +21,8 @@ pub struct UserMappings {
     /// Committed and in-flight virtual bytes, owned by the indexed mappings.
     mapped_bytes: usize,
     reserved_bytes: usize,
+    mapped_data_bytes: usize,
+    reserved_data_bytes: usize,
     /// Largest committed virtual size of this mm; reservations are not mappings.
     peak_bytes: usize,
     /// Owning address space, used to back-fill the reverse reference during VMA lifecycle changes
@@ -36,6 +39,8 @@ impl UserMappings {
             reservations: BTreeMap::new(),
             mapped_bytes: 0,
             reserved_bytes: 0,
+            mapped_data_bytes: 0,
+            reserved_data_bytes: 0,
             peak_bytes: 0,
             owner: Weak::new(),
         };
@@ -196,6 +201,13 @@ impl UserMappings {
             .expect("user virtual size exceeds address-space bounds")
     }
 
+    /// DATA admission includes unpublished file mappings, just like AS.
+    pub(super) fn data_usage_bytes(&self) -> usize {
+        self.mapped_data_bytes
+            .checked_add(self.reserved_data_bytes)
+            .expect("user DATA size exceeds address-space bounds")
+    }
+
     pub(crate) fn peak_usage_bytes(&self) -> usize {
         self.peak_bytes
     }
@@ -214,6 +226,7 @@ impl UserMappings {
     pub(super) fn reserve_region(
         &mut self,
         region: VirtRegion,
+        vm_flags: VmFlags,
     ) -> Result<MmapReservationId, SystemError> {
         if !self.region_available_for_reservation(region) {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
@@ -226,8 +239,21 @@ impl UserMappings {
         let id = MMAP_RESERVATION_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
         self.reserve_hole(&region);
         self.reserved_bytes = reserved_bytes;
-        self.reservations
-            .insert(region.start(), MmapReservation { id, region });
+        let is_data = vm_flags.is_data_mapping();
+        if is_data {
+            self.reserved_data_bytes = self
+                .reserved_data_bytes
+                .checked_add(region.size())
+                .expect("reserved DATA size exceeds address-space bounds");
+        }
+        self.reservations.insert(
+            region.start(),
+            MmapReservation {
+                id,
+                region,
+                is_data,
+            },
+        );
         Ok(id)
     }
 
@@ -241,14 +267,21 @@ impl UserMappings {
             .reserved_bytes
             .checked_sub(reservation.region.size())
             .expect("reservation accounting diverged from its index");
+        if reservation.is_data {
+            self.reserved_data_bytes = self
+                .reserved_data_bytes
+                .checked_sub(reservation.region.size())
+                .expect("reservation DATA accounting diverged from its index");
+        }
         self.unreserve_hole(&reservation.region);
         Some(reservation.region)
     }
 
-    pub(super) fn remove_reservation_for_commit(
+    fn remove_reservation_for_commit(
         &mut self,
         id: MmapReservationId,
         region: VirtRegion,
+        is_data: bool,
     ) -> Result<(), SystemError> {
         let start = self
             .reservations
@@ -256,10 +289,16 @@ impl UserMappings {
             .find_map(|(start, reservation)| (reservation.id == id).then_some(*start))
             .ok_or(SystemError::EFAULT)?;
         let reservation = *self.reservations.get(&start).ok_or(SystemError::EFAULT)?;
-        if reservation.region != region {
+        if reservation.region != region || reservation.is_data != is_data {
             return Err(SystemError::EFAULT);
         }
         self.reservations.remove(&start);
+        if reservation.is_data {
+            self.reserved_data_bytes = self
+                .reserved_data_bytes
+                .checked_sub(region.size())
+                .expect("reservation DATA accounting diverged from its index");
+        }
         self.reserved_bytes = self
             .reserved_bytes
             .checked_sub(region.size())
@@ -272,8 +311,11 @@ impl UserMappings {
         id: MmapReservationId,
         vma: Arc<LockedVMA>,
     ) -> Result<(), SystemError> {
-        let region = vma.lock().region;
-        self.remove_reservation_for_commit(id, region)?;
+        let (region, is_data) = {
+            let guard = vma.lock();
+            (guard.region, guard.vm_flags().is_data_mapping())
+        };
+        self.remove_reservation_for_commit(id, region, is_data)?;
         self.insert_vma(vma);
         Ok(())
     }
@@ -378,7 +420,10 @@ impl UserMappings {
 
     /// Insert a new VMA into the current process's mappings.
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
-        let region = vma.lock().region;
+        let (region, is_data) = {
+            let guard = vma.lock();
+            (guard.region, guard.vm_flags().is_data_mapping())
+        };
         // The address range to be inserted must be free, meaning no overlapping VMA may exist in the current process's address space.
         assert!(!self.has_conflict(region));
         let mapped_bytes = self
@@ -391,6 +436,12 @@ impl UserMappings {
         self.vmas_by_start.insert(region.start(), vma.clone());
         self.vmas.insert(vma);
         self.mapped_bytes = mapped_bytes;
+        if is_data {
+            self.mapped_data_bytes = self
+                .mapped_data_bytes
+                .checked_add(region.size())
+                .expect("mapped DATA size exceeds address-space bounds");
+        }
         self.peak_bytes = core::cmp::max(self.peak_bytes, mapped_bytes);
     }
 
@@ -420,6 +471,12 @@ impl UserMappings {
             .mapped_bytes
             .checked_sub(region.size())
             .expect("VMA accounting diverged from its index");
+        if vma.lock().vm_flags().is_data_mapping() {
+            self.mapped_data_bytes = self
+                .mapped_data_bytes
+                .checked_sub(region.size())
+                .expect("VMA DATA accounting diverged from its index");
+        }
         self.unreserve_hole(region);
         self.detach_vma(&vma);
 
@@ -434,6 +491,8 @@ impl UserMappings {
         self.reservations.clear();
         self.mapped_bytes = 0;
         self.reserved_bytes = 0;
+        self.mapped_data_bytes = 0;
+        self.reserved_data_bytes = 0;
         self.vm_holes.clear();
         for vma in &vmas {
             self.detach_vma(vma);

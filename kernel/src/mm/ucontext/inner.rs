@@ -426,57 +426,7 @@ impl InnerAddressSpace {
         Ok(())
     }
 
-    pub(super) fn check_rlimit_as_for_bytes(&self, len: usize) -> Result<(), SystemError> {
-        self.check_rlimit_as_for_growth(len)
-    }
-
-    pub(super) fn check_rlimit_as_for_region(
-        &self,
-        region: VirtRegion,
-        len: usize,
-        map_flags: MapFlags,
-    ) -> Result<(), SystemError> {
-        let covered = if map_flags.contains(MapFlags::MAP_FIXED) {
-            self.covered_vma_bytes(region)
-        } else {
-            0
-        };
-        self.check_rlimit_as_for_growth(len.saturating_sub(covered))
-    }
-
-    fn check_rlimit_as_for_growth(&self, growth: usize) -> Result<(), SystemError> {
-        if growth == 0 {
-            return Ok(());
-        }
-
-        if !ProcessManager::initialized() {
-            return Ok(());
-        }
-
-        let rlim_as = ProcessManager::current_pcb()
-            .get_rlimit(RLimitID::As)
-            .rlim_cur as usize;
-        if rlim_as == usize::MAX {
-            return Ok(());
-        }
-
-        let limit_pages = rlim_as >> MMArch::PAGE_SHIFT;
-        let used_pages = self.vma_usage_bytes() >> MMArch::PAGE_SHIFT;
-        let growth_pages = growth
-            .checked_add(MMArch::PAGE_SIZE - 1)
-            .ok_or(SystemError::ENOMEM)?
-            >> MMArch::PAGE_SHIFT;
-        if used_pages
-            .checked_add(growth_pages)
-            .is_none_or(|v| v > limit_pages)
-        {
-            Err(SystemError::ENOMEM)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn covered_vma_bytes(&self, region: VirtRegion) -> usize {
+    pub(super) fn covered_vma_bytes(&self, region: VirtRegion) -> usize {
         self.mappings
             .conflicts(region)
             .into_iter()

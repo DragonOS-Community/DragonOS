@@ -32,6 +32,7 @@ pub(crate) static RECOVERY_WAITERS: OomWaitQueue = OomWaitQueue::new();
 
 static READY: AtomicBool = AtomicBool::new(false);
 static WORK_PENDING: AtomicBool = AtomicBool::new(false);
+static BALLOON_PENDING: AtomicBool = AtomicBool::new(false);
 static RECLAIM_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "x86_64")]
 static COMPACTION_PENDING: AtomicBool = AtomicBool::new(false);
@@ -101,6 +102,15 @@ pub(crate) fn request_reclaim_deadline() {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn request_compaction() {
     COMPACTION_PENDING.store(true, Ordering::Release);
+    WORK_PENDING.store(true, Ordering::Release);
+    if is_ready() {
+        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    }
+}
+
+/// Balloon timer/IRQ callbacks defer all scheduler work to this task.
+pub(crate) fn request_balloon_deadline() {
+    BALLOON_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
         softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
@@ -182,6 +192,9 @@ fn notification_loop() -> i32 {
     STARTED.complete();
     loop {
         if WORK_PENDING.swap(false, Ordering::AcqRel) {
+            if BALLOON_PENDING.swap(false, Ordering::AcqRel) {
+                crate::driver::virtio::virtio_balloon::notify_deadline();
+            }
             if RECLAIM_PENDING.swap(false, Ordering::AcqRel) {
                 crate::mm::page::reclaim_wait::notify_deadline();
             }

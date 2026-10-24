@@ -47,6 +47,7 @@ mod placement;
 use free_index::FreeIndex;
 mod recovery;
 use placement::{PlacementMap, BLOCK_ORDER, LOW_ORDERS};
+mod reporting;
 pub(crate) use recovery::{DmaAllocationFailure, DmaRecoveryZone};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +114,14 @@ pub(crate) struct BuddySnapshot {
     diagnostics: BuddyDiagnostics,
 }
 
+#[cfg(feature = "mm_selftest")]
+impl BuddySnapshot {
+    /// Pressure fixtures must budget against the address zone they consume.
+    pub(crate) fn dma32_free_pages(&self) -> usize {
+        self.free_pages[BuddyZone::Dma32.index()]
+    }
+}
+
 /// 保存buddy算法中每一页存放的BuddyEntry的信息，占据每个页的起始位置
 #[derive(Debug)]
 #[repr(C)]
@@ -122,6 +131,9 @@ pub struct PageList<A> {
     order: u8,
     // 下一个页面的地址
     next_page: PhysAddr,
+    // Permanent ring: metadata pages never return to ordinary free lists.
+    report_next: PhysAddr,
+    report_scan: usize,
     phantom: PhantomData<A>,
 }
 
@@ -131,6 +143,8 @@ impl<A> Clone for PageList<A> {
             entry_num: self.entry_num,
             order: self.order,
             next_page: self.next_page,
+            report_next: self.report_next,
+            report_scan: self.report_scan,
             phantom: PhantomData,
         }
     }
@@ -148,6 +162,8 @@ impl<A> PageList<A> {
             entry_num: 0,
             order: 0,
             next_page: PhysAddr::new(0),
+            report_next: PhysAddr::new(0),
+            report_scan: 0,
             phantom: PhantomData,
         }
     }
@@ -156,6 +172,8 @@ impl<A> PageList<A> {
             entry_num,
             order: 0,
             next_page,
+            report_next: PhysAddr::new(0),
+            report_scan: 0,
             phantom: PhantomData,
         }
     }
@@ -185,6 +203,7 @@ pub struct BuddyAllocator<A> {
     diagnostics: BuddyDiagnostics,
     isolation: Option<compaction::IsolationState>,
     next_isolation_id: u64,
+    reporting: reporting::ReportingState,
     /// Whether this allocator has ever managed memory above 4 GiB.  Most
     /// current systems are DMA32-only; avoid probing every empty Normal order
     /// on their hot allocation path.
@@ -255,6 +274,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             diagnostics: BuddyDiagnostics::default(),
             isolation: None,
             next_isolation_id: 1,
+            reporting: reporting::ReportingState::new(),
             has_normal_memory: false,
             total: PageFrameCount::new(pages),
             phantom: PhantomData,
@@ -276,7 +296,11 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         let index = offset / mem::size_of::<PhysAddr>();
         assert!(index < list.entry_num);
         let stored: PhysAddr = unsafe { A::read(A::phys_2_virt(entry).unwrap()) };
-        assert_eq!(stored, base, "free index points at a different block");
+        assert_eq!(
+            Self::decode_entry(stored),
+            base,
+            "free index points at a different block"
+        );
         Some((list.order, metadata, index))
     }
 
@@ -599,6 +623,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             diagnostics: BuddyDiagnostics::default(),
             isolation: None,
             next_isolation_id: 1,
+            reporting: reporting::ReportingState::new(),
             has_normal_memory: false,
             total: PageFrameCount::new(0),
             phantom: PhantomData,
@@ -689,7 +714,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         return page_list;
     }
 
-    pub fn write_page(curr_page: PhysAddr, page_list: PageList<A>) {
+    pub fn write_page(curr_page: PhysAddr, mut page_list: PageList<A>) {
+        if page_list.report_next.is_null() {
+            page_list.report_next = curr_page;
+        }
         // 把物理地址转换为虚拟地址
         let virt_addr = unsafe { A::phys_2_virt(curr_page) };
         let virt_addr = virt_addr.unwrap();
@@ -898,7 +926,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         debug_assert_eq!(self.class_area(zone, order, class), page_addr);
         self.set_class_area(zone, order, class, next_nonempty);
         let empty_head = self.empty_area(zone, order);
-        Self::write_page(page_addr, PageList::new(0, empty_head).with_order(order));
+        let mut header: PageList<A> = Self::read_page(page_addr);
+        header.entry_num = 0;
+        header.order = order;
+        header.next_page = empty_head;
+        header.report_scan = 0;
+        Self::write_page(page_addr, header);
         self.set_empty_area(zone, order, page_addr);
     }
 
@@ -924,13 +957,15 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         let last_index = first.entry_num - 1;
         let last: PhysAddr = unsafe { A::read(Self::entry_virt_addr(first_addr, last_index)) };
         self.free_index.remove(
-            removed,
+            Self::decode_entry(removed),
             Self::entry_addr(target_page_addr, target_index),
             order,
         );
         if target_page_addr != first_addr || target_index != last_index {
-            self.free_index
-                .relocate(last, Self::entry_addr(target_page_addr, target_index));
+            self.free_index.relocate(
+                Self::decode_entry(last),
+                Self::entry_addr(target_page_addr, target_index),
+            );
         }
 
         if target_page_addr == first_addr {
@@ -940,6 +975,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 }
             }
             first.entry_num -= 1;
+            first.report_scan = 0;
             unsafe {
                 A::write(
                     Self::entry_virt_addr(first_addr, first.entry_num),
@@ -960,6 +996,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 );
             }
             first.entry_num -= 1;
+            first.report_scan = 0;
             let next_nonempty = first.next_page;
             Self::write_page(first_addr, first);
             if last_index == 0 {
@@ -968,6 +1005,8 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             // The target page remains non-empty because the removed slot was
             // replaced from the first non-empty page.
             target_page = Self::read_page(target_page_addr);
+            target_page.report_scan = 0;
+            Self::write_page(target_page_addr, target_page.clone());
             debug_assert!(target_page.entry_num > 0);
         }
 
@@ -976,7 +1015,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         if class == FramePlacement::Movable {
             self.movable_blocks[zone.index()][Self::order2index(order)] -= 1;
         }
-        removed
+        Self::decode_entry(removed)
     }
 
     /// Insert a block whose buddy is known to be allocated.  This is used for
@@ -1011,10 +1050,20 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             || Self::read_page::<PageList<A>>(first_addr).entry_num == Self::BUDDY_ENTRIES;
         if needs_metadata {
             let empty = self.empty_area(zone, order);
-            let metadata = if !empty.is_null() {
+            let reused = !empty.is_null();
+            let metadata = if reused {
                 let recycled: PageList<A> = Self::read_page(empty);
                 self.set_empty_area(zone, order, recycled.next_page);
                 empty
+            } else if self.reporting.returning && !self.reporting.spare.is_null() {
+                let spare = self.reporting.spare;
+                self.reporting.spare = PhysAddr::new(0);
+                // The prepaid owner is one page, not a target-order extent.
+                // Preserve its pageblock label; retagging a live pageblock
+                // would invalidate its existing low-order class chains.
+                let placement = self.placement.get::<A>(spare);
+                self.prepare_metadata_page(spare, MIN_ORDER as u8, placement);
+                spare
             } else if !first_addr.is_null() && order as usize > MIN_ORDER {
                 // An already full same-class head proves this exact source
                 // exists. Preserve the incoming outside sibling as a whole;
@@ -1032,16 +1081,24 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 // incoming extent terminates self-hosting without recursion
                 // to the same or any higher order.
                 self.prepare_metadata_page(base, order, class);
-                Self::write_page(base, PageList::new(0, PhysAddr::new(0)));
+                let report_next = self.link_reporting_metadata(zone, order, base);
+                let mut header = PageList::new(0, PhysAddr::new(0)).with_order(order);
+                header.report_next = report_next;
+                Self::write_page(base, header);
                 self.set_empty_area(zone, order, base);
                 for lower in (MIN_ORDER..order as usize).rev() {
                     self.insert_without_merge(base + (1usize << lower), lower as u8);
                 }
                 return;
             };
-            let mut list = PageList::new(0, first_addr);
-            list.order = order;
-            Self::write_page(metadata, list);
+            let report_next = if reused && self.reporting_metadata_linked(zone, order, metadata) {
+                Self::read_page::<PageList<A>>(metadata).report_next
+            } else {
+                self.link_reporting_metadata(zone, order, metadata)
+            };
+            let mut header = PageList::new(0, first_addr).with_order(order);
+            header.report_next = report_next;
+            Self::write_page(metadata, header);
             self.set_class_area(zone, order, class, metadata);
             first_addr = metadata;
         }
@@ -1050,6 +1107,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         A::write(Self::entry_virt_addr(first_addr, head.entry_num), base);
         head.entry_num += 1;
         let slot = Self::entry_addr(first_addr, head.entry_num - 1);
+        head.report_scan = 0;
         Self::write_page(first_addr, head);
         self.free_index.insert(base, slot, order);
         self.adjust_free_pages(zone, 1usize << (order as usize - MIN_ORDER), true);
@@ -1249,6 +1307,20 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             let index = Self::order2index(requested_order);
             let attempts = &mut self.diagnostics.zones[zone.index()].attempts[index];
             *attempts = attempts.saturating_add(1);
+            // A wide User address ceiling restricts representable addresses;
+            // it does not authorize consuming the DMA-only fallback reserve.
+            // Kernel and genuinely low-address DMA requests retain their own
+            // existing admission policy.
+            if zone == BuddyZone::Dma32
+                && level == ReserveLevel::User
+                && max_phys_addr.data() > DMA32_LIMIT
+                && !self.dma32_fallback_allowed(count.data())
+            {
+                admission_denied = true;
+                let misses = &mut self.diagnostics.zones[zone.index()].misses[index];
+                *misses = misses.saturating_add(1);
+                continue;
+            }
             for (current_order, class) in placement::allocation_chains(requested_order, placement) {
                 let current_order = current_order as usize;
                 let mut list_addr = self.class_area(zone, current_order as u8, class);
@@ -1258,8 +1330,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 loop {
                     let list: PageList<A> = Self::read_page(list_addr);
                     for index in 0..list.entry_num {
-                        let entry_addr = Self::entry_virt_addr(list_addr, index);
-                        let entry: PhysAddr = unsafe { A::read(entry_addr) };
+                        let entry = Self::read_entry(list_addr, index);
                         let fits = entry
                             .data()
                             .checked_add(requested_bytes - 1)
@@ -1336,7 +1407,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     ///
     /// - `base` - 块的起始地址
     /// - `order` - 块的阶数
-    unsafe fn buddy_free(&mut self, mut base: PhysAddr, order: u8) {
+    unsafe fn buddy_free(&mut self, base: PhysAddr, order: u8) {
+        self.buddy_free_reported(base, order, false);
+    }
+
+    unsafe fn buddy_free_reported(&mut self, mut base: PhysAddr, order: u8, reported: bool) {
+        let original_order = order as usize;
         if self.quarantine_free(base, order) {
             return;
         }
@@ -1379,6 +1455,14 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 debug_assert_eq!(removed, buddy_addr);
             } else {
                 self.insert_without_merge(base, order as u8);
+                if reported && order == original_order {
+                    let head = self.free_area(zone, order as u8);
+                    let page: PageList<A> = Self::read_page(head);
+                    A::write(
+                        Self::entry_virt_addr(head, page.entry_num - 1),
+                        PhysAddr::new(base.data() | reporting::REPORTED),
+                    );
+                }
                 return;
             }
             base = min(base, buddy_addr);
@@ -1557,6 +1641,7 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
             diagnostics: BuddyDiagnostics::default(),
             isolation: None,
             next_isolation_id: 1,
+            reporting: reporting::ReportingState::new(),
             has_normal_memory: false,
             total: PageFrameCount::new(ARENA_PAGES),
             watermarks: [ZoneWatermarks::default(); 2],
@@ -2042,6 +2127,7 @@ pub(crate) fn with_fragmented_buffer_arena(
         diagnostics: BuddyDiagnostics::default(),
         isolation: None,
         next_isolation_id: 1,
+        reporting: reporting::ReportingState::new(),
         has_normal_memory: false,
         total: PageFrameCount::new(PAGES),
         watermarks: [ZoneWatermarks::default(); 2],
@@ -2087,3 +2173,9 @@ pub(crate) fn with_fragmented_buffer_arena(
         Ok(frame)
     })
 }
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use reporting::selftest_report as reporting_selftest_report;

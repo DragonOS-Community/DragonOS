@@ -96,6 +96,7 @@ unsafe fn empty(backing: PhysAddr) -> BuddyAllocator<MMArch> {
         diagnostics: super::super::BuddyDiagnostics::default(),
         isolation: None,
         next_isolation_id: 1,
+        reporting: super::super::reporting::ReportingState::new(),
         has_normal_memory: false,
         total: PageFrameCount::new(BACKING_PAGES),
         phantom: PhantomData,

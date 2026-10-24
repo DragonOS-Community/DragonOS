@@ -731,7 +731,7 @@ fn dma_recovery_reserve_guard() -> bool {
 // modern virtio-blk rings. Any reclaimed reachable page suffices; high-order
 // adjacency and migration are covered by the independent fragmented fixtures.
 // The finite prefix denies the baseline without starving the whole guest.
-fn dma_capacity_recovery() -> (bool, alloc::string::String) {
+fn dma_capacity_recovery(minimum_expected_base: usize) -> (bool, alloc::string::String) {
     let mut detail = alloc::string::String::new();
     let mut phase = "headroom";
     let result = (|| -> Result<bool, SystemError> {
@@ -749,13 +749,10 @@ fn dma_capacity_recovery() -> (bool, alloc::string::String) {
             }
         }
         let free = unsafe { LockedFrameAllocator.usage() }.free().data();
-        if free < 2 * DMA_HEADROOM_PAGES {
-            return Err(SystemError::ENOMEM);
-        }
-        // A debug/CI kernel can occupy the whole first 64 MiB. Derive the
-        // search domain from available capacity like the other DMA fixtures;
-        // even exhausting this prefix leaves at least half the free inventory.
-        let end = (free / 2)
+        // Choose from the currently available DMA32 inventory, retaining the
+        // same bounded prefix/headroom policy as the other real DMA fixtures.
+        // A fixed low-address prefix need not contain any free aligned run.
+        let end = dma_fixture_budget(free, None)?
             .checked_mul(MMArch::PAGE_SIZE)
             .ok_or(SystemError::ENOMEM)?
             .min(DMA32_END);
@@ -763,7 +760,15 @@ fn dma_capacity_recovery() -> (bool, alloc::string::String) {
         phase = "fixture_run";
         // The range/isolation helper handles high-order runs. Donate its two
         // frames as independent clean owners; the DMA request below is one page.
-        let run = try_allocate_in_range(PhysAddr::new(0), PhysAddr::new(end), 1, &mut entries)
+        let allocation =
+            try_allocate_in_range(PhysAddr::new(0), PhysAddr::new(end), 1, &mut entries);
+        let _ = writeln!(
+            detail,
+            "search_end={end} range_stop={:?} range_found={} scan_remaining={entries}",
+            allocation.as_ref().err(),
+            allocation.as_ref().is_ok_and(Option::is_some)
+        );
+        let run = allocation
             .map_err(|_| SystemError::ENOMEM)?
             .ok_or(SystemError::ENOMEM)?;
         let (base, count) = run.into_raw_parts();
@@ -862,7 +867,8 @@ fn dma_capacity_recovery() -> (bool, alloc::string::String) {
                 .filter(|page| page.strong_count() != 0)
                 .count()
         );
-        let passed = unavailable
+        let passed = base.data() >= minimum_expected_base
+            && unavailable
             && pages.0[0].strong_count() == 0
             && pages.0[1].strong_count() != 0
             && recovered.as_ref().is_ok_and(|buffer| {
@@ -878,6 +884,39 @@ fn dma_capacity_recovery() -> (bool, alloc::string::String) {
     })();
     let _ = writeln!(detail, "phase={phase} error={:?}", result.as_ref().err());
     (result.unwrap_or(false), detail)
+}
+
+// Preserve the capacity/reclaim contract after all allocatable low-prefix
+// frames have real owners. Only fixture placement changes; the one-page DMA
+// mask, outside clean control, and every capacity assertion remain identical.
+fn dma_capacity_occupied_prefix() -> (bool, alloc::string::String) {
+    const PREFIX_END: usize = 64 * 1024 * 1024;
+    let mut held_pages = 0;
+    let mut recovery_detail = alloc::string::String::new();
+    let result = (|| -> Result<bool, SystemError> {
+        // Prepare reservation metadata before taking the headroom snapshot.
+        let mut held = PrefixReservations::new(PREFIX_END)?;
+        let free = unsafe { LockedFrameAllocator.usage() }.free().data();
+        let dma32_free = LockedFrameAllocator::diagnostic_snapshot()
+            .ok_or(SystemError::ENOMEM)?
+            .dma32_free_pages();
+        // Holding at most 64MiB leaves the inner capacity fixture's existing
+        // 128MiB admission floor in both global and DMA32 inventories. The
+        // inner fixture still recalculates its budget after this reservation.
+        if free < 3 * DMA_HEADROOM_PAGES || dma32_free < 3 * DMA_HEADROOM_PAGES {
+            return Err(SystemError::ENOMEM);
+        }
+        held.hold_remaining()?;
+        held_pages = held.pages;
+        let (passed, detail) = dma_capacity_recovery(PREFIX_END);
+        recovery_detail = detail;
+        drop(held);
+        Ok(passed)
+    })();
+    let error = result.as_ref().err();
+    (result.as_ref().copied().unwrap_or(false), alloc::format!(
+        "error={error:?} held_pages={held_pages} prefix_end={PREFIX_END} recovery=[{recovery_detail}]"
+    ))
 }
 
 fn invalid_seeds() -> bool {
@@ -1083,14 +1122,26 @@ fn dma_recovery_inventory(max: PhysAddr) -> Result<(usize, usize, usize, usize),
     Ok((len, buckets, mask_entries, bound))
 }
 
+/// Both pressure fixtures must leave headroom in the DMA-addressable zone,
+/// not merely in Normal memory which cannot satisfy their bounded requests.
+fn dma_fixture_budget(free: usize, reservation_limit: Option<usize>) -> Result<usize, SystemError> {
+    if free < 2 * DMA_HEADROOM_PAGES {
+        return Err(SystemError::ENOMEM);
+    }
+    let dma32_free = LockedFrameAllocator::diagnostic_snapshot()
+        .ok_or(SystemError::ENOMEM)?
+        .dma32_free_pages();
+    Ok((free / 2)
+        .min(dma32_free / 2)
+        .min(free - DMA_HEADROOM_PAGES)
+        .min(reservation_limit.unwrap_or(usize::MAX)))
+}
+
 /// Exercise actual registry discovery and the real Service implementation with
 /// a private owner. The global DMA consumer's cursor/backoff is never changed.
 fn dma_discovery_deferral_progress() -> Result<bool, SystemError> {
     let free = unsafe { LockedFrameAllocator.usage() }.free().data();
-    if free < 2 * DMA_HEADROOM_PAGES {
-        return Err(SystemError::ENOMEM);
-    }
-    let end = (free / 2)
+    let end = dma_fixture_budget(free, None)?
         .checked_mul(MMArch::PAGE_SIZE)
         .ok_or(SystemError::ENOMEM)?
         .min(DMA32_END);
@@ -1273,14 +1324,8 @@ fn dma_automatic_recovery(
     let result = (|| -> Result<(bool, bool, bool, bool), SystemError> {
         detail.phase = "initial_headroom";
         detail.free_before = unsafe { LockedFrameAllocator.usage() }.free().data();
-        // This is a controlled pressure fixture, not permission to consume
-        // arbitrary low memory. Include external layout owners in its limit.
-        if detail.free_before < 2 * DMA_HEADROOM_PAGES {
-            return Err(SystemError::ENOMEM);
-        }
-        let budget = (detail.free_before / 2)
-            .min(detail.free_before - DMA_HEADROOM_PAGES)
-            .min(reservation_limit.unwrap_or(usize::MAX));
+        // Include external layout owners while preserving real DMA32 headroom.
+        let budget = dma_fixture_budget(detail.free_before, reservation_limit)?;
         detail.search_end = budget
             .checked_mul(MMArch::PAGE_SIZE)
             .ok_or(SystemError::ENOMEM)?
@@ -1852,7 +1897,8 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
 pub(crate) fn report() -> alloc::string::String {
     let _serial = TEST_LOCK.lock();
     let mut deferred_detail = alloc::string::String::new();
-    let (capacity_recovery, capacity_detail) = dma_capacity_recovery();
+    let (capacity_recovery, capacity_detail) = dma_capacity_recovery(0);
+    let (capacity_occupied, capacity_occupied_detail) = dma_capacity_occupied_prefix();
     let mut checks = alloc::vec![
         (
             "real_fragmented_capture",
@@ -1890,6 +1936,7 @@ pub(crate) fn report() -> alloc::string::String {
         ("deadline_rollback", deadline_rollback().unwrap_or(false)),
         ("dma_recovery_reserve_guard", dma_recovery_reserve_guard()),
         ("dma_capacity_recovery", capacity_recovery,),
+        ("dma_capacity_occupied_prefix", capacity_occupied),
         ("seed_boundaries_no_mutation", invalid_seeds()),
         (
             "repeated_capture",
@@ -1956,6 +2003,10 @@ pub(crate) fn report() -> alloc::string::String {
     }
     let _ = writeln!(output, "deferred_free_detail={deferred_detail}");
     let _ = writeln!(output, "dma_capacity_recovery_detail=[{capacity_detail}]");
+    let _ = writeln!(
+        output,
+        "dma_capacity_occupied_prefix_detail=[{capacity_occupied_detail}]"
+    );
     let _ = writeln!(output, "cold_workspace_detail={cold_detail}");
     let _ = writeln!(output, "dma_recovery_detail={dma_detail}");
     let _ = writeln!(output, "dma_occupied_layout_detail={layout_detail}");

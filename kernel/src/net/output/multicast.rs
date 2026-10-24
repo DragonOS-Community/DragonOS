@@ -52,7 +52,7 @@ fn deliver_clone(
     egress: &Arc<dyn Iface>,
     epoch: u64,
     route: OutputRouteDecision,
-    mut frame: Vec<u8>,
+    mut frame: PacketBuffer,
     oifname: [u8; 16],
 ) {
     let clone_ct = ct.fork();
@@ -88,9 +88,7 @@ pub(super) fn ipv6_loopback(
     oifname: [u8; 16],
 ) {
     if frame.len() <= route.ip_mtu {
-        let mut clone = Vec::new();
-        if clone.try_reserve_exact(frame.len()).is_ok() {
-            clone.extend_from_slice(frame);
+        if let Ok(clone) = PacketBuffer::try_from_slice(frame) {
             deliver_clone(ct, egress, epoch, route, clone, oifname);
         }
         return;

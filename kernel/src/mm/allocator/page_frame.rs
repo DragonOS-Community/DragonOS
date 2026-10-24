@@ -305,8 +305,81 @@ impl PageFrameUsage {
     }
 }
 
+/// Allocation purpose selects the ordinary floor, independently of accounting.
+#[derive(Clone, Copy, Debug)]
+pub enum FrameAllocationClass {
+    Kernel,
+    User,
+}
+
+/// Placement groups similar physical lifetimes. It grants neither migration
+/// eligibility nor access to protected reserves; those contracts stay separate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FramePlacement {
+    #[default]
+    Unmovable,
+    Movable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FrameAllocationRequest {
+    pub count: PageFrameCount,
+    pub max_phys_addr: PhysAddr,
+    pub class: FrameAllocationClass,
+    pub placement: FramePlacement,
+}
+
+impl FrameAllocationRequest {
+    pub fn kernel(count: PageFrameCount, max_phys_addr: PhysAddr) -> Self {
+        Self {
+            count,
+            max_phys_addr,
+            class: FrameAllocationClass::Kernel,
+            placement: FramePlacement::Unmovable,
+        }
+    }
+    pub fn user(count: PageFrameCount, max_phys_addr: PhysAddr) -> Self {
+        Self {
+            count,
+            max_phys_addr,
+            class: FrameAllocationClass::User,
+            placement: FramePlacement::Unmovable,
+        }
+    }
+    pub fn with_placement(mut self, placement: FramePlacement) -> Self {
+        self.placement = placement;
+        self
+    }
+    pub(crate) fn normalized(self) -> Option<Self> {
+        if self.count.data() == 0 {
+            return None;
+        }
+        Some(Self {
+            count: PageFrameCount::new(self.count.data().checked_next_power_of_two()?),
+            ..self
+        })
+    }
+    pub(crate) fn reserve_level(self) -> super::reserve::ReserveLevel {
+        match self.class {
+            FrameAllocationClass::User => super::reserve::ReserveLevel::User,
+            FrameAllocationClass::Kernel => super::reserve::kernel_level(),
+        }
+    }
+}
+
 /// 能够分配页帧的分配器需要实现的trait
 pub trait FrameAllocator {
+    unsafe fn allocate_request(
+        &mut self,
+        request: FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        if request.max_phys_addr.data() == usize::MAX {
+            self.allocate(request.count)
+        } else {
+            self.allocate_below(request.count, request.max_phys_addr)
+        }
+    }
     // @brief 分配count个页帧
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)>;
 
@@ -337,6 +410,12 @@ pub trait FrameAllocator {
 
 /// @brief 通过一个 &mut T 的引用来对一个实现了 FrameAllocator trait 的类型进行调用，使代码更加灵活
 impl<T: FrameAllocator> FrameAllocator for &mut T {
+    unsafe fn allocate_request(
+        &mut self,
+        request: FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        T::allocate_request(self, request)
+    }
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         return T::allocate(self, count);
     }
@@ -368,28 +447,17 @@ pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, P
     unsafe { LockedFrameAllocator.allocate(count) }
 }
 
+pub unsafe fn allocate_page_frames_request(
+    request: FrameAllocationRequest,
+) -> Option<(PhysAddr, PageFrameCount)> {
+    LockedFrameAllocator.allocate_request(request)
+}
+
 pub unsafe fn allocate_page_frames_below(
     count: PageFrameCount,
     max_phys_addr: PhysAddr,
 ) -> Option<(PhysAddr, PageFrameCount)> {
     unsafe { LockedFrameAllocator.allocate_below(count, max_phys_addr) }
-}
-
-pub fn retry_oom_victim_page_frame_alloc<F>(
-    mut try_allocate: F,
-) -> Option<(PhysAddr, PageFrameCount)>
-where
-    F: FnMut() -> Option<(PhysAddr, PageFrameCount)>,
-{
-    if !crate::mm::oom::current_is_oom_victim() {
-        return None;
-    }
-
-    // OOM victims are already destined to die and need a chance to allocate
-    // page tables or kernel objects while exiting and freeing their mm.
-    // This mirrors Linux's TIF_MEMDIE reserve access at the page allocator.
-    crate::mm::page::PageReclaimer::wakeup_claim_thread();
-    try_allocate()
 }
 
 /// @brief 向全局页帧分配器释放连续count个页帧

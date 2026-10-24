@@ -20,6 +20,7 @@ use crate::{
     libs::spinlock::SpinLock,
     process::{
         cred::Cred,
+        exec_args::ExecArguments,
         execve::do_execve,
         fork::CloneFlags,
         kthread::{KernelThreadClosure, KernelThreadCreateInfo, KernelThreadMechanism},
@@ -204,7 +205,13 @@ fn run_child_prepare(
     let mut frame = TrapFrame::new();
     child.flags().remove(ProcessFlags::KTHREAD);
     drop(child);
-    let result = do_execve(&path, argv, envp, &mut frame);
+    let prepared = ExecArguments::from_kernel(&path, &argv, &envp);
+    drop(argv);
+    drop(envp);
+    let result = match prepared {
+        Ok(arguments) => do_execve(&path, arguments, &mut frame),
+        Err(error) => Err(error.into()),
+    };
     drop(path);
     match result {
         Ok(()) => Ok(frame),

@@ -1460,6 +1460,10 @@ impl InnerAddressSpace {
 
     /// Unmap all mappings in the user address space
     pub unsafe fn unmap_all(&mut self) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.signal_trampoline = None;
+        }
         // Two calling scenarios:
         // 1) Explicit call (still has external `Arc<AddressSpace>` references): `outer.upgrade()` returns `Some`,
         //    taking the normal mm-aware shootdown + release path.

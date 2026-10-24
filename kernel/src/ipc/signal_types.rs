@@ -326,10 +326,29 @@ impl Sigaction {
 #[derive(Debug, Clone, Default)]
 pub struct UserSigaction {
     pub handler: *mut core::ffi::c_void,
-    pub flags: SigFlags,
+    /// Linux unsigned long sa_flags: keep the wire word free of Rust padding.
+    pub flags: usize,
+    #[cfg(not(target_arch = "riscv64"))]
     pub restorer: *mut core::ffi::c_void,
     pub mask: SigSet,
 }
+
+// Every wire word is initialized; no implicit padding is exported to userspace.
+const _: () = {
+    assert!(core::mem::offset_of!(UserSigaction, flags) == 8);
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        assert!(core::mem::size_of::<UserSigaction>() == 32);
+        assert!(core::mem::offset_of!(UserSigaction, mask) == 24);
+    }
+};
+
+// Linux RV64 uses asm-generic sigaction without a sa_restorer field.
+#[cfg(target_arch = "riscv64")]
+const _: () = {
+    assert!(core::mem::size_of::<UserSigaction>() == 24);
+    assert!(core::mem::offset_of!(UserSigaction, mask) == 16);
+};
 
 /**
  * 内核内部使用的SigInfo结构体，不直接暴露给用户态

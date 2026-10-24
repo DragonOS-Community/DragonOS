@@ -16,6 +16,16 @@ use crate::{
 };
 
 static DEADLINE: AtomicU64 = AtomicU64::new(0);
+static PRESSURE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn pressure_epoch() -> u64 {
+    PRESSURE_EPOCH.load(Ordering::Acquire)
+}
+
+pub(crate) fn request_pressure() {
+    PRESSURE_EPOCH.fetch_add(1, Ordering::Release);
+    crate::mm::memory_notify::request_reclaim_deadline();
+}
 static WRITEBACK_WAITING: AtomicBool = AtomicBool::new(false);
 // Never removed after bootstrap. The permanent reclaimer PCB is also pinned
 // by its creator/PAGE_RECLAIMER_THREAD, so notifier clones cannot retire it.
@@ -57,9 +67,9 @@ impl ReclaimWait {
         (ArmedWait, deadline)
     }
 
-    pub(super) fn pause_us(&self, microseconds: u64) {
+    pub(super) fn pause_us(&self, microseconds: u64, observed_epoch: u64) {
         let (_armed, deadline) = self.arm(microseconds, false);
-        while clock() < deadline {
+        while clock() < deadline && pressure_epoch() == observed_epoch {
             self.waiter
                 .wait(false)
                 .expect("background reclaimer pause failed");

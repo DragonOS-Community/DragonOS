@@ -37,7 +37,7 @@ pub(crate) struct ProtectionSnapshot {
     unowned_remaining: u64,
 }
 
-pub(crate) use super::registry::global_snapshot;
+pub(crate) use super::registry::{global_snapshot, try_global_snapshot};
 
 impl ProtectionSnapshot {
     pub fn new(root: &Arc<MemoryAccount>) -> Result<Self, SystemError> {

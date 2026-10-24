@@ -51,7 +51,7 @@ pub struct BridgeDriver {
     pub inner: SpinLock<Bridge>,
     pub netns: RwLock<Weak<NetNamespace>>,
     local_iface: SpinLock<Weak<BridgeIface>>,
-    local_rx_queue: SpinLock<VecDeque<Vec<u8>>>,
+    local_rx_queue: SpinLock<crate::libs::prepared_queue::Queue<super::PacketBuffer>>,
     active: AtomicBool,
     mtu_set_by_user: AtomicBool,
     in_flight: AtomicUsize,
@@ -65,7 +65,7 @@ impl BridgeDriver {
             inner: SpinLock::new(Bridge::new(name)),
             netns: RwLock::new(Weak::new()),
             local_iface: SpinLock::new(Weak::new()),
-            local_rx_queue: SpinLock::new(VecDeque::new()),
+            local_rx_queue: SpinLock::new(crate::libs::prepared_queue::Queue::new()),
             active: AtomicBool::new(true),
             mtu_set_by_user: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
@@ -235,19 +235,20 @@ impl BridgeDriver {
         // smoltcp input copy needs the bridge MAC to pass its L2 admission
         // check for a local FDB entry owned by a port.
         crate::net::socket::packet::deliver_to_packet_sockets(&local_iface, frame, packet_type);
-        let mut owned = Vec::new();
-        if owned.try_reserve_exact(frame.len()).is_err() {
+        let Ok(mut owned) = super::PacketBuffer::try_from_slice(frame) else {
             return;
-        }
-        owned.extend_from_slice(frame);
+        };
         if let Some(dst) = local_stack_dst {
             owned[..6].copy_from_slice(dst.as_bytes());
         }
+        let Ok(node) = crate::libs::prepared_queue::Node::try_new(owned) else {
+            return;
+        };
         let mut queue = self.local_rx_queue.lock();
-        if queue.len() >= BRIDGE_MAX_LOCAL_FRAMES || queue.try_reserve(1).is_err() {
+        if queue.len() >= BRIDGE_MAX_LOCAL_FRAMES {
             return;
         }
-        queue.push_back(owned);
+        queue.push_node(node);
         drop(queue);
         if let Some(napi) = local.napi_struct() {
             napi_schedule(napi);

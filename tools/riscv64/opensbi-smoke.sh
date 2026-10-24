@@ -247,7 +247,9 @@ boot_userspace() {
   fi
   wait_for "$run_dir/guest.log" '# '
   # Split the marker so terminal command echo cannot satisfy the assertion.
-  printf '%s\n' "test -r /bin/sh && printf 'DRAGONOS-%s\\n' SMOKE-OK" >&4
+  printf '%s\n' "/bin/busybox true && printf 'DRAGONOS-%s\\n' EXEC-OK" >&4
+  wait_for "$run_dir/guest.log" '^DRAGONOS-EXEC-OK[[:space:]]*$'
+  printf '%s\n' "printf 'DRAGONOS-%s\\n' SMOKE-OK" >&4
   wait_for "$run_dir/guest.log" '^DRAGONOS-SMOKE-OK[[:space:]]*$'
   echo "DragonOS userspace smoke passed ($mode); logs: $run_dir"
 }

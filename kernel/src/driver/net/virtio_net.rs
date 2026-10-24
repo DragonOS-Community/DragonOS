@@ -815,7 +815,11 @@ impl VirtioInterface {
         ));
         iface_config.random_seed = rand() as u64;
 
-        let iface = iface::Interface::new(iface_config, &mut device_inner, Instant::now().into());
+        let iface = crate::driver::net::packet_storage::new_interface(
+            iface_config,
+            &mut device_inner,
+            Instant::now().into(),
+        );
 
         // Linux registers netdevs administratively DOWN (BROADCAST|MULTICAST
         // only); userspace — dragon-network or a guest agent — brings the
@@ -1034,6 +1038,7 @@ pub struct VirtioNetRxToken {
 pub struct VirtioNetTxToken {
     driver: VirtIONicDeviceInner,
     tx_buffer: Option<TxDmaBuffer>,
+    reply: Option<super::NativeReply>,
     meta: phy::PacketMeta,
 }
 
@@ -1051,6 +1056,7 @@ impl VirtioNetTxToken {
         Self {
             driver,
             tx_buffer: None,
+            reply: None,
             meta: phy::PacketMeta::default(),
         }
     }
@@ -1059,6 +1065,7 @@ impl VirtioNetTxToken {
         Self {
             driver,
             tx_buffer: Some(tx_buffer),
+            reply: None,
             meta: phy::PacketMeta::default(),
         }
     }
@@ -1112,6 +1119,20 @@ impl phy::Device for VirtIONicDeviceInner {
 }
 
 impl phy::TxToken for VirtioNetTxToken {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        if len > VIRTIO_NET_MAX_FRAME_SIZE {
+            return Err(phy::TxEgressError::Exhausted);
+        }
+        if self.tx_buffer.is_some() {
+            return Ok(());
+        }
+        if let Some(reply) = self.reply.as_mut() {
+            return reply.prepare_buffer(len);
+        }
+        let iface = self.driver.iface().ok_or(phy::TxEgressError::Exhausted)?;
+        self.reply = Some(super::NativeReply::prepare(iface, len)?);
+        Ok(())
+    }
     fn set_meta(&mut self, meta: phy::PacketMeta) {
         self.meta = meta;
     }
@@ -1125,32 +1146,17 @@ impl phy::TxToken for VirtioNetTxToken {
             return result;
         }
 
-        // The token paired with an RX packet is intentionally lazy: RX must
-        // continue to make progress even while the TX queue is saturated.
-        // If immediate submission is backpressured, transfer ownership to the
-        // interface's bounded output queue; smoltcp cannot retry this token.
-        let mut frame = alloc::vec![0; len];
-        let result = f(&mut frame);
-        let iface = self.driver.iface();
-        let tx_generation = iface
-            .as_ref()
-            .map(|iface| iface.common().tx_completion_generation());
-        match self.driver.try_response_transmit(&frame) {
+        let mut reply = self
+            .reply
+            .take()
+            .expect("RX reply storage prepared before emit");
+        assert_eq!(reply.frame.len(), len);
+        let result = f(&mut reply.frame);
+        let generation = reply.generation();
+        match self.driver.try_response_transmit(&reply.frame) {
             Ok(()) => {}
             Err(SystemError::ENOBUFS) | Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                let queued = iface.zip(tx_generation).is_some_and(|(iface, generation)| {
-                    super::defer_native_output_after_tx_backpressure(
-                        iface.as_ref(),
-                        phy::Medium::Ethernet,
-                        self.meta,
-                        frame,
-                        generation,
-                    )
-                    .is_ok()
-                });
-                if !queued {
-                    log::debug!("virtio-net dropped RX-path reply: deferred output is unavailable");
-                }
+                reply.defer(phy::Medium::Ethernet, self.meta, generation);
             }
             Err(err) => error!("virtio-net failed to transmit RX-path reply: {err:?}"),
         }

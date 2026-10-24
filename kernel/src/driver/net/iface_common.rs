@@ -1,5 +1,7 @@
 use super::*;
 use crate::net::ingress::{NetIngressFilter, NetIngressFilterInit, RoutedIngressWork};
+use crate::net::socket::inet::raw::{RawIngressBatch, RawIngressQueue};
+use alloc::boxed::Box;
 use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
 
 pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>>;
@@ -780,6 +782,8 @@ impl IfaceCommon {
                 IfacePollScope::LocalOnly | IfacePollScope::Full => {}
             }
 
+            let mut raw_batch = Box::try_new(RawIngressBatch::default()).ok();
+            let mut raw_retirement = Vec::new();
             let netns = self.net_namespace();
             let nft_ruleset = netns.as_ref().map(|netns| netns.nftables().snapshot());
             let nft_ruleset_changed = || {
@@ -924,6 +928,13 @@ impl IfaceCommon {
             let mark = Cell::new(0);
             let forward_fragment = Cell::new(None);
             let packet_context = core::cell::RefCell::new(None);
+            // Account only after every poll-mode recheck succeeds. Packet and
+            // pin allocations are charged as matching raw datagrams arrive.
+            let raw_reserved = raw_batch.as_mut().is_some_and(|batch| {
+                netns
+                    .as_ref()
+                    .is_some_and(|netns| batch.reserve_header(&netns.raw_ingress))
+            });
             let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
             let mut nft_filter = netns.as_ref().map(|netns| {
                 NetIngressFilter::new(NetIngressFilterInit {
@@ -941,6 +952,8 @@ impl IfaceCommon {
                         .flatten(),
                     fib_routes: route_policy.as_ref(),
                     work: &mut ingress_work,
+                    raw_batch: raw_batch.as_deref_mut().filter(|_| raw_reserved),
+                    raw_retirement: &mut raw_retirement,
                 })
             });
 
@@ -1034,6 +1047,19 @@ impl IfaceCommon {
             // Lock order is smoltcp -> configured-neighbor read. Release in the
             // reverse order before output draining may acquire another smoltcp
             // lock; RTNL delete deliberately uses smoltcp -> table write.
+            let raw_owner = if raw_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.work.is_empty())
+            {
+                netns
+                    .as_ref()
+                    .unwrap()
+                    .raw_ingress
+                    .lock_irqsave()
+                    .publish(raw_batch.take().unwrap())
+            } else {
+                false
+            };
             drop(configured_neighbors);
             drop(interface);
             drop(sockets);
@@ -1049,6 +1075,17 @@ impl IfaceCommon {
             // A last notification pin must not reenter namespace/device
             // retirement while this poll contributes to close_and_wait.
             drop(_poll_guard);
+            if raw_owner {
+                RawIngressQueue::drain(&netns.as_ref().unwrap().raw_ingress);
+            }
+            // Pressure/OOM fallback pins retire outside both interface locks
+            // and poll admission, without suppressing ordinary protocol input.
+            if let Some(batch) = raw_batch {
+                if let Some(netns) = &netns {
+                    batch.retire(&netns.raw_ingress);
+                }
+            }
+            drop(raw_retirement);
 
             // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
             // 否则会形成典型锁顺序反转死锁：
@@ -1139,6 +1176,8 @@ impl IfaceCommon {
                 IfacePollScope::LocalOnly | IfacePollScope::Full => {}
             }
 
+            let mut raw_batch = Box::try_new(RawIngressBatch::default()).ok();
+            let mut raw_retirement = Vec::new();
             let netns = self.net_namespace();
             let nft_ruleset = netns.as_ref().map(|netns| netns.nftables().snapshot());
             let nft_ruleset_changed = || {
@@ -1275,6 +1314,13 @@ impl IfaceCommon {
                         authoritative_output,
                     });
 
+            // Account only after every poll-mode recheck succeeds. Packet and
+            // pin allocations are charged as matching raw datagrams arrive.
+            let raw_reserved = raw_batch.as_mut().is_some_and(|batch| {
+                netns
+                    .as_ref()
+                    .is_some_and(|netns| batch.reserve_header(&netns.raw_ingress))
+            });
             let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
             let (processed, had_packet, ingress_budget, poll_again, deadline_rearm) = {
                 let ingress_stage = Cell::new(IngressStage::Pending);
@@ -1301,6 +1347,8 @@ impl IfaceCommon {
                             .flatten(),
                         fib_routes: route_policy.as_ref(),
                         work: &mut ingress_work,
+                        raw_batch: raw_batch.as_deref_mut().filter(|_| raw_reserved),
+                        raw_retirement: &mut raw_retirement,
                     })
                 });
 
@@ -1496,6 +1544,19 @@ impl IfaceCommon {
             // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
             // Preserve the same smoltcp -> neighbor lock order as the direct poll
             // path before draining may enter a target interface.
+            let raw_owner = if raw_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.work.is_empty())
+            {
+                netns
+                    .as_ref()
+                    .unwrap()
+                    .raw_ingress
+                    .lock_irqsave()
+                    .publish(raw_batch.take().unwrap())
+            } else {
+                false
+            };
             drop(configured_neighbors);
             drop(interface);
             drop(sockets);
@@ -1508,6 +1569,17 @@ impl IfaceCommon {
             self.clear_namespace_routing_if_idle();
             self.notify_deadline_rearm(deadline_rearm);
             drop(_poll_guard);
+            if raw_owner {
+                RawIngressQueue::drain(&netns.as_ref().unwrap().raw_ingress);
+            }
+            // Pressure/OOM fallback pins retire outside both interface locks
+            // and poll admission, without suppressing ordinary protocol input.
+            if let Some(batch) = raw_batch {
+                if let Some(netns) = &netns {
+                    batch.retire(&netns.raw_ingress);
+                }
+            }
+            drop(raw_retirement);
             self.notify_all_bound_sockets();
 
             // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
@@ -1572,10 +1644,17 @@ impl IfaceCommon {
         let mut prefer_deferred = true;
         let mut work_done = 0;
         for _ in 0..budget {
-            let (mut output, mut in_flight, deferred_probe) = match self
-                .local_input_queue
-                .pop_ready_output(crate::time::Instant::now().into(), prefer_deferred)
-            {
+            // A previous drain can run concurrently with another smoltcp
+            // ingress poll. Do not expose its generated reply before that poll
+            // publishes the corresponding raw request to the namespace FIFO.
+            // Only transfer ownership here; routing and retirement stay outside
+            // the smoltcp -> local-output lock order.
+            let pop = {
+                let _interface = self.smol_iface.lock();
+                self.local_input_queue
+                    .pop_ready_output(crate::time::Instant::now().into(), prefer_deferred)
+            };
+            let (mut output, mut in_flight, deferred_probe) = match pop {
                 LocalOutputPop::Ready(output, in_flight, deferred_probe) => {
                     (output, in_flight, deferred_probe)
                 }

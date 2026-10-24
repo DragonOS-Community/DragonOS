@@ -11,6 +11,11 @@ use super::TrapFrame;
 
 #[no_mangle]
 unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
+    // A terminal stop must work even if the failed allocation retained task,
+    // scheduler or IRQ locks. Do not enter RCU, swapgs bookkeeping or irqdesc.
+    if vector == super::ipi::IPI_NUM_STOP_CPU.data() && crate::debug::fatal::is_active() {
+        crate::debug::fatal::halt_current_cpu();
+    }
     // swapgs
 
     if trap_frame.is_from_user() {

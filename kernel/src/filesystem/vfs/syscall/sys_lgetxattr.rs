@@ -21,7 +21,7 @@ impl Syscall for SysLgetxattrHandle {
         let buf_ptr = Self::buf(args);
         let size = Self::size(args);
 
-        path_getxattr(path_ptr, name_ptr, buf_ptr, size, 0)
+        path_getxattr(path_ptr, name_ptr, buf_ptr, size, false)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

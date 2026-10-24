@@ -267,5 +267,5 @@ fn dealloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
 #[cfg(target_os = "none")]
 #[alloc_error_handler]
 pub fn global_alloc_err_handler(layout: Layout) -> ! {
-    panic!("global_alloc_error, layout: {:?}", layout);
+    crate::debug::fatal::allocation_failure(layout)
 }

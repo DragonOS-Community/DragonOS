@@ -16,7 +16,7 @@ impl Syscall for SysLremovexattrHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        path_removexattr(Self::path(args), Self::name(args), 0)
+        path_removexattr(Self::path(args), Self::name(args), false)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

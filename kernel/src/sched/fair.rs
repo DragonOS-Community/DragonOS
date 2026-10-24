@@ -2134,7 +2134,7 @@ impl Scheduler for CompletelyFairScheduler {
         let binding = se.cfs_rq();
         let cfs_rq = binding.force_mut();
 
-        if unlikely(rq.nr_running == 1) {
+        if unlikely(rq.nr_running() == 1) {
             return;
         }
 

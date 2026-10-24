@@ -396,6 +396,16 @@ impl PciTransport {
             .expect("VirtIO PCI IRQ must be configured before it is queried")
     }
 
+    /// Check the final configuration interrupt routing after queue setup.
+    /// A device may reject an MSI-X assignment by returning NO_VECTOR.
+    pub(super) fn config_irq_valid(&self) -> bool {
+        if !matches!(*self.device.irq_type.read(), IrqType::Msix { .. }) {
+            return true;
+        }
+        // The common configuration mapping is held for the transport lifetime.
+        unsafe { volread!(self.common_cfg, msix_config) == VIRTIO_RECV_VECTOR_INDEX }
+    }
+
     pub fn interrupt_ack(&self) -> PciInterruptAck {
         PciInterruptAck {
             isr_status: self.isr_status,

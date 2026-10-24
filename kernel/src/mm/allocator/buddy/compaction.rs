@@ -2,7 +2,12 @@
 //! This module knows only frame ownership. Page eligibility, migration, request
 //! backoff and placement policy belong to the caller outside the buddy lock.
 
-use super::{BuddyAllocator, BuddyZone, PageList, MAX_ORDER, MIN_ORDER};
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+use super::PageList;
+use super::{placement, BuddyAllocator, BuddyZone, FramePlacement, MAX_ORDER, MIN_ORDER};
 use crate::mm::{MemoryManagementArch, PhysAddr};
 #[cfg(all(
     feature = "mm_selftest",
@@ -11,6 +16,7 @@ use crate::mm::{MemoryManagementArch, PhysAddr};
 use alloc::vec::Vec;
 
 pub(crate) const MAX_COMPACT_ORDER: usize = 9;
+const _: () = assert!(MAX_COMPACT_ORDER + MIN_ORDER <= placement::BLOCK_ORDER);
 const BITMAP_WORDS: usize = (1 << MAX_COMPACT_ORDER) / u64::BITS as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,70 +127,135 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         // This is a hard address-domain request, like allocate_below with a
         // finite limit. It does not use unrestricted-allocation DMA32 fallback.
         for zone in [BuddyZone::Normal, BuddyZone::Dma32] {
+            let (low, high) = match zone {
+                BuddyZone::Dma32 => (start.data(), end.data().min(1usize << 32)),
+                BuddyZone::Normal => (start.data().max(1usize << 32), end.data()),
+            };
+            if low >= high || high - low < bytes {
+                continue;
+            }
             for current in MIN_ORDER + order..MAX_ORDER {
-                charge(remaining_scan, 1)?;
-                let mut metadata = self.free_area(zone, current as u8);
-                while !metadata.is_null() {
-                    charge(remaining_scan, 1)?;
-                    let list: PageList<A> = Self::read_page(metadata);
-                    for index in (0..list.entry_num).rev() {
-                        charge(remaining_scan, 1)?;
-                        let base: PhysAddr =
-                            unsafe { A::read(Self::entry_virt_addr(metadata, index)) };
-                        let block_end = base
-                            .data()
-                            .checked_add(1 << current)
-                            .ok_or(RangeError::Invalid)?;
-                        let low = base.data().max(start.data());
-                        let Some(selected) =
-                            low.checked_add(bytes - 1).map(|value| value & !(bytes - 1))
-                        else {
-                            continue;
-                        };
-                        if selected
-                            .checked_add(bytes)
-                            .is_none_or(|limit| limit > block_end.min(end.data()))
-                        {
-                            continue;
-                        }
-                        // Every following action has fixed order-bounded work;
-                        // reserve its split iterations before removing ownership.
-                        charge(remaining_scan, current - (MIN_ORDER + order) + 1)?;
-                        let removed = self.remove_entry(zone, current as u8, metadata, index);
-                        debug_assert_eq!(removed, base);
-                        let selected = PhysAddr::new(selected);
-                        unsafe {
-                            self.return_outside_halves(base, current, selected, MIN_ORDER + order)
-                        };
-                        return Ok(Some(selected));
-                    }
-                    metadata = list.next_page;
+                // The head of a larger containing block can precede the
+                // request. Otherwise the index skips unrelated free blocks,
+                // including all lower orders, via nonempty-word summaries.
+                let ancestor = PhysAddr::new(low & !((1usize << current) - 1));
+                charge(remaining_scan, self.index_lookup_bound())?;
+                let ancestor_selected =
+                    low.checked_add(bytes - 1).map(|value| value & !(bytes - 1));
+                let ancestor_end = ancestor.data().checked_add(1usize << current);
+                let usable_ancestor = self.free_entry(ancestor).is_some_and(|(found, _, _)| {
+                    found as usize == current
+                        && ancestor_selected.is_some_and(|selected| {
+                            selected.checked_add(bytes).is_some_and(|last| {
+                                ancestor_end.is_some_and(|block_end| last <= block_end.min(high))
+                            })
+                        })
+                });
+                let base = if usable_ancestor {
+                    Some(ancestor)
+                } else {
+                    self.index_next_head(
+                        current as u8,
+                        PhysAddr::new(low),
+                        PhysAddr::new(high),
+                        remaining_scan,
+                    )?
+                };
+                let Some(base) = base else { continue };
+                let block_end = base
+                    .data()
+                    .checked_add(1usize << current)
+                    .ok_or(RangeError::Invalid)?;
+                let selected = low
+                    .max(base.data())
+                    .checked_add(bytes - 1)
+                    .map(|value| value & !(bytes - 1))
+                    .ok_or(RangeError::Invalid)?;
+                if selected
+                    .checked_add(bytes)
+                    .is_none_or(|limit| limit > high.min(block_end))
+                {
+                    continue;
                 }
+                let (found, metadata, index) = self.free_entry(base).expect("indexed head missing");
+                assert_eq!(found as usize, current);
+                let class = if current < placement::BLOCK_ORDER {
+                    self.placement.get::<A>(base)
+                } else {
+                    FramePlacement::Unmovable
+                };
+                let split_class = if current >= placement::BLOCK_ORDER {
+                    FramePlacement::Unmovable
+                } else {
+                    class
+                };
+                let headroom = self.split_headroom_for(
+                    zone,
+                    (MIN_ORDER + order) as u8,
+                    current as u8,
+                    split_class,
+                );
+                let mutations =
+                    current - (MIN_ORDER + order) + 1 + headroom * (MAX_ORDER - MIN_ORDER);
+                charge(
+                    remaining_scan,
+                    self.compaction_point_bound(mutations)
+                        .ok_or(RangeError::Invalid)?,
+                )?;
+                let removed = self.remove_entry(zone, current as u8, class, metadata, index);
+                assert_eq!(removed, base);
+                let selected = PhysAddr::new(selected);
+                self.classify_allocation(
+                    selected,
+                    current as u8,
+                    (MIN_ORDER + order) as u8,
+                    FramePlacement::Unmovable,
+                );
+                unsafe { self.return_outside_halves(base, current, selected, MIN_ORDER + order) };
+                return Ok(Some(selected));
             }
         }
         Ok(None)
     }
 
-    /// Reserve one complete scan before changing ownership. Non-head metadata
-    /// pages contain at least BUDDY_ENTRIES - 1 entries: a new head replaces a
-    /// full head, possibly after consuming one old entry for its own metadata.
-    /// Removal replaces non-head slots from the head, preserving their density.
-    /// Thus the exact free-block counters also bound metadata visits without
-    /// walking the chains just to decide whether the scan is affordable.
-    fn isolation_work_bound(&self, zone: BuddyZone, target_order: usize) -> Option<usize> {
-        let mut work = MAX_ORDER - MIN_ORDER;
-        for &blocks in &self.diagnostics.zones[zone.index()].free_blocks {
-            let metadata = blocks.div_ceil(Self::BUDDY_ENTRIES - 1);
-            work = work.checked_add(blocks)?.checked_add(metadata)?;
+    /// Local heads, their slot replacements and order-bounded splits are
+    /// prepaid before mutation. Unrelated zone inventory is never charged.
+    fn isolation_work_bound(
+        &self,
+        zone: BuddyZone,
+        target_order: usize,
+        start: PhysAddr,
+    ) -> Option<usize> {
+        let pages = 1usize << (target_order - MIN_ORDER);
+        let ancestors = MAX_ORDER - target_order;
+        // Both the read-only preflight and removal's ancestor lookup are
+        // charged. Their bound is independent of the free-list population.
+        let probes = ancestors
+            .checked_mul(2)?
+            .checked_mul(self.index_lookup_bound())?;
+        for current in target_order + 1..MAX_ORDER {
+            let base = PhysAddr::new(start.data() & !((1usize << current) - 1));
+            if self
+                .free_entry(base)
+                .is_some_and(|(found, _, _)| found as usize == current)
+            {
+                let class = if current < placement::BLOCK_ORDER {
+                    self.placement.get::<A>(base)
+                } else {
+                    FramePlacement::Unmovable
+                };
+                let headroom =
+                    self.split_headroom_for(zone, target_order as u8, current as u8, class);
+                let mutations = (current - target_order + 1)
+                    .checked_add(headroom.checked_mul(MAX_ORDER - MIN_ORDER)?)?;
+                return probes.checked_add(self.compaction_point_bound(mutations)?);
+            }
         }
-        // At most one free block per target page is removed. A containing
-        // larger block needs at most this many outside-half insertions.
-        work.checked_add(1 << (target_order - MIN_ORDER))?
-            .checked_add(MAX_ORDER - 1 - target_order)
+        probes.checked_add(self.index_isolation_bound(start, pages)?)
     }
 
-    /// Prepay a conservative bound, then remove intersecting blocks in one
-    /// pass under the same buddy lock. Budget failure cannot change ownership.
+    /// Prepay a conservative bound, then remove intersecting heads by address
+    /// lookup under the same buddy lock. Budget failure cannot change ownership.
     pub(crate) fn begin_isolation(
         &mut self,
         start: PhysAddr,
@@ -205,7 +276,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             .checked_add(1)
             .ok_or(RangeError::Invalid)?;
         let work = self
-            .isolation_work_bound(zone, MIN_ORDER + order)
+            .isolation_work_bound(zone, MIN_ORDER + order, start)
             .ok_or(RangeError::Invalid)?;
         charge(remaining_scan, work)?;
         // The reservation is deliberately conservative and is not refunded.
@@ -221,42 +292,55 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             free: [0; BITMAP_WORDS],
             free_pages: 0,
         };
-        // No insertion is allowed until every target block is removed. A
-        // head-last replacement comes from an already scanned position and
-        // is therefore outside the target. Descending indices stay valid.
-        for current in MIN_ORDER..MAX_ORDER {
-            let mut metadata = self.free_area(zone, current as u8);
-            while !metadata.is_null() {
-                let list: PageList<A> = Self::read_page(metadata);
-                // remove_entry may recycle this page into the empty chain.
-                // Keep its original successor before that overwrites next.
-                let next = list.next_page;
-                for index in (0..list.entry_num).rev() {
-                    let base: PhysAddr = unsafe { A::read(Self::entry_virt_addr(metadata, index)) };
-                    let block_end = base
-                        .data()
-                        .checked_add(1 << current)
-                        .expect("buddy free block address overflow");
-                    if base.data() < end && block_end > start.data() {
-                        assert!(blocks < pages, "overlapping buddy free blocks");
-                        blocks += 1;
-                        // Aligned power-of-two intervals are disjoint or
-                        // nested. Only one larger block can contain a target.
-                        if current > MIN_ORDER + order {
-                            assert!(
-                                containing.is_none() && base <= start && block_end >= end,
-                                "invalid containing buddy free block"
-                            );
-                            containing = Some((base, current));
-                        }
-                        let removed = self.remove_entry(zone, current as u8, metadata, index);
-                        assert_eq!(removed, base, "isolation removal slot changed");
-                        let first = start.data().max(base.data());
-                        let last = end.min(block_end);
-                        state.mark_free(PhysAddr::new(first), (last - first) >> MIN_ORDER);
-                    }
+        // Every supported aligned target is at most one placement pageblock.
+        // Its low-order heads therefore share a label, which remains stable
+        // while the buddy lock is held. Query once, rather than per free head.
+        let target_class = self.placement.get::<A>(start);
+        // First inspect the aligned ancestors: a larger free block may
+        // contain start even though its head lies outside the target.
+        for current in (MIN_ORDER + order + 1..MAX_ORDER).rev() {
+            let base = PhysAddr::new(start.data() & !((1usize << current) - 1));
+            if let Some((found, metadata, index)) = self.free_entry(base) {
+                if found as usize != current {
+                    continue;
                 }
-                metadata = next;
+                let class = if current < placement::BLOCK_ORDER {
+                    target_class
+                } else {
+                    FramePlacement::Unmovable
+                };
+                assert_eq!(self.remove_entry(zone, found, class, metadata, index), base);
+                containing = Some((base, current));
+                state.mark_free(start, pages);
+                break;
+            }
+        }
+        if containing.is_none() {
+            // No insertion until all overlapping heads are gone. Deleting
+            // an entry can move any other head's slot; query the index anew
+            // instead of retaining PageList iterators across replacements.
+            let mut address = start.data();
+            while address < end {
+                let base = PhysAddr::new(address);
+                if let Some((found, metadata, index)) = self.free_entry(base) {
+                    let current = found as usize;
+                    assert!(
+                        current <= MIN_ORDER + order,
+                        "overlapping buddy free blocks"
+                    );
+                    assert!(blocks < pages, "too many target free blocks");
+                    blocks += 1;
+                    let class = if current < placement::BLOCK_ORDER {
+                        target_class
+                    } else {
+                        FramePlacement::Unmovable
+                    };
+                    assert_eq!(self.remove_entry(zone, found, class, metadata, index), base);
+                    state.mark_free(base, 1usize << (current - MIN_ORDER));
+                    address += 1usize << current;
+                } else {
+                    address += 1usize << MIN_ORDER;
+                }
             }
         }
         self.next_isolation_id = next_id;
@@ -293,6 +377,11 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         let state = self.isolation.as_ref()?;
         if !state.matches(key) || state.free_pages != state.pages {
             return None;
+        }
+        let start = state.start;
+        if state.pages == (1 << (placement::BLOCK_ORDER - MIN_ORDER)) {
+            self.placement
+                .set::<A>(start, placement::BLOCK_ORDER, FramePlacement::Unmovable);
         }
         Some(self.isolation.take().unwrap().start)
     }
@@ -395,5 +484,7 @@ mod selftest;
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
 pub(crate) fn selftest_checks() -> Vec<(&'static str, bool)> {
-    selftest::checks()
+    let mut checks = selftest::checks();
+    checks.extend(super::free_index::selftest_checks());
+    checks
 }

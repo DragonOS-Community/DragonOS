@@ -11,20 +11,31 @@ Refer to https://wiki.nixos.org/wiki/Flakes#Setup to enable flake support.
 - If you want to experience Nix's declarative management without changing your distribution, try home-manager and configure it to enable flakes and direnv.
 - Otherwise, you can directly install flakes in a standalone Nix manner, or add `--experimental-features 'nix-command flakes'` before each command.
 
+## Allowing the Current User to Use KVM
+
+The Nix launch scripts do not use `sudo`; QEMU runs as the current user, so the current user needs access to `/dev/kvm` (and optionally `/dev/vhost-vsock`). Usually it is enough to join the `kvm` group and log in again:
+
+```shell
+sudo usermod -aG kvm $USER
+```
+
+For the vsock device, the `vhost_vsock` kernel module must also be loaded. If `/dev/kvm` is unavailable, the launch script prints a hint and falls back to TCG software emulation (slower).
+
 ## Domestic Mirror Acceleration (Recommended)
 
-If you are in China and do not have a global proxy, the first dependency pull may be slow or even fail. This repository has built-in domestic mirror configurations in `flake.nix`, which will take effect automatically when using `nix develop / nix run`.
-
-If it still doesn't work, it is recommended to append the following content to your user-level configuration (it will not overwrite your existing configuration):
+If you are in China and do not have a global proxy, the first dependency pull may be slow or even fail. It is recommended to append the following content to your user-level configuration (it will not overwrite your existing configuration):
 
 ```shell
 mkdir -p ~/.config/nix
 cat >> ~/.config/nix/nix.conf <<'EOF'
 # DragonOS Nix mirror (CN)
 extra-substituters = https://mirrors.tuna.tsinghua.edu.cn/nix-channels/store https://mirrors.ustc.edu.cn/nix-channels/store
-extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 EOF
 ```
+
+::: info
+With a multi-user installation (nix-daemon), `extra-substituters` set by a non-trusted user are ignored. In that case configure them in `/etc/nix/nix.conf` (`nix.settings.substituters` on NixOS), or add the current user to `trusted-users`.
+:::
 
 ## Cloning the Repository
 
@@ -62,7 +73,9 @@ By default, this will compile the kernel ELF to `./bin/kernel/kernel.elf`
 nix run .#rootfs-x86_64
 ```
 
-This will generate `./bin/qemu-system-x86_64.img`
+The disk image is built and cached in the Nix store; this command only copies it to `./bin/disk-image-x86_64.img` when the image has changed.
+
+For interactive runs, if nothing under `user/` has changed, the copy is skipped so that changes you made to the disk inside DragonOS are kept. To discard them and restore a clean image, run `nix run .#rootfs-x86_64 -- --force`. When image preparation selects `AUTO_TEST=dunit` or `AUTO_TEST=syscall` (including `make test-dunit` and `make test-syscall`), it always restores the clean image and discards guest disk changes.
 
 ## Starting the Kernel
 
@@ -76,11 +89,25 @@ Now you can see your terminal loading DragonOS.
 To exit the DragonOS (QEMU) environment, type `ctrl + a`, then `x`
 :::
 
+Environment variables that adjust the launch:
+
+- `QEMU_ACCEL=kvm|tcg`: force the accelerator
+- `AUTO_TEST=syscall|dunit`: run the corresponding tests automatically after boot
+- `QEMU_GDB_WAIT=1`: with `nix run .#start-debug-x86_64`, wait for a GDB connection (`nix run .#gdb-x86_64`) before booting
+
+## Build and Run in One Step
+
+```shell
+nix run .#yolo-x86_64
+```
+
+Runs `make kernel`, prepares the rootfs image and starts QEMU. The kernel is built with exactly the same toolchain as `nix develop`, so entering the dev shell first is not required.
 
 ## More Nix Command Usage and Nix Script Maintenance
 
 - `cd docs && nix run` Build documentation and start an HTTP server.
 - If storage space is tight, `nix store gc` Clean up dangling historical build copies.
+- To keep the dev environment from being garbage-collected, use direnv (`use flake` keeps it automatically) or `nix develop --profile .nix-gc-root`.
 - In the project root directory, `nix flake show` View available build targets.
 - More Nix-related user-space builds are detailed in the Userland section.
 

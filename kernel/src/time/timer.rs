@@ -460,6 +460,10 @@ pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
     compiler_fence(Ordering::SeqCst);
     let now = prev + add_jiffies;
     crate::mm::page::reclaim_wait::tick(now);
+    #[cfg(target_arch = "x86_64")]
+    crate::mm::compaction::background::tick(now);
+    crate::driver::virtio::virtio_balloon::tick(now);
+    crate::mm::fault_recovery::tick();
     return now;
 }
 

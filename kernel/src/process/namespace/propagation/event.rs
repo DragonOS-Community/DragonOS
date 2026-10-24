@@ -985,15 +985,17 @@ pub(super) fn propagate_umount(
     {
         return Err(SystemError::EINVAL);
     }
-    propagate_umount_sources(core::slice::from_ref(source_child), lazy)
+    propagate_umount_sources(core::slice::from_ref(source_child), lazy).map(|_| ())
 }
 
 /// Propagate removal of a complete local umount list. `sources` is ordered
 /// deepest-first, matching `MountFS::umount_subtree_with_mode()`.
+/// Return the already prepared source/removed-target owners so ordinary umount
+/// can wait for their final shutdown after releasing the topology lock.
 pub(crate) fn propagate_umount_sources(
     sources: &[Arc<MountFS>],
     lazy: bool,
-) -> Result<(), SystemError> {
+) -> Result<Vec<Arc<MountFS>>, SystemError> {
     let mut source_ids = HashSet::new();
     source_ids
         .try_reserve(sources.len())
@@ -1150,7 +1152,7 @@ pub(crate) fn propagate_umount_sources(
         MountFS::finish_disconnected_umount(&target.child, lazy)
             .expect("detached prepared propagation root has valid teardown topology");
     }
-    Ok(())
+    Ok(graph_targets)
 }
 
 struct PropagatedUmountTarget {

@@ -14,7 +14,6 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    mm::allocator::page_frame::FrameAllocator,
     mm::allocator::slab::slab_usage,
     mm::page_cache_stats,
 };
@@ -39,10 +38,9 @@ impl MeminfoFileOps {
     }
 
     fn generate_meminfo_content() -> Vec<u8> {
-        use crate::arch::mm::LockedFrameAllocator;
         use crate::arch::MMArch;
 
-        let usage = unsafe { LockedFrameAllocator.usage() };
+        let usage = crate::mm::balloon::managed_usage();
         let slab_kb = slab_usage().total() >> 10;
         let stats = page_cache_stats::snapshot();
         let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;

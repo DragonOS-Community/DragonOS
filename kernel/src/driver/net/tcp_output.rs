@@ -176,6 +176,10 @@ pub(crate) struct TcpOutputDevice<'a> {
 pub(crate) struct TcpTxToken<'a>(LocalInputTxToken<'a>);
 
 impl SmolTxToken for TcpTxToken<'_> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        self.0.prepare_buffer(len)
+    }
+
     fn deferred_ip_output(&self, _: smoltcp::wire::IpVersion) -> bool {
         true
     }
@@ -324,7 +328,7 @@ pub(crate) fn new_transport_interface() -> smoltcp::iface::Interface {
     // The root namespace is constructed by sysfs before timekeeping starts.
     // This empty transport context has no timers; connect/poll supplies the
     // current monotonic time before any protocol state becomes active.
-    smoltcp::iface::Interface::new(
+    crate::driver::net::packet_storage::new_interface(
         config,
         &mut TransportOnlyDevice,
         smoltcp::time::Instant::ZERO,

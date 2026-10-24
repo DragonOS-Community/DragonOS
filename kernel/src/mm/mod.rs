@@ -23,12 +23,15 @@ use self::{
 
 pub(crate) mod allocation;
 pub mod allocator;
+pub(crate) mod balloon;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod compaction;
+pub(crate) mod cpu_buffer;
 pub mod device_linear;
 pub mod dma;
 pub mod early_ioremap;
 pub mod fault;
+pub(crate) mod fault_recovery;
 pub mod ident_map;
 pub mod init;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -48,6 +51,7 @@ pub(crate) mod oom_wait;
 pub mod page;
 pub mod page_cache_stats;
 pub(crate) mod page_lru;
+pub mod page_reporting;
 pub(crate) mod page_rmap;
 pub mod percpu;
 pub mod readahead;

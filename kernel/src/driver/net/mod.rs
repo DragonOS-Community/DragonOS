@@ -1,4 +1,4 @@
-use alloc::collections::VecDeque;
+pub use crate::mm::cpu_buffer::CpuBuffer as PacketBuffer;
 use alloc::ffi::CString;
 use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};
@@ -45,6 +45,7 @@ mod iface_common;
 mod iface_deadline;
 pub(crate) mod local_output;
 pub(crate) mod local_queue;
+pub(crate) mod packet_storage;
 pub(crate) mod tcp_output;
 mod tx_admission;
 

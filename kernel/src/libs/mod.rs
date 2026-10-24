@@ -36,4 +36,5 @@ pub mod decompress;
 pub mod pod;
 pub mod ranges;
 
+pub(crate) mod paged_vec;
 pub(crate) mod prepared_queue;

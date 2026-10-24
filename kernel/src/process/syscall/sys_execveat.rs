@@ -36,7 +36,8 @@ impl Syscall for SysExecveAt {
         // 权限校验
         SysExecve::check_args(frame, path_ptr, argv_ptr, env_ptr)?;
 
-        let (path, argv, envp) = SysExecve::basic_args(
+        let (path, arguments) = SysExecve::basic_args(
+            dirfd as i32,
             path_ptr as *const u8,
             argv_ptr as *const *const u8,
             env_ptr as *const *const u8,
@@ -52,7 +53,7 @@ impl Syscall for SysExecveAt {
         }
 
         let at_flags = AtFlags::from_bits(flags.bits() as i32).ok_or(SystemError::EINVAL)?;
-        let result = do_execveat(dirfd as i32, &path, argv, envp, at_flags, frame);
+        let result = do_execveat(dirfd as i32, &path, arguments, at_flags, frame);
         drop(path);
         result.map_err(ExecFailure::finish)?;
 

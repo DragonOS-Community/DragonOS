@@ -108,7 +108,7 @@ pub(crate) enum RoutedIngressWork {
         ingress_ifindex: u32,
         source_mac: EthernetAddress,
         broadcast: bool,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         ct_context: CtPacketContext,
         mark: u32,
     },
@@ -116,20 +116,20 @@ pub(crate) enum RoutedIngressWork {
         target: Arc<dyn Iface>,
         target_epoch: u64,
         next_hop: IpAddress,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         fragment_info: Option<super::forward_mtu::ReassembledForwardInfo>,
         netns: Arc<NetNamespace>,
         ct_context: CtPacketContext,
     },
     MtuErrorIpv4 {
         netns: Arc<NetNamespace>,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         mtu: usize,
         ct_context: Option<CtPacketContext>,
     },
     MtuErrorIpv6 {
         netns: Arc<NetNamespace>,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         mtu: usize,
         ct_context: Option<CtPacketContext>,
     },
@@ -203,7 +203,7 @@ impl RoutedIngressWork {
                 target.as_ref(),
                 ingress_ifindex,
                 source_mac,
-                PacketBuffer::from_existing_heap(packet),
+                packet,
                 broadcast,
                 LocalPacketOrigin::LinkIngressPreRouted,
                 Some(ct_context),
@@ -735,7 +735,9 @@ impl<'a> NetIngressFilter<'a> {
                 let Some(ct_context) = self.take_handoff_context(IpVersion::Ipv6) else {
                     return RouteInputVerdict::Drop;
                 };
-                let Ok(packet) = packet.take_owned() else {
+                let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 self.work.push(RoutedIngressWork::Local {
@@ -783,7 +785,9 @@ impl<'a> NetIngressFilter<'a> {
                         .get()
                         .is_some_and(|info| info.may_refragment(mtu))
                 {
-                    let Ok(packet) = packet.take_owned() else {
+                    let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                        crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                    }) else {
                         return RouteInputVerdict::Drop;
                     };
                     self.work.push(RoutedIngressWork::MtuErrorIpv6 {
@@ -794,7 +798,9 @@ impl<'a> NetIngressFilter<'a> {
                     });
                     return RouteInputVerdict::Forward;
                 }
-                let Ok(mut packet) = packet.take_owned() else {
+                let Ok(mut packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 let Ok(mut forwarded) = Ipv6Packet::new_checked(packet.as_mut_slice()) else {
@@ -996,7 +1002,11 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         } else {
             None
         };
-        let Ok(bytes) = packet.take_owned() else {
+        let Ok(bytes) = packet
+            .take_owned()
+            .map_err(|_| ())
+            .and_then(|bytes| crate::driver::net::packet_storage::take(bytes).map_err(|_| ()))
+        else {
             return PreRoutingVerdict::Drop;
         };
         self.work.push(RoutedIngressWork::Defrag {
@@ -1172,7 +1182,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 let Some(ct_context) = self.take_handoff_context(IpVersion::Ipv4) else {
                     return RouteInputVerdict::Drop;
                 };
-                let Ok(packet) = packet.take_owned() else {
+                let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 self.work.push(RoutedIngressWork::Local {
@@ -1208,7 +1220,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                         .get()
                         .is_some_and(|info| info.may_refragment(mtu))
                 {
-                    let Ok(packet) = packet.take_owned() else {
+                    let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                        crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                    }) else {
                         return RouteInputVerdict::Drop;
                     };
                     self.work.push(RoutedIngressWork::MtuErrorIpv4 {
@@ -1219,7 +1233,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     });
                     return RouteInputVerdict::Forward;
                 }
-                let Ok(mut packet) = packet.take_owned() else {
+                let Ok(mut packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 let Ok(mut forwarded) = Ipv4Packet::new_checked(packet.as_mut_slice()) else {
@@ -1327,11 +1343,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                         if self.work.try_reserve(1).is_err() {
                             return LocalInputVerdict::Drop;
                         }
-                        let mut bytes = Vec::new();
-                        if bytes.try_reserve_exact(packet.bytes().len()).is_err() {
+                        let Ok(bytes) = PacketBuffer::try_from_slice(packet.bytes()) else {
                             return LocalInputVerdict::Drop;
-                        }
-                        bytes.extend_from_slice(packet.bytes());
+                        };
                         self.work.push(RoutedIngressWork::Defrag {
                             netns: self.netns.clone(),
                             fragment: PendingIpFragment::Ipv6(PendingIpv6Fragment {
@@ -1425,7 +1439,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             let work = RawIngressWork {
                 sockets,
                 matched,
-                packet: Vec::new(),
+                packet: PacketBuffer::new(),
                 source,
                 destination,
                 protocol,
@@ -1511,7 +1525,11 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             } else {
                 None
             };
-            let Ok(bytes) = packet.take_owned() else {
+            let Ok(bytes) = packet
+                .take_owned()
+                .map_err(|_| ())
+                .and_then(|bytes| crate::driver::net::packet_storage::take(bytes).map_err(|_| ()))
+            else {
                 return RouteInputVerdict::Drop;
             };
             self.work.push(RoutedIngressWork::Defrag {

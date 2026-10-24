@@ -157,6 +157,46 @@ impl<T, const LIMIT: usize> PagedVec<T, LIMIT> {
         self.pop().unwrap()
     }
 
+    /// Requested backing bytes, including spare slots and the fat-pointer
+    /// directory. A failed reservation can increase this value without len.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        // All chunks except the optional final partial chunk have the same
+        // slot count. capacity therefore describes their exact total payload.
+        self.chunks.capacity() * size_of::<Box<[MaybeUninit<T>]>>()
+            + self.capacity() * size_of::<T>()
+    }
+
+    /// Insert into prepared capacity without allocating, preserving order.
+    pub(crate) fn insert(&mut self, index: usize, value: T) {
+        assert!(index <= self.len);
+        self.push(value);
+        for position in (index + 1..self.len).rev() {
+            self.swap(position - 1, position);
+        }
+    }
+
+    /// Remove an initialized value, preserving the order of remaining values.
+    pub(crate) fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len);
+        for position in index + 1..self.len {
+            self.swap(position - 1, position);
+        }
+        self.pop().unwrap()
+    }
+
+    pub(crate) fn partition_point(&self, mut predicate: impl FnMut(&T) -> bool) -> usize {
+        let (mut left, mut right) = (0, self.len);
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if predicate(&self[middle]) {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        left
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         (0..self.len).map(|index| &self[index])
     }
@@ -291,6 +331,39 @@ mod tests {
     #[should_panic(expected = "paged vector push without prepared capacity")]
     fn push_does_not_implicitly_allocate() {
         PagedVec::<u8, 8>::new().push(1);
+    }
+
+    #[test]
+    fn ordered_mutations_cross_chunks_and_drop_values_once() {
+        let mut values = PagedVec::<Arc<usize>, 1025>::new();
+        values.try_reserve(1025).unwrap();
+        let marker = Arc::new(4096);
+        values.push(marker.clone());
+        for index in 0..1024 {
+            values.insert(index, Arc::new(index));
+        }
+        assert_eq!(values.partition_point(|value| **value < 700), 700);
+        assert_eq!(**values.last().unwrap(), 4096);
+        assert_eq!(Arc::strong_count(&marker), 2);
+        let removed = values.remove(1024);
+        assert!(Arc::ptr_eq(&removed, &marker));
+        assert!(values
+            .iter()
+            .enumerate()
+            .all(|(index, value)| index == **value));
+        drop(removed);
+        assert_eq!(Arc::strong_count(&marker), 1);
+        assert_eq!(
+            values.allocated_bytes(),
+            values.chunks.capacity() * size_of::<Box<[MaybeUninit<Arc<usize>>]>>()
+                + values
+                    .chunks
+                    .iter()
+                    .map(|chunk| core::mem::size_of_val(chunk.as_ref()))
+                    .sum::<usize>()
+        );
+        drop(values);
+        assert_eq!(Arc::strong_count(&marker), 1);
     }
 
     #[test]

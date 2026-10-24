@@ -64,3 +64,5 @@ normal/udp_source_route
 fuse/stat_blocks
 normal/socket_address_output
 normal/balloon_memory_integrity
+normal/copy_file_range_semantics
+normal/exec_string_layout

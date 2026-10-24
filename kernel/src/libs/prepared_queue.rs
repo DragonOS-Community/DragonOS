@@ -104,6 +104,17 @@ impl<T> Queue<T> {
         self.len += 1;
     }
 
+    /// Return an already prepared event to the head without allocating.
+    pub(crate) fn push_front_node(&mut self, mut node: Box<Node<T>>) {
+        debug_assert!(node.next.is_none());
+        if self.head.is_none() {
+            self.tail = Some(NonNull::from(node.as_mut()));
+        }
+        node.next = self.head.take();
+        self.head = Some(node);
+        self.len += 1;
+    }
+
     pub(crate) fn pop_node(&mut self) -> Option<Box<Node<T>>> {
         let mut node = self.head.take()?;
         self.head = node.next.take();
@@ -246,6 +257,30 @@ mod tests {
         let original = suffix.pop_node().unwrap();
         assert_eq!(original.as_ref() as *const Node<Value>, address);
         assert!(suffix.back().is_none());
+    }
+
+    #[test]
+    fn blocked_node_returns_ahead_of_concurrent_arrivals() {
+        let mut queue = Queue::new();
+        let blocked = Node::try_new(1usize).unwrap();
+        let address = blocked.as_ref() as *const Node<usize>;
+        queue.push_node(blocked);
+        let blocked = queue.pop_node().unwrap();
+        queue.push_node(Node::try_new(2).unwrap());
+        queue.push_node(Node::try_new(3).unwrap());
+        queue.push_front_node(blocked);
+        let first = queue.pop_node().unwrap();
+        assert_eq!(first.as_ref() as *const Node<usize>, address);
+        assert_eq!(*first.value(), 1);
+        assert_eq!(queue.pop_node().unwrap().into_value(), 2);
+        assert_eq!(queue.pop_node().unwrap().into_value(), 3);
+        assert!(queue.is_empty());
+        queue.push_front_node(first);
+        assert_eq!(queue.back(), Some(&1));
+        queue.push_node(Node::try_new(4).unwrap());
+        assert_eq!(queue.pop_node().unwrap().into_value(), 1);
+        assert_eq!(queue.pop_node().unwrap().into_value(), 4);
+        assert!(queue.back().is_none());
     }
 
     #[test]

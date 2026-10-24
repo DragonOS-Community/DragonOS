@@ -245,6 +245,7 @@ normal/fuse_write_privileges
 normal/read_buffer_selftest
 
 normal/shared_file_position
+normal/copy_file_range_semantics
 
 normal/ext4_shared_xattr
 

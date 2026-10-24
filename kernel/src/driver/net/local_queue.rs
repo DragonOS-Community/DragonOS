@@ -578,13 +578,31 @@ pub(super) struct LocalOutputDrainGuard<'a> {
     pub(super) active: bool,
 }
 
+enum OutputQueueRef<'a> {
+    Borrowed(&'a SpinLock<LocalOutputQueueState>),
+    Owned(Arc<dyn Iface>),
+}
+impl core::ops::Deref for OutputQueueRef<'_> {
+    type Target = SpinLock<LocalOutputQueueState>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(output) => output,
+            Self::Owned(iface) => &iface.common().local_input_queue.output,
+        }
+    }
+}
+
 pub(super) struct LocalOutputReservation<'a> {
-    pub(super) output: &'a SpinLock<LocalOutputQueueState>,
+    output: OutputQueueRef<'a>,
     pub(super) bytes: usize,
     pub(super) active: bool,
     node: Option<OutputNode>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transfer the existing packet and receipt without a poll-path allocation"
+)]
 pub(super) enum LocalOutputPop<'a> {
     Ready(
         LocalOutputPacket,
@@ -594,6 +612,10 @@ pub(super) enum LocalOutputPop<'a> {
     DeferredUntil(smoltcp::time::Instant),
     Empty,
 }
+
+// This is a small, short-lived stack carrier. Boxing Ready would introduce a
+// fallible allocation after the queue has already admitted the packet.
+const _: () = assert!(core::mem::size_of::<LocalOutputPop<'static>>() <= 256);
 
 pub(super) enum ExistingDeferredCommit<'a> {
     Queued(smoltcp::time::Instant),
@@ -639,21 +661,21 @@ impl LocalOutputDrainGuard<'_> {
 }
 
 impl<'a> LocalOutputReservation<'a> {
-    fn install_packet(&mut self, packet: LocalOutputPacket) -> OutputNode {
-        let mut node = self.node.take().expect("output reservation owns its node");
+    fn install_packet(slot: &mut Option<OutputNode>, packet: LocalOutputPacket) -> OutputNode {
+        let mut node = slot.take().expect("output reservation owns its node");
         debug_assert!(node.value().packet.is_none());
         node.value_mut().packet = Some(packet);
         node
     }
 
-    fn restore_node(&mut self, mut node: OutputNode) -> LocalOutputPacket {
+    fn restore_node(slot: &mut Option<OutputNode>, mut node: OutputNode) -> LocalOutputPacket {
         let packet = node
             .value_mut()
             .packet
             .take()
             .expect("output node owns packet");
-        debug_assert!(self.node.is_none());
-        self.node = Some(node);
+        debug_assert!(slot.is_none());
+        *slot = Some(node);
         packet
     }
 
@@ -772,7 +794,7 @@ impl<'a> LocalOutputReservation<'a> {
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
         output.bytes += self.bytes;
-        let mut node = self.install_packet(packet);
+        let mut node = Self::install_packet(&mut self.node, packet);
         node.value_mut().retry_at = retry_at;
         if let Some(index) = output
             .backpressured
@@ -826,7 +848,7 @@ impl<'a> LocalOutputReservation<'a> {
 
     fn commit_packet(mut self, packet: LocalOutputPacket) {
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
-        let node = self.install_packet(packet);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
@@ -856,7 +878,7 @@ impl<'a> LocalOutputReservation<'a> {
         let LocalOutputDisposition::Routed { .. } = packet.disposition else {
             return Err(packet);
         };
-        let node = self.install_packet(packet);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         if let Err(node) = output.deferred_routes.try_enqueue(
             node,
@@ -866,7 +888,7 @@ impl<'a> LocalOutputReservation<'a> {
             advance_existing_probe,
             LocalInputQueue::DEFERRED_ROUTE_LIMITS,
         ) {
-            return Err(self.restore_node(node));
+            return Err(Self::restore_node(&mut self.node, node));
         }
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
@@ -886,7 +908,7 @@ impl<'a> LocalOutputReservation<'a> {
             return ExistingDeferredCommit::Missing(packet, self);
         };
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
-        let node = self.install_packet(packet);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         let retry_at = match output.deferred_routes.try_join(
             node,
@@ -895,12 +917,12 @@ impl<'a> LocalOutputReservation<'a> {
         ) {
             JoinDeferredResult::Queued(retry_at) => retry_at,
             JoinDeferredResult::Missing(node) => {
-                let packet = self.restore_node(node);
+                let packet = Self::restore_node(&mut self.node, node);
                 drop(output);
                 return ExistingDeferredCommit::Missing(packet, self);
             }
             JoinDeferredResult::Full(node) => {
-                let packet = self.restore_node(node);
+                let packet = Self::restore_node(&mut self.node, node);
                 drop(output);
                 return ExistingDeferredCommit::Full(packet, self);
             }
@@ -925,7 +947,7 @@ impl<'a> LocalOutputReservation<'a> {
         probe_sent: bool,
     ) -> Result<bool, LocalOutputPacket> {
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
-        let node = self.install_packet(packet);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         let LocalOutputQueueState {
             packets,
@@ -936,7 +958,7 @@ impl<'a> LocalOutputReservation<'a> {
             .finish_probe(node, self.bytes, key, retry_at, probe_sent, packets)
         {
             Ok(resolved) => resolved,
-            Err(node) => return Err(self.restore_node(node)),
+            Err(node) => return Err(Self::restore_node(&mut self.node, node)),
         };
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
@@ -1046,6 +1068,25 @@ impl LocalInputQueue {
         self.accepting.store(true, Ordering::Release);
     }
 
+    /// Retain the interface only while a token owns an unpublished receipt.
+    /// commit puts just its packet/node into the queue, never this Arc.
+    pub(super) fn reserve_owned_output(
+        iface: Arc<dyn Iface>,
+    ) -> Option<LocalOutputReservation<'static>> {
+        let mut reservation = iface.common().local_input_queue.reserve_output()?;
+        let bytes = reservation.bytes;
+        let active = reservation.active;
+        let node = reservation.node.take();
+        reservation.active = false;
+        drop(reservation);
+        Some(LocalOutputReservation {
+            output: OutputQueueRef::Owned(iface),
+            bytes,
+            active,
+            node,
+        })
+    }
+
     pub(super) fn reserve_output(&self) -> Option<LocalOutputReservation<'_>> {
         let mut output = self.output.lock();
         if !self.accepting.load(Ordering::Acquire) {
@@ -1059,7 +1100,7 @@ impl LocalInputQueue {
         output.deferred_routes.prepare_capacity(frames).ok()?;
         output.reserved_frames += 1;
         Some(LocalOutputReservation {
-            output: &self.output,
+            output: OutputQueueRef::Borrowed(&self.output),
             bytes: 0,
             active: true,
             node: Some(node),
@@ -1116,7 +1157,7 @@ impl LocalInputQueue {
             return LocalOutputPop::Ready(
                 packet,
                 LocalOutputReservation {
-                    output: &self.output,
+                    output: OutputQueueRef::Borrowed(&self.output),
                     bytes,
                     active: true,
                     node: Some(node),

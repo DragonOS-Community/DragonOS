@@ -29,6 +29,8 @@ type ExecPointers = crate::mm::kernel_buffer::KernelSlice<VirtAddr>;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 type ExecPointers = Vec<VirtAddr>;
 
+use super::exec_args::{ExecArguments, ExecStrings};
+
 use super::{
     namespace::{nsproxy::exec_task_namespaces, user_namespace::map_id_up},
     pid::PidType,
@@ -79,9 +81,8 @@ pub enum LoadBinaryResult {
     NeedReexec {
         /// Start information for the next exec round.
         next: ExecStartInfo,
-        /// New argv (interpreter path + [optional arg] + script path + original
-        /// args).
-        new_argv: Vec<CString>,
+        /// Bounded shebang metadata; argv is rebuilt outside exec_update.
+        interpreter_arg: Option<String>,
     },
 }
 
@@ -246,17 +247,22 @@ impl ExecParam {
     /// - `file`: The executable file opened via `do_open_execat`.
     /// - `vm`: The address space.
     /// - `flags`: Execution flags.
-    pub fn new(
+    pub(crate) fn new(
         file: Arc<File>,
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
         filename: CString,
         execfn: CString,
         interp_flags: ExecInterpFlags,
+        arguments: &ExecArguments,
     ) -> Result<Self, SystemError> {
         let exec_write_guard =
             crate::filesystem::vfs::write_access::InodeWriteGuard::deny_write(file.inode())?;
-        let mut init_info = ProcInitInfo::new(execfn.to_string_lossy().as_ref());
+        let mut init_info = ProcInitInfo::new(
+            execfn.to_string_lossy().as_ref(),
+            arguments.args.clone(),
+            arguments.envs.clone(),
+        );
         init_info.execfn = Some(execfn.clone());
         Ok(Self {
             file,
@@ -786,33 +792,6 @@ pub fn load_binary_file_with_context(
                 },
             )?;
 
-        // Get the script path.
-        let script_path = param.filename().to_string_lossy().into_owned();
-
-        // Build the new argv.
-        // Linux semantics: [interpreter, optional_arg, script_path, original_args[1:]...]
-        let mut new_argv = Vec::new();
-
-        // argv[0] = interpreter path
-        new_argv.push(
-            CString::new(shebang_info.interpreter_path.clone()).map_err(|_| SystemError::EINVAL)?,
-        );
-
-        // argv[1] = optional argument (if present)
-        if let Some(ref arg) = shebang_info.interpreter_arg {
-            new_argv.push(CString::new(arg.clone()).map_err(|_| SystemError::EINVAL)?);
-        }
-
-        // argv[N] = script path
-        new_argv.push(CString::new(script_path).map_err(|_| SystemError::EINVAL)?);
-
-        // Append the original arguments (skip argv[0], already replaced by the
-        // script path).
-        let original_args = &param.init_info().args;
-        if original_args.len() > 1 {
-            new_argv.extend(original_args[1..].iter().cloned());
-        }
-
         return Ok(LoadBinaryResult::NeedReexec {
             next: ExecStartInfo::new(
                 interpreter_file,
@@ -820,7 +799,7 @@ pub fn load_binary_file_with_context(
                 param.execfn().to_string_lossy().into_owned(),
                 ExecInterpFlags::empty(),
             ),
-            new_argv,
+            interpreter_arg: shebang_info.interpreter_arg,
         });
     }
 
@@ -885,19 +864,19 @@ impl ExecStackPointers {
 #[derive(Debug)]
 pub struct ProcInitInfo {
     pub proc_name: CString,
-    pub args: Vec<CString>,
-    pub envs: Vec<CString>,
+    pub args: Arc<ExecStrings>,
+    pub envs: Arc<ExecStrings>,
     pub auxv: BTreeMap<u8, usize>,
     pub execfn: Option<CString>,
     pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
-    pub fn new(proc_name: &str) -> Self {
+    pub fn new(proc_name: &str, args: Arc<ExecStrings>, envs: Arc<ExecStrings>) -> Self {
         Self {
             proc_name: CString::new(proc_name).unwrap_or(CString::new("").unwrap()),
-            args: Vec::new(),
-            envs: Vec::new(),
+            args,
+            envs,
             auxv: BTreeMap::new(),
             execfn: None,
             rand_num: [0u8; 16],
@@ -986,13 +965,15 @@ impl ProcInitInfo {
     fn push_strings(
         &self,
         ustack: &mut UserStack,
-        strings: &[CString],
+        strings: &ExecStrings,
         pointers: &mut [VirtAddr],
     ) -> Result<(), SystemError> {
         // Lengths were validated together before push_at made any stack write.
         // No allocation or admission recovery runs under the exec-update lock.
-        for (index, string) in strings.iter().enumerate().rev() {
-            self.push_str(ustack, string)?;
+        for (index, range) in (0..strings.len()).rev().zip(strings.ranges().rev()) {
+            for part in strings.chunks(range).rev() {
+                self.push_slice(ustack, part)?;
+            }
             pointers[index] = ustack.sp();
         }
         Ok(())

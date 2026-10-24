@@ -12,11 +12,8 @@ use crate::{
     arch::{ipc::signal::Signal, syscall::syscall_handler, CurrentIrqArch, MMArch},
     driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
     exception::{softirq::do_softirq, InterruptArch},
-    ipc::{
-        signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
-        signal_types::{SEGV_ACCERR, SEGV_MAPERR},
-    },
-    mm::{ucontext::AddressSpace, VirtAddr},
+    ipc::{signal::force_sig_fault_to_current, signal_types::SEGV_ACCERR},
+    mm::VirtAddr,
     process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, __schedule},
 };
@@ -47,6 +44,8 @@ const ILL_ILLTRP: i32 = 4;
 const BUS_ADRALN: i32 = 1;
 const TRAP_BRKPT: i32 = 1;
 
+// Linux 6.6 RISC-V DO_ERROR_INFO reports epc for access/misalignment
+// traps. Page faults are different: they report stval through user_page_fault.
 fn user_trap_signal(signal: Signal, code: i32, address: usize) -> Result<(), SystemError> {
     unsafe { CurrentIrqArch::interrupt_enable() };
     let result = force_sig_fault_to_current(signal, code, VirtAddr::new(address));
@@ -54,17 +53,14 @@ fn user_trap_signal(signal: Signal, code: i32, address: usize) -> Result<(), Sys
     result
 }
 
-fn user_page_fault_signal(address: usize) -> Result<(), SystemError> {
+fn user_page_fault(trap_frame: &TrapFrame) -> Result<(), SystemError> {
     unsafe { CurrentIrqArch::interrupt_enable() };
-    let address = VirtAddr::new(address);
-    let code = if address.check_user()
-        && AddressSpace::current().is_ok_and(|mm| mm.read().mappings.contains(address).is_some())
-    {
-        SEGV_ACCERR
-    } else {
-        SEGV_MAPERR
-    };
-    let result = force_sig_fault_to_current(Signal::SIGSEGV, code, address);
+    let address = VirtAddr::new(trap_frame.badaddr);
+    let result =
+        match MMArch::handle_user_page_fault(address, trap_frame.cause.code(), trap_frame.epc) {
+            Ok(()) => Ok(()),
+            Err(fault) => force_sig_fault_to_current(fault.signal, fault.code, address),
+        };
     unsafe { CurrentIrqArch::interrupt_disable() };
     result
 }
@@ -279,7 +275,7 @@ fn do_trap_insn_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
     let cause = trap_frame.cause;
     let epc = trap_frame.epc;
     if trap_frame.is_from_user() {
-        return user_page_fault_signal(vaddr);
+        return user_page_fault(trap_frame);
     } else {
         panic!(
             "riscv64_do_irq: do_trap_insn_page_fault(kernel mode): epc: {epc:#x}, vaddr={:#x}, cause={:?}",
@@ -294,7 +290,7 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
     let cause = trap_frame.cause;
     let epc = trap_frame.epc;
     if trap_frame.is_from_user() {
-        return user_page_fault_signal(vaddr);
+        return user_page_fault(trap_frame);
     } else if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     } else {
@@ -310,23 +306,7 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
 /// 处理页存储错误异常 #15
 fn do_trap_store_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
     if trap_frame.is_from_user() {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-        let result = MMArch::handle_user_store_page_fault(VirtAddr::new(trap_frame.badaddr));
-        // A pending signal can interrupt fault retry; leave delivery to the user return path.
-        if matches!(
-            result,
-            Ok(()) | Err(SystemError::EINTR | SystemError::ERESTARTSYS)
-        ) {
-            unsafe { CurrentIrqArch::interrupt_disable() };
-            return Ok(());
-        }
-        if result == Err(SystemError::ENOMEM) {
-            let result = force_kernel_signal_to_current(Signal::SIGKILL);
-            unsafe { CurrentIrqArch::interrupt_disable() };
-            return result;
-        }
-        unsafe { CurrentIrqArch::interrupt_disable() };
-        return user_page_fault_signal(trap_frame.badaddr);
+        return user_page_fault(trap_frame);
     } else if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     }

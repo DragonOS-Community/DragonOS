@@ -251,8 +251,7 @@ bitflags! {
         const SA_RESTART   = 0x10000000;
         const SA_NODEFER  = 0x40000000;
         const SA_RESETHAND = 0x80000000;
-        const SA_RESTORER   =0x04000000;
-        const SA_ALL = Self::SA_NOCLDSTOP.bits()|Self::SA_NOCLDWAIT.bits()|Self::SA_NODEFER.bits()|Self::SA_ONSTACK.bits()|Self::SA_RESETHAND.bits()|Self::SA_RESTART.bits()|Self::SA_SIGINFO.bits()|Self::SA_RESTORER.bits();
+        const SA_ALL = Self::SA_NOCLDSTOP.bits()|Self::SA_NOCLDWAIT.bits()|Self::SA_NODEFER.bits()|Self::SA_ONSTACK.bits()|Self::SA_RESETHAND.bits()|Self::SA_RESTART.bits()|Self::SA_SIGINFO.bits();
     }
 
 }
@@ -287,6 +286,8 @@ impl RiscV64SigStack {
     }
 
     #[inline]
+    // Linux __save_altstack saves raw sas_ss_flags here. SS_ONSTACK is
+    // computed dynamically for sigaltstack queries, not for uc_stack.
     fn to_user_stack(self) -> StackT {
         StackT {
             ss_sp: self.sp as *mut c_void,
@@ -370,7 +371,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             sig_number.handle_default();
             continue;
         }
-        let Some(sigaction) = pcb.sighand().handler(sig_number) else {
+        let Some(sigaction) = pcb.sighand().handler_for_delivery(sig_number) else {
             continue;
         };
         match sigaction.action() {
@@ -415,16 +416,19 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     };
 
     *got_signal = true;
-    let mut blocked = sig_block | sigaction.mask();
-    if !sigaction.flags().contains(SigFlags::SA_NODEFER) {
-        blocked.insert(sig_number.into_sigset());
-    }
-    set_current_blocked(&mut blocked);
-    ProcessManager::current_pcb()
-        .flags()
-        .remove(ProcessFlags::RESTORE_SIG_MASK);
-
     let res = handle_signal(sig_number, &sigaction, &info, &frame_oldset, frame);
+    if res.is_ok() {
+        // Linux signal_delivered() commits these changes only after the frame
+        // was written successfully, so failed delivery retains the old mask.
+        let mut blocked = sig_block | sigaction.mask();
+        if !sigaction.flags().contains(SigFlags::SA_NODEFER) {
+            blocked.insert(sig_number.into_sigset());
+        }
+        set_current_blocked(&mut blocked);
+        ProcessManager::current_pcb()
+            .flags()
+            .remove(ProcessFlags::RESTORE_SIG_MASK);
+    }
     if let Err(e) = res {
         // 连 SIGSEGV 的用户帧也无法建立时，强制默认动作，避免反复递送失败。
         let _ = if sig_number == Signal::SIGSEGV {
@@ -583,10 +587,13 @@ fn setup_frame(
         SigactionType::SaHandler(SaHandlerType::Customized(addr)) => addr.data(),
         _ => return Err(SystemError::EINVAL),
     };
-    if !sigaction.flags().contains(SigFlags::SA_RESTORER) {
-        return Err(SystemError::EINVAL);
-    }
-    let ret_code_ptr = sigaction.restorer().ok_or(SystemError::EINVAL)?.data();
+    // RV64 Linux has no sa_restorer in rt_sigaction. Supply a kernel-owned
+    // executable mapping without placing instructions on the user stack.
+    let ret_code_ptr = crate::mm::ucontext::AddressSpace::current()?
+        .read()
+        .signal_trampoline
+        .ok_or(SystemError::EFAULT)?
+        .data();
     if !user_pc(handler_addr) || !user_pc(ret_code_ptr) {
         return Err(SystemError::EFAULT);
     }
@@ -604,10 +611,12 @@ fn setup_frame(
         siginfo: info.convert_to_posix_siginfo(),
         ucontext: user_ucontext,
     };
+    frame.copy_to_user(&mut writer)?;
+    // Match Linux signal_delivered(): a failed frame write must preserve the
+    // alternate stack for delivery of the resulting SIGSEGV.
     if sig_altstack.flags.contains(SigStackFlags::SS_AUTODISARM) {
         pcb.sig_altstack_mut().reset_for_autodisarm();
     }
-    frame.copy_to_user(&mut writer)?;
     trap_frame.epc = handler_addr;
     trap_frame.ra = ret_code_ptr;
     trap_frame.sp = frame_ptr as usize;

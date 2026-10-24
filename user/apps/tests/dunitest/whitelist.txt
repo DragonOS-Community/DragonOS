@@ -304,3 +304,4 @@ normal/page_retirement
 normal/shared_page_migration
 normal/page_compaction
 normal/global_reclaim
+normal/riscv_signal_semantics

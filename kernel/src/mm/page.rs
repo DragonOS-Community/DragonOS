@@ -2967,7 +2967,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
     pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> Self {
-        if Arch::PAGE_FAULT_ENABLED {
+        if Arch::PAGE_FAULT_ENABLED || cfg!(target_arch = "riscv64") {
+            // RISC-V eager mappings still need the architecture's protection
+            // encoding: PROT_NONE must clear V while retaining G/R as a
+            // resident leaf. Its protection map already keeps private writable
+            // pages writable when demand paging is disabled.
             let vm_flags = super::VmFlags::from(prot_flags);
             Arch::vm_get_page_prot(vm_flags).set_user(user)
         } else {

@@ -19,23 +19,6 @@ use super::sys_write::get_file_by_fd;
 /// Writes data to a file at a specific offset without changing the file position.
 pub struct SysPwrite64Handle;
 
-/// 校验 pwrite/pwritev 的偏移和长度是否符合 Linux 语义。
-/// - 负偏移返回 EINVAL。
-/// - 偏移、长度或偏移+长度超过 i64::MAX 也返回 EINVAL。
-pub(super) fn validate_pwrite_range(offset: i64, len: usize) -> Result<usize, SystemError> {
-    if offset < 0 {
-        return Err(SystemError::EINVAL);
-    }
-    let offset_u64 = offset as u64;
-    let len_u64 = len as u64;
-    let max_off = i64::MAX as u64;
-    let end = offset_u64.checked_add(len_u64).ok_or(SystemError::EINVAL)?;
-    if offset_u64 > max_off || len_u64 > max_off || end > max_off {
-        return Err(SystemError::EINVAL);
-    }
-    Ok(offset_u64 as usize)
-}
-
 impl Syscall for SysPwrite64Handle {
     /// Returns the number of arguments expected by the `pwrite64` syscall
     fn num_args(&self) -> usize {
@@ -70,7 +53,8 @@ impl Syscall for SysPwrite64Handle {
         if frame.is_from_user() {
             access_ok(address, len).map_err(|_| SystemError::EFAULT)?;
         }
-        let offset = validate_pwrite_range(offset, len)?;
+        let offset = offset as usize;
+        file.verify_pread_range(offset, len)?;
         let count = len.min((i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1));
         if frame.is_from_user() {
             let input = unsafe { UserBuffer::new(address, len) };

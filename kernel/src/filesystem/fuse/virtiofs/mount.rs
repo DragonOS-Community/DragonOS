@@ -1,21 +1,32 @@
-use alloc::{sync::Arc, vec};
-use core::fmt::Write;
+use alloc::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+    vec,
+};
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
+use lazy_static::lazy_static;
 use linkme::distributed_slice;
 use system_error::SystemError;
 
 use crate::{
     driver::virtio::virtio_fs::{virtio_fs_find_instance, VirtioFsInstance},
+    exception::workqueue::{schedule_work, Work},
     filesystem::vfs::{
-        file::File, mount::MountFS, FilePrivateData, FileSystem, FileSystemMakerData,
-        FsCreationContext, FsInfo, IndexNode, MountableFileSystem, SuperBlock, VmaOpenRollback,
-        FSMAKER,
+        file::File,
+        mount::{MountFS, MountFlags, SuperBlockState},
+        FilePrivateData, FileSystem, FileSystemMakerData, FsCreationContext, FsInfo, IndexNode,
+        MountableFileSystem, SuperBlock, VmaOpenRollback, FSMAKER,
     },
+    libs::mutex::Mutex,
     mm::{
         fault::{FaultFlags, PageFaultMessage},
         MemoryManagementArch, VirtRegion, VmFaultReason, VmFlags,
     },
-    process::Cred,
+    process::{namespace::user_namespace::UserNamespace, Cred, ProcessManager},
     register_mountable_fs,
 };
 
@@ -36,7 +47,7 @@ struct VirtioFsMountData {
     group_id: u32,
     allow_other: bool,
     default_permissions: bool,
-    conn: Arc<FuseConn>,
+    dax_mode: DaxMountMode,
     instance: Arc<VirtioFsInstance>,
 }
 
@@ -46,12 +57,47 @@ impl FileSystemMakerData for VirtioFsMountData {
     }
 }
 
+lazy_static! {
+    // Only in-memory domain lookup is global; device initialization and teardown
+    // use the selected domain without blocking mounts of other devices.
+    static ref VIRTIOFS_MOUNT_DOMAINS: Mutex<BTreeMap<usize, Weak<VirtioFsMountDomain>>> =
+        Mutex::new(BTreeMap::new());
+}
+
+#[derive(Debug)]
+struct VirtioFsMountDomain {
+    canonical: Mutex<Weak<VirtioFsFs>>,
+}
+
+impl Default for VirtioFsMountDomain {
+    fn default() -> Self {
+        Self {
+            canonical: Mutex::new(Weak::new()),
+        }
+    }
+}
+
+fn mount_domain(instance: &Arc<VirtioFsInstance>) -> Arc<VirtioFsMountDomain> {
+    let key = Arc::as_ptr(instance) as usize;
+    let mut domains = VIRTIOFS_MOUNT_DOMAINS.lock();
+    domains.retain(|_, domain| domain.strong_count() != 0);
+    if let Some(domain) = domains.get(&key).and_then(Weak::upgrade) {
+        return domain;
+    }
+    let domain = Arc::new(VirtioFsMountDomain::default());
+    domains.insert(key, Arc::downgrade(&domain));
+    domain
+}
+
 #[derive(Debug)]
 struct VirtioFsFs {
     inner: Arc<dyn FileSystem>,
     conn: Arc<FuseConn>,
     instance: Arc<VirtioFsInstance>,
     session_id: u64,
+    superblock: Arc<SuperBlockState>,
+    mount_domain: Arc<VirtioFsMountDomain>,
+    shutdown_started: AtomicBool,
 }
 
 /// Narrow authority for the sole production external-PFN installer. Neither
@@ -253,7 +299,36 @@ impl VirtioFsFs {
     }
 }
 
+impl Drop for VirtioFsFs {
+    fn drop(&mut self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // A factory result can fail VFS preparation before a construction pin
+        // exists. Its final destructor must not do FUSE I/O or wait while a
+        // caller may still hold a VFS lock. Keep the domain alive until the old
+        // transport has been returned, so a new factory can wait for this session.
+        let inner = self.inner.clone();
+        let instance = self.instance.clone();
+        let session_id = self.session_id;
+        let domain = self.mount_domain.clone();
+        schedule_work(Work::new(move || {
+            let _domain = &domain;
+            inner.on_umount();
+            instance.wait_session_released(session_id);
+        }));
+    }
+}
+
 impl FileSystem for VirtioFsFs {
+    fn shared_mount_superblock_state(&self, _flags: MountFlags) -> Option<Arc<SuperBlockState>> {
+        Some(self.superblock.clone())
+    }
+
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.superblock.owner_user_ns().clone())
+    }
+
     fn page_cache_writeback_domain(
         &self,
     ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
@@ -342,8 +417,10 @@ impl FileSystem for VirtioFsFs {
     }
 
     fn on_umount(&self) {
-        self.inner.on_umount();
-        self.instance.wait_session_released(self.session_id);
+        if !self.shutdown_started.swap(true, Ordering::AcqRel) {
+            self.inner.on_umount();
+            self.instance.wait_session_released(self.session_id);
+        }
     }
 }
 
@@ -373,31 +450,13 @@ impl MountableFileSystem for VirtioFsFs {
         let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
             Self::parse_mount_options(raw_data, &context.cred)?;
         let instance = virtio_fs_find_instance(source).ok_or(SystemError::ENODEV)?;
-        let cache_window = instance.cache_window();
-        if dax_mode == DaxMountMode::Always
-            && cache_window
-                .as_ref()
-                .is_none_or(|window| window.len() < super::dax::DAX_RANGE_SIZE)
-        {
-            return Err(SystemError::EINVAL.into());
-        }
-        let conn = FuseConn::new_for_virtiofs_with_dax_window(
-            VIRTIOFS_MAX_REQUEST_SIZE,
-            VIRTIOFS_RSP_BUF_SIZE,
-            cache_window,
-            dax_mode,
-        )?;
-        if dax_mode == DaxMountMode::Always && !conn.dax_enabled() {
-            return Err(SystemError::EINVAL.into());
-        }
-
         Ok(Some(Arc::new(VirtioFsMountData {
             rootmode,
             user_id,
             group_id,
             allow_other,
             default_permissions,
-            conn,
+            dax_mode,
             instance,
         })))
     }
@@ -405,10 +464,86 @@ impl MountableFileSystem for VirtioFsFs {
     fn make_fs(
         data: Option<&dyn FileSystemMakerData>,
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_in_owner(data, MountFlags::empty(), ProcessManager::current_user_ns())
+    }
+
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::make_fs_in_owner(data, flags, ProcessManager::current_user_ns())
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+        context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::make_fs_in_owner(data, flags, context.cred.user_ns.clone())
+    }
+}
+
+impl VirtioFsFs {
+    fn make_fs_in_owner(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+        owner: Arc<UserNamespace>,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
         let md = data
             .and_then(|d| d.as_any().downcast_ref::<VirtioFsMountData>())
             .ok_or(SystemError::EINVAL)?;
+        let domain = mount_domain(&md.instance);
+        let mut canonical = domain.canonical.lock();
+        loop {
+            if let Some(existing) = canonical.upgrade() {
+                if existing.superblock.shutdown_started() {
+                    let state = existing.superblock.clone();
+                    drop(canonical);
+                    state.wait_for_shutdown_if_started();
+                    canonical = domain.canonical.lock();
+                    if canonical
+                        .upgrade()
+                        .is_some_and(|current| Arc::ptr_eq(&current, &existing))
+                    {
+                        *canonical = Weak::new();
+                    }
+                    continue;
+                }
+                if !Arc::ptr_eq(existing.superblock.owner_user_ns(), &owner) {
+                    return Err(SystemError::EBUSY);
+                }
+                // sget_fc reuses the complete superblock. Later valid mount
+                // options never reconfigure its connection or DAX policy.
+                return Ok(existing);
+            }
+            if let Some(session_id) = md.instance.active_session_id() {
+                // The last factory result may have failed before VFS acquired
+                // a construction pin. Its asynchronous destructor owns cleanup.
+                drop(canonical);
+                md.instance.wait_session_released(session_id);
+                canonical = domain.canonical.lock();
+                continue;
+            }
+            break;
+        }
 
+        let cache_window = md.instance.cache_window();
+        if md.dax_mode == DaxMountMode::Always
+            && cache_window
+                .as_ref()
+                .is_none_or(|window| window.len() < super::dax::DAX_RANGE_SIZE)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let conn = FuseConn::new_for_virtiofs_with_dax_window(
+            VIRTIOFS_MAX_REQUEST_SIZE,
+            VIRTIOFS_RSP_BUF_SIZE,
+            cache_window,
+            md.dax_mode,
+        )?;
+        if md.dax_mode == DaxMountMode::Always && !conn.dax_enabled() {
+            return Err(SystemError::EINVAL);
+        }
         let fuse_mount_data = FuseMountData {
             rootmode: md.rootmode,
             user_id: md.user_id,
@@ -418,27 +553,29 @@ impl MountableFileSystem for VirtioFsFs {
                 .min(u32::MAX as usize) as u32,
             allow_other: md.allow_other,
             default_permissions: md.default_permissions,
-            conn: md.conn.clone(),
+            conn: conn.clone(),
         };
-
         let inner = <FuseFS as MountableFileSystem>::make_fs(Some(
             &fuse_mount_data as &dyn FileSystemMakerData,
         ))?;
-
-        let session_id = match start_bridge(md.instance.clone(), md.conn.clone()) {
+        let session_id = match start_bridge(md.instance.clone(), conn.clone()) {
             Ok(id) => id,
-            Err(e) => {
+            Err(error) => {
                 inner.on_umount();
-                return Err(e);
+                return Err(error);
             }
         };
-
-        Ok(Arc::new(VirtioFsFs {
+        let fs = Arc::new(Self {
             inner,
-            conn: md.conn.clone(),
+            conn,
             instance: md.instance.clone(),
             session_id,
-        }))
+            superblock: Arc::new(SuperBlockState::new_with_owner(flags, owner)),
+            mount_domain: domain.clone(),
+            shutdown_started: AtomicBool::new(false),
+        });
+        *canonical = Arc::downgrade(&fs);
+        Ok(fs)
     }
 }
 

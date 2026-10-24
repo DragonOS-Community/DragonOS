@@ -311,3 +311,5 @@ normal/page_reporting
 normal/balloon_memory_integrity
 normal/syslog_snapshot
 normal/syslog_stream
+normal/proc_mem_offset
+normal/virtiofs_multimount

@@ -156,7 +156,7 @@ impl VirtioFsInstanceState {
     }
 
     fn is_session_released(&self, session_id: u64) -> bool {
-        self.released_session_id == session_id
+        session_id != 0 && self.released_session_id >= session_id
     }
 }
 
@@ -249,9 +249,11 @@ impl VirtioFsInstance {
             return Err(SystemError::EBUSY);
         }
 
-        let transport = state.transport.take().ok_or(SystemError::EBUSY)?.0;
         let session_id = state.next_session_id;
-        state.next_session_id = state.next_session_id.wrapping_add(1);
+        // Completion comparisons rely on generations never being reused.
+        let next_session_id = session_id.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+        let transport = state.transport.take().ok_or(SystemError::EBUSY)?.0;
+        state.next_session_id = next_session_id;
         state.active_session_id = session_id;
         state.session_active = true;
         state.active_bridge = None;
@@ -328,7 +330,9 @@ impl VirtioFsInstance {
         if let Some(conn) = conn {
             conn.clear_bridge_wake();
         }
-        self.session_wait.wakeup(None);
+        // Completion satisfies every waiter for this generation, including
+        // both a factory retry and an orphan-filesystem cleanup worker.
+        self.session_wait.wake_all();
     }
 
     /// Publish logical session completion while keeping an unsafe transport quarantined.
@@ -353,8 +357,18 @@ impl VirtioFsInstance {
         if let Some(conn) = conn {
             conn.clear_bridge_wake();
         }
-        self.session_wait.wakeup(None);
+        // Completion satisfies every waiter for this generation, including
+        // both a factory retry and an orphan-filesystem cleanup worker.
+        self.session_wait.wake_all();
         true
+    }
+
+    /// Snapshot the generation whose cleanup a filesystem factory must await.
+    /// The factory releases its own lock before waiting and rechecks identity
+    /// afterwards; this does not grant ownership of the transport.
+    pub(crate) fn active_session_id(&self) -> Option<u64> {
+        let state = self.state.lock_irqsave();
+        state.session_active.then_some(state.active_session_id)
     }
 
     pub fn wait_session_released(&self, session_id: u64) {
@@ -588,6 +602,19 @@ mod tests {
         assert!(!state.session_active);
         assert_eq!(state.active_session_id, 0);
         assert!(state.transport.is_none());
+    }
+
+    #[test]
+    fn later_completion_keeps_earlier_generation_released() {
+        let mut state = active_state(9);
+        state.released_session_id = 8;
+        assert!(state.is_session_released(7));
+        assert!(state.is_session_released(8));
+        assert!(!state.is_session_released(9));
+        assert!(!state.is_session_released(0));
+        assert!(state.release_active_session_without_transport(9));
+        assert!(state.is_session_released(8));
+        assert!(state.is_session_released(9));
     }
 
     #[test]

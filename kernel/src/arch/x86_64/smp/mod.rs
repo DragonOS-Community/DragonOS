@@ -100,6 +100,9 @@ unsafe extern "C" fn smp_ap_start_stage1() -> ! {
         x86::Ring::Ring0,
         current_idle.kernel_stack().stack_max_address().data() as u64,
     );
+    if let Some(ist_top) = crate::arch::x86_64::interrupt::ist::double_fault_stack_top(id.data()) {
+        tss.set_ist(0, ist_top);
+    }
     TSSManager::load_tr();
 
     CurrentIrqArch::arch_ap_early_irq_init().expect("arch_ap_early_irq_init failed");

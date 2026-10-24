@@ -100,7 +100,7 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
         set_system_intr_gate(5, 0, VirtAddr::new(trap_bounds as usize));
         set_intr_gate(6, 0, VirtAddr::new(trap_undefined_opcode as usize));
         set_intr_gate(7, 0, VirtAddr::new(trap_dev_not_avaliable as usize));
-        set_intr_gate(8, 0, VirtAddr::new(trap_double_fault as usize));
+        set_intr_gate(8, 1, VirtAddr::new(trap_double_fault as usize));
         set_intr_gate(
             9,
             0,
@@ -392,17 +392,22 @@ unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: 
 }
 
 /// 处理双重错误 8 #DF
+///
+/// 运行在 IST 栈上：栈底没有 PCB 槽，任何 `current_pcb()`/`log!`/分配都会
+/// 再次失败（递归放大为三重错误）。这里只使用零分配的串口通道并停机。
 #[no_mangle]
 unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) {
-    error!(
-        "do_double_fault(8), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
-        error_code,
-        regs.rsp,
-        regs.rip,
-        smp_get_processor_id().data(),
-        ProcessManager::current_pid()
-    );
-    panic!("Double Fault");
+    use crate::libs::printk::{emergency_print_hex_noalloc, emergency_print_noalloc};
+    emergency_print_noalloc("\n[#DF] double fault (IST): err=");
+    emergency_print_hex_noalloc(error_code);
+    emergency_print_noalloc(" rsp=");
+    emergency_print_hex_noalloc(regs.rsp);
+    emergency_print_noalloc(" rip=");
+    emergency_print_hex_noalloc(regs.rip);
+    emergency_print_noalloc(" -- halted\n");
+    loop {
+        core::arch::asm!("cli; hlt", options(nomem, nostack));
+    }
 }
 
 /// 处理协处理器段越界 9 #MF

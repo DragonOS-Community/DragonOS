@@ -108,6 +108,103 @@ impl Write for BoundedLogRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 零分配紧急输出通道
+//
+// 供内核堆耗尽、嵌套 panic 等无法再依赖任何堆分配的路径使用。
+// 与常规 printk 路径不同，这里连设备驱动的锁与缓冲都不碰：x86_64 上直接
+// 轮询 COM1 (0x3F8) 的 LSR 后逐字节写端口，无锁、无堆、有限自旋，任何
+// 上下文安全。
+// ---------------------------------------------------------------------------
+
+/// 直接向 COM1 写一个字节（不含任何锁与堆分配）。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn emergency_com1_putc(byte: u8) {
+    const COM1: u16 = 0x3f8;
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") COM1,
+            in("al") byte,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// 读取 COM1 的 LSR（线状态寄存器）。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn emergency_com1_lsr() -> u8 {
+    const LSR: u16 = 0x3f8 + 5;
+    let value: u8;
+    unsafe {
+        core::arch::asm!(
+            "in al, dx",
+            in("dx") LSR,
+            out("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+/// 零分配地输出一段静态字符串。
+///
+/// 每个字节最多自旋等待 THR 空位有限次；无串口时直接丢弃字节，
+/// 保证任何环境下都有限返回。
+#[cfg(target_arch = "x86_64")]
+pub fn emergency_print_noalloc(s: &str) {
+    const LSR_THRE: u8 = 0x20;
+    for &byte in s.as_bytes() {
+        let mut spins: u32 = 0;
+        while unsafe { emergency_com1_lsr() } & LSR_THRE == 0 && spins < 100_000 {
+            spins += 1;
+        }
+        unsafe { emergency_com1_putc(byte) };
+    }
+}
+
+/// 零分配地输出一个 u64 的十进制表示（栈上格式化）。
+#[cfg(target_arch = "x86_64")]
+pub fn emergency_print_u64_noalloc(mut value: u64) {
+    let mut buf = [0u8; 20];
+    let mut end = buf.len();
+    if value == 0 {
+        end -= 1;
+        buf[end] = b'0';
+    }
+    while value > 0 {
+        end -= 1;
+        buf[end] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    let s = core::str::from_utf8(&buf[end..]).unwrap_or("?");
+    emergency_print_noalloc(s);
+}
+
+/// 零分配地输出一个 u64 的十六进制表示（`0x` 前缀，小写）。
+#[cfg(target_arch = "x86_64")]
+pub fn emergency_print_hex_noalloc(value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[2 + i] = HEX[((value >> (60 - 4 * i)) & 0xf) as usize];
+    }
+    let s = core::str::from_utf8(&buf).unwrap_or("?");
+    emergency_print_noalloc(s);
+}
+
+/// 非 x86_64 架构暂无可用的零分配通道，退化为空实现。
+#[cfg(not(target_arch = "x86_64"))]
+pub fn emergency_print_noalloc(_s: &str) {}
+
+/// 非 x86_64 架构暂无可用的零分配通道，退化为空实现。
+#[cfg(not(target_arch = "x86_64"))]
+pub fn emergency_print_hex_noalloc(_value: u64) {}
+
 pub struct Logger;
 
 impl Logger {

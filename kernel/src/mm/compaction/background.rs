@@ -5,7 +5,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
-use super::{recovery::Service, CompactedFrames, Stop, MAX_COMPACT_ORDER};
+use super::{
+    recovery::{Service, ServiceError},
+    CompactedFrames, Stop, MAX_COMPACT_ORDER,
+};
 use crate::{
     arch::mm::LockedFrameAllocator,
     init::initcall::INITCALL_CORE,
@@ -119,16 +122,22 @@ impl Pending {
         None
     }
 
-    fn finish(&mut self, work: Work, success: bool) {
+    fn finish(&mut self, work: Work, outcome: &Result<(), ServiceError>) {
         let slot = &mut self.slots[work.slot];
-        // Even success retains the minimum interval: a continuous demand/probe
-        // success stream must not turn into a busy allocate/free loop.
-        slot.failures = if success {
-            0
-        } else {
-            slot.failures.saturating_add(1).min(8)
+        // Even successful and advancing discovery rounds retain the minimum
+        // interval. No result republishes a request or clears real failures
+        // merely because a partial registry window had no eligible source.
+        let delay = match outcome {
+            Ok(()) => {
+                slot.failures = 0;
+                MIN_INTERVAL_US
+            }
+            Err(ServiceError::DiscoveryProgress) => MIN_INTERVAL_US,
+            Err(ServiceError::Stopped(_)) => {
+                slot.failures = slot.failures.saturating_add(1).min(8);
+                (MIN_INTERVAL_US << slot.failures.saturating_sub(1)).min(MAX_INTERVAL_US)
+            }
         };
-        let delay = (MIN_INTERVAL_US << slot.failures.saturating_sub(1)).min(MAX_INTERVAL_US);
         slot.not_before = next_n_us_timer_jiffies(delay);
         slot.active = false;
     }
@@ -225,7 +234,7 @@ fn worker() -> i32 {
             if outcome.is_ok() {
                 selftest::SUCCESSES.fetch_add(1, Ordering::Relaxed);
             }
-            PENDING.lock_irqsave().finish(work, outcome.is_ok());
+            PENDING.lock_irqsave().finish(work, &outcome);
             crate::sched::cond_resched();
         } else {
             // An early or check-to-sleep notification remains NOTIFIED in the
@@ -249,7 +258,7 @@ fn probe(work: Work) -> Result<Result<CompactedFrames, DmaAllocationFailure>, St
     }))
 }
 
-fn run(work: Work) -> Result<(), Stop> {
+fn run(work: Work) -> Result<(), ServiceError> {
     let deadline = next_n_us_timer_jiffies(SLICE_US);
     let mut failure = match probe(work)? {
         Ok(run) => {
@@ -266,7 +275,7 @@ fn run(work: Work) -> Result<(), Stop> {
             | AllocationFailure::AddressLimit
     ) {
         if clock() >= deadline {
-            return Err(Stop::Timeout);
+            return Err(Stop::Timeout.into());
         }
         let zones = ZonePressureSnapshot {
             dma32_deficit: 1,
@@ -274,7 +283,7 @@ fn run(work: Work) -> Result<(), Stop> {
         };
         let _ = PageReclaimer::try_shrink_global_below(work.count(), 4096, Some(zones), work.max);
         if clock() >= deadline {
-            return Err(Stop::Timeout);
+            return Err(Stop::Timeout.into());
         }
         failure = match probe(work)? {
             Ok(run) => {
@@ -288,10 +297,10 @@ fn run(work: Work) -> Result<(), Stop> {
         .zone
         .filter(|_| failure.reason == AllocationFailure::Fragmentation)
     else {
-        return Err(Stop::NoMemory);
+        return Err(Stop::NoMemory.into());
     };
     if clock() >= deadline {
-        return Err(Stop::Timeout);
+        return Err(Stop::Timeout.into());
     }
     #[cfg(feature = "mm_selftest")]
     selftest::COMPACTIONS.fetch_add(1, Ordering::Relaxed);

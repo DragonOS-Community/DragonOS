@@ -216,6 +216,16 @@ impl PlacementMap {
         None
     }
 
+    /// Structural work of one bounded binary span lookup and one label
+    /// access. Compaction only changes one pageblock label at a time.
+    pub(super) fn lookup_work_bound(&self) -> usize {
+        if self.count == 0 {
+            0
+        } else {
+            usize::BITS as usize - self.count.leading_zeros() as usize + 1
+        }
+    }
+
     pub(super) fn get<A: MemoryManagementArch>(&self, base: PhysAddr) -> FramePlacement {
         let Some((span, index)) = self.locate::<A>(base.data() >> BLOCK_ORDER) else {
             return FramePlacement::Unmovable;

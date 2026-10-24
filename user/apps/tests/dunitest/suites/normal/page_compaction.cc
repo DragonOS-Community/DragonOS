@@ -40,11 +40,12 @@ void CheckReport(const std::string& report) {
             "dma_occupied_range_unavailable", "dma_occupied_same_mask_fragmentation",
             "dma_occupied_atomic_no_recovery", "dma_occupied_noio_no_recovery",
             "dma_occupied_automatic_recovery", "dma_discovery_deferral_progress",
-            "buddy_compaction_split_capture", "buddy_compaction_metadata_slots",
+            "buddy_compaction_split_capture", "buddy_compaction_metadata_slots", "buddy_compaction_local_index", "buddy_compaction_ancestor_tail",
             "buddy_compaction_abort_stale", "buddy_compaction_cross_free",
             "buddy_compaction_budget_rollback", "buddy_compaction_range_validation",
             "buddy_compaction_alloc_exclusion", "buddy_compaction_zone_reuse",
             "background_endpoint_fairness", "background_arrival_cooldown", "background_round_robin_idle",
+            "background_discovery_boundaries", "background_discovery_cooldown", "background_discovery_registry_stable",
             "dma_background_real_request", "dma_background_migration_retry", "dma_background_idle"}) {
         EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
     }

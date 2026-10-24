@@ -18,7 +18,9 @@ use crate::mm::allocator::bump::BumpAllocator;
 use crate::mm::allocator::page_frame::{
     allocate_page_frames, deallocate_page_frames, PhysPageFrame,
 };
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
+use crate::mm::allocator::page_frame::{
+    FrameAllocator, FramePlacement, PageFrameCount, PageFrameUsage,
+};
 use crate::mm::{MemoryManagementArch, PhysAddr, PhysMemoryArea, VirtAddr};
 
 use core::cmp::min;
@@ -37,10 +39,12 @@ const DMA32_LIMIT: usize = u32::MAX as usize;
 /// Keep 16 MiB of low memory available for devices which cannot address
 /// Normal memory when an unrestricted allocation falls back to DMA32.
 const DMA32_FALLBACK_RESERVE_PAGES: usize = (16 * 1024 * 1024) >> MIN_ORDER;
-const DMA32_ALLOCATION_METADATA_HEADROOM: usize = MAX_ORDER - MIN_ORDER;
+const DMA32_ALLOCATION_METADATA_HEADROOM: usize = placement::MAX_METADATA_HEADROOM;
 
 pub(crate) mod compaction;
+mod placement;
 mod recovery;
+use placement::{PlacementMap, BLOCK_ORDER, LOW_ORDERS};
 pub(crate) use recovery::{DmaAllocationFailure, DmaRecoveryZone};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +92,8 @@ struct ZoneDiagnostics {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct BuddyDiagnostics {
+    placement_requests: [u64; 2],
+    placement_fallback: [u64; 2],
     zones: [ZoneDiagnostics; 2],
     requests: [u64; BUDDY_ORDER_COUNT],
     failures: [u64; BUDDY_ORDER_COUNT],
@@ -100,6 +106,7 @@ struct BuddyDiagnostics {
 /// and metadata allocation. OOM retries are separate buddy requests.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BuddySnapshot {
+    metadata_from_movable: u64,
     free_pages: [usize; 2],
     diagnostics: BuddyDiagnostics,
 }
@@ -148,6 +155,10 @@ impl<A> PageList<A> {
 #[repr(C)]
 #[derive(Debug)]
 pub struct BuddyAllocator<A> {
+    movable_free_area: [[PhysAddr; LOW_ORDERS]; 2],
+    movable_blocks: [[usize; LOW_ORDERS]; 2],
+    placement: PlacementMap,
+    metadata_from_movable: u64,
     // DMA32 and normal memory have separate free lists.  This keeps a
     // 32-bit DMA allocation bounded by the number of buddy orders instead of
     // scanning every high-memory free block while interrupts are disabled.
@@ -171,6 +182,71 @@ pub struct BuddyAllocator<A> {
 }
 
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
+    /// Caller exclusively owns 39 metadata pages and the disjoint managed
+    /// arena. Neither physical owner is transferred to the global allocator.
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    pub(super) unsafe fn placement_fixture(
+        metadata: PhysAddr,
+        managed: PhysAddr,
+        pages: usize,
+    ) -> Option<Self> {
+        let bytes = pages.checked_mul(A::PAGE_SIZE)?;
+        let end = managed.data().checked_add(bytes)?;
+        let metadata_end = metadata.data().checked_add(39 * A::PAGE_SIZE)?;
+        if pages == 0
+            || !managed.check_aligned(A::PAGE_SIZE)
+            || !metadata.check_aligned(A::PAGE_SIZE)
+            || metadata.data() < end && managed.data() < metadata_end
+        {
+            return None;
+        }
+        let mut dma32_empty_area = [PhysAddr::new(0); BUDDY_ORDER_COUNT];
+        let mut normal_empty_area = [PhysAddr::new(0); BUDDY_ORDER_COUNT];
+        for (index, slot) in dma32_empty_area
+            .iter_mut()
+            .chain(normal_empty_area.iter_mut())
+            .enumerate()
+        {
+            *slot = metadata + index * A::PAGE_SIZE;
+            Self::write_page(*slot, PageList::new(0, PhysAddr::new(0)));
+        }
+        let areas = [PhysMemoryArea::new(
+            managed,
+            bytes,
+            crate::mm::memblock::MemoryAreaAttr::empty(),
+        )];
+        let (count, blocks, _) = PlacementMap::requirements(&areas)?;
+        let map = PlacementMap::initialize::<A>(
+            metadata + 38 * A::PAGE_SIZE,
+            A::PAGE_SIZE,
+            count,
+            blocks,
+            &areas,
+        )?;
+        Some(Self {
+            dma32_free_area: [PhysAddr::new(0); BUDDY_ORDER_COUNT],
+            normal_free_area: [PhysAddr::new(0); BUDDY_ORDER_COUNT],
+            movable_free_area: [[PhysAddr::new(0); LOW_ORDERS]; 2],
+            movable_blocks: [[0; LOW_ORDERS]; 2],
+            placement: map,
+            metadata_from_movable: 0,
+            dma32_empty_area,
+            normal_empty_area,
+            dma32_free_pages: 0,
+            normal_free_pages: 0,
+            watermarks: [ZoneWatermarks::default(); 2],
+            diagnostics: BuddyDiagnostics::default(),
+            isolation: None,
+            next_isolation_id: 1,
+            has_normal_memory: false,
+            total: PageFrameCount::new(pages),
+            phantom: PhantomData,
+        })
+    }
+
     fn zone_free(&self, zone: BuddyZone) -> usize {
         match zone {
             BuddyZone::Dma32 => self.dma32_free_pages,
@@ -197,19 +273,87 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     /// Only destinations of this split can start metadata growth. The source
     /// order is removed, never inserted, and its occupied list is irrelevant.
     fn split_metadata_headroom(&self, zone: BuddyZone, requested: u8, source: u8) -> usize {
+        self.split_headroom_for(zone, requested, source, FramePlacement::Unmovable)
+    }
+
+    fn split_headroom_for(
+        &self,
+        zone: BuddyZone,
+        requested: u8,
+        source: u8,
+        split_class: FramePlacement,
+    ) -> usize {
         for order in (requested..source).rev() {
-            let head = self.free_area(zone, order);
-            let full = !head.is_null()
-                && Self::read_page::<PageList<A>>(head).entry_num == Self::BUDDY_ENTRIES;
-            if full && self.empty_area(zone, order).is_null() {
-                // Growth recursively inserts only into lower orders. Across
-                // <=19 orders, each order receives <=19 slots, fewer than one
-                // metadata page's capacity: at most one new page per order.
-                debug_assert!(Self::BUDDY_ENTRIES > BUDDY_ORDER_COUNT);
-                return Self::order2index(order) + 1;
+            let class = if (order as usize) < BLOCK_ORDER {
+                split_class
+            } else {
+                FramePlacement::Unmovable
+            };
+            let head = self.class_area(zone, order, class);
+            let needs = head.is_null()
+                || Self::read_page::<PageList<A>>(head).entry_num == Self::BUDDY_ENTRIES;
+            if needs && self.empty_area(zone, order).is_null() {
+                // At most one new metadata page per class/order. Growth only
+                // inserts into lower orders, <=38 slots < a metadata page.
+                assert!(Self::BUDDY_ENTRIES > 2 * BUDDY_ORDER_COUNT);
+                let orders = Self::order2index(order) + 1;
+                return orders
+                    + if order as usize >= BLOCK_ORDER && split_class == FramePlacement::Movable {
+                        LOW_ORDERS
+                    } else {
+                        0
+                    };
             }
         }
         0
+    }
+
+    fn class_blocks(&self, zone: BuddyZone, order: usize, class: FramePlacement) -> usize {
+        let index = order - MIN_ORDER;
+        let movable = if order < BLOCK_ORDER {
+            self.movable_blocks[zone.index()][index]
+        } else {
+            0
+        };
+        if class == FramePlacement::Movable {
+            movable
+        } else {
+            self.diagnostics.zones[zone.index()].free_blocks[index] - movable
+        }
+    }
+
+    fn record_placement_fallback(&mut self, base: PhysAddr, class: FramePlacement) {
+        if self.placement.get::<A>(base) != class {
+            let counter = &mut self.diagnostics.placement_fallback[class as usize];
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn placement_of(&self, base: PhysAddr) -> FramePlacement {
+        self.placement.get::<A>(base)
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn placement_statistics(&self) -> ([u64; 2], [u64; 2]) {
+        (
+            self.diagnostics.placement_requests,
+            self.diagnostics.placement_fallback,
+        )
+    }
+
+    fn classify_allocation(
+        &mut self,
+        base: PhysAddr,
+        source: u8,
+        requested: u8,
+        class: FramePlacement,
+    ) {
+        if source as usize >= BLOCK_ORDER {
+            let label_order = (requested as usize).max(BLOCK_ORDER);
+            let block = PhysAddr::new(base.data() & !((1usize << label_order) - 1));
+            self.placement.set::<A>(block, label_order, class);
+        }
     }
 
     pub(crate) fn pressure_snapshot(&self) -> ZonePressureSnapshot {
@@ -251,7 +395,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     ) -> Option<(PhysAddr, PageFrameCount)> {
         let request = request.normalized()?;
         let result = self
-            .buddy_alloc_below_with_level(request.count, request.max_phys_addr, level)
+            .buddy_alloc_below_with_placement(
+                request.count,
+                request.max_phys_addr,
+                level,
+                request.placement,
+            )
             .ok();
         self.request_pressure_if_needed(result.is_none());
         result
@@ -300,6 +449,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         let mut allocator = Self {
             dma32_free_area,
             normal_free_area,
+            movable_free_area: [[PhysAddr::new(0); LOW_ORDERS]; 2],
+            movable_blocks: [[0; LOW_ORDERS]; 2],
+            placement: PlacementMap::empty(),
+            metadata_from_movable: 0,
             dma32_empty_area,
             normal_empty_area,
             dma32_free_pages: 0,
@@ -314,15 +467,31 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         };
 
         let mut total_pages_to_buddy = PageFrameCount::new(0);
-        static mut RES_AREAS: [PhysMemoryArea; 128] = [PhysMemoryArea::DEFAULT; 128];
-        let mut offset_in_remain_area = bump_allocator
-            .remain_areas(&mut RES_AREAS)
-            .expect("BuddyAllocator: failed to get remain areas from bump allocator");
-
-        let remain_areas = &RES_AREAS[0..];
+        static mut RES_AREAS: [PhysMemoryArea;
+            crate::mm::memblock::INITIAL_MEMORY_REGIONS_NUM * 2] =
+            [PhysMemoryArea::DEFAULT; crate::mm::memblock::INITIAL_MEMORY_REGIONS_NUM * 2];
+        let (count, offset) = bump_allocator.remain_areas(&mut RES_AREAS)?;
+        let count = PlacementMap::normalize::<A>(&mut RES_AREAS[..count], offset)?;
+        let (max_spans, max_blocks, bytes) = PlacementMap::requirements(&RES_AREAS[..count])?;
+        let metadata_pages = bytes.checked_add(A::PAGE_SIZE - 1)? / A::PAGE_SIZE;
+        let metadata_pages = metadata_pages.max(1);
+        let (storage, actual) = bump_allocator.allocate(PageFrameCount::new(metadata_pages))?;
+        if actual.data() != metadata_pages {
+            return None;
+        }
+        let (count, offset) = bump_allocator.remain_areas(&mut RES_AREAS)?;
+        let count = PlacementMap::normalize::<A>(&mut RES_AREAS[..count], offset)?;
+        let remain_areas = &RES_AREAS[..count];
+        allocator.placement = PlacementMap::initialize::<A>(
+            storage,
+            metadata_pages.checked_mul(A::PAGE_SIZE)?,
+            max_spans,
+            max_blocks,
+            remain_areas,
+        )?;
 
         for area in remain_areas {
-            let mut paddr = (area.area_base_aligned() + offset_in_remain_area).data();
+            let mut paddr = area.base.data();
             let mut remain_pages =
                 PageFrameCount::from_bytes(area.area_end_aligned().data() - paddr).unwrap();
 
@@ -332,10 +501,6 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             // debug!("area: {area:?}, paddr: {paddr:#x}, remain_pages: {remain_pages:?}");
 
             total_pages_to_buddy += remain_pages;
-
-            if offset_in_remain_area != 0 {
-                offset_in_remain_area = 0;
-            }
 
             // 先从低阶开始，尽可能地填满空闲链表
             for i in MIN_ORDER..MAX_ORDER {
@@ -450,6 +615,19 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
     #[inline]
     fn free_area(&self, zone: BuddyZone, order: u8) -> PhysAddr {
+        self.class_area(zone, order, FramePlacement::Unmovable)
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    fn set_free_area(&mut self, zone: BuddyZone, order: u8, value: PhysAddr) {
+        self.set_class_area(zone, order, FramePlacement::Unmovable, value);
+    }
+
+    fn class_area(&self, zone: BuddyZone, order: u8, class: FramePlacement) -> PhysAddr {
+        if class == FramePlacement::Movable {
+            assert!((order as usize) < BLOCK_ORDER);
+            return self.movable_free_area[zone.index()][Self::order2index(order)];
+        }
         let index = Self::order2index(order);
         match zone {
             BuddyZone::Dma32 => self.dma32_free_area[index],
@@ -458,7 +636,18 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
     }
 
     #[inline]
-    fn set_free_area(&mut self, zone: BuddyZone, order: u8, value: PhysAddr) {
+    fn set_class_area(
+        &mut self,
+        zone: BuddyZone,
+        order: u8,
+        class: FramePlacement,
+        value: PhysAddr,
+    ) {
+        if class == FramePlacement::Movable {
+            assert!((order as usize) < BLOCK_ORDER);
+            self.movable_free_area[zone.index()][Self::order2index(order)] = value;
+            return;
+        }
         let index = Self::order2index(order);
         match zone {
             BuddyZone::Dma32 => self.dma32_free_area[index] = value,
@@ -503,18 +692,21 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
     pub(crate) fn diagnostic_snapshot(&self) -> BuddySnapshot {
         BuddySnapshot {
+            metadata_from_movable: self.metadata_from_movable,
             free_pages: [self.dma32_free_pages, self.normal_free_pages],
             diagnostics: self.diagnostics,
         }
     }
 
-    fn record_request(&mut self, count: PageFrameCount) -> Option<u8> {
+    fn record_request(&mut self, count: PageFrameCount, placement: FramePlacement) -> Option<u8> {
         assert!(count.data().is_power_of_two());
         let order = log2(count.data());
         if order >= BUDDY_ORDER_COUNT {
             self.record_failure(None, AllocationFailure::InvalidOrder);
             return None;
         }
+        self.diagnostics.placement_requests[placement as usize] =
+            self.diagnostics.placement_requests[placement as usize].saturating_add(1);
         self.diagnostics.requests[order] = self.diagnostics.requests[order].saturating_add(1);
         Some((order + MIN_ORDER) as u8)
     }
@@ -528,23 +720,53 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         *failures = failures.saturating_add(1);
     }
 
-    fn try_zone(&mut self, zone: BuddyZone, order: u8, level: ReserveLevel) -> Option<PhysAddr> {
+    fn try_zone(
+        &mut self,
+        zone: BuddyZone,
+        order: u8,
+        level: ReserveLevel,
+        placement: FramePlacement,
+    ) -> Result<PhysAddr, AllocationFailure> {
         let needed = 1usize << (order as usize - MIN_ORDER);
-        // pop_front chooses the first nonempty source. All lower destinations
-        // are empty, with prepaid/recycled metadata, so this split costs no RAM.
         let index = Self::order2index(order);
-        let attempts = &mut self.diagnostics.zones[zone.index()].attempts[index];
-        *attempts = attempts.saturating_add(1);
-        let result = if self.admits(zone, needed, 0, level) {
-            self.pop_front(zone, order)
-        } else {
-            None
-        };
-        if result.is_none() {
-            let misses = &mut self.diagnostics.zones[zone.index()].misses[index];
-            *misses = misses.saturating_add(1);
+        self.diagnostics.zones[zone.index()].attempts[index] =
+            self.diagnostics.zones[zone.index()].attempts[index].saturating_add(1);
+        let mut denied = false;
+        for (source, class) in placement::allocation_chains(order, placement) {
+            let head = self.class_area(zone, source, class);
+            if head.is_null() {
+                continue;
+            }
+            let split_class = if source as usize >= BLOCK_ORDER {
+                placement
+            } else {
+                class
+            };
+            let metadata = self.split_headroom_for(zone, order, source, split_class);
+            if !self.admits(zone, needed, metadata, level) {
+                denied = true;
+                continue;
+            }
+            let list: PageList<A> = Self::read_page(head);
+            let base = self.remove_entry(zone, source, class, head, list.entry_num - 1);
+            self.classify_allocation(base, source, order, placement);
+            self.record_placement_fallback(base, placement);
+            let mut current = source;
+            while current > order {
+                current -= 1;
+                unsafe {
+                    self.insert_without_merge(base + (1usize << current), current);
+                }
+            }
+            return Ok(base);
         }
-        result
+        self.diagnostics.zones[zone.index()].misses[index] =
+            self.diagnostics.zones[zone.index()].misses[index].saturating_add(1);
+        Err(if denied {
+            AllocationFailure::Reserve
+        } else {
+            AllocationFailure::Fragmentation
+        })
     }
 
     fn lacks_capacity(&self, count: PageFrameCount) -> bool {
@@ -555,11 +777,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         &mut self,
         zone: BuddyZone,
         order: u8,
+        class: FramePlacement,
         page_addr: PhysAddr,
         next_nonempty: PhysAddr,
     ) {
-        debug_assert_eq!(self.free_area(zone, order), page_addr);
-        self.set_free_area(zone, order, next_nonempty);
+        debug_assert_eq!(self.class_area(zone, order, class), page_addr);
+        self.set_class_area(zone, order, class, next_nonempty);
         let empty_head = self.empty_area(zone, order);
         Self::write_page(page_addr, PageList::new(0, empty_head));
         self.set_empty_area(zone, order, page_addr);
@@ -572,6 +795,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         &mut self,
         zone: BuddyZone,
         order: u8,
+        class: FramePlacement,
         target_page_addr: PhysAddr,
         target_index: usize,
     ) -> PhysAddr {
@@ -579,7 +803,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         assert!(target_index < target_page.entry_num);
         let removed: PhysAddr =
             unsafe { A::read(Self::entry_virt_addr(target_page_addr, target_index)) };
-        let first_addr = self.free_area(zone, order);
+        let first_addr = self.class_area(zone, order, class);
         assert!(!first_addr.is_null());
         let mut first: PageList<A> = Self::read_page(first_addr);
         assert!(first.entry_num > 0);
@@ -602,7 +826,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             let next_nonempty = first.next_page;
             Self::write_page(first_addr, first);
             if last_index == 0 {
-                self.recycle_empty_metadata(zone, order, first_addr, next_nonempty);
+                self.recycle_empty_metadata(zone, order, class, first_addr, next_nonempty);
             }
         } else {
             unsafe {
@@ -616,7 +840,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             let next_nonempty = first.next_page;
             Self::write_page(first_addr, first);
             if last_index == 0 {
-                self.recycle_empty_metadata(zone, order, first_addr, next_nonempty);
+                self.recycle_empty_metadata(zone, order, class, first_addr, next_nonempty);
             }
             // The target page remains non-empty because the removed slot was
             // replaced from the first non-empty page.
@@ -626,125 +850,97 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
 
         self.adjust_free_pages(zone, 1usize << (order as usize - MIN_ORDER), false);
         self.diagnostics.zones[zone.index()].free_blocks[Self::order2index(order)] -= 1;
+        if class == FramePlacement::Movable {
+            self.movable_blocks[zone.index()][Self::order2index(order)] -= 1;
+        }
         removed
     }
 
     /// Insert a block whose buddy is known to be allocated.  This is used for
     /// halves produced by an allocation split, avoiding a pointless linear
     /// buddy search on the IRQ-off allocation path.
+    unsafe fn prepare_metadata_page(&mut self, base: PhysAddr, order: u8, class: FramePlacement) {
+        if order as usize >= BLOCK_ORDER {
+            self.placement
+                .set::<A>(base, BLOCK_ORDER, FramePlacement::Unmovable);
+        } else if class == FramePlacement::Movable {
+            self.metadata_from_movable = self.metadata_from_movable.saturating_add(1);
+        }
+        core::ptr::write_bytes(
+            A::phys_2_virt(base).unwrap().as_ptr::<u8>(),
+            0,
+            A::PAGE_SIZE,
+        );
+    }
+
     unsafe fn insert_without_merge(&mut self, base: PhysAddr, order: u8) {
         let zone = Self::zone_for(base, order as usize);
         if zone == BuddyZone::Normal {
             self.has_normal_memory = true;
         }
-        let mut first_addr = self.free_area(zone, order);
+        let class = if (order as usize) < BLOCK_ORDER {
+            self.placement.get::<A>(base)
+        } else {
+            FramePlacement::Unmovable
+        };
+        let mut first_addr = self.class_area(zone, order, class);
         let needs_metadata = first_addr.is_null()
             || Self::read_page::<PageList<A>>(first_addr).entry_num == Self::BUDDY_ENTRIES;
-
         if needs_metadata {
-            let empty_head = self.empty_area(zone, order);
-            let new_page_addr = if !empty_head.is_null() {
-                let empty: PageList<A> = Self::read_page(empty_head);
-                self.set_empty_area(zone, order, empty.next_page);
-                empty_head
-            } else if order as usize == MIN_ORDER {
-                base
-            } else {
-                // The current order is full, so consume one block from this
-                // same order as metadata and return all but its first page to
-                // strictly lower orders.  This keeps metadata recursion
-                // bounded and never searches/merges on the allocation path.
-                let metadata_base = self
-                    .pop_front(zone, order)
-                    .expect("full buddy order has no metadata source");
-                let mut split_order = order as usize;
-                while split_order > MIN_ORDER {
-                    split_order -= 1;
-                    self.insert_without_merge(
-                        metadata_base + (1 << split_order),
-                        split_order as u8,
-                    );
+            let empty = self.empty_area(zone, order);
+            let metadata = if !empty.is_null() {
+                let recycled: PageList<A> = Self::read_page(empty);
+                self.set_empty_area(zone, order, recycled.next_page);
+                empty
+            } else if !first_addr.is_null() && order as usize > MIN_ORDER {
+                // An already full same-class head proves this exact source
+                // exists. Preserve the incoming outside sibling as a whole;
+                // do not call the general allocator or search higher orders.
+                let head: PageList<A> = Self::read_page(first_addr);
+                let source = self.remove_entry(zone, order, class, first_addr, head.entry_num - 1);
+                self.prepare_metadata_page(source, order, class);
+                for lower in (MIN_ORDER..order as usize).rev() {
+                    self.insert_without_merge(source + (1usize << lower), lower as u8);
                 }
-                metadata_base
-            };
-            core::ptr::write_bytes(
-                A::phys_2_virt(new_page_addr).unwrap().as_ptr::<u8>(),
-                0,
-                A::PAGE_SIZE,
-            );
-            if new_page_addr == base {
-                let empty_head = self.empty_area(zone, order);
-                Self::write_page(new_page_addr, PageList::new(0, empty_head));
-                self.set_empty_area(zone, order, new_page_addr);
+                first_addr = self.class_area(zone, order, class);
+                source
+            } else {
+                // A new class may have no source and no shared spare. The
+                // incoming extent terminates self-hosting without recursion
+                // to the same or any higher order.
+                self.prepare_metadata_page(base, order, class);
+                Self::write_page(base, PageList::new(0, PhysAddr::new(0)));
+                self.set_empty_area(zone, order, base);
+                for lower in (MIN_ORDER..order as usize).rev() {
+                    self.insert_without_merge(base + (1usize << lower), lower as u8);
+                }
                 return;
-            }
-            Self::write_page(new_page_addr, PageList::new(0, first_addr));
-            self.set_free_area(zone, order, new_page_addr);
-            first_addr = new_page_addr;
+            };
+            Self::write_page(metadata, PageList::new(0, first_addr));
+            self.set_class_area(zone, order, class, metadata);
+            first_addr = metadata;
         }
-
-        let mut first = Self::read_page::<PageList<A>>(first_addr);
-        debug_assert!(first.entry_num < Self::BUDDY_ENTRIES);
-        A::write(Self::entry_virt_addr(first_addr, first.entry_num), base);
-        first.entry_num += 1;
-        Self::write_page(first_addr, first);
+        let mut head: PageList<A> = Self::read_page(first_addr);
+        assert!(head.entry_num < Self::BUDDY_ENTRIES);
+        A::write(Self::entry_virt_addr(first_addr, head.entry_num), base);
+        head.entry_num += 1;
+        Self::write_page(first_addr, head);
         self.adjust_free_pages(zone, 1usize << (order as usize - MIN_ORDER), true);
         self.diagnostics.zones[zone.index()].free_blocks[Self::order2index(order)] += 1;
+        if class == FramePlacement::Movable {
+            self.movable_blocks[zone.index()][Self::order2index(order)] += 1;
+        }
     }
 
-    /// 从空闲链表的开头，取出1个指定阶数的伙伴块，如果没有，则返回None
-    ///
-    /// ## 参数
-    ///
-    /// - `order` - 伙伴块的阶数
+    #[cfg(feature = "mm_selftest")]
     fn pop_front(&mut self, zone: BuddyZone, order: u8) -> Option<PhysAddr> {
-        let mut alloc_in_specific_order = |spec_order: u8| {
-            let page_list_addr = self.free_area(zone, spec_order);
-            if page_list_addr.is_null() {
-                return None;
-            }
-            let page_list: PageList<A> = Self::read_page(page_list_addr);
-            let entry =
-                self.remove_entry(zone, spec_order, page_list_addr, page_list.entry_num - 1);
-            assert!(!entry.is_null());
-            assert!(entry.check_aligned(1 << spec_order));
-            Some(entry)
-        };
-        let result: Option<PhysAddr> = alloc_in_specific_order(order);
-        // debug!("result={:?}", result);
-        if result.is_some() {
-            return result;
-        }
-        // 尝试从更大的链表中分裂
-
-        let mut current_order = (order + 1) as usize;
-        let mut x: Option<PhysAddr> = None;
-        while current_order < MAX_ORDER {
-            x = alloc_in_specific_order(current_order as u8);
-            // debug!("current_order={:?}", current_order);
-            if x.is_some() {
-                break;
-            }
-            current_order += 1;
-        }
-
-        // debug!("x={:?}", x);
-        // 如果找到一个大的块，就进行分裂
-        if let Some(x) = x {
-            // 分裂到order阶
-            while current_order > order as usize {
-                current_order -= 1;
-                // 把后面那半块放回空闲链表
-
-                let buddy = x + (1 << current_order);
-                // debug!("x={:?}, buddy={:?}", x, buddy);
-                // debug!("current_order={:?}, buddy={:?}", current_order, buddy);
-                unsafe { self.insert_without_merge(buddy, current_order as u8) };
-            }
-            return Some(x);
-        }
-
-        return None;
+        self.try_zone(
+            zone,
+            order,
+            ReserveLevel::Reclaim,
+            FramePlacement::Unmovable,
+        )
+        .ok()
     }
 
     /// 从伙伴系统中分配count个页面
@@ -782,28 +978,46 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         count: PageFrameCount,
         level: ReserveLevel,
     ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
+        self.buddy_alloc_with_placement(count, level, FramePlacement::Unmovable)
+    }
+
+    fn buddy_alloc_with_placement(
+        &mut self,
+        count: PageFrameCount,
+        level: ReserveLevel,
+        placement: FramePlacement,
+    ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
         let order = self
-            .record_request(count)
+            .record_request(count, placement)
             .ok_or(AllocationFailure::InvalidOrder)?;
 
         // debug!("buddy_alloc: order = {}", order);
         // 获取该阶数的一个空闲页面
         // Preserve scarce DMA32 memory while normal memory is available.
         let normal = if self.has_normal_memory {
-            self.try_zone(BuddyZone::Normal, order, level)
+            Some(self.try_zone(BuddyZone::Normal, order, level, placement))
         } else {
             None
         };
+        let mut admission_denied = matches!(normal, Some(Err(AllocationFailure::Reserve)));
         let dma32_fallback_allowed = self.dma32_fallback_allowed(count.data());
-        let free_addr = normal.or_else(|| {
-            dma32_fallback_allowed
-                .then(|| self.try_zone(BuddyZone::Dma32, order, level))
-                .flatten()
+        let free_addr = normal.and_then(Result::ok).or_else(|| {
+            if !dma32_fallback_allowed {
+                return None;
+            }
+            match self.try_zone(BuddyZone::Dma32, order, level, placement) {
+                Ok(base) => Some(base),
+                Err(reason) => {
+                    admission_denied |= reason == AllocationFailure::Reserve;
+                    None
+                }
+            }
         });
         if free_addr.is_none() {
             let reason = if self.lacks_capacity(count) {
                 AllocationFailure::Capacity
-            } else if (!dma32_fallback_allowed && self.dma32_free_pages >= count.data())
+            } else if admission_denied
+                || (!dma32_fallback_allowed && self.dma32_free_pages >= count.data())
                 || (self.dma32_free_pages >= count.data() || self.normal_free_pages >= count.data())
                     && !self.admits(BuddyZone::Dma32, count.data(), 0, level)
                     && (!self.has_normal_memory
@@ -856,21 +1070,38 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         max_phys_addr: PhysAddr,
         level: ReserveLevel,
     ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
+        self.buddy_alloc_below_with_placement(
+            count,
+            max_phys_addr,
+            level,
+            FramePlacement::Unmovable,
+        )
+    }
+
+    fn buddy_alloc_below_with_placement(
+        &mut self,
+        count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+        level: ReserveLevel,
+        placement: FramePlacement,
+    ) -> Result<(PhysAddr, PageFrameCount), AllocationFailure> {
         if max_phys_addr.data() == usize::MAX {
-            return self.buddy_alloc_with_level(count, level);
+            return self.buddy_alloc_with_placement(count, level, placement);
         }
         let requested_order = self
-            .record_request(count)
+            .record_request(count, placement)
             .ok_or(AllocationFailure::InvalidOrder)?;
         let requested_bytes = count.data() * A::PAGE_SIZE;
         if max_phys_addr.data() == DMA32_LIMIT {
-            let result = self.try_zone(BuddyZone::Dma32, requested_order, level);
-            if result.is_none() {
+            let result = self.try_zone(BuddyZone::Dma32, requested_order, level, placement);
+            if result.is_err() {
                 let reason = if self.lacks_capacity(count) {
                     AllocationFailure::Capacity
                 } else if self.dma32_free_pages < count.data() {
                     AllocationFailure::ZoneLimit
-                } else if !self.admits(BuddyZone::Dma32, count.data(), 0, level) {
+                } else if result == Err(AllocationFailure::Reserve)
+                    || !self.admits(BuddyZone::Dma32, count.data(), 0, level)
+                {
                     AllocationFailure::Reserve
                 } else {
                     AllocationFailure::Fragmentation
@@ -891,8 +1122,9 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             let index = Self::order2index(requested_order);
             let attempts = &mut self.diagnostics.zones[zone.index()].attempts[index];
             *attempts = attempts.saturating_add(1);
-            for current_order in requested_order as usize..MAX_ORDER {
-                let mut list_addr = self.free_area(zone, current_order as u8);
+            for (current_order, class) in placement::allocation_chains(requested_order, placement) {
+                let current_order = current_order as usize;
+                let mut list_addr = self.class_area(zone, current_order as u8, class);
                 if list_addr.is_null() {
                     continue;
                 }
@@ -912,10 +1144,15 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                         if !self.admits(
                             zone,
                             count.data(),
-                            self.split_metadata_headroom(
+                            self.split_headroom_for(
                                 zone,
                                 requested_order,
                                 current_order as u8,
+                                if current_order >= BLOCK_ORDER {
+                                    placement
+                                } else {
+                                    class
+                                },
                             ),
                             level,
                         ) {
@@ -923,7 +1160,15 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                             continue;
                         }
 
-                        let base = self.remove_entry(zone, current_order as u8, list_addr, index);
+                        let base =
+                            self.remove_entry(zone, current_order as u8, class, list_addr, index);
+                        self.classify_allocation(
+                            base,
+                            current_order as u8,
+                            requested_order,
+                            placement,
+                        );
+                        self.record_placement_fallback(base, placement);
                         let mut split_order = current_order;
                         while split_order > requested_order as usize {
                             split_order -= 1;
@@ -989,7 +1234,12 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             // 伙伴块的地址是base ^ (1 << order)
             let buddy_addr = PhysAddr::new(base.data() ^ (1 << order));
 
-            let mut page_list_paddr = self.free_area(zone, order as u8);
+            let class = if order < BLOCK_ORDER {
+                self.placement.get::<A>(base)
+            } else {
+                FramePlacement::Unmovable
+            };
+            let mut page_list_paddr = self.class_area(zone, order as u8, class);
             let mut buddy_entry_index = None;
             let mut buddy_entry_page_list_paddr = None;
             // 除非order是最大的，否则尝试查找伙伴块
@@ -1017,6 +1267,7 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
                 let removed = self.remove_entry(
                     zone,
                     order as u8,
+                    class,
                     buddy_entry_page_list_paddr.unwrap(),
                     buddy_entry_index,
                 );
@@ -1070,6 +1321,21 @@ pub(crate) fn allocation_stats_report(snapshot: BuddySnapshot) -> alloc::string:
         )
         .unwrap();
     }
+    for (name, index) in [("unmovable", 0), ("movable", 1)] {
+        writeln!(
+            report,
+            "placement {name} requests {} fallback {}",
+            snapshot.diagnostics.placement_requests[index],
+            snapshot.diagnostics.placement_fallback[index]
+        )
+        .unwrap();
+    }
+    writeln!(
+        report,
+        "metadata_from_movable={}",
+        snapshot.metadata_from_movable
+    )
+    .unwrap();
     writeln!(report, "snapshot_end=1").unwrap();
     report
 }
@@ -1101,6 +1367,11 @@ pub(crate) fn allocation_diagnostics_selftest_report() -> alloc::string::String 
     }
     writeln!(report, "summary_fail={failures}").unwrap();
     report
+}
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) fn placement_selftest_report() -> alloc::string::String {
+    placement::selftest_report()
 }
 
 /// Exercise bounded allocation, splitting, and merging on a private arena.
@@ -1162,6 +1433,10 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
         BuddyAllocator {
             dma32_free_area,
             normal_free_area,
+            movable_free_area: [[PhysAddr::new(0); LOW_ORDERS]; 2],
+            movable_blocks: [[0; LOW_ORDERS]; 2],
+            placement: PlacementMap::empty(),
+            metadata_from_movable: 0,
             dma32_empty_area,
             normal_empty_area,
             dma32_free_pages: 0,
@@ -1635,6 +1910,10 @@ pub(crate) fn with_fragmented_buffer_arena(
     let mut allocator = BuddyAllocator::<MMArch> {
         dma32_free_area: [PhysAddr::new(0); BUDDY_ORDER_COUNT],
         normal_free_area: [PhysAddr::new(0); BUDDY_ORDER_COUNT],
+        movable_free_area: [[PhysAddr::new(0); LOW_ORDERS]; 2],
+        movable_blocks: [[0; LOW_ORDERS]; 2],
+        placement: PlacementMap::empty(),
+        metadata_from_movable: 0,
         dma32_empty_area,
         normal_empty_area,
         dma32_free_pages: 0,

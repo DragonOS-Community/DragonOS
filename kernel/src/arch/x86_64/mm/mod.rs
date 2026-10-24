@@ -18,7 +18,7 @@ use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{
-    FrameAllocationRequest, FrameAllocator, PageFrameCount, PageFrameUsage,
+    FrameAllocationRequest, FrameAllocator, FramePlacement, PageFrameCount, PageFrameUsage,
 };
 use crate::mm::memblock::mem_block_manager;
 use crate::mm::ucontext::LockedVMA;
@@ -602,6 +602,7 @@ unsafe fn allocator_init() {
 
     let phy_offset = unsafe { MMArch::virt_2_phys(virt_offset) }.unwrap();
 
+    bump::snapshot_reclaimable_prefix().expect("Failed to preserve bootstrap RAM ownership");
     mem_block_manager()
         .reserve_block(PhysAddr::new(0), phy_offset.data())
         .expect("Failed to reserve block");
@@ -800,9 +801,10 @@ impl LockedFrameAllocator {
     }
 
     /// Relocation must not start reclaim or retry through the OOM victim path.
-    pub(crate) unsafe fn allocate_one_no_reclaim() -> Option<PhysAddr> {
+    pub(crate) unsafe fn allocate_migration_target_no_reclaim() -> Option<PhysAddr> {
         let request =
-            FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX));
+            FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+                .with_placement(FramePlacement::Movable);
         Self::with_buddy(|buddy| {
             buddy.allocate_admitted(request, crate::mm::allocator::reserve::ReserveLevel::Kernel)
         })

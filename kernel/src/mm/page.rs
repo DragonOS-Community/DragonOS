@@ -44,8 +44,8 @@ use crate::{
 
 use super::{
     allocator::page_frame::{
-        deallocate_page_frames, FrameAllocationRequest, FrameAllocator, PageFrameCount,
-        PhysPageFrame,
+        deallocate_page_frames, FrameAllocationRequest, FrameAllocator, FramePlacement,
+        PageFrameCount, PhysPageFrame,
     },
     syscall::ProtFlags,
     ucontext::LockedVMA,
@@ -55,6 +55,8 @@ use super::{
 pub(crate) mod access;
 #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 pub(crate) mod compaction_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) mod placement_selftest;
 pub(crate) mod reclaim_wait;
 pub(crate) mod retirement;
 pub(crate) use retirement::retire_unmapped_page;
@@ -566,6 +568,22 @@ pub(crate) fn allocate_registered_file_cache_page(
     )
 }
 
+fn registered_data_placement(
+    page_type: &PageType,
+    flags: PageFlags,
+    charged: bool,
+) -> FramePlacement {
+    if cfg!(target_arch = "x86_64")
+        && charged
+        && !flags.contains(PageFlags::PG_UNEVICTABLE)
+        && matches!(page_type, PageType::Normal | PageType::File(_))
+    {
+        FramePlacement::Movable
+    } else {
+        FramePlacement::Unmovable
+    }
+}
+
 fn allocate_registered_data_page_initialized_with_request(
     page_type: PageType,
     flags: PageFlags,
@@ -579,6 +597,14 @@ fn allocate_registered_data_page_initialized_with_request(
     {
         return Err(SystemError::EINVAL);
     }
+    // Only this registered single-page path has the audited data lifecycle.
+    // Raw/contiguous/legacy-manager callers keep their original default. This
+    // preference never substitutes for migration's live pin/rmap/cache checks.
+    let request = request.with_placement(registered_data_placement(
+        &page_type,
+        flags,
+        charge.is_some(),
+    ));
     // Production anonymous/COW/uprobe-private and file/shmem cache births
     // carry their data receipt. Uncharged permanent/selftest pages and kernel
     // backing keep Kernel admission; reserve authority never upgrades User.

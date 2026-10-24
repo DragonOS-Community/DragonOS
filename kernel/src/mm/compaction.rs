@@ -1,4 +1,4 @@
-//! Explicit bounded compaction, without allocator failure or background policy.
+//! Bounded allocation or replenishment, without allocator/background policy.
 //!
 //! Buddy owns the isolated free frames. Migration owns PTE/reference freezing.
 //! This coordinator owns only work limits, candidate selection and deferral.
@@ -191,6 +191,24 @@ pub(crate) struct Attempt {
     pub next: PhysAddr,
 }
 
+/// Replenishment returns ordinary free inventory, never an allocated owner.
+#[derive(Debug)]
+pub(crate) struct ReplenishAttempt {
+    pub outcome: Result<(), Stop>,
+    pub stats: Stats,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Goal {
+    Allocate,
+    Replenish,
+}
+
+enum Completion {
+    Allocated(CompactedFrames),
+    Released,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Domain {
     start: PhysAddr,
@@ -214,9 +232,38 @@ impl Compactor {
         }
     }
     pub(crate) fn allocate(&mut self, request: Request) -> Attempt {
+        let (outcome, stats, next) = self.attempt(request, Goal::Allocate);
+        Attempt {
+            outcome: outcome.map(|completion| match completion {
+                Completion::Allocated(run) => run,
+                Completion::Released => unreachable!("allocation completed without ownership"),
+            }),
+            stats,
+            next,
+        }
+    }
+
+    /// Prepare ordinary free inventory without consuming an existing run or
+    /// retagging its placement for a device owner. The caller supplies policy.
+    pub(crate) fn replenish(&mut self, request: Request) -> ReplenishAttempt {
+        let (outcome, stats, _) = self.attempt(request, Goal::Replenish);
+        ReplenishAttempt {
+            outcome: outcome.map(|completion| match completion {
+                Completion::Released => (),
+                Completion::Allocated(_) => unreachable!("replenishment retained ownership"),
+            }),
+            stats,
+        }
+    }
+
+    fn attempt(
+        &mut self,
+        request: Request,
+        goal: Goal,
+    ) -> (Result<Completion, Stop>, Stats, PhysAddr) {
         let mut stats = Stats::default();
         let mut next = request.start;
-        let result = self.execute(request, &mut stats, &mut next);
+        let result = self.execute(request, goal, &mut stats, &mut next);
         if result.is_ok() {
             self.defer_shift = 0;
             self.defer_left = 0;
@@ -224,18 +271,15 @@ impl Compactor {
             self.defer_shift = (self.defer_shift + 1).min(MAX_DEFER_SHIFT);
             self.defer_left = (1u8 << self.defer_shift) - 1;
         }
-        Attempt {
-            outcome: result,
-            stats,
-            next,
-        }
+        (result, stats, next)
     }
     fn execute(
         &mut self,
         request: Request,
+        goal: Goal,
         stats: &mut Stats,
         next: &mut PhysAddr,
-    ) -> Result<CompactedFrames, Stop> {
+    ) -> Result<Completion, Stop> {
         if !CurrentIrqArch::is_irq_enabled()
             || in_interrupt()
             || ProcessManager::current_pcb().preempt_count() != 0
@@ -299,12 +343,15 @@ impl Compactor {
         }
         let _execution = EXECUTION.try_lock().map_err(|_| Stop::Busy)?;
         let mut remaining = limits.entries;
-        let fast = try_allocate_in_range(start, end, order, &mut remaining);
-        stats.entries = limits.entries - remaining;
-        if let Some(run) = fast? {
-            return Ok(run);
+        if goal == Goal::Allocate {
+            let fast = try_allocate_in_range(start, end, order, &mut remaining);
+            stats.entries = limits.entries - remaining;
+            if let Some(run) = fast? {
+                return Ok(Completion::Allocated(run));
+            }
         }
-        // Ordinary allocation is always attempted before applying deferral.
+        // Allocation still tries existing inventory before deferral. Replenish
+        // must actually process a candidate even when another free run exists.
         if self.defer_left != 0 {
             self.defer_left -= 1;
             return Err(Stop::Deferred);
@@ -359,8 +406,20 @@ impl Compactor {
                     _ => break,
                 }
             }
-            if let Some(run) = lease.capture() {
-                return Ok(run);
+            match goal {
+                Goal::Allocate => {
+                    if let Some(run) = lease.capture() {
+                        return Ok(Completion::Allocated(run));
+                    }
+                }
+                Goal::Replenish if lease.free_pages() == 1 << order => {
+                    // Capture denotes device ownership and can change the
+                    // placement label. Replenishment instead returns every
+                    // isolated frame through the existing normal free path.
+                    drop(lease);
+                    return Ok(Completion::Released);
+                }
+                Goal::Replenish => {}
             }
             if lease.free_pages() == before {
                 no_progress += 1;

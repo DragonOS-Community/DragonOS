@@ -428,7 +428,9 @@ impl DmaAllocator {
                         super::compaction::recovery::allocate(order, max, zone, deadline)
                     {
                         let (physical, count) = run.into_raw_parts();
-                        return self.finish_raw(physical, count, options);
+                        let raw = self.finish_raw(physical, count, options)?;
+                        super::compaction::background::observe_allocation(count, max, physical);
+                        return Ok(raw);
                     }
                     // The synchronous attempt consumed only its own budget.
                     // A real fragmented failure authorizes one background round.
@@ -475,9 +477,13 @@ impl DmaAllocator {
             })
             .ok_or(RawAllocationFailure::System(SystemError::ENOMEM))?
             .map_err(RawAllocationFailure::Frame)?;
-            return self
+            let raw = self
                 .finish_raw(physical, count, options)
-                .map_err(RawAllocationFailure::System);
+                .map_err(RawAllocationFailure::System)?;
+            if level == crate::mm::allocator::reserve::ReserveLevel::Kernel {
+                super::compaction::background::observe_allocation(count, max, physical);
+            }
+            return Ok(raw);
         }
         let allocation = if let Some(mask) = options.dma_mask {
             let max = usize::try_from(mask).unwrap_or(usize::MAX);

@@ -854,7 +854,19 @@ impl FrameAllocator for LockedFrameAllocator {
     ) -> Option<(PhysAddr, PageFrameCount)> {
         let request = request.normalized()?;
         let level = request.reserve_level();
-        Self::with_buddy(|buddy| buddy.allocate_admitted(request, level)).flatten()
+        let allocation =
+            Self::with_buddy(|buddy| buddy.allocate_admitted(request, level)).flatten();
+        if request.count.data() > 1 && level == crate::mm::allocator::reserve::ReserveLevel::Kernel
+        {
+            if let Some((physical, count)) = allocation {
+                crate::mm::compaction::background::observe_allocation(
+                    count,
+                    request.max_phys_addr,
+                    physical,
+                );
+            }
+        }
+        allocation
     }
 
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {

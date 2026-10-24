@@ -3,6 +3,16 @@ use super::*;
 
 const CAPACITY_SCAN_BUDGET: usize = 4096;
 
+/// A bounded inventory observation, never an allocation or a capacity promise
+/// for an arbitrary DMA mask. Admission and watermarks describe the whole zone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompactionSnapshot {
+    pub runs: usize,
+    pub free_pages: usize,
+    pub high: usize,
+    pub admitted: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DmaRecoveryZone {
     Normal,
@@ -32,6 +42,81 @@ impl DmaAllocationFailure {
 }
 
 impl<A: MemoryManagementArch> BuddyAllocator<A> {
+    pub(crate) fn compaction_snapshot(
+        &self,
+        order: usize,
+        max: PhysAddr,
+        normal: bool,
+        limit: usize,
+    ) -> Result<CompactionSnapshot, compaction::RangeError> {
+        if order == 0 || order > compaction::MAX_COMPACT_ORDER || limit == 0 || limit > 64 {
+            return Err(compaction::RangeError::Invalid);
+        }
+        let zone = if normal {
+            BuddyZone::Normal
+        } else {
+            BuddyZone::Dma32
+        };
+        let start = if normal { DMA32_LIMIT + 1 } else { 0 };
+        let maximum = if normal {
+            max.data()
+        } else {
+            max.data().min(DMA32_LIMIT)
+        };
+        let target_bytes = A::PAGE_SIZE << order;
+        let mut snapshot = CompactionSnapshot {
+            runs: 0,
+            free_pages: self.zone_free(zone),
+            high: self.watermarks[zone.index()].high,
+            admitted: maximum >= start
+                && maximum - start >= target_bytes - 1
+                && self.admits(zone, 1 << order, 0, ReserveLevel::Kernel),
+        };
+        if maximum < start {
+            return Ok(snapshot);
+        }
+        let mut budget = CAPACITY_SCAN_BUDGET;
+        for source_order in MIN_ORDER + order..MAX_ORDER {
+            let bytes = 1usize << source_order;
+            let weight = bytes / target_bytes;
+            // This exclusive head bound includes only complete source blocks.
+            // Subtract before adding so an unrestricted inclusive mask cannot
+            // overflow at usize::MAX.
+            if maximum - start >= bytes - 1 {
+                let end = ((maximum - (bytes - 1)) & !(A::PAGE_SIZE - 1)) + A::PAGE_SIZE;
+                let heads = self.free_index.count_heads(
+                    source_order as u8,
+                    PhysAddr::new(start),
+                    PhysAddr::new(end),
+                    (limit - snapshot.runs).div_ceil(weight),
+                    &mut budget,
+                )?;
+                snapshot.runs = (snapshot.runs + heads * weight).min(limit);
+            }
+            if snapshot.runs == limit {
+                break;
+            }
+            // A larger source may straddle the mask. Its reachable, aligned
+            // target children are still usable; a partial target never counts.
+            let tail = maximum & !(bytes - 1);
+            let reachable = maximum - tail + 1;
+            if tail >= start && reachable < bytes && reachable >= target_bytes {
+                let heads = self.free_index.count_heads(
+                    source_order as u8,
+                    PhysAddr::new(tail),
+                    PhysAddr::new(tail + A::PAGE_SIZE),
+                    1,
+                    &mut budget,
+                )?;
+                snapshot.runs = (snapshot.runs + heads * (reachable / target_bytes)).min(limit);
+            }
+            if snapshot.runs == limit {
+                break;
+            }
+        }
+        Ok(snapshot)
+    }
+
     /// One ordinary buddy attempt, without reclaim, followed only on a
     /// constrained miss by bounded evidence gathering. No cumulative counters
     /// are used to infer the reason for this request.
@@ -198,11 +283,66 @@ pub(super) fn typed_allocation_selftest(fresh: impl Fn() -> BuddyAllocator<MMArc
     // Sibling calls keep each fixture's allocator locals out of the other's
     // stack frame. Do not call the fallback case from inside the base case.
     typed_base_allocation_selftest(&fresh)
+        && compaction_snapshot_selftest(&fresh)
         && evidence_budget_selftest(&fresh)
         && reserve_domain_selftest(&fresh)
         && floor_classification_selftest(&fresh)
         && finite_zone_proof_selftest(&fresh)
         && fallback_allocation_selftest(&fresh)
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+#[inline(never)]
+fn compaction_snapshot_selftest(fresh: &impl Fn() -> BuddyAllocator<MMArch>) -> bool {
+    let mut allocator = fresh();
+    let low = PhysAddr::new(0x0200_0000);
+    let high = PhysAddr::new(1usize << 32);
+    let page = MMArch::PAGE_SIZE;
+    unsafe {
+        allocator.free(low, PageFrameCount::new(8));
+        allocator.free(high, PageFrameCount::new(8));
+    }
+    let before = allocator.diagnostic_snapshot();
+    let runs = |normal, max, limit| {
+        allocator
+            .compaction_snapshot(1, PhysAddr::new(max), normal, limit)
+            .map(|snapshot| snapshot.runs)
+    };
+    let counts = runs(false, usize::MAX, 64) == Ok(4)
+        && runs(true, usize::MAX, 64) == Ok(4)
+        && runs(false, usize::MAX, 2) == Ok(2)
+        && runs(false, low.data() + 6 * page - 1, 64) == Ok(3)
+        && runs(false, low.data() + 6 * page - 2, 64) == Ok(2)
+        && runs(false, low.data() + 8 * page - 2, 64) == Ok(3)
+        && runs(false, low.data() + page - 1, 64) == Ok(0)
+        && runs(true, DMA32_LIMIT, 64) == Ok(0);
+    let invalid = allocator.compaction_snapshot(0, high, false, 2)
+        == Err(compaction::RangeError::Invalid)
+        && allocator.compaction_snapshot(1, high, false, 65)
+            == Err(compaction::RangeError::Invalid)
+        && allocator.compaction_snapshot(1, high, false, 0) == Err(compaction::RangeError::Invalid);
+    let after = allocator.diagnostic_snapshot();
+    let unchanged = before.free_pages == after.free_pages
+        && before.diagnostics.requests == after.diagnostics.requests
+        && before.diagnostics.failures == after.diagnostics.failures
+        && before.diagnostics.zones[0].free_blocks == after.diagnostics.zones[0].free_blocks
+        && before.diagnostics.zones[1].free_blocks == after.diagnostics.zones[1].free_blocks;
+    allocator.watermarks[0] = ZoneWatermarks {
+        min: 7,
+        low: 8,
+        high: 9,
+    };
+    let floor = allocator.compaction_snapshot(1, PhysAddr::new(usize::MAX), false, 2)
+        == Ok(CompactionSnapshot {
+            runs: 2,
+            free_pages: 8,
+            high: 9,
+            admitted: false,
+        });
+    counts && invalid && unchanged && floor
 }
 
 #[cfg(all(

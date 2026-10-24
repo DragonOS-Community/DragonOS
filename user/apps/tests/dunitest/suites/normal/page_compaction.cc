@@ -31,6 +31,7 @@ void CheckReport(const std::string& report) {
     EXPECT_NE(std::string::npos, report.find("summary_fail=0\n")) << report;
     for (const char* key : {
             "real_fragmented_capture", "partial_pin_cleanup", "migration_budget_cleanup",
+            "replenish_existing_run", "replenish_pin_cleanup", "replenish_budget_cleanup",
             "unknown_blocker", "rmap_budget", "deferred_free_fastpath",
             "scan_budget_no_mutation", "isolation_allocation_free_window",
             "atomic_rejected", "deadline_rollback", "dma_recovery_reserve_guard",
@@ -47,7 +48,10 @@ void CheckReport(const std::string& report) {
             "buddy_compaction_alloc_exclusion", "buddy_compaction_zone_reuse",
             "background_endpoint_fairness", "background_arrival_cooldown", "background_round_robin_idle",
             "background_discovery_boundaries", "background_discovery_cooldown", "background_discovery_registry_stable",
-            "dma_background_real_request", "dma_background_migration_retry", "dma_background_idle"}) {
+            "dma_background_real_request", "dma_background_migration_retry", "dma_background_idle",
+            "proactive_successful_demand", "proactive_migration_capture", "proactive_lease_expiry",
+            "proactive_worker_demand_exclusion", "proactive_recent_masks", "proactive_global_gates", "proactive_backoff_expiry",
+            "proactive_active_replacement", "proactive_class_fairness"}) {
         EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
     }
 }

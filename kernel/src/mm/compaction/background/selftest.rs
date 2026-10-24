@@ -227,3 +227,355 @@ pub(crate) fn checks(buckets: usize) -> [(&'static str, bool); 5] {
         ("background_discovery_cooldown", discovery_cooldown()),
     ]
 }
+
+pub(super) static PRO_DEMANDS: AtomicU64 = AtomicU64::new(0);
+static PRO_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static PRO_SLOT_ROUNDS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+pub(super) fn record_proactive_start(slot: usize) {
+    PRO_ROUNDS.fetch_add(1, Ordering::Relaxed);
+    PRO_SLOT_ROUNDS[slot].fetch_add(1, Ordering::Relaxed);
+}
+pub(super) static PRO_MOVED: AtomicU64 = AtomicU64::new(0);
+static PRO_SLICES: AtomicU64 = AtomicU64::new(0);
+static PRO_DISCOVERIES: AtomicU64 = AtomicU64::new(0);
+static PRO_INCREASED: AtomicU64 = AtomicU64::new(0);
+static PRO_FAILURES: AtomicU64 = AtomicU64::new(0);
+static PRO_STOPS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+pub(super) fn record_proactive(result: &ProactiveResult) {
+    if result.used_slice {
+        PRO_SLICES.fetch_add(1, Ordering::Relaxed);
+    }
+    match result.state {
+        ProactiveState::Discovery => {
+            PRO_DISCOVERIES.fetch_add(1, Ordering::Relaxed);
+        }
+        ProactiveState::Progress { .. } => {
+            PRO_INCREASED.fetch_add(1, Ordering::Relaxed);
+        }
+        ProactiveState::Failed(stop) => {
+            PRO_FAILURES.fetch_add(1, Ordering::Relaxed);
+            let index = match stop {
+                Stop::Invalid => 0,
+                Stop::Busy => 1,
+                Stop::Budget => 2,
+                Stop::Blocked => 3,
+                Stop::NoMemory => 4,
+                Stop::Deferred => 5,
+                Stop::Timeout => 6,
+            };
+            PRO_STOPS[index].fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProactiveObservation {
+    pub demands: u64,
+    pub rounds: u64,
+    pub slices: u64,
+    pub discoveries: u64,
+    pub moved: u64,
+    pub increased: u64,
+    pub failures: u64,
+    pub expired: u64,
+    pub stops: [u64; 7],
+    pub active: usize,
+    pub leases: usize,
+    pub deadline: u64,
+}
+
+pub(crate) fn observe_proactive() -> ProactiveObservation {
+    let state = PENDING.lock_irqsave();
+    let now = clock();
+    ProactiveObservation {
+        demands: PRO_DEMANDS.load(Ordering::Relaxed),
+        rounds: PRO_ROUNDS.load(Ordering::Relaxed),
+        slices: PRO_SLICES.load(Ordering::Relaxed),
+        discoveries: PRO_DISCOVERIES.load(Ordering::Relaxed),
+        moved: PRO_MOVED.load(Ordering::Relaxed),
+        increased: PRO_INCREASED.load(Ordering::Relaxed),
+        failures: PRO_FAILURES.load(Ordering::Relaxed),
+        expired: state.proactive.expired,
+        stops: core::array::from_fn(|index| PRO_STOPS[index].load(Ordering::Relaxed)),
+        active: state
+            .proactive
+            .slots
+            .iter()
+            .filter(|slot| slot.active)
+            .count(),
+        leases: state
+            .proactive
+            .slots
+            .iter()
+            .flat_map(|slot| slot.endpoints.iter().flatten())
+            .filter(|demand| demand.expires > now)
+            .count(),
+        deadline: PROACTIVE_DEADLINE.load(Ordering::Acquire),
+    }
+}
+
+/// Observe one slot without treating other slots' legitimate demand as work
+/// authorized by this slot. The worker increments rounds only after taking it.
+pub(crate) fn observe_slot(order: usize, normal: bool) -> Option<(u64, usize)> {
+    if order == 0 || order > MAX_COMPACT_ORDER {
+        return None;
+    }
+    let index = usize::from(!normal) * MAX_COMPACT_ORDER + order - 1;
+    let state = PENDING.lock_irqsave();
+    let now = clock();
+    let leases = state.proactive.slots[index]
+        .endpoints
+        .iter()
+        .flatten()
+        .filter(|demand| demand.expires > now)
+        .count();
+    Some((PRO_SLOT_ROUNDS[index].load(Ordering::Relaxed), leases))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MaskObservation {
+    pub expires: u64,
+    pub refilling: bool,
+    pub not_before: u64,
+}
+
+pub(crate) fn observe_mask(order: usize, max: PhysAddr, normal: bool) -> Option<MaskObservation> {
+    if order == 0 || order > MAX_COMPACT_ORDER {
+        return None;
+    }
+    let max = if normal {
+        max.data()
+    } else {
+        max.data().min(u32::MAX as usize)
+    };
+    let state = PENDING.lock_irqsave();
+    let slot = &state.proactive.slots[usize::from(!normal) * MAX_COMPACT_ORDER + order - 1];
+    let demand = slot
+        .endpoints
+        .iter()
+        .flatten()
+        .find(|demand| demand.max == max && demand.expires > clock())?;
+    Some(MaskObservation {
+        expires: demand.expires,
+        refilling: demand.refilling,
+        not_before: demand
+            .check_after
+            .max(slot.not_before)
+            .max(state.proactive.discovery_after),
+    })
+}
+
+fn recent_masks() -> bool {
+    let mut state = Proactive::new();
+    state.post(0, 100, 0);
+    state.post(0, 200, 1);
+    let old_wide = state.slots[0].endpoints[1].unwrap().expires;
+    state.post(0, 100, 2);
+    if state.slots[0].endpoints[1].unwrap().expires != old_wide {
+        return false;
+    }
+    state.post(0, 300, 3);
+    if !state.slots[0]
+        .endpoints
+        .iter()
+        .flatten()
+        .any(|entry| entry.max == 100)
+        || state.slots[0]
+            .endpoints
+            .iter()
+            .flatten()
+            .any(|entry| entry.max == 200)
+    {
+        return false;
+    }
+    state.expire(after(3, LEASE_US));
+    state.deadline() == 0 && state.expired == 2
+}
+
+fn proactive_gates() -> bool {
+    let mut state = Proactive::new();
+    state.post(0, 100, 0);
+    state.post(1, 200, 0);
+    let now = after(0, CHECK_US);
+    let Some(first) = state.take_ready(now) else {
+        return false;
+    };
+    state.finish(
+        first,
+        &ProactiveResult {
+            state: ProactiveState::Healthy,
+            used_slice: false,
+        },
+        now,
+    );
+    if state.slice_after != 0 || state.take_ready(now).is_some() {
+        return false;
+    }
+    let next = after(now, DISCOVERY_US);
+    let Some(second) = state.take_ready(next) else {
+        return false;
+    };
+    if second.work.slot != 1 {
+        return false;
+    }
+    state.finish(
+        second,
+        &ProactiveResult {
+            state: ProactiveState::Failed(Stop::Blocked),
+            used_slice: true,
+        },
+        next,
+    );
+    let gate = state.slice_after;
+    let cooldown = state.slots[1].not_before;
+    state.post(1, 300, next + 1);
+    state.slice_after == gate
+        && state.slots[1].not_before == cooldown
+        && state.slots[1].failures == 1
+}
+
+fn proactive_backoff_expiry() -> bool {
+    let mut state = Proactive::new();
+    state.post(0, 100, 0);
+    let mut now = after(0, CHECK_US);
+    // Repeated real successes keep the lease fresh without clearing failures.
+    for expected in 1..=7 {
+        while state.slots[0].endpoints[0].unwrap().expires <= now {
+            let refresh = state.slots[0].endpoints[0].unwrap().expires - 1;
+            state.post(0, 100, refresh);
+        }
+        state.post(0, 100, now);
+        let Some(work) = state.take_ready(now) else {
+            return false;
+        };
+        state.finish(
+            work,
+            &ProactiveResult {
+                state: ProactiveState::Failed(Stop::Blocked),
+                used_slice: true,
+            },
+            now,
+        );
+        if state.slots[0].failures != expected {
+            return false;
+        }
+        now = state.slots[0].not_before;
+    }
+    let expires = state.slots[0].endpoints[0].unwrap().expires;
+    if state.deadline() != expires || expires >= now {
+        return false;
+    }
+    state.expire(expires);
+    state.deadline() == 0 && state.take_ready(now).is_none()
+}
+
+fn proactive_replacement() -> bool {
+    let mut state = Proactive::new();
+    state.post(0, 100, 0);
+    state.post(0, 200, 1);
+    let now = after(0, CHECK_US);
+    let Some(work) = state.take_ready(now) else {
+        return false;
+    };
+    state.post(0, 300, now);
+    state.finish(
+        work,
+        &ProactiveResult {
+            state: ProactiveState::Progress { refilling: true },
+            used_slice: true,
+        },
+        now,
+    );
+    state.slots[0].endpoints[work.endpoint]
+        .is_some_and(|entry| entry.max == 300 && !entry.refilling)
+}
+
+fn proactive_renewal() -> bool {
+    let mut state = Proactive::new();
+    state.post(0, 100, 0);
+    let Some(work) = state.take_ready(after(0, CHECK_US)) else {
+        return false;
+    };
+    // The worker is delayed after taking the old lease; a real success renews
+    // the same mask before its original expiry, then the old round expires.
+    state.post(0, 100, work.expires - 1);
+    let renewed = state.slots[0].endpoints[work.endpoint].unwrap().expires;
+    state.finish(
+        work,
+        &ProactiveResult {
+            state: ProactiveState::Expired,
+            used_slice: false,
+        },
+        work.expires,
+    );
+    let Some(endpoint) = state.slots[0].endpoints[work.endpoint] else {
+        return false;
+    };
+    let ready = after(work.expires, DISCOVERY_US);
+    endpoint.expires == renewed
+        && renewed > work.expires
+        && !endpoint.refilling
+        && endpoint.check_after == ready
+        && state.deadline() == ready
+        && state.expired == 0
+        && state
+            .take_ready(ready)
+            .is_some_and(|next| next.expires == renewed)
+}
+
+fn work_class_fairness() -> bool {
+    let mut state = Pending::new();
+    state.post(0, 100);
+    state.proactive.post(1, 200, 0);
+    let now = after(0, CHECK_US);
+    let Some(SelectedWork::Urgent(_)) = state.take_next(now) else {
+        return false;
+    };
+    state.post(2, 300);
+    matches!(state.take_next(now), Some(SelectedWork::Proactive(_)))
+}
+
+pub(crate) fn proactive_checks() -> [(&'static str, bool); 5] {
+    [
+        ("proactive_recent_masks", recent_masks()),
+        ("proactive_global_gates", proactive_gates()),
+        ("proactive_backoff_expiry", proactive_backoff_expiry()),
+        (
+            "proactive_active_replacement",
+            proactive_replacement() && proactive_renewal(),
+        ),
+        ("proactive_class_fairness", work_class_fairness()),
+    ]
+}
+
+pub(super) static INTERNAL_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static WORKER_ALLOCATION_CHECK: AtomicU64 = AtomicU64::new(0);
+
+/// A single real order-one allocation by the real worker proves that its
+/// higher-order metadata hook reaches the owner filter. Other tasks may post
+/// legitimate demand concurrently, so a global-demand delta is not an oracle.
+pub(super) fn check_worker_allocation() {
+    use crate::mm::allocator::kernel_allocator::{KernelAllocator, LocalAlloc};
+    let layout = core::alloc::Layout::from_size_align(4097, 4096).unwrap();
+    let before = INTERNAL_SUPPRESSED.load(Ordering::Relaxed);
+    let pointer = unsafe { KernelAllocator.alloc_physical(layout, false, true) };
+    let passed = !pointer.is_null() && INTERNAL_SUPPRESSED.load(Ordering::Relaxed) > before;
+    if !pointer.is_null() {
+        unsafe {
+            KernelAllocator.local_dealloc(pointer, layout);
+        }
+    }
+    WORKER_ALLOCATION_CHECK.store(if passed { 1 } else { 2 }, Ordering::Release);
+}
+
+/// None until the real worker has completed its one-time allocation check.
+pub(crate) fn worker_allocation_check() -> Option<bool> {
+    match WORKER_ALLOCATION_CHECK.load(Ordering::Acquire) {
+        0 => None,
+        1 => Some(true),
+        _ => Some(false),
+    }
+}

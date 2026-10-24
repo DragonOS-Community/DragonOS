@@ -4070,6 +4070,27 @@ fn register_mounted_superblock(mount: &Arc<MountFS>) {
         .push(Arc::downgrade(mount));
 }
 
+/// 关机/重启前对所有可写挂载做收尾：先 sync，再调用 `FileSystem::on_umount`
+/// （ext4 会 drain journal 并清除 RECOVER 标志）。
+///
+/// 对齐 Linux 关机前的 `sync` + `remount-ro` 语义：没有这一步，rw 挂载的
+/// ext4 会带着未提交事务断电，下次启动 replay 可能遇到不一致状态。
+pub fn shutdown_mounted_filesystems() {
+    for mount in list_unique_mounted_superblocks() {
+        if mount.is_sb_readonly() {
+            continue;
+        }
+        if let Err(error) = mount.try_sync_fs_with_umount_read(false) {
+            log::warn!(
+                "shutdown: sync_fs failed on {}: {:?}",
+                mount.fs_type(),
+                error
+            );
+        }
+        mount.inner_filesystem().on_umount();
+    }
+}
+
 pub fn list_unique_mounted_superblocks() -> Vec<Arc<MountFS>> {
     let mut guard = MOUNTED_SUPERBLOCKS.lock_irqsave();
     let mut mounts: Vec<Arc<MountFS>> = Vec::new();

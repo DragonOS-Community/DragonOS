@@ -17,6 +17,11 @@ pub struct UserMappings {
     pub(super) vm_holes: BTreeMap<VirtAddr, usize>,
     /// mmap address reservations that are being set up but not yet published as VMAs.
     pub(super) reservations: BTreeMap<VirtAddr, MmapReservation>,
+    /// Committed and in-flight virtual bytes, owned by the indexed mappings.
+    mapped_bytes: usize,
+    reserved_bytes: usize,
+    /// Largest committed virtual size of this mm; reservations are not mappings.
+    peak_bytes: usize,
     /// Owning address space, used to back-fill the reverse reference during VMA lifecycle changes
     owner: Weak<AddressSpace>,
 }
@@ -29,6 +34,9 @@ impl UserMappings {
             vm_holes: core::iter::once((VirtAddr::new(0), MMArch::USER_END_VADDR.data()))
                 .collect::<BTreeMap<_, _>>(),
             reservations: BTreeMap::new(),
+            mapped_bytes: 0,
+            reserved_bytes: 0,
+            peak_bytes: 0,
             owner: Weak::new(),
         };
     }
@@ -180,11 +188,23 @@ impl UserMappings {
             .map(|reservation| reservation.region)
     }
 
-    pub(super) fn reservation_usage_bytes(&self) -> usize {
-        self.reservations
-            .values()
-            .map(|reservation| reservation.region.size())
-            .sum()
+    /// Include in-flight reservations when admitting another mapping. Procfs
+    /// waits for reservations to finish before reading this same statistic.
+    pub(super) fn usage_bytes(&self) -> usize {
+        self.mapped_bytes
+            .checked_add(self.reserved_bytes)
+            .expect("user virtual size exceeds address-space bounds")
+    }
+
+    pub(crate) fn peak_usage_bytes(&self) -> usize {
+        self.peak_bytes
+    }
+
+    /// mremap temporarily publishes both source and target under the mm write
+    /// lock. Exclude that implementation detail while retaining real net growth,
+    /// including the two mappings intentionally kept by MREMAP_DONTUNMAP.
+    pub(super) fn finish_remap_peak(&mut self, prior_peak: usize) {
+        self.peak_bytes = core::cmp::max(prior_peak, self.mapped_bytes);
     }
 
     fn region_available_for_reservation(&self, region: VirtRegion) -> bool {
@@ -199,8 +219,13 @@ impl UserMappings {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
+        let reserved_bytes = self
+            .reserved_bytes
+            .checked_add(region.size())
+            .expect("reserved virtual size exceeds address-space bounds");
         let id = MMAP_RESERVATION_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
         self.reserve_hole(&region);
+        self.reserved_bytes = reserved_bytes;
         self.reservations
             .insert(region.start(), MmapReservation { id, region });
         Ok(id)
@@ -212,6 +237,10 @@ impl UserMappings {
             .iter()
             .find_map(|(start, reservation)| (reservation.id == id).then_some(*start))?;
         let reservation = self.reservations.remove(&start)?;
+        self.reserved_bytes = self
+            .reserved_bytes
+            .checked_sub(reservation.region.size())
+            .expect("reservation accounting diverged from its index");
         self.unreserve_hole(&reservation.region);
         Some(reservation.region)
     }
@@ -231,6 +260,10 @@ impl UserMappings {
             return Err(SystemError::EFAULT);
         }
         self.reservations.remove(&start);
+        self.reserved_bytes = self
+            .reserved_bytes
+            .checked_sub(region.size())
+            .expect("reservation accounting diverged from its index");
         Ok(())
     }
 
@@ -348,11 +381,17 @@ impl UserMappings {
         let region = vma.lock().region;
         // The address range to be inserted must be free, meaning no overlapping VMA may exist in the current process's address space.
         assert!(!self.has_conflict(region));
+        let mapped_bytes = self
+            .mapped_bytes
+            .checked_add(region.size())
+            .expect("mapped virtual size exceeds address-space bounds");
         self.reserve_hole(&region);
 
         self.attach_vma(&vma);
         self.vmas_by_start.insert(region.start(), vma.clone());
         self.vmas.insert(vma);
+        self.mapped_bytes = mapped_bytes;
+        self.peak_bytes = core::cmp::max(self.peak_bytes, mapped_bytes);
     }
 
     /// Remove a VMA from the current mappings and add the corresponding address space to the hole list.
@@ -377,6 +416,10 @@ impl UserMappings {
         }
         let removed = self.vmas.remove(&vma);
         debug_assert!(removed, "vmas_by_start and vmas diverged for {:?}", region);
+        self.mapped_bytes = self
+            .mapped_bytes
+            .checked_sub(region.size())
+            .expect("VMA accounting diverged from its index");
         self.unreserve_hole(region);
         self.detach_vma(&vma);
 
@@ -389,6 +432,8 @@ impl UserMappings {
         let vmas = core::mem::take(&mut self.vmas);
         self.vmas_by_start.clear();
         self.reservations.clear();
+        self.mapped_bytes = 0;
+        self.reserved_bytes = 0;
         self.vm_holes.clear();
         for vma in &vmas {
             self.detach_vma(vma);

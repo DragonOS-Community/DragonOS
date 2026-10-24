@@ -4,6 +4,14 @@ use crate::mm::page::PageEntry;
 #[cfg(target_arch = "x86_64")]
 use ::uprobe::UPROBE_INSN_COPY_SIZE;
 
+/// The byte break and page mapping extent have different units. Keep the
+/// conversion in one place for reservation waits and the actual VMA commit.
+pub(super) struct BrkChange {
+    pub(super) old_end: VirtAddr,
+    pub(super) new_end: VirtAddr,
+    pub(super) region: Option<VirtRegion>,
+}
+
 pub(super) struct PreparedMunmap {
     plans: Vec<MunmapVmaPlan>,
     locked_vm_after_commit: usize,
@@ -1509,133 +1517,133 @@ impl InnerAddressSpace {
         }
     }
 
-    /// Set the process's heap memory space
-    ///
-    /// ## Parameters
-    ///
-    /// - `new_brk`: the new end address of the heap. Must be page-aligned, a user space address, and greater than or equal to the current heap start address.
-    ///
-    /// ## Return Value
-    ///
-    /// Returns the old heap end address and, when the committed VMA inherited
-    /// `MCL_FUTURE`, an outer-layer population request.
-    ///
-    /// The caller must release `AddressSpace::write()` before consuming the
-    /// request.  See `AddressSpace::populate_range_post_commit`.
+    /// Validate a byte request and derive the page extent it would change.
+    pub(super) fn brk_change(&self, requested: VirtAddr) -> Result<BrkChange, SystemError> {
+        if requested < self.brk_start || requested >= MMArch::USER_END_VADDR {
+            return Err(SystemError::ENOMEM);
+        }
+        let align = |addr: VirtAddr| {
+            addr.data()
+                .checked_add(MMArch::PAGE_SIZE - 1)
+                .map(|end| VirtAddr::new(end & !(MMArch::PAGE_SIZE - 1)))
+                .ok_or(SystemError::ENOMEM)
+        };
+        let old_end = align(self.brk)?;
+        let new_end = align(requested)?;
+        let region = if old_end < new_end {
+            Some(VirtRegion::new(old_end, new_end - old_end))
+        } else if new_end < old_end {
+            Some(VirtRegion::new(new_end, old_end - new_end))
+        } else {
+            None
+        };
+        Ok(BrkChange {
+            old_end,
+            new_end,
+            region,
+        })
+    }
+
+    /// Linux checks the exact data+heap bytes even for a same-page break
+    /// change, and may_expand_vm additionally checks data pages on growth.
+    fn check_brk_data_limit(
+        &self,
+        requested: VirtAddr,
+        change: &BrkChange,
+        limit: usize,
+    ) -> Result<(), SystemError> {
+        if limit == usize::MAX {
+            return Ok(());
+        }
+        let heap = requested
+            .data()
+            .checked_sub(self.brk_start.data())
+            .ok_or(SystemError::ENOMEM)?;
+        let data = self
+            .end_data
+            .data()
+            .checked_sub(self.start_data.data())
+            .ok_or(SystemError::ENOMEM)?;
+        if heap.checked_add(data).is_none_or(|bytes| bytes > limit) {
+            return Err(SystemError::ENOMEM);
+        }
+        if change.new_end > change.old_end {
+            // Linux is_data_mapping(): private, writable and non-stack. RWX
+            // mappings count too. Only finite DATA limits require this scan.
+            let data_bytes = self.mappings.iter_vmas().try_fold(0usize, |total, vma| {
+                let vma = vma.lock();
+                let flags = *vma.vm_flags();
+                if (flags & (VmFlags::VM_WRITE | VmFlags::VM_SHARED | VmFlags::VM_GROWSDOWN))
+                    == VmFlags::VM_WRITE
+                {
+                    total
+                        .checked_add(vma.region().size())
+                        .ok_or(SystemError::ENOMEM)
+                } else {
+                    Ok(total)
+                }
+            })?;
+            let growth = change.new_end - change.old_end;
+            if data_bytes
+                .checked_add(growth)
+                .is_none_or(|bytes| (bytes >> MMArch::PAGE_SHIFT) > (limit >> MMArch::PAGE_SHIFT))
+            {
+                return Err(SystemError::ENOMEM);
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit a byte break after validating limits and changing its page extent.
+    /// The caller consumes deferred notifications/population outside the MM lock.
     pub(super) unsafe fn set_brk(
         &mut self,
-        new_brk: VirtAddr,
+        requested: VirtAddr,
+        data_limit: usize,
         creator: Option<&Arc<ObjectAccount>>,
         data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
     ) -> Result<BrkOutcome, MmapFailure> {
-        assert!(new_brk.check_aligned(MMArch::PAGE_SIZE));
-
-        if !new_brk.check_user() || new_brk < self.brk_start {
-            return Err(SystemError::EFAULT.into());
-        }
-
-        // Soft limit: RLIMIT_DATA
-        let rlim = ProcessManager::current_pcb()
-            .get_rlimit(RLimitID::Data)
-            .rlim_cur as usize;
-        if rlim != usize::MAX {
-            let desired = new_brk.data().saturating_sub(self.brk_start.data());
-            if desired > rlim {
-                return Err(SystemError::ENOMEM.into());
-            }
-        }
-
+        let change = self.brk_change(requested)?;
+        self.check_brk_data_limit(requested, &change, data_limit)?;
         let old_brk = self.brk;
-
-        if new_brk > self.brk {
-            let len = new_brk - self.brk;
-            let brk_region = VirtRegion::new(self.brk, len);
-            if self.mappings.has_conflict(brk_region) {
+        let mut notifications = VmaCloseNotifications::default();
+        let mut post_commit_population = None;
+        if change.new_end > change.old_end {
+            let region = change.region.expect("growing break has a page extent");
+            if self.mappings.has_conflict(region) {
                 return Err(SystemError::ENOMEM.into());
             }
-            let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
-            let map_flags =
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE;
             self.map_anonymous(
-                old_brk,
-                len,
-                prot_flags,
-                map_flags,
+                change.old_end,
+                region.size(),
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                 true,
                 false,
                 creator,
                 data_account,
             )?;
-
-            self.brk = new_brk;
-            let post_commit_population = self.mappings.contains(old_brk).and_then(|vma| {
+            post_commit_population = self.mappings.contains(change.old_end).and_then(|vma| {
                 vma.lock()
                     .vm_flags()
                     .contains(VmFlags::VM_LOCKED)
-                    .then(|| (brk_region, Arc::downgrade(&vma)))
+                    .then(|| (region, Arc::downgrade(&vma)))
             });
-            return Ok(BrkOutcome {
-                old_brk,
-                post_commit_population,
-                notifications: VmaCloseNotifications::default(),
-            });
-        } else {
-            let unmap_len = self.brk - new_brk;
-            let unmap_start = new_brk;
-            if unmap_len == 0 {
-                return Ok(BrkOutcome {
-                    old_brk,
-                    post_commit_population: None,
-                    notifications: VmaCloseNotifications::default(),
-                });
-            }
-            let notifications = self.munmap_collect(
-                VirtPageFrame::new(unmap_start),
-                PageFrameCount::from_bytes(unmap_len).unwrap(),
+        } else if change.new_end < change.old_end {
+            let region = change.region.expect("shrinking break has a page extent");
+            notifications = self.munmap_collect(
+                VirtPageFrame::new(region.start()),
+                PageFrameCount::from_bytes(region.size()).unwrap(),
                 creator.ok_or(SystemError::EINVAL)?,
             )?;
-            self.brk = new_brk;
-            return Ok(BrkOutcome {
-                old_brk,
-                post_commit_population: None,
-                notifications,
-            });
         }
-    }
-
-    pub(super) unsafe fn sbrk(
-        &mut self,
-        incr: isize,
-        creator: Option<&Arc<ObjectAccount>>,
-        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
-    ) -> Result<BrkOutcome, MmapFailure> {
-        if incr == 0 {
-            return Ok(BrkOutcome {
-                old_brk: self.brk,
-                post_commit_population: None,
-                notifications: VmaCloseNotifications::default(),
-            });
-        }
-
-        let new_brk = if incr > 0 {
-            self.brk + incr as usize
-        } else {
-            self.brk - incr.unsigned_abs()
-        };
-
-        let new_brk = VirtAddr::new(page_align_up(new_brk.data()));
-
-        let rlim = ProcessManager::current_pcb()
-            .get_rlimit(RLimitID::Data)
-            .rlim_cur as usize;
-        if rlim != usize::MAX {
-            let desired = new_brk.data().saturating_sub(self.brk_start.data());
-            if desired > rlim {
-                return Err(SystemError::ENOMEM.into());
-            }
-        }
-
-        return self.set_brk(new_brk, creator, data_account);
+        // The logical break changes only after the page transaction commits.
+        self.brk = requested;
+        Ok(BrkOutcome {
+            old_brk,
+            post_commit_population,
+            notifications,
+        })
     }
 
     pub(super) fn find_free_at_prepare(

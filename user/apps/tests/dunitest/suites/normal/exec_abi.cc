@@ -405,7 +405,11 @@ TEST(ExecAbi, InitialStackOomRetiresExecWithoutKernelPanic) {
     } while (waited < 0 && errno == EINTR);
     ASSERT_EQ(child, waited) << strerror(errno);
     ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
-    EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+    // Linux exec preserves an existing fatal signal after PONR. OOM may
+    // already have queued SIGKILL; otherwise exec falls back to SIGSEGV.
+    const int fatal_signal = WTERMSIG(status);
+    EXPECT_TRUE(fatal_signal == SIGSEGV || fatal_signal == SIGKILL)
+        << "unexpected signal=" << fatal_signal;
 
     const int state = open(inject_path, O_RDONLY);
     ASSERT_GE(state, 0) << strerror(errno);

@@ -1006,7 +1006,7 @@ impl BinaryLoader for ElfLoader {
             }
 
             if start_data.is_none()
-                || (start_data.is_some() && start_data.as_ref().unwrap() > &p_vaddr)
+                || (start_data.is_some() && start_data.as_ref().unwrap() < &p_vaddr)
             {
                 start_data = Some(p_vaddr);
             }
@@ -1019,7 +1019,8 @@ impl BinaryLoader for ElfLoader {
                 elf_bss = seg_file_end;
             }
 
-            // 统计 end_code/end_data 使用页对齐后的文件端点（更贴近 /proc/maps 的 VMA 粒度）
+            // Keep the existing code statistic page-granular, but Linux data
+            // boundaries use exact PT_LOAD file endpoints for RLIMIT_DATA.
             let seg_end_vaddr_f = Self::elf_page_align_up(seg_file_end);
 
             if ((seg_to_load.p_flags & elf::abi::PF_X) != 0)
@@ -1030,9 +1031,9 @@ impl BinaryLoader for ElfLoader {
             }
 
             if end_data.is_none()
-                || (end_data.is_some() && end_data.as_ref().unwrap() < &seg_end_vaddr_f)
+                || (end_data.is_some() && end_data.as_ref().unwrap() < &seg_file_end)
             {
-                end_data = Some(seg_end_vaddr_f);
+                end_data = Some(seg_file_end);
             }
 
             // Safety: validation above ensures p_vaddr + p_memsz does not overflow u64

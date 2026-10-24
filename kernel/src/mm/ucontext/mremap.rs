@@ -259,6 +259,27 @@ impl InnerAddressSpace {
         &mut self,
         request: MremapRequest,
         creator: &Arc<ObjectAccount>,
+        before_mutation: F,
+    ) -> Result<MremapOutcome, MremapFailure>
+    where
+        F: FnMut(&mut Self, &[VirtRegion]) -> Result<(), SystemError>,
+    {
+        let prior_peak = self.mappings.peak_usage_bytes();
+        let result = self.mremap_inner(request, creator, before_mutation);
+        // Like Linux move_vma(), never retain the temporary source+target
+        // double count, including when target installation fails and rolls back.
+        self.mappings.finish_remap_peak(prior_peak);
+        result
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure returns deferred cleanup obligations without allocating under the MM lock"
+    )]
+    fn mremap_inner<F>(
+        &mut self,
+        request: MremapRequest,
+        creator: &Arc<ObjectAccount>,
         mut before_mutation: F,
     ) -> Result<MremapOutcome, MremapFailure>
     where

@@ -57,26 +57,25 @@ impl FileOps for StatmFileOps {
     ) -> Result<usize, SystemError> {
         // `single_open()`: one fd sees one statm record.
         proc_snapshot_operation(operation, data, || {
-            let pcb = self
-                .target
-                .thread_group_leader()
-                .ok_or(SystemError::ESRCH)?;
+            let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
-            let user_vm = {
-                let basic = pcb.basic();
-                basic.user_vm()
-            };
+            let user_vm = pcb.active_vm();
 
             // Process memory information (simplified: no shared/text/lib/data).
             let (size_pages, resident_pages) = user_vm
-                .map(|vm| {
+                .map(|mm| {
+                    let vm = mm.vm();
                     let guard = vm.read_guard_no_reservations();
                     // Field 1 is total virtual pages; field 2 uses the RAS-maintained resident page count.
                     let size_pages = (guard
                         .vma_usage_bytes()
                         .saturating_add(MMArch::PAGE_SIZE - 1))
                         >> MMArch::PAGE_SHIFT;
-                    (size_pages, vm.resident_pages())
+                    let resident_pages = vm.resident_pages();
+                    drop(guard);
+                    // Never let final mmput re-enter the write lock under a read guard.
+                    drop(mm);
+                    (size_pages, resident_pages)
                 })
                 .unwrap_or((0, 0));
 

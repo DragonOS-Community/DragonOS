@@ -314,3 +314,5 @@ normal/syslog_stream
 normal/proc_mem_offset
 normal/virtiofs_multimount
 normal/proc_vm_size
+normal/brk_semantics
+normal/mmap_fixed_address

@@ -65,6 +65,7 @@ mod sys_symlinkat;
 mod sys_timerfd;
 mod sys_truncate;
 mod sys_unlinkat;
+#[cfg(target_arch = "x86_64")]
 mod sys_utime;
 mod sys_utimensat;
 mod sys_write;

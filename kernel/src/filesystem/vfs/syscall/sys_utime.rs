@@ -1,10 +1,10 @@
 use crate::arch::syscall::nr::SYS_UTIME;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::syscall::UtimensFlags,
+    filesystem::vfs::{open::do_utimensat, syscall::UtimensFlags, MAX_PATHLEN},
     syscall::{
         table::{FormattedSyscallParam, Syscall},
-        user_access::UserBufferReader,
+        user_access::{vfs_check_and_clone_cstr, UserBufferReader},
     },
     time::PosixTimeSpec,
 };
@@ -44,7 +44,7 @@ impl Syscall for SysUtimeHandle {
             None
         } else {
             let reader = UserBufferReader::new(times, core::mem::size_of::<UtimeBuf>(), true)?;
-            let buf = reader.read_from_user::<UtimeBuf>(0)?[0];
+            let buf = reader.read_one_from_user::<UtimeBuf>(0)?;
             Some([
                 PosixTimeSpec {
                     tv_sec: buf.actime,
@@ -57,14 +57,15 @@ impl Syscall for SysUtimeHandle {
             ])
         };
 
-        super::utimensat::do_sys_utimensat(
+        let pathname = vfs_check_and_clone_cstr(filename, Some(MAX_PATHLEN))?
+            .into_string()
+            .map_err(|_| SystemError::EINVAL)?;
+        // The converted timestamps are kernel values, not a user buffer.
+        do_utimensat(
             crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
-            filename,
-            times
-                .as_ref()
-                .map(|t| t.as_ptr())
-                .unwrap_or(core::ptr::null()),
-            UtimensFlags::empty().bits(),
+            Some(pathname),
+            times,
+            UtimensFlags::empty(),
         )
     }
 

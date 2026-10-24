@@ -29,6 +29,9 @@ jobs:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
 
+      - name: Validate memory acceptance tooling
+        run: python3 -m unittest discover -s tools/agent_memory -p 'test_*.py'
+
       - name: Change source
         run: |
           find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +

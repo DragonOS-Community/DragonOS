@@ -42,8 +42,24 @@ class SyslogSnapshot : public ::testing::Test {
         char* made = mkdtemp(path);
         ASSERT_NE(nullptr, made);
         directory = made;
+        int policy = open("/proc/sys/kernel/printk", O_RDONLY | O_CLOEXEC);
+        ASSERT_GE(policy, 0);
+        char text[128];
+        ssize_t size = read(policy, text, sizeof(text));
+        EXPECT_EQ(0, close(policy));
+        ASSERT_GT(size, 0);
+        console_policy.assign(text, size);
     }
     void TearDown() override {
+        if (restore_console) {
+            int policy = open("/proc/sys/kernel/printk", O_WRONLY | O_CLOEXEC);
+            EXPECT_GE(policy, 0);
+            if (policy >= 0) {
+                EXPECT_EQ(static_cast<ssize_t>(console_policy.size()),
+                          write(policy, console_policy.data(), console_policy.size()));
+                EXPECT_EQ(0, close(policy));
+            }
+        }
         if (!directory.empty()) rmdir(directory.c_str());
         alarm(0);
     }
@@ -53,7 +69,8 @@ class SyslogSnapshot : public ::testing::Test {
                             "size=not-a-number"));
         ASSERT_EQ(EINVAL, errno);
     }
-    std::string directory;
+    std::string directory, console_policy;
+    bool restore_console = false;
 };
 TEST_F(SyslogSnapshot, FirstReadDoesNotNeedProcOrSizeWarmup) {
     Emit();
@@ -167,7 +184,16 @@ TEST_F(SyslogSnapshot, ReadClearFaultCommitsOnlyCompleteEarlierRecords) {
     EXPECT_EQ(0, munmap(pages, 8192));
     // Adjacent records can have identical timestamps and text. Compare the
     // complete retained suffix, rather than treating text as record identity.
-    EXPECT_EQ(before.substr(boundary), Snapshot());
+    // Returning EFAULT may itself append a syscall-return DEBUG record.
+    // Preserve the original suffix exactly, while requiring that the first
+    // warning really was cleared even if the two warning texts are identical.
+    const std::string suffix = before.substr(boundary);
+    const std::string after = Snapshot();
+    ASSERT_GE(after.size(), suffix.size());
+    EXPECT_EQ(suffix, after.substr(0, suffix.size()));
+    const size_t warning = after.find(kWarning);
+    ASSERT_NE(std::string::npos, warning);
+    EXPECT_EQ(std::string::npos, after.find(kWarning, warning + strlen(kWarning)));
 }
 TEST_F(SyslogSnapshot, OutOfRangeReadClearFailsBeforeAdvancingVisibility) {
     ASSERT_EQ(0, Read(kClear, nullptr, 0));
@@ -178,14 +204,15 @@ TEST_F(SyslogSnapshot, OutOfRangeReadClearFailsBeforeAdvancingVisibility) {
     EXPECT_EQ(EFAULT, errno);
     EXPECT_NE(std::string::npos, Snapshot().find(kWarning));
 }
-TEST_F(SyslogSnapshot, ClearPreservesTheRetainedSizePolicy) {
+TEST_F(SyslogSnapshot, ClearPreservesTheBufferCapacity) {
     Emit();
     int before = Read(10, nullptr, 1);
     ASSERT_GT(before, 0);
     ASSERT_EQ(0, Read(kClear, nullptr, 0));
     EXPECT_GE(Read(10, nullptr, 1), before);
 }
-TEST_F(SyslogSnapshot, FilteredProcReadReturnsOnlyCopiedBytes) {
+TEST_F(SyslogSnapshot, ConsoleLevelDoesNotFilterProcRead) {
+    restore_console = true;
     Emit();
     int fd = open("/proc/kmsg", O_RDONLY);
     ASSERT_GE(fd, 0);
@@ -216,3 +243,8 @@ TEST_F(SyslogSnapshot, ConcurrentReadersAndWritersKeepCompleteSnapshots) {
     EXPECT_NE(std::string::npos, Snapshot().find(kWarning));
 }
 }  // namespace
+
+int main(int argc, char** argv) {
+    testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

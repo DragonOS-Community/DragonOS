@@ -430,6 +430,8 @@ pub enum FilePrivateData {
     Kernfs(Option<KernFilePrivateData>),
     /// timerfd open-file-description flags (notably O_NONBLOCK).
     TimerFd(FileFlags),
+    /// Shared /proc/kmsg stream flags, captured after its open-time capability check.
+    Kmsg(FileFlags),
     /// Configurable filesystem context shared by dup/fork aliases.
     FsContext(Arc<crate::filesystem::vfs::mount_api::context::FsContext>),
     /// Ownership of a detached mount tree until it is attached or finally closed.
@@ -540,7 +542,7 @@ impl FilePrivateData {
             FilePrivateData::Overlayfs(pdata) => {
                 pdata.set_flags(flags)?;
             }
-            FilePrivateData::TimerFd(current) => *current = flags,
+            FilePrivateData::TimerFd(current) | FilePrivateData::Kmsg(current) => *current = flags,
             _ => {}
         }
         Ok(())

@@ -511,7 +511,7 @@ impl VethInterface {
     ) -> Result<smoltcp::iface::Interface, SystemError> {
         let mut config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(self.mac()));
         config.random_seed = rand() as u64;
-        let mut stack = smoltcp::iface::Interface::new(
+        let mut stack = crate::driver::net::packet_storage::new_interface(
             config,
             &mut self.driver.clone(),
             crate::time::Instant::now().into(),
@@ -555,7 +555,7 @@ impl VethInterface {
         let hw_addr = HardwareAddress::Ethernet(mac_address);
         let mut iface_config = smoltcp::iface::Config::new(hw_addr);
         iface_config.random_seed = rand() as u64;
-        let mut iface = smoltcp::iface::Interface::new(
+        let mut iface = crate::driver::net::packet_storage::new_interface(
             iface_config,
             &mut driver.clone(),
             crate::time::Instant::now().into(),
@@ -1138,6 +1138,9 @@ pub(crate) fn buffer_selftest() -> bool {
         let (source, peer) = VethInterface::new_pair("mm262-source", "mm262-peer");
         *source.common.napi_struct.write() = Some(NapiStruct::new_disabled(source.clone(), 10));
         *peer.common.napi_struct.write() = Some(NapiStruct::new_disabled(peer.clone(), 10));
+        if !super::local_output::native_reply_selftest(source.clone())? {
+            return Ok(false);
+        }
         let mut driver = source.driver.clone();
         let mut tx = <VethDriver as phy::Device>::transmit(
             &mut driver,

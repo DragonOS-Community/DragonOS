@@ -31,38 +31,81 @@ impl LocalOutputDrainResult {
     }
 }
 
-/// Preserve a frame produced by a physical RX/TX token when the device queue
-/// cannot accept it immediately. smoltcp consumes such tokens without an
-/// error return, so ownership must move into the bounded interface output
-/// queue before `consume` returns.
-pub(super) fn defer_native_output_after_tx_backpressure(
-    iface: &dyn Iface,
-    medium: smoltcp::phy::Medium,
-    meta: PacketMeta,
-    frame: Vec<u8>,
-    observed_generation: u64,
-) -> Result<(), Vec<u8>> {
-    let common = iface.common();
-    let Some(mut reservation) = common.local_input_queue.reserve_output() else {
-        return Err(frame);
-    };
-    if !reservation.try_resize(frame.capacity()) {
-        return Err(frame);
+/// Exact payload and output admission are acquired before a physical RX reply
+/// is emitted. On TX backpressure the existing owner and node move together.
+pub(super) struct NativeReply {
+    pub(super) frame: PacketBuffer,
+    reservation: LocalOutputReservation<'static>,
+    iface: Arc<dyn Iface>,
+}
+impl NativeReply {
+    pub(super) fn prepare(
+        iface: Arc<dyn Iface>,
+        len: usize,
+    ) -> Result<Self, smoltcp::phy::TxEgressError> {
+        let mut reservation = LocalInputQueue::reserve_owned_output(iface.clone())
+            .ok_or(smoltcp::phy::TxEgressError::Exhausted)?;
+        if !reservation.try_resize(len) {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        let mut frame = PacketBuffer::try_with_capacity(len)
+            .map_err(|_| smoltcp::phy::TxEgressError::Exhausted)?;
+        if !reservation.try_resize(frame.capacity()) {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        frame
+            .resize(len, 0)
+            .map_err(|_| smoltcp::phy::TxEgressError::Exhausted)?;
+        Ok(Self {
+            frame,
+            reservation,
+            iface,
+        })
     }
-    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
-    let retry_at =
-        now + smoltcp::time::Duration::from_micros(common.next_local_output_tx_backoff_us());
-    // Physical RX tokens already emitted into this legacy heap owner. Move
-    // it without another allocation; their birth policy is tracked separately.
-    let owned = PacketBuffer::from_existing_heap(frame);
-    reservation.requeue_native_backpressured(medium, meta, owned, retry_at);
-    let retry_at = if common.release_tx_backpressure_after(observed_generation) {
-        now
-    } else {
-        retry_at
-    };
-    common.schedule_registered_local_output(retry_at);
-    Ok(())
+    pub(super) fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        if len <= self.frame.capacity() {
+            self.frame.resize(len, 0).expect("existing reply capacity");
+            return Ok(());
+        }
+        let old_capacity = self.frame.capacity();
+        if !self.reservation.try_resize(len.max(old_capacity)) {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        let prepared = PacketBuffer::try_with_capacity(len).and_then(|mut frame| {
+            frame.resize(len, 0)?;
+            Ok(frame)
+        });
+        let frame = match prepared {
+            Ok(frame) => frame,
+            Err(_) => {
+                assert!(self.reservation.try_resize(old_capacity));
+                return Err(smoltcp::phy::TxEgressError::Exhausted);
+            }
+        };
+        if !self.reservation.try_resize(frame.capacity()) {
+            assert!(self.reservation.try_resize(old_capacity));
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        self.frame = frame;
+        Ok(())
+    }
+    pub(super) fn generation(&self) -> u64 {
+        self.iface.common().tx_completion_generation()
+    }
+    pub(super) fn defer(self, medium: smoltcp::phy::Medium, meta: PacketMeta, generation: u64) {
+        let common = self.iface.common();
+        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+        let retry_at =
+            now + smoltcp::time::Duration::from_micros(common.next_local_output_tx_backoff_us());
+        self.reservation
+            .requeue_native_backpressured(medium, meta, self.frame, retry_at);
+        let deadline = if common.release_tx_backpressure_after(generation) {
+            now
+        } else {
+            retry_at
+        };
+        common.schedule_registered_local_output(deadline);
+    }
 }
 
 /// A namespace-local view over the target interface's transport stack.
@@ -2240,4 +2283,42 @@ pub(super) fn native_output_selftest<D: SmolDevice + ?Sized>(
         && packet.frame[..12].iter().all(|byte| *byte == 0xa5)
         && packet.frame[12..14] == 0x0800u16.to_be_bytes()
         && packet.frame[14..].iter().all(|byte| *byte == 0xa5))
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(super) fn native_reply_selftest(iface: Arc<dyn Iface>) -> Result<bool, SystemError> {
+    const _: () = assert!(crate::libs::paged_vec::PagedVec::<
+        LocalOutputReservation<'static>,
+        MAX_LOCAL_OUTPUT_FRAMES,
+    >::layout_supported());
+    let mut reply = NativeReply::prepare(iface.clone(), 64).map_err(|_| SystemError::ENOMEM)?;
+    let mut reservations = crate::libs::paged_vec::PagedVec::<_, MAX_LOCAL_OUTPUT_FRAMES>::new();
+    reservations.try_reserve(MAX_LOCAL_OUTPUT_FRAMES - 1)?;
+    for _ in 1..MAX_LOCAL_OUTPUT_FRAMES {
+        reservations
+            .push(LocalInputQueue::reserve_owned_output(iface.clone()).ok_or(SystemError::ENOMEM)?);
+    }
+    // Changed-length preparation must reuse the one already admitted frame,
+    // even when no additional frame slot can be obtained.
+    reply.prepare_buffer(128).map_err(|_| SystemError::ENOMEM)?;
+    reply.frame.fill(0x5a);
+    let pointer = reply.frame.as_ptr();
+    if reply.prepare_buffer(usize::MAX).is_ok()
+        || reply.frame.as_ptr() != pointer
+        || reply.frame.len() != 128
+        || reply.frame.iter().any(|byte| *byte != 0x5a)
+    {
+        return Ok(false);
+    }
+    reply.prepare_buffer(32).map_err(|_| SystemError::ENOMEM)?;
+    {
+        let output = iface.common().local_input_queue.output.lock();
+        if output.reserved_frames != MAX_LOCAL_OUTPUT_FRAMES || output.reserved_bytes != 128 {
+            return Ok(false);
+        }
+    }
+    drop(reply);
+    drop(reservations);
+    let output = iface.common().local_input_queue.output.lock();
+    Ok(output.reserved_frames == 0 && output.reserved_bytes == 0)
 }

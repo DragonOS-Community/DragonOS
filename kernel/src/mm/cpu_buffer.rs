@@ -55,6 +55,11 @@ pub struct CpuBuffer {
     len: usize,
 }
 
+// SAFETY: shared access exposes only immutable initialized bytes. Backing is
+// stable until exclusive mutation or final ownership transfer; mapped teardown
+// is deferred by Drop. This does not make task-local KernelBuffer shareable.
+unsafe impl Sync for CpuBuffer {}
+
 enum Backend {
     Heap(Vec<u8>),
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -448,3 +453,18 @@ pub(crate) fn selftest() -> bool {
     }
     run().unwrap_or(false)
 }
+
+impl AsRef<[u8]> for CpuBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl AsMut<[u8]> for CpuBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+const _: fn() = || {
+    fn require<T: Send + Sync + 'static>() {}
+    require::<CpuBuffer>();
+};

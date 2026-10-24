@@ -7,8 +7,9 @@
 
 extern crate alloc;
 
+use crate::{driver::net::PacketBuffer, libs::paged_vec::PagedVec};
+#[cfg(test)]
 use alloc::vec::Vec;
-use core::mem::size_of;
 
 const MAX_DATAGRAM_LEN: usize = u16::MAX as usize;
 const MAX_QUEUES: usize = 128;
@@ -65,8 +66,11 @@ struct Key {
 #[derive(Debug)]
 struct Fragment {
     offset: usize,
-    payload: Vec<u8>,
+    payload: PacketBuffer,
 }
+
+// Fragment metadata and its pointer directory each remain single-page.
+const _: () = assert!(PagedVec::<Fragment, MAX_FRAGMENTS_PER_QUEUE>::layout_supported());
 
 impl Fragment {
     fn end(&self) -> usize {
@@ -78,8 +82,8 @@ impl Fragment {
 struct Queue<M> {
     key: Key,
     expires_at_us: u64,
-    fragments: Vec<Fragment>,
-    first_header: Option<Vec<u8>>,
+    fragments: PagedVec<Fragment, MAX_FRAGMENTS_PER_QUEUE>,
+    first_header: Option<PacketBuffer>,
     first_origin: Option<M>,
     final_end: Option<usize>,
     largest_end: usize,
@@ -94,7 +98,7 @@ struct Queue<M> {
 /// the completing fragment supplies the receive device, as in Linux's
 /// `ip_frag_reasm()`. The packet has no remaining fragment offset.
 pub(crate) struct ReassembledIpv4<M> {
-    pub(crate) packet: Vec<u8>,
+    pub(crate) packet: PacketBuffer,
     pub(crate) first_origin: M,
     pub(crate) completion_origin: M,
     pub(crate) max_original_fragment_len: usize,
@@ -118,9 +122,11 @@ pub(crate) enum ReassemblyResult<M> {
 }
 
 /// The caller serializes this small state (for example with the namespace's
-/// SpinLock). No rule, FIB, device or socket locks are acquired here.
+/// Mutex). Large byte storage requires IRQ-on preemptible task context;
+/// callers must not hold a SpinLock. No rule, FIB, device or socket locks
+/// are acquired here.
 pub(crate) struct Ipv4Defragmenter<M> {
-    queues: Vec<Queue<M>>,
+    queues: PagedVec<Queue<M>, MAX_QUEUES>,
     charged_bytes: usize,
 }
 
@@ -193,7 +199,7 @@ impl Parsed<'_> {
 impl<M: Clone> Ipv4Defragmenter<M> {
     pub(crate) const fn new() -> Self {
         Self {
-            queues: Vec::new(),
+            queues: PagedVec::new(),
             charged_bytes: 0,
         }
     }
@@ -215,10 +221,31 @@ impl<M: Clone> Ipv4Defragmenter<M> {
                 index += 1;
             }
         }
+        self.release_empty_storage();
         expired
     }
 
+    fn release_empty_storage(&mut self) {
+        if self.queues.is_empty() {
+            debug_assert_eq!(self.charged_bytes, self.queues.allocated_bytes());
+            self.queues = PagedVec::new();
+            self.charged_bytes = 0;
+        }
+    }
+
     pub(crate) fn submit(
+        &mut self,
+        bytes: &[u8],
+        domain: DefragDomain,
+        origin: M,
+        now_us: u64,
+    ) -> ReassemblyResult<M> {
+        let result = self.submit_inner(bytes, domain, origin, now_us);
+        self.release_empty_storage();
+        result
+    }
+
+    fn submit_inner(
         &mut self,
         bytes: &[u8],
         domain: DefragDomain,
@@ -234,31 +261,33 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         // leaves an empty fragment. The key must be parsed first so a prior
         // fragment cannot remain queued after this malformed arrival.
         if parsed.payload.is_empty() {
-            if let Some(index) = self.queues.iter().position(|queue| queue.key == parsed.key) {
+            let existing = self.queues.iter().position(|queue| queue.key == parsed.key);
+            if let Some(index) = existing {
                 self.remove(index);
             }
             return ReassemblyResult::Rejected(ReassemblyError::Malformed);
         }
-        let mut index = match self.queues.iter().position(|queue| queue.key == parsed.key) {
+        let existing = self.queues.iter().position(|queue| queue.key == parsed.key);
+        let mut index = match existing {
             Some(index) => index,
             None => {
                 if self.queues.len() == MAX_QUEUES {
                     self.evict_oldest(None);
                 }
-                if self.queues.try_reserve(1).is_err() {
+                let old_storage = self.queues.allocated_bytes();
+                let reserve = self.queues.try_reserve(1);
+                self.charged_bytes += self.queues.allocated_bytes() - old_storage;
+                self.evict_until_room(None, 0);
+                if reserve.is_err() {
                     return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
                 }
-                let charge = size_of::<Queue<M>>();
-                if self.charged_bytes.saturating_add(charge) > MAX_STORED_BYTES {
-                    self.evict_until_room(None, charge);
-                }
-                if self.charged_bytes.saturating_add(charge) > MAX_STORED_BYTES {
+                if self.charged_bytes > MAX_STORED_BYTES {
                     return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
                 }
                 self.queues.push(Queue {
                     key: parsed.key,
                     expires_at_us: now_us.saturating_add(REASSEMBLY_TIMEOUT_US),
-                    fragments: Vec::new(),
+                    fragments: PagedVec::new(),
                     first_header: None,
                     first_origin: None,
                     final_end: None,
@@ -267,9 +296,8 @@ impl<M: Clone> Ipv4Defragmenter<M> {
                     ecn_seen: 0,
                     largest_fragment: 0,
                     largest_df_fragment: 0,
-                    charged_bytes: charge,
+                    charged_bytes: 0,
                 });
-                self.charged_bytes += charge;
                 self.queues.len() - 1
             }
         };
@@ -300,7 +328,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         let first_overlap = queue
             .fragments
             .partition_point(|fragment| fragment.end() <= parsed.offset);
-        for fragment in &queue.fragments[first_overlap..] {
+        for fragment in queue.fragments.iter().skip(first_overlap) {
             if fragment.offset >= end {
                 break;
             }
@@ -322,33 +350,37 @@ impl<M: Clone> Ipv4Defragmenter<M> {
             return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
         }
 
-        let mut payload = Vec::new();
+        let mut payload = PacketBuffer::new();
         if payload.try_reserve_exact(parsed.payload.len()).is_err() {
             self.remove(index);
             return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
         }
-        payload.extend_from_slice(parsed.payload);
+        payload
+            .extend_from_slice(parsed.payload)
+            .expect("prepared payload");
         let mut header = None;
         if parsed.offset == 0 {
-            let mut first = Vec::new();
+            let mut first = PacketBuffer::new();
             if first.try_reserve_exact(parsed.header.len()).is_err() {
                 self.remove(index);
                 return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
             }
-            first.extend_from_slice(parsed.header);
+            first
+                .extend_from_slice(parsed.header)
+                .expect("prepared header");
             header = Some(first);
         }
-        let old_fragment_capacity = self.queues[index].fragments.capacity();
+        let old_fragment_capacity = self.queues[index].fragments.allocated_bytes();
         if self.queues[index].fragments.try_reserve(1).is_err() {
             self.remove(index);
             return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
         }
         let fragment_capacity_delta =
-            self.queues[index].fragments.capacity() - old_fragment_capacity;
+            self.queues[index].fragments.allocated_bytes() - old_fragment_capacity;
         let charge = payload
             .capacity()
-            .saturating_add(header.as_ref().map_or(0, Vec::capacity))
-            .saturating_add(fragment_capacity_delta.saturating_mul(size_of::<Fragment>()));
+            .saturating_add(header.as_ref().map_or(0, PacketBuffer::capacity))
+            .saturating_add(fragment_capacity_delta);
         self.evict_until_room(Some(&mut index), charge);
         if self.charged_bytes.saturating_add(charge) > MAX_STORED_BYTES {
             self.remove(index);
@@ -455,18 +487,22 @@ fn assemble<M>(
     if not_ect && queue.ecn_seen & !1 != 0 {
         return Err(ReassemblyError::InconsistentEcn);
     }
-    let mut packet = Vec::new();
+    let mut packet = PacketBuffer::new();
     packet
         .try_reserve_exact(total_len)
         .map_err(|_| ReassemblyError::OutOfMemory)?;
-    packet.extend_from_slice(&header);
+    packet
+        .extend_from_slice(&header)
+        .expect("prepared datagram");
     let mut next_offset = 0;
-    for fragment in queue.fragments {
+    for fragment in queue.fragments.iter() {
         if fragment.offset != next_offset {
             return Err(ReassemblyError::Malformed);
         }
         next_offset += fragment.payload.len();
-        packet.extend_from_slice(&fragment.payload);
+        packet
+            .extend_from_slice(&fragment.payload)
+            .expect("prepared datagram");
     }
     if next_offset != final_end {
         return Err(ReassemblyError::Malformed);
@@ -806,6 +842,43 @@ mod tests {
         }
         assert_eq!(assembler.queues.len(), MAX_QUEUES);
         assert!(assembler.charged_bytes <= MAX_STORED_BYTES);
+    }
+
+    #[test]
+    fn fragment_metadata_spans_pages_and_all_owned_storage_is_charged() {
+        let mut assembler = Ipv4Defragmenter::new();
+        for offset in (0..400 * 8).step_by(8).rev() {
+            let bytes = fragment(71, offset, true, b"abcdefgh", 0, &[]);
+            assert!(matches!(
+                assembler.submit(&bytes, DOMAIN, 1, 0),
+                ReassemblyResult::Pending
+            ));
+            let queue = &assembler.queues[0];
+            let expected = queue.fragments.allocated_bytes()
+                + queue
+                    .fragments
+                    .iter()
+                    .map(|fragment| fragment.payload.capacity())
+                    .sum::<usize>()
+                + queue
+                    .first_header
+                    .as_ref()
+                    .map_or(0, PacketBuffer::capacity);
+            assert_eq!(queue.charged_bytes, expected);
+            assert_eq!(
+                assembler.charged_bytes,
+                expected + assembler.queues.allocated_bytes()
+            );
+        }
+        let last = fragment(71, 400 * 8, false, b"end", 0, &[]);
+        let datagram = completed(assembler.submit(&last, DOMAIN, 1, 0));
+        assert_eq!(datagram.packet.len(), 20 + 400 * 8 + 3);
+        assert!(datagram.packet[20..20 + 400 * 8]
+            .chunks_exact(8)
+            .all(|chunk| chunk == b"abcdefgh"));
+        assert_eq!(&datagram.packet[20 + 400 * 8..], b"end");
+        assert_eq!(assembler.charged_bytes, 0);
+        assert_eq!(assembler.queues.allocated_bytes(), 0);
     }
 
     #[test]

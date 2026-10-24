@@ -37,7 +37,7 @@ pub(super) struct LoopbackRxQueue {
 /// socket's attached smoltcp interface (which can be lo for a wildcard bind).
 #[derive(Debug)]
 pub(super) struct RawRxPacket {
-    pub(super) bytes: Vec<u8>,
+    pub(super) bytes: crate::driver::net::PacketBuffer,
     pub(super) ingress_ifindex: u32,
 }
 
@@ -260,11 +260,9 @@ fn deliver_raw_to_sockets(
 
         // SO_RCVBUF：投递/丢弃语义
         let rcvbuf = s.options.read().sock_rcvbuf as usize;
-        let mut packet = Vec::new();
-        if packet.try_reserve_exact(ctx.packet.len()).is_err() {
+        let Ok(packet) = crate::driver::net::PacketBuffer::try_from_slice(ctx.packet) else {
             continue;
-        }
-        packet.extend_from_slice(ctx.packet);
+        };
         let enqueued = {
             let mut q = s.loopback_rx.lock();
             let can_enqueue = if q.bytes == 0 {
@@ -298,7 +296,7 @@ pub(crate) struct RawIngressWork {
     pub(crate) sockets: Vec<Arc<RawSocket>>,
     /// Admission-time matches occupy the prefix; the suffix is retirement only.
     pub(crate) matched: usize,
-    pub(crate) packet: Vec<u8>,
+    pub(crate) packet: crate::driver::net::PacketBuffer,
     pub(crate) source: IpAddress,
     pub(crate) destination: IpAddress,
     pub(crate) protocol: IpProtocol,
@@ -451,7 +449,10 @@ impl RawIngressBatch {
             queue.lock_irqsave().release(bytes);
             return Err(work);
         }
-        work.packet.extend_from_slice(packet);
+        // Capacity was prepared above; no copy can allocate after admission.
+        work.packet
+            .extend_from_slice(packet)
+            .expect("raw ingress capacity prepared");
         self.charged += bytes;
         self.work.push(work);
         Ok(())
@@ -501,7 +502,7 @@ impl RawIngressBatch {
 
 /// Echo Reply 构建参数
 struct EchoReplyParams {
-    reply_payload: Vec<u8>,
+    reply_payload: crate::driver::net::PacketBuffer,
     /// 原始目的地址，作为 reply 的源
     src: IpAddress,
     /// 原始源地址，作为 reply 的目的
@@ -535,7 +536,7 @@ fn try_build_icmp_echo_reply(packet: &[u8]) -> Option<EchoReplyParams> {
     let dst = smoltcp::wire::Ipv4Address::new(packet[16], packet[17], packet[18], packet[19]);
 
     // 构建 reply payload
-    let mut reply_payload = payload.to_vec();
+    let mut reply_payload = crate::driver::net::PacketBuffer::try_from_slice(payload).ok()?;
     reply_payload[0] = ICMP_ECHO_REPLY;
     reply_payload[2] = 0;
     reply_payload[3] = 0;
@@ -597,7 +598,7 @@ fn try_build_icmpv6_echo_reply(packet: &[u8]) -> Option<EchoReplyParams> {
     );
 
     // 构建 reply payload (校验和由 build_ipv6_packet 计算)
-    let mut reply_payload = payload.to_vec();
+    let mut reply_payload = crate::driver::net::PacketBuffer::try_from_slice(payload).ok()?;
     reply_payload[0] = ICMPV6_ECHO_REPLY;
     reply_payload[2] = 0;
     reply_payload[3] = 0;

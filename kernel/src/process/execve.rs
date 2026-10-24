@@ -1,3 +1,4 @@
+use super::exec_args::ExecArguments;
 use super::trace::trace_sched_process_exec;
 use crate::{
     arch::{interrupt::TrapFrame, ipc::signal::Signal, CurrentIrqArch},
@@ -19,7 +20,7 @@ use crate::{
     },
     syscall::Syscall,
 };
-use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, string::String, sync::Arc};
 use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
@@ -62,29 +63,26 @@ impl From<SystemError> for ExecFailure {
 ///
 /// ## 参数
 /// - `path`: 要执行的文件路径
-/// - `argv`: 参数列表
-/// - `envp`: 环境变量列表
+/// - `arguments`: 已捕获、计费并冻结的参数和环境快照
 /// - `regs`: 陷入帧
 ///
 /// ## 返回值
 /// 成功时准备好新的用户帧，失败时由调用者释放资源后处理 ExecFailure。
 pub(crate) fn do_execve(
     path: &str,
-    argv: Vec<CString>,
-    envp: Vec<CString>,
+    arguments: ExecArguments,
     regs: &mut TrapFrame,
 ) -> Result<(), ExecFailure> {
     let file = do_open_execat(AtFlags::AT_FDCWD.bits(), path)?;
     let start = ExecStartInfo::new(file, path.into(), path.into(), ExecInterpFlags::empty());
 
-    do_execve_with_info(start, argv, envp, regs)
+    do_execve_with_info(start, arguments, regs)
 }
 
 pub(crate) fn do_execveat(
     dirfd: i32,
     path: &str,
-    argv: Vec<CString>,
-    envp: Vec<CString>,
+    arguments: ExecArguments,
     flags: AtFlags,
     regs: &mut TrapFrame,
 ) -> Result<(), ExecFailure> {
@@ -96,16 +94,15 @@ pub(crate) fn do_execveat(
         exec_path_interp_flags(dirfd, path),
     );
 
-    do_execve_with_info(start, argv, envp, regs)
+    do_execve_with_info(start, arguments, regs)
 }
 
 pub(crate) fn do_execve_with_info(
     start: ExecStartInfo,
-    argv: Vec<CString>,
-    envp: Vec<CString>,
+    arguments: ExecArguments,
     regs: &mut TrapFrame,
 ) -> Result<(), ExecFailure> {
-    do_execve_internal(start, argv, envp, regs, ExecContext::new())
+    do_execve_internal(start, arguments, regs, ExecContext::new())
 }
 
 pub fn exec_visible_name(dirfd: i32, path: &str) -> String {
@@ -142,15 +139,13 @@ fn exec_path_interp_flags(dirfd: i32, path: &str) -> ExecInterpFlags {
 ///
 /// ## 参数
 /// - `file`: 已打开的可执行文件
-/// - `argv`: 参数列表
-/// - `envp`: 环境变量列表
+/// - `arguments`: 已捕获、计费并冻结的参数和环境快照
 /// - `regs`: 陷入帧
 /// - `ctx`: 执行上下文，用于跟踪递归深度
 #[inline(never)]
 fn do_execve_internal(
     start: ExecStartInfo,
-    argv: Vec<CString>,
-    envp: Vec<CString>,
+    arguments: ExecArguments,
     regs: &mut TrapFrame,
     ctx: ExecContext,
 ) -> Result<(), ExecFailure> {
@@ -159,7 +154,8 @@ fn do_execve_internal(
     // The final strings for this loader iteration are already known. Prepare
     // recoverable CPU metadata before any exec-update transaction is held.
     // Declaration order also releases exec_guard before this owner on errors.
-    let mut stack_pointers = ExecStackPointers::prepare(argv.len(), envp.len())?;
+    let mut stack_pointers =
+        ExecStackPointers::prepare(arguments.args.len(), arguments.envs.len())?;
     // Prospective MM admission may reclaim or wait. Never do it while the
     // exec-update lock protects the irreversible exec transaction.
     let (address_space, exec_guard) = loop {
@@ -186,11 +182,8 @@ fn do_execve_internal(
         CString::new(start.filename()).map_err(|_| SystemError::EINVAL)?,
         CString::new(start.execfn()).map_err(|_| SystemError::EINVAL)?,
         start.interp_flags(),
+        &arguments,
     )?;
-
-    // 预先设置args，以便shebang处理时可以访问原始参数
-    param.init_info_mut().args = argv.clone();
-    param.init_info_mut().envs = envp.clone();
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
 
@@ -272,7 +265,7 @@ fn do_execve_internal(
             pcb.basic_mut()
                 .set_name(ProcessControlBlock::generate_name(&executable_path));
             pcb.set_execute_path(executable_path);
-            pcb.set_cmdline_from_argv(&param.init_info().args);
+            pcb.set_cmdline_snapshot(Some(param.init_info().args.clone()));
 
             // vfork 父进程必须在 child 完成 exec commit 后再恢复。
             // 否则父子仍可能共享 files_struct，child 的 close_on_exec() 会污染父进程。
@@ -351,7 +344,10 @@ fn do_execve_internal(
             Ok(())
         }
 
-        Ok(LoadBinaryResult::NeedReexec { next, new_argv }) => {
+        Ok(LoadBinaryResult::NeedReexec {
+            next,
+            interpreter_arg,
+        }) => {
             // Shebang场景：需要递归执行解释器
             // 恢复旧的地址空间
             if let Some(old_vm) = old_vm {
@@ -361,10 +357,23 @@ fn do_execve_internal(
             // Release the script's temporary deny before loading its interpreter.
             drop(param);
             drop(stack_pointers);
+            drop(address_space);
             // 增加递归深度并递归调用
             let new_ctx = ctx.increment_depth();
 
-            do_execve_internal(next, new_argv, envp, regs, new_ctx)
+            // The loader returns only bounded script metadata. All large CPU
+            // storage/freeze runs after the transaction and prospective MM drop.
+            let rewritten = if let Some(ref optional) = interpreter_arg {
+                arguments.rewrite(&[
+                    next.filename().as_bytes(),
+                    optional.as_bytes(),
+                    start.filename().as_bytes(),
+                ])?
+            } else {
+                arguments.rewrite(&[next.filename().as_bytes(), start.filename().as_bytes()])?
+            };
+            drop(arguments);
+            do_execve_internal(next, rewritten, regs, new_ctx)
         }
 
         Err(e) => finish_exec_error(&param, old_vm.as_ref(), e),

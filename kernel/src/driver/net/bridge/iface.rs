@@ -5,7 +5,7 @@ struct BridgeNetDriver {
     bridge: Arc<BridgeDriver>,
 }
 
-struct BridgeRxToken(Vec<u8>);
+struct BridgeRxToken(crate::driver::net::PacketBuffer);
 
 impl RxToken for BridgeRxToken {
     fn consume<R, F>(self, f: F) -> R
@@ -16,16 +16,39 @@ impl RxToken for BridgeRxToken {
     }
 }
 
-struct BridgeTxToken(BridgeNetDriver);
+struct BridgeTxToken {
+    driver: BridgeNetDriver,
+    prepared: Option<crate::driver::net::PacketBuffer>,
+}
 
 impl phy::TxToken for BridgeTxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|frame| frame.len() == len)
+        {
+            return Ok(());
+        }
+        let mut frame = crate::driver::net::PacketBuffer::try_with_capacity(len)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        frame
+            .resize(len, 0)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        self.prepared = Some(frame);
+        Ok(())
+    }
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = vec![0; len];
+        let mut frame = self
+            .prepared
+            .take()
+            .expect("bridge storage prepared before emit");
+        assert_eq!(frame.len(), len);
         let result = f(&mut frame);
-        let _ = self.0.bridge.local_transmit(&frame);
+        let _ = self.driver.bridge.local_transmit(&frame);
         result
     }
 }
@@ -46,15 +69,22 @@ impl phy::Device for BridgeNetDriver {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.bridge
-            .local_rx_queue
-            .lock()
-            .pop_front()
-            .map(|frame| (BridgeRxToken(frame), BridgeTxToken(self.clone())))
+        self.bridge.local_rx_queue.lock().pop_node().map(|node| {
+            (
+                BridgeRxToken((*node).into_value()),
+                BridgeTxToken {
+                    driver: self.clone(),
+                    prepared: None,
+                },
+            )
+        })
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        Some(BridgeTxToken(self.clone()))
+        Some(BridgeTxToken {
+            driver: self.clone(),
+            prepared: None,
+        })
     }
 }
 
@@ -117,7 +147,11 @@ impl BridgeIface {
         };
         let mut config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(mac));
         config.random_seed = rand() as u64;
-        let mut stack = smoltcp::iface::Interface::new(config, &mut phy, Instant::now().into());
+        let mut stack = crate::driver::net::packet_storage::new_interface(
+            config,
+            &mut phy,
+            Instant::now().into(),
+        );
         stack.set_any_ip(true);
         let iface = Arc::new(Self {
             driver: driver.clone(),
@@ -565,7 +599,8 @@ impl Iface for BridgeIface {
     }
     fn quiesce_admin_down(&self) {
         self.driver.wait_idle();
-        self.driver.local_rx_queue.lock().clear();
+        let retired = core::mem::take(&mut *self.driver.local_rx_queue.lock());
+        drop(retired);
     }
     fn publish_admin_state(&self, is_up: bool) {
         self.driver.active.store(is_up, Ordering::SeqCst);

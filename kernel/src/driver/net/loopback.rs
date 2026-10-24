@@ -399,8 +399,11 @@ impl LoopbackInterface {
         iface_config.random_seed = rand() as u64;
         iface_config.is_loopback = true;
 
-        let mut iface =
-            smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
+        let mut iface = crate::driver::net::packet_storage::new_interface(
+            iface_config,
+            &mut driver,
+            Instant::now().into(),
+        );
 
         iface.set_any_ip(true);
 

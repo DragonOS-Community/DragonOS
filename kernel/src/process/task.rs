@@ -3,7 +3,6 @@ use core::sync::atomic::{
 };
 
 use alloc::{
-    ffi::CString,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
@@ -356,7 +355,7 @@ pub struct ProcessControlBlockData {
     pub(super) executable_path: RwLock<String>,
     /// Process command line (used for /proc/<pid>/cmdline; Linux semantics: argv
     /// entries are separated by '\0').
-    pub(super) cmdline: RwLock<Vec<u8>>,
+    pub(super) cmdline: RwLock<Option<Arc<super::exec_args::ExecStrings>>>,
     /// Resource limits are shared by a thread group, like Linux's
     /// `signal_struct::rlim`. A process fork receives a copied Arc.
     pub(super) rlimits: Arc<TaskResourceLimits>,
@@ -960,7 +959,7 @@ impl ProcessControlBlock {
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
                 executable_path: RwLock::new(name),
-                cmdline: RwLock::new(Vec::new()),
+                cmdline: RwLock::new(None),
                 rlimits,
                 #[cfg(target_arch = "x86_64")]
                 uprobe: super::uprobe::TaskXolState::new(),
@@ -1608,29 +1607,15 @@ impl ProcessControlBlock {
         self.executable_path.read().clone()
     }
 
-    /// Returns the raw byte sequence for /proc/<pid>/cmdline (argv entries
-    /// separated by '\0').
-    #[inline(always)]
-    pub fn cmdline_bytes(&self) -> Vec<u8> {
+    /// Immutable argv snapshot: sharing it never duplicates the argument bytes.
+    pub(crate) fn cmdline_snapshot(&self) -> Option<Arc<super::exec_args::ExecStrings>> {
         self.cmdline.read().clone()
     }
 
-    /// Directly set cmdline (used for fork inheritance and similar scenarios).
-    #[inline(always)]
-    pub fn set_cmdline_bytes(&self, data: Vec<u8>) {
-        *self.cmdline.write() = data;
-    }
-
-    /// Write argv after a successful exec (Linux semantics: each argument is
-    /// NUL-terminated; the entire buffer is typically NUL-terminated as well).
-    #[inline(never)]
-    pub fn set_cmdline_from_argv(&self, argv: &[CString]) {
-        let mut buf: Vec<u8> = Vec::new();
-        for arg in argv {
-            buf.extend_from_slice(arg.as_bytes());
-            buf.push(0);
-        }
-        *self.cmdline.write() = buf;
+    pub(crate) fn set_cmdline_snapshot(&self, data: Option<Arc<super::exec_args::ExecStrings>>) {
+        let old = core::mem::replace(&mut *self.cmdline.write(), data);
+        // Last-page release must not run while holding the PCB publication lock.
+        drop(old);
     }
 
     pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {

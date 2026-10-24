@@ -328,7 +328,7 @@ pub(crate) fn new_transport_interface() -> smoltcp::iface::Interface {
     // The root namespace is constructed by sysfs before timekeeping starts.
     // This empty transport context has no timers; connect/poll supplies the
     // current monotonic time before any protocol state becomes active.
-    smoltcp::iface::Interface::new(
+    crate::driver::net::packet_storage::new_interface(
         config,
         &mut TransportOnlyDevice,
         smoltcp::time::Instant::ZERO,

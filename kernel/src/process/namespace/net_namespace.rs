@@ -4,6 +4,7 @@ use crate::driver::net::{IfacePollScope, PacketBuffer};
 use crate::exception::workqueue::{Work, WorkQueue};
 use crate::init::initcall::INITCALL_SUBSYS;
 use crate::libs::mutex::Mutex;
+use crate::libs::paged_vec::PagedVec;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
@@ -38,7 +39,7 @@ use crate::{
     process::namespace::{nsproxy::NsCommon, user_namespace::UserNamespace},
 };
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -429,7 +430,7 @@ struct FragmentOrigin {
 /// been released. The namespace poller then becomes the sole reassembly owner.
 #[derive(Debug)]
 pub(crate) struct PendingIpv4Fragment {
-    pub(crate) packet: Vec<u8>,
+    pub(crate) packet: PacketBuffer,
     pub(crate) ingress_ifindex: u32,
     pub(crate) owner_ifindex: u32,
     pub(crate) source_hardware_addr: HardwareAddress,
@@ -455,7 +456,7 @@ impl PendingIpv4Fragment {
 
 #[derive(Debug)]
 pub(crate) struct PendingIpv6Fragment {
-    pub(crate) packet: Vec<u8>,
+    pub(crate) packet: PacketBuffer,
     pub(crate) ingress_ifindex: u32,
     pub(crate) owner_ifindex: u32,
     pub(crate) source_hardware_addr: HardwareAddress,
@@ -484,6 +485,9 @@ pub(crate) enum PendingIpFragment {
     Ipv6(PendingIpv6Fragment),
 }
 
+const _: () =
+    assert!(PagedVec::<Option<PendingIpFragment>, DEFRAG_PENDING_PACKETS>::layout_supported());
+
 impl PendingIpFragment {
     fn packet_capacity(&self) -> usize {
         match self {
@@ -495,36 +499,55 @@ impl PendingIpFragment {
 
 #[derive(Debug)]
 struct DefragPending {
-    packets: VecDeque<PendingIpFragment>,
+    // All slots are prepared before publication. Rotation never allocates or
+    // shifts live packet owners while the pending spinlock is held.
+    packets: PagedVec<Option<PendingIpFragment>, DEFRAG_PENDING_PACKETS>,
+    head: usize,
+    len: usize,
     bytes: usize,
 }
 
 impl DefragPending {
     fn prepare() -> Result<Self, SystemError> {
-        let mut packets = VecDeque::new();
-        packets
-            .try_reserve(DEFRAG_PENDING_PACKETS)
-            .map_err(|_| SystemError::ENOMEM)?;
-        Ok(Self { packets, bytes: 0 })
+        let mut packets = PagedVec::new();
+        packets.try_reserve(DEFRAG_PENDING_PACKETS)?;
+        for _ in 0..DEFRAG_PENDING_PACKETS {
+            packets.push(None);
+        }
+        Ok(Self {
+            packets,
+            head: 0,
+            len: 0,
+            bytes: 0,
+        })
     }
 
     /// The ring is reserved before publishing conntrack rules. The rejected
     /// packet remains caller-owned, so even a full-queue drop runs unlocked.
     fn push(&mut self, packet: PendingIpFragment) -> Result<(), PendingIpFragment> {
         let capacity = packet.packet_capacity();
-        if self.packets.len() == DEFRAG_PENDING_PACKETS
+        if self.len == DEFRAG_PENDING_PACKETS
             || self.bytes.saturating_add(capacity) > DEFRAG_PENDING_BYTES
         {
             return Err(packet);
         }
-        debug_assert!(self.packets.capacity() >= DEFRAG_PENDING_PACKETS);
+        let index = (self.head + self.len) % DEFRAG_PENDING_PACKETS;
+        debug_assert!(self.packets[index].is_none());
+        self.packets[index] = Some(packet);
+        self.len += 1;
         self.bytes += capacity;
-        self.packets.push_back(packet);
         Ok(())
     }
 
     fn pop(&mut self) -> Option<PendingIpFragment> {
-        let packet = self.packets.pop_front()?;
+        if self.len == 0 {
+            return None;
+        }
+        let packet = self.packets[self.head]
+            .take()
+            .expect("occupied pending slot");
+        self.head = (self.head + 1) % DEFRAG_PENDING_PACKETS;
+        self.len -= 1;
         self.bytes -= packet.packet_capacity();
         Some(packet)
     }
@@ -536,8 +559,7 @@ mod defrag_pending_tests {
     use smoltcp::wire::Ipv4Packet;
 
     fn packet(bytes: usize) -> PendingIpv4Fragment {
-        let mut packet = Vec::new();
-        packet.try_reserve_exact(bytes).unwrap();
+        let packet = PacketBuffer::try_with_capacity(bytes).unwrap();
         PendingIpv4Fragment {
             packet,
             ingress_ifindex: 2,
@@ -558,12 +580,37 @@ mod defrag_pending_tests {
             pending.push(PendingIpFragment::Ipv4(packet(0))).unwrap();
         }
         assert!(pending.push(PendingIpFragment::Ipv4(packet(0))).is_err());
-        assert_eq!(pending.packets.len(), DEFRAG_PENDING_PACKETS);
+        assert_eq!(pending.len, DEFRAG_PENDING_PACKETS);
         for _ in 0..DEFRAG_PENDING_PACKETS {
             pending.pop().unwrap();
         }
         assert!(pending.pop().is_none());
         assert_eq!(pending.bytes, 0);
+    }
+
+    #[test]
+    fn prepared_ring_wraps_without_reordering_or_growing() {
+        let mut pending = DefragPending::prepare().unwrap();
+        let storage = pending.packets.allocated_bytes();
+        for round in 0..3 {
+            for index in 0..DEFRAG_PENDING_PACKETS {
+                let mut fragment = packet(0);
+                fragment.mark = (round * DEFRAG_PENDING_PACKETS + index) as u32;
+                pending.push(PendingIpFragment::Ipv4(fragment)).unwrap();
+            }
+            for index in 0..DEFRAG_PENDING_PACKETS {
+                let PendingIpFragment::Ipv4(fragment) = pending.pop().unwrap() else {
+                    panic!("wrong protocol")
+                };
+                assert_eq!(
+                    fragment.mark,
+                    (round * DEFRAG_PENDING_PACKETS + index) as u32
+                );
+            }
+            assert_eq!(pending.len, 0);
+            assert_eq!(pending.bytes, 0);
+            assert_eq!(pending.packets.allocated_bytes(), storage);
+        }
     }
 
     #[test]
@@ -780,12 +827,12 @@ impl NetnsPoller {
         self.defrag_pending
             .lock()
             .as_ref()
-            .is_some_and(|queue| !queue.packets.is_empty())
+            .is_some_and(|queue| queue.len != 0)
     }
 
     fn reinject_ip(
         netns: &NetNamespace,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         first_origin: FragmentOrigin,
         completion: FragmentOrigin,
         broadcast: bool,
@@ -833,9 +880,6 @@ impl NetnsPoller {
             DefragSource::LocalInput => Some(CtPacketContext::Untracked),
             DefragSource::LinkIngress => None,
         };
-        // Preserve the already accepted legacy reassembly owner without an
-        // additional allocation or a new local-delivery failure condition.
-        let packet = PacketBuffer::from_existing_heap(packet);
         if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch_with_fragment(
             owner.as_ref(),
             completion.ingress_ifindex,

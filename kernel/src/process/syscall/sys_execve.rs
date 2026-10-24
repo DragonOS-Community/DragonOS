@@ -1,15 +1,10 @@
-#[allow(unused_imports)]
-use alloc::string::ToString;
-
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_EXECVE;
-use crate::filesystem::vfs::{MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES};
-use crate::mm::page::PAGE_4K_SIZE;
-use crate::mm::{access_ok, VirtAddr};
+use crate::filesystem::vfs::{fcntl::AtFlags, MAX_PATHLEN};
+use crate::process::exec_args::ExecArguments;
 use crate::process::execve::{do_execve, ExecFailure};
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::{check_and_clone_cstr_array, vfs_check_and_clone_cstr};
+use crate::syscall::user_access::vfs_check_and_clone_cstr;
 use alloc::{ffi::CString, string::String, vec::Vec};
 use log::error;
 use system_error::SystemError;
@@ -38,62 +33,35 @@ impl SysExecve {
         if path_ptr == 0 {
             return Err(SystemError::EINVAL);
         }
-        let virt_path_ptr = VirtAddr::new(path_ptr);
-        let virt_argv_ptr = VirtAddr::new(argv_ptr);
-        let virt_env_ptr = VirtAddr::new(env_ptr);
-
-        // 权限校验
-        if frame.is_from_user()
-            && (access_ok(virt_path_ptr, MAX_PATHLEN).is_err()
-                || access_ok(virt_argv_ptr, PAGE_4K_SIZE).is_err())
-            || access_ok(virt_env_ptr, PAGE_4K_SIZE).is_err()
-        {
-            return Err(SystemError::EFAULT);
-        }
+        // Each actual pathname/pointer/string read is checked by the protected
+        // importer. A page-sized numerical precheck rejects short valid arrays
+        // near the userspace boundary and does not establish readability.
+        let _ = (frame, argv_ptr, env_ptr);
         Ok(())
     }
 
-    pub fn basic_args(
+    pub(crate) fn basic_args(
+        dirfd: i32,
         path: *const u8,
         argv: *const *const u8,
         envp: *const *const u8,
-    ) -> Result<(CString, Vec<CString>, Vec<CString>), SystemError> {
-        let path: CString = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
-        let mut argv: Vec<CString> = check_and_clone_cstr_array(argv)?;
-        let envp: Vec<CString> = check_and_clone_cstr_array(envp)?;
-
-        // Linux 语义：当 argv 为空时，添加一个空字符串作为 argv[0]，使 argc = 1
-        // 这确保用户空间程序不会混淆，避免它们从 argv[1] 开始处理或意外遍历 envp
-        if argv.is_empty() {
-            argv.push(CString::new("").unwrap());
-        } else if !argv[0].is_empty() {
-            // 这里需要处理符号链接, 应用程序一般不支持嵌套符号链接
-            // 如 test -> echo -> busybox, 需要内核代为解析到 echo, 传入 test 则不会让程序执行 echo 命令
-            // 只有当 argv[0] 非空时才尝试解析符号链接
-            let root = ProcessManager::current_mntns().root_inode();
-            if let Ok(real_inode) = root.lookup_follow_symlink2(
-                argv[0].to_string_lossy().as_ref(),
-                VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                false,
-            ) {
-                // 只有当 absolute_path() 成功时才替换 argv[0]
-                // 如果失败（返回 ENOSYS），保持原路径不变
-                if let Ok(real_path) = real_inode.absolute_path() {
-                    argv[0] = CString::new(real_path).unwrap();
-                }
-            }
-        }
-
-        Ok((path, argv, envp))
+    ) -> Result<(CString, ExecArguments), SystemError> {
+        let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
+        let name = crate::process::execve::exec_visible_name(
+            dirfd,
+            path.to_str().map_err(|_| SystemError::EINVAL)?,
+        );
+        let arguments =
+            ExecArguments::from_user(&name, argv as usize, envp as usize)?.resolve_arg0()?;
+        Ok((path, arguments))
     }
 
-    pub fn execve(
+    pub(crate) fn execve(
         path: String,
-        argv: Vec<CString>,
-        envp: Vec<CString>,
+        arguments: ExecArguments,
         frame: &mut TrapFrame,
     ) -> Result<(), SystemError> {
-        let result = do_execve(&path, argv, envp, frame);
+        let result = do_execve(&path, arguments, frame);
         drop(path);
         result.map_err(ExecFailure::finish)
     }
@@ -111,7 +79,8 @@ impl Syscall for SysExecve {
 
         Self::check_args(frame, path_ptr, argv_ptr, env_ptr)?;
 
-        let (path, argv, envp) = Self::basic_args(
+        let (path, arguments) = Self::basic_args(
+            AtFlags::AT_FDCWD.bits(),
             path_ptr as *const u8,
             argv_ptr as *const *const u8,
             env_ptr as *const *const u8,
@@ -127,7 +96,7 @@ impl Syscall for SysExecve {
             return Err(SystemError::ENOENT);
         }
 
-        Self::execve(path, argv, envp, frame)?;
+        Self::execve(path, arguments, frame)?;
         return Ok(0);
     }
 

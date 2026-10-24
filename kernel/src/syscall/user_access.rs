@@ -648,55 +648,6 @@ pub fn vfs_check_and_clone_cstr(
     return do_check_and_clone_cstr(user, max_length, true);
 }
 
-/// Check and copy a C string array from user space
-///
-/// Stops copying when encountering a null pointer. Returns an error when encountering an invalid address.
-/// ## Arguments
-///
-/// - `user`: Pointer array to C strings in user space
-///
-/// ## Returns
-///
-/// Returns the copied C string array
-///
-/// ## Errors
-///
-/// - `EFAULT`: User space address is invalid
-pub fn check_and_clone_cstr_array(user: *const *const u8) -> Result<Vec<CString>, SystemError> {
-    if user.is_null() {
-        Ok(Vec::new())
-    } else {
-        // debug!("check_and_clone_cstr_array: {:p}\n", user);
-        let mut buffer = Vec::new();
-        for i in 0.. {
-            let addr = unsafe { user.add(i) };
-            let str_ptr: *const u8;
-            // Read the value at this address (which is also a pointer)
-            unsafe {
-                let dst = [0usize; 1];
-                let mut dst = core::mem::transmute::<[usize; 1], [u8; size_of::<usize>()]>(dst);
-
-                // 使用受异常表保护的版本
-                copy_from_user_protected(&mut dst, VirtAddr::new(addr as usize))?;
-
-                let dst = core::mem::transmute::<[u8; size_of::<usize>()], [usize; 1]>(dst);
-                str_ptr = dst[0] as *const u8;
-
-                // debug!("str_ptr: {:p}, addr:{addr:?}\n", str_ptr);
-            }
-
-            if str_ptr.is_null() {
-                break;
-            }
-            // Read the string pointed to by this pointer
-            let string = check_and_clone_cstr(str_ptr, None)?;
-            // Put the string into the buffer
-            buffer.push(string);
-        }
-        return Ok(buffer);
-    }
-}
-
 #[derive(Debug)]
 pub struct UserBufferWriter<'a> {
     buffer: &'a mut [u8],

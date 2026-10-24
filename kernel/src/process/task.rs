@@ -1067,6 +1067,14 @@ impl ProcessControlBlock {
             rlim_cur: pending_signals,
             rlim_max: pending_signals,
         };
+        // Linux fork_init() 同样把 init 任务的 RLIMIT_NPROC 设为 max_threads/2
+        // （kernel/fork.c）。留 0 会让 getrlimit/sysconf(_SC_CHILD_MAX) 返回 0：
+        // bash 的 bgpids 表在 c_childmax==0 时 bgp_reset 跳过分配却仍索引
+        // storage[0]，后台/命令替换子进程启动即空指针崩溃。
+        arr[RLimitID::Nproc as usize] = RLimit64 {
+            rlim_cur: pending_signals,
+            rlim_max: pending_signals,
+        };
 
         arr
     }

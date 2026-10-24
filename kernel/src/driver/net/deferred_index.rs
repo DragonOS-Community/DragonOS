@@ -1,5 +1,8 @@
-use alloc::vec::Vec;
+use super::local_queue::MAX_LOCAL_OUTPUT_FRAMES;
+use crate::libs::paged_vec::PagedVec;
 use system_error::SystemError;
+
+const MAX_INDEX_NODES: usize = MAX_LOCAL_OUTPUT_FRAMES * 2 - 1;
 
 pub(super) type NodeId = usize;
 pub(super) type RouteIndexKey = [u8; 21];
@@ -11,6 +14,8 @@ enum Node {
     Branch { bit: u8, children: [NodeId; 2] },
 }
 
+const _: () = assert!(PagedVec::<Node, MAX_INDEX_NODES>::layout_supported());
+
 /// A fallibly allocated Patricia index for complete (family, ifindex, address) keys.
 ///
 /// Branch bits strictly increase from root to leaf, bounding every lookup by
@@ -18,7 +23,7 @@ enum Node {
 /// stable across removals so heap swaps can update leaf slots in O(1).
 #[derive(Debug, Default)]
 pub(super) struct DeferredRouteIndex {
-    nodes: Vec<Node>,
+    nodes: PagedVec<Node, MAX_INDEX_NODES>,
     root: Option<NodeId>,
     free_head: Option<NodeId>,
     free_count: usize,
@@ -41,16 +46,32 @@ impl DeferredRouteIndex {
         }
     }
 
-    pub(super) fn try_reserve_insert(&mut self) -> Result<(), SystemError> {
-        let required: usize = if self.root.is_some() { 2 } else { 1 };
+    /// Prepare the worst-case live binary tree before packet emission. Free
+    /// node IDs count as reusable slots, not as additional live ownership.
+    pub(super) fn prepare_capacity(&mut self, leaves: usize) -> Result<(), SystemError> {
+        if leaves > MAX_LOCAL_OUTPUT_FRAMES {
+            return Err(SystemError::ENOBUFS);
+        }
+        let required = leaves.saturating_mul(2).saturating_sub(1);
+        let live = self.nodes.len() - self.free_count;
+        let additional_live = required.saturating_sub(live);
         self.nodes
-            .try_reserve(required.saturating_sub(self.free_count))
-            .map_err(|_| SystemError::ENOMEM)
+            .try_reserve(additional_live.saturating_sub(self.free_count))
     }
 
-    /// Inserts a key after `try_reserve_insert`; this method cannot allocate.
+    pub(super) fn has_insert_capacity(&self) -> bool {
+        let required = if self.root.is_some() { 2 } else { 1 };
+        self.leaves < MAX_LOCAL_OUTPUT_FRAMES
+            && self.nodes.capacity() - self.nodes.len() + self.free_count >= required
+    }
+
+    /// Inserts a key after `prepare_capacity`; this method cannot allocate.
     pub(super) fn insert_prepared(&mut self, key: RouteIndexKey, slot: usize) -> NodeId {
         debug_assert!(self.get(key).is_none());
+        assert!(
+            self.has_insert_capacity(),
+            "Patricia insert without prepared capacity"
+        );
         let Some(root) = self.root else {
             let leaf = self.alloc_prepared(Node::Leaf { key, slot });
             self.root = Some(leaf);
@@ -233,7 +254,7 @@ mod tests {
             keys.push(key);
         }
         for (slot, key) in keys.iter().copied().enumerate() {
-            index.try_reserve_insert().unwrap();
+            index.prepare_capacity(index.len() + 1).unwrap();
             index.insert_prepared(key, slot);
         }
         assert_eq!(index.len(), keys.len());
@@ -251,11 +272,43 @@ mod tests {
         }
         assert_eq!(index.len(), 0);
         for (slot, key) in keys.iter().copied().enumerate().rev() {
-            index.try_reserve_insert().unwrap();
+            index.prepare_capacity(index.len() + 1).unwrap();
             index.insert_prepared(key, slot);
         }
         for (slot, key) in keys.iter().copied().enumerate() {
             assert_eq!(index.get(key).unwrap().1, slot);
+        }
+    }
+
+    #[test]
+    fn worst_case_capacity_is_prepared_and_node_ids_are_reused() {
+        let mut index = DeferredRouteIndex::default();
+        index.prepare_capacity(MAX_LOCAL_OUTPUT_FRAMES).unwrap();
+        let key = |slot: usize| {
+            let mut key = [0; 21];
+            key[..core::mem::size_of::<usize>()].copy_from_slice(&slot.to_be_bytes());
+            key
+        };
+        for slot in 0..MAX_LOCAL_OUTPUT_FRAMES {
+            assert!(index.has_insert_capacity());
+            index.insert_prepared(key(slot), slot);
+        }
+        assert_eq!(index.nodes.len(), MAX_INDEX_NODES);
+        assert!(!index.has_insert_capacity());
+        assert_eq!(
+            index.prepare_capacity(MAX_LOCAL_OUTPUT_FRAMES + 1),
+            Err(SystemError::ENOBUFS)
+        );
+        for slot in (0..MAX_LOCAL_OUTPUT_FRAMES).rev() {
+            assert_eq!(index.remove(key(slot)), Some(slot));
+        }
+        let allocated = index.nodes.len();
+        for slot in 0..MAX_LOCAL_OUTPUT_FRAMES {
+            index.insert_prepared(key(slot), slot + 7);
+        }
+        assert_eq!(index.nodes.len(), allocated);
+        for slot in 0..MAX_LOCAL_OUTPUT_FRAMES {
+            assert_eq!(index.get(key(slot)).unwrap().1, slot + 7);
         }
     }
 }

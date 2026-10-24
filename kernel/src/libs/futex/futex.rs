@@ -103,8 +103,7 @@ impl DerefMut for FutexRegistryGuard {
 }
 impl Drop for FutexRegistryGuard {
     fn drop(&mut self) {
-        let retired =
-            core::mem::replace(&mut self.0.as_mut().unwrap().retired, WaitQueueNodes::new());
+        let retired = core::mem::take(&mut self.0.as_mut().unwrap().retired);
         drop(self.0.take());
         drop(retired);
     }

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::driver::net::{
     inject_owned_local_ip_packet_if_epoch, types::InterfaceFlags, veth::VethInterface, Iface,
-    LocalPacketOrigin,
+    LocalPacketOrigin, PacketBuffer,
 };
 use crate::process::namespace::net_namespace::{
     DefragSource, NetNamespace, PendingIpFragment, PendingIpv4Fragment, PendingIpv6Fragment,
@@ -203,7 +203,7 @@ impl RoutedIngressWork {
                 target.as_ref(),
                 ingress_ifindex,
                 source_mac,
-                packet,
+                PacketBuffer::from_existing_heap(packet),
                 broadcast,
                 LocalPacketOrigin::LinkIngressPreRouted,
                 Some(ct_context),

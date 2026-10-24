@@ -176,6 +176,10 @@ pub(crate) struct TcpOutputDevice<'a> {
 pub(crate) struct TcpTxToken<'a>(LocalInputTxToken<'a>);
 
 impl SmolTxToken for TcpTxToken<'_> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        self.0.prepare_buffer(len)
+    }
+
     fn deferred_ip_output(&self, _: smoltcp::wire::IpVersion) -> bool {
         true
     }

@@ -68,6 +68,31 @@ impl KernelBuffer {
         Self::try_new_zeroed_layout(layout)
     }
 
+    /// CPU owners that must avoid every higher-order allocation use this
+    /// explicit mapping route, rather than changing ordinary scratch policy.
+    pub(crate) fn try_new_zeroed_virtual(len: usize) -> Result<Self, MemoryAllocationError> {
+        if !vmalloc::task_context() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+        let layout = Layout::array::<u8>(len).map_err(|_| SystemError::ENOMEM)?;
+        let owner = object_for_task(&ProcessManager::current_pcb());
+        let allocation = VmAllocation::try_new_zeroed_in(layout, &owner)?;
+        Ok(Self {
+            backend: Backend::Virtual(allocation),
+        })
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn try_new_zeroed_virtual_in(
+        len: usize,
+        owner: &Arc<ObjectAccount>,
+    ) -> Result<Self, MemoryAllocationError> {
+        let layout = Layout::array::<u8>(len).map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self {
+            backend: Backend::Virtual(VmAllocation::try_new_zeroed_in(layout, owner)?),
+        })
+    }
+
     fn try_new_zeroed_layout(layout: Layout) -> Result<Self, MemoryAllocationError> {
         if !vmalloc::task_context() {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());

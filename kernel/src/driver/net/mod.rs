@@ -1,4 +1,4 @@
-use alloc::collections::VecDeque;
+pub use crate::mm::cpu_buffer::CpuBuffer as PacketBuffer;
 use alloc::ffi::CString;
 use alloc::sync::Weak;
 use alloc::{fmt, vec::Vec};

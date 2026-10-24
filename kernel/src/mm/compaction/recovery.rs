@@ -20,15 +20,19 @@ use crate::{
 
 const DMA32_END: usize = 1usize << 32;
 
-struct Service {
+pub(super) struct Service {
     compactor: Compactor,
     cursor: usize,
+    #[cfg(feature = "mm_selftest")]
+    pub(super) last_moved: usize,
 }
 impl Service {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             compactor: Compactor::new(),
             cursor: 0,
+            #[cfg(feature = "mm_selftest")]
+            last_moved: 0,
         }
     }
 }
@@ -72,13 +76,17 @@ pub(crate) fn allocate(
 }
 
 impl Service {
-    fn allocate(
+    pub(super) fn allocate(
         &mut self,
         order: usize,
         max: PhysAddr,
         zone: DmaRecoveryZone,
         deadline: Option<u64>,
     ) -> Result<CompactedFrames, Stop> {
+        #[cfg(feature = "mm_selftest")]
+        {
+            self.last_moved = 0;
+        }
         if deadline.is_some_and(|until| crate::time::timer::clock() >= until) {
             return Err(Stop::Timeout);
         }
@@ -104,7 +112,12 @@ impl Service {
             // position so the next real attempt cannot skip it in lockstep with
             // the domain's exponential backoff.
             request.deadline = deadline;
-            let outcome = self.compactor.allocate(request).outcome;
+            let attempt = self.compactor.allocate(request);
+            #[cfg(feature = "mm_selftest")]
+            {
+                self.last_moved = attempt.stats.moved;
+            }
+            let outcome = attempt.outcome;
             if matches!(&outcome, Err(Stop::Deferred)) {
                 self.cursor = cursor_before;
             }

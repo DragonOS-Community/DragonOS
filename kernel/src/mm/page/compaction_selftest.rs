@@ -752,7 +752,13 @@ fn dma_capacity_recovery() -> (bool, alloc::string::String) {
         if free < 2 * DMA_HEADROOM_PAGES {
             return Err(SystemError::ENOMEM);
         }
-        let end = ((free / 2).min(16384) * MMArch::PAGE_SIZE).min(DMA32_END);
+        // A debug/CI kernel can occupy the whole first 64 MiB. Derive the
+        // search domain from available capacity like the other DMA fixtures;
+        // even exhausting this prefix leaves at least half the free inventory.
+        let end = (free / 2)
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?
+            .min(DMA32_END);
         let mut entries = 65536;
         phase = "fixture_run";
         // The range/isolation helper handles high-order runs. Donate its two
@@ -1544,6 +1550,287 @@ fn dma_occupied_layout() -> ((bool, bool, bool, bool, bool), alloc::string::Stri
     ))
 }
 
+// Wait using the ordinary guest timer, never a test-only worker wake or pause.
+fn background_idle_until(
+    deadline: u64,
+) -> Result<Option<crate::mm::compaction::background::selftest::Observation>, SystemError> {
+    loop {
+        let observed = crate::mm::compaction::background::selftest::observe();
+        if observed.pending == 0 && observed.active == 0 && observed.deadline == 0 {
+            return Ok(Some(observed));
+        }
+        if crate::time::timer::clock() >= deadline {
+            return Ok(None);
+        }
+        crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 1_000_000))?;
+    }
+}
+
+// Prepare capacity before holding the registry. These are real fixed-frame
+// owners, not a candidate override: they prevent unrelated data from consuming
+// this fixture's free holes while the real worker discovers its sources.
+fn pin_foreign_dma_sources(
+    fixture: &Fixture,
+    end: usize,
+) -> Result<(Vec<super::access::PageAccessPin>, usize), SystemError> {
+    for _ in 0..8 {
+        let len = page_manager_lock().phys2page.len();
+        let mut pins = Vec::new();
+        pins.try_reserve_exact(len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let Some(mut manager) = try_page_manager_lock() else {
+            crate::sched::sched_yield();
+            continue;
+        };
+        if manager.phys2page.len() > pins.capacity() {
+            drop(manager);
+            continue;
+        }
+        let buckets = manager.phys2page.raw_table().buckets();
+        let mut busy = false;
+        for (physical, page) in &manager.phys2page {
+            if physical.data() >= end
+                || fixture
+                    .sources
+                    .iter()
+                    .any(|source| source.physical == *physical)
+            {
+                continue;
+            }
+            match page.try_pin_access() {
+                Ok(pin) => pins.push(pin),
+                Err(_) => {
+                    busy = true;
+                    break;
+                }
+            }
+        }
+        drop(manager);
+        if !busy {
+            return Ok((pins, buckets));
+        }
+        // Page owners and their pin counts must retire outside the registry.
+        drop(pins);
+        crate::sched::sched_yield();
+    }
+    Err(SystemError::EBUSY)
+}
+
+fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
+    use crate::mm::compaction::background::selftest::observe;
+    let mut detail = alloc::string::String::new();
+    let mut phase = "initial_idle";
+    let mut rounds = 0;
+    let result = (|| -> Result<(bool, bool, bool), SystemError> {
+        let initial =
+            background_idle_until(crate::time::timer::next_n_us_timer_jiffies(2_000_000))?
+                .ok_or(SystemError::ETIMEDOUT)?;
+        let free = unsafe { LockedFrameAllocator.usage() }.free().data();
+        if free < 2 * DMA_HEADROOM_PAGES {
+            return Err(SystemError::ENOMEM);
+        }
+        let end = (free / 2)
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?
+            .min(DMA32_END);
+        phase = "fixture";
+        let mut fixture =
+            Fixture::with_range(false, false, Some((PhysAddr::new(0), PhysAddr::new(end))))?;
+        let prefix_end = fixture.base.unwrap().data() + BACKING * MMArch::PAGE_SIZE;
+        let mut prefix = PrefixReservations::new(prefix_end)?;
+        let mut foreign = Vec::new();
+        foreign
+            .try_reserve_exact(prefix_end / (DMA_REQUEST_PAGES * MMArch::PAGE_SIZE))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut pins = Vec::new();
+        pins.try_reserve_exact(SOURCES)
+            .map_err(|_| SystemError::ENOMEM)?;
+        phase = "foreign_pins";
+        let (foreign_pins, buckets) = pin_foreign_dma_sources(&fixture, prefix_end)?;
+        let round_bound = buckets.div_ceil(super::COMPACTION_DISCOVERY_BUCKETS) + SOURCES + 1;
+        prefix.hold_remaining()?;
+        let exercise = (|| -> Result<(bool, bool, bool), SystemError> {
+            fixture.release_holes();
+            let ordinary = DmaAllocOptions {
+                dma_mask: Some((prefix_end - 1) as u64),
+                use_pool: false,
+                ..DmaAllocOptions::default()
+            };
+            phase = "baseline";
+            let baseline = dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
+                DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, ordinary)
+            });
+            let unavailable = matches!(baseline, Err(SystemError::ENOMEM));
+            drop(baseline);
+            if !unavailable || !fixture.valid() {
+                return Ok((false, false, false));
+            }
+            let mut recovered = None;
+            // Each new failure authorizes one round. With foreign data pinned, a
+            // complete registry traversal plus the fixture identities covers the
+            // eligible input. Include the real maximum slot cooldown per round.
+            let deadline = crate::time::timer::next_n_us_timer_jiffies(
+                (round_bound as u64).saturating_mul(1_100_000),
+            );
+            for _ in 0..round_bound {
+                if crate::time::timer::clock() >= deadline {
+                    break;
+                }
+                phase = "real_pinned_request";
+                for index in 0..SOURCES {
+                    pins.push(
+                        fixture
+                            .source_page(index)
+                            .ok_or(SystemError::EFAULT)?
+                            .try_pin_access()
+                            .map_err(|_| SystemError::EBUSY)?,
+                    );
+                }
+                let before = observe();
+                let allocation = dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
+                    DmaBuffer::try_alloc_pages(
+                        DMA_REQUEST_PAGES,
+                        DmaAllocOptions {
+                            compaction: DmaCompaction::DirectAndBackground,
+                            ..ordinary
+                        },
+                    )
+                });
+                // A worker racing before these real data pins are removed may
+                // legitimately stop. Only a new failed request authorizes a new round.
+                pins.clear();
+                if let Ok(buffer) = allocation {
+                    recovered = Some(buffer);
+                    break;
+                }
+                if !matches!(allocation, Err(SystemError::ENOMEM)) {
+                    return Err(allocation.err().unwrap());
+                }
+                if observe().requests == before.requests {
+                    phase = "no_fragmented_handoff";
+                    break;
+                }
+                rounds += 1;
+                phase = "worker_consumption";
+                let Some(after) = background_idle_until(deadline)? else {
+                    break;
+                };
+                if after.moved > initial.moved {
+                    // This retry has no direct-recovery permission. It cannot
+                    // manufacture the migration evidence attributed to the worker.
+                    match DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, ordinary) {
+                        Ok(buffer) => {
+                            recovered = Some(buffer);
+                            break;
+                        }
+                        Err(SystemError::ENOMEM) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            phase = "final_idle";
+            let final_state =
+                background_idle_until(crate::time::timer::next_n_us_timer_jiffies(3_000_000))?
+                    .ok_or(SystemError::ETIMEDOUT)?;
+            let triggered = unavailable
+                && final_state.requests > initial.requests
+                && final_state.rounds > initial.rounds;
+            let migrated =
+                final_state.compactions > initial.compactions && final_state.moved > initial.moved;
+            let ownership = recovered.as_ref().is_some_and(|buffer| {
+                buffer.page_count().data() == DMA_REQUEST_PAGES
+                    && buffer
+                        .paddr()
+                        .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
+                    && buffer.paddr() + buffer.len() <= prefix_end
+                    && buffer.as_slice().iter().all(|byte| *byte == 0)
+            }) && fixture.valid();
+            if let Some(buffer) = recovered.as_mut() {
+                buffer.as_mut_slice().fill(0x96);
+            }
+            let contents = recovered
+                .as_ref()
+                .is_some_and(|buffer| buffer.as_slice().iter().all(|byte| *byte == 0x96))
+                && fixture.valid();
+            phase = "idle_observation";
+            crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 20_000_000))?;
+            let quiet = observe();
+            let idle = quiet.requests == final_state.requests
+                && quiet.rounds == final_state.rounds
+                && quiet.moved == final_state.moved
+                && quiet.pending == 0
+                && quiet.active == 0
+                && quiet.deadline == 0;
+            let _ = writeln!(detail, "requests={} rounds={} compactions={} moved={} legal_requests={rounds} captured={} idle={idle}",
+                final_state.requests - initial.requests, final_state.rounds - initial.rounds,
+                final_state.compactions - initial.compactions, final_state.moved - initial.moved, recovered.is_some());
+            let fixture_moved = fixture
+                .sources
+                .iter()
+                .filter(|source| {
+                    let index =
+                        (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
+                    fixture
+                        .source_page(index)
+                        .is_some_and(|page| page.phys_address() != source.physical)
+                })
+                .count();
+            let stops: [u64; 7] =
+                core::array::from_fn(|index| final_state.stops[index] - initial.stops[index]);
+            let final_buckets = page_manager_lock().phys2page.raw_table().buckets();
+            let _ = writeln!(detail, "foreign_pins={} buckets={buckets}/{final_buckets} round_bound={round_bound} fixture_moved={fixture_moved} stops={stops:?}", foreign_pins.len());
+            drop(recovered);
+            Ok((
+                triggered,
+                migrated && ownership && contents && buckets == final_buckets,
+                idle,
+            ))
+        })();
+        // The exercise may leave on any error, including with an in-flight
+        // one-shot request. Release its temporary source pins, then quiesce
+        // using a fresh cleanup budget before releasing any fixture owner.
+        pins.clear();
+        let cleanup = background_idle_until(crate::time::timer::next_n_us_timer_jiffies(3_000_000));
+        let quiescent = matches!(&cleanup, Ok(Some(_)));
+        if exercise.is_err() || !quiescent {
+            let state = observe();
+            let stops: [u64; 7] =
+                core::array::from_fn(|index| state.stops[index] - initial.stops[index]);
+            let fixture_moved = fixture
+                .sources
+                .iter()
+                .filter(|source| {
+                    let index =
+                        (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
+                    fixture
+                        .source_page(index)
+                        .is_some_and(|page| page.phys_address() != source.physical)
+                })
+                .count();
+            let _ = writeln!(detail, "cleanup_quiet={quiescent} foreign_pins={} buckets={buckets} round_bound={round_bound} fixture_moved={fixture_moved} requests={} rounds={} moved={} stops={stops:?}",
+                foreign_pins.len(), state.requests-initial.requests, state.rounds-initial.rounds, state.moved-initial.moved);
+        }
+        drop(foreign);
+        drop(prefix);
+        drop(foreign_pins);
+        let passed =
+            fixture.finish(quiescent && exercise.as_ref().is_ok_and(|(_, valid, _)| *valid));
+        if !quiescent {
+            phase = "cleanup_idle";
+            return Err(cleanup.err().unwrap_or(SystemError::ETIMEDOUT));
+        }
+        let (triggered, _, idle) = exercise?;
+        phase = "complete";
+        Ok((triggered, passed, idle))
+    })();
+    let _ = writeln!(
+        detail,
+        "phase={phase} error={:?} legal_requests={rounds}",
+        result.as_ref().err()
+    );
+    (result.unwrap_or((false, false, false)), detail)
+}
+
 pub(crate) fn report() -> alloc::string::String {
     let _serial = TEST_LOCK.lock();
     let mut deferred_detail = alloc::string::String::new();
@@ -1617,6 +1904,14 @@ pub(crate) fn report() -> alloc::string::String {
         ("dma_occupied_automatic_recovery", layout_recovered),
     ]);
     checks.extend(crate::mm::allocator::buddy::compaction::selftest_checks());
+    checks.extend(crate::mm::compaction::background::selftest::checks());
+    let ((background_triggered, background_migrated, background_idle), background_detail) =
+        dma_background_recovery();
+    checks.extend([
+        ("dma_background_real_request", background_triggered),
+        ("dma_background_migration_retry", background_migrated),
+        ("dma_background_idle", background_idle),
+    ]);
     let failed = checks.iter().filter(|(_, passed)| !passed).count();
     let mut output = alloc::format!("status={}\n", if failed == 0 { "ok" } else { "fail" });
     for (name, passed) in checks {
@@ -1627,6 +1922,7 @@ pub(crate) fn report() -> alloc::string::String {
     let _ = writeln!(output, "cold_workspace_detail={cold_detail}");
     let _ = writeln!(output, "dma_recovery_detail={dma_detail}");
     let _ = writeln!(output, "dma_occupied_layout_detail={layout_detail}");
+    let _ = writeln!(output, "dma_background_detail=[{background_detail}]");
     let _ = writeln!(output, "summary_fail={failed}");
     output
 }

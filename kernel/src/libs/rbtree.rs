@@ -63,6 +63,19 @@ where
 pub struct PreparedNode<K: Ord + Debug, V: Debug>(Box<RBTreeNode<K, V>>);
 
 impl<K: Ord + Debug, V: Debug> PreparedNode<K, V> {
+    pub(crate) fn allocation_layout() -> core::alloc::Layout {
+        core::alloc::Layout::new::<RBTreeNode<K, V>>()
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut V {
+        &mut self.0.value
+    }
+
+    /// Free detached storage before releasing the returned value's resources.
+    pub(crate) fn into_pair(self) -> (K, V) {
+        self.0.pair()
+    }
+
     pub fn try_new(key: K, value: V) -> Result<Self, core::alloc::AllocError> {
         Box::try_new(RBTreeNode {
             color: Color::Black,
@@ -282,7 +295,7 @@ impl<K: Ord + Debug, V: Debug> NodePtr<K, V> {
     }
 
     #[inline]
-    fn null() -> NodePtr<K, V> {
+    const fn null() -> NodePtr<K, V> {
         NodePtr(ptr::null_mut())
     }
 
@@ -863,7 +876,7 @@ impl<K: Ord + Debug, V: Debug> Default for RBTree<K, V> {
 
 impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
     /// Creates an empty `RBTree`.
-    pub fn new() -> RBTree<K, V> {
+    pub const fn new() -> RBTree<K, V> {
         RBTree {
             root: NodePtr::null(),
             len: 0,
@@ -1254,6 +1267,36 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
         self.len = 0;
     }
 
+    /// First key strictly greater than `key`; no iterator allocation.
+    pub(crate) fn upper_bound(&self, key: &K) -> Option<(&K, &V)> {
+        let mut cursor = self.root;
+        let mut found = NodePtr::null();
+        while !cursor.is_null() {
+            unsafe {
+                if (*cursor.0).key > *key {
+                    found = cursor;
+                    cursor = cursor.left();
+                } else {
+                    cursor = cursor.right();
+                }
+            }
+        }
+        if found.is_null() {
+            None
+        } else {
+            unsafe { Some((&(*found.0).key, &(*found.0).value)) }
+        }
+    }
+
+    /// Detach without deallocating, for retirement after releasing an IRQ lock.
+    pub(crate) fn extract(&mut self, key: &K) -> Option<PreparedNode<K, V>> {
+        let node = self.find_node(key);
+        if node.is_null() {
+            return None;
+        }
+        unsafe { Some(self.detach_node(node)) }
+    }
+
     #[inline]
     pub fn remove(&mut self, k: &K) -> Option<V> {
         let node = self.find_node(k);
@@ -1337,6 +1380,10 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
 
     #[inline]
     unsafe fn delete(&mut self, node: NodePtr<K, V>) -> (K, V) {
+        self.detach_node(node).into_pair()
+    }
+
+    unsafe fn detach_node(&mut self, node: NodePtr<K, V>) -> PreparedNode<K, V> {
         let mut child;
         let mut parent;
         let color;
@@ -1380,8 +1427,11 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
                 self.delete_fixup(child, parent);
             }
 
-            let obj = Box::from_raw(node.0);
-            return obj.pair();
+            let mut obj = Box::from_raw(node.0);
+            obj.left = NodePtr::null();
+            obj.right = NodePtr::null();
+            obj.parent = NodePtr::null();
+            return PreparedNode(obj);
         }
 
         if !node.left().is_null() {
@@ -1408,8 +1458,11 @@ impl<K: Ord + Debug, V: Debug> RBTree<K, V> {
             self.delete_fixup(child, parent);
         }
 
-        let obj = Box::from_raw(node.0);
-        return obj.pair();
+        let mut obj = Box::from_raw(node.0);
+        obj.left = NodePtr::null();
+        obj.right = NodePtr::null();
+        obj.parent = NodePtr::null();
+        PreparedNode(obj)
     }
 
     /// Return the keys iter
@@ -1890,5 +1943,55 @@ mod prepared_tests {
             assert_eq!(tree.pop_first(), Some((key, key * 2)));
         }
         assert!(tree.pop_first().is_none());
+    }
+    #[test]
+    fn detached_nodes_keep_values_and_balance_across_reinsertion() {
+        use alloc::{collections::BTreeMap, sync::Arc};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Probe(usize, Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut tree = RBTree::new();
+        let mut reference = BTreeMap::new();
+        for index in 0..1024 {
+            let key = (index * 577) % 1024;
+            tree.insert_prepared(PreparedNode::try_new(key, Probe(key, dropped.clone())).unwrap());
+            reference.insert(key, key);
+        }
+        for index in 0..1024 {
+            let key = (index * 733) % 1024;
+            let mut node = tree.extract(&key).unwrap();
+            reference.remove(&key);
+            assert_eq!(node.value_mut().0, key);
+            assert_eq!(dropped.load(Ordering::Relaxed), index / 2);
+            // Reinsert the same physical node under its original key, exercising
+            // root/two-child/leaf removals without allocating replacement nodes.
+            if index % 2 == 0 {
+                tree.insert_prepared(node);
+                reference.insert(key, key);
+            } else {
+                drop(node.into_pair());
+            }
+            assert_eq!(tree.len(), reference.len());
+            assert!(tree.keys().copied().eq(reference.keys().copied()));
+            for bound in [0, key, 1023, 1024] {
+                let expected = reference
+                    .range((
+                        core::ops::Bound::Excluded(bound),
+                        core::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .map(|(&k, _)| k);
+                assert_eq!(tree.upper_bound(&bound).map(|(&k, _)| k), expected);
+            }
+        }
+        assert!(tree.extract(&2048).is_none());
+        drop(tree);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1024);
     }
 }

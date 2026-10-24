@@ -429,6 +429,22 @@ load_cr3:
     jmp to_switch_seg
 
 load_apu_cr3:
+    // APs must interpret NX entries before adopting the BSP's normal page
+    // tables. Even a data read from an NX page faults with RSVD when NXE=0.
+    // This bootstrap mapping has no NX bits and needs no stack here.
+    movl $0x80000000, %eax
+    cpuid
+    cmpl $0x80000001, %eax
+    jb .Lapu_nxe_ready
+    movl $0x80000001, %eax
+    cpuid
+    btl $20, %edx
+    jnc .Lapu_nxe_ready
+    movl $0xC0000080, %ecx
+    rdmsr
+    btsl $11, %eax
+    wrmsr
+.Lapu_nxe_ready:
     // 由于内存管理模块重置了页表，因此ap核心初始化的时候，需要使用新的内核页表。
     // 这个页表的值由smp模块设置到__APU_START_CR3变量中
     // 加载__APU_START_CR3中的值

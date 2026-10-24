@@ -17,9 +17,9 @@ use crate::init::{
 /// 全局内核日志级别配置
 ///
 /// 遵循Linux内核语义：
-/// - console_loglevel: 控制台输出级别，只有级别小于等于此值的消息才会输出
+/// - console_loglevel: 控制台输出级别，只有级别小于此值的消息才会输出
 /// - default_message_loglevel: 默认消息级别
-/// - minimum_console_loglevel: 最小控制台级别
+/// - minimum_console_loglevel: 最小控制台阈值
 /// - default_console_loglevel: 默认控制台级别
 pub static KERNEL_LOG_LEVEL: KernelLogLevel = KernelLogLevel::new();
 
@@ -76,7 +76,7 @@ impl From<::log::Level> for LogLevel {
 #[derive(Debug)]
 pub struct KernelLogLevel {
     /// 控制台输出级别 (console_loglevel)
-    /// 只有级别小于等于此值的消息才会输出到控制台
+    /// 只有级别小于此值的消息才会输出到控制台
     pub console_level: AtomicU8,
     /// 默认消息级别 (default_message_loglevel)
     pub default_message_level: AtomicU8,
@@ -92,7 +92,7 @@ impl KernelLogLevel {
     /// 默认值遵循Linux内核标准：
     /// - console_loglevel: 7 (默认输出INFO及以上级别，不输出DEBUG)
     /// - default_message_loglevel: 4 (WARNING)
-    /// - minimum_console_loglevel: 1 (ALERT)
+    /// - minimum_console_loglevel: 1 (仅 EMERG 输出)
     /// - default_console_loglevel: 7
     pub const fn new() -> Self {
         Self {
@@ -148,7 +148,7 @@ impl KernelLogLevel {
         self.default_message_level.load(Ordering::Acquire)
     }
 
-    /// 获取最小控制台级别
+    /// 获取最小控制台阈值
     pub fn get_minimum_level(&self) -> u8 {
         self.minimum_level.load(Ordering::Acquire)
     }
@@ -175,7 +175,7 @@ impl KernelLogLevel {
 /// loglevel命令行参数处理
 ///
 /// 支持格式：loglevel=N (N=0-8)
-/// 示例：loglevel=4 只输出WARNING及以上级别的日志
+/// 示例：loglevel=4 只输出ERROR及更严重的日志
 /// 示例：loglevel=8 输出DEBUG及以上级别的日志
 #[linkme::distributed_slice(KCMDLINE_PARAM_KV)]
 static LOGLEVEL_PARAM: KernelCmdlineParameter = KernelCmdlineParameter::KV(KernelCmdlineKV {

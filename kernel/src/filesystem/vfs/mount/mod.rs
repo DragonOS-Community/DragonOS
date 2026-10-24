@@ -653,6 +653,10 @@ pub struct MountFS {
     /// Marks a covered topper reparented onto a propagated underlay root.
     /// The edge role is copied with the mount object.
     tucked_under: AtomicBool,
+    /// Kernel automount origin, equivalent to Linux MNT_SHRINKABLE. This is
+    /// entry state, not a userspace MS_SUBMOUNT flag or a superblock property.
+    /// Set before publication and retained by mount clones.
+    shrinkable: AtomicBool,
     /// The inode of the mount point where this filesystem is mounted
     self_mountpoint: RwSem<Option<Arc<MountFSInode>>>,
     /// Weak reference to this MountFS
@@ -2053,6 +2057,7 @@ impl MountFS {
             wrapper_cache: Mutex::new(MountWrapperCache::default()),
             mountpoints: Mutex::new(HashMap::new()),
             tucked_under: AtomicBool::new(false),
+            shrinkable: AtomicBool::new(false),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: RwSem::new(MountNamespaceMembership::default()),
@@ -2117,6 +2122,7 @@ impl MountFS {
             wrapper_cache: Mutex::new(MountWrapperCache::default()),
             mountpoints: Mutex::new(HashMap::new()),
             tucked_under: AtomicBool::new(self.tucked_under.load(Ordering::Acquire)),
+            shrinkable: AtomicBool::new(self.shrinkable.load(Ordering::Acquire)),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: RwSem::new(MountNamespaceMembership::default()),
@@ -3752,9 +3758,81 @@ impl MountFS {
         Self::umount_subtree_with_mode(&self.self_ref(), false)
     }
 
-    /// Detach a complete mount subtree, deepest mounts first. Ordinary umount
-    /// performs one preflight busy check so it cannot partially detach merely
-    /// because a descendant owns an external path/file reference.
+    /// Reclaim idle kernel automounts under the topology/admission lock. Like
+    /// Linux's shrink_submounts(), repeat only after a successful removal:
+    /// propagation can change a previously visited sibling's leaf status.
+    fn shrink_submounts_locked(
+        root: &Arc<MountFS>,
+        retired: &mut Vec<Vec<Arc<MountFS>>>,
+    ) -> Result<(), SystemError> {
+        loop {
+            let mut pending = root.try_mount_children()?;
+            let mut candidates = Vec::new();
+            while let Some(mount) = pending.pop() {
+                // Do not descend through an ordinary user mount to reclaim an
+                // automount below it: that branch is busy for the parent umount.
+                if !mount.shrinkable.load(Ordering::Acquire) {
+                    continue;
+                }
+                let children = mount.try_mount_children()?;
+                pending
+                    .try_reserve(children.len())
+                    .map_err(|_| SystemError::ENOMEM)?;
+                pending.extend(children);
+                candidates.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                candidates.push(mount);
+            }
+            let mut progress = false;
+            for mount in candidates.into_iter().rev() {
+                // A propagated removal can also retire the requested root and
+                // restore a cover outside it. Never continue reclaiming from
+                // that stale candidate snapshot after losing the root edge.
+                if !root.is_live() {
+                    return Err(SystemError::EINVAL);
+                }
+                // A previous propagation commit can have removed another local
+                // candidate. Only a current, unpinned leaf can be reclaimed.
+                if !mount.is_live()
+                    || mount
+                        .mountpoints
+                        .lock()
+                        .values()
+                        .any(|stack| !stack.is_empty())
+                    || mount.has_external_pins()
+                {
+                    continue;
+                }
+                let mountpoint = mount.self_mountpoint().ok_or(SystemError::EINVAL)?;
+                if propagation_umount_busy(&mountpoint.mount_fs(), &mountpoint) {
+                    continue;
+                }
+                // Reserve the shutdown-owner batch before the topology commit.
+                // No failure after a successful detach may lose a retired peer.
+                retired.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                mount.lifecycle.lock().state = MountLifecycleState::Detaching;
+                let removed = match propagate_umount_sources(core::slice::from_ref(&mount), false) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        mount.lifecycle.lock().state = MountLifecycleState::Live;
+                        return Err(error);
+                    }
+                };
+                mount
+                    .commit_umount_at(&mountpoint, false)
+                    .expect("prepared automount edge commit cannot fail");
+                retired.push(removed);
+                progress = true;
+            }
+            if !progress {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Ordinary umount first reclaims idle automounts, then checks the remaining
+    /// subtree for real owners/ordinary submounts. Like Linux, idle siblings may
+    /// be reclaimed even when another busy child makes the parent return EBUSY.
+    /// Lazy detach keeps its existing complete-subtree behavior.
     pub fn umount_subtree_with_mode(
         root: &Arc<MountFS>,
         lazy: bool,
@@ -3773,81 +3851,97 @@ impl MountFS {
         // Potentially sleeping metadata reads happen without the topology lock.
         let mounts = {
             let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-            let mounts = collect(root);
-            // Linux's ordinary do_umount() leaves non-shrinkable submounts in
-            // place and reports EBUSY; only MNT_DETACH disconnects a complete
-            // subtree. DragonOS currently has no transient shrinkable mount
-            // class, so every visible child is busy here.
-            if !lazy && mounts.len() != 1 {
-                return Err(SystemError::EBUSY);
-            }
-            mounts
+            collect(root)
         };
-        let mut super_blocks = Vec::new();
-        for mount in &mounts {
-            let state = mount.super_block_state();
-            if !super_blocks
-                .iter()
-                .any(|existing| Arc::ptr_eq(existing, &state))
-            {
-                super_blocks.push(state);
-            }
-        }
         let mut propagation_keys = Vec::with_capacity(mounts.len());
         for mount in &mounts {
             let mountpoint = mount.self_mountpoint().ok_or(SystemError::EINVAL)?;
             propagation_keys.push((mountpoint.mount_fs.clone(), mountpoint));
         }
 
-        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        let current = collect(root);
-        if current.len() != mounts.len()
-            || current
-                .iter()
-                .zip(mounts.iter())
-                .any(|(left, right)| left.mount_id() != right.mount_id())
-        {
-            return Err(SystemError::EBUSY);
-        }
-        if root.is_locked() {
-            return Err(SystemError::EINVAL);
-        }
-        if !lazy && root.subtree_has_external_pins() {
-            return Err(SystemError::EBUSY);
-        }
-        for (mount, (parent, mountpoint)) in mounts.iter().zip(propagation_keys.iter()) {
-            if !mount.is_live() {
-                return Err(SystemError::EINVAL);
-            }
-            if !lazy && propagation_umount_busy(parent, mountpoint) {
+        let mut retired = Vec::new();
+        let result = (|| {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            let current = collect(root);
+            if current.len() != mounts.len()
+                || current
+                    .iter()
+                    .zip(mounts.iter())
+                    .any(|(left, right)| left.mount_id() != right.mount_id())
+            {
                 return Err(SystemError::EBUSY);
             }
-        }
-        for mount in &mounts {
-            mount.lifecycle.lock().state = MountLifecycleState::Detaching;
-        }
-
-        let root_mountpoint = root.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        if let Err(error) = propagate_umount_sources(&mounts, lazy) {
-            for mount in &mounts {
-                let mut lifecycle = mount.lifecycle.lock();
-                if lifecycle.state == MountLifecycleState::Detaching {
-                    lifecycle.state = MountLifecycleState::Live;
+            if root.is_locked() {
+                return Err(SystemError::EINVAL);
+            }
+            if !root.is_live() {
+                return Err(SystemError::EINVAL);
+            }
+            if !lazy {
+                Self::shrink_submounts_locked(root, &mut retired)?;
+                if root
+                    .mountpoints
+                    .lock()
+                    .values()
+                    .any(|stack| !stack.is_empty())
+                    || root.has_external_pins()
+                {
+                    return Err(SystemError::EBUSY);
                 }
             }
-            return Err(error);
-        }
-        root.commit_umount_at(&root_mountpoint, lazy)
-            .expect("prepared local umount edge commit cannot fail");
+            let sources = if lazy {
+                &mounts[..]
+            } else {
+                core::slice::from_ref(root)
+            };
+            // collect() is deepest-first, so the original root key is last.
+            let keys = if lazy {
+                &propagation_keys[..]
+            } else {
+                &propagation_keys[propagation_keys.len() - 1..]
+            };
+            for (mount, (parent, mountpoint)) in sources.iter().zip(keys.iter()) {
+                if !mount.is_live() {
+                    return Err(SystemError::EINVAL);
+                }
+                if !lazy && propagation_umount_busy(parent, mountpoint) {
+                    return Err(SystemError::EBUSY);
+                }
+            }
+            retired.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            let root_mountpoint = root.self_mountpoint().ok_or(SystemError::EINVAL)?;
+            for mount in sources {
+                mount.lifecycle.lock().state = MountLifecycleState::Detaching;
+            }
+
+            let removed = match propagate_umount_sources(sources, lazy) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    for mount in sources {
+                        let mut lifecycle = mount.lifecycle.lock();
+                        if lifecycle.state == MountLifecycleState::Detaching {
+                            lifecycle.state = MountLifecycleState::Live;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            root.commit_umount_at(&root_mountpoint, lazy)
+                .expect("prepared local umount edge commit cannot fail");
+            retired.push(removed);
+            Ok(root.clone())
+        })();
         // Final filesystem shutdown may sleep and may itself need pathname
-        // operations. Never wait while holding the topology/admission lock.
-        drop(_topology);
+        // operations. Wait outside the topology lock on success AND failure:
+        // an earlier idle sibling or propagated peer may already be retired.
         if !lazy {
-            for super_block in super_blocks {
-                super_block.wait_for_shutdown_if_started();
+            for batch in retired {
+                for mount in batch {
+                    mount.super_block_state.wait_for_shutdown_if_started();
+                }
             }
         }
-        Ok(root.clone())
+        result
     }
 
     /// Detach this mount. Lazy detach skips the external-pin busy check and
@@ -5352,24 +5446,23 @@ impl MountFSInode {
         )
     }
 
-    /// Attach an automatically discovered submount only if the mountpoint is
-    /// still uncovered at the publication linearization point.
-    pub(crate) fn mount_subtree_with_state_if_vacant(
+    /// Attach an automatically discovered, shrinkable submount only if the
+    /// mountpoint is still uncovered at the publication linearization point.
+    pub(crate) fn mount_automount_if_vacant(
         &self,
         inner_fs: Arc<dyn FileSystem>,
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
-        super_block_state: Option<Arc<SuperBlockState>>,
-        bind_source: Option<&Arc<MountFS>>,
     ) -> Result<Arc<MountFS>, SystemError> {
         let prepared = self.prepare_subtree_with_root_dentry(
             inner_fs,
             root_inner_inode,
             None,
             mount_flags,
-            super_block_state,
-            bind_source,
+            None,
+            None,
         )?;
+        prepared.shrinkable.store(true, Ordering::Release);
         if let Err(error) = self.publish_prepared_subtree_inner(&prepared, true) {
             MountFS::deactivate_disconnected_subtree(&prepared);
             return Err(error);
@@ -5499,6 +5592,9 @@ impl MountFSInode {
         );
 
         if let Some(source) = bind_source {
+            new_mount_fs
+                .shrinkable
+                .store(source.shrinkable.load(Ordering::Acquire), Ordering::Release);
             inherit_bind_mount_propagation(source, &new_mount_fs);
         }
 

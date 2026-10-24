@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::syscall::Syscall;
 
-use super::kmsg::{LogSnapshot, SnapshotKind, KMSG};
+use super::kmsg::{check_syslog_permission, kmsg, read_stream, LogSnapshot, KMSG_TEXT_CAPACITY};
 use crate::{
     mm::{access_ok, VirtAddr},
     syscall::user_access::copy_to_user_protected,
@@ -22,6 +22,9 @@ enum SyslogAction {
     ReadClear = 4,
     /// Clear ring buffer.
     Clear = 5,
+    ConsoleOff = 6,
+    ConsoleOn = 7,
+    SizeUnread = 9,
     /// Set level of messages printed to console.
     ConsoleLevel = 8,
     /// Return size of the log buffer.
@@ -39,7 +42,10 @@ impl From<i32> for SyslogAction {
             3 => SyslogAction::ReadAll,
             4 => SyslogAction::ReadClear,
             5 => SyslogAction::Clear,
+            6 => SyslogAction::ConsoleOff,
+            7 => SyslogAction::ConsoleOn,
             8 => SyslogAction::ConsoleLevel,
+            9 => SyslogAction::SizeUnread,
             10 => SyslogAction::SizeBuffer,
             _ => SyslogAction::Inval,
         }
@@ -64,24 +70,27 @@ impl Syscall {
         len: i32,
         from_user: bool,
     ) -> Result<usize, SystemError> {
+        check_syslog_permission(syslog_action_type)?;
         let action = SyslogAction::from(syslog_action_type);
-        let kmsg = unsafe { KMSG.as_ref().ok_or(SystemError::ENODEV)? };
+        let kmsg = kmsg()?;
         match action {
             SyslogAction::Close | SyslogAction::Open => return Ok(0),
             SyslogAction::Clear => {
                 kmsg.lock_irqsave().clear();
                 return Ok(0);
             }
-            SyslogAction::ConsoleLevel => return kmsg.lock_irqsave().set_level(len as usize),
-            SyslogAction::Inval => return Err(SystemError::EINVAL),
-            SyslogAction::SizeBuffer => {
-                let mut snapshot = LogSnapshot::try_new()?;
-                // Preserve the existing retained-byte size policy, including
-                // records hidden from READ_ALL by clear. No level is consumed.
-                kmsg.lock_irqsave()
-                    .capture(&mut snapshot, SnapshotKind::Retained);
-                return Ok(snapshot.byte_len());
+            SyslogAction::ConsoleOff => {
+                kmsg.lock_irqsave().console_off();
+                return Ok(0);
             }
+            SyslogAction::ConsoleOn => {
+                kmsg.lock_irqsave().console_on();
+                return Ok(0);
+            }
+            SyslogAction::ConsoleLevel => return kmsg.lock_irqsave().set_level(len),
+            SyslogAction::SizeUnread => return Ok(kmsg.lock_irqsave().unread_bytes()),
+            SyslogAction::Inval => return Err(SystemError::EINVAL),
+            SyslogAction::SizeBuffer => return Ok(KMSG_TEXT_CAPACITY),
             _ => {}
         }
         if buf == 0 || len < 0 {
@@ -94,16 +103,6 @@ impl Syscall {
         if from_user && access_ok(VirtAddr::new(buf), len).is_err() {
             return Err(SystemError::EFAULT);
         }
-        let mut snapshot = LogSnapshot::try_new()?;
-        let prefix = matches!(action, SyslogAction::Read);
-        kmsg.lock_irqsave().capture(
-            &mut snapshot,
-            if prefix {
-                SnapshotKind::Prefix
-            } else {
-                SnapshotKind::Visible
-            },
-        );
         let mut offset = 0;
         let mut copy = |bytes: &[u8]| {
             let address = buf.checked_add(offset).ok_or(SystemError::EFAULT)?;
@@ -121,9 +120,11 @@ impl Syscall {
             offset += bytes.len();
             Ok(())
         };
-        if prefix {
-            return snapshot.read_prefix(len, &mut copy);
+        if matches!(action, SyslogAction::Read) {
+            return read_stream(len, &mut copy);
         }
+        let mut snapshot = LogSnapshot::try_new()?;
+        kmsg.lock_irqsave().capture(&mut snapshot);
         let (result, cutoff) = snapshot.read_all(len, &mut copy);
         if matches!(action, SyslogAction::ReadClear) {
             // Commit only complete records, including on a later copy fault.

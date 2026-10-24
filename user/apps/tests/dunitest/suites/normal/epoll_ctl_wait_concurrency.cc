@@ -6,6 +6,9 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <cstdlib>
+#include <string>
 #include <unistd.h>
 
 #include <atomic>
@@ -452,6 +455,33 @@ TEST(EpollCtlWaitConcurrency, DoubleEpollOneShotExchangeMakesProgress) {
     close(epfds[1]);
     close(sockets[0]);
     close(sockets[1]);
+}
+
+
+TEST(EpollCtlWaitConcurrency, ReadWriteFifoRegistersBothReadAndWriteSources) {
+    char directory[] = "/tmp/epoll-rw-fifo-XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(directory));
+    std::string path = std::string(directory) + "/fifo";
+    ASSERT_EQ(0, mkfifo(path.c_str(), 0600));
+    int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    ASSERT_GE(ep, 0);
+    epoll_event event{};
+    event.events = EPOLLIN | EPOLLOUT;
+    event.data.u64 = 321;
+    ASSERT_EQ(0, epoll_ctl(ep, EPOLL_CTL_ADD, fd, &event));
+    ASSERT_EQ(1, epoll_wait(ep, &event, 1, 0));
+    EXPECT_EQ(321u, event.data.u64);
+    EXPECT_NE(0u, event.events & EPOLLOUT);
+    ASSERT_EQ(1, write(fd, "x", 1));
+    ASSERT_EQ(1, epoll_wait(ep, &event, 1, 1000));
+    EXPECT_NE(0u, event.events & EPOLLIN);
+    EXPECT_EQ(0, epoll_ctl(ep, EPOLL_CTL_DEL, fd, nullptr));
+    EXPECT_EQ(0, close(ep));
+    EXPECT_EQ(0, close(fd));
+    EXPECT_EQ(0, unlink(path.c_str()));
+    EXPECT_EQ(0, rmdir(directory));
 }
 
 int main(int argc, char** argv) {

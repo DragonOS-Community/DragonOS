@@ -171,6 +171,7 @@ normal/cubesandbox_pty_exec_chain
 normal/eventfd_pending_signal
 normal/timerfd_semantics
 normal/virtiofs_smoke
+normal/virtiofs_automount
 normal/virtiofs_dax
 normal/af_packet_sockopt
 normal/af_packet_ring
@@ -309,3 +310,4 @@ normal/riscv_signal_semantics
 normal/page_reporting
 normal/balloon_memory_integrity
 normal/syslog_snapshot
+normal/syslog_stream

@@ -100,6 +100,7 @@ fn do_start_kernel() {
     // sched_init();
     // 初始化中断下半部（softirq、bottom_half、tasklet）
     irq_bottom_half_init().expect("bottom half subsystem init failed");
+    crate::filesystem::procfs::kmsg::kmsg_notification_init();
     Syscall::init().expect("syscall init failed");
     timekeeping_init();
     time_init();

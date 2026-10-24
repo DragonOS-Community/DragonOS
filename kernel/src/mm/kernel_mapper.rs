@@ -37,28 +37,55 @@ pub struct KernelMapper {
 
 impl KernelMapper {
     fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper) -> Self {
+        // owner/count 必须在关中断的临界区内一起更新。否则存在如下窗口：
+        // 本 CPU 完成 owner CAS 后、尚未 fetch_add 计数时发生中断；中断处理
+        // 里再次获取 mapper，看到 owner==cpuid、count==0，于是拿到可写守卫，
+        // 释放时又把 owner 清成 INVALID（count 也回到 0）。原调用恢复后把
+        // count 加到 1，此时 owner==INVALID、count==1；另一个 CPU 随后可以
+        // 成功 CAS owner 并因 prev_count>0 被误判为 readonly。该只读守卫在
+        // 释放 MMIO 时会返回 EAGAIN，最终触发 panic。
+        //
+        // 这里只在真正尝试获取时关中断；若锁被其它 CPU 持有，先恢复中断再
+        // 自旋，避免长时间关中断。
         loop {
-            match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            let already_owned = match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
                 KERNEL_MAPPER_NO_PROCESSOR,
                 cpuid,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => false,
                 // 当前处理器已经持有了锁
-                Err(id) if id == cpuid => break,
+                Err(id) if id == cpuid => true,
                 // either CAS failed, or some other hardware thread holds the lock
-                Err(_) => core::hint::spin_loop(),
-            }
+                Err(_) => {
+                    drop(irq_guard);
+                    core::hint::spin_loop();
+                    continue;
+                }
+            };
+
+            let prev_count = KERNEL_MAPPER_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+            compiler_fence(Ordering::Acquire);
+
+            // 关中断后 owner 与 count 的不变量必须成立：新获取时 count 为 0，
+            // 重入时 count 必大于 0。若此处不成立，说明还有其它破坏该不变量的
+            // 路径，应在 debug 构建中尽早暴露，而不是把它变成 readonly 守卫。
+            debug_assert_eq!(
+                already_owned,
+                prev_count > 0,
+                "kernel mapper lock invariant violated: owner={:?}, count={}",
+                KERNEL_MAPPER_LOCK_OWNER.load(Ordering::Relaxed),
+                prev_count
+            );
+
+            // 本地核心已经持有过锁，因此标记当前加锁获得的映射器为只读
+            let readonly = prev_count > 0;
+            drop(irq_guard);
+
+            return Self { mapper, readonly };
         }
-
-        let prev_count = KERNEL_MAPPER_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
-        compiler_fence(Ordering::Acquire);
-
-        // 本地核心已经持有过锁，因此标记当前加锁获得的映射器为只读
-        let readonly = prev_count > 0;
-
-        return Self { mapper, readonly };
     }
 
     /// @brief 锁定内核映射器, 并返回一个内核映射器对象

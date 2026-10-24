@@ -172,14 +172,16 @@ impl AddressSpace {
     /// Recreate the parent's trampoline at the exact inherited return address.
     /// XOL VMAs are DONTCOPY, so an independent child must own a fresh page.
     /// Register it in the normal pool to retain all XOL mutation protections.
+    /// Keep the clone transaction's write guard: file-rmap already exposes
+    /// child VMAs to global registrations which could otherwise occupy this VA.
     #[cfg(target_arch = "x86_64")]
-    fn inherit_uret_trampoline(
+    pub(super) fn inherit_uret_trampoline_locked(
         self: &Arc<Self>,
+        inner: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
         vaddr: usize,
         creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
         data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
     ) -> Result<(), MemoryAllocationError> {
-        let mut inner = self.write();
         self.xol_pool.reserve_page()?;
         let base = vaddr & !(MMArch::PAGE_SIZE - 1);
         let page = inner.map_anonymous(
@@ -2651,10 +2653,6 @@ impl AddressSpace {
                     // even on a hart that has never run the parent.
                     #[cfg(target_arch = "riscv64")]
                     child.sync_remote_user_icache();
-                    #[cfg(target_arch = "x86_64")]
-                    if let Some(vaddr) = self.uret_trampoline_vaddr() {
-                        child.inherit_uret_trampoline(vaddr, &creator, &child_data_account)?;
-                    }
                     #[cfg(target_arch = "x86_64")]
                     super::uprobe::fork_inherit_uprobes(&child);
                     return Ok(child);

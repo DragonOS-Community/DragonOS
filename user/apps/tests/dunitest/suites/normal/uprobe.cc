@@ -2395,16 +2395,25 @@ TEST(UprobeTest, PrivateInstructionMismatchDoesNotFailFork) {
 // A forked child initially shares the parent's private breakpoint page.  A
 // concurrent system-wide registration must never observe the child's VMA
 // before the inherited INT3 has been reconciled with its empty hit table.
-TEST(UprobeTest, ConcurrentSystemWideRegistrationDuringFork) {
+void CheckConcurrentSystemWideRegistrationDuringFork(bool return_probe) {
     std::string path;
     unsigned long offset = 0;
     ASSERT_TRUE(resolve_file_offset(
         reinterpret_cast<const void*>(&uprobe_target), path, offset));
 
-    FdGuard task_event(open_uprobe_perf_event(path, offset));
+    UprobePerfEventOptions task_options;
+    task_options.config = return_probe ? 1 : 0;
+    FdGuard task_event(open_uprobe_perf_event(path, offset, task_options));
     ASSERT_GE(task_event.get(), 0) << "task uprobe failed, errno=" << errno;
 
+    // Return probes create their per-MM trampoline on the first completed
+    // hit. Ensure fork must rebuild an already initialized parent trampoline.
+    if (return_probe) {
+        ASSERT_EQ(uprobe_target(7), 15);
+    }
+
     UprobePerfEventOptions system_options;
+    system_options.config = task_options.config;
     system_options.pid = -1;
     system_options.cpu = 0;
     system_options.disabled = true;
@@ -2476,6 +2485,14 @@ TEST(UprobeTest, ConcurrentSystemWideRegistrationDuringFork) {
     EXPECT_EQ(child_failure, 0) << "forked child failed";
     EXPECT_EQ(registration_errno.load(std::memory_order_acquire), 0)
         << "concurrent system-wide registration failed";
+}
+
+TEST(UprobeTest, ConcurrentSystemWideRegistrationDuringFork) {
+    CheckConcurrentSystemWideRegistrationDuringFork(false);
+}
+
+TEST(UprobeTest, ConcurrentSystemWideReturnRegistrationDuringFork) {
+    CheckConcurrentSystemWideRegistrationDuringFork(true);
 }
 
 // Exercise the exact window where one CPU has executed INT3 while another

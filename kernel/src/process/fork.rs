@@ -1066,6 +1066,10 @@ impl ProcessManager {
                 let membership_guard = crate::process::pid::pid_membership_lock();
                 let relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
 
+                if !pcb.active_pid_ns().accepts_new_tasks() {
+                    break Err(SystemError::ENOMEM);
+                }
+
                 // Linux copy_process() rejects a dying parent immediately before
                 // task-list publication. OOM commit owns this same PID lock, so
                 // an unpublished CLONE_VM child cannot slip past its shared-MM

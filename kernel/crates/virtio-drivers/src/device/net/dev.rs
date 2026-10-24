@@ -25,19 +25,26 @@ pub struct VirtIONet<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
 impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> {
     /// Create a new VirtIO-Net driver.
     pub fn new(transport: T, buf_len: usize) -> Result<Self> {
-        let mut inner = VirtIONetRaw::new(transport)?;
-
+        let inner = VirtIONetRaw::new(transport)?;
         const NONE_BUF: Option<RxBuffer> = None;
-        let mut rx_buffers = [NONE_BUF; QUEUE_SIZE];
-        for (i, rx_buf_place) in rx_buffers.iter_mut().enumerate() {
+        // Establish the owner before publishing the first payload descriptor.
+        // Its Drop stops DMA before any of these buffers can be freed.
+        let mut device = Self {
+            inner,
+            rx_buffers: [NONE_BUF; QUEUE_SIZE],
+        };
+        for i in 0..QUEUE_SIZE {
             let mut rx_buf = RxBuffer::new(i, buf_len);
-            // Safe because the buffer lives as long as the queue.
-            let token = unsafe { inner.receive_begin(rx_buf.as_bytes_mut())? };
-            assert_eq!(token, i as u16);
-            *rx_buf_place = Some(rx_buf);
+            // SAFETY: the allocation is retained in device until completion or reset.
+            let token = unsafe { device.inner.receive_begin(rx_buf.as_bytes_mut())? };
+            if token as usize >= QUEUE_SIZE || device.rx_buffers[token as usize].is_some() {
+                device.inner.stop_dma();
+                return Err(Error::WrongToken);
+            }
+            rx_buf.idx = token;
+            device.rx_buffers[token as usize] = Some(rx_buf);
         }
-
-        Ok(VirtIONet { inner, rx_buffers })
+        Ok(device)
     }
 
     /// Acknowledge interrupt.
@@ -76,23 +83,43 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
     /// It will try to pop a buffer that completed data reception in the
     /// NIC queue.
     pub fn receive(&mut self) -> Result<RxBuffer> {
-        if let Some(token) = self.inner.poll_receive() {
-            let mut rx_buf = self.rx_buffers[token as usize]
-                .take()
-                .ok_or(Error::WrongToken)?;
-            if token != rx_buf.idx {
-                return Err(Error::WrongToken);
+        let token = match self.inner.poll_receive_checked() {
+            Ok(Some(token)) => token,
+            Ok(None) => return Err(Error::NotReady),
+            Err(error) => {
+                self.inner.stop_dma();
+                return Err(error);
             }
-
-            // Safe because `token` == `rx_buf.idx`, we are passing the same
-            // buffer as we passed to `VirtQueue::add` and it is still valid.
-            let (_hdr_len, pkt_len) =
-                unsafe { self.inner.receive_complete(token, rx_buf.as_bytes_mut())? };
-            rx_buf.set_packet_len(pkt_len);
-            Ok(rx_buf)
-        } else {
-            Err(Error::NotReady)
-        }
+        };
+        let result = match self.rx_buffers[token as usize].as_mut() {
+            Some(buffer) if buffer.idx == token => {
+                // SAFETY: the same allocation remains owned by this slot.
+                unsafe { self.inner.reclaim_receive(token, buffer.as_bytes_mut()) }
+            }
+            _ => Err(Error::WrongToken),
+        };
+        let used = match result {
+            Ok(lengths) => lengths,
+            Err(error) => {
+                // Reclamation failed: retain the slot until reset and detach
+                // in Drop, rather than releasing device-owned memory.
+                self.inner.stop_dma();
+                return Err(error);
+            }
+        };
+        // Successful reclamation retires this slot even if header validation fails.
+        let mut buffer = self.rx_buffers[token as usize].take().unwrap();
+        let (header_len, packet_len) = match self.inner.prepare_receive(buffer.as_bytes_mut(), used)
+        {
+            Ok(lengths) => lengths,
+            Err(error) => {
+                self.inner.stop_dma();
+                return Err(error);
+            }
+        };
+        buffer.header_len = header_len;
+        buffer.set_packet_len(packet_len);
+        Ok(buffer)
     }
 
     /// Gives back the ownership of `rx_buf`, and recycles it for next use.
@@ -104,7 +131,8 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
         let new_token = unsafe { self.inner.receive_begin(rx_buf.as_bytes_mut()) }?;
         // `rx_buffers[new_token]` is expected to be `None` since it was taken
         // away at `Self::receive()` and has not been added back.
-        if self.rx_buffers[new_token as usize].is_some() {
+        if new_token as usize >= QUEUE_SIZE || self.rx_buffers[new_token as usize].is_some() {
+            self.inner.stop_dma();
             return Err(Error::WrongToken);
         }
         rx_buf.idx = new_token;
@@ -121,5 +149,17 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
     /// completed.
     pub fn send(&mut self, tx_buf: TxBuffer) -> Result {
         self.inner.send(tx_buf.packet())
+    }
+}
+
+impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> Drop for VirtIONet<H, T, QUEUE_SIZE> {
+    fn drop(&mut self) {
+        self.inner.stop_dma();
+        for buffer in self.rx_buffers.iter_mut().flatten() {
+            // SAFETY: reset is confirmed, and slots contain only outstanding
+            // descriptors; successfully reclaimed buffers were removed.
+            unsafe { self.inner.detach_receive(buffer.idx, buffer.as_bytes_mut()) }
+                .expect("buffered receive slot must own its descriptor");
+        }
     }
 }

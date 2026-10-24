@@ -13,7 +13,7 @@ use napi_state::CompleteState;
 use smoltcp::{iface, phy, wire};
 use unified_init::macros::unified_init;
 use virtio_drivers::{
-    device::net::VirtIONetRaw,
+    device::net::{ReceiveParser, RxOffloads, TcpGsoKind, VirtIONetRaw},
     transport::{DeviceStatus, DeviceType as VirtioDeviceType, Transport},
     PhysAddr,
 };
@@ -69,6 +69,9 @@ mod driver;
 const VIRTIO_NET_BASENAME: &str = "virtio_net";
 const VIRTIO_NET_QUEUE_SIZE: usize = 64;
 const VIRTIO_NET_BUFFER_SIZE: usize = 4096;
+// A complete non-jumbo IPv6 GSO packet plus Ethernet/VLAN and virtio headers.
+// The current DMA allocator rounds this 17-page request to 32 physical pages.
+const VIRTIO_NET_RX_BUFFER_SIZE: usize = 17 * 4096;
 const VIRTIO_NET_IP_MTU: usize = 1500;
 // smoltcp expects the complete Ethernet frame size here. Without
 // VIRTIO_NET_F_MTU, Linux exposes the standard 1500-byte IP MTU.
@@ -484,6 +487,8 @@ struct RxDmaBuffer {
     dma: DmaBuffer,
     packet_offset: usize,
     packet_len: usize,
+    used_len: usize,
+    gso: Option<net_gso::Cursor>,
 }
 
 impl RxDmaBuffer {
@@ -508,12 +513,16 @@ pub struct VirtIoNetImpl {
     rx_quarantine: Vec<RxDmaBuffer>,
     tx_quarantine: Vec<TxDmaBuffer>,
     poisoned: bool,
+    pending_rx: Option<RxDmaBuffer>,
+    // Includes lock-free metadata/protocol initialization and an outstanding
+    // segmented token. Ordinary tokens never clear another token's gate.
+    rx_inflight: bool,
 }
 
 impl VirtIoNetImpl {
-    fn dma_buffer(direction: DmaDirection) -> Result<DmaBuffer, SystemError> {
+    fn dma_buffer(direction: DmaDirection, size: usize) -> Result<DmaBuffer, SystemError> {
         DmaBuffer::try_alloc_bytes(
-            VIRTIO_NET_BUFFER_SIZE,
+            size,
             DmaAllocOptions {
                 direction,
                 use_pool: false,
@@ -538,12 +547,14 @@ impl VirtIoNetImpl {
         let mut tx_free = Vec::with_capacity(VIRTIO_NET_QUEUE_SIZE);
         for _ in 0..VIRTIO_NET_QUEUE_SIZE {
             rx_buffers.push(RxDmaBuffer {
-                dma: Self::dma_buffer(DmaDirection::FromDevice)?,
+                dma: Self::dma_buffer(DmaDirection::FromDevice, VIRTIO_NET_RX_BUFFER_SIZE)?,
                 packet_offset: 0,
                 packet_len: 0,
+                used_len: 0,
+                gso: None,
             });
             tx_free.push(TxDmaBuffer {
-                dma: Self::dma_buffer(DmaDirection::ToDevice)?,
+                dma: Self::dma_buffer(DmaDirection::ToDevice, VIRTIO_NET_BUFFER_SIZE)?,
                 used_len: 0,
             });
         }
@@ -553,7 +564,11 @@ impl VirtIoNetImpl {
         let mut rx_quarantine = Vec::new();
         // Declared last so an initialization error drops/resets the raw device
         // before any buffer already submitted to it is released.
-        let mut inner = RawVirtioNet::new(transport).map_err(|_| SystemError::EIO)?;
+        let mut inner = RawVirtioNet::new_with_rx_offloads(
+            transport,
+            RxOffloads::TCPV4 | RxOffloads::TCPV6 | RxOffloads::ECN,
+        )
+        .map_err(|_| SystemError::EIO)?;
         // VirtQueue starts with callbacks enabled. Publish suppression before
         // the first RX descriptor becomes device-owned; the first committed
         // NAPI cycle is the only path that enables callbacks.
@@ -582,6 +597,8 @@ impl VirtIoNetImpl {
             rx_quarantine,
             tx_quarantine: Vec::new(),
             poisoned: false,
+            pending_rx: None,
+            rx_inflight: false,
         })
     }
 
@@ -597,9 +614,18 @@ impl VirtIoNetImpl {
         }
     }
 
-    fn receive(&mut self) -> Result<Option<RxDmaBuffer>, SystemError> {
+    /// Transfer one CPU-owned source and immutable parser out of the IRQ lock.
+    /// Packet validation/checksum work happens after this owner transaction.
+    fn take_receive(&mut self) -> Result<Option<(RxDmaBuffer, ReceiveParser)>, SystemError> {
         if self.poisoned {
             return Err(SystemError::EIO);
+        }
+        if self.rx_inflight {
+            return Ok(None);
+        }
+        if let Some(buffer) = self.pending_rx.take() {
+            self.rx_inflight = true;
+            return Ok(Some((buffer, self.inner.receive_parser())));
         }
         let token = match self.inner.poll_receive_checked() {
             Ok(Some(token)) => token,
@@ -618,36 +644,51 @@ impl VirtIoNetImpl {
             self.poison("RX token has no device-owned buffer");
             return Err(SystemError::EIO);
         };
-
-        // SAFETY: This is the same allocation submitted for this token and it remained stable.
-        let completed = unsafe {
-            self.inner
-                .receive_complete(token, buffer.dma.as_mut_slice())
-        };
-        let (header_len, packet_len) = match completed {
-            Ok(lengths) => lengths,
+        // SAFETY: the allocation was submitted under this token and remained
+        // device-owned in rx_slots until pop_used/unshare completed.
+        let used = match unsafe { self.inner.reclaim_receive(token, buffer.dma.as_mut_slice()) } {
+            Ok(used) => used,
             Err(_) => {
+                // Descriptor ownership is uncertain; retain the DMA target.
                 self.rx_slots[index] = Some(buffer);
                 self.poison("RX completion/token mismatch");
                 return Err(SystemError::EIO);
             }
         };
-        let Some(end) = header_len.checked_add(packet_len) else {
-            self.poison("RX completion length overflow");
-            return Err(SystemError::EIO);
-        };
-        if end > buffer.dma.len() {
-            // The descriptor is reclaimed and the allocation is CPU-owned,
-            // but an impossible used length is a device/queue integrity
-            // failure. Quarantine the buffer and fail-stop instead of
-            // silently returning it to an untrusted queue.
+        if used > buffer.dma.len() {
             self.rx_quarantine.push(buffer);
             self.poison("RX completion exceeds submitted DMA buffer");
             return Err(SystemError::EIO);
         }
-        buffer.packet_offset = header_len;
-        buffer.packet_len = packet_len;
-        Ok(Some(buffer))
+        buffer.used_len = used;
+        self.rx_inflight = true;
+        Ok(Some((buffer, self.inner.receive_parser())))
+    }
+
+    /// A token returns only CPU-owned storage. Never overwrite pending state
+    /// with another owner, and resubmit to DMA only after its final segment.
+    fn return_rx(&mut self, mut buffer: RxDmaBuffer) -> Result<bool, SystemError> {
+        let segmented = buffer.gso.is_some();
+        if segmented {
+            self.rx_inflight = false;
+        }
+        if self.poisoned {
+            return Err(SystemError::EIO);
+        }
+        if buffer
+            .gso
+            .as_ref()
+            .is_some_and(|cursor| !cursor.is_finished())
+        {
+            debug_assert!(self.pending_rx.is_none());
+            self.pending_rx = Some(buffer);
+        } else {
+            buffer.gso = None;
+            self.recycle_rx(buffer)?;
+        }
+        // Even a last-segment late return may unblock already-used hardware
+        // entries hidden behind the gate. Resume NAPI after releasing this lock.
+        Ok(segmented)
     }
 
     fn recycle_rx(&mut self, mut buffer: RxDmaBuffer) -> Result<(), SystemError> {
@@ -656,6 +697,8 @@ impl VirtIoNetImpl {
         }
         buffer.packet_offset = 0;
         buffer.packet_len = 0;
+        buffer.used_len = 0;
+        buffer.gso = None;
         // SAFETY: ownership returns to the queue and the allocation stays in rx_slots.
         let token = unsafe { self.inner.receive_begin(buffer.dma.as_mut_slice()) }
             .map_err(|_| SystemError::EIO)?;
@@ -709,6 +752,12 @@ impl VirtIoNetImpl {
     }
 
     fn has_rx_completion(&mut self) -> Result<bool, SystemError> {
+        if self.rx_inflight {
+            return Ok(false);
+        }
+        if self.pending_rx.is_some() {
+            return Ok(true);
+        }
         match self.inner.poll_receive_checked() {
             Ok(token) => Ok(token.is_some()),
             Err(_) => {
@@ -963,6 +1012,74 @@ impl VirtIONicDeviceInner {
         self.iface.lock().upgrade()
     }
 
+    fn receive(&self) -> Result<Option<RxDmaBuffer>, SystemError> {
+        let candidate = self.inner.lock_irqsave().take_receive()?;
+        let Some((mut buffer, parser)) = candidate else {
+            return Ok(None);
+        };
+        if buffer.gso.is_none() {
+            let prepared = parser.prepare(buffer.dma.as_mut_slice(), buffer.used_len);
+            let Ok((header_len, packet_len, metadata)) = prepared else {
+                // Reclaimed ownership is known: a bad protocol frame is a
+                // packet drop, not a queue-integrity failure.
+                let mut driver = self.inner.lock_irqsave();
+                driver.rx_inflight = false;
+                driver.recycle_rx(buffer)?;
+                return Ok(None);
+            };
+            buffer.packet_offset = header_len;
+            buffer.packet_len = packet_len;
+            if let Some(gso) = metadata.gso {
+                let parameters = net_gso::Parameters {
+                    version: match gso.kind {
+                        TcpGsoKind::TcpV4 => net_gso::IpVersion::V4,
+                        TcpGsoKind::TcpV6 => net_gso::IpVersion::V6,
+                    },
+                    segment_size: gso.gso_size,
+                    checksum: gso.checksum.map(|checksum| net_gso::PartialChecksum {
+                        start: checksum.start,
+                        offset: checksum.offset,
+                    }),
+                };
+                let mtu = self.iface().map_or(VIRTIO_NET_IP_MTU, |iface| iface.mtu());
+                match net_gso::Cursor::new(buffer.packet(), parameters, mtu) {
+                    Ok(cursor) => buffer.gso = Some(cursor),
+                    Err(_) => {
+                        let mut driver = self.inner.lock_irqsave();
+                        driver.rx_inflight = false;
+                        driver.recycle_rx(buffer)?;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        if let Some(cursor) = buffer.gso.as_mut() {
+            let offset = buffer.packet_offset;
+            let end = offset + cursor.source_len();
+            buffer.packet_len = cursor
+                .next_segment(&mut buffer.dma.as_mut_slice()[offset..end])
+                .expect("pending GSO cursor must have an unconsumed segment");
+        } else {
+            // Ordinary tokens may coexist; their eventual return does not
+            // release the exclusive owner gate of a subsequent GSO token.
+            self.inner.lock_irqsave().rx_inflight = false;
+        }
+        Ok(Some(buffer))
+    }
+
+    fn return_rx(&self, buffer: RxDmaBuffer) {
+        let result = self.inner.lock_irqsave().return_rx(buffer);
+        match result {
+            Ok(true) => {
+                if let Some(napi) = self.iface().and_then(|iface| iface.napi_struct()) {
+                    napi_schedule(napi);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => error!("virtio-net failed to return RX buffer: {error:?}"),
+        }
+    }
+
     fn submit_frame<R, F>(
         &self,
         mut buffer: TxDmaBuffer,
@@ -1085,8 +1202,7 @@ impl phy::Device for VirtIONicDeviceInner {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut driver = self.inner.lock_irqsave();
-        match driver.receive() {
+        match VirtIONicDeviceInner::receive(self) {
             Ok(Some(rx_buffer)) => Some((
                 VirtioNetRxToken::new(self.clone(), rx_buffer),
                 VirtioNetTxToken::deferred(self.clone()),
@@ -1169,8 +1285,7 @@ impl phy::RxToken for VirtioNetRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let rx_buf = self.rx_buffer.take().unwrap();
-        let packet = rx_buf.packet();
+        let packet = self.rx_buffer.as_ref().unwrap().packet();
 
         // 向注册的 packet socket 分发数据包
         if let Some(iface) = self.driver.iface() {
@@ -1179,9 +1294,10 @@ impl phy::RxToken for VirtioNetRxToken {
         }
 
         let result = f(packet);
-        if let Err(err) = self.driver.inner.lock_irqsave().recycle_rx(rx_buf) {
-            error!("virtio-net failed to recycle RX buffer: {err:?}");
-        }
+        // Keep the owner in self while callbacks run, so unwinding also uses
+        // Drop's one return path and cannot strand the segment gate.
+        let rx_buf = self.rx_buffer.take().unwrap();
+        self.driver.return_rx(rx_buf);
         result
     }
 }
@@ -1189,9 +1305,7 @@ impl phy::RxToken for VirtioNetRxToken {
 impl Drop for VirtioNetRxToken {
     fn drop(&mut self) {
         if let Some(buffer) = self.rx_buffer.take() {
-            if let Err(err) = self.driver.inner.lock_irqsave().recycle_rx(buffer) {
-                error!("virtio-net failed to recycle dropped RX token: {err:?}");
-            }
+            self.driver.return_rx(buffer);
         }
     }
 }

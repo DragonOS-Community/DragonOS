@@ -13,6 +13,11 @@ use crate::process::pid::{Pid, PidType};
 use crate::process::ProcessControlBlock;
 use crate::process::ProcessManager;
 use crate::process::RawPid;
+use crate::{
+    arch::ipc::signal::Signal,
+    ipc::signal_types::{SaHandlerType, SigCode, SigInfo, SigType, SigactionType},
+    process::abi::WaitOption,
+};
 
 use super::nsproxy::NsCommon;
 use super::user_namespace::UserNamespace;
@@ -278,6 +283,84 @@ impl PidNamespace {
     pub fn disable_pid_allocation(&self) {
         let _transaction = crate::process::pid::pid_map_lock();
         self.inner().dead = true;
+    }
+
+    /// Final fork publication holds PID_MEMBERSHIP_LOCK, as does disabling
+    /// allocation for the last namespace-init thread. A PID reserved earlier
+    /// must not acquire a task after the shutdown kill snapshot.
+    pub(in crate::process) fn accepts_new_tasks(&self) -> bool {
+        if self.inner().dead {
+            return false;
+        }
+        let mut parent = self.parent();
+        while let Some(namespace) = parent {
+            if namespace.inner().dead {
+                return false;
+            }
+            parent = namespace.parent();
+        }
+        true
+    }
+
+    /// Linux zap_pid_ns_processes(): retain a valid child reaper until every
+    /// other numeric identity has retired, including zombies owned outside
+    /// this namespace. The caller is still schedulable and owns no spinlock.
+    pub(in crate::process) fn shutdown(&self, current: &Arc<ProcessControlBlock>) {
+        let mut action = current
+            .sighand()
+            .handler(Signal::SIGCHLD)
+            .expect("SIGCHLD must have a disposition");
+        action.set_action(SigactionType::SaHandler(SaHandlerType::Ignore));
+        current.sighand().set_handler(Signal::SIGCHLD, action);
+
+        let mut next = 2;
+        let bound = self.published_pid_bound();
+        let mut batch: [Option<Arc<Pid>>; 32] = core::array::from_fn(|_| None);
+        while next <= bound {
+            self.read_pid_batch(&mut next, bound, &mut batch);
+            for pid in batch.iter_mut().filter_map(Option::take) {
+                let Some(task) = pid.pid_task(PidType::PID) else {
+                    continue;
+                };
+                if task.tgid == current.tgid {
+                    continue;
+                }
+                let mut info = SigInfo::new(
+                    Signal::SIGKILL,
+                    0,
+                    SigCode::Kernel,
+                    SigType::Kill {
+                        pid: RawPid(0),
+                        uid: 0,
+                    },
+                );
+                // Kernel origin also kills an UNKILLABLE nested namespace init.
+                let _ =
+                    Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), task, PidType::TGID);
+            }
+        }
+
+        let init_pids = if current.is_thread_group_leader() {
+            1
+        } else {
+            2
+        };
+        current.process_signal().child_wait_queue().wait_until(|| {
+            // Reparenting can add a previously external parent's zombie even
+            // after an earlier wait returned ECHILD. Drain on every wake.
+            loop {
+                match crate::process::exit::kernel_wait4(
+                    -1,
+                    WaitOption::WALL | WaitOption::WNOHANG,
+                    None,
+                ) {
+                    Ok((pid, _)) if pid != 0 => continue,
+                    Ok(_) | Err(SystemError::ECHILD) => break,
+                    Err(error) => panic!("namespace shutdown wait failed: {error:?}"),
+                }
+            }
+            (self.pid_allocated() == init_pids).then_some(())
+        });
     }
 
     /// Cancel a namespace created by this failed fork/unshare attempt. The

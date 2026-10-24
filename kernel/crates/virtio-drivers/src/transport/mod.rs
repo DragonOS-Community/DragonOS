@@ -112,6 +112,36 @@ pub trait Transport {
         negotiated_features
     }
 
+    /// Negotiates features with reset and modern-device acceptance checks.
+    /// Legacy devices do not implement the FEATURES_OK handshake.
+    fn try_begin_init<F: Flags<Bits = u64> + BitAnd<Output = F> + Debug>(
+        &mut self,
+        supported_features: F,
+    ) -> Result<F> {
+        self.reset()?;
+        self.set_status(DeviceStatus::ACKNOWLEDGE);
+        self.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
+        let mut offered = self.read_device_features();
+        if self.requires_legacy_layout() {
+            offered &= !(1 << 32);
+        }
+        let negotiated = F::from_bits_truncate(offered) & supported_features;
+        if !self.requires_legacy_layout() && negotiated.bits() & (1 << 32) == 0 {
+            self.set_status(self.get_status() | DeviceStatus::FAILED);
+            return Err(Error::Unsupported);
+        }
+        self.write_driver_features(negotiated.bits());
+        if !self.requires_legacy_layout() {
+            self.set_status(self.get_status() | DeviceStatus::FEATURES_OK);
+            if !self.get_status().contains(DeviceStatus::FEATURES_OK) {
+                self.set_status(self.get_status() | DeviceStatus::FAILED);
+                return Err(Error::Unsupported);
+            }
+        }
+        self.set_guest_page_size(PAGE_SIZE as u32);
+        Ok(negotiated)
+    }
+
     /// Finishes initializing the device.
     fn finish_init(&mut self) {
         self.set_status(

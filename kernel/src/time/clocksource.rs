@@ -1098,13 +1098,18 @@ fn sample_watchdog(
         }
 
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
-            // debug!("set_unstable");
-            // 误差过大，标记为unstable
+            // Use warning severity for degraded clock reliability. Retain
+            // best-effort logging because watchdog sampling may run in
+            // timer/softirq context and must not block on the log lock.
             Logger.try_log_fmt(
-                LogLevel::INFO,
+                LogLevel::WARN,
                 format_args!(
-                    "clocksource watchdog skew: cs_dev_nsec={} wd_dev_nsec={}",
-                    cs_dev_nsec, wd_dev_nsec
+                    "clocksource watchdog: '{}' unstable: cs_nsec={} wd_nsec={} ref='{}' diff_ns={}",
+                    cs_data.name,
+                    cs_dev_nsec,
+                    wd_dev_nsec,
+                    wd_now_data.name,
+                    cs_dev_nsec.abs_diff(wd_dev_nsec)
                 ),
             );
             cs.mark_unstable_from_watchdog(

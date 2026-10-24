@@ -3,8 +3,11 @@
 //! admission and delivered by its task; other feedback is deferred until the
 //! netdevice poll releases its locks. Protocol-specific policy stays in sockets.
 
+use crate::driver::net::PacketBuffer;
 use crate::process::namespace::net_namespace::NetNamespace;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
+#[cfg(test)]
+use alloc::vec::Vec;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, Ipv4Address, Ipv6Address};
 use system_error::SystemError;
 
@@ -35,7 +38,7 @@ pub struct IcmpErrorFeedback {
     pub(crate) icmp_code: u8,
     pub(crate) offender: IpAddress,
     pub(crate) ingress_ifindex: u32,
-    pub(crate) quote: Vec<u8>,
+    pub(crate) quote: PacketBuffer,
     pub(crate) transport_offset: usize,
     pub(crate) outer_ttl: u8,
     pub(crate) outer_tos: u8,
@@ -274,13 +277,9 @@ pub(crate) fn parse(packet: &[u8], ingress_ifindex: u32) -> Option<IcmpErrorFeed
         ),
         _ => (0, 0, None),
     };
-    let mut owned = Vec::new();
-    // Admission bounds the complete quotation; never silently truncate the
-    // user-visible error payload just to make a control event fit its quota.
-    if transport_offset + 8 > quote.len() || owned.try_reserve_exact(quote.len()).is_err() {
-        return None;
-    }
-    owned.extend_from_slice(quote);
+    // Preserve the complete quotation with a CPU owner; long ICMP errors must
+    // not require high-order physical pages or truncate user-visible payload.
+    let owned = PacketBuffer::try_from_slice(quote).ok()?;
     Some(IcmpErrorFeedback {
         source,
         destination,

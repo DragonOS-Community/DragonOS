@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stddef.h>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 
 #include <vector>
+#include <string>
 
 namespace {
 
@@ -346,6 +348,75 @@ TEST(ExecAbi, PostPointOfNoReturnExecFailureIsFatal) {
         EXPECT_EQ(SIGSEGV, WTERMSIG(status));
     }
     EXPECT_EQ(0, unlink(path));
+}
+
+TEST(ExecAbi, InitialStackOomRetiresExecWithoutKernelPanic) {
+    constexpr const char* inject_path = "/proc/sys/vm/oom_fault_inject";
+    int control = open(inject_path, O_WRONLY);
+    if (control < 0 && errno == ENOENT) {
+        GTEST_SKIP() << "requires DragonOS OOM fault injection";
+    }
+    ASSERT_GE(control, 0) << strerror(errno);
+    struct Cleanup {
+        int control;
+        char path[128] = {};
+        ~Cleanup() {
+            (void)write(control, "0\n", 2);
+            close(control);
+            if (path[0] != '\0') unlink(path);
+        }
+    } cleanup{control};
+    ensure_tmp_dir();
+    snprintf(cleanup.path, sizeof(cleanup.path), "/tmp/exec_stack_oom_%d", getpid());
+
+    // A lazy, page-aligned file segment has neither an interpreter nor a BSS
+    // tail to fault during ELF loading. The first new-MM fault is the kernel's
+    // initial user-stack write, before any program instruction can execute.
+    std::vector<unsigned char> image(4096, 0);
+    memcpy(image.data(), kCheckRdxElf, sizeof(kCheckRdxElf));
+    Elf64_Phdr segment;
+    memcpy(&segment, image.data() + sizeof(Elf64_Ehdr), sizeof(segment));
+    segment.p_filesz = image.size();
+    segment.p_memsz = image.size();
+    memcpy(image.data() + sizeof(Elf64_Ehdr), &segment, sizeof(segment));
+    write_executable(cleanup.path, image.data(), image.size());
+    ASSERT_FALSE(HasFatalFailure());
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        alarm(10);
+        char* const args[] = {cleanup.path, nullptr};
+        char* const env[] = {nullptr};
+        char config[64];
+        const int count = snprintf(config, sizeof(config), "%d 0 1\n", getpid());
+        if (count <= 0 || count >= static_cast<int>(sizeof(config)) ||
+            write(control, config, count) != count) {
+            _exit(97);
+        }
+        close(control);
+        execve(cleanup.path, args, env);
+        _exit(98);  // A post-PONR stack failure must not resume the old image.
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(child, waited) << strerror(errno);
+    ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
+    EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+
+    const int state = open(inject_path, O_RDONLY);
+    ASSERT_GE(state, 0) << strerror(errno);
+    char bytes[1024];
+    const ssize_t count = read(state, bytes, sizeof(bytes));
+    close(state);
+    ASSERT_GT(count, 0);
+    const std::string observed(bytes, static_cast<size_t>(count));
+    EXPECT_NE(observed.find("target_tgid=" + std::to_string(child) + " "),
+              std::string::npos) << observed;
+    EXPECT_NE(observed.find("seen=1 remaining=0\n"), std::string::npos) << observed;
 }
 
 TEST(ExecAbi, PostPonrFailureDoesNotChangeSharedSiblingHandler) {

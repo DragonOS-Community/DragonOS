@@ -1,26 +1,12 @@
 {
   lib,
   pkgs,
-  fenix,
-  system,
+  rustPlatform,
   installDir,
   version ? "20251218",
 }:
 
 let
-  fenixPkgs = fenix.packages.${system};
-  toolchain = fenixPkgs.combine (
-    with fenixPkgs;
-    [
-      minimal.rustc
-      minimal.cargo
-    ]
-  );
-  rustPlatform = pkgs.makeRustPlatform {
-    cargo = toolchain;
-    rustc = toolchain;
-  };
-
   testsArchive = pkgs.fetchurl {
     url = "https://cnb.cool/DragonOS-Community/test-suites/-/releases/download/release_${version}/gvisor-syscalls-tests.tar.xz";
     sha256 = "sha256-JVCjDtqF9iNw6B4pXGP39gZRs6rEqtLsrroihraPqQE=";

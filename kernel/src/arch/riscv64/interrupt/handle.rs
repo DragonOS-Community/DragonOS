@@ -9,9 +9,10 @@ use system_error::SystemError;
 use super::TrapFrame;
 use crate::exception::{ebreak::EBreak, extable::ExceptionTableManager};
 use crate::{
-    arch::syscall::syscall_handler,
+    arch::{ipc::signal::Signal, syscall::syscall_handler, CurrentIrqArch, MMArch},
     driver::{clocksource::timer_riscv::RiscVSbiTimer, irqchip::riscv_intc::riscv_intc_irq},
-    exception::softirq::do_softirq,
+    exception::{softirq::do_softirq, InterruptArch},
+    ipc::{signal::force_sig_fault_to_current, signal_types::SEGV_ACCERR},
     mm::VirtAddr,
     process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
     sched::{SchedMode, __schedule},
@@ -37,6 +38,32 @@ static EXCEPTION_HANDLERS: [ExceptionHandler; 16] = [
     default_handler,            // 14
     do_trap_store_page_fault,   // 15
 ];
+
+const ILL_ILLOPC: i32 = 1;
+const ILL_ILLTRP: i32 = 4;
+const BUS_ADRALN: i32 = 1;
+const TRAP_BRKPT: i32 = 1;
+
+// Linux 6.6 RISC-V DO_ERROR_INFO reports epc for access/misalignment
+// traps. Page faults are different: they report stval through user_page_fault.
+fn user_trap_signal(signal: Signal, code: i32, address: usize) -> Result<(), SystemError> {
+    unsafe { CurrentIrqArch::interrupt_enable() };
+    let result = force_sig_fault_to_current(signal, code, VirtAddr::new(address));
+    unsafe { CurrentIrqArch::interrupt_disable() };
+    result
+}
+
+fn user_page_fault(trap_frame: &TrapFrame) -> Result<(), SystemError> {
+    unsafe { CurrentIrqArch::interrupt_enable() };
+    let address = VirtAddr::new(trap_frame.badaddr);
+    let result =
+        match MMArch::handle_user_page_fault(address, trap_frame.cause.code(), trap_frame.epc) {
+            Ok(()) => Ok(()),
+            Err(fault) => force_sig_fault_to_current(fault.signal, fault.code, address),
+        };
+    unsafe { CurrentIrqArch::interrupt_disable() };
+    result
+}
 
 fn try_fixup_kernel_user_access(trap_frame: &mut TrapFrame) -> bool {
     if trap_frame.is_from_user() || ProcessManager::current_pcb().pagefault_disabled() == 0 {
@@ -86,10 +113,6 @@ unsafe extern "C" fn riscv64_do_irq(trap_frame: &mut TrapFrame) {
     } else if trap_frame.cause.is_exception() {
         riscv64_do_exception(trap_frame);
     }
-
-    if from_user {
-        crate::rcu::user_enter();
-    }
 }
 
 /// 处理中断
@@ -105,6 +128,10 @@ fn riscv64_do_exception(trap_frame: &mut TrapFrame) {
         let handler = EXCEPTION_HANDLERS[code];
         handler(trap_frame).ok();
     } else {
+        if trap_frame.is_from_user() {
+            default_handler(trap_frame).ok();
+            return;
+        }
         error!("riscv64_do_irq: exception code out of range");
         loop {
             // kernel die
@@ -113,7 +140,11 @@ fn riscv64_do_exception(trap_frame: &mut TrapFrame) {
     };
 }
 
-fn default_handler(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn default_handler(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGILL, ILL_ILLTRP, trap_frame.epc);
+    }
+
     error!("riscv64_do_irq: handler not found");
     loop {
         spin_loop();
@@ -121,7 +152,11 @@ fn default_handler(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
 }
 
 /// 处理指令地址不对齐异常 #0
-fn do_trap_insn_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_insn_misaligned(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGBUS, BUS_ADRALN, trap_frame.epc);
+    }
+
     error!("riscv64_do_irq: do_trap_insn_misaligned");
     loop {
         spin_loop();
@@ -129,7 +164,11 @@ fn do_trap_insn_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 }
 
 /// 处理指令访问异常 #1
-fn do_trap_insn_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_insn_access_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGSEGV, SEGV_ACCERR, trap_frame.epc);
+    }
+
     error!("riscv64_do_irq: do_trap_insn_access_fault");
     loop {
         spin_loop();
@@ -137,7 +176,11 @@ fn do_trap_insn_access_fault(_trap_frame: &mut TrapFrame) -> Result<(), SystemEr
 }
 
 /// 处理非法指令异常 #2
-fn do_trap_insn_illegal(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_insn_illegal(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGILL, ILL_ILLOPC, trap_frame.epc);
+    }
+
     error!("riscv64_do_irq: do_trap_insn_illegal");
     loop {
         spin_loop();
@@ -146,13 +189,21 @@ fn do_trap_insn_illegal(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> 
 
 /// 处理断点异常 #3
 fn do_trap_break(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGTRAP, TRAP_BRKPT, trap_frame.epc);
+    }
+
     trace!("riscv64_do_irq: do_trap_break");
     // handle breakpoint
     EBreak::handle(trap_frame)
 }
 
 /// 处理加载地址不对齐异常 #4
-fn do_trap_load_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_load_misaligned(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGBUS, BUS_ADRALN, trap_frame.epc);
+    }
+
     error!("riscv64_do_irq: do_trap_load_misaligned");
     loop {
         spin_loop();
@@ -161,6 +212,10 @@ fn do_trap_load_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErro
 
 /// 处理加载访问异常 #5
 fn do_trap_load_access_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGSEGV, SEGV_ACCERR, trap_frame.epc);
+    }
+
     if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     }
@@ -172,7 +227,11 @@ fn do_trap_load_access_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemErr
 }
 
 /// 处理存储地址不对齐异常 #6
-fn do_trap_store_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+fn do_trap_store_misaligned(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGBUS, BUS_ADRALN, trap_frame.epc);
+    }
+
     error!("riscv64_do_irq: do_trap_store_misaligned");
     loop {
         spin_loop();
@@ -181,6 +240,10 @@ fn do_trap_store_misaligned(_trap_frame: &mut TrapFrame) -> Result<(), SystemErr
 
 /// 处理存储访问异常 #7
 fn do_trap_store_access_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
+    if trap_frame.is_from_user() {
+        return user_trap_signal(Signal::SIGSEGV, SEGV_ACCERR, trap_frame.epc);
+    }
+
     if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     }
@@ -212,19 +275,12 @@ fn do_trap_insn_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
     let cause = trap_frame.cause;
     let epc = trap_frame.epc;
     if trap_frame.is_from_user() {
-        error!(
-            "riscv64_do_irq: do_trap_insn_page_fault(user mode): epc: {epc:#x}, vaddr={:#x}, cause={:?}",
-            vaddr, cause
-        );
+        return user_page_fault(trap_frame);
     } else {
         panic!(
             "riscv64_do_irq: do_trap_insn_page_fault(kernel mode): epc: {epc:#x}, vaddr={:#x}, cause={:?}",
             vaddr, cause
         );
-    }
-
-    loop {
-        spin_loop();
     }
 }
 
@@ -234,10 +290,7 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
     let cause = trap_frame.cause;
     let epc = trap_frame.epc;
     if trap_frame.is_from_user() {
-        error!(
-            "riscv64_do_irq: do_trap_load_page_fault(user mode): epc: {epc:#x}, vaddr={:#x}, cause={:?}",
-            vaddr, cause
-        );
+        return user_page_fault(trap_frame);
     } else if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     } else {
@@ -246,17 +299,15 @@ fn do_trap_load_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError
             vaddr, cause
         );
     }
-
-    loop {
-        spin_loop();
-    }
 }
 
 // 14 reserved
 
 /// 处理页存储错误异常 #15
 fn do_trap_store_page_fault(trap_frame: &mut TrapFrame) -> Result<(), SystemError> {
-    if try_fixup_kernel_user_access(trap_frame) {
+    if trap_frame.is_from_user() {
+        return user_page_fault(trap_frame);
+    } else if try_fixup_kernel_user_access(trap_frame) {
         return Ok(());
     }
 

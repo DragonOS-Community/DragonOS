@@ -2,6 +2,7 @@ pub mod abi;
 pub mod cputime;
 pub mod cred;
 pub mod exec;
+pub(crate) mod exec_args;
 pub mod execve;
 pub mod exit;
 pub mod fork;

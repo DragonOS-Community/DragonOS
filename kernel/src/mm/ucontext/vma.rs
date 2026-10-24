@@ -922,6 +922,17 @@ impl VMA {
         } else {
             flags
         };
+        // On RV64 eager allocation does not imply exclusive ownership: fork
+        // may have shared this private page. Preserve the write-fault boundary
+        // when mprotect restores writes, so do_wp_page can establish COW first.
+        #[cfg(target_arch = "riscv64")]
+        let pte_flags = if self.vm_flags.contains(VmFlags::VM_WRITE)
+            && !self.vm_flags.contains(VmFlags::VM_SHARED)
+        {
+            pte_flags.set_write(false)
+        } else {
+            pte_flags
+        };
         let mut page_manager = page_manager_lock();
         for page in self.region.pages() {
             // debug!("remap page {:?}", page.virt_address());

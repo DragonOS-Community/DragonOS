@@ -20,15 +20,51 @@ use crate::{
 
 const DMA32_END: usize = 1usize << 32;
 
-struct Service {
+/// Discovery has a bounded registry window distinct from target execution.
+/// Crossing its table boundary remains an unsuccessful round; advancing within
+/// a window is not evidence that compaction itself has failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ServiceError {
+    DiscoveryProgress,
+    Stopped(Stop),
+}
+impl From<Stop> for ServiceError {
+    fn from(stop: Stop) -> Self {
+        Self::Stopped(stop)
+    }
+}
+impl ServiceError {
+    fn discovery_miss(before: usize, after: usize) -> Self {
+        if after > before {
+            Self::DiscoveryProgress
+        } else {
+            // This is a scanner boundary, not proof that a whole scan used the
+            // same mask: wide/narrow requests deliberately share this cursor.
+            Self::Stopped(Stop::Blocked)
+        }
+    }
+
+    fn into_stop(self) -> Stop {
+        match self {
+            Self::DiscoveryProgress => Stop::Blocked,
+            Self::Stopped(stop) => stop,
+        }
+    }
+}
+
+pub(super) struct Service {
     compactor: Compactor,
     cursor: usize,
+    #[cfg(feature = "mm_selftest")]
+    pub(super) last_moved: usize,
 }
 impl Service {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             compactor: Compactor::new(),
             cursor: 0,
+            #[cfg(feature = "mm_selftest")]
+            last_moved: 0,
         }
     }
 }
@@ -40,12 +76,14 @@ static RECOVERY: Mutex<[Service; MAX_COMPACT_ORDER]> =
 
 /// This is an additional runtime guard, not permission to enter while holding
 /// driver, pool, MM, Page, registry or filesystem I/O resource locks.
-fn context_allowed() -> bool {
+pub(crate) fn context_allowed() -> bool {
     ProcessManager::initialized()
         && CurrentIrqArch::is_irq_enabled()
         && !in_interrupt()
         && ProcessManager::current_pcb().preempt_count() == 0
         && !noio_active()
+        && crate::mm::allocator::reserve::kernel_level()
+            == crate::mm::allocator::reserve::ReserveLevel::Kernel
 }
 
 /// Recover only after the same DMA attempt established fragmentation.
@@ -56,6 +94,7 @@ pub(crate) fn allocate(
     order: usize,
     max: PhysAddr,
     zone: DmaRecoveryZone,
+    deadline: u64,
 ) -> Result<CompactedFrames, Stop> {
     if order == 0 || order > MAX_COMPACT_ORDER {
         return Err(Stop::Invalid);
@@ -65,16 +104,26 @@ pub(crate) fn allocate(
     }
     let mut services = RECOVERY.try_lock().map_err(|_| Stop::Busy)?;
     let service = &mut services[order - 1];
-    service.allocate(order, max, zone)
+    service
+        .allocate(order, max, zone, Some(deadline))
+        .map_err(ServiceError::into_stop)
 }
 
 impl Service {
-    fn allocate(
+    pub(super) fn allocate(
         &mut self,
         order: usize,
         max: PhysAddr,
         zone: DmaRecoveryZone,
-    ) -> Result<CompactedFrames, Stop> {
+        deadline: Option<u64>,
+    ) -> Result<CompactedFrames, ServiceError> {
+        #[cfg(feature = "mm_selftest")]
+        {
+            self.last_moved = 0;
+        }
+        if deadline.is_some_and(|until| crate::time::timer::clock() >= until) {
+            return Err(Stop::Timeout.into());
+        }
         // The same failed buddy attempt proved capacity in this one zone.
         // Do not spend its evidence on a different, capacity-starved domain.
         let normal = matches!(zone, DmaRecoveryZone::Normal);
@@ -85,32 +134,43 @@ impl Service {
             PhysAddr::new(max.data().min(u32::MAX as usize))
         };
         if minimum > maximum {
-            return Err(Stop::Invalid);
+            return Err(Stop::Invalid.into());
         }
         let cursor_before = self.cursor;
         let physical =
             compaction_candidate(&mut self.cursor, minimum, maximum).map_err(|_| Stop::Busy)?;
-        if let Some(request) =
-            physical.and_then(|physical| candidate_request(physical, order, max, normal))
-        {
+        let Some(physical) = physical else {
+            return Err(ServiceError::discovery_miss(cursor_before, self.cursor));
+        };
+        if let Some(mut request) = candidate_request(physical, order, max, normal) {
             // Deferred work did not consume this candidate. Keep its discovery
             // position so the next real attempt cannot skip it in lockstep with
             // the domain's exponential backoff.
-            let outcome = self.compactor.allocate(request).outcome;
+            request.deadline = deadline;
+            let attempt = self.compactor.allocate(request);
+            #[cfg(feature = "mm_selftest")]
+            {
+                self.last_moved = attempt.stats.moved;
+            }
+            let outcome = attempt.outcome;
             if matches!(&outcome, Err(Stop::Deferred)) {
                 self.cursor = cursor_before;
             }
             let run = outcome?;
-            if matches!(zone, DmaRecoveryZone::Dma32Fallback)
-                && !LockedFrameAllocator::with_buddy(|buddy| buddy.dma32_fallback_allowed(0))
-                    .unwrap_or(false)
+            let level = crate::mm::allocator::reserve::kernel_level();
+            if !LockedFrameAllocator::with_buddy(|buddy| {
+                buddy.held_handoff_allowed(run.start(), level)
+                    && (!matches!(zone, DmaRecoveryZone::Dma32Fallback)
+                        || buddy.dma32_fallback_allowed(0))
+            })
+            .unwrap_or(false)
             {
                 drop(run);
-                return Err(Stop::Busy);
+                return Err(Stop::Busy.into());
             }
             return Ok(run);
         }
-        Err(Stop::Blocked)
+        Err(Stop::Blocked.into())
     }
 }
 
@@ -165,15 +225,66 @@ fn candidate_request(
         end: PhysAddr::new(end),
         order,
         start_at: Some(PhysAddr::new(seed)),
+        deadline: None,
         limits: Limits {
-            targets: 1,
+            targets: 8,
             entries: 16384,
             pages: 512,
             migrations: 512,
             rmaps: 64,
-            no_progress: 1,
+            no_progress: 8,
         },
     })
+}
+
+/// Formal contention coverage owns only the existing synchronous service lock.
+/// The independent background service remains runnable throughout the request.
+#[cfg(feature = "mm_selftest")]
+pub(crate) mod selftest {
+    #[inline(never)]
+    pub(crate) fn discovery_boundaries(buckets: usize) -> bool {
+        use super::{
+            DmaRecoveryZone, MMArch, MemoryManagementArch, PhysAddr, Service, ServiceError, Stop,
+        };
+        if buckets == 0 {
+            return false;
+        }
+        let mut service = Service::new();
+        // Physical page zero is reserved by boot and checked by the caller.
+        // No candidate override is used: both queries inspect the real registry.
+        let first = service.allocate(
+            1,
+            PhysAddr::new(MMArch::PAGE_SIZE - 1),
+            DmaRecoveryZone::Dma32,
+            None,
+        );
+        let advancing = if buckets > 256 {
+            matches!(first, Err(ServiceError::DiscoveryProgress)) && service.cursor == 256
+        } else {
+            matches!(first, Err(ServiceError::Stopped(Stop::Blocked))) && service.cursor == 0
+        };
+        service.cursor = buckets - 1;
+        let boundary = service.allocate(
+            1,
+            PhysAddr::new(MMArch::PAGE_SIZE - 1),
+            DmaRecoveryZone::Dma32,
+            None,
+        );
+        advancing
+            && matches!(boundary, Err(ServiceError::Stopped(Stop::Blocked)))
+            && ServiceError::discovery_miss(512, 256) == ServiceError::Stopped(Stop::Blocked)
+            && ServiceError::DiscoveryProgress.into_stop() == Stop::Blocked
+    }
+
+    pub(crate) fn allocate_with_direct_contention(
+        pages: usize,
+        options: crate::mm::dma::DmaAllocOptions,
+    ) -> Result<crate::mm::dma::DmaBuffer, system_error::SystemError> {
+        let _direct = super::RECOVERY
+            .try_lock()
+            .map_err(|_| system_error::SystemError::EBUSY)?;
+        crate::mm::dma::DmaBuffer::try_alloc_pages(pages, options)
+    }
 }
 
 /// Caller owns a fragmented prefix whose seeded target begins with a raw
@@ -185,9 +296,11 @@ pub(crate) fn deferred_discovery_selftest(
     order: usize,
     max: PhysAddr,
 ) -> bool {
-    let Some(request) = candidate_request(physical, order, max, false) else {
+    let Some(mut request) = candidate_request(physical, order, max, false) else {
         return false;
     };
+    request.limits.targets = 1;
+    request.limits.no_progress = 1;
     let mut service = Service::new();
     // Establish backoff with the real blocked target, not a synthetic flag.
     if !matches!(
@@ -202,10 +315,15 @@ pub(crate) fn deferred_discovery_selftest(
     {
         return false;
     }
-    let deferred = service.allocate(order, max, DmaRecoveryZone::Dma32);
-    if !matches!(deferred, Err(Stop::Deferred)) || service.cursor != cursor {
+    let deferred = service.allocate(order, max, DmaRecoveryZone::Dma32, None);
+    if !matches!(deferred, Err(ServiceError::Stopped(Stop::Deferred))) || service.cursor != cursor {
         return false;
     }
-    let attempted = service.allocate(order, max, DmaRecoveryZone::Dma32);
-    matches!(attempted, Err(Stop::Blocked)) && service.cursor == expected
+    let attempted = service.allocate(order, max, DmaRecoveryZone::Dma32, None);
+    !matches!(
+        attempted,
+        Err(ServiceError::Stopped(
+            Stop::Deferred | Stop::Invalid | Stop::Timeout
+        ))
+    ) && service.cursor == expected
 }

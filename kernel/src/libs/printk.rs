@@ -1,6 +1,5 @@
 use core::fmt::{self, Write};
 
-use alloc::string::{String, ToString};
 use log::{info, Level, Log};
 
 use super::lib_ui::textui::{textui_putstr, FontColor};
@@ -8,7 +7,10 @@ use super::lib_ui::textui::{textui_putstr, FontColor};
 use crate::{
     debug::klog::loglevel::{LogLevel, KERNEL_LOG_LEVEL},
     driver::tty::{tty_driver::TtyOperation, virtual_terminal::vc_manager},
-    filesystem::procfs::{klog::LogMessage, kmsg::KMSG},
+    filesystem::procfs::{
+        klog::LogMessage,
+        kmsg::{notify_readers, KMSG},
+    },
     time::PosixTimeSpec,
 };
 
@@ -122,32 +124,45 @@ impl Logger {
         let Some(kmsg) = (unsafe { KMSG.as_ref() }) else {
             return;
         };
-        let mut message = String::new();
-        if message.try_reserve_exact(text.len()).is_err() {
+        let Ok(message) = LogMessage::try_new(
+            PosixTimeSpec::now_cpu_time(),
+            level,
+            format_args!("{}", text),
+        ) else {
             return;
-        }
-        message.push_str(text);
-        let record = LogMessage::new(PosixTimeSpec::now_cpu_time(), level, message);
+        };
+        let Ok(record) = alloc::sync::Arc::try_new(message) else {
+            return;
+        };
         // Kmsg::push 返回被驱逐消息，必须在锁外 drop：锁内释放堆内存可能
         // 进入分配器慢路径而睡眠（持自旋锁睡眠 = 永久楔死）。
+        let mut pending = Some(record);
         let evicted = match kmsg.try_lock_irqsave() {
-            Ok(mut kmsg) => kmsg.push(record),
+            Ok(mut kmsg) => kmsg.push(pending.take().unwrap()),
             Err(_) => None,
         };
+        let published = pending.is_none();
         drop(evicted);
+        drop(pending);
+        if published {
+            notify_readers();
+        }
     }
 
     pub fn log(&self, log_level: LogLevel, message: fmt::Arguments) {
-        if unsafe { KMSG.is_some() } {
-            let timestamp: PosixTimeSpec = PosixTimeSpec::now_cpu_time();
-
-            let log_message = LogMessage::new(timestamp, log_level, message.to_string());
-
-            // to_string 的分配在锁外完成；push 返回的驱逐消息也必须
-            // 在 KMSG 锁释放后再 drop，锁内只做无分配的槽位操作。
-            let evicted = unsafe { KMSG.as_ref().unwrap().lock_irqsave().push(log_message) };
-            drop(evicted);
-        }
+        let Some(kmsg) = (unsafe { KMSG.as_ref() }) else {
+            return;
+        };
+        let Ok(record) = LogMessage::try_new(PosixTimeSpec::now_cpu_time(), log_level, message)
+            .and_then(|record| {
+                alloc::sync::Arc::try_new(record).map_err(|_| system_error::SystemError::ENOMEM)
+            })
+        else {
+            return;
+        };
+        let evicted = kmsg.lock_irqsave().push(record);
+        drop(evicted);
+        notify_readers();
     }
 }
 
@@ -157,17 +172,19 @@ impl Logger {
 struct KernelLogger;
 
 impl Log for KernelLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        // 根据全局日志级别过滤日志
-        KERNEL_LOG_LEVEL.should_print(metadata.level().into())
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        // Console policy must not discard records from the kernel log ring.
+        true
     }
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
             // 记录到 kmsg 缓冲区
             Self::kernel_log(record);
-            // 输出到控制台
-            Self::iodisplay(record)
+            // The console threshold only controls the real console sink.
+            if KERNEL_LOG_LEVEL.should_print(record.level().into()) {
+                Self::iodisplay(record)
+            }
         }
     }
 

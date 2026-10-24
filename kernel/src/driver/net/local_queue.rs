@@ -1,8 +1,61 @@
 pub(super) use super::deferred_queue::DeferredRouteKey;
 use super::deferred_queue::{DeferredRouteLimits, DeferredRouteQueue, JoinDeferredResult};
 use super::*;
+use crate::libs::prepared_queue::{Node as PreparedNode, Queue as PreparedQueue};
 use crate::net::conntrack::CtPacketContext;
 use core::cell::RefCell;
+
+pub(super) const MAX_LOCAL_OUTPUT_FRAMES: usize = 1024;
+pub(super) type OutputNode = alloc::boxed::Box<PreparedNode<OutputEnvelope>>;
+pub(super) type OutputQueue = PreparedQueue<OutputEnvelope>;
+const _: () = assert!(
+    core::mem::size_of::<PreparedNode<OutputEnvelope>>() <= crate::libs::paged_vec::CHUNK_BYTES
+);
+const _: () = assert!(
+    core::mem::size_of::<PreparedNode<LocalInputPacket>>() <= crate::libs::paged_vec::CHUNK_BYTES
+);
+
+/// One admission node follows its packet through ready, backpressure and
+/// neighbor queues. Only an uncommitted reservation may have no packet.
+#[derive(Debug)]
+pub(super) struct OutputEnvelope {
+    pub(super) packet: Option<LocalOutputPacket>,
+    pub(super) retry_at: smoltcp::time::Instant,
+}
+
+impl OutputEnvelope {
+    fn empty() -> Self {
+        Self {
+            packet: None,
+            retry_at: smoltcp::time::Instant::from_micros(0),
+        }
+    }
+
+    pub(super) fn packet(&self) -> &LocalOutputPacket {
+        self.packet
+            .as_ref()
+            .expect("published output node has a packet")
+    }
+
+    pub(super) fn packet_mut(&mut self) -> &mut LocalOutputPacket {
+        self.packet
+            .as_mut()
+            .expect("published output node has a packet")
+    }
+}
+
+impl core::ops::Deref for OutputEnvelope {
+    type Target = LocalOutputPacket;
+    fn deref(&self) -> &Self::Target {
+        self.packet()
+    }
+}
+
+impl core::ops::DerefMut for OutputEnvelope {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.packet_mut()
+    }
+}
 
 /// Optional accounting owner for a queued output datagram. The networking
 /// queue knows only that bytes were charged, not which socket/account owns
@@ -64,7 +117,7 @@ mod charge_tests {
 }
 
 pub(super) struct LocalInputRxToken<'a> {
-    pub(super) frame: Vec<u8>,
+    pub(super) frame: PacketBuffer,
     pub(super) meta: PacketMeta,
     pub(super) ingress_stage: IngressStage,
     pub(super) stage_cell: Option<&'a Cell<IngressStage>>,
@@ -180,7 +233,7 @@ mod local_input_context_tests {
         let broadcast = Cell::new(false);
         let context = RefCell::new(Some(CtPacketContext::Invalid));
         LocalInputRxToken {
-            frame: Vec::new(),
+            frame: PacketBuffer::new(),
             meta: PacketMeta::default(),
             ingress_stage: IngressStage::PreRoutingDone,
             stage_cell: Some(&stage),
@@ -210,7 +263,7 @@ mod local_input_context_tests {
     fn token_without_context_does_not_restore_previous_packet() {
         let context = RefCell::new(Some(CtPacketContext::Invalid));
         LocalInputRxToken {
-            frame: Vec::new(),
+            frame: PacketBuffer::new(),
             meta: PacketMeta::default(),
             ingress_stage: IngressStage::LocalOutput,
             stage_cell: None,
@@ -231,7 +284,7 @@ mod local_input_context_tests {
     fn local_token_installs_mark_only_during_consume() {
         let mark = Cell::new(0);
         LocalInputRxToken {
-            frame: Vec::new(),
+            frame: PacketBuffer::new(),
             meta: PacketMeta::default(),
             ingress_stage: IngressStage::LocalOutput,
             stage_cell: None,
@@ -256,7 +309,7 @@ pub(super) struct LocalInputPacket {
     pub(super) broadcast: bool,
     pub(super) destination_mac: smoltcp::wire::EthernetAddress,
     pub(super) source_mac: smoltcp::wire::EthernetAddress,
-    pub(super) ip_packet: Vec<u8>,
+    pub(super) ip_packet: PacketBuffer,
     pub(super) ct_context: Option<CtPacketContext>,
     pub(super) mark: u32,
     pub(super) forward_fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
@@ -267,7 +320,14 @@ impl LocalInputPacket {
         self.ip_packet.len()
     }
 
-    pub(super) fn into_frame(self, medium: smoltcp::phy::Medium) -> Result<Vec<u8>, SystemError> {
+    fn resident_bytes(&self) -> usize {
+        self.ip_packet.capacity()
+    }
+
+    pub(super) fn into_frame(
+        self,
+        medium: smoltcp::phy::Medium,
+    ) -> Result<PacketBuffer, SystemError> {
         let ethertype = match smoltcp::wire::IpVersion::of_packet(&self.ip_packet)
             .map_err(|_| SystemError::EINVAL)?
         {
@@ -280,21 +340,21 @@ impl LocalInputPacket {
         let frame_len = 14usize
             .checked_add(self.ip_packet.len())
             .ok_or(SystemError::EMSGSIZE)?;
-        let mut frame = Vec::new();
+        let mut frame = PacketBuffer::new();
         frame
             .try_reserve_exact(frame_len)
             .map_err(|_| SystemError::ENOMEM)?;
-        frame.extend_from_slice(&self.destination_mac.0);
-        frame.extend_from_slice(&self.source_mac.0);
-        frame.extend_from_slice(&ethertype);
-        frame.extend_from_slice(&self.ip_packet);
+        frame.extend_from_slice(&self.destination_mac.0)?;
+        frame.extend_from_slice(&self.source_mac.0)?;
+        frame.extend_from_slice(&ethertype)?;
+        frame.extend_from_slice(&self.ip_packet)?;
         Ok(frame)
     }
 }
 
 #[derive(Debug)]
 pub(super) struct LocalInputQueueState {
-    pub(super) packets: VecDeque<LocalInputPacket>,
+    pub(super) packets: PreparedQueue<LocalInputPacket>,
     pub(super) bytes: usize,
 }
 
@@ -303,7 +363,7 @@ pub(super) struct LocalOutputPacket {
     pub(super) medium: smoltcp::phy::Medium,
     pub(super) meta: PacketMeta,
     pub(super) disposition: LocalOutputDisposition,
-    pub(super) frame: Vec<u8>,
+    pub(super) frame: PacketBuffer,
     /// Only tracked packets allocate a sidecar. Keeping the large candidate
     /// off the queue header preserves its normal no-CT footprint and avoids
     /// inflating every output/deferred-queue enum variant.
@@ -351,12 +411,6 @@ pub(super) enum PreparedIpProgress {
         identification: u32,
         max_fragment_len: Option<usize>,
     },
-}
-
-#[derive(Debug)]
-pub(super) struct BackpressuredLocalOutput {
-    pub(super) retry_at: smoltcp::time::Instant,
-    pub(super) packet: LocalOutputPacket,
 }
 
 /// Immutable output policy chosen before entering the smoltcp serialization
@@ -493,8 +547,8 @@ mod context_tests {
 
 #[derive(Debug, Default)]
 pub(super) struct LocalOutputQueueState {
-    pub(super) packets: VecDeque<LocalOutputPacket>,
-    pub(super) backpressured: VecDeque<BackpressuredLocalOutput>,
+    pub(super) packets: OutputQueue,
+    pub(super) backpressured: OutputQueue,
     pub(super) deferred_routes: DeferredRouteQueue,
     pub(super) frames: usize,
     pub(super) bytes: usize,
@@ -504,7 +558,7 @@ pub(super) struct LocalOutputQueueState {
 
 #[derive(Debug, Default)]
 pub(super) struct LocalOutputScratchPool {
-    pub(super) buffers: Vec<Vec<u8>>,
+    pub(super) buffers: Vec<PacketBuffer>,
     pub(super) bytes: usize,
 }
 
@@ -524,12 +578,31 @@ pub(super) struct LocalOutputDrainGuard<'a> {
     pub(super) active: bool,
 }
 
-pub(super) struct LocalOutputReservation<'a> {
-    pub(super) output: &'a SpinLock<LocalOutputQueueState>,
-    pub(super) bytes: usize,
-    pub(super) active: bool,
+enum OutputQueueRef<'a> {
+    Borrowed(&'a SpinLock<LocalOutputQueueState>),
+    Owned(Arc<dyn Iface>),
+}
+impl core::ops::Deref for OutputQueueRef<'_> {
+    type Target = SpinLock<LocalOutputQueueState>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(output) => output,
+            Self::Owned(iface) => &iface.common().local_input_queue.output,
+        }
+    }
 }
 
+pub(super) struct LocalOutputReservation<'a> {
+    output: OutputQueueRef<'a>,
+    pub(super) bytes: usize,
+    pub(super) active: bool,
+    node: Option<OutputNode>,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transfer the existing packet and receipt without a poll-path allocation"
+)]
 pub(super) enum LocalOutputPop<'a> {
     Ready(
         LocalOutputPacket,
@@ -539,6 +612,10 @@ pub(super) enum LocalOutputPop<'a> {
     DeferredUntil(smoltcp::time::Instant),
     Empty,
 }
+
+// This is a small, short-lived stack carrier. Boxing Ready would introduce a
+// fallible allocation after the queue has already admitted the packet.
+const _: () = assert!(core::mem::size_of::<LocalOutputPop<'static>>() <= 256);
 
 pub(super) enum ExistingDeferredCommit<'a> {
     Queued(smoltcp::time::Instant),
@@ -584,8 +661,26 @@ impl LocalOutputDrainGuard<'_> {
 }
 
 impl<'a> LocalOutputReservation<'a> {
+    fn install_packet(slot: &mut Option<OutputNode>, packet: LocalOutputPacket) -> OutputNode {
+        let mut node = slot.take().expect("output reservation owns its node");
+        debug_assert!(node.value().packet.is_none());
+        node.value_mut().packet = Some(packet);
+        node
+    }
+
+    fn restore_node(slot: &mut Option<OutputNode>, mut node: OutputNode) -> LocalOutputPacket {
+        let packet = node
+            .value_mut()
+            .packet
+            .take()
+            .expect("output node owns packet");
+        debug_assert!(slot.is_none());
+        *slot = Some(node);
+        packet
+    }
+
     /// Move this token's byte reservation without changing the queue-wide
-    /// frame reservation. This is used when routing selects a larger MTU.
+    /// frame reservation. Prepare the actual capacity before buffer birth.
     pub(super) fn try_resize(&mut self, bytes: usize) -> bool {
         let mut output = self.output.lock();
         let unreserved = output.reserved_bytes - self.bytes;
@@ -632,7 +727,7 @@ impl<'a> LocalOutputReservation<'a> {
     )]
     pub(super) fn commit_prepared_ipv4(
         self,
-        frame: Vec<u8>,
+        frame: PacketBuffer,
         meta: PacketMeta,
         disposition: LocalOutputDisposition,
         may_fragment: bool,
@@ -663,7 +758,7 @@ impl<'a> LocalOutputReservation<'a> {
     )]
     pub(super) fn commit_prepared_ipv6(
         self,
-        frame: Vec<u8>,
+        frame: PacketBuffer,
         meta: PacketMeta,
         disposition: LocalOutputDisposition,
         identification: u32,
@@ -699,20 +794,18 @@ impl<'a> LocalOutputReservation<'a> {
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
         output.bytes += self.bytes;
-        let queued = BackpressuredLocalOutput { retry_at, packet };
-        if output
+        let mut node = Self::install_packet(&mut self.node, packet);
+        node.value_mut().retry_at = retry_at;
+        if let Some(index) = output
             .backpressured
-            .back()
-            .is_none_or(|tail| tail.retry_at <= retry_at)
+            .iter()
+            .position(|queued| queued.retry_at > retry_at)
         {
-            output.backpressured.push_back(queued);
+            let mut later = output.backpressured.split_off(index);
+            output.backpressured.push_node(node);
+            output.backpressured.append(&mut later);
         } else {
-            let index = output
-                .backpressured
-                .iter()
-                .position(|queued| queued.retry_at > retry_at)
-                .expect("a later backpressure deadline exists");
-            output.backpressured.insert(index, queued);
+            output.backpressured.push_node(node);
         }
         self.active = false;
     }
@@ -721,7 +814,7 @@ impl<'a> LocalOutputReservation<'a> {
         self,
         medium: smoltcp::phy::Medium,
         meta: PacketMeta,
-        frame: Vec<u8>,
+        frame: PacketBuffer,
         retry_at: smoltcp::time::Instant,
     ) {
         self.requeue_backpressured(
@@ -755,12 +848,13 @@ impl<'a> LocalOutputReservation<'a> {
 
     fn commit_packet(mut self, packet: LocalOutputPacket) {
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
         output.bytes += self.bytes;
-        output.packets.push_back(packet);
+        output.packets.push_node(node);
         self.active = false;
     }
 
@@ -784,15 +878,18 @@ impl<'a> LocalOutputReservation<'a> {
         let LocalOutputDisposition::Routed { .. } = packet.disposition else {
             return Err(packet);
         };
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
-        output.deferred_routes.try_enqueue(
-            packet,
+        if let Err(node) = output.deferred_routes.try_enqueue(
+            node,
             self.bytes,
             retry_at,
             probe_sent,
             advance_existing_probe,
             LocalInputQueue::DEFERRED_ROUTE_LIMITS,
-        )?;
+        ) {
+            return Err(Self::restore_node(&mut self.node, node));
+        }
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
@@ -811,18 +908,21 @@ impl<'a> LocalOutputReservation<'a> {
             return ExistingDeferredCommit::Missing(packet, self);
         };
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         let retry_at = match output.deferred_routes.try_join(
-            packet,
+            node,
             self.bytes,
             LocalInputQueue::DEFERRED_ROUTE_LIMITS,
         ) {
             JoinDeferredResult::Queued(retry_at) => retry_at,
-            JoinDeferredResult::Missing(packet) => {
+            JoinDeferredResult::Missing(node) => {
+                let packet = Self::restore_node(&mut self.node, node);
                 drop(output);
                 return ExistingDeferredCommit::Missing(packet, self);
             }
-            JoinDeferredResult::Full(packet) => {
+            JoinDeferredResult::Full(node) => {
+                let packet = Self::restore_node(&mut self.node, node);
                 drop(output);
                 return ExistingDeferredCommit::Full(packet, self);
             }
@@ -847,14 +947,19 @@ impl<'a> LocalOutputReservation<'a> {
         probe_sent: bool,
     ) -> Result<bool, LocalOutputPacket> {
         debug_assert_eq!(packet.frame.capacity(), self.bytes);
+        let node = Self::install_packet(&mut self.node, packet);
         let mut output = self.output.lock();
         let LocalOutputQueueState {
             packets,
             deferred_routes,
             ..
         } = &mut *output;
-        let resolved =
-            deferred_routes.finish_probe(packet, self.bytes, key, retry_at, probe_sent, packets)?;
+        let resolved = match deferred_routes
+            .finish_probe(node, self.bytes, key, retry_at, probe_sent, packets)
+        {
+            Ok(resolved) => resolved,
+            Err(node) => return Err(Self::restore_node(&mut self.node, node)),
+        };
         output.reserved_frames -= 1;
         output.reserved_bytes -= self.bytes;
         output.frames += 1;
@@ -876,7 +981,7 @@ impl Drop for LocalOutputReservation<'_> {
 }
 
 impl LocalInputQueue {
-    const MAX_FRAMES: usize = 1024;
+    const MAX_FRAMES: usize = MAX_LOCAL_OUTPUT_FRAMES;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
     const MAX_DEFERRED_FRAMES_PER_NEIGHBOR: usize = 64;
     const MAX_DEFERRED_BYTES_PER_NEIGHBOR: usize = 256 * 1024;
@@ -891,7 +996,7 @@ impl LocalInputQueue {
     pub(super) fn new() -> Self {
         Self {
             state: SpinLock::new(LocalInputQueueState {
-                packets: VecDeque::new(),
+                packets: PreparedQueue::new(),
                 bytes: 0,
             }),
             response_scratch: SpinLock::new(LocalOutputScratchPool::default()),
@@ -906,28 +1011,25 @@ impl LocalInputQueue {
         packet: LocalInputPacket,
         owner_still_current: impl FnOnce() -> bool,
     ) -> Result<(), SystemError> {
+        let node = PreparedNode::try_new(packet)?;
         let mut state = self.state.lock();
         if !self.accepting.load(Ordering::Acquire) || !owner_still_current() {
             return Err(SystemError::ENODEV);
         }
         if state.packets.len() >= Self::MAX_FRAMES
-            || state.bytes.saturating_add(packet.len()) > Self::MAX_BYTES
+            || state.bytes.saturating_add(node.value().resident_bytes()) > Self::MAX_BYTES
         {
             return Err(SystemError::ENOBUFS);
         }
-        state
-            .packets
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        state.bytes += packet.len();
-        state.packets.push_back(packet);
+        state.bytes += node.value().resident_bytes();
+        state.packets.push_node(node);
         Ok(())
     }
 
     pub(super) fn pop(&self) -> Option<LocalInputPacket> {
         let mut state = self.state.lock();
-        let packet = state.packets.pop_front()?;
-        state.bytes -= packet.len();
+        let packet = state.packets.pop_node()?.into_value();
+        state.bytes -= packet.resident_bytes();
         Some(packet)
     }
 
@@ -966,6 +1068,25 @@ impl LocalInputQueue {
         self.accepting.store(true, Ordering::Release);
     }
 
+    /// Retain the interface only while a token owns an unpublished receipt.
+    /// commit puts just its packet/node into the queue, never this Arc.
+    pub(super) fn reserve_owned_output(
+        iface: Arc<dyn Iface>,
+    ) -> Option<LocalOutputReservation<'static>> {
+        let mut reservation = iface.common().local_input_queue.reserve_output()?;
+        let bytes = reservation.bytes;
+        let active = reservation.active;
+        let node = reservation.node.take();
+        reservation.active = false;
+        drop(reservation);
+        Some(LocalOutputReservation {
+            output: OutputQueueRef::Owned(iface),
+            bytes,
+            active,
+            node,
+        })
+    }
+
     pub(super) fn reserve_output(&self) -> Option<LocalOutputReservation<'_>> {
         let mut output = self.output.lock();
         if !self.accepting.load(Ordering::Acquire) {
@@ -974,26 +1095,15 @@ impl LocalInputQueue {
         if output.frames.saturating_add(output.reserved_frames) >= Self::MAX_FRAMES {
             return None;
         }
-        let additional = output
-            .frames
-            .saturating_add(output.reserved_frames)
-            .saturating_add(1)
-            .saturating_sub(output.packets.len());
-        output.packets.try_reserve(additional).ok()?;
-        let additional_backpressured = output
-            .frames
-            .saturating_add(output.reserved_frames)
-            .saturating_add(1)
-            .saturating_sub(output.backpressured.len());
-        output
-            .backpressured
-            .try_reserve(additional_backpressured)
-            .ok()?;
+        let node = PreparedNode::try_new(OutputEnvelope::empty()).ok()?;
+        let frames = output.frames + output.reserved_frames + 1;
+        output.deferred_routes.prepare_capacity(frames).ok()?;
         output.reserved_frames += 1;
         Some(LocalOutputReservation {
-            output: &self.output,
+            output: OutputQueueRef::Borrowed(&self.output),
             bytes: 0,
             active: true,
+            node: Some(node),
         })
     }
 
@@ -1010,9 +1120,9 @@ impl LocalInputQueue {
         {
             let queued = output
                 .backpressured
-                .pop_front()
+                .pop_node()
                 .expect("front was observed above");
-            output.packets.push_back(queued.packet);
+            output.packets.push_node(queued);
         }
         // Give one due neighbor bucket priority per drain round. The rest of
         // the round preserves FIFO service for ready output.
@@ -1028,12 +1138,17 @@ impl LocalInputQueue {
                 .pop_due(now, Self::MAX_NEIGHBOR_PROBES, packets)
                 .expect("a due deferred bucket was observed");
             (Some(packet), key)
-        } else if let Some(packet) = output.packets.pop_front() {
+        } else if let Some(packet) = output.packets.pop_node() {
             (Some(packet), None)
         } else {
             (None, None)
         };
-        if let Some(packet) = packet {
+        if let Some(mut node) = packet {
+            let packet = node
+                .value_mut()
+                .packet
+                .take()
+                .expect("queued output owns packet");
             let bytes = packet.frame.capacity();
             output.frames -= 1;
             output.bytes -= bytes;
@@ -1042,9 +1157,10 @@ impl LocalInputQueue {
             return LocalOutputPop::Ready(
                 packet,
                 LocalOutputReservation {
-                    output: &self.output,
+                    output: OutputQueueRef::Borrowed(&self.output),
                     bytes,
                     active: true,
+                    node: Some(node),
                 },
                 probe_key,
             );
@@ -1086,9 +1202,8 @@ impl LocalInputQueue {
         if output.backpressured.is_empty() {
             return false;
         }
-        while let Some(queued) = output.backpressured.pop_front() {
-            output.packets.push_back(queued.packet);
-        }
+        let mut released = core::mem::take(&mut output.backpressured);
+        output.packets.append(&mut released);
         true
     }
 
@@ -1185,11 +1300,18 @@ impl LocalInputQueue {
         guard.finish_and_has_output(&self.output)
     }
 
-    pub(super) fn recycle_output(&self, frame: Vec<u8>) {
+    pub(super) fn recycle_output(&self, frame: PacketBuffer) {
         Self::recycle_scratch(&self.response_scratch, frame);
     }
 
-    pub(super) fn recycle_scratch(pool: &SpinLock<LocalOutputScratchPool>, mut frame: Vec<u8>) {
+    pub(super) fn recycle_scratch(
+        pool: &SpinLock<LocalOutputScratchPool>,
+        mut frame: PacketBuffer,
+    ) {
+        if frame.capacity() > crate::libs::paged_vec::CHUNK_BYTES {
+            return;
+        }
+
         frame.clear();
         let mut pooled = pool.lock();
         if pooled.buffers.len() >= Self::MAX_SCRATCH_FRAMES
@@ -1201,6 +1323,55 @@ impl LocalInputQueue {
         pooled.bytes += frame.capacity();
         pooled.buffers.push(frame);
     }
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn input_residency_selftest() -> bool {
+    fn packet(capacity: usize) -> Result<LocalInputPacket, SystemError> {
+        let mut bytes = PacketBuffer::try_with_capacity(capacity)?;
+        bytes.resize(capacity.min(20), 0xa5)?;
+        Ok(LocalInputPacket {
+            ingress_ifindex: 1,
+            ingress_stage: IngressStage::Pending,
+            broadcast: false,
+            destination_mac: smoltcp::wire::EthernetAddress([0; 6]),
+            source_mac: smoltcp::wire::EthernetAddress([0; 6]),
+            ip_packet: bytes,
+            ct_context: None,
+            mark: 0,
+            forward_fragment: None,
+        })
+    }
+    fn run() -> Result<bool, SystemError> {
+        let queue = LocalInputQueue::new();
+        let input = packet(LocalInputQueue::MAX_BYTES)?;
+        let pointer = input.ip_packet.as_ptr();
+        queue.enqueue(input, || true)?;
+        let resident = queue.state.lock().bytes;
+        if resident != LocalInputQueue::MAX_BYTES
+            || !matches!(
+                queue.enqueue(packet(1)?, || true),
+                Err(SystemError::ENOBUFS)
+            )
+        {
+            return Ok(false);
+        }
+        let input = queue.pop().ok_or(SystemError::EIO)?;
+        if input.ip_packet.as_ptr() != pointer
+            || input.len() != 20
+            || input.resident_bytes() != LocalInputQueue::MAX_BYTES
+            || input.ip_packet.iter().any(|byte| *byte != 0xa5)
+            || queue.state.lock().bytes != 0
+        {
+            return Ok(false);
+        }
+        drop(input);
+        queue.enqueue(packet(1)?, || true)?;
+        drop(queue.pop().ok_or(SystemError::EIO)?);
+        let state = queue.state.lock();
+        Ok(state.bytes == 0 && state.packets.is_empty())
+    }
+    run().unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1215,7 +1386,7 @@ mod output_ct_context_tests {
         ]));
         let now = smoltcp::time::Instant::from_millis(0);
         for (mark, retry_ms) in [(1, 1000), (2, 2000)] {
-            let frame = alloc::vec![0x60; 40];
+            let frame = PacketBuffer::from_existing_heap(alloc::vec![0x60; 40]);
             let mut reservation = queue.reserve_output().unwrap();
             assert!(reservation.try_resize(frame.capacity()));
             reservation
@@ -1283,9 +1454,9 @@ mod output_ct_context_tests {
     fn deferred_output_keeps_its_packet_context_across_retry() {
         let queue = LocalInputQueue::new();
         let mut reservation = queue.reserve_output().unwrap();
-        let mut frame = Vec::new();
+        let mut frame = PacketBuffer::new();
         frame.try_reserve_exact(20).unwrap();
-        frame.resize(20, 0);
+        frame.resize(20, 0).unwrap();
         assert!(reservation.try_resize(frame.capacity()));
         reservation.commit_packet(LocalOutputPacket {
             medium: smoltcp::phy::Medium::Ip,
@@ -1334,7 +1505,7 @@ mod output_ct_context_tests {
     fn prepared_ipv6_keeps_tracking_context_across_retry() {
         let queue = LocalInputQueue::new();
         let mut reservation = queue.reserve_output().unwrap();
-        let frame = alloc::vec![0x60; 40];
+        let frame = PacketBuffer::from_existing_heap(alloc::vec![0x60; 40]);
         assert!(reservation.try_resize(frame.capacity()));
         reservation.commit_prepared_ipv6(
             frame,

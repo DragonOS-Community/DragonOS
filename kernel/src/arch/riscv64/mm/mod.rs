@@ -24,6 +24,7 @@ use crate::{
 use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
 
 pub mod bump;
+mod fault;
 pub(super) mod init;
 
 pub type PageMapper = crate::mm::page::PageMapper<RiscV64MMArch, LockedFrameAllocator>;
@@ -491,6 +492,18 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> Ent
 pub struct LockedFrameAllocator;
 
 impl LockedFrameAllocator {
+    pub(crate) fn with_buddy<T>(
+        operation: impl FnOnce(&mut BuddyAllocator<MMArch>) -> T,
+    ) -> Option<T> {
+        INNER_ALLOCATOR.lock_irqsave().as_mut().map(operation)
+    }
+    pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_ref()
+            .map(BuddyAllocator::pressure_snapshot)
+            .unwrap_or_default()
+    }
     pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
         INNER_ALLOCATOR
             .lock_irqsave()
@@ -500,12 +513,24 @@ impl LockedFrameAllocator {
 }
 
 impl FrameAllocator for LockedFrameAllocator {
+    unsafe fn allocate_request(
+        &mut self,
+        request: crate::mm::allocator::page_frame::FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        let request = request.normalized()?;
+        let level = request.reserve_level();
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_mut()
+            .and_then(|buddy| buddy.allocate_admitted(request, level))
+    }
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
-        } else {
-            return None;
-        }
+        self.allocate_request(
+            crate::mm::allocator::page_frame::FrameAllocationRequest::kernel(
+                count,
+                PhysAddr::new(usize::MAX),
+            ),
+        )
     }
 
     unsafe fn allocate_below(
@@ -513,11 +538,9 @@ impl FrameAllocator for LockedFrameAllocator {
         count: PageFrameCount,
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            allocator.buddy_alloc_below(count.next_power_of_two(), max_phys_addr)
-        } else {
-            None
-        }
+        self.allocate_request(
+            crate::mm::allocator::page_frame::FrameAllocationRequest::kernel(count, max_phys_addr),
+        )
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {

@@ -18,7 +18,7 @@ use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{
-    retry_oom_victim_page_frame_alloc, FrameAllocator, PageFrameCount, PageFrameUsage,
+    FrameAllocationRequest, FrameAllocator, FramePlacement, PageFrameCount, PageFrameUsage,
 };
 use crate::mm::memblock::mem_block_manager;
 use crate::mm::ucontext::LockedVMA;
@@ -547,13 +547,20 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
 
 impl X86_64MMArch {
     pub(crate) fn init_current_cpu_nxe() -> bool {
-        // EFER 是每 CPU 状态。BSP 在 mm 初始化时会开启 NXE，AP 也必须分别开启，
-        // 否则访问带 NX 位的用户页会触发 #PF.RSVD。
+        if !raw_cpuid::CpuId::new()
+            .get_extended_processor_and_feature_identifiers()
+            .is_some_and(|features| features.has_execute_disable())
+        {
+            return false;
+        }
+        // EFER is per-CPU. The BSP enables NXE before publishing NX mappings;
+        // AP bootstrap assembly does so before loading the BSP page tables.
+        // A later AP call is idempotent, never the first enable boundary.
         let mut efer = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
-            debug!("Enabling EFER.NXE on current CPU");
             efer.insert(EferFlags::NO_EXECUTE_ENABLE);
             unsafe { x86_64::registers::model_specific::Efer::write(efer) };
+            debug!("Enabling EFER.NXE on current CPU");
         }
 
         x86_64::registers::model_specific::Efer::read().contains(EferFlags::NO_EXECUTE_ENABLE)
@@ -561,7 +568,7 @@ impl X86_64MMArch {
 
     /// 初始化当前 CPU 的 XD/NX 能力状态。
     ///
-    /// BSP 在页表策略初始化前记录全局 XD_RESERVED；AP 只需要分别打开本地 EFER.NXE。
+    /// BSP 在页表策略初始化前记录全局 XD_RESERVED；AP 在汇编加载 BSP 页表前开启本地 NXE。
     pub(crate) fn init_xd_rsvd() {
         // BSP 在初始化页表策略前探测并开启 NXE，得到系统是否支持 NX 的结论。
         let xd_reserved = !Self::init_current_cpu_nxe();
@@ -602,6 +609,7 @@ unsafe fn allocator_init() {
 
     let phy_offset = unsafe { MMArch::virt_2_phys(virt_offset) }.unwrap();
 
+    bump::snapshot_reclaimable_prefix().expect("Failed to preserve bootstrap RAM ownership");
     mem_block_manager()
         .reserve_block(PhysAddr::new(0), phy_offset.data())
         .expect("Failed to reserve block");
@@ -800,8 +808,15 @@ impl LockedFrameAllocator {
     }
 
     /// Relocation must not start reclaim or retry through the OOM victim path.
-    pub(crate) unsafe fn allocate_one_no_reclaim() -> Option<PhysAddr> {
-        Self::allocate_inner(PageFrameCount::ONE).map(|(physical, _)| physical)
+    pub(crate) unsafe fn allocate_migration_target_no_reclaim() -> Option<PhysAddr> {
+        let request =
+            FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+                .with_placement(FramePlacement::Movable);
+        Self::with_buddy(|buddy| {
+            buddy.allocate_admitted(request, crate::mm::allocator::reserve::ReserveLevel::Kernel)
+        })
+        .flatten()
+        .map(|(physical, _)| physical)
     }
 
     pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
@@ -811,36 +826,34 @@ impl LockedFrameAllocator {
             .map(BuddyAllocator::diagnostic_snapshot)
     }
 
-    unsafe fn allocate_inner(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
-        } else {
-            return None;
-        }
+    pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
+        Self::with_buddy(|buddy| buddy.pressure_snapshot()).unwrap_or_default()
     }
 }
 
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        count = count.next_power_of_two();
-        if let Some(frame) = unsafe { Self::allocate_inner(count) } {
-            return Some(frame);
-        }
+    unsafe fn allocate_request(
+        &mut self,
+        request: FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        let request = request.normalized()?;
+        let level = request.reserve_level();
+        Self::with_buddy(|buddy| buddy.allocate_admitted(request, level)).flatten()
+    }
 
-        retry_oom_victim_page_frame_alloc(|| unsafe { Self::allocate_inner(count) })
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        self.allocate_request(FrameAllocationRequest::kernel(
+            count,
+            PhysAddr::new(usize::MAX),
+        ))
     }
 
     unsafe fn allocate_below(
         &mut self,
-        mut count: PageFrameCount,
+        count: PageFrameCount,
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
-        count = count.next_power_of_two();
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            allocator.buddy_alloc_below(count, max_phys_addr)
-        } else {
-            None
-        }
+        self.allocate_request(FrameAllocationRequest::kernel(count, max_phys_addr))
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {

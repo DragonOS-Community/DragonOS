@@ -15,7 +15,9 @@ use crate::{
         file::{File, FileFlags, FilePrivateData},
         filesystem_maker,
         inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
-        mount::{DetachedMountTree, MountFS, MountFlags, MountSnapshotGuard},
+        mount::{
+            DetachedMountTree, MountFS, MountFlags, MountSnapshotGuard, SuperBlockActiveGuard,
+        },
         produce_fs_in_context, FileSystem, FsCreationContext, FsconfigPreparedData, IndexNode,
         InodeMode, Metadata,
     },
@@ -66,6 +68,7 @@ struct FsContextState {
     sb_flags: MountFlags,
     sb_flags_mask: MountFlags,
     fs: Option<Arc<dyn FileSystem>>,
+    fs_active: Option<SuperBlockActiveGuard>,
     prepared: Option<FsconfigPreparedData>,
     target: Option<ReconfigureTarget>,
 }
@@ -101,6 +104,7 @@ impl FsContextState {
             sb_flags: MountFlags::empty(),
             sb_flags_mask: MountFlags::empty(),
             fs: None,
+            fs_active: None,
             prepared: None,
             target: None,
         }
@@ -405,17 +409,31 @@ fn try_configure_fs_context(
                 let raw_data = encode_legacy_options(&state)?;
                 let mut creation = context.creation.clone();
                 creation.fsconfig_prepared = state.prepared.clone();
-                produce_fs_in_context(
-                    &context.fs_type,
-                    raw_data.as_deref(),
-                    state.source.as_deref().unwrap_or(""),
-                    state.sb_flags,
-                    &creation,
-                )
+                loop {
+                    let fs = produce_fs_in_context(
+                        &context.fs_type,
+                        raw_data.as_deref(),
+                        state.source.as_deref().unwrap_or(""),
+                        state.sb_flags,
+                        &creation,
+                    )?;
+                    match SuperBlockActiveGuard::acquire_shared(
+                        &fs,
+                        state.sb_flags,
+                        &creation.cred.user_ns,
+                    ) {
+                        Ok(active) => break Ok((fs, active)),
+                        // Final unmount won the reservation. The factory waits
+                        // for its old instance to finish before returning a new root.
+                        Err(SystemError::ESTALE) => continue,
+                        Err(error) => break Err(error.into()),
+                    }
+                }
             })();
             match result {
-                Ok(fs) => {
+                Ok((fs, active)) => {
                     state.fs = Some(fs);
+                    state.fs_active = active;
                     state.phase = Phase::AwaitingMount;
                     Ok(())
                 }
@@ -516,6 +534,7 @@ pub fn create_mount_from_fs_context(
     // No fallible operation may follow cleanup of the successfully used fd.
     state.target = Some(ReconfigureTarget::new(result.root())?);
     state.fs = None;
+    state.fs_active = None;
     state.clean_parameters();
     Ok(result)
 }

@@ -10,6 +10,8 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
+#include <vector>
 
 namespace {
 
@@ -517,6 +519,134 @@ TEST_F(SchedAffinityFixture, SameUidParentCanUpdateChildAffinity) {
         << "waitpid failed: errno=" << errno << " (" << strerror(errno) << ")";
     ASSERT_TRUE(WIFEXITED(status)) << "helper did not exit normally, status=" << status;
     EXPECT_EQ(0, WEXITSTATUS(status)) << "helper exit status=" << WEXITSTATUS(status);
+}
+
+namespace {
+
+// Own every child until reaped, including assertion/fork failure paths.
+class WakeupChildren {
+public:
+    ~WakeupChildren() {
+        for (pid_t pid : pids) {
+            if (pid <= 0) continue;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+        }
+    }
+
+    std::vector<pid_t> pids;
+};
+
+long long MonotonicMilliseconds() {
+    timespec now {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return static_cast<long long>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+}
+
+}  // namespace
+
+TEST_F(SchedAffinityFixture, TimerWakeupsAndForkBurstCompleteOnBusyCpuPair) {
+    const int first = FirstCpu(original_);
+    const int second = NextCpu(original_, first);
+    if (second < 0) {
+        GTEST_SKIP() << "requires at least two allowed CPUs";
+    }
+    cpu_set_t pair;
+    CPU_ZERO(&pair);
+    CPU_SET(first, &pair);
+    CPU_SET(second, &pair);
+    ASSERT_EQ(0, sched_setaffinity(0, sizeof(pair), &pair));
+
+    WakeupChildren children;
+    // Keep both CPUs runnable so wakeup placement must compare rq load rather
+    // than always taking the idle-CPU shortcut. These children never own a
+    // kernel lock; alarms and the parent owner bound their lifetime.
+    for (int cpu : {first, second}) {
+        int ready[2];
+        ASSERT_EQ(0, pipe(ready));
+        const pid_t pid = fork();
+        if (pid == 0) {
+            close(ready[0]);
+            alarm(10);
+            if (SetOneCpu(0, cpu) != 0) _exit(51);
+            const char token = 'r';
+            if (write(ready[1], &token, 1) != 1) _exit(52);
+            close(ready[1]);
+            for (;;) asm volatile("" ::: "memory");
+        }
+        close(ready[1]);
+        if (pid < 0) {
+            close(ready[0]);
+            FAIL() << "fork busy worker failed: " << strerror(errno);
+        }
+        children.pids.push_back(pid);
+        char token = 0;
+        ssize_t got;
+        do {
+            got = read(ready[0], &token, 1);
+        } while (got < 0 && errno == EINTR);
+        close(ready[0]);
+        ASSERT_EQ(1, got);
+        ASSERT_EQ('r', token);
+    }
+
+    constexpr int kSleepers = 8;
+    constexpr int kWakeups = 32;
+    for (int i = 0; i < kSleepers; ++i) {
+        const pid_t pid = fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            alarm(10);
+            cpu_set_t actual;
+            CPU_ZERO(&actual);
+            if (sched_getaffinity(0, sizeof(actual), &actual) != 0) _exit(53);
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &actual) != CPU_ISSET(cpu, &pair)) _exit(54);
+            }
+            for (int round = 0; round < kWakeups; ++round) {
+                timespec remaining {0, 1000000};
+                while (nanosleep(&remaining, &remaining) != 0) {
+                    if (errno != EINTR) _exit(55);
+                }
+                const int cpu = CurrentCpu();
+                if (cpu != first && cpu != second) _exit(56);
+            }
+            _exit(0);
+        }
+        children.pids.push_back(pid);
+    }
+
+    const long long start = MonotonicMilliseconds();
+    ASSERT_GE(start, 0);
+    int completed = 0;
+    while (completed < kSleepers) {
+        for (size_t i = 2; i < children.pids.size(); ++i) {
+            if (children.pids[i] <= 0) continue;
+            int status = 0;
+            const pid_t pid = waitpid(children.pids[i], &status, WNOHANG);
+            if (pid < 0 && errno == EINTR) continue;
+            ASSERT_GE(pid, 0);
+            if (pid == 0) continue;
+            children.pids[i] = 0;
+            ++completed;
+            ASSERT_TRUE(WIFEXITED(status)) << "sleeper status=" << status;
+            ASSERT_EQ(0, WEXITSTATUS(status));
+        }
+        const long long now = MonotonicMilliseconds();
+        ASSERT_GE(now, start);
+        ASSERT_LT(now - start, 15000) << "incomplete timer wakeups="
+                                   << kSleepers - completed;
+        if (completed < kSleepers) usleep(1000);
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        int status = 0;
+        pid_t result;
+        do {
+            result = waitpid(children.pids[i], &status, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result > 0) children.pids[i] = 0;
+        ASSERT_EQ(0, result) << "busy CPU worker exited before all timer wakeups";
+    }
 }
 
 int main(int argc, char** argv) {

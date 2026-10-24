@@ -11,20 +11,31 @@ nix 的引入使得 DragonOS 的开发环境不再依赖手动维护的 `bootstr
 - 如果你想体验 nix 带来的声明式管理，又不想更改发行版，尝试 home-manager 并在其上配置启用 flakes、direnv
 - 否则可以直接以 nix standalone 的方式安装 flakes，或者每次输入命令时添加 `--experimental-features 'nix-command flakes'`
 
+## 允许当前用户使用 KVM
+
+nix 启动脚本不使用 `sudo`，QEMU 以当前用户身份运行，因此当前用户需要能访问 `/dev/kvm`（以及可选的 `/dev/vhost-vsock`）。通常加入 `kvm` 用户组并重新登录即可：
+
+```shell
+sudo usermod -aG kvm $USER
+```
+
+如需 vsock 设备，还需加载 `vhost_vsock` 内核模块。`/dev/kvm` 不可用时，启动脚本会给出提示并回退到 TCG 软件模拟（较慢）。
+
 ## 国内镜像加速（推荐）
 
-如果你在国内且没有全局代理，首次拉取依赖可能很慢甚至失败。本仓库已在 `flake.nix` 内置国内镜像配置，使用 `nix develop / nix run` 时会自动生效。
-
-若仍然不生效，建议在用户级配置中追加以下内容（不会覆盖你已有配置）：
+如果你在国内且没有全局代理，首次拉取依赖可能很慢甚至失败。建议在用户级配置中追加以下内容（不会覆盖你已有配置）：
 
 ```shell
 mkdir -p ~/.config/nix
 cat >> ~/.config/nix/nix.conf <<'EOF'
 # DragonOS Nix mirror (CN)
 extra-substituters = https://mirrors.tuna.tsinghua.edu.cn/nix-channels/store https://mirrors.ustc.edu.cn/nix-channels/store
-extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 EOF
 ```
+
+::: info
+使用多用户安装（nix-daemon）时，非 trusted-user 设置的 `extra-substituters` 会被忽略。此时请在 `/etc/nix/nix.conf`（NixOS 上为 `nix.settings.substituters`）中配置，或把当前用户加入 `trusted-users`。
+:::
 
 ## 克隆仓库
 
@@ -62,7 +73,9 @@ make kernel
 nix run .#rootfs-x86_64
 ```
 
-这会生成 `./bin/qemu-system-x86_64.img`
+磁盘镜像在 nix store 中构建并缓存，交互模式下，该命令只在镜像发生变化时把它拷贝为 `./bin/disk-image-x86_64.img`。
+
+`user/` 下的软件包没有变化时会直接跳过，从而保留你在 DragonOS 中对磁盘所做的修改；如需丢弃这些修改、恢复为干净镜像，执行 `nix run .#rootfs-x86_64 -- --force`。 镜像准备选择 `AUTO_TEST=dunit` 或 `AUTO_TEST=syscall` 时（包括 `make test-dunit` 和 `make test-syscall`），始终恢复干净镜像，并丢弃 guest 内的磁盘修改。
 
 ## 启动内核
 
@@ -76,11 +89,25 @@ nix run .#start-x86_64
 需要退出 DragonOS （QEMU）环境，请输入 `ctrl + a`，然后 `x`
 :::
 
+启动时可以通过环境变量调整行为：
+
+- `QEMU_ACCEL=kvm|tcg`：强制指定加速方式
+- `AUTO_TEST=syscall|dunit`：开机后自动运行对应测试
+- `QEMU_GDB_WAIT=1`：配合 `nix run .#start-debug-x86_64` 使用，启动后等待 GDB 连接（`nix run .#gdb-x86_64`）
+
+## 一键构建并运行
+
+```shell
+nix run .#yolo-x86_64
+```
+
+依次执行 `make kernel`、准备 rootfs 镜像、启动 QEMU。编译内核使用的工具链与 `nix develop` 完全一致，不需要事先进入 dev shell。
 
 ## 更多 nix 命令用法及 nix script 维护
 
 - `cd docs && nix run` 构建文档并启动一个 http 服务器
 - 如果存储空间告急，`nix store gc` 清理悬空的历史构建副本
+- 防止开发环境被 `nix store gc` 清理：使用 direnv（`use flake` 会自动保留），或使用 `nix develop --profile .nix-gc-root`
 - 项目根目录下 `nix flake show` 查看可供构建的目标
 - 更多 nix 相关的用户空间构建详见 Userland 部分
 

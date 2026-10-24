@@ -61,6 +61,8 @@ mod filecaps;
 pub mod idmap;
 mod operations;
 mod selftest;
+mod superblock_lifecycle;
+pub(crate) use superblock_lifecycle::SuperBlockActiveGuard;
 pub mod writer;
 pub(crate) use selftest::run_mount_wrapper_cache_debug_selftest;
 #[cfg(feature = "mm_selftest")]
@@ -653,6 +655,10 @@ pub struct MountFS {
     /// Marks a covered topper reparented onto a propagated underlay root.
     /// The edge role is copied with the mount object.
     tucked_under: AtomicBool,
+    /// Kernel automount origin, equivalent to Linux MNT_SHRINKABLE. This is
+    /// entry state, not a userspace MS_SUBMOUNT flag or a superblock property.
+    /// Set before publication and retained by mount clones.
+    shrinkable: AtomicBool,
     /// The inode of the mount point where this filesystem is mounted
     self_mountpoint: RwSem<Option<Arc<MountFSInode>>>,
     /// Weak reference to this MountFS
@@ -1979,9 +1985,10 @@ impl MountFS {
             if state.shutdown_started() {
                 return Err(SystemError::ESTALE);
             }
-            if state.flags().contains(MountFlags::RDONLY) != flags.contains(MountFlags::RDONLY)
-                || !Arc::ptr_eq(state.owner_user_ns(), &owner_user_ns)
-            {
+            // sget_fc checks ownership, while device-specific factories (for
+            // example ext4/get_tree_bdev) validate incompatible SB options.
+            // A new entry's read-only attribute is independent of this SB.
+            if !Arc::ptr_eq(state.owner_user_ns(), &owner_user_ns) {
                 return Err(SystemError::EBUSY);
             }
             return Ok(state);
@@ -2053,6 +2060,7 @@ impl MountFS {
             wrapper_cache: Mutex::new(MountWrapperCache::default()),
             mountpoints: Mutex::new(HashMap::new()),
             tucked_under: AtomicBool::new(false),
+            shrinkable: AtomicBool::new(false),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: RwSem::new(MountNamespaceMembership::default()),
@@ -2117,6 +2125,7 @@ impl MountFS {
             wrapper_cache: Mutex::new(MountWrapperCache::default()),
             mountpoints: Mutex::new(HashMap::new()),
             tucked_under: AtomicBool::new(self.tucked_under.load(Ordering::Acquire)),
+            shrinkable: AtomicBool::new(self.shrinkable.load(Ordering::Acquire)),
             self_mountpoint: RwSem::new(self_mountpoint),
             self_ref: self_ref.clone(),
             namespace: RwSem::new(MountNamespaceMembership::default()),
@@ -3696,46 +3705,7 @@ impl MountFS {
     }
 
     fn finish_final_shutdown(&self) {
-        let sb_state = self.super_block_state();
-        let _umount_guard = sb_state.umount_write();
-        self.inner_filesystem.close_external_inode_admission();
-        if let Err(err) = self.sync_filesystem_locked() {
-            log::warn!("final superblock sync failed during umount: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        if let Err(err) = self.inner_filesystem.quiesce_page_cache_producers() {
-            log::warn!("final page-cache producer quiesce failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        if let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() {
-            domain.close_background_admission();
-            if let Err(err) = domain.wait_drained() {
-                log::warn!("final page-cache I/O drain failed: {:?}", err);
-                sb_state.record_wb_error(err);
-            }
-            for cache in domain.snapshot() {
-                if let Err(err) = cache.retire_for_domain() {
-                    log::warn!("final page-cache retirement failed: {:?}", err);
-                    sb_state.record_wb_error(err);
-                }
-            }
-        }
-        if let Err(err) = self.inner_filesystem.shrink_inode_cache_for_shutdown() {
-            log::warn!("final inode cache shrink failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        if let Err(err) = self.inner_filesystem.quiesce_async_inode_work() {
-            log::warn!("final asynchronous inode quiesce failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        let epoch = self.inner_filesystem.seal_eviction_queue();
-        if let Err(err) = self.inner_filesystem.drain_evictions_through(epoch) {
-            log::warn!("final superblock eviction drain failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        sb_state.drain_fsnotify_objects_for_unmount();
-        self.inner_filesystem.on_umount();
-        sb_state.finish_shutdown();
+        superblock_lifecycle::finish_shutdown(&self.inner_filesystem, &self.super_block_state);
     }
 
     /// Unmount the filesystem.
@@ -3752,9 +3722,81 @@ impl MountFS {
         Self::umount_subtree_with_mode(&self.self_ref(), false)
     }
 
-    /// Detach a complete mount subtree, deepest mounts first. Ordinary umount
-    /// performs one preflight busy check so it cannot partially detach merely
-    /// because a descendant owns an external path/file reference.
+    /// Reclaim idle kernel automounts under the topology/admission lock. Like
+    /// Linux's shrink_submounts(), repeat only after a successful removal:
+    /// propagation can change a previously visited sibling's leaf status.
+    fn shrink_submounts_locked(
+        root: &Arc<MountFS>,
+        retired: &mut Vec<Vec<Arc<MountFS>>>,
+    ) -> Result<(), SystemError> {
+        loop {
+            let mut pending = root.try_mount_children()?;
+            let mut candidates = Vec::new();
+            while let Some(mount) = pending.pop() {
+                // Do not descend through an ordinary user mount to reclaim an
+                // automount below it: that branch is busy for the parent umount.
+                if !mount.shrinkable.load(Ordering::Acquire) {
+                    continue;
+                }
+                let children = mount.try_mount_children()?;
+                pending
+                    .try_reserve(children.len())
+                    .map_err(|_| SystemError::ENOMEM)?;
+                pending.extend(children);
+                candidates.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                candidates.push(mount);
+            }
+            let mut progress = false;
+            for mount in candidates.into_iter().rev() {
+                // A propagated removal can also retire the requested root and
+                // restore a cover outside it. Never continue reclaiming from
+                // that stale candidate snapshot after losing the root edge.
+                if !root.is_live() {
+                    return Err(SystemError::EINVAL);
+                }
+                // A previous propagation commit can have removed another local
+                // candidate. Only a current, unpinned leaf can be reclaimed.
+                if !mount.is_live()
+                    || mount
+                        .mountpoints
+                        .lock()
+                        .values()
+                        .any(|stack| !stack.is_empty())
+                    || mount.has_external_pins()
+                {
+                    continue;
+                }
+                let mountpoint = mount.self_mountpoint().ok_or(SystemError::EINVAL)?;
+                if propagation_umount_busy(&mountpoint.mount_fs(), &mountpoint) {
+                    continue;
+                }
+                // Reserve the shutdown-owner batch before the topology commit.
+                // No failure after a successful detach may lose a retired peer.
+                retired.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                mount.lifecycle.lock().state = MountLifecycleState::Detaching;
+                let removed = match propagate_umount_sources(core::slice::from_ref(&mount), false) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        mount.lifecycle.lock().state = MountLifecycleState::Live;
+                        return Err(error);
+                    }
+                };
+                mount
+                    .commit_umount_at(&mountpoint, false)
+                    .expect("prepared automount edge commit cannot fail");
+                retired.push(removed);
+                progress = true;
+            }
+            if !progress {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Ordinary umount first reclaims idle automounts, then checks the remaining
+    /// subtree for real owners/ordinary submounts. Like Linux, idle siblings may
+    /// be reclaimed even when another busy child makes the parent return EBUSY.
+    /// Lazy detach keeps its existing complete-subtree behavior.
     pub fn umount_subtree_with_mode(
         root: &Arc<MountFS>,
         lazy: bool,
@@ -3773,81 +3815,97 @@ impl MountFS {
         // Potentially sleeping metadata reads happen without the topology lock.
         let mounts = {
             let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-            let mounts = collect(root);
-            // Linux's ordinary do_umount() leaves non-shrinkable submounts in
-            // place and reports EBUSY; only MNT_DETACH disconnects a complete
-            // subtree. DragonOS currently has no transient shrinkable mount
-            // class, so every visible child is busy here.
-            if !lazy && mounts.len() != 1 {
-                return Err(SystemError::EBUSY);
-            }
-            mounts
+            collect(root)
         };
-        let mut super_blocks = Vec::new();
-        for mount in &mounts {
-            let state = mount.super_block_state();
-            if !super_blocks
-                .iter()
-                .any(|existing| Arc::ptr_eq(existing, &state))
-            {
-                super_blocks.push(state);
-            }
-        }
         let mut propagation_keys = Vec::with_capacity(mounts.len());
         for mount in &mounts {
             let mountpoint = mount.self_mountpoint().ok_or(SystemError::EINVAL)?;
             propagation_keys.push((mountpoint.mount_fs.clone(), mountpoint));
         }
 
-        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        let current = collect(root);
-        if current.len() != mounts.len()
-            || current
-                .iter()
-                .zip(mounts.iter())
-                .any(|(left, right)| left.mount_id() != right.mount_id())
-        {
-            return Err(SystemError::EBUSY);
-        }
-        if root.is_locked() {
-            return Err(SystemError::EINVAL);
-        }
-        if !lazy && root.subtree_has_external_pins() {
-            return Err(SystemError::EBUSY);
-        }
-        for (mount, (parent, mountpoint)) in mounts.iter().zip(propagation_keys.iter()) {
-            if !mount.is_live() {
-                return Err(SystemError::EINVAL);
-            }
-            if !lazy && propagation_umount_busy(parent, mountpoint) {
+        let mut retired = Vec::new();
+        let result = (|| {
+            let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+            let current = collect(root);
+            if current.len() != mounts.len()
+                || current
+                    .iter()
+                    .zip(mounts.iter())
+                    .any(|(left, right)| left.mount_id() != right.mount_id())
+            {
                 return Err(SystemError::EBUSY);
             }
-        }
-        for mount in &mounts {
-            mount.lifecycle.lock().state = MountLifecycleState::Detaching;
-        }
-
-        let root_mountpoint = root.self_mountpoint().ok_or(SystemError::EINVAL)?;
-        if let Err(error) = propagate_umount_sources(&mounts, lazy) {
-            for mount in &mounts {
-                let mut lifecycle = mount.lifecycle.lock();
-                if lifecycle.state == MountLifecycleState::Detaching {
-                    lifecycle.state = MountLifecycleState::Live;
+            if root.is_locked() {
+                return Err(SystemError::EINVAL);
+            }
+            if !root.is_live() {
+                return Err(SystemError::EINVAL);
+            }
+            if !lazy {
+                Self::shrink_submounts_locked(root, &mut retired)?;
+                if root
+                    .mountpoints
+                    .lock()
+                    .values()
+                    .any(|stack| !stack.is_empty())
+                    || root.has_external_pins()
+                {
+                    return Err(SystemError::EBUSY);
                 }
             }
-            return Err(error);
-        }
-        root.commit_umount_at(&root_mountpoint, lazy)
-            .expect("prepared local umount edge commit cannot fail");
+            let sources = if lazy {
+                &mounts[..]
+            } else {
+                core::slice::from_ref(root)
+            };
+            // collect() is deepest-first, so the original root key is last.
+            let keys = if lazy {
+                &propagation_keys[..]
+            } else {
+                &propagation_keys[propagation_keys.len() - 1..]
+            };
+            for (mount, (parent, mountpoint)) in sources.iter().zip(keys.iter()) {
+                if !mount.is_live() {
+                    return Err(SystemError::EINVAL);
+                }
+                if !lazy && propagation_umount_busy(parent, mountpoint) {
+                    return Err(SystemError::EBUSY);
+                }
+            }
+            retired.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            let root_mountpoint = root.self_mountpoint().ok_or(SystemError::EINVAL)?;
+            for mount in sources {
+                mount.lifecycle.lock().state = MountLifecycleState::Detaching;
+            }
+
+            let removed = match propagate_umount_sources(sources, lazy) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    for mount in sources {
+                        let mut lifecycle = mount.lifecycle.lock();
+                        if lifecycle.state == MountLifecycleState::Detaching {
+                            lifecycle.state = MountLifecycleState::Live;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            root.commit_umount_at(&root_mountpoint, lazy)
+                .expect("prepared local umount edge commit cannot fail");
+            retired.push(removed);
+            Ok(root.clone())
+        })();
         // Final filesystem shutdown may sleep and may itself need pathname
-        // operations. Never wait while holding the topology/admission lock.
-        drop(_topology);
+        // operations. Wait outside the topology lock on success AND failure:
+        // an earlier idle sibling or propagated peer may already be retired.
         if !lazy {
-            for super_block in super_blocks {
-                super_block.wait_for_shutdown_if_started();
+            for batch in retired {
+                for mount in batch {
+                    mount.super_block_state.wait_for_shutdown_if_started();
+                }
             }
         }
-        Ok(root.clone())
+        result
     }
 
     /// Detach this mount. Lazy detach skips the external-pin busy check and
@@ -3904,48 +3962,7 @@ impl MountFS {
     /// Corresponds to Linux `sync_inodes_sb()`: write back all dirty page caches under the specified mount.
     /// Page caches are registered in their filesystem's stable writeback domain.
     fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
-        let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() else {
-            return Ok(());
-        };
-        let mut last_err = Ok(());
-        let mut members = domain
-            .snapshot()
-            .into_iter()
-            .filter(|cache| cache.has_dirty_or_writeback_work());
-        let mut pending = Vec::new();
-        pending
-            .try_reserve_exact(crate::filesystem::page_cache::DOMAIN_WRITEBACK_WINDOW)
-            .map_err(|_| SystemError::ENOMEM)?;
-        loop {
-            let mut count = 0;
-            for page_cache in members
-                .by_ref()
-                .take(crate::filesystem::page_cache::DOMAIN_WRITEBACK_WINDOW)
-            {
-                count += 1;
-                match page_cache.start_sync_for_domain() {
-                    Ok(writeback) => pending.push(writeback),
-                    Err(error) => {
-                        self.record_wb_error(error.clone());
-                        last_err = Err(error);
-                    }
-                }
-            }
-            if count == 0 {
-                break;
-            }
-            // Submit across mappings before forcing durable completion. An
-            // outer guard would seal each small file before the next starts.
-            let _sync_request = self.inner_filesystem.begin_sync_writeback();
-            for writeback in pending.drain(..) {
-                if let Err(error) = writeback.finish() {
-                    log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", error);
-                    self.record_wb_error(error.clone());
-                    last_err = Err(error);
-                }
-            }
-        }
-        last_err
+        superblock_lifecycle::sync_inodes(&self.inner_filesystem, &self.super_block_state)
     }
 
     pub fn sync_inodes_with_umount_read(&self) -> Result<(), SystemError> {
@@ -4015,39 +4032,10 @@ impl MountFS {
     /// this mount's superblock `umount_lock`, either for read (`syncfs`) or write
     /// (`umount`).
     fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
-        if self.is_sb_readonly() {
-            return Ok(());
-        }
-
-        // writeback_inodes_sb(sb) — void
-        let mut last_err = self.sync_inodes_of_mount();
-        // sync_fs(sb, 0)
-        if let Err(e) = self.sync_fs(false) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        if let Err(e) = self.sync_blockdev(false) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        // sync_inodes_sb(sb) — void
-        if let Err(e) = self.sync_inodes_of_mount() {
-            last_err = Err(e);
-        }
-        // sync_fs(sb, 1)
-        if let Err(e) = self.sync_fs(true) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        if let Err(e) = self.sync_blockdev(true) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        last_err
+        superblock_lifecycle::sync_filesystem_locked(
+            &self.inner_filesystem,
+            &self.super_block_state,
+        )
     }
 
     /// Public read-locked wrapper for callers that do not already hold the
@@ -5352,24 +5340,23 @@ impl MountFSInode {
         )
     }
 
-    /// Attach an automatically discovered submount only if the mountpoint is
-    /// still uncovered at the publication linearization point.
-    pub(crate) fn mount_subtree_with_state_if_vacant(
+    /// Attach an automatically discovered, shrinkable submount only if the
+    /// mountpoint is still uncovered at the publication linearization point.
+    pub(crate) fn mount_automount_if_vacant(
         &self,
         inner_fs: Arc<dyn FileSystem>,
         root_inner_inode: Arc<dyn IndexNode>,
         mount_flags: MountFlags,
-        super_block_state: Option<Arc<SuperBlockState>>,
-        bind_source: Option<&Arc<MountFS>>,
     ) -> Result<Arc<MountFS>, SystemError> {
         let prepared = self.prepare_subtree_with_root_dentry(
             inner_fs,
             root_inner_inode,
             None,
             mount_flags,
-            super_block_state,
-            bind_source,
+            None,
+            None,
         )?;
+        prepared.shrinkable.store(true, Ordering::Release);
         if let Err(error) = self.publish_prepared_subtree_inner(&prepared, true) {
             MountFS::deactivate_disconnected_subtree(&prepared);
             return Err(error);
@@ -5499,6 +5486,9 @@ impl MountFSInode {
         );
 
         if let Some(source) = bind_source {
+            new_mount_fs
+                .shrinkable
+                .store(source.shrinkable.load(Ordering::Acquire), Ordering::Release);
             inherit_bind_mount_propagation(source, &new_mount_fs);
         }
 

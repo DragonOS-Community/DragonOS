@@ -37,7 +37,7 @@ pub(super) struct LoopbackRxQueue {
 /// socket's attached smoltcp interface (which can be lo for a wildcard bind).
 #[derive(Debug)]
 pub(super) struct RawRxPacket {
-    pub(super) bytes: Vec<u8>,
+    pub(super) bytes: crate::driver::net::PacketBuffer,
     pub(super) ingress_ifindex: u32,
 }
 
@@ -260,11 +260,9 @@ fn deliver_raw_to_sockets(
 
         // SO_RCVBUF：投递/丢弃语义
         let rcvbuf = s.options.read().sock_rcvbuf as usize;
-        let mut packet = Vec::new();
-        if packet.try_reserve_exact(ctx.packet.len()).is_err() {
+        let Ok(packet) = crate::driver::net::PacketBuffer::try_from_slice(ctx.packet) else {
             continue;
-        }
-        packet.extend_from_slice(ctx.packet);
+        };
         let enqueued = {
             let mut q = s.loopback_rx.lock();
             let can_enqueue = if q.bytes == 0 {
@@ -298,7 +296,7 @@ pub(crate) struct RawIngressWork {
     pub(crate) sockets: Vec<Arc<RawSocket>>,
     /// Admission-time matches occupy the prefix; the suffix is retirement only.
     pub(crate) matched: usize,
-    pub(crate) packet: Vec<u8>,
+    pub(crate) packet: crate::driver::net::PacketBuffer,
     pub(crate) source: IpAddress,
     pub(crate) destination: IpAddress,
     pub(crate) protocol: IpProtocol,
@@ -323,9 +321,188 @@ impl RawIngressWork {
     }
 }
 
+/// A batch is allocated before entering interface serialization. Linking it
+/// cannot fail after socket pins have been acquired by the receive callback.
+#[derive(Default)]
+pub(crate) struct RawIngressBatch {
+    pub(crate) work: Vec<RawIngressWork>,
+    next: Option<alloc::boxed::Box<RawIngressBatch>>,
+    charged: usize,
+}
+
+/// Namespace-wide publication order, shared by every interface and poll path.
+/// Producers publish while holding smol_iface. The sole drainer executes only
+/// after leaving poll admission, so final socket/namespace retirement cannot
+/// wait for the drainer's own poll guard during device teardown.
+#[derive(Default)]
+pub(crate) struct RawIngressQueue {
+    pending: Option<alloc::boxed::Box<RawIngressBatch>>,
+    draining: bool,
+    charged: usize,
+}
+
+impl core::fmt::Debug for RawIngressQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawIngressQueue")
+            .field("charged", &self.charged)
+            .field("draining", &self.draining)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RawIngressQueue {
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+    fn charge(&mut self, bytes: usize) -> bool {
+        let Some(charged) = self.charged.checked_add(bytes) else {
+            return false;
+        };
+        if charged > Self::MAX_BYTES {
+            return false;
+        }
+        self.charged = charged;
+        true
+    }
+
+    fn release(&mut self, bytes: usize) {
+        debug_assert!(self.charged >= bytes);
+        self.charged -= bytes;
+    }
+
+    pub(crate) fn drain(queue: &crate::libs::spinlock::SpinLock<Self>) {
+        loop {
+            let pending = queue.lock_irqsave().take_pending();
+            if pending.is_none() {
+                return;
+            }
+            RawIngressBatch::execute_fifo(pending, queue);
+        }
+    }
+
+    pub(crate) fn publish(&mut self, mut batch: alloc::boxed::Box<RawIngressBatch>) -> bool {
+        debug_assert!(!batch.work.is_empty());
+        batch.next = self.pending.take();
+        self.pending = Some(batch);
+        let owner = !self.draining;
+        self.draining = true;
+        owner
+    }
+
+    /// Taking an empty queue and relinquishing ownership are one transaction:
+    /// a producer either joins this drain or becomes the next owner itself.
+    pub(crate) fn take_pending(&mut self) -> Option<alloc::boxed::Box<RawIngressBatch>> {
+        let pending = self.pending.take();
+        if pending.is_none() {
+            self.draining = false;
+        }
+        pending
+    }
+}
+
+impl RawIngressBatch {
+    pub(crate) fn reserve_header(
+        &mut self,
+        queue: &crate::libs::spinlock::SpinLock<RawIngressQueue>,
+    ) -> bool {
+        let bytes = core::mem::size_of::<Self>();
+        if !queue.lock_irqsave().charge(bytes) {
+            return false;
+        }
+        self.charged = bytes;
+        true
+    }
+
+    /// All errors return the socket pins to the caller for local retirement.
+    /// Charge owned allocations, not poll count: small independent polls must
+    /// not exhaust admission while almost all of the byte budget remains free.
+    pub(crate) fn record(
+        &mut self,
+        mut work: RawIngressWork,
+        packet: &[u8],
+        queue: &crate::libs::spinlock::SpinLock<RawIngressQueue>,
+    ) -> Result<(), RawIngressWork> {
+        if self.work.len() == self.work.capacity() {
+            let metadata = core::mem::size_of::<RawIngressWork>();
+            if !queue.lock_irqsave().charge(metadata) {
+                return Err(work);
+            }
+            // Exact growth keeps every allocated entry charged, including a
+            // spare entry left behind when the subsequent packet copy fails.
+            if self.work.try_reserve_exact(1).is_err() {
+                queue.lock_irqsave().release(metadata);
+                return Err(work);
+            }
+            self.charged += metadata;
+        }
+        let Some(bytes) = work
+            .sockets
+            .capacity()
+            .checked_mul(core::mem::size_of::<Arc<RawSocket>>())
+            .and_then(|pins| pins.checked_add(packet.len()))
+        else {
+            return Err(work);
+        };
+        if !queue.lock_irqsave().charge(bytes) {
+            return Err(work);
+        }
+        if work.packet.try_reserve_exact(packet.len()).is_err() {
+            queue.lock_irqsave().release(bytes);
+            return Err(work);
+        }
+        // Capacity was prepared above; no copy can allocate after admission.
+        work.packet
+            .extend_from_slice(packet)
+            .expect("raw ingress capacity prepared");
+        self.charged += bytes;
+        self.work.push(work);
+        Ok(())
+    }
+
+    pub(crate) fn retire(
+        self: alloc::boxed::Box<Self>,
+        queue: &crate::libs::spinlock::SpinLock<RawIngressQueue>,
+    ) {
+        let charged = self.charged;
+        drop(self);
+        // Building, detached, executing and empty batches retain their charge
+        // until their buffers and socket/namespace pins have actually retired.
+        if charged != 0 {
+            queue.lock_irqsave().release(charged);
+        }
+    }
+
+    /// Publication uses a stack to avoid allocation and unsafe tail pointers.
+    /// Reverse detached batches outside the queue lock to restore FIFO order.
+    fn execute_fifo(
+        mut pending: Option<alloc::boxed::Box<Self>>,
+        queue: &crate::libs::spinlock::SpinLock<RawIngressQueue>,
+    ) {
+        let mut ordered = None;
+        while let Some(mut batch) = pending {
+            pending = batch.next.take();
+            batch.next = ordered;
+            ordered = Some(batch);
+        }
+        while let Some(mut batch) = ordered {
+            ordered = batch.next.take();
+            for work in batch.work.drain(..) {
+                work.execute();
+            }
+            batch.retire(queue);
+            // Sustained ingress must not suppress scheduler-requested progress.
+            // Some direct-poll callers may already be nonpreemptible.
+            if <crate::arch::CurrentIrqArch as crate::exception::InterruptArch>::is_irq_enabled()
+                && crate::process::ProcessManager::current_pcb().preempt_count() == 0
+            {
+                crate::sched::cond_resched();
+            }
+        }
+    }
+}
+
 /// Echo Reply 构建参数
 struct EchoReplyParams {
-    reply_payload: Vec<u8>,
+    reply_payload: crate::driver::net::PacketBuffer,
     /// 原始目的地址，作为 reply 的源
     src: IpAddress,
     /// 原始源地址，作为 reply 的目的
@@ -359,7 +536,7 @@ fn try_build_icmp_echo_reply(packet: &[u8]) -> Option<EchoReplyParams> {
     let dst = smoltcp::wire::Ipv4Address::new(packet[16], packet[17], packet[18], packet[19]);
 
     // 构建 reply payload
-    let mut reply_payload = payload.to_vec();
+    let mut reply_payload = crate::driver::net::PacketBuffer::try_from_slice(payload).ok()?;
     reply_payload[0] = ICMP_ECHO_REPLY;
     reply_payload[2] = 0;
     reply_payload[3] = 0;
@@ -421,7 +598,7 @@ fn try_build_icmpv6_echo_reply(packet: &[u8]) -> Option<EchoReplyParams> {
     );
 
     // 构建 reply payload (校验和由 build_ipv6_packet 计算)
-    let mut reply_payload = payload.to_vec();
+    let mut reply_payload = crate::driver::net::PacketBuffer::try_from_slice(payload).ok()?;
     reply_payload[0] = ICMPV6_ECHO_REPLY;
     reply_payload[2] = 0;
     reply_payload[3] = 0;

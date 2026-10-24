@@ -31,35 +31,81 @@ impl LocalOutputDrainResult {
     }
 }
 
-/// Preserve a frame produced by a physical RX/TX token when the device queue
-/// cannot accept it immediately. smoltcp consumes such tokens without an
-/// error return, so ownership must move into the bounded interface output
-/// queue before `consume` returns.
-pub(super) fn defer_native_output_after_tx_backpressure(
-    iface: &dyn Iface,
-    medium: smoltcp::phy::Medium,
-    meta: PacketMeta,
-    frame: Vec<u8>,
-    observed_generation: u64,
-) -> Result<(), Vec<u8>> {
-    let common = iface.common();
-    let Some(mut reservation) = common.local_input_queue.reserve_output() else {
-        return Err(frame);
-    };
-    if !reservation.try_resize(frame.capacity()) {
-        return Err(frame);
+/// Exact payload and output admission are acquired before a physical RX reply
+/// is emitted. On TX backpressure the existing owner and node move together.
+pub(super) struct NativeReply {
+    pub(super) frame: PacketBuffer,
+    reservation: LocalOutputReservation<'static>,
+    iface: Arc<dyn Iface>,
+}
+impl NativeReply {
+    pub(super) fn prepare(
+        iface: Arc<dyn Iface>,
+        len: usize,
+    ) -> Result<Self, smoltcp::phy::TxEgressError> {
+        let mut reservation = LocalInputQueue::reserve_owned_output(iface.clone())
+            .ok_or(smoltcp::phy::TxEgressError::Exhausted)?;
+        if !reservation.try_resize(len) {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        let mut frame = PacketBuffer::try_with_capacity(len)
+            .map_err(|_| smoltcp::phy::TxEgressError::Exhausted)?;
+        if !reservation.try_resize(frame.capacity()) {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        frame
+            .resize(len, 0)
+            .map_err(|_| smoltcp::phy::TxEgressError::Exhausted)?;
+        Ok(Self {
+            frame,
+            reservation,
+            iface,
+        })
     }
-    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
-    let retry_at =
-        now + smoltcp::time::Duration::from_micros(common.next_local_output_tx_backoff_us());
-    reservation.requeue_native_backpressured(medium, meta, frame, retry_at);
-    let retry_at = if common.release_tx_backpressure_after(observed_generation) {
-        now
-    } else {
-        retry_at
-    };
-    common.schedule_registered_local_output(retry_at);
-    Ok(())
+    pub(super) fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        if len <= self.frame.capacity() {
+            self.frame.resize(len, 0).expect("existing reply capacity");
+            return Ok(());
+        }
+        let old_capacity = self.frame.capacity();
+        if !self.reservation.try_resize(len.max(old_capacity)) {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        let prepared = PacketBuffer::try_with_capacity(len).and_then(|mut frame| {
+            frame.resize(len, 0)?;
+            Ok(frame)
+        });
+        let frame = match prepared {
+            Ok(frame) => frame,
+            Err(_) => {
+                assert!(self.reservation.try_resize(old_capacity));
+                return Err(smoltcp::phy::TxEgressError::Exhausted);
+            }
+        };
+        if !self.reservation.try_resize(frame.capacity()) {
+            assert!(self.reservation.try_resize(old_capacity));
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        self.frame = frame;
+        Ok(())
+    }
+    pub(super) fn generation(&self) -> u64 {
+        self.iface.common().tx_completion_generation()
+    }
+    pub(super) fn defer(self, medium: smoltcp::phy::Medium, meta: PacketMeta, generation: u64) {
+        let common = self.iface.common();
+        let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+        let retry_at =
+            now + smoltcp::time::Duration::from_micros(common.next_local_output_tx_backoff_us());
+        self.reservation
+            .requeue_native_backpressured(medium, meta, self.frame, retry_at);
+        let deadline = if common.release_tx_backpressure_after(generation) {
+            now
+        } else {
+            retry_at
+        };
+        common.schedule_registered_local_output(deadline);
+    }
 }
 
 /// A namespace-local view over the target interface's transport stack.
@@ -251,7 +297,7 @@ impl OutputBackendPolicy<'_> {
 /// pool. Pool locking is limited to checkout/return; smoltcp and driver
 /// callbacks never run while holding it.
 pub(super) struct LocalInputScratch<'a> {
-    pub(super) buffer: Option<Vec<u8>>,
+    pub(super) buffer: Option<PacketBuffer>,
     pub(super) pool: &'a SpinLock<LocalOutputScratchPool>,
 }
 
@@ -260,17 +306,16 @@ impl<'a> LocalInputScratch<'a> {
         pool: &SpinLock<LocalOutputScratchPool>,
         min_capacity: usize,
         max_capacity: usize,
-    ) -> Vec<u8> {
+    ) -> PacketBuffer {
         let mut pooled = pool.lock();
-        // The pool is bounded to 64 buffers. Pick a compatible size so a
-        // jumbo route does not force small packets to reserve jumbo storage,
-        // while the next jumbo packet can reuse its own returned buffer.
+        // Only small buffers enter this bounded pool. Large mappings retire
+        // after use rather than remaining resident in an idle namespace.
         let Some(index) = pooled
             .buffers
             .iter()
             .rposition(|buffer| (min_capacity..=max_capacity).contains(&buffer.capacity()))
         else {
-            return Vec::new();
+            return PacketBuffer::new();
         };
         let buffer = pooled.buffers.swap_remove(index);
         pooled.bytes -= buffer.capacity();
@@ -299,7 +344,9 @@ impl<'a> LocalInputScratch<'a> {
             .as_mut()
             .expect("checked-out scratch always owns its buffer");
         debug_assert!(len <= buffer.capacity());
-        buffer.resize(len, 0);
+        buffer
+            .resize(len, 0)
+            .expect("transmit capacity prepared before emit");
         buffer.as_mut_slice()
     }
 
@@ -307,32 +354,41 @@ impl<'a> LocalInputScratch<'a> {
         &mut self,
         capacity: usize,
         reservation: &mut LocalOutputReservation<'_>,
-    ) -> bool {
+    ) -> Result<(), SystemError> {
         let buffer = self
             .buffer
             .as_mut()
-            .expect("checked-out scratch always owns its buffer");
+            .expect("checked-out scratch owns buffer");
         if buffer.capacity() >= capacity {
-            return true;
+            return Ok(());
         }
         debug_assert!(buffer.is_empty());
-        let mut replacement = Self::take_pooled(self.pool, capacity, capacity + capacity / 4);
-        if replacement.try_reserve_exact(capacity).is_err()
-            || !reservation.try_resize(replacement.capacity())
-        {
+        let old_capacity = buffer.capacity();
+        let mut replacement =
+            Self::take_pooled(self.pool, capacity, capacity.saturating_add(capacity / 4));
+        let target = capacity.max(replacement.capacity());
+        if !reservation.try_resize(target) {
             LocalInputQueue::recycle_scratch(self.pool, replacement);
-            return false;
+            return Err(SystemError::ENOBUFS);
         }
+        if let Err(error) = replacement.try_reserve_exact(capacity) {
+            // Shrinking our own reservation cannot fail. Preserve both the
+            // old storage and its accounting for a subsequent smaller retry.
+            assert!(reservation.try_resize(old_capacity));
+            LocalInputQueue::recycle_scratch(self.pool, replacement);
+            return Err(error);
+        }
+        debug_assert_eq!(replacement.capacity(), target);
         core::mem::swap(buffer, &mut replacement);
         LocalInputQueue::recycle_scratch(self.pool, replacement);
-        true
+        Ok(())
     }
 
     pub(super) fn capacity(&self) -> usize {
-        self.buffer.as_ref().map_or(0, Vec::capacity)
+        self.buffer.as_ref().map_or(0, PacketBuffer::capacity)
     }
 
-    pub(super) fn take(&mut self) -> Option<Vec<u8>> {
+    pub(super) fn take(&mut self) -> Option<PacketBuffer> {
         self.buffer.take()
     }
 }
@@ -398,11 +454,9 @@ impl<'a> PreparedIpOutputReservation<'a> {
             .reserve_output()
             .ok_or(SystemError::ENOBUFS)?;
         let mut scratch =
-            LocalInputScratch::checkout(&common.local_input_queue.response_scratch, len)
+            LocalInputScratch::checkout(&common.local_input_queue.response_scratch, 0)
                 .ok_or(SystemError::ENOMEM)?;
-        if !reservation.try_resize(scratch.capacity()) {
-            return Err(SystemError::ENOBUFS);
-        }
+        scratch.try_ensure_capacity(len, &mut reservation)?;
         scratch.resize(len);
         if common.namespace_epoch() != owner_epoch
             || !common
@@ -701,7 +755,7 @@ fn prepare_deferred_ipv4_for_mtu(
 fn prepared_ipv4_fragment(
     packet: &LocalOutputPacket,
     mtu: usize,
-) -> Result<(Vec<u8>, usize), SystemError> {
+) -> Result<(PacketBuffer, usize), SystemError> {
     let parsed = ParsedIpv4Output::parse(&packet.frame)?;
     let Some(PreparedIpProgress::Ipv4 { offset, .. }) = packet.prepared_ip else {
         return Err(SystemError::EINVAL);
@@ -723,14 +777,14 @@ fn prepared_ipv4_fragment(
     if start / 8 > 0x1fff {
         return Err(SystemError::EMSGSIZE);
     }
-    let mut fragment = Vec::new();
+    let mut fragment = PacketBuffer::new();
     fragment
         .try_reserve_exact(parsed.header_len + chunk)
         .map_err(|_| SystemError::ENOMEM)?;
-    fragment.extend_from_slice(&packet.frame[..parsed.header_len]);
+    fragment.extend_from_slice(&packet.frame[..parsed.header_len])?;
     fragment.extend_from_slice(
         &packet.frame[parsed.header_len + offset..parsed.header_len + offset + chunk],
-    );
+    )?;
     if offset != 0 {
         let mut option = 20;
         while option < parsed.header_len {
@@ -763,7 +817,7 @@ fn prepared_ipv4_fragment(
 fn next_output_fragment(
     packet: &LocalOutputPacket,
     mtu: usize,
-) -> Result<Option<(Vec<u8>, usize)>, SystemError> {
+) -> Result<Option<(PacketBuffer, usize)>, SystemError> {
     if packet.frame.first().is_some_and(|byte| byte >> 4 == 6) && mtu < 1280 {
         return Err(SystemError::ENETDOWN);
     }
@@ -806,7 +860,7 @@ fn next_output_fragment(
 fn prepared_ipv6_fragment(
     packet: &LocalOutputPacket,
     mtu: usize,
-) -> Result<(Vec<u8>, usize), SystemError> {
+) -> Result<(PacketBuffer, usize), SystemError> {
     let Some(PreparedIpProgress::Ipv6 {
         offset,
         identification,
@@ -823,7 +877,7 @@ pub(crate) fn ipv6_fragment(
     mtu: usize,
     offset: usize,
     identification: u32,
-) -> Result<(Vec<u8>, usize), SystemError> {
+) -> Result<(PacketBuffer, usize), SystemError> {
     let ipv6 = smoltcp::wire::Ipv6Packet::new_checked(frame).map_err(|_| SystemError::EINVAL)?;
     if ipv6.total_len() != frame.len() {
         return Err(SystemError::EMSGSIZE);
@@ -846,13 +900,13 @@ pub(crate) fn ipv6_fragment(
     if chunk == 0 {
         return Err(SystemError::EMSGSIZE);
     }
-    let mut fragment = Vec::new();
+    let mut fragment = PacketBuffer::new();
     fragment
         .try_reserve_exact(split + 8 + chunk)
         .map_err(|_| SystemError::ENOMEM)?;
-    fragment.extend_from_slice(&frame[..split]);
-    fragment.extend_from_slice(&[0; 8]);
-    fragment.extend_from_slice(&frame[split + offset..split + offset + chunk]);
+    fragment.extend_from_slice(&frame[..split])?;
+    fragment.extend_from_slice(&[0; 8])?;
+    fragment.extend_from_slice(&frame[split + offset..split + offset + chunk])?;
     fragment[4..6].copy_from_slice(&((split - 40 + 8 + chunk) as u16).to_be_bytes());
     fragment[previous_next_header] = smoltcp::wire::IpProtocol::Ipv6Frag.into();
     fragment[split] = frame[previous_next_header];
@@ -915,7 +969,7 @@ fn fragment_transmit_error(
 
 fn fragment_transmit_complete(
     packet: &mut LocalOutputPacket,
-    fragment: &Option<(Vec<u8>, usize)>,
+    fragment: &Option<(PacketBuffer, usize)>,
 ) -> bool {
     let Some((_, payload_len)) = fragment else {
         return true;
@@ -963,7 +1017,7 @@ mod prepared_ipv4_tests {
                 next_hop: smoltcp::wire::Ipv4Address::new(192, 0, 2, 2).into(),
                 ip_mtu: 1500,
             },
-            frame,
+            frame: PacketBuffer::from_existing_heap(frame),
             ct_context: OutputCtContext::Untracked,
             mark: 0,
             prepared_ip: Some(PreparedIpProgress::Ipv4 {
@@ -988,7 +1042,7 @@ mod prepared_ipv4_tests {
         assert_eq!(&small[4..6], &[0, 0]);
         assert_ne!(small[6] & 0x40, 0);
 
-        let mut large = small.clone();
+        let mut large = PacketBuffer::try_from_slice(&small).unwrap();
         assert_eq!(
             Ok(true),
             prepare_deferred_ipv4_for_mtu(&mut large, 28, Some(0x1234))
@@ -1130,7 +1184,7 @@ mod prepared_ipv6_tests {
                 next_hop: smoltcp::wire::Ipv6Address::LOCALHOST.into(),
                 ip_mtu: 1280,
             },
-            frame,
+            frame: PacketBuffer::from_existing_heap(frame),
             ct_context: OutputCtContext::Untracked,
             mark: 0,
             prepared_ip: Some(PreparedIpProgress::Ipv6 {
@@ -1247,6 +1301,12 @@ pub(super) struct LocalInputTxToken<'a> {
 }
 
 impl SmolTxToken for LocalInputTxToken<'_> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        self.scratch
+            .try_ensure_capacity(len, &mut self.reservation)
+            .map_err(|_| smoltcp::phy::TxEgressError::Exhausted)
+    }
+
     fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion) -> bool {
         self.backend_policy.requires_output_admission(version)
     }
@@ -1265,7 +1325,11 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         use smoltcp::phy::IpOutputError;
         use smoltcp::wire::{IpAddress, IpVersion, Ipv4Packet, Ipv6Address, Ipv6Packet};
 
-        if !self.scratch.try_ensure_capacity(len, &mut self.reservation) {
+        if self
+            .scratch
+            .try_ensure_capacity(len, &mut self.reservation)
+            .is_err()
+        {
             return Err(IpOutputError::Exhausted);
         }
         let bytes = self.scratch.resize(len);
@@ -1539,13 +1603,6 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             self.disposition = LocalOutputDisposition::NativeOwner;
             return Ok(());
         };
-        if !self
-            .scratch
-            .try_ensure_capacity(egress.ip_mtu, &mut self.reservation)
-        {
-            self.disposition = LocalOutputDisposition::Drop;
-            return Err(smoltcp::phy::TxEgressError::Exhausted);
-        }
         self.medium = egress.medium;
         self.disposition = LocalOutputDisposition::from_context(egress.context, egress.ip_mtu);
         Ok(())
@@ -1589,14 +1646,7 @@ impl LocalInputTxToken<'_> {
         if let Some(route) = route {
             if route.kind == crate::net::route::RTN_LOCAL {
                 let route_ip_mtu = core::cmp::min(route.ip_mtu, u16::MAX as usize);
-                let ip_mtu = if self
-                    .scratch
-                    .try_ensure_capacity(route_ip_mtu, &mut self.reservation)
-                {
-                    route_ip_mtu
-                } else {
-                    core::cmp::min(route_ip_mtu, self.owner_ip_mtu)
-                };
+                let ip_mtu = route_ip_mtu;
                 self.medium = smoltcp::phy::Medium::Ip;
                 self.disposition = LocalOutputDisposition::Local {
                     oif: route.oif,
@@ -1611,20 +1661,12 @@ impl LocalInputTxToken<'_> {
             let next_hop = route.next_hop;
             self.medium = smoltcp::phy::Medium::Ip;
             // The address owner and selected egress may have different MTUs.
-            // Grow only the token that actually needs the larger route MTU;
-            // on allocation pressure, a smaller legal fragment/drop boundary
-            // is preferable to constructing beyond the scratch capacity.
+            // Storage is prepared for the actual emitted frame, independently
+            // of the route's protocol fragmentation boundary.
             // IPv4's total-length field is the hard protocol ceiling even if
             // userspace configured a larger logical device MTU.
             let route_ip_mtu = core::cmp::min(route.ip_mtu, u16::MAX as usize);
-            let ip_mtu = if self
-                .scratch
-                .try_ensure_capacity(route_ip_mtu, &mut self.reservation)
-            {
-                route_ip_mtu
-            } else {
-                core::cmp::min(route_ip_mtu, self.owner_ip_mtu)
-            };
+            let ip_mtu = route_ip_mtu;
             self.disposition = LocalOutputDisposition::Routed {
                 oif: route.oif,
                 next_hop,
@@ -1647,6 +1689,14 @@ impl LocalInputTxToken<'_> {
 }
 
 impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        match (self.routed.as_mut(), self.physical.as_mut()) {
+            (Some(routed), _) => routed.prepare_buffer(len),
+            (None, Some(physical)) => physical.prepare_buffer(len),
+            (None, None) => Err(smoltcp::phy::TxEgressError::Exhausted),
+        }
+    }
+
     fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion) -> bool {
         self.backend_policy.requires_output_admission(version)
     }
@@ -1782,24 +1832,14 @@ pub(super) fn local_tx_token<'a>(
     backend_policy: OutputBackendPolicy<'a>,
     capabilities: DeviceCapabilities,
 ) -> Option<LocalInputTxToken<'a>> {
-    let mut reservation = queue.reserve_output()?;
-    // The device capability is the lifetime maximum accepted by smoltcp;
-    // a bridge/veth starts at 1500 and can later grow to jumbo MTU. Charge
-    // the current owner MTU, not that maximum, for every ordinary packet.
+    let reservation = queue.reserve_output()?;
+    // Keep the current owner MTU as a protocol boundary. Buffer capacity and
+    // byte admission are prepared later for the actual emitted length.
     let owner_ip_mtu = backend_policy
         .routes
         .ingress_device(backend_policy.owner_ifindex)
         .map_or(capabilities.ip_mtu(), |iface| iface.mtu());
-    let frame_capacity = owner_ip_mtu
-        + if capabilities.medium == smoltcp::phy::Medium::Ethernet {
-            14
-        } else {
-            0
-        };
-    let scratch = LocalInputScratch::checkout(&queue.response_scratch, frame_capacity)?;
-    if !reservation.try_resize(scratch.capacity()) {
-        return None;
-    }
+    let scratch = LocalInputScratch::checkout(&queue.response_scratch, 0)?;
     Some(LocalInputTxToken {
         medium: capabilities.medium,
         meta: PacketMeta::default(),
@@ -2199,8 +2239,86 @@ where
         return LocalOutputTransmitResult::RetrySoon(packet);
     };
     token.set_meta(packet.meta);
+    match token.prepare_buffer(packet.frame.len()) {
+        Ok(()) => {}
+        Err(smoltcp::phy::TxEgressError::Exhausted) => {
+            return LocalOutputTransmitResult::RetrySoon(packet);
+        }
+    }
     token.consume(packet.frame.len(), |buffer| {
         buffer.copy_from_slice(&packet.frame);
     });
     LocalOutputTransmitResult::Sent(packet)
+}
+
+/// Exercise the production native handoff using a real device token, including
+/// preservation of the original owner when its prepared queue is full.
+#[cfg(feature = "mm_selftest")]
+pub(super) fn native_output_selftest<D: SmolDevice + ?Sized>(
+    device: &mut D,
+    ready: bool,
+) -> Result<bool, SystemError> {
+    let mut frame = PacketBuffer::try_with_capacity(64)?;
+    frame.resize(64, 0xa5)?;
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    let pointer = frame.as_ptr();
+    let packet = LocalOutputPacket {
+        medium: device.capabilities().medium,
+        meta: PacketMeta::default(),
+        disposition: LocalOutputDisposition::NativeOwner,
+        frame,
+        ct_context: OutputCtContext::Untracked,
+        mark: 0,
+        prepared_ip: None,
+        forward_mtu_feedback: None,
+        _charge: None,
+    };
+    let packet = match transmit_native_output(device, packet) {
+        LocalOutputTransmitResult::Sent(packet) if ready => packet,
+        LocalOutputTransmitResult::RetrySoon(packet) if !ready => packet,
+        _ => return Ok(false),
+    };
+    Ok(packet.frame.as_ptr() == pointer
+        && packet.frame.len() == 64
+        && packet.frame[..12].iter().all(|byte| *byte == 0xa5)
+        && packet.frame[12..14] == 0x0800u16.to_be_bytes()
+        && packet.frame[14..].iter().all(|byte| *byte == 0xa5))
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(super) fn native_reply_selftest(iface: Arc<dyn Iface>) -> Result<bool, SystemError> {
+    const _: () = assert!(crate::libs::paged_vec::PagedVec::<
+        LocalOutputReservation<'static>,
+        MAX_LOCAL_OUTPUT_FRAMES,
+    >::layout_supported());
+    let mut reply = NativeReply::prepare(iface.clone(), 64).map_err(|_| SystemError::ENOMEM)?;
+    let mut reservations = crate::libs::paged_vec::PagedVec::<_, MAX_LOCAL_OUTPUT_FRAMES>::new();
+    reservations.try_reserve(MAX_LOCAL_OUTPUT_FRAMES - 1)?;
+    for _ in 1..MAX_LOCAL_OUTPUT_FRAMES {
+        reservations
+            .push(LocalInputQueue::reserve_owned_output(iface.clone()).ok_or(SystemError::ENOMEM)?);
+    }
+    // Changed-length preparation must reuse the one already admitted frame,
+    // even when no additional frame slot can be obtained.
+    reply.prepare_buffer(128).map_err(|_| SystemError::ENOMEM)?;
+    reply.frame.fill(0x5a);
+    let pointer = reply.frame.as_ptr();
+    if reply.prepare_buffer(usize::MAX).is_ok()
+        || reply.frame.as_ptr() != pointer
+        || reply.frame.len() != 128
+        || reply.frame.iter().any(|byte| *byte != 0x5a)
+    {
+        return Ok(false);
+    }
+    reply.prepare_buffer(32).map_err(|_| SystemError::ENOMEM)?;
+    {
+        let output = iface.common().local_input_queue.output.lock();
+        if output.reserved_frames != MAX_LOCAL_OUTPUT_FRAMES || output.reserved_bytes != 128 {
+            return Ok(false);
+        }
+    }
+    drop(reply);
+    drop(reservations);
+    let output = iface.common().local_input_queue.output.lock();
+    Ok(output.reserved_frames == 0 && output.reserved_bytes == 0)
 }

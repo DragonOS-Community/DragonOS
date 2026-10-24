@@ -1,3 +1,4 @@
+use super::PacketBuffer;
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
@@ -11,16 +12,16 @@ use crate::driver::net::types::InterfaceFlags;
 use crate::driver::net::{napi::napi_schedule, napi::NapiStruct};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
+use crate::libs::prepared_queue::{Node, Queue};
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::LOOPBACK_IFINDEX;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::time::Instant;
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
@@ -50,7 +51,7 @@ const LOOPBACK_STACK_MTU: usize = u16::MAX as usize;
 /// ## 环回接收令牌
 /// 用于储存lo网卡接收到的数据
 pub struct LoopbackRxToken {
-    buffer: Vec<u8>,
+    buffer: PacketBuffer,
     driver: LoopbackDriver,
 }
 
@@ -83,90 +84,108 @@ impl phy::RxToken for LoopbackRxToken {
 /// 返回驱动用于操作lo设备
 pub struct LoopbackTxToken {
     driver: LoopbackDriver,
+    prepared: Option<LoopbackReservation>,
 }
 
 impl phy::TxToken for LoopbackTxToken {
-    /// ## 实现TxToken的consume函数
-    /// 向lo的队列推入待发送的数据报，实现环回
-    ///
-    /// ## 参数
-    /// - self
-    /// - len：数据包的长度
-    /// - f：接受一个可变的 u8 切片，并返回类型 `R` 的结果。
-    ///
-    /// ## 返回值
-    /// 返回f对数据包操纵的结果
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes == len)
+        {
+            return Ok(());
+        }
+        // Publish a replacement only after preparation succeeds. On failure
+        // the earlier exact-size reservation remains valid for its old frame.
+        let mut prepared = self
+            .driver
+            .reserve_slot(len)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        let mut buffer =
+            PacketBuffer::try_with_capacity(len).map_err(|_| phy::TxEgressError::Exhausted)?;
+        buffer
+            .resize(len, 0)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        *prepared.node.as_mut().unwrap().value_mut() = buffer;
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0; len];
+        let mut prepared = self
+            .prepared
+            .take()
+            .expect("loopback TX requires exact preparation");
+        assert_eq!(prepared.bytes, len);
+        let buffer = prepared.node.as_mut().unwrap().value_mut();
         let result = f(buffer.as_mut_slice());
         if let Some(iface) = self.driver.iface() {
             crate::net::socket::packet::deliver_ip_to_packet_sockets(
                 &iface,
-                &buffer,
+                buffer,
                 crate::net::socket::packet::PacketType::Outgoing,
             );
         }
-        let _ = self.driver.submit_frame(buffer);
-        // debug!("lo transmit!");
+        let _ = prepared.commit();
         result
     }
 }
 
+const LOOPBACK_QUEUE_FRAMES: usize = 1024;
+const LOOPBACK_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Default)]
-/// ## Loopback设备
-/// 成员是一个队列，用来存放接受到的数据包。
-/// 当使用lo发送数据包时，不会把数据包传到link层，而是直接发送到该队列，实现环回。
 pub struct Loopback {
-    //回环设备的缓冲区,接受的数据包会存放在这里，发送的数据包也会发送到这里，实现环回
-    queue: VecDeque<Vec<u8>>,
+    queue: Queue<PacketBuffer>,
+    queued_bytes: usize,
+    reserved_frames: usize,
+    reserved_bytes: usize,
 }
 
 impl Loopback {
-    /// ## Loopback处理接受到的数据包函数
-    /// Loopback接受到数据后会调用这个函数来弹出接收的数据，返回给协议栈
-    ///
-    /// ## 参数
-    /// - &mut self ：自身可变引用
-    ///
-    /// ## 返回值
-    /// - queue的头部数据包
-    pub fn loopback_receive(&mut self) -> Vec<u8> {
-        let buffer = self.queue.pop_front();
-        match buffer {
-            Some(buffer) => {
-                // log::debug!(
-                //     "lo receive: {} bytes, remaining_queue_len={}, self_ptr={:p}",
-                //     buffer.len(),
-                //     self.queue.len(),
-                //     self
-                // );
-                return buffer;
-            }
-            None => {
-                if !self.queue.is_empty() {
-                    log::warn!("lo receive: queue not empty but pop_front returned None!");
-                }
-                return Vec::new();
-            }
-        }
+    fn loopback_receive(&mut self) -> Option<PacketBuffer> {
+        let node = self.queue.pop_node()?;
+        self.queued_bytes -= node.value().capacity();
+        Some(node.into_value())
     }
-    /// ## Loopback发送数据包的函数
-    /// Loopback发送数据包给自己的接收队列，实现环回
-    ///
-    /// ## 参数
-    /// - &mut self：自身可变引用
-    /// - buffer：需要发送的数据包
-    pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        // log::debug!(
-        //     "lo transmit: {} bytes, queue_len={}, self_ptr={:p}",
-        //     buffer.len(),
-        //     self.queue.len(),
-        //     self
-        // );
-        self.queue.push_back(buffer);
+}
+
+struct LoopbackReservation {
+    driver: LoopbackDriver,
+    node: Option<Box<Node<PacketBuffer>>>,
+    bytes: usize,
+}
+
+impl LoopbackReservation {
+    fn commit(mut self) -> Result<(), SystemError> {
+        // An MTU change invalidates emission but never its prepared resources.
+        self.driver
+            .validate_frame_len(self.node.as_ref().unwrap().value().len())?;
+        debug_assert_eq!(self.node.as_ref().unwrap().value().capacity(), self.bytes);
+        let node = self.node.take().unwrap();
+        {
+            let mut inner = self.driver.inner.lock();
+            inner.reserved_frames -= 1;
+            inner.reserved_bytes -= self.bytes;
+            inner.queued_bytes += self.bytes;
+            inner.queue.push_node(node);
+        }
+        self.driver.notify_rx();
+        Ok(())
+    }
+}
+
+impl Drop for LoopbackReservation {
+    fn drop(&mut self) {
+        if self.node.is_some() {
+            let mut inner = self.driver.inner.lock();
+            inner.reserved_frames -= 1;
+            inner.reserved_bytes -= self.bytes;
+        }
     }
 }
 
@@ -223,11 +242,7 @@ impl phy::Device for LoopbackDriver {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let buffer = self.inner.lock().loopback_receive();
-        // receive 队列为空，返回 None 以通知上层没有可以 receive 的包
-        if buffer.is_empty() {
-            return None;
-        }
+        let buffer = self.inner.lock().loopback_receive()?;
 
         let rx = LoopbackRxToken {
             buffer,
@@ -235,6 +250,7 @@ impl phy::Device for LoopbackDriver {
         };
         let tx = LoopbackTxToken {
             driver: self.clone(),
+            prepared: None,
         };
         Some((rx, tx))
     }
@@ -250,6 +266,7 @@ impl phy::Device for LoopbackDriver {
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(LoopbackTxToken {
             driver: self.clone(),
+            prepared: None,
         })
     }
 }
@@ -278,11 +295,35 @@ impl LoopbackDriver {
         Ok(())
     }
 
-    fn submit_frame(&self, frame: Vec<u8>) -> Result<(), SystemError> {
-        // Recheck immediately before enqueueing: the configured MTU can change
-        // after a caller's pre-allocation check.
-        self.validate_frame_len(frame.len())?;
-        self.inner.lock().loopback_transmit(frame);
+    fn reserve_slot(&self, len: usize) -> Result<LoopbackReservation, SystemError> {
+        self.reserve_storage(len, len)
+    }
+
+    fn reserve_storage(
+        &self,
+        wire_len: usize,
+        bytes: usize,
+    ) -> Result<LoopbackReservation, SystemError> {
+        self.validate_frame_len(wire_len)?;
+        let node = Node::try_new(PacketBuffer::new())?;
+        let mut inner = self.inner.lock();
+        if inner.queue.len() + inner.reserved_frames >= LOOPBACK_QUEUE_FRAMES
+            || bytes
+                > LOOPBACK_QUEUE_BYTES.saturating_sub(inner.queued_bytes + inner.reserved_bytes)
+        {
+            return Err(SystemError::ENOBUFS);
+        }
+        inner.reserved_frames += 1;
+        inner.reserved_bytes += bytes;
+        drop(inner);
+        Ok(LoopbackReservation {
+            driver: self.clone(),
+            node: Some(node),
+            bytes,
+        })
+    }
+
+    fn notify_rx(&self) {
         if let Some(iface) = self.iface() {
             if let Some(napi) = iface.napi_struct() {
                 napi_schedule(napi);
@@ -290,12 +331,13 @@ impl LoopbackDriver {
                 netns.wakeup_poll_thread();
             }
         }
-        Ok(())
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
         self.validate_frame_len(frame.len())?;
-        self.submit_frame(frame.to_vec())
+        let mut prepared = self.reserve_slot(frame.len())?;
+        *prepared.node.as_mut().unwrap().value_mut() = PacketBuffer::try_from_slice(frame)?;
+        prepared.commit()
     }
 }
 
@@ -357,8 +399,11 @@ impl LoopbackInterface {
         iface_config.random_seed = rand() as u64;
         iface_config.is_loopback = true;
 
-        let mut iface =
-            smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
+        let mut iface = crate::driver::net::packet_storage::new_interface(
+            iface_config,
+            &mut driver,
+            Instant::now().into(),
+        );
 
         iface.set_any_ip(true);
 
@@ -595,6 +640,24 @@ impl Iface for LoopbackInterface {
         Ok(())
     }
 
+    fn raw_transmit_owned(&self, mut frame: PacketBuffer) -> Result<(), SystemError> {
+        let len = frame.len().checked_sub(14).ok_or(SystemError::EINVAL)?;
+        // Preserve the existing allocation while removing the synthetic
+        // Ethernet header. Residency is capacity, MTU validation is wire len.
+        let mut prepared = self.driver.reserve_storage(len, frame.capacity())?;
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        frame.as_mut_slice().copy_within(14.., 0);
+        frame.truncate(len);
+        *prepared.node.as_mut().unwrap().value_mut() = frame;
+        prepared.commit()
+    }
+
     fn route_and_send(
         &self,
         _next_hop: &smoltcp::wire::IpAddress,
@@ -706,4 +769,96 @@ pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     log::debug!("Successfully init loopback device");
     return Ok(());
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn buffer_selftest() -> bool {
+    fn run() -> Result<bool, SystemError> {
+        let mut driver = LoopbackDriver::default();
+        let mut tx = <LoopbackDriver as phy::Device>::transmit(
+            &mut driver,
+            smoltcp::time::Instant::from_millis(0),
+        )
+        .unwrap();
+        phy::TxToken::prepare_buffer(&mut tx, 17).map_err(|_| SystemError::ENOMEM)?;
+        phy::TxToken::prepare_buffer(&mut tx, 17).map_err(|_| SystemError::ENOMEM)?;
+        if phy::TxToken::prepare_buffer(&mut tx, usize::MAX).is_ok() {
+            return Ok(false);
+        }
+        {
+            let inner = driver.inner.lock();
+            if inner.reserved_frames != 1 || inner.reserved_bytes != 17 {
+                return Ok(false);
+            }
+        }
+        phy::TxToken::consume(tx, 17, |bytes| bytes.fill(0xa5));
+        let rx = driver
+            .inner
+            .lock()
+            .loopback_receive()
+            .ok_or(SystemError::EIO)?;
+        if rx.len() != 17 || rx.iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+        drop(rx);
+
+        if !super::local_output::native_output_selftest(&mut driver, true)? {
+            return Ok(false);
+        }
+        let native = driver
+            .inner
+            .lock()
+            .loopback_receive()
+            .ok_or(SystemError::EIO)?;
+        if native.len() != 64 || native[14..].iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+        drop(native);
+        let mut reservations = Queue::new();
+        for _ in 0..LOOPBACK_QUEUE_FRAMES {
+            reservations.push_node(Node::try_new(driver.reserve_slot(1)?)?);
+        }
+        if !matches!(driver.reserve_slot(1), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        if !super::local_output::native_output_selftest(&mut driver, false)? {
+            return Ok(false);
+        }
+        drop(reservations.pop_node());
+        drop(driver.reserve_slot(1)?);
+        drop(reservations);
+        let mut reservations = Queue::new();
+        for _ in 0..LOOPBACK_QUEUE_BYTES / LOOPBACK_MTU {
+            reservations.push_node(Node::try_new(driver.reserve_slot(LOOPBACK_MTU)?)?);
+        }
+        if !matches!(driver.reserve_slot(1), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        drop(reservations);
+        let iface = LoopbackInterface::new(driver.clone());
+        *iface.common.napi_struct.write() = Some(NapiStruct::new_disabled(iface.clone(), 10));
+        let mut frame = PacketBuffer::try_with_capacity(128)?;
+        frame.resize(17, 0)?;
+        frame[14..].copy_from_slice(b"own");
+        let pointer = frame.as_ptr();
+        iface.raw_transmit_owned(frame)?;
+        if driver.inner.lock().queued_bytes != 128 {
+            return Ok(false);
+        }
+        let frame = driver
+            .inner
+            .lock()
+            .loopback_receive()
+            .ok_or(SystemError::EIO)?;
+        if frame.as_slice() != b"own" || frame.as_ptr() != pointer || frame.capacity() != 128 {
+            return Ok(false);
+        }
+        drop(frame);
+        let inner = driver.inner.lock();
+        Ok(inner.queue.is_empty()
+            && inner.queued_bytes == 0
+            && inner.reserved_frames == 0
+            && inner.reserved_bytes == 0)
+    }
+    run().unwrap_or(false)
 }

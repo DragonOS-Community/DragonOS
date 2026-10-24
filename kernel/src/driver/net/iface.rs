@@ -131,7 +131,7 @@ pub(crate) fn inject_owned_local_ip_packet_with_context<I: Iface + ?Sized>(
     iface: &I,
     ingress_ifindex: u32,
     source_mac: smoltcp::wire::EthernetAddress,
-    ip_packet: Vec<u8>,
+    ip_packet: PacketBuffer,
     broadcast: bool,
     origin: LocalPacketOrigin,
     ct_context: Option<CtPacketContext>,
@@ -156,7 +156,7 @@ pub(crate) fn inject_owned_local_ip_packet_with_context_and_mark<I: Iface + ?Siz
     iface: &I,
     ingress_ifindex: u32,
     source_mac: smoltcp::wire::EthernetAddress,
-    ip_packet: Vec<u8>,
+    ip_packet: PacketBuffer,
     broadcast: bool,
     origin: LocalPacketOrigin,
     ct_context: Option<CtPacketContext>,
@@ -183,7 +183,7 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch<I: Iface + ?Sized>(
     iface: &I,
     ingress_ifindex: u32,
     source_mac: smoltcp::wire::EthernetAddress,
-    ip_packet: Vec<u8>,
+    ip_packet: PacketBuffer,
     broadcast: bool,
     origin: LocalPacketOrigin,
     ct_context: Option<CtPacketContext>,
@@ -214,7 +214,7 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch_with_fragment<I: Iface + ?Si
     iface: &I,
     ingress_ifindex: u32,
     source_mac: smoltcp::wire::EthernetAddress,
-    ip_packet: Vec<u8>,
+    ip_packet: PacketBuffer,
     broadcast: bool,
     origin: LocalPacketOrigin,
     ct_context: Option<CtPacketContext>,
@@ -302,11 +302,7 @@ pub(crate) fn inject_local_ip_packet_with_context_and_mark<I: Iface + ?Sized>(
     ct_context: Option<CtPacketContext>,
     mark: u32,
 ) -> Result<(), SystemError> {
-    let mut owned_packet = Vec::new();
-    owned_packet
-        .try_reserve_exact(ip_packet.len())
-        .map_err(|_| SystemError::ENOMEM)?;
-    owned_packet.extend_from_slice(ip_packet);
+    let owned_packet = PacketBuffer::try_from_slice(ip_packet)?;
     inject_owned_local_ip_packet_with_context_and_mark(
         iface,
         ingress_ifindex,
@@ -388,7 +384,7 @@ pub trait Iface: crate::driver::base::device::Device {
     /// Submit a frame whose allocation may be transferred to the driver.
     /// Drivers with an owned receive queue can override this to avoid copying;
     /// borrowed-only DMA drivers keep the common fallback.
-    fn raw_transmit_owned(&self, frame: Vec<u8>) -> Result<(), SystemError> {
+    fn raw_transmit_owned(&self, frame: PacketBuffer) -> Result<(), SystemError> {
         self.raw_transmit(&frame)
     }
 
@@ -406,11 +402,12 @@ pub trait Iface: crate::driver::base::device::Device {
     ) -> Result<(), RouteSendError> {
         // A short original packet may instead emit an ARP request or an
         // IPv6 Neighbor Solicitation (Ethernet + IPv6 + NS with SLLAO).
-        let frame_capacity = (14usize + ip_packet.len()).max(86);
-        let mut frame = Vec::new();
-        frame
-            .try_reserve_exact(frame_capacity)
-            .map_err(|_| RouteSendError::Failed(SystemError::ENOMEM))?;
+        let frame_capacity = ip_packet
+            .len()
+            .checked_add(14)
+            .ok_or(SystemError::ENOMEM)?
+            .max(86);
+        let mut frame = PacketBuffer::try_with_capacity(frame_capacity)?;
         let frame_prepared = Cell::new(false);
         let permanent_neighbor = match next_hop {
             smoltcp::wire::IpAddress::Ipv4(address)
@@ -643,7 +640,7 @@ pub trait Iface: crate::driver::base::device::Device {
         &self,
         ingress_ifindex: u32,
         source_mac: smoltcp::wire::EthernetAddress,
-        ip_packet: Vec<u8>,
+        ip_packet: PacketBuffer,
         broadcast: bool,
         origin: LocalPacketOrigin,
     ) -> Result<(), SystemError> {
@@ -784,17 +781,25 @@ pub trait Iface: crate::driver::base::device::Device {
 }
 
 struct PreparedFrameTxToken<'a> {
-    frame: &'a mut Vec<u8>,
+    frame: &'a mut PacketBuffer,
     prepared: &'a Cell<bool>,
 }
 
 impl SmolTxToken for PreparedFrameTxToken<'_> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        if len > self.frame.capacity() {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        Ok(())
+    }
+
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        debug_assert!(len <= self.frame.capacity());
-        self.frame.resize(len, 0);
+        self.frame
+            .resize(len, 0)
+            .expect("TX consume must fit the prepared frame");
         let result = f(self.frame.as_mut_slice());
         self.prepared.set(true);
         result

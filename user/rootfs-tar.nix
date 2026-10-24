@@ -4,11 +4,11 @@
   nixpkgs,
   system,
   target,
-  fenix,
   testOpt,
+  nightlyRustPlatform,
 }:
 
-# 产物是一个可以生成 rootfs.tar 的脚本
+# 产物是一个未压缩的 docker 镜像 tar，其中的 layer.tar 即 rootfs 内容
 let
   apps = import ./apps {
     inherit
@@ -17,8 +17,8 @@ let
       nixpkgs
       system
       target
-      fenix
       testOpt
+      nightlyRustPlatform
       ;
   };
 
@@ -32,8 +32,7 @@ let
         cp -r $src/* $out/
       '';
 
-  # 使用 buildImage 创建 Docker 镜像（单层）
-  # 直接返回 dockerImage，解压逻辑在 default.nix 中处理
+  # 使用 buildImage 创建 Docker 镜像（单层），copyToRoot 会连同 /nix/store 闭包一起打包
   dockerImage = pkgs.dockerTools.buildImage {
     name = "busybox-rootfs";
     copyToRoot = [
@@ -41,6 +40,14 @@ let
     ]
     ++ apps;
     keepContentsDirlinks = false;
+    # Create writable runtime directories in the layer, after Nix store
+    # permission normalization. /var/tmp must remain disk-backed for tests.
+    extraCommands = ''
+      mkdir -p var/tmp
+      chmod 1777 var/tmp
+    '';
+    # 仅作为 disk-image.nix 的中间产物，不需要压缩
+    compressor = "none";
   };
 
 in

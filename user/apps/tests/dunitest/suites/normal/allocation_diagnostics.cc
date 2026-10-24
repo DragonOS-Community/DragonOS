@@ -125,6 +125,7 @@ TEST(AllocationDiagnostics, PrivateArenaValidatesFailureClassesAndCountConservat
     EXPECT_NE(first.find("fragmentation_and_capacity_diagnostics=ok\n"), std::string::npos) << first;
     EXPECT_NE(first.find("zone_reserve_and_address_diagnostics=ok\n"), std::string::npos) << first;
     EXPECT_NE(first.find("metadata_count_conservation=ok\n"), std::string::npos) << first;
+    EXPECT_NE(first.find("reserve_scope_irq_fork=ok\n"), std::string::npos) << first;
     EXPECT_NE(first.find("summary_fail=0\n"), std::string::npos) << first;
     EXPECT_EQ(first, ReadPath(kSelftestPath));
     CheckStats(ReadPath(kStatsPath));

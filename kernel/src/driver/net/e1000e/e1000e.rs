@@ -99,6 +99,22 @@ pub struct E1000EBuffer {
 }
 
 impl E1000EBuffer {
+    pub fn try_new(length: usize) -> Result<Self, SystemError> {
+        if length > PAGE_SIZE {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let (paddr, buffer) = crate::mm::dma::try_dma_alloc_pages_raw(
+            E1000E_DMA_PAGES,
+            crate::mm::dma::DmaAllocOptions::default(),
+        )?;
+        Ok(Self {
+            buffer,
+            paddr,
+            capacity: PAGE_SIZE,
+            data_len: length,
+        })
+    }
+
     pub fn new(length: usize) -> Self {
         assert!(length <= PAGE_SIZE);
         let (paddr, vaddr) = dma_alloc(E1000E_DMA_PAGES);

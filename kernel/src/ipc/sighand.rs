@@ -83,6 +83,18 @@ impl SigHand {
     pub fn handler(&self, sig: Signal) -> Option<Sigaction> {
         self.inner().handlers.get(Self::sig2idx(sig)).cloned()
     }
+    /// Select a disposition for delivery and consume SA_RESETHAND atomically.
+    /// Like Linux get_signal(), retain the selected action for this delivery
+    /// while resetting only the shared handler, including on frame setup failure.
+    pub fn handler_for_delivery(&self, sig: Signal) -> Option<Sigaction> {
+        let mut inner = self.inner_mut();
+        let handler = inner.handlers.get_mut(Self::sig2idx(sig))?;
+        let selected = *handler;
+        if selected.action().is_customized() && selected.flags().contains(SigFlags::SA_RESETHAND) {
+            handler.set_action(SigactionType::SaHandler(SaHandlerType::Default));
+        }
+        Some(selected)
+    }
     pub fn set_handler(&self, sig: Signal, act: Sigaction) {
         if let Some(h) = self.inner_mut().handlers.get_mut(Self::sig2idx(sig)) {
             *h = act;

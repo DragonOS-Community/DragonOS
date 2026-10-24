@@ -17,6 +17,7 @@ use crate::{
     process::ProcessManager,
 };
 
+pub(crate) mod background;
 pub(crate) mod recovery;
 
 static EXECUTION: Mutex<()> = Mutex::new(());
@@ -31,6 +32,7 @@ pub(crate) enum Stop {
     Blocked,
     NoMemory,
     Deferred,
+    Timeout,
 }
 impl From<RangeError> for Stop {
     fn from(error: RangeError) -> Self {
@@ -170,6 +172,8 @@ pub(crate) struct Request {
     /// Optional first scan address within this stable domain. Changing only
     /// the seed preserves the domain/order failure deferral history.
     pub start_at: Option<PhysAddr>,
+    /// Cooperative deadline; an in-flight migration/TLB operation completes first.
+    pub deadline: Option<u64>,
     pub limits: Limits,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -243,6 +247,7 @@ impl Compactor {
             end,
             order,
             start_at,
+            deadline,
             limits,
         } = request;
         if order == 0
@@ -282,6 +287,10 @@ impl Compactor {
             return Err(Stop::Invalid);
         }
         *next = PhysAddr::new(candidate);
+        let expired = || deadline.is_some_and(|until| crate::time::timer::clock() >= until);
+        if expired() {
+            return Err(Stop::Timeout);
+        }
         let domain = Domain { start, end, order };
         if self.domain != Some(domain) {
             self.domain = Some(domain);
@@ -306,6 +315,9 @@ impl Compactor {
             .checked_add(bytes)
             .is_some_and(|last| last <= end.data())
         {
+            if expired() {
+                return Err(Stop::Timeout);
+            }
             if stats.targets == limits.targets {
                 return Err(if saw_busy { Stop::Busy } else { Stop::Budget });
             }
@@ -316,6 +328,9 @@ impl Compactor {
             let before = lease.free_pages();
             let mut stopped = Stop::Blocked;
             for offset in 0..(1usize << order) {
+                if expired() {
+                    return Err(Stop::Timeout);
+                }
                 if lease.free_pages() == 1 << order {
                     break;
                 }

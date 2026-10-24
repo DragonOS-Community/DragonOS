@@ -48,27 +48,19 @@ impl FileOps for CmdlineFileOps {
     ) -> Result<usize, SystemError> {
         let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
-        // 获取 cmdline 字节
-        let cmdline_bytes = pcb.cmdline_bytes();
-
-        // 如果 cmdline 为空，返回进程名
-        let mut content = if cmdline_bytes.is_empty() {
-            let name = {
-                let basic = pcb.basic();
-                basic.name().as_bytes().to_vec()
-            };
-            let mut result = name;
-            result.push(0); // 以 \0 结尾
-            result
-        } else {
-            cmdline_bytes
-        };
-
-        // Linux 的 /proc/self/cmdline 格式是: arg0\0arg1\0arg2\0
-        // 必须以 \0 结尾（而不是 \n）
-        if !content.ends_with(b"\0") {
-            content.push(0);
+        // Clone only the immutable owner, then release the PCB guard before
+        // borrowing its page chunks. Partial reads allocate no full-size copy.
+        if let Some(snapshot) = pcb.cmdline_snapshot() {
+            if snapshot.byte_len() != 0 {
+                let count = len.min(buf.len());
+                return Ok(snapshot.copy_range(offset, &mut buf[..count]));
+            }
         }
+        let mut content = {
+            let basic = pcb.basic();
+            basic.name().as_bytes().to_vec()
+        };
+        content.push(0);
 
         proc_read(offset, len, buf, &content)
     }

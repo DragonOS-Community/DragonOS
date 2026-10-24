@@ -3165,14 +3165,23 @@ impl PageCache {
         let charge = owner
             .try_charge(kind, 1)
             .map_err(MemoryAllocationError::Charge)?;
-        crate::mm::page::allocate_registered_data_page(
-            PageType::File(FileMapInfo {
-                page_cache: page_cache_ref,
-                index: page_index,
-            }),
-            self.page_flags(),
-            Some(charge),
-        )
+        let page_type = PageType::File(FileMapInfo {
+            page_cache: page_cache_ref,
+            index: page_index,
+        });
+        if kind == MemoryKind::File {
+            crate::mm::page::allocate_registered_file_cache_page(
+                page_type,
+                self.page_flags(),
+                charge,
+            )
+        } else {
+            crate::mm::page::allocate_registered_data_page(
+                page_type,
+                self.page_flags(),
+                Some(charge),
+            )
+        }
         .map_err(MemoryAllocationError::System)
     }
 

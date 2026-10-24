@@ -12,6 +12,9 @@ pub struct InnerAddressSpace {
     pub mmap_min: VirtAddr,
     /// User stack information struct
     pub user_stack: Option<UserStack>,
+    /// Kernel-provided rt_sigreturn entry; inherited with its ordinary RX VMA.
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) signal_trampoline: Option<VirtAddr>,
     /// Main image ownership, released at last mm user teardown. Tuple elements
     /// drop in order: release deny-write before the File and its mount pin,
     /// matching Linux's allow_write_access() before fput().
@@ -71,6 +74,8 @@ impl InnerAddressSpace {
             brk_start: MMArch::USER_BRK_START,
             brk: MMArch::USER_BRK_START,
             user_stack: None,
+            #[cfg(target_arch = "riscv64")]
+            signal_trampoline: None,
             exec_write_guard: None,
             start_code: VirtAddr(0),
             end_code: VirtAddr(0),
@@ -130,6 +135,10 @@ impl InnerAddressSpace {
         new_guard.start_data = self.start_data;
         new_guard.end_data = self.end_data;
         new_guard.exec_write_guard = self.exec_write_guard.clone();
+        #[cfg(target_arch = "riscv64")]
+        {
+            new_guard.signal_trampoline = self.signal_trampoline;
+        }
 
         let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
         let mut child_present_pages = 0usize;
@@ -555,5 +564,58 @@ impl InnerAddressSpace {
             }
             vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
         }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl InnerAddressSpace {
+    /// Install the architecture's sigreturn entry before publishing a new image.
+    /// The ordinary RX mapping follows the mm through fork and teardown. Users
+    /// may unmap it, as with Linux's vDSO; returning there then faults in user mode.
+    pub(super) fn map_signal_trampoline(
+        &mut self,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        // addi a7, zero, __NR_rt_sigreturn; ecall. No stack or register scratch.
+        const CODE: [u32; 2] = [0x08b0_0893, 0x0000_0073];
+        const _: () = assert!(crate::arch::syscall::nr::SYS_RT_SIGRETURN == 139);
+        let hint = VirtAddr::new(
+            (MMArch::USER_END_VADDR.data() & !MMArch::PAGE_OFFSET_MASK) - MMArch::PAGE_SIZE,
+        );
+        let page = self.map_anonymous(
+            hint,
+            MMArch::PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            true,
+            true,
+            Some(creator),
+            data_account,
+        )?;
+        // The unpublished mm is exclusively locked, so its eager page cannot
+        // be unmapped while the kernel initializes the physical alias.
+        let (paddr, _) = self
+            .user_mapper
+            .utable
+            .translate(page.virt_address())
+            .ok_or(SystemError::EFAULT)?;
+        let owned_page = page_manager_lock().get(&paddr).ok_or(SystemError::EFAULT)?;
+        // Isolation also requires this mm's write lock. This fresh page has
+        // never been published, so neither Busy nor pin overflow can occur.
+        let access = owned_page
+            .try_pin_access()
+            .map_err(|_| SystemError::EFAULT)?;
+        let alias =
+            unsafe { MMArch::phys_2_virt(access.phys_address()) }.ok_or(SystemError::EFAULT)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                CODE.as_ptr().cast::<u8>(),
+                alias.as_ptr::<u8>() as *mut u8,
+                core::mem::size_of_val(&CODE),
+            );
+        }
+        self.signal_trampoline = Some(page.virt_address());
+        Ok(())
     }
 }

@@ -67,3 +67,4 @@ normal/balloon_memory_integrity
 normal/copy_file_range_semantics
 normal/exec_string_layout
 normal/syslog_snapshot
+normal/proc_mem_offset

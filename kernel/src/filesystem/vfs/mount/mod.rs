@@ -61,6 +61,8 @@ mod filecaps;
 pub mod idmap;
 mod operations;
 mod selftest;
+mod superblock_lifecycle;
+pub(crate) use superblock_lifecycle::SuperBlockActiveGuard;
 pub mod writer;
 pub(crate) use selftest::run_mount_wrapper_cache_debug_selftest;
 #[cfg(feature = "mm_selftest")]
@@ -1983,9 +1985,10 @@ impl MountFS {
             if state.shutdown_started() {
                 return Err(SystemError::ESTALE);
             }
-            if state.flags().contains(MountFlags::RDONLY) != flags.contains(MountFlags::RDONLY)
-                || !Arc::ptr_eq(state.owner_user_ns(), &owner_user_ns)
-            {
+            // sget_fc checks ownership, while device-specific factories (for
+            // example ext4/get_tree_bdev) validate incompatible SB options.
+            // A new entry's read-only attribute is independent of this SB.
+            if !Arc::ptr_eq(state.owner_user_ns(), &owner_user_ns) {
                 return Err(SystemError::EBUSY);
             }
             return Ok(state);
@@ -3702,46 +3705,7 @@ impl MountFS {
     }
 
     fn finish_final_shutdown(&self) {
-        let sb_state = self.super_block_state();
-        let _umount_guard = sb_state.umount_write();
-        self.inner_filesystem.close_external_inode_admission();
-        if let Err(err) = self.sync_filesystem_locked() {
-            log::warn!("final superblock sync failed during umount: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        if let Err(err) = self.inner_filesystem.quiesce_page_cache_producers() {
-            log::warn!("final page-cache producer quiesce failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        if let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() {
-            domain.close_background_admission();
-            if let Err(err) = domain.wait_drained() {
-                log::warn!("final page-cache I/O drain failed: {:?}", err);
-                sb_state.record_wb_error(err);
-            }
-            for cache in domain.snapshot() {
-                if let Err(err) = cache.retire_for_domain() {
-                    log::warn!("final page-cache retirement failed: {:?}", err);
-                    sb_state.record_wb_error(err);
-                }
-            }
-        }
-        if let Err(err) = self.inner_filesystem.shrink_inode_cache_for_shutdown() {
-            log::warn!("final inode cache shrink failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        if let Err(err) = self.inner_filesystem.quiesce_async_inode_work() {
-            log::warn!("final asynchronous inode quiesce failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        let epoch = self.inner_filesystem.seal_eviction_queue();
-        if let Err(err) = self.inner_filesystem.drain_evictions_through(epoch) {
-            log::warn!("final superblock eviction drain failed: {:?}", err);
-            sb_state.record_wb_error(err);
-        }
-        sb_state.drain_fsnotify_objects_for_unmount();
-        self.inner_filesystem.on_umount();
-        sb_state.finish_shutdown();
+        superblock_lifecycle::finish_shutdown(&self.inner_filesystem, &self.super_block_state);
     }
 
     /// Unmount the filesystem.
@@ -3998,48 +3962,7 @@ impl MountFS {
     /// Corresponds to Linux `sync_inodes_sb()`: write back all dirty page caches under the specified mount.
     /// Page caches are registered in their filesystem's stable writeback domain.
     fn sync_inodes_of_mount(&self) -> Result<(), SystemError> {
-        let Some(domain) = self.inner_filesystem.page_cache_writeback_domain() else {
-            return Ok(());
-        };
-        let mut last_err = Ok(());
-        let mut members = domain
-            .snapshot()
-            .into_iter()
-            .filter(|cache| cache.has_dirty_or_writeback_work());
-        let mut pending = Vec::new();
-        pending
-            .try_reserve_exact(crate::filesystem::page_cache::DOMAIN_WRITEBACK_WINDOW)
-            .map_err(|_| SystemError::ENOMEM)?;
-        loop {
-            let mut count = 0;
-            for page_cache in members
-                .by_ref()
-                .take(crate::filesystem::page_cache::DOMAIN_WRITEBACK_WINDOW)
-            {
-                count += 1;
-                match page_cache.start_sync_for_domain() {
-                    Ok(writeback) => pending.push(writeback),
-                    Err(error) => {
-                        self.record_wb_error(error.clone());
-                        last_err = Err(error);
-                    }
-                }
-            }
-            if count == 0 {
-                break;
-            }
-            // Submit across mappings before forcing durable completion. An
-            // outer guard would seal each small file before the next starts.
-            let _sync_request = self.inner_filesystem.begin_sync_writeback();
-            for writeback in pending.drain(..) {
-                if let Err(error) = writeback.finish() {
-                    log::warn!("sync_inodes_of_mount: page cache sync failed: {:?}", error);
-                    self.record_wb_error(error.clone());
-                    last_err = Err(error);
-                }
-            }
-        }
-        last_err
+        superblock_lifecycle::sync_inodes(&self.inner_filesystem, &self.super_block_state)
     }
 
     pub fn sync_inodes_with_umount_read(&self) -> Result<(), SystemError> {
@@ -4109,39 +4032,10 @@ impl MountFS {
     /// this mount's superblock `umount_lock`, either for read (`syncfs`) or write
     /// (`umount`).
     fn sync_filesystem_locked(&self) -> Result<(), SystemError> {
-        if self.is_sb_readonly() {
-            return Ok(());
-        }
-
-        // writeback_inodes_sb(sb) — void
-        let mut last_err = self.sync_inodes_of_mount();
-        // sync_fs(sb, 0)
-        if let Err(e) = self.sync_fs(false) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        if let Err(e) = self.sync_blockdev(false) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        // sync_inodes_sb(sb) — void
-        if let Err(e) = self.sync_inodes_of_mount() {
-            last_err = Err(e);
-        }
-        // sync_fs(sb, 1)
-        if let Err(e) = self.sync_fs(true) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        if let Err(e) = self.sync_blockdev(true) {
-            self.record_wb_error(e.clone());
-            return Err(e);
-        }
-
-        last_err
+        superblock_lifecycle::sync_filesystem_locked(
+            &self.inner_filesystem,
+            &self.super_block_state,
+        )
     }
 
     /// Public read-locked wrapper for callers that do not already hold the

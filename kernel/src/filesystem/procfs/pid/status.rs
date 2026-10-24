@@ -179,8 +179,7 @@ impl StatusFileOps {
             // Match stat/statm: count committed virtual mappings, including
             // untouched/PROT_NONE ranges, rather than resident physical pages.
             let size = address_space_guard.vma_usage_bytes() / 1024;
-            // todo: 当前进程运行过程中占用内存的峰值
-            let hiwater_vm: u64 = 0;
+            let hiwater_vm = address_space_guard.mappings.peak_usage_bytes() / 1024;
             // 进程代码段的大小
             let text = (address_space_guard.end_code - address_space_guard.start_code) / 1024;
             // 进程数据段的大小

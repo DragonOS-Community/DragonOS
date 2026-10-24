@@ -246,10 +246,9 @@ impl StatFileOps {
     fn generate_content(&self) -> Result<Vec<u8>, SystemError> {
         let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
 
-        let (comm, user_vm) = {
-            let basic = pcb.basic();
-            (basic.name().to_string(), basic.user_vm())
-        };
+        let comm = pcb.basic().name().to_string();
+        // Match get_task_mm(): keep mappings alive through exec/exit sampling.
+        let user_vm = pcb.active_vm();
         let state = pcb.sched_info().state();
         let tty_nr = {
             pcb.sig_info_irqsave()
@@ -293,10 +292,14 @@ impl StatFileOps {
             .map(|tgid_pid| tgid_pid.tasks_iter(PidType::TGID).count() as i64)
             .unwrap_or(1);
         let (vsize_bytes, rss_pages) = user_vm
-            .map(|vm| {
+            .map(|mm| {
+                let vm = mm.vm();
                 let guard = vm.read_guard_no_reservations();
                 let bytes = guard.vma_usage_bytes();
                 let pages = vm.resident_pages();
+                drop(guard);
+                // The final mmput can acquire the mm write lock.
+                drop(mm);
                 (bytes as u64, pages as u64)
             })
             .unwrap_or((0, 0));

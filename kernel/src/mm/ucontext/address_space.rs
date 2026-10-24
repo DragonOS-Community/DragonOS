@@ -1298,7 +1298,7 @@ impl AddressSpace {
         fixed_hint: bool,
     ) -> Option<VirtAddr> {
         let addr = start_vaddr.data() & (!MMArch::PAGE_OFFSET_MASK);
-        if (addr != 0) && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
+        if !fixed_hint && (addr != 0) && round_to_min && (addr < DEFAULT_MMAP_MIN_ADDR) {
             Some(VirtAddr::new(page_align_up(DEFAULT_MMAP_MIN_ADDR)))
         } else if addr == 0 && fixed_hint {
             Some(VirtAddr::new(0))
@@ -2471,24 +2471,33 @@ impl AddressSpace {
                 return Ok(guard.brk.data());
             }
 
-            let new_brk = VirtAddr::new(page_align_up(new_addr.data()));
-            let wait_region = if new_brk > guard.brk {
-                Some(VirtRegion::new(guard.brk, new_brk - guard.brk))
-            } else if new_brk < guard.brk {
-                Some(VirtRegion::new(new_brk, guard.brk - new_brk))
-            } else {
-                None
+            let change = match guard.brk_change(new_addr) {
+                Ok(change) => change,
+                Err(_) => return Ok(guard.brk.data()),
             };
-            if let Some(region) = wait_region {
+            if let Some(region) = change.region {
                 if guard.mappings.first_reservation_conflict(region).is_some() {
                     drop(guard);
                     self.wait_for_no_reservation_conflict(region);
                     continue;
                 }
             }
+            // A finite DATA growth check scans committed data VMAs. Serialize
+            // with in-flight file mappings, just as Linux's mmap write lock.
+            let data_limit = ProcessManager::current_pcb()
+                .get_rlimit(RLimitID::Data)
+                .rlim_cur as usize;
+            if change.new_end > change.old_end
+                && data_limit != usize::MAX
+                && guard.mappings.first_reservation_region().is_some()
+            {
+                drop(guard);
+                self.wait_for_no_reservations();
+                continue;
+            }
 
             unsafe {
-                match guard.set_brk(new_brk, Some(&creator), &data_account) {
+                match guard.set_brk(new_addr, data_limit, Some(&creator), &data_account) {
                     Ok(outcome) => {
                         let current_brk = guard.brk.data();
                         let post_commit_population = outcome.post_commit_population;
@@ -2535,29 +2544,35 @@ impl AddressSpace {
                 return Ok(guard.brk);
             }
 
-            let requested = if incr > 0 {
-                guard.brk + incr as usize
-            } else {
-                guard.brk - incr.unsigned_abs()
-            };
-            let new_brk = VirtAddr::new(page_align_up(requested.data()));
-            let wait_region = if new_brk > guard.brk {
-                Some(VirtRegion::new(guard.brk, new_brk - guard.brk))
-            } else if new_brk < guard.brk {
-                Some(VirtRegion::new(new_brk, guard.brk - new_brk))
-            } else {
-                None
-            };
-
-            if let Some(region) = wait_region {
+            let requested = VirtAddr::new(
+                guard
+                    .brk
+                    .data()
+                    .checked_add_signed(incr)
+                    .ok_or(SystemError::ENOMEM)?,
+            );
+            let change = guard.brk_change(requested)?;
+            if let Some(region) = change.region {
                 if guard.mappings.first_reservation_conflict(region).is_some() {
                     drop(guard);
                     self.wait_for_no_reservation_conflict(region);
                     continue;
                 }
             }
-
-            let outcome = match unsafe { guard.sbrk(incr, Some(&creator), &data_account) } {
+            let data_limit = ProcessManager::current_pcb()
+                .get_rlimit(RLimitID::Data)
+                .rlim_cur as usize;
+            if change.new_end > change.old_end
+                && data_limit != usize::MAX
+                && guard.mappings.first_reservation_region().is_some()
+            {
+                drop(guard);
+                self.wait_for_no_reservations();
+                continue;
+            }
+            let outcome = match unsafe {
+                guard.set_brk(requested, data_limit, Some(&creator), &data_account)
+            } {
                 Ok(outcome) => outcome,
                 Err(failure) => {
                     drop(guard);

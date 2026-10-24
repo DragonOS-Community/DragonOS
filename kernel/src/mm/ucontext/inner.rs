@@ -45,17 +45,9 @@ pub struct InnerAddressSpace {
 }
 
 impl InnerAddressSpace {
-    /// Current virtual memory usage of this address space in bytes (simple sum of all VMA sizes)
+    /// Virtual bytes admitted by this mm, including in-flight mmap reservations.
     pub fn vma_usage_bytes(&self) -> usize {
-        let vma_bytes = self
-            .mappings
-            .iter_vmas()
-            .map(|v| {
-                let g = v.lock();
-                g.region().size()
-            })
-            .sum::<usize>();
-        vma_bytes.saturating_add(self.mappings.reservation_usage_bytes())
+        self.mappings.usage_bytes()
     }
 
     pub(crate) fn new(

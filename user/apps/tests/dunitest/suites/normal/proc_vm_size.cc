@@ -37,6 +37,12 @@ public:
         mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) {}
     ~Mapping() { if (ptr_ != MAP_FAILED) munmap(ptr_, size_); }
     void* get() const { return ptr_; }
+    int UnmapTail(size_t retained) {
+        if (retained >= size_) { errno = EINVAL; return -1; }
+        const int rc = munmap(static_cast<char*>(ptr_) + retained, size_ - retained);
+        if (!rc) size_ = retained;
+        return rc;
+    }
 private:
     size_t size_;
     void* ptr_;
@@ -60,10 +66,11 @@ bool ReadFile(const char* path, char* buffer, size_t capacity) {
     return fd.get() >= 0 && ReadFd(fd.get(), buffer, capacity);
 }
 
-bool ParseVmSize(const char* text, size_t* bytes) {
+bool ParseVmField(const char* text, const char* key, size_t* bytes) {
+    const size_t key_len = strlen(key);
     for (const char* line = text; line && *line; ) {
-        if (strncmp(line, "VmSize:", 7) == 0) {
-            const char* value = line + 7;
+        if (strncmp(line, key, key_len) == 0) {
+            const char* value = line + key_len;
             while (*value == ' ' || *value == '\t') ++value;
             char* end = nullptr;
             errno = 0;
@@ -79,6 +86,45 @@ bool ParseVmSize(const char* text, size_t* bytes) {
         if (line) ++line;
     }
     return false;
+}
+
+bool ParseVmSize(const char* text, size_t* bytes) {
+    return ParseVmField(text, "VmSize:", bytes);
+}
+
+struct VmSnapshot { size_t size = 0, peak = 0; };
+bool Snapshot(VmSnapshot* out, pid_t pid = 0) {
+    char path[80], data[16384];
+    if (pid) snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    else strcpy(path, "/proc/self/status");
+    return ReadFile(path, data, sizeof(data)) &&
+           ParseVmSize(data, &out->size) &&
+           ParseVmField(data, "VmPeak:", &out->peak);
+}
+
+bool ParseStatSize(char* data, size_t* bytes) {
+    char* field = strrchr(data, ')');
+    if (!field) return false;
+    ++field;
+    for (int i = 3; i < 23; ++i) {
+        while (*field == ' ') ++field;
+        while (*field && *field != ' ') ++field;
+        if (!*field) return false;
+    }
+    char* end = nullptr;
+    const auto value = strtoull(field, &end, 10);
+    if (end == field || value > SIZE_MAX) return false;
+    *bytes = value;
+    return true;
+}
+
+bool ParseStatmSize(char* data, size_t* bytes) {
+    char* end = nullptr;
+    const auto pages = strtoull(data, &end, 10);
+    const size_t page = sysconf(_SC_PAGESIZE);
+    if (end == data || pages > SIZE_MAX / page) return false;
+    *bytes = pages * page;
+    return true;
 }
 
 bool VmSize(size_t* bytes, pid_t pid = 0) {
@@ -261,13 +307,191 @@ TEST(ProcVmSize, SnapshotStaysAtEofAndRewindRefreshes) {
     EXPECT_EQ(after, before + 3 * page);
 }
 
+TEST(ProcVmSize, PeakRetainsGrowthWithoutCountingSplitsOrReplacement) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (!child) {
+        const size_t page = sysconf(_SC_PAGESIZE);
+        VmSnapshot before, grown, changed, shrunk;
+        if (!Snapshot(&before) || before.peak < before.size) _exit(1);
+        const size_t span = before.peak - before.size + 16 * page;
+        Mapping mapping(span);
+        if (mapping.get() == MAP_FAILED || !Snapshot(&grown)) _exit(2);
+        if (grown.size != before.size + span || grown.peak != grown.size) _exit(3);
+        void* middle = static_cast<char*>(mapping.get()) + page;
+        if (mprotect(middle, page, PROT_READ) || !Snapshot(&changed)) _exit(4);
+        if (changed.size != grown.size || changed.peak != grown.peak) _exit(5);
+        if (mmap(middle, page, PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != middle) _exit(6);
+        if (!Snapshot(&changed) || changed.peak != grown.peak) _exit(7);
+        if (munmap(mapping.get(), span) || !Snapshot(&shrunk)) _exit(8);
+        if (shrunk.size != before.size || shrunk.peak != grown.peak) _exit(9);
+        _exit(0);
+    }
+    ExpectChildSuccess(child);
+}
+
+// Fork after preparing the destination hole: the child's initial high water
+// excludes the parent's temporary reservation, so a transient duplicate source
+// mapping cannot hide below a previous peak.
+TEST(ProcVmSize, MremapPeakCountsCommittedGrowthOnly) {
+    const size_t span = 8 * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    Mapping source(4 * span);
+    ASSERT_NE(source.get(), MAP_FAILED);
+    char* destination = static_cast<char*>(source.get()) + 2 * span;
+    ASSERT_EQ(source.UnmapTail(span), 0);
+    for (int mode = 0; mode < 4; ++mode) {
+        const pid_t child = fork();
+        ASSERT_GE(child, 0);
+        if (!child) {
+            VmSnapshot before, after;
+            if (!Snapshot(&before) || before.peak != before.size) _exit(1);
+            const size_t new_span = mode == 0 ? span : 2 * span;
+            int flags = MREMAP_MAYMOVE | MREMAP_FIXED;
+            if (mode == 3) flags |= MREMAP_DONTUNMAP;
+            if (mode == 2) {
+                rlimit limit{};
+                if (getrlimit(RLIMIT_AS, &limit)) _exit(2);
+                limit.rlim_cur = before.size;
+                if (setrlimit(RLIMIT_AS, &limit)) _exit(3);
+            }
+            // DONTUNMAP requires equal old/new lengths.
+            const size_t final_span = mode == 3 ? span : new_span;
+            errno = 0;
+            void* result = mremap(source.get(), span, final_span, flags, destination);
+            if (mode == 2) {
+                if (result != MAP_FAILED || errno != ENOMEM) _exit(4);
+            } else if (result != destination) _exit(5);
+            if (!Snapshot(&after)) _exit(6);
+            const size_t growth = mode == 1 || mode == 3 ? span : 0;
+            if (after.size != before.size + growth || after.peak != after.size) _exit(7);
+            _exit(0);
+        }
+        ExpectChildSuccess(child);
+    }
+}
+
+TEST(ProcVmSize, ForkPeakStartsAtCopiedMappingsExcludingDontFork) {
+    const size_t span = 8 * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    Mapping omitted(span), copied(span);
+    ASSERT_NE(omitted.get(), MAP_FAILED);
+    ASSERT_NE(copied.get(), MAP_FAILED);
+    ASSERT_EQ(madvise(omitted.get(), span, MADV_DONTFORK), 0);
+    VmSnapshot parent;
+    ASSERT_TRUE(Snapshot(&parent));
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (!child) {
+        VmSnapshot snapshot;
+        if (!Snapshot(&snapshot)) _exit(1);
+        if (snapshot.size != parent.size - span || snapshot.peak != snapshot.size) _exit(2);
+        _exit(0);
+    }
+    ExpectChildSuccess(child);
+}
+
+TEST(ProcVmSize, StatAndStatmSnapshotsRefreshAfterRewind) {
+    const size_t page = sysconf(_SC_PAGESIZE);
+    const char* paths[] = {"/proc/self/stat", "/proc/self/statm"};
+    for (size_t i = 0; i < 2; ++i) {
+        Fd fd(open(paths[i], O_RDONLY));
+        ASSERT_GE(fd.get(), 0);
+        char data[16384];
+        size_t before = 0, after = 0;
+        ASSERT_TRUE(ReadFd(fd.get(), data, sizeof(data)));
+        ASSERT_TRUE(i ? ParseStatmSize(data, &before) : ParseStatSize(data, &before));
+        Mapping mapping(3 * page);
+        ASSERT_NE(mapping.get(), MAP_FAILED);
+        EXPECT_EQ(read(fd.get(), data, 1), 0);
+        ASSERT_EQ(lseek(fd.get(), 0, SEEK_SET), 0);
+        ASSERT_TRUE(ReadFd(fd.get(), data, sizeof(data)));
+        ASSERT_TRUE(i ? ParseStatmSize(data, &after) : ParseStatSize(data, &after));
+        EXPECT_EQ(after, before + 3 * page);
+    }
+}
+
+struct LeaderExitWorkerArgs { int report, release; };
+void* LeaderExitWorker(void* data) {
+    auto* args = static_cast<LeaderExitWorkerArgs*>(data);
+    pid_t tid = syscall(SYS_gettid);
+    char go;
+    const bool ok = Transfer(args->report, &tid, sizeof(tid), true) &&
+                    Transfer(args->release, &go, 1, false);
+    _exit(ok ? 0 : 20);
+}
+
+TEST(ProcVmSize, LiveThreadStatmSurvivesLeaderExit) {
+    int report[2], release[2];
+    ASSERT_EQ(pipe(report), 0);
+    Fd report_read(report[0]), report_write(report[1]);
+    ASSERT_EQ(pipe(release), 0);
+    Fd release_read(release[0]), release_write(release[1]);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (!child) {
+        close(report[0]);
+        close(release[1]);
+        // Static storage survives raw exit of the leader and its stack.
+        static LeaderExitWorkerArgs args;
+        args = {report[1], release[0]};
+        pthread_t worker;
+        if (pthread_create(&worker, nullptr, LeaderExitWorker, &args)) _exit(21);
+        syscall(SYS_exit, 0);
+        __builtin_unreachable();
+    }
+    struct Reap {
+        pid_t pid;
+        ~Reap() {
+            if (pid > 0) {
+                kill(pid, SIGKILL);
+                while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+            }
+        }
+    } reap{child};
+    pid_t tid = 0;
+    ASSERT_TRUE(Transfer(report[0], &tid, sizeof(tid), false));
+    char path[100], data[16384];
+    bool exited = false;
+    snprintf(path, sizeof(path), "/proc/%d/status", child);
+    for (int i = 0; i < 500 && !exited; ++i) {
+        if (ReadFile(path, data, sizeof(data))) {
+            const char* state = strstr(data, "\nState:");
+            exited = state && (strstr(state, "Exited") || strstr(state, "Z (zombie)"));
+        }
+        if (!exited) usleep(10000);
+    }
+    ASSERT_TRUE(exited);
+    size_t size = 0;
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/statm", child, tid);
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatmSize(data, &size));
+    ASSERT_GT(size, 0u);
+    const size_t thread_size = size;
+    snprintf(path, sizeof(path), "/proc/%d/statm", tid);
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatmSize(data, &size));
+    EXPECT_EQ(size, thread_size);
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", child, tid);
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatSize(data, &size));
+    EXPECT_EQ(size, thread_size);
+    snprintf(path, sizeof(path), "/proc/%d/statm", child);
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatmSize(data, &size));
+    EXPECT_EQ(size, 0u);
+    char go = 1;
+    ASSERT_TRUE(Transfer(release[1], &go, 1, true));
+    ExpectChildSuccess(child);
+    reap.pid = -1;
+}
+
 // The exec helper reports its own stable mm, then waits for the parent. The
 // parent uses a status fd opened before exec: status follows the task's new mm.
 constexpr char kExecArg[] = "--proc-vm-size-exec";
 int ExecHelper(int report, int control) {
-    size_t size = 0;
+    VmSnapshot snapshot;
     char go;
-    return VmSize(&size) && Transfer(report, &size, sizeof(size), true) &&
+    return Snapshot(&snapshot) && Transfer(report, &snapshot, sizeof(snapshot), true) &&
            Transfer(control, &go, 1, false) ? 0 : 1;
 }
 
@@ -282,7 +506,7 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     if (!child) {
         close(report[0]);
         close(control[1]);
-        Mapping old_mapping(8u << 20);
+        Mapping old_mapping(64u << 20);
         if (old_mapping.get() == MAP_FAILED) _exit(1);
         char ready = 1, go;
         if (!Transfer(report[1], &ready, 1, true) ||
@@ -305,20 +529,49 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     snprintf(path, sizeof(path), "/proc/%d/status", child);
     Fd status(open(path, O_RDONLY));
     ASSERT_GE(status.get(), 0);
+    VmSnapshot old_snapshot;
+    ASSERT_TRUE(Snapshot(&old_snapshot, child));
+    snprintf(path, sizeof(path), "/proc/%d/stat", child);
+    Fd stat_fd(open(path, O_RDONLY));
+    snprintf(path, sizeof(path), "/proc/%d/statm", child);
+    Fd statm_fd(open(path, O_RDONLY));
+    ASSERT_GE(stat_fd.get(), 0);
+    ASSERT_GE(statm_fd.get(), 0);
     ASSERT_TRUE(Transfer(control[1], &go, 1, true));
-    size_t expected = 0, observed = 0;
+    VmSnapshot expected;
+    size_t observed = 0;
     ASSERT_TRUE(Transfer(report[0], &expected, sizeof(expected), false));
     char data[16384];
     ASSERT_TRUE(ReadFd(status.get(), data, sizeof(data)));
     ASSERT_TRUE(ParseVmSize(data, &observed));
-    EXPECT_EQ(observed, expected);
+    EXPECT_EQ(observed, expected.size);
+    size_t peak = 0;
+    ASSERT_TRUE(ParseVmField(data, "VmPeak:", &peak));
+    EXPECT_EQ(peak, expected.peak);
+    EXPECT_GE(peak, expected.size);
+    EXPECT_LT(peak, old_snapshot.peak);
+    ASSERT_TRUE(ReadFd(stat_fd.get(), data, sizeof(data)));
+    ASSERT_TRUE(ParseStatSize(data, &observed));
+    EXPECT_EQ(observed, expected.size);
+    ASSERT_TRUE(ReadFd(statm_fd.get(), data, sizeof(data)));
+    ASSERT_TRUE(ParseStatmSize(data, &observed));
+    EXPECT_EQ(observed, expected.size);
     ASSERT_TRUE(Transfer(control[1], &go, 1, true));
     siginfo_t info{};
     ASSERT_EQ(waitid(P_PID, child, &info, WEXITED | WNOWAIT), 0);
     EXPECT_EQ(info.si_code, CLD_EXITED);
     EXPECT_EQ(info.si_status, 0);
+    snprintf(path, sizeof(path), "/proc/%d/status", child);
     ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
     EXPECT_FALSE(ParseVmSize(data, &observed));
+    snprintf(path, sizeof(path), "/proc/%d/stat", child);
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatSize(data, &observed));
+    EXPECT_EQ(observed, 0u);
+    snprintf(path, sizeof(path), "/proc/%d/statm", child);
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatmSize(data, &observed));
+    EXPECT_EQ(observed, 0u);
 }
 
 } // namespace

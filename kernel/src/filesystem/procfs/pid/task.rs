@@ -4,7 +4,7 @@
 
 use super::{
     cgroup::CgroupFileOps, fd::FdDirOps, fdinfo::FdInfoDirOps, mem::MemFileOps,
-    oom_score_adj::OomScoreAdjFileOps, status::StatusFileOps,
+    oom_score_adj::OomScoreAdjFileOps, statm::StatmFileOps, status::StatusFileOps,
 };
 use crate::{
     filesystem::{
@@ -221,6 +221,9 @@ impl TidDirOps {
         }),
         ("status", |ops, parent| {
             StatusFileOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("statm", |ops, parent| {
+            StatmFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("mem", |ops, parent| {
             MemFileOps::new_inode(ops.target.clone(), parent)

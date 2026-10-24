@@ -454,12 +454,10 @@ impl<'a> PageFaultMessage<'a> {
         let index = table.index_of(address).unwrap();
         entry.set_flags(entry.flags().set_write(true).set_dirty(true));
         table.set_entry(index, entry);
-        mm.flush_tlb_range(
-            address,
-            VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
-            MMArch::PAGE_SHIFT as u8,
-            false,
-        );
+        // 与 do_wp_page 相同：shootdown 会等待远端 ACK，不能在页表编辑临界区
+        // （且持有 rmap/页表锁）内发起，守卫释放后统一执行。
+        drop(_pt_edit);
+        flush_tlb_after_unlock(&mm, address);
         VmFaultReason::VM_FAULT_COMPLETED
     }
 
@@ -1174,9 +1172,14 @@ impl PageFaultHandler {
         // 任何修改 PTE（RO -> RW 或替换物理页）的分支都必须让远端 CPU 同步失效旧 TLB。
         // 旧的本地 `invlpg` / 无 flush 写法会让其他 CPU 继续持有旧翻译，
         // 导致错误的重复写保护 fault 或访问到已被替换的旧物理页（风险 4 残留）。
-        let end = VirtAddr::new(address.data() + MMArch::PAGE_SIZE);
+        //
+        // 但 shootdown 不能在 `page_table_edit()` 的临界区里发起：它会同步等待
+        // 远端 CPU 的 ACK，而远端可能正卡在等待我们持有的页表/rmap 锁上，
+        // 于是双方互等（实测 java 启动即整机停摆）。因此各分支只记录"需要
+        // flush"，守卫 drop 之后再统一执行。
+        let mut tlb_flush_needed = false;
 
-        if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
+        let reason = if vma.lock().vm_flags().contains(VmFlags::VM_SHARED) {
             // 共享映射：原地升级 PTE 为可写，并标记脏。
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
@@ -1207,7 +1210,7 @@ impl PageFaultHandler {
 
             // PTE 从 RO 升级为 RW：其他 CPU 持有的 RO 缓存会导致它们访问时触发虚假写保护 fault，
             // 必须 mm-aware shootdown 让其它 CPU 重新 walk 最新 PTE。
-            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+            tlb_flush_needed = true;
             VmFaultReason::VM_FAULT_COMPLETED
         } else if vma.is_anonymous() {
             // 私有匿名映射，根据引用计数判断是否拷贝页面
@@ -1220,7 +1223,7 @@ impl PageFaultHandler {
                 entry.set_flags(new_flags);
                 table.set_entry(i, entry);
 
-                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+                tlb_flush_needed = true;
                 VmFaultReason::VM_FAULT_COMPLETED
             } else {
                 let new_page = match PageFaultMessage::copy_anonymous_page(&old_page, &data_account)
@@ -1237,7 +1240,7 @@ impl PageFaultHandler {
                 // hold a Linux-style per-PTE lock while every fault reader checks
                 // the PTE, so do not create a transient empty PTE here.
                 table.set_entry(i, super::page::PageEntry::new(new_paddr, new_flags));
-                mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+                tlb_flush_needed = true;
 
                 Self::attach_fault_mapped_page(
                     &new_page,
@@ -1259,7 +1262,7 @@ impl PageFaultHandler {
             let table = mapper.get_table(address, 0).unwrap();
             let i = table.index_of(address).unwrap();
             table.set_entry(i, super::page::PageEntry::new(new_paddr, new_flags));
-            mm.flush_tlb_range(address, end, MMArch::PAGE_SHIFT as u8, false);
+            tlb_flush_needed = true;
 
             Self::attach_fault_mapped_page(
                 &new_page,
@@ -1269,7 +1272,15 @@ impl PageFaultHandler {
             );
             Self::detach_fault_mapped_page(&old_page, &vma);
             VmFaultReason::VM_FAULT_COMPLETED
+        };
+
+        // 页表编辑临界区已退出；此时再发起 mm-aware shootdown，不会与远端
+        // CPU 竞争我们刚刚持有的页表/rmap 锁。
+        drop(_pt_edit);
+        if tlb_flush_needed {
+            flush_tlb_after_unlock(&mm, address);
         }
+        reason
     }
 
     /// 缺页附近页预读
@@ -1891,4 +1902,22 @@ impl PageFaultHandler {
 
         VmFaultReason::VM_FAULT_COMPLETED
     }
+}
+
+/// 在释放 `page_table_edit()` 守卫之后再发起 mm-aware shootdown。
+///
+/// `flush_tlb_range` 会同步等待远端 CPU 的 ACK；如果在页表编辑临界区内发起，
+/// 远端 CPU 可能正阻塞在我们持有的页表/rmap 锁上，双方互等就是整机停摆
+/// （实测 java 启动即停在该路径）。守卫释放后本 CPU 不再持有这些锁，
+/// 等待 ACK 才是安全的。
+///
+/// 中断状态由 `flush_tlb_mm_range` 自己处理：进入时若 IF=0，它会先临时开中断
+/// 再取 shootdown 串行锁，返回前恢复原状，因此这里不再额外开关中断。
+fn flush_tlb_after_unlock(mm: &Arc<AddressSpace>, address: VirtAddr) {
+    mm.flush_tlb_range(
+        address,
+        VirtAddr::new(address.data() + MMArch::PAGE_SIZE),
+        MMArch::PAGE_SHIFT as u8,
+        false,
+    );
 }

@@ -306,9 +306,8 @@ fn kernel_restart_prepare(cmd: Option<&str>) {
 
     set_system_state(SystemState::Restart);
 
-    // 重启同样要收尾可写文件系统：否则 ext4 带着未提交事务断电，
-    // 下次启动需要 replay（见 kernel_shutdown_prepare 同名调用）。
-    crate::filesystem::vfs::mount::shutdown_mounted_filesystems();
+    // Complete best-effort filesystem writeback while devices are available.
+    crate::filesystem::vfs::mount::sync_mounted_filesystems_for_shutdown();
 
     device_shutdown();
 }
@@ -346,9 +345,8 @@ pub fn kernel_shutdown_prepare(state: SystemState) {
 
     set_system_state(state);
 
-    // 关机/重启前收尾可写文件系统（sync + ext4 journal 清理 RECOVER），
-    // 避免下次启动对未提交事务做 replay。
-    crate::filesystem::vfs::mount::shutdown_mounted_filesystems();
+    // Complete best-effort filesystem writeback while devices are available.
+    crate::filesystem::vfs::mount::sync_mounted_filesystems_for_shutdown();
 
     device_shutdown();
 }

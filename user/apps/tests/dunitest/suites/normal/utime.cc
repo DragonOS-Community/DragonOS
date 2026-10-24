@@ -198,3 +198,8 @@ TEST(UtimeTest, UnavailableOnThisArchitecture) {
     GTEST_SKIP() << "This architecture has no SYS_utime";
 }
 #endif
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

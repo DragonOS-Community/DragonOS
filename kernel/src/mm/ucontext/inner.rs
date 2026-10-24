@@ -113,8 +113,9 @@ impl InnerAddressSpace {
             new_guard.user_stack = Some(self.user_stack.as_ref().unwrap().clone_info_only());
         }
 
-        // Copy holes
-        new_guard.mappings.vm_holes = self.mappings.vm_holes.clone();
+        // Keep the fresh child's full free range. insert_vma below derives
+        // holes from the VMAs actually inherited; copying the parent's holes
+        // would leave VM_DONTCOPY ranges falsely occupied in the child.
 
         // Copy other address space attributes
         new_guard.brk = self.brk;
@@ -277,6 +278,15 @@ impl InnerAddressSpace {
                 &mut new_guard,
                 data_account,
             )?;
+            #[cfg(target_arch = "x86_64")]
+            if let Some(vaddr) = parent_mm.uret_trampoline_vaddr() {
+                new_addr_space.inherit_uret_trampoline_locked(
+                    &mut new_guard,
+                    vaddr,
+                    creator,
+                    data_account,
+                )?;
+            }
             Ok(())
         })();
 

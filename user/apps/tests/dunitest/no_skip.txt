@@ -72,3 +72,4 @@ normal/proc_vm_size
 normal/brk_semantics
 normal/mmap_fixed_address
 normal/rlimit_data
+normal/fork_mapping_holes

@@ -14,8 +14,8 @@ pub struct UserMappings {
     pub(super) vmas: HashSet<Arc<LockedVMA>>,
     /// VMAs indexed by start address, used for address lookup, range scanning, and deletion.
     pub(super) vmas_by_start: BTreeMap<VirtAddr, Arc<LockedVMA>>,
-    /// VMA holes in the current user space
-    pub(super) vm_holes: BTreeMap<VirtAddr, usize>,
+    /// Free user ranges derived from this collection's VMAs and reservations.
+    vm_holes: BTreeMap<VirtAddr, usize>,
     /// mmap address reservations that are being set up but not yet published as VMAs.
     pub(super) reservations: BTreeMap<VirtAddr, MmapReservation>,
     /// Committed and in-flight virtual bytes, owned by the indexed mappings.

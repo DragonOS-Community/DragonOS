@@ -2005,6 +2005,15 @@ impl ProcessControlBlock {
         self.rseq_state.write_irqsave()
     }
 
+    /// Take the pending CLONE_CHILD_SETTID address, if any.
+    ///
+    /// The write itself is performed at the return-to-user boundary, where
+    /// interrupts are enabled and a user-memory fault can run safely.
+    #[inline]
+    pub fn take_set_child_tid(&self) -> Option<crate::mm::VirtAddr> {
+        self.thread.write_irqsave().set_child_tid.take()
+    }
+
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {
         for _ in 0..times {
             if let Some(r) = self.sig_info.try_write_irqsave() {

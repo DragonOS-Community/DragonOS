@@ -265,6 +265,13 @@ impl SmpCpuManager {
         self.cpuhp_state(cpu_id).state.load(Ordering::Acquire) == CpuHpState::Dead as u32
     }
 
+    /// A `Dying` CPU still executes and may access the page tables until it is
+    /// `Dead`, so it remains a valid target for a synchronous shootdown.
+    #[inline]
+    pub fn is_dying_cpu(&self, cpu_id: ProcessorId) -> bool {
+        self.cpuhp_state(cpu_id).state.load(Ordering::Acquire) == CpuHpState::Dying as u32
+    }
+
     /// 获取出现在系统中的CPU
     #[allow(dead_code)]
     pub fn present_cpus(&self) -> &CpuMask {

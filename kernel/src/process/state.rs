@@ -201,6 +201,9 @@ bitflags! {
         /// Process is waiting for an I/O operation to complete (used for iowait
         /// accounting).
         const IN_IOWAIT = 1 << 13;
+        /// CLONE_CHILD_SETTID is pending and must be written at the
+        /// return-to-user boundary, where faults and TLB shootdowns are safe.
+        const NEED_CHILD_TID = 1 << 14;
         /// PID links and visible-thread accounting have already been released.
         const PID_UNHASHED = 1 << 15;
         /// Task is currently traced by another task.
@@ -261,6 +264,7 @@ impl ProcessFlags {
             | Self::NEED_MEMORY_HIGH.bits
             | Self::NEED_CGROUP_FREEZE.bits
             | Self::PENDING_GROUP_STOP.bits
+            | Self::NEED_CHILD_TID.bits
     }
 
     /// Test and clear flags.

@@ -46,7 +46,7 @@ use crate::{
 };
 
 #[cfg(target_arch = "x86_64")]
-use crate::libs::spinlock::SpinLock;
+use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 
 /// Sentinel end value meaning "flush the entire mm"; combined with start=0 it means "do not use range-based flush".
 pub const TLB_FLUSH_ALL: VirtAddr = VirtAddr::new(usize::MAX);
@@ -190,6 +190,48 @@ static mut CSD_FLUSH_TLB: Option<PerCpuVar<CsdFlushTlb>> = None;
 /// can be upgraded to per-initiator CSD pools in the future.
 #[cfg(target_arch = "x86_64")]
 static FLUSH_TLB_GLOBAL_LOCK: SpinLock<()> = SpinLock::new(());
+
+/// 关中断的等待循环中，主动完成发往本 CPU 的 shootdown。
+///
+/// 死锁场景：CPU A 持 `FLUSH_TLB_GLOBAL_LOCK` 并等待本 CPU 的 ack，而本 CPU 正
+/// 在关中断上下文里自旋争用同一把锁——IPI 无法送达，双方互等。
+/// 这里按 IPI handler 的同一流程就地执行 `local_flush_tlb_func` 并置 `done`，
+/// 使持锁方可以继续，从而打破互等。与 IPI handler 并发执行是幂等的。
+#[cfg(target_arch = "x86_64")]
+fn service_pending_inbound_flush() {
+    if !crate::smp::cpu::smp_cpu_manager_initialized() {
+        return;
+    }
+    let cpu = smp_get_processor_id();
+    let csd = unsafe { csd_flush_tlb().force_get(cpu) };
+    if csd.done.load(Ordering::Acquire) {
+        return;
+    }
+    // 取走指针并立刻置空：服务完成后发起者会返回、栈帧失效；若 IPI 迟到，
+    // handler 看到 None 会直接返回，不会解引用悬垂指针。
+    let info_ptr = {
+        let mut guard = csd.info.lock();
+        guard.take()
+    };
+    let Some(info_ptr) = info_ptr else {
+        return;
+    };
+    // SAFETY: 发起者栈帧在 done=true 之前一直有效（见 CsdFlushTlb 注释）。
+    local_flush_tlb_func(unsafe { &*info_ptr });
+    csd.done.store(true, Ordering::Release);
+}
+
+/// 获取全局 shootdown 锁；等待期间服务发往本 CPU 的请求，避免 IRQ-off 互等。
+#[cfg(target_arch = "x86_64")]
+fn acquire_flush_tlb_lock() -> SpinLockGuard<'static, ()> {
+    loop {
+        if let Ok(guard) = FLUSH_TLB_GLOBAL_LOCK.try_lock() {
+            return guard;
+        }
+        service_pending_inbound_flush();
+        core::hint::spin_loop();
+    }
+}
 
 /// Initialize this module. Must be called after `PerCpu::init()`.
 pub fn tlb_init() {
@@ -431,7 +473,15 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
             let csd = unsafe { csd_flush_tlb().force_get(cpu) };
             #[cfg(feature = "mm_selftest")]
             let mut test_spins = 0usize;
+            let mut spins = 0u64;
             while !csd.done.load(Ordering::Acquire) {
+                // 本 CPU 可能在等锁的其它 CPU 眼里也是目标；周期性服务发往
+                // 本 CPU 的请求，避免双方都在关中断等待时互等（见
+                // service_pending_inbound_flush 的说明）。
+                spins += 1;
+                if spins & 1023 == 0 {
+                    service_pending_inbound_flush();
+                }
                 #[cfg(feature = "mm_selftest")]
                 if let Some(observer) = &info.observer {
                     if !observer.skip_ack() {
@@ -493,7 +543,7 @@ pub fn flush_tlb_mm_range(
         unsafe { CurrentIrqArch::interrupt_enable() };
     }
     #[cfg(target_arch = "x86_64")]
-    let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
+    let _flush_guard = acquire_flush_tlb_lock();
 
     // Disable interrupts to protect the entire initiation process:
     // - Prevent migration during inc_tlb_gen and snapshot of active_cpus;
@@ -599,7 +649,7 @@ fn flush_tlb_kernel_range_inner(
         unsafe { CurrentIrqArch::interrupt_enable() };
     }
     #[cfg(target_arch = "x86_64")]
-    let _flush_guard = FLUSH_TLB_GLOBAL_LOCK.lock();
+    let _flush_guard = acquire_flush_tlb_lock();
 
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     compiler_fence(Ordering::SeqCst);

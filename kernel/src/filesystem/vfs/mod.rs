@@ -2979,14 +2979,16 @@ impl dyn IndexNode {
 
         // 逐级查找文件
         while !rest_path.is_empty() {
-            // 当前这一级不是文件夹
-            if lookup_metadata(&result)?.file_type != FileType::Dir {
+            // Reuse one metadata snapshot for the directory and permission
+            // checks. Uncached FUSE/virtiofs attributes otherwise require
+            // two GETATTR round trips for this path component.
+            let metadata = lookup_metadata(&result)?;
+            if metadata.file_type != FileType::Dir {
                 return Err(SystemError::ENOTDIR.into());
             }
 
             // 检查当前目录的执行权限（搜索权限）
             // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
-            let metadata = lookup_metadata(&result)?;
             permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;

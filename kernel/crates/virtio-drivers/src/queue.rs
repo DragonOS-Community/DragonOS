@@ -9,14 +9,19 @@ use bitflags::bitflags;
 #[cfg(test)]
 use core::cmp::min;
 use core::hint::spin_loop;
+#[cfg(feature = "alloc")]
+use core::mem::MaybeUninit;
 use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
-#[cfg(feature = "alloc")]
-use core::ptr::addr_of_mut;
 use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicU16, Ordering};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+#[cfg(feature = "alloc")]
+mod cpu_storage;
+#[cfg(feature = "alloc")]
+use cpu_storage::PagedArray;
 
 /// The mechanism for bulk data transport on virtio devices.
 ///
@@ -50,6 +55,9 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     /// The head desc index of the free list.
     free_head: u16,
     /// Our trusted copy of `desc` that the device can't access.
+    #[cfg(feature = "alloc")]
+    desc_shadow: PagedArray<Descriptor>,
+    #[cfg(not(feature = "alloc"))]
     desc_shadow: [Descriptor; SIZE],
     /// Our trusted copy of `avail.idx`.
     avail_idx: u16,
@@ -65,7 +73,7 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     #[cfg(feature = "alloc")]
     indirect: bool,
     #[cfg(feature = "alloc")]
-    indirect_lists: [Option<NonNull<[Descriptor]>>; SIZE],
+    indirect_lists: PagedArray<Option<NonNull<[Descriptor]>>>,
 }
 
 impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
@@ -101,20 +109,17 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             VirtQueueLayout::allocate_flexible(size)?
         };
 
-        transport.queue_set(
-            idx,
-            size.into(),
-            layout.descriptors_paddr(),
-            layout.driver_area_paddr(),
-            layout.device_area_paddr(),
-        );
-
         let desc =
             nonnull_slice_from_raw_parts(layout.descriptors_vaddr().cast::<Descriptor>(), SIZE);
         let avail = layout.avail_vaddr().cast();
         let used = layout.used_vaddr().cast();
 
+        #[cfg(feature = "alloc")]
+        let mut desc_shadow = PagedArray::try_filled(SIZE, Descriptor::new_zeroed())?;
+        #[cfg(not(feature = "alloc"))]
         let mut desc_shadow: [Descriptor; SIZE] = FromZeroes::new_zeroed();
+        #[cfg(feature = "alloc")]
+        let indirect_lists = PagedArray::try_filled(if indirect { SIZE } else { 0 }, None)?;
         // Link descriptors together.
         for i in 0..(size - 1) {
             desc_shadow[i as usize].next = i + 1;
@@ -125,9 +130,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             }
         }
 
-        #[cfg(feature = "alloc")]
-        const NONE: Option<NonNull<[Descriptor]>> = None;
-        Ok(VirtQueue {
+        let queue = VirtQueue {
             layout,
             desc,
             avail,
@@ -143,14 +146,25 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             #[cfg(feature = "alloc")]
             indirect,
             #[cfg(feature = "alloc")]
-            indirect_lists: [NONE; SIZE],
-        })
+            indirect_lists,
+        };
+        // Publish only after every fallible allocation and all trusted state
+        // initialization succeeded. No allocation can fail after this point.
+        transport.queue_set(
+            idx,
+            size.into(),
+            queue.layout.descriptors_paddr(),
+            queue.layout.driver_area_paddr(),
+            queue.layout.device_area_paddr(),
+        );
+        Ok(queue)
     }
 
     /// Creates a new VirtQueue directly on the heap.
     ///
-    /// This avoids placing the full `VirtQueue` value on the caller's stack, which matters for
-    /// large queue sizes because the queue contains descriptor shadow arrays sized by `SIZE`.
+    /// CPU metadata is stored in separate page-sized blocks. Allocate the small
+    /// owner before creating/publishing the queue, so allocation failure never
+    /// frees a ring which has already been made visible to the device.
     #[cfg(feature = "alloc")]
     pub fn new_boxed<T: Transport>(
         transport: &mut T,
@@ -158,73 +172,15 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         indirect: bool,
         event_idx: bool,
     ) -> Result<Box<Self>> {
-        if transport.queue_used(idx) {
-            return Err(Error::AlreadyUsed);
-        }
-        if !SIZE.is_power_of_two()
-            || SIZE > u16::MAX.into()
-            || transport.max_queue_size(idx) < SIZE as u32
-        {
-            return Err(Error::InvalidParam);
-        }
-        let size = SIZE as u16;
-
-        let layout = if transport.requires_legacy_layout() {
-            VirtQueueLayout::allocate_legacy(size)?
-        } else {
-            VirtQueueLayout::allocate_flexible(size)?
-        };
-
-        transport.queue_set(
-            idx,
-            size.into(),
-            layout.descriptors_paddr(),
-            layout.driver_area_paddr(),
-            layout.device_area_paddr(),
-        );
-
-        let desc =
-            nonnull_slice_from_raw_parts(layout.descriptors_vaddr().cast::<Descriptor>(), SIZE);
-        let avail = layout.avail_vaddr().cast();
-        let used = layout.used_vaddr().cast();
-
-        let mut boxed = Box::<Self>::new_uninit();
-        let queue = boxed.as_mut_ptr();
-
-        // SAFETY: `queue` points to a heap allocation for `Self`. Each field is initialized
-        // exactly once below before `assume_init`, and no initialized field is read before then.
-        unsafe {
-            addr_of_mut!((*queue).layout).write(layout);
-            addr_of_mut!((*queue).desc).write(desc);
-            addr_of_mut!((*queue).avail).write(avail);
-            addr_of_mut!((*queue).used).write(used);
-            addr_of_mut!((*queue).queue_idx).write(idx);
-            addr_of_mut!((*queue).num_used).write(0);
-            addr_of_mut!((*queue).free_head).write(0);
-
-            let desc_shadow = addr_of_mut!((*queue).desc_shadow) as *mut Descriptor;
-            for i in 0..SIZE {
-                let mut shadow: Descriptor = FromZeroes::new_zeroed();
-                if i + 1 < SIZE {
-                    shadow.next = (i + 1) as u16;
-                    (*desc.as_ptr())[i].next = (i + 1) as u16;
-                }
-                desc_shadow.add(i).write(shadow);
-            }
-
-            addr_of_mut!((*queue).avail_idx).write(0);
-            addr_of_mut!((*queue).last_used_idx).write(0);
-            addr_of_mut!((*queue).event_idx).write(event_idx);
-            addr_of_mut!((*queue).indirect).write(indirect);
-
-            let indirect_lists =
-                addr_of_mut!((*queue).indirect_lists) as *mut Option<NonNull<[Descriptor]>>;
-            for i in 0..SIZE {
-                indirect_lists.add(i).write(None);
-            }
-
-            Ok(boxed.assume_init())
-        }
+        let layout = core::alloc::Layout::new::<MaybeUninit<Self>>();
+        let raw = cpu_storage::try_allocate(layout)?.cast::<MaybeUninit<Self>>();
+        // SAFETY: allocation has the exact Box layout and MaybeUninit requires
+        // no initialization. On an error from new(), Box releases the shell.
+        let mut boxed = unsafe { Box::from_raw(raw.as_ptr()) };
+        boxed.write(Self::new(transport, idx, indirect, event_idx)?);
+        // SAFETY: write initialized the whole value, including notification
+        // state, using the same constructor as non-boxed queues.
+        Ok(unsafe { boxed.assume_init() })
     }
 
     /// Add buffers to the virtqueue, return a token.
@@ -904,7 +860,7 @@ fn queue_part_sizes(queue_size: u16) -> (usize, usize, usize) {
 }
 
 #[repr(C, align(16))]
-#[derive(AsBytes, Clone, Debug, FromBytes, FromZeroes)]
+#[derive(AsBytes, Copy, Clone, Debug, FromBytes, FromZeroes)]
 pub(crate) struct Descriptor {
     addr: u64,
     len: u32,
@@ -1713,3 +1669,6 @@ mod tests {
 #[cfg(test)]
 #[path = "queue_balloon_tests.rs"]
 mod balloon_tests;
+
+#[cfg(all(test, feature = "alloc"))]
+mod cpu_storage_tests;

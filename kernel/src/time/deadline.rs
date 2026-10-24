@@ -138,6 +138,12 @@ impl DeadlineEvent {
         Ok(())
     }
 
+    /// Deadline currently queued for this event, if any (selftest only).
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn queued_deadline(&self) -> Option<u64> {
+        self.state.lock_irqsave().queued.map(|key| key.0)
+    }
+
     /// Cancels queued/rearm work; a callback already entered may finish.
     pub fn cancel(&self) {
         let Some(owner_queue) = QUEUES.get(self.owner.data() as usize) else {

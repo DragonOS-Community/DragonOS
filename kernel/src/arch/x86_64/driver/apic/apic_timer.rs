@@ -1,6 +1,6 @@
 use core::cell::RefCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{fence, AtomicU64, Ordering};
+use core::sync::atomic::{fence, Ordering};
 
 use crate::arch::driver::{
     hpet::{hpet_instance, is_hpet_enabled},
@@ -373,10 +373,8 @@ pub(crate) fn program_deadline_delta(delta_ns: u64) {
         .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
     .clamp(1, u32::MAX as u128) as u64;
     let divisor = timer.divisor;
-    let pcount = timer.periodic_count;
     timer.init(LocalApicTimerMode::Oneshot, count, divisor);
     timer.start_current();
-    tmict_probe(0, delta_ns, count, pcount);
 }
 
 pub(crate) fn restore_periodic() {
@@ -386,123 +384,7 @@ pub(crate) fn restore_periodic() {
         let divisor = timer.divisor;
         timer.init(LocalApicTimerMode::Periodic, count, divisor);
         timer.start_current();
-        tmict_probe(1, 0, count, count);
     }
-}
-
-// ===========================================================================
-// TMICT 探针：APIC 单次/周期武装计数采样（默认静默）
-//
-// 设计要点（R16 教训）：
-// 1) **所有采样基线必须 per-CPU**。早期版本用单个 static，被两个 CPU 交替
-//    swap，相邻两次采样跨 CPU 混合，差分彻底失真（曾据此误判 tsc_hz=9.1GHz）。
-// 2) **PMTMR 是 24bit 计数器**（~4.7ms 回绕），直接跨窗口差分得到的是无意义
-//    值；这里用 per-CPU 扩展计数器把回绕累加进 64bit，据此交叉定频 TSC。
-// 3) **打印用编译期开关关闭**：本函数由 program_deadline_delta 在 rq/deadline
-//    临界区内（IF=0）调用，直写串口会占用数 ms，正是"console in irq-off"
-//    类缺陷。需要时钟取证时把 TMICT_PRINT 改为 true。
-// ===========================================================================
-
-/// 打印开关：默认关闭（见文件头注释 3）。
-const TMICT_PRINT: bool = false;
-
-static TP_TOTAL: AtomicU64 = AtomicU64::new(0);
-static TP_ONESHOT: AtomicU64 = AtomicU64::new(0);
-static TP_PERIODIC: AtomicU64 = AtomicU64::new(0);
-static TP_LAST_DELTA: AtomicU64 = AtomicU64::new(0);
-static TP_LAST_CNT: AtomicU64 = AtomicU64::new(0);
-static TP_LAST_PCOUNT: AtomicU64 = AtomicU64::new(0);
-static TP_LINES: AtomicU64 = AtomicU64::new(0);
-
-const PROBE_CPUS: usize = PerCpu::MAX_CPU_NUM as usize;
-/// 上次打印的 TSC 窗口起点（per-CPU）。
-static TP_WINDOW_TSC: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
-/// PMTMR 扩展计数与 TSC 的配对基线（per-CPU，用于交叉定频）。
-static TP_PM_EXT_REF: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
-static TP_PM_TSC_REF: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
-
-/// PMTMR 原始读数上一次采样值（per-CPU，回绕累加用）。
-static PM_LAST_RAW: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(u64::MAX) }; PROBE_CPUS];
-/// PMTMR 扩展后的 64bit 计数（per-CPU）。
-static PM_EXT: [AtomicU64; PROBE_CPUS] = [const { AtomicU64::new(0) }; PROBE_CPUS];
-
-/// 读 PMTMR 并扩展到 64bit（本 CPU 独占槽位，仅探针使用）。
-fn pm_extended(cpu: usize) -> u64 {
-    let raw = (acpi_pm_read_early() as u64) & ACPI_PM_MASK;
-    let last = PM_LAST_RAW[cpu].load(Ordering::Relaxed);
-    if last == u64::MAX {
-        PM_LAST_RAW[cpu].store(raw, Ordering::Relaxed);
-        PM_EXT[cpu].store(raw, Ordering::Relaxed);
-        return raw;
-    }
-    let delta = raw.wrapping_sub(last) & ACPI_PM_MASK;
-    PM_LAST_RAW[cpu].store(raw, Ordering::Relaxed);
-    PM_EXT[cpu].fetch_add(delta, Ordering::Relaxed) + delta
-}
-
-/// 记录一次武装事件；`kind`: 0 = 单次（deadline），1 = 周期（tick 恢复）。
-///
-/// 计数始终更新；打印仅在 `TMICT_PRINT` 且处于 1s 窗口或每 2048 次事件时发生，
-/// 并限制总行数，避免探针自身成为噪声源。
-fn tmict_probe(kind: usize, delta_ns: u64, cnt: u64, pcount: u64) {
-    if kind == 0 {
-        TP_ONESHOT.fetch_add(1, Ordering::Relaxed);
-    } else {
-        TP_PERIODIC.fetch_add(1, Ordering::Relaxed);
-    }
-    TP_LAST_DELTA.store(delta_ns, Ordering::Relaxed);
-    TP_LAST_CNT.store(cnt, Ordering::Relaxed);
-    TP_LAST_PCOUNT.store(pcount, Ordering::Relaxed);
-    let total = TP_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-    if !TMICT_PRINT {
-        return;
-    }
-
-    let cpu = smp_get_processor_id().data() as usize;
-    if cpu >= PROBE_CPUS {
-        return;
-    }
-    let khz = TSCManager::cpu_khz();
-    let tsc = unsafe { x86::time::rdtsc() };
-    let window_elapsed =
-        khz > 0 && tsc.wrapping_sub(TP_WINDOW_TSC[cpu].load(Ordering::Relaxed)) > khz * 1_000_000;
-    if !window_elapsed && !total.is_multiple_of(2048) {
-        return;
-    }
-    // 总行数上限：探针只在取证时短暂开启，无需无限输出。
-    if TP_LINES.fetch_add(1, Ordering::Relaxed) >= 64 {
-        return;
-    }
-    TP_WINDOW_TSC[cpu].store(tsc, Ordering::Relaxed);
-
-    // PMTMR(3.579545MHz，宿主保证真实速率) × TSC 交叉定频：
-    // 真实 TSC 频率 = Δtsc / Δpmtmr × 3.579545e6。
-    let tsc_hz = if PMTMR_IO_PORT.load(Ordering::SeqCst) != 0 {
-        let pm = pm_extended(cpu);
-        let p0 = TP_PM_EXT_REF[cpu].swap(pm, Ordering::Relaxed);
-        let t0 = TP_PM_TSC_REF[cpu].swap(tsc, Ordering::Relaxed);
-        let d_tsc = tsc.wrapping_sub(t0);
-        let d_pm = pm.wrapping_sub(p0);
-        if p0 != 0 && d_pm > 100_000 {
-            Some((d_tsc as u128 * 3_579_545u128 / d_pm as u128) as u64)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    log::warn!(
-        "tmict cpu={} tot={} 1shot={} per={} delta={}ns cnt={:#x} pcount={:#x} tsc_hz={}",
-        cpu,
-        total,
-        TP_ONESHOT.load(Ordering::Relaxed),
-        TP_PERIODIC.load(Ordering::Relaxed),
-        TP_LAST_DELTA.load(Ordering::Relaxed),
-        TP_LAST_CNT.load(Ordering::Relaxed),
-        TP_LAST_PCOUNT.load(Ordering::Relaxed),
-        tsc_hz.map_or_else(|| "init".to_string(), |v| v.to_string())
-    );
 }
 
 pub(crate) fn deadline_capable() -> bool {

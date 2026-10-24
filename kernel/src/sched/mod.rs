@@ -1513,58 +1513,6 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
     fair_group::bind_task_group_cpu(pcb, cpu);
 }
 
-/// 粗粒度周期计数器，仅用于 rq 锁临界区时长哨兵。
-///
-/// x86_64 上直接读 TSC（无锁、无内存访问，可安全地在调度路径调用）；
-/// 其他架构返回 0，哨兵自动失效（不影响语义）。
-#[inline(always)]
-fn rq_lock_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe { x86::time::rdtsc() }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        0
-    }
-}
-
-/// rq 锁临界区超时哨兵。**必须在放锁之后调用**。
-///
-/// 目标核的 tick/IPI 路径会在 `__schedule_inner()` 里获取同一把 rq 锁，且
-/// `self_lock()` 只有 1e6 次自旋的忍耐度。若临界区里混进 console 输出、
-/// 块 IO 或嵌套等待，目标核就会 spinout panic。
-/// 这里只做统计+告警：不改变临界区语义，也绝不把任何输出放回锁内。
-fn report_long_rq_section(cpu: ProcessorId, held_cycles: u64) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // 阈值 1ms：正常入队路径是几微秒量级。
-        const THRESHOLD_MS: u64 = 1;
-        let cycles_per_ms = crate::arch::driver::tsc::TSCManager::tsc_khz();
-        let budget = cycles_per_ms.saturating_mul(THRESHOLD_MS).max(1);
-        if held_cycles > budget {
-            // 只报前若干次，避免哨兵本身变成抖动源。
-            static REPORTED: AtomicUsize = AtomicUsize::new(0);
-            let n = REPORTED.fetch_add(1, Ordering::Relaxed);
-            // 调用者若仍处于关中断上下文（例如从 IRQ 里唤醒任务），绝不在这里
-            // 打印——那正是本哨兵要防的缺陷。只计数。
-            if n < 16 && CurrentIrqArch::is_irq_enabled() {
-                let held_us = held_cycles / (cycles_per_ms / 1000).max(1);
-                log::warn!(
-                    "sched: long rq section cpu={} held={}us (reported={})",
-                    cpu.data(),
-                    held_us,
-                    n
-                );
-            }
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (cpu, held_cycles);
-    }
-}
-
 /// 对标 Linux ttwu_queue + ttwu_do_activate
 pub fn enqueue_task_on_cpu(
     pcb: &Arc<ProcessControlBlock>,
@@ -1580,8 +1528,7 @@ pub fn enqueue_task_on_cpu(
     pcb.sched_info().set_on_cpu(Some(target_cpu));
 
     let rq = cpu_rq(target_cpu.data() as usize);
-    let lock_start = rq_lock_cycles();
-    let (rq, guard) = rq.self_lock();
+    let (rq, _guard) = rq.self_lock();
 
     rq.update_rq_clock();
 
@@ -1601,13 +1548,6 @@ pub fn enqueue_task_on_cpu(
     }
 
     rq.check_preempt_current(pcb, wake_flags);
-    drop(guard);
-
-    // 回归哨兵：rq 锁临界区必须短。目标核的 tick/IPI 路径要在
-    // `__schedule_inner()` 里拿同一把锁，1e6 次自旋拿不到就会 panic。
-    // 任何把 console/IO/嵌套等待放进锁内的改动都会让这里超时。
-    // 注意：**放锁之后**才统计与输出，绝不能在锁内打印。
-    report_long_rq_section(target_cpu, rq_lock_cycles().wrapping_sub(lock_start));
 }
 
 pub fn request_task_migration(

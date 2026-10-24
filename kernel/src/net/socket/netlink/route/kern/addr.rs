@@ -380,13 +380,12 @@ pub(super) fn addr_to_segment(
         index: NonZeroU32::new(iface.nic_id() as u32),
     };
 
-    // 属性顺序必须与 Linux inet_fill_ifaddr()/inet6_fill_ifaddr() 一致：
-    // IFA_ADDRESS、IFA_LOCAL，随后才是 IFA_LABEL/IFA_BROADCAST。
-    // Go 标准库 net.newAddr() 依赖该顺序（存在 IFA_LOCAL 时跳过 IFA_ADDRESS
-    // 并取紧随其后的属性作为本地地址），顺序错误会让它把 IFA_LABEL("lo") 的
-    // 3 字节负载当成 IPv4 地址，直接 index out of range。
+    // Match Linux inet_fill_ifaddr(): IPv4 ADDRESS, LOCAL, BROADCAST, LABEL.
     let mut attrs = vec![AddrAttr::Address(octets.clone()), AddrAttr::Local(octets)];
     if matches!(cidr.address(), IpAddress::Ipv4(_)) {
+        if let Some(broadcast) = broadcast.filter(|address| !address.is_unspecified()) {
+            attrs.push(AddrAttr::Broadcast(broadcast.octets().to_vec()));
+        }
         let label = match label_override {
             Some(label) => label.clone(),
             None => crate::net::address::address_label(iface, cidr)?,
@@ -395,9 +394,6 @@ pub(super) fn addr_to_segment(
         // inet_fill_ifaddr() omits IFA_LABEL when ifa_label[0] is NUL.
         if !label.as_bytes().is_empty() {
             attrs.push(AddrAttr::Label(label.to_bytes_with_nul().to_vec()));
-        }
-        if let Some(broadcast) = broadcast.filter(|address| !address.is_unspecified()) {
-            attrs.push(AddrAttr::Broadcast(broadcast.octets().to_vec()));
         }
     }
 

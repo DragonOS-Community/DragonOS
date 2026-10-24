@@ -1040,6 +1040,13 @@ impl ProcessControlBlock {
         };
         arr[RLimitID::Rss as usize] = arr[RLimitID::As as usize];
 
+        // Linux INIT_RLIMITS allows heap growth unless userspace explicitly
+        // lowers RLIMIT_DATA. Leaving this at zero rejects every brk growth.
+        arr[RLimitID::Data as usize] = RLimit64 {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+
         // Set the default file size limit (Linux typically defaults to unlimited).
         arr[RLimitID::Fsize as usize] = RLimit64 {
             rlim_cur: u64::MAX,

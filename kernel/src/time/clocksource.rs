@@ -1098,13 +1098,21 @@ fn sample_watchdog(
         }
 
         if cs_dev_nsec.abs_diff(wd_dev_nsec) > WATCHDOG_THRESHOLD.into() {
-            // debug!("set_unstable");
-            // 误差过大，标记为unstable
+            // 误差过大，标记为不稳定。降级判定必须可见：INFO 会被
+            // console_loglevel / quiet 过滤掉，而这一行是"当前时钟源不可信、
+            // 即将被降级并重选"的唯一记录，因此固定走 WARN 通道。
+            // 这里用 Logger.try_log_fmt（best-effort、可丢弃、不抢日志锁）而不是
+            // warn!：watchdog 采样可能运行在定时器/软中断上下文，普通日志通道
+            // 需要持锁输出，不能在此时阻塞。
             Logger.try_log_fmt(
-                LogLevel::INFO,
+                LogLevel::WARN,
                 format_args!(
-                    "clocksource watchdog skew: cs_dev_nsec={} wd_dev_nsec={}",
-                    cs_dev_nsec, wd_dev_nsec
+                    "clocksource watchdog: '{}' unstable: cs_nsec={} wd_nsec={} ref='{}' diff_ns={}",
+                    cs_data.name,
+                    cs_dev_nsec,
+                    wd_dev_nsec,
+                    wd_now_data.name,
+                    cs_dev_nsec.abs_diff(wd_dev_nsec)
                 ),
             );
             cs.mark_unstable_from_watchdog(

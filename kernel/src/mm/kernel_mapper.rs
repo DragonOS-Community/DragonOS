@@ -9,6 +9,7 @@ use crate::{
     exception::InterruptArch,
     libs::align::page_align_up,
     mm::{allocator::page_frame::PageFrameCount, MMArch, MemoryManagementArch},
+    process::preempt::PreemptGuard,
     smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
@@ -33,10 +34,14 @@ pub struct KernelMapper {
     mapper: PageMapper,
     /// 标记当前映射器是否为只读
     readonly: bool,
+    // Pin CPU ownership until Drop has released owner/count.
+    _preempt_guard: PreemptGuard,
 }
 
+impl !Send for KernelMapper {}
+
 impl KernelMapper {
-    fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper) -> Self {
+    fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper, preempt_guard: PreemptGuard) -> Self {
         // owner/count 必须在关中断的临界区内一起更新。否则存在如下窗口：
         // 本 CPU 完成 owner CAS 后、尚未 fetch_add 计数时发生中断；中断处理
         // 里再次获取 mapper，看到 owner==cpuid、count==0，于是拿到可写守卫，
@@ -84,16 +89,22 @@ impl KernelMapper {
             let readonly = prev_count > 0;
             drop(irq_guard);
 
-            return Self { mapper, readonly };
+            return Self {
+                mapper,
+                readonly,
+                _preempt_guard: preempt_guard,
+            };
         }
     }
 
     /// @brief 锁定内核映射器, 并返回一个内核映射器对象
     #[inline(always)]
     pub fn lock() -> Self {
+        // CPU identity must remain stable during acquisition and ownership.
+        let preempt_guard = PreemptGuard::new();
         let cpuid = smp_get_processor_id();
         let mapper = unsafe { PageMapper::current(PageTableKind::Kernel, LockedFrameAllocator) };
-        return Self::lock_cpu(cpuid, mapper);
+        return Self::lock_cpu(cpuid, mapper, preempt_guard);
     }
 
     /// @brief 获取内核映射器的page mapper的可变引用。如果当前映射器为只读，则返回 None

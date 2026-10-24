@@ -552,11 +552,12 @@ impl MmioBuddyMemPool {
         }
 
         // 归还到buddy
-        mmio_pool()
-            .give_back_block(vaddr, length.trailing_zeros())
-            .unwrap_or_else(|err| {
-                panic!("MMIO release failed: self: {self:?}, err msg: {:?}", err);
-            });
+        if let Err(err) = mmio_pool().give_back_block(vaddr, length.trailing_zeros()) {
+            // 映射已经拆除但块未能归还；继续向上返回错误，由调用方决定
+            // 如何记录/降级。这里不应在任意上下文（含 Drop）里直接 panic。
+            error!("MMIO give_back_block failed: vaddr={vaddr:?}, length={length}, err={err:?}");
+            return Err(err);
+        }
 
         return Ok(0);
     }
@@ -727,11 +728,18 @@ impl MMIOSpaceGuard {
 
 impl Drop for MMIOSpaceGuard {
     fn drop(&mut self) {
-        let _ = mmio_pool()
-            .release_mmio(self.vaddr, self.size)
-            .unwrap_or_else(|err| {
-                panic!("MMIO release failed: self: {self:?}, err msg: {:?}", err);
-            });
+        if let Err(err) = mmio_pool().release_mmio(self.vaddr, self.size) {
+            // release_mmio 只会在当前 CPU 已持有 KernelMapper（重入得到只读
+            // 守卫）时返回 EAGAIN。重入期间不能安全修改内核页表，但 Drop
+            // 也不应把内核打崩：保留该 MMIO 窗口并记录错误。
+            //
+            // lock_cpu 已经改为关中断更新 owner/count，上述瞬时 EAGAIN 不应
+            // 再出现；这里保留兜底，避免未来出现新的重入路径时变成 panic。
+            error!(
+                "MMIO release deferred (window leaked): self: {:?}, err: {:?}",
+                self, err
+            );
+        }
     }
 }
 

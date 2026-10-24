@@ -7,7 +7,7 @@ use alloc::{
 };
 use core::mem::MaybeUninit;
 
-use device_output_buffer::{BufferError, DeviceOutputBuffer};
+use device_output_buffer::BufferError;
 use log::{debug, info, warn};
 use system_error::SystemError;
 use virtio_drivers::{
@@ -37,7 +37,7 @@ use super::super::{
 };
 use super::{
     queue::{create_queue, wait_transport_reset_complete, VirtioFsQueue},
-    reply::{ResponseBufferPool, VirtioFsReplyStorage},
+    reply::{DeviceOutputBuffer, ResponseBufferPool, VirtioFsReplyStorage},
     VIRTIOFS_MAX_REQUEST_SIZE,
 };
 use crate::filesystem::fuse::reply::FuseReply;
@@ -319,8 +319,8 @@ struct ReplyCreditBlockedHead {
 }
 
 fn response_buffer_virt_to_phys(vaddr: usize) -> Option<usize> {
-    // SAFETY: DeviceOutputBuffer supplies the address of its live Box allocation. The kernel
-    // allocator obtains slab and buddy memory from the architecture direct map.
+    // SAFETY: DeviceOutputBuffer retains an explicit PhysicalBox allocation.
+    // Its stable slab/buddy backing belongs to the architecture direct map.
     unsafe { MMArch::virt_2_phys(VirtAddr::new(vaddr)) }.map(|paddr| paddr.data())
 }
 

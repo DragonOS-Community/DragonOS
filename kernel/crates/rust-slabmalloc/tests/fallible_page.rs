@@ -49,3 +49,22 @@ fn backing_page_failure_returns_error_and_can_retry() {
     // Existing callers still use the same metadata initialization through new().
     drop(ObjectPage::new());
 }
+
+#[test]
+fn supplied_backing_is_initialized_without_another_allocation() {
+    let storage = Box::<ObjectPage<'static>>::new_uninit();
+    let address = storage.as_ptr() as usize;
+    FAIL_NEXT_PAGE.with(|armed| armed.set(true));
+    let page = ObjectPage::init_boxed(storage);
+    assert_eq!(
+        page.as_ref() as *const ObjectPage<'static> as usize,
+        address
+    );
+    let still_armed = FAIL_NEXT_PAGE.with(|armed| armed.get());
+    assert!(
+        still_armed,
+        "initializing supplied backing must not allocate"
+    );
+    assert!(ObjectPage::try_new().is_err());
+    drop(page);
+}

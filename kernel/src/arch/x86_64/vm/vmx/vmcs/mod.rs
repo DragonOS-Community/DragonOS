@@ -1,7 +1,6 @@
 use core::{intrinsics::unlikely, sync::atomic::Ordering};
 
-use alloc::{boxed::Box, collections::LinkedList, sync::Arc};
-use bitmap::{traits::BitMapOps, AllocBitmap};
+use alloc::{collections::LinkedList, sync::Arc};
 use x86::{
     controlregs::Cr4,
     vmx::vmcs::{
@@ -17,17 +16,21 @@ use crate::{
         MMArch,
     },
     libs::spinlock::{SpinLock, SpinLockGuard},
-    mm::{percpu::PerCpuVar, MemoryManagementArch, PhysAddr, VirtAddr},
+    mm::{
+        allocator::physical::{PhysicalBox, PhysicalPage},
+        percpu::PerCpuVar,
+        MemoryManagementArch, PhysAddr,
+    },
     smp::cpu::{AtomicProcessorId, ProcessorId},
 };
 
-use super::vmx_info;
+use super::{vmx_info, VmxHardwareBacking};
 
 pub mod feat;
 
 pub static mut PERCPU_VMCS: Option<PerCpuVar<Option<Arc<LockedVMControlStructure>>>> = None;
 pub static mut PERCPU_LOADED_VMCS_LIST: Option<PerCpuVar<LinkedList<Arc<LockedLoadedVmcs>>>> = None;
-pub static mut VMXAREA: Option<PerCpuVar<Box<VMControlStructure>>> = None;
+pub(crate) static mut VMXAREA: Option<PerCpuVar<PhysicalBox<VMControlStructure>>> = None;
 
 pub fn current_vmcs() -> &'static Option<Arc<LockedVMControlStructure>> {
     unsafe { PERCPU_VMCS.as_ref().unwrap().get() }
@@ -46,7 +49,7 @@ pub fn current_loaded_vmcs_list() -> &'static LinkedList<Arc<LockedLoadedVmcs>> 
     unsafe { PERCPU_LOADED_VMCS_LIST.as_ref().unwrap().get() }
 }
 
-pub fn vmx_area() -> &'static PerCpuVar<Box<VMControlStructure>> {
+pub(crate) fn vmx_area() -> &'static PerCpuVar<PhysicalBox<VMControlStructure>> {
     unsafe { VMXAREA.as_ref().unwrap() }
 }
 
@@ -59,9 +62,9 @@ pub struct VMControlStructure {
 }
 
 impl VMControlStructure {
-    pub fn new() -> Box<Self> {
-        let mut vmcs: Box<VMControlStructure> = unsafe {
-            Box::try_new_zeroed()
+    pub(crate) fn new() -> PhysicalBox<Self> {
+        let mut vmcs: PhysicalBox<VMControlStructure> = unsafe {
+            PhysicalBox::<VMControlStructure>::try_new_zeroed()
                 .expect("alloc vmcs failed")
                 .assume_init()
         };
@@ -92,27 +95,35 @@ impl VMControlStructure {
 pub struct LockedVMControlStructure {
     /// 记录内部的vmcs的物理地址
     phys_addr: PhysAddr,
-    inner: SpinLock<Box<VMControlStructure>>,
+    inner: SpinLock<PhysicalBox<VMControlStructure>>,
+    // The per-CPU current VMCS may outlive VirtCpu. Keep every programmed
+    // backing alive through that final VMCS reference, including failed create.
+    _hardware: Arc<SpinLock<PhysicalBox<VmxHardwareBacking>>>,
+    _msr_bitmap: VmxMsrBitmap,
 }
 
 impl LockedVMControlStructure {
     #[inline(never)]
-    pub fn new(shadow: bool) -> Arc<Self> {
+    pub(crate) fn new(
+        shadow: bool,
+        hardware: Arc<SpinLock<PhysicalBox<VmxHardwareBacking>>>,
+        msr_bitmap: VmxMsrBitmap,
+    ) -> Arc<Self> {
         let mut vmcs = VMControlStructure::new();
 
-        let phys_addr = unsafe {
-            MMArch::virt_2_phys(VirtAddr::new(vmcs.as_ref() as *const _ as usize)).unwrap()
-        };
+        let phys_addr = vmcs.phys_addr().unwrap();
 
         vmcs.set_shadow_vmcs(shadow);
 
         Arc::new(Self {
             phys_addr,
             inner: SpinLock::new(vmcs),
+            _hardware: hardware,
+            _msr_bitmap: msr_bitmap,
         })
     }
 
-    pub fn lock(&self) -> SpinLockGuard<'_, Box<VMControlStructure>> {
+    pub(crate) fn lock(&self) -> SpinLockGuard<'_, PhysicalBox<VMControlStructure>> {
         self.inner.lock()
     }
 
@@ -319,14 +330,14 @@ pub enum ControlsType {
 }
 
 impl LockedLoadedVmcs {
-    pub fn new() -> Arc<Self> {
+    pub(crate) fn new(hardware: Arc<SpinLock<PhysicalBox<VmxHardwareBacking>>>) -> Arc<Self> {
         let bitmap = if vmx_info().has_msr_bitmap() {
             let bitmap = VmxMsrBitmap::new(true, MMArch::PAGE_SIZE * u8::BITS as usize);
             bitmap
         } else {
             VmxMsrBitmap::new(true, 0)
         };
-        let vmcs = LockedVMControlStructure::new(false);
+        let vmcs = LockedVMControlStructure::new(false, hardware, bitmap.clone());
 
         VmxAsm::vmclear(vmcs.phys_addr);
 
@@ -363,9 +374,9 @@ impl LockedLoadedVmcs {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VmxMsrBitmap {
-    data: AllocBitmap,
+    data: Option<Arc<SpinLock<PhysicalBox<PhysicalPage>>>>,
     phys_addr: usize,
 }
 
@@ -391,13 +402,23 @@ impl VmxMsrBitmapAccess {
 
 impl VmxMsrBitmap {
     pub fn new(init_val: bool, size: usize) -> Self {
-        let mut data = AllocBitmap::new(size);
-        data.set_all(init_val);
-
-        let addr = data.data() as *const [usize] as *const usize as usize;
+        if size == 0 {
+            return Self {
+                data: None,
+                phys_addr: 0,
+            };
+        }
+        assert_eq!(size, MMArch::PAGE_SIZE * u8::BITS as usize);
+        let mut data = unsafe {
+            PhysicalBox::<PhysicalPage>::try_new_zeroed()
+                .expect("alloc msr bitmap failed")
+                .assume_init()
+        };
+        data.fill(if init_val { 0xff } else { 0 });
+        let phys_addr = data.phys_addr().unwrap().data();
         Self {
-            data,
-            phys_addr: unsafe { MMArch::virt_2_phys(VirtAddr::new(addr)).unwrap().data() },
+            data: Some(Arc::new(SpinLock::new(data))),
+            phys_addr,
         }
     }
 
@@ -423,17 +444,23 @@ impl VmxMsrBitmap {
     }
 
     fn bit_op(&mut self, msr: usize, base: usize, action: VmxMsrBitmapAction) -> bool {
+        let Some(data) = &self.data else {
+            return false;
+        };
+        let mut data = data.lock();
+        let bit = msr + base;
+        let Some(byte) = data.get_mut(bit / 8) else {
+            return false;
+        };
+        let mask = 1 << (bit % 8);
         match action {
-            VmxMsrBitmapAction::Test => {
-                let ret = self.data.get(msr + base);
-                ret.unwrap_or(false)
-            }
+            VmxMsrBitmapAction::Test => *byte & mask != 0,
             VmxMsrBitmapAction::Set => {
-                self.data.set(msr + base, true);
+                *byte |= mask;
                 true
             }
             VmxMsrBitmapAction::Clear => {
-                self.data.set(msr + base, false);
+                *byte &= !mask;
                 true
             }
         }

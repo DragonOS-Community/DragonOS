@@ -78,7 +78,7 @@ impl KernelAllocator {
             LockedFrameAllocator.free(phy_addr, allocated_frame_count);
             return Err(AllocError);
         };
-        if unlikely(virt_addr.is_null()) {
+        if unlikely(virt_addr.is_null()) || !virt_addr.data().is_multiple_of(layout.align()) {
             LockedFrameAllocator.free(phy_addr, allocated_frame_count);
             return Err(AllocError);
         }
@@ -95,21 +95,62 @@ impl KernelAllocator {
         return Ok(NonNull::from(slice));
     }
 
-    /// Explicit CPU-buffer first attempt. Buddy allocation never invokes OOM
-    /// recovery; small size classes retain the normal slab refill policy.
-    /// The caller must use local_dealloc with this same layout.
-    pub(crate) unsafe fn alloc_buffer_zeroed(&self, layout: Layout) -> *mut u8 {
-        if allocator_select_condition(layout) {
-            self.alloc_in_buddy(layout, true)
-                .map(|allocation| {
-                    let ptr = allocation.as_mut_ptr();
-                    core::ptr::write_bytes(ptr, 0, allocation.len());
-                    ptr
-                })
+    /// Allocate direct-mapped physical storage, without entering GlobalAlloc.
+    /// `no_retry` constrains this to one buddy admission and pressure notification;
+    /// slab refill follows the same policy and never allocates through GlobalAlloc.
+    pub(crate) unsafe fn alloc_physical(
+        &self,
+        layout: Layout,
+        zeroed: bool,
+        no_retry: bool,
+    ) -> *mut u8 {
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+        let pointer = if allocator_select_condition(layout) {
+            self.alloc_in_buddy(layout, no_retry)
+                .map(|allocation| allocation.as_mut_ptr())
                 .unwrap_or_default()
         } else {
-            self.local_alloc_zeroed(layout)
+            slab::allocate(layout, no_retry)
+        };
+        if zeroed && !pointer.is_null() {
+            core::ptr::write_bytes(pointer, 0, layout.size());
         }
+        pointer
+    }
+
+    /// Nonrecursive, zeroed metadata storage. Its exact Layout remains compatible
+    /// with the direct branch of GlobalAlloc when reconstructed as a Box.
+    pub(crate) unsafe fn alloc_metadata(&self, layout: Layout) -> *mut u8 {
+        self.alloc_physical(layout, true, true)
+    }
+
+    pub(crate) unsafe fn alloc_buffer_zeroed(&self, layout: Layout) -> *mut u8 {
+        self.alloc_physical(layout, true, true)
+    }
+
+    unsafe fn alloc_global(&self, layout: Layout) -> *mut u8 {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        if super::heap::HeapPlan::preferred(layout) == super::heap::HeapPlan::Virtual {
+            let pointer = crate::mm::vmalloc::try_global_alloc(layout);
+            if !pointer.is_null() {
+                return pointer;
+            }
+        }
+        // No reclaim, task-local account lookup, or recursive GlobalAlloc here.
+        // A constrained caller and a failed virtual attempt get one direct try.
+        let pointer = self.alloc_physical(layout, true, true);
+        alloc_debug_log(
+            if allocator_select_condition(layout) {
+                LogSource::Buddy
+            } else {
+                LogSource::Slab
+            },
+            layout,
+            pointer,
+        );
+        pointer
     }
 
     /// Transfers a direct buddy allocation into the size-class slab domain.
@@ -139,33 +180,11 @@ impl KernelAllocator {
 /// 为内核分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
-        if allocator_select_condition(layout) {
-            return self
-                .alloc_in_buddy(layout, false)
-                .map(|x| x.as_mut_ptr())
-                .unwrap_or_default();
-        } else {
-            return slab::allocate(layout);
-        }
+        self.alloc_physical(layout, false, false)
     }
 
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if allocator_select_condition(layout) {
-            return self
-                .alloc_in_buddy(layout, false)
-                .map(|x| {
-                    let ptr: *mut u8 = x.as_mut_ptr();
-                    core::ptr::write_bytes(ptr, 0, x.len());
-                    ptr
-                })
-                .unwrap_or_default();
-        } else {
-            let ptr = slab::allocate(layout);
-            if !ptr.is_null() {
-                core::ptr::write_bytes(ptr, 0, layout.size());
-            }
-            return ptr;
-        }
+        self.alloc_physical(layout, true, false)
     }
 
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -188,13 +207,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             crate::mm::oom::denial::note_rejection();
             return core::ptr::null_mut();
         }
-        let r = self.local_alloc_zeroed(layout);
-        if allocator_select_condition(layout) {
-            alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
-        } else {
-            alloc_debug_log(klog_types::LogSource::Slab, layout, r);
-        }
-        return r;
+        self.alloc_global(layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -203,17 +216,16 @@ unsafe impl GlobalAlloc for KernelAllocator {
             crate::mm::oom::denial::note_rejection();
             return core::ptr::null_mut();
         }
-        let r = self.local_alloc_zeroed(layout);
-        if allocator_select_condition(layout) {
-            alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
-        } else {
-            alloc_debug_log(klog_types::LogSource::Slab, layout, r);
-        }
-        return r;
+        self.alloc_global(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if allocator_select_condition(layout) || (ptr as usize).is_multiple_of(4096) {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        if crate::mm::vmalloc::contains(VirtAddr::new(ptr as usize)) {
+            crate::mm::vmalloc::global_dealloc(ptr);
+            return;
+        }
+        if allocator_select_condition(layout) {
             dealloc_debug_log(klog_types::LogSource::Buddy, layout, ptr);
         } else {
             dealloc_debug_log(klog_types::LogSource::Slab, layout, ptr);
@@ -235,33 +247,6 @@ fn dealloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
         source,
     )
 }
-
-// 为内核slab分配器实现Allocator特性
-// unsafe impl Allocator for KernelAllocator {
-//     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-//         let memory = unsafe {self.local_alloc(layout)};
-//         if memory.is_null() {
-//             Err(AllocError)
-//         } else {
-//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
-//             Ok(unsafe { NonNull::new_unchecked(slice) })
-//         }
-//     }
-
-//     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-//         let memory = unsafe {self.local_alloc_zeroed(layout)};
-//         if memory.is_null() {
-//             Err(AllocError)
-//         } else {
-//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
-//             Ok(unsafe { NonNull::new_unchecked(slice) })
-//         }
-//     }
-
-//     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-//         self.local_dealloc(ptr.cast().as_ptr(), layout);
-//     }
-// }
 
 /// 内存分配错误处理函数
 #[cfg(target_os = "none")]

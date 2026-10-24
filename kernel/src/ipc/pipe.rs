@@ -508,8 +508,11 @@ impl PipeRuntime {
                 .map_err(|_| SystemError::ENOMEM)?;
         let mut expected = baseline.kernel_bytes;
         for layout in [ring_layout, segment_layout] {
-            let kind = KernelByteKind::SlabUnreclaimable.for_allocation(layout) as usize;
-            expected[kind] += allocation_footprint(layout);
+            // The unlimited success case exercises the default fixed plan;
+            // the tight-limit case above separately requires direct fallback.
+            let plan = crate::mm::allocator::heap::HeapPlan::preferred(layout);
+            let kind = plan.kind(KernelByteKind::SlabUnreclaimable, layout) as usize;
+            expected[kind] += plan.footprint(layout);
         }
         ok &= account.snapshot().kernel_bytes == expected;
         drop(padding);

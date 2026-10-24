@@ -63,7 +63,7 @@ where
 pub struct PreparedNode<K: Ord + Debug, V: Debug>(Box<RBTreeNode<K, V>>);
 
 impl<K: Ord + Debug, V: Debug> PreparedNode<K, V> {
-    pub(crate) fn allocation_layout() -> core::alloc::Layout {
+    pub(crate) const fn allocation_layout() -> core::alloc::Layout {
         core::alloc::Layout::new::<RBTreeNode<K, V>>()
     }
 
@@ -74,6 +74,36 @@ impl<K: Ord + Debug, V: Debug> PreparedNode<K, V> {
     /// Free detached storage before releasing the returned value's resources.
     pub(crate) fn into_pair(self) -> (K, V) {
         self.0.pair()
+    }
+
+    pub(crate) fn key_mut(&mut self) -> &mut K {
+        &mut self.0.key
+    }
+
+    /// Prepare a node using non-recursive backing storage.
+    ///
+    /// # Safety
+    /// `allocate` must return null or unique storage satisfying the supplied
+    /// layout, compatible with the global allocator's deallocation for that
+    /// exact layout. In particular a small node cannot use a raw buddy page.
+    pub(crate) unsafe fn try_new_with(
+        key: K,
+        value: V,
+        allocate: impl FnOnce(core::alloc::Layout) -> *mut u8,
+    ) -> Result<Self, core::alloc::AllocError> {
+        let pointer = allocate(Self::allocation_layout()).cast::<RBTreeNode<K, V>>();
+        if pointer.is_null() {
+            return Err(core::alloc::AllocError);
+        }
+        pointer.write(RBTreeNode {
+            color: Color::Black,
+            left: NodePtr::null(),
+            right: NodePtr::null(),
+            parent: NodePtr::null(),
+            key,
+            value,
+        });
+        Ok(Self(Box::from_raw(pointer)))
     }
 
     pub fn try_new(key: K, value: V) -> Result<Self, core::alloc::AllocError> {

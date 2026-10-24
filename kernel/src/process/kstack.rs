@@ -10,13 +10,18 @@ use crate::{
         object::{ObjectAccount, ObjectCharge},
     },
     libs::{align::AlignedBox, spinlock::SpinLock},
-    mm::{PhysAddr, VirtAddr},
+    mm::{allocator::physical::PhysicalBox, PhysAddr, VirtAddr},
     process::ProcessControlBlock,
 };
+
+#[repr(C, align(32768))]
+#[derive(Debug)]
+struct StackBytes([u8; KernelStack::SIZE]);
 
 #[derive(Debug)]
 pub struct KernelStack {
     stack: Option<AlignedBox<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>>,
+    dynamic_stack: Option<PhysicalBox<StackBytes>>,
     /// Indicates whether this kernel stack can be freed.
     ty: KernelStackType,
     charge: Option<ObjectCharge>,
@@ -171,6 +176,14 @@ unsafe fn dealloc_from_kernel_space(vaddr: VirtAddr, paddr: PhysAddr, count: usi
 }
 
 impl KernelStack {
+    fn storage_ptr(&self) -> *const u8 {
+        if let Some(stack) = &self.dynamic_stack {
+            (**stack).0.as_ptr()
+        } else {
+            self.stack.as_ref().unwrap().as_ptr()
+        }
+    }
+
     pub const SIZE: usize = 0x8000;
     pub const ALIGN: usize = 0x8000;
 
@@ -211,15 +224,19 @@ impl KernelStack {
                             real_kstack_vaddr.data() as *mut [u8; KernelStack::SIZE],
                         ),
                     ),
+                    dynamic_stack: None,
                     ty: KernelStackType::KernelSpace(kstack_vaddr, kstack_paddr, count),
                     charge,
                 })
             }
         } else {
             Ok(Self {
-                stack: Some(
-                    AlignedBox::<[u8; KernelStack::SIZE], { KernelStack::ALIGN }>::new_zeroed()?,
-                ),
+                stack: None,
+                dynamic_stack: Some(unsafe {
+                    PhysicalBox::<StackBytes>::try_new_zeroed()
+                        .map_err(|_| SystemError::ENOMEM)?
+                        .assume_init()
+                }),
                 ty: KernelStackType::Dynamic,
                 charge,
             })
@@ -242,6 +259,7 @@ impl KernelStack {
                     base.data() as *mut [u8; KernelStack::SIZE],
                 ),
             ),
+            dynamic_stack: None,
             ty: KernelStackType::Static,
             charge: None,
         })
@@ -273,12 +291,12 @@ impl KernelStack {
 
     /// Returns the start virtual address (low address) of the kernel stack.
     pub fn start_address(&self) -> VirtAddr {
-        return VirtAddr::new(self.stack.as_ref().unwrap().as_ptr() as usize);
+        return VirtAddr::new(self.storage_ptr() as usize);
     }
 
     /// Returns the end virtual address (high address, exclusive) of the kernel stack.
     pub fn stack_max_address(&self) -> VirtAddr {
-        return VirtAddr::new(self.stack.as_ref().unwrap().as_ptr() as usize + Self::SIZE);
+        return VirtAddr::new(self.storage_ptr() as usize + Self::SIZE);
     }
 
     pub unsafe fn set_pcb(&mut self, pcb: Weak<ProcessControlBlock>) -> Result<(), SystemError> {
@@ -325,7 +343,7 @@ impl KernelStack {
     #[allow(dead_code)]
     pub unsafe fn pcb(&self) -> Option<Arc<ProcessControlBlock>> {
         // Retrieve the PCB pointer from the lowest address of the kernel stack.
-        let p = self.stack.as_ref().unwrap().as_ptr() as *const *const ProcessControlBlock;
+        let p = self.storage_ptr() as *const *const ProcessControlBlock;
         if unlikely(unsafe { (*p).is_null() }) {
             return None;
         }
@@ -342,8 +360,8 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        if let Some(stack) = &self.stack {
-            let ptr = stack.as_ptr() as *const *const ProcessControlBlock;
+        if self.stack.is_some() || self.dynamic_stack.is_some() {
+            let ptr = self.storage_ptr() as *const *const ProcessControlBlock;
             if unsafe { !(*ptr).is_null() } {
                 let pcb_ptr: Weak<ProcessControlBlock> = unsafe { Weak::from_raw(*ptr) };
                 drop(pcb_ptr);
@@ -363,7 +381,7 @@ impl Drop for KernelStack {
                 core::mem::forget(bx);
             }
             KernelStackType::Dynamic => {
-                drop(self.stack.take());
+                drop(self.dynamic_stack.take());
             }
         }
         drop(self.charge.take());

@@ -22,6 +22,7 @@ use crate::exception::{
     HardwareIrqNumber,
 };
 use crate::libs::spinlock::SpinLockGuard;
+use crate::mm::allocator::physical::{PhysicalBox, PhysicalPage};
 use crate::mm::VirtAddr;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
@@ -123,7 +124,7 @@ pub struct VmxKvmInitFunc;
 impl VmxKvmInitFunc {
     pub fn setup_per_cpu(&self) {
         let mut vmcs_areas = Vec::new();
-        vmcs_areas.resize(PerCpu::MAX_CPU_NUM as usize, VMControlStructure::new());
+        vmcs_areas.resize_with(PerCpu::MAX_CPU_NUM as usize, VMControlStructure::new);
         unsafe { VMXAREA = PerCpuVar::new(vmcs_areas) };
 
         let mut percpu_current_vmcs = Vec::new();
@@ -547,8 +548,7 @@ impl KvmFunc for VmxKvmFunc {
 
         debug!("vmcs idx {}", vmcs.abort);
 
-        let phys_addr =
-            unsafe { MMArch::virt_2_phys(VirtAddr::new(vmcs as *const _ as usize)).unwrap() };
+        let phys_addr = vmx_area().get().phys_addr().unwrap();
 
         // TODO: intel_pt_handle_vmx(1);
 
@@ -1080,7 +1080,14 @@ impl KvmFunc for VmxKvmFunc {
             return Ok(());
         }
 
-        kvm_vmx.pid_table = Some(unsafe { Box::new_zeroed().assume_init() });
+        // Retain the existing entry capacity; changing it requires auditing
+        // every architectural vCPU-id bound, independently of heap policy.
+        let table = unsafe {
+            PhysicalBox::<[u64]>::try_new_zeroed_slice(MMArch::PAGE_SIZE)
+                .map_err(|_| SystemError::ENOMEM)?
+                .assume_init()
+        };
+        kvm_vmx.pid_table = Some(Arc::new(table));
         Ok(())
     }
 
@@ -1862,12 +1869,21 @@ impl Vmx {
         let vmx = vcpu.vmx_mut();
         vmx.msr_ia32_feature_control_valid_bits = 1 << 0;
 
-        vmx.post_intr_desc.control.set_nv(0xf2);
-        vmx.post_intr_desc.control.set_sn(true);
+        vmx.hardware.lock().post_intr_desc.control.set_nv(0xf2);
+        vmx.hardware.lock().post_intr_desc.control.set_sn(true);
     }
 
     fn init_vmcs(&mut self, vcpu: &mut VirtCpu, vm: &Vm) {
         let kvm_vmx = vm.kvm_vmx();
+        {
+            let mut hardware = vcpu.vmx().hardware.lock();
+            hardware.pid_table = kvm_vmx.pid_table.clone();
+            hardware.apic_regs = if vcpu.arch.lapic_in_kernel() {
+                Some(vcpu.arch.lapic().regs.clone())
+            } else {
+                None
+            };
+        }
         if vmx_info().nested {
             todo!()
         }
@@ -1921,7 +1937,7 @@ impl Vmx {
             VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_NOTIFICATION_VECTOR, 0xf2);
             VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_DESC_ADDR_FULL, unsafe {
                 MMArch::virt_2_phys(VirtAddr::new(
-                    &vcpu.vmx().post_intr_desc as *const _ as usize,
+                    &vcpu.vmx().hardware.lock().post_intr_desc as *const _ as usize,
                 ))
                 .unwrap()
                 .data() as u64
@@ -1930,11 +1946,16 @@ impl Vmx {
 
         if self.enable_apicv && vcpu.arch.lapic_in_kernel() {
             // PID_POINTER_TABLE
-            VmxAsm::vmx_vmwrite(0x2042, unsafe {
-                MMArch::virt_2_phys(VirtAddr::new(kvm_vmx.pid_table().as_ptr() as usize))
+            VmxAsm::vmx_vmwrite(
+                0x2042,
+                kvm_vmx
+                    .pid_table
+                    .as_ref()
                     .unwrap()
-                    .data() as u64
-            });
+                    .phys_addr()
+                    .unwrap()
+                    .data() as u64,
+            );
             // LAST_PID_POINTER_INDEX
             VmxAsm::vmx_vmwrite(0x08, vm.arch.max_vcpu_ids as u64 - 1);
         }
@@ -1973,7 +1994,7 @@ impl Vmx {
         VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, 0);
         VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_ADDR_FULL, unsafe {
             MMArch::virt_2_phys(VirtAddr::new(
-                vcpu.vmx().msr_autoload.host.val.as_ptr() as *const _ as usize,
+                vcpu.vmx().hardware.lock().msr_autoload.host.val.as_ptr() as *const _ as usize,
             ))
             .unwrap()
             .data() as u64
@@ -1981,7 +2002,7 @@ impl Vmx {
         VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, 0);
         VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_ADDR_FULL, unsafe {
             MMArch::virt_2_phys(VirtAddr::new(
-                vcpu.vmx().msr_autoload.guest.val.as_ptr() as usize
+                vcpu.vmx().hardware.lock().msr_autoload.guest.val.as_ptr() as usize,
             ))
             .unwrap()
             .data() as u64
@@ -2025,11 +2046,16 @@ impl Vmx {
         }
 
         if self.enable_pml {
-            VmxAsm::vmx_vmwrite(control::PML_ADDR_FULL, unsafe {
-                MMArch::virt_2_phys(VirtAddr::new(vcpu.vmx().pml_pg.as_ref().as_ptr() as usize))
+            VmxAsm::vmx_vmwrite(
+                control::PML_ADDR_FULL,
+                vcpu.vmx()
+                    .hardware
+                    .lock()
+                    .pml_pg
+                    .phys_addr()
                     .unwrap()
-                    .data() as u64
-            });
+                    .data() as u64,
+            );
 
             VmxAsm::vmx_vmwrite(guest::PML_INDEX, VmxVCpuPriv::PML_ENTITY_NUM as u64 - 1);
         }
@@ -2048,11 +2074,10 @@ impl Vmx {
         if self.has_tpr_shadow() {
             VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, 0);
             if vcpu.arch.lapic_in_kernel() {
-                VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, unsafe {
-                    MMArch::virt_2_phys(VirtAddr::new(vcpu.arch.lapic().regs.as_ptr() as usize))
-                        .unwrap()
-                        .data() as u64
-                });
+                VmxAsm::vmx_vmwrite(
+                    control::VIRT_APIC_ADDR_FULL,
+                    vcpu.arch.lapic().regs.phys_addr().unwrap().data() as u64,
+                );
             }
 
             VmxAsm::vmx_vmwrite(control::TPR_THRESHOLD, 0);
@@ -2160,6 +2185,8 @@ impl Vmx {
 
         let efer_slot = vcpu
             .vmx()
+            .hardware
+            .lock()
             .msr_autoload
             .guest
             .find_loadstore_msr_slot(msr::IA32_EFER);
@@ -2169,7 +2196,7 @@ impl Vmx {
         } else if let Some(slot) = efer_slot {
             error!(
                 "EFER = 0x{:x} (autoload)",
-                vcpu.vmx().msr_autoload.guest.val[slot].data
+                vcpu.vmx().hardware.lock().msr_autoload.guest.val[slot].data
             );
         } else if vmentry_ctl.contains(EntryControls::IA32E_MODE_GUEST) {
             error!(
@@ -2220,7 +2247,10 @@ impl Vmx {
         }
 
         if self.vmread(control::VMENTRY_MSR_LOAD_COUNT) > 0 {
-            self.dump_msrs("guest autoload", &vcpu.vmx().msr_autoload.guest);
+            self.dump_msrs(
+                "guest autoload",
+                &vcpu.vmx().hardware.lock().msr_autoload.guest,
+            );
         }
         if self.vmread(control::VMEXIT_MSR_LOAD_COUNT) > 0 {
             self.dump_msrs("guest autostore", &vcpu.vmx().msr_autostore);
@@ -2284,7 +2314,10 @@ impl Vmx {
         }
 
         if self.vmread(control::VMEXIT_MSR_LOAD_COUNT) > 0 {
-            self.dump_msrs("host autoload", &vcpu.vmx().msr_autoload.host);
+            self.dump_msrs(
+                "host autoload",
+                &vcpu.vmx().hardware.lock().msr_autoload.host,
+            );
         }
 
         error!("\n--- CONTROL STATE ---");
@@ -3378,6 +3411,37 @@ pub struct VmxSegmentCache {
     pub seg: [VmxSaveSegment; 8],
 }
 
+/// Storage referenced by VMCS fields, retained by the VMCS itself rather than
+/// merely its movable vCPU. Hardware never accesses the bookkeeping pointers.
+#[derive(Debug)]
+pub(crate) struct VmxHardwareBacking {
+    post_intr_desc: PostedIntrDesc,
+    msr_autoload: VmxMsrAutoLoad,
+    pml_pg: PhysicalBox<PhysicalPage>,
+    pid_table: Option<Arc<PhysicalBox<[u64]>>>,
+    apic_regs: Option<Arc<PhysicalBox<PhysicalPage>>>,
+}
+
+impl VmxHardwareBacking {
+    fn new() -> Arc<SpinLock<PhysicalBox<Self>>> {
+        let pml_pg = unsafe {
+            PhysicalBox::<PhysicalPage>::try_new_zeroed()
+                .expect("alloc PML page failed")
+                .assume_init()
+        };
+        Arc::new(SpinLock::new(
+            PhysicalBox::try_new(Self {
+                post_intr_desc: PostedIntrDesc::default(),
+                msr_autoload: VmxMsrAutoLoad::default(),
+                pml_pg,
+                pid_table: None,
+                apic_regs: None,
+            })
+            .expect("alloc VMX hardware state failed"),
+        ))
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct VmxVCpuPriv {
@@ -3396,7 +3460,7 @@ pub struct VmxVCpuPriv {
     guest_uret_msrs: [VmxUretMsr; KvmArchManager::KVM_MAX_NR_USER_RETURN_MSRS],
     guest_uret_msrs_loaded: bool,
 
-    post_intr_desc: PostedIntrDesc,
+    hardware: Arc<SpinLock<PhysicalBox<VmxHardwareBacking>>>,
 
     shadow_msr_intercept_read: AllocBitmap,
     shadow_msr_intercept_write: AllocBitmap,
@@ -3414,10 +3478,7 @@ pub struct VmxVCpuPriv {
     ple_window: u32,
     ple_window_dirty: bool,
 
-    msr_autoload: VmxMsrAutoLoad,
     msr_autostore: VmxMsrs,
-
-    pml_pg: Box<[u8; MMArch::PAGE_SIZE]>,
 
     rmode: VmxRMode,
 
@@ -3440,11 +3501,11 @@ pub struct KvmVmx {
     tss_addr: usize,
     ept_identity_pagetable_done: bool,
     ept_identity_map_addr: u64,
-    pid_table: Option<Box<[u64; MMArch::PAGE_SIZE]>>,
+    pid_table: Option<Arc<PhysicalBox<[u64]>>>,
 }
 
 impl KvmVmx {
-    pub fn pid_table(&self) -> &[u64; MMArch::PAGE_SIZE] {
+    pub fn pid_table(&self) -> &[u64] {
         self.pid_table.as_ref().unwrap().as_ref()
     }
 }
@@ -3458,7 +3519,8 @@ impl VmxVCpuPriv {
 
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/vmx/vmx.c#7452
     pub fn init(vcpu: &mut VirtCpu, vm: &Vm) {
-        let vmcs = LockedLoadedVmcs::new();
+        let hardware = VmxHardwareBacking::new();
+        let vmcs = LockedLoadedVmcs::new(hardware.clone());
 
         // TODO: 改堆分配
         let mut vmx = Self {
@@ -3469,11 +3531,9 @@ impl VmxVCpuPriv {
             guest_uret_msrs: [VmxUretMsr::default(); KvmArchManager::KVM_MAX_NR_USER_RETURN_MSRS],
             shadow_msr_intercept_read: AllocBitmap::new(16),
             shadow_msr_intercept_write: AllocBitmap::new(16),
-            post_intr_desc: PostedIntrDesc::default(),
+            hardware,
             ple_window: 0,
             ple_window_dirty: false,
-            msr_autoload: VmxMsrAutoLoad::default(),
-            pml_pg: unsafe { Box::new_zeroed().assume_init() },
             guest_uret_msrs_loaded: false,
             msr_ia32_feature_control: 0,
             msr_ia32_feature_control_valid_bits: 0,
@@ -3656,7 +3716,8 @@ impl VmxVCpuPriv {
             _ => {}
         }
 
-        let m = &mut self.msr_autoload;
+        let mut hardware = self.hardware.lock();
+        let m = &mut hardware.msr_autoload;
         let i = m.guest.find_loadstore_msr_slot(msr);
 
         if let Some(i) = i {
@@ -3720,7 +3781,8 @@ impl VmxVCpuPriv {
             _ => {}
         }
 
-        let m = &mut self.msr_autoload;
+        let mut hardware = self.hardware.lock();
+        let m = &mut hardware.msr_autoload;
         let i = m.guest.find_loadstore_msr_slot(msr);
         let j = if !entry_only {
             m.host.find_loadstore_msr_slot(msr)

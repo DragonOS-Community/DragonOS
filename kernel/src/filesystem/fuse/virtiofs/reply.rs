@@ -7,10 +7,26 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use device_output_buffer::{BufferError, DeviceOutputBuffer, RetentionCredits, RetentionLimits};
+use device_output_buffer::{BufferError, RetentionCredits, RetentionLimits};
 use system_error::SystemError;
 
 use crate::libs::spinlock::SpinLock;
+use crate::mm::allocator::physical::PhysicalBox;
+
+pub(super) type DeviceOutputBuffer = device_output_buffer::DeviceOutputBuffer<PhysicalBox<[u8]>>;
+
+fn allocate_response_buffer<F>(len: usize, translator: F) -> Result<DeviceOutputBuffer, BufferError>
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    if len == 0 {
+        return Err(BufferError::InvalidLength);
+    }
+    let storage =
+        PhysicalBox::<[u8]>::try_new_zeroed_slice(len).map_err(|_| BufferError::OutOfMemory)?;
+    // SAFETY: zero is valid for u8; PhysicalBox is an exclusive stable allocation.
+    unsafe { DeviceOutputBuffer::from_backing(storage.assume_init(), translator) }
+}
 
 use super::super::{conn::FuseConn, stats};
 use super::VIRTIOFS_RSP_BUF_SIZE;
@@ -127,7 +143,7 @@ impl ResponseBufferPool {
             return Ok(buf);
         }
 
-        let buf = DeviceOutputBuffer::new(len, virt_to_phys).map_err(|error| match error {
+        let buf = allocate_response_buffer(len, virt_to_phys).map_err(|error| match error {
             BufferError::OutOfMemory => SystemError::ENOMEM,
             _ => SystemError::EIO,
         })?;
@@ -376,9 +392,7 @@ impl Drop for DeviceReplyLease {
 mod tests {
     use alloc::vec;
 
-    use device_output_buffer::DeviceOutputBuffer;
-
-    use super::{ResponseBufferPool, VirtioFsReplyStorage};
+    use super::{allocate_response_buffer, ResponseBufferPool, VirtioFsReplyStorage};
     use crate::filesystem::fuse::conn::FuseConn;
 
     fn direct(vaddr: usize) -> Option<usize> {
@@ -390,7 +404,7 @@ mod tests {
         let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
         let pool = ResponseBufferPool::new(&conn);
         let reservation = pool.reserve(80).unwrap();
-        let mut buffer = DeviceOutputBuffer::new(64, direct).unwrap();
+        let mut buffer = allocate_response_buffer(64, direct).unwrap();
         unsafe {
             buffer.submission_dma_slice(direct).unwrap();
         }

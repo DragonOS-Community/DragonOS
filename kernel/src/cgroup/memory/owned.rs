@@ -13,6 +13,8 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
+use crate::mm::allocator::heap::{self, AllocationCharge, HeapPlan};
+
 use super::{
     accounting::{ChargeFailure, KernelByteKind},
     object::{ObjectAccount, ObjectCharge},
@@ -24,6 +26,8 @@ use crate::mm::allocator::kernel_allocator::allocation_footprint;
 #[must_use]
 pub(crate) struct PreparedBox<T> {
     charge: ObjectCharge,
+    plan: HeapPlan,
+    kind: KernelByteKind,
     value: PhantomData<T>,
 }
 
@@ -67,15 +71,17 @@ impl<T> OwnedBox<T> {
         account: &Arc<ObjectAccount>,
         kind: KernelByteKind,
     ) -> Result<PreparedBox<T>, ChargeFailure> {
-        let charge = account.try_charge_allocation(kind, Layout::new::<T>())?;
+        let (plan, charge) = heap::object_plan(account, kind, Layout::new::<T>())?;
         Ok(PreparedBox {
             charge,
+            plan,
+            kind,
             value: PhantomData,
         })
     }
 }
 
-/// A fixed physical allocation with explicit ownership. Slice borrowers may
+/// Fixed-size heap storage with explicit ownership and a retirement receipt. Slice borrowers may
 /// mutate elements, but cannot grow storage or detach its admission receipt.
 #[derive(Debug)]
 pub(crate) struct OwnedSlice<T: Copy> {
@@ -93,13 +99,10 @@ impl<T: Copy> OwnedSlice<T> {
         initial: T,
     ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         let layout = Layout::array::<T>(len).map_err(|_| system_error::SystemError::ENOMEM)?;
-        let charge = if layout.size() == 0 {
-            None
-        } else {
-            Some(account.try_charge_allocation(kind, layout)?)
-        };
-        let mut storage =
-            Box::<[T]>::try_new_uninit_slice(len).map_err(|_| system_error::SystemError::ENOMEM)?;
+        let (plan, mut charge) = heap::object_plan(account, kind, layout)?;
+        let mut storage = unsafe { heap::uninit_slice::<T>(plan, len, charge.bytes()) }
+            .map_err(|_| system_error::SystemError::ENOMEM)?;
+        unsafe { heap::finalize_object(storage.as_mut_ptr().cast(), layout, kind, &mut charge) };
         if core::mem::size_of::<T>() != 0 {
             for slot in storage.iter_mut() {
                 slot.write(initial);
@@ -111,7 +114,7 @@ impl<T: Copy> OwnedSlice<T> {
         let storage = unsafe { storage.assume_init() };
         Ok(Self {
             storage: Some(storage),
-            charge,
+            charge: Some(charge),
         })
     }
 }
@@ -135,24 +138,26 @@ impl<T: Copy> DerefMut for OwnedSlice<T> {
 
 impl<T: Copy> Drop for OwnedSlice<T> {
     fn drop(&mut self) {
-        drop(self.storage.take());
-        drop(self.charge.take());
+        if let Some(storage) = self.storage.take() {
+            heap::drop_box(storage, self.charge.take().map(AllocationCharge::Object));
+        }
     }
 }
 
 impl<T> PreparedBox<T> {
-    /// Physical ENOMEM is distinct from the typed admission failure above.
-    /// If allocation fails, the prepared receipt is rolled back by RAII.
-    pub fn try_init(self, value: T) -> Result<OwnedBox<T>, AllocError> {
-        let storage = match Box::<T>::try_new_uninit() {
-            Ok(storage) => storage,
+    /// Allocate exactly the plan admitted by prepare; failure preserves the
+    /// receipt while the caller's unpublished value is destroyed.
+    pub fn try_init(mut self, value: T) -> Result<OwnedBox<T>, AllocError> {
+        let layout = Layout::new::<T>();
+        let pointer = match unsafe { self.plan.allocate_admitted(layout, self.charge.bytes()) } {
+            Ok(pointer) => pointer,
             Err(error) => {
-                // Keep the receipt alive while releasing the caller's value,
-                // just as Box::try_new(value) does on allocation failure.
                 drop(value);
                 return Err(error);
             }
         };
+        unsafe { heap::finalize_object(pointer.as_ptr(), layout, self.kind, &mut self.charge) };
+        let storage = unsafe { Box::from_raw(pointer.as_ptr().cast::<MaybeUninit<T>>()) };
         Ok(AllocatedBox {
             value: Some(storage),
             charge: Some(self.charge),
@@ -160,10 +165,11 @@ impl<T> PreparedBox<T> {
         .init(value))
     }
 
-    /// Allocate before open-like side effects, leaving final initialization
-    /// infallible. MaybeUninit<T> has exactly T's size and alignment.
-    pub fn try_allocate(self) -> Result<AllocatedBox<T>, AllocError> {
-        let value = Box::<T>::try_new_uninit()?;
+    pub fn try_allocate(mut self) -> Result<AllocatedBox<T>, AllocError> {
+        let layout = Layout::new::<T>();
+        let pointer = unsafe { self.plan.allocate_admitted(layout, self.charge.bytes())? };
+        unsafe { heap::finalize_object(pointer.as_ptr(), layout, self.kind, &mut self.charge) };
+        let value = unsafe { Box::from_raw(pointer.as_ptr().cast::<MaybeUninit<T>>()) };
         Ok(AllocatedBox {
             value: Some(value),
             charge: Some(self.charge),
@@ -204,7 +210,7 @@ impl<T, const N: usize> AllocatedBox<[T; N]> {
                 }
             }
         }
-        let mut storage = self.value.take().expect("prepared array allocation");
+        let storage = self.value.as_mut().expect("prepared array allocation");
         // SAFETY: a prepared [T; N] allocation has the same layout as N
         // MaybeUninit<T> elements; the exclusive slice never escapes this call.
         let elements = unsafe {
@@ -222,7 +228,7 @@ impl<T, const N: usize> AllocatedBox<[T; N]> {
         drop(prefix);
         OwnedBox {
             // SAFETY: all N elements were written; prefix no longer drops them.
-            value: Some(unsafe { storage.assume_init() }),
+            value: Some(unsafe { self.value.take().unwrap().assume_init() }),
             charge: self.charge.take(),
         }
     }
@@ -230,8 +236,9 @@ impl<T, const N: usize> AllocatedBox<[T; N]> {
 
 impl<T> Drop for AllocatedBox<T> {
     fn drop(&mut self) {
-        drop(self.value.take());
-        drop(self.charge.take());
+        if let Some(storage) = self.value.take() {
+            heap::drop_box(storage, self.charge.take().map(AllocationCharge::Object));
+        }
     }
 }
 
@@ -257,8 +264,9 @@ impl<T> Drop for OwnedBox<T> {
     fn drop(&mut self) {
         // Returning the Box allocation precedes uncharging. Keeping a receipt
         // in T itself would instead uncharge before Box deallocation.
-        drop(self.value.take());
-        drop(self.charge.take());
+        if let Some(storage) = self.value.take() {
+            heap::drop_box(storage, self.charge.take().map(AllocationCharge::Object));
+        }
     }
 }
 

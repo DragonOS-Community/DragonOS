@@ -8,8 +8,8 @@ use crate::{arch::MMArch, mm::MemoryManagementArch};
 
 #[inline]
 pub(crate) fn uses_buddy(layout: Layout) -> bool {
-    // Preserve the existing allocator's hot-path comparison and policy.
-    layout.size() > 2048
+    // A slab slot cannot satisfy alignments beyond its largest size class.
+    layout.size() > 2048 || layout.align() > 2048
 }
 
 /// A valid Layout cannot exceed isize::MAX, so rounding its size to a page
@@ -17,15 +17,18 @@ pub(crate) fn uses_buddy(layout: Layout) -> bool {
 pub(super) fn buddy_frame_count(layout: Layout) -> usize {
     layout
         .size()
+        .max(layout.align())
         .div_ceil(MMArch::PAGE_SIZE)
         .next_power_of_two()
 }
 
-/// Bytes reserved for a Box/Vec allocation with this layout.
+/// Bytes reserved by the explicit physical/local allocator for this layout.
+/// Default heap owners must use heap's fixed plan or actual footprint: their
+/// large allocation may instead have virtually mapped backing.
 ///
 /// Zero-sized owned values have no allocation. This is not the contract of
 /// calling the global allocator directly with a zero-sized layout. It reports
-/// slot size only, not extra alignment support or slab backing-page overhead.
+/// slot size only, including required alignment but not shared slab-page overhead.
 pub(crate) fn allocation_footprint(layout: Layout) -> u64 {
     if layout.size() == 0 {
         return 0;
@@ -73,6 +76,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn alignment_selects_and_sizes_physical_storage() {
+        for (size, align, bytes) in [(1, 4096, 4096), (1, 16384, 16384), (4097, 32768, 32768)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            assert!(uses_buddy(layout));
+            assert_eq!(allocation_footprint(layout), bytes);
+        }
+        assert_eq!(
+            allocation_footprint(Layout::from_size_align(0, 8192).unwrap()),
+            0
+        );
     }
 
     #[test]

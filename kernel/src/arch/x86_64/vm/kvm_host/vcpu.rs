@@ -152,20 +152,81 @@ pub struct X86VcpuArch {
     pub exit_qual: u64,
 }
 
+// The existing by-value constructor must remain small relative to a 32 KiB
+// kernel stack; do not reintroduce a large zeroed heap temporary to initialize it.
+const _: () = assert!(core::mem::size_of::<X86VcpuArch>() <= 2048);
+
 impl X86VcpuArch {
     const KVM_NR_DB_REGS: usize = 4;
 
     #[inline(never)]
     pub fn new() -> Self {
-        let mut ret: Box<X86VcpuArch> = unsafe { Box::new_zeroed().assume_init() };
-        ret.last_vmentry_cpu = ProcessorId::INVALID;
-        ret.regs_avail = AllocBitmap::new(32);
-        ret.regs_dirty = AllocBitmap::new(32);
-        ret.mp_state = MutilProcessorState::Runnable;
-
-        ret.apic = None;
-        //max_phyaddr=?? fztodo
-        *ret
+        // These fields contain Rust owners and enums: a zeroed allocation is
+        // not a valid value, even when the corresponding C KVM structs use
+        // kzalloc. Construct every field before any destructor can run.
+        Self {
+            last_vmentry_cpu: ProcessorId::INVALID,
+            regs_avail: AllocBitmap::new(32),
+            regs_dirty: AllocBitmap::new(32),
+            mp_state: MutilProcessorState::Runnable,
+            apic_base: 0,
+            apic: None,
+            host_pkru: 0,
+            pkru: 0,
+            hflags: HFlags::empty(),
+            microcode_version: 0,
+            arch_capabilities: 0,
+            perf_capabilities: 0,
+            ia32_xss: 0,
+            guest_state_protected: false,
+            cpuid_entries: Vec::new(),
+            exception: KvmQueuedException::default(),
+            exception_vmexit: KvmQueuedException::default(),
+            apf: KvmAsyncPageFault::default(),
+            emulate_regs_need_sync_from_vcpu: false,
+            emulate_regs_need_sync_to_vcpu: false,
+            smbase: 0,
+            interrupt: KvmQueuedInterrupt::default(),
+            tsc_offset_adjustment: 0,
+            mmu: None,
+            root_mmu: None,
+            guset_mmu: None,
+            walk_mmu: None,
+            nested_mmu: None,
+            mmu_pte_list_desc_cache: KvmMmuMemoryCache::default(),
+            mmu_shadow_page_cache: KvmMmuMemoryCache::default(),
+            mmu_shadowed_info_cache: KvmMmuMemoryCache::default(),
+            mmu_page_header_cache: KvmMmuMemoryCache::default(),
+            max_phyaddr: 0,
+            pat: 0,
+            regs: [0; KvmReg::NrVcpuRegs as usize],
+            cr0: Cr0::empty(),
+            cr0_guest_owned_bits: Cr0::empty(),
+            cr2: 0,
+            cr3: 0,
+            cr4: Cr4::empty(),
+            cr4_guest_owned_bits: Cr4::empty(),
+            cr4_guest_rsvd_bits: Cr4::empty(),
+            cr8: 0,
+            efer: EferFlags::empty(),
+            xcr0: Xcr0::empty(),
+            dr6: 0,
+            dr7: 0,
+            single_step_rip: 0,
+            msr_misc_features_enables: 0,
+            ia32_misc_enable_msr: MiscEnable::empty(),
+            smi_pending: false,
+            smi_count: 0,
+            nmi_queued: 0,
+            nmi_pending: 0,
+            nmi_injected: false,
+            handling_intr_from_guest: KvmIntrType::None,
+            xfd_no_write_intercept: false,
+            l1tf_flush_l1d: false,
+            at_instruction_boundary: false,
+            db: [0; Self::KVM_NR_DB_REGS],
+            exit_qual: 0,
+        }
     }
 
     pub fn clear_dirty(&mut self) {
@@ -1711,6 +1772,24 @@ pub struct KvmAsyncPageFault {
     delivery_as_pf_vmexit: bool,
     /// 是否处于页面就绪挂起状态
     pageready_pending: bool,
+}
+
+impl Default for KvmAsyncPageFault {
+    fn default() -> Self {
+        Self {
+            halted: false,
+            gfns: [0; Self::ASYNC_PF_PER_VCPU],
+            data: GfnToHvaCache::default(),
+            msr_en_val: 0,
+            msr_int_val: 0,
+            vec: 0,
+            id: 0,
+            send_user_only: false,
+            host_apf_flags: 0,
+            delivery_as_pf_vmexit: false,
+            pageready_pending: false,
+        }
+    }
 }
 
 impl KvmAsyncPageFault {

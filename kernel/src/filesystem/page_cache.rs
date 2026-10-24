@@ -3,6 +3,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
+use crate::mm::allocator::heap::{self, AllocationCharge, HeapPlan, HeapPlanAllocator};
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
@@ -937,11 +938,26 @@ impl PreparedRemotePageDirty {
     }
 }
 
+type AccountedPageMap =
+    HashMap<usize, Arc<PageEntry>, hashbrown::hash_map::DefaultHashBuilder, HeapPlanAllocator>;
+
+fn drop_page_map(pages: AccountedPageMap, charge: Option<ObjectCharge>) {
+    let (pointer, layout) = pages.raw_table().allocation_info();
+    unsafe {
+        heap::drop_storage_with_charge(
+            pages,
+            pointer.as_ptr(),
+            layout,
+            charge.map(AllocationCharge::Object),
+        )
+    };
+}
+
 #[derive(Debug)]
 pub struct InnerPageCache {
     #[allow(unused)]
     id: usize,
-    pages: HashMap<usize, Arc<PageEntry>>,
+    pages: AccountedPageMap,
     // The table allocation is physically freed before its byte receipt.
     pages_charge: Option<ObjectCharge>,
     page_indices: CacheIndex,
@@ -1216,7 +1232,7 @@ struct PageEntryState {
 }
 
 struct CacheTableCapacity {
-    pages: HashMap<usize, Arc<PageEntry>>,
+    pages: AccountedPageMap,
     charge: Option<ObjectCharge>,
 }
 
@@ -1263,8 +1279,7 @@ impl Drop for BackendPageReservation {
 
 impl Drop for CacheTableCapacity {
     fn drop(&mut self) {
-        drop(mem::take(&mut self.pages));
-        drop(self.charge.take());
+        drop_page_map(mem::take(&mut self.pages), self.charge.take());
     }
 }
 
@@ -2432,7 +2447,7 @@ impl InnerPageCache {
     ) -> InnerPageCache {
         Self {
             id,
-            pages: HashMap::new(),
+            pages: AccountedPageMap::new_in(HeapPlanAllocator::Auto),
             pages_charge: None,
             page_indices: CacheIndex::new(),
             dirty_pages: CacheIndex::new(),
@@ -2567,6 +2582,7 @@ impl Drop for InnerPageCache {
         }
         detach_pages_from_manager_batched(self.pages.values().map(|entry| &entry.page));
         detach_pages_from_reclaimer_batched(self.pages.values().map(|entry| &entry.page));
+        drop_page_map(mem::take(&mut self.pages), self.pages_charge.take());
     }
 }
 
@@ -2615,19 +2631,53 @@ impl PageCache {
             }
             required
         };
-        let mut pages = HashMap::new();
+        let mut pages = AccountedPageMap::new_in(HeapPlanAllocator::Auto);
         pages
             .try_reserve(required)
-            .map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))?;
-        // Only inspect the pinned library's actual allocation layout. No raw
-        // bucket access or copied private capacity/layout formula is used.
-        let (_, layout) = pages.raw_table().allocation_info();
-        let charge = match creator.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)
-        {
+            .map_err(|_| SystemError::ENOMEM)?;
+        let (pointer, layout) = pages.raw_table().allocation_info();
+        let charge = match unsafe {
+            heap::charge_existing_object(
+                creator,
+                KernelByteKind::SlabUnreclaimable,
+                pointer.as_ptr(),
+                layout,
+            )
+        } {
             Ok(charge) => charge,
+            Err(error)
+                if error.reason == crate::cgroup::memory::accounting::ChargeFailureReason::Max
+                    && heap::is_virtual(pointer.as_ptr())
+                    && HeapPlan::Physical.footprint(layout)
+                        < unsafe { heap::actual_footprint(pointer.as_ptr(), layout) } =>
+            {
+                drop_page_map(pages, None);
+                let mut direct_charge = creator.try_charge(
+                    HeapPlan::Physical.kind(KernelByteKind::SlabUnreclaimable, layout),
+                    HeapPlan::Physical.footprint(layout),
+                )?;
+                pages = AccountedPageMap::new_in(HeapPlanAllocator::Physical);
+                pages
+                    .try_reserve(required)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                let (direct_pointer, actual_layout) = pages.raw_table().allocation_info();
+                assert_eq!(
+                    actual_layout, layout,
+                    "same hashbrown capacity changed allocation layout"
+                );
+                unsafe {
+                    heap::finalize_object(
+                        direct_pointer.as_ptr(),
+                        actual_layout,
+                        KernelByteKind::SlabUnreclaimable,
+                        &mut direct_charge,
+                    )
+                };
+                direct_charge
+            }
             Err(error) => {
-                drop(pages);
-                return Err(MemoryAllocationError::Charge(error));
+                drop_page_map(pages, None);
+                return Err(error.into());
             }
         };
         Ok(Some(CacheTableCapacity {

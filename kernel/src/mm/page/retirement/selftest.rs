@@ -1016,10 +1016,14 @@ fn heap_denied_device_output_buffer() -> Result<bool, SystemError> {
     let passed = {
         let _scope = denial::Scope::enter(true);
         let before = denial::probe_denied();
-        let result = DeviceOutputBuffer::new(4112, |address| {
-            translated.set(true);
-            Some(address)
-        });
+        // Keep the allocation observable even when the result is rejected below.
+        let result = core::hint::black_box(DeviceOutputBuffer::new(
+            core::hint::black_box(4112),
+            |address| {
+                translated.set(true);
+                Some(address)
+            },
+        ));
         let rejected = matches!(result, Err(BufferError::OutOfMemory));
         let after = denial::probe_denied();
         before && after && rejected && !translated.get()

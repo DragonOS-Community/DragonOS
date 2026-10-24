@@ -243,7 +243,7 @@ impl InnerAddressSpace {
                 .ok_or(SystemError::ENOMEM)?,
         };
 
-        self.check_rlimit_as_for_region(region, page_count.bytes(), map_flags)?;
+        self.check_mmap_limits(region, vm_flags)?;
 
         let mut new_locked_vm = if vm_flags.contains(VmFlags::VM_LOCKED) {
             Some(

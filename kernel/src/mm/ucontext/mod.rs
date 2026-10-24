@@ -106,6 +106,7 @@ static MMAP_RESERVATION_ID_ALLOCATOR: AtomicU64 = AtomicU64::new(1);
 
 mod address_space;
 mod inner;
+mod limits;
 mod mapper;
 mod mappings;
 mod mmap;

@@ -560,7 +560,7 @@ impl InnerAddressSpace {
             new_len.saturating_sub(old_len)
         };
         if as_delta != 0 {
-            mremap_try!(self.check_rlimit_as_for_bytes(as_delta));
+            mremap_try!(self.check_vm_expansion(vm_flags, as_delta));
         }
 
         if old_len == 0 && !can_move {

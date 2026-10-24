@@ -1706,7 +1706,7 @@ impl AddressSpace {
             if vm_flags.is_mlock_flag_unsupported() {
                 vm_flags &= VmFlags::VM_LOCKED_CLEAR_MASK;
             }
-            if let Err(err) = guard.check_rlimit_as_for_region(region, len, map_flags) {
+            if let Err(err) = guard.check_mmap_limits(region, vm_flags) {
                 map_fail!(err);
             }
 
@@ -1768,7 +1768,7 @@ impl AddressSpace {
                 };
             }
 
-            let reservation_id = match guard.mappings.reserve_region(region) {
+            let reservation_id = match guard.mappings.reserve_region(region, vm_flags) {
                 Ok(reservation_id) => reservation_id,
                 Err(err) => map_fail!(err),
             };
@@ -2136,7 +2136,7 @@ impl AddressSpace {
                 InnerAddressSpace::notify_close_notifications(notifications);
                 return Err(err);
             }
-            let deferred_execute = guard.commit_mprotect(prepared);
+            let (deferred_execute, notifications, terminal_error) = guard.commit_mprotect(prepared);
             #[cfg(not(target_arch = "x86_64"))]
             let _ = deferred_execute;
             #[cfg(target_arch = "x86_64")]
@@ -2155,7 +2155,8 @@ impl AddressSpace {
             if let Some(uprobe_change) = uprobe_change {
                 uprobe_change.finish(self);
             }
-            return Ok(());
+            InnerAddressSpace::notify_close_notifications(notifications);
+            return terminal_error.map_or(Ok(()), Err);
         }
     }
 
@@ -2482,8 +2483,9 @@ impl AddressSpace {
                     continue;
                 }
             }
-            // A finite DATA growth check scans committed data VMAs. Serialize
-            // with in-flight file mappings, just as Linux's mmap write lock.
+            // Preserve brk ordering against in-flight file mmap commits, as
+            // Linux does with the mmap write lock. DATA admission also counts
+            // reservations for operations which do not wait.
             let data_limit = ProcessManager::current_pcb()
                 .get_rlimit(RLimitID::Data)
                 .rlim_cur as usize;

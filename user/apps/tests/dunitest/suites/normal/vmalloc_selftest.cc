@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdint>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,10 +33,11 @@ class VmallocSelftest : public ::testing::Test {
     }
 };
 
-constexpr std::array<const char*, 9> kChecks = {
+constexpr std::array<const char*, 17> kChecks = {
     "zero_alignment_cross_page", "allocation_domains", "partial_failure_rollback", "noncontiguous_backing",
     "shared_table_lifetime", "layout_boundaries", "accounting", "smp_visibility_reuse",
-    "completion_deadline",
+    "completion_deadline", "sparse_full_window", "global_header_footprint", "shared_parents_old_root",
+    "retirement_fifo", "charged_heap_plans", "default_global_heap", "atomic_global_retirement", "explicit_physical_owners",
 };
 
 std::string ReadFd(int fd, size_t chunk_size) {
@@ -105,6 +108,24 @@ bool BindCpu(int cpu) {
 
 }  // namespace
 
+TEST_F(VmallocSelftest, ReportsSparseCapacitySeparatelyFromResidentBacking) {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key, unit;
+    uint64_t value = 0, total = 0, used = 0;
+    bool saw_used = false;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "VmallocTotal:") total = value;
+        if (key == "VmallocUsed:") { used = value; saw_used = true; }
+    }
+#if defined(__x86_64__)
+    EXPECT_EQ(total, 128ULL * 1024 * 1024);
+#elif defined(__riscv)
+    EXPECT_EQ(total, 16ULL * 1024 * 1024);
+#endif
+    EXPECT_TRUE(saw_used);
+    EXPECT_LE(used, total);
+}
+
 TEST_F(VmallocSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
     const int fd = open(kSelftestPath, O_RDONLY);
     ASSERT_GE(fd, 0) << strerror(errno);
@@ -174,7 +195,13 @@ TEST_F(VmallocSelftest, ForkedAddressSpacesCanAllocateAndReuseSharedKernelMappin
             }
             const auto first = ReadReport();
             const auto second = ReadReport();
-            _exit(ReportOk(first) && first == second ? 0 : 12);
+            const bool ok = ReportOk(first) && first == second;
+            if (!ok) {
+                // Preserve the failing kernel case instead of only exit 12.
+                (void)write(STDERR_FILENO, first.data(), first.size());
+                (void)write(STDERR_FILENO, second.data(), second.size());
+            }
+            _exit(ok ? 0 : 12);
         }
         children.push_back(child);
     }

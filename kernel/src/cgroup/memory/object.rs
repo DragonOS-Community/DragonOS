@@ -47,6 +47,37 @@ impl ObjectCharge {
     pub(crate) fn owner(&self) -> &Arc<ObjectAccount> {
         &self.owner
     }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Finalize an unpublished allocation without another admission. Shared
+    /// objcg tail pages are refunded from the aggregate, not per allocation.
+    pub(crate) fn shrink_to(&mut self, kind: KernelByteKind, bytes: u64) {
+        assert!(bytes <= self.bytes, "allocation exceeded its admitted plan");
+        let mut state = self.owner.state.lock_irqsave();
+        state
+            .budget
+            .account()
+            .adjust_kernel_bytes(self.kind, self.bytes, false);
+        state.kinds[self.kind as usize] -= self.bytes;
+        state.bytes -= self.bytes - bytes;
+        state
+            .budget
+            .account()
+            .adjust_kernel_bytes(kind, bytes, true);
+        state.kinds[kind as usize] += bytes;
+        self.kind = kind;
+        self.bytes = bytes;
+        let excess = state.budget.pages() - pages(state.bytes);
+        drop(
+            state
+                .budget
+                .split_off(excess)
+                .expect("object budget covers live bytes"),
+        );
+    }
 }
 
 struct ObjectLink {
@@ -316,6 +347,61 @@ mod tests {
     }
 
     #[test]
+    fn finalized_receipt_keeps_reparented_account_and_class() {
+        let registry = ObjectRegistry::new();
+        let root = MemoryAccount::new(0x29911, None).unwrap();
+        let leaf = MemoryAccount::new(0x29912, Some(root.clone())).unwrap();
+        let owner = ObjectAccount::new_in(&leaf, &registry).unwrap();
+        let mut receipt = owner
+            .try_charge(KernelByteKind::Vmalloc, 2 * PAGE_BYTES + 1)
+            .unwrap();
+        registry.offline(&leaf).unwrap();
+        receipt.shrink_to(KernelByteKind::KernelOther, PAGE_BYTES);
+        assert_eq!(leaf.current_pages(), 0);
+        assert_eq!(leaf.snapshot().kernel_bytes, [0; KERNEL_BYTE_KIND_COUNT]);
+        assert_eq!(root.current_pages(), 1);
+        assert_eq!(
+            root.snapshot().kernel_bytes[KernelByteKind::KernelOther as usize],
+            PAGE_BYTES
+        );
+        assert_eq!(
+            root.snapshot().kernel_bytes[KernelByteKind::Vmalloc as usize],
+            0
+        );
+        drop(receipt);
+        assert_eq!(root.current_pages(), 0);
+    }
+
+    #[test]
+    fn shrink_reclassifies_bytes_and_refunds_only_aggregate_tail() {
+        let root = MemoryAccount::new(0x29901, None).unwrap();
+        let owner = ObjectAccount::new(&root).unwrap();
+        let mut first = owner
+            .try_charge(KernelByteKind::SlabUnreclaimable, PAGE_BYTES + 1)
+            .unwrap();
+        let tail = owner
+            .try_charge(KernelByteKind::SlabUnreclaimable, 1)
+            .unwrap();
+        first.shrink_to(KernelByteKind::Vmalloc, PAGE_BYTES);
+        assert_eq!(root.current_pages(), 2);
+        first.shrink_to(KernelByteKind::Vmalloc, PAGE_BYTES - 1);
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.current, 1);
+        assert_eq!(
+            snapshot.kernel_bytes[KernelByteKind::Vmalloc as usize],
+            PAGE_BYTES - 1
+        );
+        assert_eq!(
+            snapshot.kernel_bytes[KernelByteKind::SlabUnreclaimable as usize],
+            1
+        );
+        drop(first);
+        assert_eq!(root.current_pages(), 1);
+        drop(tail);
+        assert_eq!(root.current_pages(), 0);
+    }
+
+    #[test]
     fn concurrent_mixed_byte_charges_share_and_release_the_same_budget() {
         let registry = ObjectRegistry::new();
         let root = MemoryAccount::new(1, None).unwrap();
@@ -423,7 +509,7 @@ mod tests {
         assert_eq!(root.snapshot().current, 3);
         assert_eq!(
             root.snapshot().kernel_bytes,
-            [PAGE_BYTES + 1, PAGE_BYTES - 1, 0, 0, 0]
+            [PAGE_BYTES + 1, PAGE_BYTES - 1, 0, 0, 0, 0]
         );
         drop(old_charge);
         drop(fresh_charge);
@@ -536,7 +622,10 @@ mod tests {
         assert_empty(&leaf);
         assert_empty(&parent);
         assert_eq!(root.snapshot().current, 2);
-        assert_eq!(root.snapshot().kernel_bytes, [0, 0, PAGE_BYTES + 1, 0, 0]);
+        assert_eq!(
+            root.snapshot().kernel_bytes,
+            [0, 0, PAGE_BYTES + 1, 0, 0, 0]
+        );
         drop(charge);
         assert_empty(&root);
     }
@@ -566,7 +655,10 @@ mod tests {
             .try_charge(KernelByteKind::PageTables, PAGE_BYTES)
             .unwrap();
         assert_eq!(root.snapshot().current, PAGE_COUNTER_MAX);
-        assert_eq!(root.snapshot().kernel_bytes, [0, PAGE_BYTES, 0, a_bytes, 0]);
+        assert_eq!(
+            root.snapshot().kernel_bytes,
+            [0, PAGE_BYTES, 0, a_bytes, 0, 0]
+        );
         assert_eq!(
             second
                 .try_charge(KernelByteKind::Stack, 1)
@@ -574,7 +666,10 @@ mod tests {
                 .reason,
             ChargeFailureReason::CounterOverflow
         );
-        assert_eq!(root.snapshot().kernel_bytes, [0, PAGE_BYTES, 0, a_bytes, 0]);
+        assert_eq!(
+            root.snapshot().kernel_bytes,
+            [0, PAGE_BYTES, 0, a_bytes, 0, 0]
+        );
         assert_eq!(second.state.lock_irqsave().bytes, PAGE_BYTES);
         drop(b);
         let replacement = second
@@ -607,7 +702,10 @@ mod tests {
             .unwrap();
         assert_eq!(leaf.snapshot().current, 1);
         assert!(object.try_charge(KernelByteKind::Stack, 1).is_err());
-        assert_eq!(leaf.snapshot().kernel_bytes, [0, 0, PAGE_BYTES - 64, 64, 0]);
+        assert_eq!(
+            leaf.snapshot().kernel_bytes,
+            [0, 0, PAGE_BYTES - 64, 64, 0, 0]
+        );
         drop(a);
         assert_eq!(leaf.snapshot().current, 1);
         drop(b);
@@ -639,7 +737,7 @@ mod tests {
         assert_eq!(root.snapshot().current, 3);
         assert_eq!(
             root.snapshot().kernel_bytes,
-            [2 * PAGE_BYTES, PAGE_BYTES, 0, 0, 0]
+            [2 * PAGE_BYTES, PAGE_BYTES, 0, 0, 0, 0]
         );
         drop(stack);
         drop(table);

@@ -101,6 +101,26 @@ impl MeminfoFileOps {
                 .to_owned(),
         );
 
+        // Vmalloc backing is ordinary RAM, but is not a slab cache. Keep it
+        // separate from Slab and count deferred frees until their TLB barrier.
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            data.extend_from_slice(
+                format!(
+                    "VmallocTotal:\t{} kB\n",
+                    crate::mm::vmalloc::capacity_bytes() >> 10
+                )
+                .as_bytes(),
+            );
+            data.extend_from_slice(
+                format!(
+                    "VmallocUsed:\t{} kB\n",
+                    crate::mm::vmalloc::usage_bytes() >> 10
+                )
+                .as_bytes(),
+            );
+        }
+
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut data);
 

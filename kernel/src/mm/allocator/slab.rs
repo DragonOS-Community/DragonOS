@@ -76,9 +76,9 @@ impl SlabAllocator {
     }
 }
 
-/// Allocates backing storage without holding SLABALLOCATOR: buddy OOM retry can
-/// wake the reclaim task, whose scheduling must not recursively take this lock.
-pub(super) unsafe fn allocate(layout: Layout) -> *mut u8 {
+/// Prepare backing outside SLABALLOCATOR, through the explicit physical path.
+/// This is also the raw metadata path, so refill must never enter GlobalAlloc.
+pub(super) unsafe fn allocate(layout: Layout, no_retry: bool) -> *mut u8 {
     let first = {
         let mut guard = SLABALLOCATOR.lock_irqsave();
         let Some(slab) = guard.as_mut() else {
@@ -92,7 +92,14 @@ pub(super) unsafe fn allocate(layout: Layout) -> *mut u8 {
         Err(AllocationError::OutOfMemory) => {}
     }
 
-    let mut spare = ObjectPage::try_new().ok();
+    let raw = KERNEL_ALLOCATOR.alloc_physical(Layout::new::<ObjectPage>(), false, no_retry);
+    let mut spare = if raw.is_null() {
+        None
+    } else {
+        Some(ObjectPage::init_boxed(Box::from_raw(
+            raw.cast::<core::mem::MaybeUninit<ObjectPage>>(),
+        )))
+    };
     let result = {
         let mut guard = SLABALLOCATOR.lock_irqsave();
         match guard.as_mut() {

@@ -406,7 +406,7 @@ impl Cgroup2Inode {
         {
             let mut inner = dir.inner.lock();
             if let Cgroup2InodeKind::Dir { children, .. } = &mut inner.kind {
-                for entry in children.drain_filter(|_, child| {
+                for entry in children.extract_if(|_, child| {
                     let child_inner = child.inner.lock();
                     match &child_inner.kind {
                         Cgroup2InodeKind::File {

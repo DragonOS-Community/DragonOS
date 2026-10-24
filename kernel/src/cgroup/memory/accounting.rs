@@ -54,7 +54,7 @@ pub(crate) enum KernelByteKind {
     SlabUnreclaimable,
     /// Buddy-backed kernel allocations, not slab and not socket data.
     KernelOther,
-    /// Actual ordinary RAM backing of explicit virtual allocations.
+    /// Actual ordinary RAM backing and exclusive metadata of virtual allocations.
     Vmalloc,
 }
 

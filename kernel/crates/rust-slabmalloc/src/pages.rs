@@ -289,7 +289,11 @@ impl<'a> ObjectPage<'a> {
 
     /// Allocate a slab page without aborting when its backing allocation fails.
     pub fn try_new() -> Result<Box<ObjectPage<'a>>, alloc::alloc::AllocError> {
-        let mut page = Box::<ObjectPage<'a>>::try_new_uninit()?;
+        Ok(Self::init_boxed(Box::<ObjectPage<'a>>::try_new_uninit()?))
+    }
+
+    /// Initialize already allocated storage without recursively allocating a page.
+    pub fn init_boxed(mut page: Box<MaybeUninit<Self>>) -> Box<Self> {
         unsafe {
             // The data area is intentionally uninitialized object storage.  It
             // is wrapped in MaybeUninit so constructing ObjectPage is sound;
@@ -303,7 +307,7 @@ impl<'a> ObjectPage<'a> {
             core::ptr::addr_of_mut!((*raw)._state_pad).write([0; 7]);
             core::ptr::addr_of_mut!((*raw).bitfield)
                 .write(core::array::from_fn(|_| AtomicU64::new(0)));
-            Ok(page.assume_init())
+            page.assume_init()
         }
     }
 }

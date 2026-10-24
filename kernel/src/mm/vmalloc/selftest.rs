@@ -27,12 +27,14 @@ use crate::{
 pub(super) struct AllocationTest {
     remaining: Option<usize>,
     pub(super) isolated: bool,
+    pub(super) bounds: Option<(usize, usize)>,
 }
 impl AllocationTest {
     pub(super) const fn ordinary() -> Self {
         Self {
             remaining: None,
             isolated: false,
+            bounds: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl AllocationTest {
         Self {
             remaining,
             isolated: true,
+            bounds: None,
         }
     }
 
@@ -57,9 +60,11 @@ impl AllocationTest {
 pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn used_pages() -> usize {
-    POOL.lock_irqsave().used[SELFTEST_START / 64..]
+    POOL.lock_irqsave()
+        .occupied
         .iter()
-        .map(|word| word.count_ones() as usize)
+        .filter(|(start, _)| **start >= SELFTEST_START)
+        .map(|(start, reservation)| reservation.end - start)
         .sum()
 }
 
@@ -218,20 +223,24 @@ fn shared_table() -> bool {
     if slot != second.start / TABLE_PAGES {
         return false;
     }
-    let Some(table_frame) = POOL.lock_irqsave().tables[slot]
-        .as_ref()
+    let Some(table_frame) = POOL
+        .lock_irqsave()
+        .tables
+        .get(&slot)
         .map(|table| table.frame)
     else {
         return false;
     };
     second.as_mut_slice().fill(0x95);
     drop(first);
-    let retained = POOL.lock_irqsave().tables[slot]
-        .as_ref()
+    let retained = POOL
+        .lock_irqsave()
+        .tables
+        .get(&slot)
         .is_some_and(|table| table.frame == table_frame);
     let intact = second.as_slice().iter().all(|byte| *byte == 0x95);
     drop(second);
-    let reclaimed = POOL.lock_irqsave().tables[slot].is_none();
+    let reclaimed = POOL.lock_irqsave().tables.get(&slot).is_none();
     retained && intact && reclaimed && concurrent_allocations()
 }
 
@@ -366,8 +375,10 @@ fn accounting() -> bool {
         return false;
     };
     let snapshot = account.snapshot();
-    let metadata = (pages.div_ceil(CHUNK) as u64)
-        * crate::mm::allocator::kernel_allocator::allocation_footprint(Layout::new::<Chunk>());
+    let metadata = (pages.div_ceil(CHUNK) as u64) * allocation_footprint(Layout::new::<Chunk>())
+        + allocation_footprint(Layout::new::<AllocationRecord>())
+        + allocation_footprint(ReservationNode::allocation_layout())
+        + allocation_footprint(TableNode::allocation_layout());
     let expected_bytes = bytes as u64 + MMArch::PAGE_SIZE as u64 + metadata;
     let charged = snapshot.kernel_bytes[KernelByteKind::Vmalloc as usize] == bytes as u64
         && snapshot.kernel_bytes[KernelByteKind::PageTables as usize] == MMArch::PAGE_SIZE as u64
@@ -383,9 +394,17 @@ fn accounting() -> bool {
 
 fn admission_failures(root: &Arc<MemoryAccount>, layout: Layout, pages: usize) -> bool {
     let baseline = used_pages();
-    // Max=0 rejects backing; exactly backing rejects the first metadata node;
-    // backing + one metadata page admits the first node and rejects its table.
-    for (limit, expected_data_calls) in [(0, 0), (pages as u64, 0), (pages as u64 + 1, 1)] {
+    // Max=0 rejects data; exactly data rejects record metadata; the next
+    // budget admits all independent metadata but rejects the shared table PFN.
+    let initial_metadata = allocation_footprint(Layout::new::<AllocationRecord>())
+        + allocation_footprint(ReservationNode::allocation_layout())
+        + allocation_footprint(Layout::new::<Chunk>());
+    let before_table = (pages * MMArch::PAGE_SIZE) as u64 + initial_metadata;
+    for (limit, expected_data_calls) in [
+        (0, 0),
+        (pages as u64, 0),
+        (before_table.div_ceil(MMArch::PAGE_SIZE as u64), 1),
+    ] {
         let Ok(child) = MemoryAccount::new(u64::MAX - 2, Some(root.clone())) else {
             return false;
         };
@@ -641,15 +660,206 @@ fn completion_deadline() -> bool {
     observed && joined
 }
 
+// Create a user root before mapping into both sides of a distant 1 GiB
+// boundary and the final page. Real RAM consumption is at most two data pages.
+fn shared_parents_old_root() -> bool {
+    let Ok(old_root) = MMArch::setup_new_usermapper(None) else {
+        return false;
+    };
+    let Ok(account) = MemoryAccount::new(u64::MAX - 17, None) else {
+        return false;
+    };
+    let Ok(owner) = ObjectAccount::prepare(&account) else {
+        return false;
+    };
+    let boundary = PAGES - (1 << 30) / MMArch::PAGE_SIZE;
+    for (low, high) in [(boundary - 1, boundary + 1), (PAGES - 1, PAGES)] {
+        let mut test = AllocationTest::isolated(None);
+        test.bounds = Some((low, high));
+        let pages = high - low;
+        let layout = Layout::from_size_align(pages * MMArch::PAGE_SIZE, MMArch::PAGE_SIZE).unwrap();
+        let Ok(mut allocation) = VmAllocation::allocate_owned(
+            layout,
+            pages,
+            &mut test,
+            &mut frame_zeroed,
+            owner.object_account(),
+        ) else {
+            return false;
+        };
+        if allocation.start != low {
+            return false;
+        }
+        allocation.as_mut_slice().fill(0x6d);
+        for page in 0..pages {
+            let address = allocation.address() + page * MMArch::PAGE_SIZE;
+            if old_root.utable.translate(address).map(|(frame, _)| frame)
+                != Some(allocation.chunks.as_ref().unwrap().frames[page])
+                || unsafe { core::ptr::read_volatile(address.as_ptr::<u8>()) } != 0x6d
+            {
+                return false;
+            }
+        }
+        let address = allocation.address();
+        drop(allocation);
+        if old_root.utable.translate(address).is_some() || account.current_pages() != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+// Exercise the entire VA capacity using only a tiny sparse index; no backing
+// RAM is needed to prove that reservations can exceed the former 1 GiB limit.
+fn sparse_full_window() -> bool {
+    let mut pool = Pool {
+        occupied: RBTree::new(),
+        tables: RBTree::new(),
+        ready: true,
+    };
+    if pool.find_free(PAGES, MMArch::PAGE_SIZE, 0, 0, PAGES) != Some(0) {
+        return false;
+    }
+    let Ok(node) = (unsafe {
+        ReservationNode::try_new_with(
+            0,
+            Reservation {
+                end: PAGES - 2,
+                charge: None,
+            },
+            |layout| KERNEL_ALLOCATOR.alloc_metadata(layout),
+        )
+    }) else {
+        return false;
+    };
+    pool.occupied.insert_prepared(node);
+    let found = pool.find_free(2, MMArch::PAGE_SIZE, 0, 0, PAGES) == Some(PAGES - 2)
+        && pool.find_free(3, MMArch::PAGE_SIZE, 0, 0, PAGES).is_none();
+    let node = pool.occupied.extract(&0).unwrap();
+    drop(node);
+    found && pool.find_free(PAGES, MMArch::PAGE_SIZE, 0, 0, PAGES) == Some(0)
+}
+
+fn global_header_footprint() -> bool {
+    for align in [
+        1,
+        core::mem::align_of::<usize>(),
+        MMArch::PAGE_SIZE,
+        2 << 20,
+    ] {
+        let layout = Layout::from_size_align(3 * MMArch::PAGE_SIZE + 17, align).unwrap();
+        let Some(expected) = global_footprint(layout) else {
+            return false;
+        };
+        let pointer = try_global_alloc(layout);
+        if pointer.is_null() {
+            return false;
+        }
+        let valid = unsafe {
+            (pointer as usize).is_multiple_of(align)
+                && actual_global_footprint(pointer) == expected
+                && core::slice::from_raw_parts(pointer, layout.size())
+                    .iter()
+                    .all(|byte| *byte == 0)
+        };
+        unsafe {
+            core::ptr::write_bytes(pointer, 0x75, layout.size());
+            global_dealloc(pointer);
+        }
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
+
+// Private records contain no mapped resources. This exercises the actual
+// intrusive queue, including producers arriving between worker pops.
+fn retirement_fifo() -> bool {
+    fn record(id: usize) -> Result<Box<AllocationRecord>, SystemError> {
+        unsafe {
+            metadata_box(AllocationRecord {
+                start: 0,
+                pages: 0,
+                len: id,
+                payload_offset: 0,
+                reserved: false,
+                chunks: None,
+                charge: None,
+                metadata_charge: None,
+                attached_charge: None,
+                next_retired: 0,
+                #[cfg(target_arch = "x86_64")]
+                teardown_observer: None,
+            })
+        }
+    }
+    let Ok(first) = record(1) else {
+        return false;
+    };
+    let Ok(second) = record(2) else {
+        return false;
+    };
+    let Ok(third) = record(3) else {
+        return false;
+    };
+    let Ok(fourth) = record(4) else {
+        return false;
+    };
+    let mut queue = RetiredQueue::new();
+    let mut correct = queue.pop().is_none();
+    queue.push(first);
+    queue.push(second);
+    correct &= queue
+        .pop()
+        .is_some_and(|record| record.len == 1 && record.next_retired == 0);
+    queue.push(third);
+    correct &= queue
+        .pop()
+        .is_some_and(|record| record.len == 2 && record.next_retired == 0);
+    correct &= queue
+        .pop()
+        .is_some_and(|record| record.len == 3 && record.next_retired == 0);
+    correct &= queue.is_empty() && queue.head == 0 && queue.tail == 0;
+    queue.push(fourth);
+    correct &= queue
+        .pop()
+        .is_some_and(|record| record.len == 4 && record.next_retired == 0);
+    correct &= queue.pop().is_none();
+    // Keep failure diagnostics allocation-free and never abandon a linked Box.
+    while let Some(record) = queue.pop() {
+        drop(record);
+        correct = false;
+    }
+    correct && queue.head == 0 && queue.tail == 0
+}
+
 pub(crate) fn report() -> String {
     let _serial = TEST_LOCK.lock();
     let cases = [
+        ("charged_heap_plans", crate::mm::allocator::heap::selftest()),
+        ("retirement_fifo", retirement_fifo()),
         ("zero_alignment_cross_page", basic()),
         ("allocation_domains", allocation_domains()),
         ("partial_failure_rollback", rollback()),
         ("noncontiguous_backing", noncontiguous()),
         ("shared_table_lifetime", shared_table()),
         ("layout_boundaries", boundaries()),
+        ("sparse_full_window", sparse_full_window()),
+        ("global_header_footprint", global_header_footprint()),
+        ("shared_parents_old_root", shared_parents_old_root()),
+        (
+            "default_global_heap",
+            crate::mm::allocator::selftest::default_heap(),
+        ),
+        (
+            "atomic_global_retirement",
+            crate::mm::allocator::selftest::atomic_retirement(),
+        ),
+        (
+            "explicit_physical_owners",
+            crate::mm::allocator::physical::check_physical_owners().unwrap_or(false),
+        ),
         ("accounting", accounting()),
         ("smp_visibility_reuse", smp_visibility()),
         ("completion_deadline", completion_deadline()),

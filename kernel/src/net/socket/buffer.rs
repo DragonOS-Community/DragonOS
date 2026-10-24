@@ -2,6 +2,7 @@
 //! All preparation uses explicit birth accounts outside resource locks; the
 //! resulting owner only exposes a slice, never an unaccounted resize API.
 
+use crate::mm::allocator::heap::{self, AllocationCharge};
 use alloc::{boxed::Box, sync::Arc};
 use core::alloc::Layout;
 use system_error::SystemError;
@@ -14,7 +15,7 @@ use crate::{
         socket::{SockAccount, SockCharge},
         MemoryAccount,
     },
-    mm::{allocation::MemoryAllocationError, allocator::kernel_allocator::allocation_footprint},
+    mm::allocation::MemoryAllocationError,
 };
 
 /// Socket birth captures task context once; subsequent ingress, interface
@@ -39,7 +40,15 @@ impl SocketMemory {
 struct SockBufferBody<T> {
     // Declaration order is physical backing first, then its unique receipt.
     storage: Box<[T]>,
-    charge: SockCharge,
+    charge: Option<SockCharge>,
+}
+
+impl<T> Drop for SockBufferBody<T> {
+    fn drop(&mut self) {
+        let storage =
+            core::mem::replace(&mut self.storage, alloc::vec::Vec::new().into_boxed_slice());
+        heap::drop_box(storage, self.charge.take().map(AllocationCharge::Socket));
+    }
 }
 
 /// The erased trait box only holds this thin identity. The body Box and the
@@ -61,9 +70,11 @@ impl<T: Copy> SockBuffer<T> {
             OwnedBox::<SockBufferBody<T>>::prepare(creator, KernelByteKind::SlabUnreclaimable)?
                 .try_allocate()
                 .map_err(|_| SystemError::ENOMEM)?;
-        let charge = sock.try_charge(allocation_footprint(layout))?;
-        let mut storage =
-            Box::<[T]>::try_new_uninit_slice(capacity).map_err(|_| SystemError::ENOMEM)?;
+        let (plan, mut charge) = heap::socket_plan(sock, layout)?;
+        let mut storage = unsafe { heap::uninit_slice::<T>(plan, capacity, charge.bytes()) }
+            .map_err(|_| SystemError::ENOMEM)?;
+        unsafe { charge.shrink_to(heap::actual_footprint(storage.as_mut_ptr().cast(), layout)) };
+
         for slot in storage.iter_mut() {
             slot.write(initial);
         }
@@ -71,12 +82,18 @@ impl<T: Copy> SockBuffer<T> {
         // clone or destructor side effect; no resource is published yet.
         let storage = unsafe { storage.assume_init() };
         Ok(Self {
-            body: body.init(SockBufferBody { storage, charge }),
+            body: body.init(SockBufferBody {
+                storage,
+                charge: Some(charge),
+            }),
         })
     }
 
     pub fn charge_mut(&mut self) -> &mut SockCharge {
-        &mut self.body.charge
+        self.body
+            .charge
+            .as_mut()
+            .expect("live socket backing receipt")
     }
 }
 
@@ -125,7 +142,18 @@ pub(crate) fn try_owned_packet_buffer<H: Copy + core::fmt::Debug + Send + Sync +
 #[derive(Debug)]
 struct SocketSetBufferBody {
     slots: Box<[smoltcp::iface::SocketStorage<'static>]>,
-    _backing_charge: ObjectCharge,
+    _backing_charge: Option<ObjectCharge>,
+}
+
+impl Drop for SocketSetBufferBody {
+    fn drop(&mut self) {
+        let storage =
+            core::mem::replace(&mut self.slots, alloc::vec::Vec::new().into_boxed_slice());
+        heap::drop_box(
+            storage,
+            self._backing_charge.take().map(AllocationCharge::Object),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -158,10 +186,18 @@ pub(crate) fn try_socket_set_storage(
         OwnedBox::<SocketSetBufferBody>::prepare(creator, KernelByteKind::SlabUnreclaimable)?
             .try_allocate()
             .map_err(|_| SystemError::ENOMEM)?;
-    let backing_charge =
-        creator.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
-    let mut slots =
-        Box::<[Slot]>::try_new_uninit_slice(capacity).map_err(|_| SystemError::ENOMEM)?;
+    let (plan, mut backing_charge) =
+        heap::object_plan(creator, KernelByteKind::SlabUnreclaimable, layout)?;
+    let mut slots = unsafe { heap::uninit_slice::<Slot>(plan, capacity, backing_charge.bytes()) }
+        .map_err(|_| SystemError::ENOMEM)?;
+    unsafe {
+        heap::finalize_object(
+            slots.as_mut_ptr().cast(),
+            layout,
+            KernelByteKind::SlabUnreclaimable,
+            &mut backing_charge,
+        )
+    };
     for slot in slots.iter_mut() {
         slot.write(Slot::EMPTY);
     }
@@ -170,7 +206,7 @@ pub(crate) fn try_socket_set_storage(
     let storage = SocketSetBuffer {
         body: body.init(SocketSetBufferBody {
             slots,
-            _backing_charge: backing_charge,
+            _backing_charge: Some(backing_charge),
         }),
     };
     Ok(smoltcp::iface::SocketSetStorage::from_owned(

@@ -2,8 +2,9 @@
 //! capacity, not requested user length or the stack-resident Vec header.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::{alloc::Layout, mem};
+use core::mem;
 
+use crate::mm::allocator::heap::{self, AllocationCharge};
 use crate::{
     cgroup::memory::{
         accounting::KernelByteKind,
@@ -11,7 +12,6 @@ use crate::{
     },
     mm::allocation::MemoryAllocationError,
 };
-use system_error::SystemError;
 
 pub(super) struct WriteBuffer {
     storage: Vec<u8>,
@@ -34,17 +34,12 @@ impl WriteBuffer {
         if self.storage.capacity() >= needed {
             return Ok(());
         }
-        let layout = Layout::array::<u8>(needed).map_err(|_| SystemError::ENOMEM)?;
-        let charge = creator.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
-        let mut candidate = Vec::new();
-        candidate
-            .try_reserve_exact(needed)
-            .map_err(|_| SystemError::ENOMEM)?;
+        let (mut candidate, charge) =
+            heap::object_vec::<u8>(creator, KernelByteKind::SlabUnreclaimable, needed)?;
         candidate.extend_from_slice(&self.storage);
         let old_storage = mem::replace(&mut self.storage, candidate);
         let old_charge = self.charge.replace(charge);
-        drop(old_storage);
-        drop(old_charge);
+        heap::drop_vec(old_storage, old_charge.map(AllocationCharge::Object));
         Ok(())
     }
 
@@ -66,7 +61,9 @@ impl WriteBuffer {
 
 impl Drop for WriteBuffer {
     fn drop(&mut self) {
-        drop(mem::take(&mut self.storage));
-        drop(self.charge.take());
+        heap::drop_vec(
+            mem::take(&mut self.storage),
+            self.charge.take().map(AllocationCharge::Object),
+        );
     }
 }

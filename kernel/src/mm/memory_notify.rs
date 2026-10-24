@@ -217,6 +217,10 @@ fn notification_loop() -> i32 {
             if crate::mm::cpu_buffer::drain_retired() {
                 WORK_PENDING.store(true, Ordering::Release);
             }
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+            if crate::mm::vmalloc::drain_retired() {
+                WORK_PENDING.store(true, Ordering::Release);
+            }
         }
         // Producers store pending before notifying this permanent waiter.
         // The existing consume/prepare/block/recheck handshake closes both

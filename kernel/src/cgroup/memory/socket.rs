@@ -34,6 +34,30 @@ pub(crate) struct SockCharge {
     bytes: u64,
 }
 
+impl SockCharge {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Preserve the socket's birth account and refund only aggregate tail pages.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        assert!(
+            bytes <= self.bytes,
+            "socket allocation exceeded its admitted plan"
+        );
+        let mut state = self.owner.state.lock_irqsave();
+        state.bytes -= self.bytes - bytes;
+        self.bytes = bytes;
+        let excess = state.budget.pages() - pages(state.bytes);
+        drop(
+            state
+                .budget
+                .split_off(excess)
+                .expect("socket stock covers live storage"),
+        );
+    }
+}
+
 fn pages(bytes: u64) -> u64 {
     bytes / PAGE_BYTES + u64::from(!bytes.is_multiple_of(PAGE_BYTES))
 }
@@ -164,6 +188,26 @@ mod tests {
         let leaf = MemoryAccount::new(2, Some(root.clone())).unwrap();
         let socket = new_socket(&leaf);
         (root, leaf, socket)
+    }
+
+    #[test]
+    fn shrink_preserves_birth_and_shared_tail() {
+        let (_, leaf, socket) = child();
+        let mut first = socket.try_charge(PAGE_BYTES + 1).unwrap();
+        let tail = socket.try_charge(1).unwrap();
+        first.shrink_to(PAGE_BYTES);
+        assert_eq!(leaf.current_pages(), 2);
+        first.shrink_to(PAGE_BYTES - 1);
+        assert_eq!(leaf.current_pages(), 1);
+        assert!(Arc::ptr_eq(&first.owner, &socket));
+        assert_eq!(
+            leaf.snapshot().kernel_bytes,
+            [0; super::super::accounting::KERNEL_BYTE_KIND_COUNT]
+        );
+        drop(first);
+        assert_eq!(leaf.current_pages(), 1);
+        drop(tail);
+        assert_eq!(leaf.current_pages(), 0);
     }
 
     #[test]

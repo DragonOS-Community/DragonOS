@@ -19,7 +19,7 @@ impl<T: fmt::Debug> fmt::Debug for Node<T> {
 }
 
 impl<T> Node<T> {
-    pub(crate) fn allocation_layout() -> core::alloc::Layout {
+    pub(crate) const fn allocation_layout() -> core::alloc::Layout {
         core::alloc::Layout::new::<Self>()
     }
 

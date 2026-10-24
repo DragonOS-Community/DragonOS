@@ -43,6 +43,16 @@ pub(crate) type SourceNode = PreparedNode<u64, Registration>;
 pub(crate) type ReadyNode = Box<Node<Registration>>;
 pub(crate) type ReadyQueue = Queue<Registration>;
 
+// These receipts move out of their nodes before destruction. Keep the nodes
+// within the default heap's synchronous direct policy; large owners use the
+// explicit receipt-transfer helpers instead.
+const _: () = {
+    let source = SourceNode::allocation_layout();
+    let ready = Node::<Registration>::allocation_layout();
+    assert!(!crate::mm::allocator::heap::HeapPlan::prefers_virtual_layout(source));
+    assert!(!crate::mm::allocator::heap::HeapPlan::prefers_virtual_layout(ready));
+};
+
 #[derive(Debug)]
 pub(crate) struct RegistrationLinks {
     sources: [Option<SourceNode>; SOURCE_LINKS],

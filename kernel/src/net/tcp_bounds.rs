@@ -1,4 +1,5 @@
 //! Strong notification ownership with pre-reserved, physically accounted slots.
+use crate::mm::allocator::heap::{self, AllocationCharge};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use system_error::SystemError;
@@ -107,13 +108,8 @@ impl Storage {
         creator: &Arc<ObjectAccount>,
         capacity: usize,
     ) -> Result<Self, MemoryAllocationError> {
-        let layout =
-            core::alloc::Layout::array::<Slot>(capacity).map_err(|_| SystemError::EOVERFLOW)?;
-        let charge = creator.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(capacity)
-            .map_err(|_| SystemError::ENOMEM)?;
+        let (mut slots, charge) =
+            heap::object_vec::<Slot>(creator, KernelByteKind::SlabUnreclaimable, capacity)?;
         for _ in 0..capacity {
             slots.push(Slot::Vacant);
         }
@@ -121,6 +117,15 @@ impl Storage {
             slots,
             _charge: Some(charge),
         })
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        heap::drop_vec(
+            core::mem::take(&mut self.slots),
+            self._charge.take().map(AllocationCharge::Object),
+        );
     }
 }
 

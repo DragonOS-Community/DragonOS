@@ -5,8 +5,9 @@ use crate::{
         kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
     },
     init::{boot::BootloaderAcpiArg, boot_params},
-    libs::align::{page_align_down, page_align_up, AlignedBox},
+    libs::align::{page_align_down, page_align_up},
     mm::{
+        allocator::physical::PhysicalBox,
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
         MemoryManagementArch, PhysAddr, VirtAddr,
     },
@@ -29,7 +30,11 @@ static mut __ACPI_TABLE: Option<acpi::AcpiTables<AcpiHandlerImpl>> = None;
 /// `/sys/firmware/acpi`的kobject实例
 static mut ACPI_KOBJECT_INSTANCE: Option<Arc<CommonKobj>> = None;
 
-static mut RSDP_TMP_BOX: Option<AlignedBox<[u8; 4096], 4096>> = None;
+#[repr(C, align(4096))]
+#[derive(Debug)]
+struct RsdpPage([u8; 4096]);
+
+static mut RSDP_TMP_BOX: Option<PhysicalBox<RsdpPage>> = None;
 
 #[inline(always)]
 pub fn acpi_manager() -> &'static AcpiManager {
@@ -122,7 +127,11 @@ impl AcpiManager {
     /// RSDP物理地址
     fn rsdp_paddr(rsdp_instance: &acpi::rsdp::Rsdp) -> PhysAddr {
         unsafe {
-            RSDP_TMP_BOX = Some(AlignedBox::new_zeroed().expect("rs_acpi_init(): failed to alloc"))
+            RSDP_TMP_BOX = Some(
+                PhysicalBox::<RsdpPage>::try_new_zeroed()
+                    .expect("rs_acpi_init(): failed to alloc")
+                    .assume_init(),
+            )
         };
 
         let size = core::mem::size_of::<acpi::rsdp::Rsdp>();
@@ -132,13 +141,8 @@ impl AcpiManager {
                 size,
             )
         };
-        unsafe { RSDP_TMP_BOX.as_mut().unwrap()[0..size].copy_from_slice(tmp_data) };
-        let rsdp_paddr = unsafe {
-            MMArch::virt_2_phys(VirtAddr::new(
-                RSDP_TMP_BOX.as_ref().unwrap().as_ptr() as usize
-            ))
-            .unwrap()
-        };
+        unsafe { RSDP_TMP_BOX.as_mut().unwrap().as_mut().0[0..size].copy_from_slice(tmp_data) };
+        let rsdp_paddr = unsafe { RSDP_TMP_BOX.as_ref().unwrap().phys_addr().unwrap() };
 
         return rsdp_paddr;
     }

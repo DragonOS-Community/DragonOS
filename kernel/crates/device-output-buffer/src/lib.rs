@@ -124,8 +124,8 @@ struct DmaIdentity {
 /// The backing bytes are initialized once at allocation because virtio-drivers currently accepts
 /// `&mut [u8]`, not `MaybeUninit<u8>`. Reuse makes the bytes logically uninitialized: no safe byte
 /// accessor exists until `complete_after_pop` accepts the used length.
-pub struct DeviceOutputBuffer {
-    backing: ManuallyDrop<Box<[u8]>>,
+pub struct DeviceOutputBuffer<B: AsRef<[u8]> + AsMut<[u8]> = Box<[u8]>> {
+    backing: ManuallyDrop<B>,
     allocation_identity: DmaIdentity,
     writable_len: usize,
     initialized_len: usize,
@@ -133,7 +133,7 @@ pub struct DeviceOutputBuffer {
     state: BufferState,
 }
 
-impl core::fmt::Debug for DeviceOutputBuffer {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> core::fmt::Debug for DeviceOutputBuffer<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DeviceOutputBuffer")
             .field("allocation_len", &self.allocation_len())
@@ -145,7 +145,7 @@ impl core::fmt::Debug for DeviceOutputBuffer {
 }
 
 impl DeviceOutputBuffer {
-    pub fn new<F>(len: usize, mut virt_to_phys: F) -> Result<Self, BufferError>
+    pub fn new<F>(len: usize, virt_to_phys: F) -> Result<Self, BufferError>
     where
         F: FnMut(usize) -> Option<usize>,
     {
@@ -163,7 +163,28 @@ impl DeviceOutputBuffer {
         // allocator used by Box. Every byte is initialized; this is the sole
         // owner. Keep ordinary Box cleanup until address translation succeeds.
         let backing = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(raw, len)) };
-        let vaddr = backing.as_ptr() as usize;
+        // SAFETY: Box keeps an exclusive fixed-address allocation across moves.
+        unsafe { Self::from_backing(backing, virt_to_phys) }
+    }
+}
+
+impl<B: AsRef<[u8]> + AsMut<[u8]>> DeviceOutputBuffer<B> {
+    /// Create device storage from an explicitly allocated backing owner.
+    ///
+    /// # Safety
+    /// Moving B and calling AsRef/AsMut must always preserve the same nonempty
+    /// slice address and length until B is destroyed. B exclusively owns that
+    /// allocation; no other accessor may alias the device's writable range.
+    pub unsafe fn from_backing<F>(mut backing: B, mut virt_to_phys: F) -> Result<Self, BufferError>
+    where
+        F: FnMut(usize) -> Option<usize>,
+    {
+        let len = backing.as_ref().len();
+        if len == 0 {
+            return Err(BufferError::InvalidLength);
+        }
+        backing.as_mut().fill(0);
+        let vaddr = backing.as_ref().as_ptr() as usize;
         let paddr = virt_to_phys(vaddr).ok_or(BufferError::NotDirectMapped)?;
         Ok(Self {
             backing: ManuallyDrop::new(backing),
@@ -337,8 +358,8 @@ impl DeviceOutputBuffer {
         let paddr =
             virt_to_phys(self.allocation_identity.vaddr).ok_or(BufferError::NotDirectMapped)?;
         if paddr != self.allocation_identity.paddr
-            || self.backing.as_ptr() as usize != self.allocation_identity.vaddr
-            || self.backing.len() != self.allocation_identity.len
+            || self.backing.as_ref().as_ptr() as usize != self.allocation_identity.vaddr
+            || self.backing.as_ref().len() != self.allocation_identity.len
         {
             return Err(BufferError::DmaIdentityChanged);
         }
@@ -346,7 +367,7 @@ impl DeviceOutputBuffer {
     }
 }
 
-impl Drop for DeviceOutputBuffer {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> Drop for DeviceOutputBuffer<B> {
     fn drop(&mut self) {
         if self.state == BufferState::Submitted {
             // Fail safe: a live descriptor may still reference this allocation. The bridge's
@@ -367,6 +388,38 @@ mod tests {
 
     fn direct(vaddr: usize) -> Option<usize> {
         Some(vaddr.wrapping_sub(0x1000))
+    }
+
+    #[test]
+    fn custom_backing_preserves_identity_across_moves() {
+        struct Storage(alloc::boxed::Box<[u8]>);
+        impl AsRef<[u8]> for Storage {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl AsMut<[u8]> for Storage {
+            fn as_mut(&mut self) -> &mut [u8] {
+                &mut self.0
+            }
+        }
+        let storage = Storage(alloc::vec![0xa5; 257].into_boxed_slice());
+        let address = storage.0.as_ptr();
+        let buffer = unsafe { DeviceOutputBuffer::from_backing(storage, direct).unwrap() };
+        let mut moved = alloc::boxed::Box::new(buffer);
+        let slice = unsafe { moved.submission_dma_slice(direct).unwrap() };
+        assert_eq!(slice.as_ptr(), address);
+        moved.mark_submitted();
+        let retired = unsafe { moved.retirement_dma_slice(direct).unwrap() };
+        assert_eq!(retired.as_ptr(), address);
+        unsafe {
+            moved.complete_after_pop(257).unwrap();
+        }
+        assert!(moved
+            .initialized_prefix()
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[test]

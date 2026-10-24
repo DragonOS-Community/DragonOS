@@ -1,4 +1,5 @@
 //! A unique byte ring; physical backing dies before its kernel receipt.
+use crate::mm::allocator::heap::{self, AllocationCharge};
 use crate::{
     cgroup::memory::{
         accounting::KernelByteKind,
@@ -7,11 +8,7 @@ use crate::{
     mm::{allocation::MemoryAllocationError, MemoryManagementArch},
 };
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use core::{
-    alloc::Layout,
-    ops::{Deref, DerefMut},
-};
-use system_error::SystemError;
+use core::ops::{Deref, DerefMut};
 
 /// Page provenance independent of physical byte-ring positions.
 #[derive(Debug, Clone, Copy)]
@@ -38,17 +35,14 @@ impl PipeBuffer {
         if size == 0 {
             return Ok(Self::default());
         }
-        let layout = Layout::array::<u8>(size).map_err(|_| SystemError::EOVERFLOW)?;
-        let charge = actor.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size)
-            .map_err(|_| SystemError::ENOMEM)?;
+        let (mut bytes, charge) =
+            heap::object_vec::<u8>(actor, KernelByteKind::SlabUnreclaimable, size)?;
         bytes.resize(size, 0);
         Ok(Self {
             bytes,
             _charge: Some(charge),
-            ..Self::default()
+            segments: VecDeque::new(),
+            _segment_charge: None,
         })
     }
 
@@ -61,12 +55,9 @@ impl PipeBuffer {
             return Ok(buffer);
         }
         let slots = size.div_ceil(crate::arch::MMArch::PAGE_SIZE);
-        let layout = Layout::array::<PipeSegment>(slots).map_err(|_| SystemError::EOVERFLOW)?;
-        let charge = actor.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
-        buffer
-            .segments
-            .try_reserve_exact(slots)
-            .map_err(|_| SystemError::ENOMEM)?;
+        let (segments, charge) =
+            heap::object_vec::<PipeSegment>(actor, KernelByteKind::SlabUnreclaimable, slots)?;
+        buffer.segments = VecDeque::from(segments);
         buffer._segment_charge = Some(charge);
         Ok(buffer)
     }
@@ -144,5 +135,18 @@ impl Deref for PipeBuffer {
 impl DerefMut for PipeBuffer {
     fn deref_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
+    }
+}
+
+impl Drop for PipeBuffer {
+    fn drop(&mut self) {
+        heap::drop_vec(
+            core::mem::take(&mut self.bytes),
+            self._charge.take().map(AllocationCharge::Object),
+        );
+        heap::drop_deque(
+            core::mem::take(&mut self.segments),
+            self._segment_charge.take().map(AllocationCharge::Object),
+        );
     }
 }

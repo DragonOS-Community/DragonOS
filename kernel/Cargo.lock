@@ -501,6 +501,7 @@ name = "dragonos_kernel"
 version = "0.4.0"
 dependencies = [
  "acpi",
+ "allocator-api2",
  "aml",
  "asm_macros",
  "atomic_enum",
@@ -517,7 +518,7 @@ dependencies = [
  "driver_base_macros",
  "elf",
  "fdt",
- "hashbrown 0.13.2",
+ "hashbrown 0.14.5",
  "ida",
  "inherit-methods-macro",
  "intertrait",
@@ -706,6 +707,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43a3c133739dddd0d2990f9a4bdf8eb4b21ef50e4851ca85ab661199821d510e"
 dependencies = [
  "ahash",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+dependencies = [
+ "ahash",
+ "allocator-api2",
 ]
 
 [[package]]

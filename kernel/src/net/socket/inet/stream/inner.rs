@@ -1,3 +1,4 @@
+use crate::mm::allocator::heap::{self, AllocationCharge};
 use crate::net::socket::inet::common::SocketDeviceBinding;
 use alloc::sync::Arc;
 use core::num::NonZeroU32;
@@ -30,7 +31,7 @@ pub const DEFAULT_TX_BUF_SIZE: usize = 128 * 1024;
 #[derive(Debug)]
 pub(super) struct ListenerSlots {
     entries: Vec<super::bound::TcpBound>,
-    _charge: crate::cgroup::memory::object::ObjectCharge,
+    _charge: Option<crate::cgroup::memory::object::ObjectCharge>,
 }
 
 impl ListenerSlots {
@@ -38,20 +39,24 @@ impl ListenerSlots {
         creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
         capacity: usize,
     ) -> Result<Self, MemoryAllocationError> {
-        let layout = core::alloc::Layout::array::<super::bound::TcpBound>(capacity)
-            .map_err(|_| SystemError::EOVERFLOW)?;
-        let charge = creator.try_charge_allocation(
+        let (entries, charge) = heap::object_vec::<super::bound::TcpBound>(
+            creator,
             crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
-            layout,
+            capacity,
         )?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(capacity)
-            .map_err(|_| SystemError::ENOMEM)?;
         Ok(Self {
             entries,
-            _charge: charge,
+            _charge: Some(charge),
         })
+    }
+}
+
+impl Drop for ListenerSlots {
+    fn drop(&mut self) {
+        heap::drop_vec(
+            core::mem::take(&mut self.entries),
+            self._charge.take().map(AllocationCharge::Object),
+        );
     }
 }
 

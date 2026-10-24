@@ -230,6 +230,9 @@ const fn mask_is_contiguous(mask: u64) -> bool {
     mask != 0 && (mask & mask.wrapping_add(1)) == 0
 }
 
+/// 活跃时钟源倒置读数计数（持续性倒走检测，见 `clocksource_delta`）。
+static INVERTED_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 fn clocksource_delta(
     cycle_now: u64,
@@ -240,12 +243,31 @@ fn clocksource_delta(
     if !mask_is_contiguous(mask) || max_cycles == 0 || max_cycles > mask {
         return Err(SystemError::EINVAL);
     }
-    let delta = cycle_now.wrapping_sub(cycle_last) & mask;
+    let raw = cycle_now.wrapping_sub(cycle_last) & mask;
+    // 单调时钟源的读数不允许回退。跨 CPU 读取同一时钟源时（kvm-clock 的
+    // per-CPU pvclock 值、未经同步校准的 TSC），一次回退读数会经
+    // wrapping_sub 变成 ~2^mask 的"巨大前跳"，再被 max_cycles 封顶成数小时的
+    // 前向跳变，足以毒化 tick 的绝对期限。回退样本按 0 elapsed 处理，随下一次
+    // 正常读数自然恢复。Linux 通过 TSC 同步校验与 KVM master clock 从构造上保证
+    // 单调，这里在换算入口强制同一不变式。
+    if raw > mask >> 1 {
+        // 持续性倒置升级：偶发倒置按 0 处理即可自愈；但若时钟源在持续倒走
+        // （KVM 负载下 pvclock 回退），永久钳 0 会把单调钟冻死。每 64 次倒置
+        // 唤醒一次 clocksource watchdog kthread —— 它会做活跃源倒走自检
+        // （active_clocksource_regressed），标记 unstable 并重选健康源。
+        if INVERTED_READS
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(64)
+        {
+            crate::time::clocksource::run_watchdog_kthread();
+        }
+        return Ok(0);
+    }
     // Match Linux timekeeping_get_delta(): a delayed update beyond the
     // conversion-safe window is capped, not allowed to overflow and not
     // promoted into a kernel panic. The next writer advances cycle_last to
     // the current sample, so the exceptional interval cannot repeat.
-    Ok(delta.min(max_cycles))
+    Ok(raw.min(max_cycles))
 }
 
 #[inline]

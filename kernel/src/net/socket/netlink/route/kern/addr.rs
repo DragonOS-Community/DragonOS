@@ -380,7 +380,8 @@ pub(super) fn addr_to_segment(
         index: NonZeroU32::new(iface.nic_id() as u32),
     };
 
-    let mut attrs = vec![AddrAttr::Address(octets.clone())];
+    // Match Linux inet_fill_ifaddr(): IPv4 ADDRESS, LOCAL, BROADCAST, LABEL.
+    let mut attrs = vec![AddrAttr::Address(octets.clone()), AddrAttr::Local(octets)];
     if matches!(cidr.address(), IpAddress::Ipv4(_)) {
         if let Some(broadcast) = broadcast.filter(|address| !address.is_unspecified()) {
             attrs.push(AddrAttr::Broadcast(broadcast.octets().to_vec()));
@@ -395,7 +396,6 @@ pub(super) fn addr_to_segment(
             attrs.push(AddrAttr::Label(label.to_bytes_with_nul().to_vec()));
         }
     }
-    attrs.push(AddrAttr::Local(octets));
 
     Ok(AddrSegment::new(header, addr_message, attrs))
 }

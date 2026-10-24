@@ -13,6 +13,7 @@ pub mod transport_mmio;
 pub mod transport_pci;
 #[allow(clippy::module_inception)]
 pub mod virtio;
+pub mod virtio_balloon;
 pub mod virtio_fs;
 pub mod virtio_impl;
 pub mod virtio_pmem;
@@ -95,6 +96,7 @@ pub fn virtio_drivers_error_to_system_error(error: virtio_drivers::Error) -> Sys
         virtio_drivers::Error::WrongToken => SystemError::EINVAL,
         virtio_drivers::Error::AlreadyUsed => SystemError::EBUSY,
         virtio_drivers::Error::InvalidParam => SystemError::EINVAL,
+        virtio_drivers::Error::MemoryError => SystemError::ENOMEM,
         virtio_drivers::Error::DmaError => SystemError::ENOMEM,
         virtio_drivers::Error::IoError => SystemError::EIO,
         virtio_drivers::Error::Unsupported => SystemError::ENOSYS,

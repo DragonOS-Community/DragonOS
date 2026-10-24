@@ -12,11 +12,11 @@ use super::{
         NftPacket, RulesetSnapshot,
     },
     route::{OutputRouteGuard, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST},
-    socket::inet::raw::RawIngressWork,
+    socket::inet::raw::{RawIngressBatch, RawIngressWork},
 };
 use crate::driver::net::{
     inject_owned_local_ip_packet_if_epoch, types::InterfaceFlags, veth::VethInterface, Iface,
-    LocalPacketOrigin,
+    LocalPacketOrigin, PacketBuffer,
 };
 use crate::process::namespace::net_namespace::{
     DefragSource, NetNamespace, PendingIpFragment, PendingIpv4Fragment, PendingIpv6Fragment,
@@ -65,6 +65,8 @@ pub(crate) struct NetIngressFilter<'a> {
     routes: Option<&'a OutputRouteGuard<'a>>,
     fib_routes: Option<&'a OutputRouteGuard<'a>>,
     work: &'a mut Vec<RoutedIngressWork>,
+    raw_batch: Option<&'a mut RawIngressBatch>,
+    raw_retirement: &'a mut Vec<RawIngressWork>,
     icmp_error_items: usize,
     icmp_error_bytes: usize,
 }
@@ -84,13 +86,14 @@ pub(crate) struct NetIngressFilterInit<'a> {
     pub(crate) routes: Option<&'a OutputRouteGuard<'a>>,
     pub(crate) fib_routes: Option<&'a OutputRouteGuard<'a>>,
     pub(crate) work: &'a mut Vec<RoutedIngressWork>,
+    pub(crate) raw_batch: Option<&'a mut RawIngressBatch>,
+    pub(crate) raw_retirement: &'a mut Vec<RawIngressWork>,
 }
 
 /// A route decision and owned datagram are transferred out of the receive
 /// callback together. No target interface is entered while the source's
 /// smoltcp, socket-set, or FIB locks are held.
 pub(crate) enum RoutedIngressWork {
-    Raw(RawIngressWork),
     IcmpError {
         netns: Arc<NetNamespace>,
         feedback: super::icmp_error::IcmpErrorFeedback,
@@ -105,7 +108,7 @@ pub(crate) enum RoutedIngressWork {
         ingress_ifindex: u32,
         source_mac: EthernetAddress,
         broadcast: bool,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         ct_context: CtPacketContext,
         mark: u32,
     },
@@ -113,20 +116,20 @@ pub(crate) enum RoutedIngressWork {
         target: Arc<dyn Iface>,
         target_epoch: u64,
         next_hop: IpAddress,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         fragment_info: Option<super::forward_mtu::ReassembledForwardInfo>,
         netns: Arc<NetNamespace>,
         ct_context: CtPacketContext,
     },
     MtuErrorIpv4 {
         netns: Arc<NetNamespace>,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         mtu: usize,
         ct_context: Option<CtPacketContext>,
     },
     MtuErrorIpv6 {
         netns: Arc<NetNamespace>,
-        packet: Vec<u8>,
+        packet: PacketBuffer,
         mtu: usize,
         ct_context: Option<CtPacketContext>,
     },
@@ -137,10 +140,6 @@ impl RoutedIngressWork {
         let result = match self {
             Self::IcmpError { netns, feedback } => {
                 super::icmp_error::execute(&netns, feedback);
-                return;
-            }
-            Self::Raw(work) => {
-                work.execute();
                 return;
             }
             Self::Defrag { netns, fragment } => {
@@ -284,6 +283,8 @@ impl<'a> NetIngressFilter<'a> {
             routes,
             fib_routes,
             work,
+            raw_batch,
+            raw_retirement,
         } = init;
         Self {
             ruleset,
@@ -300,6 +301,8 @@ impl<'a> NetIngressFilter<'a> {
             routes,
             fib_routes,
             work,
+            raw_batch,
+            raw_retirement,
             icmp_error_items: 0,
             icmp_error_bytes: 0,
         }
@@ -732,7 +735,9 @@ impl<'a> NetIngressFilter<'a> {
                 let Some(ct_context) = self.take_handoff_context(IpVersion::Ipv6) else {
                     return RouteInputVerdict::Drop;
                 };
-                let Ok(packet) = packet.take_owned() else {
+                let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 self.work.push(RoutedIngressWork::Local {
@@ -780,7 +785,9 @@ impl<'a> NetIngressFilter<'a> {
                         .get()
                         .is_some_and(|info| info.may_refragment(mtu))
                 {
-                    let Ok(packet) = packet.take_owned() else {
+                    let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                        crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                    }) else {
                         return RouteInputVerdict::Drop;
                     };
                     self.work.push(RoutedIngressWork::MtuErrorIpv6 {
@@ -791,7 +798,9 @@ impl<'a> NetIngressFilter<'a> {
                     });
                     return RouteInputVerdict::Forward;
                 }
-                let Ok(mut packet) = packet.take_owned() else {
+                let Ok(mut packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 let Ok(mut forwarded) = Ipv6Packet::new_checked(packet.as_mut_slice()) else {
@@ -993,7 +1002,11 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         } else {
             None
         };
-        let Ok(bytes) = packet.take_owned() else {
+        let Ok(bytes) = packet
+            .take_owned()
+            .map_err(|_| ())
+            .and_then(|bytes| crate::driver::net::packet_storage::take(bytes).map_err(|_| ()))
+        else {
             return PreRoutingVerdict::Drop;
         };
         self.work.push(RoutedIngressWork::Defrag {
@@ -1169,7 +1182,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 let Some(ct_context) = self.take_handoff_context(IpVersion::Ipv4) else {
                     return RouteInputVerdict::Drop;
                 };
-                let Ok(packet) = packet.take_owned() else {
+                let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 self.work.push(RoutedIngressWork::Local {
@@ -1205,7 +1220,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                         .get()
                         .is_some_and(|info| info.may_refragment(mtu))
                 {
-                    let Ok(packet) = packet.take_owned() else {
+                    let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                        crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                    }) else {
                         return RouteInputVerdict::Drop;
                     };
                     self.work.push(RoutedIngressWork::MtuErrorIpv4 {
@@ -1216,7 +1233,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     });
                     return RouteInputVerdict::Forward;
                 }
-                let Ok(mut packet) = packet.take_owned() else {
+                let Ok(mut packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
+                    crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 let Ok(mut forwarded) = Ipv4Packet::new_checked(packet.as_mut_slice()) else {
@@ -1324,11 +1343,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                         if self.work.try_reserve(1).is_err() {
                             return LocalInputVerdict::Drop;
                         }
-                        let mut bytes = Vec::new();
-                        if bytes.try_reserve_exact(packet.bytes().len()).is_err() {
+                        let Ok(bytes) = PacketBuffer::try_from_slice(packet.bytes()) else {
                             return LocalInputVerdict::Drop;
-                        }
-                        bytes.extend_from_slice(packet.bytes());
+                        };
                         self.work.push(RoutedIngressWork::Defrag {
                             netns: self.netns.clone(),
                             fragment: PendingIpFragment::Ipv6(PendingIpv6Fragment {
@@ -1396,7 +1413,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         // Allocate retirement work before upgrading any socket reference.
         // A poll-start listener snapshot can miss sockets registered before
         // this actual packet arrived, even when the packet was sent by one.
-        if self.work.try_reserve(1).is_err() {
+        if self.raw_retirement.try_reserve(1).is_err() {
             return LocalInputVerdict::Drop;
         }
         let Ok(mut sockets) = super::socket::inet::raw::snapshot_raw_ingress_sockets(self.netns)
@@ -1419,22 +1436,29 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             }
         }
         if !sockets.is_empty() {
-            let mut bytes = Vec::new();
-            if matched != 0 && bytes.try_reserve_exact(packet.len()).is_ok() {
-                bytes.extend_from_slice(packet);
-            }
-            // Include nonmatching candidates and copy-failure paths: their
-            // final strong references must not die under interface locks.
-            self.work.push(RoutedIngressWork::Raw(RawIngressWork {
+            let work = RawIngressWork {
                 sockets,
                 matched,
-                packet: bytes,
+                packet: PacketBuffer::new(),
                 source,
                 destination,
                 protocol,
                 ingress_ifindex,
                 netns: self.netns.clone(),
-            }));
+            };
+            // Nonmatching candidates and all resource-pressure paths retain
+            // their pins locally until the interface and poll guards are gone.
+            let retirement = if matched != 0 {
+                match self.raw_batch.as_mut() {
+                    Some(batch) => batch.record(work, packet, &self.netns.raw_ingress).err(),
+                    None => Some(work),
+                }
+            } else {
+                Some(work)
+            };
+            if let Some(work) = retirement {
+                self.raw_retirement.push(work);
+            }
         }
         // Linux considers a raw protocol matched even when allocation or the
         // receive queue fails; an unknown protocol must not emit ICMP then.
@@ -1501,7 +1525,11 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             } else {
                 None
             };
-            let Ok(bytes) = packet.take_owned() else {
+            let Ok(bytes) = packet
+                .take_owned()
+                .map_err(|_| ())
+                .and_then(|bytes| crate::driver::net::packet_storage::take(bytes).map_err(|_| ()))
+            else {
                 return RouteInputVerdict::Drop;
             };
             self.work.push(RoutedIngressWork::Defrag {

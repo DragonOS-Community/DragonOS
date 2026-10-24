@@ -683,8 +683,8 @@ TEST(UprobeTest, UnsupportedConfigAndPerfCoreOptionsAreRejected) {
     };
 
     UprobePerfEventOptions options;
-    options.config = 1;  // retprobe
-    expect_eopnotsupp("retprobe config", options);
+    options.config = 1ULL << 1;  // reserved configuration bit
+    expect_eopnotsupp("reserved config", options);
 
     options = {};
     options.config = 1ULL << 32;  // USDT ref_ctr_offset
@@ -714,6 +714,33 @@ TEST(UprobeTest, RelativePathUsesCurrentWorkingDirectory) {
     const int saved_errno = errno;
     EXPECT_GE(event.get(), 0) << "relative path should resolve from cwd, errno=" << saved_errno;
     ASSERT_EQ(fchdir(old_cwd.get()), 0);
+}
+
+TEST(UprobeTest, ReturnProbeCountsCompletedCalls) {
+    std::string path;
+    unsigned long offset = 0;
+    ASSERT_TRUE(resolve_file_offset(
+                    reinterpret_cast<const void*>(&uprobe_target), path, offset));
+    UprobePerfEventOptions options;
+    options.config = 1;  // Linux uprobe PMU return-probe selector
+    FdGuard fd(open_uprobe_perf_event(path, offset, options));
+    ASSERT_GE(fd.get(), 0) << "errno=" << errno;
+
+    __u64 count = 0;
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 0U);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(uprobe_target(i), i * 2 + 1);
+    }
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 3U);
+    ASSERT_EQ(ioctl(fd.get(), PERF_EVENT_IOC_DISABLE, 0), 0);
+    EXPECT_EQ(uprobe_target(4), 9);
+    ASSERT_EQ(read(fd.get(), &count, sizeof(count)),
+              static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, 3U);
 }
 
 TEST(UprobeTest, CounterReadUsesRawSingletonFormat) {

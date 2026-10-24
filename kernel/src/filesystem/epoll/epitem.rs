@@ -4,14 +4,106 @@ use super::{
     EPollEvent, EPollEventType,
 };
 use crate::{
-    cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox},
+    cgroup::memory::{
+        accounting::KernelByteKind,
+        object::{ObjectAccount, ObjectCharge},
+        owned::OwnedBox,
+    },
     filesystem::{poll::PollFlags, vfs::file::File},
-    libs::{mutex::Mutex, spinlock::SpinLock},
+    libs::{
+        mutex::Mutex,
+        prepared_queue::{Node, Queue},
+        rbtree::PreparedNode,
+        spinlock::SpinLock,
+    },
     mm::allocation::MemoryAllocationError,
 };
-use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use system_error::SystemError;
+
+/// Source registrations are bounded by pipe read + write and File close tracking.
+const SOURCE_LINKS: usize = 3;
+static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Receipt follows each physical node, including detached retirement queues.
+#[derive(Debug)]
+pub(crate) struct Registration {
+    pub(crate) item: Weak<EPollItem>,
+    // Only published source nodes hold a strong owner. File's final-close
+    // drain must remain able to unregister even if epoll closes concurrently.
+    // Unpublished/returned nodes (owned by the item itself) never hold this pin.
+    pub(crate) published_pin: Option<Arc<EPollItem>>,
+    _charge: ObjectCharge,
+}
+pub(crate) type SourceNode = PreparedNode<u64, Registration>;
+pub(crate) type ReadyNode = Box<Node<Registration>>;
+pub(crate) type ReadyQueue = Queue<Registration>;
+
+#[derive(Debug)]
+pub(crate) struct RegistrationLinks {
+    sources: [Option<SourceNode>; SOURCE_LINKS],
+    pub(crate) spare: ReadyQueue,
+    // Access only with this item's owning ReadyState lock held.
+    pub(crate) ready: bool,
+    pub(crate) overflow: bool,
+}
+
+impl RegistrationLinks {
+    fn prepare(creator: &Arc<ObjectAccount>, id: u64) -> Result<Self, MemoryAllocationError> {
+        let mut links = Self {
+            sources: core::array::from_fn(|_| None),
+            spare: Queue::new(),
+            ready: false,
+            overflow: false,
+        };
+        for slot in &mut links.sources {
+            let charge = creator.try_charge_allocation(
+                KernelByteKind::SlabUnreclaimable,
+                SourceNode::allocation_layout(),
+            )?;
+            *slot = Some(
+                SourceNode::try_new(
+                    id,
+                    Registration {
+                        item: Weak::new(),
+                        published_pin: None,
+                        _charge: charge,
+                    },
+                )
+                .map_err(|_| SystemError::ENOMEM)?,
+            );
+        }
+        for _ in 0..2 {
+            let charge = creator.try_charge_allocation(
+                KernelByteKind::SlabUnreclaimable,
+                Node::<Registration>::allocation_layout(),
+            )?;
+            links.spare.push_node(Node::try_new(Registration {
+                item: Weak::new(),
+                published_pin: None,
+                _charge: charge,
+            })?);
+        }
+        Ok(links)
+    }
+}
+
+impl Drop for RegistrationLinks {
+    fn drop(&mut self) {
+        for slot in &mut self.sources {
+            if let Some(node) = slot.take() {
+                drop(node.into_pair());
+            }
+        }
+        while let Some(node) = self.spare.pop_node() {
+            drop(node.into_value());
+        }
+    }
+}
 
 /// EpollItem表示的是Epoll所真正管理的对象
 /// 每当用户向Epoll添加描述符时都会注册一个新的EpollItem，EpollItem携带了一些被监听的描述符的必要信息
@@ -29,6 +121,8 @@ impl core::ops::Deref for EPollItem {
 
 #[derive(Debug)]
 pub struct EPollItemData {
+    pub(crate) registration_id: u64,
+    pub(crate) links: SpinLock<RegistrationLinks>,
     /// 对应的Epoll
     pub(super) epoll: Weak<Mutex<EventPoll>>,
     /// 直接引用 EventPoll 的 ready_state，使回调路径绕过外层 Mutex。
@@ -59,10 +153,16 @@ impl EPollItem {
         events: EPollEvent,
         file: Weak<File>,
     ) -> Result<Arc<Self>, MemoryAllocationError> {
+        let registration_id = NEXT_REGISTRATION_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        let links = RegistrationLinks::prepare(creator, registration_id)?;
         let body = OwnedBox::<EPollItemData>::prepare(creator, KernelByteKind::SlabUnreclaimable)?
             .try_allocate()
             .map_err(|_| SystemError::ENOMEM)?;
         let data = body.init(EPollItemData {
+            registration_id,
+            links: SpinLock::new(links),
             epoll,
             ready_state,
             poll_epitems,
@@ -72,6 +172,32 @@ impl EPollItem {
             active: AtomicBool::new(true),
         });
         Arc::try_new(Self { data }).map_err(|_| SystemError::ENOMEM.into())
+    }
+
+    pub(crate) fn take_source_node(self: &Arc<Self>) -> SourceNode {
+        let mut links = self.links.lock_irqsave();
+        let mut node = links
+            .sources
+            .iter_mut()
+            .find_map(Option::take)
+            .expect("registration source count exceeds prepared pipe+File bound");
+        node.value_mut().item = Arc::downgrade(self);
+        node.value_mut().published_pin = Some(self.clone());
+        node
+    }
+
+    pub(crate) fn return_source_node(&self, mut node: SourceNode) {
+        // Retire the published strong pin only after releasing links. A spare
+        // node must never hold a strong reference back to its own item.
+        let published_pin = node.value_mut().published_pin.take();
+        let mut links = self.links.lock_irqsave();
+        *links
+            .sources
+            .iter_mut()
+            .find(|node| node.is_none())
+            .expect("source node returned twice") = Some(node);
+        drop(links);
+        drop(published_pin);
     }
 
     pub fn epoll(&self) -> Weak<Mutex<EventPoll>> {

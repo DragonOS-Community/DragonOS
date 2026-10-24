@@ -88,7 +88,7 @@ impl BioQueue {
         let pending = {
             let mut inner = self.inner.lock_irqsave();
             inner.state = BioQueueState::Stopped;
-            core::mem::replace(&mut inner.queue, Queue::new())
+            core::mem::take(&mut inner.queue)
         };
         self.wait_queue.notify_all();
         pending

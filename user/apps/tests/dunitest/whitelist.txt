@@ -130,6 +130,7 @@ normal/tty_console_device
 normal/hvc_console_backpressure
 normal/signal_fpstate_sigreturn
 normal/general_protection_signal
+normal/unmapped_fault_signal
 normal/ioperm_semantics
 normal/seccomp
 normal/signal_sigqueueinfo
@@ -154,6 +155,7 @@ normal/kernel_buffer_selftest
 normal/overlay_xattr_selftest
 normal/xattr_syscall_selftest
 normal/xattr_syscall
+normal/xattr_unsupported
 normal/virtio_blk_backpressure
 normal/mknod_socket
 normal/pmem_block
@@ -169,6 +171,7 @@ normal/cubesandbox_pty_exec_chain
 normal/eventfd_pending_signal
 normal/timerfd_semantics
 normal/virtiofs_smoke
+normal/virtiofs_automount
 normal/virtiofs_dax
 normal/af_packet_sockopt
 normal/af_packet_ring
@@ -243,6 +246,7 @@ normal/fuse_write_privileges
 normal/read_buffer_selftest
 
 normal/shared_file_position
+normal/copy_file_range_semantics
 
 normal/ext4_shared_xattr
 
@@ -302,3 +306,10 @@ normal/page_retirement
 normal/shared_page_migration
 normal/page_compaction
 normal/global_reclaim
+normal/riscv_signal_semantics
+normal/page_reporting
+normal/balloon_memory_integrity
+normal/syslog_snapshot
+normal/syslog_stream
+normal/proc_mem_offset
+normal/virtiofs_multimount

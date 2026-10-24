@@ -108,7 +108,7 @@ impl FutexRegistry {
         // An owner's donor tree is represented by its already prepared links.
         // Reinsert changed lock tops after existing equal-priority donors, just
         // as rt_mutex's FIFO tie ordering; never allocate during propagation.
-        let mut owned = core::mem::replace(&mut self.task_mut(task).unwrap().owned, Queue::new());
+        let mut owned = core::mem::take(&mut self.task_mut(task).unwrap().owned);
         let mut stable = Queue::new();
         let mut changed = Queue::new();
         while let Some(node) = owned.pop_node() {

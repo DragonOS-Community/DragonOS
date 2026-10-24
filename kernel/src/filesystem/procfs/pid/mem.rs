@@ -55,17 +55,32 @@ impl MemFileOps {
 }
 
 impl FileOps for MemFileOps {
+    fn configure_open_file(
+        &self,
+        _data: &FilePrivateData,
+        behavior: &mut crate::filesystem::vfs::OpenFileBehavior,
+    ) {
+        behavior
+            .mode
+            .insert(crate::filesystem::vfs::file::FileMode::FMODE_UNSIGNED_OFFSET);
+    }
+
     fn seek(
         &self,
-        _position: &mut usize,
+        position: &mut usize,
         origin: &crate::driver::base::block::SeekFrom,
         _data: MutexGuard<FilePrivateData>,
     ) -> Option<Result<(), SystemError>> {
         use crate::driver::base::block::SeekFrom;
-        match origin {
-            SeekFrom::SeekSet(_) | SeekFrom::SeekCurrent(_) => None,
-            _ => Some(Err(SystemError::EINVAL)),
-        }
+        // mem_lseek treats f_pos as an address bit pattern, including values
+        // whose signed loff_t representation is negative. The File owns the
+        // position lock; unlike ordinary file seeks, SEEK_CUR wraps modulo 2^64.
+        *position = match origin {
+            SeekFrom::SeekSet(offset) => *offset as usize,
+            SeekFrom::SeekCurrent(offset) => position.wrapping_add(*offset as usize),
+            _ => return Some(Err(SystemError::EINVAL)),
+        };
+        Some(Ok(()))
     }
 
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {

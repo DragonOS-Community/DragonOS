@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
+#include <thread>
 
 namespace {
 
@@ -130,6 +132,80 @@ TEST(RawIcmp6FilterSemantics, ChangingMaskDoesNotRefilterQueuedPackets) {
     errno = 0;
     EXPECT_EQ(-1, recv(socket.fd(), &packet, sizeof(packet), MSG_DONTWAIT));
     EXPECT_EQ(EAGAIN, errno);
+}
+
+TEST(RawIcmp6IngressOrder, ConcurrentEchoRepliesFollowTheirRequests) {
+    ASSERT_NO_FATAL_FAILURE(IsolateLoopback());
+    RawIcmp6Socket observer;
+    ASSERT_GE(observer.fd(), 0) << errno;
+    int receive_buffer = 1024 * 1024;
+    ASSERT_EQ(0, setsockopt(observer.fd(), SOL_SOCKET, SO_RCVBUF,
+                           &receive_buffer, sizeof(receive_buffer))) << errno;
+    icmp6_filter filter;
+    ICMP6_FILTER_SETBLOCKALL(&filter);
+    ICMP6_FILTER_SETPASS(ICMP6_ECHO_REQUEST, &filter);
+    ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filter);
+    ASSERT_EQ(0, setsockopt(observer.fd(), IPPROTO_ICMPV6, ICMP6_FILTER,
+                           &filter, sizeof(filter))) << errno;
+
+    constexpr size_t workers = 4;
+    constexpr size_t per_worker = 16;
+    std::array<RawIcmp6Socket, workers> senders;
+    ICMP6_FILTER_SETBLOCKALL(&filter);
+    for (const auto& sender : senders) {
+        ASSERT_GE(sender.fd(), 0) << errno;
+        ASSERT_EQ(0, setsockopt(sender.fd(), IPPROTO_ICMPV6, ICMP6_FILTER,
+                               &filter, sizeof(filter))) << errno;
+    }
+    const auto destination = LoopbackAddress();
+    // Each round uses unique identities. Check only causal request/reply order;
+    // independent senders have no defined relative ordering on Linux.
+    for (size_t round = 0; round < 16; ++round) {
+        SCOPED_TRACE(round);
+        std::atomic<bool> start {false};
+        std::atomic<int> send_error {0};
+        std::array<std::thread, workers> threads;
+        for (size_t worker = 0; worker < workers; ++worker) {
+            threads[worker] = std::thread([&, worker] {
+                while (!start.load(std::memory_order_acquire)) sched_yield();
+                for (size_t sequence = 0; sequence < per_worker; ++sequence) {
+                    icmp6_hdr packet {};
+                    packet.icmp6_type = ICMP6_ECHO_REQUEST;
+                    packet.icmp6_id = htons(0x5000 + worker);
+                    packet.icmp6_seq = htons(round * per_worker + sequence);
+                    if (sendto(senders[worker].fd(), &packet, sizeof(packet), 0,
+                               reinterpret_cast<const sockaddr*>(&destination),
+                               sizeof(destination)) != static_cast<ssize_t>(sizeof(packet))) {
+                        send_error.store(errno);
+                    }
+                }
+            });
+        }
+        start.store(true, std::memory_order_release);
+        for (auto& thread : threads) thread.join();
+        ASSERT_EQ(0, send_error.load());
+        std::array<unsigned char, workers * per_worker> received {};
+        for (size_t count = 0; count < 2 * workers * per_worker; ++count) {
+            ASSERT_EQ(1, WaitReadable(observer.fd())) << "received=" << count;
+            icmp6_hdr packet {};
+            ASSERT_EQ(static_cast<ssize_t>(sizeof(packet)),
+                      recv(observer.fd(), &packet, sizeof(packet), MSG_DONTWAIT)) << errno;
+            const size_t worker = ntohs(packet.icmp6_id) - 0x5000;
+            const size_t sequence = ntohs(packet.icmp6_seq) - round * per_worker;
+            ASSERT_LT(worker, workers);
+            ASSERT_LT(sequence, per_worker);
+            auto& state = received[worker * per_worker + sequence];
+            if (packet.icmp6_type == ICMP6_ECHO_REQUEST) {
+                EXPECT_EQ(0, state) << "duplicate or late request";
+                state |= 1;
+            } else {
+                ASSERT_EQ(ICMP6_ECHO_REPLY, packet.icmp6_type);
+                EXPECT_EQ(1, state) << "reply overtook request";
+                state |= 2;
+            }
+        }
+        for (const auto state : received) EXPECT_EQ(3, state);
+    }
 }
 
 }  // namespace

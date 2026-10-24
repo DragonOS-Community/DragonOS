@@ -18,7 +18,6 @@ pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},
-    panic::Location,
     sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering},
 };
 
@@ -101,7 +100,7 @@ fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
 
 #[inline]
 pub(crate) fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
-    task_is_idle(&rq.current()) && rq.nr_running == 0
+    task_is_idle(&rq.current()) && rq.nr_running() == 0
 }
 
 #[inline]
@@ -152,9 +151,7 @@ fn first_allowed_online_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
 }
 
 fn rq_nr_running(cpu: ProcessorId) -> usize {
-    let rq = cpu_rq(cpu.data() as usize);
-    let (rq, _guard) = rq.self_lock();
-    rq.nr_running
+    cpu_rq(cpu.data() as usize).nr_running()
 }
 
 fn select_fork_idle_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Option<ProcessorId> {
@@ -504,8 +501,8 @@ pub struct CpuRunQueue {
 
     next_balance: u64,
 
-    /// 运行任务数
-    nr_running: usize,
+    /// Runnable count. Writers hold rq; placement may read an advisory snapshot.
+    nr_running: AtomicUsize,
 
     /// 被阻塞的任务数量
     nr_uninterruptible: usize,
@@ -555,7 +552,7 @@ impl CpuRunQueue {
             clock_updata_flags: ClockUpdataFlag::empty(),
             overload: false,
             next_balance: 0,
-            nr_running: 0,
+            nr_running: AtomicUsize::new(0),
             nr_uninterruptible: 0,
             nr_iowait: AtomicUsize::new(0),
             calc_load_update: clock() + (5 * HZ + 1),
@@ -575,28 +572,17 @@ impl CpuRunQueue {
     /// 此函数只能在关中断的情况下使用！！！
     /// 获取到 rq 的可变引用，并显式持有 rq 锁。
     #[allow(clippy::mut_from_ref)]
-    #[track_caller]
     pub fn self_lock(&self) -> (&mut Self, SpinLockGuard<'_, ()>) {
-        let mut spins = 0usize;
-        let guard = loop {
-            if let Ok(guard) = self.lock.try_lock_irqsave() {
-                break guard;
-            }
-
-            spins += 1;
-            if spins >= 1_000_000 {
-                let caller = Location::caller();
-                panic!(
-                    "CpuRunQueue::self_lock spinout on cpu {:?}, caller {}:{}",
-                    self.cpu,
-                    caller.file(),
-                    caller.line()
-                );
-            }
-
-            core::hint::spin_loop();
-        };
+        let guard = self.lock.lock_irqsave();
         (self.force_mut_locked(), guard)
+    }
+
+    /// Advisory placement snapshot, equivalent to Linux's lockless rq load
+    /// reads. This does not publish task state or authorize queue mutations;
+    /// enqueue, dequeue and migration still require the runqueue lock.
+    #[inline]
+    pub fn nr_running(&self) -> usize {
+        self.nr_running.load(Ordering::Relaxed)
     }
 
     /// Best-effort current-task snapshot for lockup diagnostics.
@@ -937,19 +923,20 @@ impl CpuRunQueue {
     }
 
     pub fn add_nr_running(&mut self, nr_running: usize) {
-        let prev = self.nr_running;
-
-        self.nr_running = prev + nr_running;
+        let prev = self.nr_running();
+        let next = prev + nr_running;
+        self.nr_running.store(next, Ordering::Relaxed);
         loadavg::inc_nr_running(nr_running);
-        if prev < 2 && self.nr_running >= 2 && !self.overload {
+        if prev < 2 && next >= 2 && !self.overload {
             self.overload = true;
         }
     }
 
     pub fn sub_nr_running(&mut self, count: usize) {
-        self.nr_running -= count;
+        let next = self.nr_running() - count;
+        self.nr_running.store(next, Ordering::Relaxed);
         loadavg::dec_nr_running(count);
-        if self.nr_running < 2 && self.overload {
+        if next < 2 && self.overload {
             self.overload = false;
         }
     }
@@ -963,9 +950,8 @@ impl CpuRunQueue {
 
     /// 在运行idle？
     pub fn sched_idle_rq(&self) -> bool {
-        return unlikely(
-            self.nr_running == self.cfs.idle_h_nr_running as usize && self.nr_running > 0,
-        );
+        let nr_running = self.nr_running();
+        unlikely(nr_running == self.cfs.idle_h_nr_running as usize && nr_running > 0)
     }
 
     #[inline]
@@ -1748,22 +1734,35 @@ mod tests {
     use crate::smp::cpu::ProcessorId;
 
     #[test]
+    fn rq_load_snapshot_does_not_wait_for_held_runqueue_lock() {
+        let mut rq = CpuRunQueue::new(ProcessorId::new(0));
+        // Balance the global accounting before returning from this test.
+        rq.add_nr_running(2);
+        {
+            let _guard = rq.lock.lock_irqsave();
+            assert_eq!(rq.nr_running(), 2);
+        }
+        rq.sub_nr_running(2);
+        assert_eq!(rq.nr_running(), 0);
+    }
+
+    #[test]
     fn rq_overload_clears_after_nr_running_drops_below_two() {
         let mut rq = CpuRunQueue::new(ProcessorId::new(0));
         let global_before = loadavg::nr_running();
 
         rq.add_nr_running(2);
         assert!(rq.overload);
-        assert_eq!(rq.nr_running, 2);
+        assert_eq!(rq.nr_running(), 2);
 
         rq.sub_nr_running(1);
         assert!(!rq.overload);
-        assert_eq!(rq.nr_running, 1);
+        assert_eq!(rq.nr_running(), 1);
 
         assert_eq!(loadavg::nr_running(), global_before + 1);
 
         rq.sub_nr_running(1);
-        assert_eq!(rq.nr_running, 0);
+        assert_eq!(rq.nr_running(), 0);
         assert_eq!(loadavg::nr_running(), global_before);
     }
 }

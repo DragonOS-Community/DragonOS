@@ -430,6 +430,8 @@ pub enum FilePrivateData {
     Kernfs(Option<KernFilePrivateData>),
     /// timerfd open-file-description flags (notably O_NONBLOCK).
     TimerFd(FileFlags),
+    /// Shared /proc/kmsg stream flags, captured after its open-time capability check.
+    Kmsg(FileFlags),
     /// Configurable filesystem context shared by dup/fork aliases.
     FsContext(Arc<crate::filesystem::vfs::mount_api::context::FsContext>),
     /// Ownership of a detached mount tree until it is attached or finally closed.
@@ -540,7 +542,7 @@ impl FilePrivateData {
             FilePrivateData::Overlayfs(pdata) => {
                 pdata.set_flags(flags)?;
             }
-            FilePrivateData::TimerFd(current) => *current = flags,
+            FilePrivateData::TimerFd(current) | FilePrivateData::Kmsg(current) => *current = flags,
             _ => {}
         }
         Ok(())
@@ -2050,9 +2052,7 @@ impl File {
         }
         if !self.mode.read().contains(FileMode::FMODE_STREAM) {
             let offset = self.offset.load(Ordering::SeqCst);
-            if offset > isize::MAX as usize || count > isize::MAX as usize - offset {
-                return Err(SystemError::EINVAL);
-            }
+            self.verify_pread_range(offset, count)?;
         }
         Ok(())
     }
@@ -2405,7 +2405,22 @@ impl File {
         offset: usize,
         count: usize,
     ) -> Result<(), SystemError> {
-        if offset > isize::MAX as usize || count > isize::MAX as usize - offset {
+        if count > isize::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+        // Linux rw_verify_area(): unsigned-offset owners may cross the signed
+        // boundary, but a high-bit position must not reach or wrap through zero.
+        // Explicit negative pread/pwrite arguments are rejected separately by
+        // syscall admission, before this per-file capability check.
+        let unsigned = self.mode.read().contains(FileMode::FMODE_UNSIGNED_OFFSET);
+        if offset > isize::MAX as usize {
+            if !unsigned {
+                return Err(SystemError::EINVAL);
+            }
+            if count >= offset.wrapping_neg() {
+                return Err(SystemError::EOVERFLOW);
+            }
+        } else if !unsigned && count > isize::MAX as usize - offset {
             return Err(SystemError::EINVAL);
         }
         Ok(())

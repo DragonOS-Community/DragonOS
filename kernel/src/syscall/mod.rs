@@ -13,8 +13,6 @@ use table::{syscall_table, syscall_table_init};
 
 use crate::arch::interrupt::TrapFrame;
 
-use self::user_access::UserBufferWriter;
-
 pub mod iov;
 pub mod misc;
 pub mod trace;
@@ -203,23 +201,12 @@ impl Syscall {
                         schedule(SchedMode::SM_NONE);
                         Ok(0)
                     }
-                    SYS_SYSLOG => {
-                        let syslog_action_type = dispatch_args[0];
-                        let buf_vaddr = dispatch_args[1];
-                        let len = dispatch_args[2];
-                        let from_user = frame.is_from_user();
-                        if len == 0 {
-                            Self::do_syslog(syslog_action_type, &mut [], 0)
-                        } else {
-                            match UserBufferWriter::new(buf_vaddr as *mut u8, len, from_user) {
-                                Ok(mut writer) => match writer.buffer(0) {
-                                    Ok(buf) => Self::do_syslog(syslog_action_type, buf, len),
-                                    Err(e) => Err(e),
-                                },
-                                Err(e) => Err(e),
-                            }
-                        }
-                    }
+                    SYS_SYSLOG => Self::do_syslog(
+                        dispatch_args[0] as i32,
+                        dispatch_args[1],
+                        dispatch_args[2] as i32,
+                        frame.is_from_user(),
+                    ),
                     SYS_FSYNC => {
                         warn!("SYS_FSYNC has not yet been implemented");
                         Ok(0)

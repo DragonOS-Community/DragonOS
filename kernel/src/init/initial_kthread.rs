@@ -14,8 +14,8 @@ use crate::{
     driver::net::e1000e::e1000e::e1000e_init,
     filesystem::vfs::vcore::mount_root_fs,
     process::{
-        exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
-        ProcessFlags, ProcessManager,
+        exec_args::ExecArguments, execve::do_execve, kthread::KernelThreadMechanism,
+        stdio::stdio_init, ProcessFlags, ProcessManager,
     },
     rcu,
     smp::smp_init,
@@ -133,7 +133,7 @@ fn switch_to_user() -> ! {
 
     drop(current_pcb);
 
-    let mut proc_init_info = ProcInitInfo::new("");
+    let mut proc_init_info = InitCommand::new("");
     // 设置默认环境变量
     set_init_env(&mut proc_init_info.envs, CString::new("HOME=/").unwrap());
     set_init_env(
@@ -191,9 +191,26 @@ fn switch_to_user() -> ! {
     unsafe { arch_switch_to_user(trap_frame) };
 }
 
+/// Mutable boot configuration is separate from frozen exec snapshots.
+struct InitCommand {
+    proc_name: CString,
+    args: alloc::vec::Vec<CString>,
+    envs: alloc::vec::Vec<CString>,
+}
+
+impl InitCommand {
+    fn new(name: &str) -> Self {
+        Self {
+            proc_name: CString::new(name).unwrap(),
+            args: alloc::vec::Vec::new(),
+            envs: alloc::vec::Vec::new(),
+        }
+    }
+}
+
 fn try_to_run_init_process(
     path: &str,
-    proc_init_info: &mut ProcInitInfo,
+    proc_init_info: &mut InitCommand,
     ext_args: &Option<&str>,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
@@ -248,20 +265,13 @@ fn init_env_key_matches(env: &CString, key: &[u8]) -> bool {
 }
 
 fn run_init_process(
-    proc_init_info: &ProcInitInfo,
+    proc_init_info: &InitCommand,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
     let path = proc_init_info.proc_name.to_str().unwrap();
 
-    do_execve(
-        path,
-        proc_init_info.args.clone(),
-        proc_init_info.envs.clone(),
-        trap_frame,
-    )
-    .map_err(crate::process::execve::ExecFailure::finish)?;
-    // 初始化阶段直接调用 do_execve（绕过 sys_execve），因此这里补齐 cmdline 存储
-    ProcessManager::current_pcb().set_cmdline_from_argv(&proc_init_info.args);
+    let arguments = ExecArguments::from_kernel(path, &proc_init_info.args, &proc_init_info.envs)?;
+    do_execve(path, arguments, trap_frame).map_err(crate::process::execve::ExecFailure::finish)?;
     Ok(())
 }

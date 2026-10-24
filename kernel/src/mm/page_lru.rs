@@ -177,6 +177,41 @@ impl PageLru {
         self.head = Some(*key);
     }
 
+    /// Arrange only fixture-owned recency before a bounded production scan.
+    /// The caller holds the reclaimer mutex and pins `page`; membership and
+    /// ownership never change, nor does the relative order of unrelated nodes.
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    pub(crate) fn place_cold_for_selftest(&mut self, page: &Arc<Page>) -> bool {
+        let key = page.phys_address();
+        if !self
+            .peek(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, page))
+        {
+            return false;
+        }
+        if self.tail == Some(key) {
+            return true;
+        }
+        self.detach_links(key);
+        let old_tail = self.tail;
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .expect("fixture LRU entry missing");
+        entry.prev = old_tail;
+        entry.next = None;
+        if let Some(tail) = old_tail {
+            self.entries
+                .get_mut(&tail)
+                .expect("fixture LRU tail missing")
+                .next = Some(key);
+        } else {
+            self.head = Some(key);
+        }
+        self.tail = Some(key);
+        true
+    }
+
     pub(crate) fn pop(&mut self, key: &PhysAddr) -> Option<Arc<Page>> {
         if !self.entries.contains_key(key) {
             return None;

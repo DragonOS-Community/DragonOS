@@ -8,12 +8,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    arch::{ipc::signal::Signal, mm::LockedFrameAllocator, MMArch},
+    arch::ipc::signal::Signal,
     cgroup::memory::{
         account_for_task, ChargeFailure, ChargeFailureReason, MemoryAccount, MemoryEvent,
     },
     libs::spinlock::SpinLock,
-    mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
     process::{ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
 };
 
@@ -212,7 +211,7 @@ fn better_candidate(new: &OomCandidate, old: &OomCandidate) -> bool {
 }
 
 fn total_system_pages() -> isize {
-    let total_pages = unsafe { LockedFrameAllocator.usage() }.total().bytes() >> MMArch::PAGE_SHIFT;
+    let total_pages = super::balloon::managed_usage().total().data();
     total_pages.min(isize::MAX as usize).max(1) as isize
 }
 
@@ -724,6 +723,12 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
                 continue;
             }
         };
+        // Global selection is serialized, but no victim/PID/MM resource is
+        // locked yet. Balloon completion may sleep and must precede a kill.
+        if crate::driver::virtio::virtio_balloon::deflate_on_oom() {
+            finish_selection_none();
+            return OomOutcome::Retry;
+        }
         let mut work = Lease::checkout();
         let adjustment = match ProcessManager::lock_oom_score_adj_for_oom() {
             Ok(guard) => guard,

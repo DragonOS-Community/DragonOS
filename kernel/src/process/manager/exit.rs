@@ -372,179 +372,192 @@ impl ProcessManager {
             }
         }
 
-        // Linux fires trace_sched_process_exit(tsk) early in do_exit() for
-        // every exiting task; BPF consumers filter main threads themselves.
-        // basic() disables IRQs and preemption. Release it before callbacks
-        // run, since BPF user-memory reads may need to resolve a page fault.
-        let mut comm = [0u8; 16];
-        {
-            let basic = current_pcb.basic();
-            let name = basic.name().as_bytes();
-            let len = name.len().min(comm.len() - 1);
-            comm[..len].copy_from_slice(&name[..len]);
-        }
-        crate::process::trace::trace_sched_process_exit(
-            &comm,
-            current_pcb.raw_pid().data() as i32,
-            current_pcb.sched_info().prio(),
-        );
-
-        current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
-
-        // Exit will not return to the old user context; release ActiveXol's strong
-        // references to site/slot/consumer before entering mm teardown. This cleanup does
-        // not need to — and should not — modify the trapframe.
-        #[cfg(target_arch = "x86_64")]
-        crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
-
+        // The witness is checked before reserve access; ordinary exit and
+        // SIGKILL alone do not gain the OOM reserve. The lexical scope returns
+        // before the terminal switch, which will not run this stack's drops.
+        let oom_victim = crate::mm::oom::current_is_oom_victim();
         let raw_pid = current_pcb.raw_pid();
-        let _final_irq_guard;
-        // log::debug!("[exit: {}]", raw_pid.data());
-        {
-            let pcb = current_pcb.clone();
-            let (group_leader, group_dead) = {
-                let _membership_guard = crate::process::pid::pid_membership_lock();
-                pcb.mark_exiting();
-                let thread = pcb.threads_read_irqsave();
-                let group_leader = thread.group_leader().unwrap_or_else(|| pcb.clone());
-                let live = thread.thread_group_live.clone();
-                drop(thread);
-                // Match Linux signal_struct::live: every successfully
-                // published thread contributes once and consumes its token on
-                // first entering do_exit(). The unique 1 -> 0 transition owns
-                // thread-group finalization without scanning group_tasks.
-                let previous = live.fetch_sub(1, Ordering::AcqRel);
-                assert_ne!(previous, 0, "thread-group live count underflow");
-                (group_leader, previous == 1)
-            };
-            ptrace::settle_exiting_group_stop(&pcb);
-            // Match Linux perf_event_exit_task(): terminal task events must be
-            // detached while the old mm and its original instruction bytes
-            // are still available. The perf fd retains its final count.
+        let cleanup = || {
+            // Linux fires trace_sched_process_exit(tsk) early in do_exit() for
+            // every exiting task; BPF consumers filter main threads themselves.
+            // basic() disables IRQs and preemption. Release it before callbacks
+            // run, since BPF user-memory reads may need to resolve a page fault.
+            let mut comm = [0u8; 16];
+            {
+                let basic = current_pcb.basic();
+                let name = basic.name().as_bytes();
+                let len = name.len().min(comm.len() - 1);
+                comm[..len].copy_from_slice(&name[..len]);
+            }
+            crate::process::trace::trace_sched_process_exit(
+                &comm,
+                current_pcb.raw_pid().data() as i32,
+                current_pcb.sched_info().prio(),
+            );
+
+            current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
+
+            // Exit will not return to the old user context; release ActiveXol's strong
+            // references to site/slot/consumer before entering mm teardown. This cleanup does
+            // not need to — and should not — modify the trapframe.
             #[cfg(target_arch = "x86_64")]
-            crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
-            let pid = pcb.pid();
-            if pid.is_child_reaper() {
-                pid.ns_of_pid().disable_pid_allocation();
-            }
-            pcb.wait_queue.mark_dead();
+            crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
 
-            // Perform post-exit work for the process.
-            Self::release_task_futex_state(&pcb);
-            compiler_fence(Ordering::SeqCst);
-
-            detach_sem_undo(&pcb);
-            // If this process was created via vfork, complete the completion.
-            let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
-            if let Some(vd) = vfork_done {
-                vd.complete_all();
-            }
-
-            // Linux exit_mm() happens before exit_files(): after clear_child_tid
-            // and robust-list cleanup have consumed user memory, the exiting task
-            // must stop exposing a user-visible mm even if file close blocks.
-            //
-            // The CPU-visible active mm is switched to idle here and tracked by
-            // per-CPU TlbState. The PCB-visible user_vm becomes None, matching
-            // Linux task->mm == NULL after exit_mm().
-            let old_user_vm = pcb.with_task_lock_irqsave(|| {
-                let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
-                let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-                let cpu = smp_get_processor_id();
-                let mut basic = pcb.basic_mut();
-                let old_vm = unsafe { basic.replace_user_vm(None) };
-                idle_vm.active_cpus_set(cpu);
-                unsafe { idle_vm.make_current() };
-                if let Some(old_vm) = old_vm.as_ref() {
-                    old_vm.active_cpus_clear(cpu);
-                }
-                unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
-                drop(basic);
-                drop(irq_guard);
-                old_vm
-            });
-            if let Some(old_vm) = old_user_vm.as_ref() {
-                // live-- precedes faultable exit cleanup, so every exiting
-                // task preserves the peak, not just the last entrant.
-                group_leader.preserve_maxrss(old_vm);
-                old_vm.replace_departing_memory_owner(&pcb);
-            }
-            Self::release_old_user_vm_if_last(old_user_vm.as_ref());
-            drop(old_user_vm);
-            // Shared-MM non-last users do not enter unmap_all; their core
-            // participation is complete before ordinary file-close callbacks.
-            #[cfg(feature = "mm_selftest")]
-            crate::mm::oom::denial::end_victim_core_retirement();
-
-            pcb.exit_files();
-            // Linux exit_fs() follows exit_files(). A zombie must not keep
-            // cwd/root path references alive, otherwise an already-reaped
-            // chrooted child can make an unrelated umount report EBUSY.
-            pcb.exit_fs();
-            pcb.exit_timers(group_dead);
-
-            // Linux releases task namespaces before publishing Zombie, not
-            // when the parent eventually reaps the PCB. In particular, a
-            // dead container init must not pin its netns and veth peers.
-            pcb.exit_task_namespaces();
-
-            if group_dead {
-                let (current_tty, is_session_leader, sid) = {
-                    let siginfo = group_leader.sig_info_irqsave();
-                    (siginfo.tty(), siginfo.is_session_leader, pcb.task_session())
+            let _final_irq_guard;
+            // log::debug!("[exit: {}]", raw_pid.data());
+            {
+                let pcb = current_pcb.clone();
+                let (group_leader, group_dead) = {
+                    let _membership_guard = crate::process::pid::pid_membership_lock();
+                    pcb.mark_exiting();
+                    let thread = pcb.threads_read_irqsave();
+                    let group_leader = thread.group_leader().unwrap_or_else(|| pcb.clone());
+                    let live = thread.thread_group_live.clone();
+                    drop(thread);
+                    // Match Linux signal_struct::live: every successfully
+                    // published thread contributes once and consumes its token on
+                    // first entering do_exit(). The unique 1 -> 0 transition owns
+                    // thread-group finalization without scanning group_tasks.
+                    let previous = live.fetch_sub(1, Ordering::AcqRel);
+                    assert_ne!(previous, 0, "thread-group live count underflow");
+                    (group_leader, previous == 1)
                 };
-                if let Some(tty) = current_tty {
-                    if is_session_leader {
-                        let tty_pgrp = sid.as_ref().and_then(|sid| {
-                            TtyJobCtrlManager::remove_session_tty_if_owner(&tty, sid)
-                        });
-                        if let Some(pgrp) = tty_pgrp {
-                            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+                ptrace::settle_exiting_group_stop(&pcb);
+                // Match Linux perf_event_exit_task(): terminal task events must be
+                // detached while the old mm and its original instruction bytes
+                // are still available. The perf fd retains its final count.
+                #[cfg(target_arch = "x86_64")]
+                crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
+                let pid = pcb.pid();
+                if pid.is_child_reaper() {
+                    pid.ns_of_pid().disable_pid_allocation();
+                }
+                pcb.wait_queue.mark_dead();
+
+                // Perform post-exit work for the process.
+                Self::release_task_futex_state(&pcb);
+                compiler_fence(Ordering::SeqCst);
+
+                detach_sem_undo(&pcb);
+                // If this process was created via vfork, complete the completion.
+                let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
+                if let Some(vd) = vfork_done {
+                    vd.complete_all();
+                }
+
+                // Linux exit_mm() happens before exit_files(): after clear_child_tid
+                // and robust-list cleanup have consumed user memory, the exiting task
+                // must stop exposing a user-visible mm even if file close blocks.
+                //
+                // The CPU-visible active mm is switched to idle here and tracked by
+                // per-CPU TlbState. The PCB-visible user_vm becomes None, matching
+                // Linux task->mm == NULL after exit_mm().
+                let old_user_vm = pcb.with_task_lock_irqsave(|| {
+                    let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
+                    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                    let cpu = smp_get_processor_id();
+                    let mut basic = pcb.basic_mut();
+                    let old_vm = unsafe { basic.replace_user_vm(None) };
+                    idle_vm.active_cpus_set(cpu);
+                    unsafe { idle_vm.make_current() };
+                    if let Some(old_vm) = old_vm.as_ref() {
+                        old_vm.active_cpus_clear(cpu);
+                    }
+                    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
+                    drop(basic);
+                    drop(irq_guard);
+                    old_vm
+                });
+                if let Some(old_vm) = old_user_vm.as_ref() {
+                    // live-- precedes faultable exit cleanup, so every exiting
+                    // task preserves the peak, not just the last entrant.
+                    group_leader.preserve_maxrss(old_vm);
+                    old_vm.replace_departing_memory_owner(&pcb);
+                }
+                Self::release_old_user_vm_if_last(old_user_vm.as_ref());
+                drop(old_user_vm);
+                // Shared-MM non-last users do not enter unmap_all; their core
+                // participation is complete before ordinary file-close callbacks.
+                #[cfg(feature = "mm_selftest")]
+                crate::mm::oom::denial::end_victim_core_retirement();
+
+                pcb.exit_files();
+                // Linux exit_fs() follows exit_files(). A zombie must not keep
+                // cwd/root path references alive, otherwise an already-reaped
+                // chrooted child can make an unrelated umount report EBUSY.
+                pcb.exit_fs();
+                pcb.exit_timers(group_dead);
+
+                // Linux releases task namespaces before publishing Zombie, not
+                // when the parent eventually reaps the PCB. In particular, a
+                // dead container init must not pin its netns and veth peers.
+                pcb.exit_task_namespaces();
+
+                if group_dead {
+                    let (current_tty, is_session_leader, sid) = {
+                        let siginfo = group_leader.sig_info_irqsave();
+                        (siginfo.tty(), siginfo.is_session_leader, pcb.task_session())
+                    };
+                    if let Some(tty) = current_tty {
+                        if is_session_leader {
+                            let tty_pgrp = sid.as_ref().and_then(|sid| {
+                                TtyJobCtrlManager::remove_session_tty_if_owner(&tty, sid)
+                            });
+                            if let Some(pgrp) = tty_pgrp {
+                                let _ =
+                                    crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+                            }
+                        } else {
+                            group_leader.sig_info_mut().set_tty(None);
                         }
                     } else {
                         group_leader.sig_info_mut().set_tty(None);
                     }
-                } else {
-                    group_leader.sig_info_mut().set_tty(None);
                 }
-            }
 
-            // Linux semantics: a zombie must not appear in cgroup.procs.
-            // Hold cgroup_accounting_lock to avoid deadlock with cgroup.procs writes.
-            {
-                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-                crate::cgroup::freezer::exit(&pcb);
-            }
-            if pcb.is_kthread() {
-                let exited_completion = {
-                    let worker_private = pcb.worker_private();
-                    worker_private
-                        .as_ref()
-                        .and_then(|x| x.kernel_thread())
-                        .map(|x| x.exited_completion())
-                };
-                if let Some(exited_completion) = exited_completion {
-                    exited_completion.complete_all();
+                // Linux semantics: a zombie must not appear in cgroup.procs.
+                // Hold cgroup_accounting_lock to avoid deadlock with cgroup.procs writes.
+                {
+                    let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                    crate::cgroup::freezer::exit(&pcb);
                 }
-            }
+                if pcb.is_kthread() {
+                    let exited_completion = {
+                        let worker_private = pcb.worker_private();
+                        worker_private
+                            .as_ref()
+                            .and_then(|x| x.kernel_thread())
+                            .map(|x| x.exited_completion())
+                    };
+                    if let Some(exited_completion) = exited_completion {
+                        exited_completion.complete_all();
+                    }
+                }
 
-            // Align with Linux do_task_dead(): do not manually deactivate_task
-            // here. The task remains on the rq; later __schedule() will detect
-            // the Exited state and perform the single deactivate_task, avoiding
-            // a double dequeue that would underflow nr_running.
+                // Align with Linux do_task_dead(): do not manually deactivate_task
+                // here. The task remains on the rq; later __schedule() will detect
+                // the Exited state and perform the single deactivate_task, avoiding
+                // a double dequeue that would underflow nr_running.
 
-            _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            // Set the scheduling state to Exited before calling exit_notify at the
-            // very end.
-            // Mirrors Linux do_task_dead()'s set_special_state(TASK_DEAD):
-            // complete the state write under pi_lock protection, serializing with
-            // concurrent wakeups also protected by pi_lock in wakeup().
-            {
-                let _pi_guard = pcb.sched_info.pi_lock_irqsave();
-                pcb.sched_info.set_state(ProcessState::Exited(exit_code));
+                _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                // Set the scheduling state to Exited before calling exit_notify at the
+                // very end.
+                // Mirrors Linux do_task_dead()'s set_special_state(TASK_DEAD):
+                // complete the state write under pi_lock protection, serializing with
+                // concurrent wakeups also protected by pi_lock in wakeup().
+                {
+                    let _pi_guard = pcb.sched_info.pi_lock_irqsave();
+                    pcb.sched_info.set_state(ProcessState::Exited(exit_code));
+                }
+                ProcessManager::exit_notify(&pcb);
             }
-            ProcessManager::exit_notify(&pcb);
-        }
+            _final_irq_guard
+        };
+        let _final_irq_guard = if oom_victim {
+            crate::mm::allocator::reserve::with_oom_exit_reserve(cleanup)
+        } else {
+            cleanup()
+        };
 
         // The terminal switch never returns to run this stack's destructors.
         // Retain only the running-task owner, released by the new stack's tail.

@@ -5,6 +5,7 @@ use crate::{
     },
     libs::{
         mutex::{Mutex, MutexGuard},
+        prepared_queue::Queue,
         rbtree::RBTree,
         spinlock::SpinLock,
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
@@ -19,7 +20,7 @@ use crate::{
 use core::fmt::Debug;
 
 use alloc::{
-    collections::{BTreeSet, LinkedList},
+    collections::BTreeSet,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -27,26 +28,56 @@ use system_error::SystemError;
 
 use super::{fs::EPollInode, EPollCtlOption, EPollEvent, EPollEventType, EPollItem};
 
-/// Epoll ready state protected by a dedicated irqsave spin lock.
-///
-/// This corresponds to Linux 6.6's `ep->lock`, which protects `rdllist`,
-/// `ovflist`, and the wait queue. The callback path does not acquire the outer
-/// sleeping mutex. The source registration snapshot still allocates and scans
-/// entries in hardirq context; that existing latency concern is separate from
-/// this lock-discipline guarantee.
+use super::epitem::{ReadyNode, ReadyQueue, Registration};
+
+/// Linux ep->lock boundary. Ready/overflow nodes are charged and prepared
+/// at registration birth; callbacks neither allocate nor acquire ep->mtx.
 pub(crate) struct ReadyState {
-    /// 就绪列表（正常路径）
-    ready_list: LinkedList<Arc<EPollItem>>,
-    /// 溢出列表 — 在 `ep_send_events` 扫描期间累积回调事件。
-    /// - `None` = 正常模式（回调直接加入 ready_list）
-    /// - `Some(vec)` = 扫描模式（回调推入 ovflist）
-    ///
-    /// 对标 Linux `ep->ovflist`：
-    /// - `EP_UNACTIVE_PTR` (-1) ↔ `None`
-    /// - `NULL` / chain ↔ `Some(vec)`
-    ovflist: Option<Vec<Arc<EPollItem>>>,
-    /// epoll_wait 等待者
+    ready_list: ReadyQueue,
+    ovflist: Option<ReadyQueue>,
     epoll_wq: WaitQueue,
+}
+
+impl ReadyState {
+    /// The owning ready lock also serializes membership and spare ownership.
+    fn enqueue(&mut self, item: &Arc<EPollItem>) -> bool {
+        let mut links = item.links.lock_irqsave();
+        let overflow = self.ovflist.is_some();
+        let queued = if overflow {
+            &mut links.overflow
+        } else {
+            &mut links.ready
+        };
+        if *queued {
+            return false;
+        }
+        *queued = true;
+        let mut node = links
+            .spare
+            .pop_node()
+            .expect("at most one ready and one overflow node");
+        node.value_mut().item = Arc::downgrade(item);
+        match self.ovflist.as_mut() {
+            Some(queue) => queue.push_node(node),
+            None => self.ready_list.push_node(node),
+        }
+        true
+    }
+}
+
+fn retire_ready_queue(mut queue: ReadyQueue) {
+    while let Some(node) = queue.pop_node() {
+        drop(node.into_value());
+    }
+}
+
+impl Drop for ReadyState {
+    fn drop(&mut self) {
+        retire_ready_queue(core::mem::take(&mut self.ready_list));
+        if let Some(queue) = self.ovflist.take() {
+            retire_ready_queue(queue);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -104,7 +135,7 @@ impl EventPoll {
         Self {
             ep_items: RBTree::new(),
             ready_state: Arc::new(SpinLock::new(ReadyState {
-                ready_list: LinkedList::new(),
+                ready_list: Queue::new(),
                 ovflist: None,
                 epoll_wq: WaitQueue::default(),
             })),
@@ -659,117 +690,105 @@ impl EventPoll {
         !rs.ready_list.is_empty() || rs.ovflist.is_some()
     }
 
-    /// 开始就绪列表扫描：偷取 ready_list 到返回的 Vec 中，
-    /// 激活 ovflist 使回调期间的新事件进入溢出列表。
-    ///
-    /// 对标 Linux `ep_start_scan()`。调用者必须持有外层 Mutex。
-    fn ep_start_scan(&self) -> Vec<Arc<EPollItem>> {
+    /// ep_start_scan: transfer existing nodes without allocation.
+    fn ep_start_scan(&self) -> ReadyQueue {
         let mut rs = self.ready_state.lock_irqsave();
-        let mut stolen = Vec::new();
-        while let Some(item) = rs.ready_list.pop_front() {
-            stolen.push(item);
-        }
-        rs.ovflist = Some(Vec::new());
+        let stolen = core::mem::take(&mut rs.ready_list);
+        rs.ovflist = Some(Queue::new());
         stolen
     }
 
-    /// 结束就绪列表扫描：将 ovflist 排空回 ready_list，
-    /// 将剩余的扫描项（水平触发需要重入队的）也加回去，关闭 ovflist。
-    ///
-    /// 对标 Linux `ep_done_scan()`。调用者必须持有外层 Mutex。
-    fn ep_done_scan(&self, remaining: Vec<Arc<EPollItem>>) {
-        let mut rs = self.ready_state.lock_irqsave();
-
-        // 将扫描期间溢出列表中积累的事件合并回 ready_list
-        if let Some(ovf) = rs.ovflist.take() {
-            for epi in ovf {
-                if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epi)) {
-                    rs.ready_list.push_back(epi);
+    /// ep_done_scan: overflow callbacks survive, but duplicate nodes return to
+    /// the registration. The caller holds ep->mtx, so each live registration
+    /// is pinned by ep_items throughout the short ready-state critical section.
+    fn ep_done_scan(&self, mut remaining: ReadyQueue, mut delivered_lt: ReadyQueue) {
+        let mut retired = Queue::new();
+        {
+            let mut rs = self.ready_state.lock_irqsave();
+            let mut overflow = rs.ovflist.take().expect("matching ep_start_scan");
+            while let Some(node) = overflow.pop_node() {
+                let Some(item) = node.value().item.upgrade() else {
+                    retired.push_node(node);
+                    continue;
+                };
+                let mut links = item.links.lock_irqsave();
+                links.overflow = false;
+                if links.ready {
+                    links.spare.push_node(node);
+                } else {
+                    links.ready = true;
+                    rs.ready_list.push_node(node);
                 }
             }
-        }
-        // ovflist 已经是 None（关闭溢出模式）
-
-        // 将水平触发等需要重入队的项加回 ready_list
-        for epi in remaining {
-            if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epi)) {
-                rs.ready_list.push_back(epi);
+            // Linux ep_done_scan puts unprocessed txlist first, concurrent
+            // overflow next, and already-delivered LT entries last. Continuous
+            // callbacks must not starve the unprocessed tail at maxevents=1.
+            rs.ready_list.append(&mut delivered_lt);
+            remaining.append(&mut rs.ready_list);
+            rs.ready_list = remaining;
+            if !rs.ready_list.is_empty() {
+                rs.epoll_wq.wakeup_all(None);
             }
         }
-
-        // 如果 ready_list 非空且有等待者，唤醒他们
-        if !rs.ready_list.is_empty() {
-            rs.epoll_wq.wakeup_all(None);
-        }
+        retire_ready_queue(retired);
     }
 
-    /// ## 将已经准备好的事件拷贝到用户空间
-    ///
-    /// 使用三阶段扫描协议（对标 Linux ep_send_events + ep_start/done_scan）：
-    /// 1. ep_start_scan: 偷取 ready_list，激活 ovflist
-    /// 2. 遍历偷取的列表，调用 ep_item_poll 收集事件（此时回调进入 ovflist）
-    /// 3. ep_done_scan: 将 ovflist 合并回 ready_list，重入队水平触发项
+    fn recycle_scanned(&self, item: &Arc<EPollItem>, node: ReadyNode) {
+        let _rs = self.ready_state.lock_irqsave();
+        let mut links = item.links.lock_irqsave();
+        links.ready = false;
+        links.spare.push_node(node);
+    }
+
     fn ep_send_events(
         epoll: LockedEventPoll,
         output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
         max_events: i32,
     ) -> Result<usize, SystemError> {
         let ep_guard = epoll.0.lock();
-        let mut res: usize = 0;
-
-        // Phase 1: 偷取 ready_list，激活 ovflist
-        let stolen = ep_guard.ep_start_scan();
-
-        // Phase 2: 遍历偷取的列表（此时 ovflist 吸收并发回调）
-        let mut push_back = Vec::new();
-        let mut pending = stolen.into_iter();
+        let mut res = 0;
+        let mut pending = ep_guard.ep_start_scan();
+        let mut delivered_lt = Queue::new();
         let mut error = None;
-        let mut remaining = Vec::new();
-        for epitem in pending.by_ref() {
-            if res >= max_events as usize {
-                remaining.push(epitem);
+        while res < max_events as usize {
+            let Some(node) = pending.pop_node() else {
                 break;
-            }
+            };
+            let Some(epitem) = node.value().item.upgrade() else {
+                drop(node.into_value());
+                continue;
+            };
             let revents = epitem.ep_item_poll();
-
-            // 如果没有就绪事件，跳过此项
             if revents.is_empty() {
+                ep_guard.recycle_scanned(&epitem, node);
                 continue;
             }
-
             let registered = EPollEventType::from_bits_truncate(epitem.event.lock_irqsave().events);
             let is_oneshot = registered.contains(EPollEventType::EPOLLONESHOT);
             let is_edge = registered.contains(EPollEventType::EPOLLET);
-
             let event = EPollEvent {
                 events: revents.bits,
                 data: epitem.event.lock_irqsave().data,
             };
-
             if let Err(err) = output(res, &event) {
-                // Failed delivery must not consume ET/ONESHOT state.
-                remaining.push(epitem);
+                // Fault must not consume ET/ONESHOT or rotate this entry.
+                pending.push_front_node(node);
                 error = Some(err);
                 break;
             }
             res += 1;
-
             if is_oneshot {
                 let mut event_guard = epitem.event.lock_irqsave();
                 let new_event = event_guard.events & EPollEventType::EP_PRIVATE_BITS.bits;
                 event_guard.set_events(new_event);
-            } else if !is_edge {
-                push_back.push(epitem);
+            }
+            if is_oneshot || is_edge {
+                ep_guard.recycle_scanned(&epitem, node);
+            } else {
+                delivered_lt.push_node(node);
             }
         }
-
-        // Phase 3: 将 ovflist 合并回 ready_list，重入队水平触发项
-        // Unprocessed entries precede delivered LT entries: a small maxevents
-        // must rotate through all ready descriptors rather than starve the tail.
-        remaining.extend(pending);
-        remaining.extend(push_back);
-        ep_guard.ep_done_scan(remaining);
-
+        ep_guard.ep_done_scan(pending, delivered_lt);
         if res == 0 {
             if let Some(err) = error {
                 return Err(err);
@@ -825,9 +844,8 @@ impl EventPoll {
         let mut notify_nested = false;
         if !event.is_empty() {
             let mut rs = epoll_guard.ready_state.lock_irqsave();
-            if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epitem)) {
-                let was_empty = rs.ready_list.is_empty();
-                rs.ready_list.push_back(epitem.clone());
+            let was_empty = rs.ready_list.is_empty();
+            if rs.enqueue(&epitem) {
                 notify_nested = was_empty;
                 rs.epoll_wq.wakeup(None);
             }
@@ -873,11 +891,26 @@ impl EventPoll {
     }
 
     fn deactivate_and_remove_ready(epoll: &EventPoll, epitem: &Arc<EPollItem>) {
-        let mut rs = epoll.ready_state.lock_irqsave();
-        epitem.deactivate();
-        rs.ready_list.retain(|item| !Arc::ptr_eq(item, epitem));
-        if let Some(ovflist) = rs.ovflist.as_mut() {
-            ovflist.retain(|item| !Arc::ptr_eq(item, epitem));
+        let retired;
+        let overflow;
+        {
+            let mut rs = epoll.ready_state.lock_irqsave();
+            epitem.deactivate();
+            retired = rs
+                .ready_list
+                .extract_if(|registration| registration.item.ptr_eq(&Arc::downgrade(epitem)));
+            overflow = rs.ovflist.as_mut().map(|queue| {
+                queue.extract_if(|registration| registration.item.ptr_eq(&Arc::downgrade(epitem)))
+            });
+            let mut links = epitem.links.lock_irqsave();
+            links.ready = false;
+            links.overflow = false;
+        }
+        // No scan can coexist with DEL/close while ep->mtx is held. Retiring
+        // the charged detached nodes is safe only after releasing ep->lock.
+        retire_ready_queue(retired);
+        if let Some(queue) = overflow {
+            retire_ready_queue(queue);
         }
     }
 
@@ -904,9 +937,8 @@ impl EventPoll {
         let mut notify_nested = false;
         if !event.is_empty() {
             let mut rs = epoll_guard.ready_state.lock_irqsave();
-            if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epitem)) {
-                let was_empty = rs.ready_list.is_empty();
-                rs.ready_list.push_back(epitem.clone());
+            let was_empty = rs.ready_list.is_empty();
+            if rs.enqueue(&epitem) {
                 notify_nested = was_empty;
                 rs.epoll_wq.wakeup(None);
             }
@@ -972,8 +1004,8 @@ impl EventPoll {
     ///
     /// Like Linux `ep_poll_callback()`, this path never acquires the outer
     /// sleeping `Mutex<EventPoll>`. Registration and ready-state locks use
-    /// irqsave discipline. The registration snapshot's existing allocation and
-    /// O(N) scan remain a separately documented hardirq latency risk.
+    /// irqsave discipline. Source and ready nodes were prepared before
+    /// registration publication; the callback path performs no allocation.
     pub fn wakeup_epoll(
         epitems: &EPollItemList,
         pollflags: EPollEventType,
@@ -996,18 +1028,23 @@ impl EventPoll {
         broadcast: bool,
     ) -> Result<(), SystemError> {
         // Release the source lock before any callback or nested notification.
-        let snapshot = epitems.snapshot();
+        let through = epitems.last_id();
         // Linux places ordinary callbacks before exclusive callbacks. The
         // classification is immutable: exclusive may only be added, never MOD.
         for exclusive in [false, true] {
-            for epitem in &snapshot {
+            let mut after = 0;
+            while let Some((id, item)) = epitems.next(after, through) {
+                after = id;
+                let Some(epitem) = item.upgrade() else {
+                    continue;
+                };
                 let is_exclusive = epitem.event().lock_irqsave().events()
                     & EPollEventType::EPOLLEXCLUSIVE.bits()
                     != 0;
                 if is_exclusive != exclusive {
                     continue;
                 }
-                if Self::notify_epitem(epitem, pollflags) && !broadcast {
+                if Self::notify_epitem(&epitem, pollflags) && !broadcast {
                     break;
                 }
             }
@@ -1051,17 +1088,7 @@ impl EventPoll {
                 return false;
             }
 
-            if let Some(ref mut ovflist) = rs.ovflist {
-                // 扫描进行中 — 推入溢出列表
-                if !ovflist.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                    ovflist.push(epitem.clone());
-                }
-            } else {
-                // 正常模式 — 推入 ready_list
-                if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                    rs.ready_list.push_back(epitem.clone());
-                }
-            }
+            rs.enqueue(epitem);
 
             if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
                 && !pollflags.contains(EPollEventType::POLLFREE)
@@ -1090,44 +1117,94 @@ impl EventPoll {
     }
 }
 
-/// An IRQ-safe list of epoll registrations attached to a pollable source.
-///
-/// The inner lock is deliberately private: wakeups can run in hardirq context,
-/// so task-context registration updates must use the same irqsave discipline.
+/// Source registrations, prepared at epoll_ctl birth. Notification never
+/// allocates and invokes callbacks only after releasing the source lock.
 #[derive(Debug)]
 pub struct EPollItemList {
-    items: SpinLock<LinkedList<Arc<EPollItem>>>,
+    // Published nodes own the item until explicit source removal, matching
+    // Linux waitqueue registration lifetime across File/epoll close races.
+    items: SpinLock<RBTree<u64, Registration>>,
 }
 
 impl EPollItemList {
-    pub fn add(&self, epitem: Arc<EPollItem>) {
-        self.items.lock_irqsave().push_back(epitem);
-    }
-
-    pub fn remove(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut items = self.items.lock_irqsave();
-        let old_len = items.len();
-        items.retain(|item| !Arc::ptr_eq(item, epitem));
-        if items.len() != old_len {
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
+    pub const fn new() -> Self {
+        Self {
+            items: SpinLock::new(RBTree::new()),
         }
     }
 
-    fn snapshot(&self) -> Vec<Arc<EPollItem>> {
-        self.items.lock_irqsave().iter().cloned().collect()
+    pub fn add(&self, epitem: Arc<EPollItem>) {
+        // All possible source memberships (pipe read/write + File) were
+        // prepared and charged before the first publication.
+        let mut items = self.items.lock_irqsave();
+        if !items.contains_key(&epitem.registration_id) {
+            // No links lock is ever held while acquiring a source lock.
+            items.insert_prepared(epitem.take_source_node());
+        }
     }
 
-    pub fn take_all(&self) -> LinkedList<Arc<EPollItem>> {
-        core::mem::take(&mut *self.items.lock_irqsave())
+    pub fn remove(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let node = self.items.lock_irqsave().extract(&epitem.registration_id);
+        match node {
+            Some(node) => {
+                epitem.return_source_node(node);
+                Ok(())
+            }
+            None => Err(SystemError::ENOENT),
+        }
+    }
+
+    fn last_id(&self) -> u64 {
+        self.items
+            .lock_irqsave()
+            .get_last()
+            .map_or(0, |(id, _)| *id)
+    }
+
+    fn next(&self, after: u64, through: u64) -> Option<(u64, Weak<EPollItem>)> {
+        let items = self.items.lock_irqsave();
+        let (id, registration) = items.upper_bound(&after)?;
+        (*id <= through).then(|| (*id, registration.item.clone()))
+    }
+
+    pub fn take_all(&self) -> EPollItemDrain {
+        EPollItemDrain {
+            items: core::mem::take(&mut *self.items.lock_irqsave()),
+        }
     }
 }
 
 impl Default for EPollItemList {
     fn default() -> Self {
-        Self {
-            items: SpinLock::new(LinkedList::new()),
+        Self::new()
+    }
+}
+impl Drop for EPollItemList {
+    fn drop(&mut self) {
+        drop(self.take_all());
+    }
+}
+
+/// Detached source storage: free node memory before its charge receipt.
+pub struct EPollItemDrain {
+    items: RBTree<u64, Registration>,
+}
+impl Iterator for EPollItemDrain {
+    type Item = Arc<EPollItem>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let id = *self.items.get_first()?.0;
+            let (_, mut registration) = self.items.extract(&id).unwrap().into_pair();
+            if let Some(item) = registration.published_pin.take() {
+                return Some(item);
+            }
+        }
+    }
+}
+impl Drop for EPollItemDrain {
+    fn drop(&mut self) {
+        while let Some((&id, _)) = self.items.get_first() {
+            drop(self.items.extract(&id).unwrap().into_pair());
         }
     }
 }

@@ -656,7 +656,13 @@ impl AddressSpace {
                     Some(creator),
                     &data_account,
                 )?;
+                #[cfg(target_arch = "riscv64")]
+                g.map_signal_trampoline(creator, &data_account)?;
             }
+        }
+        #[cfg(target_arch = "riscv64")]
+        if create_stack {
+            result.sync_remote_user_icache();
         }
         return Ok(result);
     }
@@ -2626,6 +2632,10 @@ impl AddressSpace {
             drop(guard);
             match result {
                 Ok(()) => {
+                    // A fresh child mm must fence before executing inherited code
+                    // even on a hart that has never run the parent.
+                    #[cfg(target_arch = "riscv64")]
+                    child.sync_remote_user_icache();
                     #[cfg(target_arch = "x86_64")]
                     if let Some(vaddr) = self.uret_trampoline_vaddr() {
                         child.inherit_uret_trampoline(vaddr, &creator, &child_data_account)?;

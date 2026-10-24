@@ -71,7 +71,7 @@ static QUEUE: SpinLock<Queue> = SpinLock::new(Queue::new());
 /// stacks; neither coalescing nor publication allocates or retires a last owner.
 pub(crate) fn enqueue(mm: Arc<AddressSpace>) {
     QUEUE.lock_irqsave().push(mm);
-    super::memory_notify::request_lazy_mm_drop();
+    super::memory_notify::request_deferred_drop();
 }
 
 /// Only the resource-lock-free memory worker may retire these owners. A finite

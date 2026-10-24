@@ -9,8 +9,8 @@ use crate::{
         pci::pci_irq::IrqType,
         pci::{
             pci::{
-                PciBarSubresourceGuard, PciDeviceStructure, PciDeviceStructureGeneralDevice,
-                PciError,
+                Command, PciBarSubresourceGuard, PciDeviceStructure,
+                PciDeviceStructureGeneralDevice, PciError,
             },
             pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ},
         },
@@ -175,6 +175,13 @@ pub enum VirtIOTransport {
 }
 
 impl VirtIOTransport {
+    pub(crate) fn config_irq_valid(&self) -> bool {
+        match self {
+            Self::Pci(transport) => transport.config_irq_valid(),
+            Self::Mmio(_) => true,
+        }
+    }
+
     pub fn irq(&self) -> IrqNumber {
         match self {
             VirtIOTransport::Pci(transport) => transport.irq(),
@@ -209,6 +216,24 @@ impl VirtIOTransport {
             VirtIOTransport::Pci(transport) => transport.reserve_shared_memory_region(region),
             VirtIOTransport::Mmio(_) => Err(PciError::InvalidBarType),
         }
+    }
+
+    /// Enter polling mode only when no interrupt owner exists. Suppressing
+    /// used notifications alone does not mask configuration-change INTx.
+    /// MMIO has no equivalent generic interrupt-mask register.
+    pub(crate) fn prepare_polling(&mut self) -> Result<(), system_error::SystemError> {
+        let Self::Pci(transport) = self else {
+            return Err(system_error::SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        };
+        let device = transport.pci_device();
+        let _lifecycle = device.common_header.irq_lifecycle.lock();
+        device
+            .ensure_irq_unowned()
+            .map_err(|_| system_error::SystemError::EBUSY)?;
+        let (_, command) = device.status_command();
+        device.set_command(command | Command::INTERRUPT_DISABLE);
+        transport.ack_interrupt();
+        Ok(())
     }
 
     /// 设置中断

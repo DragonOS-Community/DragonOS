@@ -19,7 +19,17 @@ use crate::{
         ucontext::{AddressSpace, UserStack},
         VirtAddr,
     },
+    syscall::user_access::copy_to_user_protected,
 };
+
+// Keep unsupported architectures on their existing fallible heap path; this
+// consumer does not imply a vmalloc port for those platforms.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+type ExecPointers = crate::mm::kernel_buffer::KernelSlice<VirtAddr>;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+type ExecPointers = Vec<VirtAddr>;
+
+use super::exec_args::{ExecArguments, ExecStrings};
 
 use super::{
     namespace::{nsproxy::exec_task_namespaces, user_namespace::map_id_up},
@@ -71,9 +81,8 @@ pub enum LoadBinaryResult {
     NeedReexec {
         /// Start information for the next exec round.
         next: ExecStartInfo,
-        /// New argv (interpreter path + [optional arg] + script path + original
-        /// args).
-        new_argv: Vec<CString>,
+        /// Bounded shebang metadata; argv is rebuilt outside exec_update.
+        interpreter_arg: Option<String>,
     },
 }
 
@@ -238,17 +247,22 @@ impl ExecParam {
     /// - `file`: The executable file opened via `do_open_execat`.
     /// - `vm`: The address space.
     /// - `flags`: Execution flags.
-    pub fn new(
+    pub(crate) fn new(
         file: Arc<File>,
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
         filename: CString,
         execfn: CString,
         interp_flags: ExecInterpFlags,
+        arguments: &ExecArguments,
     ) -> Result<Self, SystemError> {
         let exec_write_guard =
             crate::filesystem::vfs::write_access::InodeWriteGuard::deny_write(file.inode())?;
-        let mut init_info = ProcInitInfo::new(execfn.to_string_lossy().as_ref());
+        let mut init_info = ProcInitInfo::new(
+            execfn.to_string_lossy().as_ref(),
+            arguments.args.clone(),
+            arguments.envs.clone(),
+        );
         init_info.execfn = Some(execfn.clone());
         Ok(Self {
             file,
@@ -778,33 +792,6 @@ pub fn load_binary_file_with_context(
                 },
             )?;
 
-        // Get the script path.
-        let script_path = param.filename().to_string_lossy().into_owned();
-
-        // Build the new argv.
-        // Linux semantics: [interpreter, optional_arg, script_path, original_args[1:]...]
-        let mut new_argv = Vec::new();
-
-        // argv[0] = interpreter path
-        new_argv.push(
-            CString::new(shebang_info.interpreter_path.clone()).map_err(|_| SystemError::EINVAL)?,
-        );
-
-        // argv[1] = optional argument (if present)
-        if let Some(ref arg) = shebang_info.interpreter_arg {
-            new_argv.push(CString::new(arg.clone()).map_err(|_| SystemError::EINVAL)?);
-        }
-
-        // argv[N] = script path
-        new_argv.push(CString::new(script_path).map_err(|_| SystemError::EINVAL)?);
-
-        // Append the original arguments (skip argv[0], already replaced by the
-        // script path).
-        let original_args = &param.init_info().args;
-        if original_args.len() > 1 {
-            new_argv.extend(original_args[1..].iter().cloned());
-        }
-
         return Ok(LoadBinaryResult::NeedReexec {
             next: ExecStartInfo::new(
                 interpreter_file,
@@ -812,7 +799,7 @@ pub fn load_binary_file_with_context(
                 param.execfn().to_string_lossy().into_owned(),
                 ExecInterpFlags::empty(),
             ),
-            new_argv,
+            interpreter_arg: shebang_info.interpreter_arg,
         });
     }
 
@@ -838,24 +825,58 @@ pub fn load_binary_file_with_context(
     Ok(LoadBinaryResult::Loaded(result))
 }
 
+/// Per-exec CPU pointer storage prepared before acquiring exec_update. Its
+/// admission may reclaim/wait; stack population must only borrow this owner.
+/// Keep it outside ExecParam so final vmalloc release also occurs after the
+/// exec transaction guard, including every early error and shebang restart.
+pub(crate) struct ExecStackPointers {
+    args: ExecPointers,
+    envs: ExecPointers,
+}
+
+impl ExecStackPointers {
+    pub(crate) fn prepare(argc: usize, envc: usize) -> Result<Self, SystemError> {
+        Ok(Self {
+            args: Self::allocate(argc)?,
+            envs: Self::allocate(envc)?,
+        })
+    }
+
+    fn allocate(len: usize) -> Result<ExecPointers, SystemError> {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            File::recover_io(|| ExecPointers::try_filled(len, VirtAddr::new(0)))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let mut storage = Vec::new();
+            storage
+                .try_reserve_exact(len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            storage.resize(len, VirtAddr::new(0));
+            Ok(storage)
+        }
+    }
+}
+
 /// Program initialization information. These values are pushed onto the user
 /// stack.
 #[derive(Debug)]
 pub struct ProcInitInfo {
     pub proc_name: CString,
-    pub args: Vec<CString>,
-    pub envs: Vec<CString>,
+    pub args: Arc<ExecStrings>,
+    pub envs: Arc<ExecStrings>,
     pub auxv: BTreeMap<u8, usize>,
     pub execfn: Option<CString>,
     pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
-    pub fn new(proc_name: &str) -> Self {
+    pub fn new(proc_name: &str, args: Arc<ExecStrings>, envs: Arc<ExecStrings>) -> Self {
         Self {
             proc_name: CString::new(proc_name).unwrap_or(CString::new("").unwrap()),
-            args: Vec::new(),
-            envs: Vec::new(),
+            args,
+            envs,
             auxv: BTreeMap::new(),
             execfn: None,
             rand_num: [0u8; 16],
@@ -870,18 +891,26 @@ impl ProcInitInfo {
     ///
     /// A tuple where the first element is the final user stack pointer and the
     /// second element is the starting address of the `argv` pointer array.
-    pub unsafe fn push_at(
+    pub(crate) unsafe fn push_at(
         &mut self,
         ustack: &mut UserStack,
+        pointers: &mut ExecStackPointers,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
+        // Reject a stale preparation before any stack write. A script restarts
+        // exec with its final argument list and prepares fresh storage there.
+        if pointers.args.len() != self.args.len() || pointers.envs.len() != self.envs.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let envps = &mut pointers.envs;
+        let argps = &mut pointers.args;
         // First, push the program name onto the stack.
         self.push_str(ustack, &self.proc_name)?;
 
         // Then push the environment variables onto the stack.
-        let envps = self.push_strings(ustack, &self.envs)?;
+        self.push_strings(ustack, &self.envs, envps)?;
 
         // Then push the arguments onto the stack.
-        let argps = self.push_strings(ustack, &self.args)?;
+        self.push_strings(ustack, &self.args, argps)?;
 
         // Push the random number and store its pointer in auxv.
         self.push_slice(ustack, &[self.rand_num])?;
@@ -905,10 +934,8 @@ impl ProcInitInfo {
         // - argc: 1 word
         let length_to_push =
             self.remaining_stack_words(envps.len(), argps.len()) * core::mem::size_of::<usize>();
-        self.push_slice(
-            ustack,
-            &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
-        )?;
+        let padding = (ustack.sp().data() - length_to_push) & 0xF;
+        self.push_slice(ustack, &[0u8; 15][..padding])?;
 
         // Push auxv.
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
@@ -918,11 +945,11 @@ impl ProcInitInfo {
 
         // Push the environment variable pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
-        self.push_slice(ustack, envps.as_slice())?;
+        self.push_slice(ustack, envps)?;
 
         // Push the argument pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
-        self.push_slice(ustack, argps.as_slice())?;
+        self.push_slice(ustack, argps)?;
         let argv_ptr = ustack.sp();
 
         // Push argc onto the stack.
@@ -934,22 +961,22 @@ impl ProcInitInfo {
     /// Copy strings in reverse onto the downward-growing stack, matching Linux's
     /// contiguous, ascending-address string layout. Process-title implementations
     /// rely on this layout when computing the writable argument string span.
-    /// Return pointers in the original logical order, not the copy order.
+    /// Record pointers in the original logical order, not the copy order.
     fn push_strings(
         &self,
         ustack: &mut UserStack,
-        strings: &[CString],
-    ) -> Result<Vec<VirtAddr>, SystemError> {
-        let mut pointers = Vec::new();
-        pointers
-            .try_reserve_exact(strings.len())
-            .map_err(|_| SystemError::ENOMEM)?;
-        for string in strings.iter().rev() {
-            self.push_str(ustack, string)?;
-            pointers.push(ustack.sp());
+        strings: &ExecStrings,
+        pointers: &mut [VirtAddr],
+    ) -> Result<(), SystemError> {
+        // Lengths were validated together before push_at made any stack write.
+        // No allocation or admission recovery runs under the exec-update lock.
+        for (index, range) in (0..strings.len()).rev().zip(strings.ranges().rev()) {
+            for part in strings.chunks(range).rev() {
+                self.push_slice(ustack, part)?;
+            }
+            pointers[index] = ustack.sp();
         }
-        pointers.reverse();
-        Ok(pointers)
+        Ok(())
     }
 
     fn remaining_stack_words(&self, envc: usize, argc: usize) -> usize {
@@ -961,12 +988,20 @@ impl ProcInitInfo {
     }
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {
-        let mut sp = ustack.sp();
-        sp -= core::mem::size_of_val(slice);
-        sp -= sp.data() % core::mem::align_of::<T>();
+        let len = core::mem::size_of_val(slice);
+        let address = ustack
+            .sp()
+            .data()
+            .checked_sub(len)
+            .ok_or(SystemError::E2BIG)?;
+        let sp = VirtAddr::new(address - address % core::mem::align_of::<T>());
 
-        unsafe { core::slice::from_raw_parts_mut(sp.data() as *mut T, slice.len()) }
-            .copy_from_slice(slice);
+        // The stack VMA is lazy: even a valid address may fail to acquire a
+        // physical page. Never turn userspace into a Rust slice and memcpy
+        // through an unprotected kernel fault. Exec's existing error path
+        // retires the failed image after these owners have unwound normally.
+        let bytes = unsafe { core::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), len) };
+        unsafe { copy_to_user_protected(sp, bytes)? };
         unsafe {
             ustack.set_sp(sp);
         }

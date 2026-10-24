@@ -1,7 +1,5 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::mm::LockedFrameAllocator;
 use crate::arch::syscall::nr::SYS_SYSINFO;
-use crate::mm::allocator::page_frame::FrameAllocator;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
@@ -95,7 +93,7 @@ fn do_sysinfo(info: *mut PosixSysInfo) -> Result<usize, SystemError> {
     let mut writer = UserBufferWriter::new(info, core::mem::size_of::<PosixSysInfo>(), true)?;
     let mut sysinfo = PosixSysInfo::default();
 
-    let mem = unsafe { LockedFrameAllocator.usage() };
+    let mem = crate::mm::balloon::managed_usage();
 
     sysinfo.uptime = uptime_secs();
     sysinfo.loads = [0; 3];

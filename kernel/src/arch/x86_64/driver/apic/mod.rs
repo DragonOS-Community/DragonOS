@@ -50,6 +50,28 @@ pub enum LocalApicEnableType {
 static LOCAL_APIC_ENABLE_TYPE: AtomicLocalApicEnableType =
     AtomicLocalApicEnableType::new(LocalApicEnableType::XApic);
 
+/// Best-effort stop broadcast for an already terminal kernel failure.
+/// Never use the normal ICR writer: it waits without a bound and its xAPIC
+/// lookup may panic on a nested RefCell borrow or incomplete CPU bootstrap.
+pub(crate) fn try_fatal_stop_others() {
+    if unsafe { core::arch::x86_64::__cpuid(1) }.edx & (1 << 9) == 0 {
+        return;
+    }
+    let base = unsafe { rdmsr(IA32_APIC_BASE) };
+    if base & (1 << 11) == 0 {
+        return;
+    }
+    let vector = crate::arch::interrupt::ipi::IPI_NUM_STOP_CPU.data() as u8;
+    // Fixed, physical, edge-triggered, all excluding self. No target mask or
+    // CPU registry is needed, and completion/acknowledgement is never awaited.
+    let low = u32::from(vector) | (1 << 14) | (3 << 18);
+    if base & (1 << 10) != 0 {
+        unsafe { wrmsr(x86::msr::IA32_X2APIC_ICR, u64::from(low)) };
+    } else {
+        xapic::try_fatal_broadcast(low);
+    }
+}
+
 pub trait LocalAPIC {
     /// @brief 判断当前处理器是否支持这个类型的apic
     ///

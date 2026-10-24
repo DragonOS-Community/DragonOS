@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::{intrinsics::unlikely, panic};
+use core::{fmt::Write, intrinsics::unlikely, panic};
 use log::error;
 use system_error::SystemError;
 use x86::{bits64::rflags::RFlags, controlregs::Cr4};
@@ -16,6 +16,7 @@ use crate::{
         signal::force_sig_fault_to_current,
         signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     },
+    libs::printk::BoundedLogRecord,
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         oom::{OomContext, OomOutcome},
@@ -31,6 +32,44 @@ pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
 
 impl X86_64MMArch {
+    /// Called only after releasing the address-space guard on terminal unmapped
+    /// user faults. Logging may allocate or enter the console path.
+    fn report_unmapped_fault(
+        regs: &TrapFrame,
+        error_code: X86PfErrorCode,
+        address: VirtAddr,
+        flags: FaultFlags,
+    ) {
+        let pcb = ProcessManager::current_pcb();
+        let mut name = BoundedLogRecord::new();
+        if let Some(basic) = pcb.try_basic() {
+            let source = basic.name();
+            let mut end = source.len().min(64);
+            while !source.is_char_boundary(end) {
+                end -= 1;
+            }
+            let _ = name.write_str(&source[..end]);
+        } else {
+            let _ = name.write_str("<unavailable>");
+        }
+        // The nonblocking basic-info guard is gone before formatting or logging.
+        // Registers are the faulting instruction's snapshot, not syscall args.
+        log::error!(
+            "pid: {} ({}) No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, rax:{:#x}, rdi:{:#x}, rsi:{:#x}, rdx:{:#x}, rsp:{:#x}, flags: {:?}",
+            ProcessManager::current_pid().data(),
+            name.as_str(),
+            error_code,
+            regs.rip,
+            address.data(),
+            regs.rax,
+            regs.rdi,
+            regs.rsi,
+            regs.rdx,
+            regs.rsp,
+            flags
+        );
+    }
+
     /// A protection fault can block behind the address-space write lock while
     /// mprotect/mremap publishes a new leaf PTE. The hardware error code then
     /// describes the old PTE, so revalidate write/instruction permission from
@@ -203,10 +242,10 @@ impl X86_64MMArch {
             }
         }
         panic!(
-            "do_kern_addr_fault has not yet been implemented, 
+            "do_kern_addr_fault has not yet been implemented,
         fault address: {:#x},
         rip: {:#x},
-        error_code: {:#b}, 
+        error_code: {:#b},
         pid: {}\n",
             address.data(),
             regs.rip,
@@ -368,7 +407,7 @@ impl X86_64MMArch {
         );
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
 
-        let mut tried_direct_reclaim = false;
+        let mut global_recovery = crate::mm::fault_recovery::GlobalFaultRecoveryState::new();
         let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
 
         'fault_retry: loop {
@@ -399,13 +438,8 @@ impl X86_64MMArch {
                             return;
                         }
 
-                        log::error!(
-                            "pid:{}, can not find nearest vma, \n\terror_code: {:?}, address: {:#x}, rip: {:#x}",
-                            ProcessManager::current_pid().data(),
-                            error_code,
-                            address.data(),
-                            regs.rip,
-                        );
+                        drop(space_guard);
+                        Self::report_unmapped_fault(regs, error_code, address, flags);
 
                         send_segv_maperr();
                         return;
@@ -547,14 +581,8 @@ impl X86_64MMArch {
                             return;
                         }
 
-                        log::error!(
-                            "pid: {} No mapped vma, error_code: {:?},rip:{:#x}, address: {:#x}, flags: {:?}",
-                            ProcessManager::current_pid().data(),
-                            error_code,
-                            regs.rip,
-                            address.data(),
-                            flags
-                        );
+                        drop(space_guard);
+                        Self::report_unmapped_fault(regs, error_code, address, flags);
 
                         send_segv_maperr();
                         return;
@@ -723,18 +751,15 @@ impl X86_64MMArch {
                     // Skip direct reclaim for fault-injection OOM: the injection
                     // consumes a fail count on the first fault, so reclaiming
                     // then retrying would bypass the killer entirely.
-                    if !tried_direct_reclaim
-                        && !fault.contains(VmFaultReason::VM_FAULT_OOM_INJECTED)
-                    {
-                        tried_direct_reclaim = true;
-                        drop(space_guard);
-                        crate::mm::page::PageReclaimer::shrink_list(
-                            <crate::mm::allocator::page_frame::PageFrameCount>::new(64),
-                        );
-                        continue;
-                    }
-
                     drop(space_guard);
+                    if !fault.contains(VmFaultReason::VM_FAULT_OOM_INJECTED) {
+                        match global_recovery.retry() {
+                            Ok(true) => continue 'fault_retry,
+                            Ok(false) => {}
+                            Err(SystemError::EINTR | SystemError::ERESTARTSYS) => return,
+                            Err(_) => {}
+                        }
+                    }
                     crate::mm::oom::report::report(format_args!(
                         "page fault OOM: pid={:?}, addr={:#x}, rip={:#x}, fault={:?}\n",
                         ProcessManager::current_pid(),

@@ -827,7 +827,7 @@ impl ProcessManager {
         pcb.set_execute_path(current_pcb.execute_path());
 
         // 继承 cmdline（/proc/<pid>/cmdline 语义）
-        pcb.set_cmdline_bytes(current_pcb.cmdline_bytes());
+        pcb.set_cmdline_snapshot(current_pcb.cmdline_snapshot());
 
         let current_leader = {
             let ti = current_pcb.thread.read_irqsave();

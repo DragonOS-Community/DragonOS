@@ -576,12 +576,10 @@ pub fn fuse_try_automount_submount(
             attr_flags,
         );
         let submount_flags = mountpoint.mount_fs().mount_flags() | MountFlags::SUBMOUNT;
-        match mountpoint.mount_subtree_with_state_if_vacant(
+        match mountpoint.mount_automount_if_vacant(
             sub_fs.clone(),
             sub_fs.root_node(),
             submount_flags,
-            None,
-            None,
         ) {
             Ok(_) | Err(SystemError::EEXIST) => Ok(()),
             Err(error) => Err(error),

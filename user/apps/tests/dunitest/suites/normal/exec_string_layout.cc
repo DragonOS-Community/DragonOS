@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -8,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -20,6 +23,8 @@ namespace {
 constexpr char kPrefix[] = "dragonos-exec-layout-";
 constexpr char kEmptyArgvEnv[] = "DRAGONOS_EXEC_LAYOUT_EMPTY_ARGV=1";
 constexpr char kScriptMode[] = "--exec-layout-script";
+constexpr char kLongArgZeroMode[] = "--exec-layout-long-arg-zero";
+constexpr char kBinaryArgZeroMode[] = "--exec-layout-binary-arg-zero";
 std::string self_path;
 
 struct Input {
@@ -45,6 +50,36 @@ Input input_for(const std::string& mode, const std::string& script = {}) {
             input.args.push_back("arg-" + std::to_string(i));
             input.env.push_back("ENV_" + std::to_string(i) + "=value");
         }
+    } else if (mode == "many-entries") {
+        // Each kernel pointer array exceeds two pages on 64-bit guests.
+        for (int i = 0; i < 1537; ++i) {
+            input.args.push_back("arg-" + std::to_string(i));
+            input.env.push_back("ENV_" + std::to_string(i) + "=value");
+        }
+    } else if (mode == "max-string") {
+        // Linux MAX_ARG_STRLEN includes the terminating NUL.
+        input.args.push_back(std::string(32 * static_cast<size_t>(getpagesize()) - 1, 'm'));
+    } else if (mode == "many-empty") {
+        // Exceeds a single page-sized directory of CString-sized entries.
+        input.args.insert(input.args.end(), 60000, "");
+        input.env.insert(input.env.end(), 30000, "");
+    } else if (mode == "binary") {
+        input.args.push_back(std::string("arg-\xff\x80", 6));
+        input.env.push_back(std::string("KEY=\xfe\x81", 6));
+    } else if (mode == "long-arg-zero") {
+        // argv[0] is opaque data, not a pathname. Exercise the entire legal
+        // Linux string length without asking path resolution to copy it.
+        input.args = {std::string(32 * static_cast<size_t>(getpagesize()) - 1, 'z'),
+                      kLongArgZeroMode, "payload"};
+    } else if (mode == "binary-arg-zero") {
+        input.args = {std::string("argzero-\xff\x80", 10), kBinaryArgZeroMode, "payload"};
+    } else if (mode == "page-edge") {
+        input.args.push_back("end");
+    } else if (mode == "proc-snapshot") {
+        input.args.push_back(std::string(3 * static_cast<size_t>(getpagesize()) + 37, 'p'));
+        input.args.insert(input.args.end(), {"", "last"});
+    } else if (mode == "small-stack-fit") {
+        input.args.insert(input.args.end(), 28, std::string(4095, 's'));
     } else if (mode == "empty-argv") {
         // Linux normalizes argv={NULL} to argc=1, argv[0]="".
         input.args = {""};
@@ -129,6 +164,74 @@ int check_layout(int argc, char** argv, char** envp, const Input& expected,
     return 0;
 }
 
+// Read in small pieces and then seek across a page boundary. This must not
+// depend on a kernel-side contiguous copy of the entire command line.
+int check_proc_cmdline(const Input& input) {
+    std::string expected;
+    for (const auto& arg : input.args) {
+        expected.append(arg);
+        expected.push_back('\0');
+    }
+    const int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 10;
+    }
+    char bytes[137];
+    size_t offset = 0;
+    int result = 0;
+    for (;;) {
+        const ssize_t n = read(fd, bytes, sizeof(bytes));
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 || static_cast<size_t>(n) > expected.size() - offset ||
+            (n > 0 && memcmp(bytes, expected.data() + offset, n) != 0)) {
+            result = 11;
+            break;
+        }
+        if (n == 0) {
+            if (offset != expected.size()) {
+                result = 12;
+            }
+            break;
+        }
+        offset += static_cast<size_t>(n);
+    }
+    const off_t boundary = static_cast<off_t>(getpagesize()) - 3;
+    if (result == 0 && lseek(fd, boundary, SEEK_SET) != boundary) {
+        result = 13;
+    }
+    if (result == 0) {
+        const ssize_t n = read(fd, bytes, sizeof(bytes));
+        if (n != static_cast<ssize_t>(sizeof(bytes)) ||
+            memcmp(bytes, expected.data() + boundary, sizeof(bytes)) != 0) {
+            result = 14;
+        }
+    }
+    close(fd);
+    return result;
+}
+
+int check_proc_snapshot_and_fork(const Input& input) {
+    const int result = check_proc_cmdline(input);
+    if (result != 0) {
+        return result;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        return 15;
+    }
+    if (child == 0) {
+        _exit(check_proc_cmdline(input));
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 16;
+}
+
 std::vector<char*> pointers(std::vector<std::string>& strings) {
     std::vector<char*> result;
     for (auto& value : strings) {
@@ -151,10 +254,74 @@ void run_case(const std::string& mode, const std::string& script = {}) {
     const pid_t child = fork();
     ASSERT_GE(child, 0) << strerror(errno);
     if (child == 0) {
-        alarm(10);
+        alarm(30);
+        if (mode == "small-stack-fit") {
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_STACK, &limit) != 0) {
+                _exit(120);
+            }
+            limit.rlim_cur = 512 * 1024;
+            if (setrlimit(RLIMIT_STACK, &limit) != 0) {
+                _exit(121);
+            }
+        }
+        if (mode == "page-edge") {
+            const size_t page = static_cast<size_t>(getpagesize());
+            void* mapping = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mapping == MAP_FAILED ||
+                mprotect(static_cast<char*>(mapping) + page, page, PROT_NONE) != 0) {
+                _exit(122);
+            }
+            char* ending = static_cast<char*>(mapping) + page - 4;
+            memcpy(ending, "end", 4);
+            argv[1] = ending;
+        }
         execve(path.c_str(), argv.data(), envp.data());
         dprintf(STDERR_FILENO, "execve failed: %s\n", strerror(errno));
         _exit(127);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(child, waited) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+// A rejected call must return to the old image, which then performs a valid
+// exec. Unexpected success enters an intentionally mismatched helper case and
+// fails deterministically rather than constructing an unbounded argument list.
+void expect_e2big_and_retry(size_t strings, size_t string_bytes, rlim_t soft_stack) {
+    std::vector<std::string> rejected(strings, std::string(string_bytes, 'x'));
+    rejected.insert(rejected.begin(), std::string(kPrefix) + "unexpected-rejected-exec");
+    auto rejected_argv = pointers(rejected);
+    char* empty_env[] = {nullptr};
+    Input valid = input_for("single");
+    auto valid_argv = pointers(valid.args);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        alarm(30);
+        if (soft_stack != 0) {
+            struct rlimit limit;
+            if (getrlimit(RLIMIT_STACK, &limit) != 0) {
+                _exit(120);
+            }
+            limit.rlim_cur = soft_stack;
+            if (setrlimit(RLIMIT_STACK, &limit) != 0) {
+                _exit(121);
+            }
+        }
+        execve(self_path.c_str(), rejected_argv.data(), empty_env);
+        if (errno != E2BIG) {
+            dprintf(STDERR_FILENO, "rejected exec errno=%d, expected E2BIG\n", errno);
+            _exit(123);
+        }
+        execve(self_path.c_str(), valid_argv.data(), empty_env);
+        _exit(124);
     }
     int status = 0;
     pid_t waited;
@@ -188,7 +355,30 @@ TEST(ExecStringLayout, EmptyStrings) { run_case("empty-strings"); }
 TEST(ExecStringLayout, EmptyEnvironment) { run_case("empty-env"); }
 TEST(ExecStringLayout, SingleArgument) { run_case("single"); }
 TEST(ExecStringLayout, CrossPageStringsAndManyEntries) { run_case("large"); }
+TEST(ExecStringLayout, ManyArgumentAndEnvironmentPointers) { run_case("many-entries"); }
 TEST(ExecStringLayout, EmptyArgumentVector) { run_case("empty-argv"); }
+TEST(ExecStringLayout, LargestLinuxArgumentString) { run_case("max-string"); }
+TEST(ExecStringLayout, ManyEmptyArgumentsAndEnvironmentEntries) { run_case("many-empty"); }
+TEST(ExecStringLayout, NonUtf8ArgumentsAndEnvironment) { run_case("binary"); }
+TEST(ExecStringLayout, LargestLinuxArgZeroIsOpaqueData) { run_case("long-arg-zero"); }
+TEST(ExecStringLayout, NonUtf8ArgZeroIsOpaqueData) { run_case("binary-arg-zero"); }
+TEST(ExecStringLayout, TerminatingNulAtProtectedPageBoundary) { run_case("page-edge"); }
+TEST(ExecStringLayout, ProcCmdlinePartialReadsAndForkSnapshot) { run_case("proc-snapshot"); }
+TEST(ExecStringLayout, SmallStackAcceptsArgumentsBelowBudget) { run_case("small-stack-fit"); }
+
+TEST(ExecStringLayout, OverlongArgumentReturnsE2bigAndCanRetry) {
+    expect_e2big_and_retry(1, 32 * static_cast<size_t>(getpagesize()), 0);
+}
+
+TEST(ExecStringLayout, SmallStackEnforcesTotalArgumentBudget) {
+    expect_e2big_and_retry(40, 4095, 512 * 1024);
+}
+
+TEST(ExecStringLayout, SmallStackChargesArgumentPointers) {
+    // Every empty string consumes one byte plus one pointer on the new stack.
+    expect_e2big_and_retry(16000, 0, 512 * 1024);
+}
+
 
 TEST(ExecStringLayout, ShebangInterpreterArguments) {
     ASSERT_TRUE(mkdir("/tmp", 0755) == 0 || errno == EEXIST);
@@ -228,6 +418,10 @@ int main(int argc, char** argv, char** envp) {
     std::string script;
     if (argc > 0 && strncmp(argv[0], kPrefix, sizeof(kPrefix) - 1) == 0) {
         mode = argv[0] + sizeof(kPrefix) - 1;
+    } else if (argc > 1 && strcmp(argv[1], kLongArgZeroMode) == 0) {
+        mode = "long-arg-zero";
+    } else if (argc > 1 && strcmp(argv[1], kBinaryArgZeroMode) == 0) {
+        mode = "binary-arg-zero";
     } else if (argc > 1 && strcmp(argv[1], kScriptMode) == 0) {
         mode = "script";
         for (size_t i = 0; envp[i] != nullptr; ++i) {
@@ -242,6 +436,12 @@ int main(int argc, char** argv, char** envp) {
         mode = "empty-argv";
     }
     if (!mode.empty()) {
+        if (mode == "proc-snapshot") {
+            const int result = check_proc_snapshot_and_fork(input_for(mode));
+            if (result != 0) {
+                return result;
+            }
+        }
         return check_layout(argc, argv, envp, input_for(mode, script),
                             script.empty() ? self_path : script);
     }

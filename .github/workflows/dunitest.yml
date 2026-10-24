@@ -29,9 +29,19 @@ jobs:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
 
+      - name: Validate memory acceptance tooling
+        run: python3 -m unittest discover -s tools/agent_memory -p 'test_*.py'
+
       - name: Change source
         run: |
-          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+          find . -type f \( -name "*.toml" -o -name "Makefile" -o -name "Cargo.lock" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
+      - name: Validate VirtIO queue CPU storage
+        shell: bash -ileo pipefail {0}
+        run: |
+          source /root/.cargo/env
+          cargo test --manifest-path kernel/crates/virtio-drivers/Cargo.toml --locked
+          cargo check --manifest-path kernel/crates/virtio-drivers/Cargo.toml --locked --no-default-features
 
       - name: Require MM regression tests
         shell: bash

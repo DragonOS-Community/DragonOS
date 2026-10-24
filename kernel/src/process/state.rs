@@ -231,6 +231,9 @@ bitflags! {
         const NEED_CGROUP_FREEZE = 1 << 27;
         /// Job-control stop deferred until a lock-free task-context boundary.
         const PENDING_GROUP_STOP = 1 << 28;
+        /// Lexically scoped reserve access; never inherited by fork.
+        const RECLAIM_RESERVE = 1 << 31;
+        const OOM_EXIT_RESERVE = 1 << 32;
         /// Selftest-only ordinary heap denial; never inherited by fork.
         #[cfg(feature = "mm_selftest")]
         const OOM_HEAP_DENIED = 1 << 29;

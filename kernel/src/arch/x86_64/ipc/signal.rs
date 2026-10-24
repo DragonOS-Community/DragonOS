@@ -848,7 +848,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             sig_number.handle_default();
             return;
         }
-        let sa = pcb.sighand().handler(sig_number).unwrap();
+        let sa = pcb.sighand().handler_for_delivery(sig_number).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {

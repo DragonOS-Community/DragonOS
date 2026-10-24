@@ -3,7 +3,7 @@
 //! 初始化代码可参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/platform/pvh/enlighten.c#45
 use alloc::string::{String, ToString};
 use core::{ffi::CStr, hint::spin_loop};
-use param::{E820Type, HvmMemmapTableEntry, HvmStartInfo};
+use param::{E820Type, HvmMemmapTableEntry, HvmModlistEntry, HvmStartInfo};
 use system_error::SystemError;
 
 use crate::{
@@ -16,7 +16,11 @@ use crate::{
         boot_params,
     },
     libs::lazy_init::Lazy,
-    mm::{memblock::mem_block_manager, MemoryManagementArch, PhysAddr},
+    mm::{
+        early_ioremap::EarlyIoRemap,
+        memblock::{mem_block_manager, INITIAL_MEMORY_REGIONS_NUM},
+        MemoryManagementArch, PhysAddr,
+    },
 };
 
 mod param;
@@ -26,6 +30,67 @@ use super::rsdp::{cache_bios_rsdp_result, cached_bios_rsdp};
 static START_INFO: Lazy<HvmStartInfo> = Lazy::new();
 
 struct PvhBootCallback;
+
+/// PVH module descriptors are trusted hypervisor boot metadata, like the E820
+/// table and RSDP supplied by the same handoff. RESERVED does not imply that a
+/// descriptor is unreadable. A temporary mapping avoids assuming it lies in
+/// the bootstrap direct map; it does not validate arbitrary device addresses.
+fn read_module_entry(physical: usize) -> Result<HvmModlistEntry, SystemError> {
+    let mapped = EarlyIoRemap::map_not_aligned(
+        PhysAddr::new(physical),
+        core::mem::size_of::<HvmModlistEntry>(),
+        true,
+    )?;
+    // SAFETY: the trusted PVH handoff supplies readable descriptor bytes;
+    // the complete fixed-size entry remains mapped until the matching unmap.
+    // The protocol does not require the list pointer to be Rust-aligned.
+    let entry = unsafe { core::ptr::read_unaligned(mapped.data() as *const HvmModlistEntry) };
+    EarlyIoRemap::unmap(mapped)?;
+    Ok(entry)
+}
+
+fn reserve_boot_modules(start_info: &HvmStartInfo) -> Result<(), SystemError> {
+    let count = usize::try_from(start_info.nr_modules).map_err(|_| SystemError::EINVAL)?;
+    if count == 0 {
+        return Ok(());
+    }
+    // Keep early work and memblock fragmentation within the existing boot
+    // memory-region support bound, with no temporary descriptor array.
+    if count > INITIAL_MEMORY_REGIONS_NUM || start_info.modlist_paddr == 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let base = usize::try_from(start_info.modlist_paddr).map_err(|_| SystemError::EINVAL)?;
+    let bytes = count
+        .checked_mul(core::mem::size_of::<HvmModlistEntry>())
+        .ok_or(SystemError::EINVAL)?;
+    base.checked_add(bytes).ok_or(SystemError::EINVAL)?;
+    for index in 0..count {
+        let physical = base
+            .checked_add(
+                index
+                    .checked_mul(core::mem::size_of::<HvmModlistEntry>())
+                    .ok_or(SystemError::EINVAL)?,
+            )
+            .ok_or(SystemError::EINVAL)?;
+        let entry = read_module_entry(physical)?;
+        let start = usize::try_from(entry.paddr).map_err(|_| SystemError::EINVAL)?;
+        let size = usize::try_from(entry.size).map_err(|_| SystemError::EINVAL)?;
+        let end = start.checked_add(size).ok_or(SystemError::EINVAL)?;
+        // PVH address zero denotes absence. No payload is loaded or read here.
+        if start == 0 || size == 0 {
+            continue;
+        }
+        let mask = MMArch::PAGE_SIZE - 1;
+        let first = start & !mask;
+        let limit = end.checked_add(mask).ok_or(SystemError::EINVAL)? & !mask;
+        // Like Linux's early_reserve_initrd, reserve the supplied physical
+        // extent without requiring E820 RAM. Existing flags are preserved;
+        // reserve_block never adds a hole or device range to usable memory.
+        // The temporary descriptor mapping and its slot lock are already gone.
+        mem_block_manager().reserve_block(PhysAddr::new(first), limit - first)?;
+    }
+    Ok(())
+}
 
 impl BootCallbacks for PvhBootCallback {
     fn init_bootloader_name(&self) -> Result<Option<String>, SystemError> {
@@ -134,6 +199,7 @@ impl BootCallbacks for PvhBootCallback {
                 ep = unsafe { ep.add(1) };
             }
         }
+        reserve_boot_modules(start_info)?;
         send_to_default_serial8250_port("init_memory_area_from pvh boot end\n\0".as_bytes());
         log::info!(
             "Total memory size: {:#x}, Usable memory size: {:#x}",

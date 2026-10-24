@@ -5,6 +5,7 @@ use crate::{
         fsnotify::{self, FsEvent},
         vfs::{
             file::File, syscall::AtFlags, utils::user_path_at, IndexNode, XattrFlags, MAX_PATHLEN,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     mm::{allocation::MemoryAllocationError, VirtAddr},
@@ -69,7 +70,7 @@ pub(super) fn path_getxattr(
     name_ptr: *const u8,
     buf_ptr: *mut u8,
     size: usize,
-    lookup_flags: usize,
+    follow_final: bool,
 ) -> Result<usize, SystemError> {
     let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
@@ -78,7 +79,7 @@ pub(super) fn path_getxattr(
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = crate::filesystem::vfs::file::File::recover_io(|| {
-        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+        current_node.lookup_follow_symlink2(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
     })?;
 
     do_getxattr(inode, name_ptr, buf_ptr, size)
@@ -108,7 +109,7 @@ pub(super) fn path_listxattr(
     path_ptr: *const u8,
     buf_ptr: *mut u8,
     size: usize,
-    lookup_flags: usize,
+    follow_final: bool,
 ) -> Result<usize, SystemError> {
     let path = vfs_check_and_clone_cstr(path_ptr, Some(MAX_PATHLEN))?
         .into_string()
@@ -117,7 +118,7 @@ pub(super) fn path_listxattr(
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = crate::filesystem::vfs::file::File::recover_io(|| {
-        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+        current_node.lookup_follow_symlink2(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
     })?;
 
     do_listxattr(inode, buf_ptr, size)
@@ -158,7 +159,7 @@ fn do_listxattr(
 pub(super) fn path_removexattr(
     path_ptr: *const u8,
     name_ptr: *const u8,
-    lookup_flags: usize,
+    follow_final: bool,
 ) -> Result<usize, SystemError> {
     // Linux imports the name before touching the pathname. Keep this owned
     // snapshot outside retries so userspace cannot change the selected key.
@@ -170,7 +171,7 @@ pub(super) fn path_removexattr(
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = crate::filesystem::vfs::file::File::recover_io(|| {
-        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+        current_node.lookup_follow_symlink2(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
     })?;
 
     do_removexattr(inode, name.as_bytes())
@@ -223,7 +224,7 @@ pub(super) fn path_setxattr(
     name_ptr: *const u8,
     value_ptr: *const u8,
     size: usize,
-    lookup_flags: usize,
+    follow_final: bool,
     flags: i32,
 ) -> Result<usize, SystemError> {
     let xattr = prepare_setxattr_args(name_ptr, value_ptr, size, flags)?;
@@ -235,7 +236,7 @@ pub(super) fn path_setxattr(
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = crate::filesystem::vfs::file::File::recover_io(|| {
-        current_node.lookup_follow_symlink(&rest_path, lookup_flags)
+        current_node.lookup_follow_symlink2(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
     })?;
 
     do_setxattr(inode, xattr)

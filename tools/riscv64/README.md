@@ -34,11 +34,10 @@ done
 ```
 
 默认使用 QEMU 自带 OpenSBI（`-bios default`）、单 hart、2 GiB 内存和新建 FAT
-磁盘。脚本先校验内核 ELF 的 RISC-V 架构；进入 BusyBox 后执行 shell 内建命令
-`test -r /bin/sh && printf 'DRAGONOS-%s\n' SMOKE-OK`，收到独立一行
-`DRAGONOS-SMOKE-OK` 才返回 0。
-此测试暂只覆盖进入用户态及 shell 内建命令，不覆盖 fork/exec 外部程序；
-外部命令触发的 RISC-V 子进程 RCU 状态异常留待后续修复并恢复覆盖。
+磁盘。脚本先校验内核 ELF 的 RISC-V 架构；进入 BusyBox 后执行外部命令
+`/bin/busybox true`，收到独立一行 `DRAGONOS-EXEC-OK` 后，再检查
+`DRAGONOS-SMOKE-OK`，两项均成功才返回 0。此测试覆盖进入用户态及
+shell fork/exec 外部程序。
 退出时清理测试磁盘，保留日志。
 
 `OPENSBI_FIRMWARE` 可指定 OpenSBI `fw_dynamic.bin`；`DRAGONOS_BOOT_TIMEOUT_SECS`

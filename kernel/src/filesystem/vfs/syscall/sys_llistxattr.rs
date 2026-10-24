@@ -16,7 +16,7 @@ impl Syscall for SysLlistxattrHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        path_listxattr(Self::path(args), Self::buf(args), Self::size(args), 0)
+        path_listxattr(Self::path(args), Self::buf(args), Self::size(args), false)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

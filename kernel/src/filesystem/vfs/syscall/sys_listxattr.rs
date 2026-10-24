@@ -3,7 +3,6 @@
 use super::xattr_utils::path_listxattr;
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_LISTXATTR},
-    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::{string::ToString, vec::Vec};
@@ -17,12 +16,7 @@ impl Syscall for SysListxattrHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        path_listxattr(
-            Self::path(args),
-            Self::buf(args),
-            Self::size(args),
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        )
+        path_listxattr(Self::path(args), Self::buf(args), Self::size(args), true)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

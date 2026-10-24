@@ -2,6 +2,7 @@ pub mod block;
 pub mod bpf;
 pub mod errseq;
 pub mod ext4;
+pub(crate) mod fatal;
 pub mod fuse;
 pub mod jump_label;
 pub mod klog;

@@ -1,13 +1,143 @@
 use super::{
     deferred_index::{DeferredRouteIndex, NodeId, RouteIndexKey},
-    local_queue::{LocalOutputDisposition, LocalOutputPacket},
+    local_queue::{LocalOutputDisposition, OutputNode, OutputQueue, MAX_LOCAL_OUTPUT_FRAMES},
 };
-use alloc::{collections::VecDeque, vec::Vec};
+use crate::libs::paged_vec::PagedVec;
+use system_error::SystemError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DeferredRouteKey {
     pub(super) oif: u32,
     pub(super) next_hop: smoltcp::wire::IpAddress,
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::super::local_queue::{LocalOutputPacket, OutputCtContext, OutputEnvelope};
+    use super::*;
+    use crate::libs::prepared_queue::Node;
+
+    fn key(last: u8) -> DeferredRouteKey {
+        DeferredRouteKey {
+            oif: 7,
+            next_hop: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
+                192, 0, 2, last,
+            )),
+        }
+    }
+
+    fn packet(key: DeferredRouteKey, mark: u32) -> OutputNode {
+        Node::try_new(OutputEnvelope {
+            packet: Some(LocalOutputPacket {
+                medium: smoltcp::phy::Medium::Ip,
+                meta: smoltcp::phy::PacketMeta::default(),
+                disposition: LocalOutputDisposition::Routed {
+                    oif: key.oif,
+                    next_hop: key.next_hop,
+                    ip_mtu: 1500,
+                },
+                frame: Default::default(),
+                ct_context: OutputCtContext::Untracked,
+                mark,
+                prepared_ip: None,
+                forward_mtu_feedback: None,
+                _charge: None,
+            }),
+            retry_at: smoltcp::time::Instant::from_millis(0),
+        })
+        .unwrap()
+    }
+
+    fn limits() -> DeferredRouteLimits {
+        DeferredRouteLimits {
+            frames: 8,
+            bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn probe_and_neighbor_release_transfer_the_same_nodes_in_fifo_order() {
+        let mut deferred = DeferredRouteQueue::default();
+        let mut ready = OutputQueue::new();
+        let now = smoltcp::time::Instant::from_millis(1);
+        let first = packet(key(1), 1);
+        let identity = first.as_ref() as *const _;
+        deferred.prepare_capacity(2).unwrap();
+        assert!(deferred
+            .try_enqueue(first, 0, now, false, false, limits())
+            .is_ok());
+        assert!(deferred
+            .try_enqueue(packet(key(1), 2), 0, now, false, false, limits())
+            .is_ok());
+        let (probe, probe_key) = deferred.pop_due(now, 3, &mut ready).unwrap();
+        assert_eq!(probe.as_ref() as *const _, identity);
+        assert_eq!(probe_key, Some(key(1)));
+        assert!(deferred.release_neighbor(key(1), &mut ready));
+        assert!(deferred
+            .finish_probe(probe, 0, key(1), now, false, &mut ready)
+            .unwrap());
+        assert!(deferred.is_empty());
+        assert_eq!(ready.pop_node().unwrap().as_ref() as *const _, identity);
+        assert_eq!(ready.pop_node().unwrap().value().mark, 2);
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn unprepared_admission_returns_its_owner_without_publishing() {
+        let mut deferred = DeferredRouteQueue::default();
+        let now = smoltcp::time::Instant::from_millis(0);
+        let node = packet(key(1), 1);
+        let identity = node.as_ref() as *const _;
+        let returned = deferred
+            .try_enqueue(node, 0, now, false, false, limits())
+            .unwrap_err();
+        assert_eq!(returned.as_ref() as *const _, identity);
+        assert!(deferred.is_empty());
+        assert!(!deferred.contains(key(1)));
+    }
+
+    #[test]
+    fn bulk_release_preserves_index_and_heap_after_compaction() {
+        let mut deferred = DeferredRouteQueue::default();
+        let mut ready = OutputQueue::new();
+        let now = smoltcp::time::Instant::from_millis(1);
+        deferred.prepare_capacity(20).unwrap();
+        for last in (1..=20).rev() {
+            assert!(deferred
+                .try_enqueue(
+                    packet(key(last), last as u32),
+                    0,
+                    now,
+                    false,
+                    false,
+                    limits()
+                )
+                .is_ok());
+        }
+        deferred.release_resolved(
+            |address| match address {
+                smoltcp::wire::IpAddress::Ipv4(address) => address.octets()[3] % 2 == 0,
+                _ => false,
+            },
+            &mut ready,
+        );
+        assert_eq!(ready.len(), 10);
+        for last in 1..=20 {
+            assert_eq!(deferred.contains(key(last)), last % 2 != 0);
+        }
+        let mut previous = 0;
+        while let Some((node, probe_key)) = deferred.pop_due(now, 0, &mut ready) {
+            assert!(probe_key.is_none());
+            assert!(node.value().mark > previous);
+            previous = node.value().mark;
+            assert!(matches!(
+                node.value().disposition,
+                LocalOutputDisposition::Drop
+            ));
+        }
+        assert_eq!(previous, 19);
+        assert!(deferred.is_empty());
+    }
 }
 
 impl DeferredRouteKey {
@@ -71,14 +201,16 @@ struct DeferredRouteBucket {
     probe_in_flight: bool,
     probe_bytes: usize,
     resolved: bool,
-    packets: VecDeque<LocalOutputPacket>,
+    packets: OutputQueue,
     bytes: usize,
 }
 
+const _: () = assert!(PagedVec::<DeferredRouteBucket, MAX_LOCAL_OUTPUT_FRAMES>::layout_supported());
+
 pub(super) enum JoinDeferredResult {
     Queued(smoltcp::time::Instant),
-    Missing(LocalOutputPacket),
-    Full(LocalOutputPacket),
+    Missing(OutputNode),
+    Full(OutputNode),
 }
 
 #[derive(Clone, Copy)]
@@ -96,11 +228,23 @@ pub(super) struct DeferredRouteLimits {
 /// local-output lock; this object deliberately owns no lock of its own.
 #[derive(Debug, Default)]
 pub(super) struct DeferredRouteQueue {
-    heap: Vec<DeferredRouteBucket>,
+    heap: PagedVec<DeferredRouteBucket, MAX_LOCAL_OUTPUT_FRAMES>,
     index: DeferredRouteIndex,
 }
 
 impl DeferredRouteQueue {
+    /// Prepare worst-case per-frame neighbor metadata before emission. This
+    /// uses the containing queue's total frames plus outstanding reservations,
+    /// since the eventual neighbor key is not known until packet serialization.
+    pub(super) fn prepare_capacity(&mut self, frames: usize) -> Result<(), SystemError> {
+        if frames > MAX_LOCAL_OUTPUT_FRAMES {
+            return Err(SystemError::ENOBUFS);
+        }
+        self.heap
+            .try_reserve(frames.saturating_sub(self.heap.len()))?;
+        self.index.prepare_capacity(frames)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
@@ -109,20 +253,17 @@ impl DeferredRouteQueue {
         self.index.get(key.packed()).is_some()
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "failed admission returns the owned packet for bounded-queue recycling without another allocation"
-    )]
     pub(super) fn try_enqueue(
         &mut self,
-        packet: LocalOutputPacket,
+        packet: OutputNode,
         bytes: usize,
         retry_at: smoltcp::time::Instant,
         probe_sent: bool,
         advance_existing_probe: bool,
         limits: DeferredRouteLimits,
-    ) -> Result<smoltcp::time::Instant, LocalOutputPacket> {
-        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+    ) -> Result<smoltcp::time::Instant, OutputNode> {
+        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.value().disposition
+        else {
             return Err(packet);
         };
         let key = DeferredRouteKey { oif, next_hop };
@@ -134,7 +275,6 @@ impl DeferredRouteQueue {
                     .saturating_add(bucket.probe_bytes)
                     .saturating_add(bytes)
                     > limits.bytes
-                || bucket.packets.try_reserve(1).is_err()
             {
                 return Err(packet);
             }
@@ -147,21 +287,22 @@ impl DeferredRouteQueue {
                 bucket.probes = bucket.probes.saturating_add(1);
             }
             bucket.bytes += bytes;
-            bucket.packets.push_back(packet);
+            bucket.packets.push_node(packet);
             let retry_at = bucket.retry_at;
             self.repair(index);
             self.debug_validate();
             return Ok(retry_at);
         }
 
-        let mut packets = VecDeque::new();
-        if self.heap.try_reserve(1).is_err()
-            || self.index.try_reserve_insert().is_err()
-            || packets.try_reserve(1).is_err()
+        let mut packets = OutputQueue::new();
+        if limits.frames == 0
+            || bytes > limits.bytes
+            || self.heap.len() == self.heap.capacity()
+            || !self.index.has_insert_capacity()
         {
             return Err(packet);
         }
-        packets.push_back(packet);
+        packets.push_node(packet);
         let index = self.heap.len();
         let index_leaf = self.index.insert_prepared(key.packed(), index);
         self.heap.push(DeferredRouteBucket {
@@ -182,11 +323,12 @@ impl DeferredRouteQueue {
 
     pub(super) fn try_join(
         &mut self,
-        packet: LocalOutputPacket,
+        packet: OutputNode,
         bytes: usize,
         limits: DeferredRouteLimits,
     ) -> JoinDeferredResult {
-        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition else {
+        let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.value().disposition
+        else {
             return JoinDeferredResult::Missing(packet);
         };
         let key = DeferredRouteKey { oif, next_hop };
@@ -200,13 +342,12 @@ impl DeferredRouteQueue {
                 .saturating_add(bucket.probe_bytes)
                 .saturating_add(bytes)
                 > limits.bytes
-            || bucket.packets.try_reserve(1).is_err()
         {
             return JoinDeferredResult::Full(packet);
         }
         let retry_at = bucket.retry_at;
         bucket.bytes += bytes;
-        bucket.packets.push_back(packet);
+        bucket.packets.push_node(packet);
         JoinDeferredResult::Queued(retry_at)
     }
 
@@ -214,9 +355,9 @@ impl DeferredRouteQueue {
         &mut self,
         now: smoltcp::time::Instant,
         max_probes: u8,
-        ready: &mut VecDeque<LocalOutputPacket>,
-    ) -> Option<(LocalOutputPacket, Option<DeferredRouteKey>)> {
-        let bucket = self.heap.first()?;
+        ready: &mut OutputQueue,
+    ) -> Option<(OutputNode, Option<DeferredRouteKey>)> {
+        let bucket = self.heap.iter().next()?;
         if bucket.probe_in_flight || bucket.retry_at > now {
             return None;
         }
@@ -224,10 +365,10 @@ impl DeferredRouteQueue {
             let mut bucket = self.remove_at(0);
             if !bucket.resolved {
                 for packet in bucket.packets.iter_mut() {
-                    packet.disposition = LocalOutputDisposition::Drop;
+                    packet.packet_mut().disposition = LocalOutputDisposition::Drop;
                 }
             }
-            let packet = bucket.packets.pop_front()?;
+            let packet = bucket.packets.pop_node()?;
             ready.append(&mut bucket.packets);
             self.debug_validate();
             return Some((packet, None));
@@ -236,9 +377,9 @@ impl DeferredRouteQueue {
         let bucket = &mut self.heap[0];
         let packet = bucket
             .packets
-            .pop_front()
+            .pop_node()
             .expect("a schedulable deferred bucket contains a packet");
-        let bytes = packet.frame.capacity();
+        let bytes = packet.value().frame.capacity();
         bucket.bytes -= bytes;
         bucket.probe_in_flight = true;
         bucket.probe_bytes = bytes;
@@ -248,19 +389,15 @@ impl DeferredRouteQueue {
         Some((packet, Some(key)))
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "failed probe handoff must return the owned packet to its caller"
-    )]
     pub(super) fn finish_probe(
         &mut self,
-        packet: LocalOutputPacket,
+        packet: OutputNode,
         bytes: usize,
         key: DeferredRouteKey,
         retry_at: smoltcp::time::Instant,
         probe_sent: bool,
-        ready: &mut VecDeque<LocalOutputPacket>,
-    ) -> Result<bool, LocalOutputPacket> {
+        ready: &mut OutputQueue,
+    ) -> Result<bool, OutputNode> {
         let Some((_, index)) = self.index.get(key.packed()) else {
             return Err(packet);
         };
@@ -274,7 +411,9 @@ impl DeferredRouteQueue {
             bucket.probe_in_flight = false;
             bucket.probe_bytes = 0;
             bucket.bytes += bytes;
-            bucket.packets.push_front(packet);
+            let mut rest = core::mem::take(&mut bucket.packets);
+            bucket.packets.push_node(packet);
+            bucket.packets.append(&mut rest);
             if !resolved {
                 bucket.retry_at = retry_at;
                 if probe_sent {
@@ -295,7 +434,7 @@ impl DeferredRouteQueue {
     pub(super) fn complete_probe_success(
         &mut self,
         key: DeferredRouteKey,
-        ready: &mut VecDeque<LocalOutputPacket>,
+        ready: &mut OutputQueue,
     ) {
         let Some((_, index)) = self.index.get(key.packed()) else {
             return;
@@ -311,7 +450,7 @@ impl DeferredRouteQueue {
     pub(super) fn complete_packet_failure(
         &mut self,
         key: DeferredRouteKey,
-        ready: &mut VecDeque<LocalOutputPacket>,
+        ready: &mut OutputQueue,
     ) {
         let Some((_, index)) = self.index.get(key.packed()) else {
             return;
@@ -335,7 +474,7 @@ impl DeferredRouteQueue {
     pub(super) fn release_neighbor(
         &mut self,
         key: DeferredRouteKey,
-        ready: &mut VecDeque<LocalOutputPacket>,
+        ready: &mut OutputQueue,
     ) -> bool {
         let Some((_, index)) = self.index.get(key.packed()) else {
             return false;
@@ -355,26 +494,31 @@ impl DeferredRouteQueue {
     pub(super) fn release_resolved(
         &mut self,
         mut is_resolved: impl FnMut(smoltcp::wire::IpAddress) -> bool,
-        ready: &mut VecDeque<LocalOutputPacket>,
+        ready: &mut OutputQueue,
     ) {
-        let mut removed_any = false;
-        let index = &mut self.index;
-        self.heap.retain_mut(|bucket| {
-            if !is_resolved(bucket.key.next_hop) {
-                return true;
+        let original_len = self.heap.len();
+        let mut retained = 0;
+        for current in 0..original_len {
+            let bucket = &mut self.heap[current];
+            if is_resolved(bucket.key.next_hop) {
+                if bucket.probe_in_flight {
+                    bucket.resolved = true;
+                } else {
+                    ready.append(&mut bucket.packets);
+                    let removed_slot = self.index.remove(bucket.key.packed());
+                    debug_assert!(removed_slot.is_some());
+                    continue;
+                }
             }
-            if bucket.probe_in_flight {
-                bucket.resolved = true;
-                true
-            } else {
-                ready.append(&mut bucket.packets);
-                let removed_slot = index.remove(bucket.key.packed());
-                debug_assert!(removed_slot.is_some());
-                removed_any = true;
-                false
+            // Stable in-place compaction: removed, now-empty buckets move to
+            // the tail without allocating or changing any retained node IDs.
+            self.heap.swap(retained, current);
+            retained += 1;
+        }
+        if retained != original_len {
+            while self.heap.len() > retained {
+                drop(self.heap.pop());
             }
-        });
-        if removed_any {
             for (slot, bucket) in self.heap.iter().enumerate() {
                 self.index
                     .set_slot(bucket.index_leaf, bucket.key.packed(), slot);
@@ -388,13 +532,15 @@ impl DeferredRouteQueue {
 
     pub(super) fn has_due(&self, now: smoltcp::time::Instant) -> bool {
         self.heap
-            .first()
+            .iter()
+            .next()
             .is_some_and(|bucket| !bucket.probe_in_flight && bucket.retry_at <= now)
     }
 
     pub(super) fn next_retry(&self) -> Option<smoltcp::time::Instant> {
         self.heap
-            .first()
+            .iter()
+            .next()
             .filter(|bucket| !bucket.probe_in_flight)
             .map(|bucket| bucket.retry_at)
     }

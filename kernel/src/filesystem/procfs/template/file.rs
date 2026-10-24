@@ -1,4 +1,5 @@
 use crate::libs::mutex::MutexGuard;
+use crate::syscall::user_buffer::UserBuffer;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
@@ -7,8 +8,8 @@ use crate::{
             file::{FileFlags, FileMode},
             vcore::generate_inode_id,
             FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata,
-            OpenFileBehavior, PostWriteSyncPolicy, PrimaryWriteResult, PrimaryWriteSource,
-            SetMetadataMask, WritePrivilegeStage,
+            OpenFileBehavior, PollableInode, PostWriteSyncPolicy, PrimaryWriteResult,
+            PrimaryWriteSource, SetMetadataMask, UserReadMode, WritePrivilegeStage,
         },
     },
     time::PosixTimeSpec,
@@ -136,6 +137,27 @@ pub trait FileOps: Sync + Send + Sized + Debug {
     fn supports_read_iter_flags(&self) -> bool {
         true
     }
+    /// Optional direct protected read for consuming proc streams. Ordinary
+    /// seq providers retain their bounded buffered read implementation.
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Buffered
+    }
+
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        Ok(None)
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     /// Check dynamic backing identity before exposing inode attributes.
     fn validate_inode(&self) -> Result<(), SystemError> {
         Ok(())
@@ -370,6 +392,24 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         self.inner
             .read_at(offset, len, buf, data)
             .map_err(Into::into)
+    }
+
+    fn user_read_mode(&self) -> UserReadMode {
+        self.inner.user_read_mode()
+    }
+
+    fn read_user_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.inner.read_user_at(offset, len, writer, data)
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        self.inner.as_pollable_inode()
     }
 
     fn write_at(

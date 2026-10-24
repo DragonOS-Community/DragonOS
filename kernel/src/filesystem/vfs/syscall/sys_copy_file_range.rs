@@ -6,6 +6,7 @@
 use crate::arch::syscall::nr::SYS_COPY_FILE_RANGE;
 use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::{File, FileFlags, FileMode};
+use crate::filesystem::vfs::mount::MountFS;
 use crate::filesystem::vfs::FileType;
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
@@ -214,6 +215,13 @@ fn copy_file_range_impl(
     pos_out: Option<usize>,
     len: usize,
 ) -> Result<usize, SystemError> {
+    // There are no filesystem-specific copy offload methods yet. Like Linux's
+    // generic fallback, admit only files in the same superblock, before EOF
+    // clipping or a zero-length return. Pseudo files can report a nominal size
+    // unrelated to their readable contents; EXDEV lets userspace fall back to
+    // ordinary read/write instead of observing a successful, truncated copy.
+    check_copy_filesystem(in_file, out_file)?;
+
     // Explicit offsets do not participate in the shared-position transaction.
     // Sorting and deduplication also cover two descriptors of the same OFD.
     let _positions = File::lock_position_pair(
@@ -296,6 +304,29 @@ fn copy_file_range_impl(
         out_file.notify_io_event(FsEvent::MODIFY);
     }
     completion_error.map_or(Ok(total_copied), Err)
+}
+
+fn check_copy_filesystem(in_file: &File, out_file: &File) -> Result<(), SystemError> {
+    let in_fs = in_file.inode().fs();
+    let out_fs = out_file.inode().fs();
+    let same_superblock = match (
+        in_fs.as_any_ref().downcast_ref::<MountFS>(),
+        out_fs.as_any_ref().downcast_ref::<MountFS>(),
+    ) {
+        // Bind mounts and mount-namespace copies have distinct MountFS
+        // wrappers but retain the same superblock state.
+        (Some(input), Some(output)) => {
+            Arc::ptr_eq(&input.super_block_state(), &output.super_block_state())
+        }
+        (None, None) => Arc::ptr_eq(&in_fs, &out_fs),
+        // A raw backend does not identify a particular mounted superblock.
+        _ => false,
+    };
+    if same_superblock {
+        Ok(())
+    } else {
+        Err(SystemError::EXDEV)
+    }
 }
 
 /// 检查两个范围是否重叠

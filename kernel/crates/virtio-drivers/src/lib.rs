@@ -84,6 +84,8 @@ pub enum Error {
     AlreadyUsed,
     /// Invalid parameter.
     InvalidParam,
+    /// Failed to allocate CPU-only driver metadata.
+    MemoryError,
     /// Failed to alloc DMA memory.
     DmaError,
     /// I/O Error
@@ -110,6 +112,7 @@ impl Display for Error {
             ),
             Self::AlreadyUsed => write!(f, "Virtqueue is already in use"),
             Self::InvalidParam => write!(f, "Invalid parameter"),
+            Self::MemoryError => write!(f, "Failed to allocate CPU metadata"),
             Self::DmaError => write!(f, "Failed to allocate DMA memory"),
             Self::IoError => write!(f, "I/O Error"),
             Self::Unsupported => write!(f, "Request not supported by device"),

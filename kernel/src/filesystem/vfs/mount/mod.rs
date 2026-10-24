@@ -4070,6 +4070,29 @@ fn register_mounted_superblock(mount: &Arc<MountFS>) {
         .push(Arc::downgrade(mount));
 }
 
+/// Best-effort full filesystem sync before shutting down block devices.
+///
+/// Mounted filesystems can still have live writers. Keep their journals and
+/// device ownership active: final unmount hooks require the separate VFS
+/// quiesce/drain protocol and must not mark a live filesystem clean.
+pub fn sync_mounted_filesystems_for_shutdown() {
+    for mount in list_unique_mounted_superblocks() {
+        let state = mount.super_block_state();
+        {
+            let _umount = state.umount_read();
+            // A snapshot keeps the mount object alive, but does not prevent
+            // final superblock shutdown from closing backend admission.
+            if !state.shutdown_started() {
+                if let Err(error) = mount.sync_filesystem_locked() {
+                    log::warn!("shutdown: sync failed on {}: {:?}", mount.fs_type(), error);
+                }
+            }
+        }
+        // Final teardown needs the write lock; never wait while holding a reader.
+        state.wait_for_shutdown_if_started();
+    }
+}
+
 pub fn list_unique_mounted_superblocks() -> Vec<Arc<MountFS>> {
     let mut guard = MOUNTED_SUPERBLOCKS.lock_irqsave();
     let mut mounts: Vec<Arc<MountFS>> = Vec::new();

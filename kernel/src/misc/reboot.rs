@@ -306,6 +306,9 @@ fn kernel_restart_prepare(cmd: Option<&str>) {
 
     set_system_state(SystemState::Restart);
 
+    // Complete best-effort filesystem writeback while devices are available.
+    crate::filesystem::vfs::mount::sync_mounted_filesystems_for_shutdown();
+
     device_shutdown();
 }
 
@@ -341,6 +344,9 @@ pub fn kernel_shutdown_prepare(state: SystemState) {
     reboot_notifier_chain().call_chain(event, None, None);
 
     set_system_state(state);
+
+    // Complete best-effort filesystem writeback while devices are available.
+    crate::filesystem::vfs::mount::sync_mounted_filesystems_for_shutdown();
 
     device_shutdown();
 }

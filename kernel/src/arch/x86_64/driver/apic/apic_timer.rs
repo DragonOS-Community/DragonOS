@@ -1,6 +1,6 @@
 use core::cell::RefCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 use crate::arch::driver::{
     hpet::{hpet_instance, is_hpet_enabled},
@@ -24,7 +24,7 @@ use crate::time::clocksource::HZ;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 pub use drop;
-use log::debug;
+use log::{debug, warn};
 use system_error::SystemError;
 use x86::cpuid::cpuid;
 use x86::msr::{wrmsr, IA32_X2APIC_DIV_CONF, IA32_X2APIC_INIT_COUNT};
@@ -369,9 +369,27 @@ impl LocalApicTimer {
 /// this RefCell borrow alive while dispatching a deadline callback.
 pub(crate) fn program_deadline_delta(delta_ns: u64) {
     let mut timer = local_apic_timer_instance_mut(smp_get_processor_id());
-    let count = ((delta_ns as u128 * timer.periodic_count as u128)
-        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
-    .clamp(1, u32::MAX as u128) as u64;
+    let raw = (delta_ns as u128 * timer.periodic_count as u128)
+        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000);
+    if raw > u32::MAX as u128 {
+        // 请求的 delta 超出计数器范围，说明 tick 期限已被毒化（正常路径
+        // delta <= 1 tick）。此前这里静默截断为 u32::MAX：下一次 tick 被
+        // 推迟数秒到数分钟，而现场没有任何线索。
+        // 本函数运行在 deadline 队列的关中断临界区内，因此告警必须自带
+        // 节流（不做 console 直写、不形成 printk 风暴）：前 8 次与之后
+        // 每 1024 次各记录一条。
+        static OVERFLOW_WARNED: AtomicU64 = AtomicU64::new(0);
+        let n = OVERFLOW_WARNED.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_multiple_of(1024) {
+            warn!(
+                "apic timer: one-shot delta {}ns exceeds counter range, clamped (n={}, pcount={})",
+                delta_ns,
+                n + 1,
+                timer.periodic_count
+            );
+        }
+    }
+    let count = raw.clamp(1, u32::MAX as u128) as u64;
     let divisor = timer.divisor;
     timer.init(LocalApicTimerMode::Oneshot, count, divisor);
     timer.start_current();

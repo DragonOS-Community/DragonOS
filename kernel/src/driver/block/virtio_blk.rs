@@ -1781,7 +1781,7 @@ fn submit_bio_wait(
 fn submission_error(error: VirtioError) -> SystemError {
     match error {
         VirtioError::QueueFull => SystemError::EAGAIN_OR_EWOULDBLOCK,
-        VirtioError::DmaError => SystemError::ENOMEM,
+        VirtioError::DmaError | VirtioError::MemoryError => SystemError::ENOMEM,
         _ => SystemError::EIO,
     }
 }

@@ -398,8 +398,14 @@ unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: 
 #[no_mangle]
 unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) {
     use crate::libs::printk::{emergency_print_hex_noalloc, emergency_print_noalloc};
+    // #DF 时 CR2 不会被更新，它保存的是触发本次级联的最近一次缺页地址；
+    // 在只可能来自“压栈失败”的场景里，这个值就是缺失的栈页地址。
+    let cr2: u64;
+    core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
     emergency_print_noalloc("\n[#DF] double fault (IST): err=");
     emergency_print_hex_noalloc(error_code);
+    emergency_print_noalloc(" cr2=");
+    emergency_print_hex_noalloc(cr2);
     emergency_print_noalloc(" rsp=");
     emergency_print_hex_noalloc(regs.rsp);
     emergency_print_noalloc(" rip=");

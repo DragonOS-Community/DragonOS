@@ -1009,6 +1009,20 @@ impl Ext4 {
         start < reserved_end && reserved_start < end
     }
 
+    /// Whether `block` lies in a region reserved for ext4 system metadata
+    /// (superblock/GDT, block/inode bitmaps, inode tables). File data and
+    /// directory payload blocks are outside these ranges.
+    pub(super) fn is_system_metadata_block(&self, block: PBlockId) -> bool {
+        let candidate = self
+            .system_metadata_ranges
+            .partition_point(|(_, reserved_end)| *reserved_end <= block);
+        self.system_metadata_ranges
+            .get(candidate)
+            .is_some_and(|(reserved_start, reserved_end)| {
+                *reserved_start <= block && block < *reserved_end
+            })
+    }
+
     /// Validate that a physical range is ordinary file-owned storage rather
     /// than ext4 system metadata or the internal journal. All ranges are
     /// half-open and every end is checked before comparison.

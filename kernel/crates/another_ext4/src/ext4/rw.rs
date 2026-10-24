@@ -15,7 +15,14 @@ pub(super) struct MetadataIo<'fs, 'tx, 'core> {
 
 impl super::journal_transaction::MetadataBlockSource for Ext4 {
     fn read_committed_metadata(&self, home: PBlockId) -> Result<Block> {
-        if !matches!(self.metadata_mode, super::MetadataMutationMode::Batched(_)) {
+        // Batched and Direct modes both publish a complete home-current image
+        // after their writes: Batched at logical acceptance, Direct after every
+        // staged home block was written. Journal mode publishes at checkpoint,
+        // and its committed reads are served by the journal batch state.
+        if !matches!(
+            self.metadata_mode,
+            super::MetadataMutationMode::Batched(_) | super::MetadataMutationMode::Direct(_)
+        ) {
             return self.block_device.read_block(home);
         }
         let outcome = self.metadata_cache.read(self.block_device.as_ref(), home);
@@ -271,7 +278,27 @@ impl Ext4 {
             self.poison(ErrCode::EIO);
             return Err(Ext4Error::new(ErrCode::EIO));
         }
-        self.block_device.write_block(block)
+        self.block_device.write_block(block)?;
+        // Direct-mode writes bypass transactions. Publish their home-current
+        // image so later metadata reads observe the new block instead of a
+        // stale cache entry (and so a block just written by one operation is
+        // not read back from the device by the next one). Only system
+        // metadata belongs in this cache: admitting file payload blocks would
+        // evict the bitmaps/inode tables that the next operation needs and
+        // make large writes pay a pointless 4 KiB copy.
+        if matches!(self.metadata_mode, super::MetadataMutationMode::Direct(_))
+            && self.is_system_metadata_block(block.id)
+        {
+            let notify = self.metadata_cache.publish_or_admit(
+                block.id,
+                &block.data,
+                super::metadata_cache::PublicationPoint::HomeCurrent,
+            );
+            if notify {
+                self.metadata_mutation_barrier.notify_progress();
+            }
+        }
+        Ok(())
     }
 
     /// Read super block from in-memory cache (no disk I/O).

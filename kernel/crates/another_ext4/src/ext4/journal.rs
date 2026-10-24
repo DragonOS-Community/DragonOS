@@ -147,6 +147,13 @@ impl Ext4 {
         self.metadata_mode = MetadataMutationMode::Direct(
             journal_transaction::DirectTransactionCore::new(target_blocks)?,
         );
+        // Direct mode writes every staged home block synchronously and then
+        // publishes the home-current images. That publication path is complete
+        // without a journal, so the same read cache used by Batched mode can
+        // serve committed metadata reads here as well. Without it, every
+        // inode/bitmap access in a no-journal writable layer goes to the block
+        // device even when the previous operation just wrote that exact block.
+        self.metadata_cache = super::MetadataBlockCache::new(super::METADATA_CACHE_BLOCKS);
         Ok(())
     }
 
@@ -547,7 +554,7 @@ impl journal_transaction::CachePublisher for Ext4 {
     fn publish(&self, blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>) {
         let mut notify = false;
         for block in blocks.values() {
-            notify |= self.metadata_cache.publish_existing(
+            notify |= self.metadata_cache.publish_or_admit(
                 block.home(),
                 block.bytes(),
                 PublicationPoint::HomeCurrent,
@@ -566,7 +573,7 @@ impl journal_transaction::CachePublisher for Ext4 {
     ) {
         let mut notify = false;
         for block in blocks.values() {
-            notify |= self.metadata_cache.publish_existing(
+            notify |= self.metadata_cache.publish_or_admit(
                 block.home(),
                 block.bytes(),
                 PublicationPoint::HomeCurrent,
@@ -589,7 +596,7 @@ impl journal_transaction::CachePublisher for Ext4 {
     ) {
         let mut notify = false;
         for block in blocks.values() {
-            notify |= self.metadata_cache.publish_existing(
+            notify |= self.metadata_cache.publish_or_admit(
                 block.home(),
                 block.bytes(),
                 PublicationPoint::Accepted { sequence },

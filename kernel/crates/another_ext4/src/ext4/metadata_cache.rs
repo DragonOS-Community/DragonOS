@@ -130,6 +130,7 @@ pub(super) struct MetadataCacheStatsSnapshot {
     pub evictions: usize,
     pub bypasses: usize,
     pub published_dirty: usize,
+    pub admissions: usize,
     pub checkpoint_cleaned: usize,
     pub invalidations: usize,
     pub stale_loads: usize,
@@ -145,6 +146,7 @@ struct MetadataCacheStats {
     evictions: AtomicUsize,
     bypasses: AtomicUsize,
     published_dirty: AtomicUsize,
+    admissions: AtomicUsize,
     checkpoint_cleaned: AtomicUsize,
     invalidations: AtomicUsize,
     stale_loads: AtomicUsize,
@@ -394,6 +396,57 @@ impl MetadataBlockCache {
         let Some(index) = set.find(home) else {
             return false;
         };
+        self.publish_into_slot(&mut set, index, image, point, false)
+    }
+
+    /// Publish an image, admitting it when the home is not resident.
+    ///
+    /// Batched metadata transactions stage the blocks they modify and publish
+    /// them at the logical acceptance point. Those blocks are overwhelmingly
+    /// re-read by the next operation (inode/block bitmaps, inode tables,
+    /// directory blocks). `publish_existing` only refreshes blocks that were
+    /// already cached, so the first write to a cold block was followed by a
+    /// disk read on the next operation. Admitting the published image lets
+    /// that next operation hit the cache instead.
+    ///
+    /// The admitted image is the full 4 KiB accepted view; checkpoint and
+    /// invalidation semantics are identical to `publish_existing`.
+    pub(super) fn publish_or_admit(
+        &self,
+        home: PBlockId,
+        image: &[u8; BLOCK_SIZE],
+        point: PublicationPoint,
+    ) -> bool {
+        let Some(set_lock) = self.set_for(home) else {
+            return false;
+        };
+        let mut set = set_lock.lock();
+        let (index, admitted) = match set.find(home) {
+            Some(index) => (index, false),
+            None => match set.admit_way() {
+                Some((index, evicted)) => {
+                    if evicted {
+                        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    set.ways[index].home = Some(home);
+                    (index, true)
+                }
+                // Every way is pinned by a Loading or Dirty entry. Skipping
+                // admission is safe; the next read will load from disk.
+                None => return false,
+            },
+        };
+        self.publish_into_slot(&mut set, index, image, point, admitted)
+    }
+
+    fn publish_into_slot(
+        &self,
+        set: &mut CacheSet,
+        index: usize,
+        image: &[u8; BLOCK_SIZE],
+        point: PublicationPoint,
+        admitted: bool,
+    ) -> bool {
         let slot = &mut set.ways[index];
         let ended_loading = matches!(slot.state, SlotState::Loading { .. });
         if let (
@@ -409,10 +462,17 @@ impl MetadataBlockCache {
         slot.state = match point {
             PublicationPoint::HomeCurrent => SlotState::Clean,
             PublicationPoint::Accepted { sequence } => {
-                self.stats.published_dirty.fetch_add(1, Ordering::Relaxed);
+                if admitted {
+                    self.stats.admissions.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.stats.published_dirty.fetch_add(1, Ordering::Relaxed);
+                }
                 SlotState::Dirty { sequence }
             }
         };
+        if admitted && matches!(point, PublicationPoint::HomeCurrent) {
+            self.stats.admissions.fetch_add(1, Ordering::Relaxed);
+        }
         slot.referenced = true;
         ended_loading
     }
@@ -551,6 +611,7 @@ impl MetadataBlockCache {
             evictions: self.stats.evictions.load(Ordering::Relaxed),
             bypasses: self.stats.bypasses.load(Ordering::Relaxed),
             published_dirty: self.stats.published_dirty.load(Ordering::Relaxed),
+            admissions: self.stats.admissions.load(Ordering::Relaxed),
             checkpoint_cleaned: self.stats.checkpoint_cleaned.load(Ordering::Relaxed),
             invalidations: self.stats.invalidations.load(Ordering::Relaxed),
             stale_loads: self.stats.stale_loads.load(Ordering::Relaxed),
@@ -723,6 +784,23 @@ mod tests {
         let stale = loader.join().unwrap();
         assert_eq!(stale.result.unwrap_err().code(), ErrCode::EAGAIN);
         assert_eq!(cache.read(device.as_ref(), 9).result.unwrap().data[0], 0x5a);
+    }
+
+    #[test]
+    fn published_absent_block_is_admitted_and_serves_later_reads() {
+        let cache = MetadataBlockCache::new(WAYS);
+        let device = TestDevice::plain();
+        let image = [0x6b; BLOCK_SIZE];
+        // No Loading owner exists, so the publication reports no waiter to
+        // wake; the admission itself is still installed.
+        assert!(!cache.publish_or_admit(77, &image, PublicationPoint::Accepted { sequence: 1 }));
+        let hit = cache.read(&device, 77);
+        assert_eq!(hit.result.unwrap().data[0], 0x6b);
+        // The accepted image was admitted, so the next read never reached the
+        // block device.
+        assert_eq!(device.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.stats().admissions, 1);
+        assert_eq!(cache.checkpoint(1, &[77]), 1);
     }
 
     #[test]

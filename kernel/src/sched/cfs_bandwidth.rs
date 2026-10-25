@@ -78,7 +78,19 @@ pub(crate) fn refresh_runtime_event(rq: &mut CpuRunQueue, task: &Arc<ProcessCont
         .expect("runtime deadline events not initialized");
     match remaining {
         Some(remaining) if remaining > 0 => {
-            let _ = event.arm(deadline::now_ns().saturating_add(remaining as u64));
+            let deadline = deadline::now_ns().saturating_add(remaining as u64);
+            // The event owns a preallocated node; failure means a scheduler
+            // lifecycle bug that would silently stop runtime throttling.
+            let _armed = event.arm(deadline);
+            #[cfg(feature = "mm_selftest")]
+            {
+                debug_assert!(_armed.is_ok(), "runtime deadline event arm failed");
+                debug_assert_eq!(
+                    event.queued_deadline(),
+                    Some(deadline),
+                    "runtime event must be armed at the requested deadline"
+                );
+            }
         }
         Some(_) => {
             event.cancel();

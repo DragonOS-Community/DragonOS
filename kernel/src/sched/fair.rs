@@ -1995,14 +1995,19 @@ impl CompletelyFairScheduler {
         }
     }
 
-    pub fn set_next_task(rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
+    pub fn set_next_task(_rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
         let mut se = next.sched_info().sched_entity();
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let cfs = se.cfs_rq();
             cfs.force_mut().set_next_entity(&se);
             (true, true)
         });
-        super::cfs_bandwidth::refresh_runtime_event(rq, &next);
+        // 此处不武装 runtime 耗尽事件（对齐 Linux：Linux 没有任何随切换武装的
+        // runtime 定时器，耗尽在 update_curr 计费点检查）。`pick_next_task()`
+        // 在 set_next_task() 之后已经无条件调用过一次 refresh_runtime_event()，
+        // 这里的调用是**重复武装**：每次切换把同一个 deadline 事件重新
+        // arm(now+remaining) 一次，纯属多余开销。精确期限由 SchedClass::tick
+        // 在真实计费之后的 refresh_runtime_event() 武装。
     }
 
     /// 寻找到最近公共组长

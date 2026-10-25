@@ -30,6 +30,14 @@ pub(crate) enum HeapPlan {
 
 impl HeapPlan {
     pub(crate) const fn prefers_virtual_layout(layout: Layout) -> bool {
+        // Stub architectures (e.g. loongarch64) leave PAGE_SHIFT = 0, so
+        // PAGE_SIZE is 1 and every real allocation would "prefer" the virtual
+        // layout. That is meaningless for the physical heap and trips
+        // compile-time layout assertions (see epoll::epitem). Treat them as
+        // always using the direct policy.
+        if <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SHIFT == 0 {
+            return false;
+        }
         layout.size() > 2 * <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE
             || layout.align() > <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE
     }

@@ -22,7 +22,8 @@ DragonOS 的构建、打包、Nix 集成与测试文件。
 
 内核侧**不需要新增 syscall**，但 `sysinfo_collector` 依赖 gopsutil 的
 `host.Info()`，后者需要 `/proc/uptime`；DragonOS 原先没有该文件，因此本移植在
-procfs 中新增了 `/proc/uptime`（格式与 Linux 一致：uptime + 各 CPU idle 总和）。
+procfs 中新增了 `/proc/uptime`（格式与 Linux 一致：uptime + 各 CPU idle 总和；PR
+[#2565](https://github.com/DragonOS-Community/DragonOS/pull/2565)）。
 
 ## 2. 为什么必须静态链接
 

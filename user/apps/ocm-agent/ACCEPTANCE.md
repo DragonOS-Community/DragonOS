@@ -59,7 +59,9 @@ ocm-agent 源码**不在 DragonOS 仓库内**，通过两处引用同一个 GitH
 git submodule update --init user/apps/ocm-agent/upstream
 ```
 
-> 当前备份分支不包含内核 `/proc/uptime` 和 busybox 构建修复（它们在独立 PR 中）；
+> 当前备份分支不包含内核 `/proc/uptime` 和 busybox 构建修复（分别在
+> [PR #2565](https://github.com/DragonOS-Community/DragonOS/pull/2565) 和
+> [PR #2566](https://github.com/DragonOS-Community/DragonOS/pull/2566) 中）；
 > 在 PR 合入前，本地工作区保留这两处修改，验收才能复现。详见 §7 和 §9。
 
 ## 3. 测试拓扑
@@ -260,7 +262,9 @@ DATA_REQ_NEW(0x10) → DATA_REQ_NEW_RESP(0x11)
 ```
 
 注意**不追加尾随 NUL**：DragonOS 其他 procfs 文件常用 `trim_string` 追加 NUL，gopsutil 会把
-NUL 当成额外一行并报 `wrong uptime format`。该修复在独立 PR 中。
+NUL 当成额外一行并报 `wrong uptime format`。该修复见
+[PR #2565](https://github.com/DragonOS-Community/DragonOS/pull/2565)
+（分支 `feat/procfs-uptime`，commit `98637fcf`）。
 
 ### 7.2 GitHub 镜像 `dragonos` 分支
 
@@ -276,7 +280,9 @@ NUL 当成额外一行并报 `wrong uptime format`。该修复在独立 PR 中�
 - 禁用 `CONFIG_TC`：Linux 6.16 uapi 已删除 CBQ 常量，BusyBox 1.35 的 `tc.c` 无法编译；
 - 追加配置后执行 `yes "" | make oldconfig`，避免新符号进入交互式 `(NEW)` 状态。
 
-该修复在独立 PR 中；在合入前保留在工作区，否则非 Nix 的 `make user` 会失败。
+该修复见 [PR #2566](https://github.com/DragonOS-Community/DragonOS/pull/2566)
+（分支 `fix/busybox-build`，commit `cd30543d`）。在合入前保留在工作区，否则非 Nix 的
+`make user` 会失败。
 
 ## 8. 已知缺口
 
@@ -306,5 +312,5 @@ python3 user/apps/ocm-agent/scripts/dragonos-acceptance.py --duration 60
 
 - ocm-agent GitHub 镜像：<https://github.com/sparkzky/ocm-agent>（`master` 纯净镜像，`dragonos` 修复分支）
 - ocm-agent 上游：<https://gitee.com/OpenCloudOS/ocm-agent>
-- 内核 `/proc/uptime` PR：`DragonOS-Community/DragonOS#<TBD>`
-- busybox 构建 PR：`DragonOS-Community/DragonOS#<TBD>`
+- 内核 `/proc/uptime` PR：[DragonOS-Community/DragonOS#2565](https://github.com/DragonOS-Community/DragonOS/pull/2565)
+- busybox 构建 PR：[DragonOS-Community/DragonOS#2566](https://github.com/DragonOS-Community/DragonOS/pull/2566)

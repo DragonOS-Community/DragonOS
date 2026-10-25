@@ -18,7 +18,10 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 #[cfg(target_arch = "x86_64")]
-use core::{hint::spin_loop, sync::atomic::AtomicBool};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{AtomicBool, AtomicPtr},
+};
 
 #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 pub(crate) mod selftest;
@@ -148,20 +151,37 @@ pub fn tlb_state_loaded_mm() -> Option<Arc<AddressSpace>> {
 
 /// Per-CPU CSD (Call Single Data) for synchronous ack during TLB shootdown.
 ///
-/// Currently only serves FlushTLB; not abstracted into a generic `smp_call_function`.
+/// 无锁协议。曾经的 `SpinLock<Option<ptr>>` 在并发 `docker exec` 场景下出现过
+/// 目标 CPU handler 长时间自旋在同一把 `info` 锁、而没有任何正常临界区持锁者的
+/// 现场（`SPIN_LOCK_ADDR` 落在 CSD 堆区、831 万次争用、`TLB_CSD_HOLDER=0`），
+/// 说明锁字节的持有者不可归属（guard 泄漏或相邻内存越界）。这里直接去掉锁：
+///
+/// - 发布方（持有 `FLUSH_TLB_GLOBAL_LOCK`，因此每个目标槽位同时只有一个请求）：
+///   1. `done = false`（Release）：先清 ack，保证迟到的 handler 不会提前置位；
+///   2. `info = &FlushTlbInfo`（Release）：地址指向发起方栈帧，栈帧在整个等待窗口内有效；
+///   3. `compiler_fence(SeqCst)` 后发 IPI。
+/// - 接收方（IPI handler / 关中断自旋中的服务路径）：`info.swap(null, AcqRel)`
+///   一次性取走指针；取到者执行失效并置 `done = true`，取不到者直接返回。
+///   单取者保证不会出现“取走指针后再解引用已失效栈帧”，也避免了同一请求重复 ack。
+///
+/// 迟到的 IPI 只可能在 `done=false` 且 `info=null`（发布前）或 `info` 已被取走时到达：
+/// 前者直接返回（发布方随后会发新的 IPI），后者返回（ack 已由取走者给出）。
+/// 若迟到 handler 恰好取走了刚发布但尚未发 IPI 的指针，它会提前完成失效并 ack——
+/// 这在语义上仍然正确：页表写入发生在 `done=false`（Release）之前，
+/// handler 的 Acquire 读保证能看到新页表，提前失效不会漏掉任何过期 TLB 项。
 ///
 /// x86_64 only; RISC-V's `send_ipi(FlushTLB, ..)` uses synchronous SBI `remote_sfence_vma`
 /// and does not need CSD.
 #[cfg(target_arch = "x86_64")]
 pub struct CsdFlushTlb {
-    /// Pointer to `FlushTlbInfo` written by the initiator; read by the receiver.
-    info: SpinLock<Option<*const FlushTlbInfo>>,
-    /// Set to true by the target CPU upon completion.
+    /// 指向本次请求的 `FlushTlbInfo`（发起方栈上对象）；`null` 表示无请求。
+    info: AtomicPtr<FlushTlbInfo>,
+    /// 目标 CPU 完成失效后置 `true`。
     done: AtomicBool,
 }
 
-// SAFETY: The pointer itself is unsafe, but it points to an object on the initiator's stack,
-// synchronized via the done flag.
+// SAFETY: 指针全程由 `info` 的原子交换与 `done` 的 Release/Acquire 配对保护；
+// 栈上对象的生命周期覆盖整个等待窗口（见上方协议说明）。
 #[cfg(target_arch = "x86_64")]
 unsafe impl Sync for CsdFlushTlb {}
 #[cfg(target_arch = "x86_64")]
@@ -171,9 +191,36 @@ unsafe impl Send for CsdFlushTlb {}
 impl CsdFlushTlb {
     const fn new() -> Self {
         Self {
-            info: SpinLock::new(None),
+            info: AtomicPtr::new(core::ptr::null_mut()),
             done: AtomicBool::new(true),
         }
+    }
+
+    /// 发布一次请求；调用方必须保证该槽位没有未完成请求。
+    fn publish(&self, info: &FlushTlbInfo) {
+        self.done.store(false, Ordering::Release);
+        self.info.store(
+            info as *const FlushTlbInfo as *mut FlushTlbInfo,
+            Ordering::Release,
+        );
+    }
+
+    /// 取走请求指针；只有取到非空值的一方负责执行失效并置 `done`。
+    fn take(&self) -> Option<*const FlushTlbInfo> {
+        let p = self.info.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if p.is_null() {
+            None
+        } else {
+            Some(p as *const FlushTlbInfo)
+        }
+    }
+
+    /// 执行已取走的请求（调用方保证 `p` 在 `done` 置位前有效）。
+    fn complete(&self, p: *const FlushTlbInfo) {
+        // SAFETY: 发起方栈帧在 `done=true` 之前一直有效（见协议说明）。
+        local_flush_tlb_func(unsafe { &*p });
+        compiler_fence(Ordering::SeqCst);
+        self.done.store(true, Ordering::Release);
     }
 }
 
@@ -204,22 +251,16 @@ fn service_pending_inbound_flush() {
     }
     let cpu = smp_get_processor_id();
     let csd = unsafe { csd_flush_tlb().force_get(cpu) };
-    // 全程持锁且关中断：本函数可能在开中断上下文被调用。
-    // - 若取走指针后、flush 前被本 CPU 的 IPI 打断，handler 会看到 None 而提前
-    //   置 done，发起者将在 flush 完成前返回（违反 INV-4）；
-    // - 更严重的是 handler 会在同一 CPU 上抢同一把 csd.info 锁：若用不关中断的
-    //   `lock()`，handler 会自旋等待被它打断、已挂起的持锁者 —— 自死锁。
-    // 因此这里必须 lock_irqsave：IPI 被推迟到 flush 完成并放锁之后。
-    let mut guard = csd.info.lock_irqsave();
     if csd.done.load(Ordering::Acquire) {
         return;
     }
-    let Some(info_ptr) = guard.take() else {
-        return;
-    };
-    // SAFETY: 发起者栈帧在 done=true 之前一直有效（见 CsdFlushTlb 注释）。
-    local_flush_tlb_func(unsafe { &*info_ptr });
-    csd.done.store(true, Ordering::Release);
+    // 一次性取走指针：嵌套调用（例如服务路径执行中又被 IPI 打断）只能有一方
+    // 取得指针并置 done，其余直接返回，避免解引用已失效的发起方栈帧。
+    // 取走-执行-ack 之间不再持有任何锁，因此也不会与本 CPU 的 IPI handler
+    // 形成「handler 自旋等待被它打断的持锁者」的自死锁。
+    if let Some(info_ptr) = csd.take() {
+        csd.complete(info_ptr);
+    }
 }
 
 /// 获取全局 shootdown 锁；等待期间服务发往本 CPU 的请求，避免 IRQ-off 互等。
@@ -232,6 +273,20 @@ fn acquire_flush_tlb_lock() -> SpinLockGuard<'static, ()> {
         service_pending_inbound_flush();
         core::hint::spin_loop();
     }
+}
+
+/// 给 `SpinLock` 争用循环用的入口，带递归保护。
+///
+/// service 内部会取 CSD 的 `info` 自旋锁；若该锁争用，其等待循环又会调用本
+/// 入口，需直接返回，避免无限递归。
+#[cfg(target_arch = "x86_64")]
+pub fn try_service_inbound_flush_from_spin(_locked_spin: usize) {
+    static IN_SERVICE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if IN_SERVICE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    service_pending_inbound_flush();
+    IN_SERVICE.store(false, Ordering::Release);
 }
 
 /// Initialize this module. Must be called after `PerCpu::init()`.
@@ -255,6 +310,8 @@ pub fn tlb_init() {
         unsafe {
             CSD_FLUSH_TLB = Some(PerCpuVar::new(csds).expect("PerCpuVar length mismatch"));
         }
+        // 让任意关中断自旋等待者都能应答 shootdown（见 libs::spinlock_hook）。
+        crate::libs::spinlock_hook::set_hook(try_service_inbound_flush_from_spin);
     }
 }
 
@@ -375,16 +432,13 @@ pub fn remote_flush_tlb_on_ipi() {
     {
         let cpu = smp_get_processor_id();
         let csd = unsafe { csd_flush_tlb().force_get(cpu) };
-        let info_ptr: *const FlushTlbInfo = {
-            let guard = csd.info.lock();
-            match *guard {
-                Some(p) => p,
-                None => {
-                    // Should not happen; defensively set done to avoid initiator deadlock
-                    csd.done.store(true, Ordering::Release);
-                    return;
-                }
-            }
+        // `done=true` 表示没有待完成请求（迟到的 IPI）；`take()` 为空同理
+        // （指针已被服务路径取走）。
+        if csd.done.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(info_ptr) = csd.take() else {
+            return;
         };
 
         // SAFETY: the initiator's stack frame remains valid throughout the polling window in `flush_tlb_multi`;
@@ -434,19 +488,18 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Prepare CSD slots for each target CPU
+        // Publish the request into each target's CSD slot. Ordering matters:
+        // clear `done` before storing `info`, so a late IPI from a previous
+        // shootdown can never observe the new pointer with a stale ack.
         for cpu in active.iter_cpu() {
             if cpu == my_cpu {
                 continue;
             }
             let csd = unsafe { csd_flush_tlb().force_get(cpu) };
-            {
-                let mut g = csd.info.lock();
-                *g = Some(info as *const FlushTlbInfo);
-            }
-            csd.done.store(false, Ordering::SeqCst);
+            csd.publish(info);
         }
 
+        // 发布与 IPI 之间不允许编译器重排（见 `CsdFlushTlb::publish` 的顺序要求）。
         compiler_fence(Ordering::SeqCst);
 
         // Send IPIs (one Specified per CPU, avoiding "Other" broadcast that would cause unrelated CPUs to take extra paths)
@@ -498,9 +551,8 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
                 }
                 spin_loop();
             }
-            // Clean up CSD slot to prevent misuse
-            let mut g = csd.info.lock();
-            *g = None;
+            // No cleanup needed: the receiver already swapped the pointer out
+            // (`take`), so the slot is empty once `done` is observed.
         }
     }
 

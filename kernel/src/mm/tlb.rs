@@ -204,16 +204,17 @@ fn service_pending_inbound_flush() {
     }
     let cpu = smp_get_processor_id();
     let csd = unsafe { csd_flush_tlb().force_get(cpu) };
+    // 全程持锁且关中断：本函数可能在开中断上下文被调用。
+    // - 若取走指针后、flush 前被本 CPU 的 IPI 打断，handler 会看到 None 而提前
+    //   置 done，发起者将在 flush 完成前返回（违反 INV-4）；
+    // - 更严重的是 handler 会在同一 CPU 上抢同一把 csd.info 锁：若用不关中断的
+    //   `lock()`，handler 会自旋等待被它打断、已挂起的持锁者 —— 自死锁。
+    // 因此这里必须 lock_irqsave：IPI 被推迟到 flush 完成并放锁之后。
+    let mut guard = csd.info.lock_irqsave();
     if csd.done.load(Ordering::Acquire) {
         return;
     }
-    // 取走指针并立刻置空：服务完成后发起者会返回、栈帧失效；若 IPI 迟到，
-    // handler 看到 None 会直接返回，不会解引用悬垂指针。
-    let info_ptr = {
-        let mut guard = csd.info.lock();
-        guard.take()
-    };
-    let Some(info_ptr) = info_ptr else {
+    let Some(info_ptr) = guard.take() else {
         return;
     };
     // SAFETY: 发起者栈帧在 done=true 之前一直有效（见 CsdFlushTlb 注释）。

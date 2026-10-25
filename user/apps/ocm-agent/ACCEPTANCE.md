@@ -166,6 +166,9 @@ python3 user/apps/ocm-agent/scripts/dragonos-acceptance.py --duration 60
 | 帧统计 | REGISTER 1、HEARTBEAT 13、DATA_SMALL 11、DATA_UPLOAD_FRAG 4、DATA_REQ_NEW 1 |
 | 小数据 ACK | 11/11 成功 |
 
+> `agent sent/ack` 若显示 10/10，是 agent 每 10 秒一次的 metrics 日志采样；gateway
+> 实际收到并 ACK 了 11 个 `DATA_SMALL`（最后一条在采样窗口之后发出）。
+
 ### 5.2 os_monitor（10 帧，154 个指标值，15 个指标名）
 
 | 指标 | 最后值 | 说明 |

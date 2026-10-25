@@ -13,7 +13,7 @@ crate-type = ["staticlib"]
 members = ["crates/*"]
 
 [features]
-default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
+default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test", "kstack_protect"]
 # kvm
 kvm = []
 

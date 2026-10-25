@@ -320,6 +320,13 @@ pub(super) struct AllocationState {
     reserved_metadata_blocks: u64,
     delalloc_claims: BTreeMap<DelallocReservationId, DelallocClaim>,
     delalloc_consumptions: BTreeMap<u64, DelallocConsumptionRecord>,
+    /// 按 (inode, generation) 索引的延迟分配 claim 数据块。
+    ///
+    /// `stat_file_attr()` 每次都要知道某 inode 尚未落盘的保留块数。此前它对
+    /// `delalloc_claims` 做全表扫描，容器解包/批量写时 claim 数量上升会让每次
+    /// stat 变成 O(claims)，整体表现为数分钟级的容器启动延迟。
+    /// 这里与 `delalloc_claims` 同步维护一份索引，查询退化为区间求和。
+    inode_delalloc_data: BTreeMap<(InodeId, u32, DelallocReservationId), u64>,
 }
 
 static NEXT_DELALLOC_MOUNT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -346,7 +353,53 @@ impl AllocationState {
             reserved_metadata_blocks: 0,
             delalloc_claims: BTreeMap::new(),
             delalloc_consumptions: BTreeMap::new(),
+            inode_delalloc_data: BTreeMap::new(),
         })
+    }
+
+    /// 设置 claim 的 inode 归属，并同步按 inode 的 stat 索引。
+    ///
+    /// `owner` 为 `None` 时清除归属并移除索引项。`inode_owner` 是索引的
+    /// 唯一来源，任何修改都必须经过本方法，否则 `inode_reserved_data_blocks`
+    /// 会漏算。
+    pub(super) fn set_claim_inode_owner(
+        &mut self,
+        id: DelallocReservationId,
+        owner: Option<(InodeId, u32)>,
+    ) {
+        let Some(claim) = self.delalloc_claims.get_mut(&id) else {
+            return;
+        };
+        let previous = claim.inode_owner;
+        claim.inode_owner = owner;
+        let data_blocks = claim.data_blocks;
+        if let Some((inode, generation)) = previous {
+            self.inode_delalloc_data.remove(&(inode, generation, id));
+        }
+        if let Some((inode, generation)) = owner {
+            self.inode_delalloc_data
+                .insert((inode, generation, id), data_blocks);
+        }
+    }
+
+    /// claim 的 `data_blocks` 变化后同步索引（消耗/回滚路径）。
+    pub(super) fn sync_claim_owner_blocks(
+        &mut self,
+        id: DelallocReservationId,
+        claim: &DelallocClaim,
+    ) {
+        if let Some((inode, generation)) = claim.inode_owner {
+            if let Some(slot) = self.inode_delalloc_data.get_mut(&(inode, generation, id)) {
+                *slot = claim.data_blocks;
+            }
+        }
+    }
+
+    /// claim 被移除时清理索引。
+    pub(super) fn forget_claim_owner(&mut self, id: DelallocReservationId, claim: &DelallocClaim) {
+        if let Some((inode, generation)) = claim.inode_owner {
+            self.inode_delalloc_data.remove(&(inode, generation, id));
+        }
     }
 }
 

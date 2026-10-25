@@ -70,12 +70,29 @@ impl AllocationState {
         inode: InodeId,
         generation: u32,
     ) -> Result<u64> {
-        self.delalloc_claims
-            .values()
-            .filter(|claim| claim.inode_owner == Some((inode, generation)))
-            .try_fold(0u64, |total, claim| {
+        // 只遍历该 inode 的 claim 区间，未绑定 inode 的 claim 不计入（与全表
+        // 扫描版本语义一致：旧实现按 inode_owner 过滤）。
+        let start = (
+            inode,
+            generation,
+            DelallocReservationId {
+                mount_generation: 0,
+                serial: 0,
+            },
+        );
+        let end = (
+            inode,
+            generation,
+            DelallocReservationId {
+                mount_generation: u64::MAX,
+                serial: u64::MAX,
+            },
+        );
+        self.inode_delalloc_data
+            .range(start..=end)
+            .try_fold(0u64, |total, (_, blocks)| {
                 total
-                    .checked_add(claim.data_blocks)
+                    .checked_add(*blocks)
                     .ok_or_else(|| Ext4Error::new(ErrCode::ERANGE))
             })
     }
@@ -294,6 +311,9 @@ impl AllocationState {
         for reservation in reservations.iter_mut() {
             let removed = self.delalloc_claims.remove(&reservation.id);
             debug_assert!(removed.is_some());
+            if let Some(claim) = removed {
+                self.forget_claim_owner(reservation.id, &claim);
+            }
             reservation.deactivate();
         }
         self.reserved_data_blocks = new_reserved_data_blocks;
@@ -400,6 +420,14 @@ impl AllocationState {
             DelallocReservationUse::Metadata => claim.metadata_blocks = new_remaining,
         }
         claim.inflight_consumptions = new_inflight_consumptions;
+        if let Some((inode, generation)) = claim.inode_owner {
+            if let Some(slot) = self
+                .inode_delalloc_data
+                .get_mut(&(inode, generation, reservation))
+            {
+                *slot = claim.data_blocks;
+            }
+        }
         match use_kind {
             DelallocReservationUse::Data => self.reserved_data_blocks = new_reserved_total,
             DelallocReservationUse::Metadata => {
@@ -503,6 +531,15 @@ impl AllocationState {
                 }
             }
             claim.inflight_consumptions = new_inflight_consumptions;
+            if let Some((inode, generation)) = claim.inode_owner {
+                if let Some(slot) = self.inode_delalloc_data.get_mut(&(
+                    inode,
+                    generation,
+                    consumption_record.reservation,
+                )) {
+                    *slot = claim.data_blocks;
+                }
+            }
             consumption.resolve();
             Ok(())
         })();
@@ -603,6 +640,9 @@ impl AllocationState {
         }
         let removed = self.delalloc_claims.remove(&reservation_id);
         debug_assert!(removed.is_some());
+        if let Some(claim) = removed {
+            self.forget_claim_owner(reservation_id, &claim);
+        }
         reservation.deactivate();
         Ok(())
     }
@@ -702,6 +742,9 @@ impl AllocationState {
             }
             let removed_claim = self.delalloc_claims.remove(&reservation.id);
             debug_assert!(removed_claim.is_some());
+            if let Some(claim) = removed_claim {
+                self.forget_claim_owner(reservation.id, &claim);
+            }
             self.reserved_metadata_blocks = new_reserved_metadata;
             reservation.deactivate();
             Ok(())
@@ -796,7 +839,7 @@ impl Ext4 {
             offset,
             expected_durable_eof_before,
         )?;
-        claim.inode_owner = Some((inode_id, inode_generation));
+        allocation.set_claim_inode_owner(lease.id, Some((inode_id, inode_generation)));
         Ok(())
     }
     /// Apply one clean delayed-allocation capacity mutation.
@@ -1533,7 +1576,9 @@ impl Ext4 {
             debit.resolve();
         }
         for lease in leases.iter_mut() {
-            allocation.delalloc_claims.remove(&lease.id);
+            if let Some(claim) = allocation.delalloc_claims.remove(&lease.id) {
+                allocation.forget_claim_owner(lease.id, &claim);
+            }
             lease.deactivate();
         }
         allocation.reserved_metadata_blocks = reserved_metadata;
@@ -2713,21 +2758,9 @@ mod allocation_tests {
         let mut first = state.reserve_delalloc(100, 3, 7).unwrap();
         let mut second = state.reserve_delalloc(100, 2, 5).unwrap();
         let mut other = state.reserve_delalloc(100, 4, 0).unwrap();
-        state
-            .delalloc_claims
-            .get_mut(&first.id)
-            .unwrap()
-            .inode_owner = Some((12, 4));
-        state
-            .delalloc_claims
-            .get_mut(&second.id)
-            .unwrap()
-            .inode_owner = Some((12, 4));
-        state
-            .delalloc_claims
-            .get_mut(&other.id)
-            .unwrap()
-            .inode_owner = Some((12, 3));
+        state.set_claim_inode_owner(first.id, Some((12, 4)));
+        state.set_claim_inode_owner(second.id, Some((12, 4)));
+        state.set_claim_inode_owner(other.id, Some((12, 3)));
         assert_eq!(state.inode_reserved_data_blocks(12, 4).unwrap(), 5);
         assert_eq!(state.inode_reserved_data_blocks(13, 4).unwrap(), 0);
         assert_eq!(state.inode_reserved_data_blocks(12, 3).unwrap(), 4);

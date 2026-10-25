@@ -369,9 +369,17 @@ impl LocalApicTimer {
 /// this RefCell borrow alive while dispatching a deadline callback.
 pub(crate) fn program_deadline_delta(delta_ns: u64) {
     let mut timer = local_apic_timer_instance_mut(smp_get_processor_id());
-    let count = ((delta_ns as u128 * timer.periodic_count as u128)
-        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
-    .clamp(1, u32::MAX as u128) as u64;
+    let raw = (delta_ns as u128 * timer.periodic_count as u128)
+        .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000);
+    // The deadline layer bounds every programmed delta to one tick; reaching
+    // the hardware counter limit here therefore means an upper-layer invariant
+    // was violated. Keep the clamp as a defensive backstop, never as the
+    // recovery mechanism (a silent clamp used to hide a stalled tick horizon).
+    debug_assert!(
+        raw <= u32::MAX as u128,
+        "one-shot deadline delta exceeds the APIC counter range"
+    );
+    let count = raw.clamp(1, u32::MAX as u128) as u64;
     let divisor = timer.divisor;
     timer.init(LocalApicTimerMode::Oneshot, count, divisor);
     timer.start_current();

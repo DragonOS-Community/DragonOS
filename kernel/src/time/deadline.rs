@@ -130,7 +130,7 @@ impl DeadlineEvent {
         queue.pending.insert(node);
         state.queued = Some(key);
         if self.owner == smp_get_processor_id() {
-            program_locked(&queue);
+            program_locked(&mut queue);
         }
         drop(state);
         drop(queue);
@@ -158,7 +158,7 @@ impl DeadlineEvent {
         assert!(state.spare.is_none());
         state.spare = Some(node);
         if self.owner == smp_get_processor_id() {
-            program_locked(&queue);
+            program_locked(&mut queue);
         }
         drop(state);
         drop(queue);
@@ -225,17 +225,26 @@ pub fn init_local() {
     let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
     queue.next_tick = now_ns().saturating_add(TICK_NS);
     queue.ready = true;
-    program_locked(&queue);
+    program_locked(&mut queue);
 }
 
 pub fn reprogram_local() {
-    let queue = QUEUES[smp_get_processor_id().data() as usize].lock_irqsave();
+    let mut queue = QUEUES[smp_get_processor_id().data() as usize].lock_irqsave();
     if queue.ready {
-        program_locked(&queue);
+        program_locked(&mut queue);
     }
 }
 
-fn program_locked(queue: &Queue) {
+/// Re-anchor and program the next local timer event.
+///
+/// `next_tick` is the absolute deadline of the periodic tick and must never be
+/// further than one tick period from now. A clock jump (or a missed update) can
+/// leave it in the far future; silently programming the underlying counter to
+/// its maximum would let the tick stall until that absolute deadline, and
+/// `handle_irq()` would keep seeing `now < next_tick` and never run the tick.
+/// Repair the horizon here, at the layer that owns the deadline, so the
+/// hardware one-shot delta is always bounded by `TICK_NS`.
+fn program_locked(queue: &mut Queue) {
     if !queue.ready {
         return;
     }
@@ -246,11 +255,19 @@ fn program_locked(queue: &Queue) {
         crate::driver::clocksource::timer_riscv::program_deadline_delta(TICK_NS);
         return;
     }
+    let now = now_ns();
+    let horizon = now.saturating_add(TICK_NS);
+    if queue.next_tick > horizon {
+        // The stored tick deadline is beyond the next period: the tick can no
+        // longer catch up. Re-anchor it before programming; pending event
+        // deadlines are still honored through `next`.
+        queue.next_tick = horizon;
+    }
     let next = queue
         .pending
         .first_key()
         .map_or(queue.next_tick, |key| key.0.min(queue.next_tick));
-    let delta = next.saturating_sub(now_ns()).max(1);
+    let delta = next.saturating_sub(now).max(1);
     #[cfg(target_arch = "x86_64")]
     crate::arch::driver::apic::apic_timer::program_deadline_delta(delta);
     #[cfg(target_arch = "riscv64")]
@@ -491,6 +508,30 @@ pub fn run_selftests() {
             .pending
             .contains_key(&key));
         assert_eq!(state_spare_identity(&event), node_identity);
+
+        // A corrupted far-future tick horizon must be repaired at this layer:
+        // otherwise the hardware counter clamp would hide a stalled tick and
+        // `handle_irq()` would never observe `now >= next_tick` again.
+        {
+            let cpu = smp_get_processor_id();
+            let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
+            let saved_next = queue.next_tick;
+            let before = now_ns();
+            let far = before.saturating_add(3_600 * 1_000_000_000);
+            queue.next_tick = far;
+            program_locked(&mut queue);
+            assert!(
+                queue.next_tick < far,
+                "far-future tick horizon was not re-anchored"
+            );
+            assert!(
+                queue.next_tick <= now_ns().saturating_add(TICK_NS),
+                "re-anchored tick horizon exceeds one period"
+            );
+            queue.next_tick = saved_next;
+            program_locked(&mut queue);
+        }
+
         reprogram_local();
         drop(irq);
     }

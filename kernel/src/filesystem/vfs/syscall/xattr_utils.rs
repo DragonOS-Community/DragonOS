@@ -4,12 +4,18 @@ use crate::{
     filesystem::{
         fsnotify::{self, FsEvent},
         vfs::{
-            file::File, syscall::AtFlags, utils::user_path_at, IndexNode, XattrFlags, MAX_PATHLEN,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            file::File,
+            permission::{check_inode_permission, PermissionMask},
+            syscall::AtFlags,
+            utils::user_path_at,
+            FileType, IndexNode, XattrFlags, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     mm::{allocation::MemoryAllocationError, VirtAddr},
-    process::ProcessManager,
+    process::{
+        cred::{capable, CAPFlags},
+        ProcessManager,
+    },
     syscall::user_access::{
         check_and_clone_cstr, copy_from_user_protected, copy_to_user_protected,
         vfs_check_and_clone_cstr,
@@ -196,6 +202,26 @@ fn do_removexattr(inode: Arc<dyn IndexNode>, name: &[u8]) -> Result<usize, Syste
     Ok(result)
 }
 
+// Linux xattr_permission(MAY_READ). Namespace policy belongs at the syscall
+// boundary; filesystem-internal attribute lookups retain their own credentials.
+fn check_xattr_get_permission(inode: &Arc<dyn IndexNode>, name: &[u8]) -> Result<(), SystemError> {
+    if name.starts_with(b"security.") || name.starts_with(b"system.") {
+        return Ok(());
+    }
+    if name.starts_with(b"trusted.") {
+        return if capable(CAPFlags::CAP_SYS_ADMIN) {
+            Ok(())
+        } else {
+            Err(SystemError::ENODATA)
+        };
+    }
+    let metadata = inode.metadata()?;
+    if name.starts_with(b"user.") && !matches!(metadata.file_type, FileType::File | FileType::Dir) {
+        return Err(SystemError::ENODATA);
+    }
+    check_inode_permission(inode, &metadata, PermissionMask::MAY_READ)
+}
+
 fn do_getxattr(
     inode: Arc<dyn IndexNode>,
     name_ptr: *const u8,
@@ -205,6 +231,7 @@ fn do_getxattr(
     let name = clone_xattr_name(name_ptr)?;
 
     File::recover_io(|| {
+        check_xattr_get_permission(&inode, name.as_bytes())?;
         copy_xattr_output(
             size,
             XATTR_SIZE_MAX,

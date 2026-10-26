@@ -501,6 +501,31 @@ TEST_F(XattrSyscall, ForkRetainsNonePagesAndRestoredWritesUseCopyOnWrite) {
     EXPECT_EQ(0, munmap(resident, page * 2));
 }
 
+TEST_F(XattrSyscall, SymlinkReadsUseNamespacePolicyAndFollowSemantics) {
+    const std::string link = path + ".link";
+    ASSERT_EQ(0, symlink(path.c_str(), link.c_str()));
+    for (const char* name : {"security.capability", "user.missing", "trusted.missing"}) {
+        errno = 0;
+        EXPECT_EQ(-1, lgetxattr(link.c_str(), name, nullptr, 0));
+        EXPECT_EQ(ENODATA, errno) << name;
+    }
+    std::array<char, sizeof(kValue)> value {};
+    EXPECT_EQ(static_cast<ssize_t>(value.size()),
+              getxattr(link.c_str(), kName, value.data(), value.size()));
+    EXPECT_EQ(0, memcmp(value.data(), kValue, value.size()));
+    errno = 0;
+    EXPECT_EQ(-1, lgetxattr(link.c_str(), kName, nullptr, 0));
+    EXPECT_EQ(ENODATA, errno);
+    ASSERT_EQ(0, unlink(path.c_str()));
+    errno = 0;
+    EXPECT_EQ(-1, getxattr(link.c_str(), "security.capability", nullptr, 0));
+    EXPECT_EQ(ENOENT, errno);
+    errno = 0;
+    EXPECT_EQ(-1, lgetxattr(link.c_str(), "security.capability", nullptr, 0));
+    EXPECT_EQ(ENODATA, errno);
+    EXPECT_EQ(0, unlink(link.c_str()));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

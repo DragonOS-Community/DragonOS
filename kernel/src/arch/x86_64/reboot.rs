@@ -21,7 +21,7 @@ use crate::{
     sched::{request_task_migration, schedule, SchedMode},
     smp::{
         core::smp_get_processor_id,
-        cpu::{smp_cpu_manager, ProcessorId},
+        cpu::{smp_cpu_manager, CpuHpState, ProcessorId},
     },
     time::{sleep::nanosleep, PosixTimeSpec},
 };
@@ -173,22 +173,20 @@ pub(crate) fn migrate_to_reboot_cpu() {
     }
 }
 
-fn stop_other_cpus() {
-    if STOPPING_CPUS.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
+/// True only when peers have completed terminal teardown. Kexec must not reuse
+/// RAM after a timeout, unlike a restart that can still attempt hardware reset.
+pub(crate) fn stop_other_cpus() -> bool {
     let this_cpu = smp_get_processor_id();
     let mut targets = CpuMask::new();
 
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
-        if cpu != this_cpu && smp_cpu_manager().is_online_cpu(cpu) {
+        if cpu != this_cpu && cpu_needs_stop(smp_cpu_manager().cpuhp_state(cpu).state()) {
             targets.set(cpu, true);
         }
     }
 
-    if targets.is_empty() {
-        return;
+    if STOPPING_CPUS.swap(true, Ordering::SeqCst) || targets.is_empty() {
+        return targets.is_empty();
     }
 
     for cpu in targets.iter_cpu() {
@@ -198,15 +196,15 @@ fn stop_other_cpus() {
     for _ in 0..STOP_OTHER_CPUS_TIMEOUT_LOOPS {
         if targets
             .iter_cpu()
-            .all(|cpu| smp_cpu_manager().is_dead_cpu(cpu))
+            .all(|cpu| !cpu_needs_stop(smp_cpu_manager().cpuhp_state(cpu).state()))
         {
-            return;
+            return true;
         }
         spin_loop();
     }
 
     for cpu in targets.iter_cpu() {
-        if !smp_cpu_manager().is_dead_cpu(cpu) {
+        if cpu_needs_stop(smp_cpu_manager().cpuhp_state(cpu).state()) {
             log::warn!(
                 "stop_other_cpus: CPU {} did not reach Dead before timeout (state: {:?})",
                 cpu.data(),
@@ -214,6 +212,32 @@ fn stop_other_cpus() {
             );
         }
     }
+    false
+}
+
+fn cpu_needs_stop(state: CpuHpState) -> bool {
+    matches!(
+        state,
+        CpuHpState::Online | CpuHpState::Starting | CpuHpState::Dying
+    )
+}
+
+pub(crate) fn run_kvm_shutdown_selftests() -> Result<(), &'static str> {
+    for state in [CpuHpState::Online, CpuHpState::Starting, CpuHpState::Dying] {
+        if !cpu_needs_stop(state) {
+            return Err("active CPU accepted as stopped before RAM reuse");
+        }
+    }
+    for state in [
+        CpuHpState::Offline,
+        CpuHpState::Dead,
+        CpuHpState::FailedParked,
+    ] {
+        if cpu_needs_stop(state) {
+            return Err("terminal CPU teardown not accepted");
+        }
+    }
+    Ok(())
 }
 
 /// # 功能

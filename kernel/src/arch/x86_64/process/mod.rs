@@ -1044,6 +1044,7 @@ pub(crate) fn stop_this_cpu() -> ! {
     }
 
     smp_cpu_manager().begin_shutdown_current_cpu(cpu_id);
+    crate::arch::kvm_para::shutdown_time();
     CurrentApic.disable_local_apic();
     smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 

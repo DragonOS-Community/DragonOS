@@ -45,6 +45,17 @@ TEST(TimekeepingSelftest, KernelPureAndTransactionalChecksPass) {
     EXPECT_NE(std::string::npos, report.find("rwlock.upgrader_reader_limit=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("rwlock.pending_blocks_new_owners=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("kvm_allocator.staged_success=ok\n")) << report;
+    for (const char* name : {"sched_clock", "rq_bounded", "rq_reset", "usage_balance",
+                             "usage_reset_with_balance", "zero_limit_observes_reset",
+                             "independent_consumers"}) {
+        EXPECT_NE(std::string::npos,
+                  report.find(std::string("virtual_time.") + name + "=ok\n"))
+            << report;
+    }
+#if defined(__x86_64__)
+    EXPECT_NE(std::string::npos, report.find("virtual_time.kvm_steal_reader=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("virtual_time.kvm_shutdown_states=ok\n")) << report;
+#endif
     EXPECT_NE(std::string::npos,
               report.find("kvm_allocator.mapping_failure_releases_frame=ok\n"))
         << report;

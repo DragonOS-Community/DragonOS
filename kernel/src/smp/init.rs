@@ -22,6 +22,8 @@ pub fn smp_ap_start_stage2() -> ! {
         // Withdraw GP responsibility before publishing completion and
         // entering the terminal park where this AP can no longer report.
         crate::rcu::cpu_dying(cpu);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::kvm_para::shutdown_time();
         smp_cpu_manager().complete_ap_thread(true, Err(error));
         park_failed_ap();
     }
@@ -62,6 +64,7 @@ fn do_ap_start_stage2() -> Result<(), system_error::SystemError> {
     {
         crate::arch::x86_64::mm::X86_64MMArch::init_current_cpu_nxe();
         crate::driver::clocksource::kvm_clock::kvmclock_init_secondary()?;
+        crate::arch::kvm_para::steal_time::init_current_cpu()?;
     }
     arch_syscall_init()?;
     Ok(())

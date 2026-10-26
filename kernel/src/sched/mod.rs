@@ -494,6 +494,7 @@ pub struct CpuRunQueue {
     clock_task: u64,
     clock: u64,
     prev_irq_time: u64,
+    prev_steal_time_rq: u64,
     clock_updata_flags: ClockUpdataFlag,
 
     /// 过载
@@ -549,6 +550,7 @@ impl CpuRunQueue {
             clock_task: 0,
             clock: 0,
             prev_irq_time: 0,
+            prev_steal_time_rq: 0,
             clock_updata_flags: ClockUpdataFlag::empty(),
             overload: false,
             next_balance: 0,
@@ -906,6 +908,10 @@ impl CpuRunQueue {
         self.prev_irq_time += irq_delta;
 
         delta -= irq_delta;
+
+        if let Some(total) = cputime::steal_clock(self.cpu) {
+            delta -= cputime::rq_steal_time(total, &mut self.prev_steal_time_rq, delta);
+        }
 
         // todo: psi?
 

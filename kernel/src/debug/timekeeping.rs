@@ -10,6 +10,7 @@ use crate::{
         vfs::{InodeMode, PollStatus},
     },
     libs::rwlock::run_rwlock_selftests,
+    sched::cputime::run_virtual_time_selftests,
     time::{clocksource::run_clocksource_selftests, timekeeping::run_timekeeping_selftests},
 };
 
@@ -94,6 +95,7 @@ fn run_selftests() -> String {
     let (timekeeping_passed, timekeeping_failed, timekeeping_body) = run_timekeeping_selftests();
     let (clocksource_passed, clocksource_failed, clocksource_body) = run_clocksource_selftests();
     let (rwlock_passed, rwlock_failed, rwlock_body) = run_rwlock_selftests();
+    let (virtual_passed, virtual_failed, virtual_body) = run_virtual_time_selftests();
     #[cfg(target_arch = "x86_64")]
     let (kvm_passed, kvm_failed, kvm_body) = run_kvm_clock_allocator_selftests();
     #[cfg(not(target_arch = "x86_64"))]
@@ -112,13 +114,21 @@ fn run_selftests() -> String {
     };
     #[cfg(not(feature = "mm_selftest"))]
     let (timer_passed, timer_failed, timer_body) = (0, 0, String::new());
-    let passed =
-        timekeeping_passed + clocksource_passed + rwlock_passed + kvm_passed + timer_passed;
-    let failed =
-        timekeeping_failed + clocksource_failed + rwlock_failed + kvm_failed + timer_failed;
+    let passed = timekeeping_passed
+        + clocksource_passed
+        + rwlock_passed
+        + kvm_passed
+        + timer_passed
+        + virtual_passed;
+    let failed = timekeeping_failed
+        + clocksource_failed
+        + rwlock_failed
+        + kvm_failed
+        + timer_failed
+        + virtual_failed;
     let status = if failed == 0 { "ok" } else { "fail" };
     format!(
-        "status={status}\n{timekeeping_body}{clocksource_body}{rwlock_body}{kvm_body}{timer_body}summary_pass={passed}\nsummary_fail={failed}\n"
+        "status={status}\n{timekeeping_body}{clocksource_body}{rwlock_body}{kvm_body}{timer_body}{virtual_body}summary_pass={passed}\nsummary_fail={failed}\n"
     )
 }
 

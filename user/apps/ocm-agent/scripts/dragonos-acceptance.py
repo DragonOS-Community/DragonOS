@@ -248,9 +248,11 @@ def inject(agent: Path, gateway: Path, config: Path) -> None:
              str(root / "plugins/os_monitor/app.conf.yml")], check=True)
         run(["sudo", "-n", install, "-m", "755", str(app / "bin/plugins/sysinfo_collector/sysinfo_collector"),
              str(root / "plugins/sysinfo_collector/sysinfo_collector")], check=True)
+        # `make plugins` stages the collector YAMLs next to the binaries, so
+        # the acceptance run does not depend on the source checkout location.
         for name in ("os_monitor", "sysinfo_collector"):
             run(["sudo", "-n", install, "-m", "644",
-                 str(app / "upstream/plugins" / ("os-monitor" if name == "os_monitor" else "sysinfo-collector") / f"{name}.yml"),
+                 str(app / "bin" / "plugin-conf" / f"{name}.yml"),
                  str(root / "plugin-conf" / f"{name}.yml")], check=True)
         for script in ("acceptance-start.sh", "acceptance-large.sh", "acceptance-stats.sh"):
             run(["sudo", "-n", install, "-m", "755", str(RUN_DIR / script), str(root / script)], check=True)

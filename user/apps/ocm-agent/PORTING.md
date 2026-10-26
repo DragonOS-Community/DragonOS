@@ -22,8 +22,8 @@ ocm-agent 源码**不保存在本仓库**。DADK 通过 git source 直接引用
 
 内核侧**不需要新增 syscall**，但 `sysinfo_collector` 依赖 gopsutil 的
 `host.Info()`，后者需要 `/proc/uptime`；DragonOS 原先没有该文件，因此本移植在
-procfs 中新增了 `/proc/uptime`（格式与 Linux 一致：uptime + 各 CPU idle 总和；PR
-[#2565](https://github.com/DragonOS-Community/DragonOS/pull/2565)）。
+procfs 中新增了 `/proc/uptime`（格式与 Linux 一致：uptime + 各 CPU idle 总和；已通过
+PR [#2565](https://github.com/DragonOS-Community/DragonOS/pull/2565) 合入 master）。
 
 ## 2. 为什么必须静态链接
 
@@ -220,7 +220,8 @@ python3 user/apps/ocm-agent/scripts/dragonos-acceptance.py --duration 60
 - `user/apps/default.nix`：把 x86_64 的 ocm-agent 加入 Nix rootfs；
 - `user/dadk/config/all/ocm_agent.toml` 及 `sets/{default,ubuntu2404}` 软链接；
 - `user/apps/busybox/Makefile`：禁用 `tc` applet 并在追加配置后执行 `oldconfig`，
-  以便在缺少 CBQ uapi 的新内核头文件（Linux 6.16）主机上完成 `make user`。
+  以便在缺少 CBQ uapi 的新内核头文件（Linux 6.16）主机上完成 `make user`
+  （已通过 PR [#2566](https://github.com/DragonOS-Community/DragonOS/pull/2566) 合入 master）。
 
 GitHub 镜像 `dragonos` 分支上的两个修复：
 

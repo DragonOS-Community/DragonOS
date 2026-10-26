@@ -59,10 +59,11 @@ DADK 的 `build-command` 通过 `DADK_SOURCE_CACHE_DIR_OCM_AGENT_0_1_0` 使用�
 DADK 首次构建会克隆到 `bin/dadk_cache/source/ocm_agent_0_1_0`；本地直接编译则克隆到
 未跟踪的 `upstream/`。GitHub 访问受限时可预先准备同 commit 的源码缓存。
 
-> 当前备份分支不包含内核 `/proc/uptime` 和 busybox 构建修复（分别在
+> 内核 `/proc/uptime` 与 busybox 构建修复已通过
 > [PR #2565](https://github.com/DragonOS-Community/DragonOS/pull/2565) 和
-> [PR #2566](https://github.com/DragonOS-Community/DragonOS/pull/2566) 中）；
-> 在 PR 合入前，本地工作区保留这两处修改，验收才能复现。详见 §7 和 §9。
+> [PR #2566](https://github.com/DragonOS-Community/DragonOS/pull/2566) 合入 `master`。
+> 本分支已 rebase 到包含这两处修复的 `master`；2026-10-26 rebase 后重新执行本验收，
+> 结果仍为 PASS，工作区不再保留额外修改。详见 §7 和 §9。
 
 ## 3. 测试拓扑
 
@@ -280,9 +281,8 @@ NUL 当成额外一行并报 `wrong uptime format`。该修复见
 - 禁用 `CONFIG_TC`：Linux 6.16 uapi 已删除 CBQ 常量，BusyBox 1.35 的 `tc.c` 无法编译；
 - 追加配置后执行 `yes "" | make oldconfig`，避免新符号进入交互式 `(NEW)` 状态。
 
-该修复见 [PR #2566](https://github.com/DragonOS-Community/DragonOS/pull/2566)
-（分支 `fix/busybox-build`，commit `cd30543d`）。在合入前保留在工作区，否则非 Nix 的
-`make user` 会失败。
+该修复已通过 [PR #2566](https://github.com/DragonOS-Community/DragonOS/pull/2566)
+合入 `master`（原分支 `fix/busybox-build`）。
 
 ## 8. 已知缺口
 

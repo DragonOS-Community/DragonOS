@@ -397,7 +397,7 @@ impl LockedVMA {
 
                     // Remove the current VMA from anon_vma
                     let PresentPfn::Managed(page_arc) =
-                        Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                        Self::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
                     else {
                         unsafe { flush.ignore() };
                         tlb.accumulate_range(page.virt_address());
@@ -469,7 +469,7 @@ impl LockedVMA {
                     };
 
                     let PresentPfn::Managed(page_arc) =
-                        Self::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                        Self::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
                     else {
                         // A raw mixed PFN belongs to this file VMA. CacheOnly and
                         // EvenCow both zap it; private COW pages are managed and are
@@ -655,11 +655,9 @@ impl LockedVMA {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    if let PresentPfn::Managed(page) = Self::classify_present_pfn(
-                        &mut page_manager_guard,
-                        paddr,
-                        *guard.vm_flags(),
-                    ) {
+                    if let PresentPfn::Managed(page) =
+                        Self::classify_present_pfn(&page_manager_guard, paddr, *guard.vm_flags())
+                    {
                         let mut page_guard = page.write();
                         page_guard.replace_vma_for_split(self, before.clone());
                     }
@@ -671,11 +669,9 @@ impl LockedVMA {
             let virt_iter = after.lock().region.iter_pages();
             for frame in virt_iter {
                 if let Some((paddr, _)) = utable.translate(frame.virt_address()) {
-                    if let PresentPfn::Managed(page) = Self::classify_present_pfn(
-                        &mut page_manager_guard,
-                        paddr,
-                        *guard.vm_flags(),
-                    ) {
+                    if let PresentPfn::Managed(page) =
+                        Self::classify_present_pfn(&page_manager_guard, paddr, *guard.vm_flags())
+                    {
                         let mut page_guard = page.write();
                         page_guard.replace_vma_for_split(self, after.clone());
                     }

@@ -295,7 +295,7 @@ impl LockedExt4Inode {
             return Ok(None);
         }
         let (fs, size, _) = self.dax_source()?;
-        if offset % BLOCK != 0
+        if !offset.is_multiple_of(BLOCK)
             || offset.checked_add(BLOCK).ok_or(SystemError::EOVERFLOW)? > size
             || !expected.check_aligned(BLOCK)
         {

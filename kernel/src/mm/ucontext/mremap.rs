@@ -907,7 +907,7 @@ impl InnerAddressSpace {
                     tlb.accumulate_range(dst);
                     installed_target_pte = true;
                     if let PresentPfn::Managed(page) =
-                        LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                        LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
                     {
                         installed_target_present_pages += 1;
                         page.write().insert_vma(new_vma.clone(), dst, locked_source);
@@ -927,7 +927,7 @@ impl InnerAddressSpace {
                         tlb.accumulate_range(dst);
                     }
                     if let PresentPfn::Managed(page) =
-                        LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                        LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
                     {
                         page.write().remove_vma(new_vma.as_ref());
                     }
@@ -970,7 +970,7 @@ impl InnerAddressSpace {
                     }
 
                     if let PresentPfn::Managed(page) =
-                        LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                        LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
                     {
                         removed_source_present_pages += 1;
                         page.write().remove_vma(old_vma.as_ref());

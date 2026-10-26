@@ -548,6 +548,32 @@ impl FileSystem for OverlayFS {
         None
     }
 
+    /// OverlayFS keeps no page cache of its own: file data pages belong to
+    /// the upper/lower backing inode, and every file mapping must therefore
+    /// bind the backing file (`mmap_effective_file`). A fault reaching this
+    /// hook means such a mapping was bypassed; the default trait behaviour is
+    /// to panic, which takes the whole kernel down, so report it as SIGBUS
+    /// and leave one diagnostic instead.
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut crate::mm::fault::PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> crate::mm::VmFaultReason {
+        static REPORTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            log::error!(
+                "overlayfs: page fault on a mapping bound to the overlay inode \
+                 (addr={:?}, pgoffs={}..{}); file mappings must bind the backing file",
+                pfm.address(),
+                start_pgoff,
+                end_pgoff
+            );
+        }
+        crate::mm::VmFaultReason::VM_FAULT_SIGBUS
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_inode.clone()
     }

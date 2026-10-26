@@ -72,19 +72,30 @@ impl<T> SpinLock<T> {
 
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let mut spins: u32 = 0;
         loop {
             let res = self.try_lock();
             if let Ok(res) = res {
                 return res;
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0x3ff == 0 {
+                // 争用期间让本 CPU 仍能应答 TLB shootdown（见 spinlock_hook）。
+                crate::libs::spinlock_hook::run(self as *const _ as usize);
             }
             spin_loop();
         }
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<'_, T> {
+        let mut spins: u32 = 0;
         loop {
             if let Ok(guard) = self.try_lock_irqsave() {
                 return guard;
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0x3ff == 0 {
+                crate::libs::spinlock_hook::run(self as *const _ as usize);
             }
             spin_loop();
         }

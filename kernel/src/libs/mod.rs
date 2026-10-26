@@ -21,6 +21,7 @@ pub mod rwlock;
 pub mod rwsem;
 pub mod semaphore;
 pub mod spinlock;
+pub mod spinlock_hook;
 pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;

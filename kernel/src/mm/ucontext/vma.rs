@@ -6,6 +6,13 @@ use crate::mm::mmu_gather::PAGE_BATCH;
 
 const UNMAP_SCAN_BATCH: usize = 256;
 
+/// Keep registry owners and this transaction's TLB pin together until all
+/// registry/Page guards have gone. No allocation is needed for the batch.
+struct UnmappedPage {
+    page: Arc<Page>,
+    retired: Option<crate::mm::page::retirement::RetiredPageOwners>,
+}
+
 /// Classification of a present user PTE in a VMA.
 ///
 /// VM_PFNMAP is explicitly driver-owned and pinned by its VMA backing; it
@@ -83,7 +90,7 @@ impl LockedVMA {
     }
 
     pub(crate) fn classify_present_pfn(
-        page_manager: &mut PageManager,
+        page_manager: &PageManager,
         paddr: PhysAddr,
         vm_flags: VmFlags,
     ) -> PresentPfn {
@@ -93,7 +100,9 @@ impl LockedVMA {
         if vm_flags.contains(VmFlags::VM_PFNMAP) {
             return PresentPfn::External;
         }
-        if let Some(page) = page_manager.get(&paddr) {
+        // Identity bookkeeping is not a data access. In particular, fork,
+        // split and mlock must not rewrite the global LRU for every PTE.
+        if let Some(page) = page_manager.get_registered(&paddr) {
             return PresentPfn::Managed(page);
         }
         assert!(
@@ -308,13 +317,49 @@ impl LockedVMA {
         return Ok(());
     }
 
+    fn has_recency(vma: &VMA) -> bool {
+        !vma.vm_flags()
+            .intersects(VmFlags::VM_SEQ_READ | VmFlags::VM_RAND_READ)
+            && vma
+                .vm_file()
+                .is_none_or(|file| !file.mode().contains(FileMode::FMODE_NOREUSE))
+    }
+
+    /// Preserve the access hint from the PTE being removed, independently of
+    /// PFN classification (Linux zap_pte_range()/vma_has_recency()).
+    fn unmap_managed_page(
+        &self,
+        page: Arc<Page>,
+        old_flags: EntryFlags<MMArch>,
+        allow_recency: bool,
+        manager: &mut crate::mm::page::PageManager,
+    ) -> UnmappedPage {
+        let (accessed_file, retired) = {
+            let mut guard = page.write();
+            let accessed_file = allow_recency
+                && old_flags.has_flag(MMArch::ENTRY_FLAG_ACCESSED)
+                && matches!(guard.page_type(), PageType::File(_));
+            guard.remove_vma(self);
+            let retired = crate::mm::page::retirement::try_detach_unmapped_page_with_manager(
+                &page, &mut guard, manager,
+            );
+            (accessed_file, retired)
+        };
+        // The caller holds PageManager. Drop the Page guard before acquiring
+        // the reclaimer, retaining the existing manager -> reclaimer order.
+        if accessed_file {
+            crate::mm::page::page_reclaimer_lock().mark_accessed(&page.phys_address());
+        }
+        UnmappedPage { page, retired }
+    }
+
     /// Unmap the entire VMA, stashing physical pages pending release into `tlb` and accumulating the TLB flush range.
     ///
     /// The caller must complete all PTE clears before calling `tlb.finish()`, which uniformly
     /// performs cross-core TLB shootdown first and then frees physical pages (INV-3).
     pub fn unmap(&self, mapper: &mut PageMapper, tlb: &mut MmuGather<'_>) {
         // todo: if the current VMA is associated with a file, complete the file-related logic
-        let (region, should_wakeup_writeback, mm, vm_flags) = {
+        let (region, should_wakeup_writeback, mm, vm_flags, allow_recency) = {
             let mut self_guard = self.lock();
             let region = *self_guard.region();
             let mm = self_guard.address_space().and_then(|mm| mm.upgrade());
@@ -323,12 +368,19 @@ impl LockedVMA {
                 && self_guard
                     .vm_flags()
                     .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE);
-            (region, should_wakeup_writeback, mm, *self_guard.vm_flags())
+            let allow_recency = Self::has_recency(&self_guard);
+            (
+                region,
+                should_wakeup_writeback,
+                mm,
+                *self_guard.vm_flags(),
+                allow_recency,
+            )
         };
 
         let mut pages = region.pages();
         loop {
-            let mut pending: [Option<Arc<Page>>; PAGE_BATCH] = core::array::from_fn(|_| None);
+            let mut pending: [Option<UnmappedPage>; PAGE_BATCH] = core::array::from_fn(|_| None);
             let mut used = 0;
             let mut scanned = 0;
             {
@@ -339,7 +391,7 @@ impl LockedVMA {
                     if mapper.translate(page.virt_address()).is_none() {
                         continue;
                     }
-                    let (paddr, _, flush) =
+                    let (paddr, old_flags, flush) =
                         unsafe { mapper.unmap_phys_gather(page.virt_address(), true, tlb) }
                             .expect("Failed to unmap, beacuse of some page is not mapped");
 
@@ -351,11 +403,12 @@ impl LockedVMA {
                         tlb.accumulate_range(page.virt_address());
                         continue;
                     };
-                    {
-                        let mut page_guard = page_arc.write();
-                        page_guard.remove_vma(self);
-                    }
-                    pending[used] = Some(page_arc);
+                    pending[used] = Some(self.unmap_managed_page(
+                        page_arc,
+                        old_flags,
+                        allow_recency,
+                        &mut page_manager_guard,
+                    ));
                     used += 1;
 
                     // Local PTE cleared; no immediate invlpg. Final TLB invalidation is performed uniformly by MmuGather.
@@ -394,6 +447,7 @@ impl LockedVMA {
         let vma_start = self_guard.region().start();
         let backing_pgoff = self_guard.backing_page_offset();
         let vm_flags = *self_guard.vm_flags();
+        let allow_recency = Self::has_recency(&self_guard);
         let file_page_cache = self_guard
             .vm_file()
             .and_then(|file| file.inode().page_cache());
@@ -401,7 +455,7 @@ impl LockedVMA {
 
         let mut pages = intersection.pages();
         loop {
-            let mut pending: [Option<Arc<Page>>; PAGE_BATCH] = core::array::from_fn(|_| None);
+            let mut pending: [Option<UnmappedPage>; PAGE_BATCH] = core::array::from_fn(|_| None);
             let mut used = 0;
             let mut scanned = 0;
             {
@@ -453,17 +507,18 @@ impl LockedVMA {
                         }
                     }
 
-                    let Some((paddr, _, flush)) =
+                    let Some((paddr, old_flags, flush)) =
                         (unsafe { mapper.unmap_phys_preserve_tables(virt) })
                     else {
                         continue;
                     };
 
-                    {
-                        let mut page_guard = page_arc.write();
-                        page_guard.remove_vma(self);
-                    }
-                    pending[used] = Some(page_arc);
+                    pending[used] = Some(self.unmap_managed_page(
+                        page_arc,
+                        old_flags,
+                        allow_recency,
+                        &mut page_manager_guard,
+                    ));
                     used += 1;
 
                     unsafe { flush.ignore() };
@@ -480,21 +535,29 @@ impl LockedVMA {
     /// All registry and Page guards have gone before classification, owner
     /// retirement or a gather batch's synchronous TLB acknowledgement.
     fn retire_unmapped_batch(
-        pages: &mut [Option<Arc<Page>>],
+        pages: &mut [Option<UnmappedPage>],
         mm: Option<&Arc<AddressSpace>>,
         tlb: &mut MmuGather<'_>,
     ) {
-        for page in pages.iter().flatten() {
-            InnerAddressSpace::remove_page_unevictable_if_unneeded(page);
+        for entry in pages.iter().flatten() {
+            if entry.retired.is_none() {
+                InnerAddressSpace::remove_page_unevictable_if_unneeded(&entry.page);
+            }
         }
         if let Some(mm) = mm {
             mm.account_present_pages_sub(pages.len());
         }
         for slot in pages {
-            let page = slot.take().expect("filled unmap batch slot");
-            crate::mm::page::retire_unmapped_page(&page);
+            let UnmappedPage { page, retired } = slot.take().expect("filled unmap batch slot");
+            if retired.is_none() {
+                crate::mm::page::retire_unmapped_page(&page);
+            }
             // This transaction keeps its own pin even if another MM removes
             // the final rmap. That MM's barrier cannot substitute for ours.
+            // The local Page Arc pins the frame while registry owners drop.
+            // stash_page may flush a full batch synchronously, so no retired
+            // registry owner should outlive that batch's release boundary.
+            drop(retired);
             tlb.stash_page(page);
         }
     }

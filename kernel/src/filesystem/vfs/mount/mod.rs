@@ -6345,6 +6345,21 @@ impl IndexNode for MountFSInode {
             .check_mmap_file(file, len, offset, vm_flags)
     }
 
+    fn is_dax(&self) -> bool {
+        self.dentry.inode.is_dax()
+    }
+
+    fn pin_readonly_external_page(
+        &self,
+        file_offset: usize,
+        expected_pfn: crate::mm::PhysAddr,
+    ) -> Result<Option<crate::driver::base::block::direct_access::DirectAccessRange>, SystemError>
+    {
+        self.dentry
+            .inode
+            .pin_readonly_external_page(file_offset, expected_pfn)
+    }
+
     fn mmap_vm_flags(&self, file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags, SystemError> {
         self.dentry.inode.mmap_vm_flags(file, vm_flags)
     }

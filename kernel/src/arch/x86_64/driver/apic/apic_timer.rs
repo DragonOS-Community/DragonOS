@@ -158,7 +158,7 @@ impl LocalApicTimerIntrController {
     #[allow(dead_code)]
     pub(super) fn uninstall(&self) {
         let cpu_id = smp_get_processor_id();
-        let local_apic_timer = local_apic_timer_instance(cpu_id);
+        let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
         local_apic_timer.stop_current();
     }
 
@@ -172,7 +172,7 @@ impl LocalApicTimerIntrController {
     #[allow(dead_code)]
     pub(super) fn disable(&self) {
         let cpu_id = smp_get_processor_id();
-        let local_apic_timer = local_apic_timer_instance_mut(cpu_id);
+        let mut local_apic_timer = local_apic_timer_instance_mut(cpu_id);
         local_apic_timer.stop_current();
     }
 }
@@ -180,6 +180,8 @@ impl LocalApicTimerIntrController {
 #[derive(Debug, Copy, Clone)]
 pub struct LocalApicTimer {
     mode: LocalApicTimerMode,
+    /// Whether LVTT is unmasked; remains true after a one-shot counter expires.
+    enabled: bool,
     /// IntialCount
     initial_count: u64,
     periodic_count: u64,
@@ -206,6 +208,7 @@ impl LocalApicTimer {
     pub const fn new() -> Self {
         LocalApicTimer {
             mode: LocalApicTimerMode::Periodic,
+            enabled: false,
             initial_count: 0,
             periodic_count: 0,
             hres_calibrated: false,
@@ -315,11 +318,13 @@ impl LocalApicTimer {
     }
 
     fn setup_lvt(&mut self, vector: u8, mask: bool, mode: LocalApicTimerMode) {
+        self.mode = mode;
         let mode: u32 = mode as u32;
         let data = (mode << 17) | (vector as u32) | (if mask { 1 << 16 } else { 0 });
         let lvt = LVT::new(LVTRegister::Timer, data).unwrap();
 
         CurrentApic.set_lvt(lvt);
+        self.enabled = !mask;
     }
 
     fn set_divisor(&mut self, divisor: u32) {
@@ -336,12 +341,14 @@ impl LocalApicTimer {
         let mut lvt = CurrentApic.read_lvt(LVTRegister::Timer);
         lvt.set_mask(false);
         CurrentApic.set_lvt(lvt);
+        self.enabled = true;
     }
 
-    fn stop_current(&self) {
+    fn stop_current(&mut self) {
         let mut lvt = CurrentApic.read_lvt(LVTRegister::Timer);
         lvt.set_mask(true);
         CurrentApic.set_lvt(lvt);
+        self.enabled = false;
     }
 
     fn set_lvt_masked(&mut self, mode: LocalApicTimerMode) {
@@ -372,9 +379,15 @@ pub(crate) fn program_deadline_delta(delta_ns: u64) {
     let count = ((delta_ns as u128 * timer.periodic_count as u128)
         .div_ceil(LocalApicTimer::INTERVAL_MS as u128 * 1_000_000))
     .clamp(1, u32::MAX as u128) as u64;
-    let divisor = timer.divisor;
-    timer.init(LocalApicTimerMode::Oneshot, count, divisor);
-    timer.start_current();
+    if timer.mode == LocalApicTimerMode::Oneshot && timer.enabled {
+        // The mode and divider are already installed. Like Linux lapic_next_event,
+        // rearm only the count; redundant LVTT/divider writes cause VM exits.
+        timer.set_initial_cnt(count);
+    } else {
+        let divisor = timer.divisor;
+        // init unmasks LVTT before writing the count, including tiny deadlines.
+        timer.init(LocalApicTimerMode::Oneshot, count, divisor);
+    }
 }
 
 pub(crate) fn restore_periodic() {
@@ -383,6 +396,8 @@ pub(crate) fn restore_periodic() {
         let count = timer.periodic_count;
         let divisor = timer.divisor;
         timer.init(LocalApicTimerMode::Periodic, count, divisor);
+        timer.start_current();
+    } else if !timer.enabled {
         timer.start_current();
     }
 }

@@ -4,7 +4,7 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, AtomicU64, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
 };
 
 use alloc::sync::{Arc, Weak};
@@ -89,6 +89,10 @@ pub mod debugreg {
 /// Per-CPU shadow of the current hardware DR7
 static CPU_DR7: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
     [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
+// The boot CPU and APs must install a known hardware state once before relying
+// on the zero shadow; firmware/bootloader debug state is not part of our ABI.
+static CPU_DR7_INITIALIZED: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicBool::new(false) }; PerCpu::MAX_CPU_NUM as usize];
 static CPU_DEBUG_OWNER_GENERATION: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
     [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
 
@@ -123,6 +127,9 @@ pub(crate) fn clear_current_debug_regs(task: &ProcessControlBlock) {
 }
 
 unsafe fn load_task_debug_regs(task: &ProcessControlBlock) {
+    debug_assert!(!CurrentIrqArch::is_irq_enabled());
+    let initialized =
+        &CPU_DR7_INITIALIZED[crate::smp::core::smp_get_processor_id().data() as usize];
     let generation = task.ptrace_session_generation();
     cpu_debug_owner_generation().store(generation, Ordering::Relaxed);
     let should_load = task.flags().contains(ProcessFlags::HW_DEBUG_REGS)
@@ -140,9 +147,13 @@ unsafe fn load_task_debug_regs(task: &ProcessControlBlock) {
             debugreg::write_dr(3, dr[3]);
             debugreg::write_dr(7, dr[7]);
         }
-    } else {
+        initialized.store(true, Ordering::Relaxed);
+    } else if !initialized.load(Ordering::Relaxed) || cpu_dr7().load(Ordering::Relaxed) != 0 {
+        // Avoid a debug-register VM exit when an ordinary task follows another
+        // ordinary task. A previous breakpoint owner must still be disarmed.
         unsafe { debugreg::write_dr7(0) };
         cpu_dr7().store(0, Ordering::Relaxed);
+        initialized.store(true, Ordering::Relaxed);
     }
 }
 

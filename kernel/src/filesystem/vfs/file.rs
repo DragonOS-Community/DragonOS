@@ -2677,6 +2677,11 @@ impl File {
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        // DAX reads own their device access. The cache retained for sparse or
+        // partial mmap pages must not populate ordinary read-ahead pages.
+        if self.inode.is_dax() {
+            return Ok(());
+        }
         if self.mode().contains(FileMode::FMODE_RANDOM) {
             return Ok(());
         }

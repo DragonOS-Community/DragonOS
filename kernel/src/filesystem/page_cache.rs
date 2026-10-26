@@ -50,6 +50,7 @@ use lazy_static::lazy_static;
 
 mod mapping;
 mod migration;
+mod mmap_read;
 mod ordered_index;
 mod read_batch;
 mod read_dma;

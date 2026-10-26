@@ -74,6 +74,11 @@ pub fn contains(address: VirtAddr) -> bool {
     address.data().wrapping_sub(BASE) < SIZE
 }
 
+/// Whether a nonempty half-open interval intersects the reserved vmalloc arena.
+pub(crate) fn overlaps(start: VirtAddr, end: VirtAddr) -> bool {
+    start < end && start.data() < BASE + SIZE && end.data() > BASE
+}
+
 unsafe fn metadata_box<T>(value: T) -> Result<Box<T>, SystemError> {
     let pointer = KERNEL_ALLOCATOR
         .alloc_metadata(Layout::new::<T>())

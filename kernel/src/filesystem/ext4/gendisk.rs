@@ -15,6 +15,10 @@ pub(super) struct SubmittedExt4Read {
 }
 
 impl SubmittedExt4Read {
+    pub(super) fn is_terminal(&self) -> bool {
+        self.bio.is_terminal()
+    }
+
     pub(super) fn wait_read_into(self, dst: &mut [u8]) -> Result<(), SystemError> {
         if dst.len() != self.expected_bytes {
             return Err(SystemError::EINVAL);

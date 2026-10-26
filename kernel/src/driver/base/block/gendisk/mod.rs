@@ -134,6 +134,30 @@ impl GenDisk {
         });
     }
 
+    /// Bound the provider capability to this disk's exact partition range.
+    pub fn direct_access(
+        &self,
+    ) -> Result<Option<super::direct_access::DirectAccessRange>, SystemError> {
+        let device = self.block_device()?;
+        let _gate = device.blkdev_meta().raw_cache_gate.read();
+        self.check_online()?;
+        let Some(access) = device.direct_access()? else {
+            return Ok(None);
+        };
+        let offset = self
+            .range
+            .lba_start
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let len = self
+            .range
+            .lba_end
+            .checked_sub(self.range.lba_start)
+            .and_then(|blocks| blocks.checked_mul(LBA_SIZE))
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(Some(access.subrange(offset, len)?))
+    }
+
     pub fn block_device(&self) -> Result<Arc<dyn BlockDevice>, SystemError> {
         self.bdev.upgrade().ok_or(SystemError::ENODEV)
     }
@@ -170,6 +194,10 @@ impl GenDisk {
     pub(crate) fn has_node_holders(&self) -> bool {
         self.open_holders.load(Ordering::Acquire) != 0
             || self.mount_holders.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn is_online_locked(&self) -> bool {
+        self.online.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_online_locked(&self, online: bool) {

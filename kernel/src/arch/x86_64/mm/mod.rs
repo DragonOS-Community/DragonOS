@@ -2,6 +2,7 @@
 
 pub mod barrier;
 pub mod bump;
+pub(crate) mod cache;
 pub mod fault;
 pub mod pkru;
 
@@ -664,6 +665,21 @@ unsafe fn allocator_init() {
                 // 暂时不刷新TLB
                 flusher.ignore();
             }
+        }
+
+        // User roots copy the kernel PML4 entries once. Fix their shared PDPT
+        // identities before publishing this root, so later device mappings in
+        // high physical-address slots are visible in every address space.
+        // These at most 256 bootstrap pages are permanent, not device-owned;
+        // no leaf mappings are installed for RAM holes or device memory here.
+        let slot_size = 1usize << (MMArch::PAGE_ADDRESS_SHIFT - MMArch::PAGE_ENTRY_SHIFT);
+        for index in MMArch::PAGE_KERNEL_INDEX..MMArch::PAGE_ENTRY_NUM {
+            let address = MMArch::PHYS_OFFSET
+                .checked_add((index - MMArch::PAGE_KERNEL_INDEX) * slot_size)
+                .expect("Kernel page-table slot address overflow");
+            mapper
+                .prepare_kernel_subtree(VirtAddr::new(address), MMArch::PAGE_LEVELS - 2)
+                .expect("Failed to prepare shared kernel page-table subtree");
         }
     }
 

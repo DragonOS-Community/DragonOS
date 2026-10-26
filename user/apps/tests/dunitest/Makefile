@@ -216,3 +216,12 @@ clean:
 
 fmt:
 	@cd $(RUNNER_DIR) && cargo fmt
+
+# Optional real virtio-pmem DAX fixture; not a default build/runner dependency.
+# Attach this disposable image as pmem0 and opt in with EXT4_DAX_DEVICE=/dev/pmem0.
+.PHONY: ext4-dax-fixture
+ext4-dax-fixture: $(BUILD_DIR)/fixtures/ext4_dax.img
+.DELETE_ON_ERROR: $(BUILD_DIR)/fixtures/ext4_dax.img
+$(BUILD_DIR)/fixtures/ext4_dax.img: scripts/make_ext4_dax_fixture.py
+	@mkdir -p "$(dir $@)"
+	@python3 $< "$@"

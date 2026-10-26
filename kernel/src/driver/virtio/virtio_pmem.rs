@@ -27,7 +27,7 @@ use crate::{
             kset::KSet,
         },
         block::pmem::{
-            register_pmem_region, PmemAccessMode, PmemBlockDevice, PmemFlushOps, PmemRegion,
+            register_pmem_region, PmemAccessMode, PmemBlockDevice, PmemProvider, PmemRegion,
             PmemRegionSource,
         },
         virtio::{
@@ -94,6 +94,9 @@ struct InnerVirtIOPmemDevice {
     pending_flush: Option<FlushRequest>,
     block_device: Option<Arc<PmemBlockDevice>>,
     state: VirtIOPmemState,
+    admission_closed: bool,
+    direct_pins: usize,
+    reset_failed: bool,
     start: PhysAddr,
     size: usize,
     name: Option<String>,
@@ -181,6 +184,9 @@ impl VirtIOPmemDevice {
                 pending_flush: None,
                 block_device: None,
                 state: VirtIOPmemState::ReadyNotPublished,
+                admission_closed: false,
+                direct_pins: 0,
+                reset_failed: false,
                 start,
                 size,
                 name: None,
@@ -222,7 +228,7 @@ impl VirtIOPmemDevice {
             size,
             source: PmemRegionSource::Virtio,
             access: PmemAccessMode::ReadWrite,
-            flush: Some(Arc::new(VirtIOPmemFlushOps {
+            provider: Some(Arc::new(VirtIOPmemProvider {
                 device: Arc::downgrade(self),
             })),
         })?;
@@ -233,15 +239,20 @@ impl VirtIOPmemDevice {
         Ok(())
     }
 
-    fn fail_unpublished(&self) {
-        let mut inner = self.inner();
-        inner.state = VirtIOPmemState::Dead;
-        inner.pending_flush = None;
-        if let Some(transport) = inner.transport.as_mut() {
-            transport.set_status(DeviceStatus::FAILED);
-            transport.queue_unset(VIRTIO_PMEM_FLUSH_QUEUE);
+    fn fail_unpublished(&self) -> Result<(), SystemError> {
+        {
+            let mut inner = self.inner();
+            match inner.state {
+                VirtIOPmemState::Dead => return Ok(()),
+                VirtIOPmemState::Published => return Err(SystemError::EBUSY),
+                _ => {}
+            }
+            inner.admission_closed = true;
+            inner.state = VirtIOPmemState::Quiescing;
         }
-        self.flush_wait.wakeup_all(None);
+        // DRIVER_OK exposes the queue itself to DMA, even without a FLUSH
+        // buffer. Failed publication therefore uses the same ACK barrier.
+        self.reset_quiescing()
     }
 
     fn flush(&self) -> Result<(), SystemError> {
@@ -373,48 +384,176 @@ impl VirtIOPmemDevice {
     }
 
     fn shutdown(&self) -> Result<(), SystemError> {
-        let block_device = {
+        let block = {
             let mut inner = self.inner();
-            if inner.state >= VirtIOPmemState::Quiescing {
-                return Ok(());
+            match inner.state {
+                VirtIOPmemState::Dead => return Ok(()),
+                // Namespace removal has already committed. Retry only reset.
+                VirtIOPmemState::Quiescing => None,
+                VirtIOPmemState::Published => {
+                    if inner.admission_closed || inner.direct_pins != 0 {
+                        return Err(SystemError::EBUSY);
+                    }
+                    let block = inner.block_device.clone().ok_or(SystemError::ENODEV)?;
+                    inner.admission_closed = true;
+                    Some(block)
+                }
+                VirtIOPmemState::ReadyNotPublished => return Err(SystemError::EBUSY),
             }
-            inner.state = VirtIOPmemState::Quiescing;
-            self.flush_wait.wakeup_all(None);
-            inner.block_device.take()
         };
 
-        if let Some(block_device) = block_device {
-            let block_device = block_device as Arc<dyn BlockDevice>;
-            let _ = block_dev_manager().unregister(&block_device);
+        if let Some(block) = block {
+            let registered = block as Arc<dyn BlockDevice>;
+            // FLUSH must cover the final raw-cache payload, but precede any
+            // namespace removal so an error leaves the original device usable.
+            if let Err(error) =
+                block_dev_manager().unregister_with_precommit(&registered, || self.flush())
+            {
+                self.inner().admission_closed = false;
+                return Err(error);
+            }
+            self.inner().state = VirtIOPmemState::Quiescing;
         }
 
-        let _guard = self.flush_mutex.lock();
-        let mut inner = self.inner();
-        if let Some(transport) = inner.transport.as_mut() {
-            transport.set_status(DeviceStatus::empty());
-            transport.queue_unset(VIRTIO_PMEM_FLUSH_QUEUE);
+        self.reset_quiescing()
+    }
+
+    fn reset_quiescing(&self) -> Result<(), SystemError> {
+        // Other shutdown callers may retry after a timeout, but cannot reset
+        // the same transport concurrently or free a device-owned request.
+        let _flush = self
+            .flush_mutex
+            .try_lock()
+            .map_err(|_| SystemError::EBUSY)?;
+        let mut transport = {
+            let mut inner = self.inner();
+            if inner.state == VirtIOPmemState::Dead {
+                return Ok(());
+            }
+            inner.transport.take().ok_or(SystemError::EBUSY)?
+        };
+        if let Err(error) = transport.reset() {
+            let first_failure = {
+                let mut inner = self.inner();
+                let first = !inner.reset_failed;
+                inner.reset_failed = true;
+                inner.transport = Some(transport);
+                first
+            };
+            if first_failure {
+                error!("VirtIOPmem: reset did not acknowledge; retain transport and DMA owners");
+            }
+            return Err(virtio_drivers_error_to_system_error(error));
         }
-        inner.pending_flush = None;
-        inner.state = VirtIOPmemState::Dead;
+        transport.queue_unset(VIRTIO_PMEM_FLUSH_QUEUE);
+        let retired = {
+            let mut inner = self.inner();
+            let retired = (
+                inner.pending_flush.take(),
+                inner.flush_queue.take(),
+                inner.block_device.take(),
+            );
+            inner.transport = Some(transport);
+            inner.state = VirtIOPmemState::Dead;
+            inner.reset_failed = false;
+            retired
+        };
+        // ACK is the DMA barrier. No destructor runs under the IRQ spinlock.
+        drop(retired);
         Ok(())
     }
 }
 
-struct VirtIOPmemFlushOps {
+impl Drop for VirtIOPmemDevice {
+    fn drop(&mut self) {
+        let mut inner = self.inner();
+        debug_assert_eq!(inner.direct_pins, 0);
+        if inner.reset_failed {
+            // A real reset attempt timed out. Transport Drop ignores reset errors;
+            // do not let it release mappings or DMA memory still owned by hardware.
+            // While registered, shutdown may retry; this last-owner fallback
+            // retains only the unsafe transport/queue/request, never normal paths.
+            core::mem::forget(inner.transport.take());
+            core::mem::forget(inner.flush_queue.take());
+            core::mem::forget(inner.pending_flush.take());
+        }
+    }
+}
+
+struct VirtIOPmemProvider {
     device: Weak<VirtIOPmemDevice>,
 }
 
-impl PmemFlushOps for VirtIOPmemFlushOps {
+impl PmemProvider for VirtIOPmemProvider {
+    fn direct_access(
+        &self,
+        block: Arc<PmemBlockDevice>,
+    ) -> Result<Option<Arc<dyn crate::driver::base::block::direct_access::DirectAccess>>, SystemError>
+    {
+        if !block.has_direct_mapping() {
+            return Ok(None);
+        }
+        let device = self.device.upgrade().ok_or(SystemError::ENODEV)?;
+        {
+            let mut inner = device.inner();
+            if inner.state != VirtIOPmemState::Published || inner.admission_closed {
+                return Err(SystemError::ENODEV);
+            }
+            if !inner
+                .block_device
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &block))
+            {
+                return Err(SystemError::ENODEV);
+            }
+            inner.direct_pins = inner
+                .direct_pins
+                .checked_add(1)
+                .ok_or(SystemError::EOVERFLOW)?;
+        }
+        Ok(Some(Arc::new(VirtIOPmemDirectAccess { block, device })))
+    }
+
     fn flush(&self) -> Result<(), SystemError> {
         let device = self.device.upgrade().ok_or(SystemError::ENODEV)?;
         device.flush()
     }
 }
 
+/// Only external callers own this lease; the block/provider never caches it.
+#[derive(Debug)]
+struct VirtIOPmemDirectAccess {
+    block: Arc<PmemBlockDevice>,
+    device: Arc<VirtIOPmemDevice>,
+}
+
+impl Drop for VirtIOPmemDirectAccess {
+    fn drop(&mut self) {
+        let mut inner = self.device.inner();
+        debug_assert!(inner.direct_pins != 0);
+        inner.direct_pins -= 1;
+    }
+}
+
+// SAFETY: PMEM registration reserves this memory-like device range outside
+// managed RAM. The block owns its single WB mapping and checks all accesses;
+// this external capability pins the controller against shutdown until Drop.
+unsafe impl crate::driver::base::block::direct_access::DirectAccess for VirtIOPmemDirectAccess {
+    fn len(&self) -> usize {
+        self.block.usable_size()
+    }
+    fn checked_paddr(&self, offset: usize, len: usize) -> Result<PhysAddr, SystemError> {
+        self.block.direct_paddr(offset, len)
+    }
+    fn read_at(&self, offset: usize, out: &mut [u8]) -> Result<(), SystemError> {
+        self.block.copy_from_pmem(offset, out)
+    }
+}
+
 impl VirtIODevice for VirtIOPmemDevice {
     fn handle_irq(&self, _irq: IrqNumber) -> Result<IrqReturn, SystemError> {
         let mut inner = self.inner();
-        if inner.state >= VirtIOPmemState::Dead {
+        if inner.state >= VirtIOPmemState::Quiescing {
             return Ok(IrqReturn::NotHandled);
         }
 
@@ -640,7 +779,8 @@ impl VirtIODriver for VirtIOPmemDriver {
             .downcast::<VirtIOPmemDevice>()
             .map_err(|_| SystemError::EINVAL)?;
         if let Err(e) = dev.publish_pmem() {
-            dev.fail_unpublished();
+            // Reset failure is reported by reset_quiescing and retains its DMA owners.
+            let _ = dev.fail_unpublished();
             return Err(e);
         }
         Ok(())
@@ -765,9 +905,28 @@ pub fn virtio_pmem(
             device.fallback_to_polling();
         }
     }
-    virtio_device_manager()
-        .device_add(device as Arc<dyn VirtIODevice>)
-        .expect("Add virtio pmem failed");
+    // Keep our local owner even when registration fails before the driver
+    // probe; DRIVER_OK has already exposed the queue to the device.
+    if let Err(error) = virtio_device_manager().device_add(device.clone() as Arc<dyn VirtIODevice>)
+    {
+        let state = device.inner().state;
+        // add_groups can fail after probe has published the block device.
+        // That path must respect live pins and recoverable namespace removal.
+        let cleanup = match state {
+            VirtIOPmemState::Published => device.shutdown(),
+            VirtIOPmemState::ReadyNotPublished | VirtIOPmemState::Quiescing => {
+                device.fail_unpublished()
+            }
+            VirtIOPmemState::Dead => Ok(()),
+        };
+        match cleanup {
+            Ok(()) => error!("VirtIOPmem: registration failed: {:?}; cleanup completed", error),
+            Err(cleanup_error) => error!(
+                "VirtIOPmem: registration failed: {:?}; cleanup deferred: {:?}; retain device owners",
+                error, cleanup_error
+            ),
+        }
+    }
 }
 
 #[unified_init(INITCALL_POSTCORE)]

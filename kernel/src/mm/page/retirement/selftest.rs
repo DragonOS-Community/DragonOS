@@ -180,6 +180,92 @@ fn last_unmap() -> Result<bool, SystemError> {
     Ok(f.unmap(0, 1) && f.freed())
 }
 
+/// Exercise the VMA transaction's already-held manager rather than the
+/// standalone Page -> try-manager retry loop. The real revoked PTE keeps its
+/// Page through the same gather barrier used by ordinary unmap.
+fn manager_owned_retirement(lru: bool, reclaimer_busy: bool) -> Result<bool, SystemError> {
+    let f = Fixture::new(1, lru)?;
+    let page = f.pages[0].upgrade().unwrap();
+    let generation = f.mm.tlb_gen.load(Ordering::SeqCst);
+    let mut gather = MmuGather::gather(&f.mm);
+    let (owners, observed) = {
+        let mut inner = f.mm.write();
+        let vma = inner.mappings.contains(f.address).unwrap();
+        let _pt = f.mm.page_table_edit();
+        let mut manager = page_manager_lock();
+        // Acquire in manager -> reclaimer -> Page order. Holding the reclaimer
+        // makes the helper's try-lock fail without requiring another task or
+        // introducing the inverse registry lock order in the fixture itself.
+        let mut held_reclaimer = reclaimer_busy.then(page_reclaimer_lock);
+        let (physical, _, flush) = unsafe {
+            inner
+                .user_mapper
+                .utable
+                .unmap_phys_gather(f.address, true, &mut gather)
+        }
+        .unwrap();
+        unsafe { flush.ignore() };
+        gather.accumulate_range(f.address);
+        let mut data = page.write();
+        data.remove_vma(&vma);
+        let owners = super::try_detach_unmapped_page_with_manager(&page, &mut data, &mut manager);
+        let observed = physical == page.phys_address()
+            && data.map_count() == 0
+            && if reclaimer_busy {
+                owners.is_none()
+                    && manager.get_registered(&physical).is_some()
+                    && data.flags().contains(PageFlags::PG_LRU)
+                    && held_reclaimer.as_mut().unwrap().get(&physical).is_some()
+            } else {
+                owners.is_some()
+                    && manager.get_registered(&physical).is_none()
+                    && !data.flags().contains(PageFlags::PG_LRU)
+            };
+        drop(data);
+        drop(held_reclaimer);
+        drop(manager);
+        (owners, observed)
+    };
+    f.mm.account_present_pages_sub(1);
+    if reclaimer_busy {
+        // No rescue contributes to the failed-try assertion above. This is
+        // the production fallback after every Page/registry guard has gone.
+        retire_unmapped_page(&page);
+    }
+    let unlinked = detached(&page);
+    drop(owners);
+    gather.stash_page(page);
+    // With registry owners gone, the gather is the only remaining Page owner.
+    let pinned = f.pages[0].upgrade().is_some() && f.account.current_pages() == 1;
+    gather.finish();
+    Ok(observed
+        && unlinked
+        && pinned
+        && f.mm.tlb_gen.load(Ordering::SeqCst) > generation
+        && f.freed())
+}
+
+fn manager_owned_retirement_ineligible() -> Result<bool, SystemError> {
+    let f = Fixture::new(1, true)?;
+    let page = f.pages[0].upgrade().unwrap();
+    let (owners, untouched) = {
+        let mut manager = page_manager_lock();
+        let mut data = page.write();
+        let owners = super::try_detach_unmapped_page_with_manager(&page, &mut data, &mut manager);
+        let untouched = owners.is_none()
+            && data.map_count() == 1
+            && data.flags().contains(PageFlags::PG_LRU)
+            && manager.get_registered(&page.phys_address()).is_some();
+        drop(data);
+        drop(manager);
+        (owners, untouched)
+    };
+    drop(owners);
+    let registered_lru = page_reclaimer_lock().get(&page.phys_address()).is_some();
+    drop(page);
+    Ok(untouched && registered_lru && f.unmap(0, 1) && f.freed())
+}
+
 fn partial_unmap() -> Result<bool, SystemError> {
     let f = Fixture::new(3, true)?;
     if !f.unmap(1, 1) || f.pages[1].upgrade().is_some() || f.account.current_pages() != 2 {
@@ -1105,6 +1191,19 @@ pub(crate) fn report() -> String {
             heap_denied_device_output_buffer,
         ),
         ("last_unmap", last_unmap),
+        ("manager_owned_plain_retirement", || {
+            manager_owned_retirement(false, false)
+        }),
+        ("manager_owned_lru_retirement", || {
+            manager_owned_retirement(true, false)
+        }),
+        (
+            "manager_owned_retirement_ineligible",
+            manager_owned_retirement_ineligible,
+        ),
+        ("manager_owned_reclaimer_busy", || {
+            manager_owned_retirement(true, true)
+        }),
         ("partial_unmap", partial_unmap),
         ("madvise_range", madvise_range),
         ("teardown", || teardown(false)),

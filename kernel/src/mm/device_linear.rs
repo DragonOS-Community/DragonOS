@@ -59,6 +59,54 @@ fn level_size(level: usize) -> Option<usize> {
     1usize.checked_shl(shift as u32)
 }
 
+/// Validate the complete linear interval before editing any shared page tables.
+/// An existing parent table is a sharing guarantee, not permission to consume
+/// another kernel VA allocator's reserved window.
+pub(super) fn validate_range(
+    paddr: PhysAddr,
+    length: usize,
+) -> Result<(VirtAddr, VirtAddr), SystemError> {
+    if length == 0
+        || !paddr.check_aligned(MMArch::PAGE_SIZE)
+        || !length.is_multiple_of(MMArch::PAGE_SIZE)
+    {
+        return Err(SystemError::EINVAL);
+    }
+    paddr
+        .data()
+        .checked_add(length)
+        .ok_or(SystemError::EOVERFLOW)?;
+    let start = paddr
+        .data()
+        .checked_add(MMArch::PHYS_OFFSET)
+        .ok_or(SystemError::EOVERFLOW)?;
+    let end = start.checked_add(length).ok_or(SystemError::EOVERFLOW)?;
+    let start = VirtAddr::new(start);
+    let end = VirtAddr::new(end);
+    if !MMArch::virt_is_valid(start) || !MMArch::virt_is_valid(end - 1) {
+        return Err(SystemError::ERANGE);
+    }
+    let intersects = |low: VirtAddr, high: VirtAddr| start < high && end > low;
+    if intersects(MMArch::MMIO_BASE, MMArch::MMIO_TOP)
+        || intersects(MMArch::FIXMAP_START_VADDR, MMArch::FIXMAP_END_VADDR)
+    {
+        return Err(SystemError::ERANGE);
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    if crate::mm::vmalloc::overlaps(start, end) {
+        return Err(SystemError::ERANGE);
+    }
+    // Keep architecture-specific exclusions and relocation rules authoritative.
+    // A device-linear mapping must agree with that translation at both ends.
+    let last = paddr + (length - 1);
+    if unsafe { MMArch::phys_2_virt(paddr) } != Some(start)
+        || unsafe { MMArch::phys_2_virt(last) } != Some(end - 1)
+    {
+        return Err(SystemError::ERANGE);
+    }
+    Ok((start, end))
+}
+
 /// RAII owner for a write-back device-memory mapping in the kernel linear address space.
 #[derive(Debug)]
 pub struct DeviceLinearMapping {
@@ -75,21 +123,11 @@ impl DeviceLinearMapping {
         length: usize,
         flags: EntryFlags<MMArch>,
     ) -> Result<Self, SystemError> {
-        if length == 0
-            || !paddr.check_aligned(MMArch::PAGE_SIZE)
-            || !length.is_multiple_of(MMArch::PAGE_SIZE)
-        {
-            return Err(SystemError::EINVAL);
-        }
-        let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EOVERFLOW)?;
-        let end_data = vaddr
-            .data()
-            .checked_add(length)
-            .ok_or(SystemError::EOVERFLOW)?;
+        let (vaddr, end) = validate_range(paddr, length)?;
         let mut mapping = Self {
             pstart: paddr,
             start: vaddr,
-            end: VirtAddr::new(end_data),
+            end,
             segments: Vec::new(),
             created_tables: Vec::new(),
         };
@@ -235,3 +273,6 @@ mod tests {
         assert_eq!(level_size(2), Some(1024 * 1024 * 1024));
     }
 }
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(super) mod selftest;

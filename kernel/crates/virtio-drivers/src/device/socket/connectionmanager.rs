@@ -122,89 +122,100 @@ impl<H: Hal, T: Transport> VsockConnectionManager<H, T> {
     }
 
     /// Polls the vsock device to receive data or other updates.
+    ///
+    /// Handles internal control packets until an event is available or the RX queue is empty.
+    /// `None` means the queue is empty; errors are returned without further polling.
     pub fn poll(&mut self) -> Result<Option<VsockEvent>> {
-        let guest_cid = self.driver.guest_cid();
-        let connections = &mut self.connections;
+        loop {
+            let guest_cid = self.driver.guest_cid();
+            let connections = &mut self.connections;
 
-        let result = self.driver.poll(|event, body| {
-            let connection = get_connection_for_event(connections, &event, guest_cid);
+            let mut consumed = false;
+            let result = self.driver.poll(|event, body| {
+                consumed = true;
+                let connection = get_connection_for_event(connections, &event, guest_cid);
 
-            // Skip events which don't match any connection we know about, unless they are a
-            // connection request.
-            let connection = if let Some((_, connection)) = connection {
-                connection
-            } else if let VsockEventType::ConnectionRequest = event.event_type {
-                // If the requested connection already exists or the CID isn't ours, ignore it.
-                if connection.is_some() || event.destination.cid != guest_cid {
+                // Skip events which don't match any connection we know about, unless they are a
+                // connection request.
+                let connection = if let Some((_, connection)) = connection {
+                    connection
+                } else if let VsockEventType::ConnectionRequest = event.event_type {
+                    // If the requested connection already exists or the CID isn't ours, ignore it.
+                    if connection.is_some() || event.destination.cid != guest_cid {
+                        return Ok(None);
+                    }
+                    // Add the new connection to our list, at least for now. It will be removed again
+                    // below if we weren't listening on the port.
+                    connections.push(Connection::new(event.source, event.destination.port));
+                    connections.last_mut().unwrap()
+                } else {
                     return Ok(None);
+                };
+
+                // Update stored connection info.
+                connection.info.update_for_event(&event);
+
+                if let VsockEventType::Received { length } = event.event_type {
+                    // Copy to buffer
+                    if !connection.buffer.add(body) {
+                        return Err(SocketError::OutputBufferTooShort(length).into());
+                    }
                 }
-                // Add the new connection to our list, at least for now. It will be removed again
-                // below if we weren't listening on the port.
-                connections.push(Connection::new(event.source, event.destination.port));
-                connections.last_mut().unwrap()
-            } else {
+
+                Ok(Some(event))
+            })?;
+
+            let Some(event) = result else {
+                if consumed {
+                    // Ignoring a packet does not mean that the RX queue is empty.
+                    continue;
+                }
                 return Ok(None);
             };
 
-            // Update stored connection info.
-            connection.info.update_for_event(&event);
+            // The connection must exist because we found it above in the callback.
+            let (connection_index, connection) =
+                get_connection_for_event(connections, &event, guest_cid).unwrap();
 
-            if let VsockEventType::Received { length } = event.event_type {
-                // Copy to buffer
-                if !connection.buffer.add(body) {
-                    return Err(SocketError::OutputBufferTooShort(length).into());
-                }
-            }
-
-            Ok(Some(event))
-        })?;
-
-        let Some(event) = result else {
-            return Ok(None);
-        };
-
-        // The connection must exist because we found it above in the callback.
-        let (connection_index, connection) =
-            get_connection_for_event(connections, &event, guest_cid).unwrap();
-
-        match event.event_type {
-            VsockEventType::ConnectionRequest => {
-                if self.listening_ports.contains(&event.destination.port) {
-                    self.driver.accept(&connection.info)?;
-                } else {
-                    // Reject the connection request and remove it from our list.
-                    self.driver.force_close(&connection.info)?;
-                    self.connections.swap_remove(connection_index);
-
-                    // No need to pass the request on to the client, as we've already rejected it.
-                    return Ok(None);
-                }
-            }
-            VsockEventType::Connected => {}
-            VsockEventType::Disconnected { reason } => {
-                // Wait until client reads all data before removing connection.
-                if connection.buffer.is_empty() {
-                    if reason == DisconnectReason::Shutdown {
+            match event.event_type {
+                VsockEventType::ConnectionRequest => {
+                    if self.listening_ports.contains(&event.destination.port) {
+                        self.driver.accept(&connection.info)?;
+                    } else {
+                        // Reject the connection request and remove it from our list.
                         self.driver.force_close(&connection.info)?;
-                    }
-                    self.connections.swap_remove(connection_index);
-                } else {
-                    connection.peer_requested_shutdown = true;
-                }
-            }
-            VsockEventType::Received { .. } => {
-                // Already copied the buffer in the callback above.
-            }
-            VsockEventType::CreditRequest => {
-                // If the peer requested credit, send an update.
-                self.driver.credit_update(&connection.info)?;
-                // No need to pass the request on to the client, we've already handled it.
-                return Ok(None);
-            }
-            VsockEventType::CreditUpdate => {}
-        }
+                        self.connections.swap_remove(connection_index);
 
-        Ok(Some(event))
+                        // No need to pass the request on to the client, as we've already rejected it.
+                        continue;
+                    }
+                }
+                VsockEventType::Connected => {}
+                VsockEventType::Disconnected { reason } => {
+                    // Wait until client reads all data before removing connection.
+                    if connection.buffer.is_empty() {
+                        if reason == DisconnectReason::Shutdown {
+                            self.driver.force_close(&connection.info)?;
+                        }
+                        self.connections.swap_remove(connection_index);
+                    } else {
+                        connection.peer_requested_shutdown = true;
+                    }
+                }
+                VsockEventType::Received { .. } => {
+                    // Already copied the buffer in the callback above.
+                }
+                VsockEventType::CreditRequest => {
+                    // If the peer requested credit, send an update.
+                    self.driver.credit_update(&connection.info)?;
+                    // No need to pass the request on to the client, we've already handled it.
+                    continue;
+                }
+                VsockEventType::CreditUpdate => {}
+            }
+
+            return Ok(Some(event));
+        }
     }
 
     /// Reads data received from the given connection.
@@ -403,6 +414,120 @@ mod tests {
     use core::{mem::size_of, ptr::NonNull};
     use std::{sync::Mutex, thread};
     use zerocopy::{AsBytes, FromBytes};
+
+    #[test]
+    fn internal_packets_do_not_hide_queued_data() {
+        for op in [
+            VirtioVsockOp::Rst,
+            VirtioVsockOp::CreditRequest,
+            VirtioVsockOp::Request,
+        ] {
+            queued_data_after_internal_packet(op, true);
+            queued_data_after_internal_packet(op, false);
+        }
+    }
+
+    fn queued_data_after_internal_packet(op: VirtioVsockOp, with_data: bool) {
+        let peer = VsockAddr { cid: 2, port: 1234 };
+        let guest_port = 4321;
+        let mut config_space = VirtioVsockConfig {
+            guest_cid_low: ReadOnly::new(66),
+            guest_cid_high: ReadOnly::new(0),
+        };
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![
+                QueueStatus::default(),
+                QueueStatus::default(),
+                QueueStatus::default(),
+            ],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Socket,
+            max_queue_size: 32,
+            device_features: 0,
+            config_space: NonNull::from(&mut config_space),
+            state: state.clone(),
+        };
+        let mut socket =
+            VsockConnectionManager::new(VirtIOSocket::<FakeHal, _>::new(transport).unwrap());
+        socket.connections.push(Connection::new(peer, guest_port));
+        let header = VirtioVsockHdr {
+            op: op.into(),
+            src_cid: peer.cid.into(),
+            dst_cid: 66.into(),
+            src_port: if op == VirtioVsockOp::CreditRequest {
+                peer.port
+            } else {
+                peer.port + 1
+            }
+            .into(),
+            dst_port: if op == VirtioVsockOp::Request {
+                guest_port + 1
+            } else {
+                guest_port
+            }
+            .into(),
+            len: 0.into(),
+            socket_type: SocketType::Stream.into(),
+            flags: 0.into(),
+            buf_alloc: 1024.into(),
+            fwd_cnt: 0.into(),
+        };
+        let payload = b"queued data";
+        let mut data = VirtioVsockHdr {
+            op: VirtioVsockOp::Rw.into(),
+            src_port: peer.port.into(),
+            dst_port: guest_port.into(),
+            len: (payload.len() as u32).into(),
+            ..header
+        }
+        .as_bytes()
+        .to_vec();
+        data.extend_from_slice(payload);
+        {
+            let mut device = state.lock().unwrap();
+            // Publish both packets together; no further RX notification is needed.
+            device.write_to_queue::<QUEUE_SIZE>(RX_QUEUE_IDX, header.as_bytes());
+            if with_data {
+                device.write_to_queue::<QUEUE_SIZE>(RX_QUEUE_IDX, &data);
+            }
+        }
+        let response = if op == VirtioVsockOp::Rst {
+            None
+        } else {
+            let device_state = state.clone();
+            Some(thread::spawn(move || {
+                State::wait_until_queue_notified(&device_state, TX_QUEUE_IDX);
+                let bytes = device_state
+                    .lock()
+                    .unwrap()
+                    .read_from_queue::<QUEUE_SIZE>(TX_QUEUE_IDX);
+                let reply = VirtioVsockHdr::read_from(bytes.as_slice()).unwrap();
+                let expected = if op == VirtioVsockOp::CreditRequest {
+                    VirtioVsockOp::CreditUpdate
+                } else {
+                    VirtioVsockOp::Rst
+                };
+                assert_eq!(reply.op.get(), expected as u16);
+            }))
+        };
+        let event = socket.poll().unwrap();
+        if let Some(response) = response {
+            response.join().unwrap();
+        }
+        if !with_data {
+            assert!(event.is_none());
+            assert_eq!(socket.connections.len(), 1);
+            return;
+        }
+        assert!(matches!(event.unwrap().event_type,
+            VsockEventType::Received { length } if length == payload.len()));
+        let mut received = [0; 32];
+        let count = socket.recv(peer, guest_port, &mut received).unwrap();
+        assert_eq!(&received[..count], payload);
+        assert!(socket.poll().unwrap().is_none());
+    }
 
     #[test]
     fn send_recv() {

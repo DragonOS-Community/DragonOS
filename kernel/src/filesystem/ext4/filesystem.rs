@@ -1,4 +1,5 @@
 use crate::{
+    arch::MMArch,
     driver::base::{
         block::gendisk::{GenDisk, GenDiskMountGuard},
         device::device_number::DeviceNumber,
@@ -27,7 +28,7 @@ use crate::{
     },
     mm::{
         fault::{PageFaultHandler, PageFaultMessage},
-        VmFaultReason,
+        MemoryManagementArch, VmFaultReason,
     },
     process::{namespace::user_namespace::UserNamespace, ProcessManager},
     register_mountable_fs,
@@ -160,6 +161,7 @@ pub struct Ext4FileSystem {
     /// Strong device owner used by ext4 PageCache batch reads. Keeping this
     /// exact partition object avoids a late device-number lookup after submit.
     pub(super) gendisk: Arc<GenDisk>,
+    pub(super) dax_access: Option<crate::driver::base::block::direct_access::DirectAccessRange>,
     /// Keeps the device bound through final shutdown, independently of stale
     /// in-memory references to the retired filesystem.
     device_mount_holder: Mutex<Option<GenDiskMountGuard>>,
@@ -222,7 +224,7 @@ pub struct Ext4FileSystem {
     eviction_wait: WaitQueue,
 
     /// Mount-time ext4 options parsed from user/kernel mount data.
-    _mount_options: Ext4MountOptions,
+    pub(super) _mount_options: Ext4MountOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,14 +245,8 @@ pub enum Ext4ErrorsBehavior {
 pub struct Ext4MountOptions {
     /// Requested DAX mode.
     ///
-    /// **Parsed and stored only** — actual DAX semantics (accessing file
-    /// contents directly from the underlying pmem device, bypassing the page
-    /// cache) are **not implemented yet**: all I/O still goes through the page
-    /// cache regardless of this value. The option is accepted so that
-    /// mount(2) behaves like Linux for callers that pass `dax` mount data
-    /// (e.g. `rootflags=dax`, or mounting a read-only virtio-pmem ext4 image),
-    /// and it mirrors what the kernel-internal root-mount path (vcore.rs)
-    /// records for the same option.
+    /// Effective only for eligible regular files on read-only filesystems
+    /// whose device supplies a pinned direct-access capability.
     pub dax: Option<Ext4DaxMode>,
     pub errors: Ext4ErrorsBehavior,
     pub read_only: bool,
@@ -303,9 +299,7 @@ impl Ext4MountOptions {
                 "errors=panic" => options.errors = Ext4ErrorsBehavior::Panic,
                 // Linux accepts a bare "dax" as the deprecated alias for
                 // "dax=always" (fs/ext4/super.c), so mount(2) must accept it
-                // too. NOTE: like the root-mount path, the mode is recorded
-                // only — no page-cache bypass is performed yet (see the `dax`
-                // field doc above).
+                // too. Device and inode eligibility are checked separately.
                 "dax" | "dax=always" => options.dax = Some(Ext4DaxMode::Always),
                 "dax=inode" => options.dax = Some(Ext4DaxMode::Inode),
                 "dax=never" => options.dax = Some(Ext4DaxMode::Never),
@@ -419,6 +413,13 @@ impl FileSystem for Ext4FileSystem {
     }
 
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if let Some(file) = pfm.vm_file().cloned() {
+            if let Some(inode) = file.inode().as_any_ref().downcast_ref::<LockedExt4Inode>() {
+                if inode.dax_enabled {
+                    return inode.dax_fault(pfm);
+                }
+            }
+        }
         PageFaultHandler::filemap_fault(pfm)
     }
 
@@ -509,6 +510,10 @@ impl FileSystem for Ext4FileSystem {
 }
 
 impl Ext4FileSystem {
+    pub(super) fn is_read_only(&self) -> bool {
+        self._mount_options.read_only
+    }
+
     fn shutdown_on_umount(&self) {
         if self._mount_options.read_only {
             return;
@@ -1472,6 +1477,16 @@ impl Ext4FileSystem {
             // configuration and never replays a live filesystem's journal.
             return Ok(existing);
         }
+        let dax_access = if mount_options.read_only && mount_options.dax != Some(Ext4DaxMode::Never)
+        {
+            // Like Linux fs_dax_get_by_bdev(), reject unaligned partitions
+            // before publishing DAX policy; their byte access remains valid.
+            mount_data.direct_access()?.filter(|access| {
+                access.len().is_multiple_of(MMArch::PAGE_SIZE) && access.page_paddr(0).is_ok()
+            })
+        } else {
+            None
+        };
         // another_ext4 supports 4KiB filesystem blocks; negotiate that same
         // geometry before its block-device adapter begins loading metadata.
         device_mount_holder.set_min_block_size(4096)?;
@@ -1509,6 +1524,7 @@ impl Ext4FileSystem {
         }
         let root_inode: Arc<LockedExt4Inode> =
             Arc::new_cyclic(|self_ref: &Weak<LockedExt4Inode>| LockedExt4Inode {
+                dax_enabled: false,
                 inner: Mutex::new(Ext4Inode::new_mount_root(
                     self_ref.clone(),
                     Ext4InodeTimes::from(&root_attr),
@@ -1538,6 +1554,7 @@ impl Ext4FileSystem {
             fs,
             raw_dev,
             gendisk: mount_data,
+            dax_access,
             device_mount_holder: Mutex::new(Some(device_mount_holder)),
             root_inode,
             dirty_inodes: Mutex::new(Vec::new()),

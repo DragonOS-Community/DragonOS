@@ -36,6 +36,12 @@ pub struct PageCacheReadBatchCompletion {
 }
 
 impl PageCacheReadBatchCompletion {
+    /// Retain the exact demand incarnation before submission may fail and
+    /// unlink it. This is private to PageCache's fault-preparation protocol.
+    pub(super) fn slot_entry(&self, slot: usize) -> Option<Arc<PageEntry>> {
+        self.inner.slots.get(slot).map(|slot| slot.entry.clone())
+    }
+
     pub(super) fn reserve(
         cache: &Arc<PageCache>,
         start_index: usize,

@@ -12,9 +12,10 @@ use system_error::SystemError;
 
 use crate::{
     arch::MMArch,
+    driver::base::block::direct_access::DirectAccessRange,
     filesystem::{
         page_cache::{PageCache, PreparedRemotePageDirty},
-        vfs::IndexNode,
+        vfs::{file::File, IndexNode},
     },
     mm::{
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
@@ -59,10 +60,17 @@ struct RemoteVmaSnapshot {
     writer_inode: Option<Arc<dyn IndexNode>>,
 }
 
-struct PinnedRemotePage {
-    access: PageAccessPin,
-    cache_entry: Option<PageCacheEntry>,
-    _writer: Option<RemoteWriteReservation>,
+enum PinnedRemotePage {
+    Managed {
+        access: PageAccessPin,
+        cache_entry: Option<PageCacheEntry>,
+        _writer: Option<RemoteWriteReservation>,
+    },
+    ReadonlyExternal {
+        range: DirectAccessRange,
+        // Preserve mount semantics after releasing MM locks, not just bytes.
+        _file: Arc<File>,
+    },
 }
 
 struct RemoteWriteReservation(Arc<dyn IndexNode>);
@@ -148,10 +156,30 @@ impl AddressSpace {
                 }
             };
 
+            let (access, cache_entry, _writer) = match pinned {
+                PinnedRemotePage::Managed {
+                    access,
+                    cache_entry,
+                    _writer,
+                } => (access, cache_entry, _writer),
+                PinnedRemotePage::ReadonlyExternal { range, _file } => {
+                    let RemoteAccess::Read(buffer) = &mut dir else {
+                        return finish(copied);
+                    };
+                    if range
+                        .read_at(page_offset, &mut buffer[copied..copied + chunk])
+                        .is_err()
+                    {
+                        return finish(copied);
+                    }
+                    copied += chunk;
+                    continue;
+                }
+            };
             let dirty = if write {
-                match pinned.cache_entry.as_ref() {
+                match cache_entry.as_ref() {
                     Some((cache, index)) => {
-                        match cache.prepare_remote_page_dirty(*index, pinned.access.page()) {
+                        match cache.prepare_remote_page_dirty(*index, access.page()) {
                             Ok(token) => token,
                             Err(_) => return finish(copied),
                         }
@@ -162,9 +190,9 @@ impl AddressSpace {
                 None
             };
 
-            copy_pinned_page(&mut dir, copied, page_offset, chunk, &pinned.access, dirty);
+            copy_pinned_page(&mut dir, copied, page_offset, chunk, &access, dirty);
             if write {
-                mark_remote_pte_dirty(self, page_addr, pinned.access.phys_address());
+                mark_remote_pte_dirty(self, page_addr, access.phys_address());
             }
             copied += chunk;
         }
@@ -216,9 +244,46 @@ fn pin_remote_page_locked(
     if !flags.has_user() && !force {
         return Err(PinRemoteError::Denied);
     }
-    let page = page_manager_lock()
-        .get(&frame)
-        .ok_or(PinRemoteError::UnsupportedSpecial)?;
+    let page = page_manager_lock().get(&frame);
+    let Some(page) = page else {
+        if !vm_flags.contains(VmFlags::VM_MIXEDMAP) {
+            return Err(PinRemoteError::UnsupportedSpecial);
+        }
+        // A readonly external credential can never authorize a write. Force
+        // still goes through the normal private COW fault and managed pin.
+        if write {
+            return if vm_flags.contains(VmFlags::VM_SHARED) {
+                Err(PinRemoteError::Denied)
+            } else {
+                Err(PinRemoteError::WriteProtect)
+            };
+        }
+        let (file, file_offset) = {
+            let guard = vma.lock();
+            let file = guard.vm_file().ok_or(PinRemoteError::UnsupportedSpecial)?;
+            let base = guard.backing_page_offset().ok_or(PinRemoteError::Fault)?;
+            let relative = page_addr
+                .data()
+                .checked_sub(guard.region().start().data())
+                .ok_or(PinRemoteError::Fault)?;
+            let file_offset = base
+                .checked_mul(MMArch::PAGE_SIZE)
+                .and_then(|base| base.checked_add(relative))
+                .ok_or(PinRemoteError::Fault)?;
+            (file, file_offset)
+        };
+        let range = file
+            .inode()
+            .pin_readonly_external_page(file_offset, frame)
+            .map_err(|_| PinRemoteError::UnsupportedSpecial)?
+            .ok_or(PinRemoteError::UnsupportedSpecial)?;
+        if range.len() != MMArch::PAGE_SIZE
+            || range.checked_paddr(0, MMArch::PAGE_SIZE).ok() != Some(frame)
+        {
+            return Err(PinRemoteError::UnsupportedSpecial);
+        }
+        return Ok(PinnedRemotePage::ReadonlyExternal { range, _file: file });
+    };
     if write && !flags.has_write() && !(force && fault_completed) {
         return Err(PinRemoteError::WriteProtect);
     }
@@ -244,7 +309,7 @@ fn pin_remote_page_locked(
             .then_some(RemoteWriteReservation(inode))
     });
 
-    Ok(PinnedRemotePage {
+    Ok(PinnedRemotePage::Managed {
         access,
         cache_entry: snapshot.cache_entry,
         _writer: writer,
@@ -434,7 +499,7 @@ fn fault_in_remote_page(
                 flags |= FaultFlags::FAULT_FLAG_TRIED;
             }
             let outcome = unsafe {
-                let message = PageFaultMessage::new(
+                let mut message = PageFaultMessage::new(
                     vma.clone(),
                     address,
                     flags,
@@ -443,6 +508,13 @@ fn fault_in_remote_page(
                     creator.clone(),
                     data_account.clone(),
                 );
+                if force
+                    && write
+                    && !vm_flags.contains(VmFlags::VM_SHARED)
+                    && vm_flags.contains(VmFlags::VM_MAYWRITE)
+                {
+                    message.allow_remote_forced_cow();
+                }
                 PageFaultHandler::handle_mm_fault(message)
             };
             if let Some(failure) = outcome.charge_failure {

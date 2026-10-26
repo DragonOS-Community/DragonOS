@@ -36,8 +36,15 @@ pub enum PmemAccessMode {
     ReadWrite,
 }
 
-pub trait PmemFlushOps: Send + Sync {
+pub trait PmemProvider: Send + Sync {
     fn flush(&self) -> Result<(), SystemError>;
+    fn direct_access(
+        &self,
+        _block: Arc<PmemBlockDevice>,
+    ) -> Result<Option<Arc<dyn crate::driver::base::block::direct_access::DirectAccess>>, SystemError>
+    {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -46,7 +53,7 @@ pub struct PmemRegion {
     pub size: usize,
     pub source: PmemRegionSource,
     pub access: PmemAccessMode,
-    pub flush: Option<Arc<dyn PmemFlushOps>>,
+    pub provider: Option<Arc<dyn PmemProvider>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +104,14 @@ fn reserve_pmem_region(start: PhysAddr, size: usize) -> Result<PmemRegisteredReg
     Ok(reservation)
 }
 
+/// Release the physical reservation only after the device mapping has been dropped.
+struct PmemReservation(PmemRegisteredRegion);
+impl Drop for PmemReservation {
+    fn drop(&mut self) {
+        release_pmem_region(self.0);
+    }
+}
+
 fn release_pmem_region(reservation: PmemRegisteredRegion) {
     let mut regions = PMEM_REGISTERED_REGIONS.lock_irqsave();
     if let Some(idx) = regions.iter().position(|region| *region == reservation) {
@@ -109,13 +124,10 @@ pub fn register_pmem_region(mut region: PmemRegion) -> Result<Arc<PmemBlockDevic
     let reservation = reserve_pmem_region(region.start, region.size)?;
 
     let id = PMEM_NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    let dev = PmemBlockDevice::new(region.clone(), id);
+    let dev = PmemBlockDevice::new(region.clone(), id, PmemReservation(reservation))?;
     let dev_name = dev.dev_name().to_string();
     let registered = dev.clone() as Arc<dyn BlockDevice>;
-    if let Err(e) = block_dev_manager().register(registered) {
-        release_pmem_region(reservation);
-        return Err(e);
-    }
+    block_dev_manager().register(registered)?;
 
     log::info!(
         "PMEM block device registered: /dev/{} source={:?} start={:?} size={:#x}",
@@ -425,7 +437,7 @@ fn pmem_init() -> Result<(), SystemError> {
             size,
             source: PmemRegionSource::Platform,
             access: PmemAccessMode::ReadWrite,
-            flush: None,
+            provider: None,
         })?;
     }
 

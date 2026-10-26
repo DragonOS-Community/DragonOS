@@ -153,6 +153,29 @@ TEST(TimerFdSemantics, OneShotPollReadAndReset) {
     EXPECT_EQ(EAGAIN, errno);
 }
 
+// Repeated tiny deadlines exercise the clockevent rearm path after both an
+// expiration and cancellation, without relying on a particular timer quantum.
+TEST(TimerFdSemantics, RepeatedShortOneShotsAfterCancel) {
+    UniqueFd fd(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
+    ASSERT_GE(fd.get(), 0) << strerror(errno);
+    const itimerspec disarmed = {};
+    itimerspec short_timer = {};
+    short_timer.it_value.tv_nsec = 1;
+    itimerspec pending = {};
+    pending.it_value.tv_sec = 60;
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_EQ(0, timerfd_settime(fd.get(), 0, &pending, nullptr));
+        ASSERT_EQ(0, timerfd_settime(fd.get(), 0, &disarmed, nullptr));
+        ASSERT_EQ(0, timerfd_settime(fd.get(), 0, &short_timer, nullptr));
+        pollfd ready = {fd.get(), POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 1000)) << "iteration=" << i;
+        ASSERT_NE(0, ready.revents & POLLIN);
+        uint64_t ticks = 0;
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(ticks)), read(fd.get(), &ticks, sizeof(ticks)));
+        ASSERT_EQ(1u, ticks);
+    }
+}
+
 TEST(TimerFdSemantics, VectoredReadUsesScalarFallbackSemantics) {
     UniqueFd fd(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK));
     ASSERT_GE(fd.get(), 0) << strerror(errno);
@@ -203,8 +226,20 @@ TEST(TimerFdSemantics, PeriodicAccumulatesMissedExpirations) {
 
     itimerspec current = {};
     ASSERT_EQ(0, timerfd_gettime(fd.get(), &current));
+    EXPECT_EQ(value.it_interval.tv_sec, current.it_interval.tv_sec);
     EXPECT_EQ(value.it_interval.tv_nsec, current.it_interval.tv_nsec);
-    EXPECT_TRUE(current.it_value.tv_sec > 0 || current.it_value.tv_nsec > 0);
+    // A deadline can pass before its callback runs; zero is a valid snapshot.
+    EXPECT_GE(current.it_value.tv_sec, 0);
+    EXPECT_GE(current.it_value.tv_nsec, 0);
+    EXPECT_LT(current.it_value.tv_nsec, 1000000000L);
+
+    pollfd ready = {fd.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 1000));
+    ASSERT_NE(0, ready.revents & POLLIN);
+    uint64_t next_ticks = 0;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(next_ticks)),
+              read(fd.get(), &next_ticks, sizeof(next_ticks)));
+    EXPECT_GE(next_ticks, 1u);
 }
 
 TEST(TimerFdSemantics, RealtimePeriodicRearmsAfterLazyExpiration) {
@@ -233,7 +268,9 @@ TEST(TimerFdSemantics, RealtimePeriodicRearmsAfterLazyExpiration) {
     ASSERT_EQ(0, timerfd_gettime(fd.get(), &current));
     EXPECT_EQ(value.it_interval.tv_sec, current.it_interval.tv_sec);
     EXPECT_EQ(value.it_interval.tv_nsec, current.it_interval.tv_nsec);
-    EXPECT_TRUE(current.it_value.tv_sec > 0 || current.it_value.tv_nsec > 0);
+    EXPECT_GE(current.it_value.tv_sec, 0);
+    EXPECT_GE(current.it_value.tv_nsec, 0);
+    EXPECT_LT(current.it_value.tv_nsec, 1000000000L);
 
     pollfd ready = {fd.get(), POLLIN, 0};
     ASSERT_EQ(1, poll(&ready, 1, 1000));

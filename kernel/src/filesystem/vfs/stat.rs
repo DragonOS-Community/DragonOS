@@ -318,8 +318,13 @@ pub fn vfs_getattr(
 
     if request_mask.contains(PosixStatxMask::STATX_ALL) {
         kstat.attributes = StxAttributes::STATX_ATTR_APPEND;
-        kstat.attributes_mask |=
-            StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
+        kstat.attributes_mask |= StxAttributes::STATX_ATTR_AUTOMOUNT;
+    }
+
+    // Attribute support is independent of the requested basic-stat mask.
+    kstat.attributes_mask.insert(StxAttributes::STATX_ATTR_DAX);
+    if inode.is_dax() {
+        kstat.attributes.insert(StxAttributes::STATX_ATTR_DAX);
     }
 
     kstat.mode = inode.stat_mode(&metadata);

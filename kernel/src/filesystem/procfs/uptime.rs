@@ -16,7 +16,7 @@ use crate::{
     },
     sched::cputime::{kcpustat_cpu, CpuUsageStat},
     smp::cpu::{smp_cpu_manager, ProcessorId},
-    time::{clocksource::HZ, timer::clock},
+    time::timekeeping::boottime_now,
 };
 use alloc::{
     format,
@@ -38,9 +38,9 @@ impl UptimeFileOps {
     }
 
     fn generate_uptime_content() -> Vec<u8> {
-        let ticks = clock();
-        let uptime_secs = ticks / HZ;
-        let uptime_centis = (ticks % HZ) * 100 / HZ;
+        let uptime = boottime_now();
+        let uptime_secs = uptime.tv_sec;
+        let uptime_centis = uptime.tv_nsec / 10_000_000;
 
         // Linux reports total idle time summed over all present CPUs.
         let present_cpus = smp_cpu_manager()

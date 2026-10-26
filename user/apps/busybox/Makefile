@@ -31,7 +31,7 @@ $(bin): $(busybox_dir) Makefile
 	@# 应用必要补丁和配置调整
 	cd $(busybox_dir) && \
 	make defconfig && \
-	sed -i '/CONFIG_TC/s/.*/# CONFIG_TC is not set/' .config && \
+	sed -i 's/^CONFIG_TC=y$$/# CONFIG_TC is not set/' .config && \
 	sed -i '/CONFIG_STATIC/s/.*/CONFIG_STATIC=y/' .config && \
 	sed -i '/CONFIG_FEATURE_EDITING_MAX_LEN/s/.*/CONFIG_FEATURE_EDITING_MAX_LEN=8192/' .config && \
 	sed -i '/CONFIG_PIE/d' .config && \

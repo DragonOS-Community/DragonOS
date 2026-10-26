@@ -1,3 +1,4 @@
+mod dax;
 mod direct_read;
 
 use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount};
@@ -816,6 +817,8 @@ pub struct Ext4Inode {
 
 #[derive(Debug)]
 pub struct LockedExt4Inode {
+    /// Fixed before publication; read-only mounts cannot change this policy.
+    pub(super) dax_enabled: bool,
     pub(super) inner: Mutex<Ext4Inode>,
     pub(super) io_lock: Mutex<()>,
     pub(super) mapping_io: Arc<Ext4MappingIoDomain>,
@@ -844,6 +847,41 @@ pub struct LockedExt4Inode {
 #[derive(Debug)]
 struct Ext4PageCacheBackend {
     inode: Weak<LockedExt4Inode>,
+}
+
+/// Native ext4 reads do not require delayed-allocation write authority.
+/// Keep a read-only mount's write contract separate from the token backend.
+#[derive(Debug)]
+struct Ext4ReadOnlyPageCacheBackend(Ext4PageCacheBackend);
+
+impl PageCacheBackend for Ext4ReadOnlyPageCacheBackend {
+    fn read_batch_pages(&self) -> usize {
+        self.0.read_batch_pages()
+    }
+
+    fn read_window_limit(&self, start: usize, pages: usize) -> Result<usize, SystemError> {
+        self.0.read_window_limit(start, pages)
+    }
+
+    fn submit_read_batch(
+        self: Arc<Self>,
+        request: PageCacheReadBatchRequest,
+        completion: PageCacheReadBatchCompletion,
+    ) {
+        self.0.submit_read_batch_inner(request, completion);
+    }
+
+    fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        self.0.read_page(index, buf)
+    }
+
+    fn npages(&self) -> usize {
+        self.0.npages()
+    }
+
+    fn write_page(&self, _index: usize, _buf: &[u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EROFS)
+    }
 }
 
 struct Ext4SubmittedReadSegment {
@@ -937,9 +975,246 @@ struct Ext4ReadWorkerState {
     mapping_read: Ext4MappingReadPermit,
 }
 
+impl Ext4ReadWorkerState {
+    fn complete(self) {
+        let Self {
+            submitted,
+            inode: _inode,
+            operation: _operation,
+            fs: _fs,
+            completion,
+            mapping_read,
+        } = self;
+        for mut segment in submitted {
+            let result = segment.request.wait_read_into(&mut segment.payload);
+            match result {
+                Ok(()) => {
+                    let _ = completion.complete_data(
+                        segment.first_slot,
+                        segment.page_count,
+                        &segment.payload,
+                        segment.last_page_valid_bytes,
+                    );
+                }
+                Err(error) => {
+                    let _ =
+                        completion.complete_error(segment.first_slot, segment.page_count, error);
+                }
+            }
+        }
+        drop(mapping_read);
+    }
+}
+
 impl Ext4PageCacheBackend {
     fn new(inode: Weak<LockedExt4Inode>) -> Self {
         Self { inode }
+    }
+
+    fn submit_read_batch_inner(
+        &self,
+        request: PageCacheReadBatchRequest,
+        completion: PageCacheReadBatchCompletion,
+    ) {
+        // Build the queued owner before submitting any BIO. After the device
+        // accepts a request, completion and mapping-exclusion lifetime must no
+        // longer depend on another allocation succeeding.
+        let work_state = Arc::new(Mutex::new(None::<Ext4ReadWorkerState>));
+        let worker_state = work_state.clone();
+        let work = Work::new(move || {
+            let Some(state) = worker_state.lock().take() else {
+                return;
+            };
+            state.complete();
+        });
+        let mut completion = Some(completion);
+        let result = (|| -> Result<Ext4ReadWorkerState, SystemError> {
+            let inode = self.inode()?;
+            let operation = inode.begin_operation()?;
+            let _size = inode.size_lock.read();
+            let _io = inode.io_lock.lock();
+            let mapping_read = inode.mapping_io.begin_read()?;
+            let (fs, inode_num, file_size) = {
+                let guard = inode.inner.lock();
+                (
+                    guard.concret_fs(),
+                    guard.inner_inode_num,
+                    guard.cached_file_size.ok_or(SystemError::EIO)? as usize,
+                )
+            };
+            let offset = request
+                .start_index
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let capacity = request
+                .page_count
+                .checked_mul(MMArch::PAGE_SIZE)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let stable_valid = file_size.saturating_sub(offset).min(capacity);
+            if stable_valid != request.valid_bytes {
+                return Err(SystemError::EIO);
+            }
+            let plan = fs.retry_metadata_read_contention(|| {
+                fs.fs.plan_read(
+                    inode_num,
+                    offset,
+                    capacity,
+                    request.page_count.min(16) as u32,
+                )
+            })?;
+            let coverage = Ext4ReadWindowCoverage::new(
+                request.page_count,
+                request.valid_bytes,
+                plan.valid_bytes,
+            )?;
+            let zero_extension = coverage.zero_extension(request.page_count);
+
+            // Finish every fallible allocation before the first BIO is
+            // submitted. Once a device owns a request, no later ENOMEM may
+            // drop its lifetime permit before retirement.
+            let mut prepared = Vec::new();
+            let prepared_capacity = plan
+                .segments
+                .len()
+                .checked_add(usize::from(zero_extension.is_some()))
+                .ok_or(SystemError::EOVERFLOW)?;
+            prepared
+                .try_reserve_exact(prepared_capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+            let mut next_lower_slot = 0usize;
+            for segment in plan.segments {
+                let logical_start = segment.logical_start() as usize;
+                let first_byte = logical_start
+                    .checked_mul(another_ext4::BLOCK_SIZE)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                let first_slot =
+                    first_byte.checked_sub(offset).ok_or(SystemError::EIO)? / MMArch::PAGE_SIZE;
+                let page_count = segment.block_count() as usize;
+                if first_slot != next_lower_slot || page_count == 0 {
+                    return Err(SystemError::EIO);
+                }
+                let segment_end = first_slot
+                    .checked_add(page_count)
+                    .ok_or(SystemError::EOVERFLOW)?;
+                if segment_end > coverage.durable_pages {
+                    return Err(SystemError::EIO);
+                }
+                next_lower_slot = segment_end;
+                let last_valid = coverage.lower_segment_last_valid_bytes(segment_end);
+                match segment {
+                    another_ext4::ReadSegment::Zero { .. } => {
+                        prepared.push(Ext4PreparedReadSegment::Zero {
+                            first_slot,
+                            page_count,
+                            last_page_valid_bytes: last_valid,
+                        });
+                    }
+                    another_ext4::ReadSegment::Mapped { physical_start, .. } => {
+                        let payload_len = page_count
+                            .checked_mul(MMArch::PAGE_SIZE)
+                            .ok_or(SystemError::EOVERFLOW)?;
+                        let mut payload = Vec::new();
+                        payload
+                            .try_reserve_exact(payload_len)
+                            .map_err(|_| SystemError::ENOMEM)?;
+                        payload.resize(payload_len, 0);
+                        prepared.push(Ext4PreparedReadSegment::Mapped {
+                            first_slot,
+                            page_count,
+                            last_page_valid_bytes: last_valid,
+                            physical_start,
+                            payload,
+                        });
+                    }
+                }
+            }
+            if next_lower_slot != coverage.durable_pages {
+                return Err(SystemError::EIO);
+            }
+            if let Some((first_slot, page_count, last_page_valid_bytes)) = zero_extension {
+                prepared.push(Ext4PreparedReadSegment::Zero {
+                    first_slot,
+                    page_count,
+                    last_page_valid_bytes,
+                });
+            }
+
+            let mut submitted = Vec::new();
+            submitted
+                .try_reserve_exact(prepared.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            for segment in prepared {
+                match segment {
+                    Ext4PreparedReadSegment::Zero {
+                        first_slot,
+                        page_count,
+                        last_page_valid_bytes,
+                    } => {
+                        let _ = completion
+                            .as_ref()
+                            .expect("completion owner")
+                            .complete_zero(first_slot, page_count, last_page_valid_bytes);
+                    }
+                    Ext4PreparedReadSegment::Mapped {
+                        first_slot,
+                        page_count,
+                        last_page_valid_bytes,
+                        physical_start,
+                        payload,
+                    } => match fs.gendisk.submit_ext4_read(physical_start, page_count) {
+                        Ok(submission) => submitted.push(Ext4SubmittedReadSegment {
+                            first_slot,
+                            page_count,
+                            last_page_valid_bytes,
+                            request: submission,
+                            payload,
+                        }),
+                        Err(error) => {
+                            let _ = completion
+                                .as_ref()
+                                .expect("completion owner")
+                                .complete_error(first_slot, page_count, error);
+                        }
+                    },
+                }
+            }
+            drop(_io);
+            drop(_size);
+            Ok(Ext4ReadWorkerState {
+                submitted,
+                inode,
+                operation,
+                fs,
+                completion: completion.take().expect("completion transfers to worker"),
+                mapping_read,
+            })
+        })();
+
+        let state = match result {
+            Ok(state) => state,
+            Err(error) => {
+                let completion = completion.take().expect("failed preparation retains owner");
+                let unfinished = completion.unfinished();
+                if unfinished > 0 {
+                    let _ = completion.complete_error(0, request.page_count, error);
+                }
+                return;
+            }
+        };
+        // Synchronous devices may have retired every BIO before returning.
+        // Avoid making a fault wait for a worker just to publish those results.
+        // A terminal result cannot become pending again; failed requests still
+        // pass through the same error/length validation as queued completion.
+        if state
+            .submitted
+            .iter()
+            .all(|segment| segment.request.is_terminal())
+        {
+            state.complete();
+        } else {
+            *work_state.lock() = Some(state);
+            crate::filesystem::page_cache::schedule_read_completion(work);
+        }
     }
 
     fn inode(&self) -> Result<Arc<LockedExt4Inode>, SystemError> {
@@ -1499,221 +1774,7 @@ impl PageCacheBackend for Ext4PageCacheBackend {
         request: PageCacheReadBatchRequest,
         completion: PageCacheReadBatchCompletion,
     ) {
-        // Build the queued owner before submitting any BIO. After the device
-        // accepts a request, completion and mapping-exclusion lifetime must no
-        // longer depend on another allocation succeeding.
-        let work_state = Arc::new(Mutex::new(None));
-        let worker_state = work_state.clone();
-        let work = Work::new(move || {
-            let Some(state) = worker_state.lock().take() else {
-                return;
-            };
-            let Ext4ReadWorkerState {
-                submitted,
-                inode: _inode,
-                operation: _operation,
-                fs: _fs,
-                completion,
-                mapping_read,
-            } = state;
-            for mut segment in submitted {
-                let result = segment.request.wait_read_into(&mut segment.payload);
-                match result {
-                    Ok(()) => {
-                        let _ = completion.complete_data(
-                            segment.first_slot,
-                            segment.page_count,
-                            &segment.payload,
-                            segment.last_page_valid_bytes,
-                        );
-                    }
-                    Err(error) => {
-                        let _ = completion.complete_error(
-                            segment.first_slot,
-                            segment.page_count,
-                            error,
-                        );
-                    }
-                }
-            }
-            drop(mapping_read);
-        });
-        let mut completion = Some(completion);
-        let result = (|| -> Result<Ext4ReadWorkerState, SystemError> {
-            let inode = self.inode()?;
-            let operation = inode.begin_operation()?;
-            let _size = inode.size_lock.read();
-            let _io = inode.io_lock.lock();
-            let mapping_read = inode.mapping_io.begin_read()?;
-            let (fs, inode_num, file_size) = {
-                let guard = inode.inner.lock();
-                (
-                    guard.concret_fs(),
-                    guard.inner_inode_num,
-                    guard.cached_file_size.ok_or(SystemError::EIO)? as usize,
-                )
-            };
-            let offset = request
-                .start_index
-                .checked_mul(MMArch::PAGE_SIZE)
-                .ok_or(SystemError::EOVERFLOW)?;
-            let capacity = request
-                .page_count
-                .checked_mul(MMArch::PAGE_SIZE)
-                .ok_or(SystemError::EOVERFLOW)?;
-            let stable_valid = file_size.saturating_sub(offset).min(capacity);
-            if stable_valid != request.valid_bytes {
-                return Err(SystemError::EIO);
-            }
-            let plan = fs.retry_metadata_read_contention(|| {
-                fs.fs.plan_read(
-                    inode_num,
-                    offset,
-                    capacity,
-                    request.page_count.min(16) as u32,
-                )
-            })?;
-            let coverage = Ext4ReadWindowCoverage::new(
-                request.page_count,
-                request.valid_bytes,
-                plan.valid_bytes,
-            )?;
-            let zero_extension = coverage.zero_extension(request.page_count);
-
-            // Finish every fallible allocation before the first BIO is
-            // submitted. Once a device owns a request, no later ENOMEM may
-            // drop its lifetime permit before retirement.
-            let mut prepared = Vec::new();
-            let prepared_capacity = plan
-                .segments
-                .len()
-                .checked_add(usize::from(zero_extension.is_some()))
-                .ok_or(SystemError::EOVERFLOW)?;
-            prepared
-                .try_reserve_exact(prepared_capacity)
-                .map_err(|_| SystemError::ENOMEM)?;
-            let mut next_lower_slot = 0usize;
-            for segment in plan.segments {
-                let logical_start = segment.logical_start() as usize;
-                let first_byte = logical_start
-                    .checked_mul(another_ext4::BLOCK_SIZE)
-                    .ok_or(SystemError::EOVERFLOW)?;
-                let first_slot =
-                    first_byte.checked_sub(offset).ok_or(SystemError::EIO)? / MMArch::PAGE_SIZE;
-                let page_count = segment.block_count() as usize;
-                if first_slot != next_lower_slot || page_count == 0 {
-                    return Err(SystemError::EIO);
-                }
-                let segment_end = first_slot
-                    .checked_add(page_count)
-                    .ok_or(SystemError::EOVERFLOW)?;
-                if segment_end > coverage.durable_pages {
-                    return Err(SystemError::EIO);
-                }
-                next_lower_slot = segment_end;
-                let last_valid = coverage.lower_segment_last_valid_bytes(segment_end);
-                match segment {
-                    another_ext4::ReadSegment::Zero { .. } => {
-                        prepared.push(Ext4PreparedReadSegment::Zero {
-                            first_slot,
-                            page_count,
-                            last_page_valid_bytes: last_valid,
-                        });
-                    }
-                    another_ext4::ReadSegment::Mapped { physical_start, .. } => {
-                        let payload_len = page_count
-                            .checked_mul(MMArch::PAGE_SIZE)
-                            .ok_or(SystemError::EOVERFLOW)?;
-                        let mut payload = Vec::new();
-                        payload
-                            .try_reserve_exact(payload_len)
-                            .map_err(|_| SystemError::ENOMEM)?;
-                        payload.resize(payload_len, 0);
-                        prepared.push(Ext4PreparedReadSegment::Mapped {
-                            first_slot,
-                            page_count,
-                            last_page_valid_bytes: last_valid,
-                            physical_start,
-                            payload,
-                        });
-                    }
-                }
-            }
-            if next_lower_slot != coverage.durable_pages {
-                return Err(SystemError::EIO);
-            }
-            if let Some((first_slot, page_count, last_page_valid_bytes)) = zero_extension {
-                prepared.push(Ext4PreparedReadSegment::Zero {
-                    first_slot,
-                    page_count,
-                    last_page_valid_bytes,
-                });
-            }
-
-            let mut submitted = Vec::new();
-            submitted
-                .try_reserve_exact(prepared.len())
-                .map_err(|_| SystemError::ENOMEM)?;
-            for segment in prepared {
-                match segment {
-                    Ext4PreparedReadSegment::Zero {
-                        first_slot,
-                        page_count,
-                        last_page_valid_bytes,
-                    } => {
-                        let _ = completion
-                            .as_ref()
-                            .expect("completion owner")
-                            .complete_zero(first_slot, page_count, last_page_valid_bytes);
-                    }
-                    Ext4PreparedReadSegment::Mapped {
-                        first_slot,
-                        page_count,
-                        last_page_valid_bytes,
-                        physical_start,
-                        payload,
-                    } => match fs.gendisk.submit_ext4_read(physical_start, page_count) {
-                        Ok(submission) => submitted.push(Ext4SubmittedReadSegment {
-                            first_slot,
-                            page_count,
-                            last_page_valid_bytes,
-                            request: submission,
-                            payload,
-                        }),
-                        Err(error) => {
-                            let _ = completion
-                                .as_ref()
-                                .expect("completion owner")
-                                .complete_error(first_slot, page_count, error);
-                        }
-                    },
-                }
-            }
-            drop(_io);
-            drop(_size);
-            Ok(Ext4ReadWorkerState {
-                submitted,
-                inode,
-                operation,
-                fs,
-                completion: completion.take().expect("completion transfers to worker"),
-                mapping_read,
-            })
-        })();
-
-        let state = match result {
-            Ok(state) => state,
-            Err(error) => {
-                let completion = completion.take().expect("failed preparation retains owner");
-                let unfinished = completion.unfinished();
-                if unfinished > 0 {
-                    let _ = completion.complete_error(0, request.page_count, error);
-                }
-                return;
-            }
-        };
-        *work_state.lock() = Some(state);
-        crate::filesystem::page_cache::schedule_read_completion(work);
+        self.submit_read_batch_inner(request, completion);
     }
 
     fn read_page(&self, index: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -2207,6 +2268,31 @@ impl IndexNode for LockedExt4Inode {
         }
     }
 
+    fn is_dax(&self) -> bool {
+        self.dax_enabled
+    }
+
+    fn pin_readonly_external_page(
+        &self,
+        file_offset: usize,
+        expected_pfn: crate::mm::PhysAddr,
+    ) -> Result<Option<crate::driver::base::block::direct_access::DirectAccessRange>, SystemError>
+    {
+        self.dax_pin_readonly(file_offset, expected_pfn)
+    }
+
+    fn mmap_vm_flags(
+        &self,
+        _file: &Arc<vfs::file::File>,
+        vm_flags: crate::mm::VmFlags,
+    ) -> Result<crate::mm::VmFlags, SystemError> {
+        Ok(if self.dax_enabled {
+            vm_flags | crate::mm::VmFlags::VM_MIXEDMAP
+        } else {
+            vm_flags
+        })
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         Ok(())
     }
@@ -2474,6 +2560,11 @@ impl IndexNode for LockedExt4Inode {
         buf: &mut [u8],
         data: PrivateData,
     ) -> Result<usize, MemoryAllocationError> {
+        if self.dax_enabled {
+            drop(data);
+            let count = len.min(buf.len());
+            return self.dax_read_kernel(offset, &mut buf[..count]);
+        }
         let _operation = self.begin_operation()?;
         let len = core::cmp::min(len, buf.len());
         let buf = &mut buf[0..len];
@@ -2509,6 +2600,11 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
         intent: vfs::ReadIoIntent,
     ) -> Result<usize, MemoryAllocationError> {
+        if self.dax_enabled {
+            drop(data);
+            let count = len.min(buf.len());
+            return self.dax_read_kernel(offset, &mut buf[..count]);
+        }
         if intent == vfs::ReadIoIntent::Direct {
             drop(data);
             self.read_direct_kernel(offset, len, buf)
@@ -2533,6 +2629,10 @@ impl IndexNode for LockedExt4Inode {
         data: PrivateData,
         intent: vfs::ReadIoIntent,
     ) -> Result<Option<usize>, SystemError> {
+        if self.dax_enabled {
+            drop(data);
+            return self.dax_read_user(offset, len, writer).map(Some);
+        }
         if intent == vfs::ReadIoIntent::Direct {
             drop(data);
             self.read_direct_user(offset, len, writer).map(Some)
@@ -2550,6 +2650,10 @@ impl IndexNode for LockedExt4Inode {
         writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         data: PrivateData,
     ) -> Result<Option<usize>, SystemError> {
+        if self.dax_enabled {
+            drop(data);
+            return self.dax_read_user(offset, len, writer).map(Some);
+        }
         let page_cache = self.inner.lock().page_cache.clone();
         let Some(page_cache) = page_cache else {
             return Ok(None);
@@ -6559,8 +6663,10 @@ impl LockedExt4Inode {
     ) -> Result<Arc<Self>, SystemError> {
         debug_assert_eq!(inode_num, attr.ino);
         let fs = fs_ptr.upgrade().ok_or(SystemError::EIO)?;
+        let dax_enabled = Self::initial_dax_policy(&fs, inode_num, attr.ftype)?;
         let lifecycle = Ext4InodeLifecycle::new();
         let inode = Arc::new_cyclic(|self_ref| LockedExt4Inode {
+            dax_enabled,
             inner: Mutex::new(Ext4Inode::new(
                 inode_num,
                 fs_ptr.clone(),
@@ -6601,14 +6707,19 @@ impl LockedExt4Inode {
         // the current generic admission callback would therefore form an
         // ABBA. Do not add an ext4 admission wrapper here until that split,
         // token lifecycle, and defer/progress protocol are complete.
-        let backend: Arc<dyn PageCacheBackend> =
-            if attr.ftype == FileType::RegularFile && fs.delalloc_mapper_authority.is_some() {
-                Arc::new(Ext4PageCacheBackend::new(Arc::downgrade(&inode)))
-            } else {
-                Arc::new(AsyncPageCacheBackend::new(
-                    Arc::downgrade(&inode) as Weak<dyn IndexNode>
-                ))
-            };
+        let backend: Arc<dyn PageCacheBackend> = if attr.ftype == FileType::RegularFile
+            && fs.is_read_only()
+        {
+            Arc::new(Ext4ReadOnlyPageCacheBackend(Ext4PageCacheBackend::new(
+                Arc::downgrade(&inode),
+            )))
+        } else if attr.ftype == FileType::RegularFile && fs.delalloc_mapper_authority.is_some() {
+            Arc::new(Ext4PageCacheBackend::new(Arc::downgrade(&inode)))
+        } else {
+            Arc::new(AsyncPageCacheBackend::new(
+                Arc::downgrade(&inode) as Weak<dyn IndexNode>
+            ))
+        };
         let page_cache = PageCache::new_file(
             Arc::downgrade(&inode) as Weak<dyn IndexNode>,
             backend,

@@ -2832,6 +2832,17 @@ impl Ext4 {
         Ok(Self::file_attr(&inode))
     }
 
+    /// Read validated on-disk flags without changing the shared FileAttr ABI.
+    /// Callers deciding a fixed mapping policy do this before publishing an inode.
+    pub fn inode_flags(&self, id: InodeId) -> Result<u32> {
+        let _view = self.lock_metadata_read_view()?;
+        let inode = self.read_inode(id)?;
+        if inode.inode.mode().bits() == 0 {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        Ok(inode.inode.flags())
+    }
+
     /// Read only an already resident inode image. A miss must not reach the
     /// block device: openat2(RESOLVE_CACHED) can retry without that flag.
     pub fn getattr_cached(&self, id: InodeId) -> Result<Option<FileAttr>> {
@@ -4719,6 +4730,20 @@ mod tests {
         );
         assert_eq!(attr.links, 2);
         assert_eq!(attr.rdev, (259, 0x1_0002));
+    }
+
+    #[test]
+    fn inode_flags_preserve_dax_and_reject_free_inodes() {
+        let fs = make_test_fs(16);
+        let mut inode = Box::new(Inode::default());
+        inode.set_mode(InodeMode::FILE | InodeMode::from_bits_retain(0o600));
+        inode.set_flags(0x0208_0000);
+        fs.inode_cache.lock().insert(InodeRef::new(42, inode));
+        assert_eq!(fs.inode_flags(42).unwrap(), 0x0208_0000);
+        fs.inode_cache
+            .lock()
+            .insert(InodeRef::new(43, Box::new(Inode::default())));
+        assert!(matches!(fs.inode_flags(43), Err(error) if error.code() == ErrCode::EINVAL));
     }
 
     #[test]

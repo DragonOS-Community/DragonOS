@@ -104,7 +104,331 @@ fn one_shot_terminal(complete_first: bool) -> Result<bool, SystemError> {
         && valid_result.load(Ordering::Acquire))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MmapReadOutcome {
+    Ready,
+    DemandError,
+    NeighborError,
+    PendingDemand,
+}
+
+/// Exercise the native submission contract, rather than the default per-page
+/// worker. Pending ownership is released explicitly, including timeout paths.
+struct MmapReadBackend {
+    outcome: MmapReadOutcome,
+    bytes: usize,
+    demand_calls: AtomicUsize,
+    neighbor_pages: AtomicUsize,
+    fallback_calls: AtomicUsize,
+    pending: SpinLock<(
+        bool,
+        Option<(PageCacheReadBatchRequest, PageCacheReadBatchCompletion)>,
+    )>,
+}
+
+impl core::fmt::Debug for MmapReadBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MmapReadBackend").finish()
+    }
+}
+
+impl MmapReadBackend {
+    fn new(outcome: MmapReadOutcome, bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            outcome,
+            bytes,
+            demand_calls: AtomicUsize::new(0),
+            neighbor_pages: AtomicUsize::new(0),
+            fallback_calls: AtomicUsize::new(0),
+            pending: SpinLock::new((outcome == MmapReadOutcome::PendingDemand, None)),
+        })
+    }
+
+    fn publish(request: PageCacheReadBatchRequest, completion: PageCacheReadBatchCompletion) {
+        let payload = vec![0x5a; request.page_count * MMArch::PAGE_SIZE];
+        let tail = request.valid_bytes - (request.page_count - 1) * MMArch::PAGE_SIZE;
+        let _ = completion.complete_data(0, request.page_count, &payload, tail);
+    }
+
+    fn release_pending(&self) {
+        let pending = {
+            let mut state = self.pending.lock_irqsave();
+            state.0 = false;
+            state.1.take()
+        };
+        if let Some((request, completion)) = pending {
+            Self::publish(request, completion);
+        }
+    }
+}
+
+impl PageCacheBackend for MmapReadBackend {
+    fn read_page(&self, _: usize, buffer: &mut [u8]) -> Result<usize, SystemError> {
+        self.fallback_calls.fetch_add(1, Ordering::AcqRel);
+        buffer.fill(0x5a);
+        Ok(buffer.len())
+    }
+
+    fn write_page(&self, _: usize, _: &[u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EROFS)
+    }
+
+    fn npages(&self) -> usize {
+        self.bytes.div_ceil(MMArch::PAGE_SIZE)
+    }
+
+    fn read_batch_pages(&self) -> usize {
+        4
+    }
+
+    fn read_window_limit(&self, start: usize, count: usize) -> Result<usize, SystemError> {
+        Ok(self
+            .bytes
+            .saturating_sub(start * MMArch::PAGE_SIZE)
+            .min(count * MMArch::PAGE_SIZE))
+    }
+
+    fn submit_read_batch(
+        self: Arc<Self>,
+        request: PageCacheReadBatchRequest,
+        completion: PageCacheReadBatchCompletion,
+    ) {
+        let demand = request.start_index == 0;
+        if demand {
+            self.demand_calls.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.neighbor_pages
+                .fetch_add(request.page_count, Ordering::AcqRel);
+        }
+        if (demand && self.outcome == MmapReadOutcome::DemandError)
+            || (!demand && self.outcome == MmapReadOutcome::NeighborError)
+        {
+            let _ = completion.complete_error(0, request.page_count, SystemError::EIO);
+            return;
+        }
+        if demand {
+            let mut state = self.pending.lock_irqsave();
+            if state.0 {
+                state.1 = Some((request, completion));
+                return;
+            }
+        }
+        Self::publish(request, completion);
+    }
+}
+
+fn mmap_read_retry() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::MemoryPolicy;
+    let owner = MemoryAccount::new(0, None)?;
+    let creator = ObjectAccount::new(&owner)?;
+    let empty_backend = MmapReadBackend::new(MmapReadOutcome::Ready, 0);
+    let empty = PageCache::new_unowned(None, Some(empty_backend.clone()));
+    let Some(empty_wait) = empty.mmap_read_retry_wait(0, 4, &owner, &creator) else {
+        return Ok(false);
+    };
+    if empty_wait.wait().is_err()
+        || empty.manager().pages_count()? != 0
+        || empty_backend.demand_calls.load(Ordering::Acquire) != 0
+        || empty_backend.neighbor_pages.load(Ordering::Acquire) != 0
+        || empty
+            .mmap_read_retry_wait(usize::MAX, 4, &owner, &creator)
+            .is_some()
+    {
+        return Ok(false);
+    }
+    for outcome in [MmapReadOutcome::DemandError, MmapReadOutcome::NeighborError] {
+        let backend = MmapReadBackend::new(outcome, 4 * MMArch::PAGE_SIZE);
+        let cache = PageCache::new_unowned(None, Some(backend.clone()));
+        let Some(wait) = cache.mmap_read_retry_wait(0, 4, &owner, &creator) else {
+            return Ok(false);
+        };
+        if wait.wait().is_err() || backend.demand_calls.load(Ordering::Acquire) != 1 {
+            return Ok(false);
+        }
+        if outcome == MmapReadOutcome::DemandError {
+            if backend.neighbor_pages.load(Ordering::Acquire) != 0
+                || cache.manager().pages_count()? != 0
+            {
+                return Ok(false);
+            }
+        } else if !cache.fault_page_state(0).ready
+            || cache.manager().pages_count()? != 1
+            || backend.neighbor_pages.load(Ordering::Acquire) != 3
+        {
+            return Ok(false);
+        }
+    }
+
+    // Native EOF clipping must zero the partial tail and never reserve page 3.
+    let backend = MmapReadBackend::new(MmapReadOutcome::Ready, 2 * MMArch::PAGE_SIZE + 17);
+    let cache = PageCache::new_unowned(None, Some(backend.clone()));
+    let Some(wait) = cache.mmap_read_retry_wait(0, 4, &owner, &creator) else {
+        return Ok(false);
+    };
+    wait.wait().map_err(PageCache::legacy_allocation_error)?;
+    let tail = cache.inner.lock().get_entry(2).ok_or(SystemError::EIO)?;
+    if !short_read_valid(&tail)
+        || cache.fault_page_state(3).cached
+        || backend.neighbor_pages.load(Ordering::Acquire) != 2
+        || cache.mmap_read_retry_wait(0, 1, &owner, &creator).is_some()
+    {
+        return Ok(false);
+    }
+
+    // An advisory charge refusal must leave no Loading page and no data charge;
+    // relaxing that limit must still permit the ordinary demand fill.
+    let limited = MemoryAccount::new(0, Some(owner.clone()))?;
+    limited.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    let backend = MmapReadBackend::new(MmapReadOutcome::Ready, 4 * MMArch::PAGE_SIZE);
+    let cache = PageCache::new_unowned(None, Some(backend.clone()));
+    let Some(wait) = cache.mmap_read_retry_wait(0, 4, &limited, &creator) else {
+        return Ok(false);
+    };
+    if wait.wait().is_err()
+        || limited.current_pages() != 0
+        || cache.manager().pages_count()? != 0
+        || backend.demand_calls.load(Ordering::Acquire) != 0
+    {
+        return Ok(false);
+    }
+    limited.set_policy(MemoryPolicy::default());
+    let page = cache
+        .manager()
+        .try_commit_page_pinned(0, &limited, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    drop(page);
+    if backend.fallback_calls.load(Ordering::Acquire) != 1 {
+        return Ok(false);
+    }
+
+    let backend = MmapReadBackend::new(MmapReadOutcome::PendingDemand, 4 * MMArch::PAGE_SIZE);
+    let cache = PageCache::new_unowned(None, Some(backend.clone()));
+    let Some(wait) = cache.mmap_read_retry_wait(0, 4, &owner, &creator) else {
+        return Ok(false);
+    };
+    pending_read_wait(cache, backend, wait, 3)
+}
+
+fn pending_read_wait(
+    cache: Arc<PageCache>,
+    backend: Arc<MmapReadBackend>,
+    wait: Arc<dyn FaultRetryWait>,
+    neighbor_pages: usize,
+) -> Result<bool, SystemError> {
+    let finished = Arc::new(AtomicBool::new(false));
+    let succeeded = Arc::new(AtomicBool::new(false));
+    let worker_finished = finished.clone();
+    let worker_succeeded = succeeded.clone();
+    let worker_task = Arc::new(SpinLock::new(
+        None::<Arc<crate::process::ProcessControlBlock>>,
+    ));
+    let task_slot = worker_task.clone();
+    schedule_pagecache_io(Work::new(move || {
+        *task_slot.lock_irqsave() = Some(crate::process::ProcessManager::current_pcb());
+        worker_succeeded.store(wait.wait().is_ok(), Ordering::Release);
+        worker_finished.store(true, Ordering::Release);
+    }));
+    let deadline = crate::time::Instant::now() + TIMEOUT;
+    let held = loop {
+        // Submission alone does not prove that the token waits: observe its
+        // actual blocked task before allowing the native completion to run.
+        let blocked = worker_task
+            .lock_irqsave()
+            .as_ref()
+            .is_some_and(|task| task.sched_info().state().is_blocked());
+        if blocked && backend.pending.lock_irqsave().1.is_some() {
+            break !finished.load(Ordering::Acquire)
+                && !cache.fault_page_state(0).ready
+                && backend.neighbor_pages.load(Ordering::Acquire) == 0;
+        }
+        if finished.load(Ordering::Acquire) || crate::time::Instant::now() >= deadline {
+            break false;
+        }
+        crate::sched::sched_yield();
+    };
+    // Close admission before releasing the captured completion, so a delayed
+    // worker cannot publish an unowned pending request after a test timeout.
+    backend.release_pending();
+    let deadline = crate::time::Instant::now() + TIMEOUT;
+    while !finished.load(Ordering::Acquire) && crate::time::Instant::now() < deadline {
+        crate::sched::sched_yield();
+    }
+    Ok(held
+        && finished.load(Ordering::Acquire)
+        && succeeded.load(Ordering::Acquire)
+        && cache.fault_page_state(0).ready
+        && backend.neighbor_pages.load(Ordering::Acquire) == neighbor_pages)
+}
+
+fn fault_demand_read() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::MemoryPolicy;
+    let owner = MemoryAccount::new(0, None)?;
+    let creator = ObjectAccount::new(&owner)?;
+    for outcome in [MmapReadOutcome::Ready, MmapReadOutcome::DemandError] {
+        let backend = MmapReadBackend::new(outcome, 17);
+        let cache = PageCache::new_unowned(None, Some(backend.clone()));
+        let wait = cache
+            .fault_demand_retry_wait(0, &owner, &creator)
+            .map_err(PageCache::legacy_allocation_error)?;
+        let result = wait.wait();
+        if outcome == MmapReadOutcome::DemandError {
+            // Synchronous completion already removed its failed cache entry.
+            // The token must still observe that exact incarnation's error.
+            if !matches!(result, Err(MemoryAllocationError::System(SystemError::EIO)))
+                || cache.fault_page_state(0).cached
+            {
+                return Ok(false);
+            }
+        } else {
+            result.map_err(PageCache::legacy_allocation_error)?;
+            let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+            if !short_read_valid(&entry) {
+                return Ok(false);
+            }
+            wait.wait().map_err(PageCache::legacy_allocation_error)?;
+        }
+        if backend.demand_calls.load(Ordering::Acquire) != 1
+            || backend.neighbor_pages.load(Ordering::Acquire) != 0
+            || backend.fallback_calls.load(Ordering::Acquire) != 0
+        {
+            return Ok(false);
+        }
+    }
+    let limited = MemoryAccount::new(0, Some(owner.clone()))?;
+    limited.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    let backend = MmapReadBackend::new(MmapReadOutcome::Ready, MMArch::PAGE_SIZE);
+    let cache = PageCache::new_unowned(None, Some(backend.clone()));
+    let wait = cache
+        .fault_demand_retry_wait(0, &limited, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    if !matches!(wait.wait(), Err(MemoryAllocationError::Charge(_)))
+        || limited.current_pages() != 0
+        || cache.fault_page_state(0).cached
+        || backend.demand_calls.load(Ordering::Acquire) != 0
+    {
+        return Ok(false);
+    }
+    let backend = MmapReadBackend::new(MmapReadOutcome::PendingDemand, 17);
+    let cache = PageCache::new_unowned(None, Some(backend.clone()));
+    let wait = cache
+        .fault_demand_retry_wait(0, &owner, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    pending_read_wait(cache, backend, wait, 0)
+}
+
 pub(super) fn run() -> Result<bool, SystemError> {
+    if !fault_demand_read()? {
+        return Ok(false);
+    }
+    if !mmap_read_retry()? {
+        return Ok(false);
+    }
     if !one_shot_terminal(false)? || !one_shot_terminal(true)? {
         return Ok(false);
     }

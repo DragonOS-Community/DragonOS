@@ -247,7 +247,7 @@ impl InnerAddressSpace {
                                     }
                                 }
                                 if let PresentPfn::Managed(page) = LockedVMA::classify_present_pfn(
-                                    &mut page_manager_guard,
+                                    &page_manager_guard,
                                     phys_addr,
                                     vm_flags,
                                 ) {
@@ -467,7 +467,7 @@ impl InnerAddressSpace {
             let vm_flags = *vma.lock().vm_flags();
             let mut page_manager_guard = page_manager_lock();
             if let PresentPfn::Managed(page) =
-                LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
+                LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
             {
                 page.write().add_mlocked_vma_ref(vma);
             }
@@ -492,8 +492,7 @@ impl InnerAddressSpace {
                 let vm_flags = *vma.lock().vm_flags();
                 let page = {
                     let mut page_manager_guard = page_manager_lock();
-                    match LockedVMA::classify_present_pfn(&mut page_manager_guard, paddr, vm_flags)
-                    {
+                    match LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags) {
                         PresentPfn::Managed(page) => Some(page),
                         PresentPfn::External => None,
                     }

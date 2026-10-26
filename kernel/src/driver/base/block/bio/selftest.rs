@@ -36,7 +36,10 @@ pub(crate) fn heap_denied_bio_birth() -> Result<bool, SystemError> {
 
 pub(crate) fn bio_terminal_protocol() -> Result<bool, SystemError> {
     let bio = BioRequest::try_new_read(0, 1)?;
+    let initial = !bio.is_terminal();
     bio.write_buffer(&[0x5a; LBA_SIZE])?;
+    bio.mark_submitted(0)?;
+    let submitted = !bio.is_terminal();
     let calls = Arc::new(AtomicUsize::new(0));
     let weak = Arc::downgrade(&bio);
     let count = calls.clone();
@@ -63,6 +66,7 @@ pub(crate) fn bio_terminal_protocol() -> Result<bool, SystemError> {
     short.complete(Ok(LBA_SIZE - 1));
     let failed = BioRequest::try_new_flush()?;
     failed.complete(Err(SystemError::ESHUTDOWN));
+    let terminal = bio.is_terminal() && short.is_terminal() && failed.is_terminal();
     let errors = short.wait_status() == Err(SystemError::EIO)
         && short.wait_read_into(&mut output) == Err(SystemError::EIO)
         && failed.wait_status() == Err(SystemError::ESHUTDOWN);
@@ -81,10 +85,19 @@ pub(crate) fn bio_terminal_protocol() -> Result<bool, SystemError> {
         }) == Err(SystemError::ENOMEM);
         let listed = pending.register_callback(prepared) == Err(SystemError::ENOMEM);
         let copy = bio.wait() == Err(SystemError::ENOMEM);
-        boxed && listed && copy && bio.wait_read_into(&mut output) == Ok(LBA_SIZE)
+        boxed
+            && listed
+            && copy
+            && !pending.is_terminal()
+            && bio.is_terminal()
+            && bio.wait_read_into(&mut output) == Ok(LBA_SIZE)
     };
     pending.complete(Ok(0));
-    Ok(copied
+    Ok(initial
+        && submitted
+        && terminal
+        && pending.is_terminal()
+        && copied
         && duplicate
         && invalid
         && errors

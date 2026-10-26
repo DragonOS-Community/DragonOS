@@ -1049,6 +1049,24 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// Allow a filesystem to add internal VMA flags after VFS permission
     /// checks derived the user-visible protection and sharing flags.
+    /// Whether this inode actually uses direct-access file contents.
+    fn is_dax(&self) -> bool {
+        false
+    }
+
+    /// Obtain one immutable external page already authorized by a file PTE.
+    /// Called under MM/PT locks: implementations must not wait for metadata
+    /// or I/O. The returned exact-page range owns its backing resource.
+    /// `file_offset` is a page-aligned byte offset, not a page index.
+    fn pin_readonly_external_page(
+        &self,
+        _file_offset: usize,
+        _expected_pfn: crate::mm::PhysAddr,
+    ) -> Result<Option<crate::driver::base::block::direct_access::DirectAccessRange>, SystemError>
+    {
+        Ok(None)
+    }
+
     fn mmap_vm_flags(&self, _file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags, SystemError> {
         Ok(vm_flags)
     }

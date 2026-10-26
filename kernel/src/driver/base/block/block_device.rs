@@ -229,6 +229,13 @@ pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
 
 /// @brief 块设备应该实现的操作
 pub trait BlockDevice: Device {
+    /// Optional provider-owned read-only access, never a bare unpinned PFN.
+    fn direct_access(
+        &self,
+    ) -> Result<Option<super::direct_access::DirectAccessRange>, SystemError> {
+        Ok(None)
+    }
+
     /// Permissions used for the published devfs block node.
     fn devfs_mode(&self) -> InodeMode {
         InodeMode::from_bits_truncate(0o755)

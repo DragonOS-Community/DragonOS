@@ -223,6 +223,135 @@ TEST_F(Ext4UserRead, AlignedDirectReadSmoke) {
     free(output);
     close(reader);
 }
+
+// Reopen after unmount so a new inode/PageCache must fill the file from the
+// read-only filesystem, rather than reusing pages dirtied by test setup.
+class Ext4ReadOnlyRead : public ::testing::Test {
+protected:
+    dunitest::LoopExt4 fs;
+    int fd = -1;
+    std::vector<unsigned char> expected;
+
+    void SetUp() override {
+        ASSERT_NO_FATAL_FAILURE(fs.SetUp("ext4_inode_identity.img", "/tmp", "ext4_ro_read"));
+        ASSERT_NO_FATAL_FAILURE(fs.Mount());
+        const std::string path = fs.mount_point() + "/sparse-read";
+        fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        expected.resize(5 * kPage + 137, 0);
+        for (size_t i = 0; i < kPage; ++i) expected[i] = (i * 17 + 1) % 251;
+        std::fill(expected.begin() + 5 * kPage, expected.end(), 0x6b);
+        ASSERT_EQ(pwrite(fd, expected.data(), kPage, 0), static_cast<ssize_t>(kPage));
+        ASSERT_EQ(pwrite(fd, expected.data() + 5 * kPage, 137, 5 * kPage), 137);
+        ASSERT_EQ(fsync(fd), 0);
+        ASSERT_EQ(close(fd), 0);
+        fd = -1;
+        ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+        ASSERT_NO_FATAL_FAILURE(fs.Mount(MS_RDONLY));
+        fd = open(path.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0) << strerror(errno);
+    }
+
+    void TearDown() override {
+        if (fd >= 0) close(fd);
+    }
+};
+
+TEST_F(Ext4ReadOnlyRead, ColdMmapReadsDataHolesAndZeroesEofTail) {
+    const size_t mapped_size = 6 * kPage;
+    void* mapping = mmap(nullptr, mapped_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ASSERT_NE(mapping, MAP_FAILED) << strerror(errno);
+    EXPECT_EQ(memcmp(mapping, expected.data(), expected.size()), 0);
+    const auto* bytes = static_cast<const unsigned char*>(mapping);
+    EXPECT_TRUE(std::all_of(bytes + expected.size(), bytes + mapped_size,
+                            [](unsigned char value) { return value == 0; }));
+    EXPECT_EQ(munmap(mapping, mapped_size), 0);
+}
+
+TEST_F(Ext4ReadOnlyRead, ColdOffsetMappingAndRandomAdvice) {
+    // Begin inside the file and fault at a non-page-aligned byte address. The
+    // final partial page and holes must survive both normal and random advice.
+    for (int advice : {MADV_NORMAL, MADV_RANDOM}) {
+        if (advice == MADV_RANDOM) {
+            ASSERT_EQ(close(fd), 0);
+            fd = -1;
+            ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+            ASSERT_NO_FATAL_FAILURE(fs.Mount(MS_RDONLY));
+            fd = open((fs.mount_point() + "/sparse-read").c_str(), O_RDONLY);
+            ASSERT_GE(fd, 0) << strerror(errno);
+        }
+        const size_t length = 5 * kPage;
+        void* mapping = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, kPage);
+        ASSERT_NE(mapping, MAP_FAILED) << strerror(errno);
+        ASSERT_EQ(madvise(mapping, length, advice), 0) << strerror(errno);
+        const auto* bytes = static_cast<const unsigned char*>(mapping);
+        EXPECT_EQ(bytes[4 * kPage + 17], expected[5 * kPage + 17]);
+        EXPECT_EQ(memcmp(bytes, expected.data() + kPage, expected.size() - kPage), 0);
+        EXPECT_EQ(bytes[length - 1], 0);
+        ASSERT_EQ(munmap(mapping, length), 0);
+    }
+}
+
+TEST(Ext4ColdMmap, SharedWriteRetriesBeforePageMkwrite) {
+    dunitest::LoopExt4 fs;
+    ASSERT_NO_FATAL_FAILURE(fs.SetUp("ext4_inode_identity.img", "/tmp", "ext4_cold_shared"));
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    const std::string path = fs.mount_point() + "/cold-shared";
+    int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const size_t length = 20 * kPage;
+    std::vector<unsigned char> expected(length);
+    for (size_t i = 0; i < length; ++i) expected[i] = (i * 13 + i / kPage) % 251;
+    ASSERT_EQ(write(fd, expected.data(), length), static_cast<ssize_t>(length));
+    ASSERT_EQ(fsync(fd), 0);
+    ASSERT_EQ(close(fd), 0);
+    ASSERT_NO_FATAL_FAILURE(fs.Unmount());
+    ASSERT_NO_FATAL_FAILURE(fs.Mount());
+    fd = open(path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    void* mapping = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NE(mapping, MAP_FAILED) << strerror(errno);
+    auto* bytes = static_cast<unsigned char*>(mapping);
+    // Store first: a read must not warm the demanded page before shared fault.
+    bytes[37] = 0x9d;
+    expected[37] = 0x9d;
+    EXPECT_EQ(memcmp(bytes, expected.data(), length), 0);
+    ASSERT_EQ(msync(mapping, length, MS_SYNC), 0) << strerror(errno);
+    ASSERT_EQ(munmap(mapping, length), 0);
+    std::vector<unsigned char> output(length);
+    EXPECT_EQ(pread(fd, output.data(), length, 0), static_cast<ssize_t>(length));
+    EXPECT_EQ(output, expected);
+    EXPECT_EQ(close(fd), 0);
+}
+
+TEST_F(Ext4ReadOnlyRead, ColdBufferedReadClipsAtEof) {
+    std::vector<unsigned char> output(expected.size() + kPage, 0xa5);
+    EXPECT_EQ(pread(fd, output.data(), output.size(), 0),
+              static_cast<ssize_t>(expected.size()));
+    EXPECT_EQ(memcmp(output.data(), expected.data(), expected.size()), 0);
+    EXPECT_EQ(output[expected.size()], 0xa5);
+    EXPECT_EQ(pread(fd, output.data(), output.size(), expected.size()), 0);
+}
+
+
+TEST_F(Ext4ReadOnlyRead, WritableOpenRejectedAndPrivateCowRemainsPrivate) {
+    errno = 0;
+    const int writer = open((fs.mount_point() + "/sparse-read").c_str(), O_RDWR);
+    const int open_error = errno;
+    if (writer >= 0) close(writer);
+    EXPECT_EQ(writer, -1);
+    EXPECT_EQ(open_error, EROFS);
+    void* mapping = mmap(nullptr, kPage, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    ASSERT_NE(mapping, MAP_FAILED) << strerror(errno);
+    auto* bytes = static_cast<unsigned char*>(mapping);
+    EXPECT_EQ(bytes[0], expected[0]);
+    bytes[0] ^= 0xff;
+    unsigned char original = 0;
+    EXPECT_EQ(pread(fd, &original, 1, 0), 1);
+    EXPECT_EQ(original, expected[0]);
+    EXPECT_EQ(munmap(mapping, kPage), 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

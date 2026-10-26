@@ -30,8 +30,13 @@ pub(crate) enum HeapPlan {
 
 impl HeapPlan {
     pub(crate) const fn prefers_virtual_layout(layout: Layout) -> bool {
-        layout.size() > 2 * <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE
-            || layout.align() > <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE
+        // Keep layout eligibility consistent with the available virtual backends.
+        // Other architectures may still have placeholder page geometry.
+        cfg!(any(target_arch = "x86_64", target_arch = "riscv64"))
+            && (layout.size()
+                > 2 * <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE
+                || layout.align()
+                    > <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE)
     }
 
     pub(crate) fn preferred(layout: Layout) -> Self {

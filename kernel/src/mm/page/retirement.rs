@@ -53,6 +53,34 @@ pub(crate) fn detach_unmapped_page_locked(
     }
 }
 
+/// Reuse a caller's manager/Page transaction after removing an rmap.
+///
+/// `None` leaves both registries untouched and requires normal retirement
+/// after releasing the caller's guards. In particular, never block on the
+/// reclaimer under a Page guard. `Some` means detach completed, even when no
+/// registry owned this Page. Release the returned owners outside all guards,
+/// retaining the caller's Page Arc through its own TLB barrier.
+pub(crate) fn try_detach_unmapped_page_with_manager(
+    page: &Arc<Page>,
+    data: &mut InnerPage,
+    manager: &mut PageManager,
+) -> Option<RetiredPageOwners> {
+    if !data.can_deallocate_after_vma_unmap() {
+        return None;
+    }
+    let mut reclaimer = if data.flags().contains(PageFlags::PG_LRU) {
+        Some(try_page_reclaimer_lock()?)
+    } else {
+        None
+    };
+    Some(detach_unmapped_page_locked(
+        page,
+        data,
+        manager,
+        reclaimer.as_deref_mut(),
+    ))
+}
+
 /// Sleepable counterpart for VMA, COW and unpublished-page cleanup.
 ///
 /// The caller retains `page` through any outstanding TLB barrier. A Page

@@ -173,9 +173,9 @@ pub trait AllocablePage {
     where
         Self: core::marker::Sized;
 
-    /// Returns which list this page currently belongs to inside [`SCAllocator`].
+    /// Returns the allocator occupancy state of this page.
     fn page_state(&self) -> PageState;
-    /// Updates the state of this page (must be kept consistent with list membership).
+    /// Updates the state (empty/partial lists and the full count must agree).
     fn set_page_state(&mut self, state: PageState);
 
     /// Tries to find a free block within `data` that satisfies `alignment` requirement.
@@ -242,7 +242,7 @@ pub trait AllocablePage {
     }
 }
 
-/// Which list a page currently belongs to inside an [`SCAllocator`].
+/// Allocator occupancy state; full pages are detached from the free-page lists.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PageState {

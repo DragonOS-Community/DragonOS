@@ -17,14 +17,16 @@ use crate::{
     exception::InterruptArch,
     libs::rwlock::RwLock,
     mm::percpu::{PerCpu, PerCpuVar},
-    process::ProcessManager,
+    process::{ProcessFlags, ProcessManager},
     sched::cputime::IrqTime,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
-    time::timer::clock,
+    time::{clocksource::HZ, timer::clock},
 };
 
 const MAX_SOFTIRQ_NUM: u64 = 64;
 const MAX_SOFTIRQ_RESTART: i32 = 20;
+// Match Linux msecs_to_jiffies(2), rounding up to the current tick granularity.
+const MAX_SOFTIRQ_TIME_JIFFIES: u64 = (2 * HZ).div_ceil(1000);
 
 static SOFTIRQ_VECTORS: AtomicPtr<Softirq> = AtomicPtr::new(null_mut());
 
@@ -223,8 +225,7 @@ impl Softirq {
         // non-zero preempt count even though local IRQs may be enabled below.
         // This prevents a timer IRQ nested inside task-context softirq handling
         // from scheduling away before the softirq handler returns.
-        // TODO pcb的flags未修改
-        let end = clock() + 500 * 2;
+        let start = clock();
         let cpu_id = smp_get_processor_id();
         let mut max_restart = MAX_SOFTIRQ_RESTART;
         loop {
@@ -265,7 +266,13 @@ impl Softirq {
             compiler_fence(Ordering::SeqCst);
             let has_pending = self.pending_for(cpu_id).load(Ordering::SeqCst) != 0;
             compiler_fence(Ordering::SeqCst);
-            if has_pending && clock() < end && max_restart > 0 {
+            if has_pending
+                && clock().wrapping_sub(start) < MAX_SOFTIRQ_TIME_JIFFIES
+                && !ProcessManager::current_pcb()
+                    .flags()
+                    .contains(ProcessFlags::NEED_SCHEDULE)
+                && max_restart > 0
+            {
                 continue;
             }
             // Pending work left after the time/restart budget remains set for

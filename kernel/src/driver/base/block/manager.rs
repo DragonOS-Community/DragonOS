@@ -382,6 +382,57 @@ impl BlockDevManager {
 
     /// 卸载磁盘设备
     pub fn unregister(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
+        self.unregister_with_precommit(dev, || Ok(()))
+    }
+
+    /// Close normal I/O admission, drain payloads, then perform the driver's
+    /// durability boundary before removing any namespace entry. The callback
+    /// runs without manager/metadata locks and must not reacquire raw_cache_gate.
+    pub(crate) fn unregister_with_precommit(
+        &self,
+        dev: &Arc<dyn BlockDevice>,
+        precommit: impl FnOnce() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let _gate = dev.blkdev_meta().raw_cache_gate.write();
+        let nodes = self.snapshot_raw_nodes_locked(dev.as_ref())?;
+        if nodes.iter().any(|node| node.has_node_holders()) {
+            return Err(SystemError::EBUSY);
+        }
+        let mut online = Vec::new();
+        online
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        for node in &nodes {
+            online.push(node.is_online_locked());
+            node.set_online_locked(false);
+        }
+        let result = (|| {
+            // Drain every previously submitted payload, including when an
+            // earlier cache reports an error. A failed drain never commits.
+            let mut error = None;
+            for node in &nodes {
+                if let Err(err) = node.sync_raw_cache_locked() {
+                    error.get_or_insert(err);
+                }
+                if node.has_dirty_raw_cache_locked() || node.has_raw_writeback_locked() {
+                    error.get_or_insert(SystemError::EBUSY);
+                }
+            }
+            if let Some(err) = error {
+                return Err(err);
+            }
+            precommit()?;
+            self.unregister_namespace(dev)
+        })();
+        if result.is_err() {
+            for (node, was_online) in nodes.iter().zip(online) {
+                node.set_online_locked(was_online);
+            }
+        }
+        result
+    }
+
+    fn unregister_namespace(&self, dev: &Arc<dyn BlockDevice>) -> Result<(), SystemError> {
         // 回归注释（保持原子性/可恢复性）：
         // 这里不能在 devfs_unregister 之前就把设备从 manager 移除、或清空 blk_meta.gendisks。
         // 否则一旦 devfs_unregister 中途失败，会留下不可恢复的不一致状态：

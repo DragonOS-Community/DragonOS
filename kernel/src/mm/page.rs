@@ -1304,6 +1304,11 @@ impl PageReclaimer {
         self.lru.get(paddr).cloned()
     }
 
+    /// A real access hint, separate from registry identity lookups.
+    pub(crate) fn mark_accessed(&mut self, paddr: &PhysAddr) {
+        self.lru.promote(paddr);
+    }
+
     pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
         self.lru.pop(paddr)
     }
@@ -4465,9 +4470,9 @@ pub trait Flusher<Arch: MemoryManagementArch> {
     fn consume(&mut self, flush: PageFlush<Arch>);
 }
 
-/// 用于刷新某个虚拟地址的刷新器。这个刷新器一经产生，就必须调用flush()方法，
-/// 否则会造成对页表的更改被忽略，这是不安全的
-#[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
+/// Invalidate one local TLB entry when explicitly flushed or dropped.
+/// `ignore()` transfers that responsibility to the caller's later barrier.
+#[must_use = "Flush, drop, or consume this token through a matching TLB barrier"]
 pub struct PageFlush<Arch: MemoryManagementArch> {
     virt: VirtAddr,
     phantom: PhantomData<Arch>,
@@ -4482,7 +4487,7 @@ impl<Arch: MemoryManagementArch> PageFlush<Arch> {
     }
 
     pub fn flush(self) {
-        unsafe { Arch::invalidate_page(self.virt) };
+        drop(self);
     }
 
     /// 忽略掉这个刷新器
@@ -4494,13 +4499,13 @@ impl<Arch: MemoryManagementArch> PageFlush<Arch> {
 impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
     fn drop(&mut self) {
         unsafe {
-            MMArch::invalidate_page(self.virt);
+            Arch::invalidate_page(self.virt);
         }
     }
 }
 
-/// A flusher for the entire page table. Once created, its `flush()` method must be called;
-/// otherwise, page table changes will be silently ignored, which is unsafe.
+/// Invalidate the entire local TLB when explicitly flushed or dropped.
+/// `ignore()` transfers that responsibility to the caller's later barrier.
 ///
 /// # Usage Constraints
 ///
@@ -4518,7 +4523,7 @@ impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
 ///
 /// [`MmuGather`]: crate::mm::mmu_gather::MmuGather
 /// [`AddressSpace::flush_tlb_range`]: crate::mm::ucontext::AddressSpace::flush_tlb_range
-#[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
+#[must_use = "Flush, drop, or consume this token through a matching TLB barrier"]
 pub struct PageFlushAll<Arch: MemoryManagementArch> {
     phantom: PhantomData<fn() -> Arch>,
 }
@@ -4532,7 +4537,7 @@ impl<Arch: MemoryManagementArch> PageFlushAll<Arch> {
     }
 
     pub fn flush(self) {
-        unsafe { Arch::invalidate_all() };
+        drop(self);
     }
 
     /// 忽略掉这个刷新器

@@ -214,9 +214,16 @@ pub struct PageFaultMessage<'a> {
     mm: Arc<AddressSpace>,
     retry_wait: Option<Arc<dyn FaultRetryWait>>,
     charge_failure: Option<ChargeFailure>,
+    /// Set only after remote forced-private-write admission, never by ABI flags.
+    remote_forced_cow: bool,
 }
 
 impl<'a> PageFaultMessage<'a> {
+    /// Only the remote-access admission path may enable private forced COW.
+    pub(super) fn allow_remote_forced_cow(&mut self) {
+        self.remote_forced_cow = true;
+    }
+
     pub fn new(
         vma: Arc<LockedVMA>,
         address: VirtAddr,
@@ -249,6 +256,7 @@ impl<'a> PageFaultMessage<'a> {
             mm,
             retry_wait: None,
             charge_failure: None,
+            remote_forced_cow: false,
         }
     }
 
@@ -478,13 +486,17 @@ impl<'a> PageFaultMessage<'a> {
             let guard = self.vma.lock();
             (
                 *guard.vm_flags(),
-                guard.flags().set_write(true).set_dirty(true),
+                guard
+                    .flags()
+                    .set_write(guard.vm_flags().contains(VmFlags::VM_WRITE))
+                    .set_dirty(true),
                 guard.vm_flags().contains(VmFlags::VM_LOCKED),
             )
         };
         if !vm_flags.contains(VmFlags::VM_MIXEDMAP)
             || vm_flags.contains(VmFlags::VM_SHARED)
-            || !vm_flags.contains(VmFlags::VM_WRITE)
+            || !(vm_flags.contains(VmFlags::VM_WRITE)
+                || (self.remote_forced_cow && vm_flags.contains(VmFlags::VM_MAYWRITE)))
         {
             return VmFaultReason::VM_FAULT_SIGSEGV;
         }
@@ -1010,10 +1022,12 @@ impl PageFaultHandler {
         let file = pfm.vm_file().unwrap().clone();
         let mut ret = file.with_io_fs(|fs| fs.fault(pfm));
 
-        if ret.intersects(VmFaultReason::VM_FAULT_ERROR) {
-            return ret;
-        }
-        if ret.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+        if ret.intersects(
+            VmFaultReason::VM_FAULT_ERROR
+                | VmFaultReason::VM_FAULT_NOPAGE
+                | VmFaultReason::VM_FAULT_RETRY
+                | VmFaultReason::VM_FAULT_COMPLETED,
+        ) {
             return ret;
         }
 
@@ -1400,6 +1414,12 @@ impl PageFaultHandler {
         drop(vma_guard);
 
         for pgoff in start_pgoff..end_pgoff {
+            let address =
+                VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
+            // Fault-around must leave every nonempty PTE to its own fault path.
+            if mapper.get_entry(address, 0).is_some() {
+                continue;
+            }
             if let Some(page_pin) = page_cache.manager().peek_page_pinned(pgoff) {
                 let page = page_pin.page();
                 let page_guard = page.upread();
@@ -1409,26 +1429,21 @@ impl PageFaultHandler {
                 let phys = page.phys_address();
                 drop(page_guard);
 
-                let address =
-                    VirtAddr::new(addr.data() + ((pgoff - start_pgoff) << MMArch::PAGE_SHIFT));
-                if mapper.get_entry(address, 0).is_none() {
-                    let mut flags = entry_flags;
-                    if is_private_file_vma
-                        || vma_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
-                    {
-                        flags = flags.set_write(false);
+                let mut flags = entry_flags;
+                if is_private_file_vma || vma_flags.contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE)
+                {
+                    flags = flags.set_write(false);
+                }
+                Self::attach_fault_mapped_page(&page, &vma, address, mlocked);
+                match mapper.try_map_phys(address, phys, flags, Some(&pfm.creator_object)) {
+                    Ok(Some(flush)) => {
+                        flush.flush();
+                        Self::account_new_present_mapping(&mm);
                     }
-                    Self::attach_fault_mapped_page(&page, &vma, address, mlocked);
-                    match mapper.try_map_phys(address, phys, flags, Some(&pfm.creator_object)) {
-                        Ok(Some(flush)) => {
-                            flush.flush();
-                            Self::account_new_present_mapping(&mm);
-                        }
-                        result => {
-                            Self::detach_fault_mapped_page(&page, &vma);
-                            if let Err(failure) = result {
-                                return pfm.fail_charge(failure);
-                            }
+                    result => {
+                        Self::detach_fault_mapped_page(&page, &vma);
+                        if let Err(failure) = result {
+                            return pfm.fail_charge(failure);
                         }
                     }
                 }
@@ -1612,6 +1627,36 @@ impl PageFaultHandler {
             if !page_cache.fault_page_state(backing_pgoff).cached {
                 account_major_fault_event(pfm.data_account());
                 ret = VmFaultReason::VM_FAULT_MAJOR;
+                if pfm.flags.contains(FaultFlags::FAULT_FLAG_ALLOW_RETRY)
+                    && !pfm.flags.intersects(
+                        FaultFlags::FAULT_FLAG_TRIED | FaultFlags::FAULT_FLAG_RETRY_NOWAIT,
+                    )
+                    && !pfm.vm_flags.contains(VmFlags::VM_RAND_READ)
+                {
+                    // Only use bounds already stabilized by the fault. Backend
+                    // metadata and native read admission run after RETRY drops
+                    // the address-space and invalidation guards.
+                    let mut window = vma_guard
+                        .region()
+                        .end()
+                        .data()
+                        .saturating_sub(pfm.address_aligned_down().data())
+                        >> MMArch::PAGE_SHIFT;
+                    if let Some(size) = size {
+                        let eof_pages = (size >> MMArch::PAGE_SHIFT)
+                            + usize::from(size & (MMArch::PAGE_SIZE - 1) != 0);
+                        window = window.min(eof_pages.saturating_sub(backing_pgoff));
+                    }
+                    if let Some(wait) = page_cache.mmap_read_retry_wait(
+                        backing_pgoff,
+                        window,
+                        &pfm.data_account,
+                        &pfm.creator_object,
+                    ) {
+                        pfm.set_retry_wait(wait);
+                        return ret | VmFaultReason::VM_FAULT_RETRY;
+                    }
+                }
             }
 
             match page_cache.manager().try_commit_page_pinned(

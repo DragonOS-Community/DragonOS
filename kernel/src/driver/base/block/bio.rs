@@ -185,6 +185,13 @@ impl BioRequest {
         self.inner.lock_irqsave().token
     }
 
+    /// Whether device access has retired, including a failed or short request.
+    /// Terminal results are immutable; a subsequent wait observes the result
+    /// without sleeping. This does not imply that the I/O succeeded.
+    pub fn is_terminal(&self) -> bool {
+        self.inner.lock_irqsave().result.is_some()
+    }
+
     /// 完成BIO请求
     pub fn complete(&self, result: Result<usize, SystemError>) {
         let callbacks = {

@@ -132,17 +132,14 @@ fn page_list_state_migration_full_partial_empty() {
         }
     }
 
-    assert_eq!(
-        sa.full_slabs.elements, 1,
-        "single page should end up in full list"
-    );
+    assert_eq!(sa.full_count, 1, "single page should be counted as full");
     assert_eq!(sa.slabs.elements, 0);
     assert_eq!(sa.empty_slabs.elements, 0);
 
     // Free one object: Full -> Partial.
     let one = objs.pop().expect("must have at least one allocation");
     unsafe { sa.deallocate(one, layout).expect("Can't deallocate") };
-    assert_eq!(sa.full_slabs.elements, 0, "full -> partial on first free");
+    assert_eq!(sa.full_count, 0, "full -> partial on first free");
     assert_eq!(sa.slabs.elements, 1);
     assert_eq!(sa.empty_slabs.elements, 0);
 
@@ -151,7 +148,7 @@ fn page_list_state_migration_full_partial_empty() {
         unsafe { sa.deallocate(p, layout).expect("Can't deallocate") };
     }
 
-    assert_eq!(sa.full_slabs.elements, 0);
+    assert_eq!(sa.full_count, 0);
     assert_eq!(sa.slabs.elements, 0);
     assert_eq!(
         sa.empty_slabs.elements, 1,
@@ -163,6 +160,79 @@ fn page_list_state_migration_full_partial_empty() {
         pager.release_page(&mut *p)
     });
     assert_eq!(pager.currently_allocated(), 0);
+}
+
+#[test]
+fn first_free_does_not_write_other_full_pages() {
+    // Copy initialized metadata only: ObjectPage's unused data is MaybeUninit.
+    // No borrowed page/link survives an allocator mutation or the reclaim callback.
+    unsafe fn metadata(page: *mut ObjectPage<'_>) -> (usize, usize, PageState, [u64; 8]) {
+        let page = &mut *page;
+        let prev = page
+            .prev()
+            .resolve()
+            .map_or(0, |p| p as *const ObjectPage as usize);
+        let next = page
+            .next()
+            .resolve()
+            .map_or(0, |p| p as *const ObjectPage as usize);
+        (
+            prev,
+            next,
+            page.page_state(),
+            core::array::from_fn(|i| page.bitfield()[i].load(Ordering::Relaxed)),
+        )
+    }
+
+    let mut pager = Pager::new();
+    let mut sa: SCAllocator<ObjectPage> = SCAllocator::new(512);
+    let layout = Layout::from_size_align(512, 1).unwrap();
+    let mut pages = Vec::new();
+    for _ in 0..3 {
+        let page = pager.allocate_page().expect("page allocation failed");
+        pages.push(page as *mut ObjectPage);
+        unsafe { sa.refill(page) };
+    }
+    let mut objects = Vec::new();
+    for _ in 0..3 * sa.obj_per_page {
+        let object = sa.allocate(layout).expect("refilled capacity disappeared");
+        unsafe { object.as_ptr().write_bytes(0xa7, layout.size()) };
+        objects.push(object);
+    }
+    assert!(sa.allocate(layout).is_err());
+    let full_detached = pages.iter().all(|page| {
+        let (prev, next, state, _) = unsafe { metadata(*page) };
+        state == PageState::Full && prev == 0 && next == 0
+    });
+    let before = unsafe { [metadata(pages[0]), metadata(pages[2])] };
+    let index = objects
+        .iter()
+        .position(|object| object.as_ptr() as usize & !(OBJECT_PAGE_SIZE - 1) == pages[1] as usize)
+        .expect("middle page has no object");
+    let object = objects.swap_remove(index);
+    unsafe { sa.deallocate(object, layout).expect("first free failed") };
+    let after = unsafe { [metadata(pages[0]), metadata(pages[2])] };
+    let unchanged = before == after;
+    let neighbors_still_full = before.iter().all(|row| row.2 == PageState::Full)
+        && after.iter().all(|row| row.2 == PageState::Full);
+
+    // Complete ownership cleanup before the expected old-implementation failure.
+    let mut data_intact = true;
+    for object in objects {
+        data_intact &= unsafe {
+            core::slice::from_raw_parts(object.as_ptr(), layout.size())
+                .iter()
+                .all(|byte| *byte == 0xa7)
+        };
+        unsafe { sa.deallocate(object, layout).expect("cleanup free failed") };
+    }
+    sa.try_reclaim_pages(usize::MAX, &mut |page: *mut ObjectPage| unsafe {
+        pager.release_page(&mut *page)
+    });
+    assert_eq!(pager.currently_allocated(), 0);
+    assert!(neighbors_still_full && data_intact);
+    assert!(full_detached, "Full pages retained list links");
+    assert!(unchanged, "first free changed another Full page's metadata");
 }
 
 macro_rules! test_sc_allocation {

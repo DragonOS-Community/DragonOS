@@ -848,6 +848,11 @@ pub(crate) fn report() -> String {
         ("sparse_full_window", sparse_full_window()),
         ("global_header_footprint", global_header_footprint()),
         ("shared_parents_old_root", shared_parents_old_root()),
+        #[cfg(target_arch = "x86_64")]
+        (
+            "device_linear_shared_roots",
+            crate::mm::device_linear::selftest::run(),
+        ),
         (
             "default_global_heap",
             crate::mm::allocator::selftest::default_heap(),

@@ -24,6 +24,35 @@ use super::{
     driver::apic::{lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC},
 };
 
+/// 中断独立栈（IST）。
+///
+/// Linux 用 IST 保证 `#DF`/NMI/MCE 等在任务栈不可用时仍有可用栈。
+/// DragonOS 的 `current_pcb()` 从“栈底 PCB 槽”取当前任务，因此 IST 栈上
+/// 不能调用任何依赖 `current_pcb()` 的设施——使用 IST 的处理函数必须走
+/// 零分配通道（`emergency_print_*`）并直接停机。
+pub mod ist {
+    use crate::mm::percpu::PerCpu;
+
+    /// 每个 CPU 的双重错误栈大小（Linux 用 4 页，这里取 16 KiB）。
+    const DOUBLE_FAULT_STACK_SIZE: usize = 0x4000;
+
+    #[repr(C, align(16))]
+    struct IstStack([u8; DOUBLE_FAULT_STACK_SIZE]);
+
+    static mut DOUBLE_FAULT_STACKS: [IstStack; PerCpu::MAX_CPU_NUM as usize] =
+        [const { IstStack([0; DOUBLE_FAULT_STACK_SIZE]) }; PerCpu::MAX_CPU_NUM as usize];
+
+    /// 返回该 CPU 双重错误 IST 栈的栈顶（16 字节对齐）。
+    pub fn double_fault_stack_top(cpu: u32) -> Option<u64> {
+        let cpu = usize::try_from(cpu).ok()?;
+        if cpu >= PerCpu::MAX_CPU_NUM as usize {
+            return None;
+        }
+        let base = unsafe { core::ptr::addr_of!(DOUBLE_FAULT_STACKS[cpu]) } as usize;
+        Some(((base + DOUBLE_FAULT_STACK_SIZE) & !0xf) as u64)
+    }
+}
+
 /// @brief 关闭中断
 #[inline]
 pub fn cli() {

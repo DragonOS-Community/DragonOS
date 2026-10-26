@@ -1,0 +1,20 @@
+gateway_addrs:
+  - "10.0.2.2:15163"
+heartbeat_interval_sec: 5
+data_dir: /opt/ocm-agent/data
+plugins_conf_dir: /opt/ocm-agent/plugin-conf
+cgroup:
+  enabled: false
+log:
+  level: info
+  output: stdout
+collector:
+  enabled: false
+fingerprint:
+  prefer_iface: ""
+taskrunner:
+  workdir_ttl_sec: 3600
+  workdir_cleanup_interval_sec: 600
+large_data:
+  req_new_wait_timeout_ms: 10000
+  session_timeout_sec: 120

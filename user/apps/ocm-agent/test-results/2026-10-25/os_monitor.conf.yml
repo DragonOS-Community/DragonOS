@@ -1,0 +1,14 @@
+app:
+  tick_interval: 3
+  push_interval: 5
+  log_level: "info"
+cpu:
+  usage: {interval: 5}
+  loadavg: {interval: 5}
+mem:
+  usage: {interval: 5}
+net:
+  flow: {interval: 5}
+disk:
+  usage: {interval: 10}
+  util: {interval: 10}

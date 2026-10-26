@@ -1,0 +1,42 @@
+# 用户程序名称
+name = "ocm-agent"
+# 版本号
+version = "0.1.0"
+# 用户程序描述信息
+description = "OpenCloudOS OCManager host agent (static build for DragonOS)"
+# （可选）是否只构建一次，如果为true，DADK会在构建成功后，将构建结果缓存起来，下次构建时，直接使用缓存的构建结果
+build-once = false
+#  (可选) 是否只安装一次，如果为true，DADK会在安装成功后，不再重复安装
+install-once = false
+# 目标架构
+# 可选值："x86_64", "aarch64", "riscv64"
+target-arch = ["x86_64"]
+# 任务源
+[task-source]
+# 构建类型
+# 可选值："build-from_source", "install-from-prebuilt"
+type = "build-from-source"
+# 构建来源
+# "build_from_source" 可选值："git", "local", "archive"
+# "install_from_prebuilt" 可选值："local", "archive"
+source = "git"
+# 上游仓库（DragonOS 修复在 dragonos 分支）
+source-path = "https://github.com/sparkzky/ocm-agent.git"
+# 固定到 dragonos 分支上的已验证 commit（与 default.nix 的 fetchgit 保持一致）
+# 注意：branch 和 revision 只能二选一；这里用 revision 保证可复现。
+# DADK 首次构建会克隆到 bin/dadk_cache/source/ocm_agent_0_1_0。
+revision = "d08b700e20243cee892ef67b975f89500f352c4b"
+# 构建相关信息
+[build]
+# DADK 源码目录会由 DADK_SOURCE_CACHE_DIR_OCM_AGENT_0_1_0 导出；
+# 构建脚本仍在 DragonOS 仓库里，因此通过 ROOT_PATH 回到 app 目录。
+build-command = "make -C $ROOT_PATH/user/apps/ocm-agent install-dadk SRC_DIR=$DADK_SOURCE_CACHE_DIR_OCM_AGENT_0_1_0"
+# 安装相关信息
+[install]
+# （可选）安装到DragonOS的路径
+# 构建目录中已经按 opt/ocm-agent/ 布局组织，因此安装到根目录。
+in-dragonos-path = "/"
+# 清除相关信息
+[clean]
+# （可选）清除命令
+clean-command = "make -C $ROOT_PATH/user/apps/ocm-agent clean"

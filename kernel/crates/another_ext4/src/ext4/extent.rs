@@ -1870,8 +1870,13 @@ impl Ext4 {
         }
         let home = super::rw::MetadataIo::transaction(self, transaction)
             .allocate_initialized_data(inode_ref, try_filled_bytes(0)?)?;
-        let mut extent = Extent::new(iblock, home, 1);
-        extent.mark_unwritten();
+        // Write-path allocation: the block has just been zero-filled and will
+        // receive the caller's data right away, so publish it as a normal
+        // (written) extent. Marking it unwritten would turn this inode's tail
+        // extent into an unwritten one, and every later append would be
+        // rejected with ENOTSUP by extent_right_spine_projection -- this
+        // backend has no unwritten-to-written conversion path.
+        let extent = Extent::new(iblock, home, 1);
         self.transaction_insert_allocated_extent(transaction, inode_ref, &extent)?;
         self.transaction_stage_inode_with_csum(transaction, inode_ref)?;
         Ok(home)

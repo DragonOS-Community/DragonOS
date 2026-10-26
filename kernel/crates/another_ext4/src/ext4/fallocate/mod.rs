@@ -72,6 +72,29 @@ impl Ext4 {
         offset: usize,
         len: usize,
     ) -> Result<PreallocationProgress> {
+        // 不带初始化范围的调用：按 ext4 语义，预分配出来的块一律是 unwritten。
+        self.preallocate_range_batch_initialized(id, offset, len, 0)
+    }
+
+    /// 与 [`Self::preallocate_range_batch`] 相同，但声明
+    /// `[0, initialized_upto)` 这段在本次操作结束后会属于文件有效数据。
+    ///
+    /// 落在该区间内的新块已经由 `allocate_initialized_data` 写零，可以
+    /// 直接标记为 **written**；只有超出该区间的块（典型的
+    /// `FALLOC_FL_KEEP_SIZE` 越过 EOF 的预分配）必须保持 unwritten，
+    /// 否则 e2fsck 会认为 inode 尺寸应当扩大。
+    ///
+    /// 这一点是必须的：本实现没有"未写→已写"转换路径，若把有效数据区间
+    /// 内的块也标成 unwritten，之后写入会撞上
+    /// `extent_right_spine_projection` 的 ENOTSUP（sqlite 的
+    /// `posix_fallocate` 之后 pwrite 即为此）。
+    pub fn preallocate_range_batch_initialized(
+        &self,
+        id: InodeId,
+        offset: usize,
+        len: usize,
+        initialized_upto: usize,
+    ) -> Result<PreallocationProgress> {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
@@ -109,7 +132,10 @@ impl Ext4 {
         // Ext4 permits KEEP allocations beyond i_size as unwritten mappings.
         // Initialized mappings beyond EOF make e2fsck demand an enlarged size.
         let mut extent = Extent::new(logical, home, 1);
-        extent.mark_unwritten();
+        let block_end = (logical as usize + 1) * BLOCK_SIZE;
+        if block_end > initialized_upto {
+            extent.mark_unwritten();
+        }
         self.transaction_insert_allocated_extent(&mut transaction, &mut inode, &extent)?;
         self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
         self.finish_range_transaction(transaction)?;

@@ -3997,9 +3997,18 @@ impl LockedExt4Inode {
                     page.as_slice_mut()[size % MMArch::PAGE_SIZE..].fill(0);
                 }
             }
+            // 本次 fallocate 结束后属于文件有效数据的范围：grow（mode 0）
+            // 会把 EOF 扩到 end，KEEP_SIZE 则保持当前 size。该范围内的新块
+            // 已经在 crate 内写零，可按 written 发布；范围外必须保持
+            // unwritten（e2fsck 约束）。
+            let initialized_upto = if grow { end } else { size };
             let progress = fs.retry_metadata_contention(|| {
-                fs.fs
-                    .preallocate_range_batch(inode_num, offset, end - offset)
+                fs.fs.preallocate_range_batch_initialized(
+                    inode_num,
+                    offset,
+                    end - offset,
+                    initialized_upto,
+                )
             })?;
             if progress.next_offset <= offset || progress.next_offset > end {
                 return Err(SystemError::EIO);

@@ -9,7 +9,8 @@ let
   version = "0.1.0";
   # Pinned mirror of gitee.com/OpenCloudOS/ocm-agent. The `dragonos` branch
   # carries two portability fixes on top of the pristine upstream mirror.
-  # Keep this revision in sync with user/apps/ocm-agent/upstream.
+  # Keep this revision in sync with the DADK git source in
+  # user/dadk/config/all/ocm_agent.toml.
   upstream = fetchgit {
     url = "https://github.com/sparkzky/ocm-agent.git";
     rev = "d08b700e20243cee892ef67b975f89500f352c4b";

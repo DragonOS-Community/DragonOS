@@ -1,11 +1,11 @@
 # ocm-agent DragonOS 移植说明
 
-ocm-agent 源码**不保存在本仓库**，而是通过 git submodule 引用
+ocm-agent 源码**不保存在本仓库**。DADK 通过 git source 直接引用
 <https://github.com/sparkzky/ocm-agent>（上游为
 <https://gitee.com/OpenCloudOS/ocm-agent>），固定 commit
-`d08b700e20243cee892ef67b975f89500f352c4b`（`dragonos` 分支）。该分支的 `master`
-是上游的纯净镜像；`dragonos` 仅包含两个可移植性修复（见 §7）。本目录只保存
-DragonOS 的构建、打包、Nix 集成与测试文件。
+`d08b700e20243cee892ef67b975f89500f352c4b`（`dragonos` 分支）；Nix 用 `fetchgit`
+引用同一 revision。该分支的 `master` 是上游的纯净镜像；`dragonos` 仅包含两个
+可移植性修复（见 §7）。本目录只保存 DragonOS 的构建、打包、Nix 集成与测试文件。
 
 ## 1. 结论
 
@@ -48,17 +48,22 @@ CGO_ENABLED=1 CC=musl-gcc go build \
 ### 3.1 Make / DADK 流程
 
 ```bash
-# 首次检出后初始化子模块（DragonStub 同理）
-git submodule update --init user/apps/ocm-agent/upstream
+# 本地直接编译（可选）：把上游克隆到未跟踪的 upstream/
+make -C user/apps/ocm-agent fetch-src
 
-# 只编译本程序（从 upstream/ 构建）
+# 只编译本程序
 make -C user/apps/ocm-agent
 
 # 由 DADK 安装到 bin/sysroot/opt/ocm-agent/
+# DADK 会按 ocm_agent.toml 的 git source + revision 自动克隆
 make user
 ```
 
-子模块缺失时 Makefile 会打印明确的 `git submodule update --init` 提示并退出。
+本地源码缺失时 Makefile 会提示执行 `make -C user/apps/ocm-agent fetch-src`。
+
+DADK 首次构建会按 `source-path` 克隆到 `bin/dadk_cache/source/ocm_agent_0_1_0`。
+若宿主机访问 GitHub 受限，可预先准备同 commit 的本地镜像，或临时把
+`source-path` 指向本地裸仓库；`revision` 保证构建内容不变。
 
 DADK 配置：`user/dadk/config/all/ocm_agent.toml`，已链接进
 `sets/default` 与 `sets/ubuntu2404`。安装布局与上游一致：
@@ -88,10 +93,10 @@ make -C user/apps/ocm-agent install-plugins  # 安装到 $(INSTALL_DIR)/opt/ocm-
 `user/apps/ocm-agent/default.nix` 用 `fetchgit` 按 commit + NAR hash 拉取同一个
 GitHub 镜像，再交给 `pkgsStatic.buildGoModule`（`CGO_ENABLED=1`），并通过
 `user/apps/default.nix` 加入 x86_64 rootfs。模块依赖由 `vendorHash` 固定，构建过程
-不依赖宿主 Go，也不依赖本地的 submodule 工作区。
+不依赖宿主 Go，也不依赖本地源码缓存。
 
-升级上游时需要同时更新三处：mirror 分支、submodule gitlink、`default.nix` 里的
-`rev`/`hash`。
+升级上游时需要同时更新两处：`user/dadk/config/all/ocm_agent.toml` 的 `revision`
+（make/DADK 流程）和 `default.nix` 的 `rev`/`hash`（Nix 流程）。
 
 ## 4. 在 DragonOS 中运行
 
@@ -208,8 +213,10 @@ python3 user/apps/ocm-agent/scripts/dragonos-acceptance.py --duration 60
   `procfs/mod.rs`、`procfs/root.rs` 注册。注意该文件**不追加尾随 NUL**：gopsutil 的
   `ReadLines` 会把尾随 NUL 当成额外一行并报 `wrong uptime format`；
 - `user/apps/ocm-agent/`：`Makefile`、`default.nix`、端到端验收脚本与说明，不含上游源码；
-- `user/apps/ocm-agent/upstream`：指向 GitHub 镜像 `dragonos` 分支固定 commit 的 submodule；
-- `.gitmodules`：新增上述子模块条目；
+- `user/dadk/config/all/ocm_agent.toml`：`source = "git"`，
+  `source-path = "https://github.com/sparkzky/ocm-agent.git"`，
+  `revision = "d08b700..."`；构建命令通过 `DADK_SOURCE_CACHE_DIR_*` 使用 DADK
+  克隆的源码目录；
 - `user/apps/default.nix`：把 x86_64 的 ocm-agent 加入 Nix rootfs；
 - `user/dadk/config/all/ocm_agent.toml` 及 `sets/{default,ubuntu2404}` 软链接；
 - `user/apps/busybox/Makefile`：禁用 `tc` applet 并在追加配置后执行 `oldconfig`，
@@ -227,15 +234,14 @@ GitHub 镜像 `dragonos` 分支上的两个修复：
 ## 8. 更新上游
 
 ```bash
-# 1. 同步镜像的 dragonos 分支（在本地 upstream clone 中）
+# 1. 同步镜像的 dragonos 分支（在本地 clone 中）
 git push git@github.com:sparkzky/ocm-agent.git <new-commit>:dragonos
 
-# 2. 更新 DragonOS 侧 submodule
-git -C user/apps/ocm-agent/upstream fetch origin dragonos
-git -C user/apps/ocm-agent/upstream checkout <new-commit>
-git add user/apps/ocm-agent/upstream
+# 2. 更新 DADK 的 revision
+#    user/dadk/config/all/ocm_agent.toml -> revision = "<new-commit>"
 
 # 3. 更新 default.nix 的 rev，并用新源码树重算 hash
-git -C user/apps/ocm-agent/upstream archive HEAD | tar -x -C /tmp/ocm-clean
-nix hash path --type sha256 /tmp/ocm-clean
+git clone https://github.com/sparkzky/ocm-agent.git /tmp/ocm-upstream
+git -C /tmp/ocm-upstream checkout <new-commit>
+nix hash path --type sha256 /tmp/ocm-upstream
 ```

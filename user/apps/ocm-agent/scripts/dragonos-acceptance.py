@@ -79,9 +79,28 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+def ensure_source() -> Path:
+    """Return a source tree for direct builds (DADK cache or local clone)."""
+    local = APP_DIR / "upstream"
+    if (local / "go.mod").exists():
+        return local
+    cache = REPO_ROOT / "bin" / "dadk_cache" / "source" / "ocm_agent_0_1_0"
+    if (cache / "go.mod").exists():
+        return cache
+    log("upstream source missing; running make fetch-src")
+    r = run(["make", "-C", str(APP_DIR), "fetch-src"])
+    if r.returncode != 0:
+        raise SystemExit("failed to fetch upstream source (run `make user` with network access)")
+    return local
+
+
 def build_binaries() -> tuple[Path, Path]:
     log("building agent and gateway")
-    r = run(["make", "-C", str(APP_DIR), "all", "plugins"])
+    src = ensure_source()
+    r = run(
+        ["make", "-C", str(APP_DIR), "all", "plugins"],
+        env={**os.environ, "SRC_DIR": str(src)},
+    )
     if r.returncode != 0:
         raise SystemExit("agent/plugins build failed")
     agent = APP_DIR / "bin" / "ocm-agent"

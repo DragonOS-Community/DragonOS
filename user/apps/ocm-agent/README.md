@@ -6,12 +6,13 @@
 - GitHub 镜像（本仓库引用 `dragonos` 分支）：<https://github.com/sparkzky/ocm-agent>
   - `master`：上游 Gitee 的纯净镜像
   - `dragonos`：上游 + 两个 DragonOS 可移植性修复
-- 源码位置：`upstream/`（git submodule，固定在镜像仓库的一个 commit）
-
-首次检出后初始化子模块：
+- 源码获取：DADK 通过 git source 直接克隆镜像仓库的 `dragonos` 分支；
+  本地直接编译时先执行 `make -C user/apps/ocm-agent fetch-src`（克隆到
+  未跟踪的 `upstream/`）。
 
 ```bash
-git submodule update --init user/apps/ocm-agent/upstream
+make -C user/apps/ocm-agent fetch-src   # 仅本地直接编译需要
+make user                                # DADK 自动 git clone 到缓存
 ```
 
 - 移植说明、构建方式、冒烟测试和已知限制：[PORTING.md](./PORTING.md)

@@ -466,7 +466,10 @@ def main() -> int:
     if not IMAGE.exists():
         raise SystemExit(f"rootfs image missing: {IMAGE} (run `nix run .#rootfs-x86_64`)")
     if not args.binary.exists():
-        raise SystemExit(f"agent binary missing: {args.binary} (run `make -C user/apps/ocm-agent`)")
+        raise SystemExit(
+            f"agent binary missing: {args.binary} "
+            "(run `make -C user/apps/ocm-agent fetch-src all`)"
+        )
 
     TEST_DIR.mkdir(parents=True, exist_ok=True)
     port = args.port or free_port()

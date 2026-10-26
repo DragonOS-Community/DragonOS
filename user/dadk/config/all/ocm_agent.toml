@@ -19,13 +19,18 @@ type = "build-from-source"
 # 构建来源
 # "build_from_source" 可选值："git", "local", "archive"
 # "install_from_prebuilt" 可选值："local", "archive"
-source = "local"
-# 路径或URL
-source-path = "user/apps/ocm-agent"
+source = "git"
+# 上游仓库（DragonOS 修复在 dragonos 分支）
+source-path = "https://github.com/sparkzky/ocm-agent.git"
+# 固定到 dragonos 分支上的已验证 commit（与 default.nix 的 fetchgit 保持一致）
+# 注意：branch 和 revision 只能二选一；这里用 revision 保证可复现。
+# DADK 首次构建会克隆到 bin/dadk_cache/source/ocm_agent_0_1_0。
+revision = "d08b700e20243cee892ef67b975f89500f352c4b"
 # 构建相关信息
 [build]
-# （可选）构建命令
-build-command = "make install-dadk"
+# DADK 源码目录会由 DADK_SOURCE_CACHE_DIR_OCM_AGENT_0_1_0 导出；
+# 构建脚本仍在 DragonOS 仓库里，因此通过 ROOT_PATH 回到 app 目录。
+build-command = "make -C $ROOT_PATH/user/apps/ocm-agent install-dadk SRC_DIR=$DADK_SOURCE_CACHE_DIR_OCM_AGENT_0_1_0"
 # 安装相关信息
 [install]
 # （可选）安装到DragonOS的路径
@@ -34,4 +39,4 @@ in-dragonos-path = "/"
 # 清除相关信息
 [clean]
 # （可选）清除命令
-clean-command = "make clean"
+clean-command = "make -C $ROOT_PATH/user/apps/ocm-agent clean"

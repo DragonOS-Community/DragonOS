@@ -34,12 +34,12 @@
 ```text
 DragonOS 仓库
 ├── user/apps/ocm-agent/
-│   ├── Makefile                 ← 从 upstream/ 构建静态 agent 和插件
+│   ├── Makefile                 ← 从 DADK 缓存/本地 upstream 构建静态 agent 和插件
 │   ├── default.nix              ← Nix：fetchgit 固定 commit，pkgsStatic.buildGoModule
 │   ├── scripts/gateway/         ← 协议兼容 mock gateway（TLS/注册/ACK/大数据解码）
 │   ├── scripts/dragonos-acceptance.py
 │   ├── scripts/dragonos-smoke.py
-│   └── upstream/                ← git submodule
+│   └── upstream/                ← 本地直接编译时的源码（未跟踪，可选）
 ├── user/apps/default.nix        ← 把 ocm-agent 加入 Nix rootfs
 └── user/dadk/config/...         ← DADK 构建/安装配置
 ```
@@ -48,16 +48,16 @@ ocm-agent 源码**不在 DragonOS 仓库内**，通过两处引用同一个 GitH
 
 | 引用点 | 地址/版本 |
 |---|---|
-| git submodule `user/apps/ocm-agent/upstream` | `https://github.com/sparkzky/ocm-agent.git`，`branch = dragonos`，commit `d08b700e20243cee892ef67b975f89500f352c4b` |
+| DADK `user/dadk/config/all/ocm_agent.toml` | `source = "git"`，`source-path = "https://github.com/sparkzky/ocm-agent.git"`，`revision = d08b700e20243cee892ef67b975f89500f352c4b`（`dragonos` 分支） |
 | Nix `default.nix` | `fetchgit` 同一仓库，`rev = d08b700...`，`hash = sha256-84ybp...` |
 
+DADK 的 `build-command` 通过 `DADK_SOURCE_CACHE_DIR_OCM_AGENT_0_1_0` 使用它克隆的
+源码目录，因此不需要 submodule。本地直接 `make -C user/apps/ocm-agent` 时，先执行
+`make -C user/apps/ocm-agent fetch-src` 把源码克隆到未跟踪的 `upstream/`。
+
 镜像仓库的 `master` 是 Gitee 上游的纯净镜像；`dragonos` 分支包含两个可移植性修复（见 §7）。
-
-初始化：
-
-```bash
-git submodule update --init user/apps/ocm-agent/upstream
-```
+DADK 首次构建会克隆到 `bin/dadk_cache/source/ocm_agent_0_1_0`；本地直接编译则克隆到
+未跟踪的 `upstream/`。GitHub 访问受限时可预先准备同 commit 的源码缓存。
 
 > 当前备份分支不包含内核 `/proc/uptime` 和 busybox 构建修复（分别在
 > [PR #2565](https://github.com/DragonOS-Community/DragonOS/pull/2565) 和
@@ -298,7 +298,7 @@ NUL 当成额外一行并报 `wrong uptime format`。该修复见
 ## 9. 复现与参考
 
 ```bash
-git submodule update --init user/apps/ocm-agent/upstream
+make -C user/apps/ocm-agent fetch-src   # 本地直接编译需要；make user 由 DADK 自动克隆
 make kernel
 make -C user/apps/ocm-agent all plugins
 make user

@@ -2,9 +2,11 @@
 #
 # DragonOS build wrapper for ocm-agent.
 #
-# The upstream source is a git submodule pinned to
+# The upstream source is fetched from
 # https://github.com/sparkzky/ocm-agent.git (a mirror of
-# gitee.com/OpenCloudOS/ocm-agent). Nothing from upstream is vendored here.
+# gitee.com/OpenCloudOS/ocm-agent, `dragonos` branch). DADK clones it via the
+# git task source; for a direct local build run `make fetch-src` first.
+# Nothing from upstream is vendored here.
 #
 # Upstream builds a dynamically linked binary for a full Linux distribution.
 # DragonOS ships a minimal root filesystem without a system dynamic loader,
@@ -12,7 +14,9 @@
 # github.com/mattn/go-sqlite3 is used for the ongoing large-data store.
 
 APP      := ocm-agent
-SRC_DIR  := upstream
+SRC_DIR  ?= upstream
+SRC_URL  ?= https://github.com/sparkzky/ocm-agent.git
+SRC_REV  ?= d08b700e20243cee892ef67b975f89500f352c4b
 VERSION  ?= 0.1.0
 COMMIT   ?= $(shell git -C $(SRC_DIR) rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE     ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -49,16 +53,23 @@ else
 endif
 INSTALL_DIR := $(INSTALL_ROOT)/opt/ocm-agent
 
-.PHONY: all build check-upstream test vet plugins clean install install-dadk install-plugins
+.PHONY: all build check-upstream fetch-src test vet plugins clean install install-dadk install-plugins
 
 all: build
 
 check-upstream:
 	@test -f $(SRC_DIR)/go.mod || { \
-		echo "ERROR: upstream submodule is missing."; \
-		echo "Run: git submodule update --init user/apps/ocm-agent/upstream"; \
+		echo "ERROR: upstream source is missing: $(SRC_DIR)"; \
+		echo "Run: make -C user/apps/ocm-agent fetch-src"; \
 		exit 1; \
 	}
+
+fetch-src:
+	@if [ ! -d $(SRC_DIR)/.git ]; then \
+		git clone $(SRC_URL) $(SRC_DIR); \
+	fi
+	git -C $(SRC_DIR) fetch origin $(SRC_REV)
+	git -C $(SRC_DIR) checkout $(SRC_REV)
 
 build: check-upstream
 	@mkdir -p bin

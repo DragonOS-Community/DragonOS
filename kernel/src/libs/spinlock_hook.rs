@@ -21,7 +21,7 @@ pub fn set_hook(hook: fn(usize)) {
 pub fn run(lock_addr: usize) {
     let hook = HOOK.load(Ordering::Acquire);
     if hook != 0 {
-        // SAFETY: 只由 `set_hook` 写入合法的 `fn()` 指针，生命周期为进程全局。
+        // SAFETY: set_hook only stores a valid, process-lifetime fn(usize).
         let f: fn(usize) = unsafe { core::mem::transmute(hook) };
         f(lock_addr);
     }

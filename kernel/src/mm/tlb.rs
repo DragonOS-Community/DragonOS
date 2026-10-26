@@ -151,10 +151,8 @@ pub fn tlb_state_loaded_mm() -> Option<Arc<AddressSpace>> {
 
 /// Per-CPU CSD (Call Single Data) for synchronous ack during TLB shootdown.
 ///
-/// 无锁协议。曾经的 `SpinLock<Option<ptr>>` 在并发 `docker exec` 场景下出现过
-/// 目标 CPU handler 长时间自旋在同一把 `info` 锁、而没有任何正常临界区持锁者的
-/// 现场（`SPIN_LOCK_ADDR` 落在 CSD 堆区、831 万次争用、`TLB_CSD_HOLDER=0`），
-/// 说明锁字节的持有者不可归属（guard 泄漏或相邻内存越界）。这里直接去掉锁：
+/// Lock-free publication, claim and acknowledgement protocol. Receivers must
+/// remain on the target CPU with interrupts disabled through acknowledgement.
 ///
 /// - 发布方（持有 `FLUSH_TLB_GLOBAL_LOCK`，因此每个目标槽位同时只有一个请求）：
 ///   1. `done = false`（Release）：先清 ack，保证迟到的 handler 不会提前置位；
@@ -216,9 +214,26 @@ impl CsdFlushTlb {
     }
 
     /// 执行已取走的请求（调用方保证 `p` 在 `done` 置位前有效）。
-    fn complete(&self, p: *const FlushTlbInfo) {
+    fn complete(&self, p: *const FlushTlbInfo, from_spin: bool) {
         // SAFETY: 发起方栈帧在 `done=true` 之前一直有效（见协议说明）。
-        local_flush_tlb_func(unsafe { &*p });
+        let info = unsafe { &*p };
+        #[cfg(feature = "mm_selftest")]
+        if let Some(observer) = &info.observer {
+            observer.before_remote(info);
+        }
+        if from_spin {
+            // A contended lock can be inside the CR3/TlbState switch window.
+            // Flush hardware conservatively without reading or updating that
+            // partially published software state. If CR3 has not switched yet,
+            // the subsequent CR3 load also invalidates the incoming mm.
+            unsafe { MMArch::invalidate_all() };
+        } else {
+            local_flush_tlb_func(info);
+        }
+        #[cfg(feature = "mm_selftest")]
+        if let Some(observer) = &info.observer {
+            observer.after_remote();
+        }
         compiler_fence(Ordering::SeqCst);
         self.done.store(true, Ordering::Release);
     }
@@ -242,10 +257,14 @@ static FLUSH_TLB_GLOBAL_LOCK: SpinLock<()> = SpinLock::new(());
 ///
 /// 死锁场景：CPU A 持 `FLUSH_TLB_GLOBAL_LOCK` 并等待本 CPU 的 ack，而本 CPU 正
 /// 在关中断上下文里自旋争用同一把锁——IPI 无法送达，双方互等。
-/// 这里按 IPI handler 的同一流程就地执行 `local_flush_tlb_func` 并置 `done`，
-/// 使持锁方可以继续，从而打破互等。与 IPI handler 并发执行是幂等的。
+/// Claim and acknowledge using the IPI protocol, but invalidate hardware in
+/// full without accessing CPU-local mm state that the caller may be switching.
 #[cfg(target_arch = "x86_64")]
 fn service_pending_inbound_flush() {
+    // SpinLock's failed try-lock restores IRQ/preemption state before calling
+    // the hook. Pin execution from CPU selection through flush and ack, just
+    // as the IPI handler does, including when called with IRQs initially on.
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     if !crate::smp::cpu::smp_cpu_manager_initialized() {
         return;
     }
@@ -259,7 +278,7 @@ fn service_pending_inbound_flush() {
     // 取走-执行-ack 之间不再持有任何锁，因此也不会与本 CPU 的 IPI handler
     // 形成「handler 自旋等待被它打断的持锁者」的自死锁。
     if let Some(info_ptr) = csd.take() {
-        csd.complete(info_ptr);
+        csd.complete(info_ptr, true);
     }
 }
 
@@ -275,18 +294,11 @@ fn acquire_flush_tlb_lock() -> SpinLockGuard<'static, ()> {
     }
 }
 
-/// 给 `SpinLock` 争用循环用的入口，带递归保护。
-///
-/// service 内部会取 CSD 的 `info` 自旋锁；若该锁争用，其等待循环又会调用本
-/// 入口，需直接返回，避免无限递归。
+/// SpinLock contention entry. The service path neither allocates nor takes
+/// locks; the atomic claim and IRQ exclusion require no global recursion gate.
 #[cfg(target_arch = "x86_64")]
 pub fn try_service_inbound_flush_from_spin(_locked_spin: usize) {
-    static IN_SERVICE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if IN_SERVICE.swap(true, Ordering::AcqRel) {
-        return;
-    }
     service_pending_inbound_flush();
-    IN_SERVICE.store(false, Ordering::Release);
 }
 
 /// Initialize this module. Must be called after `PerCpu::init()`.
@@ -430,33 +442,13 @@ pub fn local_flush_tlb_func(info: &FlushTlbInfo) {
 pub fn remote_flush_tlb_on_ipi() {
     #[cfg(target_arch = "x86_64")]
     {
+        // Hardware interrupts cannot interrupt the IRQ-off mm switch window.
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let cpu = smp_get_processor_id();
         let csd = unsafe { csd_flush_tlb().force_get(cpu) };
-        // `done=true` 表示没有待完成请求（迟到的 IPI）；`take()` 为空同理
-        // （指针已被服务路径取走）。
-        if csd.done.load(Ordering::Acquire) {
-            return;
+        if let Some(info_ptr) = csd.take() {
+            csd.complete(info_ptr, false);
         }
-        let Some(info_ptr) = csd.take() else {
-            return;
-        };
-
-        // SAFETY: the initiator's stack frame remains valid throughout the polling window in `flush_tlb_multi`;
-        // it will not be freed before done=true.
-        let info = unsafe { &*info_ptr };
-
-        #[cfg(feature = "mm_selftest")]
-        if let Some(observer) = &info.observer {
-            observer.before_remote(info);
-        }
-        local_flush_tlb_func(info);
-        #[cfg(feature = "mm_selftest")]
-        if let Some(observer) = &info.observer {
-            observer.after_remote();
-        }
-
-        compiler_fence(Ordering::SeqCst);
-        csd.done.store(true, Ordering::Release);
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -586,22 +578,12 @@ pub fn flush_tlb_mm_range(
     stride_shift: u8,
     freed_tables: bool,
 ) {
-    // Serialize before disabling local interrupts. If a CPU spins for the
-    // shootdown CSD slots with IRQs disabled, it cannot service another CPU's
-    // TLB IPI, and two concurrent flush initiators can deadlock.
-    #[cfg(target_arch = "x86_64")]
-    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-    }
+    // Keep the caller's IRQ state throughout lock contention and initiation.
+    // Waiting CPUs explicitly service inbound requests without enabling IRQs
+    // inside an unrelated caller-owned critical section.
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = acquire_flush_tlb_lock();
-
-    // Disable interrupts to protect the entire initiation process:
-    // - Prevent migration during inc_tlb_gen and snapshot of active_cpus;
-    // - Prevent being scheduled out while waiting for IPI ack.
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
     // Publish barrier: ensure page table writes are visible to other CPUs before the generation increment.
     compiler_fence(Ordering::SeqCst);
@@ -653,12 +635,6 @@ pub fn flush_tlb_mm_range(
         observer.flush_returned();
     }
     compiler_fence(Ordering::SeqCst);
-    drop(irq_guard);
-
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_disable() };
-    }
 }
 
 /// Synchronously invalidate a kernel address-space range on every online CPU.
@@ -695,16 +671,10 @@ fn flush_tlb_kernel_range_inner(
         Arc<selftest::Observer>,
     >,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    let irq_was_enabled = CurrentIrqArch::is_irq_enabled();
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_enable() };
-    }
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     #[cfg(target_arch = "x86_64")]
     let _flush_guard = acquire_flush_tlb_lock();
 
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     compiler_fence(Ordering::SeqCst);
     let this_cpu = smp_get_processor_id();
     let info = FlushTlbInfo {
@@ -733,12 +703,6 @@ fn flush_tlb_kernel_range_inner(
         observer.flush_returned();
     }
     compiler_fence(Ordering::SeqCst);
-    drop(irq_guard);
-
-    #[cfg(target_arch = "x86_64")]
-    if !irq_was_enabled {
-        unsafe { CurrentIrqArch::interrupt_disable() };
-    }
 }
 
 /// Convenience wrapper for full-mm flush

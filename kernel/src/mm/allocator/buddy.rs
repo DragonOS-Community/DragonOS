@@ -48,7 +48,7 @@ use free_index::FreeIndex;
 mod recovery;
 use placement::{PlacementMap, BLOCK_ORDER, LOW_ORDERS};
 mod reporting;
-pub(crate) use recovery::{DmaAllocationFailure, DmaRecoveryZone};
+pub(crate) use recovery::{CompactionSnapshot, DmaAllocationFailure, DmaRecoveryZone};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuddyZone {

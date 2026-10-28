@@ -3,7 +3,7 @@
 //! The caller supplies the allocation evidence and a sleepable lock context.
 //! This owner supplies only bounded candidate discovery and persistent backoff;
 //! it never changes the ordinary heap/frame allocator's failure policy.
-use super::{CompactedFrames, Compactor, Limits, Request, Stop, MAX_COMPACT_ORDER};
+use super::{CompactedFrames, Compactor, Limits, Request, Stats, Stop, MAX_COMPACT_ORDER};
 use crate::{
     arch::{mm::LockedFrameAllocator, CurrentIrqArch, MMArch},
     cgroup::memory::io::noio_active,
@@ -117,15 +117,75 @@ impl Service {
         zone: DmaRecoveryZone,
         deadline: Option<u64>,
     ) -> Result<CompactedFrames, ServiceError> {
+        let (request, cursor_before) = self.prepare_request(order, max, zone, deadline)?;
+        let attempt = self.compactor.allocate(request);
+        #[cfg(feature = "mm_selftest")]
+        {
+            self.last_moved = attempt.stats.moved;
+        }
+        // Deferred work did not consume the candidate. Preserve its position
+        // rather than skipping it in lockstep with exponential backoff.
+        if matches!(&attempt.outcome, Err(Stop::Deferred)) {
+            self.cursor = cursor_before;
+        }
+        let run = attempt.outcome?;
+        let level = crate::mm::allocator::reserve::kernel_level();
+        if !LockedFrameAllocator::with_buddy(|buddy| {
+            buddy.held_handoff_allowed(run.start(), level)
+                && (!matches!(zone, DmaRecoveryZone::Dma32Fallback)
+                    || buddy.dma32_fallback_allowed(0))
+        })
+        .unwrap_or(false)
+        {
+            drop(run);
+            return Err(Stop::Busy.into());
+        }
+        Ok(run)
+    }
+
+    /// Reuse bounded discovery and migration for an independently authorized
+    /// inventory refill. The worker must establish fresh mask capacity and
+    /// watermark headroom; this service neither reserves nor hands off a run.
+    pub(super) fn replenish(
+        &mut self,
+        order: usize,
+        max: PhysAddr,
+        zone: DmaRecoveryZone,
+        deadline: Option<u64>,
+    ) -> Result<Stats, ServiceError> {
+        let (request, cursor_before) = self.prepare_request(order, max, zone, deadline)?;
+        let attempt = self.compactor.replenish(request);
+        #[cfg(feature = "mm_selftest")]
+        {
+            self.last_moved = attempt.stats.moved;
+        }
+        if matches!(&attempt.outcome, Err(Stop::Deferred)) {
+            self.cursor = cursor_before;
+        }
+        attempt.outcome?;
+        Ok(attempt.stats)
+    }
+
+    fn prepare_request(
+        &mut self,
+        order: usize,
+        max: PhysAddr,
+        zone: DmaRecoveryZone,
+        deadline: Option<u64>,
+    ) -> Result<(Request, usize), ServiceError> {
         #[cfg(feature = "mm_selftest")]
         {
             self.last_moved = 0;
         }
+        if order == 0 || order > MAX_COMPACT_ORDER {
+            return Err(Stop::Invalid.into());
+        }
         if deadline.is_some_and(|until| crate::time::timer::clock() >= until) {
             return Err(Stop::Timeout.into());
         }
-        // The same failed buddy attempt proved capacity in this one zone.
-        // Do not spend its evidence on a different, capacity-starved domain.
+        // Allocate is called with the same failed attempt's one-zone proof.
+        // Replenish uses the worker's fresh one-zone inventory/capacity proof.
+        // Neither spends evidence on a different, capacity-starved domain.
         let normal = matches!(zone, DmaRecoveryZone::Normal);
         let minimum = PhysAddr::new(if normal { DMA32_END } else { 0 });
         let maximum = if normal {
@@ -142,35 +202,9 @@ impl Service {
         let Some(physical) = physical else {
             return Err(ServiceError::discovery_miss(cursor_before, self.cursor));
         };
-        if let Some(mut request) = candidate_request(physical, order, max, normal) {
-            // Deferred work did not consume this candidate. Keep its discovery
-            // position so the next real attempt cannot skip it in lockstep with
-            // the domain's exponential backoff.
-            request.deadline = deadline;
-            let attempt = self.compactor.allocate(request);
-            #[cfg(feature = "mm_selftest")]
-            {
-                self.last_moved = attempt.stats.moved;
-            }
-            let outcome = attempt.outcome;
-            if matches!(&outcome, Err(Stop::Deferred)) {
-                self.cursor = cursor_before;
-            }
-            let run = outcome?;
-            let level = crate::mm::allocator::reserve::kernel_level();
-            if !LockedFrameAllocator::with_buddy(|buddy| {
-                buddy.held_handoff_allowed(run.start(), level)
-                    && (!matches!(zone, DmaRecoveryZone::Dma32Fallback)
-                        || buddy.dma32_fallback_allowed(0))
-            })
-            .unwrap_or(false)
-            {
-                drop(run);
-                return Err(Stop::Busy.into());
-            }
-            return Ok(run);
-        }
-        Err(Stop::Blocked.into())
+        let mut request = candidate_request(physical, order, max, normal).ok_or(Stop::Blocked)?;
+        request.deadline = deadline;
+        Ok((request, cursor_before))
     }
 }
 

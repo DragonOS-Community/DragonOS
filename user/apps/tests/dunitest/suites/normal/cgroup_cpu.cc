@@ -632,6 +632,128 @@ TEST_F(CgroupCpuTest, DisabledChildAndRootKeepBasicAccountingAfterRemoval) {
   EXPECT_GE(Usage(node_), ancestor_after);
 }
 
+// A normal read sleeper, not SIGSTOP: the observer runs on the same CPU,
+// so observing S after READY also follows an actual switch away from the child.
+TEST_F(CgroupCpuTest, BlockedSameCpuTaskUsesNewCpuCssOnWake) {
+  ASSERT_EQ(0, Write(node_ + "/cgroup.subtree_control", "+cpu"));
+  const std::string source = NewChild("blocked-source");
+  const std::string target = NewChild("blocked-target");
+  ASSERT_FALSE(source.empty()); ASSERT_FALSE(target.empty());
+  ASSERT_EQ(0, Write(target + "/cpu.max", "25000 100000"));
+  ASSERT_EQ("25000 100000\n", Read(target + "/cpu.max"));
+  const int cpu = OneCpu(); ASSERT_GE(cpu, 0);
+  cpu_set_t original;
+  ASSERT_EQ(0, sched_getaffinity(0, sizeof(original), &original));
+  struct RestoreAffinity {
+    cpu_set_t mask;
+    ~RestoreAffinity() {
+      EXPECT_EQ(0, sched_setaffinity(0, sizeof(mask), &mask));
+    }
+  } restore{original};
+  cpu_set_t singleton;
+  CPU_ZERO(&singleton); CPU_SET(cpu, &singleton);
+  ASSERT_EQ(0, sched_setaffinity(0, sizeof(singleton), &singleton));
+  struct Pipes {
+    int gate[2]{-1, -1};
+    int result[2]{-1, -1};
+    static void Close(int& fd) {
+      if (fd >= 0) { close(fd); fd = -1; }
+    }
+    ~Pipes() {
+      Close(gate[0]); Close(gate[1]); Close(result[0]); Close(result[1]);
+    }
+  } pipes;
+  ASSERT_EQ(0, pipe(pipes.gate));
+  ASSERT_EQ(0, pipe(pipes.result));
+  ASSERT_LE(child_, 0);
+  child_ = fork();
+  ASSERT_GE(child_, 0);
+  if (child_ == 0) {
+    Pipes::Close(pipes.gate[1]); Pipes::Close(pipes.result[0]);
+    if (signal(SIGALRM, SIG_DFL) == SIG_ERR) _exit(2);
+    alarm(10);
+    if (sched_setaffinity(0, sizeof(singleton), &singleton) != 0) _exit(2);
+    if (write(pipes.result[1], "R", 1) != 1) _exit(3);
+    // Parent is the only writer. EOF releases the read, avoiding a parent
+    // write/SIGPIPE race when an assertion or the child safety alarm wins.
+    char token;
+    ssize_t count;
+    do { count = read(pipes.gate[0], &token, 1); } while (count < 0 && errno == EINTR);
+    if (count != 0) _exit(3);
+    Pipes::Close(pipes.gate[0]);
+    auto checked_clock = [](clockid_t id) {
+      timespec value{};
+      if (clock_gettime(id, &value) != 0) _exit(4);
+      return uint64_t(value.tv_sec) * 1000000000ULL + value.tv_nsec;
+    };
+    const uint64_t start_wall = checked_clock(CLOCK_MONOTONIC);
+    const uint64_t start_cpu = checked_clock(CLOCK_THREAD_CPUTIME_ID);
+    volatile unsigned long work = 0;
+    uint64_t used_cpu;
+    do {
+      for (unsigned i = 0; i < 10000; ++i) work = work * 33 + i;
+      if (checked_clock(CLOCK_MONOTONIC) - start_wall >= 5000000000ULL) _exit(4);
+      used_cpu = checked_clock(CLOCK_THREAD_CPUTIME_ID) - start_cpu;
+    } while (used_cpu < 32000000ULL);
+    const Sample sample{used_cpu, checked_clock(CLOCK_MONOTONIC) - start_wall};
+    count = write(pipes.result[1], &sample, sizeof(sample));
+    _exit(count == static_cast<ssize_t>(sizeof(sample)) ? 0 : 5);
+  }
+  Pipes::Close(pipes.gate[0]); Pipes::Close(pipes.result[1]);
+  ASSERT_EQ(0, Write(source + "/cgroup.procs", std::to_string(child_)));
+  auto readable = [&]() {
+    const uint64_t end = Clock(CLOCK_MONOTONIC) + 5000000000ULL;
+    for (unsigned attempt = 0; attempt < 100 && Clock(CLOCK_MONOTONIC) < end; ++attempt) {
+      pollfd descriptor{pipes.result[0], POLLIN, 0};
+      const int count = poll(&descriptor, 1, 50);
+      if (count > 0) return (descriptor.revents & POLLIN) != 0;
+      if (count < 0 && errno != EINTR) return false;
+    }
+    return false;
+  };
+  ASSERT_TRUE(readable());
+  char ready;
+  ASSERT_EQ(1, read(pipes.result[0], &ready, 1));
+  ASSERT_EQ('R', ready);
+  const std::string stat_path = "/proc/" + std::to_string(child_) + "/stat";
+  bool sleeping = false;
+  const uint64_t sleep_deadline = Clock(CLOCK_MONOTONIC) + 2000000000ULL;
+  for (unsigned attempt = 0; attempt < 2000 && Clock(CLOCK_MONOTONIC) < sleep_deadline; ++attempt) {
+    const std::string state = Read(stat_path);
+    const size_t end = state.rfind(')');
+    if (end != std::string::npos && end + 2 < state.size() &&
+        state[end + 1] == ' ' && state[end + 2] == 'S') {
+      sleeping = true;
+      break;
+    }
+    usleep(1000);
+  }
+  ASSERT_TRUE(sleeping) << "child never blocked after READY on the shared CPU";
+  cpu_set_t observed;
+  ASSERT_EQ(0, sched_getaffinity(child_, sizeof(observed), &observed));
+  ASSERT_EQ(1, CPU_COUNT(&observed)); ASSERT_TRUE(CPU_ISSET(cpu, &observed));
+  const uint64_t source_before = Usage(source);
+  ASSERT_NE(UINT64_MAX, source_before);
+  ASSERT_EQ(0, Write(target + "/cgroup.procs", std::to_string(child_)));
+  const uint64_t target_before = Usage(target);
+  ASSERT_NE(UINT64_MAX, target_before);
+  Pipes::Close(pipes.gate[1]);
+  ASSERT_TRUE(readable());
+  Sample sample{};
+  ASSERT_EQ(static_cast<ssize_t>(sizeof(sample)), read(pipes.result[0], &sample, sizeof(sample)));
+  int status = 0;
+  ASSERT_TRUE(ReapChild(&status));
+  ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(0, WEXITSTATUS(status));
+  ASSERT_GE(sample.cpu_ns, 32000000ULL);
+  ASSERT_GT(sample.wall_ns, 0U);
+  EXPECT_EQ(source_before, Usage(source));
+  const uint64_t target_after = Usage(target);
+  ASSERT_NE(UINT64_MAX, target_after); ASSERT_GE(target_after, target_before);
+  EXPECT_GT(target_after - target_before, sample.cpu_ns / 2000);
+  // Quota enforcement has independent tests: host descheduling can spread
+  // this short work across periods without nr_throttled ever increasing.
+}
+
 TEST_F(CgroupCpuTest, DisabledAndMigratedSleepingTaskUsesNewCpuCssOnWake) {
   ASSERT_EQ(0, Write(node_ + "/cgroup.subtree_control", "+cpu"));
   const std::string source = NewChild("sleep-source"), target = NewChild("sleep-target");

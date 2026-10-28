@@ -12,7 +12,11 @@ mod queue;
 use queue::{DeadlineQueue, Node};
 use system_error::SystemError;
 
-use super::{clocksource::HZ, tick_common::tick_handle_periodic, timekeeping};
+use super::{
+    clocksource::HZ,
+    tick_common::{tick_handle_global, tick_handle_periodic},
+    timekeeping,
+};
 use crate::{
     arch::{interrupt::TrapFrame, CurrentIrqArch},
     exception::InterruptArch,
@@ -23,6 +27,11 @@ use crate::{
 
 const TICK_NS: u64 = 1_000_000_000 / HZ;
 const MAX_CALLBACKS: usize = 32;
+// Regression-only count of ready-queue programming attempts, including fallback.
+// Ordinary kernels have no counter or accounting on this path.
+#[cfg(feature = "mm_selftest")]
+static PROGRAM_ATTEMPTS: [core::sync::atomic::AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
 static CONTINUOUS: AtomicBool = AtomicBool::new(false);
 static CAPABLE: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
     [const { AtomicBool::new(false) }; PerCpu::MAX_CPU_NUM as usize];
@@ -47,6 +56,13 @@ impl Queue {
             next_tick: 0,
             pending: DeadlineQueue::new(),
         }
+    }
+
+    /// The periodic tick shares the clockevent with queued deadlines.
+    fn next_deadline(&self) -> u64 {
+        self.pending
+            .first_key()
+            .map_or(self.next_tick, |key| key.0.min(self.next_tick))
     }
 }
 
@@ -107,6 +123,8 @@ impl DeadlineEvent {
         if !queue.ready {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
+        let previous_deadline = queue.next_deadline();
+        let local = self.owner == smp_get_processor_id();
         let mut state = self.state.lock_irqsave();
         let mut node = if let Some(key) = state.queued.take() {
             queue
@@ -129,12 +147,17 @@ impl DeadlineEvent {
         }
         queue.pending.insert(node);
         state.queued = Some(key);
-        if self.owner == smp_get_processor_id() {
+        let reprogram = previous_deadline != queue.next_deadline();
+        if reprogram && local {
             program_locked(&queue);
         }
         drop(state);
         drop(queue);
-        kick_owner(self.owner);
+        // Unlocking can permit migration. Use the remote decision made while
+        // pinned by the owner queue guard, even if we now run on the owner.
+        if reprogram && !local {
+            notify_owner(self.owner);
+        }
         Ok(())
     }
 
@@ -145,6 +168,8 @@ impl DeadlineEvent {
             return;
         };
         let mut queue = owner_queue.lock_irqsave();
+        let previous_deadline = queue.next_deadline();
+        let local = self.owner == smp_get_processor_id();
         let mut state = self.state.lock_irqsave();
         state.generation = state.generation.wrapping_add(1);
         let Some(key) = state.queued.take() else {
@@ -157,13 +182,16 @@ impl DeadlineEvent {
         let retired = node.pending.take();
         assert!(state.spare.is_none());
         state.spare = Some(node);
-        if self.owner == smp_get_processor_id() {
+        let reprogram = previous_deadline != queue.next_deadline();
+        if reprogram && local {
             program_locked(&queue);
         }
         drop(state);
         drop(queue);
         drop(retired);
-        kick_owner(self.owner);
+        if reprogram && !local {
+            notify_owner(self.owner);
+        }
     }
 }
 
@@ -203,6 +231,8 @@ pub(crate) fn all_online_supported() -> bool {
 /// Called after dropping the timekeeper write lock. An event deadline must
 /// never be driven by jiffies itself: that would stop the tick which advances it.
 pub(crate) fn clocksource_changed(continuous: bool) {
+    // Keep skip-self notifications and the final local reprogram on one CPU.
+    let _pin = crate::process::preempt::PreemptGuard::new();
     CONTINUOUS.store(continuous, Ordering::Release);
     for (index, slot) in QUEUES.iter().enumerate() {
         let ready = slot.lock_irqsave().ready;
@@ -222,6 +252,7 @@ pub fn init_local() {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
     let capable = false;
     CAPABLE[cpu.data() as usize].store(capable, Ordering::Release);
+    timekeeping::init_jiffies_tick();
     let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
     queue.next_tick = now_ns().saturating_add(TICK_NS);
     queue.ready = true;
@@ -239,6 +270,8 @@ fn program_locked(queue: &Queue) {
     if !queue.ready {
         return;
     }
+    #[cfg(feature = "mm_selftest")]
+    PROGRAM_ATTEMPTS[smp_get_processor_id().data() as usize].fetch_add(1, Ordering::Relaxed);
     if !supported() {
         #[cfg(target_arch = "x86_64")]
         crate::arch::driver::apic::apic_timer::restore_periodic();
@@ -246,10 +279,7 @@ fn program_locked(queue: &Queue) {
         crate::driver::clocksource::timer_riscv::program_deadline_delta(TICK_NS);
         return;
     }
-    let next = queue
-        .pending
-        .first_key()
-        .map_or(queue.next_tick, |key| key.0.min(queue.next_tick));
+    let next = queue.next_deadline();
     let delta = next.saturating_sub(now_ns()).max(1);
     #[cfg(target_arch = "x86_64")]
     crate::arch::driver::apic::apic_timer::program_deadline_delta(delta);
@@ -257,10 +287,17 @@ fn program_locked(queue: &Queue) {
     crate::driver::clocksource::timer_riscv::program_deadline_delta(delta);
 }
 
+/// Caller must be pinned through its subsequent local reprogram.
 fn kick_owner(owner: ProcessorId) {
-    if owner == smp_get_processor_id() {
-        return;
+    if owner != smp_get_processor_id() {
+        notify_owner(owner);
     }
+}
+
+/// Do not recheck the caller CPU: a remote producer can migrate after unlock.
+fn notify_owner(owner: ProcessorId) {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = owner;
     #[cfg(target_arch = "x86_64")]
     crate::arch::interrupt::ipi::send_ipi(
         crate::exception::ipi::IpiKind::SpecVector(crate::exception::HardwareIrqNumber::new(205)),
@@ -288,6 +325,7 @@ pub fn handle_irq(frame: &TrapFrame) {
             false
         }
     };
+    tick_handle_global(tick);
     if tick {
         tick_handle_periodic(frame);
     }
@@ -365,6 +403,8 @@ fn finish_callback(event: &Arc<DeadlineEvent>, generation: u64, now: u64) {
 /// Production generation and queue primitives, without changing interrupt
 /// delivery or relying on a userspace test syscall.
 pub fn run_selftests() {
+    #[cfg(feature = "mm_selftest")]
+    deadline_queue_selftest();
     use alloc::sync::Weak;
     use core::sync::atomic::AtomicU64;
     #[derive(Debug)]
@@ -399,6 +439,8 @@ pub fn run_selftests() {
         let event = DeadlineEvent::new(smp_get_processor_id(), probe.clone());
         *probe.event.lock_irqsave() = Arc::downgrade(&event);
         let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        #[cfg(feature = "mm_selftest")]
+        nonhead_reprogram_selftest(&event);
         let node_identity = state_spare_identity(&event);
         let now = now_ns();
         let deadline = now.saturating_add(TICK_NS);
@@ -494,6 +536,209 @@ pub fn run_selftests() {
         reprogram_local();
         drop(irq);
     }
+}
+
+/// Tests the public remote-owner contract, not IPI ordering or exact latency.
+/// Keep this separate from run_selftests(), whose local tests pin their caller.
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) fn run_remote_owner_selftest() -> Option<bool> {
+    use crate::{
+        process::{
+            kthread::{KernelThreadClosure, KernelThreadMechanism},
+            preempt::PreemptGuard,
+            ProcessManager,
+        },
+        sched::completion::Completion,
+        smp::cpu::{smp_cpu_manager, smp_cpu_manager_initialized},
+    };
+    use alloc::string::ToString;
+    use core::sync::atomic::{AtomicU64, AtomicUsize};
+
+    #[derive(Debug)]
+    struct ResultState {
+        callback_done: Completion,
+        worker_done: Completion,
+        abort: AtomicBool,
+        calls: AtomicUsize,
+        cpu: AtomicUsize,
+        when: AtomicU64,
+    }
+    // No event/PCB reference: late callbacks retain only their own result data.
+    impl DeadlineCallback for ResultState {
+        fn expire(&self, now: u64) -> Option<u64> {
+            self.cpu
+                .store(smp_get_processor_id().data() as usize, Ordering::Relaxed);
+            self.when.store(now, Ordering::Relaxed);
+            self.calls.fetch_add(1, Ordering::Release);
+            self.callback_done.complete();
+            None
+        }
+    }
+
+    fn exercise(event: &Arc<DeadlineEvent>, result: &ResultState, producer: ProcessorId) -> bool {
+        if smp_get_processor_id() != producer
+            || producer == event.owner
+            || result.abort.load(Ordering::Acquire)
+            || KernelThreadMechanism::should_stop(&ProcessManager::current_pcb())
+        {
+            return false;
+        }
+        {
+            let _pin = PreemptGuard::new();
+            let generation = event.state.lock_irqsave().generation;
+            if event.arm(u64::MAX - 2).is_err() || event.arm(u64::MAX - 1).is_err() {
+                return false;
+            }
+            event.cancel();
+            let state = event.state.lock_irqsave();
+            if state.queued.is_some()
+                || state.generation != generation.wrapping_add(3)
+                || result.calls.load(Ordering::Acquire) != 0
+            {
+                return false;
+            }
+        }
+        for expected in 1..=2 {
+            if result.abort.load(Ordering::Acquire)
+                || KernelThreadMechanism::should_stop(&ProcessManager::current_pcb())
+            {
+                return false;
+            }
+            let deadline = {
+                let _pin = PreemptGuard::new();
+                if smp_get_processor_id() != producer {
+                    return false;
+                }
+                let deadline = now_ns().saturating_add(100_000);
+                if event.arm(deadline).is_err() {
+                    return false;
+                }
+                deadline
+            };
+            // No pin or queue/rq lock may span this sleep.
+            if !matches!(result.callback_done.wait_for_completion_timeout(HZ as i64), Ok(left) if left > 0)
+                || result.abort.load(Ordering::Acquire)
+                || result.calls.load(Ordering::Acquire) != expected
+                || result.cpu.load(Ordering::Relaxed) != event.owner.data() as usize
+                || result.when.load(Ordering::Relaxed) < deadline
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    if !smp_cpu_manager_initialized() || !all_online_supported() {
+        return None;
+    }
+    let online = smp_cpu_manager().online_cpus();
+    let mut cpus = online.iter_cpu();
+    let owner = cpus.next()?;
+    let producer = cpus.next()?;
+    if !CurrentIrqArch::is_irq_enabled() || ProcessManager::current_pcb().preempt_count() != 0 {
+        return Some(false);
+    }
+    let Ok(result) = Arc::try_new(ResultState {
+        callback_done: Completion::new(),
+        worker_done: Completion::new(),
+        abort: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+        cpu: AtomicUsize::new(usize::MAX),
+        when: AtomicU64::new(0),
+    }) else {
+        return Some(false);
+    };
+    let Ok(event) = DeadlineEvent::try_new(owner, result.clone()) else {
+        return Some(false);
+    };
+    let worker_event = event.clone();
+    let worker_result = result.clone();
+    let Ok(closure) = Box::try_new(move || {
+        let ok = exercise(&worker_event, &worker_result, producer);
+        worker_result.worker_done.complete();
+        if ok {
+            0
+        } else {
+            1
+        }
+    }) else {
+        return Some(false);
+    };
+    let Some(worker) = KernelThreadMechanism::create_on_cpu(
+        KernelThreadClosure::EmptyClosure((closure, ())),
+        "deadline-remote-selftest".to_string(),
+        producer,
+    ) else {
+        return Some(false);
+    };
+    let completed = ProcessManager::wakeup(&worker).is_ok()
+        && matches!(result.worker_done.wait_for_completion_timeout((5 * HZ) as i64), Ok(left) if left > 0);
+    // Stop cannot release a private completion wait by itself. Wake that wait
+    // first, join every created producer, then cancel its final possible arm.
+    result.abort.store(true, Ordering::Release);
+    result.callback_done.complete_all();
+    let stopped = KernelThreadMechanism::stop(&worker);
+    event.cancel();
+    Some(completed && stopped == Ok(0) && result.calls.load(Ordering::Acquire) == 2)
+}
+
+#[cfg(feature = "mm_selftest")]
+fn deadline_queue_selftest() {
+    fn insert(queue: &mut Queue, deadline: u64, id: usize) {
+        let mut node = Node::try_new().expect("deadline fixture allocation");
+        node.key = (deadline, id);
+        queue.pending.insert(node);
+    }
+    let mut queue = Queue::new();
+    queue.next_tick = 100;
+    assert_eq!(queue.next_deadline(), 100);
+    insert(&mut queue, 200, 1);
+    assert_eq!(queue.next_deadline(), 100);
+    insert(&mut queue, 50, 2);
+    assert_eq!(queue.next_deadline(), 50);
+    let mut node = queue.pending.remove(&(50, 2)).unwrap();
+    node.key = (150, 2);
+    queue.pending.insert(node);
+    assert_eq!(queue.next_deadline(), 100);
+    queue.pending.remove(&(150, 2)).unwrap();
+    insert(&mut queue, 50, 2);
+    insert(&mut queue, 50, 3);
+    queue.pending.remove(&(50, 2)).unwrap();
+    assert_eq!(queue.next_deadline(), 50);
+    queue.pending.remove(&(50, 3)).unwrap();
+    assert_eq!(queue.next_deadline(), 100);
+    insert(&mut queue, 100, 4);
+    assert_eq!(queue.next_deadline(), 100);
+    queue.pending.remove(&(100, 4)).unwrap();
+    assert_eq!(queue.next_deadline(), 100);
+    queue.pending.remove(&(200, 1)).unwrap();
+    assert_eq!(queue.next_deadline(), 100);
+}
+
+/// Reuse the prepared event: this IRQ-off interval performs no allocation.
+/// Remote producers may change pending work, but cannot change our next_tick or
+/// execute this CPU's programming/IPI path until IRQs are restored. Both far
+/// deadlines remain after next_tick regardless of any remote pending events.
+#[cfg(feature = "mm_selftest")]
+fn nonhead_reprogram_selftest(event: &Arc<DeadlineEvent>) {
+    assert!(!CurrentIrqArch::is_irq_enabled());
+    let cpu = smp_get_processor_id();
+    assert_eq!(event.owner, cpu);
+    let next_tick = QUEUES[cpu.data() as usize].lock_irqsave().next_tick;
+    assert!(next_tick < u64::MAX - 2);
+    let attempts = &PROGRAM_ATTEMPTS[cpu.data() as usize];
+    let before = attempts.load(Ordering::Relaxed);
+    event.arm(u64::MAX - 2).unwrap();
+    event.arm(u64::MAX - 1).unwrap();
+    event.cancel();
+    assert_eq!(
+        attempts.load(Ordering::Relaxed) - before,
+        0,
+        "nonhead deadline mutations must not reprogram clockevent"
+    );
+    let before = attempts.load(Ordering::Relaxed);
+    reprogram_local();
+    assert_eq!(attempts.load(Ordering::Relaxed) - before, 1);
 }
 
 fn state_spare_identity(event: &DeadlineEvent) -> usize {

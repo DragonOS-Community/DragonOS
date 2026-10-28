@@ -23,7 +23,7 @@ use crate::{
         core::smp_get_processor_id,
         cpu::{smp_cpu_manager, CpuHpState, ProcessorId},
     },
-    time::{sleep::nanosleep, PosixTimeSpec},
+    time::sleep::busy_wait_us,
 };
 use core::{
     arch::asm,
@@ -278,18 +278,10 @@ fn emergency_restart() -> ! {
                 // 重试10次键盘重启，每次等待50微妙
                 for _ in 0..10 {
                     kb_wait();
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50_000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                     // 发送0xfe到键盘控制器以触发重启
                     unsafe { CurrentPortIOArch::out8(0x64, 0xfe) };
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50_000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                 }
 
                 // 如果这是第一次尝试键盘重启，且原始重启类型是ACPI，则再次尝试ACPI重启
@@ -335,20 +327,12 @@ fn emergency_restart() -> ! {
                     unsafe {
                         CurrentPortIOArch::out8(0xcf9, cf9 | 2);
                     }
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                     // 执行实际的重启
                     unsafe {
                         CurrentPortIOArch::out8(0xcf9, cf9 | reboot_code);
                     }
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                 }
                 // CF9重启失败后，转到三重重启方式
                 reboot_type = RebootType::Triple;
@@ -379,11 +363,7 @@ fn kb_wait() {
         }
     }
     // 延迟2微妙，避免过度占用CPU
-    let sleep_time = PosixTimeSpec {
-        tv_sec: 0,
-        tv_nsec: 2_000, // 2000ns
-    };
-    let _ = nanosleep(sleep_time);
+    busy_wait_us(2);
 }
 
 /// # BIOS重启

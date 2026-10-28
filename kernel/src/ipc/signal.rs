@@ -478,12 +478,12 @@ impl Signal {
 
         let Some(target_pcb) = target_pcb else {
             if is_thread_target {
-                pcb.recalc_sigpending();
+                pcb.recalc_sigpending_tsk();
             }
             return;
         };
 
-        target_pcb.recalc_sigpending();
+        target_pcb.recalc_sigpending_tsk();
         compiler_fence(core::sync::atomic::Ordering::SeqCst);
         signal_wake_up(target_pcb, *self == Signal::SIGKILL);
     }
@@ -577,7 +577,7 @@ impl Signal {
             .sig_pending_mut()
             .signal_mut()
             .insert(Signal::SIGKILL.into());
-        task.recalc_sigpending();
+        task.recalc_sigpending_tsk();
         signal_wake_up(task.clone(), true);
     }
 
@@ -953,15 +953,21 @@ impl ProcessControlBlock {
         res
     }
 
-    /// 重新计算线程的flag中的TIF_SIGPENDING位
-    /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/kernel/signal.c?r=&mo=4806&fi=182#182
+    /// Recompute current's pending notification at a signal-consumption or
+    /// mask-change boundary. Never use this clearing operation on another task.
     pub fn recalc_sigpending(&self) {
-        if !self.recalc_sigpending_tsk() {
-            self.flags().remove(ProcessFlags::HAS_PENDING_SIGNAL);
-        }
+        debug_assert_eq!(self.raw_pid(), ProcessManager::current_pid());
+        self.recalc_sigpending_inner(true);
     }
 
-    fn recalc_sigpending_tsk(&self) -> bool {
+    /// Publish pending work without clearing a remote task's notification.
+    /// Like Linux recalc_sigpending_tsk(), this also preserves restart work
+    /// when a ptrace stop resumes with no signal left in the queue.
+    pub(crate) fn recalc_sigpending_tsk(&self) -> bool {
+        self.recalc_sigpending_inner(false)
+    }
+
+    fn recalc_sigpending_inner(&self, allow_clear: bool) -> bool {
         let pending = self.process_signal();
         let pending_guard = pending.lock_irqsave();
         let siginfo_guard = self.sig_info_irqsave();
@@ -973,11 +979,13 @@ impl ProcessControlBlock {
             self.flags().insert(ProcessFlags::HAS_PENDING_SIGNAL);
             return true;
         }
-        /*
-         * We must never clear the flag in another thread, or in current
-         * when it's possible the current syscall is returning -ERESTART*.
-         * So we don't clear it here, and only callers who know they should do.
-         */
+        // Keep the empty check and clear under both pending locks. Otherwise
+        // a sender can enqueue and publish after the check, only for our stale
+        // clear to erase its notification. Queue writers take one of these
+        // locks; remote recalculation is set-only and runs before wakeup.
+        if allow_clear {
+            self.flags().remove(ProcessFlags::HAS_PENDING_SIGNAL);
+        }
         return false;
     }
 
@@ -989,13 +997,13 @@ impl ProcessControlBlock {
 }
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/include/linux/sched/signal.h?fi=restore_saved_sigmask#547
 pub fn restore_saved_sigmask() {
-    if ProcessManager::current_pcb()
-        .flags()
-        .test_and_clear(ProcessFlags::RESTORE_SIG_MASK)
+    let pcb = ProcessManager::current_pcb();
+    // Only current publishes RESTORE_SIG_MASK. Avoid a flags RMW on the usual
+    // return path; retain the atomic clear to preserve other CPUs' flag updates.
+    if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK)
+        && pcb.flags().test_and_clear(ProcessFlags::RESTORE_SIG_MASK)
     {
-        let saved = *ProcessManager::current_pcb()
-            .sig_info_irqsave()
-            .saved_sigmask();
+        let saved = *pcb.sig_info_irqsave().saved_sigmask();
         __set_current_blocked(&saved);
     }
     compiler_fence(Ordering::SeqCst);

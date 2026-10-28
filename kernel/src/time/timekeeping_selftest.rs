@@ -114,8 +114,174 @@ impl Report {
     }
 }
 
+// Only local clocks, timekeepers and synthetic counter samples below. These
+// fixtures exercise the production pure helpers and conversion installation,
+// not the global atomic commit, hardware notification or CPU sample count.
+fn jiffies_handoff_continuity() -> bool {
+    let old = FakeClock::new("jiffy-old", u64::MAX, 1, 1, u64::MAX / 2);
+    old.set_cycle(100);
+    let local = Timekeeper::new();
+    if local
+        .timekeeper_setup_internals(old.clone() as Arc<dyn Clocksource>)
+        .is_err()
+    {
+        return false;
+    }
+    old.set_cycle(100 + 5 * JIFFY_NS + 1);
+    let coarse = FakeClock::new(
+        "jiffy-coarse",
+        u64::MAX,
+        (2 * JIFFY_NS) as u32,
+        1,
+        u64::MAX / 2,
+    );
+    coarse.inner.lock_irqsave().data.flags = ClocksourceFlags::empty();
+    let coarse_dyn = coarse.clone() as Arc<dyn Clocksource>;
+    let data = match validated_clocksource_data(&coarse_dyn) {
+        Ok(data) => data,
+        Err(_) => return false,
+    };
+    let mut tk = local.inner.write_irqsave();
+    tk.next_jiffy_ns = Some(JIFFY_NS);
+    tk.forward();
+    let base = match tk.mono.as_ref() {
+        Some(base) => base.base_ns,
+        None => return false,
+    };
+    let flags = old.clocksource_data().flags;
+    let (add, next) = match jiffy_handoff(JIFFY_NS, base, &flags) {
+        Ok(result) => result,
+        Err(_) => return false,
+    };
+    if (add, next) != (2, 3 * JIFFY_NS) {
+        return false;
+    }
+    // The real install samples the jiffies counter only after committing add.
+    // Here only the private coarse clock's counter changes.
+    coarse.set_cycle(10 + add);
+    tk.next_jiffy_ns = Some(next);
+    tk.install_forwarded(coarse_dyn.clone(), &data);
+    let fraction_preserved =
+        tk.mono.as_ref().is_some_and(|b| {
+            b.base_ns == 5 * JIFFY_NS / 2 && b.fraction == 1 && b.cycle_last == 12
+        }) && tk.raw.as_ref().is_some_and(|b| {
+            b.base_ns == 5 * JIFFY_NS / 2 && b.fraction == 1 && b.cycle_last == 12
+        });
+    let (add, next) = match jiffy_advance(next, tk.monotonic_ns(), false, true) {
+        Ok(result) => result,
+        Err(_) => return false,
+    };
+    if add != 1 {
+        return false;
+    }
+    coarse.set_cycle(12 + add);
+    tk.next_jiffy_ns = Some(next);
+    tk.forward();
+    let coarse_progress = tk.monotonic_ns() == 7 * JIFFY_NS / 2
+        && tk.mono.as_ref().is_some_and(|b| b.fraction == 1)
+        && next == 4 * JIFFY_NS;
+    drop(tk);
+    let resumed = FakeClock::new("jiffy-resumed", u64::MAX, 1, 1, u64::MAX / 2);
+    resumed.set_cycle(900);
+    if local
+        .timekeeper_setup_internals(resumed.clone() as Arc<dyn Clocksource>)
+        .is_err()
+    {
+        return false;
+    }
+    let tk = local.inner.read_irqsave();
+    fraction_preserved
+        && coarse_progress
+        && tk.next_jiffy_ns == Some(4 * JIFFY_NS)
+        && tk.monotonic_ns() == 7 * JIFFY_NS / 2
+        && tk
+            .mono
+            .as_ref()
+            .is_some_and(|b| b.fraction == 1 && b.cycle_last == 900)
+        && tk.raw.as_ref().is_some_and(|b| {
+            b.base_ns == 7 * JIFFY_NS / 2 && b.fraction == 1 && b.cycle_last == 900
+        })
+        && jiffy_advance(next, tk.monotonic_ns(), true, false) == Ok((0, next))
+        && jiffy_advance(next, next, true, false) == Ok((1, 5 * JIFFY_NS))
+}
+
+fn jiffies_unstable_handoff() -> bool {
+    let old = FakeClock::new("jiffy-failed", u64::MAX, 1, 0, u64::MAX / 2);
+    old.set_cycle(100);
+    let local = Timekeeper::new();
+    if local
+        .timekeeper_setup_internals(old.clone() as Arc<dyn Clocksource>)
+        .is_err()
+    {
+        return false;
+    }
+    old.set_cycle(100 + 1000 * JIFFY_NS);
+    if old
+        .update_clocksource_data(ClocksourceUpdate::MarkUnstable)
+        .is_err()
+    {
+        return false;
+    }
+    let new = FakeClock::new("jiffy-recovered", u64::MAX, 1, 0, u64::MAX / 2);
+    new.set_cycle(900);
+    let new_dyn = new.clone() as Arc<dyn Clocksource>;
+    let data = match validated_clocksource_data(&new_dyn) {
+        Ok(data) => data,
+        Err(_) => return false,
+    };
+    let mut tk = local.inner.write_irqsave();
+    tk.next_jiffy_ns = Some(3 * JIFFY_NS);
+    tk.forward();
+    let flags = old.clocksource_data().flags;
+    let base = match tk.mono.as_ref() {
+        Some(base) => base.base_ns,
+        None => return false,
+    };
+    let (add, next) = match jiffy_handoff(3 * JIFFY_NS, base, &flags) {
+        Ok(result) => result,
+        Err(_) => return false,
+    };
+    if (add, next) != (0, 1001 * JIFFY_NS) {
+        return false;
+    }
+    tk.next_jiffy_ns = Some(next);
+    tk.install_forwarded(new_dyn, &data);
+    new.set_cycle(900 + JIFFY_NS / 2);
+    let early = jiffy_advance(next, tk.monotonic_ns(), true, false);
+    new.set_cycle(900 + JIFFY_NS);
+    add == 0
+        && early == Ok((0, next))
+        && jiffy_advance(next, tk.monotonic_ns(), true, false) == Ok((1, 1002 * JIFFY_NS))
+}
+
 pub(crate) fn run_timekeeping_selftests() -> (usize, usize, String) {
     let mut report = Report::new();
+
+    report.case(
+        "jiffies_phase_elapsed",
+        jiffy_advance(3 * JIFFY_NS, 5 * JIFFY_NS / 2, true, true) == Ok((0, 3 * JIFFY_NS))
+            && jiffy_advance(3 * JIFFY_NS, 3 * JIFFY_NS, true, false) == Ok((1, 4 * JIFFY_NS))
+            && jiffy_advance(3 * JIFFY_NS, 13 * JIFFY_NS / 2, true, false) == Ok((4, 7 * JIFFY_NS))
+            && jiffy_advance(7 * JIFFY_NS, 13 * JIFFY_NS / 2, true, true) == Ok((0, 7 * JIFFY_NS))
+            && jiffy_advance(7 * JIFFY_NS, 7 * JIFFY_NS, true, false) == Ok((1, 8 * JIFFY_NS)),
+    );
+    report.case(
+        "jiffies_fallback_gate",
+        jiffy_advance(3 * JIFFY_NS, 1000 * JIFFY_NS, false, false) == Ok((0, 3 * JIFFY_NS))
+            && jiffy_advance(3 * JIFFY_NS, 1000 * JIFFY_NS, false, true) == Ok((1, 4 * JIFFY_NS))
+            && jiffy_handoff(3 * JIFFY_NS, 1000 * JIFFY_NS, &ClocksourceFlags::empty())
+                == Ok((0, 3 * JIFFY_NS)),
+    );
+    report.case(
+        "jiffies_phase_overflow",
+        jiffy_advance(u64::MAX, u64::MAX - 1, true, false) == Ok((0, u64::MAX))
+            && jiffy_advance(u64::MAX, u64::MAX, true, false) == Err(SystemError::EOVERFLOW)
+            && jiffy_advance(u64::MAX, 0, false, true) == Err(SystemError::EOVERFLOW)
+            && jiffy_handoff(0, u64::MAX, &ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
+                == Err(SystemError::EOVERFLOW),
+    );
+    report.case("jiffies_source_handoff", jiffies_handoff_continuity());
+    report.case("jiffies_unstable_handoff", jiffies_unstable_handoff());
 
     report.case(
         "contiguous_masks",
@@ -136,6 +302,105 @@ pub(crate) fn run_timekeeping_selftests() -> (usize, usize, String) {
             && clocksource_delta(9, 0, 0xff, 8) == Ok(8)
             && clocksource_delta(1, 0, 0xfe, 8) == Err(SystemError::EINVAL),
     );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        report.case(
+            "tsc_deadline_conversion",
+            crate::arch::driver::apic::apic_timer::tsc_deadline_conversion_selftest(),
+        );
+        // Linux x86 validates the mask's high bit before conversion capping.
+        // Keep genuine forward overflow below half a counter period.
+        let delta_boundaries = [0xff, 0x00ff_ffff, u64::MAX].into_iter().all(|mask| {
+            let half = (mask >> 1) + 1;
+            clocksource_delta(55, 55, mask, 8) == Ok(0)
+                && clocksource_delta(99, 100, mask, 8) == Ok(0)
+                && clocksource_delta(5, mask - 15, mask, mask) == Ok(21)
+                && clocksource_delta(half - 1, 0, mask, mask) == Ok(half - 1)
+                && clocksource_delta(half, 0, mask, mask) == Ok(0)
+                && clocksource_delta(half + 1, 0, mask, mask) == Ok(0)
+                && clocksource_delta(8, 0, mask, 8) == Ok(8)
+                && clocksource_delta(9, 0, mask, 8) == Ok(8)
+        }) && clocksource_delta(1, 0, 1, 1) == Ok(0)
+            && clocksource_delta(0, 0, 0, 1) == Err(SystemError::EINVAL)
+            && clocksource_delta(0, 1, 0xfe, 8) == Err(SystemError::EINVAL)
+            && clocksource_delta(0, 1, 0xff, 0) == Err(SystemError::EINVAL)
+            && clocksource_delta(0, 1, 0xff, 0x100) == Err(SystemError::EINVAL);
+        report.case("backward_delta_boundaries", delta_boundaries);
+
+        // A private timekeeper only: the real clocksource and hardware are
+        // never changed. Old modulo-then-cap turns 100 -> 99 into 12ns.
+        let read_clock = FakeClock::new("backward-read", 0xff, 3, 1, 8);
+        read_clock.set_cycle(100);
+        let read_keeper = Timekeeper::new();
+        let read_setup = read_keeper
+            .timekeeper_setup_internals(read_clock.clone() as Arc<dyn Clocksource>)
+            .is_ok();
+        read_clock.set_cycle(99);
+        let state = read_keeper.inner.read_irqsave();
+        let read_ok = match (&state.mono, &state.raw) {
+            (Some(mono), Some(raw)) => {
+                state.monotonic_ns() == 0
+                    && state.raw_ns() == 0
+                    && state.realtime_ns() == 0
+                    && state.boottime_ns() == 0
+                    && mono.base_ns == 0
+                    && raw.base_ns == 0
+                    && mono.fraction == 0
+                    && raw.fraction == 0
+                    && mono.cycle_last == 100
+                    && raw.cycle_last == 100
+            }
+            _ => false,
+        };
+        drop(state);
+        report.case("backward_read_zero_elapsed", read_setup && read_ok);
+
+        let forward_clock = FakeClock::new("backward-forward", 0xff, 3, 1, 8);
+        forward_clock.set_cycle(100);
+        let forward_keeper = Timekeeper::new();
+        let forward_setup = forward_keeper
+            .timekeeper_setup_internals(forward_clock.clone() as Arc<dyn Clocksource>)
+            .is_ok();
+        let forward_ok = if forward_setup {
+            let mut state = forward_keeper.inner.write_irqsave();
+            forward_clock.set_cycle(101);
+            let reads = forward_clock.reads();
+            state.forward();
+            let first = state.mono.as_ref().is_some_and(|base| {
+                base.base_ns == 1 && base.fraction == 1 && base.cycle_last == 101
+            }) && state.raw.as_ref().is_some_and(|base| {
+                base.base_ns == 1 && base.fraction == 1 && base.cycle_last == 101
+            }) && forward_clock.reads() == reads + 1;
+
+            // A writer still reanchors both bases to the current sample,
+            // retaining its fractional carry when the validated delta is 0.
+            forward_clock.set_cycle(100);
+            let reads = forward_clock.reads();
+            state.forward();
+            let backward = state.mono.as_ref().is_some_and(|base| {
+                base.base_ns == 1 && base.fraction == 1 && base.cycle_last == 100
+            }) && state.raw.as_ref().is_some_and(|base| {
+                base.base_ns == 1 && base.fraction == 1 && base.cycle_last == 100
+            }) && forward_clock.reads() == reads + 1;
+
+            forward_clock.set_cycle(101);
+            let reads = forward_clock.reads();
+            state.forward();
+            let progress = state.mono.as_ref().is_some_and(|base| {
+                base.base_ns == 3 && base.fraction == 0 && base.cycle_last == 101
+            }) && state.raw.as_ref().is_some_and(|base| {
+                base.base_ns == 3 && base.fraction == 0 && base.cycle_last == 101
+            }) && forward_clock.reads() == reads + 1;
+            first && backward && progress
+        } else {
+            false
+        };
+        report.case(
+            "backward_forward_fraction_progress",
+            forward_setup && forward_ok,
+        );
+    }
 
     report.case(
         "fraction_carry",

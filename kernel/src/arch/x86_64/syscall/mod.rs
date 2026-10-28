@@ -12,10 +12,7 @@ use crate::{
 use log::debug;
 use system_error::SystemError;
 
-use super::{
-    interrupt::{entry::set_system_trap_gate, TrapFrame},
-    mm::barrier::mfence,
-};
+use super::interrupt::{entry::set_system_trap_gate, TrapFrame};
 
 pub mod nr;
 mod sys_arch_prctl;
@@ -90,16 +87,10 @@ pub extern "sysv64" fn syscall_handler(frame: &mut TrapFrame) {
         frame.r8 as usize,
         frame.r9 as usize,
     ];
-    mfence();
-    let pid = ProcessManager::current_pcb().raw_pid();
     let show = false;
-    // let show = if syscall_num != SYS_SCHED && pid.data() >= 9{
-    //     true
-    // } else {
-    //     false
-    // };
 
     if show {
+        let pid = ProcessManager::current_pcb().raw_pid();
         debug!("syscall: pid: {:?}, num={:?}\n", pid, syscall_num);
     }
 

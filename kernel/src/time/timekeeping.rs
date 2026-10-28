@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::{
-    clocksource::{Clocksource, ClocksourceMask},
+    clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, HZ},
     syscall::PosixTimeval,
     NSEC_PER_SEC,
 };
@@ -24,6 +24,8 @@ use super::{
 pub static TIMEKEEPING_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
+
+const JIFFY_NS: u64 = 1_000_000_000 / HZ;
 
 const TIME_SETTOD_SEC_MAX: i64 = i64::MAX / NSEC_PER_SEC as i64 - 30 * 365 * 24 * 60 * 60;
 
@@ -96,7 +98,7 @@ impl TimekeeperReadBase {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TimekeeperData {
     mono: Option<TimekeeperReadBase>,
     raw: Option<TimekeeperReadBase>,
@@ -104,6 +106,8 @@ pub struct TimekeeperData {
     boottime_offset_ns: u64,
     clock_was_set_seq: u64,
     clocksource_generation: u64,
+    // Global jiffy progress, independent of per-CPU clockevent capability.
+    next_jiffy_ns: Option<u64>,
 }
 
 impl TimekeeperData {
@@ -115,6 +119,7 @@ impl TimekeeperData {
             boottime_offset_ns: 0,
             clock_was_set_seq: 0,
             clocksource_generation: 0,
+            next_jiffy_ns: None,
         }
     }
 
@@ -129,6 +134,28 @@ impl TimekeeperData {
         mono.forward(cycle_now);
         raw.forward(cycle_now);
         debug_assert_eq!(mono.cycle_last, raw.cycle_last);
+    }
+
+    // Caller has forwarded the old base and validated the new conversion.
+    fn install_forwarded(&mut self, clock: Arc<dyn Clocksource>, data: &ClocksourceData) {
+        let mono_base_ns = self.mono.as_ref().map_or(0, |base| base.base_ns);
+        let raw_base_ns = self.raw.as_ref().map_or(0, |base| base.base_ns);
+        let old_mono_fraction = self.mono.as_ref().map_or(0, |base| base.fraction);
+        let old_raw_fraction = self.raw.as_ref().map_or(0, |base| base.fraction);
+        let old_shift = self.mono.as_ref().map(|base| base.shift);
+
+        let cycle_last = clock.read().data();
+        let mut mono = TimekeeperReadBase::new(clock.clone(), data, cycle_last, mono_base_ns)
+            .expect("validated clocksource became invalid");
+        let mut raw = TimekeeperReadBase::new(clock, data, cycle_last, raw_base_ns)
+            .expect("validated clocksource became invalid");
+        if let Some(old_shift) = old_shift {
+            mono.fraction = rescale_fraction(old_mono_fraction, old_shift, mono.shift);
+            raw.fraction = rescale_fraction(old_raw_fraction, old_shift, raw.shift);
+        }
+        self.mono = Some(mono);
+        self.raw = Some(raw);
+        self.clocksource_generation = self.clocksource_generation.wrapping_add(1);
     }
 
     fn monotonic_ns(&self) -> u64 {
@@ -168,24 +195,7 @@ impl Timekeeper {
         &self,
         clock: Arc<dyn Clocksource>,
     ) -> Result<(), SystemError> {
-        let data = clock.clocksource_data();
-        if data.mask.bits() == 0
-            || data.mult == 0
-            || data.shift >= u64::BITS
-            || data.max_cycles == 0
-            || data.max_cycles > data.mask.bits()
-            || !mask_is_contiguous(data.mask.bits())
-        {
-            warn!(
-                "refusing invalid clocksource {}: mask={:#x} mult={} shift={}",
-                data.name,
-                data.mask.bits(),
-                data.mult,
-                data.shift
-            );
-            return Err(SystemError::EINVAL);
-        }
-
+        let data = validated_clocksource_data(&clock)?;
         let mut tk = self.inner.write_irqsave();
         if let Some(current) = tk.mono.as_ref() {
             if Arc::ptr_eq(&current.clock, &clock) {
@@ -194,24 +204,7 @@ impl Timekeeper {
             tk.forward();
         }
 
-        let mono_base_ns = tk.mono.as_ref().map_or(0, |base| base.base_ns);
-        let raw_base_ns = tk.raw.as_ref().map_or(0, |base| base.base_ns);
-        let old_mono_fraction = tk.mono.as_ref().map_or(0, |base| base.fraction);
-        let old_raw_fraction = tk.raw.as_ref().map_or(0, |base| base.fraction);
-        let old_shift = tk.mono.as_ref().map(|base| base.shift);
-
-        let cycle_last = clock.read().data();
-        let mut mono = TimekeeperReadBase::new(clock.clone(), &data, cycle_last, mono_base_ns)
-            .expect("validated clocksource became invalid");
-        let mut raw = TimekeeperReadBase::new(clock, &data, cycle_last, raw_base_ns)
-            .expect("validated clocksource became invalid");
-        if let Some(old_shift) = old_shift {
-            mono.fraction = rescale_fraction(old_mono_fraction, old_shift, mono.shift);
-            raw.fraction = rescale_fraction(old_raw_fraction, old_shift, raw.shift);
-        }
-        tk.mono = Some(mono);
-        tk.raw = Some(raw);
-        tk.clocksource_generation = tk.clocksource_generation.wrapping_add(1);
+        tk.install_forwarded(clock, &data);
         drop(tk);
         Ok(())
     }
@@ -223,6 +216,30 @@ impl Timekeeper {
             .as_ref()
             .map(|base| base.clock.clone())
     }
+}
+
+fn validated_clocksource_data(
+    clock: &Arc<dyn Clocksource>,
+) -> Result<ClocksourceData, SystemError> {
+    let data = clock.clocksource_data();
+    if data.mask.bits() == 0
+        || data.mult == 0
+        || data.shift >= u64::BITS
+        || data.max_cycles == 0
+        || data.max_cycles > data.mask.bits()
+        || !mask_is_contiguous(data.mask.bits())
+    {
+        warn!(
+            "refusing invalid clocksource {}: mask={:#x} mult={} shift={}",
+            data.name,
+            data.mask.bits(),
+            data.mult,
+            data.shift
+        );
+        return Err(SystemError::EINVAL);
+    }
+
+    Ok(data)
 }
 
 #[inline]
@@ -241,10 +258,14 @@ fn clocksource_delta(
         return Err(SystemError::EINVAL);
     }
     let delta = cycle_now.wrapping_sub(cycle_last) & mask;
-    // Match Linux timekeeping_get_delta(): a delayed update beyond the
-    // conversion-safe window is capped, not allowed to overflow and not
-    // promoted into a kernel panic. The next writer advances cycle_last to
-    // the current sample, so the exceptional interval cannot repeat.
+    // Linux x86 selects CLOCKSOURCE_VALIDATE_LAST_CYCLE: reject a delta
+    // outside the counter's forward half before applying conversion bounds.
+    if cfg!(target_arch = "x86_64") && delta & !(mask >> 1) != 0 {
+        return Ok(0);
+    }
+    // Cap accepted forward intervals, as Linux DEBUG_TIMEKEEPING does, to
+    // avoid conversion overflow. A writer still advances cycle_last to the
+    // current sample, including when the validated delta is zero.
     Ok(delta.min(max_cycles))
 }
 
@@ -310,13 +331,126 @@ pub fn timekeeper() -> &'static Timekeeper {
 /// Only installing the global source may change hardware clockevent mode.
 /// Independent Timekeeper instances (including selftests) have no such effect.
 pub(crate) fn install_clocksource(clock: Arc<dyn Clocksource>) -> Result<(), SystemError> {
-    timekeeper().timekeeper_setup_internals(clock.clone())?;
+    let data = validated_clocksource_data(&clock)?;
+    {
+        let mut tk = timekeeper().inner.write_irqsave();
+        if !tk
+            .mono
+            .as_ref()
+            .is_some_and(|base| Arc::ptr_eq(&base.clock, &clock))
+        {
+            // A few Arc/scalar clones on the rare control path, never per tick.
+            // Prove the new phase before publishing any counter/base change.
+            let mut candidate = tk.clone();
+            let old_flags = candidate
+                .mono
+                .as_ref()
+                .map(|base| base.clock.clocksource_data().flags);
+            // As before, switching sources forwards the old base exactly once.
+            candidate.forward();
+            if let Some(next) = candidate.next_jiffy_ns {
+                let now = candidate
+                    .mono
+                    .as_ref()
+                    .expect("tick source missing")
+                    .base_ns;
+                let flags = old_flags.expect("tick source flags missing");
+                let (add, next) = jiffy_handoff(next, now, &flags).expect("jiffy phase overflow");
+                // New-source cycle_last must be sampled after this pure commit.
+                super::timer::add_timer_jiffies(add);
+                candidate.next_jiffy_ns = Some(next);
+            }
+            candidate.install_forwarded(clock.clone(), &data);
+            *tk = candidate;
+        }
+    }
     let flags = clock.clocksource_data().flags;
     super::deadline::clocksource_changed(
         flags.contains(super::clocksource::ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS)
             && !flags.contains(super::clocksource::ClocksourceFlags::CLOCK_SOURCE_UNSTABLE),
     );
     Ok(())
+}
+
+fn continuous_source(flags: &ClocksourceFlags) -> bool {
+    flags.contains(ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS)
+        && !flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
+}
+
+// Settle only a reliable old source; a failed source starts a new phase.
+fn jiffy_handoff(next: u64, now: u64, flags: &ClocksourceFlags) -> Result<(u64, u64), SystemError> {
+    if flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE) {
+        Ok((0, now.checked_add(JIFFY_NS).ok_or(SystemError::EOVERFLOW)?))
+    } else {
+        jiffy_advance(next, now, continuous_source(flags), false)
+    }
+}
+
+// A pure phase calculation: a non-continuous source cannot drive its own ticks.
+fn jiffy_advance(
+    next: u64,
+    now: u64,
+    continuous: bool,
+    local_tick: bool,
+) -> Result<(u64, u64), SystemError> {
+    let add = if continuous {
+        if now < next {
+            0
+        } else {
+            (now - next) / JIFFY_NS + 1
+        }
+    } else {
+        u64::from(local_tick)
+    };
+    let next = add
+        .checked_mul(JIFFY_NS)
+        .and_then(|elapsed| next.checked_add(elapsed))
+        .ok_or(SystemError::EOVERFLOW)?;
+    Ok((add, next))
+}
+
+// CPU0 initializes once, outside the deadline queue lock. AP init is a no-op.
+pub(crate) fn init_jiffies_tick() {
+    if crate::smp::core::smp_get_processor_id().data() != 0 {
+        return;
+    }
+    let mut tk = timekeeper().inner.write_irqsave();
+    if tk.next_jiffy_ns.is_none() {
+        tk.next_jiffy_ns = Some(
+            tk.monotonic_ns()
+                .checked_add(JIFFY_NS)
+                .expect("jiffy phase overflow"),
+        );
+    }
+}
+
+// Normal IRQ updates are CPU0-only. The source control path above may settle
+// old elapsed time under this same lock; it never runs timer maintenance.
+pub(crate) fn advance_jiffies(local_tick: bool) -> bool {
+    let mut tk = timekeeper().inner.write_irqsave();
+    let next = tk.next_jiffy_ns.expect("jiffy tick not initialized");
+    let flags = tk
+        .mono
+        .as_ref()
+        .expect("tick source missing")
+        .clock
+        .clocksource_data()
+        .flags;
+    let (add, next) = jiffy_advance(
+        next,
+        tk.monotonic_ns(),
+        continuous_source(&flags),
+        local_tick,
+    )
+    .expect("jiffy phase overflow");
+    super::timer::add_timer_jiffies(add);
+    tk.next_jiffy_ns = Some(next);
+    // Preserve update_wall_time's original suspend guard. In particular a
+    // jiffies source must be forwarded after publishing its new count.
+    if (add != 0 || local_tick) && !TIMEKEEPING_SUSPENDED.load(Ordering::Acquire) {
+        tk.forward();
+    }
+    add != 0
 }
 
 pub fn boottime_seconds() -> i64 {
@@ -470,13 +604,6 @@ pub fn timekeeping_init() {
 
     drop(irq_guard);
     info!("timekeeping_init successfully");
-}
-
-pub fn update_wall_time() {
-    if TIMEKEEPING_SUSPENDED.load(Ordering::Acquire) {
-        return;
-    }
-    timekeeper().inner.write_irqsave().forward();
 }
 
 #[path = "timekeeping_selftest.rs"]

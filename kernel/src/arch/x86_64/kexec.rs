@@ -181,6 +181,7 @@ pub fn machine_kexec(kimage: Rc<SpinLock<Kimage>>) {
         crate::arch::process::stop_this_cpu();
     }
     crate::arch::kvm_para::shutdown_time();
+    crate::arch::driver::apic::CurrentApic.lapic_shutdown();
     // The assembly replaces the stack and returns into the replacement
     // kernel's entry point, never into this kernel's caller.
     unsafe { relocate_kernel_func(arg1, arg2, arg3) }

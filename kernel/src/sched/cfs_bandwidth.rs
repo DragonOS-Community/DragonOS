@@ -4,9 +4,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
 use system_error::SystemError;
 
-use super::fair::FairSchedEntity;
-use super::{cpu_is_online, cpu_rq, CpuRunQueue, SchedClass, TaskGroup};
-use crate::process::ProcessControlBlock;
+use super::{cpu_is_online, cpu_rq, TaskGroup};
 use crate::{
     libs::spinlock::SpinLock,
     mm::percpu::PerCpu,
@@ -19,87 +17,6 @@ const RETAIN_NS: i64 = 1_000_000;
 const SLACK_NS: u64 = 5_000_000;
 const MIN_PERIOD_REMAIN_NS: u64 = 2_000_000;
 const CPUS: usize = PerCpu::MAX_CPU_NUM as usize;
-static RUNTIME_EVENTS: [SpinLock<Option<Arc<DeadlineEvent>>>; CPUS] =
-    [const { SpinLock::new(None) }; CPUS];
-
-#[derive(Debug)]
-struct RuntimeDeadline {
-    cpu: ProcessorId,
-}
-impl DeadlineCallback for RuntimeDeadline {
-    fn expire(&self, now: u64) -> Option<u64> {
-        let binding = cpu_rq(self.cpu.data() as usize);
-        let (rq, _guard) = binding.self_lock();
-        rq.update_rq_clock();
-        let current = rq.current();
-        if current.sched_info().sched_class() != SchedClass::Fair {
-            return None;
-        }
-        let mut se = current.sched_info().sched_entity();
-        FairSchedEntity::for_each_in_group(&mut se, |se| {
-            se.cfs_rq().force_mut().update_current();
-            (true, true)
-        });
-        match remaining_runtime(&current) {
-            Some(remaining) if remaining > 0 => Some(now.saturating_add(remaining as u64)),
-            Some(_) => {
-                rq.resched_current();
-                None
-            }
-            None => None,
-        }
-    }
-}
-
-fn remaining_runtime(task: &Arc<ProcessControlBlock>) -> Option<i64> {
-    if task.sched_info().sched_class() != SchedClass::Fair {
-        return None;
-    }
-    let mut remaining: Option<i64> = None;
-    let mut se = task.sched_info().sched_entity();
-    FairSchedEntity::for_each_in_group(&mut se, |se| {
-        let cfs = se.cfs_rq();
-        if cfs.runtime_enabled {
-            remaining =
-                Some(remaining.map_or(cfs.runtime_remaining, |r| r.min(cfs.runtime_remaining)));
-        }
-        (true, true)
-    });
-    remaining
-}
-
-/// Exactly one exhaustion event per CPU, not one timer for every runnable
-/// task. Caller holds rq and passes the next task when rq.current is still old.
-pub(crate) fn refresh_runtime_event(rq: &mut CpuRunQueue, task: &Arc<ProcessControlBlock>) {
-    let remaining = remaining_runtime(task);
-    let slot = RUNTIME_EVENTS[rq.cpu().data() as usize].lock_irqsave();
-    let event = slot
-        .as_ref()
-        .expect("runtime deadline events not initialized");
-    match remaining {
-        Some(remaining) if remaining > 0 => {
-            let _ = event.arm(deadline::now_ns().saturating_add(remaining as u64));
-        }
-        Some(_) => {
-            event.cancel();
-            rq.resched_current();
-        }
-        None => event.cancel(),
-    }
-}
-
-/// Boot preparation precedes process/IRQ startup. No event is created lazily
-/// while holding rq, and arm/cancel only move its preallocated queue node.
-pub(crate) fn init_runtime_events() {
-    for (cpu, runtime_event) in RUNTIME_EVENTS.iter().enumerate() {
-        let owner = ProcessorId::new(cpu as u32);
-        let event = DeadlineEvent::new(owner, Arc::new(RuntimeDeadline { cpu: owner }));
-        let mut slot = runtime_event.lock_irqsave();
-        assert!(slot.is_none(), "runtime deadline events initialized twice");
-        *slot = Some(event);
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BandwidthSnapshot {
     pub(crate) nr_periods: u64,

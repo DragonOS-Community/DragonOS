@@ -57,6 +57,13 @@ TEST(KthreadSelftest, CreateRunStopAndReapHandshakes) {
         EXPECT_NE(std::string::npos, report.find("deadline_generation=ok\n")) << report;
         EXPECT_NE(std::string::npos, report.find("deadline_fallback=ok\n")) << report;
     }
+    // Ordinary kernels explicitly skip the private scheduler fixture; a
+    // sched_selftest build must pass its real pick/cleanup contract.
+    if (report.find("group_switch=skip_sched_disabled\n") == std::string::npos) {
+        EXPECT_NE(std::string::npos, report.find("group_switch=ok\n")) << report;
+        EXPECT_NE(std::string::npos, report.find("group_switch_setup=true ")) << report;
+        EXPECT_NE(std::string::npos, report.find(" cleanup=true ")) << report;
+    }
     EXPECT_NE(std::string::npos, report.find("pid_membership_lifetime=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("task_destruction=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("task_reaped=true remaining_owners=0\n")) << report;

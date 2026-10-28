@@ -1,4 +1,4 @@
-#[cfg(feature = "mm_selftest")]
+#[cfg(feature = "sched_selftest")]
 pub(crate) mod affinity_selftest;
 pub(crate) mod cfs_bandwidth;
 pub mod clock;

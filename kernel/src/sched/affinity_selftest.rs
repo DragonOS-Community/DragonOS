@@ -1,4 +1,4 @@
-//! Finite affinity-publication/placement regression, compiled only for mm_selftest.
+//! Finite affinity-publication/placement regression, compiled only for sched_selftest.
 use alloc::{boxed::Box, string::ToString, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

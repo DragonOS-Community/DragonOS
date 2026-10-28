@@ -729,7 +729,7 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
         }
         None => report.push_str("deadline_stop_clear=skip_unavailable_or_not_observed\n"),
     }
-    #[cfg(feature = "mm_selftest")]
+    #[cfg(feature = "sched_selftest")]
     match crate::sched::affinity_selftest::run() {
         Some(result) => {
             append_kthread_selftest_case(
@@ -748,7 +748,7 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
         }
         None => report.push_str("affinity_placement=skip_unavailable\n"),
     }
-    #[cfg(feature = "mm_selftest")]
+    #[cfg(feature = "sched_selftest")]
     match crate::sched::fair::run_group_switch_selftest() {
         Ok(result) => {
             append_kthread_selftest_case(&mut report, "group_switch", result.ok(), &mut failures);
@@ -764,8 +764,8 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
             report.push_str("group_switch_setup=allocation_or_context_error\n");
         }
     }
-    #[cfg(not(feature = "mm_selftest"))]
-    report.push_str("group_switch=skip_mm_disabled\n");
+    #[cfg(not(feature = "sched_selftest"))]
+    report.push_str("group_switch=skip_sched_disabled\n");
     crate::sched::pelt::run_selftests();
     append_kthread_selftest_case(&mut report, "pelt_arithmetic", true, &mut failures);
 

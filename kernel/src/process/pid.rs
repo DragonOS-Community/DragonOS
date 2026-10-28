@@ -18,7 +18,7 @@ use super::{ProcessControlBlock, RawPid};
 #[path = "pid_selftest.rs"]
 mod selftest;
 pub(crate) use selftest::selftest_membership_lifetime;
-#[cfg(feature = "mm_selftest")]
+#[cfg(feature = "sched_selftest")]
 pub(crate) use selftest::task as unpublished_task_for_selftest;
 
 /// Serializes logical and physical PGID/SID membership transactions.

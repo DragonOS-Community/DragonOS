@@ -150,7 +150,7 @@ impl WaitQueue {
     /// Test-only exact registration evidence. SLEEPING is published only by
     /// prepare_sleep(), after the queued waiter's predicate returned None.
     /// This does not imply the target PCB has reached mark_sleep().
-    #[cfg(feature = "mm_selftest")]
+    #[cfg(feature = "sched_selftest")]
     pub(crate) fn has_sleeping_waiter(&self, tag: usize) -> bool {
         self.inner
             .lock_irqsave()

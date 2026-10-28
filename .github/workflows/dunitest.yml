@@ -9,7 +9,7 @@ on:
 
 env:
   ARCH: x86_64
-  KERNEL_FEATURES: mm_selftest
+  KERNEL_FEATURES: mm_selftest,sched_selftest
   HOME: /root
   # The CI container has no Docker daemon; use the archive-backed manifest.
   ROOTFS_MANIFEST: default

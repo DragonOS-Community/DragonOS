@@ -2365,7 +2365,7 @@ impl Scheduler for CompletelyFairScheduler {
     }
 }
 
-#[cfg(feature = "mm_selftest")]
+#[cfg(feature = "sched_selftest")]
 mod group_switch_selftest;
-#[cfg(feature = "mm_selftest")]
+#[cfg(feature = "sched_selftest")]
 pub(crate) use group_switch_selftest::run as run_group_switch_selftest;

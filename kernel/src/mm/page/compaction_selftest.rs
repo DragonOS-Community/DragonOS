@@ -1730,6 +1730,22 @@ fn background_idle_until(
     }
 }
 
+fn background_fixture_idle_until(
+    order: usize,
+    max: PhysAddr,
+    deadline: u64,
+) -> Result<bool, SystemError> {
+    loop {
+        if crate::mm::compaction::background::selftest::fixture_idle(order, max, false) {
+            return Ok(true);
+        }
+        if crate::time::timer::clock() >= deadline {
+            return Ok(false);
+        }
+        crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 1_000_000))?;
+    }
+}
+
 // Prepare capacity before holding the registry. These are real fixed-frame
 // owners, not a candidate override: they prevent unrelated data from consuming
 // this fixture's free holes while the real worker discovers its sources.
@@ -1784,7 +1800,7 @@ fn pin_foreign_dma_sources(
 // No failed DMA recovery request or private worker authorization is issued.
 fn proactive_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
     use crate::mm::compaction::background::selftest::{
-        observe, observe_mask, observe_proactive, observe_slot,
+        observe, observe_mask, observe_proactive, observe_slot, FIXTURE_QUIESCENCE_US,
     };
     let mut phase = "headroom";
     let mut detail = alloc::string::String::new();
@@ -1800,7 +1816,19 @@ fn proactive_background_recovery() -> ((bool, bool, bool), alloc::string::String
         phase = "fixture";
         let mut fixture =
             Fixture::with_range(false, false, Some((PhysAddr::new(0), PhysAddr::new(end))))?;
-        let prefix_end = fixture.base.unwrap().data() + BACKING * MMArch::PAGE_SIZE;
+        // Retain a real free run before allocating fixture metadata. Otherwise
+        // that metadata can consume the last initial run inside the final mask.
+        // Raw ownership does not publish a successful-demand lease.
+        let order = DMA_REQUEST_PAGES.trailing_zeros() as usize;
+        let mut entries = 65_536;
+        let mut initial_run = Some(
+            try_allocate_in_range(PhysAddr::new(0), PhysAddr::new(end), order, &mut entries)
+                .map_err(|_| SystemError::ENOMEM)?
+                .ok_or(SystemError::ENOMEM)?,
+        );
+        let prefix_end = (fixture.base.unwrap().data() + BACKING * MMArch::PAGE_SIZE).max(
+            initial_run.as_ref().unwrap().start().data() + DMA_REQUEST_PAGES * MMArch::PAGE_SIZE,
+        );
         let max = PhysAddr::new(prefix_end - 1);
         let mut prefix = PrefixReservations::new(prefix_end)?;
         let mut foreign = Vec::new();
@@ -1821,110 +1849,133 @@ fn proactive_background_recovery() -> ((bool, bool, bool), alloc::string::String
                     .map_err(|_| SystemError::EBUSY)?,
             );
         }
-        let options = DmaAllocOptions {
-            dma_mask: Some(max.data() as u64),
-            use_pool: false,
-            ..DmaAllocOptions::default()
-        };
-        phase = "successful_demand";
-        let demand = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, options)?;
-        prefix.hold_remaining()?;
-        fixture.release_holes();
-        let order = DMA_REQUEST_PAGES.trailing_zeros() as usize;
-        phase = "readonly_missing_stock";
-        loop {
-            let stock = LockedFrameAllocator::with_buddy(|buddy| {
-                buddy.compaction_snapshot(order, max, false, 2)
-            })
-            .ok_or(SystemError::ENOMEM)?
-            .map_err(|_| SystemError::EBUSY)?;
-            if stock.runs == 0 {
-                break;
+        let mut demand = None;
+        let mut captured = None;
+        let exercise = (|| -> Result<(bool, bool, bool), SystemError> {
+            let options = DmaAllocOptions {
+                dma_mask: Some(max.data() as u64),
+                use_pool: false,
+                ..DmaAllocOptions::default()
+            };
+            phase = "successful_demand";
+            drop(initial_run.take());
+            demand = Some(DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, options)?);
+            prefix.hold_remaining()?;
+            fixture.release_holes();
+            phase = "readonly_missing_stock";
+            loop {
+                let stock = LockedFrameAllocator::with_buddy(|buddy| {
+                    buddy.compaction_snapshot(order, max, false, 2)
+                })
+                .ok_or(SystemError::ENOMEM)?
+                .map_err(|_| SystemError::EBUSY)?;
+                if stock.runs == 0 {
+                    break;
+                }
+                // Consume only observed available inventory, never issue a failed
+                // request to authorize the old recovery mechanism.
+                if foreign.len() == foreign.capacity() {
+                    return Err(SystemError::ENOMEM);
+                }
+                foreign.push(DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, options)?);
             }
-            // Consume only observed available inventory, never issue a failed
-            // request to authorize the old recovery mechanism.
-            if foreign.len() == foreign.capacity() {
-                return Err(SystemError::ENOMEM);
+            if !fixture.valid() {
+                return Ok((false, false, false));
             }
-            foreign.push(DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, options)?);
-        }
-        if !fixture.valid() {
-            return Ok((false, false, false));
-        }
-        let initial = observe_proactive();
-        let requests = observe().requests;
+            let initial = observe_proactive();
+            let requests = observe().requests;
+            setup_pins.clear();
+            phase = "ordinary_timer_progress";
+            let deadline = crate::time::timer::next_n_us_timer_jiffies(12_000_000);
+            let after = loop {
+                let sample = LockedFrameAllocator::with_buddy(|buddy| {
+                    buddy.compaction_snapshot(order, max, false, 2)
+                })
+                .ok_or(SystemError::ENOMEM)?
+                .map_err(|_| SystemError::EBUSY)?;
+                let observed = observe_proactive();
+                if sample.runs != 0 && observed.moved > initial.moved {
+                    break observed;
+                }
+                if crate::time::timer::clock() >= deadline {
+                    return Err(SystemError::ETIMEDOUT);
+                }
+                crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 5_000_000))?;
+            };
+            let moved = fixture.sources.iter().any(|source| {
+                let index = (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
+                fixture
+                    .source_page(index)
+                    .is_some_and(|page| page.phys_address() != source.physical)
+            });
+            phase = "ordinary_capture";
+            captured = Some(DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, options)?);
+            let buffer = captured.as_ref().unwrap();
+            let ownership = buffer
+                .paddr()
+                .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
+                && buffer.paddr() + buffer.len() <= prefix_end
+                && buffer.as_slice().iter().all(|byte| *byte == 0)
+                && fixture.valid();
+            let triggered = after.rounds > initial.rounds
+                && after.slices > initial.slices
+                && observe().requests == requests;
+            phase = "demand_expiry";
+            let actual_expiry = observe_mask(order, max, false)
+                .ok_or(SystemError::EIO)?
+                .expires;
+            let expiry_limit = crate::time::timer::next_n_us_timer_jiffies(12_000_000);
+            loop {
+                if crate::time::timer::clock() >= actual_expiry
+                    && observe_mask(order, max, false).is_none()
+                    && observe_slot(order, false).is_some_and(|(_, leases)| leases == 0)
+                {
+                    break;
+                }
+                if crate::time::timer::clock() >= expiry_limit {
+                    return Err(SystemError::ETIMEDOUT);
+                }
+                crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 10_000_000))?;
+            }
+            let (quiet_rounds, _) = observe_slot(order, false).ok_or(SystemError::EIO)?;
+            crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 600_000_000))?;
+            let stopped = observe_slot(order, false)
+                .is_some_and(|(rounds, leases)| rounds == quiet_rounds && leases == 0);
+            // Retain all fixed owners until expiry: cleanup must not manufacture
+            // a free target which could masquerade as production migration.
+            let valid = fixture.valid();
+            let _ = writeln!(detail, "requests_unchanged={} rounds={} slices={} moved={} source_changed={moved} captured={ownership} lease_expired=true",
+                observe().requests == requests, after.rounds - initial.rounds,
+                after.slices - initial.slices, after.moved - initial.moved);
+            Ok((triggered, moved && ownership && valid, stopped))
+        })();
+        // Every error exit retains the fixed owners and pins until both work
+        // classes finish and the fixture's successful-demand lease expires.
+        let cleanup = background_fixture_idle_until(
+            order,
+            max,
+            crate::time::timer::next_n_us_timer_jiffies(FIXTURE_QUIESCENCE_US),
+        );
+        let quiescent = matches!(&cleanup, Ok(true));
         drop(setup_pins);
-        phase = "ordinary_timer_progress";
-        let deadline = crate::time::timer::next_n_us_timer_jiffies(12_000_000);
-        let after = loop {
-            let sample = LockedFrameAllocator::with_buddy(|buddy| {
-                buddy.compaction_snapshot(order, max, false, 2)
-            })
-            .ok_or(SystemError::ENOMEM)?
-            .map_err(|_| SystemError::EBUSY)?;
-            let observed = observe_proactive();
-            if sample.runs != 0 && observed.moved > initial.moved {
-                break observed;
-            }
-            if crate::time::timer::clock() >= deadline {
-                return Err(SystemError::ETIMEDOUT);
-            }
-            crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 5_000_000))?;
-        };
-        let moved = fixture.sources.iter().any(|source| {
-            let index = (source.address.data() - fixture.address.data()) / MMArch::PAGE_SIZE;
-            fixture
-                .source_page(index)
-                .is_some_and(|page| page.phys_address() != source.physical)
-        });
-        phase = "ordinary_capture";
-        let buffer = DmaBuffer::try_alloc_pages(DMA_REQUEST_PAGES, options)?;
-        let ownership = buffer
-            .paddr()
-            .is_multiple_of(DMA_REQUEST_PAGES * MMArch::PAGE_SIZE)
-            && buffer.paddr() + buffer.len() <= prefix_end
-            && buffer.as_slice().iter().all(|byte| *byte == 0)
-            && fixture.valid();
-        let triggered = after.rounds > initial.rounds
-            && after.slices > initial.slices
-            && observe().requests == requests;
-        phase = "demand_expiry";
-        let actual_expiry = observe_mask(order, max, false)
-            .ok_or(SystemError::EIO)?
-            .expires;
-        let expiry_limit = crate::time::timer::next_n_us_timer_jiffies(12_000_000);
-        loop {
-            if crate::time::timer::clock() >= actual_expiry
-                && observe_mask(order, max, false).is_none()
-                && observe_slot(order, false).is_some_and(|(_, leases)| leases == 0)
-            {
-                break;
-            }
-            if crate::time::timer::clock() >= expiry_limit {
-                return Err(SystemError::ETIMEDOUT);
-            }
-            crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 10_000_000))?;
-        }
-        let (quiet_rounds, _) = observe_slot(order, false).ok_or(SystemError::EIO)?;
-        crate::time::sleep::nanosleep(crate::time::PosixTimeSpec::new(0, 600_000_000))?;
-        let stopped = observe_slot(order, false)
-            .is_some_and(|(rounds, leases)| rounds == quiet_rounds && leases == 0);
-        // Retain all fixed owners until expiry: cleanup must not manufacture
-        // a free target which could masquerade as production migration.
-        let valid = fixture.valid();
-        let _ = writeln!(detail, "requests_unchanged={} rounds={} slices={} moved={} source_changed={moved} captured={ownership} lease_expired=true",
-            observe().requests == requests, after.rounds - initial.rounds,
-            after.slices - initial.slices, after.moved - initial.moved);
-        drop(buffer);
+        drop(captured);
         drop(demand);
+        drop(initial_run);
         drop(foreign);
         drop(foreign_pins);
         drop(prefix);
-        Ok((
-            triggered,
-            moved && ownership && valid,
-            fixture.finish(valid && stopped),
-        ))
+        let passed = fixture.finish(
+            quiescent
+                && exercise
+                    .as_ref()
+                    .is_ok_and(|(_, valid, stopped)| *valid && *stopped),
+        );
+        if !quiescent {
+            phase = "cleanup_idle";
+            return Err(cleanup.err().unwrap_or(SystemError::ETIMEDOUT));
+        }
+        let (triggered, valid, _) = exercise?;
+        Ok((triggered, valid, passed))
     })();
     let error = result.as_ref().err().cloned();
     (
@@ -1934,7 +1985,9 @@ fn proactive_background_recovery() -> ((bool, bool, bool), alloc::string::String
 }
 
 fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
-    use crate::mm::compaction::background::selftest::observe;
+    use crate::mm::compaction::background::selftest::{
+        observe, observe_proactive, FIXTURE_QUIESCENCE_US,
+    };
     let mut detail = alloc::string::String::new();
     let mut phase = "initial_idle";
     let mut rounds = 0;
@@ -1943,6 +1996,7 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
         let initial =
             background_idle_until(crate::time::timer::next_n_us_timer_jiffies(2_000_000))?
                 .ok_or(SystemError::ETIMEDOUT)?;
+        let initial_proactive = observe_proactive();
         let free = unsafe { LockedFrameAllocator.usage() }.free().data();
         if free < 2 * DMA_HEADROOM_PAGES {
             return Err(SystemError::ENOMEM);
@@ -1955,6 +2009,8 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
         let mut fixture =
             Fixture::with_range(false, false, Some((PhysAddr::new(0), PhysAddr::new(end))))?;
         let prefix_end = fixture.base.unwrap().data() + BACKING * MMArch::PAGE_SIZE;
+        let max = PhysAddr::new(prefix_end - 1);
+        let order = DMA_REQUEST_PAGES.trailing_zeros() as usize;
         let mut prefix = PrefixReservations::new(prefix_end)?;
         let mut foreign = Vec::new();
         foreign
@@ -2032,7 +2088,9 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
                     exit_reason = "worker_deadline";
                     break;
                 };
-                if after.moved > initial.moved {
+                if after.moved > initial.moved
+                    || observe_proactive().moved > initial_proactive.moved
+                {
                     // This retry has no direct-recovery permission. It cannot
                     // manufacture the migration evidence attributed to the worker.
                     match dma_fixture_allocation(&fixture, &mut foreign, prefix_end, || {
@@ -2049,14 +2107,25 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
                 }
             }
             phase = "final_idle";
-            let final_state =
-                background_idle_until(crate::time::timer::next_n_us_timer_jiffies(3_000_000))?
-                    .ok_or(SystemError::ETIMEDOUT)?;
+            if !background_fixture_idle_until(
+                order,
+                max,
+                crate::time::timer::next_n_us_timer_jiffies(FIXTURE_QUIESCENCE_US),
+            )? {
+                return Err(SystemError::ETIMEDOUT);
+            }
+            let final_state = observe();
+            let final_proactive = observe_proactive();
             let triggered = unavailable
                 && final_state.requests > initial.requests
                 && final_state.rounds > initial.rounds;
-            let migrated =
-                final_state.compactions > initial.compactions && final_state.moved > initial.moved;
+            // Both work classes share this worker and migration core. A recent
+            // successful demand can replenish the run before urgent discovery
+            // reaches it; the consumed request must not have to move it again.
+            let migrated = (final_state.compactions > initial.compactions
+                && final_state.moved > initial.moved)
+                || (final_proactive.slices > initial_proactive.slices
+                    && final_proactive.moved > initial_proactive.moved);
             let ownership = recovered.as_ref().is_some_and(|buffer| {
                 buffer.page_count().data() == DMA_REQUEST_PAGES
                     && buffer
@@ -2081,9 +2150,10 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
                 && quiet.pending == 0
                 && quiet.active == 0
                 && quiet.deadline == 0;
-            let _ = writeln!(detail, "requests={} rounds={} compactions={} moved={} legal_requests={rounds} captured={} idle={idle} foreign_runs={} discovery_progress={}",
+            let _ = writeln!(detail, "requests={} rounds={} compactions={} moved={} legal_requests={rounds} captured={} idle={idle} foreign_runs={} discovery_progress={} proactive_slices={} proactive_moved={}",
                 final_state.requests - initial.requests, final_state.rounds - initial.rounds,
-                final_state.compactions - initial.compactions, final_state.moved - initial.moved, recovered.is_some(), foreign.len(), final_state.discovery_progress - initial.discovery_progress);
+                final_state.compactions - initial.compactions, final_state.moved - initial.moved, recovered.is_some(), foreign.len(), final_state.discovery_progress - initial.discovery_progress,
+                final_proactive.slices - initial_proactive.slices, final_proactive.moved - initial_proactive.moved);
             let fixture_moved = fixture
                 .sources
                 .iter()
@@ -2102,15 +2172,19 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
             drop(recovered);
             Ok((
                 triggered,
-                migrated && ownership && contents && buckets == final_buckets,
+                migrated && fixture_moved != 0 && ownership && contents && buckets == final_buckets,
                 idle,
             ))
         })();
         // The exercise may leave on any error, including with an in-flight
-        // one-shot request. Quiesce using a fresh cleanup budget before
+        // request or successful-demand lease. Use a fresh cleanup budget before
         // releasing any fixture owner or foreign physical-access pin.
-        let cleanup = background_idle_until(crate::time::timer::next_n_us_timer_jiffies(3_000_000));
-        let quiescent = matches!(&cleanup, Ok(Some(_)));
+        let cleanup = background_fixture_idle_until(
+            order,
+            max,
+            crate::time::timer::next_n_us_timer_jiffies(FIXTURE_QUIESCENCE_US),
+        );
+        let quiescent = matches!(&cleanup, Ok(true));
         if exercise.is_err() || !quiescent {
             let state = observe();
             let stops: [u64; 7] =

@@ -368,6 +368,80 @@ pub(crate) fn observe_mask(order: usize, max: PhysAddr, normal: bool) -> Option<
     })
 }
 
+// Fixture owners must outlive their successful demand and any work already
+// executing on the shared worker. Other masks may retain legitimate leases.
+pub(crate) const FIXTURE_QUIESCENCE_US: u64 = LEASE_US + 3_000_000;
+
+fn fixture_idle_state(state: &Pending, index: usize, max: usize, now: u64) -> bool {
+    state
+        .slots
+        .iter()
+        .all(|slot| slot.pending.is_none() && !slot.active)
+        && state.proactive.slots.iter().all(|slot| !slot.active)
+        && !state.proactive.slots[index]
+            .endpoints
+            .iter()
+            .flatten()
+            .any(|demand| demand.max == max && demand.expires > now)
+}
+
+/// Take one coherent, read-only observation; never cancel demand or work.
+pub(crate) fn fixture_idle(order: usize, max: PhysAddr, normal: bool) -> bool {
+    if order == 0 || order > MAX_COMPACT_ORDER {
+        return false;
+    }
+    let index = usize::from(!normal) * MAX_COMPACT_ORDER + order - 1;
+    let max = if normal {
+        max.data()
+    } else {
+        max.data().min(u32::MAX as usize)
+    };
+    let state = PENDING.lock_irqsave();
+    fixture_idle_state(&state, index, max, clock())
+}
+
+fn fixture_quiescence() -> bool {
+    let mut state = Pending::new();
+    let index = MAX_COMPACT_ORDER;
+    if !fixture_idle_state(&state, index, 100, 0) {
+        return false;
+    }
+    state.proactive.post(index, 100, 0);
+    let expires = state.proactive.slots[index].endpoints[0].unwrap().expires;
+    if fixture_idle_state(&state, index, 100, 0) || !fixture_idle_state(&state, index, 100, expires)
+    {
+        return false;
+    }
+    // Expiry/replacement can remove the endpoint while its work is in flight.
+    state.proactive.slots[index].active = true;
+    state.proactive.slots[index].endpoints = [None, None];
+    if fixture_idle_state(&state, index, 100, expires) {
+        return false;
+    }
+    state.proactive.slots[index].active = false;
+    state.proactive.post(index, 200, expires);
+    if !fixture_idle_state(&state, index, 100, expires) {
+        return false;
+    }
+    // A different order can also be executing on the same worker.
+    state.proactive.slots[0].active = true;
+    if fixture_idle_state(&state, index, 100, expires) {
+        return false;
+    }
+    state.proactive.slots[0].active = false;
+    state.post(0, 100);
+    if fixture_idle_state(&state, index, 100, expires) {
+        return false;
+    }
+    state.slots[0].pending = None;
+    state.slots[0].active = true;
+    if fixture_idle_state(&state, index, 100, expires) {
+        return false;
+    }
+    state.slots[0].active = false;
+    fixture_idle_state(&state, index, 100, expires)
+}
+
 fn recent_masks() -> bool {
     let mut state = Proactive::new();
     state.post(0, 100, 0);
@@ -538,7 +612,7 @@ fn work_class_fairness() -> bool {
     matches!(state.take_next(now), Some(SelectedWork::Proactive(_)))
 }
 
-pub(crate) fn proactive_checks() -> [(&'static str, bool); 5] {
+pub(crate) fn proactive_checks() -> [(&'static str, bool); 6] {
     [
         ("proactive_recent_masks", recent_masks()),
         ("proactive_global_gates", proactive_gates()),
@@ -548,6 +622,7 @@ pub(crate) fn proactive_checks() -> [(&'static str, bool); 5] {
             proactive_replacement() && proactive_renewal(),
         ),
         ("proactive_class_fairness", work_class_fairness()),
+        ("proactive_fixture_quiescence", fixture_quiescence()),
     ]
 }
 

@@ -51,7 +51,7 @@ void CheckReport(const std::string& report) {
             "dma_background_real_request", "dma_background_migration_retry", "dma_background_idle",
             "proactive_successful_demand", "proactive_migration_capture", "proactive_lease_expiry",
             "proactive_worker_demand_exclusion", "proactive_recent_masks", "proactive_global_gates", "proactive_backoff_expiry",
-            "proactive_active_replacement", "proactive_class_fairness"}) {
+            "proactive_active_replacement", "proactive_class_fairness", "proactive_fixture_quiescence"}) {
         EXPECT_NE(std::string::npos, report.find(std::string(key) + "=ok\n")) << report;
     }
 }

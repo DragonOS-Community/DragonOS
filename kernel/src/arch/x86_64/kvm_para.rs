@@ -1,15 +1,29 @@
 use x86::cpuid::{cpuid, CpuId, Hypervisor, HypervisorInfo};
 
+pub(crate) mod steal_time;
+
+/// Revoke host writes before publishing a terminal CPU state or reusing RAM.
+/// This is not a suspend hook: the CPU must not resume normal scheduling.
+pub(crate) fn shutdown_time() {
+    use crate::{arch::CurrentIrqArch, exception::InterruptArch};
+
+    debug_assert!(!CurrentIrqArch::is_irq_enabled());
+    crate::driver::clocksource::kvm_clock::shutdown_current_cpu();
+    steal_time::shutdown_current_cpu();
+}
+
 pub const KVM_CPUID_FEATURES: u32 = 0x4000_0001;
 
 pub const KVM_FEATURE_CLOCKSOURCE: u32 = 0;
 pub const KVM_FEATURE_CLOCKSOURCE2: u32 = 3;
+pub const KVM_FEATURE_STEAL_TIME: u32 = 5;
 pub const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u32 = 24;
 
 pub const MSR_KVM_WALL_CLOCK: u32 = 0x11;
 pub const MSR_KVM_SYSTEM_TIME: u32 = 0x12;
 pub const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 pub const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+pub const MSR_KVM_STEAL_TIME: u32 = 0x4b56_4d03;
 
 pub fn kvm_para_get_hypervisor_info() -> Option<HypervisorInfo> {
     let c = CpuId::new().get_hypervisor_info()?;

@@ -124,12 +124,19 @@ const _: () = {
 pub struct KernelCpuStat {
     /// 各类 CPU 时间累计（单位：纳秒）
     pub cpustat: [AtomicU64; NR_CPU_STATS],
+    // These two cursors are written only by this CPU with IRQs disabled.
+    // Keep observation separate from consumption: tick accounting may retain
+    // an unconsumed balance, including when the current limit is zero.
+    observed_steal_time: AtomicU64,
+    consumed_steal_time: AtomicU64,
 }
 
 impl KernelCpuStat {
     pub const fn new() -> Self {
         Self {
             cpustat: [const { AtomicU64::new(0) }; NR_CPU_STATS],
+            observed_steal_time: AtomicU64::new(0),
+            consumed_steal_time: AtomicU64::new(0),
         }
     }
 
@@ -154,6 +161,49 @@ impl KernelCpuStat {
         }
         result
     }
+
+    fn account_steal(&self, total: u64, max: u64) -> u64 {
+        debug_assert!(!CurrentIrqArch::is_irq_enabled());
+        let observed = self.observed_steal_time.load(Ordering::Relaxed);
+        let consumed = self.consumed_steal_time.load(Ordering::Relaxed);
+        self.observed_steal_time.store(total, Ordering::Relaxed);
+        if total < observed {
+            // A restored source must normally preserve its cumulative value.
+            // If that contract is lost, discard the old balance rather than
+            // underflowing or charging history from a different epoch.
+            self.consumed_steal_time.store(total, Ordering::Relaxed);
+            return 0;
+        }
+        let steal = total.saturating_sub(consumed).min(max);
+        self.consumed_steal_time
+            .store(consumed + steal, Ordering::Relaxed);
+        if steal != 0 {
+            self.account(CpuUsageStat::Steal, steal);
+        }
+        steal
+    }
+}
+
+/// Cumulative steal is optional, and belongs to the target CPU, not the reader.
+#[inline]
+pub(super) fn steal_clock(cpu: ProcessorId) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    return crate::arch::kvm_para::steal_time::read(cpu);
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = cpu;
+        None
+    }
+}
+
+/// Linux rq accounting consumes the full published sample even when only part
+/// fits in this clock update. Tick/usage accounting instead retains a balance.
+#[inline]
+pub(super) fn rq_steal_time(total: u64, previous: &mut u64, delta: u64) -> u64 {
+    let steal = total.saturating_sub(*previous).min(delta);
+    *previous = total;
+    steal
 }
 
 static KERNEL_CPU_STAT: Lazy<PerCpuVar<KernelCpuStat>> = PerCpuVar::define_lazy();
@@ -359,8 +409,15 @@ impl CpuTimeFunc {
         accounted
     }
 
-    pub fn steal_account_process_time(_max: u64) -> u64 {
-        // 这里未考虑虚拟机时间窃取
-        0
+    pub fn steal_account_process_time(max: u64) -> u64 {
+        debug_assert!(!CurrentIrqArch::is_irq_enabled());
+        let Some(total) = steal_clock(smp_get_processor_id()) else {
+            return 0;
+        };
+        kcpustat_this_cpu().account_steal(total, max)
     }
 }
+
+#[path = "cputime_selftest.rs"]
+mod selftest;
+pub(crate) use selftest::run_virtual_time_selftests;

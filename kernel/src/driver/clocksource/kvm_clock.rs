@@ -54,6 +54,10 @@ impl KvmClockPage {
 static mut KVM_CLOCK_PAGES: Option<PerCpuVar<KvmClockPage>> = None;
 static MSR_KVM_SYSTEM_TIME: AtomicU32 = AtomicU32::new(0);
 static KVM_CLOCK_READY: AtomicBool = AtomicBool::new(false);
+// Allocating an AP's page does not register it with that vCPU. Publish local
+// eligibility only after its MSR is installed; pages live for the kernel's life.
+static KVM_CLOCK_REGISTERED: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicBool::new(false) }; PerCpu::MAX_CPU_NUM as usize];
 
 #[derive(Debug)]
 pub struct KvmClock(SpinLock<InnerKvmClock>);
@@ -283,6 +287,36 @@ fn kvm_clock_read() -> Option<u64> {
     Some(pvclock::pvclock_clocksource_read_nowd(pvti))
 }
 
+/// Scheduler-only nanosecond read, independent of clocksource selection.
+///
+/// The caller keeps IRQs disabled through both this read and its local clock
+/// update. Successful registration is permanent, so an initialized CPU cannot
+/// silently fall back to a different raw clock epoch.
+pub(crate) fn sched_clock_read() -> Option<u64> {
+    use crate::{arch::CurrentIrqArch, exception::InterruptArch};
+
+    debug_assert!(!CurrentIrqArch::is_irq_enabled());
+    if !KVM_CLOCK_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let cpu = smp_get_processor_id();
+    if !KVM_CLOCK_REGISTERED[cpu.data() as usize].load(Ordering::Acquire) {
+        return None;
+    }
+    let pvti = this_cpu_pvti().expect("registered kvm-clock CPU lost its pvclock page");
+    Some(pvclock::pvclock_clocksource_read_nowd(pvti))
+}
+
+/// Stop host writes before this CPU terminates or old kernel RAM is reused.
+/// The caller has IRQs disabled and must not resume ordinary kernel execution.
+pub(crate) fn shutdown_current_cpu() {
+    let registered = &KVM_CLOCK_REGISTERED[smp_get_processor_id().data() as usize];
+    if registered.load(Ordering::Acquire) {
+        disable_system_time_msr();
+        registered.store(false, Ordering::Release);
+    }
+}
+
 fn init_msrs() -> bool {
     let (system_time, wall_clock) = match kvm_para::kvm_clock_msrs() {
         Some(msrs) => msrs,
@@ -350,7 +384,8 @@ pub fn kvmclock_init() -> bool {
         return false;
     }
 
-    KVM_CLOCK_READY.store(true, Ordering::SeqCst);
+    KVM_CLOCK_REGISTERED[smp_get_processor_id().data() as usize].store(true, Ordering::Release);
+    KVM_CLOCK_READY.store(true, Ordering::Release);
 
     update_tsc_khz_from_pvclock();
 
@@ -370,6 +405,7 @@ pub fn kvmclock_init_secondary() -> Result<(), SystemError> {
     }
 
     write_system_time_msr(page.phys);
+    KVM_CLOCK_REGISTERED[cpu_id.data() as usize].store(true, Ordering::Release);
     Ok(())
 }
 

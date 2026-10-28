@@ -116,6 +116,9 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     // 3.独立尝试注册 ACPI PM Timer，保留可用的备用时钟源
     // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
+    if let Err(error) = crate::arch::kvm_para::steal_time::init_current_cpu() {
+        warn!("KVM steal time unavailable: {:?}", error);
+    }
     let hpet_ok = match hpet_init() {
         Ok(()) => match hpet_instance().hpet_enable() {
             Ok(_) => true,

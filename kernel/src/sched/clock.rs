@@ -13,6 +13,10 @@ const CLOCK_UNINITIALIZED: u8 = 0;
 const CLOCK_INITIALIZING: u8 = 1;
 #[cfg(target_arch = "x86_64")]
 const CLOCK_INITIALIZED: u8 = 2;
+#[cfg(target_arch = "x86_64")]
+const SOURCE_TSC: u8 = 0;
+#[cfg(target_arch = "x86_64")]
+const SOURCE_PVCLOCK: u8 = 1;
 
 #[cfg(target_arch = "x86_64")]
 #[repr(align(64))]
@@ -21,6 +25,7 @@ struct SchedClockData {
     tick_clock: AtomicU64,
     clock: AtomicU64,
     state: AtomicU8,
+    source: AtomicU8,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -31,24 +36,34 @@ impl SchedClockData {
             tick_clock: AtomicU64::new(0),
             clock: AtomicU64::new(0),
             state: AtomicU8::new(CLOCK_UNINITIALIZED),
+            source: AtomicU8::new(SOURCE_TSC),
         }
     }
 
-    fn initialize(&self, raw: u64, global: u64) -> bool {
+    fn initialize(&self, raw: u64, global: u64, source: u8) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        if state == CLOCK_INITIALIZING {
+            return false;
+        }
+        if state == CLOCK_INITIALIZED && self.source.load(Ordering::Relaxed) == source {
+            return true;
+        }
+        // Local IRQs are disabled. The same handoff also covers an AP that
+        // sampled TSC before its pvclock registration; never subtract epochs.
         match self.state.compare_exchange(
-            CLOCK_UNINITIALIZED,
+            state,
             CLOCK_INITIALIZING,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => {}
-            Err(CLOCK_INITIALIZED) => return true,
             Err(_) => return false,
         }
         let old = self.clock.load(Ordering::Acquire);
         let anchor = advance_clock(self, later_clock(global, old));
         self.tick_raw.store(raw, Ordering::Relaxed);
         self.tick_clock.store(anchor, Ordering::Relaxed);
+        self.source.store(source, Ordering::Relaxed);
         self.state.store(CLOCK_INITIALIZED, Ordering::Release);
         true
     }
@@ -89,11 +104,17 @@ const fn corrected_clock_value(raw: u64, tick_raw: u64, tick_clock: u64, old: u6
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn raw_sched_clock() -> u64 {
+fn raw_sched_clock() -> (u64, u8) {
+    if let Some(now) = crate::driver::clocksource::kvm_clock::sched_clock_read() {
+        return (now, SOURCE_PVCLOCK);
+    }
     if crate::arch::driver::tsc::TSCManager::cpu_khz() == 0 {
-        0
+        (0, SOURCE_TSC)
     } else {
-        CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64
+        (
+            CurrentTimeArch::cycles2ns(CurrentTimeArch::get_cycles()) as u64,
+            SOURCE_TSC,
+        )
     }
 }
 
@@ -109,18 +130,21 @@ impl SchedClock {
     /// Couples the current CPU's raw clock to the global tick epoch.
     ///
     /// If CPU0 later stops ticking, the last raw anchor remains in place and
-    /// healthy CPUs continue advancing from their invariant local counters.
+    /// healthy CPUs continue advancing from their local clock source.
     #[inline]
     pub fn tick(cpu: ProcessorId) {
         #[cfg(target_arch = "x86_64")]
         {
-            let raw = raw_sched_clock();
+            use crate::{arch::CurrentIrqArch, exception::InterruptArch};
+            debug_assert!(!CurrentIrqArch::is_irq_enabled());
+            debug_assert_eq!(cpu, crate::smp::core::smp_get_processor_id());
+            let (raw, source) = raw_sched_clock();
             if raw == 0 {
                 return;
             }
             let global = global_tick_clock();
             let data = &SCHED_CLOCK_DATA[cpu.data() as usize];
-            if !data.initialize(raw, global) {
+            if !data.initialize(raw, global, source) {
                 return;
             }
             let local = update_local_clock(data, raw);
@@ -154,13 +178,17 @@ impl SchedClock {
     pub fn sched_clock_cpu(cpu: ProcessorId) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
-            let raw = raw_sched_clock();
-            if raw == 0 {
-                return 0;
-            }
+            use crate::{arch::CurrentIrqArch, exception::InterruptArch};
+            // Keep the PV page, raw sample and local anchor on the same CPU,
+            // including callers outside the runqueue/IRQ accounting paths.
+            let _irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
             let current_cpu = crate::smp::core::smp_get_processor_id();
             let local_data = &SCHED_CLOCK_DATA[current_cpu.data() as usize];
-            if !local_data.initialize(raw, global_tick_clock()) {
+            let (raw, source) = raw_sched_clock();
+            if raw == 0 {
+                return local_data.clock.load(Ordering::Acquire);
+            }
+            if !local_data.initialize(raw, global_tick_clock(), source) {
                 return local_data.clock.load(Ordering::Acquire);
             }
             let local = update_local_clock(local_data, raw);
@@ -236,6 +264,23 @@ pub(crate) fn run_sched_clock_selftests() -> Result<(), &'static str> {
         let wrapped = corrected_clock_value(5, u64::MAX - 10, u64::MAX - 20, u64::MAX - 20);
         if wrapped != u64::MAX - 4 {
             return Err("sched clock lost a valid wrapping delta");
+        }
+        let data = SchedClockData::new();
+        if !data.initialize(9_000_000_000, global, SOURCE_TSC) {
+            return Err("sched clock could not initialize a raw source");
+        }
+        let before = update_local_clock(&data, 9_000_020_000);
+        if !data.initialize(100, global, SOURCE_PVCLOCK)
+            || update_local_clock(&data, 120) != before + 20
+        {
+            return Err("sched clock mixed TSC and pvclock epochs");
+        }
+        let forward = SchedClockData::new();
+        forward.initialize(100, global, SOURCE_TSC);
+        if !forward.initialize(9_000_000_000, global, SOURCE_PVCLOCK)
+            || update_local_clock(&forward, 9_000_000_020) != global + 20
+        {
+            return Err("sched clock charged a forward source-epoch handoff");
         }
     }
     Ok(())

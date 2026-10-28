@@ -147,6 +147,22 @@ impl WaitQueue {
         self.num_waiters.load(Ordering::Acquire) == 0
     }
 
+    /// Test-only exact registration evidence. SLEEPING is published only by
+    /// prepare_sleep(), after the queued waiter's predicate returned None.
+    /// This does not imply the target PCB has reached mark_sleep().
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn has_sleeping_waiter(&self, tag: usize) -> bool {
+        self.inner
+            .lock_irqsave()
+            .waiters
+            .get(&tag)
+            .is_some_and(|waiters| {
+                waiters.iter().any(|waker| {
+                    waker.data().state.load(Ordering::Acquire) == Waker::STATE_SLEEPING
+                })
+            })
+    }
+
     // ==================== Core API: wait_until family ====================
 
     /// Waits until condition returns `Some(R)` (signals are ignored; use

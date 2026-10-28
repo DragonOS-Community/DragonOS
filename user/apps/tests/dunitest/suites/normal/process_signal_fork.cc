@@ -13,8 +13,10 @@ TEST(ProcessSignalFork, PosixForkAndJobControlUnavailableOnWindows) {
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -346,6 +348,172 @@ void RunAsyncSignalReturnStress(bool syscall_heavy) {
     EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
+// Each signal is acknowledged before the next send, so ordinary-signal
+// coalescing cannot turn a burst count into a false delivery assertion.
+class AckPipeGuard {
+public:
+    ~AckPipeGuard() {
+        CloseRead();
+        CloseWrite();
+    }
+    AckPipeGuard() = default;
+    AckPipeGuard(const AckPipeGuard&) = delete;
+    AckPipeGuard& operator=(const AckPipeGuard&) = delete;
+
+    bool Open() { return pipe(fds_) == 0; }
+    int ReadFd() const { return fds_[0]; }
+    int WriteFd() const { return fds_[1]; }
+    void CloseRead() {
+        if (fds_[0] >= 0) {
+            close(fds_[0]);
+            fds_[0] = -1;
+        }
+    }
+    void CloseWrite() {
+        if (fds_[1] >= 0) {
+            close(fds_[1]);
+            fds_[1] = -1;
+        }
+    }
+
+private:
+    int fds_[2] = {-1, -1};
+};
+
+int64_t SignalAckMillis() {
+    timespec now {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+        static_cast<uint64_t>(now.tv_sec) > static_cast<uint64_t>(INT64_MAX - 999) / 1000) {
+        return -1;
+    }
+    return static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+}
+
+bool ReadExpectedByteUntil(int fd, char expected, int64_t deadline_ms) {
+    for (;;) {
+        const int64_t now = SignalAckMillis();
+        if (now < 0 || now >= deadline_ms) {
+            return false;
+        }
+        pollfd descriptor {fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, static_cast<int>(deadline_ms - now));
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready <= 0 || !(descriptor.revents & POLLIN)) {
+            return false;
+        }
+        const int64_t observed = SignalAckMillis();
+        if (observed < 0 || observed >= deadline_ms) {
+            return false;
+        }
+        char value = 0;
+        const ssize_t size = read(fd, &value, sizeof(value));
+        if (size < 0 && errno == EINTR) {
+            continue;
+        }
+        return size == static_cast<ssize_t>(sizeof(value)) && value == expected;
+    }
+}
+
+volatile sig_atomic_t ack_signal_fd = -1;
+volatile sig_atomic_t ack_signal_count = 0;
+volatile sig_atomic_t ack_signal_write_failed = 0;
+
+void AcknowledgeSyscallReturnSignal(int) {
+    const int saved_errno = errno;
+    ++ack_signal_count;
+    const char ack = 'A';
+    if (write(static_cast<int>(ack_signal_fd), &ack, sizeof(ack)) !=
+        static_cast<ssize_t>(sizeof(ack))) {
+        ack_signal_write_failed = 1;
+    }
+    errno = saved_errno;
+}
+
+void RunAcknowledgedSyscallReturnSignals(bool thread_directed) {
+    constexpr int kSignals = 256;
+    AckPipeGuard acknowledgements;
+    ASSERT_TRUE(acknowledgements.Open()) << strerror(errno);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        acknowledgements.CloseRead();
+        ack_signal_fd = acknowledgements.WriteFd();
+        ack_signal_count = 0;
+        ack_signal_write_failed = 0;
+        struct sigaction action {};
+        action.sa_handler = AcknowledgeSyscallReturnSignal;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, nullptr) != 0) {
+            _exit(121);
+        }
+        action.sa_handler = SIG_DFL;
+        if (sigaction(SIGALRM, &action, nullptr) != 0) {
+            _exit(122);
+        }
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGUSR1);
+        sigaddset(&unblocked, SIGALRM);
+        if (sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) {
+            _exit(123);
+        }
+        // Independent safety exit, longer than the parent's whole-window limit.
+        alarm(15);
+        const pid_t expected = static_cast<pid_t>(syscall(SYS_getpid));
+        if (expected <= 0 || syscall(SYS_gettid) != expected) {
+            _exit(124);
+        }
+        WriteByteOrExit(acknowledgements.WriteFd(), 'R');
+        while (ack_signal_count < kSignals && !ack_signal_write_failed) {
+            if (syscall(SYS_getpid) != expected || syscall(SYS_gettid) != expected) {
+                _exit(125);
+            }
+        }
+        const bool success = !ack_signal_write_failed && ack_signal_count == kSignals &&
+            syscall(SYS_getpid) == expected && syscall(SYS_gettid) == expected;
+        alarm(0);
+        acknowledgements.CloseWrite();
+        _exit(success ? 0 : 126);
+    }
+
+    // Construct after the pipe so failure first kills/reaps this exact child,
+    // then closes the remaining read fd. No assertion leaks a live child/fd.
+    ChildProcessGuard child_guard(child);
+    acknowledgements.CloseWrite();
+    const int64_t begin = SignalAckMillis();
+    ASSERT_GE(begin, 0);
+    const int64_t total_deadline = begin + 10000;
+    ASSERT_TRUE(ReadExpectedByteUntil(acknowledgements.ReadFd(), 'R', begin + 2000))
+        << "child did not install handler and report READY";
+    for (int i = 0; i < kSignals; ++i) {
+        const int64_t now = SignalAckMillis();
+        ASSERT_GE(now, 0);
+        ASSERT_LT(now, total_deadline) << "whole 10-second signal window exceeded at " << i;
+        if (thread_directed) {
+            ASSERT_EQ(0, syscall(SYS_tgkill, child, child, SIGUSR1)) << strerror(errno);
+        } else {
+            ASSERT_EQ(0, kill(child, SIGUSR1)) << strerror(errno);
+        }
+        const int64_t per_signal_deadline = now + 1000;
+        const int64_t deadline = per_signal_deadline < total_deadline
+            ? per_signal_deadline : total_deadline;
+        // ACK proves handler entry/write, not completion. A subsequent signal
+        // may be pending until the preceding handler returns; only one is sent.
+        ASSERT_TRUE(ReadExpectedByteUntil(acknowledgements.ReadFd(), 'A', deadline))
+            << "missing per-signal ACK at " << i;
+    }
+    int status = 0;
+    ASSERT_TRUE(WaitForExit(child, &status, 300)) << "child did not exit after final ACK";
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    char extra = 0;
+    EXPECT_EQ(0, read(acknowledgements.ReadFd(), &extra, sizeof(extra)))
+        << "unexpected extra ACK after child exit";
+}
+
 }  // namespace
 
 TEST(ProcessSignalFork, AsyncSignalsDuringSyscallReturns) {
@@ -354,6 +522,39 @@ TEST(ProcessSignalFork, AsyncSignalsDuringSyscallReturns) {
 
 TEST(ProcessSignalFork, AsyncSignalsDuringUserspaceExecution) {
     RunAsyncSignalReturnStress(false);
+}
+
+TEST(ProcessSignalFork, ThreadDirectedSignalAckDuringSyscallReturns) {
+    RunAcknowledgedSyscallReturnSignals(true);
+}
+
+TEST(ProcessSignalFork, ProcessDirectedSignalAckDuringSyscallReturns) {
+    RunAcknowledgedSyscallReturnSignals(false);
+}
+
+TEST(ProcessSignalFork, ZeroTimeoutPselectRestoresSignalMaskWithoutSignal) {
+    sigset_t blocked;
+    ASSERT_EQ(0, sigemptyset(&blocked));
+    ASSERT_EQ(0, sigaddset(&blocked, SIGUSR1));
+    SignalMaskGuard mask_guard(blocked);
+    ASSERT_TRUE(mask_guard.valid()) << strerror(errno);
+
+    sigset_t before;
+    ASSERT_EQ(0, sigprocmask(SIG_SETMASK, nullptr, &before));
+    ASSERT_EQ(1, sigismember(&before, SIGUSR1));
+    sigset_t temporary = before;
+    ASSERT_EQ(0, sigdelset(&temporary, SIGUSR1));
+    ASSERT_EQ(0, sigaddset(&temporary, SIGUSR2));
+    const timespec timeout {};
+    // No signal is sent and no handler count is involved: this is the normal
+    // zero-timeout return, which must restore the original mask independently.
+    ASSERT_EQ(0, pselect(0, nullptr, nullptr, nullptr, &timeout, &temporary)) << strerror(errno);
+    sigset_t after;
+    ASSERT_EQ(0, sigprocmask(SIG_SETMASK, nullptr, &after));
+    for (int signal = 1; signal < NSIG; ++signal) {
+        EXPECT_EQ(sigismember(&before, signal), sigismember(&after, signal))
+            << "mask mismatch for signal " << signal;
+    }
 }
 
 TEST(ProcessSignalFork, SigchldHandlerCanImmediatelyReapExitedChild) {

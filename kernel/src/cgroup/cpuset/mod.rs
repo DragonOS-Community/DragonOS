@@ -237,13 +237,17 @@ pub(crate) fn set_user_affinity(
     task: &Arc<ProcessControlBlock>,
     request: CpuMask,
 ) -> Result<(), SystemError> {
-    let _guard = lock();
-    let mask = &request & &allowed_locked(&task.task_cgroup_node());
-    if mask.is_empty() {
-        return Err(SystemError::EINVAL);
+    {
+        let _guard = lock();
+        let mask = &request & &allowed_locked(&task.task_cgroup_node());
+        if mask.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        task.sched_info().pi_lock_irqsave().user_cpus_allowed = Some(request);
+        ProcessManager::set_cpus_allowed(task, mask)?;
     }
-    task.sched_info().pi_lock_irqsave().user_cpus_allowed = Some(request);
-    ProcessManager::set_cpus_allowed(task, mask)?;
+    // Publication is serialized with cpuset updates. Placement waits on the
+    // latest effective mask and must not hold the global cgroup update lock.
     crate::sched::wait_cpu_placement(task);
     Ok(())
 }

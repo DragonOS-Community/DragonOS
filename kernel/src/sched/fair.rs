@@ -1,6 +1,5 @@
 use core::intrinsics::unlikely;
 use core::mem::swap;
-use core::sync::atomic::fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::libs::spinlock::SpinLock;
@@ -973,7 +972,6 @@ impl CfsRunQueue {
         let now = self.rq().clock_task();
         let curr = curr.unwrap();
 
-        fence(Ordering::SeqCst);
         if unlikely(now <= curr.exec_start) {
             // warn!(
             //     "update_current return now <= curr.exec_start now {now} execstart {}",
@@ -982,7 +980,6 @@ impl CfsRunQueue {
             return;
         }
 
-        fence(Ordering::SeqCst);
         let delta_exec = now - curr.exec_start;
 
         let curr = curr.force_mut();
@@ -998,7 +995,6 @@ impl CfsRunQueue {
 
         // 根据实际运行时长加权增加虚拟运行时长
         curr.vruntime += curr.calculate_delta_fair(delta_exec);
-        fence(Ordering::SeqCst);
         self.update_deadline(&curr.self_arc());
         self.update_min_vruntime();
 
@@ -1511,6 +1507,10 @@ impl CfsRunQueue {
             self.update_current();
         }
 
+        // Like Linux put_prev_entity(): register exhaustion even when the
+        // next task belongs to RT and no Fair pick follows this settlement.
+        self.check_runtime();
+
         if prev.on_rq() {
             self.inner_enqueue_entity(&prev);
         }
@@ -1995,14 +1995,44 @@ impl CompletelyFairScheduler {
         }
     }
 
-    pub fn set_next_task(rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
+    pub fn set_next_task(_rq: &mut CpuRunQueue, next: Arc<ProcessControlBlock>) {
         let mut se = next.sched_info().sched_entity();
         FairSchedEntity::for_each_in_group(&mut se, |se| {
             let cfs = se.cfs_rq();
             cfs.force_mut().set_next_entity(&se);
             (true, true)
         });
-        super::cfs_bandwidth::refresh_runtime_event(rq, &next);
+    }
+
+    /// The owner rq is locked with IRQs disabled. Fair-to-Fair switches only
+    /// replace the diverging entity chains: a shared ancestor stays current,
+    /// preserving its request's RUN_TO_PARITY token and PELT/tree position.
+    pub(super) fn switch_task(prev: &Arc<ProcessControlBlock>, next: &Arc<ProcessControlBlock>) {
+        let mut previous = prev.sched_info().sched_entity();
+        let mut selected = next.sched_info().sched_entity();
+        loop {
+            let previous_rq = previous.cfs_rq();
+            let selected_rq = selected.cfs_rq();
+            if Arc::ptr_eq(&previous_rq, &selected_rq) {
+                previous_rq.force_mut().put_prev_entity(previous);
+                previous_rq.force_mut().set_next_entity(&selected);
+                return;
+            }
+
+            // Both decisions use this round's original depths. Advancing one
+            // side must not alter whether the other side also advances.
+            let previous_depth = previous.depth;
+            let selected_depth = selected.depth;
+            if previous_depth >= selected_depth {
+                let parent = previous.parent().expect("disjoint Fair entity roots");
+                previous_rq.force_mut().put_prev_entity(previous);
+                previous = parent;
+            }
+            if selected_depth >= previous_depth {
+                selected_rq.force_mut().set_next_entity(&selected);
+                selected = selected.parent().expect("disjoint Fair entity roots");
+            }
+        }
     }
 
     /// 寻找到最近公共组长
@@ -2263,7 +2293,7 @@ impl Scheduler for CompletelyFairScheduler {
         se.map(|se| se.pcb())
     }
 
-    fn tick(rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {
+    fn tick(_rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {
         let mut se = pcb.sched_info().sched_entity();
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
@@ -2274,7 +2304,6 @@ impl Scheduler for CompletelyFairScheduler {
             cfs_rq.entity_tick(se, queued);
             (true, true)
         });
-        super::cfs_bandwidth::refresh_runtime_event(rq, &pcb);
     }
 
     fn task_fork(pcb: Arc<ProcessControlBlock>) {
@@ -2335,3 +2364,8 @@ impl Scheduler for CompletelyFairScheduler {
         });
     }
 }
+
+#[cfg(feature = "mm_selftest")]
+mod group_switch_selftest;
+#[cfg(feature = "mm_selftest")]
+pub(crate) use group_switch_selftest::run as run_group_switch_selftest;

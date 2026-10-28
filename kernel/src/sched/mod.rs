@@ -1,3 +1,5 @@
+#[cfg(feature = "mm_selftest")]
+pub(crate) mod affinity_selftest;
 pub(crate) mod cfs_bandwidth;
 pub mod clock;
 pub mod completion;
@@ -1034,20 +1036,33 @@ impl CpuRunQueue {
         let next = next.unwrap_or_else(|| self.idle.upgrade().unwrap());
 
         if !Arc::ptr_eq(&prev, &next) {
-            match prev.sched_info().sched_class() {
-                SchedClass::Realtime => RealtimeScheduler::put_prev_task(self, prev),
-                SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, prev),
-                SchedClass::Idle => IdleScheduler::put_prev_task(self, prev),
-            }
+            match (
+                prev.sched_info().sched_class(),
+                next.sched_info().sched_class(),
+            ) {
+                (SchedClass::Fair, SchedClass::Fair) => {
+                    CompletelyFairScheduler::switch_task(&prev, &next);
+                }
+                (previous_class, selected_class) => {
+                    match previous_class {
+                        SchedClass::Realtime => RealtimeScheduler::put_prev_task(self, prev),
+                        SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, prev),
+                        SchedClass::Idle => IdleScheduler::put_prev_task(self, prev),
+                    }
 
-            match next.sched_info().sched_class() {
-                SchedClass::Realtime => RealtimeScheduler::set_next_task(self, next.clone()),
-                SchedClass::Fair => CompletelyFairScheduler::set_next_task(self, next.clone()),
-                SchedClass::Idle => {}
+                    match selected_class {
+                        SchedClass::Realtime => {
+                            RealtimeScheduler::set_next_task(self, next.clone())
+                        }
+                        SchedClass::Fair => {
+                            CompletelyFairScheduler::set_next_task(self, next.clone())
+                        }
+                        SchedClass::Idle => {}
+                    }
+                }
             }
         }
 
-        cfs_bandwidth::refresh_runtime_event(self, &next);
         next
     }
 }
@@ -1510,6 +1525,12 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
 
     let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
     let old_cpu = pcb.sched_info().on_cpu();
+    // Sleeping tasks retain their binding; cgroup moves rebind under pi/rq.
+    // Migrating tasks still need the original detach/rebind, even on return
+    // to their source CPU after an affinity change.
+    if old_cpu == Some(cpu) && on_rq == OnRq::None {
+        return;
+    }
     if pcb.sched_info().sched_class() == SchedClass::Fair
         && (on_rq == OnRq::Migrating || old_cpu.is_some_and(|old_cpu| old_cpu != cpu))
     {
@@ -1644,7 +1665,8 @@ pub(crate) fn wait_cpu_placement(pcb: &Arc<ProcessControlBlock>) {
     });
 }
 
-/// Called after the switch tail publishes placement and releases pi/rq locks.
+/// Notify after placement or affinity-mask publication, with pi/rq locks released.
+/// A mask change can make the current CPU legal without an actual switch.
 pub(crate) fn notify_cpu_placement(pcb: &Arc<ProcessControlBlock>) {
     fence(Ordering::SeqCst);
     if !CPU_PLACEMENT_WAIT.is_empty() {
@@ -1685,7 +1707,6 @@ pub fn sched_init() {
 
     // 初始化 per-CPU CPU 时间统计
     cputime::init_kernel_cpu_stat();
-    cfs_bandwidth::init_runtime_events();
 }
 
 #[inline]

@@ -400,7 +400,7 @@ impl ProcessControlBlock {
 
         // Recompute signal pending after wakeup (the tracer may have injected a signal).
         if let Some(strong) = self.self_ref.upgrade() {
-            strong.recalc_sigpending();
+            strong.recalc_sigpending_tsk();
         }
 
         PtraceStopOutcome::Committed {

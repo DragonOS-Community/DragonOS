@@ -4,7 +4,7 @@
 use super::*;
 use crate::process::KernelStack;
 
-fn task() -> Result<Arc<ProcessControlBlock>, SystemError> {
+pub(crate) fn task() -> Result<Arc<ProcessControlBlock>, SystemError> {
     let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
     let task = loop {
         let birth = (|| {

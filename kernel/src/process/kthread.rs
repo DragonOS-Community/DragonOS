@@ -697,6 +697,75 @@ pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
         report
             .push_str("deadline_generation=skip_unavailable\ndeadline_fallback=skip_unavailable\n");
     }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    match crate::time::deadline::run_remote_owner_selftest() {
+        Some(ok) => {
+            append_kthread_selftest_case(&mut report, "deadline_remote_owner", ok, &mut failures)
+        }
+        None => report.push_str("deadline_remote_owner=skip_unavailable\n"),
+    }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    {
+        use crate::arch::driver::apic::{
+            apic_timer::LocalApicTimerMode, CurrentApic, LVTRegister, LocalAPIC,
+        };
+        // Snapshot the actual LVTT on one CPU, without reprogramming its timer.
+        // IRQ-off prevents migration; allocate/format only after restoring it.
+        let flags = crate::arch::asm::irqflags::local_irq_save();
+        let mode = CurrentApic.read_lvt(LVTRegister::Timer).timer_mode();
+        crate::arch::asm::irqflags::local_irq_restore(flags);
+        let name = match mode {
+            Some(LocalApicTimerMode::Deadline) => "tsc_deadline",
+            Some(LocalApicTimerMode::Oneshot) => "oneshot",
+            Some(LocalApicTimerMode::Periodic) => "periodic",
+            None => "unsupported",
+        };
+        report.push_str(&alloc::format!("deadline_apic_mode={name}\n"));
+    }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    match crate::arch::driver::apic::apic_timer::stop_clear_selftest() {
+        Some(ok) => {
+            append_kthread_selftest_case(&mut report, "deadline_stop_clear", ok, &mut failures)
+        }
+        None => report.push_str("deadline_stop_clear=skip_unavailable_or_not_observed\n"),
+    }
+    #[cfg(feature = "mm_selftest")]
+    match crate::sched::affinity_selftest::run() {
+        Some(result) => {
+            append_kthread_selftest_case(
+                &mut report,
+                "affinity_placement",
+                result.ok,
+                &mut failures,
+            );
+            report.push_str(&alloc::format!(
+                "affinity_placement_release_reason={} release_done={} registered={} rescued={}\n",
+                result.release_reason,
+                result.release_done,
+                result.registered,
+                result.rescued,
+            ));
+        }
+        None => report.push_str("affinity_placement=skip_unavailable\n"),
+    }
+    #[cfg(feature = "mm_selftest")]
+    match crate::sched::fair::run_group_switch_selftest() {
+        Ok(result) => {
+            append_kthread_selftest_case(&mut report, "group_switch", result.ok(), &mut failures);
+            report.push_str(&alloc::format!(
+                "group_switch_setup={} leaf_switch={} token_preserved={} b_eligible={} edf_b={} winner_b={} cleanup={} old_token={} observed_token={} deadline={}\n",
+                result.setup, result.leaf_switch, result.token_preserved, result.b_eligible,
+                result.edf_b, result.winner_b, result.cleanup, result.old_token,
+                result.observed_token, result.deadline,
+            ));
+        }
+        Err(_) => {
+            append_kthread_selftest_case(&mut report, "group_switch", false, &mut failures);
+            report.push_str("group_switch_setup=allocation_or_context_error\n");
+        }
+    }
+    #[cfg(not(feature = "mm_selftest"))]
+    report.push_str("group_switch=skip_mm_disabled\n");
     crate::sched::pelt::run_selftests();
     append_kthread_selftest_case(&mut report, "pelt_arithmetic", true, &mut failures);
 

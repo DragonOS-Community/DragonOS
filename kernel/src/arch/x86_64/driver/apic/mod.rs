@@ -558,6 +558,7 @@ impl CurrentApic {
             return;
         }
 
+        apic_timer::shutdown_local();
         self.clear_local_apic();
 
         // 软禁用APIC（意味着清除 82489DX 寄存器）

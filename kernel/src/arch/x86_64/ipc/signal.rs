@@ -761,6 +761,13 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         return;
     }
 
+    // Pending publication and current's clearing are serialized by the pending
+    // locks. The outer return path still handles stops, restart and saved masks
+    // even when there is no signal queue work to inspect here.
+    if !pcb.has_pending_signal_fast() {
+        return;
+    }
+
     // Read the process-level shared_pending bitmap first (the sighand read lock
     // is released right after).
     // This must complete before taking the sig_info read lock: otherwise do_signal

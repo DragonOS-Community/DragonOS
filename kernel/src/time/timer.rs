@@ -1,7 +1,7 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -26,7 +26,6 @@ use crate::{
 use super::{
     absolute_timer::{self, AbsoluteClock},
     jiffies::NSEC_PER_JIFFY,
-    timekeeping::update_wall_time,
 };
 
 const MAX_TIMEOUT: i64 = i64::MAX;
@@ -451,20 +450,26 @@ pub fn run_local_timer() {
     try_raise_timer_softirq();
 }
 
-/// 更新系统时间片
-pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
-    let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
-    compiler_fence(Ordering::SeqCst);
-    update_wall_time();
+/// Pure count commit. Global timekeeping's write lock serializes all writers.
+/// No maintenance, clock read, wakeup or queue operation is allowed here.
+pub(super) fn add_timer_jiffies(add: u64) {
+    if add != 0 {
+        TIMER_JIFFIES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                now.checked_add(add)
+            })
+            .expect("jiffies counter overflow");
+    }
+}
 
-    compiler_fence(Ordering::SeqCst);
-    let now = prev + add_jiffies;
+/// CPU0 IRQ maintenance only, after releasing the timekeeper write lock.
+pub(super) fn timer_tick_maintenance() {
+    let now = clock();
     crate::mm::page::reclaim_wait::tick(now);
     #[cfg(target_arch = "x86_64")]
     crate::mm::compaction::background::tick(now);
     crate::driver::virtio::virtio_balloon::tick(now);
     crate::mm::fault_recovery::tick();
-    return now;
 }
 
 pub fn clock() -> u64 {

@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
@@ -757,11 +758,59 @@ TEST(TimekeepingSemantics, RawClockNanosleepThreadCpuClockIsUnsupported) {
 }
 
 TEST(TimekeepingSemantics, SuccessfulNanosleepLeavesRemainingUntouched) {
-    const timespec request = {.tv_sec = 0, .tv_nsec = 1000000};
-    timespec remaining = {.tv_sec = 123, .tv_nsec = 456};
-    ASSERT_EQ(0, nanosleep(&request, &remaining));
-    EXPECT_EQ(123, remaining.tv_sec);
-    EXPECT_EQ(456, remaining.tv_nsec);
+    // Include zero and a deadline that may expire during timer preparation.
+    for (long nanoseconds : {0L, 1L, 1000000L}) {
+        const timespec request = {.tv_sec = 0, .tv_nsec = nanoseconds};
+        timespec remaining = {.tv_sec = 123, .tv_nsec = 456};
+        ASSERT_EQ(0, nanosleep(&request, &remaining)) << "request_ns=" << nanoseconds;
+        EXPECT_EQ(123, remaining.tv_sec) << "request_ns=" << nanoseconds;
+        EXPECT_EQ(456, remaining.tv_nsec) << "request_ns=" << nanoseconds;
+    }
+}
+
+TEST(TimekeepingSemantics, ShortNanosleepDoesNotBusyWait) {
+    constexpr int kIterations = 128;
+    constexpr int64_t kRequestNanoseconds = 499000;
+    constexpr int64_t kRequestedTotalNanoseconds = kIterations * kRequestNanoseconds;
+    const timespec request = {.tv_sec = 0, .tv_nsec = kRequestNanoseconds};
+    timespec wall_start = {};
+    timespec cpu_start = {};
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &wall_start));
+    ASSERT_EQ(0, clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start));
+    int64_t minimum_sleep_ns = INT64_MAX;
+    bool remaining_unchanged = true;
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+        timespec before = {};
+        timespec after = {};
+        timespec remaining = {.tv_sec = 123, .tv_nsec = 456};
+        ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &before));
+        ASSERT_EQ(0, nanosleep(&request, &remaining))
+            << "iteration=" << iteration << " errno=" << errno;
+        ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &after));
+        const int64_t elapsed_ns = DiffNs(before, after);
+        if (elapsed_ns < minimum_sleep_ns) {
+            minimum_sleep_ns = elapsed_ns;
+        }
+        remaining_unchanged &= remaining.tv_sec == 123 && remaining.tv_nsec == 456;
+    }
+    timespec cpu_end = {};
+    timespec wall_end = {};
+    ASSERT_EQ(0, clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end));
+    ASSERT_EQ(0, clock_gettime(CLOCK_MONOTONIC, &wall_end));
+    const int64_t cpu_ns = DiffNs(cpu_start, cpu_end);
+    const int64_t wall_ns = DiffNs(wall_start, wall_end);
+    printf("short nanosleep: requested_ns=%lld wall_ns=%lld thread_cpu_ns=%lld "
+           "minimum_sleep_ns=%lld\n",
+           static_cast<long long>(kRequestedTotalNanoseconds), static_cast<long long>(wall_ns),
+           static_cast<long long>(cpu_ns), static_cast<long long>(minimum_sleep_ns));
+    EXPECT_TRUE(remaining_unchanged);
+    EXPECT_GE(minimum_sleep_ns, kRequestNanoseconds);
+    EXPECT_GE(wall_ns, kRequestedTotalNanoseconds);
+    EXPECT_GE(cpu_ns, 0);
+    // Compare against requested time, not elapsed wall: host descheduling must
+    // not hide a busy loop. Low-resolution blocking may take much longer.
+    EXPECT_LT(cpu_ns, kRequestedTotalNanoseconds / 2)
+        << "requested_ns=" << kRequestedTotalNanoseconds << " wall_ns=" << wall_ns;
 }
 
 TEST(TimekeepingSemantics, InterruptedNanosleepReportsNormalizedRemainingTime) {

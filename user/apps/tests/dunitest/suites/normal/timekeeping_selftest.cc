@@ -39,6 +39,13 @@ TEST(TimekeepingSelftest, KernelPureAndTransactionalChecksPass) {
     EXPECT_EQ(0u, report.find("status=ok\n")) << report;
     EXPECT_EQ(std::string::npos, report.find("=fail\n")) << report;
     EXPECT_NE(std::string::npos, report.find("timekeeping.wrap_24=ok\n")) << report;
+    for (const char* name : {"jiffies_phase_elapsed", "jiffies_fallback_gate",
+                             "jiffies_phase_overflow", "jiffies_source_handoff",
+                             "jiffies_unstable_handoff"}) {
+        EXPECT_NE(std::string::npos,
+                  report.find(std::string("timekeeping.") + name + "=ok\n"))
+            << report;
+    }
     EXPECT_NE(std::string::npos, report.find("timekeeping.switch_continuity=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("timekeeping.settimeofday_domains=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("rwlock.ticket_fifo=ok\n")) << report;
@@ -53,6 +60,12 @@ TEST(TimekeepingSelftest, KernelPureAndTransactionalChecksPass) {
             << report;
     }
 #if defined(__x86_64__)
+    EXPECT_NE(std::string::npos, report.find("timekeeping.tsc_deadline_conversion=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("timekeeping.backward_delta_boundaries=ok\n")) << report;
+    EXPECT_NE(std::string::npos, report.find("timekeeping.backward_read_zero_elapsed=ok\n")) << report;
+    EXPECT_NE(std::string::npos,
+              report.find("timekeeping.backward_forward_fraction_progress=ok\n"))
+        << report;
     EXPECT_NE(std::string::npos, report.find("virtual_time.kvm_steal_reader=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("virtual_time.kvm_shutdown_states=ok\n")) << report;
 #endif

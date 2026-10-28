@@ -647,6 +647,11 @@ impl ProcessManager {
         pcb: &Arc<ProcessControlBlock>,
         mask: CpuMask,
     ) -> Result<(), SystemError> {
+        // A new mask can satisfy an older placement waiter without a switch.
+        // Declare this before pi_guard so every return notifies after unlocking.
+        defer::defer!({
+            crate::sched::notify_cpu_placement(pcb);
+        });
         let mut pi_guard = pcb.sched_info().pi_lock_irqsave();
         pi_guard.set_cpus_allowed(mask.clone());
 

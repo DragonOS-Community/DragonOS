@@ -94,7 +94,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
         debug!("GDT_Table={:?}, IDT_Table={:?}\n", gdt_vaddr, idt_vaddr);
     }
 
-    set_current_core_tss(stack_start, 0);
+    set_current_core_tss(stack_start);
     unsafe { TSSManager::load_tr() };
     arch_trap_init().expect("arch_trap_init failed");
 
@@ -165,12 +165,17 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     return Ok(());
 }
 
-fn set_current_core_tss(stack_start: usize, ist0: usize) {
+fn set_current_core_tss(stack_start: usize) {
     let current_tss = unsafe { TSSManager::current_tss() };
+    let cpu = crate::smp::core::smp_get_processor_id().data();
+    let ist_top = crate::arch::x86_64::interrupt::ist::double_fault_stack_top(cpu).unwrap_or(0);
     debug!(
-        "set_current_core_tss: stack_start={:#x}, ist0={:#x}\n",
-        stack_start, ist0
+        "set_current_core_tss: stack_start={:#x}, ist1={:#x}\n",
+        stack_start, ist_top
     );
     current_tss.set_rsp(x86::Ring::Ring0, stack_start as u64);
-    current_tss.set_ist(0, ist0 as u64);
+    // TSS 的 IST 数组下标 0 对应描述符里的 IST1；#DF 门使用 ist=1。
+    if ist_top != 0 {
+        current_tss.set_ist(0, ist_top);
+    }
 }

@@ -275,10 +275,14 @@ ENTRY(trap_dev_not_avaliable)
 
 // 8 #DF 双重错误
 ENTRY(trap_double_fault)
-    pushq %rax
-    leaq do_double_fault(%rip), %rax    // 获取中断服务程序的地址
-    xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
-    jmp Err_Code
+    // IST supplies a complete hardware frame even when the interrupted stack
+    // is unusable. Never enter ordinary error_entry, bad-IRET fixup, RCU or
+    // task-state handling here. The fatal handler needs no GS/PCB state.
+    cld
+    movq %rsp, %rdi
+    andq $-16, %rsp
+    callq do_double_fault
+    ud2
 
 // 9 协处理器越界（保留）
 ENTRY(trap_coprocessor_segment_overrun)

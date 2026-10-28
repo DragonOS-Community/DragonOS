@@ -3740,14 +3740,6 @@ impl IndexNode for LockedExt4Inode {
         let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
 
-        if fs
-            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
-            .ftype
-            == FileType::SymLink
-        {
-            return Err(SystemError::EPERM);
-        }
-
         fs.retry_metadata_read_contention(|| ext4.getxattr(inode_num, name, buf))
     }
 

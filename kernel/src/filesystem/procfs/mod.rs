@@ -37,6 +37,7 @@ mod syscall;
 mod sysrq;
 pub(super) mod template;
 mod thread_self;
+mod uptime;
 mod utils;
 mod version;
 mod version_signature;

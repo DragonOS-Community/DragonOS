@@ -1,7 +1,7 @@
 use core::intrinsics::likely;
 
 use crate::{
-    arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
+    arch::driver::apic::{CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
     process::{utils::current_pcb_flags, ProcessFlags},
     sched::{SchedMode, __schedule},
@@ -48,8 +48,7 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
     }
 
     // 检测当前进程是否可被调度
-    let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
-        || vector == APIC_TIMER_IRQ_NUM.data();
+    let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE);
     let disposition = if should_schedule && irq_outermost {
         crate::rcu::RcuIrqDisposition::ToKernel
     } else {

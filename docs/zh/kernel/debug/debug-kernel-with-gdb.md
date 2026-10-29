@@ -333,7 +333,7 @@ continue            #用于继续程序的执行，直到遇到下一个断点�
 quit                #退出调试                    
 
 list                            #或者l，显示当前活动源文件源代码的片段，以及当前执行的位置。
-list <filename>:<function>      #显示<filename>文件里面的<funtion>函数的源代码片段
+list <filename>:<function>      #显示<filename>文件里面的<function>函数的源代码片段
 list <filename>:<line_number>   #显示<filename>文件里面的<line_number>附近的源代码片段
 list <first>,<last>             #显示当前活动源文件的<first>至<last>之间的源代码片段
 set listsize <count>            #设置list命令显示的源代码行数。默认情况下，list命令显示当前行和其周围的几行代码。

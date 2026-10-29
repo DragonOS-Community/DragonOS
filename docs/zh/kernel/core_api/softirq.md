@@ -47,7 +47,7 @@ pub fn register_softirq(&self,
   
   - softirq_num：中断向量号
   
-  - hanlder：中断函数对应的结构体，需要指向实现了`SoftirqVec`特征的结构体变量
+  - handler：中断函数对应的结构体，需要指向实现了`SoftirqVec`特征的结构体变量
 
 - 返回：
   

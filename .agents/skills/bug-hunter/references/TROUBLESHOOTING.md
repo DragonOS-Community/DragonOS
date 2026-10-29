@@ -35,8 +35,8 @@
 排查：
 
 - 优先使用 `{"suggested_weights": {...}}`。
-- 或使用扁平映射 `{"Security Sentinel": 5.0, ...}`。
-- 检查角色名是否与 `persona_matrix.json` 一致。
+- 或使用扁平映射 `{"Security & Concurrency Sentinel": 4.0, ...}`。
+- 检查角色名是否与内置 3 角色一致：`Security & Concurrency Sentinel`、`Logic & Correctness Reviewer`、`System & Performance Reviewer`。
 
 ## 5. 报告为空（Accepted findings = 0）
 

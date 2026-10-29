@@ -18,4 +18,8 @@ export DADK?=$(shell which dadk)
 endif
 
 # RootFS manifest name under config/rootfs-manifests/
+ifeq ($(ARCH),x86_64)
+export ROOTFS_MANIFEST?=ubuntu2404
+else
 export ROOTFS_MANIFEST?=default
+endif

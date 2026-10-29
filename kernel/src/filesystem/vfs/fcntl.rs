@@ -1,5 +1,13 @@
 const F_LINUX_SPECIFIC_BASE: u32 = 1024;
 
+/// Native Linux f_owner_ex: an owner kind and a namespace-relative pid.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct FileOwnerEx {
+    pub kind: i32,
+    pub pid: i32,
+}
+
 /// fcntl syscall command
 ///
 /// for linux-specific fcntl commands, see:
@@ -31,6 +39,8 @@ pub enum FcntlCommand {
     SetSig = 10,
     /// get signal to send on asynchronous I/O
     GetSig = 11,
+    SetOwnEx = 15,
+    GetOwnEx = 16,
 
     SetLease = F_LINUX_SPECIFIC_BASE,
     GetLease = F_LINUX_SPECIFIC_BASE + 1,

@@ -1,8 +1,22 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
+#include <algorithm>
+#include <fcntl.h>
+#include <new>
+#include <memory>
+#include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
+#include <sys/epoll.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -13,7 +27,90 @@
 
 #include "gtest/gtest.h"
 
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+
+#ifndef __WCLONE
+#define __WCLONE 0x80000000
+#endif
+
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
+#ifndef __WNOTHREAD
+#define __WNOTHREAD 0x20000000
+#endif
+
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+
+#ifndef SYS_pidfd_open
+#ifdef __NR_pidfd_open
+#define SYS_pidfd_open __NR_pidfd_open
+#else
+#define SYS_pidfd_open 434
+#endif
+#endif
+
+#ifndef PR_SET_CHILD_SUBREAPER
+#define PR_SET_CHILD_SUBREAPER 36
+#endif
+
+#ifndef CLONE_PARENT
+#define CLONE_PARENT 0x00008000
+#endif
+
 namespace {
+
+constexpr size_t kCloneStackSize = 1024 * 1024;
+constexpr uid_t kWaitidChildUid = 1234;
+
+volatile sig_atomic_t g_ptrace_clone_exit_signal = 0;
+
+void RecordPtraceCloneExitSignal(int) { ++g_ptrace_clone_exit_signal; }
+
+int PtraceCloneExit(void*) {
+  if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+    return 2;
+  }
+  return 0;
+}
+
+struct ScopedSignalAction {
+  int signal;
+  struct sigaction old_action;
+
+  ~ScopedSignalAction() { sigaction(signal, &old_action, nullptr); }
+};
+
+bool ReadExact(int fd, void* buf, size_t len) {
+  char* cursor = static_cast<char*>(buf);
+  while (len > 0) {
+    ssize_t n = read(fd, cursor, len);
+    if (n <= 0) {
+      return false;
+    }
+    cursor += n;
+    len -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool WriteExact(int fd, const void* buf, size_t len) {
+  const char* cursor = static_cast<const char*>(buf);
+  while (len > 0) {
+    ssize_t n = write(fd, cursor, len);
+    if (n <= 0) {
+      return false;
+    }
+    cursor += n;
+    len -= static_cast<size_t>(n);
+  }
+  return true;
+}
 
 uint64_t RusageCpuUsec(const struct rusage& ru) {
   return static_cast<uint64_t>(ru.ru_utime.tv_sec) * 1000000ULL +
@@ -47,12 +144,1880 @@ void BusyForUsec(uint64_t usec) {
   _exit(static_cast<int>(sink & 0));
 }
 
+int PidfdOpen(pid_t pid, unsigned int flags) {
+  return static_cast<int>(syscall(SYS_pidfd_open, pid, flags));
+}
+
 void* ThreadBurn(void* arg) {
   BurnCpuForUsec(reinterpret_cast<uintptr_t>(arg));
   return nullptr;
 }
 
+void ExpectEncodedExitStatus(int status, int code) {
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(code, WEXITSTATUS(status));
+  EXPECT_NE(code, status);
+}
+
+struct ThreadForkArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t child = -1;
+  int fork_errno = 0;
+  pid_t wait_result = -1;
+  int wait_errno = 0;
+  int wait_status = 0;
+};
+
+void* ForkChildFromThread(void* arg) {
+  auto* args = reinterpret_cast<ThreadForkArgs*>(arg);
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(17);
+  }
+  if (child < 0) {
+    args->fork_errno = errno;
+  } else {
+    args->child = child;
+  }
+
+  char byte = child < 0 ? 'e' : 'x';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    args->fork_errno = errno;
+  }
+
+  if (child >= 0) {
+    char release = 0;
+    if (read(args->release_fd, &release, 1) != 1) {
+      args->fork_errno = errno;
+      return nullptr;
+    }
+    args->wait_result = wait4(child, &args->wait_status, __WNOTHREAD, nullptr);
+    if (args->wait_result < 0) {
+      args->wait_errno = errno;
+    }
+  }
+  return nullptr;
+}
+
+struct ThreadForkExitArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  int release_write_fd = -1;
+  pid_t child = -1;
+  int fork_errno = 0;
+};
+
+void* ForkChildAndExitThread(void* arg) {
+  auto* args = reinterpret_cast<ThreadForkExitArgs*>(arg);
+  pid_t child = fork();
+  if (child == 0) {
+    close(args->ready_fd);
+    close(args->release_write_fd);
+    char release = 0;
+    if (read(args->release_fd, &release, 1) != 1) {
+      _exit(22);
+    }
+    _exit(23);
+  }
+  if (child < 0) {
+    args->fork_errno = errno;
+  } else {
+    args->child = child;
+  }
+
+  char byte = child < 0 ? 'e' : 'x';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    args->fork_errno = errno;
+  }
+  return nullptr;
+}
+
+struct ThreadTidArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t tid = -1;
+};
+
+struct DelayedWriteArgs {
+  int fd = -1;
+  useconds_t delay_usec = 0;
+};
+
+void* DelayedWriteByte(void* arg) {
+  auto* args = reinterpret_cast<DelayedWriteArgs*>(arg);
+  usleep(args->delay_usec);
+  char byte = 'x';
+  WriteExact(args->fd, &byte, 1);
+  return nullptr;
+}
+
+struct StartThenReleaseArgs {
+  int started_fd = -1;
+  int release_fd = -1;
+  useconds_t delay_usec = 0;
+};
+
+void* WaitForStartThenRelease(void* arg) {
+  auto* args = reinterpret_cast<StartThenReleaseArgs*>(arg);
+  char byte = 0;
+  if (read(args->started_fd, &byte, 1) == 1) {
+    sched_yield();
+    usleep(args->delay_usec);
+    char release = 'x';
+    WriteExact(args->release_fd, &release, 1);
+  }
+  return nullptr;
+}
+
+pid_t WaitPidWithTimeout(pid_t pid, int* status, uint64_t timeout_usec,
+                         int* wait_errno) {
+  const uint64_t start = MonotonicUsec();
+  while (MonotonicUsec() - start < timeout_usec) {
+    errno = 0;
+    pid_t ret = waitpid(pid, status, WNOHANG);
+    if (ret == pid) {
+      return ret;
+    }
+    if (ret < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (wait_errno != nullptr) {
+        *wait_errno = errno;
+      }
+      return -1;
+    }
+    usleep(1000);
+  }
+  return 0;
+}
+
+void* ReportTidAndWait(void* arg) {
+  auto* args = reinterpret_cast<ThreadTidArgs*>(arg);
+  args->tid = static_cast<pid_t>(syscall(SYS_gettid));
+  char byte = 't';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    return nullptr;
+  }
+  char release = 0;
+  if (read(args->release_fd, &release, 1) != 1) {
+    return nullptr;
+  }
+  return nullptr;
+}
+
+struct BlockingThreadExitArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+};
+
+void* BlockThenExitThread(void* arg) {
+  auto* args = reinterpret_cast<BlockingThreadExitArgs*>(arg);
+  char byte = 'r';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    syscall(SYS_exit, 4);
+  }
+  char release = 0;
+  if (read(args->release_fd, &release, 1) != 1) {
+    syscall(SYS_exit, 5);
+  }
+  syscall(SYS_exit, 0);
+  return nullptr;
+}
+
+struct ThreadPtraceForkArgs {
+  int result = -1;
+  int err = 0;
+  int status = 0;
+};
+
+void* ForkTracemeAndWaitFromThread(void* arg) {
+  auto* args = reinterpret_cast<ThreadPtraceForkArgs*>(arg);
+  int fds[2] = {};
+  if (pipe(fds) != 0) {
+    args->err = errno;
+    return nullptr;
+  }
+
+  pid_t child = fork();
+  if (child == 0) {
+    close(fds[0]);
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+      _exit(2);
+    }
+    if (write(fds[1], "x", 1) != 1) {
+      _exit(3);
+    }
+    close(fds[1]);
+    _exit(0);
+  }
+  if (child < 0) {
+    args->err = errno;
+    close(fds[0]);
+    close(fds[1]);
+    return nullptr;
+  }
+
+  close(fds[1]);
+  char byte = 0;
+  if (read(fds[0], &byte, 1) != 1) {
+    args->err = errno;
+    close(fds[0]);
+    return nullptr;
+  }
+  close(fds[0]);
+
+  args->result = wait4(child, &args->status, __WNOTHREAD | __WCLONE, nullptr);
+  if (args->result < 0) {
+    args->err = errno;
+  }
+  return nullptr;
+}
+
+void ExitGroup(int code) {
+  syscall(SYS_exit_group, code);
+  _exit(code);
+}
+
+struct TracemeReparentArgs {
+  int ready_fd = -1;
+  int release_fd = -1;
+  pid_t child = -1;
+};
+
+void* TracemeAfterLeaderExitSibling(void* arg) {
+  auto* args = reinterpret_cast<TracemeReparentArgs*>(arg);
+  char byte = 0;
+  if (read(args->ready_fd, &byte, 1) != 1) {
+    ExitGroup(60);
+  }
+
+  pid_t child = args->child;
+  if (child <= 0) {
+    ExitGroup(61);
+  }
+
+  bool reparented = false;
+  int status = 0;
+  for (int i = 0; i < 1000; ++i) {
+    errno = 0;
+    pid_t ret = wait4(child, &status, __WNOTHREAD | WNOHANG, nullptr);
+    if (ret == 0) {
+      reparented = true;
+      break;
+    }
+    if (ret == child) {
+      ExitGroup(62);
+    }
+    if (errno != ECHILD) {
+      ExitGroup(63);
+    }
+    usleep(1000);
+  }
+  if (!reparented) {
+    ExitGroup(64);
+  }
+
+  if (write(args->release_fd, "x", 1) != 1) {
+    ExitGroup(65);
+  }
+
+  status = 0;
+  pid_t ret = wait4(child, &status, __WALL, nullptr);
+  if (ret != child) {
+    ExitGroup(66);
+  }
+  if (!WIFEXITED(status)) {
+    ExitGroup(67);
+  }
+  ExitGroup(WEXITSTATUS(status));
+  return nullptr;
+}
+
+struct SubreaperAliveArgs {
+  int ready_fd = -1;
+  int intermediate_release_fd = -1;
+  int grandchild_release_fd = -1;
+  int result_fd = -1;
+  pid_t intermediate = -1;
+  pid_t grandchild = -1;
+};
+
+void ReportSubreaperResult(SubreaperAliveArgs* args, int code) {
+  if (args != nullptr && args->result_fd >= 0) {
+    WriteExact(args->result_fd, &code, sizeof(code));
+  }
+  ExitGroup(code);
+}
+
+void* SubreaperLeaderExitSibling(void* arg) {
+  auto* args = reinterpret_cast<SubreaperAliveArgs*>(arg);
+  char byte = 0;
+  if (read(args->ready_fd, &byte, 1) != 1) {
+    ReportSubreaperResult(args, 70);
+  }
+
+  pid_t grandchild = args->grandchild;
+  if (grandchild <= 0) {
+    ReportSubreaperResult(args, 71);
+  }
+
+  int status = 0;
+  bool intermediate_reparented = false;
+  for (int i = 0; i < 1000; ++i) {
+    errno = 0;
+    pid_t ret =
+        wait4(args->intermediate, &status, __WNOTHREAD | WNOHANG, nullptr);
+    if (ret == 0) {
+      intermediate_reparented = true;
+      break;
+    }
+    if (ret == args->intermediate) {
+      ReportSubreaperResult(args, 72);
+    }
+    if (errno != ECHILD) {
+      ReportSubreaperResult(args, 73);
+    }
+    usleep(1000);
+  }
+  if (!intermediate_reparented) {
+    ReportSubreaperResult(args, 74);
+  }
+
+  if (write(args->intermediate_release_fd, "i", 1) != 1) {
+    ReportSubreaperResult(args, 75);
+  }
+
+  pid_t ret = wait4(args->intermediate, &status, __WNOTHREAD, nullptr);
+  if (ret != args->intermediate) {
+    ReportSubreaperResult(args, 76);
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    ReportSubreaperResult(args, 77);
+  }
+
+  status = 0;
+  bool reparented = false;
+  for (int i = 0; i < 1000; ++i) {
+    errno = 0;
+    ret = wait4(grandchild, &status, __WNOTHREAD | WNOHANG, nullptr);
+    if (ret == 0) {
+      reparented = true;
+      break;
+    }
+    if (ret == grandchild) {
+      ReportSubreaperResult(args, 78);
+    }
+    if (errno != ECHILD) {
+      ReportSubreaperResult(args, 79);
+    }
+    usleep(1000);
+  }
+  if (!reparented) {
+    ReportSubreaperResult(args, 80);
+  }
+
+  if (write(args->grandchild_release_fd, "g", 1) != 1) {
+    ReportSubreaperResult(args, 81);
+  }
+
+  status = 0;
+  ret = wait4(grandchild, &status, __WNOTHREAD, nullptr);
+  if (ret != grandchild) {
+    ReportSubreaperResult(args, 82);
+  }
+  if (!WIFEXITED(status)) {
+    ReportSubreaperResult(args, 83);
+  }
+  ReportSubreaperResult(args, WEXITSTATUS(status));
+  return nullptr;
+}
+
+struct ConcurrentExitArgs {
+  int ready_fd = -1;
+  int exit_fd = -1;
+  int child_release_fd = -1;
+  pid_t child = -1;
+  int fork_errno = 0;
+};
+
+void* ForkChildThenConcurrentExit(void* arg) {
+  auto* args = reinterpret_cast<ConcurrentExitArgs*>(arg);
+  pid_t child = fork();
+  if (child == 0) {
+    char release = 0;
+    if (read(args->child_release_fd, &release, 1) != 1) {
+      _exit(32);
+    }
+    _exit(41);
+  }
+  if (child < 0) {
+    args->fork_errno = errno;
+  } else {
+    args->child = child;
+  }
+
+  char byte = child < 0 ? 'e' : 'a';
+  if (write(args->ready_fd, &byte, 1) != 1) {
+    args->fork_errno = errno;
+  }
+
+  char release = 0;
+  if (read(args->exit_fd, &release, 1) != 1) {
+    syscall(SYS_exit, 21);
+  }
+  syscall(SYS_exit, 0);
+  return nullptr;
+}
+
+void* ConcurrentExitOnlyThread(void* arg) {
+  auto* args = reinterpret_cast<ConcurrentExitArgs*>(arg);
+  if (write(args->ready_fd, "b", 1) != 1) {
+    syscall(SYS_exit, 22);
+  }
+
+  char release = 0;
+  if (read(args->exit_fd, &release, 1) != 1) {
+    syscall(SYS_exit, 23);
+  }
+  syscall(SYS_exit, 0);
+  return nullptr;
+}
+
+struct CloneParentSpawnResult {
+  pid_t pid = -1;
+  int err = 0;
+};
+
+struct CloneParentWaitResult {
+  pid_t result = -1;
+  int err = 0;
+  int status = 0;
+};
+
+int CloneParentChild(void* arg) {
+  int release_fd = *reinterpret_cast<int*>(arg);
+  char byte = 0;
+  if (read(release_fd, &byte, 1) != 1) {
+    _exit(18);
+  }
+  _exit(19);
+}
+
+bool WaitidPeekExited(pid_t child, siginfo_t* si) {
+  for (int i = 0; i < 1000; ++i) {
+    memset(si, 0, sizeof(*si));
+    if (syscall(SYS_waitid, P_PID, child, si, WEXITED | WNOWAIT | WNOHANG,
+                nullptr) != 0) {
+      return false;
+    }
+    if (si->si_pid == child) {
+      return true;
+    }
+    usleep(1000);
+  }
+  return false;
+}
+
+bool WaitidPidfdExited(int pidfd, pid_t child, siginfo_t* si) {
+  for (int i = 0; i < 1000; ++i) {
+    memset(si, 0, sizeof(*si));
+    if (syscall(SYS_waitid, P_PIDFD, pidfd, si, WEXITED | WNOHANG,
+                nullptr) != 0) {
+      return false;
+    }
+    if (si->si_pid == child) {
+      return true;
+    }
+    usleep(1000);
+  }
+  return false;
+}
+
+int BlockingWaitExitRaceHelper(int iter) {
+  int started_pipe[2] = {};
+  int release_pipe[2] = {};
+  if (pipe(started_pipe) != 0 || pipe(release_pipe) != 0) {
+    return 10;
+  }
+
+  const int expected_exit = 40 + iter;
+  pid_t child = fork();
+  if (child == 0) {
+    close(started_pipe[0]);
+    close(started_pipe[1]);
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(11);
+    }
+    close(release_pipe[0]);
+    _exit(expected_exit);
+  }
+  if (child < 0) {
+    return 12;
+  }
+
+  close(release_pipe[0]);
+
+  StartThenReleaseArgs release_args {};
+  release_args.started_fd = started_pipe[0];
+  release_args.release_fd = release_pipe[1];
+  release_args.delay_usec = 20000;
+  pthread_t release_thread {};
+  if (pthread_create(&release_thread, nullptr, WaitForStartThenRelease,
+                     &release_args) != 0) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    return 13;
+  }
+
+  char started = 's';
+  if (!WriteExact(started_pipe[1], &started, 1)) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    pthread_join(release_thread, nullptr);
+    return 14;
+  }
+  close(started_pipe[1]);
+
+  int status = 0;
+  errno = 0;
+  pid_t ret = wait4(child, &status, 0, nullptr);
+  int wait_errno = errno;
+  pthread_join(release_thread, nullptr);
+  close(started_pipe[0]);
+  close(release_pipe[1]);
+
+  if (ret != child) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, WNOHANG);
+    return wait_errno == ECHILD ? 15 : 16;
+  }
+  if (!WIFEXITED(status)) {
+    return 17;
+  }
+  if (WEXITSTATUS(status) != expected_exit) {
+    return 18;
+  }
+  return 0;
+}
+
 }  // namespace
+
+TEST(WaitRusage, WaitidReportsChildRealUid) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    if (setuid(kWaitidChildUid) != 0) {
+      _exit(77);
+    }
+    _exit(0);
+  }
+
+  siginfo_t si {};
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si, WEXITED, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(SIGCHLD, si.si_signo);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(child, si.si_pid);
+  EXPECT_EQ(kWaitidChildUid, si.si_uid);
+  EXPECT_EQ(0, si.si_status);
+}
+
+TEST(WaitRusage, WaitPidSelfReturnsEchild) {
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(getpid(), &status, WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  siginfo_t si {};
+  errno = 0;
+  EXPECT_EQ(-1, syscall(SYS_waitid, P_PID, getpid(), &si,
+                        WEXITED | WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, WaitidWnohangLiveChildClearsSiginfoAndLeavesRusage) {
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(2);
+    }
+    close(release_pipe[0]);
+    _exit(0);
+  }
+  close(release_pipe[0]);
+
+  siginfo_t si {};
+  memset(&si, 0x5a, sizeof(si));
+  struct rusage usage {};
+  memset(&usage, 0x5a, sizeof(usage));
+  unsigned char usage_before[sizeof(usage)] = {};
+  memcpy(usage_before, &usage, sizeof(usage));
+
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si,
+                       WEXITED | WNOHANG, &usage))
+      << strerror(errno);
+  EXPECT_EQ(0, si.si_signo);
+  EXPECT_EQ(0, si.si_code);
+  EXPECT_EQ(0, si.si_pid);
+  EXPECT_EQ(0, si.si_status);
+  EXPECT_EQ(0, memcmp(usage_before, &usage, sizeof(usage)));
+
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, nullptr,
+                       WEXITED | WNOHANG, nullptr))
+      << strerror(errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, CloneParentChildNotWaitableByCreatorWithWnothread) {
+  int child_pid_pipe[2] = {};
+  int child_release_pipe[2] = {};
+  int creator_attempt_pipe[2] = {};
+  int creator_result_pipe[2] = {};
+  ASSERT_EQ(0, pipe(child_pid_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(child_release_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(creator_attempt_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(creator_result_pipe)) << strerror(errno);
+
+  pid_t creator = fork();
+  ASSERT_GE(creator, 0) << strerror(errno);
+  if (creator == 0) {
+    close(child_pid_pipe[0]);
+    close(creator_attempt_pipe[1]);
+    close(creator_result_pipe[0]);
+    close(child_release_pipe[1]);
+
+    void* stack = malloc(kCloneStackSize);
+    CloneParentSpawnResult spawn {};
+    if (stack == nullptr) {
+      spawn.err = ENOMEM;
+      WriteExact(child_pid_pipe[1], &spawn, sizeof(spawn));
+      _exit(10);
+    }
+
+    void* stack_top = static_cast<char*>(stack) + kCloneStackSize;
+    pid_t child = clone(CloneParentChild, stack_top, CLONE_PARENT | SIGCHLD,
+                        &child_release_pipe[0]);
+    spawn.pid = child;
+    if (child < 0) {
+      spawn.err = errno;
+      WriteExact(child_pid_pipe[1], &spawn, sizeof(spawn));
+      _exit(11);
+    }
+    if (!WriteExact(child_pid_pipe[1], &spawn, sizeof(spawn))) {
+      _exit(12);
+    }
+
+    char attempt = 0;
+    if (read(creator_attempt_pipe[0], &attempt, 1) != 1) {
+      _exit(13);
+    }
+
+    CloneParentWaitResult result {};
+    result.result = wait4(child, &result.status, __WNOTHREAD | WNOHANG,
+                          nullptr);
+    if (result.result < 0) {
+      result.err = errno;
+    }
+    if (!WriteExact(creator_result_pipe[1], &result, sizeof(result))) {
+      _exit(14);
+    }
+    _exit(0);
+  }
+
+  close(child_pid_pipe[1]);
+  close(creator_attempt_pipe[0]);
+  close(creator_result_pipe[1]);
+  close(child_release_pipe[0]);
+
+  CloneParentSpawnResult spawn {};
+  ASSERT_TRUE(ReadExact(child_pid_pipe[0], &spawn, sizeof(spawn)))
+      << strerror(errno);
+  ASSERT_GT(spawn.pid, 0) << strerror(spawn.err);
+
+  ASSERT_EQ(1, write(child_release_pipe[1], "x", 1)) << strerror(errno);
+  siginfo_t si {};
+  ASSERT_TRUE(WaitidPeekExited(spawn.pid, &si)) << strerror(errno);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(19, si.si_status);
+
+  ASSERT_EQ(1, write(creator_attempt_pipe[1], "x", 1)) << strerror(errno);
+  CloneParentWaitResult result {};
+  ASSERT_TRUE(ReadExact(creator_result_pipe[0], &result, sizeof(result)))
+      << strerror(errno);
+  EXPECT_EQ(-1, result.result);
+  EXPECT_EQ(ECHILD, result.err);
+
+  int status = 0;
+  ASSERT_EQ(spawn.pid, wait4(spawn.pid, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 19);
+
+  ASSERT_EQ(creator, wait4(creator, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, PtraceTracemeChildIsWaitableWithWclone) {
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(fds[0]);
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+      _exit(2);
+    }
+    if (write(fds[1], "x", 1) != 1) {
+      _exit(3);
+    }
+    close(fds[1]);
+    _exit(0);
+  }
+
+  close(fds[1]);
+  char byte = 0;
+  ASSERT_EQ(1, read(fds[0], &byte, 1)) << strerror(errno);
+  close(fds[0]);
+
+  int status = 0;
+  ASSERT_EQ(child, wait4(child, &status, __WCLONE, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, nullptr, WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+}
+
+TEST(WaitRusage, PtraceTracemeClonePreservesExitSignal) {
+  struct sigaction action {};
+  action.sa_handler = RecordPtraceCloneExitSignal;
+  sigemptyset(&action.sa_mask);
+  struct sigaction old_action {};
+  ASSERT_EQ(0, sigaction(SIGUSR1, &action, &old_action)) << strerror(errno);
+  ScopedSignalAction restore = {.signal = SIGUSR1, .old_action = old_action};
+  g_ptrace_clone_exit_signal = 0;
+
+  auto stack = std::make_unique<char[]>(kCloneStackSize);
+  pid_t child = clone(PtraceCloneExit, stack.get() + kCloneStackSize, SIGUSR1,
+                      nullptr);
+  ASSERT_GT(child, 0) << strerror(errno);
+
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = wait4(child, &status, __WCLONE, nullptr);
+  } while (waited < 0 && errno == EINTR);
+  ASSERT_EQ(child, waited) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+  EXPECT_EQ(1, g_ptrace_clone_exit_signal);
+}
+
+TEST(WaitRusage, RepeatedPtraceTracemeFailsWithEperm) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+      _exit(2);
+    }
+    errno = 0;
+    if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != -1 ||
+        errno != EPERM) {
+      _exit(3);
+    }
+    _exit(0);
+  }
+
+  int status = 0;
+  ASSERT_EQ(child, wait4(child, &status, __WALL, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, WcloneDoesNotReapOrdinaryForkChild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(0);
+  }
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, &status, WNOHANG | __WCLONE, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, Wait4AndWaitpidReturnEncodedExitStatus) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(42);
+  }
+
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 42);
+
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(21);
+  }
+
+  status = 0;
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 21);
+
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(33);
+  }
+
+  status = 0;
+  ASSERT_EQ(child, wait4(-1, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 33);
+
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(34);
+  }
+
+  status = 0;
+  ASSERT_EQ(child, wait4(0, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 34);
+
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+  child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(fds[1]);
+    char byte = 0;
+    if (read(fds[0], &byte, 1) < 0) {
+      _exit(2);
+    }
+    close(fds[0]);
+    _exit(35);
+  }
+
+  close(fds[0]);
+  ASSERT_EQ(0, setpgid(child, child)) << strerror(errno);
+  ASSERT_EQ(1, write(fds[1], "x", 1)) << strerror(errno);
+  close(fds[1]);
+
+  status = 0;
+  ASSERT_EQ(child, wait4(-child, &status, 0, nullptr)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 35);
+}
+
+TEST(WaitRusage, WaitidPidExitedChildWithoutWexitedReturnsEchild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(7);
+  }
+
+  siginfo_t si {};
+  bool observed_exit = false;
+  for (int i = 0; i < 1000; ++i) {
+    memset(&si, 0, sizeof(si));
+    ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si,
+                         WEXITED | WNOWAIT | WNOHANG, nullptr))
+        << strerror(errno);
+    if (si.si_pid == child) {
+      observed_exit = true;
+      break;
+    }
+    usleep(1000);
+  }
+  ASSERT_TRUE(observed_exit);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(7, si.si_status);
+
+  memset(&si, 0x5a, sizeof(si));
+  errno = 0;
+  EXPECT_EQ(-1,
+            syscall(SYS_waitid, P_PID, child, &si, WSTOPPED | WNOHANG, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ExpectEncodedExitStatus(status, 7);
+}
+
+TEST(WaitRusage, WnothreadWaitsForChildForkedByCurrentThread) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadForkArgs args;
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkChildFromThread, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+  ASSERT_EQ(0, args.fork_errno) << strerror(args.fork_errno);
+  ASSERT_GT(args.child, 0);
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(args.child, &status, WNOHANG | __WNOTHREAD, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+  EXPECT_EQ(args.child, args.wait_result) << strerror(args.wait_errno);
+  ExpectEncodedExitStatus(args.wait_status, 17);
+}
+
+TEST(WaitRusage, WnothreadChildReparentedWhenForkingThreadExits) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadForkExitArgs args;
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  args.release_write_fd = release_pipe[1];
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkChildAndExitThread, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+
+  ASSERT_EQ(0, args.fork_errno) << strerror(args.fork_errno);
+  ASSERT_GT(args.child, 0);
+
+  auto close_release_pipe = [&release_pipe] {
+    if (release_pipe[1] >= 0) {
+      close(release_pipe[1]);
+      release_pipe[1] = -1;
+    }
+  };
+  auto cleanup_child = [&args, &close_release_pipe] {
+    close_release_pipe();
+    int cleanup_status = 0;
+    while (wait4(args.child, &cleanup_status, 0, nullptr) == -1 &&
+           errno == EINTR) {
+    }
+  };
+
+  struct timespec reparent_deadline {};
+  if (clock_gettime(CLOCK_MONOTONIC, &reparent_deadline) != 0) {
+    const int clock_errno = errno;
+    cleanup_child();
+    FAIL() << strerror(clock_errno);
+  }
+  ++reparent_deadline.tv_sec;
+  bool reparented = false;
+  while (true) {
+    struct timespec now {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+      const int clock_errno = errno;
+      cleanup_child();
+      FAIL() << strerror(clock_errno);
+    }
+    if (now.tv_sec > reparent_deadline.tv_sec ||
+        (now.tv_sec == reparent_deadline.tv_sec &&
+         now.tv_nsec >= reparent_deadline.tv_nsec)) {
+      break;
+    }
+
+    siginfo_t si {};
+    errno = 0;
+    long ret = syscall(SYS_waitid, P_PID, args.child, &si,
+                       WEXITED | WNOHANG | WNOWAIT | __WNOTHREAD, nullptr);
+    if (ret == 0 && si.si_pid == 0) {
+      reparented = true;
+      break;
+    }
+    if (ret == -1 && (errno == ECHILD || errno == EINTR)) {
+      usleep(1000);
+      continue;
+    }
+
+    const int wait_errno = errno;
+    cleanup_child();
+    if (ret == 0) {
+      FAIL() << "waitid observed child " << si.si_pid
+             << " before it was released";
+    }
+    FAIL() << "waitid before releasing child returned " << ret << ": "
+           << strerror(wait_errno);
+  }
+
+  if (!reparented) {
+    cleanup_child();
+    FAIL() << "child was not reparented to the waiting thread before timeout";
+  }
+
+  errno = 0;
+  if (write(release_pipe[1], "x", 1) != 1) {
+    const int write_errno = errno;
+    cleanup_child();
+    FAIL() << strerror(write_errno);
+  }
+  close_release_pipe();
+
+  int status = 0;
+  ASSERT_EQ(args.child, wait4(args.child, &status, __WNOTHREAD, nullptr))
+      << strerror(errno);
+  ExpectEncodedExitStatus(status, 23);
+}
+
+TEST(WaitRusage, ThreadGroupLeaderWaitDelayedUntilSubthreadsExit) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(ready_pipe[0]);
+    close(release_pipe[1]);
+    BlockingThreadExitArgs args;
+    args.ready_fd = ready_pipe[1];
+    args.release_fd = release_pipe[0];
+    pthread_t thread {};
+    if (pthread_create(&thread, nullptr, BlockThenExitThread, &args) != 0) {
+      syscall(SYS_exit, 2);
+    }
+    syscall(SYS_exit, 0);
+  }
+
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+
+  usleep(50000);
+  siginfo_t si {};
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PID, child, &si, WSTOPPED | WNOHANG,
+                       nullptr))
+      << strerror(errno);
+  EXPECT_EQ(0, si.si_pid);
+
+  int status = 0;
+  ASSERT_EQ(0, wait4(child, &status, WNOHANG, nullptr)) << strerror(errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, ThreadForkedTracemeIsWaitableByForkingThreadWithWclone) {
+  ThreadPtraceForkArgs args;
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ForkTracemeAndWaitFromThread, &args))
+      << strerror(errno);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+
+  EXPECT_GT(args.result, 0) << strerror(args.err);
+  ASSERT_TRUE(WIFEXITED(args.status));
+  EXPECT_EQ(0, WEXITSTATUS(args.status));
+}
+
+TEST(WaitRusage, TracemeAfterLeaderReparentUsesLiveThread) {
+  pid_t helper = fork();
+  ASSERT_GE(helper, 0) << strerror(errno);
+  if (helper == 0) {
+    auto* args = static_cast<TracemeReparentArgs*>(
+        malloc(sizeof(TracemeReparentArgs)));
+    if (args == nullptr) {
+      _exit(10);
+    }
+    new (args) TracemeReparentArgs();
+
+    int ready_pipe[2] = {};
+    int release_pipe[2] = {};
+    if (pipe(ready_pipe) != 0 || pipe(release_pipe) != 0) {
+      _exit(11);
+    }
+    args->ready_fd = ready_pipe[0];
+    args->release_fd = release_pipe[1];
+
+    pthread_t sibling {};
+    if (pthread_create(&sibling, nullptr, TracemeAfterLeaderExitSibling,
+                       args) != 0) {
+      _exit(12);
+    }
+
+    pid_t child = fork();
+    if (child == 0) {
+      close(ready_pipe[0]);
+      close(ready_pipe[1]);
+      close(release_pipe[1]);
+
+      char release = 0;
+      if (read(release_pipe[0], &release, 1) != 1) {
+        _exit(30);
+      }
+      if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+        _exit(40 + errno);
+      }
+      _exit(0);
+    }
+    if (child < 0) {
+      _exit(13);
+    }
+
+    close(release_pipe[0]);
+    args->child = child;
+    if (write(ready_pipe[1], "x", 1) != 1) {
+      _exit(14);
+    }
+    close(ready_pipe[1]);
+
+    syscall(SYS_exit, 0);
+    _exit(15);
+  }
+
+  int status = 0;
+  ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, SubreaperLeaderExitUsesAliveThread) {
+  int result_pipe[2] = {};
+  ASSERT_EQ(0, pipe(result_pipe)) << strerror(errno);
+
+  pid_t helper = fork();
+  ASSERT_GE(helper, 0) << strerror(errno);
+  if (helper == 0) {
+    close(result_pipe[0]);
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+      _exit(10);
+    }
+
+    auto* args = static_cast<SubreaperAliveArgs*>(
+        malloc(sizeof(SubreaperAliveArgs)));
+    if (args == nullptr) {
+      _exit(11);
+    }
+    new (args) SubreaperAliveArgs();
+
+    int ready_pipe[2] = {};
+    int intermediate_release_pipe[2] = {};
+    int grandchild_release_pipe[2] = {};
+    int pid_pipe[2] = {};
+    if (pipe(ready_pipe) != 0 || pipe(intermediate_release_pipe) != 0 ||
+        pipe(grandchild_release_pipe) != 0 || pipe(pid_pipe) != 0) {
+      _exit(12);
+    }
+
+    args->ready_fd = ready_pipe[0];
+    args->intermediate_release_fd = intermediate_release_pipe[1];
+    args->grandchild_release_fd = grandchild_release_pipe[1];
+    args->result_fd = result_pipe[1];
+
+    pthread_t sibling {};
+    if (pthread_create(&sibling, nullptr, SubreaperLeaderExitSibling, args) !=
+        0) {
+      _exit(13);
+    }
+
+    pid_t intermediate = fork();
+    if (intermediate == 0) {
+      pid_t grandchild = fork();
+      if (grandchild == 0) {
+        char release = 0;
+        if (read(grandchild_release_pipe[0], &release, 1) != 1) {
+          _exit(30);
+        }
+        _exit(37);
+      }
+      if (grandchild < 0) {
+        _exit(31);
+      }
+      if (!WriteExact(pid_pipe[1], &grandchild, sizeof(grandchild))) {
+        _exit(32);
+      }
+      char release = 0;
+      if (read(intermediate_release_pipe[0], &release, 1) != 1) {
+        _exit(33);
+      }
+      _exit(0);
+    }
+    if (intermediate < 0) {
+      _exit(14);
+    }
+
+    pid_t grandchild = -1;
+    if (!ReadExact(pid_pipe[0], &grandchild, sizeof(grandchild))) {
+      _exit(15);
+    }
+    args->intermediate = intermediate;
+    args->grandchild = grandchild;
+    if (write(ready_pipe[1], "r", 1) != 1) {
+      _exit(16);
+    }
+
+    syscall(SYS_exit, 0);
+    _exit(17);
+  }
+
+  close(result_pipe[1]);
+  int sibling_result = -1;
+  ASSERT_TRUE(ReadExact(result_pipe[0], &sibling_result, sizeof(sibling_result)))
+      << strerror(errno);
+  EXPECT_EQ(37, sibling_result);
+
+  int status = 0;
+  ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+}
+
+TEST(WaitRusage, ConcurrentExitingThreadsDoNotKeepChildOnDyingReaper) {
+  for (int iter = 0; iter < 20; ++iter) {
+    pid_t helper = fork();
+    ASSERT_GE(helper, 0) << strerror(errno);
+    if (helper == 0) {
+      auto* args = static_cast<ConcurrentExitArgs*>(
+          malloc(sizeof(ConcurrentExitArgs)));
+      if (args == nullptr) {
+        _exit(10);
+      }
+      new (args) ConcurrentExitArgs();
+
+      int ready_pipe[2] = {};
+      int exit_pipe[2] = {};
+      int child_release_pipe[2] = {};
+      if (pipe(ready_pipe) != 0 || pipe(exit_pipe) != 0 ||
+          pipe(child_release_pipe) != 0) {
+        _exit(11);
+      }
+
+      args->ready_fd = ready_pipe[1];
+      args->exit_fd = exit_pipe[0];
+      args->child_release_fd = child_release_pipe[0];
+
+      pthread_t fork_thread {};
+      pthread_t exit_thread {};
+      if (pthread_create(&fork_thread, nullptr, ForkChildThenConcurrentExit,
+                         args) != 0) {
+        _exit(12);
+      }
+      if (pthread_create(&exit_thread, nullptr, ConcurrentExitOnlyThread,
+                         args) != 0) {
+        _exit(13);
+      }
+
+      char ready[2] = {};
+      if (!ReadExact(ready_pipe[0], ready, sizeof(ready))) {
+        _exit(14);
+      }
+      if (args->fork_errno != 0 || args->child <= 0) {
+        _exit(15);
+      }
+
+      if (!WriteExact(exit_pipe[1], "xx", 2)) {
+        _exit(16);
+      }
+      if (pthread_join(fork_thread, nullptr) != 0 ||
+          pthread_join(exit_thread, nullptr) != 0) {
+        _exit(17);
+      }
+
+      int status = 0;
+      bool waitable = false;
+      for (int i = 0; i < 1000; ++i) {
+        errno = 0;
+        pid_t ret = wait4(args->child, &status, __WNOTHREAD | WNOHANG,
+                          nullptr);
+        if (ret == 0) {
+          waitable = true;
+          break;
+        }
+        if (ret == args->child) {
+          _exit(18);
+        }
+        if (errno != ECHILD) {
+          _exit(19);
+        }
+        usleep(1000);
+      }
+      if (!waitable) {
+        _exit(20);
+      }
+
+      if (write(child_release_pipe[1], "c", 1) != 1) {
+        _exit(21);
+      }
+
+      status = 0;
+      pid_t ret = wait4(args->child, &status, __WNOTHREAD, nullptr);
+      if (ret != args->child) {
+        _exit(22);
+      }
+      if (!WIFEXITED(status)) {
+        _exit(23);
+      }
+      _exit(WEXITSTATUS(status));
+    }
+
+    int status = 0;
+    ASSERT_EQ(helper, waitpid(helper, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status)) << "iter=" << iter << " status=" << status;
+    EXPECT_EQ(41, WEXITSTATUS(status)) << "iter=" << iter;
+  }
+}
+
+TEST(WaitRusage, BlockingWait4ChildExitDoesNotLoseWakeup) {
+  for (int iter = 0; iter < 5; ++iter) {
+    pid_t helper = fork();
+    ASSERT_GE(helper, 0) << strerror(errno);
+    if (helper == 0) {
+      _exit(BlockingWaitExitRaceHelper(iter));
+    }
+
+    int status = 0;
+    int wait_errno = 0;
+    pid_t wait_ret = WaitPidWithTimeout(helper, &status, 3000000, &wait_errno);
+    if (wait_ret == 0) {
+      kill(helper, SIGKILL);
+      waitpid(helper, nullptr, 0);
+      FAIL() << "blocking wait helper timed out at iter=" << iter
+             << " helper=" << helper;
+    }
+    ASSERT_EQ(helper, wait_ret) << "iter=" << iter << " helper=" << helper
+                                << " errno=" << wait_errno << " ("
+                                << strerror(wait_errno) << ")";
+
+    ASSERT_TRUE(WIFEXITED(status)) << "iter=" << iter << " status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << "iter=" << iter;
+  }
+}
+
+TEST(WaitRusage, NaturalWaitCannotReapThreadTid) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadTidArgs args;
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  pthread_t thread {};
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ReportTidAndWait, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  close(ready_pipe[0]);
+  ASSERT_GT(args.tid, 0);
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(args.tid, &status, WNOHANG | __WCLONE, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  errno = 0;
+  EXPECT_EQ(-1, wait4(args.tid, &status, WNOHANG | __WALL, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+}
+
+TEST(WaitRusage, WaitidPidfdNegativeFdIsEinval) {
+  siginfo_t si {};
+  errno = 0;
+  EXPECT_EQ(-1,
+            syscall(SYS_waitid, P_PIDFD, -1, &si, WEXITED | WNOHANG, nullptr));
+  EXPECT_EQ(EINVAL, errno);
+}
+
+TEST(WaitRusage, PidfdOpenRejectsInvalidPidAndFlags) {
+  errno = 0;
+  EXPECT_EQ(-1, PidfdOpen(0, 0));
+  EXPECT_EQ(EINVAL, errno);
+
+  errno = 0;
+  EXPECT_EQ(-1, PidfdOpen(-1, 0));
+  EXPECT_EQ(EINVAL, errno);
+
+  errno = 0;
+  EXPECT_EQ(-1, PidfdOpen(getpid(), O_CLOEXEC));
+  EXPECT_EQ(EINVAL, errno);
+}
+
+TEST(WaitRusage, PidfdOpenAllowsRepeatedOpenSamePid) {
+  int first = PidfdOpen(getpid(), 0);
+  ASSERT_GE(first, 0) << strerror(errno);
+
+  int second = PidfdOpen(getpid(), 0);
+  ASSERT_GE(second, 0) << strerror(errno);
+  EXPECT_NE(first, second);
+
+  close(first);
+  close(second);
+}
+
+TEST(WaitRusage, PidfdOpenRejectsNonLeaderTid) {
+  int ready_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  ThreadTidArgs args {};
+  args.ready_fd = ready_pipe[1];
+  args.release_fd = release_pipe[0];
+  pthread_t thread;
+  ASSERT_EQ(0, pthread_create(&thread, nullptr, ReportTidAndWait, &args))
+      << strerror(errno);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(ready_pipe[0], &byte, 1)) << strerror(errno);
+  ASSERT_GT(args.tid, 0);
+  ASSERT_NE(args.tid, getpid());
+
+  errno = 0;
+  EXPECT_EQ(-1, PidfdOpen(args.tid, 0));
+  EXPECT_EQ(EINVAL, errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  ASSERT_EQ(0, pthread_join(thread, nullptr)) << strerror(errno);
+  close(ready_pipe[0]);
+  close(ready_pipe[1]);
+  close(release_pipe[0]);
+  close(release_pipe[1]);
+}
+
+TEST(WaitRusage, WaitidPidfdRejectsNonPidfdFd) {
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+
+  siginfo_t si {};
+  errno = 0;
+  EXPECT_EQ(-1, syscall(SYS_waitid, P_PIDFD, fds[0],
+                        &si, WEXITED | WNOHANG, nullptr));
+  EXPECT_EQ(EBADF, errno);
+
+  close(fds[0]);
+  close(fds[1]);
+}
+
+TEST(WaitRusage, WaitidPidfdWaitsExitedChild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(33);
+  }
+
+  int pidfd = PidfdOpen(child, 0);
+  ASSERT_GE(pidfd, 0) << strerror(errno);
+
+  siginfo_t si {};
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si, WEXITED, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(SIGCHLD, si.si_signo);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(child, si.si_pid);
+  EXPECT_EQ(33, si.si_status);
+
+  close(pidfd);
+}
+
+TEST(WaitRusage, WaitidPidfdNonblockWithoutWnohangReturnsEagain) {
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(2);
+    }
+    _exit(34);
+  }
+  close(release_pipe[0]);
+
+  int pidfd = PidfdOpen(child, 0);
+  ASSERT_GE(pidfd, 0) << strerror(errno);
+  int flags = fcntl(pidfd, F_GETFL);
+  ASSERT_GE(flags, 0) << strerror(errno);
+  ASSERT_EQ(0, fcntl(pidfd, F_SETFL, flags | O_NONBLOCK)) << strerror(errno);
+
+  DelayedWriteArgs release_args {};
+  release_args.fd = release_pipe[1];
+  release_args.delay_usec = 100000;
+  pthread_t release_thread;
+  ASSERT_EQ(0, pthread_create(&release_thread, nullptr, DelayedWriteByte,
+                              &release_args))
+      << strerror(errno);
+
+  siginfo_t si {};
+  errno = 0;
+  EXPECT_EQ(-1, syscall(SYS_waitid, P_PIDFD, pidfd, &si, WEXITED, nullptr));
+  EXPECT_EQ(EAGAIN, errno);
+
+  ASSERT_EQ(0, pthread_join(release_thread, nullptr)) << strerror(errno);
+  close(release_pipe[1]);
+
+  ASSERT_TRUE(WaitidPidfdExited(pidfd, child, &si)) << strerror(errno);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(34, si.si_status);
+
+  close(pidfd);
+}
+
+TEST(WaitRusage, WaitidPidfdNonblockWithWnohangReturnsZeroAndClearsSiginfo) {
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(2);
+    }
+    _exit(35);
+  }
+  close(release_pipe[0]);
+
+  int pidfd = PidfdOpen(child, O_NONBLOCK);
+  ASSERT_GE(pidfd, 0) << strerror(errno);
+
+  siginfo_t si {};
+  si.si_signo = SIGCHLD;
+  si.si_code = CLD_EXITED;
+  si.si_pid = child;
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si,
+                       WEXITED | WNOHANG, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(0, si.si_signo);
+  EXPECT_EQ(0, si.si_code);
+  EXPECT_EQ(0, si.si_pid);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+
+  ASSERT_TRUE(WaitidPidfdExited(pidfd, child, &si)) << strerror(errno);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(35, si.si_status);
+
+  close(pidfd);
+}
+
+TEST(WaitRusage, PidfdPollAndLseekSemantics) {
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(release_pipe[1]);
+    char byte = 0;
+    if (read(release_pipe[0], &byte, 1) != 1) {
+      _exit(2);
+    }
+    _exit(36);
+  }
+  close(release_pipe[0]);
+
+  int pidfd = PidfdOpen(child, 0);
+  ASSERT_GE(pidfd, 0) << strerror(errno);
+
+  errno = 0;
+  EXPECT_EQ(-1, lseek(pidfd, 0, SEEK_SET));
+  EXPECT_EQ(ESPIPE, errno);
+
+  struct pollfd pfd {};
+  pfd.fd = pidfd;
+  pfd.events = POLLIN;
+  ASSERT_EQ(0, poll(&pfd, 1, 0)) << strerror(errno);
+  EXPECT_EQ(0, pfd.revents & POLLIN);
+
+  int epfd = epoll_create1(0);
+  ASSERT_GE(epfd, 0) << strerror(errno);
+  struct epoll_event event {};
+  event.events = EPOLLIN;
+  event.data.fd = pidfd;
+  ASSERT_EQ(0, epoll_ctl(epfd, EPOLL_CTL_ADD, pidfd, &event))
+      << strerror(errno);
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+
+  siginfo_t si {};
+  bool exited = false;
+  for (int i = 0; i < 200; ++i) {
+    memset(&si, 0, sizeof(si));
+    ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si,
+                         WEXITED | WNOWAIT | WNOHANG, nullptr))
+        << strerror(errno);
+    if (si.si_pid == child) {
+      exited = true;
+      break;
+    }
+    usleep(1000);
+  }
+  ASSERT_TRUE(exited);
+
+  pfd.revents = 0;
+  ASSERT_EQ(1, poll(&pfd, 1, 0)) << strerror(errno);
+  EXPECT_NE(0, pfd.revents & POLLIN);
+
+  struct epoll_event ready {};
+  ASSERT_EQ(1, epoll_wait(epfd, &ready, 1, 0)) << strerror(errno);
+  EXPECT_EQ(pidfd, ready.data.fd);
+  EXPECT_NE(0u, ready.events & EPOLLIN);
+
+  memset(&si, 0, sizeof(si));
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si, WEXITED, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(36, si.si_status);
+
+  close(epfd);
+  close(pidfd);
+}
+
+TEST(WaitRusage, PidfdPollWaitsForWholeThreadGroupExit) {
+  int thread_ready_pipe[2] = {};
+  int leader_go_pipe[2] = {};
+  int leader_exiting_pipe[2] = {};
+  int release_pipe[2] = {};
+  ASSERT_EQ(0, pipe(thread_ready_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(leader_go_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(leader_exiting_pipe)) << strerror(errno);
+  ASSERT_EQ(0, pipe(release_pipe)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(thread_ready_pipe[0]);
+    close(leader_go_pipe[1]);
+    close(leader_exiting_pipe[0]);
+    close(release_pipe[1]);
+
+    BlockingThreadExitArgs args;
+    args.ready_fd = thread_ready_pipe[1];
+    args.release_fd = release_pipe[0];
+    pthread_t thread {};
+    if (pthread_create(&thread, nullptr, BlockThenExitThread, &args) != 0) {
+      syscall(SYS_exit, 2);
+    }
+
+    char go = 0;
+    if (read(leader_go_pipe[0], &go, 1) != 1) {
+      syscall(SYS_exit, 3);
+    }
+
+    char byte = 'l';
+    if (write(leader_exiting_pipe[1], &byte, 1) != 1) {
+      syscall(SYS_exit, 4);
+    }
+    syscall(SYS_exit, 0);
+  }
+
+  close(thread_ready_pipe[1]);
+  close(leader_go_pipe[0]);
+  close(leader_exiting_pipe[1]);
+  close(release_pipe[0]);
+
+  char byte = 0;
+  ASSERT_EQ(1, read(thread_ready_pipe[0], &byte, 1)) << strerror(errno);
+
+  int pidfd = PidfdOpen(child, 0);
+  ASSERT_GE(pidfd, 0) << strerror(errno);
+
+  int epfd = epoll_create1(0);
+  ASSERT_GE(epfd, 0) << strerror(errno);
+  struct epoll_event event {};
+  event.events = EPOLLIN;
+  event.data.fd = pidfd;
+  ASSERT_EQ(0, epoll_ctl(epfd, EPOLL_CTL_ADD, pidfd, &event))
+      << strerror(errno);
+
+  ASSERT_EQ(1, write(leader_go_pipe[1], "x", 1)) << strerror(errno);
+  close(leader_go_pipe[1]);
+  ASSERT_EQ(1, read(leader_exiting_pipe[0], &byte, 1)) << strerror(errno);
+  close(leader_exiting_pipe[0]);
+
+  for (int i = 0; i < 1000; ++i) {
+    struct pollfd pfd {};
+    pfd.fd = pidfd;
+    pfd.events = POLLIN;
+    ASSERT_EQ(0, poll(&pfd, 1, 0)) << strerror(errno);
+    EXPECT_EQ(0, pfd.revents & POLLIN);
+
+    struct epoll_event ready {};
+    ASSERT_EQ(0, epoll_wait(epfd, &ready, 1, 0)) << strerror(errno);
+
+    siginfo_t si {};
+    ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si,
+                         WEXITED | WNOHANG, nullptr))
+        << strerror(errno);
+    EXPECT_EQ(0, si.si_pid);
+    usleep(1000);
+  }
+
+  ASSERT_EQ(1, write(release_pipe[1], "x", 1)) << strerror(errno);
+  close(release_pipe[1]);
+
+  siginfo_t si {};
+  bool exited = false;
+  for (int i = 0; i < 1000; ++i) {
+    memset(&si, 0, sizeof(si));
+    ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si,
+                         WEXITED | WNOWAIT | WNOHANG, nullptr))
+        << strerror(errno);
+    if (si.si_pid == child) {
+      exited = true;
+      break;
+    }
+    usleep(1000);
+  }
+  ASSERT_TRUE(exited);
+
+  struct pollfd pfd {};
+  pfd.fd = pidfd;
+  pfd.events = POLLIN;
+  ASSERT_EQ(1, poll(&pfd, 1, 0)) << strerror(errno);
+  EXPECT_NE(0, pfd.revents & POLLIN);
+
+  struct epoll_event ready {};
+  ASSERT_EQ(1, epoll_wait(epfd, &ready, 1, 0)) << strerror(errno);
+  EXPECT_EQ(pidfd, ready.data.fd);
+  EXPECT_NE(0u, ready.events & EPOLLIN);
+
+  memset(&si, 0, sizeof(si));
+  ASSERT_EQ(0, syscall(SYS_waitid, P_PIDFD, pidfd, &si, WEXITED, nullptr))
+      << strerror(errno);
+  EXPECT_EQ(CLD_EXITED, si.si_code);
+  EXPECT_EQ(0, si.si_status);
+
+  close(thread_ready_pipe[0]);
+  close(epfd);
+  close(pidfd);
+}
+
+TEST(WaitRusage, Wait4RejectsWnowaitWithoutReapingChild) {
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    _exit(0);
+  }
+
+  int status = 0;
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, &status, WNOWAIT, nullptr));
+  EXPECT_EQ(EINVAL, errno);
+
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, WnohangNoEventDoesNotTouchUserPointers) {
+  int fds[2] = {};
+  ASSERT_EQ(0, pipe(fds)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    close(fds[1]);
+    char byte = 0;
+    if (read(fds[0], &byte, 1) < 0) {
+      _exit(2);
+    }
+    close(fds[0]);
+    _exit(0);
+  }
+  close(fds[0]);
+
+  errno = 0;
+  EXPECT_EQ(0, wait4(child, reinterpret_cast<int*>(1), WNOHANG,
+                     reinterpret_cast<struct rusage*>(1)))
+      << strerror(errno);
+
+  ASSERT_EQ(1, write(fds[1], "x", 1)) << strerror(errno);
+  close(fds[1]);
+
+  int status = 0;
+  ASSERT_EQ(child, wait4(child, &status, 0, nullptr)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(WaitRusage, ExplicitSigignSigchldAutoreapsWithoutChildRusage) {
+  struct sigaction old_action {};
+  struct sigaction ignore_action {};
+  ignore_action.sa_handler = SIG_IGN;
+  sigemptyset(&ignore_action.sa_mask);
+  ASSERT_EQ(0, sigaction(SIGCHLD, &ignore_action, &old_action)) << strerror(errno);
+
+  struct rusage before {};
+  ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &before)) << strerror(errno);
+
+  pid_t child = fork();
+  ASSERT_GE(child, 0) << strerror(errno);
+  if (child == 0) {
+    BusyForUsec(300000);
+  }
+
+  errno = 0;
+  EXPECT_EQ(-1, wait4(child, nullptr, 0, nullptr));
+  EXPECT_EQ(ECHILD, errno);
+
+  struct rusage after {};
+  ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after)) << strerror(errno);
+  EXPECT_EQ(RusageCpuUsec(before), RusageCpuUsec(after));
+  EXPECT_EQ(before.ru_maxrss, after.ru_maxrss);
+
+  ASSERT_EQ(0, sigaction(SIGCHLD, &old_action, nullptr)) << strerror(errno);
+}
 
 TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   struct rusage before {};
@@ -78,6 +2043,8 @@ TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   struct rusage after_nowait {};
   ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after_nowait)) << strerror(errno);
   EXPECT_EQ(RusageCpuUsec(before), RusageCpuUsec(after_nowait));
+  EXPECT_EQ(before.ru_maxrss, after_nowait.ru_maxrss);
+  EXPECT_GT(nowait_usage.ru_maxrss, 0);
 
   int status = 0;
   struct rusage waited_usage {};
@@ -90,6 +2057,8 @@ TEST(WaitRusage, WNowaitDoesNotReapAndWait4AccountsChildUsage) {
   ASSERT_EQ(0, getrusage(RUSAGE_CHILDREN, &after_wait)) << strerror(errno);
   EXPECT_GE(RusageCpuUsec(after_wait) - RusageCpuUsec(before),
             RusageCpuUsec(waited_usage));
+  EXPECT_EQ(std::max(before.ru_maxrss, waited_usage.ru_maxrss),
+            after_wait.ru_maxrss);
 
   errno = 0;
   EXPECT_EQ(-1, wait4(child, nullptr, WNOHANG, nullptr));
@@ -119,7 +2088,192 @@ TEST(WaitRusage, Wait4IncludesExitedThreadCpuTime) {
   EXPECT_GE(RusageCpuUsec(usage), 100000u);
 }
 
+namespace {
+
+constexpr size_t kRssBytes = 64 * 1024 * 1024;
+// Linux may batch RSS accounting; do not assert an exact anonymous-page count.
+constexpr long kRssToleranceKb = 4 * 1024;
+constexpr long kRssMinimumKb = kRssBytes / 1024 - kRssToleranceKb;
+
+void* TouchRss(size_t bytes) {
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) return MAP_FAILED;
+  void* mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) return mapping;
+  volatile char* pages = static_cast<volatile char*>(mapping);
+  for (size_t offset = 0; offset < bytes; offset += page_size) pages[offset] = 1;
+  return mapping;
+}
+
+void ExpectRssChild(pid_t child) {
+  ASSERT_GT(child, 0) << strerror(errno);
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+  ASSERT_TRUE(WIFEXITED(status)) << status;
+  EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+void ExecRssProbe(const char* mode) {
+  execl("/proc/self/exe", "wait_rusage_test", mode,
+        static_cast<char*>(nullptr));
+  _exit(90);
+}
+
+void* ThreadExecRssProbe(void*) {
+  ExecRssProbe("--maxrss-probe");
+  return nullptr;
+}
+
+struct ThreadRssResult {
+  long self = 0;
+  long thread = 0;
+  int error = 0;
+};
+
+void* ReadThreadRss(void* argument) {
+  auto* result = static_cast<ThreadRssResult*>(argument);
+  struct rusage self {}, thread {};
+  if (getrusage(RUSAGE_SELF, &self) != 0 ||
+      getrusage(RUSAGE_THREAD, &thread) != 0) {
+    result->error = 1;
+    return nullptr;
+  }
+  result->self = self.ru_maxrss;
+  result->thread = thread.ru_maxrss;
+  return nullptr;
+}
+
+void RunRssExecTest(const char* mode) {
+  const pid_t child = fork();
+  if (child == 0) {
+    if (TouchRss(kRssBytes) == MAP_FAILED) _exit(10);
+    // No query before exec: preserving the old mm cannot depend on getrusage.
+    ExecRssProbe(mode);
+  }
+  ExpectRssChild(child);
+}
+
+}  // namespace
+
+TEST(WaitRusage, MaxRssRetainsUnobservedPeakAfterMunmap) {
+  const pid_t child = fork();
+  if (child == 0) {
+    void* mapping = TouchRss(kRssBytes);
+    if (mapping == MAP_FAILED) _exit(10);
+    // Intentionally do not sample while the allocation is still resident.
+    if (munmap(mapping, kRssBytes) != 0) _exit(11);
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) _exit(12);
+    _exit(usage.ru_maxrss >= kRssMinimumKb ? 0 : 13);
+  }
+  ExpectRssChild(child);
+}
+
+TEST(WaitRusage, MaxRssIsSharedByThreads) {
+  const pid_t child = fork();
+  if (child == 0) {
+    void* mapping = TouchRss(kRssBytes);
+    if (mapping == MAP_FAILED) _exit(10);
+    ThreadRssResult result;
+    pthread_t worker {};
+    if (pthread_create(&worker, nullptr, ReadThreadRss, &result) != 0) _exit(11);
+    if (pthread_join(worker, nullptr) != 0) _exit(12);
+    if (result.error || result.self < kRssMinimumKb ||
+        result.thread < kRssMinimumKb ||
+        labs(result.self - result.thread) > kRssToleranceKb) _exit(13);
+    if (munmap(mapping, kRssBytes) != 0) _exit(14);
+    struct rusage after {};
+    if (getrusage(RUSAGE_SELF, &after) != 0 ||
+        after.ru_maxrss < result.self) _exit(15);
+    _exit(0);
+  }
+  ExpectRssChild(child);
+}
+
+TEST(WaitRusage, MaxRssForkDoesNotInheritReleasedPeak) {
+  const pid_t child = fork();
+  if (child == 0) {
+    void* mapping = TouchRss(kRssBytes);
+    if (mapping == MAP_FAILED || munmap(mapping, kRssBytes) != 0) _exit(10);
+    struct rusage parent {};
+    if (getrusage(RUSAGE_SELF, &parent) != 0 ||
+        parent.ru_maxrss < kRssMinimumKb) _exit(11);
+    const pid_t grandchild = fork();
+    if (grandchild == 0) {
+      struct rusage fresh {};
+      if (getrusage(RUSAGE_SELF, &fresh) != 0) _exit(12);
+      _exit(fresh.ru_maxrss + 32 * 1024 < parent.ru_maxrss ? 0 : 13);
+    }
+    int status = 0;
+    if (grandchild < 0 || waitpid(grandchild, &status, 0) != grandchild ||
+        !WIFEXITED(status)) _exit(14);
+    _exit(WEXITSTATUS(status));
+  }
+  ExpectRssChild(child);
+}
+
+TEST(WaitRusage, MaxRssSurvivesExec) {
+  RunRssExecTest("--maxrss-probe");
+}
+
+TEST(WaitRusage, MaxRssSurvivesNonLeaderExecHandoff) {
+  // First exec removes the large mm. The subsequent worker exec must transfer
+  // the old leader's saved history, not merely sample the small current mm.
+  RunRssExecTest("--maxrss-thread-exec");
+}
+
+TEST(WaitRusage, MaxRssChildrenUsesMaximumIncludingGrandchildren) {
+  const pid_t supervisor = fork();
+  if (supervisor == 0) {
+    struct rusage children {};
+    if (getrusage(RUSAGE_CHILDREN, &children) != 0 ||
+        children.ru_maxrss != 0) _exit(10);
+    for (int iteration = 0; iteration < 2; ++iteration) {
+      const pid_t child = fork();
+      if (child == 0) {
+        if (iteration == 0) {
+          const pid_t grandchild = fork();
+          if (grandchild == 0) {
+            if (TouchRss(kRssBytes) == MAP_FAILED) _exit(11);
+            _exit(0);  // No query: exit must preserve this peak.
+          }
+          int status = 0;
+          if (grandchild < 0 || waitpid(grandchild, &status, 0) != grandchild ||
+              !WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(12);
+        } else if (TouchRss(kRssBytes / 2) == MAP_FAILED) {
+          _exit(13);
+        }
+        _exit(0);
+      }
+      int status = 0;
+      struct rusage waited {}, after {};
+      if (child < 0 || wait4(child, &status, 0, &waited) != child ||
+          !WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(14);
+      if (iteration == 0 && waited.ru_maxrss < kRssMinimumKb) _exit(15);
+      if (getrusage(RUSAGE_CHILDREN, &after) != 0 ||
+          after.ru_maxrss != std::max(children.ru_maxrss, waited.ru_maxrss))
+        _exit(16);
+      children = after;
+    }
+    _exit(0);
+  }
+  ExpectRssChild(supervisor);
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && strcmp(argv[1], "--maxrss-probe") == 0) {
+    struct rusage usage {};
+    return getrusage(RUSAGE_SELF, &usage) == 0 &&
+                   usage.ru_maxrss >= kRssMinimumKb ? 0 : 91;
+  }
+  if (argc == 2 && strcmp(argv[1], "--maxrss-thread-exec") == 0) {
+    pthread_t worker {};
+    if (pthread_create(&worker, nullptr, ThreadExecRssProbe, nullptr) != 0)
+      return 92;
+    pthread_join(worker, nullptr);
+    return 93;  // Successful exec never returns to either old thread.
+  }
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

@@ -1,12 +1,12 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVMMSG;
 use crate::filesystem::epoll::EPollEventType;
-use crate::filesystem::vfs::file::FileFlags;
 use crate::libs::wait_queue::{TimeoutWaker, Waiter};
 use crate::net::posix::MsgHdr;
-use crate::net::socket;
+use crate::net::socket::PMSG;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
@@ -78,18 +78,14 @@ impl Syscall for SysRecvmmsgHandle {
             (Some(Duration::from_micros(us)), Some(Instant::now()))
         };
 
-        let file_nonblock = {
-            let binding = ProcessManager::current_pcb().fd_table();
-            let guard = binding.read();
-            let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-            file.flags().contains(FileFlags::O_NONBLOCK)
-        };
-
-        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-        let sock = socket_inode.as_socket().unwrap();
+        // One handle for the whole batch: the descriptor is resolved once and
+        // the socket stays alive across every (possibly blocking) receive.
+        let sock = SocketFdRef::from_fd(fd as i32)?;
+        let socket = sock.socket()?;
+        let file_nonblock = sock.is_nonblocking();
 
         // Wait-for-one semantics: after receiving the first message, don't block for subsequent.
-        let wait_for_one = !timeout.is_null() || (flags & socket::PMSG::WAITFORONE.bits()) != 0;
+        let wait_for_one = !timeout.is_null() || (flags & PMSG::WAITFORONE.bits()) != 0;
 
         let total_len = vlen
             .checked_mul(core::mem::size_of::<MMsgHdr>())
@@ -102,27 +98,35 @@ impl Syscall for SysRecvmmsgHandle {
 
         for i in 0..vlen {
             // For i>0, force nonblocking if we're in WAITFORONE/timeout mode.
-            let mut this_flags = flags;
+            // WAITFORONE controls the batch, not the protocol's per-message
+            // receive allowlist (Linux do_recvmmsg()).
+            let mut this_flags = flags & !PMSG::WAITFORONE.bits();
             if received > 0 && wait_for_one {
-                this_flags |= socket::PMSG::DONTWAIT.bits();
+                this_flags |= PMSG::DONTWAIT.bits();
             }
 
             // First message: if blocking and no data, optionally wait up to timeout.
             if received == 0
                 && !file_nonblock
-                && (this_flags & socket::PMSG::DONTWAIT.bits()) == 0
+                && (this_flags & PMSG::DONTWAIT.bits()) == 0
                 && !timeout.is_null()
-                && !sock.check_io_event().contains(EPollEventType::EPOLLIN)
+                && socket.recv_needs_pre_wait(PMSG::from_bits_retain(this_flags))
+                // Do not wait on the ordinary queue for a request the owner
+                // rejects. Import the message below before returning its error.
+                && socket
+                    .check_recv_flags(PMSG::from_bits_retain(this_flags))
+                    .is_ok()
+                && !socket.check_io_event().contains(EPollEventType::EPOLLIN)
             {
                 // Wait until readable or timeout.
-                wait_readable_with_timeout(sock, timeout_dur)?;
+                wait_readable_with_timeout(socket, timeout_dur)?;
             }
 
             let base = unsafe { (msgvec as *mut u8).add(i * core::mem::size_of::<MMsgHdr>()) };
             let msg_hdr_ptr = base as *mut MsgHdr;
 
-            match crate::net::syscall::sys_recvmsg::do_recvmsg(
-                fd,
+            match crate::net::syscall::sys_recvmsg::do_recvmsg_with_sock(
+                &sock,
                 msg_hdr_ptr,
                 this_flags,
                 frame.is_from_user(),

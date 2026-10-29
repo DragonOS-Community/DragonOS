@@ -14,6 +14,8 @@ pub fn local_irq_save() -> usize {
 // 恢复先前保存的rflags的值x
 pub fn local_irq_restore(x: usize) {
     unsafe {
-        asm!("push {}; popfq", in(reg) x, options(nomem, preserves_flags));
+        // POPFQ restores arithmetic flags too. It must clobber condition codes
+        // so the compiler cannot reuse a comparison made before this restore.
+        asm!("push {}; popfq", in(reg) x, options(nomem));
     }
 }

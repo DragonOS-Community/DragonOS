@@ -33,10 +33,11 @@ pub struct SpinLockGuard<'a, T: 'a> {
 
 /// `spin_lock_bh` 风格的守卫：持锁期间屏蔽本 CPU 的 softirq/tasklet 执行（不关硬中断）。
 ///
-/// Drop 顺序：先解锁，再恢复 BH（等价于 Linux 的 `spin_unlock_bh`）。
+/// Drop 顺序：先解锁(guard)，再恢复 BH。等价于 Linux 的 `spin_unlock_bh`。
+/// Rust 按字段声明顺序 drop，因此 guard 必须在 bh 前面。
 pub struct SpinLockBhGuard<'a, T: 'a> {
-    bh: LocalBhDisableGuard,
     guard: SpinLockGuard<'a, T>,
+    bh: LocalBhDisableGuard,
 }
 
 impl<'a, T: 'a> SpinLockGuard<'a, T> {
@@ -71,19 +72,30 @@ impl<T> SpinLock<T> {
 
     #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let mut spins: u32 = 0;
         loop {
             let res = self.try_lock();
             if let Ok(res) = res {
                 return res;
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0x3ff == 0 {
+                // 争用期间让本 CPU 仍能应答 TLB shootdown（见 spinlock_hook）。
+                crate::libs::spinlock_hook::run(self as *const _ as usize);
             }
             spin_loop();
         }
     }
 
     pub fn lock_irqsave(&self) -> SpinLockGuard<'_, T> {
+        let mut spins: u32 = 0;
         loop {
             if let Ok(guard) = self.try_lock_irqsave() {
                 return guard;
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0x3ff == 0 {
+                crate::libs::spinlock_hook::run(self as *const _ as usize);
             }
             spin_loop();
         }
@@ -94,7 +106,6 @@ impl<T> SpinLock<T> {
     /// 注意：该接口不关硬中断；若同一把锁也会在 hardirq 获取，则必须用 `lock_irqsave()`。
     pub fn lock_bh(&self) -> SpinLockBhGuard<'_, T> {
         let bh = local_bh_disable();
-        // `local_bh_disable()` 不禁用抢占，由 `lock()` 来禁用
         let guard = self.lock();
         SpinLockBhGuard { bh, guard }
     }
@@ -152,7 +163,6 @@ impl<T> SpinLock<T> {
 
     fn unlock(&self) {
         self.lock.store(false, Ordering::Release);
-        ProcessManager::preempt_enable();
     }
 
     pub fn is_locked(&self) -> bool {
@@ -180,8 +190,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.unlock();
-        // restore irq
+        // 先恢复中断，再启用抢占
         self.irq_flag.take();
+        ProcessManager::preempt_enable();
     }
 }
 

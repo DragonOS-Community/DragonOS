@@ -1,51 +1,49 @@
-# 锁的类型及其规则
+# Types of Locks and Their Rules
 
-## 简介
+## Introduction
 
-&emsp;&emsp;DragonOS内核实现了一些锁，大致可以分为两类：
+The DragonOS kernel implements several types of locks, which can be broadly categorized into two types:
 
-- 休眠锁
-- 自旋锁
+- Sleepable locks
+- Spinlocks
 
-## 锁的类型
+## Lock Types
 
-### 休眠锁
+### Sleepable Locks
 
-&emsp;&emsp;休眠锁只能在可抢占的上下文之中被获取。
+Sleepable locks can only be acquired in preemptible contexts.
 
-&emsp;&emsp;在DragonOS之中，实现了以下的休眠锁：
+In DragonOS, the following sleepable locks are implemented:
 
 - semaphore
 - rwsem
 - mutex_t
 
-### 自旋锁
+### Spinlocks
 
 - spinlock_t
-- {ref}`RawSpinLock <_spinlock_doc_rawspinlock>`（Rust版本的spinlock_t，但与spinlock_t不兼容）
-- {ref}`SpinLock <_spinlock_doc_spinlock>` —— 在RawSpinLock的基础上，封装了一层守卫(Guard), 将锁及其要保护到的数据绑定在一个结构体内，并能在编译期避免未加锁就访问数据的问题。
+- [RawSpinLock ](/kernel/locking/spinlock.html#_spinlock_doc_rawspinlock) (Rust version of spinlock_t, but incompatible with spinlock_t)
+- [SpinLock ](/kernel/locking/spinlock.html#_spinlock_doc_spinlock) — Built on RawSpinLock, it encapsulates a Guard layer, binding the lock and the data it protects within a single structure, and prevents accessing data without locking at compile time.
 
-&emsp;&emsp;进程在获取自旋锁后，将改变pcb中的锁变量持有计数，从而隐式地禁止了抢占。为了获得更多灵活的操作，spinlock还提供了以下的方法：
+When a process acquires a spinlock, it modifies the lock variable holding count in the PCB, thereby implicitly disabling preemption. For more flexible operations, spinlocks also provide the following methods:
 
-
-| 后缀                     | 说明                                                |
+| Suffix                     | Description                                                |
 | ------------------------ | --------------------------------------------------- |
-| _irq()                   | 在加锁时关闭中断/在放锁时开启中断                   |
-| _irqsave()/_irqrestore() | 在加锁时保存中断状态，并关中断/在放锁时恢复中断状态 |
+| _irq()                   | Disables interrupts when acquiring the lock / Enables interrupts when releasing the lock |
+| _irqsave()/_irqrestore() | Saves interrupt state and disables interrupts when acquiring the lock / Restores interrupt state when releasing the lock |
 
+## Detailed Descriptions
 
-## 详细介绍
+### Detailed Description of Spinlocks
 
-### 自旋锁的详细介绍
+For detailed information about spinlocks, please refer to the document: [Spinlock](/kernel/locking/spinlock.html#_spinlock_doc)
 
-&emsp;&emsp;关于自旋锁的详细介绍，请见文档：{ref}`自旋锁 <_spinlock_doc>`
+### Semaphore
 
-### semaphore信号量
+The semaphore is implemented based on counting.
 
-&emsp;&emsp;semaphore信号量是基于计数实现的。
+When available resources are insufficient, a process attempting to perform a down operation on the semaphore will be put to sleep until resources become available.
 
-&emsp;&emsp;当可用资源不足时，尝试对semaphore执行down操作的进程将会被休眠，直到资源可用。
+### Mutex
 
-### mutex互斥量
-
-&emsp;&emsp;请见{ref}`Mutex文档 <_mutex_doc>`
+Please refer to [Mutex documentation](/kernel/locking/mutex.html#_mutex_doc)

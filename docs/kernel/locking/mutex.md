@@ -1,25 +1,26 @@
-(_mutex_doc)=
+<a id="_mutex_doc"></a>
 
-:::{note}
-作者：龙进 <longjin@RinGoTek.cn>
+::: info Author
+Long Jin `<longjin@RinGoTek.cn>`
 :::
 
-# mutex互斥量
 
-&emsp;&emsp;mutex是一种轻量级的同步原语，只有被加锁、空闲两种状态。
+# mutex (Mutual Exclusion Lock)
 
-&emsp;&emsp;当mutex被占用时，尝试对mutex进行加锁操作的进程将会被休眠，直到资源可用。
+A mutex is a lightweight synchronization primitive that has only two states: locked or free.
 
-## 1. 特性
+When a mutex is held, any process attempting to lock it will be put to sleep until the resource becomes available.
 
-- 同一时间只有1个任务可以持有mutex
-- 不允许递归地加锁、解锁
-- 只允许通过mutex的api来操作mutex
-- 在硬中断、软中断中不能使用mutex
+## 1. Features
 
-## 2. 定义
+- Only one task can hold the mutex at any given time
+- Does not allow recursive locking/unlocking
+- Can only be manipulated through the mutex's API
+- Cannot be used in hard interrupts or soft interrupts
 
-&emsp;&emsp;mutex定义在`lib/mutex.rs`中，定义如下所示：
+## 2. Definition
+
+The mutex is defined in `lib/mutex.rs`, as shown below:
 
 ```rust
 /// @brief Mutex互斥量结构体
@@ -35,13 +36,13 @@ pub struct Mutex<T> {
 }
 ```
 
-## 3. 使用
+## 3. Usage
 
-&emsp;&emsp;与SpinLock类似，Rust版本的Mutex具有一个守卫。使用的时候，需要将要被保护的数据的所有权移交Mutex。并且，守卫只能在加锁成功后产生，因此，每个时刻，每个Mutex最多存在1个守卫。
+Similar to SpinLock, the Rust version of Mutex has a guard. When using it, you need to transfer ownership of the data to be protected to the Mutex. Moreover, the guard can only be created after a successful lock, so there can be at most one guard for each Mutex at any time.
 
-&emsp;&emsp;当需要读取、修改Mutex保护的数据时，请先使用Mutex的`lock()`方法。该方法会返回一个`MutexGuard`。您可以使用被保护的数据的成员函数来进行一些操作。或者是直接读取、写入被保护的数据。（相当于您获得了被保护的数据的可变引用）
+When you need to read or modify the data protected by the Mutex, first use the `lock()` method of the Mutex. This method returns a `MutexGuard`. You can then use the member functions of the protected data to perform operations, or directly read/write the protected data (equivalent to obtaining a mutable reference to the protected data).
 
-&emsp;&emsp;完整示例如下方代码所示：
+A complete example is shown in the following code:
 
 ```rust
 let x :Mutex<Vec<i32>>= Mutex::new(Vec::new());
@@ -58,7 +59,7 @@ let x :Mutex<Vec<i32>>= Mutex::new(Vec::new());
     debug!("x={:?}", x);
 ```
 
-&emsp;&emsp;对于结构体内部的变量，我们可以使用Mutex进行细粒度的加锁，也就是使用Mutex包裹需要细致加锁的成员变量，比如这样：
+For variables inside a struct, we can use Mutex for fine-grained locking, i.e., wrapping the member variables that require detailed locking with Mutex, like this:
 
 ```rust
 pub struct a {
@@ -66,7 +67,7 @@ pub struct a {
 }
 ```
 
-&emsp;&emsp;当然，我们也可以对整个结构体进行加锁：
+Of course, we can also lock the entire struct:
 
 ```rust
 struct MyStruct {
@@ -78,41 +79,40 @@ pub struct LockedMyStruct(Mutex<MyStruct>);
 
 ## 4. API
 
-### 4.1. new - 初始化Mutex
+### 4.1. new - Initialize Mutex
 
-#### 原型
+#### Prototype
 
 ```rust
 pub const fn new(value: T) -> Self
 ```
 
-#### 说明
+#### Description
 
-&emsp;&emsp;`new()`方法用于初始化一个Mutex。该方法需要一个被保护的数据作为参数。并且，该方法会返回一个Mutex。
+The `new()` method is used to initialize a Mutex. This method takes the data to be protected as a parameter and returns a Mutex.
 
+### 4.2. lock - Acquire Lock
 
-### 4.2. lock - 加锁
-
-#### 原型
+#### Prototype
 
 ```rust
 pub fn lock(&self) -> MutexGuard<T>
 ```
 
-#### 说明
+#### Description
 
-&emsp;&emsp;对Mutex加锁，返回Mutex的守卫，您可以使用这个守卫来操作被保护的数据。
+Acquires the Mutex lock and returns the Mutex guard, which you can use to manipulate the protected data.
 
-&emsp;&emsp;如果Mutex已经被加锁，那么，该方法会通过 `WaitQueue.wait_until()` 进入阻塞等待，直到锁可用。等待过程使用 Waiter/Waker 状态机握手，避免唤醒丢失。
+If the Mutex is already locked, this method will block and wait via `WaitQueue.wait_until()` until the lock becomes available. The waiting process uses a Waiter/Waker state machine handshake to prevent wake-up loss.
 
-### 4.3. try_lock - 尝试加锁
+### 4.3. try_lock - Attempt to Acquire Lock
 
-#### 原型
+#### Prototype
 
 ```rust
 pub fn try_lock(&self) -> Result<MutexGuard<T>, i32>
 ```
 
-#### 说明
+#### Description
 
-&emsp;&emsp;尝试对Mutex加锁。如果加锁失败，不会将当前进程加入等待队列。如果加锁成功，返回Mutex的守卫；如果当前Mutex已经被加锁，返回`Err(错误码)`。
+Attempts to acquire the Mutex lock. If the attempt fails, the current process is not added to the waiting queue. If the lock is successfully acquired, the Mutex guard is returned; if the Mutex is already locked, `Err(错误码)` is returned.

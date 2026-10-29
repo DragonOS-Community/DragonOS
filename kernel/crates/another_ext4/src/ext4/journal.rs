@@ -1,11 +1,699 @@
-use super::Ext4;
+use super::{journal_recovery, journal_transaction, Ext4, MetadataMutationMode, PublicationPoint};
+use crate::constants::BLOCK_SIZE;
+use crate::ext4_defs::{AsBytes, Block, BlockDevice, InodeRef, SuperBlock};
+use crate::jbd2::Superblock as JournalSuperblock;
+use crate::prelude::*;
+
+/// Publication is deliberately separate from disk commit failures. Accepted
+/// operations may never be rolled back, even if the worker later fails before
+/// writing a commit record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MetadataPublication {
+    Durable,
+    Accepted(u64),
+}
+
+fn validate_journal_inode(sb: &SuperBlock, inode: &InodeRef) -> Result<()> {
+    if !inode.inode.is_file()
+        || !inode.inode.uses_extents()
+        || (sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM)
+            && !inode.verify_checksum(sb.metadata_checksum_seed()))
+    {
+        return Err(Ext4Error::new(ErrCode::EIO));
+    }
+    Ok(())
+}
+
+fn journal_replay_identity_matches(
+    before: &InodeRef,
+    after: &InodeRef,
+    before_mapping: &[PBlockId],
+    after_mapping: &[PBlockId],
+) -> bool {
+    after.id == before.id
+        && after.inode.generation() == before.inode.generation()
+        && after.inode.mode() == before.inode.mode()
+        && after.inode.size() == before.inode.size()
+        && after_mapping == before_mapping
+}
+
+struct RecoveryDevice<'a> {
+    device: &'a dyn BlockDevice,
+    journal_blocks: &'a [PBlockId],
+    journal_block_set: &'a BTreeSet<PBlockId>,
+    filesystem_blocks: u64,
+}
+
+impl journal_recovery::JournalRecoveryIo for RecoveryDevice<'_> {
+    fn block_size(&self) -> usize {
+        BLOCK_SIZE
+    }
+
+    fn filesystem_blocks(&self) -> u64 {
+        self.filesystem_blocks
+    }
+
+    fn read_journal(&self, logical: u32) -> Result<Vec<u8>> {
+        let physical = *self
+            .journal_blocks
+            .get(logical as usize)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        Ok(self.device.read_block(physical)?.data.to_vec())
+    }
+
+    fn write_journal(&self, logical: u32, data: &[u8]) -> Result<()> {
+        let physical = *self
+            .journal_blocks
+            .get(logical as usize)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+        let image: Box<[u8; BLOCK_SIZE]> = data
+            .to_vec()
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| Ext4Error::new(ErrCode::EIO))?;
+        self.device.write_block(&Block::new(physical, image))
+    }
+
+    fn write_home(&self, physical: u64, data: &[u8]) -> Result<()> {
+        let image: Box<[u8; BLOCK_SIZE]> = data
+            .to_vec()
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| Ext4Error::new(ErrCode::EIO))?;
+        self.device.write_block(&Block::new(physical, image))
+    }
+
+    fn is_journal_physical(&self, physical: u64) -> bool {
+        self.journal_block_set.contains(&physical)
+    }
+
+    fn flush_home(&self) -> Result<()> {
+        self.device.flush()
+    }
+
+    fn flush_journal(&self) -> Result<()> {
+        self.device.flush()
+    }
+}
 
 impl Ext4 {
-    /// start transaction
-    #[allow(unused)]
-    pub(super) fn trans_start(&self) {}
+    fn map_validated_journal_inode(
+        &self,
+        inode: &InodeRef,
+        journal_len: usize,
+        filesystem_blocks: u64,
+    ) -> Result<(Vec<PBlockId>, BTreeSet<PBlockId>)> {
+        self.validate_complete_extent_tree(inode)?;
+        if self.extent_next_data_lblock(inode)? as usize != journal_len {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        let mut mapping = Vec::new();
+        mapping
+            .try_reserve_exact(journal_len)
+            .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+        let mut blocks = BTreeSet::new();
+        for logical in 0..journal_len {
+            let physical = self.extent_query(inode, logical as u32)?;
+            if physical == 0 || physical >= filesystem_blocks || !blocks.insert(physical) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            mapping.push(physical);
+        }
+        // The journal inode's external extent-tree nodes are journal-owned
+        // metadata too.  Protect them from the allocator and from replay home
+        // targets; otherwise a corrupted free bitmap could let a delayed data
+        // allocation overwrite the tree which defines the journal mapping.
+        for physical in self.extent_all_tree_blocks(inode)? {
+            if physical == 0 || physical >= filesystem_blocks || !blocks.insert(physical) {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+        }
+        Ok((mapping, blocks))
+    }
 
-    /// stop transaction
-    #[allow(unused)]
-    pub(super) fn trans_abort(&self) {}
+    pub fn supports_reliable_flush(&self) -> bool {
+        self.block_device.supports_reliable_flush()
+    }
+
+    pub fn flush_device(&self) -> Result<()> {
+        self.block_device.flush()
+    }
+
+    pub(super) fn initialize_direct(&mut self) -> Result<()> {
+        if !matches!(self.metadata_mode, MetadataMutationMode::ReadOnly) {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        let target_blocks = self.read_super_block_cached().block_count();
+        self.metadata_mode = MetadataMutationMode::Direct(
+            journal_transaction::DirectTransactionCore::new(target_blocks)?,
+        );
+        // Direct mode writes every staged home block synchronously and then
+        // publishes the home-current images. That publication path is complete
+        // without a journal, so the same read cache used by Batched mode can
+        // serve committed metadata reads here as well. Without it, every
+        // inode/bitmap access in a no-journal writable layer goes to the block
+        // device even when the previous operation just wrote that exact block.
+        self.metadata_cache = super::MetadataBlockCache::new(super::METADATA_CACHE_BLOCKS);
+        Ok(())
+    }
+
+    pub(super) fn mark_direct_mount_dirty(&mut self) -> Result<()> {
+        if self.write_barrier && !self.block_device.supports_reliable_flush() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        let mut sb = self.read_super_block_cached();
+        self.direct_restore_clean = sb.is_clean();
+        sb.set_clean(false);
+        self.write_super_block(&sb)?;
+        if self.write_barrier {
+            self.block_device.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn uses_journal(&self) -> bool {
+        matches!(
+            self.metadata_mode,
+            MetadataMutationMode::Journal(_) | MetadataMutationMode::Batched(_)
+        )
+    }
+
+    pub(super) fn supports_direct_range_stage(&self) -> bool {
+        matches!(self.metadata_mode, MetadataMutationMode::Direct(_))
+            && self.block_device.supports_reliable_flush()
+    }
+
+    pub fn shutdown_writable(&self) -> Result<()> {
+        // Clearing RECOVER is a metadata state transition and must not race a
+        // direct writer even if the VFS normally excludes writers at umount.
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let can_shutdown = match &self.metadata_mode {
+            MetadataMutationMode::ReadOnly => return Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Direct(core) => {
+                if !core.can_shutdown() || self.poisoned.lock().is_some() {
+                    return Err(Ext4Error::new(ErrCode::EIO));
+                }
+                if self.write_barrier {
+                    self.block_device.flush()?;
+                }
+                if self.direct_restore_clean {
+                    let mut sb = self.read_super_block_cached();
+                    sb.set_clean(true);
+                    self.write_super_block(&sb)?;
+                    if self.write_barrier {
+                        self.block_device.flush()?;
+                    }
+                }
+                return Ok(());
+            }
+            MetadataMutationMode::Journal(core) => core.can_shutdown(),
+            MetadataMutationMode::Batched(core) => core.can_shutdown(),
+        };
+        if !can_shutdown {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        // Every synchronous transaction checkpoints and clears s_start before
+        // returning. With new writers excluded by VFS umount, it is now safe
+        // to clear RECOVER as Linux does at clean shutdown.
+        let mut sb = self.read_super_block_cached();
+        sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER, false);
+        let mut block = self.block_device.read_block(0)?;
+        sb.set_checksum();
+        block.write_offset_as(crate::constants::BASE_OFFSET, &sb);
+        self.block_device.write_block(&block)?;
+        self.block_device.flush()
+    }
+
+    /// Consume the recovered synchronous journal before the mount is exposed.
+    /// All runtime metadata writers must already use private operations.
+    pub fn enable_batching(&mut self, block_budget: usize) -> Result<()> {
+        if matches!(self.metadata_mode, MetadataMutationMode::Journal(_)) {
+            let old = core::mem::replace(&mut self.metadata_mode, MetadataMutationMode::ReadOnly);
+            let MetadataMutationMode::Journal(journal) = old else {
+                unreachable!()
+            };
+            self.metadata_mode = MetadataMutationMode::Batched(journal.into_batch(block_budget)?);
+            self.metadata_cache = super::MetadataBlockCache::new(super::METADATA_CACHE_BLOCKS);
+        }
+        Ok(())
+    }
+
+    pub fn batch_progress(&self) -> Option<super::BatchProgress> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Batched(core) => Some(core.progress()),
+            _ => None,
+        }
+    }
+
+    pub fn request_batch_commit(&self) {
+        if let MetadataMutationMode::Batched(core) = &self.metadata_mode {
+            core.request_seal();
+        }
+    }
+
+    pub fn commit_pending_batch(&self) -> Result<Option<u64>> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Batched(core) => core
+                .commit_pending_with_publisher(self.block_device.as_ref(), self)
+                .map_err(|failure| {
+                    self.poison(ErrCode::EIO);
+                    failure.error
+                }),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn close_batch_admission(&self) {
+        if let MetadataMutationMode::Batched(core) = &self.metadata_mode {
+            core.close();
+        }
+    }
+
+    /// Commit one ordered nojournal phase, then publish its durable images.
+    pub(super) fn finish_direct_phase(
+        &self,
+        transaction: journal_transaction::Transaction<'_>,
+    ) -> Result<()> {
+        transaction
+            .commit_direct_flush_before_publish(self.block_device.as_ref(), self)
+            .map_err(|error| {
+                if error.poisoned {
+                    self.poison(ErrCode::EIO);
+                }
+                error.error
+            })
+    }
+
+    pub(super) fn commit_metadata_operation(
+        &self,
+        transaction: journal_transaction::Transaction<'_>,
+    ) -> core::result::Result<MetadataPublication, journal_transaction::CommitError> {
+        if transaction.is_batch() {
+            transaction
+                .publish(self)
+                .map(MetadataPublication::Accepted)
+                .map_err(|error| journal_transaction::CommitError {
+                    error,
+                    failure: journal_transaction::CommitFailure::BeforeCommit,
+                    poisoned: self.metadata_mutations_terminal(),
+                })
+        } else {
+            transaction
+                .commit(self.block_device.as_ref(), self)
+                .map(|()| MetadataPublication::Durable)
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn transaction_start(
+        &self,
+        credits: usize,
+    ) -> Result<journal_transaction::Transaction<'_>> {
+        let result = match &self.metadata_mode {
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Journal(core) => core.start(credits),
+            MetadataMutationMode::Batched(core) => return core.start(credits),
+            MetadataMutationMode::Direct(core) => core.start(credits),
+        };
+        self.normalize_transaction_start(result)
+    }
+
+    pub(super) fn transaction_credits_fit(&self, credits: usize) -> Result<bool> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(core) => core.credits_fit(credits),
+            MetadataMutationMode::Batched(core) => core.credits_fit(credits),
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Direct(_) => Ok(true),
+        }
+    }
+
+    pub(super) fn transaction_start_direct_range(
+        &self,
+        credits: usize,
+    ) -> Result<journal_transaction::Transaction<'_>> {
+        let result = match &self.metadata_mode {
+            MetadataMutationMode::Direct(core) => core.start_direct_range(credits),
+            MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
+            MetadataMutationMode::Journal(_) | MetadataMutationMode::Batched(_) => {
+                Err(Ext4Error::new(ErrCode::ENOTSUP))
+            }
+        };
+        self.normalize_transaction_start(result)
+    }
+
+    fn normalize_transaction_start<'a>(
+        &self,
+        result: Result<journal_transaction::Transaction<'a>>,
+    ) -> Result<journal_transaction::Transaction<'a>> {
+        match result {
+            // Every production transaction start is protected either by the
+            // exclusive metadata gate or by unpublished single-threaded mount
+            // recovery. A busy raw core therefore means the ownership
+            // invariant is already broken; retrying it through the upper
+            // generation bridge would create a self-waking hot loop.
+            Err(error) if error.code() == ErrCode::EAGAIN => {
+                log::error!(
+                    "ext4 transaction core is busy behind the metadata gate; fail-stopping"
+                );
+                self.poison(ErrCode::EIO);
+                Err(Ext4Error::new(ErrCode::EIO))
+            }
+            result => result,
+        }
+    }
+
+    pub(super) fn initialize_journal(&mut self) -> Result<()> {
+        if !self.block_device.supports_reliable_flush() {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+        // Unsupported orphan-file states must be rejected before replay can
+        // write home blocks or this mount can set RECOVER.
+        self.writable_orphan_preflight()?;
+        let mut ext4_sb = self.read_super_block_cached();
+        if !ext4_sb.has_compatible_feature(SuperBlock::FEATURE_COMPAT_HAS_JOURNAL)
+            || ext4_sb.has_compatible_feature(SuperBlock::FEATURE_COMPAT_FAST_COMMIT)
+            || ext4_sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_JOURNAL_DEV)
+            || ext4_sb.journal_device() != 0
+            || ext4_sb.journal_inode_number() == 0
+        {
+            return Err(Ext4Error::new(ErrCode::ENOTSUP));
+        }
+
+        let journal_inode = self.read_inode_uncached(ext4_sb.journal_inode_number())?;
+        validate_journal_inode(&ext4_sb, &journal_inode)?;
+        let journal_size = journal_inode.inode.size();
+        let journal_len_u64 = journal_size / BLOCK_SIZE as u64;
+        if journal_size % BLOCK_SIZE as u64 != 0
+            || journal_len_u64 == 0
+            || journal_len_u64 > u32::MAX as u64
+            || journal_len_u64 > ext4_sb.block_count()
+        {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        let journal_zero = self.extent_query(&journal_inode, 0)?;
+        if journal_zero == 0 || journal_zero >= ext4_sb.block_count() {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        let raw_journal_sb = self.block_device.read_block(journal_zero)?;
+        let mut journal_sb = JournalSuperblock::parse(&raw_journal_sb.data[..], BLOCK_SIZE as u32)?;
+        let ext4_journal_uuid = ext4_sb.journal_uuid();
+        if journal_sb.max_len as u64 != journal_len_u64
+            || (ext4_journal_uuid != [0; 16] && journal_sb.uuid != ext4_journal_uuid)
+        {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+
+        let journal_len = journal_sb.max_len as usize;
+        let (mapping, journal_blocks) =
+            self.map_validated_journal_inode(&journal_inode, journal_len, ext4_sb.block_count())?;
+
+        let needs_recovery = ext4_sb.has_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER);
+        let io = RecoveryDevice {
+            device: self.block_device.as_ref(),
+            journal_blocks: &mapping,
+            journal_block_set: &journal_blocks,
+            filesystem_blocks: ext4_sb.block_count(),
+        };
+        // Linux ext4_load_journal wipes old transactions before journal_load
+        // when RECOVER is clear. Only a dirty ext4 superblock authorizes replay.
+        if needs_recovery {
+            journal_recovery::recover(&io)?;
+            let recovered_block0 = self.block_device.read_block(0)?;
+            let recovered_sb: SuperBlock =
+                recovered_block0.read_offset_as(crate::constants::BASE_OFFSET);
+            let recovered_groups =
+                Self::read_validated_block_groups(self.block_device.as_ref(), &recovered_sb)?;
+            let recovered_system_ranges =
+                Self::build_system_metadata_ranges(&recovered_sb, &recovered_groups)?;
+            if mapping
+                .iter()
+                .any(|physical| *physical >= recovered_sb.block_count())
+            {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            ext4_sb = recovered_sb;
+            *self.cached_super_block.lock() = recovered_sb;
+            self.cached_block_groups = recovered_groups;
+            self.system_metadata_ranges = recovered_system_ranges;
+            let recovered_journal_inode =
+                self.read_inode_uncached(recovered_sb.journal_inode_number())?;
+            validate_journal_inode(&recovered_sb, &recovered_journal_inode)?;
+            let (recovered_mapping, recovered_journal_blocks) = self.map_validated_journal_inode(
+                &recovered_journal_inode,
+                journal_len,
+                recovered_sb.block_count(),
+            )?;
+            if !journal_replay_identity_matches(
+                &journal_inode,
+                &recovered_journal_inode,
+                &mapping,
+                &recovered_mapping,
+            ) || recovered_journal_blocks != journal_blocks
+            {
+                return Err(Ext4Error::new(ErrCode::EIO));
+            }
+            let refreshed = self.block_device.read_block(mapping[0])?;
+            journal_sb = JournalSuperblock::parse(&refreshed.data[..], BLOCK_SIZE as u32)?;
+            self.inode_cache.lock().entries.clear();
+        } else if journal_sb.start != 0 {
+            journal_recovery::discard(&io)?;
+            let refreshed = self.block_device.read_block(mapping[0])?;
+            journal_sb = JournalSuperblock::parse(&refreshed.data[..], BLOCK_SIZE as u32)?;
+        }
+
+        let mut image = try_filled_bytes::<1024>(0)?;
+        image.copy_from_slice(&self.block_device.read_block(mapping[0])?.data[..1024]);
+        let head = if journal_sb.start == 0 {
+            journal_sb.first
+        } else {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        };
+        self.metadata_mode =
+            MetadataMutationMode::Journal(journal_transaction::JournalTransactionCore::new(
+                journal_transaction::JournalContext {
+                    superblock: journal_sb,
+                    logical_blocks: mapping.into(),
+                    journal_blocks: Arc::new(journal_blocks),
+                    target_blocks: ext4_sb.block_count(),
+                    head,
+                    superblock_image: image,
+                },
+            )?);
+
+        // Replay may itself publish a newer ext4 superblock.  Recheck the
+        // recovered feature set before interpreting or mutating orphan state;
+        // the earlier preflight is still required to prevent replay writes on
+        // a format that was already unsupported at mount entry.
+        self.writable_orphan_preflight()?;
+
+        // Linux keeps RECOVER set for the complete read-write mount lifetime.
+        // Publish it before the first new journal transaction. A later orphan
+        // validation or cleanup error deliberately leaves RECOVER set.
+        if !needs_recovery {
+            ext4_sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER, true);
+            self.write_super_block(&ext4_sb)?;
+            self.block_device.flush()?;
+        }
+
+        // Hold the transactional metadata barrier from the complete read-only
+        // orphan snapshot through every cleanup commit.
+        self.cleanup_legacy_orphan_chain()?;
+        Ok(())
+    }
+
+    pub(super) fn journal_owns_block_range(&self, start: PBlockId, end: PBlockId) -> bool {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(journal) => journal.owns_block_range(start, end),
+            MetadataMutationMode::Batched(journal) => journal.owns_block_range(start, end),
+            MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => false,
+        }
+    }
+}
+
+impl Ext4 {
+    fn publish_typed_metadata_caches(
+        &self,
+        blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>,
+    ) {
+        // Normal transactions change descriptor counters/checksums, never the
+        // validated bitmap/table addresses. Therefore system_metadata_ranges
+        // remains immutable here; journal replay is the only path which can
+        // replace the complete SB/BGD snapshot and rebuilds it explicitly.
+        // This is the logical publication boundary (also durable for the
+        // synchronous backend). Decode value snapshots from private images;
+        // a batched checkpoint never calls this publisher. All updates
+        // below are infallible and allocation-free.
+        if let Some(block0) = blocks.get(&0) {
+            let sb = SuperBlock::from_bytes(&block0.bytes()[crate::constants::BASE_OFFSET..]);
+            *self.cached_super_block.lock() = sb;
+        }
+
+        let sb = self.read_super_block_cached();
+        let per_block = BLOCK_SIZE as u32 / sb.desc_size() as u32;
+        for (index, cached) in self.cached_block_groups.iter().enumerate() {
+            let block_id = sb.first_data_block() + index as u32 / per_block + 1;
+            let Some(image) = blocks.get(&(block_id as PBlockId)) else {
+                continue;
+            };
+            let offset = (index as u32 % per_block) * sb.desc_size() as u32;
+            *cached.lock() =
+                crate::ext4_defs::BlockGroupDesc::from_bytes(&image.bytes()[offset as usize..]);
+        }
+
+        // Transactional inode and directory mutations must not leave value
+        // snapshots from before the checkpoint visible after commit.
+        self.inode_cache.lock().entries.retain(|inode_id, _| {
+            self.inode_disk_pos(*inode_id)
+                .map(|(block, _)| !blocks.contains_key(&block))
+                .unwrap_or(false)
+        });
+    }
+}
+
+impl journal_transaction::CachePublisher for Ext4 {
+    fn publish(&self, blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>) {
+        let mut notify = false;
+        for block in blocks.values() {
+            notify |= self.metadata_cache.publish_or_admit(
+                block.home(),
+                block.bytes(),
+                PublicationPoint::HomeCurrent,
+            );
+        }
+        self.publish_typed_metadata_caches(blocks);
+        if notify {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+    }
+
+    fn publish_home_current(
+        &self,
+        blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>,
+        retired: &[super::journal_batch::RetiredRange],
+    ) {
+        let mut notify = false;
+        for block in blocks.values() {
+            notify |= self.metadata_cache.publish_or_admit(
+                block.home(),
+                block.bytes(),
+                PublicationPoint::HomeCurrent,
+            );
+        }
+        notify |= self
+            .metadata_cache
+            .invalidate_block_ranges(retired.iter().filter_map(|range| range.block_bounds()));
+        self.publish_typed_metadata_caches(blocks);
+        if notify {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+    }
+
+    fn publish_accepted(
+        &self,
+        blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>,
+        sequence: u64,
+        retired: &[super::journal_batch::RetiredRange],
+    ) {
+        let mut notify = false;
+        for block in blocks.values() {
+            notify |= self.metadata_cache.publish_or_admit(
+                block.home(),
+                block.bytes(),
+                PublicationPoint::Accepted { sequence },
+            );
+        }
+        // Retirement wins if an operation both staged and freed a home.
+        notify |= self
+            .metadata_cache
+            .invalidate_block_ranges(retired.iter().filter_map(|range| range.block_bounds()));
+        self.publish_typed_metadata_caches(blocks);
+        if notify {
+            self.metadata_mutation_barrier.notify_progress();
+        }
+    }
+
+    fn checkpoint(&self, sequence: u64, blocks: &[journal_transaction::StagedBlock]) {
+        for block in blocks {
+            self.metadata_cache.checkpoint(sequence, &[block.home()]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::BASE_OFFSET;
+    use crate::ext4_defs::{Inode, InodeMode};
+
+    fn metadata_csum_superblock() -> SuperBlock {
+        let mut raw = [0u8; 2048];
+        raw[BASE_OFFSET + 100..BASE_OFFSET + 104]
+            .copy_from_slice(&SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM.to_le_bytes());
+        raw[BASE_OFFSET + 104..BASE_OFFSET + 120].copy_from_slice(&[0x3c; 16]);
+        SuperBlock::from_bytes(&raw[BASE_OFFSET..])
+    }
+
+    fn valid_journal_inode(sb: &SuperBlock) -> InodeRef {
+        let mut inode = InodeRef::new(8, Box::new(Inode::default()));
+        inode.inode.set_mode(InodeMode::FILE | InodeMode::ALL_RW);
+        inode.inode.set_generation(9);
+        inode.inode.extent_init();
+        inode.set_checksum(sb.metadata_checksum_seed());
+        inode
+    }
+
+    #[test]
+    fn journal_inode_mode_and_checksum_are_authenticated() {
+        let sb = metadata_csum_superblock();
+        let inode = valid_journal_inode(&sb);
+        validate_journal_inode(&sb, &inode).unwrap();
+
+        let mut bad_mode = inode.clone();
+        bad_mode
+            .inode
+            .set_mode(InodeMode::DIRECTORY | InodeMode::ALL_RWX);
+        bad_mode.set_checksum(sb.metadata_checksum_seed());
+        assert_eq!(
+            validate_journal_inode(&sb, &bad_mode).unwrap_err().code(),
+            ErrCode::EIO
+        );
+
+        let mut bad_checksum = inode;
+        bad_checksum.inode.set_generation(10);
+        assert_eq!(
+            validate_journal_inode(&sb, &bad_checksum)
+                .unwrap_err()
+                .code(),
+            ErrCode::EIO
+        );
+    }
+
+    #[test]
+    fn replayed_journal_mapping_or_identity_change_is_rejected() {
+        let sb = metadata_csum_superblock();
+        let mut before = valid_journal_inode(&sb);
+        before.inode.set_size(8192);
+        before.set_checksum(sb.metadata_checksum_seed());
+        let after = before.clone();
+        assert!(journal_replay_identity_matches(
+            &before,
+            &after,
+            &[20, 21],
+            &[20, 21]
+        ));
+        assert!(!journal_replay_identity_matches(
+            &before,
+            &after,
+            &[20, 21],
+            &[20, 22]
+        ));
+        let mut changed = after;
+        changed.inode.set_generation(10);
+        assert!(!journal_replay_identity_matches(
+            &before,
+            &changed,
+            &[20, 21],
+            &[20, 21]
+        ));
+    }
 }

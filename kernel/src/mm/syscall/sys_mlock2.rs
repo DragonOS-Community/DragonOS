@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK2},
-    mm::{access_ok, can_do_mlock, ucontext::AddressSpace, VirtAddr, VmFlags},
+    mm::{access_ok, can_do_mlock, ucontext::AddressSpace, VirtAddr, VirtRegion, VmFlags},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -55,6 +55,10 @@ fn do_mlock2(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemE
         return Err(SystemError::EINVAL);
     }
 
+    if !can_do_mlock() {
+        return Err(SystemError::EPERM);
+    }
+
     let (start, len) = normalize_mlock_range(start, len)?;
     if len == 0 {
         return Ok(0);
@@ -63,21 +67,42 @@ fn do_mlock2(start: VirtAddr, len: usize, flags: usize) -> Result<usize, SystemE
         return Err(SystemError::EINVAL);
     }
 
-    if !can_do_mlock() {
-        return Err(SystemError::EPERM);
-    }
-
     let vm = AddressSpace::current()?;
-    let mut guard = vm.write_interruptible()?;
-    let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
-    check_mlock_rlimit(guard.locked_vm, new_pages)?;
-
     let mut new_flags = VmFlags::VM_LOCKED;
     if flags & MLOCK_ONFAULT != 0 {
         new_flags |= VmFlags::VM_LOCKONFAULT;
     }
-    guard.apply_vma_lock_flags(start, len, new_flags, false)?;
-    Ok(0)
+
+    let region = VirtRegion::new(start, len);
+    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    loop {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        let mut guard = vm.write_interruptible()?;
+        if guard.mappings.first_reservation_conflict(region).is_some() {
+            drop(guard);
+            vm.wait_for_no_reservation_conflict_interruptible(region)?;
+            continue;
+        }
+
+        let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
+        check_mlock_rlimit(guard.locked_vm, new_pages)?;
+        match guard.apply_vma_lock_flags_collect(start, len, new_flags, &creator) {
+            Ok(()) => {
+                drop(guard);
+                vm.populate_mlock_range_post_commit(start, len)?;
+                return Ok(0);
+            }
+            Err(failure) => {
+                drop(guard);
+                crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                    failure.notifications,
+                );
+                failure.err.recover(&mut charge_recovery)?;
+                continue;
+            }
+        }
+    }
 }
 
 syscall_table_macros::declare_syscall!(SYS_MLOCK2, SysMlock2Handle);

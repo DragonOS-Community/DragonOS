@@ -1,0 +1,2407 @@
+use super::*;
+use crate::net::ingress::{NetIngressFilter, NetIngressFilterInit, RoutedIngressWork};
+use crate::net::socket::inet::raw::{RawIngressBatch, RawIngressQueue};
+use alloc::boxed::Box;
+use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
+
+pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>>;
+
+fn poll_smol<D: SmolDevice + ?Sized>(
+    interface: &mut smoltcp::iface::Interface,
+    timestamp: smoltcp::time::Instant,
+    device: &mut D,
+    sockets: &mut smoltcp::iface::SocketSet<'_, '_>,
+    mut filter: Option<&mut dyn IpIngressFilter>,
+) -> (PollResult, bool) {
+    // Release the poll serialization/FIB locks between bounded RX batches so
+    // deferred work (including PMTU feedback) runs even under continuous RX.
+    let mut state_changed = false;
+    let mut exhausted = true;
+    for _ in 0..64 {
+        let result = match filter.as_mut() {
+            Some(filter) => {
+                interface.poll_ingress_single_filtered(timestamp, device, sockets, *filter)
+            }
+            None => interface.poll_ingress_single(timestamp, device, sockets),
+        };
+        match result {
+            PollIngressSingleResult::None => {
+                exhausted = false;
+                break;
+            }
+            PollIngressSingleResult::SocketStateChanged => state_changed = true,
+            PollIngressSingleResult::PacketProcessed => {}
+        }
+    }
+    if filter
+        .as_ref()
+        .is_none_or(|filter| filter.continue_ingress_poll())
+    {
+        state_changed |= matches!(
+            interface.poll_egress(timestamp, device, sockets),
+            PollResult::SocketStateChanged
+        );
+    }
+    (
+        if state_changed {
+            PollResult::SocketStateChanged
+        } else {
+            PollResult::None
+        },
+        exhausted,
+    )
+}
+
+fn poll_smol_single<D: SmolDevice + ?Sized>(
+    interface: &mut smoltcp::iface::Interface,
+    timestamp: smoltcp::time::Instant,
+    device: &mut D,
+    sockets: &mut smoltcp::iface::SocketSet<'_, '_>,
+    filter: Option<&mut dyn IpIngressFilter>,
+) -> PollIngressSingleResult {
+    if let Some(filter) = filter {
+        interface.poll_ingress_single_filtered(timestamp, device, sockets, filter)
+    } else {
+        interface.poll_ingress_single(timestamp, device, sockets)
+    }
+}
+
+/// Even an initially unfiltered poll must stop socket egress if a ruleset
+/// becomes active while smoltcp is iterating its sockets. The physical device
+/// has no namespace knowledge of its own.
+struct NftGenerationDevice<'a, D: SmolDevice + ?Sized> {
+    device: &'a mut D,
+    netns: Option<&'a NetNamespace>,
+    ruleset: Option<&'a crate::net::nftables::RulesetSnapshot>,
+}
+
+impl<D: SmolDevice + ?Sized> SmolDevice for NftGenerationDevice<'_, D> {
+    type RxToken<'a>
+        = D::RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = D::TxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(
+        &mut self,
+        timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.device.receive(timestamp)
+    }
+
+    fn transmit(&mut self, timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        self.device.transmit(timestamp)
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.device.capabilities()
+    }
+
+    fn outbound_ip_mtu(&self, destination: smoltcp::wire::IpAddress, meta: PacketMeta) -> usize {
+        self.device.outbound_ip_mtu(destination, meta)
+    }
+
+    fn policy_current(&self) -> bool {
+        match (self.netns, self.ruleset) {
+            (Some(netns), Some(ruleset)) => ruleset.generation == netns.nftables().generation(),
+            (None, None) => self.device.policy_current(),
+            _ => false,
+        }
+    }
+}
+
+pub struct IfaceCommon {
+    pub(super) iface_id: usize,
+    pub(super) name: RwLock<String>,
+    pub(super) flags: AtomicU32,
+    pub(super) mtu: AtomicUsize,
+    /// Linux-visible transmit queue length. The current devices do not have a
+    /// software qdisc queue, so this is distinct from hardware ring capacity.
+    tx_queue_len: AtomicU32,
+    pub(super) type_: InterfaceType,
+    tx_admission: tx_admission::TxAdmission,
+    pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
+    /// 存smoltcp网卡的套接字集
+    /// SocketSet ownership follows a device's namespace epoch. On a netns
+    /// move the active set is replaced; old sockets retain the retired set
+    /// without exposing its receive queues to the destination namespace.
+    pub(super) sockets: RwLock<InterfaceSocketSet>,
+    /// 存 kernel wrap smoltcp socket 的集合
+    pub(super) bounds: RwLock<Arc<crate::net::tcp_bounds::BoundRegistry>>,
+    /// The stack has accepted namespace-local ingress and must keep applying
+    /// authoritative output routing until its socket/deferred work quiesces.
+    pub(super) namespace_routed_stack: AtomicBool,
+    /// Scheduler-owned deadlines for independently published protocol and
+    /// local-output work. Immediate work stays with the current poll owner.
+    pub(super) poll_deadlines: PollDeadlines,
+    /// Bounded fallback delay for local-output device backpressure. Individual
+    /// packets retain their not-before deadline across unrelated poll wakes.
+    pub(super) local_output_tx_backoff_us: AtomicU64,
+    /// Monotonic handshake between TX completion and backpressure enqueue.
+    /// A producer that observes a change after enqueue promotes the packet
+    /// itself; otherwise the later completion notification does so.
+    pub(super) tx_completion_generation: AtomicU64,
+    /// 网络命名空间
+    pub(super) net_namespace: RwLock<Weak<NetNamespace>>,
+    /// Even: stable owner. Odd: netns move in progress. A poll snapshot must
+    /// match the active SocketSet selected for the same owner generation.
+    namespace_epoch: AtomicU64,
+    /// One atomic admission word closes and drains polls before a namespace
+    /// move, without holding a spinlock over SocketSet or packet processing.
+    poll_admission: tx_admission::TxAdmission,
+    /// 路由相关数据
+    pub(super) router_common_data: RouterEnableDeviceCommon,
+    /// NAPI 结构体
+    pub(super) napi_struct: RwLock<Option<Arc<NapiStruct>>>,
+    /// Namespace-local frames handed to this interface's protocol stack.
+    /// This is shared by every interface implementation so weak-host local
+    /// delivery never depends on a driver-specific receive queue.
+    pub(super) local_input_queue: LocalInputQueue,
+    /// Per-address control-plane state committed together with smoltcp's
+    /// address list. It carries Linux IFA_LABEL semantics and opaque ownership
+    /// tokens for in-kernel actors such as DHCP.
+    pub(super) address_metadata: Mutex<Vec<AddressMetadata>>,
+    /// Routes supplied by constructors before the interface joins a netns.
+    /// Drained transactionally by netns registration; never authoritative.
+    pub(super) bootstrap_routes: Mutex<Vec<BootstrapRoute>>,
+    pub(super) multicast_refcnt: Mutex<Vec<(smoltcp::wire::IpAddress, usize)>>,
+    /// Serializes configured receive-mode flags with AF_PACKET references.
+    pub(super) receive_mode: Mutex<ReceiveModeState>,
+}
+
+/// The only allocation needed to associate an interface with a network
+/// namespace. A topology transaction can prepare this before unpublishing an
+/// interface from its old namespace.
+pub(crate) struct PreparedNetnsBinding {
+    netns: Arc<NetNamespace>,
+    ingress: Arc<crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress>,
+}
+
+pub(crate) struct PreparedSocketSetMove {
+    sockets: InterfaceSocketSet,
+    bounds: Arc<crate::net::tcp_bounds::BoundRegistry>,
+}
+
+pub(crate) struct RetiredSocketSetMove {
+    _sockets: InterfaceSocketSet,
+    _bounds: Arc<crate::net::tcp_bounds::BoundRegistry>,
+}
+
+impl PreparedSocketSetMove {
+    /// Publish only after the source device has been quiesced and unregistered.
+    /// The retired SocketSet remains alive through each old BoundInner Arc.
+    pub(crate) fn publish(self, common: &IfaceCommon) -> RetiredSocketSetMove {
+        let sockets = core::mem::replace(&mut *common.sockets.write(), self.sockets);
+        let bounds = core::mem::replace(&mut *common.bounds.write(), self.bounds);
+        common
+            .namespace_routed_stack
+            .store(false, Ordering::Release);
+        RetiredSocketSetMove {
+            _sockets: sockets,
+            _bounds: bounds,
+        }
+    }
+}
+
+impl PreparedNetnsBinding {
+    pub(crate) fn prepare(netns: &Arc<NetNamespace>, ifindex: usize) -> Result<Self, SystemError> {
+        let ingress = crate::net::socket::inet::datagram::udp_bindings::NetnsUdpIngress::try_new(
+            netns, ifindex,
+        )?;
+        Ok(Self {
+            netns: netns.clone(),
+            ingress,
+        })
+    }
+
+    pub(crate) fn publish(self, common: &IfaceCommon) {
+        let socket_set = common.sockets.read().clone();
+        let mut sockets = socket_set.lock();
+        let mut namespace = common.net_namespace.write();
+        *namespace = Arc::downgrade(&self.netns);
+        sockets.set_udp_ingress_handler(Some(self.ingress));
+        sockets.set_tcp_ingress_handler(Some(self.netns.tcp_stack().clone()));
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PollModeRecheck {
+    Current,
+    Routed,
+    Authoritative,
+}
+
+impl fmt::Debug for IfaceCommon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IfaceCommon")
+            .field("iface_id", &self.iface_id)
+            .field("poll_deadlines", &self.poll_deadlines)
+            .finish()
+    }
+}
+
+impl IfaceCommon {
+    const LOCAL_OUTPUT_POLL_BUDGET: usize = 64;
+    const LOCAL_OUTPUT_TX_BACKOFF_MIN_US: u64 = 1_000;
+    const LOCAL_OUTPUT_TX_BACKOFF_MAX_US: u64 = 100_000;
+
+    pub fn new(
+        iface_id: usize,
+        type_: InterfaceType,
+        name: String,
+        mtu: usize,
+        flags: InterfaceFlags,
+        iface: smoltcp::iface::Interface,
+    ) -> Self {
+        let router_common_data = RouterEnableDeviceCommon::default();
+        router_common_data
+            .ip_addrs
+            .write()
+            .extend_from_slice(iface.ip_addrs());
+        let address_metadata = iface
+            .ip_addrs()
+            .iter()
+            .map(|cidr| AddressMetadata {
+                cidr: *cidr,
+                label: None,
+                broadcast: None,
+            })
+            .collect();
+        let sockets = smoltcp::iface::SocketSet::new(Vec::new());
+        IfaceCommon {
+            iface_id,
+            name: RwLock::new(name),
+            smol_iface: Mutex::new(iface),
+            sockets: RwLock::new(Arc::new(Mutex::new(sockets))),
+            bounds: RwLock::new(Arc::new(crate::net::tcp_bounds::BoundRegistry::new())),
+            namespace_routed_stack: AtomicBool::new(false),
+            poll_deadlines: PollDeadlines::new(),
+            local_output_tx_backoff_us: AtomicU64::new(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US),
+            tx_completion_generation: AtomicU64::new(0),
+            net_namespace: RwLock::new(Weak::new()),
+            namespace_epoch: AtomicU64::new(0),
+            poll_admission: tx_admission::TxAdmission::new(true),
+            router_common_data,
+            flags: AtomicU32::new(flags.bits()),
+            mtu: AtomicUsize::new(mtu),
+            tx_queue_len: AtomicU32::new(1000),
+            type_,
+            tx_admission: tx_admission::TxAdmission::new(flags.contains(InterfaceFlags::UP)),
+            napi_struct: RwLock::new(None),
+            local_input_queue: LocalInputQueue::new(),
+            address_metadata: Mutex::new(address_metadata),
+            bootstrap_routes: Mutex::new(Vec::new()),
+            multicast_refcnt: Mutex::new(Vec::new()),
+            receive_mode: Mutex::new(ReceiveModeState {
+                configured_flags: flags.bits(),
+                packet_promiscuity: 0,
+                packet_allmulti: 0,
+            }),
+        }
+    }
+
+    pub fn ipv4_multicast_join_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::Ipv4Address,
+    ) -> Result<(), SystemError> {
+        self.multicast_join_ref(netns, group.into())
+    }
+
+    pub(crate) fn multicast_join_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::IpAddress,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.multicast_refcnt.lock();
+        if !self
+            .net_namespace
+            .read()
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        if let Some((_, ref mut cnt)) = guard.iter_mut().find(|(g, _)| *g == group) {
+            *cnt = cnt.saturating_add(1);
+            return Ok(());
+        }
+        guard.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        self.smol_iface
+            .lock()
+            .join_multicast_group(group)
+            .map_err(|error| match error {
+                smoltcp::iface::MulticastError::GroupTableFull => SystemError::ENOBUFS,
+                smoltcp::iface::MulticastError::Unaddressable => SystemError::EINVAL,
+            })?;
+        guard.push((group, 1));
+        Ok(())
+    }
+
+    pub fn ipv4_multicast_leave_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::Ipv4Address,
+    ) -> Result<(), SystemError> {
+        self.multicast_leave_ref(netns, group.into())
+    }
+
+    pub(crate) fn multicast_leave_ref(
+        &self,
+        netns: &Arc<NetNamespace>,
+        group: smoltcp::wire::IpAddress,
+    ) -> Result<(), SystemError> {
+        let mut guard = self.multicast_refcnt.lock();
+        if !self
+            .net_namespace
+            .read()
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        let Some(pos) = guard.iter().position(|(g, _)| *g == group) else {
+            return Ok(());
+        };
+        if guard[pos].1 > 1 {
+            guard[pos].1 -= 1;
+            return Ok(());
+        }
+        guard.swap_remove(pos);
+        let _ = self.smol_iface.lock().leave_multicast_group(group);
+        Ok(())
+    }
+
+    pub(super) fn enqueue_local_input(
+        &self,
+        packet: LocalInputPacket,
+        expected_epoch: Option<u64>,
+    ) -> Result<(), SystemError> {
+        self.local_input_queue.enqueue(packet, || {
+            expected_epoch
+                .is_none_or(|expected| self.namespace_epoch.load(Ordering::Acquire) == expected)
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routed packet admission carries explicit retry and forward provenance"
+    )]
+    pub(super) fn enqueue_routed_output(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
+    ) -> Result<(), SystemError> {
+        let (packet, reservation) =
+            self.prepare_routed_output(oif, next_hop, ip_packet, fragment_info, feedback)?;
+        if let Err(packet) = reservation.commit_deferred_packet(packet, retry_at, probe_sent, false)
+        {
+            self.local_input_queue.recycle_output(packet.frame);
+            return Err(SystemError::ENOBUFS);
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_routed_output(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
+    ) -> Result<(LocalOutputPacket, LocalOutputReservation<'_>), SystemError> {
+        let prepared_ip = if next_hop.version() == smoltcp::wire::IpVersion::Ipv4 {
+            Some(routed_ipv4_progress(ip_packet, fragment_info)?)
+        } else if let Some(info) = fragment_info {
+            let netns = self.net_namespace().ok_or(SystemError::ENODEV)?;
+            Some(PreparedIpProgress::Ipv6 {
+                offset: 0,
+                identification: netns.next_ipv6_fragment_identification(),
+                max_fragment_len: Some(info.max_original_fragment_len),
+            })
+        } else {
+            None
+        };
+        if ip_packet.len() > self.mtu.load(Ordering::Acquire)
+            && !matches!(
+                prepared_ip,
+                Some(PreparedIpProgress::Ipv4 {
+                    may_fragment: true,
+                    ..
+                }) | Some(PreparedIpProgress::Ipv6 { .. })
+            )
+        {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let mut reservation = self
+            .local_input_queue
+            .reserve_output()
+            .ok_or(SystemError::ENOBUFS)?;
+        let mut scratch =
+            LocalInputScratch::checkout(&self.local_input_queue.response_scratch, ip_packet.len())
+                .ok_or(SystemError::ENOMEM)?;
+        if !reservation.try_resize(scratch.capacity()) {
+            return Err(SystemError::ENOBUFS);
+        }
+        scratch.resize(ip_packet.len()).copy_from_slice(ip_packet);
+        let frame = scratch
+            .take()
+            .expect("a deferred routed packet owns its scratch buffer");
+        Ok((
+            LocalOutputPacket {
+                medium: smoltcp::phy::Medium::Ip,
+                meta: PacketMeta::default(),
+                disposition: LocalOutputDisposition::Routed {
+                    oif,
+                    next_hop,
+                    ip_mtu: self.mtu.load(Ordering::Acquire),
+                },
+                frame,
+                ct_context: OutputCtContext::Untracked,
+                mark: 0,
+                prepared_ip,
+                forward_mtu_feedback: feedback.map(|item| item.persist()).transpose()?,
+                _charge: None,
+            },
+            reservation,
+        ))
+    }
+
+    /// Join a pending neighbor atomically if it still exists. A bucket that
+    /// resolves between the optimistic presence check and commit is reported
+    /// as missing; callers then use the immediate transmit path and never
+    /// recreate a bucket with a stale deadline.
+    pub(super) fn enqueue_existing_routed_output(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
+    ) -> Result<Option<smoltcp::time::Instant>, SystemError> {
+        let pending = self
+            .local_input_queue
+            .output
+            .lock()
+            .deferred_routes
+            .contains(DeferredRouteKey { oif, next_hop });
+        if !pending {
+            return Ok(None);
+        }
+        let (packet, reservation) =
+            self.prepare_routed_output(oif, next_hop, ip_packet, fragment_info, feedback)?;
+        match reservation.commit_existing_deferred(packet) {
+            ExistingDeferredCommit::Queued(retry_at) => Ok(Some(retry_at)),
+            ExistingDeferredCommit::Missing(packet, reservation) => {
+                drop(reservation);
+                self.local_input_queue.recycle_output(packet.frame);
+                Ok(None)
+            }
+            ExistingDeferredCommit::Full(packet, reservation) => {
+                drop(reservation);
+                self.local_input_queue.recycle_output(packet.frame);
+                Err(SystemError::ENOBUFS)
+            }
+        }
+    }
+
+    pub(super) fn enqueue_existing_deferred_output(
+        &self,
+        packet: LocalOutputPacket,
+    ) -> ExistingDeferredEnqueue<'_> {
+        let Some(mut reservation) = self.local_input_queue.reserve_output() else {
+            return ExistingDeferredEnqueue::Full(packet);
+        };
+        if !reservation.try_resize(packet.frame.capacity()) {
+            return ExistingDeferredEnqueue::Full(packet);
+        }
+        match reservation.commit_existing_deferred(packet) {
+            ExistingDeferredCommit::Queued(retry_at) => ExistingDeferredEnqueue::Queued(retry_at),
+            ExistingDeferredCommit::Missing(packet, reservation) => {
+                ExistingDeferredEnqueue::Missing(packet, reservation)
+            }
+            ExistingDeferredCommit::Full(packet, reservation) => {
+                drop(reservation);
+                ExistingDeferredEnqueue::Full(packet)
+            }
+        }
+    }
+
+    /// Transfer an accepted datagram to the actual egress neighbor queue.
+    /// Failure returns ownership to the caller; its source reservation is
+    /// still live until that caller decides to drop the packet.
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed deferred handoff returns packet ownership for exact queue accounting"
+    )]
+    pub(super) fn enqueue_prepared_deferred_output(
+        &self,
+        expected_netns: &Arc<NetNamespace>,
+        packet: LocalOutputPacket,
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    ) -> Result<(), LocalOutputPacket> {
+        let epoch = self.namespace_epoch.load(Ordering::Acquire);
+        if epoch & 1 != 0
+            || !self
+                .net_namespace
+                .read()
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, expected_netns))
+        {
+            return Err(packet);
+        }
+        let Some(mut reservation) = self.local_input_queue.reserve_output() else {
+            return Err(packet);
+        };
+        if !reservation.try_resize(packet.frame.capacity()) {
+            return Err(packet);
+        }
+        // A clone from an old device list may outlive a netns move. The
+        // reservation makes a move wait; recheck its identity before commit.
+        let owner = self.net_namespace.read();
+        if self.namespace_epoch.load(Ordering::Acquire) != epoch
+            || !owner
+                .upgrade()
+                .is_some_and(|current| Arc::ptr_eq(&current, expected_netns))
+        {
+            return Err(packet);
+        }
+        drop(owner);
+        // Joining an unresolved neighbor must not postpone an earlier probe.
+        reservation.commit_deferred_packet(packet, retry_at, probe_sent, false)
+    }
+
+    pub(super) fn schedule_local_output(
+        &self,
+        retry_at: smoltcp::time::Instant,
+        napi: Option<Arc<NapiStruct>>,
+        netns: Option<Arc<NetNamespace>>,
+    ) {
+        self.namespace_routed_stack.store(true, Ordering::Release);
+        self.defer_local_output_retry_at(retry_at);
+        if let Some(napi) = napi {
+            napi::napi_schedule(napi);
+        } else if let Some(netns) = netns {
+            netns.wakeup_poll_thread();
+        }
+    }
+
+    pub(super) fn schedule_registered_local_output(&self, retry_at: smoltcp::time::Instant) {
+        let napi = self.napi_struct.read().clone();
+        let netns = napi
+            .is_none()
+            .then(|| self.net_namespace.read().upgrade())
+            .flatten();
+        self.schedule_local_output(retry_at, napi, netns);
+    }
+
+    /// Make device-backpressured output runnable after the driver reports TX
+    /// completion. The per-packet deadlines remain a fallback for drivers that
+    /// cannot provide a precise completion notification.
+    pub(crate) fn release_tx_backpressure(&self) -> bool {
+        self.tx_completion_generation
+            .fetch_add(1, Ordering::Release);
+        let released = self.local_input_queue.release_backpressured_outputs();
+        if released {
+            self.reset_local_output_tx_backoff();
+        }
+        released
+    }
+
+    pub(super) fn tx_completion_generation(&self) -> u64 {
+        self.tx_completion_generation.load(Ordering::Acquire)
+    }
+
+    /// Close the completion-before-enqueue race without coupling queue locks
+    /// to the driver. If the generation is unchanged, a later completion must
+    /// observe the queued packet; if it changed, this side performs the
+    /// release that the earlier notification could not see.
+    pub(super) fn release_tx_backpressure_after(&self, observed_generation: u64) -> bool {
+        if self.tx_completion_generation() == observed_generation {
+            return false;
+        }
+        let released = self.local_input_queue.release_backpressured_outputs();
+        if released {
+            self.reset_local_output_tx_backoff();
+        }
+        released
+    }
+
+    pub(crate) fn notify_tx_available(&self) {
+        if !self.release_tx_backpressure() {
+            return;
+        }
+        self.schedule_registered_local_output(crate::time::Instant::now().into());
+    }
+
+    pub(crate) fn has_local_input(&self) -> bool {
+        !self.local_input_queue.is_empty()
+    }
+
+    pub(super) fn release_resolved_routed_outputs(
+        &self,
+        interface: &mut smoltcp::iface::Interface,
+        timestamp: smoltcp::time::Instant,
+        configured: Option<&crate::net::neighbor::NeighborReadGuard<'_>>,
+    ) {
+        if !self.local_input_queue.has_deferred_output() {
+            return;
+        }
+        let ifindex = self.iface_id as u32;
+        self.local_input_queue.release_resolved_outputs(|next_hop| {
+            configured.is_some_and(|neighbors| neighbors.lookup(ifindex, next_hop).is_some())
+                || interface.is_neighbor_resolved(timestamp, next_hop)
+        });
+    }
+
+    /// Close the reply-before-enqueue race for an admitted routed packet.
+    /// The actual egress owns both the neighbor cache and the deferred queue.
+    pub(super) fn release_resolved_neighbor_after_enqueue(
+        &self,
+        oif: u32,
+        next_hop: smoltcp::wire::IpAddress,
+    ) -> bool {
+        let mut interface = self.smol_iface.lock();
+        let configured = self
+            .net_namespace()
+            .is_some_and(|netns| crate::net::neighbor::lookup(&netns, oif, next_hop).is_some());
+        let resolved = configured
+            || interface.is_neighbor_resolved(crate::time::Instant::now().into(), next_hop);
+        if !resolved {
+            return false;
+        }
+        self.local_input_queue.release_neighbor(oif, next_hop)
+    }
+
+    pub(super) fn has_local_work(&self) -> bool {
+        self.has_local_input() || self.local_input_queue.has_output()
+    }
+
+    pub(super) fn needs_namespace_routing(&self) -> bool {
+        self.has_local_work()
+            || self.namespace_routed_stack.load(Ordering::Acquire)
+            || self.bounds.read().count() != 0
+    }
+
+    /// Revalidates the lock-free routing-mode snapshot after both protocol
+    /// locks have been acquired. This is shared by direct and NAPI polling so
+    /// neither backend can process newly published output with a stale device.
+    fn recheck_poll_mode(
+        &self,
+        netns: Option<&Arc<NetNamespace>>,
+        needs_routed_poll: bool,
+        authoritative_output: bool,
+        configured_output: bool,
+        ct_active: bool,
+    ) -> PollModeRecheck {
+        if !authoritative_output
+            && netns.is_some_and(|netns| netns.router().requires_authoritative_output())
+        {
+            PollModeRecheck::Authoritative
+        } else if (!needs_routed_poll
+            && (self.needs_namespace_routing()
+                || netns.is_some_and(|netns| netns.has_explicit_ipv4_broadcast())))
+            || (!configured_output && netns.is_some_and(crate::net::neighbor::has_ethernet_entries))
+            || (!ct_active && netns.is_some_and(|netns| netns.conntrack().is_active()))
+        {
+            PollModeRecheck::Routed
+        } else {
+            PollModeRecheck::Current
+        }
+    }
+
+    pub(super) fn clear_namespace_routing_if_idle(&self) {
+        // Reacquire the protocol lock after output draining so the fragment
+        // observation and latch clear cannot race another poller's interval
+        // between consuming local ingress and publishing routed output.
+        let interface = self.smol_iface.lock();
+        let routed_fragments_pending = interface.has_pending_egress_override();
+        let bounds = self.bounds.read();
+        self.local_input_queue.clear_routed_if_idle(
+            &self.namespace_routed_stack,
+            bounds.count_atomic(),
+            routed_fragments_pending,
+        );
+    }
+
+    /// Keep the routed device contract active across FIB mode changes until
+    /// every saved fragment backend has completed. This publication happens
+    /// while the smoltcp interface lock still protects the observation.
+    pub(super) fn retain_namespace_routing_for_pending_fragments(
+        &self,
+        interface: &smoltcp::iface::Interface,
+    ) {
+        if interface.has_pending_egress_override() {
+            self.namespace_routed_stack.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn poll_scope(&self) -> IfacePollScope {
+        if self.flags().contains(InterfaceFlags::UP) {
+            IfacePollScope::Full
+        } else if self.needs_namespace_routing() {
+            IfacePollScope::LocalOnly
+        } else {
+            IfacePollScope::None
+        }
+    }
+
+    pub fn poll<D>(&self, device: &mut D) -> bool
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        self.poll_with_authoritative_mode(device, false)
+    }
+
+    pub(super) fn poll_with_authoritative_mode<D>(
+        &self,
+        device: &mut D,
+        force_authoritative: bool,
+    ) -> bool
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        let mut force_authoritative = force_authoritative;
+        loop {
+            let namespace_epoch = self.namespace_epoch.load(Ordering::Acquire);
+            if namespace_epoch & 1 != 0 {
+                return false;
+            }
+            let scope = self.poll_scope();
+            match scope {
+                IfacePollScope::None => return false,
+                IfacePollScope::LocalOnly | IfacePollScope::Full => {}
+            }
+
+            let mut raw_batch = Box::try_new(RawIngressBatch::default()).ok();
+            let mut raw_retirement = Vec::new();
+            let netns = self.net_namespace();
+            let nft_ruleset = netns.as_ref().map(|netns| netns.nftables().snapshot());
+            let nft_ruleset_changed = || {
+                netns
+                    .as_ref()
+                    .zip(nft_ruleset.as_ref())
+                    .is_some_and(|(netns, pinned)| {
+                        pinned.generation != netns.nftables().generation()
+                    })
+            };
+            let nft_device_names = match (netns.as_ref(), nft_ruleset.as_ref()) {
+                (Some(netns), Some(ruleset)) if ruleset.requires_iface_names() => {
+                    match crate::net::nftables::NftDeviceNames::snapshot(netns) {
+                        Ok(names) => names,
+                        Err(_) => return false,
+                    }
+                }
+                _ => crate::net::nftables::NftDeviceNames::empty(),
+            };
+            let authoritative_output = force_authoritative
+                || netns
+                    .as_ref()
+                    .is_some_and(|netns| netns.router().requires_authoritative_output());
+            let configured_output = netns
+                .as_ref()
+                .is_some_and(crate::net::neighbor::has_ethernet_entries);
+            let ipv6_forwarding = netns
+                .as_ref()
+                .is_some_and(|netns| netns.ipv6_forwarding_enabled());
+            let explicit_broadcast_ingress = netns
+                .as_ref()
+                .is_some_and(|netns| netns.has_explicit_ipv4_broadcast());
+            let ct_active = netns
+                .as_ref()
+                .is_some_and(|netns| netns.conntrack().is_active());
+            let requires_nat_addresses = nft_ruleset.as_ref().is_some_and(|ruleset| {
+                [
+                    smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpVersion::Ipv6,
+                ]
+                .into_iter()
+                .any(|version| {
+                    ruleset.requires_masquerade(
+                        version,
+                        crate::net::nftables::NftIpv4Hook::PostRouting,
+                    ) || ruleset
+                        .requires_redirect(version, crate::net::nftables::NftIpv4Hook::PreRouting)
+                })
+            });
+            let needs_routed_poll = self.needs_namespace_routing()
+                || scope == IfacePollScope::LocalOnly
+                || authoritative_output
+                || configured_output
+                || ipv6_forwarding
+                || explicit_broadcast_ingress
+                || ct_active
+                || requires_nat_addresses
+                || nft_ruleset.as_ref().is_some_and(|ruleset| {
+                    ruleset.requires_route_lookup() || ruleset.has_output_hook()
+                });
+            // ARP ownership needs the namespace FIB even on an otherwise
+            // unfiltered Ethernet fast path. A read view alone must not
+            // switch IP output backends or local-input polling modes.
+            let needs_route_view = needs_routed_poll || self.type_ == InterfaceType::ETHER;
+            let router = if needs_route_view {
+                netns.as_ref().map(|netns| netns.router())
+            } else {
+                None
+            };
+            let mut route_policy = router.as_ref().and_then(|router| {
+                netns
+                    .as_ref()
+                    .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
+            });
+            if requires_nat_addresses
+                && route_policy
+                    .as_mut()
+                    .is_none_or(|routes| routes.prepare_masquerade_addresses().is_err())
+            {
+                return false;
+            }
+            let routed_this_round = needs_routed_poll && route_policy.is_some();
+            let owner_is_up = scope == IfacePollScope::Full;
+
+            let Some(_poll_guard) = self.enter_poll_epoch(namespace_epoch) else {
+                drop(route_policy);
+                drop(router);
+                continue;
+            };
+            let socket_set = self.sockets.read().clone();
+            let mut sockets = socket_set.lock();
+            let mut interface = self.smol_iface.lock();
+            let timestamp = crate::time::Instant::now().into();
+            if self.poll_scope() != scope {
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                continue;
+            }
+            let configured_neighbors = netns.as_ref().and_then(|netns| {
+                crate::net::neighbor::has_ethernet_entries(netns)
+                    .then(|| crate::net::neighbor::read(netns))
+            });
+
+            // Reservations and route-mode changes publish before SocketSet
+            // mutation. Recheck after serialization and restart before processing
+            // any packet if the initial backend snapshot became stale.
+            let restart = self.recheck_poll_mode(
+                netns.as_ref(),
+                needs_routed_poll,
+                authoritative_output,
+                configured_output,
+                ct_active,
+            );
+            if restart != PollModeRecheck::Current || nft_ruleset_changed() {
+                drop(configured_neighbors);
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                force_authoritative |= restart == PollModeRecheck::Authoritative;
+                continue;
+            }
+            let backend_policy =
+                route_policy
+                    .as_ref()
+                    .filter(|_| routed_this_round)
+                    .map(|routes| OutputBackendPolicy {
+                        netns: netns.as_deref().unwrap(),
+                        routes,
+                        ruleset: nft_ruleset.as_deref(),
+                        device_names: &nft_device_names,
+                        configured_neighbors: configured_neighbors.as_ref(),
+                        owner_ifindex: self.iface_id as u32,
+                        owner_is_up,
+                        authoritative_output,
+                    });
+
+            let ingress_stage = Cell::new(IngressStage::Pending);
+            let handoff_broadcast = Cell::new(false);
+            let mark = Cell::new(0);
+            let forward_fragment = Cell::new(None);
+            let packet_context = core::cell::RefCell::new(None);
+            // Account only after every poll-mode recheck succeeds. Packet and
+            // pin allocations are charged as matching raw datagrams arrive.
+            let raw_reserved = raw_batch.as_mut().is_some_and(|batch| {
+                netns
+                    .as_ref()
+                    .is_some_and(|netns| batch.reserve_header(&netns.raw_ingress))
+            });
+            let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
+            let mut nft_filter = netns.as_ref().map(|netns| {
+                NetIngressFilter::new(NetIngressFilterInit {
+                    ruleset: nft_ruleset.as_ref().unwrap(),
+                    netns,
+                    owner_ifindex: self.iface_id as u32,
+                    device_names: &nft_device_names,
+                    stage: &ingress_stage,
+                    handoff_broadcast: &handoff_broadcast,
+                    mark: &mark,
+                    forward_fragment: &forward_fragment,
+                    packet_context: &packet_context,
+                    routes: (ipv6_forwarding || explicit_broadcast_ingress || ct_active)
+                        .then_some(route_policy.as_ref())
+                        .flatten(),
+                    fib_routes: route_policy.as_ref(),
+                    work: &mut ingress_work,
+                    raw_batch: raw_batch.as_deref_mut().filter(|_| raw_reserved),
+                    raw_retirement: &mut raw_retirement,
+                })
+            });
+
+            let (has_events, poll_again, deadline_rearm) = {
+                let local_result = if routed_this_round
+                    && (self.has_local_input() || scope == IfacePollScope::LocalOnly)
+                {
+                    let mut local_device = LocalInputDevice::new(
+                        device,
+                        self,
+                        backend_policy.unwrap(),
+                        nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &handoff_broadcast),
+                        nft_filter.as_ref().map(|_| &packet_context),
+                        nft_filter.as_ref().map(|_| &mark),
+                        nft_filter.as_ref().map(|_| &forward_fragment),
+                    );
+                    Some(poll_smol(
+                        &mut interface,
+                        timestamp,
+                        &mut local_device,
+                        &mut sockets,
+                        nft_filter
+                            .as_mut()
+                            .map(|filter| filter as &mut dyn IpIngressFilter),
+                    ))
+                } else {
+                    None
+                };
+                let poll_result = if scope == IfacePollScope::Full {
+                    if routed_this_round {
+                        let mut routed_device = RoutedTxDevice {
+                            device,
+                            queue: &self.local_input_queue,
+                            backend_policy: backend_policy.unwrap(),
+                        };
+                        Some(poll_smol(
+                            &mut interface,
+                            timestamp,
+                            &mut routed_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ))
+                    } else {
+                        let mut guarded_device = NftGenerationDevice {
+                            device,
+                            netns: netns.as_deref(),
+                            ruleset: nft_ruleset.as_deref(),
+                        };
+                        Some(poll_smol(
+                            &mut interface,
+                            timestamp,
+                            &mut guarded_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ))
+                    }
+                } else {
+                    None
+                };
+
+                self.release_resolved_routed_outputs(
+                    &mut interface,
+                    timestamp,
+                    configured_neighbors.as_ref(),
+                );
+                self.retain_namespace_routing_for_pending_fragments(&interface);
+
+                let poll_at = interface.poll_at(timestamp, &sockets);
+                let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
+                (
+                    local_result.is_some_and(|result| {
+                        matches!(result.0, smoltcp::iface::PollResult::SocketStateChanged)
+                    }) || poll_result.is_some_and(|result| {
+                        matches!(result.0, smoltcp::iface::PollResult::SocketStateChanged)
+                    }),
+                    poll_again
+                        || self.has_local_input()
+                        || local_result.is_some_and(|result| result.1)
+                        || poll_result.is_some_and(|result| result.1),
+                    deadline_rearm,
+                )
+            };
+
+            // Publish the deadline while the smoltcp serialization locks are held,
+            // but notify the namespace only after dropping them.
+            // Lock order is smoltcp -> configured-neighbor read. Release in the
+            // reverse order before output draining may acquire another smoltcp
+            // lock; RTNL delete deliberately uses smoltcp -> table write.
+            let raw_owner = if raw_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.work.is_empty())
+            {
+                netns
+                    .as_ref()
+                    .unwrap()
+                    .raw_ingress
+                    .lock_irqsave()
+                    .publish(raw_batch.take().unwrap())
+            } else {
+                false
+            };
+            drop(configured_neighbors);
+            drop(interface);
+            drop(sockets);
+            drop(route_policy);
+            drop(router);
+            for work in ingress_work.drain(..) {
+                work.execute();
+            }
+            let output_drain = self.drain_local_outputs(device, Self::LOCAL_OUTPUT_POLL_BUDGET);
+            self.clear_namespace_routing_if_idle();
+            self.notify_deadline_rearm(deadline_rearm);
+
+            // A last notification pin must not reenter namespace/device
+            // retirement while this poll contributes to close_and_wait.
+            drop(_poll_guard);
+            if raw_owner {
+                RawIngressQueue::drain(&netns.as_ref().unwrap().raw_ingress);
+            }
+            // Pressure/OOM fallback pins retire outside both interface locks
+            // and poll admission, without suppressing ordinary protocol input.
+            if let Some(batch) = raw_batch {
+                if let Some(netns) = &netns {
+                    batch.retire(&netns.raw_ingress);
+                }
+            }
+            drop(raw_retirement);
+
+            // 注意：不要在持有 bounds 读锁(且 irqsave)期间调用 socket.notify()。
+            // 否则会形成典型锁顺序反转死锁：
+            // - poll 路径：bounds.read_irqsave() -> socket.notify() -> socket.inner(RwLock)
+            // - connect/bind/close 路径：socket.inner(RwLock) -> bounds.write()
+            // 因此这里先快照一份 bound sockets，再逐个 notify。
+            //
+            // IMPORTANT: 对于 loopback 场景（如 gVisor BlockingLargeWrite 测试），始终需要唤醒所有
+            // 等待的 socket。原因：smoltcp 在处理 ACK 后可能不返回 SocketStateChanged，但发送端的
+            // can_send() 已经变为 true。如果只在 has_events 时唤醒，发送端会永远等待。
+            // 唤醒后 socket 会重新检查条件，如果条件不满足会继续等待，所以不会造成忙等待。
+            self.notify_all_bound_sockets();
+
+            if nft_ruleset_changed() {
+                // poll_filtered stopped before consuming the next RX token.
+                // Reacquire matching rule, FIB, interface-name, and MASQ views
+                // before resuming either ingress or socket egress.
+                continue;
+            }
+
+            // TODO: remove closed sockets
+            // let closed_sockets = self
+            //     .closing_sockets
+            //     .lock_irq_disabled()
+            //     .extract_if(|closing_socket| closing_socket.is_closed())
+            //     .collect::<Vec<_>>();
+            // drop(closed_sockets);
+            // `Iface::poll()` 的返回值不仅用于“这轮有没有状态变化”，还会被
+            // `poll_iface_until_quiescent()` 当作“是否还需要立刻再 poll 一轮”的判据。
+            //
+            // smoltcp 会通过 `poll_at() == Now` 表示还有立即可推进的工作
+            // （例如 loopback 二次往返、ACK/window update、仅 egress 前进等）。
+            // 如果这里只返回 `has_events`，快路径会过早停止，剩余工作只能等下一次外部事件，
+            // 在 blocking TCP 大包场景就会表现为 send/recv 偶发永久卡住。
+            // Draining output can enqueue a new local input packet after the
+            // earlier poll_again snapshot. Do not report quiescence until that
+            // packet has had an ingress poll opportunity. NAPI uses the same
+            // post-drain check below.
+            return has_events
+                || poll_again
+                || self.has_local_input()
+                || output_drain.needs_immediate_poll();
+        }
+    }
+
+    /// NAPI 使用的 bounded poll：最多处理 `budget` 个 ingress 包，然后推进一次 egress。
+    ///
+    /// 返回值语义：是否仍有 ingress backlog 需要继续 poll（即 budget 用尽且仍在处理包）。
+    pub fn poll_napi<D>(&self, device: &mut D, budget: usize) -> napi::NapiPollResult
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        self.poll_napi_with_authoritative_mode(device, budget, false, false)
+    }
+
+    /// veth ingress needs an FIB view even when its output still uses the
+    /// ordinary per-interface route projection.
+    pub(super) fn poll_napi_routed_ingress<D>(
+        &self,
+        device: &mut D,
+        budget: usize,
+    ) -> napi::NapiPollResult
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        self.poll_napi_with_authoritative_mode(device, budget, false, true)
+    }
+
+    pub(super) fn poll_napi_with_authoritative_mode<D>(
+        &self,
+        device: &mut D,
+        budget: usize,
+        force_authoritative: bool,
+        route_ingress: bool,
+    ) -> napi::NapiPollResult
+    where
+        D: smoltcp::phy::Device + ?Sized,
+    {
+        let mut force_authoritative = force_authoritative;
+        loop {
+            let namespace_epoch = self.namespace_epoch.load(Ordering::Acquire);
+            if namespace_epoch & 1 != 0 {
+                return napi::NapiPollResult::idle();
+            }
+            let scope = self.poll_scope();
+            match scope {
+                IfacePollScope::None => return napi::NapiPollResult::idle(),
+                IfacePollScope::LocalOnly | IfacePollScope::Full => {}
+            }
+
+            let mut raw_batch = Box::try_new(RawIngressBatch::default()).ok();
+            let mut raw_retirement = Vec::new();
+            let netns = self.net_namespace();
+            let nft_ruleset = netns.as_ref().map(|netns| netns.nftables().snapshot());
+            let nft_ruleset_changed = || {
+                netns
+                    .as_ref()
+                    .zip(nft_ruleset.as_ref())
+                    .is_some_and(|(netns, pinned)| {
+                        pinned.generation != netns.nftables().generation()
+                    })
+            };
+            let nft_device_names = match (netns.as_ref(), nft_ruleset.as_ref()) {
+                (Some(netns), Some(ruleset)) if ruleset.requires_iface_names() => {
+                    match crate::net::nftables::NftDeviceNames::snapshot(netns) {
+                        Ok(names) => names,
+                        Err(_) => return napi::NapiPollResult::new(0, true),
+                    }
+                }
+                _ => crate::net::nftables::NftDeviceNames::empty(),
+            };
+            let authoritative_output = force_authoritative
+                || netns
+                    .as_ref()
+                    .is_some_and(|netns| netns.router().requires_authoritative_output());
+            let configured_output = netns
+                .as_ref()
+                .is_some_and(crate::net::neighbor::has_ethernet_entries);
+            let ipv6_forwarding = netns
+                .as_ref()
+                .is_some_and(|netns| netns.ipv6_forwarding_enabled());
+            let explicit_broadcast_ingress = netns
+                .as_ref()
+                .is_some_and(|netns| netns.has_explicit_ipv4_broadcast());
+            let ct_active = netns
+                .as_ref()
+                .is_some_and(|netns| netns.conntrack().is_active());
+            let requires_nat_addresses = nft_ruleset.as_ref().is_some_and(|ruleset| {
+                [
+                    smoltcp::wire::IpVersion::Ipv4,
+                    smoltcp::wire::IpVersion::Ipv6,
+                ]
+                .into_iter()
+                .any(|version| {
+                    ruleset.requires_masquerade(
+                        version,
+                        crate::net::nftables::NftIpv4Hook::PostRouting,
+                    ) || ruleset
+                        .requires_redirect(version, crate::net::nftables::NftIpv4Hook::PreRouting)
+                })
+            });
+            let needs_routed_poll = self.needs_namespace_routing()
+                || scope == IfacePollScope::LocalOnly
+                || authoritative_output
+                || configured_output
+                || route_ingress
+                || ipv6_forwarding
+                || explicit_broadcast_ingress
+                || ct_active
+                || requires_nat_addresses
+                || nft_ruleset.as_ref().is_some_and(|ruleset| {
+                    ruleset.requires_route_lookup() || ruleset.has_output_hook()
+                });
+            // Keep ARP address ownership independent of nft/conntrack and
+            // of the IP TX backend selected for this NAPI round.
+            let needs_route_view = needs_routed_poll || self.type_ == InterfaceType::ETHER;
+            let router = if needs_route_view {
+                netns.as_ref().map(|netns| netns.router())
+            } else {
+                None
+            };
+            let mut route_policy = router.as_ref().and_then(|router| {
+                netns
+                    .as_ref()
+                    .map(|netns| crate::net::route::lock_output_routes(router, netns.device_list()))
+            });
+            if requires_nat_addresses
+                && route_policy
+                    .as_mut()
+                    .is_none_or(|routes| routes.prepare_masquerade_addresses().is_err())
+            {
+                return napi::NapiPollResult::new(0, true);
+            }
+            let routed_this_round = needs_routed_poll && route_policy.is_some();
+            let owner_is_up = scope == IfacePollScope::Full;
+
+            let Some(_poll_guard) = self.enter_poll_epoch(namespace_epoch) else {
+                drop(route_policy);
+                drop(router);
+                continue;
+            };
+            let socket_set = self.sockets.read().clone();
+            let mut sockets = socket_set.lock();
+            let mut interface = self.smol_iface.lock();
+            let timestamp = crate::time::Instant::now().into();
+            if self.poll_scope() != scope {
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                continue;
+            }
+            let configured_neighbors = netns.as_ref().and_then(|netns| {
+                crate::net::neighbor::has_ethernet_entries(netns)
+                    .then(|| crate::net::neighbor::read(netns))
+            });
+
+            let restart = self.recheck_poll_mode(
+                netns.as_ref(),
+                needs_routed_poll,
+                authoritative_output,
+                configured_output,
+                ct_active,
+            );
+            if restart != PollModeRecheck::Current || nft_ruleset_changed() {
+                drop(configured_neighbors);
+                drop(interface);
+                drop(sockets);
+                drop(route_policy);
+                drop(router);
+                force_authoritative |= restart == PollModeRecheck::Authoritative;
+                continue;
+            }
+            let backend_policy =
+                route_policy
+                    .as_ref()
+                    .filter(|_| routed_this_round)
+                    .map(|routes| OutputBackendPolicy {
+                        netns: netns.as_deref().unwrap(),
+                        routes,
+                        ruleset: nft_ruleset.as_deref(),
+                        device_names: &nft_device_names,
+                        configured_neighbors: configured_neighbors.as_ref(),
+                        owner_ifindex: self.iface_id as u32,
+                        owner_is_up,
+                        authoritative_output,
+                    });
+
+            // Account only after every poll-mode recheck succeeds. Packet and
+            // pin allocations are charged as matching raw datagrams arrive.
+            let raw_reserved = raw_batch.as_mut().is_some_and(|batch| {
+                netns
+                    .as_ref()
+                    .is_some_and(|netns| batch.reserve_header(&netns.raw_ingress))
+            });
+            let mut ingress_work: Vec<RoutedIngressWork> = Vec::new();
+            let (processed, had_packet, ingress_budget, poll_again, deadline_rearm) = {
+                let ingress_stage = Cell::new(IngressStage::Pending);
+                let handoff_broadcast = Cell::new(false);
+                let mark = Cell::new(0);
+                let forward_fragment = Cell::new(None);
+                let packet_context = core::cell::RefCell::new(None);
+                let mut nft_filter = netns.as_ref().map(|netns| {
+                    NetIngressFilter::new(NetIngressFilterInit {
+                        ruleset: nft_ruleset.as_ref().unwrap(),
+                        netns,
+                        owner_ifindex: self.iface_id as u32,
+                        device_names: &nft_device_names,
+                        stage: &ingress_stage,
+                        handoff_broadcast: &handoff_broadcast,
+                        mark: &mark,
+                        forward_fragment: &forward_fragment,
+                        packet_context: &packet_context,
+                        routes: (route_ingress
+                            || ipv6_forwarding
+                            || explicit_broadcast_ingress
+                            || ct_active)
+                            .then_some(route_policy.as_ref())
+                            .flatten(),
+                        fib_routes: route_policy.as_ref(),
+                        work: &mut ingress_work,
+                        raw_batch: raw_batch.as_deref_mut().filter(|_| raw_reserved),
+                        raw_retirement: &mut raw_retirement,
+                    })
+                });
+
+                let mut processed = 0usize;
+                let mut had_packet = false;
+
+                // Local output is packet work too: it performs route/neighbor
+                // classification and transmission rather than merely reaping TX
+                // completions. Reserve half the shared NAPI budget when it is already
+                // backlogged, then let either side consume unused capacity.
+                let ingress_budget = if self.local_input_queue.has_ready_output(timestamp) {
+                    budget.div_ceil(2)
+                } else {
+                    budget
+                };
+
+                // Reserve at most half of the first pass for namespace-local handoff,
+                // then poll the hardware/device queue. If the device has no work, use
+                // the remaining budget for local input. This keeps both sources
+                // progressing without reducing throughput when only one is active.
+                let local_first_budget = if scope == IfacePollScope::Full {
+                    ingress_budget.div_ceil(2)
+                } else {
+                    ingress_budget
+                };
+                if routed_this_round {
+                    let mut local_device = LocalInputDevice::new(
+                        device,
+                        self,
+                        backend_policy.unwrap(),
+                        nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &handoff_broadcast),
+                        nft_filter.as_ref().map(|_| &packet_context),
+                        nft_filter.as_ref().map(|_| &mark),
+                        nft_filter.as_ref().map(|_| &forward_fragment),
+                    );
+                    for _ in 0..local_first_budget {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            &mut local_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                            }
+                        }
+                    }
+                }
+
+                let device_budget = if scope == IfacePollScope::Full {
+                    ingress_budget - processed
+                } else {
+                    0
+                };
+                let mut device_processed = 0usize;
+                if routed_this_round {
+                    let mut routed_device = RoutedTxDevice {
+                        device,
+                        queue: &self.local_input_queue,
+                        backend_policy: backend_policy.unwrap(),
+                    };
+                    for _ in 0..device_budget {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            &mut routed_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                                device_processed += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for _ in 0..device_budget {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                                device_processed += 1;
+                            }
+                        }
+                    }
+                }
+
+                let remaining = device_budget - device_processed;
+                if routed_this_round && remaining > 0 && self.has_local_input() {
+                    let mut local_device = LocalInputDevice::new(
+                        device,
+                        self,
+                        backend_policy.unwrap(),
+                        nft_filter.as_ref().map(|_| &ingress_stage),
+                        nft_filter.as_ref().map(|_| &handoff_broadcast),
+                        nft_filter.as_ref().map(|_| &packet_context),
+                        nft_filter.as_ref().map(|_| &mark),
+                        nft_filter.as_ref().map(|_| &forward_fragment),
+                    );
+                    for _ in 0..remaining {
+                        match poll_smol_single(
+                            &mut interface,
+                            timestamp,
+                            &mut local_device,
+                            &mut sockets,
+                            nft_filter
+                                .as_mut()
+                                .map(|filter| filter as &mut dyn IpIngressFilter),
+                        ) {
+                            smoltcp::iface::PollIngressSingleResult::None => break,
+                            smoltcp::iface::PollIngressSingleResult::PacketProcessed
+                            | smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                                had_packet = true;
+                                processed += 1;
+                            }
+                        }
+                    }
+                }
+
+                // 推进发送路径（smoltcp 保证 bounded work）。
+                // A newly committed rule may need different FIB, device-name,
+                // or MASQUERADE snapshots. Resume with a fresh poll view.
+                if !nft_ruleset_changed() {
+                    if routed_this_round && owner_is_up {
+                        let mut routed_device = RoutedTxDevice {
+                            device,
+                            queue: &self.local_input_queue,
+                            backend_policy: backend_policy.unwrap(),
+                        };
+                        let _ = interface.poll_egress(timestamp, &mut routed_device, &mut sockets);
+                    } else if routed_this_round {
+                        let mut local_device = LocalInputDevice::new(
+                            device,
+                            self,
+                            backend_policy.unwrap(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        let _ = interface.poll_egress(timestamp, &mut local_device, &mut sockets);
+                    } else {
+                        let mut guarded_device = NftGenerationDevice {
+                            device,
+                            netns: netns.as_deref(),
+                            ruleset: nft_ruleset.as_deref(),
+                        };
+                        let _ = interface.poll_egress(timestamp, &mut guarded_device, &mut sockets);
+                    }
+                }
+
+                self.release_resolved_routed_outputs(
+                    &mut interface,
+                    timestamp,
+                    configured_neighbors.as_ref(),
+                );
+                self.retain_namespace_routing_for_pending_fragments(&interface);
+
+                let poll_at = interface.poll_at(timestamp, &sockets);
+                let (poll_again, deadline_rearm) = self.publish_poll_deadline(timestamp, poll_at);
+                (
+                    processed,
+                    had_packet,
+                    ingress_budget,
+                    poll_again,
+                    deadline_rearm,
+                )
+            };
+
+            // 解锁后唤醒/通知 socket（沿用原 poll() 的 Linux-like 语义）。
+            // Preserve the same smoltcp -> neighbor lock order as the direct poll
+            // path before draining may enter a target interface.
+            let raw_owner = if raw_batch
+                .as_ref()
+                .is_some_and(|batch| !batch.work.is_empty())
+            {
+                netns
+                    .as_ref()
+                    .unwrap()
+                    .raw_ingress
+                    .lock_irqsave()
+                    .publish(raw_batch.take().unwrap())
+            } else {
+                false
+            };
+            drop(configured_neighbors);
+            drop(interface);
+            drop(sockets);
+            drop(route_policy);
+            drop(router);
+            for work in ingress_work.drain(..) {
+                work.execute();
+            }
+            let output_drain = self.drain_local_outputs(device, budget - processed);
+            self.clear_namespace_routing_if_idle();
+            self.notify_deadline_rearm(deadline_rearm);
+            drop(_poll_guard);
+            if raw_owner {
+                RawIngressQueue::drain(&netns.as_ref().unwrap().raw_ingress);
+            }
+            // Pressure/OOM fallback pins retire outside both interface locks
+            // and poll admission, without suppressing ordinary protocol input.
+            if let Some(batch) = raw_batch {
+                if let Some(netns) = &netns {
+                    batch.retire(&netns.raw_ingress);
+                }
+            }
+            drop(raw_retirement);
+            self.notify_all_bound_sockets();
+
+            // NAPI 语义：只要“还有立即可推进的工作”，就应继续留在 poll_list。
+            //
+            // 除了 ingress backlog 超过 budget 之外，egress/ACK 路径也可能要求立刻再次 poll：
+            // smoltcp 会通过 `poll_at() == Now`（这里被 clamp 成 `Some(timestamp)`）表达这一点。
+            // 如果忽略这个条件，loopback/TCP 大流量场景可能出现：
+            // - 已处理完当前 ingress batch；
+            // - 但仍有 ACK / window update / 后续 egress 需要立即发送；
+            // - NAPI 线程却错误睡眠，直到下一次外部事件才继续推进，
+            //   导致 send done 后 recv 端偶发卡住。
+            return napi::NapiPollResult::new(
+                processed + output_drain.work_done,
+                (had_packet && processed == ingress_budget)
+                    || poll_again
+                    || self.has_local_input()
+                    || output_drain.needs_immediate_poll()
+                    || nft_ruleset_changed(),
+            );
+        }
+    }
+
+    fn report_forward_mtu_drop(
+        netns: &Arc<NetNamespace>,
+        packet: &LocalOutputPacket,
+        error: SystemError,
+    ) {
+        if error != SystemError::EMSGSIZE {
+            return;
+        }
+        let (Some(feedback), LocalOutputDisposition::Routed { oif, ip_mtu, .. }) =
+            (&packet.forward_mtu_feedback, packet.disposition)
+        else {
+            return;
+        };
+        let devices = netns.device_list();
+        let Some(egress) = devices.get(&(oif as usize)).cloned() else {
+            return;
+        };
+        drop(devices);
+        // The output reservation has been released by the caller before this
+        // enters the ordinary local OUTPUT/POST_ROUTING path.
+        if let Err(error) = feedback.send(&packet.frame, ip_mtu.min(egress.mtu())) {
+            log::debug!("late forward MTU feedback discarded: {:?}", error);
+        }
+    }
+
+    fn drain_local_outputs<D>(&self, device: &mut D, budget: usize) -> LocalOutputDrainResult
+    where
+        D: SmolDevice + ?Sized,
+    {
+        let Some(netns) = self.net_namespace() else {
+            return LocalOutputDrainResult::new(0, LocalOutputDrainState::Quiescent);
+        };
+        let Some(drain_guard) = self.local_input_queue.try_begin_output_drain() else {
+            return if self.local_input_queue.has_output() {
+                LocalOutputDrainResult::new(0, LocalOutputDrainState::BudgetExhausted)
+            } else {
+                LocalOutputDrainResult::new(0, LocalOutputDrainState::Contended)
+            };
+        };
+        let mut prefer_deferred = true;
+        let mut work_done = 0;
+        for _ in 0..budget {
+            // A previous drain can run concurrently with another smoltcp
+            // ingress poll. Do not expose its generated reply before that poll
+            // publishes the corresponding raw request to the namespace FIFO.
+            // Only transfer ownership here; routing and retirement stay outside
+            // the smoltcp -> local-output lock order.
+            let pop = {
+                let _interface = self.smol_iface.lock();
+                self.local_input_queue
+                    .pop_ready_output(crate::time::Instant::now().into(), prefer_deferred)
+            };
+            let (mut output, mut in_flight, deferred_probe) = match pop {
+                LocalOutputPop::Ready(output, in_flight, deferred_probe) => {
+                    (output, in_flight, deferred_probe)
+                }
+                LocalOutputPop::DeferredUntil(retry_at) => {
+                    drop(drain_guard);
+                    self.defer_local_output_retry_at(retry_at);
+                    return LocalOutputDrainResult::new(
+                        work_done,
+                        LocalOutputDrainState::Backpressured,
+                    );
+                }
+                LocalOutputPop::Empty => {
+                    return if self.local_input_queue.finish_output_drain(drain_guard) {
+                        LocalOutputDrainResult::new(
+                            work_done,
+                            LocalOutputDrainState::BudgetExhausted,
+                        )
+                    } else {
+                        LocalOutputDrainResult::new(work_done, LocalOutputDrainState::Quiescent)
+                    };
+                }
+            };
+            work_done += 1;
+            prefer_deferred = false;
+
+            // Admission belongs to the actual egress interface. Atomically
+            // join an existing neighbor bucket before attempting transmit so
+            // neither same-owner nor cross-owner output can bypass it.
+            if deferred_probe.is_none() && output.prepared_ip.is_none() {
+                if let LocalOutputDisposition::Routed { oif, .. } = output.disposition {
+                    if oif == self.iface_id as u32 {
+                        match in_flight.commit_existing_deferred(output) {
+                            ExistingDeferredCommit::Queued(retry_at) => {
+                                self.defer_local_output_retry_at(retry_at);
+                                continue;
+                            }
+                            ExistingDeferredCommit::Missing(packet, reservation) => {
+                                output = packet;
+                                in_flight = reservation;
+                            }
+                            ExistingDeferredCommit::Full(packet, reservation) => {
+                                log::debug!(
+                                    "dropping deferred output on {}: per-neighbor queue full",
+                                    self.name()
+                                );
+                                drop(reservation);
+                                self.local_input_queue.recycle_output(packet.frame);
+                                continue;
+                            }
+                        }
+                    } else if let Some(egress) = netns.device_list().get(&(oif as usize)).cloned() {
+                        match egress.common().enqueue_existing_deferred_output(output) {
+                            ExistingDeferredEnqueue::Queued(retry_at) => {
+                                drop(in_flight);
+                                egress.common().schedule_registered_local_output(retry_at);
+                                continue;
+                            }
+                            ExistingDeferredEnqueue::Missing(packet, egress_reservation) => {
+                                match transmit_admitted_routed_output(
+                                    egress.as_ref(),
+                                    packet,
+                                    egress_reservation,
+                                ) {
+                                    AdmittedRoutedOutput::Sent(packet) => {
+                                        drop(in_flight);
+                                        self.local_input_queue.recycle_output(packet.frame);
+                                    }
+                                    AdmittedRoutedOutput::Queued(retry_at) => {
+                                        drop(in_flight);
+                                        egress.common().schedule_registered_local_output(retry_at);
+                                    }
+                                    AdmittedRoutedOutput::Drop(packet, error) => {
+                                        log::debug!(
+                                            "dropping routed output on {}: {:?}",
+                                            egress.name(),
+                                            error
+                                        );
+                                        drop(in_flight);
+                                        Self::report_forward_mtu_drop(&netns, &packet, error);
+                                        self.local_input_queue.recycle_output(packet.frame);
+                                    }
+                                }
+                                continue;
+                            }
+                            ExistingDeferredEnqueue::Full(packet) => {
+                                log::debug!(
+                                    "dropping deferred output on {}: egress queue full",
+                                    egress.name()
+                                );
+                                drop(in_flight);
+                                self.local_input_queue.recycle_output(packet.frame);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            let tx_generation = self.tx_completion_generation();
+            match transmit_local_stack_output(
+                &netns,
+                self.flags().contains(InterfaceFlags::UP),
+                device,
+                output,
+            ) {
+                LocalOutputTransmitResult::Continue(output) => {
+                    debug_assert!(output.prepared_ip.is_some());
+                    in_flight.requeue_ready(output);
+                    if let Some(key) = deferred_probe {
+                        // The first fragment succeeded. A remaining fragment
+                        // is ready, not a neighbor probe; release the bucket's
+                        // in-flight representative and its other packets.
+                        self.local_input_queue.complete_deferred_probe_success(key);
+                    }
+                    continue;
+                }
+                LocalOutputTransmitResult::Sent(output) => {
+                    self.reset_local_output_tx_backoff();
+                    if let Some(key) = deferred_probe {
+                        self.local_input_queue.complete_deferred_probe_success(key);
+                    } else if let LocalOutputDisposition::Routed { oif, next_hop, .. } =
+                        output.disposition
+                    {
+                        self.local_input_queue.release_neighbor(oif, next_hop);
+                    }
+                    drop(in_flight);
+                    self.local_input_queue.recycle_output(output.frame);
+                }
+                LocalOutputTransmitResult::Drop(output, error) => {
+                    self.reset_local_output_tx_backoff();
+                    log::debug!("dropping deferred output on {}: {:?}", self.name(), error);
+                    if let Some(key) = deferred_probe {
+                        self.local_input_queue.complete_deferred_packet_failure(key);
+                    }
+                    drop(in_flight);
+                    Self::report_forward_mtu_drop(&netns, &output, error);
+                    self.local_input_queue.recycle_output(output.frame);
+                }
+                LocalOutputTransmitResult::RetrySoon(output) => {
+                    let delay_us = self.next_local_output_tx_backoff_us();
+                    let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+                    let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
+                    if let Some(key) = deferred_probe {
+                        // A failed physical submission waits on TX capacity,
+                        // not on neighbor resolution. Return the representative
+                        // to the typed TX-backpressure queue while leaving the
+                        // remaining neighbor bucket eligible for another probe.
+                        self.local_input_queue.complete_deferred_packet_failure(key);
+                    }
+                    in_flight.requeue_backpressured(output, retry_at);
+                    if !self.release_tx_backpressure_after(tx_generation) {
+                        self.defer_local_output_retry_at(retry_at);
+                    }
+                    continue;
+                }
+                LocalOutputTransmitResult::RetryAt {
+                    packet,
+                    retry_at,
+                    probe_sent,
+                } => {
+                    self.reset_local_output_tx_backoff();
+                    let LocalOutputDisposition::Routed { oif, next_hop, .. } = packet.disposition
+                    else {
+                        unreachable!("only routed output performs neighbor discovery");
+                    };
+                    if let Some(key) = deferred_probe {
+                        debug_assert_eq!(oif, self.iface_id as u32);
+                        match in_flight.finish_deferred_probe(packet, key, retry_at, probe_sent) {
+                            Ok(resolved) => {
+                                if !resolved {
+                                    self.defer_local_output_retry_at(retry_at);
+                                }
+                            }
+                            Err(packet) => {
+                                self.local_input_queue.complete_deferred_packet_failure(key);
+                                self.local_input_queue.recycle_output(packet.frame);
+                            }
+                        }
+                    } else if packet.prepared_ip.is_some() && oif != self.iface_id as u32 {
+                        // OUTPUT can change the egress after the source queue
+                        // accepted this datagram. Keep its source reservation
+                        // until the actual egress has admitted the packet.
+                        let Some(egress) = netns.device_list().get(&(oif as usize)).cloned() else {
+                            log::debug!("dropping routed output: egress {} disappeared", oif);
+                            drop(in_flight);
+                            self.local_input_queue.recycle_output(packet.frame);
+                            continue;
+                        };
+                        match egress
+                            .common()
+                            .enqueue_prepared_deferred_output(&netns, packet, retry_at, probe_sent)
+                        {
+                            Ok(()) => {
+                                drop(in_flight);
+                                let retry_at = if egress
+                                    .common()
+                                    .release_resolved_neighbor_after_enqueue(oif, next_hop)
+                                {
+                                    crate::time::Instant::now().into()
+                                } else {
+                                    retry_at
+                                };
+                                egress.common().schedule_registered_local_output(retry_at);
+                            }
+                            Err(packet) => {
+                                log::debug!(
+                                    "dropping routed output on {}: egress neighbor queue full",
+                                    egress.name()
+                                );
+                                drop(in_flight);
+                                self.local_input_queue.recycle_output(packet.frame);
+                            }
+                        }
+                    } else if oif == self.iface_id as u32 {
+                        match in_flight.commit_deferred_packet(packet, retry_at, probe_sent, false)
+                        {
+                            Ok(()) => {
+                                let retry_at = if self
+                                    .release_resolved_neighbor_after_enqueue(oif, next_hop)
+                                {
+                                    crate::time::Instant::now().into()
+                                } else {
+                                    retry_at
+                                };
+                                self.defer_local_output_retry_at(retry_at);
+                            }
+                            Err(packet) => {
+                                log::debug!(
+                                    "dropping deferred output on {}: per-neighbor queue full",
+                                    self.name()
+                                );
+                                self.local_input_queue.recycle_output(packet.frame);
+                            }
+                        }
+                    } else {
+                        // Cross-egress packets are admitted and transmitted in
+                        // the branch above, while a deferred probe is always
+                        // owned by this interface's neighbor bucket.
+                        debug_assert!(deferred_probe.is_some());
+                        drop(in_flight);
+                        self.local_input_queue.recycle_output(packet.frame);
+                    }
+                    continue;
+                }
+            }
+        }
+        if self.local_input_queue.finish_output_drain(drain_guard) {
+            LocalOutputDrainResult::new(work_done, LocalOutputDrainState::BudgetExhausted)
+        } else {
+            LocalOutputDrainResult::new(work_done, LocalOutputDrainState::Quiescent)
+        }
+    }
+
+    pub(super) fn next_local_output_tx_backoff_us(&self) -> u64 {
+        self.local_output_tx_backoff_us
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(
+                    current
+                        .saturating_mul(2)
+                        .min(Self::LOCAL_OUTPUT_TX_BACKOFF_MAX_US),
+                )
+            })
+            .unwrap_or(Self::LOCAL_OUTPUT_TX_BACKOFF_MAX_US)
+    }
+
+    pub(super) fn reset_local_output_tx_backoff(&self) {
+        self.local_output_tx_backoff_us
+            .store(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US, Ordering::Release);
+    }
+
+    pub(crate) fn unbind_socket(
+        &self,
+        socket: Arc<dyn InetSocket>,
+    ) -> crate::net::socket::inet::common::registration::RetiredIfaceBinding {
+        let registry = self.bounds.read().clone();
+        let retired = registry.take_bound(&socket);
+        crate::net::socket::inet::common::registration::RetiredIfaceBinding {
+            socket: retired,
+            registry: Some(registry),
+        }
+    }
+
+    /// Notify all bound sockets unconditionally.
+    /// This is used after listener shutdown to ensure all client sockets
+    /// are woken up even if the interface poll didn't detect any events.
+    pub fn notify_all_bound_sockets(&self) {
+        let registry = self.bounds.read_irqsave().clone();
+        let end = registry.end();
+        for start in (0..end).step_by(crate::net::tcp_bounds::BOUND_BATCH) {
+            let pins = registry.snapshot(start, end);
+            for socket in pins.iter().flatten() {
+                socket.notify();
+                socket
+                    .wait_queue()
+                    .wakeup(Some(ProcessState::Blocked(true)));
+            }
+        }
+    }
+
+    pub fn ipv4_addr(&self) -> Option<Ipv4Addr> {
+        self.smol_iface.lock().ipv4_addr()
+    }
+
+    pub fn ip_addrs(&self) -> RwSemReadGuard<'_, Vec<smoltcp::wire::IpCidr>> {
+        self.router_common_data.ip_addrs.read()
+    }
+
+    pub fn prefix_len(&self) -> Option<u8> {
+        self.smol_iface
+            .lock()
+            .ip_addrs()
+            .first()
+            .map(|ip_addr| ip_addr.prefix_len())
+    }
+
+    pub fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.net_namespace.read().upgrade()
+    }
+
+    pub fn set_net_namespace(&self, ns: Arc<NetNamespace>) -> Result<(), SystemError> {
+        PreparedNetnsBinding::prepare(&ns, self.iface_id)?.publish(self);
+        Ok(())
+    }
+
+    pub fn clear_net_namespace(&self) {
+        let socket_set = self.sockets.read().clone();
+        let mut sockets = socket_set.lock();
+        let mut namespace = self.net_namespace.write();
+        *namespace = Weak::new();
+        sockets.set_udp_ingress_handler(None);
+        sockets.set_tcp_ingress_handler(None);
+    }
+
+    /// Capture the SocketSet belonging to this device's current namespace.
+    /// A concurrent netns move may retire the set after this returns, but
+    /// the caller's Arc keeps it alive and it will never receive destination
+    /// namespace ingress.
+    pub(crate) fn add_smol_socket_in_netns<T>(
+        &self,
+        socket: T,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(InterfaceSocketSet, smoltcp::iface::SocketHandle), (T, SystemError)>
+    where
+        T: smoltcp::socket::AnySocket<'static>,
+    {
+        let owner = self.net_namespace.read();
+        if !owner
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, netns))
+        {
+            return Err((socket, SystemError::ENODEV));
+        }
+        let set = self.sockets.read().clone();
+        drop(owner);
+        let handle = set.lock().add(socket);
+        Ok((set, handle))
+    }
+
+    pub(crate) fn socket_set_in_netns(
+        &self,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<InterfaceSocketSet, SystemError> {
+        let owner = self.net_namespace.read();
+        if !owner
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        Ok(self.sockets.read().clone())
+    }
+
+    pub(crate) fn socket_registration_snapshot(
+        &self,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<
+        (
+            InterfaceSocketSet,
+            Arc<crate::net::tcp_bounds::BoundRegistry>,
+            u64,
+        ),
+        SystemError,
+    > {
+        let epoch = self.namespace_epoch.load(Ordering::Acquire);
+        if epoch & 1 != 0 || !self.namespace_owner_matches(netns) {
+            return Err(SystemError::ENODEV);
+        }
+        let set = self.sockets.read().clone();
+        let registry = self.bounds.read().clone();
+        if self.namespace_epoch.load(Ordering::Acquire) != epoch {
+            return Err(SystemError::ENODEV);
+        }
+        Ok((set, registry, epoch))
+    }
+
+    fn namespace_owner_matches(&self, netns: &Arc<NetNamespace>) -> bool {
+        // The caller already pins this exact namespace. Do not upgrade an
+        // unrelated owner under resource locks and risk its final destructor.
+        self.net_namespace.read().as_ptr() == Arc::as_ptr(netns)
+    }
+
+    pub(crate) fn socket_registration_is_current(
+        &self,
+        netns: &Arc<NetNamespace>,
+        set: &InterfaceSocketSet,
+        registry: &Arc<crate::net::tcp_bounds::BoundRegistry>,
+        epoch: u64,
+    ) -> bool {
+        self.namespace_epoch.load(Ordering::Acquire) == epoch
+            && self.namespace_owner_matches(netns)
+            && Arc::ptr_eq(&self.sockets.read(), set)
+            && Arc::ptr_eq(&self.bounds.read(), registry)
+    }
+
+    pub(crate) fn enter_socket_publication(
+        &self,
+        epoch: u64,
+    ) -> Option<tx_admission::TxAdmissionGuard<'_>> {
+        self.enter_poll_epoch(epoch)
+    }
+
+    pub(crate) fn prepare_socket_set_move(&self) -> Result<PreparedSocketSetMove, SystemError> {
+        let sockets = Arc::try_new(Mutex::new(smoltcp::iface::SocketSet::new(Vec::new())))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let bounds = Arc::try_new(crate::net::tcp_bounds::BoundRegistry::new())
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(PreparedSocketSetMove { sockets, bounds })
+    }
+
+    pub(crate) fn begin_netns_move(&self) {
+        let previous = self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0);
+    }
+
+    fn enter_poll_epoch(&self, expected: u64) -> Option<tx_admission::TxAdmissionGuard<'_>> {
+        if expected & 1 != 0 {
+            return None;
+        }
+        let guard = self.poll_admission.try_enter()?;
+        if self.namespace_epoch.load(Ordering::Acquire) == expected {
+            Some(guard)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn wait_for_poll_before_netns_move(&self) {
+        // The atomic CLOSED bit and active count form one admission word, so
+        // neither side can miss the other through store buffering.
+        self.poll_admission.close_and_wait();
+    }
+
+    pub(crate) fn namespace_epoch(&self) -> u64 {
+        self.namespace_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn end_netns_move(&self) {
+        let previous = self.namespace_epoch.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(previous & 1, 1);
+        self.poll_admission.open();
+    }
+
+    /// Permanent counterpart of a namespace move's temporary poll barrier.
+    /// The device is already quiesced and will never be published again.
+    pub(crate) fn retire_for_device_removal(&self) {
+        self.begin_netns_move();
+        self.wait_for_poll_before_netns_move();
+        self.retire_queued_work_for_netns_move();
+    }
+
+    pub(crate) fn retire_queued_work_for_netns_move(&self) {
+        self.local_input_queue.retire_for_netns_move();
+    }
+
+    pub(crate) fn activate_queued_work_after_netns_move(&self) {
+        self.local_input_queue.activate_after_netns_move();
+    }
+
+    /// Runs a construction-time mutation while preventing namespace
+    /// publication from starting. This is the lifecycle barrier shared by
+    /// all bootstrap state owned by an interface.
+    pub(crate) fn with_unpublished<T>(
+        &self,
+        mutation: impl FnOnce() -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let namespace = self.net_namespace.read();
+        if namespace.upgrade().is_some() {
+            return Err(SystemError::EBUSY);
+        }
+        mutation()
+    }
+
+    pub fn name(&self) -> String {
+        self.name.read().clone()
+    }
+
+    /// Read the interface name without cloning it.
+    ///
+    /// The callback runs while the name read lock is held and must not acquire
+    /// address-metadata, FIB, or smoltcp locks. This narrow API lets control
+    /// plane prepare phases copy into already-reserved storage without hiding
+    /// an infallible `String` allocation in a read accessor.
+    pub(crate) fn with_iface_name<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        let name = self.name.read();
+        f(name.as_str())
+    }
+
+    pub fn set_name(&self, name: String) {
+        *self.name.write() = name;
+    }
+
+    /// Publish one prepared interface-name/address-label generation.
+    ///
+    /// Both values are moved into place without allocation. The lock order is
+    /// intentionally `address_metadata -> name`; callers must never acquire
+    /// these locks in the reverse order.
+    pub(crate) fn publish_name_and_address_metadata(
+        &self,
+        name: String,
+        metadata: Vec<AddressMetadata>,
+    ) {
+        let mut current_metadata = self.address_metadata.lock();
+        let mut current_name = self.name.write();
+        *current_metadata = metadata;
+        *current_name = name;
+    }
+
+    pub fn flags(&self) -> InterfaceFlags {
+        InterfaceFlags::from_bits_truncate(self.flags.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn prepare_configured_flags(
+        &self,
+        requested: InterfaceFlags,
+        change_mask: InterfaceFlags,
+    ) -> Result<PreparedConfiguredFlags, SystemError> {
+        let state = self.receive_mode.lock();
+        let old = InterfaceFlags::from_bits_truncate(state.configured_flags);
+        let configured = (state.configured_flags & !change_mask.bits())
+            | (requested.bits() & change_mask.bits());
+
+        Self::total_receive_mode_count(
+            state.packet_promiscuity,
+            configured & InterfaceFlags::PROMISC.bits() != 0,
+        )?;
+        Self::total_receive_mode_count(
+            state.packet_allmulti,
+            configured & InterfaceFlags::ALLMULTI.bits() != 0,
+        )?;
+
+        Ok(PreparedConfiguredFlags {
+            old,
+            new: InterfaceFlags::from_bits_truncate(configured),
+        })
+    }
+
+    /// Publishes a flag update whose fallible validation completed while RTNL
+    /// was held. RTNL serializes configured-flag writers; packet-socket
+    /// receive-mode references remain independent and are folded into the
+    /// effective flags under the same lock.
+    pub(crate) fn publish_configured_flags(&self, prepared: PreparedConfiguredFlags) {
+        let mut state = self.receive_mode.lock();
+        debug_assert_eq!(
+            InterfaceFlags::from_bits_truncate(state.configured_flags),
+            prepared.old_flags()
+        );
+        state.configured_flags = prepared.new_flags().bits();
+        self.publish_effective_flags(&state);
+    }
+
+    pub fn link_flags_snapshot(&self) -> Result<LinkFlagsSnapshot, SystemError> {
+        let state = self.receive_mode.lock();
+        let configured = InterfaceFlags::from_bits_truncate(state.configured_flags);
+        Ok(LinkFlagsSnapshot {
+            configured,
+            promiscuity: Self::total_receive_mode_count(
+                state.packet_promiscuity,
+                configured.contains(InterfaceFlags::PROMISC),
+            )?,
+            allmulti: Self::total_receive_mode_count(
+                state.packet_allmulti,
+                configured.contains(InterfaceFlags::ALLMULTI),
+            )?,
+        })
+    }
+
+    pub fn configured_flags(&self) -> InterfaceFlags {
+        InterfaceFlags::from_bits_truncate(self.receive_mode.lock().configured_flags)
+    }
+
+    pub fn type_(&self) -> InterfaceType {
+        self.type_
+    }
+
+    pub fn tx_queue_len(&self) -> u32 {
+        self.tx_queue_len.load(Ordering::Acquire)
+    }
+
+    /// Called under RTNL after the link update has completed validation.
+    pub(crate) fn set_tx_queue_len(&self, len: u32) {
+        self.tx_queue_len.store(len, Ordering::Release);
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.mtu.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_acquire_tx(&self) -> Option<tx_admission::TxAdmissionGuard<'_>> {
+        self.tx_admission.try_enter()
+    }
+
+    pub(crate) fn close_tx_and_wait(&self) {
+        self.tx_admission.close_and_wait();
+    }
+
+    pub(crate) fn open_tx(&self) {
+        self.tx_admission.open();
+    }
+
+    pub fn set_mtu(&self, mtu: usize) {
+        self.mtu.store(mtu, Ordering::Release);
+        if let Some(netns) = self.net_namespace() {
+            netns.router().pmtu.lock().invalidate();
+        }
+    }
+
+    pub(crate) fn address_metadata(&self) -> &Mutex<Vec<AddressMetadata>> {
+        &self.address_metadata
+    }
+
+    pub(crate) fn has_explicit_ipv4_broadcast(&self, address: smoltcp::wire::Ipv4Address) -> bool {
+        self.address_metadata
+            .lock()
+            .iter()
+            .any(|entry| entry.broadcast == Some(address))
+    }
+
+    pub(crate) fn configured_ipv4_broadcast_count(&self) -> usize {
+        crate::net::address::configured_ipv4_broadcast_count(&self.address_metadata.lock())
+    }
+
+    /// Stages a route before publication. Holding the namespace read guard
+    /// closes the race with `set_net_namespace()` during registration.
+    pub(crate) fn stage_bootstrap_route(&self, route: BootstrapRoute) -> Result<(), SystemError> {
+        self.with_unpublished(|| {
+            let expected_oif = u32::try_from(self.iface_id).map_err(|_| SystemError::EOVERFLOW)?;
+            if route.oif != expected_oif {
+                return Err(SystemError::EINVAL);
+            }
+
+            let mut routes = self.bootstrap_routes.lock();
+            if routes.contains(&route) {
+                return Err(SystemError::EEXIST);
+            }
+            routes.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            routes.push(route);
+            Ok(())
+        })
+    }
+
+    /// Transfers unpublished routes to netns registration without cloning.
+    pub(crate) fn take_bootstrap_routes(&self) -> Vec<BootstrapRoute> {
+        core::mem::take(&mut *self.bootstrap_routes.lock())
+    }
+
+    /// Restores the hand-off buffer when netns registration rolls back.
+    pub(crate) fn restore_bootstrap_routes(&self, routes: Vec<BootstrapRoute>) {
+        let mut staged = self.bootstrap_routes.lock();
+        debug_assert!(staged.is_empty());
+        *staged = routes;
+    }
+
+    pub(crate) fn release_configured_neighbor(
+        &self,
+        ifindex: u32,
+        next_hop: smoltcp::wire::IpAddress,
+    ) -> bool {
+        self.local_input_queue.release_neighbor(ifindex, next_hop)
+    }
+
+    /// Publishes a configured-neighbor commit to the deferred output queue.
+    /// The authoritative table is already committed before this projection is
+    /// invoked, so waking output never exposes uncommitted control-plane data.
+    pub(crate) fn configured_neighbor_committed(
+        &self,
+        ifindex: u32,
+        next_hop: smoltcp::wire::IpAddress,
+    ) {
+        if self.release_configured_neighbor(ifindex, next_hop) {
+            self.schedule_registered_local_output(crate::time::Instant::now().into());
+        }
+    }
+
+    pub fn adjust_promiscuity(&self, inc: i32) -> Result<(), SystemError> {
+        self.adjust_receive_mode(InterfaceFlags::PROMISC, inc)
+    }
+
+    pub fn adjust_allmulti(&self, inc: i32) -> Result<(), SystemError> {
+        self.adjust_receive_mode(InterfaceFlags::ALLMULTI, inc)
+    }
+
+    pub(super) fn adjust_receive_mode(
+        &self,
+        flag: InterfaceFlags,
+        inc: i32,
+    ) -> Result<(), SystemError> {
+        let mut state = self.receive_mode.lock();
+        let old = if flag == InterfaceFlags::PROMISC {
+            state.packet_promiscuity
+        } else if flag == InterfaceFlags::ALLMULTI {
+            state.packet_allmulti
+        } else {
+            return Err(SystemError::EINVAL);
+        };
+        let new = match inc {
+            1 => old.checked_add(1).ok_or(SystemError::EOVERFLOW)?,
+            -1 => old.checked_sub(1).ok_or(SystemError::EINVAL)?,
+            _ => return Err(SystemError::EINVAL),
+        };
+        let configured = state.configured_flags & flag.bits() != 0;
+        Self::total_receive_mode_count(new, configured)?;
+
+        if flag == InterfaceFlags::PROMISC {
+            state.packet_promiscuity = new;
+        } else {
+            state.packet_allmulti = new;
+        }
+        self.publish_effective_flags(&state);
+        Ok(())
+    }
+
+    pub(super) fn total_receive_mode_count(
+        packet: u32,
+        configured: bool,
+    ) -> Result<u32, SystemError> {
+        packet
+            .checked_add(u32::from(configured))
+            .ok_or(SystemError::EOVERFLOW)
+    }
+
+    pub(super) fn publish_effective_flags(&self, state: &ReceiveModeState) {
+        let mut effective = state.configured_flags;
+        if state.packet_promiscuity != 0 {
+            effective |= InterfaceFlags::PROMISC.bits();
+        }
+        if state.packet_allmulti != 0 {
+            effective |= InterfaceFlags::ALLMULTI.bits();
+        }
+        self.flags.store(effective, Ordering::Release);
+    }
+}

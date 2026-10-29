@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How to Use GDB to Debug the Kernel &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Performance Analysis of the Kernel Using DADK" href="profiling-kernel-with-dadk.html" />
+    <link rel="prev" title="Kernel Stack Traceback" href="traceback.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Kernel Debug Module</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="traceback.html">Kernel Stack Traceback</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">How to Use GDB to Debug the Kernel</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#introduction">Introduction</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#getting-started">1. Getting Started</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#debugging">2. Debugging</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#viewing-variables-and-memory">2.3 Viewing Variables and Memory</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#conclusion">Conclusion</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="profiling-kernel-with-dadk.html">Performance Analysis of the Kernel Using DADK</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Kernel Debug Module</a></li>
+      <li class="breadcrumb-item active">How to Use GDB to Debug the Kernel</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/locales/en/kernel/debug/debug-kernel-with-gdb.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/debug/debug-kernel-with-gdb.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:41</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="how-to-use-gdb-to-debug-the-kernel">
+<h1>How to Use GDB to Debug the Kernel<a class="headerlink" href="#how-to-use-gdb-to-debug-the-kernel" title="Permalink to this heading"></a></h1>
+<section id="introduction">
+<h2>Introduction<a class="headerlink" href="#introduction" title="Permalink to this heading"></a></h2>
+<p>  GDB is a powerful open-source debugging tool that can help you better diagnose and fix errors in programs.</p>
+<p>  It provides a rich set of features that allow you to check the execution status of a program, track the execution flow of code, view and modify the values of variables, analyze memory states, and more. It can be used in conjunction with a compiler to allow you to access debugging information during the debugging process.</p>
+<p>  This tutorial will guide you on how to use <code class="docutils literal notranslate"><span class="pre">rust-gdb</span></code> to debug the kernel in DragonOS, including how to start debugging and the corresponding debugging commands.</p>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>If you are already familiar with the various commands of <code class="docutils literal notranslate"><span class="pre">rust-gdb</span></code>, you only need to read the first part of this tutorial.</p>
+</div>
+</section>
+<hr class="docutils" />
+<section id="getting-started">
+<h2>1. Getting Started<a class="headerlink" href="#getting-started" title="Permalink to this heading"></a></h2>
+<section id="preparation">
+<h3>1.1 Preparation<a class="headerlink" href="#preparation" title="Permalink to this heading"></a></h3>
+<p>  Before you start debugging the kernel, you need to enable debug mode in /Kernel/Cargo.toml by changing <code class="docutils literal notranslate"><span class="pre">debug</span> <span class="pre">=</span> <span class="pre">false</span></code> to <code class="docutils literal notranslate"><span class="pre">debug</span> <span class="pre">=</span> <span class="pre">true</span></code> in the Cargo.toml file.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">debug</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">false</span>
+</pre></div>
+</div>
+<p>  <strong>Change to</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">debug</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span>
+</pre></div>
+</div>
+</section>
+<section id="running-dragonos">
+<h3>1.2 Running DragonOS<a class="headerlink" href="#running-dragonos" title="Permalink to this heading"></a></h3>
+<p>  After the preparation is complete, you can compile and run DragonOS to proceed with the subsequent debugging work.</p>
+<p>  Open a terminal in the root directory of DragonOS and use <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">run</span></code> to start compiling and running DragonOS. For more help with compilation commands, see</p>
+<blockquote>
+<div><p><a class="reference external" href="https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html">Building DragonOS</a>.</p>
+</div></blockquote>
+</section>
+<section id="running-gdb">
+<h3>1.3 Running GDB<a class="headerlink" href="#running-gdb" title="Permalink to this heading"></a></h3>
+<p>  Once DragonOS has started running, you can start debugging with GDB.</p>
+<p>  <strong>You only need to open a new terminal and run <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">gdb</span></code> to start the GDB debugger.</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>❯<span class="w"> </span>make<span class="w"> </span>gdb
+rust-gdb<span class="w"> </span>-n<span class="w"> </span>-x<span class="w"> </span>tools/.gdbinit
+GNU<span class="w"> </span>gdb<span class="w"> </span><span class="o">(</span>Ubuntu<span class="w"> </span><span class="m">12</span>.1-0ubuntu1~22.04<span class="o">)</span><span class="w"> </span><span class="m">12</span>.1
+Copyright<span class="w"> </span><span class="o">(</span>C<span class="o">)</span><span class="w"> </span><span class="m">2022</span><span class="w"> </span>Free<span class="w"> </span>Software<span class="w"> </span>Foundation,<span class="w"> </span>Inc.
+License<span class="w"> </span>GPLv3+:<span class="w"> </span>GNU<span class="w"> </span>GPL<span class="w"> </span>version<span class="w"> </span><span class="m">3</span><span class="w"> </span>or<span class="w"> </span>later<span class="w"> </span>&lt;http://gnu.org/licenses/gpl.html&gt;
+This<span class="w"> </span>is<span class="w"> </span>free<span class="w"> </span>software:<span class="w"> </span>you<span class="w"> </span>are<span class="w"> </span>free<span class="w"> </span>to<span class="w"> </span>change<span class="w"> </span>and<span class="w"> </span>redistribute<span class="w"> </span>it.
+There<span class="w"> </span>is<span class="w"> </span>NO<span class="w"> </span>WARRANTY,<span class="w"> </span>to<span class="w"> </span>the<span class="w"> </span>extent<span class="w"> </span>permitted<span class="w"> </span>by<span class="w"> </span>law.
+Type<span class="w"> </span><span class="s2">&quot;show copying&quot;</span><span class="w"> </span>and<span class="w"> </span><span class="s2">&quot;show warranty&quot;</span><span class="w"> </span><span class="k">for</span><span class="w"> </span>details.
+This<span class="w"> </span>GDB<span class="w"> </span>was<span class="w"> </span>configured<span class="w"> </span>as<span class="w"> </span><span class="s2">&quot;x86_64-linux-gnu&quot;</span>.
+Type<span class="w"> </span><span class="s2">&quot;show configuration&quot;</span><span class="w"> </span><span class="k">for</span><span class="w"> </span>configuration<span class="w"> </span>details.
+For<span class="w"> </span>bug<span class="w"> </span>reporting<span class="w"> </span>instructions,<span class="w"> </span>please<span class="w"> </span>see:
+&lt;https://www.gnu.org/software/gdb/bugs/&gt;.
+Find<span class="w"> </span>the<span class="w"> </span>GDB<span class="w"> </span>manual<span class="w"> </span>and<span class="w"> </span>other<span class="w"> </span>documentation<span class="w"> </span>resources<span class="w"> </span>online<span class="w"> </span>at:
+<span class="w">    </span>&lt;http://www.gnu.org/software/gdb/documentation/&gt;.
+
+--Type<span class="w"> </span>&lt;RET&gt;<span class="w"> </span><span class="k">for</span><span class="w"> </span>more,<span class="w"> </span>q<span class="w"> </span>to<span class="w"> </span>quit,<span class="w"> </span>c<span class="w"> </span>to<span class="w"> </span><span class="k">continue</span><span class="w"> </span>without<span class="w"> </span>paging--
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>If you see the above information, input <code class="docutils literal notranslate"><span class="pre">c</span></code> and press Enter.</p>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="debugging">
+<h2>2. Debugging<a class="headerlink" href="#debugging" title="Permalink to this heading"></a></h2>
+<section id="start">
+<h3>2.1 Start<a class="headerlink" href="#start" title="Permalink to this heading"></a></h3>
+<p>  After completing the above steps, you can start debugging.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>For<span class="w"> </span>help,<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">&quot;help&quot;</span>.
+Type<span class="w"> </span><span class="s2">&quot;apropos word&quot;</span><span class="w"> </span>to<span class="w"> </span>search<span class="w"> </span><span class="k">for</span><span class="w"> </span>commands<span class="w"> </span>related<span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;word&quot;</span>.
+warning:<span class="w"> </span>No<span class="w"> </span>executable<span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>specified<span class="w"> </span>and<span class="w"> </span>target<span class="w"> </span>does<span class="w"> </span>not<span class="w"> </span>support
+determining<span class="w"> </span>executable<span class="w"> </span>automatically.<span class="w">  </span>Try<span class="w"> </span>using<span class="w"> </span>the<span class="w"> </span><span class="s2">&quot;file&quot;</span><span class="w"> </span>command.
+0xffff8000001f8f63<span class="w"> </span><span class="k">in</span><span class="w"> </span>??<span class="w"> </span><span class="o">()</span>
+<span class="o">(</span>gdb<span class="o">)</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>The output information from GDB, <code class="docutils literal notranslate"><span class="pre">0xffff8000001f8f63</span> <span class="pre">in</span> <span class="pre">??</span> <span class="pre">()</span></code>, indicates that DragonOS is still in the process of booting.</p>
+</div>
+<p>  <strong>Input <code class="docutils literal notranslate"><span class="pre">continue</span></code> or <code class="docutils literal notranslate"><span class="pre">c</span></code> to continue the program execution.</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>For<span class="w"> </span>help,<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">&quot;help&quot;</span>.
+Type<span class="w"> </span><span class="s2">&quot;apropos word&quot;</span><span class="w"> </span>to<span class="w"> </span>search<span class="w"> </span><span class="k">for</span><span class="w"> </span>commands<span class="w"> </span>related<span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;word&quot;</span>.
+warning:<span class="w"> </span>No<span class="w"> </span>executable<span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>specified<span class="w"> </span>and<span class="w"> </span>target<span class="w"> </span>does<span class="w"> </span>not<span class="w"> </span>support
+determining<span class="w"> </span>executable<span class="w"> </span>automatically.<span class="w">  </span>Try<span class="w"> </span>using<span class="w"> </span>the<span class="w"> </span><span class="s2">&quot;file&quot;</span><span class="w"> </span>command.
+0xffff8000001f8f63<span class="w"> </span><span class="k">in</span><span class="w"> </span>??<span class="w"> </span><span class="o">()</span>
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span><span class="k">continue</span>
+Continuing.
+</pre></div>
+</div>
+<p>  While DragonOS is running, you can press <code class="docutils literal notranslate"><span class="pre">Ctrl+C</span></code> at any time to send an interrupt signal to view the current state of the kernel.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span><span class="k">continue</span>
+Continuing.
+^C
+Thread<span class="w"> </span><span class="m">1</span><span class="w"> </span>received<span class="w"> </span>signal<span class="w"> </span>SIGINT,<span class="w"> </span>Interrupt.
+0xffff800000140c21<span class="w"> </span><span class="k">in</span><span class="w"> </span>io_in8<span class="w"> </span><span class="o">(</span><span class="nv">port</span><span class="o">=</span><span class="m">113</span><span class="o">)</span><span class="w"> </span>at<span class="w"> </span>common/glib.h:136
+<span class="m">136</span><span class="w">         </span>__asm__<span class="w"> </span>__volatile__<span class="o">(</span><span class="s2">&quot;inb   %%dx,   %0      \n\t&quot;</span>
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>
+</pre></div>
+</div>
+</section>
+<section id="setting-breakpoints-and-watchpoints">
+<h3>2.2 Setting Breakpoints and Watchpoints<a class="headerlink" href="#setting-breakpoints-and-watchpoints" title="Permalink to this heading"></a></h3>
+<p>  Setting breakpoints and watchpoints is the most fundamental step in program debugging.</p>
+<ul class="simple">
+<li><p><strong>Setting Breakpoints</strong></p></li>
+</ul>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">break</span></code> or <code class="docutils literal notranslate"><span class="pre">b</span></code> command to set a breakpoint.</p>
+<p>  Regarding the usage of <code class="docutils literal notranslate"><span class="pre">break</span></code> or <code class="docutils literal notranslate"><span class="pre">b</span></code> commands:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>b<span class="w"> </span>&lt;line_number&gt;<span class="w"> </span><span class="c1">#在当前活动源文件的相应行号打断点</span>
+
+b<span class="w"> </span>&lt;file&gt;:&lt;line_number&gt;<span class="w"> </span><span class="c1">#在对应文件的相应行号打断点</span>
+
+b<span class="w"> </span>&lt;function_name&gt;<span class="w"> </span><span class="c1">#为一个命名函数打断点</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong>Setting Watchpoints</strong></p></li>
+</ul>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">watch</span></code> command to set a watchpoint.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>watch<span class="w"> </span>&lt;variable&gt;<span class="w"> </span><span class="c1"># 设置对特定变量的监视点,将在特定变量发生变化的时候触发断点</span>
+
+watch<span class="w"> </span>&lt;expression&gt;<span class="w"> </span><span class="c1"># 设置对特定表达式的监视点，比如watch *(int*)0x12345678会在内存地址0x12345678处</span>
+<span class="w">                   </span><span class="c1"># 的整数值发生更改时触发断点。</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong>Managing Breakpoints and Watchpoints</strong></p></li>
+</ul>
+<p>  Once we have set breakpoints, how can we view all the breakpoint information?</p>
+<p>  You can use <code class="docutils literal notranslate"><span class="pre">info</span> <span class="pre">b</span></code>, <code class="docutils literal notranslate"><span class="pre">info</span> <span class="pre">break</span></code>, or <code class="docutils literal notranslate"><span class="pre">info</span> <span class="pre">breakpoints</span></code> to view all breakpoint information:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>b<span class="w"> </span><span class="m">309</span>
+Breakpoint<span class="w"> </span><span class="m">12</span><span class="w"> </span>at<span class="w"> </span>0xffff8000001f8f16:<span class="w"> </span>file<span class="w"> </span>/home/heyicong/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/thingbuf-0.1.4/src/lib.rs,<span class="w"> </span>line<span class="w"> </span><span class="m">315</span>.
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>watch<span class="w"> </span>slots
+Watchpoint<span class="w"> </span><span class="m">13</span>:<span class="w"> </span>slots
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>info<span class="w"> </span>b
+Num<span class="w">     </span>Type<span class="w">           </span>Disp<span class="w"> </span>Enb<span class="w"> </span>Address<span class="w">            </span>What
+<span class="m">12</span><span class="w">      </span>breakpoint<span class="w">     </span>keep<span class="w"> </span>y<span class="w">   </span>0xffff8000001f8f16<span class="w"> </span><span class="k">in</span><span class="w"> </span>thingbuf::Core::pop_ref&lt;u8&gt;<span class="w"> </span>
+<span class="w">                                                   </span>at<span class="w"> </span>/home/heyicong/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/thingbuf-0.1.4/src/lib.rs:315
+<span class="m">13</span><span class="w">      </span>watchpoint<span class="w">     </span>keep<span class="w"> </span>y<span class="w">                      </span>slots
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>
+</pre></div>
+</div>
+<p>  In the above information, the breakpoint with number 12 is the one we set in line 309 of the active source file. If its <code class="docutils literal notranslate"><span class="pre">Address</span></code> is <code class="docutils literal notranslate"><span class="pre">&lt;MULTIPLE&gt;</span></code>, it indicates that there are identical breakpoints at multiple addresses. This is very common in loops. The breakpoint with number 13 is the watchpoint we set for the <code class="docutils literal notranslate"><span class="pre">slots</span></code> variable.</p>
+<p>  We can perform operations on breakpoints or watchpoints using the following commands:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>delete<span class="w"> </span>&lt;breakpoint#&gt;<span class="w"> </span><span class="c1"># 或 d &lt;breakpoint#&gt; 删除对应编号的断点，在您不再需要使用这个断点的时候可以通过此命令删除断点</span>
+delete<span class="w"> </span>&lt;watchpoint#&gt;<span class="w"> </span><span class="c1"># 或 d &lt;watchpoint##&gt; 删除对应编号的监视点，在您不再需要使用这个监视点的时候可以通过此命令删除监视点</span>
+
+disable<span class="w"> </span>&lt;breakpoint#&gt;<span class="w"> </span><span class="c1"># 禁用对应编号的断点，这适合于您只是暂时不需要使用这个断点时使用，当您禁用一个断点，下</span>
+<span class="w">                      </span><span class="c1"># 次程序运行到该断点处将不会停下来</span>
+disable<span class="w"> </span>&lt;watchpoint#&gt;<span class="w"> </span><span class="c1"># 禁用对应编号的监视点，这适合于您只是暂时不需要使用这个监视点时使用</span>
+
+<span class="nb">enable</span><span class="w"> </span>&lt;breakpoint#&gt;<span class="w"> </span><span class="c1"># 启用对应编号的断点</span>
+<span class="nb">enable</span><span class="w"> </span>&lt;watchpoint#&gt;<span class="w"> </span><span class="c1"># 启用对应编号的监视点</span>
+
+<span class="c1">#clear命令</span>
+clear<span class="w"> </span><span class="c1"># 清除当前活动源文件的断点以及监视点</span>
+clear<span class="w"> </span>&lt;point_number&gt;<span class="w"> </span><span class="c1"># 清除对应编号的所有断点或监视点，这与delete行为是一致的</span>
+clear<span class="w"> </span>&lt;file&gt;<span class="w"> </span><span class="c1"># 清除指定文件的所有断点与监视点</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="viewing-variables-and-memory">
+<h2>2.3 Viewing Variables and Memory<a class="headerlink" href="#viewing-variables-and-memory" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>print and display</strong></p></li>
+</ul>
+<p>  You can use <code class="docutils literal notranslate"><span class="pre">print</span></code> or <code class="docutils literal notranslate"><span class="pre">p</span></code> to print variable values.</p>
+<p>  The <code class="docutils literal notranslate"><span class="pre">print</span></code> command is used to print the value of a variable or expression. It allows you to view the data in the program during debugging.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>print<span class="w"> </span>&lt;variable&gt;<span class="w"> </span><span class="c1"># 打印对应变量名的值，例如：print my_variable 或者 p my_variable</span>
+
+print<span class="w"> </span>&lt;expression&gt;<span class="w"> </span><span class="c1"># 打印合法表达式的值，例如：print a+b 或者 p a+b</span>
+
+<span class="c1"># 示例输出</span>
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>print<span class="w"> </span>order
+<span class="nv">$3</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>core::sync::atomic::Ordering::SeqCst
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>如果您不仅想打印值，还想显示更多详细信息（例如类型信息），可以使用ptype命令。</p>
+</div>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">display</span></code> command to continuously track variables or expressions. The <code class="docutils literal notranslate"><span class="pre">display</span></code> command is used to set expressions that need to be tracked and displayed every time the program stops. It is similar to the print command, but unlike print, the display command automatically prints the value of the specified expression every time the program stops, without requiring manual input of a command.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>display<span class="w"> </span>&lt;variable&gt;<span class="w"> </span><span class="c1"># 打印对应变量名的值，例如：display my_variable</span>
+
+display<span class="w"> </span>&lt;expression&gt;<span class="w"> </span><span class="c1"># 打印合法表达式的值，例如：display a+b</span>
+
+<span class="c1"># 示例输出</span>
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>display<span class="w"> </span>order
+<span class="m">1</span>:<span class="w"> </span><span class="nv">order</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>core::sync::atomic::Ordering::SeqCst<span class="w"> </span><span class="c1">#其中1表示display编号，</span>
+<span class="w">                                                </span><span class="c1">#您可以通过info display命令来查看所有display编号</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>一旦您设置了display命令，每当程序停止（例如，在断点处停止）时，GDB将自动打印指定表达式的值。</p>
+<p>display命令非常有用，因为它允许您在调试过程中持续监视表达式的值，而无需每次都手动输入print命令。它特别适用于那些您希望持续跟踪的变量或表达式。</p>
+</div>
+<p>  <strong>To cancel an already set display command and stop automatically displaying the value of an expression, you can use the undisplay command:</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>undisplay<span class="w"> </span>&lt;display编号&gt;<span class="w"> </span><span class="c1"># 如果不指定&lt;display编号&gt;，则将取消所有已设置的display命令，</span>
+<span class="w">                       </span><span class="c1"># 您可以通过info display命令来查看所有display编号</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>请注意，print和display命令只会在程序暂停执行时评估变量或表达式的值。如果程序正在运行，您需要通过设置断点或使用其他调试命令来暂停程序，然后才能使用print命令查看数据的值,display命令设置的值将会在程序暂停时自动输出。</p>
+</div>
+<ul class="simple">
+<li><p><strong>Output Format</strong></p></li>
+</ul>
+<p>  You can set the output format to get more information you need, for example: <code class="docutils literal notranslate"><span class="pre">print</span> <span class="pre">/a</span> <span class="pre">var</span></code></p>
+<blockquote>
+<div><p>Refer to <a class="reference external" href="https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf">GDB Cheat Sheet</a></p>
+</div></blockquote>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>Format
+a<span class="w"> </span>Pointer.
+c<span class="w"> </span>Read<span class="w"> </span>as<span class="w"> </span>integer,<span class="w"> </span>print<span class="w"> </span>as<span class="w"> </span>character.
+d<span class="w"> </span>Integer,<span class="w"> </span>signed<span class="w"> </span>decimal.
+f<span class="w"> </span>Floating<span class="w"> </span>point<span class="w"> </span>number.
+o<span class="w"> </span>Integer,<span class="w"> </span>print<span class="w"> </span>as<span class="w"> </span>octal.
+s<span class="w"> </span>Try<span class="w"> </span>to<span class="w"> </span>treat<span class="w"> </span>as<span class="w"> </span>C<span class="w"> </span>string.
+t<span class="w"> </span>Integer,<span class="w"> </span>print<span class="w"> </span>as<span class="w"> </span>binary<span class="w"> </span><span class="o">(</span><span class="nv">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>„two“<span class="o">)</span>.
+u<span class="w"> </span>Integer,<span class="w"> </span>unsigned<span class="w"> </span>decimal.
+x<span class="w"> </span>Integer,<span class="w"> </span>print<span class="w"> </span>as<span class="w"> </span>hexadecimal.
+</pre></div>
+</div>
+<section id="viewing-the-call-stack">
+<h3>2.4 Viewing the Call Stack<a class="headerlink" href="#viewing-the-call-stack" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Viewing the Call Stack</strong></p></li>
+</ul>
+<p>  When the program is paused at a breakpoint, how should you trace the program’s behavior?</p>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">backtarce</span></code> command to view the call stack. The <code class="docutils literal notranslate"><span class="pre">backtrace</span></code> command is used to print the backtrace information of the current call stack. It displays all the active function call chains during program execution, including the function names, parameters, and line numbers in the source files.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># 示例输出</span>
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>backtrace<span class="w"> </span>
+<span class="c1">#0  function1 (arg1=10, arg2=20) at file1.c:15</span>
+<span class="c1">#1  function2 () at file2.c:25</span>
+<span class="c1">#2  xx () at xx.c:8</span>
+</pre></div>
+</div>
+<p>  Each line of backtrace information starts with #&lt;frame_number&gt;, indicating the frame number. Then comes the function name and parameter list, followed by the source file name and line number.
+By viewing the backtrace information, you can understand in which functions the program is executing and the position of each function in the call stack. This is very useful for debugging the program and locating problems.</p>
+<ul class="simple">
+<li><p><strong>Switching the Stack</strong></p></li>
+</ul>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">frame</span></code> or <code class="docutils literal notranslate"><span class="pre">f</span></code> command to switch to the corresponding stack frame to get more information and perform operations.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>frame<span class="w"> </span>&lt;frame_number&gt;
+f<span class="w"> </span>&lt;frame_number&gt;
+</pre></div>
+</div>
+<p>  In addition to simply executing the backtrace command, you can also use some options to customize the output of the backtrace information. For example:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>backtrace<span class="w"> </span>full<span class="w">                          </span><span class="c1">#显示完整的符号信息，包括函数参数和局部变量。</span>
+backtrace<span class="w"> </span>&lt;frame_count&gt;<span class="w">                 </span><span class="c1">#限制回溯信息的帧数，只显示指定数量的帧。</span>
+backtrace<span class="w"> </span>&lt;frame_start&gt;-&lt;frame_end&gt;<span class="w">     </span><span class="c1">#指定要显示的帧范围。</span>
+backtrace<span class="w"> </span>thread<span class="w"> </span>&lt;thread_id&gt;<span class="w">            </span><span class="c1">#显示指定线程的回溯信息。</span>
+</pre></div>
+</div>
+</section>
+<section id="multi-core">
+<h3>2.5 Multi-core<a class="headerlink" href="#multi-core" title="Permalink to this heading"></a></h3>
+<p>  When debugging the kernel, you may need to view the running status of each core.</p>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">info</span> <span class="pre">threads</span></code> command to view the running status of each core.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>info<span class="w"> </span>threads<span class="w"> </span>
+<span class="w">  </span>Id<span class="w">   </span>Target<span class="w"> </span>Id<span class="w">                    </span>Frame<span class="w"> </span>
+<span class="w">  </span><span class="m">1</span><span class="w">    </span>Thread<span class="w"> </span><span class="m">1</span>.1<span class="w"> </span><span class="o">(</span>CPU#0<span class="w"> </span><span class="o">[</span>halted<span class="w"> </span><span class="o">])</span><span class="w"> </span>0xffff800000140a3e<span class="w"> </span><span class="k">in</span><span class="w"> </span>Start_Kernel<span class="w"> </span><span class="o">()</span><span class="w"> </span>at<span class="w"> </span>main.c:227
+*<span class="w"> </span><span class="m">2</span><span class="w">    </span>Thread<span class="w"> </span><span class="m">1</span>.2<span class="w"> </span><span class="o">(</span>CPU#1<span class="w"> </span><span class="o">[</span>running<span class="o">])</span><span class="w"> </span>thingbuf::Core::pop_ref&lt;u8&gt;<span class="w"> </span><span class="o">()</span>
+<span class="w">    </span>at<span class="w"> </span>/home/heyicong/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-df7c3c540f42cdbd/thingbuf-0.1.4/src/lib.rs:315
+<span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>
+</pre></div>
+</div>
+<p>  You can use the <code class="docutils literal notranslate"><span class="pre">thread</span> <span class="pre">&lt;thread_id&gt;</span></code> command to switch to the context of a specific core to view and debug the status of that core. For example:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">(</span>gdb<span class="o">)</span><span class="w"> </span>thread<span class="w"> </span><span class="m">1</span>
+<span class="o">[</span>Switching<span class="w"> </span>to<span class="w"> </span>thread<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="o">(</span>Thread<span class="w"> </span><span class="m">1</span>.1<span class="o">)]</span>
+<span class="c1">#0  0xffff800000140a3e in Start_Kernel () at main.c:227</span>
+<span class="m">227</span><span class="w">                 </span>hlt<span class="o">()</span><span class="p">;</span>
+</pre></div>
+</div>
+</section>
+<section id="more">
+<h3>2.6 More<a class="headerlink" href="#more" title="Permalink to this heading"></a></h3>
+<p>  Next, I will introduce more commands that you may find useful during debugging:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>step<span class="w">                </span><span class="c1">#或者s,逐行执行程序，并进入到函数调用中。可以在step命令后加执行次数，例：step 3 表示要连续执行3个步骤</span>
+step<span class="w"> </span>&lt;<span class="k">function</span>&gt;<span class="w">     </span><span class="c1">#进入指定的函数，并停止在函数内的第一行。</span>
+
+next<span class="w">                </span><span class="c1">#或者n,逐行执行程序，但跳过函数调用，直接执行函数调用后的下一行代码。</span>
+<span class="w">                    </span><span class="c1">#它允许你在不进入函数内部的情况下执行代码，从而快速跳过函数调用的细节。</span>
+<span class="w">                    </span><span class="c1">#同样，next也可以在命令后加执行次数</span>
+
+finish<span class="w">              </span><span class="c1">#用于从当前函数中一直执行到函数返回为止，并停在调用该函数的地方。</span>
+<span class="w">                    </span><span class="c1">#它允许你快速执行完当前函数的剩余部分，并返回到调用函数的上下文中。  </span>
+
+<span class="k">continue</span><span class="w">            </span><span class="c1">#用于继续程序的执行，直到遇到下一个断点或</span>
+<span class="w">                    </span><span class="c1">#程序正常结束或者程序暂停。 </span>
+
+quit<span class="w">                </span><span class="c1">#退出调试                    </span>
+
+list<span class="w">                            </span><span class="c1">#或者l，显示当前活动源文件源代码的片段，以及当前执行的位置。</span>
+list<span class="w"> </span>&lt;filename&gt;:&lt;<span class="k">function</span>&gt;<span class="w">      </span><span class="c1">#显示&lt;filename&gt;文件里面的&lt;funtion&gt;函数的源代码片段</span>
+list<span class="w"> </span>&lt;filename&gt;:&lt;line_number&gt;<span class="w">   </span><span class="c1">#显示&lt;filename&gt;文件里面的&lt;line_number&gt;附近的源代码片段</span>
+list<span class="w"> </span>&lt;first&gt;,&lt;last&gt;<span class="w">             </span><span class="c1">#显示当前活动源文件的&lt;first&gt;至&lt;last&gt;之间的源代码片段</span>
+<span class="nb">set</span><span class="w"> </span>listsize<span class="w"> </span>&lt;count&gt;<span class="w">            </span><span class="c1">#设置list命令显示的源代码行数。默认情况下，list命令显示当前行和其周围的几行代码。</span>
+
+info<span class="w"> </span>args<span class="w">                       </span><span class="c1">#显示当前函数的参数及其值</span>
+info<span class="w"> </span>breakpoints<span class="w">                </span><span class="c1">#显示断点以及监视点信息</span>
+info<span class="w"> </span>display<span class="w">                    </span><span class="c1">#显示当前设置的display列表</span>
+info<span class="w"> </span>locals<span class="w">                     </span><span class="c1">#显示当前函数/栈帧中的局部变量及其值</span>
+info<span class="w"> </span>sharedlibrary<span class="w">              </span><span class="c1">#显示当前已加载的共享库（shared library）信息</span>
+info<span class="w"> </span>signals<span class="w">                    </span><span class="c1">#显示当前程序所支持的信号信息。它可以列出程序可以接收和处理的不同信号的列表。</span>
+info<span class="w"> </span>threads<span class="w">                    </span><span class="c1">#显示各个核心/线程信息，它可以列出当前正在运行的核心/线程以及它们的状态。</span>
+
+show<span class="w"> </span>directories<span class="w">                </span><span class="c1">#显示当前源代码文件的搜索路径列表。这些搜索路径决定了GDB在查找源代码文件时的搜索范围。</span>
+show<span class="w"> </span>listsize<span class="w">                   </span><span class="c1">#显示打印源代码时的上下文行数。它确定了在使用list命令（或其简写形式l）时显示的源代码行数。</span>
+
+whatis<span class="w"> </span>variable_name<span class="w">            </span><span class="c1">#查看给定变量或表达式的类型信息。它可以帮助你了解变量的数据类型。</span>
+ptype<span class="w">                           </span><span class="c1">#显示给定类型或变量的详细类型信息。它可以帮助你了解类型的结构和成员。</span>
+<span class="w">                                </span><span class="c1">#相较于whatis命令，ptype命令更加详细。</span>
+
+<span class="nb">set</span><span class="w"> </span>var<span class="w"> </span>&lt;variable_name&gt;<span class="o">=</span>&lt;value&gt;<span class="w"> </span><span class="c1">#设置变量值</span>
+
+<span class="k">return</span><span class="w"> </span>&lt;expression&gt;<span class="w">             </span><span class="c1">#强制使当前函数返回设定值                                                  </span>
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Permalink to this heading"></a></h2>
+<p>  Now, you can use rust-gdb to debug the DragonOS kernel code.</p>
+<blockquote>
+<div><p>You can refer to the GDB command documentation for more help: <a class="reference external" href="https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf">GDB Cheat Sheet</a></p>
+</div></blockquote>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="traceback.html" class="btn btn-neutral float-left" title="Kernel Stack Traceback" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="profiling-kernel-with-dadk.html" class="btn btn-neutral float-right" title="Performance Analysis of the Kernel Using DADK" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/kernel/debug/debug-kernel-with-gdb.html">V0.2.0</a></dd>
+      <dd><a href="debug-kernel-with-gdb.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/debug/debug-kernel-with-gdb.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/debug/debug-kernel-with-gdb.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

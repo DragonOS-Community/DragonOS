@@ -1,28 +1,41 @@
-use core::{hint::spin_loop, sync::atomic::Ordering};
+use core::sync::atomic::Ordering;
 
-use alloc::{string::ToString, sync::Arc};
+use crate::filesystem::fsnotify::{self, FsEvent};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use log::{error, info, warn};
 use system_error::SystemError;
 
 use crate::libs::casting::DowncastArc;
 use crate::{
-    define_event_trace,
     driver::base::block::{gendisk::GenDisk, manager::block_dev_manager},
     filesystem::{
         devfs::devfs_init,
         devpts::devpts_init,
-        ext4::filesystem::Ext4FileSystem,
+        ext4::filesystem::{Ext4DaxMode, Ext4ErrorsBehavior, Ext4FileSystem, Ext4MountOptions},
         fat::fs::FATFileSystem,
         procfs::procfs_init,
         sysfs::sysfs_init,
         vfs::{
-            permission::PermissionMask, AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode,
-            MountFS,
+            file::{File, FileMode, FilePrivateData},
+            mount::{MountFSInode, MountFlags, MOUNT_LIFECYCLE_LOCK},
+            permission::PermissionMask,
+            AtomicInodeId, FileSystem, FileType, InodeFlags, InodeMode, Metadata, MountFS,
+            OpenTruncateContext, SetMetadataMask,
         },
     },
-    mm::truncate::truncate_inode_pages,
-    process::{cred::CAPFlags, namespace::mnt::mnt_namespace_init, ProcessManager},
+    init::cmdline::kenrel_cmdline_param_manager,
+    ipc::kill::send_signal_to_pid,
+    libs::mutex::MutexGuard,
+    process::{
+        cred::{CAPFlags, Cred},
+        namespace::mnt::{mnt_namespace_init, RootMountAttachment},
+        resource::RLimitID,
+        ProcessManager,
+    },
+    unsafe_define_event_trace,
 };
+
+use crate::arch::ipc::signal::Signal;
 
 use super::{
     stat::LookUpFlags,
@@ -40,6 +53,10 @@ const ROOTFS_TRY_LIST: [&str; 6] = [
     "/dev/sdio1",
 ];
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
+kernel_cmdline_param_arg!(ROOTFS_RO_PARAM, ro, false, false);
+kernel_cmdline_param_arg!(ROOTFS_RW_PARAM, rw, false, false);
+kernel_cmdline_param_kv!(ROOTFS_TYPE_PARAM, rootfstype, "");
+kernel_cmdline_param_kv!(ROOTFS_FLAGS_PARAM, rootflags, "");
 
 /// @brief 原子地生成新的Inode号。
 /// 请注意，所有的inode号都需要通过该函数来生成.全局的inode号，除了以下两个特殊的以外，都是唯一的
@@ -79,21 +96,38 @@ pub fn vfs_init() -> Result<(), SystemError> {
 
 /// @brief 迁移伪文件系统的inode
 /// 请注意，为了避免删掉了伪文件系统内的信息，因此没有在原root inode那里调用unlink.
-fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemError> {
+fn migrate_virtual_filesystem(
+    new_fs: Arc<dyn FileSystem>,
+    root_mount_flags: MountFlags,
+    root_attachment: RootMountAttachment,
+) -> Result<(), SystemError> {
     info!("VFS: Migrating filesystems...");
 
     let current_mntns = ProcessManager::current_mntns();
     let old_root_inode = current_mntns.root_inode();
-    let old_mntfs = current_mntns.root_mntfs().clone();
+    let old_mntfs = current_mntns.root_mntfs();
+    assert!(
+        old_mntfs.propagation().is_private(),
+        "the boot root must remain private until rootfs migration"
+    );
     let new_fs = MountFS::new(
         new_fs,
         None,
         None,
-        old_mntfs.propagation(),
+        crate::process::namespace::propagation::MountPropagation::new_private(),
         Some(&current_mntns),
-        old_mntfs.mount_flags(),
+        root_mount_flags,
         old_mntfs.mount_source(),
-    );
+    )?;
+
+    // Normal inode mutations require a live mount to retain their writer pin.
+    // Activate the initialized replacement before creating missing mountpoints;
+    // this does not publish it as the namespace root. Do not retain the topology
+    // lock across mkdir/mount_from, which acquire their own lifecycle guards.
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        new_fs.activate()?;
+    }
 
     // 获取新的根文件系统的根节点的引用
     let new_root_inode = new_fs.root_inode();
@@ -116,8 +150,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
         .mount_from(old_root_inode.find("sys").expect("sys not mounted!"))
         .expect("Failed to migrate filesystem of sys");
 
-    unsafe {
-        current_mntns.force_change_root_mountfs(new_fs);
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        current_mntns.force_change_root_mountfs(new_fs, root_attachment);
     }
 
     // 换根后需要同步更新“当前进程”的 fs root/pwd。
@@ -125,9 +160,9 @@ fn migrate_virtual_filesystem(new_fs: Arc<dyn FileSystem>) -> Result<(), SystemE
     // 以及 init stdio 的 /dev/hvc0 查找都会仍在旧 root 上执行，导致找不到设备节点。
     let new_root_inode = current_mntns.root_inode();
     let pcb = ProcessManager::current_pcb();
-    pcb.fs_struct_mut().set_root(new_root_inode.clone());
+    pcb.fs_struct().set_root(new_root_inode.clone());
     // init 通常 cwd 为 "/"，将 pwd 同步到新根，避免落在旧根造成后续语义混乱
-    pcb.fs_struct_mut().set_pwd(new_root_inode.clone());
+    pcb.fs_struct().set_pwd(new_root_inode.clone());
 
     // WARNING: mount devpts after devfs has been mounted,
     devpts_init().expect("Failed to initialize devpts");
@@ -151,6 +186,190 @@ enum RootFsKind {
     Fat,
 }
 
+impl RootFsKind {
+    fn from_cmdline_name(name: &str) -> Option<Self> {
+        match name {
+            "ext4" => Some(Self::Ext4),
+            "fat" | "vfat" => Some(Self::Fat),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ext4 => "ext4",
+            Self::Fat => "fat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootMountMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootMountOptions {
+    mount_flags: MountFlags,
+    ext4_options: Ext4MountOptions,
+}
+
+impl RootMountOptions {
+    fn has_ext4_specific_options(&self) -> bool {
+        self.ext4_options != Ext4MountOptions::default()
+    }
+}
+
+fn root_mount_mode() -> RootMountMode {
+    if ROOTFS_RO_PARAM.was_supplied() && ROOTFS_RW_PARAM.was_supplied() {
+        warn!("rootfs: both ro and rw are supplied; using the last pre-`--` option");
+    }
+
+    match kenrel_cmdline_param_manager()
+        .last_bare_option_before_init_args(&["ro", "rw"])
+        .as_deref()
+    {
+        Some("rw") => RootMountMode::ReadWrite,
+        _ => RootMountMode::ReadOnly,
+    }
+}
+
+fn rootfstype_candidates() -> Result<Vec<RootFsKind>, SystemError> {
+    let Some(rootfstype) = ROOTFS_TYPE_PARAM.value_str() else {
+        return Ok(Vec::new());
+    };
+    if rootfstype.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    for name in rootfstype
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let Some(kind) = RootFsKind::from_cmdline_name(name) else {
+            error!("rootfs: unsupported rootfstype '{}'", name);
+            return Err(SystemError::EINVAL);
+        };
+        result.push(kind);
+    }
+
+    if result.is_empty() {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(result)
+}
+
+fn parse_ext4_dax_option(opt: &str) -> Result<Ext4DaxMode, SystemError> {
+    match opt {
+        "dax" | "dax=always" => Ok(Ext4DaxMode::Always),
+        "dax=inode" => Ok(Ext4DaxMode::Inode),
+        "dax=never" => Ok(Ext4DaxMode::Never),
+        _ => Err(SystemError::EINVAL),
+    }
+}
+
+fn parse_ext4_errors_option(value: &str) -> Result<Ext4ErrorsBehavior, SystemError> {
+    match value {
+        "continue" => Ok(Ext4ErrorsBehavior::Continue),
+        "remount-ro" => Ok(Ext4ErrorsBehavior::RemountRo),
+        "panic" => Ok(Ext4ErrorsBehavior::Panic),
+        _ => Err(SystemError::EINVAL),
+    }
+}
+
+fn apply_common_rootflag(opt: &str, mount_flags: &mut MountFlags) -> bool {
+    match opt {
+        "defaults" => {}
+        "ro" => mount_flags.insert(MountFlags::RDONLY),
+        "rw" => mount_flags.remove(MountFlags::RDONLY),
+        "sync" => mount_flags.insert(MountFlags::SYNCHRONOUS),
+        "async" => mount_flags.remove(MountFlags::SYNCHRONOUS),
+        "dirsync" => mount_flags.insert(MountFlags::DIRSYNC),
+        "lazytime" => mount_flags.insert(MountFlags::LAZYTIME),
+        "nolazytime" => mount_flags.remove(MountFlags::LAZYTIME),
+        "mand" => mount_flags.insert(MountFlags::MANDLOCK),
+        "nomand" => mount_flags.remove(MountFlags::MANDLOCK),
+        "nosuid" => mount_flags.insert(MountFlags::NOSUID),
+        "suid" => mount_flags.remove(MountFlags::NOSUID),
+        "nodev" => mount_flags.insert(MountFlags::NODEV),
+        "dev" => mount_flags.remove(MountFlags::NODEV),
+        "noexec" => mount_flags.insert(MountFlags::NOEXEC),
+        "exec" => mount_flags.remove(MountFlags::NOEXEC),
+        "noatime" => {
+            mount_flags.remove(MountFlags::RELATIME | MountFlags::STRICTATIME);
+            mount_flags.insert(MountFlags::NOATIME);
+        }
+        "atime" | "strictatime" => {
+            mount_flags.remove(MountFlags::RELATIME | MountFlags::NOATIME);
+        }
+        "relatime" => {
+            mount_flags.remove(MountFlags::NOATIME | MountFlags::STRICTATIME);
+            mount_flags.insert(MountFlags::RELATIME);
+        }
+        "nodiratime" => mount_flags.insert(MountFlags::NODIRATIME),
+        "diratime" => mount_flags.remove(MountFlags::NODIRATIME),
+        "nosymfollow" => mount_flags.insert(MountFlags::NOSYMFOLLOW),
+        "symfollow" => mount_flags.remove(MountFlags::NOSYMFOLLOW),
+        "iversion" => mount_flags.insert(MountFlags::I_VERSION),
+        "noiversion" => mount_flags.remove(MountFlags::I_VERSION),
+        _ => return false,
+    }
+    true
+}
+
+fn parse_rootflags(mode: RootMountMode) -> Result<RootMountOptions, SystemError> {
+    let mut mount_flags = match mode {
+        RootMountMode::ReadOnly => MountFlags::RDONLY | MountFlags::RELATIME,
+        RootMountMode::ReadWrite => MountFlags::RELATIME,
+    };
+    let mut ext4_options = Ext4MountOptions::default();
+
+    let Some(rootflags) = ROOTFS_FLAGS_PARAM.value_str() else {
+        return Ok(RootMountOptions {
+            mount_flags,
+            ext4_options,
+        });
+    };
+    if rootflags.is_empty() {
+        return Ok(RootMountOptions {
+            mount_flags,
+            ext4_options,
+        });
+    }
+
+    for opt in rootflags
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if apply_common_rootflag(opt, &mut mount_flags) {
+            continue;
+        }
+
+        match opt {
+            _ if opt == "dax" || opt.starts_with("dax=") => {
+                ext4_options.dax = Some(parse_ext4_dax_option(opt)?);
+            }
+            _ if opt.starts_with("errors=") => {
+                let value = opt.split_once('=').ok_or(SystemError::EINVAL)?.1;
+                ext4_options.errors = parse_ext4_errors_option(value)?;
+            }
+            _ => {
+                error!("rootfs: unsupported rootflags option '{}'", opt);
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+        }
+    }
+
+    Ok(RootMountOptions {
+        mount_flags,
+        ext4_options,
+    })
+}
+
 fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
     match Ext4FileSystem::probe(gendisk) {
         Ok(true) => return Some(RootFsKind::Ext4),
@@ -171,7 +390,10 @@ fn probe_rootfs_kind(gendisk: &Arc<GenDisk>) -> Option<RootFsKind> {
 pub fn mount_root_fs() -> Result<(), SystemError> {
     info!("Try to mount root fs...");
     block_dev_manager().print_gendisks();
-    let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
+    let gendisk = if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM
+        .value_str()
+        .filter(|path| !path.is_empty())
+    {
         try_find_gendisk(rootfs_dev_path)
             .unwrap_or_else(|| panic!("Failed to find rootfs device {}", rootfs_dev_path))
     } else {
@@ -181,40 +403,84 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
             .ok_or(SystemError::ENODEV)?
     };
 
-    let kind = probe_rootfs_kind(&gendisk);
+    let mode = root_mount_mode();
+    let root_options = parse_rootflags(mode)?;
+    let configured_kinds = rootfstype_candidates()?;
+    let probed_kind = if configured_kinds.is_empty() {
+        probe_rootfs_kind(&gendisk)
+    } else {
+        None
+    };
 
-    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match kind {
-        Some(RootFsKind::Ext4) => Ext4FileSystem::from_gendisk(gendisk.clone()),
-        Some(RootFsKind::Fat) => Ok(FATFileSystem::new(gendisk.clone())?),
+    let init_rootfs = |kind: RootFsKind| -> Result<Arc<dyn FileSystem>, SystemError> {
+        match kind {
+            RootFsKind::Ext4 => {
+                let mut ext4_options = root_options.ext4_options;
+                ext4_options.read_only = root_options.mount_flags.contains(MountFlags::RDONLY);
+                Ext4FileSystem::from_gendisk_with_options(gendisk.clone(), ext4_options)
+            }
+            RootFsKind::Fat => {
+                if root_options.has_ext4_specific_options() {
+                    error!("rootfs: ext4-specific rootflags cannot be used with FAT rootfs");
+                    return Err(SystemError::EINVAL);
+                }
+                Ok(FATFileSystem::new(gendisk.clone())?)
+            }
+        }
+    };
+
+    let rootfs: Result<Arc<dyn FileSystem>, SystemError> = match probed_kind {
+        Some(kind) => init_rootfs(kind),
         None => {
-            // 兜底：按常见顺序尝试初始化（ext4 -> fat），便于未来扩展 probe 或处理特殊镜像。
-            Ext4FileSystem::from_gendisk(gendisk.clone()).or_else(|_| {
-                let fat: Arc<FATFileSystem> = FATFileSystem::new(gendisk.clone())?;
-                Ok(fat)
-            })
+            let candidates = if configured_kinds.is_empty() {
+                Vec::from([RootFsKind::Ext4, RootFsKind::Fat])
+            } else {
+                configured_kinds
+            };
+
+            let mut last_err = SystemError::EINVAL;
+            let mut mounted = None;
+            for kind in candidates {
+                match init_rootfs(kind) {
+                    Ok(fs) => {
+                        mounted = Some(fs);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("rootfs: failed to initialize {}: {:?}", kind.name(), e);
+                        last_err = e;
+                    }
+                }
+            }
+            mounted.ok_or(last_err)
         }
     };
 
     let rootfs = match rootfs {
         Ok(fs) => fs,
         Err(e) => {
-            error!("Failed to initialize rootfs filesystem: {:?}", e);
-            loop {
-                spin_loop();
-            }
+            // Linux 语义（VFS: panic("VFS: Unable to mount root fs on ...")）：
+            // 根文件系统挂载失败是致命错误。这里必须把错误向上传递，让
+            // initial_kernel_thread 以带错误码的 panic 终止；不得静默忙转，
+            // 否则一个可诊断的挂载错误会变成“无输出挂死”，且 panic 输出
+            // 路径（含错误码）也会被跳过。
+            return Err(e);
         }
     };
 
     let fs_name = rootfs.name().to_string();
-    let r = migrate_virtual_filesystem(rootfs.clone());
+    let r = migrate_virtual_filesystem(
+        rootfs.clone(),
+        root_options.mount_flags,
+        RootMountAttachment::Attached,
+    );
     if r.is_err() {
         error!(
             "Failed to migrate virtual filesystem to rootfs ({}).",
             fs_name
         );
-        loop {
-            spin_loop();
-        }
+        // 与 Linux 一致：根文件系统就位失败必须显式失败，不能静默忙转。
+        return r;
     }
     info!("Successfully migrate rootfs to {}!", fs_name);
 
@@ -225,20 +491,25 @@ pub fn mount_root_fs() -> Result<(), SystemError> {
 pub fn change_root_fs() -> Result<(), SystemError> {
     info!("Try to change root fs to initramfs...");
     let initramfs = crate::init::initram::INIT_ROOT_INODE().fs();
-    let r = migrate_virtual_filesystem(initramfs);
+    let r = migrate_virtual_filesystem(
+        initramfs,
+        MountFlags::empty(),
+        RootMountAttachment::Unattached,
+    );
 
     if r.is_err() {
         error!("Failed to migrate virtual filesystem to initramfs!");
-        loop {
-            spin_loop();
-        }
+        // 与 mount_root_fs 一致：显式失败，不能静默忙转。
+        return r;
     }
     info!("Successfully migrate rootfs to initramfs!");
 
     return Ok(());
 }
 
-define_event_trace!(
+// SAFETY: this VFS mkdir event is emitted from syscall process context and is
+// not reachable from x86 NMI/MCE handlers.
+unsafe_define_event_trace!(
     do_mkdir_at,
     TP_system(vfs),
     TP_PROTO(path:&str, mode: InodeMode),
@@ -291,8 +562,9 @@ pub fn do_mkdir_at(
         return Err(SystemError::ENAMETOOLONG);
     }
     if let Some(parent) = parent {
-        current_inode =
-            current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        current_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+            current_inode.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
     }
     let parent_md = current_inode.metadata()?;
     // 确保父节点是目录
@@ -328,9 +600,21 @@ pub fn do_mkdir_at(
     }
     let umask = pcb.fs_struct().umask();
     let final_mode = InodeMode::from_bits_truncate(final_mode_bits) & !umask;
-
-    // 执行创建
-    return current_inode.mkdir(name, final_mode);
+    let notify = || {
+        fsnotify::fsnotify(
+            FsEvent::CREATE | FsEvent::ISDIR,
+            Some((&current_inode, name)),
+            None,
+            0,
+        );
+    };
+    if let Some(mounted) = current_inode.clone().downcast_arc::<MountFSInode>() {
+        super::file::File::recover_io(|| mounted.mkdir_with_post_commit(name, final_mode, notify))
+    } else {
+        let inode = super::file::File::recover_io(|| current_inode.mkdir(name, final_mode))?;
+        notify();
+        Ok(inode)
+    }
 }
 
 /// 解析父目录inode
@@ -352,7 +636,9 @@ pub(super) fn resolve_parent_inode(
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     match parent_path {
         None => Ok(inode_begin),
-        Some(path) => inode_begin.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES),
+        Some(path) => crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        }),
     }
 }
 
@@ -406,8 +692,22 @@ pub fn do_remove_dir(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::ENOTDIR);
     }
 
-    // 删除文件夹
-    parent_inode.rmdir(filename)?;
+    let notify = || {
+        // DELETE_SELF is emitted later when the disconnected dentry finally
+        // detaches from the inode.
+        fsnotify::fsnotify(
+            FsEvent::DELETE,
+            Some((&parent_inode, filename)),
+            Some(&target_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
+        super::file::File::recover_io(|| mounted.rmdir_with_post_commit(filename, notify))?;
+    } else {
+        super::file::File::recover_io(|| parent_inode.rmdir(filename))?;
+        notify();
+    }
 
     return Ok(0);
 }
@@ -447,14 +747,23 @@ pub fn do_unlink_at(dirfd: i32, path: &str) -> Result<u64, SystemError> {
         return Err(SystemError::EISDIR);
     }
 
-    // 对目标 inode 执行页缓存清理
-    if let Some(page_cache) = target_inode.page_cache().clone() {
-        truncate_inode_pages(page_cache, 0);
+    let notify = || {
+        // Linux publishes the link-count ATTRIB before the parent DELETE
+        // record. DELETE_SELF remains deferred to final dentry detach.
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&target_inode), 0);
+        fsnotify::fsnotify(
+            FsEvent::DELETE,
+            Some((&parent_inode, filename)),
+            Some(&target_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = parent_inode.clone().downcast_arc::<MountFSInode>() {
+        super::file::File::recover_io(|| mounted.unlink_with_post_commit(filename, notify))?;
+    } else {
+        super::file::File::recover_io(|| parent_inode.unlink(filename))?;
+        notify();
     }
-
-    // 在父目录上执行 unlink 操作
-    parent_inode.unlink(filename)?;
-
     return Ok(0);
 }
 
@@ -465,18 +774,51 @@ pub(super) fn do_file_lookup_at(
 ) -> Result<Arc<dyn IndexNode>, SystemError> {
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dfd, path)?;
     let follow_final = lookup_flags.contains(LookUpFlags::FOLLOW);
-    return inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final);
+    return crate::filesystem::vfs::file::File::recover_io(|| {
+        inode.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
+    });
 }
 
-/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
-/// - 目录返回 EISDIR
-/// - 非普通文件返回 EINVAL
-/// - 只读挂载返回 EROFS
-#[inline(never)]
-pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemError> {
-    let md = inode.metadata()?;
-    let old_size = md.size;
+#[inline]
+pub fn current_file_lock_owner_id() -> u64 {
+    let binding = ProcessManager::current_pcb().fd_table();
+    let fd_table_guard = binding.read();
+    fd_table_guard.lock_owner_id() as u64
+}
 
+#[inline(never)]
+fn vfs_truncate_inner<F>(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+    do_resize: F,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError>
+where
+    F: FnOnce(
+        &Arc<dyn IndexNode>,
+        &Metadata,
+        SetMetadataMask,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError>,
+{
+    let md = inode.metadata()?;
+
+    validate_truncate(&inode, &md, len)?;
+    let _write_access = super::write_access::InodeWriteGuard::writer(inode.clone())?;
+    let (md, mask) = prepare_write_side_effect_metadata(md, len);
+    let applied = do_resize(&inode, &md, mask)?;
+    let mut event = FsEvent::MODIFY;
+    if applied.contains(SetMetadataMask::MODE) {
+        // notify_change emits one combined event for ATTR_SIZE|ATTR_MODE.
+        event |= FsEvent::ATTRIB;
+    }
+    fsnotify::fsnotify_inode(event, &inode);
+    Ok(())
+}
+
+fn validate_truncate(
+    inode: &Arc<dyn IndexNode>,
+    md: &Metadata,
+    len: usize,
+) -> Result<(), SystemError> {
     // 防御性检查：统一拒绝超出 isize::MAX 的长度，避免后续类型转换溢出
     if len > isize::MAX as usize {
         return Err(SystemError::EINVAL);
@@ -513,32 +855,346 @@ pub fn vfs_truncate(inode: Arc<dyn IndexNode>, len: usize) -> Result<(), SystemE
         }
     }
 
-    let result = inode.resize(len);
+    Ok(())
+}
 
-    // Linux 语义：对普通文件进行截断（且确实改变 size）后，若无 CAP_FSETID，清理 suid/sgid。
-    if result.is_ok() && old_size != len as i64 {
-        let cred = ProcessManager::current_pcb().cred();
-        if !cred.has_capability(CAPFlags::CAP_FSETID) {
-            let mut md2 = inode.metadata()?;
-            if md2.file_type == FileType::File
-                && md2.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
-            {
-                md2.mode.remove(InodeMode::S_ISUID);
+pub(crate) fn prepare_write_side_effect_metadata(
+    md: Metadata,
+    new_size: usize,
+) -> (Metadata, SetMetadataMask) {
+    let cred = ProcessManager::current_pcb().cred();
+    prepare_write_side_effect_metadata_with_cred(md, new_size, &cred)
+}
 
-                if should_remove_sgid(md2.mode, md2.gid, &cred) {
-                    md2.mode.remove(InodeMode::S_ISGID);
-                }
+pub(crate) fn prepare_open_truncate(metadata_before_open: Metadata) -> OpenTruncateContext {
+    let (requested, mask) = prepare_write_side_effect_metadata(metadata_before_open, 0);
+    OpenTruncateContext { requested, mask }
+}
 
-                inode.set_metadata(&md2)?;
+/// Complete Linux's post-open truncate stage for an existing regular file.
+/// The open caller holds temporary inode write access across the filesystem
+/// open hook and this stage, including for O_RDONLY | O_TRUNC.
+pub(crate) fn vfs_open_truncate(
+    file: &File,
+    context: &OpenTruncateContext,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    let inode = file.inode();
+    validate_truncate(&inode, &context.requested, 0)?;
+    let applied = inode.resize_open_truncate_result(
+        0,
+        current_file_lock_owner_id(),
+        file.private_data.lock(),
+        context,
+    )?;
+    let mut event = FsEvent::MODIFY;
+    if applied.contains(SetMetadataMask::MODE) {
+        event |= FsEvent::ATTRIB;
+    }
+    file.notify_dentry_event(event);
+    Ok(())
+}
+
+/// Derive write-side mode changes from the commit-stage snapshot, not an old
+/// pathname snapshot which could restore bits changed by concurrent chmod.
+pub(crate) fn prepare_backing_resize_metadata(
+    context: &super::permission::InodeOpContext,
+    raw: &Metadata,
+    requested: &Metadata,
+    mut mask: SetMetadataMask,
+    len: usize,
+) -> Result<(Metadata, SetMetadataMask), SystemError> {
+    let view = context.view_metadata(raw);
+    context.validate_size_mapping(&view)?;
+    let mut requested = requested.clone();
+    if mask.contains(SetMetadataMask::WRITE_SIDE_EFFECT) {
+        if let Some(cred) = &context.cred {
+            let (derived, derived_mask) =
+                prepare_write_side_effect_metadata_with_cred(view, len, cred);
+            requested.mode = derived.mode;
+            if mask.contains(SetMetadataMask::MTIME) {
+                requested.mtime = derived.mtime;
             }
+            if mask.contains(SetMetadataMask::CTIME) {
+                requested.ctime = derived.ctime;
+            }
+            mask.remove(SetMetadataMask::MODE);
+            mask |= derived_mask & SetMetadataMask::MODE;
+        }
+        mask.insert(SetMetadataMask::KILL_PRIV);
+    }
+    let mut backing = context.backing_metadata_request(raw, &requested, mask)?;
+    backing.size = len as i64;
+    Ok((backing, mask))
+}
+
+/// Fallocate's internal size update is not a user ATTR_SIZE request. Only
+/// actual mode/capability removal goes through notify_change mapping checks.
+pub(crate) fn prepare_backing_fallocate_metadata(
+    context: &super::permission::InodeOpContext,
+    raw: &Metadata,
+    size: usize,
+    kill_capability: bool,
+) -> Result<(Metadata, SetMetadataMask), SystemError> {
+    let view = context.view_metadata(raw);
+    let cred = context.cred.as_ref().ok_or(SystemError::EINVAL)?;
+    let (requested, mut mask) =
+        prepare_write_side_effect_metadata_with_cred(view.clone(), size, cred);
+    if kill_capability {
+        mask.insert(SetMetadataMask::KILL_PRIV);
+    }
+    if mask.intersects(SetMetadataMask::MODE | SetMetadataMask::KILL_PRIV) {
+        context.validate_setattr_mapping(
+            &view,
+            &view,
+            mask & (SetMetadataMask::MODE | SetMetadataMask::KILL_PRIV),
+        )?;
+    }
+    let mut backing = raw.clone();
+    super::merge_metadata_masked(&mut backing, &requested, mask);
+    backing.size = size as i64;
+    Ok((backing, mask))
+}
+
+pub(crate) fn prepare_write_side_effect_metadata_with_cred(
+    mut md: Metadata,
+    new_size: usize,
+    cred: &Arc<Cred>,
+) -> (Metadata, SetMetadataMask) {
+    let now = crate::time::PosixTimeSpec::now();
+    md.size = new_size as i64;
+    md.mtime = now;
+    md.ctime = now;
+    let mut mask =
+        SetMetadataMask::MTIME | SetMetadataMask::CTIME | SetMetadataMask::WRITE_SIDE_EFFECT;
+
+    if !cred.has_capability_in_ns(
+        &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+        CAPFlags::CAP_FSETID,
+    ) && md.file_type == FileType::File
+        && md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID)
+    {
+        let original_mode = md.mode;
+        md.mode.remove(InodeMode::S_ISUID);
+
+        if md.mode.contains(InodeMode::S_IXGRP)
+            || (should_remove_sgid(md.mode, md.gid, cred)
+                && !cred.has_capability_wrt_inode_uidgid(&md, CAPFlags::CAP_FSETID))
+        {
+            md.mode.remove(InodeMode::S_ISGID);
+        }
+
+        if md.mode != original_mode {
+            mask.insert(SetMetadataMask::MODE);
+        }
+    }
+    (md, mask)
+}
+
+/// 统一的 VFS 截断封装：对 inode 进行基本检查并调用 resize
+/// - 目录返回 EISDIR
+/// - 非普通文件返回 EINVAL
+/// - 只读挂载返回 EROFS
+#[inline(never)]
+pub fn vfs_truncate(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    let lock_owner = current_file_lock_owner_id();
+    vfs_truncate_inner(inode, len, |inode, metadata, mask| {
+        inode.resize_with_metadata_result(len, lock_owner, metadata, mask)
+    })
+}
+
+/// 基于已打开文件执行 VFS 截断，保留公共检查，并把 fd 私有数据传给文件系统。
+#[inline(never)]
+pub fn vfs_truncate_file<'a>(
+    inode: Arc<dyn IndexNode>,
+    len: usize,
+    lock_owner: u64,
+    data: impl FnOnce() -> MutexGuard<'a, FilePrivateData>,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    vfs_truncate_inner(inode, len, |inode, metadata, mask| {
+        inode.resize_file_with_metadata_result(len, lock_owner, data(), metadata, mask)
+    })
+}
+
+pub fn check_file_size_limit(new_size: usize) -> Result<(), SystemError> {
+    let current_pcb = ProcessManager::current_pcb();
+    let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
+    if fsize_limit.rlim_cur != u64::MAX && new_size as u64 > fsize_limit.rlim_cur {
+        let _ = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ);
+        return Err(SystemError::EFBIG);
+    }
+    Ok(())
+}
+
+/// Generic resize-backed `fallocate(mode=0)` for real local regular files.
+///
+/// This helper provides DragonOS' compatibility guarantee that mode=0 makes the
+/// file size at least `offset + len`. It is intentionally opt-in: pseudo
+/// filesystems and protocol filesystems must keep returning EOPNOTSUPP or
+/// provide their own fallocate implementation.
+pub fn resize_based_fallocate(
+    inode: &dyn IndexNode,
+    mode: i32,
+    offset: usize,
+    len: usize,
+    lock_owner: u64,
+    attrib: &mut super::AttribStageObserver<'_>,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    resize_based_fallocate_with_context(
+        inode,
+        mode,
+        offset,
+        len,
+        lock_owner,
+        attrib,
+        &super::permission::InodeOpContext::legacy(),
+    )
+}
+
+pub fn resize_based_fallocate_with_context(
+    inode: &dyn IndexNode,
+    mode: i32,
+    offset: usize,
+    len: usize,
+    lock_owner: u64,
+    attrib: &mut super::AttribStageObserver<'_>,
+    context: &super::permission::InodeOpContext,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    if mode != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+
+    if len == 0 {
+        return Err(SystemError::EINVAL.into());
+    }
+
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG.into());
+    }
+
+    let md = inode.metadata()?;
+    if md.file_type != FileType::File {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+
+    // The filesystem re-reads size and metadata inside its native mutation
+    // lock. A VFS snapshot cannot safely decide whether a concurrent grow has
+    // already satisfied the request or which privilege bits remain to clear.
+    let mask =
+        inode.fallocate_resize_atomic_with_inode_context(offset, new_size, lock_owner, context)?;
+    if mask.contains(SetMetadataMask::MODE) {
+        attrib.commit();
+    }
+    Ok(())
+}
+
+/// 基于已打开文件执行 VFS fallocate 公共检查，再分派给具体文件系统。
+#[inline(never)]
+pub fn vfs_fallocate_file(
+    file: Arc<File>,
+    mode: i32,
+    offset: usize,
+    len: usize,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+    const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+    const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+    const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;
+    const FALLOC_FL_SUPPORTED_MASK: u32 = FALLOC_FL_KEEP_SIZE
+        | FALLOC_FL_PUNCH_HOLE
+        | FALLOC_FL_COLLAPSE_RANGE
+        | FALLOC_FL_ZERO_RANGE
+        | FALLOC_FL_INSERT_RANGE
+        | FALLOC_FL_UNSHARE_RANGE;
+
+    if len == 0 || offset > isize::MAX as usize || len > isize::MAX as usize {
+        return Err(SystemError::EINVAL.into());
+    }
+    // VFS-layer s_maxbytes upper-bound guard (aligned with Linux do_fallocate): offset+len must not overflow or exceed isize::MAX.
+    // Each filesystem implementation re-validates on its own, but the VFS layer should not leave a gap.
+    let new_size = offset.checked_add(len).ok_or(SystemError::EFBIG)?;
+    if new_size > isize::MAX as usize {
+        return Err(SystemError::EFBIG.into());
+    }
+
+    let mode_bits = mode as u32;
+    if mode < 0 || (mode_bits & !FALLOC_FL_SUPPORTED_MASK) != 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+    if (mode_bits & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
+        == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+    if (mode_bits & FALLOC_FL_PUNCH_HOLE) != 0 && (mode_bits & FALLOC_FL_KEEP_SIZE) == 0 {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+    if (mode_bits & FALLOC_FL_COLLAPSE_RANGE) != 0 && (mode_bits & !FALLOC_FL_COLLAPSE_RANGE) != 0 {
+        return Err(SystemError::EINVAL.into());
+    }
+    if (mode_bits & FALLOC_FL_INSERT_RANGE) != 0 && (mode_bits & !FALLOC_FL_INSERT_RANGE) != 0 {
+        return Err(SystemError::EINVAL.into());
+    }
+    if (mode_bits & FALLOC_FL_UNSHARE_RANGE) != 0
+        && (mode_bits & !(FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_KEEP_SIZE)) != 0
+    {
+        return Err(SystemError::EINVAL.into());
+    }
+
+    let mode_flags = file.mode();
+    if mode_flags.contains(FileMode::FMODE_PATH) {
+        return Err(SystemError::EBADF.into());
+    }
+    if !mode_flags.contains(FileMode::FMODE_WRITE) || !mode_flags.can_write() {
+        return Err(SystemError::EBADF.into());
+    }
+
+    let inode = file.inode();
+    let md = inode.metadata()?;
+    if md.flags.contains(InodeFlags::S_APPEND) && (mode_bits & !FALLOC_FL_KEEP_SIZE) != 0 {
+        return Err(SystemError::EPERM.into());
+    }
+    if md.flags.contains(InodeFlags::S_IMMUTABLE) {
+        return Err(SystemError::EPERM.into());
+    }
+    if md.flags.contains(InodeFlags::S_SWAPFILE) {
+        return Err(SystemError::ETXTBSY.into());
+    }
+
+    let fs = inode.fs();
+    if let Some(mfs) = fs.clone().downcast_arc::<MountFS>() {
+        if mfs
+            .mount_flags()
+            .contains(crate::filesystem::vfs::mount::MountFlags::RDONLY)
+        {
+            return Err(SystemError::EROFS.into());
         }
     }
 
-    if result.is_ok() && len < old_size as usize {
-        if let Some(page_cache) = inode.page_cache() {
-            page_cache.truncate(len)?;
-        }
+    match md.file_type {
+        FileType::File | FileType::BlockDevice => {}
+        FileType::Dir => return Err(SystemError::EISDIR.into()),
+        FileType::Pipe => return Err(SystemError::ESPIPE.into()),
+        _ => return Err(SystemError::ENODEV.into()),
     }
 
-    result
+    let mut publish_attrib = || file.notify_dentry_event(FsEvent::ATTRIB);
+    let mut attrib = super::AttribStageObserver::new(&mut publish_attrib);
+    let r = inode.fallocate_file(
+        mode,
+        offset,
+        len,
+        current_file_lock_owner_id(),
+        &mut attrib,
+        file.private_data.lock(),
+    );
+    if r.is_ok() {
+        file.notify_fs_event(FsEvent::MODIFY);
+    }
+    r
 }

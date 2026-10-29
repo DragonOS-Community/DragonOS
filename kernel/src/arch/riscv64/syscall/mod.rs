@@ -1,8 +1,12 @@
 /// 系统调用号
 pub mod nr;
+mod sys_rt_sigreturn;
 use system_error::SystemError;
 
-use crate::{exception::InterruptArch, process::ProcessManager, syscall::Syscall};
+use crate::{
+    arch::CurrentSignalArch, exception::InterruptArch, ipc::signal_types::SignalArch,
+    process::ProcessManager, syscall::Syscall,
+};
 
 use super::{interrupt::TrapFrame, CurrentIrqArch};
 
@@ -39,5 +43,7 @@ pub(super) fn syscall_handler(syscall_num: usize, frame: &mut TrapFrame) -> () {
         Syscall::catch_handle(syscall_num, &args, frame)
             .unwrap_or_else(|e| e.to_posix_errno() as usize)
     };
-    syscall_return!(syscall_handle(), frame, false);
+    frame.a0 = syscall_handle();
+    unsafe { CurrentSignalArch::do_signal_or_restart(frame) };
+    syscall_return!(frame.a0, frame, false);
 }

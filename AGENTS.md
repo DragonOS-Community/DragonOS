@@ -43,6 +43,14 @@ DragonOS是一个面向云计算轻量化场景的，完全自主内核的，提
 
 ### 开发时的一些常见命令
 
-- 格式化代码：在项目根目录下运行`make fmt`,会自动格式化，并且运行clippy检查
 - 编译内核：在项目根目录下运行`make kernel`. 当你想检查你编辑的代码有没有语法错误的时候，请执行这个命令
+- Nix开发环境（推荐）：`nix develop`激活环境后可使用上述命令；`nix run .#yolo-x86_64`一键编译+启动QEMU。详见`docs/introduction/develop_nix.md`
 
+
+## WHERE TO LOOK
+
+| 任务 | 位置 | 备注 |
+|------|------|------|
+| 运行 DragonOS | `docs/introduction/develop_nix.md` | Nix 一键启动流程 |
+| OOM Killer | `kernel/src/mm/oom.rs` | 全局状态机，缺页路径触发，详见代码注释 |
+| 进程管理重构后 | `kernel/src/process/state.rs`（ProcessFlags）、`kernel/src/process/manager/exit.rs`（exit路径） | mod.rs 已拆分为子模块 |

@@ -81,8 +81,7 @@ pub(super) fn do_munmap(start_vaddr: VirtAddr, len: usize) -> Result<usize, Syst
     let page_count = PageFrameCount::new(len / MMArch::PAGE_SIZE);
 
     current_address_space
-        .write()
-        .munmap(start_frame, page_count)
+        .munmap_wait(start_frame, page_count)
         .map_err(|_| SystemError::EINVAL)?;
 
     return Ok(0);

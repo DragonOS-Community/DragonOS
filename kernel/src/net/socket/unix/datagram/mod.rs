@@ -1,9 +1,9 @@
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollEventType},
     filesystem::vfs::iov::IoVecs,
     filesystem::vfs::{
         fasync::{FAsyncItems, FASYNC_POLL_IN},
-        utils::DName,
         vcore::generate_inode_id,
         InodeId,
     },
@@ -14,9 +14,13 @@ use crate::{
         posix::MsgHdr,
         socket::{
             self,
-            common::{parse_timeval_opt, write_timeval_opt, EPollItems},
+            common::{
+                parse_timeval_opt, write_i32_getsockopt, write_timeval_opt, write_u32_getsockopt,
+                EPollItems,
+            },
             endpoint::Endpoint,
-            unix::{UnixEndpoint, UnixEndpointBound},
+            recv_buffer::{ReceiveAttempt, RecvBuffer},
+            unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType},
             AddressFamily, Socket, PMSG, PSOCK, PSOL,
         },
     },
@@ -35,7 +39,7 @@ use crate::time::Duration;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     filesystem::vfs::file::File,
-    net::socket::unix::{current_ucred, nobody_ucred, UCred},
+    net::socket::unix::{current_ucred, nobody_ucred, write_peercred_option, PeerCred, UCred},
     process::ProcessManager,
     syscall::user_access::UserBufferReader,
 };
@@ -62,6 +66,15 @@ struct DatagramMessage {
     sender_accounted_len: usize,
 }
 
+/// Identity and lengths of the single record selected by recvmsg.
+struct DatagramRecvMeta {
+    copy_len: usize,
+    orig_len: usize,
+    sender_addr: Option<UnixEndpointBound>,
+    rights: Vec<Arc<File>>,
+    creds: Option<UCred>,
+}
+
 impl DatagramMessage {
     fn new(
         data: Vec<u8>,
@@ -84,9 +97,11 @@ impl DatagramMessage {
 #[derive(Debug)]
 struct Inner {
     /// 本地绑定地址
-    local_addr: Option<UnixEndpointBound>,
+    local_addr: Option<UnixBinding>,
     /// 连接的对端地址（用于 connect 后的 send）
     peer_addr: Option<UnixEndpointBound>,
+    peer_cred: Option<PeerCred>,
+    closed: bool,
     /// 接收队列 - 保存接收到的数据报
     recv_queue: VecDeque<DatagramMessage>,
     /// 接收队列的最大容量（消息数量）
@@ -100,6 +115,8 @@ impl Inner {
         Self {
             local_addr: None,
             peer_addr: None,
+            peer_cred: None,
+            closed: false,
             recv_queue: VecDeque::new(),
             recv_queue_capacity: Self::DEFAULT_RECV_QUEUE_CAPACITY,
         }
@@ -109,27 +126,17 @@ impl Inner {
         &mut self,
         endpoint: UnixEndpoint,
         netns: &Arc<NetNamespace>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.local_addr.is_some() {
-            return endpoint.bind_unnamed();
+            return endpoint.bind_unnamed().map_err(Into::into);
         }
-        let bound_addr = endpoint.bind_in(netns)?;
+        let bound_addr = endpoint.bind_in(netns, UnixSocketType::Datagram)?;
         self.local_addr = Some(bound_addr);
         Ok(())
     }
 
-    fn connect(
-        &mut self,
-        endpoint: UnixEndpoint,
-        netns: &Arc<NetNamespace>,
-    ) -> Result<(), SystemError> {
-        let peer_addr = endpoint.connect_in(netns)?;
-        self.peer_addr = Some(peer_addr);
-        Ok(())
-    }
-
     fn local_endpoint(&self) -> Option<UnixEndpointBound> {
-        self.local_addr.clone()
+        self.local_addr.as_ref().map(UnixBinding::address)
     }
 
     fn peer_endpoint(&self) -> Option<UnixEndpointBound> {
@@ -137,6 +144,9 @@ impl Inner {
     }
 
     fn push_message(&mut self, msg: DatagramMessage) -> Result<(), SystemError> {
+        if self.closed {
+            return Err(SystemError::ECONNREFUSED);
+        }
         if self.recv_queue.len() >= self.recv_queue_capacity {
             return Err(SystemError::ENOBUFS);
         }
@@ -153,102 +163,44 @@ impl Inner {
     }
 }
 
-/// 抽象套接字的键：namespace ID + 抽象名称
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AbstractSocketKey {
-    nsid: usize,
-    name: Arc<[u8]>,
-}
-
-impl AbstractSocketKey {
-    fn new(nsid: usize, name: Arc<[u8]>) -> Self {
-        Self { nsid, name }
-    }
-}
-
-/// 抽象名称绑定的 socket 表
-struct AbstractSocketTable {
-    inner: RwSem<HashMap<AbstractSocketKey, Weak<UnixDatagramSocket>>>,
-}
-
-impl AbstractSocketTable {
-    fn new() -> Self {
-        Self {
-            inner: RwSem::new(HashMap::new()),
-        }
-    }
-
-    fn insert(&self, nsid: usize, name: Arc<[u8]>, socket: Weak<UnixDatagramSocket>) {
-        self.inner
-            .write()
-            .insert(AbstractSocketKey::new(nsid, name), socket);
-    }
-
-    fn remove(&self, nsid: usize, name: Arc<[u8]>) -> Option<Weak<UnixDatagramSocket>> {
-        self.inner
-            .write()
-            .remove(&AbstractSocketKey::new(nsid, name))
-    }
-
-    fn get(&self, nsid: usize, name: Arc<[u8]>) -> Option<Arc<UnixDatagramSocket>> {
-        self.inner
-            .read()
-            .get(&AbstractSocketKey::new(nsid, name))
-            .and_then(Weak::upgrade)
-    }
-}
-
 /// Unix 域数据报 Socket 的绑定表
 /// 用于根据地址查找对应的 socket
 struct BindTable {
-    /// 路径绑定的 socket
-    path_sockets: RwSem<HashMap<DName, Weak<UnixDatagramSocket>>>,
-    /// 抽象名称绑定的 socket
-    abstract_sockets: AbstractSocketTable,
+    sockets: RwSem<HashMap<UnixEndpointBound, Weak<UnixDatagramSocket>>>,
 }
 
 impl BindTable {
     fn new() -> Self {
         Self {
-            path_sockets: RwSem::new(HashMap::new()),
-            abstract_sockets: AbstractSocketTable::new(),
+            sockets: RwSem::new(HashMap::new()),
         }
     }
 
-    fn register(&self, addr: &UnixEndpointBound, socket: &Arc<UnixDatagramSocket>) {
-        match addr {
-            UnixEndpointBound::Path(path) => {
-                self.path_sockets
-                    .write()
-                    .insert(path.clone(), Arc::downgrade(socket));
-            }
-            UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets
-                    .insert(handle.nsid(), handle.name(), Arc::downgrade(socket));
-            }
+    fn register(
+        &self,
+        addr: &UnixEndpointBound,
+        socket: &Arc<UnixDatagramSocket>,
+    ) -> Result<(), SystemError> {
+        let mut sockets = self.sockets.write();
+        if sockets.get(addr).and_then(Weak::upgrade).is_some() {
+            return Err(SystemError::EADDRINUSE);
         }
+        sockets.insert(addr.clone(), Arc::downgrade(socket));
+        Ok(())
     }
 
-    fn unregister(&self, addr: &UnixEndpointBound) {
-        match addr {
-            UnixEndpointBound::Path(path) => {
-                self.path_sockets.write().remove(path);
-            }
-            UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets.remove(handle.nsid(), handle.name());
-            }
+    fn unregister(&self, addr: &UnixEndpointBound, socket: &UnixDatagramSocket) {
+        let mut sockets = self.sockets.write();
+        if sockets
+            .get(addr)
+            .is_some_and(|entry| core::ptr::eq(entry.as_ptr(), socket))
+        {
+            sockets.remove(addr);
         }
     }
 
     fn lookup(&self, addr: &UnixEndpointBound) -> Option<Arc<UnixDatagramSocket>> {
-        match addr {
-            UnixEndpointBound::Path(path) => {
-                self.path_sockets.read().get(path).and_then(Weak::upgrade)
-            }
-            UnixEndpointBound::Abstract(handle) => {
-                self.abstract_sockets.get(handle.nsid(), handle.name())
-            }
-        }
+        self.sockets.read().get(addr).and_then(Weak::upgrade)
     }
 }
 
@@ -269,6 +221,7 @@ pub struct UnixDatagramSocket {
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     netns: Arc<NetNamespace>,
     is_nonblocking: AtomicBool,
     sndbuf: AtomicUsize,
@@ -280,12 +233,20 @@ pub struct UnixDatagramSocket {
     self_weak: Weak<UnixDatagramSocket>,
 
     passcred: AtomicBool,
+    reuse_options: super::UnixReuseOptions,
 
     is_read_shutdown: AtomicBool,
     is_write_shutdown: AtomicBool,
 }
 
 impl UnixDatagramSocket {
+    fn forget_dead_peer(&self, expected: &UnixEndpointBound) {
+        let mut inner = self.inner.lock();
+        if inner.peer_addr.as_ref() == Some(expected) {
+            inner.peer_addr = None;
+        }
+    }
+
     /// 默认的缓冲区大小
     pub const DEFAULT_BUF_SIZE: usize = 64 * 1024;
     pub const MIN_SOCKET_BUF_SIZE: usize = 1024;
@@ -304,6 +265,7 @@ impl UnixDatagramSocket {
             wait_queue: Arc::new(WaitQueue::default()),
             inode_id: generate_inode_id(),
             open_files: AtomicUsize::new(0),
+            fsnotify_watches: AtomicUsize::new(0),
             netns: netns.clone(),
             is_nonblocking: AtomicBool::new(is_nonblocking),
             sndbuf: AtomicUsize::new(Self::DEFAULT_BUF_SIZE),
@@ -315,6 +277,7 @@ impl UnixDatagramSocket {
             self_weak: weak.clone(),
 
             passcred: AtomicBool::new(false),
+            reuse_options: super::UnixReuseOptions::default(),
 
             is_read_shutdown: AtomicBool::new(false),
             is_write_shutdown: AtomicBool::new(false),
@@ -322,43 +285,47 @@ impl UnixDatagramSocket {
     }
 
     /// 创建一对已连接的 Unix 数据报 socket
-    pub fn new_pair(is_nonblocking: bool) -> (Arc<Self>, Arc<Self>) {
+    pub fn new_pair(is_nonblocking: bool) -> Result<(Arc<Self>, Arc<Self>), SystemError> {
         let socket_a = Self::new(is_nonblocking);
         let socket_b = Self::new(is_nonblocking);
+        let peer_cred = PeerCred::current();
 
         let netns = socket_a.netns.clone();
 
         // 为每个 socket 分配一个临时的抽象地址
-        let addr_a = netns
-            .unix_abstract_table()
-            .alloc_ephemeral_abstract_name()
-            .ok();
-        let addr_b = netns
-            .unix_abstract_table()
-            .alloc_ephemeral_abstract_name()
-            .ok();
+        let addr_a = UnixBinding::abstract_name(
+            netns
+                .unix_abstract_table()
+                .alloc_ephemeral_abstract_name(UnixSocketType::Datagram)?,
+        );
+        let addr_b = UnixBinding::abstract_name(
+            netns
+                .unix_abstract_table()
+                .alloc_ephemeral_abstract_name(UnixSocketType::Datagram)?,
+        );
+
+        let peer_a = addr_a.address();
+        let peer_b = addr_b.address();
 
         // 设置本地和对端地址
         {
             let mut inner_a = socket_a.inner.lock();
-            inner_a.local_addr = addr_a.clone().map(UnixEndpointBound::Abstract);
-            inner_a.peer_addr = addr_b.clone().map(UnixEndpointBound::Abstract);
+            inner_a.local_addr = Some(addr_a);
+            inner_a.peer_addr = Some(peer_b.clone());
+            inner_a.peer_cred = Some(peer_cred.clone());
         }
         {
             let mut inner_b = socket_b.inner.lock();
-            inner_b.local_addr = addr_b.clone().map(UnixEndpointBound::Abstract);
-            inner_b.peer_addr = addr_a.clone().map(UnixEndpointBound::Abstract);
+            inner_b.local_addr = Some(addr_b);
+            inner_b.peer_addr = Some(peer_a.clone());
+            inner_b.peer_cred = Some(peer_cred);
         }
 
         // 注册到绑定表
-        if let Some(ref addr) = addr_a {
-            BIND_TABLE.register(&UnixEndpointBound::Abstract(addr.clone()), &socket_a);
-        }
-        if let Some(ref addr) = addr_b {
-            BIND_TABLE.register(&UnixEndpointBound::Abstract(addr.clone()), &socket_b);
-        }
+        BIND_TABLE.register(&peer_a, &socket_a)?;
+        BIND_TABLE.register(&peer_b, &socket_b)?;
 
-        (socket_a, socket_b)
+        Ok((socket_a, socket_b))
     }
 
     pub fn ioctl_fionread(&self) -> usize {
@@ -611,6 +578,54 @@ impl UnixDatagramSocket {
         Ok((copy_len, msg.sender_addr, orig_len))
     }
 
+    /// Admit storage before removing a record. A retry after lock-free buffer
+    /// preparation always selects the current head and its matching metadata.
+    fn try_recvmsg_record(
+        &self,
+        buffer: &mut RecvBuffer,
+        capacity: usize,
+        peek: bool,
+    ) -> Result<ReceiveAttempt<DatagramRecvMeta>, SystemError> {
+        let mut inner = self.inner.lock();
+        let msg = inner
+            .recv_queue
+            .front()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let orig_len = msg.data.len();
+        let copy_len = capacity.min(orig_len);
+        if buffer.capacity() < copy_len {
+            return Ok(ReceiveAttempt::NeedBuffer(copy_len));
+        }
+        if peek {
+            buffer
+                .bytes_mut(copy_len)
+                .copy_from_slice(&msg.data[..copy_len]);
+            return Ok(ReceiveAttempt::Ready(DatagramRecvMeta {
+                copy_len,
+                orig_len,
+                sender_addr: msg.sender_addr.clone(),
+                rights: msg.rights.clone(),
+                creds: msg.creds,
+            }));
+        }
+
+        // Keep the existing short critical section: the owned message remains
+        // valid after dequeue, and sender wakeup must not retain our inner lock.
+        let msg = inner.pop_message().ok_or(SystemError::EIO)?;
+        drop(inner);
+        buffer
+            .bytes_mut(copy_len)
+            .copy_from_slice(&msg.data[..copy_len]);
+        Self::release_sender_accounting(&msg.sender_addr, msg.sender_accounted_len);
+        Ok(ReceiveAttempt::Ready(DatagramRecvMeta {
+            copy_len,
+            orig_len,
+            sender_addr: msg.sender_addr,
+            rights: msg.rights,
+            creds: msg.creds,
+        }))
+    }
+
     fn recv_return_len(copy_len: usize, orig_len: usize, flags: PMSG) -> usize {
         if flags.contains(PMSG::TRUNC) {
             orig_len
@@ -633,6 +648,14 @@ impl UnixDatagramSocket {
 }
 
 impl Socket for UnixDatagramSocket {
+    fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
+        self.netns.clone()
+    }
+
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
     fn open_file_counter(&self) -> &AtomicUsize {
         &self.open_files
     }
@@ -651,27 +674,44 @@ impl Socket for UnixDatagramSocket {
 
     fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-        self.inner.lock().connect(unix_endpoint, &self.netns)
+        let peer_addr = unix_endpoint.connect_in(&self.netns, UnixSocketType::Datagram)?;
+        BIND_TABLE
+            .lookup(&peer_addr)
+            .ok_or(SystemError::ECONNREFUSED)?;
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Err(SystemError::EBADF);
+        }
+        inner.peer_addr = Some(peer_addr);
+        Ok(())
     }
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-
-        // 先绑定地址
-        let (bound_addr, should_register) = {
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let (mut inner, was_unbound) = loop {
+            let candidate = unix_endpoint.clone();
             let mut inner = self.inner.lock();
+            if inner.closed {
+                return Err(SystemError::EBADF);
+            }
             let was_unbound = inner.local_addr.is_none();
-            inner.bind(unix_endpoint, &self.netns)?;
-            (inner.local_addr.clone(), was_unbound)
-        };
-
-        // 注册到绑定表（filesystem / abstract）。
-        // 使用创建时保存的 Weak<Self> 来获取 Arc<Self>。
-        if should_register {
-            if let Some(addr) = bound_addr {
-                if let Some(this) = self.self_weak.upgrade() {
-                    BIND_TABLE.register(&addr, &this);
+            match inner.bind(candidate, &self.netns) {
+                Ok(()) => break (inner, was_unbound),
+                Err(error) => {
+                    drop(inner);
+                    error.recover(&mut recovery)?;
                 }
+            }
+        };
+        if was_unbound {
+            let addr = inner.local_endpoint().ok_or(SystemError::EINVAL)?;
+            let this = self.self_weak.upgrade().ok_or(SystemError::EBADF)?;
+            if let Err(error) = BIND_TABLE.register(&addr, &this) {
+                let retired = inner.local_addr.take();
+                drop(inner);
+                drop(retired);
+                return Err(error);
             }
         }
 
@@ -697,6 +737,9 @@ impl Socket for UnixDatagramSocket {
             .map_err(|_| SystemError::ENOPROTOOPT)?;
 
         match opt {
+            crate::net::socket::PSO::REUSEADDR | crate::net::socket::PSO::REUSEPORT => {
+                self.reuse_options.set(opt, optval)
+            }
             crate::net::socket::PSO::SNDBUF | crate::net::socket::PSO::SNDBUFFORCE => {
                 let requested = Self::parse_u32_opt(optval)? as usize;
                 let new_size = Self::effective_sockbuf(requested);
@@ -771,6 +814,7 @@ impl Socket for UnixDatagramSocket {
     fn recv(&self, buffer: &mut [u8], flags: socket::PMSG) -> Result<usize, SystemError> {
         let peek = flags.contains(PMSG::PEEK);
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
 
         if nonblock {
             return self
@@ -786,10 +830,7 @@ impl Socket for UnixDatagramSocket {
                     return Ok(Self::recv_return_len(copy_len, orig_len, flags));
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_queue.wait_event_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(e) => return Err(e),
             }
@@ -804,6 +845,7 @@ impl Socket for UnixDatagramSocket {
     ) -> Result<(usize, Endpoint), SystemError> {
         let peek = flags.contains(PMSG::PEEK);
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
 
         let do_recv = |buffer: &mut [u8]| -> Result<(usize, Endpoint), SystemError> {
             let (copy_len, addr, orig_len) = self.try_recv_from(buffer, peek)?;
@@ -822,10 +864,7 @@ impl Socket for UnixDatagramSocket {
             match do_recv(buffer) {
                 Ok(result) => return Ok(result),
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    self.wait_queue.wait_event_interruptible_timeout(
-                        || self.can_recv(),
-                        self.recv_timeout(),
-                    )?;
+                    timeout.wait(&self.wait_queue, || self.can_recv())?;
                 }
                 Err(e) => return Err(e),
             }
@@ -843,114 +882,41 @@ impl Socket for UnixDatagramSocket {
         )
     }
 
-    fn recv_msg(&self, msg: &mut MsgHdr, flags: socket::PMSG) -> Result<usize, SystemError> {
+    fn recv_msg(
+        &self,
+        msg: &mut MsgHdr,
+        flags: socket::PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
         // recvmsg semantics:
         // - Deliver SCM_RIGHTS if present on the next datagram.
         // - If payload is truncated, set MSG_TRUNC.
         // - If control buffer is insufficient or missing, set MSG_CTRUNC.
         // - Fill msg_name/msg_namelen when provided.
 
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
-        let mut buf = iovs.new_buf(true);
-        let buf_cap = buf.len();
-
+        let mut buf = RecvBuffer::default();
+        let capacity = iovs.total_len();
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
         let peek = flags.contains(PMSG::PEEK);
-
-        let (payload_copy_len, sender_addr, orig_len, rights, creds) = if nonblock {
-            if peek {
-                let inner = self.inner.lock();
-                let msg_in = inner
-                    .recv_queue
-                    .front()
-                    .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-
-                let orig_len = msg_in.data.len();
-                let copy_len = core::cmp::min(buf_cap, orig_len);
-                buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-
-                (
-                    copy_len,
-                    msg_in.sender_addr.clone(),
-                    orig_len,
-                    msg_in.rights.clone(),
-                    msg_in.creds,
-                )
-            } else {
-                // Pop first (short lock), then copy/compute outside.
-                let msg_in = {
-                    let mut inner = self.inner.lock();
-                    inner
-                        .pop_message()
-                        .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
-                };
-
-                let orig_len = msg_in.data.len();
-                let copy_len = core::cmp::min(buf_cap, orig_len);
-                buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-
-                Self::release_sender_accounting(&msg_in.sender_addr, msg_in.sender_accounted_len);
-
-                (
-                    copy_len,
-                    msg_in.sender_addr,
-                    orig_len,
-                    msg_in.rights,
-                    msg_in.creds,
-                )
-            }
-        } else {
-            loop {
-                if peek {
-                    let got = {
-                        let inner = self.inner.lock();
-                        inner.recv_queue.front().map(|msg_in| {
-                            let orig_len = msg_in.data.len();
-                            let copy_len = core::cmp::min(buf_cap, orig_len);
-                            buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-                            (
-                                copy_len,
-                                msg_in.sender_addr.clone(),
-                                orig_len,
-                                msg_in.rights.clone(),
-                                msg_in.creds,
-                            )
-                        })
-                    };
-                    if let Some(v) = got {
-                        break v;
-                    }
-                } else {
-                    let popped = {
-                        let mut inner = self.inner.lock();
-                        inner.pop_message()
-                    };
-                    if let Some(msg_in) = popped {
-                        let orig_len = msg_in.data.len();
-                        let copy_len = core::cmp::min(buf_cap, orig_len);
-                        buf[..copy_len].copy_from_slice(&msg_in.data[..copy_len]);
-
-                        Self::release_sender_accounting(
-                            &msg_in.sender_addr,
-                            msg_in.sender_accounted_len,
-                        );
-
-                        break (
-                            copy_len,
-                            msg_in.sender_addr,
-                            orig_len,
-                            msg_in.rights,
-                            msg_in.creds,
-                        );
-                    }
+        let DatagramRecvMeta {
+            copy_len: payload_copy_len,
+            sender_addr,
+            orig_len,
+            rights,
+            creds,
+        } = loop {
+            match self.try_recvmsg_record(&mut buf, capacity, peek) {
+                Ok(ReceiveAttempt::Ready(meta)) => break meta,
+                Ok(ReceiveAttempt::NeedBuffer(required)) => buf.prepare(required)?,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    timeout.wait(&self.wait_queue, || self.can_recv())?;
                 }
-
-                self.wait_queue
-                    .wait_event_interruptible_timeout(|| self.can_recv(), self.recv_timeout())?;
+                Err(error) => return Err(error),
             }
         };
 
-        iovs.scatter(&buf[..payload_copy_len])?;
+        iovs.scatter_exact(buf.bytes(payload_copy_len))?;
 
         // 写回来源地址
         let endpoint = sender_addr
@@ -959,7 +925,7 @@ impl Socket for UnixDatagramSocket {
         msg.msg_namelen = endpoint.write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
 
         msg.msg_flags = 0;
-        if orig_len > buf_cap {
+        if orig_len > capacity {
             msg.msg_flags |= PMSG::TRUNC.bits() as i32;
         }
 
@@ -1022,51 +988,16 @@ impl Socket for UnixDatagramSocket {
 
         // 2) SCM_RIGHTS (if present)
         if has_rights {
-            let remaining = control_len - write_off;
-            let data_avail = remaining.saturating_sub(cmsg_align(hdr_len));
-            let max_fds = data_avail / core::mem::size_of::<i32>();
-            let fit = core::cmp::min(max_fds, rights.len());
-            if fit == 0 {
-                msg.msg_flags |= MSG_CTRUNC;
-                msg.msg_controllen = write_off;
-                return Ok(Self::recv_return_len(payload_copy_len, orig_len, flags));
-            }
-            if fit < rights.len() {
-                msg.msg_flags |= MSG_CTRUNC;
-            }
-
-            let cloexec = flags.contains(socket::PMSG::CMSG_CLOEXEC);
-            let mut received_fds: Vec<i32> = Vec::with_capacity(fit);
-            {
-                let fd_table_binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table = fd_table_binding.write();
-                for file in rights.iter().take(fit) {
-                    // SCM_RIGHTS 复制的是 fd 引用，必须共享同一个 open file description。
-                    let new_fd = fd_table.alloc_fd_arc(file.clone(), None, cloexec)?;
-                    received_fds.push(new_fd);
-                }
-            }
-
-            let data_len = received_fds.len() * core::mem::size_of::<i32>();
-            let fd_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(received_fds.as_ptr() as *const u8, data_len)
-            };
-
             let mut buf = CmsgBuffer {
                 ptr: control_ptr,
                 len: control_len,
                 write_off: &mut write_off,
             };
-            if let Err(e) = buf.put(
+            buf.put_rights(
                 &mut msg.msg_flags,
-                SOL_SOCKET,
-                SCM_RIGHTS,
-                data_len,
-                fd_bytes,
-            ) {
-                super::rollback_allocated_fds(&received_fds);
-                return Err(e);
-            }
+                &rights,
+                flags.contains(socket::PMSG::CMSG_CLOEXEC),
+            );
         }
 
         msg.msg_controllen = write_off;
@@ -1080,11 +1011,15 @@ impl Socket for UnixDatagramSocket {
             .inner
             .lock()
             .peer_endpoint()
-            .ok_or(SystemError::EDESTADDRREQ)?;
+            .ok_or(SystemError::ENOTCONN)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         if nonblock {
-            return Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
+            let result = Self::convert_enobufs_to_eagain(self.try_send_to(buffer, &peer_addr));
+            if result == Err(SystemError::ECONNREFUSED) {
+                self.forget_dead_peer(&peer_addr);
+            }
+            return result;
         }
 
         loop {
@@ -1095,6 +1030,10 @@ impl Socket for UnixDatagramSocket {
                         || self.send_buffer_available(buffer.len()),
                         self.send_timeout(),
                     )?;
+                }
+                Err(SystemError::ECONNREFUSED) => {
+                    self.forget_dead_peer(&peer_addr);
+                    return Err(SystemError::ECONNREFUSED);
                 }
                 Err(e) => return Err(e),
             }
@@ -1109,18 +1048,19 @@ impl Socket for UnixDatagramSocket {
         let buf = iovs.gather()?;
 
         // Resolve destination.
-        let target_addr = if !msg.msg_name.is_null() {
+        let connected_send = msg.msg_name.is_null();
+        let target_addr = if !connected_send {
             let endpoint = crate::net::posix::SockAddr::to_endpoint(
                 msg.msg_name as *const crate::net::posix::SockAddr,
                 msg.msg_namelen,
             )?;
             let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-            unix_endpoint.connect_in(&self.netns)?
+            unix_endpoint.connect_in(&self.netns, UnixSocketType::Datagram)?
         } else {
             self.inner
                 .lock()
                 .peer_endpoint()
-                .ok_or(SystemError::EDESTADDRREQ)?
+                .ok_or(SystemError::ENOTCONN)?
         };
 
         // Parse SCM_RIGHTS / SCM_CREDENTIALS from msg_control.
@@ -1135,7 +1075,7 @@ impl Socket for UnixDatagramSocket {
                 UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
             let mut off = 0usize;
             while off + core::mem::size_of::<Cmsghdr>() <= msg.msg_controllen {
-                let hdr = *reader.read_one_from_user::<Cmsghdr>(off)?;
+                let hdr = reader.read_one_from_user::<Cmsghdr>(off)?;
                 if hdr.cmsg_len < core::mem::size_of::<Cmsghdr>() {
                     return Err(SystemError::EINVAL);
                 }
@@ -1178,12 +1118,16 @@ impl Socket for UnixDatagramSocket {
 
         let nonblock = self.is_nonblocking() || _flags.contains(PMSG::DONTWAIT);
         if nonblock {
-            return Self::convert_enobufs_to_eagain(self.try_send_to_with_rights(
+            let result = Self::convert_enobufs_to_eagain(self.try_send_to_with_rights(
                 &buf,
                 &target_addr,
                 rights_files,
                 force_creds,
             ));
+            if connected_send && result == Err(SystemError::ECONNREFUSED) {
+                self.forget_dead_peer(&target_addr);
+            }
+            return result;
         }
 
         loop {
@@ -1200,6 +1144,10 @@ impl Socket for UnixDatagramSocket {
                         self.send_timeout(),
                     )?;
                 }
+                Err(SystemError::ECONNREFUSED) if connected_send => {
+                    self.forget_dead_peer(&target_addr);
+                    return Err(SystemError::ECONNREFUSED);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1212,7 +1160,7 @@ impl Socket for UnixDatagramSocket {
         address: Endpoint,
     ) -> Result<usize, SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(address)?;
-        let target_addr = unix_endpoint.connect_in(&self.netns)?;
+        let target_addr = unix_endpoint.connect_in(&self.netns, UnixSocketType::Datagram)?;
 
         let nonblock = self.is_nonblocking() || flags.contains(PMSG::DONTWAIT);
         if nonblock {
@@ -1231,6 +1179,17 @@ impl Socket for UnixDatagramSocket {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn validate_send_buffer_len(
+        &self,
+        len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        if len > Self::MAX_MSG_SIZE {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
     }
 
     fn send_buffer_size(&self) -> usize {
@@ -1257,87 +1216,72 @@ impl Socket for UnixDatagramSocket {
         let opt =
             crate::net::socket::PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
         match opt {
+            crate::net::socket::PSO::REUSEADDR | crate::net::socket::PSO::REUSEPORT => {
+                self.reuse_options.get(opt, value)
+            }
             crate::net::socket::PSO::TYPE => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = PSOCK::Datagram as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
+            }
+            crate::net::socket::PSO::PEERCRED => {
+                let peer_cred = self.inner.lock().peer_cred.clone();
+                Ok(write_peercred_option(value, peer_cred.as_ref()))
             }
             crate::net::socket::PSO::DOMAIN => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = AddressFamily::Unix as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::PROTOCOL => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v: i32 = 0;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::SNDBUF => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.send_buffer_size() as u32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_u32_getsockopt(value, v))
             }
             crate::net::socket::PSO::RCVBUF => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.recv_buffer_size() as u32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_u32_getsockopt(value, v))
             }
             crate::net::socket::PSO::SNDTIMEO_OLD | crate::net::socket::PSO::SNDTIMEO_NEW => {
                 let us = self.send_timeout_us.load(Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             crate::net::socket::PSO::RCVTIMEO_OLD | crate::net::socket::PSO::RCVTIMEO_NEW => {
                 let us = self.recv_timeout_us.load(Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             crate::net::socket::PSO::RCVLOWAT => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self.rcvlowat.load(Ordering::Relaxed);
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             crate::net::socket::PSO::PASSCRED => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v: i32 = if self.passcred.load(Ordering::Acquire) {
                     1
                 } else {
                     0
                 };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
     fn do_close(&self) -> Result<(), SystemError> {
-        // 先从绑定表中注销，防止新消息进入
-        let inner = self.inner.lock();
-        if let Some(ref addr) = inner.local_addr {
-            BIND_TABLE.unregister(addr);
+        let mut inner = self.inner.lock();
+        if inner.closed {
+            return Ok(());
         }
+        inner.closed = true;
+        if let Some(ref addr) = inner.local_addr {
+            BIND_TABLE.unregister(&addr.address, self);
+        }
+        let local_addr = inner.local_addr.take();
+        inner.peer_addr.take();
         drop(inner);
+        drop(local_addr);
 
         // 清空接收队列并释放所有发送端记账
         // 注意：需要在获取 inner 锁之后操作，但释放记账时不能持有 inner 锁
@@ -1395,7 +1339,7 @@ impl Drop for UnixDatagramSocket {
         // 从绑定表中注销，释放地址
         let inner = self.inner.lock();
         if let Some(ref addr) = inner.local_addr {
-            BIND_TABLE.unregister(addr);
+            BIND_TABLE.unregister(&addr.address, self);
         }
         // 注意：不在这里释放接收队列中的记账
         // 因为 Drop 运行时其他 socket 可能已经被 drop，访问它们不安全

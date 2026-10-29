@@ -59,24 +59,41 @@ fn do_mlockall(flags: usize) -> Result<usize, SystemError> {
     }
 
     let vm = AddressSpace::current()?;
-    let mut guard = vm.write_interruptible()?;
-    if flags & MCL_CURRENT != 0 {
-        let new_pages = guard.count_unlocked_pages_for_mlockall()?;
-        check_mlock_rlimit(guard.locked_vm, new_pages)?;
-    }
-    guard.set_mlock_future(VmFlags::VM_NONE);
+    loop {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        let mut guard = vm.write_interruptible()?;
+        if guard.mappings.first_reservation_region().is_some() {
+            drop(guard);
+            vm.wait_for_no_reservations_interruptible()?;
+            continue;
+        }
 
-    if flags & MCL_CURRENT != 0 {
-        guard.apply_mlockall_current(lock_flags)?;
-    }
+        if flags & MCL_CURRENT != 0 {
+            let new_pages = guard.count_unlocked_pages_for_mlockall()?;
+            check_mlock_rlimit(guard.locked_vm, new_pages)?;
+        }
+        guard.set_mlock_future(VmFlags::VM_NONE);
 
-    if flags & MCL_FUTURE != 0 {
-        guard.set_mlock_future(lock_flags);
-    }
+        let notifications = if flags & MCL_CURRENT != 0 {
+            Some(guard.apply_mlockall_current_collect(lock_flags, &creator))
+        } else {
+            None
+        };
 
-    // TODO: when fault-time page locking is implemented, VM_LOCKONFAULT should
-    // mark pages unevictable on demand instead of relying only on VMA state.
-    Ok(0)
+        if flags & MCL_FUTURE != 0 {
+            guard.set_mlock_future(lock_flags);
+        }
+
+        drop(guard);
+        if let Some(notifications) = notifications {
+            crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(notifications);
+        }
+        if flags & MCL_CURRENT != 0 {
+            vm.populate_mlockall_post_commit();
+        }
+        return Ok(0);
+    }
 }
 
 syscall_table_macros::declare_syscall!(SYS_MLOCKALL, SysMlockallHandle);

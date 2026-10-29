@@ -1,18 +1,51 @@
-use core::sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch},
+    arch::CurrentIrqArch,
     exception::InterruptArch,
-    ipc::kill::send_signal_to_pcb,
     libs::lazy_init::Lazy,
     mm::percpu::PerCpuVar,
-    process::{ProcessControlBlock, ProcessState},
+    process::ProcessControlBlock,
     smp::{core::smp_get_processor_id, cpu::ProcessorId},
     time::jiffies::TICK_NESC,
 };
 use alloc::sync::Arc;
 
-use super::{clock::SchedClock, cpu_irq_time, cpu_rq, prio::PrioUtil, SchedPolicy};
+use super::{clock::SchedClock, cpu_irq_time, cpu_rq, prio::PrioUtil, SchedClass};
+
+/// Linux cputime_adjust: retain tick classification while scaling to actual
+/// scheduler runtime. The owner serializes calls with its previous-value lock.
+#[derive(Debug, Default)]
+pub(crate) struct AdjustedCpuTime {
+    user_ns: u64,
+    system_ns: u64,
+}
+
+impl AdjustedCpuTime {
+    pub(crate) fn adjust(&mut self, runtime: u64, user: u64, system: u64) -> (u64, u64) {
+        if self.user_ns.saturating_add(self.system_ns) < runtime {
+            let system = if system == 0 {
+                0
+            } else if user == 0 {
+                runtime
+            } else {
+                ((system as u128 * runtime as u128) / (system as u128 + user as u128)) as u64
+            };
+            let mut system = system.max(self.system_ns);
+            let mut user = runtime - system;
+            if user < self.user_ns {
+                user = self.user_ns;
+                system = runtime - user;
+            }
+            self.user_ns = user;
+            self.system_ns = system;
+        }
+        (self.user_ns, self.system_ns)
+    }
+}
 
 /// CPU 时间类型枚举（对齐 Linux kernel_stat.h 的 cpu_usage_stat）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,23 +69,74 @@ pub const NR_CPU_STATS: usize = 10;
 /// Linux 用户空间时间单位（ticks per second）
 pub const USER_HZ: u64 = 100;
 
+/// Linux task_sched_runtime(): only settle an entity still owned by this rq.
+/// Membership/exit aggregation must instead read its settled atomic snapshot.
+pub(crate) fn task_sched_runtime(task: &ProcessControlBlock) -> u64 {
+    loop {
+        let _pi = task.sched_info().pi_lock_irqsave();
+        let Some(cpu) = task.sched_info().on_cpu() else {
+            return task.cputime().sum_exec_runtime.load(Ordering::Relaxed);
+        };
+        if *task.sched_info().on_rq.lock_irqsave() != super::OnRq::Queued {
+            return task.cputime().sum_exec_runtime.load(Ordering::Relaxed);
+        }
+        let binding = cpu_rq(cpu.data() as usize);
+        let (rq, _guard) = binding.self_lock();
+        if task.sched_info().on_cpu() != Some(cpu) {
+            continue;
+        }
+        if core::ptr::eq(Arc::as_ptr(&rq.current()), task)
+            && *task.sched_info().on_rq.lock_irqsave() == super::OnRq::Queued
+        {
+            rq.update_rq_clock();
+            match task.sched_info().sched_class() {
+                SchedClass::Fair => {
+                    super::fair::CompletelyFairScheduler::update_current_chain(&rq.current())
+                }
+                SchedClass::Realtime => {
+                    super::realtime::RealtimeScheduler::update_bandwidth(rq, SchedClass::Realtime)
+                }
+                SchedClass::Idle => {}
+            }
+        }
+        return task.cputime().sum_exec_runtime.load(Ordering::Relaxed);
+    }
+}
+
 /// 将纳秒转换为 USER_HZ 单位的 ticks
 #[inline]
 pub const fn ns_to_clock_t(ns: u64) -> u64 {
-    ns * USER_HZ / 1_000_000_000
+    // USER_HZ is 100, an exact divisor of nanoseconds per second.
+    ns / (1_000_000_000 / USER_HZ)
 }
+
+// Keep accumulated multi-thread CPU time monotonic beyond the old ns*HZ
+// overflow boundary. These checks execute at compile time on every platform.
+const _: () = {
+    assert!(ns_to_clock_t(9_999_999) == 0);
+    assert!(ns_to_clock_t(10_000_000) == 1);
+    assert!(ns_to_clock_t(u64::MAX / USER_HZ + 1) == (u64::MAX / USER_HZ + 1) / 10_000_000);
+    assert!(ns_to_clock_t(u64::MAX) == u64::MAX / 10_000_000);
+};
 
 /// per-CPU 的内核 CPU 统计（对齐 Linux kernel_cpustat）
 #[derive(Debug)]
 pub struct KernelCpuStat {
     /// 各类 CPU 时间累计（单位：纳秒）
     pub cpustat: [AtomicU64; NR_CPU_STATS],
+    // These two cursors are written only by this CPU with IRQs disabled.
+    // Keep observation separate from consumption: tick accounting may retain
+    // an unconsumed balance, including when the current limit is zero.
+    observed_steal_time: AtomicU64,
+    consumed_steal_time: AtomicU64,
 }
 
 impl KernelCpuStat {
     pub const fn new() -> Self {
         Self {
             cpustat: [const { AtomicU64::new(0) }; NR_CPU_STATS],
+            observed_steal_time: AtomicU64::new(0),
+            consumed_steal_time: AtomicU64::new(0),
         }
     }
 
@@ -77,6 +161,49 @@ impl KernelCpuStat {
         }
         result
     }
+
+    fn account_steal(&self, total: u64, max: u64) -> u64 {
+        debug_assert!(!CurrentIrqArch::is_irq_enabled());
+        let observed = self.observed_steal_time.load(Ordering::Relaxed);
+        let consumed = self.consumed_steal_time.load(Ordering::Relaxed);
+        self.observed_steal_time.store(total, Ordering::Relaxed);
+        if total < observed {
+            // A restored source must normally preserve its cumulative value.
+            // If that contract is lost, discard the old balance rather than
+            // underflowing or charging history from a different epoch.
+            self.consumed_steal_time.store(total, Ordering::Relaxed);
+            return 0;
+        }
+        let steal = total.saturating_sub(consumed).min(max);
+        self.consumed_steal_time
+            .store(consumed + steal, Ordering::Relaxed);
+        if steal != 0 {
+            self.account(CpuUsageStat::Steal, steal);
+        }
+        steal
+    }
+}
+
+/// Cumulative steal is optional, and belongs to the target CPU, not the reader.
+#[inline]
+pub(super) fn steal_clock(cpu: ProcessorId) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    return crate::arch::kvm_para::steal_time::read(cpu);
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = cpu;
+        None
+    }
+}
+
+/// Linux rq accounting consumes the full published sample even when only part
+/// fits in this clock update. Tick/usage accounting instead retains a balance.
+#[inline]
+pub(super) fn rq_steal_time(total: u64, previous: &mut u64, delta: u64) -> u64 {
+    let steal = total.saturating_sub(*previous).min(delta);
+    *previous = total;
+    steal
 }
 
 static KERNEL_CPU_STAT: Lazy<PerCpuVar<KernelCpuStat>> = PerCpuVar::define_lazy();
@@ -108,78 +235,90 @@ pub fn init_kernel_cpu_stat() {
 }
 
 pub fn irq_time_read(cpu: ProcessorId) -> u64 {
-    compiler_fence(Ordering::SeqCst);
-    let irqtime = cpu_irq_time(cpu);
-
-    let mut total;
-
-    loop {
-        let seq = irqtime.sync.load(Ordering::SeqCst);
-        total = irqtime.total;
-
-        if seq == irqtime.sync.load(Ordering::SeqCst) {
-            break;
-        }
-    }
-    compiler_fence(Ordering::SeqCst);
-    total
+    cpu_irq_time(cpu).total.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Default)]
-pub struct IrqTime {
-    pub total: u64,
-    pub tick_delta: u64,
-    pub hardirq_delta: u64,
-    pub softirq_delta: u64,
-    pub irq_start_time: u64,
-    pub sync: AtomicUsize,
+struct IrqTimeLocal {
+    tick_delta: u64,
+    hardirq_delta: u64,
+    softirq_delta: u64,
+    irq_start_time: u64,
 }
 
-impl IrqTime {
-    pub fn account_delta(&mut self, delta: u64, is_hardirq: bool) {
-        // 开始更改时增加序列号
-        self.sync.fetch_add(1, Ordering::SeqCst);
-        self.total += delta;
-        self.tick_delta += delta;
+#[derive(Debug)]
+pub(crate) struct IrqTime {
+    owner: ProcessorId,
+    total: AtomicU64,
+    local: UnsafeCell<IrqTimeLocal>,
+}
 
-        // 根据中断类型分别记录
-        if is_hardirq {
-            self.hardirq_delta += delta;
-        } else {
-            self.softirq_delta += delta;
+// `total` is the only cross-CPU field and is atomic. `local` is accessed only
+// by `owner` with local IRQs disabled, as enforced by `with_local()`.
+unsafe impl Sync for IrqTime {}
+
+impl IrqTime {
+    pub(crate) fn new(owner: ProcessorId) -> Self {
+        Self {
+            owner,
+            total: AtomicU64::new(0),
+            local: UnsafeCell::new(IrqTimeLocal::default()),
         }
     }
 
-    pub fn irqtime_tick_accounted(&mut self, max: u64) -> (u64, u64, u64) {
-        let total_delta = self.tick_delta.min(max);
-        let hardirq_delta = self.hardirq_delta.min(total_delta);
-        let softirq_delta = self.softirq_delta.min(total_delta - hardirq_delta);
+    #[inline]
+    fn with_local<R>(&self, f: impl FnOnce(&mut IrqTimeLocal) -> R) -> R {
+        debug_assert_eq!(self.owner, smp_get_processor_id());
+        debug_assert!(!CurrentIrqArch::is_irq_enabled());
 
-        self.tick_delta -= total_delta;
-        self.hardirq_delta -= hardirq_delta;
-        self.softirq_delta -= softirq_delta;
-
-        (total_delta, hardirq_delta, softirq_delta)
+        // SAFETY: each instance has one owner CPU. All callers run on that CPU
+        // with IRQs disabled, so local fields cannot be accessed concurrently.
+        f(unsafe { &mut *self.local.get() })
     }
 
-    pub fn irqtime_start() {
-        let cpu = smp_get_processor_id();
-        let irq_time = cpu_irq_time(cpu);
-        compiler_fence(Ordering::SeqCst);
-        irq_time.irq_start_time = SchedClock::sched_clock_cpu(cpu) as u64;
-        compiler_fence(Ordering::SeqCst);
+    fn account_delta(&self, delta: u64, is_hardirq: bool) {
+        self.total.fetch_add(delta, Ordering::Relaxed);
+        self.with_local(|local| {
+            local.tick_delta += delta;
+
+            // 根据中断类型分别记录
+            if is_hardirq {
+                local.hardirq_delta += delta;
+            } else {
+                local.softirq_delta += delta;
+            }
+        });
     }
 
-    pub fn irqtime_account_irq(_pcb: Arc<ProcessControlBlock>, is_hardirq: bool) {
-        compiler_fence(Ordering::SeqCst);
+    fn irqtime_tick_accounted(&self, max: u64) -> (u64, u64, u64) {
+        self.with_local(|local| {
+            let total_delta = local.tick_delta.min(max);
+            let hardirq_delta = local.hardirq_delta.min(total_delta);
+            let softirq_delta = local.softirq_delta.min(total_delta - hardirq_delta);
+
+            local.tick_delta -= total_delta;
+            local.hardirq_delta -= hardirq_delta;
+            local.softirq_delta -= softirq_delta;
+
+            (total_delta, hardirq_delta, softirq_delta)
+        })
+    }
+
+    pub(crate) fn irqtime_start() {
         let cpu = smp_get_processor_id();
         let irq_time = cpu_irq_time(cpu);
-        compiler_fence(Ordering::SeqCst);
-        let delta = SchedClock::sched_clock_cpu(cpu) as u64 - irq_time.irq_start_time;
-        compiler_fence(Ordering::SeqCst);
+        irq_time.with_local(|local| {
+            local.irq_start_time = SchedClock::sched_clock_cpu(cpu) as u64;
+        });
+    }
+
+    pub(crate) fn irqtime_account_irq(_pcb: Arc<ProcessControlBlock>, is_hardirq: bool) {
+        let cpu = smp_get_processor_id();
+        let irq_time = cpu_irq_time(cpu);
+        let irq_start_time = irq_time.with_local(|local| local.irq_start_time);
+        let delta = SchedClock::sched_clock_cpu(cpu) as u64 - irq_start_time;
 
         irq_time.account_delta(delta, is_hardirq);
-        compiler_fence(Ordering::SeqCst);
     }
 }
 
@@ -204,8 +343,8 @@ impl CpuTimeFunc {
         let kcpustat = kcpustat_this_cpu();
 
         // 判断是否是 idle 进程
-        let policy = pcb.sched_info().policy();
-        if policy == SchedPolicy::IDLE {
+        let sched_class = pcb.sched_info().sched_class();
+        if sched_class == SchedClass::Idle {
             // idle 进程：根据 nr_iowait 区分 IDLE 和 IOWAIT
             let cpu_id = smp_get_processor_id();
             let rq = cpu_rq(cpu_id.data() as usize);
@@ -221,8 +360,7 @@ impl CpuTimeFunc {
         } else if user_tick {
             // 用户态时间：区分 NICE
             // 获取进程的 nice 值（通过 static_prio 计算）
-            let prio_data = pcb.sched_info().prio_data();
-            let static_prio = prio_data.static_prio;
+            let static_prio = pcb.sched_info().static_prio();
             // 使用 PrioUtil 将 prio 转换为 nice 值
             let nice = PrioUtil::prio_to_nice(static_prio);
 
@@ -234,70 +372,16 @@ impl CpuTimeFunc {
                 kcpustat.account(CpuUsageStat::User, accounted_cputime);
             }
             pcb.account_utime(accounted_cputime);
+            pcb.account_cgroup_cputime(true, accounted_cputime);
         } else {
             // 系统态时间：记入 SYSTEM
             // IRQ 和 SOFTIRQ 通过 account_other_time() 在 tick 中单独记账
             kcpustat.account(CpuUsageStat::System, accounted_cputime);
             pcb.account_stime(accounted_cputime);
+            pcb.account_cgroup_cputime(false, accounted_cputime);
         }
 
-        // 只有非 idle 进程才累加 sum_exec_runtime
-        if policy != SchedPolicy::IDLE {
-            pcb.add_sum_exec_runtime(accounted_cputime);
-        }
-
-        // 唤醒可能在等待 CPU-time 时钟的线程（clock_nanosleep: PROCESS/THREAD_CPUTIME）。
-        // 线程 CPU-time：仅在该线程运行时推进，因此唤醒该 PCB 的等待队列即可。
-        if !pcb.cputime_wait_queue().is_empty() {
-            pcb.cputime_wait_queue()
-                .wakeup_all(Some(ProcessState::Blocked(true)));
-        }
-
-        // 进程 CPU-time：需要在任一线程推进时唤醒线程组组长上的等待队列。
-        // 这样“主线程 sleep + 子线程 busy loop”的场景才能正确返回。
-        if !pcb.is_thread_group_leader() {
-            if let Some(leader) = pcb.threads_read_irqsave().group_leader() {
-                if !leader.cputime_wait_queue().is_empty() {
-                    leader
-                        .cputime_wait_queue()
-                        .wakeup_all(Some(ProcessState::Blocked(true)));
-                }
-            }
-        }
-
-        // 检查并处理CPU时间定时器
-        let mut itimers = pcb.itimers_irqsave();
-        // 处理 ITIMER_VIRTUAL (仅在用户态tick时消耗时间)
-        if user_tick && itimers.virt.is_active {
-            if itimers.virt.value <= accounted_cputime {
-                send_signal_to_pcb(pcb.clone(), Signal::SIGVTALRM).ok();
-                if itimers.virt.interval > 0 {
-                    // 周期性定时器：在旧的剩余时间上增加间隔时间
-                    itimers.virt.value += itimers.virt.interval;
-                } else {
-                    // 一次性定时器：禁用
-                    itimers.virt.is_active = false;
-                    itimers.virt.value = 0;
-                }
-            } else {
-                itimers.virt.value -= accounted_cputime;
-            }
-        }
-
-        // 处理 ITIMER_PROF (在用户态和内核态tick时都消耗时间)
-        if itimers.prof.is_active {
-            if itimers.prof.value <= accounted_cputime {
-                send_signal_to_pcb(pcb.clone(), Signal::SIGPROF).ok();
-                if itimers.prof.interval > 0 {
-                    itimers.prof.value += itimers.prof.interval;
-                } else {
-                    itimers.prof.is_active = false;
-                    itimers.prof.value = 0;
-                }
-            } else {
-                itimers.prof.value -= accounted_cputime;
-            }
-        }
+        pcb.account_itimers(user_tick, accounted_cputime);
     }
 
     pub fn account_other_time(max: u64) -> u64 {
@@ -325,8 +409,15 @@ impl CpuTimeFunc {
         accounted
     }
 
-    pub fn steal_account_process_time(_max: u64) -> u64 {
-        // 这里未考虑虚拟机时间窃取
-        0
+    pub fn steal_account_process_time(max: u64) -> u64 {
+        debug_assert!(!CurrentIrqArch::is_irq_enabled());
+        let Some(total) = steal_clock(smp_get_processor_id()) else {
+            return 0;
+        };
+        kcpustat_this_cpu().account_steal(total, max)
     }
 }
+
+#[path = "cputime_selftest.rs"]
+mod selftest;
+pub(crate) use selftest::run_virtual_time_selftests;

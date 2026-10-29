@@ -2,17 +2,19 @@
 //!
 //! 这个文件展示了系统的内存使用情况
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::mm::MemoryManagementArch;
 use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_snapshot_operation, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    mm::allocator::page_frame::FrameAllocator,
+    mm::allocator::slab::slab_usage,
     mm::page_cache_stats,
 };
 use alloc::{
@@ -36,10 +38,10 @@ impl MeminfoFileOps {
     }
 
     fn generate_meminfo_content() -> Vec<u8> {
-        use crate::arch::mm::LockedFrameAllocator;
         use crate::arch::MMArch;
 
-        let usage = unsafe { LockedFrameAllocator.usage() };
+        let usage = crate::mm::balloon::managed_usage();
+        let slab_kb = slab_usage().total() >> 10;
         let stats = page_cache_stats::snapshot();
         let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
         let cached_pages = stats.file_pages.saturating_sub(stats.shmem_pages);
@@ -86,13 +88,38 @@ impl MeminfoFileOps {
                 .as_bytes()
                 .to_owned(),
         );
-        data.append(&mut format!("Slab:\t\t{} kB\n", 0u64).as_bytes().to_owned());
+        data.append(&mut format!("Slab:\t\t{} kB\n", slab_kb).as_bytes().to_owned());
         data.append(
             &mut format!("SReclaimable:\t{} kB\n", 0u64)
                 .as_bytes()
                 .to_owned(),
         );
-        data.append(&mut format!("SUnreclaim:\t{} kB\n", 0u64).as_bytes().to_owned());
+        // DragonOS currently has no typed reclaimable slab caches/shrinkers.
+        data.append(
+            &mut format!("SUnreclaim:\t{} kB\n", slab_kb)
+                .as_bytes()
+                .to_owned(),
+        );
+
+        // Vmalloc backing is ordinary RAM, but is not a slab cache. Keep it
+        // separate from Slab and count deferred frees until their TLB barrier.
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            data.extend_from_slice(
+                format!(
+                    "VmallocTotal:\t{} kB\n",
+                    crate::mm::vmalloc::capacity_bytes() >> 10
+                )
+                .as_bytes(),
+            );
+            data.extend_from_slice(
+                format!(
+                    "VmallocUsed:\t{} kB\n",
+                    crate::mm::vmalloc::usage_bytes() >> 10
+                )
+                .as_bytes(),
+            );
+        }
 
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut data);
@@ -102,14 +129,19 @@ impl MeminfoFileOps {
 }
 
 impl FileOps for MeminfoFileOps {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_meminfo_content();
-        proc_read(offset, len, buf, &content)
+        // `single_open()`: one fd sees one meminfo record.
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_meminfo_content()))
     }
 }

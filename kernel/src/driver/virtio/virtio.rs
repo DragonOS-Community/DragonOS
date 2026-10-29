@@ -2,6 +2,7 @@ use super::mmio::virtio_probe_mmio;
 use super::transport_pci::PciTransport;
 use super::virtio_fs::virtio_fs;
 use super::virtio_impl::HalImpl;
+use super::virtio_rng::virtio_rng;
 use crate::driver::base::device::bus::Bus;
 use crate::driver::base::device::{Device, DeviceId};
 use crate::driver::block::virtio_blk::virtio_blk;
@@ -13,6 +14,7 @@ use crate::driver::pci::pci::{
 };
 use crate::driver::pci::subsys::pci_bus;
 use crate::driver::virtio::transport::VirtIOTransport;
+use crate::driver::virtio::virtio_pmem::virtio_pmem;
 use crate::driver::virtio::virtio_vsock::virtio_vsock;
 use crate::init::initcall::INITCALL_DEVICE;
 
@@ -69,6 +71,9 @@ pub(super) fn virtio_device_init(
     dev_parent: Option<Arc<dyn Device>>,
 ) {
     match transport.device_type() {
+        DeviceType::MemoryBalloon | DeviceType::MemoryBallooning => {
+            super::virtio_balloon::virtio_balloon(transport, dev_id)
+        }
         DeviceType::Block => virtio_blk(transport, dev_id, dev_parent),
         DeviceType::GPU => {
             warn!("Not support virtio_gpu device for now");
@@ -78,7 +83,9 @@ pub(super) fn virtio_device_init(
             warn!("Not support virtio_input device for now");
         }
         DeviceType::Network => virtio_net(transport, dev_id, dev_parent),
+        DeviceType::EntropySource => virtio_rng(transport),
         DeviceType::FileSystem => virtio_fs(transport, dev_id, dev_parent),
+        DeviceType::Pmem => virtio_pmem(transport, dev_id, dev_parent),
         DeviceType::Socket => virtio_vsock(transport, dev_id, dev_parent),
         t => {
             warn!("Unrecognized virtio device: {:?}", t);

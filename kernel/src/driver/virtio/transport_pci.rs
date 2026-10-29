@@ -1,9 +1,13 @@
 //! PCI transport for VirtIO.
 
+use crate::arch::{
+    msi::{arch_pci_msi_vector_alloc, arch_pci_msi_vector_release, arch_pci_msi_vector_setup},
+    PciArch, TraitPciArch,
+};
 use crate::driver::base::device::DeviceId;
 use crate::driver::pci::pci::{
-    BusDeviceFunction, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
-    PciStandardDeviceBar, PCI_CAP_ID_VNDR,
+    BusDeviceFunction, PciAddr, PciBarMappingRequest, PciBarSubresourceGuard, PciDeviceStructure,
+    PciDeviceStructureGeneralDevice, PciError, PciStandardDeviceBar, PCI_CAP_ID_VNDR,
 };
 
 use crate::driver::pci::root::pci_root_0;
@@ -11,26 +15,28 @@ use crate::driver::pci::root::pci_root_0;
 use crate::exception::IrqNumber;
 
 use crate::libs::volatile::{ReadOnly, Volatile, VolatileReadable, VolatileWritable, WriteOnly};
-use crate::mm::VirtAddr;
+use crate::mm::{MemoryManagementArch, PhysAddr, VirtAddr};
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     fmt::{self, Display, Formatter},
     mem::{align_of, size_of},
     ptr::{self, addr_of_mut, NonNull},
 };
+use log::warn;
 use virtio_drivers::{
     transport::{DeviceStatus, DeviceType, Transport},
-    Error, Hal, PhysAddr,
+    Error, Hal, PhysAddr as VirtioPhysAddr,
 };
 
+use super::transport::VirtioSharedMemoryRegion;
 use super::VIRTIO_VENDOR_ID;
 use crate::driver::pci::pci_irq::IrqType;
 
 /// The offset to add to a VirtIO device ID to get the corresponding PCI device ID.
-/// PCI Virtio设备的DEVICE_ID 的offset
+/// The offset of the PCI VirtIO device ID.
 const PCI_DEVICE_ID_OFFSET: u16 = 0x1040;
-/// PCI Virtio 设备的DEVICE_ID及其对应的设备类型
+/// PCI VirtIO device IDs and their corresponding device types.
 const TRANSITIONAL_NETWORK: u16 = 0x1000;
 const TRANSITIONAL_BLOCK: u16 = 0x1001;
 const TRANSITIONAL_MEMORY_BALLOONING: u16 = 0x1002;
@@ -47,6 +53,9 @@ const CAP_BAR_OFFSET_OFFSET: u8 = 8;
 const CAP_LENGTH_OFFSET: u8 = 12;
 /// The offset of the`notify_off_multiplier` field within `virtio_pci_notify_cap`.
 const CAP_NOTIFY_OFF_MULTIPLIER_OFFSET: u8 = 16;
+const CAP_SHARED_MEMORY_OFFSET_HI_OFFSET: u8 = 16;
+const CAP_SHARED_MEMORY_LENGTH_HI_OFFSET: u8 = 20;
+const VIRTIO_PCI_CAP64_LEN: u8 = 24;
 
 /// Common configuration.
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -56,16 +65,18 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 /// Device specific configuration.
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+/// Additional shared memory capability.
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
 
-/// Virtio设备接收中断的设备号
-const VIRTIO_RECV_VECTOR: IrqNumber = IrqNumber::new(56);
-/// Virtio设备接收中断的设备号的表项号
+fn shared_memory_cap_len_supported(cap_len: u8) -> bool {
+    cap_len >= VIRTIO_PCI_CAP64_LEN
+}
+
+/// The MSI-X table entry index for VirtIO device receive interrupts.
 const VIRTIO_RECV_VECTOR_INDEX: u16 = 0;
-// 接收的queue号
+// Receive queue number
 const QUEUE_RECEIVE: u16 = 0;
-///@brief device id 转换为设备类型
-///@param pci_device_id，device_id
-///@return DeviceType 对应的设备类型
+/// Converts a PCI device ID to the corresponding VirtIO device type.
 fn device_type(pci_device_id: u16) -> DeviceType {
     match pci_device_id {
         TRANSITIONAL_NETWORK => DeviceType::Network,
@@ -84,7 +95,7 @@ fn device_type(pci_device_id: u16) -> DeviceType {
 ///
 /// Ref: 4.1 Virtio Over PCI Bus
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PciTransport {
     device_type: DeviceType,
     /// The bus, device and function identifier for the VirtIO device.
@@ -94,20 +105,42 @@ pub struct PciTransport {
     /// The start of the queue notification region within some BAR.
     notify_region: NonNull<[WriteOnly<u16>]>,
     notify_off_multiplier: u32,
+    /// Cached notify-region indices keyed by virtqueue index.
+    queue_notify_indices: Vec<Option<usize>>,
     /// The ISR status register within some BAR.
     isr_status: NonNull<Volatile<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
     config_space: Option<NonNull<[u32]>>,
-    irq: IrqNumber,
     dev_id: Arc<DeviceId>,
     device: Arc<PciDeviceStructureGeneralDevice>,
+    shared_memory_regions: Vec<(u8, Option<VirtioSharedMemoryRegion>)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PciInterruptAck {
+    isr_status: NonNull<Volatile<u8>>,
+}
+
+// The handle only permits an atomic MMIO ISR-status read used for interrupt acknowledgement.
+// Queue/config mutation remains owned by PciTransport.
+unsafe impl Send for PciInterruptAck {}
+unsafe impl Sync for PciInterruptAck {}
+
+impl PciInterruptAck {
+    pub fn ack_interrupt(&self) -> bool {
+        // Safe because the ISR status pointer comes from a valid VirtIO PCI ISR BAR region.
+        // Reading the ISR status resets it to 0 and causes the device to de-assert the interrupt.
+        let isr_status = unsafe { self.isr_status.as_ptr().vread() };
+        // TODO: Distinguish between queue interrupt and device configuration interrupt.
+        isr_status & 0x3 != 0
+    }
 }
 
 impl PciTransport {
     /// Construct a new PCI VirtIO device driver for the given device function on the given PCI
     /// root controller.
     ///
-    /// ## 参数
+    /// ## Parameters
     ///
     /// - `device` - The PCI device structure for the VirtIO device.
     /// - `irq_handler` - An optional handler for the device's interrupt. If `None`, a default
@@ -118,7 +151,6 @@ impl PciTransport {
         device: Arc<PciDeviceStructureGeneralDevice>,
         dev_id: Arc<DeviceId>,
     ) -> Result<Self, VirtioPciError> {
-        let irq = VIRTIO_RECV_VECTOR;
         let header = &device.common_header;
         let bus_device_function = header.bus_device_function;
         if header.vendor_id != VIRTIO_VENDOR_ID {
@@ -131,15 +163,64 @@ impl PciTransport {
         let mut notify_off_multiplier = 0;
         let mut isr_cfg = None;
         let mut device_cfg = None;
-        device.bar_ioremap().unwrap()?;
+        let mut shared_memory_regions = Vec::new();
+        let mut shared_memory_bars = Vec::new();
+        let mut transport_config_mappings = Vec::new();
+        let mut mapped_config_types = Vec::new();
+        for capability in device.capabilities().unwrap() {
+            if capability.id != PCI_CAP_ID_VNDR {
+                continue;
+            }
+            let cap_len = capability.private_header as u8;
+            let cfg_type = (capability.private_header >> 8) as u8;
+            if cap_len < 16 || capability.offset.checked_add(cap_len - 1).is_none() {
+                continue;
+            }
+            let bar = pci_root_0().read_config(
+                bus_device_function,
+                (capability.offset + CAP_BAR_OFFSET).into(),
+            ) as u8;
+            let valid_transport_config = matches!(
+                cfg_type,
+                VIRTIO_PCI_CAP_COMMON_CFG
+                    | VIRTIO_PCI_CAP_NOTIFY_CFG
+                    | VIRTIO_PCI_CAP_ISR_CFG
+                    | VIRTIO_PCI_CAP_DEVICE_CFG
+            ) && (cfg_type != VIRTIO_PCI_CAP_NOTIFY_CFG
+                || cap_len >= 20);
+            if valid_transport_config && bar < 6 && !mapped_config_types.contains(&cfg_type) {
+                let offset = pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_BAR_OFFSET_OFFSET).into(),
+                );
+                let length = pci_root_0().read_config(
+                    bus_device_function,
+                    (capability.offset + CAP_LENGTH_OFFSET).into(),
+                );
+                transport_config_mappings.push(PciBarMappingRequest {
+                    bar,
+                    offset: u64::from(offset),
+                    length: u64::from(length),
+                });
+                mapped_config_types.push(cfg_type);
+            }
+            if cfg_type != VIRTIO_PCI_CAP_SHARED_MEMORY_CFG
+                || !shared_memory_cap_len_supported(cap_len)
+                || capability.offset.checked_add(cap_len - 1).is_none()
+            {
+                continue;
+            }
+            if bar < 6 && !shared_memory_bars.contains(&bar) {
+                shared_memory_bars.push(bar);
+            }
+        }
+        transport_config_mappings.extend(device.msix_mapping_requests()?);
+        device
+            .bar_ioremap_with_mappings(&shared_memory_bars, &transport_config_mappings)
+            .unwrap()?;
         device.enable_master();
-        let standard_device = device.as_standard_device().unwrap();
-        // 目前缺少对PCI设备中断号的统一管理，所以这里需要指定一个中断号。不能与其他中断重复
-        let irq_vector = standard_device.irq_vector_mut().unwrap();
-        irq_vector.write().push(irq);
-
         // panic!();
-        //device_capability为迭代器，遍历其相当于遍历所有的cap空间
+        // device_capability is an iterator; iterating over it traverses all capability space.
         for capability in device.capabilities().unwrap() {
             if capability.id != PCI_CAP_ID_VNDR {
                 continue;
@@ -147,6 +228,9 @@ impl PciTransport {
             let cap_len = capability.private_header as u8;
             let cfg_type = (capability.private_header >> 8) as u8;
             if cap_len < 16 {
+                continue;
+            }
+            if capability.offset.checked_add(cap_len - 1).is_none() {
                 continue;
             }
             let struct_info = VirtioCapabilityInfo {
@@ -165,27 +249,77 @@ impl PciTransport {
             };
 
             match cfg_type {
-                VIRTIO_PCI_CAP_COMMON_CFG if common_cfg.is_none() => {
+                VIRTIO_PCI_CAP_COMMON_CFG if struct_info.bar < 6 && common_cfg.is_none() => {
                     common_cfg = Some(struct_info);
                 }
-                VIRTIO_PCI_CAP_NOTIFY_CFG if cap_len >= 20 && notify_cfg.is_none() => {
+                VIRTIO_PCI_CAP_NOTIFY_CFG
+                    if cap_len >= 20 && struct_info.bar < 6 && notify_cfg.is_none() =>
+                {
                     notify_cfg = Some(struct_info);
                     notify_off_multiplier = pci_root_0().read_config(
                         bus_device_function,
                         (capability.offset + CAP_NOTIFY_OFF_MULTIPLIER_OFFSET).into(),
                     );
                 }
-                VIRTIO_PCI_CAP_ISR_CFG if isr_cfg.is_none() => {
+                VIRTIO_PCI_CAP_ISR_CFG if struct_info.bar < 6 && isr_cfg.is_none() => {
                     isr_cfg = Some(struct_info);
                 }
-                VIRTIO_PCI_CAP_DEVICE_CFG if device_cfg.is_none() => {
+                VIRTIO_PCI_CAP_DEVICE_CFG if struct_info.bar < 6 && device_cfg.is_none() => {
                     device_cfg = Some(struct_info);
+                }
+                VIRTIO_PCI_CAP_SHARED_MEMORY_CFG if shared_memory_cap_len_supported(cap_len) => {
+                    if struct_info.bar >= 6 {
+                        continue;
+                    }
+                    let bar_and_id = pci_root_0().read_config(
+                        bus_device_function,
+                        (capability.offset + CAP_BAR_OFFSET).into(),
+                    );
+                    let id = (bar_and_id >> 8) as u8;
+                    if shared_memory_regions
+                        .iter()
+                        .any(|(seen_id, _)| *seen_id == id)
+                    {
+                        continue;
+                    }
+
+                    let offset_hi = pci_root_0().read_config(
+                        bus_device_function,
+                        (capability.offset + CAP_SHARED_MEMORY_OFFSET_HI_OFFSET).into(),
+                    );
+                    let length_hi = pci_root_0().read_config(
+                        bus_device_function,
+                        (capability.offset + CAP_SHARED_MEMORY_LENGTH_HI_OFFSET).into(),
+                    );
+                    let offset = u64::from(struct_info.offset) | (u64::from(offset_hi) << 32);
+                    let length = u64::from(struct_info.length) | (u64::from(length_hi) << 32);
+                    let region = validate_shared_memory_region(
+                        &device.standard_device_bar.read(),
+                        struct_info.bar,
+                        offset,
+                        length,
+                    )
+                    .filter(|_| {
+                        !shared_memory_overlaps_mappings(
+                            struct_info.bar,
+                            offset,
+                            length,
+                            &transport_config_mappings,
+                        )
+                    });
+                    if region.is_none() {
+                        warn!(
+                            "VirtIO PCI shared-memory capability id={} is outside its BAR or cannot be represented",
+                            id
+                        );
+                    }
+                    shared_memory_regions.push((id, region));
                 }
                 _ => {}
             }
         }
 
-        let common_cfg = get_bar_region::<_>(
+        let common_cfg = get_bar_region::<CommonCfg>(
             &device.standard_device_bar.read(),
             &common_cfg.ok_or(VirtioPciError::MissingCommonConfig)?,
         )?;
@@ -199,6 +333,8 @@ impl PciTransport {
         //debug!("notify.offset={},notify.length={}",notify_cfg.offset,notify_cfg.length);
         let notify_region =
             get_bar_region_slice::<_>(&device.standard_device_bar.read(), &notify_cfg)?;
+        let queue_count = unsafe { volread!(common_cfg, num_queues) as usize };
+        let queue_notify_indices = vec![None; queue_count];
         let isr_status = get_bar_region::<_>(
             &device.standard_device_bar.read(),
             &isr_cfg.ok_or(VirtioPciError::MissingIsrConfig)?,
@@ -217,11 +353,12 @@ impl PciTransport {
             common_cfg,
             notify_region,
             notify_off_multiplier,
+            queue_notify_indices,
             isr_status,
             config_space,
-            irq,
             dev_id,
             device,
+            shared_memory_regions,
         })
     }
 
@@ -229,8 +366,130 @@ impl PciTransport {
         self.device.clone()
     }
 
+    /// Reserves the CPU vector when an interrupt-driven driver actually requests IRQ setup.
+    /// Polling-only users such as virtio-vsock do not consume an MSI vector.
+    pub(super) fn setup_irq_vector(&self) -> Result<IrqNumber, VirtioPciError> {
+        let standard_device = self.device.as_standard_device().unwrap();
+        let irq_vector = standard_device.irq_vector_mut().unwrap();
+        let mut irq_vector = irq_vector.write();
+        if !irq_vector.is_empty() {
+            return Err(VirtioPciError::IrqVectorAlreadyAssigned);
+        }
+        let irq = arch_pci_msi_vector_alloc().ok_or(VirtioPciError::IrqVectorUnavailable)?;
+        if arch_pci_msi_vector_setup(irq).is_err() {
+            arch_pci_msi_vector_release(irq);
+            return Err(VirtioPciError::IrqVectorUnavailable);
+        }
+        irq_vector.push(irq);
+        Ok(irq)
+    }
+
     pub fn irq(&self) -> IrqNumber {
-        self.irq
+        *self
+            .device
+            .as_standard_device()
+            .unwrap()
+            .irq_vector_mut()
+            .unwrap()
+            .read()
+            .first()
+            .expect("VirtIO PCI IRQ must be configured before it is queried")
+    }
+
+    /// Check the final configuration interrupt routing after queue setup.
+    /// A device may reject an MSI-X assignment by returning NO_VECTOR.
+    pub(super) fn config_irq_valid(&self) -> bool {
+        if !matches!(*self.device.irq_type.read(), IrqType::Msix { .. }) {
+            return true;
+        }
+        // The common configuration mapping is held for the transport lifetime.
+        unsafe { volread!(self.common_cfg, msix_config) == VIRTIO_RECV_VECTOR_INDEX }
+    }
+
+    pub fn interrupt_ack(&self) -> PciInterruptAck {
+        PciInterruptAck {
+            isr_status: self.isr_status,
+        }
+    }
+
+    pub fn ack_interrupt_ref(&self) -> bool {
+        self.interrupt_ack().ack_interrupt()
+    }
+
+    pub fn shared_memory_region(&self, id: u8) -> Option<VirtioSharedMemoryRegion> {
+        self.shared_memory_regions
+            .iter()
+            .find(|(region_id, _)| *region_id == id)
+            .and_then(|(_, region)| *region)
+    }
+
+    pub fn reserve_shared_memory_region(
+        &self,
+        region: VirtioSharedMemoryRegion,
+    ) -> Result<PciBarSubresourceGuard, PciError> {
+        PciBarSubresourceGuard::reserve(
+            &self.device,
+            region.bar(),
+            region.offset(),
+            region.length(),
+            region.physical_address(),
+        )
+    }
+
+    fn cache_queue_notify_index(&mut self, queue: u16) -> Option<usize> {
+        let queue_index = queue as usize;
+        if queue_index >= self.queue_notify_indices.len() {
+            warn!(
+                "VirtIO PCI notify queue {} out of range, num_queues={}",
+                queue,
+                self.queue_notify_indices.len()
+            );
+            return None;
+        }
+
+        unsafe {
+            volwrite!(self.common_cfg, queue_select, queue);
+            let queue_notify_off = volread!(self.common_cfg, queue_notify_off);
+            let offset_bytes =
+                usize::from(queue_notify_off).checked_mul(self.notify_off_multiplier as usize);
+            let Some(offset_bytes) = offset_bytes else {
+                warn!(
+                    "VirtIO PCI notify offset overflow: queue={}, notify_off={}, multiplier={}",
+                    queue, queue_notify_off, self.notify_off_multiplier
+                );
+                return None;
+            };
+
+            let Some(end_offset_bytes) = offset_bytes.checked_add(size_of::<u16>()) else {
+                warn!(
+                    "VirtIO PCI notify offset end overflow: queue={}, offset_bytes={}",
+                    queue, offset_bytes
+                );
+                return None;
+            };
+            let notify_region_len_bytes = self.notify_region.len() * size_of::<u16>();
+            if end_offset_bytes > notify_region_len_bytes {
+                warn!(
+                    "VirtIO PCI notify offset out of range: queue={}, offset_bytes={}, notify_region_len_bytes={}",
+                    queue,
+                    offset_bytes,
+                    notify_region_len_bytes
+                );
+                return None;
+            }
+
+            let index = offset_bytes / size_of::<u16>();
+            self.queue_notify_indices[queue_index] = Some(index);
+            Some(index)
+        }
+    }
+
+    fn fail_bad_notify_config(&mut self, queue: u16) -> ! {
+        self.set_status(DeviceStatus::FAILED);
+        panic!(
+            "VirtIO PCI queue {} has invalid or missing notification register",
+            queue
+        );
     }
 }
 
@@ -274,17 +533,19 @@ impl Transport for PciTransport {
     }
 
     fn notify(&mut self, queue: u16) {
-        // Safe because the common config and notify region pointers are valid and we checked in
-        // get_bar_region that they were aligned.
-        unsafe {
-            volwrite!(self.common_cfg, queue_select, queue);
-            // TODO: Consider caching this somewhere (per queue).
-            let queue_notify_off = volread!(self.common_cfg, queue_notify_off);
+        let queue_index = queue as usize;
+        let Some(index) = self
+            .queue_notify_indices
+            .get(queue_index)
+            .copied()
+            .flatten()
+            .or_else(|| self.cache_queue_notify_index(queue))
+        else {
+            self.fail_bad_notify_config(queue);
+        };
 
-            let offset_bytes = usize::from(queue_notify_off) * self.notify_off_multiplier as usize;
-            let index = offset_bytes / size_of::<u16>();
-            addr_of_mut!((*self.notify_region.as_ptr())[index]).vwrite(queue);
-        }
+        // Safe because notify_region is a valid BAR mapping and the cached index is bounds-checked.
+        unsafe { addr_of_mut!((*self.notify_region.as_ptr())[index]).vwrite(queue) };
     }
 
     fn set_status(&mut self, status: DeviceStatus) {
@@ -298,7 +559,7 @@ impl Transport for PciTransport {
     fn get_status(&self) -> DeviceStatus {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
-        unsafe { DeviceStatus::from_bits_truncate(volread!(self.common_cfg, device_status).into()) }
+        unsafe { DeviceStatus::from_bits_retain(volread!(self.common_cfg, device_status).into()) }
     }
 
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {
@@ -311,9 +572,9 @@ impl Transport for PciTransport {
         &mut self,
         queue: u16,
         size: u32,
-        descriptors: PhysAddr,
-        driver_area: PhysAddr,
-        device_area: PhysAddr,
+        descriptors: VirtioPhysAddr,
+        driver_area: VirtioPhysAddr,
+        device_area: VirtioPhysAddr,
     ) {
         // Safe because the common config pointer is valid and we checked in get_bar_region that it
         // was aligned.
@@ -323,7 +584,10 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_desc, descriptors as u64);
             volwrite!(self.common_cfg, queue_driver, driver_area as u64);
             volwrite!(self.common_cfg, queue_device, device_area as u64);
-            // 这里设置队列中断对应的中断项
+            if self.cache_queue_notify_index(queue).is_none() {
+                self.fail_bad_notify_config(queue);
+            }
+            // Set the interrupt entry corresponding to the queue interrupt
             if matches!(*self.device.irq_type.read(), IrqType::Msix { .. }) {
                 if queue == QUEUE_RECEIVE {
                     volwrite!(self.common_cfg, msix_config, VIRTIO_RECV_VECTOR_INDEX);
@@ -359,6 +623,9 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, queue_driver, 0);
             volwrite!(self.common_cfg, queue_device, 0);
         }
+        if let Some(index) = self.queue_notify_indices.get_mut(queue as usize) {
+            *index = None;
+        }
     }
 
     fn queue_used(&mut self, queue: u16) -> bool {
@@ -371,12 +638,7 @@ impl Transport for PciTransport {
     }
 
     fn ack_interrupt(&mut self) -> bool {
-        // Safe because the common config pointer is valid and we checked in get_bar_region that it
-        // was aligned.
-        // Reading the ISR status resets it to 0 and causes the device to de-assert the interrupt.
-        let isr_status = unsafe { self.isr_status.as_ptr().vread() };
-        // TODO: Distinguish between queue interrupt and device configuration interrupt.
-        isr_status & 0x3 != 0
+        self.ack_interrupt_ref()
     }
 
     fn config_space<T>(&self) -> Result<NonNull<T>, Error> {
@@ -403,9 +665,10 @@ impl Transport for PciTransport {
 impl Drop for PciTransport {
     fn drop(&mut self) {
         // Reset the device when the transport is dropped.
-        self.set_status(DeviceStatus::empty());
+        let _ = self.reset();
 
-        // todo: 调用pci的中断释放函数，并且在virtio_irq_manager里面删除对应的设备的中断
+        // TODO: Call the PCI interrupt release function and remove the corresponding device
+        // interrupt from virtio_irq_manager
     }
 }
 
@@ -430,7 +693,7 @@ struct CommonCfg {
 }
 
 /// Information about a VirtIO structure within some BAR, as provided by a `virtio_pci_cap`.
-/// cfg空间在哪个bar的多少偏移处，长度多少
+/// Information about which BAR a VirtIO structure resides in, at what offset, and its length.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VirtioCapabilityInfo {
     /// The bar in which the structure can be found.
@@ -442,7 +705,7 @@ struct VirtioCapabilityInfo {
 }
 
 /// An error encountered initialising a VirtIO PCI transport.
-/// VirtIO PCI transport 初始化时的错误
+/// An error encountered during VirtIO PCI transport initialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VirtioPciError {
     /// PCI device vender ID was not the VirtIO vendor ID.
@@ -469,10 +732,14 @@ pub enum VirtioPciError {
         /// The expected alignment in bytes.
         alignment: usize,
     },
-    ///获取虚拟地址失败
+    /// Failed to obtain the virtual address.
     BarGetVaddrFailed,
     /// A generic PCI error,
     Pci(PciError),
+    /// No CPU vector is available from the architecture PCI MSI/MSI-X range.
+    IrqVectorUnavailable,
+    /// The same PCI function was already assigned an interrupt vector.
+    IrqVectorAlreadyAssigned,
 }
 
 impl Display for VirtioPciError {
@@ -511,20 +778,30 @@ impl Display for VirtioPciError {
             ),
             Self::BarGetVaddrFailed => write!(f, "Get bar virtaddress failed"),
             Self::Pci(pci_error) => pci_error.fmt(f),
+            Self::IrqVectorUnavailable => write!(f, "No PCI MSI/MSI-X CPU vector is available."),
+            Self::IrqVectorAlreadyAssigned => {
+                write!(
+                    f,
+                    "The PCI function already has an assigned interrupt vector."
+                )
+            }
         }
     }
 }
 
-/// PCI error到VirtioPciError的转换，层层上报
+/// Conversion from `PciError` to `VirtioPciError`, propagated up through the layers.
 impl From<PciError> for VirtioPciError {
     fn from(error: PciError) -> Self {
         Self::Pci(error)
     }
 }
 
-/// @brief 获取虚拟地址并将其转化为对应类型的指针
-/// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息
-/// @return Result<NonNull<T>, VirtioPciError> 成功则返回对应类型的指针，失败则返回Error
+/// Obtains a virtual address and casts it to a pointer of the corresponding type.
+///
+/// * `device_bar` - The BAR info structure.
+/// * `struct_info` - The location info of the config space.
+///
+/// Returns a pointer of type `T` on success, or a `VirtioPciError` on failure.
 fn get_bar_region<T>(
     device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
@@ -536,16 +813,17 @@ fn get_bar_region<T>(
     if bar_address == 0 {
         return Err(VirtioPciError::BarNotAllocated(struct_info.bar));
     }
-    if struct_info.offset + struct_info.length > bar_size
+    if u64::from(struct_info.offset)
+        .checked_add(u64::from(struct_info.length))
+        .is_none_or(|end| end > bar_size)
         || size_of::<T>() > struct_info.length as usize
     {
         return Err(VirtioPciError::BarOffsetOutOfRange);
     }
     //debug!("Chossed bar ={},used={}",struct_info.bar,struct_info.offset + struct_info.length);
-    let vaddr = (bar_info
-        .virtual_address()
-        .ok_or(VirtioPciError::BarGetVaddrFailed)?)
-        + struct_info.offset as usize;
+    let vaddr = bar_info
+        .virtual_address_at(u64::from(struct_info.offset), struct_info.length as usize)
+        .ok_or(VirtioPciError::BarGetVaddrFailed)?;
     if !vaddr.data().is_multiple_of(align_of::<T>()) {
         return Err(VirtioPciError::Misaligned {
             vaddr,
@@ -556,9 +834,12 @@ fn get_bar_region<T>(
     Ok(vaddr.cast())
 }
 
-/// @brief 获取虚拟地址并将其转化为对应类型的切片的指针
-/// @param device_bar 存储bar信息的结构体 struct_info 存储cfg空间的位置信息切片的指针
-/// @return Result<NonNull<[T]>, VirtioPciError> 成功则返回对应类型的指针切片，失败则返回Error
+/// Obtains a virtual address and casts it to a pointer to a slice of the corresponding type.
+///
+/// * `device_bar` - The BAR info structure.
+/// * `struct_info` - The location info of the config space.
+///
+/// Returns a pointer to a `[T]` slice on success, or a `VirtioPciError` on failure.
 fn get_bar_region_slice<T>(
     device_bar: &PciStandardDeviceBar,
     struct_info: &VirtioCapabilityInfo,
@@ -574,4 +855,151 @@ fn get_bar_region_slice<T>(
 
 fn nonnull_slice_from_raw_parts<T>(data: NonNull<T>, len: usize) -> NonNull<[T]> {
     NonNull::new(ptr::slice_from_raw_parts_mut(data.as_ptr(), len)).unwrap()
+}
+
+fn validate_shared_memory_region(
+    device_bar: &PciStandardDeviceBar,
+    bar: u8,
+    offset: u64,
+    length: u64,
+) -> Option<VirtioSharedMemoryRegion> {
+    let bar_info = device_bar.get_bar(bar).ok()?;
+    let (bar_address, bar_size) = bar_info.memory_address_size()?;
+    validate_shared_memory_range(bar_address, bar_size, bar, offset, length)
+}
+
+fn shared_memory_overlaps_mappings(
+    bar: u8,
+    offset: u64,
+    length: u64,
+    mappings: &[PciBarMappingRequest],
+) -> bool {
+    let Some(end) = offset.checked_add(length) else {
+        return true;
+    };
+    let page_mask = !((crate::arch::MMArch::PAGE_SIZE as u64) - 1);
+    let cache_start = offset & page_mask;
+    let Some(cache_end) = end
+        .checked_add(crate::arch::MMArch::PAGE_SIZE as u64 - 1)
+        .map(|value| value & page_mask)
+    else {
+        return true;
+    };
+    mappings.iter().any(|mapping| {
+        if mapping.bar != bar {
+            return false;
+        }
+        let Some(mapping_end) = mapping.offset.checked_add(mapping.length) else {
+            return true;
+        };
+        let mapping_start = mapping.offset & page_mask;
+        let mapping_end =
+            mapping_end.saturating_add(crate::arch::MMArch::PAGE_SIZE as u64 - 1) & page_mask;
+        cache_start < mapping_end && mapping_start < cache_end
+    })
+}
+
+fn validate_shared_memory_range(
+    bar_address: u64,
+    bar_size: u64,
+    bar: u8,
+    offset: u64,
+    length: u64,
+) -> Option<VirtioSharedMemoryRegion> {
+    if bar_address == 0 {
+        return None;
+    }
+
+    let end = offset.checked_add(length)?;
+    if end > bar_size {
+        return None;
+    }
+
+    let bar_address = usize::try_from(bar_address).ok()?;
+    let offset = usize::try_from(offset).ok()?;
+    let physical_base = PciArch::address_pci_to_physical(PciAddr::new(bar_address));
+    let physical_address = physical_base.data().checked_add(offset)?;
+    Some(VirtioSharedMemoryRegion::new(
+        PhysAddr::new(physical_address),
+        length,
+        bar,
+        offset as u64,
+    ))
+}
+
+#[cfg(test)]
+mod shared_memory_tests {
+    use super::{
+        shared_memory_cap_len_supported, shared_memory_overlaps_mappings,
+        validate_shared_memory_range,
+    };
+    use crate::driver::pci::pci::PciBarMappingRequest;
+
+    #[test]
+    fn accepts_padded_shared_memory_capability() {
+        assert!(!shared_memory_cap_len_supported(23));
+        assert!(shared_memory_cap_len_supported(24));
+        assert!(shared_memory_cap_len_supported(28));
+    }
+
+    #[test]
+    fn validates_shared_memory_range() {
+        let region = validate_shared_memory_range(0x1000, 0x4000, 2, 0x1000, 0x2000).unwrap();
+        assert_eq!(region.physical_address().data(), 0x2000);
+        assert_eq!(region.length(), 0x2000);
+    }
+
+    #[test]
+    fn rejects_unallocated_shared_memory_bar() {
+        assert!(validate_shared_memory_range(0, 0x4000, 2, 0x1000, 0x2000).is_none());
+    }
+
+    #[test]
+    fn preserves_zero_length_region() {
+        let region = validate_shared_memory_range(0x1000, 0x4000, 2, 0x4000, 0).unwrap();
+        assert_eq!(region.physical_address().data(), 0x5000);
+        assert_eq!(region.length(), 0);
+    }
+
+    #[test]
+    fn rejects_range_end_overflow() {
+        assert!(validate_shared_memory_range(0x1000, u64::MAX, 2, u64::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn rejects_range_outside_bar() {
+        assert!(validate_shared_memory_range(0x1000, 0x4000, 2, 0x3000, 0x1001).is_none());
+    }
+
+    #[test]
+    fn rejects_shared_page_with_transport_mapping() {
+        let mappings = [PciBarMappingRequest {
+            bar: 2,
+            offset: 0x80,
+            length: 0x100,
+        }];
+        assert!(shared_memory_overlaps_mappings(2, 0x800, 0x800, &mappings));
+    }
+
+    #[test]
+    fn accepts_mapping_on_adjacent_page() {
+        let mappings = [PciBarMappingRequest {
+            bar: 2,
+            offset: 0,
+            length: 0x1000,
+        }];
+        assert!(!shared_memory_overlaps_mappings(
+            2, 0x1000, 0x1000, &mappings
+        ));
+    }
+
+    #[test]
+    fn ignores_mapping_in_different_bar() {
+        let mappings = [PciBarMappingRequest {
+            bar: 4,
+            offset: 0,
+            length: 0x2000,
+        }];
+        assert!(!shared_memory_overlaps_mappings(2, 0, 0x2000, &mappings));
+    }
 }

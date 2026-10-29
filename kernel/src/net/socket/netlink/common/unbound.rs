@@ -1,7 +1,9 @@
 use crate::{
     filesystem::epoll::EPollEventType,
+    filesystem::vfs::fasync::FAsyncItems,
     libs::wait_queue::WaitQueue,
     net::socket::{
+        common::EPollItems,
         netlink::{
             addr::{multicast::GroupIdSet, NetlinkSocketAddr},
             common::bound::BoundNetlink,
@@ -10,7 +12,7 @@ use crate::{
         },
         utils::datagram_common,
     },
-    process::namespace::net_namespace::NetNamespace,
+    process::{cred::Cred, namespace::net_namespace::NetNamespace},
 };
 use alloc::sync::Arc;
 use core::marker::PhantomData;
@@ -19,13 +21,26 @@ use system_error::SystemError;
 #[derive(Debug)]
 pub struct UnboundNetlink<P: SupportedNetlinkProtocol> {
     groups: GroupIdSet,
-    phantom: PhantomData<BoundNetlink<P::Message>>,
+    epoll_items: Arc<EPollItems>,
+    fasync_items: Arc<FAsyncItems>,
+    opener_cred: Arc<Cred>,
+    message_queue: MessageQueue<P::Message>,
+    phantom: PhantomData<BoundNetlink<P>>,
 }
 
 impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(
+        epoll_items: Arc<EPollItems>,
+        fasync_items: Arc<FAsyncItems>,
+        opener_cred: Arc<Cred>,
+        message_queue: MessageQueue<P::Message>,
+    ) -> Self {
         Self {
             groups: GroupIdSet::new_empty(),
+            epoll_items,
+            fasync_items,
+            opener_cred,
+            message_queue,
             phantom: PhantomData,
         }
     }
@@ -45,26 +60,36 @@ impl<P: SupportedNetlinkProtocol> UnboundNetlink<P> {
 
 impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P> {
     type Endpoint = NetlinkSocketAddr;
-    type Bound = BoundNetlink<P::Message>;
+    type Bound = BoundNetlink<P>;
 
     fn bind(
         &mut self,
         endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
-    ) -> Result<BoundNetlink<P::Message>, SystemError> {
-        let message_queue = MessageQueue::<P::Message>::new();
+    ) -> Result<BoundNetlink<P>, SystemError> {
+        let message_queue = self.message_queue.clone();
         let bound_handle = {
             let endpoint = {
                 let mut endpoint = *endpoint;
                 endpoint.add_groups(self.groups);
                 endpoint
             };
-            let receiver = MessageReceiver::new(message_queue.clone(), wait_queue);
+            let receiver = MessageReceiver::new(
+                message_queue.clone(),
+                wait_queue,
+                self.epoll_items.clone(),
+                self.fasync_items.clone(),
+            );
             <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
-        Ok(BoundNetlink::new(bound_handle, message_queue, netns))
+        Ok(BoundNetlink::new(
+            bound_handle,
+            message_queue,
+            netns,
+            self.opener_cred.clone(),
+        ))
     }
 
     fn bind_ephemeral(
@@ -72,8 +97,8 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
         _remote_endpoint: &Self::Endpoint,
         wait_queue: Arc<WaitQueue>,
         netns: Arc<NetNamespace>,
-    ) -> Result<BoundNetlink<P::Message>, SystemError> {
-        let message_queue = MessageQueue::<P::Message>::new();
+    ) -> Result<BoundNetlink<P>, SystemError> {
+        let message_queue = self.message_queue.clone();
 
         let bound_handle = {
             let endpoint = {
@@ -81,11 +106,21 @@ impl<P: SupportedNetlinkProtocol> datagram_common::Unbound for UnboundNetlink<P>
                 endpoint.add_groups(self.groups);
                 endpoint
             };
-            let receiver = MessageReceiver::new(message_queue.clone(), wait_queue);
+            let receiver = MessageReceiver::new(
+                message_queue.clone(),
+                wait_queue,
+                self.epoll_items.clone(),
+                self.fasync_items.clone(),
+            );
             <P as SupportedNetlinkProtocol>::bind(&endpoint, receiver, netns.clone())?
         };
 
-        Ok(BoundNetlink::new(bound_handle, message_queue, netns))
+        Ok(BoundNetlink::new(
+            bound_handle,
+            message_queue,
+            netns,
+            self.opener_cred.clone(),
+        ))
     }
 
     fn check_io_events(&self) -> EPollEventType {

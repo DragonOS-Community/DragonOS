@@ -1,0 +1,4 @@
+# Required default binaries, exact case counts, and environment-dependent skips.
+# Keep in sync with the pinned gVisor test archive in default.nix.
+mount_test 87
+pivot_root_test 19 PivotRootTest.OnRootFS

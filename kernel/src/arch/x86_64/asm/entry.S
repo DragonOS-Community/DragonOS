@@ -28,6 +28,25 @@ RFLAGS	=	0xa8
 OLD_RSP	=	0xb0
 OLDSS	=	0xb8
 
+// DS/ES are user-controlled through ptrace. Linux accepts selectors with RPL3
+// even when the descriptor does not exist, so restore them with the same
+// exception-table clearing semantics used by the FS/GS context switch.
+.macro RESTORE_DATA_SEGMENT segment
+    popq %rax
+.Lload_\segment\()_\@:
+    movq %rax, %\segment
+    jmp .Lload_\segment\()_done_\@
+.Lload_\segment\()_fixup_\@:
+    movq $0, %rax
+    movq %rax, %\segment
+.Lload_\segment\()_done_\@:
+    .pushsection __ex_table, "a"
+    .balign 8
+    .quad .Lload_\segment\()_\@ - .
+    .quad .Lload_\segment\()_fixup_\@ - . + 8
+    .popsection
+.endm
+
 Restore_all:
     // === 恢复调用现场 ===
     popq %r15
@@ -45,15 +64,13 @@ Restore_all:
     popq %rdi
     popq %rbp
 
-    popq %rax   //  不允许直接pop到ds
-    movq %rax, %ds
-
-    popq %rax
-    movq %rax, %es
+    RESTORE_DATA_SEGMENT ds
+    RESTORE_DATA_SEGMENT es
 
     popq %rax
     addq $0x10, %rsp // 弹出变量FUNC和errcode
     
+.Lnative_user_iret:
     iretq
 
 ret_from_exception:
@@ -114,7 +131,6 @@ Err_Code:
 
     cld
     
-    movq ERRCODE(%rsp), %rsi    // 把错误码装进rsi，作为函数的第二个参数
     movq FUNC(%rsp), %rdx
     
     movq $0x10, %rdi    // 加载内核段的地址
@@ -123,18 +139,65 @@ Err_Code:
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
-__entry_err_code_before_gs_check_1:
-    pushq %rcx
-    movq CS(%rdi), %rcx
-    and $0x3, %rcx
-    cmp $0x3, %rcx
+    // Ordinary user exceptions are the hot path. Like Linux error_entry,
+    // inspect the fault frame's privilege first and only compare return-site
+    // labels for a kernel-mode exception that may have been raised by iretq.
+    movq CS(%rdi), %rax
+    andq $3, %rax
+    cmpq $3, %rax
+    je .Lerror_entry_from_user
 
-    jne __entry_err_code_after_gs_check_1
+    // An iretq fault arrives while CPL is still 0, immediately below the
+    // original five-word user return frame, and after swapgs selected user GS.
+    // Rebuild this TrapFrame as a user exception, as Linux fixup_bad_iret does,
+    // so #GP/#NP/#SS are delivered to the tracee with the original selectors.
+    leaq .Lnative_user_iret(%rip), %rax
+    cmpq %rax, RIP(%rdi)
+    je .Lfixup_bad_user_iret
+    leaq .Lsyscall_user_iret(%rip), %rax
+    cmpq %rax, RIP(%rdi)
+    jne .Lerror_entry_from_kernel
+
+.Lfixup_bad_user_iret:
+    // OLD_RSP is the fault frame's saved kernel stack pointer. It points at
+    // the original five-word IRET target, matching Linux fixup_bad_iret().
+    movq OLD_RSP(%rdi), %rax
+    movq 0x8(%rax), %rcx
+    andq $3, %rcx
+    cmpq $3, %rcx
+    jne .Lerror_entry_from_kernel
     swapgs
+    movq 0x0(%rax), %rcx
+    movq %rcx, RIP(%rdi)
+    movq 0x8(%rax), %rcx
+    movq %rcx, CS(%rdi)
+    movq 0x10(%rax), %rcx
+    movq %rcx, RFLAGS(%rdi)
+    movq 0x18(%rax), %rcx
+    movq %rcx, OLD_RSP(%rdi)
+    movq 0x20(%rax), %rcx
+    movq %rcx, OLDSS(%rdi)
+    pushq %rcx
+    jmp __entry_err_code_after_gs_check_1
+
+.Lerror_entry_from_user:
+    swapgs
+.Lerror_entry_from_kernel:
+    pushq %rcx
 
 __entry_err_code_after_gs_check_1:
     popq %rcx
 
+    // Make RCU watch user-origin entries before high-level kernel code.
+    movq %rsp, %rdi
+    callq irqentry_enter
+    // irqentry_enter follows the SysV ABI and may clobber argument registers.
+    // Preserve the original exception code in the frame until after it
+    // returns, then establish the handler ABI and orig_rax sentinel together.
+    movq ERRCODE(%rsp), %rsi
+    movq $-1, ERRCODE(%rsp)
+    movq FUNC(%rsp), %rdx
+    movq %rsp, %rdi
     callq *%rdx //调用服务程序 带*号表示调用的是绝对地址
 
 __entry_err_code_to_ret_from_exception:
@@ -144,7 +207,7 @@ __entry_err_code_to_ret_from_exception:
 // 0 #DE 除法错误
 ENTRY(trap_divide_error)
     
-    pushq $0    //由于#DE不会产生错误码，但是为了保持弹出结构的一致性，故也压入一个错误码0
+    pushq $-1    // #DE has no error code; push -1 as the orig_rax sentinel (matching Linux: not a syscall)
     pushq %rax  // 先将rax入栈
     leaq do_divide_error(%rip), %rax    // 获取中断服务程序的地址
     
@@ -153,7 +216,7 @@ ENTRY(trap_divide_error)
 
 // 1 #DB 调试异常
 ENTRY(trap_debug)
-    pushq $0    
+    pushq $-1
     pushq %rax  
     leaq do_debug(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -172,7 +235,7 @@ ENTRY(trap_nmi)
 
 // 3 #BP 断点异常
 ENTRY(trap_int3)
-    pushq $0
+    pushq $-1
     pushq %rax
     leaq do_int3(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -180,7 +243,7 @@ ENTRY(trap_int3)
 
 // 4 #OF 溢出异常
 ENTRY(trap_overflow)
-    pushq $0
+    pushq $-1    // #OF has no error code; orig_rax sentinel
     pushq %rax
     leaq do_overflow(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -188,7 +251,7 @@ ENTRY(trap_overflow)
 
 // 5 #BR 越界异常
 ENTRY(trap_bounds)
-    pushq $0
+    pushq $-1    // #BR has no error code; orig_rax sentinel
     pushq %rax
     leaq do_bounds(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -196,7 +259,7 @@ ENTRY(trap_bounds)
 
 // 6 #UD 无效/未定义的机器码
 ENTRY(trap_undefined_opcode)
-    pushq $0
+    pushq $-1    // #UD has no error code; orig_rax sentinel
     pushq %rax
     leaq do_undefined_opcode(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -204,7 +267,7 @@ ENTRY(trap_undefined_opcode)
 
 // 7 #NM 设备异常（FPU不存在）
 ENTRY(trap_dev_not_avaliable)
-    pushq $0
+    pushq $-1    // #NM has no error code; orig_rax sentinel
     pushq %rax
     leaq do_dev_not_avaliable(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -212,14 +275,18 @@ ENTRY(trap_dev_not_avaliable)
 
 // 8 #DF 双重错误
 ENTRY(trap_double_fault)
-    pushq %rax
-    leaq do_double_fault(%rip), %rax    // 获取中断服务程序的地址
-    xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
-    jmp Err_Code
+    // IST supplies a complete hardware frame even when the interrupted stack
+    // is unusable. Never enter ordinary error_entry, bad-IRET fixup, RCU or
+    // task-state handling here. The fatal handler needs no GS/PCB state.
+    cld
+    movq %rsp, %rdi
+    andq $-16, %rsp
+    callq do_double_fault
+    ud2
 
 // 9 协处理器越界（保留）
 ENTRY(trap_coprocessor_segment_overrun)
-    pushq $0
+    pushq $-1    // no error code; orig_rax sentinel
     pushq %rax
     leaq do_coprocessor_segment_overrun(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -268,7 +335,7 @@ ENTRY(trap_page_fault)
 
 // 16 #MF X87 FPU错误（计算错误）
 ENTRY(trap_x87_FPU_error)
-    pushq $0
+    pushq $-1    // #MF has no error code; orig_rax sentinel
     pushq %rax
     leaq do_x87_FPU_error(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -283,7 +350,7 @@ ENTRY(trap_alignment_check)
 
 // 18 #MC 机器检测
 ENTRY(trap_machine_check)
-    pushq $0
+    pushq $-1    // #MC has no error code; orig_rax sentinel
     pushq %rax
     leaq do_machine_check(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -291,7 +358,7 @@ ENTRY(trap_machine_check)
 
 // 19 #XM SIMD浮点异常
 ENTRY(trap_SIMD_exception)
-    pushq $0
+    pushq $-1    // #XM has no error code; orig_rax sentinel
     pushq %rax
     leaq do_SIMD_exception(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -299,7 +366,7 @@ ENTRY(trap_SIMD_exception)
 
 // 20 #VE 虚拟化异常
 ENTRY(trap_virtualization_exception)
-    pushq $0
+    pushq $-1    // #VE has no error code; orig_rax sentinel
     pushq %rax
     leaq do_virtualization_exception(%rip), %rax    // 获取中断服务程序的地址
     xchgq %rax, (%rsp)  // 把FUNC的地址换入栈中
@@ -372,15 +439,17 @@ ENTRY(syscall_64)
 
     movq %rsp, %rdi // 把栈指针装入rdi，作为函数的第一个的参数
 
+    callq irqentry_enter
+    movq %rsp, %rdi
+    movq FUNC(%rsp), %rdx
     sti
     callq *%rdx //调用服务程序
 
     // 将原本要返回的栈帧的栈指针传入 irqentry_exit 的第一个参数
     movq %rsp, %rdi
 
-    callq irqentry_exit
-
     cli
+    callq irqentry_exit
     
     // === 恢复调用现场 ===
     popq %r15
@@ -398,11 +467,8 @@ ENTRY(syscall_64)
     popq %rdi
     popq %rbp
 
-    popq %rax           // 不允许直接pop到ds
-    movq %rax, %ds
-
-    popq %rax
-    movq %rax, %es
+    RESTORE_DATA_SEGMENT ds
+    RESTORE_DATA_SEGMENT es
 
     popq %rax
     addq $0x10, %rsp    // 弹出变量FUNC和errcode
@@ -410,6 +476,10 @@ ENTRY(syscall_64)
     cmpq (%rsp), %rcx
     jne .L_syscall_must_use_iret
     cmpq 0x10(%rsp), %r11
+    jne .L_syscall_must_use_iret
+    cmpq $51, 0x8(%rsp)     // USER_CS
+    jne .L_syscall_must_use_iret
+    cmpq $43, 0x20(%rsp)    // USER_DS / user SS
     jne .L_syscall_must_use_iret
 
     popq %rcx           // pop rip到rcx
@@ -425,4 +495,5 @@ ENTRY(syscall_64)
 // 此时栈结构完美符合 iretq 要求: [RIP, CS, RFLAGS, RSP, SS]
 .L_syscall_must_use_iret: 
     swapgs
+.Lsyscall_user_iret:
     iretq

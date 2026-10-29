@@ -2,10 +2,12 @@
 //!
 //! 这个目录包含了进程打开的所有文件描述符的详细信息
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         pid::ProcPidTarget,
-        template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
+        template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFile, ProcFileBuilder},
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -33,7 +35,9 @@ impl FdInfoDirOps {
     }
 
     fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        // `proc_readfd_common()`/`seq_show()` walk `get_proc_task(inode)`, so a
+        // hidden tid reports the descriptor table of the thread it names.
+        self.target.task()
     }
 }
 
@@ -47,11 +51,18 @@ impl DirOps for FdInfoDirOps {
         let fd = name.parse::<i32>().map_err(|_| SystemError::ENOENT)?;
 
         // 获取进程引用
-        let process = self.get_process().ok_or(SystemError::ESRCH)?;
+        let process = self.get_process().ok_or(SystemError::ENOENT)?;
 
         // 检查文件描述符是否存在
         {
-            let fd_table = process.fd_table();
+            // The process may have reached exit_files() after the proc target
+            // was resolved. A disappearing fd table is normal procfs churn,
+            // not an invariant which may be unwrapped.
+            let fd_table = process
+                .basic()
+                .try_fd_table()
+                .clone()
+                .ok_or(SystemError::ENOENT)?;
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
@@ -81,8 +92,10 @@ impl DirOps for FdInfoDirOps {
 
         // 获取进程的所有文件描述符
         if let Some(process) = self.get_process() {
+            let Some(fd_table) = process.basic().try_fd_table().clone() else {
+                return;
+            };
             let fds: Vec<i32> = {
-                let fd_table = process.fd_table();
                 let fd_table_guard = fd_table.read();
                 fd_table_guard.iter().map(|(fd, _)| fd).collect()
             };
@@ -95,44 +108,82 @@ impl DirOps for FdInfoDirOps {
             }
         }
     }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        child
+            .downcast_ref::<ProcFile<FdInfoFileOps>>()
+            .is_some_and(|file| file.ops().is_current())
+    }
 }
 
 /// /proc/[pid]/fdinfo/[fd] 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct FdInfoFileOps {
-    /// 存储 PID，在需要时动态查找进程
-    // pid: RawPid,
-    // fd: i32,
-    // 暂时不用参数
-    phantom: core::marker::PhantomData<()>,
+    target: ProcPidTarget,
+    fd: i32,
 }
 
 impl FdInfoFileOps {
     pub fn new_inode(
-        _target: ProcPidTarget,
-        _fd: i32,
+        target: ProcPidTarget,
+        fd: i32,
         parent: Weak<dyn IndexNode>,
     ) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(
-            Self {
-                phantom: core::marker::PhantomData,
-            },
-            InodeMode::S_IRUGO,
-        )
-        .parent(parent)
-        .build()
-        .unwrap()
+        ProcFileBuilder::new(Self { target, fd }, InodeMode::S_IRUGO)
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+
+    fn is_current(&self) -> bool {
+        let Some(process) = self.target.task() else {
+            return false;
+        };
+        let Some(fd_table) = process.basic().try_fd_table().clone() else {
+            return false;
+        };
+        let fd_table_guard = fd_table.read();
+        fd_table_guard.get_file_by_fd(self.fd).is_some()
     }
 }
 
 impl FileOps for FdInfoFileOps {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
+    fn open(
         &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &crate::filesystem::vfs::file::FileFlags,
+    ) -> Result<(), SystemError> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(SystemError::ENOENT)
+        }
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
+        &self,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Ok(0)
+        crate::filesystem::procfs::utils::proc_snapshot_operation(operation, data, || {
+            if self.is_current() {
+                // Existing fdinfo output is empty; preserve its independent
+                // limitation while using the real single_open seek lifecycle.
+                Ok(alloc::vec::Vec::new())
+            } else {
+                Err(SystemError::ENOENT)
+            }
+        })
     }
 }

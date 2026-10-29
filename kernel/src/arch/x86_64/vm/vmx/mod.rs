@@ -10,16 +10,20 @@ use log::warn;
 use x86_64::registers::control::Cr3Flags;
 use x86_64::structures::paging::PhysFrame;
 
-use crate::arch::process::table::USER_DS;
+use crate::arch::interrupt::ipi::{send_ipi, IPI_NUM_LOADED_VMCS_CLEAR};
 use crate::arch::vm::mmu::kvm_mmu::KvmMmu;
 use crate::arch::vm::uapi::kvm_exit;
 use crate::arch::vm::uapi::{
     AC_VECTOR, BP_VECTOR, DB_VECTOR, GP_VECTOR, MC_VECTOR, NM_VECTOR, PF_VECTOR, UD_VECTOR,
 };
 use crate::arch::vm::vmx::vmcs::VmcsIntrHelper;
+use crate::exception::{
+    ipi::{IpiKind, IpiTarget},
+    HardwareIrqNumber,
+};
 use crate::libs::spinlock::SpinLockGuard;
+use crate::mm::allocator::physical::{PhysicalBox, PhysicalPage};
 use crate::mm::VirtAddr;
-use crate::process::ProcessManager;
 use crate::virt::vm::kvm_host::vcpu::GuestDebug;
 use crate::{
     arch::{
@@ -36,7 +40,10 @@ use crate::{
         percpu::{PerCpu, PerCpuVar},
         MemoryManagementArch,
     },
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    smp::{
+        core::smp_get_processor_id,
+        cpu::{smp_cpu_manager, ProcessorId},
+    },
     virt::vm::{kvm_dev::kvm_init, kvm_host::vcpu::VirtCpu, user_api::UapiKvmSegment},
 };
 use alloc::{alloc::Global, boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
@@ -51,8 +58,6 @@ use system_error::SystemError;
 use x86::controlregs::{cr2, cr2_write};
 use x86::dtables::ldtr;
 use x86::msr::wrmsr;
-use x86::segmentation::load_ds;
-use x86::segmentation::load_es;
 use x86::segmentation::{ds, es, fs, gs};
 use x86::vmx::vmcs::ro;
 use x86::{
@@ -119,7 +124,7 @@ pub struct VmxKvmInitFunc;
 impl VmxKvmInitFunc {
     pub fn setup_per_cpu(&self) {
         let mut vmcs_areas = Vec::new();
-        vmcs_areas.resize(PerCpu::MAX_CPU_NUM as usize, VMControlStructure::new());
+        vmcs_areas.resize_with(PerCpu::MAX_CPU_NUM as usize, VMControlStructure::new);
         unsafe { VMXAREA = PerCpuVar::new(vmcs_areas) };
 
         let mut percpu_current_vmcs = Vec::new();
@@ -311,6 +316,20 @@ impl KvmInitFunc for VmxKvmInitFunc {
 #[derive(Debug)]
 pub struct VmxKvmFunc;
 
+#[derive(Clone)]
+struct RemoteLoadedVmcsClear {
+    loaded_vmcs: Arc<LockedLoadedVmcs>,
+    vmcs: Arc<self::vmcs::LockedVMControlStructure>,
+    shadow_vmcs: Option<Arc<self::vmcs::LockedVMControlStructure>>,
+    launched: bool,
+    owner: ProcessorId,
+}
+
+static REMOTE_LOADED_VMCS_CLEAR_SERIAL: SpinLock<()> = SpinLock::new(());
+static REMOTE_LOADED_VMCS_CLEAR_REQUEST: SpinLock<Option<RemoteLoadedVmcsClear>> =
+    SpinLock::new(None);
+static REMOTE_LOADED_VMCS_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
+
 pub struct VmxKvmFuncConfig {
     pub have_set_apic_access_page_addr: bool,
     pub have_update_cr8_intercept: bool,
@@ -329,29 +348,31 @@ impl VmxKvmFunc {
         _buddy: Option<Arc<LockedLoadedVmcs>>,
     ) {
         let vmx = vcpu.vmx();
-        let already_loaded = vmx.loaded_vmcs.lock().cpu == cpu;
+        let already_loaded = vmx.loaded_vmcs.owner_cpu() == cpu;
 
         if !already_loaded {
             Self::loaded_vmcs_clear(&vmx.loaded_vmcs);
-            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-            current_loaded_vmcs_list_mut().push_back(vmx.loaded_vmcs.clone());
         }
 
-        if let Some(prev) = current_vmcs() {
+        {
+            // The remote-clear IPI accesses both per-CPU structures. Keep the
+            // list update and active-VMCS transition in one IRQ-safe section.
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+
+            if !already_loaded {
+                current_loaded_vmcs_list_mut().push_back(vmx.loaded_vmcs.clone());
+            }
+
             let vmcs = vmx.loaded_vmcs.lock().vmcs.clone();
-            if !Arc::ptr_eq(&vmcs, prev) {
+            if !current_vmcs()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &vmcs))
+            {
                 VmxAsm::vmcs_load(vmcs.phys_addr());
                 *current_vmcs_mut() = Some(vmcs);
 
                 // TODO:buddy barrier?
             }
-        } else {
-            let vmcs = vmx.loaded_vmcs.lock().vmcs.clone();
-            VmxAsm::vmcs_load(vmcs.phys_addr());
-            *current_vmcs_mut() = Some(vmcs);
-
-            // TODO:buddy barrier?
         }
 
         if !already_loaded {
@@ -361,7 +382,6 @@ impl VmxKvmFunc {
                 x86::dtables::sgdt(&mut pseudo_descriptpr);
             };
 
-            vmx.loaded_vmcs.lock().cpu = cpu;
             let id = vmx.loaded_vmcs.lock().vmcs.lock().revision_id();
             debug!(
                 "revision_id {id} req {:?}",
@@ -369,12 +389,14 @@ impl VmxKvmFunc {
             );
             vcpu.request(VirtCpuRequest::KVM_REQ_TLB_FLUSH);
 
+            let tr_selector = unsafe { x86::task::tr().bits() };
+            VmxAsm::vmx_vmwrite(host::TR_SELECTOR, tr_selector as u64);
             VmxAsm::vmx_vmwrite(
                 host::TR_BASE,
                 KvmX86Asm::get_segment_base(
                     pseudo_descriptpr.base,
                     pseudo_descriptpr.limit,
-                    unsafe { x86::task::tr().bits() },
+                    tr_selector,
                 ),
             );
 
@@ -383,16 +405,24 @@ impl VmxKvmFunc {
             VmxAsm::vmx_vmwrite(host::IA32_SYSENTER_ESP, unsafe {
                 rdmsr(msr::IA32_SYSENTER_ESP)
             });
+
+            // Publish ownership only after the VMCS and host state are ready.
+            vcpu.vmx().loaded_vmcs.set_owner_cpu(cpu);
         }
     }
 
     pub fn loaded_vmcs_clear(loaded_vmcs: &Arc<LockedLoadedVmcs>) {
-        let mut guard = loaded_vmcs.lock();
-        if guard.cpu == ProcessorId::INVALID {
+        let owner = loaded_vmcs.owner_cpu();
+        if owner == ProcessorId::INVALID {
             return;
         }
 
-        if guard.cpu == smp_get_processor_id() {
+        if owner == smp_get_processor_id() {
+            let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            let mut guard = loaded_vmcs.lock();
+            if loaded_vmcs.owner_cpu() != owner {
+                return;
+            }
             if let Some(vmcs) = current_vmcs() {
                 if Arc::ptr_eq(vmcs, &guard.vmcs) {
                     *current_vmcs_mut() = None;
@@ -407,14 +437,90 @@ impl VmxKvmFunc {
                 }
             }
 
-            let _ = current_loaded_vmcs_list_mut().extract_if(|x| Arc::ptr_eq(x, loaded_vmcs));
+            current_loaded_vmcs_list_mut()
+                .extract_if(|x| Arc::ptr_eq(x, loaded_vmcs))
+                .for_each(drop);
 
-            guard.cpu = ProcessorId::INVALID;
             guard.launched = false;
+            loaded_vmcs.set_owner_cpu(ProcessorId::INVALID);
         } else {
-            // 交由对应cpu处理
-            todo!()
+            Self::remote_loaded_vmcs_clear(loaded_vmcs, owner);
         }
+    }
+
+    fn remote_loaded_vmcs_clear(loaded_vmcs: &Arc<LockedLoadedVmcs>, owner: ProcessorId) {
+        let _serial = REMOTE_LOADED_VMCS_CLEAR_SERIAL.lock();
+        if loaded_vmcs.owner_cpu() != owner {
+            return;
+        }
+        assert!(
+            smp_cpu_manager().is_online_cpu(owner),
+            "VMCS owner CPU is offline"
+        );
+
+        let request = {
+            let guard = loaded_vmcs.lock();
+            if loaded_vmcs.owner_cpu() != owner {
+                return;
+            }
+            RemoteLoadedVmcsClear {
+                loaded_vmcs: loaded_vmcs.clone(),
+                vmcs: guard.vmcs.clone(),
+                shadow_vmcs: guard.shadow_vmcs.clone(),
+                launched: guard.launched,
+                owner,
+            }
+        };
+        REMOTE_LOADED_VMCS_CLEAR_DONE.store(false, Ordering::Relaxed);
+        {
+            let mut slot = REMOTE_LOADED_VMCS_CLEAR_REQUEST.lock();
+            assert!(slot.is_none());
+            *slot = Some(request);
+        }
+
+        send_ipi(
+            IpiKind::SpecVector(HardwareIrqNumber::new(IPI_NUM_LOADED_VMCS_CLEAR.data())),
+            IpiTarget::Specified(owner),
+        );
+        while !REMOTE_LOADED_VMCS_CLEAR_DONE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        *REMOTE_LOADED_VMCS_CLEAR_REQUEST.lock() = None;
+
+        assert_eq!(loaded_vmcs.owner_cpu(), ProcessorId::INVALID);
+        loaded_vmcs.lock().launched = false;
+    }
+
+    /// Clears a loaded VMCS on its owning CPU from the dedicated IPI context.
+    pub fn handle_remote_loaded_vmcs_clear() {
+        let request = REMOTE_LOADED_VMCS_CLEAR_REQUEST.lock().clone();
+        let Some(request) = request else {
+            return;
+        };
+        if request.owner != smp_get_processor_id()
+            || request.loaded_vmcs.owner_cpu() != request.owner
+        {
+            REMOTE_LOADED_VMCS_CLEAR_DONE.store(true, Ordering::Release);
+            return;
+        }
+
+        if current_vmcs()
+            .as_ref()
+            .is_some_and(|vmcs| Arc::ptr_eq(vmcs, &request.vmcs))
+        {
+            *current_vmcs_mut() = None;
+        }
+        VmxAsm::vmclear(request.vmcs.phys_addr());
+        if request.launched {
+            if let Some(shadow) = &request.shadow_vmcs {
+                VmxAsm::vmclear(shadow.phys_addr());
+            }
+        }
+        current_loaded_vmcs_list_mut()
+            .extract_if(|entry| Arc::ptr_eq(entry, &request.loaded_vmcs))
+            .for_each(drop);
+        request.loaded_vmcs.set_owner_cpu(ProcessorId::INVALID);
+        REMOTE_LOADED_VMCS_CLEAR_DONE.store(true, Ordering::Release);
     }
 
     pub fn seg_setup(&self, seg: VcpuSegment) {
@@ -442,8 +548,7 @@ impl KvmFunc for VmxKvmFunc {
 
         debug!("vmcs idx {}", vmcs.abort);
 
-        let phys_addr =
-            unsafe { MMArch::virt_2_phys(VirtAddr::new(vmcs as *const _ as usize)).unwrap() };
+        let phys_addr = vmx_area().get().phys_addr().unwrap();
 
         // TODO: intel_pt_handle_vmx(1);
 
@@ -975,7 +1080,14 @@ impl KvmFunc for VmxKvmFunc {
             return Ok(());
         }
 
-        kvm_vmx.pid_table = Some(unsafe { Box::new_zeroed().assume_init() });
+        // Retain the existing entry capacity; changing it requires auditing
+        // every architectural vCPU-id bound, independently of heap policy.
+        let table = unsafe {
+            PhysicalBox::<[u64]>::try_new_zeroed_slice(MMArch::PAGE_SIZE)
+                .map_err(|_| SystemError::ENOMEM)?
+                .assume_init()
+        };
+        kvm_vmx.pid_table = Some(Arc::new(table));
         Ok(())
     }
 
@@ -1093,11 +1205,6 @@ impl KvmFunc for VmxKvmFunc {
 
         Vmx::vmx_vcpu_enter_exit(vcpu, vcpu.vmx().vmx_vcpu_run_flags());
 
-        unsafe {
-            load_ds(USER_DS);
-            load_es(USER_DS);
-        };
-
         // TODO: pt_guest_exit
 
         // TODO: kvm_load_host_xsave_state
@@ -1153,22 +1260,16 @@ impl KvmFunc for VmxKvmFunc {
             return;
         }
 
-        // fixme: 这里读的是当前cpu的gsbase，正确安全做法应该为将gsbase设置为percpu变量
-        let gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
-
-        let current = ProcessManager::current_pcb();
-        let mut pcb_arch = current.arch_info_irqsave();
-
         let fs_sel = fs().bits();
         let gs_sel = gs().bits();
-
-        unsafe {
-            pcb_arch.save_fsbase();
-            pcb_arch.save_gsbase();
-        }
-
-        let fs_base = pcb_arch.fsbase();
-        vmx.msr_host_kernel_gs_base = pcb_arch.gsbase() as u64;
+        // VMCS host state describes the currently active kernel context, not
+        // the current task's saved user FS/GS state. Read the hardware MSRs
+        // directly so selector-dependent legacy task bookkeeping cannot alter
+        // the host base pair. After swapgs, IA32_KERNEL_GS_BASE holds the
+        // inactive user GS base that must be restored after guest execution.
+        let fs_base = unsafe { rdmsr(msr::IA32_FS_BASE) } as usize;
+        let gs_base = unsafe { rdmsr(msr::IA32_GS_BASE) } as usize;
+        vmx.msr_host_kernel_gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
 
         unsafe { wrmsr(msr::IA32_KERNEL_GSBASE, vmx.msr_guest_kernel_gs_base) };
 
@@ -1179,10 +1280,49 @@ impl KvmFunc for VmxKvmFunc {
         host_state.ds_sel = ds().bits();
         host_state.es_sel = es().bits();
 
-        host_state.set_host_fsgs(fs_sel, gs_sel, fs_base, gs_base as usize);
+        host_state.set_host_fsgs(fs_sel, gs_sel, fs_base, gs_base);
         drop(loaded_vmcs);
 
         vmx.guest_state_loaded = true;
+    }
+
+    fn prepare_switch_to_host(&self, vcpu: &mut VirtCpu) {
+        let vmx = vcpu.vmx_mut();
+        if !vmx.guest_state_loaded {
+            return;
+        }
+
+        vmx.msr_guest_kernel_gs_base = unsafe { rdmsr(msr::IA32_KERNEL_GSBASE) };
+
+        let (ds_sel, es_sel, fs_sel, gs_sel) = {
+            let host_state = &vmx.loaded_vmcs().host_state;
+            (
+                host_state.ds_sel,
+                host_state.es_sel,
+                host_state.fs_sel,
+                host_state.gs_sel,
+            )
+        };
+        if gs_sel & 7 != 0 {
+            unsafe {
+                crate::arch::process::ArchPCBInfo::load_user_gs_selector_with_fixup(gs_sel);
+            }
+        }
+        if fs_sel & 7 != 0 {
+            unsafe {
+                crate::arch::process::ArchPCBInfo::load_fs_selector_with_fixup(fs_sel);
+            }
+        }
+        if ds_sel | es_sel != 0 {
+            unsafe {
+                crate::arch::process::ArchPCBInfo::load_ds_selector_with_fixup(ds_sel);
+                crate::arch::process::ArchPCBInfo::load_es_selector_with_fixup(es_sel);
+            }
+        }
+
+        unsafe { wrmsr(msr::IA32_KERNEL_GSBASE, vmx.msr_host_kernel_gs_base) };
+        vmx.guest_state_loaded = false;
+        vmx.guest_uret_msrs_loaded = false;
     }
 
     fn flush_tlb_all(&self, vcpu: &mut VirtCpu) {
@@ -1207,6 +1347,31 @@ impl KvmFunc for VmxKvmFunc {
             Vmx::handle_external_interrupt_irqoff(vcpu);
         } else if basic == VmxExitReasonBasic::EXCEPTION_OR_NMI {
             //todo!()
+        }
+    }
+
+    fn cache_exit_info(&self, vcpu: &mut VirtCpu) {
+        if vcpu.vmx().emulation_required || vcpu.vmx().exit_reason.failed_vmentry() {
+            return;
+        }
+
+        if VmxExitReasonBasic::from(vcpu.vmx().exit_reason.basic())
+            == VmxExitReasonBasic::EPT_VIOLATION
+        {
+            let qualification = VmxAsm::vmx_vmread(ro::EXIT_QUALIFICATION);
+            let gpa = VmxAsm::vmx_vmread(ro::GUEST_PHYSICAL_ADDR_FULL);
+            vcpu.vmx_mut().exit_qualification = qualification;
+            vcpu.vmx_mut().exit_gpa = gpa;
+            vcpu.arch
+                .mark_register_available(KvmReg::VcpuExregExitInfo1);
+
+            if vcpu.vmx().idt_vectoring_info.bits() & IntrInfo::INTR_INFO_VALID_MASK.bits() == 0
+                && vmx_info().enable_vnmi
+                && qualification & IntrInfo::INTR_INFO_UNBLOCK_NMI.bits() as u64 != 0
+            {
+                let state = VmxAsm::vmx_vmread(guest::INTERRUPTIBILITY_STATE);
+                VmxAsm::vmx_vmwrite(guest::INTERRUPTIBILITY_STATE, state | (1 << 3));
+            }
         }
     }
 
@@ -1704,12 +1869,21 @@ impl Vmx {
         let vmx = vcpu.vmx_mut();
         vmx.msr_ia32_feature_control_valid_bits = 1 << 0;
 
-        vmx.post_intr_desc.control.set_nv(0xf2);
-        vmx.post_intr_desc.control.set_sn(true);
+        vmx.hardware.lock().post_intr_desc.control.set_nv(0xf2);
+        vmx.hardware.lock().post_intr_desc.control.set_sn(true);
     }
 
     fn init_vmcs(&mut self, vcpu: &mut VirtCpu, vm: &Vm) {
         let kvm_vmx = vm.kvm_vmx();
+        {
+            let mut hardware = vcpu.vmx().hardware.lock();
+            hardware.pid_table = kvm_vmx.pid_table.clone();
+            hardware.apic_regs = if vcpu.arch.lapic_in_kernel() {
+                Some(vcpu.arch.lapic().regs.clone())
+            } else {
+                None
+            };
+        }
         if vmx_info().nested {
             todo!()
         }
@@ -1763,7 +1937,7 @@ impl Vmx {
             VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_NOTIFICATION_VECTOR, 0xf2);
             VmxAsm::vmx_vmwrite(control::POSTED_INTERRUPT_DESC_ADDR_FULL, unsafe {
                 MMArch::virt_2_phys(VirtAddr::new(
-                    &vcpu.vmx().post_intr_desc as *const _ as usize,
+                    &vcpu.vmx().hardware.lock().post_intr_desc as *const _ as usize,
                 ))
                 .unwrap()
                 .data() as u64
@@ -1772,11 +1946,16 @@ impl Vmx {
 
         if self.enable_apicv && vcpu.arch.lapic_in_kernel() {
             // PID_POINTER_TABLE
-            VmxAsm::vmx_vmwrite(0x2042, unsafe {
-                MMArch::virt_2_phys(VirtAddr::new(kvm_vmx.pid_table().as_ptr() as usize))
+            VmxAsm::vmx_vmwrite(
+                0x2042,
+                kvm_vmx
+                    .pid_table
+                    .as_ref()
                     .unwrap()
-                    .data() as u64
-            });
+                    .phys_addr()
+                    .unwrap()
+                    .data() as u64,
+            );
             // LAST_PID_POINTER_INDEX
             VmxAsm::vmx_vmwrite(0x08, vm.arch.max_vcpu_ids as u64 - 1);
         }
@@ -1815,7 +1994,7 @@ impl Vmx {
         VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_COUNT, 0);
         VmxAsm::vmx_vmwrite(control::VMEXIT_MSR_LOAD_ADDR_FULL, unsafe {
             MMArch::virt_2_phys(VirtAddr::new(
-                vcpu.vmx().msr_autoload.host.val.as_ptr() as *const _ as usize,
+                vcpu.vmx().hardware.lock().msr_autoload.host.val.as_ptr() as *const _ as usize,
             ))
             .unwrap()
             .data() as u64
@@ -1823,7 +2002,7 @@ impl Vmx {
         VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_COUNT, 0);
         VmxAsm::vmx_vmwrite(control::VMENTRY_MSR_LOAD_ADDR_FULL, unsafe {
             MMArch::virt_2_phys(VirtAddr::new(
-                vcpu.vmx().msr_autoload.guest.val.as_ptr() as usize
+                vcpu.vmx().hardware.lock().msr_autoload.guest.val.as_ptr() as usize,
             ))
             .unwrap()
             .data() as u64
@@ -1867,11 +2046,16 @@ impl Vmx {
         }
 
         if self.enable_pml {
-            VmxAsm::vmx_vmwrite(control::PML_ADDR_FULL, unsafe {
-                MMArch::virt_2_phys(VirtAddr::new(vcpu.vmx().pml_pg.as_ref().as_ptr() as usize))
+            VmxAsm::vmx_vmwrite(
+                control::PML_ADDR_FULL,
+                vcpu.vmx()
+                    .hardware
+                    .lock()
+                    .pml_pg
+                    .phys_addr()
                     .unwrap()
-                    .data() as u64
-            });
+                    .data() as u64,
+            );
 
             VmxAsm::vmx_vmwrite(guest::PML_INDEX, VmxVCpuPriv::PML_ENTITY_NUM as u64 - 1);
         }
@@ -1890,11 +2074,10 @@ impl Vmx {
         if self.has_tpr_shadow() {
             VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, 0);
             if vcpu.arch.lapic_in_kernel() {
-                VmxAsm::vmx_vmwrite(control::VIRT_APIC_ADDR_FULL, unsafe {
-                    MMArch::virt_2_phys(VirtAddr::new(vcpu.arch.lapic().regs.as_ptr() as usize))
-                        .unwrap()
-                        .data() as u64
-                });
+                VmxAsm::vmx_vmwrite(
+                    control::VIRT_APIC_ADDR_FULL,
+                    vcpu.arch.lapic().regs.phys_addr().unwrap().data() as u64,
+                );
             }
 
             VmxAsm::vmx_vmwrite(control::TPR_THRESHOLD, 0);
@@ -1904,6 +2087,7 @@ impl Vmx {
     }
 
     /// 打印VMCS信息用于debug
+    #[allow(dead_code)]
     pub fn dump_vmcs(&self, vcpu: &VirtCpu) {
         let vmentry_ctl = unsafe {
             EntryControls::from_bits_unchecked(self.vmread(control::VMENTRY_CONTROLS) as u32)
@@ -2001,6 +2185,8 @@ impl Vmx {
 
         let efer_slot = vcpu
             .vmx()
+            .hardware
+            .lock()
             .msr_autoload
             .guest
             .find_loadstore_msr_slot(msr::IA32_EFER);
@@ -2010,7 +2196,7 @@ impl Vmx {
         } else if let Some(slot) = efer_slot {
             error!(
                 "EFER = 0x{:x} (autoload)",
-                vcpu.vmx().msr_autoload.guest.val[slot].data
+                vcpu.vmx().hardware.lock().msr_autoload.guest.val[slot].data
             );
         } else if vmentry_ctl.contains(EntryControls::IA32E_MODE_GUEST) {
             error!(
@@ -2061,7 +2247,10 @@ impl Vmx {
         }
 
         if self.vmread(control::VMENTRY_MSR_LOAD_COUNT) > 0 {
-            self.dump_msrs("guest autoload", &vcpu.vmx().msr_autoload.guest);
+            self.dump_msrs(
+                "guest autoload",
+                &vcpu.vmx().hardware.lock().msr_autoload.guest,
+            );
         }
         if self.vmread(control::VMEXIT_MSR_LOAD_COUNT) > 0 {
             self.dump_msrs("guest autostore", &vcpu.vmx().msr_autostore);
@@ -2125,7 +2314,10 @@ impl Vmx {
         }
 
         if self.vmread(control::VMEXIT_MSR_LOAD_COUNT) > 0 {
-            self.dump_msrs("host autoload", &vcpu.vmx().msr_autoload.host);
+            self.dump_msrs(
+                "host autoload",
+                &vcpu.vmx().hardware.lock().msr_autoload.host,
+            );
         }
 
         error!("\n--- CONTROL STATE ---");
@@ -2218,6 +2410,7 @@ impl Vmx {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dump_sel(&self, name: &'static str, sel: u32) {
         error!(
             "{name} sel = 0x{:x}, attr = 0x{:x}, limit = 0x{:x}, base = 0x{:x}",
@@ -2228,6 +2421,7 @@ impl Vmx {
         );
     }
 
+    #[allow(dead_code)]
     pub fn dump_dtsel(&self, name: &'static str, limit: u32) {
         error!(
             "{name} limit = 0x{:x}, base = 0x{:x}",
@@ -2236,6 +2430,7 @@ impl Vmx {
         );
     }
 
+    #[allow(dead_code)]
     pub fn dump_msrs(&self, name: &'static str, msr: &VmxMsrs) {
         error!("MSR {name}:");
         for (idx, msr) in msr.val.iter().enumerate() {
@@ -2244,6 +2439,7 @@ impl Vmx {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn vmread(&self, field: u32) -> u64 {
         VmxAsm::vmx_vmread(field)
     }
@@ -3006,14 +3202,9 @@ impl Vmx {
     ) -> Result<i32, SystemError> {
         let exit_reason = vcpu.vmx().exit_reason;
         // self.dump_vmcs(vcpu);
-        {
-            let reason = self.vmread(ro::EXIT_REASON);
-            debug!("vm_exit reason 0x{:x}\n", reason);
-        }
+        debug!("vm_exit reason {:?}\n", exit_reason);
         let unexpected_vmexit = |vcpu: &mut VirtCpu| -> Result<i32, SystemError> {
             error!("vmx: unexpected exit reason {:?}\n", exit_reason);
-
-            self.dump_vmcs(vcpu);
 
             let cpu = vcpu.arch.last_vmentry_cpu.into() as u64;
             let run = vcpu.kvm_run_mut();
@@ -3047,12 +3238,10 @@ impl Vmx {
         }
 
         if exit_reason.failed_vmentry() {
-            self.dump_vmcs(vcpu);
             todo!()
         }
 
         if unlikely(vcpu.vmx().fail != 0) {
-            self.dump_vmcs(vcpu);
             todo!()
         }
 
@@ -3085,7 +3274,10 @@ impl Vmx {
                 debug!("vmx: handled exit return {:?}\n", r);
                 return Ok(r);
             }
-            Some(Err(_)) | None => unexpected_vmexit(vcpu),
+            // A normal RAM/HVA failure is a recoverable KVM_RUN error, not
+            // an unknown VM-exit. Propagate it so the outer spin guards drop.
+            Some(Err(error)) => Err(error),
+            None => unexpected_vmexit(vcpu),
         }
     }
 
@@ -3219,6 +3411,37 @@ pub struct VmxSegmentCache {
     pub seg: [VmxSaveSegment; 8],
 }
 
+/// Storage referenced by VMCS fields, retained by the VMCS itself rather than
+/// merely its movable vCPU. Hardware never accesses the bookkeeping pointers.
+#[derive(Debug)]
+pub(crate) struct VmxHardwareBacking {
+    post_intr_desc: PostedIntrDesc,
+    msr_autoload: VmxMsrAutoLoad,
+    pml_pg: PhysicalBox<PhysicalPage>,
+    pid_table: Option<Arc<PhysicalBox<[u64]>>>,
+    apic_regs: Option<Arc<PhysicalBox<PhysicalPage>>>,
+}
+
+impl VmxHardwareBacking {
+    fn new() -> Arc<SpinLock<PhysicalBox<Self>>> {
+        let pml_pg = unsafe {
+            PhysicalBox::<PhysicalPage>::try_new_zeroed()
+                .expect("alloc PML page failed")
+                .assume_init()
+        };
+        Arc::new(SpinLock::new(
+            PhysicalBox::try_new(Self {
+                post_intr_desc: PostedIntrDesc::default(),
+                msr_autoload: VmxMsrAutoLoad::default(),
+                pml_pg,
+                pid_table: None,
+                apic_regs: None,
+            })
+            .expect("alloc VMX hardware state failed"),
+        ))
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct VmxVCpuPriv {
@@ -3237,7 +3460,7 @@ pub struct VmxVCpuPriv {
     guest_uret_msrs: [VmxUretMsr; KvmArchManager::KVM_MAX_NR_USER_RETURN_MSRS],
     guest_uret_msrs_loaded: bool,
 
-    post_intr_desc: PostedIntrDesc,
+    hardware: Arc<SpinLock<PhysicalBox<VmxHardwareBacking>>>,
 
     shadow_msr_intercept_read: AllocBitmap,
     shadow_msr_intercept_write: AllocBitmap,
@@ -3255,10 +3478,7 @@ pub struct VmxVCpuPriv {
     ple_window: u32,
     ple_window_dirty: bool,
 
-    msr_autoload: VmxMsrAutoLoad,
     msr_autostore: VmxMsrs,
-
-    pml_pg: Box<[u8; MMArch::PAGE_SIZE]>,
 
     rmode: VmxRMode,
 
@@ -3272,6 +3492,7 @@ pub struct VmxVCpuPriv {
     guest_state_loaded: bool,
 
     exit_qualification: u64, //暂时不知道用处fztodo
+    exit_gpa: u64,
 }
 
 #[derive(Debug, Default)]
@@ -3280,11 +3501,11 @@ pub struct KvmVmx {
     tss_addr: usize,
     ept_identity_pagetable_done: bool,
     ept_identity_map_addr: u64,
-    pid_table: Option<Box<[u64; MMArch::PAGE_SIZE]>>,
+    pid_table: Option<Arc<PhysicalBox<[u64]>>>,
 }
 
 impl KvmVmx {
-    pub fn pid_table(&self) -> &[u64; MMArch::PAGE_SIZE] {
+    pub fn pid_table(&self) -> &[u64] {
         self.pid_table.as_ref().unwrap().as_ref()
     }
 }
@@ -3298,7 +3519,8 @@ impl VmxVCpuPriv {
 
     /// 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/arch/x86/kvm/vmx/vmx.c#7452
     pub fn init(vcpu: &mut VirtCpu, vm: &Vm) {
-        let vmcs = LockedLoadedVmcs::new();
+        let hardware = VmxHardwareBacking::new();
+        let vmcs = LockedLoadedVmcs::new(hardware.clone());
 
         // TODO: 改堆分配
         let mut vmx = Self {
@@ -3309,11 +3531,9 @@ impl VmxVCpuPriv {
             guest_uret_msrs: [VmxUretMsr::default(); KvmArchManager::KVM_MAX_NR_USER_RETURN_MSRS],
             shadow_msr_intercept_read: AllocBitmap::new(16),
             shadow_msr_intercept_write: AllocBitmap::new(16),
-            post_intr_desc: PostedIntrDesc::default(),
+            hardware,
             ple_window: 0,
             ple_window_dirty: false,
-            msr_autoload: VmxMsrAutoLoad::default(),
-            pml_pg: unsafe { Box::new_zeroed().assume_init() },
             guest_uret_msrs_loaded: false,
             msr_ia32_feature_control: 0,
             msr_ia32_feature_control_valid_bits: 0,
@@ -3333,6 +3553,7 @@ impl VmxVCpuPriv {
             exit_intr_info: IntrInfo::empty(),
             msr_autostore: VmxMsrs::default(),
             exit_qualification: 0, //fztodo
+            exit_gpa: 0,
         };
 
         vmx.vpid = vmx_info().alloc_vpid().unwrap_or_default() as u16;
@@ -3495,7 +3716,8 @@ impl VmxVCpuPriv {
             _ => {}
         }
 
-        let m = &mut self.msr_autoload;
+        let mut hardware = self.hardware.lock();
+        let m = &mut hardware.msr_autoload;
         let i = m.guest.find_loadstore_msr_slot(msr);
 
         if let Some(i) = i {
@@ -3559,7 +3781,8 @@ impl VmxVCpuPriv {
             _ => {}
         }
 
-        let m = &mut self.msr_autoload;
+        let mut hardware = self.hardware.lock();
+        let m = &mut hardware.msr_autoload;
         let i = m.guest.find_loadstore_msr_slot(msr);
         let j = if !entry_only {
             m.host.find_loadstore_msr_slot(msr)
@@ -3637,6 +3860,11 @@ impl VmxVCpuPriv {
     pub fn get_exit_qual(&self) -> u64 {
         self.exit_qualification
     }
+
+    pub fn get_exit_gpa(&self) -> u64 {
+        self.exit_gpa
+    }
+
     pub fn vmread_exit_qual(&mut self) {
         self.exit_qualification = VmxAsm::vmx_vmread(ro::EXIT_QUALIFICATION);
     }

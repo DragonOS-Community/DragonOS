@@ -27,18 +27,21 @@ $(busybox_dir): $(busybox_tarball_path)
 	tar -xjf $< -C $(build_dir)
 
 # 配置和编译
-$(bin): $(busybox_dir)
+$(bin): $(busybox_dir) Makefile
 	@# 应用必要补丁和配置调整
 	cd $(busybox_dir) && \
 	make defconfig && \
+	sed -i 's/^CONFIG_TC=y$$/# CONFIG_TC is not set/' .config && \
 	sed -i '/CONFIG_STATIC/s/.*/CONFIG_STATIC=y/' .config && \
+	sed -i '/CONFIG_FEATURE_EDITING_MAX_LEN/s/.*/CONFIG_FEATURE_EDITING_MAX_LEN=8192/' .config && \
 	sed -i '/CONFIG_PIE/d' .config && \
 	echo "CONFIG_CROSS_COMPILER_PREFIX=\"$(prefix)\"" >> .config && \
 	echo "CONFIG_FEATURE_STATIC=y" >> .config && \
 	echo "CONFIG_STATIC_LIBGCC=y" >> .config && \
 	echo "CONFIG_ASH=y" >> .config && \
 	echo "CONFIG_FEATURE_DEFAULT_PASSWD_ALGO=\"sha512\"" >> .config && \
-	echo "CONFIG_ASH_READ_PROFILE=y" >> .config
+	echo "CONFIG_ASH_READ_PROFILE=y" >> .config && \
+	yes "" | make oldconfig >/dev/null
 
 
 	@# 执行编译

@@ -4,14 +4,20 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MOUNT},
     filesystem::vfs::{
         fcntl::AtFlags,
-        mount::{is_mountpoint_root, MountFlags},
-        produce_fs,
+        filesystem_maker,
+        mount::{
+            is_mountpoint_root, with_topology_snapshot, MountFSInode, MountFlags,
+            MOUNT_LIFECYCLE_LOCK,
+        },
+        mount_api::reconfigure::prepare_reconfigure_locked,
+        produce_fs_in_context,
         utils::user_path_at,
-        FileType, FsReconfigureRequest, IndexNode, InodeId, MountFS, MAX_PATHLEN,
+        FileType, FsCreationContext, FsReconfigureRequest, IndexNode, MountFS, MAX_PATHLEN,
         VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::{
+        cred::{ns_capable, CAPFlags},
         namespace::propagation::{
             change_mnt_propagation_recursive, flags_to_propagation_type, is_propagation_change,
         },
@@ -27,21 +33,24 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-/// #挂载文件系统
+/// # Mount filesystem
 ///
-/// 用于挂载文件系统,目前仅支持ramfs挂载
+/// Handles the Linux-compatible `mount(2)` syscall entry point.
 ///
-/// ## 参数:
+/// Depending on `mountflags`, this may create a new mount, bind mount, remount,
+/// move an existing mount, or change mount propagation attributes.
 ///
-/// - source       挂载设备(目前只支持ext4格式的硬盘)
-/// - target       挂载目录
-/// - filesystemtype   文件系统
-/// - mountflags     挂载选项
-/// - data        带数据挂载
+/// ## Parameters:
 ///
-/// ## 返回值
-/// - Ok(0): 挂载成功
-/// - Err(SystemError) :挂载过程中出错
+/// - `source`: source path/device string, or the mount path being moved for `MS_MOVE`
+/// - `target`: target mount point path
+/// - `filesystemtype`: filesystem type for new mounts; ignored by bind/move/propagation changes
+/// - `mountflags`: Linux `MS_*` mount flags
+/// - `data`: filesystem-specific mount data
+///
+/// ## Return value
+/// - `Ok(0)`: mount operation completed successfully
+/// - `Err(SystemError)`: mount operation failed
 pub struct SysMountHandle;
 
 impl Syscall for SysMountHandle {
@@ -54,12 +63,15 @@ impl Syscall for SysMountHandle {
         let target = Self::target(args);
         let filesystemtype = Self::filesystemtype(args);
         let data = Self::raw_data(args);
-        let mount_flags = Self::mountflags(args);
+        let raw_mount_flags = Self::mountflags(args);
         // log::debug!(
         //     "sys_mount: source: {:?}, target: {:?}, filesystemtype: {:?}, mount_flags: {:?}, data: {:?}",
         //     source, target, filesystemtype, mount_flags, data
         // );
-        let mount_flags = MountFlags::from_bits_truncate(mount_flags);
+        let mount_flags = MountFlags::from_bits_truncate(raw_mount_flags);
+        if is_propagation_change(mount_flags) && raw_mount_flags & !MountFlags::all().bits() != 0 {
+            return Err(SystemError::EINVAL);
+        }
 
         let target = copy_mount_path_string(target).inspect_err(|e| {
             log::error!("Failed to read mount target: {:?}", e);
@@ -140,22 +152,30 @@ impl SysMountHandle {
 
 syscall_table_macros::declare_syscall!(SYS_MOUNT, SysMountHandle);
 
-/// # do_mount - 挂载文件系统
+/// Linux `may_mount()`: modifying the current mount namespace requires
+/// CAP_SYS_ADMIN in that namespace's owning user namespace.
+pub(super) fn may_mount() -> bool {
+    let current_mntns = ProcessManager::current_mntns();
+    ns_capable(current_mntns.user_ns(), CAPFlags::CAP_SYS_ADMIN)
+}
+
+/// # do_mount - Dispatch a mount operation
 ///
-/// 将给定的文件系统挂载到指定的挂载点。
+/// Resolves `target` in the current mount namespace and dispatches the request
+/// according to `mount_flags`.
 ///
-/// 此函数会检查是否已经挂载了相同的文件系统，如果已经挂载，则返回错误。
-/// 它还会处理符号链接，并确保挂载点是有效的。
+/// ## Arguments
 ///
-/// ## 参数
+/// - `source`: source path/device string, or the mount path being moved for `MS_MOVE`.
+/// - `target`: target mount point path from userspace.
+/// - `filesystemtype`: filesystem type for new mounts.
+/// - `data`: filesystem-specific mount data.
+/// - `mount_flags`: Linux `MS_*` mount flags.
 ///
-/// - `fs`: Arc<dyn FileSystem>，要挂载的文件系统。
-/// - `mount_point`: &str，挂载点路径。
+/// ## Return value
 ///
-/// ## 返回值
-///
-/// - `Ok(Arc<MountFS>)`: 挂载成功后返回挂载的文件系统。
-/// - `Err(SystemError)`: 挂载失败时返回错误。
+/// - `Ok(())`: mount operation completed successfully.
+/// - `Err(SystemError)`: Returns an error on failure.
 pub fn do_mount(
     source: Option<String>,
     target: Option<String>,
@@ -163,13 +183,16 @@ pub fn do_mount(
     data: Option<String>,
     mount_flags: MountFlags,
 ) -> Result<(), SystemError> {
+    let requested_target = target.as_deref().unwrap_or("");
     let (current_node, rest_path) = user_path_at(
         &ProcessManager::current_pcb(),
         AtFlags::AT_FDCWD.bits(),
-        target.as_deref().unwrap_or(""),
+        requested_target,
     )?;
-    let inode = current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    return path_mount(source, inode, filesystemtype, data, mount_flags);
+    let inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
+    path_mount(source, inode, filesystemtype, data, mount_flags)
 }
 
 fn path_mount(
@@ -185,6 +208,10 @@ fn path_mount(
 
     if flags.contains(MountFlags::NOUSER) {
         return Err(SystemError::EINVAL);
+    }
+
+    if !may_mount() {
+        return Err(SystemError::EPERM);
     }
 
     let mut mnt_flags = MountFlags::empty();
@@ -228,7 +255,7 @@ fn path_mount(
             | MountFlags::LAZYTIME
             | MountFlags::I_VERSION);
 
-    // MS_REMOUNT|MS_BIND 和 MS_REMOUNT 共用此 atime 保留逻辑。
+    // MS_REMOUNT|MS_BIND and MS_REMOUNT share this atime preservation logic.
     if flags.contains(MountFlags::REMOUNT)
         && !flags.intersects(
             MountFlags::NOATIME
@@ -265,19 +292,26 @@ fn path_mount(
     }
 
     if flags.contains(MountFlags::MOVE) {
-        log::warn!("todo: move mnt");
-        return Err(SystemError::ENOSYS);
+        return do_move_mount(source, target_inode);
     }
 
-    // 创建新的挂载
-    return do_new_mount(source, target_inode, filesystemtype, data, mnt_flags).map(|_| ());
+    // Create a new mount
+    return do_new_mount(
+        source,
+        target_inode,
+        filesystemtype,
+        data,
+        sb_flags,
+        mnt_flags,
+    )
+    .map(|_| ());
 }
 
-/// 修改已有挂载的 mount flags
+/// Modify the mount flags of an existing mount.
 ///
-/// Linux 两条独立路径：
-/// - do_reconfigure_mnt()：MS_REMOUNT|MS_BIND, down_read(sb), 只改 mount flags ← 本函数
-/// - do_remount()：MS_REMOUNT alone, down_write(sb) + reconfigure_super() + set_mount_attributes() ← TODO
+/// Linux has two independent paths:
+/// - do_reconfigure_mnt(): MS_REMOUNT|MS_BIND, down_read(sb), only changes mount flags ← this function
+/// - do_remount(): MS_REMOUNT alone, down_write(sb) + reconfigure_super() + set_mount_attributes()
 fn do_reconfigure_bind_mount(
     target_inode: Arc<dyn IndexNode>,
     requested_flags: MountFlags,
@@ -291,18 +325,31 @@ fn do_reconfigure_bind_mount(
         .downcast_arc::<MountFS>()
         .ok_or(SystemError::EINVAL)?;
 
-    // 目标 mount 必须属于当前进程的 mount namespace。
+    // The target mount must belong to the current process's mount namespace.
     let current_mntns = ProcessManager::current_mntns();
     if !target_mfs.is_belongs_to_mntns(&current_mntns) {
         return Err(SystemError::EINVAL);
     }
 
-    // 保留不可修改的 flags，只覆盖 SETTABLE 位。
-    target_mfs.update_mount_flags(|mount_flags| {
-        let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
-        let new_settable = requested_flags & MountFlags::MNT_USER_SETTABLE_MASK;
-        *mount_flags = preserved | new_settable;
-    });
+    let superblock = target_mfs.super_block_state();
+    let _umount = superblock.umount_read();
+    // Preserve unmodifiable flags, only overwrite SETTABLE bits.
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    if !target_mfs.is_live() || !target_mfs.is_belongs_to_mntns(&current_mntns) {
+        return Err(SystemError::EINVAL);
+    }
+    if !target_mfs.can_reconfigure_mount_flags(requested_flags) {
+        return Err(SystemError::EPERM);
+    }
+    let new_flags = (target_mfs.mount_flags() & !MountFlags::MNT_USER_SETTABLE_MASK)
+        | (requested_flags & MountFlags::MNT_USER_SETTABLE_MASK);
+    if new_flags.contains(MountFlags::RDONLY) && !target_mfs.is_readonly() {
+        // Check this mount, not the SB total: a writable sibling bind remains
+        // legal when this particular entry becomes read-only.
+        target_mfs.try_hold_writers()?.commit_mount_flags(new_flags);
+    } else {
+        target_mfs.set_mount_flags(new_flags);
+    }
 
     Ok(())
 }
@@ -327,29 +374,50 @@ fn do_remount(
         return Err(SystemError::EINVAL);
     }
 
+    // Serialize the filesystem reconfigure operation per superblock. The
+    // potentially sleeping callback stays outside the global topology lock;
+    // only the final paired SB/mount flag publication is topology-atomic.
+    let super_block_state = target_mfs.super_block_state();
+    let _reconfigure = super_block_state.umount_write();
+    {
+        // Linearize admission after excluding final shutdown. If detach won
+        // first, fail before invoking a stateful filesystem callback; if we
+        // win, the SB write guard keeps the backend alive through commit.
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        if !target_mfs.is_live() || !target_mfs.is_belongs_to_mntns(&current_mntns) {
+            return Err(SystemError::EINVAL);
+        }
+        if !target_mfs.can_reconfigure_mount_flags(requested_mnt_flags) {
+            return Err(SystemError::EPERM);
+        }
+    }
     let old_sb_flags = target_mfs.super_block_flags();
     let (data_sb_flags, data_sb_flags_mask, fs_private_data) = parse_remount_data(data.as_deref())?;
+    // Linux do_remount() requires CAP_SYS_ADMIN in sb->s_user_ns before a
+    // legacy remount may change shared superblock or filesystem-private state.
+    if !ns_capable(super_block_state.owner_user_ns(), CAPFlags::CAP_SYS_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
     let sb_flags_mask = MountFlags::RMT_MASK | data_sb_flags_mask;
     let requested_sb_flags = (requested_sb_flags & !data_sb_flags_mask) | data_sb_flags;
     let new_sb_flags = (old_sb_flags & !sb_flags_mask) | (requested_sb_flags & sb_flags_mask);
 
-    if new_sb_flags.contains(MountFlags::RDONLY)
-        && !old_sb_flags.contains(MountFlags::RDONLY)
-        && target_mfs.has_writers()
-    {
-        return Err(SystemError::EBUSY);
-    }
-
-    let effective_sb_flags = target_mfs
-        .inner_filesystem()
-        .reconfigure(FsReconfigureRequest {
+    let prepared = prepare_reconfigure_locked(
+        &target_mfs,
+        FsReconfigureRequest {
             sb_flags: new_sb_flags,
             sb_flags_mask,
             raw_data: fs_private_data.as_deref(),
             oldapi: true,
-        })?;
+        },
+    )?;
 
-    target_mfs.set_super_block_flags(effective_sb_flags);
+    let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+    // reconfigure() may already have committed filesystem-private state. A
+    // concurrent lazy detach must not turn that successful operation into a
+    // partial-commit error; the SB write guard keeps final shutdown out until
+    // the paired flag publication completes.
+    prepared.commit();
     target_mfs.update_mount_flags(|mount_flags| {
         let preserved = *mount_flags & !MountFlags::MNT_USER_SETTABLE_MASK;
         let new_settable = requested_mnt_flags & MountFlags::MNT_USER_SETTABLE_MASK;
@@ -426,20 +494,77 @@ fn do_new_mount(
     target_inode: Arc<dyn IndexNode>,
     filesystemtype: Option<String>,
     data: Option<String>,
+    superblock_flags: MountFlags,
     mount_flags: MountFlags,
 ) -> Result<Arc<MountFS>, SystemError> {
     let fs_type_str = filesystemtype.ok_or(SystemError::EINVAL)?;
-    let source = source.ok_or(SystemError::EINVAL)?;
-    let fs = produce_fs(&fs_type_str, data.as_deref(), &source).inspect_err(|e| {
-        log::warn!("Failed to produce filesystem: {:?}", e);
-    })?;
+    let creation_flags = superblock_flags | mount_flags;
+    let creation = FsCreationContext::current();
+    if !filesystem_maker(&fs_type_str)
+        .ok_or(SystemError::ENODEV)?
+        .mount_capable(&creation.cred.user_ns)
+    {
+        return Err(SystemError::EPERM);
+    }
+    loop {
+        // Linux accepts a NULL source for nodev filesystems. Keep an
+        // explicitly supplied empty string distinct from the display name.
+        let fs = crate::filesystem::vfs::file::File::recover_io(|| {
+            produce_fs_in_context(
+                &fs_type_str,
+                data.as_deref(),
+                source.as_deref().unwrap_or(""),
+                creation_flags,
+                &creation,
+            )
+        })
+        .inspect_err(|e| {
+            log::warn!("Failed to produce filesystem: {:?}", e);
+        })?;
+        let mnt_inode = target_inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+        let (to_mount_fs, root_inner_inode) = fs
+            .clone()
+            .downcast_arc::<MountFS>()
+            .map(|it| (it.inner_filesystem(), it.root_inner_inode()))
+            .unwrap_or_else(|| {
+                let root_inner_inode = fs.root_inode();
+                (fs, root_inner_inode)
+            });
 
-    let _abs_path = target_inode.absolute_path()?;
-
-    // Linux lock_mount() 会保留用户指定 mountpoint，并在其栈顶继续叠加挂载。
-    let new_mount = target_inode.mount(fs, mount_flags)?;
-    new_mount.set_mount_source(Some(source));
-    Ok(new_mount)
+        let prepared = match mnt_inode.prepare_subtree_with_root_dentry(
+            to_mount_fs.clone(),
+            root_inner_inode,
+            None,
+            creation_flags,
+            None,
+            None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(SystemError::ESTALE)
+                if to_mount_fs
+                    .shared_mount_superblock_state(creation_flags)
+                    .is_some_and(|state| state.shutdown_started()) =>
+            {
+                // The last unmount beat this construction reservation. No
+                // topology has been published. Re-enter the factory, which
+                // waits for final shutdown before recovering a new instance.
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        // This construction has not been published: the SB has consumed its
+        // own flags, and the mount entry must retain only entry attributes.
+        prepared.set_mount_flags(mount_flags);
+        prepared.set_mount_source(Some(source.clone().unwrap_or_else(|| String::from("none"))));
+        if let Err(error) = mnt_inode.publish_prepared_subtree(&prepared) {
+            MountFS::deactivate_disconnected_subtree(&prepared);
+            return Err(error);
+        }
+        return Ok(prepared);
+    }
 }
 #[inline(never)]
 fn copy_mount_string(raw: Option<*const u8>) -> Result<Option<String>, SystemError> {
@@ -478,7 +603,7 @@ fn copy_mount_path_string(raw: Option<*const u8>) -> Result<Option<String>, Syst
 ///
 /// # Arguments
 /// * `source` - The source path to bind from
-/// * `target_inode` - The target mount point
+/// * `target_inode` - The target mount point inode
 /// * `flags` - Mount flags (MS_BIND, optionally MS_REC)
 ///
 /// # Returns
@@ -503,8 +628,9 @@ fn do_bind_mount(
         AtFlags::AT_FDCWD.bits(),
         &source_path,
     )?;
-    let source_inode =
-        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let source_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        current_node.lookup_follow_symlink(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
 
     let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
     let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
@@ -512,99 +638,73 @@ fn do_bind_mount(
         return Err(SystemError::ENOTDIR);
     }
 
-    // Get the source's filesystem
-    let source_fs = source_inode.fs();
-
-    // Check if source is on a MountFS
-    let source_mfs = source_fs.clone().downcast_arc::<MountFS>();
-
-    // 源挂载必须属于当前 mount namespace。
-    if let Some(ref mfs) = source_mfs {
-        let current_mntns = ProcessManager::current_mntns();
-        if !mfs.is_belongs_to_mntns(&current_mntns) {
-            return Err(SystemError::EINVAL);
-        }
-    }
-
-    // Check if source is unbindable - if so, reject the bind mount
-    if let Some(ref mfs) = source_mfs {
-        if mfs.propagation().is_unbindable() {
-            // log::debug!("do_bind_mount: source is unbindable, rejecting bind mount");
-            return Err(SystemError::EINVAL);
-        }
-    }
-
-    // Clone source_mfs for recursive bind mount (need to keep it for later use)
-    let source_mfs_for_recursive = source_mfs.clone();
-
-    let root_inner_inode = source_inode
+    let source_mount_inode = source_inode
         .clone()
-        .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
-        .map(|inode| inode.underlying_inode())
-        .unwrap_or_else(|| source_inode.clone());
+        .downcast_arc::<MountFSInode>()
+        .ok_or(SystemError::EINVAL)?;
 
-    // Get the inner filesystem for mounting while preserving the source subtree root.
-    let inner_fs = source_mfs
-        .map(|mfs| mfs.inner_filesystem())
-        .unwrap_or(source_fs);
-
-    // do_loopback：目标挂载点必须属于当前 mount namespace。
-    let current_mntns = ProcessManager::current_mntns();
-    let target_mount_fs = target_inode
+    let source_mfs = source_inode
         .fs()
         .downcast_arc::<MountFS>()
         .ok_or(SystemError::EINVAL)?;
-    if !target_mount_fs.is_belongs_to_mntns(&current_mntns) {
-        return Err(SystemError::EINVAL);
-    }
 
-    let target_mfs = target_inode
+    let target_mountpoint = target_inode
         .clone()
         .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
-        .ok_or(SystemError::EINVAL)?
-        .mount_subtree_with_state(
-            inner_fs,
-            root_inner_inode,
-            MountFlags::empty(),
-            source_mfs_for_recursive
-                .as_ref()
-                .map(|mfs| mfs.super_block_state()),
-        )?;
-    target_mfs.set_mount_source(Some(source_path.clone()));
+        .ok_or(SystemError::EINVAL)?;
+    let target_mount_fs = target_mountpoint.mount_fs();
+    let current_mntns = ProcessManager::current_mntns();
 
-    // If MS_REC is set, recursively bind all submounts from source to target
-    if flags.contains(MountFlags::REC) {
-        if let Some(ref mfs) = source_mfs_for_recursive {
-            // Linux kern_path() 将用户路径解析为 struct path，后续 copy_tree 基于
-            // 内核 mount/dentry 数据结构遍历子挂载，不涉及字符串路径匹配。
-            // DragonOS 使用 strip_prefix 做路径匹配，因此必须将 source_path 规范化为
-            // 与 mount_list 存储格式（absolute_path 产生的规范化绝对路径）一致。
-            // 直接传用户原始字符串会在相对路径、含 .. 的路径、符号链接路径下导致
-            // strip_prefix 匹配失败，静默跳过所有子挂载。
-            let resolved_source_path = match source_inode.absolute_path() {
-                Ok(p) => p,
-                Err(_) => {
-                    // absolute_path 失败（如 devfs 设备节点）。
-                    // 文件型 bind mount 没有子挂载，跳过递归是安全的。
-                    return Ok(());
-                }
-            };
-            let target_path = match target_inode.absolute_path() {
-                Ok(p) => p,
-                Err(_) => {
-                    return Ok(());
-                }
-            };
-            if let Err(e) =
-                do_recursive_bind_mount(mfs, &target_mfs, &resolved_source_path, &target_path)
-            {
-                // Linux copy_tree 失败时调用 umount_tree(res, UMOUNT_SYNC) 递归回滚整棵子树。
-                // Linux do_loopback 中 graft_tree 失败时同样调用 umount_tree 回滚。
-                // 保证 all-or-nothing 原子语义。
-                MountFS::umount_tree(&target_mfs);
-                return Err(e);
+    // Linux holds namespace_lock across check_mnt(), clone_mnt(root), and
+    // copy_tree(children). Take one mount+dentry snapshot for the equivalent
+    // source validation and complete detached clone so root and descendants
+    // cannot observe different lifecycle or propagation states.
+    let target_mfs = with_topology_snapshot(|| {
+        if !source_mfs.is_live()
+            || !source_mfs.is_belongs_to_mntns(&current_mntns)
+            || !target_mount_fs.is_live()
+            || !target_mount_fs.is_belongs_to_mntns(&current_mntns)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        if source_mfs.propagation().is_unbindable() {
+            return Err(SystemError::EINVAL);
+        }
+        if !flags.contains(MountFlags::REC)
+            && MountFS::has_locked_children_in_view_locked(&source_mfs, &source_mount_inode)?
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let root_inner_inode = if is_mountpoint_root(&source_inode) {
+            source_mfs.root_inner_inode()
+        } else {
+            source_mount_inode.underlying_inode()
+        };
+        let target_mfs = target_mountpoint.prepare_subtree_with_root_dentry_prevalidated(
+            source_mfs.inner_filesystem(),
+            root_inner_inode,
+            Some(source_mount_inode.shared_dentry()),
+            source_mfs.mount_flags(),
+            Some(source_mfs.super_block_state()),
+            Some(&source_mfs),
+        )?;
+        target_mfs.set_mount_source(Some(source_path.clone()));
+
+        // The root edge is the publication point, so lookup never observes a
+        // half-copied recursive bind tree.
+        if flags.contains(MountFlags::REC) {
+            if let Err(error) = MountFS::copy_visible_submounts_locked(&source_mfs, &target_mfs) {
+                MountFS::abandon_unpublished_tree(&target_mfs);
+                return Err(error);
             }
         }
+        Ok(target_mfs)
+    })?;
+
+    if let Err(error) = target_mountpoint.publish_prepared_subtree(&target_mfs) {
+        MountFS::deactivate_disconnected_subtree(&target_mfs);
+        return Err(error);
     }
 
     Ok(())
@@ -622,20 +722,14 @@ fn do_bind_mount(
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
 ///
-/// namespace 隔离由 VFS 路径查找隐式保证。
+/// Namespace isolation is implicitly guaranteed by VFS path lookup.
 fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result<(), SystemError> {
-    // 目标必须是挂载点根
+    // Target must be a mount root
     if !is_mountpoint_root(&target_inode) {
         return Err(SystemError::EINVAL);
     }
 
-    let prop_type = match flags_to_propagation_type(flags) {
-        Some(t) => t,
-        None => {
-            log::warn!("do_change_type: no propagation flag set");
-            return Err(SystemError::EINVAL);
-        }
-    };
+    let prop_type = flags_to_propagation_type(flags)?;
 
     // Check if recursive flag is set
     let recursive = flags.contains(MountFlags::REC);
@@ -658,157 +752,67 @@ fn do_change_type(target_inode: Arc<dyn IndexNode>, flags: MountFlags) -> Result
     Ok(())
 }
 
-/// Recursively bind mount all submounts from source to target.
+/// Implement mount(MS_MOVE): move an already-mounted mount (along with its entire subtree) to a new mount point.
 ///
-/// This function traverses the source mount tree and creates corresponding
-/// bind mounts at the target location for all submounts.
+/// Aligns with Linux `do_move_mount` (fs/namespace.c). The calling convention is
+/// `mount(source, target, NULL, MS_MOVE, NULL)`, where `source` is the path of the
+/// mount being moved (not a device name). `MS_REC` is meaningless for move, as move
+/// inherently moves the entire subtree.
 ///
 /// # Arguments
-/// * `source_mfs` - The source MountFS to copy submounts from
-/// * `target_mfs` - The target MountFS to create submounts in
-/// * `source_base_path` - The absolute path of the source mount point
-/// * `target_base_path` - The absolute path of the target mount point
+/// * `source` - The source path of the mount being moved.
+/// * `target_inode` - The target inode of the new mount point.
 ///
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(SystemError)` on failure
-fn do_recursive_bind_mount(
-    source_mfs: &Arc<MountFS>,
-    _target_mfs: &Arc<MountFS>,
-    source_base_path: &str,
-    target_base_path: &str,
+fn do_move_mount(
+    source: Option<String>,
+    target_inode: Arc<dyn IndexNode>,
 ) -> Result<(), SystemError> {
-    let mnt_ns = ProcessManager::current_mntns();
-    let mount_list = mnt_ns.mount_list();
-
-    // Queue for BFS traversal: (source_submount, source_mountpoint_ino)
-    struct SubmountInfo {
-        source_mfs: Arc<MountFS>,
-        source_mp_ino: InodeId,
+    let source_path = source.ok_or(SystemError::EINVAL)?;
+    if source_path.is_empty() {
+        return Err(SystemError::EINVAL);
     }
 
-    let mut queue: Vec<SubmountInfo> = Vec::new();
+    // Resolve source path → inode.
+    let (begin, rest) = user_path_at(
+        &ProcessManager::current_pcb(),
+        AtFlags::AT_FDCWD.bits(),
+        &source_path,
+    )?;
+    let source_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        begin.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
 
-    // Add all direct submounts of source to the queue
-    for (child_ino, child_mfs) in source_mfs.mountpoints().iter() {
-        queue.push(SubmountInfo {
-            source_mfs: child_mfs.clone(),
-            source_mp_ino: *child_ino,
-        });
+    let current_mntns = ProcessManager::current_mntns();
+
+    // path_mounted(old_path): source must be a mount root, not an ordinary subdirectory within a mount.
+    if !is_mountpoint_root(&source_inode) {
+        return Err(SystemError::EINVAL);
     }
 
-    // Process all submounts
-    while let Some(info) = queue.pop() {
-        // Get the mount path of this submount
-        let child_mount_path = match mount_list.get_mount_path_by_ino(info.source_mp_ino) {
-            Some(path) => path,
-            None => {
-                log::warn!(
-                    "do_recursive_bind_mount: mount path not found for inode {:?}",
-                    info.source_mp_ino
-                );
-                continue;
-            }
-        };
+    // Resolve the mount object. Namespace membership, lifecycle, locking,
+    // propagation constraints and cycle prevention are validated atomically by
+    // MntNamespace::move_mount() under the topology lock.
+    let source_mfs = source_inode
+        .fs()
+        .downcast_arc::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
 
-        // Calculate the relative path from source base
-        let relative_path = match child_mount_path.as_str().strip_prefix(source_base_path) {
-            Some(rel) => {
-                if rel.is_empty() {
-                    continue; // Skip if it's the source itself
-                }
-                rel
-            }
-            None => {
-                log::warn!(
-                    "do_recursive_bind_mount: path {} is not under source base {}",
-                    child_mount_path.as_str(),
-                    source_base_path
-                );
-                continue;
-            }
-        };
-
-        // Calculate target path
-        let target_child_path = if target_base_path.ends_with('/') {
-            alloc::format!(
-                "{}{}",
-                target_base_path.trim_end_matches('/'),
-                relative_path
-            )
-        } else {
-            alloc::format!("{}{}", target_base_path, relative_path)
-        };
-
-        // log::debug!(
-        //     "do_recursive_bind_mount: binding submount {} -> {}",
-        //     child_mount_path.as_str(),
-        //     target_child_path
-        // );
-
-        // Look up the target directory inode
-        let root_inode = mnt_ns.root_inode();
-        let target_child_inode = match root_inode
-            .lookup_follow_symlink(&target_child_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-        {
-            Ok(inode) => inode,
-            Err(e) => {
-                return Err(e);
-            }
-        };
-
-        let source_child_is_dir =
-            info.source_mfs.root_inner_inode().metadata()?.file_type == FileType::Dir;
-        let target_child_is_dir = target_child_inode.metadata()?.file_type == FileType::Dir;
-        if source_child_is_dir != target_child_is_dir {
-            log::warn!(
-                "do_recursive_bind_mount: source and target type mismatch for {}",
-                target_child_path
-            );
-            return Err(SystemError::ENOTDIR);
-        }
-
-        // Get the inner filesystem for mounting
-        // source_mfs is already Arc<MountFS>, so we can directly call inner_filesystem()
-        let child_inner_fs = info.source_mfs.inner_filesystem();
-
-        // Create the bind mount
-        let child_root_inner_inode = info.source_mfs.root_inner_inode();
-        match target_child_inode
-            .clone()
-            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
-            .ok_or(SystemError::EINVAL)?
-            .mount_subtree_with_state(
-                child_inner_fs,
-                child_root_inner_inode,
-                MountFlags::empty(),
-                Some(info.source_mfs.super_block_state()),
-            ) {
-            Ok(new_child_mnt) => {
-                let source = info
-                    .source_mfs
-                    .mount_source()
-                    .unwrap_or_else(|| String::from(child_mount_path.as_str()));
-                new_child_mnt.set_mount_source(Some(source));
-            }
-            Err(e) => {
-                log::warn!(
-                    "do_recursive_bind_mount: failed to mount at {}: {:?}",
-                    target_child_path,
-                    e
-                );
-                return Err(e);
-            }
-        }
-
-        // Add this submount's children to the queue
-        for (grandchild_ino, grandchild_mfs) in info.source_mfs.mountpoints().iter() {
-            queue.push(SubmountInfo {
-                source_mfs: grandchild_mfs.clone(),
-                source_mp_ino: *grandchild_ino,
-            });
-        }
+    // d_is_dir(new) != d_is_dir(old): source and target types must match.
+    let source_is_dir = source_inode.metadata()?.file_type == FileType::Dir;
+    let target_is_dir = target_inode.metadata()?.file_type == FileType::Dir;
+    if source_is_dir != target_is_dir {
+        return Err(SystemError::ENOTDIR);
     }
+
+    // Target mount point inode (for topology attachment and propagation).
+    let target_mountpoint = target_inode
+        .clone()
+        .downcast_arc::<MountFSInode>()
+        .ok_or(SystemError::EINVAL)?;
+    current_mntns.move_mount(&source_mfs, &target_mountpoint)?;
 
     Ok(())
 }

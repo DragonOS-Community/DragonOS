@@ -3,15 +3,16 @@ pub mod byte_parser;
 pub mod casting;
 pub mod cpumask;
 pub mod elf;
+pub mod errseq;
 #[macro_use]
 pub mod int_like;
 pub mod keyboard_parser;
 pub mod lazy_init;
 pub mod lib_ui;
-pub mod lock_free_flags;
 pub mod mutex;
 pub mod notifier;
 pub mod once;
+pub(crate) mod resource_wait;
 #[macro_use]
 pub mod printk;
 pub mod rbtree;
@@ -20,6 +21,7 @@ pub mod rwlock;
 pub mod rwsem;
 pub mod semaphore;
 pub mod spinlock;
+pub mod spinlock_hook;
 pub mod vec_cursor;
 #[macro_use]
 pub mod volatile;
@@ -34,3 +36,6 @@ pub mod decompress;
 
 pub mod pod;
 pub mod ranges;
+
+pub(crate) mod paged_vec;
+pub(crate) mod prepared_queue;

@@ -1,10 +1,12 @@
-use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicUsize;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicI32, AtomicUsize};
 
 use alloc::vec::Vec;
 
 use super::namespace::user_namespace::{UserNamespace, INIT_USER_NAMESPACE};
 use crate::process::ProcessManager;
+use crate::security::keys::{KeyRef, SpecialKeyringKind};
+use system_error::SystemError;
 
 const GLOBAL_ROOT_UID: Kuid = Kuid(0);
 const GLOBAL_ROOT_GID: Kgid = Kgid(0);
@@ -15,10 +17,27 @@ lazy_static::lazy_static! {
 int_like!(Kuid, AtomicKuid, usize, AtomicUsize);
 int_like!(Kgid, AtomicKgid, usize, AtomicUsize);
 
+/// suid_dumpable value: core dumps fully disabled
+pub const SUID_DUMP_DISABLE: i32 = 0;
+/// suid_dumpable value: dump by the normal user-process rules
+pub const SUID_DUMP_USER: i32 = 1;
+/// suid_dumpable value: root suid binaries may also dump.
+#[allow(dead_code)]
+pub const SUID_DUMP_ROOT: i32 = 2;
+
+/// Global suid_dumpable switch (/proc/sys/fs/suid_dumpable).
+pub static SUID_DUMPABLE: AtomicI32 = AtomicI32::new(SUID_DUMP_DISABLE);
+
+/// Highest capability number recognized by this kernel (Linux 6.6: CAP_CHECKPOINT_RESTORE).
+pub const CAP_LAST_CAP: usize = 40;
+
+/// Linux's initial destination for request_key() results.
+pub const KEY_REQKEY_DEFL_THREAD_KEYRING: i32 = 1;
+
 bitflags! {
     pub struct CAPFlags:u64{
         const CAP_EMPTY_SET = 0;
-        const CAP_FULL_SET = (1 << 41) - 1;
+        const CAP_FULL_SET = (1u64 << (CAP_LAST_CAP + 1)) - 1;
 
         // 具体的capability定义，与Linux保持一致
         const CAP_CHOWN = 1 << 0;
@@ -61,7 +80,7 @@ bitflags! {
         const CAP_AUDIT_READ = 1 << 37;
         const CAP_PERFMON = 1 << 38;
         const CAP_BPF = 1 << 39;
-        const CAP_CHECKPOINT_RESTORE = 1 << 40;
+        const CAP_CHECKPOINT_RESTORE = 1 << CAP_LAST_CAP;
     }
 }
 
@@ -74,7 +93,6 @@ pub enum CredFsCmp {
 /// 凭证集
 #[derive(Debug, Clone)]
 pub struct Cred {
-    pub self_ref: Weak<Cred>,
     /// 进程实际uid
     pub uid: Kuid,
     /// 进程实际gid
@@ -103,21 +121,24 @@ pub struct Cred {
     pub cap_bset: CAPFlags,
     /// Ambient capability set
     pub cap_ambient: CAPFlags,
-    /// supplementary groups for euid/fsgid
-    pub group_info: Option<GroupInfo>,
+    /// Linux SECURE_KEEP_CAPS (a credential property, cleared by userns and exec).
+    pub keepcaps: bool,
     pub user_ns: Arc<UserNamespace>,
+    /// Credentials own the task's keyring references.  Links in a keyring
+    /// remain shared across credential copies, as in Linux.
+    pub thread_keyring: Option<KeyRef>,
+    pub process_keyring: Option<KeyRef>,
+    pub session_keyring: Option<KeyRef>,
+    pub request_key_auth: Option<KeyRef>,
+    pub jit_keyring: i32,
 }
 
 impl Cred {
     fn init() -> Arc<Self> {
-        // 默认 init 进程能力集：
-        // - CAP_FSETID 会影响写/截断时是否清除 suid/sgid 位（Linux: CAP_FSETID 可阻止清理）。
-        //   gVisor syscall 测试假设该能力不启用，否则会观察到 setuid/setgid 位被保留。
-        // - cap_ambient 默认应为空（Linux init 的 ambient 也是空）。
-        let mut init_caps = CAPFlags::CAP_FULL_SET;
-        init_caps.remove(CAPFlags::CAP_FSETID);
-        Arc::new_cyclic(|weak_self| Self {
-            self_ref: weak_self.clone(),
+        // 默认 init 进程能力集对齐 Linux init_cred：
+        // permitted/effective/bset 为 full set，ambient 为空。
+        let init_caps = CAPFlags::CAP_FULL_SET;
+        Arc::new(Self {
             uid: GLOBAL_ROOT_UID,
             gid: GLOBAL_ROOT_GID,
             suid: GLOBAL_ROOT_UID,
@@ -132,23 +153,88 @@ impl Cred {
             cap_effective: init_caps,
             cap_bset: init_caps,
             cap_ambient: CAPFlags::CAP_EMPTY_SET,
-            group_info: None,
+            keepcaps: false,
             user_ns: INIT_USER_NAMESPACE.clone(),
+            thread_keyring: None,
+            process_keyring: None,
+            session_keyring: None,
+            request_key_auth: None,
+            jit_keyring: KEY_REQKEY_DEFL_THREAD_KEYRING,
         })
     }
 
     pub fn new_arc(cred: Cred) -> Arc<Self> {
-        Arc::new_cyclic(|weak_self| {
-            let mut new_cred = cred;
-            new_cred.self_ref = weak_self.clone();
-            new_cred
-        })
+        Arc::new(cred)
+    }
+
+    /// Use when preparing a credential in a fallible fork or exec phase.
+    pub fn try_new_arc(cred: Cred) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(cred).map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// Linux copy_creds(): a new thread receives a fresh thread keyring if
+    /// the creator had one; a new process never inherits the process keyring.
+    /// A session keyring and request-key context are copied by reference.
+    pub fn prepare_fork_keyrings(
+        &self,
+        clone_thread: bool,
+    ) -> Result<Option<Arc<Self>>, SystemError> {
+        let needs_copy =
+            self.thread_keyring.is_some() || (!clone_thread && self.process_keyring.is_some());
+        if !needs_copy {
+            return Ok(None);
+        }
+
+        let mut next = self.clone();
+        if self.thread_keyring.is_some() {
+            next.thread_keyring = if clone_thread {
+                Some(crate::security::keys::create_special_keyring(
+                    &next,
+                    SpecialKeyringKind::Thread,
+                )?)
+            } else {
+                None
+            };
+        }
+        if !clone_thread {
+            next.process_keyring = None;
+        }
+        Ok(Some(Self::try_new_arc(next)?))
+    }
+
+    /// Prepare before exec's last fallible operation.  The successful commit
+    /// then only publishes an already allocated credential.
+    pub fn prepare_exec_keyrings(&self) -> Result<Option<Arc<Self>>, SystemError> {
+        if !self.keepcaps && self.thread_keyring.is_none() && self.process_keyring.is_none() {
+            return Ok(None);
+        }
+        let mut next = self.clone();
+        next.keepcaps = false;
+        next.thread_keyring = None;
+        next.process_keyring = None;
+        Ok(Some(Self::try_new_arc(next)?))
+    }
+
+    /// Linux commit_creds() updates the permission owner of an existing
+    /// thread ring when fsuid/fsgid changes, without moving its quota charge.
+    /// Call before acquiring the task publication lock: the key state mutex
+    /// may sleep and must never nest below task_lock.
+    pub(crate) fn sync_thread_keyring_owner(&self, old: &Cred) {
+        if self.fsuid != old.fsuid || self.fsgid != old.fsgid {
+            if let Some(thread_keyring) = self.thread_keyring.as_ref() {
+                crate::security::keys::set_key_owner_uid_gid(
+                    thread_keyring,
+                    self.fsuid,
+                    self.fsgid,
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
     /// Compare two credentials with respect to filesystem access.
     pub fn fscmp(&self, other: Arc<Cred>) -> CredFsCmp {
-        if Arc::ptr_eq(&self.self_ref.upgrade().unwrap(), &other) {
+        if core::ptr::eq(self, other.as_ref()) {
             return CredFsCmp::Equal;
         }
 
@@ -166,39 +252,14 @@ impl Cred {
             return CredFsCmp::Greater;
         }
 
-        if self.group_info == other.group_info {
+        if self.groups == other.groups {
             return CredFsCmp::Equal;
         }
-
-        if let (Some(ga), Some(gb)) = (&self.group_info, &other.group_info) {
-            let ga_count = ga.gids.len();
-            let gb_count = gb.gids.len();
-
-            if ga_count < gb_count {
-                return CredFsCmp::Less;
-            }
-            if ga_count > gb_count {
-                return CredFsCmp::Greater;
-            }
-
-            for i in 0..ga_count {
-                if ga.gids[i] < gb.gids[i] {
-                    return CredFsCmp::Less;
-                }
-                if ga.gids[i] > gb.gids[i] {
-                    return CredFsCmp::Greater;
-                }
-            }
-        } else {
-            if self.group_info.is_none() {
-                return CredFsCmp::Less;
-            }
-            if other.group_info.is_none() {
-                return CredFsCmp::Greater;
-            }
+        match self.groups.cmp(&other.groups) {
+            core::cmp::Ordering::Less => CredFsCmp::Less,
+            core::cmp::Ordering::Equal => CredFsCmp::Equal,
+            core::cmp::Ordering::Greater => CredFsCmp::Greater,
         }
-
-        return CredFsCmp::Equal;
     }
 
     pub fn setuid(&mut self, uid: usize) {
@@ -248,6 +309,11 @@ impl Cred {
         cap_capable(self, &self.user_ns, cap)
     }
 
+    /// Check whether the current process has the given capability in the specified (usually the target task's) user namespace.
+    pub fn has_capability_in_ns(&self, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
+        cap_capable(self, targ_ns, cap)
+    }
+
     /// 检查当前进程是否具有CAP_SYS_ADMIN权限
     pub fn has_cap_sys_admin(&self) -> bool {
         self.has_capability(CAPFlags::CAP_SYS_ADMIN)
@@ -273,14 +339,12 @@ pub fn cap_capable(cred: &Cred, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> 
         }
 
         let ns_owner = ns.inner.lock().owner;
-        if let Some(ref parent_weak) = ns.parent {
-            if let Some(parent_ns) = parent_weak.upgrade() {
-                if Arc::ptr_eq(&parent_ns, &cred.user_ns) && ns_owner == cred.euid.data() {
-                    return true;
-                }
-                ns = parent_ns;
-                continue;
+        if let Some(parent_ns) = ns.parent.as_ref() {
+            if Arc::ptr_eq(parent_ns, &cred.user_ns) && ns_owner == cred.euid.data() {
+                return true;
             }
+            ns = parent_ns.clone();
+            continue;
         }
 
         return false;
@@ -291,6 +355,45 @@ pub fn cap_capable(cred: &Cred, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> 
 pub fn ns_capable(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
     let pcb = ProcessManager::current_pcb();
     cap_capable(&pcb.cred(), ns, cap)
+}
+
+/// Check whether the current process has a capability in the initial user namespace.
+///
+/// Linux `capable(cap)` is equivalent to `ns_capable(&init_user_ns, cap)`.
+/// Hardware-level capabilities such as `CAP_SYS_RAWIO` must use this semantic
+/// instead of checking the current process user namespace.
+pub fn capable(cap: CAPFlags) -> bool {
+    ns_capable(&INIT_USER_NAMESPACE, cap)
+}
+
+/// Whether the current task may use perf's privileged monitoring features.
+///
+/// This matches Linux 6.6 `perfmon_capable()`: `CAP_PERFMON` is the least
+/// privileged authorization, while `CAP_SYS_ADMIN` remains a compatibility
+/// fallback for existing administrative callers.
+pub fn perfmon_capable() -> bool {
+    capable(CAPFlags::CAP_PERFMON) || capable(CAPFlags::CAP_SYS_ADMIN)
+}
+
+/// Whether new's permitted caps are a subset of old's (no privilege raise).
+pub fn cred_cap_issubset(old: &Cred, new: &Cred) -> bool {
+    let mut ns = new.user_ns.clone();
+    // Same namespace: compare the cap sets directly
+    if Arc::ptr_eq(&old.user_ns, &ns) {
+        return (new.cap_permitted.bits() & !old.cap_permitted.bits()) == 0;
+    }
+    // Across namespaces: walk the parent chain checking each owner against old's euid
+    while !Arc::ptr_eq(&ns, &INIT_USER_NAMESPACE) {
+        let ns_owner = ns.inner.lock().owner;
+        let Some(parent_ns) = ns.parent.as_ref() else {
+            return false;
+        };
+        if Arc::ptr_eq(&old.user_ns, parent_ns) && ns_owner == old.euid.data() {
+            return true;
+        }
+        ns = parent_ns.clone();
+    }
+    false
 }
 
 /// 检查当前进程在指定 ns 中是否有某 capability（setid 上下文）
@@ -306,15 +409,11 @@ pub fn ns_capable_setid(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
 /// - uid/gid/euid/egid/fsuid/fsgid **不改变**
 /// - user_ns 指向新的 namespace
 pub fn set_cred_user_ns(cred: &mut Cred, user_ns: Arc<UserNamespace>) {
+    cred.keepcaps = false;
     cred.cap_inheritable = CAPFlags::CAP_EMPTY_SET;
     cred.cap_permitted = CAPFlags::CAP_FULL_SET;
     cred.cap_effective = CAPFlags::CAP_FULL_SET;
     cred.cap_ambient = CAPFlags::CAP_EMPTY_SET;
     cred.cap_bset = CAPFlags::CAP_FULL_SET;
     cred.user_ns = user_ns;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct GroupInfo {
-    pub gids: Vec<Kgid>,
 }

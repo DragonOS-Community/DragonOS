@@ -1,74 +1,74 @@
 # MMIO
 
-MMIO是“内存映射IO”的缩写，它被广泛应用于与硬件设备的交互之中。
+MMIO stands for "Memory-Mapped I/O," and it is widely used for interaction with hardware devices.
 
-## 地址空间管理
+## Address Space Management
 
-DragonOS中实现了MMIO地址空间的管理机制，本节将介绍它们。
+DragonOS implements a mechanism for managing MMIO address spaces. This section will introduce them.
 
-### 为什么需要MMIO地址空间自动分配？
+### Why is Automatic Allocation of MMIO Address Space Needed?
 
-&emsp;&emsp;由于计算机上的很多设备都需要MMIO的地址空间，而每台计算机上所连接的各种设备的对MMIO地址空间的需求是不一样的。如果我们为每个类型的设备都手动指定一个MMIO地址，会使得虚拟地址空间被大大浪费，也会增加系统的复杂性。并且，我们在将来还需要为不同的虚拟内存区域做异常处理函数。因此，我们需要一套能够自动分配MMIO地址空间的机制。
+Since many devices on a computer require MMIO address space, and the demand for MMIO address space varies among different devices connected to each computer, manually specifying an MMIO address for each device type would lead to significant waste of virtual address space and increase system complexity. Moreover, we will need to handle exception handling functions for different virtual memory regions in the future. Therefore, we need a mechanism that can automatically allocate MMIO address space.
 
-### 这套机制提供了什么功能？
+### What Features Does This Mechanism Provide?
 
-- 为驱动程序分配4K到1GB的MMIO虚拟地址空间
-- 对于这些虚拟地址空间，添加到VMA中进行统一管理
-- 可以批量释放这些地址空间
+- Allocates MMIO virtual address space ranging from 4K to 1GB for drivers
+- Adds these virtual address spaces to VMA for unified management
+- Allows batch release of these address spaces
 
-### 这套机制是如何实现的？
+### How Is This Mechanism Implemented?
 
-&emsp;&emsp;这套机制本质上是使用了伙伴系统来对MMIO虚拟地址空间进行维护。在`mm/mm.h`中指定了MMIO的虚拟地址空间范围，这个范围是`0xffffa10000000000`开始的1TB的空间。也就是说，这个伙伴系统为MMIO维护了这1TB的虚拟地址空间。
+This mechanism essentially uses the buddy system to maintain MMIO virtual address space. In `mm/mm.h`, the MMIO virtual address space range is specified, which starts at `0xffffa10000000000` and covers a 1TB space. In other words, the buddy system maintains this 1TB virtual address space for MMIO.
 
-### 地址空间分配过程
+### Address Space Allocation Process
 
-1. 初始化MMIO-mapping模块，在mmio的伙伴系统中创建512个1GB的`__mmio_buddy_addr_region`
-2. 驱动程序使用`mmio_create`请求分配地址空间。
-3. `mmio_create`对申请的地址空间大小按照2的n次幂进行对齐，然后从buddy中申请内存地址空间
-4. 创建VMA，并将VMA标记为`VM_IO|VM_DONTCOPY`。MMIO的vma只绑定在`initial_mm`下，且不会被拷贝。
-5. 分配完成
+1. Initialize the MMIO-mapping module, creating 512 1GB `__mmio_buddy_addr_region` blocks in the MMIO buddy system.
+2. The driver uses `mmio_create` to request address space allocation.
+3. `mmio_create` aligns the requested address space size to the nearest power of 2 and allocates memory address space from the buddy.
+4. Create a VMA and mark it as `VM_IO|VM_DONTCOPY`. MMIO VMA is only bound under `initial_mm` and will not be copied.
+5. Allocation is complete.
 
-一旦MMIO地址空间分配完成，它就像普通的vma一样，可以使用mmap系列函数进行操作。
+Once the MMIO address space is allocated, it behaves like a regular VMA and can be operated using mmap series functions.
 
-### MMIO的映射过程
+### MMIO Mapping Process
 
-&emsp;&emsp;在得到了虚拟地址空间之后，当我们尝试往这块地址空间内映射内存时，我们可以调用`mm_map`函数，对这块区域进行映射。
+After obtaining the virtual address space, when we attempt to map memory into this address space, we can call the `mm_map` function to map this region.
 
-&emsp;&emsp;该函数会对MMIO的VMA的映射做出特殊处理。即：创建`Page`结构体以及对应的`anon_vma`. 然后会将对应的物理地址，填写到页表之中。
+This function performs special handling for MMIO VMA mapping. That is: it creates a `Page` structure and the corresponding `anon_vma`. Then, it fills the corresponding physical address into the page table.
 
-### MMIO虚拟地址空间的释放
+### Releasing MMIO Virtual Address Space
 
-&emsp;&emsp;当设备被卸载时，驱动程序可以调用`mmio_release`函数对指定的mmio地址空间进行释放。
+When a device is unmounted, the driver can call the `mmio_release` function to release the specified MMIO address space.
 
-&emsp;&emsp;释放的过程中，`mmio_release`将执行以下流程：
+During the release process, `mmio_release` performs the following steps:
 
-1. 取消mmio区域在页表中的映射。
-2. 将释放MMIO区域的VMA
-3. 将地址空间归还给mmio的伙伴系统。
+1. Remove the MMIO region's mapping from the page table.
+2. Release the MMIO region's VMA.
+3. Return the address space back to the MMIO buddy system.
 
-## MMIO的伙伴算法
+## Buddy Algorithm for MMIO
 
-### 伙伴的定义
+### Definition of Buddy
 
-&emsp;&emsp;同时满足以下三个条件的两个内存块被称为伙伴内存块：
+Two memory blocks are considered buddy memory blocks if they satisfy the following three conditions:
 
-1. 两个内存块的大小相同
-2. 两个内存块的内存地址连续
-3. 两个内存块由同一个大块内存分裂得到
+1. The sizes of the two memory blocks are the same.
+2. The memory addresses of the two memory blocks are contiguous.
+3. The two memory blocks are derived from the same larger block of memory.
 
-### 伙伴算法
+### Buddy Algorithm
 
-&emsp;&emsp;伙伴（buddy）算法的作用是维护以及组织大块连续内存块的分配和回收，以减少系统时运行产生的外部碎片。伙伴系统中的每个内存块的大小均为$2^n$。 在DragonOS中，伙伴系统内存池共维护了1TB的连续存储空间，最大的内存块大小为$1G$，即$2^{30}B$，最小的内存块大小为$4K$，即 $2^{12}B$。
+The buddy algorithm is used to manage and organize the allocation and recycling of large contiguous memory blocks to reduce external fragmentation during system runtime. In the buddy system, each memory block size is $2^n$ bytes. In DragonOS, the buddy system memory pool maintains a total of 1TB of contiguous storage space, with the largest memory block size being $1G$ (i.e., $2^{30}B$) and the smallest memory block size being $4K$ (i.e., $2^{12}B$).
 
-&emsp;&emsp;伙伴算法的核心思想是当应用申请内存时，每次都分配比申请的内存大小更大的最小内存块，同时分配出去的内存块大小为$2^nB$。（e.g. 假设某应用申请了$3B$内存，显然并没有整数值n，使$2^n = 3$ ，且$3 \in [2^1,2^2]$，所以系统会去取一块大小为$2^2B$的内存块，将它分配给申请的应用，本次申请内存操作顺利完成。）
+The core idea of the buddy algorithm is that when an application requests memory, it always allocates the smallest memory block larger than the requested size, and the allocated memory block size is $2^nB$. (e.g., if an application requests $3B$ of memory, there is no integer $n$ such that $2^n = 3$, and $3 \in [2^1, 2^2]$, so the system will allocate a $2^2B$ memory block to the application, and the memory request is successfully completed.)
 
-&emsp;&emsp;那么当伙伴系统中没有如此“合适”的内存块时该怎么办呢？系统先会去寻找更大的内存块，如果找到了，则会将大内存块分裂成合适的内存块分配给应用。（e.g. 假设申请$3B$内存，此时系统中比$3B$大的最小内存块的大小为$16B$，那么$16B$会被分裂成两块$8B$的内存块，一块放入内存池中，一块继续分裂成两块$4B$的内存块。两块$4B$的内存块，一块放入内存池中，一块分配给应用。至此，本次申请内存操作顺利完成。）
+What if there is no such "suitable" memory block in the buddy system? The system will first look for a larger memory block. If found, it will split the larger memory block into suitable memory blocks to allocate to the application. (e.g., if an application requests $3B$ of memory, and the system's smallest memory block larger than $3B$ is $16B$, then the $16B$ block will be split into two $8B$ blocks. One is placed back into the memory pool, and the other is further split into two $4B$ blocks. One of the $4B$ blocks is placed back into the memory pool, and the other is allocated to the application. Thus, the memory request is successfully completed.)
 
-&emsp;&emsp;如果系统没有找到更大的内存块，系统将会尝试合并较小的内存块，直到符合申请空间的大小。（e.g. 假设申请$3B$内存，系统检查内存池发现只有两个$2B$的内存块，那么系统将会把这两个$2B$的内存块合并成一块$4B$的内存块，并分配给应用。至此，本次申请内存操作顺利完成。）
+If the system cannot find a larger memory block, it will attempt to merge smaller memory blocks until the required size is met. (e.g., if an application requests $3B$ of memory, and the system checks the memory pool and finds only two $2B$ memory blocks, the system will merge these two $2B$ blocks into a $4B$ block and allocate it to the application. Thus, the memory request is successfully completed.)
 
-&emsp;&emsp;最后，当系统既没有找到大块内存，又无法成功合并小块内存时，就会通知应用内存不够，无法分配内存。
+Finally, if the system cannot find a large enough memory block and is unable to successfully merge smaller blocks, it will notify the application that there is not enough memory to allocate.
 
-### 伙伴算法的数据结构
+### Data Structures of the Buddy Algorithm
 
 ```
 
@@ -151,39 +151,39 @@ pub struct MmioBuddyAddrRegion {
                   
 ```
 
-### 设计思路
+### Design Philosophy
 
-&emsp;&emsp;DragonOS中，使用`MmioBuddyMemPool`结构体作为buddy（为表述方便，以下将伙伴算法简称为buddy）内存池的数据结构，其记录了内存池的起始地址（pool_start_addr）以及内存池中内存块的总大小（pool_size），同时其维护了大小为`MMIO_BUDDY_REGION_COUNT`的双向链表数组（free_regions）。`free_regions`中的各个链表维护了若干空闲内存块（MmioBuddyAddrRegion）。
+In DragonOS, the `MmioBuddyMemPool` structure is used as the data structure for the buddy (for convenience of expression, the buddy algorithm is referred to as buddy) memory pool. It records the starting address (pool_start_addr) of the memory pool and the total size of memory blocks in the memory pool (pool_size). It also maintains a bidirectional linked list array (free_regions) of size `MMIO_BUDDY_REGION_COUNT`. Each linked list in `free_regions` maintains several free memory blocks (MmioBuddyAddrRegion).
 
-&emsp;&emsp;`free_regions`的下标（index）与内存块的大小有关。由于每个内存块大小都为$2^{n}$ bytes，那么可以令$exp = n$。index与exp的换算公式如下：$index = exp - 12$。e.g. 一个大小为$2^{12}$ bytes的内存块，其$exp = 12$，使用上述公式计算得$index = 12 -12 = 0$，所以该内存块会被存入`free_regions[0].list`中。通过上述换算公式，每次取出或释放$2^n$大小的内存块，只需要操作`free_regions[n -12]`即可。DragonOS中，buddy内存池最大的内存块大小为$1G =  2^{30}bytes$，最小的内存块大小为 $4K =  2^{12} bytes$，所以$index\in[0,18]$。
+The index of `free_regions` is related to the size of the memory block. Since each memory block size is $2^{n}$ bytes, we can let $exp = n$. The conversion formula between index and exp is as follows: $index = exp - 12$. For example, a memory block of size $2^{12}$ bytes has $exp = 12$, and using the above formula, we get $index = 12 - 12 = 0$, so this memory block is stored in `free_regions[0].list`. Through this conversion formula, each time we take or release a memory block of size $2^n$, we only need to operate on `free_regions[n -12]`. In DragonOS, the largest memory block size in the buddy memory pool is $1G = 2^{30} bytes$, and the smallest is $4K = 2^{12} bytes$, so $index \in [0, 18]$.
 
-&emsp;&emsp;作为内存分配机制，buddy服务于所有进程，为了解决在各个进程之间实现free_regions中的链表数据同步的问题，`free_regions`中的链表类型采用加了 {ref}`自旋锁 <_spinlock_doc_spinlock>`（SpinLock）的空闲内存块链表（MmioFreeRegionList），`MmioFreeRegionList`中封装有真正的存储了空闲内存块信息的结构体的链表（list）和对应链表长度（num_free）。有了自选锁后，同一时刻只允许一个进程修改某个链表，如取出链表元素（申请内存）或者向链表中插入元素（释放内存）。
+As a memory allocation mechanism, the buddy serves all processes. To solve the problem of synchronizing the linked list data in free_regions among different processes, the linked list type in `free_regions` uses a SpinLock (denoted as [自旋锁 ](/kernel/locking/spinlock.html#_spinlock_doc_spinlock)) to protect the free memory block linked list (MmioFreeRegionList). `MmioFreeRegionList` encapsulates a linked list (list) that actually stores information about free memory blocks and the corresponding list length (num_free). With the use of a spinlock, only one process can modify a particular linked list at the same time, such as taking elements from the list (memory allocation) or inserting elements into the list (memory release).
 
-&emsp;&emsp;`MmioFreeRegionList`中的元素类型为`MmioBuddyAddrRegion`结构体，`MmioBuddyAddrRegion`记录了内存块的起始地址（vaddr）。
+The element type in `MmioFreeRegionList` is the `MmioBuddyAddrRegion` structure, which records the starting address (vaddr) of the memory block.
 
-### 伙伴算法内部api
+### Internal APIs of the Buddy Algorithm
 
-**P.S 以下函数均为MmioBuddyMemPool的成员函数。系统中已经创建了一个MmioBuddyMemPool类型的全局引用`MMIO_POOL`，如要使用以下函数，请以`MMIO_POOL.xxx()`形式使用，以此形式使用则不需要传入self。**
+**P.S. The following functions are all members of the MmioBuddyMemPool structure. A global reference of type MmioBuddyMemPool has already been created in the system, denoted as `MMIO_POOL`. To use the following functions, please use them in the form of `MMIO_POOL.xxx()`, which does not require passing self.**
 
-| **函数名**                                                           | **描述**                                                    |
+| **Function Name**                                                           | **Description**                                                    |
 |:----------------------------------------------------------------- |:--------------------------------------------------------- |
-| __create_region(&self, vaddr)                                     | 将虚拟地址传入，创建新的内存块地址结构体                                      |
-| __give_back_block(&self, vaddr, exp)                              | 将地址为vaddr，幂为exp的内存块归还给buddy                               |
-| __buddy_split(&self,region,exp,list_guard)                        | 将给定大小为$2^{exp}$的内存块一分为二，并插入内存块大小为$2^{exp-1}$的链表中          |
-| __query_addr_region(&self,exp,list_guard)                         | 从buddy中申请一块大小为$2^{exp}$的内存块                               |
-| mmio_buddy_query_addr_region(&self,exp)                           | 对query_addr_region进行封装，**请使用这个函数，而不是__query_addr_region** |
-| __buddy_add_region_obj(&self,region,list_guard)                   | 往指定的地址空间链表中添加一个内存块                                        |
-| __buddy_block_vaddr(&self, vaddr, exp)                            | 根据地址和内存块大小，计算伙伴块虚拟内存的地址                                   |
-| __pop_buddy_block( &self, vaddr,exp,list_guard)                   | 寻找并弹出指定内存块的伙伴块                                            |
-| __buddy_pop_region( &self,        list_guard)                     | 从指定空闲链表中取出内存区域                                            |
-| __buddy_merge(&self,exp,list_guard,high_list_guard)               | 合并所有$2^{exp}$大小的内存块                                       |
-| __buddy_merge_blocks(&self,region_1,region_2,exp,high_list_guard) | 合并两个**已经从链表中取出的**内存块                                      |
+| __create_region(&self, vaddr)                                     | Pass the virtual address to create a new memory block address structure                                      |
+| __give_back_block(&self, vaddr, exp)                              | Return the memory block at address vaddr with exponent exp back to the buddy                               |
+| __buddy_split(&self, region, exp, list_guard)                        | Split the given memory block of size $2^{exp}$ into two and insert the memory blocks of size $2^{exp-1}$ into the list |
+| __query_addr_region(&self, exp, list_guard)                         | Request a memory block of size $2^{exp}$ from the buddy                               |
+| mmio_buddy_query_addr_region(&self, exp)                           | A wrapper for query_addr_region, **please use this function instead of __query_addr_region** |
+| __buddy_add_region_obj(&self, region, list_guard)                   | Add a memory block to the specified address space list                                        |
+| __buddy_block_vaddr(&self, vaddr, exp)                            | Calculate the virtual memory address of the buddy block based on the address and memory block size                                   |
+| __pop_buddy_block( &self, vaddr, exp, list_guard)                   | Find and pop the buddy block of the specified memory block                                            |
+| __buddy_pop_region( &self, list_guard)                     | Retrieve a memory region from the specified free list                                            |
+| __buddy_merge(&self, exp, list_guard, high_list_guard)               | Merge all memory blocks of size $2^{exp}$                                       |
+| __buddy_merge_blocks(&self, region_1, region_2, exp, high_list_guard) | Merge two **already removed from the list** memory blocks                                      |
 
-### 伙伴算法对外api
+### External APIs of the Buddy Algorithm
 
-| **函数名**                                         | **描述**                                      |
+| **Function Name**                                         | **Description**                                      |
 | ----------------------------------------------- | ------------------------------------------- |
-| __mmio_buddy_init()                             | 初始化buddy系统，**在mmio_init()中调用，请勿随意调用**       |
-| __exp2index(exp)                                | 将$2^{exp}$的exp转换成内存池中的数组的下标（index）          |
-| mmio_create(size,vm_flags,res_vaddr,res_length) | 创建一块根据size对齐后的大小的mmio区域，并将其vma绑定到initial_mm |
-| mmio_release(vaddr, length)                     | 取消地址为vaddr，大小为length的mmio的映射并将其归还到buddy中    |
+| __mmio_buddy_init()                             | Initialize the buddy system, **called in mmio_init(), do not call it arbitrarily**       |
+| __exp2index(exp)                                | Convert the exponent $exp$ of $2^{exp}$ to the index in the memory pool's array          |
+| mmio_create(size, vm_flags, res_vaddr, res_length) | Create an MMIO region with size aligned to the requested size, and bind its VMA to initial_mm |
+| mmio_release(vaddr, length)                     | Cancel the mapping of MMIO at address vaddr with size length and return it to the buddy    |

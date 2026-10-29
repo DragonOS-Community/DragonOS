@@ -9,17 +9,20 @@ use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
 };
-use crate::driver::pci::pci_irq::{IrqCommonMsg, IrqSpecificMsg, PciInterrupt, PciIrqMsg, IRQ};
+use crate::driver::pci::pci_irq::{
+    IrqCommonMsg, IrqSpecificMsg, IrqType, PciInterrupt, PciIrqError, PciIrqMsg, IRQ,
+};
 use crate::exception::IrqNumber;
-use alloc::string::ToString;
+use crate::time::Instant;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::intrinsics::unlikely;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{compiler_fence, Ordering};
 use log::{debug, info};
+use system_error::SystemError;
 
 use crate::libs::volatile::{ReadOnly, Volatile, WriteOnly};
 
@@ -62,6 +65,7 @@ const E1000E_RECV_VECTOR: IrqNumber = IrqNumber::new(57);
 
 // napi队列中暂时存储的buffer个数
 const E1000E_RECV_NAPI: usize = 1024;
+const E1000E_RUNTIME_RX_INTERRUPTS: u32 = E1000E_IMS_RXT0 | E1000E_IMS_RXDMT0 | E1000E_IMS_OTHER;
 
 // 收/发包的描述符结构 pp.24 Table 3-1
 #[repr(C)]
@@ -86,82 +90,93 @@ struct E1000ERecvDesc {
     error: u8,
     special: u8,
 }
-#[derive(Copy, Clone)]
-// Buffer的Copy只是指针操作，不涉及实际数据的复制，因此要小心使用，确保不同的buffer不会使用同一块内存
+#[must_use = "DMA buffer ownership must be explicitly transferred or freed"]
 pub struct E1000EBuffer {
     buffer: NonNull<u8>,
     paddr: usize,
-    // length字段为0则表示这个buffer是一个占位符，不指向实际内存
-    // the buffer is empty and no page is allocated if length field is set 0
-    length: usize,
+    capacity: usize,
+    data_len: usize,
 }
 
 impl E1000EBuffer {
+    pub fn try_new(length: usize) -> Result<Self, SystemError> {
+        if length > PAGE_SIZE {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let (paddr, buffer) = crate::mm::dma::try_dma_alloc_pages_raw(
+            E1000E_DMA_PAGES,
+            crate::mm::dma::DmaAllocOptions::default(),
+        )?;
+        Ok(Self {
+            buffer,
+            paddr,
+            capacity: PAGE_SIZE,
+            data_len: length,
+        })
+    }
+
     pub fn new(length: usize) -> Self {
         assert!(length <= PAGE_SIZE);
-        if unlikely(length == 0) {
-            // 在某些情况下，我们并不需要实际分配buffer，只需要提供一个占位符即可
-            // we dont need to allocate dma pages for buffer in some cases
-            E1000EBuffer {
-                buffer: NonNull::dangling(),
-                paddr: 0,
-                length: 0,
-            }
-        } else {
-            let (paddr, vaddr) = dma_alloc(E1000E_DMA_PAGES);
-            E1000EBuffer {
-                buffer: vaddr,
-                paddr,
-                length,
-            }
+        let (paddr, vaddr) = dma_alloc(E1000E_DMA_PAGES);
+        E1000EBuffer {
+            buffer: vaddr,
+            paddr,
+            capacity: PAGE_SIZE,
+            data_len: length,
         }
     }
 
     #[allow(dead_code)]
     pub fn as_addr(&self) -> NonNull<u8> {
-        assert!(self.length != 0);
+        assert!(self.capacity != 0);
         return self.buffer;
     }
 
     #[allow(dead_code)]
     pub fn as_addr_u64(&self) -> u64 {
-        assert!(self.length != 0);
+        assert!(self.capacity != 0);
         return self.buffer.as_ptr() as u64;
     }
 
     pub fn as_paddr(&self) -> usize {
-        assert!(self.length != 0);
+        assert!(self.capacity != 0);
         return self.paddr;
     }
 
     #[allow(dead_code)]
     pub fn as_slice(&self) -> &[u8] {
-        assert!(self.length != 0);
-        return unsafe { from_raw_parts(self.buffer.as_ptr(), self.length) };
+        assert!(self.capacity != 0);
+        return unsafe { from_raw_parts(self.buffer.as_ptr(), self.data_len) };
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        assert!(self.length != 0);
-        return unsafe { from_raw_parts_mut(self.buffer.as_ptr(), self.length) };
+        assert!(self.capacity != 0);
+        return unsafe { from_raw_parts_mut(self.buffer.as_ptr(), self.data_len) };
     }
 
     pub fn set_length(&mut self, length: usize) {
-        self.length = length;
+        assert!(length <= self.capacity);
+        self.data_len = length;
     }
 
     pub fn len(&self) -> usize {
-        return self.length;
+        return self.data_len;
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
     // 释放buffer内部的dma_pages，需要小心使用
     pub fn free_buffer(self) {
-        if self.length != 0 {
-            unsafe { dma_dealloc(self.paddr, self.buffer, E1000E_DMA_PAGES) };
-        }
+        unsafe { dma_dealloc(self.paddr, self.buffer, E1000E_DMA_PAGES) };
     }
 }
 
 #[allow(dead_code)]
 pub struct E1000EDevice {
+    pci_device: Arc<PciDeviceStructureGeneralDevice>,
+    irq_dev_id: Arc<DeviceId>,
+    active: bool,
     // 设备寄存器
     // device registers
     general_regs: NonNull<GeneralRegs>,
@@ -181,17 +196,36 @@ pub struct E1000EDevice {
 
     // 设备收/发包缓冲区数组
     // buffers of receive/transmit packets
-    recv_buffers: Vec<E1000EBuffer>,
-    trans_buffers: Vec<E1000EBuffer>,
+    recv_buffers: Vec<Option<E1000EBuffer>>,
+    trans_buffers: Vec<Option<E1000EBuffer>>,
     mac: [u8; 6],
     first_trans: bool,
+    tx_completion_interrupt_armed: bool,
     // napi队列，用于存放在中断关闭期间通过轮询收取的buffer
     // the napi queue is designed to save buffer/packet when the interrupt is close
     // NOTE: this feature is not completely implemented and not used in the current version
-    napi_buffers: Vec<E1000EBuffer>,
+    napi_buffers: Vec<Option<E1000EBuffer>>,
     napi_buffer_head: usize,
     napi_buffer_tail: usize,
     napi_buffer_empty: bool,
+}
+
+/// Owns the sleep-capable half of e1000e teardown.
+///
+/// Hardware producers are stopped while the device spinlock is held. IRQ
+/// synchronization is deliberately deferred until this token is consumed
+/// after that guard has been dropped.
+pub struct E1000EIrqTeardown {
+    pci_device: Arc<PciDeviceStructureGeneralDevice>,
+    irq_dev_id: Arc<DeviceId>,
+}
+
+impl E1000EIrqTeardown {
+    pub fn finish(self) {
+        if let Err(error) = self.pci_device.irq_uninstall(Some(&self.irq_dev_id)) {
+            log::error!("failed to uninstall e1000e IRQ during teardown: {error:?}");
+        }
+    }
 }
 
 impl E1000EDevice {
@@ -214,7 +248,7 @@ impl E1000EDevice {
         if address == 0 {
             return Err(E1000EPciError::BarNotAllocated);
         }
-        if size != E1000E_BAR_REG_SIZE {
+        if size != u64::from(E1000E_BAR_REG_SIZE) {
             return Err(E1000EPciError::UnexpectedBarSize);
         }
         let vaddress = bar0
@@ -224,20 +258,33 @@ impl E1000EDevice {
 
         // 初始化msi中断
         // initialize msi interupt
+        let lifecycle_guard = device.common_header.irq_lifecycle.lock();
+        device.ensure_irq_unowned()?;
         let irq_vector = device.irq_vector_mut().unwrap();
         irq_vector.write().push(E1000E_RECV_VECTOR);
-        device.irq_init(IRQ::PCI_IRQ_MSI).expect("IRQ Init Failed");
+        if device.irq_init(IRQ::PCI_IRQ_MSI).is_none() {
+            irq_vector.write().clear();
+            return Err(PciError::PciIrqError(PciIrqError::PciDeviceNotSupportIrq).into());
+        }
         let msg = PciIrqMsg {
             irq_common_message: IrqCommonMsg::init_from(
                 0,
                 "E1000E_RECV_IRQ".to_string(),
                 &DefaultE1000EIrqHandler,
-                device_id,
+                device_id.clone(),
             ),
             irq_specific_message: IrqSpecificMsg::msi_default(),
         };
-        device.irq_install(msg)?;
-        device.irq_enable(true)?;
+        if let Err(error) = device.irq_install(msg) {
+            irq_vector.write().clear();
+            *device.irq_type.write() = IrqType::Unused;
+            return Err(error.into());
+        }
+        if let Err(error) = device.irq_enable(true) {
+            let _ = device.irq_uninstall_locked(Some(&device_id));
+            return Err(error.into());
+        }
+        drop(lifecycle_guard);
 
         let general_regs: NonNull<GeneralRegs> =
             get_register_ptr(vaddress, E1000E_GENERAL_REGS_OFFSET);
@@ -312,8 +359,8 @@ impl E1000EDevice {
 
         // 初始化receive和transmit packet的缓冲区
         // initialzie receive and transmit buffers
-        let mut recv_buffers: Vec<E1000EBuffer> = Vec::with_capacity(recv_ring_length);
-        let mut trans_buffers: Vec<E1000EBuffer> = Vec::with_capacity(trans_ring_length);
+        let mut recv_buffers: Vec<Option<E1000EBuffer>> = Vec::with_capacity(recv_ring_length);
+        let mut trans_buffers: Vec<Option<E1000EBuffer>> = Vec::with_capacity(trans_ring_length);
 
         // 初始化缓冲区与descriptor，descriptor 中的addr字典应当指向buffer的物理地址
         // Receive buffers of appropriate size should be allocated and pointers to these buffers should be stored in the descriptor ring.
@@ -321,14 +368,13 @@ impl E1000EDevice {
             let buffer = E1000EBuffer::new(PAGE_SIZE);
             ring.addr = buffer.as_paddr() as u64;
             ring.status = 0;
-            recv_buffers.push(buffer);
+            recv_buffers.push(Some(buffer));
         }
         // Same as receive buffers
         for ring in trans_desc_ring.iter_mut().take(recv_ring_length) {
-            let buffer = E1000EBuffer::new(PAGE_SIZE);
-            ring.addr = buffer.as_paddr() as u64;
+            ring.addr = 0;
             ring.status = 1;
-            trans_buffers.push(buffer);
+            trans_buffers.push(None);
         }
 
         // Receive Initialization 14.6
@@ -404,6 +450,9 @@ impl E1000EDevice {
             volwrite!(interrupt_regs, ims, ims);
         }
         return Ok(E1000EDevice {
+            pci_device: device.clone(),
+            irq_dev_id: device_id,
+            active: true,
             general_regs,
             interrupt_regs,
             rctl_regs,
@@ -419,11 +468,42 @@ impl E1000EDevice {
             trans_buffers,
             mac,
             first_trans: true,
-            napi_buffers: vec![E1000EBuffer::new(0); E1000E_RECV_NAPI],
+            tx_completion_interrupt_armed: false,
+            napi_buffers: (0..E1000E_RECV_NAPI).map(|_| None).collect(),
             napi_buffer_head: 0,
             napi_buffer_tail: 0,
             napi_buffer_empty: true,
         });
+    }
+
+    /// Stops every hardware producer before descriptor ownership is released.
+    /// Idempotence lets probe rollback and `Drop` share one reverse-order path.
+    pub fn prepare_quiesce(&mut self) -> Option<E1000EIrqTeardown> {
+        if !self.active {
+            return None;
+        }
+        unsafe {
+            volwrite!(self.interrupt_regs, imc, E1000E_IMC_CLEAR);
+            let rctl = volread!(self.rctl_regs, rctl) & !E1000E_RCTL_EN;
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let tctl = volread!(self.tctl_regs, tctl) & !E1000E_TCTL_EN;
+            volwrite!(self.tctl_regs, tctl, tctl);
+            // Flush posted PCI writes before waiting for outstanding DMA.
+            let _ = volread!(self.general_regs, status);
+        }
+        compiler_fence(Ordering::SeqCst);
+        // Intel e1000e requires a 10 ms drain interval after RX/TX disable.
+        // Teardown can run while the device's spinlock is owned, so this
+        // hardware barrier must not enter the scheduler.
+        let drain_deadline = Instant::now().total_micros().saturating_add(10_000);
+        while Instant::now().total_micros() < drain_deadline {
+            core::hint::spin_loop();
+        }
+        self.active = false;
+        Some(E1000EIrqTeardown {
+            pci_device: self.pci_device.clone(),
+            irq_dev_id: self.irq_dev_id.clone(),
+        })
     }
     pub fn e1000e_receive(&mut self) -> Option<E1000EBuffer> {
         self.e1000e_intr();
@@ -433,15 +513,65 @@ impl E1000EDevice {
         if (desc.status & E1000E_RXD_STATUS_DD) == 0 {
             return None;
         }
-        let mut buffer = self.recv_buffers[index];
+        let mut buffer = self.recv_buffers[index]
+            .take()
+            .expect("receive descriptor must own a DMA buffer");
         let new_buffer = E1000EBuffer::new(PAGE_SIZE);
-        self.recv_buffers[index] = new_buffer;
         desc.addr = new_buffer.as_paddr() as u64;
-        buffer.set_length(desc.len as usize);
+        self.recv_buffers[index] = Some(new_buffer);
+        let packet_len = desc.len as usize;
         rdt = index;
         unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
+        if packet_len > buffer.capacity() {
+            buffer.free_buffer();
+            return None;
+        }
+        buffer.set_length(packet_len);
         // debug!("e1000e: receive packet");
         return Some(buffer);
+    }
+
+    /// Stop runtime RX production before NAPI is quiesced. Descriptor memory
+    /// remains owned by the driver throughout the administrative transition.
+    pub fn suspend_runtime_rx(&mut self) {
+        unsafe {
+            volwrite!(self.interrupt_regs, imc, E1000E_IMC_CLEAR);
+            let rctl = volread!(self.rctl_regs, rctl) & !E1000E_RCTL_EN;
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let _ = volread!(self.general_regs, status);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Return completions from the stopped receiver without allocating new
+    /// DMA buffers.
+    pub fn discard_rx_completions(&mut self) {
+        for _ in 0..self.recv_desc_ring.len() {
+            let mut rdt = unsafe { volread!(self.receive_regs, rdt0) } as usize;
+            let index = (rdt + 1) % self.recv_desc_ring.len();
+            let desc = &mut self.recv_desc_ring[index];
+            if (desc.status & E1000E_RXD_STATUS_DD) == 0 {
+                break;
+            }
+            desc.status = 0;
+            desc.len = 0;
+            rdt = index;
+            unsafe { volwrite!(self.receive_regs, rdt0, rdt as u32) };
+        }
+        self.e1000e_intr();
+    }
+
+    pub fn resume_runtime_rx(&mut self) {
+        unsafe {
+            let rctl = volread!(self.rctl_regs, rctl) | E1000E_RCTL_EN;
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let _ = volread!(self.general_regs, status);
+            let mut interrupts = E1000E_IMS_LSC | E1000E_RUNTIME_RX_INTERRUPTS;
+            if self.tx_completion_interrupt_armed {
+                interrupts |= E1000E_IMS_TXDW;
+            }
+            volwrite!(self.interrupt_regs, ims, interrupts);
+        }
     }
 
     pub fn e1000e_can_transmit(&self) -> bool {
@@ -454,22 +584,64 @@ impl E1000EDevice {
         true
     }
 
-    pub fn e1000e_transmit(&mut self, packet: E1000EBuffer) {
+    /// Arm a one-shot TX completion wakeup and recheck the descriptor after
+    /// publishing the interrupt mask. This mirrors Linux's stop/recheck
+    /// pattern and closes the completion-before-arm race.
+    pub fn arm_tx_completion_interrupt(&mut self) -> bool {
+        if self.e1000e_can_transmit() {
+            return true;
+        }
+        if !self.tx_completion_interrupt_armed {
+            unsafe { volwrite!(self.interrupt_regs, ims, E1000E_IMS_TXDW) };
+            self.tx_completion_interrupt_armed = true;
+        }
+        if !self.e1000e_can_transmit() {
+            return false;
+        }
+        self.disarm_tx_completion_interrupt();
+        true
+    }
+
+    /// Consume an armed wakeup once descriptor capacity is observable. TXDW
+    /// remains masked during normal traffic, avoiding one interrupt per frame
+    /// even though every descriptor requests status write-back.
+    pub fn take_tx_completion_wakeup(&mut self) -> bool {
+        if !self.tx_completion_interrupt_armed || !self.e1000e_can_transmit() {
+            return false;
+        }
+        self.disarm_tx_completion_interrupt();
+        true
+    }
+
+    fn disarm_tx_completion_interrupt(&mut self) {
+        unsafe { volwrite!(self.interrupt_regs, imc, E1000E_IMS_TXDW) };
+        self.tx_completion_interrupt_armed = false;
+    }
+
+    pub fn e1000e_transmit(&mut self, packet: E1000EBuffer) -> Result<(), E1000EBuffer> {
         let mut tdt = unsafe { volread!(self.transimit_regs, tdt0) } as usize;
         let index = tdt % self.trans_desc_ring.len();
         let desc = &mut self.trans_desc_ring[index];
-        let buffer = self.trans_buffers[index];
-        self.trans_buffers[index] = packet;
+        if (desc.status & E1000E_TXD_STATUS_DD) == 0 {
+            return Err(packet);
+        }
+        let old_buffer = self.trans_buffers[index].take();
+        let packet_addr = packet.as_paddr() as u64;
+        let packet_len = packet.len() as u16;
+        self.trans_buffers[index] = Some(packet);
         // recycle unused transmit buffer
-        buffer.free_buffer();
+        if let Some(buffer) = old_buffer {
+            buffer.free_buffer();
+        }
         // Set the transmit descriptor
-        desc.addr = packet.as_paddr() as u64;
-        desc.len = packet.len() as u16;
+        desc.addr = packet_addr;
+        desc.len = packet_len;
         desc.status = 0;
         desc.cmd = E1000E_TXD_CMD_EOP | E1000E_TXD_CMD_RS | E1000E_TXD_CMD_IFCS;
         tdt = (tdt + 1) % self.trans_desc_ring.len();
         unsafe { volwrite!(self.transimit_regs, tdt0, tdt as u32) };
         self.first_trans = false;
+        Ok(())
     }
     pub fn mac_address(&self) -> [u8; 6] {
         return self.mac;
@@ -517,7 +689,7 @@ impl E1000EDevice {
                 }
                 match self.e1000e_receive() {
                     Some(buffer) => {
-                        self.napi_buffers[self.napi_buffer_tail] = buffer;
+                        self.napi_buffers[self.napi_buffer_tail] = Some(buffer);
                         self.napi_buffer_tail = (self.napi_buffer_tail + 1) % E1000E_RECV_NAPI;
                         self.napi_buffer_empty = false;
                     }
@@ -533,21 +705,21 @@ impl E1000EDevice {
             self.e1000e_intr_set(true);
         }
 
-        let result = self.napi_buffers[self.napi_buffer_head];
-        match result.len() {
-            0 => {
+        let result = self.napi_buffers[self.napi_buffer_head].take();
+        match result {
+            None => {
                 // napi队列和网卡队列中都不存在数据包
                 // both napi queue and device buffer is empty, no packet will receive
                 return None;
             }
-            _ => {
+            Some(buffer) => {
                 // 有剩余的已到达的数据包
                 // there is packet in napi queue
                 self.napi_buffer_head = (self.napi_buffer_head + 1) % E1000E_RECV_NAPI;
                 if self.napi_buffer_head == self.napi_buffer_tail {
                     self.napi_buffer_empty = true;
                 }
-                return Some(result);
+                return Some(buffer);
             }
         }
     }
@@ -555,6 +727,9 @@ impl E1000EDevice {
 
 impl Drop for E1000EDevice {
     fn drop(&mut self) {
+        if let Some(teardown) = self.prepare_quiesce() {
+            teardown.finish();
+        }
         // 释放已分配的所有dma页
         // free all dma pages we have allocated
         debug!("droping...");
@@ -563,11 +738,14 @@ impl Drop for E1000EDevice {
         unsafe {
             // 释放所有buffer中的dma页
             // free all dma pages in buffers
-            for i in 0..recv_ring_length {
-                self.recv_buffers[i].free_buffer();
+            for buffer in self.recv_buffers.drain(..recv_ring_length).flatten() {
+                buffer.free_buffer();
             }
-            for i in 0..trans_ring_length {
-                self.trans_buffers[i].free_buffer();
+            for buffer in self.trans_buffers.drain(..trans_ring_length).flatten() {
+                buffer.free_buffer();
+            }
+            for buffer in self.napi_buffers.drain(..).flatten() {
+                buffer.free_buffer();
             }
             // 释放descriptor ring
             // free descriptor ring
@@ -615,18 +793,18 @@ pub fn e1000e_probe() -> Result<u64, E1000EPciError> {
                     standard_device.common_header.device_id
                 );
 
-                // todo: 根据pci的path来生成device id
+                let pci_function = String::from(standard_device.common_header.bus_device_function);
                 let dev_id = DeviceId::new(
                     None,
                     Some(format!(
-                        "e1000e_{}",
-                        standard_device.common_header.device_id
+                        "e1000e_{}_{pci_function}",
+                        standard_device.common_header.device_id,
                     )),
                 )
                 .unwrap();
 
                 let e1000e = E1000EDevice::new(standard_device.clone(), dev_id.clone())?;
-                e1000e_driver_init(e1000e, dev_id);
+                e1000e_driver_init(e1000e, dev_id)?;
                 initialized = true;
             }
         }
@@ -751,6 +929,7 @@ const E1000E_CTRL_TFCE: u32 = 1 << 28;
 const E1000E_CTRL_PHY_RST: u32 = 1 << 31;
 
 // IMS
+const E1000E_IMS_TXDW: u32 = 1 << 0;
 const E1000E_IMS_LSC: u32 = 1 << 2;
 const E1000E_IMS_RXDMT0: u32 = 1 << 4;
 #[allow(dead_code)]
@@ -810,12 +989,19 @@ pub enum E1000EPciError {
     // Size of BAR is not 128KB
     UnexpectedBarSize,
     Pci(PciError),
+    Netdevice(SystemError),
 }
 
 /// PCI error到VirtioPciError的转换，层层上报
 impl From<PciError> for E1000EPciError {
     fn from(error: PciError) -> Self {
         Self::Pci(error)
+    }
+}
+
+impl From<SystemError> for E1000EPciError {
+    fn from(error: SystemError) -> Self {
+        Self::Netdevice(error)
     }
 }
 

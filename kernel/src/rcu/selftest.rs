@@ -2,7 +2,7 @@ use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Debug,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 use crate::{
@@ -13,8 +13,13 @@ use crate::{
         notifier::{AtomicNotifierChain, NotifierBlock, NotifyResult},
         spinlock::SpinLock,
     },
-    process::preempt::PreemptGuard,
-    smp::{core::smp_get_processor_id, cpu::ProcessorId},
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        preempt::PreemptGuard,
+        ProcessManager,
+    },
+    sched::completion::Completion,
+    smp::cpu::{smp_cpu_manager, ProcessorId},
 };
 use system_error::SystemError;
 
@@ -124,154 +129,981 @@ unsafe fn rcu_selftest_callback(head: NonNull<RcuHead>) {
     probe.hits.fetch_add(1, Ordering::SeqCst);
 }
 
-struct RcuSelftestCpuStateGuard {
-    cpu: ProcessorId,
-    saved: RcuCpuState,
-}
-
-impl RcuSelftestCpuStateGuard {
-    fn new_active(cpu: ProcessorId) -> Self {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_idx = cpu.data() as usize;
-        let saved = inner.cpu_states[cpu_idx];
-        inner.cpu_states[cpu_idx].in_idle_eqs = false;
-        inner.cpu_states[cpu_idx].irq_nesting = 0;
-        inner.cpu_states[cpu_idx].irq_from_idle_eqs = false;
-        Self { cpu, saved }
+fn queue_callback_probe(hits: Arc<AtomicUsize>) {
+    let probe = Box::into_raw(Box::new(RcuSelftestCallbackProbe {
+        head: RcuHead::new(),
+        hits,
+    }));
+    // SAFETY: the callback owns the stable Box and reconstructs it exactly
+    // once after admission has detached the embedded head.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*probe).head)),
+            rcu_selftest_callback,
+        );
     }
 }
 
-impl Drop for RcuSelftestCpuStateGuard {
-    fn drop(&mut self) {
-        restore_cpu_state_after_selftest(self.cpu, self.saved);
+fn run_callback_flood_selftest() -> Result<(), &'static str> {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let callbacks = RCU_CALLBACK_BATCH_LIMIT * 2 + 1;
+    for _ in 0..callbacks {
+        queue_callback_probe(hits.clone());
     }
-}
-
-fn restore_cpu_state_after_selftest(cpu: ProcessorId, saved: RcuCpuState) {
-    let wake_worker = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_idx = cpu.data() as usize;
-        inner.cpu_states[cpu_idx] = saved;
-        if inner.gp_active && inner.waiting_cpus.get(cpu).unwrap_or(false) {
-            inner.waiting_cpus.set(cpu, false);
-        }
-        RcuState::pump_grace_periods(&mut inner) || inner.has_ready_work()
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
-}
-
-fn run_idle_irq_wakeup_selftest() -> Result<(), &'static str> {
-    let cpu = smp_get_processor_id();
-    let cpu_idx = cpu.data() as usize;
-
     rcu_barrier();
-    let (_, _, _, pending_before, ready_before) = debug_snapshot();
-    if pending_before != 0 || ready_before != 0 {
-        return Err("rcu callback queues were not empty before idle IRQ selftest");
+    if hits.load(Ordering::SeqCst) != callbacks {
+        return Err("RCU callback flood did not drain across bounded batches");
     }
+    Ok(())
+}
 
-    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    let _preempt_guard = PreemptGuard::new();
-    let cpu_state_guard = RcuSelftestCpuStateGuard::new_active(cpu);
+#[repr(C)]
+struct RcuSlowCallbackProbe {
+    head: RcuHead,
+    hits: Arc<AtomicUsize>,
+}
 
-    let wake_worker = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let wake_worker = enter_cpu_idle_eqs(&mut inner, cpu);
-        if !cpu_in_idle_eqs(&inner.cpu_states[cpu_idx]) {
-            return Err("internal idle EQS helper failed to mark the CPU idle");
-        }
-
-        let cpu_state = &mut inner.cpu_states[cpu_idx];
-        cpu_state.irq_from_idle_eqs = cpu_in_idle_eqs(cpu_state);
-        cpu_state.irq_nesting += 1;
-        if cpu_in_idle_eqs(cpu_state) {
-            return Err("internal idle IRQ helper failed to exit the idle EQS state");
-        }
-
-        wake_worker
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
+unsafe fn rcu_slow_selftest_callback(head: NonNull<RcuHead>) {
+    // SAFETY: the callback owns the Box allocated below and consumes it once.
+    let probe = unsafe { Box::from_raw(head.as_ptr() as *mut RcuSlowCallbackProbe) };
+    let started = rcu_now();
+    while !progress::elapsed_at_least(rcu_now(), started, RCU_SLOW_CALLBACK_NS + 1_000_000) {
+        core::hint::spin_loop();
     }
+    probe.hits.fetch_add(1, Ordering::SeqCst);
+}
 
-    let idle_hits = Arc::new(AtomicUsize::new(0));
-    rcu_defer({
-        let idle_hits = idle_hits.clone();
-        move || {
-            idle_hits.fetch_add(1, Ordering::SeqCst);
-        }
-    });
-
-    let pre_exit_error = {
-        let inner = RCU_STATE.inner.lock_irqsave();
-        if idle_hits.load(Ordering::SeqCst) != 0 {
-            Some("idle IRQ callback ran before the interrupted CPU returned to idle")
-        } else if !inner.gp_active || !inner.waiting_cpus.get(cpu).unwrap_or(false) {
-            Some("idle IRQ selftest did not put the current CPU in waiting_cpus")
-        } else if inner.pending_callbacks.len() != 1 || !inner.ready_callbacks.is_empty() {
-            Some("idle IRQ selftest corrupted callback queue state before irq_exit")
-        } else {
-            None
-        }
-    };
-    if let Some(error) = pre_exit_error {
-        return Err(error);
+fn run_slow_callback_budget_selftest() -> Result<(), &'static str> {
+    let slow_before = RCU_STATE.stats.slow_callbacks.load(Ordering::Acquire);
+    let budget_before = RCU_STATE
+        .stats
+        .callback_time_budget_hits
+        .load(Ordering::Acquire);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let probe = Box::into_raw(Box::new(RcuSlowCallbackProbe {
+        head: RcuHead::new(),
+        hits: hits.clone(),
+    }));
+    // SAFETY: ownership of the stable Box transfers to the callback.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*probe).head)),
+            rcu_slow_selftest_callback,
+        );
     }
-
-    let idle_irq_exit_result = {
-        let mut inner = RCU_STATE.inner.lock_irqsave();
-        let cpu_state = &mut inner.cpu_states[cpu_idx];
-        if cpu_state.irq_nesting != 1 || !cpu_state.irq_from_idle_eqs {
-            Err("idle IRQ selftest lost the interrupted-idle state")
-        } else {
-            cpu_state.irq_nesting -= 1;
-            cpu_state.irq_from_idle_eqs = false;
-            Ok(enter_cpu_idle_eqs(&mut inner, cpu))
-        }
-    };
-    let wake_worker = match idle_irq_exit_result {
-        Ok(wake_worker) => wake_worker,
-        Err(error) => {
-            return Err(error);
-        }
-    };
-
-    RCU_STATE.wake_state_waiters();
-    if wake_worker {
-        RCU_STATE.wake_worker();
-        RCU_STATE.maybe_process_ready_callbacks_inline();
-    }
-
-    let post_exit_waiting = {
-        let inner = RCU_STATE.inner.lock_irqsave();
-        inner.waiting_cpus.get(cpu).unwrap_or(false)
-    };
-    if post_exit_waiting {
-        return Err("idle IRQ exit left the current CPU in waiting_cpus");
-    }
-
-    drop(cpu_state_guard);
-    drop(_preempt_guard);
-    drop(_irq_guard);
-
     rcu_barrier();
 
-    if idle_hits.load(Ordering::SeqCst) != 1 {
-        return Err("callback did not execute after the idle IRQ wakeup selftest finished");
+    if hits.load(Ordering::SeqCst) != 1
+        || RCU_STATE.stats.slow_callbacks.load(Ordering::Acquire) <= slow_before
+        || RCU_STATE
+            .stats
+            .callback_time_budget_hits
+            .load(Ordering::Acquire)
+            <= budget_before
+        || RCU_STATE.stats.max_callback_ns.load(Ordering::Acquire) < RCU_SLOW_CALLBACK_NS
+    {
+        return Err("RCU slow callback did not trigger time-budget diagnostics");
+    }
+    Ok(())
+}
+
+fn run_reschedule_escalation_selftest() -> Result<(), &'static str> {
+    if !crate::smp::kick_cpu_supported() {
+        // The policy and failure accounting remain covered on every
+        // architecture. This production-path test requires an implemented
+        // generic KickCpu IPI receiver.
+        return Ok(());
+    }
+
+    let current_cpu = crate::smp::core::smp_get_processor_id();
+    let Some(target_cpu) = smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .find(|cpu| *cpu != current_cpu && smp_cpu_manager().is_online_cpu(*cpu))
+    else {
+        // UP configurations cannot exercise a remote reschedule IPI.
+        return Ok(());
+    };
+
+    // Finish any pre-existing GP before constructing the target holdout. The
+    // success condition below is per target CPU, so unrelated GP traffic on a
+    // different CPU cannot satisfy this test.
+    synchronize_rcu();
+    let ready = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+    let saw_escalation = Arc::new(AtomicBool::new(false));
+    let thread_ready = ready.clone();
+    let thread_done = done.clone();
+    let thread_saw = saw_escalation.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let preempt_guard = PreemptGuard::new();
+            let submitted_before = RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis();
+            let received_before = crate::smp::kick_cpu_received(target_cpu);
+            let started = rcu_now();
+            thread_ready.complete();
+            while !(progress::elapsed_at_least(rcu_now(), started, 3_000_000_000)
+                || RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis()
+                    != submitted_before
+                    && crate::smp::kick_cpu_received(target_cpu) != received_before)
+            {
+                core::hint::spin_loop();
+            }
+            let escalated = RCU_STATE.contexts[target_cpu.data() as usize].resched_ipis()
+                != submitted_before
+                && crate::smp::kick_cpu_received(target_cpu) != received_before;
+            thread_saw.store(escalated, Ordering::Release);
+            drop(preempt_guard);
+            crate::sched::sched_yield();
+            thread_done.complete();
+            i32::from(!escalated)
+        }),
+        (),
+    ));
+    let Some(worker) = KernelThreadMechanism::create_on_cpu(
+        closure,
+        "rcu-resched-holdout".to_string(),
+        target_cpu,
+    ) else {
+        return Err("RCU reschedule selftest could not create its holdout task");
+    };
+    if ProcessManager::wakeup(&worker).is_err() {
+        let _ = KernelThreadMechanism::stop(&worker);
+        return Err("RCU reschedule selftest could not wake its holdout task");
+    }
+    if ready.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&worker);
+        return Err("RCU reschedule selftest holdout did not start");
+    }
+
+    synchronize_rcu();
+    let done_result = done.wait_for_completion();
+    let stop_result = KernelThreadMechanism::stop(&worker);
+    if done_result.is_err() || stop_result.is_err() || !saw_escalation.load(Ordering::Acquire) {
+        return Err("RCU holdout did not recover through reschedule escalation");
+    }
+    Ok(())
+}
+
+fn run_smp_callback_barrier_selftest() -> Result<(), &'static str> {
+    let cpus: Vec<ProcessorId> = smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .filter(|cpu| smp_cpu_manager().is_online_cpu(*cpu))
+        .collect();
+    if cpus.is_empty() {
+        return Err("RCU SMP callback selftest found no online CPU");
+    }
+
+    const CALLBACKS_PER_CPU: usize = 9;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Completion::new());
+    let start = Arc::new(Completion::new());
+    let first_admitted = Arc::new(Completion::new());
+    let continue_enqueue = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+    let mut workers = Vec::new();
+
+    for cpu in cpus.iter().copied() {
+        let thread_hits = hits.clone();
+        let thread_ready = ready.clone();
+        let thread_start = start.clone();
+        let thread_first_admitted = first_admitted.clone();
+        let thread_continue = continue_enqueue.clone();
+        let thread_done = done.clone();
+        let closure = KernelThreadClosure::EmptyClosure((
+            Box::new(move || {
+                thread_ready.complete();
+                if thread_start.wait_for_completion().is_err() {
+                    thread_done.complete();
+                    return 1;
+                }
+
+                queue_callback_probe(thread_hits.clone());
+                thread_first_admitted.complete();
+                if thread_continue.wait_for_completion().is_err() {
+                    thread_done.complete();
+                    return 1;
+                }
+                for _ in 1..CALLBACKS_PER_CPU {
+                    queue_callback_probe(thread_hits.clone());
+                }
+                thread_done.complete();
+                0
+            }),
+            (),
+        ));
+        let Some(worker) = KernelThreadMechanism::create_on_cpu(
+            closure,
+            format!("rcu-callback-cpu{}", cpu.data()),
+            cpu,
+        ) else {
+            start.complete_all();
+            continue_enqueue.complete_all();
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback selftest could not create a worker");
+        };
+        if ProcessManager::wakeup(&worker).is_err() {
+            start.complete_all();
+            continue_enqueue.complete_all();
+            let _ = KernelThreadMechanism::stop(&worker);
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback selftest could not wake a worker");
+        }
+        workers.push(worker);
+    }
+
+    for _ in &workers {
+        if ready.wait_for_completion().is_err() {
+            start.complete_all();
+            continue_enqueue.complete_all();
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback workers did not reach their start gate");
+        }
+    }
+    start.complete_all();
+    for _ in &workers {
+        if first_admitted.wait_for_completion().is_err() {
+            continue_enqueue.complete_all();
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback workers did not admit their first callback");
+        }
+    }
+
+    // Every CPU now owns a callback ahead of its barrier marker. Release the
+    // remaining admissions immediately before the barrier to exercise its
+    // ownership scan concurrently with enqueue.
+    continue_enqueue.complete_all();
+    rcu_barrier();
+    for _ in &workers {
+        if done.wait_for_completion().is_err() {
+            for worker in &workers {
+                let _ = KernelThreadMechanism::stop(worker);
+            }
+            return Err("RCU SMP callback workers did not finish enqueue");
+        }
+    }
+    rcu_barrier();
+
+    let mut stopped = true;
+    for worker in &workers {
+        stopped &= KernelThreadMechanism::stop(worker).is_ok();
+    }
+    if !stopped {
+        return Err("RCU SMP callback selftest could not stop its workers");
+    }
+    if hits.load(Ordering::SeqCst) != workers.len() * CALLBACKS_PER_CPU {
+        return Err("RCU SMP callback/barrier selftest lost an admitted callback");
+    }
+    Ok(())
+}
+
+fn run_concurrent_barrier_selftest() -> Result<(), &'static str> {
+    let hits = Arc::new(AtomicUsize::new(0));
+    for _ in 0..(RCU_CALLBACK_BATCH_LIMIT + 1) {
+        queue_callback_probe(hits.clone());
+    }
+
+    let ready = Arc::new(Completion::new());
+    let start = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+    let spawn = |name: &'static str| {
+        let ready = ready.clone();
+        let start = start.clone();
+        let done = done.clone();
+        KernelThreadMechanism::create_and_run(
+            KernelThreadClosure::EmptyClosure((
+                Box::new(move || {
+                    ready.complete();
+                    if start.wait_for_completion().is_err() {
+                        done.complete();
+                        return 1;
+                    }
+                    rcu_barrier();
+                    done.complete();
+                    0
+                }),
+                (),
+            )),
+            name.into(),
+        )
+    };
+
+    let first = spawn("rcu-barrier-a")
+        .ok_or("concurrent barrier selftest could not create its first worker")?;
+    let Some(second) = spawn("rcu-barrier-b") else {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        return Err("concurrent barrier selftest could not create its second worker");
+    };
+    if ready.wait_for_completion().is_err() || ready.wait_for_completion().is_err() {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("concurrent barrier workers did not reach their start gate");
+    }
+    start.complete_all();
+    if done.wait_for_completion().is_err() || done.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("concurrent barrier workers did not finish");
+    }
+
+    let first_stopped = KernelThreadMechanism::stop(&first).is_ok();
+    let second_stopped = KernelThreadMechanism::stop(&second).is_ok();
+    if !first_stopped || !second_stopped {
+        return Err("concurrent barrier selftest could not stop its workers");
+    }
+    if hits.load(Ordering::SeqCst) != RCU_CALLBACK_BATCH_LIMIT + 1 {
+        return Err("concurrent barriers returned before their callback prefixes drained");
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct RcuSelftestRequeueProbe {
+    head: RcuHead,
+    hits: Arc<AtomicUsize>,
+}
+
+unsafe fn rcu_selftest_requeue_callback(head: NonNull<RcuHead>) {
+    let probe = head.as_ptr().cast::<RcuSelftestRequeueProbe>();
+    // SAFETY: `head` is the first field of the live boxed probe.
+    let hit = unsafe { (*probe).hits.fetch_add(1, Ordering::SeqCst) };
+    if hit == 0 {
+        // SAFETY: callback invocation has detached and released this head, and
+        // the Box remains at the same address until the second invocation.
+        unsafe { call_rcu_raw(head, rcu_selftest_requeue_callback) };
+    } else {
+        // SAFETY: the second callback owns the Box transferred by the test.
+        drop(unsafe { Box::from_raw(probe) });
+    }
+}
+
+fn run_duplicate_claim_selftest() -> Result<(), &'static str> {
+    let head = Arc::new(RcuHead::new());
+    let successes = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Completion::new());
+    let start = Arc::new(Completion::new());
+    let done = Arc::new(Completion::new());
+
+    let spawn = |name: &'static str| {
+        let head = head.clone();
+        let successes = successes.clone();
+        let ready = ready.clone();
+        let start = start.clone();
+        let done = done.clone();
+        let closure = KernelThreadClosure::EmptyClosure((
+            Box::new(move || {
+                ready.complete();
+                if start.wait_for_completion().is_err() {
+                    done.complete();
+                    return 1;
+                }
+                if head.try_claim() {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                }
+                done.complete();
+                0
+            }),
+            (),
+        ));
+        KernelThreadMechanism::create_and_run(closure, name.to_string())
+    };
+
+    let first = spawn("rcu-duplicate-claim-a")
+        .ok_or("duplicate claim selftest could not create its first worker")?;
+    let Some(second) = spawn("rcu-duplicate-claim-b") else {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        return Err("duplicate claim selftest could not create its second worker");
+    };
+
+    if ready.wait_for_completion().is_err() || ready.wait_for_completion().is_err() {
+        start.complete_all();
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("duplicate claim selftest workers did not reach their start gate");
+    }
+    start.complete_all();
+    if done.wait_for_completion().is_err() || done.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&second);
+        return Err("duplicate claim selftest workers did not finish their claims");
+    }
+
+    let first_stopped = KernelThreadMechanism::stop(&first).is_ok();
+    let second_stopped = KernelThreadMechanism::stop(&second).is_ok();
+    if !first_stopped || !second_stopped {
+        return Err("duplicate claim selftest could not stop its workers");
+    }
+    if successes.load(Ordering::SeqCst) != 1 || !head.is_queued() {
+        return Err("duplicate claim did not have exactly one state transition");
     }
 
     Ok(())
 }
 
+fn request_selftest_gp() -> gp::RcuSequence {
+    let target = {
+        let mut inner = RCU_STATE.inner.lock_irqsave();
+        let target = inner.gp.request_future();
+        RcuState::pump_grace_periods(&mut inner);
+        target
+    };
+    RCU_STATE.wake_state_waiters();
+    RCU_STATE.wake_worker();
+    target
+}
+
+fn wait_for_selftest_gp_active(target: gp::RcuSequence, required_cpu: ProcessorId) -> bool {
+    let started = rcu_now();
+    loop {
+        let inner = RCU_STATE.inner.lock_irqsave();
+        if inner.gp.current() == target
+            && !inner.gp.has_completed(target)
+            && inner.gp.is_waiting_for(required_cpu)
+        {
+            return true;
+        }
+        drop(inner);
+        if progress::elapsed_at_least(rcu_now(), started, 1_000_000_000) {
+            return false;
+        }
+        sched_yield();
+    }
+}
+
+fn wait_for_selftest_gp(target: gp::RcuSequence) {
+    RCU_STATE.state_wait.wait_until(|| {
+        RCU_STATE
+            .inner
+            .lock_irqsave()
+            .gp
+            .has_completed(target)
+            .then_some(())
+    });
+    fence(Ordering::SeqCst);
+}
+
+fn selftest_gp_completed(target: gp::RcuSequence) -> bool {
+    RCU_STATE.inner.lock_irqsave().gp.has_completed(target)
+}
+
+fn selftest_remote_cpu() -> Option<ProcessorId> {
+    let current = crate::smp::core::smp_get_processor_id();
+    smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .find(|cpu| *cpu != current && smp_cpu_manager().is_online_cpu(*cpu))
+}
+
+fn run_sync_read_litmus_selftest() -> Result<(), &'static str> {
+    let Some(reader_cpu) = selftest_remote_cpu() else {
+        // The fixed schedule needs a reader to remain non-preemptible while
+        // the updater and coordinator make progress on another CPU.
+        return Ok(());
+    };
+    synchronize_rcu();
+
+    let current_cpu = crate::smp::core::smp_get_processor_id();
+    let x = Arc::new(AtomicUsize::new(0));
+    let y = Arc::new(AtomicUsize::new(0));
+    let allow_y = Arc::new(AtomicBool::new(false));
+    let reader_entered = Arc::new(Completion::new());
+    let releaser_done = Arc::new(Completion::new());
+    let saw_active_gp = Arc::new(AtomicBool::new(false));
+    let target_gp = Arc::new(SpinLock::new(None));
+
+    let reader_x = x.clone();
+    let reader_y = y.clone();
+    let reader_allow_y = allow_y.clone();
+    let reader_entered_worker = reader_entered.clone();
+    let reader_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            reader_x.store(1, Ordering::Release);
+            reader_entered_worker.complete();
+            while !reader_allow_y.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            reader_y.store(1, Ordering::Relaxed);
+            0
+        }),
+        (),
+    ));
+    let Some(reader) = KernelThreadMechanism::create_on_cpu(
+        reader_closure,
+        "rcu-sync-read-reader".to_string(),
+        reader_cpu,
+    ) else {
+        return Err("RCU+sync+read could not create its reader");
+    };
+    let releaser_allow_y = allow_y.clone();
+    let releaser_done_worker = releaser_done.clone();
+    let releaser_saw_active_gp = saw_active_gp.clone();
+    let releaser_target_gp = target_gp.clone();
+    let releaser_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let target = releaser_target_gp
+                .lock_irqsave()
+                .expect("RCU+sync+read target GP was not published");
+            let active = wait_for_selftest_gp_active(target, reader_cpu);
+            releaser_saw_active_gp.store(active, Ordering::Release);
+            releaser_allow_y.store(true, Ordering::Release);
+            releaser_done_worker.complete();
+            i32::from(!active)
+        }),
+        (),
+    ));
+    let Some(releaser) = KernelThreadMechanism::create_on_cpu(
+        releaser_closure,
+        "rcu-sync-read-releaser".to_string(),
+        current_cpu,
+    ) else {
+        allow_y.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        return Err("RCU+sync+read could not create its GP releaser");
+    };
+    if ProcessManager::wakeup(&reader).is_err() || reader_entered.wait_for_completion().is_err() {
+        allow_y.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+read reader did not enter");
+    }
+    let target = request_selftest_gp();
+    *target_gp.lock_irqsave() = Some(target);
+    if ProcessManager::wakeup(&releaser).is_err() {
+        allow_y.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+read GP releaser did not start");
+    }
+
+    let x_before_gp = x.load(Ordering::Acquire);
+    wait_for_selftest_gp(target);
+    let y_after_gp = y.load(Ordering::Relaxed);
+    let completed = releaser_done.wait_for_completion().is_ok();
+    let reader_stopped = KernelThreadMechanism::stop(&reader).is_ok();
+    let releaser_stopped = KernelThreadMechanism::stop(&releaser).is_ok();
+    if !saw_active_gp.load(Ordering::Acquire) || !completed || !reader_stopped || !releaser_stopped
+    {
+        return Err("RCU+sync+read fixed schedule did not complete");
+    }
+    if x_before_gp != 1 || y_after_gp != 1 {
+        return Err("RCU+sync+read observed x=1 after y remained zero across a GP");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RcuSyncFreeNode {
+    value: AtomicUsize,
+}
+
+fn run_sync_free_litmus_selftest() -> Result<(), &'static str> {
+    let Some(reader_cpu) = selftest_remote_cpu() else {
+        return Ok(());
+    };
+    synchronize_rcu();
+
+    let current_cpu = crate::smp::core::smp_get_processor_id();
+    let old = Arc::new(RcuSyncFreeNode {
+        value: AtomicUsize::new(1),
+    });
+    let new = Arc::new(RcuSyncFreeNode {
+        value: AtomicUsize::new(1),
+    });
+    let published = Arc::new(AtomicPtr::new(Arc::as_ptr(&old) as *mut RcuSyncFreeNode));
+    let allow_read = Arc::new(AtomicBool::new(false));
+    let reader_loaded = Arc::new(Completion::new());
+    let releaser_done = Arc::new(Completion::new());
+    let saw_active_gp = Arc::new(AtomicBool::new(false));
+    let target_gp = Arc::new(SpinLock::new(None));
+    let observed = Arc::new(AtomicUsize::new(usize::MAX));
+
+    let reader_published = published.clone();
+    let reader_allow = allow_read.clone();
+    let reader_loaded_worker = reader_loaded.clone();
+    let reader_observed = observed.clone();
+    let reader_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            let object = rcu_dereference(&reader_published);
+            reader_loaded_worker.complete();
+            while !reader_allow.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            if object.is_null() {
+                reader_observed.store(usize::MAX - 1, Ordering::Release);
+                return 1;
+            }
+            // SAFETY: the old Arc is retained by the coordinator and RCU
+            // additionally protects this dereference in the tested schedule.
+            reader_observed.store(
+                unsafe { &*object }.value.load(Ordering::Relaxed),
+                Ordering::Release,
+            );
+            0
+        }),
+        (),
+    ));
+    let Some(reader) = KernelThreadMechanism::create_on_cpu(
+        reader_closure,
+        "rcu-sync-free-reader".to_string(),
+        reader_cpu,
+    ) else {
+        return Err("RCU+sync+free could not create its reader");
+    };
+    let releaser_allow_read = allow_read.clone();
+    let releaser_done_worker = releaser_done.clone();
+    let releaser_saw_active_gp = saw_active_gp.clone();
+    let releaser_target_gp = target_gp.clone();
+    let releaser_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let target = releaser_target_gp
+                .lock_irqsave()
+                .expect("RCU+sync+free target GP was not published");
+            let active = wait_for_selftest_gp_active(target, reader_cpu);
+            releaser_saw_active_gp.store(active, Ordering::Release);
+            releaser_allow_read.store(true, Ordering::Release);
+            releaser_done_worker.complete();
+            i32::from(!active)
+        }),
+        (),
+    ));
+    let Some(releaser) = KernelThreadMechanism::create_on_cpu(
+        releaser_closure,
+        "rcu-sync-free-releaser".to_string(),
+        current_cpu,
+    ) else {
+        allow_read.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        return Err("RCU+sync+free could not create its GP releaser");
+    };
+    if ProcessManager::wakeup(&reader).is_err() || reader_loaded.wait_for_completion().is_err() {
+        allow_read.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+free reader did not load the old pointer");
+    }
+    rcu_assign_pointer(&published, Arc::as_ptr(&new) as *mut RcuSyncFreeNode);
+    let target = request_selftest_gp();
+    *target_gp.lock_irqsave() = Some(target);
+    if ProcessManager::wakeup(&releaser).is_err() {
+        allow_read.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        let _ = KernelThreadMechanism::stop(&releaser);
+        return Err("RCU+sync+free GP releaser did not start");
+    }
+
+    wait_for_selftest_gp(target);
+    old.value.store(0, Ordering::Relaxed);
+    let completed = releaser_done.wait_for_completion().is_ok();
+    let reader_stopped = KernelThreadMechanism::stop(&reader).is_ok();
+    let releaser_stopped = KernelThreadMechanism::stop(&releaser).is_ok();
+    if !saw_active_gp.load(Ordering::Acquire) || !completed || !reader_stopped || !releaser_stopped
+    {
+        return Err("RCU+sync+free fixed schedule did not complete");
+    }
+    if observed.load(Ordering::Acquire) != 1 {
+        return Err("RCU+sync+free reader observed the GP-after destruction write");
+    }
+    Ok(())
+}
+
+fn run_reader_handoff_selftest() -> Result<(), &'static str> {
+    let Some(first_cpu) = selftest_remote_cpu() else {
+        return Ok(());
+    };
+    synchronize_rcu();
+
+    let coordinator_cpu = crate::smp::core::smp_get_processor_id();
+    let release_first = Arc::new(AtomicBool::new(false));
+    let first_entered = Arc::new(Completion::new());
+    let successor_done = Arc::new(Completion::new());
+    let target_gp = Arc::new(SpinLock::new(None));
+    let completed_during_successor = Arc::new(AtomicBool::new(false));
+
+    let first_release = release_first.clone();
+    let first_entered_worker = first_entered.clone();
+    let first_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            first_entered_worker.complete();
+            while !first_release.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            0
+        }),
+        (),
+    ));
+    let Some(first) = KernelThreadMechanism::create_on_cpu(
+        first_closure,
+        "rcu-reader-handoff-first".to_string(),
+        first_cpu,
+    ) else {
+        return Err("RCU reader handoff could not create its first reader");
+    };
+
+    let successor_release = release_first.clone();
+    let successor_done_worker = successor_done.clone();
+    let successor_target = target_gp.clone();
+    let successor_completed = completed_during_successor.clone();
+    let successor_closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let _guard = rcu_read_lock();
+            let target = successor_target
+                .lock_irqsave()
+                .expect("RCU reader handoff target GP was not published");
+            // The readers overlap: the successor enters before it releases
+            // the reader that was present at target-GP start.
+            successor_release.store(true, Ordering::Release);
+            let started = rcu_now();
+            while !selftest_gp_completed(target)
+                && !progress::elapsed_at_least(rcu_now(), started, 1_000_000_000)
+            {
+                core::hint::spin_loop();
+            }
+            successor_completed.store(selftest_gp_completed(target), Ordering::Release);
+            successor_done_worker.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(successor) = KernelThreadMechanism::create_on_cpu(
+        successor_closure,
+        "rcu-reader-handoff-successor".to_string(),
+        coordinator_cpu,
+    ) else {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        return Err("RCU reader handoff could not create its successor");
+    };
+
+    if ProcessManager::wakeup(&first).is_err() || first_entered.wait_for_completion().is_err() {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&successor);
+        return Err("RCU reader handoff first reader did not enter");
+    }
+    let target = request_selftest_gp();
+    if !wait_for_selftest_gp_active(target, first_cpu) {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&successor);
+        return Err("RCU reader handoff target GP did not start");
+    }
+    *target_gp.lock_irqsave() = Some(target);
+    if ProcessManager::wakeup(&successor).is_err() || successor_done.wait_for_completion().is_err()
+    {
+        release_first.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&first);
+        let _ = KernelThreadMechanism::stop(&successor);
+        return Err("RCU reader handoff successor did not finish");
+    }
+
+    let first_stopped = KernelThreadMechanism::stop(&first).is_ok();
+    let successor_stopped = KernelThreadMechanism::stop(&successor).is_ok();
+    wait_for_selftest_gp(target);
+    if !first_stopped || !successor_stopped || !completed_during_successor.load(Ordering::Acquire) {
+        return Err("RCU target GP did not progress across overlapping reader handoff");
+    }
+    Ok(())
+}
+
+fn run_arc_slot_cross_thread_selftest() -> Result<(), &'static str> {
+    const REPLACEMENTS: usize = 64;
+    let initial_drops = Arc::new(AtomicUsize::new(0));
+    let replacement_drops = Arc::new(AtomicUsize::new(0));
+    let slot = Arc::new(RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 40,
+        drops: initial_drops.clone(),
+    })));
+    let reader_loaded = Arc::new(Completion::new());
+    let allow_drop = Arc::new(AtomicBool::new(false));
+    let reader_ok = Arc::new(AtomicBool::new(false));
+
+    let reader_slot = slot.clone();
+    let reader_loaded_worker = reader_loaded.clone();
+    let reader_allow_drop = allow_drop.clone();
+    let reader_ok_worker = reader_ok.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let pinned = reader_slot.load();
+            reader_loaded_worker.complete();
+            while !reader_allow_drop.load(Ordering::Acquire) {
+                sched_yield();
+            }
+            reader_ok_worker.store(pinned.id == 40, Ordering::Release);
+            drop(pinned);
+            0
+        }),
+        (),
+    ));
+    let Some(reader) =
+        KernelThreadMechanism::create_and_run(closure, "rcu-arc-slot-cross-thread".to_string())
+    else {
+        return Err("RcuArcSlot cross-thread test could not create its reader");
+    };
+    if reader_loaded.wait_for_completion().is_err() {
+        allow_drop.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        return Err("RcuArcSlot cross-thread reader did not pin the initial object");
+    }
+
+    for index in 0..REPLACEMENTS {
+        slot.store_deferred(Arc::new(RcuSelftestDropProbe {
+            id: 41 + index,
+            drops: replacement_drops.clone(),
+        }));
+    }
+    rcu_barrier();
+    if initial_drops.load(Ordering::Acquire) != 0 {
+        allow_drop.store(true, Ordering::Release);
+        let _ = KernelThreadMechanism::stop(&reader);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuArcSlot dropped a cross-thread pinned snapshot early");
+    }
+
+    allow_drop.store(true, Ordering::Release);
+    if KernelThreadMechanism::stop(&reader).is_err() || !reader_ok.load(Ordering::Acquire) {
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuArcSlot cross-thread reader did not retain its snapshot");
+    }
+    if initial_drops.load(Ordering::Acquire) != 1 {
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuArcSlot initial snapshot was not dropped after the final pin");
+    }
+    drop(slot);
+    rcu_barrier();
+    if replacement_drops.load(Ordering::Acquire) != REPLACEMENTS {
+        return Err("RcuArcSlot replacements were not dropped exactly once");
+    }
+    Ok(())
+}
+
 fn run_pr1_selftest() -> Result<(), &'static str> {
+    if ProcessManager::current_pcb().rcu_read_depth() != 0 {
+        return Err("initial rcu_read_depth was not zero");
+    }
+
+    // PR1's fixed schedules sample a remote reader and a local releaser on
+    // opposite sides of sleepable GP waits. Keep that coordinator on one CPU
+    // without changing the debugfs caller's concurrently managed affinity.
+    let coordinator_cpu = {
+        let _pin = PreemptGuard::new();
+        crate::smp::core::smp_get_processor_id()
+    };
+    let done = Arc::new(Completion::new());
+    let result = Arc::new(SpinLock::new(None));
+    let worker_done = done.clone();
+    let worker_result = result.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let outcome = run_pr1_on_cpu();
+            let exit_code = i32::from(outcome.is_err());
+            *worker_result.lock_irqsave() = Some(outcome);
+            worker_done.complete();
+            exit_code
+        }),
+        (),
+    ));
+    let worker = KernelThreadMechanism::create_on_cpu(
+        closure,
+        "rcu-pr1-coordinator".to_string(),
+        coordinator_cpu,
+    )
+    .ok_or("RCU PR1 could not create its coordinator")?;
+    if ProcessManager::wakeup(&worker).is_err() {
+        KernelThreadMechanism::stop(&worker)
+            .map_err(|_| "RCU PR1 could not stop its coordinator after wake failure")?;
+        return Err("RCU PR1 could not wake its coordinator");
+    }
+
+    let completed = done.wait_for_completion().is_ok();
+    let stopped = KernelThreadMechanism::stop(&worker).is_ok();
+    if !completed || !stopped {
+        return Err("RCU PR1 coordinator did not finish");
+    }
+    let outcome = result
+        .lock_irqsave()
+        .take()
+        .ok_or("RCU PR1 coordinator did not publish its result")?;
+    outcome
+}
+
+// Only private GP/pump state is exercised here: no worker birth, formatting,
+// global context mutation or sleepable synchronize_rcu belongs in this scope.
+fn run_gp_coordination_selftests() -> Result<(), &'static str> {
+    #[cfg(feature = "mm_selftest")]
+    let _scope = crate::mm::oom::denial::Scope::enter(true);
+    #[cfg(feature = "mm_selftest")]
+    if !crate::mm::oom::denial::probe_denied() {
+        return Err("RCU GP heap-denial entry probes succeeded unexpectedly");
+    }
+    cpu_mask::run_selftests()?;
+    gp::run_state_machine_selftests()?;
+    run_callback_generation_selftest()?;
+    run_immediate_gp_accounting_selftest()?;
+    #[cfg(feature = "mm_selftest")]
+    if !crate::mm::oom::denial::probe_denied() {
+        return Err("RCU GP heap-denial exit probes succeeded unexpectedly");
+    }
+    Ok(())
+}
+
+fn run_pr1_on_cpu() -> Result<(), &'static str> {
+    run_gp_coordination_selftests()?;
+    super::srcu::run_state_machine_selftests()?;
+    super::srcu::run_runtime_selftests()?;
+    progress::run_progress_selftests()?;
+    if callback_duration_ns(100, 100 + RCU_SLOW_CALLBACK_NS) != Some(RCU_SLOW_CALLBACK_NS)
+        || callback_duration_ns(0, 10).is_some()
+        || callback_duration_ns(100, 99).is_some()
+        || callback_duration_ns(100, 200) != Some(100)
+    {
+        return Err("RCU callback duration validation accepted an invalid clock sample");
+    }
+    if RCU_SLOW_CALLBACK_NS < RCU_CALLBACK_TIME_BUDGET_NS {
+        return Err("RCU slow callback threshold is below the batch time budget");
+    }
+    crate::sched::clock::run_sched_clock_selftests()?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let cycles = usize::MAX / 1_000_000 + 1;
+        let khz = 3_000_000;
+        let expected = ((cycles as u128 * 1_000_000u128) / khz as u128) as usize;
+        if crate::arch::time::cycles_to_ns(cycles, khz) != expected {
+            return Err("x86 cycles-to-nanoseconds conversion overflowed");
+        }
+    }
+    context::run_context_selftests()?;
+    callback::run_segmented_callback_selftests()?;
+    run_duplicate_claim_selftest()?;
+    run_cpu_hotplug_lifecycle_selftest()?;
+    run_cpu_hotplug_concurrent_selftest()?;
+    run_callback_flood_selftest()?;
+    run_slow_callback_budget_selftest()?;
+    run_reschedule_escalation_selftest()?;
+    run_smp_callback_barrier_selftest()?;
+    run_concurrent_barrier_selftest()?;
+    run_sync_read_litmus_selftest()?;
+    run_sync_free_litmus_selftest()?;
+    run_reader_handoff_selftest()?;
+    run_arc_slot_cross_thread_selftest()?;
+
     if ProcessManager::current_pcb().rcu_read_depth() != 0 {
         return Err("initial rcu_read_depth was not zero");
     }
@@ -299,13 +1131,8 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
     }
 
     rcu_barrier();
-    let (_, completed_gp_before, completed_cb_before, pending_before, ready_before) =
-        debug_snapshot();
-    if pending_before != 0 || ready_before != 0 {
-        return Err("rcu callback queues were not empty before blocked-reader selftest");
-    }
-
     let blocked_hits = Arc::new(AtomicUsize::new(0));
+    let companion_hits = Arc::new(AtomicUsize::new(0));
     let blocked_result = {
         let _guard = rcu_read_lock();
         rcu_defer({
@@ -314,37 +1141,54 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
                 blocked_hits.fetch_add(1, Ordering::SeqCst);
             }
         });
+        // RCU queues are shared with ordinary object retirement. A barrier
+        // waits for its captured prefix; it does not exclude later producers.
+        // Queue an independent callback to exercise this without depending on
+        // background activity, and check only the callbacks owned by this test.
+        rcu_defer({
+            let companion_hits = companion_hits.clone();
+            move || {
+                companion_hits.fetch_add(1, Ordering::SeqCst);
+            }
+        });
 
-        if blocked_hits.load(Ordering::SeqCst) != 0 {
+        if blocked_hits.load(Ordering::SeqCst) != 0 || companion_hits.load(Ordering::SeqCst) != 0 {
             Err("rcu_defer callback ran before leaving the read-side critical section")
         } else {
-            note_context_switch();
-            let (_, completed_gp_mid, completed_cb_mid, pending_mid, ready_mid) = debug_snapshot();
-
-            if blocked_hits.load(Ordering::SeqCst) != 0 {
+            note_context_switch(&ProcessManager::current_pcb());
+            if blocked_hits.load(Ordering::SeqCst) != 0
+                || companion_hits.load(Ordering::SeqCst) != 0
+            {
                 Err("context switch inside rcu_read_lock executed callback early")
-            } else if completed_gp_mid != completed_gp_before {
-                Err("context switch inside rcu_read_lock incorrectly completed a grace period")
-            } else if completed_cb_mid != completed_cb_before {
-                Err("context switch inside rcu_read_lock incorrectly completed a callback")
-            } else if pending_mid != 1 || ready_mid != 0 {
-                Err("context switch inside rcu_read_lock corrupted callback queue state")
             } else {
                 Ok(())
             }
         }
     };
 
-    note_context_switch();
+    note_context_switch(&ProcessManager::current_pcb());
     rcu_barrier();
     blocked_result?;
 
-    if blocked_hits.load(Ordering::SeqCst) != 1 {
+    if blocked_hits.load(Ordering::SeqCst) != 1 || companion_hits.load(Ordering::SeqCst) != 1 {
         return Err("callback did not execute after the blocked reader left its critical section");
     }
 
     rcu_barrier();
-    run_idle_irq_wakeup_selftest()?;
+
+    let failed_allocation_drops = Arc::new(AtomicUsize::new(0));
+    let failed_allocation_probe = RcuSelftestDropProbe {
+        id: 30,
+        drops: failed_allocation_drops.clone(),
+    };
+    if try_queue_deferred_callback_with(move || drop(failed_allocation_probe), |_deferred| Err(()))
+        .is_ok()
+    {
+        return Err("injected deferred allocation failure unexpectedly published a callback");
+    }
+    if failed_allocation_drops.load(Ordering::SeqCst) != 1 {
+        return Err("deferred allocation failure did not return closure ownership");
+    }
 
     let callback_hits = Arc::new(AtomicUsize::new(0));
     let callback_probe = Box::new(RcuSelftestCallbackProbe {
@@ -355,17 +1199,42 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
 
     // SAFETY: `callback_probe` stays alive until `rcu_selftest_callback()`
     // reconstructs and consumes the allocation.
-    unsafe {
-        call_rcu_raw(
-            NonNull::new_unchecked(ptr::addr_of_mut!((*callback_probe).head)),
-            rcu_selftest_callback,
-        );
+    {
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        // SAFETY: `callback_probe` remains boxed at this address until the
+        // callback reconstructs it. Raw admission is allocation-free and is
+        // permitted while IRQs are disabled.
+        unsafe {
+            call_rcu_raw(
+                NonNull::new_unchecked(ptr::addr_of_mut!((*callback_probe).head)),
+                rcu_selftest_callback,
+            );
+        }
     }
 
     rcu_barrier();
 
     if callback_hits.load(Ordering::SeqCst) != 1 {
         return Err("call_rcu callback was not executed exactly once");
+    }
+
+    let requeue_hits = Arc::new(AtomicUsize::new(0));
+    let requeue_probe = Box::into_raw(Box::new(RcuSelftestRequeueProbe {
+        head: RcuHead::new(),
+        hits: requeue_hits.clone(),
+    }));
+    // SAFETY: the Box is transferred to the callback and stays at a stable
+    // address through both the initial admission and callback-side requeue.
+    unsafe {
+        call_rcu_raw(
+            NonNull::new_unchecked(ptr::addr_of_mut!((*requeue_probe).head)),
+            rcu_selftest_requeue_callback,
+        );
+    }
+    rcu_barrier();
+    rcu_barrier();
+    if requeue_hits.load(Ordering::SeqCst) != 2 {
+        return Err("callback-side RcuHead requeue did not execute exactly twice");
     }
 
     let deferred_drops = Arc::new(AtomicUsize::new(0));
@@ -379,6 +1248,25 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
         return Err("rcu_defer_drop did not run after rcu_barrier");
     }
 
+    let fallible_deferred_drops = Arc::new(AtomicUsize::new(0));
+    try_rcu_defer_drop_arc(Arc::new(RcuSelftestDropProbe {
+        id: 2,
+        drops: fallible_deferred_drops.clone(),
+    }))
+    .map_err(|_| "try_rcu_defer_drop_arc could not reserve a callback")?;
+    rcu_barrier();
+
+    if fallible_deferred_drops.load(Ordering::SeqCst) != 1 {
+        return Err("try_rcu_defer_drop_arc did not run after rcu_barrier");
+    }
+
+    let completed_gp_before = RCU_STATE.inner.lock_irqsave().gp.completed();
+    synchronize_rcu_noalloc();
+    let completed_gp_after = RCU_STATE.inner.lock_irqsave().gp.completed();
+    if !completed_gp_after.has_reached(completed_gp_before.next()) {
+        return Err("synchronize_rcu_noalloc did not complete a new grace period");
+    }
+
     let deferred_hits = Arc::new(AtomicUsize::new(0));
     rcu_defer({
         let deferred_hits = deferred_hits.clone();
@@ -390,6 +1278,354 @@ fn run_pr1_selftest() -> Result<(), &'static str> {
 
     if deferred_hits.load(Ordering::SeqCst) != 1 {
         return Err("rcu_defer closure did not run after rcu_barrier");
+    }
+
+    Ok(())
+}
+
+fn run_callback_generation_selftest() -> Result<(), &'static str> {
+    unsafe fn noop_callback(_head: NonNull<RcuHead>) {}
+
+    let cpu0 = ProcessorId::new(0);
+    let cpu1 = ProcessorId::new(1);
+    let mut inner = RcuStateInner::new();
+    let mut callbacks = RcuSegmentedCallbacks::new();
+    let first_head = RcuHead::new();
+    let second_head = RcuHead::new();
+
+    let first_gp = inner.gp.request_future();
+    if inner.gp.start_requested(
+        RcuCpuMask::from_cpu(cpu0),
+        [0; PerCpu::MAX_CPU_NUM as usize],
+    ) != first_gp
+    {
+        return Err("callback generation selftest failed to start its first GP");
+    }
+
+    if !first_head.try_claim() || !second_head.try_claim() {
+        return Err("fresh callback generation heads could not be claimed");
+    }
+    callbacks.enqueue(NonNull::from(&first_head), noop_callback);
+    callbacks.enqueue(NonNull::from(&second_head), noop_callback);
+    let expected_second_gp = first_gp.next();
+    let requested_second_gp = inner.gp.request_future();
+    if requested_second_gp != expected_second_gp
+        || !callbacks.classify_next(requested_second_gp, true)
+        || callbacks.depth().next_ready != 2
+    {
+        return Err("callback admitted during an active GP targeted the wrong generation");
+    }
+    if callbacks.has_ready() || callbacks.has_unclassified() {
+        return Err("worker would spin on a future GP blocked by the active waiting mask");
+    }
+
+    if !inner.gp.report_quiescent_state(cpu0) {
+        return Err("callback generation selftest could not complete its first waiting mask");
+    }
+    if inner.gp.complete_ready() != first_gp || callbacks.complete_gp(first_gp) {
+        return Err("callbacks became ready during the GP that preceded admission");
+    }
+    callbacks.prepare_gp_start(expected_second_gp);
+    if inner.gp.start_requested(
+        RcuCpuMask::from_cpu(cpu1),
+        [0; PerCpu::MAX_CPU_NUM as usize],
+    ) != expected_second_gp
+        || !inner.gp.is_waiting_for(cpu1)
+        || callbacks.depth().wait != 2
+        || callbacks.has_ready()
+    {
+        return Err("callbacks became ready before their post-admission GP completed");
+    }
+
+    if !inner.gp.report_quiescent_state(cpu1) {
+        return Err("callback generation selftest could not complete its second waiting mask");
+    }
+    if inner.gp.complete_ready() != expected_second_gp
+        || !callbacks.complete_gp(expected_second_gp)
+        || callbacks.depth().done != 2
+        || !callbacks.has_ready()
+    {
+        return Err("callbacks did not become ready after their target GP completed");
+    }
+
+    let first_callback = callbacks.pop_ready().unwrap();
+    let second_callback = callbacks.pop_ready().unwrap();
+    if first_callback.head != NonNull::from(&first_head)
+        || second_callback.head != NonNull::from(&second_head)
+    {
+        return Err("callback generation transition did not preserve admission FIFO");
+    }
+    if !callbacks.is_empty() {
+        return Err("callback generation transition did not drain its FIFO");
+    }
+
+    Ok(())
+}
+
+fn pump_cpu_lifecycle_model(inner: &mut RcuStateInner) -> bool {
+    RcuState::pump_grace_periods_with(
+        inner,
+        1,
+        GracePeriodPumpHooks {
+            waiting_snapshot: |participants: &RcuCpuMask| {
+                (*participants, [0; PerCpu::MAX_CPU_NUM as usize])
+            },
+            credit_context: |_: &mut GracePeriodState| false,
+            publish_active: |_| {},
+            complete_callbacks: |_| false,
+            prepare_callbacks: |_| {},
+            note_gp_start: |_| {},
+            note_gp_complete: |_| {},
+        },
+    )
+}
+
+fn run_immediate_gp_accounting_selftest() -> Result<(), &'static str> {
+    let mut inner = RcuStateInner::new();
+    inner.gp.request_future();
+    let mut starts = 0usize;
+    let mut completions = 0usize;
+    RcuState::pump_grace_periods_with(
+        &mut inner,
+        42,
+        GracePeriodPumpHooks {
+            waiting_snapshot: |_: &RcuCpuMask| {
+                (RcuCpuMask::new(), [0; PerCpu::MAX_CPU_NUM as usize])
+            },
+            credit_context: |_: &mut GracePeriodState| false,
+            publish_active: |_| {},
+            complete_callbacks: |_| false,
+            prepare_callbacks: |_| {},
+            note_gp_start: |_| starts += 1,
+            note_gp_complete: |_| completions += 1,
+        },
+    );
+    if starts != 1 || completions != 1 || inner.gp.is_active() || inner.progress.is_some() {
+        return Err("immediately completed RCU GP was not accounted exactly once");
+    }
+    Ok(())
+}
+
+fn run_cpu_hotplug_lifecycle_selftest() -> Result<(), &'static str> {
+    let cpu = ProcessorId::new(PerCpu::MAX_CPU_NUM - 1);
+    let incoming = ProcessorId::new(PerCpu::MAX_CPU_NUM - 2);
+    let mut inner = RcuStateInner::new();
+
+    if !prepare_cpu_starting_locked(&inner, cpu) {
+        return Err("fresh offline CPU was not eligible for RCU preparation");
+    }
+
+    // BSP publication of Starting does not admit an AP that has not executed
+    // its local RCU starting hook.
+    let before_ap_runs = inner.gp.request_future();
+    pump_cpu_lifecycle_model(&mut inner);
+    if !inner.gp.has_completed(before_ap_runs) || inner.gp.is_waiting_for(cpu) {
+        return Err("RCU waited for a Starting CPU before its AP-side hook");
+    }
+
+    cpu_starting_locked(&mut inner, cpu);
+    let after_ap_runs = inner.gp.request_future();
+    pump_cpu_lifecycle_model(&mut inner);
+    if !inner.gp.is_waiting_for(cpu) || inner.gp.has_completed(after_ap_runs) {
+        return Err("RCU did not admit a CPU after its AP-side starting hook");
+    }
+    if prepare_cpu_starting_locked(&inner, cpu) {
+        return Err("RCU allowed an active participant to be prepared again");
+    }
+
+    // An AP becoming RCU-ready during an active GP must join only the next
+    // fresh snapshot.
+    if !prepare_cpu_starting_locked(&inner, incoming) {
+        return Err("incoming CPU could not be prepared during an active GP");
+    }
+    cpu_starting_locked(&mut inner, incoming);
+    if inner.gp.is_waiting_for(incoming) {
+        return Err("incoming CPU was added to an already-active GP");
+    }
+    let next_gp = inner.gp.request_future();
+
+    // This is the original offline/new-GP race in deterministic order: the
+    // first GP observed the CPU, Dying removes both future admission and its
+    // existing responsibility under the same lock, and the next GP snapshot
+    // must not add it back.
+    cpu_dying_locked(&mut inner, cpu);
+    pump_cpu_lifecycle_model(&mut inner);
+    if inner.gp.is_waiting_for(cpu)
+        || !inner.gp.is_waiting_for(incoming)
+        || inner.gp.has_completed(next_gp)
+    {
+        return Err("Dying CPU was re-admitted or incoming CPU missed the next GP");
+    }
+
+    cpu_dying_locked(&mut inner, incoming);
+    pump_cpu_lifecycle_model(&mut inner);
+    if !inner.gp.has_completed(next_gp) {
+        return Err("CPU Dying did not complete the GP it was responsible for");
+    }
+
+    // Repeated model transitions use the same production mask operations and
+    // ensure no waiting bit leaks across generations. This is not presented as
+    // a substitute for a future platform-level CPU restart stress test.
+    for _ in 0..32 {
+        if !prepare_cpu_starting_locked(&inner, cpu) {
+            return Err("completed CPU teardown left stale RCU responsibility");
+        }
+        cpu_starting_locked(&mut inner, cpu);
+        let target = inner.gp.request_future();
+        pump_cpu_lifecycle_model(&mut inner);
+        if !inner.gp.is_waiting_for(cpu) {
+            return Err("repeated RCU lifecycle did not admit its online CPU");
+        }
+        cpu_dying_locked(&mut inner, cpu);
+        pump_cpu_lifecycle_model(&mut inner);
+        if !inner.gp.has_completed(target) || inner.gp.is_waiting_for(cpu) {
+            return Err("repeated RCU lifecycle leaked a GP holdout");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_cpu_hotplug_concurrent_selftest() -> Result<(), &'static str> {
+    const ROUNDS: usize = 32;
+
+    // Use an absent logical CPU so the test exercises the production global
+    // lifecycle hooks without racing a real CPU's context tracker. This is a
+    // concurrency test for the RCU protocol, not a claim that platform-level
+    // CPU reset/restart has been implemented.
+    let Some(synthetic_cpu) = (0..PerCpu::MAX_CPU_NUM)
+        .rev()
+        .map(ProcessorId::new)
+        .find(|&cpu| !smp_cpu_manager().present_cpus().get(cpu).unwrap_or(false))
+    else {
+        // A machine using every representable logical CPU has no context slot
+        // that a synthetic lifecycle test may safely borrow.
+        return Ok(());
+    };
+
+    let round_ready = Arc::new(Completion::new());
+    let round_release = Arc::new(Completion::new());
+    let round_withdrawn = Arc::new(Completion::new());
+    let round_advance = Arc::new(Completion::new());
+    let finished = Arc::new(Completion::new());
+    let failed = Arc::new(AtomicBool::new(false));
+    let completed_rounds = Arc::new(AtomicUsize::new(0));
+    let callback_hits = Arc::new(AtomicUsize::new(0));
+
+    let round_ready_worker = round_ready.clone();
+    let round_release_worker = round_release.clone();
+    let round_withdrawn_worker = round_withdrawn.clone();
+    let round_advance_worker = round_advance.clone();
+    let finished_worker = finished.clone();
+    let failed_worker = failed.clone();
+    let completed_rounds_worker = completed_rounds.clone();
+    let callback_hits_worker = callback_hits.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            for _ in 0..ROUNDS {
+                if !prepare_cpu_starting(synthetic_cpu) {
+                    failed_worker.store(true, Ordering::Release);
+                    round_ready_worker.complete_all();
+                    round_withdrawn_worker.complete_all();
+                    round_advance_worker.complete_all();
+                    break;
+                }
+                cpu_starting(synthetic_cpu);
+
+                // Exercise a real read-side section and global callback
+                // admission while the lifecycle participant is visible.
+                {
+                    let _guard = rcu_read_lock();
+                    core::hint::black_box(0usize);
+                }
+                rcu_defer({
+                    let callback_hits = callback_hits_worker.clone();
+                    move || {
+                        callback_hits.fetch_add(1, Ordering::AcqRel);
+                    }
+                });
+
+                // Hold the synthetic participant until the main task has
+                // admitted its concurrent reader/callback workload. Explicit
+                // handoff avoids relying on scheduler yield fairness.
+                round_ready_worker.complete();
+                if round_release_worker.wait_for_completion().is_err() {
+                    failed_worker.store(true, Ordering::Release);
+                    cpu_dying(synthetic_cpu);
+                    round_withdrawn_worker.complete_all();
+                    round_advance_worker.complete_all();
+                    break;
+                }
+                cpu_dying(synthetic_cpu);
+                completed_rounds_worker.fetch_add(1, Ordering::AcqRel);
+                round_withdrawn_worker.complete();
+                if round_advance_worker.wait_for_completion().is_err() {
+                    failed_worker.store(true, Ordering::Release);
+                    break;
+                }
+            }
+
+            // Idempotent cleanup keeps a failed round from poisoning later GPs.
+            cpu_dying(synthetic_cpu);
+            finished_worker.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(worker) = KernelThreadMechanism::create_and_run(
+        closure,
+        "rcu-hotplug-concurrency-selftest".to_string(),
+    ) else {
+        return Err("RCU hotplug concurrency selftest could not create its worker");
+    };
+
+    for _ in 0..ROUNDS {
+        if round_ready.wait_for_completion().is_err() {
+            round_release.complete_all();
+            round_advance.complete_all();
+            let _ = KernelThreadMechanism::stop(&worker);
+            return Err("RCU hotplug concurrency selftest missed lifecycle admission");
+        }
+        {
+            let _guard = rcu_read_lock();
+            core::hint::black_box(1usize);
+        }
+        rcu_defer({
+            let callback_hits = callback_hits.clone();
+            move || {
+                callback_hits.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        round_release.complete();
+        synchronize_rcu();
+        rcu_barrier();
+        if round_withdrawn.wait_for_completion().is_err() {
+            round_release.complete_all();
+            round_advance.complete_all();
+            let _ = KernelThreadMechanism::stop(&worker);
+            return Err("RCU hotplug concurrency selftest missed lifecycle withdrawal");
+        }
+        // Do not let the next synthetic Starting race ahead of this round's
+        // synchronize/barrier completion and become an unintended holdout.
+        round_advance.complete();
+    }
+
+    let finished_result = finished.wait_for_completion();
+    let stop_result = KernelThreadMechanism::stop(&worker);
+    cpu_dying(synthetic_cpu);
+    rcu_barrier();
+
+    if finished_result.is_err() || stop_result.is_err() {
+        return Err("RCU hotplug concurrency selftest worker did not finish cleanly");
+    }
+    if failed.load(Ordering::Acquire) {
+        return Err("RCU hotplug concurrency selftest rejected a clean lifecycle round");
+    }
+    if completed_rounds.load(Ordering::Acquire) != ROUNDS {
+        return Err("RCU hotplug concurrency selftest lost a lifecycle transition");
+    }
+    if callback_hits.load(Ordering::Acquire) != ROUNDS * 2 {
+        return Err("RCU hotplug concurrency selftest lost or duplicated a callback");
     }
 
     Ok(())
@@ -433,6 +1669,57 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
         return Err("current slot object was not dropped after slot destruction grace period");
     }
 
+    let terminal_drops = Arc::new(AtomicUsize::new(0));
+    let mut terminal_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 13,
+        drops: terminal_drops.clone(),
+    }));
+    // SAFETY: this local slot was never read/published to another context;
+    // this task may retire the probe now and never accesses the slot again.
+    let terminal_owner =
+        unsafe { terminal_slot.take_for_drop() }.ok_or("terminal slot lost its unique owner")?;
+    drop(terminal_owner);
+    if terminal_drops.load(Ordering::SeqCst) != 1 {
+        return Err("terminal exclusive slot owner was not retired synchronously");
+    }
+    drop(terminal_slot);
+    rcu_barrier();
+    if terminal_drops.load(Ordering::SeqCst) != 1 {
+        return Err("terminal slot drop released its owner twice");
+    }
+
+    let prepared_old_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_new_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
+        id: 11,
+        drops: prepared_old_drops.clone(),
+    }));
+    let prepared_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "prepared RCU retirement reservation failed")?;
+    let retirement = prepared_slot.swap_prepared(
+        Arc::new(RcuSelftestDropProbe {
+            id: 12,
+            drops: prepared_new_drops.clone(),
+        }),
+        prepared_retire,
+    );
+    if prepared_old_drops.load(Ordering::SeqCst) != 0 {
+        return Err("prepared RCU swap dropped the old object before enqueue");
+    }
+    retirement.enqueue();
+    rcu_barrier();
+    if prepared_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared RCU retirement did not drop the old object after a grace period");
+    }
+    if prepared_slot.load().id != 12 {
+        return Err("prepared RCU swap did not publish the replacement object");
+    }
+    drop(prepared_slot);
+    rcu_barrier();
+    if prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared RCU replacement was not dropped after slot destruction");
+    }
+
     let with_read_old_drops = Arc::new(AtomicUsize::new(0));
     let with_read_new_drops = Arc::new(AtomicUsize::new(0));
     let with_read_slot = RcuArcSlot::new(Arc::new(RcuSelftestDropProbe {
@@ -467,7 +1754,31 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
         return Err("RcuArcSlot::with_read replacement snapshot was not dropped after slot drop");
     }
 
-    let sighand = SigHand::new();
+    let sighand_root = crate::cgroup::memory::MemoryAccount::new(0x776611, None)
+        .map_err(|_| "failed to prepare sighand root account")?;
+    let sighand_account = crate::cgroup::memory::MemoryAccount::new(0x776612, Some(sighand_root))
+        .map_err(|_| "failed to prepare sighand memory account")?;
+    let sighand_creator = crate::cgroup::memory::object::ObjectAccount::new(&sighand_account)
+        .map_err(|_| "failed to prepare sighand object account")?;
+    sighand_account.set_policy(crate::cgroup::memory::MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    if !matches!(
+        SigHand::try_new_for(&sighand_creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || sighand_account.current_pages() != 0
+        || sighand_account
+            .snapshot()
+            .kernel_bytes
+            .iter()
+            .any(|bytes| *bytes != 0)
+    {
+        return Err("sighand quota rejection changed its unpublished account");
+    }
+    sighand_account.set_policy(Default::default());
+    let sighand = SigHand::try_new_for(&sighand_creator)
+        .map_err(|_| "failed to prepare accounted sighand")?;
     if sighand.is_shared() {
         return Err("fresh sighand unexpectedly reported shared");
     }
@@ -498,6 +1809,42 @@ fn run_pr2_selftest() -> Result<(), &'static str> {
         return Err("sighand task reference count did not return to zero");
     }
 
+    let body_bytes: u64 = sighand_account.snapshot().kernel_bytes.iter().sum();
+    if body_bytes == 0 {
+        return Err("sighand body has no actual kernel charge");
+    }
+    let old_weak = Arc::downgrade(&sighand);
+    let sighand_slot = RcuArcSlot::new(sighand);
+    let replacement = SigHand::try_new_for(&sighand_creator)
+        .map_err(|_| "failed to prepare replacement sighand")?;
+    let survived_reader = sighand_slot.with_read(|old| {
+        sighand_slot.store_deferred(replacement);
+        old.load_count() == 0
+            && old_weak.upgrade().is_some()
+            && sighand_account.snapshot().kernel_bytes.iter().sum::<u64>() == body_bytes * 2
+    });
+    if !survived_reader {
+        return Err("retired sighand body did not survive its RCU reader");
+    }
+    rcu_barrier();
+    if old_weak.upgrade().is_some()
+        || sighand_account.snapshot().kernel_bytes.iter().sum::<u64>() != body_bytes
+    {
+        return Err("retired sighand body was not refunded after its grace period");
+    }
+    drop(sighand_slot);
+    rcu_barrier();
+    if sighand_account.current_pages() != 0
+        || sighand_account
+            .snapshot()
+            .kernel_bytes
+            .iter()
+            .any(|bytes| *bytes != 0)
+    {
+        return Err("last sighand body was not refunded with its Weak header alive");
+    }
+    drop(old_weak);
+
     Ok(())
 }
 
@@ -508,7 +1855,6 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     let option_race_old_drops = Arc::new(AtomicUsize::new(0));
     let option_race_new_drops = Arc::new(AtomicUsize::new(0));
     let option_drop_drops = Arc::new(AtomicUsize::new(0));
-
     let option_slot = RcuOptionArcSlot::new_none();
     if option_slot.load().is_some() {
         return Err("RcuOptionArcSlot::new_none did not start empty");
@@ -618,6 +1964,253 @@ fn run_pr3_selftest() -> Result<(), &'static str> {
     drop(pinned_drop_slot);
     if option_drop_drops.load(Ordering::SeqCst) != 1 {
         return Err("RcuOptionArcSlot drop object was not released after final reader pin");
+    }
+
+    // Task nsproxy uses a prepared replacement while live, then clears the
+    // optional slot at exit. Neither transition may release an RCU reader's
+    // pinned reference early.
+    let prepared_old_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_new_drops = Arc::new(AtomicUsize::new(0));
+    let prepared_slot = RcuOptionArcSlot::new_some(Arc::new(RcuSelftestDropProbe {
+        id: 9,
+        drops: prepared_old_drops.clone(),
+    }));
+    let pinned_old = prepared_slot
+        .load()
+        .ok_or("prepared optional slot started empty")?;
+    let prepared_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "prepared optional RCU retirement reservation failed")?;
+    prepared_slot
+        .swap_prepared(
+            Arc::new(RcuSelftestDropProbe {
+                id: 10,
+                drops: prepared_new_drops.clone(),
+            }),
+            prepared_retire,
+        )
+        .enqueue();
+    rcu_barrier();
+    if prepared_old_drops.load(Ordering::SeqCst) != 0
+        || prepared_slot.load().map(|value| value.id) != Some(10)
+    {
+        return Err("prepared optional RCU replacement lost a live reader or new publication");
+    }
+    drop(pinned_old);
+    if prepared_old_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional RCU replacement retained the old object");
+    }
+    let pinned_current = prepared_slot
+        .load()
+        .ok_or("prepared optional RCU slot unexpectedly empty at exit")?;
+    let final_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "final optional RCU retirement reservation failed")?;
+    let final_retirement = prepared_slot
+        .clear_prepared(final_retire)
+        .ok_or("final optional RCU clear did not retain its owner")?;
+    if prepared_slot.load().is_some() || prepared_new_drops.load(Ordering::SeqCst) != 0 {
+        return Err("prepared optional clear lost its live reader before enqueue");
+    }
+    final_retirement.enqueue();
+    rcu_barrier();
+    if prepared_new_drops.load(Ordering::SeqCst) != 0 {
+        return Err("prepared optional clear dropped a pinned reader");
+    }
+    drop(pinned_current);
+    if prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional clear retained its final reader owner");
+    }
+    let unused_retire = PreparedRcuArcRetire::prepare()
+        .map_err(|_| "empty optional RCU clear reservation failed")?;
+    if prepared_slot.clear_prepared(unused_retire).is_some() {
+        return Err("empty optional RCU clear created a duplicate retirement");
+    }
+    drop(prepared_slot);
+    rcu_barrier();
+    if prepared_new_drops.load(Ordering::SeqCst) != 1 {
+        return Err("prepared optional slot drop retired a cleared owner twice");
+    }
+
+    run_option_slot_cross_thread_lifecycle_selftest()?;
+
+    Ok(())
+}
+
+fn run_option_slot_cross_thread_lifecycle_selftest() -> Result<(), &'static str> {
+    let pinned_drops = Arc::new(AtomicUsize::new(0));
+    let replacement_drops = Arc::new(AtomicUsize::new(0));
+    let slot = Arc::new(RcuOptionArcSlot::new_some(Arc::new(RcuSelftestDropProbe {
+        id: 20,
+        drops: pinned_drops.clone(),
+    })));
+    let invalid_read = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let first_read = Arc::new(Completion::new());
+    let reader_gate = Arc::new(Completion::new());
+    let gated_read = Arc::new(Completion::new());
+    let overlap_entered = Arc::new(Completion::new());
+    let overlap_start = Arc::new(Completion::new());
+    let overlap_done = Arc::new(Completion::new());
+
+    let slot_reader = slot.clone();
+    let reader_gate_reader = reader_gate.clone();
+    let invalid_read_reader = invalid_read.clone();
+    let reads_reader = reads.clone();
+    let first_read_reader = first_read.clone();
+    let gated_read_reader = gated_read.clone();
+    let overlap_entered_reader = overlap_entered.clone();
+    let overlap_start_reader = overlap_start.clone();
+    let overlap_done_reader = overlap_done.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let first_snapshot = slot_reader.load();
+            if first_snapshot.as_ref().map(|value| value.id) != Some(20) {
+                invalid_read_reader.store(true, Ordering::Release);
+            }
+            reads_reader.fetch_add(1, Ordering::Release);
+            first_read_reader.complete();
+
+            if reader_gate_reader.wait_for_completion().is_err() {
+                invalid_read_reader.store(true, Ordering::Release);
+                gated_read_reader.complete();
+                overlap_entered_reader.complete();
+                overlap_done_reader.complete();
+                return 1;
+            }
+
+            if let Some(value) = slot_reader.load() {
+                if value.id != 20 && value.id != 21 {
+                    invalid_read_reader.store(true, Ordering::Release);
+                }
+            }
+            reads_reader.fetch_add(1, Ordering::Release);
+            gated_read_reader.complete();
+
+            drop(first_snapshot);
+
+            if let Some(value) = slot_reader.load() {
+                if value.id != 20 && value.id != 21 {
+                    invalid_read_reader.store(true, Ordering::Release);
+                }
+            }
+            reads_reader.fetch_add(1, Ordering::Release);
+            overlap_entered_reader.complete();
+
+            if overlap_start_reader.wait_for_completion().is_err() {
+                invalid_read_reader.store(true, Ordering::Release);
+                overlap_done_reader.complete();
+                return 1;
+            }
+
+            for _ in 0..510 {
+                if let Some(value) = slot_reader.load() {
+                    if value.id != 20 && value.id != 21 {
+                        invalid_read_reader.store(true, Ordering::Release);
+                    }
+                }
+                reads_reader.fetch_add(1, Ordering::Release);
+            }
+            overlap_done_reader.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(reader) = KernelThreadMechanism::create_and_run(
+        closure,
+        "rcu-option-slot-selftest-reader".to_string(),
+    ) else {
+        return Err("RcuOptionArcSlot failed to create its lifecycle reader");
+    };
+
+    if first_read.wait_for_completion().is_err() {
+        reader_gate.complete();
+        overlap_start.complete();
+        let _ = KernelThreadMechanism::stop(&reader);
+        slot.store_deferred(None);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuOptionArcSlot lifecycle reader did not start");
+    }
+
+    let mut created_replacements = 0usize;
+    for index in 0..128 {
+        let next = if index % 3 == 0 {
+            None
+        } else {
+            created_replacements += 1;
+            Some(Arc::new(RcuSelftestDropProbe {
+                id: 20 + index % 2,
+                drops: replacement_drops.clone(),
+            }))
+        };
+        slot.store_deferred(next);
+    }
+    rcu_barrier();
+    let pinned_survived_replacements = pinned_drops.load(Ordering::Acquire) == 0;
+
+    let reads_before_gate = reads.load(Ordering::Acquire);
+    reader_gate.complete();
+    if gated_read.wait_for_completion().is_err() {
+        overlap_start.complete();
+        let _ = KernelThreadMechanism::stop(&reader);
+        slot.store_deferred(None);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuOptionArcSlot lifecycle reader missed its gate");
+    }
+    let reads_after_gate = reads.load(Ordering::Acquire);
+
+    if overlap_entered.wait_for_completion().is_err() {
+        overlap_start.complete();
+        let _ = KernelThreadMechanism::stop(&reader);
+        slot.store_deferred(None);
+        drop(slot);
+        rcu_barrier();
+        return Err("RcuOptionArcSlot overlap reader did not enter");
+    }
+    overlap_start.complete();
+
+    for index in 128..256 {
+        let next = if index % 3 == 0 {
+            None
+        } else {
+            created_replacements += 1;
+            Some(Arc::new(RcuSelftestDropProbe {
+                id: 20 + index % 2,
+                drops: replacement_drops.clone(),
+            }))
+        };
+        slot.store_deferred(next);
+    }
+
+    let overlap_result = overlap_done.wait_for_completion();
+    let stop_result = KernelThreadMechanism::stop(&reader);
+    slot.store_deferred(None);
+    drop(slot);
+    rcu_barrier();
+
+    if stop_result.is_err() {
+        return Err("RcuOptionArcSlot failed to stop its lifecycle reader");
+    }
+    if overlap_result.is_err() {
+        return Err("RcuOptionArcSlot bounded overlap reader did not finish");
+    }
+    if reads_after_gate <= reads_before_gate {
+        return Err("RcuOptionArcSlot lifecycle reader missed its second load");
+    }
+    if !pinned_survived_replacements {
+        return Err("RcuOptionArcSlot dropped a cross-thread pinned snapshot");
+    }
+    if invalid_read.load(Ordering::Acquire) {
+        return Err("RcuOptionArcSlot lifecycle reader observed an invalid value");
+    }
+    if reads.load(Ordering::Acquire) != 513 {
+        return Err("RcuOptionArcSlot bounded overlap reader ran an unexpected load count");
+    }
+    if pinned_drops.load(Ordering::Acquire) != 1 {
+        return Err("RcuOptionArcSlot cross-thread pinned snapshot was not dropped exactly once");
+    }
+    if replacement_drops.load(Ordering::Acquire) != created_replacements {
+        return Err("RcuOptionArcSlot cross-thread replacements were not dropped exactly once");
     }
 
     Ok(())
@@ -774,6 +2367,7 @@ fn run_pr5_selftest() -> Result<(), &'static str> {
 }
 
 pub fn run_debug_selftests() -> String {
+    let has_remote_cpu = selftest_remote_cpu().is_some();
     let pr1 = run_pr1_selftest();
     let pr2 = run_pr2_selftest();
     let pr3 = run_pr3_selftest();
@@ -787,10 +2381,17 @@ pub fn run_debug_selftests() -> String {
         "status=fail\n"
     });
 
-    match pr1 {
+    match &pr1 {
         Ok(()) => report.push_str("pr1=ok\n"),
         Err(reason) => report.push_str(&format!("pr1=fail:{reason}\n")),
     }
+    report.push_str(if pr1.is_err() {
+        "smp_litmus=not-completed\n"
+    } else if has_remote_cpu {
+        "smp_litmus=ok\n"
+    } else {
+        "smp_litmus=skip:no-remote-cpu\n"
+    });
 
     match pr2 {
         Ok(()) => report.push_str("pr2=ok\n"),

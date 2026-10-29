@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{fence, Ordering},
 };
 
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{ffi::CString, string::String, vec::Vec};
 
 use crate::libs::spinlock::SpinLock;
 
@@ -77,6 +77,7 @@ impl KernelCmdlineParamBuilder {
                 value: [0; KernelCmdlineEarlyKV::VALUE_MAX_LEN],
                 index: 0,
                 initialized: false,
+                supplied: false,
                 default: self.default_str,
             })
         } else {
@@ -90,6 +91,7 @@ impl KernelCmdlineParamBuilder {
                 name: self.name,
                 value: self.default_bool,
                 initialized: false,
+                supplied: false,
                 inv: self.inv,
                 default: self.default_bool,
             })),
@@ -97,6 +99,7 @@ impl KernelCmdlineParamBuilder {
                 name: self.name,
                 value: None,
                 initialized: false,
+                supplied: false,
                 default: self.default_str,
             })),
             _ => None,
@@ -153,6 +156,14 @@ impl KernelCmdlineParameter {
         matches!(self, KernelCmdlineParameter::EarlyKV(_))
     }
 
+    pub fn was_supplied(&self) -> bool {
+        match self {
+            KernelCmdlineParameter::Arg(v) => v.was_supplied(),
+            KernelCmdlineParameter::KV(v) => v.supplied,
+            KernelCmdlineParameter::EarlyKV(v) => v.supplied,
+        }
+    }
+
     /// 强行获取可变引用
     ///
     /// # Safety
@@ -170,6 +181,7 @@ pub struct KernelCmdlineArg {
     name: &'static str,
     value: bool,
     initialized: bool,
+    supplied: bool,
     /// 是否反转
     inv: bool,
     default: bool,
@@ -179,12 +191,17 @@ impl KernelCmdlineArg {
     pub fn value(&self) -> bool {
         volatile_read!(self.value)
     }
+
+    pub fn was_supplied(&self) -> bool {
+        volatile_read!(self.supplied)
+    }
 }
 
 pub struct KernelCmdlineKV {
     pub name: &'static str,
     pub value: Option<CString>,
     pub initialized: bool,
+    pub supplied: bool,
     pub default: &'static str,
 }
 
@@ -194,6 +211,7 @@ pub struct KernelCmdlineEarlyKV {
     pub value: [u8; Self::VALUE_MAX_LEN],
     pub index: usize,
     pub initialized: bool,
+    pub supplied: bool,
     pub default: &'static str,
 }
 
@@ -277,6 +295,7 @@ impl KernelCmdlineManager {
                             p.index = len;
                         }
                         p.initialized = true;
+                        p.supplied = true;
                     }
                     _ => unreachable!(),
                 }
@@ -307,12 +326,7 @@ impl KernelCmdlineManager {
         let mut kernel_cmdline_end = false;
         for argument in self.split_args(boot_params.boot_cmdline_str()) {
             if kernel_cmdline_end {
-                if inner.init_path.is_none() {
-                    panic!("cmdline: init proc path is not set while init proc args are set");
-                }
-                if !argument.is_empty() {
-                    inner.init_args.push(CString::new(argument).unwrap());
-                }
+                Self::push_init_arg(&mut inner, argument);
                 continue;
             }
 
@@ -326,12 +340,9 @@ impl KernelCmdlineManager {
                 Some(v) => v,
                 None => continue,
             };
-            if option == "init" && value.is_some() {
-                if inner.init_path.is_some() {
-                    panic!("cmdline: init proc path is set twice");
-                }
+            if node.is_none() && option == "init" && value.is_some() {
                 if let Some(val) = value {
-                    inner.init_path = Some(CString::new(val).unwrap());
+                    Self::set_init_path(&mut inner, val);
                 }
                 continue;
             }
@@ -345,13 +356,18 @@ impl KernelCmdlineManager {
                 let param = unsafe { param.force_mut() };
                 match param {
                     KernelCmdlineParameter::KV(p) => {
+                        let Some(value) = value else {
+                            log::warn!("cmdline: key-value parameter {} has no value", p.name);
+                            continue;
+                        };
                         if p.value.is_some() {
                             log::warn!("cmdline: parameter {} is set twice", p.name);
                             continue;
                         }
 
-                        p.value = Some(CString::new(value.unwrap()).unwrap());
+                        p.value = Some(CString::new(value).unwrap());
                         p.initialized = true;
+                        p.supplied = true;
                     }
                     _ => unreachable!(),
                 }
@@ -366,17 +382,16 @@ impl KernelCmdlineManager {
                         }
                         p.value = !p.inv;
                         p.initialized = true;
+                        p.supplied = true;
                     }
                     _ => unreachable!(),
                 }
                 fence(Ordering::SeqCst);
             } else if node.is_none() {
                 if let Some(val) = value {
-                    inner
-                        .init_envs
-                        .push(CString::new(format!("{}={}", option, val)).unwrap());
+                    Self::set_init_env(&mut inner, option, val);
                 } else if !option.is_empty() {
-                    inner.init_args.push(CString::new(option).unwrap());
+                    Self::push_init_arg(&mut inner, option);
                 }
             }
         }
@@ -385,7 +400,38 @@ impl KernelCmdlineManager {
         self.default_initialize();
         // 处理loglevel参数
         crate::debug::klog::loglevel::handle_loglevel_param();
+        crate::time::clocksource::handle_clocksource_cmdline_param();
         fence(Ordering::SeqCst);
+    }
+
+    fn set_init_path(inner: &mut InnerKernelCmdlineManager, path: &str) {
+        inner.init_path = Some(CString::new(path).unwrap());
+        inner.init_args.clear();
+    }
+
+    fn push_init_arg(inner: &mut InnerKernelCmdlineManager, arg: &str) {
+        if !arg.is_empty() {
+            inner.init_args.push(CString::new(arg).unwrap());
+        }
+    }
+
+    fn set_init_env(inner: &mut InnerKernelCmdlineManager, key: &str, value: &str) {
+        let env = CString::new(format!("{}={}", key, value)).unwrap();
+        if let Some(slot) = inner
+            .init_envs
+            .iter_mut()
+            .find(|env| Self::cstring_key_matches_env(env, key))
+        {
+            *slot = env;
+        } else {
+            inner.init_envs.push(env);
+        }
+    }
+
+    fn cstring_key_matches_env(env: &CString, key: &str) -> bool {
+        let bytes = env.as_bytes();
+        let key = key.as_bytes();
+        bytes.len() > key.len() && bytes.starts_with(key) && bytes[key.len()] == b'='
     }
 
     fn default_initialize(&self) {
@@ -412,6 +458,26 @@ impl KernelCmdlineManager {
         });
     }
 
+    pub fn last_bare_option_before_init_args(&self, names: &[&str]) -> Option<String> {
+        let boot_params = boot_params().read();
+        let mut last = None;
+
+        for argument in self.split_args(boot_params.boot_cmdline_str()) {
+            if argument == "--" {
+                break;
+            }
+
+            let Some((node, option, value)) = self.split_arg(argument) else {
+                continue;
+            };
+            if node.is_none() && value.is_none() && names.contains(&option) {
+                last = Some(String::from(option));
+            }
+        }
+
+        last
+    }
+
     fn find_param(
         &self,
         node: Option<&str>,
@@ -425,19 +491,54 @@ impl KernelCmdlineManager {
         };
 
         list.iter().find(|x| {
-            let name = x.name();
-            if let Some(node) = node {
-                // 加1是因为有一个点号
-                name.len() == (node.len() + option.len() + 1)
-                    && name.starts_with(node)
-                    && name[node.len() + 1..].starts_with(option)
-            } else {
-                name == option
-            }
+            Self::split_registered_param_name(x.name())
+                .map(|(param_node, param_option)| match (node, param_node) {
+                    (Some(node), Some(param_node)) => {
+                        Self::cmdline_param_name_eq(node, param_node)
+                            && Self::cmdline_param_name_eq(option, param_option)
+                    }
+                    (None, None) => Self::cmdline_param_name_eq(option, param_option),
+                    _ => false,
+                })
+                .unwrap_or(false)
         })
     }
 
-    fn split_arg<'a>(&self, arg: &'a str) -> Option<(Option<&'a str>, &'a str, Option<&'a str>)> {
+    fn split_registered_param_name(name: &str) -> Option<(Option<&str>, &str)> {
+        let mut iter = name.splitn(2, '.');
+        let v1 = iter.next().map(|v| v.trim());
+        let v2 = iter.next().map(|v| v.trim());
+        let v3 = iter.next().map(|v| v.trim());
+        let v = [v1, v2, v3];
+
+        let mut key_split_len = 0;
+        v.iter().for_each(|x| {
+            if x.is_some() {
+                key_split_len += 1
+            }
+        });
+
+        match key_split_len {
+            1 => Some((None, v[0].unwrap())),
+            2 => Some((Some(v[0].unwrap()), v[1].unwrap())),
+            _ => None,
+        }
+    }
+
+    fn cmdline_param_name_eq(a: &str, b: &str) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+
+        a.bytes()
+            .zip(b.bytes())
+            .all(|(a, b)| a == b || matches!((a, b), (b'-', b'_') | (b'_', b'-')))
+    }
+
+    pub(crate) fn split_arg<'a>(
+        &self,
+        arg: &'a str,
+    ) -> Option<(Option<&'a str>, &'a str, Option<&'a str>)> {
         let mut iter = arg.splitn(2, '=');
         let key = iter.next().unwrap();
         let value = iter.next();
@@ -472,7 +573,7 @@ impl KernelCmdlineManager {
         Some((node, option, value))
     }
 
-    fn split_args<'a>(&self, cmdline: &'a str) -> impl Iterator<Item = &'a str> {
+    pub(crate) fn split_args<'a>(&self, cmdline: &'a str) -> impl Iterator<Item = &'a str> {
         // 是否在引号内
         let mut in_quote = false;
         cmdline.split(move |c: char| {

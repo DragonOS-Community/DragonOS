@@ -28,6 +28,10 @@ impl ExeSymOps {
 }
 
 impl SymOps for ExeSymOps {
+    fn is_magic_link(&self) -> bool {
+        true
+    }
+
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
         let exe = pcb.execute_path();

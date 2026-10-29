@@ -1,11 +1,11 @@
 use system_error::SystemError;
 
+use super::socket_fd::SocketFdRef;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_RECVMSG;
-use crate::filesystem::vfs::{file::FileFlags, iov::IoVecs};
+use crate::filesystem::vfs::iov::IoVecs;
 use crate::net::posix::MsgHdr;
-use crate::net::socket;
-use crate::process::ProcessManager;
+use crate::net::socket::PMSG;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::string::ToString;
@@ -95,6 +95,21 @@ pub(super) fn do_recvmsg(
     flags: u32,
     from_user: bool,
 ) -> Result<usize, SystemError> {
+    // Keep the open file description alive across the (possibly blocking) receive.
+    let sock = SocketFdRef::from_fd(fd as i32)?;
+    do_recvmsg_with_sock(&sock, msg, flags, from_user)
+}
+
+/// Receive one message, with the caller owning the socket handle.
+///
+/// `recvmmsg` shares a single handle across its whole loop, so the descriptor is
+/// resolved exactly once even though several messages are received.
+pub(super) fn do_recvmsg_with_sock(
+    sock: &SocketFdRef,
+    msg: *mut MsgHdr,
+    flags: u32,
+    from_user: bool,
+) -> Result<usize, SystemError> {
     if msg.is_null() {
         return Err(SystemError::EFAULT);
     }
@@ -103,59 +118,22 @@ pub(super) fn do_recvmsg(
     let reader = UserBufferReader::new(msg, core::mem::size_of::<MsgHdr>(), from_user)?;
     let mut kmsg = reader.buffer_protected(0)?.read_one::<MsgHdr>(0)?;
 
-    // log::debug!(
-    //     "do_recvmsg: fd={}, msg_iovlen={}, msg_iov={:?}, flags={:#x}",
-    //     fd,
-    //     kmsg.msg_iovlen,
-    //     kmsg.msg_iov,
-    //     flags
-    // );
-
-    // 检查每个缓冲区地址是否合法，生成iovecs（fallback path needs this).
+    // Import the destination once; protocol owners scatter the selected payload.
     let iovs = unsafe { IoVecs::from_user(kmsg.msg_iov, kmsg.msg_iovlen, true)? };
 
     // Honor O_NONBLOCK set via fcntl(F_SETFL) by translating it to MSG_DONTWAIT.
-    let file_nonblock = {
-        let binding = ProcessManager::current_pcb().fd_table();
-        let guard = binding.read();
-        let file = guard.get_file_by_fd(fd as i32).ok_or(SystemError::EBADF)?;
-        file.flags().contains(FileFlags::O_NONBLOCK)
-    };
+    // `PMSG` is imported rather than spelled `socket::PMSG`, matching the other
+    // recv/send syscalls and keeping the flag type distinguishable from the
+    // local socket handle bound below.
+    let socket = sock.socket()?;
 
-    let (buf, recv_size, used_recv_msg) = {
-        let socket_inode = ProcessManager::current_pcb().get_socket_inode(fd as i32)?;
-        let socket = socket_inode.as_socket().unwrap();
-
-        let mut pmsg_flags = socket::PMSG::from_bits_truncate(flags);
-        if file_nonblock {
-            pmsg_flags.insert(socket::PMSG::DONTWAIT);
-        }
-
-        // 优先使用 recv_msg 以便实现 msg_flags/msg_controllen 等语义。
-        match socket.recv_msg(&mut kmsg, pmsg_flags) {
-            Ok(recv_size) => (alloc::vec::Vec::new(), recv_size, true),
-            Err(SystemError::ENOSYS) => {
-                let mut buf = iovs.new_buf(true);
-                // 从socket中读取数据
-                let recv_size = socket.recv(&mut buf, pmsg_flags)?;
-                (buf, recv_size, false)
-            }
-            Err(e) => return Err(e),
-        }
-    };
-
-    // 将数据写入用户空间的iovecs（recv_msg 路径已自行处理散布写入）
-    if !buf.is_empty() {
-        iovs.scatter(&buf[..recv_size])?;
+    let mut pmsg_flags = PMSG::from_bits_retain(flags);
+    if sock.is_nonblocking() {
+        pmsg_flags.insert(PMSG::DONTWAIT);
     }
-
-    // Fallback path does not produce control messages.
-    if !used_recv_msg {
-        // 最小保证：不产生控制消息时必须把 msg_controllen 写回 0
-        // 否则用户态 CMSG_FIRSTHDR 可能非空。
-        kmsg.msg_controllen = 0;
-        kmsg.msg_flags = 0;
-    }
+    // Every socket implements recv_msg. Repeating a protocol ENOSYS through
+    // recv would lose its message flags and could perform a second receive.
+    let recv_size = socket.recv_msg(&mut kmsg, pmsg_flags, &iovs)?;
 
     // Copy out only the result fields that Linux updates.
     let mut writer =

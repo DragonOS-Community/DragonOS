@@ -26,9 +26,12 @@ impl Syscall for SysUname {
         let mut writer =
             UserBufferWriter::new(name, core::mem::size_of::<PosixNewUtsName>(), true)?;
 
-        let uts_ns = ProcessManager::current_utsns();
-        let uts_wrapper = uts_ns.utsname();
-        writer.copy_one_to_user(&PosixNewUtsName::from(uts_wrapper.deref()), 0)?;
+        let uts_name = {
+            let uts_ns = ProcessManager::current_utsns();
+            let uts_wrapper = uts_ns.utsname();
+            PosixNewUtsName::from(uts_wrapper.deref())
+        };
+        writer.copy_one_to_user(&uts_name, 0)?;
 
         return Ok(0);
     }

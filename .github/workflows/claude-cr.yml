@@ -6,6 +6,8 @@ on:
 
 jobs:
   claude-review:
+    # 暂时禁用：当前 CI 中该机器人报错，恢复时删除下一行即可
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: write

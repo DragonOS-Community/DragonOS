@@ -21,28 +21,48 @@ use self::{
     ucontext::{AddressSpace, LockedVMA, UserMapper},
 };
 
+pub(crate) mod allocation;
 pub mod allocator;
+pub(crate) mod balloon;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod compaction;
+pub(crate) mod cpu_buffer;
+pub mod device_linear;
 pub mod dma;
 pub mod early_ioremap;
 pub mod fault;
+pub(crate) mod fault_recovery;
 pub mod ident_map;
 pub mod init;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+pub(crate) mod kernel_buffer;
 pub mod kernel_mapper;
+pub(crate) mod lazy_mm_drop;
 pub mod madvise;
 pub mod memblock;
+pub(crate) mod memory_notify;
 pub mod mincore;
 pub mod mmio_buddy;
 pub mod mmu_gather;
 pub mod no_init;
+pub mod oom;
+pub(crate) mod oom_reaper;
+pub(crate) mod oom_wait;
 pub mod page;
 pub mod page_cache_stats;
+pub(crate) mod page_lru;
+pub mod page_reporting;
+pub(crate) mod page_rmap;
 pub mod percpu;
 pub mod readahead;
+pub mod remote_access;
 pub mod syscall;
 pub mod sysfs;
 pub mod tlb;
 pub mod truncate;
 pub mod ucontext;
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+pub mod vmalloc;
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）
 static mut __IDLE_PROCESS_ADDRESS_SPACE: Option<Arc<AddressSpace>> = None;
@@ -84,6 +104,12 @@ bitflags! {
         const VM_ARCH_1 = 0x01000000;
         const VM_WIPEONFORK = 0x02000000;
         const VM_DONTDUMP = 0x04000000;
+        /// The VMA may contain both ordinary managed pages and raw device PFNs.
+        ///
+        /// This matches Linux VM_MIXEDMAP: raw PFNs must never enter the
+        /// page-manager/rmap/LRU paths, while private COW pages in the same VMA
+        /// remain normal managed pages.
+        const VM_MIXEDMAP = 0x10000000;
 
         const VM_LOCKED_CLEAR_MASK = !(Self::VM_LOCKED.bits | Self::VM_LOCKONFAULT.bits);
     }
@@ -104,6 +130,7 @@ bitflags! {
         const VM_FAULT_DONE_COW = 0x001000;
         const VM_FAULT_NEEDDSYNC = 0x002000;
         const VM_FAULT_COMPLETED = 0x004000;
+        const VM_FAULT_OOM_INJECTED = 0x008000;
         const VM_FAULT_HINDEX_MASK = 0x0f0000;
         const VM_FAULT_ERROR = 0x000001 | 0x000002 | 0x000040 | 0x000010 | 0x000020 | 0x000800;
     }
@@ -112,6 +139,37 @@ bitflags! {
         const MS_ASYNC = 1;
         const MS_INVALIDATE = 2;
         const MS_SYNC = 4;
+    }
+}
+
+impl VmFlags {
+    /// Linux is_data_mapping(): private writable memory, excluding grow-down
+    /// stacks. Executable writable mappings still consume RLIMIT_DATA.
+    #[inline]
+    pub fn is_data_mapping(self) -> bool {
+        (self & (Self::VM_WRITE | Self::VM_SHARED | Self::VM_GROWSDOWN)) == Self::VM_WRITE
+    }
+
+    /// VMAs which Linux mlock_fixup() leaves unlocked and unaccounted.
+    #[inline]
+    pub fn is_mlock_flag_unsupported(self) -> bool {
+        self.intersects(
+            Self::VM_IO
+                | Self::VM_DONTEXPAND
+                | Self::VM_PFNMAP
+                | Self::VM_MIXEDMAP
+                | Self::VM_HUGETLB,
+        )
+    }
+
+    /// VMAs which cannot be handled by DragonOS' ordinary prefault path.
+    ///
+    /// This deliberately differs from `is_mlock_flag_unsupported`: Linux
+    /// __mm_populate() only skips VM_IO/VM_PFNMAP, while DragonOS must also
+    /// skip hugetlb until its fault path is implemented.
+    #[inline]
+    pub fn is_mlock_population_unsupported(self) -> bool {
+        self.intersects(Self::VM_IO | Self::VM_PFNMAP | Self::VM_MIXEDMAP | Self::VM_HUGETLB)
     }
 }
 
@@ -504,6 +562,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     /// 当该位为1时，代表该页表项是全局的
     const ENTRY_FLAG_GLOBAL: usize;
 
+    /// Return whether a present entry at `level` is a leaf mapping rather than a pointer to the
+    /// next-level table. Architectures such as RISC-V encode this through permission bits instead
+    /// of a dedicated huge-page bit.
+    fn entry_is_leaf(level: usize, flags: usize) -> bool;
+
     /// 虚拟地址与物理地址的偏移量
     const PHYS_OFFSET: usize;
 
@@ -514,6 +577,11 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
 
     /// 每个页面的大小
     const PAGE_SIZE: usize = 1 << Self::PAGE_SHIFT;
+    /// SysV SHM attach ABI alignment.
+    ///
+    /// Linux exposes this as SHMLBA. It equals PAGE_SIZE on x86_64, but it is
+    /// intentionally modeled as a separate ABI constant.
+    const SHMLBA: usize = Self::PAGE_SIZE;
     /// 通过这个mask，获取地址的页内偏移量
     const PAGE_OFFSET_MASK: usize = Self::PAGE_SIZE - 1;
     /// 通过这个mask，获取页的首地址
@@ -554,6 +622,8 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     const FIXMAP_START_VADDR: VirtAddr;
     /// 内核的固定映射区的大小
     const FIXMAP_SIZE: usize;
+    /// Architecture-owned fixmap pages excluded from `EarlyIoRemap`.
+    const FIXMAP_RESERVED_TOP_PAGES: usize = 0;
     /// 内核的固定映射区的结束地址
     const FIXMAP_END_VADDR: VirtAddr =
         VirtAddr::new(Self::FIXMAP_START_VADDR.data() + Self::FIXMAP_SIZE);
@@ -640,7 +710,9 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
     fn initial_page_table() -> PhysAddr;
 
     /// 初始化新的usermapper，为用户进程创建页表
-    fn setup_new_usermapper() -> Result<UserMapper, SystemError>;
+    fn setup_new_usermapper(
+        account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<UserMapper, allocation::MemoryAllocationError>;
 
     /// 创建页表项
     ///
@@ -759,38 +831,6 @@ pub trait MemoryManagementArch: Clone + Copy + Debug {
         // 对于不支持异常表的架构，直接使用普通的内存设置
         ptr::write_bytes(dst, value, len);
         0
-    }
-}
-
-/// RAII guard for kernel write protection
-///
-/// Ensures write protection is re-enabled even if a panic occurs.
-/// This guard disables kernel write protection on creation and
-/// re-enables it when dropped.
-///
-/// # Example
-/// ```ignore
-/// {
-///     let _guard = KernelWpGuard::new();
-///     // Write protection is disabled here
-///     // ... perform write operations ...
-/// } // Write protection is re-enabled when _guard is dropped
-/// ```
-pub struct KernelWpGuard;
-
-impl KernelWpGuard {
-    /// Create a new guard that disables kernel write protection
-    #[inline]
-    pub fn new() -> Self {
-        MMArch::disable_kernel_wp();
-        Self
-    }
-}
-
-impl Drop for KernelWpGuard {
-    #[inline]
-    fn drop(&mut self) {
-        MMArch::enable_kernel_wp();
     }
 }
 

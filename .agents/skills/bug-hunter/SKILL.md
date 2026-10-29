@@ -42,12 +42,12 @@ description: 分布式多智能体缺陷检测总控技能。基于输入随机�
 - `references/TROUBLESHOOTING.md`：常见失败排查。
 - `references/METRICS.md`：质量指标与阈值调优。
 - `references/finding_schema.json`：Finding 对象 schema。
-- `references/persona_matrix.json`：角色矩阵与默认权重。
+- 角色矩阵与默认权重：内置于 `scripts/weighted_vote.py` 的 `DEFAULT_WEIGHTS`（3 角色）。
 
 ## 执行顺序
 
 1. **Stage 1 输入处理**：提取 diff，脱敏，按文件/块级生成 N 轮随机输入。
-2. **Stage 2 并行评审**：⚠️ **必须使用 Agent 工具并行启动 8 个子智能体；每个子智能体从 `shuffled_passes.json` 随机抽取 1 个 pass，并按固定 persona 分工输出 findings，禁止手工编写 findings！**
+2. **Stage 2 并行评审**：⚠️ **必须使用 Agent 工具并行启动 3 个子智能体；每个子智能体从 `shuffled_passes.json` 随机抽取 1 个 pass，并按固定 persona 分工输出 findings，禁止手工编写 findings！**
 3. **Stage 3 证据融合**：将 JSON 发现项做语义去重与冲突标记。
 4. **Stage 4 共识裁决**：按权重计算共识分，筛选过阈值问题并格式化输出。
 5. **Stage 5 闭环学习**：记录建议被接受/拒绝情况，更新人格权重参考。
@@ -78,7 +78,7 @@ description: 分布式多智能体缺陷检测总控技能。基于输入随机�
     "description": "问题描述",
     "fix_code": "建议修复代码",
     "confidence": 0.0,
-    "agent": "Security Sentinel"
+    "agent": "Security & Concurrency Sentinel"
   }
 ]
 ```
@@ -138,7 +138,7 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
 
 ## 规则
 
-- ⚠️ **Stage 2 必须使用 Agent 工具并行启动 8 个子智能体，禁止手工编写 findings！**
+- ⚠️ **Stage 2 必须使用 Agent 工具并行启动 3 个子智能体，禁止手工编写 findings！**
 - 不允许跳过 Stage 3 和 Stage 4。
 - 无 `fix_code` 的发现项默认降权。
 - 不报告纯格式问题或命名偏好。

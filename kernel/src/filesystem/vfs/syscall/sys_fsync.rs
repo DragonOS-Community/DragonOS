@@ -25,8 +25,8 @@ fn do_fsync(fd: i32, datasync: bool) -> Result<usize, SystemError> {
         return Err(SystemError::EBADF);
     }
 
-    file.inode().sync_file(datasync, file.private_data.lock())?;
-    Ok(0)
+    file.sync_range_and_check_wb_error(0, usize::MAX, datasync)
+        .map(|_| 0)
 }
 
 /// synchronize a file's in-core state with storage device.

@@ -1,5 +1,4 @@
 use crate::{
-    alloc::string::ToString,
     arch::{io::PortIOArch, CurrentPortIOArch},
     driver::acpi::{
         acpi_manager,
@@ -7,11 +6,14 @@ use crate::{
     },
     libs::spinlock::SpinLock,
     time::{
-        clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, CycleNum},
+        clocksource::{
+            Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, ClocksourceUpdate,
+            CycleNum,
+        },
         PIT_TICK_RATE,
     },
 };
-use acpi::fadt::Fadt;
+use acpi::{address::AddressSpace, fadt::Fadt};
 use alloc::sync::{Arc, Weak};
 use core::intrinsics::unlikely;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -80,18 +82,18 @@ struct InnerAcpipm {
 impl Acpipm {
     pub fn new() -> Arc<Self> {
         let data = ClocksourceData {
-            name: "acpi_pm".to_string(),
+            name: "acpi_pm".into(),
             rating: 200,
             mask: ClocksourceMask::new(ACPI_PM_MASK),
             mult: 0,
             shift: 0,
+            max_cycles: Default::default(),
             max_idle_ns: Default::default(),
             flags: ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS,
             watchdog_last: CycleNum::new(0),
             cs_last: CycleNum::new(0),
             uncertainty_margin: 0,
             maxadj: 0,
-            cycle_last: CycleNum::new(0),
         };
         let acpi_pm = Arc::new(Acpipm(SpinLock::new(InnerAcpipm {
             data,
@@ -117,20 +119,8 @@ impl Clocksource for Acpipm {
         return self.0.lock_irqsave().self_reaf.upgrade().unwrap();
     }
 
-    fn update_clocksource_data(&self, data: ClocksourceData) -> Result<(), SystemError> {
-        let d = &mut self.0.lock_irqsave().data;
-        d.set_name(data.name);
-        d.set_rating(data.rating);
-        d.set_mask(data.mask);
-        d.set_mult(data.mult);
-        d.set_shift(data.shift);
-        d.set_max_idle_ns(data.max_idle_ns);
-        d.set_flags(data.flags);
-        d.watchdog_last = data.watchdog_last;
-        d.cs_last = data.cs_last;
-        d.set_uncertainty_margin(data.uncertainty_margin);
-        d.set_maxadj(data.maxadj);
-        d.cycle_last = data.cycle_last;
+    fn update_clocksource_data(&self, update: ClocksourceUpdate) -> Result<(), SystemError> {
+        update.apply(&mut self.0.lock_irqsave().data);
         return Ok(());
     }
 }
@@ -209,14 +199,21 @@ const ACPI_PM_READ_CHECKS: u32 = 10000;
 fn find_acpi_pm_clock() -> Result<(), SystemError> {
     let fadt = acpi_manager()
         .tables()
-        .unwrap()
+        .ok_or(SystemError::ENODEV)?
         .find_table::<Fadt>()
-        .expect("failed to find FADT table");
+        .map_err(|_| SystemError::ENODEV)?;
     let pm_timer_block = fadt.pm_timer_block().map_err(|_| SystemError::ENODEV)?;
     let pm_timer_block = pm_timer_block.ok_or(SystemError::ENODEV)?;
-    let pmtmr_addr = pm_timer_block.address;
-
-    PMTMR_IO_PORT.store(pmtmr_addr as u32, Ordering::SeqCst);
+    // This driver uses port I/O; never truncate an MMIO or oversized GAS
+    // address into a port. Optional firmware absence must not stop boot.
+    if pm_timer_block.address_space != AddressSpace::SystemIo
+        || pm_timer_block.bit_offset != 0
+        || pm_timer_block.address == 0
+        || pm_timer_block.address > u16::MAX as u64
+    {
+        return Err(SystemError::ENODEV);
+    }
+    PMTMR_IO_PORT.store(pm_timer_block.address as u32, Ordering::SeqCst);
 
     info!(
         "apic_pmtmr I/O port: {}",
@@ -283,6 +280,7 @@ pub fn init_acpi_pm_clocksource() -> Result<(), SystemError> {
     // 检查ACPI PM Timer的频率是否正确
     if !verify_pmtmr_rate() {
         PMTMR_IO_PORT.store(0, Ordering::SeqCst);
+        return Err(SystemError::ENODEV);
     }
 
     // 检查TSC时钟源的监视器是否被禁用，如果被禁用则将时钟源的标志设置为CLOCK_SOURCE_MUST_VERIFY

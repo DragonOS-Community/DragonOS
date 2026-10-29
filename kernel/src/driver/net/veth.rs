@@ -1,5 +1,6 @@
 use super::bridge::BridgeEnableDevice;
-use super::{Iface, IfaceCommon};
+use super::PacketBuffer;
+use super::{BootstrapRoute, Iface, IfaceCommon, IfacePollScope, MtuBounds, ETHERNET_MAX_IP_MTU};
 use super::{NetDeivceState, NetDeviceCommonData, Operstate};
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
@@ -10,34 +11,51 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::net::bridge::{BridgeCommonData, BridgePort};
+use crate::driver::net::bridge::{BridgeCommonData, BridgePort, BridgePortId};
 use crate::driver::net::napi::{napi_schedule, NapiStruct};
 use crate::driver::net::register_netdevice;
 use crate::driver::net::types::InterfaceFlags;
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
+use crate::libs::mutex::Mutex;
+use crate::libs::prepared_queue::{Node, Queue};
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
 use crate::net::generate_iface_id;
-use crate::net::routing::{DnatRule, RouteEntry, RouterEnableDevice, SnatRule};
+use crate::net::route::{RTN_UNICAST, RTPROT_BOOT, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN};
+use crate::net::routing::RouterEnableDevice;
 use crate::process::namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE};
-use crate::process::ProcessManager;
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
 use smoltcp::phy::DeviceCapabilities;
 use smoltcp::phy::{self, RxToken};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, HardwareAddress, IpAddress, IpCidr};
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+const VETH_IP_MTU: usize = 1500;
+const VETH_MAX_FRAME_SIZE: usize = ETHERNET_MAX_IP_MTU + 14;
+const VETH_MAX_PENDING_FRAMES: usize = 1024;
+const VETH_MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct Veth {
     name: String,
-    rx_queue: VecDeque<Vec<u8>>,
+    /// Frames awaiting bridge/routing classification. Classification may
+    /// consult the authoritative FIB and therefore must run outside smoltcp's
+    /// interface lock.
+    pending_rx_queue: Queue<PendingVethFrame>,
+    /// Frames classified for local smoltcp delivery.
+    local_rx_queue: Queue<PendingVethFrame>,
+    queued_frames: usize,
+    queued_bytes: usize,
+    reserved_frames: usize,
+    reserved_bytes: usize,
+    /// Serialized with peer enqueue so DOWN both rejects new external ingress
+    /// and drains everything accepted before the transition.
+    peer_ingress_enabled: bool,
+    ingress_generation: u64,
     /// 对端的 `VethInterface`，在完成数据发送的时候会使用到
     peer: Weak<VethInterface>,
     self_iface_ref: Weak<VethInterface>,
@@ -47,7 +65,14 @@ impl Veth {
     pub fn new(name: String) -> Self {
         Veth {
             name,
-            rx_queue: VecDeque::new(),
+            pending_rx_queue: Queue::new(),
+            local_rx_queue: Queue::new(),
+            queued_frames: 0,
+            queued_bytes: 0,
+            reserved_frames: 0,
+            reserved_bytes: 0,
+            peer_ingress_enabled: true,
+            ingress_generation: 0,
             peer: Weak::new(),
             self_iface_ref: Weak::new(),
         }
@@ -55,61 +80,6 @@ impl Veth {
 
     pub fn set_peer_iface(&mut self, peer: &Arc<VethInterface>) {
         self.peer = Arc::downgrade(peer);
-    }
-
-    pub fn send_to_peer(&self, data: &[u8]) {
-        if let Some(peer) = self.peer.upgrade() {
-            // log::info!("Veth {} trying to send", self.name);
-
-            Self::to_peer(&peer, data);
-        }
-    }
-
-    pub(self) fn to_peer(peer: &Arc<VethInterface>, data: &[u8]) {
-        let mut peer_veth = peer.driver.inner.lock();
-        peer_veth.rx_queue.push_back(data.to_vec());
-
-        // {
-        //     let ether = EthernetFrame::new_checked(data).unwrap();
-        //     if ether.ethertype() == smoltcp::wire::EthernetProtocol::Ipv4 {
-        //         if let Some(ipv4_packet) =
-        //             smoltcp::wire::Ipv4Packet::new_checked(ether.payload()).ok()
-        //         {
-        //             log::info!(
-        //                 "Veth {} sending IPv4 packet to peer: {} -> {}",
-        //                 peer.name,
-        //                 ipv4_packet.src_addr(),
-        //                 ipv4_packet.dst_addr()
-        //             );
-        //         }
-        //     } else if ether.ethertype() == smoltcp::wire::EthernetProtocol::Ipv6 {
-        //         if let Some(ipv6_packet) =
-        //             smoltcp::wire::Ipv6Packet::new_checked(ether.payload()).ok()
-        //         {
-        //             log::info!(
-        //                 "Veth {} sending IPv6 packet to peer: {} -> {}",
-        //                 peer.name,
-        //                 ipv6_packet.src_addr(),
-        //                 ipv6_packet.dst_addr()
-        //             );
-        //         }
-        //     } else {
-        //         log::info!(
-        //             "Veth {} sending non-IP packet to peer: ethertype={:?}",
-        //             peer.name,
-        //             ether.ethertype()
-        //         );
-        //     }
-        // }
-
-        drop(peer_veth);
-
-        let Some(napi) = peer.napi_struct() else {
-            log::error!("Veth {} has no napi_struct", peer.name);
-            return;
-        };
-
-        napi_schedule(napi);
     }
 
     fn to_bridge(bridge_data: &BridgeCommonData, data: &[u8]) {
@@ -121,55 +91,11 @@ impl Veth {
         bridge.handle_frame(bridge_data.id, data);
     }
 
-    /// 经过路由发送，返回是否发送成功
-    fn to_router(&self, data: &[u8]) -> bool {
-        let Some(self_iface) = self.self_iface_ref.upgrade() else {
-            return false;
-        };
-
-        let frame: EthernetFrame<&[u8]> = EthernetFrame::new_checked(data).unwrap();
-        // log::info!("trying to go to router");
-        match self_iface.handle_routable_packet(&frame) {
-            Ok(_) => {
-                // log::info!("successfully sent to router");
-                true
-            }
-            // 先不管错误，直接告诉外面没有经过路由发送出去
-            Err(Some(err)) => {
-                log::error!("Router error: {:?}", err);
-                false
-            }
-            Err(_) => {
-                // log::info!("not routed");
-                false
-            }
-        }
-    }
-
-    pub fn recv_from_peer(&mut self) -> Option<Vec<u8>> {
-        // log::info!("Veth {} trying to receive", self.name);
-        let data = self.rx_queue.pop_front()?;
-
-        if let Some(bridge_common_data) = self
-            .self_iface_ref
-            .upgrade()
-            .unwrap()
-            .inner
-            .lock()
-            .bridge_common_data
-            .as_ref()
-        {
-            // log::info!("Veth {} sending data to bridge", self.name);
-            Self::to_bridge(bridge_common_data, &data);
-            return None;
-        }
-
-        // 说明获取的包发给进入路由了，无须返回
-        if self.to_router(&data) {
-            return None;
-        }
-
-        Some(data)
+    fn recv_local(&mut self) -> Option<PacketBuffer> {
+        let frame = self.local_rx_queue.pop_node()?.into_value();
+        self.queued_frames -= 1;
+        self.queued_bytes -= frame.data.capacity();
+        Some(frame.data)
     }
 
     pub fn name(&self) -> &str {
@@ -177,22 +103,132 @@ impl Veth {
     }
 }
 
+#[derive(Clone)]
 pub struct VethDriver {
     pub inner: Arc<SpinLock<Veth>>,
-    /// 指向所属网络接口的弱引用，用于 packet socket 分发
-    iface: SpinLock<Weak<dyn Iface>>,
+    /// Serializes dequeue, classification, and local enqueue as one ordered
+    /// ingress batch across NAPI, netns, and synchronous socket pollers.
+    ingress_classification_lock: Arc<Mutex<()>>,
+    /// A shared weak reference to the owning network interface, used for packet
+    /// socket delivery.
+    iface: Arc<SpinLock<Weak<dyn Iface>>>,
 }
 
-impl Clone for VethDriver {
-    fn clone(&self) -> Self {
-        VethDriver {
-            inner: self.inner.clone(),
-            iface: SpinLock::new(self.iface.lock().clone()),
-        }
+impl Debug for VethDriver {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VethDriver")
+            .field("name", &self.name())
+            .finish()
     }
 }
 
+enum IngressDisposition {
+    Consumed,
+    Local,
+}
+
+struct PendingVethFrame {
+    generation: u64,
+    data: PacketBuffer,
+}
+
 impl VethDriver {
+    /// Classifies a bounded batch before smoltcp locks its interface. Routed
+    /// and bridged frames are consumed here; local frames move to the queue
+    /// exposed through `Device::receive`.
+    fn prepare_ingress(&self, scan_budget: usize) -> usize {
+        let _classification_guard = self.ingress_classification_lock.lock();
+        let mut scanned = 0;
+        for _ in 0..scan_budget {
+            let frame = {
+                let mut veth = self.inner.lock();
+                veth.pending_rx_queue.pop_node()
+            };
+            let Some(frame) = frame else {
+                break;
+            };
+            scanned += 1;
+
+            let local = matches!(
+                self.classify_and_consume(&frame.value().data),
+                IngressDisposition::Local
+            );
+            let mut inner = self.inner.lock();
+            if local
+                && inner.peer_ingress_enabled
+                && inner.ingress_generation == frame.value().generation
+            {
+                // Keep the exact prepared node and its accepted byte budget.
+                inner.local_rx_queue.push_node(frame);
+            } else {
+                inner.queued_frames -= 1;
+                inner.queued_bytes -= frame.value().data.capacity();
+                drop(inner);
+                drop(frame);
+            }
+        }
+        scanned
+    }
+
+    fn classify_and_consume(&self, data: &[u8]) -> IngressDisposition {
+        let Some(iface) = self.inner.lock().self_iface_ref.upgrade() else {
+            return IngressDisposition::Local;
+        };
+        // Like Linux's ptype_all taps, packet sockets observe ingress before
+        // bridge/routing can consume it, not only frames delivered locally.
+        let packet_iface: Arc<dyn Iface> = iface.clone();
+        let pkt_type = crate::net::socket::packet::classify_packet(data, &packet_iface);
+        crate::net::socket::packet::deliver_to_packet_sockets(&packet_iface, data, pkt_type);
+
+        if let Some(bridge_data) = iface.common_bridge_data() {
+            Veth::to_bridge(&bridge_data, data);
+            return IngressDisposition::Consumed;
+        }
+
+        let Ok(frame) = EthernetFrame::new_checked(data) else {
+            return IngressDisposition::Local;
+        };
+        // Non-bridge IP must pass through smoltcp's validated ingress path
+        // before PRE_ROUTING and the FIB decision. The old pre-smoltcp
+        // router would bypass nftables (and conntrack) for either family.
+        if matches!(
+            frame.ethertype(),
+            smoltcp::wire::EthernetProtocol::Ipv4 | smoltcp::wire::EthernetProtocol::Ipv6
+        ) {
+            return IngressDisposition::Local;
+        }
+        match iface.handle_routable_packet(&frame) {
+            Ok(()) => IngressDisposition::Consumed,
+            Err(Some(error)) => {
+                log::error!("Router error: {:?}", error);
+                IngressDisposition::Consumed
+            }
+            Err(None) => IngressDisposition::Local,
+        }
+    }
+
+    fn has_pending_ingress(&self) -> bool {
+        !self.inner.lock().pending_rx_queue.is_empty()
+    }
+
+    fn has_local_ingress(&self) -> bool {
+        !self.inner.lock().local_rx_queue.is_empty()
+    }
+
+    fn validate_frame_len(&self, frame: &[u8]) -> Result<(), SystemError> {
+        let max_untagged = self.iface().map_or(VETH_IP_MTU, |iface| iface.mtu()) + 14;
+        if frame.len() <= max_untagged {
+            return Ok(());
+        }
+        let vlan_tagged = frame.len() >= 14
+            && matches!(u16::from_be_bytes([frame[12], frame[13]]), 0x8100 | 0x88a8);
+        if vlan_tagged && frame.len() <= max_untagged + 4 {
+            Ok(())
+        } else {
+            Err(SystemError::EMSGSIZE)
+        }
+    }
+
     /// # `new_pair`
     /// 创建一对虚拟以太网设备（veth pair），用于网络测试
     /// ## 参数
@@ -207,11 +243,13 @@ impl VethDriver {
 
         let driver1 = VethDriver {
             inner: dev1,
-            iface: SpinLock::new(Weak::<VethInterface>::new()),
+            ingress_classification_lock: Arc::new(Mutex::new(())),
+            iface: Arc::new(SpinLock::new(Weak::<VethInterface>::new())),
         };
         let driver2 = VethDriver {
             inner: dev2,
-            iface: SpinLock::new(Weak::<VethInterface>::new()),
+            ingress_classification_lock: Arc::new(Mutex::new(())),
+            iface: Arc::new(SpinLock::new(Weak::<VethInterface>::new())),
         };
 
         (driver1, driver2)
@@ -230,27 +268,171 @@ impl VethDriver {
     pub fn iface(&self) -> Option<Arc<dyn Iface>> {
         self.iface.lock().upgrade()
     }
+
+    fn reserve_slot(&self, len: usize) -> Result<VethReservation, SystemError> {
+        self.reserve_storage(len, len)
+    }
+
+    fn reserve_storage(
+        &self,
+        wire_len: usize,
+        bytes: usize,
+    ) -> Result<VethReservation, SystemError> {
+        // The exact VLAN bytes are checked at commit. Bound unknown bytes by
+        // the largest frame this device can accept before preparing storage.
+        let mtu = self.iface().map_or(VETH_IP_MTU, |iface| iface.mtu());
+        if wire_len > mtu + 18 {
+            return Err(SystemError::EMSGSIZE);
+        }
+        let mut node = Node::try_new(PendingVethFrame {
+            generation: 0,
+            data: PacketBuffer::new(),
+        })?;
+        let peer = self
+            .inner
+            .lock()
+            .peer
+            .upgrade()
+            .ok_or(SystemError::ENOBUFS)?;
+        let napi = peer.napi_struct().ok_or(SystemError::ENOBUFS)?;
+        let mut inner = peer.driver.inner.lock();
+        if !inner.peer_ingress_enabled {
+            return Err(SystemError::ENETDOWN);
+        }
+        if inner.queued_frames + inner.reserved_frames >= VETH_MAX_PENDING_FRAMES
+            || bytes
+                > VETH_MAX_PENDING_BYTES.saturating_sub(inner.queued_bytes + inner.reserved_bytes)
+        {
+            return Err(SystemError::ENOBUFS);
+        }
+        node.value_mut().generation = inner.ingress_generation;
+        inner.reserved_frames += 1;
+        inner.reserved_bytes += bytes;
+        drop(inner);
+        Ok(VethReservation {
+            source: self.clone(),
+            peer,
+            napi,
+            node: Some(node),
+            bytes,
+        })
+    }
+
+    fn submit_frame(&self, frame: PacketBuffer) -> Result<(), SystemError> {
+        self.validate_frame_len(&frame)?;
+        let mut prepared = self.reserve_storage(frame.len(), frame.capacity())?;
+        prepared.node.as_mut().unwrap().value_mut().data = frame;
+        prepared.commit()
+    }
+
+    pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        self.validate_frame_len(frame)?;
+        let mut prepared = self.reserve_slot(frame.len())?;
+        prepared.node.as_mut().unwrap().value_mut().data = PacketBuffer::try_from_slice(frame)?;
+        prepared.commit()
+    }
+}
+
+struct VethReservation {
+    source: VethDriver,
+    peer: Arc<VethInterface>,
+    napi: Arc<NapiStruct>,
+    node: Option<Box<Node<PendingVethFrame>>>,
+    bytes: usize,
+}
+
+impl VethReservation {
+    fn commit(mut self) -> Result<(), SystemError> {
+        self.source
+            .validate_frame_len(&self.node.as_ref().unwrap().value().data)?;
+        if let Some(iface) = self.source.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &self.node.as_ref().unwrap().value().data,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        debug_assert_eq!(
+            self.node.as_ref().unwrap().value().data.capacity(),
+            self.bytes
+        );
+        let node = self.node.take().unwrap();
+        let mut inner = self.peer.driver.inner.lock();
+        inner.reserved_frames -= 1;
+        inner.reserved_bytes -= self.bytes;
+        if !inner.peer_ingress_enabled || inner.ingress_generation != node.value().generation {
+            return Err(SystemError::ENETDOWN);
+        }
+        inner.queued_frames += 1;
+        inner.queued_bytes += self.bytes;
+        inner.pending_rx_queue.push_node(node);
+        drop(inner);
+        napi_schedule(self.napi.clone());
+        Ok(())
+    }
+}
+
+impl Drop for VethReservation {
+    fn drop(&mut self) {
+        if self.node.is_some() {
+            let mut inner = self.peer.driver.inner.lock();
+            inner.reserved_frames -= 1;
+            inner.reserved_bytes -= self.bytes;
+        }
+    }
 }
 
 pub struct VethTxToken {
     driver: VethDriver,
+    prepared: Option<VethReservation>,
 }
 
 impl phy::TxToken for VethTxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes == len)
+        {
+            return Ok(());
+        }
+        // Keep any earlier valid preparation until its replacement succeeds.
+        let mut prepared = self
+            .driver
+            .reserve_slot(len)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        let mut buffer =
+            PacketBuffer::try_with_capacity(len).map_err(|_| phy::TxEgressError::Exhausted)?;
+        buffer
+            .resize(len, 0)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        prepared.node.as_mut().unwrap().value_mut().data = buffer;
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0; len];
-        let result = f(&mut buf);
-        self.driver.inner.lock().send_to_peer(&buf);
+        let mut prepared = self
+            .prepared
+            .take()
+            .expect("veth TX requires exact preparation");
+        assert_eq!(prepared.bytes, len);
+        let result = f(prepared
+            .node
+            .as_mut()
+            .unwrap()
+            .value_mut()
+            .data
+            .as_mut_slice());
+        let _ = prepared.commit();
         result
     }
 }
 
 pub struct VethRxToken {
-    buffer: Vec<u8>,
-    driver: VethDriver,
+    buffer: PacketBuffer,
 }
 
 impl RxToken for VethRxToken {
@@ -258,73 +440,7 @@ impl RxToken for VethRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let packet = self.buffer.as_slice();
-
-        // 向注册的 packet socket 分发数据包
-        if let Some(iface) = self.driver.iface() {
-            let pkt_type = determine_packet_type(packet, &iface);
-            iface.common().deliver_to_packet_sockets(packet, pkt_type);
-        }
-
-        f(packet)
-    }
-}
-
-/// 根据以太网帧的目的 MAC 地址确定数据包类型
-fn determine_packet_type(
-    frame: &[u8],
-    iface: &Arc<dyn Iface>,
-) -> crate::net::socket::packet::PacketType {
-    use crate::net::socket::packet::PacketType;
-
-    if frame.len() < 14 {
-        return PacketType::Host;
-    }
-
-    let dst_mac = &frame[0..6];
-
-    // 检查是否为广播地址 (FF:FF:FF:FF:FF:FF)
-    if dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] {
-        return PacketType::Broadcast;
-    }
-
-    // 检查是否为多播地址 (第一个字节的最低位为1)
-    if dst_mac[0] & 0x01 != 0 {
-        return PacketType::Multicast;
-    }
-
-    // 检查是否为发往本机的包
-    let our_mac = iface.mac();
-    if dst_mac == our_mac.as_bytes() {
-        return PacketType::Host;
-    }
-
-    // 其他情况为发往其他主机的包（混杂模式下捕获）
-    PacketType::OtherHost
-}
-
-#[derive(Debug)]
-struct VethDriverWarpper(UnsafeCell<VethDriver>);
-unsafe impl Send for VethDriverWarpper {}
-unsafe impl Sync for VethDriverWarpper {}
-
-impl Deref for VethDriverWarpper {
-    type Target = VethDriver;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-
-impl DerefMut for VethDriverWarpper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl VethDriverWarpper {
-    #[allow(clippy::mut_from_ref)]
-    fn force_get_mut(&self) -> &mut VethDriver {
-        unsafe { &mut *self.0.get() }
+        f(self.buffer.as_slice())
     }
 }
 
@@ -334,7 +450,8 @@ impl phy::Device for VethDriver {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500;
+        // This is the stack's reconfiguration ceiling, not its current MTU.
+        caps.max_transmission_unit = VETH_MAX_FRAME_SIZE;
         caps.medium = smoltcp::phy::Medium::Ethernet;
         caps
     }
@@ -344,15 +461,13 @@ impl phy::Device for VethDriver {
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut guard = self.inner.lock();
-        guard.recv_from_peer().map(|buf| {
+        guard.recv_local().map(|buf| {
             // log::info!("VethDriver received data: {:?}", buf);
             (
-                VethRxToken {
-                    buffer: buf,
-                    driver: self.clone(),
-                },
+                VethRxToken { buffer: buf },
                 VethTxToken {
                     driver: self.clone(),
+                    prepared: None,
                 },
             )
         })
@@ -361,6 +476,7 @@ impl phy::Device for VethDriver {
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(VethTxToken {
             driver: self.clone(),
+            prepared: None,
         })
     }
 }
@@ -369,9 +485,9 @@ impl phy::Device for VethDriver {
 #[cast_to([sync] device::Device)]
 #[derive(Debug)]
 pub struct VethInterface {
-    name: String,
-    driver: VethDriverWarpper,
+    driver: VethDriver,
     common: IfaceCommon,
+    mac_address: SpinLock<EthernetAddress>,
     inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -387,51 +503,96 @@ pub struct VethCommonData {
 }
 
 impl VethInterface {
-    pub fn peer_veth(&self) -> Arc<VethInterface> {
-        self.inner.lock().peer_veth.upgrade().unwrap()
+    /// A netns move must not carry protocol reassembly, fragments, neighbors,
+    /// or multicast state across the namespace boundary. Prepare a fresh
+    /// smoltcp interface before the move's irreversible sysfs transaction.
+    pub(crate) fn prepare_stack_for_netns_move(
+        &self,
+    ) -> Result<smoltcp::iface::Interface, SystemError> {
+        let mut config = smoltcp::iface::Config::new(HardwareAddress::Ethernet(self.mac()));
+        config.random_seed = rand() as u64;
+        let mut stack = crate::driver::net::packet_storage::new_interface(
+            config,
+            &mut self.driver.clone(),
+            crate::time::Instant::now().into(),
+        );
+        stack.set_any_ip(true);
+        stack.set_route_table_includes_connected_prefixes(true);
+        stack
+            .set_ip_mtu(self.stack_mtu(self.mtu()))
+            .map_err(|_| SystemError::EINVAL)?;
+        Ok(stack)
+    }
+
+    pub(crate) fn publish_stack_after_netns_move(&self, stack: smoltcp::iface::Interface) {
+        // Memberships belonged to the source namespace. Keep the established
+        // refcount -> smoltcp lock order while replacing both pieces of state;
+        // a target namespace must join its groups on the fresh stack itself.
+        let mut groups = self.common.multicast_refcnt.lock();
+        *self.smol_iface().lock() = stack;
+        groups.clear();
+    }
+
+    pub fn peer_veth_opt(&self) -> Option<Arc<VethInterface>> {
+        self.inner.lock().peer_veth.upgrade()
     }
 
     pub fn new(driver: VethDriver) -> Arc<Self> {
+        Self::new_with_initial_state(driver, true)
+    }
+
+    fn new_with_initial_state(driver: VethDriver, initially_up: bool) -> Arc<Self> {
         let iface_id = generate_iface_id();
-        let name = driver.name();
         let mac = [
             0x02,
-            0x00,
-            0x00,
-            0x00,
+            (iface_id >> 32) as u8,
+            (iface_id >> 24) as u8,
+            (iface_id >> 16) as u8,
             (iface_id >> 8) as u8,
             iface_id as u8,
         ];
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+        let mac_address = EthernetAddress(mac);
+        let hw_addr = HardwareAddress::Ethernet(mac_address);
         let mut iface_config = smoltcp::iface::Config::new(hw_addr);
         iface_config.random_seed = rand() as u64;
-        let mut iface = smoltcp::iface::Interface::new(
+        let mut iface = crate::driver::net::packet_storage::new_interface(
             iface_config,
             &mut driver.clone(),
             crate::time::Instant::now().into(),
         );
         iface.set_any_ip(true);
 
-        let flags = InterfaceFlags::BROADCAST
-            | InterfaceFlags::MULTICAST
-            | InterfaceFlags::UP
-            | InterfaceFlags::RUNNING
-            | InterfaceFlags::LOWER_UP;
+        let mut flags = InterfaceFlags::BROADCAST | InterfaceFlags::MULTICAST;
+        if initially_up {
+            flags |= InterfaceFlags::UP | InterfaceFlags::RUNNING | InterfaceFlags::LOWER_UP;
+        }
+        let mtu = VETH_IP_MTU;
 
         let device = Arc::new(VethInterface {
-            name,
-            driver: VethDriverWarpper(UnsafeCell::new(driver.clone())),
-            common: IfaceCommon::new(iface_id, super::types::InterfaceType::EETHER, flags, iface),
+            driver: driver.clone(),
+            common: IfaceCommon::new(
+                iface_id,
+                super::types::InterfaceType::ETHER,
+                driver.name(),
+                mtu,
+                flags,
+                iface,
+            ),
+            mac_address: SpinLock::new(mac_address),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
         });
+        if !initially_up {
+            device.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+            device.set_operstate(Operstate::IF_OPER_DOWN);
+            device.driver.inner.lock().peer_ingress_enabled = false;
+        }
         let napi_struct = NapiStruct::new(device.clone(), 10);
         *device.common.napi_struct.write() = Some(napi_struct);
 
         // 设置 driver 对接口的弱引用，用于 packet socket 分发
         device
             .driver
-            .force_get_mut()
             .set_iface(Arc::downgrade(&device) as Weak<dyn Iface>);
 
         driver.inner.lock().self_iface_ref = Arc::downgrade(&device);
@@ -447,9 +608,22 @@ impl VethInterface {
     }
 
     pub fn new_pair(name1: &str, name2: &str) -> (Arc<Self>, Arc<Self>) {
+        Self::new_pair_with_initial_state(name1, name2, true)
+    }
+
+    /// Runtime-created veth links start administratively down, like Linux.
+    pub fn new_pair_dynamic(name1: &str, name2: &str) -> (Arc<Self>, Arc<Self>) {
+        Self::new_pair_with_initial_state(name1, name2, false)
+    }
+
+    fn new_pair_with_initial_state(
+        name1: &str,
+        name2: &str,
+        initially_up: bool,
+    ) -> (Arc<Self>, Arc<Self>) {
         let (driver1, driver2) = VethDriver::new_pair(name1, name2);
-        let iface1 = VethInterface::new(driver1);
-        let iface2 = VethInterface::new(driver2);
+        let iface1 = VethInterface::new_with_initial_state(driver1, initially_up);
+        let iface2 = VethInterface::new_with_initial_state(driver2, initially_up);
 
         iface1.set_peer_iface(&iface2);
         iface2.set_peer_iface(&iface1);
@@ -457,76 +631,94 @@ impl VethInterface {
         (iface1, iface2)
     }
 
+    pub fn bridge_master(&self) -> Option<Arc<super::bridge::BridgeIface>> {
+        self.common_bridge_data()?
+            .bridge_driver_ref
+            .upgrade()?
+            .local_iface()
+    }
+
+    fn update_bridge_carrier(&self) {
+        if let Some(data) = self.common_bridge_data() {
+            if let Some(bridge) = data.bridge_driver_ref.upgrade() {
+                bridge.update_carrier_from_ports();
+            }
+        }
+    }
+
+    pub fn set_mac(&self, mac: EthernetAddress) -> Result<(), SystemError> {
+        let bytes = mac.as_bytes();
+        if bytes[0] & 1 != 0 || bytes.iter().all(|byte| *byte == 0) {
+            return Err(SystemError::EINVAL);
+        }
+        let napi = self.napi_struct();
+        if let Some(napi) = napi.as_ref() {
+            super::napi::napi_pause_and_wait(napi);
+        }
+        self.common
+            .smol_iface
+            .lock()
+            .set_hardware_addr(HardwareAddress::Ethernet(mac));
+        let old = core::mem::replace(&mut *self.mac_address.lock(), mac);
+        if let Some(data) = self.common_bridge_data() {
+            if let Some(bridge) = data.bridge_driver_ref.upgrade() {
+                bridge.port_mac_changed(data.id, old, mac);
+            }
+        }
+        if let Some(napi) = napi {
+            super::napi::napi_resume(napi);
+        }
+        Ok(())
+    }
+
+    fn update_carrier_with_peer(&self, self_up: bool) {
+        let peer = self.peer_veth_opt();
+        let peer_up = peer.as_ref().is_some_and(|other| {
+            other.flags().contains(InterfaceFlags::UP)
+                && other
+                    .net_state()
+                    .contains(NetDeivceState::__LINK_STATE_START)
+        });
+        let carrier = self_up && peer_up;
+        for endpoint in core::iter::once(self).chain(peer.as_deref()) {
+            if carrier {
+                endpoint.clear_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+                endpoint.set_operstate(Operstate::IF_OPER_UP);
+            } else {
+                endpoint.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+                endpoint.set_operstate(Operstate::IF_OPER_DOWN);
+            }
+        }
+    }
+
+    /// Stop both endpoints before either can be unpublished. The caller keeps
+    /// ownership of both Arc references and unregisters them after this returns.
+    pub fn shutdown_pair(&self) {
+        let peer = self.peer_veth_opt();
+        self.common.close_tx_and_wait();
+        self.begin_admin_down();
+        if let Some(other) = peer.as_ref() {
+            other.common.close_tx_and_wait();
+            other.begin_admin_down();
+        }
+        for endpoint in core::iter::once(self).chain(peer.as_deref()) {
+            if let Some(napi) = endpoint.napi_struct() {
+                super::napi::napi_pause_and_wait(&napi);
+                endpoint.quiesce_admin_down();
+                super::napi::napi_disable(&napi);
+            } else {
+                endpoint.quiesce_admin_down();
+            }
+            endpoint.inner.lock().peer_veth = Weak::new();
+            endpoint.driver.inner.lock().peer = Weak::new();
+            endpoint.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
+            endpoint.set_operstate(Operstate::IF_OPER_DOWN);
+        }
+    }
+
     fn inner(&self) -> SpinLockGuard<'_, VethCommonData> {
         self.inner.lock()
     }
-
-    /// # `update_ip_addrs`
-    /// 更新虚拟以太网设备的 IP 地址
-    /// ## 参数
-    /// - `cidr`: 要添加的 IP 地址和子网掩码
-    /// ## 描述
-    /// 该方法会将指定的 IP 地址添加到虚拟以太网设备的 IP 地址列表中。
-    /// 如果添加失败（例如列表已满），则会触发 panic。
-    pub fn update_ip_addrs(&self, cidr: IpCidr) {
-        let iface = &mut self.common.smol_iface.lock();
-        iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs.push(cidr).expect("Push ipCidr failed: full");
-        });
-        self.common.router_common_data.ip_addrs.write().push(cidr);
-
-        // // 直接更新对端的arp_table
-        // self.inner.lock().peer_veth.upgrade().map(|peer| {
-        //     peer.common
-        //         .router_common_data
-        //         .arp_table
-        //         .write()
-        //         .insert(cidr.address(), self.mac())
-        // });
-
-        // log::info!("VethInterface {} updated IP address: {}", self.name, addr);
-    }
-
-    /// # `add_default_route_to_peer`
-    /// 添加默认路由到对端虚拟以太网设备
-    /// ## 参数
-    /// - `peer_ip`: 对端设备的 IP 地址
-    /// ## 描述
-    /// 该方法会在当前虚拟以太网设备的路由表中
-    /// 添加一条默认路由，
-    /// 指向对端虚拟以太网设备的 IP 地址。
-    /// 如果添加失败，则会触发 panic。
-    ///
-    pub fn add_default_route_to_peer(&self, peer_ip: IpAddress) {
-        let iface = &mut self.common.smol_iface.lock();
-        // iface.update_ip_addrs(|ip_addrs| {
-        //     ip_addrs.push(self_cidr).expect("Push ipCidr failed: full");
-        // });
-        iface.routes_mut().update(|routes_map| {
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-                    via_router: peer_ip,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default route to peer failed");
-        });
-    }
-
-    // pub fn add_direct_route(&self, cidr: IpCidr, via_router: IpAddress) {
-    //     let iface = &mut self.common.smol_iface.lock_irqsave();
-    //     iface.routes_mut().update(|routes_map| {
-    //         routes_map
-    //             .push(smoltcp::iface::Route {
-    //                 cidr,
-    //                 via_router,
-    //                 preferred_until: None,
-    //                 expires_at: None,
-    //             })
-    //             .expect("Add direct route failed");
-    //     });
-    // }
 }
 
 impl KObject for VethInterface {
@@ -563,10 +755,12 @@ impl KObject for VethInterface {
     }
 
     fn name(&self) -> String {
-        self.name.clone()
+        self.common.name()
     }
 
-    fn set_name(&self, _name: String) {}
+    fn set_name(&self, name: String) {
+        self.common.set_name(name);
+    }
     fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
         self.locked_kobj_state.read()
     }
@@ -590,7 +784,7 @@ impl device::Device for VethInterface {
     }
 
     fn id_table(&self) -> IdTable {
-        IdTable::new(self.name.clone(), None)
+        IdTable::new(self.common.name(), None)
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
@@ -652,30 +846,69 @@ impl device::Device for VethInterface {
 }
 
 impl Iface for VethInterface {
+    fn destroy_on_netns_exit(&self) -> bool {
+        true
+    }
+
     fn common(&self) -> &IfaceCommon {
         &self.common
     }
 
     fn iface_name(&self) -> String {
-        self.name.clone()
+        self.common.name()
     }
 
     fn mac(&self) -> EthernetAddress {
-        if let HardwareAddress::Ethernet(mac) = self.common.smol_iface.lock().hardware_addr() {
-            mac
-        } else {
-            EthernetAddress([0, 0, 0, 0, 0, 0])
-        }
+        *self.mac_address.lock()
     }
 
     fn poll(&self) -> bool {
-        // log::info!("VethInterface {} polling normal", self.name);
-        self.common.poll(self.driver.force_get_mut())
-        // self.clear_recv_buffer();
+        let mut driver = self.driver.clone();
+        match self.common.poll_scope() {
+            IfacePollScope::None => false,
+            IfacePollScope::LocalOnly => self.common.poll(&mut driver),
+            IfacePollScope::Full => {
+                let result = self.poll_napi(64);
+                result.work_done != 0 || result.poll_again
+            }
+        }
     }
 
-    fn poll_napi(&self, budget: usize) -> bool {
-        self.common.poll_napi(self.driver.force_get_mut(), budget)
+    fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
+        let mut driver = self.driver.clone();
+        match self.common.poll_scope() {
+            IfacePollScope::None => return super::napi::NapiPollResult::idle(),
+            IfacePollScope::LocalOnly => return self.common.poll_napi(&mut driver, budget),
+            IfacePollScope::Full => {}
+        }
+        // When both queues are backlogged, reserve bounded progress for each
+        // side. A single active queue may still use the full NAPI budget.
+        let local_backlogged = driver.has_local_ingress() || self.common().has_local_input();
+        let both_backlogged = local_backlogged && driver.has_pending_ingress();
+        let local_budget = if both_backlogged {
+            budget.div_ceil(2)
+        } else {
+            budget
+        };
+        let smoltcp = self
+            .common
+            .poll_napi_routed_ingress(&mut driver, local_budget);
+        // Classification is real receive work even when a frame is moved to
+        // the local smoltcp queue for a later pass. Charge every scanned frame
+        // to this NAPI instance so the global packet budget remains fair.
+        let prepared = driver.prepare_ingress(budget - smoltcp.work_done);
+        super::napi::NapiPollResult::new(
+            prepared + smoltcp.work_done,
+            smoltcp.poll_again || driver.has_pending_ingress() || driver.has_local_ingress(),
+        )
+    }
+
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        self.driver.try_raw_transmit(frame)
+    }
+
+    fn raw_transmit_owned(&self, frame: PacketBuffer) -> Result<(), SystemError> {
+        self.driver.submit_frame(frame)
     }
 
     fn addr_assign_type(&self) -> u8 {
@@ -693,6 +926,20 @@ impl Iface for VethInterface {
 
     fn set_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state |= state;
+        if state
+            .intersects(NetDeivceState::__LINK_STATE_START | NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            self.update_bridge_carrier();
+        }
+    }
+
+    fn clear_net_state(&self, state: NetDeivceState) {
+        self.inner().netdevice_common.state &= !state;
+        if state
+            .intersects(NetDeivceState::__LINK_STATE_START | NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            self.update_bridge_carrier();
+        }
     }
 
     fn operstate(&self) -> Operstate {
@@ -704,33 +951,54 @@ impl Iface for VethInterface {
     }
 
     fn mtu(&self) -> usize {
-        use smoltcp::phy::Device;
-        self.driver
-            .force_get_mut()
-            .capabilities()
-            .max_transmission_unit
+        self.common.mtu()
+    }
+
+    fn mtu_bounds(&self) -> MtuBounds {
+        MtuBounds {
+            min: 68,
+            max: ETHERNET_MAX_IP_MTU,
+        }
+    }
+
+    fn begin_admin_down(&self) {
+        let mut driver = self.driver.inner.lock();
+        driver.peer_ingress_enabled = false;
+        driver.ingress_generation = driver.ingress_generation.wrapping_add(1);
+    }
+
+    fn quiesce_admin_down(&self) {
+        // Serialize with the complete dequeue/classify/commit section. Once
+        // this returns, no frame accepted in the old generation can still
+        // produce bridge, routing, packet-socket, or local-stack side effects.
+        let classification_guard = self.driver.ingress_classification_lock.lock();
+        let mut driver = self.driver.inner.lock();
+        let pending = core::mem::take(&mut driver.pending_rx_queue);
+        let local = core::mem::take(&mut driver.local_rx_queue);
+        driver.queued_frames = 0;
+        driver.queued_bytes = 0;
+        // Existing unpublished reservations release their own counters, even
+        // across DOWN/UP. Generation rejects their stale commit.
+        drop(driver);
+        drop(classification_guard);
+        drop(pending);
+        drop(local);
+    }
+
+    fn publish_admin_state(&self, is_up: bool) {
+        if is_up {
+            self.driver.inner.lock().peer_ingress_enabled = true;
+        }
+        self.update_carrier_with_peer(is_up);
     }
 }
 
 impl BridgeEnableDevice for VethInterface {
     fn receive_from_bridge(&self, frame: &[u8]) {
-        // log::info!("VethInterface {} received from bridge", self.name);
-        let peer = self.peer_veth();
-
-        if self
-            .inner
-            .lock()
-            .bridge_common_data
-            .as_ref()
-            .unwrap()
-            .bridge_driver_ref
-            .upgrade()
-            .is_some()
-        {
-            // log::info!("VethInterface {} sending data to peer", self.name);
-
-            // let peer = self.peer_veth();
-            Veth::to_peer(&peer, frame);
+        if self.common_bridge_data().is_some() {
+            if let Some(_tx) = self.common.try_acquire_tx() {
+                let _ = self.driver.try_raw_transmit(frame);
+            }
         }
     }
 
@@ -747,40 +1015,20 @@ impl BridgeEnableDevice for VethInterface {
     fn common_bridge_data(&self) -> Option<BridgeCommonData> {
         self.inner().bridge_common_data.clone()
     }
-}
 
-impl RouterEnableDevice for VethInterface {
-    fn route_and_send(&self, _next_hop: &IpAddress, ip_packet: &[u8]) {
-        // log::info!(
-        //     "VethInterface {} routing packet to {}",
-        //     self.iface_name(),
-        //     next_hop
-        // );
-
-        // 构造以太网帧
-        let dst_mac = self.peer_veth().mac();
-        let src_mac = self.mac();
-
-        // 以太网类型为 IPv4
-        let ethertype = [0x08, 0x00];
-
-        let mut frame = Vec::with_capacity(14 + ip_packet.len());
-        frame.extend_from_slice(&dst_mac.0);
-        frame.extend_from_slice(&src_mac.0);
-        frame.extend_from_slice(&ethertype);
-        frame.extend_from_slice(ip_packet);
-
-        // 发送到对端
-        self.driver.inner.lock().send_to_peer(&frame);
-    }
-
-    fn is_my_ip(&self, ip: IpAddress) -> bool {
-        self.common
-            .ip_addrs()
-            .iter()
-            .any(|cidr| cidr.contains_addr(&ip))
+    fn clear_common_bridge_data(&self, bridge_id: BridgePortId) {
+        let mut inner = self.inner.lock();
+        if inner
+            .bridge_common_data
+            .as_ref()
+            .is_some_and(|data| data.id == bridge_id)
+        {
+            inner.bridge_common_data = None;
+        }
     }
 }
+
+impl RouterEnableDevice for VethInterface {}
 
 fn veth_route_test() {
     let (iface_ns1, iface_host1) = VethInterface::new_pair("veth-ns1", "veth-host1");
@@ -788,90 +1036,64 @@ fn veth_route_test() {
 
     let addr1 = IpAddress::v4(192, 168, 1, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    iface_ns1.update_ip_addrs(cidr1);
+    crate::net::address::initialize_address(&(iface_ns1.clone() as Arc<dyn Iface>), cidr1)
+        .expect("initialize veth address");
 
     let addr2 = IpAddress::v4(192, 168, 1, 254);
     let cidr2 = IpCidr::new(addr2, 24);
-    iface_host1.update_ip_addrs(cidr2);
+    crate::net::address::initialize_address(&(iface_host1.clone() as Arc<dyn Iface>), cidr2)
+        .expect("initialize veth address");
 
     let addr3 = IpAddress::v4(192, 168, 2, 254);
     let cidr3 = IpCidr::new(addr3, 24);
-    iface_host2.update_ip_addrs(cidr3);
+    crate::net::address::initialize_address(&(iface_host2.clone() as Arc<dyn Iface>), cidr3)
+        .expect("initialize veth address");
 
     let addr4 = IpAddress::v4(192, 168, 2, 3);
     let cidr4 = IpCidr::new(addr4, 24);
-    iface_ns2.update_ip_addrs(cidr4);
+    crate::net::address::initialize_address(&(iface_ns2.clone() as Arc<dyn Iface>), cidr4)
+        .expect("initialize veth address");
 
-    // 添加默认路由
-    iface_ns1.add_default_route_to_peer(addr2);
-    iface_host1.add_default_route_to_peer(addr1);
-
-    iface_host2.add_default_route_to_peer(addr4);
-    iface_ns2.add_default_route_to_peer(addr3);
+    // The fixture lives in one real netns. Endpoints use explicit host routes
+    // to enter through their peers; ingress then exercises namespace-local
+    // handoff to the interface that owns the destination address.
+    for (iface, destination, gateway, scope) in [
+        (&iface_ns1, addr4, Some(addr2), RT_SCOPE_UNIVERSE),
+        (&iface_ns2, addr1, Some(addr3), RT_SCOPE_UNIVERSE),
+        (&iface_host1, addr1, None, crate::net::route::RT_SCOPE_LINK),
+        (&iface_host2, addr4, None, crate::net::route::RT_SCOPE_LINK),
+    ] {
+        let oif = u32::try_from(iface.nic_id()).expect("fixture ifindex overflow");
+        iface
+            .common
+            .stage_bootstrap_route(BootstrapRoute {
+                destination: IpCidr::new(destination, 32),
+                source: None,
+                preferred_source: None,
+                table: RT_TABLE_MAIN,
+                priority: 0,
+                tos: 0,
+                protocol: RTPROT_BOOT,
+                scope,
+                kind: RTN_UNICAST,
+                oif,
+                gateway,
+                nexthop_flags: 0,
+            })
+            .expect("stage veth fixture host route");
+    }
 
     let turn_on = |a: &Arc<VethInterface>, ns: Arc<NetNamespace>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        ns.add_device(a.clone());
-        a.common().set_net_namespace(ns.clone());
-        register_netdevice(a.clone()).expect("register veth device failed");
+        register_netdevice(&ns, a.clone()).expect("register veth fixture interface");
     };
-
-    let ns1 = NetNamespace::new_empty(ProcessManager::current_user_ns()).unwrap();
-    let ns2 = NetNamespace::new_empty(ProcessManager::current_user_ns()).unwrap();
-
-    let router_ns1 = ns1.router();
-    // 任何发往 192.168.1.0/24 网络的数据包都是本地邻居，可以直接从 veth-ns1 发送。
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_ns1.clone());
-    router_ns1.add_route(route);
-    // 任何不匹配其他路由的数据包，都应该通过 veth-ns1 接口发送给下一跳 192.168.1.254。
-    let next_hop = IpAddress::v4(192, 168, 1, 254);
-    let route = RouteEntry::new_default(next_hop, iface_ns1.clone());
-    router_ns1.add_route(route);
-
-    let router_ns2 = ns2.router();
-    // 任何发往 192.168.2.0/24 网络的数据包都是本地邻居，可以直接从 veth-ns2 发送
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 2, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_ns2.clone());
-    router_ns2.add_route(route);
-    // 任何不匹配其他路由的数据包，都应该通过 veth-ns2 接口发送给下一跳 192.168.2.254
-    let next_hop = IpAddress::v4(192, 168, 2, 254);
-    let route = RouteEntry::new_default(next_hop, iface_ns2.clone());
-    router_ns2.add_route(route);
-
-    let host_router = INIT_NET_NAMESPACE.router();
-    // 任何发往 192.168.1.0/24 网络的数据包，都应该从 veth-host1 接口直接发送
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 1, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_host1.clone());
-    host_router.add_route(route);
-    // 任何发往 192.168.2.0/24 网络的数据包，都应该从 veth-host2 接口直接发送
-    let dest = IpCidr::new(IpAddress::v4(192, 168, 2, 0), 24);
-    let route = RouteEntry::new_connected(dest, iface_host2.clone());
-    host_router.add_route(route);
 
     turn_on(&iface_ns1, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_ns2, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_host1, INIT_NET_NAMESPACE.clone());
     turn_on(&iface_host2, INIT_NET_NAMESPACE.clone());
-
-    let snat_rules = vec![SnatRule {
-        // 匹配所有来自 192.168.1.0/24 网络的流量
-        source_cidr: "192.168.1.0/24".parse().unwrap(),
-        // 将源地址转换为 192.168.2.254(hardcode)
-        nat_ip: IpAddress::v4(192, 168, 2, 254),
-    }];
-
-    let dnat_rules = vec![DnatRule {
-        external_addr: IpAddress::v4(192, 168, 2, 1),
-        internal_addr: IpAddress::v4(192, 168, 2, 3),
-        internal_port: None,
-        external_port: None,
-    }];
-
-    host_router.nat_tracker().update_snat_rules(snat_rules);
-    host_router.nat_tracker().update_dnat_rules(dnat_rules);
 }
 
 fn veth_epoll_test() {
@@ -879,22 +1101,19 @@ fn veth_epoll_test() {
 
     let addr1 = IpAddress::v4(111, 111, 11, 1);
     let cidr1 = IpCidr::new(addr1, 24);
-    iface1.update_ip_addrs(cidr1);
+    crate::net::address::initialize_address(&(iface1.clone() as Arc<dyn Iface>), cidr1)
+        .expect("initialize veth address");
 
     let addr2 = IpAddress::v4(111, 111, 11, 2);
     let cidr2 = IpCidr::new(addr2, 24);
-    iface2.update_ip_addrs(cidr2);
-
-    iface1.add_default_route_to_peer(addr2);
-    iface2.add_default_route_to_peer(addr1);
+    crate::net::address::initialize_address(&(iface2.clone() as Arc<dyn Iface>), cidr2)
+        .expect("initialize veth address");
 
     let turn_on = |a: &Arc<VethInterface>, ns: Arc<NetNamespace>| {
         a.set_net_state(NetDeivceState::__LINK_STATE_START);
         a.set_operstate(Operstate::IF_OPER_UP);
         // NET_DEVICES.write_irqsave().insert(a.nic_id(), a.clone());
-        ns.add_device(a.clone());
-        a.common().set_net_namespace(ns.clone());
-        register_netdevice(a.clone()).expect("register veth device failed");
+        register_netdevice(&ns, a.clone()).expect("register veth fixture interface");
     };
 
     turn_on(&iface1, INIT_NET_NAMESPACE.clone());
@@ -903,8 +1122,141 @@ fn veth_epoll_test() {
 
 #[unified_init(INITCALL_DEVICE)]
 pub fn veth_init() -> Result<(), SystemError> {
-    veth_epoll_test();
-    veth_route_test();
-    log::info!("Veth pair initialized.");
+    if super::net_test_fixtures_enabled() {
+        veth_epoll_test();
+        veth_route_test();
+        log::info!("Veth test fixtures initialized.");
+    }
     Ok(())
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn buffer_selftest() -> bool {
+    fn run() -> Result<bool, SystemError> {
+        // Private, unregistered interfaces exercise production admission and
+        // generation rollback without scheduling synthetic packets globally.
+        let (source, peer) = VethInterface::new_pair("mm262-source", "mm262-peer");
+        *source.common.napi_struct.write() = Some(NapiStruct::new_disabled(source.clone(), 10));
+        *peer.common.napi_struct.write() = Some(NapiStruct::new_disabled(peer.clone(), 10));
+        if !super::local_output::native_reply_selftest(source.clone())? {
+            return Ok(false);
+        }
+        let mut driver = source.driver.clone();
+        let mut tx = <VethDriver as phy::Device>::transmit(
+            &mut driver,
+            smoltcp::time::Instant::from_millis(0),
+        )
+        .unwrap();
+        phy::TxToken::prepare_buffer(&mut tx, 64).map_err(|_| SystemError::ENOMEM)?;
+        phy::TxToken::prepare_buffer(&mut tx, 64).map_err(|_| SystemError::ENOMEM)?;
+        if phy::TxToken::prepare_buffer(&mut tx, usize::MAX).is_ok() {
+            return Ok(false);
+        }
+        {
+            let inner = peer.driver.inner.lock();
+            if inner.reserved_frames != 1 || inner.reserved_bytes != 64 {
+                return Ok(false);
+            }
+        }
+        phy::TxToken::consume(tx, 64, |frame| {
+            frame.fill(0xa5);
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        });
+        {
+            let inner = peer.driver.inner.lock();
+            if inner.queued_frames != 1
+                || inner.queued_bytes != 64
+                || inner.reserved_frames != 0
+                || inner.reserved_bytes != 0
+            {
+                return Ok(false);
+            }
+        }
+        if peer.driver.prepare_ingress(1) != 1 {
+            return Ok(false);
+        }
+        let frame = peer
+            .driver
+            .inner
+            .lock()
+            .recv_local()
+            .ok_or(SystemError::EIO)?;
+        if frame.len() != 64
+            || frame[..12].iter().any(|byte| *byte != 0xa5)
+            || frame[12..14] != 0x0800u16.to_be_bytes()
+            || frame[14..].iter().any(|byte| *byte != 0xa5)
+        {
+            return Ok(false);
+        }
+        drop(frame);
+        if !super::local_output::native_output_selftest(&mut driver, true)?
+            || peer.driver.prepare_ingress(1) != 1
+        {
+            return Ok(false);
+        }
+        let native = peer
+            .driver
+            .inner
+            .lock()
+            .recv_local()
+            .ok_or(SystemError::EIO)?;
+        if native.len() != 64 || native[14..].iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+        drop(native);
+        let mut reservations = Queue::new();
+        for _ in 0..VETH_MAX_PENDING_FRAMES {
+            reservations.push_node(Node::try_new(driver.reserve_slot(1)?)?);
+        }
+        if !matches!(driver.reserve_slot(1), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        if !super::local_output::native_output_selftest(&mut driver, false)? {
+            return Ok(false);
+        }
+        drop(reservations.pop_node());
+        drop(driver.reserve_slot(1)?);
+        drop(reservations);
+
+        source.common.set_mtu(ETHERNET_MAX_IP_MTU);
+        let bytes = VETH_MAX_FRAME_SIZE;
+        let count = VETH_MAX_PENDING_BYTES / bytes;
+        let mut reservations = Queue::new();
+        for _ in 0..count {
+            reservations.push_node(Node::try_new(driver.reserve_slot(bytes)?)?);
+        }
+        {
+            let inner = peer.driver.inner.lock();
+            if inner.reserved_frames != count
+                || inner.reserved_bytes != count * bytes
+                || count >= VETH_MAX_PENDING_FRAMES
+            {
+                return Ok(false);
+            }
+        }
+        if !matches!(driver.reserve_slot(bytes), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        drop(reservations);
+        source.common.set_mtu(VETH_IP_MTU);
+
+        let mut old = driver.reserve_slot(64)?;
+        let mut frame = PacketBuffer::try_with_capacity(64)?;
+        frame.resize(64, 0)?;
+        old.node.as_mut().unwrap().value_mut().data = frame;
+        peer.begin_admin_down();
+        peer.quiesce_admin_down();
+        peer.publish_admin_state(true);
+        if !matches!(old.commit(), Err(SystemError::ENETDOWN)) {
+            return Ok(false);
+        }
+        let inner = peer.driver.inner.lock();
+        Ok(inner.pending_rx_queue.is_empty()
+            && inner.local_rx_queue.is_empty()
+            && inner.queued_frames == 0
+            && inner.queued_bytes == 0
+            && inner.reserved_frames == 0
+            && inner.reserved_bytes == 0)
+    }
+    run().unwrap_or(false)
 }

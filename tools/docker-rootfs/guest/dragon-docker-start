@@ -1,0 +1,42 @@
+#!/bin/sh
+# Guest-only: preserve Docker's default bridge, firewall and storage settings.
+set -eu
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+case "$(uname -r)" in
+    *dragonos*) ;;
+    *) echo 'Run this helper inside DragonOS, not on the host.' >&2; exit 1 ;;
+esac
+# Never inherit a remote context or TLS endpoint from the interactive shell.
+unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+docker() {
+    command docker --host=unix:///var/run/docker.sock "$@"
+}
+test -s /etc/ssl/certs/ca-certificates.crt || {
+    echo 'Missing CA bundle; rebuild the docker rootfs profile.' >&2
+    exit 1
+}
+if docker info >/dev/null 2>&1; then
+    echo 'Docker is already ready.'
+    exit 0
+fi
+if [ -e /run/docker.pid ]; then
+    echo 'Docker pidfile exists; inspect the existing daemon before starting another.' >&2
+    exit 1
+fi
+dockerd > /tmp/dockerd.log 2>&1 &
+daemon_pid=$!
+attempt=0
+while [ "$attempt" -lt 60 ]; do
+    if docker info >/dev/null 2>&1; then
+        docker info --format '{{.ServerVersion}} {{.Driver}}'
+        exit 0
+    fi
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+        echo 'dockerd exited; inspect /tmp/dockerd.log.' >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+echo 'dockerd readiness timed out; inspect /tmp/dockerd.log. Daemon was not killed.' >&2
+exit 1

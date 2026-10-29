@@ -1,4 +1,5 @@
-use alloc::boxed::Box;
+use crate::mm::allocator::physical::{PhysicalBox, PhysicalPage};
+use alloc::sync::Arc;
 
 use crate::{
     arch::kvm_arch_ops,
@@ -16,7 +17,7 @@ const MSR_IA32_APICBASE_BASE: u64 = 0xfffff << 12;
 #[derive(Debug)]
 pub struct KvmLapic {
     pub apicv_active: bool,
-    pub regs: Box<[u8]>,
+    pub(crate) regs: Arc<PhysicalBox<PhysicalPage>>,
 }
 
 impl VirtCpu {

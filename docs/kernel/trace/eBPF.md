@@ -1,63 +1,61 @@
 # eBPF
 
-> 作者: 陈林峰
+> Author: Chen Linfeng  
 > 
 > Email: chenlinfeng25@outlook.com
 
-## 概述
+## Overview
 
-eBPF 是一项革命性的技术，起源于 Linux 内核，它可以在特权上下文中（如操作系统内核）运行沙盒程序。它用于安全有效地扩展内核的功能，而无需通过更改内核源代码或加载内核模块的方式来实现。
+eBPF is a revolutionary technology that originated from the Linux kernel. It allows sandboxed programs to run in privileged contexts (such as the operating system kernel). It is used to extend the kernel's functionality in a secure and efficient manner without modifying the kernel source code or loading kernel modules.
 
-从历史上看，由于内核具有监督和控制整个系统的特权，操作系统一直是实现可观测性、安全性和网络功能的理想场所。同时，由于操作系统内核的核心地位和对稳定性和安全性的高要求，操作系统内核很难快速迭代发展。因此在传统意义上，与在操作系统本身之外实现的功能相比，操作系统级别的创新速度要慢一些。
+Historically, due to the kernel's privileged position in supervising and controlling the entire system, the operating system has been an ideal place for implementing observability, security, and networking features. At the same time, due to the kernel's core position and high requirements for stability and security, the kernel has been difficult to iterate quickly. Therefore, traditionally, the innovation speed at the operating system level has been slower compared to features implemented outside the operating system itself.
 
-eBPF 从根本上改变了这个方式。通过允许在操作系统中运行沙盒程序的方式，应用程序开发人员可以运行 eBPF 程序，以便在运行时向操作系统添加额外的功能。然后在 JIT 编译器和验证引擎的帮助下，操作系统确保它像本地编译的程序一样具备安全性和执行效率。这引发了一股基于 eBPF 的项目热潮，它们涵盖了广泛的用例，包括下一代网络实现、可观测性和安全功能等领域。
+eBPF fundamentally changes this approach. By allowing sandboxed programs to run within the operating system, application developers can run eBPF programs to add additional functionality to the operating system at runtime. Then, with the help of JIT compilers and verification engines, the operating system ensures that these programs are as secure and efficient as natively compiled programs. This has sparked a wave of eBPF-based projects covering a wide range of use cases, including next-generation network implementations, observability, and security features.
 
-## eBPF In DragonOS
+## eBPF in DragonOS
 
-在一个新的OS上添加eBPF的支持需要了解eBPF的运行过程，通常，eBPF需要用户态工具和内核相关基础设施配合才能发挥其功能。而新的OS通常会兼容Linux上的应用程序，这可以进一步简化对用户态工具的移植工作，只要内核实现相关的系统调用和功能，就可以配合已有的工具完成eBPF的支持。
+Adding eBPF support to a new OS requires understanding the eBPF runtime process. Typically, eBPF needs user-space tools and kernel-related infrastructure to function properly. Since a new OS usually is compatible with Linux applications, this can further simplify the porting work of user-space tools. As long as the kernel implements the relevant system calls and features, it can work with existing tools to support eBPF.
 
-## eBPF的运行流程
+## eBPF Execution Process
 
-![image-20240909165945192](/kernel/trace/ebpf_flow.png)
+![eBPF execution flow](/kernel/trace/ebpf_flow.png)
 
-如图所示，eBPF程序的运行过程分为三个主要步骤：
+As shown in the figure, the execution process of an eBPF program is divided into three main steps:
 
-1. 源代码->二进制
-    1. 用户可以使用python/C/Rust编写eBPF程序，并使用相关的工具链编译源代码到二进制程序
-    2. 这个步骤中，用户需要合理使用helper函数丰富eBPF程序功能
-2. 加载eBPF程序
-    1. 用户态的工具库会封装内核提供的系统调用接口，以简化用户的工作。用户态工具对eBPF程序经过预处理后发出系统调用，请求内核加载eBPF程序。
-    1. 内核首先会对eBPF程序进行验证，检查程序的正确性和合法性，同时也会对程序做进一步的处理
-    1. 内核会根据用户请求，将eBPF程序附加到内核的挂载点上(kprobe/uprobe/trace_point)
-    1. 在内核运行期间，当这些挂载点被特定的事件触发， eBPF程序就会被执行
-3. 数据交互
-    1. eBPF程序可以收集内核的信息，用户工具可以选择性的获取这些信息
-    2. eBPF程序可以直接将信息输出到文件中，用户工具通过读取和解析文件中的内容拿到信息
-    3. eBPF程序通过Map在内核和用户态之间共享和交换数据
+1. Source code -> Binary
+    1. Users can write eBPF programs in Python/C/Rust and compile the source code into a binary program using the relevant toolchain.
+    2. In this step, users need to reasonably use helper functions to enrich the functionality of the eBPF program.
+2. Loading eBPF program
+    1. User-space tool libraries encapsulate the system call interfaces provided by the kernel to simplify the user's work. After preprocessing, user-space tools make system calls to request the kernel to load the eBPF program.
+    1. The kernel first verifies the eBPF program to check its correctness and legality, and also performs further processing on the program.
+    1. The kernel attaches the eBPF program to the kernel's mount points (kprobe/uprobe/trace_point) based on the user's request.
+    1. During kernel operation, when these mount points are triggered by specific events, the eBPF program is executed.
+3. Data Interaction
+    1. eBPF programs can collect information from the kernel, and user tools can selectively retrieve this information.
+    2. eBPF programs can directly output information to a file, and user tools can read and parse the content of the file to obtain the information.
+    3. eBPF programs share and exchange data between the kernel and user space through Maps.
 
+## User-space Support
 
+There are many user-space eBPF tool libraries, such as C's libbpf, Python's bcc, and Rust's Aya. Overall, the processing flow of these tools is similar. DragonOS currently supports eBPF programs written with the [Aya](https://github.com/aya-rs/aya) framework. As an example, the user-space tool processing flow for Aya is as follows:
 
-## 用户态支持
+1. Provide helper functions and Map abstractions for eBPF usage, making it easier to implement eBPF programs.
+2. Process the compiled eBPF program, call system calls to create Maps, and obtain corresponding file descriptors.
+3. Update the values of Maps (.data) as needed.
+4. Modify the relevant instructions of the eBPF program based on relocation information.
+5. Handle bpf to bpf calls in the eBPF program according to the kernel version.
+6. Load the eBPF program into the kernel.
+7. Package system calls and provide a large number of functions to help access eBPF information and interact with the kernel.
 
-用户态的eBPF工具库有很多，比如C的libbpf，python的bcc, Rust的Aya，总体来说，这些工具的处理流程都大致相同。DragonOS当前支持[Aya](https://github.com/aya-rs/aya)框架编写的eBPF程序，以Aya为例，用户态的工具的处理过程如下:
-
-1. 提供eBPF使用的helper函数和Map抽象，方便实现eBPF程序
-2. 处理编译出来的eBPF程序，调用系统调用创建Map，获得对应的文件描述符
-3. 根据需要，更新Map的值(.data)
-4. 根据重定位信息，对eBPF程序的相关指令做修改
-5. 根据内核版本，对eBPF程序中的bpf to bpf call进行处理
-6. 加载eBPF程序到内核中
-7. 对系统调用封装，提供大量的函数帮助访问eBPF的信息并与内核交互
-
-DragonOS对Aya 库的支持并不完整。通过对Aya库的删减，我们实现了一个较小的[tiny-aya](https://github.com/DragonOS-Community/tiny-aya)。为了确保后期对Aya的兼容，tiny-aya只对Aya中的核心工具aya做了修改**，其中一些函数被禁用，因为这些函数的所需的系统调用或者文件在DragonOS中还未实现**。
+DragonOS's support for the Aya library is not complete. By trimming the Aya library, we have implemented a smaller [tiny-aya](https://github.com/DragonOS-Community/tiny-aya). To ensure future compatibility with Aya, tiny-aya only modifies the core tool aya in Aya. Some functions have been disabled because the system calls or files they require are not yet implemented in DragonOS.
 
 ### Tokio
 
-Aya需要使用异步运行时，通过增加一些系统调用和修复一些错误DragonOS现在已经支持基本的tokio运行时。
+Aya requires an asynchronous runtime. With the addition of some system calls and fixes for some errors, DragonOS now supports a basic Tokio runtime.
 
-### 使用Aya创建eBPF程序
+### Using Aya to Create an eBPF Program
 
-与Aya官方提供的[文档](https://aya-rs.dev/book/start/development/)所述，只需要根据其流程安装对应的Rust工具链，就可以按照模板创建eBPF项目。以当前实现的`syscall_ebf`为例，这个程序的功能是统计系统调用的次数，并将其存储在一个HashMap中。
+As described in the [official documentation](https://aya-rs.dev/book/start/development/) provided by Aya, users only need to install the corresponding Rust toolchain according to its process to create an eBPF project based on a template. Taking the current implementation of `syscall_ebf` as an example, this program counts the number of system calls and stores them in a HashMap.
 
 ```
 ├── Cargo.toml
@@ -68,24 +66,24 @@ Aya需要使用异步运行时，通过增加一些系统调用和修复一些�
 └── xtask
 ```
 
-在user/app目录中，项目结构如上所示：
+The project structure in the user/app directory is as follows:
 
-- `syscall_ebpf-ebpf`是 eBPF代码的实现目录，其会被编译到字节码
-- `syscall_ebpf-common` 是公共库，方便内核和用户态进行信息交互
-- `syscall_ebpf` 是用户态程序，其负责加载eBPF程序并获取eBPF程序产生的数据
-- `xtask` 是一个命令行工具，方便用户编译和运行用户态程序
+- `syscall_ebpf-ebpf` is the directory for implementing eBPF code, which will be compiled into bytecode.
+- `syscall_ebpf-common` is a common library, convenient for information exchange between the kernel and user space.
+- `syscall_ebpf` is the user-space program, responsible for loading the eBPF program and retrieving data generated by the eBPF program.
+- `xtask` is a command-line tool, convenient for users to compile and run user-space programs.
 
-为了在DragonOS中运行用户态程序，暂时还不能直接使用模板创建的项目：
+To run user-space programs in DragonOS, the project created using the template cannot be used directly:
 
-1. 这个项目不符合DragonOS对用户程序的项目结构要求，当然这可以通过稍加修改完成
-2. 因为DragonOS对tokio运行时的支持还不是完整体，需要稍微修改一下使用方式
+1. This project does not meet DragonOS's requirements for the structure of user programs, but this can be easily modified.
+2. Because DragonOS's support for the Tokio runtime is not yet complete, the usage method needs to be slightly modified.
 
 ```
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
 ```
 
-3. 因为对Aya支持不是完整体，因此项目依赖的aya和aya-log需要换成tiny-aya中的实现。
+3. Because the support for Aya is not complete, the project's dependencies on aya and aya-log need to be replaced with the implementations in tiny-aya.
 
 ```
 [dependencies]
@@ -93,30 +91,28 @@ aya = { git = "https://github.com/DragonOS-Community/tiny-aya.git" }
 aya-log = { git = "https://github.com/DragonOS-Community/tiny-aya.git" }
 ```
 
-只需要稍加修改，就可以利用Aya现有的工具完成eBPF程序的实现。
+With slight modifications, eBPF programs can be implemented using the existing tools of Aya.
 
-## 内核态支持
+## Kernel-space Support
 
-内核态支持主要为三个部分：
+Kernel-space support mainly consists of three parts:
 
-1. kprobe实现：位于目录`kernel/crates/kprobe`
-2. rbpf运行时：位于目录`kernel/crates/rbpf`
-3. 系统调用支持
-4. helper函数支持
+1. kprobe implementation: located in directory `kernel/crates/kprobe`
+2. rbpf runtime: located in directory `kernel/crates/rbpf`
+3. System call support
+4. Helper function support
 
 ### rbpf
 
-由于rbpf之前只是用于运行一些简单的eBPF程序，其需要通过一些修改才能运行更复杂的程序。
+Previously, rbpf was used to run some simple eBPF programs. To run more complex programs, it needs to be modified.
 
-1. 增加bpf to bpf call 的支持：通过增加新的栈抽象和保存和恢复必要的寄存器数据
-2. 关闭内部不必要的内存检查，这通常由内核的验证器完成
-3. 增加带所有权的数据结构避免生命周期的限制
+1. Add support for bpf to bpf calls: by adding new stack abstractions and saving and restoring necessary register data.
+2. Disable unnecessary internal memory checks, which are usually handled by the kernel's verifier.
+3. Add data structures with ownership to avoid limitations on lifetimes.
 
+### System Calls
 
-
-### 系统调用
-
-eBPF相关的系统调用都集中在`bpf()` 上，通过参数cmd来进一步区分功能，目前对其支持如下:
+All eBPF-related system calls are concentrated in `bpf()`, and they are further distinguished by the parameter `cmd`. The current support is as follows:
 
 ```rust
 pub fn bpf(cmd: bpf_cmd, attr: &bpf_attr) -> Result<usize> {
@@ -145,7 +141,7 @@ pub fn bpf(cmd: bpf_cmd, attr: &bpf_attr) -> Result<usize> {
 }
 ```
 
-其中对创建Map命令会再次细分，以确定具体的Map类型，目前我们对通用的Map基本添加了支持:
+Among these, the command for creating a Map is further细分 to determine the specific Map type. Currently, we have added support for general Maps:
 
 ```rust
 bpf_map_type::BPF_MAP_TYPE_ARRAY 
@@ -166,7 +162,7 @@ bpf_map_type::BPF_MAP_TYPE_CPUMAP
 }
 ```
 
-所有的Map都会实现定义好的接口，这个接口参考Linux的实现定义:
+All Maps implement the defined interface, which is referenced from the Linux implementation:
 
 ```rust
 pub trait BpfMapCommonOps: Send + Sync + Debug + CastFromSync {
@@ -235,9 +231,7 @@ pub trait BpfMapCommonOps: Send + Sync + Debug + CastFromSync {
 }
 ```
 
-联通eBPF和kprobe的系统调用是[`perf_event_open`](https://man7.org/linux/man-pages/man2/perf_event_open.2.html)，这个系统调用在Linux中非常复杂，因此Dragon中并没有按照Linux进行实现，目前只支持其中两个功能:
-
-
+The system call that connects eBPF and kprobe is [`perf_event_open`](https://man7.org/linux/man-pages/man2/perf_event_open.2.html). This system call is very complex in Linux, so DragonOS does not implement it according to Linux. Currently, only two functions are supported:
 
 ```rust
 match args.type_ {
@@ -260,10 +254,10 @@ match args.type_ {
 }
 ```
 
-- 其中一个`PERF_TYPE_SOFTWARE`是用来创建软件定义的事件，`PERF_COUNT_SW_BPF_OUTPUT` 确保这个事件用来采集bpf的输出。
-- `PERF_TYPE_MAX` 通常指示创建kprobe/uprobe事件，也就是用户程序使用kprobe的途径之一，用户程序可以将eBPF程序绑定在这个事件上
+- One of them, `PERF_TYPE_SOFTWARE`, is used to create software-defined events, and `PERF_COUNT_SW_BPF_OUTPUT` ensures that this event is used to collect the output of bpf.
+- `PERF_TYPE_MAX` usually indicates the creation of kprobe/uprobe events, which is one of the ways users can use kprobe. Users can bind an eBPF program to this event.
 
-同样的，perf不同的事件也实现定义的接口:
+Similarly, different events of perf also implement the defined interface:
 
 ```rust
 pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom {
@@ -285,13 +279,13 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom {
 }
 ```
 
-这个接口目前并不稳定。
+This interface is currently not stable.
 
-### helper函数支持
+### Helper Function Support
 
-用户态工具通过系统调用和内核进行通信，完成eBPF数据的设置、交换。在内核中，eBPF程序的运行也需要内核的帮助，单独的eBPF程序并没有什么太大的用处，因此其会调用内核提供的`helper` 函数完成对内核资源的访问。
+User-space tools communicate with the kernel through system calls to set up and exchange eBPF data. In the kernel, the execution of eBPF programs also requires the help of the kernel. A standalone eBPF program is not very useful, so it calls the kernel-provided `helper` functions to access kernel resources.
 
-目前已经支持的大多数`helper` 函数是与Map操作相关:
+Most of the currently supported `helper` functions are related to Map operations:
 
 ```rust
 /// Initialize the helper functions.
@@ -321,4 +315,3 @@ pub fn init_helper_functions() {
     BPF_HELPER_FUN_SET.init(map);
 }
 ```
-

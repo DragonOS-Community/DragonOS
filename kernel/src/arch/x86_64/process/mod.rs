@@ -4,21 +4,21 @@ use core::{
     arch::asm,
     intrinsics::unlikely,
     mem::ManuallyDrop,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
 };
 
 use alloc::sync::{Arc, Weak};
 
 use kdepends::memoffset::offset_of;
-use log::{error, info, warn};
+use log::{error, warn};
 use system_error::SystemError;
 use x86::{controlregs::Cr4, segmentation::SegmentSelector};
 
 use crate::{
     arch::process::table::TSSManager,
     exception::InterruptArch,
-    libs::spinlock::SpinLockGuard,
-    mm::VirtAddr,
+    libs::spinlock::{SpinLock, SpinLockGuard},
+    mm::{percpu::PerCpu, VirtAddr},
     process::{
         fork::{CloneFlags, KernelCloneArgs},
         KernelStack, ProcessControlBlock, ProcessFlags, ProcessManager, PROCESS_SWITCH_RESULT,
@@ -28,6 +28,7 @@ use crate::{
 };
 
 use self::{
+    io_bitmap::TaskIoBitmap,
     kthread::kernel_thread_bootstrap_stage1,
     syscall::ARCH_SET_FS,
     table::{switch_fs_and_gs, KERNEL_DS, USER_DS},
@@ -39,6 +40,7 @@ use super::{
 };
 
 pub mod idle;
+pub mod io_bitmap;
 pub mod kthread;
 pub mod syscall;
 pub mod table;
@@ -60,6 +62,100 @@ union InitProcUnion {
 static BSP_IDLE_STACK_SPACE: InitProcUnion = InitProcUnion {
     idle_stack: [0; 32768],
 };
+
+/// x86 debug register primitives (ptrace hardware breakpoints).
+///
+/// DR0-3/DR7 are loaded per task by the context switch.
+pub mod debugreg {
+    /// Write the given debug register (DR0-3/DR7 only).
+    #[inline]
+    pub unsafe fn write_dr(n: usize, val: u64) {
+        match n {
+            0 => unsafe { core::arch::asm!("mov dr0, {0}", in(reg) val, options(nomem, nostack)) },
+            1 => unsafe { core::arch::asm!("mov dr1, {0}", in(reg) val, options(nomem, nostack)) },
+            2 => unsafe { core::arch::asm!("mov dr2, {0}", in(reg) val, options(nomem, nostack)) },
+            3 => unsafe { core::arch::asm!("mov dr3, {0}", in(reg) val, options(nomem, nostack)) },
+            7 => unsafe { core::arch::asm!("mov dr7, {0}", in(reg) val, options(nomem, nostack)) },
+            _ => {}
+        }
+    }
+    /// Write DR7. The write is serializing; call only when necessary.
+    #[inline]
+    pub unsafe fn write_dr7(val: u64) {
+        unsafe { core::arch::asm!("mov dr7, {0}", in(reg) val, options(nomem, nostack)) }
+    }
+}
+
+/// Per-CPU shadow of the current hardware DR7
+static CPU_DR7: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
+// The boot CPU and APs must install a known hardware state once before relying
+// on the zero shadow; firmware/bootloader debug state is not part of our ABI.
+static CPU_DR7_INITIALIZED: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicBool::new(false) }; PerCpu::MAX_CPU_NUM as usize];
+static CPU_DEBUG_OWNER_GENERATION: [AtomicU64; PerCpu::MAX_CPU_NUM as usize] =
+    [const { AtomicU64::new(0) }; PerCpu::MAX_CPU_NUM as usize];
+
+/// Per-CPU DR7 shadow slot; accessed only with IRQs off on the local CPU.
+#[inline]
+pub(crate) fn cpu_dr7() -> &'static AtomicU64 {
+    &CPU_DR7[crate::smp::core::smp_get_processor_id().data() as usize]
+}
+
+#[inline]
+pub(crate) fn cpu_debug_owner_generation() -> &'static AtomicU64 {
+    &CPU_DEBUG_OWNER_GENERATION[crate::smp::core::smp_get_processor_id().data() as usize]
+}
+
+/// Restore the current task's latest debug-register state immediately before
+/// returning to userspace. The pending flag keeps context switch from arming
+/// DR7 while signal/ptrace work may schedule.
+pub(crate) fn restore_current_debug_regs() {
+    let _irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    let current = ProcessManager::current_pcb();
+    current.flags().remove(ProcessFlags::PENDING_DEBUG);
+    unsafe { load_task_debug_regs(&current) };
+}
+
+/// Clear local hardware state while exec replaces the current task image.
+/// The saved task state and pending record have already been cleared.
+pub(crate) fn clear_current_debug_regs(task: &ProcessControlBlock) {
+    let _irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    unsafe { debugreg::write_dr7(0) };
+    cpu_dr7().store(0, Ordering::Relaxed);
+    cpu_debug_owner_generation().store(task.ptrace_session_generation(), Ordering::Relaxed);
+}
+
+unsafe fn load_task_debug_regs(task: &ProcessControlBlock) {
+    debug_assert!(!CurrentIrqArch::is_irq_enabled());
+    let initialized =
+        &CPU_DR7_INITIALIZED[crate::smp::core::smp_get_processor_id().data() as usize];
+    let generation = task.ptrace_session_generation();
+    cpu_debug_owner_generation().store(generation, Ordering::Relaxed);
+    let should_load = task.flags().contains(ProcessFlags::HW_DEBUG_REGS)
+        && !task.flags().contains(ProcessFlags::PENDING_DEBUG);
+    if should_load {
+        let mut dr = task.ptrace_debug_regs_snapshot();
+        dr[6] = 0;
+        dr[7] &= !crate::process::ptrace::DR_CONTROL_RESERVED;
+        cpu_dr7().store(dr[7], Ordering::Relaxed);
+        compiler_fence(Ordering::SeqCst);
+        unsafe {
+            debugreg::write_dr(0, dr[0]);
+            debugreg::write_dr(1, dr[1]);
+            debugreg::write_dr(2, dr[2]);
+            debugreg::write_dr(3, dr[3]);
+            debugreg::write_dr(7, dr[7]);
+        }
+        initialized.store(true, Ordering::Relaxed);
+    } else if !initialized.load(Ordering::Relaxed) || cpu_dr7().load(Ordering::Relaxed) != 0 {
+        // Avoid a debug-register VM exit when an ordinary task follows another
+        // ordinary task. A previous breakpoint owner must still be disarmed.
+        unsafe { debugreg::write_dr7(0) };
+        cpu_dr7().store(0, Ordering::Relaxed);
+        initialized.store(true, Ordering::Relaxed);
+    }
+}
 
 /// PCB中与架构相关的信息
 #[derive(Debug)]
@@ -83,10 +179,15 @@ pub struct ArchPCBInfo {
     gsdata: X86_64GSData,
     /// 浮点寄存器的状态
     fp_state: Option<FpState>,
+    /// x86 I/O permission bitmap shared with forked user tasks.
+    io_bitmap: Option<Arc<SpinLock<TaskIoBitmap>>>,
 }
 
 #[allow(dead_code)]
 impl ArchPCBInfo {
+    pub fn kernel_rsp(&self) -> usize {
+        self.rsp
+    }
     /// 创建一个新的ArchPCBInfo
     ///
     /// ## 参数
@@ -118,6 +219,7 @@ impl ArchPCBInfo {
             fs: KERNEL_DS,
             gs: KERNEL_DS,
             fp_state: None,
+            io_bitmap: None,
         };
 
         r.rsp = kstack.stack_max_address().data() - 8;
@@ -184,17 +286,150 @@ impl ArchPCBInfo {
     pub unsafe fn save_fsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.fsbase = x86::current::segmentation::rdfsbase() as usize;
+        } else if self.fs.bits() != 0 {
+            // Without FSGSBASE a non-null selector supplies the hidden base
+            // from its descriptor. Linux does not preserve a stale MSR base
+            // for this legacy state.
+            self.fsbase = 0;
         } else {
             self.fsbase = x86::msr::rdmsr(x86::msr::IA32_FS_BASE) as usize;
         }
     }
 
+    pub(crate) unsafe fn save_fs_selector(&mut self) {
+        let selector: u16;
+        core::arch::asm!("mov {0:x}, fs", out(reg) selector, options(nostack, preserves_flags));
+        self.fs = SegmentSelector::from_raw(selector);
+    }
+
+    pub(crate) unsafe fn save_gs_selector(&mut self) {
+        let selector: u16;
+        core::arch::asm!("mov {0:x}, gs", out(reg) selector, options(nostack, preserves_flags));
+        self.gs = SegmentSelector::from_raw(selector);
+    }
+
+    /// Load a user-controlled selector with an exception-table fallback.
+    /// Linux accepts any selector whose low 16 bits are zero or have RPL 3;
+    /// a missing GDT/LDT descriptor is therefore handled at load time by
+    /// clearing the hardware selector instead of faulting in kernel mode.
+    pub(crate) unsafe fn restore_fs_selector(&mut self) {
+        let selector = Self::load_fs_selector_with_fixup(self.fs.bits());
+        self.fs = SegmentSelector::from_raw(selector);
+    }
+
+    pub(crate) unsafe fn restore_gs_selector(&mut self) {
+        let selector = Self::load_gs_selector_with_fixup(self.gs.bits());
+        self.gs = SegmentSelector::from_raw(selector);
+    }
+
+    pub(crate) unsafe fn load_fs_selector_with_fixup(mut selector: u16) -> u16 {
+        core::arch::asm!(
+            "2: mov fs, {selector:x}",
+            "jmp 3f",
+            "4: mov {selector:x}, 0",
+            "mov fs, {selector:x}",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            selector = inout(reg) selector,
+            options(nostack, preserves_flags)
+        );
+        selector
+    }
+
+    pub(crate) unsafe fn load_gs_selector_with_fixup(mut selector: u16) -> u16 {
+        core::arch::asm!(
+            "2: mov gs, {selector:x}",
+            "jmp 3f",
+            "4: mov {selector:x}, 0",
+            "mov gs, {selector:x}",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            selector = inout(reg) selector,
+            options(nostack, preserves_flags)
+        );
+        selector
+    }
+
+    /// Restore the user GS selector while kernel GS is active.
+    ///
+    /// `mov gs, selector` changes the active hidden GS base. Kernel entry code
+    /// runs with the per-CPU GS base active, so mirror Linux's load_gs_index()
+    /// and modify the inactive user side between a balanced swapgs pair.
+    pub(crate) unsafe fn load_user_gs_selector_with_fixup(selector: u16) -> u16 {
+        let irq_guard = CurrentIrqArch::save_and_disable_irq();
+        core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        let selector = Self::load_gs_selector_with_fixup(selector);
+        core::arch::asm!("swapgs", options(nostack, preserves_flags));
+        drop(irq_guard);
+        selector
+    }
+
+    pub(crate) unsafe fn load_ds_selector_with_fixup(mut selector: u16) -> u16 {
+        core::arch::asm!(
+            "2: mov ds, {selector:x}",
+            "jmp 3f",
+            "4: mov {selector:x}, 0",
+            "mov ds, {selector:x}",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            selector = inout(reg) selector,
+            options(nostack, preserves_flags)
+        );
+        selector
+    }
+
+    pub(crate) unsafe fn load_es_selector_with_fixup(mut selector: u16) -> u16 {
+        core::arch::asm!(
+            "2: mov es, {selector:x}",
+            "jmp 3f",
+            "4: mov {selector:x}, 0",
+            "mov es, {selector:x}",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            selector = inout(reg) selector,
+            options(nostack, preserves_flags)
+        );
+        selector
+    }
+
     pub unsafe fn save_gsbase(&mut self) {
         if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) {
             self.gsbase = x86::current::segmentation::rdgsbase() as usize;
+        } else if self.gs.bits() != 0 {
+            self.gsbase = 0;
         } else {
             self.gsbase = x86::msr::rdmsr(x86::msr::IA32_GS_BASE) as usize;
         }
+    }
+
+    /// Save user GS base while in kernel context (after swapgs)
+    pub unsafe fn save_user_gsbase(&mut self) {
+        if !x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE) && self.gs.bits() != 0 {
+            self.gsbase = 0;
+        } else {
+            self.gsbase = x86::msr::rdmsr(x86::msr::IA32_KERNEL_GSBASE) as usize;
+        }
+    }
+
+    /// Write user GS base from kernel context: goes to IA32_KERNEL_GSBASE
+    pub unsafe fn restore_user_gsbase(&mut self) {
+        x86::msr::wrmsr(x86::msr::IA32_KERNEL_GSBASE, self.gsbase as u64);
     }
 
     pub unsafe fn restore_fsbase(&mut self) {
@@ -203,6 +438,22 @@ impl ArchPCBInfo {
         } else {
             x86::msr::wrmsr(x86::msr::IA32_FS_BASE, self.fsbase as u64);
         }
+    }
+
+    /// Clear the FS segment selector (hardware register and field)
+    pub unsafe fn load_fs_selector_zero(&mut self) {
+        self.fs = SegmentSelector::new(0, x86::Ring::Ring0);
+        unsafe {
+            core::arch::asm!("mov fs, {0:x}", in(reg) 0u16, options(nostack, preserves_flags))
+        };
+    }
+
+    /// Clear the GS segment selector
+    pub unsafe fn load_gs_selector_zero(&mut self) {
+        self.gs = SegmentSelector::new(0, x86::Ring::Ring0);
+        unsafe {
+            core::arch::asm!("mov gs, {0:x}", in(reg) 0u16, options(nostack, preserves_flags))
+        };
     }
 
     pub unsafe fn restore_gsbase(&mut self) {
@@ -234,12 +485,73 @@ impl ArchPCBInfo {
         self.gsbase
     }
 
+    /// Base exposed for a stopped task through ptrace. On legacy CPUs a
+    /// non-null selector owns the hidden base; DragonOS has no per-task TLS
+    /// GDT or LDT descriptors, so every such descriptor base is zero.
+    pub(crate) fn ptrace_fsbase(&self) -> usize {
+        if unsafe { x86::controlregs::cr4() }.contains(Cr4::CR4_ENABLE_FSGSBASE)
+            || self.fs.bits() == 0
+        {
+            self.fsbase
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn ptrace_gsbase(&self) -> usize {
+        if unsafe { x86::controlregs::cr4() }.contains(Cr4::CR4_ENABLE_FSGSBASE)
+            || self.gs.bits() == 0
+        {
+            self.gsbase
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn fs_selector(&self) -> u16 {
+        self.fs.bits()
+    }
+
+    pub(crate) fn gs_selector(&self) -> u16 {
+        self.gs.bits()
+    }
+
+    /// Set user FS base (ptrace SETREGS write path).
+    pub fn set_fsbase(&mut self, base: usize) {
+        self.fsbase = base;
+    }
+
+    /// Set user GS base (same semantics as set_fsbase).
+    pub fn set_gsbase(&mut self, base: usize) {
+        self.gsbase = base;
+    }
+
+    pub(crate) fn set_fs_selector(&mut self, selector: u16) {
+        self.fs = SegmentSelector::from_raw(selector);
+    }
+
+    pub(crate) fn set_gs_selector(&mut self, selector: u16) {
+        self.gs = SegmentSelector::from_raw(selector);
+    }
+
     pub fn cr2_mut(&mut self) -> &mut usize {
         &mut self.cr2
     }
 
     pub fn fp_state_mut(&mut self) -> &mut Option<FpState> {
         &mut self.fp_state
+    }
+
+    pub fn io_bitmap(&self) -> Option<Arc<SpinLock<TaskIoBitmap>>> {
+        self.io_bitmap.clone()
+    }
+
+    pub fn io_bitmap_ref(&self) -> Option<&Arc<SpinLock<TaskIoBitmap>>> {
+        self.io_bitmap.as_ref()
+    }
+
+    pub fn set_io_bitmap(&mut self, bitmap: Option<Arc<SpinLock<TaskIoBitmap>>>) {
+        self.io_bitmap = bitmap;
     }
 
     /// ### 克隆ArchPCBInfo,需要注意gsdata也是对应clone的
@@ -259,8 +571,20 @@ impl ArchPCBInfo {
             gsbase: self.gsbase,
             fs: self.fs,
             gs: self.gs,
-            gsdata: self.gsdata.clone(),
             fp_state: self.fp_state,
+            gsdata: self.gsdata.clone(),
+            io_bitmap: self.io_bitmap.clone(),
+        }
+    }
+
+    pub fn sync_current_state_before_fork(&mut self) {
+        unsafe {
+            self.save_fs_selector();
+            self.save_fsbase();
+            self.save_gs_selector();
+            // fork runs in syscall context (after swapgs), so the true user gsbase
+            // lives in IA32_KERNEL_GSBASE; save_user_gsbase is required.
+            self.save_user_gsbase();
         }
     }
 
@@ -339,9 +663,17 @@ impl ProcessManager {
             *trap_frame_ptr = child_trapframe;
         }
 
-        // 获取并拷贝父进程的架构信息
-        // 注意：需要使用mut guard以便保存FP状态
         let mut current_arch_guard = current_pcb.arch_info_irqsave();
+
+        // Copy the parent's arch info
+        // Note: the guard must be mut to save FP state
+        unsafe {
+            current_arch_guard.save_fs_selector();
+            current_arch_guard.save_fsbase();
+            current_arch_guard.save_gs_selector();
+            // Synchronous fork: read the true user gsbase from IA32_KERNEL_GSBASE
+            current_arch_guard.save_user_gsbase();
+        }
 
         // 在拷贝FP状态之前，先从硬件寄存器保存当前的FP状态
         // 这样确保即使在信号处理函数中fork，子进程也能继承fork时刻的真实FP寄存器状态
@@ -352,6 +684,7 @@ impl ProcessManager {
         new_arch_guard.fs = current_arch_guard.fs;
         new_arch_guard.gs = current_arch_guard.gs;
         new_arch_guard.fp_state = current_arch_guard.fp_state;
+        new_arch_guard.io_bitmap = current_arch_guard.io_bitmap.clone();
 
         // 拷贝浮点寄存器的状态
         if let Some(fp_state) = current_arch_guard.fp_state.as_ref() {
@@ -361,6 +694,7 @@ impl ProcessManager {
 
         // 设置返回地址（子进程开始执行的指令地址）
         if new_pcb.flags().contains(ProcessFlags::KTHREAD) {
+            new_arch_guard.io_bitmap = None;
             let kthread_bootstrap_stage1_func_addr = kernel_thread_bootstrap_stage1 as usize;
             new_arch_guard.rip = kthread_bootstrap_stage1_func_addr;
         } else {
@@ -390,43 +724,83 @@ impl ProcessManager {
         // 切换浮点寄存器
         next.arch_info_irqsave().restore_fp_state();
 
-        // 切换fsbase
-        prev.arch_info_irqsave().save_fsbase();
-        next.arch_info_irqsave().restore_fsbase();
+        // Loading a selector can replace its hidden base. Preserve Linux's
+        // selector-before-base ordering when installing the next FS state.
+        let prev_fs_selector = {
+            let mut prev_arch = prev.arch_info_irqsave();
+            prev_arch.save_fs_selector();
+            prev_arch.save_fsbase();
+            prev_arch.fs_selector()
+        };
+        {
+            let mut next_arch = next.arch_info_irqsave();
+            let requested_fs_selector = next_arch.fs_selector();
+            if prev_fs_selector != 0 || requested_fs_selector != 0 {
+                next_arch.restore_fs_selector();
+            }
+            if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE)
+                || requested_fs_selector <= 3
+            {
+                next_arch.restore_fsbase();
+            }
+        }
 
         // 切换gsbase
         Self::switch_gsbase(&prev, &next);
 
+        // Switch hardware debug registers (ptrace POKEUSER breakpoints):
+        // a task with HW_DEBUG_REGS loads its DR0-3/DR7 on switch-in.
+        unsafe { load_task_debug_regs(&next) };
+
         // 切换地址空间（无锁快速路径）
-        let next_addr_space = next.basic().user_vm().unwrap();
-        let prev_addr_space = prev.basic().user_vm();
+        let next_addr_space = next.basic().user_vm();
+        let prev_user_vm = prev.basic().user_vm();
+        let prev_active_mm = prev_user_vm
+            .clone()
+            .or_else(crate::mm::tlb::tlb_state_loaded_mm);
         let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
-        // INV-1: clear prev mm's bit before switching hardware page table (if prev/next differ),
-        // set next mm's bit after switching.
-        // Order: clear(prev) → set CR3 → set(next) → update per-CPU TlbState.
+        // INV-1: before loading a different user mm, mark this CPU active in the
+        // next mm so concurrent remote shootdowns cannot miss the CPU after CR3
+        // changes. Keep the previous bit until after the hardware switch; the
+        // temporary double membership is safe and may only cause an extra IPI.
+        // Order: set(next) → set CR3 → clear(prev) → update per-CPU TlbState.
         //
-        // Note: if prev and next point to the same mm (same-address-space thread switch), keep the bit unchanged.
-        let same_mm = match prev_addr_space.as_ref() {
-            Some(p) => Arc::ptr_eq(p, &next_addr_space),
-            None => false,
+        // If next has no user mm, keep the current loaded mm in lazy-TLB mode.
+        let same_mm = match (prev_active_mm.as_ref(), next_addr_space.as_ref()) {
+            (Some(p), Some(n)) => Arc::ptr_eq(p, n),
+            _ => false,
         };
 
-        if !same_mm {
-            if let Some(prev_mm) = prev_addr_space.as_ref() {
-                prev_mm.active_cpus_clear(cpu);
+        let retire_lazy_mm = prev_user_vm.is_none() && next_addr_space.is_some() && !same_mm;
+
+        if let Some(next_mm) = next_addr_space {
+            if !same_mm {
+                next_mm.active_cpus_set(cpu);
             }
-        }
 
-        next_addr_space.make_current();
-        compiler_fence(Ordering::SeqCst);
+            next_mm.make_current();
+            compiler_fence(Ordering::SeqCst);
 
-        if !same_mm {
-            next_addr_space.active_cpus_set(cpu);
+            if !same_mm {
+                if let Some(prev_mm) = prev_active_mm.as_ref() {
+                    prev_mm.active_cpus_clear(cpu);
+                }
+            }
+            // Update per-CPU TlbState: hardware-loaded mm and generation
+            crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone());
         }
-        // Update per-CPU TlbState: hardware-loaded mm and generation
-        crate::mm::tlb::tlb_state_set_loaded_mm(next_addr_space.clone());
+        // Hardware/per-CPU ownership is established. A terminal switch cannot
+        // leave temporary mm owners awaiting destruction on the abandoned stack.
+        drop(prev_user_vm);
+        if retire_lazy_mm {
+            if let Some(mm) = prev_active_mm {
+                crate::mm::lazy_mm_drop::enqueue(mm);
+            }
+        } else {
+            drop(prev_active_mm);
+        }
         compiler_fence(Ordering::SeqCst);
         // 切换内核栈
 
@@ -445,6 +819,7 @@ impl ProcessManager {
             x86::Ring::Ring0,
             next.kernel_stack().stack_max_address().data() as u64,
         );
+        TSSManager::invalidate_io_bitmap();
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().prev_pcb = Some(prev);
         PROCESS_SWITCH_RESULT.as_mut().unwrap().get_mut().next_pcb = Some(next);
         // debug!("switch tss ok");
@@ -455,10 +830,26 @@ impl ProcessManager {
 
     unsafe fn switch_gsbase(prev: &Arc<ProcessControlBlock>, next: &Arc<ProcessControlBlock>) {
         asm!("swapgs", options(nostack, preserves_flags));
-        prev.arch_info_irqsave().save_gsbase();
-        next.arch_info_irqsave().restore_gsbase();
-        // 将下一个进程的kstack写入kernel_gsbase
-        next.arch_info_irqsave().store_kernel_gsbase();
+        let prev_gs_selector = {
+            let mut prev_arch = prev.arch_info_irqsave();
+            prev_arch.save_gs_selector();
+            prev_arch.save_gsbase();
+            prev_arch.gs_selector()
+        };
+        {
+            let mut next_arch = next.arch_info_irqsave();
+            let requested_gs_selector = next_arch.gs_selector();
+            if prev_gs_selector != 0 || requested_gs_selector != 0 {
+                next_arch.restore_gs_selector();
+            }
+            if x86::controlregs::cr4().contains(Cr4::CR4_ENABLE_FSGSBASE)
+                || requested_gs_selector <= 3
+            {
+                next_arch.restore_gsbase();
+            }
+            // 将下一个进程的kstack写入kernel_gsbase
+            next_arch.store_kernel_gsbase();
+        }
         asm!("swapgs", options(nostack, preserves_flags));
     }
 }
@@ -489,13 +880,6 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
 
         mov [rdi + {off_r15}], r15
         mov r15, [rsi + {off_r15}]
-
-        // switch segment registers (这些寄存器只能通过接下来的switch_hook的return来切换)
-        mov [rdi + {off_fs}], fs
-        mov [rdi + {off_gs}], gs
-
-        // mov fs, [rsi + {off_fs}]
-        // mov gs, [rsi + {off_gs}]
 
         mov [rdi + {off_rbp}], rbp
         mov rbp, [rsi + {off_rbp}]
@@ -535,9 +919,6 @@ unsafe extern "sysv64" fn switch_to_inner(prev: *mut ArchPCBInfo, next: *mut Arc
         off_rsp = const(offset_of!(ArchPCBInfo, rsp)),
         off_r15 = const(offset_of!(ArchPCBInfo, r15)),
         off_rip = const(offset_of!(ArchPCBInfo, rip)),
-        off_fs = const(offset_of!(ArchPCBInfo, fs)),
-        off_gs = const(offset_of!(ArchPCBInfo, gs)),
-
         switch_hook = sym crate::process::switch_finish_hook,
     );
 }
@@ -583,8 +964,8 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     arch_guard.store_kernel_gsbase();
 
     switch_fs_and_gs(
-        SegmentSelector::from_bits_truncate(arch_guard.fs.bits()),
-        SegmentSelector::from_bits_truncate(arch_guard.gs.bits()),
+        SegmentSelector::from_raw(arch_guard.fs.bits()),
+        SegmentSelector::from_raw(arch_guard.gs.bits()),
     );
     arch_guard.rip = new_rip.data();
 
@@ -596,7 +977,7 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     // 重要！在这里之后，一定要保证上面的引用计数变量、动态申请的变量、锁的守卫都被drop了，否则可能导致内存安全问题！
 
     compiler_fence(Ordering::SeqCst);
-    crate::rcu::note_exit_to_user_mode();
+    TSSManager::update_io_bitmap_from_current();
     ready_to_switch_to_user(trap_frame, trap_frame_vaddr.data(), new_rip.data());
 }
 
@@ -662,20 +1043,17 @@ pub(crate) fn stop_this_cpu() -> ! {
         CurrentIrqArch::interrupt_disable();
     }
 
-    crate::rcu::cpu_offline(cpu_id);
-    // 将当前cpu标记为offline
-    smp_cpu_manager().set_online_cpu(cpu_id, false);
+    smp_cpu_manager().begin_shutdown_current_cpu(cpu_id);
+    crate::arch::kvm_para::shutdown_time();
     CurrentApic.disable_local_apic();
+    smp_cpu_manager().complete_shutdown_current_cpu(cpu_id);
 
+    // The halt loop must be instruction-only: this function may be entered
+    // from the panic path, including memory exhaustion with interrupts
+    // disabled. Every wakeup must not print or allocate memory again.
     loop {
-        native_halt();
-    }
-}
-
-#[inline(always)]
-fn native_halt() {
-    info!("Starting System Halt...");
-    unsafe {
-        asm!("hlt", options(nomem, nostack, preserves_flags));
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 }

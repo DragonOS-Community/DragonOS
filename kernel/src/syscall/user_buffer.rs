@@ -2,24 +2,48 @@
 //!
 //! 提供对用户空间缓冲区的安全访问接口，所有操作都通过异常表保护
 
-use crate::mm::VirtAddr;
+use crate::mm::{access_ok, VirtAddr};
 use num::traits::FromBytes;
 use system_error::SystemError;
 
-/// 用户空间缓冲区的安全包装
-///
-/// 这个类型封装了对用户空间内存的访问，确保所有读写操作
-/// 都通过异常表机制处理可能的页错误
+use super::iov::IoVecs;
+
+enum UserBufferBacking<'a> {
+    Contiguous(VirtAddr),
+    Vectored(&'a IoVecs),
+}
+
 pub struct UserBuffer<'a> {
-    /// 用户空间地址
-    user_addr: VirtAddr,
+    backing: UserBufferBacking<'a>,
     /// 缓冲区长度
     len: usize,
-    /// 生命周期标记
-    _phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> UserBuffer<'a> {
+    /// Build an address-only protected userspace buffer.
+    ///
+    /// Unlike `UserBufferWriter`, this does not construct a Rust slice over
+    /// the user range. Individual accesses remain exception-table protected,
+    /// so a range containing a later unmapped page can safely report EFAULT
+    /// at the exact copy operation.
+    pub fn new_protected<U>(
+        addr: *mut U,
+        len: usize,
+        from_user: bool,
+    ) -> Result<Self, SystemError> {
+        if len != 0 && addr.is_null() {
+            return Err(SystemError::EFAULT);
+        }
+        let user_addr = VirtAddr::new(addr as usize);
+        if from_user {
+            access_ok(user_addr, len).map_err(|_| SystemError::EFAULT)?;
+        }
+        Ok(Self {
+            backing: UserBufferBacking::Contiguous(user_addr),
+            len,
+        })
+    }
+
     /// 创建一个新的用户缓冲区包装
     ///
     /// # 参数
@@ -30,9 +54,21 @@ impl<'a> UserBuffer<'a> {
     /// 调用者必须确保地址和长度是有效的用户空间范围
     pub(crate) unsafe fn new(addr: VirtAddr, len: usize) -> Self {
         Self {
-            user_addr: addr,
+            backing: UserBufferBacking::Contiguous(addr),
             len,
-            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Borrow a validated snapshot without allocating a second segment table.
+    /// The caller retains `vectors` until this logical buffer is no longer used.
+    pub(crate) fn new_vectored(vectors: &'a IoVecs, len: usize) -> Self {
+        assert!(
+            len <= vectors.total_len(),
+            "logical buffer exceeds iovec snapshot"
+        );
+        Self {
+            backing: UserBufferBacking::Vectored(vectors),
+            len,
         }
     }
 
@@ -47,7 +83,143 @@ impl<'a> UserBuffer<'a> {
     }
 
     pub fn user_addr(&self) -> VirtAddr {
-        self.user_addr
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => *addr,
+            UserBufferBacking::Vectored(segments) => segments
+                .iter()
+                .find(|segment| segment.iov_len != 0)
+                .map(|segment| VirtAddr::new(segment.iov_base as usize))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Only legacy scalar adapters may interpret this buffer as one range.
+    pub fn as_contiguous_address(&self) -> Option<VirtAddr> {
+        match self.backing {
+            UserBufferBacking::Contiguous(addr) => Some(addr),
+            UserBufferBacking::Vectored(_) => None,
+        }
+    }
+
+    /// OR alignment used by legacy direct-I/O owners (notably FAT). Empty
+    /// segments do not contribute, matching Linux iov_iter_alignment().
+    pub(crate) fn alignment(&self, len: usize) -> usize {
+        self.alignment_at(0, len)
+    }
+
+    pub(crate) fn alignment_at(&self, offset: usize, len: usize) -> usize {
+        let mut result = 0;
+        self.visit_range(offset, len, |address, count| {
+            if count != 0 {
+                result |= address | count;
+            }
+            true
+        });
+        result
+    }
+
+    /// Block direct I/O checks address and length masks separately, including
+    /// still-present empty segments. This intentionally differs from the OR
+    /// alignment above, as do Linux's bdev_iter_is_aligned() and legacy DIO.
+    pub(crate) fn is_aligned_at(
+        &self,
+        offset: usize,
+        len: usize,
+        address_mask: usize,
+        length_mask: usize,
+    ) -> bool {
+        let mut aligned = true;
+        self.visit_range(offset, len, |address, count| {
+            aligned = address & address_mask == 0 && count & length_mask == 0;
+            aligned
+        });
+        aligned
+    }
+
+    fn visit_range(&self, offset: usize, len: usize, mut visit: impl FnMut(usize, usize) -> bool) {
+        let mut remaining = len.min(self.len.saturating_sub(offset));
+        if remaining == 0 {
+            return;
+        }
+        match &self.backing {
+            UserBufferBacking::Contiguous(address) => {
+                visit(address.data() + offset, remaining);
+            }
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                for segment in segments.iter() {
+                    // Protected copy/zero iteration consumes the last positive
+                    // segment, then stops at its immediate successor. A zero
+                    // segment at that exact boundary remains in the suffix,
+                    // unlike Linux's separate explicit iov_iter_advance path.
+                    if skip != 0 && skip >= segment.iov_len {
+                        skip -= segment.iov_len;
+                        continue;
+                    }
+                    let count = remaining.min(segment.iov_len - skip);
+                    if !visit(segment.iov_base as usize + skip, count) {
+                        break;
+                    }
+                    skip = 0;
+                    remaining -= count;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copy a byte prefix without changing whole-record copy semantics.
+    /// Inaccessible later segments stop the logical input at the actual fault.
+    pub fn read_prefix_from_user(
+        &self,
+        offset: usize,
+        dst: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        if offset > self.len {
+            return Err(SystemError::EINVAL);
+        }
+        let copy_len = dst.len().min(self.len - offset);
+        if copy_len == 0 {
+            return Ok(0);
+        }
+        let copy = |address, bytes: &mut [u8]| unsafe {
+            crate::syscall::user_access::copy_from_user_prefix_protected(bytes, address)
+        };
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => copy(*addr + offset, &mut dst[..copy_len]),
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut copied = 0;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
+                        continue;
+                    }
+                    let want = (segment.iov_len - skip).min(copy_len - copied);
+                    let n = match copy(
+                        VirtAddr::new(segment.iov_base as usize) + skip,
+                        &mut dst[copied..copied + want],
+                    ) {
+                        Ok(n) => n,
+                        Err(SystemError::EFAULT) if copied != 0 => return Ok(copied),
+                        Err(error) => return Err(error),
+                    };
+                    copied += n;
+                    if n < want || copied == copy_len {
+                        return Ok(copied);
+                    }
+                    skip = 0;
+                }
+                // A constructed logical buffer must have sufficient capacity.
+                if copied != 0 {
+                    Ok(copied)
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
+        }
     }
 
     /// 从用户缓冲区读取数据到内核缓冲区
@@ -72,10 +244,40 @@ impl<'a> UserBuffer<'a> {
             return Ok(0);
         }
 
-        let src_addr = VirtAddr::new(self.user_addr.data() + offset);
-
-        unsafe {
-            crate::syscall::user_access::copy_from_user_protected(&mut dst[..copy_len], src_addr)
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => unsafe {
+                crate::syscall::user_access::copy_from_user_protected(
+                    &mut dst[..copy_len],
+                    *addr + offset,
+                )
+            },
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut copied = 0usize;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
+                        continue;
+                    }
+                    let chunk = (segment.iov_len - skip).min(copy_len - copied);
+                    unsafe {
+                        crate::syscall::user_access::copy_from_user_protected(
+                            &mut dst[copied..copied + chunk],
+                            VirtAddr::new(segment.iov_base as usize) + skip,
+                        )?;
+                    }
+                    copied += chunk;
+                    skip = 0;
+                    if copied == copy_len {
+                        break;
+                    }
+                }
+                if copied == copy_len {
+                    Ok(copied)
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
         }
     }
 
@@ -89,21 +291,85 @@ impl<'a> UserBuffer<'a> {
     /// - `Ok(len)`: 成功写入的字节数
     /// - `Err(SystemError)`: 写入失败（如地址不在VMA中）
     pub fn write_to_user(&mut self, offset: usize, src: &[u8]) -> Result<usize, SystemError> {
-        // offset == src.len is valid, as long as don't try to dereference it in &src[offset..]
+        self.write_output(offset, src, false, |address, bytes| unsafe {
+            crate::syscall::user_access::copy_to_user_protected(address, bytes)
+        })
+    }
+
+    /// Write a byte prefix and preserve progress across vector segments.
+    /// A record owner must use `write_to_user` instead, so a partial current
+    /// record cannot accidentally become a successful consumption commit.
+    pub fn write_prefix_to_user(
+        &mut self,
+        offset: usize,
+        src: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.write_output(offset, src, true, |address, bytes| unsafe {
+            crate::syscall::user_access::copy_to_user_prefix_protected(address, bytes)
+        })
+    }
+
+    /// Write a prefix without resolving user faults or taking MM locks.
+    /// Callers must release source locks before retrying an uncopied remainder
+    /// through `write_prefix_to_user`.
+    pub(crate) fn write_prefix_to_user_nofault(
+        &mut self,
+        offset: usize,
+        src: &[u8],
+    ) -> Result<usize, SystemError> {
+        self.write_output(offset, src, true, |address, bytes| unsafe {
+            crate::syscall::user_access::copy_to_user_prefix_nofault(address, bytes)
+        })
+    }
+
+    fn write_output(
+        &mut self,
+        offset: usize,
+        src: &[u8],
+        allow_partial: bool,
+        copy: impl Fn(VirtAddr, &[u8]) -> Result<usize, SystemError>,
+    ) -> Result<usize, SystemError> {
         if offset > self.len {
             return Err(SystemError::EINVAL);
         }
-
-        let available = self.len - offset;
-        let copy_len = core::cmp::min(src.len(), available);
-
+        let copy_len = src.len().min(self.len - offset);
         if copy_len == 0 {
             return Ok(0);
         }
-
-        let dst_addr = VirtAddr::new(self.user_addr.data() + offset);
-
-        unsafe { crate::syscall::user_access::copy_to_user_protected(dst_addr, &src[..copy_len]) }
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => copy(*addr + offset, &src[..copy_len]),
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut copied = 0;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
+                        continue;
+                    }
+                    let want = (segment.iov_len - skip).min(copy_len - copied);
+                    let n = match copy(
+                        VirtAddr::new(segment.iov_base as usize) + skip,
+                        &src[copied..copied + want],
+                    ) {
+                        Ok(n) => n,
+                        Err(_) if allow_partial && copied != 0 => return Ok(copied),
+                        Err(error) => return Err(error),
+                    };
+                    copied += n;
+                    if n < want || copied == copy_len {
+                        return Ok(copied);
+                    }
+                    skip = 0;
+                }
+                // Construction guarantees enough logical capacity. Keep an
+                // error for a violated contract, rather than inventing bytes.
+                if allow_partial && copied != 0 {
+                    Ok(copied)
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
+        }
     }
 
     /// 从用户缓冲区读取单个值
@@ -252,8 +518,38 @@ impl<'a> UserBuffer<'a> {
             return Ok(());
         }
 
-        let dst_addr = crate::mm::VirtAddr::new(self.user_addr.data() + offset);
-        unsafe { clear_user_cow_protected(dst_addr, clear_len) }.map(|_| ())
+        match &self.backing {
+            UserBufferBacking::Contiguous(addr) => {
+                unsafe { clear_user_cow_protected(*addr + offset, clear_len) }.map(|_| ())
+            }
+            UserBufferBacking::Vectored(segments) => {
+                let mut skip = offset;
+                let mut cleared = 0usize;
+                for segment in segments.iter() {
+                    if skip >= segment.iov_len {
+                        skip -= segment.iov_len;
+                        continue;
+                    }
+                    let chunk = (segment.iov_len - skip).min(clear_len - cleared);
+                    unsafe {
+                        clear_user_cow_protected(
+                            VirtAddr::new(segment.iov_base as usize) + skip,
+                            chunk,
+                        )?
+                    };
+                    cleared += chunk;
+                    skip = 0;
+                    if cleared == clear_len {
+                        break;
+                    }
+                }
+                if cleared == clear_len {
+                    Ok(())
+                } else {
+                    Err(SystemError::EFAULT)
+                }
+            }
+        }
     }
 
     /// 将整个用户缓冲区清零

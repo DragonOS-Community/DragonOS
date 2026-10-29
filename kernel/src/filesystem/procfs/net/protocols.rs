@@ -5,10 +5,12 @@
 //! DragonOS 目前没有 1:1 的 proto_list，采用“静态能力表 + 可扩展注册点”的方式提供
 //! 兼容的输出格式。
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::filesystem::{
     procfs::{
         template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_read,
+        utils::proc_snapshot_operation,
     },
     vfs::{FilePrivateData, IndexNode, InodeMode},
 };
@@ -150,14 +152,24 @@ impl ProtocolsFileOps {
 }
 
 impl FileOps for ProtocolsFileOps {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_protocols_content();
-        proc_read(offset, len, buf, &content)
+        // `seq_file` (Linux `proc_create_net(&proto_seq_ops)`, `net/core/sock.c`):
+        // one fd sees one rendered record.
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_protocols_content()))
     }
 }

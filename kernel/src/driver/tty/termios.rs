@@ -33,11 +33,17 @@ pub struct Termios {
     pub control_mode: ControlMode,
     pub local_mode: LocalMode,
     pub control_characters: [u8; CONTORL_CHARACTER_NUM],
+    /// Active line discipline (derived from c_line_abi).
     pub line: LineDisciplineType,
+    /// Raw ABI c_line value preserved across TCGETS/TCSETA round-trips.
+    /// Linux stores the c_line byte as-is; line discipline switching is
+    /// done via TIOCSETD, not by writing c_line in termios.
+    pub c_line_abi: u8,
     pub input_speed: u32,
     pub output_speed: u32,
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PosixTermios {
     pub c_iflag: u32,
@@ -49,69 +55,61 @@ pub struct PosixTermios {
 }
 
 impl PosixTermios {
-    pub fn from_kernel_termios(termios: Termios) -> Self {
+    pub fn from_kernel_termios(termios: &Termios) -> Self {
         Self {
             c_iflag: termios.input_mode.bits,
             c_oflag: termios.output_mode.bits,
             c_cflag: termios.control_mode.bits,
             c_lflag: termios.local_mode.bits,
             c_cc: termios.control_characters,
-            c_line: termios.line as u8,
+            c_line: termios.c_line_abi,
         }
     }
 
     pub fn to_kernel_termios(self) -> Termios {
-        // TODO：这里没有考虑非规范模式
+        // Linux copies the raw flag words, including unnamed bits. Preserve
+        // them at the ABI boundary; drivers normalize hardware settings.
         Termios {
-            input_mode: InputMode::from_bits_truncate(self.c_iflag),
-            output_mode: OutputMode::from_bits_truncate(self.c_oflag),
-            control_mode: ControlMode::from_bits_truncate(self.c_cflag),
-            local_mode: LocalMode::from_bits_truncate(self.c_lflag),
+            input_mode: InputMode { bits: self.c_iflag },
+            output_mode: OutputMode { bits: self.c_oflag },
+            control_mode: ControlMode { bits: self.c_cflag },
+            local_mode: LocalMode { bits: self.c_lflag },
             control_characters: self.c_cc,
             line: LineDisciplineType::from_line(self.c_line),
+            c_line_abi: self.c_line,
             input_speed: self.input_speed().unwrap_or(38400),
             output_speed: self.output_speed().unwrap_or(38400),
         }
     }
 
     fn output_speed(&self) -> Option<u32> {
-        let flag = ControlMode::from_bits_truncate(
-            self.c_cflag & ControlMode::CBAUD.intersection(ControlMode::CBAUDEX).bits(),
-        ); // CBAUD + CBAUDEX
-        flag.baud_rate()
+        let cflag = ControlMode::from_bits_truncate(self.c_cflag & ControlMode::CBAUD.bits());
+        cflag.baud_rate()
     }
 
     fn input_speed(&self) -> Option<u32> {
-        let ibaud = (self.c_cflag & ControlMode::CIBAUD.bits()) >> 16;
-        if ibaud == 0 {
-            self.output_speed()
-        } else {
-            ControlMode::from_bits_truncate(ibaud).baud_rate()
-        }
+        let cflag = ControlMode::from_bits_truncate(self.c_cflag);
+        cflag.input_baud_rate()
     }
 }
 
-pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = [
-    b'C' - 0x40,  // VINTR
-    b'\\' - 0x40, // VQUIT
-    0o177,        // VERASE
-    b'U' - 0x40,  // VKILL
-    b'D' - 0x40,  // VEOF
-    1,            // VMIN
-    0,            // VEOL
-    0,            // VTIME
-    0,            // VEOL2
-    0,            // VSWTC
-    b'W' - 0x40,  // VWERASE
-    b'R' - 0x40,  // VREPRINT
-    b'Z' - 0x40,  // VSUSP
-    b'Q' - 0x40,  // VSTART
-    b'S' - 0x40,  // VSTOP
-    b'V' - 0x40,  // VLNEXT
-    b'O' - 0x40,  // VDISCARD
-    0,
-    0,
-];
+pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
+    let mut chs = [0; CONTORL_CHARACTER_NUM];
+    chs[ControlCharIndex::VINTR] = b'C' - 0x40;
+    chs[ControlCharIndex::VQUIT] = b'\\' - 0x40;
+    chs[ControlCharIndex::VERASE] = 0o177;
+    chs[ControlCharIndex::VKILL] = b'U' - 0x40;
+    chs[ControlCharIndex::VEOF] = b'D' - 0x40;
+    chs[ControlCharIndex::VSTART] = b'Q' - 0x40;
+    chs[ControlCharIndex::VSTOP] = b'S' - 0x40;
+    chs[ControlCharIndex::VSUSP] = b'Z' - 0x40;
+    chs[ControlCharIndex::VREPRINT] = b'R' - 0x40;
+    chs[ControlCharIndex::VDISCARD] = b'O' - 0x40;
+    chs[ControlCharIndex::VWERASE] = b'W' - 0x40;
+    chs[ControlCharIndex::VLNEXT] = b'V' - 0x40;
+    chs[ControlCharIndex::VMIN] = 1;
+    chs
+};
 
 // pub const INIT_CONTORL_CHARACTERS: [u8; CONTORL_CHARACTER_NUM] = {
 //     let mut chs: [u8; CONTORL_CHARACTER_NUM] = Default::default();
@@ -151,6 +149,7 @@ lazy_static! {
                 | LocalMode::IEXTEN,
             control_characters: INIT_CONTORL_CHARACTERS,
             line: LineDisciplineType::NTty,
+            c_line_abi: INIT_C_LINE_ABI,
             input_speed: 38400,
             output_speed: 38400,
         }
@@ -361,7 +360,7 @@ bitflags! {
         const TERMIOS_WAIT	=2;
         const TERMIOS_TERMIO	=4;
         const TERMIOS_OLD	=8;
-    }
+}
 }
 
 impl ControlMode {
@@ -403,6 +402,111 @@ impl ControlMode {
             _ => None,
         }
     }
+
+    /// Get input baud rate from CIBAUD bits, falling back to output baud rate.
+    pub fn input_baud_rate(&self) -> Option<u32> {
+        let ibaud = (self.bits() & Self::CIBAUD.bits()) >> 16;
+        if ibaud == 0 {
+            self.baud_rate()
+        } else {
+            ControlMode::from_bits_truncate(ibaud).baud_rate()
+        }
+    }
+}
+
+pub const NCC: usize = 8;
+
+/// Default c_line ABI value (N_TTY = 0).
+pub const INIT_C_LINE_ABI: u8 = 0;
+
+/// Legacy SVR4 `struct termio` — the smaller predecessor of `struct termios`.
+/// Used by ioctl commands TCGETA / TCSETA / TCSETAW / TCSETAF.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PosixTermio {
+    pub c_iflag: u16,
+    pub c_oflag: u16,
+    pub c_cflag: u16,
+    pub c_lflag: u16,
+    pub c_line: u8,
+    pub c_cc: [u8; NCC],
+    /// Explicit padding in place of repr(C) implicit tail padding.
+    /// Essential: `Default::default()` zeros this field, preventing kernel
+    /// stack data leak to userspace via TCGETA.
+    pub(crate) _pad: u8,
+}
+
+// Compile-time guard: sizeof(PosixTermio) must be 18 to match C struct
+// termio on all supported ABIs.  If this fails on a new architecture,
+// the _pad field and/or repr alignment need adjustment.
+const _: () = assert!(core::mem::size_of::<PosixTermio>() == 18);
+
+impl PosixTermio {
+    /// Convert kernel Termios → user-space termio.
+    /// Fields wider than u16 are truncated; excess c_cc slots are dropped.
+    pub fn from_kernel_termios(termios: &Termios) -> Self {
+        let mut cc = [0u8; NCC];
+        let copy_len = NCC.min(termios.control_characters.len());
+        cc[..copy_len].copy_from_slice(&termios.control_characters[..copy_len]);
+        Self {
+            c_iflag: termios.input_mode.bits as u16,
+            c_oflag: termios.output_mode.bits as u16,
+            c_cflag: termios.control_mode.bits as u16,
+            c_lflag: termios.local_mode.bits as u16,
+            c_line: termios.c_line_abi,
+            c_cc: cc,
+            _pad: 0,
+        }
+    }
+
+    /// Convert user-space termio → kernel Termios, merging with `old`.
+    ///
+    /// Matches Linux 6.6 generic `user_termio_to_kernel_termios()`:
+    /// the low 16 bits of each flag word come from the termio, the high
+    /// 16 bits are preserved from `old`. Only the first NCC control
+    /// characters are overwritten; the rest are preserved from `old`.
+    ///
+    /// `self._pad` is intentionally ignored — it exists solely to prevent
+    /// kernel stack data leaks to userspace via TCGETA reads.
+    /// User-supplied `_pad` values from TCGETA ioctl are harmless.
+    pub fn to_kernel_termios(self, old: &Termios) -> Termios {
+        let mut cc = old.control_characters;
+        cc[..NCC].copy_from_slice(&self.c_cc);
+
+        // As with termios, neither half of the merged ABI flags may be
+        // truncated to the set of bits currently named by the kernel.
+        let control_mode = ControlMode {
+            bits: (old.control_mode.bits & 0xffff_0000) | self.c_cflag as u32,
+        };
+        let (input_speed, output_speed) = Self::speeds_from_cflag(control_mode);
+
+        Termios {
+            input_mode: InputMode {
+                bits: (old.input_mode.bits & 0xffff_0000) | self.c_iflag as u32,
+            },
+            output_mode: OutputMode {
+                bits: (old.output_mode.bits & 0xffff_0000) | self.c_oflag as u32,
+            },
+            control_mode,
+            local_mode: LocalMode {
+                bits: (old.local_mode.bits & 0xffff_0000) | self.c_lflag as u32,
+            },
+            control_characters: cc,
+            line: LineDisciplineType::from_line(self.c_line),
+            c_line_abi: self.c_line,
+            input_speed,
+            output_speed,
+        }
+    }
+
+    /// Extract input/output speeds from a merged kernel Termios c_cflag,
+    /// mirroring how Linux `set_termios()` calls `tty_termios_baud_rate()`
+    /// after `user_termio_to_kernel_termios()`.
+    pub fn speeds_from_cflag(cflag: ControlMode) -> (u32, u32) {
+        let ospeed = cflag.baud_rate().unwrap_or(38400);
+        let ispeed = cflag.input_baud_rate().unwrap_or(ospeed);
+        (ispeed, ospeed)
+    }
 }
 
 /// 对应termios中控制字符的索引
@@ -420,28 +524,28 @@ impl ControlCharIndex {
     pub const VKILL: usize = 3;
     /// 文件结束信号 \0?
     pub const VEOF: usize = 4;
-    /// 指定非规范模式下的最小字符数
-    pub const VMIN: usize = 5;
-    /// 换行符
-    pub const VEOL: usize = 6;
     /// 指定非规范模式下的超时时间
-    pub const VTIME: usize = 7;
-    /// 换行符
-    pub const VEOL2: usize = 8;
+    pub const VTIME: usize = 5;
+    /// 指定非规范模式下的最小字符数
+    pub const VMIN: usize = 6;
     /// 未使用，保留
-    pub const VSWTC: usize = 9;
-    /// 擦除前一个单词
-    pub const VWERASE: usize = 10;
-    /// 重新打印整行
-    pub const VREPRINT: usize = 11;
-    /// 挂起信号
-    pub const VSUSP: usize = 12;
+    pub const VSWTC: usize = 7;
     /// 启动输出信号
-    pub const VSTART: usize = 13;
+    pub const VSTART: usize = 8;
     /// 停止输出信号
-    pub const VSTOP: usize = 14;
+    pub const VSTOP: usize = 9;
+    /// 挂起信号
+    pub const VSUSP: usize = 10;
+    /// 换行符
+    pub const VEOL: usize = 11;
+    /// 重新打印整行
+    pub const VREPRINT: usize = 12;
+    /// 对应于字符丢弃信号，用于丢弃当前输入的行
+    pub const VDISCARD: usize = 13;
+    /// 擦除前一个单词
+    pub const VWERASE: usize = 14;
     /// 将下一个字符视为字面值，而不是特殊字符
     pub const VLNEXT: usize = 15;
-    /// 对应于字符丢弃信号，用于丢弃当前输入的行
-    pub const VDISCARD: usize = 16;
+    /// 换行符
+    pub const VEOL2: usize = 16;
 }

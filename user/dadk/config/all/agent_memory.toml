@@ -1,0 +1,20 @@
+name = "agent_memory"
+version = "0.1.0"
+description = "Guest cgroup sampler for the real Agent memory acceptance workload"
+build-once = false
+install-once = false
+target-arch = ["x86_64"]
+
+[task-source]
+type = "build-from-source"
+source = "local"
+source-path = "user/apps/agent_memory"
+
+[build]
+build-command = "make install"
+
+[install]
+in-dragonos-path = "/bin"
+
+[clean]
+clean-command = "make clean"

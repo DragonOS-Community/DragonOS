@@ -78,8 +78,25 @@ impl Bus for SerioBus {
         return pdrv.connect(&pdev);
     }
 
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let pdrv = drv.cast::<dyn SerioDriver>().map_err(|_| {
+            error!(
+                "SerioBus::remove() failed: device.driver() is not a SerioDriver. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        let pdev = device.clone().cast::<dyn SerioDevice>().map_err(|_| {
+            error!(
+                "SerioBus::remove() failed: device is not a SerioDevice. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        pdrv.disconnect(&pdev)
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {

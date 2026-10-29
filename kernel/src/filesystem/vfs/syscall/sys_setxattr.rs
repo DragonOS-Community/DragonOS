@@ -2,7 +2,7 @@
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_SETXATTR},
-    filesystem::vfs::{syscall::xattr_utils::path_setxattr, VFS_MAX_FOLLOW_SYMLINK_TIMES},
+    filesystem::vfs::syscall::xattr_utils::path_setxattr,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::{string::ToString, vec::Vec};
@@ -22,14 +22,7 @@ impl Syscall for SysSetxattrHandle {
         let size = Self::size(args);
         let flags = Self::flags(args);
 
-        path_setxattr(
-            path_ptr,
-            name_ptr,
-            value_ptr,
-            size,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            flags,
-        )
+        path_setxattr(path_ptr, name_ptr, value_ptr, size, true, flags)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

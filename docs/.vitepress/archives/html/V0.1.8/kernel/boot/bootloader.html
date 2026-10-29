@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>引导加载程序 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="Multiboot2支持模块" href="multiboot2.html" />
+    <link rel="prev" title="引导加载" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">引导加载</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">引导加载程序</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">原理</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">参考资料</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="multiboot2.html">Multiboot2支持模块</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">引导加载</a></li>
+      <li class="breadcrumb-item active">引导加载程序</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/5db5a56/docs/kernel/boot/bootloader.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>引导加载程序<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<section id="id2">
+<h2>原理<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  目前，DragonOS支持Legacy BIOS以及UEFI两种方式，进行启动引导。</p>
+<p>  在<code class="docutils literal notranslate"><span class="pre">head.S</span></code>的头部包含了Multiboot2引导头，里面标志了一些Multiboot2相关的特定信息，以及一些配置命令。</p>
+<p>  在DragonOS的启动初期，会存储由GRUB2传来的magic number以及multiboot2_boot_info_addr。当系统进入<code class="docutils literal notranslate"><span class="pre">Start_Kernel</span></code>函数之后，将会把这两个信息保存到multiboot2驱动程序之中。信息的具体含义请参照Multiboot2 Specification进行理解，该部分难度不大，相信读者经过思考能理解其中的原理。</p>
+</section>
+<section id="id3">
+<h2>参考资料<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference external" href="http://git.savannah.gnu.org/cgit/grub.git/tree/doc/multiboot.texi?h=multiboot2">Multiboot2 Specification</a></p></li>
+<li><p><a class="reference external" href="https://www.gnu.org/software/grub/manual/grub/grub.html">GNU GRUB Manual 2.06</a></p></li>
+<li><p><a class="reference external" href="https://bbs.dragonos.org/forum.php?mod=viewthread&amp;tid=46">UEFI/Legacy启动 - yujianwu - DragonOS社区</a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="引导加载" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="multiboot2.html" class="btn btn-neutral float-right" title="Multiboot2支持模块" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>5db5a56</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.8
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/boot/bootloader.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/boot/bootloader.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/boot/bootloader.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/boot/bootloader.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/boot/bootloader.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/boot/bootloader.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/boot/bootloader.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/boot/bootloader.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/boot/bootloader.html">V0.1.7</a></dd>
+      <dd><a href="bootloader.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/boot/bootloader.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/boot/bootloader.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/boot/bootloader.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/boot/bootloader.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/boot/bootloader.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

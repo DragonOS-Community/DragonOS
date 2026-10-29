@@ -6,73 +6,142 @@ use system_error::SystemError;
 use crate::{
     arch::{CurrentIrqArch, CurrentTimeArch},
     exception::InterruptArch,
-    process::ProcessManager,
-    sched::{schedule, SchedMode},
-    time::timekeeping::getnstimeofday,
+    libs::wait_queue::{Waiter, Waker},
+    process::preempt::PreemptGuard,
+    smp::core::smp_get_processor_id,
 };
 
 use super::{
-    timer::{next_n_us_timer_jiffies, Timer, WakeUpHelper},
+    deadline::{self, DeadlineCallback, DeadlineEvent},
+    timekeeping::monotonic_now,
+    timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
     PosixTimeSpec, TimeArch,
 };
 
-/// @brief 休眠指定时间（单位：纳秒）
-///
-/// @param sleep_time 指定休眠的时间
-///
-/// @return Ok(TimeSpec) 剩余休眠时间
-///
-/// @return Err(SystemError) 错误码
-pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError> {
-    if sleep_time.tv_nsec < 0 || sleep_time.tv_nsec >= 1000000000 {
+#[derive(Debug)]
+struct SleepWake(Arc<Waker>);
+
+impl DeadlineCallback for SleepWake {
+    fn expire(&self, _now_ns: u64) -> Option<u64> {
+        self.0.wake();
+        None
+    }
+}
+
+impl TimerFunction for SleepWake {
+    fn run(&mut self) -> Result<(), SystemError> {
+        self.0.wake();
+        Ok(())
+    }
+}
+
+/// Own cancellation on every return path, including signal and early wake.
+enum SleepTimer {
+    Deadline(Arc<DeadlineEvent>),
+    Coarse(Arc<Timer>),
+}
+
+impl Drop for SleepTimer {
+    fn drop(&mut self) {
+        match self {
+            Self::Deadline(event) => event.cancel(),
+            Self::Coarse(timer) => {
+                timer.cancel();
+            }
+        }
+    }
+}
+
+fn arm_sleep(deadline: PosixTimeSpec, waker: &Arc<Waker>) -> Result<SleepTimer, SystemError> {
+    let (owner, capable) = {
+        let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        (smp_get_processor_id(), deadline::supported())
+    };
+    // All allocation/reclaim happens after restoring IRQs. x86 can arm the
+    // fixed owner remotely; RISC-V admits deadline users only on a single CPU.
+    if capable {
+        let callback = Arc::try_new(SleepWake(waker.clone())).map_err(|_| SystemError::ENOMEM)?;
+        let event = DeadlineEvent::try_new(owner, callback).map_err(|_| SystemError::ENOMEM)?;
+        match event.arm(deadline.to_ktime_ns()) {
+            Ok(()) => return Ok(SleepTimer::Deadline(event)),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP) => event.cancel(),
+            Err(err) => return Err(err),
+        }
+    }
+
+    let remaining = deadline.saturating_sub_timespec(&monotonic_now());
+    let expiry = next_n_us_timer_jiffies(remaining.to_ktime_ns().div_ceil(1000));
+    let callback = Box::try_new(SleepWake(waker.clone())).map_err(|_| SystemError::ENOMEM)?;
+    let prepared = Timer::try_prepare(callback, expiry)?;
+    let timer = prepared.timer();
+    prepared.activate();
+    Ok(SleepTimer::Coarse(timer))
+}
+
+/// Sleep in process context until the monotonic deadline or a pending signal.
+/// Hardware stalls in atomic/shutdown contexts must use `busy_wait_us` instead.
+pub fn nanosleep(sleep_time: PosixTimeSpec) -> Result<(), SystemError> {
+    if !sleep_time.is_valid_timeout() {
         return Err(SystemError::EINVAL);
     }
-    // 对于小于500us的时间，使用spin/rdtsc来进行定时
-    if sleep_time.tv_nsec < 500000 && sleep_time.tv_sec == 0 {
-        let expired_tsc: usize = CurrentTimeArch::cal_expire_cycles(sleep_time.tv_nsec as usize);
-        while CurrentTimeArch::get_cycles() < expired_tsc {
-            spin_loop()
-        }
-        return Ok(PosixTimeSpec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        });
+    if sleep_time.is_empty() {
+        return Ok(());
     }
 
-    let total_sleep_time_us: u64 =
-        sleep_time.tv_sec as u64 * 1000000 + sleep_time.tv_nsec as u64 / 1000;
-    // 创建定时器
-    let handler: Box<WakeUpHelper> = WakeUpHelper::new(ProcessManager::current_pcb());
-    let timer: Arc<Timer> = Timer::new(handler, next_n_us_timer_jiffies(total_sleep_time_us));
-
-    let start_time = getnstimeofday();
-    timer.activate();
-
-    // Linux 语义：等待可能出现伪唤醒；只有在收到未被屏蔽的信号时才中断。
-    // 对于 job-control stop/continue 这类不应直接对用户态暴露的唤醒，应继续等待直到到期。
+    let deadline = monotonic_now().saturating_add_ktime(&sleep_time);
+    let (waiter, waker) = Waiter::try_new_pair()?;
     loop {
-        let irq_guard: crate::exception::IrqFlagsGuard =
-            unsafe { CurrentIrqArch::save_and_disable_irq() };
-        ProcessManager::mark_sleep(true).ok();
-        drop(irq_guard);
-        schedule(SchedMode::SM_NONE);
-
-        if timer.timeout() {
-            break;
+        if deadline
+            .saturating_sub_timespec(&monotonic_now())
+            .is_empty()
+        {
+            return Ok(());
         }
-
-        // 未到期而被唤醒：若存在未屏蔽待处理信号，则视为被信号打断；否则认为是伪唤醒，继续等待。
-        let current_pcb = ProcessManager::current_pcb();
-        let has_real_signal =
-            current_pcb.has_pending_signal_fast() && current_pcb.has_pending_not_masked_signal();
-        if has_real_signal {
-            timer.cancel();
+        let timer = arm_sleep(deadline, &waker)?;
+        // Preparation may itself consume the remaining interval.
+        if deadline
+            .saturating_sub_timespec(&monotonic_now())
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let result = waiter.wait(true);
+        drop(timer);
+        let interrupted = match result {
+            Ok(()) => false,
+            Err(SystemError::ERESTARTSYS) => true,
+            Err(err) => return Err(err),
+        };
+        // Completion wins a race with signal delivery, as in Linux nanosleep.
+        if deadline
+            .saturating_sub_timespec(&monotonic_now())
+            .is_empty()
+        {
+            return Ok(());
+        }
+        if interrupted {
             return Err(SystemError::ERESTARTSYS);
         }
+        // Never complete on a non-expiry notification or restart a full
+        // relative interval. Rearm only the original absolute deadline.
     }
+}
 
-    let end_time = getnstimeofday();
-    let real_sleep_time = end_time - start_time;
-    let rm_time: PosixTimeSpec = (sleep_time - real_sleep_time.into()).into();
-    Ok(rm_time)
+/// Calibrated hardware stall, including when IRQs/clockevents are shut down.
+/// This intentionally does not provide the process-sleep monotonic contract.
+pub(crate) fn busy_wait_us(mut microseconds: u64) {
+    // Bound multiplication and each modular deadline to a short interval.
+    // A passed/tiny deadline (including an uncalibrated zero frequency) must
+    // return rather than underflow a cycle budget into an enormous delay.
+    while microseconds != 0 {
+        let chunk = microseconds.min(1_000);
+        // Keep each calibrated interval in one CPU's counter domain. Between
+        // chunks, callers with IRQs enabled may migrate and re-anchor.
+        let _preempt = PreemptGuard::new();
+        let expires = CurrentTimeArch::cal_expire_cycles(chunk as usize * 1_000);
+        while (CurrentTimeArch::get_cycles().wrapping_sub(expires) as isize) < 0 {
+            spin_loop();
+        }
+        microseconds -= chunk;
+    }
 }

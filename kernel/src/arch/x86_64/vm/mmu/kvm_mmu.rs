@@ -535,12 +535,14 @@ impl VirtCpuArch {
 }
 
 impl VirtCpu {
-    pub fn kvm_mmu_reload(&mut self, vm: &Vm) -> Result<(), SystemError> {
+    /// Prepares an MMU root without touching the CPU-local active VMCS.
+    pub fn kvm_mmu_reload(&mut self, vm: &Vm) -> Result<bool, SystemError> {
         if likely(self.arch.mmu().root.hpa != KvmMmu::INVALID_PAGE) {
-            return Ok(());
+            return Ok(false);
         }
 
-        return self.kvm_mmu_load(vm);
+        self.kvm_mmu_load(vm)?;
+        Ok(true)
     }
 
     pub fn kvm_mmu_load(&mut self, vm: &Vm) -> Result<(), SystemError> {
@@ -555,8 +557,6 @@ impl VirtCpu {
         }
 
         // TODO: kvm_mmu_sync_roots
-
-        self.kvm_mmu_load_pgd(vm);
 
         Ok(())
     }

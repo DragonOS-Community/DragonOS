@@ -26,6 +26,32 @@ pub(super) fn current_xapic_instance() -> &'static RefCell<Option<XApic>> {
     unsafe { &XAPIC_INSTANCES.as_ref()[smp_get_processor_id().data() as usize] }
 }
 
+/// Terminal, bounded ICR write. The caller has disabled local interrupts.
+pub(super) fn try_fatal_broadcast(low: u32) {
+    let Some(cpu) = crate::arch::process::table::TSSManager::current_cpu_from_tr() else {
+        return;
+    };
+    let Some(slot) = (unsafe { XAPIC_INSTANCES.as_ref() }).get(cpu.data() as usize) else {
+        return;
+    };
+    let Ok(instance) = slot.try_borrow() else {
+        return;
+    };
+    let Some(apic) = instance.as_ref() else {
+        return;
+    };
+    for _ in 0..1024 {
+        if unsafe { apic.read(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0) } & DELIVS == 0 {
+            unsafe {
+                apic.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_63_32, 0);
+                apic.write(XApicOffset::LOCAL_APIC_OFFSET_Local_APIC_ICR_31_0, low);
+            }
+            return;
+        }
+        spin_loop();
+    }
+}
+
 /// TODO：统一变量
 /// @brief local APIC 寄存器地址偏移量
 #[derive(Debug)]

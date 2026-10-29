@@ -14,7 +14,7 @@ use core::{
 
 use alloc::{
     boxed::Box,
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{Arc, Weak},
     vec::Vec,
@@ -26,10 +26,10 @@ use crate::{
     arch::{ipc::signal::Signal, CurrentIrqArch},
     exception::InterruptArch,
     libs::mutex::MutexGuard,
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, ProcessState},
+    process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{io_schedule, schedule, SchedMode},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer},
+        timer::{clock, next_n_us_timer_jiffies, Timer},
         Duration, Instant,
     },
 };
@@ -43,10 +43,14 @@ enum WaitSignalMode {
     Killable,
 }
 
+const DEFAULT_WAIT_TAG: usize = usize::MAX;
+const EMPTY_TAG_CACHE_LIMIT: usize = 8;
+
 #[derive(Debug)]
 struct InnerWaitQueue {
     dead: bool,
-    waiters: VecDeque<Arc<Waker>>,
+    waiters: BTreeMap<usize, VecDeque<Arc<Waker>>>,
+    empty_tag_count: usize,
 }
 
 /// 等待队列：基于一次性 Waiter/Waker，避免唤醒丢失
@@ -65,7 +69,19 @@ pub struct Waiter {
 /// 可跨 CPU/线程共享的唤醒器
 #[derive(Debug)]
 pub struct Waker {
+    body: WakerStorage,
+}
+#[derive(Debug)]
+enum WakerStorage {
+    // Keep ordinary waiters' original single-Arc allocation. The accounted
+    // identity shell has enum padding, not another copy of these fields.
+    Bootstrap(WakerData),
+    Accounted(crate::cgroup::memory::owned::OwnedBox<WakerData>),
+}
+#[derive(Debug)]
+struct WakerData {
     state: AtomicU8,
+    tag: usize,
     target: Weak<ProcessControlBlock>,
 }
 
@@ -83,24 +99,68 @@ impl WaitQueue {
         if guard.dead {
             return Err(SystemError::ECHILD);
         }
-        guard.waiters.push_back(waker);
+        if waker.data().tag != DEFAULT_WAIT_TAG
+            && guard
+                .waiters
+                .get(&waker.data().tag)
+                .is_some_and(VecDeque::is_empty)
+        {
+            guard.empty_tag_count -= 1;
+        }
+        guard
+            .waiters
+            .entry(waker.data().tag)
+            .or_default()
+            .push_back(waker);
         self.num_waiters.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     pub fn remove_waker(&self, target: &Arc<Waker>) {
         let mut guard = self.inner.lock_irqsave();
-        let before = guard.waiters.len();
-        guard.waiters.retain(|w| !Arc::ptr_eq(w, target));
-        let removed = before - guard.waiters.len();
+        let (removed, became_empty) =
+            if let Some(waiters) = guard.waiters.get_mut(&target.data().tag) {
+                let before = waiters.len();
+                waiters.retain(|w| !Arc::ptr_eq(w, target));
+                let removed = before - waiters.len();
+                (removed, removed > 0 && waiters.is_empty())
+            } else {
+                (0, false)
+            };
         if removed > 0 {
             self.num_waiters
                 .fetch_sub(removed as u32, Ordering::Release);
         }
+        let evicted = became_empty
+            .then(|| guard.cache_or_evict_empty_tag(target.data().tag))
+            .flatten();
+        drop(guard);
+        drop(evicted);
     }
 
+    /// Returns a transient, lockless snapshot of whether the queue is empty.
+    ///
+    /// This is only an advisory hint. A negative result must not be used to
+    /// skip a correctness-critical, one-shot wakeup without an independent
+    /// synchronization protocol.
     pub fn is_empty(&self) -> bool {
-        self.num_waiters.fetch_add(0, Ordering::Acquire) == 0
+        self.num_waiters.load(Ordering::Acquire) == 0
+    }
+
+    /// Test-only exact registration evidence. SLEEPING is published only by
+    /// prepare_sleep(), after the queued waiter's predicate returned None.
+    /// This does not imply the target PCB has reached mark_sleep().
+    #[cfg(feature = "sched_selftest")]
+    pub(crate) fn has_sleeping_waiter(&self, tag: usize) -> bool {
+        self.inner
+            .lock_irqsave()
+            .waiters
+            .get(&tag)
+            .is_some_and(|waiters| {
+                waiters.iter().any(|waker| {
+                    waker.data().state.load(Ordering::Acquire) == Waker::STATE_SLEEPING
+                })
+            })
     }
 
     // ==================== Core API: wait_until family ====================
@@ -126,8 +186,28 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Uninterruptible,
             None,
+            None,
             None::<fn()>,
             false,
+        )
+        .unwrap()
+    }
+
+    /// Wait uninterruptibly for a caller-defined class. Reuses the same
+    /// register-before-check protocol as wait_until; wake_one_tagged selects
+    /// this class without waking waiters for unrelated completion sources.
+    pub(crate) fn wait_until_tagged<F, R>(&self, tag: usize, cond: F) -> R
+    where
+        F: FnMut() -> Option<R>,
+    {
+        assert_ne!(tag, DEFAULT_WAIT_TAG);
+        self.wait_until_impl_tagged(
+            cond,
+            WaitSignalMode::Uninterruptible,
+            None,
+            None,
+            None::<fn()>,
+            (false, tag),
         )
         .unwrap()
     }
@@ -143,6 +223,7 @@ impl WaitQueue {
         self.wait_until_impl(
             cond,
             WaitSignalMode::Uninterruptible,
+            None,
             None,
             None::<fn()>,
             true,
@@ -162,6 +243,7 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Interruptible,
             None,
+            None,
             None::<fn()>,
             false,
         )
@@ -179,6 +261,7 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Interruptible,
             None,
+            None,
             None::<fn()>,
             true,
         )
@@ -189,7 +272,14 @@ impl WaitQueue {
     where
         F: FnMut() -> Option<R>,
     {
-        self.wait_until_impl(cond, WaitSignalMode::Killable, None, None::<fn()>, false)
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Killable,
+            None,
+            None,
+            None::<fn()>,
+            false,
+        )
     }
 
     /// Waits until condition returns `Some(R)` with timeout (interruptible).
@@ -207,8 +297,51 @@ impl WaitQueue {
             cond,
             WaitSignalMode::Interruptible,
             Some(timeout),
+            None,
             None::<fn()>,
             false,
+        )
+    }
+
+    /// Waits with a timeout expressed in scheduler ticks.
+    ///
+    /// This preserves timeout ranges that cannot be represented by `Duration`'s
+    /// microsecond storage and is useful for Linux socket timeout semantics.
+    #[track_caller]
+    pub fn wait_until_timeout_ticks<F, R>(
+        &self,
+        cond: F,
+        timeout_ticks: u64,
+    ) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+    {
+        self.wait_until_impl(
+            cond,
+            WaitSignalMode::Interruptible,
+            None,
+            Some(timeout_ticks),
+            None::<fn()>,
+            false,
+        )
+    }
+
+    /// IO-accounted interruptible wait with a full-width scheduler-tick budget.
+    pub fn wait_event_io_interruptible_timeout_ticks<F>(
+        &self,
+        mut condition: F,
+        timeout_ticks: u64,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.wait_until_impl(
+            || condition().then_some(()),
+            WaitSignalMode::Interruptible,
+            None,
+            Some(timeout_ticks),
+            None::<fn()>,
+            true,
         )
     }
 
@@ -220,25 +353,54 @@ impl WaitQueue {
     /// - This ensures no wakeup is lost between check and sleep
     fn wait_until_impl<F, R, B>(
         &self,
-        mut cond: F,
+        cond: F,
         mode: WaitSignalMode,
         timeout: Option<Duration>,
-        mut before_sleep: Option<B>,
+        timeout_ticks: Option<u64>,
+        before_sleep: Option<B>,
         is_io: bool,
     ) -> Result<R, SystemError>
     where
         F: FnMut() -> Option<R>,
         B: FnMut(),
     {
+        self.wait_until_impl_tagged(
+            cond,
+            mode,
+            timeout,
+            timeout_ticks,
+            before_sleep,
+            (is_io, DEFAULT_WAIT_TAG),
+        )
+    }
+
+    fn wait_until_impl_tagged<F, R, B>(
+        &self,
+        mut cond: F,
+        mode: WaitSignalMode,
+        timeout: Option<Duration>,
+        timeout_ticks: Option<u64>,
+        mut before_sleep: Option<B>,
+        wait_class: (bool, usize),
+    ) -> Result<R, SystemError>
+    where
+        F: FnMut() -> Option<R>,
+        B: FnMut(),
+    {
+        let (is_io, tag) = wait_class;
         // Fast path: check condition first
         if let Some(res) = cond() {
             return Ok(res);
         }
 
-        let deadline = timeout.map(|t| Instant::now() + t);
+        // Compute one fixed deadline for the whole wait. Reusing it across wakeups
+        // prevents timer re-registration or preemption from extending the budget.
+        let deadline_ticks = timeout_ticks
+            .map(|ticks| clock().saturating_add(ticks))
+            .or_else(|| timeout.map(|duration| next_n_us_timer_jiffies(duration.total_micros())));
 
         // Create only ONE waiter/waker pair (key difference from old implementation)
-        let (waiter, waker) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair_tagged(tag);
 
         fn cancel_or_timeout<F, R>(
             cond: &mut F,
@@ -258,15 +420,9 @@ impl WaitQueue {
 
         loop {
             // Check timeout
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    self.remove_waker(&waker);
-                    return cancel_or_timeout(
-                        &mut cond,
-                        &waker,
-                        SystemError::EAGAIN_OR_EWOULDBLOCK,
-                    );
-                }
+            if deadline_ticks.is_some_and(|deadline| clock() >= deadline) {
+                self.remove_waker(&waker);
+                return cancel_or_timeout(&mut cond, &waker, SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
 
             // Enqueue waker BEFORE checking condition (critical for correctness!)
@@ -309,19 +465,16 @@ impl WaitQueue {
             }
 
             // Setup timeout timer if needed
-            let timer = if let Some(deadline) = deadline {
-                let remain = deadline
-                    .duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO);
-                if remain == Duration::ZERO {
+            let timer = if let Some(deadline) = deadline_ticks {
+                if clock() >= deadline {
                     self.remove_waker(&waker);
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    return cancel_or_timeout(
+                        &mut cond,
+                        &waker,
+                        SystemError::EAGAIN_OR_EWOULDBLOCK,
+                    );
                 }
-                let sleep_us = remain.total_micros();
-                let t: Arc<Timer> = Timer::new(
-                    TimeoutWaker::new(waker.clone()),
-                    next_n_us_timer_jiffies(sleep_us),
-                );
+                let t: Arc<Timer> = Timer::new(TimeoutWaker::new(waker.clone()), deadline);
                 t.activate();
                 Some(t)
             } else {
@@ -376,8 +529,33 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             None,
+            None,
             before_sleep,
             false,
+        )
+    }
+
+    /// Wait interruptibly while publishing a caller-defined class tag on the
+    /// waiter. The tag lets a wakeup source select one eligible class without
+    /// disturbing unrelated waiters on the same queue.
+    pub fn wait_event_interruptible_tagged<F>(
+        &self,
+        tag: usize,
+        mut cond: F,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        if tag == DEFAULT_WAIT_TAG {
+            return Err(SystemError::EINVAL);
+        }
+        self.wait_until_impl_tagged(
+            || if cond() { Some(()) } else { None },
+            WaitSignalMode::Interruptible,
+            None,
+            None,
+            None::<fn()>,
+            (false, tag),
         )
     }
 
@@ -398,6 +576,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             None,
+            None,
             before_sleep,
             true,
         )
@@ -415,6 +594,7 @@ impl WaitQueue {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Killable,
+            None,
             None,
             before_sleep,
             false,
@@ -434,6 +614,7 @@ impl WaitQueue {
         self.wait_until_impl(
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Uninterruptible,
+            None,
             None,
             before_sleep,
             false,
@@ -456,6 +637,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             timeout,
+            None,
             None::<fn()>,
             false,
         )
@@ -476,6 +658,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             timeout,
+            None,
             None::<fn()>,
             true,
         )
@@ -497,6 +680,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Uninterruptible,
             timeout,
+            None,
             None::<fn()>,
             false,
         )
@@ -519,6 +703,7 @@ impl WaitQueue {
             || if cond() { Some(()) } else { None },
             WaitSignalMode::Interruptible,
             timeout,
+            None,
             before_sleep,
             false,
         )
@@ -532,22 +717,56 @@ impl WaitQueue {
     }
 
     pub fn wake_one(&self) -> bool {
-        if self.is_empty() {
-            return false;
-        }
-
         loop {
             let next = {
                 let mut guard = self.inner.lock_irqsave();
-                let waker = guard.waiters.pop_front();
+                let tagged_waker = guard
+                    .waiters
+                    .iter_mut()
+                    .find_map(|(tag, waiters)| waiters.pop_front().map(|waker| (*tag, waker)));
+                let waker = tagged_waker.as_ref().map(|(_, waker)| waker);
                 if waker.is_some() {
                     self.num_waiters.fetch_sub(1, Ordering::Release);
                 }
-                waker
+                let evicted = tagged_waker
+                    .as_ref()
+                    .filter(|(tag, _)| guard.waiters.get(tag).is_some_and(VecDeque::is_empty))
+                    .and_then(|(tag, _)| guard.cache_or_evict_empty_tag(*tag));
+                drop(guard);
+                drop(evicted);
+                tagged_waker.map(|(_, waker)| waker)
             };
 
             let Some(waker) = next else { return false };
             if waker.wake() {
+                return true;
+            }
+        }
+    }
+
+    /// Wake the first live waiter in an exact caller-defined class.
+    pub fn wake_one_tagged(&self, tag: usize) -> bool {
+        if tag == DEFAULT_WAIT_TAG {
+            return false;
+        }
+        loop {
+            let next = {
+                let mut guard = self.inner.lock_irqsave();
+                let waker = guard.waiters.get_mut(&tag).and_then(VecDeque::pop_front);
+                let Some(waker) = waker else { return false };
+                self.num_waiters.fetch_sub(1, Ordering::Release);
+                let evicted = guard
+                    .waiters
+                    .get(&tag)
+                    .is_some_and(VecDeque::is_empty)
+                    .then(|| guard.cache_or_evict_empty_tag(tag))
+                    .flatten();
+                drop(guard);
+                drop(evicted);
+                waker
+            };
+
+            if next.wake() {
                 return true;
             }
         }
@@ -559,22 +778,20 @@ impl WaitQueue {
     }
 
     pub fn wake_all(&self) -> usize {
-        if self.is_empty() {
-            return 0;
-        }
-
-        let mut drained = VecDeque::new();
+        let drained;
         {
             let mut guard = self.inner.lock_irqsave();
-            mem::swap(&mut guard.waiters, &mut drained);
+            drained = mem::take(&mut guard.waiters);
+            guard.empty_tag_count = 0;
             self.num_waiters.store(0, Ordering::Release);
         }
 
-        let wakers = drained;
         let mut woken = 0;
-        for w in wakers {
-            if w.wake() {
-                woken += 1;
+        for (_, wakers) in drained {
+            for waker in wakers {
+                if waker.wake() {
+                    woken += 1;
+                }
             }
         }
         woken
@@ -582,16 +799,19 @@ impl WaitQueue {
 
     /// 标记等待队列失效，清空并唤醒剩余等待者
     pub fn mark_dead(&self) {
-        let mut drained = VecDeque::new();
+        let drained;
         {
             let mut guard = self.inner.lock_irqsave();
             guard.dead = true;
-            mem::swap(&mut guard.waiters, &mut drained);
+            drained = mem::take(&mut guard.waiters);
+            guard.empty_tag_count = 0;
             self.num_waiters.store(0, Ordering::Release);
         }
-        for w in drained {
-            w.wake();
-            w.close();
+        for (_, wakers) in drained {
+            for waker in wakers {
+                waker.wake();
+                waker.close();
+            }
         }
     }
 
@@ -657,15 +877,74 @@ impl WaitQueue {
 impl InnerWaitQueue {
     pub const INIT: InnerWaitQueue = InnerWaitQueue {
         dead: false,
-        waiters: VecDeque::new(),
+        waiters: BTreeMap::new(),
+        empty_tag_count: 0,
     };
+
+    fn cache_or_evict_empty_tag(&mut self, tag: usize) -> Option<VecDeque<Arc<Waker>>> {
+        if tag == DEFAULT_WAIT_TAG {
+            return None;
+        }
+        if self.empty_tag_count < EMPTY_TAG_CACHE_LIMIT {
+            self.empty_tag_count += 1;
+            None
+        } else {
+            self.waiters.remove(&tag)
+        }
+    }
 }
 
 impl Waiter {
+    /// Prepare a waiter for allocation-constrained recovery paths. Queue
+    /// registration, if needed, is a separate operation owned by the caller.
+    pub(crate) fn try_new_pair() -> Result<(Self, Arc<Waker>), SystemError> {
+        let waker = Waker::try_new_current()?;
+        Ok((
+            Self {
+                waker: waker.clone(),
+                _nosend: PhantomData,
+            },
+            waker,
+        ))
+    }
+
+    /// CPU-clock wait metadata: prepare before queue/rq/resource guards.
+    pub(crate) fn try_new_pair_for(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<(Self, Arc<Waker>), crate::mm::allocation::MemoryAllocationError> {
+        use crate::cgroup::memory::{accounting::KernelByteKind, owned::OwnedBox};
+        let task = ProcessManager::current_pcb();
+        let body = OwnedBox::prepare(creator, KernelByteKind::SlabUnreclaimable)?
+            .try_init(WakerData {
+                state: AtomicU8::new(Waker::STATE_IDLE),
+                tag: DEFAULT_WAIT_TAG,
+                target: Arc::downgrade(&task),
+            })
+            .map_err(|_| SystemError::ENOMEM)?;
+        let waker = Arc::try_new(Waker {
+            body: WakerStorage::Accounted(body),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok((
+            Self {
+                waker: waker.clone(),
+                _nosend: PhantomData,
+            },
+            waker,
+        ))
+    }
+
     pub fn new_pair() -> (Self, Arc<Waker>) {
+        Self::new_pair_tagged(DEFAULT_WAIT_TAG)
+    }
+
+    fn new_pair_tagged(tag: usize) -> (Self, Arc<Waker>) {
         let waker = Arc::new(Waker {
-            state: AtomicU8::new(Waker::STATE_IDLE),
-            target: Arc::downgrade(&ProcessManager::current_pcb()),
+            body: WakerStorage::Bootstrap(WakerData {
+                state: AtomicU8::new(Waker::STATE_IDLE),
+                tag,
+                target: Arc::downgrade(&ProcessManager::current_pcb()),
+            }),
         });
         let waiter = Waiter {
             waker: waker.clone(),
@@ -698,6 +977,39 @@ impl Drop for Waiter {
 }
 
 impl Waker {
+    fn data(&self) -> &WakerData {
+        match &self.body {
+            WakerStorage::Bootstrap(data) => data,
+            WakerStorage::Accounted(data) => data,
+        }
+    }
+    pub(crate) fn try_new_current() -> Result<Arc<Self>, SystemError> {
+        Self::try_new_for(&ProcessManager::current_pcb())
+    }
+
+    /// Bind prepared storage to an unpublished task without retaining it.
+    pub(crate) fn try_new_for(task: &Arc<ProcessControlBlock>) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Self {
+            body: WakerStorage::Bootstrap(WakerData {
+                state: AtomicU8::new(Self::STATE_IDLE),
+                tag: DEFAULT_WAIT_TAG,
+                target: Arc::downgrade(task),
+            }),
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// Reusable task-bound waiting without moving the !Send Waiter into a PCB.
+    /// A different logical task cannot borrow this waker to block itself.
+    pub(crate) fn wait_current_killable(&self) -> Result<(), SystemError> {
+        let current = ProcessManager::current_pcb();
+        if self.data().target.as_ptr() != Arc::as_ptr(&current) {
+            return Err(SystemError::EINVAL);
+        }
+        drop(current);
+        block_current_waker_killable(self)
+    }
+
     const STATE_IDLE: u8 = 0;
     const STATE_SLEEPING: u8 = 1;
     const STATE_NOTIFIED: u8 = 2;
@@ -705,11 +1017,12 @@ impl Waker {
 
     pub fn wake(&self) -> bool {
         loop {
-            let state = self.state.load(Ordering::Acquire);
+            let state = self.data().state.load(Ordering::Acquire);
             match state {
                 Self::STATE_CLOSED | Self::STATE_NOTIFIED => return false,
                 Self::STATE_IDLE => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_IDLE,
@@ -719,11 +1032,15 @@ impl Waker {
                         )
                         .is_ok()
                     {
+                        if let Some(pcb) = self.data().target.upgrade() {
+                            let _ = ProcessManager::wakeup(&pcb);
+                        }
                         return true;
                     }
                 }
                 Self::STATE_SLEEPING => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_SLEEPING,
@@ -733,7 +1050,7 @@ impl Waker {
                         )
                         .is_ok()
                     {
-                        if let Some(pcb) = self.target.upgrade() {
+                        if let Some(pcb) = self.data().target.upgrade() {
                             let _ = ProcessManager::wakeup(&pcb);
                         }
                         return true;
@@ -746,15 +1063,23 @@ impl Waker {
 
     #[inline]
     pub fn close(&self) {
-        self.state.store(Self::STATE_CLOSED, Ordering::Release);
+        self.data()
+            .state
+            .store(Self::STATE_CLOSED, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.data().state.load(Ordering::Acquire) == Self::STATE_CLOSED
     }
 
     fn consume_notification(&self) -> bool {
         loop {
-            let state = self.state.load(Ordering::Acquire);
+            let state = self.data().state.load(Ordering::Acquire);
             match state {
                 Self::STATE_NOTIFIED => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_NOTIFIED,
@@ -775,10 +1100,11 @@ impl Waker {
 
     fn prepare_sleep(&self) -> WakerSleepState {
         loop {
-            let state = self.state.load(Ordering::Acquire);
+            let state = self.data().state.load(Ordering::Acquire);
             match state {
                 Self::STATE_IDLE => {
                     if self
+                        .data()
                         .state
                         .compare_exchange(
                             Self::STATE_IDLE,
@@ -853,14 +1179,7 @@ fn block_current_impl(
 
         // Handle a wake racing between prepare_sleep and mark_sleep.
         if waiter.waker.consume_notification() {
-            let pcb = ProcessManager::current_pcb();
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            if matches!(writer.state(), ProcessState::Blocked(_)) {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
-            }
-            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
+            ProcessManager::undo_mark_sleep();
             drop(irq_guard);
             return Ok(());
         }
@@ -882,14 +1201,21 @@ fn block_current_impl(
 }
 
 fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
+    block_current_waker_killable(&waiter.waker)
+}
+
+fn block_current_waker_killable(waker: &Waker) -> Result<(), SystemError> {
     loop {
-        if waiter.waker.consume_notification() {
+        if Signal::oom_fatal_signal_pending(&ProcessManager::current_pcb()) {
+            return Err(SystemError::ERESTARTSYS);
+        }
+        if waker.consume_notification() {
             return Ok(());
         }
 
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
-        match waiter.waker.prepare_sleep() {
+        match waker.prepare_sleep() {
             WakerSleepState::Notified | WakerSleepState::Closed => {
                 drop(irq_guard);
                 return Ok(());
@@ -899,15 +1225,17 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
 
         ProcessManager::mark_sleep(true)?;
 
-        if waiter.waker.consume_notification() {
-            let pcb = ProcessManager::current_pcb();
-            let mut writer = pcb.sched_info().inner_lock_write_irqsave();
-            if matches!(writer.state(), ProcessState::Blocked(_)) {
-                writer.set_state(ProcessState::Runnable);
-                writer.set_wakeup();
-            }
-            pcb.flags().remove(ProcessFlags::NEED_SCHEDULE);
-            drop(writer);
+        // A sender can queue SIGKILL and observe Runnable just before the
+        // blocked-state publication. Rechecking after mark_sleep pairs with
+        // its wakeup and prevents sleeping past an already committed kill.
+        if Signal::oom_fatal_signal_pending(&ProcessManager::current_pcb()) {
+            ProcessManager::undo_mark_sleep();
+            drop(irq_guard);
+            return Err(SystemError::ERESTARTSYS);
+        }
+
+        if waker.consume_notification() {
+            ProcessManager::undo_mark_sleep();
             drop(irq_guard);
             return Ok(());
         }
@@ -915,7 +1243,7 @@ fn block_current_killable(waiter: &Waiter) -> Result<(), SystemError> {
 
         schedule(SchedMode::SM_NONE);
 
-        if Signal::signal_pending_state(false, true, &ProcessManager::current_pcb()) {
+        if Signal::oom_fatal_signal_pending(&ProcessManager::current_pcb()) {
             return Err(SystemError::ERESTARTSYS);
         }
     }
@@ -941,23 +1269,171 @@ impl EventWaitQueue {
         }
     }
 
+    fn register_waker(&self, events: u64, waker: Arc<Waker>) {
+        let mut entry = Some((events, waker));
+        let mut spare: Vec<(u64, Arc<Waker>)> = Vec::new();
+
+        loop {
+            let needed_capacity;
+            {
+                let mut guard = self.wait_list.lock_irqsave();
+                if guard.len() < guard.capacity() {
+                    guard.push(entry.take().unwrap());
+                    return;
+                }
+
+                needed_capacity = (guard.len() + 1).next_power_of_two().max(4);
+                if spare.capacity() >= needed_capacity {
+                    spare.extend(guard.drain(..));
+                    spare = mem::replace(&mut *guard, spare);
+                    continue;
+                }
+            }
+
+            spare = Vec::with_capacity(needed_capacity);
+        }
+    }
+
+    fn remove_waker(&self, target: &Arc<Waker>) {
+        let mut guard = self.wait_list.lock_irqsave();
+        guard.retain(|(_, waker)| !Arc::ptr_eq(waker, target));
+    }
+
+    pub fn wait_event_interruptible<F>(&self, events: u64, mut cond: F) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        before_sleep_check(0);
+        if cond() {
+            return Ok(());
+        }
+
+        let (waiter, waker) = Waiter::new_pair();
+        loop {
+            self.register_waker(events, waker.clone());
+
+            if cond() {
+                self.remove_waker(&waker);
+                return Ok(());
+            }
+
+            if Signal::signal_pending_state(true, false, &ProcessManager::current_pcb()) {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            if let Err(err) = waiter.wait(true) {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    pub fn wait_event_interruptible_timeout<F>(
+        &self,
+        events: u64,
+        mut cond: F,
+        timeout: Duration,
+    ) -> Result<(), SystemError>
+    where
+        F: FnMut() -> bool,
+    {
+        before_sleep_check(0);
+        if cond() {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + timeout;
+        let (waiter, waker) = Waiter::new_pair();
+        loop {
+            if Instant::now() >= deadline {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            self.register_waker(events, waker.clone());
+
+            if cond() {
+                self.remove_waker(&waker);
+                return Ok(());
+            }
+
+            if Signal::signal_pending_state(true, false, &ProcessManager::current_pcb()) {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::ERESTARTSYS);
+            }
+
+            let remain = deadline
+                .duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remain == Duration::ZERO {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            let timer: Arc<Timer> = Timer::new(
+                TimeoutWaker::new(waker.clone()),
+                next_n_us_timer_jiffies(remain.total_micros()),
+            );
+            timer.activate();
+
+            let wait_result = waiter.wait(true);
+            let was_timeout = timer.timeout();
+            if !was_timeout {
+                timer.cancel();
+            }
+
+            if was_timeout {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            if let Err(err) = wait_result {
+                self.remove_waker(&waker);
+                waker.close();
+                if cond() {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        }
+    }
+
     pub fn sleep(&self, events: u64) {
         before_sleep_check(0);
         let (waiter, waker) = Waiter::new_pair();
-        {
-            let mut guard = self.wait_list.lock_irqsave();
-            guard.push((events, waker));
-        }
+        self.register_waker(events, waker);
         let _ = waiter.wait(true);
     }
 
     pub fn sleep_unlock_spinlock<T>(&self, events: u64, to_unlock: SpinLockGuard<T>) {
         before_sleep_check(1);
         let (waiter, waker) = Waiter::new_pair();
-        {
-            let mut guard = self.wait_list.lock_irqsave();
-            guard.push((events, waker));
-        }
+        self.register_waker(events, waker);
         drop(to_unlock);
         let _ = waiter.wait(true);
     }

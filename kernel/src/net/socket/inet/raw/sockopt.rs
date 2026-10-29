@@ -1,5 +1,3 @@
-use alloc::string::String;
-
 use smoltcp::wire::IpProtocol;
 use system_error::SystemError;
 
@@ -8,8 +6,12 @@ use super::constants::{
 };
 use super::options::DEFAULT_IP_TTL;
 use super::{Icmp6Filter, RawSocket};
+use crate::net::socket::common::{
+    parse_timeval_opt, write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt,
+    write_timeval_opt, write_u32_getsockopt,
+};
 use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
-use crate::net::socket::{IpOption, IFNAMSIZ, PIPV6, PRAW, PSO};
+use crate::net::socket::{IpOption, PIPV6, PRAW, PSO};
 
 fn sock_buf_u32_from_opt(val: &[u8]) -> Result<u32, SystemError> {
     if val.len() < 4 {
@@ -46,58 +48,42 @@ impl RawSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match PSO::try_from(name as u32) {
-            Ok(PSO::SNDBUF) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.options.read().sock_sndbuf;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+            Ok(PSO::ERROR) => {
+                let mut errors = self.errors.lock();
+                let errno = errors.0;
+                errors.0 = 0;
+                Ok(write_i32_getsockopt(value, errno))
             }
-            Ok(PSO::RCVBUF) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.options.read().sock_rcvbuf;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
-            }
-            Ok(PSO::BINDTODEVICE) => {
-                let name = self
-                    .options
-                    .read()
-                    .bind_to_device
-                    .clone()
-                    .unwrap_or_default();
-                let need = core::cmp::min(name.len() + 1, IFNAMSIZ);
-                if value.len() < need {
-                    return Err(SystemError::EINVAL);
-                }
-                if need == 0 {
-                    return Ok(0);
-                }
-                let bytes = name.as_bytes();
-                let copy_len = core::cmp::min(bytes.len(), need.saturating_sub(1));
-                value[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                value[copy_len] = 0;
-                Ok(need)
-            }
+            Ok(PSO::SNDBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_sndbuf)),
+            Ok(PSO::RCVBUF) => Ok(write_u32_getsockopt(value, self.options.read().sock_rcvbuf)),
+            Ok(PSO::BINDTODEVICE) => self.device_binding.get(&self.netns, value),
+            Ok(PSO::BROADCAST) => Ok(write_i32_getsockopt(
+                value,
+                self.so_broadcast
+                    .load(core::sync::atomic::Ordering::Acquire) as i32,
+            )),
             Ok(PSO::LINGER) => {
-                if value.len() < 8 {
-                    return Err(SystemError::EINVAL);
-                }
                 let opts = self.options.read();
-                value[..4].copy_from_slice(&opts.linger_onoff.to_ne_bytes());
-                value[4..8].copy_from_slice(&opts.linger_linger.to_ne_bytes());
-                Ok(8)
+                Ok(write_linger_getsockopt(
+                    value,
+                    opts.linger_onoff,
+                    opts.linger_linger,
+                ))
             }
-            Ok(PSO::ACCEPTCONN) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = 0i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+            Ok(PSO::ACCEPTCONN) => Ok(write_i32_getsockopt(value, 0)),
+            Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW) => {
+                let us = self
+                    .send_timeout_us
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                Ok(write_timeval_opt(value, us))
+            }
+            Ok(PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
+                let us = self
+                    .recv_timeout_us
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let us = if us == u64::MAX { 0 } else { us };
+                Ok(write_timeval_opt(value, us))
             }
             Ok(PSO::DETACH_FILTER) => Err(SystemError::ENOPROTOOPT),
             _ => Err(SystemError::ENOPROTOOPT),
@@ -114,12 +100,10 @@ impl RawSocket {
                 if self.protocol != IpProtocol::Icmp {
                     return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                 }
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
+                // Linux raw_geticmpfilter copies sizeof(struct icmp_filter)==32 bytes;
+                // DragonOS exposes a 32-bit mask for ICMP types 0–31 (see options::IcmpFilter).
                 let mask = self.options.read().icmp_filter.get_mask();
-                value[..4].copy_from_slice(&mask.to_ne_bytes());
-                Ok(4)
+                Ok(write_u32_getsockopt(value, mask))
             }
             _ => Err(SystemError::ENOPROTOOPT),
         }
@@ -131,72 +115,58 @@ impl RawSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match IpOption::try_from(name as u32) {
-            Ok(IpOption::HDRINCL) => {
-                let v = if self.options.read().ip_hdrincl {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
-            Ok(IpOption::TOS) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.options.read().ip_tos as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
-            }
-            Ok(IpOption::TTL) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.options.read().ip_ttl as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
-            }
-            Ok(IpOption::PKTINFO) => {
-                let v = if self.options.read().recv_pktinfo_v4 {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
-            Ok(IpOption::RECVTTL) => {
-                let v = if self.options.read().recv_ttl {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
-            Ok(IpOption::RECVTOS) => {
-                let v = if self.options.read().recv_tos {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
+            Ok(IpOption::MTU_DISCOVER) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ip_pmtu.as_i32(),
+            )),
+            Ok(IpOption::MTU) => Ok(write_i32_getsockopt(
+                value,
+                self.connected_path_mtu()? as i32,
+            )),
+            Ok(IpOption::RECVERR) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().recv_err_v4 as i32,
+            )),
+            Ok(IpOption::HDRINCL) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().ip_hdrincl as i32,
+            )),
+            Ok(IpOption::TOS) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().ip_tos as i32,
+            )),
+            Ok(IpOption::TTL) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().ip_ttl as i32,
+            )),
+            Ok(IpOption::PKTINFO) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().recv_pktinfo_v4 as i32,
+            )),
+            Ok(IpOption::RECVTTL) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().recv_ttl as i32,
+            )),
+            Ok(IpOption::RECVTOS) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.options.read().recv_tos as i32,
+            )),
             Ok(IpOption::MULTICAST_IF) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
                 let v = self
                     .ip_multicast_addr
                     .load(core::sync::atomic::Ordering::Relaxed);
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_u32_getsockopt(value, v))
             }
+            Ok(IpOption::MULTICAST_TTL) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.ip_multicast_ttl
+                    .load(core::sync::atomic::Ordering::Acquire),
+            )),
+            Ok(IpOption::MULTICAST_LOOP) => Ok(write_i32_getsockopt_ipv4(
+                value,
+                self.ip_multicast_loop
+                    .load(core::sync::atomic::Ordering::Acquire) as i32,
+            )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -210,61 +180,54 @@ impl RawSocket {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         match PIPV6::try_from(name as u32) {
+            Ok(PIPV6::MULTICAST_LOOP) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ipv6_multicast_loop as i32,
+            )),
+            Ok(PIPV6::MTU_DISCOVER) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ipv6_pmtu.as_i32(),
+            )),
+            Ok(PIPV6::MTU) => Ok(write_i32_getsockopt(
+                value,
+                self.connected_path_mtu()? as i32,
+            )),
+            Ok(PIPV6::RECVERR) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().recv_err_v6 as i32,
+            )),
+            Ok(PIPV6::HDRINCL) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ip_hdrincl as i32,
+            )),
             Ok(PIPV6::CHECKSUM) => {
                 let v = if self.protocol == IpProtocol::Icmpv6 {
                     ICMPV6_CHECKSUM_OFFSET
                 } else {
                     self.options.read().ipv6_checksum
                 };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
+                Ok(write_i32_getsockopt(value, v))
             }
-            Ok(PIPV6::UNICAST_HOPS) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.options.read().ip_ttl as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
-            }
-            Ok(PIPV6::TCLASS) => {
-                if value.len() < 4 {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.options.read().ip_tos as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(4)
-            }
-            Ok(PIPV6::RECVPKTINFO) => {
-                let v = if self.options.read().recv_pktinfo_v6 {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
-            Ok(PIPV6::RECVHOPLIMIT) => {
-                let v = if self.options.read().recv_hoplimit {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
-            Ok(PIPV6::RECVTCLASS) => {
-                let v = if self.options.read().recv_tclass {
-                    1i32
-                } else {
-                    0i32
-                };
-                let len = core::cmp::min(value.len(), 4);
-                value[..len].copy_from_slice(&v.to_ne_bytes()[..len]);
-                Ok(len)
-            }
+            Ok(PIPV6::UNICAST_HOPS) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ip_ttl as i32,
+            )),
+            Ok(PIPV6::TCLASS) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ip_tos as i32,
+            )),
+            Ok(PIPV6::RECVPKTINFO) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().recv_pktinfo_v6 as i32,
+            )),
+            Ok(PIPV6::RECVHOPLIMIT) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().recv_hoplimit as i32,
+            )),
+            Ok(PIPV6::RECVTCLASS) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().recv_tclass as i32,
+            )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -291,8 +254,10 @@ impl RawSocket {
                 core::mem::size_of_val(&filt.icmp6_filt),
             )
         };
-        value[..bytes.len()].copy_from_slice(bytes);
-        Ok(bytes.len())
+        // Linux rawv6_geticmpfilter: 仅拷贝 min(用户缓冲区, filter) 字节。
+        let len = core::cmp::min(value.len(), bytes.len());
+        value[..len].copy_from_slice(&bytes[..len]);
+        Ok(len)
     }
 
     // ========================================================================
@@ -309,6 +274,13 @@ impl RawSocket {
                 let v = sock_buf_u32_from_opt(val)?;
                 let newv = clamp_sock_buf(v, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF);
                 self.options.write().sock_sndbuf = newv;
+                self.send_account.set_limit(newv as usize);
+                Ok(())
+            }
+            Ok(PSO::BROADCAST) => {
+                let enable = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                self.so_broadcast
+                    .store(enable, core::sync::atomic::Ordering::Release);
                 Ok(())
             }
             Ok(PSO::RCVBUF) => {
@@ -318,22 +290,8 @@ impl RawSocket {
                 Ok(())
             }
             Ok(PSO::BINDTODEVICE) => {
-                let end = val.iter().position(|&b| b == 0).unwrap_or(val.len());
-                let name_bytes = &val[..end];
-                if name_bytes.is_empty() {
-                    self.options.write().bind_to_device = None;
-                    return Ok(());
-                }
-                let name = core::str::from_utf8(name_bytes).map_err(|_| SystemError::EINVAL)?;
-                let found = self
-                    .netns
-                    .device_list()
-                    .values()
-                    .any(|iface| iface.iface_name() == name);
-                if !found {
-                    return Err(SystemError::ENODEV);
-                }
-                self.options.write().bind_to_device = Some(String::from(name));
+                let mut update = self.device_binding.prepare_update(&self.netns, val)?;
+                update.commit();
                 Ok(())
             }
             Ok(PSO::DETACH_FILTER) => {
@@ -358,7 +316,21 @@ impl RawSocket {
                 opts.linger_linger = l_linger;
                 Ok(())
             }
-            _ => Ok(()),
+            Ok(PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW) => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.send_timeout_us
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW) => {
+                let d = parse_timeval_opt(val)?;
+                let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
+                self.recv_timeout_us
+                    .store(us, core::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
@@ -381,6 +353,28 @@ impl RawSocket {
 
     pub(super) fn set_option_ip_level(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
         match IpOption::try_from(name as u32) {
+            Ok(IpOption::MTU_DISCOVER) => {
+                self.options.write().ip_pmtu = super::super::common::pmtu::PmtuPolicy::from_i32(
+                    read_i32_opt(val)
+                        .or_else(|| val.first().map(|value| *value as i32))
+                        .ok_or(SystemError::EINVAL)?,
+                )?;
+                Ok(())
+            }
+            Ok(IpOption::RECVERR) => {
+                let enabled = read_i32_opt(val)
+                    .unwrap_or_else(|| val.first().copied().unwrap_or(0) as i32)
+                    != 0;
+                if val.is_empty() {
+                    return Err(SystemError::EINVAL);
+                }
+                let mut errors = self.errors.lock();
+                self.options.write().recv_err_v4 = enabled;
+                if !enabled {
+                    errors.1.clear();
+                }
+                Ok(())
+            }
             Ok(IpOption::HDRINCL) => {
                 let enable = val.first().copied().unwrap_or(0) != 0;
                 self.options.write().ip_hdrincl = enable;
@@ -424,11 +418,36 @@ impl RawSocket {
                 &self.ip_multicast_ifindex,
                 &self.ip_multicast_addr,
             ),
+            Ok(IpOption::MULTICAST_TTL) => {
+                let value = if val.len() == 1 {
+                    i32::from(val[0])
+                } else {
+                    read_i32_opt(val).ok_or(SystemError::EINVAL)?
+                };
+                let ttl = match value {
+                    -1 => 1,
+                    0..=255 => value,
+                    _ => return Err(SystemError::EINVAL),
+                };
+                self.ip_multicast_ttl
+                    .store(ttl, core::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Ok(IpOption::MULTICAST_LOOP) => {
+                let value = if val.len() == 1 {
+                    i32::from(val[0])
+                } else {
+                    read_i32_opt(val).ok_or(SystemError::EINVAL)?
+                };
+                self.ip_multicast_loop
+                    .store(value != 0, core::sync::atomic::Ordering::Release);
+                Ok(())
+            }
             Ok(IpOption::ADD_MEMBERSHIP) | Ok(IpOption::DROP_MEMBERSHIP) => {
                 let opt = IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)
+                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups).map(|_| ())
             }
-            _ => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 
@@ -437,6 +456,42 @@ impl RawSocket {
             return Err(SystemError::ENOPROTOOPT);
         }
         match PIPV6::try_from(name as u32) {
+            Ok(PIPV6::MULTICAST_LOOP) => {
+                let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)?;
+                if !(0..=1).contains(&enabled) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.options.write().ipv6_multicast_loop = enabled != 0;
+                Ok(())
+            }
+            Ok(PIPV6::MTU) => {
+                let mtu = read_i32_opt(val).ok_or(SystemError::EINVAL)?;
+                if mtu != 0 && mtu < 1280 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.options.write().ipv6_frag_size = mtu as usize;
+                Ok(())
+            }
+            Ok(PIPV6::MTU_DISCOVER) => {
+                self.options.write().ipv6_pmtu = super::super::common::pmtu::PmtuPolicy::from_i32(
+                    read_i32_opt(val).ok_or(SystemError::EINVAL)?,
+                )?;
+                Ok(())
+            }
+            Ok(PIPV6::RECVERR) => {
+                let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                let mut errors = self.errors.lock();
+                self.options.write().recv_err_v6 = enabled;
+                if !enabled {
+                    errors.1.clear();
+                }
+                Ok(())
+            }
+            Ok(PIPV6::HDRINCL) => {
+                let enabled = read_i32_opt(val).ok_or(SystemError::EINVAL)? != 0;
+                self.options.write().ip_hdrincl = enabled;
+                Ok(())
+            }
             Ok(PIPV6::CHECKSUM) => {
                 if self.protocol == IpProtocol::Icmpv6 {
                     return Err(SystemError::EINVAL);
@@ -487,7 +542,7 @@ impl RawSocket {
                 self.options.write().recv_tclass = enable;
                 Ok(())
             }
-            _ => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
         }
     }
 

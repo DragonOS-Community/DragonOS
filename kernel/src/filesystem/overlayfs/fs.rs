@@ -1,0 +1,1308 @@
+use super::config::OverlayMountData;
+use super::entry::OvlLayer;
+use super::inode::{DirState, OvlInode, OvlLinkState};
+use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
+use crate::filesystem::vfs::{
+    self,
+    fcntl::AtFlags,
+    utils::{user_resolved_path_at, ResolvedPath},
+    vcore::generate_inode_id,
+    FileSystem, FileSystemMakerData, FileType, FsCreationContext, FsInfo, FsReconfigureRequest,
+    FsconfigPreparedData, IndexNode, InodeId, LinkMutationCoordinator, MountableFileSystem,
+    SuperBlock, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+};
+use crate::libs::{casting::DowncastArc, mutex::Mutex};
+use crate::process::{Cred, ProcessManager};
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+use hashbrown::HashMap;
+use system_error::SystemError;
+
+const MAX_MOUNT_ANCESTOR_DEPTH: usize = vfs::MAX_PATHLEN;
+const INODE_CACHE_PRUNE_INTERVAL: usize = 256;
+type LowerRoot = (String, Arc<dyn IndexNode>);
+
+/// Path objects fixed when each fsconfig parameter is supplied. The resulting
+/// overlay filesystem retains its share of these pins until final shutdown.
+#[derive(Debug, Clone, Default)]
+struct OverlayFsconfigPaths {
+    upper: Option<Arc<ResolvedPath>>,
+    work: Option<Arc<ResolvedPath>>,
+    lowers: Option<Vec<Arc<ResolvedPath>>>,
+}
+
+fn resolve_fsconfig_layer(
+    name: &str,
+) -> Result<Arc<ResolvedPath>, crate::mm::allocation::MemoryAllocationError> {
+    let pcb = ProcessManager::current_pcb();
+    let (start, rest) = user_resolved_path_at(&pcb, AtFlags::AT_FDCWD.bits(), name)?;
+    let path = start.inode().lookup_follow_symlink_owned(
+        &start,
+        &rest,
+        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        true,
+    )?;
+    if path.inode().metadata()?.file_type != FileType::Dir {
+        return Err(SystemError::EINVAL.into());
+    }
+    Arc::try_new(path).map_err(|_| SystemError::ENOMEM.into())
+}
+
+fn validate_workdir(inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    if inode.metadata()?.file_type != FileType::Dir
+        || inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .is_some_and(|inode| inode.mount_fs().is_readonly())
+    {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct RealInodeIdentity {
+    filesystem: usize,
+    dev_id: usize,
+    inode_id: InodeId,
+}
+
+impl RealInodeIdentity {
+    pub(super) fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
+        let fs = OverlayFS::canonical_backing_fs(inode);
+        let metadata = inode.metadata()?;
+        Ok(Self {
+            filesystem: Arc::as_ptr(&fs) as *const () as usize,
+            dev_id: metadata.dev_id,
+            inode_id: metadata.inode_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OvlInodeOrigin {
+    Lower {
+        lower: Vec<RealInodeIdentity>,
+        upper: Option<RealInodeIdentity>,
+    },
+    Upper(RealInodeIdentity),
+}
+
+/// Stable identity of one overlay-visible non-directory inode.
+///
+/// Once an inode has a lower origin, copy-up must not change this identity.
+/// Pure-upper inodes use the backing upper identity directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum OvlLinkIdentity {
+    Lower(RealInodeIdentity),
+    Upper(RealInodeIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OvlLinkSeed {
+    identity: OvlLinkIdentity,
+    initial_nlinks: usize,
+}
+
+impl OvlLinkSeed {
+    pub(super) fn new(identity: OvlLinkIdentity, initial_nlinks: usize) -> Self {
+        Self {
+            identity,
+            initial_nlinks,
+        }
+    }
+
+    pub(super) fn identity(self) -> OvlLinkIdentity {
+        self.identity
+    }
+
+    pub(super) fn initial_nlinks(self) -> usize {
+        self.initial_nlinks
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OvlInodeCacheKey {
+    redirect: String,
+    origin: OvlInodeOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DirIdentity {
+    Lower(Vec<RealInodeIdentity>),
+    Upper(RealInodeIdentity),
+}
+
+#[derive(Debug, Default)]
+struct DirStateCache {
+    entries: BTreeMap<DirIdentity, Weak<DirState>>,
+    insertions_since_prune: usize,
+}
+
+impl DirStateCache {
+    fn intern(&mut self, key: DirIdentity) -> Arc<DirState> {
+        if let Some(state) = self.entries.get(&key).and_then(Weak::upgrade) {
+            return state;
+        }
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, state| state.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        let state = Arc::new(DirState::default());
+        self.entries.insert(key, Arc::downgrade(&state));
+        self.insertions_since_prune += 1;
+        state
+    }
+}
+
+#[derive(Debug, Default)]
+struct OvlInodeCache {
+    entries: BTreeMap<OvlInodeCacheKey, Weak<OvlInode>>,
+    /// Mount-global bounded retention for repeated short-lived lookups.
+    recent_lookups: VecDeque<Arc<OvlInode>>,
+    /// Bounded strong cache for non-samefs directories whose fallback inode
+    /// number is only meaningful for the OvlInode cache lifetime.
+    recent_fallback_dirs: VecDeque<Arc<OvlInode>>,
+    insertions_since_prune: usize,
+}
+
+/// Weak owners shared by path-specific overlay inodes of one logical inode.
+/// Keeping FIFO identity here also survives copy-up and hardlink aliases.
+#[derive(Debug)]
+struct OvlInodeOwners {
+    coordinator: Weak<LinkMutationCoordinator>,
+    fifo: Weak<crate::ipc::pipe::LockedPipeInode>,
+}
+
+#[derive(Debug, Default)]
+struct OvlLinkStateCache {
+    entries: HashMap<OvlLinkIdentity, Weak<OvlLinkState>>,
+    inode_owners: HashMap<OvlLinkIdentity, OvlInodeOwners>,
+    /// Copy-up publishes this small identity connector before the new upper
+    /// name becomes visible. It preserves a lower-origin seed without eagerly
+    /// allocating the shared mutation state on lookup or open.
+    connectors: HashMap<RealInodeIdentity, OvlLinkSeed>,
+    /// Lower-origin states are created only for a logical link-count mutation.
+    /// A mutation guard pins here before the backing commit so retaining the
+    /// authoritative union count can never allocate after namespace change.
+    divergent: HashMap<OvlLinkIdentity, Arc<OvlLinkState>>,
+    insertions_since_prune: usize,
+    owner_insertions_since_prune: usize,
+}
+
+impl OvlLinkStateCache {
+    fn intern_inode_owners(
+        &mut self,
+        identity: OvlLinkIdentity,
+        file_type: FileType,
+    ) -> Result<
+        (
+            Arc<LinkMutationCoordinator>,
+            Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
+        ),
+        SystemError,
+    > {
+        let cached = self.inode_owners.get(&identity);
+        let coordinator = cached.and_then(|owners| owners.coordinator.upgrade());
+        let fifo = (file_type == FileType::Pipe).then(|| {
+            cached
+                .and_then(|owners| owners.fifo.upgrade())
+                .unwrap_or_else(crate::ipc::pipe::LockedPipeInode::new_fifo_shell)
+        });
+        if let Some(coordinator) = coordinator {
+            if let Some(fifo) = fifo.as_ref() {
+                self.inode_owners.get_mut(&identity).unwrap().fifo = Arc::downgrade(fifo);
+            }
+            return Ok((coordinator, fifo));
+        }
+        if self.owner_insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.inode_owners.retain(|_, owners| {
+                owners.coordinator.strong_count() != 0 || owners.fifo.strong_count() != 0
+            });
+            self.owner_insertions_since_prune = 0;
+        }
+        self.inode_owners
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let coordinator =
+            Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?;
+        self.inode_owners.insert(
+            identity,
+            OvlInodeOwners {
+                coordinator: Arc::downgrade(&coordinator),
+                fifo: fifo.as_ref().map(Arc::downgrade).unwrap_or_default(),
+            },
+        );
+        self.owner_insertions_since_prune += 1;
+        Ok((coordinator, fifo))
+    }
+
+    fn resolve(&self, identity: OvlLinkIdentity) -> Option<Arc<OvlLinkState>> {
+        self.entries.get(&identity).and_then(Weak::upgrade)
+    }
+
+    fn intern(
+        &mut self,
+        identity: OvlLinkIdentity,
+        upper_alias: Option<OvlLinkIdentity>,
+        nlinks: usize,
+    ) -> Result<Arc<OvlLinkState>, SystemError> {
+        if let Some(state) = self
+            .resolve(identity)
+            .or_else(|| upper_alias.and_then(|upper_identity| self.resolve(upper_identity)))
+        {
+            self.entries
+                .try_reserve(1 + usize::from(upper_alias.is_some()))
+                .map_err(|_| SystemError::ENOMEM)?;
+            self.entries.insert(identity, Arc::downgrade(&state));
+            if let Some(upper_identity) = upper_alias {
+                self.entries.insert(upper_identity, Arc::downgrade(&state));
+            }
+            return Ok(state);
+        }
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, state| state.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        self.entries
+            .try_reserve(1 + usize::from(upper_alias.is_some()))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let state =
+            Arc::try_new(OvlLinkState::new(identity, nlinks)).map_err(|_| SystemError::ENOMEM)?;
+        self.entries.insert(identity, Arc::downgrade(&state));
+        if let Some(upper_identity) = upper_alias {
+            self.entries.insert(upper_identity, Arc::downgrade(&state));
+        }
+        self.insertions_since_prune += 1;
+        Ok(state)
+    }
+
+    fn begin_mutation(&mut self, state: &Arc<OvlLinkState>) -> Result<bool, SystemError> {
+        let identity = state.identity();
+        if self.divergent.contains_key(&identity) {
+            return Ok(false);
+        }
+        self.divergent
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.divergent.insert(identity, state.clone());
+        Ok(true)
+    }
+
+    fn abort_mutation(&mut self, state: &Arc<OvlLinkState>, newly_pinned: bool) {
+        if newly_pinned
+            && self
+                .divergent
+                .get(&state.identity())
+                .is_some_and(|current| Arc::ptr_eq(current, state))
+        {
+            self.divergent.remove(&state.identity());
+        }
+    }
+
+    fn alias(
+        &mut self,
+        alias: OvlLinkIdentity,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<(), SystemError> {
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.entries.insert(alias, Arc::downgrade(state));
+        Ok(())
+    }
+
+    fn commit_mutation(&mut self, state: &Arc<OvlLinkState>, nlinks: usize) {
+        let identity = state.identity();
+        if nlinks == 0 {
+            if self
+                .divergent
+                .get(&identity)
+                .is_some_and(|current| Arc::ptr_eq(current, state))
+            {
+                self.divergent.remove(&identity);
+            }
+            self.connectors
+                .retain(|_, seed| seed.identity() != identity);
+            self.entries.retain(|_, cached| {
+                cached
+                    .upgrade()
+                    .is_some_and(|current| !Arc::ptr_eq(&current, state))
+            });
+        } else {
+            debug_assert!(self.divergent.contains_key(&identity));
+        }
+    }
+
+    fn connector(&self, upper: RealInodeIdentity) -> Option<OvlLinkSeed> {
+        self.connectors.get(&upper).copied()
+    }
+}
+
+pub(super) struct OvlLinkSeedPublication {
+    fs: Arc<OverlayFS>,
+    upper: RealInodeIdentity,
+    seed: OvlLinkSeed,
+    inserted: bool,
+    committed: bool,
+}
+
+impl OvlLinkSeedPublication {
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for OvlLinkSeedPublication {
+    fn drop(&mut self) {
+        if self.committed || !self.inserted {
+            return;
+        }
+        let mut cache = self.fs.link_state_cache.lock();
+        if cache.connectors.get(&self.upper) == Some(&self.seed) {
+            cache.connectors.remove(&self.upper);
+        }
+        if cache.connectors.is_empty() {
+            self.fs
+                .link_seed_connectors_present
+                .store(false, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct AncestorPublication {
+    lower: Vec<RealInodeIdentity>,
+    upper: Weak<dyn IndexNode>,
+}
+
+#[derive(Debug, Default)]
+struct AncestorPublicationCache {
+    entries: BTreeMap<String, AncestorPublication>,
+    insertions_since_prune: usize,
+}
+
+const FALLBACK_DIR_CACHE_SIZE: usize = 256;
+const LOOKUP_RETENTION_SIZE: usize = 1024;
+const LOCK_STRIPE_COUNT: usize = 64;
+
+impl OvlInodeCache {
+    fn lookup(&self, key: &OvlInodeCacheKey) -> Option<Arc<OvlInode>> {
+        self.entries.get(key).and_then(Weak::upgrade)
+    }
+
+    fn still_contains(&self, key: &OvlInodeCacheKey, expected: Option<&Arc<OvlInode>>) -> bool {
+        match (self.lookup(key), expected) {
+            (Some(current), Some(expected)) => Arc::ptr_eq(&current, expected),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn retain(&mut self, inode: Arc<OvlInode>, retain_fallback_dir: bool) {
+        self.recent_lookups
+            .retain(|cached| !Arc::ptr_eq(cached, &inode));
+        self.recent_lookups.push_back(inode.clone());
+        if self.recent_lookups.len() > LOOKUP_RETENTION_SIZE {
+            self.recent_lookups.pop_front();
+        }
+
+        if retain_fallback_dir {
+            self.recent_fallback_dirs
+                .retain(|cached| !Arc::ptr_eq(cached, &inode));
+            self.recent_fallback_dirs.push_back(inode.clone());
+            if self.recent_fallback_dirs.len() > FALLBACK_DIR_CACHE_SIZE {
+                self.recent_fallback_dirs.pop_front();
+            }
+        }
+    }
+
+    fn replace(&mut self, key: OvlInodeCacheKey, inode: Arc<OvlInode>, retain_fallback_dir: bool) {
+        if self.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            self.entries.retain(|_, inode| inode.strong_count() != 0);
+            self.insertions_since_prune = 0;
+        }
+        self.entries.insert(key, Arc::downgrade(&inode));
+        self.insertions_since_prune += 1;
+        self.retain(inode, retain_fallback_dir);
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(super) struct OvlSuperBlock {
+    super_block: SuperBlock,
+    pseudo_dev: DeviceNumber, // virtual device number
+    is_lower: bool,
+}
+
+/// Semantic backing-mount ownership ends at superblock shutdown, independently
+/// of the lifetime of cached inode wrappers and workqueue Arc references.
+#[derive(Debug)]
+struct OverlayBackingMounts {
+    write_mount: Option<vfs::mount::MountExternalGuard>,
+    _paths: Option<Arc<OverlayFsconfigPaths>>,
+}
+
+#[derive(Debug)]
+pub(super) struct OverlayFS {
+    #[allow(dead_code)]
+    pub(super) numlayer: usize,
+    #[allow(dead_code)]
+    pub(super) numfs: u32,
+    #[allow(dead_code)]
+    pub(super) numdatalayer: usize,
+    pub(super) layers: Vec<OvlLayer>, // index 0 is upper when present; lowers have index >= 1
+    pub(super) workdir: Option<Arc<dyn IndexNode>>,
+    // Admission must not take upper_inode/copy-up locks to find its backing
+    // mount. None means final shutdown has released our semantic ownership.
+    backing_mounts: Mutex<Option<OverlayBackingMounts>>,
+    pub(super) root_inode: Arc<OvlInode>,
+    pub(super) super_block: SuperBlock,
+    pub(super) mutation_lock: Mutex<()>,
+    pub(super) backing_cred: Arc<Cred>,
+    pub(super) samefs: bool,
+    inode_cache: Mutex<OvlInodeCache>,
+    link_state_cache: Mutex<OvlLinkStateCache>,
+    link_seed_connectors_present: AtomicBool,
+    dir_state_cache: Mutex<DirStateCache>,
+    ancestor_publications: Mutex<AncestorPublicationCache>,
+    copy_up_locks: Vec<Mutex<()>>,
+    ancestor_copy_up_locks: Vec<Mutex<()>>,
+    content_locks: Vec<Mutex<()>>,
+}
+
+impl FileSystem for OverlayFS {
+    fn prepare_write(&self) -> Result<Vec<vfs::mount::writer::MountWriteGuard>, SystemError> {
+        let mut writers = Vec::new();
+        let backing = self.backing_mounts.lock();
+        let backing = backing.as_ref().ok_or(SystemError::EBUSY)?;
+        if let Some(mount) = &backing.write_mount {
+            writers.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            writers.push(mount.mount().want_write_from(mount)?);
+        }
+        Ok(writers)
+    }
+    fn shrink_inode_cache_for_shutdown(&self) -> Result<(), SystemError> {
+        // Final shutdown has no active mounts or external operations. Detach
+        // the cache before releasing retentions: their zero-owner callbacks
+        // can publish work to the still-live backing filesystem.
+        let cache = core::mem::take(&mut *self.inode_cache.lock());
+        for inode in cache.entries.values().filter_map(Weak::upgrade) {
+            inode.release_backing_retentions_for_shutdown();
+        }
+        for inode in cache
+            .recent_lookups
+            .iter()
+            .chain(cache.recent_fallback_dirs.iter())
+        {
+            inode.release_backing_retentions_for_shutdown();
+        }
+        self.root_inode.release_backing_retentions_for_shutdown();
+        for layer in &self.layers {
+            layer.mnt.release_backing_retentions_for_shutdown();
+        }
+        drop(cache);
+        Ok(())
+    }
+
+    fn on_umount(&self) {
+        // Like Linux ovl_put_super(): ordinary umount must release backing
+        // mount pins before VFS publishes shutdown completion. Drop outside
+        // our lock because the last pin can start backing filesystem shutdown.
+        let backing = self.backing_mounts.lock().take();
+        drop(backing);
+    }
+
+    fn required_superblock_flags(&self) -> crate::filesystem::vfs::mount::MountFlags {
+        if self.ovl_upper_mnt().is_none() {
+            crate::filesystem::vfs::mount::MountFlags::RDONLY
+        } else {
+            crate::filesystem::vfs::mount::MountFlags::empty()
+        }
+    }
+
+    fn reconfigure(
+        &self,
+        request: FsReconfigureRequest<'_>,
+    ) -> Result<crate::filesystem::vfs::mount::MountFlags, SystemError> {
+        let flags = request.sb_flags & request.sb_flags_mask;
+        if self.ovl_upper_mnt().is_none()
+            && !flags.contains(crate::filesystem::vfs::mount::MountFlags::RDONLY)
+        {
+            return Err(SystemError::EROFS);
+        }
+        if !request.oldapi && request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(flags)
+    }
+
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        self.root_inode.clone()
+    }
+
+    fn info(&self) -> vfs::FsInfo {
+        FsInfo {
+            blk_dev_id: 0,
+            max_name_len: 255,
+        }
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "overlayfs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        self.super_block.clone()
+    }
+}
+
+impl OverlayFS {
+    pub(super) fn ovl_upper_mnt(&self) -> Option<Arc<OvlInode>> {
+        self.layers
+            .first()
+            .filter(|layer| layer.index == 0)
+            .map(|layer| layer.mnt.clone())
+    }
+
+    pub(super) fn require_upper(&self) -> Result<(), SystemError> {
+        self.ovl_upper_mnt().map(|_| ()).ok_or(SystemError::EROFS)
+    }
+
+    pub(super) fn intern_inode(
+        self: &Arc<Self>,
+        redirect: String,
+        file_type: FileType,
+        upper_inode: Option<Arc<dyn IndexNode>>,
+        lower_inodes: Vec<Arc<dyn IndexNode>>,
+        replace_stale: bool,
+        initial_nlinks: usize,
+    ) -> Result<Option<Arc<OvlInode>>, SystemError> {
+        let upper_identity = upper_inode
+            .as_ref()
+            .map(RealInodeIdentity::from_inode)
+            .transpose()?;
+        let recovered_seed = if lower_inodes.is_empty() && file_type != FileType::Dir {
+            upper_identity.and_then(|upper| self.resolve_link_seed(upper))
+        } else {
+            None
+        };
+        let origin = if let Some(seed) = recovered_seed {
+            let OvlLinkIdentity::Lower(lower) = seed.identity() else {
+                return Err(SystemError::EIO);
+            };
+            OvlInodeOrigin::Lower {
+                lower: alloc::vec![lower],
+                upper: upper_identity,
+            }
+        } else if lower_inodes.is_empty() {
+            OvlInodeOrigin::Upper(upper_identity.ok_or(SystemError::ENOENT)?)
+        } else {
+            OvlInodeOrigin::Lower {
+                lower: lower_inodes
+                    .iter()
+                    .map(RealInodeIdentity::from_inode)
+                    .collect::<Result<Vec<_>, _>>()?,
+                upper: upper_identity,
+            }
+        };
+        let link_identity = match &origin {
+            OvlInodeOrigin::Lower { lower, .. } => {
+                lower.first().copied().map(OvlLinkIdentity::Lower)
+            }
+            OvlInodeOrigin::Upper(identity) => Some(OvlLinkIdentity::Upper(*identity)),
+        };
+        let key = OvlInodeCacheKey {
+            redirect: redirect.clone(),
+            origin,
+        };
+        let retain_fallback_dir = !self.samefs && file_type == FileType::Dir;
+        let expected_has_upper = upper_inode.is_some();
+        let inode = loop {
+            // Never inspect an inode while holding inode_cache: copy-up owns
+            // upper_inode before consulting this cache for ancestor objects.
+            let candidate = self.inode_cache.lock().lookup(&key);
+            if let Some(candidate) = candidate.as_ref() {
+                if candidate.has_upper() == expected_has_upper {
+                    let mut cache = self.inode_cache.lock();
+                    if cache.still_contains(&key, Some(candidate)) {
+                        cache.retain(candidate.clone(), retain_fallback_dir);
+                        break candidate.clone();
+                    }
+                    continue;
+                }
+                // A lower-only backing snapshot can race with this candidate's
+                // copy-up publication.  Ask lookup to refresh the backing once
+                // before deciding that the cached upper is detached.
+                if !expected_has_upper && !replace_stale {
+                    return Ok(None);
+                }
+            }
+
+            let replacement = {
+                let fallback_id = retain_fallback_dir.then(generate_inode_id);
+                // A cache hit already owns the canonical coordinator. Only
+                // intern one when this lookup really needs a new inode; the
+                // cache comparison below decides which racing replacement is
+                // published, and the loser drops its temporary references.
+                let (link_coordinator, fifo) = match link_identity {
+                    Some(identity) if file_type != FileType::Dir => self
+                        .link_state_cache
+                        .lock()
+                        .intern_inode_owners(identity, file_type)?,
+                    _ => (
+                        Arc::try_new(LinkMutationCoordinator::new())
+                            .map_err(|_| SystemError::ENOMEM)?,
+                        None,
+                    ),
+                };
+                let inode = OvlInode::new(
+                    redirect.clone(),
+                    file_type,
+                    upper_inode.clone(),
+                    lower_inodes.clone(),
+                    fallback_id,
+                    link_coordinator,
+                    fifo,
+                );
+                inode.set_fs(Arc::downgrade(self));
+                inode
+            };
+            let mut cache = self.inode_cache.lock();
+            if cache.still_contains(&key, candidate.as_ref()) {
+                cache.replace(key.clone(), replacement.clone(), retain_fallback_dir);
+                break replacement;
+            }
+        };
+        inode.load_origin_once()?;
+        if let Some(identity) = link_identity {
+            inode.install_link_seed(
+                identity,
+                recovered_seed
+                    .map(OvlLinkSeed::initial_nlinks)
+                    .unwrap_or(initial_nlinks),
+            );
+        }
+        Ok(Some(inode))
+    }
+
+    pub(super) fn resolve_link_state(
+        &self,
+        identity: OvlLinkIdentity,
+    ) -> Option<Arc<OvlLinkState>> {
+        self.link_state_cache.lock().resolve(identity)
+    }
+
+    pub(super) fn intern_link_state(
+        &self,
+        identity: OvlLinkIdentity,
+        upper_alias: Option<OvlLinkIdentity>,
+        initial_nlinks: usize,
+    ) -> Result<Arc<OvlLinkState>, SystemError> {
+        self.link_state_cache
+            .lock()
+            .intern(identity, upper_alias, initial_nlinks)
+    }
+
+    pub(super) fn begin_link_mutation(
+        &self,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<bool, SystemError> {
+        self.link_state_cache.lock().begin_mutation(state)
+    }
+
+    pub(super) fn abort_link_mutation(&self, state: &Arc<OvlLinkState>, newly_pinned: bool) {
+        self.link_state_cache
+            .lock()
+            .abort_mutation(state, newly_pinned);
+    }
+
+    pub(super) fn alias_link_state(
+        &self,
+        alias: OvlLinkIdentity,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<(), SystemError> {
+        self.link_state_cache.lock().alias(alias, state)
+    }
+
+    pub(super) fn commit_link_mutation(&self, state: &Arc<OvlLinkState>, nlinks: usize) {
+        let mut cache = self.link_state_cache.lock();
+        cache.commit_mutation(state, nlinks);
+        if cache.connectors.is_empty() {
+            self.link_seed_connectors_present
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn resolve_link_seed(&self, upper: RealInodeIdentity) -> Option<OvlLinkSeed> {
+        if !self.link_seed_connectors_present.load(Ordering::Acquire) {
+            return None;
+        }
+        self.link_state_cache.lock().connector(upper)
+    }
+
+    pub(super) fn prepare_link_seed_publication(
+        self: &Arc<Self>,
+        upper: RealInodeIdentity,
+        seed: OvlLinkSeed,
+    ) -> Result<OvlLinkSeedPublication, SystemError> {
+        let mut cache = self.link_state_cache.lock();
+        let inserted = match cache.connectors.get(&upper) {
+            Some(current) if *current == seed => false,
+            Some(_) => return Err(SystemError::EIO),
+            None => {
+                cache
+                    .connectors
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                cache.connectors.insert(upper, seed);
+                true
+            }
+        };
+        self.link_seed_connectors_present
+            .store(true, Ordering::Release);
+        drop(cache);
+        Ok(OvlLinkSeedPublication {
+            fs: self.clone(),
+            upper,
+            seed,
+            inserted,
+            committed: false,
+        })
+    }
+
+    pub(super) fn cached_lower_dirs(
+        &self,
+        redirect: &str,
+        lowers: &[Arc<dyn IndexNode>],
+    ) -> Result<Vec<Arc<OvlInode>>, SystemError> {
+        let lower_identities = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let cache = self.inode_cache.lock();
+        let mut inodes = cache
+            .entries
+            .iter()
+            .filter_map(|(key, inode)| {
+                let OvlInodeOrigin::Lower { lower, .. } = &key.origin else {
+                    return None;
+                };
+                (key.redirect == redirect && *lower == lower_identities)
+                    .then(|| inode.upgrade())
+                    .flatten()
+            })
+            .filter(|inode| inode.is_dir())
+            .collect::<Vec<_>>();
+        inodes.sort_by_key(Arc::as_ptr);
+        inodes.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        Ok(inodes)
+    }
+
+    pub(super) fn prepare_ancestor_publication(
+        &self,
+        lowers: &[Arc<dyn IndexNode>],
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<AncestorPublication, SystemError> {
+        let lower = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AncestorPublication {
+            lower,
+            upper: Arc::downgrade(upper),
+        })
+    }
+
+    pub(super) fn remember_ancestor_publication(
+        &self,
+        redirect: &str,
+        publication: AncestorPublication,
+    ) {
+        let mut cache = self.ancestor_publications.lock();
+        if cache.insertions_since_prune >= INODE_CACHE_PRUNE_INTERVAL {
+            cache
+                .entries
+                .retain(|_, publication| publication.upper.strong_count() != 0);
+            cache.insertions_since_prune = 0;
+        }
+        cache.entries.insert(String::from(redirect), publication);
+        cache.insertions_since_prune += 1;
+    }
+
+    pub(super) fn matches_ancestor_publication(
+        &self,
+        redirect: &str,
+        lowers: &[Arc<dyn IndexNode>],
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let lower = lowers
+            .iter()
+            .map(RealInodeIdentity::from_inode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let published = self
+            .ancestor_publications
+            .lock()
+            .entries
+            .get(redirect)
+            .and_then(|publication| {
+                (publication.lower == lower)
+                    .then(|| publication.upper.upgrade())
+                    .flatten()
+            });
+        Ok(published.is_some_and(|published| Arc::ptr_eq(&published, upper)))
+    }
+
+    pub(super) fn same_backing_inode(
+        &self,
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Self::same_mount_inode(left, right)
+    }
+
+    pub(super) fn intern_dir_state(&self, inode: &OvlInode) -> Result<Arc<DirState>, SystemError> {
+        let identity = if inode.lower_inodes.is_empty() {
+            DirIdentity::Upper(RealInodeIdentity::from_inode(
+                inode
+                    .upper_inode
+                    .lock()
+                    .as_ref()
+                    .ok_or(SystemError::ENOENT)?,
+            )?)
+        } else {
+            DirIdentity::Lower(
+                inode
+                    .lower_inodes
+                    .iter()
+                    .map(RealInodeIdentity::from_inode)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        Ok(self.dir_state_cache.lock().intern(identity))
+    }
+
+    fn redirect_lock_index(&self, redirect: &str) -> usize {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in redirect.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash as usize % LOCK_STRIPE_COUNT
+    }
+
+    pub(super) fn copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        &self.copy_up_locks[self.redirect_lock_index(redirect)]
+    }
+
+    pub(super) fn ancestor_copy_up_lock(&self, redirect: &str) -> &Mutex<()> {
+        &self.ancestor_copy_up_locks[self.redirect_lock_index(redirect)]
+    }
+
+    pub(super) fn content_lock(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<&Mutex<()>, SystemError> {
+        let identity = RealInodeIdentity::from_inode(inode)?;
+        let mut hash = identity.filesystem as u64;
+        hash ^= (identity.dev_id as u64).rotate_left(21);
+        hash ^= (identity.inode_id.data() as u64).rotate_left(42);
+        Ok(&self.content_locks[hash as usize % self.content_locks.len()])
+    }
+
+    fn canonical_backing_fs(inode: &Arc<dyn IndexNode>) -> Arc<dyn FileSystem> {
+        let mut fs = inode.fs();
+        while let Some(mount_fs) = fs.clone().downcast_arc::<MountFS>() {
+            fs = mount_fs.inner_filesystem();
+        }
+        fs
+    }
+
+    pub(super) fn backing_fsid(&self, inode: &Arc<dyn IndexNode>) -> Result<u32, SystemError> {
+        let target_fs = Self::canonical_backing_fs(inode);
+        // Origin records describe a lower object. Prefer a lower layer when the
+        // upper and lower directories happen to share the same filesystem.
+        for layer in self
+            .layers
+            .iter()
+            .filter(|layer| layer.index != 0)
+            .chain(self.layers.iter().filter(|layer| layer.index == 0))
+        {
+            let real = if layer.index == 0 {
+                layer.mnt.upper_inode.lock().clone()
+            } else {
+                layer.mnt.lower_inodes.first().cloned()
+            };
+            let Some(real) = real else {
+                continue;
+            };
+            if Arc::ptr_eq(&target_fs, &Self::canonical_backing_fs(&real)) {
+                return Ok(layer.fsid);
+            }
+        }
+        Err(SystemError::EXDEV)
+    }
+
+    pub(super) fn backing_fsid_matches_device(
+        &self,
+        fsid: u32,
+        dev_id: usize,
+    ) -> Result<bool, SystemError> {
+        let Some(layer) = self.layers.iter().find(|layer| layer.fsid == fsid) else {
+            return Ok(false);
+        };
+        let Some(lower) = layer.mnt.lower_inodes.first() else {
+            return Ok(false);
+        };
+        Ok(lower.metadata()?.dev_id == dev_id)
+    }
+
+    fn same_mount_inode(
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let left = Self::canonical_inode(left.clone());
+        let right = Self::canonical_inode(right.clone());
+        if !Arc::ptr_eq(&left.fs(), &right.fs()) {
+            return Ok(false);
+        }
+
+        Ok(left.metadata()?.inode_id == right.metadata()?.inode_id)
+    }
+
+    fn is_mount_ancestor(
+        ancestor: &Arc<dyn IndexNode>,
+        node: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        let ancestor = Self::canonical_inode(ancestor.clone());
+        let node = Self::canonical_inode(node.clone());
+        if !Arc::ptr_eq(&ancestor.fs(), &node.fs()) {
+            return Ok(false);
+        }
+
+        let mut current = node;
+        for _ in 0..MAX_MOUNT_ANCESTOR_DEPTH {
+            if Self::same_mount_inode(&ancestor, &current)? {
+                return Ok(true);
+            }
+
+            let parent = Self::canonical_inode(current.parent().map_err(|_| SystemError::EINVAL)?);
+            if Self::same_mount_inode(&parent, &current)? {
+                return Ok(false);
+            }
+            if !Arc::ptr_eq(&ancestor.fs(), &parent.fs()) {
+                return Ok(false);
+            }
+            current = parent;
+        }
+
+        Err(SystemError::ELOOP)
+    }
+
+    fn canonical_inode(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        while let Some(mount_inode) = inode.clone().downcast_arc::<MountFSInode>() {
+            inode = mount_inode.underlying_inode();
+        }
+        inode
+    }
+
+    fn layers_overlap_either_direction(
+        left: &Arc<dyn IndexNode>,
+        right: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Ok(Self::same_mount_inode(left, right)?
+            || Self::is_mount_ancestor(left, right)?
+            || Self::is_mount_ancestor(right, left)?)
+    }
+}
+
+impl MountableFileSystem for OverlayFS {
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = true;
+
+    fn prepare_fsconfig_string(
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+        _owner: &crate::process::namespace::user_namespace::UserNamespace,
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
+        let mut paths = match previous {
+            Some(previous) => previous
+                .downcast_ref::<OverlayFsconfigPaths>()
+                .ok_or(SystemError::EINVAL)?
+                .clone(),
+            None => OverlayFsconfigPaths::default(),
+        };
+        match key {
+            "upperdir" => paths.upper = Some(resolve_fsconfig_layer(value)?),
+            "workdir" => {
+                let work = resolve_fsconfig_layer(value)?;
+                validate_workdir(&work.inode())?;
+                paths.work = Some(work);
+            }
+            "lowerdir" => {
+                let names = OverlayMountData::parse_lower_dirs(value)?;
+                let mut lowers = Vec::new();
+                lowers
+                    .try_reserve(names.len())
+                    .map_err(|_| SystemError::ENOMEM)?;
+                for name in names {
+                    lowers.push(resolve_fsconfig_layer(&name)?);
+                }
+                paths.lowers = Some(lowers);
+            }
+            _ => return Err(SystemError::EINVAL.into()),
+        }
+        Ok(Some(Arc::try_new(paths).map_err(|_| SystemError::ENOMEM)?))
+    }
+
+    fn make_fs(
+        data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_in_context(
+            data,
+            crate::filesystem::vfs::mount::MountFlags::empty(),
+            &FsCreationContext::current(),
+        )
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        _mount_flags: crate::filesystem::vfs::mount::MountFlags,
+        context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let mount_data = data
+            .and_then(|d| d.as_any().downcast_ref::<OverlayMountData>())
+            .ok_or(SystemError::EINVAL)?;
+        let prepared = context
+            .fsconfig_prepared
+            .as_ref()
+            .map(|paths| {
+                paths
+                    .clone()
+                    .downcast::<OverlayFsconfigPaths>()
+                    .map_err(|_| SystemError::EINVAL)
+            })
+            .transpose()?;
+        let root_inode = context.mnt_ns.root_inode();
+        let upper_inode = match &mount_data.upper_dir {
+            Some(name) => Some(match &prepared {
+                Some(paths) => paths.upper.as_ref().ok_or(SystemError::EINVAL)?.inode(),
+                None => root_inode.lookup(name).map_err(|_| SystemError::EINVAL)?,
+            }),
+            None => None,
+        };
+        let upper_layer = match (&mount_data.upper_dir, &upper_inode) {
+            (Some(name), Some(inode)) => {
+                if inode.metadata()?.file_type != FileType::Dir {
+                    return Err(SystemError::EINVAL);
+                }
+                Some(OvlLayer {
+                    mnt: OvlInode::new(
+                        name.clone(),
+                        FileType::Dir,
+                        Some(inode.clone()),
+                        Vec::new(),
+                        None,
+                        Arc::try_new(LinkMutationCoordinator::new())
+                            .map_err(|_| SystemError::ENOMEM)?,
+                        None,
+                    ),
+                    index: 0,
+                    fsid: 0,
+                })
+            }
+            _ => None,
+        };
+
+        let lower_roots: Result<Vec<LowerRoot>, SystemError> = mount_data
+            .lower_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| {
+                let lower_inode = match &prepared {
+                    Some(paths) => paths
+                        .lowers
+                        .as_ref()
+                        .and_then(|lowers| lowers.get(index))
+                        .ok_or(SystemError::EINVAL)?
+                        .inode(),
+                    None => root_inode.lookup(dir).map_err(|_| SystemError::EINVAL)?,
+                };
+                if lower_inode.metadata()?.file_type != FileType::Dir {
+                    return Err(SystemError::EINVAL);
+                }
+                Ok((dir.clone(), lower_inode))
+            })
+            .collect();
+
+        let lower_roots = lower_roots?;
+
+        let lower_layers: Result<Vec<OvlLayer>, SystemError> = lower_roots
+            .iter()
+            .enumerate()
+            .map(|(i, (dir, lower_inode))| {
+                let lower_file_type = lower_inode.metadata()?.file_type;
+                Ok(OvlLayer {
+                    mnt: OvlInode::new(
+                        dir.clone(),
+                        lower_file_type,
+                        None,
+                        vec![lower_inode.clone()],
+                        None,
+                        Arc::try_new(LinkMutationCoordinator::new())
+                            .map_err(|_| SystemError::ENOMEM)?,
+                        None,
+                    ),
+                    index: (i + 1) as u32,
+                    fsid: (i + 1) as u32,
+                })
+            })
+            .collect();
+
+        let lower_layers = lower_layers?;
+
+        // Linux validates a supplied workdir even when it ultimately ignores
+        // the option for a lower-only overlay. Recheck after fsconfig as the
+        // backing mount can become read-only before CREATE.
+        let workdir_inode = match &mount_data.work_dir {
+            Some(name) => Some(match &prepared {
+                Some(paths) => paths.work.as_ref().ok_or(SystemError::EINVAL)?.inode(),
+                None => root_inode.lookup(name)?,
+            }),
+            _ => None,
+        };
+        if let Some(work) = &workdir_inode {
+            validate_workdir(work)?;
+        }
+        if let (Some(upper), Some(work)) = (&upper_inode, &workdir_inode) {
+            if work.metadata()?.file_type != FileType::Dir
+                || !Arc::ptr_eq(&upper.fs(), &work.fs())
+                || Self::layers_overlap_either_direction(upper, work)?
+            {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        for (i, (_, lower_inode)) in lower_roots.iter().enumerate() {
+            if let (Some(upper), Some(work)) = (&upper_inode, &workdir_inode) {
+                if Self::layer_is_same_or_descendant_of(lower_inode, upper)?
+                    || Self::layer_is_same_or_descendant_of(lower_inode, work)?
+                {
+                    return Err(SystemError::ELOOP);
+                }
+            }
+
+            for (_, other_lower_inode) in lower_roots.iter().skip(i + 1) {
+                if Self::layers_overlap_either_direction(lower_inode, other_lower_inode)? {
+                    return Err(SystemError::ELOOP);
+                }
+            }
+        }
+
+        if lower_roots.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut layers = Vec::new();
+        if let Some(upper) = upper_layer {
+            layers.push(upper);
+        }
+        layers.extend(lower_layers);
+
+        let reference_backing_fs =
+            Self::canonical_backing_fs(upper_inode.as_ref().unwrap_or(&lower_roots[0].1));
+        let samefs = lower_roots.iter().all(|(_, lower)| {
+            Arc::ptr_eq(&reference_backing_fs, &Self::canonical_backing_fs(lower))
+        });
+        let write_mount = upper_inode
+            .as_ref()
+            .and_then(|upper| upper.fs().downcast_arc::<MountFS>())
+            .map(|mount| mount.try_pin_external())
+            .transpose()?;
+        let root_inode = OvlInode::new(
+            String::new(),
+            FileType::Dir,
+            upper_inode,
+            lower_roots
+                .iter()
+                .map(|(_, lower_inode)| lower_inode.clone())
+                .collect(),
+            (!samefs).then(generate_inode_id),
+            Arc::try_new(LinkMutationCoordinator::new()).map_err(|_| SystemError::ENOMEM)?,
+            None,
+        );
+
+        let super_block = SuperBlock::new(vfs::Magic::OVERLAYFS_MAGIC, 4096, 255);
+        let backing_cred = context.cred.clone();
+        let fs = Arc::new_cyclic(|weak_fs| {
+            for layer in &layers {
+                layer.mnt.set_fs(weak_fs.clone());
+            }
+            root_inode.set_fs(weak_fs.clone());
+
+            OverlayFS {
+                numlayer: layers.len(),
+                numfs: 1,
+                numdatalayer: lower_roots.len(),
+                layers,
+                workdir: workdir_inode,
+                backing_mounts: Mutex::new(Some(OverlayBackingMounts {
+                    write_mount,
+                    _paths: prepared,
+                })),
+                root_inode,
+                super_block: super_block.clone(),
+                mutation_lock: Mutex::new(()),
+                backing_cred,
+                samefs,
+                inode_cache: Mutex::new(OvlInodeCache::default()),
+                link_state_cache: Mutex::new(OvlLinkStateCache::default()),
+                link_seed_connectors_present: AtomicBool::new(false),
+                dir_state_cache: Mutex::new(DirStateCache::default()),
+                ancestor_publications: Mutex::new(AncestorPublicationCache::default()),
+                copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+                ancestor_copy_up_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+                content_locks: (0..LOCK_STRIPE_COUNT).map(|_| Mutex::new(())).collect(),
+            }
+        });
+        fs.root_inode.load_origin_once()?;
+        Ok(fs)
+    }
+
+    fn make_mount_data(
+        raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        let mount_data = OverlayMountData::from_raw(raw_data).map_err(|e| {
+            log::error!("Failed to create overlay mount data: {:?}", e);
+            e
+        })?;
+        Ok(Some(Arc::new(mount_data)))
+    }
+}
+
+impl OverlayFS {
+    fn layer_is_same_or_descendant_of(
+        layer: &Arc<dyn IndexNode>,
+        ancestor: &Arc<dyn IndexNode>,
+    ) -> Result<bool, SystemError> {
+        Ok(Self::same_mount_inode(layer, ancestor)? || Self::is_mount_ancestor(ancestor, layer)?)
+    }
+}

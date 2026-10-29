@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Linux tty设备 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="应用程序开发文档" href="../../userland/appdev/index.html" />
+    <link rel="prev" title="Device" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Device</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Linux tty设备</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#terminal">1. 核心概念：终端（Terminal）</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tty">2. TTY 设备文件</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#dev-tty">3. <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 的作用：一个动态的、指向“当前”的链接</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#dev-tty-stdin-stdout-stderr">4. <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 与标准输入/输出/错误 (stdin, stdout, stderr) 的区别</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">示例：</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">总结</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">在用户程序中，通常是怎么使用/dev/tty的</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id4">总结</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#dev-ptmx-dev-pts">/dev/ptmx和 /dev/pts/下文件有什么作用？</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pty">1. 伪终端 (PTY) 的概念</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#dev-ptmx-master-multiplexer">2. <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code>：伪终端的主设备复用器 (Master Multiplexer)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#dev-pts">3. <code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 目录和其下的文件</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">4. 完整的创建流程</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">总结</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#dev-ptmx">简单的用户程序展示/dev/ptmx的使用</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Device</a></li>
+      <li class="breadcrumb-item active">Linux tty设备</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/device/tty.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="linux-tty">
+<h1>Linux tty设备<a class="headerlink" href="#linux-tty" title="Permalink to this heading"></a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">dev/tty</span></code> 是一个在 Linux 和其他 Unix-like 系统中非常特殊的设备文件。从本质上讲，<strong>它是一个指向当前进程的控制终端（Controlling Terminal）的别名或快捷方式</strong>。</p>
+<section id="terminal">
+<h2>1. 核心概念：终端（Terminal）<a class="headerlink" href="#terminal" title="Permalink to this heading"></a></h2>
+<p>在计算机早期，用户通过物理设备与计算机交互，这些设备被称为“终端”。一个典型的物理终端包含一个键盘用于输入和一个屏幕（或打印机）用于输出。</p>
+<p>在现代 Linux 系统中，物理终端已经不常见，取而代之的是<strong>终端模拟器 (Terminal Emulator)</strong>，例如 GNOME Terminal, Konsole, xterm, iTerm2 等。这些是图形界面下的软件程序，它们模拟了物理终端的行为。</p>
+<p>此外，还有<strong>控制台 (Console)</strong>，这是直接连接到计算机硬件的终端，通常在没有图形界面或图形界面崩溃时使用。在 Linux 中，你可以通过 <code class="docutils literal notranslate"><span class="pre">Ctrl</span> <span class="pre">+</span> <span class="pre">Alt</span> <span class="pre">+</span> <span class="pre">F1-F6</span></code> 切换到虚拟控制台。</p>
+<p>无论是哪种形式，系统都通过一个名为 <strong>TTY</strong> 的驱动程序子系统来管理这些终端会话。TTY 这个名字来源于早期的“Teletypewriter”（电传打字机）。</p>
+</section>
+<section id="tty">
+<h2>2. TTY 设备文件<a class="headerlink" href="#tty" title="Permalink to this heading"></a></h2>
+<p>在 Linux 中，“一切皆文件”。系统通过 <code class="docutils literal notranslate"><span class="pre">/dev</span></code> 目录下的特殊文件与硬件设备进行通信。对于终端，也有一系列的设备文件，通常位于 <code class="docutils literal notranslate"><span class="pre">/dev/</span></code> 目录下，例如：</p>
+<ul class="simple">
+<li><p><strong>/dev/ttyS0, /dev/ttyS1, …</strong>: 物理串口设备（Serial Ports）。</p></li>
+<li><p><strong>/dev/tty1, /dev/tty2, …</strong>: 虚拟控制台（Virtual Consoles）。</p></li>
+<li><p><strong>/dev/pts/0, /dev/pts/1, …</strong>: 伪终端（Pseudo-terminals）。这是我们最常用的，当你打开一个终端模拟器窗口时，系统就会创建一个伪终端，并为其分配一个像 <code class="docutils literal notranslate"><span class="pre">/dev/pts/0</span></code> 这样的设备文件。</p></li>
+</ul>
+<p>每个终端会话（比如你打开的一个终端窗口）都与一个特定的 TTY 设备文件相关联。你可以通过 <code class="docutils literal notranslate"><span class="pre">tty</span></code> 命令来查看当前终端对应的设备文件：</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ tty
+/dev/pts/0
+</pre></div>
+</div>
+</section>
+<section id="dev-tty">
+<h2>3. <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 的作用：一个动态的、指向“当前”的链接<a class="headerlink" href="#dev-tty" title="Permalink to this heading"></a></h2>
+<p>现在我们回到主角 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code>。</p>
+<p>想象一下你正在编写一个程序，这个程序需要与用户直接交互（读取用户的输入或向用户的屏幕显示信息），无论这个程序最终从哪里运行。</p>
+<ul class="simple">
+<li><p>如果用户在虚拟控制台 <code class="docutils literal notranslate"><span class="pre">tty2</span></code> 上运行你的程序，程序应该向 <code class="docutils literal notranslate"><span class="pre">/dev/tty2</span></code> 读写。</p></li>
+<li><p>如果用户在 GNOME Terminal 的一个窗口里运行，程序可能需要向 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code> 读写。</p></li>
+<li><p>如果用户通过 <code class="docutils literal notranslate"><span class="pre">ssh</span></code> 远程登录运行，程序又需要向另一个伪终端设备读写。</p></li>
+</ul>
+<p>如果让程序自己去判断当前在哪个终端上运行，将会非常复杂和不可靠。</p>
+<p><code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 就是为了解决这个问题而存在的。<strong>无论一个进程的“控制终端”是哪一个具体的设备（<code class="docutils literal notranslate"><span class="pre">/dev/tty2</span></code> 或 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code> 等），<code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 始终是指向这个控制终端的链接。</strong></p>
+<p>当一个程序打开 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 文件时，内核会自动将这个文件描述符重定向到当前进程的实际控制终端。这样，程序开发者就不需要关心底层的具体 TTY 设备是什么，只需要统一地对 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 进行读写，就能确保与当前用户进行交互。</p>
+<p><strong>简单来说，<code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 就是对程序说：“把信息发送给那个启动了你的用户，无论他在哪里。”</strong></p>
+</section>
+<section id="dev-tty-stdin-stdout-stderr">
+<h2>4. <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 与标准输入/输出/错误 (stdin, stdout, stderr) 的区别<a class="headerlink" href="#dev-tty-stdin-stdout-stderr" title="Permalink to this heading"></a></h2>
+<p>你可能会问：这听起来和标准输入（stdin）、标准输出（stdout）很像，有什么区别？</p>
+<p>在大多数情况下，进程的标准输入、输出和错误流默认就是连接到其控制终端的。例如，当你运行 <code class="docutils literal notranslate"><span class="pre">ls</span></code> 命令时，它的 <code class="docutils literal notranslate"><span class="pre">stdout</span></code> 默认就是你的终端，所以你能在屏幕上看到文件列表。</p>
+<p>然而，<strong>重定向 (Redirection)</strong> 会改变这种默认行为。</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">ls</span> <span class="pre">&gt;</span> <span class="pre">files.txt</span></code>：<code class="docutils literal notranslate"><span class="pre">ls</span></code> 命令的 <code class="docutils literal notranslate"><span class="pre">stdout</span></code> 被重定向到了 <code class="docutils literal notranslate"><span class="pre">files.txt</span></code> 文件，而不是终端。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">cat</span> <span class="pre">my_script.sh</span> <span class="pre">|</span> <span class="pre">bash</span></code>：<code class="docutils literal notranslate"><span class="pre">bash</span></code> 进程的 <code class="docutils literal notranslate"><span class="pre">stdin</span></code> 被重定向到了管道 (<code class="docutils literal notranslate"><span class="pre">|</span></code>)，它从 <code class="docutils literal notranslate"><span class="pre">cat</span></code> 命令的输出中读取内容，而不是从键盘。</p></li>
+</ul>
+<p>在这种情况下，如果程序内部仍然希望强制与用户交互（例如，一个需要用户输入密码的脚本），它就不能再依赖 <code class="docutils literal notranslate"><span class="pre">stdin</span></code> 或 <code class="docutils literal notranslate"><span class="pre">stdout</span></code> 了。因为它们可能已经被重定向到文件或管道，不再是用户的屏幕和键盘了。</p>
+<p><strong>这时，<code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 就派上了用场。</strong></p>
+<p>对 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 的读写操作会绕过标准输入/输出的重定向，直接访问控制终端。</p>
+<section id="id1">
+<h3>示例：<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<p>来看一个实际的例子。假设我们有一个脚本 <code class="docutils literal notranslate"><span class="pre">ask_password.sh</span></code>：</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+
+<span class="c1"># 尝试从标准输入读取密码</span>
+<span class="n">echo</span> <span class="s2">&quot;Enter password (from stdin):&quot;</span>
+<span class="n">read</span> <span class="n">password_stdin</span>
+
+<span class="c1"># 现在，强制从控制终端读取密码</span>
+<span class="n">echo</span> <span class="s2">&quot;Enter password again (from /dev/tty):&quot;</span>
+<span class="n">read</span> <span class="n">password_tty</span> <span class="o">&lt;</span> <span class="o">/</span><span class="n">dev</span><span class="o">/</span><span class="n">tty</span>
+
+<span class="n">echo</span> <span class="s2">&quot;Password from stdin: $password_stdin&quot;</span>
+<span class="n">echo</span> <span class="s2">&quot;Password from tty: $password_tty&quot;</span>
+</pre></div>
+</div>
+<p>现在，我们正常运行它：</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ ./ask_password.sh
+Enter password (from stdin):
+my_secret_pass
+Enter password again (from /dev/tty):
+my_secret_pass
+Password from stdin: my_secret_pass
+Password from tty: my_secret_pass
+</pre></div>
+</div>
+<p>看起来没有区别。但是，现在我们尝试用重定向的方式运行它：</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ echo &quot;password_from_file&quot; | ./ask_password.sh
+Enter password (from stdin):
+Enter password again (from /dev/tty):
+my_real_secret  &lt;-- 这里光标会停住，等待你从键盘输入
+Password from stdin: password_from_file
+Password from tty: my_real_secret
+</pre></div>
+</div>
+<p><strong>分析：</strong></p>
+<ol class="arabic simple">
+<li><p>第一个 <code class="docutils literal notranslate"><span class="pre">read</span></code> 命令从 <code class="docutils literal notranslate"><span class="pre">stdin</span></code> 读取。由于我们通过管道将 <code class="docutils literal notranslate"><span class="pre">echo</span></code> 的输出重定向到了脚本的 <code class="docutils literal notranslate"><span class="pre">stdin</span></code>，所以它读到了 “password_from_file”。</p></li>
+<li><p>第二个 <code class="docutils literal notranslate"><span class="pre">read</span></code> 命令被明确地重定向为从 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 读取 (<code class="docutils literal notranslate"><span class="pre">&lt;</span> <span class="pre">/dev/tty</span></code>)。这个操作绕过了 <code class="docutils literal notranslate"><span class="pre">stdin</span></code> 管道，直接访问了你的键盘和屏幕。因此，它会停下来等待你手动输入密码。</p></li>
+</ol>
+<p>这就是 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 的核心价值：<strong>提供一个无论标准流如何重定向，都能保证与用户终端进行交互的可靠通道。</strong> 像 <code class="docutils literal notranslate"><span class="pre">ssh</span></code>、<code class="docutils literal notranslate"><span class="pre">sudo</span></code> 等需要安全输入密码的程序，内部都会使用这种机制。</p>
+</section>
+</section>
+<section id="id2">
+<h2>总结<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>特性</p></th>
+<th class="head"><p>描述</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>定义</strong></p></td>
+<td><p>一个特殊的设备文件，作为当前进程控制终端的别名或快捷方式。</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>作用</strong></p></td>
+<td><p>为程序提供一个稳定、可靠的方式来与启动它的用户终端进行交互。</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>动态性</strong></p></td>
+<td><p>它本身不是一个具体的设备，而是一个由内核管理的、动态指向具体 TTY 设备的链接。</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>与 stdin/stdout 的区别</strong></p></td>
+<td><p>当标准输入/输出/错误流被重定向到文件、管道或其他进程时，<code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 仍然可以用来直接访问用户的屏幕和键盘。</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>典型用途</strong></p></td>
+<td><p>- 需要用户输入密码或确认的程序（如 <code class="docutils literal notranslate"><span class="pre">sudo</span></code>, <code class="docutils literal notranslate"><span class="pre">ssh</span></code>）。<br>- 需要在脚本中明确与用户交互，即使用户通过管道或重定向运行该脚本。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id3">
+<h2>在用户程序中，通常是怎么使用/dev/tty的<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>好的，在用户程序中使用 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 的核心目标是：<strong>绕过可能被重定向的标准输入/输出流，强制与用户的控制终端进行直接交互。</strong></p>
+<p>这在以下几个场景中非常常见：</p>
+<ol class="arabic simple">
+<li><p><strong>请求敏感信息</strong>：比如密码、私钥密码等。即使脚本的输出被重定向到日志文件，你也不希望密码提示和输入过程被记录下来。</p></li>
+<li><p><strong>交互式确认</strong>：在一个可能被自动化调用的脚本中，执行危险操作前（如 <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-rf</span> <span class="pre">/</span></code>），需要强制用户手动确认。</p></li>
+<li><p><strong>诊断和调试</strong>：向用户的屏幕打印调试信息，即使用户已经将脚本的标准输出重定向到了别处。</p></li>
+<li><p><strong>全屏或基于光标的应用程序</strong>：像 <code class="docutils literal notranslate"><span class="pre">vim</span></code>, <code class="docutils literal notranslate"><span class="pre">top</span></code> 这样的程序需要直接控制终端的屏幕、颜色和光标位置，它们会直接与 TTY 设备打交道。</p></li>
+</ol>
+<section id="id4">
+<h3>总结<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>在用户程序中使用 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 的模式非常一致：</p>
+<ol class="arabic simple">
+<li><p><strong>打开文件</strong>：像打开普通文件一样打开 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code>，通常需要读写权限 (<code class="docutils literal notranslate"><span class="pre">r+</span></code>)。</p></li>
+<li><p><strong>错误处理</strong>：检查打开操作是否成功。如果一个进程没有控制终端（例如，一个由 <code class="docutils literal notranslate"><span class="pre">systemd</span></code> 启动的后台守护进程），打开 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 将会失败。程序需要妥善处理这种情况。</p></li>
+<li><p><strong>写入（输出）</strong>：使用标准的文件写入函数（如 <code class="docutils literal notranslate"><span class="pre">fprintf</span></code>, <code class="docutils literal notranslate"><span class="pre">write</span></code>）向打开的 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 文件描述符写入数据，这将会在用户的屏幕上显示提示信息。</p></li>
+<li><p><strong>读取（输入）</strong>：使用标准的文件读取函数（如 <code class="docutils literal notranslate"><span class="pre">fgets</span></code>, <code class="docutils literal notranslate"><span class="pre">read</span></code>）从 <code class="docutils literal notranslate"><span class="pre">/dev/tty</span></code> 读取数据，这将获取用户的键盘输入。</p></li>
+<li><p><strong>关闭文件</strong>：完成交互后，关闭文件描述符。</p></li>
+</ol>
+</section>
+</section>
+<section id="dev-ptmx-dev-pts">
+<h2>/dev/ptmx和 /dev/pts/下文件有什么作用？<a class="headerlink" href="#dev-ptmx-dev-pts" title="Permalink to this heading"></a></h2>
+<p>好的，我们来详细讲解 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 和 <code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 目录下的文件。这两个组件是现代 Linux 系统中实现**伪终端（Pseudo-terminals, PTY）**机制的核心，对于我们日常使用的终端模拟器、SSH 远程登录等功能至关重要。</p>
+<p>简单来说，它们共同创建了一个“假的”终端设备，让程序（如 <code class="docutils literal notranslate"><span class="pre">bash</span></code>）以为自己正在和一个物理终端对话，而实际上它是在和一个软件（如 GNOME Terminal 或 <code class="docutils literal notranslate"><span class="pre">sshd</span></code>）对话。</p>
+<p>这个机制包含两个部分：</p>
+<ul class="simple">
+<li><p><strong>主设备 (Master)</strong>：由 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 代表。</p></li>
+<li><p><strong>从设备 (Slave)</strong>：位于 <code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 目录下，例如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/0</span></code>, <code class="docutils literal notranslate"><span class="pre">/dev/pts/1</span></code> 等。</p></li>
+</ul>
+<p>下面我们来深入了解它们各自的作用以及如何协同工作。</p>
+<section id="pty">
+<h3>1. 伪终端 (PTY) 的概念<a class="headerlink" href="#pty" title="Permalink to this heading"></a></h3>
+<p>首先，理解为什么需要伪终端。在早期的 Unix 系统中，用户通过物理串口（如 <code class="docutils literal notranslate"><span class="pre">/dev/ttyS0</span></code>）连接的物理终端与计算机交互。后来，随着图形界面和网络的发展，我们需要一种在软件层面模拟这种硬件终端的方法。</p>
+<p>伪终端就是这种软件模拟的终端。它像一个管道一样，在两端各有一个“设备”：</p>
+<ul class="simple">
+<li><p><strong>主端 (Master Side)</strong>：由终端模拟器（如 xterm, GNOME Terminal）或远程登录服务（如 <code class="docutils literal notranslate"><span class="pre">sshd</span></code>）持有和控制。</p></li>
+<li><p><strong>从端 (Slave Side)</strong>：提供给应用程序（如 <code class="docutils literal notranslate"><span class="pre">shell</span></code>, <code class="docutils literal notranslate"><span class="pre">vim</span></code>, <code class="docutils literal notranslate"><span class="pre">top</span></code>）使用。这个从设备看起来和行为上都与一个真正的物理终端设备一模一样。</p></li>
+</ul>
+<p>当你在终端模拟器里敲击键盘时，终端模拟器程序从主端写入数据；内核将这些数据转发到从端，<code class="docutils literal notranslate"><span class="pre">shell</span></code> 程序就能从从端读到你的输入。反之，当 <code class="docutils literal notranslate"><span class="pre">shell</span></code> 程序产生输出时（例如 <code class="docutils literal notranslate"><span class="pre">ls</span></code> 的结果），它向从端写入数据；内核将其转发到主端，终端模拟器读取这些数据并在窗口中显示出来。</p>
+</section>
+<section id="dev-ptmx-master-multiplexer">
+<h3>2. <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code>：伪终端的主设备复用器 (Master Multiplexer)<a class="headerlink" href="#dev-ptmx-master-multiplexer" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 是一个特殊的字符设备文件，它的名字是 “pseudo-terminal multiplexer” 的缩写。可以把它理解为<strong>创建伪终端主/从设备对的工厂</strong>。</p>
+<p>它的核心作用是：</p>
+<ol class="arabic simple">
+<li><p><strong>创建新的 PTY 对</strong>：当一个程序（如终端模拟器）需要一个新的伪终端时，它会打开 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 文件。</p></li>
+<li><p><strong>返回主设备的文件描述符</strong>：这个 <code class="docutils literal notranslate"><span class="pre">open</span></code> 操作会成功返回一个文件描述符。这个文件描述符就代表了新创建的 PTY 对的<strong>主端 (Master)</strong>。</p></li>
+<li><p><strong>动态创建从设备</strong>：在打开 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 的同时，内核会在 <code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 目录下动态地创建一个对应的<strong>从设备 (Slave)</strong> 文件，比如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/0</span></code>。</p></li>
+<li><p><strong>提供控制接口</strong>：程序可以通过对 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 返回的文件描述符执行 <code class="docutils literal notranslate"><span class="pre">ioctl()</span></code> 系统调用，来对 PTY 进行配置，例如获取从设备的名称、解锁从设备等。</p></li>
+</ol>
+<p><strong>关键点</strong>：你不能直接对 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 进行大量的读写。它的主要目的是通过 <code class="docutils literal notranslate"><span class="pre">open()</span></code> 调用来请求和创建一个新的 PTY 对。之后所有的读写操作都通过 <code class="docutils literal notranslate"><span class="pre">open()</span></code> 返回的那个文件描述符来进行。每次打开 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 都会创建一个全新的、独立的 PTY 主/从设备对。</p>
+</section>
+<section id="dev-pts">
+<h3>3. <code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 目录和其下的文件<a class="headerlink" href="#dev-pts" title="Permalink to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">/dev/pts</span></code> 是一个特殊的文件系统，类型是 <code class="docutils literal notranslate"><span class="pre">devpts</span></code>。这个目录专门用来存放伪终端的<strong>从设备 (Slave)</strong> 文件。</p>
+<ul class="simple">
+<li><p><strong>动态创建</strong>：这个目录下的文件（如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/0</span></code>, <code class="docutils literal notranslate"><span class="pre">/dev/pts/1</span></code>, …）不是永久存在的。它们是在对应的 PTY 主设备被创建时（即 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 被打开时）由内核动态创建的。</p></li>
+<li><p><strong>从设备的角色</strong>：每个 <code class="docutils literal notranslate"><span class="pre">/dev/pts/N</span></code> 文件都扮演着 PTY 对中从端的角色。它是一个标准的 TTY 设备，应用程序（如 <code class="docutils literal notranslate"><span class="pre">bash</span></code>）可以像对待任何其他终端设备一样打开它、读取用户输入、写入程序输出。</p></li>
+<li><p><strong>分配给 Shell</strong>：终端模拟器在创建了 PTY 对之后，会 <code class="docutils literal notranslate"><span class="pre">fork</span></code> 一个子进程，并在子进程中将标准输入、标准输出和标准错误都重定向到这个新创建的从设备（例如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/0</span></code>）上，然后执行 <code class="docutils literal notranslate"><span class="pre">bash</span></code> 或其他 shell。这样，<code class="docutils literal notranslate"><span class="pre">bash</span></code> 就“拥有”了这个伪终端作为它的控制终端。</p></li>
+</ul>
+<p>你可以通过 <code class="docutils literal notranslate"><span class="pre">tty</span></code> 命令查看当前 shell 关联的从设备：</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ tty
+/dev/pts/0
+</pre></div>
+</div>
+<p>如果你再打开一个新的终端窗口，在新窗口里执行 <code class="docutils literal notranslate"><span class="pre">tty</span></code>，你可能会看到：</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>$ tty
+/dev/pts/1
+</pre></div>
+</div>
+</section>
+<section id="id5">
+<h3>4. 完整的创建流程<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<p>让我们把整个过程串起来，看看当你打开一个新的终端窗口时，后台发生了什么：</p>
+<ol class="arabic simple">
+<li><p><strong>打开 ptmx</strong>：GNOME Terminal 程序调用 <code class="docutils literal notranslate"><span class="pre">open(&quot;/dev/ptmx&quot;,</span> <span class="pre">O_RDWR)</span></code>。</p></li>
+<li><p><strong>创建 PTY 对</strong>：内核接收到请求，创建一个新的伪终端主/从设备对。</p></li>
+<li><p><strong>返回主设备FD</strong>：<code class="docutils literal notranslate"><span class="pre">open</span></code> 调用返回一个文件描述符（比如 <code class="docutils literal notranslate"><span class="pre">fd=3</span></code>）给 GNOME Terminal。这个 <code class="docutils literal notranslate"><span class="pre">fd</span></code> 就是 PTY 的主端。</p></li>
+<li><p><strong>创建从设备文件</strong>：同时，内核在 <code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 目录下创建一个新的从设备文件，比如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code>。</p></li>
+<li><p><strong>解锁和授权</strong>：GNOME Terminal 程序通过对主设备的文件描述符 <code class="docutils literal notranslate"><span class="pre">fd=3</span></code> 执行一系列 <code class="docutils literal notranslate"><span class="pre">ioctl</span></code> 调用（如 <code class="docutils literal notranslate"><span class="pre">grantpt</span></code> 和 <code class="docutils literal notranslate"><span class="pre">unlockpt</span></code>），来设置从设备 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code> 的权限和状态，使其可用。</p></li>
+<li><p><strong>获取从设备名</strong>：GNOME Terminal 通过 <code class="docutils literal notranslate"><span class="pre">ioctl</span></code> 调用 <code class="docutils literal notranslate"><span class="pre">ptsname</span></code> 来查询与 <code class="docutils literal notranslate"><span class="pre">fd=3</span></code> 对应的主设备关联的从设备名称，得到字符串 “/dev/pts/5”。</p></li>
+<li><p><strong>创建子进程</strong>：GNOME Terminal 调用 <code class="docutils literal notranslate"><span class="pre">fork()</span></code> 创建一个子进程。</p></li>
+<li><p><strong>设置会话和重定向</strong>：在子进程中：</p>
+<ul class="simple">
+<li><p>创建一个新的会话 (<code class="docutils literal notranslate"><span class="pre">setsid()</span></code>)，并将 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code> 设置为该会话的控制终端。</p></li>
+<li><p>关闭标准输入、输出、错误（文件描述符 0, 1, 2）。</p></li>
+<li><p>打开 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code> 并将其复制到文件描述符 0, 1, 2。现在，子进程的 <code class="docutils literal notranslate"><span class="pre">stdin</span></code>, <code class="docutils literal notranslate"><span class="pre">stdout</span></code>, <code class="docutils literal notranslate"><span class="pre">stderr</span></code> 都指向了这个伪终端从设备。</p></li>
+</ul>
+</li>
+<li><p><strong>执行 Shell</strong>：子进程调用 <code class="docutils literal notranslate"><span class="pre">execve(&quot;/bin/bash&quot;,</span> <span class="pre">...)</span></code> 来启动 <code class="docutils literal notranslate"><span class="pre">bash</span></code>。<code class="docutils literal notranslate"><span class="pre">bash</span></code> 继承了已经设置好的文件描述符，所以它自然地从 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code> 读取命令并向其写入结果。</p></li>
+<li><p><strong>数据转发</strong>：</p>
+<ul class="simple">
+<li><p>你在 GNOME Terminal 窗口输入 <code class="docutils literal notranslate"><span class="pre">ls</span></code>。</p></li>
+<li><p>GNOME Terminal 程序从键盘事件中读取输入，并通过主设备的文件描述符 <code class="docutils literal notranslate"><span class="pre">fd=3</span></code> <strong>写入</strong> “ls\n”。</p></li>
+<li><p>内核将数据从主端转发到从端 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code>。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">bash</span></code> 从它的标准输入（即 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code>）<strong>读取</strong> “ls\n”，执行命令。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ls</span></code> 的输出被 <code class="docutils literal notranslate"><span class="pre">bash</span></code> <strong>写入</strong> 到它的标准输出（即 <code class="docutils literal notranslate"><span class="pre">/dev/pts/5</span></code>）。</p></li>
+<li><p>内核将数据从从端转发到主端。</p></li>
+<li><p>GNOME Terminal 程序通过主设备的文件描述符 <code class="docutils literal notranslate"><span class="pre">fd=3</span></code> <strong>读取</strong> <code class="docutils literal notranslate"><span class="pre">ls</span></code> 的输出结果，并将其渲染显示在窗口中。</p></li>
+</ul>
+</li>
+</ol>
+</section>
+<section id="id6">
+<h3>总结<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>组件</p></th>
+<th class="head"><p>角色</p></th>
+<th class="head"><p>作用</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong><code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code></strong></p></td>
+<td><p><strong>主设备工厂 (Master Factory)</strong></p></td>
+<td><p>作为一个单一的入口点，当被打开时，它会创建一个新的伪终端主/从设备对，并返回代表<strong>主设备</strong>的文件描述符。</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong><code class="docutils literal notranslate"><span class="pre">/dev/pts/</span></code> 下的文件</strong></p></td>
+<td><p><strong>从设备 (Slave Devices)</strong></p></td>
+<td><p>这些是动态创建的设备文件，每一个都代表一个伪终端的<strong>从设备</strong>。它们为应用程序（如 shell）提供了一个标准的 TTY 接口，使其可以像与物理终端一样进行交互。</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="dev-ptmx">
+<h3>简单的用户程序展示/dev/ptmx的使用<a class="headerlink" href="#dev-ptmx" title="Permalink to this heading"></a></h3>
+<p>好的，下面是一个简单的 C 语言用户程序，它清晰地展示了如何使用 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 来创建一个伪终端，并在这个伪终端中启动一个 shell (<code class="docutils literal notranslate"><span class="pre">/bin/bash</span></code>)。</p>
+<p>这个程序将扮演一个最基础的“终端模拟器”的角色。它会处理主设备（master）端，而 <code class="docutils literal notranslate"><span class="pre">bash</span></code> shell 会在它创建的从设备（slave）端运行。</p>
+<section id="id7">
+<h4>程序功能分解<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h4>
+<ol class="arabic simple">
+<li><p><strong>打开 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code></strong>：获取一个伪终端主设备（master PTY）的文件描述符。</p></li>
+<li><p><strong>初始化从设备</strong>：调用 <code class="docutils literal notranslate"><span class="pre">grantpt()</span></code> 和 <code class="docutils literal notranslate"><span class="pre">unlockpt()</span></code> 来设置从设备（slave PTY）的权限和状态。</p></li>
+<li><p><strong>获取从设备名</strong>：调用 <code class="docutils literal notranslate"><span class="pre">ptsname()</span></code> 来得到对应的从设备路径（例如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/3</span></code>）。</p></li>
+<li><p><strong>创建子进程</strong>：使用 <code class="docutils literal notranslate"><span class="pre">fork()</span></code> 创建一个子进程，这个子进程将用来运行 shell。</p></li>
+<li><p><strong>子进程设置</strong>：在子进程中，将其会话（session）与从设备关联，并将标准输入、输出、错误重定向到从设备，然后执行 <code class="docutils literal notranslate"><span class="pre">/bin/bash</span></code>。</p></li>
+<li><p><strong>父进程通信</strong>：在父进程中，监听用户在当前终端的输入和来自 <code class="docutils literal notranslate"><span class="pre">bash</span></code> 的输出，并在它们之间来回传递数据，实现交互。</p></li>
+</ol>
+</section>
+<section id="ptmx-demo-c">
+<h4>源代码 (<code class="docutils literal notranslate"><span class="pre">ptmx_demo.c</span></code>)<a class="headerlink" href="#ptmx-demo-c" title="Permalink to this heading"></a></h4>
+<p>C</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>#define _XOPEN_SOURCE 600 // Needed for grantpt, unlockpt, ptsname
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/select.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;termios.h&gt; // Not strictly needed for the demo, but good practice
+#include &lt;string.h&gt;
+
+int main() {
+    int master_fd;
+    char *slave_name;
+    pid_t pid;
+
+    // 1. 打开 /dev/ptmx 来获取一个主设备文件描述符
+    master_fd = open(&quot;/dev/ptmx&quot;, O_RDWR | O_NOCTTY);
+    if (master_fd &lt; 0) {
+        perror(&quot;Error opening /dev/ptmx&quot;);
+        return 1;
+    }
+    printf(&quot;1. Master PTY opened with fd: %d\n&quot;, master_fd);
+
+    // 2. 授权并解锁从设备
+    if (grantpt(master_fd) != 0) {
+        perror(&quot;Error calling grantpt&quot;);
+        close(master_fd);
+        return 1;
+    }
+    if (unlockpt(master_fd) != 0) {
+        perror(&quot;Error calling unlockpt&quot;);
+        close(master_fd);
+        return 1;
+    }
+    printf(&quot;2. Slave PTY permissions granted and unlocked.\n&quot;);
+
+    // 3. 获取从设备的名字
+    slave_name = ptsname(master_fd);
+    if (slave_name == NULL) {
+        perror(&quot;Error calling ptsname&quot;);
+        close(master_fd);
+        return 1;
+    }
+    printf(&quot;3. Slave PTY name is: %s\n&quot;, slave_name);
+
+    // 4. 创建子进程
+    pid = fork();
+    if (pid &lt; 0) {
+        perror(&quot;Error calling fork&quot;);
+        close(master_fd);
+        return 1;
+    }
+
+    // 5. 子进程的代码
+    if (pid == 0) {
+        int slave_fd;
+
+        // 创建一个新的会话，使子进程成为会话领导者
+        // 这是让从设备成为控制终端的关键步骤
+        if (setsid() &lt; 0) {
+            perror(&quot;setsid failed&quot;);
+            exit(1);
+        }
+
+        // 打开从设备
+        slave_fd = open(slave_name, O_RDWR);
+        if (slave_fd &lt; 0) {
+            perror(&quot;Error opening slave pty&quot;);
+            exit(1);
+        }
+
+        // 将从设备设置为该进程的控制终端
+        // TIOCSCTTY 是 &quot;Set Controlling TTY&quot; 的意思
+        if (ioctl(slave_fd, TIOCSCTTY, NULL) &lt; 0) {
+            perror(&quot;ioctl TIOCSCTTY failed&quot;);
+            exit(1);
+        }
+        
+        // 将子进程的标准输入、输出、错误重定向到从设备
+        dup2(slave_fd, STDIN_FILENO);   // fd 0
+        dup2(slave_fd, STDOUT_FILENO);  // fd 1
+        dup2(slave_fd, STDERR_FILENO);  // fd 2
+
+        // 关闭不再需要的文件描述符
+        close(master_fd); // 子进程不需要主设备
+        close(slave_fd);  // 因为已经 dup2 了，这个原始的也可以关了
+
+        // 执行一个新的 bash shell
+        printf(&quot;--- Starting Bash Shell in Slave PTY ---\n\n&quot;);
+        fflush(stdout);
+        execlp(&quot;/bin/bash&quot;, &quot;bash&quot;, NULL);
+
+        // 如果 execlp 成功，下面的代码不会被执行
+        perror(&quot;execlp failed&quot;);
+        exit(1);
+    }
+
+    // 6. 父进程的代码
+    printf(&quot;4. Forked child process with PID: %d\n&quot;, pid);
+    printf(&quot;5. Parent process will now forward data between stdin and master PTY.\n&quot;);
+    printf(&quot;--- You are now interacting with the new shell. Type &#39;exit&#39; to quit. ---\n\n&quot;);
+    
+    // 父进程不需要从设备
+    // close(slave_fd) in parent - it was never opened here
+
+    char buffer[256];
+    ssize_t nread;
+
+    // 循环，直到子进程退出
+    while (1) {
+        fd_set read_fds;
+        FD_ZERO(&amp;read_fds);
+        FD_SET(STDIN_FILENO, &amp;read_fds); // 监听当前终端的输入
+        FD_SET(master_fd, &amp;read_fds);    // 监听主设备的输出 (来自子进程shell)
+
+        // 使用 select 阻塞，直到有数据可读
+        if (select(master_fd + 1, &amp;read_fds, NULL, NULL, NULL) &lt; 0) {
+            perror(&quot;select failed&quot;);
+            break;
+        }
+
+        // 检查是否是当前终端有输入
+        if (FD_ISSET(STDIN_FILENO, &amp;read_fds)) {
+            nread = read(STDIN_FILENO, buffer, sizeof(buffer));
+            if (nread &gt; 0) {
+                // 将用户的输入写入主设备，数据会流向子进程的shell
+                write(master_fd, buffer, nread);
+            } else {
+                break; // 读错误或EOF
+            }
+        }
+
+        // 检查是否是主设备有输出
+        if (FD_ISSET(master_fd, &amp;read_fds)) {
+            nread = read(master_fd, buffer, sizeof(buffer));
+            if (nread &gt; 0) {
+                // 将来自shell的输出写入当前终端的屏幕
+                write(STDOUT_FILENO, buffer, nread);
+            } else {
+                // 读取到 0 或 -1，意味着子进程的另一端关闭了连接
+                // 通常是 shell 执行了 exit
+                break;
+            }
+        }
+    }
+
+    printf(&quot;\n--- Shell terminated. Parent process is shutting down. ---\n&quot;);
+    close(master_fd);
+    wait(NULL); // 等待子进程完全终止
+
+    return 0;
+}
+</pre></div>
+</div>
+</section>
+<section id="id8">
+<h4>如何编译和运行<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<ol class="arabic">
+<li><p><strong>保存代码</strong>：将上面的代码保存为 <code class="docutils literal notranslate"><span class="pre">ptmx_demo.c</span></code>。</p></li>
+<li><p><strong>编译</strong>：使用 gcc 进行编译。</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">gcc</span> <span class="o">-</span><span class="n">o</span> <span class="n">ptmx_demo</span> <span class="n">ptmx_demo</span><span class="o">.</span><span class="n">c</span>
+</pre></div>
+</div>
+</li>
+<li><p><strong>运行</strong>：执行生成的可执行文件。</p>
+<p>Bash</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">./</span><span class="n">ptmx_demo</span>
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="id9">
+<h4>运行时的输出和交互<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p>当你运行程序时，你会看到类似下面的输出：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>1. Master PTY opened with fd: 3
+2. Slave PTY permissions granted and unlocked.
+3. Slave PTY name is: /dev/pts/2
+4. Forked child process with PID: 12345
+5. Parent process will now forward data between stdin and master PTY.
+--- You are now interacting with the new shell. Type &#39;exit&#39; to quit. ---
+
+bash-5.1$
+</pre></div>
+</div>
+<p><strong>发生了什么？</strong></p>
+<ul class="simple">
+<li><p>你的 <code class="docutils literal notranslate"><span class="pre">./ptmx_demo</span></code> 程序创建了一个新的伪终端 <code class="docutils literal notranslate"><span class="pre">/dev/pts/2</span></code>。</p></li>
+<li><p>它启动了一个新的 <code class="docutils literal notranslate"><span class="pre">bash</span></code> 进程，这个 <code class="docutils literal notranslate"><span class="pre">bash</span></code> 的“世界”就是 <code class="docutils literal notranslate"><span class="pre">/dev/pts/2</span></code>。</p></li>
+<li><p>你的 <code class="docutils literal notranslate"><span class="pre">./ptmx_demo</span></code> 程序正在作为中间人：</p>
+<ul>
+<li><p>它读取你在当前终端（比如 <code class="docutils literal notranslate"><span class="pre">/dev/pts/1</span></code>）的键盘输入。</p></li>
+<li><p>将你的输入（如 <code class="docutils literal notranslate"><span class="pre">ls</span> <span class="pre">-l</span></code>）写入到主设备（<code class="docutils literal notranslate"><span class="pre">master_fd</span></code>）。</p></li>
+<li><p>内核将数据转发给从设备 <code class="docutils literal notranslate"><span class="pre">/dev/pts/2</span></code>。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">bash</span></code> 从它的标准输入（<code class="docutils literal notranslate"><span class="pre">/dev/pts/2</span></code>）读取到 <code class="docutils literal notranslate"><span class="pre">ls</span> <span class="pre">-l</span></code> 并执行。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">bash</span></code> 将 <code class="docutils literal notranslate"><span class="pre">ls</span> <span class="pre">-l</span></code> 的结果写入到它的标准输出（<code class="docutils literal notranslate"><span class="pre">/dev/pts/2</span></code>）。</p></li>
+<li><p>内核将数据转发给主设备。</p></li>
+<li><p>你的 <code class="docutils literal notranslate"><span class="pre">./ptmx_demo</span></code> 程序从主设备（<code class="docutils literal notranslate"><span class="pre">master_fd</span></code>）读取到结果，并将其打印到自己的标准输出，所以你就在屏幕上看到了 <code class="docutils literal notranslate"><span class="pre">ls</span> <span class="pre">-l</span></code> 的结果。</p></li>
+</ul>
+</li>
+</ul>
+<p>你可以像在普通 shell 中一样执行命令：</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>bash-5.1$ pwd
+/home/user/test
+bash-5.1$ whoami
+user
+bash-5.1$ ps -f
+UID          PID    PPID  C STIME TTY          TIME CMD
+user       12344   5678  0 10:30 pts/1    00:00:00 ./ptmx_demo
+user       12345  12344  0 10:30 pts/2    00:00:00 bash
+user       12350  12345  0 10:31 pts/2    00:00:00 ps -f
+</pre></div>
+</div>
+<p>注意 <code class="docutils literal notranslate"><span class="pre">ps</span></code> 命令的输出！我们的 <code class="docutils literal notranslate"><span class="pre">ptmx_demo</span></code> 程序运行在 <code class="docutils literal notranslate"><span class="pre">pts/1</span></code>（你原来的终端），而它创建的 <code class="docutils literal notranslate"><span class="pre">bash</span></code> 进程则运行在一个全新的终端 <code class="docutils literal notranslate"><span class="pre">pts/2</span></code> 上。</p>
+<p>当你输入 <code class="docutils literal notranslate"><span class="pre">exit</span></code> 并回车时，<code class="docutils literal notranslate"><span class="pre">bash</span></code> 进程会终止，这会导致伪终端连接关闭。父进程中的 <code class="docutils literal notranslate"><span class="pre">read(master_fd,</span> <span class="pre">...)</span></code> 会返回 0，循环中断，程序优雅地退出。</p>
+<p>这个例子完整地展示了 <code class="docutils literal notranslate"><span class="pre">/dev/ptmx</span></code> 的核心用途：创建一个隔离的终端会话环境，并允许一个程序（父进程）完全控制另一个程序（子进程）的输入和输出。这也是所有终端模拟器、<code class="docutils literal notranslate"><span class="pre">ssh</span></code> 服务和 <code class="docutils literal notranslate"><span class="pre">tmux</span></code>/<code class="docutils literal notranslate"><span class="pre">screen</span></code> 等工具的基础工作原理。</p>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="Device" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../../userland/appdev/index.html" class="btn btn-neutral float-right" title="应用程序开发文档" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/device/tty.html">V0.3.0</a></dd>
+      <dd><a href="tty.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/device/tty.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

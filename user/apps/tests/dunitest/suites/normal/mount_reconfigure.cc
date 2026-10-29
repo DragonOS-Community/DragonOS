@@ -1,16 +1,26 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef CLONE_NEWNS
@@ -53,6 +63,33 @@ static bool path_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
 }
+
+static bool running_on_dragonos() {
+    struct utsname value {};
+    return uname(&value) == 0 &&
+           (strstr(value.release, "dragonos") != nullptr ||
+            strstr(value.nodename, "dragonos") != nullptr);
+}
+
+struct NamespaceBindCleanup {
+    std::string target;
+    std::string directory;
+    int original_fd = -1;
+    int target_fd = -1;
+    bool switched = false;
+    bool mounted = false;
+
+    ~NamespaceBindCleanup() {
+        if (switched && original_fd >= 0) {
+            setns(original_fd, CLONE_NEWUTS);
+        }
+        if (target_fd >= 0) close(target_fd);
+        if (original_fd >= 0) close(original_fd);
+        if (mounted) umount2(target.c_str(), MNT_DETACH);
+        if (!target.empty()) unlink(target.c_str());
+        if (!directory.empty()) rmdir(directory.c_str());
+    }
+};
 
 static bool mount_has_option(const char *mountpoint, const char *option) {
     FILE *fp;
@@ -104,6 +141,51 @@ static bool mount_has_option(const char *mountpoint, const char *option) {
     return found;
 }
 
+static bool mountinfo_root_for(const std::string &mountpoint, std::string *root) {
+    FILE *fp = fopen("/proc/self/mountinfo", "r");
+    if (fp == nullptr) return false;
+
+    char *line = nullptr;
+    size_t cap = 0;
+    bool found = false;
+    while (getline(&line, &cap, fp) > 0) {
+        char *saveptr = nullptr;
+        char *field = strtok_r(line, " ", &saveptr);  // mount ID
+        if (field == nullptr) continue;
+        field = strtok_r(nullptr, " ", &saveptr);  // parent ID
+        if (field == nullptr) continue;
+        field = strtok_r(nullptr, " ", &saveptr);  // major:minor
+        if (field == nullptr) continue;
+        char *mount_root = strtok_r(nullptr, " ", &saveptr);
+        char *current_mountpoint = strtok_r(nullptr, " ", &saveptr);
+        if (mount_root != nullptr && current_mountpoint != nullptr &&
+            mountpoint == current_mountpoint) {
+            *root = mount_root;
+            found = true;
+            break;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return found;
+}
+
+struct AtimeReaderContext {
+    int fd;
+    std::atomic<bool> stop;
+};
+
+static void *atime_reader(void *opaque) {
+    auto *context = static_cast<AtimeReaderContext *>(opaque);
+    char byte;
+    while (!context->stop.load(std::memory_order_relaxed)) {
+        if (pread(context->fd, &byte, 1, 0) != 1) {
+            return reinterpret_cast<void *>(1);
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 TEST(MountReconfigure, BindRemountReadonly) {
@@ -148,6 +230,10 @@ TEST(MountReconfigure, BindRemountReadonly) {
         cleanup_mount(source);
         FAIL() << strerror(errno);
     }
+
+    errno = 0;
+    EXPECT_EQ(-1, access(target, W_OK));
+    EXPECT_EQ(EROFS, errno);
 
     snprintf(dst_file, sizeof(dst_file), "%s/readonly.txt", target);
     fd = open(dst_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -349,6 +435,26 @@ TEST(MountReconfigure, NoexecRejectsExec) {
         FAIL() << strerror(errno);
     }
 
+    int fd = open(target_file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    errno = 0;
+    void *mapping = mmap(NULL, 0, PROT_EXEC, MAP_PRIVATE, fd, 0);
+    EXPECT_EQ(MAP_FAILED, mapping);
+    EXPECT_EQ(EINVAL, errno);
+
+    errno = 0;
+    mapping = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    EXPECT_EQ(MAP_FAILED, mapping);
+    EXPECT_EQ(EPERM, errno);
+
+    mapping = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(-1, mprotect(mapping, 4096, PROT_READ | PROT_EXEC));
+    EXPECT_EQ(EACCES, errno);
+    EXPECT_EQ(0, munmap(mapping, 4096)) << strerror(errno);
+    close(fd);
+
     char *const argv[] = {target_file, nullptr};
     char *const envp[] = {nullptr};
     errno = 0;
@@ -360,6 +466,406 @@ TEST(MountReconfigure, NoexecRejectsExec) {
     rmdir(target);
     rmdir(source);
     rmdir(root);
+}
+
+TEST(MountReconfigure, StrictAtimeReadUpdatesAccessTime) {
+    const char *target = "/tmp/test_mount_strictatime_read";
+    const char *file = "/tmp/test_mount_strictatime_read/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+
+    int fd = open(file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    char byte;
+    ASSERT_EQ(1, read(fd, &byte, 1)) << strerror(errno);
+    close(fd);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(file, &st)) << strerror(errno);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, StrictAtimeEofReadUpdatesAccessTime) {
+    const char *target = "/tmp/test_mount_strictatime_eof";
+    const char *file = "/tmp/test_mount_strictatime_eof/empty";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+
+    int fd = open(file, O_CREAT | O_RDONLY, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+
+    char byte = 0;
+    ASSERT_EQ(0, read(fd, &byte, 1)) << strerror(errno);
+    struct stat st = {};
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+    ASSERT_EQ(0, read(fd, &byte, 0)) << strerror(errno);
+    ASSERT_EQ(0, fstat(fd, &st)) << strerror(errno);
+    EXPECT_EQ(1, st.st_atim.tv_sec);
+    close(fd);
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, DirectoryReadHonorsAtimeFlags) {
+    const char *strict_target = "/tmp/test_mount_dir_strictatime";
+    const char *strict_file = "/tmp/test_mount_dir_strictatime/file";
+    const char *nodir_target = "/tmp/test_mount_dir_nodiratime";
+    const char *nodir_file = "/tmp/test_mount_dir_nodiratime/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(strict_target);
+    ensure_dir(nodir_target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", strict_target, "tmpfs", MS_STRICTATIME, NULL))
+        << strerror(errno);
+    ASSERT_EQ(0,
+              mount("tmpfs", nodir_target, "tmpfs", MS_STRICTATIME | MS_NODIRATIME, NULL))
+        << strerror(errno);
+    ASSERT_EQ(0, write_file(strict_file)) << strerror(errno);
+    ASSERT_EQ(0, write_file(nodir_file)) << strerror(errno);
+
+    struct timespec times[2] = {{1, 0}, {2, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, strict_target, times, 0)) << strerror(errno);
+    ASSERT_EQ(0, utimensat(AT_FDCWD, nodir_target, times, 0)) << strerror(errno);
+
+    auto read_directory = [](const char *path) {
+        DIR *dir = opendir(path);
+        if (dir == nullptr) {
+            return -1;
+        }
+        while (readdir(dir) != nullptr) {
+        }
+        return closedir(dir);
+    };
+    ASSERT_EQ(0, read_directory(strict_target)) << strerror(errno);
+    ASSERT_EQ(0, read_directory(nodir_target)) << strerror(errno);
+
+    struct stat strict_st = {};
+    struct stat nodir_st = {};
+    ASSERT_EQ(0, stat(strict_target, &strict_st)) << strerror(errno);
+    ASSERT_EQ(0, stat(nodir_target, &nodir_st)) << strerror(errno);
+    EXPECT_GT(strict_st.st_atim.tv_sec, 1);
+    EXPECT_EQ(1, nodir_st.st_atim.tv_sec);
+
+    unlink(strict_file);
+    unlink(nodir_file);
+    cleanup_mount(strict_target);
+    cleanup_mount(nodir_target);
+}
+
+TEST(MountReconfigure, FollowsTmpfsSymlinkLongerThan256Bytes) {
+    const char *target = "/tmp/test_mount_long_symlink";
+    const char *file = "/tmp/test_mount_long_symlink/file";
+    const char *link = "/tmp/test_mount_long_symlink/link";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    std::string link_target;
+    for (int i = 0; i < 130; ++i) {
+        link_target += "./";
+    }
+    link_target += "file";
+    ASSERT_GT(link_target.size(), 256UL);
+    ASSERT_EQ(0, symlink(link_target.c_str(), link)) << strerror(errno);
+
+    int fd = open(link, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    char byte = 0;
+    ASSERT_EQ(1, read(fd, &byte, 1)) << strerror(errno);
+    EXPECT_EQ('x', byte);
+    close(fd);
+    unlink(link);
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, CreatDirectoryIsAlwaysInvalid) {
+    const char *target = "/tmp/test_mount_creat_directory";
+    const char *missing = "/tmp/test_mount_creat_directory/missing";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+
+    errno = 0;
+    EXPECT_EQ(-1, open(target, O_RDONLY | O_CREAT | O_DIRECTORY, 0600));
+    EXPECT_EQ(EINVAL, errno);
+    errno = 0;
+    EXPECT_EQ(-1, open(missing, O_RDONLY | O_CREAT | O_DIRECTORY, 0600));
+    EXPECT_EQ(EINVAL, errno);
+    rmdir(target);
+}
+
+TEST(MountReconfigure, NoatimeRequiresOwnerOrCapFowner) {
+    const char *target = "/tmp/test_mount_noatime_permission";
+    const char *file = "/tmp/test_mount_noatime_permission/file";
+    const char *link = "/tmp/test_mount_noatime_permission/link";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, NULL)) << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+    ASSERT_EQ(0, symlink("file", link)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setuid(1000) != 0) {
+            _exit(10);
+        }
+
+        errno = 0;
+        int fd = open(file, O_RDONLY | O_NOATIME);
+        if (fd >= 0 || errno != EPERM) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(11);
+        }
+
+        errno = 0;
+        fd = open(link, O_RDONLY | O_NOFOLLOW | O_NOATIME);
+        if (fd >= 0 || errno != ELOOP) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(14);
+        }
+
+        errno = 0;
+        fd = open(target, O_RDONLY | O_DIRECT | O_NOATIME);
+        if (fd >= 0 || errno != EPERM) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            _exit(15);
+        }
+
+        fd = open(file, O_RDONLY);
+        if (fd < 0) {
+            _exit(12);
+        }
+        errno = 0;
+        if (fcntl(fd, F_SETFL, O_NOATIME) != -1 || errno != EPERM) {
+            close(fd);
+            _exit(13);
+        }
+        close(fd);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(link);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, NoatimeCreateUsesCallerOwnership) {
+    const char *target = "/tmp/test_mount_noatime_create_owner";
+    const char *file = "/tmp/test_mount_noatime_create_owner/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, "mode=0777"))
+        << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(20);
+        }
+        int fd = open(file, O_CREAT | O_EXCL | O_RDONLY | O_NOATIME, 0600);
+        if (fd < 0) {
+            _exit(21);
+        }
+        struct stat st = {};
+        if (fstat(fd, &st) != 0 || st.st_uid != 1000 || st.st_gid != 1000) {
+            close(fd);
+            _exit(22);
+        }
+        close(fd);
+        fd = open(file, O_RDONLY | O_NOATIME);
+        if (fd < 0) {
+            _exit(23);
+        }
+        close(fd);
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(file);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, SetgidDirectoryCreationSemantics) {
+    const char *target = "/tmp/test_mount_setgid_create";
+    const char *parent = "/tmp/test_mount_setgid_create/parent";
+    const char *file = "/tmp/test_mount_setgid_create/parent/file";
+    const char *dir = "/tmp/test_mount_setgid_create/parent/dir";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, "mode=0777")) << strerror(errno);
+    ASSERT_EQ(0, mkdir(parent, 0777)) << strerror(errno);
+    ASSERT_EQ(0, chown(parent, 0, 2000)) << strerror(errno);
+    ASSERT_EQ(0, chmod(parent, 02777)) << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        if (setgid(1000) != 0 || setuid(1000) != 0) {
+            _exit(30);
+        }
+        umask(0);
+        int fd = open(file, O_CREAT | O_EXCL | O_WRONLY, 02770);
+        if (fd < 0) {
+            _exit(31);
+        }
+        close(fd);
+        struct stat st = {};
+        if (stat(file, &st) != 0 || st.st_gid != 2000 || (st.st_mode & S_ISGID) != 0) {
+            _exit(32);
+        }
+        if (mkdir(dir, 0770) != 0) {
+            _exit(33);
+        }
+        if (stat(dir, &st) != 0 || st.st_gid != 2000 || (st.st_mode & S_ISGID) == 0) {
+            _exit(34);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    unlink(file);
+    rmdir(dir);
+    rmdir(parent);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, AtimeUpdateDoesNotOverwriteConcurrentMetadata) {
+    const char *target = "/tmp/test_mount_atime_atomic";
+    const char *file = "/tmp/test_mount_atime_atomic/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", MS_STRICTATIME, "size=1m"))
+        << strerror(errno);
+    ASSERT_EQ(0, write_file(file)) << strerror(errno);
+
+    int fd = open(file, O_RDONLY);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    AtimeReaderContext context = {fd, false};
+    pthread_t reader;
+    ASSERT_EQ(0, pthread_create(&reader, nullptr, atime_reader, &context));
+
+    for (int i = 0; i < 2000; ++i) {
+        ASSERT_EQ(0, chmod(file, (i & 1) ? 0613 : 0642)) << strerror(errno);
+        struct timespec times[2] = {{100 + i, 0}, {200 + i, 0}};
+        ASSERT_EQ(0, utimensat(AT_FDCWD, file, times, 0)) << strerror(errno);
+    }
+
+    const mode_t final_mode = 0613;
+    const time_t final_mtime = 123456;
+    ASSERT_EQ(0, chmod(file, final_mode)) << strerror(errno);
+    struct timespec final_times[2] = {{1, 0}, {final_mtime, 0}};
+    ASSERT_EQ(0, utimensat(AT_FDCWD, file, final_times, 0)) << strerror(errno);
+    usleep(20000);
+    context.stop.store(true, std::memory_order_relaxed);
+    void *thread_result = nullptr;
+    ASSERT_EQ(0, pthread_join(reader, &thread_result));
+    ASSERT_EQ(nullptr, thread_result);
+
+    struct stat st = {};
+    ASSERT_EQ(0, stat(file, &st)) << strerror(errno);
+    EXPECT_EQ(final_mode, st.st_mode & 0777);
+    EXPECT_EQ(final_mtime, st.st_mtim.tv_sec);
+    EXPECT_GT(st.st_atim.tv_sec, 1);
+
+    close(fd);
+    cleanup_mount(target);
+}
+
+TEST(MountReconfigure, TmpfsStatfsTracksPageQuotaWithoutCachedFreeBlocks) {
+    const char *target = "/tmp/test_tmpfs_statfs_quota";
+    const char *file = "/tmp/test_tmpfs_statfs_quota/file";
+
+    ensure_dir("/tmp");
+    ensure_dir(target);
+    ASSERT_EQ(0, unshare(CLONE_NEWNS)) << strerror(errno);
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount("tmpfs", target, "tmpfs", 0, "size=16k")) << strerror(errno);
+
+    struct statfs before = {};
+    ASSERT_EQ(0, statfs(target, &before)) << strerror(errno);
+    ASSERT_EQ(4UL, before.f_blocks);
+    ASSERT_EQ(4UL, before.f_bfree);
+
+    int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, posix_fallocate(fd, 0, 8192));
+
+    struct statfs allocated = {};
+    ASSERT_EQ(0, statfs(target, &allocated)) << strerror(errno);
+    EXPECT_EQ(4UL, allocated.f_blocks);
+    EXPECT_EQ(2UL, allocated.f_bfree);
+
+    errno = 0;
+    EXPECT_EQ(-1, mount("tmpfs", target, "tmpfs", MS_REMOUNT, "size=4k"));
+    EXPECT_EQ(EINVAL, errno);
+
+    struct statfs rejected = {};
+    ASSERT_EQ(0, statfs(target, &rejected)) << strerror(errno);
+    EXPECT_EQ(4UL, rejected.f_blocks);
+    EXPECT_EQ(2UL, rejected.f_bfree);
+
+    ASSERT_EQ(0, ftruncate(fd, 0)) << strerror(errno);
+    struct statfs released = {};
+    ASSERT_EQ(0, statfs(target, &released)) << strerror(errno);
+    EXPECT_EQ(4UL, released.f_bfree);
+
+    close(fd);
+    unlink(file);
+    cleanup_mount(target);
 }
 
 TEST(MountReconfigure, BindRemountReadonlyDoesNotChangeSourceSuperblock) {
@@ -398,7 +904,7 @@ TEST(MountReconfigure, BindRemountReadonlyDoesNotChangeSourceSuperblock) {
     cleanup_mount(source);
 }
 
-TEST(MountReconfigure, TmpfsRemountModeCanReturnToDefaultPermissions) {
+TEST(MountReconfigure, TmpfsRemountModeDoesNotReplaceRootPermissions) {
     const char *target = "/tmp/test_tmpfs_remount_mode";
     struct stat st;
 
@@ -417,11 +923,14 @@ TEST(MountReconfigure, TmpfsRemountModeCanReturnToDefaultPermissions) {
 
     ASSERT_EQ(mount("tmpfs", target, "tmpfs", MS_REMOUNT, "mode=755"), 0) << strerror(errno);
     ASSERT_EQ(stat(target, &st), 0) << strerror(errno);
-    EXPECT_EQ(st.st_mode & 0777, 0755U);
+    // Linux shmem_reconfigure accepts mode but does not mutate the root inode.
+    EXPECT_EQ(st.st_mode & 0777, 0777U);
+
+    ASSERT_EQ(chmod(target, 0700), 0) << strerror(errno);
 
     ASSERT_EQ(mount("tmpfs", target, "tmpfs", MS_REMOUNT, "mode=777"), 0) << strerror(errno);
     ASSERT_EQ(stat(target, &st), 0) << strerror(errno);
-    EXPECT_EQ(st.st_mode & 0777, 0777U);
+    EXPECT_EQ(st.st_mode & 0777, 0700U);
 
     cleanup_mount(target);
 }
@@ -841,9 +1350,288 @@ TEST(MountReconfigure, StackedMountKeepsOriginalTarget) {
     EXPECT_FALSE(path_exists(upper_marker));
     EXPECT_TRUE(path_exists(sibling));
 
+    // Regression: popping the top mount must restore the lower mount's reverse
+    // mountpoint inode index. copy_mnt_ns() uses that index when cloning the
+    // namespace, so a second unshare should preserve the now-visible lower mount.
+    if (unshare(CLONE_NEWNS) != 0) {
+        int saved_errno = errno;
+        umount(target);
+        unlink(sibling);
+        rmdir(target);
+        rmdir(base);
+        FAIL() << strerror(saved_errno);
+    }
+    EXPECT_TRUE(path_exists(lower_marker));
+    EXPECT_FALSE(path_exists(upper_marker));
+    EXPECT_TRUE(path_exists(sibling));
+
     ASSERT_EQ(0, umount(target)) << strerror(errno);
     unlink(sibling);
     rmdir(target);
+    rmdir(base);
+}
+
+TEST(MountReconfigure, StackedMountRepeatedUnmountKeepsLowerIndex) {
+    const char *base = "/tmp/test_stacked_mount_repeated";
+    const char *target = "/tmp/test_stacked_mount_repeated/target";
+    char lower_marker[256];
+    char upper_marker[256];
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    ensure_dir(target);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    for (int i = 0; i < 16; ++i) {
+        snprintf(lower_marker, sizeof(lower_marker), "%s/lower_marker_%d", target, i);
+        snprintf(upper_marker, sizeof(upper_marker), "%s/upper_marker_%d", target, i);
+
+        ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+        ASSERT_EQ(0, write_file(lower_marker)) << strerror(errno);
+
+        ASSERT_EQ(0, mount("", target, "ramfs", 0, NULL)) << strerror(errno);
+        ASSERT_EQ(0, write_file(upper_marker)) << strerror(errno);
+
+        ASSERT_EQ(0, umount(target)) << "top umount failed at round " << i << ": "
+                                     << strerror(errno);
+        EXPECT_TRUE(path_exists(lower_marker)) << "lower mount lost at round " << i;
+        EXPECT_FALSE(path_exists(upper_marker)) << "upper mount remained visible at round " << i;
+
+        ASSERT_EQ(0, unshare(CLONE_NEWNS)) << "copy_mnt_ns failed at round " << i << ": "
+                                           << strerror(errno);
+        EXPECT_TRUE(path_exists(lower_marker)) << "lower mount index lost after unshare at round "
+                                               << i;
+        EXPECT_FALSE(path_exists(upper_marker)) << "upper mount reappeared after unshare at round "
+                                                << i;
+
+        ASSERT_EQ(0, umount(target)) << "lower umount failed at round " << i << ": "
+                                     << strerror(errno);
+    }
+
+    rmdir(target);
+    rmdir(base);
+}
+
+TEST(MountReconfigure, BindNamespaceOverOpenFileKeepsOpenFileIoFs) {
+    const char *base = "/tmp/test_mount_open_file_io_fs";
+    const char *target = "/tmp/test_mount_open_file_io_fs/ipc";
+    constexpr size_t kPageSize = 4096;
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    // tmpfs implements the ordinary file mmap callbacks exercised below;
+    // ramfs currently does not and would turn this mount-identity regression
+    // into an unrelated default map_pages panic.
+    ASSERT_EQ(0, mount("", base, "tmpfs", 0, NULL)) << strerror(errno);
+    int fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    ASSERT_EQ(0, ftruncate(fd, kPageSize)) << strerror(errno);
+    ASSERT_EQ(5, pwrite(fd, "lower", 5, 0)) << strerror(errno);
+    struct statfs lower_fd_statfs = {};
+    ASSERT_EQ(0, fstatfs(fd, &lower_fd_statfs)) << strerror(errno);
+
+    // This is the same bind shape used by Cube agent when it persists IPC
+    // namespaces. Path operations must resolve the newly mounted namespace
+    // inode, while the already-open fd must retain the ramfs selected at open.
+    ASSERT_EQ(0, mount("/proc/self/ns/ipc", target, NULL, MS_BIND, NULL)) << strerror(errno);
+
+    struct statfs overmounted_fd_statfs = {};
+    ASSERT_EQ(0, fstatfs(fd, &overmounted_fd_statfs)) << strerror(errno);
+    EXPECT_EQ(lower_fd_statfs.f_type, overmounted_fd_statfs.f_type);
+    struct statfs overmounted_path_statfs = {};
+    ASSERT_EQ(0, statfs(target, &overmounted_path_statfs)) << strerror(errno);
+    EXPECT_NE(lower_fd_statfs.f_type, overmounted_path_statfs.f_type);
+
+    void *mapping = mmap(NULL, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    EXPECT_EQ(0, memcmp(mapping, "lower", 5));
+    static_cast<char *>(mapping)[0] = 'L';
+    ASSERT_EQ(0, msync(mapping, kPageSize, MS_SYNC)) << strerror(errno);
+    ASSERT_EQ(0, munmap(mapping, kPageSize)) << strerror(errno);
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    char value[5] = {};
+    ASSERT_EQ(5, pread(fd, value, sizeof(value), 0)) << strerror(errno);
+    EXPECT_EQ(0, memcmp(value, "Lower", 5));
+    close(fd);
+    unlink(target);
+    ASSERT_EQ(0, umount(base)) << strerror(errno);
+    rmdir(base);
+}
+
+TEST(MountReconfigure, BoundNamespaceSurvivesSourceTaskExit) {
+    if (unshare(CLONE_NEWNS) != 0) {
+        if (errno == EPERM && !running_on_dragonos()) {
+            GTEST_SKIP() << "mount namespace unavailable: " << strerror(errno);
+        }
+        FAIL() << "unshare(CLONE_NEWNS): " << strerror(errno);
+    }
+    ASSERT_EQ(0, mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) << strerror(errno);
+
+    char directory[] = "/tmp/dunitest-ns-pin-XXXXXX";
+    ASSERT_NE(nullptr, mkdtemp(directory)) << strerror(errno);
+
+    NamespaceBindCleanup cleanup;
+    cleanup.directory = directory;
+    cleanup.target = cleanup.directory + "/uts";
+    int placeholder = open(cleanup.target.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
+    ASSERT_GE(placeholder, 0) << strerror(errno);
+    close(placeholder);
+    // Cleanup may always attempt umount; this also covers a worker failure
+    // after mount succeeds but before it reports completion.
+    cleanup.mounted = true;
+
+    cleanup.original_fd = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(cleanup.original_fd, 0) << strerror(errno);
+    struct stat original_stat {};
+    ASSERT_EQ(0, fstat(cleanup.original_fd, &original_stat)) << strerror(errno);
+
+    char proc_fd[64];
+    ASSERT_GT(snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", cleanup.original_fd), 0);
+    char namespace_identity[128] = {};
+    const ssize_t identity_len =
+        readlink(proc_fd, namespace_identity, sizeof(namespace_identity) - 1);
+    ASSERT_GT(identity_len, 0) << strerror(errno);
+    namespace_identity[identity_len] = '\0';
+    EXPECT_EQ("uts:[" + std::to_string(original_stat.st_ino) + "]", namespace_identity);
+
+    int result_pipe[2];
+    ASSERT_EQ(0, pipe2(result_pipe, O_CLOEXEC)) << strerror(errno);
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        close(result_pipe[0]);
+        if (unshare(CLONE_NEWUTS) != 0) _exit(errno == EPERM ? 77 : 79);
+
+        int source_fd = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
+        if (source_fd < 0) _exit(80);
+        struct stat source_stat {};
+        if (fstat(source_fd, &source_stat) != 0) _exit(81);
+        close(source_fd);
+
+        if (mount("/proc/self/ns/uts", cleanup.target.c_str(), NULL, MS_BIND, NULL) != 0) {
+            _exit(errno == EPERM ? 78 : 82);
+        }
+        if (write(result_pipe[1], &source_stat.st_ino, sizeof(source_stat.st_ino)) !=
+            static_cast<ssize_t>(sizeof(source_stat.st_ino))) {
+            _exit(83);
+        }
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    ino_t source_ino = 0;
+    ssize_t result_size = read(result_pipe[0], &source_ino, sizeof(source_ino));
+    close(result_pipe[0]);
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0)) << strerror(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    const int exit_code = WEXITSTATUS(status);
+    if ((exit_code == 77 || exit_code == 78) && !running_on_dragonos()) {
+        GTEST_SKIP() << "namespace bind unavailable";
+    }
+    ASSERT_EQ(0, exit_code) << "namespace worker failed with code " << exit_code;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(source_ino)), result_size);
+
+    const std::string stale_source = "/proc/" + std::to_string(child) + "/ns/uts";
+    errno = 0;
+    EXPECT_EQ(-1, access(stale_source.c_str(), F_OK));
+    EXPECT_EQ(ENOENT, errno);
+
+    struct stat persistent_stat {};
+    ASSERT_EQ(0, stat(cleanup.target.c_str(), &persistent_stat)) << strerror(errno);
+    EXPECT_EQ(source_ino, persistent_stat.st_ino);
+    EXPECT_NE(original_stat.st_ino, persistent_stat.st_ino);
+    std::string mountinfo_root;
+    ASSERT_TRUE(mountinfo_root_for(cleanup.target, &mountinfo_root));
+    EXPECT_EQ("uts:[" + std::to_string(source_ino) + "]", mountinfo_root);
+
+    cleanup.target_fd = open(cleanup.target.c_str(), O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(cleanup.target_fd, 0) << strerror(errno);
+    ASSERT_GT(snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", cleanup.target_fd), 0);
+    char bound_path[PATH_MAX] = {};
+    const ssize_t bound_path_len = readlink(proc_fd, bound_path, sizeof(bound_path) - 1);
+    ASSERT_GT(bound_path_len, 0) << strerror(errno);
+    bound_path[bound_path_len] = '\0';
+    EXPECT_EQ(cleanup.target, bound_path);
+    ASSERT_EQ(0, setns(cleanup.target_fd, CLONE_NEWUTS)) << strerror(errno);
+    cleanup.switched = true;
+
+    struct stat selected_stat {};
+    ASSERT_EQ(0, stat("/proc/self/ns/uts", &selected_stat)) << strerror(errno);
+    EXPECT_EQ(source_ino, selected_stat.st_ino);
+
+    ASSERT_EQ(0, setns(cleanup.original_fd, CLONE_NEWUTS)) << strerror(errno);
+    cleanup.switched = false;
+    struct stat restored_stat {};
+    ASSERT_EQ(0, stat("/proc/self/ns/uts", &restored_stat)) << strerror(errno);
+    EXPECT_EQ(original_stat.st_ino, restored_stat.st_ino);
+}
+
+TEST(MountReconfigure, ProcFdMagicLinkKeepsReferencedMountProjection) {
+    const char *base = "/tmp/test_mount_proc_fd_projection";
+    const char *source = "/tmp/test_mount_proc_fd_projection/source";
+    const char *topper = "/tmp/test_mount_proc_fd_projection/topper";
+    const char *target = "/tmp/test_mount_proc_fd_projection/target";
+
+    ensure_dir("/tmp");
+    ensure_dir(base);
+    if (unshare(CLONE_NEWNS) != 0) {
+        GTEST_SKIP() << strerror(errno);
+    }
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    ASSERT_EQ(0, mount("", base, "tmpfs", 0, NULL)) << strerror(errno);
+
+    int source_fd = open(source, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(source_fd, 0) << strerror(errno);
+    ASSERT_EQ(6, write(source_fd, "source", 6)) << strerror(errno);
+    int topper_fd = open(topper, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(topper_fd, 0) << strerror(errno);
+    ASSERT_EQ(6, write(topper_fd, "topper", 6)) << strerror(errno);
+    close(topper_fd);
+    int target_fd = open(target, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(target_fd, 0) << strerror(errno);
+    close(target_fd);
+
+    char proc_fd[64] = {};
+    snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", source_fd);
+    // The proc-fd magic link retains the lower open file's struct path even
+    // after the pathname is covered by a different mount.
+    ASSERT_EQ(0, mount(topper, source, NULL, MS_BIND, NULL)) << strerror(errno);
+    ASSERT_EQ(0, mount(proc_fd, target, NULL, MS_BIND, NULL)) << strerror(errno);
+
+    struct stat source_stat = {};
+    struct stat target_stat = {};
+    ASSERT_EQ(0, fstat(source_fd, &source_stat)) << strerror(errno);
+    ASSERT_EQ(0, stat(target, &target_stat)) << strerror(errno);
+    EXPECT_EQ(source_stat.st_dev, target_stat.st_dev);
+    EXPECT_EQ(source_stat.st_ino, target_stat.st_ino);
+    char value[6] = {};
+    int bound_fd = open(target, O_RDONLY);
+    ASSERT_GE(bound_fd, 0) << strerror(errno);
+    ASSERT_EQ(6, read(bound_fd, value, sizeof(value))) << strerror(errno);
+    EXPECT_EQ(0, memcmp(value, "source", sizeof(value)));
+    close(bound_fd);
+
+    ASSERT_EQ(0, umount(target)) << strerror(errno);
+    ASSERT_EQ(0, umount(source)) << strerror(errno);
+    close(source_fd);
+    unlink(source);
+    unlink(topper);
+    unlink(target);
+    ASSERT_EQ(0, umount(base)) << strerror(errno);
     rmdir(base);
 }
 

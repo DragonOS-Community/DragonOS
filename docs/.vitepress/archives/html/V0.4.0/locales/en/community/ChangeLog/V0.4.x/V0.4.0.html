@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V0.4.0 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../../" id="documentation_options" src="../../../../../_static/documentation_options.js"></script>
+        <script src="../../../../../_static/jquery.js"></script>
+        <script src="../../../../../_static/underscore.js"></script>
+        <script src="../../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../../_static/doctools.js"></script>
+        <script src="../../../../../_static/translations.js"></script>
+    <script src="../../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../../search.html" />
+    <link rel="next" title="V.3.0" href="../V0.3.x/V0.3.0.html" />
+    <link rel="prev" title="Release Notes" href="../index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/device/index.html">设备</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html">Release Notes</a><ul class="current">
+<li class="toctree-l3 current"><a class="current reference internal" href="#">V0.4.0</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#core-highlights">Core Highlights</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#version-overview">Version Overview</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#detailed-changes">Detailed Changes</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#known-concerns">Known Concerns</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#acknowledgments">Acknowledgments</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#references">References</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.3.x/V0.3.0.html">V.3.0</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.2.x/V0.2.0.html">V0.2.0</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.10.html">V0.1.10</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.9.html">V0.1.9</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.8.html">V0.1.8</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.7.html">V0.1.7</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.6.html">V0.1.6</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.5.html">V0.1.5</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.4.html">V0.1.4</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.3.html">V0.1.3</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.2.html">V0.1.2</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.1.html">V0.1.1</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.0.html">V0.1.0</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="../index.html">Release Notes</a></li>
+      <li class="breadcrumb-item active">V0.4.0</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/locales/en/community/ChangeLog/V0.4.x/V0.4.0.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: community/ChangeLog/V0.4.x/V0.4.0.md</p></li>
+<li><p>Translation time: 2025-12-22 12:00:51</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="v0-4-0">
+<h1>V0.4.0<a class="headerlink" href="#v0-4-0" title="Permalink to this heading"></a></h1>
+<blockquote>
+<div><p>Preface: This version focuses on “Linux semantic alignment + engineering usability”. Significant enhancements have been made to I/O multiplexing, POSIX timers/CPU time, file systems and procfs; tmpfs, mount propagation, and wait queue refactoring pave the way for container/cloud-native scenarios; CI/nightly builds and Playground make the experience and regression smoother.</p>
+</div></blockquote>
+<blockquote>
+<div><p>Release Date: 2025-12-22</p>
+</div></blockquote>
+<section id="core-highlights">
+<h2>Core Highlights<a class="headerlink" href="#core-highlights" title="Permalink to this heading"></a></h2>
+<section id="i-o-multiplexing-and-time-semantics-alignment-with-linux-6-6">
+<h3>I/O Multiplexing and Time Semantics: Alignment with Linux 6.6<a class="headerlink" href="#i-o-multiplexing-and-time-semantics-alignment-with-linux-6-6" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>poll/pselect6 System Call Improvements</strong>: Fixed signal mask restoration logic, optimized <code class="docutils literal notranslate"><span class="pre">pselect6</span></code> implementation, correctly handled sigmask parameter and timeout validation, removed zero-timeout early return logic, ensured proper saving and restoring of signal masks during I/O waiting (#_translated_label__1531_en)</p></li>
+<li><p><strong>Enhanced epoll Event Handling</strong>: Properly handled epoll events for regular files, avoided unnecessary epitem additions; fixed epoll timeout wakeup mechanism, ensured timers wake waiting queues via Waker; improved poll_select_finish function to support more time types (#_translated_label__1528_en, #_translated_label__1492_en)</p></li>
+<li><p><strong>Complete POSIX Interval Timer Implementation</strong>: Implemented timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete system calls, supported SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID signal delivery modes, fixed gVisor timers_test (#_translated_label__1501_en, #_translated_label__1521_en)</p></li>
+<li><p><strong>Process and Thread CPU Time Statistics</strong>: Implemented ProcessCpuTime structure, supported user-mode, kernel-mode and total execution time statistics; added cputime_wait_queue to PCB, supported clock_nanosleep for CLOCK_PROCESS/THREAD_CPUTIME_ID; extended clock_gettime and clock_nanosleep system calls to support process and thread CPU time clocks (#_translated_label__1517_en)</p></li>
+<li><p><strong>POSIX Scheduling System Calls</strong>: Implemented sched_getparam, sched_getscheduler system calls, refactored sched_yield into an independent module (#_translated_label__1416_en)</p></li>
+</ul>
+</section>
+<section id="file-systems-and-vfs-functional-expansion-and-stability-improvements">
+<h3>File Systems and VFS: Functional Expansion and Stability Improvements<a class="headerlink" href="#file-systems-and-vfs-functional-expansion-and-stability-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>tmpfs File System Support</strong>: Added tmpfs support and integrated with devfs, provided memory file system capabilities; implemented atomic size management, zero-page creation, page cache management and other features; supported /dev/shm mounting, improved chroot and mount propagation mechanisms (#_translated_label__1459_en, #_translated_label__1480_en, #_translated_label__1410_en)</p></li>
+<li><p><strong>New System Call Implementations</strong>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">copy_file_range</span></code>: Implemented efficient file range copy system call (#_translated_label__1513_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">creat</span></code>: Added creat system call support, following Linux semantics (create new file or truncate existing file and open in write-only mode) (#_translated_label__1482_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">preadv2/pwritev2</span></code>: Implemented vectorized I/O system call with offset and flags, supported RWF flag validation (#_translated_label__1451_en, #_translated_label__1461_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fadvise64</span></code>: Implemented file access advisory system call, supported page cache range writeback and eviction, improved prefetch mechanism for random access patterns (#_translated_label__1439_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">umask</span></code>: Implemented umask system call, improved permission handling, set default umask to 0022 (#_translated_label__1500_en, #_translated_label__1419_en)</p></li>
+</ul>
+</li>
+<li><p><strong>File Operation Improvements</strong>:</p>
+<ul>
+<li><p>Fixed page cache truncation logic in truncate system call, fixed boundary conditions, added length checks (#_translated_label__1444_en)</p></li>
+<li><p>Enhanced symbolic link handling, increased maximum symbolic link following count to 40 (aligned with Linux 6.6 standard), improved VFS behavior (#_translated_label__1507_en)</p></li>
+<li><p>Fixed symlinkat handling when parent directory path is None (#_translated_label__1512_en)</p></li>
+<li><p>Fixed sys_rename logic and supported RENAME_NOREPLACE flag (#_translated_label__1393_en)</p></li>
+<li><p>Fixed pread64 system call compatibility and error handling, validated offset parameter and user buffer (#_translated_label__1398_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Append Lock Mechanism</strong>: Implemented file append operation lock manager, used jhash algorithm to ensure correctness of concurrent writes, supported forced append semantics (#_translated_label__1483_en)</p></li>
+<li><p><strong>EventFd File System</strong>: Implemented EventFd file system and enhanced VFS inode capabilities, supported event notification mechanisms; added is_stream, supports_seek, supports_pread, supports_pwrite methods to IndexNode trait (#_translated_label__1486_en)</p></li>
+<li><p><strong>File System Flag Refactoring</strong>: Refactored file system flag system, distinguished between open flags and access modes, improved code clarity (#_translated_label__1414_en)</p></li>
+<li><p><strong>Unified Path Checking</strong>: Unified use of vfs_check_and_clone_cstr function for path checking, reduced code duplication (#_translated_label__1481_en)</p></li>
+<li><p><strong>File Prefetch Functionality</strong>: Added file prefetch functionality, implemented readahead module for file prefetch algorithms, improved sequential read performance (#_translated_label__1391_en)</p></li>
+<li><p><strong>Mount Propagation Mechanism</strong>: Implemented mount propagation mechanism, supported Shared, Private, Slave, Unbindable propagation types, implemented recursive bind mount support (#_translated_label__1410_en)</p></li>
+</ul>
+</section>
+<section id="procfs-and-system-information-significant-observability-enhancements">
+<h3>procfs and System Information: Significant Observability Enhancements<a class="headerlink" href="#procfs-and-system-information-significant-observability-enhancements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Process Information Files</strong>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/stat</span></code>: Provided process status information, supported BusyBox ps/pstree/top and other tools (#_translated_label__1490_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/task</span></code>: Implemented thread directory structure, supported displaying main thread with tid=pid (#_translated_label__1490_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/cmdline</span></code> and <code class="docutils literal notranslate"><span class="pre">/proc/cmdline</span></code>: Provided process and kernel command line arguments (#_translated_label__1489_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/maps</span></code>: Provided process memory mapping information, improved page fault handling (#_translated_label__1468_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/statm</span></code>: Provided process memory statistics information (#_translated_label__1455_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Namespace Support</strong>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/ns/</span></code> Directory: Supported dynamic creation of namespace files, implemented basic cgroup namespace structure (#_translated_label__1515_en)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/thread-self/ns</span></code>: Supported viewing thread namespaces, implemented setns system call for namespace management (#_translated_label__1412_en, #_translated_label__1515_en)</p></li>
+<li><p>Fixed race conditions during namespace file creation (#_translated_label__1413_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Kernel Log Management</strong>: Implemented kernel log level management and procfs interface (/proc/sys/kernel/printk), supported dynamic adjustment of log levels (#_translated_label__1415_en)</p></li>
+<li><p><strong>File Descriptor Information</strong>: Added file descriptor related support in procfs, supported /proc/self/fd/N magic links, implemented FIONREAD ioctl command for pipes, added /proc/<pid>/fdinfo directory support (#_translated_label__1426_en)</p></li>
+</ul>
+</section>
+<section id="process-management-and-execution-closer-to-linux-behavior">
+<h3>Process Management and Execution: Closer to Linux Behavior<a class="headerlink" href="#process-management-and-execution-closer-to-linux-behavior" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Shebang Script Support</strong>: Added shebang script execution support, implemented script parsing and recursive execution, could directly run script files, supported multiple interpreters (#_translated_label__1511_en)</p></li>
+<li><p><strong>Process Wait Semantics Fixes</strong>:</p>
+<ul>
+<li><p>Fixed wait semantics for child processes in thread groups (#_translated_label__1427_en)</p></li>
+<li><p>Fixed parent process wakeup logic when child processes exit, ensured parent process is woken up regardless of exit_signal value (#_translated_label__1516_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Process Execution Improvements</strong>:</p>
+<ul>
+<li><p>Fixed sys_exec related tests, fixed empty path and empty argument handling in execve system call (#_translated_label__1518_en)</p></li>
+<li><p>Improved execve and execveat system call implementations, enhanced execution file permission checks and signal handling</p></li>
+<li><p>Implemented fd_table unsharing in execve processes, ensured isolation</p></li>
+<li><p>Improved path resolution logic, fixed error logging when shebang interpreter is not found</p></li>
+</ul>
+</li>
+<li><p><strong>Signal Handling Enhancements</strong>:</p>
+<ul>
+<li><p>Corrected POSIX timer signal delivery logic, supported SIGEV_THREAD mode, relaxed SIGEV_THREAD_ID restrictions (#_translated_label__1521_en)</p></li>
+<li><p>Fixed signal ignore logic, implemented signal ignore check logic (#_translated_label__1434_en)</p></li>
+<li><p>Implemented enhanced signal handling and IPC mechanisms, added rt_sigqueueinfo and rt_tgsigqueueinfo system calls (#_translated_label__1423_en)</p></li>
+<li><p>Fixed kill process group bug (#_translated_label__1424_en)</p></li>
+<li><p>Fixed issues related to sys_rt_sigtimedwait and sys_rt_sigreturn (#_translated_label__1406_en, #_translated_label__1394_en, #_translated_label__1400_en)</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="memory-management-and-i-o-performance-and-stability-optimizations">
+<h3>Memory Management and I/O: Performance and Stability Optimizations<a class="headerlink" href="#memory-management-and-i-o-performance-and-stability-optimizations" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>User Space Memory Access Fixes</strong>:</p>
+<ul>
+<li><p>Fixed zero-length buffer validation during IoVecs construction, ensured Linux semantics compliance</p></li>
+<li><p>Fixed scatter method error handling when encountering inaccessible memory, avoided returning errors after partial writes</p></li>
+<li><p>Fixed readv/preadv system calls to support chunked reading and partial successful writes</p></li>
+<li><p>Fixed page reclamation logic to avoid reclaiming still-mapped file pages</p></li>
+<li><p>Fixed null pointer checks in UserBufferReader/Writer, prevented undefined behavior</p></li>
+<li><p>Optimized IoVecs user space memory access checks and copy logic, uniformly used user_accessible_len for accessibility validation (#_translated_label__1522_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Block Cache Enhancements</strong>: Enhanced CacheBlock and BlockCache functionality, added from_slice and write_data methods, improved insert_one_block and immediate_write methods to accept slices instead of vectors, fixed FileMapInfo::page_cache memory leak issue (changed to Weak<PageCache>) (#_translated_label__1465_en)</p></li>
+<li><p><strong>Page Cache Improvements</strong>:</p>
+<ul>
+<li><p>Fixed page cache truncation during truncate, fixed boundary conditions (#_translated_label__1444_en)</p></li>
+<li><p>Improved page cache management, refactored page cache read/write to resolve deadlock issues (#_translated_label__1455_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Memory Management Optimizations</strong>:</p>
+<ul>
+<li><p>Fixed slab allocator iterator out-of-bounds access and concurrency safety issues, changed SLABALLOCATOR to SpinLock protection (#_translated_label__1464_en)</p></li>
+<li><p>Fixed error handling return value for exception table safe copying (#_translated_label__1395_en)</p></li>
+<li><p>Optimized page reclamation process, split into two phases to avoid deadlocks (#_translated_label__1455_en)</p></li>
+</ul>
+</li>
+<li><p><strong>mmap Support Enhancements</strong>: Implemented mmap method for multiple file system nodes, improved mmap error handling and validation, enhanced memory protection handling and validation (#_translated_label__1455_en)</p></li>
+</ul>
+</section>
+<section id="ipc-and-pipes-blocking-semantics-and-race-condition-fixes">
+<h3>IPC and Pipes: Blocking Semantics and Race Condition Fixes<a class="headerlink" href="#ipc-and-pipes-blocking-semantics-and-race-condition-fixes" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>FIFO Blocking Open Semantics</strong>: Implemented FIFO blocking open semantics, added open_wait_queue to LockedPipeInode for FIFO blocking waits during opening, implemented Linux FIFO blocking/non-blocking open semantics (O_RDONLY/O_WRONLY/O_RDWR) (#_translated_label__1429_en)</p></li>
+<li><p><strong>Pipe Behavior Improvements</strong>:</p>
+<ul>
+<li><p>Fixed and improved pipe behavior, added PipeFS (pipe file system) and registered PIPEFS_MAGIC</p></li>
+<li><p>Expanded pipe buffer to 65536 bytes, supported atomic writes</p></li>
+<li><p>Implemented FIFO (named pipe) support, allowed O_RDWR mode opening</p></li>
+<li><p>Fixed race conditions for writer wakeup in blocking mode, increased writer count before waiting for readers in blocking mode (#_translated_label__1529_en, #_translated_label__1426_en)</p></li>
+<li><p>Added pipe buffer size query functionality (F_GETPIPE_SZ and F_SETPIPE_SZ) to fcntl system call</p></li>
+<li><p>Added file descriptor related support in procfs</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="network-and-devices-stability-improvements">
+<h3>Network and Devices: Stability Improvements<a class="headerlink" href="#network-and-devices-stability-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Network Stack Optimizations</strong>:</p>
+<ul>
+<li><p>Changed NapiManager lock mechanism to lock_irqsave, fixed potential deadlocks when calling napi_schedule in interrupt context (#_translated_label__1525_en)</p></li>
+<li><p>Fixed UDP getsockname/getpeername system calls (#_translated_label__1460_en)</p></li>
+</ul>
+</li>
+<li><p><strong>TTY Driver Enhancements</strong>:</p>
+<ul>
+<li><p>Enhanced TTY driver and device management, improved handling of master and slave types (#_translated_label__1462_en)</p></li>
+<li><p>Fixed TTY and session permission check logic, added TIOCNOTTY command support (#_translated_label__1430_en)</p></li>
+<li><p>Added page_cache method to TTY devices and handled cases without page cache (#_translated_label__1428_en)</p></li>
+<li><p>Improved PTY device management, added /dev/ptmx symbolic link pointing to internal devpts node (#_translated_label__1462_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Asynchronous I/O Notification</strong>: Implemented asynchronous I/O notification mechanism and enhanced ioctl system calls (#_translated_label__1425_en)</p></li>
+</ul>
+</section>
+<section id="file-system-implementations-ext4-and-fat-improvements">
+<h3>File System Implementations: ext4 and FAT Improvements<a class="headerlink" href="#file-system-implementations-ext4-and-fat-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>ext4 File System</strong>:</p>
+<ul>
+<li><p>Fixed spinlock deadlocks in ext4 inode read/write operations</p></li>
+<li><p>Added parent directory pointer support, implemented parent() method</p></li>
+<li><p>Improved block device addressing logic, uniformly used 512-byte LBA</p></li>
+<li><p>Enhanced root file system detection mechanism, supported automatic identification of ext4 and FAT</p></li>
+<li><p>Fixed interpreter path lookup issues in ELF loader</p></li>
+<li><p>Added detection methods for ext4 and fat file systems and optimized code (#_translated_label__1509_en)</p></li>
+</ul>
+</li>
+<li><p><strong>FAT File System</strong>:</p>
+<ul>
+<li><p>Updated directory link count management, ensured directory link counts start from 2 (self-reference and parent directory link) (#_translated_label__1454_en)</p></li>
+<li><p>Improved file system statistics support, implemented SuperBlock fields required for statfs (#_translated_label__1491_en)</p></li>
+<li><p>Fixed overflow issues when updating free cluster counts in FAT32 FSInfo (#_translated_label__1491_en)</p></li>
+</ul>
+</li>
+<li><p><strong>File System Statistics</strong>: Improved file system statistics support for FAT and tmpfs, added default capacity policy (half of physical memory) for tmpfs (#_translated_label__1491_en)</p></li>
+</ul>
+</section>
+<section id="wait-queue-refactoring-introduction-of-waiter-waker-pattern">
+<h3>Wait Queue Refactoring: Introduction of Waiter/Waker Pattern<a class="headerlink" href="#wait-queue-refactoring-introduction-of-waiter-waker-pattern" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Wait Queue Mechanism Refactoring</strong>: Refactored wait queue mechanism, introduced Waiter/Waker pattern to prevent wakeup losses, unified wait interfaces, provided wait_event_interruptible/uninterruptible methods, refactored futex, epoll, eventfd, semaphore, completion and other modules to use new wait queues, optimized process wait for child process exit logic (#_translated_label__1452_en)</p></li>
+<li><p><strong>Signal Handling Fixes</strong>: Consumed signals promptly and refreshed HAS_PENDING_SIGNAL state in sys_rt_sigtimedwait, changed futex interruptible wakeup error code from ERESTARTSYS to EINTR to comply with Linux semantics (#_translated_label__1452_en)</p></li>
+</ul>
+</section>
+<section id="engineering-efficiency-and-ci-automation-and-toolchain-improvements">
+<h3>Engineering Efficiency and CI: Automation and Toolchain Improvements<a class="headerlink" href="#engineering-efficiency-and-ci-automation-and-toolchain-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Nightly Build Workflow</strong>: Added nightly build and release workflow, supported automated building and releasing, separated build and release steps, compressed build artifacts into tarballs (#_translated_label__1469_en, #_translated_label__1471_en, #_translated_label__1472_en, #_translated_label__1473_en, #_translated_label__1474_en, #_translated_label__1475_en, #_translated_label__1476_en, #_translated_label__1477_en)</p></li>
+<li><p><strong>Build Container Upgrade</strong>: Upgraded build container version to v1.19, fixed CI related issues, added riscv64 libc support, updated Docker image repository addresses in CI workflows (#_translated_label__1442_en)</p></li>
+<li><p><strong>CI Process Fixes</strong>:</p>
+<ul>
+<li><p>Fixed CI process where tests failed but returned success status (#_translated_label__1403_en)</p></li>
+<li><p>Fixed gVisor test automation scripts, fixed scripts for automatically enabling/disabling gVisor syscall test case packaging (#_translated_label__1405_en)</p></li>
+<li><p>Added open_test test (#_translated_label__1458_en)</p></li>
+</ul>
+</li>
+<li><p><strong>Code Review Automation</strong>: Added Claude code review workflow, optimized code review process and configuration, enabled progress tracking functionality (#_translated_label__1435_en, #_translated_label__1436_en, #_translated_label__1437_en, #_translated_label__1438_en, #_translated_label__1440_en, #_translated_label__1445_en, #_translated_label__1446_en, #_translated_label__1447_en)</p></li>
+<li><p><strong>Development Container Support</strong>: Added devcontainer support based on CNB images, set non-root user as default devcontainer user (#_translated_label__1449_en, #_translated_label__1457_en)</p></li>
+</ul>
+</section>
+<section id="documentation-and-community-experience-and-accessibility-improvements">
+<h3>Documentation and Community: Experience and Accessibility Improvements<a class="headerlink" href="#documentation-and-community-experience-and-accessibility-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>DragonOS Playground</strong>: Updated README and build documentation, added DragonOS Playground experience methods, added cloud-native development experience methods in README, provided one-click launch link for CNB platform, updated community news with Playground launch information (#_translated_label__1484_en)</p></li>
+<li><p><strong>Documentation Translation Updates</strong>: Multiple rounds of documentation translation updates, improved internationalization support (#_translated_label__1485_en, #_translated_label__1453_en, #_translated_label__1411_en, #_translated_label__1408_en, #_translated_label__1402_en, #_translated_label__1396_en)</p></li>
+<li><p><strong>User Environment Improvements</strong>:</p>
+<ul>
+<li><p>Fixed PS1 environment variable to match bash default highlighting (#_translated_label__1432_en)</p></li>
+<li><p>Used colored PS1, improved user experience (#_translated_label__1422_en)</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="gvisor-testing-continuous-compatibility-improvements">
+<h3>gVisor Testing: Continuous Compatibility Improvements<a class="headerlink" href="#gvisor-testing-continuous-compatibility-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Test Case Expansion</strong>: Removed fifo_test blocklist file from gVisor tests, expanded test coverage (#_translated_label__1524_en)</p></li>
+<li><p><strong>System Call Fixes</strong>:</p>
+<ul>
+<li><p>Fixed abnormal behavior of open system call under gVisor, fixed multiple open-related tests (#_translated_label__1417_en)</p></li>
+<li><p>Fixed boundary cases of utimensat/futimesat system calls for gVisor test compatibility (#_translated_label__1431_en)</p></li>
+<li><p>Fixed pread64 system call compatibility and error handling (#_translated_label__1398_en)</p></li>
+<li><p>Fixed sys_rename logic and supported RENAME_NOREPLACE (#_translated_label__1393_en)</p></li>
+<li><p>Fixed getdents system call implementation (#_translated_label__1397_en)</p></li>
+<li><p>Fixed SIG derivation issues when writing partially readable buffers in syscall/vfs (#_translated_label__1375_en)</p></li>
+<li><p>Fixed cputime, sys_rt_sigtimedwait and sys_rt_sigreturn related issues (#_translated_label__1406_en, #_translated_label__1394_en, #_translated_label__1400_en)</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="other-improvements">
+<h3>Other Improvements<a class="headerlink" href="#other-improvements" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Symbol Table Query Fixes</strong>: Fixed symbol table query issues, used binary search for symbols instead of original logic (#_translated_label__1443_en)</p></li>
+<li><p><strong>Device Driver Improvements</strong>: Added random device support (/dev/random), provided random byte generation capability (#_translated_label__1455_en)</p></li>
+<li><p><strong>File System Improvements</strong>: Improved directory link count management, updated directory link count management in FAT and RAM file systems (#_translated_label__1454_en)</p></li>
+</ul>
+</section>
+</section>
+<section id="version-overview">
+<h2>Version Overview<a class="headerlink" href="#version-overview" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>I/O Multiplexing</strong>: Fixed poll/pselect6 signal mask restoration logic, enhanced epoll event handling, improved timeout wakeup mechanism</p></li>
+<li><p><strong>Time and Timers</strong>: Complete POSIX interval timer implementation, CPU time statistics, improved clock_nanosleep, POSIX scheduling system calls</p></li>
+<li><p><strong>File Systems</strong>: tmpfs support, new system calls like copy_file_range, creat, preadv2, pwritev2, fadvise64, umask, append lock mechanism, EventFd file system, mount propagation mechanism</p></li>
+<li><p><strong>procfs Enhancements</strong>: Support for /proc/<pid>/stat, /proc/<pid>/task, /proc/<pid>/cmdline, /proc/<pid>/maps, /proc/<pid>/ns/, /proc/thread-self/ns/ and other files, kernel log management</p></li>
+<li><p><strong>Process Management</strong>: Shebang script support, process wait semantics fixes, signal handling enhancements, process execution improvements</p></li>
+<li><p><strong>Memory and I/O</strong>: Fixed user space memory access, enhanced block cache, improved page cache, fixed slab allocator concurrency safety, enhanced mmap support</p></li>
+<li><p><strong>IPC and Pipes</strong>: FIFO blocking open semantics, pipe race condition fixes, dynamic pipe buffer adjustment</p></li>
+<li><p><strong>Network and Devices</strong>: Optimized network stack lock mechanism, fixed UDP sockets, enhanced TTY drivers, added random device support</p></li>
+<li><p><strong>File System Implementations</strong>: Fixed ext4 deadlocks, improved FAT file system, enhanced file system statistics</p></li>
+<li><p><strong>Wait Queue Refactoring</strong>: Waiter/Waker pattern, unified wait interfaces</p></li>
+<li><p><strong>Engineering Efficiency</strong>: Nightly build workflow, build container upgraded to v1.19, CI process fixes, code review automation, development container support</p></li>
+<li><p><strong>Documentation and Community</strong>: DragonOS Playground promotion, documentation translation updates, user environment improvements</p></li>
+<li><p><strong>gVisor Testing</strong>: Expanded test cases, multiple system call fixes to pass gVisor tests</p></li>
+</ul>
+</section>
+<section id="detailed-changes">
+<h2>Detailed Changes<a class="headerlink" href="#detailed-changes" title="Permalink to this heading"></a></h2>
+<section id="id1">
+<h3>1. I/O Multiplexing and Time Semantics: Alignment with Linux 6.6<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<section id="poll-pselect6-optimizations-translated-label-1531-en">
+<h4>poll/pselect6 Optimizations (#_translated_label__1531_en)<a class="headerlink" href="#poll-pselect6-optimizations-translated-label-1531-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed signal mask restoration logic in poll_select_finish, avoided incorrect restoration during ERESTARTSYS</p></li>
+<li><p>Refactored pselect6 system call, correctly handled sigmask parameter and timeout validation</p></li>
+<li><p>Removed zero-timeout early return logic in poll_select_finish</p></li>
+<li><p>Added as_millis method to PosixTimeSpec</p></li>
+<li><p>Added whitelist for select-related tests</p></li>
+</ul>
+</section>
+<section id="epoll-event-handling-translated-label-1528-en-translated-label-1492-en">
+<h4>epoll Event Handling (#_translated_label__1528_en, #_translated_label__1492_en)<a class="headerlink" href="#epoll-event-handling-translated-label-1528-en-translated-label-1492-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed logic where regular files were always ready in epoll, avoided unnecessary epitem additions</p></li>
+<li><p>Improved poll_select_finish function to support more time types</p></li>
+<li><p>Fixed negative timeout value check in select system call</p></li>
+<li><p>Refactored timer creation logic, used EpollTimeoutWaker structure to implement TimerFunction</p></li>
+<li><p>Changed timeout wakeup method from direct PCB wakeup to triggering via Waker::wake()</p></li>
+</ul>
+</section>
+<section id="posix-interval-timer-translated-label-1501-en-translated-label-1521-en">
+<h4>POSIX Interval Timer (#_translated_label__1501_en, #_translated_label__1521_en)<a class="headerlink" href="#posix-interval-timer-translated-label-1501-en-translated-label-1521-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added handling for system calls timer_create/timer_settime/timer_gettime/timer_getoverrun/timer_delete and integrated them into the syscall table</p></li>
+<li><p>Implemented process-level POSIX interval timers: creation/deletion/setting/querying based on CLOCK_MONOTONIC, periodic reloading, and expiration scheduling</p></li>
+<li><p>Fully implemented SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID (relaxed SIGEV_THREAD_ID restrictions to allow signal delivery to any thread in the same thread group) and SI_TIMER siginfo (including si_timerid/si_overrun/si_value)</p></li>
+<li><p>Fixed overrun semantics and signal coalescing: merged and accumulated overruns in the per-thread pending queue to prevent duplicate queuing that could kill the process with signals</p></li>
+<li><p>Fixed remaining time calculation in gettime for periodic timers and the issue of returning 0 for callback windows</p></li>
+<li><p>Fixed self-deadlock caused by signal lock/queue access in timer callbacks</p></li>
+<li><p>Fixed the issue where ProcessControlBlock::raw_tgid() returned the wrong field</p></li>
+</ul>
+</section>
+<section id="cpu-time-statistics-translated-label-1517-en">
+<h4>CPU Time Statistics (#_translated_label__1517_en)<a class="headerlink" href="#cpu-time-statistics-translated-label-1517-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added the ProcessCpuTime structure to track user-mode, kernel-mode, and total execution time</p></li>
+<li><p>Added cputime_wait_queue to PCB to support clock_nanosleep for CLOCK_PROCESS/THREAD_CPUTIME_ID</p></li>
+<li><p>Added CPU-time wait queue wakeup logic in scheduler CPU time statistics</p></li>
+<li><p>Extended system calls clock_gettime and clock_nanosleep to support process and thread CPU time clocks</p></li>
+<li><p>Added the PosixTimeSpec::from_ns method for convenient creation of time specifications from nanoseconds</p></li>
+<li><p>Added defensive fallback and logging for invalid thread group relationships in process_cputime_ns</p></li>
+<li><p>Added comments explaining atomic operation ordering for thread_cputime_ns</p></li>
+<li><p>Added a multi-threaded CPU time test program to verify the functionality of accumulating thread times into process CPU time</p></li>
+</ul>
+</section>
+<section id="posix-scheduling-system-calls-translated-label-1416-en">
+<h4>POSIX Scheduling System Calls (#_translated_label__1416_en)<a class="headerlink" href="#posix-scheduling-system-calls-translated-label-1416-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added the sched_getparam system call to retrieve process scheduling parameters</p></li>
+<li><p>Added the sched_getscheduler system call to retrieve process scheduling policies</p></li>
+<li><p>Refactored sched_yield into an independent module, providing appropriate system call handlers</p></li>
+<li><p>Added utility functions for scheduling permission checks</p></li>
+<li><p>Removed the old do_sched_yield implementation from the main system call module</p></li>
+</ul>
+</section>
+</section>
+<section id="id2">
+<h3>2. File Systems and VFS: Functional Expansion and Stability Improvements<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<section id="tmpfs-file-system-translated-label-1459-en-translated-label-1480-en-translated-label-1410-en">
+<h4>tmpfs File System (#_translated_label__1459_en, #_translated_label__1480_en, #_translated_label__1410_en)<a class="headerlink" href="#tmpfs-file-system-translated-label-1459-en-translated-label-1480-en-translated-label-1410-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Introduced a new tmpfs module for in-memory temporary file storage</p></li>
+<li><p>Updated devfs to mount /dev/shm as tmpfs, aligning with Linux semantics</p></li>
+<li><p>Enhanced the vfs module to include TMPFS_MAGIC for tmpfs identification</p></li>
+<li><p>Added methods and structures required for tmpfs functionality, including inode management and file operations</p></li>
+<li><p>Implemented atomic size management, adding atomic operations to manage the current size of the tmpfs file system</p></li>
+<li><p>Integrated size management into inode operations to ensure thread-safe size updates and adherence to specified limits</p></li>
+<li><p>Enhanced resize and truncate methods to adjust the file system size accordingly during file modifications</p></li>
+<li><p>Implemented zero-page creation, adding the create_zero_pages method to InnerPageCache for efficient zero-page creation</p></li>
+<li><p>Updated Tmpfs to utilize the new zero-page creation during read/write operations, ensuring seamless page fault handling</p></li>
+<li><p>Enhanced PageFaultHandler, adding pagecache_fault_zero to specifically manage tmpfs page faults</p></li>
+<li><p>Fixed chroot-related issues and implemented mount propagation mechanisms</p></li>
+</ul>
+</section>
+<section id="new-system-call-implementations">
+<h4>New System Call Implementations<a class="headerlink" href="#new-system-call-implementations" title="Permalink to this heading"></a></h4>
+<p><strong>copy_file_range (#_translated_label__1513_en)</strong></p>
+<ul class="simple">
+<li><p>Implemented the copy_file_range system call to support efficient data copying between files</p></li>
+<li><p>Added comprehensive test cases covering basic functionality, boundary conditions, and error handling</p></li>
+</ul>
+<p><strong>creat (#_translated_label__1482_en)</strong></p>
+<ul class="simple">
+<li><p>Implemented the creat system call handler, following Linux semantics: creating a new file or truncating an existing file and opening it in write-only mode</p></li>
+<li><p>Registered the creat system call in the syscall table for the x86_64 architecture</p></li>
+<li><p>Added the creat test item to the gvisor test whitelist</p></li>
+</ul>
+<p><strong>preadv2/pwritev2 (#_translated_label__1451_en, #_translated_label__1461_en)</strong></p>
+<ul class="simple">
+<li><p>Implemented the preadv2 system call to support vectorized reading with offsets and flags</p></li>
+<li><p>Handled the case where offset is -1 by using the current file offset, otherwise reusing preadv logic</p></li>
+<li><p>Added validation for RWF flags, adhering to Linux compatibility requirements</p></li>
+<li><p>Implemented the pwritev2 system call to allow vectorized writing with offsets and flags</p></li>
+<li><p>Implemented validation for file descriptors and offsets to ensure robust error handling</p></li>
+<li><p>Reused the core logic of pwritev for the new system calls to maintain consistency in file write operations</p></li>
+</ul>
+<p><strong>fadvise64 (#_translated_label__1439_en)</strong></p>
+<ul class="simple">
+<li><p>Added implementation of the fadvise64 system call</p></li>
+<li><p>Added functionality for page cache range writeback and eviction</p></li>
+<li><p>Improved prefetch mechanisms to support random access patterns</p></li>
+<li><p>Expanded management of file access mode flags</p></li>
+<li><p>Encapsulated access to file prefetch states and optimized fadvise64 implementation</p></li>
+<li><p>Fixed the page boundary check logic in fadvise64</p></li>
+</ul>
+<p><strong>umask (#_translated_label__1500_en, #_translated_label__1419_en)</strong></p>
+<ul class="simple">
+<li><p>Set the default umask to 0022 for new file system instances</p></li>
+<li><p>Added helper functions apply_umask_for_create() and chmod_preserve_type()</p></li>
+<li><p>Implemented appropriate permission checks for file creation and chmod operations</p></li>
+<li><p>Fixed the fchmod system call to work correctly and reject O_PATH file descriptors</p></li>
+<li><p>Added open_create_test to the gvisor test suite</p></li>
+</ul>
+</section>
+<section id="file-operation-improvements">
+<h4>File Operation Improvements<a class="headerlink" href="#file-operation-improvements" title="Permalink to this heading"></a></h4>
+<p><strong>truncate Fix (#_translated_label__1444_en)</strong></p>
+<ul class="simple">
+<li><p>Limited buffer size to 512KB to avoid capacity overflow due to excessive memory allocation</p></li>
+<li><p>Added page cache truncation for resize</p></li>
+<li><p>Increased checks for len to verify if the truncated length exceeds limits</p></li>
+<li><p>Checked filemode</p></li>
+<li><p>Improved type conversion logic for length parameters; uniformly used the limited-size buffer strategy</p></li>
+<li><p>Added maximum capacity checks in fat’s resize</p></li>
+<li><p>Uniformly defined ZERO_BUF_SIZE; added checks for zero writes; uniformly rejected lengths exceeding isize::MAX at the vfs layer</p></li>
+</ul>
+<p><strong>Symbolic Link Handling Enhancements (#_translated_label__1507_en)</strong></p>
+<ul class="simple">
+<li><p>Updated tmpfs to require both regular files and symbolic links to use the page cache, ensuring correct read/write operations</p></li>
+<li><p>Increased the maximum number of symbolic link follows to 40, aligning with Linux 6.6 standards</p></li>
+<li><p>Improved symbolic link handling in VFS, correctly following symbolic links based on path conditions and trailing slashes</p></li>
+<li><p>Added validation for conflicting flags in vfs_statx to prevent invalid operations</p></li>
+<li><p>Improved system call implementations for symbolic links and lstat to adhere to Linux semantics, ensuring correct behavior for symbolic link creation and path resolution</p></li>
+<li><p>Corrected the handling logic for symbolic link follow counts, adjusting VFS_MAX_FOLLOW_SYMLINK_TIMES from 40 to 41</p></li>
+</ul>
+<p><strong>Other File Operation Fixes</strong></p>
+<ul class="simple">
+<li><p>Fixed the handling logic in symlinkat when the parent directory path is None (#_translated_label__1512_en)</p></li>
+<li><p>Fixed the logic in sys_rename and added support for the RENAME_NOREPLACE flag (#_translated_label__1393_en)</p></li>
+<li><p>Fixed compatibility and error handling in the pread64 system call, validating the offset parameter and user buffer (#_translated_label__1398_en)</p></li>
+</ul>
+</section>
+<section id="append-lock-mechanism-translated-label-1483-en">
+<h4>Append Lock Mechanism (#_translated_label__1483_en)<a class="headerlink" href="#append-lock-mechanism-translated-label-1483-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Introduced the AppendLockManager to ensure atomicity of append operations across file systems, preventing data corruption in concurrent write scenarios</p></li>
+<li><p>Updated file write methods to utilize the new append lock mechanism, ensuring respect for the latest file end position when appending to files</p></li>
+<li><p>Enhanced write_append and pwrite_append methods to support forced append semantics, aligning with Linux behavior</p></li>
+<li><p>Initialized the append lock manager during VFS initialization to ensure readiness before any file write operations</p></li>
+<li><p>Added the jhash library and used it for hash calculations of append_lock</p></li>
+</ul>
+</section>
+<section id="eventfd-file-system-translated-label-1486-en">
+<h4>EventFd File System (#_translated_label__1486_en)<a class="headerlink" href="#eventfd-file-system-translated-label-1486-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Introduced EventFdFs as a new pseudo-file system to support eventfd file descriptors, including methods for root inode retrieval and file system information</p></li>
+<li><p>Enhanced the IndexNode trait, adding methods is_stream, supports_seek, supports_pread, and supports_pwrite to simplify stream file operation semantics</p></li>
+<li><p>Updated file handling in VFS to leverage new inode capabilities, ensuring correct behavior for pread, pwrite, and lseek operations</p></li>
+<li><p>Added eventfd_test to the system call whitelist for testing</p></li>
+<li><p>Fixed the error handling order for O_PATH and stream objects in pread/pwrite</p></li>
+</ul>
+</section>
+<section id="file-system-flags-refactoring-translated-label-1414-en">
+<h4>File System Flags Refactoring (#_translated_label__1414_en)<a class="headerlink" href="#file-system-flags-refactoring-translated-label-1414-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Refactored the file system flags system to distinguish between open flags and access modes</p></li>
+<li><p>Improved code clarity and maintainability</p></li>
+</ul>
+</section>
+<section id="unified-path-checking-translated-label-1481-en">
+<h4>Unified Path Checking (#_translated_label__1481_en)<a class="headerlink" href="#unified-path-checking-translated-label-1481-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Replaced check_and_clone_cstr in multiple VFS system calls with vfs_check_and_clone_cstr</p></li>
+<li><p>Simplified the method of obtaining page_cache references in page_cache.rs</p></li>
+<li><p>Added a new function copy_mount_path_string in sys_mount.rs specifically for handling mount paths</p></li>
+<li><p>Removed redundant path length checks in rename_utils.rs</p></li>
+</ul>
+</section>
+<section id="file-prefetch-functionality-translated-label-1391-en">
+<h4>File Prefetch Functionality (#_translated_label__1391_en)<a class="headerlink" href="#file-prefetch-functionality-translated-label-1391-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added the readahead module to implement file prefetch algorithms</p></li>
+<li><p>Modified the page_cache module to support prefetch markers</p></li>
+<li><p>Added prefetch state management to the File structure</p></li>
+<li><p>Added the PG_READAHEAD flag bit to PageFlags</p></li>
+</ul>
+</section>
+<section id="mount-propagation-mechanism-translated-label-1410-en">
+<h4>Mount Propagation Mechanism (#_translated_label__1410_en)<a class="headerlink" href="#mount-propagation-mechanism-translated-label-1410-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added support for mount propagation types: Shared, Private, Slave, and Unbindable</p></li>
+<li><p>Introduced a new module to manage mount propagation semantics, including peer group registration and event propagation</p></li>
+<li><p>Updated existing mount functions to handle propagation logic during mount and unmount operations</p></li>
+<li><p>Enhanced documentation to include detailed information and usage of the new mount propagation features</p></li>
+<li><p>Added unit tests to verify the correctness of mount propagation behavior in different scenarios</p></li>
+<li><p>Implemented support for recursive bind mounts, adding the recursive bind mount feature with support for the MS_BIND | MS_REC flags</p></li>
+<li><p>Implemented BFS traversal to copy sub-mounts in do_recursive_bind_mount</p></li>
+<li><p>Fixed mount registration order to prevent dangling registrations in case of failures</p></li>
+</ul>
+</section>
+</section>
+<section id="procfs-and-system-information-significantly-enhanced-observability">
+<h3>3. procfs and System Information: Significantly Enhanced Observability<a class="headerlink" href="#procfs-and-system-information-significantly-enhanced-observability" title="Permalink to this heading"></a></h3>
+<section id="process-information-files">
+<h4>Process Information Files<a class="headerlink" href="#process-information-files" title="Permalink to this heading"></a></h4>
+<p><strong>/proc/<pid>/stat and /proc/<pid>/task (#_translated_label__1490_en)</strong></p>
+<ul class="simple">
+<li><p>Added generation of the /proc/<pid>/stat file, supporting tools like BusyBox ps/pstree/top</p></li>
+<li><p>Implemented the /proc/<pid>/task directory structure, supporting the display of the main thread with tid=pid</p></li>
+<li><p>Added the proc_pid_stat and proc_pid_task modules to handle related logic</p></li>
+<li><p>Extended the ProcFileType enumeration, adding types such as ProcPidStat and ProcPidTaskDir</p></li>
+<li><p>Added a tid field in InodeInfo to support thread information</p></li>
+</ul>
+<p><strong>/proc/cmdline and /proc/<pid>/cmdline (#_translated_label__1489_en)</strong></p>
+<ul class="simple">
+<li><p>Added the proc_pid_cmdline module to implement the reading logic for /proc/cmdline and /proc/<pid>/cmdline files</p></li>
+<li><p>Added a cmdline field in the Process Control Block to store command-line arguments of processes</p></li>
+<li><p>Properly set and inherited cmdline data during execve, fork, and initial process startup</p></li>
+<li><p>Created corresponding file nodes in procfs and integrated them into the file type enumeration and opening logic</p></li>
+</ul>
+<p><strong>/proc/<pid>/maps (#_translated_label__1468_en)</strong></p>
+<ul class="simple">
+<li><p>Added the proc_maps module to implement the generation logic for /proc/<pid>/maps files</p></li>
+<li><p>Registered the maps file in ProcFS, supporting the creation and cleanup of process folders</p></li>
+<li><p>Updated the gvisor test whitelist, adding time_test</p></li>
+<li><p>Corrected the user-space judgment logic in page fault handling, prioritizing the use of TrapFrame and error codes to determine the access initiator</p></li>
+</ul>
+<p><strong>/proc/<pid>/statm (#_translated_label__1455_en)</strong></p>
+<ul class="simple">
+<li><p>Introduced the ProcStatm file type into the ProcFileType enumeration</p></li>
+<li><p>Implemented the open_statm function to return a placeholder response for the statm file</p></li>
+<li><p>Updated ProcFS inode creation to include a statm file for each process</p></li>
+<li><p>Enhanced the IndexNode implementation to handle the new ProcStatm file type</p></li>
+<li><p>Optimized the statm file opening logic, adding virtual memory page count calculations</p></li>
+</ul>
+</section>
+<section id="namespace-support">
+<h4>Namespace Support<a class="headerlink" href="#namespace-support" title="Permalink to this heading"></a></h4>
+<p><strong>/proc/<pid>/ns/ Directory (#_translated_label__1515_en)</strong></p>
+<ul class="simple">
+<li><p>Added the /proc/<pid>/ns/ directory to support dynamic creation of namespace files</p></li>
+<li><p>Implemented the basic structure for cgroup namespaces, supporting the CLONE_NEWCGROUP flag</p></li>
+<li><p>Added ioctl support for namespace files (commands such as NS_GET_NSTYPE)</p></li>
+<li><p>Extended the setns system call to support switching cgroup namespaces</p></li>
+</ul>
+<p><strong>/proc/thread-self/ns (#_translated_label__1412_en)</strong></p>
+<ul class="simple">
+<li><p>Introduced a new module to handle namespace files under /proc/thread-self/ns, allowing applications to reference namespaces via symbolic links</p></li>
+<li><p>Implemented dynamic creation of namespace files and their corresponding IDs, ensuring compatibility with Linux behavior</p></li>
+<li><p>Updated ProcFS to create necessary directory structures and files for thread-specific namespaces</p></li>
+<li><p>Enhanced the existing ProcFileType enumeration to include new types for thread self-namespaces</p></li>
+<li><p>Implemented the setns system call for namespace management, allowing processes to join existing namespaces using file descriptors</p></li>
+</ul>
+<p><strong>Namespace File Race Fixes (#_translated_label__1413_en)</strong></p>
+<ul class="simple">
+<li><p>Added appropriate error handling for concurrent namespace file creation</p></li>
+<li><p>Moved namespace type validation earlier in the creation process</p></li>
+<li><p>Ensured that child inodes are fully initialized before becoming visible in the children map</p></li>
+<li><p>Handled EEXIST race conditions by rechecking the children map</p></li>
+</ul>
+</section>
+<section id="kernel-log-management-translated-label-1415-en">
+<h4>Kernel Log Management (#_translated_label__1415_en)<a class="headerlink" href="#kernel-log-management-translated-label-1415-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Introduced a new module to manage kernel log levels, mimicking Linux behavior</p></li>
+<li><p>Added support for dynamically configuring log levels through the command line and procfs interface</p></li>
+<li><p>Created a new /proc/sys/kernel/printk file for reading and writing log level settings</p></li>
+<li><p>Updated the existing logging mechanism to utilize the new log level management system</p></li>
+<li><p>Enhanced QEMU startup scripts to allow setting log levels via environment variables</p></li>
+</ul>
+</section>
+<section id="file-descriptor-information-translated-label-1426-en">
+<h4>File Descriptor Information (#_translated_label__1426_en)<a class="headerlink" href="#file-descriptor-information-translated-label-1426-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added file descriptor-related support in procfs</p></li>
+<li><p>Added a target_inode field in the procfs InodeInfo to store the original file inode of magic links</p></li>
+<li><p>Implemented the IndexNode::special_node method to allow /proc/self/fd/N to return a reference to the original file</p></li>
+<li><p>Handled SpecialNodeData::Reference in VFS to support path resolution for magic links</p></li>
+<li><p>Implemented the ioctl FIONREAD command for pipe files to retrieve the number of readable bytes</p></li>
+<li><p>Added support for the /proc/<pid>/fdinfo directory and implemented dynamic adjustment of pipe buffers</p></li>
+</ul>
+</section>
+</section>
+<section id="id3">
+<h3>4. Process Management and Execution: Closer to Linux Behavior<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<section id="shebang-script-support-translated-label-1511-en">
+<h4>Shebang Script Support (#_translated_label__1511_en)<a class="headerlink" href="#shebang-script-support-translated-label-1511-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added the shebang module to implement script parsing and recursive execution</p></li>
+<li><p>Refactored the exec module to support recursive loading and context tracking</p></li>
+<li><p>Added a test program to verify shebang functionality</p></li>
+<li><p>Added the inline attribute to the parse_shebang_line function for optimization</p></li>
+</ul>
+</section>
+<section id="process-wait-semantics-fixes">
+<h4>Process Wait Semantics Fixes<a class="headerlink" href="#process-wait-semantics-fixes" title="Permalink to this heading"></a></h4>
+<p><strong>Thread Group Wait Semantics (#_translated_label__1427_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed the wait semantics for child processes in thread groups</p></li>
+</ul>
+<p><strong>Parent Process Wakeup Logic (#_translated_label__1516_en)</strong></p>
+<ul class="simple">
+<li><p>Corrected the parent process wakeup conditions to ensure wakeup regardless of the exit_signal value</p></li>
+<li><p>Fixed the incorrect position of the thread group leader wakeup logic</p></li>
+</ul>
+</section>
+<section id="process-execution-improvements-translated-label-1518-en">
+<h4>Process Execution Improvements (#_translated_label__1518_en)<a class="headerlink" href="#process-execution-improvements-translated-label-1518-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed issues in the execve system call with empty paths and empty arguments, checking if argv is empty before resolving symbolic links to avoid null pointer dereferences</p></li>
+<li><p>Added checks for empty path strings, returning the ENOENT error code</p></li>
+<li><p>Added version management functionality to the gvisor test suite, introducing version variables and version files to support automatic detection and upgrades</p></li>
+<li><p>Enhanced execution file permission checks and signal handling, adding file type and execution permission checks in the execve system call</p></li>
+<li><p>Removed redundant interpreter_path fields in shebang processing</p></li>
+<li><p>Fixed the signal mask copying issue during fork to ensure POSIX compliance</p></li>
+<li><p>Improved handling of the AT_EMPTY_PATH and AT_SYMLINK_NOFOLLOW flags in the execveat system call</p></li>
+<li><p>Implemented unsharing of the fd_table in the execve process to ensure isolation</p></li>
+<li><p>Updated path resolution logic to replace argv[0] only when absolute_path() succeeds, otherwise keeping the original path</p></li>
+<li><p>Improved error logging when the shebang interpreter is not found</p></li>
+</ul>
+</section>
+<section id="signal-handling-enhancements">
+<h4>Signal Handling Enhancements<a class="headerlink" href="#signal-handling-enhancements" title="Permalink to this heading"></a></h4>
+<p><strong>POSIX Timer Signal Delivery (#_translated_label__1521_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed the issue where ProcessControlBlock::raw_tgid() returned the wrong field</p></li>
+<li><p>Added support for SIGEV_THREAD in POSIX timers, compatible with gVisor tests</p></li>
+<li><p>Relaxed SIGEV_THREAD_ID restrictions to allow signal delivery to any thread in the same thread group</p></li>
+</ul>
+<p><strong>Signal Ignore Logic (#_translated_label__1434_en)</strong></p>
+<ul class="simple">
+<li><p>Implemented signal ignore check logic</p></li>
+<li><p>Fixed getpid to return the correct tgid in namespaces</p></li>
+<li><p>Fixed the copy_process order during fork</p></li>
+<li><p>Fixed the CloneFlags::CLONE_SIGHAND flag in the init process</p></li>
+</ul>
+<p><strong>Enhanced Signal Handling and IPC Mechanisms (#_translated_label__1423_en)</strong></p>
+<ul class="simple">
+<li><p>Added the rt_sigqueueinfo and rt_tgsigqueueinfo system calls for POSIX-compliant signal delivery</p></li>
+<li><p>Enhanced the kill process functionality, providing appropriate signal validation and permission checks</p></li>
+<li><p>Improved process exit handling, including signal cleanup and parent process notification</p></li>
+<li><p>Updated the fork implementation to correctly handle signal inheritance</p></li>
+<li><p>Implemented the setresuid system call, providing appropriate permission management</p></li>
+<li><p>Added comprehensive test coverage for signal-related system calls</p></li>
+</ul>
+<p><strong>Process Group Kill Fix (#_translated_label__1424_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed the bug in killing process groups, enabling the KillTest.ProcessGroups to pass</p></li>
+</ul>
+<p><strong>sys_rt_sigtimedwait and sys_rt_sigreturn Fixes (#_translated_label__1406_en, #_translated_label__1394_en, #_translated_label__1400_en)</strong></p>
+<ul class="simple">
+<li><p>Improved process CPU time statistics accuracy by adjusting the baseline to net time (accounted_cputime) after deducting IRQ and Steal time.</p></li>
+<li><p>Fixed the signal waiting logic in sys_rt_sigtimedwait to ensure correct entry into do_kernel_rt_sigtimedwait even when the waited signal set is empty.</p></li>
+<li><p>Resolved potential infinite sleep issues: when a thread is awakened by non-target signals or non-timeout events, it will correctly return EINTR.</p></li>
+<li><p>Fixed a bug where bitflags were incorrectly removed; should use remove().</p></li>
+<li><p>Fixed sys_rt_sigreturn: when returning from a signal handler to user space, if the to-be-restored %rcx / %r11 conflicts with sysretq behavior, forcibly jump to the .L_syscall_must_use_iret branch and use iretq to precisely restore the full context.</p></li>
+</ul>
+</section>
+</section>
+<section id="id4">
+<h3>5. Memory Management and I/O: Performance and Stability Optimizations<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<section id="user-space-memory-access-fixes-translated-label-1522-en">
+<h4>User-Space Memory Access Fixes (#_translated_label__1522_en)<a class="headerlink" href="#user-space-memory-access-fixes-translated-label-1522-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed validation of zero-length buffers during IoVecs construction to comply with Linux semantics.</p></li>
+<li><p>Improved error handling in the scatter method when encountering inaccessible memory to avoid partial writes followed by errors.</p></li>
+<li><p>Fixed system calls like readv/preadv to support chunked reads and partial successful writes.</p></li>
+<li><p>Fixed page reclamation logic to avoid reclaiming still-mapped file pages.</p></li>
+<li><p>Fixed null pointer checks in UserBufferReader/Writer to prevent undefined behavior.</p></li>
+<li><p>Adjusted cache thresholds and added memory detection logic for gVisor tests.</p></li>
+<li><p>Optimized user-space memory access checks and copy logic for IoVecs, removing redundant verify_area and UserBufferReader/Writer checks, and unifying accessibility verification using user_accessible_len.</p></li>
+<li><p>Used copy_from_user_protected for exception-protected copying in the gather method, aligning with the scatter method.</p></li>
+<li><p>Improved error handling logic to return successfully read data when partial data is read, otherwise return EFAULT.</p></li>
+</ul>
+</section>
+<section id="block-cache-enhancements-translated-label-1465-en">
+<h4>Block Cache Enhancements (#_translated_label__1465_en)<a class="headerlink" href="#block-cache-enhancements-translated-label-1465-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added a from_slice method to CacheBlock for direct instance creation from slices, avoiding unnecessary allocations.</p></li>
+<li><p>Introduced a write_data method in CacheBlock to allow in-place block data updates.</p></li>
+<li><p>Updated insert_one_block and immediate_write methods in BlockCache to accept slices instead of vectors, improving performance and memory usage.</p></li>
+<li><p>Implemented error handling for block size validation in multiple locations to ensure data integrity.</p></li>
+<li><p>Changed FileMapInfo::page_cache to Weak<PageCache> to fix memory leaks caused by reference cycles.</p></li>
+</ul>
+</section>
+<section id="page-cache-improvements-translated-label-1444-en-translated-label-1455-en">
+<h4>Page Cache Improvements (#_translated_label__1444_en, #_translated_label__1455_en)<a class="headerlink" href="#page-cache-improvements-translated-label-1444-en-translated-label-1455-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed page cache truncation during truncate operations, addressing boundary conditions.</p></li>
+<li><p>Refactored page cache read/write operations to resolve deadlocks and improve error handling, splitting them into two phases to avoid holding locks during user page faults.</p></li>
+<li><p>Improved filesystem page fault handling to return SIGBUS instead of panicking.</p></li>
+<li><p>Optimized user buffer access checks in sys_read/sys_write.</p></li>
+<li><p>Fixed alignment checks for mprotect parameters.</p></li>
+</ul>
+</section>
+<section id="memory-management-optimizations">
+<h4>Memory Management Optimizations<a class="headerlink" href="#memory-management-optimizations" title="Permalink to this heading"></a></h4>
+<p><strong>Slab Allocator Fixes (#_translated_label__1464_en)</strong></p>
+<ul class="simple">
+<li><p>Added a remaining field to ObjectPageIterMut to prevent iterator out-of-bounds errors.</p></li>
+<li><p>Changed SLABALLOCATOR to SpinLock protection to fix concurrent access issues.</p></li>
+<li><p>Properly used locks in kernel_allocator to protect slab allocator operations.</p></li>
+</ul>
+<p><strong>Exception Table Safe Copy (#_translated_label__1395_en)</strong></p>
+<ul class="simple">
+<li><p>Modified the error handling return value for safe exception table copying.</p></li>
+</ul>
+<p><strong>Page Reclamation Optimization (#_translated_label__1455_en)</strong></p>
+<ul class="simple">
+<li><p>Optimized the page reclamation process to prevent deadlocks, splitting it into two phases to reduce the risk of long-held reclaimer locks and lower lock order inversion risks with page_manager/page_cache.</p></li>
+<li><p>Updated shrink_list to handle victim page eviction without holding the reclaimer lock, ensuring safer memory management.</p></li>
+<li><p>Improved drain_lru to efficiently retrieve victim pages for reclamation.</p></li>
+</ul>
+</section>
+<section id="mmap-support-enhancements-translated-label-1455-en">
+<h4>mmap Support Enhancements (#_translated_label__1455_en)<a class="headerlink" href="#mmap-support-enhancements-translated-label-1455-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Implemented mmap methods for LockedZeroInode, LockedExt4Inode, LockedFATInode, and LockedRamFSInode to enable memory mapping operations.</p></li>
+<li><p>Improved mmap error handling and validation, enhancing error responses for unsupported operations.</p></li>
+<li><p>Added checks for MAP_PRIVATE and MAP_SHARED flags to ensure only one is set.</p></li>
+<li><p>Implemented page alignment validation for MAP_FIXED.</p></li>
+<li><p>Enhanced memory protection handling and validation, updating init_xd_rsvd to ensure NX support is enabled and hardware limitations are properly handled.</p></li>
+<li><p>Improved alignment checks in sys_mprotect to prevent overflows and ensure proper memory region validation.</p></li>
+<li><p>Enhanced offset checks and memory allocation logic in the mmap system call.</p></li>
+</ul>
+</section>
+</section>
+<section id="ipc-and-pipes-blocking-semantics-and-race-fixes">
+<h3>6. IPC and Pipes: Blocking Semantics and Race Fixes<a class="headerlink" href="#ipc-and-pipes-blocking-semantics-and-race-fixes" title="Permalink to this heading"></a></h3>
+<section id="fifo-blocking-open-semantics-translated-label-1429-en">
+<h4>FIFO Blocking Open Semantics (#_translated_label__1429_en)<a class="headerlink" href="#fifo-blocking-open-semantics-translated-label-1429-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added open_wait_queue to LockedPipeInode for blocking waits during FIFO opens.</p></li>
+<li><p>Implemented Linux FIFO blocking/non-blocking open semantics (O_RDONLY/O_WRONLY/O_RDWR).</p></li>
+<li><p>Added helper methods has_reader/has_writer to check pipe status.</p></li>
+<li><p>Updated test configurations to whitelist fifo_test.</p></li>
+</ul>
+</section>
+<section id="pipe-behavior-improvements-translated-label-1529-en-translated-label-1426-en">
+<h4>Pipe Behavior Improvements (#_translated_label__1529_en, #_translated_label__1426_en)<a class="headerlink" href="#pipe-behavior-improvements-translated-label-1529-en-translated-label-1426-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed and enhanced pipe behavior, introducing a new PipeFS and registering PIPEFS_MAGIC.</p></li>
+<li><p>Expanded pipe buffers to 65536 bytes, supporting atomic writes.</p></li>
+<li><p>Implemented named pipe (FIFO) support, allowing O_RDWR mode opens.</p></li>
+<li><p>Improved fcntl’s F_SETFL implementation to only modify specific flag bits.</p></li>
+<li><p>Fixed the error code for writing to read-only file descriptors to EBADF.</p></li>
+<li><p>Automatically added O_LARGEFILE flag for named pipes.</p></li>
+<li><p>Optimized pipe read/write logic to support circular writes and partial writes.</p></li>
+<li><p>Fixed race conditions in blocking mode write-end wakeups: incremented writer count before waiting for readers in blocking mode to avoid races; immediately woke up waiting readers after incrementing writer count; rolled back writer count on signal interruptions; ensured correct reader wakeups in non-blocking mode.</p></li>
+<li><p>Added ESPIPE error checks for pipes, sockets, and character devices in preadv/pwrite64/pwritev system calls.</p></li>
+<li><p>Added F_GETPIPE_SZ and F_SETPIPE_SZ to the fcntl system call for querying pipe buffer sizes.</p></li>
+<li><p>Optimized pipe close logic to avoid potential deadlocks.</p></li>
+<li><p>Added file descriptor-related support in procfs, including magic links for /proc/self/fd/N and implementing FIONREAD for pipes.</p></li>
+<li><p>Added /proc/<pid>/fdinfo directory support and implemented dynamic pipe buffer adjustments.</p></li>
+</ul>
+</section>
+</section>
+<section id="networking-and-devices-stability-improvements">
+<h3>7. Networking and Devices: Stability Improvements<a class="headerlink" href="#networking-and-devices-stability-improvements" title="Permalink to this heading"></a></h3>
+<section id="network-stack-optimizations">
+<h4>Network Stack Optimizations<a class="headerlink" href="#network-stack-optimizations" title="Permalink to this heading"></a></h4>
+<p><strong>NapiManager Lock Mechanism (#_translated_label__1525_en)</strong></p>
+<ul class="simple">
+<li><p>Changed NapiManager’s lock mechanism to lock_irqsave.</p></li>
+<li><p>Fixed potential deadlocks when calling napi_schedule in interrupt contexts.</p></li>
+</ul>
+<p><strong>UDP Socket Fixes (#_translated_label__1460_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed UDP getsockname/getpeername system calls.</p></li>
+<li><p>Added a test whitelist to support new available inet system calls.</p></li>
+</ul>
+</section>
+<section id="tty-driver-enhancements">
+<h4>TTY Driver Enhancements<a class="headerlink" href="#tty-driver-enhancements" title="Permalink to this heading"></a></h4>
+<p><strong>TTY Driver and Device Management (#_translated_label__1462_en)</strong></p>
+<ul class="simple">
+<li><p>Updated TTY drivers to more effectively handle master and slave types during close operations, ensuring proper cleanup of /dev/pts device entries.</p></li>
+<li><p>Improved control TTY detachment handling by adding support for the TIOCNOTTY command.</p></li>
+<li><p>Refactored PTY device initialization to ensure correct metadata setup and device registration.</p></li>
+<li><p>Added a symbolic link for /dev/ptmx pointing to the internal devpts node to prevent ENOENT errors during early access.</p></li>
+<li><p>Improved PTY device management and cleanup logic, enhancing PtyDevPtsLink to more effectively manage PTY device lifecycles.</p></li>
+</ul>
+<p><strong>TTY Permission Checks (#_translated_label__1430_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed TTY and session permission check logic via pty_root_test.</p></li>
+</ul>
+<p><strong>TTY Page Cache Support (#_translated_label__1428_en)</strong></p>
+<ul class="simple">
+<li><p>Implemented a page_cache method in TTY devices that returns None to indicate character devices do not require page caching.</p></li>
+<li><p>Added handling for no-page-cache scenarios in page fault processing to avoid panics and return VM_FAULT_SIGBUS.</p></li>
+</ul>
+</section>
+<section id="asynchronous-i-o-notification-translated-label-1425-en">
+<h4>Asynchronous I/O Notification (#_translated_label__1425_en)<a class="headerlink" href="#asynchronous-i-o-notification-translated-label-1425-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Implemented an asynchronous I/O notification mechanism and enhanced ioctl system calls.</p></li>
+</ul>
+</section>
+<section id="random-device-support-translated-label-1455-en">
+<h4>Random Device Support (#_translated_label__1455_en)<a class="headerlink" href="#random-device-support-translated-label-1455-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added a new random device module, random_dev, providing random byte generation capabilities.</p></li>
+<li><p>Registered /dev/random in DevFS to ensure system access to random data.</p></li>
+</ul>
+</section>
+</section>
+<section id="filesystem-implementations-ext4-and-fat-improvements">
+<h3>8. Filesystem Implementations: ext4 and FAT Improvements<a class="headerlink" href="#filesystem-implementations-ext4-and-fat-improvements" title="Permalink to this heading"></a></h3>
+<section id="ext4-filesystem-translated-label-1509-en">
+<h4>ext4 Filesystem (#_translated_label__1509_en)<a class="headerlink" href="#ext4-filesystem-translated-label-1509-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed spinlock deadlocks in ext4 inode read/write operations.</p></li>
+<li><p>Added parent directory pointer support, implementing the parent() method.</p></li>
+<li><p>Improved block device addressing logic, unifying the use of 512-byte LBA.</p></li>
+<li><p>Enhanced root filesystem detection to support automatic identification of ext4 and FAT.</p></li>
+<li><p>Fixed interpreter path lookup issues in the ELF loader.</p></li>
+<li><p>Updated the another_ext4 dependency version.</p></li>
+<li><p>Added probe methods for ext4 and FAT filesystems and optimized code, introducing new probe methods in Ext4FileSystem and FATFileSystem.</p></li>
+<li><p>Refactored filesystem detection logic in <a class="reference external" href="http://vcore.rs">vcore.rs</a> to use new probe methods instead of standalone detection functions.</p></li>
+<li><p>Optimized default value setting for the parent field in Ext4Inode constructors, using unwrap_or_default instead of unwrap_or_else.</p></li>
+<li><p>Added PATH environment variable settings in the rcS startup script.</p></li>
+</ul>
+</section>
+<section id="fat-filesystem-translated-label-1454-en-translated-label-1491-en">
+<h4>FAT Filesystem (#_translated_label__1454_en, #_translated_label__1491_en)<a class="headerlink" href="#fat-filesystem-translated-label-1454-en-translated-label-1491-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Updated directory link count management, adjusting counts to start from 2, considering self-references and parent directory links.</p></li>
+<li><p>Updated logic for incrementing and decrementing link counts during directory creation and deletion.</p></li>
+<li><p>Enhanced dynamic calculation of directory link counts in the VFS layer to ensure accuracy when metadata is unreliable.</p></li>
+<li><p>Implemented SuperBlock fields required for FAT filesystem statfs (f_blocks, f_bfree, f_bavail, f_frsize).</p></li>
+<li><p>Fixed overflow issues in FAT32 FSInfo free cluster count updates.</p></li>
+<li><p>Provided a stable st_dev identifier for mount points.</p></li>
+</ul>
+</section>
+<section id="filesystem-statistics-translated-label-1491-en">
+<h4>Filesystem Statistics (#_translated_label__1491_en)<a class="headerlink" href="#filesystem-statistics-translated-label-1491-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Improved filesystem statistics support for FAT and tmpfs.</p></li>
+<li><p>Added a default capacity policy (half of physical memory) for tmpfs and synchronized SuperBlock statistics updates.</p></li>
+</ul>
+</section>
+</section>
+<section id="wait-queue-refactoring-introducing-waiter-waker-pattern">
+<h3>9. Wait Queue Refactoring: Introducing Waiter/Waker Pattern<a class="headerlink" href="#wait-queue-refactoring-introducing-waiter-waker-pattern" title="Permalink to this heading"></a></h3>
+<section id="wait-queue-mechanism-refactoring-translated-label-1452-en">
+<h4>Wait Queue Mechanism Refactoring (#_translated_label__1452_en)<a class="headerlink" href="#wait-queue-mechanism-refactoring-translated-label-1452-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Refactored WaitQueue to introduce the Waiter/Waker pattern to prevent wakeup losses.</p></li>
+<li><p>Unified wait interfaces, providing wait_event_interruptible/uninterruptible methods.</p></li>
+<li><p>Refactored modules like futex, epoll, eventfd, semaphore, and completion to use the new wait queue.</p></li>
+<li><p>Optimized process waiting logic for child process exits using the new wait queue interface.</p></li>
+<li><p>Added design documentation for the wait queue to explain the new mechanism.</p></li>
+<li><p>Added a SKIP_GRUB option to support skipping GRUB installation in CI or headless environments.</p></li>
+</ul>
+</section>
+<section id="signal-handling-fixes-translated-label-1452-en">
+<h4>Signal Handling Fixes (#_translated_label__1452_en)<a class="headerlink" href="#signal-handling-fixes-translated-label-1452-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Promptly refreshed the HAS_PENDING_SIGNAL state after consuming signals in sys_rt_sigtimedwait to avoid misjudgments in subsequent wait paths.</p></li>
+<li><p>Changed the error code for interruptible futex wakeups from ERESTARTSYS to EINTR to align with Linux semantics.</p></li>
+</ul>
+</section>
+</section>
+<section id="id5">
+<h3>10. Engineering Efficiency and CI: Automation and Toolchain Improvements<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<section id="nightly-build-workflow-translated-label-1469-en-translated-label-1471-en-translated-label-1472-en-translated-label-1473-en-translated-label-1474-en-translated-label-1475-en-translated-label-1476-en-translated-label-1477-en">
+<h4>Nightly Build Workflow (#_translated_label__1469_en, #_translated_label__1471_en, #_translated_label__1472_en, #_translated_label__1473_en, #_translated_label__1474_en, #_translated_label__1475_en, #_translated_label__1476_en, #_translated_label__1477_en)<a class="headerlink" href="#nightly-build-workflow-translated-label-1469-en-translated-label-1471-en-translated-label-1472-en-translated-label-1473-en-translated-label-1474-en-translated-label-1475-en-translated-label-1476-en-translated-label-1477-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added nightly build and release workflows.</p></li>
+<li><p>Supported automated builds and releases, separating build and release steps.</p></li>
+<li><p>Compressed build artifacts into tarballs and uploaded them for later use.</p></li>
+<li><p>Modified Dockerfile to copy compressed artifacts instead of individual files, improving efficiency and organization.</p></li>
+<li><p>Added steps to create a ‘bin’ directory in the nightly build workflow for better artifact organization.</p></li>
+<li><p>Restored the HOME environment variable in the nightly build workflow to ensure proper build context.</p></li>
+<li><p>Updated the nightly build workflow to conditionally run build and release jobs.</p></li>
+<li><p>Added steps to checkout the DragonOS codebase in the nightly build workflow.</p></li>
+</ul>
+</section>
+<section id="build-container-upgrade-translated-label-1442-en">
+<h4>Build Container Upgrade (#_translated_label__1442_en)<a class="headerlink" href="#build-container-upgrade-translated-label-1442-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Upgraded the build container version to v1.19.</p></li>
+<li><p>Added –ci installation mode and APT_FLAG (–no-install-recommends) to <a class="reference external" href="http://bootstrap.sh">bootstrap.sh</a>.</p></li>
+<li><p>Skipped grub/docs in CI, removed old RUST_VERSION_OLD installation steps.</p></li>
+<li><p>Used –no-install-recommends in Dockerfile.</p></li>
+<li><p>Adjusted build scripts and BUILD_CONTAINER_VERSION.</p></li>
+<li><p>Updated DADK version to v0.5.1 and adjusted build scripts.</p></li>
+<li><p>Updated Docker image sources in CI workflows.</p></li>
+<li><p>Added linux-libc-dev-riscv64-cross to Ubuntu/Debian bootstrap installation lists for riscv64 cross-compilation libc headers.</p></li>
+<li><p>Updated Docker image repository addresses in CI workflows.</p></li>
+</ul>
+</section>
+<section id="ci-process-fixes">
+<h4>CI Process Fixes<a class="headerlink" href="#ci-process-fixes" title="Permalink to this heading"></a></h4>
+<p><strong>Test Status Fixes (#_translated_label__1403_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed CI processes where tests failed but returned a success status.</p></li>
+</ul>
+<p><strong>gVisor Test Script Fixes (#_translated_label__1405_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed scripts for automatically enabling/disabling gVisor syscall test case packaging.</p></li>
+</ul>
+<p><strong>Test Additions (#_translated_label__1458_en)</strong></p>
+<ul class="simple">
+<li><p>Added open_test.</p></li>
+</ul>
+</section>
+<section id="code-review-automation-translated-label-1435-en-translated-label-1436-en-translated-label-1437-en-translated-label-1438-en-translated-label-1440-en-translated-label-1445-en-translated-label-1446-en-translated-label-1447-en">
+<h4>Code Review Automation (#_translated_label__1435_en, #_translated_label__1436_en, #_translated_label__1437_en, #_translated_label__1438_en, #_translated_label__1440_en, #_translated_label__1445_en, #_translated_label__1446_en, #_translated_label__1447_en)<a class="headerlink" href="#code-review-automation-translated-label-1435-en-translated-label-1436-en-translated-label-1437-en-translated-label-1438-en-translated-label-1440-en-translated-label-1445-en-translated-label-1446-en-translated-label-1447-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added a Claude code review workflow.</p></li>
+<li><p>Optimized code review processes and configurations.</p></li>
+<li><p>Enabled progress tracking.</p></li>
+<li><p>Expanded Claude parameters to support more tools.</p></li>
+<li><p>Refactored prompt structures to clarify five key areas of code review.</p></li>
+<li><p>Removed duplicate comment update instructions, simplifying workflow logic.</p></li>
+<li><p>Explicitly used specific tools for inline comments and status updates.</p></li>
+<li><p>Provided specific guidance for single-line and multi-line comments.</p></li>
+<li><p>Simplified PR status summary requirements.</p></li>
+</ul>
+</section>
+<section id="development-container-support-translated-label-1449-en-translated-label-1457-en">
+<h4>Development Container Support (#_translated_label__1449_en, #_translated_label__1457_en)<a class="headerlink" href="#development-container-support-translated-label-1449-en-translated-label-1457-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Added devcontainer support based on CNB images.</p></li>
+<li><p>Set non-root users as the default devcontainer user.</p></li>
+<li><p>Fixed devcontainer: changed the container user from ‘dragonos’ to ‘root’, then updated to use ‘dragonos’ as the default user.</p></li>
+<li><p>Fixed CI: changed the source from the default image server to github.</p></li>
+</ul>
+</section>
+</section>
+<section id="id6">
+<h3>11. Documentation and Community: Experience and Accessibility Improvements<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<section id="dragonos-playground-translated-label-1484-en">
+<h4>DragonOS Playground (#_translated_label__1484_en)<a class="headerlink" href="#dragonos-playground-translated-label-1484-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Updated README and build documentation to include DragonOS Playground experiences.</p></li>
+<li><p>Added cloud-native development experiences in README, providing a one-click launch link for the CNB platform.</p></li>
+<li><p>Updated community news with Playground launch information.</p></li>
+<li><p>Added a quick experience section at the beginning of build documentation, recommending the use of Playground.</p></li>
+</ul>
+</section>
+<section id="documentation-translation-updates-translated-label-1485-en-translated-label-1453-en-translated-label-1411-en-translated-label-1408-en-translated-label-1402-en-translated-label-1396-en">
+<h4>Documentation Translation Updates (#_translated_label__1485_en, #_translated_label__1453_en, #_translated_label__1411_en, #_translated_label__1408_en, #_translated_label__1402_en, #_translated_label__1396_en)<a class="headerlink" href="#documentation-translation-updates-translated-label-1485-en-translated-label-1453-en-translated-label-1411-en-translated-label-1408-en-translated-label-1402-en-translated-label-1396-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Multiple rounds of documentation translation updates to enhance internationalization support.</p></li>
+</ul>
+</section>
+<section id="user-environment-improvements">
+<h4>User Environment Improvements<a class="headerlink" href="#user-environment-improvements" title="Permalink to this heading"></a></h4>
+<p><strong>PS1 Environment Variable (#_translated_label__1432_en, #_translated_label__1422_en)</strong></p>
+<ul class="simple">
+<li><p>Corrected the PS1 environment variable to match bash default highlighting.</p></li>
+<li><p>Used a colored PS1 to enhance user experience.</p></li>
+</ul>
+</section>
+</section>
+<section id="id7">
+<h3>12. gVisor Testing: Continuous Compatibility Improvements<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<section id="test-case-expansions-translated-label-1524-en">
+<h4>Test Case Expansions (#_translated_label__1524_en)<a class="headerlink" href="#test-case-expansions-translated-label-1524-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Removed the fifo_test blocklist file from gVisor tests.</p></li>
+<li><p>Expanded test coverage to continuously improve Linux compatibility.</p></li>
+</ul>
+</section>
+<section id="system-call-fixes">
+<h4>System Call Fixes<a class="headerlink" href="#system-call-fixes" title="Permalink to this heading"></a></h4>
+<p><strong>open System Call (#_translated_label__1417_en)</strong></p>
+<ul class="simple">
+<li><p>Adjusted error code types returned for readable and writable.</p></li>
+<li><p>Fixed the following tests: OpenTest.OTrunc, OpenTest.OTruncAndReadOnlyDir, OpenTest.OCreateDirectory, OpenTest.MustCreateExisting, OpenTest.CreateWithAppend, OpenTest.AppendOnly, OpenTest.AppendConcurrentWrite, OpenTest.DirectoryWritableFails, OpenTest.DirectoryDirectFails, OpenTest.Null, OpenTest.CanTruncateReadOnly, OpenTest.OpenNonDirectoryWithTrailingSlash, OpenTest.OpenWithStrangeFlags.</p></li>
+<li><p>Added a block for open_test.</p></li>
+</ul>
+<p><strong>utimensat/futimesat (#_translated_label__1431_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed boundary cases for utimensat/futimesat system calls to ensure gVisor test compatibility.</p></li>
+</ul>
+<p><strong>pread64 (#_translated_label__1398_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed compatibility and error handling for the pread64 system call.</p></li>
+<li><p>Validated the offset parameter: returned EINVAL for negative offsets or overflows.</p></li>
+<li><p>Validated the user buffer: used new_checked to ensure memory is mapped, correctly returning EFAULT.</p></li>
+<li><p>Checked file types: returned ESPIPE for non-seekable files (e.g., pipes, sockets).</p></li>
+<li><p>Fixed permission checks in File::readable().</p></li>
+<li><p>Fixed multiple failures in the gVisor pread64 test suite.</p></li>
+</ul>
+<p><strong>sys_rename (#_translated_label__1393_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed sys_rename logic and added support for RENAME_NOREPLACE.</p></li>
+</ul>
+<p><strong>getdents (#_translated_label__1397_en)</strong></p>
+<ul class="simple">
+<li><p>Fixed the getdents system call implementation.</p></li>
+</ul>
+<p><strong>Other Fixes</strong></p>
+<ul class="simple">
+<li><p>Fixed SIG derivation issues when writing partially readable buffers in syscall/vfs (#_translated_label__1375_en).</p></li>
+<li><p>Fixed issues related to cputime, sys_rt_sigtimedwait, and sys_rt_sigreturn (#_translated_label__1406_en, #_translated_label__1394_en, #_translated_label__1400_en).</p></li>
+</ul>
+</section>
+</section>
+<section id="id8">
+<h3>13. Other Improvements<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<section id="symbol-table-query-fixes-translated-label-1443-en">
+<h4>Symbol Table Query Fixes (#_translated_label__1443_en)<a class="headerlink" href="#symbol-table-query-fixes-translated-label-1443-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed symbol table query issues where the original logic would return index i when addr equals kallsyms_adress_list[i+1], but the correct index should be i+1.</p></li>
+<li><p>Now uses binary search for symbols.</p></li>
+</ul>
+</section>
+<section id="cargo-lock-cleanup-translated-label-1530-en">
+<h4>Cargo.lock Cleanup (#_translated_label__1530_en)<a class="headerlink" href="#cargo-lock-cleanup-translated-label-1530-en" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>Fixed duplicate entries for the another_ext4 package in Cargo.lock.</p></li>
+<li><p>Unified lockfile formats to avoid conflicts when different developers use different Cargo versions.</p></li>
+</ul>
+</section>
+</section>
+</section>
+<section id="known-concerns">
+<h2>Known Concerns<a class="headerlink" href="#known-concerns" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>The integration path of I/O multiplexing with signals is relatively complex. It is recommended to focus on regression testing of high-concurrency network services/event loop frameworks after upgrading to version 0.4.0.</p></li>
+<li><p>Changes related to tmpfs and chroot involve filesystem mounting and path resolution. It is advised to verify behavior in containerized scenarios.</p></li>
+<li><p>The refactored waiting queue mechanism involves concurrency control. Stability and performance under multi-threaded scenarios should be tested as a priority.</p></li>
+<li><p>POSIX interval timers and CPU time statistics are new features. It is recommended to validate timer precision and performance overhead in practical applications.</p></li>
+<li><p>Mount propagation is a new feature. Behavior of different propagation types should be verified in containerized scenarios.</p></li>
+</ul>
+</section>
+<section id="acknowledgments">
+<h2>Acknowledgments<a class="headerlink" href="#acknowledgments" title="Permalink to this heading"></a></h2>
+<p>Thank you to all community contributors who provided code, testing, documentation, and feedback for DragonOS 0.4.0！</p>
+<p>This release includes 105 commits, covering improvements and fixes across multiple modules such as the kernel core, filesystem, process management, memory management, networking, device drivers, and engineering tools.</p>
+<p>Key contributors (in order of commit time): LoGin, Vitus, kaleidoscope416, Samuel Dai, aLinChe, xboHodx, Yuming Jiang, kado, goldwind-ting, sparkzky, and others.</p>
+<p>For the full list of contributors, please refer to the <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/graphs/contributors">Contributors page</a> on the GitHub repository.</p>
+</section>
+<section id="references">
+<h2>References<a class="headerlink" href="#references" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Linux Compatibility Testing Dashboard</strong>: <a class="reference external" href="https://ci-dashboard.dragonos.org">ci-dashboard.dragonos.org</a></p></li>
+<li><p><strong>DragonOS Playground</strong>: <a class="reference external" href="https://cnb.cool/DragonOS-Community/playground">cnb.cool/DragonOS-Community/playground</a></p></li>
+<li><p><strong>Community Repository</strong>: <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS">github.com/DragonOS-Community/DragonOS</a></p></li>
+<li><p><strong>Official Documentation</strong>: <a class="reference external" href="https://docs.dragonos.org">docs.dragonos.org</a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="../index.html" class="btn btn-neutral float-left" title="Release Notes" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../V0.3.x/V0.3.0.html" class="btn btn-neutral float-right" title="V.3.0" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="V0.4.0.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../../master/locales/en/community/ChangeLog/V0.4.x/V0.4.0.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

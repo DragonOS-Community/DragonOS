@@ -1,33 +1,37 @@
+#[cfg(feature = "sched_selftest")]
+pub(crate) mod affinity_selftest;
+pub(crate) mod cfs_bandwidth;
 pub mod clock;
 pub mod completion;
 pub mod cputime;
 pub mod fair;
+pub mod fair_group;
 pub mod fair_tree;
-pub mod fifo;
 #[cfg(feature = "fifo_demo")]
 pub mod fifo_demo;
 pub mod idle;
 pub mod loadavg;
 pub mod pelt;
+mod pelt_list;
+pub mod policy;
 pub mod prio;
+pub mod realtime;
 pub mod syscall;
 
 use core::{
     intrinsics::{likely, unlikely},
-    panic::Location,
     sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering},
 };
 
 use alloc::{
     boxed::Box,
-    collections::LinkedList,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use system_error::SystemError;
 
 use crate::{
-    arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, CurrentIrqArch},
+    arch::{cpu::current_cpu_id, interrupt::ipi::send_ipi, ipc::signal::Signal, CurrentIrqArch},
     exception::{
         ipi::{IpiKind, IpiTarget},
         InterruptArch,
@@ -55,11 +59,13 @@ use self::{
     clock::{ClockUpdataFlag, SchedClock},
     cputime::{irq_time_read, CpuTimeFunc, IrqTime},
     fair::{CfsRunQueue, CompletelyFairScheduler, FairSchedEntity},
-    fifo::FifoScheduler,
-    prio::PrioUtil,
+    prio::{PrioUtil, DEFAULT_PRIO, MAX_PRIO, MAX_RT_PRIO, NICE_WIDTH},
+    realtime::RealtimeScheduler,
 };
 
-static mut CPU_IRQ_TIME: Option<Vec<&'static mut IrqTime>> = None;
+pub use policy::{LinuxSchedPolicy, SchedClass};
+
+static mut CPU_IRQ_TIME: Option<Vec<&'static IrqTime>> = None;
 pub static IDLE_CPUS: AtomicCpuMask = AtomicCpuMask::new();
 
 // 这里虽然rq是percpu的，但是在负载均衡的时候需要修改对端cpu的rq，所以仍需加锁
@@ -74,8 +80,8 @@ pub const SCHED_CAPACITY_SHIFT: u64 = SCHED_FIXEDPOINT_SHIFT;
 pub const SCHED_CAPACITY_SCALE: u64 = 1 << SCHED_CAPACITY_SHIFT;
 
 #[inline]
-pub fn cpu_irq_time(cpu: ProcessorId) -> &'static mut IrqTime {
-    unsafe { CPU_IRQ_TIME.as_mut().unwrap()[cpu.data() as usize] }
+pub(crate) fn cpu_irq_time(cpu: ProcessorId) -> &'static IrqTime {
+    unsafe { CPU_IRQ_TIME.as_ref().unwrap()[cpu.data() as usize] }
 }
 
 #[inline]
@@ -91,17 +97,21 @@ pub fn cpu_rq(cpu: usize) -> Arc<CpuRunQueue> {
 
 #[inline]
 fn task_is_idle(pcb: &Arc<ProcessControlBlock>) -> bool {
-    pcb.sched_info().policy() == SchedPolicy::IDLE
+    pcb.sched_info().sched_class() == SchedClass::Idle
 }
 
 #[inline]
-fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
-    task_is_idle(&rq.current()) && rq.nr_running == 0
+pub(crate) fn rq_is_idle_cpu(rq: &CpuRunQueue) -> bool {
+    task_is_idle(&rq.current()) && rq.nr_running() == 0
 }
 
 #[inline]
 pub fn cpu_is_online(cpu: ProcessorId) -> bool {
     smp_cpu_manager().is_online_cpu(cpu)
+}
+
+pub(crate) fn try_current_task(cpu: ProcessorId) -> Option<Arc<ProcessControlBlock>> {
+    cpu_rq(cpu.data() as usize).try_current_task()
 }
 
 pub fn nr_iowait() -> u32 {
@@ -143,9 +153,7 @@ fn first_allowed_online_cpu(allowed: &CpuMask) -> Option<ProcessorId> {
 }
 
 fn rq_nr_running(cpu: ProcessorId) -> usize {
-    let rq = cpu_rq(cpu.data() as usize);
-    let (rq, _guard) = rq.self_lock();
-    rq.nr_running
+    cpu_rq(cpu.data() as usize).nr_running()
 }
 
 fn select_fork_idle_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Option<ProcessorId> {
@@ -187,39 +195,41 @@ fn select_least_loaded_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Proc
     best_cpu
 }
 
+/// 选择目标 CPU。调用者必须在 pi_lock 保护下读取 cpus_allowed 并传入，
 pub fn select_task_rq(
     pcb: &Arc<ProcessControlBlock>,
     prev_cpu: ProcessorId,
     wake_flags: WakeupFlags,
+    allowed: &CpuMask,
 ) -> ProcessorId {
-    let allowed = pcb.sched_info().cpus_allowed();
     let current_cpu = smp_get_processor_id();
-    let fallback_cpu = if cpu_allowed_and_online(&allowed, prev_cpu) {
+    let fallback_cpu = if cpu_allowed_and_online(allowed, prev_cpu) {
         prev_cpu
-    } else if cpu_allowed_and_online(&allowed, current_cpu) {
+    } else if cpu_allowed_and_online(allowed, current_cpu) {
         current_cpu
     } else {
-        first_allowed_online_cpu(&allowed)
+        first_allowed_online_cpu(allowed)
             .or_else(|| allowed.iter_cpu().next())
             .unwrap_or(prev_cpu)
     };
 
-    if pcb.flags().contains(ProcessFlags::KTHREAD) || pcb.sched_info().policy() != SchedPolicy::CFS
+    if pcb.flags().contains(ProcessFlags::KTHREAD)
+        || pcb.sched_info().sched_class() != SchedClass::Fair
     {
         return fallback_cpu;
     }
 
     if wake_flags.contains(WakeupFlags::WF_FORK) {
-        return select_fork_idle_cpu(&allowed, fallback_cpu)
-            .unwrap_or_else(|| select_least_loaded_cpu(&allowed, fallback_cpu));
+        return select_fork_idle_cpu(allowed, fallback_cpu)
+            .unwrap_or_else(|| select_least_loaded_cpu(allowed, fallback_cpu));
     }
 
     if wake_flags.contains(WakeupFlags::WF_TTWU) {
-        if let Some(idle_cpu) = pick_idle_cpu(&allowed) {
+        if let Some(idle_cpu) = pick_idle_cpu(allowed) {
             return idle_cpu;
         }
 
-        return select_least_loaded_cpu(&allowed, fallback_cpu);
+        return select_least_loaded_cpu(allowed, fallback_cpu);
     }
 
     fallback_cpu
@@ -235,6 +245,9 @@ lazy_static! {
         | SchedFeature::TTWU_QUEUE
         | SchedFeature::SIS_UTIL
         | SchedFeature::RT_PUSH_IPI
+        | SchedFeature::PLACE_LAG
+        | SchedFeature::PLACE_DEADLINE_INITIAL
+        | SchedFeature::RUN_TO_PARITY
         | SchedFeature::ALT_PERIOD
         | SchedFeature::BASE_SLICE
         | SchedFeature::UTIL_EST
@@ -252,7 +265,7 @@ pub trait Scheduler {
     fn yield_task(rq: &mut CpuRunQueue);
 
     /// ## 检查进入可运行状态的任务能否抢占当前正在运行的任务
-    fn check_preempt_currnet(
+    fn check_preempt_current(
         rq: &mut CpuRunQueue,
         pcb: &Arc<ProcessControlBlock>,
         flags: WakeupFlags,
@@ -277,30 +290,22 @@ pub trait Scheduler {
     fn put_prev_task(rq: &mut CpuRunQueue, prev: Arc<ProcessControlBlock>);
 }
 
-/// 调度策略
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SchedPolicy {
-    /// 实时进程
-    RT,
-    /// 先进先出调度
-    FIFO,
-    /// 完全公平调度
-    CFS,
-    /// IDLE
-    IDLE,
-}
-
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct TaskGroup {
     /// CFS管理的调度实体，percpu的
-    entitys: Vec<Arc<FairSchedEntity>>,
+    pub(crate) entities: Vec<Arc<FairSchedEntity>>,
     /// 每个CPU的CFS运行队列
-    cfs: Vec<Arc<CfsRunQueue>>,
+    pub(crate) cfs: Vec<Arc<CfsRunQueue>>,
     /// 父节点
-    parent: Option<Arc<TaskGroup>>,
+    pub(crate) parent: Option<Arc<TaskGroup>>,
 
-    shares: u64,
+    pub(crate) shares: core::sync::atomic::AtomicU64,
+    pub(crate) load_avg: core::sync::atomic::AtomicU64,
+    pub(crate) idle: core::sync::atomic::AtomicBool,
+    pub(crate) children: [SpinLock<Vec<Weak<TaskGroup>>>; PerCpu::MAX_CPU_NUM as usize],
+    /// Initialized exactly once before this group is registered or published.
+    pub(crate) bandwidth: Lazy<Arc<cfs_bandwidth::CfsBandwidth>>,
+    pub(crate) retired: core::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -319,6 +324,17 @@ impl LoadWeight {
     pub const WMULT_CONST: u32 = !0;
 
     pub const NICE_0_LOAD_SHIFT: u32 = Self::SCHED_FIXEDPOINT_SHIFT + Self::SCHED_FIXEDPOINT_SHIFT;
+    pub const NICE_0_LOAD: u64 = 1u64 << Self::NICE_0_LOAD_SHIFT;
+    /// Relative weights of the fair scheduling class, indexed by
+    /// `prio - MAX_RT_PRIO` for `prio` in `[MAX_RT_PRIO, MAX_PRIO)`.
+    ///
+    /// The length is `NICE_WIDTH` rather than a literal so the table cannot
+    /// drift away from the priority range it indexes.
+    pub const SCHED_PRIO_TO_WEIGHT: [u64; NICE_WIDTH as usize] = [
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
+        4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
+        137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    ];
 
     pub fn update_load_add(&mut self, inc: u64) {
         self.weight += inc;
@@ -333,6 +349,33 @@ impl LoadWeight {
     pub fn update_load_set(&mut self, weight: u64) {
         self.weight = weight;
         self.inv_weight = 0;
+    }
+
+    /// Scaled fair class weight for a fair class priority.
+    ///
+    /// `prio` must be an internal priority in `[MAX_RT_PRIO, MAX_PRIO)`. The
+    /// assert is deliberately not a clamp: a clamp would silently give an
+    /// out-of-domain priority (for example an RT task, or a stale value
+    /// computed from the wrong priority space) the weight of nice 19, hiding
+    /// the caller's bug behind a plausible looking runqueue weight.
+    ///
+    /// This is the single place that maps a priority to a scaled weight, so
+    /// the assert and the table index cannot drift apart between the
+    /// assign-into-a-fresh-entity path ([`Self::set_load_weight_from_prio`])
+    /// and the reweight-an-existing-entity path
+    /// ([`crate::sched::fair::CfsRunQueue::reweight_entity`]).
+    pub const fn weight_from_prio(prio: i32) -> u64 {
+        assert!(
+            prio >= MAX_RT_PRIO && prio < MAX_PRIO,
+            "weight_from_prio: prio is outside [MAX_RT_PRIO, MAX_PRIO)"
+        );
+        let index = (prio - MAX_RT_PRIO) as usize;
+        Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index])
+    }
+
+    /// Loads the fair class weight for a fair class priority.
+    pub fn set_load_weight_from_prio(&mut self, prio: i32) {
+        self.update_load_set(Self::weight_from_prio(prio));
     }
 
     /// ## 更新负载权重的倒数
@@ -416,6 +459,20 @@ impl LoadWeight {
     }
 }
 
+// Linux states this invariant in `kernel/sched/sched.h`: the fair class weight
+// for nice 0 must be exactly NICE_0_LOAD.
+//
+// DragonOS relies on it in two independent places — `FairSchedEntity::new`
+// starts every entity at `NICE_0_LOAD`, and `sched_fork` derives the load from
+// `static_prio` via `set_load_weight_from_prio` — and the two only agree while
+// `DEFAULT_PRIO` maps to the table's NICE_0_LOAD entry. Pinning it here means a
+// future change to the priority space fails the build instead of silently
+// giving non-forked tasks a different weight from forked ones.
+const _: () = assert!(
+    LoadWeight::scale_load(LoadWeight::SCHED_PRIO_TO_WEIGHT[(DEFAULT_PRIO - MAX_RT_PRIO) as usize])
+        == LoadWeight::NICE_0_LOAD
+);
+
 pub trait SchedArch {
     /// 开启当前核心的调度
     fn enable_sched_local();
@@ -439,6 +496,7 @@ pub struct CpuRunQueue {
     clock_task: u64,
     clock: u64,
     prev_irq_time: u64,
+    prev_steal_time_rq: u64,
     clock_updata_flags: ClockUpdataFlag,
 
     /// 过载
@@ -446,8 +504,8 @@ pub struct CpuRunQueue {
 
     next_balance: u64,
 
-    /// 运行任务数
-    nr_running: usize,
+    /// Runnable count. Writers hold rq; placement may read an advisory snapshot.
+    nr_running: AtomicUsize,
 
     /// 被阻塞的任务数量
     nr_uninterruptible: usize,
@@ -461,14 +519,16 @@ pub struct CpuRunQueue {
 
     /// CFS调度器
     cfs: Arc<CfsRunQueue>,
+    /// CPU-local active/blocked CFS queues in child-before-parent order.
+    /// Weak payloads do not pin deleted CPU controller instances. Unique nodes
+    /// are prepared by each CFS queue, not allocated during wakeup or tick.
+    cfs_pelt_queues: pelt_list::PeltList,
 
-    fifo: fifo::FifoRunQueue,
+    rt: realtime::RealtimeRunQueue,
 
     clock_pelt: u64,
     lost_idle_time: u64,
     clock_idle: u64,
-
-    cfs_tasks: LinkedList<Arc<FairSchedEntity>>,
 
     /// 最近一次的调度信息
     sched_info: SchedInfo,
@@ -492,20 +552,21 @@ impl CpuRunQueue {
             clock_task: 0,
             clock: 0,
             prev_irq_time: 0,
+            prev_steal_time_rq: 0,
             clock_updata_flags: ClockUpdataFlag::empty(),
             overload: false,
             next_balance: 0,
-            nr_running: 0,
+            nr_running: AtomicUsize::new(0),
             nr_uninterruptible: 0,
             nr_iowait: AtomicUsize::new(0),
             calc_load_update: clock() + (5 * HZ + 1),
             calc_load_active: 0,
             cfs: Arc::new(CfsRunQueue::new()),
-            fifo: fifo::FifoRunQueue::new(),
+            cfs_pelt_queues: pelt_list::PeltList::default(),
+            rt: realtime::RealtimeRunQueue::new(),
             clock_pelt: 0,
             lost_idle_time: 0,
             clock_idle: 0,
-            cfs_tasks: LinkedList::new(),
             sched_info: SchedInfo::default(),
             current: Weak::new(),
             idle: Weak::new(),
@@ -515,28 +576,28 @@ impl CpuRunQueue {
     /// 此函数只能在关中断的情况下使用！！！
     /// 获取到 rq 的可变引用，并显式持有 rq 锁。
     #[allow(clippy::mut_from_ref)]
-    #[track_caller]
     pub fn self_lock(&self) -> (&mut Self, SpinLockGuard<'_, ()>) {
-        let mut spins = 0usize;
-        let guard = loop {
-            if let Ok(guard) = self.lock.try_lock_irqsave() {
-                break guard;
-            }
-
-            spins += 1;
-            if spins >= 1_000_000 {
-                let caller = Location::caller();
-                panic!(
-                    "CpuRunQueue::self_lock spinout on cpu {:?}, caller {}:{}",
-                    self.cpu,
-                    caller.file(),
-                    caller.line()
-                );
-            }
-
-            core::hint::spin_loop();
-        };
+        let guard = self.lock.lock_irqsave();
         (self.force_mut_locked(), guard)
+    }
+
+    /// Advisory placement snapshot, equivalent to Linux's lockless rq load
+    /// reads. This does not publish task state or authorize queue mutations;
+    /// enqueue, dequeue and migration still require the runqueue lock.
+    #[inline]
+    pub fn nr_running(&self) -> usize {
+        self.nr_running.load(Ordering::Relaxed)
+    }
+
+    /// Best-effort current-task snapshot for lockup diagnostics.
+    ///
+    /// The caller must tolerate `None`: a stalled CPU may itself hold the
+    /// runqueue lock, so diagnostic code must never spin waiting for it.
+    pub(crate) fn try_current_task(&self) -> Option<Arc<ProcessControlBlock>> {
+        let guard = self.lock.try_lock_irqsave().ok()?;
+        let current = self.current();
+        drop(guard);
+        Some(current)
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -566,11 +627,10 @@ impl CpuRunQueue {
             }
         }
 
-        match pcb.sched_info().policy() {
-            SchedPolicy::CFS => CompletelyFairScheduler::enqueue(self, pcb, flags),
-            SchedPolicy::FIFO => FifoScheduler::enqueue(self, pcb, flags),
-            SchedPolicy::RT => todo!(),
-            SchedPolicy::IDLE => IdleScheduler::enqueue(self, pcb, flags),
+        match pcb.sched_info().sched_class() {
+            SchedClass::Realtime => RealtimeScheduler::enqueue(self, pcb, flags),
+            SchedClass::Fair => CompletelyFairScheduler::enqueue(self, pcb, flags),
+            SchedClass::Idle => IdleScheduler::enqueue(self, pcb, flags),
         }
 
         // TODO:https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/sched/core.c#239
@@ -597,58 +657,128 @@ impl CpuRunQueue {
             }
         }
 
-        match pcb.sched_info().policy() {
-            SchedPolicy::CFS => CompletelyFairScheduler::dequeue(self, pcb, flags),
-            SchedPolicy::FIFO => FifoScheduler::dequeue(self, pcb, flags),
-            SchedPolicy::RT => todo!(),
-            SchedPolicy::IDLE => IdleScheduler::dequeue(self, pcb, flags),
+        match pcb.sched_info().sched_class() {
+            SchedClass::Realtime => RealtimeScheduler::dequeue(self, pcb, flags),
+            SchedClass::Fair => CompletelyFairScheduler::dequeue(self, pcb, flags),
+            SchedClass::Idle => IdleScheduler::dequeue(self, pcb, flags),
         }
     }
 
-    /// 启用一个任务，将加入队列
-    pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
-        let was_idle_cpu = rq_is_idle_cpu(self);
+    pub(crate) fn put_prev_task_for_class(
+        &mut self,
+        class: SchedClass,
+        pcb: Arc<ProcessControlBlock>,
+    ) {
+        match class {
+            SchedClass::Realtime => RealtimeScheduler::put_prev_task(self, pcb),
+            SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, pcb),
+            SchedClass::Idle => IdleScheduler::put_prev_task(self, pcb),
+        }
+    }
 
-        // 如果进程之前因 IO 等待而睡眠，现在被唤醒，减少 nr_iowait 计数
-        if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
-            self.nr_iowait.fetch_sub(1, Ordering::Relaxed);
+    pub(crate) fn set_next_task_for_class(
+        &mut self,
+        class: SchedClass,
+        pcb: Arc<ProcessControlBlock>,
+    ) {
+        match class {
+            SchedClass::Realtime => RealtimeScheduler::set_next_task(self, pcb),
+            SchedClass::Fair => CompletelyFairScheduler::set_next_task(self, pcb),
+            SchedClass::Idle => unreachable!("scheduler changes cannot target the idle class"),
+        }
+    }
+
+    /// Apply the reachable subset of Linux `check_class_changed()` semantics.
+    pub(crate) fn check_scheduler_changed(
+        &mut self,
+        pcb: &Arc<ProcessControlBlock>,
+        old_class: SchedClass,
+        old_prio: i32,
+    ) {
+        if *pcb.sched_info().on_rq.lock_irqsave() != OnRq::Queued {
+            return;
         }
 
+        let new_class = pcb.sched_info().sched_class();
+        let new_prio = pcb.sched_info().prio();
+        if old_class == new_class && old_prio == new_prio {
+            return;
+        }
+
+        if !Arc::ptr_eq(&self.current(), pcb) {
+            self.check_preempt_current(pcb, WakeupFlags::empty());
+            return;
+        }
+
+        if old_class != new_class {
+            if old_class == SchedClass::Realtime && new_class == SchedClass::Fair {
+                self.resched_current();
+            }
+            return;
+        }
+
+        if new_class == SchedClass::Realtime
+            && new_prio > old_prio
+            && self
+                .rt
+                .highest_prio()
+                .is_some_and(|highest| highest < new_prio as usize)
+        {
+            self.resched_current();
+        }
+
+        // Linux `prio_changed_fair()`: the running task just made itself less
+        // important, so it has to give the CPU back. Unlike the realtime case
+        // there is no queue scan — the fair class picks by virtual runtime, so
+        // the only thing that can immediately deserve the CPU more is the
+        // already-runnable set, which `resched_current()` will re-evaluate.
+        //
+        // Priority is inverted: a numerically larger `prio` is a *lower*
+        // priority, i.e. a larger nice value.
+        //
+        // `rq->cfs.nr_running == 1` means the task is the only runnable fair
+        // task, so a reschedule could only re-elect it; Linux skips the
+        // request entirely and so does this.
+        if new_class == SchedClass::Fair
+            && new_prio > old_prio
+            && pcb.sched_info().sched_entity().cfs_rq().nr_running() > 1
+        {
+            self.resched_current();
+        }
+    }
+
+    /// 将任务加入运行队列，设置 on_rq = Queued。
+    pub fn activate_task(&mut self, pcb: &Arc<ProcessControlBlock>, mut flags: EnqueueFlag) {
+        // 1. 迁移标志处理
         if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
             flags |= EnqueueFlag::ENQUEUE_MIGRATED;
         }
 
-        if flags.contains(EnqueueFlag::ENQUEUE_MIGRATED) {
-            todo!()
-        }
-
+        // 2. enqueue_task
         self.enqueue_task(pcb.clone(), flags);
 
+        // 3. 设置 on_rq = Queued
         *pcb.sched_info().on_rq.lock_irqsave() = OnRq::Queued;
-        pcb.sched_info().set_on_cpu(Some(self.cpu));
-
-        if was_idle_cpu && !rq_is_idle_cpu(self) {
-            IDLE_CPUS.clear(self.cpu);
-        }
-
-        debug_assert_eq!(*pcb.sched_info().on_rq.lock_irqsave(), OnRq::Queued);
-        debug_assert_eq!(pcb.sched_info().on_cpu(), Some(self.cpu));
-        pcb.debug_assert_fork_cpu_binding();
     }
 
     /// 检查对应的task是否可以抢占当前运行的task
-    #[allow(clippy::comparison_chain)]
-    pub fn check_preempt_currnet(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
-        if pcb.sched_info().policy() == self.current().sched_info().policy() {
-            match self.current().sched_info().policy() {
-                SchedPolicy::CFS => {
-                    CompletelyFairScheduler::check_preempt_currnet(self, pcb, flags)
+    pub fn check_preempt_current(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
+        let current_class = self.current().sched_info().sched_class();
+        let waking_class = pcb.sched_info().sched_class();
+
+        if waking_class == SchedClass::Realtime && self.rt.is_throttled() {
+            return;
+        }
+
+        if waking_class == current_class {
+            match current_class {
+                SchedClass::Fair => {
+                    CompletelyFairScheduler::check_preempt_current(self, pcb, flags)
                 }
-                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
-                SchedPolicy::RT => todo!(),
-                SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
+                SchedClass::Realtime => RealtimeScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Idle => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
-        } else if pcb.sched_info().policy() < self.current().sched_info().policy() {
+        } else if waking_class.outranks(current_class) {
             // 调度优先级更高
             self.resched_current();
         }
@@ -661,35 +791,41 @@ impl CpuRunQueue {
         }
     }
 
-    /// 远端 wakeup/策略调整场景下的保守抢占检查。
+    /// 远端策略调整场景下的保守抢占检查。
     ///
-    /// Linux 会在持有目标 rq 锁且目标 rq 时钟已更新后执行完整的 wakeup-preempt 检查。
-    /// 当前明确禁止跨核 `update_rq_clock()`，因此远端路径只能保留那些不依赖
-    /// `rq.clock_task` 最新值的抢占决策：
+    /// Linux wakeup path 会在持有目标 rq 锁且目标 rq 时钟已更新后执行完整的
+    /// wakeup-preempt 检查；DragonOS 的 `ProcessManager::wakeup()` queued fast path
+    /// 也遵循这个约束。该函数只用于没有先更新目标 rq clock 的裸远端路径，
+    /// 因此只能保留那些不依赖 `rq.clock_task` 最新值的抢占决策：
     /// - 更高调度类抢占；
     /// - FIFO 优先级抢占；
     /// - idle 被非 idle 任务抢占。
     ///
-    /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体，
-    /// 这在远端场景会重新引入“错误 CPU 更新目标 rq 时钟”的问题，因此这里故意跳过。
-    #[allow(clippy::comparison_chain)]
+    /// CFS 的 wakeup-preempt 需要像 Linux `check_preempt_wakeup()` 一样先更新当前实体；
+    /// 调用者若不能证明已持目标 rq lock 并更新 rq clock，就必须在这里跳过。
     pub fn check_preempt_remote(&mut self, pcb: &Arc<ProcessControlBlock>, flags: WakeupFlags) {
         let current = self.current();
-        let current_policy = current.sched_info().policy();
-        let next_policy = pcb.sched_info().policy();
+        let current_class = current.sched_info().sched_class();
+        let next_class = pcb.sched_info().sched_class();
 
-        if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+        if next_class == SchedClass::Realtime && self.rt.is_throttled() {
             return;
         }
 
-        if next_policy < current_policy {
+        if current.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+            if current_class == SchedClass::Idle {
+                self.resched_current();
+            }
+            return;
+        }
+
+        if next_class.outranks(current_class) {
             self.resched_current();
-        } else if next_policy == current_policy {
-            match current_policy {
-                SchedPolicy::CFS => {}
-                SchedPolicy::FIFO => FifoScheduler::check_preempt_currnet(self, pcb, flags),
-                SchedPolicy::RT => todo!(),
-                SchedPolicy::IDLE => IdleScheduler::check_preempt_currnet(self, pcb, flags),
+        } else if next_class == current_class {
+            match current_class {
+                SchedClass::Fair => {}
+                SchedClass::Realtime => RealtimeScheduler::check_preempt_current(self, pcb, flags),
+                SchedClass::Idle => IdleScheduler::check_preempt_current(self, pcb, flags),
             }
         }
 
@@ -701,25 +837,9 @@ impl CpuRunQueue {
         }
     }
 
-    /// 禁用一个任务，将离开队列
+    /// 设置 on_rq，将任务移出运行队列
     pub fn deactivate_task(&mut self, pcb: Arc<ProcessControlBlock>, flags: DequeueFlag) {
-        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
-            && matches!(
-                pcb.sched_info().inner_lock_read_irqsave().state(),
-                ProcessState::Blocked(false)
-            )
-        {
-            self.nr_uninterruptible += 1;
-            loadavg::inc_nr_uninterruptible(1);
-        }
-
-        // 如果进程因 IO 等待而睡眠，增加 nr_iowait 计数
-        if flags.contains(DequeueFlag::DEQUEUE_SLEEP)
-            && pcb.flags().contains(ProcessFlags::IN_IOWAIT)
-        {
-            self.nr_iowait.fetch_add(1, Ordering::Relaxed);
-        }
-
+        // 1. 根据标志设置 on_rq 状态
         *pcb.sched_info().on_rq.lock_irqsave() =
             if flags.intersects(DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_STOPPED) {
                 OnRq::None
@@ -727,6 +847,7 @@ impl CpuRunQueue {
                 OnRq::Migrating
             };
 
+        // 2. dequeue_task
         self.dequeue_task(pcb, flags);
     }
 
@@ -741,14 +862,19 @@ impl CpuRunQueue {
         self.nr_iowait.load(Ordering::Relaxed)
     }
 
+    pub fn dec_nr_iowait(&self) {
+        let result = self
+            .nr_iowait
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nr| nr.checked_sub(1));
+        debug_assert!(result.is_ok(), "nr_iowait underflow");
+    }
+
     /// 更新rq时钟
     pub fn update_rq_clock(&mut self) {
-        debug_assert_eq!(
-            self.cpu,
-            smp_get_processor_id(),
-            "update_rq_clock must run on its own cpu"
-        );
-
+        // Match Linux rq clock rules: callers may update a remote rq while
+        // holding that rq's lock. DragonOS sched_clock_cpu() returns a
+        // globally comparable clock on supported architectures, and irq time is
+        // tracked per CPU inside update_rq_clock_task().
         let clock = SchedClock::sched_clock_cpu(self.cpu);
         self.update_rq_clock_from_clock(clock);
     }
@@ -775,14 +901,6 @@ impl CpuRunQueue {
     /// 更新任务时钟
     pub fn update_rq_clock_task(&mut self, mut delta: u64) {
         let mut irq_delta = irq_time_read(self.cpu) - self.prev_irq_time;
-        // if self.cpu == 0 {
-        //     error!(
-        //         "cpu 0 delta {delta} irq_delta {} irq_time_read(self.cpu) {} self.prev_irq_time {}",
-        //         irq_delta,
-        //         irq_time_read(self.cpu),
-        //         self.prev_irq_time
-        //     );
-        // }
         compiler_fence(Ordering::SeqCst);
 
         if irq_delta > delta {
@@ -793,16 +911,19 @@ impl CpuRunQueue {
 
         delta -= irq_delta;
 
+        if let Some(total) = cputime::steal_clock(self.cpu) {
+            delta -= cputime::rq_steal_time(total, &mut self.prev_steal_time_rq, delta);
+        }
+
         // todo: psi?
 
-        // send_to_default_serial8250_port(format!("\n{delta}\n",).as_bytes());
         compiler_fence(Ordering::SeqCst);
         self.clock_task += delta;
         compiler_fence(Ordering::SeqCst);
-        // if self.cpu == 0 {
-        //     error!("cpu {} clock_task {}", self.cpu, self.clock_task);
-        // }
-        // todo: pelt?
+        // This platform currently models CPU and frequency capacity as 1024.
+        // Linux's scaled PELT delta is therefore exactly task-clock delta,
+        // including idle time. No capacity-induced lost idle time exists.
+        self.clock_pelt = self.clock_task;
     }
 
     pub fn calculate_global_load_tick(&mut self) {
@@ -810,19 +931,20 @@ impl CpuRunQueue {
     }
 
     pub fn add_nr_running(&mut self, nr_running: usize) {
-        let prev = self.nr_running;
-
-        self.nr_running = prev + nr_running;
+        let prev = self.nr_running();
+        let next = prev + nr_running;
+        self.nr_running.store(next, Ordering::Relaxed);
         loadavg::inc_nr_running(nr_running);
-        if prev < 2 && self.nr_running >= 2 && !self.overload {
+        if prev < 2 && next >= 2 && !self.overload {
             self.overload = true;
         }
     }
 
     pub fn sub_nr_running(&mut self, count: usize) {
-        self.nr_running -= count;
+        let next = self.nr_running() - count;
+        self.nr_running.store(next, Ordering::Relaxed);
         loadavg::dec_nr_running(count);
-        if self.nr_running < 2 && self.overload {
+        if next < 2 && self.overload {
             self.overload = false;
         }
     }
@@ -836,9 +958,8 @@ impl CpuRunQueue {
 
     /// 在运行idle？
     pub fn sched_idle_rq(&self) -> bool {
-        return unlikely(
-            self.nr_running == self.cfs.idle_h_nr_running as usize && self.nr_running > 0,
-        );
+        let nr_running = self.nr_running();
+        unlikely(nr_running == self.cfs.idle_h_nr_running as usize && nr_running > 0)
     }
 
     #[inline]
@@ -864,25 +985,16 @@ impl CpuRunQueue {
     /// 重新调度当前进程
     pub fn resched_current(&self) {
         let current = self.current();
-
-        // 又需要被调度？
-        if unlikely(current.flags().contains(ProcessFlags::NEED_SCHEDULE)) {
+        let cpu = self.cpu;
+        let already_requested = current.flags().contains(ProcessFlags::NEED_SCHEDULE);
+        current.flags().insert(ProcessFlags::NEED_SCHEDULE);
+        if cpu == smp_get_processor_id() {
             return;
         }
 
-        let cpu = self.cpu;
-
-        if cpu == smp_get_processor_id() {
-            // assert!(
-            //     Arc::ptr_eq(&current, &ProcessManager::current_pcb()),
-            //     "rq current name {} process current {}",
-            //     current.basic().name().to_string(),
-            //     ProcessManager::current_pcb().basic().name().to_string(),
-            // );
-            // 设置需要调度
-            ProcessManager::current_pcb()
-                .flags()
-                .insert(ProcessFlags::NEED_SCHEDULE);
+        // A remote idle CPU may be halted; kick it even if the flag was already
+        // set so it observes the pending reschedule promptly.
+        if already_requested && current.sched_info().sched_class() != SchedClass::Idle {
             return;
         }
 
@@ -894,28 +1006,60 @@ impl CpuRunQueue {
     pub fn pick_next_task(&mut self, prev: Arc<ProcessControlBlock>) -> Arc<ProcessControlBlock> {
         debug_assert_eq!(prev.sched_info().on_cpu(), Some(self.cpu));
 
+        // RT runtime must be current before class selection. DragonOS picks
+        // `next` before calling put_prev_task(), so accounting only there can
+        // select another RT task from a runqueue which has already exhausted
+        // its bandwidth.
+        RealtimeScheduler::update_bandwidth(self, prev.sched_info().sched_class());
+
         let mut next: Option<Arc<ProcessControlBlock>> = None;
 
-        if self.fifo.nr_running() > 0 {
-            next = FifoScheduler::pick_next_task(self, Some(prev.clone()));
+        if self.rt.nr_running() > 0 {
+            next = RealtimeScheduler::pick_next_task(self, Some(prev.clone()));
         }
 
         if next.is_none() {
             next = CompletelyFairScheduler::pick_next_task(self, Some(prev.clone()));
         }
 
+        if next.is_none()
+            && !task_is_idle(&prev)
+            && prev.sched_info().state().is_runnable()
+            && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
+            && !(prev.sched_info().sched_class() == SchedClass::Realtime && self.rt.is_throttled())
+            && !(prev.sched_info().sched_class() == SchedClass::Fair
+                && CompletelyFairScheduler::task_throttled(&prev))
+        {
+            next = Some(prev.clone());
+        }
+
         let next = next.unwrap_or_else(|| self.idle.upgrade().unwrap());
 
         if !Arc::ptr_eq(&prev, &next) {
-            match prev.sched_info().policy() {
-                SchedPolicy::FIFO => FifoScheduler::put_prev_task(self, prev),
-                SchedPolicy::RT => todo!(),
-                SchedPolicy::CFS => CompletelyFairScheduler::put_prev_task(self, prev),
-                SchedPolicy::IDLE => IdleScheduler::put_prev_task(self, prev),
-            }
+            match (
+                prev.sched_info().sched_class(),
+                next.sched_info().sched_class(),
+            ) {
+                (SchedClass::Fair, SchedClass::Fair) => {
+                    CompletelyFairScheduler::switch_task(&prev, &next);
+                }
+                (previous_class, selected_class) => {
+                    match previous_class {
+                        SchedClass::Realtime => RealtimeScheduler::put_prev_task(self, prev),
+                        SchedClass::Fair => CompletelyFairScheduler::put_prev_task(self, prev),
+                        SchedClass::Idle => IdleScheduler::put_prev_task(self, prev),
+                    }
 
-            if next.sched_info().policy() == SchedPolicy::CFS {
-                CompletelyFairScheduler::set_next_task(self, next.clone());
+                    match selected_class {
+                        SchedClass::Realtime => {
+                            RealtimeScheduler::set_next_task(self, next.clone())
+                        }
+                        SchedClass::Fair => {
+                            CompletelyFairScheduler::set_next_task(self, next.clone())
+                        }
+                        SchedClass::Idle => {}
+                    }
+                }
             }
         }
 
@@ -952,6 +1096,12 @@ bitflags! {
         const ALT_PERIOD = 1 << 12;
         /// 启用基本时间片
         const BASE_SLICE = 1 << 13;
+        /// EEVDF: once picked, keep running until ineligible or it gets a new slice.
+        const RUN_TO_PARITY = 1 << 14;
+        /// EEVDF: preserve virtual lag when placing entities.
+        const PLACE_LAG = 1 << 15;
+        /// EEVDF: give initial forked entities half a slice.
+        const PLACE_DEADLINE_INITIAL = 1 << 16;
     }
 
     pub struct EnqueueFlag: u8 {
@@ -959,6 +1109,9 @@ bitflags! {
         const ENQUEUE_RESTORE	= 0x02;
         const ENQUEUE_MOVE	= 0x04;
         const ENQUEUE_NOCLOCK	= 0x08;
+
+        /// Place a realtime task at the head of its priority bucket.
+        const ENQUEUE_HEAD      = 0x10;
 
         const ENQUEUE_MIGRATED	= 0x40;
 
@@ -1040,17 +1193,21 @@ pub fn scheduler_tick() {
 
     // 更新请求队列时钟
     rq.update_rq_clock();
-
-    match current.sched_info().policy() {
-        SchedPolicy::CFS => CompletelyFairScheduler::tick(rq, current, false),
-        SchedPolicy::FIFO => FifoScheduler::tick(rq, current, false),
-        SchedPolicy::RT => todo!(),
-        SchedPolicy::IDLE => IdleScheduler::tick(rq, current, false),
+    let current_class = current.sched_info().sched_class();
+    RealtimeScheduler::update_bandwidth(rq, current_class);
+    match current_class {
+        SchedClass::Realtime => RealtimeScheduler::tick(rq, current, false),
+        SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
+        SchedClass::Idle => IdleScheduler::tick(rq, current, false),
     }
+    let retired_pelt = CompletelyFairScheduler::update_blocked_averages(rq);
 
     rq.calculate_global_load_tick();
 
     drop(guard);
+    // Expired Weak payloads can free their control block; never do this under
+    // the runqueue lock. PeltNode Drop iteratively destroys the owned chain.
+    drop(retired_pelt);
     // TODO:处理负载均衡
 }
 
@@ -1103,7 +1260,6 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         }
     }
 
-    crate::rcu::note_context_switch();
     let cpu = smp_get_processor_id().data() as usize;
     let rq = cpu_rq(cpu);
     let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
@@ -1111,9 +1267,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         Some(current) => current,
         None => {
             let prev = rq.current();
-            if let ProcessState::Exited(_) =
-                prev.clone().sched_info().inner_lock_read_irqsave().state()
-            {
+            if let ProcessState::Exited(_) = prev.clone().sched_info().state() {
                 // 从exit进的Schedule
                 ProcessManager::current_pcb()
             } else {
@@ -1121,95 +1275,135 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
             }
         }
     };
+    crate::rcu::note_context_switch(&prev);
 
     // TODO: hrtick_clear(rq);
 
     let (rq, guard) = rq.self_lock();
+    // 对标 Linux __schedule() rq_lock 后的 smp_mb__after_spinlock()：
+    // x86_64 (TSO) 上 spinlock 已含 full barrier，此处为冗余；RISC-V 上必要。
+    fence(Ordering::SeqCst);
 
     rq.clock_updata_flags = ClockUpdataFlag::from_bits_truncate(rq.clock_updata_flags.bits() << 1);
 
     rq.update_rq_clock();
     rq.clock_updata_flags = ClockUpdataFlag::RQCF_UPDATE;
 
-    let mut migrate_prev_to = None;
-    if let Some(dest_cpu) = take_current_migration_target(&prev) {
-        // 当前任务迁移在真正切出当前 CPU 时才标记 rseq migrate，
-        // 避免在迁移请求发起后、任务仍运行在旧 CPU 时过早处理 NEED_RSEQ。
-        crate::process::rseq::Rseq::on_migrate(&prev);
+    // 对标 Linux __schedule() 的 prev_state 检查：
+    //   Linux 条件: (!(sched_mode & SM_MASK_PREEMPT) && prev_state)
+    //   ——非抢占 + prev 非 RUNNING 时进入 deactivate 分支。
+    //
+    // DragonOS 扩展：SM_PREEMPT 路径也需处理非 runnable 的 prev，
+    // 因为异步 stop_task() 可在发送端上下文将远端 current 设为 Stopped（仅 kick 不 dequeue），
+    // 导致远端 IPI 退出时 prev 已非 runnable 但仍在 runqueue 上。
+    // 此时必须在这里完成唯一一次出队。
+    //
+    // on_rq == Queued 守卫保证 deactivate 幂等：
+    //   若 stop_task 已出队（!is_current 分支），此处 on_rq != Queued，跳过。
+    //   若 stop_task 未出队（远端 current 分支），此处 on_rq == Queued，执行出队。
+    let mut prev_state = prev.sched_info().state();
+    if !prev_state.is_runnable() {
+        let interruptible = prev_state.is_blocked_interruptable();
+        let wake_kill = prev_state.is_stopped();
 
-        debug_assert!(
-            !task_is_idle(&prev),
-            "idle task must not be migrated through current task migration"
-        );
-        debug_assert!(
-            cpu_is_online(dest_cpu),
-            "current task migration target {:?} must be online",
-            dest_cpu
-        );
-        debug_assert!(
-            prev.sched_info()
-                .cpus_allowed()
-                .get(dest_cpu)
-                .unwrap_or(false),
-            "current task migration target {:?} must be allowed by affinity",
-            dest_cpu
-        );
+        // signal_pending_state 仅对 SM_NONE（自愿调度）生效：
+        //   TASK_INTERRUPTIBLE → 有任意信号 → 恢复 RUNNING
+        //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
+        //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
+        // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
+        let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
+            && Signal::signal_pending_state(interruptible, wake_kill, &prev);
 
-        rq.deactivate_task(
-            prev.clone(),
-            DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
-        );
+        if signal_wake {
+            prev.sched_info().set_state(ProcessState::Runnable);
+            prev_state = ProcessState::Runnable;
+        } else {
+            let _ = take_current_migration_target(&prev);
 
-        if prev.sched_info().policy() == SchedPolicy::CFS {
-            let mut se = prev.sched_info().sched_entity();
-            crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
-                se.cfs_rq().force_mut().set_current(Weak::default());
-                (true, true)
-            });
+            if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
+                // sched_contributes_to_load 在 deactivate_task 之前
+                if matches!(prev_state, ProcessState::Blocked(false)) {
+                    rq.nr_uninterruptible += 1;
+                    loadavg::inc_nr_uninterruptible(1);
+                }
+
+                rq.deactivate_task(
+                    prev.clone(),
+                    DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
+                );
+
+                if prev_state.is_exited() && prev.sched_info().sched_class() == SchedClass::Fair {
+                    CompletelyFairScheduler::task_dead_fair(rq, &prev);
+                }
+
+                // nr_iowait++ happens after deactivate_task.
+                if prev_state.is_blocked() && prev.flags().contains(ProcessFlags::IN_IOWAIT) {
+                    rq.nr_iowait.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-
-        *prev.sched_info().on_rq.lock_irqsave() = OnRq::None;
-        migrate_prev_to = Some(dest_cpu);
     }
 
-    // kBUG!(
-    //     "before cfs rq pcbs {:?}\nvruntimes {:?}\n",
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.pcb().pid() })
-    //         .collect::<Vec<_>>(),
-    //     rq.cfs
-    //         .entities
-    //         .iter()
-    //         .map(|x| { x.1.vruntime })
-    //         .collect::<Vec<_>>(),
-    // );
+    let mut migrate_prev_to = None;
+    if prev_state.is_runnable() {
+        if let Some(dest_cpu) = take_current_migration_target(&prev) {
+            // 当前任务迁移在真正切出当前 CPU 时才标记 rseq migrate，
+            // 避免在迁移请求发起后、任务仍运行在旧 CPU 时过早处理 NEED_RSEQ。
+            crate::process::rseq::Rseq::on_migrate(&prev);
 
-    if !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
-        && prev.sched_info().policy() != SchedPolicy::IDLE
-        && prev.sched_info().inner_lock_read_irqsave().is_mark_sleep()
-    {
-        rq.deactivate_task(
-            prev.clone(),
-            DequeueFlag::DEQUEUE_SLEEP | DequeueFlag::DEQUEUE_NOCLOCK,
-        );
+            debug_assert!(
+                !task_is_idle(&prev),
+                "idle task must not be migrated through current task migration"
+            );
+            debug_assert!(
+                cpu_is_online(dest_cpu),
+                "current task migration target {:?} must be online",
+                dest_cpu
+            );
+            // Do not read cpus_allowed under rq_lock: sched_setaffinity uses
+            // pi_lock -> rq_lock. The switch tail, after releasing this rq,
+            // revalidates the destination under pi_lock immediately before
+            // enqueue and therefore closes concurrent affinity changes
+            // without introducing rq_lock -> pi_lock inversion here.
+
+            rq.deactivate_task(
+                prev.clone(),
+                DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
+            );
+
+            if prev.sched_info().sched_class() == SchedClass::Fair {
+                let mut se = prev.sched_info().sched_entity();
+                crate::sched::fair::FairSchedEntity::for_each_in_group(&mut se, |se| {
+                    se.cfs_rq().force_mut().set_current(Weak::default());
+                    (true, true)
+                });
+            }
+
+            // Keep task_cpu unstable until the switch tail owns pi_lock and
+            // commits the destination enqueue. External task_rq_lock-style
+            // operations must not mutate scheduler state against the old rq
+            // during this lockless migration interval.
+            debug_assert_eq!(*prev.sched_info().on_rq.lock_irqsave(), OnRq::Migrating);
+            migrate_prev_to = Some(dest_cpu);
+        }
     }
 
     let next = rq.pick_next_task(prev.clone());
-
     if task_is_idle(&next) {
         IDLE_CPUS.set(rq.cpu);
     } else if task_is_idle(&prev) {
         IDLE_CPUS.clear(rq.cpu);
     }
 
-    let had_need_schedule = prev.flags().contains(ProcessFlags::NEED_SCHEDULE);
     prev.flags().remove(ProcessFlags::NEED_SCHEDULE);
     fence(Ordering::SeqCst);
     if likely(!Arc::ptr_eq(&prev, &next)) {
         crate::process::rseq::Rseq::on_preempt(&prev);
 
+        assert!(
+            next.sched_info().try_mark_running(),
+            "scheduler selected a task which is still running on another CPU"
+        );
         rq.set_current(Arc::downgrade(&next));
         compiler_fence(Ordering::SeqCst);
         account_context_switch();
@@ -1230,9 +1424,10 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
             migrate_prev_to.is_none(),
             "current task migration must switch away from the migrated task"
         );
-        // A tick preempt request may pick the same task again. Preserve rseq's
-        // preempt notification semantics for that return-to-user boundary.
-        if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) && had_need_schedule {
+        // A tick preempt request may pick the same task again. It still reached
+        // the scheduler from a preemptible return-to-user boundary, so rseq must
+        // observe a bounded preempt event even when no other entity is chosen.
+        if sched_mod.contains(SchedMode::SM_MASK_PREEMPT) {
             crate::process::rseq::Rseq::on_preempt(&prev);
         }
         drop(guard);
@@ -1245,20 +1440,56 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 }
 
 pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-    let mut prio_guard = pcb.sched_info().prio_data.write_irqsave();
     let current = ProcessManager::current_pcb();
+    let (mut fork_prio, mut fork_static_prio, mut fork_policy, reset_on_fork) = {
+        let pi_guard = current.sched_info().pi_lock_irqsave();
+        (
+            current.sched_info().normal_prio(),
+            current.sched_info().static_prio(),
+            current.sched_info().policy(),
+            pi_guard.sched_reset_on_fork(),
+        )
+    };
 
-    prio_guard.prio = current.sched_info().prio_data.read_irqsave().normal_prio;
-
-    if PrioUtil::dl_prio(prio_guard.prio) {
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    } else if PrioUtil::rt_prio(prio_guard.prio) {
-        let policy = &pcb.sched_info().sched_policy;
-        *policy.write_irqsave() = SchedPolicy::RT;
-    } else {
-        let policy = &pcb.sched_info().sched_policy;
-        *policy.write_irqsave() = SchedPolicy::CFS;
+    if reset_on_fork {
+        if fork_policy.is_realtime() {
+            // Linux resets RT children to SCHED_NORMAL at nice 0.
+            fork_policy = LinuxSchedPolicy::Normal;
+            fork_prio = prio::DEFAULT_PRIO;
+            fork_static_prio = prio::DEFAULT_PRIO;
+        } else if fork_static_prio < prio::DEFAULT_PRIO {
+            // Fair children preserve non-negative nice, but reset negative
+            // nice to zero when RESET_ON_FORK is set.
+            fork_prio = prio::DEFAULT_PRIO;
+            fork_static_prio = prio::DEFAULT_PRIO;
+        }
     }
+
+    // 子进程是 TASK_NEW，不可见。可以直接写裸字段
+    // 子进程继承父进程的 prio、static_prio、normal_prio
+    pcb.sched_info().set_prio(fork_prio);
+    pcb.sched_info().set_static_prio(fork_static_prio);
+    pcb.sched_info().set_normal_prio(fork_prio);
+    pcb.sched_info()
+        .pi_lock_irqsave()
+        .set_sched_reset_on_fork(false);
+
+    if PrioUtil::dl_prio(fork_prio) {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+    debug_assert_eq!(
+        PrioUtil::rt_prio(fork_prio),
+        fork_policy.is_realtime(),
+        "fork policy and inherited normal priority disagree"
+    );
+    pcb.sched_info().set_policy(fork_policy);
+    pcb.sched_info().set_effective_priority(fork_prio);
+
+    pcb.sched_info()
+        .sched_entity()
+        .force_mut()
+        .load
+        .set_load_weight_from_prio(fork_static_prio);
 
     pcb.sched_info()
         .sched_entity()
@@ -1272,11 +1503,10 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
     let fork_cpu = smp_get_processor_id();
 
     __set_task_cpu(pcb, fork_cpu);
-    match pcb.sched_info().policy() {
-        SchedPolicy::RT => todo!(),
-        SchedPolicy::FIFO => FifoScheduler::task_fork(pcb.clone()),
-        SchedPolicy::CFS => CompletelyFairScheduler::task_fork(pcb.clone()),
-        SchedPolicy::IDLE => todo!(),
+    match pcb.sched_info().sched_class() {
+        SchedClass::Realtime => RealtimeScheduler::task_fork(pcb.clone()),
+        SchedClass::Fair => CompletelyFairScheduler::task_fork(pcb.clone()),
+        SchedClass::Idle => unreachable!("a fork child cannot use the idle scheduling class"),
     }
 
     debug_assert_eq!(
@@ -1293,42 +1523,58 @@ fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
         cpu
     );
 
-    // TODO: Fixme There is not implement group sched;
-    let se = pcb.sched_info().sched_entity();
-    let rq = cpu_rq(cpu.data() as usize);
-    se.force_mut().set_cfs(Arc::downgrade(&rq.cfs));
+    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+    let old_cpu = pcb.sched_info().on_cpu();
+    // Sleeping tasks retain their binding; cgroup moves rebind under pi/rq.
+    // Migrating tasks still need the original detach/rebind, even on return
+    // to their source CPU after an affinity change.
+    if old_cpu == Some(cpu) && on_rq == OnRq::None {
+        return;
+    }
+    if pcb.sched_info().sched_class() == SchedClass::Fair
+        && (on_rq == OnRq::Migrating || old_cpu.is_some_and(|old_cpu| old_cpu != cpu))
+    {
+        CompletelyFairScheduler::prepare_task_rq_migration(pcb);
+    }
+
+    fair_group::bind_task_group_cpu(pcb, cpu);
 }
 
-pub fn rebind_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {
-    __set_task_cpu(pcb, cpu);
-    pcb.sched_info().set_on_cpu(Some(cpu));
-}
-
+/// 对标 Linux ttwu_queue + ttwu_do_activate
 pub fn enqueue_task_on_cpu(
     pcb: &Arc<ProcessControlBlock>,
     target_cpu: ProcessorId,
     wake_flags: WakeupFlags,
+    was_uninterruptible: bool,
 ) {
+    assert!(
+        !pcb.sched_info().is_running(),
+        "cannot enqueue a task before its previous switch-out completes"
+    );
     __set_task_cpu(pcb, target_cpu);
+    pcb.sched_info().set_on_cpu(Some(target_cpu));
 
     let rq = cpu_rq(target_cpu.data() as usize);
-    let update_clock = target_cpu == smp_get_processor_id();
     let (rq, _guard) = rq.self_lock();
 
-    if update_clock {
-        rq.update_rq_clock();
+    rq.update_rq_clock();
+
+    if was_uninterruptible {
+        rq.dec_nr_uninterruptible();
     }
+
+    let was_idle = rq_is_idle_cpu(rq);
 
     rq.activate_task(
         pcb,
         EnqueueFlag::ENQUEUE_WAKEUP | EnqueueFlag::ENQUEUE_NOCLOCK,
     );
 
-    if update_clock {
-        rq.check_preempt_currnet(pcb, wake_flags);
-    } else {
-        rq.check_preempt_remote(pcb, wake_flags);
+    if was_idle && !rq_is_idle_cpu(rq) {
+        IDLE_CPUS.clear(target_cpu);
     }
+
+    rq.check_preempt_current(pcb, wake_flags);
 }
 
 pub fn request_task_migration(
@@ -1336,13 +1582,9 @@ pub fn request_task_migration(
     dest_cpu: ProcessorId,
 ) -> Result<(), SystemError> {
     let Some(src_cpu) = pcb.sched_info().on_cpu() else {
-        // on_cpu == None can mean either first placement of a new task or
-        // migration of an existing off-rq task. Only the latter is an rseq
-        // migration event.
-        if !pcb.sched_info().is_new_task() {
-            crate::process::rseq::Rseq::on_migrate(pcb);
-        }
-        rebind_task_cpu(pcb, dest_cpu);
+        // A new task consumes its placement hint in wake_up_new_task(). An
+        // existing off-rq task must keep its previous task_cpu until wakeup so
+        // sleep/iowait accounting is charged back to the rq that dequeued it.
         return Ok(());
     };
 
@@ -1351,12 +1593,9 @@ pub fn request_task_migration(
     }
 
     let rq = cpu_rq(src_cpu.data() as usize);
-    let update_clock = src_cpu == smp_get_processor_id();
     let (rq, _guard) = rq.self_lock();
 
-    if update_clock {
-        rq.update_rq_clock();
-    }
+    rq.update_rq_clock();
 
     if Arc::ptr_eq(&rq.current(), pcb) {
         pcb.sched_info().set_migrate_to(Some(dest_cpu));
@@ -1371,22 +1610,68 @@ pub fn request_task_migration(
     }
 
     if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
-        rq.dequeue_task(
+        rq.deactivate_task(
             pcb.clone(),
             DequeueFlag::DEQUEUE_MOVE | DequeueFlag::DEQUEUE_NOCLOCK,
         );
         crate::process::rseq::Rseq::on_migrate(pcb);
-        *pcb.sched_info().on_rq.lock_irqsave() = OnRq::None;
-        pcb.sched_info().set_on_cpu(None);
         drop(_guard);
 
-        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED);
+        pcb.sched_info().wait_until_not_running();
+        enqueue_task_on_cpu(pcb, dest_cpu, WakeupFlags::WF_MIGRATED, false);
         return Ok(());
     }
 
-    crate::process::rseq::Rseq::on_migrate(pcb);
-    rebind_task_cpu(pcb, dest_cpu);
+    // Linux does not set_task_cpu() for blocked tasks directly. DragonOS
+    // wakeup() uses task_cpu as the previous rq for sleep/iowait accounting and
+    // then selects a legal target from cpus_allowed, so keep off-rq tasks bound
+    // to the rq that actually dequeued them.
     Ok(())
+}
+
+static CPU_PLACEMENT_WAIT: crate::libs::wait_queue::WaitQueue =
+    crate::libs::wait_queue::WaitQueue::default();
+
+/// Sleep until an affinity change cannot leave the task executing on an
+/// excluded CPU. No accounting, pi or rq lock may be held by this caller.
+pub(crate) fn wait_cpu_placement(pcb: &Arc<ProcessControlBlock>) {
+    // An unpublished fork child has no executing CPU to drain. First wakeup
+    // consumes the already-published mask under the scheduler's placement locks.
+    if pcb.sched_info().is_new_task() {
+        return;
+    }
+    // The caller pins the target Arc until completion, so its address is a
+    // stable class even if PID identity changes. Unrelated switches must not
+    // wake this waiter and turn a placement wait into scheduler polling.
+    CPU_PLACEMENT_WAIT.wait_until_tagged(Arc::as_ptr(pcb) as usize, || {
+        // Pairs with the producer fence before its advisory queue-empty test.
+        fence(Ordering::SeqCst);
+        let pi = pcb.sched_info().pi_lock_irqsave();
+        let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+        if on_rq == OnRq::Migrating {
+            return None;
+        }
+        let legal = pcb
+            .sched_info()
+            .on_cpu()
+            .is_none_or(|cpu| pi.cpus_allowed.get(cpu).unwrap_or(false));
+        if legal || (!pcb.sched_info().is_running() && on_rq == OnRq::None) {
+            pcb.sched_info().set_migrate_to(None);
+            pcb.flags().remove(ProcessFlags::NEED_MIGRATE);
+            Some(())
+        } else {
+            None
+        }
+    });
+}
+
+/// Notify after placement or affinity-mask publication, with pi/rq locks released.
+/// A mask change can make the current CPU legal without an actual switch.
+pub(crate) fn notify_cpu_placement(pcb: &Arc<ProcessControlBlock>) {
+    fence(Ordering::SeqCst);
+    if !CPU_PLACEMENT_WAIT.is_empty() {
+        while CPU_PLACEMENT_WAIT.wake_one_tagged(Arc::as_ptr(pcb) as usize) {}
+    }
 }
 
 pub fn take_current_migration_target(current: &Arc<ProcessControlBlock>) -> Option<ProcessorId> {
@@ -1394,21 +1679,21 @@ pub fn take_current_migration_target(current: &Arc<ProcessControlBlock>) -> Opti
         return None;
     }
 
-    let dest_cpu = current.sched_info().migrate_to()?;
+    let dest_cpu = current.sched_info().migrate_to();
     current.sched_info().set_migrate_to(None);
     current.flags().remove(ProcessFlags::NEED_MIGRATE);
-    Some(dest_cpu)
+    dest_cpu
 }
 
 #[inline(never)]
 pub fn sched_init() {
     // 初始化percpu变量
     unsafe {
-        CPU_IRQ_TIME = Some(Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize));
-        CPU_IRQ_TIME
-            .as_mut()
-            .unwrap()
-            .resize_with(PerCpu::MAX_CPU_NUM as usize, || Box::leak(Box::default()));
+        let mut irq_times = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
+        for cpu in 0..PerCpu::MAX_CPU_NUM {
+            irq_times.push(Box::leak(Box::new(IrqTime::new(ProcessorId::new(cpu)))) as &'static _);
+        }
+        CPU_IRQ_TIME = Some(irq_times);
 
         let mut cpu_runqueue = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
         for cpu in 0..PerCpu::MAX_CPU_NUM as usize {
@@ -1439,11 +1724,10 @@ pub fn sched_yield() {
 
     // TODO: schedstat_inc(rq->yld_count);
 
-    match pcb.sched_info().policy() {
-        SchedPolicy::CFS => CompletelyFairScheduler::yield_task(rq),
-        SchedPolicy::FIFO => FifoScheduler::yield_task(rq),
-        SchedPolicy::RT => rq.resched_current(),
-        SchedPolicy::IDLE => {}
+    match pcb.sched_info().sched_class() {
+        SchedClass::Realtime => RealtimeScheduler::yield_task(rq),
+        SchedClass::Fair => CompletelyFairScheduler::yield_task(rq),
+        SchedClass::Idle => {}
     }
 
     let preempt_guard = PreemptGuard::new();
@@ -1456,11 +1740,38 @@ pub fn sched_yield() {
     schedule(SchedMode::SM_NONE);
 }
 
+/// Reschedule at a preemptible kernel boundary only when the scheduler has
+/// already requested it. Unlike `sched_yield()`, this does not voluntarily
+/// give up the CPU or alter scheduling-class yield state when no reschedule is
+/// pending.
+#[inline]
+pub fn cond_resched() {
+    if ProcessManager::current_pcb()
+        .flags()
+        .contains(ProcessFlags::NEED_SCHEDULE)
+    {
+        schedule(SchedMode::SM_PREEMPT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::loadavg;
     use crate::sched::CpuRunQueue;
     use crate::smp::cpu::ProcessorId;
+
+    #[test]
+    fn rq_load_snapshot_does_not_wait_for_held_runqueue_lock() {
+        let mut rq = CpuRunQueue::new(ProcessorId::new(0));
+        // Balance the global accounting before returning from this test.
+        rq.add_nr_running(2);
+        {
+            let _guard = rq.lock.lock_irqsave();
+            assert_eq!(rq.nr_running(), 2);
+        }
+        rq.sub_nr_running(2);
+        assert_eq!(rq.nr_running(), 0);
+    }
 
     #[test]
     fn rq_overload_clears_after_nr_running_drops_below_two() {
@@ -1469,16 +1780,16 @@ mod tests {
 
         rq.add_nr_running(2);
         assert!(rq.overload);
-        assert_eq!(rq.nr_running, 2);
+        assert_eq!(rq.nr_running(), 2);
 
         rq.sub_nr_running(1);
         assert!(!rq.overload);
-        assert_eq!(rq.nr_running, 1);
+        assert_eq!(rq.nr_running(), 1);
 
         assert_eq!(loadavg::nr_running(), global_before + 1);
 
         rq.sub_nr_running(1);
-        assert_eq!(rq.nr_running, 0);
+        assert_eq!(rq.nr_running(), 0);
         assert_eq!(loadavg::nr_running(), global_before);
     }
 }

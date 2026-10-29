@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Signal信号 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="内存管理文档" href="../memory_management/index.html" />
+    <link rel="prev" title="进程间通信" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">进程间通信</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Signal信号</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">1.信号处理概要</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id2">1.1 信号发送</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">1.2 信号处理</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">2. 其他问题</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">进程间通信</a></li>
+      <li class="breadcrumb-item active">Signal信号</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/34e05fe/docs/kernel/ipc/signal.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="signal">
+<h1>Signal信号<a class="headerlink" href="#signal" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>本文Maintainer: 龙进</p>
+<p>Email: <a class="reference external" href="mailto:longjin&#37;&#52;&#48;RinGoTek&#46;cn">longjin<span>&#64;</span>RinGoTek<span>&#46;</span>cn</a></p>
+</div>
+<p>  信号是一种进程间通信机制，当我们发送一个信号给特定的进程，就能触发它的特定行为（例如退出程序，或者运行一些信号处理程序）。信号是发送到进程或同一进程内的特定线程的异步通知，用于通知它有事件发生。信号的常见用途是中断、挂起、终止或终止进程。发送信号时，操作系统会中断目标进程的正常执行流程以传递信号。可以在任何非原子指令期间中断执行。如果该进程之前注册了一个信号处理程序，则执行该例程。否则，将执行默认信号处理程序。</p>
+<p>  信号类似于中断，区别在于中断由CPU调解并由内核处理，而信号在内核中产生（也可通过系统调用让内核产生）并由各个进程或内核的默认处理函数处理。</p>
+<section id="id1">
+<h2>1.信号处理概要<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<section id="id2">
+<h3>1.1 信号发送<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<p>  当进程A想发送信号给进程B的时候，使用<code class="docutils literal notranslate"><span class="pre">kill(pid,</span> <span class="pre">signal)</span></code>接口进行发送。然后陷入内核的<code class="docutils literal notranslate"><span class="pre">sys_kill()</span></code>函数中进行处理。然后内核将会把信号加入目标进程的pcb的<code class="docutils literal notranslate"><span class="pre">sigpending</span></code>中。</p>
+<p>示意图如下：</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>   ┌────────────┐
+   │ Process A: │
+   │            │
+   │  sys_kill  │
+   └──────┬─────┘
+          │
+          │
+   ┌──────▼──────┐    ┌────────────────────┐
+   │ Send Signal ├────►Add to sigpending of│
+   └─────────────┘    │   process B.       │
+                      └────────────────────┘
+</pre></div>
+</div>
+</section>
+<section id="id3">
+<h3>1.2 信号处理<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<p>  进程会在退出内核态的时候，跳转到<code class="docutils literal notranslate"><span class="pre">do_signal()</span></code>函数内，检查当前是否有需要被处理的信号，如果有的话，就会开启信号处理流程。</p>
+<p>信号处理流程示意图：</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span> ┌───────────────────────┐
+ │       Process B:      │
+ │                       ◄─────────────────────────────────┐
+ │ Return from syscall...│                                 │
+ └─────────┬─────────────┘                                 │
+           │                                               │
+           │                                               │
+           │                ┌────────────────┐             │
+     ┌─────▼─────┐ default  │                │             │
+     │ do_signal ├────────► │ stop process B.│             │
+     └─────┬─────┘  action  │                │             │
+           │                └────────────────┘             │
+           │ custom action                                 │
+    ┌──────▼───────┐                                       │
+    │ setup signal │                                       │
+    │    frame     │                                       │
+    └──────┬───────┘                                       │
+           │jump to                                        │
+    ┌──────▼───────┐ ┌────────────┐ sys_sigreturn ┌────────┴────────┐
+    │   userland   ├─►sa_restorer ├──────────────►│Restore the stack│
+    │ sig handler  │ └────────────┘               │    frame.       │
+    └──────────────┘                              └─────────────────┘
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>如果内核检查发现，进程没有指定信号处理函数，且信号处理动作不是“忽略”，那就会杀掉进程。</p></li>
+<li><p>如果内核发现该信号没有被忽略，那么将会：</p>
+<ul>
+<li><p>备份当前内核栈</p></li>
+<li><p>设置信号处理的用户态栈帧</p></li>
+<li><p>回到用户态，执行信号处理函数</p></li>
+<li><p>信号处理函数结束之后，将会进入由libc提供的__sa_restorer中，发起<code class="docutils literal notranslate"><span class="pre">sys_sigreturn()</span></code>系统调用，回到内核态</p></li>
+<li><p>内核恢复处理信号之前的内核栈。</p></li>
+<li><p>信号处理流程结束，内核继续执行“返回用户态”的过程。</p></li>
+</ul>
+</li>
+<li><p>如果内核发现当前信号被忽略，那么就检查下一个信号。</p></li>
+<li><p>发现没有任何需要处理的信号时，返回用户态。</p></li>
+</ul>
+</section>
+</section>
+<section id="id4">
+<h2>2. 其他问题<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<p>  暂无。</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="进程间通信" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../memory_management/index.html" class="btn btn-neutral float-right" title="内存管理文档" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>34e05fe</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.4
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/ipc/signal.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/ipc/signal.html">V0.1.3</a></dd>
+      <dd><a href="signal.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/ipc/signal.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/kernel/ipc/signal.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/ipc/signal.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/ipc/signal.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/ipc/signal.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/ipc/signal.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/ipc/signal.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/ipc/signal.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/ipc/signal.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -1,0 +1,69 @@
+{
+  "kernel": "bin/kernel/kernel.elf",
+  "disk": "bin/disk-image-x86_64.img",
+  "helper": "user/apps/agent_memory/agent_memory_guest",
+  "opencode": "bin/agent-runtime/opencode",
+  "node": "bin/agent-runtime/node",
+  "sdk": "bin/agent-runtime/sdk",
+  "qemu": "/usr/bin/qemu-system-x86_64",
+  "qemu_img": "/usr/bin/qemu-img",
+  "virtiofsd": "/usr/libexec/virtiofsd",
+  "max_attempts": 59,
+  "task_timeout_seconds": 180,
+  "cases": [
+    {
+      "ram_mib": 1024,
+      "vms": 1
+    },
+    {
+      "ram_mib": 1024,
+      "vms": 2
+    },
+    {
+      "ram_mib": 1024,
+      "vms": 4
+    },
+    {
+      "ram_mib": 1024,
+      "vms": 8
+    },
+    {
+      "ram_mib": 256,
+      "vms": 1
+    },
+    {
+      "ram_mib": 2048,
+      "vms": 1,
+      "restart_resume": true
+    },
+    {
+      "ram_mib": 2048,
+      "vms": 1,
+      "agent_limits_bytes": [
+        null,
+        null
+      ]
+    },
+    {
+      "ram_mib": 2048,
+      "vms": 1,
+      "agent_limits_bytes": [
+        268435456,
+        null
+      ]
+    },
+    {
+      "ram_mib": 2048,
+      "vms": 1,
+      "diagnostic": true
+    },
+    {
+      "ram_mib": 2048,
+      "vms": 2,
+      "duration_seconds": 1800,
+      "period_seconds": 100,
+      "reuse_session": true
+    }
+  ],
+  "disk_reserve_mib": 512
+}

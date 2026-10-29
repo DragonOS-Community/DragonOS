@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::filesystem::ramfs::RamFS;
-use crate::filesystem::vfs::mount::MountFlags;
+use crate::filesystem::vfs::mount::{MountFlags, MOUNT_LIFECYCLE_LOCK};
 use crate::filesystem::vfs::FilePrivateData;
 use crate::filesystem::vfs::FileSystem;
 use crate::filesystem::vfs::MountFS;
@@ -95,6 +95,15 @@ struct CpioEntryInfo {
 #[unified_init(INITCALL_ROOTFS)]
 #[inline(never)]
 pub fn initramfs_init() -> Result<(), SystemError> {
+    // The initcall ABI is a terminal bootstrap boundary, not a task-context
+    // reclaim/retry site. Keep admission errors typed throughout extraction.
+    initramfs_init_typed().map_err(|error| match error {
+        crate::mm::allocation::MemoryAllocationError::System(error) => error,
+        crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+    })
+}
+
+fn initramfs_init_typed() -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     log::info!("initramfs_init start");
 
     let ramfs = RamFS::new();
@@ -106,10 +115,16 @@ pub fn initramfs_init() -> Result<(), SystemError> {
         None,
         MountFlags::empty(),
         None,
-    );
+    )?;
     let root_inode = mount_fs.root_inode();
     unsafe {
         __INIT_ROOT_INODE = Some(root_inode.clone());
+    }
+    {
+        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
+        mount_fs
+            .activate()
+            .expect("the initramfs mount is published exactly once");
     }
 
     // Linux 中，内嵌的 initramfs 始终存在
@@ -122,7 +137,7 @@ pub fn initramfs_init() -> Result<(), SystemError> {
 
     if get_initramfs_size() == 0 {
         log::error!("Initramfs error: Not found initram, the size is 0!");
-        return Err(SystemError::ENOENT);
+        return Err(SystemError::ENOENT.into());
     }
 
     let cpio_data = xz_decompress(get_initram())?;

@@ -92,7 +92,7 @@ pub fn calc_global_load_tick(rq: &mut CpuRunQueue) {
         return;
     }
 
-    let nr_active = rq.nr_running as isize + rq.nr_uninterruptible as isize;
+    let nr_active = rq.nr_running() as isize + rq.nr_uninterruptible as isize;
     let delta = nr_active - rq.calc_load_active;
     if delta != 0 {
         CALC_LOAD_TASKS.fetch_add(delta, Ordering::SeqCst);

@@ -1,0 +1,806 @@
+use core::{
+    hint::spin_loop,
+    sync::atomic::{compiler_fence, Ordering},
+};
+
+use alloc::sync::Arc;
+use log::{error, warn};
+
+use super::ALL_PROCESS;
+use crate::{
+    arch::{
+        ipc::signal::{SigFlags, Signal},
+        CurrentIrqArch,
+    },
+    driver::tty::tty_job_control::TtyJobCtrlManager,
+    exception::InterruptArch,
+    ipc::{
+        process_signal::{NaturalParentNotifyToken, ReapTransition},
+        sem_undo::detach_sem_undo,
+        signal_types::{SigCode, SigInfo, SigType},
+    },
+    libs::futex::{
+        constant::{FutexFlag, FUTEX_BITSET_MATCH_ANY},
+        futex::{Futex, RobustListHead},
+    },
+    mm::{ucontext::AddressSpace, IDLE_PROCESS_ADDRESS_SPACE},
+    process::{
+        exit::wstatus_to_waitid_exit_info, kthread::KernelThreadMechanism,
+        namespace::user_namespace::from_kuid_munged, pid::PidType, ptrace, ProcessControlBlock,
+        ProcessManager, ProcessState, RawPid,
+    },
+    sched::{cputime::ns_to_clock_t, SchedMode, __schedule_with_current},
+    smp::core::smp_get_processor_id,
+    syscall::user_access::clear_user_protected,
+};
+
+struct ChildExitSiginfoSnapshot {
+    code: i32,
+    pid: RawPid,
+    uid: u32,
+    status: i32,
+    utime: i64,
+    stime: i64,
+}
+
+/// A reparent transaction freezes identity under the relation lock; delivery
+/// and release run after unlocking. Pending producer ownership is not duplicated.
+pub(in crate::process) struct ReparentedZombieNotification {
+    child: Arc<ProcessControlBlock>,
+    parent: Arc<ProcessControlBlock>,
+    snapshot: Option<ChildExitSiginfoSnapshot>,
+    reaped: bool,
+}
+
+impl ChildExitSiginfoSnapshot {
+    fn into_siginfo(self, signal: Signal) -> SigInfo {
+        SigInfo::new(
+            signal,
+            0,
+            SigCode::Raw(self.code),
+            SigType::SigChild {
+                pid: self.pid,
+                uid: self.uid,
+                status: self.status,
+                utime: self.utime,
+                stime: self.stime,
+            },
+        )
+    }
+}
+
+impl ProcessManager {
+    /// Notify the parent process after a child process exits.
+    #[inline(never)]
+    fn exit_notify(current: &Arc<ProcessControlBlock>) {
+        let signal_state = current.process_signal();
+        let claimed_exec_leader = signal_state.claim_group_exec_leader_exit(current);
+
+        // A claimed old leader must retain all hashed identity until the exec
+        // owner swaps it. In particular it is never autoreaped here.
+        if claimed_exec_leader {
+            let ptrace_notification = {
+                let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+                let tracer = ptrace::ptracer_of_locked(current);
+                let snapshot = tracer
+                    .as_ref()
+                    .map(|tracer| Self::child_exit_siginfo_snapshot(current, tracer));
+                current.set_exit_state_zombie();
+                tracer.map(|tracer| {
+                    (
+                        tracer,
+                        Signal::SIGCHLD as i32,
+                        snapshot.expect("ptrace tracer requires an exit siginfo snapshot"),
+                    )
+                })
+            };
+            Self::wake_pidfd_pollers_for_task_exit(current);
+            Self::notify_ptrace_parent(ptrace_notification);
+            current.mark_exit_notify_complete();
+            let completed = signal_state.complete_group_exec_leader_exit(current);
+            debug_assert!(completed);
+            return;
+        }
+
+        // Have the INIT process adopt all children.
+        if current.raw_pid() != RawPid(1) {
+            unsafe {
+                current
+                    .adopt_childen()
+                    .unwrap_or_else(|e| panic!("adopte_childen failed: error: {e:?}"))
+            };
+            ProcessManager::exit_ptrace(current);
+            let (ptrace_notification, natural_token, autoreap_nonleader) = {
+                // Keep ptrace classification stable until Zombie publication
+                // and natural-parent ownership are committed. Concurrent
+                // detach wakes the natural parent after this snapshot, so it
+                // cannot lose the transition either.
+                let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+                let tracer = ptrace::ptracer_of_locked(current);
+                // A polling tracer may reap and unhash the child as soon as
+                // Zombie becomes visible. Freeze every child-derived field
+                // before publishing Zombie; signal delivery must consume only
+                // this immutable snapshot.
+                let ptrace_snapshot = tracer
+                    .as_ref()
+                    .map(|tracer| Self::child_exit_siginfo_snapshot(current, tracer));
+                let leader = current.is_thread_group_leader();
+                let (group_empty, natural_token) = if leader {
+                    // Publish Zombie and inspect group emptiness under the same
+                    // SigHand lock used by the last-sibling remove+claim path.
+                    // Whichever side observes the group become empty therefore
+                    // owns the one natural-parent notification transaction.
+                    let (empty, token) =
+                        signal_state.try_claim_natural_parent_notify_with(current, || {
+                            current.set_exit_state_zombie();
+                            let empty = !current
+                                .threads_read_irqsave()
+                                .group_tasks
+                                .iter()
+                                .any(|task| task.upgrade().is_some());
+                            (empty, tracer.is_none() && empty)
+                        });
+                    (empty, token)
+                } else {
+                    current.set_exit_state_zombie();
+                    (false, None)
+                };
+                let autoreap_nonleader = tracer.is_none() && !leader;
+                let ptrace_notification = tracer.map(|tracer| {
+                    let natural_tracer = current
+                        .real_parent_pcb()
+                        .map(|parent| Arc::ptr_eq(&parent, &tracer))
+                        .unwrap_or(false);
+                    let signal = if leader && group_empty && natural_tracer {
+                        current.exit_signal.load(Ordering::Acquire)
+                    } else {
+                        Signal::SIGCHLD as i32
+                    };
+                    (
+                        tracer,
+                        signal,
+                        ptrace_snapshot.expect("ptrace tracer requires an exit siginfo snapshot"),
+                    )
+                });
+                (ptrace_notification, natural_token, autoreap_nonleader)
+            };
+            // Ordinary exit does not become wait-visible until adoption and
+            // ptrace teardown have stopped using the old identity. For a
+            // group-empty leader, notification Pending is claimed first so a
+            // polling parent cannot consume Zombie before the notifier owns
+            // the Done-before-wake transaction.
+            Self::wake_pidfd_pollers_for_task_exit(current);
+            Self::notify_ptrace_parent(ptrace_notification);
+
+            if autoreap_nonleader {
+                // Linux autoreaps ordinary nonleaders. release/__unhash_process
+                // completes the generation token only after identity teardown.
+                if current.try_mark_dead_from_zombie() {
+                    unsafe { ProcessManager::release(current.raw_pid()) };
+                }
+            } else if let Some(token) = natural_token {
+                Self::notify_natural_parent_owned(current, token);
+            }
+        }
+
+        current.mark_exit_notify_complete();
+        signal_state.complete_group_exec_leader_exit(current);
+    }
+
+    fn notify_ptrace_parent(
+        tracer: Option<(Arc<ProcessControlBlock>, i32, ChildExitSiginfoSnapshot)>,
+    ) {
+        if let Some((tracer, signal, snapshot)) = tracer {
+            if signal > 0 {
+                let signal = Signal::from(signal);
+                let mut info = snapshot.into_siginfo(signal);
+                if let Err(e) =
+                    signal.send_signal_info_to_pcb(Some(&mut info), tracer.clone(), PidType::TGID)
+                {
+                    warn!(
+                        "failed to send ptrace exit signal to tracer {:?}: {:?}",
+                        tracer.raw_pid(),
+                        e
+                    );
+                }
+            }
+            ProcessManager::wake_wait_parent(&tracer);
+        }
+    }
+
+    fn child_exit_siginfo_snapshot(
+        child: &Arc<ProcessControlBlock>,
+        parent: &Arc<ProcessControlBlock>,
+    ) -> ChildExitSiginfoSnapshot {
+        let raw_status = child
+            .sched_info()
+            .state()
+            .raw_wstatus()
+            .expect("natural-parent exit notification requires an exited child")
+            as i32;
+        // Preserve Linux's observable group-exit status even though DragonOS
+        // stores the last task's local do_exit() argument separately (for
+        // example, de_thread() may return EAGAIN after SIGKILL committed).
+        let raw_status = child
+            .process_signal()
+            .group_exit_code_if_set()
+            .map(|status| status as i32)
+            .unwrap_or(raw_status);
+        let (status, code) = wstatus_to_waitid_exit_info(raw_status);
+        let pid = child
+            .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+        let parent_user_ns = parent.cred().user_ns.clone();
+        let uid = from_kuid_munged(&parent_user_ns, child.cred().uid);
+        let rusage = child.exit_notification_rusage();
+        let utime = i64::try_from(ns_to_clock_t(rusage.ru_utime.to_ns())).unwrap_or(i64::MAX);
+        let stime = i64::try_from(ns_to_clock_t(rusage.ru_stime.to_ns())).unwrap_or(i64::MAX);
+
+        ChildExitSiginfoSnapshot {
+            code,
+            pid,
+            uid,
+            status,
+            utime,
+            stime,
+        }
+    }
+
+    /// Complete the unique natural-parent notification transaction. Build the
+    /// child snapshot while identity is stable, perform an optional
+    /// owner-authorized autoreap, and publish Done before signal delivery. A
+    /// SIGCHLD handler may call wait immediately, so the signal must never
+    /// expose the intermediate Pending phase.
+    pub(crate) fn notify_natural_parent_owned(
+        child: &Arc<ProcessControlBlock>,
+        token: NaturalParentNotifyToken,
+    ) {
+        let (parent, notification, autoreap) = {
+            // Select parent/disposition and claim autoreap in the same relation
+            // transaction. Reparent must not invalidate a sampled SIG_IGN.
+            let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+            let Some(parent) = child.real_parent_pcb() else {
+                child.process_signal().complete_natural_parent_notify(token);
+                return;
+            };
+            let exit_signal = child.exit_signal.load(Ordering::SeqCst);
+            let disposition = parent.sighand().handler(Signal::SIGCHLD);
+            let ignored = disposition
+                .as_ref()
+                .is_some_and(|action| action.is_ignore());
+            let no_cldwait = disposition
+                .as_ref()
+                .is_some_and(|action| action.flags().contains(SigFlags::SA_NOCLDWAIT));
+            let autoreap = exit_signal == Signal::SIGCHLD as i32 && (ignored || no_cldwait);
+            let notification = if exit_signal > 0 && !(autoreap && ignored) {
+                let signal = Signal::from(exit_signal);
+                Some((
+                    signal,
+                    Self::child_exit_siginfo_snapshot(child, &parent).into_siginfo(signal),
+                ))
+            } else {
+                None
+            };
+            if autoreap {
+                assert_eq!(
+                    child
+                        .process_signal()
+                        .try_reap_natural_child_as_notify_owner(child, &token),
+                    ReapTransition::Reaped,
+                    "natural-parent notification owner failed to autoreap"
+                );
+            }
+            (parent, notification, autoreap)
+        };
+        if autoreap {
+            unsafe {
+                Self::release(child.raw_pid());
+            }
+        }
+
+        let (completion_parent, reparented) = {
+            let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+            assert!(
+                child.process_signal().complete_natural_parent_notify(token),
+                "natural-parent notification ownership changed"
+            );
+            let completion_parent = child.real_parent_pcb();
+            let reparented = completion_parent
+                .as_ref()
+                .filter(|new_parent| !Arc::ptr_eq(new_parent, &parent))
+                .and_then(|_| Self::prepare_reparented_zombie_locked(child));
+            (completion_parent, reparented)
+        };
+
+        if let Some((signal, mut info)) = notification {
+            if let Err(e) =
+                signal.send_signal_info_to_pcb(Some(&mut info), parent.clone(), PidType::TGID)
+            {
+                warn!(
+                    "failed to send exit signal for {:?} to parent {:?}: {:?}",
+                    child.raw_pid(),
+                    parent.raw_pid(),
+                    e
+                );
+            }
+        }
+
+        ProcessManager::wake_wait_parent(&parent);
+        if let Some(completion_parent) = completion_parent {
+            if !Arc::ptr_eq(&completion_parent, &parent) {
+                ProcessManager::wake_wait_parent(&completion_parent);
+            }
+        }
+
+        if let Some(reparented) = reparented {
+            Self::finish_reparented_zombie(reparented);
+        }
+
+        if child.is_kthread() {
+            KernelThreadMechanism::notify_daemon();
+        }
+    }
+
+    /// Caller holds PTRACE_RELATION_LOCK. Pair this decision with the Pending
+    /// -> Done transition under that same lock: exactly one side owns the new
+    /// parent's notification when exit races reparenting.
+    pub(in crate::process) fn prepare_reparented_zombie_locked(
+        child: &Arc<ProcessControlBlock>,
+    ) -> Option<ReparentedZombieNotification> {
+        if !child.is_zombie()
+            || ptrace::ptracer_of_locked(child).is_some()
+            || child.process_signal().natural_reap_blocked(child)
+            || child
+                .threads_read_irqsave()
+                .group_tasks
+                .iter()
+                .any(|task| task.upgrade().is_some())
+        {
+            return None;
+        }
+        let parent = child.real_parent_pcb()?;
+        let disposition = parent.sighand().handler(Signal::SIGCHLD);
+        let ignored = disposition
+            .as_ref()
+            .is_some_and(|action| action.is_ignore());
+        let autoreap = ignored
+            || disposition
+                .as_ref()
+                .is_some_and(|action| action.flags().contains(SigFlags::SA_NOCLDWAIT));
+        let snapshot = (!ignored).then(|| Self::child_exit_siginfo_snapshot(child, &parent));
+        let reaped = autoreap
+            && child.process_signal().try_reap_natural_child(child, true) == ReapTransition::Reaped;
+        Some(ReparentedZombieNotification {
+            child: child.clone(),
+            parent,
+            snapshot,
+            reaped,
+        })
+    }
+
+    pub(in crate::process) fn finish_reparented_zombie(event: ReparentedZombieNotification) {
+        if event.reaped {
+            unsafe {
+                Self::release(event.child.raw_pid());
+            }
+        }
+        if let Some(snapshot) = event.snapshot {
+            let mut info = snapshot.into_siginfo(Signal::SIGCHLD);
+            let _ = Signal::SIGCHLD.send_signal_info_to_pcb(
+                Some(&mut info),
+                event.parent.clone(),
+                PidType::TGID,
+            );
+        }
+        Self::wake_wait_parent(&event.parent);
+    }
+
+    fn wake_pidfd_pollers_for_task_exit(task: &Arc<ProcessControlBlock>) {
+        let thread_pid = task.pid();
+        thread_pid.wake_pidfd_pollers();
+        if let Some(tgid_pid) = task.task_pid_ptr(PidType::TGID) {
+            if !Arc::ptr_eq(&thread_pid, &tgid_pid) {
+                tgid_pid.wake_pidfd_pollers();
+            }
+        }
+    }
+
+    /// Exit the current process.
+    ///
+    /// ## Parameters
+    ///
+    /// - `exit_code`: The process exit code.
+    ///
+    /// ## Note
+    /// For a normally-exiting process, the status code should be shifted left by
+    /// 8 bits so that userspace can read the exit code correctly. For a process
+    /// terminated by a signal, the status code is the signal number in the low 7
+    /// bits and does not need shifting.
+    ///
+    /// Therefore, the caller must ensure that the passed `exit_code` has already
+    /// been shifted as appropriate.
+    pub fn exit(exit_code: usize) -> ! {
+        // Check if the init process is attempting to exit; panic if so.
+        let current_pcb = ProcessManager::current_pcb();
+
+        if current_pcb.raw_pid() == RawPid(0) {
+            log::error!(
+                "Idle process (pid=0) attempted to exit with code {}. Halting current cpu.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+
+        if current_pcb.raw_pid() == RawPid(1) {
+            log::error!(
+                "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+
+        // The witness is checked before reserve access; ordinary exit and
+        // SIGKILL alone do not gain the OOM reserve. The lexical scope returns
+        // before the terminal switch, which will not run this stack's drops.
+        let oom_victim = crate::mm::oom::current_is_oom_victim();
+        let raw_pid = current_pcb.raw_pid();
+        let cleanup = || {
+            // Linux fires trace_sched_process_exit(tsk) early in do_exit() for
+            // every exiting task; BPF consumers filter main threads themselves.
+            // basic() disables IRQs and preemption. Release it before callbacks
+            // run, since BPF user-memory reads may need to resolve a page fault.
+            let mut comm = [0u8; 16];
+            {
+                let basic = current_pcb.basic();
+                let name = basic.name().as_bytes();
+                let len = name.len().min(comm.len() - 1);
+                comm[..len].copy_from_slice(&name[..len]);
+            }
+            crate::process::trace::trace_sched_process_exit(
+                &comm,
+                current_pcb.raw_pid().data() as i32,
+                current_pcb.sched_info().prio(),
+            );
+
+            current_pcb.ptrace_event(ptrace::PtraceEvent::Exit, exit_code);
+
+            // Exit will not return to the old user context; release ActiveXol's strong
+            // references to site/slot/consumer before entering mm teardown. This cleanup does
+            // not need to — and should not — modify the trapframe.
+            #[cfg(target_arch = "x86_64")]
+            crate::exception::uprobe::cleanup_task_active_xol(&current_pcb);
+
+            let _final_irq_guard;
+            // log::debug!("[exit: {}]", raw_pid.data());
+            {
+                let pcb = current_pcb.clone();
+                let (group_leader, group_dead, namespace_shutdown) = {
+                    let _membership_guard = crate::process::pid::pid_membership_lock();
+                    pcb.mark_exiting();
+                    let thread = pcb.threads_read_irqsave();
+                    let group_leader = thread.group_leader().unwrap_or_else(|| pcb.clone());
+                    let live = thread.thread_group_live.clone();
+                    drop(thread);
+                    // Match Linux signal_struct::live: every successfully
+                    // published thread contributes once and consumes its token on
+                    // first entering do_exit(). The unique 1 -> 0 transition owns
+                    // thread-group finalization without scanning group_tasks.
+                    let previous = live.fetch_sub(1, Ordering::AcqRel);
+                    assert_ne!(previous, 0, "thread-group live count underflow");
+                    let group_dead = previous == 1;
+                    let namespace_shutdown = pcb.prepare_pid_namespace_exit(group_dead);
+                    (group_leader, group_dead, namespace_shutdown)
+                };
+                ptrace::settle_exiting_group_stop(&pcb);
+                // Match Linux perf_event_exit_task(): terminal task events must be
+                // detached while the old mm and its original instruction bytes
+                // are still available. The perf fd retains its final count.
+                #[cfg(target_arch = "x86_64")]
+                crate::mm::ucontext::uprobe::uprobe_registry_task_exit(&pcb);
+                pcb.wait_queue.mark_dead();
+
+                // Perform post-exit work for the process.
+                Self::release_task_futex_state(&pcb);
+                compiler_fence(Ordering::SeqCst);
+
+                detach_sem_undo(&pcb);
+                // If this process was created via vfork, complete the completion.
+                let vfork_done = pcb.thread.write_irqsave().vfork_done.take();
+                if let Some(vd) = vfork_done {
+                    vd.complete_all();
+                }
+
+                // Linux exit_mm() happens before exit_files(): after clear_child_tid
+                // and robust-list cleanup have consumed user memory, the exiting task
+                // must stop exposing a user-visible mm even if file close blocks.
+                //
+                // The CPU-visible active mm is switched to idle here and tracked by
+                // per-CPU TlbState. The PCB-visible user_vm becomes None, matching
+                // Linux task->mm == NULL after exit_mm().
+                let old_user_vm = pcb.with_task_lock_irqsave(|| {
+                    let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
+                    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                    let cpu = smp_get_processor_id();
+                    let mut basic = pcb.basic_mut();
+                    let old_vm = unsafe { basic.replace_user_vm(None) };
+                    idle_vm.active_cpus_set(cpu);
+                    unsafe { idle_vm.make_current() };
+                    if let Some(old_vm) = old_vm.as_ref() {
+                        old_vm.active_cpus_clear(cpu);
+                    }
+                    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
+                    drop(basic);
+                    drop(irq_guard);
+                    old_vm
+                });
+                if let Some(old_vm) = old_user_vm.as_ref() {
+                    // live-- precedes faultable exit cleanup, so every exiting
+                    // task preserves the peak, not just the last entrant.
+                    group_leader.preserve_maxrss(old_vm);
+                    old_vm.replace_departing_memory_owner(&pcb);
+                }
+                Self::release_old_user_vm_if_last(old_user_vm.as_ref());
+                drop(old_user_vm);
+                // Shared-MM non-last users do not enter unmap_all; their core
+                // participation is complete before ordinary file-close callbacks.
+                #[cfg(feature = "mm_selftest")]
+                crate::mm::oom::denial::end_victim_core_retirement();
+
+                pcb.exit_files();
+                // Linux exit_fs() follows exit_files(). A zombie must not keep
+                // cwd/root path references alive, otherwise an already-reaped
+                // chrooted child can make an unrelated umount report EBUSY.
+                pcb.exit_fs();
+                pcb.exit_timers(group_dead);
+
+                if let Some(namespace) = namespace_shutdown {
+                    // Detach this init's tracees before waiting for them. This
+                    // still runs with a schedulable task and interrupts enabled.
+                    Self::exit_ptrace(&pcb);
+                    namespace.shutdown(&pcb);
+                }
+
+                // Linux releases task namespaces before publishing Zombie, not
+                // when the parent eventually reaps the PCB. In particular, a
+                // dead container init must not pin its netns and veth peers.
+                pcb.exit_task_namespaces();
+
+                if group_dead {
+                    let (current_tty, is_session_leader, sid) = {
+                        let siginfo = group_leader.sig_info_irqsave();
+                        (siginfo.tty(), siginfo.is_session_leader, pcb.task_session())
+                    };
+                    if let Some(tty) = current_tty {
+                        if is_session_leader {
+                            let tty_pgrp = sid.as_ref().and_then(|sid| {
+                                TtyJobCtrlManager::remove_session_tty_if_owner(&tty, sid)
+                            });
+                            if let Some(pgrp) = tty_pgrp {
+                                let _ =
+                                    crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+                            }
+                        } else {
+                            group_leader.sig_info_mut().set_tty(None);
+                        }
+                    } else {
+                        group_leader.sig_info_mut().set_tty(None);
+                    }
+                }
+
+                // Linux semantics: a zombie must not appear in cgroup.procs.
+                // Hold cgroup_accounting_lock to avoid deadlock with cgroup.procs writes.
+                {
+                    let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                    crate::cgroup::freezer::exit(&pcb);
+                }
+                if pcb.is_kthread() {
+                    let exited_completion = {
+                        let worker_private = pcb.worker_private();
+                        worker_private
+                            .as_ref()
+                            .and_then(|x| x.kernel_thread())
+                            .map(|x| x.exited_completion())
+                    };
+                    if let Some(exited_completion) = exited_completion {
+                        exited_completion.complete_all();
+                    }
+                }
+
+                // Align with Linux do_task_dead(): do not manually deactivate_task
+                // here. The task remains on the rq; later __schedule() will detect
+                // the Exited state and perform the single deactivate_task, avoiding
+                // a double dequeue that would underflow nr_running.
+
+                _final_irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                // Set the scheduling state to Exited before calling exit_notify at the
+                // very end.
+                // Mirrors Linux do_task_dead()'s set_special_state(TASK_DEAD):
+                // complete the state write under pi_lock protection, serializing with
+                // concurrent wakeups also protected by pi_lock in wakeup().
+                {
+                    let _pi_guard = pcb.sched_info.pi_lock_irqsave();
+                    pcb.sched_info.set_state(ProcessState::Exited(exit_code));
+                }
+                ProcessManager::exit_notify(&pcb);
+            }
+            _final_irq_guard
+        };
+        let _final_irq_guard = if oom_victim {
+            crate::mm::allocator::reserve::with_oom_exit_reserve(cleanup)
+        } else {
+            cleanup()
+        };
+
+        // The terminal switch never returns to run this stack's destructors.
+        // Retain only the running-task owner, released by the new stack's tail.
+        __schedule_with_current(SchedMode::SM_NONE, current_pcb);
+        error!("raw_pid {raw_pid:?} exited but sched again!");
+        #[allow(clippy::empty_loop)]
+        loop {
+            spin_loop();
+        }
+    }
+
+    /// Exit the entire thread group (mirroring Linux do_group_exit semantics).
+    ///
+    /// - `exit_code`:
+    ///   - For sys_exit_group: should already be shifted left by 8 bits (wstatus
+    ///     encoding).
+    ///   - For fatal signals: the low 7 bits hold the signal number; no shift is
+    ///     needed.
+    pub fn group_exit(exit_code: usize) -> ! {
+        let final_exit_code: usize;
+
+        // Use a closure to ensure all pointers held here are dropped.
+        {
+            // Check if this is the init process.
+            let current_pcb = ProcessManager::current_pcb();
+
+            if current_pcb.raw_pid() == RawPid(1) {
+                log::error!(
+                "Init process (pid=1) attempted to group_exit with code {}. This should not happen and indicates a serious system error.",
+                exit_code
+            );
+                loop {
+                    spin_loop();
+                }
+            }
+
+            // 1. Atomically set the GROUP_EXIT flag and group_exit_code on the
+            //    shared signal_state. If another thread has already set it, reuse
+            //    the existing exit code.
+            let signal_state = current_pcb.process_signal();
+            let (code, started) = signal_state.start_group_exit(exit_code);
+            final_exit_code = code;
+            // Linux only zaps on the first GROUP_EXIT transition. OOM/fatal
+            // signal commit has already broadcast; later exiting threads must
+            // not allocate another snapshot or repeat an O(n) broadcast each.
+            if started {
+                Signal::zap_other_threads(&current_pcb);
+            }
+
+            drop(current_pcb);
+        }
+        // 3. The current thread proceeds with the normal exit flow using the
+        //    unified exit code.
+
+        ProcessManager::exit(final_exit_code);
+    }
+
+    /// Remove a process from the global process list and from the parent's
+    /// children list.
+    ///
+    /// # Parameters
+    ///
+    /// - `pid`: The **global** pid of the process.
+    ///
+    /// # Note
+    ///
+    /// The caller **must not hold** the parent's children lock before calling
+    /// this function, otherwise a deadlock will occur.
+    pub(crate) unsafe fn release(pid: RawPid) {
+        let pcb = ProcessManager::find(pid);
+        if let Some(ref pcb) = pcb {
+            debug_assert!(
+                pcb.sem_undo_group().is_none(),
+                "SEM_UNDO attachment must be detached before ProcessManager::release"
+            );
+            ProcessManager::exit_ptrace(pcb);
+            ProcessManager::ptrace_unlink_tracee(pcb);
+
+            {
+                // Pair parent discovery with children-index removal under the
+                // same tasklist-like transaction used by reparent/de_thread.
+                // Otherwise a concurrent identity handoff can move the list
+                // entry after this release selected the former parent.
+                let _relation_guard = crate::process::PTRACE_RELATION_LOCK.lock_irqsave();
+                let parent_child_vpid = pcb.real_parent_pcb().and_then(|parent| {
+                    // A concurrently exiting parent may already have unhashed
+                    // its PID before this nonleader is autoreaped. Its children
+                    // list has then been consumed by the adoption transaction,
+                    // so no attached namespace/list entry remains to clean.
+                    let parent_ns = parent
+                        .task_pid_ptr(PidType::PID)
+                        .and_then(|pid| pid.try_ns_of_pid())?;
+                    pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns))
+                        .map(|vpid| (parent, vpid))
+                });
+
+                if let Some((parent, vpid)) = parent_child_vpid {
+                    let mut children = parent.children.write();
+                    children.retain(|&p| p != vpid);
+                }
+            }
+
+            // Revoke the old PCB's global numeric lookup before __exit_signal()
+            // can detach the final PID link and return that number to the
+            // allocator. Otherwise a concurrent fork may publish a new task at
+            // the same key and this release would delete the new task instead.
+            ALL_PROCESS.lock_irqsave().as_mut().unwrap().remove(&pid);
+
+            pcb.__exit_signal();
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().uncharge_pids(1);
+            }
+        }
+    }
+
+    pub fn ptrace_unlink_tracee(tracee: &Arc<ProcessControlBlock>) {
+        ptrace::unlink_tracee(tracee)
+    }
+
+    pub fn exit_ptrace(tracer: &Arc<ProcessControlBlock>) {
+        ptrace::exit_ptrace(tracer)
+    }
+
+    /// Wake waiters that can observe child state changes through `parent`.
+    ///
+    /// Match Linux's shared signal->wait_chldexit. A single thread's exit or
+    /// an exec leader exchange must not retire another member's child wait.
+    pub(crate) fn wake_wait_parent(parent: &Arc<ProcessControlBlock>) {
+        parent.process_signal().child_wait_queue().wake_all();
+    }
+
+    /// Release the current task's user futex registrations on exit or exec.
+    ///
+    /// The caller must keep the old mm installed in both the PCB and the CPU,
+    /// and retain its user reference until this returns. Like Linux's
+    /// exit_mm_release/exec_mm_release, robust cleanup precedes clear_child_tid.
+    pub(crate) fn release_task_futex_state(pcb: &Arc<ProcessControlBlock>) {
+        crate::libs::futex::pi_futex::begin_task_cleanup(pcb);
+        RobustListHead::cleanup_robust_list(pcb);
+        crate::libs::futex::pi_futex::finish_task_cleanup(pcb);
+
+        // Consume the registration even when no user access is needed. In
+        // particular, an exec must not carry this address into the new mm.
+        let clear_child_tid = pcb.thread.write_irqsave().clear_child_tid.take();
+        let Some(addr) = clear_child_tid.filter(|addr| !addr.is_null()) else {
+            return;
+        };
+        let Some(vm) = pcb.basic().user_vm() else {
+            return;
+        };
+        if vm.user_count() <= 1 {
+            return;
+        }
+
+        // No PCB locks are held across faultable user access or futex wake.
+        // Linux ignores put_user failure and still attempts the shared wake:
+        // a read-only mapping can retain a valid futex key and waiting tasks.
+        let _ = unsafe { clear_user_protected(addr, core::mem::size_of::<i32>()) };
+        let _ = Futex::futex_wake(addr, FutexFlag::FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY);
+    }
+
+    /// Release the old user address space: if no task still uses it, tear down all mappings
+    pub(crate) fn release_old_user_vm_if_last(old_vm: Option<&Arc<AddressSpace>>) {
+        let Some(old_vm) = old_vm else {
+            return;
+        };
+        old_vm.mmput();
+    }
+}

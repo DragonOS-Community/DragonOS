@@ -1,10 +1,14 @@
 //! System call handler for sys_umount.
 
+use super::sys_mount::may_mount;
+
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_UMOUNT2},
     filesystem::vfs::{
-        fcntl::AtFlags, utils::user_path_at, FileSystem, IndexNode, MountFS, MAX_PATHLEN,
-        VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        fcntl::AtFlags,
+        mount::{is_mountpoint_root, MountFSInode},
+        utils::user_path_at,
+        FileSystem, MountFS, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     libs::casting::DowncastArc,
     process::ProcessManager,
@@ -13,11 +17,8 @@ use crate::{
         user_access,
     },
 };
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
+use core::any::Any;
 use system_error::SystemError;
 
 /// src/linux/mount.c `umount` & `umount2`
@@ -73,7 +74,7 @@ syscall_table_macros::declare_syscall!(SYS_UMOUNT2, SysUmount2Handle);
 ///
 /// - dirfd: i32 - 目录文件描述符，用于指定要卸载的文件系统的根目录。
 /// - target: &str - 要卸载的文件系统的目标路径。
-/// - _flag: UmountFlag - 卸载标志，目前未使用。
+/// - flag: UmountFlag - 卸载模式；`MNT_DETACH` 执行 lazy detach。
 ///
 /// ## 返回值
 ///
@@ -83,74 +84,68 @@ syscall_table_macros::declare_syscall!(SYS_UMOUNT2, SysUmount2Handle);
 /// ## 错误处理
 ///
 /// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
-pub fn do_umount2(
-    dirfd: i32,
-    target: &str,
-    _flag: UmountFlag,
-) -> Result<Arc<MountFS>, SystemError> {
+pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<MountFS>, SystemError> {
     let target = target.trim();
     if target.is_empty() {
         return Err(SystemError::ENOENT);
     }
 
+    if flag.contains(UmountFlag::MNT_EXPIRE)
+        && flag.intersects(UmountFlag::MNT_FORCE | UmountFlag::MNT_DETACH)
+    {
+        return Err(SystemError::EINVAL);
+    }
+    if flag.intersects(UmountFlag::MNT_EXPIRE | UmountFlag::MNT_FORCE) {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
     let (work, rest) = user_path_at(&ProcessManager::current_pcb(), dirfd, target)?;
-    let target_inode = work.lookup_follow_symlink(&rest, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    let path = visible_umount_path(&target_inode)?;
+    let target_inode = crate::filesystem::vfs::file::File::recover_io(|| {
+        work.lookup_follow_symlink2(
+            &rest,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            !flag.contains(UmountFlag::UMOUNT_NOFOLLOW),
+        )
+    })?;
+    // Linux LOOKUP_MOUNTPOINT follows mounts on the final resolved path,
+    // including a retained cwd selected by ".". Ordinary pathname lookup
+    // deliberately preserves that cursor. Do not require a directory here:
+    // bind-mounted files are valid unmount targets too.
+    let target_inode =
+        if let Some(mounted) = (target_inode.as_ref() as &dyn Any).downcast_ref::<MountFSInode>() {
+            mounted.follow_component_mounts(false, false)?
+        } else {
+            target_inode
+        };
+    if !may_mount() {
+        return Err(SystemError::EPERM);
+    }
 
     let current_mntns = ProcessManager::current_mntns();
-    let Some(fs) = current_mntns.mount_list().get(path.as_str()) else {
-        log::warn!("do_umount2: mount_list miss for resolved='{}'", path);
+    if !is_mountpoint_root(&target_inode) {
         return Err(SystemError::EINVAL);
-    };
-    if !fs.is_belongs_to_mntns(&current_mntns) {
+    }
+    let fs = target_inode
+        .fs()
+        .downcast_arc::<MountFS>()
+        .ok_or(SystemError::EINVAL)?;
+    if fs.self_mountpoint().is_none() || !fs.is_belongs_to_mntns(&current_mntns) {
         return Err(SystemError::EINVAL);
     }
 
-    // 检查通过后再实际移除
-    let Some(fs) = current_mntns.remove_mount(&path) else {
-        log::warn!("do_umount2: mount_list race for resolved='{}'", path);
-        return Err(SystemError::EINVAL);
-    };
-    if let Err(err) = fs.umount() {
+    // The target lookup above is not an external mount pin. This is deliberate:
+    // Linux discounts the syscall's own path reference from the busy check.
+    // File/path owners acquire explicit MountExternalGuard values instead.
+    let lazy = flag.contains(UmountFlag::MNT_DETACH);
+    if let Err(err) = MountFS::umount_subtree_with_mode(&fs, lazy) {
         log::warn!(
-            "do_umount2: fs.umount failed for resolved='{}', fs='{}': {:?}",
-            path,
+            "do_umount2: fs.umount failed for fs='{}': {:?}",
             fs.name(),
             err
         );
         return Err(err);
     }
     Ok(fs)
-}
-
-fn visible_umount_path(target_inode: &Arc<dyn IndexNode>) -> Result<String, SystemError> {
-    let absolute_path = target_inode.absolute_path()?;
-    let Some(target_mfs) = target_inode.fs().downcast_arc::<MountFS>() else {
-        return Ok(absolute_path);
-    };
-
-    let mount_root = target_mfs.root_inode();
-    if same_path_ref(target_inode, &mount_root) {
-        if let Some(mount_path) = ProcessManager::current_mntns()
-            .mount_list()
-            .get_mount_path_by_mountfs(&target_mfs)
-        {
-            return Ok(mount_path.as_str().to_string());
-        }
-    }
-
-    Ok(absolute_path)
-}
-
-fn same_path_ref(left: &Arc<dyn IndexNode>, right: &Arc<dyn IndexNode>) -> bool {
-    let Ok(left_meta) = left.metadata() else {
-        return false;
-    };
-    let Ok(right_meta) = right.metadata() else {
-        return false;
-    };
-
-    Arc::ptr_eq(&left.fs(), &right.fs()) && left_meta.inode_id == right_meta.inode_id
 }
 
 bitflags! {

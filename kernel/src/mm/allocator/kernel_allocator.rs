@@ -3,7 +3,6 @@ use klog_types::{AllocLogItem, LogSource};
 use crate::{
     arch::mm::LockedFrameAllocator,
     debug::klog::mm::mm_debug_log,
-    libs::align::page_align_up,
     mm::{MMArch, MemoryManagementArch, VirtAddr},
 };
 
@@ -11,12 +10,16 @@ use core::{
     alloc::{AllocError, GlobalAlloc, Layout},
     intrinsics::unlikely,
     ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::{
+    footprint::uses_buddy as allocator_select_condition,
     page_frame::{FrameAllocator, PageFrameCount},
-    slab::SLABALLOCATOR,
+    slab::{self, SLABALLOCATOR},
 };
+
+pub(crate) use super::footprint::{allocation_footprint, uses_buddy as allocation_uses_buddy};
 
 /// 类kmalloc的分配器应当实现的trait
 pub trait LocalAlloc {
@@ -28,34 +31,148 @@ pub trait LocalAlloc {
 
 pub struct KernelAllocator;
 
-impl KernelAllocator {
-    unsafe fn alloc_in_buddy(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        // 计算需要申请的页数，向上取整
-        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
-        let page_frame_count = PageFrameCount::new(count);
-        let (phy_addr, allocated_frame_count) = LockedFrameAllocator
-            .allocate(page_frame_count)
-            .ok_or(AllocError)?;
+/// Bytes currently owned by kernel heap allocations that bypass the size-class
+/// allocator and are backed directly by buddy pages.
+static LARGE_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
 
-        let virt_addr = unsafe { MMArch::phys_2_virt(phy_addr).ok_or(AllocError)? };
-        if unlikely(virt_addr.is_null()) {
+#[inline]
+fn buddy_frame_count(layout: Layout) -> PageFrameCount {
+    let count = super::footprint::buddy_frame_count(layout);
+    PageFrameCount::new(count)
+}
+
+#[inline]
+fn debit_large_allocation(bytes: u64) {
+    LARGE_ALLOCATION_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(bytes)
+        })
+        .expect("large kernel allocation accounting underflow");
+}
+
+pub(super) fn large_allocation_bytes() -> u64 {
+    LARGE_ALLOCATION_BYTES.load(Ordering::Relaxed)
+}
+
+impl KernelAllocator {
+    unsafe fn alloc_in_buddy(
+        &self,
+        layout: Layout,
+        no_retry: bool,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let page_frame_count = buddy_frame_count(layout);
+        let allocation = if no_retry {
+            LockedFrameAllocator
+                .allocate_below(page_frame_count, crate::mm::PhysAddr::new(usize::MAX))
+        } else {
+            LockedFrameAllocator.allocate(page_frame_count)
+        };
+        let (phy_addr, allocated_frame_count) = allocation.ok_or(AllocError)?;
+        if allocated_frame_count != page_frame_count {
+            LockedFrameAllocator.free(phy_addr, allocated_frame_count);
+            return Err(AllocError);
+        }
+        debug_assert_eq!(allocated_frame_count, page_frame_count);
+
+        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(phy_addr) }) else {
+            LockedFrameAllocator.free(phy_addr, allocated_frame_count);
+            return Err(AllocError);
+        };
+        if unlikely(virt_addr.is_null()) || !virt_addr.data().is_multiple_of(layout.align()) {
+            LockedFrameAllocator.free(phy_addr, allocated_frame_count);
             return Err(AllocError);
         }
 
+        let allocated_bytes = allocated_frame_count.bytes();
         let slice = unsafe {
-            core::slice::from_raw_parts_mut(
-                virt_addr.data() as *mut u8,
-                allocated_frame_count.data() * MMArch::PAGE_SIZE,
-            )
+            core::slice::from_raw_parts_mut(virt_addr.data() as *mut u8, allocated_bytes)
         };
+        LARGE_ALLOCATION_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(allocated_bytes as u64)
+            })
+            .expect("large kernel allocation accounting overflow");
         return Ok(NonNull::from(slice));
     }
 
-    pub(super) unsafe fn free_in_buddy(&self, ptr: *mut u8, layout: Layout) {
-        // 由于buddy分配的页数量是2的幂，因此释放的时候也需要按照2的幂向上取整。
-        let count = (page_align_up(layout.size()) / MMArch::PAGE_SIZE).next_power_of_two();
-        let page_frame_count = PageFrameCount::new(count);
+    /// Allocate direct-mapped physical storage, without entering GlobalAlloc.
+    /// `no_retry` constrains this to one buddy admission and pressure notification;
+    /// slab refill follows the same policy and never allocates through GlobalAlloc.
+    pub(crate) unsafe fn alloc_physical(
+        &self,
+        layout: Layout,
+        zeroed: bool,
+        no_retry: bool,
+    ) -> *mut u8 {
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+        let pointer = if allocator_select_condition(layout) {
+            self.alloc_in_buddy(layout, no_retry)
+                .map(|allocation| allocation.as_mut_ptr())
+                .unwrap_or_default()
+        } else {
+            slab::allocate(layout, no_retry)
+        };
+        if zeroed && !pointer.is_null() {
+            core::ptr::write_bytes(pointer, 0, layout.size());
+        }
+        pointer
+    }
+
+    /// Nonrecursive, zeroed metadata storage. Its exact Layout remains compatible
+    /// with the direct branch of GlobalAlloc when reconstructed as a Box.
+    pub(crate) unsafe fn alloc_metadata(&self, layout: Layout) -> *mut u8 {
+        self.alloc_physical(layout, true, true)
+    }
+
+    pub(crate) unsafe fn alloc_buffer_zeroed(&self, layout: Layout) -> *mut u8 {
+        self.alloc_physical(layout, true, true)
+    }
+
+    unsafe fn alloc_global(&self, layout: Layout) -> *mut u8 {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        if super::heap::HeapPlan::preferred(layout) == super::heap::HeapPlan::Virtual {
+            let pointer = crate::mm::vmalloc::try_global_alloc(layout);
+            if !pointer.is_null() {
+                return pointer;
+            }
+        }
+        // No reclaim, task-local account lookup, or recursive GlobalAlloc here.
+        // A constrained caller and a failed virtual attempt get one direct try.
+        let pointer = self.alloc_physical(layout, true, true);
+        alloc_debug_log(
+            if allocator_select_condition(layout) {
+                LogSource::Buddy
+            } else {
+                LogSource::Slab
+            },
+            layout,
+            pointer,
+        );
+        pointer
+    }
+
+    /// Transfers a direct buddy allocation into the size-class slab domain.
+    /// The backing pages remain allocated; only their accounting owner changes.
+    pub(super) fn transfer_large_allocation_to_slab(&self, layout: Layout) {
+        debug_assert!(allocator_select_condition(layout));
+        debit_large_allocation(buddy_frame_count(layout).bytes() as u64);
+    }
+
+    /// Frees buddy pages whose accounting is owned by another allocator.
+    pub(super) unsafe fn free_buddy_raw(&self, ptr: *mut u8, layout: Layout) {
+        let page_frame_count = buddy_frame_count(layout);
         let phy_addr = MMArch::virt_2_phys(VirtAddr::new(ptr as usize)).unwrap();
+        LockedFrameAllocator.free(phy_addr, page_frame_count);
+    }
+
+    unsafe fn dealloc_large(&self, ptr: *mut u8, layout: Layout) {
+        let page_frame_count = buddy_frame_count(layout);
+        // Validate the address before changing accounting. A failed conversion
+        // must not leave a live allocation unaccounted.
+        let phy_addr = MMArch::virt_2_phys(VirtAddr::new(ptr as usize)).unwrap();
+        debit_large_allocation(page_frame_count.bytes() as u64);
         LockedFrameAllocator.free(phy_addr, page_frame_count);
     }
 }
@@ -63,47 +180,16 @@ impl KernelAllocator {
 /// 为内核分配器实现LocalAlloc的trait
 impl LocalAlloc for KernelAllocator {
     unsafe fn local_alloc(&self, layout: Layout) -> *mut u8 {
-        if allocator_select_condition(layout) {
-            return self
-                .alloc_in_buddy(layout)
-                .map(|x| x.as_mut_ptr())
-                .unwrap_or_default();
-        } else {
-            let mut guard = SLABALLOCATOR.lock_irqsave();
-            if let Some(ref mut slab) = *guard {
-                return slab.allocate(layout);
-            }
-            return core::ptr::null_mut();
-        }
+        self.alloc_physical(layout, false, false)
     }
 
     unsafe fn local_alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if allocator_select_condition(layout) {
-            return self
-                .alloc_in_buddy(layout)
-                .map(|x| {
-                    let ptr: *mut u8 = x.as_mut_ptr();
-                    core::ptr::write_bytes(ptr, 0, x.len());
-                    ptr
-                })
-                .unwrap_or_default();
-        } else {
-            let mut guard = SLABALLOCATOR.lock_irqsave();
-            if let Some(ref mut slab) = *guard {
-                let ptr = slab.allocate(layout);
-                drop(guard);
-                if !ptr.is_null() {
-                    core::ptr::write_bytes(ptr, 0, layout.size());
-                }
-                return ptr;
-            }
-            return core::ptr::null_mut();
-        }
+        self.alloc_physical(layout, true, false)
     }
 
     unsafe fn local_dealloc(&self, ptr: *mut u8, layout: Layout) {
         if allocator_select_condition(layout) {
-            self.free_in_buddy(ptr, layout)
+            self.dealloc_large(ptr, layout)
         } else {
             let mut guard = SLABALLOCATOR.lock_irqsave();
             if let Some(ref mut slab) = *guard {
@@ -116,38 +202,36 @@ impl LocalAlloc for KernelAllocator {
 /// 为内核slab分配器实现GlobalAlloc特性
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let r = self.local_alloc_zeroed(layout);
-        if allocator_select_condition(layout) {
-            alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
-        } else {
-            alloc_debug_log(klog_types::LogSource::Slab, layout, r);
+        #[cfg(feature = "mm_selftest")]
+        if crate::mm::oom::denial::is_current_denied() {
+            crate::mm::oom::denial::note_rejection();
+            return core::ptr::null_mut();
         }
-        return r;
+        self.alloc_global(layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let r = self.local_alloc_zeroed(layout);
-        if allocator_select_condition(layout) {
-            alloc_debug_log(klog_types::LogSource::Buddy, layout, r);
-        } else {
-            alloc_debug_log(klog_types::LogSource::Slab, layout, r);
+        #[cfg(feature = "mm_selftest")]
+        if crate::mm::oom::denial::is_current_denied() {
+            crate::mm::oom::denial::note_rejection();
+            return core::ptr::null_mut();
         }
-        return r;
+        self.alloc_global(layout)
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if allocator_select_condition(layout) || (ptr as usize).is_multiple_of(4096) {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        if crate::mm::vmalloc::contains(VirtAddr::new(ptr as usize)) {
+            crate::mm::vmalloc::global_dealloc(ptr);
+            return;
+        }
+        if allocator_select_condition(layout) {
             dealloc_debug_log(klog_types::LogSource::Buddy, layout, ptr);
         } else {
             dealloc_debug_log(klog_types::LogSource::Slab, layout, ptr);
         }
         self.local_dealloc(ptr, layout);
     }
-}
-
-/// 判断选择buddy分配器还是slab分配器
-fn allocator_select_condition(layout: Layout) -> bool {
-    layout.size() > 2048
 }
 
 fn alloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
@@ -164,36 +248,9 @@ fn dealloc_debug_log(source: LogSource, layout: Layout, ptr: *mut u8) {
     )
 }
 
-// 为内核slab分配器实现Allocator特性
-// unsafe impl Allocator for KernelAllocator {
-//     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-//         let memory = unsafe {self.local_alloc(layout)};
-//         if memory.is_null() {
-//             Err(AllocError)
-//         } else {
-//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
-//             Ok(unsafe { NonNull::new_unchecked(slice) })
-//         }
-//     }
-
-//     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-//         let memory = unsafe {self.local_alloc_zeroed(layout)};
-//         if memory.is_null() {
-//             Err(AllocError)
-//         } else {
-//             let slice = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
-//             Ok(unsafe { NonNull::new_unchecked(slice) })
-//         }
-//     }
-
-//     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-//         self.local_dealloc(ptr.cast().as_ptr(), layout);
-//     }
-// }
-
 /// 内存分配错误处理函数
 #[cfg(target_os = "none")]
 #[alloc_error_handler]
 pub fn global_alloc_err_handler(layout: Layout) -> ! {
-    panic!("global_alloc_error, layout: {:?}", layout);
+    crate::debug::fatal::allocation_failure(layout)
 }

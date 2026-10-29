@@ -1,0 +1,91 @@
+#include <gtest/gtest.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <string>
+
+namespace {
+
+constexpr const char* kSelftestPath = "/sys/kernel/debug/mm/kernel_buffer_selftest";
+
+class KernelBufferSelftest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        struct stat info = {};
+        if (stat(kSelftestPath, &info) < 0) {
+            const int error = errno;
+            if (error == ENOENT) {
+                GTEST_SKIP() << "build the kernel with KERNEL_FEATURES=mm_selftest";
+            }
+            FAIL() << "stat(" << kSelftestPath << "): " << strerror(error);
+        }
+    }
+};
+
+bool ReadReport(int fd, size_t chunk_size, std::string* report) {
+    report->clear();
+    char buffer[256];
+    for (;;) {
+        const ssize_t count = read(fd, buffer, std::min(chunk_size, sizeof(buffer)));
+        if (count == 0) {
+            return true;
+        }
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        report->append(buffer, static_cast<size_t>(count));
+    }
+}
+
+}  // namespace
+
+TEST_F(KernelBufferSelftest, ChecksPassAndSnapshotIsStableAcrossPartialReads) {
+    // Reopening exercises complete allocation/release transactions repeatedly.
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        const int fd = open(kSelftestPath, O_RDONLY | O_CLOEXEC);
+        ASSERT_GE(fd, 0) << strerror(errno);
+        std::string partial;
+        const bool partial_ok = ReadReport(fd, 7, &partial);
+        const off_t rewind = lseek(fd, 0, SEEK_SET);
+        std::string complete;
+        const bool complete_ok = rewind == 0 && ReadReport(fd, 256, &complete);
+        const int closed = close(fd);
+        ASSERT_TRUE(partial_ok) << strerror(errno);
+        ASSERT_EQ(0, rewind) << strerror(errno);
+        ASSERT_TRUE(complete_ok) << strerror(errno);
+        EXPECT_EQ(0, closed) << strerror(errno);
+        EXPECT_EQ(partial, complete);
+        EXPECT_NE(std::string::npos, complete.find("status=ok\n")) << complete;
+        EXPECT_NE(std::string::npos, complete.find("summary_fail=0\n")) << complete;
+        for (const char* check : {"paged_header_storage=ok\n",
+                                  "strategy_zero_data_accounting=ok\n",
+                                  "failure_fallback_admission=ok\n",
+                                  "unsupported_virtual_heap=ok\n",
+                                  "context_size_rejection=ok\n",
+                                  "fragmented_arena_buffer=ok\n",
+                                  "typed_values_accounting=ok\n",
+                                  "typed_alignment_limits=ok\n",
+                                  "typed_failure_rollback=ok\n",
+                                  "typed_fragmented_arena=ok\n",
+                                  "cpu_buffer_deferred_retirement=ok\n",
+                                  "loopback_buffer_admission=ok\n",
+                                  "veth_buffer_admission=ok\n",
+                                  "local_input_resident_capacity=ok\n"}) {
+            EXPECT_NE(std::string::npos, complete.find(check)) << complete;
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

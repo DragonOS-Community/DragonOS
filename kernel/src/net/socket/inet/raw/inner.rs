@@ -1,14 +1,10 @@
 //! Raw socket 内部状态实现
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
-use crate::{
-    libs::mutex::Mutex,
-    net::socket::{inet::common::BoundInner, utils::extract_src_addr_from_ip_header},
-    process::namespace::net_namespace::NetNamespace,
-};
+use crate::net::socket::inet::common::BoundInner;
 
 // 重新导出供 mod.rs 使用
 pub use crate::net::socket::utils::extract_dst_addr_from_ip_header;
@@ -27,80 +23,59 @@ pub struct UnboundRaw {
 }
 
 impl UnboundRaw {
-    pub fn new(ip_version: IpVersion, protocol: IpProtocol) -> Self {
-        let rx_buffer = smoltcp::socket::raw::PacketBuffer::new(
-            vec![smoltcp::socket::raw::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_RX_BUF_SIZE],
-        );
-        let tx_buffer = smoltcp::socket::raw::PacketBuffer::new(
-            vec![smoltcp::socket::raw::PacketMetadata::EMPTY; DEFAULT_METADATA_BUF_SIZE],
-            vec![0; DEFAULT_TX_BUF_SIZE],
-        );
-        let socket = SmolRawSocket::new(ip_version, protocol, rx_buffer, tx_buffer);
-
-        Self {
-            socket,
-            ip_version,
-            protocol,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure must return the unchanged protocol owner without locked allocation"
+    )]
+    pub(crate) fn bind_prepared(
+        self,
+        local_addr: Option<IpAddress>,
+        prepared: &mut super::super::common::registration::PreparedIfaceSocket,
+        wrapper: Arc<super::RawSocket>,
+    ) -> Result<BoundRaw, (Self, SystemError)> {
+        let mut original = Some(self);
+        match prepared.with_commit(|prepared| {
+            let original = original.take().expect("one raw bind attempt");
+            let inner = prepared.attach(original.socket);
+            let bound = BoundRaw {
+                inner,
+                owner: Arc::downgrade(&wrapper),
+                ip_version: original.ip_version,
+                protocol: original.protocol,
+            };
+            wrapper.addresses.write().local = local_addr;
+            prepared.publish(wrapper);
+            bound
+        }) {
+            Ok(bound) => Ok(bound),
+            Err(error) => Err((
+                original
+                    .take()
+                    .expect("admission precedes protocol consumption"),
+                error,
+            )),
         }
     }
 
-    /// 绑定到指定的本地地址
-    pub fn bind(
-        self,
-        local_addr: IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<BoundRaw, SystemError> {
-        let inner = BoundInner::bind(self.socket, &local_addr, netns)?;
-        Ok(BoundRaw {
-            inner,
-            local_addr: Some(local_addr),
-            remote_addr: Mutex::new(None),
-            ip_version: self.ip_version,
-            protocol: self.protocol,
-        })
-    }
-
-    /// Attach the raw socket to an iface for receiving packets, without binding
-    /// to a specific local address (wildcard).
-    pub fn bind_wildcard(self, netns: Arc<NetNamespace>) -> Result<BoundRaw, SystemError> {
-        // Prefer loopback for localhost-focused workloads/tests; fall back to default iface.
-        let iface: Arc<dyn crate::net::Iface> = if let Some(lo) = netns.loopback_iface() {
-            lo
-        } else if let Some(iface) = netns.default_iface() {
-            iface
-        } else {
-            netns
-                .device_list()
-                .values()
-                .next()
-                .cloned()
-                .ok_or(SystemError::ENODEV)?
-        };
-
-        let inner = BoundInner::bind_on_iface(self.socket, iface, netns.clone())?;
-        Ok(BoundRaw {
-            inner,
-            local_addr: None,
-            remote_addr: Mutex::new(None),
-            ip_version: self.ip_version,
-            protocol: self.protocol,
-        })
-    }
-
-    /// 绑定到临时地址（根据远程地址选择合适的本地地址）
-    pub fn bind_ephemeral(
-        self,
-        remote: IpAddress,
-        netns: Arc<NetNamespace>,
-    ) -> Result<BoundRaw, SystemError> {
-        let (inner, address) = BoundInner::bind_ephemeral(self.socket, remote, netns)?;
-        Ok(BoundRaw {
-            inner,
-            local_addr: Some(address),
-            remote_addr: Mutex::new(None),
-            ip_version: self.ip_version,
-            protocol: self.protocol,
+    pub(crate) fn try_new(
+        ip_version: IpVersion,
+        protocol: IpProtocol,
+        memory: &crate::net::socket::buffer::SocketMemory,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        let rx = crate::net::socket::buffer::try_owned_packet_buffer(
+            memory,
+            DEFAULT_METADATA_BUF_SIZE,
+            DEFAULT_RX_BUF_SIZE,
+        )?;
+        let tx = crate::net::socket::buffer::try_owned_packet_buffer(
+            memory,
+            DEFAULT_METADATA_BUF_SIZE,
+            DEFAULT_TX_BUF_SIZE,
+        )?;
+        Ok(Self {
+            socket: SmolRawSocket::new(ip_version, protocol, rx, tx),
+            ip_version,
+            protocol,
         })
     }
 
@@ -119,8 +94,7 @@ impl UnboundRaw {
 #[derive(Debug)]
 pub struct BoundRaw {
     inner: BoundInner,
-    local_addr: Option<IpAddress>,
-    remote_addr: Mutex<Option<IpAddress>>,
+    owner: Weak<super::RawSocket>,
     ip_version: IpVersion,
     protocol: IpProtocol,
 }
@@ -141,59 +115,26 @@ impl BoundRaw {
     }
 
     pub fn local_addr(&self) -> Option<IpAddress> {
-        self.local_addr
+        self.owner
+            .upgrade()
+            .and_then(|owner| owner.addresses.read().local)
     }
 
     pub fn remote_addr(&self) -> Option<IpAddress> {
-        *self.remote_addr.lock()
+        self.owner
+            .upgrade()
+            .and_then(|owner| owner.addresses.read().remote)
     }
 
     pub fn connect(&self, remote: IpAddress) {
-        self.remote_addr.lock().replace(remote);
-    }
-
-    /// 尝试接收数据包
-    ///
-    /// # 返回
-    /// - `Ok((size, src_addr))`: 接收到的数据大小和源地址
-    /// - `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`: 没有数据可读
-    pub fn try_recv(
-        &self,
-        buf: &mut [u8],
-        ip_version: IpVersion,
-    ) -> Result<(usize, IpAddress), SystemError> {
-        self.with_mut_socket(|socket| {
-            if socket.can_recv() {
-                match socket.recv() {
-                    Ok(data) => {
-                        let len = data.len().min(buf.len());
-                        buf[..len].copy_from_slice(&data[..len]);
-
-                        // 从 IP 头解析源地址
-                        let src_addr = extract_src_addr_from_ip_header(data, ip_version).unwrap_or(
-                            match ip_version {
-                                IpVersion::Ipv4 => {
-                                    IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
-                                }
-                                IpVersion::Ipv6 => {
-                                    IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)
-                                }
-                            },
-                        );
-
-                        Ok((len, src_addr))
-                    }
-                    Err(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-                }
-            } else {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-            }
-        })
+        if let Some(owner) = self.owner.upgrade() {
+            owner.addresses.write().remote = Some(remote);
+        }
     }
 
     /// 尝试发送数据包
     pub fn try_send(&self, buf: &[u8], to: Option<IpAddress>) -> Result<usize, SystemError> {
-        let dest_addr = to.or(*self.remote_addr.lock());
+        let dest_addr = to.or(self.remote_addr());
 
         // 对于 raw socket，目标地址可以从数据包中获取
         // 如果没有指定目标地址且没有连接的远程地址，
@@ -214,6 +155,16 @@ impl BoundRaw {
 
     pub fn inner(&self) -> &BoundInner {
         &self.inner
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut BoundInner {
+        &mut self.inner
+    }
+
+    pub(crate) fn set_local_addr(&mut self, address: IpAddress) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.addresses.write().local = Some(address);
+        }
     }
 
     pub fn close(&self) {

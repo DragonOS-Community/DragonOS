@@ -28,28 +28,36 @@ use crate::{
     filesystem::{
         devfs::{devfs_register, DevFS, DeviceINode, LockedDevFSInode},
         devpts::{DevPtsFs, LockedDevPtsFSInode},
-        epoll::EPollItem,
+        epoll::{EPollEventType, EPollItem},
         kernfs::KernFSInode,
         vfs::{
-            file::FileFlags, utils::DName, FilePrivateData, FileType, IndexNode, InodeMode,
-            Metadata, PollableInode,
+            fasync::FAsyncItem,
+            file::{File, FileFlags},
+            read_buffer::{ReadScratch, MAX_CHUNK},
+            utils::DName,
+            FilePrivateData, FileType, IndexNode, InodeMode, Metadata, PollableInode, UserReadMode,
         },
     },
     init::initcall::INITCALL_DEVICE,
     libs::{mutex::MutexGuard, rwlock::RwLock},
     mm::VirtAddr,
     process::ProcessManager,
-    syscall::user_access::{UserBufferReader, UserBufferWriter},
+    syscall::{
+        user_access::{UserBufferReader, UserBufferWriter},
+        user_buffer::UserBuffer,
+    },
+    time::PosixTimeSpec,
 };
 
 use super::{
     kthread::tty_flush_thread_init,
-    pty::unix98pty::ptmx_open,
+    pty::unix98pty::{ptm_peer_inode, ptmx_open, pty_file_close},
     sysfs::sys_class_tty_instance,
     termios::WindowSize,
     tty_core::{TtyCore, TtyFlag, TtyIoctlCmd},
     tty_driver::{TtyDriverManager, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
+    tty_ldisc::TtyLdiscFileContext,
     virtual_terminal::vty_init,
 };
 
@@ -100,7 +108,7 @@ pub enum PtyType {
     Pts,
 }
 
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct TtyDevice {
     name: String,
     id_table: IdTable,
@@ -149,13 +157,74 @@ impl TtyDevice {
         &self.name
     }
 
-    fn tty_core(private_data: &FilePrivateData) -> Result<Arc<TtyCore>, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = private_data {
-            (tty_priv.tty.clone(), tty_priv.flags)
+    fn tty_file(private_data: &FilePrivateData) -> Result<&TtyFilePrivateData, SystemError> {
+        if let FilePrivateData::Tty(tty_priv) = private_data {
+            Ok(tty_priv)
         } else {
-            return Err(SystemError::EIO);
+            Err(SystemError::EIO)
+        }
+    }
+
+    fn read_context(
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<(Arc<TtyCore>, TtyLdiscFileContext)>, SystemError> {
+        let tty_file = Self::tty_file(&data)?;
+        if tty_file.is_hung_up() {
+            return Ok(None);
+        }
+        let tty = tty_file.tty();
+        let context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
         };
-        Ok(tty)
+        drop(data);
+        Ok(Some((tty, context)))
+    }
+
+    fn read_with_context(
+        tty: Arc<TtyCore>,
+        file_context: TtyLdiscFileContext,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        let ld = tty.ldisc();
+        let mut offset = 0;
+        let mut cookie = false;
+
+        // 边界检查：防止整数下溢
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+
+        loop {
+            let mut size = (len - offset).min(buf.len() - offset);
+            size = ld.read(
+                tty.clone(),
+                &mut buf[offset..],
+                size,
+                &mut cookie,
+                0,
+                file_context,
+            )?;
+            // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
+            if size == 0 {
+                break;
+            }
+
+            offset += size;
+
+            // 已满足读取请求或缓冲区已满
+            if offset >= len || offset >= buf.len() {
+                break;
+            }
+
+            // 没有更多数据
+            if !cookie {
+                break;
+            }
+        }
+
+        return Ok(offset);
     }
 
     /// tty_open_current_tty - get locked tty of current task
@@ -192,7 +261,18 @@ impl Debug for TtyDevice {
 
 impl PollableInode for TtyDevice {
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError> {
-        let tty = TtyDevice::tty_core(private_data)?;
+        let tty_file = TtyDevice::tty_file(private_data)?;
+        if tty_file.is_hung_up() {
+            return Ok((EPollEventType::EPOLLIN
+                | EPollEventType::EPOLLOUT
+                | EPollEventType::EPOLLERR
+                | EPollEventType::EPOLLHUP
+                | EPollEventType::EPOLLRDNORM
+                | EPollEventType::EPOLLWRNORM)
+                .bits() as usize);
+        }
+
+        let tty = tty_file.tty();
         tty.ldisc().poll(tty)
     }
 
@@ -201,7 +281,15 @@ impl PollableInode for TtyDevice {
         epitem: Arc<EPollItem>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let tty = TtyDevice::tty_core(private_data)?;
+        let tty_file = TtyDevice::tty_file(private_data)?;
+        if tty_file.is_hung_up() {
+            // hung_up_tty_poll() is permanently ready and does not register
+            // a wait queue. epoll observes the fixed mask immediately after
+            // this callback.
+            return Ok(());
+        }
+
+        let tty = tty_file.tty();
         let core = tty.core();
         core.add_epitem(epitem);
         Ok(())
@@ -212,9 +300,50 @@ impl PollableInode for TtyDevice {
         epitem: &Arc<EPollItem>,
         private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let tty = TtyDevice::tty_core(private_data)?;
+        let tty_file = TtyDevice::tty_file(private_data)?;
+        let hung_up = tty_file.is_hung_up();
+        let tty = tty_file.tty();
         let core = tty.core();
-        core.remove_epitem(epitem)
+        match core.remove_epitem(epitem) {
+            Err(SystemError::ENOENT) if hung_up => Ok(()),
+            result => result,
+        }
+    }
+
+    fn add_fasync(
+        &self,
+        fasync_item: FAsyncItem,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        let tty_file = Self::tty_file(private_data)?;
+        tty_file
+            .tty()
+            .core()
+            .add_fasync(tty_file.hangup_generation, fasync_item)
+    }
+
+    fn remove_fasync(
+        &self,
+        file: &Weak<File>,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Self::tty_file(private_data)?
+            .tty()
+            .core()
+            .remove_fasync(file);
+        Ok(())
+    }
+
+    fn release_fasync(
+        &self,
+        file: &File,
+        private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Self::tty_file(private_data)?
+            .tty()
+            .core()
+            .remove_fasync_file(file);
+        Ok(())
     }
 }
 
@@ -223,7 +352,7 @@ impl IndexNode for TtyDevice {
         &self,
         mut data: MutexGuard<FilePrivateData>,
         mode: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.tty_type == TtyType::Pty(PtyType::Ptm) {
             return ptmx_open(self, data, mode);
         }
@@ -233,7 +362,7 @@ impl IndexNode for TtyDevice {
             if let Some(current) = self.open_current_tty(dev_num, &mut data) {
                 Some(current)
             } else {
-                return Err(SystemError::ENXIO);
+                return Err(SystemError::ENXIO.into());
             }
         } else {
             None
@@ -255,42 +384,52 @@ impl IndexNode for TtyDevice {
         }
 
         let tty = tty.unwrap();
+        let hangup_generation = tty.core().file_open_hangup_generation();
 
         // 设置privdata
         *data = FilePrivateData::Tty(TtyFilePrivateData {
             tty: tty.clone(),
             flags: *mode,
+            hangup_generation,
         });
 
         tty.core().contorl_info_irqsave().clear_dead_session();
 
+        let non_pty = tty.core().driver().tty_driver_type() != TtyDriverType::Pty;
+        let open_close_guard = non_pty.then(|| tty.core().open_close_lock().lock());
+        let first_open = non_pty && tty.core().begin_file_open();
+        if first_open {
+            tty.reset_flow_state();
+        }
         let ret = tty.open(tty.core());
         if let Err(err) = ret {
-            if err == SystemError::ENOSYS {
-                return Err(SystemError::ENODEV);
+            if non_pty {
+                tty.core().end_file_open();
             }
-            return Err(err);
+            tty.core().dec_count();
+            *data = FilePrivateData::Unused;
+            if err == SystemError::ENOSYS {
+                return Err(SystemError::ENODEV.into());
+            }
+            return Err(err.into());
         }
+
+        // A successful open after a completed hangup is a normal tty file in
+        // Linux. Do not clear a hangup which raced with this open: its
+        // generation change marks this file as one of the hung-up instances.
+        tty.core().finish_file_open(hangup_generation);
+        drop(open_close_guard);
 
         let driver = tty.core().driver();
         // 考虑 O_NOCTTY：显式指定则不设置控制终端；pty master 也不会成为控制终端。
         if !(mode.contains(FileFlags::O_NOCTTY)
+            || mode.is_write_only()
             || (driver.tty_driver_type() == TtyDriverType::Pty
                 && driver.tty_driver_sub_type() == TtyDriverSubType::PtyMaster))
         {
-            let pcb = ProcessManager::current_pcb();
-            let pcb_tty = pcb.sig_info_irqsave().tty();
-            let is_session_leader = pcb.sig_info_irqsave().is_session_leader;
-            let tty_session_is_none = tty.core().contorl_info_irqsave().session.is_none();
-            // Linux tty_open_proc_set_tty 语义：必须是会话首进程、尚无 controlling tty、
-            // tty 当前未被会话占用，且本次 open 具备读权限（不是 O_WRONLY）。
-            if is_session_leader
-                && pcb_tty.is_none()
-                && tty_session_is_none
-                && !mode.is_write_only()
-            {
-                TtyJobCtrlManager::proc_set_tty(tty);
-            }
+            // The helper revalidates and commits the controlling-tty state as
+            // one membership/tty/signal transaction.
+            TtyJobCtrlManager::proc_set_tty(tty);
         }
 
         Ok(())
@@ -302,46 +441,37 @@ impl IndexNode for TtyDevice {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
-        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
-        } else {
-            return Err(SystemError::EIO);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let Some((tty, context)) = Self::read_context(data)? else {
+            return Ok(0);
         };
+        Self::read_with_context(tty, context, len, buf).map_err(Into::into)
+    }
 
-        drop(data);
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Iterator
+    }
 
-        let ld = tty.ldisc();
-        let mut offset = 0;
-        let mut cookie = false;
-
-        // 边界检查：防止整数下溢
-        if len > buf.len() {
-            return Err(SystemError::EINVAL);
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        let Some((tty, context)) = Self::read_context(data)? else {
+            return Ok(Some(0));
+        };
+        if len == 0 {
+            return Ok(Some(0));
         }
-
-        loop {
-            let mut size = (len - offset).min(buf.len() - offset);
-            size = ld.read(tty.clone(), &mut buf[offset..], size, &mut cookie, 0, flags)?;
-            // 本次迭代未读取到数据，可能是EOF或暂时无数据可读
-            if size == 0 {
-                break;
-            }
-
-            offset += size;
-
-            // 已满足读取请求或缓冲区已满
-            if offset >= len || offset >= buf.len() {
-                break;
-            }
-
-            // 没有更多数据
-            if !cookie {
-                break;
-            }
-        }
-
-        return Ok(offset);
+        // One bounded ldisc request owns the entire logical user buffer.
+        // Repeating a request per iovec could wait for new input after the
+        // first segment already completed a short terminal read.
+        let mut scratch = ReadScratch::default();
+        let buffer = scratch.prepare(len.min(MAX_CHUNK))?;
+        let read = Self::read_with_context(tty, context, buffer.len(), buffer)?;
+        writer.write_prefix_to_user(0, &buffer[..read]).map(Some)
     }
 
     fn write_at(
@@ -350,16 +480,23 @@ impl IndexNode for TtyDevice {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, system_error::SystemError> {
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let mut count = len;
-        let (tty, flags) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
-        } else {
-            return Err(SystemError::EIO);
+        let tty_file = Self::tty_file(&data)?;
+        if tty_file.is_hung_up() {
+            return Err(SystemError::EIO.into());
+        }
+        let tty = tty_file.tty();
+        let file_context = TtyLdiscFileContext {
+            flags: tty_file.flags,
+            hangup_generation: tty_file.hangup_generation,
         };
         drop(data);
         let ld = tty.ldisc();
         let core = tty.core();
+        let write_guard = core
+            .write_lock()
+            .lock_interruptible(file_context.flags.contains(FileFlags::O_NONBLOCK))?;
         let mut chunk = 2048;
         if core.flags().contains(TtyFlag::NO_WRITE_SPLIT) {
             chunk = 65536;
@@ -374,7 +511,21 @@ impl IndexNode for TtyDevice {
 
             // 将数据从buf拷贝到writebuf
 
-            let ret = ld.write(tty.clone(), &buf[written..], size, flags)?;
+            let ret = match ld.write(tty.clone(), &buf[written..], size, file_context) {
+                Ok(ret) => ret,
+                Err(err) => {
+                    if written != 0 {
+                        break;
+                    }
+                    drop(write_guard);
+                    core.write_wq()
+                        .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
+                    return Err(err.into());
+                }
+            };
+            if ret == 0 {
+                break;
+            }
 
             written += ret;
             count -= ret;
@@ -384,7 +535,13 @@ impl IndexNode for TtyDevice {
             }
 
             if pcb.has_pending_signal_fast() {
-                return Err(SystemError::ERESTARTSYS);
+                if written != 0 {
+                    break;
+                }
+                drop(write_guard);
+                core.write_wq()
+                    .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
+                return Err(SystemError::ERESTARTSYS.into());
             }
         }
 
@@ -392,6 +549,9 @@ impl IndexNode for TtyDevice {
             // todo: 更新时间
         }
 
+        drop(write_guard);
+        core.write_wq()
+            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
         Ok(written)
     }
 
@@ -421,10 +581,19 @@ impl IndexNode for TtyDevice {
         Ok(self.inner.read().metadata.clone())
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let mut guard = self.inner_write();
         guard.metadata = metadata.clone();
 
+        Ok(())
+    }
+
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut guard = self.inner_write();
+        crate::filesystem::vfs::update_atime_locked(&mut guard.metadata, now, relatime);
         Ok(())
     }
 
@@ -441,10 +610,12 @@ impl IndexNode for TtyDevice {
         };
 
         drop(data);
-        tty.close(tty.clone())
+        let ret = tty.close(tty.clone());
+        pty_file_close(&tty);
+        ret
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         Ok(())
     }
 
@@ -453,15 +624,25 @@ impl IndexNode for TtyDevice {
         cmd: u32,
         arg: usize,
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let (tty, _) = if let FilePrivateData::Tty(tty_priv) = &*data {
-            (tty_priv.tty(), tty_priv.flags)
-        } else {
-            return Err(SystemError::EIO);
-        };
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let tty_file = Self::tty_file(&data)?;
+        let hung_up = tty_file.is_hung_up();
+        let tty = tty_file.tty();
 
         // Drop the lock early: tty ioctl paths may block.
         drop(data);
+
+        // Linux replaces only the file instances which existed at hangup
+        // with hung_up_tty_fops. A later successful reopen must remain usable.
+        // Check the original file endpoint before PTY master mode ioctls
+        // redirect to the slave.
+        if hung_up {
+            return if cmd == TtyIoctlCmd::TIOCSPGRP {
+                Err(SystemError::ENOTTY.into())
+            } else {
+                Err(SystemError::EIO.into())
+            };
+        }
 
         match cmd {
             TtyIoctlCmd::TIOCSETD
@@ -471,13 +652,42 @@ impl IndexNode for TtyDevice {
             | TtyIoctlCmd::TCSBRKP => {
                 TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
                 if cmd != TtyIoctlCmd::TIOCCBRK {
-                    todo!()
+                    tty.wait_until_sent(tty.core())?;
                 }
             }
             _ => {}
         }
-
         match cmd {
+            TtyIoctlCmd::TIOCSBRK
+            | TtyIoctlCmd::TIOCCBRK
+            | TtyIoctlCmd::TCSBRK
+            | TtyIoctlCmd::TCSBRKP => return Ok(0),
+            TtyIoctlCmd::TIOCSETD => {
+                let reader =
+                    UserBufferReader::new(arg as *const i32, core::mem::size_of::<i32>(), true)?;
+                let disc = reader.read_one_from_user::<i32>(0)?;
+                if disc != 0 {
+                    return Err(SystemError::ENODEV.into());
+                }
+                return Ok(0);
+            }
+            TtyIoctlCmd::TIOCGPTPEER => {
+                let flags = FileFlags::from_bits(arg as u32).ok_or(SystemError::EINVAL)?;
+                let cloexec = flags.contains(FileFlags::O_CLOEXEC);
+                let slave_inode = ptm_peer_inode(tty)?;
+                let current = ProcessManager::current_pcb();
+                let reservation = current.fd_table().reserve::<1>(
+                    current.nofile_soft_limit(),
+                    0,
+                    cloexec,
+                    &crate::cgroup::memory::object_for_task(&current),
+                )?;
+                let file = File::new(slave_inode, flags)?;
+                return reservation
+                    .install(file)
+                    .map(|fd| fd as usize)
+                    .map_err(Into::into);
+            }
             TtyIoctlCmd::TIOCGWINSZ => {
                 let core = tty.core();
                 let winsize = *core.window_size();
@@ -490,7 +700,7 @@ impl IndexNode for TtyDevice {
 
                 let err = user_writer.copy_one_to_user(&winsize, 0);
                 if err.is_err() {
-                    return Err(SystemError::EFAULT);
+                    return Err(SystemError::EFAULT.into());
                 }
                 return Ok(0);
             }
@@ -503,12 +713,15 @@ impl IndexNode for TtyDevice {
 
                 let user_winsize = reader.read_one_from_user::<WindowSize>(0)?;
 
-                let ret = tty.resize(tty.clone(), *user_winsize);
+                let ret = tty.resize(tty.clone(), user_winsize);
 
                 if ret != Err(SystemError::ENOSYS) {
-                    return ret.map(|_| 0);
+                    return ret.map(|_| 0).map_err(Into::into);
                 } else {
-                    return tty.tty_do_resize(*user_winsize).map(|_| 0);
+                    return tty
+                        .tty_do_resize(user_winsize)
+                        .map(|_| 0)
+                        .map_err(Into::into);
                 }
             }
             _ => match TtyJobCtrlManager::job_ctrl_ioctl(tty.clone(), cmd, arg) {
@@ -517,7 +730,7 @@ impl IndexNode for TtyDevice {
                 }
                 Err(e) => {
                     if e != SystemError::ENOIOCTLCMD {
-                        return Err(e);
+                        return Err(e.into());
                     }
                 }
             },
@@ -529,7 +742,7 @@ impl IndexNode for TtyDevice {
             }
             Err(e) => {
                 if e != SystemError::ENOIOCTLCMD {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
@@ -714,11 +927,16 @@ impl CharDevice for TtyDevice {
 pub struct TtyFilePrivateData {
     pub tty: Arc<TtyCore>,
     pub flags: FileFlags,
+    pub hangup_generation: usize,
 }
 
 impl TtyFilePrivateData {
     pub fn tty(&self) -> Arc<TtyCore> {
         self.tty.clone()
+    }
+
+    pub fn is_hung_up(&self) -> bool {
+        self.hangup_generation != self.tty.core().hangup_generation()
     }
 }
 

@@ -20,13 +20,7 @@ static CPU_NUM_ATOMIC: AtomicU32 = AtomicU32::new(PerCpu::MAX_CPU_NUM);
 pub struct PerCpu;
 
 impl PerCpu {
-    #[cfg(target_arch = "x86_64")]
-    pub const MAX_CPU_NUM: u32 = 128;
-    #[cfg(target_arch = "riscv64")]
-    pub const MAX_CPU_NUM: u32 = 64;
-
-    #[cfg(target_arch = "loongarch64")]
-    pub const MAX_CPU_NUM: u32 = 128;
+    pub const MAX_CPU_NUM: u32 = 16;
 
     /// # 初始化PerCpu
     ///

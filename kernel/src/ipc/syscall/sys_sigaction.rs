@@ -46,6 +46,7 @@ pub(super) fn do_kernel_sigaction(
         )?;
         let act: UserSigaction = act_writer.buffer_protected(0)?.read_one(0)?;
         let mask: SigSet = act.mask;
+        let flags = SigFlags::from_bits_truncate(act.flags as u32);
         let input_sighandler = act.handler as u64;
 
         let sig = Signal::from(sig);
@@ -58,13 +59,13 @@ pub(super) fn do_kernel_sigaction(
         match input_sighandler {
             USER_SIG_DFL => {
                 new_ka = Sigaction::DEFAULT_SIGACTION;
-                *new_ka.flags_mut() = act.flags;
+                *new_ka.flags_mut() = flags;
                 new_ka.set_restorer(None);
             }
 
             USER_SIG_IGN => {
                 new_ka = Sigaction::DEFAULT_SIGACTION_IGNORE;
-                *new_ka.flags_mut() = act.flags;
+                *new_ka.flags_mut() = flags;
 
                 new_ka.set_restorer(None);
             }
@@ -75,9 +76,18 @@ pub(super) fn do_kernel_sigaction(
                     SigactionType::SaHandler(SaHandlerType::Customized(VirtAddr::new(
                         input_sighandler as usize,
                     ))),
-                    act.flags,
+                    flags,
                     SigSet::default(),
-                    Some(VirtAddr::new(act.restorer as usize)),
+                    {
+                        #[cfg(not(target_arch = "riscv64"))]
+                        {
+                            Some(VirtAddr::new(act.restorer as usize))
+                        }
+                        #[cfg(target_arch = "riscv64")]
+                        {
+                            None
+                        }
+                    },
                 );
             }
         }
@@ -85,6 +95,7 @@ pub(super) fn do_kernel_sigaction(
         // TODO 如果为空，赋默认值？
         // debug!("new_ka={:?}", new_ka);
         // 如果用户手动给了sa_restorer，那么就置位SA_FLAG_RESTORER，否则报错。（用户必须手动指定restorer）
+        #[cfg(not(target_arch = "riscv64"))]
         if new_ka.restorer().is_some() {
             new_ka.flags_mut().insert(SigFlags::SA_RESTORER);
         } else if new_ka.action().is_customized() {
@@ -141,17 +152,18 @@ pub(super) fn do_kernel_sigaction(
                 VirtAddr::new(USER_SIG_DFL as usize)
             }
         };
-        let mut old_act_buf = old_act_writer.buffer_protected(0)?;
-
-        let mut old_act: UserSigaction = old_act_buf.read_one::<UserSigaction>(0)?;
-
-        old_act.handler = sigaction_handler.data() as *mut c_void;
-        old_act.flags = old_sigaction.flags();
-        old_act.mask = old_sigaction.mask();
-        if old_sigaction.restorer().is_some() {
-            old_act.restorer = old_sigaction.restorer().unwrap().data() as *mut c_void;
-        }
-        old_act_buf.write_one(0, &old_act)?;
+        let old_act = UserSigaction {
+            handler: sigaction_handler.data() as *mut c_void,
+            flags: old_sigaction.flags().bits() as usize,
+            #[cfg(not(target_arch = "riscv64"))]
+            restorer: old_sigaction
+                .restorer()
+                .map_or(core::ptr::null_mut(), |address| {
+                    address.data() as *mut c_void
+                }),
+            mask: old_sigaction.mask(),
+        };
+        old_act_writer.copy_one_to_user(&old_act, 0)?;
     }
     compiler_fence(Ordering::SeqCst);
     return retval.map(|_| 0);

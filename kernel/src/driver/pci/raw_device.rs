@@ -43,7 +43,16 @@ impl From<Arc<PciDeviceStructureGeneralDevice>> for PciGeneralDevice {
         // let value = Arc::new(value.clone());
         let name: String = value.common_header.bus_device_function.into();
         let kobj_state = LockedKObjectState::new(None);
-        let dev_id = PciDeviceID::dummpy();
+        let class = u32::from(value.common_header.class_code) << 16
+            | u32::from(value.common_header.subclass) << 8
+            | u32::from(value.common_header.prog_if);
+        let dev_id = PciDeviceID::device(
+            value.common_header.vendor_id,
+            value.common_header.device_id,
+            value.subsystem_vendor_id,
+            value.subsystem_id,
+            class,
+        );
 
         // dev_id.set_special(PciSpecifiedData::Virtio());
         let res = Self {
@@ -104,6 +113,10 @@ impl PciDevice for PciGeneralDevice {
 
     fn subclass(&self) -> u8 {
         self.header.common_header.subclass
+    }
+
+    fn standard_device(&self) -> Option<Arc<PciDeviceStructureGeneralDevice>> {
+        Some(self.header.clone())
     }
 }
 

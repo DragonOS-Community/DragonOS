@@ -22,11 +22,22 @@ use crate::{
     mm::{memblock::mem_block_manager, PhysAddr},
 };
 
+use super::rsdp::{cache_bios_rsdp_result, cached_bios_rsdp};
+
 pub(super) const MULTIBOOT2_ENTRY_MAGIC: u32 = multiboot2::MAGIC;
 static MB2_INFO: Lazy<BootInformation> = Lazy::new();
 const MB2_RAW_INFO_MAX_SIZE: usize = 4096;
 
 static mut MB2_RAW_INFO: [u8; MB2_RAW_INFO_MAX_SIZE] = [0u8; MB2_RAW_INFO_MAX_SIZE];
+
+fn has_efi_context(boot_info: &BootInformation) -> bool {
+    boot_info.efi_sdt32_tag().is_some()
+        || boot_info.efi_sdt64_tag().is_some()
+        || boot_info.efi_memory_map_tag().is_some()
+        || boot_info.efi_bs_not_exited_tag().is_some()
+        || boot_info.efi_ih32_tag().is_some()
+        || boot_info.efi_ih64_tag().is_some()
+}
 
 fn mb2_rsdp_v1_tag_to_rsdp_struct(tag: &RsdpV1Tag) -> Rsdp {
     Rsdp {
@@ -70,17 +81,23 @@ impl BootCallbacks for Mb2Callback {
     }
 
     fn init_acpi_args(&self) -> Result<BootloaderAcpiArg, SystemError> {
-        if let Some(v1_tag) = MB2_INFO.get().rsdp_v1_tag() {
-            Ok(BootloaderAcpiArg::Rsdt(mb2_rsdp_v1_tag_to_rsdp_struct(
-                v1_tag,
-            )))
-        } else if let Some(v2_tag) = MB2_INFO.get().rsdp_v2_tag() {
-            Ok(BootloaderAcpiArg::Xsdt(mb2_rsdp_v2_tag_to_rsdp_struct(
+        let boot_info = MB2_INFO.get();
+        if let Some(v2_tag) = boot_info.rsdp_v2_tag() {
+            return Ok(BootloaderAcpiArg::Xsdt(mb2_rsdp_v2_tag_to_rsdp_struct(
                 v2_tag,
-            )))
-        } else {
-            Ok(BootloaderAcpiArg::NotProvided)
+            )));
         }
+        if let Some(v1_tag) = boot_info.rsdp_v1_tag() {
+            return Ok(BootloaderAcpiArg::Rsdt(mb2_rsdp_v1_tag_to_rsdp_struct(
+                v1_tag,
+            )));
+        }
+        if let Some(paddr) = cached_bios_rsdp()? {
+            log::info!("multiboot2: found RSDP at {:#x}", paddr.data());
+            return Ok(BootloaderAcpiArg::Rsdp(paddr));
+        }
+
+        Ok(BootloaderAcpiArg::NotProvided)
     }
 
     fn init_kernel_cmdline(&self) -> Result<(), SystemError> {
@@ -208,6 +225,16 @@ impl BootCallbacks for Mb2Callback {
 
         // setup kernel load base
         self.setup_kernel_load_base();
+
+        // Legacy BIOS fallback is valid only when no ACPI tag and no EFI
+        // context were supplied. UEFI systems must use their configuration
+        // table and must not probe the fixed Legacy BIOS regions.
+        if mb2_info.rsdp_v2_tag().is_none()
+            && mb2_info.rsdp_v1_tag().is_none()
+            && !has_efi_context(mb2_info)
+        {
+            cache_bios_rsdp_result();
+        }
 
         Ok(())
     }

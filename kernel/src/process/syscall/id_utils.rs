@@ -3,6 +3,7 @@
 //! 提供用于 setuid/setgid 相关系统调用的通用辅助函数，消除代码冗余
 
 use crate::process::cred::{CAPFlags, Cred};
+use crate::process::namespace::user_namespace::{make_kgid, make_kuid, UserNamespace};
 use system_error::SystemError;
 
 /// 检查值是否为"不改变"标记（-1）
@@ -14,23 +15,22 @@ pub fn is_no_change(v: usize) -> bool {
     v == usize::MAX || v == u32::MAX as usize
 }
 
-/// 验证 ID 值的有效性
-///
-/// # 参数
-/// - `v`: 要验证的 ID 值
-///
-/// # 返回
-/// - `Ok(())`: 值有效
-/// - `Err(SystemError::EINVAL)`: 值无效（超出 u32 范围且不是不改变标记）
-#[inline]
-pub fn validate_id(v: usize) -> Result<(), SystemError> {
-    if is_no_change(v) {
-        return Ok(());
+/// Syscall uid_t/gid_t arguments are 32-bit even on x86_64. Preserve the
+/// all-ones sentinel only for interfaces that accept "no change".
+pub fn map_uid_arg(ns: &UserNamespace, raw: usize, no_change: bool) -> Result<usize, SystemError> {
+    let id = raw as u32;
+    if no_change && id == u32::MAX {
+        return Ok(usize::MAX);
     }
-    if v > u32::MAX as usize {
-        return Err(SystemError::EINVAL);
+    Ok(make_kuid(ns, id)?.data())
+}
+
+pub fn map_gid_arg(ns: &UserNamespace, raw: usize, no_change: bool) -> Result<usize, SystemError> {
+    let id = raw as u32;
+    if no_change && id == u32::MAX {
+        return Ok(usize::MAX);
     }
-    Ok(())
+    Ok(make_kgid(ns, id)?.data())
 }
 
 /// setreuid/setregid 的通用实现逻辑
@@ -59,9 +59,10 @@ pub fn check_setre_permissions(
     }
 
     if !is_privileged {
-        let allowed = |id: usize| -> bool { id == old_real || id == old_eff || id == old_saved };
-        if (!is_no_change(new_real) && !allowed(new_real))
-            || (!is_no_change(new_eff) && !allowed(new_eff))
+        let allowed_eff =
+            |id: usize| -> bool { id == old_real || id == old_eff || id == old_saved };
+        if (!is_no_change(new_real) && new_real != old_real && new_real != old_eff)
+            || (!is_no_change(new_eff) && !allowed_eff(new_eff))
         {
             return Err(SystemError::EPERM);
         }
@@ -120,29 +121,6 @@ pub fn resolve_id(value: usize, old: usize) -> usize {
     }
 }
 
-/// 验证 setuid/setgid 的 ID 值有效性
-///
-/// 与 validate_id 不同，setuid/setgid 不接受 -1（不改变标记），
-/// 因此需要单独验证。
-///
-/// # 参数
-/// - `v`: 要验证的 ID 值
-///
-/// # 返回
-/// - `Ok(())`: 值有效
-/// - `Err(SystemError::EINVAL)`: 值无效（为-1或超出u32范围）
-#[inline]
-pub fn validate_setuid_id(v: usize) -> Result<(), SystemError> {
-    // setuid/setgid 不接受 -1
-    if v == usize::MAX || v == u32::MAX as usize {
-        return Err(SystemError::EINVAL);
-    }
-    if v > u32::MAX as usize {
-        return Err(SystemError::EINVAL);
-    }
-    Ok(())
-}
-
 /// 处理 UID 变化后的 capability 更新
 ///
 /// 根据 Linux capabilities(7) 手册和 Linux 内核实现（cap_emulate_setxuid），
@@ -168,8 +146,14 @@ pub struct UidTransition {
 /// - `uids`: UID 变更前后上下文
 /// - `keepcaps`: 是否保留 permitted capabilities
 pub fn handle_uid_capabilities(new_cred: &mut Cred, uids: UidTransition, keepcaps: bool) {
-    let old_has_root = uids.old_ruid == 0 || uids.old_euid == 0 || uids.old_suid == 0;
-    let new_has_root = uids.new_ruid == 0 || uids.new_euid == 0 || uids.new_suid == 0;
+    let Ok(root_uid) = make_kuid(&new_cred.user_ns, 0) else {
+        return;
+    };
+    let root_uid = root_uid.data();
+    let old_has_root =
+        uids.old_ruid == root_uid || uids.old_euid == root_uid || uids.old_suid == root_uid;
+    let new_has_root =
+        uids.new_ruid == root_uid || uids.new_euid == root_uid || uids.new_suid == root_uid;
 
     // 规则 1: 所有 UID 都从 root 变为非 root
     // - keepcaps=false: 清除 permitted/effective/ambient
@@ -183,13 +167,35 @@ pub fn handle_uid_capabilities(new_cred: &mut Cred, uids: UidTransition, keepcap
     }
 
     // 规则 2: euid 从 root 变为非 root，清除 effective
-    if uids.old_euid == 0 && uids.new_euid != 0 {
+    if uids.old_euid == root_uid && uids.new_euid != root_uid {
         new_cred.cap_effective = CAPFlags::CAP_EMPTY_SET;
     }
 
     // 规则 3: euid 从非 root 变为 root，设置 effective = permitted
-    if uids.old_euid != 0 && uids.new_euid == 0 {
+    if uids.old_euid != root_uid && uids.new_euid == root_uid {
         new_cred.cap_effective = new_cred.cap_permitted;
+    }
+}
+
+/// Linux `LSM_SETID_FS`: only filesystem-related effective capabilities
+/// track fsuid==namespace-root; unrelated effective capabilities are retained.
+pub fn handle_fsuid_capabilities(new_cred: &mut Cred, old_fsuid: usize) {
+    let Ok(root_uid) = make_kuid(&new_cred.user_ns, 0) else {
+        return;
+    };
+    let root_uid = root_uid.data();
+    let fs_caps = CAPFlags::CAP_CHOWN
+        | CAPFlags::CAP_MKNOD
+        | CAPFlags::CAP_DAC_OVERRIDE
+        | CAPFlags::CAP_DAC_READ_SEARCH
+        | CAPFlags::CAP_FOWNER
+        | CAPFlags::CAP_FSETID
+        | CAPFlags::CAP_MAC_OVERRIDE
+        | CAPFlags::CAP_LINUX_IMMUTABLE;
+    if old_fsuid == root_uid && new_cred.fsuid.data() != root_uid {
+        new_cred.cap_effective.remove(fs_caps);
+    } else if old_fsuid != root_uid && new_cred.fsuid.data() == root_uid {
+        new_cred.cap_effective |= new_cred.cap_permitted & fs_caps;
     }
 }
 

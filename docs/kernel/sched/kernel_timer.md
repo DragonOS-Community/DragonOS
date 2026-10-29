@@ -1,18 +1,18 @@
-# 内核定时器
+# Kernel Timer
 
-## 1. 简介
+## 1. Introduction
 
-&emsp;&emsp;内核定时器是内核中的一种定时器，内核定时器的工作方式是：添加定时器到队列，为每个定时器设置到期时间。当定时器到期时，会执行定时器对应的函数。
+The kernel timer is a type of timer within the kernel. The working mechanism of the kernel timer is: adding the timer to a queue and setting the expiration time for each timer. When the timer expires, the function corresponding to the timer is executed.
 
-## 2. 设计思路
+## 2. Design Concept
 
-&emsp;&emsp;定时器类型为`Timer`结构体，而`Timer`由`SpinLock<InnerTimer>`组成。全局中使用元素类型为`Arc<Timer>`的队列`TIMER_LIST`存储系统创建的定时器。创建定时器时，应调用`Timer::new(timer_func,expire_jiffies)`，timer_func为定时器要执行的操作，expire_jiffies为定时器的结束时间，`timer_func`参数的类型是实现了`TimerFunction`特性的结构体。在创建定时器后，应使用`Timer::activate()`将定时器插入到`TIMER_LIST`中。
+The timer type is a structure of `Timer`, and `Timer` is composed of `SpinLock<InnerTimer>`. A global queue `TIMER_LIST` with element type `Arc<Timer>` is used to store the timers created by the system. When creating a timer, you should call `Timer::new(timer_func,expire_jiffies)`, where timer_func is the function to be executed by the timer, expire_jiffies is the expiration time of the timer, and the type of `timer_func` parameter is a structure that implements the `TimerFunction` characteristic. After creating the timer, you should use `Timer::activate()` to insert the timer into `TIMER_LIST`.
 
-&emsp;&emsp;**如果只是希望当前pcb休眠一段时间，应调用`schedule_timeout(timeout)`，timeout指定pcb休眠的时间长度。**
+**If you only want the current PCB to sleep for a certain period, you should call `schedule_timeout(timeout)`, and timeout specifies the duration of the PCB sleep.**
 
-## 3. 定时器应实现的特性
+## 3. Features That the Timer Should Implement
 
-&emsp;&emsp;定时器要执行的函数应实现`TimerFunction`特性，其定义如下：
+The function to be executed by the timer should implement the `TimerFunction` characteristic, and its definition is as follows:
 
 ```rust
 /// 定时器要执行的函数的特征
@@ -21,120 +21,120 @@ pub trait TimerFunction: Send + Sync {
 }
 ```
 
-&emsp;&emsp;一种典型的实现方式是：新建一个零长的结构体，实现`TimerFunction`特性，然后在`run`函数中实现定时器要执行的操作。
+A typical implementation method is: creating a zero-length structure, implementing the `TimerFunction` characteristic, and then implementing the operation to be performed by the timer in the `run` function.
 
-## 4. 定时器API
+## 4. Timer API
 
-### 4.1. Timer的API
+### 4.1. Timer API
 
-#### 4.1.1. 创建一个定时器
+#### 4.1.1. Create a Timer
 ```rust
 pub fn new(timer_func: Box<dyn TimerFunction>, expire_jiffies: u64) -> Arc<Self>
 ```
 
-**参数**
-  
-- timer_func：定时器需要执行的函数对应的结构体，其实现了`TimerFunction`特性
+**Parameters**
 
-- expire_jiffies：定时器结束时刻（单位：**jiffies**）
+- timer_func: A structure corresponding to the function that the timer needs to execute, which implements the `TimerFunction` characteristic
 
-**返回**
+- expire_jiffies: The expiration time of the timer (unit: **jiffies**)
 
-- 定时器结构体指针
+**Return**
 
-#### 4.1.2. 将定时器插入到定时器链表中
+- Pointer to the timer structure
+
+#### 4.1.2. Insert the Timer into the Timer List
 
 ```rust
 pub fn activate(&self)
 ```
 
-### 4.2. 其余API
+### 4.2. Other APIs
 
-&emsp;&emsp;**若想要在.c的模块中使用以下函数，请在函数名之前加上rs_**
+**If you want to use the following functions in a .c module, please add rs_ before the function name.**
 
-#### 4.2.1. 让进程休眠一段时间
+#### 4.2.1. Make the Process Sleep for a Certain Period
 
 ```rust
 pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError>
 ```
 
-**功能**
+**Function**
 
-&emsp;&emsp;让进程休眠timeout个jiffies
+Make the process sleep for timeout jiffies
 
-**参数**
-  
-- timeout：需要休眠的时间 （单位：**jiffies**）
+**Parameters**
 
-**返回值**
-  
-- Ok(i64)：剩余需要休眠的时间 （单位：**jiffies**）
-- Err(SystemError)：错误码
+- timeout: The time to sleep (unit: **jiffies**)
 
-#### 4.2.2. 获取队列中第一个定时器的结束时间
+**Return Value**
+
+- Ok(i64): Remaining time to sleep (unit: **jiffies**)
+- Err(SystemError): Error code
+
+#### 4.2.2. Get the Expiration Time of the First Timer in the Queue
 
 ```rust
 pub fn timer_get_first_expire() -> Result<u64, SystemError>
 ```
 
-**功能**
+**Function**
 
-&emsp;&emsp;获取队列中第一个定时器的结束时间，即最早结束的定时器的结束时间
+Get the expiration time of the first timer in the queue, i.e., the expiration time of the earliest expiring timer
 
-**返回值**
-  
-- Ok(i64)：最早结束的定时器的结束时间 （单位：**jiffies**）
-- Err(SystemError)：错误码
+**Return Value**
 
-#### 4.2.3. 获取当前系统时间
+- Ok(i64): Expiration time of the earliest expiring timer (unit: **jiffies**)
+- Err(SystemError): Error code
+
+#### 4.2.3. Get the Current System Time
 
 ```rust
 pub fn clock() -> u64 
 ```
 
-**功能**
+**Function**
 
-&emsp;&emsp;获取当前系统时间（单位：**jiffies**）
+Get the current system time (unit: **jiffies**)
 
-#### 4.2.4. 计算接下来n毫秒或者微秒对应的定时器时间片
+#### 4.2.4. Calculate the Timer Time Slice Corresponding to the Next n Milliseconds or Microseconds
 
-##### 4.2.4.1. 毫秒
+##### 4.2.4.1. Milliseconds
 
 ```rust
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64
 ```
 
-**功能**
+**Function**
 
-&emsp;&emsp;计算接下来n**毫秒**对应的定时器时间片
+Calculate the timer time slice corresponding to the next n **milliseconds**
 
-**参数**
+**Parameters**
 
-- expire_ms：n毫秒
+- expire_ms: n milliseconds
 
-**返回值**
+**Return Value**
 
-&emsp;&emsp;对应的定时器时间片（单位：**毫秒**）
+The corresponding timer time slice (unit: **milliseconds**)
 
-##### 4.2.4.2. 微秒
+##### 4.2.4.2. Microseconds
 
 ```rust
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64
 ```
 
-**功能**
+**Function**
 
-&emsp;&emsp;计算接下来n**微秒**对应的定时器时间片
+Calculate the timer time slice corresponding to the next n **microseconds**
 
-**参数**
-  
-- expire_ms：n微秒
+**Parameters**
 
-**返回值**
+- expire_ms: n microseconds
 
-&emsp;&emsp;对应的定时器时间片（单位：**微秒**）
+**Return Value**
 
-## 5. 创建定时器实例
+The corresponding timer time slice (unit: **microseconds**)
+
+## 5. Creating a Timer Instance
 
 ```rust
 struct TimerExample {

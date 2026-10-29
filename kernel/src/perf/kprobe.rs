@@ -105,8 +105,8 @@ impl IndexNode for KprobePerfEvent {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        panic!("read_at not implemented for PerfEvent");
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        panic!("read_at not implemented for PerfEvent")
     }
 
     fn write_at(
@@ -115,8 +115,8 @@ impl IndexNode for KprobePerfEvent {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        panic!("write_at not implemented for PerfEvent");
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        panic!("write_at not implemented for PerfEvent")
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -154,7 +154,7 @@ impl PerfEventOps for KprobePerfEvent {
     }
 
     fn readable(&self) -> bool {
-        true
+        false
     }
 }
 

@@ -1,5 +1,5 @@
 use core::{
-    fmt::Debug,
+    fmt::{self, Debug},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -11,25 +11,30 @@ use system_error::SystemError;
 
 use crate::{
     arch::ipc::signal::Signal,
-    driver::{base::device::device_number::DeviceNumber, tty::pty::ptm_driver},
-    filesystem::epoll::{event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem},
+    driver::base::device::device_number::DeviceNumber,
+    filesystem::epoll::{
+        event_poll::{EPollItemList, EventPoll},
+        EPollEventType, EPollItem,
+    },
+    filesystem::vfs::fasync::{FAsyncItem, FAsyncItems},
     libs::{
         rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
-        wait_queue::EventWaitQueue,
+        wait_queue::{EventWaitQueue, WaitQueue},
     },
     mm::VirtAddr,
-    process::{pid::Pid, ProcessControlBlock},
+    process::{pid::Pid, ProcessControlBlock, ProcessManager},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
 use super::{
-    termios::{ControlMode, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
+    termios::{ControlMode, PosixTermio, PosixTermios, Termios, TtySetTermiosOpt, WindowSize},
     tty_driver::{TtyCorePrivateField, TtyDriver, TtyDriverSubType, TtyDriverType, TtyOperation},
     tty_job_control::TtyJobCtrlManager,
     tty_ldisc::{
         ntty::{NTtyData, NTtyLinediscipline},
-        TtyLineDiscipline,
+        TtyLdiscDrainResult, TtyLineDiscipline,
     },
     tty_port::TtyPort,
     virtual_terminal::{vc_manager, virtual_console::VirtualConsoleData, DrawRegion},
@@ -42,11 +47,78 @@ pub struct TtyCore {
     line_discipline: Arc<dyn TtyLineDiscipline>,
 }
 
-impl Drop for TtyCore {
-    fn drop(&mut self) {
-        if self.core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave {
-            ptm_driver().ttys().remove(&self.core().index);
+pub struct TtySleepLock {
+    locked: AtomicBool,
+    wait_queue: WaitQueue,
+}
+
+impl Debug for TtySleepLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TtySleepLock")
+            .field("locked", &self.locked.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+pub struct TtySleepLockGuard<'a> {
+    lock: &'a TtySleepLock,
+}
+
+impl !Send for TtySleepLockGuard<'_> {}
+
+impl TtySleepLock {
+    pub const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            wait_queue: WaitQueue::default(),
         }
+    }
+
+    pub fn lock(&self) -> TtySleepLockGuard<'_> {
+        if let Some(guard) = self.try_lock() {
+            return guard;
+        }
+
+        self.wait_queue.wait_until(|| self.try_lock())
+    }
+
+    pub fn lock_interruptible(&self, nonblock: bool) -> Result<TtySleepLockGuard<'_>, SystemError> {
+        if let Some(guard) = self.try_lock() {
+            return Ok(guard);
+        }
+
+        if nonblock {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+
+        self.wait_queue.wait_until_interruptible(|| self.try_lock())
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Acquire)
+    }
+
+    pub fn try_lock(&self) -> Option<TtySleepLockGuard<'_>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(TtySleepLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+        self.wait_queue.wake_one();
+    }
+}
+
+impl Drop for TtySleepLockGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.unlock();
     }
 }
 
@@ -61,20 +133,27 @@ impl TtyCore {
         let core = TtyCoreData {
             tty_driver: driver,
             termios: RwLock::new(termios),
+            termios_rwsem: RwSem::new(()),
             name,
             flags: RwLock::new(TtyFlag::empty()),
             count: AtomicUsize::new(0),
             window_size: RwLock::new(WindowSize::default()),
             read_wq: EventWaitQueue::new(),
             write_wq: EventWaitQueue::new(),
+            write_lock: TtySleepLock::new(),
+            open_close_lock: TtySleepLock::new(),
+            open_files: AtomicUsize::new(0),
+            job_control_lock: TtySleepLock::new(),
             port: RwLock::new(None),
             index,
             vc_index: AtomicUsize::new(usize::MAX),
             ctrl: SpinLock::new(TtyControlInfo::default()),
             closing: AtomicBool::new(false),
+            hangup_generation: AtomicUsize::new(0),
             flow: SpinLock::new(TtyFlowState::default()),
             link: RwLock::default(),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: EPollItemList::default(),
+            fasync_items: FAsyncItems::new(),
             device_number,
             privete_fields: SpinLock::new(None),
         };
@@ -82,6 +161,7 @@ impl TtyCore {
             core,
             line_discipline: Arc::new(NTtyLinediscipline {
                 data: SpinLock::new(NTtyData::new()),
+                output_lock: TtySleepLock::new(),
             }),
         });
     }
@@ -137,49 +217,191 @@ impl TtyCore {
         *self.core.port.write() = Some(port);
     }
 
-    pub fn tty_start(&self) {
-        let mut flow = self.core.flow.lock_irqsave();
+    fn tty_start_locked(&self, flow: &mut TtyFlowState) -> bool {
         if !flow.stopped || flow.tco_stopped {
-            return;
+            return false;
         }
 
         flow.stopped = false;
         let _ = self.start(self.core());
+        true
+    }
+
+    fn tty_stop_locked(&self, flow: &mut TtyFlowState) -> bool {
+        if flow.stopped {
+            return false;
+        }
+
+        flow.stopped = true;
+        let _ = self.stop(self.core());
+        true
+    }
+
+    pub fn tty_start(&self) {
+        let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        if !self.tty_start_locked(&mut flow) {
+            return;
+        }
+        drop(flow);
         self.tty_wakeup();
+    }
+
+    /// Starts output without waking writers or invoking the line discipline.
+    ///
+    /// A caller that observes `true` must call [`Self::tty_wakeup`] after
+    /// releasing any line-discipline locks it holds.
+    pub(crate) fn tty_start_without_wakeup(&self) -> bool {
+        let mut flow = self.core.flow.lock_irqsave();
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        self.tty_start_locked(&mut flow)
     }
 
     pub fn tty_stop(&self) {
         let mut flow = self.core.flow.lock_irqsave();
-        if flow.stopped {
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        self.tty_stop_locked(&mut flow);
+    }
+
+    pub fn tty_stop_tco(&self) {
+        let mut flow = self.core.flow.lock_irqsave();
+        if flow.tco_stopped {
             return;
         }
-        flow.stopped = true;
+        flow.tco_stopped = true;
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        self.tty_stop_locked(&mut flow);
+    }
 
-        let _ = self.stop(self.core());
+    pub fn tty_start_tco(&self) {
+        let mut flow = self.core.flow.lock_irqsave();
+        if !flow.tco_stopped {
+            return;
+        }
+        flow.tco_stopped = false;
+        flow.transition_seq = flow.transition_seq.wrapping_add(1);
+        if !self.tty_start_locked(&mut flow) {
+            return;
+        }
+        drop(flow);
+        self.tty_wakeup();
+    }
+
+    /// Send a software flow-control character without output post-processing.
+    pub fn tty_send_xchar(&self, ch: u8) -> Result<(), SystemError> {
+        let hook_result = {
+            let _termios_guard = self.core.termios_read_lock();
+            self.core
+                .tty_driver
+                .driver_funcs()
+                .send_xchar(self.core(), ch)
+        };
+        if hook_result != Err(SystemError::ENOSYS) {
+            // Linux's send_xchar hook is void: an implemented driver path is
+            // best-effort and never exposes a device error to userspace.
+            return Ok(());
+        }
+
+        let _write_guard = self.core.write_lock().lock_interruptible(false)?;
+        let _termios_guard = self.core.termios_read_lock();
+
+        let (temporarily_started, transition_seq) = {
+            let mut flow = self.core.flow.lock_irqsave();
+            let transition_seq = flow.transition_seq;
+            let temporarily_started = self.tty_start_locked(&mut flow);
+            (temporarily_started, transition_seq)
+        };
+        let _ = self.write(self.core(), &[ch], 1);
+        let mut should_wake = false;
+        if temporarily_started {
+            let mut flow = self.core.flow.lock_irqsave();
+            // A concurrent flow-control request owns the final state. Restore
+            // the temporary stop only if no request raced with this fallback.
+            if flow.transition_seq == transition_seq && !flow.stopped {
+                self.tty_stop_locked(&mut flow);
+            } else if !flow.stopped {
+                // A start request can observe the temporary running state and
+                // skip its own wakeup. Complete that request after dropping
+                // every lock that write_wakeup may re-enter.
+                should_wake = true;
+            }
+        }
+        drop(_termios_guard);
+        drop(_write_guard);
+        if should_wake {
+            self.tty_wakeup();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reset_flow_state(&self) {
+        *self.core.flow.lock_irqsave() = TtyFlowState::default();
     }
 
     pub fn tty_wakeup(&self) {
         if self.core.flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
-            let _ = self.ldisc().write_wakeup(self.core());
+            let _ = self.ldisc().write_wakeup(self);
         }
 
-        self.core()
-            .write_wq
-            .wakeup_any(EPollEventType::EPOLLOUT.bits() as u64);
+        let events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
+        self.core().write_wq.wakeup_any(events.bits() as u64);
+        let _ = EventPoll::wakeup_epoll(self.core().epitems(), events);
+    }
+
+    pub fn tty_vhangup(tty: Arc<TtyCore>) {
+        let _job_control_guard = tty.core().job_control_lock().lock();
+        {
+            let mut flags = tty.core().flags_write();
+            if flags.intersects(TtyFlag::HUPPED | TtyFlag::HUPPING) {
+                return;
+            }
+            flags.insert(TtyFlag::HUPPING);
+            tty.core().hangup_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        // Linux removes fasync registrations before replacing existing tty
+        // file operations with hung_up_tty_fops. This also clears O_ASYNC on
+        // every pre-hangup open file description.
+        tty.core().fasync_items.clear();
+
+        let pgid = TtyJobCtrlManager::remove_session_tty_job_locked(&tty, None);
+
+        if let Some(pgrp) = pgid {
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGHUP);
+            let _ = crate::ipc::kill::send_signal_to_pgid(&pgrp, Signal::SIGCONT);
+        }
+
+        let _ = tty.ldisc().hangup(tty.clone());
+
+        {
+            let mut ctrl = tty.core().contorl_info_irqsave();
+            ctrl.pktstatus = TtyPacketStatus::empty();
+        }
+
+        {
+            let mut flags = tty.core().flags_write();
+            flags.remove(TtyFlag::DO_WRITE_WAKEUP);
+            flags.remove(TtyFlag::HUPPING);
+            flags.insert(TtyFlag::HUPPED);
+        }
+
+        tty.core().read_wq().wakeup_all();
+        tty.core().write_wq().wakeup_all();
+        let _ = EventPoll::wakeup_epoll(tty.core().epitems(), EPollEventType::EPOLLHUP);
     }
 
     pub fn tty_mode_ioctl(tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<usize, SystemError> {
         let core = tty.core();
-        let real_tty = if core.driver().tty_driver_type() == TtyDriverType::Pty
-            && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster
-        {
+        let redirected_from_pty_master = core.driver().tty_driver_type() == TtyDriverType::Pty
+            && core.driver().tty_driver_sub_type() == TtyDriverSubType::PtyMaster;
+        let real_tty = if redirected_from_pty_master {
             core.link().unwrap()
         } else {
             tty
         };
         match cmd {
             TtyIoctlCmd::TCGETS => {
-                let termios = PosixTermios::from_kernel_termios(*real_tty.core.termios());
+                let snapshot = real_tty.core.committed_termios_snapshot();
+                let termios = PosixTermios::from_kernel_termios(&snapshot);
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<PosixTermios>(),
                     core::mem::size_of::<PosixTermios>(),
@@ -189,11 +411,23 @@ impl TtyCore {
                 user_writer.copy_one_to_user(&termios, 0)?;
                 return Ok(0);
             }
+            TtyIoctlCmd::TCGETA => {
+                let snapshot = real_tty.core.committed_termios_snapshot();
+                let termio = PosixTermio::from_kernel_termios(&snapshot);
+                let mut user_writer = UserBufferWriter::new(
+                    VirtAddr::new(arg).as_ptr::<PosixTermio>(),
+                    core::mem::size_of::<PosixTermio>(),
+                    true,
+                )?;
+                user_writer.copy_one_to_user(&termio, 0)?;
+                return Ok(0);
+            }
             TtyIoctlCmd::TCSETS => {
                 return TtyCore::core_set_termios(
                     real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_OLD,
+                    redirected_from_pty_master,
                 );
             }
             TtyIoctlCmd::TCSETSW => {
@@ -201,6 +435,43 @@ impl TtyCore {
                     real_tty,
                     VirtAddr::new(arg),
                     TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_OLD,
+                    redirected_from_pty_master,
+                );
+            }
+            TtyIoctlCmd::TCSETSF => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_FLUSH
+                        | TtySetTermiosOpt::TERMIOS_WAIT
+                        | TtySetTermiosOpt::TERMIOS_OLD,
+                    redirected_from_pty_master,
+                );
+            }
+            TtyIoctlCmd::TCSETA => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_TERMIO,
+                    redirected_from_pty_master,
+                );
+            }
+            TtyIoctlCmd::TCSETAW => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_TERMIO,
+                    redirected_from_pty_master,
+                );
+            }
+            TtyIoctlCmd::TCSETAF => {
+                return TtyCore::core_set_termios(
+                    real_tty,
+                    VirtAddr::new(arg),
+                    TtySetTermiosOpt::TERMIOS_FLUSH
+                        | TtySetTermiosOpt::TERMIOS_WAIT
+                        | TtySetTermiosOpt::TERMIOS_TERMIO,
+                    redirected_from_pty_master,
                 );
             }
             _ => {
@@ -210,6 +481,9 @@ impl TtyCore {
     }
 
     pub fn tty_perform_flush(tty: Arc<TtyCore>, arg: usize) -> Result<usize, SystemError> {
+        // Job control check for TCFLSH ioctl.  This is a separate path
+        // from core_set_termios (termios ioctls); the two are never
+        // invoked concurrently for the same operation.
         TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
 
         match arg {
@@ -218,16 +492,10 @@ impl TtyCore {
             }
             TtyFlushArg::TCIOFLUSH => {
                 tty.ldisc().flush_buffer(tty.clone())?;
-                let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
-                if ret != Err(SystemError::ENOSYS) {
-                    ret?;
-                }
+                tty.ldisc().flush_output(tty.clone())?;
             }
             TtyFlushArg::TCOFLUSH => {
-                let ret = tty.core().driver().driver_funcs().flush_buffer(tty.core());
-                if ret != Err(SystemError::ENOSYS) {
-                    ret?;
-                }
+                tty.ldisc().flush_output(tty.clone())?;
             }
             _ => {
                 return Err(SystemError::EINVAL);
@@ -241,13 +509,28 @@ impl TtyCore {
         tty: Arc<TtyCore>,
         arg: VirtAddr,
         opt: TtySetTermiosOpt,
+        redirected_from_pty_master: bool,
     ) -> Result<usize, SystemError> {
+        // Check job control: prevent background process groups from changing
+        // terminal attributes without permission.  Matches Linux 6.6
+        // set_termios() which calls tty_check_change() before any work.
+        // This path is separate from tty_perform_flush (TCFLSH ioctl);
+        // the two never overlap in a single operation.
+        TtyJobCtrlManager::tty_check_change(tty.clone(), Signal::SIGTTOU)?;
+
         #[allow(unused_assignments)]
         // TERMIOS_TERMIO下会用到
-        let mut tmp_termios = *tty.core().termios();
+        let mut tmp_termios = tty.core().committed_termios_snapshot();
 
         if opt.contains(TtySetTermiosOpt::TERMIOS_TERMIO) {
-            todo!()
+            let user_reader = UserBufferReader::new(
+                arg.as_ptr::<PosixTermio>(),
+                core::mem::size_of::<PosixTermio>(),
+                true,
+            )?;
+            let mut termio = PosixTermio::default();
+            user_reader.copy_one_from_user(&mut termio, 0)?;
+            tmp_termios = termio.to_kernel_termios(&tmp_termios);
         } else {
             let user_reader = UserBufferReader::new(
                 arg.as_ptr::<PosixTermios>(),
@@ -261,20 +544,101 @@ impl TtyCore {
             tmp_termios = term.to_kernel_termios();
         }
 
-        if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
-            let ld = tty.ldisc();
-            let _ = ld.flush_buffer(tty.clone());
+        if opt.intersects(TtySetTermiosOpt::TERMIOS_WAIT | TtySetTermiosOpt::TERMIOS_FLUSH) {
+            let events = (EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM).bits() as u64;
+
+            loop {
+                let write_guard = tty.core().write_lock().lock_interruptible(false)?;
+                let termios_guard = tty.core().termios_write_lock_interruptible()?;
+
+                let output_closed = Self::output_terminal_closed(tty.core());
+                if output_closed && !redirected_from_pty_master {
+                    return Err(SystemError::EIO);
+                }
+
+                if !output_closed {
+                    match tty.ldisc().drain_output(tty.clone())? {
+                        TtyLdiscDrainResult::Drained => {}
+                        TtyLdiscDrainResult::NeedWriteRoom(required) => {
+                            let required = required.max(1);
+                            drop(termios_guard);
+                            drop(write_guard);
+                            tty.core().write_wq().wait_event_interruptible(events, || {
+                                Self::output_terminal_closed(tty.core())
+                                    || tty.write_room(tty.core()) >= required
+                                    || !tty.ldisc().output_pending()
+                            })?;
+                            if Self::output_terminal_closed(tty.core())
+                                && !redirected_from_pty_master
+                            {
+                                return Err(SystemError::EIO);
+                            }
+                            continue;
+                        }
+                    }
+
+                    if tty.chars_in_buffer(tty.core()) != 0 {
+                        drop(termios_guard);
+                        drop(write_guard);
+                        tty.core().write_wq().wait_event_interruptible(events, || {
+                            Self::output_terminal_closed(tty.core())
+                                || tty.chars_in_buffer(tty.core()) == 0
+                        })?;
+                        if Self::output_terminal_closed(tty.core()) && !redirected_from_pty_master {
+                            return Err(SystemError::EIO);
+                        }
+                        continue;
+                    }
+                }
+
+                // Linux flushes input and waits for the physical transmitter
+                // before tty_set_termios() takes termios_rwsem for the short
+                // attribute transaction. Keeping the write side of the
+                // semaphore across either operation can deadlock synchronous
+                // input producers and unnecessarily stalls RX at low baud.
+                drop(termios_guard);
+
+                // Linux performs input flush after the output-drain recheck.
+                if opt.contains(TtySetTermiosOpt::TERMIOS_FLUSH) {
+                    tty.ldisc().flush_buffer(tty.clone())?;
+                }
+
+                if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) && !output_closed {
+                    tty.wait_until_sent(tty.core())?;
+                    let current = ProcessManager::current_pcb();
+                    if current.has_pending_signal_fast() && current.has_pending_not_masked_signal()
+                    {
+                        return Err(SystemError::ERESTARTSYS);
+                    }
+                    if Self::output_terminal_closed(tty.core()) && !redirected_from_pty_master {
+                        return Err(SystemError::EIO);
+                    }
+                }
+
+                let termios_guard = tty.core().termios_write_lock_interruptible()?;
+                let result = Self::set_termios_locked(tty.clone(), tmp_termios);
+                drop(termios_guard);
+                drop(write_guard);
+                Self::retry_deferred_output(&tty);
+                result?;
+                return Ok(0);
+            }
         }
 
-        if opt.contains(TtySetTermiosOpt::TERMIOS_WAIT) {
-            // TODO
-        }
-
-        TtyCore::set_termios_next(tty, tmp_termios)?;
+        Self::set_termios_next(tty, tmp_termios)?;
         Ok(0)
     }
 
     fn set_termios_next(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
+        let termios_guard = tty.core().termios_write_lock_interruptible()?;
+        let result = Self::set_termios_locked(tty.clone(), new_termios);
+        drop(termios_guard);
+        Self::retry_deferred_output(&tty);
+        result
+    }
+
+    /// Apply termios while the caller holds `termios_write_lock_interruptible()`.
+    fn set_termios_locked(tty: Arc<TtyCore>, new_termios: Termios) -> Result<(), SystemError> {
         let mut termios = tty.core().termios_write();
 
         let old_termios = *termios;
@@ -287,8 +651,11 @@ impl TtyCore {
         let mut termios = tty.core().termios_write();
         if ret.is_err() {
             termios.control_mode &= ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL;
-            termios.control_mode |= old_termios.control_mode
-                & !(ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL);
+            // bitflags' !mask truncates unnamed bits. Linux preserves all
+            // old hardware bits outside this software-controlled mask.
+            termios.control_mode |= old_termios
+                .control_mode
+                .difference(ControlMode::HUPCL | ControlMode::CREAD | ControlMode::CLOCAL);
             termios.input_speed = old_termios.input_speed;
             termios.output_speed = old_termios.output_speed;
         }
@@ -298,6 +665,19 @@ impl TtyCore {
         ld.set_termios(tty, Some(old_termios)).ok();
 
         Ok(())
+    }
+
+    fn output_terminal_closed(core: &TtyCoreData) -> bool {
+        let flags = core.flags();
+        flags.intersects(TtyFlag::IO_ERROR | TtyFlag::HUPPED | TtyFlag::HUPPING)
+            || (flags.contains(TtyFlag::OTHER_CLOSED)
+                && core.driver().tty_driver_sub_type() != TtyDriverSubType::PtyMaster)
+    }
+
+    fn retry_deferred_output(tty: &Arc<TtyCore>) {
+        if tty.core().flags().contains(TtyFlag::DO_WRITE_WAKEUP) {
+            tty.tty_wakeup();
+        }
     }
 
     pub fn tty_do_resize(&self, windowsize: WindowSize) -> Result<(), SystemError> {
@@ -346,12 +726,17 @@ pub struct TtyFlowState {
     pub stopped: bool,
     /// 表示 TCO（Transmit Continuous Operation）流控是否被停止
     pub tco_stopped: bool,
+    /// Changes whenever an external start/stop request can supersede a
+    /// temporary state transition used by the xchar fallback.
+    transition_seq: usize,
 }
 
 #[derive(Debug)]
 pub struct TtyCoreData {
     tty_driver: Arc<TtyDriver>,
     termios: RwLock<Termios>,
+    /// Serializes termios users with the update + driver/ldisc notification transaction.
+    termios_rwsem: RwSem<()>,
     name: String,
     flags: RwLock<TtyFlag>,
     /// 在初始化时即确定不会更改，所以这里不用加锁
@@ -364,18 +749,33 @@ pub struct TtyCoreData {
     read_wq: EventWaitQueue,
     /// 写等待队列
     write_wq: EventWaitQueue,
+    /// 串行化整个 tty write 调用，等价于 Linux tty->atomic_write_lock。
+    write_lock: TtySleepLock,
+    /// Serializes non-PTY first-open/last-close driver lifecycle callbacks.
+    open_close_lock: TtySleepLock,
+    /// User file descriptions; unlike `count`, this excludes the driver's
+    /// persistent table reference.
+    open_files: AtomicUsize,
+    /// Serializes controlling-session changes with hangup.
+    job_control_lock: TtySleepLock,
     /// 端口
     port: RwLock<Option<Arc<dyn TtyPort>>>,
     /// 前台进程
     ctrl: SpinLock<TtyControlInfo>,
     /// 是否正在关闭
     closing: AtomicBool,
+    /// Incremented when a hangup starts so file instances opened before that
+    /// point retain Linux's hung_up_tty_fops semantics independently of later
+    /// reopens.
+    hangup_generation: AtomicUsize,
     /// 流控状态
     flow: SpinLock<TtyFlowState>,
     /// 链接tty
     link: RwLock<Weak<TtyCore>>,
     /// epitems
-    epitems: LockedEPItemLinkedList,
+    epitems: EPollItemList,
+    /// Open file descriptions registered for asynchronous TTY notification.
+    fasync_items: FAsyncItems,
     /// 设备号
     device_number: DeviceNumber,
 
@@ -423,6 +823,68 @@ impl TtyCoreData {
     }
 
     #[inline]
+    pub fn hangup_generation(&self) -> usize {
+        self.hangup_generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn file_hung_up(&self, file_hangup_generation: usize) -> bool {
+        self.hangup_generation() != file_hangup_generation
+    }
+
+    /// Snapshot the generation assigned to a newly opening file.
+    ///
+    /// A file which races with an in-progress hangup belongs to the generation
+    /// being hung up. Holding the flags read lock pairs this decision with the
+    /// generation increment performed under the flags write lock.
+    pub fn file_open_hangup_generation(&self) -> usize {
+        let flags = self.flags.read_irqsave();
+        let generation = self.hangup_generation.load(Ordering::Acquire);
+        if flags.contains(TtyFlag::HUPPING) {
+            generation.wrapping_sub(1)
+        } else {
+            generation
+        }
+    }
+
+    /// Clear a completed pre-open hangup only if no newer hangup raced with
+    /// this open. The generation comparison and flag update share the same
+    /// critical section as tty_vhangup's generation increment.
+    pub fn finish_file_open(&self, file_hangup_generation: usize) {
+        let mut flags = self.flags.write_irqsave();
+        if self.hangup_generation.load(Ordering::Acquire) == file_hangup_generation {
+            flags.remove(TtyFlag::HUPPED);
+        }
+    }
+
+    pub fn add_fasync(
+        &self,
+        file_hangup_generation: usize,
+        item: FAsyncItem,
+    ) -> Result<(), SystemError> {
+        let flags = self.flags.read_irqsave();
+        if flags.contains(TtyFlag::HUPPING)
+            || self.hangup_generation.load(Ordering::Acquire) != file_hangup_generation
+        {
+            return Err(SystemError::ENOTTY);
+        }
+        self.fasync_items.add(item);
+        Ok(())
+    }
+
+    pub fn remove_fasync(&self, file: &Weak<crate::filesystem::vfs::file::File>) {
+        self.fasync_items.remove(file);
+    }
+
+    pub fn remove_fasync_file(&self, file: &crate::filesystem::vfs::file::File) {
+        self.fasync_items.remove_file(file);
+    }
+
+    pub fn private_fields(&self) -> Option<Arc<dyn TtyCorePrivateField>> {
+        self.privete_fields.lock().clone()
+    }
+
+    #[inline]
     pub fn termios(&self) -> RwLockReadGuard<'_, Termios> {
         self.termios.read_irqsave()
     }
@@ -430,6 +892,37 @@ impl TtyCoreData {
     #[inline]
     pub fn termios_write(&self) -> RwLockWriteGuard<'_, Termios> {
         self.termios.write_irqsave()
+    }
+
+    /// Snapshot only a fully committed termios transaction.
+    pub fn committed_termios_snapshot(&self) -> Termios {
+        let _guard = self.termios_read_lock();
+        *self.termios()
+    }
+
+    #[inline]
+    pub fn termios_read_lock(&self) -> RwSemReadGuard<'_, ()> {
+        self.termios_rwsem.read()
+    }
+
+    #[inline]
+    pub fn termios_read_lock_interruptible(&self) -> Result<RwSemReadGuard<'_, ()>, SystemError> {
+        self.termios_rwsem.read_interruptible()
+    }
+
+    #[inline]
+    pub fn termios_try_read_lock(&self) -> Option<RwSemReadGuard<'_, ()>> {
+        self.termios_rwsem.try_read()
+    }
+
+    #[inline]
+    pub fn termios_write_lock_interruptible(&self) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.termios_rwsem.write_interruptible()
+    }
+
+    #[inline]
+    pub fn termios_write_lock(&self) -> RwSemWriteGuard<'_, ()> {
+        self.termios_rwsem.write()
     }
 
     #[inline]
@@ -468,6 +961,34 @@ impl TtyCoreData {
     #[inline]
     pub fn write_wq(&self) -> &EventWaitQueue {
         &self.write_wq
+    }
+
+    pub fn write_lock(&self) -> &TtySleepLock {
+        &self.write_lock
+    }
+
+    pub(crate) fn open_close_lock(&self) -> &TtySleepLock {
+        &self.open_close_lock
+    }
+
+    /// Caller must hold `open_close_lock`.
+    pub(crate) fn begin_file_open(&self) -> bool {
+        self.open_files.fetch_add(1, Ordering::SeqCst) == 0
+    }
+
+    /// Caller must hold `open_close_lock`.
+    pub(crate) fn end_file_open(&self) -> bool {
+        let count = self.open_files.load(Ordering::SeqCst);
+        if count == 0 {
+            return false;
+        }
+        self.open_files.store(count - 1, Ordering::SeqCst);
+        count == 1
+    }
+
+    #[inline]
+    pub fn job_control_lock(&self) -> &TtySleepLock {
+        &self.job_control_lock
     }
 
     #[inline]
@@ -548,20 +1069,14 @@ impl TtyCoreData {
 
     #[inline]
     pub fn add_epitem(&self, epitem: Arc<EPollItem>) {
-        self.epitems.lock().push_back(epitem)
+        self.epitems.add(epitem)
     }
 
     pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 
-    pub fn epitems(&self) -> &LockedEPItemLinkedList {
+    pub fn epitems(&self) -> &EPollItemList {
         &self.epitems
     }
 
@@ -582,6 +1097,12 @@ impl TtyCoreData {
 
             while nr != 0 {
                 if !rescan {
+                    // Match Linux's `while (!stopped)` plus
+                    // `goto rescan_last_byte`: stop before consuming a new
+                    // byte, but always finish a byte already marked rescan.
+                    if self.flow.lock_irqsave().stopped {
+                        break;
+                    }
                     ch = buf[offset] as u32;
                     offset += 1;
                     nr -= 1;
@@ -644,6 +1165,11 @@ impl TtyOperation for TtyCore {
     }
 
     #[inline]
+    fn send_xchar(&self, tty: &TtyCoreData, ch: u8) -> Result<(), SystemError> {
+        self.core().tty_driver.driver_funcs().send_xchar(tty, ch)
+    }
+
+    #[inline]
     fn install(&self, driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
         return self.core().tty_driver.driver_funcs().install(driver, tty);
     }
@@ -664,8 +1190,13 @@ impl TtyOperation for TtyCore {
     }
 
     #[inline]
-    fn chars_in_buffer(&self) -> usize {
-        return self.core().tty_driver.driver_funcs().chars_in_buffer();
+    fn chars_in_buffer(&self, tty: &TtyCoreData) -> usize {
+        return tty.tty_driver.driver_funcs().chars_in_buffer(tty);
+    }
+
+    #[inline]
+    fn wait_until_sent(&self, tty: &TtyCoreData) -> Result<(), SystemError> {
+        tty.tty_driver.driver_funcs().wait_until_sent(tty)
     }
 
     #[inline]
@@ -678,21 +1209,33 @@ impl TtyOperation for TtyCore {
     }
 
     fn close(&self, tty: Arc<TtyCore>) -> Result<(), SystemError> {
+        let non_pty = tty.core().driver().tty_driver_type() != TtyDriverType::Pty;
+        let _open_close_guard = non_pty.then(|| tty.core().open_close_lock().lock());
+        let is_non_pty_last = non_pty && tty.core().end_file_open();
         self.core().dec_count();
         let cnt = self.core().count();
         // TODO: fix pty slave close issue
         let subtype = tty.core().driver().tty_driver_sub_type();
         let is_pty_slave_last = cnt == 1 && subtype == TtyDriverSubType::PtySlave;
         let is_pty_master_last = cnt == 1 && subtype == TtyDriverSubType::PtyMaster;
-        if !self.core().count_valid() || is_pty_slave_last || is_pty_master_last {
+        let final_release = !self.core().count_valid();
+        if final_release || is_pty_slave_last || is_pty_master_last || is_non_pty_last {
             // log::debug!(
             //     "TtyCore close: ref count: {}, tty: {}",
             //     cnt,
             //     tty.core().name()
             // );
             let r = self.core().tty_driver.driver_funcs().close(tty.clone());
-            // 如果计数为0或者无效，表示tty已经关闭
-            TtyJobCtrlManager::remove_session_tty(&tty);
+            // Linux pty_close() runs when the last user fd closes even though
+            // the peer keeps the tty structure count at one. The controlling
+            // session remains attached in that case and may reopen /dev/tty;
+            // only a true final structure release clears it here.
+            if final_release || is_non_pty_last {
+                self.reset_flow_state();
+            }
+            if final_release {
+                let _ = TtyJobCtrlManager::remove_session_tty(&tty);
+            }
             return r;
         }
         Ok(())
@@ -873,6 +1416,8 @@ impl TtyIoctlCmd {
     pub const TIOCGPKT: u32 = 0x80045438;
     /// 获取pts index
     pub const TIOCGPTN: u32 = 0x80045430;
+    /// Open the slave side of a Unix98 PTY from the master fd.
+    pub const TIOCGPTPEER: u32 = 0x5441;
 }
 
 pub struct TtyFlushArg;
@@ -885,4 +1430,14 @@ impl TtyFlushArg {
     pub const TCOFLUSH: usize = 1;
     /// 丢弃所有待处理输入和输出数据
     pub const TCIOFLUSH: usize = 2;
+}
+
+pub struct TtyFlowArg;
+
+#[allow(dead_code)]
+impl TtyFlowArg {
+    pub const TCOOFF: usize = 0;
+    pub const TCOON: usize = 1;
+    pub const TCIOFF: usize = 2;
+    pub const TCION: usize = 3;
 }

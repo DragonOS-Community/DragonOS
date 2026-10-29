@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Soft Interrupt &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Locks" href="../locking/index.html" />
+    <link rel="prev" title="Notifier Chain Notification Chain" href="notifier_chain.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Core API Documentation</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="kernel_api.html">DragonOS Kernel Core API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="atomic.html">Atomic Variables</a></li>
+<li class="toctree-l3"><a class="reference internal" href="casting.html">Type Conversion Library API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="notifier_chain.html">Notifier Chain Notification Chain</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Soft Interrupt</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#design-philosophy">1. Design Philosophy</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#soft-interrupt-vector-number">2. Soft Interrupt Vector Number</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#soft-interrupt-api">3. Soft Interrupt API</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Core API Documentation</a></li>
+      <li class="breadcrumb-item active">Soft Interrupt</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/locales/en/kernel/core_api/softirq.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/core_api/softirq.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:38</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="soft-interrupt">
+<h1>Soft Interrupt<a class="headerlink" href="#soft-interrupt" title="Permalink to this heading"></a></h1>
+<p>  Software interrupt, also known as the bottom half of an interrupt, is used to delay the processing of work that was not completed by the hard interrupt (the top half of the interrupt). Dividing the interrupt into two stages can effectively solve the problems of long interrupt handling time and interrupt loss.</p>
+<section id="design-philosophy">
+<h2>1. Design Philosophy<a class="headerlink" href="#design-philosophy" title="Permalink to this heading"></a></h2>
+<p>  Each CPU has its own pending status. Soft interrupts are “initiated by which CPU, executed by which CPU”, and the pending status of each CPU is not shared. The same soft interrupt vector can run concurrently on multiple cores.</p>
+<p>  When we need to register a new soft interrupt, we need to implement the <code class="docutils literal notranslate"><span class="pre">SoftirqVec</span></code> feature for the soft interrupt handler, and then call the <code class="docutils literal notranslate"><span class="pre">register_softirq</span></code> function to register the soft interrupt handler within the soft interrupt mechanism.</p>
+<p>  Please note that due to the reentrancy and concurrency of soft interrupts, the soft interrupt handler must ensure thread safety itself.</p>
+</section>
+<section id="soft-interrupt-vector-number">
+<h2>2. Soft Interrupt Vector Number<a class="headerlink" href="#soft-interrupt-vector-number" title="Permalink to this heading"></a></h2>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">enum</span> <span class="nc">SoftirqNumber</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 时钟软中断信号</span>
+<span class="w">    </span><span class="n">TIMER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// 帧缓冲区刷新软中断</span>
+<span class="w">    </span><span class="n">VideoRefresh</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="soft-interrupt-api">
+<h2>3. Soft Interrupt API<a class="headerlink" href="#soft-interrupt-api" title="Permalink to this heading"></a></h2>
+<section id="softirqvec-feature">
+<h3>3.1. SoftirqVec Feature<a class="headerlink" href="#softirqvec-feature" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">SoftirqVec</span>: <span class="nb">Send</span> <span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Debug</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">run</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  The feature that the soft interrupt handler needs to implement. It needs to implement the <code class="docutils literal notranslate"><span class="pre">run</span></code> function to handle the soft interrupt. When the soft interrupt is executed, the <code class="docutils literal notranslate"><span class="pre">run</span></code> function will be called.</p>
+</section>
+<section id="softirq-api">
+<h3>3.2. Softirq API<a class="headerlink" href="#softirq-api" title="Permalink to this heading"></a></h3>
+<section id="register-soft-interrupt-vector">
+<h4>3.2.1. Register Soft Interrupt Vector<a class="headerlink" href="#register-soft-interrupt-vector" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">register_softirq</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span>
+<span class="w">        </span><span class="n">softirq_num</span>: <span class="nc">SoftirqNumber</span><span class="p">,</span>
+<span class="w">        </span><span class="n">handler</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">SoftirqVec</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="n">SystemError</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Parameters:</p>
+<ul>
+<li><p>softirq_num: Interrupt vector number</p></li>
+<li><p>handler: The structure corresponding to the interrupt function, which needs to point to a structure variable that implements the <code class="docutils literal notranslate"><span class="pre">SoftirqVec</span></code> feature</p></li>
+</ul>
+</li>
+<li><p>Return:</p>
+<ul>
+<li><p>Ok(i32): 0</p></li>
+<li><p>Err(SystemError): Error code</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="unregister-soft-interrupt-vector">
+<h4>3.2.2. Unregister Soft Interrupt Vector<a class="headerlink" href="#unregister-soft-interrupt-vector" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">unregister_softirq</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">softirq_num</span>: <span class="nc">SoftirqNumber</span><span class="p">)</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Parameters:</p>
+<ul>
+<li><p>softirq_num: Interrupt vector number</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="execute-soft-interrupt">
+<h4>3.2.3. Execute Soft Interrupt<a class="headerlink" href="#execute-soft-interrupt" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">do_softirq</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Purpose: Execute the soft interrupt function (<strong>only called after hard interrupt execution</strong>)</p></li>
+</ul>
+</section>
+<section id="clear-the-pending-flag-of-soft-interrupt">
+<h4>3.2.4. Clear the Pending Flag of Soft Interrupt<a class="headerlink" href="#clear-the-pending-flag-of-soft-interrupt" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="k">fn</span> <span class="nf">clear_softirq_pending</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">softirq_num</span>: <span class="nc">SoftirqNumber</span><span class="p">)</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Purpose: Clear the pending flag of the specified soft interrupt on the current CPU. Please note that this function is unsafe because it directly modifies the pending flag without locking.</p></li>
+<li><p>Parameters:</p>
+<ul>
+<li><p>softirq_num: Interrupt vector number</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="mark-soft-interrupt-as-to-be-executed">
+<h4>3.2.5. Mark Soft Interrupt as to be Executed<a class="headerlink" href="#mark-soft-interrupt-as-to-be-executed" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">raise_softirq</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">softirq_num</span>: <span class="nc">SoftirqNumber</span><span class="p">)</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Purpose: Mark the specified soft interrupt as to be executed on the current CPU</p></li>
+<li><p>Parameters:</p>
+<ul>
+<li><p>softirq_num: Interrupt vector number</p></li>
+</ul>
+</li>
+</ul>
+</section>
+</section>
+<section id="usage-example">
+<h3>3.3. Usage Example<a class="headerlink" href="#usage-example" title="Permalink to this heading"></a></h3>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="cp">#[derive(Debug)]</span>
+<span class="sd">/// SoftirqExample中断结构体</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">SoftirqExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">running</span>: <span class="nc">AtomicBool</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="sd">/// SoftirqExample中断需要处理的逻辑</span>
+<span class="k">fn</span> <span class="nf">softirq_example_func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;addressed SoftirqExample&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">SoftirqVec</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">SoftirqExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">run</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">set_run</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="n">softirq_example_func</span><span class="p">();</span>
+
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">clear_run</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">SoftirqExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">()</span><span class="w"> </span>-&gt; <span class="nc">SoftirqExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">SoftirqExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">running</span>: <span class="nc">AtomicBool</span>::<span class="n">new</span><span class="p">(</span><span class="kc">false</span><span class="p">),</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">fn</span> <span class="nf">set_run</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">bool</span> <span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span>
+<span class="w">            </span><span class="p">.</span><span class="n">running</span>
+<span class="w">            </span><span class="p">.</span><span class="n">compare_exchange</span><span class="p">(</span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span>::<span class="n">Acquire</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span>::<span class="n">Relaxed</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">x</span><span class="p">.</span><span class="n">is_ok</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="kc">true</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="kc">false</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">fn</span> <span class="nf">clear_run</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">running</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span>::<span class="n">Release</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="k">fn</span> <span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">softirq_example</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Arc</span>::<span class="n">new</span><span class="p">(</span><span class="n">SoftirqExample</span>::<span class="n">new</span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">softirq_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// 注册SoftirqExample中断</span>
+<span class="w">    </span><span class="n">softirq_vectors</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="n">register_softirq</span><span class="p">(</span><span class="n">SoftirqNumber</span>::<span class="n">from</span><span class="p">(</span><span class="n">softirq_num</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="p">),</span><span class="w"> </span><span class="n">softirq_example</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">&quot;failed to register SoftirqExample&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 标志SoftirqExample中断需要执行</span>
+<span class="w">    </span><span class="n">softirq_vectors</span><span class="p">().</span><span class="n">raise_softirq</span><span class="p">(</span><span class="n">SoftirqNumber</span>::<span class="n">from</span><span class="p">(</span><span class="n">softirq_num</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="p">));</span>
+
+<span class="w">    </span><span class="c1">// 标志SoftirqExample中断不需要执行</span>
+<span class="w">    </span><span class="n">softirq_vectors</span><span class="p">().</span><span class="n">clear_softirq_pending</span><span class="p">(</span><span class="n">SoftirqNumber</span>::<span class="n">from</span><span class="p">(</span><span class="n">softirq_num</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="p">));</span>
+
+<span class="w">    </span><span class="c1">// 解注册SoftirqExample中断</span>
+<span class="w">    </span><span class="n">softirq_vectors</span><span class="p">().</span><span class="n">unregister_softirq</span><span class="p">(</span><span class="n">SoftirqNumber</span>::<span class="n">from</span><span class="p">(</span><span class="n">softirq_num</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="p">));</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="notifier_chain.html" class="btn btn-neutral float-left" title="Notifier Chain Notification Chain" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../locking/index.html" class="btn btn-neutral float-right" title="Locks" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/kernel/core_api/softirq.html">V0.2.0</a></dd>
+      <dd><a href="softirq.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/core_api/softirq.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/core_api/softirq.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

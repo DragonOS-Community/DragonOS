@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DragonOS内核核心API &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="原子变量" href="atomic.html" />
+    <link rel="prev" title="核心API文档" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">核心API文档</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">DragonOS内核核心API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">循环链表管理函数</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#void-list-init-struct-list-list"><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_init(struct</span> <span class="pre">List</span> <span class="pre">*list)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#void-list-add-struct-list-entry-struct-list-node"><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_add(struct</span> <span class="pre">List</span> <span class="pre">*entry,</span> <span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*node)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#void-list-append-struct-list-entry-struct-list-node"><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_append(struct</span> <span class="pre">List</span> <span class="pre">*entry,</span> <span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*node)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#void-list-del-struct-list-entry"><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_del(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-del-init-struct-list-entry"><code class="docutils literal notranslate"><span class="pre">list_del_init(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#bool-list-empty-struct-list-entry"><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">list_empty(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#struct-list-list-prev-struct-list-entry"><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*list_prev(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#struct-list-list-next-struct-list-entry"><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*list_next(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#void-list-replace-struct-list-old-struct-list-new"><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_replace(struct</span> <span class="pre">List</span> <span class="pre">*old,</span> <span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*new)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-entry-ptr-type-member"><code class="docutils literal notranslate"><span class="pre">list_entry(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-first-entry-ptr-type-member"><code class="docutils literal notranslate"><span class="pre">list_first_entry(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-first-entry-or-null-ptr-type-member"><code class="docutils literal notranslate"><span class="pre">list_first_entry_or_null(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-last-entry-ptr-type-member"><code class="docutils literal notranslate"><span class="pre">list_last_entry(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-last-entry-or-full-ptr-type-member"><code class="docutils literal notranslate"><span class="pre">list_last_entry_or_full(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-next-entry-pos-member"><code class="docutils literal notranslate"><span class="pre">list_next_entry(pos,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-prev-entry-pos-member"><code class="docutils literal notranslate"><span class="pre">list_prev_entry(pos,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-ptr-head"><code class="docutils literal notranslate"><span class="pre">list_for_each(ptr,</span> <span class="pre">head)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-prev-ptr-head"><code class="docutils literal notranslate"><span class="pre">list_for_each_prev(ptr,</span> <span class="pre">head)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-safe-ptr-n-head"><code class="docutils literal notranslate"><span class="pre">list_for_each_safe(ptr,</span> <span class="pre">n,</span> <span class="pre">head)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-prev-safe-ptr-n-head"><code class="docutils literal notranslate"><span class="pre">list_for_each_prev_safe(ptr,</span> <span class="pre">n,</span> <span class="pre">head)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-pos-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-reverse-pos-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_reverse(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-safe-pos-n-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-prepare-entry-pos-head-member"><code class="docutils literal notranslate"><span class="pre">list_prepare_entry(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-continue-pos-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_continue(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-continue-reverse-pos-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_continue_reverse(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-from-pos-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_from(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-safe-continue-pos-n-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe_continue(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-safe-continue-reverse-pos-n-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe_continue_reverse(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#list-for-each-entry-safe-from-pos-n-head-member"><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe_from(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#c">基础C函数库</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id62">字符串操作</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id85">内存操作</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#crc">CRC函数</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id90">函数列表</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id91">描述</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id92">参数说明</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="atomic.html">原子变量</a></li>
+<li class="toctree-l2"><a class="reference internal" href="data_structures.html">内核数据结构</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#id1">内存管理</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">核心API文档</a></li>
+      <li class="breadcrumb-item active">DragonOS内核核心API</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/083e891/docs/kernel/core_api/kernel_api.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="dragonosapi">
+<h1>DragonOS内核核心API<a class="headerlink" href="#dragonosapi" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>循环链表管理函数<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  循环链表是内核的重要的数据结构之一。包含在<code class="docutils literal notranslate"><span class="pre">kernel/common/list.h</span></code>中。</p>
+<section id="void-list-init-struct-list-list">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_init(struct</span> <span class="pre">List</span> <span class="pre">*list)</span></code><a class="headerlink" href="#void-list-init-struct-list-list" title="Permalink to this heading"></a></h3>
+<section id="id2">
+<h4>描述<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h4>
+<p>  初始化一个List结构体，使其prev和next指针指向自身</p>
+</section>
+<section id="id3">
+<h4>参数<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h4>
+<p><strong>list</strong></p>
+<p>  要被初始化的List结构体</p>
+</section>
+</section>
+<section id="void-list-add-struct-list-entry-struct-list-node">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_add(struct</span> <span class="pre">List</span> <span class="pre">*entry,</span> <span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*node)</span></code><a class="headerlink" href="#void-list-add-struct-list-entry-struct-list-node" title="Permalink to this heading"></a></h3>
+<section id="id4">
+<h4>描述<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h4>
+<p>  将node插入到entry的后方</p>
+</section>
+<section id="id5">
+<h4>参数<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  已存在于循环链表中的一个结点</p>
+<p><strong>node</strong></p>
+<p>  待插入的结点</p>
+</section>
+</section>
+<section id="void-list-append-struct-list-entry-struct-list-node">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_append(struct</span> <span class="pre">List</span> <span class="pre">*entry,</span> <span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*node)</span></code><a class="headerlink" href="#void-list-append-struct-list-entry-struct-list-node" title="Permalink to this heading"></a></h3>
+<section id="id6">
+<h4>描述<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<p>  将node插入到entry的前方</p>
+</section>
+<section id="id7">
+<h4>参数<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  已存在于循环链表中的一个结点</p>
+<p><strong>node</strong></p>
+<p>  待插入的结点</p>
+</section>
+</section>
+<section id="void-list-del-struct-list-entry">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_del(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code><a class="headerlink" href="#void-list-del-struct-list-entry" title="Permalink to this heading"></a></h3>
+<section id="id8">
+<h4>描述<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<p>  从链表中删除结点entry</p>
+</section>
+<section id="id9">
+<h4>参数<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  待删除的结点</p>
+</section>
+</section>
+<section id="list-del-init-struct-list-entry">
+<h3><code class="docutils literal notranslate"><span class="pre">list_del_init(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code><a class="headerlink" href="#list-del-init-struct-list-entry" title="Permalink to this heading"></a></h3>
+<section id="id10">
+<h4>描述<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<p>  从链表中删除结点entry，并将这个entry使用list_init()进行重新初始化。</p>
+</section>
+<section id="id11">
+<h4>参数<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  待删除的结点</p>
+</section>
+</section>
+<section id="bool-list-empty-struct-list-entry">
+<h3><code class="docutils literal notranslate"><span class="pre">bool</span> <span class="pre">list_empty(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code><a class="headerlink" href="#bool-list-empty-struct-list-entry" title="Permalink to this heading"></a></h3>
+<section id="id12">
+<h4>描述<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h4>
+<p>  判断链表是否为空</p>
+</section>
+<section id="id13">
+<h4>参数<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  链表中的一个结点</p>
+</section>
+</section>
+<section id="struct-list-list-prev-struct-list-entry">
+<h3><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*list_prev(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code><a class="headerlink" href="#struct-list-list-prev-struct-list-entry" title="Permalink to this heading"></a></h3>
+<section id="id14">
+<h4>描述<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h4>
+<p>  获取entry的前一个结点</p>
+</section>
+<section id="id15">
+<h4>参数<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  链表中的一个结点</p>
+</section>
+</section>
+<section id="struct-list-list-next-struct-list-entry">
+<h3><code class="docutils literal notranslate"><span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*list_next(struct</span> <span class="pre">List</span> <span class="pre">*entry)</span></code><a class="headerlink" href="#struct-list-list-next-struct-list-entry" title="Permalink to this heading"></a></h3>
+<section id="id16">
+<h4>描述<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h4>
+<p>  获取entry的后一个结点</p>
+</section>
+<section id="id17">
+<h4>参数<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h4>
+<p><strong>entry</strong></p>
+<p>  链表中的一个结点</p>
+</section>
+</section>
+<section id="void-list-replace-struct-list-old-struct-list-new">
+<h3><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">list_replace(struct</span> <span class="pre">List</span> <span class="pre">*old,</span> <span class="pre">struct</span> <span class="pre">List</span> <span class="pre">*new)</span></code><a class="headerlink" href="#void-list-replace-struct-list-old-struct-list-new" title="Permalink to this heading"></a></h3>
+<section id="id18">
+<h4>描述<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h4>
+<p>  将链表中的old结点替换成new结点</p>
+</section>
+<section id="id19">
+<h4>参数<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h4>
+<p><strong>old</strong></p>
+<p>  要被换下来的结点</p>
+<p><strong>new</strong></p>
+<p>  要被换入链表的新的结点</p>
+</section>
+</section>
+<section id="list-entry-ptr-type-member">
+<span id="list-entry"></span><h3><code class="docutils literal notranslate"><span class="pre">list_entry(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-entry-ptr-type-member" title="Permalink to this heading"></a></h3>
+<section id="id20">
+<h4>描述<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h4>
+<p>  该宏能通过ptr指向的List获取到List所处的结构体的地址</p>
+</section>
+<section id="id21">
+<h4>参数<a class="headerlink" href="#id21" title="Permalink to this heading"></a></h4>
+<p><strong>ptr</strong></p>
+<p>  指向List结构体的指针</p>
+<p><strong>type</strong></p>
+<p>  要被换入链表的新的结点</p>
+<p><strong>member</strong></p>
+<p>  List结构体在上述的“包裹list结构体的结构体”中的变量名</p>
+</section>
+</section>
+<section id="list-first-entry-ptr-type-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_first_entry(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-first-entry-ptr-type-member" title="Permalink to this heading"></a></h3>
+<section id="id22">
+<h4>描述<a class="headerlink" href="#id22" title="Permalink to this heading"></a></h4>
+<p>  获取链表中的第一个元素。请注意，该宏要求链表非空，否则会出错。</p>
+</section>
+<section id="id23">
+<h4>参数<a class="headerlink" href="#id23" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-entry"><span class="std std-ref">list_entry()</span></a>相同</p>
+</section>
+</section>
+<section id="list-first-entry-or-null-ptr-type-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_first_entry_or_null(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-first-entry-or-null-ptr-type-member" title="Permalink to this heading"></a></h3>
+<section id="id24">
+<h4>描述<a class="headerlink" href="#id24" title="Permalink to this heading"></a></h4>
+<p>  获取链表中的第一个元素。若链表为空，则返回NULL。</p>
+</section>
+<section id="id25">
+<h4>参数<a class="headerlink" href="#id25" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-entry"><span class="std std-ref">list_entry()</span></a>相同</p>
+</section>
+</section>
+<section id="list-last-entry-ptr-type-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_last_entry(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-last-entry-ptr-type-member" title="Permalink to this heading"></a></h3>
+<section id="id26">
+<h4>描述<a class="headerlink" href="#id26" title="Permalink to this heading"></a></h4>
+<p>  获取链表中的最后一个元素。请注意，该宏要求链表非空，否则会出错。</p>
+</section>
+<section id="id27">
+<h4>参数<a class="headerlink" href="#id27" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-entry"><span class="std std-ref">list_entry()</span></a>相同</p>
+</section>
+</section>
+<section id="list-last-entry-or-full-ptr-type-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_last_entry_or_full(ptr,</span> <span class="pre">type,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-last-entry-or-full-ptr-type-member" title="Permalink to this heading"></a></h3>
+<section id="id28">
+<h4>描述<a class="headerlink" href="#id28" title="Permalink to this heading"></a></h4>
+<p>  获取链表中的最后一个元素。若链表为空，则返回NULL。</p>
+</section>
+<section id="id29">
+<h4>参数<a class="headerlink" href="#id29" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-entry"><span class="std std-ref">list_entry()</span></a>相同</p>
+</section>
+</section>
+<section id="list-next-entry-pos-member">
+<span id="list-next-entry"></span><h3><code class="docutils literal notranslate"><span class="pre">list_next_entry(pos,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-next-entry-pos-member" title="Permalink to this heading"></a></h3>
+<section id="id30">
+<h4>描述<a class="headerlink" href="#id30" title="Permalink to this heading"></a></h4>
+<p>  获取链表中的下一个元素</p>
+</section>
+<section id="id31">
+<h4>参数<a class="headerlink" href="#id31" title="Permalink to this heading"></a></h4>
+<p><strong>pos</strong></p>
+<p>  指向当前的外层结构体的指针</p>
+<p><strong>member</strong></p>
+<p>  链表结构体在外层结构体内的变量名</p>
+</section>
+</section>
+<section id="list-prev-entry-pos-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_prev_entry(pos,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-prev-entry-pos-member" title="Permalink to this heading"></a></h3>
+<section id="id32">
+<h4>描述<a class="headerlink" href="#id32" title="Permalink to this heading"></a></h4>
+<p>  获取链表中的上一个元素</p>
+</section>
+<section id="id33">
+<h4>参数<a class="headerlink" href="#id33" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-next-entry"><span class="std std-ref">list_next_entry()</span></a>相同</p>
+</section>
+</section>
+<section id="list-for-each-ptr-head">
+<span id="list-for-each"></span><h3><code class="docutils literal notranslate"><span class="pre">list_for_each(ptr,</span> <span class="pre">head)</span></code><a class="headerlink" href="#list-for-each-ptr-head" title="Permalink to this heading"></a></h3>
+<section id="id34">
+<h4>描述<a class="headerlink" href="#id34" title="Permalink to this heading"></a></h4>
+<p>  遍历整个链表（从前往后）</p>
+</section>
+<section id="id35">
+<h4>参数<a class="headerlink" href="#id35" title="Permalink to this heading"></a></h4>
+<p><strong>ptr</strong></p>
+<p>  指向List结构体的指针</p>
+<p><strong>head</strong></p>
+<p>  指向链表头结点的指针(struct List*)</p>
+</section>
+</section>
+<section id="list-for-each-prev-ptr-head">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_prev(ptr,</span> <span class="pre">head)</span></code><a class="headerlink" href="#list-for-each-prev-ptr-head" title="Permalink to this heading"></a></h3>
+<section id="id36">
+<h4>描述<a class="headerlink" href="#id36" title="Permalink to this heading"></a></h4>
+<p>  遍历整个链表（从后往前）</p>
+</section>
+<section id="id37">
+<h4>参数<a class="headerlink" href="#id37" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each"><span class="std std-ref">list_for_each()</span></a>相同</p>
+</section>
+</section>
+<section id="list-for-each-safe-ptr-n-head">
+<span id="list-for-each-safe"></span><h3><code class="docutils literal notranslate"><span class="pre">list_for_each_safe(ptr,</span> <span class="pre">n,</span> <span class="pre">head)</span></code><a class="headerlink" href="#list-for-each-safe-ptr-n-head" title="Permalink to this heading"></a></h3>
+<section id="id38">
+<h4>描述<a class="headerlink" href="#id38" title="Permalink to this heading"></a></h4>
+<p>  从前往后遍历整个链表（支持删除当前链表结点）</p>
+<p>  该宏通过暂存中间变量，防止在迭代链表的过程中，由于删除了当前ptr所指向的链表结点从而造成错误.</p>
+</section>
+<section id="id39">
+<h4>参数<a class="headerlink" href="#id39" title="Permalink to this heading"></a></h4>
+<p><strong>ptr</strong></p>
+<p>  指向List结构体的指针</p>
+<p><strong>n</strong></p>
+<p>  用于存储临时值的List类型的指针</p>
+<p><strong>head</strong></p>
+<p>  指向链表头结点的指针(struct List*)</p>
+</section>
+</section>
+<section id="list-for-each-prev-safe-ptr-n-head">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_prev_safe(ptr,</span> <span class="pre">n,</span> <span class="pre">head)</span></code><a class="headerlink" href="#list-for-each-prev-safe-ptr-n-head" title="Permalink to this heading"></a></h3>
+<section id="id40">
+<h4>描述<a class="headerlink" href="#id40" title="Permalink to this heading"></a></h4>
+<p>  从后往前遍历整个链表.（支持删除当前链表结点）</p>
+<p>  该宏通过暂存中间变量，防止在迭代链表的过程中，由于删除了当前ptr所指向的链表结点从而造成错误.</p>
+</section>
+<section id="id41">
+<h4>参数<a class="headerlink" href="#id41" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each-safe"><span class="std std-ref">list_for_each_safe()</span></a>相同</p>
+</section>
+</section>
+<section id="list-for-each-entry-pos-head-member">
+<span id="list-for-each-entry"></span><h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-pos-head-member" title="Permalink to this heading"></a></h3>
+<section id="id42">
+<h4>描述<a class="headerlink" href="#id42" title="Permalink to this heading"></a></h4>
+<p>  从头开始迭代给定类型的链表</p>
+</section>
+<section id="id43">
+<h4>参数<a class="headerlink" href="#id43" title="Permalink to this heading"></a></h4>
+<p><strong>pos</strong></p>
+<p>  指向特定类型的结构体的指针</p>
+<p><strong>head</strong></p>
+<p>  指向链表头结点的指针(struct List*)</p>
+<p><strong>member</strong></p>
+<p>  struct List在pos的结构体中的成员变量名</p>
+</section>
+</section>
+<section id="list-for-each-entry-reverse-pos-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_reverse(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-reverse-pos-head-member" title="Permalink to this heading"></a></h3>
+<section id="id44">
+<h4>描述<a class="headerlink" href="#id44" title="Permalink to this heading"></a></h4>
+<p>  逆序迭代给定类型的链表</p>
+</section>
+<section id="id45">
+<h4>参数<a class="headerlink" href="#id45" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each-entry"><span class="std std-ref">list_for_each_entry()</span></a>相同</p>
+</section>
+</section>
+<section id="list-for-each-entry-safe-pos-n-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-safe-pos-n-head-member" title="Permalink to this heading"></a></h3>
+<section id="id46">
+<h4>描述<a class="headerlink" href="#id46" title="Permalink to this heading"></a></h4>
+<p>  从头开始迭代给定类型的链表（支持删除当前链表结点）</p>
+</section>
+<section id="id47">
+<h4>参数<a class="headerlink" href="#id47" title="Permalink to this heading"></a></h4>
+<p><strong>pos</strong></p>
+<p>  指向特定类型的结构体的指针</p>
+<p><strong>n</strong></p>
+<p>  用于存储临时值的，和pos相同类型的指针</p>
+<p><strong>head</strong></p>
+<p>  指向链表头结点的指针(struct List*)</p>
+<p><strong>member</strong></p>
+<p>  struct List在pos的结构体中的成员变量名</p>
+</section>
+</section>
+<section id="list-prepare-entry-pos-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_prepare_entry(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-prepare-entry-pos-head-member" title="Permalink to this heading"></a></h3>
+<section id="id48">
+<h4>描述<a class="headerlink" href="#id48" title="Permalink to this heading"></a></h4>
+<p>  为<a class="reference internal" href="#list-for-each-entry-continue"><span class="std std-ref">list_for_each_entry_continue()</span></a>准备一个’pos’结构体</p>
+</section>
+<section id="id49">
+<h4>参数<a class="headerlink" href="#id49" title="Permalink to this heading"></a></h4>
+<p><strong>pos</strong></p>
+<p>  指向特定类型的结构体的，用作迭代起点的指针</p>
+<p><strong>head</strong></p>
+<p>  指向要开始迭代的struct List结构体的指针</p>
+<p><strong>member</strong></p>
+<p>  struct List在pos的结构体中的成员变量名</p>
+</section>
+</section>
+<section id="list-for-each-entry-continue-pos-head-member">
+<span id="list-for-each-entry-continue"></span><h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_continue(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-continue-pos-head-member" title="Permalink to this heading"></a></h3>
+<section id="id50">
+<h4>描述<a class="headerlink" href="#id50" title="Permalink to this heading"></a></h4>
+<p>  从指定的位置的【下一个元素开始】,继续迭代给定的链表</p>
+</section>
+<section id="id51">
+<h4>参数<a class="headerlink" href="#id51" title="Permalink to this heading"></a></h4>
+<p><strong>pos</strong></p>
+<p>  指向特定类型的结构体的指针。该指针用作迭代的指针。</p>
+<p><strong>head</strong></p>
+<p>  指向要开始迭代的struct List结构体的指针</p>
+<p><strong>member</strong></p>
+<p>  struct List在pos的结构体中的成员变量名</p>
+</section>
+</section>
+<section id="list-for-each-entry-continue-reverse-pos-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_continue_reverse(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-continue-reverse-pos-head-member" title="Permalink to this heading"></a></h3>
+<section id="id52">
+<h4>描述<a class="headerlink" href="#id52" title="Permalink to this heading"></a></h4>
+<p>  从指定的位置的【上一个元素开始】,【逆序】迭代给定的链表</p>
+</section>
+<section id="id53">
+<h4>参数<a class="headerlink" href="#id53" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each-entry-continue"><span class="std std-ref">list_for_each_entry_continue()</span></a>的相同</p>
+</section>
+</section>
+<section id="list-for-each-entry-from-pos-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_from(pos,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-from-pos-head-member" title="Permalink to this heading"></a></h3>
+<section id="id54">
+<h4>描述<a class="headerlink" href="#id54" title="Permalink to this heading"></a></h4>
+<p>  从指定的位置开始,继续迭代给定的链表</p>
+</section>
+<section id="id55">
+<h4>参数<a class="headerlink" href="#id55" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each-entry-continue"><span class="std std-ref">list_for_each_entry_continue()</span></a>的相同</p>
+</section>
+</section>
+<section id="list-for-each-entry-safe-continue-pos-n-head-member">
+<span id="list-for-each-entry-safe-continue"></span><h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe_continue(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-safe-continue-pos-n-head-member" title="Permalink to this heading"></a></h3>
+<section id="id56">
+<h4>描述<a class="headerlink" href="#id56" title="Permalink to this heading"></a></h4>
+<p>  从指定的位置的【下一个元素开始】,继续迭代给定的链表.（支持删除当前链表结点）</p>
+</section>
+<section id="id57">
+<h4>参数<a class="headerlink" href="#id57" title="Permalink to this heading"></a></h4>
+<p><strong>pos</strong></p>
+<p>  指向特定类型的结构体的指针。该指针用作迭代的指针。</p>
+<p><strong>n</strong></p>
+<p>  用于存储临时值的，和pos相同类型的指针</p>
+<p><strong>head</strong></p>
+<p>  指向要开始迭代的struct List结构体的指针</p>
+<p><strong>member</strong></p>
+<p>  struct List在pos的结构体中的成员变量名</p>
+</section>
+</section>
+<section id="list-for-each-entry-safe-continue-reverse-pos-n-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe_continue_reverse(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-safe-continue-reverse-pos-n-head-member" title="Permalink to this heading"></a></h3>
+<section id="id58">
+<h4>描述<a class="headerlink" href="#id58" title="Permalink to this heading"></a></h4>
+<p>  从指定的位置的【上一个元素开始】,【逆序】迭代给定的链表。（支持删除当前链表结点）</p>
+</section>
+<section id="id59">
+<h4>参数<a class="headerlink" href="#id59" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each-entry-safe-continue"><span class="std std-ref">list_for_each_entry_safe_continue()</span></a>的相同</p>
+</section>
+</section>
+<section id="list-for-each-entry-safe-from-pos-n-head-member">
+<h3><code class="docutils literal notranslate"><span class="pre">list_for_each_entry_safe_from(pos,</span> <span class="pre">n,</span> <span class="pre">head,</span> <span class="pre">member)</span></code><a class="headerlink" href="#list-for-each-entry-safe-from-pos-n-head-member" title="Permalink to this heading"></a></h3>
+<section id="id60">
+<h4>描述<a class="headerlink" href="#id60" title="Permalink to this heading"></a></h4>
+<p>  从指定的位置开始,继续迭代给定的链表.（支持删除当前链表结点）</p>
+</section>
+<section id="id61">
+<h4>参数<a class="headerlink" href="#id61" title="Permalink to this heading"></a></h4>
+<p>  与<a class="reference internal" href="#list-for-each-entry-safe-continue"><span class="std std-ref">list_for_each_entry_safe_continue()</span></a>的相同</p>
+</section>
+</section>
+</section>
+<hr class="docutils" />
+<section id="c">
+<h2>基础C函数库<a class="headerlink" href="#c" title="Permalink to this heading"></a></h2>
+<p>  内核编程与应用层编程不同，你将无法使用LibC中的函数来进行编程。为此，内核实现了一些常用的C语言函数，并尽量使其与标准C库中的函数行为相近。值得注意的是，这些函数的行为可能与标准C库函数不同，请在使用时仔细阅读以下文档，这将会为你带来帮助。</p>
+<section id="id62">
+<h3>字符串操作<a class="headerlink" href="#id62" title="Permalink to this heading"></a></h3>
+<section id="int-strlen-const-char-s">
+<h4><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">strlen(const</span> <span class="pre">char</span> <span class="pre">*s)</span></code><a class="headerlink" href="#int-strlen-const-char-s" title="Permalink to this heading"></a></h4>
+<section id="id63">
+<h5>描述<a class="headerlink" href="#id63" title="Permalink to this heading"></a></h5>
+<p>  测量并返回字符串长度。</p>
+</section>
+<section id="id64">
+<h5>参数<a class="headerlink" href="#id64" title="Permalink to this heading"></a></h5>
+<p><strong>src</strong></p>
+<p>  源字符串</p>
+</section>
+</section>
+<section id="long-strnlen-const-char-src-unsigned-long-maxlen">
+<h4><code class="docutils literal notranslate"><span class="pre">long</span> <span class="pre">strnlen(const</span> <span class="pre">char</span> <span class="pre">*src,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">maxlen)</span></code><a class="headerlink" href="#long-strnlen-const-char-src-unsigned-long-maxlen" title="Permalink to this heading"></a></h4>
+<section id="id65">
+<h5>描述<a class="headerlink" href="#id65" title="Permalink to this heading"></a></h5>
+<p>  测量并返回字符串长度。当字符串长度大于maxlen时，返回maxlen</p>
+</section>
+<section id="id66">
+<h5>参数<a class="headerlink" href="#id66" title="Permalink to this heading"></a></h5>
+<p><strong>src</strong></p>
+<p>  源字符串</p>
+<p><strong>maxlen</strong></p>
+<p>  最大长度</p>
+</section>
+</section>
+<section id="long-strnlen-user-const-char-src-unsigned-long-maxlen">
+<h4><code class="docutils literal notranslate"><span class="pre">long</span> <span class="pre">strnlen_user(const</span> <span class="pre">char</span> <span class="pre">*src,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">maxlen)</span></code><a class="headerlink" href="#long-strnlen-user-const-char-src-unsigned-long-maxlen" title="Permalink to this heading"></a></h4>
+<section id="id67">
+<h5>描述<a class="headerlink" href="#id67" title="Permalink to this heading"></a></h5>
+<p>  测量并返回字符串长度。当字符串长度大于maxlen时，返回maxlen。</p>
+<p>  该函数会进行地址空间校验，要求src字符串必须来自用户空间。当源字符串来自内核空间时，将返回0.</p>
+</section>
+<section id="id68">
+<h5>参数<a class="headerlink" href="#id68" title="Permalink to this heading"></a></h5>
+<p><strong>src</strong></p>
+<p>  源字符串，地址位于用户空间</p>
+<p><strong>maxlen</strong></p>
+<p>  最大长度</p>
+</section>
+</section>
+<section id="char-strncpy-char-dst-const-char-src-long-count">
+<h4><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*strncpy(char</span> <span class="pre">*dst,</span> <span class="pre">const</span> <span class="pre">char</span> <span class="pre">*src,</span> <span class="pre">long</span> <span class="pre">count)</span></code><a class="headerlink" href="#char-strncpy-char-dst-const-char-src-long-count" title="Permalink to this heading"></a></h4>
+<section id="id69">
+<h5>描述<a class="headerlink" href="#id69" title="Permalink to this heading"></a></h5>
+<p>  拷贝长度为count个字节的字符串，返回dst字符串</p>
+</section>
+<section id="id70">
+<h5>参数<a class="headerlink" href="#id70" title="Permalink to this heading"></a></h5>
+<p><strong>src</strong></p>
+<p>  源字符串</p>
+<p><strong>dst</strong></p>
+<p>  目标字符串</p>
+<p><strong>count</strong></p>
+<p>  要拷贝的源字符串的长度</p>
+</section>
+</section>
+<section id="char-strcpy-char-dst-const-char-src">
+<h4><code class="docutils literal notranslate"><span class="pre">char</span> <span class="pre">*strcpy(char</span> <span class="pre">*dst,</span> <span class="pre">const</span> <span class="pre">char</span> <span class="pre">*src)</span></code><a class="headerlink" href="#char-strcpy-char-dst-const-char-src" title="Permalink to this heading"></a></h4>
+<section id="id71">
+<h5>描述<a class="headerlink" href="#id71" title="Permalink to this heading"></a></h5>
+<p>  拷贝源字符串，返回dst字符串</p>
+</section>
+<section id="id72">
+<h5>参数<a class="headerlink" href="#id72" title="Permalink to this heading"></a></h5>
+<p><strong>src</strong></p>
+<p>  源字符串</p>
+<p><strong>dst</strong></p>
+<p>  目标字符串</p>
+</section>
+</section>
+<section id="long-strncpy-from-user-char-dst-const-char-src-unsigned-long-size">
+<h4><code class="docutils literal notranslate"><span class="pre">long</span> <span class="pre">strncpy_from_user(char</span> <span class="pre">*dst,</span> <span class="pre">const</span> <span class="pre">char</span> <span class="pre">*src,</span> <span class="pre">unsigned</span> <span class="pre">long</span> <span class="pre">size)</span></code><a class="headerlink" href="#long-strncpy-from-user-char-dst-const-char-src-unsigned-long-size" title="Permalink to this heading"></a></h4>
+<section id="id73">
+<h5>描述<a class="headerlink" href="#id73" title="Permalink to this heading"></a></h5>
+<p>  从用户空间拷贝长度为count个字节的字符串到内核空间，返回拷贝的字符串的大小</p>
+<p>  该函数会对字符串的地址空间进行校验，防止出现地址空间越界的问题。</p>
+</section>
+<section id="id74">
+<h5>参数<a class="headerlink" href="#id74" title="Permalink to this heading"></a></h5>
+<p><strong>src</strong></p>
+<p>  源字符串</p>
+<p><strong>dst</strong></p>
+<p>  目标字符串</p>
+<p><strong>size</strong></p>
+<p>  要拷贝的源字符串的长度</p>
+</section>
+</section>
+<section id="int-strcmp-char-firstpart-char-secondpart">
+<h4><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">strcmp(char</span> <span class="pre">*FirstPart,</span> <span class="pre">char</span> <span class="pre">*SecondPart)</span></code><a class="headerlink" href="#int-strcmp-char-firstpart-char-secondpart" title="Permalink to this heading"></a></h4>
+<section id="id75">
+<h5>描述<a class="headerlink" href="#id75" title="Permalink to this heading"></a></h5>
+<p>比较两个字符串的大小。</p>
+<p><em><strong>返回值</strong></em></p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>情况</p></th>
+<th class="head"><p>返回值</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>FirstPart == SecondPart</p></td>
+<td><p>0</p></td>
+</tr>
+<tr class="row-odd"><td><p>FirstPart &gt; SecondPart</p></td>
+<td><p>1</p></td>
+</tr>
+<tr class="row-even"><td><p>FirstPart &lt; SecondPart</p></td>
+<td><p>-1</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="id76">
+<h5>参数<a class="headerlink" href="#id76" title="Permalink to this heading"></a></h5>
+<p><strong>FirstPart</strong></p>
+<p>  第一个字符串</p>
+<p><strong>SecondPart</strong></p>
+<p>  第二个字符串</p>
+</section>
+</section>
+<section id="printk-const-char-fmt">
+<h4><code class="docutils literal notranslate"><span class="pre">printk(const</span> <span class="pre">char*</span> <span class="pre">fmt,</span> <span class="pre">...)</span></code><a class="headerlink" href="#printk-const-char-fmt" title="Permalink to this heading"></a></h4>
+<section id="id77">
+<h5>描述<a class="headerlink" href="#id77" title="Permalink to this heading"></a></h5>
+<p>  该宏能够在控制台上以黑底白字格式化输出字符串.</p>
+</section>
+<section id="id78">
+<h5>参数<a class="headerlink" href="#id78" title="Permalink to this heading"></a></h5>
+<p><strong>fmt</strong></p>
+<p>  源格式字符串</p>
+<p><strong>…</strong></p>
+<p>  可变参数</p>
+</section>
+</section>
+<section id="printk-color-unsigned-int-frcolor-unsigned-int-bkcolor-const-char-fmt">
+<h4><code class="docutils literal notranslate"><span class="pre">printk_color(unsigned</span> <span class="pre">int</span> <span class="pre">FRcolor,</span> <span class="pre">unsigned</span> <span class="pre">int</span> <span class="pre">BKcolor,</span> <span class="pre">const</span> <span class="pre">char*</span> <span class="pre">fmt,</span> <span class="pre">...)</span></code><a class="headerlink" href="#printk-color-unsigned-int-frcolor-unsigned-int-bkcolor-const-char-fmt" title="Permalink to this heading"></a></h4>
+<section id="id79">
+<h5>描述<a class="headerlink" href="#id79" title="Permalink to this heading"></a></h5>
+<p>  在控制台上以指定前景色和背景色格式化输出字符串.</p>
+</section>
+<section id="id80">
+<h5>参数<a class="headerlink" href="#id80" title="Permalink to this heading"></a></h5>
+<p><strong>FRcolor</strong></p>
+<p>  前景色</p>
+<p><strong>BKcolor</strong></p>
+<p>  背景色</p>
+<p><strong>fmt</strong></p>
+<p>  源格式字符串</p>
+<p><strong>…</strong></p>
+<p>  可变参数</p>
+</section>
+</section>
+<section id="int-vsprintf-char-buf-const-char-fmt-va-list-args">
+<h4><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">vsprintf(char</span> <span class="pre">*buf,</span> <span class="pre">const</span> <span class="pre">char</span> <span class="pre">*fmt,</span> <span class="pre">va_list</span> <span class="pre">args)</span></code><a class="headerlink" href="#int-vsprintf-char-buf-const-char-fmt-va-list-args" title="Permalink to this heading"></a></h4>
+<section id="id81">
+<h5>描述<a class="headerlink" href="#id81" title="Permalink to this heading"></a></h5>
+<p>  按照fmt格式化字符串，并将结果输出到buf中，返回写入buf的字符数量。</p>
+</section>
+<section id="id82">
+<h5>参数<a class="headerlink" href="#id82" title="Permalink to this heading"></a></h5>
+<p><strong>buf</strong></p>
+<p>  输出缓冲区</p>
+<p><strong>fmt</strong></p>
+<p>  源格式字符串</p>
+<p><strong>args</strong></p>
+<p>  可变参数列表</p>
+</section>
+</section>
+<section id="int-sprintk-char-buf-const-char-fmt">
+<h4><code class="docutils literal notranslate"><span class="pre">int</span> <span class="pre">sprintk(char</span> <span class="pre">*buf,</span> <span class="pre">const</span> <span class="pre">char</span> <span class="pre">*fmt,</span> <span class="pre">...)</span></code><a class="headerlink" href="#int-sprintk-char-buf-const-char-fmt" title="Permalink to this heading"></a></h4>
+<section id="id83">
+<h5>描述<a class="headerlink" href="#id83" title="Permalink to this heading"></a></h5>
+<p>  按照fmt格式化字符串，并将结果输出到buf中，返回写入buf的字符数量。</p>
+</section>
+<section id="id84">
+<h5>参数<a class="headerlink" href="#id84" title="Permalink to this heading"></a></h5>
+<p><strong>buf</strong></p>
+<p>  输出缓冲区</p>
+<p><strong>fmt</strong></p>
+<p>  源格式字符串</p>
+<p><strong>…</strong></p>
+<p>  可变参数</p>
+</section>
+</section>
+</section>
+<section id="id85">
+<h3>内存操作<a class="headerlink" href="#id85" title="Permalink to this heading"></a></h3>
+<section id="void-memcpy-void-dst-const-void-src-uint64-t-size">
+<h4><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*memcpy(void</span> <span class="pre">*dst,</span> <span class="pre">const</span> <span class="pre">void</span> <span class="pre">*src,</span> <span class="pre">uint64_t</span> <span class="pre">size)</span></code><a class="headerlink" href="#void-memcpy-void-dst-const-void-src-uint64-t-size" title="Permalink to this heading"></a></h4>
+<section id="id86">
+<h5>描述<a class="headerlink" href="#id86" title="Permalink to this heading"></a></h5>
+<p>  将内存从src处拷贝到dst处。</p>
+</section>
+<section id="id87">
+<h5>参数<a class="headerlink" href="#id87" title="Permalink to this heading"></a></h5>
+<p><strong>dst</strong></p>
+<p>  指向目标地址的指针</p>
+<p><strong>src</strong></p>
+<p>  指向源地址的指针</p>
+<p><strong>size</strong></p>
+<p>  待拷贝的数据大小</p>
+</section>
+</section>
+<section id="void-memmove-void-dst-const-void-src-uint64-t-size">
+<h4><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">*memmove(void</span> <span class="pre">*dst,</span> <span class="pre">const</span> <span class="pre">void</span> <span class="pre">*src,</span> <span class="pre">uint64_t</span> <span class="pre">size)</span></code><a class="headerlink" href="#void-memmove-void-dst-const-void-src-uint64-t-size" title="Permalink to this heading"></a></h4>
+<section id="id88">
+<h5>描述<a class="headerlink" href="#id88" title="Permalink to this heading"></a></h5>
+<p>  与<code class="docutils literal notranslate"><span class="pre">memcpy()</span></code>类似，但是在源数据区域与目标数据区域之间存在重合时，该函数能防止数据被错误的覆盖。</p>
+</section>
+<section id="id89">
+<h5>参数<a class="headerlink" href="#id89" title="Permalink to this heading"></a></h5>
+<p><strong>dst</strong></p>
+<p>  指向目标地址的指针</p>
+<p><strong>src</strong></p>
+<p>  指向源地址的指针</p>
+<p><strong>size</strong></p>
+<p>  待拷贝的数据大小</p>
+</section>
+</section>
+</section>
+</section>
+<section id="crc">
+<h2>CRC函数<a class="headerlink" href="#crc" title="Permalink to this heading"></a></h2>
+<section id="id90">
+<h3>函数列表<a class="headerlink" href="#id90" title="Permalink to this heading"></a></h3>
+<p><strong><code class="docutils literal notranslate"><span class="pre">uint8_t</span> <span class="pre">crc7(uint8_t</span> <span class="pre">crc,</span> <span class="pre">const</span> <span class="pre">uint8_t</span> <span class="pre">*buffer,</span> <span class="pre">size_t</span> <span class="pre">len)</span></code></strong></p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">uint8_t</span> <span class="pre">crc8(uint8_t</span> <span class="pre">crc,</span> <span class="pre">const</span> <span class="pre">uint8_t</span> <span class="pre">*buffer,</span> <span class="pre">size_t</span> <span class="pre">len)</span></code></strong></p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">uint16_t</span> <span class="pre">crc16(uint16_t</span> <span class="pre">crc,</span> <span class="pre">uint8_t</span> <span class="pre">const</span> <span class="pre">*buffer,</span> <span class="pre">size_t</span> <span class="pre">len)</span></code></strong></p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">uint32_t</span> <span class="pre">crc32(uint32_t</span> <span class="pre">crc,</span> <span class="pre">uint8_t</span> <span class="pre">const</span> <span class="pre">*buffer,</span> <span class="pre">size_t</span> <span class="pre">len)</span></code></strong></p>
+<p><strong><code class="docutils literal notranslate"><span class="pre">uint64_t</span> <span class="pre">crc64(uint64_t</span> <span class="pre">crc,</span> <span class="pre">uint8_t</span> <span class="pre">const</span> <span class="pre">*buffer,</span> <span class="pre">size_t</span> <span class="pre">len)</span></code></strong></p>
+</section>
+<section id="id91">
+<h3>描述<a class="headerlink" href="#id91" title="Permalink to this heading"></a></h3>
+<p>  用于计算循环冗余校验码</p>
+</section>
+<section id="id92">
+<h3>参数说明<a class="headerlink" href="#id92" title="Permalink to this heading"></a></h3>
+<p><strong>crc</strong></p>
+<p>  传入的CRC初始值</p>
+<p><strong>buffer</strong></p>
+<p>  待处理的数据缓冲区</p>
+<p><strong>len</strong></p>
+<p>  缓冲区大小（字节）</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="核心API文档" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="atomic.html" class="btn btn-neutral float-right" title="原子变量" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>083e891</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.6
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/kernel/core_api/kernel_api.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/kernel/core_api/kernel_api.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/core_api/kernel_api.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/kernel/core_api/kernel_api.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/kernel/core_api/kernel_api.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/kernel/core_api/kernel_api.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/kernel/core_api/kernel_api.html">V0.1.5</a></dd>
+      <dd><a href="kernel_api.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/core_api/kernel_api.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/core_api/kernel_api.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/core_api/kernel_api.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/core_api/kernel_api.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/core_api/kernel_api.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/core_api/kernel_api.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/core_api/kernel_api.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -10,3 +10,8 @@ spin = "0.9"
 
 [features]
 fuser_root_inode = []
+# Exposes host recovery and fault-injection API surface solely to the
+# integration harness.
+# The DragonOS kernel dependency neither enables nor forwards this feature;
+# ext4_test enables it explicitly in its independent host-test workspace.
+test-api = []

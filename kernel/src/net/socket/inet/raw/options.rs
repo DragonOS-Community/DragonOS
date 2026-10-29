@@ -1,4 +1,3 @@
-use alloc::string::String;
 use core::fmt::Debug;
 
 use super::constants::{SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX};
@@ -70,6 +69,13 @@ impl IcmpFilter {
 pub struct RawSocketOptions {
     /// IP_HDRINCL: 用户是否提供完整 IP 头
     pub ip_hdrincl: bool,
+    pub ip_pmtu: super::super::common::pmtu::PmtuPolicy,
+    pub ipv6_pmtu: super::super::common::pmtu::PmtuPolicy,
+    pub recv_err_v4: bool,
+    pub recv_err_v6: bool,
+    /// IPV6_MTU source fragmentation ceiling; zero means use route MTU.
+    pub ipv6_frag_size: usize,
+    pub ipv6_multicast_loop: bool,
     /// IP_TOS: Type of Service
     pub ip_tos: u8,
     /// IP_TTL: Time to Live
@@ -100,9 +106,6 @@ pub struct RawSocketOptions {
     /// SO_RCVBUF: 返回给 getsockopt 的 sk_rcvbuf（Linux 会将 setsockopt 的值 *2 后存储）
     pub sock_rcvbuf: u32,
 
-    /// SO_BINDTODEVICE: 绑定的设备名（不含 '\0'）
-    pub bind_to_device: Option<String>,
-
     /// SO_LINGER
     pub linger_onoff: i32,
     pub linger_linger: i32,
@@ -121,6 +124,12 @@ impl Default for RawSocketOptions {
     fn default() -> Self {
         Self {
             ip_hdrincl: false,
+            ip_pmtu: Default::default(),
+            ipv6_pmtu: Default::default(),
+            recv_err_v4: false,
+            recv_err_v6: false,
+            ipv6_frag_size: 0,
+            ipv6_multicast_loop: true,
             ip_tos: 0,
             ip_ttl: DEFAULT_IP_TTL,
             recv_pktinfo_v4: false,
@@ -137,7 +146,6 @@ impl Default for RawSocketOptions {
             // 初始值设为 sysctl_*mem_max * 2，与 Linux 默认行为一致。
             sock_sndbuf: SYSCTL_WMEM_MAX.saturating_mul(2),
             sock_rcvbuf: SYSCTL_RMEM_MAX.saturating_mul(2),
-            bind_to_device: None,
             linger_onoff: 0,
             linger_linger: 0,
             filter_attached: false,

@@ -300,7 +300,7 @@ impl Attribute for AttrActions {
         let actions = irq_desc.actions();
         let mut len = 0;
 
-        for action in actions {
+        for action in actions.iter() {
             if len != 0 {
                 len += sysfs_emit_str(&mut buf[len..], &format!(",{}", action.inner().name()))
                     .unwrap();

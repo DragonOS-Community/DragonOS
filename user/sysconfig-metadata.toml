@@ -1,0 +1,33 @@
+# Guest metadata spec for the DragonOS sysconfig payload.
+#
+# tools/build_sysconfig_payload.py generates a deterministic
+# bin/sysconfig.tar from this file, without reading the host UID/GID/umask.
+#
+# Rules:
+# - owner/group are always numeric guest IDs;
+# - mode must be an octal string (e.g. "0755"); setuid/setgid/sticky bits
+#   are not allowed;
+# - directories and regular files default to directory-mode and
+#   regular-file-mode respectively;
+# - executable files (any execute bit in the source) must be explicitly
+#   declared in [files] below, otherwise the generator fails closed;
+# - only directories and regular files are supported; symlinks and special
+#   nodes are rejected.
+
+version = 1
+
+[defaults]
+uid = 0
+gid = 0
+directory-mode = "0755"
+regular-file-mode = "0644"
+
+[files]
+# Startup scripts and commands
+"etc/init.d/rcS" = { mode = "0755" }
+"usr/lib/dragon-network/udhcpc.script" = { mode = "0755" }
+"usr/sbin/dragon-network" = { mode = "0755" }
+"usr/sbin/dragon-network-boot" = { mode = "0755" }
+# Account secret files
+"etc/shadow" = { mode = "0600" }
+"etc/gshadow" = { mode = "0600" }

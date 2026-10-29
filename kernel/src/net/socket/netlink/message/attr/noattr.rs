@@ -1,7 +1,7 @@
 use crate::net::socket::netlink::message::attr::Attribute;
 use alloc::vec::Vec;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NoAttr {}
 
 impl Attribute for NoAttr {

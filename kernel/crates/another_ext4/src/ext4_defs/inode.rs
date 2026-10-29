@@ -7,7 +7,7 @@
 
 use super::crc::*;
 use super::AsBytes;
-use super::{ExtentNode, ExtentNodeMut};
+use super::{ExtentNode, ExtentNodeMut, MetadataChecksumSeed};
 use crate::constants::*;
 use crate::prelude::*;
 use crate::FileType;
@@ -324,6 +324,21 @@ impl Inode {
         self.dtime = dtime;
     }
 
+    /// Next inode number in the legacy ext4 orphan list, or zero.
+    ///
+    /// Linux stores this pointer in `i_dtime` while an inode is orphaned.
+    pub fn next_orphan(&self) -> InodeId {
+        self.dtime
+    }
+
+    /// Set the next inode number in the legacy ext4 orphan list.
+    ///
+    /// This deliberately aliases `i_dtime`; callers must recompute the inode
+    /// checksum before persisting the inode.
+    pub fn set_next_orphan(&mut self, next: InodeId) {
+        self.dtime = next;
+    }
+
     pub fn crtime(&self) -> u32 {
         self.crtime
     }
@@ -369,6 +384,11 @@ impl Inode {
         self.flags
     }
 
+    /// Whether `i_block` contains an extent root rather than inline/device data.
+    pub fn uses_extents(&self) -> bool {
+        self.flags & Self::FLAG_EXTENTS != 0
+    }
+
     pub fn set_flags(&mut self, f: u32) {
         self.flags |= f;
     }
@@ -402,6 +422,26 @@ impl Inode {
     pub fn extent_init(&mut self) {
         self.set_flags(Self::FLAG_EXTENTS);
         self.extent_root_mut().init(0, 0);
+    }
+
+    /// Initialize the inline representation of a fast symbolic link.
+    ///
+    /// The trailing NUL is stored on disk but is not included in `i_size`.
+    pub(crate) fn set_fast_symlink(&mut self, target: &[u8]) -> Result<()> {
+        let disk_len = target
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::ENAMETOOLONG))?;
+        if !self.is_softlink() || disk_len > self.block.len() {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+
+        self.block.fill(0);
+        self.block[..target.len()].copy_from_slice(target);
+        self.flags &= !Self::FLAG_EXTENTS;
+        self.set_size(target.len() as u64);
+        self.set_fs_block_count(0);
+        Ok(())
     }
 
     /// Check if this inode is a device node (character or block device).
@@ -461,22 +501,83 @@ pub struct InodeRef {
     pub inode: Box<Inode>,
 }
 
+/// One-shot capability for reclaiming one specific unlinked inode lifetime.
+///
+/// The fields are private so callers cannot forge a request from a bare inode
+/// number.  The type is intentionally not `Clone`: ownership must stay with the
+/// canonical lifetime until physical eviction.
+#[derive(Debug)]
+pub struct InodeReclaimHandle {
+    pub(crate) inode_id: InodeId,
+    pub(crate) generation: u32,
+}
+
+/// A failed physical reclaim together with its unconsumed capability.
+#[derive(Debug)]
+pub struct InodeReclaimError {
+    error: Ext4Error,
+    handle: InodeReclaimHandle,
+}
+
+impl InodeReclaimError {
+    pub(crate) fn new(error: Ext4Error, handle: InodeReclaimHandle) -> Self {
+        Self { error, handle }
+    }
+
+    pub fn into_parts(self) -> (Ext4Error, InodeReclaimHandle) {
+        (self.error, self.handle)
+    }
+}
+
+impl From<InodeReclaimError> for Ext4Error {
+    fn from(failure: InodeReclaimError) -> Self {
+        failure.error
+    }
+}
+
+impl InodeReclaimHandle {
+    pub(crate) fn new(inode_id: InodeId, generation: u32) -> Self {
+        Self {
+            inode_id,
+            generation,
+        }
+    }
+
+    pub fn inode_id(&self) -> InodeId {
+        self.inode_id
+    }
+}
+
 impl InodeRef {
     pub fn new(id: InodeId, inode: Box<Inode>) -> Self {
         Self { id, inode }
     }
 
-    pub fn set_checksum(&mut self, uuid: &[u8]) {
-        // Must set checksum field to 0 before calculation to avoid including old value
-        // causing checksum to never match (Linux semantics).
-        self.inode.osd2.l_checksum_lo = 0;
-        self.inode.checksum_hi = 0;
-        let mut checksum = crc32(CRC32_INIT, uuid);
-        checksum = crc32(checksum, &self.id.to_le_bytes());
-        checksum = crc32(checksum, &self.inode.generation.to_le_bytes());
-        checksum = crc32(checksum, self.inode.to_bytes());
+    pub fn set_checksum(&mut self, seed: MetadataChecksumSeed) {
+        let checksum = self.calculated_checksum(seed);
         self.inode.osd2.l_checksum_lo = checksum as u16;
         self.inode.checksum_hi = (checksum >> 16) as u16;
+    }
+
+    /// Return the checksum stored in the on-disk inode fields.
+    pub fn checksum(&self) -> u32 {
+        self.inode.osd2.l_checksum_lo as u32 | ((self.inode.checksum_hi as u32) << 16)
+    }
+
+    /// Compute the Linux ext4 inode checksum without modifying the inode.
+    pub fn calculated_checksum(&self, seed: MetadataChecksumSeed) -> u32 {
+        // Linux treats both checksum fields as zero while calculating CRC32C.
+        let mut inode = self.inode.as_ref().clone();
+        inode.osd2.l_checksum_lo = 0;
+        inode.checksum_hi = 0;
+        let mut checksum = seed.crc32c(&self.id.to_le_bytes());
+        checksum = crc32(checksum, &inode.generation.to_le_bytes());
+        crc32(checksum, inode.to_bytes())
+    }
+
+    /// Verify the stored checksum against the inode identity and filesystem UUID.
+    pub fn verify_checksum(&self, seed: MetadataChecksumSeed) -> bool {
+        self.checksum() == self.calculated_checksum(seed)
     }
 }
 
@@ -545,6 +646,70 @@ pub mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_reclaim_error_returns_its_one_shot_handle() {
+        let failure = InodeReclaimError::new(
+            Ext4Error::new(ErrCode::EAGAIN),
+            InodeReclaimHandle::new(37, 91),
+        );
+        let (error, handle) = failure.into_parts();
+        assert_eq!(error.code(), ErrCode::EAGAIN);
+        assert_eq!(handle.inode_id, 37);
+        assert_eq!(handle.generation, 91);
+    }
+
+    #[test]
+    fn next_orphan_is_the_dtime_disk_field() {
+        let mut inode = Inode::default();
+        inode.set_next_orphan(123);
+        assert_eq!(inode.next_orphan(), 123);
+        assert_eq!(inode.dtime(), 123);
+
+        inode.set_dtime(456);
+        assert_eq!(inode.next_orphan(), 456);
+    }
+
+    #[test]
+    fn fast_symlink_reserves_one_byte_for_the_trailing_nul() {
+        let mut inode = Inode::default();
+        inode.set_mode(InodeMode::SOFTLINK | InodeMode::ALL_RWX);
+        inode.extent_init();
+
+        let fast = [b'a'; 59];
+        inode.set_fast_symlink(&fast).unwrap();
+        assert_eq!(inode.size(), 59);
+        assert_eq!(inode.fs_block_count(), 0);
+        assert!(!inode.uses_extents());
+        assert_eq!(&inode.inline_block()[..59], &fast);
+        assert_eq!(inode.inline_block()[59], 0);
+
+        let mut boundary = Inode::default();
+        boundary.set_mode(InodeMode::SOFTLINK | InodeMode::ALL_RWX);
+        boundary.extent_init();
+        assert_eq!(
+            boundary.set_fast_symlink(&[b'b'; 60]).unwrap_err().code(),
+            ErrCode::EINVAL
+        );
+    }
+
+    #[test]
+    fn inode_checksum_can_be_verified_without_mutation() {
+        let uuid = *b"0123456789abcdef";
+        let seed = MetadataChecksumSeed::from_uuid(&uuid);
+        let mut inode = InodeRef::new(42, Box::new(Inode::default()));
+        inode.inode.set_generation(7);
+        inode.inode.set_next_orphan(11);
+        inode.set_checksum(seed);
+
+        let stored = inode.checksum();
+        assert!(inode.verify_checksum(seed));
+        assert_eq!(inode.checksum(), stored);
+
+        inode.inode.set_next_orphan(12);
+        assert!(!inode.verify_checksum(seed));
+        assert_eq!(inode.checksum(), stored);
+    }
 
     // ==================== device module tests ====================
 

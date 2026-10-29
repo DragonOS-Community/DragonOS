@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V.3.0 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+        <script src="../../../_static/jquery.js"></script>
+        <script src="../../../_static/underscore.js"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../_static/doctools.js"></script>
+        <script src="../../../_static/translations.js"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../search.html" />
+    <link rel="next" title="V0.2.0" href="../V0.2.x/V0.2.0.html" />
+    <link rel="prev" title="V0.4.0" href="../V0.4.x/V0.4.0.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">发行日志</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../V0.4.x/V0.4.0.html">V0.4.0</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">V.3.0</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">核心亮点</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#linux">Linux 兼容性突破</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">容器原生能力显著增强</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">多线程稳定性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">系统调用全面扩容</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id5">版本概览</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id6">详细变更</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id7">1. 线程与信号：向 Linux 行为对齐</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#futex">2. Futex &amp; 内存：同步栈焕然一新</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">3. 容器与命名空间：为云原生而生</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id9">4. 平台与设备：可部署性跃迁</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id10">5. 工程效率与社区：省时、省心、可复用</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id11">已知关注点</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id12">贡献者鸣谢</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id13">参考资料</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.2.x/V0.2.0.html">V0.2.0</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.10.html">V0.1.10</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.9.html">V0.1.9</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.8.html">V0.1.8</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.7.html">V0.1.7</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.6.html">V0.1.6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.5.html">V0.1.5</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.4.html">V0.1.4</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.3.html">V0.1.3</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.2.html">V0.1.2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.1.html">V0.1.1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.0.html">V0.1.0</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">发行日志</a></li>
+      <li class="breadcrumb-item active">V.3.0</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/community/ChangeLog/V0.3.x/V0.3.0.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="v-3-0">
+<h1>V.3.0<a class="headerlink" href="#v-3-0" title="Permalink to this heading"></a></h1>
+<blockquote>
+<div><p>发布日期: 2025-11-20</p>
+</div></blockquote>
+<section id="id1">
+<h2>核心亮点<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<section id="linux">
+<h3>Linux 兼容性突破<a class="headerlink" href="#linux" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>已通过 275 个 Linux 兼容性测试用例</strong>，可在 <a class="reference external" href="https://ci-dashboard.dragonos.org">ci-dashboard.dragonos.org</a> 持续跟踪测试结果</p></li>
+<li><p>引入 gVisor Linux 系统调用自动化测试套件，每次提交/合并都能实时追踪内核行为与 Linux 的兼容性</p></li>
+<li><p>通过多项 gVisor 系统调用测试，内核行为与 Linux 更接近</p></li>
+</ul>
+</section>
+<section id="id2">
+<h3>容器原生能力显著增强<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>命名空间支持</strong>：UTS、IPC、mnt 命名空间完善，支持 <code class="docutils literal notranslate"><span class="pre">unshare</span></code> 操作，容器隔离边界与权限模型向 Linux 主线看齐</p></li>
+<li><p><strong>权限与能力</strong>：<code class="docutils literal notranslate"><span class="pre">capset/capget</span></code> 系统调用、<code class="docutils literal notranslate"><span class="pre">sethostname/domainname</span></code> 修复，完善容器身份管理</p></li>
+<li><p><strong>文件系统增强</strong>：xattr 六个系统调用、<code class="docutils literal notranslate"><span class="pre">SYS_PWRITEV</span></code>、<code class="docutils literal notranslate"><span class="pre">truncate</span></code>、路径遍历/目录切换权限检查，保障容器镜像构建和文件挂载的可控性</p></li>
+<li><p><strong>网络子系统重构</strong>：全新的网络子系统实现，提供更好的 Linux 兼容性和可扩展性；桥接网络支持，应对多租户与边缘节点场景</p></li>
+<li><p><strong>运维工具</strong>：Dropbear SSH 服务器支持，使轻量云原生场景可以即装即用</p></li>
+</ul>
+</section>
+<section id="id3">
+<h3>多线程稳定性提升<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>线程组退出机制、PI futex、<code class="docutils literal notranslate"><span class="pre">prctl(PR_SET_PDEATHSIG/PR_SET_NAME)</span></code> 等一系列改动，让复杂进程的生命周期控制更接近 Linux 主线</p></li>
+<li><p>Go 语言示例程序展示 DragonOS 在多线程场景下的最佳实践</p></li>
+<li><p>vfork、CLONE_PARENT_SETTID、signal frame、FP 状态等历史遗留问题彻底修复</p></li>
+</ul>
+</section>
+<section id="id4">
+<h3>系统调用全面扩容<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<p>新增 10+ 个系统调用接口支持，包括：</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">waitid</span></code>、<code class="docutils literal notranslate"><span class="pre">rt_sigtimedwait</span></code>、<code class="docutils literal notranslate"><span class="pre">setitimer/getitimer</span></code>、<code class="docutils literal notranslate"><span class="pre">clock_nanosleep</span></code>、<code class="docutils literal notranslate"><span class="pre">tgkill/tkill</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">SYS_GETCPU</span></code>、<code class="docutils literal notranslate"><span class="pre">SYS_PWRITEV</span></code>、<code class="docutils literal notranslate"><span class="pre">truncate</span></code></p></li>
+<li><p>xattr 相关六个系统调用、<code class="docutils literal notranslate"><span class="pre">capset/capget</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">clone3</span></code>、<code class="docutils literal notranslate"><span class="pre">get_mempolicy</span></code>、<code class="docutils literal notranslate"><span class="pre">mincore</span></code></p></li>
+</ul>
+</section>
+</section>
+<section id="id5">
+<h2>版本概览<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>内核特性</strong>：线程组退出、PI futex、PR_SET_PDEATHSIG/PR_SET_NAME、SYS_GETCPU、waitid、rt_sigtimedwait、setitimer/getitimer、clock_nanosleep 等调度/信号链路全面增强</p></li>
+<li><p><strong>内存与同步</strong>：VM_DONTCOPY、mincore、RLIMIT_FSIZE、资源限制框架、异常表用户态访问保护，futex 子系统修复/重构 10+ 项</p></li>
+<li><p><strong>文件系统与命名空间</strong>：引入 <code class="docutils literal notranslate"><span class="pre">pwritev</span></code>、<code class="docutils literal notranslate"><span class="pre">truncate</span></code>、xattr 六个系统调用、路径权限检查、UTS/mnt/IPC namespace、capset/capget、/proc 改进</p></li>
+<li><p><strong>平台与网络</strong>：x86 kexec+initram、VF2 RISC-V 适配、桥接网络、大规模网络栈重构、Dropbear SSH 服务器、Go 用户态演示与工具链完善</p></li>
+<li><p><strong>工程效率</strong>：CI 容器升级、测试上传与监控、gVisor/FreeBSD bootstrap 支持、Nix-shell 工具链版本锁定</p></li>
+</ul>
+</section>
+<section id="id6">
+<h2>详细变更<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h2>
+<section id="id7">
+<h3>1. 线程与信号：向 Linux 行为对齐<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>PRCTL 新选项、备用信号栈拷贝、克隆/等待语义补完，<code class="docutils literal notranslate"><span class="pre">waitid</span></code>/job control、资源限制（rlimit）框架与 RLIMIT_FSIZE 检查 (#1386, #1363, #1362, #1333, #1300, #1312)。</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">setitimer/getitimer</span></code>、<code class="docutils literal notranslate"><span class="pre">clock_nanosleep</span></code>、<code class="docutils literal notranslate"><span class="pre">tgkill/tkill</span></code> 等定时器/信号路由补齐；fs/gs 用户空间验证、<code class="docutils literal notranslate"><span class="pre">clone3</span></code> + <code class="docutils literal notranslate"><span class="pre">/proc/cpuinfo</span></code>、<code class="docutils literal notranslate"><span class="pre">PR_SET_PDEATHSIG</span></code> 支持，提升 ABI 兼容性 (#1377, #1307, #1336, #1299).</p></li>
+<li><p>大量信号/线程相关修复：vfork、CLONE_PARENT_SETTID、signal frame、FP 状态、sys_sigaction/sigprocmask、/proc/self/exe 链接等，解决兼容性和稳定性问题 (#1358, #1342, #1357, #1356, #1347, #1359)。</p></li>
+</ul>
+</section>
+<section id="futex">
+<h3>2. Futex &amp; 内存：同步栈焕然一新<a class="headerlink" href="#futex" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>PI futex、共享键生成重构、robust futex 竞态修复、wake op 兼容性、参数校验、futex test 启用，形成更完整的 futex 行为矩阵 (#1373, #1376, #1374, #1372, #1371, #1326, #1321, #1320, #1311, #1276, #d5158a0, #e85d1cd).</p></li>
+<li><p><strong>内存管理改进</strong>：VM_DONTCOPY 标志、异常表驱动的安全用户态访问、mincore、madvise/msync 边界修复、匿名共享页同步、伙伴分配器死锁 &amp; 边界检查等内核内存改进 (#1383, #1349, #1334, #1301, #1258, #1345, #1334, #1361, #1280)</p></li>
+<li><p><strong>资源限制</strong>：Rlimit 框架与 RLIMIT_FSIZE、<code class="docutils literal notranslate"><span class="pre">get_mempolicy</span></code>、<code class="docutils literal notranslate"><span class="pre">clone3</span></code> 集成的 <code class="docutils literal notranslate"><span class="pre">/proc/cpuinfo</span></code>，增强资源观测与限制能力 (#1300, #1312, #1299)</p></li>
+</ul>
+</section>
+<section id="id8">
+<h3>3. 容器与命名空间：为云原生而生<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>网络子系统重构</strong>：实现了全新的网络子系统，提供了更好的 Linux 兼容性，以及更好的可扩展性 (#977)</p></li>
+<li><p><strong>文件系统增强</strong>：<code class="docutils literal notranslate"><span class="pre">SYS_PWRITEV</span></code>、<code class="docutils literal notranslate"><span class="pre">truncate</span></code>、路径遍历/目录切换权限检查、<code class="docutils literal notranslate"><span class="pre">mknodat</span></code>/fatfs 死锁修复、<code class="docutils literal notranslate"><span class="pre">syncfs</span></code>/<code class="docutils literal notranslate"><span class="pre">openat</span></code>/<code class="docutils literal notranslate"><span class="pre">unlinkat</span></code>/<code class="docutils literal notranslate"><span class="pre">lseek</span></code> 行为校正，保障文件系统语义一致性 (#1322, #1308, #1348, #1346, #1369, #1355, #1344)</p></li>
+<li><p><strong>命名空间支持</strong>：扩展属性 xattr 六大系统调用、<code class="docutils literal notranslate"><span class="pre">capset/capget</span></code>、UTS namespace、<code class="docutils literal notranslate"><span class="pre">setdomainname/sethostname</span></code> 修复、IPC namespace 首版、mntns <code class="docutils literal notranslate"><span class="pre">unshare</span></code>，完善命名空间与安全隔离 (#1248, #1293, #1268, #1298, #1288, #1262)</p></li>
+<li><p><strong>容器网络与运维</strong>：桥接网络、网络栈重构、Dropbear SSH 服务器支持，使得 DragonOS 离真正运行容器更近一步 (#1287, #1295, #1304)</p></li>
+</ul>
+</section>
+<section id="id9">
+<h3>4. 平台与设备：可部署性跃迁<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>x86 <code class="docutils literal notranslate"><span class="pre">kexec</span></code> + initram 完成闭环，配合 reboot syscall 完善，为快速切换和自举铺平道路 (#1303, #1157)</p></li>
+<li><p>VF2 RISC-V 平台适配，DragonOS 成为国产 RISC-V 场景的可选方案 (#1285)</p></li>
+<li><p>SYS_GETCPU 与 SMP syscall table 对齐，让多核调度与性能分析更精准 (#1368, #1367)</p></li>
+<li><p>Go 语言示例程序，展示多线程场景下的最佳实践 (#1387)</p></li>
+</ul>
+</section>
+<section id="id10">
+<h3>5. 工程效率与社区：省时、省心、可复用<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>CI 与测试</strong>：CI 容器升级至 v1.16，加入测试结果上传、syscall 测试监控、实时 stdout 输出，问题定位速度倍增 (#1380, #1364, #1341, #15964250)</p></li>
+<li><p><strong>自动化测试</strong>：引入 gVisor Linux 系统调用自动化测试套件，每次提交/合并，都能实时追踪内核行为与 Linux 的兼容性 (#1306, #1271, #1371, #1296)</p></li>
+<li><p><strong>开发工具链</strong>：Nix-shell Rust 固定版本、FreeBSD bootstrap 支持，让外部贡献者也能快速复现同一环境 (#40603716, #093388bd)</p></li>
+<li><p><strong>社区与文档</strong>：多轮文档翻译更新、EdgeOne CDN 赞助商信息、README/支持者列表刷新 (#1385, #1317, #1315, #1294, #1292, #1290, #1289, #1281)</p></li>
+</ul>
+</section>
+</section>
+<section id="id11">
+<h2>已知关注点<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>futex 子系统近期大量变更，建议重点执行多线程压力与robust list 回归测试。</p></li>
+<li><p>新增 kexec/initram &amp; 网络重构涉及启动链路，若自定义硬件需重新验证启动脚本。</p></li>
+<li><p>Namespace/rlimit 相关 syscalls 需更新用户态工具链与测试以覆盖更多边界。</p></li>
+</ul>
+</section>
+<section id="id12">
+<h2>贡献者鸣谢<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h2>
+<p>LoGin、kaleidoscope416、linfeng、Shenjie Yang、JingXuan_Wei、aLinChe、黄铭涛、Bruce.carrot93、Samuel Dai、Vitus、Yuming Jiang、火花等 15 位伙伴共同完成了 0.3.0。</p>
+</section>
+<section id="id13">
+<h2>参考资料<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Linux 兼容性测试看板</strong>：<a class="reference external" href="https://ci-dashboard.dragonos.org">ci-dashboard.dragonos.org</a></p></li>
+<li><p><strong>社区仓库</strong>：<a class="reference external" href="https://github.com/DragonOS-Community/DragonOS">github.com/DragonOS-Community/DragonOS</a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="../V0.4.x/V0.4.0.html" class="btn btn-neutral float-left" title="V0.4.0" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../V0.2.x/V0.2.0.html" class="btn btn-neutral float-right" title="V0.2.0" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../V0.3.0/community/ChangeLog/V0.3.x/V0.3.0.html">V0.3.0</a></dd>
+      <dd><a href="V0.3.0.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../master/community/ChangeLog/V0.3.x/V0.3.0.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

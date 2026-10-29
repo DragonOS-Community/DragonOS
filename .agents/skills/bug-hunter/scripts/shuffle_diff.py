@@ -156,7 +156,7 @@ def main() -> int:
     )
     parser.add_argument("input", nargs="?", help="Input diff file (defaults to stdin)")
     parser.add_argument(
-        "--passes", type=int, default=8, help="Number of shuffled passes to emit"
+        "--passes", type=int, default=4, help="Number of shuffled passes to emit"
     )
     parser.add_argument(
         "--seed",

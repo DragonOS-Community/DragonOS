@@ -3,34 +3,47 @@ use crate::filesystem::vfs::file::File;
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::socket::common::{ShutdownBit, ShutdownState};
 use crate::net::socket::endpoint::Endpoint;
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::unix::ring_buffer::{RbConsumer, RbProducer, RingBuffer};
 use crate::net::socket::unix::stream::UnixStreamSocket;
-use crate::net::socket::unix::UCred;
-use crate::net::socket::unix::{UnixEndpoint, UnixEndpointBound};
+use crate::net::socket::unix::{PeerCred, UCred};
+use crate::net::socket::unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType};
 use crate::net::socket::Socket;
 use crate::process::namespace::net_namespace::NetNamespace;
+use crate::time::Duration;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::num::Wrapping;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use log::debug;
 use system_error::SystemError;
 
 pub(in crate::net) const UNIX_STREAM_DEFAULT_BUF_SIZE: usize = 65536;
 
-/// SCM snapshot for recvmsg containing ancillary data
-pub(super) struct ScmSnapshot {
-    /// SCM data at head (optional credentials and file rights)
-    pub(super) scm_data: Option<(Option<UCred>, Vec<Arc<File>>)>,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct StreamRecvmsgMeta {
     pub(super) copy_len: usize,
+    pub(super) scm_cred: Option<UCred>,
+    pub(super) scm_rights: Vec<Arc<File>>,
+}
+
+/// A zero-byte result can mean either a queued stream with a zero-length
+/// destination or a true EOF. Keep that distinction while holding the reader
+/// lock; the socket layer uses it to order queued data before pending errors.
+pub(super) enum StreamReadOutcome<T> {
+    Data(T),
+    Eof,
+}
+
+pub(super) struct SeqpacketRecvMeta {
+    pub(super) copy_len: usize,
+    pub(super) orig_len: usize,
+    pub(super) truncated: bool,
     pub(super) scm_cred: Option<UCred>,
     pub(super) scm_rights: Vec<Arc<File>>,
 }
@@ -43,12 +56,12 @@ pub(super) enum Inner {
 }
 
 impl Inner {
-    pub(super) fn check_io_events(&self) -> EPollEventType {
+    pub(super) fn check_io_events(&self, sndbuf: usize, is_seqpacket: bool) -> EPollEventType {
         let mut events = EPollEventType::empty();
 
         events |= match self {
             Inner::Init(init) => init.check_io_events(),
-            Inner::Connected(connected) => connected.check_io_events(),
+            Inner::Connected(connected) => connected.check_io_events(sndbuf, is_seqpacket),
             Inner::Listener(listener) => listener.check_io_events(),
         };
 
@@ -58,98 +71,146 @@ impl Inner {
 
 #[derive(Debug)]
 pub struct Init {
-    addr: Option<UnixEndpointBound>,
-    // todo shutdown
-    // is_read_shutdown: AtomicBool,
-    // is_write_shutdown: AtomicBool,
+    addr: Option<UnixBinding>,
+    /// Sticky `sk_shutdown` bits latched by `shutdown(2)` while this socket is
+    /// not connected yet.
+    ///
+    /// Linux keeps `sk_shutdown` on `struct sock`, so the bits a socket latches
+    /// before it is connected survive `listen(2)`/`connect(2)`. Here the state
+    /// is represented per form, so [`Self::listen`] and
+    /// [`Self::into_connected`] hand the bits over to the form the socket turns
+    /// into, and [`Self::restore`] gives them back when a transition fails.
+    sk_shutdown: ShutdownState,
 }
 
 impl Init {
     pub(super) fn new() -> Self {
-        Self { addr: None }
+        Self {
+            addr: None,
+            sk_shutdown: ShutdownState::new(ShutdownBit::NONE),
+        }
+    }
+
+    /// Rebuild the connecting side's `Init`, keeping the `shutdown(2)` bits it
+    /// latched while unconnected.
+    ///
+    /// A failed transition must not forget `sk_shutdown`, exactly as Linux does
+    /// not: `unix_stream_connect()` leaves `sk->sk_shutdown` untouched when it
+    /// has to report an error.
+    pub(super) fn restore(addr: Option<UnixBinding>, shutdown: ShutdownBit) -> Self {
+        Self {
+            addr,
+            sk_shutdown: ShutdownState::new(shutdown),
+        }
+    }
+
+    /// Sticky shutdown bits latched on this socket (`SHUT_RD`/`SHUT_WR`).
+    pub(super) fn shutdown_bits(&self) -> ShutdownBit {
+        self.sk_shutdown.bits()
+    }
+
+    pub(super) fn set_shutdown_bits(&self, bits: ShutdownBit) {
+        self.sk_shutdown.latch(bits);
     }
 
     pub(super) fn bind(
         &mut self,
         endpoint_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
-    ) -> Result<(), SystemError> {
+        socket_type: UnixSocketType,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.addr.is_some() {
             log::error!("the socket is already bound");
-            return endpoint_to_bind.bind_unnamed();
+            return endpoint_to_bind.bind_unnamed().map_err(Into::into);
         }
 
-        let bound_addr = endpoint_to_bind.bind_in(netns)?;
+        let bound_addr = endpoint_to_bind.bind_in(netns, socket_type)?;
         self.addr = Some(bound_addr);
 
         Ok(())
     }
 
     pub(super) fn into_connected(self, peer_addr: UnixEndpointBound) -> (Connected, Connected) {
-        let Init { addr } = self;
-        Connected::new_pair(addr, Some(peer_addr))
+        let Init { addr, sk_shutdown } = self;
+        let (client, server) = Connected::new_pair(addr, Some(peer_addr));
+
+        // `shutdown(2)` may have been latched while this socket was still
+        // unconnected. Linux keeps `sk_shutdown` on the socket across
+        // `connect(2)`, so the connecting side inherits the latched directions,
+        // while the accepted side starts clean like a freshly connected
+        // `struct sock`.
+        client.adopt_latched_shutdown(sk_shutdown.into_bits());
+        (client, server)
     }
 
     pub(super) fn endpoint(&self) -> Option<Endpoint> {
-        self.addr.clone().map(|addr| addr.into())
+        self.addr.as_ref().map(|addr| addr.address().into())
     }
 
     pub(super) fn check_io_events(&self) -> EPollEventType {
-        EPollEventType::EPOLLHUP | EPollEventType::EPOLLOUT
+        // An unconnected stream socket is in `TCP_CLOSE`, where `unix_poll()`
+        // reports `EPOLLHUP` plus the write trio `unix_writable()` grants it
+        // (that helper ignores `sk_shutdown`). A latched receive shutdown adds
+        // what `ShutdownBit::poll_events()` derives, exactly as it does for the
+        // connected and listening forms.
+        EPollEventType::EPOLLHUP
+            | EPollEventType::EPOLLOUT
+            | EPollEventType::EPOLLWRNORM
+            | EPollEventType::EPOLLWRBAND
+            | self.shutdown_bits().poll_events()
     }
 
-    pub(super) fn listen(
-        self,
-        backlog: usize,
-        is_seqpacket: bool,
-        wait_queue: Arc<WaitQueue>,
-        sndbuf_effective: usize,
-        rcvbuf_effective: usize,
-        netns: Arc<NetNamespace>,
-    ) -> Result<Listener, (SystemError, Self)> {
+    pub(super) fn listen(self, config: ListenerConfig) -> Result<Listener, (SystemError, Self)> {
+        let latched = self.shutdown_bits();
         let Some(addr) = self.addr else {
             return Err((SystemError::EINVAL, self));
         };
 
-        Ok(Listener::new(
-            addr,
-            backlog,
-            is_seqpacket,
-            wait_queue,
-            sndbuf_effective,
-            rcvbuf_effective,
-            netns,
-        ))
+        Listener::new(addr, config, latched)
+            .map_err(|addr| (SystemError::EADDRINUSE, Self::restore(Some(addr), latched)))
     }
 }
 
 #[derive(Debug)]
 pub struct Connected {
-    addr: Option<UnixEndpointBound>,
+    addr: Option<UnixBinding>,
     peer_addr: Option<UnixEndpointBound>,
     reader: Mutex<RbConsumer<u8>>,
     writer: Mutex<RbProducer<u8>>,
+    /// `SEND_SHUTDOWN` latched on this endpoint while it had no peer.
+    ///
+    /// `unix_shutdown()` mirrors a direction onto the peer, but only when the
+    /// socket already has one: `connect(2)` never propagates `sk_shutdown` by
+    /// itself. The send half of a pre-connect latch therefore closes only our
+    /// own write side (`EPIPE`) and never becomes an EOF for the peer. A ring
+    /// cannot express that asymmetry — either of its flags reads as
+    /// "read shutdown" on the peer's side — so the half lives here. See
+    /// [`Self::adopt_latched_shutdown()`].
+    local_send_shutdown: AtomicBool,
 }
 
 impl Connected {
     pub(super) fn new_pair(
-        addr: Option<UnixEndpointBound>,
+        addr: Option<UnixBinding>,
         peer_addr: Option<UnixEndpointBound>,
     ) -> (Self, Self) {
         let (this_writer, peer_reader) = RingBuffer::new(UNIX_STREAM_DEFAULT_BUF_SIZE).split();
         let (peer_writer, this_reader) = RingBuffer::new(UNIX_STREAM_DEFAULT_BUF_SIZE).split();
 
+        let local_addr = addr.as_ref().map(UnixBinding::address);
         let this = Connected {
-            addr: addr.clone(),
+            addr,
             peer_addr: peer_addr.clone(),
             reader: Mutex::new(this_reader),
             writer: Mutex::new(this_writer),
+            local_send_shutdown: AtomicBool::new(false),
         };
         let peer = Connected {
-            addr: peer_addr,
-            peer_addr: addr,
+            addr: peer_addr.map(UnixBinding::borrowed),
+            peer_addr: local_addr,
             reader: Mutex::new(peer_reader),
             writer: Mutex::new(peer_writer),
+            local_send_shutdown: AtomicBool::new(false),
         };
 
         return (this, peer);
@@ -158,13 +219,17 @@ impl Connected {
     pub(super) fn endpoint(&self) -> Endpoint {
         // Client sockets may connect without bind(2); getsockname(2) must not panic.
         self.addr
-            .clone()
-            .map(Into::into)
+            .as_ref()
+            .map(|addr| addr.address().into())
             .unwrap_or(Endpoint::Unix(UnixEndpoint::Unnamed))
     }
 
-    pub(super) fn set_endpoint(&mut self, addr: Option<UnixEndpointBound>) {
+    pub(super) fn set_endpoint(&mut self, addr: Option<UnixBinding>) {
         self.addr = addr;
+    }
+
+    pub(super) fn take_binding(&mut self) -> Option<UnixBinding> {
+        self.addr.take()
     }
 
     pub(super) fn peer_endpoint(&self) -> Option<UnixEndpointBound> {
@@ -180,12 +245,13 @@ impl Connected {
         &mut self,
         addr_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
-    ) -> Result<(), SystemError> {
+        socket_type: UnixSocketType,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.addr.is_some() {
-            return addr_to_bind.bind_unnamed();
+            return addr_to_bind.bind_unnamed().map_err(Into::into);
         }
 
-        let bound_addr = addr_to_bind.bind_in(netns)?;
+        let bound_addr = addr_to_bind.bind_in(netns, socket_type)?;
         self.set_endpoint(Some(bound_addr));
 
         Ok(())
@@ -215,8 +281,13 @@ impl Connected {
         self.reader.lock().take_connreset_pending()
     }
 
-    pub(super) fn send_free_len(&self) -> usize {
-        self.writer.lock().free_len()
+    /// Snapshot send readiness under one writer lock. `closed` is reported
+    /// separately because poll must wake a closed writer to observe EPIPE.
+    pub(super) fn send_state(&self, needed: usize, sndbuf: usize) -> (bool, bool) {
+        let writer = self.writer.lock();
+        let closed = self.send_closed(&writer);
+        let writable = writer.free_len() >= needed && writer.len().saturating_add(needed) <= sndbuf;
+        (writable && !closed, closed)
     }
 
     pub(super) fn try_send(
@@ -224,6 +295,8 @@ impl Connected {
         buf: &[u8],
         is_seqpacket: bool,
         sndbuf_limit: usize,
+        cred: Option<UCred>,
+        rights: &[Arc<File>],
     ) -> Result<(usize, Wrapping<usize>, usize), SystemError> {
         let is_empty = buf.is_empty();
         if is_empty {
@@ -233,38 +306,31 @@ impl Connected {
             }
         }
 
-        // shutdown(2) semantics:
-        // - If this end has SHUT_WR, sending must fail with EPIPE.
-        // - If peer has SHUT_RD, sending must fail with EPIPE.
-        {
-            let guard = self.writer.lock();
-            if guard.is_send_shutdown() || guard.is_recv_shutdown() {
-                return Err(SystemError::EPIPE);
-            }
-        }
-
-        //todo 判断辅助数据
-        let buffer = if is_seqpacket {
-            let mut buffer = Vec::with_capacity(buf.len() + 4);
-            let len = buf.len() as u32;
-            buffer.extend_from_slice(&len.to_ne_bytes());
-            buffer.extend_from_slice(buf);
-            buffer
-        } else {
-            buf.to_vec()
-        };
         let mut guard = self.writer.lock();
+        // SHUT_WR and the peer's SHUT_RD reject the send before any allocation.
+        if self.send_closed(&guard) {
+            return Err(SystemError::EPIPE);
+        }
 
         let queued = guard.len();
         let start = guard.tail();
 
         if is_seqpacket {
             // SOCK_SEQPACKET requires all-or-nothing record enqueue.
-            if queued.saturating_add(buffer.len()) > sndbuf_limit || guard.free_len() < buffer.len()
-            {
+            let needed = buf
+                .len()
+                .checked_add(size_of::<u32>())
+                .ok_or(SystemError::EMSGSIZE)?;
+            if queued.saturating_add(needed) > sndbuf_limit || guard.free_len() < needed {
                 return Err(SystemError::ENOBUFS);
             }
-            guard.push_slice(&buffer);
+            let mut buffer = Vec::with_capacity(needed);
+            let len = buf.len() as u32;
+            buffer.extend_from_slice(&len.to_ne_bytes());
+            buffer.extend_from_slice(buf);
+            guard
+                .push_slice_with_scm(&buffer, Some((cred, rights.to_vec())))
+                .ok_or(SystemError::EIO)?;
             return Ok((buf.len(), start, buffer.len()));
         }
 
@@ -275,148 +341,223 @@ impl Connected {
             return Err(SystemError::ENOBUFS);
         }
 
-        guard.push_slice(&buf[..max_write]);
+        guard
+            .push_slice_with_scm(&buf[..max_write], Some((cred, rights.to_vec())))
+            .ok_or(SystemError::EIO)?;
         Ok((max_write, start, max_write))
     }
 
-    pub fn try_recv(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
-        if is_seqpacket {
-            let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, false)?;
-            Ok(copy_len)
-        } else {
-            let avail_len = {
-                let guard = self.reader.lock();
-                let len = guard.len();
-                if len == 0 {
-                    // If peer has SHUT_WR and the receive queue is empty, return EOF.
-                    if guard.is_send_shutdown() {
-                        return Ok(0);
-                    }
-                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                }
-                len
-            };
-            let len = core::cmp::min(buf.len(), avail_len);
-            self.reader.lock().pop_slice(&mut buf[..len]);
-            Ok(len)
-        }
-    }
-
-    pub fn try_peek(&self, buf: &mut [u8], is_seqpacket: bool) -> Result<usize, SystemError> {
-        if is_seqpacket {
-            let (copy_len, _orig_len, _truncated) = self.try_recv_seqpacket_meta(buf, true)?;
-            Ok(copy_len)
-        } else {
-            let guard = self.reader.lock();
-            let avail_len = guard.len();
-            if avail_len == 0 {
-                if guard.is_send_shutdown() {
-                    return Ok(0);
-                }
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            let len = core::cmp::min(buf.len(), avail_len);
-            if guard.peek_slice(&mut buf[..len]).is_none() {
-                return Err(SystemError::EFAULT);
-            }
-            Ok(len)
-        }
-    }
-
-    /// Receive exactly one SOCK_SEQPACKET record.
-    ///
-    /// Returns `(copy_len, orig_len, truncated)`.
-    /// - `copy_len` is the number of bytes copied into `buf`.
-    /// - `orig_len` is the record's original payload length.
-    /// - `truncated` is true if `buf` was smaller than the record.
-    ///
-    /// If `peek` is true, the record is not consumed.
-    pub fn try_recv_seqpacket_meta(
+    pub(super) fn try_recv_stream(
         &self,
         buf: &mut [u8],
         peek: bool,
-    ) -> Result<(usize, usize, bool), SystemError> {
+    ) -> Result<StreamReadOutcome<usize>, SystemError> {
         let mut guard = self.reader.lock();
-        if guard.len() < size_of::<u32>() {
-            // If peer has SHUT_WR and the receive queue is empty, return EOF.
-            if guard.is_send_shutdown() {
-                return Ok((0, 0, false));
+        let available = guard.len();
+        if available == 0 {
+            return if guard.is_read_shutdown() {
+                Ok(StreamReadOutcome::Eof)
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            };
+        }
+
+        let len = buf.len().min(available);
+        if len != 0 {
+            if peek {
+                guard.peek_slice(&mut buf[..len]).ok_or(SystemError::EIO)?;
+            } else {
+                guard.pop_slice(&mut buf[..len]).ok_or(SystemError::EIO)?;
+            }
+        } else if !peek {
+            guard.discard_rights_at_head();
+        }
+        Ok(StreamReadOutcome::Data(len))
+    }
+
+    /// Copy one read directly to userspace and commit queue consumption only
+    /// after the protected copy succeeds.
+    pub fn try_recv_to_user(
+        &self,
+        out: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        is_seqpacket: bool,
+        queue_consumed: &mut bool,
+    ) -> Result<usize, SystemError> {
+        *queue_consumed = false;
+        let mut guard = self.reader.lock();
+        if is_seqpacket {
+            let Some(record_len) = Self::seqpacket_record_len_locked(&guard)? else {
+                return Ok(0);
+            };
+
+            let copy_len = out.len().min(record_len);
+            let mut data = Vec::new();
+            data.try_reserve(copy_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            data.resize(copy_len, 0);
+            let copy_result = if copy_len != 0 {
+                let payload = guard.head() + Wrapping(size_of::<u32>());
+                guard
+                    .peek_slice_at(payload, &mut data)
+                    .ok_or(SystemError::EFAULT)?;
+                out.write_to_user(0, &data).map(|_| copy_len)
+            } else {
+                Ok(0)
+            };
+
+            // Linux consumes a non-PEEK seqpacket record even when copying
+            // its payload to userspace faults. Stream sockets differ: their
+            // byte queue advances only after a successful copy.
+            guard
+                .consume(size_of::<u32>() + record_len)
+                .ok_or(SystemError::EIO)?;
+            *queue_consumed = true;
+            return copy_result;
+        }
+
+        let available = guard.len();
+        if available == 0 {
+            if guard.is_read_shutdown() {
+                return Ok(0);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let mut len_buf = [0u8; 4];
-        if guard.peek_slice(&mut len_buf).is_none() {
-            return Err(SystemError::EFAULT);
-        }
-        let record_len = u32::from_ne_bytes(len_buf) as usize;
+        let copy_len = out.len().min(available);
+        let mut data = Vec::new();
+        data.try_reserve(copy_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        data.resize(copy_len, 0);
+        guard.peek_slice(&mut data).ok_or(SystemError::EFAULT)?;
+        out.write_to_user(0, &data)?;
+        guard.consume(copy_len).ok_or(SystemError::EIO)?;
+        *queue_consumed = true;
+        Ok(copy_len)
+    }
 
-        if guard.len() < size_of::<u32>() + record_len {
+    /// Resolve a complete record while the caller holds the consumer lock.
+    /// `None` denotes EOF, never an empty queued record.
+    fn seqpacket_record_len_locked(reader: &RbConsumer<u8>) -> Result<Option<usize>, SystemError> {
+        if reader.len() < size_of::<u32>() {
+            return if reader.is_read_shutdown() {
+                Ok(None)
+            } else {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            };
+        }
+        let mut header = [0u8; size_of::<u32>()];
+        reader.peek_slice(&mut header).ok_or(SystemError::EIO)?;
+        let record_len = u32::from_ne_bytes(header) as usize;
+        if reader.len() < size_of::<u32>() + record_len {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
+        Ok(Some(record_len))
+    }
 
-        let copy_len = core::cmp::min(buf.len(), record_len);
-        let truncated = copy_len < record_len;
-
-        if peek {
-            if copy_len != 0 {
-                let payload_off = guard.head() + Wrapping(size_of::<u32>());
-                if guard
-                    .peek_slice_at(payload_off, &mut buf[..copy_len])
-                    .is_none()
-                {
-                    return Err(SystemError::EFAULT);
-                }
-            }
-            return Ok((copy_len, record_len, truncated));
-        }
-
-        // Consume header.
-        guard.pop_slice(&mut len_buf);
-        if record_len == 0 {
-            return Ok((0, 0, false));
-        }
-
+    /// Copy and commit one already-admitted record, including its SCM identity.
+    fn recv_seqpacket_record(
+        reader: &mut RbConsumer<u8>,
+        buf: &mut [u8],
+        record_len: usize,
+        peek: bool,
+        want_scm: bool,
+    ) -> Result<SeqpacketRecvMeta, SystemError> {
+        let copy_len = buf.len().min(record_len);
+        let (scm_cred, scm_rights) = if want_scm {
+            reader
+                .peek_scm_at(reader.head())
+                .unwrap_or((None, Vec::new()))
+        } else {
+            (None, Vec::new())
+        };
         if copy_len != 0 {
-            guard.pop_slice(&mut buf[..copy_len]);
+            let payload = reader.head() + Wrapping(size_of::<u32>());
+            reader
+                .peek_slice_at(payload, &mut buf[..copy_len])
+                .ok_or(SystemError::EIO)?;
         }
-
-        // Discard remaining bytes of this record.
-        let mut remaining = record_len - copy_len;
-        if remaining != 0 {
-            let mut trash = [0u8; 256];
-            while remaining != 0 {
-                let chunk = core::cmp::min(remaining, trash.len());
-                guard.pop_slice(&mut trash[..chunk]);
-                remaining -= chunk;
-            }
+        if !peek {
+            reader
+                .consume(size_of::<u32>() + record_len)
+                .ok_or(SystemError::EIO)?;
         }
+        Ok(SeqpacketRecvMeta {
+            copy_len,
+            orig_len: record_len,
+            truncated: copy_len < record_len,
+            scm_cred,
+            scm_rights,
+        })
+    }
 
-        Ok((copy_len, record_len, truncated))
+    pub(super) fn try_recv_seqpacket_meta(
+        &self,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Result<Option<SeqpacketRecvMeta>, SystemError> {
+        let mut reader = self.reader.lock();
+        let Some(record_len) = Self::seqpacket_record_len_locked(&reader)? else {
+            return Ok(None);
+        };
+        Self::recv_seqpacket_record(&mut reader, buf, record_len, peek, false).map(Some)
+    }
+
+    /// Buffer admission never consumes a record. The caller must prepare the
+    /// requested storage after releasing all socket and consumer locks, then
+    /// reselect the current head and its SCM together.
+    pub(super) fn try_recv_seqpacket_recvmsg(
+        &self,
+        buf: &mut RecvBuffer,
+        capacity: usize,
+        peek: bool,
+    ) -> Result<ReceiveAttempt<Option<SeqpacketRecvMeta>>, SystemError> {
+        let mut reader = self.reader.lock();
+        let Some(record_len) = Self::seqpacket_record_len_locked(&reader)? else {
+            return Ok(ReceiveAttempt::Ready(None));
+        };
+        let required = capacity.min(record_len);
+        if buf.capacity() < required {
+            return Ok(ReceiveAttempt::NeedBuffer(required));
+        }
+        Self::recv_seqpacket_record(&mut reader, buf.bytes_mut(required), record_len, peek, true)
+            .map(|meta| ReceiveAttempt::Ready(Some(meta)))
+    }
+
+    fn seqpacket_record_len(&self) -> Option<usize> {
+        Self::seqpacket_record_len_locked(&self.reader.lock())
+            .ok()
+            .flatten()
+    }
+
+    pub(super) fn recv_ready(&self, is_seqpacket: bool) -> bool {
+        if is_seqpacket {
+            self.seqpacket_record_len().is_some()
+        } else {
+            !self.reader.lock().is_empty()
+        }
     }
 
     pub(super) fn readable_len(&self, is_seqpacket: bool) -> usize {
         if is_seqpacket {
-            let guard = self.reader.lock();
-            if guard.len() < size_of::<u32>() {
-                return 0;
-            }
-
-            let mut len_buf = [0u8; 4];
-            if guard.peek_slice(&mut len_buf).is_none() {
-                return 0;
-            }
-
-            let len = u32::from_ne_bytes(len_buf) as usize;
-            // If the header is present but the payload isn't fully queued yet,
-            // report 0 (can't read a full record without blocking).
-            if guard.len() < size_of::<u32>() + len {
-                return 0;
-            }
-
-            len
+            self.seqpacket_record_len().unwrap_or(0)
         } else {
             self.reader.lock().len()
+        }
+    }
+
+    /// Linux 6.6's default CONFIG_AF_UNIX_OOB skips exactly one empty head
+    /// record on close, including for seqpacket. Any following record still
+    /// causes reset, even when its payload is also empty. This differs from
+    /// FIONREAD's first-record payload length and receive readiness.
+    pub(super) fn has_unread_for_reset(&self, is_seqpacket: bool) -> bool {
+        let reader = self.reader.lock();
+        if !is_seqpacket {
+            return !reader.is_empty();
+        }
+        match Self::seqpacket_record_len_locked(&reader) {
+            Ok(Some(0)) => reader.len() > size_of::<u32>(),
+            Ok(Some(_)) => true,
+            _ => false,
         }
     }
 
@@ -434,23 +575,65 @@ impl Connected {
         self.writer.lock().set_send_shutdown();
     }
 
-    pub(super) fn send_closed(&self) -> bool {
-        let guard = self.writer.lock();
-        guard.is_send_shutdown() || guard.is_recv_shutdown()
+    /// Take over the `shutdown(2)` bits latched before this endpoint had a
+    /// peer (`Init::into_connected()`).
+    ///
+    /// Both halves stay observable on this socket, but only the receive half is
+    /// observable by the peer: `unix_stream_sendmsg()` rejects a send when its
+    /// *peer* carries `RCV_SHUTDOWN`. Linux mirrors the send half onto the peer
+    /// only inside `unix_shutdown()`, where an unconnected socket has no peer to
+    /// mirror onto, so that half has to stay local.
+    pub(super) fn adopt_latched_shutdown(&self, latched: ShutdownBit) {
+        if latched.is_recv_shutdown() {
+            // The receive half travels through the ring the peer writes into,
+            // which is where `unix_stream_sendmsg()` looks for the peer's
+            // `RCV_SHUTDOWN`.
+            self.shutdown_recv();
+        }
+        if latched.is_send_shutdown() {
+            self.local_send_shutdown.store(true, Ordering::Release);
+        }
     }
 
-    pub(super) fn peer_send_shutdown(&self) -> bool {
-        self.reader.lock().is_send_shutdown()
+    /// Whether this endpoint may no longer send.
+    ///
+    /// Mirrors `unix_stream_sendmsg()`: it fails with `EPIPE` when this socket
+    /// shut down its own write side (`SEND_SHUTDOWN`) and also when the peer shut
+    /// down its read side (`RCV_SHUTDOWN`). Both conditions describe the same
+    /// Linux bit, because `unix_shutdown()` mirrors each direction onto the
+    /// peer; the ring the peer reads from is where that bit lives, so `writer`
+    /// carries two of the three latches. The third one (a `SHUT_WR` issued
+    /// *before* `connect(2)`) has no peer to mirror onto and therefore cannot
+    /// live in the ring without becoming a spurious EOF for the peer.
+    ///
+    /// | Condition                       | Latched by                          | Linux bit            |
+    /// |---------------------------------|-------------------------------------|----------------------|
+    /// | [`RbProducer::is_send_shutdown`]| our own `shutdown(SHUT_WR)`         | our `SEND_SHUTDOWN`  |
+    /// | [`RbProducer::is_recv_shutdown`]| the peer's `shutdown(SHUT_RD)`      | our `SEND_SHUTDOWN` (mirrored) |
+    /// | [`Self::local_send_shutdown`]   | our `shutdown(SHUT_WR)` before `connect(2)` | our `SEND_SHUTDOWN` (nothing to mirror onto) |
+    fn send_closed(&self, writer: &RbProducer<u8>) -> bool {
+        writer.is_send_shutdown()
+            || writer.is_recv_shutdown()
+            || self.local_send_shutdown.load(Ordering::Acquire)
     }
 
-    pub(super) fn push_scm_at(
-        &self,
-        offset: Wrapping<usize>,
-        len: usize,
-        cred: Option<UCred>,
-        rights: Vec<Arc<File>>,
-    ) {
-        self.writer.lock().push_scm_at(offset, len, cred, rights)
+    /// Apply one `shutdown(2)` request to this endpoint's direction state.
+    ///
+    /// Both directions are expressed through the rings shared with the peer, so
+    /// a receive shutdown also makes the peer's writes fail and a send shutdown
+    /// also gives the peer an EOF — the `peer_mode` propagation Linux does in
+    /// `unix_shutdown()` for a socket that already has a peer.
+    pub(super) fn apply_shutdown(&self, how: ShutdownBit) {
+        if how.is_recv_shutdown() {
+            self.shutdown_recv();
+        }
+        if how.is_send_shutdown() {
+            self.shutdown_send();
+        }
+    }
+
+    pub(super) fn recv_closed(&self) -> bool {
+        self.reader.lock().is_read_shutdown()
     }
 
     #[allow(dead_code)]
@@ -472,71 +655,79 @@ impl Connected {
         guard.next_scm_offset_after(head)
     }
 
-    pub(super) fn scm_snapshot_for_recvmsg(&self) -> ScmSnapshot {
-        let guard = self.reader.lock();
-        let scm_data = guard.peek_scm_at(guard.head());
-        ScmSnapshot { scm_data }
-    }
-
     pub(super) fn try_recv_stream_recvmsg_meta(
         &self,
-        buf: &mut [u8],
+        out: &mut crate::syscall::user_buffer::UserBuffer<'_>,
         peek: bool,
         want_creds: bool,
-    ) -> Result<StreamRecvmsgMeta, SystemError> {
+    ) -> Result<StreamReadOutcome<StreamRecvmsgMeta>, SystemError> {
         let mut guard = self.reader.lock();
 
         let avail_len = guard.len();
         if avail_len == 0 {
-            if guard.is_send_shutdown() {
-                return Ok(StreamRecvmsgMeta {
-                    copy_len: 0,
-                    scm_cred: None,
-                    scm_rights: Vec::new(),
-                });
+            if guard.is_read_shutdown() {
+                return Ok(StreamReadOutcome::Eof);
             }
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
 
-        let max = core::cmp::min(buf.len(), avail_len);
+        let max = core::cmp::min(out.len(), avail_len);
         let plan = guard.plan_stream_recvmsg(max, want_creds);
         let n = plan.bytes;
 
         if n != 0 {
-            if peek {
-                if guard.peek_slice(&mut buf[..n]).is_none() {
-                    return Err(SystemError::EFAULT);
-                }
-            } else {
-                if guard.pop_slice_preserve_records(&mut buf[..n]).is_none() {
-                    return Err(SystemError::EFAULT);
-                }
+            let mut data = Vec::new();
+            data.try_reserve(n).map_err(|_| SystemError::ENOMEM)?;
+            data.resize(n, 0);
+            guard.peek_slice(&mut data).ok_or(SystemError::EFAULT)?;
+            out.write_to_user(0, &data)?;
 
-                // Once any bytes of the rights-carrying record are consumed via
-                // recvmsg, rights are either delivered or discarded, but must not
-                // be visible again.
-                if let Some(start) = plan.rights_start {
-                    guard.clear_rights_at(start);
-                }
+            if !peek {
+                guard.consume_preserve_records(n).ok_or(SystemError::EIO)?;
             }
         }
 
-        Ok(StreamRecvmsgMeta {
+        // Linux detaches queued rights on non-PEEK recvmsg even when the user
+        // requested zero payload bytes. The stream data itself remains queued.
+        if !peek {
+            if let Some(start) = plan.rights_start {
+                guard.clear_rights_at(start);
+            }
+        }
+
+        Ok(StreamReadOutcome::Data(StreamRecvmsgMeta {
             copy_len: n,
             scm_cred: plan.cred,
             scm_rights: plan.rights,
-        })
+        }))
     }
 
-    pub(super) fn check_io_events(&self) -> EPollEventType {
+    pub(super) fn check_io_events(&self, sndbuf: usize, is_seqpacket: bool) -> EPollEventType {
         let mut events = EPollEventType::empty();
 
-        if !self.reader.lock().is_empty() {
-            events |= EPollEventType::EPOLLIN;
+        let reader = self.reader.lock();
+        if reader.has_connreset_pending() {
+            events |= EPollEventType::EPOLLERR;
         }
-        if !self.writer.lock().is_empty() {
-            events |= EPollEventType::EPOLLOUT;
+
+        let has_data = !reader.is_empty();
+        let recv_shutdown = reader.is_read_shutdown();
+        if has_data {
+            events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
         }
+        drop(reader);
+
+        let min_write = if is_seqpacket { size_of::<u32>() } else { 1 };
+        let (writable, send_shutdown) = self.send_state(min_write, sndbuf);
+        if writable || send_shutdown {
+            events |= EPollEventType::EPOLLOUT
+                | EPollEventType::EPOLLWRNORM
+                | EPollEventType::EPOLLWRBAND;
+        }
+
+        // RCV_SHUTDOWN/RDHUP and the full-mask HUP are shared with the listener
+        // path; see `ShutdownBit::poll_events()`.
+        events |= ShutdownBit::from_flags(recv_shutdown, send_shutdown).poll_events();
 
         events
     }
@@ -544,40 +735,43 @@ impl Connected {
 
 #[derive(Debug)]
 pub(super) struct Listener {
+    addr: UnixBinding,
     backlog: Arc<Backlog>,
 }
 
 impl Listener {
+    /// `shutdown` seeds the backlog with what the socket latched while it was
+    /// unconnected: Linux keeps `sk_shutdown` on the socket, so a listener
+    /// created afterwards already fails `accept(2)` with `EINVAL` and refuses
+    /// new connectors with `ECONNREFUSED` when `SHUT_RD` is latched.
     pub(super) fn new(
-        addr: UnixEndpointBound,
-        backlog: usize,
-        is_seqpacket: bool,
-        wait_queue: Arc<WaitQueue>,
-        sndbuf_effective: usize,
-        rcvbuf_effective: usize,
-        netns: Arc<NetNamespace>,
-    ) -> Self {
+        addr: UnixBinding,
+        config: ListenerConfig,
+        shutdown: ShutdownBit,
+    ) -> Result<Self, UnixBinding> {
         let params = BacklogParams {
-            addr,
-            backlog,
-            is_seqpacket,
-            is_shutdown: false,
-            wait_queue,
-            sndbuf_effective,
-            rcvbuf_effective,
-            netns,
+            addr: addr.address(),
+            config,
+            shutdown,
         };
-        let backlog = BACKLOG_TABLE.add_backlog(params).unwrap();
+        let backlog = match BACKLOG_TABLE.add_backlog(params) {
+            Ok(backlog) => backlog,
+            Err(()) => return Err(addr),
+        };
 
-        Self { backlog }
+        Ok(Self { addr, backlog })
     }
 
     pub(super) fn endpoint(&self) -> Endpoint {
-        self.backlog.addr().clone().into()
+        self.addr.address().into()
     }
 
-    pub fn listen(&self, backlog: usize) {
-        self.backlog.set_backlog(backlog);
+    pub fn listen(&self, backlog: usize, peer_cred: PeerCred) {
+        self.backlog.set_backlog(backlog, peer_cred);
+    }
+
+    pub(super) fn peer_cred(&self) -> PeerCred {
+        self.backlog.peer_cred()
     }
 
     pub(super) fn set_sndbuf_effective(&self, effective: usize) {
@@ -591,11 +785,17 @@ impl Listener {
     pub(super) fn try_accept(
         &self,
         inherit_passcred: bool,
+        nonblock: bool,
     ) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        let socket = self.backlog.pop_incoming()?;
+        let socket = self.backlog.pop_incoming(nonblock)?;
 
-        let peer_addr = match socket.inner.read().as_ref().expect("inner is None") {
-            Inner::Connected(connected) => connected.peer_endpoint().into(),
+        let peer_addr = match socket.inner.read().as_ref() {
+            Some(Inner::Connected(connected)) => connected.peer_endpoint().into(),
+            // Defensive only: an accepted child is dequeued and torn down under
+            // mutually exclusive states (the queue is drained under its lock, and
+            // the child has no descriptor yet), so `inner` cannot be `None` or
+            // `Init` here. Report an unnamed peer rather than panicking if a
+            // future state machine ever breaks that invariant.
             _ => Endpoint::Unix(UnixEndpoint::Unnamed),
         };
 
@@ -610,18 +810,24 @@ impl Listener {
         self.backlog.check_io_events()
     }
 
+    /// Whether a blocking `accept()` should stop waiting.
+    ///
+    /// A latched receive shutdown is terminal: it must wake the waiter even with
+    /// an empty queue, otherwise the predicate would send it straight back to
+    /// sleep and `shutdown(listener, SHUT_RD)` would never release it.
     pub(super) fn is_acceptable(&self) -> bool {
-        self.backlog
-            .incoming_conns
-            .lock()
-            .as_ref()
-            .is_some_and(|q| !q.is_empty())
+        self.backlog.has_pending() || self.backlog.is_recv_shutdown()
+    }
+
+    /// Latch a `shutdown(2)` direction on the backlog this listener owns.
+    pub(super) fn set_shutdown(&self, how: ShutdownBit) {
+        self.backlog.set_shutdown_bits(how);
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        unregister_backlog(self.backlog.addr())
+        BACKLOG_TABLE.unregister_backlog(&self.backlog)
     }
 }
 
@@ -636,43 +842,71 @@ impl BacklogTable {
         }
     }
 
-    fn add_backlog(&self, params: BacklogParams) -> Option<Arc<Backlog>> {
+    fn add_backlog(&self, params: BacklogParams) -> Result<Arc<Backlog>, ()> {
         let mut guard = self.backlog_sockets.write();
         if guard.contains_key(&params.addr) {
-            return None;
+            return Err(());
         }
 
         let addr = params.addr.clone();
         let new_backlog = Arc::new(Backlog::new(params));
         guard.insert(addr, new_backlog.clone());
 
-        Some(new_backlog)
+        Ok(new_backlog)
     }
 
     fn get_backlog(&self, addr: &UnixEndpointBound) -> Option<Arc<Backlog>> {
-        self.backlog_sockets.read().get(addr).cloned()
+        let backlog = self.backlog_sockets.read().get(addr).cloned()?;
+        (!backlog.is_closed()).then_some(backlog)
     }
 
-    fn remove_backlog(&self, addr: &UnixEndpointBound) -> Option<Arc<Backlog>> {
-        self.backlog_sockets.write().remove(addr)
+    fn unregister_backlog(&self, backlog: &Arc<Backlog>) {
+        // Close this listener first, without blocking unrelated table operations.
+        let pending = backlog.incoming_conns.lock().take();
+        let mut table = self.backlog_sockets.write();
+        if table
+            .get(backlog.addr())
+            .is_some_and(|entry| Arc::ptr_eq(entry, backlog))
+        {
+            table.remove(backlog.addr());
+        }
+        drop(table);
+        backlog.shutdown_pending(pending);
     }
 }
 
 static BACKLOG_TABLE: BacklogTable = BacklogTable::new();
 
-/// Parameters for creating a new backlog entry
+/// Socket state captured at `listen(2)` time that the resulting backlog needs.
 #[derive(Clone)]
-struct BacklogParams {
-    addr: UnixEndpointBound,
-    backlog: usize,
-    is_seqpacket: bool,
-    is_shutdown: bool,
-    wait_queue: Arc<WaitQueue>,
-    sndbuf_effective: usize,
-    rcvbuf_effective: usize,
-    netns: Arc<NetNamespace>,
+pub(super) struct ListenerConfig {
+    pub(super) backlog: usize,
+    pub(super) is_seqpacket: bool,
+    pub(super) listener: Weak<UnixStreamSocket>,
+    pub(super) sndbuf_effective: usize,
+    pub(super) rcvbuf_effective: usize,
+    pub(super) netns: Arc<NetNamespace>,
+    pub(super) peer_cred: PeerCred,
 }
 
+/// Parameters for creating a new backlog entry
+struct BacklogParams {
+    addr: UnixEndpointBound,
+    config: ListenerConfig,
+    /// `sk_shutdown` bits latched by the socket before it started listening
+    /// (see [`Init::listen()`]). Seeded here, not after registration, so a
+    /// connector cannot slip in between `add_backlog()` and the latch.
+    shutdown: ShutdownBit,
+}
+
+/// Shared state of one listening endpoint.
+///
+/// It is the listening socket's analogue of Linux `struct sock`: the accept
+/// queue, the buffer parameters inherited by accepted children, the wait queue
+/// connectors park on, and the sticky `sk_shutdown` bits. It is shared (not
+/// owned per-`UnixStreamSocket`) because `push_incoming()` runs on the
+/// *connecting* side, which only has the listener's `Weak` and must still
+/// observe the listener's shutdown state.
 #[derive(Debug)]
 pub(super) struct Backlog {
     addr: UnixEndpointBound,
@@ -680,31 +914,85 @@ pub(super) struct Backlog {
     sndbuf_effective: AtomicUsize,
     rcvbuf_effective: AtomicUsize,
     incoming_conns: Mutex<Option<VecDeque<Arc<UnixStreamSocket>>>>,
-    wait_queue: Arc<WaitQueue>,
+    /// Updated under incoming_conns to serialize relisten with connect.
+    peer_cred: Mutex<PeerCred>,
+    /// Connectors wait for queue capacity, independently of accept's readability waiters.
+    connect_wait_queue: WaitQueue,
+    listener: Weak<UnixStreamSocket>,
     is_seqpacket: bool,
     netns: Arc<NetNamespace>,
-    _is_shutdown: bool,
+    /// Sticky `sk_shutdown` bits latched by `shutdown(2)` on this listener.
+    ///
+    /// Monotonic, never cleared. The whole mask is kept (not just a "receive
+    /// shutdown" boolean) because `SHUT_RD` and `SHUT_RDWR` are observably
+    /// different: Linux `unix_poll()` adds `EPOLLHUP` only for the full mask.
+    sk_shutdown: ShutdownState,
+}
+
+/// Responsibility for retrying a capacity wait, not a reservation of a slot.
+/// Keep this alive across address resolution and the next enqueue attempt so
+/// every cancellation/error path passes on capacity it did not consume.
+pub(super) struct BacklogRetry {
+    backlog: Arc<Backlog>,
+}
+
+impl Drop for BacklogRetry {
+    fn drop(&mut self) {
+        let has_space = self
+            .backlog
+            .incoming_conns
+            .lock()
+            .as_ref()
+            .is_some_and(|incoming| incoming.len() <= self.backlog.backlog.load(Ordering::Relaxed));
+        if has_space {
+            self.backlog.connect_wait_queue.wake_one();
+        }
+    }
 }
 
 impl Backlog {
     fn new(params: BacklogParams) -> Self {
-        let incoming_sockets = if params.is_shutdown {
-            None
-        } else {
-            Some(VecDeque::with_capacity(params.backlog))
-        };
+        let ListenerConfig {
+            backlog,
+            is_seqpacket,
+            listener,
+            sndbuf_effective,
+            rcvbuf_effective,
+            netns,
+            peer_cred,
+        } = params.config;
+
+        // `None` has exactly one meaning: `unregister_backlog()` consumed the
+        // queue because the listener is gone. A latched shutdown is expressed by
+        // `sk_shutdown` alone, so the two states cannot be confused.
+        let incoming_sockets = Some(VecDeque::with_capacity(backlog));
 
         Self {
             addr: params.addr,
-            backlog: AtomicUsize::new(params.backlog),
-            sndbuf_effective: AtomicUsize::new(params.sndbuf_effective),
-            rcvbuf_effective: AtomicUsize::new(params.rcvbuf_effective),
+            backlog: AtomicUsize::new(backlog),
+            sndbuf_effective: AtomicUsize::new(sndbuf_effective),
+            rcvbuf_effective: AtomicUsize::new(rcvbuf_effective),
             incoming_conns: Mutex::new(incoming_sockets),
-            wait_queue: params.wait_queue,
-            is_seqpacket: params.is_seqpacket,
-            netns: params.netns,
-            _is_shutdown: params.is_shutdown,
+            peer_cred: Mutex::new(peer_cred),
+            connect_wait_queue: WaitQueue::default(),
+            listener,
+            is_seqpacket,
+            netns,
+            sk_shutdown: ShutdownState::new(params.shutdown),
         }
+    }
+
+    /// Sticky shutdown bits latched on this listener (`SHUT_RD`/`SHUT_WR`).
+    fn shutdown_bits(&self) -> ShutdownBit {
+        self.sk_shutdown.bits()
+    }
+
+    fn set_shutdown_bits(&self, bits: ShutdownBit) {
+        self.sk_shutdown.latch(bits);
+    }
+
+    fn is_recv_shutdown(&self) -> bool {
+        self.shutdown_bits().is_recv_shutdown()
     }
 
     fn sndbuf_effective(&self) -> usize {
@@ -727,32 +1015,62 @@ impl Backlog {
         &self.addr
     }
 
-    fn pop_incoming(&self) -> Result<Arc<UnixStreamSocket>, SystemError> {
+    pub(super) fn is_closed(&self) -> bool {
+        self.incoming_conns.lock().is_none()
+    }
+
+    /// Dequeue the oldest pending connection, if any.
+    ///
+    /// `nonblock` picks the Linux error for an empty queue. `unix_accept()`
+    /// (`net/unix/af_unix.c`) hands `MSG_DONTWAIT` to `skb_recv_datagram()` for an
+    /// `O_NONBLOCK` descriptor, and `__skb_wait_for_more_packets()`
+    /// (`net/core/datagram.c`) reports the empty queue as `EAGAIN` without ever
+    /// consulting `RCV_SHUTDOWN`. Only a blocking accept reaches the
+    /// receive-shutdown branch, which `unix_accept()` maps to `EINVAL`.
+    fn pop_incoming(&self, nonblock: bool) -> Result<Arc<UnixStreamSocket>, SystemError> {
         let mut guard = self.incoming_conns.lock();
 
         let Some(incoming_conns) = &mut *guard else {
+            // The backlog was unregistered: this listener is gone.
             return Err(SystemError::EINVAL);
         };
         let conn = incoming_conns.pop_front();
         drop(guard);
 
-        conn.ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-    }
-
-    fn set_backlog(&self, backlog: usize) {
-        let old_backlog = self.backlog.swap(backlog, Ordering::Relaxed);
-
-        if old_backlog < backlog {
-            self.wait_queue
+        if let Some(conn) = conn {
+            self.connect_wait_queue
                 .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+            return Ok(conn);
+        }
+
+        // Data wins over shutdown: queued connections are always handed out
+        // first, and only an empty queue observes the terminal state.
+        if !nonblock && self.is_recv_shutdown() {
+            Err(SystemError::EINVAL)
+        } else {
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
         }
     }
 
-    fn shutdown_pending(&self) {
-        let pending = {
-            let mut guard = self.incoming_conns.lock();
-            guard.take()
-        };
+    fn set_backlog(&self, backlog: usize, peer_cred: PeerCred) {
+        let _queue = self.incoming_conns.lock();
+        *self.peer_cred.lock() = peer_cred;
+        let old_backlog = self.backlog.swap(backlog, Ordering::Relaxed);
+        drop(_queue);
+
+        if old_backlog < backlog {
+            self.connect_wait_queue
+                .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
+        }
+    }
+
+    fn peer_cred(&self) -> PeerCred {
+        self.peer_cred.lock().clone()
+    }
+
+    fn shutdown_pending(&self, pending: Option<VecDeque<Arc<UnixStreamSocket>>>) {
+        self.connect_wait_queue
+            .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
 
         let Some(mut q) = pending else {
             return;
@@ -763,46 +1081,62 @@ impl Backlog {
         }
     }
 
-    // fn is_shutdown(&self) -> bool {
-    //     self.is_shutdown
-    // }
-
-    // fn shutdown(&self) {
-    //     *self.incoming_conns.lock() = None;
-    //     self.wait_queue
-    //         .wakeup_all(Some(crate::process::ProcessState::Blocked(true)));
-    // }
-
-    fn check_io_events(&self) -> EPollEventType {
-        if self
-            .incoming_conns
+    /// Whether a connection is waiting in the accept queue.
+    fn has_pending(&self) -> bool {
+        self.incoming_conns
             .lock()
             .as_ref()
             .is_some_and(|conns| !conns.is_empty())
-        {
-            EPollEventType::EPOLLIN
+    }
+
+    fn check_io_events(&self) -> EPollEventType {
+        let mut events = if self.has_pending() {
+            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM
         } else {
             EPollEventType::empty()
-        }
+        };
+
+        // Same `unix_poll()` mapping the connected path uses; a receive shutdown
+        // additionally makes the (drained) listener readable, which is what lets
+        // an epoll-driven acceptor observe `shutdown(listener, SHUT_RD)`.
+        events |= self.shutdown_bits().poll_events();
+        events
     }
 
     pub(super) fn push_incoming(
         &self,
         init: Init,
         client_socket: Arc<UnixStreamSocket>,
+        client_cred: PeerCred,
         is_seqpacket: bool,
         client_sndbuf_effective: usize,
         client_rcvbuf_effective: usize,
     ) -> Result<Connected, (Init, SystemError)> {
         if is_seqpacket != self.is_seqpacket {
-            //todo 这里应该是专门为sock_stream和socket_seqpacket分别创建两个socket table
-            return Err((init, SystemError::ECONNREFUSED));
+            return Err((
+                init,
+                if matches!(self.addr, UnixEndpointBound::Path(_)) {
+                    SystemError::EPROTOTYPE
+                } else {
+                    SystemError::ECONNREFUSED
+                },
+            ));
         }
         let mut guard = self.incoming_conns.lock();
 
         let Some(incoming_conns) = &mut *guard else {
-            return Err((init, SystemError::EINVAL));
+            return Err((init, SystemError::ECONNREFUSED));
         };
+
+        // Linux resolves the listener by name *and* socket type, so a type
+        // mismatch never reaches the state checks; `unix_stream_connect()` then
+        // tests `RCV_SHUTDOWN` before the accept-queue capacity
+        // (`net/unix/af_unix.c`). A shut-down listener therefore refuses new
+        // connections even when the queue still has room, and a type mismatch
+        // keeps reporting EPROTOTYPE.
+        if self.is_recv_shutdown() {
+            return Err((init, SystemError::ECONNREFUSED));
+        }
 
         // Linux uses sk_acceptq_is_full(): ack_backlog > max_ack_backlog.
         // This means backlog==0 still allows one pending connection.
@@ -811,7 +1145,13 @@ impl Backlog {
             return Err((init, SystemError::EAGAIN_OR_EWOULDBLOCK));
         }
 
-        let (client_conn, server_conn) = init.into_connected(self.addr.clone());
+        let listener_cred = self.peer_cred();
+        // Read the latch before `init` is consumed: Linux keeps `sk_shutdown`
+        // on the socket, so a `shutdown(2)` issued while this socket was
+        // unconnected has to survive the hand-off below and must not be lost if
+        // the hand-off fails.
+        let latched = init.shutdown_bits();
+        let (mut client_conn, server_conn) = init.into_connected(self.addr.clone());
 
         // Apply buffer sizes that may have been configured before connect.
         let client_snd_cap = super::ring_cap_for_effective_sockbuf(client_sndbuf_effective);
@@ -826,13 +1166,27 @@ impl Backlog {
         let c2s_cap = core::cmp::max(client_snd_cap, server_rcv_cap);
         let s2c_cap = core::cmp::max(server_snd_cap, client_rcv_cap);
 
-        let _ = client_conn.resize_sendbuf(c2s_cap);
-        let _ = server_conn.resize_recvbuf(c2s_cap);
-        let _ = server_conn.resize_sendbuf(s2c_cap);
-        let _ = client_conn.resize_recvbuf(s2c_cap);
+        debug_assert!(c2s_cap.is_power_of_two());
+        debug_assert!(s2c_cap.is_power_of_two());
+        if let Err(e) = client_conn.resize_sendbuf(c2s_cap) {
+            return Err((Init::restore(client_conn.take_binding(), latched), e));
+        }
+        if let Err(e) = server_conn.resize_recvbuf(c2s_cap) {
+            return Err((Init::restore(client_conn.take_binding(), latched), e));
+        }
+        if let Err(e) = server_conn.resize_sendbuf(s2c_cap) {
+            return Err((Init::restore(client_conn.take_binding(), latched), e));
+        }
+        if let Err(e) = client_conn.resize_recvbuf(s2c_cap) {
+            return Err((Init::restore(client_conn.take_binding(), latched), e));
+        }
 
         let server_socket =
             UnixStreamSocket::new_connected(server_conn, false, is_seqpacket, self.netns.clone());
+
+        // Publish both peer identities before making the accepted child visible.
+        *client_socket.peer_cred.lock() = Some(listener_cred);
+        *server_socket.peer_cred.lock() = Some(client_cred);
 
         // Listener-side buffer settings.
         server_socket
@@ -848,29 +1202,45 @@ impl Backlog {
         *server_socket.peer.lock() = Some(Arc::downgrade(&client_socket));
 
         incoming_conns.push_back(server_socket);
-        self.wait_queue
-            .wakeup(Some(crate::process::ProcessState::Blocked(true)));
+        drop(guard);
+        // The client still holds its inner write lock here; only touch the
+        // listener when publishing the newly acceptable connection.
+        if let Some(listener) = self.listener.upgrade() {
+            listener.wake_self_readable();
+        }
         Ok(client_conn)
     }
 
-    pub(super) fn pause_until<F>(&self, mut cond: F) -> Result<(), SystemError>
-    where
-        F: FnMut() -> Result<(), SystemError>,
-    {
-        wq_wait_event_interruptible!(
-            self.wait_queue,
-            match cond() {
-                Err(e) if e.eq(&SystemError::EAGAIN_OR_EWOULDBLOCK) => false,
-                _res => true,
-            },
-            {}
-        )
-    }
-}
+    /// Wait until a connect attempt can be retried or the listener is closed.
+    pub(super) fn wait_for_space(
+        self: &Arc<Self>,
+        timeout: Option<Duration>,
+    ) -> Result<BacklogRetry, SystemError> {
+        let retry = BacklogRetry {
+            backlog: self.clone(),
+        };
+        let ready = || {
+            let guard = self.incoming_conns.lock();
+            let has_room = guard
+                .as_ref()
+                .is_none_or(|incoming| incoming.len() <= self.backlog.load(Ordering::Relaxed));
+            drop(guard);
+            // Mirrors the `sched` condition of `unix_wait_for_peer()`
+            // (`net/unix/af_unix.c`), which includes `!(RCV_SHUTDOWN)`:
+            // a shut-down listener can no longer serve this connector, so stop
+            // waiting and let the retry surface ECONNREFUSED.
+            (has_room || self.is_recv_shutdown()).then_some(())
+        };
 
-fn unregister_backlog(addr: &UnixEndpointBound) {
-    if let Some(backlog) = BACKLOG_TABLE.remove_backlog(addr) {
-        backlog.shutdown_pending();
+        match timeout {
+            Some(timeout) => self.connect_wait_queue.wait_until_timeout(ready, timeout),
+            None => self.connect_wait_queue.wait_until_interruptible(ready),
+        }?;
+
+        // WaitQueue has removed/closed our waker before either returning this
+        // guard or dropping it on error. Never hand off inside `ready`: it runs
+        // while our own waker may still be registered and could wake itself.
+        Ok(retry)
     }
 }
 

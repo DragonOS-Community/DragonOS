@@ -1,8 +1,12 @@
 use system_error::SystemError;
 
+use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::mount::MountFSInode;
+use crate::libs::casting::DowncastArc;
 use crate::{
     filesystem::vfs::{
         fcntl::AtFlags,
+        permission::{check_inode_permission, PermissionMask},
         utils::{rsplit_path, user_path_at},
         FileType, NAME_MAX, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
@@ -20,10 +24,10 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     // - `from`（目标字符串）不要求存在，也不应被解析/规范化
     // - 仅需解析并校验 `to` 的父目录存在且为目录，且 `to` 本身不存在
     //
-    // TODO: 添加权限检查，确保进程拥有目标路径的权限（父目录 W+X）
-    if to.is_empty() {
+    if from.is_empty() || to.is_empty() {
         return Err(SystemError::ENOENT);
     }
+    let trailing_slash = to.ends_with('/');
 
     let pcb = ProcessManager::current_pcb();
 
@@ -39,17 +43,43 @@ pub fn do_symlinkat(from: &str, newdfd: Option<i32>, to: &str) -> Result<usize, 
     // 当路径只有文件名（没有目录部分）时，new_parent_path 为 None，
     // 此时父目录就是 new_begin_inode 本身（即 cwd 或 dirfd 指向的目录）
     let new_parent = match new_parent_path {
-        Some(parent_path) => {
-            new_begin_inode.lookup_follow_symlink(parent_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-        }
+        Some(parent_path) => crate::filesystem::vfs::file::File::recover_io(|| {
+            new_begin_inode.lookup_follow_symlink(parent_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?,
         None => new_begin_inode,
     };
 
-    if new_parent.metadata()?.file_type != FileType::Dir {
+    let parent_metadata = new_parent.metadata()?;
+    if parent_metadata.file_type != FileType::Dir {
         return Err(SystemError::ENOTDIR);
     }
 
-    new_parent.symlink(new_name, from)?;
+    // Linux filename_create()/may_create() checks search permission before
+    // exposing whether the destination exists, but an existing destination
+    // takes precedence over a missing write permission.
+    check_inode_permission(&new_parent, &parent_metadata, PermissionMask::MAY_EXEC)?;
+    match new_parent.find(new_name) {
+        Ok(_) => return Err(SystemError::EEXIST),
+        Err(SystemError::ENOENT) => {}
+        Err(error) => return Err(error),
+    }
+    if trailing_slash {
+        return Err(SystemError::ENOENT);
+    }
+    check_inode_permission(&new_parent, &parent_metadata, PermissionMask::MAY_WRITE)?;
+
+    let notify = || {
+        // fsnotify: the parent directory receives IN_CREATE (a symlink is not a directory, so IN_ISDIR is not set).
+        fsnotify::fsnotify(FsEvent::CREATE, Some((&new_parent, new_name)), None, 0);
+    };
+    if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
+        super::super::file::File::recover_io(|| {
+            mounted.symlink_with_post_commit(new_name, from, notify)
+        })?;
+    } else {
+        super::super::file::File::recover_io(|| new_parent.symlink(new_name, from))?;
+        notify();
+    }
 
     return Ok(0);
 }

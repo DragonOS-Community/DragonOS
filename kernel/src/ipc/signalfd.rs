@@ -1,5 +1,8 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
+use alloc::collections::LinkedList;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem::size_of;
@@ -7,63 +10,21 @@ use core::mem::size_of;
 use bitflags::bitflags;
 
 use crate::arch::ipc::signal::{SigSet, Signal};
-use crate::arch::MMArch;
-use crate::filesystem::epoll::event_poll::{EventPoll, LockedEPItemLinkedList};
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
+use crate::filesystem::epoll::event_poll::EventPoll;
 use crate::filesystem::epoll::{EPollEventType, EPollItem};
 use crate::filesystem::vfs::file::FileFlags;
 use crate::filesystem::vfs::{
-    vcore::generate_inode_id, FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, InodeFlags,
-    InodeMode, Magic, Metadata, PollableInode, SuperBlock,
+    FilePrivateData, FileSystem, IndexNode, InodeMode, Metadata, PollableInode, UserReadMode,
 };
+use crate::ipc::sighand::SigHand;
+use crate::ipc::signal_types::{SigFaultReason, SigInfo, SigType};
 use crate::libs::mutex::MutexGuard;
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use crate::syscall::user_access::UserBufferReader;
+use crate::syscall::user_buffer::UserBuffer;
 use system_error::SystemError;
-
-lazy_static::lazy_static! {
-    static ref SIGNALFD_FS: Arc<SignalFdFs> = Arc::new(SignalFdFs);
-}
-
-#[derive(Debug)]
-pub struct SignalFdFs;
-
-impl SignalFdFs {
-    pub fn instance() -> Arc<Self> {
-        SIGNALFD_FS.clone()
-    }
-}
-
-impl FileSystem for SignalFdFs {
-    fn root_inode(&self) -> Arc<dyn IndexNode> {
-        // signalfd 为伪文件系统（anon_inode 风格），root inode 不会被真正使用。
-        Arc::new(SignalFdInode::new(SigSet::empty(), SignalFdFlags::empty()))
-    }
-
-    fn info(&self) -> FsInfo {
-        FsInfo {
-            blk_dev_id: 0,
-            max_name_len: 255,
-        }
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "signalfd"
-    }
-
-    fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(
-            Magic::EVENTFD_MAGIC,
-            <MMArch as MemoryManagementArch>::PAGE_SIZE as u64,
-            255,
-        )
-    }
-}
 
 bitflags! {
     pub struct SignalFdFlags: u32 {
@@ -73,7 +34,6 @@ bitflags! {
 }
 
 /// Linux signalfd_siginfo 为 128 字节。
-/// gVisor 测试仅检查 read 返回值为 sizeof(signalfd_siginfo)。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SignalFdSigInfo {
@@ -81,10 +41,90 @@ struct SignalFdSigInfo {
 }
 
 impl SignalFdSigInfo {
-    fn from_signal(sig: Signal) -> Self {
+    fn from_siginfo(info: &SigInfo) -> Self {
         let mut bytes = [0u8; 128];
-        // ssi_signo (u32)
-        bytes[0..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+        let header = info.convert_to_posix_siginfo();
+        bytes[0..4].copy_from_slice(&header.si_signo.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&header.si_errno.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&header.si_code.to_ne_bytes());
+        // Fixed-width Linux signalfd ABI, not the siginfo_t union layout.
+        match info.sig_type() {
+            SigType::Opaque { .. } => {
+                if info.opaque_uses_poll_layout() {
+                    let poll = unsafe { header._sifields._sigpoll };
+                    bytes[20..24].copy_from_slice(&poll.si_fd.to_ne_bytes());
+                    bytes[28..32].copy_from_slice(&(poll.si_band as u32).to_ne_bytes());
+                } else {
+                    let rt = unsafe { header._sifields._rt };
+                    bytes[12..16].copy_from_slice(&(rt.si_pid as u32).to_ne_bytes());
+                    bytes[16..20].copy_from_slice(&rt.si_uid.to_ne_bytes());
+                    if header.si_code < 0 {
+                        let pointer = unsafe { rt.si_sigval.sival_ptr };
+                        bytes[44..48].copy_from_slice(&(pointer as i32).to_ne_bytes());
+                        bytes[48..56].copy_from_slice(&pointer.to_ne_bytes());
+                    }
+                }
+            }
+            SigType::Kill { pid, uid } => {
+                bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+                bytes[16..20].copy_from_slice(&uid.to_ne_bytes());
+            }
+            SigType::Rt { pid, uid, sigval } => {
+                bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+                bytes[16..20].copy_from_slice(&uid.to_ne_bytes());
+                // Kernel constructors initialize all eight bytes; user values
+                // have already been copied in full into the kernel SigInfo.
+                let pointer = unsafe { sigval.sival_ptr };
+                bytes[44..48].copy_from_slice(&(pointer as i32).to_ne_bytes());
+                bytes[48..56].copy_from_slice(&pointer.to_ne_bytes());
+            }
+            SigType::PosixTimer {
+                timerid,
+                overrun,
+                sigval,
+            } => {
+                bytes[24..28].copy_from_slice(&timerid.to_ne_bytes());
+                bytes[32..36].copy_from_slice(&overrun.to_ne_bytes());
+                let pointer = unsafe { sigval.sival_ptr };
+                bytes[44..48].copy_from_slice(&(pointer as i32).to_ne_bytes());
+                bytes[48..56].copy_from_slice(&pointer.to_ne_bytes());
+            }
+            SigType::Alarm(pid) => {
+                bytes[24..28].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+            }
+            SigType::SigChild {
+                pid,
+                uid,
+                status,
+                utime,
+                stime,
+            } => {
+                bytes[12..16].copy_from_slice(&(pid.data() as u32).to_ne_bytes());
+                bytes[16..20].copy_from_slice(&uid.to_ne_bytes());
+                bytes[40..44].copy_from_slice(&status.to_ne_bytes());
+                bytes[56..64].copy_from_slice(&utime.to_ne_bytes());
+                bytes[64..72].copy_from_slice(&stime.to_ne_bytes());
+            }
+            SigType::SigPoll { fd, band } => {
+                bytes[20..24].copy_from_slice(&fd.to_ne_bytes());
+                bytes[28..32].copy_from_slice(&(*band as u32).to_ne_bytes());
+            }
+            SigType::Fault { addr, reason } => {
+                bytes[72..80].copy_from_slice(&addr.to_ne_bytes());
+                if let SigFaultReason::AddrLsb(value) = reason {
+                    bytes[80..82].copy_from_slice(&value.to_ne_bytes());
+                }
+            }
+            SigType::SigSys {
+                call_addr,
+                syscall,
+                arch,
+            } => {
+                bytes[84..88].copy_from_slice(&syscall.to_ne_bytes());
+                bytes[88..96].copy_from_slice(&call_addr.to_ne_bytes());
+                bytes[96..100].copy_from_slice(&arch.to_ne_bytes());
+            }
+        }
         Self { bytes }
     }
 }
@@ -99,36 +139,25 @@ struct SignalFdState {
 #[derive(Debug)]
 pub struct SignalFdInode {
     state: SpinLock<SignalFdState>,
-    epitems: LockedEPItemLinkedList,
+    epitems: SpinLock<LinkedList<SignalFdEPollRegistration>>,
+}
+
+#[derive(Debug)]
+struct SignalFdEPollRegistration {
+    epitem: Arc<EPollItem>,
+    sighand: Weak<SigHand>,
 }
 
 impl SignalFdInode {
     pub fn new(mask: SigSet, flags: SignalFdFlags) -> Self {
-        let metadata = Metadata {
-            dev_id: 0,
-            inode_id: generate_inode_id(),
-            size: 0,
-            blk_size: 0,
-            blocks: 0,
-            atime: crate::time::PosixTimeSpec::default(),
-            mtime: crate::time::PosixTimeSpec::default(),
-            ctime: crate::time::PosixTimeSpec::default(),
-            btime: crate::time::PosixTimeSpec::default(),
-            file_type: FileType::CharDevice,
-            mode: InodeMode::from_bits_truncate(0o600),
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            raw_dev: Default::default(),
-            flags: InodeFlags::empty(),
-        };
+        let metadata = anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR);
         Self {
             state: SpinLock::new(SignalFdState {
                 mask,
                 flags,
                 metadata,
             }),
-            epitems: LockedEPItemLinkedList::default(),
+            epitems: SpinLock::new(LinkedList::new()),
         }
     }
 
@@ -137,7 +166,7 @@ impl SignalFdInode {
         let siginfo = pcb.sig_info_irqsave();
         let mut pending = siginfo.sig_pending().signal();
         drop(siginfo);
-        pending |= pcb.sighand().shared_pending_signal();
+        pending |= pcb.process_signal().shared_pending_signal();
         !(pending & *mask).is_empty()
     }
 
@@ -146,15 +175,57 @@ impl SignalFdInode {
         self.has_pending_for_mask(&mask)
     }
 
-    fn dequeue_one(&self) -> Option<Signal> {
+    fn dequeue_one(&self) -> Option<SigInfo> {
         let pcb = ProcessManager::current_pcb();
         let mask = self.state.lock_irqsave().mask;
         let ignore_mask = mask.complement();
-        let (sig, _info) = pcb.dequeue_pending_signal(&ignore_mask);
+        let (sig, info) = pcb.dequeue_pending_signal(&ignore_mask);
         if sig == Signal::INVALID {
             None
         } else {
-            Some(sig)
+            info
+        }
+    }
+
+    fn read_records(
+        &self,
+        len: usize,
+        mut copy: impl FnMut(usize, &[u8]) -> Result<(), SystemError>,
+    ) -> Result<usize, SystemError> {
+        let records = len / size_of::<SignalFdSigInfo>();
+        if records == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let mut total = 0;
+        for _ in 0..records {
+            let info = match self.wait_for_signal(total != 0) {
+                Ok(info) => SignalFdSigInfo::from_siginfo(&info),
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            match copy(total, &info.bytes) {
+                Ok(()) => total += size_of::<SignalFdSigInfo>(),
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(total)
+    }
+
+    fn wait_for_signal(&self, nonblock: bool) -> Result<SigInfo, SystemError> {
+        loop {
+            if let Some(info) = self.dequeue_one() {
+                return Ok(info);
+            }
+            let state = self.state.lock_irqsave();
+            if nonblock || self.nonblock(&state) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            drop(state);
+            let sighand = ProcessManager::current_pcb().sighand();
+            if wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {}).is_err() {
+                return Err(SystemError::ERESTARTSYS);
+            }
         }
     }
 
@@ -184,14 +255,14 @@ impl PollableInode for SignalFdInode {
         epitem: Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem.clone());
-        // 同时注册到 sighand 的 signalfd_epitems，使信号投递路径
-        // 可以在 hardirq 中直接 wakeup_epoll 而无需遍历 fd_table。
-        let pcb = ProcessManager::current_pcb();
-        pcb.sighand()
-            .signalfd_epitems()
+        let sighand = ProcessManager::current_pcb().sighand();
+        self.epitems
             .lock_irqsave()
-            .push_back(epitem);
+            .push_back(SignalFdEPollRegistration {
+                epitem: epitem.clone(),
+                sighand: Arc::downgrade(&sighand),
+            });
+        sighand.signalfd_epitems().add(epitem);
         Ok(())
     }
 
@@ -200,25 +271,34 @@ impl PollableInode for SignalFdInode {
         epitem: &Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if guard.len() != len {
-            drop(guard);
-            // 同时从 sighand 的 signalfd_epitems 中移除
-            let pcb = ProcessManager::current_pcb();
-            pcb.sighand()
-                .signalfd_epitems()
-                .lock_irqsave()
-                .retain(|x| !Arc::ptr_eq(x, epitem));
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
+        let owner = {
+            let mut registrations = self.epitems.lock_irqsave();
+            let mut owner = None;
+            registrations.retain(|registration| {
+                if Arc::ptr_eq(&registration.epitem, epitem) {
+                    owner = Some(registration.sighand.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            owner
+        };
+        let Some(owner) = owner else {
+            return Err(SystemError::ENOENT);
+        };
+        if let Some(sighand) = owner.upgrade() {
+            let _ = sighand.signalfd_epitems().remove(epitem);
         }
+        Ok(())
     }
 }
 
 impl IndexNode for SignalFdInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+    }
+
     fn is_stream(&self) -> bool {
         true
     }
@@ -227,8 +307,9 @@ impl IndexNode for SignalFdInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -241,36 +322,34 @@ impl IndexNode for SignalFdInode {
         len: usize,
         buf: &mut [u8],
         data_guard: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        // 释放 FilePrivateData 锁，避免在阻塞时持有锁导致 panic
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         drop(data_guard);
-
-        if len < size_of::<SignalFdSigInfo>() {
-            return Err(SystemError::EINVAL);
+        if buf.len() < len {
+            return Err(SystemError::EINVAL.into());
         }
+        self.read_records(len, |offset, record| {
+            buf[offset..offset + record.len()].copy_from_slice(record);
+            Ok(())
+        })
+        .map_err(Into::into)
+    }
 
-        loop {
-            if let Some(sig) = self.dequeue_one() {
-                let info = SignalFdSigInfo::from_signal(sig);
-                buf[0..size_of::<SignalFdSigInfo>()].copy_from_slice(&info.bytes);
-                return Ok(size_of::<SignalFdSigInfo>());
-            }
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Scalar
+    }
 
-            let state_guard = self.state.lock_irqsave();
-            if self.nonblock(&state_guard) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-            drop(state_guard);
-
-            // 阻塞等待：在 sighand 的共享 signalfd_wqh 上睡眠。
-            // 信号投递路径（含 hardirq）通过 signalfd_wqh.wakeup_all() 唤醒。
-            let pcb = ProcessManager::current_pcb();
-            let sighand = pcb.sighand();
-            let r = wq_wait_event_interruptible!(sighand.signalfd_wqh(), self.readable(), {});
-            if r.is_err() {
-                return Err(SystemError::ERESTARTSYS);
-            }
-        }
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        self.read_records(len, |offset, record| {
+            writer.write_to_user(offset, record).map(|_| ())
+        })
+        .map(Some)
     }
 
     fn write_at(
@@ -279,12 +358,13 @@ impl IndexNode for SignalFdInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EINVAL)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        SignalFdFs::instance()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -299,12 +379,16 @@ impl IndexNode for SignalFdInode {
         Ok(self.state.lock_irqsave().metadata.clone())
     }
 
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
+    }
+
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
         Ok(self)
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("signalfd"))
+        Ok(anon_inode_path("[signalfd]"))
     }
 }
 
@@ -316,7 +400,7 @@ pub(super) fn read_user_sigset(mask_ptr: usize, mask_size: usize) -> Result<SigS
         return Err(SystemError::EINVAL);
     }
     let reader = UserBufferReader::new(mask_ptr as *const u64, size_of::<u64>(), true)?;
-    let bits = *reader.read_one_from_user::<u64>(0)?;
+    let bits = reader.read_one_from_user::<u64>(0)?;
     Ok(SigSet::from_bits_truncate(bits))
 }
 

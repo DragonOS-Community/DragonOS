@@ -1,0 +1,1270 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V0.4.0 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+        <script src="../../../_static/jquery.js"></script>
+        <script src="../../../_static/underscore.js"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../_static/doctools.js"></script>
+        <script src="../../../_static/translations.js"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../search.html" />
+    <link rel="next" title="V.3.0" href="../V0.3.x/V0.3.0.html" />
+    <link rel="prev" title="发行日志" href="../index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">发行日志</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">V0.4.0</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">核心亮点</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#i-o-linux-6-6">I/O 多路复用与时间语义：向 Linux 6.6 对齐</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#vfs">文件系统与 VFS：功能扩展与稳定性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#procfs">procfs 与系统信息：可观测性大幅提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#linux">进程管理与执行：更接近 Linux 行为</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#i-o">内存管理与 I/O：性能与稳定性优化</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ipc">IPC 与管道：阻塞语义与竞态修复</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">网络与设备：稳定性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ext4-fat">文件系统实现：ext4 与 FAT 改进</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#waiter-waker">等待队列重构：引入 Waiter/Waker 模式</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ci">工程效率与 CI：自动化与工具链改进</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">文档与社区：体验与可访问性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#gvisor">gVisor 测试：兼容性持续提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">其他改进</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id5">版本概览</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id6">详细变更</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id7">1. I/O 多路复用与时间语义：对齐 Linux 6.6</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">2. 文件系统与 VFS：功能扩展与稳定性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id15">3. procfs 与系统信息：可观测性大幅提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id20">4. 进程管理与执行：更接近 Linux 行为</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id24">5. 内存管理与 I/O：性能与稳定性优化</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id29">6. IPC 与管道：阻塞语义与竞态修复</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id31">7. 网络与设备：稳定性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id34">8. 文件系统实现：ext4 与 FAT 改进</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id36">9. 等待队列重构：引入 Waiter/Waker 模式</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id39">10. 工程效率与 CI：自动化与工具链改进</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id45">11. 文档与社区：体验与可访问性提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id48">12. gVisor 测试：兼容性持续提升</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id51">13. 其他改进</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id53">已知关注点</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id54">贡献者鸣谢</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id55">参考资料</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.3.x/V0.3.0.html">V.3.0</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.2.x/V0.2.0.html">V0.2.0</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.10.html">V0.1.10</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.9.html">V0.1.9</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.8.html">V0.1.8</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.7.html">V0.1.7</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.6.html">V0.1.6</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.5.html">V0.1.5</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.4.html">V0.1.4</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.3.html">V0.1.3</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.2.html">V0.1.2</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.1.html">V0.1.1</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../V0.1.x/V0.1.0.html">V0.1.0</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">发行日志</a></li>
+      <li class="breadcrumb-item active">V0.4.0</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/community/ChangeLog/V0.4.x/V0.4.0.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="v0-4-0">
+<h1>V0.4.0<a class="headerlink" href="#v0-4-0" title="Permalink to this heading"></a></h1>
+<blockquote>
+<div><p>前言：本次版本聚焦“Linux 语义对齐 + 工程可用性”。I/O 多路复用、POSIX 定时器/CPU 时间、文件系统与 procfs 获得大幅补强；tmpfs、mount 传播、等待队列重构等为容器/云原生场景铺路；CI/夜构与 Playground 让体验和回归更顺畅。</p>
+</div></blockquote>
+<blockquote>
+<div><p>发布日期: 2025-12-22</p>
+</div></blockquote>
+<section id="id1">
+<h2>核心亮点<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<section id="i-o-linux-6-6">
+<h3>I/O 多路复用与时间语义：向 Linux 6.6 对齐<a class="headerlink" href="#i-o-linux-6-6" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>poll/pselect6 系统调用完善</strong>：修复信号掩码恢复逻辑，优化 <code class="docutils literal notranslate"><span class="pre">pselect6</span></code> 实现，正确处理 sigmask 参数和 timeout 验证，移除零超时提前返回的逻辑，确保在等待 I/O 时正确保存和恢复信号掩码 (#1531)</p></li>
+<li><p><strong>epoll 事件处理增强</strong>：正确处理普通文件的 epoll 事件，避免添加不必要的 epitem；修复 epoll 超时唤醒机制，确保定时器通过 Waker 唤醒等待队列；改进 poll_select_finish 函数以支持更多时间类型 (#1528, #1492)</p></li>
+<li><p><strong>POSIX interval timer 完整实现</strong>：实现 timer_create、timer_settime、timer_gettime、timer_getoverrun、timer_delete 系统调用，支持 SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID 信号投递模式，修复 gVisor timers_test (#1501, #1521)</p></li>
+<li><p><strong>进程与线程 CPU 时间统计</strong>：实现 ProcessCpuTime 结构体，支持用户态、内核态及总执行时间统计；为 PCB 添加 cputime_wait_queue，支持 CLOCK_PROCESS/THREAD_CPUTIME_ID 的 clock_nanosleep；扩展 clock_gettime 和 clock_nanosleep 系统调用支持进程和线程 CPU 时间时钟 (#1517)</p></li>
+<li><p><strong>POSIX 调度系统调用</strong>：实现 sched_getparam、sched_getscheduler 系统调用，重构 sched_yield 到独立模块 (#1416)</p></li>
+</ul>
+</section>
+<section id="vfs">
+<h3>文件系统与 VFS：功能扩展与稳定性提升<a class="headerlink" href="#vfs" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>tmpfs 文件系统支持</strong>：新增 tmpfs 支持并与 devfs 集成，提供内存文件系统能力；实现原子大小管理、零页创建、页缓存管理等功能；支持 /dev/shm 挂载，完善 chroot 和挂载传播机制 (#1459, #1480, #1410)</p></li>
+<li><p><strong>新系统调用实现</strong>：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">copy_file_range</span></code>：实现高效的文件范围复制系统调用 (#1513)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">creat</span></code>：新增 creat 系统调用支持，遵循 Linux 语义（创建新文件或截断现有文件并打开为只写模式）(#1482)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">preadv2/pwritev2</span></code>：实现带偏移量和标志位的向量化 I/O 系统调用，支持 RWF 标志位验证 (#1451, #1461)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fadvise64</span></code>：实现文件访问建议系统调用，支持页面缓存范围写回和驱逐，改进预读机制支持随机访问模式 (#1439)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">umask</span></code>：实现 umask 系统调用，改进权限处理，设置默认 umask 为 0022 (#1500, #1419)</p></li>
+</ul>
+</li>
+<li><p><strong>文件操作改进</strong>：</p>
+<ul>
+<li><p>修复 truncate 系统调用的页缓存截断逻辑，修复边界条件，添加长度检查 (#1444)</p></li>
+<li><p>增强符号链接处理，将最大符号链接跟随次数提升至 40（符合 Linux 6.6 标准），改进 VFS 行为 (#1507)</p></li>
+<li><p>修复 symlinkat 中父目录路径为 None 时的处理逻辑 (#1512)</p></li>
+<li><p>修复 sys_rename 逻辑并支持 RENAME_NOREPLACE 标志 (#1393)</p></li>
+<li><p>修复 pread64 系统调用的兼容性和错误处理，验证 offset 参数和用户缓冲区 (#1398)</p></li>
+</ul>
+</li>
+<li><p><strong>append 锁机制</strong>：实现文件追加操作的锁管理器，使用 jhash 算法保障并发写入的正确性，支持强制追加语义 (#1483)</p></li>
+<li><p><strong>EventFd 文件系统</strong>：实现 EventFd 文件系统并增强 VFS inode 能力，支持事件通知机制；为 IndexNode trait 添加 is_stream、supports_seek、supports_pread、supports_pwrite 方法 (#1486)</p></li>
+<li><p><strong>文件系统标志重构</strong>：重构文件系统标志体系，区分打开标志与访问模式，提升代码清晰度 (#1414)</p></li>
+<li><p><strong>路径检查统一</strong>：统一使用 vfs_check_and_clone_cstr 函数进行路径检查，减少代码重复 (#1481)</p></li>
+<li><p><strong>文件预读功能</strong>：添加文件预读功能支持，新增 readahead 模块实现文件预读算法，提升顺序读取性能 (#1391)</p></li>
+<li><p><strong>挂载传播机制</strong>：实现挂载传播机制，支持 Shared、Private、Slave、Unbindable 传播类型，实现递归绑定挂载支持 (#1410)</p></li>
+</ul>
+</section>
+<section id="procfs">
+<h3>procfs 与系统信息：可观测性大幅提升<a class="headerlink" href="#procfs" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>进程信息文件完善</strong>：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/stat</span></code>：提供进程状态信息，支持 BusyBox ps/pstree/top 等工具 (#1490)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/task</span></code>：实现线程目录结构，支持主线程 tid=pid 的展示 (#1490)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/cmdline</span></code> 和 <code class="docutils literal notranslate"><span class="pre">/proc/cmdline</span></code>：提供进程和内核命令行参数 (#1489)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/maps</span></code>：提供进程内存映射信息，改进缺页异常处理 (#1468)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/statm</span></code>：提供进程内存统计信息 (#1455)</p></li>
+</ul>
+</li>
+<li><p><strong>命名空间支持</strong>：</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/&lt;pid&gt;/ns/</span></code> 目录：支持动态创建命名空间文件，实现 cgroup 命名空间基础结构 (#1515)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/proc/thread-self/ns</span></code>：支持查看线程的命名空间，实现 setns 系统调用用于命名空间管理 (#1412, #1515)</p></li>
+<li><p>修复命名空间文件创建时的竞态条件 (#1413)</p></li>
+</ul>
+</li>
+<li><p><strong>内核日志管理</strong>：实现内核日志级别管理和 procfs 接口（/proc/sys/kernel/printk），支持动态调整日志级别 (#1415)</p></li>
+<li><p><strong>文件描述符信息</strong>：在 procfs 中新增文件描述符相关支持，支持 /proc/self/fd/N 魔法链接，实现管道 FIONREAD ioctl 命令，添加 /proc/<pid>/fdinfo 目录支持 (#1426)</p></li>
+</ul>
+</section>
+<section id="linux">
+<h3>进程管理与执行：更接近 Linux 行为<a class="headerlink" href="#linux" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>shebang 脚本支持</strong>：添加 shebang 脚本执行支持，实现脚本解析和递归执行，可直接运行脚本文件，支持多种解释器 (#1511)</p></li>
+<li><p><strong>进程等待语义修复</strong>：</p>
+<ul>
+<li><p>修复线程组中子进程的等待语义 (#1427)</p></li>
+<li><p>修复子进程退出时父进程唤醒逻辑，确保无论 exit_signal 为何值都唤醒父进程 (#1516)</p></li>
+</ul>
+</li>
+<li><p><strong>进程执行改进</strong>：</p>
+<ul>
+<li><p>修复 sys_exec 相关测试，修复 execve 系统调用中空路径和空参数处理问题 (#1518)</p></li>
+<li><p>改进 execve 和 execveat 系统调用的实现，增强执行文件权限检查与信号处理</p></li>
+<li><p>实现 fd_table 在 execve 进程中的 unsharing，确保隔离性</p></li>
+<li><p>改进路径解析逻辑，修复 shebang 解释器未找到时的错误日志</p></li>
+</ul>
+</li>
+<li><p><strong>信号处理增强</strong>：</p>
+<ul>
+<li><p>修正 POSIX 定时器信号投递逻辑，支持 SIGEV_THREAD 模式，放宽 SIGEV_THREAD_ID 限制 (#1521)</p></li>
+<li><p>修复信号忽略逻辑，实现信号忽略检查逻辑 (#1434)</p></li>
+<li><p>实现增强的信号处理和 IPC 机制，添加 rt_sigqueueinfo 和 rt_tgsigqueueinfo 系统调用 (#1423)</p></li>
+<li><p>修复 kill 进程组的 bug (#1424)</p></li>
+<li><p>修复 sys_rt_sigtimedwait 和 sys_rt_sigreturn 相关问题 (#1406, #1394, #1400)</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="i-o">
+<h3>内存管理与 I/O：性能与稳定性优化<a class="headerlink" href="#i-o" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>用户空间内存访问修复</strong>：</p>
+<ul>
+<li><p>修复 IoVecs 构造时对零长度缓冲区的验证，确保符合 Linux 语义</p></li>
+<li><p>修复 scatter 方法在遇到不可访问内存时的错误处理，避免部分写入后返回错误</p></li>
+<li><p>修复 readv/preadv 等系统调用，使其支持分块读取和部分成功写入</p></li>
+<li><p>修复页面回收逻辑，避免回收仍被映射的文件页</p></li>
+<li><p>修复 UserBufferReader/Writer 对空指针的检查，防止未定义行为</p></li>
+<li><p>优化 IoVecs 的用户空间内存访问检查与拷贝逻辑，统一使用 user_accessible_len 进行访问性验证 (#1522)</p></li>
+</ul>
+</li>
+<li><p><strong>块缓存增强</strong>：增强 CacheBlock 和 BlockCache 功能，添加 from_slice 和 write_data 方法，改进 insert_one_block 和 immediate_write 方法接受切片而非向量，修复 FileMapInfo::page_cache 的内存泄漏问题（改为 Weak<PageCache>）(#1465)</p></li>
+<li><p><strong>页面缓存改进</strong>：</p>
+<ul>
+<li><p>修复 truncate 时的页缓存截断，修复边界条件 (#1444)</p></li>
+<li><p>改进页面缓存管理，重构页缓存读写以解决死锁问题 (#1455)</p></li>
+</ul>
+</li>
+<li><p><strong>内存管理优化</strong>：</p>
+<ul>
+<li><p>修复 slab 分配器迭代器越界访问和并发安全问题，将 SLABALLOCATOR 改为 SpinLock 保护 (#1464)</p></li>
+<li><p>修复异常表安全拷贝的错误处理返回值 (#1395)</p></li>
+<li><p>优化页面回收过程，分离为两阶段以避免死锁 (#1455)</p></li>
+</ul>
+</li>
+<li><p><strong>mmap 支持增强</strong>：为多个文件系统节点实现 mmap 方法，改进 mmap 错误处理和验证，增强内存保护处理和验证 (#1455)</p></li>
+</ul>
+</section>
+<section id="ipc">
+<h3>IPC 与管道：阻塞语义与竞态修复<a class="headerlink" href="#ipc" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>FIFO 阻塞打开语义</strong>：实现 FIFO 的阻塞打开语义，为 LockedPipeInode 添加 open_wait_queue 用于 FIFO 打开时的阻塞等待，实现 Linux FIFO 的阻塞/非阻塞打开语义（O_RDONLY/O_WRONLY/O_RDWR）(#1429)</p></li>
+<li><p><strong>管道行为完善</strong>：</p>
+<ul>
+<li><p>修复并完善 pipe 的行为，新增管道文件系统（PipeFS）并注册 PIPEFS_MAGIC</p></li>
+<li><p>扩展管道缓冲区至 65536 字节，支持原子写入</p></li>
+<li><p>实现命名管道（FIFO）支持，允许 O_RDWR 模式打开</p></li>
+<li><p>修复阻塞模式下写端唤醒的竞态条件，在阻塞模式下先增加 writer 计数再等待读端 (#1529, #1426)</p></li>
+<li><p>为 fcntl 系统调用添加管道缓冲区大小查询功能（F_GETPIPE_SZ 和 F_SETPIPE_SZ）</p></li>
+<li><p>在 procfs 中新增文件描述符相关支持</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="id2">
+<h3>网络与设备：稳定性提升<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>网络栈优化</strong>：</p>
+<ul>
+<li><p>将 NapiManager 的锁机制改为 lock_irqsave，修复在中断上下文中调用 napi_schedule 可能导致的死锁问题 (#1525)</p></li>
+<li><p>修复 UDP getsockname/getpeername 系统调用 (#1460)</p></li>
+</ul>
+</li>
+<li><p><strong>TTY 驱动增强</strong>：</p>
+<ul>
+<li><p>增强 TTY 驱动和设备管理，改进 master 和 slave 类型的处理 (#1462)</p></li>
+<li><p>修复 TTY 和会话的权限检查逻辑，添加 TIOCNOTTY 命令支持 (#1430)</p></li>
+<li><p>为 TTY 设备添加 page_cache 方法并处理无页面缓存的情况 (#1428)</p></li>
+<li><p>改进 PTY 设备管理，添加 /dev/ptmx 符号链接指向内部 devpts 节点 (#1462)</p></li>
+</ul>
+</li>
+<li><p><strong>异步 I/O 通知</strong>：实现异步 I/O 通知机制和 ioctl 系统调用增强 (#1425)</p></li>
+</ul>
+</section>
+<section id="ext4-fat">
+<h3>文件系统实现：ext4 与 FAT 改进<a class="headerlink" href="#ext4-fat" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>ext4 文件系统</strong>：</p>
+<ul>
+<li><p>修复 ext4 inode 读写操作中的自旋锁死锁问题</p></li>
+<li><p>添加父目录指针支持，实现 parent() 方法</p></li>
+<li><p>改进块设备寻址逻辑，统一使用 512 字节 LBA</p></li>
+<li><p>增强根文件系统探测机制，支持 ext4 和 FAT 自动识别</p></li>
+<li><p>修复 ELF 加载器中解释器路径查找问题</p></li>
+<li><p>为 ext4 和 fat 文件系统添加探测方法并优化代码 (#1509)</p></li>
+</ul>
+</li>
+<li><p><strong>FAT 文件系统</strong>：</p>
+<ul>
+<li><p>更新目录链接计数管理，确保目录链接计数从 2 开始（自引用和父目录链接）(#1454)</p></li>
+<li><p>完善文件系统统计信息支持，实现 statfs 所需的 SuperBlock 字段 (#1491)</p></li>
+<li><p>修复 FAT32 FSInfo 空闲簇计数更新时的溢出问题 (#1491)</p></li>
+</ul>
+</li>
+<li><p><strong>文件系统统计</strong>：完善 FAT 和 tmpfs 的文件系统统计信息支持，为 tmpfs 添加默认容量策略（物理内存一半）(#1491)</p></li>
+</ul>
+</section>
+<section id="waiter-waker">
+<h3>等待队列重构：引入 Waiter/Waker 模式<a class="headerlink" href="#waiter-waker" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>等待队列机制重构</strong>：重构等待队列机制，引入 Waiter/Waker 模式避免唤醒丢失，统一等待接口，提供 wait_event_interruptible/uninterruptible 方法，重构 futex、epoll、eventfd、semaphore、completion 等模块使用新等待队列，优化进程等待子进程退出逻辑 (#1452)</p></li>
+<li><p><strong>信号处理修复</strong>：在 sys_rt_sigtimedwait 中消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，将 futex 可中断唤醒的错误码从 ERESTARTSYS 改为 EINTR，以符合 Linux 语义 (#1452)</p></li>
+</ul>
+</section>
+<section id="ci">
+<h3>工程效率与 CI：自动化与工具链改进<a class="headerlink" href="#ci" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>夜间构建工作流</strong>：新增夜间构建与发布工作流，支持自动化构建和发布，分离构建和发布步骤，压缩构建产物为 tarball (#1469, #1471, #1472, #1473, #1474, #1475, #1476, #1477)</p></li>
+<li><p><strong>构建容器升级</strong>：构建容器版本升级至 v1.19，修复 CI 相关问题，添加 riscv64 libc 支持，更新 CI 工作流中的 Docker 镜像仓库地址 (#1442)</p></li>
+<li><p><strong>CI 流程修复</strong>：</p>
+<ul>
+<li><p>修复 CI 流程中测试失败但返回成功状态的问题 (#1403)</p></li>
+<li><p>修复 gVisor 测试自动化脚本，修复自动化开启/关闭 gVisor syscall 测例打包的脚本 (#1405)</p></li>
+<li><p>添加 open_test 测试 (#1458)</p></li>
+</ul>
+</li>
+<li><p><strong>代码审查自动化</strong>：添加 Claude 代码审查工作流，优化代码审查流程和配置，启用进度跟踪功能 (#1435, #1436, #1437, #1438, #1440, #1445, #1446, #1447)</p></li>
+<li><p><strong>开发容器支持</strong>：添加基于 CNB 镜像的 devcontainer 支持，设置非 root 用户为默认 devcontainer 用户 (#1449, #1457)</p></li>
+</ul>
+</section>
+<section id="id3">
+<h3>文档与社区：体验与可访问性提升<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>DragonOS Playground</strong>：更新 README 和构建文档，添加 DragonOS Playground 体验方式，在 README 中新增云原生开发体验方式，提供 CNB 平台一键启动链接，更新社区新闻添加 Playground 上线信息 (#1484)</p></li>
+<li><p><strong>文档翻译更新</strong>：多轮文档翻译更新，提升国际化支持 (#1485, #1453, #1411, #1408, #1402, #1396)</p></li>
+<li><p><strong>用户环境改进</strong>：</p>
+<ul>
+<li><p>修正 PS1 环境变量使其与 bash 默认高亮一致 (#1432)</p></li>
+<li><p>使用彩色 PS1，提升用户体验 (#1422)</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="gvisor">
+<h3>gVisor 测试：兼容性持续提升<a class="headerlink" href="#gvisor" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>测试用例扩展</strong>：删除 gVisor 测试中的 fifo_test blocklist 文件，扩展测试覆盖范围 (#1524)</p></li>
+<li><p><strong>系统调用修复</strong>：</p>
+<ul>
+<li><p>修复 open 系统调用在 gVisor 下的异常表现，修复多个 open 相关测试 (#1417)</p></li>
+<li><p>修复 utimensat/futimesat 系统调用边界情况以兼容 gVisor 测试 (#1431)</p></li>
+<li><p>修复 pread64 系统调用的兼容性和错误处理 (#1398)</p></li>
+<li><p>修复 sys_rename 逻辑并支持 RENAME_NOREPLACE (#1393)</p></li>
+<li><p>修复 getdents 系统调用实现 (#1397)</p></li>
+<li><p>修复 syscall/vfs 中写入部分可读缓冲区时的 SIG 衍生问题 (#1375)</p></li>
+<li><p>修复 cputime、sys_rt_sigtimedwait 和 sys_rt_sigreturn 相关问题 (#1406, #1394, #1400)</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="id4">
+<h3>其他改进<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>符号表查询修复</strong>：修复符号表查询问题，使用二分查找符号替代原有逻辑 (#1443)</p></li>
+<li><p><strong>设备驱动改进</strong>：添加随机设备支持（/dev/random），提供随机字节生成能力 (#1455)</p></li>
+<li><p><strong>文件系统改进</strong>：改进目录链接计数管理，更新 FAT 和 RAM 文件系统中的目录链接计数管理 (#1454)</p></li>
+</ul>
+</section>
+</section>
+<section id="id5">
+<h2>版本概览<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>I/O 多路复用</strong>：poll/pselect6 信号掩码恢复逻辑修复，epoll 事件处理增强，超时唤醒机制完善</p></li>
+<li><p><strong>时间与定时器</strong>：POSIX interval timer 完整实现，CPU 时间统计，clock_nanosleep 完善，POSIX 调度系统调用</p></li>
+<li><p><strong>文件系统</strong>：tmpfs 支持，copy_file_range、creat、preadv2、pwritev2、fadvise64、umask 等新系统调用，append 锁机制，EventFd 文件系统，挂载传播机制</p></li>
+<li><p><strong>procfs 增强</strong>：/proc/<pid>/stat、/proc/<pid>/task、/proc/<pid>/cmdline、/proc/<pid>/maps、/proc/<pid>/ns/、/proc/thread-self/ns 等文件支持，内核日志管理</p></li>
+<li><p><strong>进程管理</strong>：shebang 脚本支持，进程等待语义修复，信号处理增强，进程执行改进</p></li>
+<li><p><strong>内存与 I/O</strong>：用户空间内存访问修复，块缓存增强，页面缓存改进，slab 分配器并发安全修复，mmap 支持增强</p></li>
+<li><p><strong>IPC 与管道</strong>：FIFO 阻塞打开语义，管道竞态条件修复，管道缓冲区动态调整</p></li>
+<li><p><strong>网络与设备</strong>：网络栈锁机制优化，UDP 套接字修复，TTY 驱动增强，随机设备支持</p></li>
+<li><p><strong>文件系统实现</strong>：ext4 死锁修复，FAT 文件系统改进，文件系统统计信息完善</p></li>
+<li><p><strong>等待队列重构</strong>：Waiter/Waker 模式，统一等待接口</p></li>
+<li><p><strong>工程效率</strong>：夜间构建工作流，构建容器升级至 v1.19，CI 流程修复，代码审查自动化，开发容器支持</p></li>
+<li><p><strong>文档与社区</strong>：DragonOS Playground 推广，文档翻译更新，用户环境改进</p></li>
+<li><p><strong>gVisor 测试</strong>：测试用例扩展，多个系统调用修复以通过 gVisor 测试</p></li>
+</ul>
+</section>
+<section id="id6">
+<h2>详细变更<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h2>
+<section id="id7">
+<h3>1. I/O 多路复用与时间语义：对齐 Linux 6.6<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<section id="poll-pselect6-1531">
+<h4>poll/pselect6 优化 (#1531)<a class="headerlink" href="#poll-pselect6-1531" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复 poll_select_finish 中信号掩码恢复逻辑，避免在 ERESTARTSYS 时错误恢复</p></li>
+<li><p>重构 pselect6 系统调用，正确处理 sigmask 参数和 timeout 验证</p></li>
+<li><p>移除 poll_select_finish 中零超时提前返回的逻辑</p></li>
+<li><p>为 PosixTimeSpec 添加 as_millis 方法</p></li>
+<li><p>将 select 相关测试加入白名单</p></li>
+</ul>
+</section>
+<section id="epoll-1528-1492">
+<h4>epoll 事件处理 (#1528, #1492)<a class="headerlink" href="#epoll-1528-1492" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复普通文件在 epoll 中总是就绪的逻辑，避免添加不必要的 epitem</p></li>
+<li><p>改进 poll_select_finish 函数以支持更多时间类型</p></li>
+<li><p>修复 select 系统调用中 timeout 负值检查</p></li>
+<li><p>重构定时器创建逻辑，使用 EpollTimeoutWaker 结构体实现 TimerFunction</p></li>
+<li><p>将超时唤醒方式从直接唤醒 PCB 改为通过 Waker::wake() 触发</p></li>
+</ul>
+</section>
+<section id="posix-interval-timer-1501-1521">
+<h4>POSIX interval timer (#1501, #1521)<a class="headerlink" href="#posix-interval-timer-1501-1521" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>新增 timer_create/timer_settime/timer_gettime/timer_getoverrun/timer_delete 系统调用处理，并接入 syscall table</p></li>
+<li><p>实现进程级 POSIX interval timer：基于 CLOCK_MONOTONIC 的创建/删除/设置/查询、周期性重装与到期调度</p></li>
+<li><p>完整实现 SIGEV_NONE/SIGEV_SIGNAL/SIGEV_THREAD_ID（放宽 SIGEV_THREAD_ID 限制，允许向同线程组的任意线程投递信号）与 SI_TIMER siginfo（含 si_timerid/si_overrun/si_value）</p></li>
+<li><p>修复 overrun 语义与信号合并：按线程 pending 队列合并并累积 overrun，避免重复入队导致进程被信号杀死</p></li>
+<li><p>修复周期性 timer 的 gettime 剩余时间计算与回调窗口返回 0 的问题</p></li>
+<li><p>修复定时器回调中信号锁/队列访问导致的自锁死</p></li>
+<li><p>修复 ProcessControlBlock::raw_tgid() 返回错误字段的问题</p></li>
+</ul>
+</section>
+<section id="cpu-1517">
+<h4>CPU 时间统计 (#1517)<a class="headerlink" href="#cpu-1517" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>新增 ProcessCpuTime 结构体，用于统计用户态、内核态及总执行时间</p></li>
+<li><p>为 PCB 添加 cputime_wait_queue，支持 CLOCK_PROCESS/THREAD_CPUTIME_ID 的 clock_nanosleep</p></li>
+<li><p>在调度器 CPU 时间统计中增加 CPU-time 等待队列唤醒逻辑</p></li>
+<li><p>扩展 clock_gettime 和 clock_nanosleep 系统调用，支持进程和线程 CPU 时间时钟</p></li>
+<li><p>添加 PosixTimeSpec::from_ns 方法，便于从纳秒创建时间规格</p></li>
+<li><p>在 process_cputime_ns 中添加对无效线程组关系的防御性回退和日志记录</p></li>
+<li><p>为 thread_cputime_ns 添加原子操作顺序的注释说明</p></li>
+<li><p>新增多线程 CPU 时间测试程序，验证进程 CPU 时间累加线程时间的功能</p></li>
+</ul>
+</section>
+<section id="posix-1416">
+<h4>POSIX 调度系统调用 (#1416)<a class="headerlink" href="#posix-1416" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>添加 sched_getparam 系统调用以获取进程调度参数</p></li>
+<li><p>添加 sched_getscheduler 系统调用以获取进程调度策略</p></li>
+<li><p>重构 sched_yield 到独立模块，提供适当的系统调用处理程序</p></li>
+<li><p>添加调度权限检查的实用函数</p></li>
+<li><p>从主系统调用模块中移除旧的 do_sched_yield 实现</p></li>
+</ul>
+</section>
+</section>
+<section id="id8">
+<h3>2. 文件系统与 VFS：功能扩展与稳定性提升<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<section id="tmpfs-1459-1480-1410">
+<h4>tmpfs 文件系统 (#1459, #1480, #1410)<a class="headerlink" href="#tmpfs-1459-1480-1410" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>引入新的 tmpfs 模块用于内存中的临时文件存储</p></li>
+<li><p>更新 devfs 以将 /dev/shm 挂载为 tmpfs，符合 Linux 语义</p></li>
+<li><p>增强 vfs 模块以包含 TMPFS_MAGIC 用于 tmpfs 识别</p></li>
+<li><p>添加 tmpfs 功能所需的方法和结构，包括 inode 管理和文件操作</p></li>
+<li><p>实现原子大小管理，添加原子操作以管理 tmpfs 文件系统的当前大小</p></li>
+<li><p>将大小管理集成到 inode 操作中，确保大小更新是线程安全的并遵循指定的限制</p></li>
+<li><p>增强 resize 和 truncate 方法以在文件修改期间相应调整文件系统大小</p></li>
+<li><p>实现零页创建，添加 create_zero_pages 方法到 InnerPageCache 以高效创建零页</p></li>
+<li><p>更新 Tmpfs 以在读写操作期间利用新的零页创建，确保无缝处理页面错误</p></li>
+<li><p>增强 PageFaultHandler，添加 pagecache_fault_zero 以专门管理 tmpfs 的页面错误</p></li>
+<li><p>修复 chroot 相关问题，实现挂载传播机制</p></li>
+</ul>
+</section>
+<section id="id9">
+<h4>新系统调用实现<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<p><strong>copy_file_range (#1513)</strong></p>
+<ul class="simple">
+<li><p>实现 copy_file_range 系统调用，支持文件间高效数据拷贝</p></li>
+<li><p>添加完整的测试用例，覆盖基本功能、边界条件和错误处理</p></li>
+</ul>
+<p><strong>creat (#1482)</strong></p>
+<ul class="simple">
+<li><p>实现 creat 系统调用处理器，遵循 Linux 语义：创建新文件或截断现有文件并打开为只写模式</p></li>
+<li><p>在 x86_64 架构下注册 creat 系统调用到系统调用表</p></li>
+<li><p>在 gvisor 测试白名单中添加 creat 测试项</p></li>
+</ul>
+<p><strong>preadv2/pwritev2 (#1451, #1461)</strong></p>
+<ul class="simple">
+<li><p>实现 preadv2 系统调用，支持带偏移量和标志位的向量化读取</p></li>
+<li><p>处理 offset 为 -1 时使用当前文件偏移量，其他情况复用 preadv 逻辑</p></li>
+<li><p>添加 RWF 标志位验证，遵循 Linux 兼容性要求</p></li>
+<li><p>实现 pwritev2 系统调用，允许带偏移量和标志的向量化写入</p></li>
+<li><p>实现文件描述符和偏移量的验证，确保健壮的错误处理</p></li>
+<li><p>为新系统调用重用 pwritev 的核心逻辑，保持文件写入操作的一致性</p></li>
+</ul>
+<p><strong>fadvise64 (#1439)</strong></p>
+<ul class="simple">
+<li><p>新增 fadvise64 系统调用实现</p></li>
+<li><p>添加页面缓存范围写回和驱逐功能</p></li>
+<li><p>改进预读机制，支持随机访问模式</p></li>
+<li><p>扩展文件访问模式标志管理</p></li>
+<li><p>封装文件预读状态访问并优化 fadvise64 实现</p></li>
+<li><p>修复 fadvise64 中页边界检查逻辑</p></li>
+</ul>
+<p><strong>umask (#1500, #1419)</strong></p>
+<ul class="simple">
+<li><p>为新文件系统实例设置默认 umask 为 0022</p></li>
+<li><p>添加 apply_umask_for_create() 和 chmod_preserve_type() 辅助函数</p></li>
+<li><p>实现文件创建和 chmod 操作的适当权限检查</p></li>
+<li><p>修复 fchmod 系统调用以正确工作并拒绝 O_PATH 文件描述符</p></li>
+<li><p>将 open_create_test 添加到 gvisor 测试套件</p></li>
+</ul>
+</section>
+<section id="id10">
+<h4>文件操作改进<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<p><strong>truncate 修复 (#1444)</strong></p>
+<ul class="simple">
+<li><p>限制缓冲区大小为 512KB，避免分配过大内存导致容量溢出</p></li>
+<li><p>为 resize 加上页缓存截断</p></li>
+<li><p>增加对 len 的检查，检查截断后的长度是否超过限度</p></li>
+<li><p>检查 filemode</p></li>
+<li><p>改进长度参数的类型转换逻辑；统一使用限制大小的缓冲区策略</p></li>
+<li><p>在 fat 的 resize 中加入最大容量检查</p></li>
+<li><p>统一定义 ZERO_BUF_SIZE；增加对零写入的检查；在 vfs 层统一拒绝超出 isize::MAX 的长度</p></li>
+</ul>
+<p><strong>符号链接处理增强 (#1507)</strong></p>
+<ul class="simple">
+<li><p>更新 tmpfs 以要求常规文件和符号链接都使用页缓存，确保正确的读写操作</p></li>
+<li><p>将最大符号链接跟随次数增加到 40，符合 Linux 6.6 标准</p></li>
+<li><p>改进 VFS 中的符号链接处理，根据路径条件和尾随斜杠正确跟随符号链接</p></li>
+<li><p>在 vfs_statx 中添加冲突标志的验证，防止无效操作</p></li>
+<li><p>改进符号链接和 lstat 的系统调用实现以遵循 Linux 语义，确保符号链接创建和路径解析的正确行为</p></li>
+<li><p>修正符号链接跟随次数的处理逻辑，将 VFS_MAX_FOLLOW_SYMLINK_TIMES 从 40 调整为 41</p></li>
+</ul>
+<p><strong>其他文件操作修复</strong></p>
+<ul class="simple">
+<li><p>修复 symlinkat 中父目录路径为 None 时的处理逻辑 (#1512)</p></li>
+<li><p>修复 sys_rename 逻辑并支持 RENAME_NOREPLACE 标志 (#1393)</p></li>
+<li><p>修复 pread64 系统调用的兼容性和错误处理，验证 offset 参数和用户缓冲区 (#1398)</p></li>
+</ul>
+</section>
+<section id="append-1483">
+<h4>append 锁机制 (#1483)<a class="headerlink" href="#append-1483" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>引入 AppendLockManager 以确保跨文件系统的追加操作的原子性，防止并发写入场景中的数据损坏</p></li>
+<li><p>更新文件写入方法以利用新的追加锁机制，确保追加到文件时尊重最新的文件结束位置</p></li>
+<li><p>增强 write_append 和 pwrite_append 方法以支持强制追加语义，符合 Linux 行为</p></li>
+<li><p>在 VFS 初始化期间初始化追加锁管理器，确保在任何文件写入操作之前准备就绪</p></li>
+<li><p>添加 jhash 库并用于 append_lock 的哈希计算</p></li>
+</ul>
+</section>
+<section id="eventfd-1486">
+<h4>EventFd 文件系统 (#1486)<a class="headerlink" href="#eventfd-1486" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>引入 EventFdFs 作为新的伪文件系统以支持 eventfd 文件描述符，包括根 inode 检索和文件系统信息的方法</p></li>
+<li><p>增强 IndexNode trait，添加 is_stream、supports_seek、supports_pread 和 supports_pwrite 方法，以简化流式文件的操作语义</p></li>
+<li><p>更新 VFS 中的文件处理以利用新的 inode 能力，确保 pread、pwrite 和 lseek 操作的正确行为</p></li>
+<li><p>将 eventfd_test 添加到系统调用白名单用于测试</p></li>
+<li><p>修复 pread/pwrite 中 O_PATH 和流式对象的错误处理顺序</p></li>
+</ul>
+</section>
+<section id="id11">
+<h4>文件系统标志重构 (#1414)<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>重构文件系统标志体系，区分打开标志与访问模式</p></li>
+<li><p>提升代码清晰度和可维护性</p></li>
+</ul>
+</section>
+<section id="id12">
+<h4>路径检查统一 (#1481)<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>将多个 VFS 系统调用中的 check_and_clone_cstr 替换为 vfs_check_and_clone_cstr</p></li>
+<li><p>在 page_cache.rs 中简化 page_cache 引用获取方式</p></li>
+<li><p>在 sys_mount.rs 中新增 copy_mount_path_string 函数专门处理挂载路径</p></li>
+<li><p>移除 rename_utils.rs 中冗余的路径长度检查</p></li>
+</ul>
+</section>
+<section id="id13">
+<h4>文件预读功能 (#1391)<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>新增 readahead 模块实现文件预读算法</p></li>
+<li><p>修改 page_cache 模块支持预读标记</p></li>
+<li><p>在 File 结构体中添加预读状态管理</p></li>
+<li><p>为 PageFlags 添加 PG_READAHEAD 标志位</p></li>
+</ul>
+</section>
+<section id="id14">
+<h4>挂载传播机制 (#1410)<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>添加对挂载传播类型的支持：Shared、Private、Slave 和 Unbindable</p></li>
+<li><p>引入新模块用于管理挂载传播语义，包括对等组注册和事件传播</p></li>
+<li><p>更新现有挂载函数以在挂载和卸载操作期间处理传播逻辑</p></li>
+<li><p>增强文档以包含新挂载传播功能的详细信息及其用法</p></li>
+<li><p>添加单元测试以验证不同场景下挂载传播行为的正确性</p></li>
+<li><p>实现递归绑定挂载支持，添加递归绑定挂载功能，支持 MS_BIND | MS_REC 标志</p></li>
+<li><p>实现 BFS 遍历以在 do_recursive_bind_mount 中复制子挂载</p></li>
+<li><p>修复挂载注册顺序以防止失败时的悬空注册</p></li>
+</ul>
+</section>
+</section>
+<section id="id15">
+<h3>3. procfs 与系统信息：可观测性大幅提升<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h3>
+<section id="id16">
+<h4>进程信息文件<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h4>
+<p><strong>/proc/<pid>/stat 和 /proc/<pid>/task (#1490)</strong></p>
+<ul class="simple">
+<li><p>添加 /proc/<pid>/stat 文件生成，支持 BusyBox ps/pstree/top 等工具</p></li>
+<li><p>实现 /proc/<pid>/task 目录结构，支持主线程 tid=pid 的展示</p></li>
+<li><p>新增 proc_pid_stat 和 proc_pid_task 模块处理相关逻辑</p></li>
+<li><p>扩展 ProcFileType 枚举，添加 ProcPidStat、ProcPidTaskDir 等类型</p></li>
+<li><p>在 InodeInfo 中新增 tid 字段以支持线程信息</p></li>
+</ul>
+<p><strong>/proc/cmdline 和 /proc/<pid>/cmdline (#1489)</strong></p>
+<ul class="simple">
+<li><p>新增 proc_pid_cmdline 模块，实现 /proc/cmdline 和 /proc/<pid>/cmdline 文件的读取逻辑</p></li>
+<li><p>在进程控制块中增加 cmdline 字段，用于存储进程的命令行参数</p></li>
+<li><p>在 execve、fork 和初始进程启动时正确设置和继承 cmdline 数据</p></li>
+<li><p>在 procfs 中创建对应的文件节点并集成到文件类型枚举和打开逻辑中</p></li>
+</ul>
+<p><strong>/proc/<pid>/maps (#1468)</strong></p>
+<ul class="simple">
+<li><p>新增 proc_maps 模块，实现 /proc/<pid>/maps 文件的生成逻辑</p></li>
+<li><p>在 ProcFS 中注册 maps 文件，支持进程文件夹的创建和清理</p></li>
+<li><p>更新 gvisor 测试白名单，添加 time_test</p></li>
+<li><p>修正缺页异常处理中的用户态判断逻辑，优先使用 TrapFrame 和错误码判断访问发起者</p></li>
+</ul>
+<p><strong>/proc/<pid>/statm (#1455)</strong></p>
+<ul class="simple">
+<li><p>将 ProcStatm 文件类型引入 ProcFileType 枚举</p></li>
+<li><p>实现 open_statm 函数以返回 statm 文件的占位符响应</p></li>
+<li><p>更新 ProcFS inode 创建以包含每个进程的 statm 文件</p></li>
+<li><p>增强 IndexNode 实现以处理新的 ProcStatm 文件类型</p></li>
+<li><p>优化 statm 文件打开逻辑，增加虚拟内存页数计算</p></li>
+</ul>
+</section>
+<section id="id17">
+<h4>命名空间支持<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h4>
+<p><strong>/proc/<pid>/ns/ 目录 (#1515)</strong></p>
+<ul class="simple">
+<li><p>新增 /proc/<pid>/ns/ 目录，支持动态创建命名空间文件</p></li>
+<li><p>实现 cgroup 命名空间基础结构，支持 CLONE_NEWCGROUP 标志</p></li>
+<li><p>为命名空间文件添加 ioctl 支持（NS_GET_NSTYPE 等命令）</p></li>
+<li><p>扩展 setns 系统调用以支持 cgroup 命名空间切换</p></li>
+</ul>
+<p><strong>/proc/thread-self/ns (#1412)</strong></p>
+<ul class="simple">
+<li><p>引入新模块用于处理 /proc/thread-self/ns 下的命名空间文件，允许应用程序通过符号链接引用命名空间</p></li>
+<li><p>实现命名空间文件及其对应 ID 的动态创建，确保与 Linux 行为兼容</p></li>
+<li><p>更新 ProcFS 以为线程特定命名空间创建必要的目录结构和文件</p></li>
+<li><p>增强现有 ProcFileType 枚举以包含线程自身命名空间的新类型</p></li>
+<li><p>实现 setns 系统调用用于命名空间管理，允许进程使用文件描述符加入现有命名空间</p></li>
+</ul>
+<p><strong>命名空间文件竞态修复 (#1413)</strong></p>
+<ul class="simple">
+<li><p>为并发命名空间文件创建添加适当的错误处理</p></li>
+<li><p>在创建过程中更早地移动命名空间类型验证</p></li>
+<li><p>确保子 inode 在 children map 中可见之前完全初始化</p></li>
+<li><p>通过重新检查 children map 处理 EEXIST 竞态条件</p></li>
+</ul>
+</section>
+<section id="id18">
+<h4>内核日志管理 (#1415)<a class="headerlink" href="#id18" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>引入新模块用于管理内核日志级别，模仿 Linux 行为</p></li>
+<li><p>添加通过命令行和 procfs 接口动态配置日志级别的支持</p></li>
+<li><p>创建新的 /proc/sys/kernel/printk 文件用于读取和写入日志级别设置</p></li>
+<li><p>更新现有日志机制以利用新的日志级别管理系统</p></li>
+<li><p>增强 QEMU 启动脚本以允许通过环境变量设置日志级别</p></li>
+</ul>
+</section>
+<section id="id19">
+<h4>文件描述符信息 (#1426)<a class="headerlink" href="#id19" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>在 procfs 中新增文件描述符相关支持</p></li>
+<li><p>为 procfs 的 InodeInfo 添加 target_inode 字段，用于存储魔法链接的原始文件 inode</p></li>
+<li><p>实现 IndexNode::special_node 方法，使 /proc/self/fd/N 能返回原始文件的引用</p></li>
+<li><p>在 VFS 中处理 SpecialNodeData::Reference，支持魔法链接的路径解析</p></li>
+<li><p>为管道文件实现 ioctl 的 FIONREAD 命令，获取可读字节数</p></li>
+<li><p>添加 /proc/<pid>/fdinfo 目录支持并实现管道缓冲区动态调整</p></li>
+</ul>
+</section>
+</section>
+<section id="id20">
+<h3>4. 进程管理与执行：更接近 Linux 行为<a class="headerlink" href="#id20" title="Permalink to this heading"></a></h3>
+<section id="shebang-1511">
+<h4>shebang 脚本支持 (#1511)<a class="headerlink" href="#shebang-1511" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>新增 shebang 模块，实现脚本解析和递归执行</p></li>
+<li><p>重构 exec 模块，支持递归加载和上下文跟踪</p></li>
+<li><p>添加测试程序验证 shebang 功能</p></li>
+<li><p>为 parse_shebang_line 函数添加 inline 属性以优化</p></li>
+</ul>
+</section>
+<section id="id21">
+<h4>进程等待语义修复<a class="headerlink" href="#id21" title="Permalink to this heading"></a></h4>
+<p><strong>线程组等待语义 (#1427)</strong></p>
+<ul class="simple">
+<li><p>修复线程组中子进程的等待语义</p></li>
+</ul>
+<p><strong>父进程唤醒逻辑 (#1516)</strong></p>
+<ul class="simple">
+<li><p>修正父进程唤醒条件，确保无论 exit_signal 为何值都唤醒父进程</p></li>
+<li><p>修复线程组 leader 唤醒逻辑的位置错误</p></li>
+</ul>
+</section>
+<section id="id22">
+<h4>进程执行改进 (#1518)<a class="headerlink" href="#id22" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复 execve 系统调用中空路径和空参数处理问题，在解析符号链接前检查 argv 是否为空，避免空指针访问</p></li>
+<li><p>添加对空路径字符串的检查，返回 ENOENT 错误码</p></li>
+<li><p>为 gvisor 测试套件添加版本管理功能，引入版本变量和版本文件以支持自动检测和升级</p></li>
+<li><p>增强执行文件权限检查与信号处理，在 execve 系统调用中增加文件类型和执行权限检查</p></li>
+<li><p>移除 shebang 处理中冗余的 interpreter_path 字段</p></li>
+<li><p>修复 fork 时信号掩码复制问题，确保 POSIX 合规性</p></li>
+<li><p>完善 execveat 系统调用对 AT_EMPTY_PATH 和 AT_SYMLINK_NOFOLLOW 标志的处理</p></li>
+<li><p>实现 fd_table 在 execve 进程中的 unsharing，确保隔离性</p></li>
+<li><p>更新路径解析逻辑，仅在 absolute_path() 成功时替换 argv[0]，在失败时保持原始路径</p></li>
+<li><p>改进 shebang 解释器未找到时的错误日志</p></li>
+</ul>
+</section>
+<section id="id23">
+<h4>信号处理增强<a class="headerlink" href="#id23" title="Permalink to this heading"></a></h4>
+<p><strong>POSIX 定时器信号投递 (#1521)</strong></p>
+<ul class="simple">
+<li><p>修复 ProcessControlBlock::raw_tgid() 返回错误字段的问题</p></li>
+<li><p>为 POSIX 定时器添加 SIGEV_THREAD 支持，兼容 gVisor 测试</p></li>
+<li><p>放宽 SIGEV_THREAD_ID 限制，允许向同线程组的任意线程投递信号</p></li>
+</ul>
+<p><strong>信号忽略逻辑 (#1434)</strong></p>
+<ul class="simple">
+<li><p>实现信号忽略检查逻辑</p></li>
+<li><p>修复 getpid 在命名空间中返回正确的 tgid</p></li>
+<li><p>修复 fork 时的 copy_process 顺序</p></li>
+<li><p>修复 init 进程中的 CloneFlags::CLONE_SIGHAND 标志</p></li>
+</ul>
+<p><strong>增强的信号处理和 IPC 机制 (#1423)</strong></p>
+<ul class="simple">
+<li><p>添加 rt_sigqueueinfo 和 rt_tgsigqueueinfo 系统调用，用于符合 POSIX 的信号投递</p></li>
+<li><p>增强 kill 进程功能，提供适当的信号验证和权限检查</p></li>
+<li><p>改进进程退出处理，包括信号清理和父进程通知</p></li>
+<li><p>更新 fork 实现以正确处理信号继承</p></li>
+<li><p>实现 setresuid 系统调用，提供适当的权限管理</p></li>
+<li><p>添加信号相关系统调用的全面测试覆盖</p></li>
+</ul>
+<p><strong>kill 进程组修复 (#1424)</strong></p>
+<ul class="simple">
+<li><p>修复 kill 进程组的 bug，使得 KillTest.ProcessGroups 通过</p></li>
+</ul>
+<p><strong>sys_rt_sigtimedwait 和 sys_rt_sigreturn 修复 (#1406, #1394, #1400)</strong></p>
+<ul class="simple">
+<li><p>修复进程 CPU 时间统计精度，将统计基准调整为扣除 IRQ 和 Steal 时间后的净时间（accounted_cputime）</p></li>
+<li><p>修复 sys_rt_sigtimedwait 的信号等待逻辑，确保即使等待信号集为空也能正确进入 do_kernel_rt_sigtimedwait</p></li>
+<li><p>修复潜在的无限睡眠问题：当线程被非目标信号或非超时事件唤醒时，将正确返回 EINTR</p></li>
+<li><p>修复 bitflags 错误移除的 bug，应该使用 remove()</p></li>
+<li><p>修复 sys_rt_sigreturn：当从信号处理函数返回用户态时，如果待恢复的 %rcx / %r11 与 sysretq 的行为冲突，则强制跳转到 .L_syscall_must_use_iret 分支，使用 iretq 指令精确恢复完整的上下文</p></li>
+</ul>
+</section>
+</section>
+<section id="id24">
+<h3>5. 内存管理与 I/O：性能与稳定性优化<a class="headerlink" href="#id24" title="Permalink to this heading"></a></h3>
+<section id="id25">
+<h4>用户空间内存访问修复 (#1522)<a class="headerlink" href="#id25" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复 IoVecs 构造时对零长度缓冲区的验证，确保符合 Linux 语义</p></li>
+<li><p>修复 scatter 方法在遇到不可访问内存时的错误处理，避免部分写入后返回错误</p></li>
+<li><p>修复 readv/preadv 等系统调用，使其支持分块读取和部分成功写入</p></li>
+<li><p>修复页面回收逻辑，避免回收仍被映射的文件页</p></li>
+<li><p>修复 UserBufferReader/Writer 对空指针的检查，防止未定义行为</p></li>
+<li><p>调整缓存阈值并添加 gVisor 测试的内存检测逻辑</p></li>
+<li><p>优化 IoVecs 的用户空间内存访问检查与拷贝逻辑，移除冗余的 verify_area 和 UserBufferReader/Writer 检查，统一使用 user_accessible_len 进行访问性验证</p></li>
+<li><p>在 gather 方法中使用 copy_from_user_protected 进行异常保护的拷贝，与 scatter 方法保持一致</p></li>
+<li><p>改进错误处理逻辑，当部分数据已成功读取时返回已读取的数据，否则返回 EFAULT</p></li>
+</ul>
+</section>
+<section id="id26">
+<h4>块缓存增强 (#1465)<a class="headerlink" href="#id26" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>为 CacheBlock 添加 from_slice 方法，用于直接从切片创建实例，避免不必要的分配</p></li>
+<li><p>在 CacheBlock 中引入 write_data 方法，允许就地更新块数据</p></li>
+<li><p>更新 BlockCache 中的 insert_one_block 和 immediate_write 方法以接受切片而非向量，提高性能和内存使用</p></li>
+<li><p>在多个位置实现块大小验证的错误处理，确保数据完整性</p></li>
+<li><p>将 FileMapInfo::page_cache 更改为 Weak<PageCache> 以修复由引用循环引起的内存泄漏</p></li>
+</ul>
+</section>
+<section id="id27">
+<h4>页面缓存改进 (#1444, #1455)<a class="headerlink" href="#id27" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复 truncate 时的页缓存截断，修复边界条件</p></li>
+<li><p>重构页缓存读写以解决死锁问题并改进错误处理，将页缓存读写拆分为两阶段以避免用户缺页时持有锁</p></li>
+<li><p>改进文件系统缺页处理，返回 SIGBUS 而非 panic</p></li>
+<li><p>优化 sys_read/sys_write 的用户缓冲区访问检查</p></li>
+<li><p>修复 mprotect 参数对齐检查</p></li>
+</ul>
+</section>
+<section id="id28">
+<h4>内存管理优化<a class="headerlink" href="#id28" title="Permalink to this heading"></a></h4>
+<p><strong>slab 分配器修复 (#1464)</strong></p>
+<ul class="simple">
+<li><p>为 ObjectPageIterMut 添加 remaining 字段，防止迭代越界</p></li>
+<li><p>将 SLABALLOCATOR 改为 SpinLock 保护，修复并发访问问题</p></li>
+<li><p>在 kernel_allocator 中正确使用锁保护 slab 分配器操作</p></li>
+</ul>
+<p><strong>异常表安全拷贝 (#1395)</strong></p>
+<ul class="simple">
+<li><p>修改异常表安全拷贝的错误处理返回值</p></li>
+</ul>
+<p><strong>页面回收优化 (#1455)</strong></p>
+<ul class="simple">
+<li><p>优化页面回收过程以防止死锁，将页面回收分为两阶段以避免长时间持有回收器锁，降低与 page_manager/page_cache 的锁顺序反转风险</p></li>
+<li><p>更新 shrink_list 方法以在不持有回收器锁的情况下处理受害者页驱逐，确保更安全的内存管理</p></li>
+<li><p>改进 drain_lru 方法以高效检索用于回收的受害者页</p></li>
+</ul>
+</section>
+<section id="mmap-1455">
+<h4>mmap 支持增强 (#1455)<a class="headerlink" href="#mmap-1455" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>为 LockedZeroInode、LockedExt4Inode、LockedFATInode 和 LockedRamFSInode 实现 mmap 方法，允许内存映射操作</p></li>
+<li><p>改进 mmap 错误处理和验证，增强错误处理以返回不支持操作的适当错误</p></li>
+<li><p>添加 MAP_PRIVATE 和 MAP_SHARED 标志的检查，确保只设置一个</p></li>
+<li><p>实现 MAP_FIXED 的页面对齐验证</p></li>
+<li><p>增强内存保护处理和验证，更新 init_xd_rsvd 函数以确保启用 NX 支持并正确处理硬件限制</p></li>
+<li><p>改进 sys_mprotect 中的对齐检查以防止溢出并确保适当的内存区域验证</p></li>
+<li><p>增强 mmap 系统调用的偏移量检查和内存分配逻辑</p></li>
+</ul>
+</section>
+</section>
+<section id="id29">
+<h3>6. IPC 与管道：阻塞语义与竞态修复<a class="headerlink" href="#id29" title="Permalink to this heading"></a></h3>
+<section id="fifo-1429">
+<h4>FIFO 阻塞打开语义 (#1429)<a class="headerlink" href="#fifo-1429" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>为 LockedPipeInode 添加 open_wait_queue 用于 FIFO 打开时的阻塞等待</p></li>
+<li><p>实现 Linux FIFO 的阻塞/非阻塞打开语义（O_RDONLY/O_WRONLY/O_RDWR）</p></li>
+<li><p>添加 has_reader/has_writer 辅助方法检查管道状态</p></li>
+<li><p>更新测试配置，将 fifo_test 加入白名单</p></li>
+</ul>
+</section>
+<section id="id30">
+<h4>管道行为完善 (#1529, #1426)<a class="headerlink" href="#id30" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复并完善 pipe 的行为，新增管道文件系统（PipeFS）并注册 PIPEFS_MAGIC</p></li>
+<li><p>扩展管道缓冲区至 65536 字节，支持原子写入</p></li>
+<li><p>实现命名管道（FIFO）支持，允许 O_RDWR 模式打开</p></li>
+<li><p>改进 fcntl 的 F_SETFL 实现，仅允许修改特定标志位</p></li>
+<li><p>修复写入只读文件描述符的错误码为 EBADF</p></li>
+<li><p>为命名管道自动添加 O_LARGEFILE 标志</p></li>
+<li><p>优化管道读写逻辑，支持循环写入和部分写入</p></li>
+<li><p>修复阻塞模式下写端唤醒的竞态条件：在阻塞模式下先增加 writer 计数再等待读端，避免竞态条件；在增加 writer 计数后立即唤醒等待的读者；处理信号中断时回滚 writer 计数；确保非阻塞模式下也正确唤醒读者</p></li>
+<li><p>在 preadv/pwrite64/pwritev 系统调用中增加对管道、Socket 和字符设备的 ESPIPE 错误检查</p></li>
+<li><p>为 fcntl 系统调用添加管道缓冲区大小查询功能（F_GETPIPE_SZ 和 F_SETPIPE_SZ）</p></li>
+<li><p>优化管道关闭逻辑，避免潜在死锁问题</p></li>
+<li><p>在 procfs 中新增文件描述符相关支持，支持 /proc/self/fd/N 魔法链接并实现管道 FIONREAD</p></li>
+<li><p>添加 /proc/<pid>/fdinfo 目录支持并实现管道缓冲区动态调整</p></li>
+</ul>
+</section>
+</section>
+<section id="id31">
+<h3>7. 网络与设备：稳定性提升<a class="headerlink" href="#id31" title="Permalink to this heading"></a></h3>
+<section id="id32">
+<h4>网络栈优化<a class="headerlink" href="#id32" title="Permalink to this heading"></a></h4>
+<p><strong>NapiManager 锁机制 (#1525)</strong></p>
+<ul class="simple">
+<li><p>将 NapiManager 的锁机制改为 lock_irqsave</p></li>
+<li><p>修复在中断上下文中调用 napi_schedule 可能导致的死锁问题</p></li>
+</ul>
+<p><strong>UDP 套接字修复 (#1460)</strong></p>
+<ul class="simple">
+<li><p>修复 UDP getsockname/getpeername 系统调用</p></li>
+<li><p>添加测试白名单以支持新的可用 inet 系统调用</p></li>
+</ul>
+</section>
+<section id="tty">
+<h4>TTY 驱动增强<a class="headerlink" href="#tty" title="Permalink to this heading"></a></h4>
+<p><strong>TTY 驱动和设备管理 (#1462)</strong></p>
+<ul class="simple">
+<li><p>更新 TTY 驱动以在关闭操作期间更有效地处理 master 和 slave 类型，确保正确清理 /dev/pts 中的设备条目</p></li>
+<li><p>改进控制 TTY 分离的处理，添加对 TIOCNOTTY 命令的支持</p></li>
+<li><p>重构 PTY 设备初始化以确保正确的元数据设置和设备注册</p></li>
+<li><p>为 /dev/ptmx 添加符号链接指向内部 devpts 节点，防止早期访问期间的 ENOENT 错误</p></li>
+<li><p>改进 PTY 设备管理和清理逻辑，增强 PtyDevPtsLink 结构以更有效地管理 PTY 设备的生命周期</p></li>
+</ul>
+<p><strong>TTY 权限检查 (#1430)</strong></p>
+<ul class="simple">
+<li><p>修复 TTY 和会话的权限检查逻辑，通过 pty_root_test</p></li>
+</ul>
+<p><strong>TTY page_cache 支持 (#1428)</strong></p>
+<ul class="simple">
+<li><p>在 TTY 设备中实现 page_cache 方法，返回 None 以表明字符设备不需要页面缓存</p></li>
+<li><p>在页面错误处理中增加对无页面缓存情况的处理，避免 panic 并返回 VM_FAULT_SIGBUS</p></li>
+</ul>
+</section>
+<section id="i-o-1425">
+<h4>异步 I/O 通知 (#1425)<a class="headerlink" href="#i-o-1425" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>实现异步 I/O 通知机制和 ioctl 系统调用增强</p></li>
+</ul>
+</section>
+<section id="id33">
+<h4>随机设备支持 (#1455)<a class="headerlink" href="#id33" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>新增随机设备模块 random_dev，提供随机字节生成能力</p></li>
+<li><p>在 DevFS 中注册 /dev/random 设备，确保系统能够访问随机数据</p></li>
+</ul>
+</section>
+</section>
+<section id="id34">
+<h3>8. 文件系统实现：ext4 与 FAT 改进<a class="headerlink" href="#id34" title="Permalink to this heading"></a></h3>
+<section id="ext4-1509">
+<h4>ext4 文件系统 (#1509)<a class="headerlink" href="#ext4-1509" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复 ext4 inode 读写操作中的自旋锁死锁问题</p></li>
+<li><p>添加父目录指针支持，实现 parent() 方法</p></li>
+<li><p>改进块设备寻址逻辑，统一使用 512 字节 LBA</p></li>
+<li><p>增强根文件系统探测机制，支持 ext4 和 FAT 自动识别</p></li>
+<li><p>修复 ELF 加载器中解释器路径查找问题</p></li>
+<li><p>更新 another_ext4 依赖版本</p></li>
+<li><p>为 ext4 和 fat 文件系统添加探测方法并优化代码，在 Ext4FileSystem 和 FATFileSystem 中新增 probe 方法</p></li>
+<li><p>重构 <a class="reference external" href="http://vcore.rs">vcore.rs</a> 中的文件系统探测逻辑，使用新的 probe 方法替代原有的独立探测函数</p></li>
+<li><p>优化 Ext4Inode 构造函数中 parent 字段的默认值设置，使用 unwrap_or_default 替代 unwrap_or_else</p></li>
+<li><p>在 rcS 启动脚本中添加 PATH 环境变量设置</p></li>
+</ul>
+</section>
+<section id="fat-1454-1491">
+<h4>FAT 文件系统 (#1454, #1491)<a class="headerlink" href="#fat-1454-1491" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>更新目录链接计数管理，调整目录的链接计数以确保从 2 开始，考虑自引用和父目录链接</p></li>
+<li><p>更新创建和删除目录时递增和递减链接计数的逻辑</p></li>
+<li><p>增强 VFS 层中目录链接计数的动态计算，确保在元数据不可靠时的准确性</p></li>
+<li><p>为 FAT 文件系统实现 statfs 所需的 SuperBlock 字段（f_blocks、f_bfree、f_bavail、f_frsize）</p></li>
+<li><p>修复 FAT32 FSInfo 空闲簇计数更新时的溢出问题</p></li>
+<li><p>为挂载点提供稳定的 st_dev 标识符</p></li>
+</ul>
+</section>
+<section id="id35">
+<h4>文件系统统计 (#1491)<a class="headerlink" href="#id35" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>完善 FAT 和 tmpfs 的文件系统统计信息支持</p></li>
+<li><p>为 tmpfs 添加默认容量策略（物理内存一半）并同步更新 SuperBlock 统计信息</p></li>
+</ul>
+</section>
+</section>
+<section id="id36">
+<h3>9. 等待队列重构：引入 Waiter/Waker 模式<a class="headerlink" href="#id36" title="Permalink to this heading"></a></h3>
+<section id="id37">
+<h4>等待队列机制重构 (#1452)<a class="headerlink" href="#id37" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>重构 WaitQueue，引入 Waiter/Waker 模式避免唤醒丢失</p></li>
+<li><p>统一等待接口，提供 wait_event_interruptible/uninterruptible 方法</p></li>
+<li><p>重构 futex、epoll、eventfd、semaphore、completion 等模块使用新等待队列</p></li>
+<li><p>优化进程等待子进程退出逻辑，使用新等待队列接口</p></li>
+<li><p>添加等待队列设计文档说明新机制</p></li>
+<li><p>添加 SKIP_GRUB 选项以支持在 CI 或无图形界面环境中跳过 GRUB 安装</p></li>
+</ul>
+</section>
+<section id="id38">
+<h4>信号处理修复 (#1452)<a class="headerlink" href="#id38" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>在 sys_rt_sigtimedwait 中消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，避免后续等待路径误判</p></li>
+<li><p>将 futex 可中断唤醒的错误码从 ERESTARTSYS 改为 EINTR，以符合 Linux 语义</p></li>
+</ul>
+</section>
+</section>
+<section id="id39">
+<h3>10. 工程效率与 CI：自动化与工具链改进<a class="headerlink" href="#id39" title="Permalink to this heading"></a></h3>
+<section id="id40">
+<h4>夜间构建工作流 (#1469, #1471, #1472, #1473, #1474, #1475, #1476, #1477)<a class="headerlink" href="#id40" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>新增夜间构建与发布工作流</p></li>
+<li><p>支持自动化构建和发布，分离构建和发布步骤</p></li>
+<li><p>压缩构建产物为 tarball 并上传以供后续使用</p></li>
+<li><p>修改 Dockerfile 以复制压缩的产物而非单个文件，提高效率和组织性</p></li>
+<li><p>添加步骤以在夜间构建工作流中创建 ‘bin’ 目录以更有效地组织构建产物</p></li>
+<li><p>在夜间构建工作流中恢复 HOME 环境变量以确保构建过程的适当目录上下文</p></li>
+<li><p>更新夜间构建工作流以有条件地运行构建和发布作业</p></li>
+<li><p>在夜间构建工作流中添加步骤以 checkout DragonOS 代码</p></li>
+</ul>
+</section>
+<section id="id41">
+<h4>构建容器升级 (#1442)<a class="headerlink" href="#id41" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>构建容器版本升级至 v1.19</p></li>
+<li><p>添加 –ci 安装模式和 APT_FLAG（–no-install-recommends）到 <a class="reference external" href="http://bootstrap.sh">bootstrap.sh</a></p></li>
+<li><p>在 CI 上跳过 grub/docs，移除旧的 RUST_VERSION_OLD 安装步骤</p></li>
+<li><p>在 Dockerfile 中使用 –no-install-recommends</p></li>
+<li><p>调整构建脚本和 BUILD_CONTAINER_VERSION</p></li>
+<li><p>更新 DADK 版本至 v0.5.1 并调整构建脚本</p></li>
+<li><p>更新 CI 工作流中的 Docker 镜像源</p></li>
+<li><p>添加 linux-libc-dev-riscv64-cross 到 Ubuntu/Debian bootstrap 安装列表，为交叉编译提供 riscv64 交叉 libc 头文件</p></li>
+<li><p>更新 CI 工作流中的 Docker 镜像仓库地址</p></li>
+</ul>
+</section>
+<section id="id42">
+<h4>CI 流程修复<a class="headerlink" href="#id42" title="Permalink to this heading"></a></h4>
+<p><strong>测试状态修复 (#1403)</strong></p>
+<ul class="simple">
+<li><p>修复 CI 流程中测试失败但返回成功状态的问题</p></li>
+</ul>
+<p><strong>gVisor 测试脚本修复 (#1405)</strong></p>
+<ul class="simple">
+<li><p>修复自动化开启/关闭 gVisor syscall 测例打包的脚本</p></li>
+</ul>
+<p><strong>测试添加 (#1458)</strong></p>
+<ul class="simple">
+<li><p>添加 open_test 测试</p></li>
+</ul>
+</section>
+<section id="id43">
+<h4>代码审查自动化 (#1435, #1436, #1437, #1438, #1440, #1445, #1446, #1447)<a class="headerlink" href="#id43" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>添加 Claude 代码审查工作流</p></li>
+<li><p>优化代码审查流程和配置</p></li>
+<li><p>启用进度跟踪功能</p></li>
+<li><p>扩展 Claude 参数以支持更多工具</p></li>
+<li><p>重构提示词结构，明确代码审查的五个重点领域</p></li>
+<li><p>移除重复的注释更新指令，简化工作流逻辑</p></li>
+<li><p>明确使用特定工具进行内联评论和状态更新</p></li>
+<li><p>提供单行和多行评论的具体操作指导</p></li>
+<li><p>简化 PR 状态总结的要求</p></li>
+</ul>
+</section>
+<section id="id44">
+<h4>开发容器支持 (#1449, #1457)<a class="headerlink" href="#id44" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>添加基于 CNB 镜像的 devcontainer 支持</p></li>
+<li><p>设置非 root 用户为默认 devcontainer 用户</p></li>
+<li><p>修复 devcontainer：将容器用户从 ‘dragonos’ 更改为 ‘root’，然后更新为使用 ‘dragonos’ 作为默认用户</p></li>
+<li><p>修复 CI：将源更改为从默认镜像服务器改为 github</p></li>
+</ul>
+</section>
+</section>
+<section id="id45">
+<h3>11. 文档与社区：体验与可访问性提升<a class="headerlink" href="#id45" title="Permalink to this heading"></a></h3>
+<section id="dragonos-playground-1484">
+<h4>DragonOS Playground (#1484)<a class="headerlink" href="#dragonos-playground-1484" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>更新 README 和构建文档，添加 DragonOS Playground 体验方式</p></li>
+<li><p>在 README 中新增云原生开发体验方式，提供 CNB 平台一键启动链接</p></li>
+<li><p>更新社区新闻，添加 Playground 上线信息</p></li>
+<li><p>在构建文档开头添加快速体验章节，推荐使用 Playground</p></li>
+</ul>
+</section>
+<section id="id46">
+<h4>文档翻译更新 (#1485, #1453, #1411, #1408, #1402, #1396)<a class="headerlink" href="#id46" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>多轮文档翻译更新，提升国际化支持</p></li>
+</ul>
+</section>
+<section id="id47">
+<h4>用户环境改进<a class="headerlink" href="#id47" title="Permalink to this heading"></a></h4>
+<p><strong>PS1 环境变量 (#1432, #1422)</strong></p>
+<ul class="simple">
+<li><p>修正 PS1 环境变量使其与 bash 默认高亮一致</p></li>
+<li><p>使用彩色 PS1，提升用户体验</p></li>
+</ul>
+</section>
+</section>
+<section id="id48">
+<h3>12. gVisor 测试：兼容性持续提升<a class="headerlink" href="#id48" title="Permalink to this heading"></a></h3>
+<section id="id49">
+<h4>测试用例扩展 (#1524)<a class="headerlink" href="#id49" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>删除 gVisor 测试中的 fifo_test blocklist 文件</p></li>
+<li><p>扩展测试覆盖范围，持续提升 Linux 兼容性</p></li>
+</ul>
+</section>
+<section id="id50">
+<h4>系统调用修复<a class="headerlink" href="#id50" title="Permalink to this heading"></a></h4>
+<p><strong>open 系统调用 (#1417)</strong></p>
+<ul class="simple">
+<li><p>调整 readable 和 writable 返回的错误码类型</p></li>
+<li><p>修复以下测试：OpenTest.OTrunc、OpenTest.OTruncAndReadOnlyDir、OpenTest.OCreateDirectory、OpenTest.MustCreateExisting、OpenTest.CreateWithAppend、OpenTest.AppendOnly、OpenTest.AppendConcurrentWrite、OpenTest.DirectoryWritableFails、OpenTest.DirectoryDirectFails、OpenTest.Null、OpenTest.CanTruncateReadOnly、OpenTest.OpenNonDirectoryWithTrailingSlash、OpenTest.OpenWithStrangeFlags</p></li>
+<li><p>添加 open_test 的 block</p></li>
+</ul>
+<p><strong>utimensat/futimesat (#1431)</strong></p>
+<ul class="simple">
+<li><p>修复 utimensat/futimesat 系统调用边界情况以兼容 gVisor 测试</p></li>
+</ul>
+<p><strong>pread64 (#1398)</strong></p>
+<ul class="simple">
+<li><p>修复 pread64 系统调用的兼容性和错误处理</p></li>
+<li><p>验证 offset 参数：当偏移量为负数或发生溢出时返回 EINVAL</p></li>
+<li><p>验证用户缓冲区：使用 new_checked 确保内存已映射，从而正确返回 EFAULT</p></li>
+<li><p>检查文件类型：对不可定位的文件（如管道、Socket）返回 ESPIPE</p></li>
+<li><p>修复 File::readable() 中的权限检查</p></li>
+<li><p>修复了 gVisor pread64 测试集中的多个失败项</p></li>
+</ul>
+<p><strong>sys_rename (#1393)</strong></p>
+<ul class="simple">
+<li><p>修复 sys_rename 逻辑并支持 RENAME_NOREPLACE</p></li>
+</ul>
+<p><strong>getdents (#1397)</strong></p>
+<ul class="simple">
+<li><p>修复 getdents 系统调用实现</p></li>
+</ul>
+<p><strong>其他修复</strong></p>
+<ul class="simple">
+<li><p>修复 syscall/vfs 中写入部分可读缓冲区时的 SIG 衍生问题 (#1375)</p></li>
+<li><p>修复 cputime、sys_rt_sigtimedwait 和 sys_rt_sigreturn 相关问题 (#1406, #1394, #1400)</p></li>
+</ul>
+</section>
+</section>
+<section id="id51">
+<h3>13. 其他改进<a class="headerlink" href="#id51" title="Permalink to this heading"></a></h3>
+<section id="id52">
+<h4>符号表查询修复 (#1443)<a class="headerlink" href="#id52" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复符号表查询问题，原有逻辑 addr 刚好等于 kallsyms_adress_list[i+1] 时，索引 index 值会是 i，但是实际上是 i+1</p></li>
+<li><p>现在修改为通过二分查找符号</p></li>
+</ul>
+</section>
+<section id="cargo-lock-1530">
+<h4>Cargo.lock 清理 (#1530)<a class="headerlink" href="#cargo-lock-1530" title="Permalink to this heading"></a></h4>
+<ul class="simple">
+<li><p>修复 Cargo.lock 中 another_ext4 包的重复条目问题</p></li>
+<li><p>统一 lockfile 格式，避免不同开发者使用不同 Cargo 版本时产生冲突</p></li>
+</ul>
+</section>
+</section>
+</section>
+<section id="id53">
+<h2>已知关注点<a class="headerlink" href="#id53" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>I/O 多路复用与信号结合的路径较为复杂，建议在升级到 0.4.0 后重点执行高并发网络服务/事件循环框架的回归测试。</p></li>
+<li><p>tmpfs 和 chroot 相关改动涉及文件系统挂载和路径解析，建议验证容器化场景下的行为。</p></li>
+<li><p>等待队列机制重构涉及并发控制，建议重点测试多线程场景下的稳定性和性能。</p></li>
+<li><p>POSIX interval timer 和 CPU 时间统计为新增功能，建议在实际应用中验证定时器精度和性能开销。</p></li>
+<li><p>挂载传播机制为新增功能，建议在容器化场景下验证不同传播类型的行为。</p></li>
+</ul>
+</section>
+<section id="id54">
+<h2>贡献者鸣谢<a class="headerlink" href="#id54" title="Permalink to this heading"></a></h2>
+<p>感谢所有为 DragonOS 0.4.0 贡献代码、测试、文档和反馈的社区伙伴！</p>
+<p>本版本共包含 105 个提交，涉及内核核心、文件系统、进程管理、内存管理、网络、设备驱动、工程工具等多个模块的改进和修复。</p>
+<p>主要贡献者包括（按提交时间顺序）：LoGin、Vitus、kaleidoscope416、Samuel Dai、aLinChe、xboHodx、Yuming Jiang、kado、goldwind-ting、sparkzky 等。</p>
+<p>详细贡献者列表可参考 GitHub 仓库的 <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/graphs/contributors">Contributors 页面</a>。</p>
+</section>
+<section id="id55">
+<h2>参考资料<a class="headerlink" href="#id55" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Linux 兼容性测试看板</strong>：<a class="reference external" href="https://ci-dashboard.dragonos.org">ci-dashboard.dragonos.org</a></p></li>
+<li><p><strong>DragonOS Playground</strong>：<a class="reference external" href="https://cnb.cool/DragonOS-Community/playground">cnb.cool/DragonOS-Community/playground</a></p></li>
+<li><p><strong>社区仓库</strong>：<a class="reference external" href="https://github.com/DragonOS-Community/DragonOS">github.com/DragonOS-Community/DragonOS</a></p></li>
+<li><p><strong>官方文档</strong>：<a class="reference external" href="https://docs.dragonos.org">docs.dragonos.org</a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="../index.html" class="btn btn-neutral float-left" title="发行日志" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../V0.3.x/V0.3.0.html" class="btn btn-neutral float-right" title="V.3.0" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="V0.4.0.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../master/community/ChangeLog/V0.4.x/V0.4.0.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

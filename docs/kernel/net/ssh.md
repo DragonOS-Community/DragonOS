@@ -1,34 +1,31 @@
-# ssh支持
+# SSH Support
 
+Currently, we use a lightweight SSH implementation [dropbear](https://matt.ucc.asn.au/dropbear/dropbear.html).
 
+## Initialization Steps
 
-目前，我们使用一个轻量级的ssh实现[dropbear](https://matt.ucc.asn.au/dropbear/dropbear.html)。
-
-
-## 初始化步骤
-
-1. 确保/bin/sh存在(应该已经存在，其实是busybox，如果不存在，可以拷贝sysroot/bin目录下的busybox文件: `cp ./bin/sysroot/bin/busybox ./bin/sysroot/bin/sh`)
-2. 确保/root目录存在(应该已经存在)
-3. 确保/etc/dropbear目录存在
+1. Ensure /bin/sh exists (it should already exist, actually busybox; if not, you can copy the busybox file from the sysroot/bin directory: `cp ./bin/sysroot/bin/busybox ./bin/sysroot/bin/sh`)
+2. Ensure the /root directory exists (it should already exist)
+3. Ensure the /etc/dropbear directory exists
    ```shell
    mkdir /etc/dropbear
-   ```
-4. 确保 /var/log/lastlog文件存在（可以是空文件）(不存在也行)
-5. 修改root用户的密码
-    ```shell
+   _en```
+4. Ensure the /var/log/lastlog file exists (can be an empty file) (not required)
+5. Change the root user's password
+    _en```shell
     busybox passwd
-    ```
-6. 启动系统后启动dropbear服务器
-    ```shell
+    _en```
+6. Start the dropbear server after the system boots
+    _en```shell
     dropbear -E -F -R -p 12580
-    ```
+    _en```
 
-7. 在本地终端中连接到服务器
-    ```shell
+7. Connect to the server from a local terminal
+    _en```shell
     ./dbclient -p 12580 root@localhos
-    ```
-    如果报错：
-    ```shell
+    _en```
+    If you encounter an error:
+    _en```shell
     ./dbclient: Connection to root@localhost:12580 exited:
 
     ssh-ed25519 host key mismatch for localhost !
@@ -36,24 +33,23 @@
     Expected SHA256:W8+kSk+aCm2uoc1ZIKU/RQJSKoqWrOKrFf9URhfFaw8
     If you know that the host key is correct you can
     remove the bad entry from ~/.ssh/known_hosts
-    ```
-    解决方法：`ssh-keygen -R localhost` 删除已存在的错误host key
-8. 输入root用户的密码，成功登录后即可使用ssh终端
-9. 退出ssh终端
-    ```shell
+    _en```
+    Solution: `ssh-keygen -R localhost` Delete the existing incorrect host key
+8. Enter the root user's password, and after successful login, you can use the SSH terminal
+9. Exit the SSH terminal
+    _en```shell
     exit
-    ```
+    _en```
 
+## Other Available Commands
 
-## 其它可用命令
-
-生成ssh密钥对
+Generate SSH key pair
 ```shell
 # 生成dropbear的ssh密钥对
 dropbearkey -t rsa -f ~/.ssh/id_dropbear
 ```
 
-将公钥添加到授权列表
+Add the public key to the authorized list
 ```shell
 # 拷贝公钥到指定目录
 cp ~/.ssh/id_dropbear.pub ./bin/sysroot
@@ -62,143 +58,129 @@ cp ~/.ssh/id_dropbear.pub ./bin/sysroot
 ./dbclient -i ~/.ssh/id_dropbear -p 12580 root@localhost
 ```
 
+## Introduction to SSH-related System Files
 
-## SSH相关的系统文件介绍
+### Purpose of /etc/passwd
 
-### /etc/passwd 的作用
+- Stores system user information: It contains basic information about each user and is an important data source for system authentication and login.
 
-- 存储系统用户信息：它包含了每个用户的基本信息，是系统认证和登录的重要数据来源。
+- Used for login and user management: The system and applications read this file to verify user identity, determine user permissions, and load corresponding settings (such as default shell, home directory, etc.).
 
-- 用于登录和用户管理：系统和应用程序通过读取该文件来验证用户身份、决定用户权限以及加载相应的设置（如默认 shell、主目录等）。
-
-- 提供支持：对于一些应用程序和命令（如 useradd、passwd、chown），它需要通过 /etc/passwd 来获取用户的相关信息。
+- Provides support: For some applications and commands (such as useradd, passwd, chown), it needs to obtain user-related information through /etc/passwd.
 
 ```bash
 username:password:UID:GID:GECOS:home_directory:shell
 ```
 
-- username（用户名）：用户的登录名称。例如：root、john、guest 等。
+- username (username): The user's login name. For example: root, john, guest, etc.
 
-- password（密码）：用户的加密密码。现在大多数系统会将密码的哈希值存储在 /etc/shadow 文件中，因此这个字段通常是一个占位符（如 x 或 *）。在较旧的系统中，密码可能直接存储在此字段中，但这种做法已不安全。
+- password (password): The user's encrypted password. Nowadays, most systems store the hash value of the password in the /etc/shadow file, so this field is usually a placeholder (such as x or *). In older systems, the password might be stored directly in this field, but this practice is no longer secure.
 
-- UID（用户 ID）：用户的唯一标识符。每个用户都有一个唯一的 UID，系统通过它来区分不同用户。通常：
+- UID (user ID): The user's unique identifier. Each user has a unique UID, and the system uses it to distinguish different users. Typically:
 
-- 0 表示 root 用户（超级用户）。
+- 0 represents the root user (superuser).
 
-- 普通用户的 UID 从 1000 开始（在一些 Linux 发行版中，可能从 500 开始）。
+- Ordinary users' UIDs usually start from 1000 (in some Linux distributions, they may start from 500).
 
-- GID（组 ID）：用户所属的主组的 ID。组 ID 是与组名称相关联的数字。通常，每个用户都会有一个与其用户名相同的组。例如，john 用户可能会有一个主组 john，其 GID 可能是 1001。
+- GID (group ID): The ID of the user's primary group. The group ID is a number associated with the group name. Typically, each user will have a group with the same name as their username. For example, the john user might have a primary group john, whose GID might be 1001.
 
-- GECOS（用户全名或备注信息）：这个字段通常存储用户的全名、电话号码等可选信息。它可以为空或包含一些描述性文字，通常是通过 chfn 命令进行设置。
+- GECOS (user's full name or remark information): This field usually stores optional information such as the user's full name, phone number, etc. It can be empty or contain some descriptive text, usually set via the chfn command.
 
-- home_directory（主目录）：用户的登录主目录，用户登录后会被自动带到这个目录。例如：/home/john、/root。如果用户是 root，其主目录通常是 /root。
+- home_directory (home directory): The user's login home directory, where the user will be automatically taken after logging in. For example: /home/john, /root. If the user is root, their home directory is usually /root.
 
-- shell（默认 shell）：用户登录时所使用的 shell 程序。通常是 /bin/bash、/bin/sh 或其他 shell 程序。对于没有实际登录权限的系统用户，这个字段可能是 /usr/sbin/nologin 或 /bin/false，以阻止他们登录系统
+- shell (default shell): The shell program used when the user logs in. Usually /bin/bash, /bin/sh, or other shell programs. For system users without actual login permissions, this field might be /usr/sbin/nologin or /bin/false to prevent them from logging into the system.
 
+### Purpose of /etc/shadow
 
-### /etc/shadow 文件的作用
+- Stores users' encrypted passwords: The /etc/shadow file saves each user's encrypted password, not the plaintext password. This is a system security mechanism to prevent password leakage.
 
-- 存储用户的加密密码：/etc/shadow 文件中保存了每个用户的 加密密码，而不是明文密码。这是一个系统的安全机制，防止密码泄漏。
+- Account expiration management: It also contains information related to account expiration, password expiration, account locking, etc., helping system administrators manage users' login permissions.
 
-- 账户过期管理：它还包含了与账户过期、密码过期、账户锁定等相关的信息，帮助系统管理员管理用户的登录权限。
-
-- 增强安全性：相比于早期系统中把密码直接存储在 /etc/passwd 中，/etc/shadow 将密码从可公开访问的文件中移除，使得系统更加安全
+- Enhances security: Compared to early systems that stored passwords directly in /etc/passwd, /etc/shadow removes passwords from publicly accessible files, making the system more secure.
 
 ```bash
 username:password:lastchg:min:max:warn:inactive:expire:flag
 ```
 
-- username（用户名）：与 /etc/passwd 中的用户名一致。
+- username (username): Consistent with the username in /etc/passwd.
 
-- password（密码）：这是用户的加密密码。如果密码为空，通常是 * 或 !，表示禁用该账户。正常情况下，这里存储的是密码的加密哈希值。
+- password (password): This is the user's encrypted password. If the password is empty, it is usually * or !, indicating the account is disabled. Normally, this stores the encrypted hash value of the password.
 
-- lastchg（上次修改日期）：密码最后一次修改的日期，表示自 1970 年 1 月 1 日以来的天数。通常这个值是通过 chage 命令查看和更新的。
+- lastchg (last change date): The date of the last password change, representing the number of days since January 1, 1970. This value is usually viewed and updated via the chage command.
 
-- min（最小密码年龄）：密码的最小使用期限。用户修改密码后，必须等待多少天才能再次修改密码。通常设置为 0，表示没有最小密码年龄限制。
+- min (minimum password age): The minimum period the password must be used. Users must wait how many days after changing the password before they can change it again. Usually set to 0, indicating no minimum password age limit.
 
-- max（最大密码年龄）：密码的最大使用期限。超过这个期限，用户必须修改密码。设置为 99999 表示密码永不过期。
+- max (maximum password age): The maximum period the password can be used. After this period, users must change the password. Set to 99999 to indicate the password never expires.
 
-- warn（警告期限）：密码过期前，系统会提前多少天开始警告用户密码即将过期。
+- warn (warning period): How many days before the password expires the system will start warning the user that the password is about to expire.
 
-- inactive（非活动期限）：密码过期后，用户仍然有多少天的时间可以继续登录。如果超过该天数，账户将被禁用。
+- inactive (inactive period): How many days the user can still log in after the password expires. If this period is exceeded, the account will be disabled.
 
-- expire（账户过期日期）：账户的过期日期，表示自 1970 年 1 月 1 日以来的天数。如果账户过期，用户将无法登录。
+- expire (account expiration date): The account's expiration date, representing the number of days since January 1, 1970. If the account expires, the user will not be able to log in.
 
-- flag（账户锁定标志）：这个字段用于存储账户是否被锁定。如果这个字段是 !! 或 *，表示用户账号被锁定，不能登录
+- flag (account lock flag): This field is used to store whether the account is locked. If this field is !! or *, it indicates the user account is locked and cannot log in.
 
-### 不同hash算法生成的密码前缀
+### Password Prefixes Generated by Different Hash Algorithms
 
-- `\$5$` 前缀（SHA-256）
-- `\$6$` 前缀（SHA-512）
-- `\$y$` 前缀（Yarrow）
+- `\$5$` prefix (SHA-256)
+- `\$6$` prefix (SHA-512)
+- `\$y$` prefix (Yarrow)
 
-
-
-
-
-### 系统调用支持
+### System Call Support
 
 - fcntl SETLK https://man7.org/linux/man-pages/man2/fcntl.2.html
 - unlink
 - fsync
 - rename https://man7.org/linux/man-pages/man2/rename.2.html
 - ioctl TCFLSH
-- renameat2: oldfd: -100, filename_from: /etc/shadow+, newfd: -100, filename_to: /etc/shadow 失败
+- renameat2: oldfd: -100, filename_from: /etc/shadow+, newfd: -100, filename_to: /etc/shadow failed
 
+### File System Related
+/proc/self directory: /proc/self is a symbolic link that always points to the /proc/[pid] directory of the accessing process itself.
 
-
-### 文件系统相关
-/proc/self目录:/proc/self 是一个 符号链接，始终指向 访问它的进程自己的 /proc/[pid] 目录
-
-| 路径                 | 作用                                     |
+| Path                 | Purpose                                     |
 | -------------------- | ---------------------------------------- |
-| `/proc/self/cmdline` | 当前进程的命令行参数                     |
-| `/proc/self/exe`     | 当前进程的可执行文件路径（是个符号链接） |
-| `/proc/self/fd/`     | 当前进程打开的所有文件描述符             |
-| `/proc/self/environ` | 当前进程的环境变量                       |
-| `/proc/self/maps`    | 当前进程的内存映射布局                   |
-| `/proc/self/status`  | 当前进程的状态信息（类似于 ps 命令）     |
+| `/proc/self/cmdline` | Command-line arguments of the current process                     |
+| `/proc/self/exe`     | Executable file path of the current process (a symbolic link) |
+| `/proc/self/fd/`     | All file descriptors opened by the current process             |
+| `/proc/self/environ` | Environment variables of the current process                       |
+| `/proc/self/maps`    | Memory mapping layout of the current process                   |
+| `/proc/self/status`  | Status information of the current process (similar to the ps command)     |
 
+- /proc/fd/{id} is also a symbolic link, pointing to the file path corresponding to the file descriptor opened by the process.
+- /dev/pts/0 These pseudo-terminals need to wait for the main device /dev/ptmx to be closed before deletion
+- The /root directory must exist
 
-- /proc/fd/{id} 也是一个符号链接，指向进程打开的文件描述符所对应的文件路径。
-- /dev/pts/0 这些伪终端需要等待主设备/dev/ptmx被关闭的时候删除
-- /root目录必须存在
+### What are the roles and usage of linux's setgroups and getgroups?
 
-### linux的setgroups和getgroups的作用和用法是什么
+In Linux, a process has:
 
-在 Linux 中，一个进程有：
+- Real user ID (real UID), effective user ID (effective UID)
+- Real group ID (real GID), effective group ID (effective GID)
+- Supplementary group ID list (supplementary groups)
 
-- 真实用户 ID (real UID)、有效用户 ID (effective UID)
-- 真实组 ID (real GID)、有效组 ID (effective GID)
-- 附加组 ID 列表（supplementary groups）
+The supplementary group ID allows the process to belong to multiple other groups in addition to the primary group, thereby gaining access permissions corresponding to those groups.
 
-附加组 ID 让进程除了主组外，还可以属于其他多个组，从而获得对应组的访问权限
+#### User ID (UID) and Group ID (GID)
+These are permission identity identifiers used to determine what a process can do.
 
+UID (User ID) indicates which user the process belongs to.
+Common types:
 
+- Real user ID (real UID): Who started the process.
+- Effective user ID (effective UID): The UID actually used for permission checks (for example, a setuid program can temporarily make EUID root).
+- Saved set-user-ID (saves the EUID before switching, used for temporary restoration).
 
-#### 用户 ID (UID) 和 组 ID (GID)
-这两个是权限身份标识，用来决定一个进程能做什么。
+The UID of the root user is 0, and other users are generally assigned starting from 1000 (or 500).
 
-UID（User ID）表示进程属于哪个用户。
-常见种类：
+GID (Group ID) indicates which primary user group the process belongs to. There are also real/effective/saved types.
+Additionally, there is a supplementary group list (supplementary groups), used to grant additional group permissions.
 
-- 真实用户 ID (real UID)：启动该进程的用户是谁。
-- 有效用户 ID (effective UID)：实际用于权限检查的 UID（比如 setuid 程序可以让 EUID 暂时变成 root）。
-- 保存的 set-user-ID（保存切换前的 EUID，用于临时恢复）。
-
-root 用户的 UID 是 0，其它用户一般是从 1000（或 500）开始分配。
-
-GID（Group ID） 表示进程属于哪个主用户组。同样有 real/effective/saved 三种。
-另外还有 附加组列表（supplementary groups），用来赋予额外的组权限。
-
-作用：
-当进程访问文件、socket、IPC 等资源时，内核会根据 EUID/EGID + 附加组列表 来判断能否访问。
-
-
-
+Role:
+When a process accesses resources such as files, sockets, IPC, etc., the kernel determines access based on EUID/EGID + supplementary group list.
 
 ## Reference
-- Linux TTY/PTS概述 https://liujunming.top/2019/09/03/Linux-TTY-PTS%E6%A6%82%E8%BF%B0/
-- 伪终端(pseudo terminal) https://zhuanlan.zhihu.com/p/678170056
-- 硬件终端 terminal(TTY)
+- Linux TTY/PTS Overview https://liujunming.top/2019/09/03/Linux-TTY-PTS%E6%A6%82%E8%BF%B0/
+- Pseudo Terminal (pseudo terminal) https://zhuanlan.zhihu.com/p/678170056
+- Hardware Terminal terminal (TTY)
  https://www.cnblogs.com/sparkdev/p/11460821.html

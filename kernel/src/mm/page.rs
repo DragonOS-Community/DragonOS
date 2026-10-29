@@ -1,43 +1,67 @@
-use alloc::{string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::ToString, vec::Vec};
 use core::{
     fmt::{self, Debug, Error, Formatter},
+    hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
     ops::Add,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+use super::page_lru::{PageLru, PreparedPageLruCapacity};
+pub(crate) use super::page_rmap::PageMapping;
+use super::page_rmap::PageVmaSet;
+use crate::libs::resource_wait::{ResourceMutex, ResourceMutexGuard};
 use alloc::sync::{Arc, Weak};
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use log::{error, info};
-use lru::LruCache;
 
 use crate::{
     arch::{mm::LockedFrameAllocator, MMArch},
+    cgroup::memory::{
+        accounting::KernelByteKind,
+        object::{ObjectAccount, ObjectCharge},
+        protection::ProtectionSnapshot,
+        ChargeFailure, MemoryAccount, MemoryCharge, MemoryKind, MemoryStat,
+    },
     filesystem::{
-        page_cache::{list_page_caches, PageCache},
+        page_cache::{
+            async_writeback_progress_snapshot, list_page_caches, PageCache,
+            PageCacheReclaimMapOutcome,
+        },
         vfs::FilePrivateData,
     },
     init::initcall::INITCALL_CORE,
     libs::{
-        mutex::{Mutex, MutexGuard},
+        mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemUpgradeableGuard, RwSemWriteGuard},
     },
     mm::page_cache_stats as pc_stats,
     process::{ProcessControlBlock, ProcessManager},
-    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 use super::{
     allocator::page_frame::{
-        deallocate_page_frames, FrameAllocator, PageFrameCount, PhysPageFrame,
+        deallocate_page_frames, FrameAllocationRequest, FrameAllocator, FramePlacement,
+        PageFrameCount, PhysPageFrame,
     },
     syscall::ProtFlags,
     ucontext::LockedVMA,
     MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr,
 };
+
+pub(crate) mod access;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) mod compaction_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) mod placement_selftest;
+pub(crate) mod reclaim_wait;
+pub(crate) mod retirement;
+pub(crate) use retirement::retire_unmapped_page;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod migration;
 
 pub const PAGE_4K_SHIFT: usize = 12;
 #[allow(dead_code)]
@@ -48,12 +72,12 @@ pub const PAGE_4K_SIZE: usize = 1 << PAGE_4K_SHIFT;
 pub const PAGE_2M_SIZE: usize = 1 << PAGE_2M_SHIFT;
 
 /// 全局物理页信息管理器
-pub static mut PAGE_MANAGER: Option<Mutex<PageManager>> = None;
+pub static mut PAGE_MANAGER: Option<ResourceMutex<PageManager>> = None;
 
 /// 初始化PAGE_MANAGER
 pub fn page_manager_init() {
     info!("page_manager_init");
-    let page_manager = Mutex::new(PageManager::new());
+    let page_manager = ResourceMutex::new(PageManager::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_MANAGER = Some(page_manager) };
@@ -62,11 +86,731 @@ pub fn page_manager_init() {
     info!("page_manager_init done");
 }
 
-pub fn page_manager_lock() -> MutexGuard<'static, PageManager> {
-    unsafe { PAGE_MANAGER.as_ref().unwrap().lock() }
+pub fn page_manager_lock() -> ResourceMutexGuard<'static, PageManager> {
+    unsafe { ResourceMutexGuard::lock(PAGE_MANAGER.as_ref().unwrap()) }
+}
+
+pub(crate) fn try_page_manager_lock() -> Option<ResourceMutexGuard<'static, PageManager>> {
+    unsafe { ResourceMutexGuard::try_lock(PAGE_MANAGER.as_ref()?) }
+}
+
+/// Maximum number of page identities changed while holding a global page
+/// registry lock. This bounds work by element count; HashMap growth itself is
+/// not a hard real-time operation.
+const PAGE_MANAGER_BULK_BATCH: usize = 64;
+
+/// Release an allocator-owned physical range as aligned buddy blocks.
+///
+/// The range may be a non-power-of-two suffix of a larger allocation. Splitting
+/// it into the largest aligned blocks avoids both invalid buddy frees and an
+/// O(n) one-frame-at-a-time teardown.
+unsafe fn free_aligned_frame_range_with_allocator(
+    allocator: &mut dyn FrameAllocator,
+    mut start: PhysAddr,
+    mut pages: usize,
+) {
+    while pages != 0 {
+        let pfn = start.data() / MMArch::PAGE_SIZE;
+        let alignment_pages = if pfn == 0 {
+            usize::MAX
+        } else {
+            1usize << pfn.trailing_zeros()
+        };
+        let length_pages = 1usize << (usize::BITS - 1 - pages.leading_zeros());
+        let block_pages = alignment_pages.min(length_pages);
+        allocator.free(start, PageFrameCount::new(block_pages));
+        start = PhysAddr::new(start.data() + block_pages * MMArch::PAGE_SIZE);
+        pages -= block_pages;
+    }
+}
+
+unsafe fn free_aligned_frame_range(start: PhysAddr, pages: usize) {
+    free_aligned_frame_range_with_allocator(&mut LockedFrameAllocator, start, pages);
+}
+
+/// Owns the part of a raw buddy allocation not yet transferred to `Page`.
+#[derive(Debug)]
+struct RawFrameExtent {
+    next: PhysAddr,
+    remaining: usize,
+}
+
+impl RawFrameExtent {
+    fn trim_to(&mut self, requested: usize) {
+        debug_assert!(requested <= self.remaining);
+        let tail = self.remaining - requested;
+        if tail != 0 {
+            let tail_start = PhysAddr::new(self.next.data() + requested * MMArch::PAGE_SIZE);
+            unsafe { free_aligned_frame_range(tail_start, tail) };
+            self.remaining = requested;
+        }
+    }
+}
+
+impl Drop for RawFrameExtent {
+    fn drop(&mut self) {
+        if self.remaining != 0 {
+            unsafe { free_aligned_frame_range(self.next, self.remaining) };
+        }
+    }
+}
+
+/// An ordinary allocation is transferred one frame at a time into InnerPage.
+/// Until transfer, every error returns the untouched suffix to its allocator.
+struct PendingPageFrames<'a> {
+    allocator: &'a mut dyn FrameAllocator,
+    next: PhysAddr,
+    remaining: usize,
+}
+
+impl PendingPageFrames<'_> {
+    fn transfer_one(&mut self) -> PhysAddr {
+        debug_assert!(self.remaining != 0);
+        let frame = self.next;
+        self.next = PhysAddr::new(frame.data() + MMArch::PAGE_SIZE);
+        self.remaining -= 1;
+        frame
+    }
+}
+
+impl Drop for PendingPageFrames<'_> {
+    fn drop(&mut self) {
+        if self.remaining != 0 {
+            unsafe {
+                free_aligned_frame_range_with_allocator(self.allocator, self.next, self.remaining)
+            };
+        }
+    }
+}
+
+/// Owns one exact physically-contiguous allocation after raw construction.
+///
+/// Every `Page` created from the run pins this object. The final pin returns
+/// the run as aligned buddy blocks, avoiding one global allocator lock per
+/// 4-KiB page while still delaying reuse until all transient page references
+/// have disappeared.
+#[derive(Debug)]
+struct ContiguousFrameOwner {
+    // Field order is significant: free the physical run before uncharging.
+    frames: RawFrameExtent,
+    memory_charge: Option<MemoryCharge>,
+}
+
+/// Registered, zeroed, intrinsically unevictable pages awaiting adoption by a
+/// private PageCache. Until `commit`, this guard owns PageManager membership
+/// and rolls it back by page identity on every failure path.
+pub struct ManagedPageBatch {
+    start_paddr: PhysAddr,
+    pages: Vec<Arc<Page>>,
+    registered: usize,
+    committed: bool,
+}
+
+impl ManagedPageBatch {
+    pub fn start_paddr(&self) -> PhysAddr {
+        self.start_paddr
+    }
+
+    pub fn pages(&self) -> &[Arc<Page>] {
+        &self.pages
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ManagedPageBatch {
+    fn drop(&mut self) {
+        if !self.committed && self.registered != 0 {
+            detach_pages_from_manager_batched(self.pages[..self.registered].iter());
+            self.registered = 0;
+        }
+    }
+}
+
+/// Allocate an exact user-visible run of zeroed Normal/PG_UNEVICTABLE pages.
+/// Slow allocation, zeroing, and `Arc<Page>` construction happen outside the
+/// global PageManager lock; only identity registration is performed there in
+/// bounded batches.
+pub fn allocate_registered_intrinsic_unevictable_pages_exact(
+    requested: PageFrameCount,
+) -> Result<ManagedPageBatch, SystemError> {
+    allocate_registered_intrinsic_unevictable_pages_exact_inner(requested, None)
+}
+
+/// Consume a reservation made before taking any page/cache publication locks.
+/// The entire exact run stays charged until its last physical owner disappears.
+pub(crate) fn allocate_charged_intrinsic_unevictable_pages_exact(
+    requested: PageFrameCount,
+    kind: MemoryKind,
+    charge: MemoryCharge,
+) -> Result<ManagedPageBatch, SystemError> {
+    if charge.kind() != kind || !PageType::Normal.accepts_memory_kind(kind) {
+        return Err(SystemError::EINVAL);
+    }
+    allocate_registered_intrinsic_unevictable_pages_exact_inner(requested, Some(charge))
+}
+
+fn allocate_registered_intrinsic_unevictable_pages_exact_inner(
+    requested: PageFrameCount,
+    mut charge: Option<MemoryCharge>,
+) -> Result<ManagedPageBatch, SystemError> {
+    let requested_pages = requested.data();
+    if requested_pages == 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let allocator_pages = requested_pages
+        .checked_next_power_of_two()
+        .ok_or(SystemError::ENOMEM)?;
+    if charge
+        .as_ref()
+        .is_some_and(|charge| charge.pages() < allocator_pages as u64)
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    let (start_paddr, actual) = unsafe {
+        LockedFrameAllocator
+            .allocate_request(data_frame_request(
+                PageFrameCount::new(allocator_pages),
+                charge.as_ref(),
+            ))
+            .ok_or(SystemError::ENOMEM)?
+    };
+    let mut raw = RawFrameExtent {
+        next: start_paddr,
+        remaining: actual.data(),
+    };
+    // FrameAllocator does not promise that an implementation returns at least
+    // the requested extent. Validate before zeroing or trimming so a short
+    // allocation cannot become an out-of-bounds write or arithmetic underflow.
+    if raw.remaining < requested_pages {
+        return Err(SystemError::ENOMEM);
+    }
+    if charge
+        .as_ref()
+        .is_some_and(|charge| charge.pages() < raw.remaining as u64)
+    {
+        return Err(SystemError::ENOMEM);
+    }
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(requested_pages)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let bytes = requested_pages
+        .checked_mul(MMArch::PAGE_SIZE)
+        .ok_or(SystemError::ENOMEM)?;
+    let vaddr = unsafe { MMArch::phys_2_virt(start_paddr) }.ok_or(SystemError::EFAULT)?;
+
+    // Zero before PageManager/PageCache publication so recycled kernel data is
+    // never observable through a userspace mapping.
+    unsafe { MMArch::write_bytes(vaddr, 0, bytes) };
+    raw.trim_to(requested_pages);
+
+    if let Some(charge) = charge.as_mut() {
+        // Only exact user-visible frames remain physically allocated now.
+        drop(charge.split_off(charge.pages() - requested_pages as u64)?);
+    }
+
+    let extent_owner = Arc::try_new(ContiguousFrameOwner {
+        frames: raw,
+        memory_charge: charge,
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+
+    for index in 0..requested_pages {
+        let paddr = PhysAddr::new(start_paddr.data() + index * MMArch::PAGE_SIZE);
+        pages.push(Page::try_new_with_contiguous_owner(
+            paddr,
+            PageType::Normal,
+            PageFlags::PG_UNEVICTABLE,
+            extent_owner.clone(),
+        )?);
+    }
+
+    let mut batch = ManagedPageBatch {
+        start_paddr,
+        pages,
+        registered: 0,
+        committed: false,
+    };
+    while batch.registered < batch.pages.len() {
+        let end = (batch.registered + PAGE_MANAGER_BULK_BATCH).min(batch.pages.len());
+        let chunk = &batch.pages[batch.registered..end];
+        {
+            let mut manager = page_manager_lock();
+            manager
+                .phys2page
+                .try_reserve(chunk.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            if chunk
+                .iter()
+                .any(|page| manager.phys2page.contains_key(&page.phys_address()))
+            {
+                return Err(SystemError::EEXIST);
+            }
+            for page in chunk {
+                manager.phys2page.insert(page.phys_address(), page.clone());
+            }
+        }
+        batch.registered = end;
+    }
+    Ok(batch)
+}
+
+/// Remove pinned pages from PageManager only when the registered identity is
+/// the expected `Arc<Page>`. Removed manager references are released after the
+/// global lock; callers retain their own page references for the whole call.
+pub fn detach_pages_from_manager_batched<'a>(pages: impl IntoIterator<Item = &'a Arc<Page>>) {
+    let mut pages = pages.into_iter();
+    let mut removed: [Option<Arc<Page>>; PAGE_MANAGER_BULK_BATCH] = core::array::from_fn(|_| None);
+    loop {
+        let mut count = 0;
+        let mut exhausted = false;
+        {
+            let mut manager = page_manager_lock();
+            while count < PAGE_MANAGER_BULK_BATCH {
+                let Some(page) = pages.next() else {
+                    exhausted = true;
+                    break;
+                };
+                removed[count] = manager.remove_page_if_same(page);
+                count += 1;
+            }
+        }
+        for slot in &mut removed[..count] {
+            drop(slot.take());
+        }
+        if exhausted {
+            break;
+        }
+    }
+}
+
+/// Identity-safe, bounded counterpart for the global page reclaimer registry.
+pub fn detach_pages_from_reclaimer_batched<'a>(pages: impl IntoIterator<Item = &'a Arc<Page>>) {
+    let mut pages = pages.into_iter();
+    let mut removed: [Option<Arc<Page>>; PAGE_MANAGER_BULK_BATCH] = core::array::from_fn(|_| None);
+    loop {
+        let mut count = 0;
+        let mut exhausted = false;
+        {
+            let mut reclaimer = page_reclaimer_lock();
+            while count < PAGE_MANAGER_BULK_BATCH {
+                let Some(page) = pages.next() else {
+                    exhausted = true;
+                    break;
+                };
+                // This is terminal retirement, not temporary unevictable
+                // reclassification. Even a previously off-list page must lose
+                // its reclaim eligibility before releasing the terminal owner.
+                removed[count] = Some(
+                    reclaimer
+                        .remove_page_if_same(page)
+                        .unwrap_or_else(|| page.clone()),
+                );
+                count += 1;
+            }
+        }
+        for slot in &mut removed[..count] {
+            if let Some(page) = slot.take() {
+                finish_lru_retirement(page);
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+}
+
+/// No reclaimer/manager/cache guard may be held here: the page lock sleeps.
+/// Retirement detaches statistics immediately even when an external Arc pins
+/// the physical frame until later. Temporary unevictable classification keeps
+/// the original node and never uses this terminal helper.
+fn finish_lru_retirement(page: Arc<Page>) {
+    page.write().remove_flags(PageFlags::PG_LRU);
+    drop(page);
 }
 
 // 物理页管理器
+/// Allocate and publish one ordinary data page with no allocation or physical
+/// OOM retry under either registry mutex. Cache membership is a later commit.
+fn data_frame_request(
+    count: PageFrameCount,
+    charge: Option<&MemoryCharge>,
+) -> FrameAllocationRequest {
+    if charge.is_some_and(|receipt| {
+        matches!(
+            receipt.kind(),
+            MemoryKind::Anon | MemoryKind::File | MemoryKind::Shmem
+        )
+    }) {
+        FrameAllocationRequest::user(count, PhysAddr::new(usize::MAX))
+    } else {
+        FrameAllocationRequest::kernel(count, PhysAddr::new(usize::MAX))
+    }
+}
+
+pub(crate) fn allocate_registered_data_page(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: Option<MemoryCharge>,
+) -> Result<Arc<Page>, SystemError> {
+    allocate_registered_data_page_initialized(page_type, flags, charge, |_| Ok(()))
+}
+
+/// Copy before publication: the source Arc pins its frame without a registry
+/// guard, and no observer can obtain a half-initialized destination page.
+pub(crate) fn copy_registered_normal_page(
+    source: &Arc<Page>,
+    charge: MemoryCharge,
+) -> Result<Arc<Page>, SystemError> {
+    allocate_registered_data_page_initialized(
+        PageType::Normal,
+        PageFlags::empty(),
+        Some(charge),
+        |destination| {
+            let source_guard = source.read();
+            let src = unsafe { MMArch::phys_2_virt(source_guard.phys_address()) }
+                .ok_or(SystemError::EFAULT)?;
+            let dst = unsafe { MMArch::phys_2_virt(destination) }.ok_or(SystemError::EFAULT)?;
+            unsafe {
+                (dst.data() as *mut u8)
+                    .copy_from_nonoverlapping(src.data() as *const u8, MMArch::PAGE_SIZE);
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn allocate_registered_data_page_initialized(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: Option<MemoryCharge>,
+    initialize: impl FnOnce(PhysAddr) -> Result<(), SystemError>,
+) -> Result<Arc<Page>, SystemError> {
+    let request = data_frame_request(PageFrameCount::ONE, charge.as_ref());
+    allocate_registered_data_page_initialized_with_request(
+        page_type, flags, charge, initialize, request,
+    )
+}
+
+fn reclaim_io_backing(
+    kind: MemoryKind,
+    noio: bool,
+    level: super::allocator::reserve::ReserveLevel,
+) -> bool {
+    kind == MemoryKind::File
+        && noio
+        && matches!(level, super::allocator::reserve::ReserveLevel::Reclaim)
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn reclaim_io_admission_selftest() -> bool {
+    use super::allocator::reserve::{kernel_level, with_reclaim_reserve, ReserveLevel};
+    let initial = kernel_level();
+    let noio_only = {
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        !reclaim_io_backing(
+            MemoryKind::File,
+            crate::cgroup::memory::io::noio_active(),
+            kernel_level(),
+        )
+    };
+    let scoped = with_reclaim_reserve(|| {
+        let without_io = !reclaim_io_backing(MemoryKind::File, false, kernel_level());
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        without_io
+            && reclaim_io_backing(
+                MemoryKind::File,
+                crate::cgroup::memory::io::noio_active(),
+                kernel_level(),
+            )
+            && !reclaim_io_backing(MemoryKind::Anon, true, kernel_level())
+            && !reclaim_io_backing(MemoryKind::Shmem, true, kernel_level())
+    });
+    matches!(initial, ReserveLevel::Kernel)
+        && noio_only
+        && scoped
+        && matches!(kernel_level(), ReserveLevel::Kernel)
+        && !reclaim_io_backing(MemoryKind::File, true, ReserveLevel::OomExit)
+        && scan_visit_budget_selftest()
+        && crate::mm::fault_recovery::budget_selftest()
+}
+
+/// Only PageCache's File path may identify a necessary stacked-I/O backing
+/// page. Ordinary data births (including nested anonymous faults) never use
+/// this exception; charging and the physical publication transaction are shared.
+pub(crate) fn allocate_registered_file_cache_page(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: MemoryCharge,
+) -> Result<Arc<Page>, SystemError> {
+    if !matches!(&page_type, PageType::File(_)) || charge.kind() != MemoryKind::File {
+        return Err(SystemError::EINVAL);
+    }
+    let request = if reclaim_io_backing(
+        charge.kind(),
+        crate::cgroup::memory::io::noio_active(),
+        super::allocator::reserve::kernel_level(),
+    ) {
+        FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+    } else {
+        FrameAllocationRequest::user(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+    };
+    allocate_registered_data_page_initialized_with_request(
+        page_type,
+        flags,
+        Some(charge),
+        |_| Ok(()),
+        request,
+    )
+}
+
+fn registered_data_placement(
+    page_type: &PageType,
+    flags: PageFlags,
+    charged: bool,
+) -> FramePlacement {
+    if cfg!(target_arch = "x86_64")
+        && charged
+        && !flags.contains(PageFlags::PG_UNEVICTABLE)
+        && matches!(page_type, PageType::Normal | PageType::File(_))
+    {
+        FramePlacement::Movable
+    } else {
+        FramePlacement::Unmovable
+    }
+}
+
+fn allocate_registered_data_page_initialized_with_request(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: Option<MemoryCharge>,
+    initialize: impl FnOnce(PhysAddr) -> Result<(), SystemError>,
+    request: FrameAllocationRequest,
+) -> Result<Arc<Page>, SystemError> {
+    if charge
+        .as_ref()
+        .is_some_and(|charge| charge.pages() != 1 || !page_type.accepts_memory_kind(charge.kind()))
+    {
+        return Err(SystemError::EINVAL);
+    }
+    // Only this registered single-page path has the audited data lifecycle.
+    // Raw/contiguous/legacy-manager callers keep their original default. This
+    // preference never substitutes for migration's live pin/rmap/cache checks.
+    let request = request.with_placement(registered_data_placement(
+        &page_type,
+        flags,
+        charge.is_some(),
+    ));
+    // Production anonymous/COW/uprobe-private and file/shmem cache births
+    // carry their data receipt. Uncharged permanent/selftest pages and kernel
+    // backing keep Kernel admission; reserve authority never upgrades User.
+    let paddr = unsafe {
+        LockedFrameAllocator
+            .allocate_request(request)
+            .map(|(paddr, _)| paddr)
+            .ok_or(SystemError::ENOMEM)?
+    };
+    let mut raw = RawFrameExtent {
+        next: paddr,
+        remaining: 1,
+    };
+    let vaddr = unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?;
+    unsafe { MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE) };
+    initialize(paddr)?;
+    // The constructor takes ownership on success AND Arc allocation failure.
+    raw.remaining = 0;
+    let page = Page::try_new_with_charge(paddr, page_type, flags, charge)?;
+    loop {
+        let mut manager_capacity = prepare_manager_capacity()?;
+        let mut lru_capacity = if flags.contains(PageFlags::PG_LRU) {
+            prepare_lru_capacity()?
+        } else {
+            None
+        };
+        let mut retired_manager = None;
+        let mut retired_lru = None;
+        let result = {
+            let mut manager = page_manager_lock();
+            let mut reclaimer = if flags.contains(PageFlags::PG_LRU) {
+                Some(page_reclaimer_lock())
+            } else {
+                None
+            };
+            if manager.phys2page.contains_key(&paddr)
+                || reclaimer
+                    .as_ref()
+                    .is_some_and(|reclaimer| reclaimer.lru.peek(&paddr).is_some())
+            {
+                Some(Err(SystemError::EEXIST))
+            } else {
+                if manager.phys2page.len() == manager.phys2page.capacity()
+                    && manager_capacity
+                        .as_ref()
+                        .is_some_and(|table| table.capacity() > manager.phys2page.len())
+                {
+                    let mut prepared = manager_capacity.take().unwrap();
+                    for (key, page) in manager.phys2page.drain() {
+                        assert!(prepared.insert(key, page).is_none());
+                    }
+                    core::mem::swap(&mut manager.phys2page, &mut prepared);
+                    retired_manager = Some(prepared);
+                }
+                if let Some(reclaimer) = reclaimer.as_mut() {
+                    if reclaimer.lru.len() == reclaimer.lru.capacity()
+                        && lru_capacity
+                            .as_ref()
+                            .is_some_and(|table| table.capacity() > reclaimer.lru.len())
+                    {
+                        retired_lru =
+                            Some(reclaimer.lru.install_capacity(lru_capacity.take().unwrap()));
+                    }
+                }
+                if manager.phys2page.len() == manager.phys2page.capacity()
+                    || reclaimer
+                        .as_ref()
+                        .is_some_and(|reclaimer| reclaimer.lru.len() == reclaimer.lru.capacity())
+                {
+                    None // Capacity changed while preparing; retry unlocked.
+                } else {
+                    assert!(manager.phys2page.insert(paddr, page.clone()).is_none());
+                    if let Some(reclaimer) = reclaimer.as_mut() {
+                        reclaimer
+                            .lru
+                            .insert_prepared(paddr, &page)
+                            .expect("preflighted page LRU insertion failed");
+                    }
+                    Some(Ok(()))
+                }
+            }
+        };
+        // Empty retired backing tables and unused proposals are real heap
+        // owners. Never release them while either registry guard is live.
+        drop(retired_lru);
+        drop(retired_manager);
+        drop(lru_capacity);
+        drop(manager_capacity);
+        match result {
+            Some(Ok(())) => return Ok(page),
+            Some(Err(error)) => return Err(error),
+            None => {}
+        }
+    }
+}
+
+fn prepare_manager_capacity() -> Result<Option<HashMap<PhysAddr, Arc<Page>>>, SystemError> {
+    let len = {
+        let manager = page_manager_lock();
+        if manager.phys2page.len() < manager.phys2page.capacity() {
+            return Ok(None);
+        }
+        manager.phys2page.len()
+    };
+    let target = len
+        .checked_mul(2)
+        .and_then(|doubled| len.checked_add(1).map(|needed| doubled.max(needed)))
+        .ok_or(SystemError::ENOMEM)?;
+    let mut prepared = HashMap::new();
+    if prepared.try_reserve(target).is_err() {
+        // A competing creator may have supplied capacity during preparation.
+        let manager = page_manager_lock();
+        if manager.phys2page.len() < manager.phys2page.capacity() {
+            return Ok(None);
+        }
+        return Err(SystemError::ENOMEM);
+    }
+    Ok(Some(prepared))
+}
+
+fn prepare_lru_capacity() -> Result<Option<PreparedPageLruCapacity>, SystemError> {
+    let len = {
+        let reclaimer = page_reclaimer_lock();
+        if reclaimer.lru.len() < reclaimer.lru.capacity() {
+            return Ok(None);
+        }
+        reclaimer.lru.len()
+    };
+    match PreparedPageLruCapacity::new(len, 1) {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(error) => {
+            let reclaimer = page_reclaimer_lock();
+            if reclaimer.lru.len() < reclaimer.lru.capacity() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const COMPACTION_DISCOVERY_BUCKETS: usize = 256;
+
+/// Bounded candidate discovery for the explicit DMA recovery service.
+/// Only physical identities leave this short registry/Page observation; a
+/// later migration must obtain its own single source Arc and revalidate it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn compaction_candidate(
+    cursor: &mut usize,
+    min: PhysAddr,
+    max: PhysAddr,
+) -> Result<Option<PhysAddr>, SystemError> {
+    let mut manager = try_page_manager_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    let table = manager.phys2page.raw_table();
+    let buckets = table.buckets();
+    if buckets == 0 {
+        *cursor = 0;
+        return Ok(None);
+    }
+    *cursor %= buckets;
+    for _ in 0..buckets.min(COMPACTION_DISCOVERY_BUCKETS) {
+        let index = *cursor;
+        *cursor = (index + 1) % buckets;
+        // The registry mutex keeps both occupancy and the borrowed bucket
+        // stable. No raw pointer or table borrow is retained after it drops.
+        let (physical, page) = unsafe {
+            if !table.is_bucket_full(index) {
+                continue;
+            }
+            table.bucket(index).as_ref()
+        };
+        // Off-domain pages do not consume this call's single returned identity.
+        if *physical < min || *physical > max {
+            continue;
+        }
+        // A fixed-frame access owner already prevents isolation. This is only
+        // a discovery hint; migration must still win its atomic admission CAS.
+        if page.access_state.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        let Some(data) = page.try_read() else {
+            continue;
+        };
+        if page.contiguous_owner.is_some()
+            || !data.individually_owns_frame
+            || data.backing_lifetime_pins != 0
+            || data.intrinsic_unevictable
+            || data.flags.intersects(
+                PageFlags::PG_RESERVED
+                    | PageFlags::PG_SLAB
+                    | PageFlags::PG_HEAD
+                    | PageFlags::PG_PRIVATE
+                    | PageFlags::PG_UNEVICTABLE
+                    | PageFlags::PG_WRITEBACK,
+            )
+            || !matches!(data.page_type, PageType::Normal | PageType::File(_))
+            || (data.map_count() == 0 && matches!(data.page_type, PageType::Normal))
+        {
+            continue;
+        }
+        return Ok(Some(*physical));
+    }
+    Ok(None)
+}
+
 pub struct PageManager {
     phys2page: HashMap<PhysAddr, Arc<Page>>,
 }
@@ -81,6 +825,11 @@ impl PageManager {
     #[allow(dead_code)]
     pub fn contains(&self, paddr: &PhysAddr) -> bool {
         self.phys2page.contains_key(paddr)
+    }
+
+    /// Unlike get(), this does not lock or promote the LRU under pressure.
+    pub(crate) fn get_registered(&self, paddr: &PhysAddr) -> Option<Arc<Page>> {
+        self.phys2page.get(paddr).cloned()
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
@@ -113,6 +862,15 @@ impl PageManager {
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
         self.phys2page.remove(paddr)
+    }
+
+    pub(crate) fn remove_page_if_same(&mut self, expected: &Arc<Page>) -> Option<Arc<Page>> {
+        let paddr = expected.phys_address();
+        let current = self.phys2page.get(&paddr)?;
+        if !Arc::ptr_eq(current, expected) {
+            return None;
+        }
+        self.phys2page.remove(&paddr)
     }
 
     /// # 创建一个新页面并加入管理器
@@ -151,6 +909,10 @@ impl PageManager {
     /// - `allocator`: 物理页帧分配器
     /// - `count`: 页面数量
     ///
+    /// PG_LRU pages must use `allocate_registered_data_page`: callers already
+    /// hold this manager guard and cannot prepare fallible LRU capacity here.
+    /// This API rejects PG_LRU before invoking the frame allocator.
+    ///
     /// ## 返回值
     ///
     /// - `Ok((PhysAddr, Vec<Arc<Page>>))`: 页面起始物理地址，新页面集合
@@ -162,29 +924,109 @@ impl PageManager {
         allocator: &mut dyn FrameAllocator,
         count: PageFrameCount,
     ) -> Result<(PhysAddr, Vec<Arc<Page>>), SystemError> {
-        compiler_fence(Ordering::SeqCst);
-        let (start_paddr, count) = unsafe { allocator.allocate(count).ok_or(SystemError::ENOMEM)? };
-        compiler_fence(Ordering::SeqCst);
+        self.create_pages_inner(page_type, flags, allocator, count, None)
+    }
 
-        unsafe {
-            let vaddr = MMArch::phys_2_virt(start_paddr).unwrap();
-            MMArch::write_bytes(vaddr, 0, MMArch::PAGE_SIZE * count.data());
+    /// Charge reservation is supplied by the caller. No reclaim or policy
+    /// wait is permitted under the manager lock.
+    pub(crate) fn create_charged_pages(
+        &mut self,
+        page_type: PageType,
+        flags: PageFlags,
+        allocator: &mut dyn FrameAllocator,
+        count: PageFrameCount,
+        kind: MemoryKind,
+        charge: MemoryCharge,
+    ) -> Result<(PhysAddr, Vec<Arc<Page>>), SystemError> {
+        if charge.kind() != kind || !page_type.accepts_memory_kind(kind) {
+            return Err(SystemError::EINVAL);
+        }
+        self.create_pages_inner(page_type, flags, allocator, count, Some(charge))
+    }
+
+    fn create_pages_inner(
+        &mut self,
+        page_type: PageType,
+        flags: PageFlags,
+        allocator: &mut dyn FrameAllocator,
+        count: PageFrameCount,
+        mut charge: Option<MemoryCharge>,
+    ) -> Result<(PhysAddr, Vec<Arc<Page>>), SystemError> {
+        let requested = count.data();
+        // Eligible pages require the unlocked birth/capacity preparation API.
+        // This caller-owned manager guard cannot provide that protocol.
+        if flags.contains(PageFlags::PG_LRU) {
+            return Err(SystemError::EINVAL);
+        }
+        if requested == 0 {
+            return Err(SystemError::EINVAL);
+        }
+        compiler_fence(Ordering::SeqCst);
+        let (start_paddr, count) = unsafe {
+            allocator
+                .allocate_request(data_frame_request(count, charge.as_ref()))
+                .ok_or(SystemError::ENOMEM)?
+        };
+        compiler_fence(Ordering::SeqCst);
+        let mut frames = PendingPageFrames {
+            allocator,
+            next: start_paddr,
+            remaining: count.data(),
+        };
+        if count.data() < requested {
+            return Err(SystemError::ENOMEM);
+        }
+        let bytes = MMArch::PAGE_SIZE
+            .checked_mul(count.data())
+            .ok_or(SystemError::ENOMEM)?;
+        if charge
+            .as_ref()
+            .is_some_and(|charge| charge.pages() < count.data() as u64)
+        {
+            return Err(SystemError::ENOMEM);
         }
 
-        let mut cur_phys = PhysPageFrame::new(start_paddr);
         let mut ret: Vec<Arc<Page>> = Vec::new();
+        if ret.try_reserve_exact(count.data()).is_err()
+            || self.phys2page.try_reserve(count.data()).is_err()
+        {
+            return Err(SystemError::ENOMEM);
+        }
+
+        unsafe {
+            let vaddr = MMArch::phys_2_virt(start_paddr).ok_or(SystemError::EFAULT)?;
+            MMArch::write_bytes(vaddr, 0, bytes);
+        }
+
         for _ in 0..count.data() {
-            let page = Page::new(cur_phys.phys_address(), page_type.clone(), flags);
-            if let Err(e) = self.insert(&page) {
-                for insert_page in ret {
-                    self.remove_page(&insert_page.read().phys_addr);
+            let page_charge = match charge.as_mut() {
+                Some(charge) => Some(charge.split_off(1)?),
+                None => None,
+            };
+            let paddr = frames.transfer_one();
+            let page = match Page::try_new_with_charge(paddr, page_type.clone(), flags, page_charge)
+            {
+                Ok(page) => page,
+                Err(err) => {
+                    self.rollback_created_pages(ret);
+                    return Err(err);
                 }
+            };
+            if let Err(e) = self.insert(&page) {
+                ret.push(page);
+                self.rollback_created_pages(ret);
                 return Err(e);
             }
             ret.push(page);
-            cur_phys = cur_phys.next();
         }
         Ok((start_paddr, ret))
+    }
+
+    fn rollback_created_pages(&mut self, pages: Vec<Arc<Page>>) {
+        for page in pages {
+            drop(self.remove_page_if_same(&page));
+            drop(page_reclaimer_lock().remove_page_if_same(&page));
+        }
     }
 
     /// # 拷贝管理器中原有页面并加入管理器，同时拷贝原页面内容
@@ -203,13 +1045,56 @@ impl PageManager {
         old_phys: &PhysAddr,
         allocator: &mut dyn FrameAllocator,
     ) -> Result<Arc<Page>, SystemError> {
+        self.copy_page_with_type(old_phys, allocator, None, None)
+    }
+
+    pub fn copy_page_as_normal(
+        &mut self,
+        old_phys: &PhysAddr,
+        allocator: &mut dyn FrameAllocator,
+    ) -> Result<Arc<Page>, SystemError> {
+        self.copy_page_with_type(old_phys, allocator, Some(PageType::Normal), None)
+    }
+
+    pub(crate) fn copy_charged_page_as_normal(
+        &mut self,
+        old_phys: &PhysAddr,
+        allocator: &mut dyn FrameAllocator,
+        charge: MemoryCharge,
+    ) -> Result<Arc<Page>, SystemError> {
+        if charge.pages() != 1 || charge.kind() != MemoryKind::Anon {
+            return Err(SystemError::EINVAL);
+        }
+        self.copy_page_with_type(old_phys, allocator, Some(PageType::Normal), Some(charge))
+    }
+
+    fn copy_page_with_type(
+        &mut self,
+        old_phys: &PhysAddr,
+        allocator: &mut dyn FrameAllocator,
+        page_type: Option<PageType>,
+        charge: Option<MemoryCharge>,
+    ) -> Result<Arc<Page>, SystemError> {
         let old_page = self.get(old_phys).ok_or(SystemError::EINVAL)?;
-        let paddr = unsafe { allocator.allocate_one().ok_or(SystemError::ENOMEM)? };
+        self.phys2page
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let paddr = unsafe {
+            allocator
+                .allocate_request(data_frame_request(PageFrameCount::ONE, charge.as_ref()))
+                .map(|(paddr, _)| paddr)
+                .ok_or(SystemError::ENOMEM)?
+        };
 
         assert!(!self.contains(&paddr), "phys page: {paddr:?} already exist");
 
-        let page = Page::copy(old_page.read(), paddr)
-            .inspect_err(|_| unsafe { allocator.free_one(paddr) })?;
+        let normal_copy = matches!(page_type, Some(PageType::Normal));
+        // copy always takes ownership of paddr, even on validation/Arc errors.
+        let page = Page::copy(old_page.read(), paddr, page_type, charge)?;
+        if normal_copy {
+            let mut guard = page.write();
+            guard.clear_mapping_unevictable_source_for_cow();
+        }
 
         self.insert(&page)?;
 
@@ -217,11 +1102,11 @@ impl PageManager {
     }
 }
 
-pub static mut PAGE_RECLAIMER: Option<Mutex<PageReclaimer>> = None;
+pub static mut PAGE_RECLAIMER: Option<ResourceMutex<PageReclaimer>> = None;
 
 pub fn page_reclaimer_init() {
     info!("page_reclaimer_init");
-    let page_reclaimer = Mutex::new(PageReclaimer::new());
+    let page_reclaimer = ResourceMutex::new(PageReclaimer::new());
 
     compiler_fence(Ordering::SeqCst);
     unsafe { PAGE_RECLAIMER = Some(page_reclaimer) };
@@ -254,40 +1139,164 @@ fn page_reclaimer_thread_init() -> Result<(), SystemError> {
 
 /// 页面回收线程执行的函数
 fn page_reclaim_thread() -> i32 {
+    let waits = reclaim_wait::ReclaimWait::new();
     loop {
-        let usage = unsafe { LockedFrameAllocator.usage() };
-        // log::info!("usage{:?}", usage);
-
-        // 保留4096个页面，总计16MB的空闲空间
-        if usage.free().data() < 4096 {
-            let page_to_free = 4096;
+        // Observe pressure before capacity so a concurrent edge prevents sleep.
+        let pressure_epoch = reclaim_wait::pressure_epoch();
+        let pressure = LockedFrameAllocator::pressure_snapshot();
+        let page_to_free = pressure.total_deficit();
+        if page_to_free != 0 {
+            let writeback_generation = async_writeback_progress_snapshot();
             // 分离选择和回收阶段，避免长时间持有页面回收器锁导致与
             // page_manager/page_cache 的锁顺序反转。
-            PageReclaimer::shrink_list(PageFrameCount::new(page_to_free));
+            let progress = PageReclaimer::try_shrink_global(
+                PageFrameCount::new(page_to_free),
+                4096,
+                Some(pressure),
+            )
+            .unwrap_or_default();
+            if progress.reclaimed == 0 {
+                // Any no-progress pass must yield: dirty pages may need an
+                // asynchronous writeback completion, while mapped,
+                // unevictable, or otherwise busy pages cannot be reclaimed by
+                // immediately draining the same LRU again.  If there is no
+                // writeback to wait for, use a bounded retry backoff.
+                if progress.dirty_seen == 0
+                    || !waits.wait_for_writeback_progress(writeback_generation)
+                {
+                    waits.pause_us(1_000, pressure_epoch);
+                }
+            }
         } else {
-            //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
-            PageReclaimer::flush_dirty_pages();
-            // 休眠5秒
-            // log::info!("sleep");
-            let _ = nanosleep(PosixTimeSpec::new(0, 500_000_000));
+            //TODO Temporarily let page reclaim thread handle dirty page writeback; should be separated later.
+            crate::mm::allocator::reserve::with_reclaim_reserve(PageReclaimer::flush_dirty_pages);
+
+            // Sleep 5 seconds, matching the Linux dirty_writeback_centisecs default.
+            // Metadata writeback is handled by the VFS writeback thread. Keeping
+            // sync_fs out of reclaim avoids coupling page reclaim to umount_lock.
+            waits.pause_us(5_000_000, pressure_epoch);
         }
     }
 }
 
 /// 获取页面回收器
-pub fn page_reclaimer_lock() -> MutexGuard<'static, PageReclaimer> {
-    unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock() }
+pub fn page_reclaimer_lock() -> ResourceMutexGuard<'static, PageReclaimer> {
+    unsafe { ResourceMutexGuard::lock(PAGE_RECLAIMER.as_ref().unwrap()) }
+}
+
+pub(crate) fn try_page_reclaimer_lock() -> Option<ResourceMutexGuard<'static, PageReclaimer>> {
+    unsafe { ResourceMutexGuard::try_lock(PAGE_RECLAIMER.as_ref()?) }
+}
+
+/// Physical eligibility for one reclaim operation. Ordinary reclaim accepts
+/// all RAM; constrained allocations count only whole pages they can reach.
+/// This is separate from protection quotas and the visited-candidate budget.
+#[derive(Clone, Copy)]
+struct ReclaimFilter {
+    zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+    max: PhysAddr,
+}
+
+impl ReclaimFilter {
+    const fn all() -> Self {
+        Self {
+            zones: None,
+            max: PhysAddr::MAX,
+        }
+    }
+
+    fn allows(self, physical: PhysAddr) -> bool {
+        physical
+            .data()
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .is_some_and(|last| last <= self.max.data())
+            && self.zones.is_none_or(|zones| zones.needs_reclaim(physical))
+    }
 }
 
 /// 页面回收器
 pub struct PageReclaimer {
-    lru: LruCache<PhysAddr, Arc<Page>>,
+    lru: PageLru,
+    writeback_cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReclaimProgress {
+    pub reclaimed: usize,
+    pub detached: usize,
+    pub scanned: usize,
+    pub dirty_seen: usize,
+    pub writeback_scheduled: usize,
+    /// Candidate slots examined, including busy and ineligible pages.
+    pub visited: usize,
+    /// LRU size at this scan's start; never summed across passes/batches.
+    pub inventory: usize,
+}
+
+/// One pass owns both its remaining visits and whether per-priority quotas
+/// apply. An unlimited pass stays unlimited after consuming candidate slots.
+struct ReclaimVisitBudget {
+    remaining: usize,
+    finite: bool,
+}
+
+fn priority_visit_budget(remaining: usize, inventory: usize, priority: u32, finite: bool) -> usize {
+    if finite {
+        remaining.min((inventory >> priority).max(1))
+    } else {
+        remaining
+    }
+}
+
+#[cfg(feature = "mm_selftest")]
+fn scan_visit_budget_selftest() -> bool {
+    // Use the production quota calculation on the formerly starving 49K LRU.
+    let mut remaining = 2048usize;
+    let mut deepest = 12;
+    for priority in (0..=12).rev() {
+        let quota = priority_visit_budget(remaining, 49_152, priority, true);
+        if quota != 0 {
+            deepest = priority;
+        }
+        remaining = remaining.saturating_sub(quota);
+    }
+    let mut progress = ReclaimProgress {
+        visited: 2,
+        inventory: 49_152,
+        ..Default::default()
+    };
+    progress.accumulate(ReclaimProgress {
+        visited: 3,
+        inventory: usize::MAX,
+        ..Default::default()
+    });
+    deepest < 12
+        && remaining == 0
+        && progress.visited == 5
+        && progress.inventory == 49_152
+        && priority_visit_budget(usize::MAX, 49_152, 12, false) == usize::MAX
+        && priority_visit_budget(1, 0, 12, true) == 1
+        && priority_visit_budget(0, usize::MAX, 0, true) == 0
+}
+
+impl ReclaimProgress {
+    fn accumulate(&mut self, other: Self) {
+        self.reclaimed = self.reclaimed.saturating_add(other.reclaimed);
+        self.detached = self.detached.saturating_add(other.detached);
+        self.scanned = self.scanned.saturating_add(other.scanned);
+        self.visited = self.visited.saturating_add(other.visited);
+        self.dirty_seen = self.dirty_seen.saturating_add(other.dirty_seen);
+        self.writeback_scheduled = self
+            .writeback_scheduled
+            .saturating_add(other.writeback_scheduled);
+    }
 }
 
 impl PageReclaimer {
     pub fn new() -> Self {
         Self {
-            lru: LruCache::unbounded(),
+            lru: PageLru::new(),
+            writeback_cursor: 0,
         }
     }
 
@@ -295,98 +1304,502 @@ impl PageReclaimer {
         self.lru.get(paddr).cloned()
     }
 
-    pub fn insert_page(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
-        self.lru.put(paddr, page.clone());
+    /// A real access hint, separate from registry identity lookups.
+    pub(crate) fn mark_accessed(&mut self, paddr: &PhysAddr) {
+        self.lru.promote(paddr);
     }
 
     pub fn remove_page(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
         self.lru.pop(paddr)
     }
 
+    pub(crate) fn remove_page_if_same(&mut self, expected: &Arc<Page>) -> Option<Arc<Page>> {
+        let paddr = expected.phys_address();
+        let current = self.lru.peek(&paddr)?;
+        if !Arc::ptr_eq(current, expected) {
+            return None;
+        }
+        self.lru.pop(&paddr)
+    }
+
     /// lru链表缩减（对外接口，内部自行获取/释放回收器锁）
     /// 分两阶段：
-    /// 1) 持有回收器锁，从 LRU 中摘下目标页面列表；
+    /// 1) 持有回收器锁，保留原节点并取得固定容量候选快照；
     /// 2) 释放回收器锁后，逐个执行写回与回收，避免锁顺序反转。
-    pub fn shrink_list(count: PageFrameCount) {
-        // 阶段1：仅持有回收器锁，摘取受害者
-        let victims = {
-            let mut reclaimer = page_reclaimer_lock();
-            reclaimer.drain_lru(count)
+    pub fn shrink_list(count: PageFrameCount) -> ReclaimProgress {
+        // Both production callers run after task/cgroup initialization and
+        // outside MM/resource locks. Registration preallocates this snapshot,
+        // so exhausted heap capacity cannot silently disable global reclaim.
+        let root = crate::cgroup::cgroup_root_node().memory_account();
+        let mut lease = crate::cgroup::memory::protection::global_snapshot(&root);
+        crate::mm::allocator::reserve::with_reclaim_reserve(|| {
+            Self::shrink_with_protection(
+                lease.get_mut(),
+                count,
+                true,
+                false,
+                usize::MAX,
+                ReclaimFilter::all(),
+            )
+        })
+    }
+
+    /// Global physical pressure uses a shared visited-candidate budget across
+    /// all priorities and the memory.low retry, independently of pages freed.
+    /// None means another scan owns the preallocated workspace.
+    pub(crate) fn try_shrink_global(
+        count: PageFrameCount,
+        visits: usize,
+        zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+    ) -> Option<ReclaimProgress> {
+        Self::try_shrink_global_below(count, visits, zones, PhysAddr::MAX)
+    }
+
+    /// As above, but only reclaim complete pages below an inclusive physical
+    /// limit. Unreachable candidates still consume the shared visit budget;
+    /// they cannot satisfy the goal or trigger unrelated writeback.
+    pub(crate) fn try_shrink_global_below(
+        count: PageFrameCount,
+        visits: usize,
+        zones: Option<crate::mm::allocator::watermark::ZonePressureSnapshot>,
+        max: PhysAddr,
+    ) -> Option<ReclaimProgress> {
+        let root = crate::cgroup::cgroup_root_node().memory_account();
+        let mut lease = crate::cgroup::memory::protection::try_global_snapshot(&root)?;
+        let filter = ReclaimFilter { zones, max };
+        Some(crate::mm::allocator::reserve::with_reclaim_reserve(|| {
+            Self::shrink_with_protection(lease.get_mut(), count, true, false, visits, filter)
+        }))
+    }
+
+    /// Protection/topology preparation happens before taking any resource
+    /// lock. A second pass may consume low reserves, but never min reserves.
+    pub(crate) fn shrink_account(
+        account: &Arc<MemoryAccount>,
+        count: PageFrameCount,
+    ) -> Result<ReclaimProgress, SystemError> {
+        Self::shrink_protected(account, count, false, false)
+    }
+
+    /// A stacked I/O caller may retain filesystem/cache/MM locks. Only try
+    /// retirement of already clean, unmapped pages; never unmap or write back.
+    pub(crate) fn shrink_account_noio(
+        account: &Arc<MemoryAccount>,
+        count: PageFrameCount,
+    ) -> Result<ReclaimProgress, SystemError> {
+        Self::shrink_protected(account, count, false, true)
+    }
+
+    fn shrink_protected(
+        account: &Arc<MemoryAccount>,
+        count: PageFrameCount,
+        allow_unowned: bool,
+        noio: bool,
+    ) -> Result<ReclaimProgress, SystemError> {
+        let mut protection = ProtectionSnapshot::new(account)?;
+        let mut scan = || {
+            Self::shrink_with_protection(
+                &mut protection,
+                count,
+                allow_unowned,
+                noio,
+                usize::MAX,
+                ReclaimFilter::all(),
+            )
         };
-
-        // 阶段2：不持有回收器锁，安全地回收页面
-        Self::evict_pages(victims);
+        // NOIO retains an unrelated caller's resources and is not itself an
+        // authorization to spend reserves. Only the ordinary reclaim scan is.
+        Ok(if noio {
+            scan()
+        } else {
+            crate::mm::allocator::reserve::with_reclaim_reserve(scan)
+        })
     }
 
-    /// 从 LRU 中批量弹出页面，不做任何回收操作。
-    fn drain_lru(&mut self, count: PageFrameCount) -> Vec<Arc<Page>> {
-        let mut victims = Vec::new();
-        for _ in 0..count.data() {
-            match self.lru.pop_lru() {
-                Some((_paddr, page)) => victims.push(page),
-                None => break,
-            }
+    fn shrink_with_protection(
+        protection: &mut ProtectionSnapshot,
+        count: PageFrameCount,
+        allow_unowned: bool,
+        noio: bool,
+        visits: usize,
+        filter: ReclaimFilter,
+    ) -> ReclaimProgress {
+        let inventory = if noio {
+            let Some(reclaimer) = try_page_reclaimer_lock() else {
+                return ReclaimProgress::default();
+            };
+            reclaimer.lru.len()
+        } else {
+            page_reclaimer_lock().lru.len()
+        };
+        // A bounded scan must leave the low-protection fallback reachable.
+        // Otherwise protected inventories larger than the entire visit budget
+        // exhaust every retry in the first pass and falsely trigger OOM.
+        let first_budget = if visits == usize::MAX {
+            visits
+        } else {
+            visits.div_ceil(2)
+        };
+        let mut budget = ReclaimVisitBudget {
+            remaining: first_budget,
+            finite: visits != usize::MAX,
+        };
+        let mut progress = Self::shrink_pass(
+            count.data(),
+            protection,
+            false,
+            allow_unowned,
+            noio,
+            &mut budget,
+            filter,
+        );
+        if progress.reclaimed < count.data() && protection.low_skipped() {
+            budget.remaining = visits.saturating_sub(first_budget.saturating_sub(budget.remaining));
+            progress.accumulate(Self::shrink_pass(
+                count.data() - progress.reclaimed,
+                protection,
+                true,
+                allow_unowned,
+                noio,
+                &mut budget,
+                filter,
+            ));
         }
-        victims
+        progress.inventory = inventory;
+        progress
     }
 
-    /// 在不持有回收器锁的情况下，完成页面写回与回收。
-    fn evict_pages(victims: Vec<Arc<Page>>) {
-        for page in victims {
-            let mut guard = page.write();
-            if let PageType::File(info) = guard.page_type().clone() {
-                // Never evict a file-backed page that is still mapped into any VMA.
-                // Our eviction path removes the page from page_cache/page_manager; dropping a
-                // still-mapped page will trip InnerPage::drop assertions and can crash userland.
-                if guard.map_count() != 0 {
-                    drop(guard);
-                    page_reclaimer_lock().insert_page(page.phys_address(), &page);
-                    continue;
-                }
+    /// Keep the original LRU node until clean retirement commits. pop_lru +
+    /// putback would destroy/reallocate a Box (and possibly hash capacity) in
+    /// the very path that must operate under allocation pressure.
+    fn reclaim_snapshot(&mut self, count: usize) -> [Option<Arc<Page>>; 64] {
+        let mut slots = core::array::from_fn(|_| None);
+        let count = count.min(slots.len()).min(self.lru.len());
+        for slot in slots.iter_mut().take(count) {
+            let Some((address, page)) = self.lru.peek_lru() else {
+                break;
+            };
+            let address = *address;
+            *slot = Some(page.clone());
+            self.lru.promote(&address);
+        }
+        slots
+    }
 
-                let page_index = info.index;
-                let paddr = guard.phys_address();
+    fn shrink_pass(
+        goal: usize,
+        protection: &mut ProtectionSnapshot,
+        low_reclaim: bool,
+        allow_unowned: bool,
+        noio: bool,
+        budget: &mut ReclaimVisitBudget,
+        filter: ReclaimFilter,
+    ) -> ReclaimProgress {
+        let mut progress = ReclaimProgress::default();
+        for priority in (0..=12).rev() {
+            if progress.reclaimed >= goal || budget.remaining == 0 {
+                break;
+            }
+            let lru_len = if noio {
+                let Some(reclaimer) = try_page_reclaimer_lock() else {
+                    break;
+                };
+                reclaimer.lru.len()
+            } else {
+                page_reclaimer_lock().lru.len()
+            };
+            protection.prepare_scan(
+                priority,
+                low_reclaim,
+                if allow_unowned { lru_len } else { 0 },
+            );
+            // Small/highly protected inventories commonly have zero raw
+            // targets at high priorities. Do not walk resource locks then.
+            if !protection.has_scan_budget() {
+                continue;
+            }
+            // A non-consumable unowned protection stock must not trap a
+            // finite scan at priority 12. Each priority gets only its share
+            // of visited candidates, not the entire outer scan's allowance.
+            let priority_limit =
+                priority_visit_budget(budget.remaining, lru_len, priority, budget.finite);
+            let mut priority_remaining = priority_limit;
+            progress.accumulate(Self::shrink_priority(
+                goal - progress.reclaimed,
+                protection,
+                low_reclaim,
+                noio,
+                &mut priority_remaining,
+                filter,
+            ));
+            budget.remaining = budget
+                .remaining
+                .saturating_sub(priority_limit.saturating_sub(priority_remaining));
+            crate::sched::cond_resched();
+        }
+        progress
+    }
 
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
-                    let writeback_target = match guard.page_type() {
-                        PageType::File(info) => info
-                            .page_cache
-                            .upgrade()
-                            .map(|page_cache| (page_cache, info.index)),
-                        _ => None,
-                    };
-                    drop(guard);
-
-                    if let Some((page_cache, page_index)) = writeback_target {
-                        let _ = page_cache.manager().writeback_page(page_index);
+    fn shrink_priority(
+        goal: usize,
+        protection: &mut ProtectionSnapshot,
+        low_reclaim: bool,
+        noio: bool,
+        remaining_visits: &mut usize,
+        filter: ReclaimFilter,
+    ) -> ReclaimProgress {
+        let mut progress = ReclaimProgress::default();
+        let mut remaining = if noio {
+            let Some(reclaimer) = try_page_reclaimer_lock() else {
+                return progress;
+            };
+            // Bound this pass by its initial inventory. A fixed prefix of
+            // the global LRU can contain only unrelated accounts and would
+            // falsely exhaust a memcg with reclaimable pages near the MRU.
+            reclaimer.lru.len()
+        } else {
+            page_reclaimer_lock().lru.len()
+        };
+        while remaining != 0 && progress.reclaimed < goal && *remaining_visits != 0 {
+            let snapshot_count = remaining.min(*remaining_visits);
+            let slots = if noio {
+                let Some(mut reclaimer) = try_page_reclaimer_lock() else {
+                    break;
+                };
+                reclaimer.reclaim_snapshot(snapshot_count)
+            } else {
+                page_reclaimer_lock().reclaim_snapshot(snapshot_count)
+            };
+            let mut visited = 0;
+            for page in slots.into_iter().flatten() {
+                visited += 1;
+                *remaining_visits -= 1;
+                // Unprocessed slots only release their snapshot Arc; the
+                // original LRU nodes never left the list.
+                if progress.reclaimed < goal && filter.allows(page.phys_address()) {
+                    progress.accumulate(if noio {
+                        Self::evict_page_noio(page, protection, low_reclaim)
                     } else {
-                        let mut guard = page.write();
-                        Self::page_writeback(&mut guard, true);
-                    }
-
-                    guard = page.write();
-                    if guard.flags().contains(PageFlags::PG_DIRTY) {
-                        drop(guard);
-                        page_reclaimer_lock().insert_page(paddr, &page);
-                        continue;
-                    }
+                        Self::evict_page(page, protection, low_reclaim)
+                    });
                 }
-
-                // 删除页面：顺序为 page_cache -> page_manager，避免原有的 reclaimer 锁参与死锁
-                //
-                // FileMapInfo 内保存 Weak<PageCache> 以避免 PageCache <-> Page 的强引用环。
-                // 如果此时 PageCache 已被释放（upgrade 失败），说明其 pages 映射也已销毁，无需再 remove。
-                if let Some(page_cache) = info.page_cache.upgrade() {
-                    if !page_cache.is_page_ready(page_index) {
-                        drop(guard);
-                        page_reclaimer_lock().insert_page(paddr, &page);
-                        continue;
-                    }
-                    let _ = page_cache.manager().remove_page(page_index);
-                }
-                page_manager_lock().remove_page(&paddr);
+            }
+            if visited == 0 {
+                break;
+            }
+            progress.visited = progress.visited.saturating_add(visited);
+            remaining = remaining.saturating_sub(visited);
+            // All candidate and backend pins have left their guard scopes.
+            crate::sched::cond_resched();
+            if !protection.has_scan_budget() {
+                break;
             }
         }
+        progress
+    }
+
+    fn evict_page_noio(
+        page: Arc<Page>,
+        protection: &mut ProtectionSnapshot,
+        low_reclaim: bool,
+    ) -> ReclaimProgress {
+        let mut progress = ReclaimProgress::default();
+        // Declare pins before the page guard so every rejection unlocks the
+        // page before possibly destroying its cache/filesystem owner.
+        let cache;
+        let mut guard = match page.try_write() {
+            Some(guard) => guard,
+            None => return progress,
+        };
+        let PageType::File(info) = guard.page_type() else {
+            return progress;
+        };
+        if page.contiguous_owner.is_some()
+            || !guard.individually_owns_frame
+            || guard.map_count() != 0
+            || guard.flags().intersects(
+                PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
+            )
+        {
+            return progress;
+        }
+        let index = info.index;
+        let account = page.memory_account().cloned();
+        cache = info.page_cache.upgrade();
+        if cache.as_ref().is_some_and(|cache| {
+            cache.mapping_unevictable() || !cache.manager().supports_clean_reclaim()
+        }) || !protection.take_scan(account.as_ref(), low_reclaim)
+        {
+            return progress;
+        }
+        progress.scanned = 1;
+        if let Some(account) = &account {
+            account.adjust_stat(MemoryStat::PgScan, 1, true);
+            if !protection.permits(account, low_reclaim) {
+                return progress;
+            }
+        }
+        // Obtain all registry guards before changing membership. Failure must
+        // leave the page on its original cache/LRU/manager, not half-retired.
+        let Some(mut reclaimer) = try_page_reclaimer_lock() else {
+            return progress;
+        };
+        let Some(mut manager) = try_page_manager_lock() else {
+            return progress;
+        };
+        let retired_entry = if let Some(cache) = &cache {
+            let Some(entry) = cache
+                .manager()
+                .try_remove_clean_page_for_reclaim(index, &page, &guard)
+            else {
+                return progress;
+            };
+            Some(entry)
+        } else {
+            None
+        };
+        let lru_owner = reclaimer.remove_page_if_same(&page);
+        let manager_owner = manager.remove_page_if_same(&page);
+        // Unlike finish_lru_retirement, this cannot reacquire a blocking page
+        // write lock: the exclusive guard has covered the entire commit.
+        guard.remove_flags(PageFlags::PG_LRU);
+        drop(manager);
+        drop(reclaimer);
+        drop(guard);
+        drop(retired_entry);
+        drop(lru_owner);
+        drop(manager_owner);
+        drop(cache);
+        progress.detached = 1;
+        if let Ok(owned) = Arc::try_unwrap(page) {
+            // Report only actual frame return, not merely detached ownership.
+            drop(owned);
+            progress.reclaimed = 1;
+            if let Some(account) = account {
+                account.adjust_stat(MemoryStat::PgSteal, 1, true);
+            }
+        }
+        progress
+    }
+
+    fn evict_page(
+        page: Arc<Page>,
+        protection: &mut ProtectionSnapshot,
+        low_reclaim: bool,
+    ) -> ReclaimProgress {
+        let mut progress = ReclaimProgress::default();
+        // Every rejected branch retains its original LRU node. Contiguous
+        // runs currently belong to intrinsic unevictable ring backing; a
+        // member's disappearance cannot prove that the shared run was freed.
+        // Do not wait on backend/fault page owners: that would defeat the
+        // bounded try-lock protocol and can form an MM -> Page -> MM cycle.
+        // Busy candidates keep their original node and report no scan/free.
+        // Declare the cache pin before the Page guard: on every early return
+        // the read lock must leave before a possible final PageCache Drop.
+        let cache;
+        let Some(guard) = page.try_read() else {
+            return progress;
+        };
+        let PageType::File(info) = guard.page_type() else {
+            return progress;
+        };
+        if page.contiguous_owner.is_some()
+            || !guard.individually_owns_frame
+            || guard
+                .flags()
+                .intersects(PageFlags::PG_UNEVICTABLE | PageFlags::PG_WRITEBACK)
+        {
+            return progress;
+        }
+        let index = info.index;
+        let account = page.memory_account().cloned();
+        cache = info.page_cache.upgrade();
+        if cache.as_ref().is_some_and(|cache| {
+            cache.mapping_unevictable() || !cache.manager().supports_clean_reclaim()
+        }) {
+            return progress;
+        }
+        // Backend-ineligible pages neither consume the raw scan stock nor
+        // record a low breach. The pin's declaration still orders retirement.
+        if !protection.take_scan(account.as_ref(), low_reclaim) {
+            return progress;
+        }
+        progress.scanned = 1;
+        if let Some(account) = &account {
+            account.adjust_stat(MemoryStat::PgScan, 1, true);
+        }
+        let dirty = guard.flags().contains(PageFlags::PG_DIRTY);
+        let mapped = guard.map_count() != 0;
+        drop(guard);
+        let mapping_outcome = if let Some(cache) = &cache {
+            cache.unmap_clean_page_for_reclaim(index, &page)
+        } else if dirty || mapped {
+            // An orphan dirty page is not made clean merely to report progress.
+            return progress;
+        } else {
+            Ok(PageCacheReclaimMapOutcome::Unmapped)
+        };
+        match mapping_outcome {
+            Ok(PageCacheReclaimMapOutcome::Dirty) => {
+                progress.dirty_seen = 1;
+                if let Some(cache) = &cache {
+                    if cache
+                        .manager()
+                        .try_start_reclaimer_writeback_range(index, index.saturating_add(63))
+                        .unwrap_or(false)
+                    {
+                        progress.writeback_scheduled = 1;
+                    }
+                }
+                return progress;
+            }
+            Ok(PageCacheReclaimMapOutcome::Unmapped) => {}
+            Ok(PageCacheReclaimMapOutcome::Busy) | Err(_) => return progress,
+        }
+        // Re-read current usage for each single-page commit, not once per
+        // batch. Other pages retained by min/low never leave the LRU.
+        if let Some(account) = &account {
+            if !protection.permits(account, low_reclaim) {
+                return progress;
+            }
+        }
+        if let Some(cache) = &cache {
+            let Ok(Some(removed)) = cache.manager().remove_clean_page_for_reclaim(index, &page)
+            else {
+                return progress;
+            };
+            drop(removed);
+        } else {
+            let Some(guard) = page.try_read() else {
+                return progress;
+            };
+            if guard.map_count() != 0
+                || guard.flags().intersects(
+                    PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE,
+                )
+            {
+                return progress;
+            }
+        }
+        let lru_owner = page_reclaimer_lock().remove_page_if_same(&page);
+        finish_lru_retirement(lru_owner.unwrap_or_else(|| page.clone()));
+        let manager_owner = page_manager_lock().remove_page_if_same(&page);
+        drop(manager_owner);
+        progress.detached = 1;
+        match Arc::try_unwrap(page) {
+            Ok(owned) => {
+                // Synchronous destructor returns the independent physical
+                // frame before its charge. No Weak/count observation substitutes
+                // for the completed allocator operation.
+                drop(owned);
+                progress.reclaimed = 1;
+                if let Some(account) = account {
+                    account.adjust_stat(MemoryStat::PgSteal, 1, true);
+                }
+            }
+            Err(retained) => drop(retained),
+        }
+        progress
     }
 
     /// Drop clean pagecache pages only, matching Linux drop_caches semantics.
@@ -417,7 +1830,7 @@ impl PageReclaimer {
     ///
     /// ## 返回值
     /// - VmFaultReason: 页面错误处理信息标志
-    pub fn page_writeback(guard: &mut InnerPage, unmap: bool) {
+    pub fn page_writeback(guard: &mut RwSemWriteGuard<'_, InnerPage>, unmap: bool) {
         // log::debug!("page writeback: {:?}", guard.phys_addr);
 
         let (page_cache, page_index) = match guard.page_type() {
@@ -433,6 +1846,9 @@ impl PageReclaimer {
                 return;
             }
         };
+        if !page_cache.supports_writeback() {
+            return;
+        }
         let paddr = guard.phys_address();
         let inode = page_cache.inode().clone().unwrap().upgrade().unwrap();
         let backend = page_cache.backend();
@@ -440,6 +1856,10 @@ impl PageReclaimer {
         if let Ok(unmapped_vmas) = page_cache.mkclean_page(page_index, unmap) {
             for vma in unmapped_vmas {
                 guard.remove_vma(vma.as_ref());
+            }
+            if guard.flags().contains(PageFlags::PG_UNEVICTABLE) && !guard.has_unevictable_source()
+            {
+                guard.remove_flags(PageFlags::PG_UNEVICTABLE);
             }
         }
 
@@ -456,7 +1876,9 @@ impl PageReclaimer {
         };
 
         if len > 0 {
-            page_cache.mark_page_writeback(page_index);
+            if !page_cache.try_mark_page_writeback(page_index, paddr) {
+                return;
+            }
             guard.remove_flags(PageFlags::PG_DIRTY);
             let data = unsafe {
                 core::slice::from_raw_parts(
@@ -481,46 +1903,78 @@ impl PageReclaimer {
                     len,
                     e
                 );
-                guard.add_flags(PageFlags::PG_ERROR);
-                page_cache.mark_page_error(page_index);
+                guard.add_flags(PageFlags::PG_ERROR | PageFlags::PG_DIRTY);
+                page_cache.mark_page_error(page_index, e);
                 return;
             }
         }
 
         guard.remove_flags(PageFlags::PG_ERROR);
         if guard.flags().contains(PageFlags::PG_DIRTY) {
-            page_cache.mark_page_dirty(page_index);
+            let _ = page_cache.mark_page_dirty_page_locked(page_index, guard);
         } else {
             page_cache.mark_page_uptodate(page_index);
         }
     }
 
-    /// lru脏页刷新
-    fn dirty_pages_snapshot(&self) -> Vec<Arc<Page>> {
-        self.lru
-            .iter()
-            .filter_map(|(_paddr, page)| {
-                let guard = page.read();
-                if guard.flags().contains(PageFlags::PG_DIRTY) {
-                    Some(page.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+    /// Take a bounded, rotating LRU snapshot without acquiring any page lock
+    /// while the global reclaimer lock is held.
+    fn writeback_scan_snapshot(&mut self, pages: &mut Vec<Arc<Page>>) {
+        const MAX_RECLAIMER_SCAN_PAGES: usize = 512;
+        const RECLAIMER_SCAN_STRIDE: usize = 8;
+        let total = self.lru.len();
+        if total == 0 {
+            self.writeback_cursor = 0;
+            return;
+        }
+
+        let start = self.writeback_cursor % total;
+        assert!(pages.is_empty());
+        let count = total.min(MAX_RECLAIMER_SCAN_PAGES).min(pages.capacity());
+        pages.extend(
+            self.lru
+                .iter()
+                .skip(start)
+                .chain(self.lru.iter().take(start))
+                .take(count)
+                .map(|(_paddr, page)| page.clone()),
+        );
+        // Large LRUs advance by the whole sampled window so every region is
+        // visited before windows overlap. When the entire LRU fits, retain a
+        // small stride to rotate which hot cache gets the first scheduling
+        // slots without skipping any page from the snapshot.
+        let advance = if total > count {
+            count
+        } else {
+            RECLAIMER_SCAN_STRIDE.min(total)
+        };
+        self.writeback_cursor = if advance >= total - start {
+            advance - (total - start)
+        } else {
+            start + advance
+        };
     }
 
     pub fn flush_dirty_pages() {
-        let pages = {
-            let reclaimer = page_reclaimer_lock();
-            reclaimer.dirty_pages_snapshot()
-        };
+        let mut pages = Vec::new();
+        if pages.try_reserve_exact(512).is_err() {
+            return;
+        }
+        {
+            let mut reclaimer = page_reclaimer_lock();
+            reclaimer.writeback_scan_snapshot(&mut pages);
+        }
         Self::flush_dirty_pages_snapshot(pages);
     }
 
     fn flush_dirty_pages_snapshot(pages: Vec<Arc<Page>>) {
+        const MAX_RECLAIMER_RUNNERS: usize = 8;
+        const MAX_RECLAIMER_PAGES_PER_RUN: usize = 512;
+        let mut scheduled_runners = 0;
         for page in pages {
-            let mut guard = page.write();
+            let Some(guard) = page.try_read() else {
+                continue;
+            };
             if guard.flags().contains(PageFlags::PG_DIRTY) {
                 let writeback_target = match guard.page_type() {
                     PageType::File(info) => info
@@ -531,9 +1985,28 @@ impl PageReclaimer {
                 };
                 if let Some((page_cache, page_index)) = writeback_target {
                     drop(guard);
-                    let _ = page_cache.manager().writeback_page(page_index);
+                    if scheduled_runners < MAX_RECLAIMER_RUNNERS {
+                        // Anchor every attempt at a page from the LRU snapshot,
+                        // then let one cache runner drain the same bounded
+                        // 512-page window as multiple backend-sized batches.
+                        // A contended cache is skipped immediately and later
+                        // snapshot candidates are still considered.
+                        let end = page_index.saturating_add(MAX_RECLAIMER_PAGES_PER_RUN - 1);
+                        if page_cache
+                            .manager()
+                            .try_start_reclaimer_writeback_range(page_index, end)
+                            .unwrap_or(false)
+                        {
+                            scheduled_runners += 1;
+                        }
+                    }
                 } else {
-                    Self::page_writeback(&mut guard, false);
+                    drop(guard);
+                    if let Some(mut guard) = page.try_write() {
+                        if guard.flags().contains(PageFlags::PG_DIRTY) {
+                            Self::page_writeback(&mut guard, false);
+                        }
+                    }
                 }
             }
         }
@@ -566,8 +2039,17 @@ bitflags! {
 #[derive(Debug)]
 pub struct Page {
     inner: RwSem<InnerPage>,
+    /// Physical-access pins and migration admission share one atomic word.
+    /// Arc ownership alone only keeps this fixed PFN alive.
+    access_state: AtomicUsize,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
+    /// Pins a bulk allocation when this page is one member of a contiguous
+    /// run. Ordinary pages own and release their frame individually.
+    contiguous_owner: Option<Arc<ContiguousFrameOwner>>,
+    /// Unique charge for an ordinary frame; contiguous runs keep theirs in
+    /// the shared frame owner. Dropped after the physical owner fields above.
+    memory_charge: Option<MemoryCharge>,
 }
 
 impl Page {
@@ -583,16 +2065,66 @@ impl Page {
     /// ## 返回值
     ///
     /// - `Arc<Page>`: 新页面
-    fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Arc<Page> {
-        let inner = InnerPage::new(phys_addr, page_type, flags);
-        let page = Arc::new(Self {
-            inner: RwSem::new(inner),
+    fn try_new(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+    ) -> Result<Arc<Page>, SystemError> {
+        Self::try_new_with_charge(phys_addr, page_type, flags, None)
+    }
+
+    fn try_new_with_charge(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        memory_charge: Option<MemoryCharge>,
+    ) -> Result<Arc<Page>, SystemError> {
+        let inner = InnerPage::new(
             phys_addr,
-        });
-        if page.read().flags == PageFlags::PG_LRU {
-            page_reclaimer_lock().insert_page(phys_addr, &page);
-        };
-        page
+            page_type,
+            flags,
+            true,
+            memory_charge
+                .as_ref()
+                .map(|charge| (charge.account().clone(), charge.kind())),
+        );
+        let page = Arc::try_new(Self {
+            inner: RwSem::new_resource(inner),
+            access_state: AtomicUsize::new(0),
+            phys_addr,
+            contiguous_owner: None,
+            memory_charge,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        // The unlocked birth API publishes manager/LRU together. Construction
+        // alone must not expose a page through either registry.
+        Ok(page)
+    }
+
+    fn try_new_with_contiguous_owner(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        owner: Arc<ContiguousFrameOwner>,
+    ) -> Result<Arc<Page>, SystemError> {
+        let inner = InnerPage::new(
+            phys_addr,
+            page_type,
+            flags,
+            false,
+            owner
+                .memory_charge
+                .as_ref()
+                .map(|charge| (charge.account().clone(), charge.kind())),
+        );
+        Arc::try_new(Self {
+            inner: RwSem::new_resource(inner),
+            access_state: AtomicUsize::new(0),
+            phys_addr,
+            contiguous_owner: Some(owner),
+            memory_charge: None,
+        })
+        .map_err(|_| SystemError::ENOMEM)
     }
 
     /// # 拷贝页面及内容
@@ -609,10 +2141,28 @@ impl Page {
     fn copy(
         old_guard: RwSemReadGuard<InnerPage>,
         new_phys: PhysAddr,
+        new_type: Option<PageType>,
+        memory_charge: Option<MemoryCharge>,
     ) -> Result<Arc<Page>, SystemError> {
-        let page_type = old_guard.page_type().clone();
-        let flags = *old_guard.flags();
-        let inner = InnerPage::new(new_phys, page_type, flags);
+        // One physical owner on every error path, including address conversion
+        // failures before InnerPage exists and Arc construction failures after.
+        let mut raw = RawFrameExtent {
+            next: new_phys,
+            remaining: 1,
+        };
+        let normal_copy = matches!(new_type, Some(PageType::Normal));
+        let page_type = new_type.unwrap_or_else(|| old_guard.page_type().clone());
+        let mut flags = *old_guard.flags();
+        if normal_copy {
+            // The new private frame has no source file-cache/LRU or dirty
+            // ownership. Its destination VMA establishes any real mlock.
+            flags.remove(
+                PageFlags::PG_LRU
+                    | PageFlags::PG_DIRTY
+                    | PageFlags::PG_WRITEBACK
+                    | PageFlags::PG_UNEVICTABLE,
+            );
+        }
         unsafe {
             let old_vaddr =
                 MMArch::phys_2_virt(old_guard.phys_address()).ok_or(SystemError::EFAULT)?;
@@ -620,10 +2170,36 @@ impl Page {
             (new_vaddr.data() as *mut u8)
                 .copy_from_nonoverlapping(old_vaddr.data() as *mut u8, MMArch::PAGE_SIZE);
         }
-        Ok(Arc::new(Self {
-            inner: RwSem::new(inner),
+        let inner = InnerPage::new(
+            new_phys,
+            page_type,
+            flags,
+            true,
+            memory_charge
+                .as_ref()
+                .map(|charge| (charge.account().clone(), charge.kind())),
+        );
+        raw.remaining = 0;
+        Arc::try_new(Self {
+            inner: RwSem::new_resource(inner),
+            access_state: AtomicUsize::new(0),
             phys_addr: new_phys,
-        }))
+            contiguous_owner: None,
+            memory_charge,
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
+
+    /// Ownership is immutable for ordinary pages, including offline accounts.
+    pub(crate) fn memory_account(&self) -> Option<&Arc<MemoryAccount>> {
+        self.memory_charge
+            .as_ref()
+            .or_else(|| {
+                self.contiguous_owner
+                    .as_ref()
+                    .and_then(|owner| owner.memory_charge.as_ref())
+            })
+            .map(MemoryCharge::account)
     }
 
     #[inline(always)]
@@ -635,6 +2211,10 @@ impl Page {
         self.inner.read()
     }
 
+    pub fn try_read(&self) -> Option<RwSemReadGuard<'_, InnerPage>> {
+        self.inner.try_read()
+    }
+
     pub fn upread(&self) -> RwSemUpgradeableGuard<'_, InnerPage> {
         self.inner.upread()
     }
@@ -642,44 +2222,116 @@ impl Page {
     pub fn write(&self) -> RwSemWriteGuard<'_, InnerPage> {
         self.inner.write()
     }
+
+    pub fn try_write(&self) -> Option<RwSemWriteGuard<'_, InnerPage>> {
+        self.inner.try_write()
+    }
+
+    pub(crate) fn shares_contiguous_frame_owner(&self, other: &Self) -> bool {
+        match (&self.contiguous_owner, &other.contiguous_owner) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
 /// 物理页面信息
 pub struct InnerPage {
     /// 映射到当前page的VMA
-    vma_set: HashSet<Arc<LockedVMA>>,
+    vma_set: PageVmaSet,
+    /// 当前对该页贡献 mlock/unevictable 原因的 VMA 子集。
+    ///
+    /// 该集合必须始终是 `vma_set` 的子集。它让 page-cache reclassify
+    /// 可以 O(1) 判断页是否仍因 VMA mlock 不可回收，而不需要反向锁住所有 VMA。
+    mlocked_vmas: PageVmaSet,
+    /// 内核子系统显式创建的 non-page-cache unevictable 页。
+    intrinsic_unevictable: bool,
+    /// Backing object lifetime pins.
+    ///
+    /// 这只表达“页面仍被 backing 对象拥有，不能从 page_manager 释放”，不表达
+    /// reclaim policy，也不应设置 `PG_UNEVICTABLE`。shared-anon backing 使用它
+    /// 替代旧的 `PG_UNEVICTABLE` lifetime workaround。
+    backing_lifetime_pins: usize,
     /// 标志
     flags: PageFlags,
     /// 页面所在物理地址
     phys_addr: PhysAddr,
     /// 页面类型
     page_type: PageType,
+    /// Ordinary pages return their own frame. Bulk pages instead pin a shared
+    /// contiguous owner stored by `Page`.
+    individually_owns_frame: bool,
+    /// Only state statistics, not another budget. Keep the original data-page
+    /// generation even when the task is migrated or that generation retires.
+    memory_stats: Option<(Arc<MemoryAccount>, MemoryKind)>,
 }
 
 impl InnerPage {
-    pub fn new(phys_addr: PhysAddr, page_type: PageType, flags: PageFlags) -> Self {
-        Self {
-            vma_set: HashSet::new(),
-            flags,
+    pub fn new(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        individually_owns_frame: bool,
+        memory_stats: Option<(Arc<MemoryAccount>, MemoryKind)>,
+    ) -> Self {
+        let intrinsic_unevictable =
+            flags.contains(PageFlags::PG_UNEVICTABLE) && !matches!(page_type, PageType::File(_));
+        let mut page = Self {
+            vma_set: PageVmaSet::new(),
+            mlocked_vmas: PageVmaSet::new(),
+            intrinsic_unevictable,
+            backing_lifetime_pins: 0,
+            flags: PageFlags::empty(),
             phys_addr,
             page_type,
-        }
+            individually_owns_frame,
+            memory_stats,
+        };
+        page.set_flags(flags);
+        page
     }
 
     /// 将vma加入anon_vma
-    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
+    pub fn insert_vma(&mut self, vma: Arc<LockedVMA>, address: VirtAddr, vma_mlocked: bool) {
         let was_mapped = self.map_count() > 0;
-        self.vma_set.insert(vma);
+        let inserted = self.vma_set.insert(vma.clone(), address);
+        if inserted && vma_mlocked {
+            self.mlocked_vmas.insert(vma, address);
+            self.add_flags(PageFlags::PG_UNEVICTABLE);
+        }
         if !was_mapped && matches!(self.page_type, PageType::File(_)) {
             pc_stats::inc_file_mapped();
+        }
+        if !was_mapped && inserted {
+            self.account_memory_stat(MemoryStat::FileMapped, true);
         }
     }
 
     /// 将vma从anon_vma中删去
+    ///
+    /// This only removes the VMA from the page-level source sets.  Callers that
+    /// may have removed the last unevictable source must subsequently run
+    /// `InnerAddressSpace::remove_page_unevictable_if_unneeded`.
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
+        drop(self.remove_vma_for_oom(vma));
+    }
+
+    pub(crate) fn has_vma(&self, vma: &LockedVMA) -> bool {
+        self.vma_set.contains(vma)
+    }
+
+    /// Consume existing source metadata only; the returned empty backing
+    /// must be dropped after all resource locks and the TLB barrier.
+    pub(crate) fn remove_vma_for_oom(
+        &mut self,
+        vma: &LockedVMA,
+    ) -> Option<HashMap<u64, PageMapping>> {
         let was_mapped = self.map_count() > 0;
-        let removed = self.vma_set.remove(vma);
+        let (removed, retired) = self.vma_set.remove_deferred(vma);
+        if removed {
+            self.mlocked_vmas.remove_keep_backing(vma);
+        }
         if removed
             && was_mapped
             && self.map_count() == 0
@@ -687,15 +2339,102 @@ impl InnerPage {
         {
             pc_stats::dec_file_mapped();
         }
+        if removed && was_mapped && self.map_count() == 0 {
+            self.account_memory_stat(MemoryStat::FileMapped, false);
+        }
+        retired
+    }
+
+    pub(crate) fn individually_owns_frame(&self) -> bool {
+        self.individually_owns_frame
     }
 
     /// 判断当前物理页是否能被回
     pub fn can_deallocate(&self) -> bool {
-        self.map_count() == 0 && !self.flags.contains(PageFlags::PG_UNEVICTABLE)
+        self.map_count() == 0
+            && !self.flags.contains(PageFlags::PG_UNEVICTABLE)
+            && self.backing_lifetime_pins == 0
+    }
+
+    /// Whether a VMA unmap may release this page from the global page manager.
+    ///
+    /// Page-cache backed pages are owned by their address_space/PageCache.  VMA
+    /// teardown only removes PTE/rmap state; the page cache eviction path is the
+    /// authority that unlinks and drops those pages from page_manager.
+    pub fn can_deallocate_after_vma_unmap(&self) -> bool {
+        self.can_deallocate() && !matches!(self.page_type, PageType::File(_))
     }
 
     pub fn shared(&self) -> bool {
         self.map_count() > 1
+    }
+
+    pub fn add_mlocked_vma_ref(&mut self, vma: &Arc<LockedVMA>) {
+        if let Some(address) = self.vma_set.address(vma.as_ref()) {
+            if self.mlocked_vmas.insert(vma.clone(), address) {
+                self.add_flags(PageFlags::PG_UNEVICTABLE);
+            }
+        }
+    }
+
+    pub fn remove_mlocked_vma_ref(&mut self, vma: &Arc<LockedVMA>) {
+        self.mlocked_vmas.remove_keep_backing(vma);
+    }
+
+    pub fn clear_unlinked_file_mapping_unevictable(&mut self) {
+        if matches!(self.page_type, PageType::File(_))
+            && self.map_count() == 0
+            && !self.has_mlocked_vma_refs()
+        {
+            self.remove_flags(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
+    #[inline(always)]
+    pub fn has_mlocked_vma_refs(&self) -> bool {
+        self.mlocked_vmas.len() != 0
+    }
+
+    pub(crate) fn replace_vma_for_split(&mut self, old: &LockedVMA, new: Arc<LockedVMA>) {
+        assert!(self.vma_set.replace_for_split(old, new.clone()));
+        self.mlocked_vmas.replace_for_split(old, new);
+    }
+
+    pub fn has_unevictable_source(&self) -> bool {
+        self.intrinsic_unevictable
+            || self.has_mlocked_vma_refs()
+            || self
+                .page_cache()
+                .map(|page_cache| page_cache.mapping_unevictable())
+                .unwrap_or(false)
+    }
+
+    pub(crate) fn intrinsic_unevictable(&self) -> bool {
+        self.intrinsic_unevictable
+    }
+
+    pub fn clear_mapping_unevictable_source_for_cow(&mut self) {
+        // A private copy has no ownership in the source file's LRU/writeback
+        // machinery. Its target VMA will establish any new mlock source.
+        self.remove_flags(PageFlags::PG_LRU | PageFlags::PG_WRITEBACK | PageFlags::PG_DIRTY);
+        self.intrinsic_unevictable = false;
+        if !self.has_unevictable_source() {
+            self.remove_flags(PageFlags::PG_UNEVICTABLE);
+        }
+    }
+
+    pub fn add_backing_lifetime_pin(&mut self) {
+        self.backing_lifetime_pins = self
+            .backing_lifetime_pins
+            .checked_add(1)
+            .expect("backing lifetime pin count overflow");
+    }
+
+    pub fn remove_backing_lifetime_pin(&mut self) {
+        self.backing_lifetime_pins = self
+            .backing_lifetime_pins
+            .checked_sub(1)
+            .expect("backing lifetime pin count underflow");
     }
 
     pub fn page_cache(&self) -> Option<Arc<PageCache>> {
@@ -713,9 +2452,10 @@ impl InnerPage {
         self.page_type = page_type;
     }
 
-    #[inline(always)]
-    pub fn vma_set(&self) -> &HashSet<Arc<LockedVMA>> {
-        &self.vma_set
+    /// Caller can reserve snapshot storage before locking this Page, then clone
+    /// these exact MM/VMA/VA identities without allocating in this iterator.
+    pub(crate) fn mappings(&self) -> impl Iterator<Item = &PageMapping> {
+        self.vma_set.iter()
     }
 
     #[inline(always)]
@@ -730,21 +2470,89 @@ impl InnerPage {
 
     #[inline(always)]
     pub fn set_flags(&mut self, flags: PageFlags) {
-        self.flags = flags
+        let old_lru = self.memory_lru_stat(self.flags);
+        let new_lru = self.memory_lru_stat(flags);
+        if old_lru != new_lru {
+            if let Some(stat) = old_lru {
+                self.account_memory_stat(stat, false);
+            }
+            if let Some(stat) = new_lru {
+                self.account_memory_stat(stat, true);
+            }
+            // Allocation, removal and unevictable transitions are not LRU
+            // activation events. Only an already evictable page changes age.
+            if old_lru.is_some() && new_lru.is_some() {
+                self.account_memory_stat(
+                    if flags.contains(PageFlags::PG_ACTIVE) {
+                        MemoryStat::PgActivate
+                    } else {
+                        MemoryStat::PgDeactivate
+                    },
+                    true,
+                );
+            }
+        }
+        for (flag, stat) in [
+            (PageFlags::PG_DIRTY, MemoryStat::FileDirty),
+            (PageFlags::PG_WRITEBACK, MemoryStat::FileWriteback),
+            (PageFlags::PG_UNEVICTABLE, MemoryStat::Unevictable),
+        ] {
+            if self.flags.contains(flag) != flags.contains(flag) {
+                self.account_memory_stat(stat, flags.contains(flag));
+            }
+        }
+        self.flags = flags;
     }
 
     #[inline(always)]
     pub fn add_flags(&mut self, flags: PageFlags) {
-        self.flags = self.flags.union(flags);
+        self.set_flags(self.flags.union(flags));
     }
 
     #[inline(always)]
     pub fn remove_flags(&mut self, flags: PageFlags) {
-        self.flags = self.flags.difference(flags);
+        self.set_flags(self.flags.difference(flags));
+    }
+
+    fn account_memory_stat(&self, stat: MemoryStat, add: bool) {
+        if let Some((account, kind)) = self.memory_stats.as_ref() {
+            // Shmem contributes to file_mapped, but without a backing-store
+            // writeback mapping its dirty bit is not Linux NR_FILE_DIRTY.
+            let accounted = match stat {
+                MemoryStat::Unevictable
+                | MemoryStat::InactiveAnon
+                | MemoryStat::ActiveAnon
+                | MemoryStat::InactiveFile
+                | MemoryStat::ActiveFile
+                | MemoryStat::PgActivate
+                | MemoryStat::PgDeactivate => true,
+                MemoryStat::FileMapped => matches!(kind, MemoryKind::File | MemoryKind::Shmem),
+                MemoryStat::FileDirty | MemoryStat::FileWriteback => *kind == MemoryKind::File,
+                _ => false,
+            };
+            if accounted {
+                account.adjust_stat(stat, 1, add);
+            }
+        }
+    }
+
+    fn memory_lru_stat(&self, flags: PageFlags) -> Option<MemoryStat> {
+        if !flags.contains(PageFlags::PG_LRU) || flags.contains(PageFlags::PG_UNEVICTABLE) {
+            return None;
+        }
+        let (_, kind) = self.memory_stats.as_ref()?;
+        let active = flags.contains(PageFlags::PG_ACTIVE);
+        match (kind, active) {
+            (MemoryKind::File, false) => Some(MemoryStat::InactiveFile),
+            (MemoryKind::File, true) => Some(MemoryStat::ActiveFile),
+            (MemoryKind::Anon | MemoryKind::Shmem, false) => Some(MemoryStat::InactiveAnon),
+            (MemoryKind::Anon | MemoryKind::Shmem, true) => Some(MemoryStat::ActiveAnon),
+            _ => None,
+        }
     }
 
     #[inline(always)]
-    fn phys_address(&self) -> PhysAddr {
+    pub(crate) fn phys_address(&self) -> PhysAddr {
         self.phys_addr
     }
 
@@ -799,9 +2607,12 @@ impl Drop for InnerPage {
             "page drop when map count is non-zero"
         );
 
-        unsafe {
-            deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
-        };
+        if self.individually_owns_frame {
+            unsafe {
+                deallocate_page_frames(PhysPageFrame::new(self.phys_addr), PageFrameCount::new(1))
+            };
+        }
+        self.set_flags(PageFlags::empty());
     }
 }
 
@@ -814,6 +2625,25 @@ pub enum PageType {
     File(FileMapInfo),
     /// 共享内存页，记录ShmId
     Shm,
+}
+
+impl PageType {
+    /// Data-page accounting is distinct from kernel object/page-table budgets.
+    /// Normal includes both private anonymous and shared anonymous backing;
+    /// its allocation caller, not this representation, selects that identity.
+    fn accepts_memory_kind(&self, kind: MemoryKind) -> bool {
+        match self {
+            Self::Normal => matches!(kind, MemoryKind::Anon | MemoryKind::Shmem),
+            Self::Shm => kind == MemoryKind::Shmem,
+            Self::File(info) => info.page_cache.upgrade().is_some_and(|cache| {
+                kind == if cache.is_shmem() {
+                    MemoryKind::Shmem
+                } else {
+                    MemoryKind::File
+                }
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -968,56 +2798,6 @@ impl<Arch: MemoryManagementArch> PageTable<Arch> {
             self.level - 1,
         ));
     }
-
-    /// 拷贝页表
-    /// ## 参数
-    ///
-    /// - `allocator`: 物理页框分配器
-    /// - `copy_on_write`: 是否写时复制
-    pub unsafe fn clone(
-        &self,
-        allocator: &mut impl FrameAllocator,
-        copy_on_write: bool,
-    ) -> Option<PageTable<Arch>> {
-        // 分配新页面作为新的页表
-        let phys = allocator.allocate_one()?;
-        let frame = MMArch::phys_2_virt(phys).unwrap();
-        MMArch::write_bytes(frame, 0, MMArch::PAGE_SIZE);
-        let new_table = PageTable::new(self.base, phys, self.level);
-        if self.level == 0 {
-            for i in 0..Arch::PAGE_ENTRY_NUM {
-                if let Some(mut entry) = self.entry(i) {
-                    if entry.present() {
-                        if copy_on_write {
-                            let mut new_flags = entry.flags().set_write(false);
-                            entry.set_flags(new_flags);
-                            self.set_entry(i, entry);
-                            new_flags = new_flags.set_dirty(false);
-                            entry.set_flags(new_flags);
-                            new_table.set_entry(i, entry);
-                        } else {
-                            let phys = allocator.allocate_one()?;
-                            let mut page_manager_guard = page_manager_lock();
-                            let old_phys = entry.address().unwrap();
-                            page_manager_guard.copy_page(&old_phys, allocator).ok()?;
-                            new_table.set_entry(i, PageEntry::new(phys, entry.flags()));
-                        }
-                    }
-                }
-            }
-        } else {
-            // 非一级页表拷贝时，对每个页表项对应的页表都进行拷贝
-            for i in 0..MMArch::PAGE_ENTRY_NUM {
-                if let Some(next_table) = self.next_level_table(i) {
-                    let table = next_table.clone(allocator, copy_on_write)?;
-                    let old_entry = self.entry(i).unwrap();
-                    let entry = PageEntry::new(table.phys(), old_entry.flags());
-                    new_table.set_entry(i, entry);
-                }
-            }
-        }
-        Some(new_table)
-    }
 }
 
 /// 页表项
@@ -1043,7 +2823,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
         }
     }
     #[inline(always)]
-    pub fn from_usize(data: usize) -> Self {
+    pub const fn from_usize(data: usize) -> Self {
         Self {
             data,
             phantom: PhantomData,
@@ -1089,7 +2869,7 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     }
 
     #[inline(always)]
-    pub fn flags(&self) -> EntryFlags<Arch> {
+    pub const fn flags(&self) -> EntryFlags<Arch> {
         unsafe { EntryFlags::from_data(self.data & Arch::ENTRY_FLAGS_MASK) }
     }
 
@@ -1098,9 +2878,12 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
         self.data = (self.data & !Arch::ENTRY_FLAGS_MASK) | flags.data();
     }
 
+    /// Whether this entry retains a resident mapping, including PROT_NONE.
+    /// Like Linux pte_present(), this is a software lifetime predicate. Use
+    /// flags().present() when testing the hardware PRESENT bit instead.
     #[inline(always)]
-    pub fn present(&self) -> bool {
-        return self.data & Arch::ENTRY_FLAG_PRESENT != 0;
+    pub const fn present(&self) -> bool {
+        self.flags().present() || self.protnone()
     }
 
     #[inline(always)]
@@ -1109,16 +2892,43 @@ impl<Arch: MemoryManagementArch> PageEntry<Arch> {
     }
 
     #[inline(always)]
-    pub fn protnone(&self) -> bool {
-        return self.data & (Arch::ENTRY_FLAG_PRESENT | Arch::ENTRY_FLAG_GLOBAL)
-            == Arch::ENTRY_FLAG_GLOBAL;
+    pub const fn protnone(&self) -> bool {
+        // A zero placeholder mask must never turn an empty entry into PROT_NONE.
+        Arch::ENTRY_FLAG_GLOBAL != 0
+            && self.data & (Arch::ENTRY_FLAG_PRESENT | Arch::ENTRY_FLAG_GLOBAL)
+                == Arch::ENTRY_FLAG_GLOBAL
     }
 
     #[inline(always)]
     pub fn write(&self) -> bool {
-        return self.data & Arch::ENTRY_FLAG_READWRITE != 0;
+        // `ENTRY_FLAG_READWRITE` is not a single "writable" bit on every
+        // architecture (riscv64 encodes R and W as separate bits), so defer to
+        // `has_write`, which knows the per-arch encoding.
+        return self.flags().has_write();
     }
 }
+
+// Check the production predicates for the native architecture at compile time.
+// In particular, zero placeholder masks must keep an empty PTE nonresident.
+const _: () = {
+    let empty = PageEntry::<MMArch>::from_usize(0);
+    assert!(!empty.present());
+    assert!(!empty.protnone());
+    assert!(!empty.flags().present());
+
+    if MMArch::ENTRY_FLAG_PRESENT != 0 {
+        let present = PageEntry::<MMArch>::from_usize(MMArch::ENTRY_FLAG_PRESENT);
+        assert!(present.present());
+        assert!(present.flags().present());
+        assert!(!present.protnone());
+    }
+    if MMArch::ENTRY_FLAG_GLOBAL != 0 {
+        let protnone = PageEntry::<MMArch>::from_usize(MMArch::ENTRY_FLAG_GLOBAL);
+        assert!(protnone.present());
+        assert!(protnone.protnone());
+        assert!(!protnone.flags().present());
+    }
+};
 
 /// 页表项的标志位
 #[derive(Copy, Clone, Hash)]
@@ -1162,7 +2972,11 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     /// - prot_flags: 页的保护标志
     /// - user: 用户空间是否可访问
     pub fn from_prot_flags(prot_flags: ProtFlags, user: bool) -> Self {
-        if Arch::PAGE_FAULT_ENABLED {
+        if Arch::PAGE_FAULT_ENABLED || cfg!(target_arch = "riscv64") {
+            // RISC-V eager mappings still need the architecture's protection
+            // encoding: PROT_NONE must clear V while retaining G/R as a
+            // resident leaf. Its protection map already keeps private writable
+            // pages writable when demand paging is disabled.
             let vm_flags = super::VmFlags::from(prot_flags);
             Arch::vm_get_page_prot(vm_flags).set_user(user)
         } else {
@@ -1262,8 +3076,10 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     }
 
     #[inline(always)]
-    pub fn present(&self) -> bool {
-        return self.has_flag(Arch::ENTRY_FLAG_PRESENT);
+    pub const fn present(&self) -> bool {
+        // Hardware presence requires a nonzero bit, including on architectures
+        // whose page-table encoding is not implemented yet.
+        self.data & Arch::ENTRY_FLAG_PRESENT != 0
     }
 
     /// 设置当前页表项的权限
@@ -1468,7 +3284,6 @@ impl<Arch: MemoryManagementArch> fmt::Debug for EntryFlags<Arch> {
 }
 
 /// 页表映射器
-#[derive(Hash)]
 pub struct PageMapper<Arch, F> {
     /// 页表类型
     table_kind: PageTableKind,
@@ -1476,7 +3291,96 @@ pub struct PageMapper<Arch, F> {
     table_paddr: PhysAddr,
     /// 页分配器
     frame_allocator: F,
+    /// Only owned user mappers have receipts. Borrowed diagnostic views and
+    /// kernel/EPT mappers must never acquire ownership of shared table frames.
+    user_tables: Option<HashMap<PhysAddr, Box<UserTableFrame>>>,
     phantom: PhantomData<fn() -> Arch>,
+}
+
+/// Unique receipt for a user page-table frame. `next` is preallocated teardown
+/// metadata: unlinking page tables never allocates or waits for a remote CPU.
+pub(crate) struct UserTableFrame {
+    frame: Option<PhysAddr>,
+    charge: Option<ObjectCharge>,
+    next: Option<Box<Self>>,
+}
+
+impl Drop for UserTableFrame {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.next.is_none(),
+            "page-table chain must be drained iteratively"
+        );
+        if let Some(frame) = self.frame.take() {
+            unsafe { LockedFrameAllocator.free_one(frame) };
+        }
+        drop(self.charge.take());
+    }
+}
+
+/// Detached frames must remain alive until the caller's synchronous shootdown.
+#[must_use = "stow detached tables in MmuGather before freeing them"]
+pub(crate) struct DetachedUserTables {
+    head: Option<Box<UserTableFrame>>,
+}
+
+impl DetachedUserTables {
+    pub(crate) const fn new() -> Self {
+        Self { head: None }
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+    fn push(&mut self, mut frame: Box<UserTableFrame>) {
+        frame.next = self.head.take();
+        self.head = Some(frame);
+    }
+    pub(crate) fn append(&mut self, mut other: Self) {
+        while let Some(mut frame) = other.head.take() {
+            other.head = frame.next.take();
+            self.push(frame);
+        }
+    }
+    /// Caller has completed a synchronous shootdown or proved mm unpublished.
+    pub(crate) unsafe fn free_after_flush(&mut self) {
+        while let Some(mut frame) = self.head.take() {
+            self.head = frame.next.take();
+            drop(frame);
+        }
+    }
+}
+
+impl<Arch, F: Hash> Hash for PageMapper<Arch, F> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.table_kind.hash(state);
+        self.table_paddr.hash(state);
+        self.frame_allocator.hash(state);
+    }
+}
+
+impl<Arch: MemoryManagementArch> PageMapper<Arch, LockedFrameAllocator> {
+    /// Fallible construction of a uniquely owned user root. Kernel/EPT roots
+    /// keep their existing independent allocation and lifetime contracts.
+    pub(crate) unsafe fn create_user(
+        account: Option<&Arc<ObjectAccount>>,
+    ) -> Result<Option<Self>, ChargeFailure> {
+        let mut mapper = Self::new(PageTableKind::User, PhysAddr::new(0), LockedFrameAllocator);
+        mapper.user_tables = Some(HashMap::new());
+        let Some(root) = mapper.allocate_owned_table(account)? else {
+            return Ok(None);
+        };
+        mapper.table_paddr = root;
+        Ok(Some(mapper))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CreatedPageTable {
+    parent_base: VirtAddr,
+    parent_phys: PhysAddr,
+    parent_level: usize,
+    index: usize,
+    child_phys: PhysAddr,
 }
 
 impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
@@ -1495,6 +3399,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             table_kind,
             table_paddr,
             frame_allocator: allocator,
+            user_tables: None,
             phantom: PhantomData,
         };
     }
@@ -1503,9 +3408,80 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
     pub unsafe fn create(table_kind: PageTableKind, mut allocator: F) -> Option<Self> {
         let table_paddr = allocator.allocate_one()?;
         // 清空页表
-        let table_vaddr = Arch::phys_2_virt(table_paddr)?;
+        let Some(table_vaddr) = Arch::phys_2_virt(table_paddr) else {
+            allocator.free_one(table_paddr);
+            return None;
+        };
         Arch::write_bytes(table_vaddr, 0, Arch::PAGE_SIZE);
         return Some(Self::new(table_kind, table_paddr, allocator));
+    }
+
+    /// Allocation, admission and publication are deliberately separate. A
+    /// failed metadata/frame allocation drops the unpublished receipt/token.
+    unsafe fn allocate_owned_table(
+        &mut self,
+        account: Option<&Arc<ObjectAccount>>,
+    ) -> Result<Option<PhysAddr>, ChargeFailure> {
+        let Some(tables) = self.user_tables.as_mut() else {
+            // Borrowed views do not own frames and cannot satisfy an
+            // accounted user allocation request.
+            if account.is_some() {
+                return Ok(None);
+            }
+            let Some(frame) = self.frame_allocator.allocate_one() else {
+                return Ok(None);
+            };
+            let Some(address) = Arch::phys_2_virt(frame) else {
+                self.frame_allocator.free_one(frame);
+                return Ok(None);
+            };
+            Arch::write_bytes(address, 0, Arch::PAGE_SIZE);
+            return Ok(Some(frame));
+        };
+        if tables.try_reserve(1).is_err() {
+            return Ok(None);
+        }
+        let Ok(mut receipt) = Box::try_new(UserTableFrame {
+            frame: None,
+            charge: None,
+            next: None,
+        }) else {
+            return Ok(None);
+        };
+        receipt.charge = match account {
+            Some(account) => {
+                Some(account.try_charge(KernelByteKind::PageTables, Arch::PAGE_SIZE as u64)?)
+            }
+            None => None,
+        };
+        let Some(frame) = self.frame_allocator.allocate_one() else {
+            return Ok(None);
+        };
+        receipt.frame = Some(frame);
+        let Some(address) = Arch::phys_2_virt(frame) else {
+            return Ok(None);
+        };
+        Arch::write_bytes(address, 0, Arch::PAGE_SIZE);
+        debug_assert!(!tables.contains_key(&frame));
+        tables.insert(frame, receipt);
+        Ok(Some(frame))
+    }
+
+    /// Only valid after an owned user mm is unpublished / no longer active.
+    pub(crate) unsafe fn release_user_tables(&mut self) -> bool {
+        let Some(tables) = self.user_tables.take() else {
+            return false;
+        };
+        for (_, frame) in tables {
+            drop(frame);
+        }
+        true
+    }
+
+    /// Actual uniquely owned frames, including the root and retained empty
+    /// tables; shared kernel subtrees and borrowed views are not included.
+    pub(crate) fn owned_user_table_pages(&self) -> usize {
+        self.user_tables.as_ref().map_or(0, HashMap::len)
     }
 
     /// 获取当前页表的页面映射器
@@ -1549,23 +3525,101 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         return &mut self.frame_allocator;
     }
 
-    /// 从当前PageMapper的页分配器中分配一个物理页，并将其映射到指定的虚拟地址
+    /// Allocate a physical page from this mapper's allocator and map it at the
+    /// specified virtual address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the mapper's required page-table edit serialization
+    /// and ensure that the target leaf entry is empty.
     pub unsafe fn map(
         &mut self,
         virt: VirtAddr,
         flags: EntryFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
-        let mut page_manager_guard = page_manager_lock();
-        let page = page_manager_guard
-            .create_one_page(
-                PageType::Normal,
-                PageFlags::empty(),
-                &mut self.frame_allocator,
-            )
-            .ok()?;
-        drop(page_manager_guard);
+        self.map_new_page(virt, flags).map(|(_, flush)| flush)
+    }
+
+    /// Allocate a managed normal page and map it into an empty leaf entry.
+    ///
+    /// The returned [`Arc<Page>`] is the same object registered in the global
+    /// page manager. Callers can use it directly for rmap/LRU accounting
+    /// instead of translating the new PTE and looking the page up again.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the mapper's required page-table edit serialization
+    /// and must have established that the target leaf entry is empty. This
+    /// method deliberately does not repeat that lookup on the anonymous-fault
+    /// hot path.
+    pub(crate) unsafe fn map_new_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+    ) -> Option<(Arc<Page>, PageFlush<Arch>)> {
+        self.try_map_new_page(virt, flags, None)
+            .expect("unaccounted table allocation cannot fail memcg admission")
+    }
+
+    /// Eager mapping counterpart with an explicitly captured table creator.
+    /// Data-page admission is independent of this page-table object charge.
+    #[expect(
+        clippy::type_complexity,
+        reason = "A successful mapping owns both the page and its flush obligation"
+    )]
+    pub(crate) unsafe fn try_map_new_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+        account: Option<&Arc<ObjectAccount>>,
+    ) -> Result<Option<(Arc<Page>, PageFlush<Arch>)>, ChargeFailure> {
+        // Legacy kernel/borrowed/custom mappers keep their allocator contract.
+        // User fault and eager paths use the explicit charged API below.
+        let mut manager = page_manager_lock();
+        let page = match manager.create_one_page(
+            PageType::Normal,
+            PageFlags::empty(),
+            &mut self.frame_allocator,
+        ) {
+            Ok(page) => page,
+            Err(_) => return Ok(None),
+        };
+        drop(manager);
         let phys = page.phys_address();
-        return self.map_phys(virt, phys, flags);
+        match self.try_map_phys(virt, phys, flags, account) {
+            Ok(Some(flush)) => Ok(Some((page, flush))),
+            result => {
+                let retired = { page_manager_lock().remove_page_if_same(&page) };
+                drop(retired);
+                result.map(|_| None)
+            }
+        }
+    }
+
+    /// Ordinary DragonOS user MM data frames have the global buddy owner.
+    /// This is not the allocation API for borrowed/kernel or EPT mappers.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Keep typed admission errors and the paired page/flush ownership"
+    )]
+    pub(crate) unsafe fn try_map_new_charged_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: EntryFlags<Arch>,
+        account: Option<&Arc<ObjectAccount>>,
+        charge: Option<MemoryCharge>,
+    ) -> Result<Option<(Arc<Page>, PageFlush<Arch>)>, crate::mm::allocation::MemoryAllocationError>
+    {
+        let page = allocate_registered_data_page(PageType::Normal, PageFlags::empty(), charge)?;
+        let phys = page.phys_address();
+        match self.try_map_phys(virt, phys, flags, account) {
+            Ok(Some(flush)) => Ok(Some((page, flush))),
+            result => {
+                let retired = { page_manager_lock().remove_page_if_same(&page) };
+                drop(retired);
+                result.map(|_| None).map_err(Into::into)
+            }
+        }
     }
 
     /// 映射一个物理页到指定的虚拟地址
@@ -1575,13 +3629,24 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         phys: PhysAddr,
         flags: EntryFlags<Arch>,
     ) -> Option<PageFlush<Arch>> {
+        self.try_map_phys(virt, phys, flags, None)
+            .expect("unaccounted table allocation cannot fail memcg admission")
+    }
+
+    pub(crate) unsafe fn try_map_phys(
+        &mut self,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        flags: EntryFlags<Arch>,
+        account: Option<&Arc<ObjectAccount>>,
+    ) -> Result<Option<PageFlush<Arch>>, ChargeFailure> {
         // 验证虚拟地址和物理地址是否对齐
         if !(virt.check_aligned(Arch::PAGE_SIZE) && phys.check_aligned(Arch::PAGE_SIZE)) {
             error!(
                 "Try to map unaligned page: virt={:?}, phys={:?}",
                 virt, phys
             );
-            return None;
+            return Ok(None);
         }
 
         let virt = VirtAddr::new(virt.data() & (!Arch::PAGE_NEGATIVE_MASK));
@@ -1592,7 +3657,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         let entry = PageEntry::new(phys, flags);
         let mut table = self.table();
         loop {
-            let i = table.index_of(virt)?;
+            let Some(i) = table.index_of(virt) else {
+                return Ok(None);
+            };
 
             assert!(i < Arch::PAGE_ENTRY_NUM);
             if table.level() == 0 {
@@ -1600,7 +3667,7 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
                 table.set_entry(i, entry);
                 compiler_fence(Ordering::SeqCst);
-                return Some(PageFlush::new(virt));
+                return Ok(Some(PageFlush::new(virt)));
             } else {
                 let next_table = table.next_level_table(i);
                 if let Some(next_table) = next_table {
@@ -1608,10 +3675,9 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     // debug!("Mapping {:?} to next level table...", virt);
                 } else {
                     // 分配下一级页表
-                    let frame = self.frame_allocator.allocate_one()?;
-
-                    // 清空这个页帧
-                    MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+                    let Some(frame) = self.allocate_owned_table(account)? else {
+                        return Ok(None);
+                    };
                     // 设置页表项的flags
                     let flags: EntryFlags<Arch> =
                         EntryFlags::new_page_table(virt.kind() == PageTableKind::User);
@@ -1620,8 +3686,259 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
                     table.set_entry(i, PageEntry::new(frame, flags));
 
                     // 获取新分配的页表
-                    table = table.next_level_table(i)?;
+                    let Some(child) = table.next_level_table(i) else {
+                        return Ok(None);
+                    };
+                    table = child;
                 }
+            }
+        }
+    }
+
+    /// Prepare a permanent shared kernel subtree before any user roots are copied.
+    /// The caller serializes edits and pins the resulting upper tables for boot lifetime.
+    pub(crate) unsafe fn prepare_kernel_subtree(
+        &mut self,
+        virt: VirtAddr,
+        level: usize,
+    ) -> Option<()> {
+        let mut table = self.table();
+        while table.level() > level {
+            let index = table.index_of(virt)?;
+            let entry = table.entry(index)?;
+            if entry.empty() {
+                let frame = self.allocate_owned_table(None).ok()??;
+                table.set_entry(
+                    index,
+                    PageEntry::new(frame, EntryFlags::new_page_table(false)),
+                )?;
+            } else if Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return None;
+            }
+            table = table.next_level_table(index)?;
+        }
+        Some(())
+    }
+
+    /// Install a caller-owned, zeroed level-0 kernel table below a pinned level-1 table.
+    /// No allocation occurs while editing the shared page tables.
+    pub(crate) unsafe fn install_kernel_leaf_table(
+        &mut self,
+        virt: VirtAddr,
+        frame: PhysAddr,
+    ) -> Option<CreatedPageTable> {
+        let mut table = self.table();
+        while table.level() > 1 {
+            table = table.next_level_table(table.index_of(virt)?)?;
+        }
+        let index = table.index_of(virt)?;
+        if !table.entry(index)?.empty() {
+            return None;
+        }
+        table.set_entry(
+            index,
+            PageEntry::new(frame, EntryFlags::new_page_table(false)),
+        )?;
+        Some(CreatedPageTable {
+            parent_base: table.base(),
+            parent_phys: table.phys(),
+            parent_level: 1,
+            index,
+            child_phys: frame,
+        })
+    }
+
+    /// Detach an empty transaction table. Its frame remains owned by the caller
+    /// until a subsequent synchronous kernel shootdown has completed.
+    pub(crate) unsafe fn detach_empty_kernel_table(&mut self, owned: &CreatedPageTable) -> bool {
+        let parent =
+            PageTable::<Arch>::new(owned.parent_base, owned.parent_phys, owned.parent_level);
+        let Some(entry) = parent.entry(owned.index) else {
+            return false;
+        };
+        if !entry.present() || entry.address().ok() != Some(owned.child_phys) {
+            return false;
+        }
+        let Some(child) = parent.next_level_table(owned.index) else {
+            return false;
+        };
+        if !(0..Arch::PAGE_ENTRY_NUM).all(|i| child.entry(i).is_some_and(|e| e.empty())) {
+            return false;
+        }
+        parent
+            .set_entry(owned.index, PageEntry::from_usize(0))
+            .is_some()
+    }
+
+    /// Map an existing physical range at a specific page-table leaf level.
+    ///
+    /// The target entry must be empty. Any intermediate tables allocated by this call are appended
+    /// to `created_tables`, allowing a higher-level transaction to reclaim only tables it owns.
+    pub unsafe fn map_phys_at_level(
+        &mut self,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        level: usize,
+        flags: EntryFlags<Arch>,
+        created_tables: &mut Vec<CreatedPageTable>,
+    ) -> Option<PageFlush<Arch>> {
+        if level >= Arch::PAGE_LEVELS {
+            return None;
+        }
+        let shift = level
+            .checked_mul(Arch::PAGE_ENTRY_SHIFT)?
+            .checked_add(Arch::PAGE_SHIFT)?;
+        let size = 1usize.checked_shl(shift as u32)?;
+        if !virt.check_aligned(size) || !phys.check_aligned(size) {
+            return None;
+        }
+
+        let virt = VirtAddr::new(virt.data() & !Arch::PAGE_NEGATIVE_MASK);
+        let mut table = self.table();
+        while table.level() > level {
+            let index = table.index_of(virt)?;
+            let entry = table.entry(index)?;
+            if entry.present() {
+                if Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                    return None;
+                }
+                table = table.next_level_table(index)?;
+                continue;
+            }
+
+            let child_phys = self
+                .allocate_owned_table(None)
+                .expect("unaccounted allocation cannot fail admission")?;
+            let child = PageTable::new(table.entry_base(index)?, child_phys, table.level() - 1);
+            table.set_entry(
+                index,
+                PageEntry::new(
+                    child_phys,
+                    EntryFlags::new_page_table(virt.kind() == PageTableKind::User),
+                ),
+            )?;
+            created_tables.push(CreatedPageTable {
+                parent_base: table.base(),
+                parent_phys: table.phys(),
+                parent_level: table.level(),
+                index,
+                child_phys,
+            });
+            table = child;
+        }
+
+        let index = table.index_of(virt)?;
+        if !table.entry(index)?.empty() {
+            return None;
+        }
+        let flags = if level == 0 {
+            flags
+        } else {
+            flags.set_huge_page(true)
+        };
+        table.set_entry(index, PageEntry::new(phys, flags))?;
+        Some(PageFlush::new(virt))
+    }
+
+    /// Return whether every top-level slot covering `[start, end)` already points at a shared
+    /// kernel page-table subtree. Device-linear mappings may add lower-level entries to an existing
+    /// shared subtree, but must not create a new top-level entry visible only in the current CR3.
+    pub unsafe fn has_existing_top_level_subtrees(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        if start >= end {
+            return false;
+        }
+        let table = self.table();
+        let top_level_size_shift = (Arch::PAGE_LEVELS - 1)
+            .checked_mul(Arch::PAGE_ENTRY_SHIFT)
+            .and_then(|shift| shift.checked_add(Arch::PAGE_SHIFT));
+        let Some(top_level_size) =
+            top_level_size_shift.and_then(|shift| 1usize.checked_shl(shift as u32))
+        else {
+            return false;
+        };
+        let mut address = start.data();
+        while address < end.data() {
+            let vaddr = VirtAddr::new(address);
+            let Some(index) = table.index_of(vaddr) else {
+                return false;
+            };
+            let Some(entry) = table.entry(index) else {
+                return false;
+            };
+            if !entry.present() || Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return false;
+            }
+            let next = (address & !(top_level_size - 1)).saturating_add(top_level_size);
+            if next <= address {
+                return false;
+            }
+            address = next.min(end.data());
+        }
+        true
+    }
+
+    /// Clear exactly the leaf entry at `level`, without descending through a huge mapping and
+    /// without freeing intermediate page tables.
+    pub unsafe fn clear_mapping_at_level(
+        &mut self,
+        virt: VirtAddr,
+        level: usize,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>)> {
+        let mut table = self.table();
+        while table.level() > level {
+            let index = table.index_of(virt)?;
+            let entry = table.entry(index)?;
+            if !entry.present() || Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return None;
+            }
+            table = table.next_level_table(index)?;
+        }
+        let index = table.index_of(virt)?;
+        let entry = table.entry(index)?;
+        if !entry.present() || !Arch::entry_is_leaf(level, entry.flags().data()) {
+            return None;
+        }
+        table.set_entry(index, PageEntry::from_usize(0))?;
+        Some((entry.address().ok()?, entry.flags()))
+    }
+
+    /// Reclaim transaction-owned page tables after a synchronous kernel TLB shootdown.
+    pub unsafe fn reclaim_created_tables(&mut self, created_tables: &mut Vec<CreatedPageTable>) {
+        // This transaction API is for shared kernel device-linear mappings.
+        // User receipts may only leave the ledger through the gather-aware
+        // unmap API; retained empty tables are freed with their owning mm.
+        assert!(
+            self.user_tables.is_none(),
+            "user table retirement requires a gather sink"
+        );
+        // A lower-level table must be reclaimed before the parent that points to it. Records that
+        // are still non-empty remain owned and are retried by a later device-mapping teardown.
+        created_tables.sort_unstable_by_key(|owned| owned.parent_level);
+        let pending = core::mem::take(created_tables);
+        for owned in pending {
+            let parent =
+                PageTable::<Arch>::new(owned.parent_base, owned.parent_phys, owned.parent_level);
+            let Some(entry) = parent.entry(owned.index) else {
+                continue;
+            };
+            if !entry.present() || entry.address().ok() != Some(owned.child_phys) {
+                continue;
+            }
+            if Arch::entry_is_leaf(owned.parent_level, entry.flags().data()) {
+                continue;
+            }
+            let child = PageTable::<Arch>::new(
+                parent.entry_base(owned.index).unwrap(),
+                owned.child_phys,
+                owned.parent_level - 1,
+            );
+            let empty = (0..Arch::PAGE_ENTRY_NUM)
+                .all(|index| child.entry(index).is_some_and(|entry| entry.empty()));
+            if empty {
+                parent.set_entry(owned.index, PageEntry::from_usize(0));
+                self.frame_allocator.free_one(owned.child_phys);
+            } else {
+                created_tables.push(owned);
             }
         }
     }
@@ -1688,19 +4005,38 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         level: usize,
     ) -> Option<PageTable<Arch>> {
-        let table = self.get_table(virt, level + 1)?;
-        let i = table.index_of(virt)?;
-        let frame = self.frame_allocator.allocate_one()?;
+        self.try_allocate_table(virt, level, None)
+            .expect("unaccounted allocation cannot fail admission")
+    }
 
-        // 清空这个页帧
-        MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+    pub(crate) unsafe fn try_allocate_table(
+        &mut self,
+        virt: VirtAddr,
+        level: usize,
+        account: Option<&Arc<ObjectAccount>>,
+    ) -> Result<Option<PageTable<Arch>>, ChargeFailure> {
+        let Some(table) = self.get_table(virt, level + 1) else {
+            return Ok(None);
+        };
+        let Some(i) = table.index_of(virt) else {
+            return Ok(None);
+        };
+        if let Some(existing) = table.next_level_table(i) {
+            return Ok(Some(existing));
+        }
+        if !table.entry(i).is_some_and(|entry| entry.empty()) {
+            return Ok(None);
+        }
+        let Some(frame) = self.allocate_owned_table(account)? else {
+            return Ok(None);
+        };
 
         // 设置页表项的flags
         let flags: EntryFlags<Arch> =
             EntryFlags::new_page_table(virt.kind() == PageTableKind::User);
 
         table.set_entry(i, PageEntry::new(frame, flags));
-        table.next_level_table(i)
+        Ok(table.next_level_table(i))
     }
 
     /// 获取虚拟地址的指定层级页表
@@ -1774,23 +4110,34 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         // }
     }
 
-    /// 拷贝用户空间映射
-    /// ## 参数
+    /// Locate an existing order-0 leaf without descending through a huge page.
     ///
-    /// - `umapper`: 要拷贝的用户空间
-    /// - `copy_on_write`: 是否写时复制
-    pub unsafe fn clone_user_mapping(&mut self, umapper: &mut Self, copy_on_write: bool) {
-        let old_table = umapper.table();
-        let new_table = self.table();
-        let allocator = self.allocator_mut();
-        // 顶级页表的[0, PAGE_KERNEL_INDEX)项为用户空间映射
-        for entry_index in 0..Arch::PAGE_KERNEL_INDEX {
-            if let Some(next_table) = old_table.next_level_table(entry_index) {
-                let table = next_table.clone(allocator, copy_on_write).unwrap();
-                let old_entry = old_table.entry(entry_index).unwrap();
-                let entry = PageEntry::new(table.phys(), old_entry.flags());
-                new_table.set_entry(entry_index, entry);
+    /// # Safety
+    /// The caller holds this user MM's write guard and PT edit serialization.
+    /// The returned slot may only outlive PT serialization while that MM write
+    /// guard keeps this anonymous mapping's table hierarchy stable. No tables
+    /// are allocated or retired. Atomic exchange is required to retain A/D
+    /// updates made by hardware independently of software PT locks.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn migration_leaf(
+        &self,
+        virt: VirtAddr,
+    ) -> Option<&core::sync::atomic::AtomicUsize> {
+        let mut table = self.table();
+        loop {
+            let index = table.index_of(virt)?;
+            if table.level() == 0 {
+                return Some(
+                    &*table
+                        .entry_virt(index)?
+                        .as_ptr::<core::sync::atomic::AtomicUsize>(),
+                );
             }
+            let entry = table.entry(index)?;
+            if !entry.flags().present() || entry.flags().has_flag(Arch::ENTRY_FLAG_HUGE_PAGE) {
+                return None;
+            }
+            table = table.next_level_table(index)?;
         }
     }
 
@@ -1904,6 +4251,8 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         unmap_parents: bool,
     ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        // Kernel / borrowed consumers retain their independent TLB contract.
+        // Owned user consumers must choose gather or explicit preserve_tables.
         self.unmap_phys_with_freed_tables(virt, unmap_parents)
             .map(|(paddr, flags, flush, _freed)| (paddr, flags, flush))
     }
@@ -1922,6 +4271,10 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         virt: VirtAddr,
         unmap_parents: bool,
     ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>, bool)> {
+        assert!(
+            self.user_tables.is_none(),
+            "owned user unmap requires a gather sink or preserve_tables"
+        );
         if !virt.check_aligned(Arch::PAGE_SIZE) {
             error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
@@ -1929,14 +4282,44 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
 
         let table = self.table();
         let mut freed_tables = false;
+        let mut detached = DetachedUserTables::new();
         unmap_phys_inner(
             virt,
             &table,
             unmap_parents,
-            self.allocator_mut(),
+            &mut self.frame_allocator,
             &mut freed_tables,
+            None,
+            &mut detached,
         )
         .map(|(paddr, flags)| (paddr, flags, PageFlush::<Arch>::new(virt), freed_tables))
+    }
+
+    /// Unlink user tables without physically freeing them. The returned chain
+    /// must be consumed by MmuGather while all frames are still alive.
+    pub(crate) unsafe fn unmap_phys_gather(
+        &mut self,
+        virt: VirtAddr,
+        unmap_parents: bool,
+        gather: &mut crate::mm::mmu_gather::MmuGather<'_>,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        if !virt.check_aligned(Arch::PAGE_SIZE) {
+            return None;
+        }
+        let table = self.table();
+        let mut freed = false;
+        let mut detached = DetachedUserTables::new();
+        let (phys, flags) = unmap_phys_inner(
+            virt,
+            &table,
+            unmap_parents,
+            &mut self.frame_allocator,
+            &mut freed,
+            self.user_tables.as_mut(),
+            &mut detached,
+        )?;
+        gather.stash_user_tables(detached);
+        Some((phys, flags, PageFlush::new(virt)))
     }
 
     /// Clear an existing leaf PTE without freeing intermediate page-table pages.
@@ -1948,6 +4331,17 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         &self,
         virt: VirtAddr,
     ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
+        self.unmap_phys_preserve_tables_if(virt, |_, _| true)
+    }
+
+    /// Conditional leaf clear under the caller's page-table edit lock.
+    /// The predicate must only inspect the supplied values: no allocation,
+    /// blocking or lock acquisition is permitted inside this callback.
+    pub(crate) unsafe fn unmap_phys_preserve_tables_if(
+        &self,
+        virt: VirtAddr,
+        predicate: impl FnOnce(PhysAddr, EntryFlags<Arch>) -> bool,
+    ) -> Option<(PhysAddr, EntryFlags<Arch>, PageFlush<Arch>)> {
         if !virt.check_aligned(Arch::PAGE_SIZE) {
             error!("Try to unmap unaligned page: virt={:?}", virt);
             return None;
@@ -1958,13 +4352,13 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
             if entry.empty() {
                 return None;
             }
-
+            let address = entry.address().ok()?;
+            let flags = entry.flags();
+            if !predicate(address, flags) {
+                return None;
+            }
             p1.set_entry(i, PageEntry::from_usize(0));
-            Some((
-                entry.address().ok()?,
-                entry.flags(),
-                PageFlush::<Arch>::new(virt),
-            ))
+            Some((address, flags, PageFlush::<Arch>::new(virt)))
         })
         .flatten()
     }
@@ -2007,6 +4401,8 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
     unmap_parents: bool,
     allocator: &mut impl FrameAllocator,
     freed_tables: &mut bool,
+    mut user_tables: Option<&mut HashMap<PhysAddr, Box<UserTableFrame>>>,
+    detached: &mut DetachedUserTables,
 ) -> Option<(PhysAddr, EntryFlags<Arch>)> {
     // 获取页表项的索引
     let i = table.index_of(vaddr)?;
@@ -2020,7 +4416,15 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
 
     let subtable = table.next_level_table(i)?;
     // 递归地取消映射
-    let result = unmap_phys_inner(vaddr, &subtable, unmap_parents, allocator, freed_tables)?;
+    let result = unmap_phys_inner(
+        vaddr,
+        &subtable,
+        unmap_parents,
+        allocator,
+        freed_tables,
+        user_tables.as_deref_mut(),
+        detached,
+    )?;
 
     // TODO: This is a bad idea for architectures where the kernel mappings are done in the process tables,
     // as these mappings may become out of sync
@@ -2035,7 +4439,14 @@ unsafe fn unmap_phys_inner<Arch: MemoryManagementArch>(
             // 如果没有，就取消子页表的映射
             table.set_entry(i, PageEntry::from_usize(0));
             // 释放子页表
-            allocator.free_one(subtable.phys());
+            if let Some(tables) = user_tables {
+                let receipt = tables
+                    .remove(&subtable.phys())
+                    .expect("owned user table missing unique frame receipt");
+                detached.push(receipt);
+            } else {
+                allocator.free_one(subtable.phys());
+            }
             // Mark: intermediate page-table pages were freed; upper layer needs a heavier shootdown for this mm (`freed_tables`).
             *freed_tables = true;
         }
@@ -2059,9 +4470,9 @@ pub trait Flusher<Arch: MemoryManagementArch> {
     fn consume(&mut self, flush: PageFlush<Arch>);
 }
 
-/// 用于刷新某个虚拟地址的刷新器。这个刷新器一经产生，就必须调用flush()方法，
-/// 否则会造成对页表的更改被忽略，这是不安全的
-#[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
+/// Invalidate one local TLB entry when explicitly flushed or dropped.
+/// `ignore()` transfers that responsibility to the caller's later barrier.
+#[must_use = "Flush, drop, or consume this token through a matching TLB barrier"]
 pub struct PageFlush<Arch: MemoryManagementArch> {
     virt: VirtAddr,
     phantom: PhantomData<Arch>,
@@ -2076,7 +4487,7 @@ impl<Arch: MemoryManagementArch> PageFlush<Arch> {
     }
 
     pub fn flush(self) {
-        unsafe { Arch::invalidate_page(self.virt) };
+        drop(self);
     }
 
     /// 忽略掉这个刷新器
@@ -2088,13 +4499,13 @@ impl<Arch: MemoryManagementArch> PageFlush<Arch> {
 impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
     fn drop(&mut self) {
         unsafe {
-            MMArch::invalidate_page(self.virt);
+            Arch::invalidate_page(self.virt);
         }
     }
 }
 
-/// A flusher for the entire page table. Once created, its `flush()` method must be called;
-/// otherwise, page table changes will be silently ignored, which is unsafe.
+/// Invalidate the entire local TLB when explicitly flushed or dropped.
+/// `ignore()` transfers that responsibility to the caller's later barrier.
 ///
 /// # Usage Constraints
 ///
@@ -2112,7 +4523,7 @@ impl<Arch: MemoryManagementArch> Drop for PageFlush<Arch> {
 ///
 /// [`MmuGather`]: crate::mm::mmu_gather::MmuGather
 /// [`AddressSpace::flush_tlb_range`]: crate::mm::ucontext::AddressSpace::flush_tlb_range
-#[must_use = "The flusher must call the 'flush()', or the changes to page table will be unsafely ignored."]
+#[must_use = "Flush, drop, or consume this token through a matching TLB barrier"]
 pub struct PageFlushAll<Arch: MemoryManagementArch> {
     phantom: PhantomData<fn() -> Arch>,
 }
@@ -2126,7 +4537,7 @@ impl<Arch: MemoryManagementArch> PageFlushAll<Arch> {
     }
 
     pub fn flush(self) {
-        unsafe { Arch::invalidate_all() };
+        drop(self);
     }
 
     /// 忽略掉这个刷新器

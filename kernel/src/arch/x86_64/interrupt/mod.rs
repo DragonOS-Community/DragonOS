@@ -16,12 +16,42 @@ use system_error::SystemError;
 use crate::{
     arch::CurrentIrqArch,
     exception::{InterruptArch, IrqFlags, IrqFlagsGuard, IrqNumber},
+    process::ProcessManager,
 };
 
 use super::{
     asm::irqflags::{local_irq_restore, local_irq_save},
     driver::apic::{lapic_vector::arch_early_irq_init, CurrentApic, LocalAPIC},
 };
+
+/// 中断独立栈（IST）。
+///
+/// Linux 用 IST 保证 `#DF`/NMI/MCE 等在任务栈不可用时仍有可用栈。
+/// DragonOS 的 `current_pcb()` 从“栈底 PCB 槽”取当前任务，因此 IST 栈上
+/// 不能调用任何依赖 `current_pcb()` 的设施——使用 IST 的处理函数必须走
+/// 零分配通道（`emergency_print_*`）并直接停机。
+pub mod ist {
+    use crate::mm::percpu::PerCpu;
+
+    /// 每个 CPU 的双重错误栈大小（Linux 用 4 页，这里取 16 KiB）。
+    const DOUBLE_FAULT_STACK_SIZE: usize = 0x4000;
+
+    #[repr(C, align(16))]
+    struct IstStack([u8; DOUBLE_FAULT_STACK_SIZE]);
+
+    static mut DOUBLE_FAULT_STACKS: [IstStack; PerCpu::MAX_CPU_NUM as usize] =
+        [const { IstStack([0; DOUBLE_FAULT_STACK_SIZE]) }; PerCpu::MAX_CPU_NUM as usize];
+
+    /// 返回该 CPU 双重错误 IST 栈的栈顶（16 字节对齐）。
+    pub fn double_fault_stack_top(cpu: u32) -> Option<u64> {
+        let cpu = usize::try_from(cpu).ok()?;
+        if cpu >= PerCpu::MAX_CPU_NUM as usize {
+            return None;
+        }
+        let base = unsafe { core::ptr::addr_of!(DOUBLE_FAULT_STACKS[cpu]) } as usize;
+        Some(((base + DOUBLE_FAULT_STACK_SIZE) & !0xf) as u64)
+    }
+}
 
 /// @brief 关闭中断
 #[inline]
@@ -176,6 +206,12 @@ impl TrapFrame {
         self.rax = value as u64;
     }
 
+    /// Reads the syscall return-value register (rax on x86_64).
+    #[inline]
+    pub fn get_syscall_return(&self) -> usize {
+        self.rax as usize
+    }
+
     /// 判断当前中断是否来自用户模式
     pub fn is_from_user(&self) -> bool {
         return (self.cs & 0x3) != 0;
@@ -227,6 +263,14 @@ impl TrapFrame {
         let val = self.rax as i32;
         SystemError::from_posix_errno(val)
     }
+
+    /// On x86_64, rax is both the syscall-number input and the return value
+    #[inline]
+    pub fn get_orig_syscall_nr(&self) -> i64 {
+        // Linux's syscall_get_nr() returns int: only the low 32 bits of
+        // orig_rax are meaningful, and comparisons use their sign extension.
+        (self.errcode as u32 as i32) as i64
+    }
 }
 
 impl ProbeArgs for TrapFrame {
@@ -242,14 +286,35 @@ impl ProbeArgs for TrapFrame {
     }
 }
 
+// uprobe's ProbeArgs has the same signature as kprobe's (a separate trait, low coupling); TrapFrame implements both,
+// so user-mode #BP/#DB dispatch can pass the same trapframe to uprobe's pre/post/event callback.
+impl uprobe::ProbeArgs for TrapFrame {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn break_address(&self) -> usize {
+        (self.rip - 1) as usize
+    }
+
+    fn debug_address(&self) -> usize {
+        self.rip as usize
+    }
+}
+
 impl crate::process::rseq::RseqTrapFrame for TrapFrame {
     #[inline]
-    fn rseq_ip(&self) -> usize {
-        self.rip as usize
+    fn rseq_effective_ip(&self) -> usize {
+        ProcessManager::current_pcb()
+            .uprobe
+            .active_probe_vaddr()
+            .unwrap_or(self.rip as usize)
     }
 
     #[inline]
-    fn set_rseq_ip(&mut self, ip: usize) {
+    fn redirect_rseq_ip(&mut self, ip: usize) {
+        // rseq owns the final redirect. Consume an active XOL first so its
+        // later #DB completion cannot restore return_addr over abort_ip.
+        crate::exception::uprobe::abort_current_xol(self);
         self.rip = ip as u64;
     }
 }

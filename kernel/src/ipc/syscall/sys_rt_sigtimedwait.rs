@@ -14,7 +14,9 @@ use crate::syscall::{
     table::{FormattedSyscallParam, Syscall},
     user_access::{UserBufferReader, UserBufferWriter},
 };
-use crate::time::{jiffies::NSEC_PER_JIFFY, timer::schedule_timeout, PosixTimeSpec};
+use crate::time::{
+    jiffies::NSEC_PER_JIFFY, timekeeping::monotonic_now, timer::schedule_timeout, PosixTimeSpec,
+};
 use alloc::vec::Vec;
 use core::mem::size_of;
 use syscall_table_macros::declare_syscall;
@@ -64,10 +66,22 @@ pub fn do_kernel_rt_sigtimedwait(
         sigset_val
     };
 
-    // 构造等待/屏蔽语义：与Linux一致
-    // - 等待集合 these
-    // - 临时屏蔽集合 = 旧blocked ∪ these（将这些信号作为masked的常规语义，但仍由本系统调用专门消费）
+    // Construct wait/block semantics: consistent with Linux.
+    // While waiting, temporarily remove awaited from blocked, and preserve the
+    // original mask in real_blocked.
     let awaited = these;
+
+    // Compute the timeout. Linux validates the timeout before modifying the
+    // temporary signal mask, to avoid leaking temporary mask state along
+    // EINVAL/EFAULT paths.
+    let deadline = if uts.is_null() {
+        None // infinite wait
+    } else {
+        let reader = UserBufferReader::new(uts, size_of::<PosixTimeSpec>(), from_user)?;
+        let timeout = reader.read_one_from_user::<PosixTimeSpec>(0)?;
+        let deadline = compute_deadline(timeout)?;
+        Some(deadline)
+    };
 
     // 快速路径：先尝试从队列中获取信号
     if let Some((sig, info)) = try_dequeue_signal(&awaited) {
@@ -78,24 +92,21 @@ pub fn do_kernel_rt_sigtimedwait(
         return Ok(sig as usize);
     }
 
+    if let Some(deadline) = deadline {
+        if is_timeout_expired(deadline) {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+    }
+
     // 设置新的信号掩码以准备睡眠，临时地解除对用户等待信号的阻塞，让信号到达时能正确唤醒睡眠中的进程
     let pcb = ProcessManager::current_pcb();
     let mut new_blocked = *pcb.sig_info_irqsave().sig_blocked();
     new_blocked.remove(awaited);
+    set_sigtimedwait_real_blocked();
     // 应用新掩码（内部会自动保存旧掩码到 saved_sigmask ，用于后续恢复）
     set_user_sigmask(&mut new_blocked);
     // 必须重新计算 pending，因为 blocked 变了，可能某些 pending 信号现在变得可见了
     pcb.recalc_sigpending();
-
-    // 计算超时时间
-    let deadline = if uts.is_null() {
-        None // 无限等待
-    } else {
-        let reader = UserBufferReader::new(uts, size_of::<PosixTimeSpec>(), from_user)?;
-        let timeout = reader.read_one_from_user::<PosixTimeSpec>(0)?;
-        let deadline = compute_deadline(*timeout)?;
-        Some(deadline)
-    };
 
     // 等待循环（prepare-to-wait 语义）
     let mut _loop_count = 0;
@@ -105,26 +116,20 @@ pub fn do_kernel_rt_sigtimedwait(
         // 第一步：准备进入可中断阻塞，先将当前线程标记为可中断阻塞，关闭中断，避免错过唤醒窗口
         let preempt_guard = PreemptGuard::new();
         // 第二步：在“已是可中断阻塞状态”下，重检是否已有目标信号，若有则不睡眠，恢复为 runnable 并返回
-        if has_pending_awaited_signal(&awaited) {
+        if let Some((sig, info)) = try_dequeue_signal(&awaited) {
             drop(preempt_guard);
-
-            if let Some((sig, info)) = try_dequeue_signal(&awaited) {
-                restore_saved_sigmask();
-                if !uinfo.is_null() {
-                    copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
-                }
-                return Ok(sig as usize);
+            restore_sigtimedwait_mask();
+            if !uinfo.is_null() {
+                copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
             }
-            // 有 pending 但未从 awaited 集取到（被其他信号打断）
-            restore_saved_sigmask();
-            return Err(SystemError::EINTR);
+            return Ok(sig as usize);
         }
 
         // 第三步：检查是否已超时；若已超时则不睡眠，恢复为 runnable 并返回超时
         if let Some(deadline) = deadline {
             if is_timeout_expired(deadline) {
                 drop(preempt_guard);
-                restore_saved_sigmask();
+                restore_sigtimedwait_mask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
         }
@@ -132,105 +137,96 @@ pub fn do_kernel_rt_sigtimedwait(
         // 第四步：检查是否有其他未屏蔽的待处理信号打断，若被其他信号唤醒了，必须返回 EINTR 让内核去处理那个信号
         pcb.recalc_sigpending();
         if pcb.has_pending_signal_fast() {
-            drop(preempt_guard);
-            restore_saved_sigmask();
-            return Err(SystemError::EINTR);
+            // An awaited signal can arrive after the first dequeue. Linux
+            // gives it priority over unrelated interruptions, including when
+            // the shared queue's earlier snapshot was consumed by a sibling.
+            if let Some((sig, info)) = try_dequeue_signal(&awaited) {
+                drop(preempt_guard);
+                restore_sigtimedwait_mask();
+                if !uinfo.is_null() {
+                    copy_posix_siginfo_to_user(uinfo, &info, from_user)?;
+                }
+                return Ok(sig as usize);
+            }
+            if has_other_unblocked_signal(&awaited) {
+                drop(preempt_guard);
+                restore_sigtimedwait_mask();
+                return Err(SystemError::EINTR);
+            }
         }
 
         // 第五步：释放中断，然后真正进入调度睡眠（窗口期内，线程保持可中断阻塞，发送侧会唤醒）
         // 计算剩余等待时间
         let remaining_time = if let Some(deadline) = deadline {
-            let now = PosixTimeSpec::now();
-            let remaining = deadline.total_nanos() - now.total_nanos();
-            if remaining <= 0 {
+            let now = monotonic_now();
+            let remaining = deadline.to_ktime_ns().saturating_sub(now.to_ktime_ns());
+            if remaining == 0 {
                 drop(preempt_guard);
-                restore_saved_sigmask();
+                restore_sigtimedwait_mask();
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
-            remaining / (NSEC_PER_JIFFY as i64)
+            (remaining / NSEC_PER_JIFFY as u64).min(i64::MAX as u64) as i64
         } else {
             i64::MAX
         };
 
         drop(preempt_guard);
         if let Err(e) = schedule_timeout(remaining_time) {
-            restore_saved_sigmask();
+            restore_sigtimedwait_mask();
             return Err(e);
         }
         // 被唤醒后回到循环起点，继续重检条件
     }
 }
 
+fn set_sigtimedwait_real_blocked() {
+    let pcb = ProcessManager::current_pcb();
+    let mut siginfo = pcb.sig_info_mut();
+    let blocked = *siginfo.sig_blocked();
+    *siginfo.real_blocked_mut() = blocked;
+}
+
+fn restore_sigtimedwait_mask() {
+    restore_saved_sigmask();
+    let pcb = ProcessManager::current_pcb();
+    *pcb.sig_info_mut().real_blocked_mut() = SigSet::empty();
+}
+
 /// 尝试从信号队列中取出信号
 fn try_dequeue_signal(awaited: &SigSet) -> Option<(Signal, SigInfo)> {
-    let pcb = ProcessManager::current_pcb();
-    let _current_pid = pcb.raw_pid();
-
-    let mut siginfo_guard = pcb.sig_info_mut();
-    let pending = siginfo_guard.sig_pending_mut();
-
-    // 检查 per-thread pending
-    // 仅允许从 awaited 集合中取信号：将"忽略掩码"设为 !awaited
-    let ignore_mask = !*awaited;
-    if let (sig, Some(info)) = pending.dequeue_signal(&ignore_mask) {
-        if sig != Signal::INVALID {
-            drop(siginfo_guard);
-            // 消费信号后及时刷新 HAS_PENDING_SIGNAL 状态，避免后续等待路径误判
-            pcb.recalc_sigpending();
-            return Some((sig, info));
-        }
+    let (sig, info) = ProcessManager::current_pcb().dequeue_pending_signal(&!*awaited);
+    if sig == Signal::INVALID {
+        None
+    } else {
+        info.map(|info| (sig, info))
     }
-
-    drop(siginfo_guard);
-
-    // 检查 shared pending
-    let (sig, info) = pcb.sighand().shared_pending_dequeue(&ignore_mask);
-
-    if sig != Signal::INVALID {
-        if let Some(info) = info {
-            // 同步刷新 pending 标志，确保后续可中断等待依据最新状态
-            pcb.recalc_sigpending();
-            return Some((sig, info));
-        }
-    }
-
-    None
 }
 
 /// 检查是否有未屏蔽的待处理信号
-fn has_pending_awaited_signal(awaited: &SigSet) -> bool {
+fn has_other_unblocked_signal(awaited: &SigSet) -> bool {
     let pcb = ProcessManager::current_pcb();
-    let _current_pid = pcb.raw_pid();
     let siginfo_guard = pcb.sig_info_irqsave();
     let pending_set = siginfo_guard.sig_pending().signal();
+    let blocked = *siginfo_guard.sig_blocked();
     drop(siginfo_guard);
-
-    let shared_pending_set = pcb.sighand().shared_pending_signal();
-    let result = pending_set.union(shared_pending_set);
-    // 只看 awaited 与 pending 的交集
-    let intersection = result.intersection(*awaited);
-    let has = !intersection.is_empty();
-
-    has
+    let shared_pending_set = pcb.process_signal().shared_pending_signal();
+    !(pending_set.union(shared_pending_set) & !blocked & !*awaited).is_empty()
 }
 
 /// 计算超时截止时间
 fn compute_deadline(timeout: PosixTimeSpec) -> Result<PosixTimeSpec, SystemError> {
-    if timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1_000_000_000 {
+    if !timeout.is_valid_timeout() {
         return Err(SystemError::EINVAL);
     }
 
-    let now = PosixTimeSpec::now();
-    Ok(PosixTimeSpec {
-        tv_sec: now.tv_sec + timeout.tv_sec,
-        tv_nsec: now.tv_nsec + timeout.tv_nsec,
-    })
+    let now = monotonic_now();
+    Ok(now.saturating_add_ktime(&timeout))
 }
 
 /// 检查是否超时
 fn is_timeout_expired(deadline: PosixTimeSpec) -> bool {
-    let now = PosixTimeSpec::now();
-    now.total_nanos() >= deadline.total_nanos()
+    let now = monotonic_now();
+    now.to_ktime_ns() >= deadline.to_ktime_ns()
 }
 
 /// 将 PosixSigInfo 拷贝到用户空间

@@ -1,25 +1,24 @@
-# 目标架构配置
+# Target Architecture Configuration
 
-## 支持的架构
+## Supported Architectures
 
 - x86_64
 - riscv64
 
-## 架构相关配置
+## Architecture-Specific Configuration
 
-为了能支持vscode的调试功能，我们需要修改`.vscode/settings.json`文件的以下行：
+In order to support the debugging functionality of VSCode, we need to modify the following line in the `.vscode/settings.json` file:
 ```
     "rust-analyzer.cargo.target": "riscv64gc-unknown-none-elf",
     // "rust-analyzer.cargo.target": "x86_64-unknown-none",
 ```
 
-如果想要为x86_64架构编译，请启用x86_64那一行，注释掉其它的。
-如果想要为riscv64架构编译，请启用riscv64那一行，注释掉其它的。
+If you want to compile for the x86_64 architecture, enable the x86_64 line and comment out the others.
+If you want to compile for the riscv64 architecture, enable the riscv64 line and comment out the others.
 
+At the same time, we also need to modify the environment variable configuration in the makefile:
 
-同时，我们还需要修改makefile的环境变量配置：
-
-请修改`env.mk`文件的以下行：
+Please modify the following line in the `env.mk` file:
 ```Makefile
 ifeq ($(ARCH), )
 # ！！！！在这里设置ARCH，可选x86_64和riscv64
@@ -28,4 +27,4 @@ export ARCH=riscv64
 endif
 ```
 
-请注意，更换架构需要重新编译，因此请运行`make clean`清理编译结果。然后再运行`make run`即可。
+Please note that changing the architecture requires a recompilation, so please run `make clean` to clean up the compilation results. Then run `make run` to proceed.

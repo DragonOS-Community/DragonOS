@@ -1,9 +1,9 @@
 use system_error::SystemError;
 
 use crate::{
-    define_event_trace,
     filesystem::vfs::{fcntl::AtFlags, file::FileFlags, open::do_sys_open, MAX_PATHLEN},
     syscall::user_access::check_and_clone_cstr,
+    unsafe_define_event_trace,
 };
 
 use super::InodeMode;
@@ -24,12 +24,15 @@ pub(super) fn do_open(path: *const u8, o_flags: u32, mode: u32) -> Result<usize,
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
-    let open_flags: FileFlags = FileFlags::from_bits(o_flags).ok_or(SystemError::EINVAL)?;
+    // Linux语义(fs/open.c build_open_flags)：未定义的flag位被静默忽略而非报EINVAL
+    let open_flags: FileFlags = FileFlags::from_bits_truncate(o_flags);
     let mode = InodeMode::from_bits(mode).ok_or(SystemError::EINVAL)?;
     return do_sys_open(AtFlags::AT_FDCWD.bits(), &path, open_flags, mode);
 }
 
-define_event_trace!(
+// SAFETY: sys_enter_openat is emitted from syscall process context and is not
+// reachable from x86 NMI/MCE handlers.
+unsafe_define_event_trace!(
     sys_enter_openat,
     TP_system(syscalls),
     TP_PROTO(dfd: i32, path:*const u8, o_flags: u32, mode: u32),

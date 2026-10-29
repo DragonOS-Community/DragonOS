@@ -1,28 +1,53 @@
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{fasync::FAsyncItems, FilePrivateData, IndexNode, InodeId, PollableInode},
+        page_cache::PageCache,
+        vfs::{
+            fasync::FAsyncItems, FilePrivateData, FileSystem, IndexNode, InodeId, PollableInode,
+        },
     },
     libs::wait_queue::WaitQueue,
     net::{
         posix::{MsgHdr, SockAddr},
         socket::common::{EPollItems, ShutdownBit},
     },
+    process::namespace::net_namespace::NetNamespace,
 };
 // use crate::filesystem::epoll::event_poll::EventPoll;
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
+
+use crate::syscall::user_access::UserBufferReader;
 
 use super::{
     endpoint::Endpoint,
     posix::{PMSG, PSOL},
 };
 
+/// Layout information for mmap-backed sockets (e.g. AF_PACKET TPACKET rings).
+///
+/// Returned by [`Socket::mmap_layout`] to supply dynamic backing metadata.
+pub struct SocketMmapLayout {
+    /// Page cache backing the mapped pages.
+    pub page_cache: Arc<PageCache>,
+    /// Logical size of the mapped region in bytes (for `filemap_fault` bounds check).
+    pub size: usize,
+}
+
 /// # `Socket` methods
 /// ## Reference
-/// - [Posix standard](https://pubs.opengroup.org/onlinepubs/9699919799/)
+/// - [Posix standard](https://pubs.opengion.org/onlinepubs/9699919799/)
 pub trait Socket: PollableInode + IndexNode {
+    /// Network namespace captured when this socket was created.
+    ///
+    /// Generic socket ioctls must use this stable namespace rather than the
+    /// calling task's current namespace, matching Linux `sock_net(sk)`.
+    fn netns(&self) -> Arc<NetNamespace>;
+
+    /// Number of fsnotify marks attached to this anonymous socket inode.
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize;
+
     /// Open-file refcount for this socket.
     ///
     /// Each `File` that references this socket (including those received via SCM_RIGHTS)
@@ -36,6 +61,10 @@ pub trait Socket: PollableInode + IndexNode {
     fn wait_queue(&self) -> &WaitQueue;
 
     fn epoll_items(&self) -> &EPollItems;
+
+    /// Associate the open description supplying socket SIGURG ownership.
+    /// O_ASYNC subscriptions remain independent.
+    fn set_owner_file(&self, _file: alloc::sync::Weak<crate::filesystem::vfs::file::File>) {}
 
     /// Get the fasync items for async I/O notification
     fn fasync_items(&self) -> &FAsyncItems;
@@ -71,6 +100,27 @@ pub trait Socket: PollableInode + IndexNode {
     /// 对应于POSIX的bind函数，用于绑定到本机指定的端点
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError>;
 
+    /// Decode a user sockaddr with this protocol's address-family policy.
+    /// Existing protocols retain mapped-address normalization; protocols that
+    /// validate the original family can preserve it until their own boundary.
+    fn endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        crate::net::posix::SockAddr::to_endpoint(addr, len)
+    }
+
+    /// Bind may interpret a sockaddr differently from connect. Keep existing
+    /// protocol decoders by default, including overrides preserving mapped IPs.
+    fn bind_endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        self.endpoint_from_user(addr, len)
+    }
+
     /// # `close`
     /// 关闭socket
     fn do_close(&self) -> Result<(), SystemError>;
@@ -90,7 +140,7 @@ pub trait Socket: PollableInode + IndexNode {
     ///
     /// 默认行为是写回源地址（若调用者提供了 addr/addrlen）。stream socket（如 TCP）
     /// 应覆盖为 `Ignore` 以符合 Linux/gVisor 语义。
-    fn recvfrom_addr_behavior(&self) -> super::RecvFromAddrBehavior {
+    fn recvfrom_addr_behavior(&self, _flags: PMSG) -> super::RecvFromAddrBehavior {
         super::RecvFromAddrBehavior::Write
     }
 
@@ -148,8 +198,54 @@ pub trait Socket: PollableInode + IndexNode {
         address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError>;
 
-    /// # `recv_msg`
-    fn recv_msg(&self, msg: &mut MsgHdr, flags: PMSG) -> Result<usize, SystemError>;
+    /// Side-effect-free receive admission, before legacy buffer borrowing or
+    /// an adapter's normal-queue wait. Owners may reject flags or requests for
+    /// receive sources they do not implement; never select or consume data.
+    fn check_recv_flags(&self, _flags: PMSG) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Whether recvmmsg's initial timeout wait uses ordinary read readiness.
+    /// Owners of immediate special receive sources bypass that adapter wait;
+    /// their recvmsg implementation still decides errors and consumption.
+    fn recv_needs_pre_wait(&self, _flags: PMSG) -> bool {
+        true
+    }
+
+    /// Scalar userspace receive. Protocols with a protected receive engine
+    /// override this without ever borrowing a slice over userspace.
+    ///
+    /// The default preserves the legacy scalar path of the other families;
+    /// it does not provide fault protection. Only contiguous backing is valid.
+    fn recv_from_user_buffer(
+        &self,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        flags: PMSG,
+    ) -> Result<(usize, Endpoint), SystemError> {
+        self.check_recv_flags(flags)?;
+        let address = buffer.as_contiguous_address().ok_or(SystemError::EINVAL)?;
+        let bytes = if buffer.is_empty() {
+            &mut []
+        } else {
+            if address.data() == 0 {
+                return Err(SystemError::EFAULT);
+            }
+            // The syscall has checked the scalar address range. This adapter
+            // retains the pre-existing legacy access contract of these owners.
+            unsafe { core::slice::from_raw_parts_mut(address.data() as *mut u8, buffer.len()) }
+        };
+        self.recv_from(bytes, flags, None)
+    }
+
+    /// Receive using the syscall's validated iovec snapshot. Owners must not
+    /// reimport msg_iov: the borrowed snapshot stays alive across waiting and
+    /// error-queue processing, including message truncation and copy faults.
+    fn recv_msg(
+        &self,
+        msg: &mut MsgHdr,
+        flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
+    ) -> Result<usize, SystemError>;
 
     // select
     /// # `send`
@@ -160,6 +256,41 @@ pub trait Socket: PollableInode + IndexNode {
 
     /// # `send_to`
     fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError>;
+
+    /// Validate a send buffer length before copying the user payload.
+    ///
+    /// Message-oriented sockets should reject impossible message sizes here so
+    /// syscall code does not allocate a kernel buffer that the socket will later
+    /// reject as `EMSGSIZE`.
+    fn validate_send_buffer_len(
+        &self,
+        _len: usize,
+        _address: Option<&Endpoint>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Send directly from a validated user buffer.
+    ///
+    /// The default keeps message-oriented socket semantics by materializing the
+    /// whole message after socket-specific length validation. Stream sockets can
+    /// override this to copy and send bounded chunks.
+    fn send_user_buffer(
+        &self,
+        reader: &UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        self.validate_send_buffer_len(len, address.as_ref())?;
+
+        let data = copy_user_buffer_to_vec(reader, len)?;
+        if let Some(endpoint) = address {
+            self.send_to(&data, flags, endpoint)
+        } else {
+            self.send(&data, flags)
+        }
+    }
 
     /// # `set_option`
     /// Posix `setsockopt` ，设置socket选项
@@ -224,6 +355,33 @@ pub trait Socket: PollableInode + IndexNode {
     fn write(&self, buffer: &[u8]) -> Result<usize, SystemError> {
         self.send(buffer, PMSG::empty())
     }
+    /// Returns mmap layout for mmap-backed sockets.
+    ///
+    /// Default `None` — most sockets don't support mmap. AF_PACKET overrides this
+    /// to expose the TPACKET ring buffer to the page-fault path.
+    fn mmap_layout(&self) -> Option<SocketMmapLayout> {
+        None
+    }
+
+    /// Stable filesystem operations for mmap-backed socket inodes. Kept
+    /// separate from dynamic ring layout so fault dispatch does not lock the
+    /// ring writer or allocate a fresh ops object.
+    fn mmap_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        None
+    }
+
+    /// Validate an mmap request before the VMA is installed.
+    ///
+    /// Default implementation checks the bounds against `mmap_layout().size`.
+    /// AF_PACKET overrides this to enforce Linux's `offset == 0 && len == ring_size`
+    /// contract and track the VMA for teardown EBUSY accounting.
+    fn mmap_validate(&self, len: usize, offset: usize) -> Result<(), SystemError> {
+        let layout = self.mmap_layout().ok_or(SystemError::EINVAL)?;
+        if offset.checked_add(len).is_none_or(|end| end > layout.size) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn read_to_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
@@ -231,13 +389,115 @@ pub(crate) fn read_to_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
     user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
     kernel_buf_len: usize,
 ) -> Result<usize, SystemError> {
+    read_to_user_buffer_with(socket, user_buffer, kernel_buf_len, |scratch_len| {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            crate::mm::kernel_buffer::KernelBuffer::new_zeroed_recovering(scratch_len)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(scratch_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            buffer.resize(scratch_len, 0);
+            Ok(buffer)
+        }
+    })
+}
+
+fn read_to_user_buffer_with<S, B>(
+    socket: &S,
+    user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    kernel_buf_len: usize,
+    allocate: impl FnOnce(usize) -> Result<B, SystemError>,
+) -> Result<usize, SystemError>
+where
+    S: Socket + ?Sized,
+    B: core::ops::DerefMut<Target = [u8]>,
+{
     if user_buffer.is_empty() {
         return Ok(0);
     }
-
     let scratch_len = core::cmp::min(kernel_buf_len.max(1), user_buffer.len());
-    let mut kbuf = alloc::vec![0u8; scratch_len];
+    let mut kbuf = allocate(scratch_len)?;
     let n = socket.read(&mut kbuf)?;
     user_buffer.write_to_user(0, &kbuf[..n])?;
     Ok(n)
 }
+
+pub(crate) fn copy_user_buffer_to_vec(
+    reader: &UserBufferReader<'_>,
+    len: usize,
+) -> Result<Vec<u8>, SystemError> {
+    let mut data = Vec::new();
+    data.try_reserve(len).map_err(|_| SystemError::ENOMEM)?;
+    data.resize(len, 0);
+    reader.copy_from_user(&mut data, 0)?;
+    Ok(data)
+}
+
+pub(crate) fn send_user_buffer_via_kernel_buf<S: Socket + ?Sized>(
+    socket: &S,
+    reader: &UserBufferReader<'_>,
+    len: usize,
+    flags: PMSG,
+    address: Option<Endpoint>,
+    kernel_buf_len: usize,
+) -> Result<usize, SystemError> {
+    if len == 0 {
+        return if let Some(endpoint) = address {
+            socket.send_to(&[], flags, endpoint)
+        } else {
+            socket.send(&[], flags)
+        };
+    }
+
+    let scratch_len = core::cmp::min(kernel_buf_len.max(1), len);
+    let mut kbuf = Vec::new();
+    kbuf.try_reserve(scratch_len)
+        .map_err(|_| SystemError::ENOMEM)?;
+    kbuf.resize(scratch_len, 0);
+    let mut total_sent = 0usize;
+
+    while total_sent < len {
+        let want = core::cmp::min(kbuf.len(), len - total_sent);
+        if let Err(e) = reader.copy_from_user(&mut kbuf[..want], total_sent) {
+            return if total_sent == 0 {
+                Err(e)
+            } else {
+                Ok(total_sent)
+            };
+        }
+
+        let result = if let Some(endpoint) = address.as_ref() {
+            socket.send_to(&kbuf[..want], flags, endpoint.clone())
+        } else {
+            socket.send(&kbuf[..want], flags)
+        };
+
+        match result {
+            Ok(0) => return Ok(total_sent),
+            Ok(n) => {
+                total_sent = total_sent.saturating_add(n);
+                if n < want {
+                    return Ok(total_sent);
+                }
+            }
+            Err(e) => {
+                return if total_sent == 0 {
+                    Err(e)
+                } else {
+                    Ok(total_sent)
+                }
+            }
+        }
+    }
+
+    Ok(total_sent)
+}
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+mod scratch_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) use scratch_selftest::run as scratch_birth_selftest;

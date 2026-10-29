@@ -1,18 +1,26 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 mod bpf;
 mod kprobe;
+pub(crate) mod release;
 mod sys_perf_event_open;
 mod tracepoint;
+#[cfg(target_arch = "x86_64")]
+mod uprobe;
 mod util;
+
+pub(crate) use util::{PERF_TYPE_KPROBE, PERF_TYPE_UPROBE};
 
 use crate::arch::MMArch;
 use crate::bpf::prog::BpfProg;
-use crate::filesystem::epoll::event_poll::LockedEPItemLinkedList;
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
+use crate::filesystem::epoll::event_poll::EPollItemList;
 use crate::filesystem::epoll::{event_poll::EventPoll, EPollEventType, EPollItem};
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::{File, FileFlags};
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::{
-    FilePrivateData, FileSystem, FileType, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
+    FilePrivateData, FileSystem, FsInfo, IndexNode, Metadata, PollableInode, SuperBlock,
 };
 use crate::include::bindings::linux_bpf::{
     perf_event_attr, perf_event_sample_format, perf_sw_ids, perf_type_id,
@@ -44,6 +52,13 @@ use system_error::SystemError;
 type Result<T> = core::result::Result<T, SystemError>;
 
 pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNode {
+    /// Non-blocking final-close notification.
+    ///
+    /// `IndexNode::close()` can run in a context where sleeping teardown is
+    /// unsafe. Events that can still admit callbacks must close that admission
+    /// here. Implementations must be idempotent and allocation-free; resource
+    /// destruction remains in the sleepable `release()` hook.
+    fn begin_release(&self) {}
     /// Set the bpf program for the perf event
     fn set_bpf_prog(&self, _bpf_prog: Arc<File>) -> Result<()> {
         Err(SystemError::ENOSYS)
@@ -56,22 +71,82 @@ pub trait PerfEventOps: Send + Sync + Debug + CastFromSync + CastFrom + IndexNod
     fn disable(&self) -> Result<()> {
         Err(SystemError::ENOSYS)
     }
+    /// Reset the event's accumulated count without changing enable state.
+    fn reset(&self) -> Result<()> {
+        Err(SystemError::ENOSYS)
+    }
+    /// Read the event-specific perf counter payload.
+    fn read_event(&self, _len: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+    /// Sleepable final release. It is always run by the perf release worker,
+    /// never by `File::drop` or an event destructor.
+    fn release(&self) -> Result<()> {
+        match self.disable() {
+            Err(SystemError::ENOSYS) => Ok(()),
+            result => result,
+        }
+    }
     /// Whether the perf event is readable
     fn readable(&self) -> bool;
+
+    /// Internal size of the currently published mmap backing.
+    ///
+    /// This bounds generic filemap faults without changing the anonymous perf
+    /// inode's user-visible `st_size`.
+    fn mmap_size(&self) -> usize {
+        0
+    }
 }
 
 pub struct JITMem {
     virt_addr: VirtAddr,
+    page_count: PageFrameCount,
 }
 
 impl JITMem {
     pub fn new() -> Self {
-        let vaddr = unsafe {
-            let (paddr, _count) =
-                allocate_page_frames(PageFrameCount::new(1)).expect("JITMem alloc failed");
-            MMArch::phys_2_virt(paddr).unwrap()
+        let (paddr, page_count) =
+            unsafe { allocate_page_frames(PageFrameCount::new(1)) }.expect("JITMem alloc failed");
+        Self {
+            virt_addr: unsafe { MMArch::phys_2_virt(paddr) }.unwrap(),
+            page_count,
+        }
+    }
+
+    /// Allocate enough executable memory for rbpf's current x86_64 emitter.
+    ///
+    /// Each eBPF instruction expands to less than 128 bytes in that emitter;
+    /// the one-page minimum also covers its fixed prologue and epilogue. Keep
+    /// this bound here, next to the allocation, so a larger program cannot
+    /// reach rbpf's fixed-buffer assertion.
+    pub fn try_for_bpf_program(program_len: usize) -> Result<Self> {
+        const BPF_INSN_SIZE: usize = 8;
+        const MAX_JIT_BYTES_PER_INSN: usize = 128;
+
+        if program_len == 0 || !program_len.is_multiple_of(BPF_INSN_SIZE) {
+            return Err(SystemError::EINVAL);
+        }
+        let instruction_count = program_len / BPF_INSN_SIZE;
+        let required = instruction_count
+            .checked_mul(MAX_JIT_BYTES_PER_INSN)
+            .ok_or(SystemError::E2BIG)?
+            .max(MMArch::PAGE_SIZE);
+        let allocation_size = required
+            .checked_add(MMArch::PAGE_SIZE - 1)
+            .ok_or(SystemError::E2BIG)?
+            & !(MMArch::PAGE_SIZE - 1);
+        let requested = PageFrameCount::new(allocation_size / MMArch::PAGE_SIZE);
+        let (paddr, page_count) =
+            unsafe { allocate_page_frames(requested) }.ok_or(SystemError::ENOMEM)?;
+        let Some(virt_addr) = (unsafe { MMArch::phys_2_virt(paddr) }) else {
+            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), page_count) };
+            return Err(SystemError::ENOMEM);
         };
-        Self { virt_addr: vaddr }
+        Ok(Self {
+            virt_addr,
+            page_count,
+        })
     }
 }
 
@@ -81,7 +156,7 @@ impl Deref for JITMem {
     fn deref(&self) -> &Self::Target {
         unsafe {
             let ptr = self.virt_addr.as_ptr();
-            core::slice::from_raw_parts(ptr, 4096)
+            core::slice::from_raw_parts(ptr, self.page_count.bytes())
         }
     }
 }
@@ -90,7 +165,7 @@ impl DerefMut for JITMem {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
             let ptr = self.virt_addr.as_ptr();
-            core::slice::from_raw_parts_mut(ptr, 4096)
+            core::slice::from_raw_parts_mut(ptr, self.page_count.bytes())
         }
     }
 }
@@ -99,8 +174,7 @@ impl Drop for JITMem {
     fn drop(&mut self) {
         unsafe {
             let paddr = MMArch::virt_2_phys(self.virt_addr).expect("JITMem drop failed");
-            let count = PageFrameCount::new(1);
-            deallocate_page_frames(PhysPageFrame::new(paddr), count);
+            deallocate_page_frames(PhysPageFrame::new(paddr), self.page_count);
         }
     }
 }
@@ -132,15 +206,23 @@ impl BasicPerfEbpfCallBack {
         }
     }
 
-    pub fn call(&self, entry: &mut [u8]) {
+    pub fn call_with_result(&self, entry: &mut [u8]) -> Option<u64> {
         let res = if cfg!(target_arch = "x86_64") {
             unsafe { self.vm.execute_program_jit(entry) }
         } else {
             self.vm.execute_program(entry)
         };
-        if res.is_err() {
-            log::error!("kprobe callback error: {:?}", res);
+        match res {
+            Ok(value) => Some(value),
+            Err(err) => {
+                log::error!("perf BPF callback error: {:?}", err);
+                None
+            }
         }
+    }
+
+    pub fn call(&self, entry: &mut [u8]) {
+        let _ = self.call_with_result(entry);
     }
 }
 
@@ -158,21 +240,31 @@ impl Drop for BasicPerfEbpfCallBack {
 }
 
 #[derive(Debug)]
-pub struct PerfEventInode {
+pub(super) struct PerfEventCore {
     event: Box<dyn PerfEventOps>,
-    epitems: LockedEPItemLinkedList,
+}
+
+#[derive(Debug)]
+pub struct PerfEventInode {
+    core: Arc<PerfEventCore>,
+    release_node: crate::libs::spinlock::SpinLock<Option<Box<release::PerfReleaseNode>>>,
+    epitems: EPollItemList,
 }
 
 impl PerfEventInode {
     pub fn new(event: Box<dyn PerfEventOps>) -> Self {
+        let core = Arc::new(PerfEventCore { event });
         Self {
-            event,
-            epitems: LockedEPItemLinkedList::default(),
+            release_node: crate::libs::spinlock::SpinLock::new(Some(Box::new(
+                release::PerfReleaseNode::new(core.clone()),
+            ))),
+            core,
+            epitems: EPollItemList::default(),
         }
     }
     fn do_poll(&self) -> Result<usize> {
         let mut events = EPollEventType::empty();
-        if self.event.readable() {
+        if self.core.event.readable() {
             events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
         }
         return Ok(events.bits() as usize);
@@ -182,34 +274,62 @@ impl PerfEventInode {
         // 唤醒epoll中等待的进程
         EventPoll::wakeup_epoll(&self.epitems, pollflag)
     }
+
+    fn mmap_size(&self) -> usize {
+        self.core.event.mmap_size()
+    }
 }
 
 impl Deref for PerfEventInode {
     type Target = Box<dyn PerfEventOps>;
 
     fn deref(&self) -> &Self::Target {
-        &self.event
+        &self.core.event
     }
 }
 
 impl IndexNode for PerfEventInode {
-    fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
-        self.event.mmap(start, len, offset)
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
     }
-    fn open(&self, _data: MutexGuard<FilePrivateData>, _flags: &FileFlags) -> Result<()> {
-        Ok(())
+
+    fn supports_pread(&self) -> bool {
+        false
+    }
+
+    fn supports_pwrite(&self) -> bool {
+        false
+    }
+
+    fn mmap(&self, start: usize, len: usize, offset: usize) -> Result<()> {
+        self.core.event.mmap(start, len, offset)
+    }
+    fn open(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<()> {
+        let node = { self.release_node.lock_irqsave().take() };
+        if let Some(node) = node {
+            self.core.event.begin_release();
+            release::enqueue(node);
+        }
         Ok(())
     }
     fn read_at(
         &self,
         _offset: usize,
-        _len: usize,
-        _buf: &mut [u8],
+        len: usize,
+        buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        panic!("read_at not implemented for PerfEvent");
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            self.core.event.read_event(len, buf);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -218,21 +338,25 @@ impl IndexNode for PerfEventInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        panic!("write_at not implemented for PerfEvent");
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EINVAL);
+        result.map_err(Into::into)
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let meta = Metadata {
-            mode: InodeMode::from_bits_truncate(0o755),
-            file_type: FileType::File,
-            ..Default::default()
-        };
-        Ok(meta)
+        Ok(anon_inode_metadata(InodeMode::S_IRUSR | InodeMode::S_IWUSR))
     }
 
-    fn resize(&self, _len: usize) -> Result<()> {
-        Ok(())
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode
+    }
+
+    fn resize(
+        &self,
+        _len: usize,
+    ) -> core::result::Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn ioctl(
@@ -240,35 +364,41 @@ impl IndexNode for PerfEventInode {
         cmd: u32,
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize> {
-        let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
-        info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
-        match req {
-            PerfEventIoc::Enable => {
-                self.event.enable()?;
-                Ok(0)
+    ) -> core::result::Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let req = PerfEventIoc::from_u32(cmd).ok_or(SystemError::EINVAL)?;
+            info!("perf_event_ioctl: request: {:?}, arg: {}", req, data);
+            match req {
+                PerfEventIoc::Enable => {
+                    self.core.event.enable()?;
+                    Ok(0)
+                }
+                PerfEventIoc::Disable => {
+                    self.core.event.disable()?;
+                    Ok(0)
+                }
+                PerfEventIoc::Reset => {
+                    self.core.event.reset()?;
+                    Ok(0)
+                }
+                PerfEventIoc::SetBpf => {
+                    info!("perf_event_ioctl: PERF_EVENT_IOC_SET_BPF, arg: {}", data);
+                    let bpf_prog_fd = data;
+                    let fd_table = ProcessManager::current_pcb().fd_table();
+                    let file = fd_table
+                        .read()
+                        .get_file_by_fd(bpf_prog_fd as _)
+                        .ok_or(SystemError::EBADF)?;
+                    self.core.event.set_bpf_prog(file)?;
+                    Ok(0)
+                }
             }
-            PerfEventIoc::Disable => {
-                self.event.disable()?;
-                Ok(0)
-            }
-            PerfEventIoc::SetBpf => {
-                info!("perf_event_ioctl: PERF_EVENT_IOC_SET_BPF, arg: {}", data);
-                let bpf_prog_fd = data;
-                let fd_table = ProcessManager::current_pcb().fd_table();
-                let file = fd_table
-                    .read()
-                    .get_file_by_fd(bpf_prog_fd as _)
-                    .ok_or(SystemError::EBADF)?;
-                self.event.set_bpf_prog(file)?;
-                Ok(0)
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        // panic!("PerfEvent does not have a filesystem")
-        Arc::new(PerfFakeFs)
+        PERF_FS.clone()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -280,7 +410,7 @@ impl IndexNode for PerfEventInode {
     }
 
     fn page_cache(&self) -> Option<Arc<PageCache>> {
-        self.event.page_cache()
+        self.core.event.page_cache()
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode> {
@@ -288,7 +418,7 @@ impl IndexNode for PerfEventInode {
     }
 
     fn absolute_path(&self) -> core::result::Result<String, SystemError> {
-        Ok(String::from("perf_event"))
+        Ok(anon_inode_path("[perf_event]"))
     }
 }
 
@@ -298,7 +428,7 @@ impl PollableInode for PerfEventInode {
     }
 
     fn add_epitem(&self, epitem: Arc<EPollItem>, _private_data: &FilePrivateData) -> Result<()> {
-        self.epitems.lock().push_back(epitem);
+        self.epitems.add(epitem);
         Ok(())
     }
 
@@ -307,26 +437,32 @@ impl PollableInode for PerfEventInode {
         epitem: &Arc<EPollItem>,
         _private_data: &FilePrivateData,
     ) -> Result<()> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
+        self.epitems.remove(epitem)
     }
 }
 
+lazy_static! {
+    static ref PERF_FS: Arc<PerfFakeFs> = Arc::new(PerfFakeFs);
+}
+
+/// Perf keeps a specialised page-fault policy for mmap buffers. It shares
+/// anon_inodefs' observable metadata, but not its generic fault operations.
 #[derive(Debug)]
 struct PerfFakeFs;
 
 impl FileSystem for PerfFakeFs {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
-        panic!("PerfFakeFs does not have a root inode")
+        AnonInodeFs::instance().root_inode()
     }
 
     fn info(&self) -> FsInfo {
-        panic!("PerfFakeFs does not have a filesystem info")
+        AnonInodeFs::instance().info()
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -334,16 +470,30 @@ impl FileSystem for PerfFakeFs {
     }
 
     fn name(&self) -> &str {
-        "perf"
+        "anon_inode"
     }
 
     fn super_block(&self) -> SuperBlock {
-        panic!("PerfFakeFs does not have a super block")
+        AnonInodeFs::instance().super_block()
     }
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
-        let res = PageFaultHandler::filemap_fault(pfm);
-        res
+        let inode_ref = {
+            let vma = pfm.vma();
+            let guard = vma.lock();
+            let file = guard.vm_file().expect("perf VMA has no file");
+            file.inode()
+        };
+        let Some(inode) = inode_ref.downcast_ref::<PerfEventInode>() else {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        };
+        let stable_size = inode.mmap_size();
+        PageFaultHandler::filemap_fault_with_stable_size(pfm, stable_size)
     }
+
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        VmFaultReason::empty()
+    }
+
     unsafe fn map_pages(
         &self,
         pfm: &mut PageFaultMessage,
@@ -359,9 +509,29 @@ pub fn perf_event_open(
     pid: i32,
     cpu: i32,
     group_fd: i32,
-    flags: u32,
+    flags: usize,
 ) -> Result<usize> {
+    // Linux validates perfmon capability before dereferencing dynamic probe
+    // names. Besides matching errno precedence, this prevents an unauthorized
+    // caller from forcing an arbitrary user-memory scan through config1.
+    if (attr.type_ == PERF_TYPE_KPROBE || attr.type_ == PERF_TYPE_UPROBE)
+        && !crate::process::cred::perfmon_capable()
+    {
+        return Err(SystemError::EACCES);
+    }
     let args = PerfProbeArgs::try_from(attr, pid, cpu, group_fd, flags)?;
+    #[cfg(target_arch = "x86_64")]
+    if args.type_ == PERF_TYPE_UPROBE {
+        uprobe::validate_perf_event_attr(attr)?;
+    }
+    if args.type_ == PERF_TYPE_KPROBE || args.type_ == PERF_TYPE_UPROBE {
+        let unsupported = PerfEventOpenFlags::PERF_FLAG_FD_NO_GROUP
+            | PerfEventOpenFlags::PERF_FLAG_FD_OUTPUT
+            | PerfEventOpenFlags::PERF_FLAG_PID_CGROUP;
+        if args.group_fd != -1 || args.flags.intersects(unsupported) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+    }
     log::info!("perf_event_process: {:#?}", args);
     let file_mode = if args
         .flags
@@ -372,15 +542,27 @@ pub fn perf_event_open(
         FileFlags::O_RDWR
     };
     let cloexec = file_mode.contains(FileFlags::O_CLOEXEC);
+    let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
 
     let event: Box<dyn PerfEventOps> = match args.type_ {
-        // Kprobe
-        // See /sys/bus/event_source/devices/kprobe/type
-        perf_type_id::PERF_TYPE_MAX => {
+        // Dynamic software PMUs are routed solely by their sysfs-advertised
+        // type. Probe names and paths are data, never dispatch metadata.
+        PERF_TYPE_KPROBE => {
             let kprobe_event = kprobe::perf_event_open_kprobe(args);
             Box::new(kprobe_event)
         }
-        perf_type_id::PERF_TYPE_SOFTWARE => {
+        PERF_TYPE_UPROBE => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let uprobe_event = uprobe::perf_event_open_uprobe(args)?;
+                Box::new(uprobe_event)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return Err(SystemError::ENOSYS);
+            }
+        }
+        ty if ty == perf_type_id::PERF_TYPE_SOFTWARE as u32 => {
             // For bpf prog output
             assert_eq!(
                 args.config,
@@ -393,13 +575,11 @@ pub fn perf_event_open(
             let bpf_event = bpf::perf_event_open_bpf(args);
             Box::new(bpf_event)
         }
-        perf_type_id::PERF_TYPE_TRACEPOINT => {
+        ty if ty == perf_type_id::PERF_TYPE_TRACEPOINT as u32 => {
             let tracepoint_event = tracepoint::perf_event_open_tracepoint(args)?;
             Box::new(tracepoint_event)
         }
-        _ => {
-            unimplemented!("perf_event_process: unknown type: {:?}", args);
-        }
+        _ => return Err(SystemError::ENOENT),
     };
 
     let page_cache = event.page_cache();
@@ -407,12 +587,19 @@ pub fn perf_event_open(
     if let Some(cache) = page_cache {
         cache.set_inode(Arc::downgrade(&(perf_event.clone() as _)))?;
     }
-    let file = File::new(perf_event, file_mode)?;
-    let fd_table = ProcessManager::current_pcb().fd_table();
-    let fd = fd_table
-        .write()
-        .alloc_fd(file, None, cloexec)
-        .map(|x| x as usize)?;
+    let file = File::new_prepared_recovering(perf_event, file_mode, storage)?;
+    let current = ProcessManager::current_pcb();
+    let fd_table = current.fd_table();
+    let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+    let fd = File::recover_io(|| {
+        fd_table.alloc_fd_arc(
+            file.clone(),
+            cloexec,
+            current.nofile_soft_limit(),
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })
+    .map(|x| x as usize)?;
     Ok(fd)
 }
 

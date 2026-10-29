@@ -1,0 +1,1242 @@
+#include <gtest/gtest.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "cap_common.h"
+
+namespace {
+
+constexpr const char* kOomScoreAdjPath = "/proc/self/oom_score_adj";
+constexpr const char* kOomFaultInjectPath = "/proc/sys/vm/oom_fault_inject";
+constexpr size_t kCloneStackSize = 64 * 1024;
+constexpr size_t kPageSize = 4096;
+constexpr size_t kBigPages = 16384;
+constexpr int kWaitVictimPolls = 200;
+constexpr useconds_t kWaitVictimPollUs = 10000;
+
+int write_oom_score_adj_errno(int score) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d\n", score);
+    if (len <= 0 || len >= static_cast<int>(sizeof(buf))) {
+        return EINVAL;
+    }
+
+    int fd = open(kOomScoreAdjPath, O_WRONLY);
+    if (fd < 0) {
+        return errno;
+    }
+
+    errno = 0;
+    ssize_t written = write(fd, buf, len);
+    int saved_errno = errno;
+    close(fd);
+    if (written < 0) {
+        return saved_errno;
+    }
+    if (written != len) {
+        return EIO;
+    }
+    return 0;
+}
+
+int read_oom_score_adj(int* out) {
+    char buf[32] = {};
+    int fd = open(kOomScoreAdjPath, O_RDONLY);
+    if (fd < 0) {
+        return errno;
+    }
+
+    errno = 0;
+    ssize_t nread = read(fd, buf, sizeof(buf) - 1);
+    int saved_errno = errno;
+    close(fd);
+    if (nread < 0) {
+        return saved_errno;
+    }
+    char* end = nullptr;
+    long value = strtol(buf, &end, 10);
+    if (end == buf) {
+        return EINVAL;
+    }
+    *out = static_cast<int>(value);
+    return 0;
+}
+
+int check_oom_score_adj_text_write(const char* text, size_t len, off_t offset,
+                                   ssize_t expected_written, int expected_errno,
+                                   int expected_score) {
+    int fd = open(kOomScoreAdjPath, O_RDWR);
+    if (fd < 0) {
+        return 1;
+    }
+    if (lseek(fd, offset, SEEK_SET) != offset) {
+        close(fd);
+        return 2;
+    }
+    errno = 0;
+    ssize_t written = write(fd, text, len);
+    int write_errno = errno;
+    close(fd);
+    if (written != expected_written || (written < 0 && write_errno != expected_errno)) {
+        fprintf(stderr, "oom_score_adj write: len=%zu offset=%lld got=%zd errno=%d, expected=%zd errno=%d\n",
+                len, static_cast<long long>(offset), written, write_errno, expected_written,
+                expected_errno);
+        return 3;
+    }
+    int score = 0;
+    if (read_oom_score_adj(&score) != 0 || score != expected_score) {
+        fprintf(stderr, "oom_score_adj readback: got=%d expected=%d\n", score, expected_score);
+        return 4;
+    }
+    return 0;
+}
+
+int child_oom_score_adj_text_parsing() {
+    if (write_oom_score_adj_errno(0) != 0) {
+        return 1;
+    }
+    const char nul_terminated[] = {'0', '\0'};
+    const char nul_with_tail[] = {'0', '\0', 'x', static_cast<char>(0xff)};
+    const char long_nul_with_tail[] = "0\0abcdefghijklm";
+    struct Case {
+        const char* text;
+        size_t len;
+        off_t offset;
+        ssize_t written;
+        int error;
+        int score;
+    };
+    const Case cases[] = {
+        {"0", 1, 0, 1, 0, 0},
+        {nul_terminated, sizeof(nul_terminated), 0, 2, 0, 0},
+        {nul_with_tail, sizeof(nul_with_tail), 0, 4, 0, 0},
+        {" \t0 \n", 5, 0, 5, 0, 0},
+        {"0xA", 3, 0, 3, 0, 10},
+        {"010", 3, 0, 3, 0, 8},
+        {"+0", 2, 0, 2, 0, 0},
+        {"0", 1, 1, 1, 0, 0},
+        {long_nul_with_tail, sizeof(long_nul_with_tail) - 1, 0, 12, 0, 0},
+        {"08", 2, 0, -1, EINVAL, 0},
+        {"0x", 2, 0, -1, EINVAL, 0},
+        {"1001", 4, 0, -1, EINVAL, 0},
+        {"2147483648", 10, 0, -1, ERANGE, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const Case& test = cases[i];
+        if (check_oom_score_adj_text_write(test.text, test.len, test.offset, test.written,
+                                           test.error, test.score) != 0) {
+            fprintf(stderr, "oom_score_adj text case %zu failed\n", i);
+            return 2;
+        }
+    }
+    return 0;
+}
+
+int drop_all_caps() {
+    cap_user_data_t zeros[2];
+    fill_caps_v3(0, 0, 0, zeros);
+    return capset_errno(_LINUX_CAPABILITY_VERSION_3, 0, zeros);
+}
+
+int expect_current_score(int expected) {
+    int value = 0;
+    int err = read_oom_score_adj(&value);
+    if (err != 0) {
+        return 10 + err;
+    }
+    return value == expected ? 0 : 20;
+}
+
+int write_exact(int fd, const void* buf, size_t len) {
+    const char* cursor = static_cast<const char*>(buf);
+    while (len > 0) {
+        ssize_t written = write(fd, cursor, len);
+        if (written < 0) {
+            return errno;
+        }
+        if (written == 0) {
+            return EIO;
+        }
+        cursor += written;
+        len -= static_cast<size_t>(written);
+    }
+    return 0;
+}
+
+int read_exact(int fd, void* buf, size_t len) {
+    char* cursor = static_cast<char*>(buf);
+    while (len > 0) {
+        ssize_t nread = read(fd, cursor, len);
+        if (nread < 0) {
+            return errno;
+        }
+        if (nread == 0) {
+            return EPIPE;
+        }
+        cursor += nread;
+        len -= static_cast<size_t>(nread);
+    }
+    return 0;
+}
+
+int write_oom_fault_inject(pid_t tgid, unsigned long fail_after, unsigned long fail_times) {
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf), "%d %lu %lu\n", tgid, fail_after, fail_times);
+    if (len <= 0 || len >= static_cast<int>(sizeof(buf))) {
+        return EINVAL;
+    }
+
+    int fd = open(kOomFaultInjectPath, O_WRONLY);
+    if (fd < 0) {
+        return errno;
+    }
+
+    errno = 0;
+    ssize_t written = write(fd, buf, len);
+    int saved_errno = errno;
+    close(fd);
+    if (written < 0) {
+        return saved_errno;
+    }
+    return written == len ? 0 : EIO;
+}
+
+void cleanup_oom_fault_inject() {
+    (void)write_oom_fault_inject(0, 0, 0);
+}
+
+struct OomFaultInjectGuard {
+    OomFaultInjectGuard() { cleanup_oom_fault_inject(); }
+    ~OomFaultInjectGuard() { cleanup_oom_fault_inject(); }
+};
+
+int read_vmstat_value(const char* name, long* value) {
+    FILE* fp = fopen("/proc/vmstat", "r");
+    if (fp == nullptr) {
+        return errno;
+    }
+
+    char key[64];
+    long val = 0;
+    while (fscanf(fp, "%63s %ld", key, &val) == 2) {
+        if (strcmp(key, name) == 0) {
+            fclose(fp);
+            *value = val;
+            return 0;
+        }
+    }
+
+    fclose(fp);
+    return ENOENT;
+}
+
+void* fault_one_page() {
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(
+        mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) {
+        return nullptr;
+    }
+
+    p[0] = 0x5a;
+    return const_cast<uint8_t*>(p);
+}
+
+void* map_and_touch_pages(size_t pages) {
+    size_t len = pages * kPageSize;
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(
+        mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    for (size_t i = 0; i < len; i += kPageSize) {
+        p[i] = static_cast<uint8_t>(i / kPageSize);
+    }
+    return const_cast<uint8_t*>(p);
+}
+
+void trigger_selfkill_child_main() {
+    if (write_oom_score_adj_errno(1000) != 0) {
+        _exit(2);
+    }
+    if (map_and_touch_pages(kBigPages) == MAP_FAILED) {
+        _exit(2);
+    }
+    if (write_oom_fault_inject(getpid(), 0, 1) != 0) {
+        _exit(2);
+    }
+
+    (void)fault_one_page();
+    _exit(3);
+}
+
+void victim_child_main(int ready_write) {
+    if (write_oom_score_adj_errno(1000) != 0) {
+        _exit(2);
+    }
+    if (map_and_touch_pages(kBigPages) == MAP_FAILED) {
+        _exit(2);
+    }
+    char byte = 'x';
+    if (write_exact(ready_write, &byte, 1) != 0) {
+        _exit(2);
+    }
+    close(ready_write);
+    for (;;) {
+        pause();
+    }
+}
+
+void trigger_retry_child_main() {
+    if (write_oom_fault_inject(getpid(), 0, 1) != 0) {
+        _exit(2);
+    }
+
+    void* p = fault_one_page();
+    if (p == nullptr) {
+        _exit(3);
+    }
+    memset(p, 0xa5, kPageSize);
+    _exit(0);
+}
+
+void expect_child_success(int (*child_fn)(), const char* name) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << name << ": fork failed: errno=" << errno << " (" << strerror(errno)
+                        << ")";
+    if (child == 0) {
+        _exit(child_fn());
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0))
+        << name << ": waitpid failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(WIFEXITED(status)) << name << ": child did not exit normally, status=0x"
+                                   << std::hex << status;
+    EXPECT_EQ(0, WEXITSTATUS(status)) << name << ": child exit status=0x" << std::hex
+                                      << WEXITSTATUS(status);
+}
+
+void expect_child_sigkill(void (*child_fn)(), const char* name) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << name << ": fork failed: errno=" << errno << " (" << strerror(errno)
+                        << ")";
+    if (child == 0) {
+        child_fn();
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0))
+        << name << ": waitpid failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(WIFSIGNALED(status)) << name << ": child did not die by signal, status=0x"
+                                    << std::hex << status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(status)) << name << ": unexpected signal";
+}
+
+bool wait_for_sigkill_with_timeout(pid_t pid, int* status) {
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        pid_t waited = waitpid(pid, status, WNOHANG);
+        if (waited == pid) {
+            return true;
+        }
+        if (waited < 0) {
+            return false;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return false;
+}
+
+int child_unprivileged_can_raise_negative_oom_score_adj() {
+    if (write_oom_score_adj_errno(-1000) != 0) {
+        return 1;
+    }
+    if (drop_all_caps() != 0) {
+        return 2;
+    }
+    if (write_oom_score_adj_errno(-500) != 0) {
+        return 3;
+    }
+    return expect_current_score(-500);
+}
+
+int child_unprivileged_cannot_lower_below_min() {
+    if (write_oom_score_adj_errno(-500) != 0) {
+        return 1;
+    }
+    if (drop_all_caps() != 0) {
+        return 2;
+    }
+    if (write_oom_score_adj_errno(-1000) != EACCES) {
+        return 3;
+    }
+    return expect_current_score(-500);
+}
+
+int child_capable_write_updates_min() {
+    if (write_oom_score_adj_errno(-200) != 0) {
+        return 1;
+    }
+    if (drop_all_caps() != 0) {
+        return 2;
+    }
+    if (write_oom_score_adj_errno(-300) != EACCES) {
+        return 3;
+    }
+    return expect_current_score(-200);
+}
+
+int child_default_unprivileged_cannot_set_negative_oom_score_adj() {
+    if (expect_current_score(0) != 0) {
+        return 1;
+    }
+    if (drop_all_caps() != 0) {
+        return 2;
+    }
+    if (write_oom_score_adj_errno(-1) != EACCES) {
+        return 3;
+    }
+    return expect_current_score(0);
+}
+
+struct ThreadForkOomArgs {
+    int ready_write;
+    int go_read;
+    int result;
+};
+
+void* thread_fork_oom_score_adj_child(void* arg) {
+    auto* args = static_cast<ThreadForkOomArgs*>(arg);
+    char byte = 'x';
+    args->result = write_exact(args->ready_write, &byte, 1);
+    if (args->result != 0) {
+        return nullptr;
+    }
+    args->result = read_exact(args->go_read, &byte, 1);
+    if (args->result != 0) {
+        return nullptr;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        args->result = 100 + errno;
+        return nullptr;
+    }
+    if (child == 0) {
+        _exit(expect_current_score(-700));
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        args->result = 200 + errno;
+        return nullptr;
+    }
+    if (!WIFEXITED(status)) {
+        args->result = 300;
+        return nullptr;
+    }
+    args->result = WEXITSTATUS(status);
+    return nullptr;
+}
+
+int child_non_leader_fork_copies_leader_oom_score_adj() {
+    int ready_pipe[2] = {-1, -1};
+    int go_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0) {
+        return 1;
+    }
+    if (pipe(go_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return 2;
+    }
+
+    ThreadForkOomArgs args = {};
+    args.ready_write = ready_pipe[1];
+    args.go_read = go_pipe[0];
+    pthread_t thread = {};
+    int rc = pthread_create(&thread, nullptr, thread_fork_oom_score_adj_child, &args);
+    if (rc != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(go_pipe[0]);
+        close(go_pipe[1]);
+        return 10 + rc;
+    }
+
+    char byte = 0;
+    int err = read_exact(ready_pipe[0], &byte, 1);
+    if (err == 0) {
+        err = write_oom_score_adj_errno(-700);
+    }
+    if (err == 0) {
+        err = write_exact(go_pipe[1], &byte, 1);
+    }
+
+    void* thread_ret = nullptr;
+    int join_err = pthread_join(thread, &thread_ret);
+    close(ready_pipe[0]);
+    close(ready_pipe[1]);
+    close(go_pipe[0]);
+    close(go_pipe[1]);
+    if (err != 0) {
+        return 400 + err;
+    }
+    if (join_err != 0) {
+        return 500 + join_err;
+    }
+    return args.result;
+}
+
+int child_vfork_write_does_not_propagate_to_parent() {
+    pid_t child = vfork();
+    if (child < 0) {
+        return 1;
+    }
+    if (child == 0) {
+        int err = write_oom_score_adj_errno(-600);
+        _exit(err == 0 ? 0 : 10 + err);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        return 100 + errno;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return 200;
+    }
+    return expect_current_score(0);
+}
+
+struct CloneVmOomArgs {
+    int go_read;
+};
+
+int clone_vm_oom_child(void* arg) {
+    auto* args = static_cast<CloneVmOomArgs*>(arg);
+    char byte = 0;
+    int err = read_exact(args->go_read, &byte, 1);
+    if (err != 0) {
+        _exit(10 + err);
+    }
+    _exit(expect_current_score(-400));
+}
+
+int child_clone_vm_process_receives_shared_mm_oom_score_adj_update() {
+    int go_pipe[2] = {-1, -1};
+    if (pipe(go_pipe) != 0) {
+        return 1;
+    }
+
+    void* stack = malloc(kCloneStackSize);
+    if (stack == nullptr) {
+        close(go_pipe[0]);
+        close(go_pipe[1]);
+        return 2;
+    }
+
+    CloneVmOomArgs args = {};
+    args.go_read = go_pipe[0];
+    auto* stack_top = static_cast<char*>(stack) + kCloneStackSize;
+    pid_t child = clone(clone_vm_oom_child, stack_top, CLONE_VM | SIGCHLD, &args);
+    if (child < 0) {
+        int err = errno;
+        free(stack);
+        close(go_pipe[0]);
+        close(go_pipe[1]);
+        return 10 + err;
+    }
+
+    int err = write_oom_score_adj_errno(-400);
+    char byte = 'x';
+    if (err == 0) {
+        err = write_exact(go_pipe[1], &byte, 1);
+    }
+
+    int status = 0;
+    int wait_err = 0;
+    if (waitpid(child, &status, 0) != child) {
+        wait_err = errno;
+    }
+    free(stack);
+    close(go_pipe[0]);
+    close(go_pipe[1]);
+    if (err != 0) {
+        return 100 + err;
+    }
+    if (wait_err != 0) {
+        return 200 + wait_err;
+    }
+    if (!WIFEXITED(status)) {
+        return 300;
+    }
+    return WEXITSTATUS(status);
+}
+
+}  // namespace
+
+TEST(OomScoreAdj, UnprivilegedCanRaiseNegativeOomScoreAdj) {
+    expect_child_success(child_unprivileged_can_raise_negative_oom_score_adj,
+                         "UnprivilegedCanRaiseNegativeOomScoreAdj");
+}
+
+TEST(OomScoreAdj, LinuxTextWriteParsing) {
+    expect_child_success(child_oom_score_adj_text_parsing, "LinuxTextWriteParsing");
+}
+
+TEST(OomScoreAdj, UnprivilegedCannotLowerBelowMin) {
+    expect_child_success(child_unprivileged_cannot_lower_below_min,
+                         "UnprivilegedCannotLowerBelowMin");
+}
+
+TEST(OomScoreAdj, CapableWriteUpdatesMin) {
+    expect_child_success(child_capable_write_updates_min, "CapableWriteUpdatesMin");
+}
+
+TEST(OomScoreAdj, DefaultUnprivilegedCannotSetNegativeOomScoreAdj) {
+    expect_child_success(child_default_unprivileged_cannot_set_negative_oom_score_adj,
+                         "DefaultUnprivilegedCannotSetNegativeOomScoreAdj");
+}
+
+TEST(OomScoreAdj, NonLeaderForkCopiesLeaderOomScoreAdj) {
+    expect_child_success(child_non_leader_fork_copies_leader_oom_score_adj,
+                         "NonLeaderForkCopiesLeaderOomScoreAdj");
+}
+
+TEST(OomScoreAdj, VforkWriteDoesNotPropagateToParent) {
+    expect_child_success(child_vfork_write_does_not_propagate_to_parent,
+                         "VforkWriteDoesNotPropagateToParent");
+}
+
+TEST(OomScoreAdj, CloneVmProcessReceivesSharedMmOomScoreAdjUpdate) {
+    expect_child_success(child_clone_vm_process_receives_shared_mm_oom_score_adj_update,
+                         "CloneVmProcessReceivesSharedMmOomScoreAdjUpdate");
+}
+
+TEST(OomKiller, FaultInjectKillsCurrentVictim) {
+    OomFaultInjectGuard guard;
+    expect_child_sigkill(trigger_selfkill_child_main, "FaultInjectKillsCurrentVictim");
+}
+
+TEST(OomKiller, VmstatOomKillCounterIncreases) {
+    OomFaultInjectGuard guard;
+    long before = 0;
+    ASSERT_EQ(0, read_vmstat_value("oom_kill", &before));
+
+    expect_child_sigkill(trigger_selfkill_child_main, "VmstatOomKillCounterIncreases");
+
+    long after = 0;
+    ASSERT_EQ(0, read_vmstat_value("oom_kill", &after));
+    EXPECT_GT(after, before);
+}
+
+TEST(OomKiller, OtherProcessVictimAllowsTriggerRetry) {
+    OomFaultInjectGuard guard;
+    int ready_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe));
+
+    pid_t victim = fork();
+    ASSERT_GE(victim, 0) << "fork victim failed: errno=" << errno << " (" << strerror(errno)
+                         << ")";
+    if (victim == 0) {
+        close(ready_pipe[0]);
+        victim_child_main(ready_pipe[1]);
+    }
+    close(ready_pipe[1]);
+
+    char ready_byte = 0;
+    int ready_err = read_exact(ready_pipe[0], &ready_byte, 1);
+    close(ready_pipe[0]);
+    if (ready_err != 0) {
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        ASSERT_EQ(0, ready_err) << "victim ready failed: errno=" << ready_err << " ("
+                                << strerror(ready_err) << ")";
+    }
+
+    pid_t trigger = fork();
+    if (trigger < 0) {
+        int saved_errno = errno;
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        ASSERT_GE(trigger, 0) << "fork trigger failed: errno=" << saved_errno << " ("
+                              << strerror(saved_errno) << ")";
+    }
+    if (trigger == 0) {
+        trigger_retry_child_main();
+    }
+
+    int trigger_status = 0;
+    pid_t waited = waitpid(trigger, &trigger_status, 0);
+    if (waited != trigger) {
+        int saved_errno = errno;
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        ASSERT_EQ(trigger, waited) << "waitpid trigger failed: errno=" << saved_errno << " ("
+                                   << strerror(saved_errno) << ")";
+    }
+    if (!WIFEXITED(trigger_status) || WEXITSTATUS(trigger_status) != 0) {
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+    }
+    ASSERT_TRUE(WIFEXITED(trigger_status))
+        << "trigger should exit normally, status=0x" << std::hex << trigger_status;
+    ASSERT_EQ(0, WEXITSTATUS(trigger_status));
+
+    int victim_status = 0;
+    if (!wait_for_sigkill_with_timeout(victim, &victim_status)) {
+        kill(victim, SIGKILL);
+        waitpid(victim, nullptr, 0);
+        FAIL() << "victim was not OOM-killed within timeout";
+    }
+    ASSERT_TRUE(WIFSIGNALED(victim_status))
+        << "victim should die by signal, status=0x" << std::hex << victim_status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(victim_status));
+}
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
+
+namespace {
+
+// Exceed three 256-leaf scan windows and the 32-page retirement window,
+// and necessarily span a 2 MiB page-table boundary before injection starts.
+constexpr size_t kHeapDenialResidentPages = 3 * 256 + 513;
+
+int read_heap_denial_config(bool* supported, unsigned long long* rejections) {
+    *supported = false;
+    int fd = open(kOomFaultInjectPath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == ENOENT ? 0 : errno;
+    }
+    char buffer[512];
+    ssize_t count;
+    do {
+        count = read(fd, buffer, sizeof(buffer) - 1);
+    } while (count < 0 && errno == EINTR);
+    int error = count < 0 ? errno : 0;
+    close(fd);
+    if (error != 0) {
+        return error;
+    }
+    if (count == static_cast<ssize_t>(sizeof(buffer) - 1)) {
+        return EOVERFLOW;
+    }
+    buffer[count] = 0;
+    const char* support = strstr(buffer, "heap_denial_supported=");
+    if (support == nullptr) {
+        return 0;
+    }
+    if (strncmp(support, "heap_denial_supported=1 ", strlen("heap_denial_supported=1 ")) != 0) {
+        return EINVAL;
+    }
+    const char* field = strstr(buffer, "heap_rejections=");
+    if (field == nullptr) {
+        return EINVAL;
+    }
+    field += strlen("heap_rejections=");
+    if (*field < '0' || *field > '9') {
+        return EINVAL;
+    }
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long value = strtoull(field, &end, 10);
+    if (errno != 0 || (*end != '\n' && *end != ' ' && *end != '\0')) {
+        return EINVAL;
+    }
+    *supported = true;
+    *rejections = value;
+    return 0;
+}
+
+int inject_heap_denial(pid_t target) {
+    char text[96];
+    int len = snprintf(text, sizeof(text), "%d 0 1 1\n", target);
+    if (len <= 0 || len >= static_cast<int>(sizeof(text))) {
+        return EINVAL;
+    }
+    int fd = open(kOomFaultInjectPath, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno;
+    }
+    int error = write_exact(fd, text, static_cast<size_t>(len));
+    close(fd);
+    return error;
+}
+
+class HeapDenialParentProtection {
+public:
+    int Protect() {
+        int error = read_oom_score_adj(&previous_);
+        if (error != 0) {
+            return error;
+        }
+        error = write_oom_score_adj_errno(-1000);
+        if (error != 0) {
+            return error;
+        }
+        restore_ = true;
+        return expect_current_score(-1000);
+    }
+    ~HeapDenialParentProtection() {
+        if (restore_) {
+            int error = write_oom_score_adj_errno(previous_);
+            EXPECT_EQ(0, error) << "restore parent oom_score_adj";
+            if (error == 0) {
+                EXPECT_EQ(0, expect_current_score(previous_));
+            }
+        }
+    }
+private:
+    int previous_ = 0;
+    bool restore_ = false;
+};
+
+// Own only this test's unreaped child. Cleanup never turns its forced SIGKILL
+// into evidence that the normal OOM transaction succeeded.
+class HeapDenialChild {
+public:
+    explicit HeapDenialChild(pid_t pid) : pid_(pid) {}
+    pid_t Poll(int* status) {
+        pid_t result = waitpid(pid_, status, WNOHANG);
+        if (result == pid_ || (result < 0 && errno == ECHILD)) {
+            pid_ = -1;
+        }
+        return result;
+    }
+    bool Wait(int* status) {
+        if (!wait_for_sigkill_with_timeout(pid_, status)) {
+            return false;
+        }
+        pid_ = -1;
+        return true;
+    }
+    ~HeapDenialChild() {
+        if (pid_ > 0) {
+            (void)kill(pid_, SIGKILL);
+            int status = 0;
+            (void)Wait(&status);
+        }
+    }
+private:
+    pid_t pid_;
+};
+
+int wait_heap_victim_ready(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return errno;
+    }
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        char byte = 0;
+        ssize_t count = read(fd, &byte, 1);
+        if (count == 1) {
+            return byte == 'r' ? 0 : EINVAL;
+        }
+        if (count == 0) {
+            return EPIPE;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return errno;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+void heap_denial_selfkill() {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0 ||
+        map_and_touch_pages(kHeapDenialResidentPages) == MAP_FAILED ||
+        inject_heap_denial(getpid()) != 0) {
+        _exit(2);
+    }
+    (void)fault_one_page();
+    _exit(3);
+}
+
+void heap_denial_victim(int ready) {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0 ||
+        map_and_touch_pages(kHeapDenialResidentPages) == MAP_FAILED ||
+        write_exact(ready, "r", 1) != 0) {
+        _exit(2);
+    }
+    close(ready);
+    for (;;) {
+        pause();
+    }
+}
+
+void heap_denial_retry() {
+    if (expect_current_score(-1000) != 0 || inject_heap_denial(getpid()) != 0) {
+        _exit(2);
+    }
+    auto* page = static_cast<volatile uint8_t*>(fault_one_page());
+    if (page == nullptr) {
+        _exit(3);
+    }
+    page[0] = 0xa5;
+    page[kPageSize - 1] = 0x6c;
+    _exit(page[0] == 0xa5 && page[kPageSize - 1] == 0x6c ? 0 : 4);
+}
+
+}  // namespace
+
+TEST(OomKiller, HeapDenialSelfVictimRetiresLargeAddressSpace) {
+    bool supported = false;
+    unsigned long long before = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &before));
+    if (!supported) {
+        GTEST_SKIP() << "requires mm_selftest heap-denial fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        heap_denial_selfkill();
+    }
+    HeapDenialChild child(pid);
+    int status = 0;
+    ASSERT_TRUE(child.Wait(&status)) << "self victim did not finish real MM teardown";
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+    unsigned long long after = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &after));
+    ASSERT_TRUE(supported);
+    ASSERT_GE(after, before);
+    EXPECT_GE(after - before, 2ULL) << "GlobalAlloc and alloc_zeroed must both return null";
+}
+
+TEST(OomKiller, HeapDenialOtherVictimAllowsProtectedTriggerRetry) {
+    bool supported = false;
+    unsigned long long before = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &before));
+    if (!supported) {
+        GTEST_SKIP() << "requires mm_selftest heap-denial fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    int ready[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    pid_t victim_pid = fork();
+    if (victim_pid < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        FAIL() << "fork victim failed: " << errno;
+    }
+    if (victim_pid == 0) {
+        close(ready[0]);
+        heap_denial_victim(ready[1]);
+    }
+    HeapDenialChild victim(victim_pid);
+    close(ready[1]);
+    int ready_error = wait_heap_victim_ready(ready[0]);
+    close(ready[0]);
+    ASSERT_EQ(0, ready_error) << "victim must have resident pages before injection";
+    pid_t trigger_pid = fork();
+    ASSERT_GE(trigger_pid, 0);
+    if (trigger_pid == 0) {
+        heap_denial_retry();
+    }
+    HeapDenialChild trigger(trigger_pid);
+    int trigger_status = 0;
+    ASSERT_TRUE(trigger.Wait(&trigger_status)) << "protected OOM trigger failed to recover";
+    ASSERT_TRUE(WIFEXITED(trigger_status));
+    EXPECT_EQ(0, WEXITSTATUS(trigger_status));
+    int victim_status = 0;
+    ASSERT_TRUE(victim.Wait(&victim_status)) << "committed victim did not finish MM teardown";
+    ASSERT_TRUE(WIFSIGNALED(victim_status));
+    EXPECT_EQ(SIGKILL, WTERMSIG(victim_status));
+    unsigned long long after = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &after));
+    ASSERT_TRUE(supported);
+    ASSERT_GE(after, before);
+    EXPECT_GE(after - before, 2ULL) << "page-fault injection alone cannot satisfy this test";
+}
+
+
+namespace {
+
+struct HeapDenialThreadReady {
+    pid_t tid;
+    int prepared;
+};
+
+void* heap_denial_resident_worker(void* argument) {
+    int ready_fd = *static_cast<int*>(argument);
+    HeapDenialThreadReady ready = {};
+    ready.tid = static_cast<pid_t>(syscall(SYS_gettid));
+    ready.prepared = map_and_touch_pages(kHeapDenialResidentPages) != MAP_FAILED;
+    if (write_exact(ready_fd, &ready, sizeof(ready)) != 0) {
+        _exit(2);
+    }
+    close(ready_fd);
+    if (!ready.prepared) {
+        _exit(2);
+    }
+    for (;;) {
+        pause();
+    }
+}
+
+int wait_heap_thread_ready(int fd, HeapDenialThreadReady* ready) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return errno;
+    }
+    size_t received = 0;
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        ssize_t count = read(fd, reinterpret_cast<char*>(ready) + received,
+                             sizeof(*ready) - received);
+        if (count > 0) {
+            received += static_cast<size_t>(count);
+            if (received == sizeof(*ready)) {
+                return ready->prepared == 1 && ready->tid > 0 ? 0 : EINVAL;
+            }
+        } else if (count == 0) {
+            return EPIPE;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return errno;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+int wait_heap_thread_sleeping(pid_t tid) {
+    char path[96];
+    int length = snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    if (length <= 0 || length >= static_cast<int>(sizeof(path))) {
+        return EINVAL;
+    }
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return errno;
+        }
+        char buffer[512];
+        ssize_t count;
+        do {
+            count = read(fd, buffer, sizeof(buffer) - 1);
+        } while (count < 0 && errno == EINTR);
+        int error = count < 0 ? errno : 0;
+        close(fd);
+        if (error != 0) {
+            return error;
+        }
+        if (count == static_cast<ssize_t>(sizeof(buffer) - 1)) {
+            return EOVERFLOW;
+        }
+        buffer[count] = 0;
+        const char* end_comm = strrchr(buffer, ')');
+        if (end_comm == nullptr || end_comm[1] != ' ' || end_comm[2] == 0) {
+            return EINVAL;
+        }
+        if (end_comm[2] == 'S') {
+            return 0;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+void heap_denial_multithread_selfkill() {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0) {
+        _exit(2);
+    }
+    int ready[2] = {-1, -1};
+    if (pipe(ready) != 0) {
+        _exit(2);
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, heap_denial_resident_worker, &ready[1]) != 0) {
+        _exit(2);
+    }
+    // Threads share descriptors: only the worker closes its write end.
+    HeapDenialThreadReady worker = {};
+    int error = wait_heap_thread_ready(ready[0], &worker);
+    close(ready[0]);
+    if (error != 0 || wait_heap_thread_sleeping(worker.tid) != 0 ||
+        inject_heap_denial(getpid()) != 0) {
+        _exit(2);
+    }
+    (void)fault_one_page();
+    _exit(3);
+}
+
+}  // namespace
+
+TEST(OomKiller, HeapDenialMultithreadSelfVictimWakesSleepingWorker) {
+    bool supported = false;
+    unsigned long long before = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &before));
+    if (!supported) {
+        GTEST_SKIP() << "requires mm_selftest heap-denial fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        heap_denial_multithread_selfkill();
+    }
+    HeapDenialChild child(pid);
+    int status = 0;
+    ASSERT_TRUE(child.Wait(&status)) << "OOM must terminate the real sleeping thread group";
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+    unsigned long long after = 0;
+    ASSERT_EQ(0, read_heap_denial_config(&supported, &after));
+    ASSERT_TRUE(supported);
+    ASSERT_GE(after, before);
+    EXPECT_GE(after - before, 2ULL);
+}
+
+namespace {
+
+struct OomExitedLeaderWorker {
+    int ready_fd;
+    int go_fd;
+};
+
+int wait_oom_leader_zombie() {
+    char path[96];
+    int length = snprintf(path, sizeof(path), "/proc/%d/stat", getpid());
+    if (length <= 0 || length >= static_cast<int>(sizeof(path))) {
+        return EINVAL;
+    }
+    for (int i = 0; i < kWaitVictimPolls; ++i) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return errno;
+        }
+        char buffer[512];
+        ssize_t count;
+        do {
+            count = read(fd, buffer, sizeof(buffer) - 1);
+        } while (count < 0 && errno == EINTR);
+        int error = count < 0 ? errno : 0;
+        close(fd);
+        if (error != 0) {
+            return error;
+        }
+        if (count == static_cast<ssize_t>(sizeof(buffer) - 1)) {
+            return EOVERFLOW;
+        }
+        buffer[count] = 0;
+        const char* end_comm = strrchr(buffer, ')');
+        if (end_comm == nullptr || end_comm[1] != ' ' || end_comm[2] == 0) {
+            return EINVAL;
+        }
+        if (end_comm[2] == 'Z') {
+            return 0;
+        }
+        usleep(kWaitVictimPollUs);
+    }
+    return ETIMEDOUT;
+}
+
+void* oom_live_worker_after_leader_exit(void* argument) {
+    // The raw-exited leader's user stack remains mapped while this MM is live;
+    // copy the fixed fd values now rather than borrowing its stack afterwards.
+    const auto args = *static_cast<OomExitedLeaderWorker*>(argument);
+    if (map_and_touch_pages(kHeapDenialResidentPages) == MAP_FAILED ||
+        wait_oom_leader_zombie() != 0 || write_exact(args.ready_fd, "r", 1) != 0) {
+        _exit(2);
+    }
+    close(args.ready_fd);
+    char go = 0;
+    if (read_exact(args.go_fd, &go, 1) != 0 || go != 'g' ||
+        write_oom_fault_inject(getpid(), 0, 1) != 0) {
+        _exit(2);
+    }
+    close(args.go_fd);
+    (void)fault_one_page();
+    _exit(3);
+}
+
+void oom_leader_exits_leaving_worker(int ready_fd, int go_fd) {
+    if (write_oom_score_adj_errno(1000) != 0 || expect_current_score(1000) != 0) {
+        _exit(2);
+    }
+    OomExitedLeaderWorker args = {ready_fd, go_fd};
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, oom_live_worker_after_leader_exit, &args) != 0) {
+        _exit(2);
+    }
+    // libc _exit is exit_group. Only this raw syscall leaves a live worker.
+    syscall(SYS_exit, 0);
+    _exit(2);
+}
+
+}  // namespace
+
+TEST(OomKiller, LiveWorkerAfterLeaderExitRemainsEligible) {
+    if (access(kOomFaultInjectPath, F_OK) != 0 && errno == ENOENT) {
+        GTEST_SKIP() << "requires DragonOS OOM fault injection";
+    }
+    OomFaultInjectGuard injection;
+    HeapDenialParentProtection protection;
+    ASSERT_EQ(0, protection.Protect());
+    int ready[2] = {-1, -1};
+    int go[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready));
+    if (pipe(go) != 0) {
+        int error = errno;
+        close(ready[0]);
+        close(ready[1]);
+        FAIL() << "create worker gate: " << error;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        int error = errno;
+        close(ready[0]);
+        close(ready[1]);
+        close(go[0]);
+        close(go[1]);
+        FAIL() << "fork live-worker group: " << error;
+    }
+    if (pid == 0) {
+        close(ready[0]);
+        close(go[1]);
+        oom_leader_exits_leaving_worker(ready[1], go[0]);
+    }
+    HeapDenialChild child(pid);
+    close(ready[1]);
+    close(go[0]);
+    int ready_error = wait_heap_victim_ready(ready[0]);
+    close(ready[0]);
+    if (ready_error != 0) {
+        close(go[1]);
+        FAIL() << "worker must observe resident MM and Zombie leader: " << ready_error;
+    }
+    int status = 0;
+    pid_t early = child.Poll(&status);
+    if (early != 0) {
+        close(go[1]);
+        FAIL() << "a Zombie leader with a live worker must not be reaped: " << early;
+    }
+    int go_error = write_exact(go[1], "g", 1);
+    close(go[1]);
+    ASSERT_EQ(0, go_error);
+    ASSERT_TRUE(child.Wait(&status)) << "live worker was not OOM-selected after leader exit";
+    ASSERT_TRUE(WIFSIGNALED(status)) << "group SIGKILL must override the leader's earlier exit(0)";
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+}

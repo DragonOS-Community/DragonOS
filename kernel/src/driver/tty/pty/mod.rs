@@ -10,7 +10,7 @@ use crate::{
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 
-use self::unix98pty::{Unix98PtyDriverInner, NR_UNIX98_PTY_MAX};
+use self::unix98pty::{pty_drain_workqueue_init, Unix98PtyDriverInner, NR_UNIX98_PTY_MAX};
 
 use super::{
     termios::{ControlMode, InputMode, LocalMode, OutputMode, TTY_STD_TERMIOS},
@@ -98,6 +98,13 @@ impl PtyCommon {
                 return Err(SystemError::EIO);
             }
 
+            if core.driver().tty_driver_sub_type() == TtyDriverSubType::PtySlave
+                && link_core.count() != 1
+            {
+                core.flags_write().insert(TtyFlag::IO_ERROR);
+                return Err(SystemError::EIO);
+            }
+
             core.flags_write().remove(TtyFlag::IO_ERROR);
             link_core.flags_write().remove(TtyFlag::OTHER_CLOSED);
             core.flags_write().insert(TtyFlag::THROTTLED);
@@ -111,7 +118,7 @@ impl PtyCommon {
         let user_reader =
             UserBufferReader::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
 
-        if *user_reader.read_one_from_user::<i32>(0)? != 0 {
+        if user_reader.read_one_from_user::<i32>(0)? != 0 {
             tty.flags_write().insert(TtyFlag::PTY_LOCK);
         } else {
             tty.flags_write().remove(TtyFlag::PTY_LOCK);
@@ -121,18 +128,20 @@ impl PtyCommon {
     }
 
     pub fn pty_get_lock(tty: &TtyCoreData, arg: VirtAddr) -> Result<(), SystemError> {
+        let locked = tty.flags().contains(TtyFlag::PTY_LOCK) as i32;
         let mut user_writer =
             UserBufferWriter::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-        user_writer.copy_one_to_user(&tty.flags().contains(TtyFlag::PTY_LOCK), 0)?;
+        user_writer.copy_one_to_user(&locked, 0)?;
         Ok(())
     }
 
     pub fn pty_set_packet_mode(tty: &TtyCoreData, arg: VirtAddr) -> Result<(), SystemError> {
         let user_reader =
             UserBufferReader::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
+        let packet_enabled = user_reader.read_one_from_user::<i32>(0)? != 0;
 
         let mut ctrl = tty.contorl_info_irqsave();
-        if *user_reader.read_one_from_user::<i32>(0)? != 0 {
+        if packet_enabled {
             if !ctrl.packet {
                 tty.link().unwrap().core().contorl_info_irqsave().pktstatus =
                     TtyPacketStatus::empty();
@@ -145,9 +154,10 @@ impl PtyCommon {
     }
 
     pub fn pty_get_packet_mode(tty: &TtyCoreData, arg: VirtAddr) -> Result<(), SystemError> {
+        let packet = tty.contorl_info_irqsave().packet as i32;
         let mut user_writer =
             UserBufferWriter::new(arg.as_ptr::<i32>(), core::mem::size_of::<i32>(), true)?;
-        user_writer.copy_one_to_user(&tty.contorl_info_irqsave().packet, 0)?;
+        user_writer.copy_one_to_user(&packet, 0)?;
         Ok(())
     }
 
@@ -167,6 +177,7 @@ impl PtyCommon {
 #[unified_init(INITCALL_DEVICE)]
 #[inline(never)]
 pub fn pty_init() -> Result<(), SystemError> {
+    pty_drain_workqueue_init();
     let mut ptm_driver = TtyDriver::new(
         NR_UNIX98_PTY_MAX,
         "ptm",
@@ -201,10 +212,7 @@ pub fn pty_init() -> Result<(), SystemError> {
     );
     pts_driver.set_subtype(TtyDriverSubType::PtySlave);
     let term = pts_driver.init_termios_mut();
-    term.input_mode = InputMode::empty();
-    term.output_mode = OutputMode::empty();
     term.control_mode = ControlMode::B38400 | ControlMode::CS8 | ControlMode::CREAD;
-    term.local_mode = LocalMode::empty();
     term.input_speed = 38400;
     term.output_speed = 38400;
     PTS_DRIVER.init(TtyDriverManager::tty_register_driver(pts_driver).unwrap());

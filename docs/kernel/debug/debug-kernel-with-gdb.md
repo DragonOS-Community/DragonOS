@@ -1,43 +1,43 @@
+# How to Use GDB to Debug the Kernel
 
-# 如何使用GDB调试内核
+## Introduction
+GDB is a powerful open-source debugging tool that can help you better diagnose and fix errors in programs.
 
-## 前言
-&emsp;&emsp;GDB是一个功能强大的开源调试工具，能够帮助您更好的诊断和修复程序中的错误。
+It provides a rich set of features that allow you to check the execution status of a program, track the execution flow of code, view and modify the values of variables, analyze memory states, and more. It can be used in conjunction with a compiler to allow you to access debugging information during the debugging process.
 
-&emsp;&emsp;它提供了一套丰富的功能，使您能够检查程序的执行状态、跟踪代码的执行流程、查看和修改变量的值、分析内存状态等。它可以与编译器配合使用，以便您在调试过程中访问程序的调试信息。
+This tutorial will guide you on how to use `rust-gdb` to debug the kernel in DragonOS, including how to start debugging and the corresponding debugging commands.
 
-&emsp;&emsp;此教程将告诉您如何在DragonOS中使用`rust-gdb`来调试内核，包括如何开始调试以及相应的调试命令。
-
-:::{note}
-如果您已经熟悉了`rust-gdb`的各种命令，那您只需要阅读此教程的第一部分即可。
+::: info
+If you are already familiar with the various commands of `rust-gdb`, you only need to read the first part of this tutorial.
 :::
 
+
 ---
-## 1.从何开始
+## 1. Getting Started
 
-### 1.1 准备工作
+### 1.1 Preparation
 
-&emsp;&emsp;在您开始调试内核之前，需要在/Kernel/Cargo.toml中开启调试模式，将Cargo.toml中的`debug = false`更改为`debug = true`。
+Before you start debugging the kernel, you need to enable debug mode in /Kernel/Cargo.toml by changing `debug = false` to `debug = true` in the Cargo.toml file.
 
 ```shell
 debug = false
 ```
-&emsp;&emsp;**更改为**
+**Change to**
 ```shell
 debug = true
 ```
 
-### 1.2 运行DragonOS
+### 1.2 Running DragonOS
 
-&emsp;&emsp;准备工作完成后，您就可以编译、运行DragonOS来开展后续的调试工作了。
+After the preparation is complete, you can compile and run DragonOS to proceed with the subsequent debugging work.
 
-&emsp;&emsp;在DragonOS根目录中开启终端，使用`make run`即可开始编译运行DragonOS,如需更多编译命令方面的帮助，详见
-> [构建DragonOS](https://docs.dragonos.org/zh_CN/latest/introduction/build_system.html)。
+Open a terminal in the root directory of DragonOS and use `make run` to start compiling and running DragonOS. For more help with compilation commands, see
+> [Building DragonOS](/introduction/build_system.html).
 
-### 1.3 运行GDB
-&emsp;&emsp;当DragonOS开始运行后，您就可以启动GDB开始调试了。
+### 1.3 Running GDB
+Once DragonOS has started running, you can start debugging with GDB.
 
-&emsp;&emsp;**您只需要开启一个新的终端，运行`make gdb`即可运行GDB调试器。**
+**You only need to open a new terminal and run `make gdb` to start the GDB debugger.**
 
 ```shell
 ❯ make gdb
@@ -58,17 +58,18 @@ Find the GDB manual and other documentation resources online at:
 --Type <RET> for more, q to quit, c to continue without paging--
 ```
 
-:::{note}
-若出现以上信息，输入c再回车即可。
+::: info
+If you see the above information, input `c` and press Enter.
 :::
+
 
 ---
 
-## 2.调试
+## 2. Debugging
 
-### 2.1 开始
+### 2.1 Start
 
-&emsp;&emsp;当以上步骤完成后，就已经可以开始调试了。
+After completing the above steps, you can start debugging.
 
 ```shell
 For help, type "help".
@@ -79,11 +80,12 @@ determining executable automatically.  Try using the "file" command.
 (gdb)
 ```
 
-:::{note}
-GDB输出的信息中`0xffff8000001f8f63 in ?? ()`表明DragonOS还在引导加载的过程中。
+::: info
+The output information from GDB, `0xffff8000001f8f63 in ?? ()`, indicates that DragonOS is still in the process of booting.
 :::
 
-&emsp;&emsp;**输入`continue`或者`c`，程序将继续执行。**
+
+**Input `continue` or `c` to continue the program execution.**
 
 ```shell
 For help, type "help".
@@ -95,7 +97,7 @@ determining executable automatically.  Try using the "file" command.
 Continuing.
 ```
 
-&emsp;&emsp;在DragonOS运行时，您可以随时按下`Ctrl+C`来发送中断信息。来查看内核当前状态。
+While DragonOS is running, you can press `Ctrl+C` at any time to send an interrupt signal to view the current state of the kernel.
 
 ```shell
 (gdb) continue
@@ -107,15 +109,15 @@ Thread 1 received signal SIGINT, Interrupt.
 (gdb) 
 ```
 
-### 2.2 设置断点和监视点
+### 2.2 Setting Breakpoints and Watchpoints
 
-&emsp;&emsp;设置断点和监视点是程序调试中最基础的一步。
+Setting breakpoints and watchpoints is the most fundamental step in program debugging.
 
-- **设置断点**
+- **Setting Breakpoints**
 
-&emsp;&emsp;您可以使用`break`或者`b`命令来设置断点。
+  You can use the `break` or `b` command to set a breakpoint.
 
-&emsp;&emsp;关于`break`或者`b`命令的使用:
+  Regarding the usage of `break` or `b` commands:
 
 ```shell
 b <line_number> #在当前活动源文件的相应行号打断点
@@ -125,9 +127,9 @@ b <file>:<line_number> #在对应文件的相应行号打断点
 b <function_name> #为一个命名函数打断点
 ```
 
-- **设置监视点**
+- **Setting Watchpoints**
 
-&emsp;&emsp;您可以使用`watch`命令来设置监视点
+  You can use the `watch` command to set a watchpoint.
 
 ```shell
 watch <variable> # 设置对特定变量的监视点,将在特定变量发生变化的时候触发断点
@@ -136,11 +138,11 @@ watch <expression> # 设置对特定表达式的监视点，比如watch *(int*)0
                    # 的整数值发生更改时触发断点。
 ```
 
-- **管理断点与监视点**
+- **Managing Breakpoints and Watchpoints**
 
-&emsp;&emsp;当我们打上断点之后，我们该如何查看我们所有的断点信息呢？
+  Once we have set breakpoints, how can we view all the breakpoint information?
 
-&emsp;&emsp;您可以通过`info b`，`info break`或者`info breakpoints`来查看所有的断点信息:
+  You can use `info b`, `info break`, or `info breakpoints` to view all breakpoint information:
 
 ```shell
 (gdb) b 309
@@ -155,9 +157,9 @@ Num     Type           Disp Enb Address            What
 (gdb) 
 ```
 
-&emsp;&emsp;以上信息中，编号为12的断点即是我们在活动源文件309行打的断点，若其`Address`为`<MULTIPLE>`，则表示在多个地址上存在相同的断点位置。这在循环中是非常常见的情况。编号为13的便是我们对`slots`变量设置的监视点。
+In the above information, the breakpoint with number 12 is the one we set in line 309 of the active source file. If its `Address` is `<MULTIPLE>`, it indicates that there are identical breakpoints at multiple addresses. This is very common in loops. The breakpoint with number 13 is the watchpoint we set for the `slots` variable.
 
-&emsp;&emsp;我们可以通过以下命令对断点或者监视点进行操作：
+We can perform operations on breakpoints or watchpoints using the following commands:
 
 ```shell
 delete <breakpoint#> # 或 d <breakpoint#> 删除对应编号的断点，在您不再需要使用这个断点的时候可以通过此命令删除断点
@@ -176,13 +178,13 @@ clear <point_number> # 清除对应编号的所有断点或监视点，这与del
 clear <file> # 清除指定文件的所有断点与监视点
 ```
 
-## 2.3 变量和内存查看
+## 2.3 Viewing Variables and Memory
 
-- **print 和 display** 
+- **print and display**
 
-&emsp;&emsp;您可以通过`print`或者`p`来打印变量值。
+  You can use `print` or `p` to print variable values.
 
-&emsp;&emsp;`print`命令用于打印变量或表达式的值。它允许您在调试过程中查看程序中的数据。
+  The `print` command is used to print the value of a variable or expression. It allows you to view the data in the program during debugging.
 
 ```shell
 print <variable> # 打印对应变量名的值，例如：print my_variable 或者 p my_variable
@@ -194,11 +196,12 @@ print <expression> # 打印合法表达式的值，例如：print a+b 或者 p a
 $3 = core::sync::atomic::Ordering::SeqCst
 ```
 
-```{note}
+::: info
 如果您不仅想打印值，还想显示更多详细信息（例如类型信息），可以使用ptype命令。
-```
+:::
 
-&emsp;&emsp;您可以使用`display`命令来持续追踪变量或者表达式,`display`命令用于设置需要持续跟踪并在每次程序停止时显示的表达式。它类似于print命令，但与print不同的是，display命令在每次程序停止时自动打印指定表达式的值，而无需手动输入命令。
+
+You can use the `display` command to continuously track variables or expressions. The `display` command is used to set expressions that need to be tracked and displayed every time the program stops. It is similar to the print command, but unlike print, the display command automatically prints the value of the specified expression every time the program stops, without requiring manual input of a command.
 
 ```shell
 display <variable> # 打印对应变量名的值，例如：display my_variable
@@ -211,27 +214,29 @@ display <expression> # 打印合法表达式的值，例如：display a+b
                                                 #您可以通过info display命令来查看所有display编号
 ```
 
-```{note}
+::: info
 一旦您设置了display命令，每当程序停止（例如，在断点处停止）时，GDB将自动打印指定表达式的值。
 
 display命令非常有用，因为它允许您在调试过程中持续监视表达式的值，而无需每次都手动输入print命令。它特别适用于那些您希望持续跟踪的变量或表达式。
-```
+:::
 
-&emsp;&emsp;**要取消已设置的display命令并停止自动显示表达式的值，可以使用undisplay命令：**
+
+**To cancel an already set display command and stop automatically displaying the value of an expression, you can use the undisplay command:**
 
 ```shell
 undisplay <display编号> # 如果不指定<display编号>，则将取消所有已设置的display命令，
                        # 您可以通过info display命令来查看所有display编号
 ```
 
-```{note}
+::: info
 请注意，print和display命令只会在程序暂停执行时评估变量或表达式的值。如果程序正在运行，您需要通过设置断点或使用其他调试命令来暂停程序，然后才能使用print命令查看数据的值,display命令设置的值将会在程序暂停时自动输出。
-```
+:::
 
-- **输出格式**
 
-&emsp;&emsp;您可以设置输出格式来获取更多您需要的信息,例如：`print /a var`
-> 参考至[GDB Cheat Sheet](https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf)
+- **Output Format**
+
+  You can set the output format to get more information you need, for example: `print /a var`
+> Refer to [GDB Cheat Sheet](https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf)
 
 ```shell
 Format
@@ -246,13 +251,13 @@ u Integer, unsigned decimal.
 x Integer, print as hexadecimal.
 ```
 
-### 2.4 查看调用堆栈
+### 2.4 Viewing the Call Stack
 
-- **查看调用栈**
+- **Viewing the Call Stack**
 
-&emsp;&emsp;当程序在断点处暂停时，应该怎样追踪程序行为呢？
+  When the program is paused at a breakpoint, how should you trace the program's behavior?
 
-&emsp;&emsp;您可以通过`backtarce`命令来查看调用栈。`backtrace`命令用于打印当前调用栈的回溯信息。它显示了程序在执行过程中所有活动的函数调用链，包括每个函数的名称、参数和源文件中的行号。
+  You can use the `backtarce` command to view the call stack. The `backtrace` command is used to print the backtrace information of the current call stack. It displays all the active function call chains during program execution, including the function names, parameters, and line numbers in the source files.
 
 ```shell
 # 示例输出
@@ -262,19 +267,19 @@ x Integer, print as hexadecimal.
 #2  xx () at xx.c:8
 ```
 
-&emsp;&emsp;每一行回溯信息都以#<frame_number>开头，指示帧的编号。然后是函数名和参数列表，最后是源文件名和行号。
-通过查看回溯信息，您可以了解程序在哪些函数中执行，以及每个函数在调用栈中的位置。这对于调试程序和定位问题非常有用。
+Each line of backtrace information starts with #`<frame_number>`, indicating the frame number. Then comes the function name and parameter list, followed by the source file name and line number.
+By viewing the backtrace information, you can understand in which functions the program is executing and the position of each function in the call stack. This is very useful for debugging the program and locating problems.
 
-- **切换堆栈**
+- **Switching the Stack**
 
-&emsp;&emsp;您可以通过`frame`或者`f`命令来切换对应的栈帧获取更多信息以及操作。
+  You can use the `frame` or `f` command to switch to the corresponding stack frame to get more information and perform operations.
 
 ```shell
 frame <frame_number>
 f <frame_number>
 ```
 
-&emsp;&emsp;除了简单地执行backtrace命令，还可以使用一些选项来自定义回溯信息的输出。例如：
+In addition to simply executing the backtrace command, you can also use some options to customize the output of the backtrace information. For example:
 ```shell
 backtrace full                          #显示完整的符号信息，包括函数参数和局部变量。
 backtrace <frame_count>                 #限制回溯信息的帧数，只显示指定数量的帧。
@@ -282,11 +287,11 @@ backtrace <frame_start>-<frame_end>     #指定要显示的帧范围。
 backtrace thread <thread_id>            #显示指定线程的回溯信息。
 ```
 
-### 2.5 多核心
+### 2.5 Multi-core
 
-&emsp;&emsp;在调试内核时，您可能需要查看各个核心的运行状态。
+When debugging the kernel, you may need to view the running status of each core.
 
-&emsp;&emsp;您可以通过`info threads`命令来查看各个核心的运行状态
+You can use the `info threads` command to view the running status of each core.
 
 ```shell
 (gdb) info threads 
@@ -297,7 +302,7 @@ backtrace thread <thread_id>            #显示指定线程的回溯信息。
 (gdb) 
 ```
 
-&emsp;&emsp;您可以使用`thread <thread_id>`命令切换到指定的核心上下文，以便查看和调试特定核心的状态。例如：
+You can use the `thread <thread_id>` command to switch to the context of a specific core to view and debug the status of that core. For example:
 
 ```shell
 (gdb) thread 1
@@ -306,9 +311,9 @@ backtrace thread <thread_id>            #显示指定线程的回溯信息。
 227                 hlt();
 ```
 
-### 2.6 更多
+### 2.6 More
 
-&emsp;&emsp;接下来，我将为您介绍更多您可能在调试中能够使用的命令：
+Next, I will introduce more commands that you may find useful during debugging:
 
 ```shell
 step                #或者s,逐行执行程序，并进入到函数调用中。可以在step命令后加执行次数，例：step 3 表示要连续执行3个步骤
@@ -354,8 +359,8 @@ return <expression>             #强制使当前函数返回设定值
 
 ---
 
-## 最后
+## Conclusion
 
-&emsp;&emsp;现在，您已经可以使用rust-gdb来调试DragonOS内核代码了。
+Now, you can use rust-gdb to debug the DragonOS kernel code.
 
-> 您可以参阅GDB命令文档来获取更多帮助：[GDB Cheat Sheet](https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf)
+> You can refer to the GDB command documentation for more help: [GDB Cheat Sheet](https://darkdust.net/files/GDB%20Cheat%20Sheet.pdf)

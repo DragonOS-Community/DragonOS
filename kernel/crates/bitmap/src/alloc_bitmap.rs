@@ -12,6 +12,29 @@ pub struct AllocBitmap {
 }
 
 impl AllocBitmap {
+    pub fn try_new(elements: usize) -> Result<Self, alloc::collections::TryReserveError> {
+        let words = elements.div_ceil(usize::BITS as usize);
+        let mut data = Vec::new();
+        data.try_reserve_exact(words)?;
+        data.resize(words, 0);
+        Ok(Self {
+            elements,
+            data,
+            core: BitMapCore::new(),
+        })
+    }
+
+    pub fn try_clone(&self) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(self.data.len())?;
+        data.extend_from_slice(&self.data);
+        Ok(Self {
+            elements: self.elements,
+            data,
+            core: self.core.clone(),
+        })
+    }
+
     pub fn new(elements: usize) -> Self {
         let data = vec![0usize; elements.div_ceil(usize::BITS as usize)];
         Self {

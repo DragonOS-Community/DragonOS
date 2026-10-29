@@ -1,15 +1,16 @@
-# 加载程序
+# Loader
 
-## 1. 二进制程序装载
+## 1. Binary Program Loading
 
-&emsp;&emsp;在小节，你将了解DragonOS的二进制程序加载器的原理。
+In this section, you will learn about the principles of the binary loader in DragonOS.
 
-&emsp;&emsp;DragonOS在装载二进制程序时，执行了“探测-装载”的过程。
+When DragonOS loads a binary program, it performs a "probe-load" process.
 
-&emsp;&emsp;在探测阶段，DragonOS会读取文件首部，然后依次调用各个二进制加载器的探测函数，判断该二进制程序是否适用于该加载器。如果适用，则使用这个加载器进行装载。
+During the probe phase, DragonOS reads the file header and sequentially calls the probe functions of each binary loader to determine whether the binary program is suitable for that loader. If it is suitable, the loader will be used to load the program.
 
-&emsp;&emsp;在装载阶段，DragonOS会使用上述加载器进行装载。装载器会将二进制程序的各个段映射到内存中，并且得到二进制程序的入口地址。
+During the load phase, DragonOS uses the aforementioned loader to load the program. The loader will map the various segments of the binary program into memory and obtain the entry address of the binary program.
 
-:::{note}
-目前DragonOS不支持动态链接，因此所有的二进制程序都是静态链接的。并且暂时支持的只有ELF加载器。
+::: info
+Currently, DragonOS does not support dynamic linking, so all binary programs are statically linked. And only the ELF loader is temporarily supported.
 :::
+

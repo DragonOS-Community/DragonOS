@@ -1,0 +1,5902 @@
+use super::*;
+use crate::arch::mm::LockedFrameAllocator;
+
+mod dirty_accounting;
+#[cfg(feature = "mm_selftest")]
+mod entry_wait;
+mod raw_writeback;
+mod read_completion;
+mod resident_backing;
+mod subpage;
+
+static PAGECACHE_COMPLETION_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+static PAGECACHE_ACCOUNTING_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// A batch large enough to dominate normal background noise verifies the
+// page-cache VM counters, including the final-drop path that regressed. The
+// tolerance avoids treating the global snapshot as an exact local oracle.
+const PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES: usize = 128;
+const PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE: i128 = 16;
+
+struct PageCacheCompletionSelftestGuard;
+
+impl Drop for PageCacheCompletionSelftestGuard {
+    fn drop(&mut self) {
+        PAGECACHE_COMPLETION_SELFTEST_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct PageCacheAccountingSelftestGuard;
+
+impl Drop for PageCacheAccountingSelftestGuard {
+    fn drop(&mut self) {
+        PAGECACHE_ACCOUNTING_SELFTEST_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn registry_contains_instance(instance_id: u64) -> bool {
+    PAGECACHE_REGISTRY
+        .lock_irqsave()
+        .entries
+        .contains_key(&instance_id)
+}
+
+fn registry_contains_mapping(cache: &Arc<PageCache>) -> bool {
+    PAGECACHE_REGISTRY
+        .lock_irqsave()
+        .entries
+        .get(&cache.instance_id)
+        .is_some_and(|entry| Weak::ptr_eq(entry, &Arc::downgrade(cache)))
+}
+
+fn wait_for_registry_retirement(identities: &[u64]) -> bool {
+    let retired = || {
+        let registry = PAGECACHE_REGISTRY.lock_irqsave();
+        identities
+            .iter()
+            .all(|id| !registry.entries.contains_key(id))
+    };
+    if retired() {
+        return true;
+    }
+    // Concurrent drop_caches snapshots may legitimately hold these mappings
+    // beyond our owner's drop. Observe retirement without registering or
+    // enumerating anything, allowing those snapshot owners to finish first.
+    let deadline = crate::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        crate::sched::sched_yield();
+        if retired() {
+            return true;
+        }
+        if crate::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+fn run_registry_batch_retire_selftest() -> bool {
+    let mut live: Vec<_> = (0..256)
+        .map(|_| PageCache::new_unowned(None, None))
+        .collect();
+    let identities: Vec<_> = live.iter().map(|cache| cache.instance_id).collect();
+    let published = live.iter().all(registry_contains_mapping);
+    let survivors = live.split_off(128);
+    drop(live);
+    let partial_retirement = wait_for_registry_retirement(&identities[..128])
+        && survivors.iter().all(registry_contains_mapping);
+
+    // Do not register another cache or enumerate the registry after retirement:
+    // neither operation may be required to release these dead registry entries.
+    drop(survivors);
+    let retired = wait_for_registry_retirement(&identities);
+    published && partial_retirement && retired
+}
+
+fn run_registry_churn_selftest() -> bool {
+    let live: Vec<_> = (0..64)
+        .map(|_| PageCache::new_unowned(None, None))
+        .collect();
+    for _ in 0..4096 {
+        let transient = PageCache::new_unowned(None, None);
+        let id = transient.instance_id;
+        if !registry_contains_mapping(&transient) {
+            return false;
+        }
+        drop(transient);
+        if !wait_for_registry_retirement(&[id]) {
+            return false;
+        }
+    }
+    // Churn must preserve every live mapping, including a prefix larger than
+    // the old scan budget. Check production registration/destruction wiring.
+    let live_discoverable = live.iter().all(registry_contains_mapping);
+    let identities: Vec<_> = live.iter().map(|cache| cache.instance_id).collect();
+    drop(live);
+    live_discoverable && wait_for_registry_retirement(&identities)
+}
+
+fn run_registry_snapshot_lifetime_selftest() -> bool {
+    let cache = PageCache::new_unowned(None, None);
+    let id = cache.instance_id;
+    let identity = Arc::downgrade(&cache);
+    let snapshot = list_page_caches();
+    let found = snapshot.iter().any(|entry| Arc::ptr_eq(entry, &cache));
+    drop(cache);
+    let snapshot_pins_mapping = registry_contains_instance(id) && identity.strong_count() != 0;
+    drop(snapshot);
+    let retired = wait_for_registry_retirement(&[id]) && identity.strong_count() == 0;
+
+    // Exercise the last-entry removal too; this must not leave historical
+    // storage in a private registry after all its members retire.
+    let mut registry = PageCacheRegistry::new();
+    let cache = PageCache::new_unowned(None, None);
+    registry.register(&cache);
+    let removed = registry
+        .unregister(cache.instance_id)
+        .is_some_and(|entry| Weak::ptr_eq(&entry, &Arc::downgrade(&cache)));
+    found && snapshot_pins_mapping && retired && removed && registry.entries.is_empty()
+}
+
+fn run_registry_concurrent_snapshot_selftest() -> bool {
+    use crate::process::kthread::{KernelThreadClosure, KernelThreadMechanism};
+
+    let anchor = PageCache::new_unowned(None, None);
+    let anchor_id = anchor.instance_id;
+    let ready = Arc::new(Completion::new());
+    let release = Arc::new(Completion::new());
+    let worker_ready = ready.clone();
+    let worker_release = release.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let snapshot = list_page_caches();
+            let found = snapshot.iter().any(|cache| cache.instance_id == anchor_id);
+            worker_ready.complete();
+            if worker_release.wait_for_completion().is_err() {
+                return 1;
+            }
+            drop(snapshot);
+            for _ in 0..128 {
+                let snapshot = list_page_caches();
+                crate::sched::sched_yield();
+                drop(snapshot);
+            }
+            if found {
+                0
+            } else {
+                1
+            }
+        }),
+        (),
+    ));
+    let Some(worker) =
+        KernelThreadMechanism::create_and_run(closure, "pagecache-registry-selftest".into())
+    else {
+        return false;
+    };
+    let ready_ok = ready.wait_for_completion().is_ok();
+    drop(anchor);
+    // The worker's real snapshot must pin the mapping across the owner's drop.
+    let snapshot_pins_mapping = registry_contains_instance(anchor_id);
+    release.complete_all();
+
+    let mut identities = Vec::new();
+    for _ in 0..256 {
+        let transient = PageCache::new_unowned(None, None);
+        identities.push(transient.instance_id);
+        crate::sched::sched_yield();
+        drop(transient);
+    }
+    // Wait for every snapshot to release its strong references before checking
+    // final retirement, including after a failed local assertion.
+    let worker_ok = matches!(KernelThreadMechanism::stop(&worker), Ok(0));
+    ready_ok
+        && snapshot_pins_mapping
+        && worker_ok
+        && wait_for_registry_retirement(&[anchor_id])
+        && wait_for_registry_retirement(&identities)
+}
+
+fn run_writeback_domain_lifecycle_selftest() -> bool {
+    let domain = PageCacheWritebackDomain::new();
+    let cache = PageCache::new_unowned(None, None);
+    if domain.register(&cache).is_err() || domain.snapshot().len() != 1 {
+        return false;
+    }
+    domain.close_background_admission();
+    if domain.wait_drained().is_err()
+        || domain.try_acquire_io().is_ok()
+        || domain.register(&cache).is_ok()
+    {
+        return false;
+    }
+    drop(cache);
+    if !domain.snapshot().is_empty() {
+        return false;
+    }
+
+    let owner: Arc<dyn crate::filesystem::vfs::FileSystem> = crate::filesystem::ramfs::RamFS::new();
+    let owner_weak = Arc::downgrade(&owner);
+    let superblock = Arc::new(crate::filesystem::vfs::mount::SuperBlockState::new(
+        crate::filesystem::vfs::mount::MountFlags::empty(),
+    ));
+    let active = PageCacheWritebackDomain::new();
+    if active.bind(&owner, &superblock).is_err() {
+        return false;
+    }
+    let permit = match active.try_acquire_io() {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    active.close_background_admission();
+    let child = permit.derive();
+    drop(owner);
+    if owner_weak.upgrade().is_none() || active.state.lock_irqsave().io_in_flight != 2 {
+        return false;
+    }
+    drop(permit);
+    if owner_weak.upgrade().is_none() || active.state.lock_irqsave().io_in_flight != 1 {
+        return false;
+    }
+    drop(child);
+    owner_weak.upgrade().is_none()
+        && active.state.lock_irqsave().io_in_flight == 0
+        && active.wait_drained().is_ok()
+}
+
+fn run_detached_read_batch_completion_selftest() -> Result<bool, SystemError> {
+    let cache = PageCache::new_unowned(None, None);
+    let completion = PageCacheReadBatchCompletion::reserve(&cache, 0, 1, None)?;
+    let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+    let page = cache.manager.remove_page(0)?.ok_or(SystemError::EIO)?;
+
+    let payload = [0u8; MMArch::PAGE_SIZE];
+    completion.complete_data(0, 1, &payload, MMArch::PAGE_SIZE)?;
+    let completed = entry.state() == PageState::Error && completion.unfinished() == 0;
+
+    drop(completion);
+    drop(entry);
+    let paddr = page.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+    drop(page);
+    drop(cache);
+    Ok(completed)
+}
+
+/// Real backend admission runs before publication, including the failure at a
+/// later slot and a backend callback which installs a competing cache entry.
+/// No global allocator fault injection or production test hook is involved.
+struct BatchAdmissionBackend {
+    cache: SpinLock<Weak<PageCache>>,
+    calls: AtomicUsize,
+    live: AtomicUsize,
+    leaked_prefix: AtomicBool,
+    conflict_ok: AtomicBool,
+    conflict: bool,
+}
+
+impl core::fmt::Debug for BatchAdmissionBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BatchAdmissionBackend")
+    }
+}
+
+impl PageCacheBackend for BatchAdmissionBackend {
+    fn read_page(&self, _: usize, _: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+    fn write_page(&self, _: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+    fn npages(&self) -> usize {
+        0
+    }
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        let cache = self.cache.lock().upgrade().ok_or(SystemError::EIO)?;
+        if call <= 2 && cache.inner.lock().get_entry(0).is_some() {
+            self.leaked_prefix.store(true, Ordering::Release);
+        }
+        if call == 2 {
+            if !self.conflict {
+                return Err(SystemError::ENOSPC);
+            }
+            // The recursive admission is call 3 and does not inject again.
+            self.conflict_ok
+                .store(cache.manager.commit_overwrite(1).is_ok(), Ordering::Release);
+        }
+        self.live.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    fn release_page(&self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_batch_admission_atomicity_selftest() -> Result<bool, SystemError> {
+    for conflict in [false, true] {
+        let backend = Arc::new(BatchAdmissionBackend {
+            cache: SpinLock::new(Weak::new()),
+            calls: AtomicUsize::new(0),
+            live: AtomicUsize::new(0),
+            leaked_prefix: AtomicBool::new(false),
+            conflict_ok: AtomicBool::new(false),
+            conflict,
+        });
+        let cache = PageCache::new_shmem(None, Some(backend.clone()));
+        *backend.cache.lock() = Arc::downgrade(&cache);
+        let expected = if conflict {
+            SystemError::EEXIST
+        } else {
+            SystemError::ENOSPC
+        };
+        let error_matches = matches!(PageCacheReadBatchCompletion::reserve(&cache, 0, 3, None), Err(error) if error == expected);
+        let (prefix_missing, winner_present, suffix_missing) = {
+            let inner = cache.inner.lock();
+            (
+                inner.get_entry(0).is_none(),
+                inner.get_entry(1).is_some(),
+                inner.get_entry(2).is_none(),
+            )
+        };
+        let live_correct = backend.live.load(Ordering::Acquire) == usize::from(conflict);
+        let conflict_correct = !conflict || backend.conflict_ok.load(Ordering::Acquire);
+        if conflict {
+            let page = cache.manager.remove_page(1)?;
+            if let Some(page) = page {
+                cache.discard_unlinked_page(&page);
+            }
+        }
+        let refunded = backend.live.load(Ordering::Acquire) == 0;
+        if !(error_matches
+            && prefix_missing
+            && winner_present == conflict
+            && suffix_missing
+            && live_correct
+            && conflict_correct
+            && refunded
+            && !backend.leaked_prefix.load(Ordering::Acquire))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Exercise the real DMA reservation/fallback producer with distinct required
+/// and advisory ranges. This proves admission rollback, not physical virtio
+/// DMA or the FUSE run planner; the latter still needs its actual mmap test.
+fn run_required_optional_dma_quota_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{
+        object::ObjectAccount, ChargeFailureReason, MemoryAccount, MemoryEvent, MemoryPolicy,
+    };
+    let root = MemoryAccount::new(0, None)?;
+    let owner = MemoryAccount::new(0, Some(root.clone()))?;
+    owner.set_policy(MemoryPolicy {
+        max: Some(2),
+        ..Default::default()
+    });
+    // Separate metadata accounting from the constrained data leaf, so the
+    // second data candidate (rather than entry metadata) hits its two-page max.
+    let creator = ObjectAccount::new(&root)?;
+    let backend = Arc::new(PageCacheQuotaSelftestBackend::default());
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    let baseline_dma = pc_stats::snapshot().read_dma_reservations;
+    let required = cache
+        .manager
+        .try_reserve_read_dma(0, 1, false, &owner, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let loading = cache.fault_page_state(0).cached && !cache.fault_page_state(0).ready;
+    let payload = [0x5au8; MMArch::PAGE_SIZE];
+    let pages = required.publish_contiguous(&payload)?;
+    drop(pages);
+    drop(required);
+    let ready = cache.fault_page_state(0).ready;
+    let held = owner.current_pages();
+    let reserved = backend.reserved.load(Ordering::Acquire);
+    let released = backend.released.load(Ordering::Acquire);
+    let metadata_held = root.snapshot().kernel_bytes;
+
+    // The first optional candidate fits and the second genuinely hits max.
+    // Failure must roll it back without a Loading prefix, backend receipt or
+    // admission stock leak. No runtime/OOM is appropriate for advisory work.
+    let optional = cache
+        .manager
+        .try_reserve_read_dma(1, 15, false, &owner, &creator);
+    let optional_rejected = matches!(&optional,
+        Err(MemoryAllocationError::Charge(failure))
+        if failure.reason == ChargeFailureReason::Max && Arc::ptr_eq(&failure.account, &owner));
+    drop(optional);
+    let holes = (1..16).all(|index| !cache.fault_page_state(index).cached);
+    let unchanged = owner.current_pages() == held
+        && root.snapshot().kernel_bytes == metadata_held
+        && backend.reserved.load(Ordering::Acquire) == reserved
+        && backend.released.load(Ordering::Acquire) == released
+        && pc_stats::snapshot().read_dma_reservations == baseline_dma;
+    let contents_ok = cache.get_ready_page(0).is_some_and(|page| {
+        let guard = page.read();
+        unsafe { guard.as_slice().iter().all(|byte| *byte == 0x5a) }
+    });
+    let events = owner.snapshot();
+    let no_oom = [
+        MemoryEvent::Oom,
+        MemoryEvent::OomKill,
+        MemoryEvent::OomGroupKill,
+    ]
+    .iter()
+    .all(|event| events.events[*event as usize] == 0);
+
+    // A required miss is not allowed to turn its same quota error into an
+    // advisory success. Keep exact typed provenance for the real outer.
+    owner.set_policy(MemoryPolicy {
+        max: Some(held),
+        ..Default::default()
+    });
+    let mandatory = cache
+        .manager
+        .try_reserve_read_dma(1, 1, false, &owner, &creator);
+    let mandatory_rejected = matches!(&mandatory,
+        Err(MemoryAllocationError::Charge(failure)) if failure.reason == ChargeFailureReason::Max);
+    drop(mandatory);
+    drop(cache);
+    let cleaned = owner.current_pages() == 0
+        && root.current_pages() == 0
+        && root.snapshot().kernel_bytes.iter().all(|bytes| *bytes == 0)
+        && backend.reserved.load(Ordering::Acquire) == backend.released.load(Ordering::Acquire)
+        && pc_stats::snapshot().read_dma_reservations == baseline_dma;
+    Ok(loading
+        && ready
+        && held == 1
+        && reserved == 1
+        && released == 0
+        && optional_rejected
+        && holes
+        && unchanged
+        && contents_ok
+        && no_oom
+        && mandatory_rejected
+        && cleaned)
+}
+
+#[inline(never)]
+fn run_preallocated_batch_lifecycle_selftest() -> Result<bool, SystemError> {
+    use crate::{
+        arch::MMArch,
+        mm::{
+            allocator::page_frame::PageFrameCount,
+            page::allocate_registered_intrinsic_unevictable_pages_exact, MemoryManagementArch as _,
+        },
+    };
+
+    // Three pages exercises the allocator-rounded-tail path on the x86 buddy
+    // allocator while the public batch must expose exactly the requested run.
+    let batch = allocate_registered_intrinsic_unevictable_pages_exact(PageFrameCount::new(3))?;
+    if batch.pages().len() != 3 {
+        return Ok(false);
+    }
+    let start = batch.start_paddr();
+    let addresses: Vec<_> = batch
+        .pages()
+        .iter()
+        .map(|page| page.phys_address())
+        .collect();
+    if addresses
+        .iter()
+        .enumerate()
+        .any(|(index, paddr)| paddr.data() != start.data() + index * MMArch::PAGE_SIZE)
+    {
+        return Ok(false);
+    }
+    if !batch
+        .pages()
+        .windows(2)
+        .all(|pair| pair[0].shares_contiguous_frame_owner(&pair[1]))
+    {
+        return Ok(false);
+    }
+    let vaddr = unsafe { MMArch::phys_2_virt(start) }.ok_or(SystemError::EFAULT)?;
+    let bytes =
+        unsafe { core::slice::from_raw_parts(vaddr.data() as *const u8, 3 * MMArch::PAGE_SIZE) };
+    if bytes.iter().any(|byte| *byte != 0) {
+        return Ok(false);
+    }
+    for page in batch.pages() {
+        page.write().add_flags(PageFlags::PG_UPTODATE);
+    }
+
+    let cache = PageCache::new_unowned(None, None);
+    cache.adopt_preallocated_unevictable_batch(7, batch)?;
+    if cache.inner.lock().pages_count() != 3
+        || addresses
+            .iter()
+            .any(|paddr| !page_manager_lock().contains(paddr))
+    {
+        return Ok(false);
+    }
+    drop(cache);
+    Ok(addresses
+        .iter()
+        .all(|paddr| !page_manager_lock().contains(paddr)))
+}
+
+struct PageCacheCompletionSelftestState {
+    generic_started: AtomicUsize,
+    generic_released: AtomicUsize,
+    completion_done: AtomicBool,
+    abort: AtomicBool,
+    wait: WaitQueue,
+}
+
+/// Coordinates the one ordering which gives dirty incarnations their meaning:
+/// an old writeback completion must not pass a front writer between that
+/// writer setting PG_DIRTY and publishing its successor under `inner`.
+struct PageCacheDirtyIncarnationRaceState {
+    completion_started: AtomicBool,
+    completion_done: AtomicBool,
+    completion_succeeded: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl Default for PageCacheDirtyIncarnationRaceState {
+    fn default() -> Self {
+        Self {
+            completion_started: AtomicBool::new(false),
+            completion_done: AtomicBool::new(false),
+            completion_succeeded: AtomicBool::new(false),
+            wait: WaitQueue::default(),
+        }
+    }
+}
+
+impl PageCacheCompletionSelftestState {
+    fn new() -> Self {
+        Self {
+            generic_started: AtomicUsize::new(0),
+            generic_released: AtomicUsize::new(0),
+            completion_done: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            wait: WaitQueue::default(),
+        }
+    }
+
+    fn release_waiters(&self) {
+        self.abort.store(true, Ordering::Release);
+        self.wait.wake_all();
+    }
+}
+
+/// Synchronization state for the deterministic file-fault invalidation retry
+/// selftest. The participants model the real wait graph: snapshot holds
+/// invalidate-read and waits for MM-read; a buffered writer queues
+/// invalidate-write; a file fault observes retry while MM-write is held; its
+/// outer retry waiter runs only after that MM-write guard is gone.
+struct PageCacheInvalidateRetrySelftestState {
+    snapshot_holds_invalidate: AtomicBool,
+    snapshot_acquired_mm_read: AtomicBool,
+    buffered_writer_queued: AtomicBool,
+    buffered_writer_acquired: AtomicBool,
+    fault_probe_observed_retry: AtomicBool,
+    fault_observed_retry: AtomicBool,
+    fault_waiter_finished: AtomicBool,
+    stop_probe: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl PageCacheInvalidateRetrySelftestState {
+    fn new() -> Self {
+        Self {
+            snapshot_holds_invalidate: AtomicBool::new(false),
+            snapshot_acquired_mm_read: AtomicBool::new(false),
+            buffered_writer_queued: AtomicBool::new(false),
+            buffered_writer_acquired: AtomicBool::new(false),
+            fault_probe_observed_retry: AtomicBool::new(false),
+            fault_observed_retry: AtomicBool::new(false),
+            fault_waiter_finished: AtomicBool::new(false),
+            stop_probe: AtomicBool::new(false),
+            wait: WaitQueue::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PageCacheQuotaSelftestBackend {
+    reserved: AtomicUsize,
+    released: AtomicUsize,
+}
+
+/// Exercise terminal block mapping errors separately from filesystem retries.
+#[derive(Debug)]
+struct TerminalWritebackSelftestBackend {
+    failure: Mutex<Option<SystemError>>,
+}
+
+impl PageCacheBackend for TerminalWritebackSelftestBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        self.failure.lock().take().map_or(Ok(buf.len()), Err)
+    }
+    fn npages(&self) -> usize {
+        1
+    }
+    fn retry_writeback_error(&self, error: SystemError) -> bool {
+        error == SystemError::EAGAIN_OR_EWOULDBLOCK
+    }
+}
+
+/// Test-only backend for the writeback claim lock-order contract.
+struct PageCacheAdmissionOrderSelftestBackend {
+    cache: SpinLock<Weak<PageCache>>,
+    order: PageCacheWritebackAdmissionOrder,
+    expects_invalidate_read: bool,
+    observed_expected_order: AtomicUsize,
+    observed_unexpected_order: AtomicUsize,
+}
+
+impl PageCacheAdmissionOrderSelftestBackend {
+    fn new(order: PageCacheWritebackAdmissionOrder, expects_invalidate_read: bool) -> Self {
+        Self {
+            cache: SpinLock::new(Weak::new()),
+            order,
+            expects_invalidate_read,
+            observed_expected_order: AtomicUsize::new(0),
+            observed_unexpected_order: AtomicUsize::new(0),
+        }
+    }
+
+    fn observe_invalidate_order(&self) -> Result<(), SystemError> {
+        let cache = self.cache.lock().upgrade().ok_or(SystemError::EIO)?;
+        let invalidate_read_held = cache.invalidate_lock.try_write().is_none();
+        if invalidate_read_held == self.expects_invalidate_read {
+            self.observed_expected_order.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.observed_unexpected_order
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for PageCacheAdmissionOrderSelftestBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCacheAdmissionOrderSelftestBackend")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PageCacheBackend for PageCacheAdmissionOrderSelftestBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        0
+    }
+
+    fn writeback_admission_order(&self) -> PageCacheWritebackAdmissionOrder {
+        self.order
+    }
+
+    fn with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        self.observe_invalidate_order()?;
+        claim()
+    }
+
+    fn try_with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        self.observe_invalidate_order()?;
+        claim()?;
+        Ok(true)
+    }
+}
+
+/// State shared by a synthetic token backend used to exercise the production
+/// bind -> snapshot -> submit/cancel lifecycle without coupling that lifecycle
+/// to any filesystem implementation.
+type PageCacheWritebackProgressCallback =
+    Arc<dyn Fn(PageCacheWritebackProgressOutcome) + Send + Sync>;
+
+struct PageCacheSubmissionSelftestState {
+    bind_attempts: AtomicUsize,
+    bound: AtomicUsize,
+    submitted: AtomicUsize,
+    failed_submissions: AtomicUsize,
+    submitted_after_admission: AtomicUsize,
+    submitted_while_admitted: AtomicUsize,
+    cancelled: AtomicUsize,
+    cancelled_while_admitted: AtomicUsize,
+    cancelled_outside_admission: AtomicUsize,
+    cancelled_after_admission: AtomicUsize,
+    cancelled_after_admission_without_invalidate: AtomicUsize,
+    cancellation_reacquired_admission: AtomicUsize,
+    snapshotted_after_admission: AtomicUsize,
+    snapshotted_while_admitted: AtomicUsize,
+    bound_outside_admission: AtomicUsize,
+    fallback_writes: AtomicUsize,
+    private_claims: AtomicUsize,
+    admission_depth: AtomicUsize,
+    first_index: AtomicUsize,
+    last_index: AtomicUsize,
+    file_size: AtomicUsize,
+    valid_bytes: AtomicUsize,
+    last_writeback_generation: AtomicU64,
+    generation_regressions: AtomicUsize,
+    single_page_certificates: AtomicUsize,
+    certificate_errors: AtomicUsize,
+    fail_next_bind: AtomicBool,
+    fail_next_submit: AtomicBool,
+    fail_admission_after_claim: AtomicBool,
+    defer_next_bind: AtomicBool,
+    defer_next_submit: AtomicBool,
+    deferred_before_claim: AtomicUsize,
+    deferred_after_submit: AtomicUsize,
+    deferred_waits: AtomicUsize,
+    deferred_waiters_entered: AtomicUsize,
+    progress_sequence: AtomicUsize,
+    progress_wait: WaitQueue,
+    retry_callbacks: Mutex<Vec<PageCacheWritebackProgressCallback>>,
+}
+
+impl core::fmt::Debug for PageCacheSubmissionSelftestState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCacheSubmissionSelftestState")
+            .field("bind_attempts", &self.bind_attempts.load(Ordering::Acquire))
+            .field("submitted", &self.submitted.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PageCacheSubmissionSelftestState {
+    fn default() -> Self {
+        Self {
+            bind_attempts: AtomicUsize::new(0),
+            bound: AtomicUsize::new(0),
+            submitted: AtomicUsize::new(0),
+            failed_submissions: AtomicUsize::new(0),
+            submitted_after_admission: AtomicUsize::new(0),
+            submitted_while_admitted: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
+            cancelled_while_admitted: AtomicUsize::new(0),
+            cancelled_outside_admission: AtomicUsize::new(0),
+            cancelled_after_admission: AtomicUsize::new(0),
+            cancelled_after_admission_without_invalidate: AtomicUsize::new(0),
+            cancellation_reacquired_admission: AtomicUsize::new(0),
+            snapshotted_after_admission: AtomicUsize::new(0),
+            snapshotted_while_admitted: AtomicUsize::new(0),
+            bound_outside_admission: AtomicUsize::new(0),
+            fallback_writes: AtomicUsize::new(0),
+            private_claims: AtomicUsize::new(0),
+            admission_depth: AtomicUsize::new(0),
+            first_index: AtomicUsize::new(0),
+            last_index: AtomicUsize::new(0),
+            file_size: AtomicUsize::new(0),
+            valid_bytes: AtomicUsize::new(0),
+            last_writeback_generation: AtomicU64::new(0),
+            generation_regressions: AtomicUsize::new(0),
+            single_page_certificates: AtomicUsize::new(0),
+            certificate_errors: AtomicUsize::new(0),
+            fail_next_bind: AtomicBool::new(false),
+            fail_next_submit: AtomicBool::new(false),
+            fail_admission_after_claim: AtomicBool::new(false),
+            defer_next_bind: AtomicBool::new(false),
+            defer_next_submit: AtomicBool::new(false),
+            deferred_before_claim: AtomicUsize::new(0),
+            deferred_after_submit: AtomicUsize::new(0),
+            deferred_waits: AtomicUsize::new(0),
+            deferred_waiters_entered: AtomicUsize::new(0),
+            progress_sequence: AtomicUsize::new(0),
+            progress_wait: WaitQueue::default(),
+            retry_callbacks: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PageCacheSubmissionSelftestBackend {
+    state: Arc<PageCacheSubmissionSelftestState>,
+    admission_order: PageCacheWritebackAdmissionOrder,
+    snapshot_phase: PageCacheWritebackSnapshotPhase,
+}
+
+#[derive(Debug)]
+struct PageCacheSubmissionSelftestToken {
+    state: Arc<PageCacheSubmissionSelftestState>,
+    writeback_generation: u64,
+    resolved: bool,
+}
+
+/// Synthetic progress source used to prove that both PageCache defer paths
+/// wait for a concrete producer event instead of spinning on Dirty pages.
+#[derive(Debug)]
+struct PageCacheSubmissionSelftestProgress {
+    state: Arc<PageCacheSubmissionSelftestState>,
+    observed_sequence: usize,
+}
+
+/// Gate the exact tagged claim -> snapshot hand-off which a WAIT_BEFORE
+/// waiter observes. The debugfs selftest uses it to prove that clearing a
+/// frozen Dirty tag is never visible before the replacement submission record
+/// has been published.
+struct PageCacheTaggedSubmissionSelftestGate {
+    snapshot_entered: AtomicBool,
+    release_snapshot: AtomicBool,
+    waiter_started: AtomicBool,
+    waiter_finished: AtomicBool,
+    worker_finished: AtomicBool,
+    worker_succeeded: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl Default for PageCacheTaggedSubmissionSelftestGate {
+    fn default() -> Self {
+        Self {
+            snapshot_entered: AtomicBool::new(false),
+            release_snapshot: AtomicBool::new(false),
+            waiter_started: AtomicBool::new(false),
+            waiter_finished: AtomicBool::new(false),
+            worker_finished: AtomicBool::new(false),
+            worker_succeeded: AtomicBool::new(false),
+            wait: WaitQueue::default(),
+        }
+    }
+}
+
+impl PageCacheSubmissionSelftestState {
+    fn deferred_progress(self: &Arc<Self>) -> Arc<dyn PageCacheWritebackProgress> {
+        let observed_sequence = self.progress_sequence.load(Ordering::Acquire);
+        Arc::new(PageCacheSubmissionSelftestProgress {
+            state: self.clone(),
+            observed_sequence,
+        })
+    }
+
+    fn release_deferred_progress(&self) {
+        // Publish the producer transition and detach its continuations under
+        // one lock.  Otherwise a retry can observe the old sequence after we
+        // have taken the list, append itself to the now-detached list, and
+        // miss this progress forever.
+        let callbacks = {
+            let mut callbacks = self.retry_callbacks.lock();
+            self.progress_sequence.fetch_add(1, Ordering::AcqRel);
+            mem::take(&mut *callbacks)
+        };
+        self.progress_wait.wake_all();
+        for callback in callbacks {
+            callback(PageCacheWritebackProgressOutcome::Progress);
+        }
+    }
+}
+
+impl PageCacheWritebackProgress for PageCacheSubmissionSelftestProgress {
+    fn wait_for_progress(&self) -> PageCacheWritebackProgressOutcome {
+        self.state.deferred_waits.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .deferred_waiters_entered
+            .fetch_add(1, Ordering::Release);
+        self.state.progress_wait.wake_all();
+        self.state.progress_wait.wait_until(|| {
+            (self.state.progress_sequence.load(Ordering::Acquire) != self.observed_sequence)
+                .then_some(())
+        });
+        PageCacheWritebackProgressOutcome::Progress
+    }
+
+    fn register_retry(&self, retry: Arc<dyn Fn(PageCacheWritebackProgressOutcome) + Send + Sync>) {
+        let invoke_now = {
+            let mut callbacks = self.state.retry_callbacks.lock();
+            if self.state.progress_sequence.load(Ordering::Acquire) == self.observed_sequence {
+                callbacks.push(retry.clone());
+                false
+            } else {
+                true
+            }
+        };
+        if invoke_now {
+            retry(PageCacheWritebackProgressOutcome::Progress);
+        }
+    }
+}
+
+impl Drop for PageCacheSubmissionSelftestToken {
+    fn drop(&mut self) {
+        assert!(
+            self.resolved,
+            "PageCache submission token was dropped without submit or cancel"
+        );
+    }
+}
+
+impl PageCacheWritebackSubmission for PageCacheSubmissionSelftestToken {
+    fn submit(
+        mut self: Box<Self>,
+        descriptor: &PageCacheWritebackDescriptor,
+        data: &[u8],
+    ) -> Result<PageCacheWritebackSubmitResult, SystemError> {
+        if self.state.admission_depth.load(Ordering::Acquire) == 0 {
+            self.state
+                .submitted_after_admission
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.state
+                .submitted_while_admitted
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.state
+            .first_index
+            .store(descriptor.first_index(), Ordering::Release);
+        self.state
+            .last_index
+            .store(descriptor.last_index(), Ordering::Release);
+        self.state
+            .file_size
+            .store(descriptor.file_size(), Ordering::Release);
+        self.state
+            .valid_bytes
+            .store(descriptor.valid_bytes(), Ordering::Release);
+        if descriptor.valid_bytes() != data.len()
+            || descriptor.writeback_generation() != self.writeback_generation
+        {
+            let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
+            assert_eq!(previous, 1, "submission token private claim underflow");
+            self.resolved = true;
+            return Err(SystemError::EIO);
+        }
+        if self.state.defer_next_submit.swap(false, Ordering::AcqRel) {
+            let progress = self.state.deferred_progress();
+            let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
+            assert_eq!(previous, 1, "submission token private claim underflow");
+            self.resolved = true;
+            self.state
+                .deferred_after_submit
+                .fetch_add(1, Ordering::Release);
+            self.state.progress_wait.wake_all();
+            return Ok(PageCacheWritebackSubmitResult::Deferred(progress));
+        }
+        if self.state.fail_next_submit.swap(false, Ordering::AcqRel) {
+            self.state
+                .failed_submissions
+                .fetch_add(1, Ordering::Relaxed);
+            let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
+            assert_eq!(previous, 1, "submission token private claim underflow");
+            self.resolved = true;
+            return Err(SystemError::EIO);
+        }
+        self.state.submitted.fetch_add(1, Ordering::Relaxed);
+        let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(previous, 1, "submission token private claim underflow");
+        self.resolved = true;
+        Ok(PageCacheWritebackSubmitResult::Completed)
+    }
+
+    fn cancel(mut self: Box<Self>, context: PageCacheWritebackCancellationContext) {
+        self.state.cancelled.fetch_add(1, Ordering::Relaxed);
+        match context {
+            PageCacheWritebackCancellationContext::BeforeSubmitWithAdmission => {
+                if self.state.admission_depth.load(Ordering::Acquire) == 1 {
+                    self.state
+                        .cancelled_while_admitted
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.state
+                        .cancelled_outside_admission
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            PageCacheWritebackCancellationContext::AfterAdmissionWithInvalidateRead => {
+                self.state
+                    .cancelled_after_admission
+                    .fetch_add(1, Ordering::Relaxed);
+                // A delayed-allocation finalizer may need to reacquire its
+                // private size -> I/O admission after PageCache has dropped
+                // the original admission but while invalidate-read still
+                // protects the batch. Make that transition explicit so a
+                // regression to another cancellation context cannot pass by
+                // merely decrementing the same test counter.
+                let previous = self.state.admission_depth.fetch_add(1, Ordering::AcqRel);
+                assert_eq!(
+                    previous, 0,
+                    "post-admission cancellation ran while backend admission was still held"
+                );
+                self.state
+                    .cancellation_reacquired_admission
+                    .fetch_add(1, Ordering::Relaxed);
+                let previous = self.state.admission_depth.fetch_sub(1, Ordering::AcqRel);
+                assert_eq!(
+                    previous, 1,
+                    "post-admission cancellation admission depth underflow"
+                );
+            }
+            PageCacheWritebackCancellationContext::AfterAdmissionWithoutInvalidateRead => {
+                assert_eq!(
+                    self.state.admission_depth.load(Ordering::Acquire),
+                    0,
+                    "legacy post-admission cancellation retained backend admission"
+                );
+                self.state
+                    .cancelled_after_admission_without_invalidate
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(previous, 1, "submission token private claim underflow");
+        self.resolved = true;
+    }
+}
+
+impl PageCacheBackend for PageCacheSubmissionSelftestBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, _buf: &[u8]) -> Result<usize, SystemError> {
+        self.state.fallback_writes.fetch_add(1, Ordering::Relaxed);
+        Err(SystemError::EIO)
+    }
+
+    fn npages(&self) -> usize {
+        0
+    }
+
+    fn writeback_admission_order(&self) -> PageCacheWritebackAdmissionOrder {
+        self.admission_order
+    }
+
+    fn writeback_snapshot_phase(&self) -> PageCacheWritebackSnapshotPhase {
+        self.snapshot_phase
+    }
+
+    fn writeback_submission_protocol(&self) -> PageCacheWritebackProtocol {
+        PageCacheWritebackProtocol::Token
+    }
+
+    fn write_batch_pages(&self) -> Result<usize, SystemError> {
+        Ok(2)
+    }
+
+    fn with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        let previous = self.state.admission_depth.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            previous, 0,
+            "submission selftest admission unexpectedly nested"
+        );
+        let result = claim();
+        let previous = self.state.admission_depth.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(previous, 1, "submission selftest admission depth underflow");
+        if result.is_ok()
+            && self
+                .state
+                .fail_admission_after_claim
+                .swap(false, Ordering::AcqRel)
+        {
+            return Err(SystemError::EIO);
+        }
+        result
+    }
+
+    fn try_with_write_admission(
+        &self,
+        claim: &mut dyn FnMut() -> Result<(), SystemError>,
+    ) -> Result<bool, SystemError> {
+        self.with_write_admission(claim)?;
+        Ok(true)
+    }
+
+    fn bind_writeback_submission(
+        &self,
+        descriptor: &PageCacheWritebackDescriptor,
+    ) -> Result<PageCacheWritebackBindResult, SystemError> {
+        self.state.bind_attempts.fetch_add(1, Ordering::Relaxed);
+        if self.state.admission_depth.load(Ordering::Acquire) != 1 {
+            self.state
+                .bound_outside_admission
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.state.bound.fetch_add(1, Ordering::Relaxed);
+        let previous_generation = self
+            .state
+            .last_writeback_generation
+            .swap(descriptor.writeback_generation(), Ordering::AcqRel);
+        if descriptor.writeback_generation() == 0
+            || (previous_generation != 0
+                && descriptor.writeback_generation() <= previous_generation)
+        {
+            self.state
+                .generation_regressions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let certificates = descriptor.dirty_certificates();
+        let expected_count = descriptor
+            .last_index()
+            .checked_sub(descriptor.first_index())
+            .and_then(|distance| distance.checked_add(1));
+        let certificates_valid = expected_count == Some(certificates.len())
+            && certificates
+                .iter()
+                .enumerate()
+                .all(|(offset, certificate)| {
+                    descriptor
+                        .first_index()
+                        .checked_add(offset)
+                        .is_some_and(|index| certificate.page_index() == index)
+                        && certificate.cache_instance_id() != 0
+                        && certificate.entry_instance_id() != 0
+                        && certificate.dirty_incarnation() != 0
+                        && matches!(
+                            certificate.kind(),
+                            PageCacheDirtyTransitionKind::NewlyDirty
+                                | PageCacheDirtyTransitionKind::RedirtiedDuringWriteback
+                        )
+                });
+        if !certificates_valid {
+            self.state
+                .certificate_errors
+                .fetch_add(1, Ordering::Relaxed);
+        } else if certificates.len() == 1 {
+            self.state
+                .single_page_certificates
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.state.defer_next_bind.swap(false, Ordering::AcqRel) {
+            self.state
+                .deferred_before_claim
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(PageCacheWritebackBindResult::Deferred(
+                self.state.deferred_progress(),
+            ));
+        }
+        let previous = self.state.private_claims.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(previous, 0, "submission selftest private claim leaked");
+        if self.state.fail_next_bind.swap(false, Ordering::AcqRel) {
+            let previous = self.state.private_claims.fetch_sub(1, Ordering::AcqRel);
+            assert_eq!(previous, 1, "submission selftest private claim underflow");
+            return Err(SystemError::EIO);
+        }
+        self.state
+            .valid_bytes
+            .store(descriptor.valid_bytes(), Ordering::Release);
+        Ok(PageCacheWritebackBindResult::Submission(Box::new(
+            PageCacheSubmissionSelftestToken {
+                state: self.state.clone(),
+                writeback_generation: descriptor.writeback_generation(),
+                resolved: false,
+            },
+        )))
+    }
+}
+
+impl PageCacheBackend for PageCacheQuotaSelftestBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        0
+    }
+
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        self.reserved.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release_page(&self) {
+        self.released.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Verify that terminal writeback completion cannot be stranded behind generic
+/// page-cache workers waiting for that completion.
+///
+/// This is only called from a root-readable debugfs selftest. It injects no
+/// delay or branch into normal page-cache operation.
+pub(crate) fn run_completion_domain_debug_selftest() -> Result<alloc::string::String, SystemError> {
+    if PAGECACHE_COMPLETION_SELFTEST_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(SystemError::EBUSY);
+    }
+    let _running = PageCacheCompletionSelftestGuard;
+    let state = Arc::new(PageCacheCompletionSelftestState::new());
+
+    let completion_domain = PageCacheWritebackDomain::new();
+    let completion_executor = completion_domain.writeback_executor()?;
+    // Place exactly one waiter on every generic page-cache worker. Direct queue
+    // selection keeps the test deterministic even if unrelated page-cache work
+    // advances the production round-robin counter concurrently. The waiters
+    // model host invalidation after it has observed a published Writeback page.
+    for workqueue in PAGECACHE_IO_WQS.iter() {
+        let waiter_state = state.clone();
+        workqueue.enqueue(Work::new(move || {
+            waiter_state.generic_started.fetch_add(1, Ordering::AcqRel);
+            waiter_state.wait.wake_all();
+            waiter_state.wait.wait_until(|| {
+                (waiter_state.completion_done.load(Ordering::Acquire)
+                    || waiter_state.abort.load(Ordering::Acquire))
+                .then_some(())
+            });
+            waiter_state.generic_released.fetch_add(1, Ordering::AcqRel);
+            waiter_state.wait.wake_all();
+        }));
+    }
+
+    const SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
+    if let Err(error) = state.wait.wait_until_timeout(
+        || (state.generic_started.load(Ordering::Acquire) == PAGECACHE_IO_WORKERS).then_some(()),
+        SELFTEST_TIMEOUT,
+    ) {
+        state.release_waiters();
+        return Ok(alloc::format!(
+            "status=fail stage=occupy_generic error={error:?} started={} expected={}\n",
+            state.generic_started.load(Ordering::Acquire),
+            PAGECACHE_IO_WORKERS
+        ));
+    }
+
+    let completion_state = state.clone();
+    writeback::schedule_pagecache_writeback(
+        &completion_executor,
+        Work::new(move || {
+            completion_state
+                .completion_done
+                .store(true, Ordering::Release);
+            completion_state.wait.wake_all();
+        }),
+    );
+
+    let completion_result = state.wait.wait_until_timeout(
+        || state.completion_done.load(Ordering::Acquire).then_some(()),
+        SELFTEST_TIMEOUT,
+    );
+    if completion_result.is_err() {
+        state.release_waiters();
+    }
+    let released_result = state.wait.wait_until_timeout(
+        || (state.generic_released.load(Ordering::Acquire) == PAGECACHE_IO_WORKERS).then_some(()),
+        SELFTEST_TIMEOUT,
+    );
+    state.release_waiters();
+
+    if let Err(error) = completion_result {
+        return Ok(alloc::format!(
+            "status=fail stage=completion error={error:?} released={} expected={}\n",
+            state.generic_released.load(Ordering::Acquire),
+            PAGECACHE_IO_WORKERS
+        ));
+    }
+    if let Err(error) = released_result {
+        return Ok(alloc::format!(
+            "status=fail stage=release error={error:?} released={} expected={}\n",
+            state.generic_released.load(Ordering::Acquire),
+            PAGECACHE_IO_WORKERS
+        ));
+    }
+
+    if !read_completion::run()? {
+        return Ok("status=fail stage=global_worker_read_completion\n".into());
+    }
+
+    if !raw_writeback::run()? {
+        return Ok("status=fail stage=raw_stacked_writeback\n".into());
+    }
+
+    Ok(alloc::format!(
+        "status=ok generic_waiters={} completion_domain=independent\nglobal_worker_read_completion=ok\nraw_stacked_writeback=ok\n",
+        PAGECACHE_IO_WORKERS
+    ))
+}
+
+/// Prove the lock-order progress rule used by `do_shared_fault()` and
+/// `do_cow_fault()` without relying on scheduler timing.
+///
+/// The selftest deliberately creates the former three-way cycle. It uses the
+/// production PageCache invalidation semaphore and the production
+/// `PageCacheInvalidateRetryWait`; the separate RwSem is a precise stand-in
+/// for `AddressSpace::write/read`, allowing the test to pin every edge before
+/// releasing the fault side. No production PageCache path observes this test.
+fn run_invalidate_retry_lock_order_selftest() -> Result<bool, SystemError> {
+    const SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let cache = PageCache::new_unowned(None, None);
+    let mm = Arc::new(RwSem::new(()));
+    let state = Arc::new(PageCacheInvalidateRetrySelftestState::new());
+
+    // B: the simulated file fault owns MM-write before it reaches the
+    // PageCache invalidation edge.
+    let mm_write = mm.write();
+
+    // A: snapshot/writeback owns invalidate-read, then waits for MM-read.
+    let snapshot_cache = cache.clone();
+    let snapshot_mm = mm.clone();
+    let snapshot_state = state.clone();
+    PAGECACHE_IO_WQS[0].enqueue(Work::new(move || {
+        let _invalidate = snapshot_cache.invalidate_read();
+        snapshot_state
+            .snapshot_holds_invalidate
+            .store(true, Ordering::Release);
+        snapshot_state.wait.wake_all();
+        let _mm_read = snapshot_mm.read();
+        snapshot_state
+            .snapshot_acquired_mm_read
+            .store(true, Ordering::Release);
+        snapshot_state.wait.wake_all();
+    }));
+
+    let retry_wait = (|| -> Result<Arc<dyn FaultRetryWait>, SystemError> {
+        state.wait.wait_until_timeout(
+            || {
+                state
+                    .snapshot_holds_invalidate
+                    .load(Ordering::Acquire)
+                    .then_some(())
+            },
+            SELFTEST_TIMEOUT,
+        )?;
+
+        // C: a buffered write queues invalidate-write behind A. RwSem writer
+        // preference then makes the file fault's try-read fail deterministically.
+        let writer_cache = cache.clone();
+        let writer_state = state.clone();
+        PAGECACHE_IO_WQS[1].enqueue(Work::new(move || {
+            writer_state
+                .buffered_writer_queued
+                .store(true, Ordering::Release);
+            writer_state.wait.wake_all();
+            let _invalidate = writer_cache.invalidate_write();
+            writer_state
+                .buffered_writer_acquired
+                .store(true, Ordering::Release);
+            writer_state.wait.wake_all();
+        }));
+
+        state.wait.wait_until_timeout(
+            || {
+                state
+                    .buffered_writer_queued
+                    .load(Ordering::Acquire)
+                    .then_some(())
+            },
+            SELFTEST_TIMEOUT,
+        )?;
+
+        // `invalidate_write()` registers its writer waiter after the worker
+        // announces that it is about to block.  A separate probe therefore
+        // observes the *actual* writer-preference condition and wakes this
+        // test only then; waiting directly on `state.wait` here could miss
+        // that registration edge and time out merely due to scheduling.
+        let probe_cache = cache.clone();
+        let probe_state = state.clone();
+        PAGECACHE_IO_WQS[2].enqueue(Work::new(move || {
+            while !probe_state.stop_probe.load(Ordering::Acquire) {
+                if let PageCacheFaultInvalidateRead::Retry(_) =
+                    probe_cache.file_fault_invalidate_read()
+                {
+                    probe_state
+                        .fault_probe_observed_retry
+                        .store(true, Ordering::Release);
+                    probe_state.wait.wake_all();
+                    return;
+                }
+                crate::sched::sched_yield();
+            }
+            probe_state.wait.wake_all();
+        }));
+        state.wait.wait_until_timeout(
+            || {
+                state
+                    .fault_probe_observed_retry
+                    .load(Ordering::Acquire)
+                    .then_some(())
+            },
+            SELFTEST_TIMEOUT,
+        )?;
+
+        // The helper is the same decision point used by both actual file
+        // fault branches. Constructing its retry token is nonblocking and is
+        // intentionally done while the simulated MM-write guard is still
+        // held; only wait() is allowed after that guard is released.
+        match cache.file_fault_invalidate_read() {
+            PageCacheFaultInvalidateRead::Retry(retry_wait) => {
+                state.fault_observed_retry.store(true, Ordering::Release);
+                Ok(retry_wait)
+            }
+            PageCacheFaultInvalidateRead::Acquired(_guard) => {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            }
+        }
+    })();
+
+    // This is the required outer-fault retry boundary. Releasing MM-write
+    // lets A finish; C then owns and releases invalidate-write; only then may
+    // the production retry waiter obtain invalidate-read and finish.
+    drop(mm_write);
+    let retry_wait = match retry_wait {
+        Ok(retry_wait) => retry_wait,
+        Err(err) => {
+            // A failed setup must never strand snapshot/writeback workers
+            // behind the test's simulated MM write lock.
+            state.stop_probe.store(true, Ordering::Release);
+            state.wait.wake_all();
+            return Err(err);
+        }
+    };
+    let waiter_state = state.clone();
+    PAGECACHE_IO_WQS[3].enqueue(Work::new(move || {
+        if retry_wait.wait().is_ok() {
+            waiter_state
+                .fault_waiter_finished
+                .store(true, Ordering::Release);
+        }
+        waiter_state.wait.wake_all();
+    }));
+
+    let completed = state.wait.wait_until_timeout(
+        || {
+            (state.snapshot_acquired_mm_read.load(Ordering::Acquire)
+                && state.buffered_writer_acquired.load(Ordering::Acquire)
+                && state.fault_waiter_finished.load(Ordering::Acquire))
+            .then_some(())
+        },
+        SELFTEST_TIMEOUT,
+    );
+    state.stop_probe.store(true, Ordering::Release);
+    completed?;
+
+    Ok(state.fault_observed_retry.load(Ordering::Acquire)
+        && state.snapshot_holds_invalidate.load(Ordering::Acquire)
+        && state.snapshot_acquired_mm_read.load(Ordering::Acquire)
+        && state.buffered_writer_queued.load(Ordering::Acquire)
+        && state.buffered_writer_acquired.load(Ordering::Acquire)
+        && state.fault_waiter_finished.load(Ordering::Acquire))
+}
+
+/// Verify that a large TOWRITE-style tag pass releases mapping exclusion
+/// between bounded chunks. The boundary probe runs synchronously after the
+/// writer is dropped, so it verifies the lock transition without depending on
+/// workqueue scheduling.
+fn run_tag_scan_chunk_release_selftest() -> Result<bool, SystemError> {
+    const SELFTEST_PAGES: usize = 513;
+
+    let cache = PageCache::new_unowned(None, None);
+    let mut pages = Vec::with_capacity(SELFTEST_PAGES);
+    for index in 0..SELFTEST_PAGES {
+        let page = cache.get_or_create_page_zero(index)?;
+        page.write().add_flags(PageFlags::PG_DIRTY);
+        let mut inner = cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        inner.set_index(index, 1, true);
+        drop(inner);
+        pages.push(page);
+    }
+
+    let mut observed = false;
+    let mut probe_ok = true;
+    // A synthetic cache has no inode, so dispatch returns EIO after the tag
+    // scan and retires the generation. The test concerns only the preceding
+    // mapping-exclusion window.
+    let _ = cache
+        .manager
+        .start_writeback_range_with_freeze_and_chunk_release(
+            0,
+            SELFTEST_PAGES - 1,
+            || Ok(()),
+            || {
+                let Some(_invalidate) = cache.try_invalidate_read() else {
+                    probe_ok = false;
+                    return;
+                };
+                let inner = cache.inner.lock();
+                observed |= inner
+                    .pages
+                    .get(&(SELFTEST_PAGES - 1))
+                    .is_some_and(|entry| entry.writeback_tag() == 0);
+            },
+        );
+
+    for (index, page) in pages.into_iter().enumerate() {
+        let _ = cache.manager.remove_page(index)?;
+        let paddr = page.phys_address();
+        page_manager_lock().remove_page(&paddr);
+        let _ = page_reclaimer_lock().remove_page(&paddr);
+    }
+
+    Ok(probe_ok && observed)
+}
+
+/// Exercise page-cache membership accounting with local identity assertions and
+/// a high-signal aggregate check of the production vmstat wiring.
+fn run_dirty_incarnation_selftest() -> Result<bool, SystemError> {
+    let cache = PageCache::new_shmem(None, None);
+    let page = cache.get_or_create_page_zero(0)?;
+    let first = {
+        let mut page_locked = page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        match cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+        {
+            PageCacheDirtyTransition::Started(incarnation) => incarnation,
+            PageCacheDirtyTransition::Merged(_) => return Ok(false),
+        }
+    };
+    let first_ok = first.kind() == PageCacheDirtyTransitionKind::NewlyDirty
+        && first.page_index() == 0
+        && first.dirty_incarnation() != 0
+        && cache.validate_dirty_incarnation(&first).is_ok();
+
+    let merged = {
+        let page_locked = page.write();
+        cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+    };
+    let merged_ok = merged.kind() == PageCacheDirtyTransitionKind::MergedIntoDirty
+        && merged.page_index() == 0
+        && merged.dirty_incarnation() == first.dirty_incarnation();
+
+    let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+    {
+        let page_locked = page.write();
+        if !cache.try_mark_page_writeback(0, page_locked.phys_address()) {
+            return Ok(false);
+        }
+    }
+    page.write().remove_flags(PageFlags::PG_DIRTY);
+
+    // Hold the writer's page lock while an old completion is queued.  The
+    // completion must remain blocked until the writer has both set PG_DIRTY
+    // and published g2 under `inner`; otherwise it could merge this write
+    // into g1 in the historic flag-to-cache gap.
+    let race = Arc::new(PageCacheDirtyIncarnationRaceState::default());
+    let race_cache = cache.clone();
+    let race_entry = entry.clone();
+    let race_page = page.clone();
+    let race_state = race.clone();
+    let redirtied = {
+        let mut page_locked = page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        PAGECACHE_IO_WQS[0].enqueue(Work::new(move || {
+            race_state.completion_started.store(true, Ordering::Release);
+            race_state.wait.wake_all();
+            let result = PageCacheManager::finish_writeback_entry_state(
+                race_cache.clone(),
+                0,
+                race_entry.clone(),
+                race_page.clone(),
+                Ok(()),
+                false,
+                ALL_BLOCKS,
+            );
+            race_state
+                .completion_succeeded
+                .store(result.is_ok(), Ordering::Release);
+            race_state.completion_done.store(true, Ordering::Release);
+            race_state.wait.wake_all();
+        }));
+        let completion_started = race
+            .wait
+            .wait_until_timeout(
+                || {
+                    race.completion_started
+                        .load(Ordering::Acquire)
+                        .then_some(())
+                },
+                Duration::from_secs(2),
+            )
+            .is_ok();
+        let completion_blocked = completion_started
+            && race
+                .wait
+                .wait_until_timeout(
+                    || race.completion_done.load(Ordering::Acquire).then_some(()),
+                    Duration::from_millis(25),
+                )
+                .is_err();
+        let transition = match cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+        {
+            PageCacheDirtyTransition::Started(incarnation) => incarnation,
+            PageCacheDirtyTransition::Merged(_) => return Ok(false),
+        };
+        (transition, completion_started && completion_blocked)
+    };
+    let (redirtied, completion_blocked_by_writer) = redirtied;
+    let completion_finished = race
+        .wait
+        .wait_until_timeout(
+            || race.completion_done.load(Ordering::Acquire).then_some(()),
+            Duration::from_secs(2),
+        )
+        .is_ok();
+    let redirty_ok = redirtied.kind() == PageCacheDirtyTransitionKind::RedirtiedDuringWriteback
+        && redirtied.dirty_incarnation() == first.dirty_incarnation() + 1
+        && cache.validate_dirty_incarnation(&first) == Err(SystemError::ESTALE)
+        && cache.validate_dirty_incarnation(&redirtied).is_ok()
+        && completion_blocked_by_writer
+        && completion_finished
+        && race.completion_succeeded.load(Ordering::Acquire)
+        && {
+            let inner = cache.inner.lock();
+            entry.state() == PageState::Dirty
+                && inner.dirty_pages.contains(&0)
+                && !inner.writeback_pages.contains(&0)
+        };
+    if !first_ok || !merged_ok || !redirty_ok {
+        return Ok(false);
+    }
+
+    let merged_successor = {
+        let page_locked = page.write();
+        cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+    };
+    if merged_successor.kind() != PageCacheDirtyTransitionKind::MergedIntoDirty
+        || merged_successor.dirty_incarnation() != redirtied.dirty_incarnation()
+    {
+        return Ok(false);
+    }
+
+    // A clean completion retires g2.  The next front-end write must be g3,
+    // not an ABA reuse of either completed generation.
+    {
+        let mut page_locked = page.write();
+        if !cache.try_mark_page_writeback(0, page_locked.phys_address()) {
+            return Ok(false);
+        }
+        page_locked.remove_flags(PageFlags::PG_DIRTY);
+    }
+    PageCacheManager::finish_writeback_entry_state(
+        cache.clone(),
+        0,
+        entry,
+        page.clone(),
+        Ok(()),
+        false,
+        ALL_BLOCKS,
+    )?;
+    let successor = {
+        let mut page_locked = page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        match cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+        {
+            PageCacheDirtyTransition::Started(incarnation) => incarnation,
+            PageCacheDirtyTransition::Merged(_) => return Ok(false),
+        }
+    };
+    let successor_ok = successor.kind() == PageCacheDirtyTransitionKind::NewlyDirty
+        && successor.dirty_incarnation() == redirtied.dirty_incarnation() + 1
+        && cache.validate_dirty_incarnation(&successor).is_ok();
+
+    let removed = cache.manager.remove_page(0)?.ok_or(SystemError::EIO)?;
+    let paddr = removed.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+    let primary_ok =
+        successor_ok && cache.validate_dirty_incarnation(&successor) == Err(SystemError::ESTALE);
+    Ok(primary_ok
+        && run_dirty_incarnation_snapshot_successor_selftest()?
+        && run_dirty_incarnation_entrypoint_selftest()?)
+}
+
+/// Exercise the other half of the page-lock protocol: an old batch snapshot
+/// must not clear PG_DIRTY after a front writer has published its successor
+/// incarnation.  This is deliberately sequenced as the former race window
+/// (`claim g1`, `publish g2`, then `snapshot g1`) rather than probabilistically
+/// relying on scheduler timing.
+fn run_dirty_incarnation_snapshot_successor_selftest() -> Result<bool, SystemError> {
+    let cache = PageCache::new_shmem(None, None);
+    let page = cache.get_or_create_page_zero(0)?;
+    let first = {
+        let mut page_locked = page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        match cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+        {
+            PageCacheDirtyTransition::Started(incarnation) => incarnation,
+            PageCacheDirtyTransition::Merged(_) => return Ok(false),
+        }
+    };
+    let mut batch = match PageCacheManager::claim_next_writeback_batch(
+        &cache,
+        0,
+        0,
+        MMArch::PAGE_SIZE,
+        None,
+        false,
+        None,
+    )? {
+        WritebackClaimOutcome::Claimed(batch) => batch,
+        _ => return Ok(false),
+    };
+    let successor = {
+        let mut page_locked = page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        match cache
+            .mark_page_dirty_page_locked_with_transition(0, &page_locked)?
+            .ok_or(SystemError::EIO)?
+        {
+            PageCacheDirtyTransition::Started(incarnation) => incarnation,
+            PageCacheDirtyTransition::Merged(_) => return Ok(false),
+        }
+    };
+    PageCacheManager::snapshot_writeback_batch(&mut batch)?;
+    let snapshot_preserved_successor = page.read().flags().contains(PageFlags::PG_DIRTY)
+        && cache.validate_dirty_incarnation(&first) == Err(SystemError::ESTALE)
+        && cache.validate_dirty_incarnation(&successor).is_ok()
+        && {
+            let inner = cache.inner.lock();
+            inner.dirty_pages.contains(&0) && inner.writeback_pages.contains(&0)
+        };
+    PageCacheManager::complete_writeback_batch(batch, Ok(()))?;
+    let completion_preserved_successor = page.read().flags().contains(PageFlags::PG_DIRTY)
+        && cache.validate_dirty_incarnation(&successor).is_ok()
+        && {
+            let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+            let inner = cache.inner.lock();
+            entry.state() == PageState::Dirty
+                && inner.dirty_pages.contains(&0)
+                && !inner.writeback_pages.contains(&0)
+        };
+    let removed = cache.manager.remove_page(0)?.is_some();
+    let paddr = page.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+    Ok(snapshot_preserved_successor && completion_preserved_successor && removed)
+}
+
+/// Cover the non-buffered front publishers which intentionally retain the
+/// capability only at their explicit future-bridge entry points.  The normal
+/// wrappers stay lightweight, but these checks ensure prepared writes,
+/// mmap-mkwrite, and FUSE-style ready-page merges obey the same lifetime.
+fn run_dirty_incarnation_entrypoint_selftest() -> Result<bool, SystemError> {
+    let prepared_cache = PageCache::new_shmem(None, None);
+    let prepared_page = prepared_cache.get_or_create_page_zero(0)?;
+    let prepared_transition = {
+        let mut reservation = prepared_cache.prepare_page_dirty()?;
+        let mut page_locked = prepared_page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        match prepared_cache
+            .mark_page_dirty_prepared_page_locked_with_transition(
+                0,
+                &mut reservation,
+                &page_locked,
+            )?
+            .ok_or(SystemError::EIO)?
+        {
+            PageCacheDirtyTransition::Started(incarnation) => incarnation,
+            PageCacheDirtyTransition::Merged(_) => return Ok(false),
+        }
+    };
+    let prepared_ok = prepared_transition.kind() == PageCacheDirtyTransitionKind::NewlyDirty
+        && prepared_cache
+            .validate_dirty_incarnation(&prepared_transition)
+            .is_ok();
+    let prepared_removed = prepared_cache.manager.remove_page(0)?.is_some();
+    let prepared_paddr = prepared_page.phys_address();
+    page_manager_lock().remove_page(&prepared_paddr);
+    let _ = page_reclaimer_lock().remove_page(&prepared_paddr);
+
+    let mkwrite_cache = PageCache::new_shmem(None, None);
+    let mkwrite_page = mkwrite_cache.get_or_create_page_zero(0)?;
+    let mkwrite_transition = match mkwrite_cache
+        .manager()
+        .prepare_page_mkwrite_with_transition(0, &mkwrite_page)?
+    {
+        PageCacheDirtyTransition::Started(incarnation) => incarnation,
+        PageCacheDirtyTransition::Merged(_) => return Ok(false),
+    };
+    let mkwrite_entry = mkwrite_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let mkwrite_generation = mkwrite_transition.dirty_incarnation();
+    let fused_merge = mkwrite_cache.manager().update_ready_page(0, 0, &[0x5a])?
+        && mkwrite_entry.dirty_incarnation() == mkwrite_generation
+        && mkwrite_cache
+            .validate_dirty_incarnation(&mkwrite_transition)
+            .is_ok();
+    let mkwrite_removed = mkwrite_cache.manager.remove_page(0)?.is_some();
+    let mkwrite_paddr = mkwrite_page.phys_address();
+    page_manager_lock().remove_page(&mkwrite_paddr);
+    let _ = page_reclaimer_lock().remove_page(&mkwrite_paddr);
+
+    // The future delayed-allocation front end needs its per-page capability
+    // before PageCache releases the page lock to a concurrent claim. Its
+    // external reservation is acquired before entering PageCache and would be
+    // rolled back by its own Drop if this local operation failed.
+    let handoff_cache = PageCache::new_shmem(None, None);
+    let handoff_page = handoff_cache.get_or_create_page_zero(0)?;
+    let handoff_data = [0xa5; MMArch::PAGE_SIZE];
+    let mut captured_transition = None;
+    let handoff_written =
+        handoff_cache.write_single_full_page_with_transition(0, &handoff_data, |transition| {
+            captured_transition = Some(transition);
+        })?;
+    let handoff_transition = captured_transition.take().ok_or(SystemError::EIO)?;
+    let handoff_incarnation = handoff_transition.dirty_incarnation();
+    let handoff_certificate = handoff_transition.certificate().ok_or(SystemError::EIO)?;
+    let mut merged_transition = None;
+    let handoff_merged_written =
+        handoff_cache.write_single_full_page_with_transition(0, &handoff_data, |transition| {
+            merged_transition = Some(transition);
+        })?;
+    let handoff_merged = merged_transition.take().ok_or(SystemError::EIO)?;
+    let handoff_ok = handoff_written == MMArch::PAGE_SIZE
+        && handoff_merged_written == MMArch::PAGE_SIZE
+        && handoff_transition.kind() == PageCacheDirtyTransitionKind::NewlyDirty
+        && handoff_certificate.page_index() == 0
+        && handoff_certificate.cache_instance_id() != 0
+        && handoff_certificate.entry_instance_id() != 0
+        && handoff_certificate.dirty_incarnation() == handoff_incarnation
+        && handoff_certificate.kind() == PageCacheDirtyTransitionKind::NewlyDirty
+        && handoff_merged.kind() == PageCacheDirtyTransitionKind::MergedIntoDirty
+        && handoff_merged.page_index() == 0
+        && handoff_merged.dirty_incarnation() == handoff_incarnation
+        && handoff_page.read().flags().contains(PageFlags::PG_DIRTY)
+        && handoff_cache
+            .validate_dirty_incarnation(match &handoff_transition {
+                PageCacheDirtyTransition::Started(incarnation) => incarnation,
+                PageCacheDirtyTransition::Merged(_) => return Ok(false),
+            })
+            .is_ok();
+    let handoff_removed = handoff_cache.manager.remove_page(0)?.is_some();
+    let handoff_paddr = handoff_page.phys_address();
+    page_manager_lock().remove_page(&handoff_paddr);
+    let _ = page_reclaimer_lock().remove_page(&handoff_paddr);
+
+    // A front-write copy keeps a PageEntryPin until it has either published
+    // its dirty incarnation or failed before publication.  A generic manager
+    // removal must respect that pin, otherwise a successful external
+    // reservation could observe ESTALE before the front handoff completes.
+    let pin_cache = PageCache::new_shmem(None, None);
+    let pin_page = pin_cache.get_or_create_page_zero(0)?;
+    let pin = pin_cache
+        .manager
+        .peek_page_pinned(0)
+        .ok_or(SystemError::EIO)?;
+    let removal_blocked_by_pin = pin_cache.manager.remove_page(0)?.is_none();
+    drop(pin);
+    let removal_after_pin_release = pin_cache.manager.remove_page(0)?.is_some();
+    let pin_paddr = pin_page.phys_address();
+    page_manager_lock().remove_page(&pin_paddr);
+    let _ = page_reclaimer_lock().remove_page(&pin_paddr);
+
+    let rejected_cache = PageCache::new_shmem(None, None);
+    let rejected_page = rejected_cache.get_or_create_page_zero(0)?;
+    let rejected_data = [0x3c; MMArch::PAGE_SIZE];
+    let rejected = rejected_cache.write_single_full_page_with_transition(1, &rejected_data, |_| {
+        unreachable!("invalid front write must not publish a transition")
+    });
+    let rejected_clean = rejected == Err(SystemError::EINVAL)
+        && !rejected_page.read().flags().contains(PageFlags::PG_DIRTY)
+        && {
+            let page_guard = rejected_page.read();
+            unsafe { page_guard.as_slice()[0] == 0 }
+        }
+        && {
+            let inner = rejected_cache.inner.lock();
+            let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+            entry.state() == PageState::UpToDate
+                && !inner.dirty_pages.contains(&0)
+                && !inner.writeback_pages.contains(&0)
+        };
+    let rejected_removed = rejected_cache.manager.remove_page(0)?.is_some();
+    let rejected_paddr = rejected_page.phys_address();
+    page_manager_lock().remove_page(&rejected_paddr);
+    let _ = page_reclaimer_lock().remove_page(&rejected_paddr);
+
+    Ok(prepared_ok
+        && prepared_removed
+        && fused_merge
+        && mkwrite_removed
+        && handoff_ok
+        && handoff_removed
+        && removal_blocked_by_pin
+        && removal_after_pin_release
+        && rejected_clean
+        && rejected_removed)
+}
+
+/// Exercise the exact-entry token used by remote writes.  The token must pin
+/// membership before publication, publish Dirty while the protected bytes are
+/// still unchanged, and release both the reservation and pin after the copy.
+fn run_remote_dirty_publish_selftest() -> Result<bool, SystemError> {
+    let cache = PageCache::new_shmem(None, None);
+    let page = cache.get_or_create_page_zero(0)?;
+    let mut prepared = cache
+        .prepare_remote_page_dirty(0, &page)?
+        .ok_or(SystemError::EIO)?;
+
+    let removal_blocked_before_publish = cache.manager.remove_page(0)?.is_none();
+    let published_before_copy = {
+        let mut page_locked = page.write();
+        prepared.publish_before_copy(&page_locked);
+        let published = {
+            let inner = cache.inner.lock();
+            let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+            inner.dirty_pages.contains(&0)
+                && entry.state() == PageState::Dirty
+                && unsafe { page_locked.as_slice()[17] == 0 }
+        };
+        unsafe { page_locked.as_slice_mut()[17] = 0x5a };
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        published
+    };
+    drop(prepared);
+
+    let copied_and_published = {
+        let page_locked = page.read();
+        let inner = cache.inner.lock();
+        inner.dirty_pages.contains(&0)
+            && page_locked.flags().contains(PageFlags::PG_DIRTY)
+            && unsafe { page_locked.as_slice()[17] == 0x5a }
+    };
+    let removal_after_token_release = cache.manager.remove_page(0)?.is_some();
+    let paddr = page.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+
+    Ok(removal_blocked_before_publish
+        && published_before_copy
+        && copied_and_published
+        && removal_after_token_release)
+}
+
+/// Exercise domain start separately from its completion/error boundary.
+fn run_domain_writeback_start_selftest() -> Result<bool, MemoryAllocationError> {
+    use crate::filesystem::vfs::{FileType, InodeMode};
+
+    // Reuse the token fixture, but supply a real inode for domain retention
+    // and stable size. The separate shmem cache needs no mounted filesystem.
+    for (fail_inline, fail_after_defer) in [(false, false), (true, false), (false, true)] {
+        let fs = crate::filesystem::ramfs::RamFS::new();
+        let inode = fs.root_inode().create(
+            "domain-writeback",
+            FileType::File,
+            InodeMode::from_bits_truncate(0o600),
+        )?;
+        inode.resize(MMArch::PAGE_SIZE)?;
+        let state = Arc::new(PageCacheSubmissionSelftestState::default());
+        let backend: Arc<dyn PageCacheBackend> = Arc::new(PageCacheSubmissionSelftestBackend {
+            state: state.clone(),
+            admission_order: PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
+            snapshot_phase: PageCacheWritebackSnapshotPhase::WithinAdmission,
+        });
+        let cache = PageCache::new_shmem(Some(Arc::downgrade(&inode)), Some(backend));
+        let page = cache.get_or_create_page_zero(0)?;
+        {
+            let mut locked = page.write();
+            locked.add_flags(PageFlags::PG_DIRTY);
+            cache.mark_page_dirty_page_locked(0, &locked)?;
+        }
+        state.fail_next_submit.store(fail_inline, Ordering::Release);
+        state
+            .defer_next_submit
+            .store(fail_after_defer, Ordering::Release);
+        let pending = cache.manager().start_sync_for_domain()?;
+        if fail_after_defer {
+            // Global writeback-budget contention may legitimately postpone
+            // the first attempt. Wait for the actual producer event, not an
+            // assumption that this machine was idle when start was called.
+            state.progress_wait.wait_until(|| {
+                (state.deferred_after_submit.load(Ordering::Acquire) != 0).then_some(())
+            });
+            state.fail_next_submit.store(true, Ordering::Release);
+            state.release_deferred_progress();
+        }
+        let result = pending.finish();
+        let expected_result = if fail_inline || fail_after_defer {
+            result == Err(SystemError::EIO) && state.failed_submissions.load(Ordering::Acquire) == 1
+        } else {
+            result.is_ok() && state.submitted.load(Ordering::Acquire) == 1
+        };
+        let resolved = state.private_claims.load(Ordering::Acquire) == 0
+            && state.submitted_while_admitted.load(Ordering::Acquire) == 0
+            && state.admission_depth.load(Ordering::Acquire) == 0
+            && state.fallback_writes.load(Ordering::Acquire) == 0
+            && cache.inner.lock().writeback_pages.is_empty();
+        let removed = cache.manager.remove_page(0)?.is_some();
+        let paddr = page.phys_address();
+        page_manager_lock().remove_page(&paddr);
+        let _ = page_reclaimer_lock().remove_page(&paddr);
+        if !expected_result || !resolved || !removed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Exercise the descriptor half of the front-dirty certificate independently
+/// from the future ext4 consumer.  In particular, g1 must remain frozen in
+/// its already-bound descriptor while a writer creates g2 during g1's
+/// Writeback state; only the next claim may observe g2.
+fn run_single_page_token_certificate_selftest() -> Result<bool, SystemError> {
+    let state = Arc::new(PageCacheSubmissionSelftestState::default());
+    let backend = Arc::new(PageCacheSubmissionSelftestBackend {
+        state: state.clone(),
+        admission_order: PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
+        snapshot_phase: PageCacheWritebackSnapshotPhase::WithinAdmission,
+    });
+    let backend_dyn: Arc<dyn PageCacheBackend> = backend;
+    // The selftest backend has no inode. Using shmem keeps its dirty publish
+    // path honest without manufacturing a file-mapping retention owner.
+    let cache = PageCache::new_shmem(None, Some(backend_dyn.clone()));
+    let page = cache.get_or_create_page_zero(0)?;
+    let mark_dirty = || -> Result<(), SystemError> {
+        let mut page_locked = page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        cache.mark_page_dirty_page_locked(0, &page_locked)
+    };
+    let claimed_or_none = |outcome: WritebackClaimOutcome| match outcome {
+        WritebackClaimOutcome::Claimed(batch) => Some(batch),
+        WritebackClaimOutcome::NoBatch
+        | WritebackClaimOutcome::Deferred(_)
+        | WritebackClaimOutcome::FailedRecorded(_) => None,
+    };
+
+    mark_dirty()?;
+    let mut first_batch = None;
+    let first_admission =
+        PageCacheManager::with_writeback_admission(&cache, &backend_dyn, &mut || {
+            first_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &cache,
+                0,
+                0,
+                MMArch::PAGE_SIZE,
+                true,
+            )?);
+            Ok(())
+        })
+        .is_ok();
+    let Some(first_batch) = first_batch else {
+        return Ok(false);
+    };
+    let first_certificate = first_batch
+        .descriptor
+        .dirty_certificate()
+        .ok_or(SystemError::EIO)?;
+
+    // This exact page is still Writeback for g1. The production dirty
+    // publisher must create a distinct RedirtiedDuringWriteback generation,
+    // not mutate the descriptor that already owns g1.
+    mark_dirty()?;
+    let first_descriptor_remains_frozen = first_batch.descriptor.dirty_certificate()
+        == Some(first_certificate)
+        && first_certificate.kind() == PageCacheDirtyTransitionKind::NewlyDirty;
+    let first_submitted = matches!(
+        PageCacheManager::submit_writeback_batch(first_batch)?,
+        WritebackSubmitOutcome::Completed
+    );
+    let g2_visible_after_g1_completion = {
+        let inner = cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+
+    let mut second_batch = None;
+    let second_admission =
+        PageCacheManager::with_writeback_admission(&cache, &backend_dyn, &mut || {
+            second_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &cache,
+                0,
+                0,
+                MMArch::PAGE_SIZE,
+                true,
+            )?);
+            Ok(())
+        })
+        .is_ok();
+    let Some(second_batch) = second_batch else {
+        return Ok(false);
+    };
+    let second_certificate = second_batch
+        .descriptor
+        .dirty_certificate()
+        .ok_or(SystemError::EIO)?;
+    let second_submitted = matches!(
+        PageCacheManager::submit_writeback_batch(second_batch)?,
+        WritebackSubmitOutcome::Completed
+    );
+
+    let certificate_progression = first_certificate.cache_instance_id()
+        == second_certificate.cache_instance_id()
+        && first_certificate.entry_instance_id() == second_certificate.entry_instance_id()
+        && first_certificate.page_index() == 0
+        && second_certificate.page_index() == 0
+        && first_certificate
+            .dirty_incarnation()
+            .checked_add(1)
+            .is_some_and(|next| next == second_certificate.dirty_incarnation())
+        && second_certificate.kind() == PageCacheDirtyTransitionKind::RedirtiedDuringWriteback;
+    let removed = cache.manager.remove_page(0)?.is_some();
+    let paddr = page.phys_address();
+    page_manager_lock().remove_page(&paddr);
+    let _ = page_reclaimer_lock().remove_page(&paddr);
+
+    Ok(first_admission
+        && first_descriptor_remains_frozen
+        && first_submitted
+        && g2_visible_after_g1_completion
+        && second_admission
+        && certificate_progression
+        && second_submitted
+        && removed
+        && state.private_claims.load(Ordering::Acquire) == 0
+        && state.single_page_certificates.load(Ordering::Acquire) == 2
+        && state.certificate_errors.load(Ordering::Acquire) == 0)
+}
+
+/// Fail only this isolated cache's admission, without exhausting guest RAM.
+#[derive(Debug)]
+struct PreallocateFailureBackend {
+    live: AtomicUsize,
+    limit: AtomicUsize,
+}
+
+impl PageCacheBackend for PreallocateFailureBackend {
+    fn read_page(&self, _index: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        Ok(0)
+    }
+
+    fn write_page(&self, _index: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        Ok(buf.len())
+    }
+
+    fn npages(&self) -> usize {
+        0
+    }
+
+    fn reserve_page(&self) -> Result<(), SystemError> {
+        self.live
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                (live < self.limit.load(Ordering::Relaxed)).then_some(live + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
+    fn release_page(&self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Reproduce the pathname-snapshot/owner-commit interleaving without timing
+/// hooks: the stale request is prepared, chmod commits, then the real inode
+/// truncate entry point runs. No task credentials or global mount are changed.
+fn run_ramfs_truncate_metadata_selftest() -> Result<bool, MemoryAllocationError> {
+    use crate::filesystem::vfs::{
+        permission::InodeOpContext, FileType, InodeMode, OpenTruncateContext, SetMetadataMask,
+    };
+    use crate::process::cred::CAPFlags;
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs.root_inode().create(
+        "truncate-metadata",
+        FileType::File,
+        InodeMode::from_bits_truncate(0o600),
+    )?;
+    let data = Mutex::new(FilePrivateData::Unused);
+    let mut unprivileged = (*crate::process::ProcessManager::current_pcb().cred()).clone();
+    unprivileged.cap_effective = CAPFlags::CAP_EMPTY_SET;
+    let unprivileged = Arc::new(unprivileged);
+    let mut ok = true;
+    for entry in 0..6 {
+        let mut context = InodeOpContext::legacy();
+        if entry < 3 {
+            context.cred = Some(unprivileged.clone());
+        }
+        let cred = context.cred.as_ref().ok_or(SystemError::EIO)?;
+        // Both directions matter: newly granted setid must be removed, and
+        // a stale MODE request must never restore unrelated chmod bits.
+        for (before, committed) in [(0o600, 0o6751), (0o6755, 0o640)] {
+            inode.resize(64)?;
+            let mut metadata = inode.metadata()?;
+            metadata.mode = InodeMode::from_bits_truncate(before);
+            inode.set_metadata_masked(&metadata, SetMetadataMask::MODE)?;
+            let (requested, mask) =
+                crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                    inode.metadata()?,
+                    17,
+                    cred,
+                );
+            metadata.mode = InodeMode::from_bits_truncate(committed);
+            inode.set_metadata_masked(&metadata, SetMetadataMask::MODE)?;
+            let (expected, expected_mask) =
+                crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                    inode.metadata()?,
+                    17,
+                    cred,
+                );
+            let truncate = OpenTruncateContext {
+                requested: requested.clone(),
+                mask,
+            };
+            let applied = match entry {
+                0 => inode.resize_with_metadata_context(17, 0, &requested, mask, &context)?,
+                1 => inode.resize_file_with_metadata_context(
+                    17,
+                    0,
+                    data.lock(),
+                    &requested,
+                    mask,
+                    &context,
+                )?,
+                2 => inode.resize_open_truncate_with_inode_context(
+                    17,
+                    0,
+                    data.lock(),
+                    &truncate,
+                    &context,
+                )?,
+                3 => inode.resize_with_metadata_result(17, 0, &requested, mask)?,
+                4 => {
+                    inode.resize_file_with_metadata_result(17, 0, data.lock(), &requested, mask)?
+                }
+                _ => inode.resize_open_truncate_result(17, 0, data.lock(), &truncate)?,
+            };
+            let actual = inode.metadata()?;
+            ok &= actual.size == 17
+                && actual.mode == expected.mode
+                && applied.contains(SetMetadataMask::MODE)
+                    == expected_mask.contains(SetMetadataMask::MODE);
+        }
+    }
+
+    // A preparation failure must leave EOF and mode untouched. This used to
+    // resize first and only then apply the metadata; the raw owner-ID check
+    // deliberately fails before a commit is possible.
+    let context = InodeOpContext::legacy();
+    let mut invalid = inode.metadata()?;
+    invalid.uid = u32::MAX as usize;
+    inode.set_metadata_masked(&invalid, SetMetadataMask::UID)?;
+    let before = inode.metadata()?;
+    let result = inode.resize_with_metadata_context(
+        2,
+        0,
+        &before,
+        SetMetadataMask::WRITE_SIDE_EFFECT,
+        &context,
+    );
+    ok &= matches!(
+        result,
+        Err(MemoryAllocationError::System(SystemError::EOVERFLOW))
+    ) && inode.metadata()?.size == before.size
+        && inode.metadata()?.mode == before.mode;
+    invalid.uid = 0;
+    inode.set_metadata_masked(&invalid, SetMetadataMask::UID)?;
+
+    // Track the real inode cache's page before any fallible write. Drop uses
+    // Page identity to retire cache/reclaimer/PageManager owners on all exits.
+    let mut cleanup = MemcgReclaimFixture {
+        cache: inode.page_cache().ok_or(SystemError::EIO)?,
+        addresses: Vec::new(),
+        identities: Vec::new(),
+    };
+    cleanup
+        .addresses
+        .try_reserve(1)
+        .map_err(|_| SystemError::ENOMEM)?;
+    cleanup
+        .identities
+        .try_reserve(1)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let page = cleanup.cache.get_or_create_page_zero(0)?;
+    cleanup.addresses.push(page.phys_address());
+    cleanup.identities.push(Arc::downgrade(&page));
+    drop(page);
+
+    // Shrink/regrow must retain the existing EOF tail-zeroing semantics.
+    inode.resize(64)?;
+    inode.write_at(0, 64, &[0x5a; 64], data.lock())?;
+    inode.resize(17)?;
+    inode.resize(64)?;
+    let mut bytes = [0; 64];
+    let read = inode.read_at(0, bytes.len(), &mut bytes, data.lock())?;
+    ok &= read == 64
+        && bytes[..17].iter().all(|byte| *byte == 0x5a)
+        && bytes[17..].iter().all(|byte| *byte == 0);
+    Ok(ok)
+}
+
+fn run_ramfs_fallocate_range_selftest() -> Result<bool, MemoryAllocationError> {
+    use crate::filesystem::vfs::{AttribStageObserver, FileType, InodeMode};
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs.root_inode().create(
+        "fallocate-range",
+        FileType::File,
+        InodeMode::from_bits_truncate(0o600),
+    )?;
+    let page_size = MMArch::PAGE_SIZE;
+    let data = Mutex::new(FilePrivateData::Unused);
+    // Keep the reproducer bounded: sparse growth itself allocates no pages.
+    inode.resize(16 * page_size)?;
+    let cache = inode.page_cache().ok_or(SystemError::EIO)?;
+    if cache.manager().pages_count()? != 0 {
+        return Ok(false);
+    }
+    let marker_offset = 13 * page_size + 17;
+    inode.write_at(marker_offset, 1, &[0x5a], data.lock())?;
+    // An unaligned request covers only pages 12 and 13, including an existing
+    // dirty page. Repeating it must neither fill preceding holes nor erase data.
+    for _ in 0..2 {
+        let mut publish = || {};
+        inode.fallocate_file(
+            0,
+            12 * page_size + 7,
+            page_size,
+            0,
+            &mut AttribStageObserver::new(&mut publish),
+            data.lock(),
+        )?;
+        if cache.manager().pages_count()? != 2
+            || cache.manager().peek_page(12).is_none()
+            || cache.manager().peek_page(13).is_none()
+            || inode.metadata()?.size != (16 * page_size) as i64
+        {
+            return Ok(false);
+        }
+        let mut marker = [0];
+        inode.read_at(marker_offset, 1, &mut marker, data.lock())?;
+        if marker != [0x5a] {
+            return Ok(false);
+        }
+    }
+    // A page-aligned extension allocates exactly its requested page and grows
+    // EOF without materializing the intervening sparse hole or the next page.
+    let mut publish = || {};
+    inode.fallocate_file(
+        0,
+        17 * page_size,
+        page_size,
+        0,
+        &mut AttribStageObserver::new(&mut publish),
+        data.lock(),
+    )?;
+    Ok(cache.manager().pages_count()? == 3
+        && cache.manager().peek_page(17).is_some()
+        && inode.metadata()?.size == (18 * page_size) as i64)
+}
+
+/// Exercise both clean-unlink entry points with each independent liveness
+/// source. This checks their contracts, not a deterministic reproduction of
+/// the old unlocked flag-check/commit race.
+fn run_clean_unlink_liveness_selftest() -> Result<bool, SystemError> {
+    let mut ok = true;
+    for reclaim in [true, false] {
+        let cache = PageCache::new_unowned(None, None);
+        let page = cache.get_or_create_page_zero(0)?;
+        let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+        let paddr = page.phys_address();
+        let page_identity = Arc::downgrade(&page);
+        let attempt = || -> Result<bool, SystemError> {
+            if reclaim {
+                Ok(cache
+                    .manager
+                    .remove_clean_page_for_reclaim(0, &page)?
+                    .is_some())
+            } else {
+                Ok(cache.manager.invalidate_all_clean()? == 1)
+            }
+        };
+        let still_linked = || {
+            cache.inner.lock().get_entry(0).is_some_and(|current| {
+                Arc::ptr_eq(&current, &entry) && current.accounting() == PageEntryAccounting::File
+            }) && page_manager_lock().get(&paddr).is_some()
+                && page_reclaimer_lock().get(&paddr).is_some()
+        };
+
+        let pin = cache.manager.peek_page_pinned(0).ok_or(SystemError::EIO)?;
+        ok &= !attempt()? && still_linked();
+        drop(pin);
+
+        for flag in [
+            PageFlags::PG_DIRTY,
+            PageFlags::PG_WRITEBACK,
+            PageFlags::PG_UNEVICTABLE,
+        ] {
+            page.write().add_flags(flag);
+            // Never call clean removal with a self-held page write guard:
+            // production removal deliberately acquires the page read lock.
+            let removed = attempt();
+            page.write().remove_flags(flag);
+            ok &= !removed? && still_linked();
+        }
+        for state in [PageState::Dirty, PageState::Writeback] {
+            {
+                let _inner = cache.inner.lock();
+                entry.account_state_transition(PageState::UpToDate, state);
+                entry.set_state(state);
+            }
+            let removed = attempt();
+            {
+                let _inner = cache.inner.lock();
+                entry.account_state_transition(state, PageState::UpToDate);
+                entry.set_state(PageState::UpToDate);
+            }
+            ok &= !removed? && still_linked();
+        }
+        for writeback in [false, true] {
+            {
+                let mut inner = cache.inner.lock();
+                if writeback {
+                    inner.set_index(0, 2, true);
+                } else {
+                    inner.set_index(0, 1, true);
+                }
+            }
+            let removed = attempt();
+            {
+                let mut inner = cache.inner.lock();
+                if writeback {
+                    inner.set_index(0, 2, false);
+                } else {
+                    inner.set_index(0, 1, false);
+                }
+            }
+            ok &= !removed? && still_linked();
+        }
+        cache.set_unevictable(true);
+        let removed = attempt();
+        cache.set_unevictable(false);
+        ok &= !removed? && still_linked();
+
+        ok &= attempt()?
+            && cache.manager.peek_page(0).is_none()
+            && entry.accounting() == PageEntryAccounting::Unaccounted;
+        if reclaim {
+            // Low-level reclaim unlinks membership only. Its caller must
+            // retire the physical page from the manager and LRU afterwards.
+            ok &= page_manager_lock().get(&paddr).is_some()
+                && page_reclaimer_lock().get(&paddr).is_some();
+            page_manager_lock().remove_page(&paddr);
+            let _ = page_reclaimer_lock().remove_page(&paddr);
+        }
+        // Invalidation already performs the same physical retirement.
+        ok &= page_manager_lock().get(&paddr).is_none()
+            && page_reclaimer_lock().get(&paddr).is_none();
+        // Preserve cleanup even when a lifecycle assertion failed, so a
+        // regression does not leak this fixture into later selftest stages.
+        page_manager_lock().remove_page(&paddr);
+        let _ = page_reclaimer_lock().remove_page(&paddr);
+        drop(entry);
+        drop(page);
+        drop(cache);
+        ok &= page_identity.upgrade().is_none();
+    }
+    Ok(ok)
+}
+
+fn run_preallocate_rollback_selftest() -> Result<bool, SystemError> {
+    let backend = Arc::new(PreallocateFailureBackend {
+        live: AtomicUsize::new(0),
+        limit: AtomicUsize::new(3),
+    });
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    cache.set_unevictable(true);
+    let existing = cache.manager().commit_overwrite(0)?;
+    {
+        let mut page = existing.write();
+        unsafe { page.as_slice_mut()[17] = 0x5a };
+        page.add_flags(PageFlags::PG_DIRTY);
+    }
+    // A pre-existing page must survive even when several new pages precede
+    // ENOMEM. Repeating the call must not accumulate unreachable pages.
+    for _ in 0..2 {
+        if cache.manager().preallocate_range(0, 4) != Err(SystemError::ENOMEM)
+            || cache.manager().pages_count()? != 1
+            || backend.live.load(Ordering::Relaxed) != 1
+            || unsafe { existing.read().as_slice()[17] != 0x5a }
+            || !cache
+                .manager()
+                .peek_page(0)
+                .is_some_and(|p| Arc::ptr_eq(&p, &existing))
+        {
+            return Ok(false);
+        }
+    }
+    // Rollback must not discard a page another user still pins or dirtied.
+    let (pin, created) = cache.manager().commit_overwrite_pinned_with_status(1)?;
+    let page = pin.page();
+    if !created || cache.manager().discard_created_page(1, &page)? {
+        return Ok(false);
+    }
+    drop(pin);
+    if !cache.manager().discard_created_page(1, &page)?
+        || cache.manager().discard_created_page(0, &existing)?
+    {
+        return Ok(false);
+    }
+    drop(page);
+    backend.limit.store(5, Ordering::Relaxed);
+    cache.manager().preallocate_range(0, 4)?;
+    let success = cache.manager().pages_count()? == 5 && backend.live.load(Ordering::Relaxed) == 5;
+    drop(existing);
+    drop(cache);
+    Ok(success && backend.live.load(Ordering::Relaxed) == 0)
+}
+
+fn run_write_prepare_rollback_selftest() -> Result<bool, SystemError> {
+    // Retention admission fails after preparation for an unattached file
+    // cache. All write entry points must keep rollback ownership until then.
+    let file_cache = PageCache::new_unowned(None, None);
+    let full_page = vec![0x33; MMArch::PAGE_SIZE];
+    if file_cache.write(0, &full_page) != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+        || file_cache.write_single_full_page_with_transition(0, &full_page, |_| {})
+            != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+        || file_cache.write_single_page_segment_with_transition(
+            0,
+            &full_page,
+            PageCacheExpectedDirtyTransition::Start,
+            |_| {},
+        ) != Err(SystemError::EIO)
+        || file_cache.manager().pages_count()? != 0
+    {
+        return Ok(false);
+    }
+    let backend = Arc::new(PreallocateFailureBackend {
+        live: AtomicUsize::new(0),
+        limit: AtomicUsize::new(3),
+    });
+    let cache = PageCache::new_shmem(None, Some(backend.clone()));
+    cache.set_unevictable(true);
+    let existing = cache.manager().commit_overwrite(0)?;
+    {
+        let mut page = existing.write();
+        unsafe { page.as_slice_mut()[17] = 0x5a };
+        page.add_flags(PageFlags::PG_DIRTY);
+    }
+    let data = vec![0x7b; 5 * MMArch::PAGE_SIZE];
+    let metadata_called = core::cell::Cell::new(false);
+    for offset in [0, 8 * MMArch::PAGE_SIZE] {
+        let result = cache.write_with_before_dirty(offset, &data, |_| {
+            metadata_called.set(true);
+            Ok(())
+        });
+        if result != Err(SystemError::ENOMEM)
+            || metadata_called.get()
+            || cache.manager().pages_count()? != 1
+            || backend.live.load(Ordering::Relaxed) != 1
+            || unsafe { existing.read().as_slice()[17] != 0x5a }
+        {
+            return Ok(false);
+        }
+    }
+    if cache.write(0, &data) != Err(SystemError::ENOMEM)
+        || cache.manager().pages_count()? != 1
+        || backend.live.load(Ordering::Relaxed) != 1
+    {
+        return Ok(false);
+    }
+    // A filesystem can reject its metadata commit after all pages are ready.
+    backend.limit.store(5, Ordering::Relaxed);
+    if cache.write_with_before_dirty(0, &data, |_| Err(SystemError::ENOSPC))
+        != Err(SystemError::ENOSPC)
+        || cache.manager().pages_count()? != 1
+        || backend.live.load(Ordering::Relaxed) != 1
+        || unsafe { existing.read().as_slice()[17] != 0x5a }
+    {
+        return Ok(false);
+    }
+    if cache.write_with_before_dirty(0, &data, |_| Ok(()))? != data.len()
+        || cache.manager().pages_count()? != 5
+        || unsafe { existing.read().as_slice()[17] != 0x7b }
+    {
+        return Ok(false);
+    }
+    drop(existing);
+    drop(cache);
+    Ok(backend.live.load(Ordering::Relaxed) == 0)
+}
+
+/// Verify production Page flag hooks against isolated original-owner counters,
+/// including failed/shared state transitions and actual final frame release.
+fn run_memcg_page_state_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{MemoryAccount, MemoryKind, MemoryStat};
+    let root = MemoryAccount::new(0, None)?;
+    let leaf = MemoryAccount::new(0, Some(root.clone()))?;
+    let cache = PageCache::new_unowned(None, None);
+    let mut ok = true;
+    // Exercise the real terminal accounting edge without fabricating a
+    // successful reclaim or OOM victim. RETRY was already left uncounted.
+    let before = leaf.snapshot();
+    let pcb = crate::process::ProcessManager::current_pcb();
+    let usage_before = pcb
+        .get_rusage(crate::process::resource::RUsageWho::RusageThread)
+        .ok_or(SystemError::EINVAL)?;
+    for error in [SystemError::EINTR, SystemError::ERESTARTSYS] {
+        crate::mm::fault::account_fault_recovery_failure(
+            &leaf,
+            crate::mm::fault::FaultFlags::FAULT_FLAG_TRIED,
+            error,
+        );
+    }
+    ok &= leaf.snapshot().stats == before.stats;
+    crate::mm::fault::account_fault_recovery_failure(
+        &leaf,
+        crate::mm::fault::FaultFlags::FAULT_FLAG_TRIED,
+        SystemError::ENOMEM,
+    );
+    let after = leaf.snapshot();
+    let usage_after = pcb
+        .get_rusage(crate::process::resource::RUsageWho::RusageThread)
+        .ok_or(SystemError::EINVAL)?;
+    ok &= after.stats[MemoryStat::PgFault as usize]
+        == before.stats[MemoryStat::PgFault as usize] + 1
+        && after.stats[MemoryStat::PgMajFault as usize]
+            == before.stats[MemoryStat::PgMajFault as usize]
+        && usage_after.ru_minflt == usage_before.ru_minflt
+        && usage_after.ru_majflt == usage_before.ru_majflt;
+    // Rejected reservations never reach the physical allocator or either
+    // registry; consuming the rejected token must still roll its budget back.
+    for (kind, pages) in [(MemoryKind::Anon, 2), (MemoryKind::PageTables, 1)] {
+        let charge = leaf
+            .try_charge(kind, pages)
+            .map_err(|_| SystemError::ENOMEM)?;
+        ok &= matches!(
+            crate::mm::page::allocate_registered_data_page(
+                PageType::Normal,
+                PageFlags::PG_LRU,
+                Some(charge),
+            ),
+            Err(SystemError::EINVAL)
+        );
+        ok &= root.current_pages() == 0;
+    }
+    for kind in [MemoryKind::File, MemoryKind::Shmem, MemoryKind::Anon] {
+        let page_type = if kind == MemoryKind::File {
+            PageType::File(FileMapInfo {
+                page_cache: Arc::downgrade(&cache),
+                index: 0,
+            })
+        } else {
+            PageType::Normal
+        };
+        let charge = leaf.try_charge(kind, 1).map_err(|_| SystemError::ENOMEM)?;
+        let page = crate::mm::page::allocate_registered_data_page(
+            page_type,
+            PageFlags::PG_LRU,
+            Some(charge),
+        )?;
+        let manager_owner = page_manager_lock().get(&page.phys_address());
+        let lru_owner = page_reclaimer_lock().get(&page.phys_address());
+        ok &= manager_owner
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &page))
+            && lru_owner
+                .as_ref()
+                .is_some_and(|registered| Arc::ptr_eq(registered, &page));
+        drop(manager_owner);
+        drop(lru_owner);
+        let (inactive, active) = if kind == MemoryKind::File {
+            (MemoryStat::InactiveFile, MemoryStat::ActiveFile)
+        } else {
+            (MemoryStat::InactiveAnon, MemoryStat::ActiveAnon)
+        };
+        let before = root.snapshot();
+        ok &= before.stats[inactive as usize] == 1 && before.stats[active as usize] == 0;
+        {
+            let mut inner = page.write();
+            inner.add_flags(PageFlags::PG_ACTIVE);
+            inner.add_flags(PageFlags::PG_ACTIVE);
+        }
+        let activated = root.snapshot();
+        ok &= activated.stats[inactive as usize] == 0
+            && activated.stats[active as usize] == 1
+            && activated.stats[MemoryStat::PgActivate as usize]
+                == before.stats[MemoryStat::PgActivate as usize] + 1;
+        {
+            let mut inner = page.write();
+            inner.remove_flags(PageFlags::PG_ACTIVE);
+            inner.remove_flags(PageFlags::PG_ACTIVE);
+        }
+        let deactivated = root.snapshot();
+        ok &= deactivated.stats[inactive as usize] == 1
+            && deactivated.stats[active as usize] == 0
+            && deactivated.stats[MemoryStat::PgDeactivate as usize]
+                == before.stats[MemoryStat::PgDeactivate as usize] + 1;
+        let flags = PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK | PageFlags::PG_UNEVICTABLE;
+        {
+            let mut inner = page.write();
+            inner.add_flags(flags);
+            inner.add_flags(flags); // repeated publication must not double count
+        }
+        let snapshot = root.snapshot();
+        let file = u64::from(kind == MemoryKind::File);
+        ok &= snapshot.current == 1
+            && snapshot.stats[MemoryStat::FileDirty as usize] == file
+            && snapshot.stats[MemoryStat::FileWriteback as usize] == file
+            && snapshot.stats[MemoryStat::Unevictable as usize] == 1
+            && snapshot.stats[inactive as usize] == 0;
+        {
+            let mut inner = page.write();
+            inner.remove_flags(flags);
+            inner.remove_flags(flags);
+        }
+        ok &= root.snapshot().stats[inactive as usize] == 1;
+        page.write().set_flags(PageFlags::PG_LRU | flags);
+        crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&page));
+        let removed = page_manager_lock().remove_page_if_same(&page);
+        drop(removed);
+        drop(page);
+        let snapshot = root.snapshot();
+        ok &= snapshot.current == 0
+            && snapshot.stats[MemoryStat::FileDirty as usize] == 0
+            && snapshot.stats[MemoryStat::FileWriteback as usize] == 0
+            && snapshot.stats[MemoryStat::Unevictable as usize] == 0
+            && snapshot.stats[inactive as usize] == 0
+            && snapshot.stats[active as usize] == 0;
+    }
+    Ok(ok)
+}
+
+/// Real independent frames, not a charge-only model. Keep only addresses in
+/// the fixture so the reclaimer's final Arc::try_unwrap can actually succeed.
+struct MemcgReclaimFixture {
+    cache: Arc<PageCache>,
+    addresses: Vec<crate::mm::PhysAddr>,
+    identities: Vec<Weak<Page>>,
+}
+
+impl MemcgReclaimFixture {
+    fn new() -> Self {
+        Self {
+            cache: PageCache::new_unowned(None, None),
+            addresses: Vec::new(),
+            identities: Vec::new(),
+        }
+    }
+
+    fn install(
+        &mut self,
+        account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<usize, SystemError> {
+        self.install_with_state(account, PageState::UpToDate)
+    }
+
+    fn install_with_state(
+        &mut self,
+        account: &Arc<crate::cgroup::memory::MemoryAccount>,
+        state: PageState,
+    ) -> Result<usize, SystemError> {
+        use crate::cgroup::memory::MemoryKind;
+        self.addresses
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        self.identities
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let index = self.addresses.len();
+        let charge = account
+            .try_charge(MemoryKind::File, 1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        let mut flags = self.cache.page_flags();
+        if state.is_ready() {
+            flags |= PageFlags::PG_UPTODATE;
+        }
+        if state == PageState::Dirty {
+            flags |= PageFlags::PG_DIRTY;
+        } else if state == PageState::Writeback {
+            flags |= PageFlags::PG_WRITEBACK;
+        }
+        let page = crate::mm::page::allocate_registered_data_page(
+            PageType::File(FileMapInfo {
+                page_cache: Arc::downgrade(&self.cache),
+                index,
+            }),
+            flags,
+            Some(charge),
+        )?;
+        // Record before descriptor/cache installation: even a failed fixture
+        // publication must retire its actual registered frame.
+        self.addresses.push(page.phys_address());
+        self.identities.push(Arc::downgrade(&page));
+        // Publication accounts membership, not dirty/writeback transitions.
+        // Model the real Loading admission before changing the owned state.
+        let entry = Arc::try_new(PageEntry::new(page.clone(), PageState::Loading))
+            .map_err(|_| SystemError::ENOMEM)?;
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        self.cache
+            .publish_prepared_range(core::iter::once((index, &entry)), 1, &creator)
+            .map_err(PageCache::legacy_allocation_error)?;
+        let mut inner = self.cache.inner.lock();
+        entry.account_state_transition(PageState::Loading, state);
+        entry.set_state(state);
+        if state == PageState::Dirty {
+            inner.set_index(index, 1, true);
+        } else if state == PageState::Writeback {
+            inner.set_index(index, 2, true);
+        }
+        Ok(index)
+    }
+
+    fn linked(&self, index: usize) -> bool {
+        self.cache.manager().peek_page(index).is_some()
+            && page_reclaimer_lock().get(&self.addresses[index]).is_some()
+            && page_manager_lock().contains(&self.addresses[index])
+    }
+}
+
+impl Drop for MemcgReclaimFixture {
+    fn drop(&mut self) {
+        for index in 0..self.addresses.len() {
+            // Freed addresses may already have been recycled by another
+            // subsystem. Cleanup is by original Page identity, never PFN alone.
+            let expected = self.identities[index].upgrade();
+            let cache_owner = self.cache.inner.lock().remove_entry(index);
+            drop(cache_owner);
+            let Some(expected) = expected else {
+                continue;
+            };
+            crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&expected));
+            let manager_owner = page_manager_lock().remove_page_if_same(&expected);
+            drop(manager_owner);
+            drop(expected);
+        }
+    }
+}
+
+/// A Page Arc protects its bytes, but only an entry pin protects membership
+/// until a fault can publish its PTE/rmap. Exercise both sides without ever
+/// installing a stale PTE or relying on a timing-sensitive reclaimer race.
+fn run_custom_fill_fault_pin_selftest() -> Result<bool, SystemError> {
+    let task = crate::process::ProcessManager::current_pcb();
+    let owner = crate::cgroup::memory::account_for_task(&task);
+    let creator = crate::cgroup::memory::object_for_task(&task);
+    let cache = PageCache::new_unowned(None, None);
+    let mut ok = true;
+
+    let bare = cache
+        .manager
+        .try_commit_page_with(0, &owner, &creator, |_, dst| {
+            dst.fill(0x5a);
+            Ok(dst.len())
+        })
+        .map_err(PageCache::legacy_allocation_error)?;
+    let bare_phys = bare.phys_address();
+    cache.drop_clean_pages();
+    ok &= !page_manager_lock().contains(&bare_phys)
+        && page_reclaimer_lock().get(&bare_phys).is_none()
+        && unsafe { bare.read().as_slice()[0] == 0x5a };
+    drop(bare);
+
+    let mut protected_during_fill = false;
+    let pin = cache
+        .manager
+        .try_commit_page_with_pinned(0, &owner, &creator, |index, dst| {
+            let entry = cache
+                .inner
+                .lock()
+                .get_entry(index)
+                .ok_or(SystemError::EIO)?;
+            protected_during_fill =
+                entry.active_users() != 0 && cache.manager.remove_page(index)?.is_none();
+            dst.fill(0xa7);
+            Ok(dst.len())
+        })
+        .map_err(PageCache::legacy_allocation_error)?;
+    let page = pin.page();
+    let physical = page.phys_address();
+    let mut replayed_fill = false;
+    let hot_pin = cache
+        .manager
+        .try_commit_page_with_pinned(0, &owner, &creator, |_, _| {
+            replayed_fill = true;
+            Err(SystemError::EIO)
+        })
+        .map_err(PageCache::legacy_allocation_error)?;
+    ok &= protected_during_fill
+        && !replayed_fill
+        && Arc::ptr_eq(&hot_pin.page(), &page)
+        && cache
+            .manager
+            .remove_clean_page_for_reclaim(0, &page)?
+            .is_none()
+        && cache.drop_clean_pages() == 0
+        && page_manager_lock().contains(&physical)
+        && page_reclaimer_lock().get(&physical).is_some();
+
+    // Force the actual publication-loser branch deterministically: the winner
+    // must be pinned while membership is locked, and the unused prepared page
+    // must leave the registries without replacing that winner.
+    let prepared_page = cache
+        .allocate_page_with_owner(Arc::downgrade(&cache), 0, &owner)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let prepared_phys = prepared_page.phys_address();
+    let prepared = cache
+        .prepare_entry(&prepared_page, PageState::Loading, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let (winner, winner_pin, inserted) = cache
+        .publish_prepared_entry_pinned(0, &prepared, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    drop(pin);
+    drop(hot_pin);
+    ok &= !inserted
+        && Arc::ptr_eq(&winner.page, &page)
+        && winner.active_users() == 1
+        && !page_manager_lock().contains(&prepared_phys)
+        && page_reclaimer_lock().get(&prepared_phys).is_none()
+        && cache.drop_clean_pages() == 0;
+    drop(prepared);
+    drop(prepared_page);
+    drop(winner_pin);
+    drop(winner);
+    cache.drop_clean_pages();
+    ok &=
+        !page_manager_lock().contains(&physical) && page_reclaimer_lock().get(&physical).is_none();
+    drop(page);
+
+    let mut failed_identity = None;
+    let mut fill_calls = 0;
+    let failed = cache
+        .manager
+        .try_commit_page_with_pinned(1, &owner, &creator, |index, _| {
+            let entry = cache
+                .inner
+                .lock()
+                .get_entry(index)
+                .ok_or(SystemError::EIO)?;
+            failed_identity = Some(Arc::downgrade(&entry.page));
+            fill_calls += 1;
+            Err(SystemError::EIO)
+        });
+    ok &= matches!(failed, Err(MemoryAllocationError::System(SystemError::EIO)))
+        && fill_calls == 1
+        && !cache.fault_page_state(1).cached;
+    // Check the failed identity rather than a PFN another CPU may reuse after
+    // the successful rollback. Either registry retaining it keeps Weak live.
+    ok &= failed_identity.ok_or(SystemError::EIO)?.upgrade().is_none();
+    Ok(ok)
+}
+
+fn run_page_fault_cache_snapshot_selftest() -> Result<bool, SystemError> {
+    let root = crate::cgroup::memory::MemoryAccount::new(0, None)?;
+    let mut ok = true;
+    for state in [
+        PageState::Loading,
+        PageState::Error,
+        PageState::UpToDate,
+        PageState::Dirty,
+        PageState::Writeback,
+    ] {
+        let mut fixture = MemcgReclaimFixture::new();
+        ok &= fixture.cache.fault_page_state(0)
+            == PageCacheFaultState {
+                cached: false,
+                ready: false,
+            };
+        let index = fixture.install_with_state(&root, state)?;
+        ok &= fixture.cache.fault_page_state(index)
+            == PageCacheFaultState {
+                cached: true,
+                ready: state.is_ready(),
+            };
+        // Loading/Error are intentionally present but not ready, so the
+        // ready-only manager peek API must not be used to retire this fixture.
+        // Release the cache lock before acquiring Page.write below.
+        let page = fixture
+            .cache
+            .inner
+            .lock()
+            .get_entry(index)
+            .ok_or(SystemError::EIO)?
+            .page
+            .clone();
+        let mut page_guard = page.write();
+        let mut inner = fixture.cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        // This private state fixture has no actual I/O in flight. Balance
+        // the production transition before terminally detaching its content.
+        entry.account_state_transition(state, PageState::UpToDate);
+        entry.set_state(PageState::UpToDate);
+        inner.set_index(index, 1, false);
+        inner.set_index(index, 2, false);
+        page_guard.remove_flags(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK);
+        let removed = inner.remove_entry(index);
+        drop(inner);
+        drop(page_guard);
+        drop(page);
+        drop(removed);
+        drop(entry);
+        ok &= fixture.cache.fault_page_state(index)
+            == PageCacheFaultState {
+                cached: false,
+                ready: false,
+            };
+        drop(fixture);
+        ok &= root.current_pages() == 0;
+    }
+    Ok(ok)
+}
+
+fn run_memcg_reclaim_scan_budget_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{protection::ProtectionSnapshot, MemoryAccount, MemoryStat};
+    use crate::mm::{allocator::page_frame::PageFrameCount, page::PageReclaimer};
+
+    let root = MemoryAccount::new(0, None)?;
+    let owner = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut fixture = MemcgReclaimFixture::new();
+    for _ in 0..4 {
+        fixture.install(&owner)?;
+    }
+    // The fixture's real cache-entry/index metadata is charged to the actual
+    // runner ObjectAccount, while this isolated data leaf owns only four file
+    // frames. This checks data-LRU accounting, not metadata attribution.
+    let before = owner.snapshot();
+    let result = PageReclaimer::shrink_account(&owner, PageFrameCount::ONE)?;
+    let after = owner.snapshot();
+    let survivors = (0..4).filter(|index| fixture.linked(*index)).count();
+    let mut ok = result.reclaimed == 1
+        && result.detached == 1
+        && survivors == 3
+        && before.file == 4
+        && after.file == 3
+        && before.current == 4
+        && after.current == 3
+        && after.stats[MemoryStat::InactiveFile as usize] == 3
+        && after.stats[MemoryStat::PgSteal as usize]
+            == before.stats[MemoryStat::PgSteal as usize] + 1;
+
+    // Consume the real pass's inventory once: repeated candidates must not
+    // create a new budget. This component proof does not pretend those calls
+    // scan or release physical frames.
+    let mut snapshot = ProtectionSnapshot::new(&owner)?;
+    snapshot.prepare_scan(0, false, 0);
+    for _ in 0..3 {
+        ok &= snapshot.take_scan(Some(&owner), false);
+    }
+    ok &= !snapshot.take_scan(Some(&owner), false);
+
+    // A genuinely new owner/page after capture is absent from that snapshot.
+    // Its real cache/LRU/manager membership must survive conservative rejection;
+    // subsequent production passes can capture it normally.
+    let mut older_snapshot = ProtectionSnapshot::new(&root)?;
+    let newcomer = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut new_fixture = MemcgReclaimFixture::new();
+    let index = new_fixture.install(&newcomer)?;
+    older_snapshot.prepare_scan(0, false, 0);
+    ok &= !older_snapshot.permits(&newcomer, false)
+        && !older_snapshot.take_scan(Some(&newcomer), false)
+        && new_fixture.linked(index)
+        && newcomer.current_pages() == 1;
+    drop(new_fixture);
+    drop(fixture);
+    ok &= owner.current_pages() == 0 && newcomer.current_pages() == 0;
+    Ok(ok)
+}
+
+/// Exercise the actual NOIO scanner/retirement path. Self-held resource locks
+/// are intentional: a blocking fallback would deadlock the proc selftest.
+fn noio_reclaim_unstarted(progress: &crate::mm::page::ReclaimProgress) -> bool {
+    progress.reclaimed == 0
+        && progress.detached == 0
+        && progress.scanned == 0
+        && progress.dirty_seen == 0
+        && progress.writeback_scheduled == 0
+}
+
+/// NOIO is try-only: an unrelated owner of the global LRU can reject a pass
+/// before scanning. Retry only that unchanged outcome, never a failed scan or
+/// partial retirement. All temporary identity pins leave before the next call.
+fn retry_unstarted_noio_reclaim(
+    account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    unchanged: impl Fn() -> bool,
+) -> Result<(crate::mm::page::ReclaimProgress, usize), SystemError> {
+    let began = crate::time::timer::clock();
+    for calls in 1..=4096 {
+        let progress = crate::mm::page::PageReclaimer::shrink_account_noio(
+            account,
+            crate::mm::allocator::page_frame::PageFrameCount::ONE,
+        )?;
+        if !noio_reclaim_unstarted(&progress)
+            || !unchanged()
+            || calls == 4096
+            || crate::time::timer::clock().wrapping_sub(began) >= 5 * crate::time::clocksource::HZ
+        {
+            return Ok((progress, calls));
+        }
+        crate::sched::cond_resched();
+    }
+    unreachable!("bounded NOIO reclaim loop always returns")
+}
+
+fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::accounting::{ChargeFailure, ChargeFailureReason};
+    use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy};
+    use crate::mm::allocation::MemoryAllocationError;
+    use crate::mm::{
+        allocator::page_frame::PageFrameCount,
+        page::{EntryFlags, PageReclaimer},
+        ucontext::{LockedVMA, VMA},
+        VirtAddr, VirtRegion, VmFlags,
+    };
+    let root = MemoryAccount::new(0, None)?;
+    // The hard counter cap must terminate before task-local policy lookup.
+    // Keep the same outer allocation-error entry used by stacked I/O callers.
+    let overflow = MemoryAllocationError::Charge(ChargeFailure {
+        account: root.clone(),
+        reason: ChargeFailureReason::CounterOverflow,
+        request_kind: crate::cgroup::memory::MemoryKind::File,
+        requested_pages: 1,
+    });
+    if overflow.recover(&mut Default::default()) != Err(SystemError::ENOMEM) {
+        return Ok(false);
+    }
+    let a = MemoryAccount::new(0, Some(root.clone()))?;
+    let b = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut fixture = MemcgReclaimFixture::new();
+    let mut sibling = MemcgReclaimFixture::new();
+    let mut ok = true;
+    let reclaim = || PageReclaimer::shrink_account_noio(&a, PageFrameCount::ONE);
+    macro_rules! fail_stage {
+        ($stage:expr) => {
+            if !ok {
+                log::error!(
+                    "NOIO selftest failed: stage={} a={} b={} root={}",
+                    $stage,
+                    a.current_pages(),
+                    b.current_pages(),
+                    root.current_pages()
+                );
+                return Ok(false);
+            }
+        };
+    }
+
+    let index = fixture.install(&a)?;
+    let page = fixture
+        .cache
+        .manager()
+        .peek_page(index)
+        .ok_or(SystemError::EIO)?;
+    {
+        let _page_guard = page.write();
+        let progress = reclaim()?;
+        ok &= progress.reclaimed == 0 && progress.detached == 0;
+    }
+    {
+        let _cache_guard = fixture.cache.inner.lock();
+        let progress = reclaim()?;
+        ok &= progress.reclaimed == 0 && progress.detached == 0;
+    }
+    ok &= fixture.linked(index) && a.current_pages() == 1;
+    fail_stage!("busy_locks");
+    let pin = fixture
+        .cache
+        .manager()
+        .peek_page_pinned(index)
+        .ok_or(SystemError::EIO)?;
+    ok &= reclaim()?.detached == 0 && fixture.linked(index);
+    drop(pin);
+    fail_stage!("active_pin");
+
+    // Install/remove the real page rmap source without touching any user MM:
+    // NOIO must reject mapped content before trying a reverse-map walker.
+    let creator =
+        crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+    let vma = LockedVMA::try_new(
+        VMA::new(
+            VirtRegion::new(VirtAddr::new(MMArch::PAGE_SIZE), MMArch::PAGE_SIZE),
+            VmFlags::VM_NONE,
+            EntryFlags::new(),
+            None,
+            None,
+            false,
+        ),
+        &creator,
+    )
+    .map_err(PageCache::legacy_allocation_error)?;
+    page.write()
+        .insert_vma(vma.clone(), VirtAddr::new(MMArch::PAGE_SIZE), false);
+    ok &= reclaim()?.detached == 0 && fixture.linked(index) && page.read().map_count() == 1;
+    page.write().remove_vma(&vma);
+    drop(vma);
+    fail_stage!("mapped_rmap");
+    for flag in [
+        PageFlags::PG_DIRTY,
+        PageFlags::PG_WRITEBACK,
+        PageFlags::PG_UNEVICTABLE,
+    ] {
+        page.write().add_flags(flag);
+        let progress = reclaim()?;
+        ok &= progress.detached == 0 && progress.writeback_scheduled == 0 && fixture.linked(index);
+        page.write().remove_flags(flag);
+        fail_stage!("page_flags");
+    }
+    drop(page);
+    let clean_low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
+    let (progress, clean_calls) = retry_unstarted_noio_reclaim(&a, || {
+        a.current_pages() == 1
+            && b.current_pages() == 0
+            && root.current_pages() == 1
+            && fixture.identities[index].upgrade().is_some()
+            && fixture.linked(index)
+            && a.snapshot().events_local[MemoryEvent::Low as usize] == clean_low_before
+    })?;
+    ok &= progress.reclaimed == 1
+        && progress.detached == 1
+        && progress.writeback_scheduled == 0
+        && a.current_pages() == 0
+        && fixture.identities[index].upgrade().is_none()
+        && !fixture.linked(index);
+    if !ok {
+        log::error!(
+            "NOIO selftest failed: stage=clean_retire progress={progress:?} calls={clean_calls} a={}",
+            a.current_pages()
+        );
+        return Ok(false);
+    }
+
+    for state in [
+        PageState::Loading,
+        PageState::Dirty,
+        PageState::Writeback,
+        PageState::Error,
+    ] {
+        let mut rejected = MemcgReclaimFixture::new();
+        rejected.install_with_state(&a, state)?;
+        let progress = reclaim()?;
+        ok &= progress.detached == 0
+            && progress.reclaimed == 0
+            && progress.writeback_scheduled == 0
+            && a.current_pages() == 1;
+        drop(rejected);
+        ok &= a.current_pages() == 0;
+        fail_stage!("entry_state");
+    }
+
+    let index = fixture.install(&a)?;
+    let sibling_index = sibling.install(&b)?;
+    a.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    b.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    let progress = PageReclaimer::shrink_account_noio(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0
+        && root.current_pages() == 2
+        && fixture.linked(index)
+        && sibling.linked(sibling_index);
+    fail_stage!("min_protection");
+    a.set_policy(MemoryPolicy {
+        low: 1,
+        ..Default::default()
+    });
+    let low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
+    let low_unchanged = || {
+        a.current_pages() == 1
+            && b.current_pages() == 1
+            && root.current_pages() == 2
+            && fixture.identities[index].upgrade().is_some()
+            && sibling.identities[sibling_index].upgrade().is_some()
+            && fixture.linked(index)
+            && sibling.linked(sibling_index)
+            && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before
+    };
+    // Deterministically prove the allowed no-scan outcome. Inspect membership
+    // only after releasing this guard: linked() reacquires the global LRU.
+    let blocked = {
+        let _held = page_reclaimer_lock();
+        PageReclaimer::shrink_account_noio(&root, PageFrameCount::ONE)?
+    };
+    ok &= noio_reclaim_unstarted(&blocked) && low_unchanged();
+    fail_stage!("busy_lru");
+    let (progress, low_calls) = retry_unstarted_noio_reclaim(&root, low_unchanged)?;
+    ok &= progress.reclaimed == 1
+        && a.current_pages() == 0
+        && b.current_pages() == 1
+        && !fixture.linked(index)
+        && sibling.linked(sibling_index)
+        && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before + 1;
+    if !ok {
+        log::error!("NOIO selftest failed: stage=low_reclaim progress={progress:?} calls={low_calls} a={} b={} low_before={} low_after={}", a.current_pages(), b.current_pages(), low_before, a.snapshot().events_local[MemoryEvent::Low as usize]);
+        return Ok(false);
+    }
+    drop(fixture);
+    drop(sibling);
+    Ok(ok && root.current_pages() == 0)
+}
+
+fn run_memcg_reclaim_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{MemoryAccount, MemoryEvent, MemoryPolicy, MemoryStat};
+    use crate::mm::{allocator::page_frame::PageFrameCount, page::PageReclaimer};
+    // These accounts never become the runner's membership/root cgroup.
+    let root = MemoryAccount::new(0, None)?;
+    let a = MemoryAccount::new(0, Some(root.clone()))?;
+    let b = MemoryAccount::new(0, Some(root.clone()))?;
+    let mut af = MemcgReclaimFixture::new();
+    let mut bf = MemcgReclaimFixture::new();
+    af.install(&a)?;
+    af.install(&a)?;
+    let sibling = bf.install(&b)?;
+    let mut ok = true;
+
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1
+        && a.current_pages() == 1
+        && b.current_pages() == 1
+        && bf.linked(sibling);
+    a.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    b.set_policy(MemoryPolicy {
+        min: 1,
+        ..Default::default()
+    });
+    let progress = PageReclaimer::shrink_account(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0 && root.current_pages() == 2 && bf.linked(sibling);
+
+    a.set_policy(MemoryPolicy {
+        low: 1,
+        ..Default::default()
+    });
+    let low_before = a.snapshot().events_local[MemoryEvent::Low as usize];
+    let progress = PageReclaimer::shrink_account(&root, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1
+        && a.current_pages() == 0
+        && b.current_pages() == 1
+        && bf.linked(sibling)
+        && a.snapshot().events_local[MemoryEvent::Low as usize] == low_before + 1;
+
+    // Reclaim root's own declared protection must not protect itself.
+    a.set_policy(MemoryPolicy {
+        min: 100,
+        low: 100,
+        ..Default::default()
+    });
+    af.install(&a)?;
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 1 && a.current_pages() == 0;
+
+    let index = af.install(&a)?;
+    let pin = af
+        .cache
+        .manager()
+        .peek_page_pinned(index)
+        .ok_or(SystemError::EIO)?;
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0 && af.linked(index) && a.current_pages() == 1;
+    drop(pin);
+    ok &= PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?.reclaimed == 1;
+
+    let index = af.install(&a)?;
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        let mut guard = page.write();
+        guard.add_flags(PageFlags::PG_DIRTY);
+        // This isolated cache has no inode/retention owner. Construct its
+        // tracked dirty membership with the same production counter/state
+        // primitives; do not bypass normal file dirty admission elsewhere.
+        let mut inner = af.cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        inner.set_index(index, 1, true);
+    }
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0
+        && progress.dirty_seen == 1
+        && af.linked(index)
+        && a.current_pages() == 1;
+    // Only fixture content is discarded; this is not a production dirty
+    // reclaim strategy. Use the actual membership/state accounting hooks.
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        page.write().remove_flags(PageFlags::PG_DIRTY);
+    }
+    af.cache.mark_page_uptodate(index);
+    ok &= PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?.reclaimed == 1;
+
+    let index = af.install(&a)?;
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        page.write().add_flags(PageFlags::PG_UNEVICTABLE);
+    }
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.reclaimed == 0 && af.linked(index) && a.current_pages() == 1;
+    {
+        let page = af
+            .cache
+            .manager()
+            .peek_page(index)
+            .ok_or(SystemError::EIO)?;
+        page.write().remove_flags(PageFlags::PG_UNEVICTABLE);
+    }
+    ok &= PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?.reclaimed == 1;
+
+    // Initial mapping-UNE pages already own their sole LRU node. Classification
+    // changes cannot unregister it or allocate a replacement node.
+    af.cache.set_unevictable(true);
+    let index = af.install(&a)?;
+    let retained = af
+        .cache
+        .manager()
+        .peek_page(index)
+        .ok_or(SystemError::EIO)?;
+    ok &= af.linked(index)
+        && retained
+            .read()
+            .flags()
+            .contains(PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE)
+        && a.snapshot().stats[MemoryStat::InactiveFile as usize] == 0;
+    for _ in 0..3 {
+        af.cache.set_unevictable(false);
+        af.cache.reclassify_unevictable_pages(true);
+        ok &= af.linked(index) && !retained.read().flags().contains(PageFlags::PG_UNEVICTABLE);
+        af.cache.set_unevictable(true);
+        af.cache.reclassify_unevictable_pages(false);
+        ok &= af.linked(index) && retained.read().flags().contains(PageFlags::PG_UNEVICTABLE);
+    }
+    af.cache.set_unevictable(false);
+    af.cache.reclassify_unevictable_pages(true);
+    // Normal COW has no ownership in the original file cache/LRU. Exercise
+    // the production copy path, then identity-retire its actual new frame.
+    retained
+        .write()
+        .add_flags(PageFlags::PG_UNEVICTABLE | PageFlags::PG_DIRTY);
+    let copied = page_manager_lock()
+        .copy_page_as_normal(&retained.phys_address(), &mut LockedFrameAllocator)?;
+    ok &= matches!(copied.read().page_type(), PageType::Normal)
+        && !copied.read().flags().intersects(
+            PageFlags::PG_LRU
+                | PageFlags::PG_UNEVICTABLE
+                | PageFlags::PG_DIRTY
+                | PageFlags::PG_WRITEBACK,
+        )
+        && page_reclaimer_lock().get(&copied.phys_address()).is_none();
+    crate::mm::page::retire_unmapped_page(&copied);
+    drop(copied);
+    retained
+        .write()
+        .remove_flags(PageFlags::PG_UNEVICTABLE | PageFlags::PG_DIRTY);
+    ok &= a.snapshot().stats[MemoryStat::InactiveFile as usize] == 1;
+    let progress = PageReclaimer::shrink_account(&a, PageFrameCount::ONE)?;
+    ok &= progress.detached == 1
+        && progress.reclaimed == 0
+        && a.current_pages() == 1
+        && a.snapshot().stats[MemoryStat::InactiveFile as usize] == 0
+        && !af.linked(index)
+        && !page_manager_lock().contains(&af.addresses[index])
+        && page_reclaimer_lock().get(&af.addresses[index]).is_none();
+    // Repeated munlock-style classification after terminal unlink must never
+    // resurrect the externally pinned old Page in the global registry.
+    for _ in 0..3 {
+        retained.write().add_flags(PageFlags::PG_UNEVICTABLE);
+        crate::mm::ucontext::InnerAddressSpace::remove_page_unevictable_if_unneeded(&retained);
+        ok &= !retained.read().flags().contains(PageFlags::PG_LRU)
+            && page_reclaimer_lock()
+                .get(&retained.phys_address())
+                .is_none();
+    }
+    drop(retained);
+    ok &= a.current_pages() == 0;
+    drop(af);
+    drop(bf);
+    Ok(ok && root.current_pages() == 0)
+}
+
+/// Fail at backend admission, before allocating or submitting a cold page.
+/// A ready prefix must be returned without asking this backend about its tail.
+#[derive(Debug)]
+struct ReadUserErrorBackend;
+
+impl PageCacheBackend for ReadUserErrorBackend {
+    fn read_page(&self, _: usize, _: &mut [u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+
+    fn write_page(&self, _: usize, _: &[u8]) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+
+    fn npages(&self) -> usize {
+        17
+    }
+
+    fn read_window_limit(&self, _: usize, _: usize) -> Result<usize, SystemError> {
+        Err(SystemError::EIO)
+    }
+}
+
+fn run_read_user_batch_selftest() -> Result<bool, SystemError> {
+    use crate::cgroup::memory::{object::ObjectAccount, MemoryAccount, MemoryPolicy};
+    use crate::filesystem::vfs::{FileType, InodeMode};
+
+    let fs = crate::filesystem::ramfs::RamFS::new();
+    let inode = fs
+        .root_inode()
+        .create(
+            "read-user-batch",
+            FileType::File,
+            InodeMode::from_bits_truncate(0o600),
+        )
+        .map_err(PageCache::legacy_allocation_error)?;
+    let page_size = MMArch::PAGE_SIZE;
+    inode
+        .resize(17 * page_size)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let root = MemoryAccount::new(0, None)?;
+    let creator = ObjectAccount::new(&root)?;
+    let mut hot = MemcgReclaimFixture::new();
+    hot.cache = PageCache::new_unowned(Some(Arc::downgrade(&inode)), None);
+    for _ in 0..17 {
+        hot.install(&root)?;
+    }
+    let batch = hot
+        .cache
+        .prepare_read_user_batch(7, usize::MAX, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let bounded = batch.len() == 16 * page_size - 7
+        && batch.items.iter().flatten().count() == 16
+        && hot
+            .cache
+            .inner
+            .lock()
+            .get_entry(0)
+            .is_some_and(|entry| entry.active_users() == 1);
+    drop(batch);
+    let released = (0..17).all(|index| {
+        hot.cache
+            .inner
+            .lock()
+            .get_entry(index)
+            .is_some_and(|entry| entry.active_users() == 0)
+    });
+    let last = hot
+        .cache
+        .prepare_read_user_batch(17 * page_size - 3, usize::MAX, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let tail = last.len() == 3;
+    drop(last);
+    let eof = hot
+        .cache
+        .prepare_read_user_batch(usize::MAX, usize::MAX, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?
+        .len()
+        == 0;
+    let empty = hot
+        .cache
+        .prepare_read_user_batch(0, 0, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?
+        .len()
+        == 0;
+
+    let mut prefix = MemcgReclaimFixture::new();
+    prefix.cache = PageCache::new_unowned(
+        Some(Arc::downgrade(&inode)),
+        Some(Arc::new(ReadUserErrorBackend)),
+    );
+    prefix.install(&root)?;
+    let batch = prefix
+        .cache
+        .prepare_read_user_batch(0, 2 * page_size, &root, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let prefix_first = batch.len() == page_size;
+    drop(batch);
+    let tail_error = matches!(
+        prefix
+            .cache
+            .prepare_read_user_batch(page_size, page_size, &root, &creator),
+        Err(MemoryAllocationError::System(SystemError::EIO))
+    );
+    let cold = PageCache::new_unowned(
+        Some(Arc::downgrade(&inode)),
+        Some(Arc::new(ReadUserErrorBackend)),
+    );
+    let first_error = matches!(
+        cold.prepare_read_user_batch(0, page_size, &root, &creator),
+        Err(MemoryAllocationError::System(SystemError::EIO))
+    );
+
+    // Data admission is isolated from descriptor charges, as in the existing
+    // DMA quota selftest. Refusal must remain typed and publish no Loading slot.
+    let rejected_owner = MemoryAccount::new(0, Some(root.clone()))?;
+    rejected_owner.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    let rejected = PageCache::new_shmem(Some(Arc::downgrade(&inode)), None);
+    let rejected_charge = matches!(
+        rejected.prepare_read_user_batch(0, page_size, &rejected_owner, &creator),
+        Err(MemoryAllocationError::Charge(failure))
+            if Arc::ptr_eq(&failure.account, &rejected_owner)
+                && failure.reason == crate::cgroup::memory::ChargeFailureReason::Max
+    );
+    let no_receipt = rejected_owner.current_pages() == 0 && rejected.manager().pages_count()? == 0;
+    Ok(bounded
+        && released
+        && tail
+        && eof
+        && empty
+        && prefix_first
+        && tail_error
+        && first_error
+        && rejected_charge
+        && no_receipt)
+}
+
+pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, SystemError> {
+    if PAGECACHE_ACCOUNTING_SELFTEST_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(SystemError::EBUSY);
+    }
+    let _running = PageCacheAccountingSelftestGuard;
+
+    if !dirty_accounting::run()? {
+        return Ok("status=fail stage=dirty_accounting_capability\n".into());
+    }
+    match resident_backing::run() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=resident_backing_writeback\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=resident_backing_writeback error={error:?}\n"
+            ))
+        }
+    }
+
+    if !subpage::run()? {
+        return Ok("status=fail stage=subpage_buffers\n".into());
+    }
+
+    if !run_memcg_page_state_selftest()? {
+        return Ok("status=fail stage=memcg_page_state\n".into());
+    }
+
+    if !crate::mm::ucontext::AddressSpace::debug_accounted_body_lifetime()? {
+        return Ok("status=fail stage=memcg_as_body_lifetime\n".into());
+    }
+
+    match crate::mm::ucontext::LockedVMA::debug_accounted_body_lifetime() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_vma_body_lifetime\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_vma_body_lifetime error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::filesystem::vfs::file::selftest::run_body_lifetime() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_file_body_lifetime\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_file_body_lifetime error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::filesystem::vfs::file::selftest::run_write_completion() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=file_write_completion\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=file_write_completion error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::filesystem::vfs::file::selftest::run_legacy_writev_completion() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=legacy_writev_completion\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=legacy_writev_completion error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::filesystem::fs::run_accounting_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_fs_context\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_fs_context error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::process::run_resource_birth_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_task_resources\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_task_resources error={error:?}\n"
+            ))
+        }
+    }
+
+    match crate::ipc::pipe::PipeRuntime::run_accounting_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=memcg_pipe_storage\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=memcg_pipe_storage error={error:?}\n"
+            ))
+        }
+    }
+
+    let (fdtable_body_size, fdtable_body_class) =
+        match crate::filesystem::vfs::fdtable::run_body_layout_selftest() {
+            Ok((true, bytes, class)) => (bytes, class),
+            Ok((false, _, _)) => return Ok("status=fail stage=memcg_fdtable_body_layout\n".into()),
+            Err(error) => {
+                return Ok(alloc::format!(
+                    "status=fail stage=memcg_fdtable_body_layout error={error:?}\n"
+                ))
+            }
+        };
+    let fdtable_layout_report = alloc::format!(
+        "memcg_fs_context=ok\nmemcg_task_resources=ok\nmemcg_pipe_storage=ok\nmemcg_fdtable_body_layout=ok\nfdtable_body_size={fdtable_body_size}\nfdtable_body_class={fdtable_body_class}\n"
+    );
+
+    if !run_memcg_reclaim_selftest()? {
+        return Ok("status=fail stage=memcg_reclaim\n".into());
+    }
+
+    if !run_memcg_reclaim_scan_budget_selftest()? {
+        return Ok("status=fail stage=memcg_reclaim_scan_budget\n".into());
+    }
+
+    if !run_memcg_noio_reclaim_selftest()? {
+        return Ok("status=fail stage=memcg_noio_reclaim\n".into());
+    }
+
+    if !run_custom_fill_fault_pin_selftest()? {
+        return Ok("status=fail stage=custom_fill_fault_pin\n".into());
+    }
+
+    if !run_page_fault_cache_snapshot_selftest()? {
+        return Ok("status=fail stage=fault_cache_snapshot\n".into());
+    }
+
+    if !run_registry_batch_retire_selftest() {
+        return Ok("status=fail stage=registry_batch_retire\n".into());
+    }
+
+    if !run_registry_churn_selftest() {
+        return Ok("status=fail stage=registry_churn\n".into());
+    }
+
+    if !run_registry_snapshot_lifetime_selftest() {
+        return Ok("status=fail stage=registry_snapshot_lifetime\n".into());
+    }
+
+    if !run_registry_concurrent_snapshot_selftest() {
+        return Ok("status=fail stage=registry_concurrent_snapshot\n".into());
+    }
+
+    if !run_write_prepare_rollback_selftest()? {
+        return Ok("status=fail stage=write_prepare_rollback\n".into());
+    }
+
+    match run_ramfs_truncate_metadata_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=ramfs_truncate_metadata\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=ramfs_truncate_metadata error={error:?}\n"
+            ))
+        }
+    }
+
+    match run_ramfs_fallocate_range_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=ramfs_fallocate_range\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=ramfs_fallocate_range error={error:?}\n"
+            ))
+        }
+    }
+
+    if !run_preallocate_rollback_selftest()? {
+        return Ok("status=fail stage=preallocate_rollback\n".into());
+    }
+
+    if !run_clean_unlink_liveness_selftest()? {
+        return Ok("status=fail stage=clean_unlink_liveness\n".into());
+    }
+
+    if !run_writeback_domain_lifecycle_selftest() {
+        return Ok("status=fail stage=writeback_domain_lifecycle\n".into());
+    }
+
+    if !run_detached_read_batch_completion_selftest()? {
+        return Ok("status=fail stage=detached_read_batch_completion\n".into());
+    }
+
+    if !run_batch_admission_atomicity_selftest()? {
+        return Ok("status=fail stage=batch_admission_atomicity\n".into());
+    }
+    if !run_read_user_batch_selftest()? {
+        return Ok("status=fail stage=read_user_batch\n".into());
+    }
+
+    if !run_required_optional_dma_quota_selftest()? {
+        return Ok("status=fail stage=required_optional_dma_quota\n".into());
+    }
+
+    if !run_preallocated_batch_lifecycle_selftest()? {
+        return Ok("status=fail stage=preallocated_batch_lifecycle\n".into());
+    }
+
+    let fault_invalidate_retry_order = run_invalidate_retry_lock_order_selftest().unwrap_or(false);
+    if !fault_invalidate_retry_order {
+        return Ok("status=fail stage=fault_invalidate_retry_order\n".into());
+    }
+
+    let tag_scan_chunk_release = run_tag_scan_chunk_release_selftest().unwrap_or(false);
+    if !tag_scan_chunk_release {
+        return Ok("status=fail stage=tag_scan_chunk_release\n".into());
+    }
+
+    let dirty_incarnation = match run_dirty_incarnation_selftest() {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=dirty_incarnation error={error:?}\n"
+            ));
+        }
+    };
+    if !dirty_incarnation {
+        return Ok("status=fail stage=dirty_incarnation\n".into());
+    }
+
+    let remote_dirty_publish = match run_remote_dirty_publish_selftest() {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=remote_dirty_publish error={error:?}\n"
+            ));
+        }
+    };
+    if !remote_dirty_publish {
+        return Ok("status=fail stage=remote_dirty_publish\n".into());
+    }
+
+    let single_page_token_certificate = match run_single_page_token_certificate_selftest() {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=single_page_token_certificate error={error:?}\n"
+            ));
+        }
+    };
+    if !single_page_token_certificate {
+        return Ok("status=fail stage=single_page_token_certificate\n".into());
+    }
+
+    #[allow(dead_code)]
+    struct PageEntryLayoutBaseline {
+        page: Arc<Page>,
+        instance_id: u64,
+        state: AtomicU8,
+        dirty_incarnation: AtomicU64,
+        dirty_transition_kind: AtomicU8,
+        writeback_tag: AtomicU64,
+        writeback_incarnation: AtomicU64,
+        accounted_unevictable: AtomicBool,
+        active_users: AtomicUsize,
+        wait_queue: WaitQueue,
+    }
+
+    let entry_size = core::mem::size_of::<PageEntry>();
+    let baseline_size = core::mem::size_of::<PageEntryLayoutBaseline>();
+    if entry_size > baseline_size {
+        return Ok(alloc::format!(
+            "status=fail stage=layout baseline_size={baseline_size} entry_size={entry_size}\n"
+        ));
+    }
+
+    if !run_submitted_writeback_selftest()? {
+        return Ok("status=fail stage=submitted_writeback\n".into());
+    }
+
+    let writeback_budget_retry = run_async_writeback_budget_retry_selftest();
+    if !writeback_budget_retry {
+        return Ok("status=fail stage=writeback_budget_retry\n".into());
+    }
+
+    match run_domain_writeback_start_selftest() {
+        Ok(true) => {}
+        Ok(false) => return Ok("status=fail stage=domain_writeback_start\n".into()),
+        Err(error) => {
+            return Ok(alloc::format!(
+                "status=fail stage=domain_writeback_start error={error:?}\n"
+            ))
+        }
+    }
+
+    // All pre-existing fixture paths expect an immediate claim.  Keep their
+    // setup concise while treating an unexpected defer as a failed claim; the
+    // dedicated token fixture below exercises both defer outcomes explicitly.
+    let claimed_or_none = |outcome: WritebackClaimOutcome| match outcome {
+        WritebackClaimOutcome::Claimed(batch) => Some(batch),
+        WritebackClaimOutcome::NoBatch
+        | WritebackClaimOutcome::Deferred(_)
+        | WritebackClaimOutcome::FailedRecorded(_) => None,
+    };
+
+    // The future ext4 delalloc backend opts into invalidate-before-admission so
+    // its admission may acquire `size_lock -> io_lock`.  Exercise the actual
+    // Dirty -> Writeback -> completion transition under that order, then prove
+    // a concurrent invalidator prevents the try-only path from entering the
+    // backend at all.
+    let admission_backend = Arc::new(PageCacheAdmissionOrderSelftestBackend::new(
+        PageCacheWritebackAdmissionOrder::InvalidateBeforeAdmission,
+        true,
+    ));
+    let admission_backend_dyn: Arc<dyn PageCacheBackend> = admission_backend.clone();
+    let admission_cache = PageCache::new_unowned(None, Some(admission_backend_dyn.clone()));
+    *admission_backend.cache.lock() = Arc::downgrade(&admission_cache);
+    let admission_page = admission_cache.get_or_create_page_zero(0)?;
+    let mark_admission_dirty = || -> Result<(), SystemError> {
+        admission_page.write().add_flags(PageFlags::PG_DIRTY);
+        let mut inner = admission_cache.inner.lock();
+        let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+        let old_state = entry.state();
+        if old_state == PageState::Writeback {
+            return Err(SystemError::EBUSY);
+        }
+        inner.set_index(0, 1, true);
+        entry.account_state_transition(old_state, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        Ok(())
+    };
+
+    mark_admission_dirty()?;
+    let mut blocking_batch = None;
+    let blocking_admission = PageCacheManager::with_writeback_admission(
+        &admission_cache,
+        &admission_backend_dyn,
+        &mut || {
+            blocking_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &admission_cache,
+                0,
+                0,
+                MMArch::PAGE_SIZE,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let Some(blocking_batch) = blocking_batch else {
+        return Ok("status=fail stage=writeback_admission_blocking_claim\n".into());
+    };
+    PageCacheManager::complete_writeback_batch(blocking_batch, Ok(()))?;
+
+    mark_admission_dirty()?;
+    let mut try_batch = None;
+    let try_admission = PageCacheManager::try_with_writeback_admission(
+        &admission_cache,
+        &admission_backend_dyn,
+        &mut || {
+            try_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &admission_cache,
+                0,
+                0,
+                MMArch::PAGE_SIZE,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .unwrap_or(false);
+    let Some(try_batch) = try_batch else {
+        return Ok("status=fail stage=writeback_admission_try_claim\n".into());
+    };
+    PageCacheManager::complete_writeback_batch(try_batch, Ok(()))?;
+
+    mark_admission_dirty()?;
+    let callbacks_before_invalidate = admission_backend
+        .observed_expected_order
+        .load(Ordering::Acquire);
+    let mut claim_entered_while_invalidating = false;
+    let try_rejected_by_invalidation = {
+        let _invalidate = admission_cache.invalidate_write();
+        !PageCacheManager::try_with_writeback_admission(
+            &admission_cache,
+            &admission_backend_dyn,
+            &mut || {
+                claim_entered_while_invalidating = true;
+                Ok(())
+            },
+        )
+        .unwrap_or(true)
+    };
+    let try_rejected_page_state_ok = {
+        let inner = admission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    // A try-only backend may obtain its admission locks yet find that a
+    // stable EOF is unavailable without waiting.  That is a normal skip, not
+    // a writeback error: PageCache must not publish the dirty page as
+    // Writeback or clear its dirty membership.
+    let errseq_before_try_stable_size_skip = admission_cache.sample_writeback_error();
+    let try_stable_size_skip = matches!(
+        PageCacheManager::try_claim_and_snapshot_within_admission_with_stable_size(
+            &admission_cache,
+            &admission_backend_dyn,
+            0,
+            0,
+            None,
+            || Ok(None),
+        )?,
+        WritebackClaimOutcome::NoBatch
+    );
+    let try_stable_size_skip_page_state_ok = {
+        let inner = admission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let try_stable_size_skip_errseq_clean = admission_cache
+        .check_writeback_error_since(errseq_before_try_stable_size_skip)
+        .is_none();
+    let admission_order_ok = blocking_admission
+        && try_admission
+        && try_rejected_by_invalidation
+        && !claim_entered_while_invalidating
+        && try_rejected_page_state_ok
+        && try_stable_size_skip
+        && try_stable_size_skip_page_state_ok
+        && try_stable_size_skip_errseq_clean
+        && admission_backend
+            .observed_expected_order
+            .load(Ordering::Acquire)
+            == 3
+        && callbacks_before_invalidate == 2
+        && admission_backend
+            .observed_unexpected_order
+            .load(Ordering::Acquire)
+            == 0;
+    if !admission_order_ok {
+        return Ok(alloc::format!(
+            "status=fail stage=writeback_admission_order blocking={blocking_admission} try={try_admission} rejected={try_rejected_by_invalidation} entered={claim_entered_while_invalidating} dirty={try_rejected_page_state_ok} stable_skip={try_stable_size_skip} stable_skip_dirty={try_stable_size_skip_page_state_ok} stable_skip_errseq_clean={try_stable_size_skip_errseq_clean} expected={} unexpected={}\n",
+            admission_backend.observed_expected_order.load(Ordering::Acquire),
+            admission_backend.observed_unexpected_order.load(Ordering::Acquire),
+        ));
+    }
+    let admission_removed = admission_cache.manager.remove_page(0)?.is_some();
+    let admission_paddr = admission_page.phys_address();
+    page_manager_lock().remove_page(&admission_paddr);
+    let _ = page_reclaimer_lock().remove_page(&admission_paddr);
+    if !admission_removed {
+        return Ok("status=fail stage=writeback_admission_cleanup\n".into());
+    }
+    drop(admission_cache);
+
+    // Generic/FUSE backends keep the established admission-before-invalidate
+    // order.  This direct contract check prevents a future default flip from
+    // silently recreating the FUSE barrier/invalidation ABBA cycle.
+    let legacy_backend = Arc::new(PageCacheAdmissionOrderSelftestBackend::new(
+        PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
+        false,
+    ));
+    let legacy_backend_dyn: Arc<dyn PageCacheBackend> = legacy_backend.clone();
+    let legacy_cache = PageCache::new_unowned(None, Some(legacy_backend_dyn.clone()));
+    *legacy_backend.cache.lock() = Arc::downgrade(&legacy_cache);
+    let mut legacy_blocking_claim = || Ok(());
+    let legacy_blocking = PageCacheManager::with_writeback_admission(
+        &legacy_cache,
+        &legacy_backend_dyn,
+        &mut legacy_blocking_claim,
+    )
+    .is_ok();
+    let mut legacy_try_claim = || Ok(());
+    let legacy_try = PageCacheManager::try_with_writeback_admission(
+        &legacy_cache,
+        &legacy_backend_dyn,
+        &mut legacy_try_claim,
+    )
+    .unwrap_or(false);
+    // A Legacy backend still receives a normal descriptor and still follows
+    // the original submit path, but it must not consume a Token generation.
+    // Keep this explicit: otherwise a future refactor can reintroduce a
+    // counter mutation on the eager ext4/FUSE hot path without breaking token
+    // lifecycle tests.
+    let legacy_page = legacy_cache.get_or_create_page_zero(0)?;
+    let legacy_entry = {
+        let inner = legacy_cache.inner.lock();
+        inner.get_entry(0).ok_or(SystemError::EIO)?
+    };
+    legacy_page.write().add_flags(PageFlags::PG_DIRTY);
+    {
+        let mut inner = legacy_cache.inner.lock();
+        let current = inner.get_entry(0).ok_or(SystemError::EIO)?;
+        if !Arc::ptr_eq(&current, &legacy_entry) {
+            return Err(SystemError::EIO);
+        }
+        let old_state = legacy_entry.state();
+        inner.set_index(0, 1, true);
+        legacy_entry.account_state_transition(old_state, PageState::Dirty);
+        legacy_entry.set_state(PageState::Dirty);
+    }
+    let legacy_generation_before = legacy_cache.inner.lock().next_writeback_generation;
+    let mut legacy_batch = None;
+    let legacy_submission_admission =
+        PageCacheManager::with_writeback_admission(&legacy_cache, &legacy_backend_dyn, &mut || {
+            legacy_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &legacy_cache,
+                0,
+                0,
+                MMArch::PAGE_SIZE,
+                true,
+            )?);
+            Ok(())
+        })
+        .is_ok();
+    let legacy_generation_is_zero = match legacy_batch {
+        Some(batch) => {
+            let generation_is_zero = batch.descriptor.writeback_generation() == 0;
+            generation_is_zero && PageCacheManager::submit_writeback_batch(batch).is_ok()
+        }
+        None => false,
+    };
+    let legacy_generation_unchanged =
+        legacy_cache.inner.lock().next_writeback_generation == legacy_generation_before;
+    let legacy_removed = legacy_cache.manager.remove_page(0)?.is_some();
+    // A frozen waiter which observed incarnation 1 must not attach itself to
+    // incarnation 2 of the same Arc<PageEntry> after the old completion.
+    legacy_entry
+        .writeback_incarnation
+        .store(2, Ordering::Release);
+    legacy_entry.set_state(PageState::Writeback);
+    let frozen_writeback_aba_ok = matches!(
+        PageCacheManager::writeback_incarnation_result(&legacy_entry, 1),
+        Some(Ok(()))
+    );
+    legacy_entry.set_state(PageState::UpToDate);
+    let legacy_paddr = legacy_page.phys_address();
+    page_manager_lock().remove_page(&legacy_paddr);
+    let _ = page_reclaimer_lock().remove_page(&legacy_paddr);
+    if !legacy_blocking
+        || !legacy_try
+        || !legacy_submission_admission
+        || !legacy_generation_is_zero
+        || !legacy_generation_unchanged
+        || !legacy_removed
+        || !frozen_writeback_aba_ok
+        || legacy_backend
+            .observed_expected_order
+            .load(Ordering::Acquire)
+            != 3
+        || legacy_backend
+            .observed_unexpected_order
+            .load(Ordering::Acquire)
+            != 0
+    {
+        return Ok(alloc::format!(
+            "status=fail stage=writeback_admission_legacy blocking={legacy_blocking} try={legacy_try} submission={legacy_submission_admission} generation_zero={legacy_generation_is_zero} generation_unchanged={legacy_generation_unchanged} removed={legacy_removed} frozen_aba={frozen_writeback_aba_ok} expected={} unexpected={}\n",
+            legacy_backend.observed_expected_order.load(Ordering::Acquire),
+            legacy_backend.observed_unexpected_order.load(Ordering::Acquire),
+        ));
+    }
+    drop(legacy_cache);
+
+    // A filesystem-specific token is bound before Dirty -> Writeback and is
+    // then the only submission path.  Exercise a multi-page partial-EOF
+    // submission, the real shared snapshot-failure cleanup branch (with the
+    // failure injected into its snapshot action while admission is held), a
+    // bind failure, a token submission failure, and a zero-payload snapshot.
+    // The synthetic backend's legacy write function deliberately fails, so
+    // every successful token path would expose a regression which silently
+    // fell back to write_pages().
+    let submission_state = Arc::new(PageCacheSubmissionSelftestState::default());
+    let submission_backend = Arc::new(PageCacheSubmissionSelftestBackend {
+        state: submission_state.clone(),
+        admission_order: PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
+        snapshot_phase: PageCacheWritebackSnapshotPhase::WithinAdmission,
+    });
+    let submission_backend_dyn: Arc<dyn PageCacheBackend> = submission_backend;
+    // This synthetic token backend has no inode owner.  Keep it shmem-backed
+    // so the production front-dirty publisher exercises its state machine
+    // without asking a deliberately absent file mapping for retention.
+    let submission_cache = PageCache::new_shmem(None, Some(submission_backend_dyn.clone()));
+    let submission_page0 = submission_cache.get_or_create_page_zero(0)?;
+    let submission_page1 = submission_cache.get_or_create_page_zero(1)?;
+    // A Token declaration is already sufficient to forbid the legacy
+    // one-page helper.  This covers the interval before the first normal
+    // bind has locked `writeback_protocol` as well as the steady state below.
+    let token_direct_rejected_before_bind = {
+        let page_locked = submission_page0.write();
+        !submission_cache.try_mark_page_writeback(0, page_locked.phys_address())
+    };
+    let token_file_size = MMArch::PAGE_SIZE
+        .checked_mul(2)
+        .and_then(|size| size.checked_sub(37))
+        .ok_or(SystemError::EOVERFLOW)?;
+    let mark_submission_dirty = |page_index: usize| -> Result<(), SystemError> {
+        let entry = submission_cache
+            .inner
+            .lock()
+            .get_entry(page_index)
+            .ok_or(SystemError::EIO)?;
+        let mut page_locked = entry.page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        submission_cache.mark_page_dirty_page_locked(page_index, &page_locked)
+    };
+    let wait_for_deferred_progress =
+        |progress: Arc<dyn PageCacheWritebackProgress>, expected_waiters: usize| {
+            progress.arm();
+            let completed = Arc::new(AtomicBool::new(false));
+            let completed_wait = Arc::new(WaitQueue::default());
+            let retry_completed = Arc::new(AtomicBool::new(false));
+            let progress_slot = Arc::new(Mutex::new(Some(progress.clone())));
+            let worker_completed = completed.clone();
+            let worker_completed_wait = completed_wait.clone();
+            let worker_progress_slot = progress_slot.clone();
+            schedule_work(Work::new(move || {
+                let Some(progress) = worker_progress_slot.lock().take() else {
+                    return;
+                };
+                progress.wait_for_progress();
+                worker_completed.store(true, Ordering::Release);
+                worker_completed_wait.wake_all();
+            }));
+            let retry_completed_callback = retry_completed.clone();
+            let retry_completed_wait = completed_wait.clone();
+            progress.register_retry(Arc::new(move |_| {
+                retry_completed_callback.store(true, Ordering::Release);
+                retry_completed_wait.wake_all();
+            }));
+            submission_state.progress_wait.wait_until(|| {
+                (submission_state
+                    .deferred_waiters_entered
+                    .load(Ordering::Acquire)
+                    >= expected_waiters)
+                    .then_some(())
+            });
+            let blocked_before_release = !completed.load(Ordering::Acquire);
+            let retry_blocked_before_release = !retry_completed.load(Ordering::Acquire);
+            submission_state.release_deferred_progress();
+            completed_wait.wait_until(|| {
+                (completed.load(Ordering::Acquire) && retry_completed.load(Ordering::Acquire))
+                    .then_some(())
+            });
+            let late_retry_completed = Arc::new(AtomicBool::new(false));
+            let late_retry_completed_callback = late_retry_completed.clone();
+            progress.register_retry(Arc::new(move |_| {
+                late_retry_completed_callback.store(true, Ordering::Release);
+            }));
+            let late_retry_runs_immediately = late_retry_completed.load(Ordering::Acquire);
+            // The first half proves synchronous callers can block on the
+            // producer predicate. The second proves async/reclaimer callers
+            // receive a producer-driven continuation without consuming a
+            // permanently blocked PageCache worker. The final check covers
+            // the other side of the registration race: a continuation
+            // registered after progress observes the advanced sequence and
+            // must be invoked synchronously instead of being stranded.
+            blocked_before_release && retry_blocked_before_release && late_retry_runs_immediately
+        };
+
+    mark_submission_dirty(0)?;
+    mark_submission_dirty(1)?;
+    let mut submitted_batch = None;
+    let submitted_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            submitted_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                1,
+                token_file_size,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let submitted = match submitted_batch {
+        Some(batch) => PageCacheManager::submit_writeback_batch(batch).is_ok(),
+        None => false,
+    };
+    let token_direct_rejected_after_lock = {
+        let page_locked = submission_page0.write();
+        !submission_cache.try_mark_page_writeback(0, page_locked.phys_address())
+    };
+    let multi_page_descriptor_ok = submission_state.first_index.load(Ordering::Acquire) == 0
+        && submission_state.last_index.load(Ordering::Acquire) == 1
+        && submission_state.file_size.load(Ordering::Acquire) == token_file_size
+        && submission_state.valid_bytes.load(Ordering::Acquire) == token_file_size
+        && submission_state
+            .last_writeback_generation
+            .load(Ordering::Acquire)
+            != 0;
+
+    mark_submission_dirty(0)?;
+    let mut snapshot_error_outcome = None;
+    let snapshot_error_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            snapshot_error_outcome = Some(PageCacheManager::claim_and_snapshot_locked_with(
+                &submission_cache,
+                WritebackBatchRange::new(0, 0),
+                token_file_size,
+                None,
+                true,
+                None,
+                |_batch| Err(SystemError::EIO),
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let snapshot_error = snapshot_error_admission
+        && matches!(
+            snapshot_error_outcome,
+            Some(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
+        );
+    let snapshot_error_page_redirtied = {
+        let inner = submission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    submission_state
+        .fail_next_bind
+        .store(true, Ordering::Release);
+    let mut bind_error_batch = None;
+    let bind_error = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            bind_error_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                0,
+                token_file_size,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .err()
+        == Some(SystemError::EIO);
+    let bind_error_page_stayed_dirty = {
+        let inner = submission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let errseq_before_submit_error = submission_cache.sample_writeback_error();
+    submission_state
+        .fail_next_submit
+        .store(true, Ordering::Release);
+    let mut submit_error_batch = None;
+    let submit_error_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            submit_error_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                0,
+                token_file_size,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let submit_error = match submit_error_batch {
+        Some(batch) => matches!(
+            PageCacheManager::submit_writeback_batch(batch),
+            Ok(WritebackSubmitOutcome::Failed(SystemError::EIO))
+        ),
+        None => false,
+    };
+    let submit_error_page_redirtied = {
+        let inner = submission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let submit_error_recorded = submission_cache
+        .check_writeback_error_since(errseq_before_submit_error)
+        == Some(SystemError::EIO);
+
+    // A mapper may discover only after snapshotting that it must wait for
+    // ordered progress.  This is not a writeback error: its token resolves
+    // the private claim, the batch returns to Dirty, and fsync-style callers
+    // wait on the producer ticket before retrying.
+    // `check_writeback_error_since()` intentionally does not advance an
+    // errseq observer.  Consume the synthetic terminal failure before using
+    // the same cache to prove that a later defer records no *new* error.
+    let mut acknowledged_submit_error = errseq_before_submit_error;
+    let submit_error_acknowledged = submission_cache
+        .writeback_error
+        .check_and_advance(&mut acknowledged_submit_error);
+    let errseq_before_submit_defer = submission_cache.sample_writeback_error();
+    // Use two pages here: deferred completion must republish the complete
+    // descriptor segment atomically, never expose page 0 as Dirty while page
+    // 1 is still Writeback and therefore permit a prefix reclaim/claim.
+    mark_submission_dirty(1)?;
+    submission_state
+        .defer_next_submit
+        .store(true, Ordering::Release);
+    let mut submit_defer_batch = None;
+    let submit_defer_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            submit_defer_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                1,
+                token_file_size,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let submit_defer_progress = match submit_defer_batch {
+        Some(batch) => match PageCacheManager::submit_writeback_batch(batch) {
+            Ok(WritebackSubmitOutcome::Deferred(progress)) => Some(progress),
+            Ok(WritebackSubmitOutcome::Completed | WritebackSubmitOutcome::Submitted)
+            | Ok(WritebackSubmitOutcome::Failed(_))
+            | Err(_) => None,
+        },
+        None => None,
+    };
+    let submit_defer_page_redirtied = {
+        let (entry0, entry1) = {
+            let inner = submission_cache.inner.lock();
+            (inner.get_entry(0), inner.get_entry(1))
+        };
+        let flags_dirty = entry0
+            .as_ref()
+            .is_some_and(|entry| entry.page.read().flags().contains(PageFlags::PG_DIRTY))
+            && entry1
+                .as_ref()
+                .is_some_and(|entry| entry.page.read().flags().contains(PageFlags::PG_DIRTY));
+        flags_dirty && {
+            let inner = submission_cache.inner.lock();
+            entry0.as_ref().is_some_and(|entry| {
+                inner
+                    .get_entry(0)
+                    .is_some_and(|current| Arc::ptr_eq(&current, entry))
+                    && entry.state() == PageState::Dirty
+            }) && entry1.as_ref().is_some_and(|entry| {
+                inner
+                    .get_entry(1)
+                    .is_some_and(|current| Arc::ptr_eq(&current, entry))
+                    && entry.state() == PageState::Dirty
+            }) && inner.dirty_pages.contains(&0)
+                && inner.dirty_pages.contains(&1)
+                && !inner.writeback_pages.contains(&0)
+                && !inner.writeback_pages.contains(&1)
+        }
+    };
+    let submit_defer_preserves_page_error = submission_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .is_some_and(|entry| entry.page.read().flags().contains(PageFlags::PG_ERROR));
+    let errseq_after_submit_defer = submission_cache.sample_writeback_error();
+    let submit_defer_no_errseq = errseq_after_submit_defer == errseq_before_submit_defer;
+    let submit_defer_waited = if let Some(progress) = submit_defer_progress {
+        wait_for_deferred_progress(progress, 1)
+    } else {
+        false
+    };
+    let mut submit_defer_retry_batch = None;
+    let submit_defer_retry_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            submit_defer_retry_batch =
+                claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                    &submission_cache,
+                    0,
+                    1,
+                    token_file_size,
+                    true,
+                )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let submit_defer_retry_completed = matches!(
+        submit_defer_retry_batch
+            .map(PageCacheManager::submit_writeback_batch)
+            .transpose(),
+        Ok(Some(WritebackSubmitOutcome::Completed))
+    );
+    let submit_defer_retry_clears_page_error = !submission_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .is_some_and(|entry| entry.page.read().flags().contains(PageFlags::PG_ERROR));
+
+    // A queue follower can be rejected before Dirty -> Writeback publication.
+    // Its ticket proves that the synchronous path has a blocking progress edge
+    // rather than re-claiming the same Dirty page in a hot loop.
+    mark_submission_dirty(0)?;
+    submission_state
+        .defer_next_bind
+        .store(true, Ordering::Release);
+    let mut claim_defer = WritebackClaimOutcome::NoBatch;
+    let claim_defer_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            claim_defer = PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                0,
+                token_file_size,
+                true,
+            )?;
+            Ok(())
+        },
+    )
+    .is_ok();
+    let claim_defer_progress = match claim_defer {
+        WritebackClaimOutcome::Deferred(progress) => Some(progress),
+        WritebackClaimOutcome::NoBatch
+        | WritebackClaimOutcome::Claimed(_)
+        | WritebackClaimOutcome::FailedRecorded(_) => None,
+    };
+    let claim_defer_page_untouched = {
+        let inner = submission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let claim_defer_waited = if let Some(progress) = claim_defer_progress {
+        wait_for_deferred_progress(progress, 2)
+    } else {
+        false
+    };
+    let mut claim_defer_retry_batch = None;
+    let claim_defer_retry_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            claim_defer_retry_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                0,
+                token_file_size,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let claim_defer_retry_completed = matches!(
+        claim_defer_retry_batch
+            .map(PageCacheManager::submit_writeback_batch)
+            .transpose(),
+        Ok(Some(WritebackSubmitOutcome::Completed))
+    );
+
+    mark_submission_dirty(0)?;
+    let (tagged_entry, tagged_epoch) = {
+        let inner = submission_cache.inner.lock();
+        let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+        let epoch = 0x5a5a_u64;
+        entry.set_writeback_tag(epoch);
+        (entry, epoch)
+    };
+    let errseq_before_tagged_snapshot_error = submission_cache.sample_writeback_error();
+    let mut tagged_snapshot_error_outcome = None;
+    let tagged_snapshot_error_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            tagged_snapshot_error_outcome = Some(PageCacheManager::claim_and_snapshot_locked_with(
+                &submission_cache,
+                WritebackBatchRange::new(0, 0),
+                token_file_size,
+                Some((0, &tagged_entry, tagged_epoch)),
+                true,
+                None,
+                |_batch| Err(SystemError::EIO),
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let tagged_snapshot_error = tagged_snapshot_error_admission
+        && matches!(
+            tagged_snapshot_error_outcome,
+            Some(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
+        );
+    // A tagged caller receives `FailedRecorded` after PageCache has already
+    // made the error visible. It must only retire the frozen generation; a
+    // second `record_writeback_error` would be observable as a duplicate
+    // errseq event to a file descriptor that acknowledged the first one.
+    let mut tagged_snapshot_error_ack = errseq_before_tagged_snapshot_error;
+    let tagged_snapshot_error_recorded_once = submission_cache
+        .writeback_error
+        .check_and_advance(&mut tagged_snapshot_error_ack)
+        == Some(SystemError::EIO);
+    PageCacheManager::retire_tagged_writeback_generation(&submission_cache, 0, 0, tagged_epoch);
+    let tagged_snapshot_error_not_recorded_twice = submission_cache
+        .writeback_error
+        .check_and_advance(&mut tagged_snapshot_error_ack)
+        .is_none();
+    let tagged_snapshot_error_page_redirtied = {
+        let inner = submission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+            && tagged_entry.writeback_tag() == 0
+    };
+
+    let bind_attempts_before_zero_payload = submission_state.bind_attempts.load(Ordering::Acquire);
+    let generation_before_zero_payload = submission_cache.inner.lock().next_writeback_generation;
+    let mut zero_payload_batch = None;
+    let zero_payload_admission = PageCacheManager::with_writeback_admission(
+        &submission_cache,
+        &submission_backend_dyn,
+        &mut || {
+            zero_payload_batch = claimed_or_none(PageCacheManager::claim_and_snapshot_locked(
+                &submission_cache,
+                0,
+                0,
+                0,
+                true,
+            )?);
+            Ok(())
+        },
+    )
+    .is_ok();
+    let zero_payload_descriptor_is_zero = match zero_payload_batch {
+        Some(batch) => {
+            batch.descriptor.writeback_generation() == 0
+                && PageCacheManager::submit_writeback_batch(batch).is_ok()
+        }
+        None => false,
+    };
+    let zero_payload_retired = zero_payload_descriptor_is_zero;
+    let zero_payload_bypassed =
+        submission_state.bind_attempts.load(Ordering::Acquire) == bind_attempts_before_zero_payload;
+    let zero_payload_generation_unchanged =
+        submission_cache.inner.lock().next_writeback_generation == generation_before_zero_payload;
+    // Keep the production `page -> inner` order: taking a page lock while
+    // holding `inner` could deadlock with dirty-page publication.  Revalidate
+    // the entry identity after sampling the page flags so this remains an
+    // exact post-completion assertion rather than a stale observation.
+    let zero_payload_entry = {
+        let inner = submission_cache.inner.lock();
+        inner.get_entry(0).ok_or(SystemError::EIO)?
+    };
+    let zero_payload_page_clean = !zero_payload_entry
+        .page
+        .read()
+        .flags()
+        .intersects(PageFlags::PG_DIRTY | PageFlags::PG_WRITEBACK);
+    let zero_payload_page_retired = zero_payload_page_clean && {
+        let inner = submission_cache.inner.lock();
+        inner.get_entry(0).is_some_and(|entry| {
+            Arc::ptr_eq(&entry, &zero_payload_entry) && entry.state() == PageState::UpToDate
+        }) && !inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    // Generation exhaustion is an admission failure, not an ABA wrap. Keep
+    // this in an independent cache: the main synthetic cache continues with
+    // tracker/cancellation scenarios below, so forcing its counter to MAX
+    // would turn a coverage check into artificial cross-test interference.
+    let overflow_state = Arc::new(PageCacheSubmissionSelftestState::default());
+    let overflow_backend: Arc<dyn PageCacheBackend> =
+        Arc::new(PageCacheSubmissionSelftestBackend {
+            state: overflow_state.clone(),
+            admission_order: PageCacheWritebackAdmissionOrder::AdmissionBeforeInvalidate,
+            snapshot_phase: PageCacheWritebackSnapshotPhase::WithinAdmission,
+        });
+    let overflow_cache = PageCache::new_unowned(None, Some(overflow_backend.clone()));
+    let overflow_page = overflow_cache.get_or_create_page_zero(0)?;
+    let overflow_entry = {
+        let inner = overflow_cache.inner.lock();
+        inner.get_entry(0).ok_or(SystemError::EIO)?
+    };
+    overflow_page.write().add_flags(PageFlags::PG_DIRTY);
+    {
+        let mut inner = overflow_cache.inner.lock();
+        let current = inner.get_entry(0).ok_or(SystemError::EIO)?;
+        if !Arc::ptr_eq(&current, &overflow_entry) {
+            return Err(SystemError::EIO);
+        }
+        let old_state = overflow_entry.state();
+        inner.set_index(0, 1, true);
+        overflow_entry.account_state_transition(old_state, PageState::Dirty);
+        overflow_entry.set_state(PageState::Dirty);
+        inner.next_writeback_generation = u64::MAX;
+    }
+    let overflow_generation_rejected =
+        PageCacheManager::with_writeback_admission(&overflow_cache, &overflow_backend, &mut || {
+            let _ = PageCacheManager::claim_and_snapshot_locked(
+                &overflow_cache,
+                0,
+                0,
+                MMArch::PAGE_SIZE,
+                true,
+            )?;
+            Ok(())
+        })
+        .err()
+            == Some(SystemError::EOVERFLOW);
+    // Preserve the production page -> inner lock order. Sample page flags
+    // before taking `inner`, then revalidate the entry identity alongside its
+    // logical Dirty/writeback memberships.
+    let overflow_page_flags_preserved = {
+        let page = overflow_entry.page.read();
+        let flags = page.flags();
+        flags.contains(PageFlags::PG_DIRTY) && !flags.contains(PageFlags::PG_WRITEBACK)
+    };
+    let overflow_generation_preserves_dirty = overflow_page_flags_preserved && {
+        let inner = overflow_cache.inner.lock();
+        inner.next_writeback_generation == u64::MAX
+            && inner.get_entry(0).is_some_and(|entry| {
+                Arc::ptr_eq(&entry, &overflow_entry) && entry.state() == PageState::Dirty
+            })
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+            && overflow_state.bind_attempts.load(Ordering::Acquire) == 0
+    };
+    let overflow_removed = overflow_cache.manager.remove_page(0)?.is_some();
+    let overflow_paddr = overflow_page.phys_address();
+    page_manager_lock().remove_page(&overflow_paddr);
+    let _ = page_reclaimer_lock().remove_page(&overflow_paddr);
+    let submission_defer_ok = submit_defer_admission
+        && submit_defer_page_redirtied
+        && submit_defer_preserves_page_error
+        && submit_defer_no_errseq
+        && submit_defer_waited
+        && submit_defer_retry_admission
+        && submit_defer_retry_completed
+        && submit_defer_retry_clears_page_error
+        && claim_defer_admission
+        && claim_defer_page_untouched
+        && claim_defer_waited
+        && claim_defer_retry_admission
+        && claim_defer_retry_completed
+        && submission_state
+            .deferred_before_claim
+            .load(Ordering::Acquire)
+            == 1
+        && submission_state
+            .deferred_after_submit
+            .load(Ordering::Acquire)
+            == 1
+        && submission_state.deferred_waits.load(Ordering::Acquire) == 2;
+
+    // A legacy/within-admission backend may report a terminal admission
+    // error only after its callback has claimed and snapshotted a token. At
+    // that point neither admission nor invalidate-read is retained, so this
+    // must select the explicitly safe no-invalidate cancellation context
+    // rather than the ext4 split finalizer.
+    mark_submission_dirty(0)?;
+    submission_state
+        .fail_admission_after_claim
+        .store(true, Ordering::Release);
+    let within_admission_post_claim_error = matches!(
+        PageCacheManager::try_claim_and_snapshot_within_admission_with_stable_size(
+            &submission_cache,
+            &submission_backend_dyn,
+            0,
+            0,
+            None,
+            || Ok(Some(token_file_size)),
+        ),
+        Ok(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
+    );
+    let within_admission_post_claim_error_redirtied = {
+        let inner = submission_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+
+    // Ext4's future delayed mapper must release `size_lock -> io_lock` before
+    // PageCache snapshots and calls `mkclean_page()`, while still keeping
+    // invalidate-read so a truncate cannot pass a claimed token. Exercise the
+    // production split helpers with an otherwise-token-only backend: bind is
+    // inside admission, every snapshot observes released admission, and both
+    // snapshot/admission failures select the dedicated post-admission
+    // cancellation path exactly once.
+    let split_state = Arc::new(PageCacheSubmissionSelftestState::default());
+    let split_backend = Arc::new(PageCacheSubmissionSelftestBackend {
+        state: split_state.clone(),
+        admission_order: PageCacheWritebackAdmissionOrder::InvalidateBeforeAdmission,
+        snapshot_phase: PageCacheWritebackSnapshotPhase::AfterAdmission,
+    });
+    let split_backend_dyn: Arc<dyn PageCacheBackend> = split_backend;
+    // This synthetic backend deliberately has no inode owner.  Use shmem so
+    // its front-dirty publisher follows the production `page -> inner`
+    // transition without asking a nonexistent file mapping for retention.
+    // The backend itself still exercises the ext4-shaped split admission and
+    // snapshot contract below.
+    let split_cache = PageCache::new_shmem(None, Some(split_backend_dyn.clone()));
+    let split_page = split_cache.get_or_create_page_zero(0)?;
+    let mark_split_dirty = || -> Result<(), SystemError> {
+        let mut page_locked = split_page.write();
+        page_locked.add_flags(PageFlags::PG_DIRTY);
+        split_cache.mark_page_dirty_page_locked(0, &page_locked)
+    };
+    let snapshot_after_admission = |batch: &mut ClaimedWritebackBatch| {
+        if split_state.admission_depth.load(Ordering::Acquire) != 0 {
+            split_state
+                .snapshotted_while_admitted
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SystemError::EIO);
+        }
+        split_state
+            .snapshotted_after_admission
+            .fetch_add(1, Ordering::Relaxed);
+        PageCacheManager::snapshot_writeback_batch(batch)
+    };
+    mark_split_dirty()?;
+    let split_blocking_submit = match PageCacheManager::claim_and_snapshot_after_admission_with(
+        &split_cache,
+        &split_backend_dyn,
+        WritebackBatchRange::new(0, 0),
+        None,
+        None,
+        || Ok(MMArch::PAGE_SIZE),
+        snapshot_after_admission,
+    )? {
+        WritebackClaimOutcome::Claimed(batch) => matches!(
+            PageCacheManager::submit_writeback_batch(batch),
+            Ok(WritebackSubmitOutcome::Completed)
+        ),
+        WritebackClaimOutcome::NoBatch
+        | WritebackClaimOutcome::Deferred(_)
+        | WritebackClaimOutcome::FailedRecorded(_) => false,
+    };
+    mark_split_dirty()?;
+    let split_snapshot_error = matches!(
+        PageCacheManager::claim_and_snapshot_after_admission_with(
+            &split_cache,
+            &split_backend_dyn,
+            WritebackBatchRange::new(0, 0),
+            None,
+            None,
+            || Ok(MMArch::PAGE_SIZE),
+            |_batch| {
+                if split_state.admission_depth.load(Ordering::Acquire) != 0 {
+                    split_state
+                        .snapshotted_while_admitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(SystemError::EIO);
+                }
+                split_state
+                    .snapshotted_after_admission
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(SystemError::EIO)
+            },
+        ),
+        Ok(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
+    );
+    let split_snapshot_error_redirtied = {
+        let inner = split_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    split_state
+        .fail_admission_after_claim
+        .store(true, Ordering::Release);
+    let split_blocking_admission_error = matches!(
+        PageCacheManager::claim_and_snapshot_after_admission_with(
+            &split_cache,
+            &split_backend_dyn,
+            WritebackBatchRange::new(0, 0),
+            None,
+            None,
+            || Ok(MMArch::PAGE_SIZE),
+            snapshot_after_admission,
+        ),
+        Ok(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
+    );
+    let split_blocking_admission_error_redirtied = {
+        let inner = split_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let split_try_submit = match PageCacheManager::try_claim_and_snapshot_after_admission_with(
+        &split_cache,
+        &split_backend_dyn,
+        0,
+        0,
+        None,
+        || Ok(Some(MMArch::PAGE_SIZE)),
+        snapshot_after_admission,
+    )? {
+        WritebackClaimOutcome::Claimed(batch) => matches!(
+            PageCacheManager::submit_writeback_batch(batch),
+            Ok(WritebackSubmitOutcome::Completed)
+        ),
+        WritebackClaimOutcome::NoBatch
+        | WritebackClaimOutcome::Deferred(_)
+        | WritebackClaimOutcome::FailedRecorded(_) => false,
+    };
+    mark_split_dirty()?;
+    split_state
+        .fail_admission_after_claim
+        .store(true, Ordering::Release);
+    let split_try_admission_error = matches!(
+        PageCacheManager::try_claim_and_snapshot_after_admission_with(
+            &split_cache,
+            &split_backend_dyn,
+            0,
+            0,
+            None,
+            || Ok(Some(MMArch::PAGE_SIZE)),
+            snapshot_after_admission,
+        ),
+        Ok(WritebackClaimOutcome::FailedRecorded(SystemError::EIO))
+    );
+    let split_try_admission_error_redirtied = {
+        let inner = split_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let split_try_rejected_by_invalidation = {
+        let _invalidate = split_cache.invalidate_write();
+        matches!(
+            PageCacheManager::try_claim_and_snapshot_after_admission_with(
+                &split_cache,
+                &split_backend_dyn,
+                0,
+                0,
+                None,
+                || Ok(Some(MMArch::PAGE_SIZE)),
+                snapshot_after_admission,
+            ),
+            Ok(WritebackClaimOutcome::NoBatch)
+        )
+    };
+    let split_try_rejection_keeps_dirty = {
+        let inner = split_cache.inner.lock();
+        inner
+            .get_entry(0)
+            .is_some_and(|entry| entry.state() == PageState::Dirty)
+            && inner.dirty_pages.contains(&0)
+            && !inner.writeback_pages.contains(&0)
+    };
+    let split_snapshot_phase_ok = split_blocking_submit
+        && split_snapshot_error
+        && split_snapshot_error_redirtied
+        && split_blocking_admission_error
+        && split_blocking_admission_error_redirtied
+        && split_try_submit
+        && split_try_admission_error
+        && split_try_admission_error_redirtied
+        && split_try_rejected_by_invalidation
+        && split_try_rejection_keeps_dirty
+        && split_state.bound.load(Ordering::Acquire) == 5
+        && split_state.submitted.load(Ordering::Acquire) == 2
+        && split_state
+            .submitted_after_admission
+            .load(Ordering::Acquire)
+            == 2
+        && split_state.submitted_while_admitted.load(Ordering::Acquire) == 0
+        && split_state
+            .snapshotted_after_admission
+            .load(Ordering::Acquire)
+            == 3
+        && split_state
+            .snapshotted_while_admitted
+            .load(Ordering::Acquire)
+            == 0
+        && split_state.cancelled.load(Ordering::Acquire) == 3
+        && split_state.cancelled_while_admitted.load(Ordering::Acquire) == 0
+        && split_state
+            .cancelled_outside_admission
+            .load(Ordering::Acquire)
+            == 0
+        && split_state
+            .cancelled_after_admission
+            .load(Ordering::Acquire)
+            == 3
+        && split_state
+            .cancellation_reacquired_admission
+            .load(Ordering::Acquire)
+            == 3
+        && split_state.bound_outside_admission.load(Ordering::Acquire) == 0
+        && split_state.private_claims.load(Ordering::Acquire) == 0
+        && split_state.admission_depth.load(Ordering::Acquire) == 0
+        && split_state.fallback_writes.load(Ordering::Acquire) == 0
+        && split_state.generation_regressions.load(Ordering::Acquire) == 0
+        && split_state.single_page_certificates.load(Ordering::Acquire) != 0
+        && split_state.certificate_errors.load(Ordering::Acquire) == 0;
+    let submission_token_ok = submitted_admission
+        && submitted
+        && token_direct_rejected_before_bind
+        && token_direct_rejected_after_lock
+        && multi_page_descriptor_ok
+        && snapshot_error
+        && snapshot_error_page_redirtied
+        && bind_error
+        && bind_error_batch.is_none()
+        && bind_error_page_stayed_dirty
+        && submit_error_admission
+        && submit_error
+        && submit_error_page_redirtied
+        && submit_error_recorded
+        && submit_error_acknowledged == Some(SystemError::EIO)
+        && tagged_snapshot_error
+        && tagged_snapshot_error_recorded_once
+        && tagged_snapshot_error_not_recorded_twice
+        && tagged_snapshot_error_page_redirtied
+        && zero_payload_admission
+        && zero_payload_retired
+        && zero_payload_bypassed
+        && zero_payload_generation_unchanged
+        && zero_payload_page_retired
+        && overflow_generation_rejected
+        && overflow_generation_preserves_dirty
+        && overflow_removed
+        && within_admission_post_claim_error
+        && within_admission_post_claim_error_redirtied
+        && submission_state.bind_attempts.load(Ordering::Acquire) == 10
+        && submission_state.bound.load(Ordering::Acquire) == 10
+        && submission_state.submitted.load(Ordering::Acquire) == 3
+        && submission_state.failed_submissions.load(Ordering::Acquire) == 1
+        && submission_state
+            .submitted_after_admission
+            .load(Ordering::Acquire)
+            == 5
+        && submission_state
+            .submitted_while_admitted
+            .load(Ordering::Acquire)
+            == 0
+        && submission_state.cancelled.load(Ordering::Acquire) == 3
+        && submission_state
+            .cancelled_while_admitted
+            .load(Ordering::Acquire)
+            == 2
+        && submission_state
+            .cancelled_outside_admission
+            .load(Ordering::Acquire)
+            == 0
+        && submission_state
+            .cancelled_after_admission_without_invalidate
+            .load(Ordering::Acquire)
+            == 1
+        && submission_state
+            .bound_outside_admission
+            .load(Ordering::Acquire)
+            == 0
+        && submission_state.private_claims.load(Ordering::Acquire) == 0
+        && submission_state.admission_depth.load(Ordering::Acquire) == 0
+        && submission_state.fallback_writes.load(Ordering::Acquire) == 0
+        && submission_state
+            .generation_regressions
+            .load(Ordering::Acquire)
+            == 0
+        && submission_state
+            .single_page_certificates
+            .load(Ordering::Acquire)
+            != 0
+        && submission_state.certificate_errors.load(Ordering::Acquire) == 0
+        && split_snapshot_phase_ok;
+
+    // A tagged retry replaces its Dirty epoch tag with a pending submission
+    // record before snapshotting.  Hold the snapshot at that exact point and
+    // prove a WAIT_BEFORE-style waiter remains blocked; the historical
+    // tag-clear -> record gap made this waiter return before the backend path
+    // was even eligible to run.
+    mark_submission_dirty(0)?;
+    let tagged_submission_epoch = 0x5a5b_u64;
+    let tagged_submission_entry = {
+        let _tagged_writeback = submission_cache.tagged_writeback_lock.lock();
+        let inner = submission_cache.inner.lock();
+        let entry = inner.get_entry(0).ok_or(SystemError::EIO)?;
+        entry.set_writeback_tag(tagged_submission_epoch);
+        entry
+    };
+    let tagged_submission_gate = Arc::new(PageCacheTaggedSubmissionSelftestGate::default());
+    let tagged_worker_cache = submission_cache.clone();
+    let tagged_worker_backend = submission_backend_dyn.clone();
+    let tagged_worker_entry = tagged_submission_entry.clone();
+    let tagged_worker_gate = tagged_submission_gate.clone();
+    let tagged_submit_executor = submission_cache.writeback_executor()?;
+    // This independent observer deliberately waits while the real submit
+    // executor is paused, so it must not occupy that executor itself.
+    let tagged_wait_worker = WorkQueue::try_new_owned("pc-wb-test-wait")?;
+    writeback::schedule_pagecache_writeback(
+        &tagged_submit_executor,
+        Work::new(move || {
+            let mut claimed = WritebackClaimOutcome::NoBatch;
+            let admission = PageCacheManager::with_writeback_admission(
+                &tagged_worker_cache,
+                &tagged_worker_backend,
+                &mut || {
+                    claimed = PageCacheManager::claim_and_snapshot_locked_with(
+                        &tagged_worker_cache,
+                        WritebackBatchRange::new(0, 0),
+                        token_file_size,
+                        Some((0, &tagged_worker_entry, tagged_submission_epoch)),
+                        true,
+                        None,
+                        |batch| {
+                            tagged_worker_gate
+                                .snapshot_entered
+                                .store(true, Ordering::Release);
+                            tagged_worker_gate.wait.wake_all();
+                            tagged_worker_gate.wait.wait_until(|| {
+                                tagged_worker_gate
+                                    .release_snapshot
+                                    .load(Ordering::Acquire)
+                                    .then_some(())
+                            });
+                            PageCacheManager::snapshot_writeback_batch(batch)
+                        },
+                    )?;
+                    Ok(())
+                },
+            );
+            let submitted = match claimed {
+                WritebackClaimOutcome::Claimed(batch) => matches!(
+                    PageCacheManager::submit_writeback_batch(batch),
+                    Ok(WritebackSubmitOutcome::Completed)
+                ),
+                WritebackClaimOutcome::NoBatch
+                | WritebackClaimOutcome::Deferred(_)
+                | WritebackClaimOutcome::FailedRecorded(_) => false,
+            };
+            tagged_worker_gate
+                .worker_succeeded
+                .store(admission.is_ok() && submitted, Ordering::Release);
+            tagged_worker_gate
+                .worker_finished
+                .store(true, Ordering::Release);
+            tagged_worker_gate.wait.wake_all();
+        }),
+    );
+    const TRACKED_SUBMISSION_SELFTEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const TRACKED_SUBMISSION_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+    let snapshot_entered = tagged_submission_gate
+        .wait
+        .wait_until_timeout(
+            || {
+                tagged_submission_gate
+                    .snapshot_entered
+                    .load(Ordering::Acquire)
+                    .then_some(())
+            },
+            TRACKED_SUBMISSION_SELFTEST_TIMEOUT,
+        )
+        .is_ok();
+    let tagged_waiter_cache = submission_cache.clone();
+    let tagged_waiter_gate = tagged_submission_gate.clone();
+    if snapshot_entered {
+        tagged_wait_worker.enqueue(Work::new(move || {
+            tagged_waiter_gate
+                .waiter_started
+                .store(true, Ordering::Release);
+            tagged_waiter_gate.wait.wake_all();
+            let completed = PageCacheManager::wait_tagged_writeback_submission(
+                &tagged_waiter_cache,
+                0,
+                0,
+                tagged_submission_epoch,
+            )
+            .is_ok();
+            tagged_waiter_gate
+                .waiter_finished
+                .store(completed, Ordering::Release);
+            tagged_waiter_gate.wait.wake_all();
+        }));
+    }
+    let waiter_started = snapshot_entered
+        && tagged_submission_gate
+            .wait
+            .wait_until_timeout(
+                || {
+                    tagged_submission_gate
+                        .waiter_started
+                        .load(Ordering::Acquire)
+                        .then_some(())
+                },
+                TRACKED_SUBMISSION_SELFTEST_TIMEOUT,
+            )
+            .is_ok();
+    // Give the waiter a bounded opportunity to return incorrectly while the
+    // snapshot gate is still closed. A correct record keeps it asleep.
+    let waiter_held_by_record = waiter_started
+        && tagged_submission_gate
+            .wait
+            .wait_until_timeout(
+                || {
+                    tagged_submission_gate
+                        .waiter_finished
+                        .load(Ordering::Acquire)
+                        .then_some(())
+                },
+                TRACKED_SUBMISSION_PROBE_TIMEOUT,
+            )
+            .is_err();
+    tagged_submission_gate
+        .release_snapshot
+        .store(true, Ordering::Release);
+    tagged_submission_gate.wait.wake_all();
+    let tagged_submission_completed = tagged_submission_gate
+        .wait
+        .wait_until_timeout(
+            || {
+                (tagged_submission_gate
+                    .worker_finished
+                    .load(Ordering::Acquire)
+                    && tagged_submission_gate
+                        .waiter_finished
+                        .load(Ordering::Acquire))
+                .then_some(())
+            },
+            TRACKED_SUBMISSION_SELFTEST_TIMEOUT,
+        )
+        .is_ok();
+    let submission_tracker_ok = snapshot_entered
+        && waiter_started
+        && waiter_held_by_record
+        && tagged_submission_completed
+        && tagged_submission_gate
+            .worker_succeeded
+            .load(Ordering::Acquire);
+    let submission_removed = submission_cache.manager.remove_page(0)?.is_some()
+        && submission_cache.manager.remove_page(1)?.is_some();
+    let submission_paddr0 = submission_page0.phys_address();
+    let submission_paddr1 = submission_page1.phys_address();
+    page_manager_lock().remove_page(&submission_paddr0);
+    let _ = page_reclaimer_lock().remove_page(&submission_paddr0);
+    page_manager_lock().remove_page(&submission_paddr1);
+    let _ = page_reclaimer_lock().remove_page(&submission_paddr1);
+    if !submission_token_ok || !submission_defer_ok || !submission_tracker_ok || !submission_removed
+    {
+        return Ok(alloc::format!(
+            "status=fail stage=writeback_submission_token bind_attempts={} bind={} submit={} failed_submit={} submit_after_admission={} submit_while_admitted={} cancel={} cancel_in_admission={} cancel_outside_admission={} bind_outside_admission={} direct_rejected_before_bind={token_direct_rejected_before_bind} direct_rejected_after_lock={token_direct_rejected_after_lock} deferred_before_claim={} deferred_after_submit={} deferred_waits={} defer_ok={submission_defer_ok} submit_defer_admission={submit_defer_admission} submit_defer_dirty={submit_defer_page_redirtied} submit_defer_preserves_pg_error={submit_defer_preserves_page_error} submit_defer_errseq_clean={submit_defer_no_errseq} submit_defer_errseq_before={errseq_before_submit_defer} submit_defer_errseq_after={errseq_after_submit_defer} submit_defer_waited={submit_defer_waited} submit_defer_retry_admission={submit_defer_retry_admission} submit_defer_retry_completed={submit_defer_retry_completed} submit_defer_retry_clears_pg_error={submit_defer_retry_clears_page_error} claim_defer_admission={claim_defer_admission} claim_defer_untouched={claim_defer_page_untouched} claim_defer_waited={claim_defer_waited} claim_defer_retry_admission={claim_defer_retry_admission} claim_defer_retry_completed={claim_defer_retry_completed} tracker_ok={submission_tracker_ok} tracker_snapshot_entered={snapshot_entered} tracker_waiter_started={waiter_started} tracker_waiter_held={waiter_held_by_record} tracker_completed={tagged_submission_completed} zero_payload_bypassed={zero_payload_bypassed} zero_payload_generation_unchanged={zero_payload_generation_unchanged} zero_payload_page_retired={zero_payload_page_retired} overflow_generation_rejected={overflow_generation_rejected} overflow_generation_preserves_dirty={overflow_generation_preserves_dirty} private_claims={} fallback={} snapshot_error={snapshot_error} snapshot_dirty={snapshot_error_page_redirtied} bind_error={bind_error} bind_error_dirty={bind_error_page_stayed_dirty} submit_error={submit_error} submit_error_dirty={submit_error_page_redirtied} submit_errseq={submit_error_recorded} tagged_snapshot_error={tagged_snapshot_error} tagged_snapshot_dirty={tagged_snapshot_error_page_redirtied} zero_payload={zero_payload_retired} removed={submission_removed}\n",
+            submission_state.bind_attempts.load(Ordering::Acquire),
+            submission_state.bound.load(Ordering::Acquire),
+            submission_state.submitted.load(Ordering::Acquire),
+            submission_state.failed_submissions.load(Ordering::Acquire),
+            submission_state.submitted_after_admission.load(Ordering::Acquire),
+            submission_state.submitted_while_admitted.load(Ordering::Acquire),
+            submission_state.cancelled.load(Ordering::Acquire),
+            submission_state.cancelled_while_admitted.load(Ordering::Acquire),
+            submission_state.cancelled_outside_admission.load(Ordering::Acquire),
+            submission_state.bound_outside_admission.load(Ordering::Acquire),
+            submission_state.deferred_before_claim.load(Ordering::Acquire),
+            submission_state.deferred_after_submit.load(Ordering::Acquire),
+            submission_state.deferred_waits.load(Ordering::Acquire),
+            submission_state.private_claims.load(Ordering::Acquire),
+            submission_state.fallback_writes.load(Ordering::Acquire),
+        ));
+    }
+    drop(submission_cache);
+
+    // Filesystem quota follows exact cache membership, including removal.
+    let quota_backend = Arc::new(PageCacheQuotaSelftestBackend::default());
+    let quota_cache = PageCache::new_shmem(None, Some(quota_backend.clone()));
+    let quota_page = quota_cache.get_or_create_page_zero(0)?;
+    let quota_removed = quota_cache.manager.remove_page(0)?.is_some();
+    let quota_ok = quota_removed
+        && quota_backend.reserved.load(Ordering::Acquire) == 1
+        && quota_backend.released.load(Ordering::Acquire) == 1;
+    let quota_paddr = quota_page.phys_address();
+    page_manager_lock().remove_page(&quota_paddr);
+    let _ = page_reclaimer_lock().remove_page(&quota_paddr);
+    if !quota_ok {
+        return Ok("status=fail stage=filesystem_quota_membership\n".into());
+    }
+
+    // Ordinary file membership: insert, explicit remove, and duplicate remove.
+    let file_cache = PageCache::new_unowned(None, None);
+    let file_page = file_cache.get_or_create_page_zero(0)?;
+    let file_entry = file_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let file_ok = file_entry.accounting() == PageEntryAccounting::File
+        && file_cache.manager.remove_page(0)?.is_some()
+        && file_entry.accounting() == PageEntryAccounting::Unaccounted
+        && file_cache.manager.remove_page(0)?.is_none();
+    let file_paddr = file_page.phys_address();
+    page_manager_lock().remove_page(&file_paddr);
+    let _ = page_reclaimer_lock().remove_page(&file_paddr);
+    if !file_ok {
+        return Ok("status=fail stage=file_membership\n".into());
+    }
+
+    // Shmem classification is immutable and follows the entry identity.
+    let shmem_cache = PageCache::new_shmem(None, None);
+    let shmem_page = shmem_cache.get_or_create_page_zero(0)?;
+    let shmem_entry = shmem_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let shmem_ok = shmem_entry.accounting() == PageEntryAccounting::Shmem
+        && shmem_cache.manager.remove_page(0)?.is_some()
+        && shmem_entry.accounting() == PageEntryAccounting::Unaccounted;
+    let shmem_paddr = shmem_page.phys_address();
+    page_manager_lock().remove_page(&shmem_paddr);
+    let _ = page_reclaimer_lock().remove_page(&shmem_paddr);
+    if !shmem_ok {
+        return Ok("status=fail stage=shmem_identity\n".into());
+    }
+
+    // Transaction rollback must observe PG_DIRTY even while publication to
+    // the cache dirty tag/state is still pending.
+    let rollback_cache = PageCache::new_shmem(None, None);
+    let rollback_page = rollback_cache.get_or_create_page_zero(0)?;
+    rollback_page.write().add_flags(PageFlags::PG_DIRTY);
+    let discarded = rollback_cache
+        .manager
+        .discard_created_page(0, &rollback_page)?;
+    let rollback_retained = rollback_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.page, &rollback_page));
+    let rollback_removed = rollback_cache.manager.remove_page(0)?.is_some();
+    let rollback_paddr = rollback_page.phys_address();
+    page_manager_lock().remove_page(&rollback_paddr);
+    let _ = page_reclaimer_lock().remove_page(&rollback_paddr);
+    if discarded || !rollback_retained || !rollback_removed {
+        return Ok("status=fail stage=dirty_transaction_rollback\n".into());
+    }
+
+    // Loading rollback consumes membership once; a late state publication on
+    // the detached entry must not revive it.
+    let state_cache = PageCache::new_unowned(None, None);
+    let loading_page = state_cache.allocate_page(Arc::downgrade(&state_cache), 0)?;
+    let loading_entry = Arc::new(PageEntry::new(loading_page.clone(), PageState::Loading));
+    let creator =
+        crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+    state_cache
+        .publish_prepared_range(core::iter::once((0, &loading_entry)), 1, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    let loading_removed_entry = state_cache.inner.lock().remove_entry(0);
+    let loading_removed = loading_removed_entry.is_some();
+    drop(loading_removed_entry);
+    loading_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
+    loading_entry.set_state(PageState::UpToDate);
+    let loading_ok =
+        loading_removed && loading_entry.accounting() == PageEntryAccounting::Unaccounted;
+    let loading_paddr = loading_page.phys_address();
+    page_manager_lock().remove_page(&loading_paddr);
+    let _ = page_reclaimer_lock().remove_page(&loading_paddr);
+    if !loading_ok {
+        return Ok("status=fail stage=loading_rollback\n".into());
+    }
+
+    // Exercise the production writeback claim/completion state machine. A
+    // successful completion returns to UpToDate; an error completion redirties
+    // the same attached entry before normal removal closes the accounting.
+    let writeback_cache = PageCache::new_unowned(None, None);
+    let writeback_page = writeback_cache.get_or_create_page_zero(0)?;
+    let writeback_entry = writeback_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    let writeback_paddr = writeback_page.phys_address();
+    writeback_page.write().add_flags(PageFlags::PG_DIRTY);
+    {
+        let mut inner = writeback_cache.inner.lock();
+        writeback_entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        writeback_entry.set_state(PageState::Dirty);
+        inner.set_index(0, 1, true);
+    }
+    let invalidate_ordinary_claim_rejected = {
+        let _invalidate = writeback_cache.invalidate_write();
+        !writeback_cache.try_mark_page_writeback(0, writeback_paddr)
+    } && writeback_entry.state() == PageState::Dirty
+        && writeback_entry.writeback_tag() == 0
+        && writeback_entry
+            .writeback_incarnation
+            .load(Ordering::Acquire)
+            == 0
+        && {
+            let inner = writeback_cache.inner.lock();
+            inner.dirty_pages.contains(&0) && !inner.writeback_pages.contains(&0)
+        };
+    if !invalidate_ordinary_claim_rejected {
+        return Ok("status=fail stage=writeback_invalidate_ordinary_claim\n".into());
+    }
+    writeback_entry.set_writeback_tag(0x6a01);
+    let tagged_ordinary_claim_rejected = !writeback_cache
+        .try_mark_page_writeback(0, writeback_paddr)
+        && writeback_entry.state() == PageState::Dirty
+        && writeback_entry.writeback_tag() == 0x6a01
+        && writeback_entry
+            .writeback_incarnation
+            .load(Ordering::Acquire)
+            == 0
+        && {
+            let inner = writeback_cache.inner.lock();
+            inner.dirty_pages.contains(&0) && !inner.writeback_pages.contains(&0)
+        };
+    if !tagged_ordinary_claim_rejected {
+        return Ok("status=fail stage=writeback_tagged_ordinary_claim\n".into());
+    }
+    writeback_entry.set_writeback_tag(0);
+    if !writeback_cache.try_mark_page_writeback(0, writeback_paddr) {
+        return Ok("status=fail stage=writeback_claim_success\n".into());
+    }
+    writeback_page.write().remove_flags(PageFlags::PG_DIRTY);
+    let first_writeback_incarnation = writeback_entry
+        .writeback_incarnation
+        .load(Ordering::Acquire);
+    {
+        let inner = writeback_cache.inner.lock();
+        if first_writeback_incarnation == 0
+            || !inner.writeback_pages.contains(&0)
+            || inner.dirty_pages.contains(&0)
+        {
+            return Ok("status=fail stage=writeback_set_success\n".into());
+        }
+    }
+    PageCacheManager::finish_writeback_entry_state(
+        writeback_cache.clone(),
+        0,
+        writeback_entry.clone(),
+        writeback_page.clone(),
+        Ok(()),
+        false,
+        ALL_BLOCKS,
+    )?;
+    {
+        let inner = writeback_cache.inner.lock();
+        if writeback_entry.state() != PageState::UpToDate
+            || inner.writeback_pages.contains(&0)
+            || inner.dirty_pages.contains(&0)
+        {
+            return Ok("status=fail stage=writeback_complete_success\n".into());
+        }
+    }
+    if !writeback_cache.try_mark_page_writeback(0, writeback_paddr) {
+        return Ok("status=fail stage=writeback_claim_error\n".into());
+    }
+    let second_writeback_incarnation = writeback_entry
+        .writeback_incarnation
+        .load(Ordering::Acquire);
+    if second_writeback_incarnation <= first_writeback_incarnation
+        || !matches!(
+            PageCacheManager::writeback_incarnation_result(
+                &writeback_entry,
+                first_writeback_incarnation
+            ),
+            Some(Ok(()))
+        )
+    {
+        return Ok("status=fail stage=writeback_incarnation_aba\n".into());
+    }
+    if PageCacheManager::finish_writeback_entry_state(
+        writeback_cache.clone(),
+        0,
+        writeback_entry.clone(),
+        writeback_page.clone(),
+        Err(SystemError::EIO),
+        false,
+        ALL_BLOCKS,
+    )
+    .is_ok()
+    {
+        return Ok("status=fail stage=writeback_error_result\n".into());
+    }
+    let writeback_removed = {
+        let mut inner = writeback_cache.inner.lock();
+        if writeback_entry.state() != PageState::Dirty
+            || inner.writeback_pages.contains(&0)
+            || !inner.dirty_pages.contains(&0)
+        {
+            return Ok("status=fail stage=writeback_complete_error\n".into());
+        }
+        inner.remove_entry(0).is_some()
+    };
+    let writeback_ok =
+        writeback_removed && writeback_entry.accounting() == PageEntryAccounting::Unaccounted;
+    page_manager_lock().remove_page(&writeback_paddr);
+    let _ = page_reclaimer_lock().remove_page(&writeback_paddr);
+    if !writeback_ok {
+        return Ok("status=fail stage=writeback_teardown\n".into());
+    }
+
+    // Terminal block errors retire only the submitted incarnation; resource
+    // retries and a concurrently published successor must remain dirty.
+    for (error, successor, expect_dirty) in [
+        (SystemError::EIO, false, false),
+        (SystemError::EIO, true, true),
+        (SystemError::EAGAIN_OR_EWOULDBLOCK, false, true),
+    ] {
+        let cache = PageCache::new_unowned(
+            None,
+            Some(Arc::new(TerminalWritebackSelftestBackend {
+                failure: Mutex::new(None),
+            })),
+        );
+        let page = cache.get_or_create_page_zero(0)?;
+        let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+        if !cache.try_mark_page_writeback(0, page.phys_address()) || !cache.has_writeback_pages() {
+            return Ok("status=fail stage=terminal_writeback_claim\n".into());
+        }
+        page.write().remove_flags(PageFlags::PG_DIRTY);
+        if successor {
+            page.write().add_flags(PageFlags::PG_DIRTY);
+            let mut inner = cache.inner.lock();
+            let _ = PageCache::publish_front_dirty_locked(&mut inner.dirty_pages, 0, &entry);
+        }
+        let result = PageCacheManager::finish_writeback_entry_state(
+            cache.clone(),
+            0,
+            entry.clone(),
+            page.clone(),
+            Err(error.clone()),
+            true,
+            ALL_BLOCKS,
+        );
+        if result != Err(error.clone())
+            || cache.has_writeback_pages()
+            || cache.has_dirty_pages() != expect_dirty
+            || entry.state()
+                != if expect_dirty {
+                    PageState::Dirty
+                } else {
+                    PageState::UpToDate
+                }
+            || !page.read().flags().contains(PageFlags::PG_ERROR)
+            || cache.check_writeback_error_since(0) != Some(error)
+        {
+            return Ok("status=fail stage=terminal_writeback_completion\n".into());
+        }
+        cache.reset_writeback_error();
+        if cache.check_writeback_error_since(0).is_some() {
+            return Ok("status=fail stage=terminal_writeback_reset\n".into());
+        }
+        cache.manager.resize(0)?;
+    }
+
+    // Clearing detached media must discard the old errno without reusing an
+    // epoch retained by a still-open File. A second OFD can acknowledge the
+    // new error before the original OFD checks its cursor.
+    let media_cache = PageCache::new_unowned(None, None);
+    let mut original_media_cursor = media_cache.sample_writeback_error();
+    media_cache.record_writeback_error(SystemError::EIO);
+    if media_cache.check_and_advance_writeback_error(&mut original_media_cursor)
+        != Some(SystemError::EIO)
+    {
+        return Ok("status=fail stage=media_error_initial_cursor\n".into());
+    }
+    for _ in 0..4 {
+        media_cache.reset_writeback_error();
+        if media_cache
+            .check_writeback_error_since(original_media_cursor)
+            .is_some()
+        {
+            return Ok("status=fail stage=media_error_detach_reset\n".into());
+        }
+        let mut later_media_cursor = media_cache.sample_writeback_error();
+        if media_cache
+            .check_and_advance_writeback_error(&mut later_media_cursor)
+            .is_some()
+        {
+            return Ok("status=fail stage=media_error_clean_epoch\n".into());
+        }
+        media_cache.record_writeback_error(SystemError::EIO);
+        if media_cache.check_and_advance_writeback_error(&mut later_media_cursor)
+            != Some(SystemError::EIO)
+            || media_cache.check_and_advance_writeback_error(&mut original_media_cursor)
+                != Some(SystemError::EIO)
+            || media_cache
+                .check_and_advance_writeback_error(&mut original_media_cursor)
+                .is_some()
+        {
+            return Ok("status=fail stage=media_error_live_cursor_aba\n".into());
+        }
+    }
+
+    // A backend's synchronous failure is a Completed(Failed) outcome, not
+    // an Err from dispatch. Laundering must report it and stop after one
+    // bounded pass even when a resource failure keeps the page dirty.
+    for error in [SystemError::EIO, SystemError::EAGAIN_OR_EWOULDBLOCK] {
+        let cache = PageCache::new_unowned(
+            None,
+            Some(Arc::new(TerminalWritebackSelftestBackend {
+                failure: Mutex::new(Some(error.clone())),
+            })),
+        );
+        let page = cache.get_or_create_page_zero(0)?;
+        let entry = cache.inner.lock().get_entry(0).ok_or(SystemError::EIO)?;
+        page.write().add_flags(PageFlags::PG_DIRTY);
+        {
+            let mut inner = cache.inner.lock();
+            let _ = PageCache::publish_front_dirty_locked(&mut inner.dirty_pages, 0, &entry);
+        }
+        let result = cache
+            .manager()
+            .launder_range_for_invalidate_with_stable_size(0, 0, MMArch::PAGE_SIZE);
+        if result != Err(error.clone())
+            || cache.has_writeback_pages()
+            || cache.has_dirty_pages() != (error == SystemError::EAGAIN_OR_EWOULDBLOCK)
+        {
+            return Ok("status=fail stage=launder_failed_outcome\n".into());
+        }
+        cache.manager.resize(0)?;
+    }
+
+    // Exhaustion must fail before publishing any Legacy state transition.
+    // Wrapping to zero would make a later frozen waiter indistinguishable
+    // from an old incarnation.
+    let overflow_cache = PageCache::new_unowned(None, None);
+    let overflow_page = overflow_cache.get_or_create_page_zero(0)?;
+    let overflow_entry = overflow_cache
+        .inner
+        .lock()
+        .get_entry(0)
+        .ok_or(SystemError::EIO)?;
+    overflow_cache.inner.lock().next_writeback_incarnation = u64::MAX;
+    if overflow_cache.try_mark_page_writeback(0, overflow_page.phys_address())
+        || overflow_entry.state() != PageState::UpToDate
+        || overflow_entry.writeback_incarnation.load(Ordering::Acquire) != 0
+    {
+        return Ok("status=fail stage=writeback_incarnation_overflow\n".into());
+    }
+    let overflow_removed = overflow_cache.manager.remove_page(0)?.is_some();
+    let overflow_paddr = overflow_page.phys_address();
+    page_manager_lock().remove_page(&overflow_paddr);
+    let _ = page_reclaimer_lock().remove_page(&overflow_paddr);
+    if !overflow_removed {
+        return Ok("status=fail stage=writeback_incarnation_overflow_cleanup\n".into());
+    }
+
+    // Generic asynchronous reads may leave a Loading entry at final drop. A
+    // late completion owns only the detached entry and must not revive its
+    // mapping accounting or physical manager/reclaimer membership.
+    let drop_cache = PageCache::new_unowned(None, None);
+    let drop_page = drop_cache.allocate_page(Arc::downgrade(&drop_cache), 0)?;
+    let drop_paddr = drop_page.phys_address();
+    let drop_entry = Arc::new(PageEntry::new(drop_page, PageState::Loading));
+    drop_cache
+        .publish_prepared_range(core::iter::once((0, &drop_entry)), 1, &creator)
+        .map_err(PageCache::legacy_allocation_error)?;
+    drop(drop_cache);
+    drop_entry.account_state_transition(PageState::Loading, PageState::UpToDate);
+    drop_entry.set_state(PageState::UpToDate);
+    if drop_entry.accounting() != PageEntryAccounting::Unaccounted
+        || page_manager_lock().contains(&drop_paddr)
+        || page_reclaimer_lock().get(&drop_paddr).is_some()
+    {
+        return Ok("status=fail stage=final_drop_loading\n".into());
+    }
+
+    let before = pc_stats::snapshot();
+    let wiring_cache = PageCache::new_shmem(None, None);
+    wiring_cache.set_unevictable(true);
+    let mut wiring_pages = Vec::with_capacity(PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES);
+    let mut first_wiring_entry = None;
+    for index in 0..PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES {
+        let page = wiring_cache.get_or_create_page_zero(index)?;
+        let mut inner = wiring_cache.inner.lock();
+        let entry = inner.get_entry(index).ok_or(SystemError::EIO)?;
+        if entry.state() != PageState::UpToDate || !inner.page_indices.contains(&index) {
+            return Ok("status=fail stage=dirty_fixture\n".into());
+        }
+        entry.account_state_transition(PageState::UpToDate, PageState::Dirty);
+        entry.set_state(PageState::Dirty);
+        inner.set_index(index, 1, true);
+        if !inner.dirty_pages.contains(&index) {
+            return Ok("status=fail stage=dirty_set\n".into());
+        }
+        drop(inner);
+        if index == 0 {
+            first_wiring_entry = Some(entry);
+        }
+        wiring_pages.push(page);
+    }
+    let first_wiring_entry = first_wiring_entry.ok_or(SystemError::EIO)?;
+    let first_wiring_paddr = wiring_pages[0].phys_address();
+    let unevictable_local_ok = first_wiring_entry
+        .accounted_unevictable
+        .load(Ordering::Acquire)
+        && wiring_pages[0]
+            .read()
+            .flags()
+            .contains(PageFlags::PG_LRU | PageFlags::PG_UNEVICTABLE)
+        && page_manager_lock().contains(&first_wiring_paddr)
+        && page_reclaimer_lock()
+            .get(&first_wiring_paddr)
+            .is_some_and(|page| Arc::ptr_eq(&page, &wiring_pages[0]));
+    if !unevictable_local_ok {
+        return Ok("status=fail stage=unevictable_fixture\n".into());
+    }
+    // UNE pages retain registry nodes, but a real global bounded scan must
+    // not detach any of these pages from cache/manager/LRU membership.
+    crate::mm::page::PageReclaimer::shrink_list(
+        crate::mm::allocator::page_frame::PageFrameCount::ONE,
+    );
+    for (index, expected) in wiring_pages.iter().enumerate() {
+        if !wiring_cache
+            .manager
+            .peek_page(index)
+            .is_some_and(|page| Arc::ptr_eq(&page, expected))
+            || !page_manager_lock()
+                .get(&expected.phys_address())
+                .is_some_and(|page| Arc::ptr_eq(&page, expected))
+            || !page_reclaimer_lock()
+                .get(&expected.phys_address())
+                .is_some_and(|page| Arc::ptr_eq(&page, expected))
+        {
+            return Ok("status=fail stage=unevictable_scan\n".into());
+        }
+    }
+    let dirty_populated = pc_stats::snapshot();
+    for (index, page) in wiring_pages.iter().enumerate() {
+        if !wiring_cache.try_mark_page_writeback(index, page.phys_address()) {
+            return Ok("status=fail stage=writeback_batch_claim\n".into());
+        }
+    }
+    let writeback_populated = pc_stats::snapshot();
+    for (index, page) in wiring_pages.iter().enumerate() {
+        let entry = wiring_cache
+            .inner
+            .lock()
+            .get_entry(index)
+            .ok_or(SystemError::EIO)?;
+        PageCacheManager::finish_writeback_entry_state(
+            wiring_cache.clone(),
+            index,
+            entry,
+            page.clone(),
+            Ok(()),
+            false,
+            ALL_BLOCKS,
+        )?;
+    }
+    {
+        let inner = wiring_cache.inner.lock();
+        if !inner.writeback_pages.is_empty()
+            || !inner.dirty_pages.is_empty()
+            || inner
+                .pages
+                .values()
+                .any(|entry| entry.state() != PageState::UpToDate)
+        {
+            return Ok("status=fail stage=writeback_batch_complete\n".into());
+        }
+    }
+    let writeback_completed = pc_stats::snapshot();
+    drop(wiring_cache);
+    let after = pc_stats::snapshot();
+    let unevictable_drop_local_ok = first_wiring_entry.accounting()
+        == PageEntryAccounting::Unaccounted
+        && !first_wiring_entry
+            .accounted_unevictable
+            .load(Ordering::Acquire)
+        && !page_manager_lock().contains(&first_wiring_paddr)
+        && page_reclaimer_lock().get(&first_wiring_paddr).is_none();
+    if !unevictable_drop_local_ok {
+        return Ok("status=fail stage=unevictable_drop\n".into());
+    }
+    drop(wiring_pages);
+
+    let file_insert_delta = dirty_populated.file_pages as i128 - before.file_pages as i128;
+    let shmem_insert_delta = dirty_populated.shmem_pages as i128 - before.shmem_pages as i128;
+    let dirty_insert_delta = dirty_populated.file_dirty as i128 - before.file_dirty as i128;
+    let unevictable_insert_delta = dirty_populated.unevictable as i128 - before.unevictable as i128;
+    let writeback_insert_delta =
+        writeback_populated.file_writeback as i128 - before.file_writeback as i128;
+    let writeback_completion_drift =
+        writeback_completed.file_writeback as i128 - before.file_writeback as i128;
+    let file_drop_drift = after.file_pages as i128 - before.file_pages as i128;
+    let shmem_drop_drift = after.shmem_pages as i128 - before.shmem_pages as i128;
+    let dirty_drop_drift = after.file_dirty as i128 - before.file_dirty as i128;
+    let unevictable_drop_drift = after.unevictable as i128 - before.unevictable as i128;
+    let writeback_drop_drift = after.file_writeback as i128 - before.file_writeback as i128;
+    let insert_delta_ok = |delta: i128| {
+        (delta - PAGECACHE_ACCOUNTING_SELFTEST_WIRING_PAGES as i128).abs()
+            <= PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+    };
+    if !insert_delta_ok(file_insert_delta)
+        || !insert_delta_ok(shmem_insert_delta)
+        || !insert_delta_ok(dirty_insert_delta)
+        || !insert_delta_ok(unevictable_insert_delta)
+        || !insert_delta_ok(writeback_insert_delta)
+        || writeback_completion_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || file_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || shmem_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || dirty_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || unevictable_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+        || writeback_drop_drift.abs() > PAGECACHE_ACCOUNTING_SELFTEST_WIRING_NOISE
+    {
+        return Ok(alloc::format!(
+            "status=fail stage=global_wiring file_insert_delta={file_insert_delta} shmem_insert_delta={shmem_insert_delta} dirty_insert_delta={dirty_insert_delta} unevictable_insert_delta={unevictable_insert_delta} writeback_insert_delta={writeback_insert_delta} writeback_completion_drift={writeback_completion_drift} file_drop_drift={file_drop_drift} shmem_drop_drift={shmem_drop_drift} dirty_drop_drift={dirty_drop_drift} unevictable_drop_drift={unevictable_drop_drift} writeback_drop_drift={writeback_drop_drift}\n"
+        ));
+    }
+
+    Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
+        "status=ok\ndirty_accounting_capability=ok\nresident_backing_writeback=ok\nsubpage_buffers=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\ncustom_fill_fault_pin=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nramfs_truncate_metadata=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
+    ))
+}
+
+/// Allocation-free entry predicates after an actual scheduler sleep.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_entry_wait_selftest() -> Result<bool, SystemError> {
+    entry_wait::run()
+}

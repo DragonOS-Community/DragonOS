@@ -1,6 +1,7 @@
 use crate::include::bindings::linux_bpf::{bpf_attach_type, bpf_attr, bpf_prog_type};
-use crate::syscall::user_access::{check_and_clone_cstr, UserBufferReader};
-use alloc::string::{String, ToString};
+use crate::process::cred::{capable, CAPFlags};
+use crate::syscall::user_access::UserBufferReader;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::CStr;
 use core::fmt::Debug;
@@ -60,7 +61,7 @@ pub struct BpfProgMeta {
     pub prog_type: bpf_prog_type,
     pub expected_attach_type: bpf_attach_type,
     pub insns: Vec<u8>,
-    pub license: String,
+    pub license: Vec<u8>,
     pub kern_version: u32,
     pub name: String,
 }
@@ -86,27 +87,98 @@ impl TryFrom<&bpf_attr> for BpfProgMeta {
         let prog_type = bpf_prog_type::from_u32(u.prog_type).ok_or(SystemError::EINVAL)?;
         let expected_attach_type =
             bpf_attach_type::from_u32(u.expected_attach_type).ok_or(SystemError::EINVAL)?;
+        // Bound and authorize the request before copying any user-controlled
+        // program or license data. The device interpreter has a deliberately
+        // smaller bound than Linux's general-purpose verifier.
+        let is_device = prog_type == bpf_prog_type::BPF_PROG_TYPE_CGROUP_DEVICE;
+        if is_device
+            && (!(capable(CAPFlags::CAP_BPF) || capable(CAPFlags::CAP_SYS_ADMIN))
+                || !(capable(CAPFlags::CAP_NET_ADMIN) || capable(CAPFlags::CAP_SYS_ADMIN)))
+        {
+            return Err(SystemError::EPERM);
+        }
+        let max_insns = if is_device { 8192 } else { 1_000_000 };
+        if u.insn_cnt == 0 || u.insn_cnt > max_insns {
+            return Err(SystemError::E2BIG);
+        }
+        let insns_len = (u.insn_cnt as usize)
+            .checked_mul(8)
+            .ok_or(SystemError::E2BIG)?;
         unsafe {
-            let insns_buf =
-                UserBufferReader::new(u.insns as *mut u8, u.insn_cnt as usize * 8, true)?;
-            let insns = insns_buf.read_from_user::<u8>(0)?.to_vec();
+            let insns_buf = UserBufferReader::new(u.insns as *mut u8, insns_len, true)?;
+            let mut insns = Vec::new();
+            insns
+                .try_reserve_exact(insns_len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            insns.resize(insns_len, 0);
+            insns_buf.copy_from_user_protected(&mut insns, 0)?;
             let name_slice =
                 core::slice::from_raw_parts(u.prog_name.as_ptr() as *const u8, u.prog_name.len());
-            let prog_name = CStr::from_bytes_until_nul(name_slice)
-                .map_err(|_| SystemError::EINVAL)?
-                .to_str()
-                .map_err(|_| SystemError::EINVAL)?
-                .to_string();
-            let license = check_and_clone_cstr(u.license as *const u8, None)?;
+            let prog_name = copy_program_name(name_slice)?;
+            let license = copy_license(u.license as *const u8)?;
             Ok(Self {
                 prog_flags: u.prog_flags,
                 prog_type,
                 expected_attach_type,
                 insns,
-                license: license.into_string().map_err(|_| SystemError::EINVAL)?,
+                license,
                 kern_version: u.kern_version,
                 name: prog_name,
             })
         }
     }
+}
+
+/// Linux bpf_obj_name_cpy: a bounded NUL-terminated ASCII identifier.
+fn copy_program_name(bytes: &[u8]) -> Result<String, SystemError> {
+    let bytes = CStr::from_bytes_until_nul(bytes)
+        .map_err(|_| SystemError::EINVAL)?
+        .to_bytes();
+    if bytes
+        .iter()
+        .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b'.')
+    {
+        return Err(SystemError::EINVAL);
+    }
+    let mut name = String::new();
+    name.try_reserve_exact(bytes.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    // The character check above already establishes UTF-8 validity.
+    name.push_str(core::str::from_utf8(bytes).map_err(|_| SystemError::EINVAL)?);
+    Ok(name)
+}
+
+/// Linux reads at most 127 license bytes and supplies the terminating NUL.
+/// License data is a byte string, rather than an additional UTF-8 ABI rule.
+fn copy_license(pointer: *const u8) -> Result<Vec<u8>, SystemError> {
+    if pointer.is_null() {
+        return Err(SystemError::EFAULT);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(127)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for offset in 0..127 {
+        let address = (pointer as usize)
+            .checked_add(offset)
+            .ok_or(SystemError::EFAULT)?;
+        let mut byte = [0];
+        UserBufferReader::new(address as *const u8, 1, true)?
+            .copy_from_user_protected(&mut byte, 0)?;
+        if byte[0] == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(super) fn name_birth_selftest() -> bool {
+    let _denied = crate::mm::oom::denial::Scope::enter(true);
+    matches!(copy_program_name(b"nonempty\0"), Err(SystemError::ENOMEM))
+        && matches!(
+            copy_license(c"GPL".as_ptr().cast()),
+            Err(SystemError::ENOMEM)
+        )
 }

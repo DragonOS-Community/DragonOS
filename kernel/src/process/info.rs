@@ -1,0 +1,438 @@
+use alloc::{
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::AtomicUsize;
+
+use crate::{
+    arch::ipc::signal::{SigSet, Signal},
+    driver::tty::tty_core::TtyCore,
+    filesystem::vfs::fdtable::FileDescriptorTable,
+    ipc::signal_types::{SigInfo, SigPending},
+    libs::rwlock::RwLock,
+    mm::{ucontext::AddressSpace, VirtAddr},
+    process::{ProcessControlBlock, ProcessManager, RawPid},
+    sched::completion::Completion,
+};
+
+#[derive(Debug)]
+pub struct ThreadInfo {
+    // Address from userspace to record the thread ID. When this thread exits,
+    // the kernel writes 0 to this address to notify the parent process.
+    pub(super) clear_child_tid: Option<VirtAddr>,
+    pub(super) set_child_tid: Option<VirtAddr>,
+
+    pub(super) vfork_done: Option<Arc<Completion>>,
+    /// The thread group leader.
+    pub(super) group_leader: Weak<ProcessControlBlock>,
+
+    /// When the current thread is the group leader, this field stores the
+    /// PCBs of all threads in the group.
+    pub(super) group_tasks: Vec<Weak<ProcessControlBlock>>,
+    /// Number of published tasks that have not entered the exit path.
+    ///
+    /// This is shared by exactly one thread group. It must not live in
+    /// `SigHand`, because CLONE_SIGHAND may share that object across distinct
+    /// thread groups.
+    pub(super) thread_group_live: Arc<AtomicUsize>,
+}
+
+impl Default for ThreadInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThreadInfo {
+    pub fn new() -> Self {
+        Self {
+            clear_child_tid: None,
+            set_child_tid: None,
+            vfork_done: None,
+            group_leader: Weak::default(),
+            group_tasks: Vec::new(),
+            thread_group_live: Arc::new(AtomicUsize::new(1)),
+        }
+    }
+
+    pub fn group_leader(&self) -> Option<Arc<ProcessControlBlock>> {
+        return self.group_leader.upgrade();
+    }
+
+    /// Returns the list of threads in the thread group excluding the leader
+    /// (maintained by the group leader).
+    ///
+    /// Note: The list is stored as `Weak` references. Callers should `upgrade()`
+    /// each entry before use and handle upgrade failures.
+    pub fn group_tasks_clone(&self) -> Vec<Weak<ProcessControlBlock>> {
+        self.group_tasks.clone()
+    }
+
+    /// Borrow the leader-owned thread list without allocating. Callers must
+    /// keep the surrounding ThreadInfo read guard alive while iterating.
+    pub(crate) fn group_tasks(&self) -> &[Weak<ProcessControlBlock>] {
+        &self.group_tasks
+    }
+
+    /// Whether the group has only the leader thread (an empty group list means a single-threaded group).
+    pub fn group_tasks_is_empty(&self) -> bool {
+        self.group_tasks.is_empty()
+    }
+
+    pub fn thread_group_empty(&self) -> bool {
+        let group_leader = self.group_leader();
+        if let Some(leader) = group_leader {
+            if Arc::ptr_eq(&leader, &ProcessManager::current_pcb()) {
+                if self.group_tasks.is_empty() {
+                    return true;
+                }
+                // Only return false when there are “live threads” in the group
+                for weak in &self.group_tasks {
+                    if let Some(task) = weak.upgrade() {
+                        if Arc::ptr_eq(&task, &ProcessManager::current_pcb()) {
+                            continue;
+                        }
+                        if !task.is_exited() && !task.is_dead() && !task.is_zombie() {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+        return true;
+    }
+}
+
+/// Basic information about a process.
+///
+/// This struct holds process metadata that rarely changes during the process
+/// lifetime.
+#[derive(Debug)]
+pub struct ProcessBasicInfo {
+    /// PID of the current process's parent.
+    pub(super) ppid: RawPid,
+    /// Process name.
+    name: String,
+
+    /// User address space.
+    user_vm: Option<Arc<AddressSpace>>,
+
+    /// File descriptor table.
+    fd_table: Option<FdTableAttachment>,
+
+    /// Process execution domain flags (personality); GDB sets bits such as ADDR_NO_RANDOMIZE via SYS_personality.
+    personality: u32,
+}
+
+/// A PCB slot's ownership of a files table.
+///
+/// This type intentionally does not implement `Clone`: only
+/// `share_for_task()` may create another task attachment. Ordinary table
+/// observers receive only an `Arc<FileDescriptorTable>`.
+#[derive(Debug)]
+pub(crate) struct FdTableAttachment {
+    table: Option<Arc<FileDescriptorTable>>,
+}
+
+impl FdTableAttachment {
+    fn new(table: Arc<FileDescriptorTable>) -> Self {
+        table.attach_task();
+        Self { table: Some(table) }
+    }
+
+    fn share_for_task(&self) -> Self {
+        Self::new(
+            self.table
+                .as_ref()
+                .expect("retired fd-table attachment")
+                .clone(),
+        )
+    }
+
+    fn observer(&self) -> Arc<FileDescriptorTable> {
+        self.table
+            .as_ref()
+            .expect("retired fd-table attachment")
+            .clone()
+    }
+
+    fn is_shared(&self) -> bool {
+        self.table
+            .as_ref()
+            .expect("retired fd-table attachment")
+            .is_shared_by_tasks()
+    }
+
+    fn retire(mut self) -> Arc<FileDescriptorTable> {
+        let table = self.table.take().expect("retired fd-table attachment");
+        table.detach_task();
+        table
+    }
+}
+
+impl Drop for FdTableAttachment {
+    fn drop(&mut self) {
+        if let Some(table) = self.table.take() {
+            table.detach_task();
+        }
+    }
+}
+
+impl ProcessBasicInfo {
+    #[inline(never)]
+    pub fn new(
+        ppid: RawPid,
+        name: String,
+        user_vm: Option<Arc<AddressSpace>>,
+        fd_table: Arc<FileDescriptorTable>,
+    ) -> RwLock<Self> {
+        return RwLock::new(Self {
+            ppid,
+            name,
+            user_vm,
+            fd_table: Some(FdTableAttachment::new(fd_table)),
+            personality: 0,
+        });
+    }
+
+    pub fn ppid(&self) -> RawPid {
+        return self.ppid;
+    }
+
+    pub fn name(&self) -> &str {
+        return &self.name;
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    pub fn user_vm(&self) -> Option<Arc<AddressSpace>> {
+        return self.user_vm.clone();
+    }
+
+    pub unsafe fn set_user_vm(&mut self, user_vm: Option<Arc<AddressSpace>>) {
+        self.user_vm = user_vm;
+    }
+
+    /// Replace the task's user address space and return the old one without
+    /// dropping it while this lock is still held. The caller must preserve the
+    /// active_cpus and TLB-state ordering required by the mm switch/exit path.
+    pub unsafe fn replace_user_vm(
+        &mut self,
+        user_vm: Option<Arc<AddressSpace>>,
+    ) -> Option<Arc<AddressSpace>> {
+        let old = self.user_vm.take();
+        self.user_vm = user_vm;
+        old
+    }
+
+    pub fn try_fd_table(&self) -> Option<Arc<FileDescriptorTable>> {
+        self.fd_table.as_ref().map(FdTableAttachment::observer)
+    }
+
+    pub(crate) fn fd_table_snapshot(&self) -> Option<(Arc<FileDescriptorTable>, bool)> {
+        self.fd_table
+            .as_ref()
+            .map(|attachment| (attachment.observer(), attachment.is_shared()))
+    }
+
+    pub(crate) fn share_fd_table_for_task(&self) -> Option<FdTableAttachment> {
+        self.fd_table
+            .as_ref()
+            .map(FdTableAttachment::share_for_task)
+    }
+
+    pub fn set_fd_table(
+        &mut self,
+        fd_table: Option<Arc<FileDescriptorTable>>,
+    ) -> Option<Arc<FileDescriptorTable>> {
+        self.set_fd_table_attachment(fd_table.map(FdTableAttachment::new))
+    }
+
+    pub(crate) fn set_fd_table_attachment(
+        &mut self,
+        fd_table: Option<FdTableAttachment>,
+    ) -> Option<Arc<FileDescriptorTable>> {
+        let old = self.fd_table.take();
+        self.fd_table = fd_table;
+        old.map(FdTableAttachment::retire)
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.personality
+    }
+
+    pub fn set_personality(&mut self, new: u32) -> u32 {
+        let old = self.personality;
+        self.personality = new;
+        old
+    }
+}
+
+#[cfg(test)]
+mod fd_table_attachment_tests {
+    use alloc::sync::Arc;
+
+    use super::FdTableAttachment;
+    use crate::filesystem::vfs::fdtable::{FdTableState, FileDescriptorTable};
+
+    #[test]
+    fn observer_arcs_do_not_count_as_task_sharing() {
+        let account = crate::cgroup::memory::MemoryAccount::new(1, None).unwrap();
+        let creator = crate::cgroup::memory::object::ObjectAccount::new(&account).unwrap();
+        let table = Arc::new(FileDescriptorTable::try_new(FdTableState::new(), &creator).unwrap());
+        let owner = FdTableAttachment::new(table);
+        let observer = owner.observer();
+        let another_observer = observer.clone();
+
+        assert!(!owner.is_shared());
+        let shared_owner = owner.share_for_task();
+        assert!(owner.is_shared());
+        drop(shared_owner);
+        assert!(!owner.is_shared());
+
+        drop(another_observer);
+        drop(observer);
+        drop(owner);
+    }
+}
+
+#[derive(Debug)]
+
+pub struct ProcessSignalInfo {
+    // Signals currently blocked by this process.
+    sig_blocked: SigSet,
+    // Original blocked mask used by sigtimedwait while it temporarily unblocks
+    // the waited signal set.
+    real_blocked: SigSet,
+    // Saved old signal mask, used for restoration.
+    saved_sigmask: SigSet,
+    // sig_pending stores the signals pending for the current thread.
+    sig_pending: SigPending,
+
+    // The tty associated with the current process.
+    tty: Option<Arc<TtyCore>>,
+    has_child_subreaper: bool,
+
+    /// Marks whether the current process is a “child subreaper.”
+    ///
+    /// TODO: Implement the prctl interface for setting this flag.
+    is_child_subreaper: bool,
+
+    /// boolean value for session group leader
+    pub is_session_leader: bool,
+
+    /// OOM killer score adjustment exposed through `/proc/[pid]/oom_score_adj`.
+    oom_score_adj: i16,
+    /// Minimum oom_score_adj an unprivileged writer may set.
+    ///
+    /// Linux updates this value only from CAP_SYS_RESOURCE writes. The default
+    /// is 0, so an unprivileged process cannot make itself more protected than
+    /// the initial state.
+    oom_score_adj_min: i16,
+}
+
+impl ProcessSignalInfo {
+    pub fn sig_blocked(&self) -> &SigSet {
+        &self.sig_blocked
+    }
+
+    pub fn sig_pending(&self) -> &SigPending {
+        &self.sig_pending
+    }
+
+    pub fn sig_pending_mut(&mut self) -> &mut SigPending {
+        &mut self.sig_pending
+    }
+
+    pub fn sig_block_mut(&mut self) -> &mut SigSet {
+        &mut self.sig_blocked
+    }
+
+    pub fn real_blocked(&self) -> &SigSet {
+        &self.real_blocked
+    }
+
+    pub fn real_blocked_mut(&mut self) -> &mut SigSet {
+        &mut self.real_blocked
+    }
+
+    pub fn saved_sigmask(&self) -> &SigSet {
+        &self.saved_sigmask
+    }
+
+    pub fn saved_sigmask_mut(&mut self) -> &mut SigSet {
+        &mut self.saved_sigmask
+    }
+
+    pub fn tty(&self) -> Option<Arc<TtyCore>> {
+        self.tty.clone()
+    }
+
+    pub fn set_tty(&mut self, tty: Option<Arc<TtyCore>>) {
+        self.tty = tty;
+    }
+
+    /// Dequeue the next signal to be processed from the current thread's
+    /// pending set.
+    ///
+    /// ## Parameters
+    ///
+    /// - `sig_mask`: Signals to be ignored (masked out).
+    pub fn dequeue_thread_signal(&mut self, sig_mask: &SigSet) -> (Signal, Option<SigInfo>) {
+        self.sig_pending.dequeue_signal(sig_mask)
+    }
+
+    pub fn has_child_subreaper(&self) -> bool {
+        self.has_child_subreaper
+    }
+
+    pub fn set_has_child_subreaper(&mut self, has_child_subreaper: bool) {
+        self.has_child_subreaper = has_child_subreaper;
+    }
+
+    pub fn is_child_subreaper(&self) -> bool {
+        self.is_child_subreaper
+    }
+
+    pub fn set_is_child_subreaper(&mut self, is_child_subreaper: bool) {
+        self.is_child_subreaper = is_child_subreaper;
+    }
+
+    pub fn oom_score_adj(&self) -> i16 {
+        self.oom_score_adj
+    }
+
+    pub fn set_oom_score_adj(&mut self, oom_score_adj: i16) {
+        self.oom_score_adj = oom_score_adj;
+    }
+
+    pub fn oom_score_adj_min(&self) -> i16 {
+        self.oom_score_adj_min
+    }
+
+    pub fn set_oom_score_adj_min(&mut self, oom_score_adj_min: i16) {
+        self.oom_score_adj_min = oom_score_adj_min;
+    }
+}
+
+impl Default for ProcessSignalInfo {
+    fn default() -> Self {
+        Self {
+            sig_blocked: SigSet::empty(),
+            real_blocked: SigSet::empty(),
+            saved_sigmask: SigSet::empty(),
+            sig_pending: SigPending::default(),
+            tty: None,
+            has_child_subreaper: false,
+            is_child_subreaper: false,
+            is_session_leader: false,
+            oom_score_adj: 0,
+            oom_score_adj_min: 0,
+        }
+    }
+}

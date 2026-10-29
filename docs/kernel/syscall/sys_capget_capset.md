@@ -1,25 +1,25 @@
-# sys_capget / sys_capset 设计说明
+# Design Documentation for sys_capget / sys_capset
 
-本文简要介绍 DragonOS 中 sys_capget 和 sys_capset 的设计与实现要点，覆盖版本协商、用户态数据结构、能力位集规则、以及调用流程。
+This document briefly introduces the design and implementation key points of sys_capget and sys_capset in DragonOS, covering version negotiation, user-space data structures, capability bitset rules, and call flows.
 
-来源代码：
+Source Code:
 - kernel/src/process/syscall/sys_cap_get_set.rs
 - kernel/src/process/cred.rs
 
-## 概述
+## Overview
 
-- DragonOS 对齐 Linux 的 capability 接口，支持用户态通过 capget/capset 读取或设置进程的能力集。
-- 能力集包括：
-  - cap_effective (pE)：当前进程实际生效的能力
-  - cap_permitted (pP)：进程被赋予的能力上限
-  - cap_inheritable (pI)：可被子进程继承的能力
-  - cap_bset：bounding set，限制可获得能力的上界（仅用于规则约束，不在本接口直接读写）
-  - cap_ambient：ambient set（不由 capset 修改）
-- 能力位宽：DragonOS 使用 64 位存储，但当前仅支持低 41 位（CAP_FULL_SET = (1<<41)-1），高位截断。
+- DragonOS aligns with Linux's capability interface, supporting user-space reading or setting process capability sets via capget/capset.
+- Capability sets include:
+  - cap_effective (pE): The capabilities currently in effect for the process
+  - cap_permitted (pP): The upper limit of capabilities granted to the process
+  - cap_inheritable (pI): Capabilities that can be inherited by child processes
+  - cap_bset: Bounding set, limiting the upper bound of obtainable capabilities (used only for rule constraints, not directly read/written in this interface)
+  - cap_ambient: Ambient set (not modified by capset)
+- Capability bit width: DragonOS uses 64-bit storage but currently only supports the lower 41 bits (CAP_FULL_SET = (1<<41)-1), with higher bits truncated.
 
-## 用户态数据结构与版本
+## User-Space Data Structures and Versions
 
-与 Linux 的用户态结构对齐：
+Aligned with Linux's user-space structures:
 
 ```c
 // header: cap_user_header_t
@@ -36,72 +36,72 @@ struct CapUserData {
 }
 ```
 
-- 版本常量：
+- Version constants:
   - _LINUX_CAPABILITY_VERSION_1 = 0x19980330
-  - _LINUX_CAPABILITY_VERSION_2 = 0x20071026（已废弃）
+  - _LINUX_CAPABILITY_VERSION_2 = 0x20071026 (deprecated)
   - _LINUX_CAPABILITY_VERSION_3 = 0x20080522
-- DragonOS 内核支持版本：_KERNEL_CAPABILITY_VERSION = v3
-- 每版本拷贝的 u32 数量：
-  - v1: 1 组（仅低 32 位）
-  - v2/v3: 2 组（低 32 位 + 高 32 位）
+- Kernel-supported version in DragonOS: _KERNEL_CAPABILITY_VERSION = v3
+- Number of u32 groups copied per version:
+  - v1: 1 group (lower 32 bits only)
+  - v2/v3: 2 groups (lower 32 bits + upper 32 bits)
 
-聚合/拆分规则：
-- capset: 从用户传入的 CapUserData[0..tocopy) 聚合为 u64（高位截断到 41 位）
-- capget: 根据请求版本返回 1 组或 2 组 u32（高位通过右移 32 获得）
+Aggregation/Splitting Rules:
+- capset: Aggregates CapUserData[0..tocopy) from user input into a u64 (truncated to 41 bits at higher positions)
+- capget: Returns the number of u32 groups corresponding to the requested version (v1:1 group; v2/v3:2 groups) based on the request, also returning 0 when data==NULL.
 
-## 版本协商与探测行为
-
-- capget:
-  - 若版本未知：写回 header.version 为内核支持版本（v3），并返回：
-    - 若 data==NULL：返回 0（用于探测）
-    - 若 data!=NULL：返回 EINVAL
-  - 若版本合法：返回请求版本对应数量的 u32 组（v1:1组；v2/v3:2组），data==NULL 时也返回 0。
-- capset:
-  - 若版本未知：直接返回 EINVAL（不承担探测职责），与 Linux 更一致。
-  - data 不能为空（NULL 返回 EFAULT）。
-
-## 目标进程选择与 pid 语义
+## Version Negotiation and Probe Behavior
 
 - capget:
-  - pid < 0：EINVAL
-  - pid == 0：使用当前进程
-  - pid != 0：查找目标任务（找不到返回 ESRCH）
+  - If version is unknown: Writes back header.version as the kernel-supported version (v3) and returns:
+    - If data==NULL: Returns 0 (for probing)
+    - If data!=NULL: Returns EINVAL
+  - If version is valid: Returns the number of u32 groups corresponding to the requested version (v1:1 group; v2/v3:2 groups), also returning 0 when data==NULL.
 - capset:
-  - pid < 0：EPERM（不允许负 pid 目标）
-  - pid == 0 或 pid == 当前进程 pid：允许
-  - pid != 当前进程 pid：EPERM（仅允许修改自身）
+  - If version is unknown: Directly returns EINVAL (does not take on probing responsibility), more consistent with Linux.
+  - data cannot be empty (NULL returns EFAULT).
 
-## 能力集规则（capset）
+## Target Process Selection and pid Semantics
 
-设：
-- pE_old = 旧 effective
-- pP_old = 旧 permitted
-- pI_old = 旧 inheritable
+- capget:
+  - pid < 0: EINVAL
+  - pid == 0: Uses the current process
+  - pid != 0: Looks up the target process (returns ESRCH if not found)
+- capset:
+  - pid < 0: EPERM (negative pid targets not allowed)
+  - pid == 0 or pid == current process pid: Allowed
+  - pid != current process pid: EPERM (only self-modification allowed)
+
+## Capability Set Rules (capset)
+
+Let:
+- pE_old = old effective
+- pP_old = old permitted
+- pI_old = old inheritable
 - bset   = bounding set
-- pE_new, pP_new, pI_new 由用户数据聚合得出（已按 41 位掩码截断）
+- pE_new, pP_new, pI_new derived from user data (already truncated to 41-bit mask)
 
-约束：
+Constraints:
 1) pE_new ⊆ pP_new  
-   若存在 pE_new 中的位不在 pP_new：EPERM
+   If any bit in pE_new is not in pP_new: EPERM
 
-2) pP_new ⊆ pP_old（不允许提升 permitted）  
-   若 pP_new 中存在不属于 pP_old 的位：EPERM
+2) pP_new ⊆ pP_old (not allowed to elevate permitted)  
+   If pP_new contains any bits not in pP_old: EPERM
 
-3) pI_new 限幅（对齐 Linux 的 CAP_SETPCAP 与 bset 约束）
-   - 如果当前进程具有 CAP_SETPCAP_BIT（在 pE_old 生效集合中）：
+3) pI_new limitation (aligned with Linux's CAP_SETPCAP and bset constraints)
+   - If the current process has CAP_SETPCAP_BIT (in the pE_old effective set):
      pI_new ⊆ (pI_old ∪ pP_old) ∩ bset  
-     若超出：EPERM
-   - 如果不具有：
-     pI_new ⊆ (pI_old ∪ pP_old) 且 pI_new ⊆ (pI_old ∪ bset)  
-     任一超出：EPERM
+     If exceeded: EPERM
+   - If not:
+     pI_new ⊆ (pI_old ∪ pP_old) and pI_new ⊆ (pI_old ∪ bset)  
+     Any exceedance: EPERM
 
-注意：
-- ambient 能力不由 capset 修改，保持不变。
-- 通过克隆旧 cred，更新 pE/pP/pI 后，原子替换到 PCB（pcb.set_cred）。
+Note:
+- Ambient capabilities are not modified by capset and remain unchanged.
+- By cloning the old cred, updating pE/pP/pI, and then atomically replacing it in the PCB (pcb.set_cred).
 
-## 流程图
+## Flowchart
 
-capget 主要流程：
+Main flow of capget:
 
 ```
 [读取 header(version,pid)]
@@ -125,7 +125,7 @@ capget 主要流程：
                              返回 0     写回用户缓冲区，返回 0
 ```
 
-capset 主要流程：
+Main flow of capset:
 
 ```
 [读取 header(version,pid)]
@@ -150,21 +150,21 @@ capset 主要流程：
                                       返回 0
 ```
 
-## 能力位宽与掩码
+## Capability Bit Width and Masks
 
-聚合时对 e/p/i 应用掩码：
+Apply masks to e/p/i during aggregation:
 - mask = CAPFlags::CAP_FULL_SET.bits() = (1<<41)-1
-- 高位被截断，保证跨版本兼容性与当前实现的一致性。
+- Higher bits are truncated to ensure cross-version compatibility and consistency with the current implementation.
 
-## 设计取舍与对齐
+## Design Trade-offs and Alignment
 
-- capget 对未知版本支持“探测”语义：写回支持版本并在 data==NULL 时返回 0。
-- capset 不承担探测：未知版本直接 EINVAL，更贴近 Linux 行为。
-- pid 约束更严格：capset 仅允许修改当前进程，避免跨进程权限修改。
-- 规则遵循 Linux 能力模型：不允许提升 permitted；effective 必须受限于 permitted；inheritable 受 CAP_SETPCAP 与 bset 限制。
+- capget supports "probe" semantics for unknown versions: writes back the supported version and returns 0 when data==NULL.
+- capset does not take on probing: unknown versions directly return EINVAL, more closely aligned with Linux behavior.
+- pid constraints are stricter: capset only allows modification of the current process to avoid cross-process permission modifications.
+- Rules follow the Linux capability model: not allowed to elevate permitted; effective must be limited by permitted; inheritable is constrained by CAP_SETPCAP and bset.
 
-## 未来工作
+## Future Work
 
-- 完善 ambient 能力与 bounding set 的更多接口（当前不在 capset 中修改 ambient）。
-- 引入更完整的能力位定义与权限检查接口。
-- 文档与测试用例对齐更多边界条件（如用户命名空间影响）。
+- Improve more interfaces for ambient capabilities and bounding set (currently ambient is not modified in capset).
+- Introduce more complete capability bit definitions and permission check interfaces.
+- Align documentation and test cases with more boundary conditions (such as the impact of user namespaces).

@@ -41,6 +41,8 @@ impl KernelThreadMechanism {
         // fork失败的话，子线程不会执行。否则将导致内存安全问题。
         let mut clone_args = KernelCloneArgs::new();
         clone_args.flags = clone_flags;
+        clone_args.kthread = true;
+        clone_args.kthread_flags = info.flags();
         if info
             .flags()
             .contains(crate::process::kthread::KernelThreadFlags::IS_PER_CPU)
@@ -56,10 +58,6 @@ impl KernelThreadMechanism {
             unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
             e
         })?;
-
-        let pcb = ProcessManager::find(pid).unwrap();
-        pcb.set_name(info.name().clone());
-        info.setup_pcb(&pcb);
 
         return Ok(pid);
     }

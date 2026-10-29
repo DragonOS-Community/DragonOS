@@ -38,7 +38,7 @@ impl Syscall for SysMprotectHandle {
             return Err(SystemError::EINVAL);
         }
         if len == 0 {
-            return Err(SystemError::EINVAL);
+            return Ok(0);
         }
         // 将长度向上对齐，同时检测溢出；超大长度视为 ENOMEM
         let len_aligned = page_align_up(len);
@@ -61,10 +61,7 @@ impl Syscall for SysMprotectHandle {
         let start_frame = VirtPageFrame::new(start_vaddr);
         let page_count = PageFrameCount::from_bytes(len_aligned).unwrap();
 
-        current_address_space
-            .write()
-            .mprotect(start_frame, page_count, prot_flags)
-            .map_err(|_| SystemError::EINVAL)?;
+        current_address_space.mprotect_wait(start_frame, page_count, prot_flags)?;
         return Ok(0);
     }
 

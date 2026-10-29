@@ -1,0 +1,622 @@
+use alloc::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+    vec,
+};
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use lazy_static::lazy_static;
+use linkme::distributed_slice;
+use system_error::SystemError;
+
+use crate::{
+    driver::virtio::virtio_fs::{virtio_fs_find_instance, VirtioFsInstance},
+    exception::workqueue::{schedule_work, Work},
+    filesystem::vfs::{
+        file::File,
+        mount::{MountFS, MountFlags, SuperBlockState},
+        FilePrivateData, FileSystem, FileSystemMakerData, FsCreationContext, FsInfo, IndexNode,
+        MountableFileSystem, SuperBlock, VmaOpenRollback, FSMAKER,
+    },
+    libs::mutex::Mutex,
+    mm::{
+        fault::{FaultFlags, PageFaultMessage},
+        MemoryManagementArch, VirtRegion, VmFaultReason, VmFlags,
+    },
+    process::{namespace::user_namespace::UserNamespace, Cred, ProcessManager},
+    register_mountable_fs,
+};
+
+use super::super::{
+    conn::FuseConn,
+    fs::{FuseFS, FuseMountData},
+    private_data::FuseFilePrivateData,
+    protocol::FuseOutHeader,
+};
+use super::{
+    bridge::start_bridge, dax::DaxMountMode, VIRTIOFS_MAX_REQUEST_SIZE, VIRTIOFS_RSP_BUF_SIZE,
+};
+
+#[derive(Debug)]
+struct VirtioFsMountData {
+    rootmode: u32,
+    user_id: u32,
+    group_id: u32,
+    allow_other: bool,
+    default_permissions: bool,
+    dax_mode: DaxMountMode,
+    instance: Arc<VirtioFsInstance>,
+}
+
+impl FileSystemMakerData for VirtioFsMountData {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+lazy_static! {
+    // Only in-memory domain lookup is global; device initialization and teardown
+    // use the selected domain without blocking mounts of other devices.
+    static ref VIRTIOFS_MOUNT_DOMAINS: Mutex<BTreeMap<usize, Weak<VirtioFsMountDomain>>> =
+        Mutex::new(BTreeMap::new());
+}
+
+#[derive(Debug)]
+struct VirtioFsMountDomain {
+    canonical: Mutex<Weak<VirtioFsFs>>,
+}
+
+impl Default for VirtioFsMountDomain {
+    fn default() -> Self {
+        Self {
+            canonical: Mutex::new(Weak::new()),
+        }
+    }
+}
+
+fn mount_domain(instance: &Arc<VirtioFsInstance>) -> Arc<VirtioFsMountDomain> {
+    let key = Arc::as_ptr(instance) as usize;
+    let mut domains = VIRTIOFS_MOUNT_DOMAINS.lock();
+    domains.retain(|_, domain| domain.strong_count() != 0);
+    if let Some(domain) = domains.get(&key).and_then(Weak::upgrade) {
+        return domain;
+    }
+    let domain = Arc::new(VirtioFsMountDomain::default());
+    domains.insert(key, Arc::downgrade(&domain));
+    domain
+}
+
+#[derive(Debug)]
+struct VirtioFsFs {
+    inner: Arc<dyn FileSystem>,
+    conn: Arc<FuseConn>,
+    instance: Arc<VirtioFsInstance>,
+    session_id: u64,
+    superblock: Arc<SuperBlockState>,
+    mount_domain: Arc<VirtioFsMountDomain>,
+    shutdown_started: AtomicBool,
+}
+
+/// Narrow authority for the sole production external-PFN installer. Neither
+/// VM_MIXEDMAP nor a filesystem name authorizes an arbitrary device PFN.
+pub(crate) fn snapshot_external_user_write(
+    file: &Arc<File>,
+    page_offset: usize,
+) -> Result<Option<super::super::inode::DaxUserWriteSnapshot>, SystemError> {
+    file.with_io_fs(|fs| {
+        let underlying = fs
+            .as_any_ref()
+            .downcast_ref::<MountFS>()
+            .map(MountFS::inner_filesystem);
+        let fs = underlying.as_deref().unwrap_or(fs);
+        let provider = fs
+            .as_any_ref()
+            .downcast_ref::<VirtioFsFs>()
+            .ok_or(SystemError::EFAULT)?;
+        let node = {
+            let Ok(private) = file.private_data.try_lock() else {
+                return Ok(None);
+            };
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(private)) = &*private else {
+                return Err(SystemError::EFAULT);
+            };
+            private.node.clone()
+        };
+        if !Arc::ptr_eq(node.conn(), &provider.conn) || !node.dax_active() || node.nodeid() == 0 {
+            return Err(SystemError::EFAULT);
+        }
+        let offset = page_offset
+            .checked_mul(crate::arch::MMArch::PAGE_SIZE)
+            .ok_or(SystemError::EFAULT)?;
+        node.snapshot_dax_user_write(offset)
+            .map(Some)
+            .map_err(|_| SystemError::EFAULT)
+    })
+}
+
+impl VirtioFsFs {
+    unsafe fn dax_fault(&self, pfm: &mut PageFaultMessage) -> Option<VmFaultReason> {
+        let vma = pfm.vma();
+        let guard = vma.lock();
+        let vm_flags = *guard.vm_flags();
+        let file = guard.vm_file()?;
+        drop(guard);
+        let node = {
+            let private = file.private_data.lock();
+            let FilePrivateData::Fuse(FuseFilePrivateData::File(private)) = &*private else {
+                return Some(VmFaultReason::VM_FAULT_SIGBUS);
+            };
+            private.node.clone()
+        };
+        if !node.dax_active() {
+            return None;
+        }
+
+        let page_index = match pfm.backing_pgoff() {
+            Some(index) => index,
+            None => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let file_offset = match page_index.checked_mul(crate::arch::MMArch::PAGE_SIZE) {
+            Some(offset) => offset,
+            None => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let _layout = node.dax_layout_read();
+        let file_size = match node.dax_file_size() {
+            Ok(size) => size,
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        if file_offset >= file_size {
+            return Some(VmFaultReason::VM_FAULT_SIGBUS);
+        }
+
+        let write = pfm.flags().contains(FaultFlags::FAULT_FLAG_WRITE);
+        let shared = vm_flags.contains(VmFlags::VM_SHARED);
+        let access = match node.dax_access(file_offset as u64, write && shared) {
+            Ok(access) => access,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                pfm.set_retry_wait(if node.dax_host_invalidation_blocked() {
+                    node.dax_host_invalidation_retry_wait()
+                } else {
+                    node.conn().dax_fault_retry_wait()
+                });
+                return Some(VmFaultReason::VM_FAULT_RETRY);
+            }
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let _host_access = match node.dax_try_host_access() {
+            Ok(guard) => guard,
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                drop(access);
+                drop(_layout);
+                pfm.set_retry_wait(node.dax_host_invalidation_retry_wait());
+                return Some(VmFaultReason::VM_FAULT_RETRY);
+            }
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let in_mapping = file_offset & (super::dax::DAX_RANGE_SIZE - 1);
+        let paddr = match access.checked_paddr(in_mapping, crate::arch::MMArch::PAGE_SIZE) {
+            Ok(paddr) => paddr,
+            Err(_) => return Some(VmFaultReason::VM_FAULT_SIGBUS),
+        };
+        let old_pfn = pfm.external_pfn();
+        let result = if write && !shared {
+            let mut source = vec![0; crate::arch::MMArch::PAGE_SIZE];
+            if access.copy_to(in_mapping, &mut source).is_err() {
+                return Some(VmFaultReason::VM_FAULT_SIGBUS);
+            }
+            pfm.cow_external_page(old_pfn, &source)
+        } else if let Some(old_pfn) = old_pfn {
+            if old_pfn != paddr {
+                VmFaultReason::VM_FAULT_SIGBUS
+            } else if write {
+                pfm.upgrade_external_pfn(paddr)
+            } else {
+                VmFaultReason::VM_FAULT_COMPLETED
+            }
+        } else {
+            pfm.map_external_pfn(paddr, write && shared)
+        };
+        if result.contains(VmFaultReason::VM_FAULT_COMPLETED) {
+            if write && shared {
+                node.note_mmap_write();
+            }
+            if node.dax_note_pte_published().is_err() {
+                return Some(VmFaultReason::VM_FAULT_SIGBUS);
+            }
+        }
+        Some(result)
+    }
+
+    fn parse_opt_u32_decimal(v: &str) -> Result<u32, SystemError> {
+        v.parse::<u32>().map_err(|_| SystemError::EINVAL)
+    }
+
+    fn parse_opt_u32_octal(v: &str) -> Result<u32, SystemError> {
+        u32::from_str_radix(v, 8).map_err(|_| SystemError::EINVAL)
+    }
+
+    fn parse_opt_bool_switch(v: &str) -> bool {
+        v.is_empty() || v != "0"
+    }
+
+    fn parse_dax_mode(v: Option<&str>) -> Result<DaxMountMode, SystemError> {
+        let Some(v) = v else {
+            return Ok(DaxMountMode::Always);
+        };
+
+        match v {
+            "always" => Ok(DaxMountMode::Always),
+            "never" => Ok(DaxMountMode::Never),
+            "inode" => Ok(DaxMountMode::Inode),
+            _ => Err(SystemError::EINVAL),
+        }
+    }
+
+    fn parse_mount_options(
+        raw: Option<&str>,
+        cred: &Cred,
+    ) -> Result<(u32, u32, u32, bool, bool, DaxMountMode), SystemError> {
+        let mut rootmode: Option<u32> = None;
+        let mut user_id: Option<u32> = None;
+        let mut group_id: Option<u32> = None;
+        let mut default_permissions = true;
+        let mut allow_other = true;
+        let mut dax_mode = DaxMountMode::InodeDefault;
+
+        for part in raw.unwrap_or("").split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (k, value) = match part.split_once('=') {
+                Some((k, v)) => (k.trim(), Some(v.trim())),
+                None => (part, None),
+            };
+            let v = value.unwrap_or("");
+
+            match k {
+                "rootmode" => rootmode = Some(Self::parse_opt_u32_octal(v)?),
+                "user_id" => user_id = Some(Self::parse_opt_u32_decimal(v)?),
+                "group_id" => group_id = Some(Self::parse_opt_u32_decimal(v)?),
+                "default_permissions" => default_permissions = Self::parse_opt_bool_switch(v),
+                "allow_other" => allow_other = Self::parse_opt_bool_switch(v),
+                "dax" => dax_mode = Self::parse_dax_mode(value)?,
+                _ => return Err(SystemError::EINVAL),
+            }
+        }
+
+        Ok((
+            rootmode.unwrap_or(0o040755),
+            user_id.unwrap_or(cred.fsuid.data() as u32),
+            group_id.unwrap_or(cred.fsgid.data() as u32),
+            default_permissions,
+            allow_other,
+            dax_mode,
+        ))
+    }
+}
+
+impl Drop for VirtioFsFs {
+    fn drop(&mut self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // A factory result can fail VFS preparation before a construction pin
+        // exists. Its final destructor must not do FUSE I/O or wait while a
+        // caller may still hold a VFS lock. Keep the domain alive until the old
+        // transport has been returned, so a new factory can wait for this session.
+        let inner = self.inner.clone();
+        let instance = self.instance.clone();
+        let session_id = self.session_id;
+        let domain = self.mount_domain.clone();
+        schedule_work(Work::new(move || {
+            let _domain = &domain;
+            inner.on_umount();
+            instance.wait_session_released(session_id);
+        }));
+    }
+}
+
+impl FileSystem for VirtioFsFs {
+    fn shared_mount_superblock_state(&self, _flags: MountFlags) -> Option<Arc<SuperBlockState>> {
+        Some(self.superblock.clone())
+    }
+
+    fn mount_owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        Some(self.superblock.owner_user_ns().clone())
+    }
+
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        self.inner.page_cache_writeback_domain()
+    }
+
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        self.inner.quiesce_page_cache_producers()
+    }
+
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        self.inner.root_inode()
+    }
+
+    fn info(&self) -> FsInfo {
+        self.inner.info()
+    }
+
+    fn support_readahead(&self) -> bool {
+        self.inner.support_readahead()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "virtiofs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        self.inner.super_block()
+    }
+
+    fn statfs(&self, inode: &Arc<dyn IndexNode>) -> Result<SuperBlock, SystemError> {
+        self.inner.statfs(inode)
+    }
+
+    fn permission_policy(&self) -> crate::filesystem::vfs::FsPermissionPolicy {
+        self.inner.permission_policy()
+    }
+
+    fn proc_show_mount_options(
+        &self,
+        _mount: &MountFS,
+        out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        if let Some(option) = self.conn.dax_mode().proc_option() {
+            out.write_str(option).map_err(|_| SystemError::EINVAL)?;
+        }
+        Ok(())
+    }
+
+    unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.dax_fault(pfm).unwrap_or_else(|| self.inner.fault(pfm))
+    }
+
+    fn fault_before_map_pages(&self) -> bool {
+        self.inner.fault_before_map_pages()
+    }
+
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        self.dax_fault(pfm)
+            .unwrap_or_else(|| self.inner.page_mkwrite(pfm))
+    }
+
+    fn mprotect(&self, old_vm_flags: VmFlags, new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        self.inner.mprotect(old_vm_flags, new_vm_flags)
+    }
+
+    fn vma_open(&self, file: &Arc<File>, region: VirtRegion, vm_flags: VmFlags) -> VmaOpenRollback {
+        self.inner.vma_open(file, region, vm_flags)
+    }
+
+    fn vma_close(&self, file: &Arc<File>, region: VirtRegion, vm_flags: VmFlags) {
+        self.inner.vma_close(file, region, vm_flags)
+    }
+
+    unsafe fn map_pages(
+        &self,
+        pfm: &mut PageFaultMessage,
+        start_pgoff: usize,
+        end_pgoff: usize,
+    ) -> VmFaultReason {
+        self.inner.map_pages(pfm, start_pgoff, end_pgoff)
+    }
+
+    fn on_umount(&self) {
+        if !self.shutdown_started.swap(true, Ordering::AcqRel) {
+            self.inner.on_umount();
+            self.instance.wait_session_released(self.session_id);
+        }
+    }
+}
+
+impl MountableFileSystem for VirtioFsFs {
+    fn make_mount_data(
+        raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
+    }
+
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
+        source: &str,
+        context: &FsCreationContext,
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        if source.is_empty() {
+            return Err(SystemError::EINVAL.into());
+        }
+
+        let (rootmode, user_id, group_id, default_permissions, allow_other, dax_mode) =
+            Self::parse_mount_options(raw_data, &context.cred)?;
+        let instance = virtio_fs_find_instance(source).ok_or(SystemError::ENODEV)?;
+        Ok(Some(Arc::new(VirtioFsMountData {
+            rootmode,
+            user_id,
+            group_id,
+            allow_other,
+            default_permissions,
+            dax_mode,
+            instance,
+        })))
+    }
+
+    fn make_fs(
+        data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_in_owner(data, MountFlags::empty(), ProcessManager::current_user_ns())
+    }
+
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::make_fs_in_owner(data, flags, ProcessManager::current_user_ns())
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+        context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        Self::make_fs_in_owner(data, flags, context.cred.user_ns.clone())
+    }
+}
+
+impl VirtioFsFs {
+    fn make_fs_in_owner(
+        data: Option<&dyn FileSystemMakerData>,
+        flags: MountFlags,
+        owner: Arc<UserNamespace>,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        let md = data
+            .and_then(|d| d.as_any().downcast_ref::<VirtioFsMountData>())
+            .ok_or(SystemError::EINVAL)?;
+        let domain = mount_domain(&md.instance);
+        let mut canonical = domain.canonical.lock();
+        loop {
+            if let Some(existing) = canonical.upgrade() {
+                if existing.superblock.shutdown_started() {
+                    let state = existing.superblock.clone();
+                    drop(canonical);
+                    state.wait_for_shutdown_if_started();
+                    canonical = domain.canonical.lock();
+                    if canonical
+                        .upgrade()
+                        .is_some_and(|current| Arc::ptr_eq(&current, &existing))
+                    {
+                        *canonical = Weak::new();
+                    }
+                    continue;
+                }
+                if !Arc::ptr_eq(existing.superblock.owner_user_ns(), &owner) {
+                    return Err(SystemError::EBUSY);
+                }
+                // sget_fc reuses the complete superblock. Later valid mount
+                // options never reconfigure its connection or DAX policy.
+                return Ok(existing);
+            }
+            if let Some(session_id) = md.instance.active_session_id() {
+                // The last factory result may have failed before VFS acquired
+                // a construction pin. Its asynchronous destructor owns cleanup.
+                drop(canonical);
+                md.instance.wait_session_released(session_id);
+                canonical = domain.canonical.lock();
+                continue;
+            }
+            break;
+        }
+
+        let cache_window = md.instance.cache_window();
+        if md.dax_mode == DaxMountMode::Always
+            && cache_window
+                .as_ref()
+                .is_none_or(|window| window.len() < super::dax::DAX_RANGE_SIZE)
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let conn = FuseConn::new_for_virtiofs_with_dax_window(
+            VIRTIOFS_MAX_REQUEST_SIZE,
+            VIRTIOFS_RSP_BUF_SIZE,
+            cache_window,
+            md.dax_mode,
+        )?;
+        if md.dax_mode == DaxMountMode::Always && !conn.dax_enabled() {
+            return Err(SystemError::EINVAL);
+        }
+        let fuse_mount_data = FuseMountData {
+            rootmode: md.rootmode,
+            user_id: md.user_id,
+            group_id: md.group_id,
+            max_read: VIRTIOFS_RSP_BUF_SIZE
+                .saturating_sub(core::mem::size_of::<FuseOutHeader>())
+                .min(u32::MAX as usize) as u32,
+            allow_other: md.allow_other,
+            default_permissions: md.default_permissions,
+            conn: conn.clone(),
+        };
+        let inner = <FuseFS as MountableFileSystem>::make_fs(Some(
+            &fuse_mount_data as &dyn FileSystemMakerData,
+        ))?;
+        let session_id = match start_bridge(md.instance.clone(), conn.clone()) {
+            Ok(id) => id,
+            Err(error) => {
+                inner.on_umount();
+                return Err(error);
+            }
+        };
+        let fs = Arc::new(Self {
+            inner,
+            conn,
+            instance: md.instance.clone(),
+            session_id,
+            superblock: Arc::new(SuperBlockState::new_with_owner(flags, owner)),
+            mount_domain: domain.clone(),
+            shutdown_started: AtomicBool::new(false),
+        });
+        *canonical = Arc::downgrade(&fs);
+        Ok(fs)
+    }
+}
+
+register_mountable_fs!(VirtioFsFs, VIRTIOFSMAKER, "virtiofs");
+
+#[cfg(test)]
+mod tests {
+    use system_error::SystemError;
+
+    use super::{DaxMountMode, VirtioFsFs};
+
+    #[test]
+    fn dax_option_parser_matches_linux_modes() {
+        assert_eq!(VirtioFsFs::parse_dax_mode(None), Ok(DaxMountMode::Always));
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("always")),
+            Ok(DaxMountMode::Always)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("never")),
+            Ok(DaxMountMode::Never)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("inode")),
+            Ok(DaxMountMode::Inode)
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("")),
+            Err(SystemError::EINVAL.into())
+        );
+        assert_eq!(
+            VirtioFsFs::parse_dax_mode(Some("on")),
+            Err(SystemError::EINVAL.into())
+        );
+    }
+
+    #[test]
+    fn proc_option_distinguishes_default_and_explicit_inode_modes() {
+        assert_eq!(DaxMountMode::InodeDefault.proc_option(), None);
+        assert_eq!(DaxMountMode::Always.proc_option(), Some("dax=always"));
+        assert_eq!(DaxMountMode::Never.proc_option(), Some("dax=never"));
+        assert_eq!(DaxMountMode::Inode.proc_option(), Some("dax=inode"));
+    }
+}

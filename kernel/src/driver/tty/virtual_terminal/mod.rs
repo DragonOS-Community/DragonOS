@@ -10,14 +10,8 @@ use system_error::SystemError;
 use unified_init::macros::unified_init;
 
 use crate::{
-    driver::{
-        base::device::{
-            device_number::{DeviceNumber, Major},
-            device_register, IdTable,
-        },
-        serial::serial8250::send_to_default_serial8250_port,
-    },
-    filesystem::devfs::{devfs_register, devfs_unregister},
+    driver::base::device::device_number::{DeviceNumber, Major},
+    filesystem::devfs::{devfs_add_symlink, devfs_remove_symlink_if_same, LockedDevFSInode},
     init::initcall::INITCALL_LATE,
     libs::{lazy_init::Lazy, rwlock::RwLock, spinlock::SpinLock},
 };
@@ -28,7 +22,6 @@ use super::{
     console::ConsoleSwitch,
     termios::{InputMode, TTY_STD_TERMIOS},
     tty_core::{TtyCore, TtyCoreData},
-    tty_device::{TtyDevice, TtyType},
     tty_driver::{TtyDriver, TtyDriverManager, TtyDriverType, TtyOperation},
     tty_port::{DefaultTtyPort, TtyPort},
 };
@@ -74,7 +67,8 @@ pub struct VirtConsole {
 }
 
 struct InnerVirtConsole {
-    vcdev: Option<Arc<TtyDevice>>,
+    vc_alias: Option<(String, Arc<LockedDevFSInode>)>,
+    devfs_removing: bool,
 }
 
 impl VirtConsole {
@@ -83,7 +77,10 @@ impl VirtConsole {
             vc_data,
             port: Arc::new(DefaultTtyPort::new()),
             index: Lazy::new(),
-            inner: SpinLock::new(InnerVirtConsole { vcdev: None }),
+            inner: SpinLock::new(InnerVirtConsole {
+                vc_alias: None,
+                devfs_removing: false,
+            }),
         })
     }
 
@@ -106,33 +103,34 @@ impl VirtConsole {
             .internal_tty()
             .ok_or(SystemError::ENODEV)?;
         let tty_core_data = tty_core.core();
-        let devnum = *tty_core_data.device_number();
-        let vcname = format!("vc{}", self.index.get());
-
-        // 注册虚拟终端设备并将虚拟终端设备加入到文件系统
-        let vcdev = TtyDevice::new(
-            vcname.clone(),
-            IdTable::new(vcname, Some(devnum)),
-            TtyType::Tty,
-        );
-
-        device_register(vcdev.clone())?;
-        devfs_register(vcdev.name_ref(), vcdev.clone())?;
+        let vcname = format!("vc{}", tty_core_data.index());
+        let alias = devfs_add_symlink(&vcname, tty_core_data.name())?;
         tty_core_data.set_vc_index(*self.index.get());
-        self.inner.lock().vcdev = Some(vcdev);
+        self.inner.lock().vc_alias = Some((vcname, alias));
 
         Ok(())
     }
 
-    fn devfs_remove(&self) {
-        let vcdev = self.inner.lock().vcdev.take();
-        if let Some(vcdev) = vcdev {
-            devfs_unregister(vcdev.name_ref(), vcdev.clone())
-                .inspect_err(|e| {
-                    log::error!("virt console: devfs_unregister failed: {:?}", e);
-                })
-                .ok();
+    fn devfs_remove(&self) -> Result<bool, SystemError> {
+        let vc_alias = {
+            let mut inner = self.inner.lock();
+            if inner.devfs_removing {
+                return Ok(false);
+            }
+            let Some(vc_alias) = inner.vc_alias.take() else {
+                return Ok(true);
+            };
+            inner.devfs_removing = true;
+            vc_alias
+        };
+        let result = devfs_remove_symlink_if_same(&vc_alias.0, &vc_alias.1);
+        let mut inner = self.inner.lock();
+        inner.devfs_removing = false;
+        if let Err(e) = result {
+            inner.vc_alias = Some(vc_alias);
+            return Err(e);
         }
+        Ok(true)
     }
 }
 
@@ -160,16 +158,16 @@ impl VirtConsoleManager {
     }
 
     pub fn get(&self, index: usize) -> Option<Arc<VirtConsole>> {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         inner.consoles.get(&index).cloned()
     }
 
     pub fn alloc(&self, vc: Arc<VirtConsole>) -> Option<usize> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         let index = inner.ida.alloc()?;
         vc.index.init(index);
         if let Some(vc_data) = vc.vc_data.as_ref() {
-            vc_data.lock().vc_index = index;
+            vc_data.lock_irqsave().vc_index = index;
         }
 
         inner.consoles.insert(index, vc);
@@ -178,20 +176,46 @@ impl VirtConsoleManager {
 
     /// 释放虚拟终端
     pub fn free(&self, index: usize) {
-        let mut inner = self.inner.lock();
-        if let Some(vc) = inner.consoles.remove(&index) {
-            vc.devfs_remove();
+        let vc = {
+            let inner = self.inner.lock_irqsave();
+            inner.consoles.get(&index).cloned()
+        };
+        if let Some(vc) = vc {
+            let remove_done = match vc.devfs_remove() {
+                Ok(remove_done) => remove_done,
+                Err(e) => {
+                    log::error!("virt console: devfs_unregister failed: {:?}", e);
+                    return;
+                }
+            };
+            if !remove_done {
+                return;
+            }
+            let mut inner = self.inner.lock_irqsave();
+            if inner
+                .consoles
+                .get(&index)
+                .is_some_and(|stored| Arc::ptr_eq(stored, &vc))
+            {
+                inner.consoles.remove(&index);
+                inner.ida.free(index);
+            }
         }
-        inner.ida.free(index);
     }
 
     /// 获取当前虚拟终端
     pub fn current_vc(&self) -> Option<Arc<VirtConsole>> {
-        self.current_vc.read().as_ref().map(|(vc, _)| vc.clone())
+        self.current_vc
+            .read_irqsave()
+            .as_ref()
+            .map(|(vc, _)| vc.clone())
     }
 
     pub fn current_vc_index(&self) -> Option<usize> {
-        self.current_vc.read().as_ref().map(|(_, index)| *index)
+        self.current_vc
+            .read_irqsave()
+            .as_ref()
+            .map(|(_, index)| *index)
     }
 
     pub fn current_vc_tty_name(&self) -> Option<String> {
@@ -203,7 +227,7 @@ impl VirtConsoleManager {
     /// 设置当前虚拟终端
     pub fn set_current_vc(&self, vc: Arc<VirtConsole>) {
         let index = *vc.index.get();
-        *self.current_vc.write() = Some((vc, index));
+        *self.current_vc.write_irqsave() = Some((vc, index));
     }
 
     /// 通过tty名称查找虚拟终端
@@ -212,7 +236,7 @@ impl VirtConsoleManager {
     ///
     /// * `name` - tty名称 (如ttyS0)
     pub fn lookup_vc_by_tty_name(&self, name: &str) -> Option<Arc<VirtConsole>> {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         for (_index, vc) in inner.consoles.iter() {
             let found = vc
                 .port
@@ -295,7 +319,7 @@ impl Color {
 }
 
 pub struct TtyConsoleDriverInner {
-    console: Arc<dyn ConsoleSwitch>,
+    console: SpinLock<Option<Arc<dyn ConsoleSwitch>>>,
 }
 
 impl core::fmt::Debug for TtyConsoleDriverInner {
@@ -305,27 +329,54 @@ impl core::fmt::Debug for TtyConsoleDriverInner {
 }
 
 impl TtyConsoleDriverInner {
-    pub fn new() -> Result<Self, SystemError> {
-        let console = {
+    pub fn new() -> Self {
+        Self {
+            console: SpinLock::new(None),
+        }
+    }
+
+    fn select_console(&self) -> Result<Arc<dyn ConsoleSwitch>, SystemError> {
+        if let Some(console) = self.console.lock().as_ref().cloned() {
+            return Ok(console);
+        }
+
+        let candidate: Arc<dyn ConsoleSwitch> = {
             #[cfg(not(target_arch = "riscv64"))]
             {
-                Arc::new(crate::driver::video::fbdev::base::fbcon::framebuffer_console::BlittingFbConsole::new()?)
+                use crate::driver::video::fbdev::base::{
+                    fbcon::framebuffer_console::BlittingFbConsole, fbmem::frame_buffer_manager,
+                    FbId,
+                };
+
+                match frame_buffer_manager().find_fb_by_id(FbId::new(0))? {
+                    Some(fb) => Arc::new(BlittingFbConsole::new(fb)),
+                    None => crate::driver::video::console::dummycon::dummy_console(),
+                }
             }
 
             #[cfg(target_arch = "riscv64")]
             crate::driver::video::console::dummycon::dummy_console()
         };
 
-        Ok(Self { console })
+        let mut console = self.console.lock();
+        if console.is_none() {
+            *console = Some(candidate);
+        }
+        Ok(console.as_ref().unwrap().clone())
     }
 
-    fn do_install(&self, tty: Arc<TtyCore>, vc: &Arc<VirtConsole>) -> Result<(), SystemError> {
+    fn do_install(
+        &self,
+        tty: Arc<TtyCore>,
+        vc: &Arc<VirtConsole>,
+        console: &Arc<dyn ConsoleSwitch>,
+    ) -> Result<(), SystemError> {
         let tty_core = tty.core();
 
         let binding = vc.vc_data().unwrap();
         let mut vc_data = binding.lock();
 
-        self.console.con_init(vc, &mut vc_data, true)?;
+        console.con_init(vc, &mut vc_data, true)?;
         if vc_data.complement_mask == 0 {
             vc_data.complement_mask = if vc_data.color_mode { 0x7700 } else { 0x0800 };
         }
@@ -333,10 +384,6 @@ impl TtyConsoleDriverInner {
         // vc_data.bytes_per_row = vc_data.cols << 1;
         vc_data.index = tty_core.index();
         vc_data.bottom = vc_data.rows;
-        vc_data.set_driver_funcs(Arc::downgrade(
-            &(self.console.clone() as Arc<dyn ConsoleSwitch>),
-        ));
-
         // todo: unicode字符集处理？
 
         if vc_data.cols > VC_MAXCOL || vc_data.rows > VC_MAXROW {
@@ -371,11 +418,12 @@ impl TtyConsoleDriverInner {
 
 impl TtyOperation for TtyConsoleDriverInner {
     fn install(&self, _driver: Arc<TtyDriver>, tty: Arc<TtyCore>) -> Result<(), SystemError> {
-        let vc = VirtConsole::new(Some(Arc::new(SpinLock::new(VirtualConsoleData::new(
-            usize::MAX,
-        )))));
+        let console = self.select_console()?;
+        let vc_data = Arc::new(SpinLock::new(VirtualConsoleData::new(usize::MAX)));
+        vc_data.lock().set_driver_funcs(Arc::downgrade(&console));
+        let vc = VirtConsole::new(Some(vc_data));
         vc_manager().alloc(vc.clone()).ok_or(SystemError::EBUSY)?;
-        self.do_install(tty, &vc)
+        self.do_install(tty, &vc, &console)
             .inspect_err(|_| vc_manager().free(vc.index().unwrap()))?;
 
         Ok(())
@@ -385,17 +433,22 @@ impl TtyOperation for TtyConsoleDriverInner {
         Ok(())
     }
 
-    fn write_room(&self, _tty: &TtyCoreData) -> usize {
+    fn write_room(&self, tty: &TtyCoreData) -> usize {
+        if tty.flow_irqsave().stopped {
+            return 0;
+        }
         32768
     }
 
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/tty/vt/vt.c#2894
     #[inline(never)]
     fn write(&self, tty: &TtyCoreData, buf: &[u8], nr: usize) -> Result<usize, SystemError> {
+        if tty.flow_irqsave().stopped {
+            return Ok(0);
+        }
         // if String::from_utf8_lossy(buf) == "Hello world!\n" {
         //     loop {}
         // }
-        send_to_default_serial8250_port(buf);
         let ret = tty.do_write(buf, nr);
         self.flush_chars(tty);
         ret
@@ -464,24 +517,22 @@ pub struct DrawRegion {
 // 初始化虚拟终端
 #[inline(never)]
 pub fn vty_init() -> Result<(), SystemError> {
-    if let Ok(tty_console_driver_inner) = TtyConsoleDriverInner::new() {
-        const NAME: &str = "tty";
-        let console_driver = TtyDriver::new(
-            MAX_NR_CONSOLES,
-            NAME,
-            0,
-            Major::TTY_MAJOR,
-            0,
-            TtyDriverType::Console,
-            *TTY_STD_TERMIOS,
-            Arc::new(tty_console_driver_inner),
-            None,
-        );
+    const NAME: &str = "tty";
+    let console_driver = TtyDriver::new(
+        MAX_NR_CONSOLES,
+        NAME,
+        0,
+        Major::TTY_MAJOR,
+        0,
+        TtyDriverType::Console,
+        *TTY_STD_TERMIOS,
+        Arc::new(TtyConsoleDriverInner::new()),
+        None,
+    );
 
-        TtyDriverManager::tty_register_driver(console_driver).inspect_err(|e| {
-            log::error!("tty console: register driver {} failed: {:?}", NAME, e);
-        })?;
-    }
+    TtyDriverManager::tty_register_driver(console_driver).inspect_err(|e| {
+        log::error!("tty console: register driver {} failed: {:?}", NAME, e);
+    })?;
 
     Ok(())
 }
@@ -491,8 +542,8 @@ fn vty_late_init() -> Result<(), SystemError> {
     let (_, console_driver) =
         TtyDriverManager::lookup_tty_driver(DeviceNumber::new(Major::TTY_MAJOR, 0))
             .ok_or(SystemError::ENODEV)?;
-    console_driver.init_tty_device(None).ok();
+    let tty_result = console_driver.init_tty_device(None).map(|_| ());
 
     vc_manager().setup_default_vc();
-    Ok(())
+    tty_result
 }

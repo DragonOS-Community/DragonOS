@@ -23,6 +23,9 @@ use super::TrapFrame;
 pub const IPI_NUM_KICK_CPU: IrqNumber = IrqNumber::new(200);
 pub const IPI_NUM_FLUSH_TLB: IrqNumber = IrqNumber::new(201);
 pub const IPI_NUM_STOP_CPU: IrqNumber = IrqNumber::new(202);
+pub const IPI_NUM_LOADED_VMCS_CLEAR: IrqNumber = IrqNumber::new(203);
+pub const IPI_NUM_TEXT_PATCH: IrqNumber = IrqNumber::new(204);
+pub const IPI_NUM_CLOCKEVENT: IrqNumber = IrqNumber::new(205);
 /// IPI的种类(架构相关，指定了向量号)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
@@ -273,6 +276,9 @@ pub fn arch_ipi_handler_init() {
     do_init_irq_handler(IPI_NUM_KICK_CPU);
     do_init_irq_handler(IPI_NUM_FLUSH_TLB);
     do_init_irq_handler(IPI_NUM_STOP_CPU);
+    do_init_irq_handler(IPI_NUM_LOADED_VMCS_CLEAR);
+    do_init_irq_handler(IPI_NUM_TEXT_PATCH);
+    do_init_irq_handler(IPI_NUM_CLOCKEVENT);
 }
 
 fn do_init_irq_handler(irq: IrqNumber) {
@@ -303,6 +309,17 @@ impl IrqFlowHandler for X86_64IpiIrqFlowHandler {
             IPI_NUM_STOP_CPU => {
                 CurrentApic.send_eoi();
                 stop_this_cpu();
+            }
+            IPI_NUM_LOADED_VMCS_CLEAR => {
+                crate::arch::vm::vmx::VmxKvmFunc::handle_remote_loaded_vmcs_clear();
+                CurrentApic.send_eoi();
+            }
+            IPI_NUM_TEXT_PATCH => {
+                crate::arch::text_patch::ipi_handler();
+            }
+            IPI_NUM_CLOCKEVENT => {
+                crate::time::deadline::reprogram_local();
+                CurrentApic.send_eoi();
             }
             _ => {
                 error!("Unknown IPI: {}", irq.data());

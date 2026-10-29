@@ -1,35 +1,84 @@
+use crate::net::socket::PMSG;
 use crate::{
     filesystem::epoll::EPollEventType,
     net::socket::netlink::{
         addr::{multicast::GroupIdSet, NetlinkSocketAddr},
         receiver::MessageQueue,
-        table::BoundHandle,
+        table::{BoundHandle, SupportedNetlinkProtocol},
     },
-    process::namespace::net_namespace::NetNamespace,
+    process::{cred::Cred, namespace::net_namespace::NetNamespace},
 };
-use alloc::fmt::Debug;
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 #[derive(Debug)]
-pub struct BoundNetlink<Message: 'static + Debug> {
-    pub(in crate::net::socket::netlink) handle: BoundHandle<Message>,
+pub struct BoundNetlink<P: SupportedNetlinkProtocol> {
+    pub(in crate::net::socket::netlink) handle: BoundHandle<P::Message>,
     pub(in crate::net::socket::netlink) remote_addr: NetlinkSocketAddr,
-    pub(in crate::net::socket::netlink) receive_queue: MessageQueue<Message>,
+    pub(in crate::net::socket::netlink) receive_queue: MessageQueue<P::Message>,
+    pub(in crate::net::socket::netlink) protocol_state: P::SocketState,
     pub(in crate::net::socket::netlink) netns: Arc<NetNamespace>,
+    pub(in crate::net::socket::netlink) opener_cred: Arc<Cred>,
 }
 
-impl<Message: 'static + Debug> BoundNetlink<Message> {
+impl<P: SupportedNetlinkProtocol> BoundNetlink<P> {
+    /// Take (or pin for PEEK) the actual datagram before inspecting userspace
+    /// capacity. No allocation is derived from an untrusted receive length.
+    pub fn try_recv_packet(&self, flags: PMSG) -> Result<P::Message, SystemError> {
+        if flags.contains(PMSG::OOB) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if let Some(error) = self.receive_queue.take_error() {
+            self.receive_queue.recover_if_empty();
+            return Err(error);
+        }
+        if self.receive_queue.is_empty() {
+            self.receive_queue.recover_if_empty();
+            P::drive_receive(self);
+            if let Some(error) = self.receive_queue.take_error() {
+                self.receive_queue.recover_if_empty();
+                return Err(error);
+            }
+        }
+        let mut queue = self.receive_queue.0.lock();
+        let message = queue
+            .front()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+            .clone();
+        if !flags.contains(PMSG::PEEK) {
+            self.receive_queue.pop_front_locked(&mut queue);
+            drop(queue);
+            self.receive_queue.recover_if_empty();
+            P::drive_receive(self);
+        }
+        Ok(message)
+    }
+
+    pub fn try_recv_common(
+        &self,
+        writer: &mut [u8],
+        flags: PMSG,
+    ) -> Result<(usize, usize, NetlinkSocketAddr), SystemError> {
+        let message = self.try_recv_packet(flags)?;
+        let bytes = P::message_bytes(&message);
+        let copied = writer.len().min(bytes.len());
+        writer[..copied].copy_from_slice(&bytes[..copied]);
+        Ok((copied, bytes.len(), P::message_source(&message)))
+    }
+
     pub(super) fn new(
-        handle: BoundHandle<Message>,
-        message_queue: MessageQueue<Message>,
+        handle: BoundHandle<P::Message>,
+        message_queue: MessageQueue<P::Message>,
         netns: Arc<NetNamespace>,
+        opener_cred: Arc<Cred>,
     ) -> Self {
         Self {
             handle,
             remote_addr: NetlinkSocketAddr::new_unspecified(),
             receive_queue: message_queue,
+            protocol_state: P::SocketState::default(),
             netns,
+            opener_cred,
         }
     }
 
@@ -45,6 +94,9 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
 
     pub fn check_io_events_common(&self) -> EPollEventType {
         let mut events = EPollEventType::EPOLLOUT;
+        if self.receive_queue.has_error() {
+            events |= EPollEventType::EPOLLERR;
+        }
 
         let receive_queue = self.receive_queue.0.lock();
         if !receive_queue.is_empty() {
@@ -64,5 +116,9 @@ impl<Message: 'static + Debug> BoundNetlink<Message> {
 
     pub fn netns(&self) -> Arc<NetNamespace> {
         self.netns.clone()
+    }
+
+    pub fn opener_cred(&self) -> Arc<Cred> {
+        self.opener_cred.clone()
     }
 }

@@ -1,14 +1,15 @@
+use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_SPLICE;
+use crate::filesystem::fsnotify::FsEvent;
 use crate::filesystem::vfs::file::FileMode;
 use crate::filesystem::vfs::FileFlags;
 use crate::filesystem::vfs::{file::File, syscall::SpliceFlags, FileType};
 use crate::ipc::kill::send_signal_to_pid;
-use crate::ipc::pipe::{LockedPipeInode, PIPE_BUF};
+use crate::ipc::pipe::PipeRuntime;
 use crate::process::resource::RLimitID;
 use crate::process::ProcessManager;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
-use crate::{arch::ipc::signal::Signal, libs::casting::DowncastArc};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -197,19 +198,34 @@ fn do_splice(
     in_is_pipe: bool,
     out_is_pipe: bool,
 ) -> Result<usize, SystemError> {
-    match (in_is_pipe, out_is_pipe) {
+    let transferred = match (in_is_pipe, out_is_pipe) {
         (true, true) => splice_pipe_to_pipe(file_in, file_out, len, flags),
         (false, true) => splice_file_to_pipe(file_in, off_in, file_out, len, flags),
         (true, false) => splice_pipe_to_file(file_in, file_out, off_out, len, flags),
         (false, false) => unreachable!(),
+    }?;
+
+    if transferred > 0 {
+        match (in_is_pipe, out_is_pipe) {
+            (_, true) => {
+                // The regular-file input path deliberately deferred ACCESS so
+                // both pipe-output cases retain Linux's event order.
+                file_out.notify_io_event(FsEvent::MODIFY);
+                file_in.notify_io_event(FsEvent::ACCESS);
+            }
+            (true, false) => {
+                // The held-pipe path publishes only after successful completion;
+                // do not duplicate those notifications.
+            }
+            (false, false) => unreachable!(),
+        }
     }
+
+    Ok(transferred)
 }
 
-fn get_pipe_inode(file: &File) -> Result<Arc<LockedPipeInode>, SystemError> {
-    let inode = file.inode();
-    inode
-        .downcast_arc::<LockedPipeInode>()
-        .ok_or(SystemError::EBADF)
+fn get_pipe_inode(file: &File) -> Result<Arc<PipeRuntime>, SystemError> {
+    file.pipe_runtime()
 }
 
 /// Linux 语义（fs/splice.c: ipipe_prep）：
@@ -221,18 +237,16 @@ fn nonblock_prep_pipe_read(pipe_in: &File, flags: SpliceFlags) -> Result<(), Sys
     }
 
     let pipe_inode = get_pipe_inode(pipe_in)?;
-    if pipe_inode.readable_len() == 0 && pipe_inode.has_writers() {
-        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-    }
-    // no writers => EOF; allow read path to return 0
+    pipe_inode.wait_readable(true)?;
+    // EOF remains a successful preparation for the authoritative transfer.
 
     Ok(())
 }
 
 /// pipe 到 pipe 的数据传输
 ///
-/// 关键行为：splice 只传输一个缓冲区单位的数据后就返回，
-/// 不会循环传输直到达到 len。这是 Linux splice 的语义。
+/// Transfer immediately available logical buffers up to the requested count.
+/// Once progress is made, an empty input or full output returns that prefix.
 fn splice_pipe_to_pipe(
     pipe_in: &File,
     pipe_out: &File,
@@ -252,71 +266,110 @@ fn splice_file_to_pipe(
     len: usize,
     flags: SpliceFlags,
 ) -> Result<usize, SystemError> {
-    let pipe_inode = get_pipe_inode(pipe)?;
+    if offset.is_some()
+        && (file.mode().contains(FileMode::FMODE_STREAM)
+            || !file.mode().contains(FileMode::FMODE_PREAD))
+    {
+        return Err(SystemError::ESPIPE);
+    }
+    let mut position = offset.unwrap_or(0);
+    splice_read_to_pipe(file, &mut position, offset.is_none(), pipe, len, flags)
+}
 
-    let limit = len.min(4096);
-    let trusted_read_limit = splice_trusted_file_read_limit(file, offset, limit);
-    if trusted_read_limit == Some(0) {
+/// Reserve pipe capacity before locking the implicit input position. Commit
+/// that position before releasing the reservation; callers own notifications.
+pub(super) fn splice_read_to_pipe(
+    file: &File,
+    position: &mut usize,
+    implicit_position: bool,
+    pipe: &File,
+    len: usize,
+    flags: SpliceFlags,
+) -> Result<usize, SystemError> {
+    File::recover_io(|| {
+        try_splice_read_to_pipe(file, position, implicit_position, pipe, len, flags)
+    })
+}
+
+fn try_splice_read_to_pipe(
+    file: &File,
+    position: &mut usize,
+    implicit_position: bool,
+    pipe: &File,
+    len: usize,
+    flags: SpliceFlags,
+) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+    let pipe_inode = get_pipe_inode(pipe)?;
+    let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+
+    // A free logical slot admits an entire source page. Wait before taking
+    // f_pos so a consumer can splice the full pipe back into this same OFD.
+    let mut transaction = pipe_inode.begin_writer_transaction();
+    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
+        pipe_inode.writable_for_splice_nonblock(&transaction, None)?
+    } else {
+        pipe_inode.wait_writable_any_for_splice(&mut transaction)?
+    };
+    let _position_guard = if implicit_position {
+        file.lock_position()
+    } else {
+        None
+    };
+    if implicit_position {
+        *position = file.pos();
+    }
+    if len > isize::MAX as usize
+        || position
+            .checked_add(len)
+            .filter(|end| *end <= isize::MAX as usize)
+            .is_none()
+    {
+        return Err(SystemError::EINVAL.into());
+    }
+    let page_size = <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE;
+    let source_offset = if file.inode().page_cache().is_some() {
+        *position & (page_size - 1)
+    } else {
+        0
+    };
+    let limit = len.min(MAX_RW_COUNT).min(page_size - source_offset);
+    let buf_size = splice_trusted_file_read_limit(file, Some(*position), limit)
+        .unwrap_or(limit)
+        .min(space);
+    // Even zero-count/EOF requests perform pipe readiness checks above.
+    if buf_size == 0 {
         return Ok(0);
     }
-    let wanted = trusted_read_limit.unwrap_or(limit);
-
-    let space = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        let space = pipe_inode.writable_len();
-        if space == 0 && pipe_inode.has_readers() {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        if trusted_read_limit.is_some()
-            && wanted <= PIPE_BUF
-            && space < wanted
-            && pipe_inode.has_readers()
-        {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-        space
-    } else if trusted_read_limit.is_some() {
-        pipe_inode.wait_writable_for_splice(wanted)?
-    } else {
-        pipe_inode.wait_writable_any_for_splice()?
-    };
-
-    let buf_size = if trusted_read_limit.is_some() && space == 0 {
-        wanted
-    } else {
-        wanted.min(space)
-    };
-    let mut buffer = vec![0u8; buf_size];
+    // A pipe has no splice_read operation. Zero count above needs no reader.
+    if file.file_type() == FileType::Pipe {
+        return Err(SystemError::EINVAL.into());
+    }
+    // All output inventory and the scratch are born before consuming input.
+    pipe_inode.prepare_output_storage(&transaction, &actor)?;
+    let mut buffer = crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)?;
 
     // 从文件读取
     // 为了满足 Linux 语义：若后续写入 pipe 被信号中断且未写入任何字节，
     // 则不应推进输入文件的 file position。
-    let (read_len, advance_file_pos) = if let Some(off) = offset {
-        (file.pread(off, buf_size, &mut buffer)?, false)
-    } else {
-        (file.read_noadv(buf_size, &mut buffer)?, true)
-    };
+    let read_len = file.try_read_at_for_transfer(*position, buf_size, &mut buffer)?;
 
     if read_len == 0 {
         return Ok(0);
     }
 
-    buffer.truncate(read_len);
-
     // 写入 pipe
-    let written = if flags.contains(SpliceFlags::SPLICE_F_NONBLOCK) {
-        pipe_inode.write_from_splice_nonblock(&buffer)
-    } else {
-        pipe.write(buffer.len(), &buffer)
-    };
+    let written =
+        pipe_inode.write_from_splice_locked(&mut transaction, &buffer[..read_len], source_offset);
 
     match written {
         Ok(write_len) => {
-            if advance_file_pos {
-                file.advance_pos(write_len);
+            *position += write_len;
+            if implicit_position {
+                file.commit_position(*position);
             }
             Ok(write_len)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -341,7 +394,7 @@ fn splice_trusted_file_read_limit(
 }
 
 fn splice_regular_file_has_trusted_size(file: &File) -> bool {
-    matches!(file.inode().fs().name(), "ext4" | "fat" | "tmpfs" | "ramfs")
+    file.with_io_fs(|fs| matches!(fs.name(), "ext4" | "fat" | "tmpfs" | "ramfs"))
 }
 
 /// pipe 到 file 的数据传输
@@ -358,54 +411,72 @@ fn splice_pipe_to_file(
     // Fast-path Linux ipipe_prep(): NONBLOCK + empty (with writers) => EAGAIN.
     nonblock_prep_pipe_read(pipe, flags)?;
 
-    // RLIMIT_FSIZE (gVisor: FromPipeMaxFileSize) 语义：
-    // 如果目标 regular file 的写入偏移已经到达/超过限制，则 splice 必须立刻失败 EFBIG，
-    // 并且不能消耗 input pipe 中的数据。
-    // 这里在“读取 pipe 之前”做预检查，避免先读后写失败导致 pipe 数据丢失。
-    let mut allowed_len = len;
-    if matches!(file.file_type(), FileType::File) {
+    // Preserve early EFBIG without consuming pipe data. The authoritative
+    // check below uses the current position after the pipe becomes readable.
+    splice_write_limit(file, offset.unwrap_or_else(|| file.pos()), len)?;
+    let buf_size = len.min(4096);
+    let mut buffer = File::recover_io(|| {
+        let actor = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+        crate::ipc::pipe::buffer::PipeBuffer::try_new_bytes(buf_size, &actor)
+    })?;
+    let written = File::recover_io(|| {
+        let Some((read, hold)) =
+            pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?
+        else {
+            return Ok(0);
+        };
+        let _position_guard = if offset.is_none() {
+            file.lock_position()
+        } else {
+            None
+        };
         let write_offset = offset.unwrap_or_else(|| file.pos());
-        let current_pcb = ProcessManager::current_pcb();
-        let fsize_limit = current_pcb.get_rlimit(RLimitID::Fsize);
-        if fsize_limit.rlim_cur != u64::MAX {
-            let limit = fsize_limit.rlim_cur as usize;
-            if write_offset >= limit {
-                if let Err(e) = send_signal_to_pid(current_pcb.raw_pid(), Signal::SIGXFSZ) {
-                    log::error!("Failed to send SIGXFSZ for RLIMIT_FSIZE violation: {:?}", e);
-                }
-                return Err(SystemError::EFBIG);
+        // Retain the same pipe head and position until synchronous completion.
+        // Unpublished primary failures release the hold before recovery.
+        let attempt = (|| {
+            let allowed = splice_write_limit(file, write_offset, read)?;
+            file.try_write_for_transfer(write_offset, allowed, &buffer[..allowed], offset.is_none())
+        })();
+        match attempt {
+            Ok(result) => {
+                // Reclaim must not depend on the reserved pipe head. A sync
+                // allocation failure is terminal here; never replay its data
+                // or release and reacquire a potentially different head.
+                let completed = file.finish_write_no_recovery(result);
+                hold.finish(completed.as_ref().copied().unwrap_or(0));
+                completed.map_err(Into::into)
             }
-            allowed_len = allowed_len.min(limit.saturating_sub(write_offset));
+            Err(error) => Err(error),
         }
+    })?;
+    if written > 0 {
+        file.notify_io_event(FsEvent::MODIFY);
+        pipe.notify_io_event(FsEvent::ACCESS);
     }
+    Ok(written)
+}
 
-    if allowed_len == 0 {
-        return Ok(0);
+/// Apply the regular-file size limit to a snapshotted output position.
+fn splice_write_limit(file: &File, position: usize, len: usize) -> Result<usize, SystemError> {
+    if file.file_type() != FileType::File {
+        return Ok(len);
     }
-
-    let buf_size = allowed_len.min(4096);
-    let mut buffer = vec![0u8; buf_size];
-
-    let read = pipe_inode.splice_peek_hold_from_blocking(buf_size, &mut buffer, nonblock)?;
-    if read == 0 {
-        return Ok(0);
+    let current = ProcessManager::current_pcb();
+    let limit = current.get_rlimit(RLimitID::Fsize).rlim_cur;
+    if limit == u64::MAX {
+        return Ok(len);
     }
-
-    let written = match (offset, file.file_type()) {
-        (Some(off), _) => file.pwrite(off, read, &buffer[..read]),
-        (None, _) => file.write(read, &buffer[..read]),
-    };
-
-    match written {
-        Ok(written) => {
-            pipe_inode.splice_finish_hold(written);
-            Ok(written)
+    let limit = limit as usize;
+    if position >= limit {
+        if let Err(error) = send_signal_to_pid(current.raw_pid(), Signal::SIGXFSZ) {
+            log::error!(
+                "Failed to send SIGXFSZ for RLIMIT_FSIZE violation: {:?}",
+                error
+            );
         }
-        Err(e) => {
-            pipe_inode.splice_finish_hold(0);
-            Err(e)
-        }
+        return Err(SystemError::EFBIG);
     }
+    Ok(len.min(limit - position))
 }
 
 syscall_table_macros::declare_syscall!(SYS_SPLICE, SysSpliceHandle);

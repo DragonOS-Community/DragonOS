@@ -23,7 +23,9 @@ impl Syscall for SysTimerGetoverrunHandle {
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let timerid = Self::timerid(args);
         let pcb = ProcessManager::current_pcb();
-        let v = pcb.posix_timers_irqsave().getoverrun(timerid)?;
+        let group = pcb.process_signal();
+        let timer = group.posix_timers().lock_irqsave().get_timer(timerid)?;
+        let v = timer.getoverrun()?;
         Ok(v as isize as usize)
     }
 

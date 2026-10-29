@@ -21,10 +21,7 @@ use crate::{
     libs::spinlock::SpinLock,
     mm::percpu::PerCpu,
     smp::core::smp_get_processor_id,
-    time::{
-        clocksource::HZ, tick_common::tick_handle_periodic, timer::try_raise_timer_softirq,
-        TimeArch,
-    },
+    time::{clocksource::HZ, timer::try_raise_timer_softirq, TimeArch},
 };
 
 pub struct RiscVSbiTimer;
@@ -44,9 +41,8 @@ impl RiscVSbiTimer {
         //     smp_get_processor_id().data(),
         //     CurrentTimeArch::get_cycles() as u64
         // );
-        tick_handle_periodic(trap_frame);
+        crate::time::deadline::handle_irq(trap_frame);
         compiler_fence(Ordering::SeqCst);
-        sbi_rt::set_timer(CurrentTimeArch::get_cycles() as u64 + unsafe { INTERVAL_CNT } as u64);
         Ok(())
     }
 
@@ -101,6 +97,15 @@ pub fn riscv_sbi_timer_init_local() {
     guard
         .set(smp_get_processor_id().data() as usize, true)
         .unwrap();
+    drop(guard);
+    crate::time::deadline::init_local();
+}
+
+pub(crate) fn program_deadline_delta(delta_ns: u64) {
+    let cycles = (delta_ns as u128 * riscv_time_base_freq() as u128)
+        .div_ceil(1_000_000_000)
+        .clamp(1, u64::MAX as u128) as u64;
+    sbi_rt::set_timer((CurrentTimeArch::get_cycles() as u64).saturating_add(cycles));
 }
 
 #[inline(never)]

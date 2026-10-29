@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>overlayfs &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../" id="documentation_options" src="../../../_static/documentation_options.js"></script>
+        <script src="../../../_static/jquery.js"></script>
+        <script src="../../../_static/underscore.js"></script>
+        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../_static/doctools.js"></script>
+        <script src="../../../_static/translations.js"></script>
+    <script src="../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../search.html" />
+    <link rel="next" title="内核调试模块" href="../../debug/index.html" />
+    <link rel="prev" title="联合文件系统" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../index.html">文件系统</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../overview.html">概述</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../vfs/index.html">VFS虚拟文件系统</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sysfs.html">SysFS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../kernfs.html">KernFS</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">联合文件系统</a><ul class="current">
+<li class="toctree-l3 current"><a class="current reference internal" href="#">overlayfs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">架构设计</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">工作原理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#copy-up">Copy-up</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">实现逻辑</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">文件系统</a></li>
+          <li class="breadcrumb-item"><a href="index.html">联合文件系统</a></li>
+      <li class="breadcrumb-item active">overlayfs</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/filesystem/unionfs/overlayfs.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="overlayfs">
+<h1>overlayfs<a class="headerlink" href="#overlayfs" title="Permalink to this heading"></a></h1>
+<p>OverlayFs是目前使用最多的联合文件系统，原理简单方便使用，主要用于容器中
+在 Docker 中，OverlayFS 是默认的存储驱动之一。Docker 为每个容器创建一个独立的上层目录，而所有容器共享同一个下层镜像文件。这样的设计使得容器之间的资源共享更加高效，同时减少了存储需求。</p>
+<section id="id1">
+<h2>架构设计<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>overlayfs主要有两个层，以及一个虚拟的合并层</p>
+<ul class="simple">
+<li><p>Lower Layer（下层）：通常是 只读 文件系统。可以包含多层。</p></li>
+<li><p>Upper Layer（上层）：为 可写层，所有的写操作都会在这一层上进行。</p></li>
+<li><p>Merged Layer（合并层）：上层和下层的逻辑视图合并后，向用户呈现的最终文件系统。</p></li>
+</ul>
+</section>
+<section id="id2">
+<h2>工作原理<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>读取操作：</p>
+<ul>
+<li><p>OverlayFS 会优先从 Upper Layer 读取文件。如果文件不存在于上层，则读取 Lower Layer 中的内容。</p></li>
+</ul>
+</li>
+<li><p>写入操作：</p>
+<ul>
+<li><p>如果一个文件位于 Lower Layer 中，并尝试写入该文件，系统会将其 copy-up 到 Upper Layer 并在上层写入。如果文件已经存在于 Upper Layer，则直接在该层写入。</p></li>
+</ul>
+</li>
+<li><p>删除操作：</p>
+<ul>
+<li><p>当删除文件时，OverlayFS 会在上层创建一个标记为 whiteout 的条目，这会隐藏下层的文件。</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="copy-up">
+<h2>Copy-up<a class="headerlink" href="#copy-up" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>写时拷贝
+当一个文件从 下层 被修改时，它会被复制到 上层（称为 copy-up）。之后的所有修改都会发生在上层的文件副本上。</p></li>
+</ul>
+</section>
+<section id="id3">
+<h2>实现逻辑<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>通过构建ovlInode来实现indexnode这个trait来代表上层或者下层的inode，具体的有关文件文件夹的操作都在</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="联合文件系统" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../../debug/index.html" class="btn btn-neutral float-right" title="内核调试模块" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../V0.2.0/kernel/filesystem/unionfs/overlayfs.html">V0.2.0</a></dd>
+      <dd><a href="../../../../V0.3.0/kernel/filesystem/unionfs/overlayfs.html">V0.3.0</a></dd>
+      <dd><a href="overlayfs.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../master/kernel/filesystem/unionfs/overlayfs.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

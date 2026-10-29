@@ -28,14 +28,15 @@ mod fdinfo;
 mod id_map;
 mod limits;
 mod maps;
-mod mountinfo;
-mod mounts;
+mod mem;
 mod ns;
+mod oom_score_adj;
 pub mod stat;
 mod statm;
 mod status;
 mod task;
 
+use crate::filesystem::procfs::mount::{inode::MountProcFileOps, ProcMountRenderKind};
 use cgroup::CgroupFileOps;
 use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
@@ -44,9 +45,9 @@ use fdinfo::FdInfoDirOps;
 use id_map::{IdMapFileOps, SetgroupsFileOps};
 use limits::LimitsFile;
 use maps::MapsFileOps;
-use mountinfo::MountInfoFileOps;
-use mounts::PidMountsFileOps;
+use mem::MemFileOps;
 use ns::NsDirOps;
+use oom_score_adj::{OomScoreAdjFileOps, OomScoreFileOps};
 use stat::StatFileOps;
 use statm::StatmFileOps;
 use status::StatusFileOps;
@@ -72,9 +73,26 @@ impl ProcPidTarget {
         Self { view_pid_ns, pid }
     }
 
+    /// Resolve `nr` as a thread-group id, the way Linux `next_tgid()` does.
+    ///
+    /// Requires the `PIDTYPE_TGID` link, which only the group leader holds, so
+    /// this resolves leaders only. Used for `/proc` directory *listing*, where
+    /// Linux also lists leaders only (`next_tgid()` in `fs/proc/base.c`).
     pub fn from_tgid_in_ns(view_pid_ns: Arc<PidNamespace>, pid: RawPid) -> Option<Self> {
         let target_pid = view_pid_ns.find_pid_in_ns(pid)?;
         target_pid.pid_task(PidType::TGID)?;
+        Some(Self::new(view_pid_ns, target_pid))
+    }
+
+    /// Resolve `nr` as a task id, the way Linux `proc_pid_lookup()` does.
+    ///
+    /// `find_task_by_pid_ns()` goes through `PIDTYPE_PID`, which every task
+    /// (including a non-leader thread and a not-yet-reaped zombie) holds
+    /// through its own `thread_pid`, so any task with a live PID link can be
+    /// named by its tid. Used for `/proc/<nr>` *lookup*.
+    pub fn from_pid_in_ns(view_pid_ns: Arc<PidNamespace>, pid: RawPid) -> Option<Self> {
+        let target_pid = view_pid_ns.find_pid_in_ns(pid)?;
+        target_pid.pid_task(PidType::PID)?;
         Some(Self::new(view_pid_ns, target_pid))
     }
 
@@ -97,6 +115,14 @@ impl ProcPidTarget {
         self.pid.pid_nr_ns(&self.view_pid_ns)
     }
 
+    /// The task this node names, the way Linux `get_proc_task(inode)` resolves
+    /// the proc inode. A `/proc/<tgid>` node names the group leader, a
+    /// `/proc/<tid>` node the thread, and either can be gone.
+    ///
+    /// Files that report per-task state (`files`, `fs_struct`, `nsproxy`) read
+    /// from here; files backed by state the whole group shares (`mm`,
+    /// `sighand`, credentials) may use [`Self::thread_group_leader()`] instead,
+    /// which is the same task for a `/proc/<tgid>` node.
     pub fn task(&self) -> Option<Arc<ProcessControlBlock>> {
         self.pid.pid_task(PidType::PID)
     }
@@ -111,6 +137,53 @@ impl ProcPidTarget {
         self.thread_group_leader()?.task_pid_ptr(PidType::TGID)
     }
 
+    pub(super) fn owner_uid_gid(&self) -> Option<(usize, usize)> {
+        self.task_owner_uid_gid(true)
+    }
+
+    // Linux keeps world-readable/executable PID directories task-owned even
+    // when ordinary files are root-owned for a non-dumpable task.
+    fn directory_owner_uid_gid(&self) -> Option<(usize, usize)> {
+        self.task_owner_uid_gid(false)
+    }
+
+    fn task_owner_uid_gid(&self, check_dumpable: bool) -> Option<(usize, usize)> {
+        let pcb = self.thread_group_leader()?;
+        if pcb.is_kthread() {
+            return Some((0, 0));
+        }
+        // Keep owned snapshots, not exec_update_lock: exec holds its write
+        // side while resolving paths such as /proc/self/fd/N.
+        let cred = pcb.cred();
+        // Credential commits publish the dumpability downgrade first. Pair
+        // with that publication before reading mm state, as ptrace does.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if check_dumpable {
+            let mm = pcb.basic().user_vm();
+            let Some(mm) = mm else {
+                return Some((0, 0));
+            };
+            if mm.dumpable() != crate::process::cred::SUID_DUMP_USER as u8 {
+                let ns = mm.user_ns();
+                return Some((
+                    crate::process::namespace::user_namespace::make_kuid(&ns, 0)
+                        .map(|id| id.data())
+                        .unwrap_or(0),
+                    crate::process::namespace::user_namespace::make_kgid(&ns, 0)
+                        .map(|id| id.data())
+                        .unwrap_or(0),
+                ));
+            }
+        }
+        Some((cred.euid.data(), cred.egid.data()))
+    }
+
+    /// Thread group id of this target in the view PID namespace.
+    ///
+    /// Re-resolves the `PidType::PID` link, so it yields 0 once the task
+    /// detaches that link. A procfs file that has already pinned `task()` must
+    /// derive `Tgid` from that task instead, the way Linux `proc_pid_status()`
+    /// reuses the pinned task through `task_tgid_nr_ns()`.
     pub fn tgid(&self) -> RawPid {
         self.thread_group_pid()
             .map(|pid| pid.pid_nr_ns(&self.view_pid_ns))
@@ -137,12 +210,19 @@ impl PidDirOps {
             .unwrap()
     }
 
+    /// The task this directory names, for the entries that only exist when it
+    /// does (`fd`/`fdinfo`, which Linux creates with `proc_pid_make_inode()` on
+    /// the same `get_proc_task(inode)` their readers use).
     fn get_process(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        self.target.task()
     }
 
     pub(super) fn is_current_target(&self) -> bool {
-        ProcPidTarget::from_tgid_in_ns(self.target.view_pid_ns().clone(), self.target.vpid())
+        // Cache-validity check: the same tid number must still resolve to the
+        // same `Arc<Pid>`. It has to use the same rule as `lookup_child()`,
+        // otherwise a directory resolved by a non-leader tid would never match
+        // its cached entry and would be rebuilt on every lookup.
+        ProcPidTarget::from_pid_in_ns(self.target.view_pid_ns().clone(), self.target.vpid())
             .map(|target| self.target.same_pid_object(&target))
             .unwrap_or(false)
     }
@@ -161,20 +241,32 @@ impl PidDirOps {
         ("maps", |ops, parent| {
             MapsFileOps::new_inode(ops.target.clone(), parent)
         }),
+        ("mem", |ops, parent| {
+            MemFileOps::new_inode(ops.target.clone(), parent)
+        }),
         ("limits", |ops, parent| {
             LimitsFile::new_inode(ops.target.clone(), parent)
         }),
         ("mountinfo", |ops, parent| {
-            MountInfoFileOps::new_inode(ops.target.clone(), parent)
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountInfo, parent)
         }),
         ("mounts", |ops, parent| {
-            PidMountsFileOps::new_inode(ops.target.clone(), parent)
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::Mounts, parent)
+        }),
+        ("mountstats", |ops, parent| {
+            MountProcFileOps::new_inode(ops.target.clone(), ProcMountRenderKind::MountStats, parent)
+        }),
+        ("oom_score", |ops, parent| {
+            OomScoreFileOps::new_inode(ops.target.clone(), parent)
+        }),
+        ("oom_score_adj", |ops, parent| {
+            OomScoreAdjFileOps::new_inode(ops.target.clone(), parent)
         }),
         ("ns", |ops, parent| {
             NsDirOps::new_inode(ops.target.clone(), parent)
         }),
         ("stat", |ops, parent| {
-            StatFileOps::new_inode(ops.target.clone(), parent)
+            StatFileOps::new_inode(ops.target.clone(), stat::StatScope::ThreadGroup, parent)
         }),
         ("statm", |ops, parent| {
             StatmFileOps::new_inode(ops.target.clone(), parent)
@@ -254,12 +346,7 @@ impl PidDirOps {
 
 impl DirOps for PidDirOps {
     fn owner(&self) -> Option<(usize, usize)> {
-        let pcb = self.target.thread_group_leader()?;
-        if pcb.is_kthread() {
-            return Some((0, 0));
-        }
-        let cred = pcb.cred();
-        Some((cred.euid.data(), cred.egid.data()))
+        self.target.directory_owner_uid_gid()
     }
 
     fn lookup_child(

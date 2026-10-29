@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>代码风格 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="与社区建立联系" href="../contact/index.html" />
+    <link rel="prev" title="参与开发" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../kernel/cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">参与开发</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">代码风格</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">0. 代码格式化工具</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">1. 缩进</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">2. 分行</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id5">3. 大括号和空格</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id6">3.1 大括号</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">3.2 空格</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id8">4. 命名</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">参与开发</a></li>
+      <li class="breadcrumb-item active">代码风格</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/325c103/docs/community/code_contribution/coding-style.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>代码风格<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<p>  这份文档将会简要的介绍DragonOS的代码风格。每个人的代码风格都各不相同，这是一件非常正常的事情。但是，对于一个开源项目的可维护性而言，我们希望制定一些代码规范，以便包括您在内的每个开发者都能在看代码的时候更加舒服。一个充斥着各种不同代码风格的项目，是难以维护的。</p>
+<p>  我们在这里提出一些建议，希望您能够尽量遵循这些建议。这些建议与Linux的代码规范相似，但又略有不同。</p>
+<section id="id2">
+<h2>0. 代码格式化工具<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  在提出下面的建议之前，我们建议您在开发的时候使用Visual Studio Code的<code class="docutils literal notranslate"><span class="pre">C/C++</span> <span class="pre">Extension</span> <span class="pre">Pack</span></code>插件作为代码格式化工具。这些插件能为您提供较好自动格式化功能，使得您的代码的基本格式符合DragonOS的要求。</p>
+<p>  当您在编码时，经常性的按下<code class="docutils literal notranslate"><span class="pre">Ctrl+shift+I</span></code>或您设置的代码格式化快捷键，能帮助您始终保持良好的代码格式。</p>
+</section>
+<section id="id3">
+<h2>1. 缩进<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>  一个制表符的宽度等于4个空格。代码的缩进是按照制表符宽度(在多数编辑器上为4个字符)进行缩进的。</p>
+<p>  这样能够使得您的代码变得更加容易阅读，也能更好的看出代码的控制结构。这样能避免很多不必要的麻烦！</p>
+<p>举个例子：在switch语句中，将switch和case放置在同一缩进级别。并且将每个case的代码往右推进一个tab。这样能让代码可读性变得更好。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">cmd</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="k">case</span><span class="w"> </span><span class="no">AHCI_CMD_READ_DMA_EXT</span><span class="p">:</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">end_handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AHCI_CMD_READ_DMA_EXT</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="k">case</span><span class="w"> </span><span class="no">AHCI_CMD_WRITE_DMA_EXT</span><span class="p">:</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">end_handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AHCI_CMD_WRITE_DMA_EXT</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="k">default</span><span class="o">:</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">end_handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pack</span><span class="o">-&gt;</span><span class="n">blk_pak</span><span class="p">.</span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cmd</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="id4">
+<h2>2. 分行<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<p>  我们建议，每行不要超过120个字符。如果超过了，除非有必要的理由，否则应当将其分为两行。</p>
+<p>  在分行时，我们需要从被分出来的第二行开始，比第一行的起始部分向右进行一个缩进，以表明这是一个子行。使用代码格式化的快捷键能让你快速完成这件事。</p>
+<p>  对于一些日志字符串而言，为了能方便的检索到他们，我们不建议对其进行分行。</p>
+<p>  对于代码的分行，请不要试图通过以下的方式将几个语句放置在同一行中，这样对于代码可读性没有任何好处：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="c1">// 错误示范(1)</span>
+<span class="k">if</span><span class="p">(</span><span class="n">a</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+
+<span class="c1">// 错误示范(2)</span>
+<span class="k">if</span><span class="p">(</span><span class="n">b</span><span class="p">)</span>
+<span class="w">    </span><span class="n">do_a</span><span class="p">(),</span><span class="n">do_b</span><span class="p">();</span>
+</pre></div>
+</div>
+</section>
+<section id="id5">
+<h2>3. 大括号和空格<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h2>
+<section id="id6">
+<h3>3.1 大括号<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>  大括号的放置位置的选择是因人而异的，主要是习惯原因，而不是技术原因。我们推荐将开始括号和结束括号都放置在一个新的行首。如下所示：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">while</span><span class="p">(</span><span class="n">i</span><span class="o">&lt;</span><span class="mi">10</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="o">++</span><span class="n">i</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  这种规定适用于所有的代码块。</p>
+<p>  这么选择的原因是，在一些编辑器上，这样放置括号，<strong>编辑器上将会出现辅助的半透明竖线，且竖线两端均为括号</strong>。这样能帮助开发者更好的定位代码块的层次关系。</p>
+<p>下面通过一些例子来演示：</p>
+<p>  在下面这个代码块中，我们需要注意的是，<code class="docutils literal notranslate"><span class="pre">else</span> <span class="pre">if</span></code>语句需要另起一行，而不是跟在上一个<code class="docutils literal notranslate"><span class="pre">}</span></code>后方。这是因为我们规定<code class="docutils literal notranslate"><span class="pre">{</span></code>必须在每行的起始位置，并且还要保持缩进级别的缘故。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">fmt</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="sc">&#39;*&#39;</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="o">++</span><span class="n">fmt</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">is_digit</span><span class="p">(</span><span class="o">*</span><span class="n">fmt</span><span class="p">))</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">field_width</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">skip_and_atoi</span><span class="p">(</span><span class="o">&amp;</span><span class="n">fmt</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  当循环中有多个简单的语句的时候，需要使用大括号。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">condition</span><span class="p">)</span><span class="w"> </span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">test</span><span class="p">)</span>
+<span class="w">        </span><span class="n">do_something</span><span class="p">();</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  当语句只有1个简单的子句时，我们不必使用大括号。</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="p">(</span><span class="n">a</span><span class="p">)</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</pre></div>
+</div>
+</section>
+<section id="id7">
+<h3>3.2 空格<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>  对于大部分关键字，我们需要在其后添加空格，以提高代码的可读性。</p>
+<p>  请您在所有这些关键字后面输入一个空格：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">if</span><span class="p">,</span><span class="w"> </span><span class="k">switch</span><span class="p">,</span><span class="w"> </span><span class="k">case</span><span class="p">,</span><span class="w"> </span><span class="no">for</span><span class="p">,</span><span class="w"> </span><span class="no">do</span><span class="p">,</span><span class="w"> </span><span class="no">while</span>
+</pre></div>
+</div>
+<p>  关键字sizeof、typeof、alignof、__atrribute__的后面则不需要添加空格，因为使用他们的时候，就像是使用函数一样。</p>
+<p>  对于指针类型的变量，<code class="docutils literal notranslate"><span class="pre">*</span></code>号要贴近变量名而不是贴近类型名。如下所示：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">a</span><span class="p">;</span>
+<span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="nf">func</span><span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">**</span><span class="n">p</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  在大多数二元和三元运算符周围（在每一侧）使用一个空格，如下所示：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="o">=</span><span class="w">  </span><span class="o">+</span><span class="w">  </span><span class="o">-</span><span class="w">  </span><span class="o">&lt;</span><span class="w">  </span><span class="o">&gt;</span><span class="w">  </span><span class="o">*</span><span class="w">  </span><span class="o">/</span><span class="w">  </span><span class="o">%</span><span class="w">  </span><span class="o">|</span><span class="w">  </span><span class="o">&amp;</span><span class="w">  </span><span class="o">^</span><span class="w">  </span><span class="o">&lt;=</span><span class="w">  </span><span class="o">&gt;=</span><span class="w">  </span><span class="o">==</span><span class="w">  </span><span class="o">!=</span><span class="w">  </span><span class="o">?</span><span class="w">  </span><span class="o">:</span>
+</pre></div>
+</div>
+<p>  这些一元运算符后方没有空格</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="o">&amp;</span><span class="w">  </span><span class="o">*</span><span class="w">  </span><span class="o">+</span><span class="w">  </span><span class="o">-</span><span class="w">  </span><span class="o">~</span><span class="w">  </span><span class="o">!</span><span class="w">  </span><span class="k">sizeof</span><span class="w">  </span><span class="n">typeof</span><span class="w">  </span><span class="k">alignof</span><span class="w">  </span><span class="n">__attribute__</span><span class="w">  </span><span class="n">defined</span>
+</pre></div>
+</div>
+<p>  特殊的例子，以下运算符的前后都不需要空格：</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="o">++</span><span class="w">  </span><span class="o">--</span><span class="w"> </span><span class="p">.</span><span class="w"> </span><span class="o">-&gt;</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id8">
+<h2>4. 命名<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h2>
+<p>  DragonOS中的命名规范不使用诸如<code class="docutils literal notranslate"><span class="pre">TempValue</span></code>这样的驼峰命名法的函数名，而是使用<code class="docutils literal notranslate"><span class="pre">tmp</span></code>这样言简意赅的命名。</p>
+<p>  注意，这里指的是我们在整个项目内都不希望使用驼峰命名法。并不意味着程序员可以随便的使用一些难以理解的缩写来作为变量名。</p>
+<p>  对于全局变量或者全局可见的函数、结构体而言，我们需要遵循以下的命名规定：</p>
+<ul class="simple">
+<li><p>名称需要易于理解，且不具有歧义。如：对于一个计算文件夹大小的函数而言，我们建议使用<code class="docutils literal notranslate"><span class="pre">count_folder_size()</span></code>来命名，而不是<code class="docutils literal notranslate"><span class="pre">cntfs()</span></code>这样令其他人头大的命名。</p></li>
+<li><p>全局的，非static的名称，除非有特别的必要，命名时需要遵循以下格式：<code class="docutils literal notranslate"><span class="pre">模块名缩写前缀_函数/变量名</span></code>。这样的命名能便于别人区分这个名称位于哪个模块内，也减少了由于命名冲突所导致的麻烦。</p></li>
+<li><p>不需要让其他代码文件可见的全局名称，必须添加<code class="docutils literal notranslate"><span class="pre">static</span></code>修饰符。</p></li>
+</ul>
+<p>  对于函数内的局部变量而言，命名规范则是需要言简意赅。过长的名称在局部变量中没有太大的意义。</p>
+<p>【文档未完成，待继续完善】</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="参与开发" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../contact/index.html" class="btn btn-neutral float-right" title="与社区建立联系" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>325c103</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="coding-style.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/community/code_contribution/coding-style.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/community/code_contribution/coding-style.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/community/code_contribution/coding-style.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -1,0 +1,51 @@
+# 锁的类型及其规则
+
+## 简介
+
+DragonOS内核实现了一些锁，大致可以分为两类：
+
+- 休眠锁
+- 自旋锁
+
+## 锁的类型
+
+### 休眠锁
+
+休眠锁只能在可抢占的上下文之中被获取。
+
+在DragonOS之中，实现了以下的休眠锁：
+
+- semaphore
+- rwsem
+- mutex_t
+
+### 自旋锁
+
+- spinlock_t
+- [RawSpinLock ](/zh/kernel/locking/spinlock.html#_spinlock_doc_rawspinlock)（Rust版本的spinlock_t，但与spinlock_t不兼容）
+- [SpinLock ](/zh/kernel/locking/spinlock.html#_spinlock_doc_spinlock) —— 在RawSpinLock的基础上，封装了一层守卫(Guard), 将锁及其要保护到的数据绑定在一个结构体内，并能在编译期避免未加锁就访问数据的问题。
+
+进程在获取自旋锁后，将改变pcb中的锁变量持有计数，从而隐式地禁止了抢占。为了获得更多灵活的操作，spinlock还提供了以下的方法：
+
+
+| 后缀                     | 说明                                                |
+| ------------------------ | --------------------------------------------------- |
+| _irq()                   | 在加锁时关闭中断/在放锁时开启中断                   |
+| _irqsave()/_irqrestore() | 在加锁时保存中断状态，并关中断/在放锁时恢复中断状态 |
+
+
+## 详细介绍
+
+### 自旋锁的详细介绍
+
+关于自旋锁的详细介绍，请见文档：[自旋锁 ](/zh/kernel/locking/spinlock.html#_spinlock_doc)
+
+### semaphore信号量
+
+semaphore信号量是基于计数实现的。
+
+当可用资源不足时，尝试对semaphore执行down操作的进程将会被休眠，直到资源可用。
+
+### mutex互斥量
+
+请见[Mutex文档 ](/zh/kernel/locking/mutex.html#_mutex_doc)

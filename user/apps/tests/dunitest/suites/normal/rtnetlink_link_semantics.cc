@@ -1,0 +1,1478 @@
+#include <gtest/gtest.h>
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <linux/if_link.h>
+#include <linux/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <poll.h>
+#include <sched.h>
+#include <dirent.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <string_view>
+
+namespace {
+
+class FdGuard {
+  public:
+    explicit FdGuard(int fd = -1) : fd_(fd) {}
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    ~FdGuard() {
+        if (fd_ >= 0) close(fd_);
+    }
+
+    int Get() const { return fd_; }
+
+  private:
+    int fd_;
+};
+
+bool IsDragonOS() {
+    struct utsname uts {};
+    return uname(&uts) == 0 && std::strstr(uts.release, "dragonos") != nullptr;
+}
+
+int OpenRouteSocket() {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0) return -1;
+
+    timeval timeout {};
+    timeout.tv_sec = 2;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        const int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+
+    sockaddr_nl address {};
+    address.nl_family = AF_NETLINK;
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        const int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+int OpenUeventSocket() {
+    int fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+    if (fd < 0) return -1;
+
+    sockaddr_nl address {};
+    address.nl_family = AF_NETLINK;
+    address.nl_groups = 1;
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        const int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+bool UeventHasField(const unsigned char* payload, size_t length, std::string_view expected) {
+    size_t offset = 0;
+    while (offset < length) {
+        const char* field = reinterpret_cast<const char*>(payload + offset);
+        const size_t remaining = length - offset;
+        const size_t field_length = strnlen(field, remaining);
+        if (field_length == remaining) return false;
+        if (std::string_view(field, field_length) == expected) return true;
+        offset += field_length + 1;
+    }
+    return false;
+}
+
+bool UeventHasNonemptyField(const unsigned char* payload, size_t length,
+                           std::string_view prefix) {
+    size_t offset = 0;
+    while (offset < length) {
+        const char* field = reinterpret_cast<const char*>(payload + offset);
+        const size_t remaining = length - offset;
+        const size_t field_length = strnlen(field, remaining);
+        if (field_length == remaining) return false;
+        const std::string_view value(field, field_length);
+        if (value.size() > prefix.size() && value.substr(0, prefix.size()) == prefix) {
+            return true;
+        }
+        offset += field_length + 1;
+    }
+    return false;
+}
+
+bool IsExpectedMoveUevent(const unsigned char* payload, size_t length,
+                          const std::string& interface, int ifindex) {
+    return UeventHasField(payload, length, "ACTION=move") &&
+           UeventHasField(payload, length, "SUBSYSTEM=net") &&
+           UeventHasField(payload, length, "INTERFACE=" + interface) &&
+           UeventHasField(payload, length, "IFINDEX=" + std::to_string(ifindex));
+}
+
+std::optional<bool> ReceiveExpectedMoveUevent(int fd, const std::string& interface,
+                                             int ifindex) {
+    std::array<unsigned char, 8192> payload {};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    // A unique temporary interface name filters unrelated host uevents. Bound
+    // both the scan and total wall time so sustained noise cannot hang CI.
+    for (int attempts = 0; attempts < 64; ++attempts) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) return std::nullopt;
+        pollfd descriptor {fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, static_cast<int>(remaining.count()));
+        if (ready == 0) return std::nullopt;
+        if (ready < 0) {
+            if (errno == EINTR) {
+                --attempts;
+                continue;
+            }
+            return false;
+        }
+        if ((descriptor.revents & POLLIN) == 0) return false;
+
+        const ssize_t received =
+            recv(fd, payload.data(), payload.size(), MSG_DONTWAIT);
+        if (received < 0) {
+            if (errno == EINTR) {
+                --attempts;
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return std::nullopt;
+            return false;
+        }
+        if (!IsExpectedMoveUevent(payload.data(), received, interface, ifindex)) continue;
+        return UeventHasNonemptyField(payload.data(), received, "DEVPATH_OLD=");
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> HasExpectedMoveUeventQueued(int fd, const std::string& interface,
+                                               int ifindex) {
+    std::array<unsigned char, 8192> payload {};
+    for (int attempts = 0; attempts < 64; ++attempts) {
+        const ssize_t received = recv(fd, payload.data(), payload.size(), MSG_DONTWAIT);
+        if (received < 0) {
+            if (errno == EINTR) {
+                --attempts;
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+            return std::nullopt;
+        }
+        if (IsExpectedMoveUevent(payload.data(), received, interface, ifindex)) return true;
+    }
+    return std::nullopt;
+}
+
+int RecvAck(int fd, uint32_t seq) {
+    std::array<unsigned char, 4096> buffer {};
+    for (;;) {
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+        if (received < 0) return errno;
+
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            if (header->nlmsg_seq != seq || header->nlmsg_type != NLMSG_ERROR) continue;
+            const auto* error = reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(header));
+            return error->error == 0 ? 0 : -error->error;
+        }
+    }
+}
+
+struct LinkSnapshot {
+    uint32_t flags;
+    uint32_t mtu;
+    std::string name;
+    std::optional<uint32_t> tx_queue_len;
+};
+
+struct RouteProbe {
+    uint8_t family;
+    uint8_t prefix_len;
+    uint8_t table;
+    uint8_t type;
+    uint32_t ifindex;
+    std::array<uint8_t, 16> destination;
+};
+
+int CountRoute(int fd, const RouteProbe& probe, uint32_t seq) {
+    struct {
+        nlmsghdr header;
+        rtmsg route;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+    request.header.nlmsg_type = RTM_GETROUTE;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = seq;
+    request.route.rtm_family = probe.family;
+    if (send(fd, &request, request.header.nlmsg_len, 0) != request.header.nlmsg_len) {
+        return -errno;
+    }
+
+    const size_t address_length = probe.family == AF_INET ? 4 : 16;
+    int count = 0;
+    std::array<unsigned char, 16384> buffer {};
+    for (;;) {
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+        if (received < 0) return -errno;
+
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            if (header->nlmsg_seq != seq) continue;
+            if (header->nlmsg_type == NLMSG_DONE) return count;
+            if (header->nlmsg_type == NLMSG_ERROR) {
+                const auto* error = reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(header));
+                return error->error == 0 ? count : error->error;
+            }
+            if (header->nlmsg_type != RTM_NEWROUTE) continue;
+
+            const auto* route = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
+            if (route->rtm_family != probe.family || route->rtm_dst_len != probe.prefix_len ||
+                route->rtm_table != probe.table || route->rtm_type != probe.type) {
+                continue;
+            }
+
+            uint32_t ifindex = 0;
+            std::array<uint8_t, 16> destination {};
+            bool has_destination = false;
+            int attr_length = RTM_PAYLOAD(header);
+            for (auto* attr = RTM_RTA(route); RTA_OK(attr, attr_length);
+                 attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) == address_length) {
+                    std::memcpy(destination.data(), RTA_DATA(attr), address_length);
+                    has_destination = true;
+                } else if (attr->rta_type == RTA_OIF &&
+                           RTA_PAYLOAD(attr) == sizeof(ifindex)) {
+                    std::memcpy(&ifindex, RTA_DATA(attr), sizeof(ifindex));
+                }
+            }
+            if (has_destination && ifindex == probe.ifindex &&
+                std::memcmp(destination.data(), probe.destination.data(), address_length) == 0) {
+                ++count;
+            }
+        }
+    }
+}
+
+int SendIpv4LoopbackDatagram() {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (fd.Get() < 0) return errno;
+
+    sockaddr_in destination {};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(9);
+    if (inet_pton(AF_INET, "127.0.0.1", &destination.sin_addr) != 1) return EINVAL;
+    const char payload = 'x';
+    if (sendto(fd.Get(), &payload, sizeof(payload), 0,
+               reinterpret_cast<const sockaddr*>(&destination), sizeof(destination)) < 0) {
+        return errno;
+    }
+    return 0;
+}
+
+bool AddAttribute(nlmsghdr* header, size_t capacity, uint16_t type, const void* data,
+                  size_t length) {
+    const size_t offset = NLMSG_ALIGN(header->nlmsg_len);
+    const size_t attribute_length = RTA_LENGTH(length);
+    const size_t next = offset + RTA_ALIGN(attribute_length);
+    if (next > capacity) return false;
+
+    auto* attribute = reinterpret_cast<rtattr*>(reinterpret_cast<unsigned char*>(header) + offset);
+    attribute->rta_type = type;
+    attribute->rta_len = attribute_length;
+    std::memcpy(RTA_DATA(attribute), data, length);
+    header->nlmsg_len = next;
+    return true;
+}
+
+int SetLink(int fd, int ifindex, uint32_t flags, uint32_t change,
+            std::optional<uint32_t> mtu, const std::optional<std::string>& name, uint32_t seq) {
+    std::array<unsigned char, 512> storage {};
+    auto* header = reinterpret_cast<nlmsghdr*>(storage.data());
+    auto* link = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(header));
+    header->nlmsg_len = NLMSG_LENGTH(sizeof(*link));
+    header->nlmsg_type = RTM_SETLINK;
+    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    header->nlmsg_seq = seq;
+    link->ifi_family = AF_UNSPEC;
+    link->ifi_index = ifindex;
+    link->ifi_flags = flags;
+    link->ifi_change = change;
+
+    if (mtu.has_value() &&
+        !AddAttribute(header, storage.size(), IFLA_MTU, &*mtu, sizeof(*mtu))) {
+        return EMSGSIZE;
+    }
+    if (name.has_value() &&
+        !AddAttribute(header, storage.size(), IFLA_IFNAME, name->c_str(), name->size() + 1)) {
+        return EMSGSIZE;
+    }
+    if (send(fd, header, header->nlmsg_len, 0) != static_cast<ssize_t>(header->nlmsg_len)) {
+        return errno;
+    }
+    return RecvAck(fd, seq);
+}
+
+std::optional<LinkSnapshot> QueryLink(int fd, int ifindex, uint32_t seq) {
+    struct {
+        nlmsghdr header;
+        ifinfomsg link;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_GETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST;
+    request.header.nlmsg_seq = seq;
+    request.link.ifi_family = AF_UNSPEC;
+    request.link.ifi_index = ifindex;
+    if (send(fd, &request, request.header.nlmsg_len, 0) != request.header.nlmsg_len) {
+        return std::nullopt;
+    }
+
+    std::array<unsigned char, 4096> buffer {};
+    for (;;) {
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+        if (received < 0) return std::nullopt;
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            if (header->nlmsg_seq != seq) continue;
+            if (header->nlmsg_type == NLMSG_ERROR) return std::nullopt;
+            if (header->nlmsg_type != RTM_NEWLINK) continue;
+
+            const auto* link = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(header));
+            if (link->ifi_index != ifindex) continue;
+            LinkSnapshot result {link->ifi_flags, 0, {}, std::nullopt};
+            bool found_mtu = false;
+            bool found_name = false;
+            int attr_length = IFLA_PAYLOAD(header);
+            for (auto* attr = IFLA_RTA(link); RTA_OK(attr, attr_length);
+                 attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type == IFLA_MTU && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
+                    std::memcpy(&result.mtu, RTA_DATA(attr), sizeof(result.mtu));
+                    found_mtu = true;
+                } else if (attr->rta_type == IFLA_TXQLEN && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
+                    uint32_t value;
+                    std::memcpy(&value, RTA_DATA(attr), sizeof(value));
+                    result.tx_queue_len = value;
+                } else if (attr->rta_type == IFLA_IFNAME && RTA_PAYLOAD(attr) > 0) {
+                    const auto* value = static_cast<const char*>(RTA_DATA(attr));
+                    const size_t payload = RTA_PAYLOAD(attr);
+                    const size_t length = strnlen(value, payload);
+                    if (length < payload) {
+                        result.name.assign(value, length);
+                        found_name = true;
+                    }
+                }
+            }
+            if (found_mtu && found_name) return result;
+            return std::nullopt;
+        }
+    }
+}
+
+std::optional<int> FindIfindex(const char* name) {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (fd.Get() < 0) return std::nullopt;
+    ifreq request {};
+    std::strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd.Get(), SIOCGIFINDEX, &request) < 0) return std::nullopt;
+    return request.ifr_ifindex;
+}
+
+bool DirectoryContainsOnly(const std::string& path, std::string_view expected) {
+    DIR* directory = opendir(path.c_str());
+    if (directory == nullptr) return false;
+    bool found = false;
+    bool valid = true;
+    while (dirent* entry = readdir(directory)) {
+        const std::string_view name(entry->d_name);
+        if (name == "." || name == "..") continue;
+        if (name != expected || found) {
+            valid = false;
+            break;
+        }
+        found = true;
+    }
+    closedir(directory);
+    return valid && found;
+}
+
+bool SendFileDescriptor(int socket_fd, int file_fd) {
+    char byte = 'F';
+    iovec io {&byte, sizeof(byte)};
+    std::array<unsigned char, CMSG_SPACE(sizeof(int))> control {};
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(header), &file_fd, sizeof(file_fd));
+    return sendmsg(socket_fd, &message, 0) == 1;
+}
+
+int ReceiveFileDescriptor(int socket_fd) {
+    char byte = 0;
+    iovec io {&byte, sizeof(byte)};
+    std::array<unsigned char, CMSG_SPACE(sizeof(int))> control {};
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    if (recvmsg(socket_fd, &message, 0) != 1) return -1;
+    cmsghdr* header = CMSG_FIRSTHDR(&message);
+    if (header == nullptr || header->cmsg_level != SOL_SOCKET ||
+        header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(sizeof(int))) {
+        return -1;
+    }
+    int file_fd = -1;
+    std::memcpy(&file_fd, CMSG_DATA(header), sizeof(file_fd));
+    return file_fd;
+}
+
+int SetLinkUp(int fd, int ifindex, bool up, uint32_t seq) {
+    struct {
+        nlmsghdr header;
+        ifinfomsg link;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_SETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    request.header.nlmsg_seq = seq;
+    request.link.ifi_family = AF_UNSPEC;
+    request.link.ifi_index = ifindex;
+    request.link.ifi_flags = up ? IFF_UP : 0;
+    request.link.ifi_change = IFF_UP;
+
+    if (send(fd, &request, request.header.nlmsg_len, 0) != request.header.nlmsg_len) {
+        return errno;
+    }
+    return RecvAck(fd, seq);
+}
+
+int RunCombinedMutationCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 77;
+    FdGuard fd(OpenRouteSocket());
+    if (fd.Get() < 0) return 10;
+    const auto ifindex = FindIfindex("lo");
+    if (!ifindex.has_value()) return 11;
+
+    uint32_t seq = 1;
+    const auto original = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!original.has_value()) return 12;
+    const uint32_t changed_mtu = original->mtu == 1500 ? 1400 : 1500;
+    const bool changed_up = (original->flags & IFF_UP) == 0;
+    const uint32_t changed_flags = changed_up ? IFF_UP : 0;
+    if (SetLink(fd.Get(), *ifindex, changed_flags, IFF_UP, changed_mtu, std::nullopt,
+                seq++) != 0) {
+        return 13;
+    }
+    const auto changed = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!changed.has_value() || changed->mtu != changed_mtu ||
+        ((changed->flags & IFF_UP) != 0) != changed_up ||
+        (changed->flags & IFF_LOOPBACK) == 0) {
+        return 14;
+    }
+
+    const uint32_t original_up = original->flags & IFF_UP;
+    if (SetLink(fd.Get(), *ifindex, original_up, IFF_UP, original->mtu, std::nullopt,
+                seq++) != 0) {
+        return 15;
+    }
+    const auto before_failure = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!before_failure.has_value()) return 16;
+    const uint32_t failed_mtu = before_failure->mtu == 1600 ? 1400 : 1600;
+    const uint32_t failed_up = (before_failure->flags & IFF_UP) == 0 ? IFF_UP : 0;
+    const int error = SetLink(fd.Get(), *ifindex, failed_up, IFF_UP, failed_mtu,
+                              std::string("bad/name"), seq++);
+    if (error == 0) return 17;
+    const auto after_failure = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!after_failure.has_value() || after_failure->name != before_failure->name) return 18;
+
+    // DragonOS intentionally gives the shared transaction stronger failure
+    // atomicity than Linux do_setlink(), which has already changed MTU when a
+    // later rename fails. Keep the host path useful without asserting the
+    // stronger DragonOS guarantee there.
+    if (IsDragonOS() &&
+        (after_failure->mtu != before_failure->mtu ||
+         (after_failure->flags & IFF_UP) != (before_failure->flags & IFF_UP))) {
+        return 19;
+    }
+    if (SetLink(fd.Get(), *ifindex, before_failure->flags & IFF_UP, IFF_UP,
+                before_failure->mtu, std::nullopt, seq++) != 0) {
+        return 20;
+    }
+    return 0;
+}
+
+int RunReplaceFlagsCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 77;
+    FdGuard fd(OpenRouteSocket());
+    if (fd.Get() < 0) return 10;
+    const auto ifindex = FindIfindex("lo");
+    if (!ifindex.has_value()) return 11;
+
+    uint32_t seq = 1;
+    const auto original = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!original.has_value()) return 12;
+    if (SetLink(fd.Get(), *ifindex, IFF_UP | IFF_NOARP, IFF_UP | IFF_NOARP,
+                std::nullopt, std::nullopt, seq++) != 0) {
+        return 13;
+    }
+    const auto prepared = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!prepared.has_value() || (prepared->flags & (IFF_UP | IFF_NOARP)) !=
+                                     (IFF_UP | IFF_NOARP)) {
+        return 14;
+    }
+
+    // Linux treats ifi_change == 0 as a full replace for compatibility. The
+    // omitted configurable NOARP bit is cleared, while device/volatile bits
+    // cannot be overwritten by userspace.
+    if (SetLink(fd.Get(), *ifindex, IFF_UP, 0, std::nullopt, std::nullopt, seq++) != 0) {
+        return 15;
+    }
+    const auto replaced = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!replaced.has_value() || (replaced->flags & IFF_UP) == 0 ||
+        (replaced->flags & IFF_NOARP) != 0) {
+        return 16;
+    }
+    constexpr uint32_t kVolatileAndDevice =
+        IFF_LOOPBACK | IFF_POINTOPOINT | IFF_BROADCAST | IFF_ECHO | IFF_MASTER |
+        IFF_SLAVE | IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT;
+    if ((replaced->flags & kVolatileAndDevice) != (prepared->flags & kVolatileAndDevice)) {
+        return 17;
+    }
+
+    const uint32_t restore_flags = original->flags & (IFF_UP | IFF_NOARP);
+    if (SetLink(fd.Get(), *ifindex, restore_flags, IFF_UP | IFF_NOARP, std::nullopt,
+                std::nullopt, seq++) != 0) {
+        return 18;
+    }
+    return 0;
+}
+
+int RunRenameValidationCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 77;
+    FdGuard fd(OpenRouteSocket());
+    if (fd.Get() < 0) return 10;
+    const auto ifindex = FindIfindex("lo");
+    if (!ifindex.has_value()) return 11;
+
+    uint32_t seq = 1;
+    const auto original = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!original.has_value()) return 12;
+    const std::array<std::string, 9> invalid_names = {
+        ".", "..", "bad/name", "bad:name", "bad name", "abcdefghijklmnop", "bad%x",
+        "bad%", "bad%d%d"};
+    for (const auto& invalid : invalid_names) {
+        if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, invalid, seq++) == 0) return 13;
+        const auto unchanged = QueryLink(fd.Get(), *ifindex, seq++);
+        if (!unchanged.has_value() || unchanged->name != original->name) return 14;
+    }
+
+    const std::string renamed = "dunitlo0";
+    struct stat old_target {};
+    const std::string old_path = "/sys/class/net/" + original->name;
+    const std::string new_path = "/sys/class/net/" + renamed;
+    const bool has_sysfs_projection = stat(old_path.c_str(), &old_target) == 0;
+    if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, renamed, seq++) != 0) return 15;
+    const auto after_rename = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!after_rename.has_value() || after_rename->name != renamed) return 16;
+    int projection_result = 0;
+    if (has_sysfs_projection) {
+        struct stat new_target {};
+        struct stat old_after {};
+        const bool new_visible = stat(new_path.c_str(), &new_target) == 0;
+        const bool old_visible = stat(old_path.c_str(), &old_after) == 0;
+        if (IsDragonOS()) {
+            // This inherited sysfs mount remains bound to the initial netns;
+            // renaming fresh-netns lo must not change that projection.
+            if (new_visible || !old_visible || old_after.st_ino != old_target.st_ino) {
+                projection_result = 17;
+            }
+        } else if (new_visible) {
+            if (old_visible || new_target.st_ino != old_target.st_ino) projection_result = 17;
+        } else if (!old_visible || old_after.st_ino != old_target.st_ino) {
+            // This sysfs mount remains bound to the parent network namespace
+            // after unshare(CLONE_NEWNET), so it legitimately continues to
+            // expose the parent namespace's lo on both Linux and DragonOS.
+            projection_result = 17;
+        }
+    }
+    if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, original->name, seq++) != 0) {
+        return 18;
+    }
+    if (projection_result != 0) return projection_result;
+
+    if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, std::string("du%d"), seq++) != 0) {
+        return 19;
+    }
+    const auto formatted = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!formatted.has_value() || formatted->name != "du0") return 20;
+    if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, original->name, seq++) != 0) {
+        return 21;
+    }
+    return 0;
+}
+
+int RunDragonOsSysfsRenameCase() {
+    FdGuard fd(OpenRouteSocket());
+    if (fd.Get() < 0) return 10;
+    const auto ifindex = FindIfindex("lo");
+    if (!ifindex.has_value()) return 11;
+
+    uint32_t seq = 1;
+    const auto original = QueryLink(fd.Get(), *ifindex, seq++);
+    if (!original.has_value()) return 12;
+    const std::string renamed = "dunitlo0";
+    const std::string old_path = "/sys/class/net/" + original->name;
+    const std::string new_path = "/sys/class/net/" + renamed;
+    struct stat old_link {};
+    struct stat old_target {};
+    if (lstat(old_path.c_str(), &old_link) != 0 || stat(old_path.c_str(), &old_target) != 0) {
+        return 13;
+    }
+    if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, renamed, seq++) != 0) return 14;
+
+    int result = 0;
+    struct stat new_link {};
+    struct stat new_target {};
+    struct stat ignored {};
+    if (lstat(old_path.c_str(), &ignored) == 0 || errno != ENOENT ||
+        lstat(new_path.c_str(), &new_link) != 0 || stat(new_path.c_str(), &new_target) != 0) {
+        result = 15;
+    } else if (new_link.st_ino != old_link.st_ino || new_target.st_ino != old_target.st_ino) {
+        result = 16;
+    }
+
+    // Always restore the globally visible initial-namespace loopback before
+    // reporting a failed assertion.
+    if (SetLink(fd.Get(), *ifindex, 0, 0, std::nullopt, original->name, seq++) != 0) {
+        return 17;
+    }
+    if (lstat(old_path.c_str(), &ignored) != 0 || lstat(new_path.c_str(), &ignored) == 0 ||
+        errno != ENOENT) {
+        return 18;
+    }
+    return result;
+}
+
+int RunSysfsMountRejectsInheritedNetnsOwnerCase() {
+    // A new user namespace alone does not confer authority over the inherited
+    // network namespace. Enabling userns mounts must preserve this owner check.
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return 77;
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
+    const char* mountpoint = "/tmp/dunit-inherited-netns-sysfs";
+    if (mkdir(mountpoint, 0755) != 0 && errno != EEXIST) return 10;
+    const int result = mount("sysfs", mountpoint, "sysfs",
+                             MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr);
+    const int error = errno;
+    if (result == 0) umount(mountpoint);
+    rmdir(mountpoint);
+    return result == -1 && error == EPERM ? 0 : 11;
+}
+
+int RunFreshNetnsSysfsProjectionCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0) return 77;
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
+
+    const std::string mountpoint = "/tmp/dunit-netns-sysfs";
+    if (mkdir(mountpoint.c_str(), 0755) != 0 && errno != EEXIST) return 10;
+    if (mount("sysfs", mountpoint.c_str(), "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              nullptr) != 0) {
+        return errno == EPERM ? 77 : 11;
+    }
+
+    int result = 0;
+    const std::string class_old = mountpoint + "/class/net/lo";
+    const std::string device_old = mountpoint + "/devices/virtual/net/lo";
+    struct stat class_link_before {};
+    struct stat class_target_before {};
+    struct stat device_before {};
+    if (lstat(class_old.c_str(), &class_link_before) != 0 ||
+        stat(class_old.c_str(), &class_target_before) != 0 ||
+        stat(device_old.c_str(), &device_before) != 0 ||
+        class_target_before.st_ino != device_before.st_ino ||
+        !DirectoryContainsOnly(mountpoint + "/class/net", "lo") ||
+        !DirectoryContainsOnly(mountpoint + "/devices/virtual/net", "lo")) {
+        result = 12;
+    }
+
+    FdGuard route(OpenRouteSocket());
+    const auto ifindex = FindIfindex("lo");
+    uint32_t seq = 1;
+    const std::string renamed = "dunitns0";
+    if (result == 0 && (route.Get() < 0 || !ifindex.has_value())) result = 13;
+    if (result == 0 &&
+        SetLink(route.Get(), *ifindex, 0, 0, std::nullopt, renamed, seq++) != 0) {
+        result = 14;
+    }
+
+    if (result == 0) {
+        const std::string class_new = mountpoint + "/class/net/" + renamed;
+        const std::string device_new = mountpoint + "/devices/virtual/net/" + renamed;
+        const std::string subsystem = device_new + "/subsystem";
+        struct stat class_link_after {};
+        struct stat class_target_after {};
+        struct stat device_after {};
+        struct stat subsystem_device {};
+        struct stat ignored {};
+        char subsystem_target[PATH_MAX] = {};
+        const ssize_t subsystem_target_len =
+            readlink(subsystem.c_str(), subsystem_target, sizeof(subsystem_target));
+        if (lstat(class_old.c_str(), &ignored) == 0 || errno != ENOENT ||
+            stat(device_old.c_str(), &ignored) == 0 || errno != ENOENT ||
+            lstat(class_new.c_str(), &class_link_after) != 0 ||
+            stat(class_new.c_str(), &class_target_after) != 0 ||
+            stat(device_new.c_str(), &device_after) != 0 ||
+            class_link_after.st_ino != class_link_before.st_ino ||
+            class_target_after.st_ino != device_after.st_ino ||
+            device_after.st_ino != device_before.st_ino ||
+            !DirectoryContainsOnly(mountpoint + "/class/net", renamed) ||
+            !DirectoryContainsOnly(mountpoint + "/devices/virtual/net", renamed) ||
+            subsystem_target_len <= 0 || subsystem_target[0] == '/' ||
+            stat((subsystem + "/" + renamed).c_str(), &subsystem_device) != 0 ||
+            subsystem_device.st_ino != device_after.st_ino) {
+            result = 15;
+        }
+        // The inherited boot mount remains bound to the initial netns.
+        if (stat("/sys/class/net/lo", &ignored) != 0 ||
+            stat((std::string("/sys/class/net/") + renamed).c_str(), &ignored) == 0) {
+            result = 16;
+        }
+    }
+
+    if (umount2(mountpoint.c_str(), MNT_DETACH) != 0 && result == 0) result = 17;
+    rmdir(mountpoint.c_str());
+    return result;
+}
+
+int RunStaleSysfsFdCase() {
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return 10;
+    const pid_t child = fork();
+    if (child < 0) return 11;
+    if (child == 0) {
+        close(sockets[0]);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0 ||
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            _exit(77);
+        }
+        const char* mountpoint = "/tmp/dunit-stale-sysfs";
+        if ((mkdir(mountpoint, 0755) != 0 && errno != EEXIST) ||
+            mount("sysfs", mountpoint, "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  nullptr) != 0) {
+            _exit(errno == EPERM ? 77 : 12);
+        }
+        const std::string type = std::string(mountpoint) + "/class/net/lo/type";
+        FdGuard attribute(open(type.c_str(), O_RDONLY));
+        if (attribute.Get() < 0 || !SendFileDescriptor(sockets[1], attribute.Get())) _exit(13);
+        umount2(mountpoint, MNT_DETACH);
+        close(sockets[1]);
+        _exit(0);
+    }
+
+    close(sockets[1]);
+    FdGuard attribute(ReceiveFileDescriptor(sockets[0]));
+    close(sockets[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 14;
+    if (WEXITSTATUS(status) == 77) return 77;
+    if (WEXITSTATUS(status) != 0 || attribute.Get() < 0) return 15;
+
+    char buffer[64] = {};
+    errno = 0;
+    const ssize_t read_result = pread(attribute.Get(), buffer, sizeof(buffer), 0);
+    // Namespace and iface objects may remain alive behind RCU/NAPI references,
+    // so an opened fd can still complete. Once the kobject weak reference is
+    // gone, the callback must return ENODEV instead of panicking.
+    return read_result >= 0 || errno == ENODEV ? 0 : 16;
+}
+
+int RunOwnerNetnsMoveUeventCase() {
+    // Netlink sockets retain the network namespace in which they were opened.
+    // Keep both owner sockets alive across unshare so the mutation and its
+    // kobject event still target the initial namespace.
+    FdGuard owner_route(OpenRouteSocket());
+    FdGuard owner_uevent(OpenUeventSocket());
+    if (owner_route.Get() < 0 || owner_uevent.Get() < 0) return 10;
+
+    const auto ifindex = FindIfindex("lo");
+    if (!ifindex.has_value()) return 11;
+    uint32_t seq = 1;
+    const auto original = QueryLink(owner_route.Get(), *ifindex, seq++);
+    if (!original.has_value()) return 12;
+
+    // Retain the initial user namespace and its CAP_NET_ADMIN while changing
+    // only the current network namespace. Linux checks current credentials
+    // when a request is sent on the retained owner RTNL socket.
+    if (unshare(CLONE_NEWNET) != 0) return 77;
+    FdGuard foreign_uevent(OpenUeventSocket());
+    if (foreign_uevent.Get() < 0) return 13;
+
+    const std::string renamed = "dunitloev0";
+    const int rename_error = SetLink(owner_route.Get(), *ifindex, 0, 0, std::nullopt,
+                                     renamed, seq++);
+    if (rename_error != 0) {
+        if (rename_error == EPERM && !IsDragonOS()) return 77;
+        return 14;
+    }
+
+    int result = 0;
+    const auto owner_event =
+        ReceiveExpectedMoveUevent(owner_uevent.Get(), renamed, *ifindex);
+    if (!owner_event.has_value()) {
+        result = 15;
+    } else if (!*owner_event) {
+        result = 16;
+    }
+
+    const auto foreign_event =
+        HasExpectedMoveUeventQueued(foreign_uevent.Get(), renamed, *ifindex);
+    if (!foreign_event.has_value()) {
+        if (result == 0) result = 17;
+    } else if (*foreign_event && result == 0) {
+        result = 18;
+    }
+
+    // Always restore the initial namespace's globally visible loopback name,
+    // including when event validation fails.
+    if (SetLink(owner_route.Get(), *ifindex, 0, 0, std::nullopt, original->name,
+                seq++) != 0) {
+        return 19;
+    }
+    const auto restored = QueryLink(owner_route.Get(), *ifindex, seq++);
+    if (!restored.has_value() || restored->name != original->name) return 20;
+    return result;
+}
+
+int RunChild(int (*test_case)()) {
+    const pid_t child = fork();
+    if (child < 0) return 255;
+    if (child == 0) _exit(test_case());
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 254;
+    return WEXITSTATUS(status);
+}
+
+// Each child mounts a view owned by its fresh netns. Never modify host links.
+struct MtuSysfsView {
+    char path[64] = "/tmp/dunit-mtu-XXXXXX";
+    bool mounted = false;
+    int Initialize() {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS) != 0) return 77;
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return 77;
+        if (mkdtemp(path) == nullptr) return 10;
+        if (mount("sysfs", path, "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  nullptr) != 0) return errno == EPERM ? 77 : 11;
+        mounted = true;
+        return 0;
+    }
+    std::string Attribute(const char* name) const {
+        return std::string(path) + "/class/net/" + name + "/mtu";
+    }
+    ~MtuSysfsView() {
+        if (mounted) umount2(path, MNT_DETACH);
+        rmdir(path);
+    }
+};
+
+bool MtuTextEquals(int fd, uint32_t mtu) {
+    char bytes[32] = {};
+    const ssize_t count = pread(fd, bytes, sizeof(bytes), 0);
+    return count >= 0 && std::string(bytes, count) == std::to_string(mtu) + "\n";
+}
+
+int RunSysfsMtuReadCase() {
+    MtuSysfsView view;
+    const int setup = view.Initialize();
+    if (setup != 0) return setup;
+    FdGuard fd(open(view.Attribute("lo").c_str(), O_RDONLY));
+    FdGuard route(OpenRouteSocket());
+    const auto index = FindIfindex("lo");
+    if (fd.Get() < 0 || route.Get() < 0 || !index) return 12;
+    const auto link = QueryLink(route.Get(), *index, 1);
+    if (!link || !MtuTextEquals(fd.Get(), link->mtu)) return 13;
+    struct stat metadata {};
+    if (fstat(fd.Get(), &metadata) != 0 || (metadata.st_mode & 0777) != 0644) return 14;
+    const std::string expected = std::to_string(link->mtu) + "\n";
+    std::string actual;
+    char byte = 'X';
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (read(fd.Get(), &byte, 1) != 1) return 15;
+        actual += byte;
+    }
+    if (actual != expected || read(fd.Get(), &byte, 1) != 0) return 16;
+    if (pread(fd.Get(), &byte, 1, 1) != 1 || byte != expected[1]) return 17;
+    if (lseek(fd.Get(), 1, SEEK_SET) != 1 || read(fd.Get(), &byte, 1) != 1 ||
+        byte != expected[1]) return 18;
+    byte = 'X';
+    if (read(fd.Get(), &byte, 0) != 0 || byte != 'X' ||
+        lseek(fd.Get(), 0, SEEK_CUR) != 2) return 19;
+    if (pread(fd.Get(), &byte, 1, expected.size()) != 0) return 20;
+    return 0;
+}
+
+int RunSysfsMtuWriteCase() {
+    MtuSysfsView view;
+    const int setup = view.Initialize();
+    if (setup != 0) return setup;
+    FdGuard fd(open(view.Attribute("lo").c_str(), O_RDWR | O_TRUNC));
+    FdGuard route(OpenRouteSocket());
+    FdGuard inet(socket(AF_INET, SOCK_DGRAM, 0));
+    const auto index = FindIfindex("lo");
+    if (fd.Get() < 0 || route.Get() < 0 || inet.Get() < 0 || !index) return 12;
+    uint32_t seq = 1;
+    const auto matches = [&](uint32_t mtu) {
+        ifreq request {};
+        std::strcpy(request.ifr_name, "lo");
+        const auto link = QueryLink(route.Get(), *index, seq++);
+        return link && link->mtu == mtu && MtuTextEquals(fd.Get(), mtu) &&
+               ioctl(inet.Get(), SIOCGIFMTU, &request) == 0 &&
+               request.ifr_mtu == static_cast<int>(mtu);
+    };
+    const auto initial = QueryLink(route.Get(), *index, seq++);
+    if (!initial || ftruncate(fd.Get(), 0) != 0 || !matches(initial->mtu) ||
+        ftruncate(fd.Get(), 7) != 0 || !matches(initial->mtu)) return 19;
+    struct Valid { std::string text; uint32_t mtu; };
+    const Valid valid[] = {{"1500", 1500}, {"+1400\n", 1400}, {"02734", 1500},
+                           {"0X578\n", 1400}, {std::string("1500\0junk", 9), 1500},
+                           {"4294968696", 1400}};
+    for (const auto& value : valid) {
+        if (write(fd.Get(), value.text.data(), value.text.size()) !=
+                static_cast<ssize_t>(value.text.size()) || !matches(value.mtu)) return 13;
+    }
+    struct Invalid { const char* text; int error; };
+    const Invalid invalid[] = {{"-1", EINVAL}, {" 1500", EINVAL}, {"1500 ", EINVAL},
+        {"1500\n\n", EINVAL}, {"+", EINVAL}, {"0x", EINVAL}, {"08", EINVAL},
+        {"2147483648", EINVAL}, {"18446744073709551615", EINVAL},
+        {"18446744073709551616", ERANGE}, {"18446744073709551616junk", ERANGE}};
+    for (const auto& value : invalid) {
+        errno = 0;
+        if (write(fd.Get(), value.text, std::strlen(value.text)) != -1 ||
+            errno != value.error || !matches(1400)) return 14;
+    }
+    if (write(fd.Get(), "", 0) != 0 || !matches(1400)) return 15;
+    // Prefix NUL ends parsing; the full accepted PAGE_SIZE is reported.
+    std::string oversized = "1500";
+    oversized.resize(4097, '\0');
+    if (write(fd.Get(), oversized.data(), oversized.size()) != 4096 ||
+        !matches(1500)) return 16;
+    ifreq request {};
+    std::strcpy(request.ifr_name, "lo");
+    request.ifr_mtu = 1600;
+    if (ioctl(inet.Get(), SIOCSIFMTU, &request) != 0 || !matches(1600)) return 17;
+    if (SetLink(route.Get(), *index, 0, 0, 1700, std::nullopt, seq++) != 0 ||
+        !matches(1700)) return 18;
+    return 0;
+}
+
+int RunSysfsMtuRenameAndPermissionCase() {
+    const uid_t parent_uid = getuid();
+    const gid_t parent_gid = getgid();
+    MtuSysfsView view;
+    const int setup = view.Initialize();
+    if (setup != 0) return setup;
+    FdGuard fd(open(view.Attribute("lo").c_str(), O_RDWR));
+    FdGuard route(OpenRouteSocket());
+    const auto index = FindIfindex("lo");
+    if (fd.Get() < 0 || route.Get() < 0 || !index) return 12;
+    struct stat before {}, after {};
+    if (fstat(fd.Get(), &before) != 0 ||
+        SetLink(route.Get(), *index, 0, 0, std::nullopt, "mtulo", 1) != 0 ||
+        stat(view.Attribute("mtulo").c_str(), &after) != 0 ||
+        before.st_ino != after.st_ino) return 13;
+    if (write(fd.Get(), "1500", 4) != 4 || !MtuTextEquals(fd.Get(), 1500)) return 14;
+    // Capabilities in a child userns do not authorize its parent's netns.
+    // Map the current credentials first: Linux cannot create a nested userns
+    // when the creator's UID/GID have no mapping in its current userns.
+    const auto write_map = [](const char* path, const std::string& value) {
+        FdGuard map(open(path, O_WRONLY));
+        return map.Get() >= 0 && write(map.Get(), value.data(), value.size()) ==
+                                     static_cast<ssize_t>(value.size());
+    };
+    if (!write_map("/proc/self/uid_map", "0 " + std::to_string(parent_uid) + " 1\n") ||
+        !write_map("/proc/self/setgroups", "deny\n") ||
+        !write_map("/proc/self/gid_map", "0 " + std::to_string(parent_gid) + " 1\n")) return 20;
+    const pid_t child = fork();
+    if (child < 0) return 15;
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER) != 0) _exit(77);
+        errno = 0;
+        if (write(fd.Get(), "1400", 4) != -1 || errno != EPERM ||
+            !MtuTextEquals(fd.Get(), 1500)) _exit(16);
+        // Permission precedes parsing, even for an invalid textual value.
+        errno = 0;
+        if (write(fd.Get(), "bad", 3) != -1 || errno != EPERM) _exit(17);
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 18;
+    if (WEXITSTATUS(status) != 0) return WEXITSTATUS(status);
+    if (!MtuTextEquals(fd.Get(), 1500)) return 19;
+    return 0;
+}
+
+std::optional<short> QueryIoctlFlags(int fd, const char* name) {
+    ifreq request {};
+    std::strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFFLAGS, &request) < 0) return std::nullopt;
+    return request.ifr_flags;
+}
+
+std::optional<uint32_t> QueryLinkFlags(int fd, int ifindex, uint32_t seq) {
+    struct {
+        nlmsghdr header;
+        ifinfomsg link;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_GETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST;
+    request.header.nlmsg_seq = seq;
+    request.link.ifi_family = AF_UNSPEC;
+    request.link.ifi_index = ifindex;
+
+    if (send(fd, &request, request.header.nlmsg_len, 0) != request.header.nlmsg_len) {
+        return std::nullopt;
+    }
+
+    std::array<unsigned char, 4096> buffer {};
+    for (;;) {
+        const ssize_t received = recv(fd, buffer.data(), buffer.size(), 0);
+        if (received < 0) return std::nullopt;
+
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            if (header->nlmsg_seq != seq) continue;
+            if (header->nlmsg_type == NLMSG_ERROR) return std::nullopt;
+            if (header->nlmsg_type != RTM_NEWLINK) continue;
+            const auto* link = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(header));
+            if (link->ifi_index == ifindex) return link->ifi_flags;
+        }
+    }
+}
+
+std::optional<int> FindEthernetIfindex() {
+    FdGuard fd(socket(AF_INET, SOCK_DGRAM, 0));
+    if (fd.Get() < 0) return std::nullopt;
+
+    for (int i = 0; i <= 20; ++i) {
+        const std::string name = "eth" + std::to_string(i);
+        ifreq ifr{};
+        std::strncpy(ifr.ifr_name, name.c_str(), IFNAMSIZ - 1);
+        if (ioctl(fd.Get(), SIOCGIFINDEX, &ifr) == 0) return ifr.ifr_ifindex;
+    }
+    return std::nullopt;
+}
+
+std::optional<uint32_t> QueryLinkMtu(int ifindex) {
+    FdGuard fd(socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE));
+    if (fd.Get() < 0) return std::nullopt;
+
+    sockaddr_nl address{};
+    address.nl_family = AF_NETLINK;
+    if (bind(fd.Get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        return std::nullopt;
+    }
+
+    struct {
+        nlmsghdr header;
+        ifinfomsg link;
+    } request{};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_GETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST;
+    request.header.nlmsg_seq = 1;
+    request.link.ifi_family = AF_UNSPEC;
+    request.link.ifi_index = ifindex;
+
+    if (send(fd.Get(), &request, request.header.nlmsg_len, 0) < 0) return std::nullopt;
+
+    char buffer[4096]{};
+    for (;;) {
+        ssize_t length = recv(fd.Get(), buffer, sizeof(buffer), 0);
+        if (length < 0) return std::nullopt;
+
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer); NLMSG_OK(header, length);
+             header = NLMSG_NEXT(header, length)) {
+            if (header->nlmsg_seq != request.header.nlmsg_seq) continue;
+            if (header->nlmsg_type == NLMSG_ERROR || header->nlmsg_type == NLMSG_DONE) {
+                return std::nullopt;
+            }
+            if (header->nlmsg_type != RTM_NEWLINK) continue;
+
+            const auto* link = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(header));
+            if (link->ifi_index != ifindex) continue;
+
+            int attr_length = IFLA_PAYLOAD(header);
+            for (auto* attr = IFLA_RTA(link); RTA_OK(attr, attr_length);
+                 attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type != IFLA_MTU || RTA_PAYLOAD(attr) != sizeof(uint32_t)) {
+                    continue;
+                }
+                uint32_t mtu = 0;
+                std::memcpy(&mtu, RTA_DATA(attr), sizeof(mtu));
+                return mtu;
+            }
+            return std::nullopt;
+        }
+    }
+}
+
+TEST(RtnetlinkLinkSemantics, TxQueueLengthMatchesIoctlSysfsAndLinkDump) {
+    FdGuard route(OpenRouteSocket());
+    FdGuard single(OpenRouteSocket());
+    FdGuard control(socket(AF_INET, SOCK_DGRAM, 0));
+    ASSERT_GE(route.Get(), 0);
+    ASSERT_GE(single.Get(), 0);
+    ASSERT_GE(control.Get(), 0);
+    struct {
+        nlmsghdr header;
+        ifinfomsg link;
+    } request {};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    request.header.nlmsg_type = RTM_GETLINK;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = 2258;
+    request.link.ifi_family = AF_UNSPEC;
+    ASSERT_EQ(send(route.Get(), &request, request.header.nlmsg_len, 0),
+              request.header.nlmsg_len);
+
+    bool done = false;
+    bool found_loopback = false;
+    bool found_ethernet = false;
+    // Dump enumerates devices without depending on configured IP addresses.
+    // Bound the receive loop in addition to the socket timeout.
+    for (int batch = 0; batch < 128 && !done; ++batch) {
+        alignas(nlmsghdr) std::array<unsigned char, 32768> buffer {};
+        const ssize_t received = recv(route.Get(), buffer.data(), buffer.size(), MSG_TRUNC);
+        ASSERT_GT(received, 0) << strerror(errno);
+        ASSERT_LE(static_cast<size_t>(received), buffer.size());
+        int remaining = static_cast<int>(received);
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+            ASSERT_EQ(header->nlmsg_seq, 2258u);
+            ASSERT_EQ(header->nlmsg_flags & NLM_F_DUMP_INTR, 0);
+            if (header->nlmsg_type == NLMSG_DONE) {
+                done = true;
+                break;
+            }
+            ASSERT_EQ(header->nlmsg_type, RTM_NEWLINK);
+            ASSERT_GE(header->nlmsg_len, NLMSG_LENGTH(sizeof(ifinfomsg)));
+            const auto* link = static_cast<const ifinfomsg*>(NLMSG_DATA(header));
+            std::optional<uint32_t> dump_qlen;
+            int length = IFLA_PAYLOAD(header);
+            for (auto* attr = IFLA_RTA(link); RTA_OK(attr, length);
+                 attr = RTA_NEXT(attr, length)) {
+                if (attr->rta_type != IFLA_TXQLEN) continue;
+                ASSERT_FALSE(dump_qlen.has_value());
+                ASSERT_EQ(RTA_PAYLOAD(attr), sizeof(uint32_t));
+                uint32_t value;
+                std::memcpy(&value, RTA_DATA(attr), sizeof(value));
+                dump_qlen = value;
+            }
+            ASSERT_TRUE(dump_qlen.has_value()) << link->ifi_index;
+            const auto snapshot = QueryLink(single.Get(), link->ifi_index, 2259);
+            ASSERT_TRUE(snapshot.has_value());
+            ASSERT_TRUE(snapshot->tx_queue_len.has_value());
+            EXPECT_EQ(*snapshot->tx_queue_len, *dump_qlen);
+            ifreq ifr {};
+            std::strncpy(ifr.ifr_name, snapshot->name.c_str(), IFNAMSIZ - 1);
+            ASSERT_EQ(ioctl(control.Get(), SIOCGIFTXQLEN, &ifr), 0);
+            EXPECT_EQ(static_cast<uint32_t>(ifr.ifr_qlen), *dump_qlen);
+
+            const std::string path = "/sys/class/net/" + snapshot->name + "/tx_queue_len";
+            FdGuard attribute(open(path.c_str(), O_RDONLY));
+            ASSERT_GE(attribute.Get(), 0) << path << ": " << strerror(errno);
+            std::array<char, 32> text {};
+            const ssize_t count = read(attribute.Get(), text.data(), text.size());
+            ASSERT_GT(count, 0) << strerror(errno);
+            EXPECT_EQ(std::string(text.data(), count), std::to_string(*dump_qlen) + "\n");
+            if (IsDragonOS()) {
+                // The boot devices retain the default; dynamic links may
+                // legitimately configure a different qlen (Docker uses 0).
+                if (snapshot->name == "lo" || snapshot->name == "eth2") {
+                    EXPECT_EQ(*dump_qlen, 1000u);
+                }
+                struct stat metadata {};
+                ASSERT_EQ(fstat(attribute.Get(), &metadata), 0);
+                EXPECT_EQ(metadata.st_mode & 0222, 0u);
+            }
+            found_loopback |= snapshot->name == "lo";
+            found_ethernet |= link->ifi_type == 1;  // ARPHRD_ETHER
+        }
+    }
+    EXPECT_TRUE(done);
+    EXPECT_TRUE(found_loopback);
+    if (IsDragonOS()) {
+        EXPECT_TRUE(found_ethernet);
+    }
+}
+
+TEST(RtnetlinkLinkSemantics, VirtioEthernetReportsStandardIpMtu) {
+    const auto ifindex = FindEthernetIfindex();
+    if (!ifindex.has_value()) GTEST_SKIP() << "No eth0-eth20 interface found";
+
+    const auto mtu = QueryLinkMtu(*ifindex);
+    ASSERT_TRUE(mtu.has_value()) << "RTM_GETLINK did not return IFLA_MTU: errno=" << errno
+                                << " (" << std::strerror(errno) << ")";
+    EXPECT_EQ(*mtu, 1500U);
+}
+
+int RunFreshNetnsLoopbackLifecycleCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 77;
+
+    FdGuard ioctl_fd(socket(AF_INET, SOCK_DGRAM, 0));
+    FdGuard route_fd(OpenRouteSocket());
+    if (ioctl_fd.Get() < 0 || route_fd.Get() < 0) return 10;
+
+    const auto ifindex = FindIfindex("lo");
+    if (!ifindex.has_value()) return 11;
+    const auto ioctl_flags = QueryIoctlFlags(ioctl_fd.Get(), "lo");
+    uint32_t seq = 1;
+    const auto rtnl_flags = QueryLinkFlags(route_fd.Get(), *ifindex, seq++);
+    if (!ioctl_flags.has_value() || !rtnl_flags.has_value()) return 12;
+
+    // Existence through both APIs proves that lo is registered. Linux creates
+    // a fresh netns with lo administratively down; volatile runtime flags must
+    // not leak from construction either.
+    constexpr uint32_t kRtnlDownMask = IFF_UP | IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT;
+    if ((static_cast<uint16_t>(*ioctl_flags) & (IFF_UP | IFF_RUNNING)) != 0) return 13;
+    if ((*rtnl_flags & kRtnlDownMask) != 0) return 14;
+    if ((static_cast<uint16_t>(*ioctl_flags) & IFF_LOOPBACK) == 0 ||
+        (*rtnl_flags & IFF_LOOPBACK) == 0) {
+        return 15;
+    }
+
+    RouteProbe connected_v4 {AF_INET, 8, RT_TABLE_LOCAL, RTN_LOCAL,
+                             static_cast<uint32_t>(*ifindex), {}};
+    RouteProbe local_v4 {AF_INET, 32, RT_TABLE_LOCAL, RTN_LOCAL,
+                         static_cast<uint32_t>(*ifindex), {}};
+    RouteProbe broadcast_v4 {AF_INET, 32, RT_TABLE_LOCAL, RTN_BROADCAST,
+                             static_cast<uint32_t>(*ifindex), {}};
+    RouteProbe local_v6 {AF_INET6, 128, RT_TABLE_LOCAL, RTN_LOCAL,
+                         static_cast<uint32_t>(*ifindex), {}};
+    if (inet_pton(AF_INET, "127.0.0.0", connected_v4.destination.data()) != 1 ||
+        inet_pton(AF_INET, "127.0.0.1", local_v4.destination.data()) != 1 ||
+        inet_pton(AF_INET, "127.255.255.255", broadcast_v4.destination.data()) != 1 ||
+        inet_pton(AF_INET6, "::1", local_v6.destination.data()) != 1) {
+        return 16;
+    }
+
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 0) {
+        return 17;
+    }
+    if (SendIpv4LoopbackDatagram() != ENETUNREACH) return 18;
+
+    if (SetLinkUp(route_fd.Get(), *ifindex, true, seq++) != 0) return 19;
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 1) {
+        return 20;
+    }
+    if (SendIpv4LoopbackDatagram() != 0) return 21;
+
+    if (SetLinkUp(route_fd.Get(), *ifindex, false, seq++) != 0) return 22;
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 0 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 0) {
+        return 23;
+    }
+    if (SendIpv4LoopbackDatagram() != 0) return 24;
+
+    if (SetLinkUp(route_fd.Get(), *ifindex, true, seq++) != 0) return 25;
+    if (CountRoute(route_fd.Get(), connected_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), broadcast_v4, seq++) != 1 ||
+        CountRoute(route_fd.Get(), local_v6, seq++) != 1) {
+        return 26;
+    }
+    return 0;
+}
+
+int RunVisibleFlagsCase() {
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 77;
+
+    FdGuard ioctl_fd(socket(AF_INET, SOCK_DGRAM, 0));
+    FdGuard route_fd(OpenRouteSocket());
+    if (ioctl_fd.Get() < 0 || route_fd.Get() < 0) return 10;
+
+    ifreq index_request {};
+    std::strncpy(index_request.ifr_name, "lo", IFNAMSIZ - 1);
+    if (ioctl(ioctl_fd.Get(), SIOCGIFINDEX, &index_request) < 0) return 11;
+    const int ifindex = index_request.ifr_ifindex;
+
+    if (SetLinkUp(route_fd.Get(), ifindex, true, 1) != 0) return 12;
+    const auto ioctl_up = QueryIoctlFlags(ioctl_fd.Get(), "lo");
+    const auto rtnl_up = QueryLinkFlags(route_fd.Get(), ifindex, 2);
+    if (!ioctl_up.has_value() || !rtnl_up.has_value()) return 13;
+    constexpr uint32_t kRuntimeFlags = IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT;
+    constexpr uint32_t kExpectedUp = IFF_UP | IFF_RUNNING;
+    if ((static_cast<uint16_t>(*ioctl_up) & kExpectedUp) != kExpectedUp) return 14;
+    if ((*rtnl_up & kExpectedUp) != kExpectedUp) return 15;
+    if ((static_cast<uint16_t>(*ioctl_up) & IFF_LOOPBACK) == 0 ||
+        (*rtnl_up & IFF_LOOPBACK) == 0) {
+        return 16;
+    }
+
+    if (SetLinkUp(route_fd.Get(), ifindex, false, 3) != 0) return 17;
+    const auto ioctl_down = QueryIoctlFlags(ioctl_fd.Get(), "lo");
+    const auto rtnl_down = QueryLinkFlags(route_fd.Get(), ifindex, 4);
+    if (!ioctl_down.has_value() || !rtnl_down.has_value()) return 18;
+    if ((static_cast<uint16_t>(*ioctl_down) & (IFF_UP | kRuntimeFlags)) != 0) return 19;
+    if ((*rtnl_down & (IFF_UP | kRuntimeFlags)) != 0) return 20;
+    if ((static_cast<uint16_t>(*ioctl_down) & IFF_LOOPBACK) == 0 ||
+        (*rtnl_down & IFF_LOOPBACK) == 0) {
+        return 21;
+    }
+    if ((static_cast<uint16_t>(*ioctl_down) & 0xffffU) != (*rtnl_down & 0xffffU)) return 22;
+
+    if (SetLinkUp(route_fd.Get(), ifindex, true, 5) != 0) return 23;
+    const auto ioctl_restored = QueryIoctlFlags(ioctl_fd.Get(), "lo");
+    const auto rtnl_restored = QueryLinkFlags(route_fd.Get(), ifindex, 6);
+    if (!ioctl_restored.has_value() || !rtnl_restored.has_value()) return 24;
+    if ((static_cast<uint16_t>(*ioctl_restored) & kExpectedUp) != kExpectedUp) return 25;
+    if ((*rtnl_restored & kExpectedUp) != kExpectedUp) return 26;
+    return 0;
+}
+
+TEST(RtnetlinkLinkSemantics, VisibleFlagsFollowAdministrativeAndRuntimeState) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) _exit(RunVisibleFlagsCase());
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    const int result = WEXITSTATUS(status);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host does not permit user/network namespace creation";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, FreshNetworkNamespaceLoopbackIsPresentButDown) {
+    const int result = RunChild(RunFreshNetnsLoopbackLifecycleCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host does not permit user/network namespace creation";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SharedTransactionCommitsTogetherAndRejectsPartialFailure) {
+    const int result = RunChild(RunCombinedMutationCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host does not permit user/network namespace creation";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, ZeroChangeMaskReplacesOnlyConfigurableFlags) {
+    const int result = RunChild(RunReplaceFlagsCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host does not permit user/network namespace creation";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, RenameValidatesNamesFormatsAndProjectedIdentity) {
+    const int result = RunChild(RunRenameValidationCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host does not permit user/network namespace creation";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, DragonOsInitialNetnsRenamePreservesSysfsInodes) {
+    if (!IsDragonOS()) GTEST_SKIP() << "initial-netns sysfs projection is DragonOS coverage";
+    EXPECT_EQ(RunChild(RunDragonOsSysfsRenameCase), 0);
+}
+
+TEST(RtnetlinkLinkSemantics, FreshNetworkNamespaceHasMountedSysfsProjection) {
+    const int result = RunChild(RunFreshNetnsSysfsProjectionCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create and mount a network-namespace sysfs view";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMountRequiresNetworkNamespaceOwnerCapability) {
+    const int result = RunChild(RunSysfsMountRejectsInheritedNetnsOwnerCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create private user/mount namespaces";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMtuSupportsModeShortReadsAndSeek) {
+    const int result = RunChild(RunSysfsMtuReadCase);
+    if (result == 77 && !IsDragonOS()) GTEST_SKIP() << "host cannot mount private netns sysfs";
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMtuTextAbiAndControlPlanesAgree) {
+    const int result = RunChild(RunSysfsMtuWriteCase);
+    if (result == 77 && !IsDragonOS()) GTEST_SKIP() << "host cannot mount private netns sysfs";
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, SysfsMtuOldFdSurvivesRenameAndChecksOwnerUserns) {
+    const int result = RunChild(RunSysfsMtuRenameAndPermissionCase);
+    if (result == 77 && !IsDragonOS()) GTEST_SKIP() << "host cannot create private user/net namespaces";
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, StaleSysfsAttributeFdFailsWithoutKernelPanic) {
+    const int result = RunStaleSysfsFdCase();
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create and mount a network-namespace sysfs view";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+TEST(RtnetlinkLinkSemantics, MoveUeventIsDeliveredOnlyToOwningNetworkNamespace) {
+    const int result = RunChild(RunOwnerNetnsMoveUeventCase);
+    if (result == 77 && !IsDragonOS()) {
+        GTEST_SKIP() << "host cannot create a privileged network namespace";
+    }
+    EXPECT_EQ(result, 0);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

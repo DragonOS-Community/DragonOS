@@ -24,7 +24,6 @@ macro_rules! new_zone {
                 SCAllocator::new(1 << 10), // 1024
                 SCAllocator::new(1 << 11), // 2048            ],
             ],
-            total: 0,
         }
     };
 }
@@ -39,7 +38,6 @@ macro_rules! new_zone {
 /// to provide the underlying `SCAllocator` with more memory in case it runs out.
 pub struct ZoneAllocator<'a> {
     small_slabs: [SCAllocator<'a, ObjectPage<'a>>; ZoneAllocator::MAX_BASE_SIZE_CLASSES],
-    total: u64,
 }
 
 impl<'a> Default for ZoneAllocator<'a> {
@@ -119,7 +117,6 @@ impl<'a> ZoneAllocator<'a> {
             let slab = &mut self.small_slabs[i];
             // reclaim的page数
             let just_reclaimed = slab.try_reclaim_pages(to_reclaim, &mut dealloc);
-            self.total -= (just_reclaimed * OBJECT_PAGE_SIZE) as u64;
 
             to_reclaim = to_reclaim.saturating_sub(just_reclaimed);
             if to_reclaim == 0 {
@@ -128,30 +125,14 @@ impl<'a> ZoneAllocator<'a> {
         }
     }
 
-    /// 获取scallocator中的还未被分配的空间
-    pub fn free_space(&mut self) -> u64 {
-        // 记录空闲空间
-        let mut free = 0;
-        // 遍历所有scallocator
-        for count in 0..ZoneAllocator::MAX_BASE_SIZE_CLASSES {
-            // 获取scallocator
-            let scallocator = &mut self.small_slabs[count];
-
-            // 遍历scallocator中的部分分配的page(partial_page)
-            for slab_page in scallocator.slabs.iter_mut() {
-                // 剩余可分配object数乘上page中规定的每个object的大小，即空闲空间
-                free += slab_page.free_obj_count() * scallocator.size();
-            }
-            // 遍历scallocator中的empty_page，把空页空间也加上去
-            free +=
-                scallocator.empty_slabs.elements * (scallocator.obj_per_page * scallocator.size());
-        }
-        free as u64
-    }
-
-    pub fn usage(&mut self) -> SlabUsage {
-        let free_num = self.free_space();
-        SlabUsage::new(self.total, free_num)
+    /// Returns a snapshot of pages currently owned by all size classes.
+    pub fn usage(&self) -> SlabUsage {
+        let resident_pages: usize = self
+            .small_slabs
+            .iter()
+            .map(SCAllocator::resident_pages)
+            .sum();
+        SlabUsage::new(resident_pages as u64 * OBJECT_PAGE_SIZE as u64)
     }
 }
 
@@ -208,8 +189,6 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
         match ZoneAllocator::get_slab(layout.size()) {
             Slab::Base(idx) => {
                 self.small_slabs[idx].refill(new_page);
-                // 每refill一个page就为slab的总空间统计加上4KB
-                self.total += OBJECT_PAGE_SIZE as u64;
                 Ok(())
             }
             Slab::Unsupported => Err(AllocationError::InvalidLayout),
@@ -217,29 +196,17 @@ unsafe impl<'a> crate::Allocator<'a> for ZoneAllocator<'a> {
     }
 }
 
-/// Slab内存空间使用情况
+/// Resident memory currently owned by the slab allocator.
 pub struct SlabUsage {
-    // slab总共使用的内存空间
     total: u64,
-    // slab的空闲空间
-    free: u64,
 }
 
 impl SlabUsage {
-    /// 初始化SlabUsage
-    pub fn new(total: u64, free: u64) -> Self {
-        Self { total, free }
+    pub fn new(total: u64) -> Self {
+        Self { total }
     }
 
     pub fn total(&self) -> u64 {
         self.total
-    }
-
-    pub fn used(&self) -> u64 {
-        self.total - self.free
-    }
-
-    pub fn free(&self) -> u64 {
-        self.free
     }
 }

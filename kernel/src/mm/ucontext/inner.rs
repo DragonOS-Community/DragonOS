@@ -1,0 +1,572 @@
+use super::*;
+
+#[derive(Debug)]
+pub struct InnerAddressSpace {
+    pub(super) mm_id: u64,
+    pub user_mapper: UserMapper,
+    pub mappings: UserMappings,
+    /// Number of locked user pages, in page units.
+    pub locked_vm: usize,
+    /// Flags inherited by future mappings after mlockall(MCL_FUTURE).
+    pub mlock_future: VmFlags,
+    pub mmap_min: VirtAddr,
+    /// User stack information struct
+    pub user_stack: Option<UserStack>,
+    /// Kernel-provided rt_sigreturn entry; inherited with its ordinary RX VMA.
+    #[cfg(target_arch = "riscv64")]
+    pub(crate) signal_trampoline: Option<VirtAddr>,
+    /// Main image ownership, released at last mm user teardown. Tuple elements
+    /// drop in order: release deny-write before the File and its mount pin,
+    /// matching Linux's allow_write_access() before fput().
+    pub(crate) exec_write_guard: Option<(
+        Arc<crate::filesystem::vfs::write_access::InodeWriteGuard>,
+        Arc<crate::filesystem::vfs::file::File>,
+    )>,
+
+    pub elf_brk_start: VirtAddr,
+    pub elf_brk: VirtAddr,
+
+    /// Start address of the current process's heap
+    pub brk_start: VirtAddr,
+    /// End address of the current process's heap (exclusive)
+    pub brk: VirtAddr,
+
+    pub start_code: VirtAddr,
+    pub end_code: VirtAddr,
+    pub start_data: VirtAddr,
+    pub end_data: VirtAddr,
+
+    /// Weak reference back to the outer `AddressSpace`.
+    ///
+    /// Back-filled by `AddressSpace::new` after constructing the Arc; used by internal
+    /// `munmap`/`mprotect`/... to obtain `Arc<AddressSpace>` for constructing `MmuGather`
+    /// and initiating TLB shootdown.
+    pub(super) outer: Weak<AddressSpace>,
+}
+
+impl InnerAddressSpace {
+    /// Virtual bytes admitted by this mm, including in-flight mmap reservations.
+    pub fn vma_usage_bytes(&self) -> usize {
+        self.mappings.usage_bytes()
+    }
+
+    pub(crate) fn new(
+        _create_stack: bool,
+        creator: Option<&Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        let result = Self {
+            mm_id: 0,
+            user_mapper: MMArch::setup_new_usermapper(creator)?,
+            mappings: UserMappings::new(),
+            locked_vm: 0,
+            mlock_future: VmFlags::VM_NONE,
+            mmap_min: VirtAddr(DEFAULT_MMAP_MIN_ADDR),
+            elf_brk_start: VirtAddr::new(0),
+            elf_brk: VirtAddr::new(0),
+            brk_start: MMArch::USER_BRK_START,
+            brk: MMArch::USER_BRK_START,
+            user_stack: None,
+            #[cfg(target_arch = "riscv64")]
+            signal_trampoline: None,
+            exec_write_guard: None,
+            start_code: VirtAddr(0),
+            end_code: VirtAddr(0),
+            start_data: VirtAddr(0),
+            end_data: VirtAddr(0),
+            outer: Weak::new(),
+        };
+
+        return Ok(result);
+    }
+
+    /// Attempt to clone the current address space, including all its mappings
+    ///
+    /// # Returns
+    ///
+    /// Returns an Arc pointer to the new cloned address space
+    #[inline(never)]
+    pub(crate) fn clone_into(
+        &mut self,
+        new_addr_space: &Arc<AddressSpace>,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if self.mappings.first_reservation_region().is_some() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+        }
+
+        let parent_mm = self
+            .outer
+            .upgrade()
+            .expect("InnerAddressSpace::try_clone called before AddressSpace::new finished");
+        let mut new_guard = new_addr_space.write();
+
+        // The parent mm may be shared by multiple threads (CLONE_VM / CLONE_THREAD), meaning threads running on other CPUs
+        // may still have writable TLB entries cached in the parent page tables. When COW write-protects the parent PTEs below,
+        // an mm-aware TLB shootdown is required: a local invlpg alone would still allow remote CPUs to write through stale writable TLB entries,
+        // breaking COW semantics (residual risk 4). Here we use MmuGather to accumulate the full rewritten range;
+        // after the loop, tlb.finish() triggers flush_tlb_mm_range to synchronously shoot down all active CPUs of the parent mm.
+        let mut parent_tlb = MmuGather::gather(&parent_mm);
+
+        // Only copy the user stack's structural info (metadata); actual user stack page content is handled in the VMA loop below
+        unsafe {
+            new_guard.user_stack = Some(self.user_stack.as_ref().unwrap().clone_info_only());
+        }
+
+        // Keep the fresh child's full free range. insert_vma below derives
+        // holes from the VMAs actually inherited; copying the parent's holes
+        // would leave VM_DONTCOPY ranges falsely occupied in the child.
+
+        // Copy other address space attributes
+        new_guard.brk = self.brk;
+        new_guard.brk_start = self.brk_start;
+        new_guard.mmap_min = self.mmap_min;
+        new_guard.elf_brk = self.elf_brk;
+        new_guard.elf_brk_start = self.elf_brk_start;
+        new_guard.start_code = self.start_code;
+        new_guard.end_code = self.end_code;
+        new_guard.start_data = self.start_data;
+        new_guard.end_data = self.end_data;
+        new_guard.exec_write_guard = self.exec_write_guard.clone();
+        #[cfg(target_arch = "riscv64")]
+        {
+            new_guard.signal_trampoline = self.signal_trampoline;
+        }
+
+        let mut parent_cow_remaps: Vec<(VirtAddr, EntryFlags<MMArch>)> = Vec::new();
+        let mut child_present_pages = 0usize;
+
+        let clone_result = (|| -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+            // Iterate over each VMA of the parent process and perform appropriate copying based on VMA attributes
+            // Reference Linux: https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#copy_page_range
+            for vma in self.mappings.vmas.iter() {
+                // Lock ordering: VMA lock -> page_manager -> shm_manager, to avoid deadlocks from cross-acquisition.
+                let vma_guard = vma.lock();
+
+                // VM_DONTCOPY: skip VMAs that should not be copied (e.g., those marked with MADV_DONTFORK)
+                if vma_guard.vm_flags().contains(VmFlags::VM_DONTCOPY) {
+                    drop(vma_guard);
+                    continue;
+                }
+
+                let vm_flags = *vma_guard.vm_flags();
+                let is_shared = vm_flags.contains(VmFlags::VM_SHARED);
+                let region = *vma_guard.region();
+                let page_flags = vma_guard.flags();
+                let sysv_shm = vma_guard.sysv_shm();
+                let vm_file = vma_guard.vm_file();
+
+                // Create new VMA
+                let mut child_vma = vma_guard.clone_info_only();
+                child_vma.vm_flags &= VmFlags::VM_LOCKED_CLEAR_MASK;
+                let new_vma = LockedVMA::try_new(child_vma, creator)?;
+                new_guard.mappings.insert_vma(new_vma.clone());
+                drop(vma_guard);
+
+                if let Some(sysv_shm) = sysv_shm {
+                    if let Err(err) = sysv_shm.open_vma() {
+                        if let Some(removed) = new_guard.mappings.remove_vma(&region) {
+                            removed.lock().set_mapped(false);
+                        }
+                        return Err(err.into());
+                    }
+                }
+
+                if let Some(file) = vm_file {
+                    // The VMA has already been inserted into the private child
+                    // mm, so its lifetime is owned by that complete address
+                    // space even if page-table cloning later fails. Dropping a
+                    // failed child runs normal unmap_all()/vma_close for every
+                    // installed VMA, matching Linux dup_mmap()/exit_mmap().
+                    // VmaOpenRollback is only for a local speculative VMA that
+                    // has not been transferred into any VMA collection.
+                    let _rollback = file.with_io_fs(|fs| fs.vma_open(&file, region, vm_flags));
+                }
+
+                // Apply different page copy strategies based on VMA type
+                let start_page = region.start();
+                let end_page = region.end();
+                let mut current_page = start_page;
+
+                {
+                    let _parent_pt_edit = parent_mm.page_table_edit();
+                    let old_mapper = &mut self.user_mapper.utable;
+                    let new_mapper = &mut new_guard.user_mapper.utable;
+                    let new_vma_mlocked = new_vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
+                    // COW 写保护标志与具体页无关，VMA 级一次计算。
+                    let cow_flags = page_flags.set_write(false);
+                    let mut page_manager_guard = page_manager_lock();
+
+                    while current_page < end_page {
+                        if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
+                            unsafe {
+                                if is_shared {
+                                    let child_flags = if vm_flags.contains(VmFlags::VM_PFNMAP)
+                                        || (page_manager_guard.get(&phys_addr).is_none()
+                                            && vm_flags.contains(VmFlags::VM_MIXEDMAP))
+                                    {
+                                        // Preserve the actual external PTE permission. Using
+                                        // VMA page flags here could make a deliberately RO DAX
+                                        // PFN writable in the child without pfn_mkwrite.
+                                        old_flags
+                                    } else {
+                                        page_flags
+                                    };
+                                    if new_mapper
+                                        .try_map_phys(
+                                            current_page,
+                                            phys_addr,
+                                            child_flags,
+                                            Some(creator),
+                                        )?
+                                        .is_none()
+                                    {
+                                        return Err(SystemError::ENOMEM.into());
+                                    }
+                                } else {
+                                    if old_flags.has_write() {
+                                        if let Some(flush) =
+                                            old_mapper.remap(current_page, cow_flags)
+                                        {
+                                            flush.ignore();
+                                            parent_tlb.accumulate_range(current_page);
+                                            parent_cow_remaps.push((current_page, old_flags));
+                                        }
+                                    }
+
+                                    if new_mapper
+                                        .try_map_phys(
+                                            current_page,
+                                            phys_addr,
+                                            cow_flags,
+                                            Some(creator),
+                                        )?
+                                        .is_none()
+                                    {
+                                        return Err(SystemError::ENOMEM.into());
+                                    }
+                                }
+                                if let PresentPfn::Managed(page) = LockedVMA::classify_present_pfn(
+                                    &page_manager_guard,
+                                    phys_addr,
+                                    vm_flags,
+                                ) {
+                                    page.write().insert_vma(
+                                        new_vma.clone(),
+                                        current_page,
+                                        new_vma_mlocked,
+                                    );
+                                    child_present_pages += 1;
+                                }
+                            }
+                        }
+                        current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
+                    }
+                }
+            }
+
+            // File-backed child VMAs are already present in file-rmap, so a
+            // system-wide uprobe registration can discover them as soon as
+            // this write guard is released. Reconcile inherited INT3 bytes
+            // while the child mm is still exclusively locked; otherwise a
+            // registration scan can observe an empty hit table with a stale
+            // breakpoint and reject a valid consumer.
+            #[cfg(target_arch = "x86_64")]
+            super::uprobe::fork_restore_inherited_uprobes_locked(
+                &parent_mm,
+                new_addr_space,
+                &mut new_guard,
+                data_account,
+            )?;
+            #[cfg(target_arch = "x86_64")]
+            if let Some(vaddr) = parent_mm.uret_trampoline_vaddr() {
+                new_addr_space.inherit_uret_trampoline_locked(
+                    &mut new_guard,
+                    vaddr,
+                    creator,
+                    data_account,
+                )?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = clone_result {
+            {
+                let _parent_pt_edit = parent_mm.page_table_edit();
+                let old_mapper = &mut self.user_mapper.utable;
+                for (page, flags) in parent_cow_remaps.into_iter().rev() {
+                    if let Some(flush) = unsafe { old_mapper.remap(page, flags) } {
+                        unsafe { flush.ignore() };
+                        parent_tlb.accumulate_range(page);
+                    } else {
+                        warn!("fork rollback lost expected parent PTE at {:?}", page);
+                    }
+                }
+            }
+            drop(new_guard);
+            parent_tlb.finish();
+            return Err(err);
+        }
+
+        drop(new_guard);
+        new_addr_space.account_present_pages_add(child_present_pages);
+        // Complete the parent mm's mm-aware shootdown: INV-3 requires TLB completion before continuing with subsequent logic;
+        // since no pages enter pending_pages here, this actually only triggers flush_tlb_mm_range.
+        parent_tlb.finish();
+
+        // The inherited breakpoint bytes were restored before publishing the
+        // child mm above. Replay currently enabled, permitted consumers after
+        // releasing the child lock; concurrent registry scans are idempotent
+        // under the same mm.write() serialization domain.
+        return Ok(());
+    }
+
+    /// Check if the stack can be extended
+    pub fn can_extend_stack(&self, bytes: usize) -> bool {
+        let bytes = page_align_up(bytes);
+        let stack = self.user_stack.as_ref().unwrap();
+        let Some(new_size) = stack.mapped_size.checked_add(bytes) else {
+            return false;
+        };
+        if new_size > stack.max_limit {
+            // Don't exceed the maximum stack size
+            return false;
+        }
+        return true;
+    }
+
+    /// Extend the user stack
+    /// ## Parameters
+    ///
+    /// - `bytes`: extension size
+    pub(crate) fn extend_stack(
+        &mut self,
+        mut bytes: usize,
+        creator: Option<&Arc<ObjectAccount>>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<Option<LockedPopulationRequest>, MemoryAllocationError> {
+        // log::debug!("extend user stack");
+
+        // Layout
+        // -------------- high->sp
+        // | stack pages|
+        // |------------|
+        // | stack pages|
+        // |------------|
+        // | not mapped |
+        // -------------- low
+
+        let prot_flags = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC;
+        let map_flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_GROWSDOWN;
+        bytes = page_align_up(bytes);
+        // Do not publish the larger stack size until the VMA insertion has
+        // committed. In particular, MCL_FUTURE may make map_anonymous fail its
+        // memlock accounting; advancing this metadata first would make a later
+        // stack fault believe an unmapped range existed.
+        let (extend_stack_start, new_mapped_size) = {
+            let stack = self.user_stack.as_ref().unwrap();
+            let new_mapped_size = stack
+                .mapped_size
+                .checked_add(bytes)
+                .ok_or(SystemError::ENOMEM)?;
+            (stack.stack_bottom - new_mapped_size, new_mapped_size)
+        };
+
+        self.map_anonymous(
+            extend_stack_start,
+            bytes,
+            prot_flags,
+            map_flags,
+            false,
+            false,
+            creator,
+            data_account,
+        )?;
+        self.user_stack.as_mut().unwrap().mapped_size = new_mapped_size;
+        let post_commit_population = self.mappings.contains(extend_stack_start).and_then(|vma| {
+            vma.lock()
+                .vm_flags()
+                .contains(VmFlags::VM_LOCKED)
+                .then(|| LockedPopulationRequest {
+                    region: VirtRegion::new(extend_stack_start, bytes),
+                    expected_vma: Arc::downgrade(&vma),
+                })
+        });
+        return Ok(post_commit_population);
+    }
+
+    /// Check whether this address space is the current process's address space
+    #[inline]
+    pub fn is_current(&self) -> bool {
+        return self.user_mapper.utable.is_current();
+    }
+
+    /// Obtain the outer `Arc<AddressSpace>`.
+    ///
+    /// Back-filled during `AddressSpace::new` construction; upgrade should always succeed on normal paths.
+    /// Returns `None` only in extreme scenarios (Weak not yet assigned / mm already destroyed).
+    #[inline]
+    pub fn outer_addr_space(&self) -> Option<Arc<AddressSpace>> {
+        self.outer.upgrade()
+    }
+
+    pub(super) fn has_mlock_quota() -> bool {
+        let pcb = ProcessManager::current_pcb();
+        pcb.get_rlimit(RLimitID::Memlock).rlim_cur != 0
+            || pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK)
+    }
+
+    pub(super) fn check_mlock_rlimit_for_pages(
+        &self,
+        new_pages: usize,
+        error: SystemError,
+    ) -> Result<(), SystemError> {
+        let pcb = ProcessManager::current_pcb();
+        if pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
+            return Ok(());
+        }
+
+        let total_pages = self.locked_vm.checked_add(new_pages).ok_or(error.clone())?;
+        let total_bytes = (total_pages as u128) * (MMArch::PAGE_SIZE as u128);
+        let rlimit = pcb.get_rlimit(RLimitID::Memlock).rlim_cur;
+        if total_bytes > rlimit as u128 {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn covered_vma_bytes(&self, region: VirtRegion) -> usize {
+        self.mappings
+            .conflicts(region)
+            .into_iter()
+            .filter_map(|vma| vma.lock().region().intersect(&region))
+            .fold(0usize, |total, intersection| {
+                total.saturating_add(intersection.size())
+            })
+    }
+
+    pub(super) fn mlock_fault_flags(vm_flags: VmFlags) -> Option<FaultFlags> {
+        // Linux populate_vma_page_range() write-faults only a private writable
+        // mapping. A writable shared mapping is populated with a read fault:
+        // forcing FAULT_FLAG_WRITE would call page_mkwrite(), dirty a clean
+        // file page, and can introduce an otherwise spurious writeback.
+        if vm_flags.contains(VmFlags::VM_WRITE) && !vm_flags.contains(VmFlags::VM_SHARED) {
+            Some(FaultFlags::FAULT_FLAG_WRITE)
+        } else if vm_flags.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
+            Some(FaultFlags::empty())
+        } else if vm_flags.contains(VmFlags::VM_EXEC) {
+            Some(FaultFlags::FAULT_FLAG_INSTRUCTION)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn add_present_page_mlock_ref(&mut self, addr: VirtAddr, vma: &Arc<LockedVMA>) {
+        if let Some((paddr, _)) = self.user_mapper.utable.translate(addr) {
+            let vm_flags = *vma.lock().vm_flags();
+            let mut page_manager_guard = page_manager_lock();
+            if let PresentPfn::Managed(page) =
+                LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
+            {
+                page.write().add_mlocked_vma_ref(vma);
+            }
+        }
+    }
+
+    pub(super) fn update_present_page_mlock_refs(
+        &mut self,
+        vma: &Arc<LockedVMA>,
+        start: VirtAddr,
+        end: VirtAddr,
+        old_locked: bool,
+        new_locked: bool,
+    ) {
+        if old_locked == new_locked {
+            return;
+        }
+
+        let mut vaddr = start;
+        while vaddr < end {
+            if let Some((paddr, _)) = self.user_mapper.utable.translate(vaddr) {
+                let vm_flags = *vma.lock().vm_flags();
+                let page = {
+                    let mut page_manager_guard = page_manager_lock();
+                    match LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags) {
+                        PresentPfn::Managed(page) => Some(page),
+                        PresentPfn::External => None,
+                    }
+                };
+                let Some(page) = page else {
+                    vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
+                    continue;
+                };
+                {
+                    let mut page_guard = page.write();
+                    if new_locked {
+                        page_guard.add_mlocked_vma_ref(vma);
+                    } else {
+                        page_guard.remove_mlocked_vma_ref(vma);
+                    }
+                }
+                if !new_locked {
+                    Self::remove_page_unevictable_if_unneeded(&page);
+                }
+            }
+            vaddr = VirtAddr::new(vaddr.data() + MMArch::PAGE_SIZE);
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+impl InnerAddressSpace {
+    /// Install the architecture's sigreturn entry before publishing a new image.
+    /// The ordinary RX mapping follows the mm through fork and teardown. Users
+    /// may unmap it, as with Linux's vDSO; returning there then faults in user mode.
+    pub(super) fn map_signal_trampoline(
+        &mut self,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+        data_account: &Arc<crate::cgroup::memory::MemoryAccount>,
+    ) -> Result<(), MemoryAllocationError> {
+        // addi a7, zero, __NR_rt_sigreturn; ecall. No stack or register scratch.
+        const CODE: [u32; 2] = [0x08b0_0893, 0x0000_0073];
+        const _: () = assert!(crate::arch::syscall::nr::SYS_RT_SIGRETURN == 139);
+        let hint = VirtAddr::new(
+            (MMArch::USER_END_VADDR.data() & !MMArch::PAGE_OFFSET_MASK) - MMArch::PAGE_SIZE,
+        );
+        let page = self.map_anonymous(
+            hint,
+            MMArch::PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            true,
+            true,
+            Some(creator),
+            data_account,
+        )?;
+        // The unpublished mm is exclusively locked, so its eager page cannot
+        // be unmapped while the kernel initializes the physical alias.
+        let (paddr, _) = self
+            .user_mapper
+            .utable
+            .translate(page.virt_address())
+            .ok_or(SystemError::EFAULT)?;
+        let owned_page = page_manager_lock().get(&paddr).ok_or(SystemError::EFAULT)?;
+        // Isolation also requires this mm's write lock. This fresh page has
+        // never been published, so neither Busy nor pin overflow can occur.
+        let access = owned_page
+            .try_pin_access()
+            .map_err(|_| SystemError::EFAULT)?;
+        let alias =
+            unsafe { MMArch::phys_2_virt(access.phys_address()) }.ok_or(SystemError::EFAULT)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                CODE.as_ptr().cast::<u8>(),
+                alias.as_ptr::<u8>() as *mut u8,
+                core::mem::size_of_val(&CODE),
+            );
+        }
+        self.signal_trampoline = Some(page.virt_address());
+        Ok(())
+    }
+}

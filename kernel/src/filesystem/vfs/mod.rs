@@ -1,20 +1,31 @@
 pub mod append_lock;
 pub mod fasync;
 pub mod fcntl;
+pub mod fdtable;
 pub mod file;
 pub mod flock;
+pub mod inode_lifecycle;
 pub mod iov;
 pub mod mount;
+pub mod mount_api;
 pub mod open;
 pub mod permission;
 pub mod posix_lock;
+pub(crate) mod read_buffer;
 pub mod stat;
 pub mod syscall;
 pub mod utils;
 pub mod vcore;
+pub mod write_access;
+mod write_buffer;
+pub mod writeback;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{any::Any, fmt::Debug, fmt::Display, sync::atomic::AtomicUsize};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::{
+    any::Any,
+    fmt::{Debug, Display, Write},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+};
 use derive_builder::Builder;
 use intertrait::CastFromSync;
 use mount::MountFlags;
@@ -33,15 +44,28 @@ use crate::{
         casting::DowncastArc,
         mutex::{Mutex, MutexGuard},
     },
-    mm::{fault::PageFaultMessage, VmFaultReason},
+    mm::{fault::PageFaultMessage, VirtRegion, VmFaultReason, VmFlags},
     net::socket::Socket,
     process::ProcessManager,
     syscall::user_buffer::UserBuffer,
     time::PosixTimeSpec,
 };
 
-use self::{file::FileFlags, utils::DName, vcore::generate_inode_id};
-pub use self::{file::FilePrivateData, mount::MountFS};
+pub use self::inode_lifecycle::{
+    EvictionEpoch, InodeRetentionKind, InodeRetentionState, UnlinkedFile,
+};
+pub use self::{
+    file::{
+        DelegatedWriteResult, FilePrivateData, OpenFileBehavior, PostWriteSyncPolicy,
+        WriteSyncIntent,
+    },
+    mount::MountFS,
+};
+use self::{
+    file::{FileFlags, PreopenedFile},
+    utils::DName,
+    vcore::generate_inode_id,
+};
 
 use super::page_cache::PageCache;
 
@@ -130,6 +154,447 @@ bitflags! {
     }
 }
 
+/// Metadata prepared for the post-open truncate stage of an existing file.
+///
+/// The snapshot is taken before filesystem open so atomic FUSE O_TRUNC cannot
+/// erase the information needed to report its killpriv side effect.
+#[derive(Debug, Clone)]
+pub struct OpenTruncateContext {
+    pub(crate) requested: Metadata,
+    pub(crate) mask: SetMetadataMask,
+}
+
+/// One-shot publication hook for a write-side ATTRIB stage that may commit
+/// before the subsequent data operation succeeds.
+pub struct AttribStageObserver<'a> {
+    publish: &'a mut dyn FnMut(),
+    committed: bool,
+}
+
+/// One primary write's privilege stage. `handled` prevents a second, racy
+/// post-data chmod; the observer reports an attribute commit even when the
+/// subsequent data operation fails.
+pub struct WritePrivilegeStage<'a> {
+    handled: bool,
+    attrib: AttribStageObserver<'a>,
+}
+
+/// One primary owner write, optionally overriding the normal position update.
+/// The override is produced with the data operation, before any completion or
+/// synchronization retry can observe a different owner state.
+#[derive(Debug, Clone, Copy)]
+pub struct PrimaryWriteResult {
+    pub written_len: usize,
+    pub next_position: Option<usize>,
+}
+
+impl PrimaryWriteResult {
+    pub fn new(written_len: usize) -> Self {
+        Self {
+            written_len,
+            next_position: None,
+        }
+    }
+}
+
+/// Read dispatch preserves the original userspace iterator until the actual
+/// storage owner has applied its direct-I/O admission rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIoIntent {
+    Buffered,
+    Direct,
+}
+
+/// The direct request retains alignment of the original effective input,
+/// including every iovec boundary, across stacking and materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteIoIntent {
+    Buffered,
+    Direct { input_alignment: usize },
+}
+
+impl WriteIoIntent {
+    pub(crate) fn check_alignment(
+        self,
+        offset: usize,
+        alignment: usize,
+    ) -> Result<(), SystemError> {
+        if let Self::Direct { input_alignment } = self {
+            if (offset | input_alignment) & (alignment - 1) != 0 {
+                return Err(SystemError::EINVAL);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Only internal storage publication is independent of the initiating task's
+/// regular-file RLIMIT_FSIZE. All other write admission remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAdmission {
+    User,
+    BackingStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOperation {
+    pub io: WriteIoIntent,
+    pub admission: WriteAdmission,
+}
+
+impl WriteOperation {
+    pub const USER_BUFFERED: Self = Self {
+        io: WriteIoIntent::Buffered,
+        admission: WriteAdmission::User,
+    };
+}
+
+/// Input retained only for the duration of one primary write. Native local
+/// filesystems materialize user input after privilege removal, while holding
+/// their canonical content guard but no metadata or namespace spin locks.
+#[derive(Clone, Copy)]
+pub enum PrimaryWriteSource<'a, 'b> {
+    Kernel(&'a [u8]),
+    User(
+        &'a UserBuffer<'b>,
+        &'a Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ),
+}
+
+impl PrimaryWriteSource<'_, '_> {
+    pub(crate) fn alignment(&self, len: usize) -> usize {
+        match self {
+            Self::Kernel(_) => len,
+            Self::User(input, _) => input.alignment(len),
+        }
+    }
+
+    pub fn with_buffer<T>(
+        self,
+        len: usize,
+        publish: impl FnOnce(&[u8]) -> Result<T, crate::mm::allocation::MemoryAllocationError>,
+    ) -> Result<T, crate::mm::allocation::MemoryAllocationError> {
+        match self {
+            Self::Kernel(buffer) => publish(buffer),
+            Self::User(reader, creator) => {
+                let mut buffer = write_buffer::WriteBuffer::new();
+                // A scratch batch bounds speculative allocation; it is not a
+                // write limit. Grow the legacy contiguous staging buffer only
+                // for bytes actually copied from userspace.
+                const COPY_BATCH: usize = 64 * 1024;
+                let mut scratch = write_buffer::WriteBuffer::new();
+                let scratch_len = len.min(COPY_BATCH);
+                scratch.try_reserve(creator, scratch_len)?;
+                scratch.resize(scratch_len);
+                while buffer.bytes().len() < len {
+                    let want = scratch.bytes().len().min(len - buffer.bytes().len());
+                    let copied = match reader.read_prefix_from_user(
+                        buffer.bytes().len(),
+                        &mut scratch.bytes_mut()[..want],
+                    ) {
+                        Ok(copied) => copied,
+                        Err(SystemError::EFAULT) if !buffer.bytes().is_empty() => break,
+                        Err(error) => return Err(error.into()),
+                    };
+                    // No data has been published yet. Allocation failure must
+                    // propagate, not masquerade as a committed short write.
+                    buffer.try_reserve(
+                        creator,
+                        buffer
+                            .bytes()
+                            .len()
+                            .checked_add(copied)
+                            .ok_or(SystemError::ENOMEM)?,
+                    )?;
+                    buffer.extend(&scratch.bytes()[..copied]);
+                    if copied < want {
+                        break;
+                    }
+                }
+                publish(buffer.bytes())
+            }
+        }
+    }
+
+    /// Materialize a complete owner-selected control command before invoking
+    /// its callback. Owners must apply their write limit before this call.
+    pub(crate) fn with_exact_buffer<T>(
+        self,
+        len: usize,
+        publish: impl FnOnce(&[u8]) -> Result<T, crate::mm::allocation::MemoryAllocationError>,
+    ) -> Result<T, crate::mm::allocation::MemoryAllocationError> {
+        match self {
+            Self::Kernel(buffer) => {
+                let bytes = buffer.get(..len).ok_or(SystemError::ENOBUFS)?;
+                publish(bytes)
+            }
+            Self::User(reader, creator) => {
+                let mut buffer = write_buffer::WriteBuffer::new();
+                buffer.try_reserve(creator, len)?;
+                buffer.resize(len);
+                if reader.read_prefix_from_user(0, buffer.bytes_mut())? != len {
+                    return Err(SystemError::EFAULT.into());
+                }
+                publish(buffer.bytes())
+            }
+        }
+    }
+
+    /// Native regular-file primitive: one bounded scratch buffer inside the
+    /// caller's single content transaction. Record providers keep with_buffer.
+    pub(crate) fn write_chunks(
+        self,
+        len: usize,
+        mut write: impl FnMut(
+            usize,
+            &[u8],
+        ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let Self::User(reader, creator) = self else {
+            let Self::Kernel(bytes) = self else {
+                unreachable!()
+            };
+            return write(0, &bytes[..len.min(bytes.len())]);
+        };
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut scratch = write_buffer::WriteBuffer::new();
+        scratch.try_reserve(creator, len.min(64 * 1024))?;
+        scratch.resize(len.min(64 * 1024));
+        let mut completed = 0;
+        while completed < len {
+            let want = scratch.bytes().len().min(len - completed);
+            let copied =
+                match reader.read_prefix_from_user(completed, &mut scratch.bytes_mut()[..want]) {
+                    Ok(copied) => copied,
+                    Err(SystemError::EFAULT) if completed > 0 => return Ok(completed),
+                    Err(error) => return Err(error.into()),
+                };
+            let written = match write(completed, &scratch.bytes()[..copied]) {
+                Ok(written) => written,
+                Err(_) if completed > 0 => return Ok(completed),
+                Err(error) => return Err(error),
+            };
+            assert!(written <= copied, "a primary write cannot exceed its input");
+            completed += written;
+            if written < copied || copied < want {
+                break;
+            }
+        }
+        Ok(completed)
+    }
+}
+
+impl<'a> WritePrivilegeStage<'a> {
+    pub fn new(publish: &'a mut dyn FnMut()) -> Self {
+        Self {
+            handled: false,
+            attrib: AttribStageObserver::new(publish),
+        }
+    }
+
+    pub fn handled(&self) -> bool {
+        self.handled
+    }
+
+    pub fn complete(&mut self) {
+        self.handled = true;
+    }
+
+    pub fn commit_attrib(&mut self) {
+        self.attrib.commit();
+    }
+}
+
+/// Authoritative result of removing one namespace link. Filesystems produce
+/// this while holding the lock that commits their link-count mutation; VFS
+/// consumers must not reconstruct it with a later metadata read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkRemovalOutcome {
+    StillLinked,
+    LastLink,
+}
+
+/// Canonical-inode coordinator for namespace operations which change link
+/// state. It is deliberately independent from fsnotify mark admission: a
+/// filesystem may wait for a userspace daemon while holding this lock, while
+/// adding a watch must remain able to proceed.
+#[derive(Debug)]
+pub struct LinkMutationCoordinator {
+    lock: Mutex<()>,
+    known_state: AtomicU8,
+    revision: AtomicUsize,
+}
+
+impl LinkMutationCoordinator {
+    const UNKNOWN: u8 = 0;
+    const LINKED: u8 = 1;
+    const ZERO_LINKS: u8 = 2;
+
+    pub const fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            known_state: AtomicU8::new(Self::UNKNOWN),
+            revision: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock()
+    }
+
+    pub fn revision(&self) -> usize {
+        self.snapshot().0
+    }
+
+    pub fn known_zero_links(&self) -> Option<bool> {
+        self.snapshot().1
+    }
+
+    /// Read one stable fact/revision pair. Odd revisions are the short
+    /// publication window between the fact store and its commit sequence.
+    pub fn snapshot(&self) -> (usize, Option<bool>) {
+        loop {
+            let before = self.revision.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let fact = match self.known_state.load(Ordering::Acquire) {
+                Self::LINKED => Some(false),
+                Self::ZERO_LINKS => Some(true),
+                _ => None,
+            };
+            let after = self.revision.load(Ordering::Acquire);
+            if before == after {
+                return (after, fact);
+            }
+        }
+    }
+
+    pub fn commit_removed(&self, outcome: LinkRemovalOutcome) -> usize {
+        let publishing = self.revision.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        debug_assert_ne!(publishing & 1, 0);
+        self.known_state.store(
+            match outcome {
+                LinkRemovalOutcome::StillLinked => Self::LINKED,
+                LinkRemovalOutcome::LastLink => Self::ZERO_LINKS,
+            },
+            Ordering::Release,
+        );
+        self.revision
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    }
+
+    pub fn commit_added(&self) -> usize {
+        let publishing = self.revision.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        debug_assert_ne!(publishing & 1, 0);
+        self.known_state.store(Self::LINKED, Ordering::Release);
+        self.revision
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    }
+}
+
+/// Namespace-visible effect of a successful rename.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameOutcome {
+    NoOp,
+    Exchange,
+    Moved {
+        replaced: Option<LinkRemovalOutcome>,
+    },
+}
+
+impl<'a> AttribStageObserver<'a> {
+    pub fn new(publish: &'a mut dyn FnMut()) -> Self {
+        Self {
+            publish,
+            committed: false,
+        }
+    }
+
+    pub fn commit(&mut self) {
+        debug_assert!(!self.committed, "ATTRIB stage committed more than once");
+        if !self.committed {
+            self.committed = true;
+            (self.publish)();
+        }
+    }
+}
+
+/// Merge only fields selected by `mask` into an existing metadata snapshot.
+/// Intent-only bits do not map to stored fields.
+pub fn merge_metadata_masked(target: &mut Metadata, requested: &Metadata, mask: SetMetadataMask) {
+    if mask.contains(SetMetadataMask::MODE) {
+        target.mode = requested.mode;
+    }
+    if mask.contains(SetMetadataMask::UID) {
+        target.uid = requested.uid;
+    }
+    if mask.contains(SetMetadataMask::GID) {
+        target.gid = requested.gid;
+    }
+    if mask.contains(SetMetadataMask::ATIME) {
+        target.atime = requested.atime;
+    }
+    if mask.contains(SetMetadataMask::MTIME) {
+        target.mtime = requested.mtime;
+    }
+    if mask.contains(SetMetadataMask::CTIME) {
+        target.ctime = requested.ctime;
+    }
+}
+
+/// Calculates a masked attribute update from the inode's current metadata.
+pub type MetadataUpdate<'a> =
+    dyn FnMut(&Metadata) -> Result<(Metadata, SetMetadataMask), SystemError> + 'a;
+
+/// Apply Linux relatime rules and update only the inode access time.
+///
+/// Local filesystems call this while holding the lock that protects their
+/// metadata, so the decision and the single-field update form one atomic
+/// operation with respect to chmod, chown, writes, and other timestamp updates.
+pub fn update_atime_locked(metadata: &mut Metadata, now: PosixTimeSpec, relatime: bool) -> bool {
+    if metadata.flags.contains(InodeFlags::S_NOATIME) {
+        return false;
+    }
+    if !should_update_atime(
+        metadata.atime,
+        metadata.mtime,
+        metadata.ctime,
+        now,
+        relatime,
+    ) {
+        return false;
+    }
+    metadata.atime = now;
+    true
+}
+
+/// Evaluate Linux strictatime/relatime policy from authoritative in-memory
+/// inode timestamps. Filesystems with a native inode cache can use this helper
+/// without constructing a full metadata snapshot or reading the disk inode.
+pub fn should_update_atime(
+    atime: PosixTimeSpec,
+    mtime: PosixTimeSpec,
+    ctime: PosixTimeSpec,
+    now: PosixTimeSpec,
+    relatime: bool,
+) -> bool {
+    if relatime {
+        let recent = now.tv_sec.saturating_sub(atime.tv_sec) < 24 * 60 * 60;
+        let atime_after_mtime = (atime.tv_sec, atime.tv_nsec) > (mtime.tv_sec, mtime.tv_nsec);
+        let atime_after_ctime = (atime.tv_sec, atime.tv_nsec) > (ctime.tv_sec, ctime.tv_nsec);
+        if atime_after_mtime && atime_after_ctime && recent {
+            return false;
+        }
+    }
+    atime != now
+}
+
 impl From<FileType> for InodeMode {
     fn from(val: FileType) -> Self {
         match val {
@@ -201,6 +666,32 @@ bitflags! {
         const S_VERITY = (1 << 16);
         /// 内核正在使用的文件（如cachefiles）
         const S_KERNEL_FILE = (1 << 17);
+        /// Read-only proc sysctl: write access cannot be granted by DAC capabilities.
+        const S_SYSCTL_READONLY = (1 << 18);
+        /// Linux proc sysctl DAC uses global effective IDs, not fsuid/caps.
+        const S_PROC_SYSCTL = (1 << 19);
+    }
+}
+
+bitflags! {
+    /// 指定 `set_metadata_masked()` 实际要更新的元数据字段。
+    ///
+    /// 该掩码对应 Linux `iattr::ia_valid` 中 DragonOS 当前可表达的
+    /// setattr 字段，避免将调用者读取的完整元数据快照误当成完整更新。
+    pub struct SetMetadataMask: u32 {
+        const MODE = 1 << 0;
+        const UID = 1 << 1;
+        const GID = 1 << 2;
+        const ATIME = 1 << 3;
+        const MTIME = 1 << 4;
+        /// 仅供 VFS/backing 自动维护；用户态 setattr 不能提供任意 ctime。
+        const CTIME = 1 << 5;
+        /// 时间设置来自“当前时间”请求，可由当前写权限授权。
+        const TIMES_BY_WRITE = 1 << 6;
+        /// 已授权的数据写/size change 引发的 metadata 副作用。
+        const WRITE_SIDE_EFFECT = 1 << 7;
+        /// Internal ATTR_KILL_PRIV request, independent of CAP_FSETID.
+        const KILL_PRIV = 1 << 8;
     }
 }
 
@@ -215,6 +706,20 @@ pub enum SpecialNodeData {
     BlockDevice(Arc<dyn BlockDevice>),
     /// 指向其他 inode 的引用（用于 /proc/self/fd/N 这种魔法链接）
     Reference(Arc<dyn IndexNode>),
+    /// A procfd magic link keeps the open file description alive until the
+    /// path walker has acquired its own inode operation ownership.
+    FileReference(Arc<File>),
+    /// A magic-link target that belongs to the producer's inner filesystem
+    /// and must retain that filesystem's mount projection.
+    ///
+    /// `MountFSInode` consumes this variant and wraps the raw target in an
+    /// anonymous dentry. Raw filesystem walks follow it like `Reference`.
+    MountProjectedReference {
+        target: Arc<dyn IndexNode>,
+        /// Stable identity rendered by `/proc/<pid>/fd/<fd>` for the
+        /// anonymous target (for example, `uts:[4026531838]`).
+        dname: utils::DName,
+    },
 }
 
 /* these are defined by POSIX and also present in glibc's dirent.h */
@@ -240,6 +745,20 @@ pub const DT_SOCK: u16 = 12;
 pub const DT_WHT: u16 = 14;
 #[allow(dead_code)]
 pub const DT_MAX: u16 = 16;
+
+/// Filesystem-supplied directory record used by `getdents(2)`.
+///
+/// `next_cookie` is an opaque continuation token. Filesystems backed by an
+/// external daemon must preserve that token instead of replacing it with a
+/// vector index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    /// Raw name bytes; Linux directory entries do not require UTF-8.
+    pub name: Vec<u8>,
+    pub ino: u64,
+    pub d_type: u8,
+    pub next_cookie: u64,
+}
 
 /// VFS 允许的最大符号链接跟随次数。
 ///
@@ -280,6 +799,10 @@ bitflags! {
 
 /// The pollable inode trait
 pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
+    /// Associate an owner notification route independent of O_ASYNC. Most
+    /// inodes only use fasync; TCP also needs this weak route for SIGURG.
+    fn set_owner_file(&self, _file: alloc::sync::Weak<file::File>) {}
+
     /// Return the poll status of the inode
     fn poll(&self, private_data: &FilePrivateData) -> Result<usize, SystemError>;
     /// Add an epoll item to the inode
@@ -314,9 +837,86 @@ pub trait PollableInode: Any + Sync + Send + Debug + CastFromSync {
         // Default implementation: not supported
         Err(SystemError::ENOSYS)
     }
+
+    /// Remove fasync state during final open-file-description release.
+    fn release_fasync(
+        &self,
+        _file: &file::File,
+        _private_data: &FilePrivateData,
+    ) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+}
+
+/// Linux's maximum byte count for a single read/write operation.
+pub(crate) const MAX_RW_COUNT: usize = (i32::MAX as usize)
+    & !(<crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE - 1);
+
+/// Userspace read dispatch: legacy `.read` is called per iovec, whereas
+/// `.read_iter` owns the whole logical buffer and its consumption boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserReadMode {
+    Buffered,
+    Scalar,
+    Iterator,
 }
 
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
+    /// Namespace-specific proc sysctl mode bits for the current credentials.
+    /// None preserves the ordinary global-root proc sysctl permission policy.
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        Ok(None)
+    }
+
+    /// Validate dynamic backing before every directory iteration, including
+    /// cached snapshots and EOF. Ordinary filesystems need no extra check.
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+    /// Optional watch-presence hint for anonymous inodes that do not pass
+    /// through MountFS object state. Implementations exposing this counter
+    /// let hot I/O paths avoid the global fsnotify index when unwatched.
+    fn fsnotify_watch_count(&self) -> Option<&AtomicUsize> {
+        None
+    }
+
+    /// Optional VFS accounting embedded by this canonical inode.
+    fn retention_state(&self) -> Option<&InodeRetentionState> {
+        None
+    }
+
+    /// Retain this canonical inode lifetime for a semantic VFS owner.
+    ///
+    /// This is deliberately distinct from `open()`: `O_PATH`, caches and
+    /// asynchronous work retain an inode without a filesystem open callback.
+    /// Admission of a new canonical lifetime must be resolved before this
+    /// infallible hook is called.
+    fn retain(&self, kind: InodeRetentionKind) -> Result<(), SystemError> {
+        if let Some(state) = self.retention_state() {
+            state.retain(kind)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release one semantic inode lifetime owner.
+    ///
+    /// Implementations must not sleep or perform fallible I/O here. The final
+    /// release may publish a one-shot eviction request for an explicit worker
+    /// or shutdown drain.
+    fn release(&self, kind: InodeRetentionKind) {
+        if self
+            .retention_state()
+            .is_some_and(|state| state.release(kind))
+        {
+            self.on_zero_retention();
+        }
+    }
+
+    /// Non-blocking final-release notification. Implementations may enqueue,
+    /// but must not execute, fallible eviction work here.
+    fn on_zero_retention(&self) {}
+
     /// 是否为"流式"文件（不可 random access / 不可 seek）。
     ///
     /// 语义目标：把"pread/pwrite/lseek 应返回 ESPIPE"的判定收敛在 VFS 层，
@@ -330,6 +930,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
             // 元数据都拿不到时，保守起见按不可 seek 处理，避免误放行 pread/pwrite。
             Err(_) => true,
         }
+    }
+
+    /// Return the stable filesystem owner used to identify this inode's
+    /// atomic-append lock domain.
+    ///
+    /// Anonymous and protocol-style inodes default to no append lock: their
+    /// writes do not use regular-file offsets and some do not belong to a
+    /// mountable filesystem at all. Inodes implementing ordinary persistent
+    /// file semantics must opt in with their canonical filesystem instance.
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        None
     }
 
     /// 是否支持 seek（lseek）。
@@ -349,6 +960,27 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         }
     }
 
+    /// Optional filesystem-owned seek. Called under the file position lock.
+    /// A handler may update position even on error (seq_lseek resets it after
+    /// a failed traversal). None leaves position unchanged and selects the
+    /// generic VFS implementation. This hook must not call File::lseek again.
+    fn seek(
+        &self,
+        _position: &mut usize,
+        _origin: &crate::driver::base::block::SeekFrom,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        None
+    }
+
+    /// Linux `noop_llseek`: ignore offset/whence and return the current f_pos.
+    ///
+    /// This is distinct from random-access support. Anonymous stream-like
+    /// files such as timerfd may opt in while still rejecting pread/pwrite.
+    fn has_noop_llseek(&self) -> bool {
+        false
+    }
+
     /// 是否允许 pread（随机读，不推进文件偏移）。
     ///
     /// 默认：对 stream 文件返回 false；对非 stream 默认允许。
@@ -362,8 +994,144 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         !self.is_stream()
     }
 
+    /// Complete the truncate stage following a successful open of an existing
+    /// regular file. Filesystems may consume an atomic-open result, but VFS
+    /// remains the owner of the common OPEN -> truncate ordering.
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &OpenTruncateContext,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.resize_file_with_metadata(len, lock_owner, data, &context.requested, context.mask)
+    }
+
+    fn resize_open_truncate_with_inode_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        truncate: &OpenTruncateContext,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.resize_open_truncate(len, lock_owner, data, truncate)
+            .map(|_| truncate.mask)
+    }
+
+    fn resize_open_truncate_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        context: &OpenTruncateContext,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        self.resize_open_truncate(len, lock_owner, data, context)?;
+        Ok(context.mask)
+    }
+
     fn mmap(&self, _start: usize, _len: usize, _offset: usize) -> Result<(), SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    fn check_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        _len: usize,
+        _offset: usize,
+        _vm_flags: VmFlags,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        Ok(())
+    }
+
+    /// Allow a filesystem to add internal VMA flags after VFS permission
+    /// checks derived the user-visible protection and sharing flags.
+    /// Whether this inode actually uses direct-access file contents.
+    fn is_dax(&self) -> bool {
+        false
+    }
+
+    /// Obtain one immutable external page already authorized by a file PTE.
+    /// Called under MM/PT locks: implementations must not wait for metadata
+    /// or I/O. The returned exact-page range owns its backing resource.
+    /// `file_offset` is a page-aligned byte offset, not a page index.
+    fn pin_readonly_external_page(
+        &self,
+        _file_offset: usize,
+        _expected_pfn: crate::mm::PhysAddr,
+    ) -> Result<Option<crate::driver::base::block::direct_access::DirectAccessRange>, SystemError>
+    {
+        Ok(None)
+    }
+
+    fn mmap_vm_flags(&self, _file: &Arc<File>, vm_flags: VmFlags) -> Result<VmFlags, SystemError> {
+        Ok(vm_flags)
+    }
+
+    /// Reserve a writable shared mapping before MAP_FIXED can discard an old
+    /// VMA.  The bool requests a matching `finish_mmap_prepare` on every exit.
+    fn prepare_mmap_file(
+        &self,
+        _file: &Arc<File>,
+        vm_flags: VmFlags,
+    ) -> Result<(VmFlags, bool), SystemError> {
+        Ok((vm_flags, false))
+    }
+
+    fn finish_mmap_prepare(&self) {}
+
+    fn get_seals(&self) -> Result<u32, SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    fn add_seals(&self, _seals: u32) -> Result<(), SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    /// The raw target of an anonymous file's /proc/*/fd symlink, if any.
+    fn proc_fd_link_target(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Pin an in-flight remote write after the VMA has been found but before
+    /// the address-space lock is dropped. `end_remote_write` balances true.
+    fn begin_remote_write(&self) -> bool {
+        false
+    }
+
+    fn end_remote_write(&self) {}
+
+    /// Whether mappings retaining this inode produce anonymous pages rather
+    /// than file-backed pages (Linux vma_set_anonymous). A replacement file's
+    /// inode supplies the property after mmap_file returns.
+    fn mmap_uses_anonymous_pages(&self) -> bool {
+        false
+    }
+
+    fn mmap_effective_file(
+        &self,
+        file: &Arc<File>,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
+        Ok(file.clone())
+    }
+
+    /// Run mmap admission after the originating file's access checks, outside
+    /// the address-space lock. Success returns the authoritative VMA file;
+    /// an inode may replace it with an internal backing (e.g. shmem).
+    /// The returned file receives subsequent VMA open/close notifications.
+    fn mmap_file(
+        &self,
+        file: &Arc<File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        _vm_flags: VmFlags,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
+        self.mmap(start, len, offset)?;
+        Ok(file.clone())
     }
 
     fn read_sync(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SystemError> {
@@ -382,12 +1150,27 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        Ok(())
     }
 
+    /// Select per-open mode and write-operation behavior after `open()` has
+    /// initialized private data.
+    fn configure_open_file(&self, _data: &FilePrivateData, _behavior: &mut OpenFileBehavior) {}
+
     /// @brief 关闭文件
+    ///
+    /// @return 成功：Ok()
+    ///         失败：Err(错误码)
+    fn flush_file(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        Ok(())
+    }
+
+    /// @brief 释放最后一个 open file description 引用
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
@@ -412,7 +1195,78 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError>;
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
+
+    /// Preserve one request's dispatch across stacking and concurrent F_SETFL.
+    /// Non-stacking owners keep their ordinary typed backing operation.
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: MutexGuard<FilePrivateData>,
+        _intent: ReadIoIntent,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.read_at(offset, len, buf, data)
+    }
+
+    /// Select the protected userspace read contract without taking private
+    /// data locks merely to discover the default buffered fallback.
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Buffered
+    }
+
+    /// Direct-capable owners may select whole-iterator admission without
+    /// changing the buffered or record-oriented contract of other files.
+    fn user_read_mode_with_io_intent(&self, _intent: ReadIoIntent) -> UserReadMode {
+        self.user_read_mode()
+    }
+
+    /// Whether read-vector flags follow Linux's `.read_iter` contract.
+    /// This is independent of the userspace copy strategy: a buffered proc
+    /// provider may expose a legacy `.read` ABI without a direct-user hook.
+    fn supports_read_iter_flags(&self) -> bool {
+        self.user_read_mode() != UserReadMode::Scalar
+    }
+
+    /// Whether the selected write operation follows Linux's `.write_iter`
+    /// contract. File uses this same classification for request flags and for
+    /// whole-request versus legacy per-iovec dispatch, independently of read
+    /// flags or how the owner copies userspace input. Legacy `.write` owners
+    /// override this to select the HIPRI-only vector loop.
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
+    /// Read directly into a protected userspace buffer.
+    ///
+    /// The default returns `None`, so ordinary inodes keep using the bounded
+    /// kernel-buffer path. Record-oriented streams such as inotify override
+    /// this when they must own the whole syscall boundary (including
+    /// per-record copy faults and the decision whether to wait again).
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        Ok(None)
+    }
+
+    /// Execute one user read with its original I/O intent. Legacy owners keep
+    /// their existing protected-copy hook and need no parallel implementation.
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+        _intent: ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at(offset, len, writer, data)
+    }
 
     /// @brief 在inode的指定偏移量开始，写入指定大小的数据（从buf的第0byte开始写入）
     ///
@@ -429,7 +1283,87 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError>;
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError>;
+
+    /// Consume one complete logical user request, including vector boundaries.
+    /// Owners such as pipes decide which copy units become visible. `None`
+    /// leaves the request untouched and selects the existing buffered fallback.
+    /// After publishing bytes or reserving observable slots, implementations
+    /// must not return a recoverable allocation request that replays this write.
+    fn write_user_buffer_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _source: &UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
+        Ok(None)
+    }
+
+    /// 基于打开文件上下文执行 fallocate。
+    ///
+    /// 默认不模拟预分配；只有真正支持 fallocate 语义的文件系统应覆盖此方法。
+    fn fallocate_file(
+        &self,
+        _mode: i32,
+        _offset: usize,
+        _len: usize,
+        _lock_owner: u64,
+        _attrib: &mut AttribStageObserver<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
+    }
+
+    /// Atomically commit the write-side metadata and non-shrinking size stage
+    /// used by mode-0 fallocate for the validated, nonempty byte range
+    /// `[offset, requested_end)`. Preserve this range for sparse allocation;
+    /// the resulting size is `max(old_size, requested_end)`.
+    /// Implementations that opt into the generic
+    /// resize-backed helper must serialize this with chmod and other content
+    /// mutations in their native inode lock domain.
+    fn fallocate_resize_atomic(
+        &self,
+        _offset: usize,
+        _requested_end: usize,
+        _lock_owner: u64,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
+    }
+
+    // Identity and attribute publication are independent of the established
+    // fallocate arguments and fd-private state; keep those contracts explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn fallocate_file_with_inode_context(
+        &self,
+        mode: i32,
+        offset: usize,
+        len: usize,
+        lock_owner: u64,
+        attrib: &mut AttribStageObserver<'_>,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.fallocate_file(mode, offset, len, lock_owner, attrib, data)
+    }
+
+    fn fallocate_resize_atomic_with_inode_context(
+        &self,
+        offset: usize,
+        requested_end: usize,
+        lock_owner: u64,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.fallocate_resize_atomic(offset, requested_end, lock_owner)
+    }
 
     /// # 在inode的指定偏移量开始，读取指定大小的数据，忽略PageCache
     ///
@@ -452,6 +1386,181 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Execute a write whose selected operation owns any required post-write
+    /// synchronization. Only inodes selecting `PostWriteSyncPolicy::Delegated`
+    /// may use this entry point.
+    fn write_at_with_sync(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _sync_intent: WriteSyncIntent,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
+    }
+
+    /// Primary content write with the identity of the selected mount.
+    fn write_at_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.write_at_with_privilege_stage(offset, len, buf, data, stage)
+    }
+
+    fn write_direct_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.write_direct_with_privilege_stage(offset, len, buf, data, stage)
+    }
+
+    fn write_at_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.write_at(offset, len, buf, data)
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        source.with_buffer(len, |buffer| {
+            self.write_at_with_privilege_stage(offset, len.min(buffer.len()), buffer, data, stage)
+                .map(PrimaryWriteResult::new)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_primary_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.write_primary_with_privilege_stage(offset, len, source, operation, data, stage)
+    }
+
+    fn write_direct_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<usize, SystemError> {
+        self.write_direct(offset, len, buf, data)
+    }
+
+    fn write_at_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        self.write_at_with_sync(offset, len, buf, sync, data)
+    }
+
+    // Preserve the delegated-write contract while carrying mount identity and
+    // the separately owned notification stage.
+    #[allow(clippy::too_many_arguments)]
+    fn write_at_with_sync_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.write_at_with_sync_with_privilege_stage(offset, len, buf, sync, data, stage)
+    }
+
+    /// Preserve original user input until the delegated owner has completed
+    /// its privilege transaction. Legacy owners still materialize once.
+    #[allow(clippy::too_many_arguments)]
+    fn write_primary_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        source.with_buffer(len, |buffer| {
+            self.write_at_with_sync_with_privilege_stage(
+                offset,
+                len.min(buffer.len()),
+                buffer,
+                sync,
+                data,
+                stage,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_primary_with_sync_with_inode_context(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
+        sync: WriteSyncIntent,
+        data: MutexGuard<FilePrivateData>,
+        context: &permission::InodeOpContext,
+        stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.write_primary_with_sync_with_privilege_stage(
+            offset, len, source, operation, sync, data, stage,
+        )
     }
 
     /// # 在inode的指定偏移量开始，写入指定大小的数据，忽略PageCache
@@ -486,13 +1595,104 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         return Err(SystemError::ENOSYS);
     }
 
+    /// Metadata already resident in memory for RESOLVE_CACHED path lookup.
+    /// Implementations must not start device/remote I/O; uncertainty is EAGAIN.
+    fn cached_metadata(&self) -> Result<Metadata, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// An already resident symlink target. Never fall back to read_at here.
+    fn cached_symlink_target(&self) -> Result<String, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// Creation time supported by this filesystem. A zero timestamp is valid;
+    /// default metadata values alone do not establish STATX_BTIME support.
+    fn birth_time(&self, _metadata: &Metadata) -> Option<PosixTimeSpec> {
+        None
+    }
+
+    /// Mode exposed by stat(2). Most inodes store the permission bits and
+    /// file type separately; Linux anon_inode objects deliberately report
+    /// mode 0600 without a file type and override this default.
+    fn stat_mode(&self, metadata: &Metadata) -> InodeMode {
+        metadata.mode | metadata.file_type.into()
+    }
+
+    /// Inode number exposed through stat and directory entries. Filesystems
+    /// with fixed on-disk numbers may differ from the VFS's internal inode ID.
+    fn reported_ino(&self, metadata: &Metadata) -> InodeId {
+        metadata.inode_id
+    }
+
+    /// Incarnation paired with `inode_id` for VFS cache identity.
+    ///
+    /// Filesystems which can reuse inode numbers while old dentries are still
+    /// referenced (notably FUSE) must override this with an identity that
+    /// changes whenever a new in-memory inode replaces the old one. Filesystems
+    /// without such reuse may keep zero.
+    fn inode_generation(&self) -> u64 {
+        0
+    }
+
+    /// Stable coordinator shared by every alias of this canonical inode.
+    ///
+    /// Any filesystem which can create hard links, relink a zero-link inode,
+    /// or report `StillLinked` from unlink/rename must override this method.
+    /// Single-edge pseudo filesystems may keep the default.
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        None
+    }
+
     /// @brief 设置inode的元数据
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn set_metadata(&self, _metadata: &Metadata) -> Result<(), SystemError> {
+    fn set_metadata(
+        &self,
+        _metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
+    }
+
+    /// 仅更新 `mask` 指定的元数据字段。
+    ///
+    /// 旧文件系统默认回退到完整 metadata 更新，以保持现有实现兼容；需要在
+    /// copy-up 等并发边界精确保留未请求字段的堆叠文件系统应覆盖此方法。
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        self.set_metadata(metadata)
+    }
+
+    /// Compute and apply an attribute change from the current inode state.
+    ///
+    /// Filesystems with a shared, mutable inode can override this to keep
+    /// permission checks and the masked update under their metadata lock.
+    /// The default retains the existing VFS behavior and setter checks.
+    fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        let current = self.metadata()?;
+        let (requested, mask) = update(&current)?;
+        self.set_metadata_masked(&requested, mask)?;
+        Ok(mask)
+    }
+
+    /// Atomically evaluate atime policy and update only atime.
+    ///
+    /// Pseudo filesystems that do not maintain access timestamps may keep the
+    /// no-op default. Mutable local and protocol filesystems must override this
+    /// instead of feeding a lockless full metadata snapshot to `set_metadata`.
+    fn update_atime(&self, _now: PosixTimeSpec, _relatime: bool) -> Result<(), SystemError> {
+        Ok(())
     }
 
     /// @brief 重新设置文件的大小
@@ -502,9 +1702,124 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
+    }
+
+    /// 基于当前 files_struct lock owner 重新设置文件大小。
+    ///
+    /// 默认回退到 inode 级 resize；需要 mandatory-locking 协议语义的文件系统
+    /// 可覆盖该方法。
+    fn resize_with_lock_owner(
+        &self,
+        len: usize,
+        _lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.resize(len)
+    }
+
+    /// 基于打开文件上下文重新设置文件大小。
+    ///
+    /// 默认回退到 inode 级 resize；需要文件句柄语义的文件系统（如 FUSE）
+    /// 可覆盖该方法，从 `FilePrivateData` 中取得 per-open 状态。
+    fn resize_file(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
+        self.resize_with_lock_owner(len, lock_owner)
+    }
+
+    /// Atomically apply a size change and its VFS-computed metadata side
+    /// effects when the filesystem can represent them in one operation.
+    ///
+    /// Local filesystems that keep size and inode metadata separately can use
+    /// the default two-step implementation. Protocol and stacking
+    /// filesystems should override this method to preserve their transaction
+    /// and request-context semantics.
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.resize_with_lock_owner(len, lock_owner)?;
+        let mut current = self.metadata()?;
+        merge_metadata_masked(&mut current, metadata, mask);
+        self.set_metadata_masked(&current, mask)
+    }
+
+    /// File-context variant of `resize_with_metadata()`.
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.resize_file(len, lock_owner, data)?;
+        let mut current = self.metadata()?;
+        merge_metadata_masked(&mut current, metadata, mask);
+        self.set_metadata_masked(&current, mask)
+    }
+
+    fn resize_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.resize_with_metadata(len, lock_owner, metadata, mask)
+            .map(|_| mask)
+    }
+
+    fn resize_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        self.resize_with_metadata(len, lock_owner, metadata, mask)?;
+        Ok(mask)
+    }
+
+    fn resize_file_with_metadata_context(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+        context: &permission::InodeOpContext,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.resize_file_with_metadata(len, lock_owner, data, metadata, mask)
+            .map(|_| mask)
+    }
+
+    fn resize_file_with_metadata_result(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: MutexGuard<FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        self.resize_file_with_metadata(len, lock_owner, data, metadata, mask)?;
+        Ok(mask)
     }
 
     /// @brief 在当前目录下创建一个新的inode
@@ -520,9 +1835,29 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         name: &str,
         file_type: FileType,
         mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则默认调用其create_with_data方法。如果仍未实现，则会得到一个Err(-ENOSYS)的返回值
         return self.create_with_data(name, file_type, mode, 0);
+    }
+
+    /// Atomically create and open a regular file when supported by the
+    /// filesystem.  The returned guard owns the open handle until VFS builds
+    /// the corresponding open file description.
+    fn create_and_open(
+        &self,
+        _name: &str,
+        _mode: InodeMode,
+        _flags: &FileFlags,
+    ) -> Result<PreopenedFile, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::ENOSYS.into())
+    }
+
+    /// Create an unnamed regular file in this directory's filesystem.
+    ///
+    /// The inode starts with no directory entry and zero links. Filesystems
+    /// that do not implement O_TMPFILE report EOPNOTSUPP, as on Linux.
+    fn tmpfile(&self, _mode: InodeMode, _flags: &FileFlags) -> Result<UnlinkedFile, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
     }
 
     /// @brief 在当前目录下创建一个新的inode，并传入一个简单的data字段，方便进行初始化。
@@ -540,18 +1875,113 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _file_type: FileType,
         _mode: InodeMode,
         _data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 在当前目录下创建符号链接（name -> target）
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let inode = self.create_with_data(name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
         let bytes = target.as_bytes();
         let len = bytes.len();
         inode.write_at(0, len, bytes, Mutex::new(FilePrivateData::Unused).lock())?;
         Ok(inode)
+    }
+
+    /// Explicit backing creation identity. Unsupported backends must never
+    /// silently drop a nonidentity mapping; old kernel callers retain their API.
+    fn create_with_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.create(name, file_type, mode)
+    }
+
+    fn create_with_data_context(
+        &self,
+        name: &str,
+        file_type: FileType,
+        mode: InodeMode,
+        data: usize,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.create_with_data(name, file_type, mode, data)
+    }
+
+    fn mkdir_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.mkdir(name, mode)
+    }
+
+    fn symlink_with_context(
+        &self,
+        name: &str,
+        target: &str,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.symlink(name, target)
+    }
+
+    fn mknod_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        dev: DeviceNumber,
+        context: &permission::InodeOpContext,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.mknod(name, mode, dev)
+    }
+
+    fn tmpfile_with_context(
+        &self,
+        mode: InodeMode,
+        flags: &FileFlags,
+        context: &permission::InodeOpContext,
+    ) -> Result<UnlinkedFile, SystemError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        self.tmpfile(mode, flags)
+    }
+
+    fn create_and_open_with_context(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        flags: &FileFlags,
+        context: &permission::InodeOpContext,
+    ) -> Result<PreopenedFile, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::ENOSYS.into());
+        }
+        self.create_and_open(name, mode, flags)
     }
 
     /// @brief 在当前目录下，创建一个名为Name的硬链接，指向另一个IndexNode
@@ -561,9 +1991,13 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn link(
+        &self,
+        _name: &str,
+        _other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 在当前目录下，删除一个名为Name的硬链接
@@ -572,9 +2006,24 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功：Ok()
     ///         失败：Err(错误码)
-    fn unlink(&self, _name: &str) -> Result<(), SystemError> {
+    fn unlink(
+        &self,
+        _name: &str,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
+    }
+
+    /// Execute a namespace mutation as part of one layered VFS transaction.
+    /// Filesystems that delegate to mounted backing paths must propagate the
+    /// context instead of recursively acquiring the global dentry lock.
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
+        context.ensure_locked();
+        self.unlink(name)
     }
 
     /// @brief 删除文件夹
@@ -583,8 +2032,53 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// @return 成功 Ok(())
     /// @return 失败 Err(错误码)
-    fn rmdir(&self, _name: &str) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+    fn rmdir(&self, _name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::ENOSYS.into());
+    }
+
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        context.ensure_locked();
+        self.rmdir(name)
+    }
+
+    fn unlink_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &mount::DentryMutationContext<'_>,
+        context: &permission::InodeOpContext,
+    ) -> Result<LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.unlink_with_context(name, mutation)
+    }
+
+    fn link_with_inode_context(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+        context: &permission::InodeOpContext,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.link(name, other)
+    }
+
+    fn rmdir_with_inode_context(
+        &self,
+        name: &str,
+        mutation: &mount::DentryMutationContext<'_>,
+        context: &permission::InodeOpContext,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.rmdir_with_context(name, mutation)
     }
 
     /// 将指定的`old_name`子目录项移动到target目录下, 并予以`new_name`。
@@ -597,9 +2091,38 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _target: &Arc<dyn IndexNode>,
         _new_name: &str,
         _flag: RenameFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
         // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+        return Err(SystemError::ENOSYS.into());
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flag: RenameFlags,
+        context: &mount::DentryMutationContext<'_>,
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
+        context.ensure_locked();
+        self.move_to(old_name, target, new_name, flag)
+    }
+
+    /// A backend receives the mapping selected by its immediate mount wrapper,
+    /// independently of the topology mutation context shared by stacked views.
+    fn move_to_with_inode_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flag: RenameFlags,
+        mutation: &mount::DentryMutationContext<'_>,
+        context: &permission::InodeOpContext,
+    ) -> Result<RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
+        if context.is_idmapped() {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        }
+        self.move_to_with_context(old_name, target, new_name, flag, mutation)
     }
 
     /// @brief 专用于 remote 权限模型下 access(2) 的检查
@@ -616,6 +2139,25 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     fn find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
         // 若文件系统没有实现此方法，则返回"不支持"
         return Err(SystemError::ENOSYS);
+    }
+
+    /// Follow existing mount projections without triggering a new automount.
+    /// Raw backends have no mount traversal to suppress.
+    fn find_no_automount(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.find(name)
+    }
+
+    /// Lookup from an authoritative in-memory name cache without backend I/O.
+    /// A cold/uncertain entry returns EAGAIN, not ENOENT.
+    fn cached_find(&self, _name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// Look up a child by its raw directory-entry name. Filesystems whose
+    /// on-wire names are byte strings should override this method.
+    fn find_bytes(&self, name: &[u8]) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let name = core::str::from_utf8(name).map_err(|_| SystemError::EIO)?;
+        self.find(name)
     }
 
     /// @brief 根据inode号，获取子目录项的名字
@@ -654,13 +2196,25 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _cmd: u32,
         _data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        // 若文件系统没有实现此方法，则返回"不支持"
-        return Err(SystemError::ENOSYS);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        // Match Linux vfs_ioctl(): a file without an ioctl handler does not
+        // support the command. sys_ioctl translates this internal error to
+        // the userspace-visible ENOTTY.
+        Err(SystemError::ENOIOCTLCMD.into())
     }
 
     /// @brief 获取inode所在的文件系统的指针
     fn fs(&self) -> Arc<dyn FileSystem>;
+
+    /// 获取 inode 所在的文件系统；供可选文件系统能力检查，以及异步回收等
+    /// 可能与卸载并发的路径使用。
+    ///
+    /// `None` 表示 inode 天生不属于任何文件系统（例如匿名 socket），或 inode
+    /// 仅弱持有文件系统且文件系统已经销毁。默认实现仅适用于 `fs()` 始终有效、
+    /// 且 inode 强持有文件系统的实现。
+    fn try_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
 
     /// @brief 获取当前 inode 所在挂载点的挂载标志
     fn mount_flags(&self) -> MountFlags {
@@ -674,6 +2228,48 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 列出当前inode下的所有目录项的名字
     fn list(&self) -> Result<Vec<String>, SystemError> {
         Err(SystemError::ENOTDIR)
+    }
+
+    /// Return directory records already typed by the filesystem. `None` keeps
+    /// legacy filesystems on the lazy name lookup path so a small getdents
+    /// buffer does not force metadata lookup for the entire directory.
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        Ok(None)
+    }
+
+    /// Materialize typed records for callers, such as overlay merging, that
+    /// necessarily need metadata for the complete directory.
+    fn materialize_list_entries(&self) -> Result<Vec<DirectoryEntry>, SystemError> {
+        if let Some(entries) = self.list_entries()? {
+            return Ok(entries);
+        }
+        let names = self.list()?;
+        let mut entries = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
+            let entry = match name.as_str() {
+                "." => self.metadata().map(|md| (self.reported_ino(&md), md)),
+                ".." => self
+                    .parent()
+                    .and_then(|parent| parent.metadata().map(|md| (parent.reported_ino(&md), md))),
+                _ => match self.find(&name) {
+                    Ok(child) => child.metadata().map(|md| (child.reported_ino(&md), md)),
+                    Err(SystemError::ENOENT) => continue,
+                    Err(error) => return Err(error),
+                },
+            };
+            let (ino, metadata) = match entry {
+                Ok(entry) => entry,
+                Err(SystemError::ENOENT) => continue,
+                Err(error) => return Err(error),
+            };
+            entries.push(DirectoryEntry {
+                name: name.into_bytes(),
+                ino: ino.into() as u64,
+                d_type: metadata.file_type.get_file_type_num() as u8,
+                next_cookie: (index + 1) as u64,
+            });
+        }
+        Ok(entries)
     }
 
     /// # mount - 挂载文件系统
@@ -775,8 +2371,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 截断当前inode到指定的长度。如果当前文件长度小于len,则不操作。
     ///
     /// @param len 要被截断到的目标长度
-    fn truncate(&self, _len: usize) -> Result<(), SystemError> {
-        return Err(SystemError::ENOSYS);
+    fn truncate(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// @brief 将当前inode的内容同步到具体设备上
@@ -795,9 +2391,24 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         &self,
         datasync: bool,
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         let _ = datasync;
-        Err(SystemError::EINVAL)
+        Err(SystemError::EINVAL.into())
+    }
+
+    /// 基于打开文件上下文同步指定文件字节范围（end 为包含端）。
+    ///
+    /// 默认回退到 whole-file fsync；支持页缓存范围写回的文件系统应覆盖此方法，
+    /// 以匹配 Linux `vfs_fsync_range()` 在 msync/sync_file_range 场景下的范围语义。
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let _ = (start, end);
+        self.sync_file(datasync, data)
     }
 
     /// @brief 仅同步数据到磁盘（不包括元数据）
@@ -812,6 +2423,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         Ok(())
     }
 
+    /// 将 inode 元数据（size/mtime 等）写入磁盘。
+    ///
+    /// 对齐 Linux `super_operations.write_inode`：在脏页回写完成后，
+    /// 如果 inode 有脏元数据（I_DIRTY_SYNC / I_DIRTY_DATASYNC），
+    /// VFS 调用此方法将元数据持久化。
+    ///
+    /// 默认 no-op——procfs/sysfs/pipe/socket 等无磁盘元数据的 inode 不需要覆盖。
+    fn write_inode(&self, _wbc: &WritebackControl) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// ## 创建一个特殊文件节点
     /// - _filename: 文件名
     /// - _mode: 权限信息
@@ -820,8 +2442,8 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         _filename: &str,
         _mode: InodeMode,
         _dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return Err(SystemError::ENOSYS);
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::ENOSYS.into());
     }
 
     /// # mkdir - 新建名称为`name`的目录项
@@ -839,23 +2461,50 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///
     /// - `Ok(Arc<dyn IndexNode>)`: 成功时返回`name`目录项的共享引用。
     /// - `Err(SystemError)`: 出错时返回错误信息。
-    fn mkdir(&self, name: &str, mode: InodeMode) -> Result<Arc<dyn IndexNode>, SystemError> {
+    fn mkdir(
+        &self,
+        name: &str,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         match self.find(name) {
             Ok(inode) => {
                 if inode.metadata()?.file_type == FileType::Dir {
                     Ok(inode)
                 } else {
-                    Err(SystemError::EEXIST)
+                    Err(SystemError::EEXIST.into())
                 }
             }
             Err(SystemError::ENOENT) => self.create(name, FileType::Dir, mode),
-            Err(err) => Err(err),
+            Err(err) => Err(err.into()),
         }
     }
 
     /// ## 返回特殊文件的inode
     fn special_node(&self) -> Option<SpecialNodeData> {
         None
+    }
+
+    /// Filesystem-specific DAC policy. Mount and immutable checks remain in
+    /// check_inode_permission(), outside this narrowly scoped override.
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: PermissionMask,
+    ) -> Result<(), SystemError> {
+        ProcessManager::current_pcb()
+            .cred()
+            .inode_permission(metadata, mask.bits())
+    }
+
+    /// Authorize following a dynamic symlink without changing O_PATH|NOFOLLOW.
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Stable classification of a magic symlink, independent of whether its
+    /// target can still be resolved at the instant of lookup.
+    fn is_magic_link(&self) -> bool {
+        false
     }
 
     /// # dname - 返回目录名
@@ -906,33 +2555,61 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
 
     /// @brief 按文件名获取扩展属性
     ///
-    /// @param name 属性名称
+    /// @param name 非 NUL 原始字节属性名称，不要求 UTF-8
     /// @param buf 用于存储扩展属性值的缓冲区
     ///
     /// @return 成功：Ok(属性值的实际长度)
     ///         失败：Err(错误码)
-    fn getxattr(&self, _name: &str, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        log::warn!(
-            "getxattr not implemented for {}",
-            crate::libs::name::get_type_name(&self)
-        );
-        return Err(SystemError::ENOSYS);
+    fn getxattr(&self, _name: &[u8], _buf: &mut [u8]) -> Result<usize, SystemError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
 
     /// @brief 按文件名设置扩展属性
     ///
-    /// @param name 属性名称
+    /// @param name 非 NUL 原始字节属性名称，不要求 UTF-8
     /// @param buf 用于存储扩展属性值的缓冲区
     /// @param value 要设置的扩展属性值
     ///
     /// @return 成功：Ok(0)
     ///         失败：Err(错误码)
-    fn setxattr(&self, _name: &str, _value: &[u8]) -> Result<usize, SystemError> {
-        log::warn!(
-            "setxattr not implemented for {}",
-            crate::libs::name::get_type_name(&self)
-        );
-        return Err(SystemError::ENOSYS);
+    fn setxattr(
+        &self,
+        _name: &[u8],
+        _value: &[u8],
+        _flags: XattrFlags,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+
+    /// @brief 列出扩展属性名，返回实际列表长度。
+    fn listxattr(&self, _buf: &mut [u8]) -> Result<usize, SystemError> {
+        // Linux vfs_listxattr() falls back to the security label list when
+        // the inode has no list method. No labels are provided by default.
+        Ok(0)
+    }
+
+    /// @brief 删除指定扩展属性。
+    fn removexattr(
+        &self,
+        _name: &[u8],
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+    }
+
+    /// Internal privilege removal after a content/ownership mutation has been
+    /// authorized. This must not require the user's CAP_SETFCAP: it only
+    /// removes privileges, never grants them. Mount and stacked filesystems
+    /// must forward this operation without entering their user xattr API.
+    fn remove_security_privileges(
+        &self,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        match self.removexattr(b"security.capability") {
+            Ok(_)
+            | Err(crate::mm::allocation::MemoryAllocationError::System(
+                SystemError::ENODATA | SystemError::ENOSYS | SystemError::EOPNOTSUPP_OR_ENOTSUP,
+            )) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// # 将当前Inode转换为 Socket 引用
@@ -959,10 +2636,46 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     }
 }
 
+/// Lifetime of a filesystem's pre-MAP_FIXED mmap reservation.  Dropping it
+/// releases the pending writer on success, error, or a retry of address lookup.
+pub struct MmapAdmission {
+    inode: Option<Arc<dyn IndexNode>>,
+}
+
+impl MmapAdmission {
+    pub fn prepare(file: &Arc<File>, flags: VmFlags) -> Result<(VmFlags, Self), SystemError> {
+        let inode = file.inode();
+        let (flags, reserved) = inode.prepare_mmap_file(file, flags)?;
+        Ok((
+            flags,
+            Self {
+                inode: reserved.then_some(inode),
+            },
+        ))
+    }
+}
+
+impl Drop for MmapAdmission {
+    fn drop(&mut self) {
+        if let Some(inode) = self.inode.take() {
+            inode.finish_mmap_prepare();
+        }
+    }
+}
+
 impl DowncastArc for dyn IndexNode {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
         self
     }
+}
+
+enum PathWalkOutcome {
+    Found(Arc<dyn IndexNode>, Option<utils::ResolvedPath>),
+    MissingFinal {
+        ownership: Option<utils::ResolvedPath>,
+        name: String,
+        must_be_dir: bool,
+    },
 }
 
 impl dyn IndexNode {
@@ -979,14 +2692,21 @@ impl dyn IndexNode {
     /// @return Ok(Arc<dyn IndexNode>) 要寻找的目录项的inode
     /// @return Err(SystemError) 错误码
     pub fn lookup(&self, path: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        return self.lookup_follow_symlink(path, 0);
+        // This legacy directory-only lookup has never read a symlink target.
+        // Keep its System-only contract without discarding a charge identity.
+        match self.walk_path::<SystemError>(path, 0, true, None, false, None, |_, _| {
+            Err(SystemError::ELOOP)
+        })? {
+            PathWalkOutcome::Found(inode, _) => Ok(inode),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT),
+        }
     }
 
     pub fn lookup_follow_symlink(
         &self,
         path: &str,
         max_follow_times: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         return self.do_lookup_follow_symlink(path, max_follow_times, true);
     }
 
@@ -995,7 +2715,7 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         return self.do_lookup_follow_symlink(path, max_follow_times, follow_final_symlink);
     }
 
@@ -1019,37 +2739,274 @@ impl dyn IndexNode {
         path: &str,
         max_follow_times: usize,
         follow_final_symlink: bool,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if self.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            None,
+            false,
+            None,
+        )? {
+            PathWalkOutcome::Found(inode, _) => Ok(inode),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT.into()),
+        }
+    }
+
+    /// Path walk variant that transfers a mount/operation pin at every mount
+    /// transition before the newly found inode is inspected or used.
+    pub fn lookup_follow_symlink_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+    ) -> Result<utils::ResolvedPath, crate::mm::allocation::MemoryAllocationError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            false,
+            None,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE.into()),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT.into()),
+        }
+    }
+
+    /// Owned non-creating lookup with explicit walk constraints. Keep the
+    /// same mount/operation pin transfers as the ordinary owned walk.
+    pub fn lookup_follow_symlink_with_options_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        options: &utils::PathWalkOptions,
+    ) -> Result<utils::ResolvedPath, crate::mm::allocation::MemoryAllocationError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            false,
+            Some(options),
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership.ok_or(SystemError::ESTALE.into()),
+            PathWalkOutcome::MissingFinal { .. } => Err(SystemError::ENOENT.into()),
+        }
+    }
+
+    /// Resolve a path while retaining the real parent of a missing final
+    /// component after all required symlinks have been expanded.
+    pub fn lookup_follow_symlink_or_missing_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+    ) -> Result<utils::OwnedLookupOutcome, crate::mm::allocation::MemoryAllocationError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            true,
+            None,
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership
+                .map(utils::OwnedLookupOutcome::Found)
+                .ok_or(SystemError::ESTALE.into()),
+            PathWalkOutcome::MissingFinal {
+                ownership,
+                name,
+                must_be_dir,
+                ..
+            } => ownership
+                .map(|parent| utils::OwnedLookupOutcome::MissingFinal {
+                    parent,
+                    name,
+                    must_be_dir,
+                })
+                .ok_or(SystemError::ESTALE.into()),
+        }
+    }
+
+    /// Owned open lookup with openat2 restrictions applied during every step.
+    pub fn lookup_openat2_owned(
+        &self,
+        start: &utils::ResolvedPath,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        options: &utils::PathWalkOptions,
+    ) -> Result<utils::OwnedLookupOutcome, crate::mm::allocation::MemoryAllocationError> {
+        match self.do_lookup_follow_symlink_owned(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            Some(start.derive()?),
+            true,
+            Some(options),
+        )? {
+            PathWalkOutcome::Found(_, ownership) => ownership
+                .map(utils::OwnedLookupOutcome::Found)
+                .ok_or(SystemError::ESTALE.into()),
+            PathWalkOutcome::MissingFinal {
+                ownership,
+                name,
+                must_be_dir,
+                ..
+            } => ownership
+                .map(|parent| utils::OwnedLookupOutcome::MissingFinal {
+                    parent,
+                    name,
+                    must_be_dir,
+                })
+                .ok_or(SystemError::ESTALE.into()),
+        }
+    }
+
+    fn do_lookup_follow_symlink_owned(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        ownership: Option<utils::ResolvedPath>,
+        return_missing_final: bool,
+        options: Option<&utils::PathWalkOptions>,
+    ) -> Result<PathWalkOutcome, crate::mm::allocation::MemoryAllocationError> {
+        self.walk_path(
+            path,
+            max_follow_times,
+            follow_final_symlink,
+            ownership,
+            return_missing_final,
+            options,
+            |inode, content| {
+                inode.read_at(
+                    0,
+                    MAX_PATHLEN,
+                    content,
+                    Mutex::new(FilePrivateData::Unused).lock(),
+                )
+            },
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Path walk policy, retained path ownership and typed symlink reader are independent"
+    )]
+    fn walk_path<E: From<SystemError>>(
+        &self,
+        path: &str,
+        max_follow_times: usize,
+        follow_final_symlink: bool,
+        mut ownership: Option<utils::ResolvedPath>,
+        return_missing_final: bool,
+        options: Option<&utils::PathWalkOptions>,
+        mut read_symlink: impl FnMut(&Arc<dyn IndexNode>, &mut [u8]) -> Result<usize, E>,
+    ) -> Result<PathWalkOutcome, E> {
+        let cache_only = options.is_some_and(|options| {
+            options
+                .resolve
+                .contains(utils::OpenHowResolve::RESOLVE_CACHED)
+        });
+        let lookup_metadata = |inode: &Arc<dyn IndexNode>| {
+            if cache_only {
+                inode.cached_metadata()
+            } else {
+                inode.metadata()
+            }
+        };
+        let start_metadata = if cache_only {
+            self.cached_metadata()?
+        } else {
+            self.metadata()?
+        };
+        if start_metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // Linux 语义：绝对路径应当以"进程 fs root"（可被 chroot 改变）为起点
-        let process_root_inode = ProcessManager::current_pcb().fs_struct().root();
-        let trailing_slash = path.ends_with('/');
+        let fs_struct = ProcessManager::current_pcb().fs_struct();
+        let process_root_path =
+            if let Some(root) = options.and_then(|options| options.scope_root.as_ref()) {
+                Some(root.derive()?)
+            } else if ownership.is_some() {
+                Some(fs_struct.root_resolved()?)
+            } else {
+                None
+            };
+        let process_root_inode = process_root_path
+            .as_ref()
+            .map(|path| path.inode())
+            .unwrap_or_else(|| fs_struct.root());
+        // IndexNode::as_any_ref may expose a backing inode. Upcast the
+        // actual object here: the root boundary belongs to its mount wrapper.
+        let mount_walk_root = (process_root_inode.as_ref() as &dyn Any)
+            .downcast_ref::<mount::MountFSInode>()
+            .map(|inode| mount::MountWalkRoot {
+                inode,
+                reject_parent: options.is_some_and(|options| {
+                    options
+                        .resolve
+                        .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                }),
+            });
+        let mut trailing_slash = path.ends_with('/');
 
         // 处理绝对路径
         // result: 上一个被找到的inode
         // rest_path: 还没有查找的路径
         let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+            if options.is_some_and(|options| {
+                options
+                    .resolve
+                    .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+            }) {
+                return Err(SystemError::EXDEV.into());
+            }
+            if ownership.is_some() {
+                ownership = Some(
+                    process_root_path
+                        .as_ref()
+                        .ok_or(SystemError::ESTALE)?
+                        .derive()?,
+                );
+            }
             (process_root_inode.clone(), String::from(rest))
         } else {
             // 是相对路径
-            (self.find(".")?, String::from(path))
+            let start = if let Some(owner) = ownership.as_ref() {
+                owner.inode()
+            } else if let Some(mounted) = (self as &dyn Any).downcast_ref::<mount::MountFSInode>() {
+                mounted.lookup_from_resolved(".", false, false, cache_only, None)?
+            } else {
+                self.find(".")?
+            };
+            (start, String::from(path))
         };
 
         let mut symlink_follows_remaining = max_follow_times;
+        // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
+        // walk. A symlink chain must not amplify allocator work per hop.
+        let mut symlink_buffer: Option<Vec<u8>> = None;
 
         // 逐级查找文件
         while !rest_path.is_empty() {
-            // 当前这一级不是文件夹
-            if result.metadata()?.file_type != FileType::Dir {
-                return Err(SystemError::ENOTDIR);
+            // Reuse one metadata snapshot for the directory and permission
+            // checks. Uncached FUSE/virtiofs attributes otherwise require
+            // two GETATTR round trips for this path component.
+            let metadata = lookup_metadata(&result)?;
+            if metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR.into());
             }
 
             // 检查当前目录的执行权限（搜索权限）
             // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
-            let metadata = result.metadata()?;
             permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
             let name;
@@ -1070,25 +3027,82 @@ impl dyn IndexNode {
                 continue;
             }
 
-            // 进程 root 边界：当解析到进程 root 时，".." 不允许逃逸，应当停留在 root。
-            // 这对应 Linux 的路径解析语义（参照 namei.c 中对 root 的处理）。
+            // Validate a scoped cursor before parent traversal. MountFS
+            // applies the root boundary at every mount-up step, not only here.
             if name == ".." {
-                let cur_md = result.metadata()?;
-                let root_md = process_root_inode.metadata()?;
-                if cur_md.dev_id == root_md.dev_id && cur_md.inode_id == root_md.inode_id {
-                    continue;
+                if let Some(options) = options.filter(|options| options.scope_root.is_some()) {
+                    options.validate_inode(&result)?;
                 }
             }
 
-            let inode = result.find(&name)?;
-            let file_type = inode.metadata()?.file_type;
+            let has_more_components = rest_path.split('/').any(|component| !component.is_empty());
+            // Keep the current directory owner aside until we know whether
+            // this component exists.  It is both the owner returned for a
+            // missing final component and the base restored for a relative
+            // symlink target.
+            let parent_ownership = ownership.take();
+            let no_xdev = options.is_some_and(|options| {
+                options
+                    .resolve
+                    .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+            });
+            // The current mount/dentry was already selected. Only the new
+            // component may follow mounts; never re-follow an overmount on
+            // a retained dirfd, cwd, scope root, or symlink parent cursor.
+            let lookup = if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>()
+            {
+                mounted.lookup_from_resolved(
+                    &name,
+                    no_xdev,
+                    !has_more_components
+                        && !trailing_slash
+                        && options.is_some_and(|options| options.no_automount),
+                    cache_only,
+                    mount_walk_root,
+                )
+            } else if name == ".." && {
+                // Preserve the legacy non-MountFS root boundary as well.
+                let current = lookup_metadata(&result)?;
+                let root = lookup_metadata(&process_root_inode)?;
+                current.dev_id == root.dev_id && current.inode_id == root.inode_id
+            } {
+                Ok(result.clone())
+            } else if cache_only {
+                result.cached_find(&name)
+            } else if !has_more_components
+                && !trailing_slash
+                && options.is_some_and(|options| options.no_automount)
+            {
+                result.find_no_automount(&name)
+            } else {
+                result.find(&name)
+            };
+            let inode = match lookup {
+                Ok(inode) => inode,
+                Err(error)
+                    if return_missing_final
+                        && error == SystemError::ENOENT
+                        && !has_more_components =>
+                {
+                    return Ok(PathWalkOutcome::MissingFinal {
+                        ownership: parent_ownership,
+                        name,
+                        must_be_dir: trailing_slash,
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if parent_ownership.is_some() {
+                ownership = Some(utils::ResolvedPath::new(inode.clone())?);
+            }
+            let file_type = lookup_metadata(&inode)?.file_type;
             // 如果已经是路径的最后一个部分，并且不希望跟随最后的符号链接
-            if rest_path.is_empty() && !follow_final_symlink && file_type == FileType::SymLink {
+            if !has_more_components && !follow_final_symlink && file_type == FileType::SymLink {
                 // Linux 语义：若 pathname 以 '/' 结尾，则必须解析为目录，
                 // 此时即使请求"不跟随最终 symlink"，也不能返回 symlink 本身。
                 if !trailing_slash {
                     // 返回符号链接本身
-                    return Ok(inode);
+                    return Ok(PathWalkOutcome::Found(inode, ownership));
                 }
             }
 
@@ -1098,9 +3112,7 @@ impl dyn IndexNode {
                 // - symlink 位于路径中间（rest_path 非空）
                 // - 需要跟随最终 symlink（follow_final_symlink=true）
                 // - 或者 pathname 以 '/' 结尾（trailing_slash=true）
-                let need_follow = !rest_path.is_empty()
-                    || follow_final_symlink
-                    || (trailing_slash && rest_path.is_empty());
+                let need_follow = has_more_components || follow_final_symlink || trailing_slash;
 
                 // 兼容旧语义：symlink_follows_remaining==0 表示完全不跟随 symlink。
                 // 在这种模式下，如果路径解析"需要跟随"（例如 symlink 位于中间，或末尾带 '/'），
@@ -1113,7 +3125,7 @@ impl dyn IndexNode {
                 // Linux 语义：超过最大符号链接层数应返回 ELOOP。
                 // 根据上面的约定：symlink_follows_remaining==1 表示计数已耗尽，不允许再跟随。
                 if need_follow && symlink_follows_remaining == 1 {
-                    return Err(SystemError::ELOOP);
+                    return Err(SystemError::ELOOP.into());
                 }
 
                 // 若不需要跟随（理论上只可能发生在"末尾 symlink + 不跟随 + 无 trailing '/'"），
@@ -1123,35 +3135,109 @@ impl dyn IndexNode {
                     continue;
                 }
 
+                if let Some(options) = options {
+                    if options
+                        .resolve
+                        .contains(utils::OpenHowResolve::RESOLVE_NO_SYMLINKS)
+                    {
+                        return Err(SystemError::ELOOP.into());
+                    }
+                    if inode.is_magic_link() {
+                        if options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_MAGICLINKS)
+                        {
+                            return Err(SystemError::ELOOP.into());
+                        }
+                        if options.scope_root.is_some() {
+                            return Err(SystemError::EXDEV.into());
+                        }
+                    }
+                }
+
                 symlink_follows_remaining -= 1;
+
+                // Magic links can project a live file or mount and need their
+                // own nonblocking snapshot protocol. Ordinary cached symlinks
+                // only need the cached target; do not call special_node(),
+                // whose backing inode lock can wait for filesystem I/O.
+                if cache_only && inode.is_magic_link() {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
+                }
+
+                inode.check_symlink_access()?;
 
                 // 首先检查是否是"魔法链接"（如 /proc/self/fd/N）
                 // 这些链接的 readlink 返回的路径可能不可解析（如 pipe:[xxx]），
                 // 但它们有一个 special_node 指向真实的 inode
-                if let Some(SpecialNodeData::Reference(target_inode)) = inode.special_node() {
+                let special_node = if cache_only {
+                    None
+                } else {
+                    inode.special_node()
+                };
+                let magic_target = match special_node.as_ref() {
+                    Some(SpecialNodeData::Reference(target_inode))
+                    | Some(SpecialNodeData::MountProjectedReference {
+                        target: target_inode,
+                        ..
+                    }) => Some(target_inode.clone()),
+                    Some(SpecialNodeData::FileReference(file)) => Some(file.path_inode()),
+                    _ => None,
+                };
+                if let Some(target_inode) = magic_target {
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+                    }) {
+                        let source_mount = inode.clone().downcast_arc::<mount::MountFSInode>();
+                        let target_mount =
+                            target_inode.clone().downcast_arc::<mount::MountFSInode>();
+                        if !matches!((source_mount, target_mount), (Some(source), Some(target)) if Arc::ptr_eq(&source.mount_fs(), &target.mount_fs()))
+                        {
+                            return Err(SystemError::EXDEV.into());
+                        }
+                    }
+                    if ownership.is_some() {
+                        ownership = Some(utils::ResolvedPath::new(target_inode.clone())?);
+                    }
                     if rest_path.is_empty() {
-                        return Ok(target_inode);
+                        return Ok(PathWalkOutcome::Found(target_inode, ownership));
                     } else {
-                        // 将 result 设为 magic link 的目标 inode，继续迭代
                         result = target_inode;
                         continue;
                     }
                 }
 
-                let mut content = [0u8; 256];
-                // 读取符号链接
-                // TODO:We need to clarify which interfaces require private data and which do not
-                let len = inode.read_at(
-                    0,
-                    256,
-                    &mut content,
-                    Mutex::new(FilePrivateData::Unused).lock(),
-                )?;
-
-                // 将读到的数据转换为utf8字符串（先转为str，再转为String）
-                let link_path = String::from(
-                    ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
-                );
+                // Filesystems such as procfs expose dynamic symlink targets
+                // with i_size == 0, so the inode size cannot be used as the
+                // read bound. Read once into a PATH_MAX-sized buffer: some of
+                // those implementations intentionally ignore the offset and
+                // therefore cannot be consumed in chunks.
+                let link_path = if cache_only {
+                    inode.cached_symlink_target()?
+                } else {
+                    if symlink_buffer.is_none() {
+                        let mut buffer = Vec::new();
+                        buffer
+                            .try_reserve_exact(MAX_PATHLEN)
+                            .map_err(|_| SystemError::ENOMEM)?;
+                        buffer.resize(MAX_PATHLEN, 0);
+                        symlink_buffer = Some(buffer);
+                    }
+                    let content = symlink_buffer.as_mut().expect("symlink buffer initialized");
+                    // TODO:We need to clarify which interfaces require private data and which do not
+                    let len = read_symlink(&inode, content)?;
+                    if len >= MAX_PATHLEN {
+                        return Err(SystemError::ENAMETOOLONG.into());
+                    }
+                    String::from(
+                        ::core::str::from_utf8(&content[..len]).map_err(|_| SystemError::EINVAL)?,
+                    )
+                };
+                if link_path.len() >= MAX_PATHLEN {
+                    return Err(SystemError::ENAMETOOLONG.into());
+                }
 
                 // 拼接路径：将 symlink 目标 + 剩余路径组合
                 let new_path = if rest_path.is_empty() {
@@ -1159,14 +3245,48 @@ impl dyn IndexNode {
                 } else {
                     link_path + "/" + &rest_path
                 };
+                // A slash required by the unresolved suffix (for example the
+                // original `link/`) remains authoritative after expansion;
+                // the symlink target may add the same requirement as well.
+                trailing_slash |= new_path.ends_with('/');
 
                 // 处理 symlink 目标为绝对路径或相对路径
                 // 绝对路径：从进程 root 开始
                 // 相对路径：从当前 result（symlink 所在目录）开始
                 if let Some(rest) = new_path.strip_prefix('/') {
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_BENEATH)
+                    }) {
+                        return Err(SystemError::EXDEV.into());
+                    }
+                    if options.is_some_and(|options| {
+                        options
+                            .resolve
+                            .contains(utils::OpenHowResolve::RESOLVE_NO_XDEV)
+                    }) {
+                        let from = inode.clone().downcast_arc::<mount::MountFSInode>();
+                        let to = process_root_inode
+                            .clone()
+                            .downcast_arc::<mount::MountFSInode>();
+                        if !matches!((from, to), (Some(from), Some(to)) if Arc::ptr_eq(&from.mount_fs(), &to.mount_fs()))
+                        {
+                            return Err(SystemError::EXDEV.into());
+                        }
+                    }
                     result = process_root_inode.clone();
+                    if ownership.is_some() {
+                        ownership = Some(
+                            process_root_path
+                                .as_ref()
+                                .ok_or(SystemError::ESTALE)?
+                                .derive()?,
+                        );
+                    }
                     rest_path = String::from(rest);
                 } else {
+                    ownership = parent_ownership;
                     rest_path = new_path;
                 }
 
@@ -1177,11 +3297,11 @@ impl dyn IndexNode {
             result = inode;
         }
 
-        if trailing_slash && result.metadata()?.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+        if trailing_slash && lookup_metadata(&result)?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR.into());
         }
 
-        return Ok(result);
+        return Ok(PathWalkOutcome::Found(result, ownership));
     }
 }
 
@@ -1206,7 +3326,8 @@ pub struct Metadata {
     /// Inode所在的文件系统中，每个块的大小
     pub blk_size: usize,
 
-    /// Inode所占的块的数目
+    /// 实际分配的512字节扇区数，与blk_size这个I/O提示无关。
+    /// 零是合法的稀疏/inline/伪文件值，不能从size推算替代。
     pub blocks: usize,
 
     /// inode最后一次被访问的时间
@@ -1319,18 +3440,27 @@ impl SuperBlock {
 bitflags! {
     pub struct Magic: u64 {
         const DEVFS_MAGIC = 0x1373;
-        const FAT_MAGIC =  0xf2f52011;
+        // Linux UAPI: MSDOS_SUPER_MAGIC.
+        const FAT_MAGIC = 0x4d44;
         const EXT4_MAGIC = 0xef53;
         const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
+        const SYSFS_MAGIC = 0x62656572;
         const CGROUP2_SUPER_MAGIC = 0x63677270;
         const PROC_MAGIC = 0x9fa0;
         const RAMFS_MAGIC = 0x858458f6;
         const DEVPTS_MAGIC = 0x1cd1;
+        const DEBUGFS_MAGIC = 0x64626720;
+        const MQUEUE_MAGIC = 0x19800202;
         const MOUNT_MAGIC = 61267;
         const PIPEFS_MAGIC = 0x50495045;
         const EVENTFD_MAGIC = 0x45564446; // "EVDF" in ASCII
+        const INOTIFY_MAGIC = 0x494E4F54; // "INOT" in ASCII
+        const PIDFD_MAGIC = 0x50494446; // "PIDF" in ASCII
+        const ANON_INODEFS_MAGIC = 0x09041934;
+        // Linux UAPI: SOCKFS_MAGIC.
+        const SOCKFS_MAGIC = 0x534f434b;
         const OVERLAYFS_MAGIC = 0x794c7630;
     }
 }
@@ -1347,10 +3477,137 @@ pub enum FsPermissionPolicy {
     Remote,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritebackSyncMode {
+    None,
+    All,
+}
+
+bitflags! {
+    /// Flags controlling Linux extended attribute set semantics.
+    pub struct XattrFlags: i32 {
+        const CREATE = 0x1;
+        const REPLACE = 0x2;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WritebackControl {
+    pub sync_mode: WritebackSyncMode,
+    pub for_sync: bool,
+}
+
+impl WritebackControl {
+    pub const fn sync_all_for_sync() -> Self {
+        Self {
+            sync_mode: WritebackSyncMode::All,
+            for_sync: true,
+        }
+    }
+
+    pub const fn sync_none() -> Self {
+        Self {
+            sync_mode: WritebackSyncMode::None,
+            for_sync: false,
+        }
+    }
+}
+
+/// Lifetime-only request that lets a filesystem promptly submit metadata
+/// required by a bounded data-writeback wait. Dropping it ends the request.
+pub trait FileSystemSyncGuard: Send {}
+
 /// @brief 所有文件系统都应该实现的trait
 pub trait FileSystem: Any + Sync + Send + Debug {
+    /// Admit the writable backing layers before VFS enters dentry or backend
+    /// locks. The returned tokens cover the complete outer mutation, including
+    /// cleanup after a layered namespace commit.
+    fn prepare_write(&self) -> Result<Vec<mount::writer::MountWriteGuard>, SystemError> {
+        Ok(Vec::new())
+    }
+    /// Called before a synchronous PageCache wait, not after it. Backends
+    /// with accepted asynchronous metadata use this to push the relevant
+    /// batches; the PageCache range still defines the finite completion target.
+    fn begin_sync_writeback(&self) -> Option<Box<dyn FileSystemSyncGuard>> {
+        None
+    }
+
+    /// Return the stable writeback/shutdown domain for file-backed mappings.
+    /// In-memory and pseudo filesystems must explicitly return `None`.
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>>;
+
+    /// Whether `sync_fs(true)` reaches a power-loss-safe backing barrier.
+    fn supports_reliable_flush(&self) -> bool {
+        false
+    }
     /// @brief 获取当前文件系统的root inode的指针
     fn root_inode(&self) -> Arc<dyn IndexNode>;
+
+    /// Superblock flags intrinsic to this filesystem instance. Applied when a
+    /// new mount superblock state is created, independently of caller flags.
+    fn required_superblock_flags(&self) -> mount::MountFlags {
+        mount::MountFlags::empty()
+    }
+
+    /// Optional canonical state for repeated mounts of this filesystem.
+    /// A backend opting in must return the same state for its whole lifetime,
+    /// with no I/O, and recreate the backend only after final shutdown. VFS
+    /// retains ownership of mount counts, construction pins and teardown.
+    fn shared_mount_superblock_state(
+        &self,
+        _flags: MountFlags,
+    ) -> Option<Arc<mount::SuperBlockState>> {
+        None
+    }
+
+    /// Optional owner for a newly created VFS superblock. Bind mounts and
+    /// mount-namespace copies reuse the existing superblock state.
+    fn mount_owner_user_ns(
+        &self,
+    ) -> Option<Arc<crate::process::namespace::user_namespace::UserNamespace>> {
+        None
+    }
+
+    /// Per-filesystem mount view hooks. Pseudo filesystems may override these
+    /// without teaching generic inodes about mount policy.
+    fn find_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        inode.find(name)
+    }
+
+    /// Cache-only mount-view lookup. The default must not bypass view-specific
+    /// name resolution (for example sysfs network namespaces).
+    fn cached_find_in_view(
+        &self,
+        _inode: &Arc<dyn IndexNode>,
+        _name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    fn find_bytes_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+        name: &[u8],
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        inode.find_bytes(name)
+    }
+
+    fn list_in_view(&self, inode: &Arc<dyn IndexNode>) -> Result<Vec<String>, SystemError> {
+        inode.list()
+    }
+
+    fn list_entries_in_view(
+        &self,
+        inode: &Arc<dyn IndexNode>,
+    ) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        inode.list_entries()
+    }
 
     /// @brief 获取当前文件系统的信息
     fn info(&self) -> FsInfo;
@@ -1361,6 +3618,16 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     /// 对于磁盘文件系统（如 ext4、fat），需要从磁盘预读数据，应该支持 readahead
     fn support_readahead(&self) -> bool {
         true // 默认支持 readahead
+    }
+
+    /// Whether a filesystem fault must run before generic fault-around.
+    ///
+    /// Most filesystems keep the Linux-style fast path where `map_pages()`
+    /// gets the first chance to install an already cached page. Remote
+    /// filesystems that must drop MM locks and retry before doing I/O can opt
+    /// in to the opposite ordering.
+    fn fault_before_map_pages(&self) -> bool {
+        false
     }
 
     /// @brief 本函数用于实现动态转换。
@@ -1385,6 +3652,61 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         Ok(request.sb_flags & request.sb_flags_mask)
     }
 
+    /// Opt in only when all ownership-sensitive operations honor the mount's
+    /// explicit identity context; projecting stat results alone is insufficient.
+    fn supports_idmapped_mounts(&self) -> bool {
+        false
+    }
+
+    /// Native parameter parsers validate before the context stores a value.
+    /// Legacy filesystems keep deferring private-option parsing to reconfigure.
+    /// This hook must not mutate the live filesystem or acquire resources.
+    fn validate_reconfigure_parameter(
+        &self,
+        _key: &str,
+        _value: Option<&str>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Stop admitting new external inode lifetimes during final superblock
+    /// shutdown. Cache shrink and asynchronous cancellation may still publish
+    /// eviction requests after this point.
+    fn close_external_inode_admission(&self) {}
+
+    /// Release filesystem-owned dentry/inode cache retention during final
+    /// shutdown. Implementations may publish eviction requests here.
+    fn shrink_inode_cache_for_shutdown(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Stop or finish asynchronous retention producers before the eviction
+    /// queue is sealed.
+    fn quiesce_async_inode_work(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Stop filesystem-private page-cache producers before the generic
+    /// writeback domain is closed and retired.
+    fn quiesce_page_cache_producers(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Seal the eviction producer queue after cache shrink and asynchronous
+    /// work have quiesced, returning the final request epoch to drain.
+    fn seal_eviction_queue(&self) -> EvictionEpoch {
+        EvictionEpoch::EMPTY
+    }
+
+    /// Wait for all eviction requests up to `epoch` and report their errors.
+    ///
+    /// Filesystems that implement deferred eviction must also retain errors in
+    /// their persistent writeback/error sequence; this call is not a
+    /// destructive single-consumer error channel.
+    fn drain_evictions_through(&self, _epoch: EvictionEpoch) -> Result<(), SystemError> {
+        Ok(())
+    }
+
     /// VFS permission checking policy for this filesystem instance.
     ///
     /// Default is `Dac` (local Unix DAC checks).
@@ -1392,13 +3714,94 @@ pub trait FileSystem: Any + Sync + Send + Debug {
         FsPermissionPolicy::Dac
     }
 
+    /// Render the device/source field used by procfs mount exports.
+    fn proc_show_devname(&self, mount: &MountFS, out: &mut dyn Write) -> Result<(), SystemError> {
+        if let Some(source) = mount.mount_source() {
+            out.write_str(&source).map_err(|_| SystemError::EINVAL)?;
+        } else {
+            out.write_str(self.name())
+                .map_err(|_| SystemError::EINVAL)?;
+        }
+        Ok(())
+    }
+
+    /// Render extra mount options for `/proc/*/mounts` and `mountinfo`.
+    fn proc_show_mount_options(
+        &self,
+        _mount: &MountFS,
+        _out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Render the mount root field used by `/proc/*/mountinfo`.
+    fn proc_show_mountinfo_root(
+        &self,
+        mount: &MountFS,
+        out: &mut dyn Write,
+    ) -> Result<(), SystemError> {
+        let root = mount.root_path()?;
+        out.write_str(&root).map_err(|_| SystemError::EINVAL)
+    }
+
+    /// Render fs-specific stats for `/proc/*/mountstats`.
+    ///
+    /// Returns `true` if any fs-specific payload was written.
+    fn proc_show_mount_stats(
+        &self,
+        _mount: &MountFS,
+        _out: &mut dyn Write,
+    ) -> Result<bool, SystemError> {
+        Ok(false)
+    }
+
     /// Called after a filesystem is successfully unmounted.
     /// Default is no-op.
     fn on_umount(&self) {}
 
+    /// super_operations.sync_fs 在 sync() 回写脏页后调用，刷新文件系统元数据。
+    fn sync_fs(&self, wait: bool) -> Result<(), SystemError> {
+        let _ = wait;
+        Ok(())
+    }
+
     unsafe fn fault(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
         VmFaultReason::VM_FAULT_SIGBUS
     }
+
+    /// Called before a shared writable file mapping is made writable and dirty.
+    ///
+    /// Filesystems that need writeback handles, size validation, or remote
+    /// permission checks should override this hook. Returning an error fault
+    /// keeps the PTE read-only and prevents the page from being marked dirty.
+    unsafe fn page_mkwrite(&self, _pfm: &mut PageFaultMessage) -> VmFaultReason {
+        VmFaultReason::VM_FAULT_SIGBUS
+    }
+
+    fn mprotect(&self, _old_vm_flags: VmFlags, _new_vm_flags: VmFlags) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Called before a cloned or split file-backed VMA becomes visible.
+    ///
+    /// This callback is deliberately infallible and must be limited to VMA
+    /// lifetime accounting. Implementations must not access userspace, fault,
+    /// re-enter the MM, or acquire an address-space lock.
+    fn vma_open(
+        &self,
+        _file: &Arc<File>,
+        _region: VirtRegion,
+        _vm_flags: VmFlags,
+    ) -> VmaOpenRollback {
+        VmaOpenRollback::NotRequired
+    }
+
+    /// Called when a file-backed VMA range is genuinely detached from an address space.
+    ///
+    /// This is not called for VMA split/reinsert used by mprotect-like metadata
+    /// changes. Filesystems may use it to flush dirty shared mappings before
+    /// the last mapping reference disappears.
+    fn vma_close(&self, _file: &Arc<File>, _region: VirtRegion, _vm_flags: VmFlags) {}
 
     unsafe fn map_pages(
         &self,
@@ -1413,6 +3816,14 @@ pub trait FileSystem: Any + Sync + Send + Debug {
     }
 }
 
+/// Whether an infallible `vma_open` changed filesystem state that must be
+/// undone if a not-yet-visible VMA is rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmaOpenRollback {
+    NotRequired,
+    Close,
+}
+
 impl DowncastArc for dyn FileSystem {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
         self
@@ -1421,12 +3832,40 @@ impl DowncastArc for dyn FileSystem {
 
 /// # 可以被挂载的文件系统应该实现的trait
 pub trait MountableFileSystem: FileSystem {
+    /// Equivalent to Linux FS_USERNS_MOUNT; opt in only after auditing the
+    /// filesystem's superblock ownership and user-namespace invariants.
+    const SUPPORTS_USERNS_MOUNT: bool = false;
+    /// Only makers that reject unknown and malformed individual legacy
+    /// options may accept fsconfig's flag/string parameter stream.
+    const SUPPORTS_FSCONFIG_LEGACY_OPTIONS: bool = false;
+
+    /// Validate one creation parameter without retaining resources or changing
+    /// filesystem state. Makers without incremental parsers validate at CREATE.
+    fn validate_fsconfig_parameter(_key: &str, _value: Option<&str>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Let a filesystem pin resources named by an fsconfig string parameter
+    /// when the parameter is supplied, not later at CREATE. The default
+    /// retains the previous state for filesystems without pathname options.
+    fn prepare_fsconfig_string(
+        _key: &str,
+        _value: &str,
+        previous: Option<&FsconfigPreparedData>,
+        _owner: &crate::process::namespace::user_namespace::UserNamespace,
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
+        Ok(previous.cloned())
+    }
+
     fn make_mount_data(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         log::error!("This filesystem does not support make_mount_data");
-        Err(SystemError::ENOSYS)
+        Err(SystemError::ENOSYS.into())
     }
 
     fn make_fs(
@@ -1434,6 +3873,35 @@ pub trait MountableFileSystem: FileSystem {
     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
         log::error!("This filesystem does not support make_fs");
         Err(SystemError::ENOSYS)
+    }
+
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        _mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs(data)
+    }
+
+    /// New mount API keeps the creator's identity and relevant namespace
+    /// references in the fs_context.  Existing mount(2) makers retain their
+    /// behavior through these default methods.
+    fn make_mount_data_in_context(
+        raw_data: Option<&str>,
+        source: &str,
+        _context: &FsCreationContext,
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        Self::make_mount_data(raw_data, source)
+    }
+
+    fn make_fs_in_context(
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+        _context: &FsCreationContext,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Self::make_fs_with_flags(data, mount_flags)
     }
 }
 
@@ -1449,17 +3917,59 @@ pub trait MountableFileSystem: FileSystem {
 macro_rules! register_mountable_fs {
     ($fs:ident, $maker_name:ident, $fs_name:literal) => {
         impl $fs {
+            fn validate_fsconfig_parameter_bridge(
+                key: &str,
+                value: Option<&str>,
+            ) -> Result<(), SystemError> {
+                <$fs as MountableFileSystem>::validate_fsconfig_parameter(key, value)
+            }
+
+            fn prepare_fsconfig_string_bridge(
+                key: &str,
+                value: &str,
+                previous: Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                owner: &$crate::process::namespace::user_namespace::UserNamespace,
+            ) -> Result<
+                Option<$crate::filesystem::vfs::FsconfigPreparedData>,
+                $crate::mm::allocation::MemoryAllocationError,
+            > {
+                <$fs as MountableFileSystem>::prepare_fsconfig_string(key, value, previous, owner)
+            }
+
+            fn make_fs_legacy_bridge(
+                data: Option<&dyn FileSystemMakerData>,
+                mount_flags: $crate::filesystem::vfs::mount::MountFlags,
+            ) -> Result<Arc<dyn FileSystem>, SystemError> {
+                <$fs as MountableFileSystem>::make_fs_with_flags(data, mount_flags)
+            }
+
+            fn make_mount_data_legacy_bridge(
+                raw_data: Option<&str>,
+                source: &str,
+            ) -> Result<
+                Option<Arc<dyn FileSystemMakerData + 'static>>,
+                $crate::mm::allocation::MemoryAllocationError,
+            > {
+                <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+            }
+
             fn make_fs_bridge(
                 data: Option<&dyn FileSystemMakerData>,
+                mount_flags: $crate::filesystem::vfs::mount::MountFlags,
+                context: &$crate::filesystem::vfs::FsCreationContext,
             ) -> Result<Arc<dyn FileSystem>, SystemError> {
-                <$fs as MountableFileSystem>::make_fs(data)
+                <$fs as MountableFileSystem>::make_fs_in_context(data, mount_flags, context)
             }
 
             fn make_mount_data_bridge(
                 raw_data: Option<&str>,
                 source: &str,
-            ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
-                <$fs as MountableFileSystem>::make_mount_data(raw_data, source)
+                context: &$crate::filesystem::vfs::FsCreationContext,
+            ) -> Result<
+                Option<Arc<dyn FileSystemMakerData + 'static>>,
+                $crate::mm::allocation::MemoryAllocationError,
+            > {
+                <$fs as MountableFileSystem>::make_mount_data_in_context(raw_data, source, context)
             }
         }
 
@@ -1470,13 +3980,49 @@ macro_rules! register_mountable_fs {
                 &($fs::make_fs_bridge
                     as fn(
                         Option<&dyn FileSystemMakerData>,
+                        $crate::filesystem::vfs::mount::MountFlags,
+                        &$crate::filesystem::vfs::FsCreationContext,
                     ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
                 &($fs::make_mount_data_bridge
                     as fn(
                         Option<&str>,
                         &str,
-                    )
-                        -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>),
+                        &$crate::filesystem::vfs::FsCreationContext,
+                    ) -> Result<
+                        Option<Arc<dyn FileSystemMakerData + 'static>>,
+                        $crate::mm::allocation::MemoryAllocationError,
+                    >),
+                &($fs::make_fs_legacy_bridge
+                    as fn(
+                        Option<&dyn FileSystemMakerData>,
+                        $crate::filesystem::vfs::mount::MountFlags,
+                    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError>),
+                &($fs::make_mount_data_legacy_bridge
+                    as fn(
+                        Option<&str>,
+                        &str,
+                    ) -> Result<
+                        Option<Arc<dyn FileSystemMakerData + 'static>>,
+                        $crate::mm::allocation::MemoryAllocationError,
+                    >),
+                $crate::filesystem::vfs::FsconfigParameterOps {
+                    prepare_string: &($fs::prepare_fsconfig_string_bridge
+                        as fn(
+                            &str,
+                            &str,
+                            Option<&$crate::filesystem::vfs::FsconfigPreparedData>,
+                            &$crate::process::namespace::user_namespace::UserNamespace,
+                        ) -> Result<
+                            Option<$crate::filesystem::vfs::FsconfigPreparedData>,
+                            $crate::mm::allocation::MemoryAllocationError,
+                        >),
+                    validate: $fs::validate_fsconfig_parameter_bridge,
+                },
+                $crate::filesystem::vfs::FileSystemMakerCapabilities {
+                    fsconfig_legacy_options:
+                        <$fs as MountableFileSystem>::SUPPORTS_FSCONFIG_LEGACY_OPTIONS,
+                    userns_mount: <$fs as MountableFileSystem>::SUPPORTS_USERNS_MOUNT,
+                },
             );
     };
 }
@@ -1511,6 +4057,19 @@ impl Metadata {
         }
     }
 }
+/// Incremental parameter handling has two distinct stages: pure validation
+/// first, then optional resource retention for string parameters.
+pub struct FsconfigParameterOps {
+    pub prepare_string: &'static FsconfigStringPreparer,
+    pub validate: fn(&str, Option<&str>) -> Result<(), SystemError>,
+}
+
+/// Independent, audited capabilities of a registered filesystem maker.
+pub struct FileSystemMakerCapabilities {
+    pub fsconfig_legacy_options: bool,
+    pub userns_mount: bool,
+}
+
 pub struct FileSystemMaker {
     /// 文件系统的创建函数
     maker: &'static FSMakerFunction,
@@ -1518,6 +4077,10 @@ pub struct FileSystemMaker {
     name: &'static str,
     /// 用于创建挂载数据的函数
     builder: &'static MountDataBuilder,
+    legacy_maker: &'static LegacyFSMakerFunction,
+    legacy_builder: &'static LegacyMountDataBuilder,
+    fsconfig: FsconfigParameterOps,
+    capabilities: FileSystemMakerCapabilities,
 }
 
 impl FileSystemMaker {
@@ -1525,19 +4088,98 @@ impl FileSystemMaker {
         name: &'static str,
         maker: &'static FSMakerFunction,
         builder: &'static MountDataBuilder,
+        legacy_maker: &'static LegacyFSMakerFunction,
+        legacy_builder: &'static LegacyMountDataBuilder,
+        fsconfig: FsconfigParameterOps,
+        capabilities: FileSystemMakerCapabilities,
     ) -> FileSystemMaker {
         FileSystemMaker {
             maker,
             name,
             builder,
+            legacy_maker,
+            legacy_builder,
+            fsconfig,
+            capabilities,
         }
+    }
+
+    pub fn supports_fsconfig_legacy_options(&self) -> bool {
+        self.capabilities.fsconfig_legacy_options
+    }
+
+    /// Check current caller capabilities, never the fs-context's saved caps.
+    pub fn mount_capable(
+        &self,
+        owner: &Arc<crate::process::namespace::user_namespace::UserNamespace>,
+    ) -> bool {
+        use crate::process::cred::{capable, ns_capable, CAPFlags};
+        if self.capabilities.userns_mount {
+            ns_capable(owner, CAPFlags::CAP_SYS_ADMIN)
+        } else {
+            capable(CAPFlags::CAP_SYS_ADMIN)
+        }
+    }
+
+    pub fn validate_fsconfig_parameter(
+        &self,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<(), SystemError> {
+        (self.fsconfig.validate)(key, value)
+    }
+
+    pub fn prepare_fsconfig_string(
+        &self,
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+        owner: &crate::process::namespace::user_namespace::UserNamespace,
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError> {
+        (self.fsconfig.prepare_string)(key, value, previous, owner)
     }
 
     pub fn build(
         &self,
         data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+        context: &FsCreationContext,
     ) -> Result<Arc<dyn FileSystem>, SystemError> {
-        (self.maker)(data)
+        (self.maker)(data, mount_flags, context)
+    }
+
+    fn build_legacy(
+        &self,
+        data: Option<&dyn FileSystemMakerData>,
+        mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem>, SystemError> {
+        (self.legacy_maker)(data, mount_flags)
+    }
+}
+
+/// Creation identity for user mounts. The separate legacy factory remains
+/// usable by boot/internal callers before process management is ready.
+#[derive(Clone)]
+pub struct FsCreationContext {
+    pub cred: Arc<crate::process::Cred>,
+    pub pid_ns: Arc<crate::process::namespace::pid_namespace::PidNamespace>,
+    pub net_ns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    pub mnt_ns: Arc<crate::process::namespace::mnt::MntNamespace>,
+    pub cgroup_ns: Arc<crate::process::namespace::cgroup_namespace::CgroupNamespace>,
+    pub fsconfig_prepared: Option<FsconfigPreparedData>,
+}
+
+impl FsCreationContext {
+    pub fn current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        Self {
+            cred: pcb.cred(),
+            pid_ns: pcb.active_pid_ns(),
+            net_ns: ProcessManager::current_netns(),
+            mnt_ns: ProcessManager::current_mntns(),
+            cgroup_ns: pcb.nsproxy().cgroup_ns.clone(),
+            fsconfig_prepared: None,
+        }
     }
 }
 
@@ -1545,13 +4187,40 @@ pub trait FileSystemMakerData: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub type FSMakerFunction =
-    fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
-pub type MountDataBuilder =
+/// Filesystem-owned, immutable state prepared at fsconfig parameter time.
+pub type FsconfigPreparedData = Arc<dyn Any + Send + Sync>;
+pub type FsconfigStringPreparer =
     fn(
-        raw_data: Option<&str>,
-        source: &str,
-    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError>;
+        key: &str,
+        value: &str,
+        previous: Option<&FsconfigPreparedData>,
+        owner: &crate::process::namespace::user_namespace::UserNamespace,
+    ) -> Result<Option<FsconfigPreparedData>, crate::mm::allocation::MemoryAllocationError>;
+
+pub type FSMakerFunction = fn(
+    data: Option<&dyn FileSystemMakerData>,
+    mount_flags: MountFlags,
+    context: &FsCreationContext,
+) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type MountDataBuilder = fn(
+    raw_data: Option<&str>,
+    source: &str,
+    context: &FsCreationContext,
+) -> Result<
+    Option<Arc<dyn FileSystemMakerData + 'static>>,
+    crate::mm::allocation::MemoryAllocationError,
+>;
+pub type LegacyFSMakerFunction = fn(
+    data: Option<&dyn FileSystemMakerData>,
+    mount_flags: MountFlags,
+) -> Result<Arc<dyn FileSystem>, SystemError>;
+pub type LegacyMountDataBuilder = fn(
+    raw_data: Option<&str>,
+    source: &str,
+) -> Result<
+    Option<Arc<dyn FileSystemMakerData + 'static>>,
+    crate::mm::allocation::MemoryAllocationError,
+>;
 
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
@@ -1580,22 +4249,63 @@ pub fn produce_fs(
     filesystem: &str,
     data: Option<&str>,
     source: &str,
-) -> Result<Arc<dyn FileSystem>, SystemError> {
+    mount_flags: MountFlags,
+) -> Result<Arc<dyn FileSystem>, crate::mm::allocation::MemoryAllocationError> {
+    match filesystem_maker(filesystem) {
+        Some(maker) => {
+            let mount_data = (maker.legacy_builder)(data, source)?;
+            let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
+            maker
+                .build_legacy(mount_data_ref, mount_flags)
+                .map_err(Into::into)
+        }
+        None => {
+            log::error!("mismatch filesystem type : {}", filesystem);
+            Err(SystemError::ENODEV.into())
+        }
+    }
+}
+
+pub fn filesystem_maker(filesystem: &str) -> Option<&'static FileSystemMaker> {
     let canonical_filesystem = if filesystem.starts_with("fuse.") {
         "fuse"
     } else {
         filesystem
     };
 
-    match FSMAKER.iter().find(|&m| m.name == canonical_filesystem) {
+    FSMAKER.iter().find(|m| m.name == canonical_filesystem)
+}
+
+pub fn produce_fs_in_context(
+    filesystem: &str,
+    data: Option<&str>,
+    source: &str,
+    mount_flags: MountFlags,
+    context: &FsCreationContext,
+) -> Result<Arc<dyn FileSystem>, crate::mm::allocation::MemoryAllocationError> {
+    match filesystem_maker(filesystem) {
         Some(maker) => {
-            let mount_data = (maker.builder)(data, source)?;
+            // Linux sget_fc's owner invariant is a construction failure,
+            // distinct from mount_capable's retryable permission rejection.
+            if !maker.capabilities.userns_mount
+                && !Arc::ptr_eq(
+                    &context.cred.user_ns,
+                    &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+                )
+            {
+                return Err(SystemError::EPERM.into());
+            }
+            let mount_data = (maker.builder)(data, source, context)?;
             let mount_data_ref = mount_data.as_ref().map(|arc| arc.as_ref());
-            maker.build(mount_data_ref)
+            maker
+                .build(mount_data_ref, mount_flags, context)
+                .map_err(Into::into)
         }
         None => {
             log::error!("mismatch filesystem type : {}", filesystem);
-            Err(SystemError::EINVAL)
+            // Linux get_fs_type() reports ENODEV when no filesystem driver is
+            // registered for the requested type.
+            Err(SystemError::ENODEV.into())
         }
     }
 }
@@ -1642,13 +4352,13 @@ impl<'a> FilldirContext<'a> {
     /// - d_type 目录项的inode的file_type_num
     pub(crate) fn fill_dir(
         &mut self,
-        name: &str,
+        name: &[u8],
         offset: usize,
         ino: u64,
         d_type: u8,
     ) -> Result<(), SystemError> {
         let name_len = name.len();
-        let name_bytes = name.as_bytes();
+        let name_bytes = name;
 
         // 根据格式计算基础结构大小
         // linux_dirent (旧格式): d_ino(8) + d_off(8) + d_reclen(2) = 18 bytes

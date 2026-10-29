@@ -63,9 +63,7 @@ impl PciDriver for TestDriver {
         Ok(())
     }
 
-    fn remove(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
-        Ok(())
-    }
+    fn remove(&self, _device: &Arc<dyn PciDevice>) {}
 
     fn resume(&self, _device: &Arc<dyn PciDevice>) -> Result<(), system_error::SystemError> {
         Ok(())

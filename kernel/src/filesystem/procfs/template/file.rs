@@ -1,11 +1,15 @@
 use crate::libs::mutex::MutexGuard;
+use crate::syscall::user_buffer::UserBuffer;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
     filesystem::{
         procfs::{template::Common, ProcfsFilePrivateData},
         vfs::{
-            file::FileFlags, vcore::generate_inode_id, FilePrivateData, FileSystem, FileType,
-            IndexNode, InodeFlags, InodeMode, Metadata,
+            file::{FileFlags, FileMode},
+            vcore::generate_inode_id,
+            FilePrivateData, FileSystem, FileType, IndexNode, InodeFlags, InodeMode, Metadata,
+            OpenFileBehavior, PollableInode, PostWriteSyncPolicy, PrimaryWriteResult,
+            PrimaryWriteSource, SetMetadataMask, UserReadMode, WritePrivilegeStage,
         },
     },
     time::PosixTimeSpec,
@@ -34,6 +38,7 @@ impl<F: FileOps> ProcFile<F> {
         is_volatile: bool,
         mode: InodeMode,
         data: usize,
+        flags: InodeFlags,
     ) -> Arc<Self> {
         let common = {
             let metadata = Metadata {
@@ -48,7 +53,7 @@ impl<F: FileOps> ProcFile<F> {
                 btime: PosixTimeSpec::default(),
                 file_type: FileType::File,
                 mode,
-                flags: InodeFlags::empty(),
+                flags,
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -62,10 +67,109 @@ impl<F: FileOps> ProcFile<F> {
             common,
         })
     }
+
+    pub(crate) fn ops(&self) -> &F {
+        &self.inner
+    }
+}
+
+/// Apply Linux seq_open()'s historical positional-write restriction.
+pub(crate) fn configure_seq_file(behavior: &mut OpenFileBehavior) {
+    behavior.mode.remove(FileMode::FMODE_PWRITE);
+}
+
+/// Direct PID seq-file operation tables have no write method. Global proc
+/// wrappers retain CAN_WRITE even when their proc_write callback is absent.
+pub(crate) fn configure_readonly_seq_file(behavior: &mut OpenFileBehavior) {
+    configure_seq_file(behavior);
+    behavior.mode.remove(FileMode::FMODE_CAN_WRITE);
+}
+
+/// A real proc write handler, including its owner-selected position update.
+/// The global proc wrapper itself remains writable even when this is absent.
+pub type ProcWriteCallback<F> = fn(
+    &F,
+    usize,
+    usize,
+    &[u8],
+    MutexGuard<'_, FilePrivateData>,
+) -> Result<PrimaryWriteResult, SystemError>;
+
+/// Linux operation-table selection. Default and generic llseek differ for
+/// negative SEEK_DATA/HOLE positions even on zero-sized proc inodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcfsSeekKind {
+    Generic,
+    Default,
+    Seq,
 }
 
 /// FileOps trait 定义了 procfs 文件需要实现的操作
 pub trait FileOps: Sync + Send + Sized + Debug {
+    /// Selected from the real Linux operation table, not inferred from the
+    /// inode's private data or positional-write capability.
+    const SEEK_KIND: ProcfsSeekKind = ProcfsSeekKind::Generic;
+
+    fn seq_operation(
+        &self,
+        _operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        _data: &mut MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EINVAL)
+    }
+
+    fn seek(
+        &self,
+        _position: &mut usize,
+        _origin: &crate::driver::base::block::SeekFrom,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        None
+    }
+
+    /// Apply provider-specific operation capabilities after the common open
+    /// defaults have been established.
+    fn configure_open_file(&self, _data: &FilePrivateData, _behavior: &mut OpenFileBehavior) {}
+
+    /// Global seq/single and sysctl providers use Linux's iterator flags.
+    /// Providers backed by legacy proc `.read` operations override this
+    /// without changing their buffered copy implementation.
+    fn supports_read_iter_flags(&self) -> bool {
+        true
+    }
+    /// Optional direct protected read for consuming proc streams. Ordinary
+    /// seq providers retain their bounded buffered read implementation.
+    fn user_read_mode(&self) -> UserReadMode {
+        UserReadMode::Buffered
+    }
+
+    fn read_user_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        drop(data);
+        Ok(None)
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Check dynamic backing identity before exposing inode attributes.
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+    /// Ordinary proc wrappers expose legacy `.write`, including files whose
+    /// reads use iterators. Sysctl providers explicitly select iterator writes.
+    fn supports_write_iter_flags(&self) -> bool {
+        false
+    }
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        Ok(None)
+    }
     /// 从文件的指定偏移量读取数据
     ///
     /// # 参数
@@ -82,37 +186,37 @@ pub trait FileOps: Sync + Send + Sized + Debug {
         offset: usize,
         len: usize,
         buf: &mut [u8],
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError>;
-
-    /// 向文件的指定偏移量写入数据（可选，默认返回 EPERM）
-    ///
-    /// # 参数
-    /// - `offset`: 写入的起始偏移量
-    /// - `len`: 要写入的字节数
-    /// - `buf`: 包含要写入数据的缓冲区
-    /// - `data`: 文件私有数据
-    ///
-    /// # 返回值
-    /// - `Ok(usize)`: 实际写入的字节数
-    /// - `Err(SystemError)`: 错误码
-    fn write_at(
-        &self,
-        _offset: usize,
-        _len: usize,
-        _buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
+        mut data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EPERM)
+        self.seq_operation(
+            crate::filesystem::procfs::utils::ProcfsSeqOperation::Read { offset, len, buf },
+            &mut data,
+        )
+    }
+
+    /// Return the real proc handler before any userspace payload staging.
+    /// An absent callback still leaves the wrapper's CAN_WRITE capability set,
+    /// matching Linux proc_reg_write(), which returns EIO without reading buf.
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        None
     }
 
     /// 打开文件时调用，可用于按 open 时上下文初始化 procfs 私有数据
-    fn open(&self, _data: &mut MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+    fn open(
+        &self,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
         Ok(())
     }
 
     /// 返回动态 owner（用于 /proc/<pid> 等需要实时 UID/GID 的场景）
     fn owner(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Override the generated inode ID for identity-bearing pseudo files.
+    fn dynamic_inode_id(&self) -> Option<crate::filesystem::vfs::InodeId> {
         None
     }
 }
@@ -121,15 +225,159 @@ pub trait FileOps: Sync + Send + Sized + Debug {
 /// 使用 inherit_methods 宏从 common 继承通用方法
 #[inherit_methods(from = "self.common")]
 impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
+    fn seek(
+        &self,
+        position: &mut usize,
+        origin: &crate::driver::base::block::SeekFrom,
+        mut data: MutexGuard<FilePrivateData>,
+    ) -> Option<Result<(), SystemError>> {
+        use crate::driver::base::block::SeekFrom;
+        use crate::filesystem::procfs::utils::ProcfsSeqOperation;
+        if F::SEEK_KIND != ProcfsSeekKind::Seq {
+            if let Some(result) = self.inner.seek(position, origin, data) {
+                return Some(result);
+            }
+            // ProcFile::new_with_data creates size-zero pseudo inodes; writes
+            // do not change that size. Position-only operations must not call
+            // validate_inode or revive an unregistered sysctl provider.
+            return match origin {
+                SeekFrom::SeekEnd(offset) => {
+                    if *offset < 0 {
+                        Some(Err(SystemError::EINVAL))
+                    } else {
+                        *position = *offset as usize;
+                        Some(Ok(()))
+                    }
+                }
+                SeekFrom::SeekData(offset)
+                    if *offset < 0 && F::SEEK_KIND == ProcfsSeekKind::Default =>
+                {
+                    Some(Err(SystemError::EINVAL))
+                }
+                SeekFrom::SeekHole(offset)
+                    if *offset < 0 && F::SEEK_KIND == ProcfsSeekKind::Default =>
+                {
+                    *position = 0;
+                    Some(Ok(()))
+                }
+                SeekFrom::SeekData(_) | SeekFrom::SeekHole(_) => Some(Err(SystemError::ENXIO)),
+                // Reuse the VFS checked position arithmetic for SET and CUR.
+                _ => None,
+            };
+        }
+        let target = match origin {
+            SeekFrom::SeekSet(offset) => *offset,
+            SeekFrom::SeekCurrent(offset) => match (*position as i64).checked_add(*offset) {
+                Some(target) => target,
+                None => return Some(Err(SystemError::EINVAL)),
+            },
+            _ => return Some(Err(SystemError::EINVAL)),
+        };
+        if target < 0 {
+            return Some(Err(SystemError::EINVAL));
+        }
+        let target = target as usize;
+        let FilePrivateData::Procfs(pdata) = &mut *data else {
+            return Some(Err(SystemError::EINVAL));
+        };
+        // These cases do not enter the provider, even after its task died.
+        if target == pdata.seq.read_position() {
+            *position = target;
+            return Some(Ok(()));
+        }
+        if target == 0 {
+            pdata.seq.rewind();
+            *position = 0;
+            return Some(Ok(()));
+        }
+        let result = self
+            .inner
+            .seq_operation(ProcfsSeqOperation::Seek { target }, &mut data);
+        match result {
+            Ok(_) => {
+                *position = target;
+                Some(Ok(()))
+            }
+            Err(err) => {
+                // Linux seq_lseek's traversal error resets both read_pos and
+                // f_pos. Also cover provider context acquisition failures.
+                if let FilePrivateData::Procfs(pdata) = &mut *data {
+                    pdata.seq.rewind();
+                }
+                *position = 0;
+                Some(Err(err))
+            }
+        }
+    }
+
+    fn supports_read_iter_flags(&self) -> bool {
+        self.inner.supports_read_iter_flags()
+    }
+    fn supports_write_iter_flags(&self) -> bool {
+        self.inner.supports_write_iter_flags()
+    }
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        self.inner.sysctl_access_bits()
+    }
+    fn configure_open_file(&self, data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+        behavior.data_file_write_checks = false;
+        self.inner.configure_open_file(data, behavior);
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem>;
-    fn as_any_ref(&self) -> &dyn core::any::Any;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let current = self.common.metadata()?;
+        if current
+            .flags
+            .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
+            && (current.mode != metadata.mode
+                || current.uid != metadata.uid
+                || current.gid != metadata.gid)
+        {
+            return Err(SystemError::EPERM.into());
+        }
+        self.common.set_metadata(metadata).map_err(Into::into)
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if mask.is_empty() {
+            return Ok(());
+        }
+        if self
+            .common
+            .metadata()?
+            .flags
+            .intersects(InodeFlags::S_SYSCTL_READONLY | InodeFlags::S_PROC_SYSCTL)
+            && mask.intersects(SetMetadataMask::MODE | SetMetadataMask::UID | SetMetadataMask::GID)
+        {
+            return Err(SystemError::EPERM.into());
+        }
+        self.common.set_metadata(metadata).map_err(Into::into)
+    }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
-        if let Some((uid, gid)) = self.inner.owner() {
+        let owner = self.inner.owner();
+        // Capture identity before the final liveness check. A retired weak
+        // target must not turn a successful stat into default root ownership.
+        self.inner.validate_inode()?;
+        if let Some((uid, gid)) = owner {
             metadata.uid = uid;
             metadata.gid = gid;
+        }
+        if let Some(inode_id) = self.inner.dynamic_inode_id() {
+            metadata.inode_id = inode_id;
         }
         Ok(metadata)
     }
@@ -140,9 +388,28 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         len: usize,
         buf: &mut [u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        // log::info!("ProcFile read_at called");
-        self.inner.read_at(offset, len, buf, data)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.inner
+            .read_at(offset, len, buf, data)
+            .map_err(Into::into)
+    }
+
+    fn user_read_mode(&self) -> UserReadMode {
+        self.inner.user_read_mode()
+    }
+
+    fn read_user_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.inner.read_user_at(offset, len, writer, data)
+    }
+
+    fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
+        self.inner.as_pollable_inode()
     }
 
     fn write_at(
@@ -151,8 +418,28 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
         len: usize,
         buf: &[u8],
         data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.inner.write_at(offset, len, buf, data)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let callback = self.inner.write_callback().ok_or(SystemError::EIO)?;
+        callback(&self.inner, offset, len, buf, data)
+            .map(|result| result.written_len)
+            .map_err(Into::into)
+    }
+
+    fn write_primary_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        _intent: crate::filesystem::vfs::WriteOperation,
+        data: MutexGuard<FilePrivateData>,
+        _stage: &mut WritePrivilegeStage<'_>,
+    ) -> Result<PrimaryWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        // Callback admission precedes allocation and protected payload access.
+        // Numeric range and iovec metadata checks remain syscall-owned.
+        let callback = self.inner.write_callback().ok_or(SystemError::EIO)?;
+        source.with_buffer(len, |buffer| {
+            callback(&self.inner, offset, len.min(buffer.len()), buffer, data).map_err(Into::into)
+        })
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -166,18 +453,18 @@ impl<F: FileOps + 'static> IndexNode for ProcFile<F> {
     fn open(
         &self,
         mut data: MutexGuard<FilePrivateData>,
-        _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        // 设置 procfs 私有数据，使得 lseek(SEEK_END) 返回 EINVAL
+        flags: &FileFlags,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        // Each open owns its record state and provider-specific pinned context.
         *data = FilePrivateData::Procfs(ProcfsFilePrivateData::new());
-        self.inner.open(&mut data)
+        self.inner.open(&mut data, flags).map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
         return Ok(());
     }
 
-    fn resize(&self, _len: usize) -> Result<(), SystemError> {
+    fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         // Linux procfs allows O_TRUNC; treat it as a no-op for pseudo files.
         Ok(())
     }

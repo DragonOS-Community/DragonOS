@@ -1,24 +1,22 @@
-# C语言代码风格
+# C Language Code Style
 
-&emsp;&emsp;这份文档将会简要的介绍DragonOS的C语言代码风格。每个人的代码风格都各不相同，这是一件非常正常的事情。但是，对于一个开源项目的可维护性而言，我们希望制定一些代码规范，以便包括您在内的每个开发者都能在看代码的时候更加舒服。一个充斥着各种不同代码风格的项目，是难以维护的。
+This document will briefly introduce the C language code style used in DragonOS. It is completely normal for each person to have their own code style. However, for the maintainability of an open-source project, we hope to establish some code standards so that every developer, including you, can feel more comfortable when reading the code. A project filled with various code styles is difficult to maintain.
 
-&emsp;&emsp;我们在这里提出一些建议，希望您能够尽量遵循这些建议。这些建议与Linux的代码规范相似，但又略有不同。在变量命名上，DragonOS采用Linux的风格；对于缩进，DragonOS采用Microsoft风格。
+We propose some recommendations here, and we hope you will follow them as much as possible. These recommendations are similar to those of Linux, but with some differences. DragonOS uses Linux's style for variable naming; for indentation, DragonOS uses Microsoft's style.
 
+## 0. Code Formatter
 
+Before we present the following recommendations, we recommend that you use the `C/C++ Extension Pack` plugin in Visual Studio Code as a code formatter during development. These plugins provide good auto-formatting functionality, ensuring that your code's basic format meets DragonOS's requirements.
 
-## 0. 代码格式化工具
+Pressing `Ctrl+shift+I` or your set code formatting shortcut frequently while coding can help you maintain good code formatting consistently.
 
-&emsp;&emsp;在提出下面的建议之前，我们建议您在开发的时候使用Visual Studio Code的`C/C++ Extension Pack`插件作为代码格式化工具。这些插件能为您提供较好自动格式化功能，使得您的代码的基本格式符合DragonOS的要求。
+## 1. Indentation
 
-&emsp;&emsp;当您在编码时，经常性的按下`Ctrl+shift+I`或您设置的代码格式化快捷键，能帮助您始终保持良好的代码格式。
+The width of a tab is equal to 4 spaces. Code indentation is based on the tab width (usually 4 characters in most editors).
 
-## 1. 缩进
+This makes your code more readable and helps better identify the control structures in the code. This can avoid many unnecessary troubles!
 
-&emsp;&emsp;一个制表符的宽度等于4个空格。代码的缩进是按照制表符宽度(在多数编辑器上为4个字符)进行缩进的。
-
-&emsp;&emsp;这样能够使得您的代码变得更加容易阅读，也能更好的看出代码的控制结构。这样能避免很多不必要的麻烦！
-
-举个例子：在switch语句中，将switch和case放置在同一缩进级别。并且将每个case的代码往右推进一个tab。这样能让代码可读性变得更好。
+For example: In a switch statement, place the switch and case on the same indentation level. And indent each case's code by one tab to the right. This improves code readability.
 
 ```c
 switch (cmd)
@@ -38,15 +36,15 @@ default:
 }
 ```
 
-## 2. 分行
+## 2. Line Breaks
 
-&emsp;&emsp;我们建议，每行不要超过120个字符。如果超过了，除非有必要的理由，否则应当将其分为两行。
+We recommend that each line should not exceed 120 characters. If it does, unless there is a necessary reason, it should be split into two lines.
 
-&emsp;&emsp;在分行时，我们需要从被分出来的第二行开始，比第一行的起始部分向右进行一个缩进，以表明这是一个子行。使用代码格式化的快捷键能让你快速完成这件事。
+When breaking lines, we need to indent the second line by one level from the first line's starting part to indicate that it is a sub-line. Using the code formatting shortcut can quickly accomplish this.
 
-&emsp;&emsp;对于一些日志字符串而言，为了能方便的检索到他们，我们不建议对其进行分行。
+For log strings, we do not recommend breaking them into multiple lines for easier retrieval.
 
-&emsp;&emsp;对于代码的分行，请不要试图通过以下的方式将几个语句放置在同一行中，这样对于代码可读性没有任何好处：
+For code line breaks, do not try to place several statements on the same line, as this provides no benefit to code readability:
 
 ```c
 // 错误示范(1)
@@ -57,12 +55,11 @@ if(b)
     do_a(),do_b();
 ```
 
-## 3. 大括号和空格
+## 3. Braces and Spaces
 
-### 3.1 大括号
+### 3.1 Braces
 
-&emsp;&emsp;大括号的放置位置的选择是因人而异的，主要是习惯原因，而不是技术原因。我们推荐将开始括号和结束括号都放置在一个新的行首。如下所示：
-
+The placement of braces is a matter of personal preference, mainly due to habit rather than technical reasons. We recommend placing the opening and closing braces on new lines, as shown below:
 
 ```c
 while(i<10)
@@ -71,13 +68,13 @@ while(i<10)
 }
 ```
 
-&emsp;&emsp;这种规定适用于所有的代码块。
+This rule applies to all code blocks.
 
-&emsp;&emsp;这么选择的原因是，在一些编辑器上，这样放置括号，**编辑器上将会出现辅助的半透明竖线，且竖线两端均为括号**。这样能帮助开发者更好的定位代码块的层次关系。
+The reason for this choice is that, in some editors, placing the braces in this way will result in **a semi-transparent vertical line appearing in the editor, with the line ends being the braces**. This helps developers better understand the hierarchical relationships of the code blocks.
 
-下面通过一些例子来演示：
+Let's demonstrate this with some examples:
 
-&emsp;&emsp;在下面这个代码块中，我们需要注意的是，`else if`语句需要另起一行，而不是跟在上一个`}`后方。这是因为我们规定`{`必须在每行的起始位置，并且还要保持缩进级别的缘故。
+In the following code block, we need to note that the `else if` statement should be on a new line, not after the previous `}`. This is because we require `{` to be at the start of each line and maintain the indentation level.
 
 ```c
 if (*fmt == '*')
@@ -90,7 +87,7 @@ else if (is_digit(*fmt))
 }
 ```
 
-&emsp;&emsp;当循环中有多个简单的语句的时候，需要使用大括号。
+When there are multiple simple statements in a loop, braces should be used.
 
 ```c
 while (condition) 
@@ -100,59 +97,62 @@ while (condition)
 }
 ```
 
-&emsp;&emsp;当语句只有1个简单的子句时，我们不必使用大括号。
+When there is only one simple statement, we do not need to use braces.
 
 ```c
 if(a)
     return 1;
 ```
 
-### 3.2 空格
+### 3.2 Spaces
 
-&emsp;&emsp;对于大部分关键字，我们需要在其后添加空格，以提高代码的可读性。
+For most keywords, we need to add a space after them to improve code readability.
 
-&emsp;&emsp;请您在所有这些关键字后面输入一个空格：
+Please add a space after all of these keywords:
 
 ```c
 if, switch, case, for, do, while
 ```
 
-&emsp;&emsp;关键字sizeof、typeof、alignof、__atrribute__的后面则不需要添加空格，因为使用他们的时候，就像是使用函数一样。
+Keywords such as sizeof, typeof, alignof, and __attribute__ do not require a space after them, as they are used like functions.
 
+For pointer-type variables, the asterisk should be close to the variable name rather than the type name. As shown below:
 
-&emsp;&emsp;对于指针类型的变量，`*`号要贴近变量名而不是贴近类型名。如下所示：
 ```c
 char *a;
 void *func(char* s, int **p);
 ```
 
-&emsp;&emsp;在大多数二元和三元运算符周围（在每一侧）使用一个空格，如下所示：
+Use a space on both sides of most binary and ternary operators, as shown below:
 
 ```c
 =  +  -  <  >  *  /  %  |  &  ^  <=  >=  ==  !=  ?  :
 ```
 
-&emsp;&emsp;这些一元运算符后方没有空格
+There is no space after these unary operators:
 
 ```c
 &  *  +  -  ~  !  sizeof  typeof  alignof  __attribute__  defined
 ```
 
-&emsp;&emsp;特殊的例子，以下运算符的前后都不需要空格：
+Special cases: no space is needed before or after the following operators:
+
 ```c
 ++  -- . ->
 ```
-## 4. 命名
 
-&emsp;&emsp;DragonOS中的命名规范不使用诸如`TempValue`这样的驼峰命名法的函数名，而是使用`tmp`这样言简意赅的命名。
+## 4. Naming
 
-&emsp;&emsp;注意，这里指的是我们在整个项目内都不希望使用驼峰命名法。并不意味着程序员可以随便的使用一些难以理解的缩写来作为变量名。
+DragonOS does not use the camelCase naming convention for function names, but instead uses concise and clear names like `tmp`.
 
-&emsp;&emsp;对于全局变量或者全局可见的函数、结构体而言，我们需要遵循以下的命名规定：
-- 名称需要易于理解，且不具有歧义。如：对于一个计算文件夹大小的函数而言，我们建议使用`count_folder_size()`来命名，而不是`cntfs()`这样令其他人头大的命名。
-- 全局的，非static的名称，除非有特别的必要，命名时需要遵循以下格式：`模块名缩写前缀_函数/变量名`。这样的命名能便于别人区分这个名称位于哪个模块内，也减少了由于命名冲突所导致的麻烦。
-- 不需要让其他代码文件可见的全局名称，必须添加`static`修饰符。
+Note that this refers to our entire project not using the camelCase naming convention. It does not mean that programmers can use obscure abbreviations for variable names.
 
-&emsp;&emsp;对于函数内的局部变量而言，命名规范则是需要言简意赅。过长的名称在局部变量中没有太大的意义。
+For global variables or globally visible functions and structures, we need to follow the following naming conventions:
 
-【文档未完成，待继续完善】
+- The name should be easy to understand and not ambiguous. For example, for a function that calculates folder size, we recommend using `count_folder_size()` instead of `cntfs()`, which can confuse others.
+- For global, non-static names, unless there is a special need, the naming should follow the format: `模块名缩写前缀_函数/变量名`. This naming convention helps others distinguish which module the name belongs to and reduces the risk of naming conflicts.
+- Global names that do not need to be visible to other code files must be prefixed with the `static` modifier.
+
+For local variables within functions, the naming convention should be concise. Long names for local variables have little significance.
+
+[Document not completed, to be continued]

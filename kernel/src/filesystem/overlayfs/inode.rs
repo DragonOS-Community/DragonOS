@@ -1,0 +1,1011 @@
+use super::entry::OvlEntry;
+use super::fs::{
+    OverlayFS, OvlLinkIdentity, OvlLinkSeed, OvlLinkSeedPublication, RealInodeIdentity,
+};
+use super::metadata::OvlOrigin;
+use super::{dir, file, lookup, readdir, rename};
+use crate::driver::base::device::device_number::DeviceNumber;
+use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
+use crate::filesystem::vfs::syscall::RenameFlags;
+use crate::filesystem::vfs::utils::DName;
+use crate::filesystem::vfs::{
+    self, inode_lifecycle::InodeRetentionGuard, DirectoryEntry, FileSystem, FileType, IndexNode,
+    InodeId, InodeRetentionKind, LinkMutationCoordinator, Metadata, OpenFileBehavior,
+    PostWriteSyncPolicy, SetMetadataMask, XattrFlags,
+};
+use crate::libs::casting::DowncastArc;
+use crate::libs::mutex::{Mutex, MutexGuard};
+use crate::mm::VmFlags;
+use crate::time::PosixTimeSpec;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use system_error::SystemError;
+
+pub(super) struct OvlLinkMutation<'a> {
+    fs: Arc<OverlayFS>,
+    state: &'a Arc<OvlLinkState>,
+    nlinks: MutexGuard<'a, usize>,
+    newly_pinned: bool,
+    committed: bool,
+}
+
+impl core::ops::Deref for OvlLinkMutation<'_> {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.nlinks
+    }
+}
+
+impl core::ops::DerefMut for OvlLinkMutation<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.nlinks
+    }
+}
+
+impl OvlLinkMutation<'_> {
+    /// Commit is allocation-free: capacity and the temporary strong pin were
+    /// installed before backing I/O while this object's nlink lock was held.
+    pub(super) fn commit(mut self) {
+        self.fs.commit_link_mutation(self.state, *self.nlinks);
+        self.committed = true;
+    }
+}
+
+impl Drop for OvlLinkMutation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.fs.abort_link_mutation(self.state, self.newly_pinned);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OvlInode {
+    pub(super) self_ref: Weak<OvlInode>,
+    pub(super) redirect: String, // Redirect path
+    pub(super) file_type: FileType,
+    /// Logical FIFO identity belongs to the overlay, independently of backing
+    /// selection. The existing identity interner shares this across aliases.
+    fifo: Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
+    #[allow(dead_code)]
+    pub(super) flags: Mutex<u64>,
+    pub(super) upper_inode: Mutex<Option<Arc<dyn IndexNode>>>, // Read-write layer (upper)
+    pub(super) lower_inodes: Vec<Arc<dyn IndexNode>>, // Read-only layer (lower, supports multi-layer)
+    pub(super) backing_retentions: Mutex<Vec<InodeRetentionGuard>>,
+    pub(super) overlay_inode_id: Option<InodeId>,
+    origin: Mutex<OriginState>,
+    pub(super) content_privilege_lock: Mutex<()>,
+    link_mutation_coordinator: Arc<LinkMutationCoordinator>,
+    /// Lazy overlay-visible link fact. Lookup records only the already-known
+    /// identity/count seed; the shared heap object is created on the first
+    /// lower-origin link-count mutation.
+    link_state: Mutex<OvlLinkStateSlot>,
+    dir_state: Mutex<Option<Arc<DirState>>>,
+    #[allow(dead_code)]
+    pub(super) oe: Arc<OvlEntry>,
+    pub(super) fs: Mutex<Weak<OverlayFS>>,
+}
+
+#[derive(Debug)]
+pub(super) struct OvlLinkState {
+    identity: OvlLinkIdentity,
+    nlinks: Mutex<usize>,
+}
+
+impl OvlLinkState {
+    pub(super) fn new(identity: OvlLinkIdentity, nlinks: usize) -> Self {
+        Self {
+            identity,
+            nlinks: Mutex::new(nlinks),
+        }
+    }
+
+    pub(super) fn identity(&self) -> OvlLinkIdentity {
+        self.identity
+    }
+
+    pub(super) fn lock(&self) -> MutexGuard<'_, usize> {
+        self.nlinks.lock()
+    }
+}
+
+#[derive(Debug)]
+enum OvlLinkStateSlot {
+    Unseeded,
+    Seeded {
+        identity: OvlLinkIdentity,
+        initial_nlinks: usize,
+        state: Option<Arc<OvlLinkState>>,
+    },
+}
+
+const LOOKUP_CACHE_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DirVersion {
+    dev_id: usize,
+    inode_id: InodeId,
+    size: i64,
+    mtime: PosixTimeSpec,
+    ctime: PosixTimeSpec,
+}
+
+#[derive(Debug, Default)]
+struct DirStateData {
+    generation: u64,
+    readdir_cache: Option<(u64, Arc<Vec<DirectoryEntry>>)>,
+    lookup_cache: BTreeMap<String, Weak<OvlInode>>,
+    lookup_order: VecDeque<String>,
+    backing_version: Option<Vec<DirVersion>>,
+}
+
+#[derive(Debug)]
+pub(super) struct DirState {
+    pub(super) mutation_lock: Mutex<()>,
+    data: Mutex<DirStateData>,
+}
+
+impl Default for DirState {
+    fn default() -> Self {
+        Self {
+            mutation_lock: Mutex::new(()),
+            data: Mutex::new(DirStateData::default()),
+        }
+    }
+}
+
+impl DirState {
+    fn revalidate<'a>(data: &'a mut DirStateData, version: &[DirVersion]) -> &'a mut DirStateData {
+        if data.backing_version.as_deref() != Some(version) {
+            data.backing_version = Some(version.to_vec());
+            data.generation = data.generation.wrapping_add(1);
+            data.readdir_cache = None;
+            data.lookup_cache.clear();
+            data.lookup_order.clear();
+        }
+        data
+    }
+
+    pub(super) fn cached_readdir(
+        &self,
+        version: &[DirVersion],
+    ) -> Option<Arc<Vec<DirectoryEntry>>> {
+        let mut data = self.data.lock();
+        let data = Self::revalidate(&mut data, version);
+        data.readdir_cache
+            .as_ref()
+            .filter(|(generation, _)| *generation == data.generation)
+            .map(|(_, entries)| entries.clone())
+    }
+
+    pub(super) fn cache_readdir(&self, version: &[DirVersion], entries: Arc<Vec<DirectoryEntry>>) {
+        let mut data = self.data.lock();
+        let data = Self::revalidate(&mut data, version);
+        let generation = data.generation;
+        data.readdir_cache = Some((generation, entries));
+    }
+
+    pub(super) fn cached_lookup(
+        &self,
+        version: &[DirVersion],
+        name: &str,
+    ) -> Option<Arc<OvlInode>> {
+        let mut data = self.data.lock();
+        Self::revalidate(&mut data, version)
+            .lookup_cache
+            .get(name)
+            .and_then(Weak::upgrade)
+    }
+
+    pub(super) fn cache_lookup(&self, name: &str, inode: Arc<OvlInode>) {
+        if name == "." || name == ".." {
+            return;
+        }
+        let mut data = self.data.lock();
+        if data
+            .lookup_cache
+            .insert(name.to_string(), Arc::downgrade(&inode))
+            .is_none()
+        {
+            data.lookup_order.push_back(name.to_string());
+        }
+        while data.lookup_cache.len() > LOOKUP_CACHE_CAPACITY {
+            if let Some(oldest) = data.lookup_order.pop_front() {
+                data.lookup_cache.remove(&oldest);
+            }
+        }
+    }
+
+    pub(super) fn modified(&self, names: &[&str]) {
+        let mut data = self.data.lock();
+        data.generation = data.generation.wrapping_add(1);
+        data.readdir_cache = None;
+        for name in names {
+            data.lookup_cache.remove(*name);
+            data.lookup_order.retain(|cached| cached != name);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OriginState {
+    Unchecked,
+    Checked(Option<OvlOrigin>),
+}
+
+impl OvlInode {
+    /// End cache retention before final Overlay shutdown releases backing
+    /// mounts. Publishing reclaim must precede the backing eviction queue seal.
+    pub(super) fn release_backing_retentions_for_shutdown(&self) {
+        let retentions = core::mem::take(&mut *self.backing_retentions.lock());
+        drop(retentions);
+    }
+
+    pub(super) fn install_upper_inode(
+        &self,
+        slot: &mut Option<Arc<dyn IndexNode>>,
+        inode: Arc<dyn IndexNode>,
+    ) -> Result<(), SystemError> {
+        let retention = InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache)?;
+        self.backing_retentions.lock().push(retention);
+        *slot = Some(inode);
+        Ok(())
+    }
+
+    pub fn new(
+        redirect: String,
+        file_type: FileType,
+        upper: Option<Arc<dyn IndexNode>>,
+        lower_inodes: Vec<Arc<dyn IndexNode>>,
+        overlay_inode_id: Option<InodeId>,
+        link_mutation_coordinator: Arc<LinkMutationCoordinator>,
+        fifo: Option<Arc<crate::ipc::pipe::LockedPipeInode>>,
+    ) -> Arc<Self> {
+        let backing_retentions = upper
+            .iter()
+            .chain(lower_inodes.iter())
+            .map(|inode| InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Cache))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("new overlay inode backing must remain retainable");
+        Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
+            redirect,
+            file_type,
+            fifo,
+            flags: Mutex::new(0),
+            upper_inode: Mutex::new(upper),
+            lower_inodes,
+            backing_retentions: Mutex::new(backing_retentions),
+            overlay_inode_id,
+            origin: Mutex::new(OriginState::Unchecked),
+            content_privilege_lock: Mutex::new(()),
+            link_mutation_coordinator,
+            link_state: Mutex::new(OvlLinkStateSlot::Unseeded),
+            dir_state: Mutex::new(None),
+            oe: Arc::new(OvlEntry::new()),
+            fs: Mutex::new(Weak::default()),
+        })
+    }
+
+    pub(super) fn install_link_seed(&self, identity: OvlLinkIdentity, initial_nlinks: usize) {
+        let mut slot = self.link_state.lock();
+        match &*slot {
+            OvlLinkStateSlot::Unseeded => {
+                *slot = OvlLinkStateSlot::Seeded {
+                    identity,
+                    initial_nlinks,
+                    state: None,
+                };
+            }
+            OvlLinkStateSlot::Seeded {
+                identity: current, ..
+            } => debug_assert_eq!(*current, identity),
+        }
+    }
+
+    fn link_seed(&self) -> Option<OvlLinkSeed> {
+        match &*self.link_state.lock() {
+            OvlLinkStateSlot::Seeded {
+                identity: identity @ OvlLinkIdentity::Lower(_),
+                initial_nlinks,
+                ..
+            } => Some(OvlLinkSeed::new(*identity, *initial_nlinks)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn prepare_copy_up_link_seed(
+        &self,
+        upper: &Arc<dyn IndexNode>,
+    ) -> Result<Option<OvlLinkSeedPublication>, SystemError> {
+        if self.file_type == FileType::Dir {
+            return Ok(None);
+        }
+        let Some(seed) = self.link_seed() else {
+            return Ok(None);
+        };
+        let upper = RealInodeIdentity::from_inode(upper)?;
+        Ok(Some(
+            self.overlay_fs()?
+                .prepare_link_seed_publication(upper, seed)?,
+        ))
+    }
+
+    /// Resolve the logical link state for a namespace mutation.
+    ///
+    /// Lower-origin objects create the state lazily. Pure-upper objects only
+    /// adopt an existing state when they are an upper hardlink alias of a
+    /// copied-up lower object; otherwise their backing outcome is authoritative.
+    pub(super) fn logical_link_state(&self) -> Result<Option<Arc<OvlLinkState>>, SystemError> {
+        let (identity, initial_nlinks, current) = match &*self.link_state.lock() {
+            OvlLinkStateSlot::Unseeded => return Ok(None),
+            OvlLinkStateSlot::Seeded {
+                identity,
+                initial_nlinks,
+                state,
+            } => (*identity, *initial_nlinks, state.clone()),
+        };
+        if current.is_some() {
+            return Ok(current);
+        }
+
+        let fs = self.overlay_fs()?;
+        let state = match identity {
+            OvlLinkIdentity::Lower(_) => {
+                let upper_alias = self
+                    .upper_inode
+                    .lock()
+                    .as_ref()
+                    .map(RealInodeIdentity::from_inode)
+                    .transpose()?
+                    .map(OvlLinkIdentity::Upper);
+                Some(fs.intern_link_state(identity, upper_alias, initial_nlinks)?)
+            }
+            OvlLinkIdentity::Upper(_) => fs.resolve_link_state(identity),
+        };
+        let Some(state) = state else {
+            return Ok(None);
+        };
+
+        let mut slot = self.link_state.lock();
+        if let OvlLinkStateSlot::Seeded {
+            state: installed, ..
+        } = &mut *slot
+        {
+            if let Some(current) = installed.as_ref() {
+                debug_assert!(Arc::ptr_eq(current, &state));
+                return Ok(Some(current.clone()));
+            }
+            *installed = Some(state.clone());
+        }
+        Ok(Some(state))
+    }
+
+    pub(super) fn begin_link_mutation<'a>(
+        &self,
+        state: &'a Arc<OvlLinkState>,
+    ) -> Result<OvlLinkMutation<'a>, SystemError> {
+        let fs = self.overlay_fs()?;
+        let nlinks = state.lock();
+        let newly_pinned = fs.begin_link_mutation(state)?;
+        Ok(OvlLinkMutation {
+            fs,
+            state,
+            nlinks,
+            newly_pinned,
+            committed: false,
+        })
+    }
+
+    /// A copy-up can create pure-upper hardlink aliases of a lower-origin
+    /// object. Publish the upper identity as an alias of the stable lower fact
+    /// before the new namespace link becomes visible.
+    pub(super) fn publish_upper_link_alias(
+        &self,
+        state: &Arc<OvlLinkState>,
+    ) -> Result<(), SystemError> {
+        let Some(upper) = self.upper_inode.lock().clone() else {
+            return Err(SystemError::EIO);
+        };
+        let alias = OvlLinkIdentity::Upper(RealInodeIdentity::from_inode(&upper)?);
+        self.overlay_fs()?.alias_link_state(alias, state)?;
+        Ok(())
+    }
+
+    /// Bridge a copy-up identity only when a logical state already exists.
+    /// Rename/open copy-up must not allocate link state for an otherwise
+    /// untouched inode, but an earlier whiteout/link mutation may require the
+    /// copied-up upper identity to keep resolving that retained fact.
+    pub(super) fn publish_existing_upper_link_alias(&self) -> Result<(), SystemError> {
+        let (identity, installed) = match &*self.link_state.lock() {
+            OvlLinkStateSlot::Unseeded => return Ok(()),
+            OvlLinkStateSlot::Seeded {
+                identity, state, ..
+            } => (*identity, state.clone()),
+        };
+        let state = match installed {
+            Some(state) => Some(state),
+            None => self.overlay_fs()?.resolve_link_state(identity),
+        };
+        if let Some(state) = state {
+            self.publish_upper_link_alias(&state)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_fs(&self, fs: Weak<OverlayFS>) {
+        *self.fs.lock() = fs;
+    }
+
+    #[allow(dead_code)]
+    pub fn ovl_lower_redirect(&self) -> Option<&str> {
+        if !self.lower_inodes.is_empty()
+            && (self.file_type == FileType::File || self.file_type == FileType::Dir)
+        {
+            Some(&self.redirect)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn overlay_fs(&self) -> Result<Arc<OverlayFS>, SystemError> {
+        self.fs.lock().upgrade().ok_or(SystemError::EINVAL)
+    }
+
+    pub(super) fn dir_state(&self) -> Result<Arc<DirState>, SystemError> {
+        if !self.is_dir() {
+            return Err(SystemError::ENOTDIR);
+        }
+        if let Some(state) = self.dir_state.lock().clone() {
+            return Ok(state);
+        }
+        let state = self.overlay_fs()?.intern_dir_state(self)?;
+        let mut slot = self.dir_state.lock();
+        Ok(slot.get_or_insert_with(|| state.clone()).clone())
+    }
+
+    pub(super) fn dir_version(&self) -> Result<Vec<DirVersion>, SystemError> {
+        let upper = self.upper_inode.lock().clone();
+        upper
+            .into_iter()
+            .chain(self.lower_inodes.iter().cloned())
+            .map(|inode| {
+                let metadata = inode.metadata()?;
+                Ok(DirVersion {
+                    dev_id: metadata.dev_id,
+                    inode_id: metadata.inode_id,
+                    size: metadata.size,
+                    mtime: metadata.mtime,
+                    ctime: metadata.ctime,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn downcast_overlay_inode(
+        inode: Arc<dyn IndexNode>,
+    ) -> Result<Arc<OvlInode>, SystemError> {
+        inode.downcast_arc::<OvlInode>().ok_or(SystemError::EXDEV)
+    }
+
+    pub(super) fn lookup_overlay_child_locked(
+        &self,
+        name: &str,
+        state: &DirState,
+    ) -> Result<Arc<OvlInode>, SystemError> {
+        Self::downcast_overlay_inode(lookup::find_locked(self, name, state)?)
+    }
+
+    pub(super) fn has_upper(&self) -> bool {
+        self.upper_inode.lock().is_some()
+    }
+
+    pub(super) fn has_lower(&self) -> bool {
+        !self.lower_inodes.is_empty()
+    }
+
+    pub(super) fn has_lower_link_origin(&self) -> bool {
+        matches!(
+            &*self.link_state.lock(),
+            OvlLinkStateSlot::Seeded {
+                identity: OvlLinkIdentity::Lower(_),
+                ..
+            }
+        )
+    }
+
+    pub(super) fn is_pure_upper(&self) -> bool {
+        self.has_upper() && !self.has_lower()
+    }
+
+    pub(super) fn is_dir(&self) -> bool {
+        self.file_type == FileType::Dir
+    }
+
+    pub(super) fn load_origin_once(&self) -> Result<(), SystemError> {
+        if matches!(*self.origin.lock(), OriginState::Checked(_)) {
+            return Ok(());
+        }
+
+        // Never hold the origin state while taking upper_inode: copy-up owns
+        // upper_inode while publishing the checked origin state.
+        let upper = self.upper_inode.lock().clone();
+        let loaded = upper
+            .as_ref()
+            .map(|upper| super::metadata::load_origin(self, upper))
+            .transpose()
+            .map_err(super::metadata::xattr_read_error)?
+            .flatten();
+        let mut state = self.origin.lock();
+        if matches!(*state, OriginState::Unchecked) {
+            *state = OriginState::Checked(loaded);
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_origin(&self, origin: Option<OvlOrigin>) {
+        *self.origin.lock() = OriginState::Checked(origin);
+    }
+
+    pub(super) fn origin(&self) -> Option<OvlOrigin> {
+        match *self.origin.lock() {
+            OriginState::Unchecked => None,
+            OriginState::Checked(origin) => origin,
+        }
+    }
+}
+
+impl IndexNode for OvlInode {
+    fn link_mutation_coordinator(&self) -> Option<&LinkMutationCoordinator> {
+        Some(self.link_mutation_coordinator.as_ref())
+    }
+
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        if behavior.data_file_write_checks {
+            behavior.direct_io = crate::filesystem::vfs::file::DirectIoPolicy::OwnerManaged;
+        }
+        if self.file_type == FileType::File {
+            behavior.post_write_sync = PostWriteSyncPolicy::Delegated;
+        }
+    }
+
+    fn special_node(&self) -> Option<vfs::SpecialNodeData> {
+        self.fifo
+            .as_ref()
+            .map(|pipe| vfs::SpecialNodeData::Pipe(pipe.clone()))
+    }
+
+    fn append_lock_fs(&self) -> Option<Arc<dyn FileSystem>> {
+        Some(self.fs())
+    }
+
+    fn open(
+        &self,
+        data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+        flags: &FileFlags,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        file::open(self, data, flags)
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        file::read_at(self, offset, len, buf, data)
+    }
+
+    fn read_at_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        intent: vfs::ReadIoIntent,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        file::read_at_with_io_intent(self, offset, len, buf, data, intent)
+    }
+
+    fn user_read_mode_with_io_intent(&self, intent: vfs::ReadIoIntent) -> vfs::UserReadMode {
+        if intent == vfs::ReadIoIntent::Direct && self.file_type == FileType::File {
+            vfs::UserReadMode::Iterator
+        } else {
+            self.user_read_mode()
+        }
+    }
+
+    fn read_user_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        intent: vfs::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        if intent == vfs::ReadIoIntent::Direct {
+            file::read_user_with_io_intent(self, offset, len, writer, data, intent)
+        } else {
+            self.read_user_at(offset, len, writer, data)
+        }
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        file::write_at(self, offset, len, buf, data)
+    }
+
+    fn write_at_with_sync(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync_intent: vfs::WriteSyncIntent,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        file::write_at_with_sync(self, offset, len, buf, sync_intent, data)
+    }
+
+    fn write_primary_with_sync_with_privilege_stage(
+        &self,
+        offset: usize,
+        len: usize,
+        source: vfs::PrimaryWriteSource<'_, '_>,
+        operation: crate::filesystem::vfs::WriteOperation,
+        sync_intent: vfs::WriteSyncIntent,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        stage: &mut vfs::WritePrivilegeStage<'_>,
+    ) -> Result<vfs::DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        file::write_primary_with_sync(
+            self,
+            offset,
+            len,
+            source,
+            operation,
+            sync_intent,
+            data,
+            stage,
+        )
+    }
+
+    fn sync_file(
+        &self,
+        datasync: bool,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        file::sync_file(self, datasync, data)
+    }
+
+    fn sync_file_range(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        file::sync_file_range(self, start, end, datasync, data)
+    }
+
+    fn flush_file(
+        &self,
+        data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+        lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        file::flush_file(self, data, lock_owner)
+    }
+
+    fn close(
+        &self,
+        data: crate::libs::mutex::MutexGuard<FilePrivateData>,
+    ) -> Result<(), SystemError> {
+        file::close(data)
+    }
+
+    fn check_mmap_file(
+        &self,
+        file: &Arc<File>,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        file::check_mmap_file(self, file, len, offset, vm_flags)
+    }
+
+    fn mmap_effective_file(
+        &self,
+        file: &Arc<File>,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
+        file::mmap_effective_file(self, file)
+    }
+
+    fn mmap_file(
+        &self,
+        file: &Arc<File>,
+        start: usize,
+        len: usize,
+        offset: usize,
+        vm_flags: VmFlags,
+    ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
+        file::mmap_file(self, file, start, len, offset, vm_flags)
+    }
+
+    fn page_cache(&self) -> Option<Arc<PageCache>> {
+        None
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        self.fs.lock().upgrade().unwrap()
+    }
+
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        self.load_origin_once()?;
+        super::metadata::metadata(self)
+    }
+
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::set_metadata_masked(
+            self,
+            metadata,
+            SetMetadataMask::MODE
+                | SetMetadataMask::UID
+                | SetMetadataMask::GID
+                | SetMetadataMask::ATIME
+                | SetMetadataMask::MTIME
+                | SetMetadataMask::CTIME,
+        )
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::set_metadata_masked(self, metadata, mask)
+    }
+
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        // Match ovl_update_time(): reading a lower-only inode must not copy it
+        // up merely to persist atime. If an upper inode already exists, let its
+        // native synchronization domain evaluate and update the timestamp.
+        let upper = self.upper_inode.lock().clone();
+        if let Some(upper) = upper {
+            upper.update_atime(now, relatime)?;
+        }
+        Ok(())
+    }
+
+    fn resize(&self, len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::resize_with_lock_owner(self, len, 0)
+    }
+
+    fn resize_with_lock_owner(
+        &self,
+        len: usize,
+        lock_owner: u64,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::resize_with_lock_owner(self, len, lock_owner)
+    }
+
+    fn resize_file(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::resize_file(self, len, lock_owner, data)
+    }
+
+    fn resize_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::resize_with_metadata(self, len, lock_owner, metadata, mask)
+    }
+
+    fn resize_file_with_metadata(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::resize_file_with_metadata(self, len, lock_owner, data, metadata, mask)
+    }
+
+    fn resize_open_truncate(
+        &self,
+        len: usize,
+        lock_owner: u64,
+        data: crate::libs::mutex::MutexGuard<vfs::FilePrivateData>,
+        context: &vfs::OpenTruncateContext,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        // Linux overlayfs clears ATTR_FILE/ATTR_OPEN before forwarding setattr
+        // to the upper inode. The outer open file therefore must not leak its
+        // backing file handle into an upper FUSE SETATTR request.
+        drop(data);
+        super::metadata::resize_with_metadata(
+            self,
+            len,
+            lock_owner,
+            &context.requested,
+            context.mask,
+        )
+    }
+
+    fn getxattr(&self, name: &[u8], buf: &mut [u8]) -> Result<usize, SystemError> {
+        super::metadata::getxattr(self, name, buf)
+    }
+
+    fn setxattr(
+        &self,
+        name: &[u8],
+        value: &[u8],
+        flags: XattrFlags,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::setxattr(self, name, value, flags)
+    }
+
+    fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
+        super::metadata::listxattr(self, buf)
+    }
+
+    fn removexattr(
+        &self,
+        name: &[u8],
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::removexattr(self, name)
+    }
+
+    fn remove_security_privileges(
+        &self,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        super::metadata::remove_security_privileges(self)
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn dname(&self) -> Result<DName, SystemError> {
+        Ok(DName::from(
+            self.redirect
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.redirect)
+                .to_string(),
+        ))
+    }
+
+    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let fs = self.overlay_fs()?;
+        let Some(parent_redirect) = self.parent_redirect() else {
+            return Ok(fs.root_inode.clone());
+        };
+
+        if parent_redirect.is_empty() {
+            return Ok(fs.root_inode.clone());
+        }
+
+        let root: Arc<dyn IndexNode> = fs.root_inode.clone();
+        root.lookup(parent_redirect)
+    }
+
+    fn list(&self) -> Result<Vec<String>, system_error::SystemError> {
+        readdir::list(self)
+    }
+
+    fn list_entries(&self) -> Result<Option<Vec<DirectoryEntry>>, SystemError> {
+        readdir::list_entries(self).map(Some)
+    }
+
+    fn mkdir(
+        &self,
+        name: &str,
+        mode: vfs::InodeMode,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        dir::mkdir(self, name, mode)
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        dir::rmdir(self, name)
+    }
+
+    fn rmdir_with_context(
+        &self,
+        name: &str,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        dir::rmdir_with_context(self, name, context)
+    }
+
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
+        dir::unlink(self, name)
+    }
+
+    fn unlink_with_context(
+        &self,
+        name: &str,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<vfs::LinkRemovalOutcome, crate::mm::allocation::MemoryAllocationError> {
+        dir::unlink_with_context(self, name, context)
+    }
+
+    fn link(
+        &self,
+        name: &str,
+        other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        dir::link(self, name, other)
+    }
+
+    fn create(
+        &self,
+        name: &str,
+        file_type: vfs::FileType,
+        mode: vfs::InodeMode,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        dir::create(self, name, file_type, mode)
+    }
+
+    fn symlink(
+        &self,
+        name: &str,
+        target: &str,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        dir::symlink(self, name, target)
+    }
+
+    fn move_to(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> Result<vfs::RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
+        rename::move_to(self, old_name, target, new_name, flags)
+    }
+
+    fn move_to_with_context(
+        &self,
+        old_name: &str,
+        target: &Arc<dyn IndexNode>,
+        new_name: &str,
+        flags: RenameFlags,
+        context: &vfs::mount::DentryMutationContext<'_>,
+    ) -> Result<vfs::RenameOutcome, crate::mm::allocation::MemoryAllocationError> {
+        rename::move_to_with_context(self, old_name, target, new_name, flags, context)
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, system_error::SystemError> {
+        lookup::find(self, name)
+    }
+
+    fn mknod(
+        &self,
+        filename: &str,
+        mode: vfs::InodeMode,
+        dev_t: DeviceNumber,
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        dir::mknod(self, filename, mode, dev_t)
+    }
+}

@@ -71,7 +71,7 @@ fn do_start_kernel() {
     // 初始化内核命令行参数
     kenrel_cmdline_param_manager().init();
 
-    boot_callback_except_early();
+    boot_callback_except_early().expect("failed to initialize boot parameters");
 
     init_intertrait();
 
@@ -93,10 +93,14 @@ fn do_start_kernel() {
     setup_arch().expect("setup_arch failed");
 
     CurrentSMPArch::prepare_cpus().expect("prepare_cpus failed");
+    // Bootstrap uses safe static PID limits; finalize CPU-scaled policy only
+    // after the possible CPU set is known, before userspace can write sysctl.
+    crate::process::pid::init_pid_limits();
 
     // sched_init();
     // 初始化中断下半部（softirq、bottom_half、tasklet）
     irq_bottom_half_init().expect("bottom half subsystem init failed");
+    crate::filesystem::procfs::kmsg::kmsg_notification_init();
     Syscall::init().expect("syscall init failed");
     timekeeping_init();
     time_init();

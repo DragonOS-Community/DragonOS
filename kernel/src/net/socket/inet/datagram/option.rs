@@ -10,7 +10,10 @@ use system_error::SystemError;
 use super::inner::{DEFAULT_RX_BUF_SIZE, DEFAULT_TX_BUF_SIZE};
 use super::UdpSocket;
 use crate::libs::byte_parser;
-use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt};
+use crate::net::socket::common::{
+    parse_timeval_opt, write_i32_getsockopt, write_i32_getsockopt_ipv4, write_linger_getsockopt,
+    write_timeval_opt, write_u32_getsockopt,
+};
 use crate::net::socket::inet::common::{apply_ipv4_membership, apply_ipv4_multicast_if};
 use crate::net::socket::{AddressFamily, IpOption, PIPV6, PSO, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
@@ -42,20 +45,12 @@ impl UdpSocket {
             PSO::SNDBUF => {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_WMEM_MAX, SOCK_MIN_SNDBUF);
-                self.send_buf_size.store(size, Ordering::Release);
-
-                // If socket is already bound, we need to recreate it with new buffer size
-                self.recreate_socket_if_bound()?;
-                Ok(())
+                self.resize_buffer(false, size)
             }
             PSO::RCVBUF => {
                 let requested = byte_parser::read_u32(val)?;
                 let size = clamp_udp_buf(requested, SYSCTL_RMEM_MAX, SOCK_MIN_RCVBUF);
-                self.recv_buf_size.store(size, Ordering::Release);
-
-                // If socket is already bound, we need to recreate it with new buffer size
-                self.recreate_socket_if_bound()?;
-                Ok(())
+                self.resize_buffer(true, size)
             }
             PSO::RCVLOWAT => {
                 let mut v = byte_parser::read_i32(val)?;
@@ -86,9 +81,7 @@ impl UdpSocket {
                 }
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_SNDBUF);
-                self.send_buf_size.store(size, Ordering::Release);
-                self.recreate_socket_if_bound()?;
-                Ok(())
+                self.resize_buffer(false, size)
             }
             PSO::RCVBUFFORCE => {
                 let cred = ProcessManager::current_pcb().cred();
@@ -97,9 +90,7 @@ impl UdpSocket {
                 }
                 let requested = byte_parser::read_i32(val)?;
                 let size = clamp_udp_buf_force(requested, SOCK_MIN_RCVBUF);
-                self.recv_buf_size.store(size, Ordering::Release);
-                self.recreate_socket_if_bound()?;
-                Ok(())
+                self.resize_buffer(true, size)
             }
             PSO::REUSEADDR => {
                 if val.len() < core::mem::size_of::<i32>() {
@@ -109,6 +100,7 @@ impl UdpSocket {
                 self.so_reuseaddr.store(v != 0, Ordering::Relaxed);
                 Ok(())
             }
+            PSO::BINDTODEVICE => self.set_device_binding(val),
             PSO::BROADCAST => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);
@@ -177,38 +169,16 @@ impl UdpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match opt {
-            PSO::TYPE => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = PSOCK::Datagram as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
+            PSO::TYPE => Ok(write_i32_getsockopt(value, PSOCK::Datagram as i32)),
             PSO::DOMAIN => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
                 let domain = match self.ip_version {
                     smoltcp::wire::IpVersion::Ipv6 => AddressFamily::INet6,
                     smoltcp::wire::IpVersion::Ipv4 => AddressFamily::INet,
                 };
-                let v = domain as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
+                Ok(write_i32_getsockopt(value, domain as i32))
             }
-            PSO::PROTOCOL => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = PSOL::UDP as i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
+            PSO::PROTOCOL => Ok(write_i32_getsockopt(value, PSOL::UDP as i32)),
             PSO::SNDBUF => {
-                if value.len() < core::mem::size_of::<u32>() {
-                    return Err(SystemError::EINVAL);
-                }
                 let size = self.send_buf_size.load(Ordering::Acquire);
                 // Linux doubles the value when returning it
                 // If 0 (not set), return default size
@@ -217,14 +187,9 @@ impl UdpSocket {
                 } else {
                     size * 2
                 };
-                let bytes = (actual_size as u32).to_ne_bytes();
-                value[0..4].copy_from_slice(&bytes);
-                Ok(core::mem::size_of::<u32>())
+                Ok(write_u32_getsockopt(value, actual_size as u32))
             }
             PSO::RCVBUF => {
-                if value.len() < core::mem::size_of::<u32>() {
-                    return Err(SystemError::EINVAL);
-                }
                 let size = self.recv_buf_size.load(Ordering::Acquire);
                 // Linux doubles the value when returning it
                 // If 0 (not set), return default size
@@ -233,128 +198,61 @@ impl UdpSocket {
                 } else {
                     size * 2
                 };
-                let bytes = (actual_size as u32).to_ne_bytes();
-                value[0..4].copy_from_slice(&bytes);
-                Ok(core::mem::size_of::<u32>())
+                Ok(write_u32_getsockopt(value, actual_size as u32))
             }
-            PSO::RCVLOWAT => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = self.rcvlowat.load(Ordering::Relaxed);
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
+            PSO::RCVLOWAT => Ok(write_i32_getsockopt(
+                value,
+                self.rcvlowat.load(Ordering::Relaxed),
+            )),
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                 let us = self.send_timeout_us.load(Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let us = self.recv_timeout_us.load(Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
-            PSO::REUSEADDR => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = if self.so_reuseaddr.load(Ordering::Relaxed) {
-                    1i32
-                } else {
-                    0i32
-                };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
-            PSO::BROADCAST => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = if self.so_broadcast.load(Ordering::Relaxed) {
-                    1i32
-                } else {
-                    0i32
-                };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
-            PSO::PASSCRED => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = if self.so_passcred.load(Ordering::Relaxed) {
-                    1i32
-                } else {
-                    0i32
-                };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
-            PSO::REUSEPORT => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = if self.so_reuseport.load(Ordering::Relaxed) {
-                    1i32
-                } else {
-                    0i32
-                };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
-            PSO::KEEPALIVE => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = if self.so_keepalive.load(Ordering::Relaxed) {
-                    1i32
-                } else {
-                    0i32
-                };
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
+            PSO::REUSEADDR => Ok(write_i32_getsockopt(
+                value,
+                self.so_reuseaddr.load(Ordering::Relaxed) as i32,
+            )),
+            PSO::BINDTODEVICE => self.device_binding.get(&self.netns, value),
+            PSO::BROADCAST => Ok(write_i32_getsockopt(
+                value,
+                self.so_broadcast.load(Ordering::Relaxed) as i32,
+            )),
+            PSO::PASSCRED => Ok(write_i32_getsockopt(
+                value,
+                self.so_passcred.load(Ordering::Relaxed) as i32,
+            )),
+            PSO::REUSEPORT => Ok(write_i32_getsockopt(
+                value,
+                self.so_reuseport.load(Ordering::Relaxed) as i32,
+            )),
+            PSO::KEEPALIVE => Ok(write_i32_getsockopt(
+                value,
+                self.so_keepalive.load(Ordering::Relaxed) as i32,
+            )),
             PSO::LINGER => {
-                if value.len() < 8 {
-                    return Err(SystemError::EINVAL);
-                }
                 let on = self.linger_onoff.load(Ordering::Relaxed);
                 let linger = if on != 0 {
                     self.linger_linger.load(Ordering::Relaxed)
                 } else {
                     0
                 };
-                value[0..4].copy_from_slice(&on.to_ne_bytes());
-                value[4..8].copy_from_slice(&linger.to_ne_bytes());
-                Ok(8)
+                Ok(write_linger_getsockopt(value, on, linger))
             }
-            PSO::ACCEPTCONN => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = 0i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
-            PSO::ERROR => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let v = 0i32;
-                value[..4].copy_from_slice(&v.to_ne_bytes());
-                Ok(core::mem::size_of::<i32>())
-            }
-            PSO::NO_CHECK => {
-                if value.len() < core::mem::size_of::<i32>() {
-                    return Err(SystemError::EINVAL);
-                }
-                let no_check = self.no_check.load(Ordering::Acquire);
-                let val = if no_check { 1i32 } else { 0i32 };
-                let bytes = val.to_ne_bytes();
-                value[0..4].copy_from_slice(&bytes);
-                Ok(core::mem::size_of::<i32>())
-            }
+            PSO::ACCEPTCONN => Ok(write_i32_getsockopt(value, 0)),
+            PSO::ERROR => Ok(write_i32_getsockopt(
+                value,
+                core::mem::take(&mut self.errqueue.lock().0),
+            )),
+            PSO::NO_CHECK => Ok(write_i32_getsockopt(
+                value,
+                self.no_check.load(Ordering::Acquire) as i32,
+            )),
             _ => Err(SystemError::ENOPROTOOPT),
         }
     }
@@ -362,6 +260,17 @@ impl UdpSocket {
     /// 处理 SOL_IP 级别的 setsockopt。
     pub(super) fn set_ip_option(&self, opt: IpOption, val: &[u8]) -> Result<(), SystemError> {
         match opt {
+            IpOption::MTU_DISCOVER => {
+                // SOL_IP accepts either an int or a one-byte option value.
+                let value = if val.len() >= core::mem::size_of::<i32>() {
+                    byte_parser::read_i32(val)?
+                } else {
+                    *val.first().ok_or(SystemError::EINVAL)? as i32
+                };
+                let policy = super::PmtuPolicy::from_i32(value)?;
+                self.pmtu_v4.store(policy.as_i32(), Ordering::Release);
+                Ok(())
+            }
             IpOption::RECVTOS => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);
@@ -375,7 +284,11 @@ impl UdpSocket {
                     return Err(SystemError::EINVAL);
                 }
                 let v = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]) != 0;
+                let mut errors = self.errqueue.lock();
                 self.recv_err_v4.store(v, Ordering::Relaxed);
+                if !v {
+                    errors.1.clear();
+                }
                 Ok(())
             }
             IpOption::MULTICAST_TTL => {
@@ -420,12 +333,32 @@ impl UdpSocket {
                 self.ip_multicast_all.store(on, Ordering::Relaxed);
                 Ok(())
             }
-            IpOption::MULTICAST_IF => apply_ipv4_multicast_if(
-                &self.netns,
-                val,
-                &self.ip_multicast_ifindex,
-                &self.ip_multicast_addr,
-            ),
+            IpOption::MULTICAST_IF => {
+                // Keep validation and the two-field configuration publish
+                // atomic with respect to send-side interface selection.
+                let _placement = self.iface_placement.write();
+                use crate::net::socket::inet::common::multicast::{
+                    find_iface_by_ifindex, find_iface_by_ipv4, parse_mreqn_for_multicast_if,
+                };
+                let (addr, index) = parse_mreqn_for_multicast_if(val)?;
+                let selected = if index != 0 {
+                    find_iface_by_ifindex(&self.netns, index)
+                } else if addr != 0 {
+                    find_iface_by_ipv4(&self.netns, addr)
+                } else {
+                    None
+                };
+                let bound = self.bound_device_ifindex();
+                if bound != 0 && selected.is_some_and(|iface| iface.nic_id() != bound) {
+                    return Err(SystemError::EINVAL);
+                }
+                apply_ipv4_multicast_if(
+                    &self.netns,
+                    val,
+                    &self.ip_multicast_ifindex,
+                    &self.ip_multicast_addr,
+                )
+            }
             IpOption::PKTINFO => {
                 if val.len() < core::mem::size_of::<i32>() {
                     return Err(SystemError::EINVAL);
@@ -444,44 +377,16 @@ impl UdpSocket {
             }
             IpOption::ADD_MEMBERSHIP | IpOption::DROP_MEMBERSHIP => {
                 // First, apply the membership at the interface level
-                apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)?;
+                let (multiaddr, ifindex) =
+                    apply_ipv4_membership(&self.netns, opt, val, &self.ip_multicast_groups)?;
 
                 // Then, register/unregister with multicast loopback registry
                 use super::multicast_loopback::multicast_registry;
-                use crate::net::socket::inet::common::multicast::parse_mreqn_for_membership;
-
-                if let Ok((multiaddr, ifaddr, ifindex)) = parse_mreqn_for_membership(val) {
-                    // Determine the interface index
-                    let resolved_ifindex = if ifindex != 0 {
-                        ifindex
-                    } else if ifaddr != 0 {
-                        // Find interface by address
-                        use crate::net::socket::inet::common::multicast::find_iface_by_ipv4;
-                        find_iface_by_ipv4(&self.netns, ifaddr)
-                            .map(|iface| iface.nic_id() as i32)
-                            .unwrap_or(0)
+                if ifindex != 0 {
+                    if opt == IpOption::ADD_MEMBERSHIP {
+                        multicast_registry().register(self.self_ref.clone(), multiaddr, ifindex);
                     } else {
-                        // Use default interface
-                        use crate::net::socket::inet::common::multicast::choose_default_ipv4_iface;
-                        choose_default_ipv4_iface(&self.netns)
-                            .map(|iface| iface.nic_id() as i32)
-                            .unwrap_or(0)
-                    };
-
-                    if resolved_ifindex != 0 {
-                        if opt == IpOption::ADD_MEMBERSHIP {
-                            multicast_registry().register(
-                                self.self_ref.clone(),
-                                multiaddr,
-                                resolved_ifindex,
-                            );
-                        } else {
-                            multicast_registry().unregister(
-                                &self.self_ref,
-                                multiaddr,
-                                resolved_ifindex,
-                            );
-                        }
+                        multicast_registry().unregister(&self.self_ref, multiaddr, ifindex);
                     }
                 }
 
@@ -497,11 +402,9 @@ impl UdpSocket {
         opt: IpOption,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
-        if value.len() < core::mem::size_of::<i32>() {
-            return Err(SystemError::EINVAL);
-        }
-
         let v = match opt {
+            IpOption::MTU_DISCOVER => self.pmtu_v4.load(Ordering::Acquire),
+            IpOption::MTU => self.connected_path_mtu(smoltcp::wire::IpVersion::Ipv4)? as i32,
             IpOption::RECVTOS => {
                 if self.recv_tos.load(Ordering::Relaxed) {
                     1i32
@@ -531,7 +434,10 @@ impl UdpSocket {
                     0i32
                 }
             }
-            IpOption::MULTICAST_IF => self.ip_multicast_addr.load(Ordering::Relaxed) as i32,
+            IpOption::MULTICAST_IF => {
+                let v = self.ip_multicast_addr.load(Ordering::Relaxed);
+                return Ok(write_u32_getsockopt(value, v));
+            }
             IpOption::PKTINFO => {
                 if self.recv_pktinfo_v4.load(Ordering::Relaxed) {
                     1i32
@@ -549,8 +455,7 @@ impl UdpSocket {
             _ => return Err(SystemError::ENOPROTOOPT),
         };
 
-        value[..4].copy_from_slice(&v.to_ne_bytes());
-        Ok(core::mem::size_of::<i32>())
+        Ok(write_i32_getsockopt_ipv4(value, v))
     }
 
     /// 处理 SOL_IPV6 级别的 setsockopt。
@@ -561,12 +466,71 @@ impl UdpSocket {
         let v = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]) != 0;
 
         match opt {
+            PIPV6::ADD_MEMBERSHIP
+            | PIPV6::DROP_MEMBERSHIP
+            | PIPV6::MCAST_JOIN_GROUP
+            | PIPV6::MCAST_LEAVE_GROUP => self.set_ipv6_membership(opt, val),
+            PIPV6::MULTICAST_IF => {
+                let index = byte_parser::read_i32(val)? as u32;
+                let _placement = self.iface_placement.write();
+                if index != 0 {
+                    crate::net::socket::inet::common::multicast::find_iface_by_ifindex(
+                        &self.netns,
+                        index as i32,
+                    )
+                    .ok_or(SystemError::ENODEV)?;
+                    let bound = self.device_binding.ifindex();
+                    if bound != 0 && bound != index as usize {
+                        return Err(SystemError::EINVAL);
+                    }
+                }
+                self.ipv6_multicast_ifindex.store(index, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MULTICAST_ALL => {
+                self.ipv6_multicast_all.store(v, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MULTICAST_LOOP => {
+                let value = byte_parser::read_i32(val)?;
+                if !(0..=1).contains(&value) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ipv6_multicast_loop.store(v, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MULTICAST_HOPS => {
+                let hops = byte_parser::read_i32(val)?;
+                if !(-1..=255).contains(&hops) {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ipv6_multicast_hops
+                    .store(if hops == -1 { 1 } else { hops }, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MTU => {
+                let mtu = byte_parser::read_i32(val)?;
+                if mtu != 0 && mtu < 1280 {
+                    return Err(SystemError::EINVAL);
+                }
+                self.ipv6_mtu.store(mtu as usize, Ordering::Release);
+                Ok(())
+            }
+            PIPV6::MTU_DISCOVER => {
+                let policy = super::PmtuPolicy::from_i32(byte_parser::read_i32(val)?)?;
+                self.pmtu_v6.store(policy.as_i32(), Ordering::Release);
+                Ok(())
+            }
             PIPV6::RECVTCLASS => {
                 self.recv_tclass.store(v, Ordering::Relaxed);
                 Ok(())
             }
             PIPV6::RECVERR | PIPV6::RECVERR_RFC4884 => {
+                let mut errors = self.errqueue.lock();
                 self.recv_err_v6.store(v, Ordering::Relaxed);
+                if !v {
+                    errors.1.clear();
+                }
                 Ok(())
             }
             PIPV6::ORIGDSTADDR => {
@@ -583,11 +547,13 @@ impl UdpSocket {
         opt: PIPV6,
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
-        if value.len() < core::mem::size_of::<i32>() {
-            return Err(SystemError::EINVAL);
-        }
-
         let v = match opt {
+            PIPV6::MULTICAST_IF => self.ipv6_multicast_ifindex.load(Ordering::Acquire) as i32,
+            PIPV6::MULTICAST_ALL => self.ipv6_multicast_all.load(Ordering::Acquire) as i32,
+            PIPV6::MULTICAST_LOOP => self.ipv6_multicast_loop.load(Ordering::Acquire) as i32,
+            PIPV6::MULTICAST_HOPS => self.ipv6_multicast_hops.load(Ordering::Acquire),
+            PIPV6::MTU_DISCOVER => self.pmtu_v6.load(Ordering::Acquire),
+            PIPV6::MTU => self.connected_path_mtu(smoltcp::wire::IpVersion::Ipv6)? as i32,
             PIPV6::RECVTCLASS => {
                 if self.recv_tclass.load(Ordering::Relaxed) {
                     1i32
@@ -612,8 +578,7 @@ impl UdpSocket {
             _ => return Err(SystemError::ENOPROTOOPT),
         };
 
-        value[..4].copy_from_slice(&v.to_ne_bytes());
-        Ok(core::mem::size_of::<i32>())
+        Ok(write_i32_getsockopt(value, v))
     }
 }
 

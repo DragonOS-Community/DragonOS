@@ -1,4 +1,4 @@
-use core::ffi::{c_int, c_longlong};
+use core::ffi::{c_int, c_long, c_longlong};
 use system_error::SystemError;
 
 use crate::syscall::Syscall;
@@ -9,6 +9,7 @@ mod sys_alarm;
 mod sys_clock_getres;
 mod sys_clock_gettime;
 mod sys_clock_nanosleep;
+mod sys_clock_settime;
 mod sys_getitimer;
 mod sys_gettimeofday;
 mod sys_nanosleep;
@@ -20,11 +21,11 @@ mod sys_timer_delete;
 mod sys_timer_getoverrun;
 mod sys_timer_gettime;
 mod sys_timer_settime;
-
+mod sys_times;
 pub(crate) use posix_clock::{posix_clock_now, posix_clock_res};
 
 pub type PosixTimeT = c_longlong;
-pub type PosixSusecondsT = c_int;
+pub type PosixSusecondsT = c_long;
 
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
@@ -60,6 +61,18 @@ pub struct Itimerval {
     pub it_interval: PosixTimeval,
     pub it_value: PosixTimeval,
 }
+
+// Native Linux LP64 ABI: both timeval fields occupy a full signed long.
+// A 32-bit tv_usec would leave padding despite the same total struct size,
+// exposing uninitialized bytes when these structs are copied to userspace.
+const _: () = {
+    assert!(core::mem::size_of::<PosixTimeT>() == 8);
+    assert!(core::mem::size_of::<PosixSusecondsT>() == 8);
+    assert!(core::mem::size_of::<PosixTimeval>() == 16);
+    assert!(core::mem::offset_of!(PosixTimeval, tv_usec) == 8);
+    assert!(core::mem::size_of::<Itimerval>() == 32);
+    assert!(core::mem::offset_of!(Itimerval, it_value) == 16);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive)]
@@ -97,8 +110,8 @@ pub const SYS_TIMEZONE: PosixTimeZone = PosixTimeZone {
 };
 
 /// CPU clock ID bit masks (matching Linux's include/linux/posix-timers.h)
-const CPUCLOCK_PERTHREAD_MASK: u32 = 4;
-const CPUCLOCK_CLOCK_MASK: u32 = 3;
+pub(crate) const CPUCLOCK_PERTHREAD_MASK: u32 = 4;
+pub(crate) const CPUCLOCK_CLOCK_MASK: u32 = 3;
 const CPUCLOCK_SCHED: u32 = 2;
 
 /// Standard POSIX clock ID constants

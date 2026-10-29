@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Internet Protocol Socket &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="UNIX" href="unix.html" />
+    <link rel="prev" title="网络子系统" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">网络子系统</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Internet Protocol Socket</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#roadmap">Roadmap</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tcp">TCP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#udp">UDP</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#boundinner">BoundInner</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="unix.html">UNIX</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ssh.html">ssh支持</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">网络子系统</a></li>
+      <li class="breadcrumb-item active">Internet Protocol Socket</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/kernel/net/inet.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="internet-protocol-socket">
+<h1>Internet Protocol Socket<a class="headerlink" href="#internet-protocol-socket" title="Permalink to this heading"></a></h1>
+<p>众所都周之，这个 Inet Socket 常用的分为 TCP, UDP 和 ICMP。基于实用性，目前实现的是 TCP 和 UDP。</p>
+<p>整个 Inet 网络协议栈与网卡的交互基于 <code class="docutils literal notranslate"><span class="pre">smoltcp</span></code> crate 来实现。</p>
+<section id="roadmap">
+<h2>Roadmap<a class="headerlink" href="#roadmap" title="Permalink to this heading"></a></h2>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> TCP</p>
+<ul class="contains-task-list">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 接受连接</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> 发起连接</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> 半双工关闭</p></li>
+</ul>
+</li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> UDP</p>
+<ul class="contains-task-list">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 传输数据</p></li>
+</ul>
+</li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> ICMP</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> ioctl</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> Misc</p>
+<ul class="contains-task-list">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> 硬中断转软中断的锁处理（避免死锁）</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> epoll_item 优化</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" disabled="disabled" type="checkbox"> 优化 <code class="docutils literal notranslate"><span class="pre">inet</span> <span class="pre">port</span></code> 资源管理</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="tcp">
+<h2>TCP<a class="headerlink" href="#tcp" title="Permalink to this heading"></a></h2>
+<p>根据 TCP 状态机来 TCP Socket 的几个状态类</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">Init</span></code>: 裸状态</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">Unbound</span></code>: 创建出来的状态</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Bound</span></code>: 绑定了地址</p></li>
+</ul>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Listening</span></code>: 监听状态</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Connecting</span></code>: 连接中状态</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">Established</span></code>: 连接建立状态</p></li>
+</ul>
+</section>
+<section id="udp">
+<h2>UDP<a class="headerlink" href="#udp" title="Permalink to this heading"></a></h2>
+<p>UDP 是无连接的，所以没有连接状态。UDP 的状态只有 <code class="docutils literal notranslate"><span class="pre">Unbound</span></code> 和 <code class="docutils literal notranslate"><span class="pre">Bound</span></code> 两种。</p>
+</section>
+<section id="boundinner">
+<h2>BoundInner<a class="headerlink" href="#boundinner" title="Permalink to this heading"></a></h2>
+<p>另一个对于 Inet Socket 的抽象，用于处理绑定网卡的 <code class="docutils literal notranslate"><span class="pre">socket</span></code>，从而封装 <code class="docutils literal notranslate"><span class="pre">smoltcp</span></code> 的接口，提供统一的资源管理。</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="网络子系统" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="unix.html" class="btn btn-neutral float-right" title="UNIX" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/net/inet.html">V0.3.0</a></dd>
+      <dd><a href="inet.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/net/inet.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

@@ -21,9 +21,11 @@ mod sys_gettid;
 mod sys_getuid;
 mod sys_groups;
 mod sys_init_module;
+mod sys_personality;
 mod sys_pidfdopen;
 mod sys_prctl;
 pub mod sys_prlimit64;
+mod sys_ptrace;
 mod sys_rseq;
 mod sys_seccomp;
 mod sys_set_tid_address;
@@ -53,6 +55,8 @@ mod sys_fork;
 mod sys_getpgrp;
 #[cfg(target_arch = "x86_64")]
 mod sys_getrlimit;
+#[cfg(target_arch = "x86_64")]
+mod sys_ioperm;
 #[cfg(target_arch = "x86_64")]
 mod sys_setrlimit;
 #[cfg(target_arch = "x86_64")]

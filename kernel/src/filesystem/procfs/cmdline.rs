@@ -2,6 +2,8 @@
 //!
 //! 这个文件展示了传递给内核的启动参数
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use alloc::string::ToString;
 
 use crate::libs::mutex::MutexGuard;
@@ -9,7 +11,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -48,15 +50,19 @@ impl CmdlineFileOps {
 }
 
 impl FileOps for CmdlineFileOps {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let content = Self::generate_cmdline_content();
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
 
-        proc_read(offset, len, buf, &content)
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
+        &self,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // `single_open()`: one fd sees one kernel command line record.
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_cmdline_content()))
     }
 }

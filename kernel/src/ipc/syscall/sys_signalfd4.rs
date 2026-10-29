@@ -47,8 +47,9 @@ impl Syscall for SysSignalFd4Handle {
         let mask = read_user_sigset(mask_ptr, mask_size)?;
 
         if fd == -1 {
+            let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
             let inode = Arc::new(SignalFdInode::new(mask, flags));
-            let mut file_flags = FileFlags::O_RDONLY;
+            let mut file_flags = FileFlags::O_RDWR;
             if flags.contains(SignalFdFlags::SFD_NONBLOCK) {
                 file_flags |= FileFlags::O_NONBLOCK;
             }
@@ -56,11 +57,19 @@ impl Syscall for SysSignalFd4Handle {
                 file_flags |= FileFlags::O_CLOEXEC;
             }
 
-            let file = File::new(inode, file_flags)?;
+            let file = File::new_prepared_recovering(inode, file_flags, storage)?;
             let cloexec = flags.contains(SignalFdFlags::SFD_CLOEXEC);
-            let binding = ProcessManager::current_pcb().fd_table();
-            let mut fd_table_guard = binding.write();
-            let fd = fd_table_guard.alloc_fd(file, None, cloexec)?;
+            let current = ProcessManager::current_pcb();
+            let binding = current.fd_table();
+            let file = Arc::try_new(file).map_err(|_| SystemError::ENOMEM)?;
+            let fd = File::recover_io(|| {
+                binding.alloc_fd_arc(
+                    file.clone(),
+                    cloexec,
+                    current.nofile_soft_limit(),
+                    &crate::cgroup::memory::object_for_task(&current),
+                )
+            })?;
             return Ok(fd as usize);
         }
 
@@ -90,9 +99,8 @@ impl Syscall for SysSignalFd4Handle {
         let _ = file.set_flags(new_flags);
 
         // close_on_exec 是 per-fd 属性，需要通过 fd 表设置
-        let fd_table = pcb.fd_table();
-        let mut fd_table_guard = fd_table.write();
-        fd_table_guard.set_cloexec(fd, flags.contains(SignalFdFlags::SFD_CLOEXEC));
+        pcb.fd_table()
+            .set_cloexec(fd, flags.contains(SignalFdFlags::SFD_CLOEXEC))?;
 
         Ok(fd as usize)
     }

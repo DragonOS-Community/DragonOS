@@ -5,12 +5,10 @@ use system_error::SystemError;
 use crate::alloc::string::ToString;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_GETCWD;
-use crate::filesystem::vfs::utils::is_ancestor;
-use crate::mm::access_ok;
-use crate::mm::VirtAddr;
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
+use crate::syscall::user_access::UserBufferWriter;
 use alloc::vec::Vec;
 
 /// System call handler for the `getcwd` syscall
@@ -35,43 +33,21 @@ impl Syscall for SysGetcwdHandle {
         let buf_vaddr = Self::buf(args);
         let size = Self::size(args);
 
-        let security_check = || {
-            access_ok(VirtAddr::new(buf_vaddr as usize), size)?;
-            return Ok(());
-        };
-        let r = security_check();
-        if let Err(e) = r {
-            Err(e)
-        } else {
-            let buf = unsafe { core::slice::from_raw_parts_mut(buf_vaddr, size) };
-            let proc = ProcessManager::current_pcb();
-            let fs = proc.fs_struct();
-            let root = fs.root();
-            let pwd = fs.pwd();
-
-            // Linux 语义（与 gVisor 测试对齐）：
-            // - 若 cwd 不在当前 fs root 下：返回 "(unreachable)" + 旧 cwd（通常是全局路径）
-            // - 否则：返回进程维护的 cwd 字符串
-            //
-            // 说明：这里不强依赖各文件系统的 dname 缓存能力，避免 getcwd(2) 因 ENOSYS 失败。
-            let cwd = if is_ancestor(&root, &pwd) {
-                proc.basic().cwd()
-            } else {
-                let mut s = "(unreachable)".to_string();
-                s.push_str(&proc.basic().cwd());
-                s
-            };
-
-            let cwd_bytes = cwd.as_bytes();
-            let cwd_len = cwd_bytes.len();
-            if cwd_len + 1 > buf.len() {
-                return Err(SystemError::ENOMEM);
-            }
-            buf[..cwd_len].copy_from_slice(cwd_bytes);
-            buf[cwd_len] = 0;
-
-            return Ok(cwd_len + 1);
+        let mut cwd = ProcessManager::current_pcb().fs_struct().cwd_path()?;
+        let length = cwd.len().checked_add(1).ok_or(SystemError::ENAMETOOLONG)?;
+        if length > crate::filesystem::vfs::MAX_PATHLEN {
+            return Err(SystemError::ENAMETOOLONG);
         }
+        if length > size {
+            return Err(SystemError::ERANGE);
+        }
+        cwd.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+        cwd.push('\0');
+        // Path ownership/topology locks have all been released. Only actual
+        // output bytes are checked/copied, not a user's arbitrary size range.
+        let mut writer = UserBufferWriter::new(buf_vaddr, length, true)?;
+        writer.copy_to_user_protected(cwd.as_bytes(), 0)?;
+        Ok(length)
     }
 
     /// Formats the syscall parameters for display/debug purposes

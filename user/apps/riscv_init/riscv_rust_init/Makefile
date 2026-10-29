@@ -27,9 +27,6 @@ endif
 build:
 	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) build --target $(RUST_TARGET)
 
-run-dragonreach:
-	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) run --target $(RUST_TARGET) --bin DragonReach
-
 clean:
 	RUSTFLAGS=$(RUSTFLAGS) cargo $(TOOLCHAIN) clean
 

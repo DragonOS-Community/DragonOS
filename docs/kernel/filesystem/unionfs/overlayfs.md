@@ -1,26 +1,31 @@
 # overlayfs
 
-OverlayFs是目前使用最多的联合文件系统，原理简单方便使用，主要用于容器中
-在 Docker 中，OverlayFS 是默认的存储驱动之一。Docker 为每个容器创建一个独立的上层目录，而所有容器共享同一个下层镜像文件。这样的设计使得容器之间的资源共享更加高效，同时减少了存储需求。
-## 架构设计
-overlayfs主要有两个层，以及一个虚拟的合并层
-- Lower Layer（下层）：通常是 只读 文件系统。可以包含多层。
-- Upper Layer（上层）：为 可写层，所有的写操作都会在这一层上进行。
-- Merged Layer（合并层）：上层和下层的逻辑视图合并后，向用户呈现的最终文件系统。
+OverlayFS is currently the most widely used union file system, with a simple principle and convenient usage, mainly used in containers.
 
+In Docker, OverlayFS is one of the default storage drivers. Docker creates an independent upper directory for each container, while all containers share the same lower image file. This design makes resource sharing between containers more efficient and reduces storage requirements.
 
-## 工作原理
-- 读取操作：
-    -  OverlayFS 会优先从 Upper Layer 读取文件。如果文件不存在于上层，则读取 Lower Layer 中的内容。
-- 写入操作：
-    - 如果一个文件位于 Lower Layer 中，并尝试写入该文件，系统会将其 copy-up 到 Upper Layer 并在上层写入。如果文件已经存在于 Upper Layer，则直接在该层写入。
-- 删除操作：
-    - 当删除文件时，OverlayFS 会在上层创建一个标记为 whiteout 的条目，这会隐藏下层的文件。
+## Architecture Design
+
+OverlayFS has two layers and a virtual merged layer.
+
+- **Lower Layer (Lower Layer)**: Usually a read-only file system. It can contain multiple layers.
+- **Upper Layer (Upper Layer)**: A writable layer. All write operations are performed on this layer.
+- **Merged Layer (Merged Layer)**: The logical view of the upper and lower layers is merged, and the final file system presented to the user is shown.
+
+## Working Principle
+
+- **Read Operation**:
+    - OverlayFS will first read the file from the Upper Layer. If the file does not exist in the upper layer, it will read the content from the Lower Layer.
+- **Write Operation**:
+    - If a file is located in the Lower Layer and an attempt is made to write to it, the system will copy it up to the Upper Layer and then write to it in the upper layer. If the file already exists in the Upper Layer, it will be directly written to that layer.
+- **Delete Operation**:
+    - When deleting a file, OverlayFS creates a whiteout entry in the upper layer, which hides the file in the lower layer.
 
 ## Copy-up
-- 写时拷贝
-当一个文件从 下层 被修改时，它会被复制到 上层（称为 copy-up）。之后的所有修改都会发生在上层的文件副本上。
 
+- **Copy-on-Write (Write-time Copy)**
+When a file in the lower layer is modified, it is copied to the upper layer (called copy-up). All subsequent modifications will be performed on the copied file in the upper layer.
 
-## 实现逻辑
-通过构建ovlInode来实现indexnode这个trait来代表上层或者下层的inode，具体的有关文件文件夹的操作都在
+## Implementation Logic
+
+The implementation is achieved by building `ovlInode` to implement the `indexnode` trait to represent the inode of the upper or lower layer. Specific operations related to files and directories are handled accordingly.

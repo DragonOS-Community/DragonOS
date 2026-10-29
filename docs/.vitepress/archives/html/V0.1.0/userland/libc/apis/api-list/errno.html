@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>errno.h &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="fcntl.h" href="fcntl.html" />
+    <link rel="prev" title="dirent.h" href="dirent.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">LibC文档</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../intro.html">简介</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html">API文档</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="ctype.html">ctype.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="dirent.html">dirent.h</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">errno.h</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">简介：</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">属性：</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id3">宏定义（复制自代码，了解即可）：</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="fcntl.html">fcntl.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="math.html">math.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="stdio.html">stdio.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="printf.html">printf.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="stddef.html">stddef.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="stdlib.html">stdlib.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="string.html">string.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="time.html">time.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="unistd.html">unistd.h</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../design/index.html">设计文档</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">LibC文档</a></li>
+          <li class="breadcrumb-item"><a href="../index.html">API文档</a></li>
+      <li class="breadcrumb-item active">errno.h</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/325c103/docs/userland/libc/apis/api-list/errno.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="errno-h">
+<h1>errno.h<a class="headerlink" href="#errno-h" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>简介：<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>共享错误号码
+</pre></div>
+</div>
+</section>
+<section id="id2">
+<h2>属性：<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>``extern int errno`` : 通用错误代码
+</pre></div>
+</div>
+</section>
+<section id="id3">
+<h2>宏定义（复制自代码，了解即可）：<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>#define E2BIG 1            /* 参数列表过长，或者在输出buffer中缺少空间 或者参数比系统内建的最大值要大 Argument list too long.*/
+
+#define EACCES 2           /* 访问被拒绝 Permission denied*/ 
+
+#define EADDRINUSE 3       /* 地址正在被使用 Address in use.*/
+
+#define EADDRNOTAVAIL 4    /* 地址不可用 Address  not available.*/
+
+#define EAFNOSUPPORT 5     /* 地址family不支持 Address family not supported.*/
+
+#define EAGAIN 6           /* 资源不可用，请重试。 Resource unavailable, try again (may be the same value as [EWOULDBLOCK]).*/
+
+#define EALREADY 7         /* 连接已经在处理 Connection already in progress.*/
+
+#define EBADF 8            /* 错误的文件描述符 Bad file descriptor.*/
+
+#define EBADMSG 9          /* 错误的消息 Bad message.*/
+
+
+#define EBUSY 10           /* 设备或资源忙 Device or resource busy.*/
+
+#define ECANCELED 11       /* 操作被取消 Operation canceled.*/
+
+#define ECHILD 12          /* 没有子进程 No child processes.*/
+
+#define ECONNABORTED 13    /* 连接已断开 Connection aborted.*/
+
+#define ECONNREFUSED 14    /* 连接被拒绝 Connection refused.*/
+
+#define ECONNRESET 15      /* 连接被重置 Connection reset.*/
+
+#define EDEADLK 16         /* 资源死锁将要发生 Resource deadlock would occur.*/
+
+#define EDESTADDRREQ 17    /* 需要目标地址 Destination address required.*/
+
+#define EDOM 18            /* 数学参数超出作用域 Mathematics argument out of domain of function.*/
+
+#define EDQUOT 19          /* 保留使用 Reserved*/
+
+
+
+#define EEXIST 20          /* 文件已存在 File exists.*/
+
+#define EFAULT 21          /* 错误的地址 Bad address*/
+
+#define EFBIG 22           /* 文件太大 File too large.*/
+
+#define EHOSTUNREACH 23    /* 主机不可达 Host is unreachable.*/
+
+#define EIDRM 24           /* 标志符被移除 Identifier removed.*/
+
+#define EILSEQ 25          /* 不合法的字符序列 Illegal byte sequence.*/
+
+#define EINPROGRESS 26     /* 操作正在处理 Operation in progress.*/
+
+#define EINTR 27           /* 被中断的函数 Interrupted function.*/
+
+#define EINVAL 28          /* 不可用的参数 Invalid argument.*/
+
+#define EIO 29             /* I/O错误 I/O error.*/
+
+
+
+#define EISCONN 30         /* 套接字已连接 Socket is connected.*/
+
+#define EISDIR 31          /* 是一个目录 Is a directory*/
+
+#define ELOOP 32           /* 符号链接级别过多 Too many levels of symbolic links.*/
+
+#define EMFILE 33          /* 文件描述符的值过大 File descriptor value too large.*/
+
+#define EMLINK 34          /* 链接数过多 Too many links.*/
+
+#define EMSGSIZE 35        /* 消息过大 Message too large.*/
+
+#define EMULTIHOP 36       /* 保留使用 Reserved.*/
+
+#define ENAMETOOLONG 37    /* 文件名过长 Filename too long.*/
+
+#define ENETDOWN 38        /* 网络已关闭 Network is down.*/
+
+#define ENETRESET 39       /* 网络连接已断开 Connection aborted by network.*/
+
+#define ENETUNREACH 40     /* 网络不可达 Network unreachable.*/
+
+#define ENFILE 41          /* 系统中打开的文件过多 Too many files open in system.*/
+
+#define ENOBUFS 42         /* 缓冲区空间不足 No buffer space available.*/
+
+#define ENODATA 43         /* 队列头没有可读取的消息 No message is available on the STREAM head read queue.*/
+
+#define ENODEV 44          /* 没有指定的设备 No such device.*/
+
+#define ENOENT 45          /* 没有指定的文件或目录 No such file or directory.*/
+
+#define ENOEXEC 46         /* 可执行文件格式错误 Executable file format error.*/
+
+#define ENOLCK 47          /* 没有可用的锁 No locks available.*/
+
+#define ENOLINK 48         /* 保留 Reserved.*/
+
+
+#define ENOMEM 49          /* 没有足够的空间 Not enough space.*/
+
+
+#define ENOMSG 50          /* 没有期待类型的消息 No message of the desired type.*/
+
+#define ENOPROTOOPT 51     /* 协议不可用 Protocol not available.*/
+
+#define ENOSPC 52          /* 设备上没有空间 No space left on device.*/
+
+#define ENOSR 53           /* 没有STREAM资源  No STREAM resources.*/
+
+#define ENOSTR 54          /* 不是STREAM Not a STREAM*/
+
+#define ENOSYS 55          /* 功能不支持 Function not supported.*/
+
+#define ENOTCONN 56        /* 套接字未连接 The socket is not connected.*/
+
+#define ENOTDIR 57         /* 不是目录 Not a directory.*/
+
+#define ENOTEMPTY 58       /* 目录非空 Directory not empty.*/
+
+#define ENOTRECOVERABLE 59 /* 状态不可覆盖 State not recoverable.*/
+
+
+
+#define ENOTSOCK 60        /* 不是一个套接字 Not a socket.*/
+
+#define ENOTSUP 61         /* 不被支持 Not supported (may be the same value as [EOPNOTSUPP]).*/
+
+#define ENOTTY 62          /* 不正确的I/O控制操作 Inappropriate I/O control operation.*/
+
+#define ENXIO 63           /* 没有这样的设备或地址 No such device or address.*/
+
+#define EOPNOTSUPP 64      /* 套接字不支持该操作 Operation not supported on socket (may be the same value as [ENOTSUP]).*/
+
+#define EOVERFLOW 65       /* 数值过大，产生溢出 Value too large to be stored in data type.*/
+
+#define EOWNERDEAD 66      /* 之前的拥有者挂了 Previous owner died.*/
+
+#define EPERM 67           /* 操作不被允许 Operation not permitted.*/
+
+#define EPIPE 68           /* 断开的管道 Broken pipe.*/
+
+#define EPROTO 69          /* 协议错误 Protocol error.*/
+
+
+
+#define EPROTONOSUPPORT 70 /* 协议不被支持 Protocol not supported.*/
+
+#define EPROTOTYPE 71      /* 对于套接字而言，错误的协议 Protocol wrong type for socket.*/
+
+#define ERANGE 72          /* 结果过大 Result too large.*/
+
+#define EROFS 73           /* 只读的文件系统 Read-only file system.*/
+
+#define ESPIPE 74          /* 错误的寻道 Invalid seek.*/
+
+#define ESRCH 75           /* 没有这样的进程 No such process.*/
+
+#define ESTALE 76          /* 保留 Reserved.*/
+
+#define ETIME 77           /* 流式ioctl()超时 Stream ioctl() timeout*/
+
+#define ETIMEDOUT 78       /* 连接超时 Connection timed out.*/
+
+#define ETXTBSY 79         /* 文本文件忙 Text file busy.*/
+
+
+
+#define EWOULDBLOCK 80     /* 操作将被禁止 Operation would block (may be the same value as [EAGAIN]).*/
+
+#define EXDEV 81           /* 跨设备连接 Cross-device link.*/
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="dirent.html" class="btn btn-neutral float-left" title="dirent.h" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="fcntl.html" class="btn btn-neutral float-right" title="fcntl.h" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>325c103</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="errno.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/userland/libc/apis/api-list/errno.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/userland/libc/apis/api-list/errno.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/userland/libc/apis/api-list/errno.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/userland/libc/apis/api-list/errno.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/userland/libc/apis/api-list/errno.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/userland/libc/apis/api-list/errno.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/userland/libc/apis/api-list/errno.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/userland/libc/apis/api-list/errno.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

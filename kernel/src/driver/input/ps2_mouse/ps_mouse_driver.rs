@@ -267,7 +267,7 @@ impl SerioDriver for Ps2MouseDriver {
     }
 
     fn disconnect(&self, _device: &Arc<dyn SerioDevice>) -> Result<(), system_error::SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
 
     // TODO: https://elixir.bootlin.com/linux/v6.6/source/drivers/input/mouse/psmouse-base.c#L1428

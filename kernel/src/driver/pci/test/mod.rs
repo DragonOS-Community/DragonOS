@@ -17,7 +17,7 @@ static mut TEST_DEVICE: Option<Arc<TestDevice>> = None;
 pub fn pt_init() -> Result<(), SystemError> {
     let tdev = Arc::new(TestDevice::new());
     let mut drv = TestDriver::new();
-    drv.add_dynid(PciDeviceID::dummpy())?;
+    drv.add_dynid(PciDeviceID::any())?;
     let tdrv = Arc::new(drv);
 
     let _ = pci_device_manager().device_add(tdev.clone());

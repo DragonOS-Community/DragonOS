@@ -12,6 +12,7 @@ pub mod entry;
 pub mod extable;
 pub mod handle;
 pub mod init;
+pub mod interrupt_context;
 pub mod ipi;
 pub mod irqchip;
 pub mod irqdata;
@@ -23,7 +24,12 @@ mod resend;
 pub mod softirq;
 pub mod sysfs;
 pub mod tasklet;
+#[cfg(target_arch = "x86_64")]
+pub mod uprobe;
 pub mod workqueue;
+
+pub(crate) use interrupt_context::enter_hardirq;
+pub use interrupt_context::{in_hardirq, in_interrupt};
 
 /// 中断的架构相关的trait
 pub trait InterruptArch: Send + Sync {

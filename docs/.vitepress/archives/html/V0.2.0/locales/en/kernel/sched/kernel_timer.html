@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kernel Timer &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Inter-Process Communication" href="../ipc/index.html" />
+    <link rel="prev" title="APIs Related to Real-Time Process Scheduler" href="rt.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">DragonOS Scheduling</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="c_waiting.html">APIs Related to “Waiting” (C Language)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rust_waiting.html">APIs Related to “Waiting” (Rust Language)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="core.html">APIs Related to Process Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cfs.html">APIs Related to the Completely Fair Scheduler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rt.html">APIs Related to Real-Time Process Scheduler</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Kernel Timer</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#introduction">1. Introduction</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#design-concept">2. Design Concept</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#features-that-the-timer-should-implement">3. Features That the Timer Should Implement</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#timer-api">4. Timer API</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#creating-a-timer-instance">5. Creating a Timer Instance</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Inter-Process Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS Scheduling</a></li>
+      <li class="breadcrumb-item active">Kernel Timer</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/locales/en/kernel/sched/kernel_timer.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/sched/kernel_timer.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:48</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="kernel-timer">
+<h1>Kernel Timer<a class="headerlink" href="#kernel-timer" title="Permalink to this heading"></a></h1>
+<section id="introduction">
+<h2>1. Introduction<a class="headerlink" href="#introduction" title="Permalink to this heading"></a></h2>
+<p>  The kernel timer is a type of timer within the kernel. The working mechanism of the kernel timer is: adding the timer to a queue and setting the expiration time for each timer. When the timer expires, the function corresponding to the timer is executed.</p>
+</section>
+<section id="design-concept">
+<h2>2. Design Concept<a class="headerlink" href="#design-concept" title="Permalink to this heading"></a></h2>
+<p>  The timer type is a structure of <code class="docutils literal notranslate"><span class="pre">Timer</span></code>, and <code class="docutils literal notranslate"><span class="pre">Timer</span></code> is composed of <code class="docutils literal notranslate"><span class="pre">SpinLock&lt;InnerTimer&gt;</span></code>. A global queue <code class="docutils literal notranslate"><span class="pre">TIMER_LIST</span></code> with element type <code class="docutils literal notranslate"><span class="pre">Arc&lt;Timer&gt;</span></code> is used to store the timers created by the system. When creating a timer, you should call <code class="docutils literal notranslate"><span class="pre">Timer::new(timer_func,expire_jiffies)</span></code>, where timer_func is the function to be executed by the timer, expire_jiffies is the expiration time of the timer, and the type of <code class="docutils literal notranslate"><span class="pre">timer_func</span></code> parameter is a structure that implements the <code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code> characteristic. After creating the timer, you should use <code class="docutils literal notranslate"><span class="pre">Timer::activate()</span></code> to insert the timer into <code class="docutils literal notranslate"><span class="pre">TIMER_LIST</span></code>.</p>
+<p>  <strong>If you only want the current PCB to sleep for a certain period, you should call <code class="docutils literal notranslate"><span class="pre">schedule_timeout(timeout)</span></code>, and timeout specifies the duration of the PCB sleep.</strong></p>
+</section>
+<section id="features-that-the-timer-should-implement">
+<h2>3. Features That the Timer Should Implement<a class="headerlink" href="#features-that-the-timer-should-implement" title="Permalink to this heading"></a></h2>
+<p>  The function to be executed by the timer should implement the <code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code> characteristic, and its definition is as follows:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// 定时器要执行的函数的特征</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">TimerFunction</span>: <span class="nb">Send</span> <span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">run</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  A typical implementation method is: creating a zero-length structure, implementing the <code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code> characteristic, and then implementing the operation to be performed by the timer in the <code class="docutils literal notranslate"><span class="pre">run</span></code> function.</p>
+</section>
+<section id="timer-api">
+<h2>4. Timer API<a class="headerlink" href="#timer-api" title="Permalink to this heading"></a></h2>
+<section id="id1">
+<h3>4.1. Timer API<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h3>
+<section id="create-a-timer">
+<h4>4.1.1. Create a Timer<a class="headerlink" href="#create-a-timer" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">(</span><span class="n">timer_func</span>: <span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">TimerFunction</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">expire_jiffies</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">Arc</span><span class="o">&lt;</span><span class="bp">Self</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p><strong>Parameters</strong></p>
+<ul class="simple">
+<li><p>timer_func: A structure corresponding to the function that the timer needs to execute, which implements the <code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code> characteristic</p></li>
+<li><p>expire_jiffies: The expiration time of the timer (unit: <strong>jiffies</strong>)</p></li>
+</ul>
+<p><strong>Return</strong></p>
+<ul class="simple">
+<li><p>Pointer to the timer structure</p></li>
+</ul>
+</section>
+<section id="insert-the-timer-into-the-timer-list">
+<h4>4.1.2. Insert the Timer into the Timer List<a class="headerlink" href="#insert-the-timer-into-the-timer-list" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">activate</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="other-apis">
+<h3>4.2. Other APIs<a class="headerlink" href="#other-apis" title="Permalink to this heading"></a></h3>
+<p>  <strong>If you want to use the following functions in a .c module, please add rs_ before the function name.</strong></p>
+<section id="make-the-process-sleep-for-a-certain-period">
+<h4>4.2.1. Make the Process Sleep for a Certain Period<a class="headerlink" href="#make-the-process-sleep-for-a-certain-period" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">schedule_timeout</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">timeout</span>: <span class="kt">i64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="n">SystemError</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p><strong>Function</strong></p>
+<p>  Make the process sleep for timeout jiffies</p>
+<p><strong>Parameters</strong></p>
+<ul class="simple">
+<li><p>timeout: The time to sleep (unit: <strong>jiffies</strong>)</p></li>
+</ul>
+<p><strong>Return Value</strong></p>
+<ul class="simple">
+<li><p>Ok(i64): Remaining time to sleep (unit: <strong>jiffies</strong>)</p></li>
+<li><p>Err(SystemError): Error code</p></li>
+</ul>
+</section>
+<section id="get-the-expiration-time-of-the-first-timer-in-the-queue">
+<h4>4.2.2. Get the Expiration Time of the First Timer in the Queue<a class="headerlink" href="#get-the-expiration-time-of-the-first-timer-in-the-queue" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">timer_get_first_expire</span><span class="p">()</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">u64</span><span class="p">,</span><span class="w"> </span><span class="n">SystemError</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p><strong>Function</strong></p>
+<p>  Get the expiration time of the first timer in the queue, i.e., the expiration time of the earliest expiring timer</p>
+<p><strong>Return Value</strong></p>
+<ul class="simple">
+<li><p>Ok(i64): Expiration time of the earliest expiring timer (unit: <strong>jiffies</strong>)</p></li>
+<li><p>Err(SystemError): Error code</p></li>
+</ul>
+</section>
+<section id="get-the-current-system-time">
+<h4>4.2.3. Get the Current System Time<a class="headerlink" href="#get-the-current-system-time" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">clock</span><span class="p">()</span><span class="w"> </span>-&gt; <span class="kt">u64</span> 
+</pre></div>
+</div>
+<p><strong>Function</strong></p>
+<p>  Get the current system time (unit: <strong>jiffies</strong>)</p>
+</section>
+<section id="calculate-the-timer-time-slice-corresponding-to-the-next-n-milliseconds-or-microseconds">
+<h4>4.2.4. Calculate the Timer Time Slice Corresponding to the Next n Milliseconds or Microseconds<a class="headerlink" href="#calculate-the-timer-time-slice-corresponding-to-the-next-n-milliseconds-or-microseconds" title="Permalink to this heading"></a></h4>
+<section id="milliseconds">
+<h5>4.2.4.1. Milliseconds<a class="headerlink" href="#milliseconds" title="Permalink to this heading"></a></h5>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">next_n_ms_timer_jiffies</span><span class="p">(</span><span class="n">expire_ms</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">u64</span>
+</pre></div>
+</div>
+<p><strong>Function</strong></p>
+<p>  Calculate the timer time slice corresponding to the next n <strong>milliseconds</strong></p>
+<p><strong>Parameters</strong></p>
+<ul class="simple">
+<li><p>expire_ms: n milliseconds</p></li>
+</ul>
+<p><strong>Return Value</strong></p>
+<p>  The corresponding timer time slice (unit: <strong>milliseconds</strong>)</p>
+</section>
+<section id="microseconds">
+<h5>4.2.4.2. Microseconds<a class="headerlink" href="#microseconds" title="Permalink to this heading"></a></h5>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">next_n_us_timer_jiffies</span><span class="p">(</span><span class="n">expire_us</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">u64</span>
+</pre></div>
+</div>
+<p><strong>Function</strong></p>
+<p>  Calculate the timer time slice corresponding to the next n <strong>microseconds</strong></p>
+<p><strong>Parameters</strong></p>
+<ul class="simple">
+<li><p>expire_ms: n microseconds</p></li>
+</ul>
+<p><strong>Return Value</strong></p>
+<p>  The corresponding timer time slice (unit: <strong>microseconds</strong>)</p>
+</section>
+</section>
+</section>
+</section>
+<section id="creating-a-timer-instance">
+<h2>5. Creating a Timer Instance<a class="headerlink" href="#creating-a-timer-instance" title="Permalink to this heading"></a></h2>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span> <span class="nc">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 结构体的成员对应函数的形参</span>
+<span class="w">    </span><span class="n">example_parameter</span>: <span class="kt">i32</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">(</span><span class="n">para</span>: <span class="kt">i32</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Box</span><span class="o">&lt;</span><span class="n">TimerExample</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nb">Box</span>::<span class="n">new</span><span class="p">(</span><span class="n">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">example_parameter</span>: <span class="nc">para</span><span class="p">,</span>
+<span class="w">        </span><span class="p">});</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="sd">/// 为结构体实现TimerFunction特性</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">TimerFunction</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// TimerFunction特性中的函数run</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">run</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 定时器需要执行的操作</span>
+<span class="w">        </span><span class="n">example_func</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">example_parameter</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="k">fn</span> <span class="nf">example_func</span><span class="p">(</span><span class="n">para</span>: <span class="kt">i32</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;para is {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">para</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="k">fn</span> <span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">timer_example</span>: <span class="nb">Box</span><span class="o">&lt;</span><span class="n">TimerExample</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TimerExample</span>::<span class="n">new</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 创建一个定时器</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">timer</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="n">Timer</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Timer</span>::<span class="n">new</span><span class="p">(</span><span class="n">timer_example</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 将定时器插入队列</span>
+<span class="w">    </span><span class="n">timer</span><span class="p">.</span><span class="n">activate</span><span class="p">();</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="rt.html" class="btn btn-neutral float-left" title="APIs Related to Real-Time Process Scheduler" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../ipc/index.html" class="btn btn-neutral float-right" title="Inter-Process Communication" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="kernel_timer.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/kernel/sched/kernel_timer.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/sched/kernel_timer.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/sched/kernel_timer.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

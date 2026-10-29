@@ -3,30 +3,36 @@ pub use multicast::MulticastMessage;
 
 use crate::net::socket::netlink::addr::multicast::GroupIdSet;
 use crate::net::socket::netlink::kobject::message::KobjectUeventMessage;
+use crate::net::socket::netlink::netfilter::{NetfilterKernelSocket, NetfilterMessage};
 use crate::net::socket::netlink::route::kern::NetlinkRouteKernelSocket;
-use crate::net::socket::netlink::route::message::RouteNlMessage;
+use crate::net::socket::netlink::route::message::RouteNlPacket;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 use crate::{libs::rand, net::socket::netlink::addr::NetlinkSocketAddr};
 use crate::{
     libs::rwsem::RwSem,
-    net::socket::netlink::{receiver::MessageReceiver, table::multicast::MulticastGroup},
+    net::socket::netlink::{
+        receiver::{MessageQueue, MessageReceiver},
+        table::multicast::MulticastGroup,
+    },
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::fmt::Debug;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use hashbrown::HashMap;
 use system_error::SystemError;
 
 pub const MAX_ALLOWED_PROTOCOL_ID: u32 = 32;
-const MAX_GROUPS: u32 = 32;
+const MAX_GROUPS: u32 = 64;
 
 #[derive(Debug)]
 pub struct NetlinkSocketTable {
-    route: Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>>,
+    route: Arc<RwSem<ProtocolSocketTable<RouteNlPacket>>>,
     kobject_uevent: Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>>,
+    netfilter: Arc<RwSem<ProtocolSocketTable<NetfilterMessage>>>,
 }
 
 impl Default for NetlinkSocketTable {
@@ -34,17 +40,22 @@ impl Default for NetlinkSocketTable {
         Self {
             route: Arc::new(RwSem::new(ProtocolSocketTable::new())),
             kobject_uevent: Arc::new(RwSem::new(ProtocolSocketTable::new())),
+            netfilter: Arc::new(RwSem::new(ProtocolSocketTable::new())),
         }
     }
 }
 
 impl NetlinkSocketTable {
-    pub fn route(&self) -> Arc<RwSem<ProtocolSocketTable<RouteNlMessage>>> {
+    pub fn route(&self) -> Arc<RwSem<ProtocolSocketTable<RouteNlPacket>>> {
         self.route.clone()
     }
 
     pub fn kobject_uevent(&self) -> Arc<RwSem<ProtocolSocketTable<KobjectUeventMessage>>> {
         self.kobject_uevent.clone()
+    }
+
+    pub fn netfilter(&self) -> Arc<RwSem<ProtocolSocketTable<NetfilterMessage>>> {
+        self.netfilter.clone()
     }
 }
 
@@ -93,28 +104,34 @@ impl<Message: 'static + Debug> ProtocolSocketTable<Message> {
         Ok(BoundHandle::new(socket_table, port, addr.groups()))
     }
 
-    fn unicast(&self, dst_port: u32, message: Message) -> Result<(), SystemError> {
-        let Some(receiver) = self.unicast_sockets.get(&dst_port) else {
-            return Ok(());
-        };
-        receiver.enqueue_message(message)
-    }
-
-    fn multicast(&self, dst_groups: GroupIdSet, message: Message) -> Result<(), SystemError>
-    where
-        Message: MulticastMessage,
-    {
+    fn group_receivers(
+        &self,
+        dst_groups: GroupIdSet,
+        excluded_port: Option<u32>,
+    ) -> Result<Vec<MessageReceiver<Message>>, SystemError> {
+        let mut receivers = Vec::new();
         for group_id in dst_groups.ids_iter() {
             let Some(group) = self.multicast_groups.get(group_id as usize) else {
                 continue;
             };
             for member in group.members() {
+                if Some(*member) == excluded_port {
+                    continue;
+                }
                 if let Some(receiver) = self.unicast_sockets.get(member) {
-                    receiver.enqueue_message(message.clone())?;
+                    receivers.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                    receivers.push(receiver.clone());
                 }
             }
         }
-        Ok(())
+        Ok(receivers)
+    }
+
+    fn has_group_listeners(&self, group_id: u32) -> bool {
+        group_id
+            .checked_sub(1)
+            .and_then(|index| self.multicast_groups.get(index as usize))
+            .is_some_and(|group| !group.members().is_empty())
     }
 }
 
@@ -199,7 +216,63 @@ impl<Message: 'static + Debug> Drop for BoundHandle<Message> {
 }
 
 pub trait SupportedNetlinkProtocol: Debug {
-    type Message: 'static + Send + Debug;
+    type Message: 'static + Send + Debug + Clone;
+    type SocketState: Default + Debug + Send + Sync;
+
+    fn multicast_group_count() -> u32;
+
+    fn new_message_queue() -> MessageQueue<Self::Message>;
+
+    fn message_bytes(message: &Self::Message) -> &[u8];
+
+    fn message_source(_message: &Self::Message) -> NetlinkSocketAddr {
+        NetlinkSocketAddr::new_unspecified()
+    }
+
+    fn drive_receive(_bound: &crate::net::socket::netlink::common::bound::BoundNetlink<Self>)
+    where
+        Self: Sized,
+    {
+    }
+
+    fn userspace_send_supported() -> bool {
+        false
+    }
+
+    fn send_userspace(
+        _buf: Vec<u8>,
+        _to: NetlinkSocketAddr,
+        _netns: Arc<NetNamespace>,
+        _nonblocking: bool,
+        _timeout: Option<crate::time::Duration>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
+    fn check_bind(
+        _addr: &NetlinkSocketAddr,
+        _netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn check_connect(
+        _addr: &NetlinkSocketAddr,
+        _netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn check_explicit_send(
+        _addr: &NetlinkSocketAddr,
+        _netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn check_membership(_netns: &Arc<NetNamespace>) -> Result<(), SystemError> {
+        Ok(())
+    }
 
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>>;
 
@@ -218,7 +291,77 @@ pub trait SupportedNetlinkProtocol: Debug {
         message: Self::Message,
         netns: Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
-        Self::socket_table(netns).read().unicast(dst_port, message)
+        Self::receiver(dst_port, netns)?.enqueue_message(message)
+    }
+
+    fn receiver(
+        dst_port: u32,
+        netns: Arc<NetNamespace>,
+    ) -> Result<MessageReceiver<Self::Message>, SystemError> {
+        Self::socket_table(netns)
+            .read()
+            .unicast_sockets
+            .get(&dst_port)
+            .filter(|receiver| !receiver.is_closed())
+            .cloned()
+            .ok_or(SystemError::ECONNREFUSED)
+    }
+
+    fn enqueue_dump(
+        dst_port: u32,
+        message: Self::Message,
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Self::receiver(dst_port, netns)?.enqueue_dump(message)
+    }
+
+    fn report_overrun(dst_port: u32, netns: Arc<NetNamespace>) {
+        if let Ok(receiver) = Self::receiver(dst_port, netns) {
+            receiver.report_overrun();
+        }
+    }
+
+    fn notify_group(
+        group_id: u32,
+        excluded_port: u32,
+        message: Self::Message,
+        netns: Arc<NetNamespace>,
+    ) where
+        Self::Message: MulticastMessage,
+    {
+        let Some(index) = group_id.checked_sub(1).filter(|index| *index < MAX_GROUPS) else {
+            return;
+        };
+        let table = Self::socket_table(netns);
+        let receivers = table
+            .read()
+            .group_receivers(GroupIdSet::new_u64(1u64 << index), Some(excluded_port));
+        if let Ok(receivers) = receivers {
+            for receiver in receivers {
+                let _ = receiver.enqueue_message(message.clone());
+            }
+        }
+    }
+
+    fn report_group_overrun(group_id: u32, excluded_port: u32, netns: Arc<NetNamespace>) {
+        let Some(index) = group_id.checked_sub(1).filter(|index| *index < MAX_GROUPS) else {
+            return;
+        };
+        let table = Self::socket_table(netns);
+        let receivers = table
+            .read()
+            .group_receivers(GroupIdSet::new_u64(1u64 << index), Some(excluded_port));
+        if let Ok(receivers) = receivers {
+            for receiver in receivers {
+                receiver.report_overrun();
+            }
+        }
+    }
+
+    fn has_group_listeners(group_id: u32, netns: Arc<NetNamespace>) -> bool {
+        Self::socket_table(netns)
+            .read()
+            .has_group_listeners(group_id)
     }
 
     //todo 多播消息用
@@ -231,9 +374,15 @@ pub trait SupportedNetlinkProtocol: Debug {
     where
         Self::Message: MulticastMessage,
     {
-        Self::socket_table(netns)
-            .read()
-            .multicast(dst_groups, message)
+        let table = Self::socket_table(netns);
+        let receivers = table.read().group_receivers(dst_groups, None)?;
+        let mut result = Ok(());
+        for receiver in receivers {
+            if let Err(error) = receiver.enqueue_message(message.clone()) {
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
@@ -241,18 +390,104 @@ pub trait SupportedNetlinkProtocol: Debug {
 pub struct NetlinkRouteProtocol;
 
 impl SupportedNetlinkProtocol for NetlinkRouteProtocol {
-    type Message = RouteNlMessage;
+    type Message = RouteNlPacket;
+    type SocketState = crate::net::socket::netlink::route::dump::RouteSocketState;
+
+    fn message_bytes(message: &Self::Message) -> &[u8] {
+        message.as_bytes()
+    }
+    fn message_source(message: &Self::Message) -> NetlinkSocketAddr {
+        message.source()
+    }
+    fn drive_receive(bound: &crate::net::socket::netlink::common::bound::BoundNetlink<Self>) {
+        bound.protocol_state.drive_if_queue_empty(
+            &bound.receive_queue,
+            bound.handle.port(),
+            &bound.netns,
+        );
+    }
+
+    fn multicast_group_count() -> u32 {
+        33
+    }
+
+    fn new_message_queue() -> MessageQueue<Self::Message> {
+        MessageQueue::new(RouteNlPacket::queue_charge)
+    }
+
+    fn check_connect(
+        addr: &NetlinkSocketAddr,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        if addr.port() != 0 || !addr.groups().is_empty() {
+            Self::check_group_send_permission(netns)?;
+        }
+        Ok(())
+    }
+
+    fn check_explicit_send(
+        addr: &NetlinkSocketAddr,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        Self::check_connect(addr, netns)
+    }
 
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().route()
     }
 }
 
+impl NetlinkRouteProtocol {
+    pub(super) fn check_group_send_permission(
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        use crate::process::cred::CAPFlags;
+        if ProcessManager::current_pcb()
+            .cred()
+            .has_capability_in_ns(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
+        {
+            Ok(())
+        } else {
+            Err(SystemError::EPERM)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NetlinkKobjectUeventProtocol;
 
+#[derive(Debug)]
+pub struct NetlinkNetfilterProtocol;
+
 impl SupportedNetlinkProtocol for NetlinkKobjectUeventProtocol {
     type Message = KobjectUeventMessage;
+    type SocketState = ();
+
+    fn message_bytes(message: &Self::Message) -> &[u8] {
+        message.as_bytes()
+    }
+
+    fn new_message_queue() -> MessageQueue<Self::Message> {
+        MessageQueue::new(KobjectUeventMessage::queue_charge)
+    }
+
+    fn userspace_send_supported() -> bool {
+        true
+    }
+
+    fn send_userspace(
+        buf: Vec<u8>,
+        to: NetlinkSocketAddr,
+        netns: Arc<NetNamespace>,
+        nonblocking: bool,
+        timeout: Option<crate::time::Duration>,
+    ) -> Result<usize, SystemError> {
+        crate::net::socket::netlink::kobject::send_userspace(buf, to, netns, nonblocking, timeout)
+    }
+
+    fn multicast_group_count() -> u32 {
+        1
+    }
 
     fn socket_table(netns: Arc<NetNamespace>) -> Arc<RwSem<ProtocolSocketTable<Self::Message>>> {
         netns.netlink_socket_table().kobject_uevent()
@@ -276,6 +511,9 @@ pub fn generate_supported_netlink_kernel_sockets() -> HashMap<u32, Arc<dyn Netli
         HashMap::with_capacity(MAX_ALLOWED_PROTOCOL_ID as usize);
     let route_socket = Arc::new(NetlinkRouteKernelSocket::new());
     sockets.insert(route_socket.protocol().into(), route_socket);
+
+    let netfilter_socket = Arc::new(NetfilterKernelSocket);
+    sockets.insert(netfilter_socket.protocol().into(), netfilter_socket);
 
     // Add other supported netlink kernel sockets here
     sockets

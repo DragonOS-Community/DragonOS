@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -9,10 +10,10 @@
 #include <unistd.h>
 
 #define SERVER_IP "192.168.2.3"
-#define FAKE_SERVER_IP "192.168.2.1"
 #define CLIENT_IP "192.168.1.1"
 #define PORT 34254
 #define BUFFER_SIZE 1024
+#define CLIENT_DEVICE "veth-ns1"
 
 // 错误处理函数
 void handle_error_message(const char *message) {
@@ -30,6 +31,14 @@ void *server_func(void *arg) {
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         handle_error_message("[server] Failed to create socket");
     }
+    int pktinfo_enabled = 1;
+    if (setsockopt(sockfd,
+                   IPPROTO_IP,
+                   IP_PKTINFO,
+                   &pktinfo_enabled,
+                   sizeof(pktinfo_enabled)) < 0) {
+        handle_error_message("[server] Failed to enable IP_PKTINFO");
+    }
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -45,15 +54,37 @@ void *server_func(void *arg) {
     }
     printf("[server] Listening on %s:%d\n", SERVER_IP, PORT);
 
-    ssize_t n = recvfrom(sockfd,
-                         buffer,
-                         BUFFER_SIZE,
-                         0,
-                         (struct sockaddr *)&client_addr,
-                         &client_len);
+    char control[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    struct iovec iov = {
+        .iov_base = buffer,
+        .iov_len = BUFFER_SIZE,
+    };
+    struct msghdr msg = {
+        .msg_name = &client_addr,
+        .msg_namelen = client_len,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control,
+        .msg_controllen = sizeof(control),
+    };
+    ssize_t n = recvmsg(sockfd, &msg, 0);
     if (n < 0) {
         handle_error_message("[server] Failed to receive");
     }
+    const struct in_pktinfo *pktinfo = NULL;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+            pktinfo = (const struct in_pktinfo *)CMSG_DATA(cmsg);
+            break;
+        }
+    }
+    assert(pktinfo != NULL && "[server] Missing IP_PKTINFO");
+    unsigned int ingress_ifindex = if_nametoindex("veth-host1");
+    assert(ingress_ifindex != 0 && "[server] Missing ingress interface");
+    assert(pktinfo->ipi_ifindex == (int)ingress_ifindex &&
+           "[server] IP_PKTINFO must report the physical ingress interface");
     buffer[n] = '\0'; // 确保字符串正确终止
 
     // //debug
@@ -97,6 +128,13 @@ void *client_func(void *arg) {
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         handle_error_message("[client] Failed to create socket");
     }
+    if (setsockopt(sockfd,
+                   SOL_SOCKET,
+                   SO_BINDTODEVICE,
+                   CLIENT_DEVICE,
+                   sizeof(CLIENT_DEVICE)) < 0) {
+        handle_error_message("[client] Failed to bind to " CLIENT_DEVICE);
+    }
 
     memset(&client_addr, 0, sizeof(client_addr));
     client_addr.sin_family = AF_INET;
@@ -114,7 +152,7 @@ void *client_func(void *arg) {
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, FAKE_SERVER_IP, &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
         handle_error_message("[client] Invalid server IP address for connect");
     }
 
@@ -126,6 +164,9 @@ void *client_func(void *arg) {
 
     if (send(sockfd, msg, strlen(msg), 0) < 0) {
         handle_error_message("[client] Failed to send");
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, "", 0) < 0) {
+        handle_error_message("[client] Failed to clear SO_BINDTODEVICE");
     }
     printf("[client] Sent: %s\n", msg);
 

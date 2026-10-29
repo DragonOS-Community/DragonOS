@@ -5,8 +5,11 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+mod device;
 mod kprobe;
 mod subsys;
+#[cfg(target_arch = "x86_64")]
+mod uprobe;
 
 static mut EVENT_SOURCE_BUS: Option<Arc<EventSourceBus>> = None;
 

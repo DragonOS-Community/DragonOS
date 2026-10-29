@@ -18,6 +18,26 @@ RUNNER_DIR = runner
 RUNNER_BIN = $(RUNNER_DIR)/target/$(RUST_TARGET)/release/dunitest-runner
 RESULTS_DIR = results
 BIN_DIR = bin
+BUILD_DIR = build
+EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
+EXT4_ORPHAN_FIXTURE = $(BUILD_DIR)/fixtures/ext4_orphan_recovery.img
+EXT4_SHARED_XATTR_FIXTURE = $(BUILD_DIR)/fixtures/ext4_shared_xattr.img
+EXT4_HOST_TEST_DIR = ../../../../kernel/crates/another_ext4/ext4_test
+# 生成 ext4 fixture 的宿主辅助程序。默认通过 cargo 现场构建运行；
+# 无法在构建期运行 cargo 的环境（如 nix 沙箱）可通过 EXT4_HOST_TOOL_BIN_DIR 指定预先构建好的程序目录。
+ifdef EXT4_HOST_TOOL_BIN_DIR
+ext4_host_tool = $(EXT4_HOST_TOOL_BIN_DIR)/$(1)
+ext4_host_tool_deps =
+else
+ext4_host_tool = cargo $(TOOLCHAIN) run --quiet --release --manifest-path $(EXT4_HOST_TEST_DIR)/Cargo.toml --bin $(1) --
+ext4_host_tool_deps = $(EXT4_HOST_TEST_DIR)/src/bin/$(1).rs $(EXT4_HOST_TEST_DIR)/src/block_file.rs $(EXT4_HOST_TEST_DIR)/Cargo.toml $(EXT4_HOST_TEST_DIR)/Cargo.lock $(EXT4_HOST_TEST_DIR)/../Cargo.toml $(wildcard $(EXT4_HOST_TEST_DIR)/../src/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*.rs $(EXT4_HOST_TEST_DIR)/../src/*/*/*.rs)
+endif
+EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
+FAT_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat_stat_blocks.img
+FAT32_STAT_FIXTURE = $(BUILD_DIR)/fixtures/fat32_stat_blocks.img
+FAT12_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat12_directory.img
+FAT12_NEAR_LIMIT_FIXTURE = $(BUILD_DIR)/fixtures/fat12_near_limit.img
+FAT16_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat16_directory.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -26,6 +46,7 @@ GTEST_ROOT = third_party/googletest
 GTEST_REPO = https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest
 GTEST_TAG = v1.17.0
 GTEST_SRC = $(GTEST_ROOT)/googletest/src/gtest-all.cc
+GTEST_OBJ = $(BUILD_DIR)/gtest/gtest-all.o
 GTEST_TMP_ROOT = $(GTEST_ROOT).tmp
 CXX ?= g++
 CXXFLAGS ?= -Wall -O2 -std=c++17 -pthread
@@ -55,12 +76,116 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS)
+build-suites: $(EXT4_SHARED_XATTR_FIXTURE) $(TEST_BINS) $(EXT4_ORPHAN_FIXTURE) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE)
 
-$(BIN_DIR)/%_test: suites/%.cc $(GTEST_SRC)
+# 4108 sectors, 1 reserved, 2x12 FAT sectors, 2 root sectors: 4081 data
+# clusters. Highest index 4082 (0xff2) is a legal FAT12 link destination.
+# Explicit geometry prevents mkfs track/alignment rounding below 0xff0.
+$(FAT12_NEAR_LIMIT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 2103296 "$@"
+	@mkfs.fat -F 12 -S 512 -s 1 -r 32 -a -g 1/1 "$@"
+
+$(FAT12_DIRECTORY_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 1M "$@"
+	@mkfs.fat -F 12 -S 512 -s 1 -r 32 "$@"
+
+$(FAT16_DIRECTORY_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 16M "$@"
+	@mkfs.fat -F 16 -S 512 -s 4 -r 64 "$@"
+
+# Fixed FAT16 geometry permits exact sector assertions and covers its
+# non-cluster root directory. Tests always mutate their own disposable copy.
+$(FAT_STAT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 16M "$@"
+	@mkfs.fat -F 16 -S 512 -s 4 -r 16 "$@"
+
+# More than 65525 data clusters: a legal FAT32 image, not forced FAT32 on
+# an undersized volume. One 512-byte sector per cluster gives exact units.
+$(FAT32_STAT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 40M "$@"
+	@mkfs.fat -F 32 -S 512 -s 1 "$@"
+
+# another_ext4 supports 4 KiB blocks; upstream mke2fs defaults give small
+# filesystems 1 KiB blocks unless the host mke2fs.conf (e.g. Debian) overrides it.
+$(EXT4_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 8M "$@"
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -O ^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set: ^orphan_file"*) \
+				rm -f "$@"; \
+				truncate -s 8M "$@"; \
+				mke2fs -q -t ext4 -F -b 4096 "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
+
+# e2fsprogs independently encodes the shared xattr image; the host helper only
+# establishes its three references and verifies checksums and peer isolation.
+.DELETE_ON_ERROR: $(EXT4_SHARED_XATTR_FIXTURE)
+$(EXT4_SHARED_XATTR_FIXTURE): $(call ext4_host_tool_deps,shared_xattr)
+	@mkdir -p "$(dir $@)"
+	@$(call ext4_host_tool,shared_xattr) --seed "$(abspath $@)"
+
+# Use production journaled unlink, retaining the orphan lifetime across a crash.
+# another_ext4 supports 4 KiB blocks; do not inherit mke2fs host defaults.
+.DELETE_ON_ERROR: $(EXT4_ORPHAN_FIXTURE)
+$(EXT4_ORPHAN_FIXTURE): $(call ext4_host_tool_deps,orphan_recovery_fixture)
+	@mkdir -p "$(dir $@)"
+	@truncate -s 8M "$@"
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -I 256 -O ^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set: ^orphan_file"*) \
+				mke2fs -q -t ext4 -F -b 4096 -I 256 "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
+	@$(call ext4_host_tool,orphan_recovery_fixture) --in-place "$@"
+
+# Small block groups force a modest payload into legal BLOCK_UNINIT groups.
+# Keep lazy bitmap initialization enabled; never pre-mount this source image.
+$(EXT4_UNINIT_FIXTURE):
+	@mkdir -p "$(dir $@)"
+	@truncate -s 32M "$@"
+	@output=$$(mke2fs -q -t ext4 -F -b 4096 -g 1024 -G 2 -I 256 -O metadata_csum,64bit,flex_bg,^orphan_file "$@" 2>&1) || { \
+		case "$$output" in \
+			*"Invalid filesystem option set:"*"orphan_file"*) \
+				rm -f "$@"; \
+				truncate -s 32M "$@"; \
+				mke2fs -q -t ext4 -F -b 4096 -g 1024 -G 2 -I 256 -O metadata_csum,64bit,flex_bg "$@" ;; \
+			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
+		esac; \
+	}
+
+$(GTEST_OBJ): $(GTEST_SRC)
+	@mkdir -p "$(dir $@)"
+	@echo "编译 googletest: $(GTEST_SRC) -> $@"
+	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) -c "$(GTEST_SRC)" -o "$@"
+
+$(BIN_DIR)/%_test: suites/%.cc $(GTEST_OBJ)
 	@mkdir -p "$(dir $@)"
 	@echo "编译测例: $< -> $@"
-	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_SRC) -o "$@"
+	@$(CXX) $(CXXFLAGS) $(GTEST_INCLUDES) "$<" $(GTEST_OBJ) -o "$@"
+
+$(BIN_DIR)/normal/fat_rename_aliases_test $(BIN_DIR)/normal/fat_rename_atomicity_test $(BIN_DIR)/normal/fat_timestamps_test $(BIN_DIR)/normal/ext4_write_progress_test $(BIN_DIR)/normal/pwritev2_sync_test $(BIN_DIR)/normal/vector_write_privileges_test $(BIN_DIR)/normal/ext4_shared_xattr_test $(BIN_DIR)/normal/overlayfs_semantics_test $(BIN_DIR)/normal/ext4_nested_writeback_test $(BIN_DIR)/normal/ext4_orphan_recovery_test $(BIN_DIR)/normal/xattr_syscall_test $(BIN_DIR)/normal/ext4_inode_identity_test $(BIN_DIR)/normal/ext4_user_read_test $(BIN_DIR)/normal/direct_read_semantics_test $(BIN_DIR)/normal/utimensat_symlink_test $(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/mount_filecaps_test $(BIN_DIR)/normal/ext4_fallocate_test $(BIN_DIR)/normal/stat_blocks_test $(BIN_DIR)/normal/fat_directory_entries_test $(BIN_DIR)/normal/loop_memory_io_test $(BIN_DIR)/normal/loop_backing_io_test $(BIN_DIR)/normal/loop_partscan_test $(BIN_DIR)/normal/loop_block_cache_test $(BIN_DIR)/normal/block_ext4_cache_test $(BIN_DIR)/normal/loop_logical_block_size_test $(BIN_DIR)/normal/block_soft_size_test: suites/normal/loop_ext4_test_support.h
+
+$(BIN_DIR)/normal/shared_page_migration_test: suites/normal/loop_ext4_test_support.h
+
+$(BIN_DIR)/normal/mount_propagation_test $(BIN_DIR)/normal/test_pivot_root_test $(BIN_DIR)/normal/user_namespace_admission_test: suites/normal/user_namespace_test_support.h
+
+$(BIN_DIR)/normal/mount_idmap_test $(BIN_DIR)/normal/proc_fd_permission_test: suites/normal/cap_common.h
+
+$(BIN_DIR)/fuse/stat_blocks_test $(BIN_DIR)/fuse/fuse_extended_test: suites/fuse/fuse_gtest_common.h suites/fuse/fuse_test_simplefs_local.h
+
+$(BIN_DIR)/normal/forward_mtu_test: suites/normal/forward_mtu_nft_support.h
+$(BIN_DIR)/normal/endpoint_pmtu_test $(BIN_DIR)/normal/udp_source_route_test: suites/normal/rtnetlink_route_test_support.h
+$(BIN_DIR)/normal/udp_ipv6_multicast_network_test: suites/normal/rtnetlink_route_test_support.h
+$(BIN_DIR)/normal/ipv6_scope_test $(BIN_DIR)/normal/ipv6_scope_network_test: suites/normal/rtnetlink_route_test_support.h
 
 run: build
 	@$(RUNNER_BIN) --bin-dir $(BIN_DIR) --results-dir $(RESULTS_DIR)
@@ -77,14 +202,26 @@ install: build
 	@cp -f $(RUNNER_BIN) $(INSTALL_DIR)/dunitest-runner
 	@chmod +x $(INSTALL_DIR)/dunitest-runner
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
+	@mkdir -p $(INSTALL_DIR)/fixtures
+	@cp --sparse=always -f $(EXT4_SHARED_XATTR_FIXTURE) $(EXT4_ORPHAN_FIXTURE) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(FAT_STAT_FIXTURE) $(FAT32_STAT_FIXTURE) $(FAT12_DIRECTORY_FIXTURE) $(FAT12_NEAR_LIMIT_FIXTURE) $(FAT16_DIRECTORY_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
+	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh
 	@chmod +x $(INSTALL_DIR)/run_tests.sh
 	@echo "安装完成"
 
 clean:
-	@rm -rf $(RESULTS_DIR) install $(BIN_DIR)
+	@rm -rf $(RESULTS_DIR) install $(BIN_DIR) $(BUILD_DIR)
 	@cd $(RUNNER_DIR) && cargo clean
 
 fmt:
 	@cd $(RUNNER_DIR) && cargo fmt
+
+# Optional real virtio-pmem DAX fixture; not a default build/runner dependency.
+# Attach this disposable image as pmem0 and opt in with EXT4_DAX_DEVICE=/dev/pmem0.
+.PHONY: ext4-dax-fixture
+ext4-dax-fixture: $(BUILD_DIR)/fixtures/ext4_dax.img
+.DELETE_ON_ERROR: $(BUILD_DIR)/fixtures/ext4_dax.img
+$(BUILD_DIR)/fixtures/ext4_dax.img: scripts/make_ext4_dax_fixture.py
+	@mkdir -p "$(dir $@)"
+	@python3 $< "$@"

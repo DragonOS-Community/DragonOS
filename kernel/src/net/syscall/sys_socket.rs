@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SOCKET;
-use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::file::FileFlags;
 use crate::net::posix::PosixArgsSocketType;
 use crate::net::socket;
 use crate::process::ProcessManager;
@@ -107,11 +107,30 @@ pub(super) fn do_socket(
         is_close_on_exec,
     )?;
 
-    let file = File::new_socket(inode, FileFlags::O_RDWR)?;
-    // 把socket添加到当前进程的文件描述符表中
-    ProcessManager::current_pcb()
-        .fd_table()
-        .write()
-        .alloc_fd(file, None, is_close_on_exec)
-        .map(|x| x as usize)
+    let current = ProcessManager::current_pcb();
+    let reservation = match super::reserve_socket_descriptors::<1>(&current, is_close_on_exec) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            if let Some(socket) = inode.as_socket() {
+                let _ = socket.do_close();
+            }
+            return Err(error);
+        }
+    };
+
+    let mut file_flags = FileFlags::O_RDWR;
+    if is_nonblock {
+        file_flags.insert(FileFlags::O_NONBLOCK);
+    }
+    let prepared = match super::prepare_socket_file() {
+        Ok(storage) => storage,
+        Err(error) => {
+            if let Some(socket) = inode.as_socket() {
+                let _ = socket.do_close();
+            }
+            return Err(error);
+        }
+    };
+    let file = super::finish_socket_file(inode, file_flags, prepared)?;
+    reservation.install(file).map(|fd| fd as usize)
 }

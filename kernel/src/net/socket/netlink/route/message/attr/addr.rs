@@ -1,5 +1,4 @@
-use crate::net::socket::netlink::{message::attr::Attribute, route::message::attr::IFNAME_SIZE};
-use alloc::ffi::CString;
+use crate::net::socket::netlink::message::attr::Attribute;
 use alloc::vec::Vec;
 use system_error::SystemError;
 
@@ -42,11 +41,15 @@ impl TryFrom<u16> for AddrAttrClass {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AddrAttr {
     Address(Vec<u8>),
     Local(Vec<u8>),
-    Label(CString),
+    /// Raw IFA_LABEL payload. Validation is address-family specific: IPv4
+    /// uses NLA_STRING(IFNAMSIZ - 1), while Linux ignores it for IPv6.
+    Label(Vec<u8>),
+    /// Raw payload: IPv4 and IPv6 apply different policies to this attribute.
+    Broadcast(Vec<u8>),
 }
 
 impl AddrAttr {
@@ -55,6 +58,7 @@ impl AddrAttr {
             AddrAttr::Address(_) => AddrAttrClass::ADDRESS,
             AddrAttr::Local(_) => AddrAttrClass::LOCAL,
             AddrAttr::Label(_) => AddrAttrClass::LABEL,
+            AddrAttr::Broadcast(_) => AddrAttrClass::BROADCAST,
         }
     }
 }
@@ -68,7 +72,8 @@ impl Attribute for AddrAttr {
         match self {
             AddrAttr::Address(addr) => addr.as_ref(),
             AddrAttr::Local(addr) => addr.as_ref(),
-            AddrAttr::Label(label) => label.to_bytes_with_nul(),
+            AddrAttr::Label(label) => label.as_slice(),
+            AddrAttr::Broadcast(value) => value.as_slice(),
         }
     }
 
@@ -101,13 +106,9 @@ impl Attribute for AddrAttr {
                 addr.copy_from_slice(buf);
                 AddrAttr::Local(addr)
             }
-            (AddrAttrClass::LABEL, 1..=IFNAME_SIZE) => {
-                // 查找第一个0字节作为结尾，否则用全部
-                let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                let cstr = CString::new(&buf[..nul_pos]).map_err(|_| SystemError::EINVAL)?;
-                AddrAttr::Label(cstr)
-            }
-            (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL | AddrAttrClass::LABEL, _) => {
+            (AddrAttrClass::LABEL, _) => AddrAttr::Label(buf.to_vec()),
+            (AddrAttrClass::BROADCAST, _) => AddrAttr::Broadcast(buf.to_vec()),
+            (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL, _) => {
                 log::warn!(
                     "address attribute `{:?}` contains invalid payload",
                     addr_class

@@ -29,9 +29,11 @@ mod sym;
 pub use self::{
     builder::{Builder, ProcDirBuilder, ProcFileBuilder, ProcSymBuilder},
     dir::{lookup_child_from_table, populate_children_from_table, DirOps, ProcDir},
-    file::{FileOps, ProcFile},
+    file::{FileOps, ProcFile, ProcWriteCallback, ProcfsSeekKind},
     sym::{ProcSym, SymOps},
 };
+
+pub(crate) use file::{configure_readonly_seq_file, configure_seq_file};
 
 /// Common - 所有 procfs inode 共享的基础设施
 ///

@@ -1,7 +1,7 @@
 //! System call handler for the get_mempolicy system call.
 
-use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_GET_MEMPOLICY};
-use crate::mm::{ucontext::AddressSpace, VirtAddr};
+use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_GET_MEMPOLICY, MMArch};
+use crate::mm::{ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VirtRegion};
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -130,7 +130,9 @@ impl SysGetMempolicy {
     /// 获取VMA的内存策略
     fn get_vma_mempolicy(addr: VirtAddr) -> Result<Mempolicy, SystemError> {
         let current_as = AddressSpace::current()?;
-        let as_guard = current_as.read();
+        let page = VirtAddr::new(addr.data() & !MMArch::PAGE_OFFSET_MASK);
+        let as_guard =
+            current_as.read_guard_no_reservation_conflict(VirtRegion::new(page, MMArch::PAGE_SIZE));
 
         // 检查地址是否在有效的VMA中
         if let Some(_vma) = as_guard.mappings.contains(addr) {

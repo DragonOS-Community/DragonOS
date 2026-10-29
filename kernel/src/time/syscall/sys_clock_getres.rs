@@ -25,6 +25,7 @@ impl Syscall for SysClockGetres {
 
     fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let clock_id = PosixClockID::try_from(Self::clock_id(args))?;
+        let res = posix_clock_res(clock_id)?;
 
         // Linux 语义：tp == NULL 时允许，直接返回 0。
         let tp = Self::timespec_ptr(args);
@@ -38,7 +39,6 @@ impl Syscall for SysClockGetres {
             frame.is_from_user(),
         )?;
 
-        let res = posix_clock_res(clock_id);
         tp_buf.buffer_protected(0)?.write_one(0, &res)?;
         Ok(0)
     }

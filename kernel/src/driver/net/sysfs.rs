@@ -1,10 +1,13 @@
+pub(crate) use crate::driver::base::device_rename::PreparedDeviceSysfsRename;
 use crate::{
     driver::base::{
         class::Class,
         device::{device_manager, Device},
-        kobject::KObject,
+        device_rename::{prepare_class_device_sysfs_move, prepare_class_device_sysfs_rename},
+        kobject::{KObject, KObjectState},
     },
     filesystem::{
+        kernfs::KernFSNamespaceTag,
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
             SYSFS_ATTR_MODE_RW,
@@ -13,17 +16,24 @@ use crate::{
     },
 };
 use alloc::sync::Arc;
+use alloc::{string::String, vec::Vec};
 use intertrait::cast::CastArc;
-use log::error;
+use log::{error, warn};
 use system_error::SystemError;
 
 use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
+use crate::process::namespace::{net_namespace::NetNamespace, NamespaceOps};
 
 /// 将设备注册到`/sys/class/net`目录下
 /// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/net-sysfs.c?fi=netdev_register_kobject#1311
-pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
+pub fn netdev_register_kobject(
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    let device = dev.clone() as Arc<dyn Device>;
+
     // 初始化设备
-    device_manager().device_default_initialize(&(dev.clone() as Arc<dyn Device>));
+    device_manager().device_default_initialize(&device);
 
     // 设置dev的class为net
     dev.set_class(Some(Arc::downgrade(
@@ -31,11 +41,133 @@ pub fn netdev_register_kobject(dev: Arc<dyn Iface>) -> Result<(), SystemError> {
     )));
 
     // 设置设备的kobject名
-    dev.set_name(dev.iface_name().clone());
+    dev.set_name(dev.iface_name());
 
-    device_manager().add_device(dev.clone() as Arc<dyn Device>)?;
+    let tag = KernFSNamespaceTag::new(netns.ns_common().nsid.data());
+    if let Err(error) = device_manager().add_device_with_namespace(device.clone(), tag) {
+        // Driver-core currently exposes a fallible multi-stage add path. If a
+        // late stage fails after publishing IN_SYSFS, use its structural
+        // teardown path before returning the registration error. No uevent
+        // has been emitted by the net class at this point.
+        if device.is_registered() {
+            device_manager().remove(&device);
+        }
+        return Err(error);
+    }
 
-    return Ok(());
+    Ok(())
+}
+
+/// Remove the netdevice from driver-core/sysfs without allocating a uevent.
+///
+/// Registration rollback uses this path before the device has been announced,
+/// so emitting a synthetic remove event would be both unnecessary and unsafe:
+/// notification construction must never stand between a failed transaction
+/// and structural teardown.
+pub fn netdev_unregister_kobject(dev: Arc<dyn Iface>) {
+    device_manager().remove(&(dev as Arc<dyn Device>));
+}
+
+/// Prepares the sysfs half of a netdevice rename without changing the logical
+/// interface name. The device inode's namespace tag selects the matching
+/// class link while preserving both inode identities.
+pub(crate) fn prepare_netdev_sysfs_rename(
+    dev: &Arc<dyn Iface>,
+    new_name: String,
+) -> Result<PreparedDeviceSysfsRename, SystemError> {
+    prepare_class_device_sysfs_rename(&(dev.clone() as Arc<dyn Device>), new_name)
+}
+
+pub(crate) fn prepare_netdev_sysfs_move(
+    dev: &Arc<dyn Iface>,
+    new_name: String,
+    target: &Arc<NetNamespace>,
+) -> Result<PreparedDeviceSysfsRename, SystemError> {
+    if !dev.kobj_state().contains(KObjectState::IN_SYSFS) || dev.inode().is_none() {
+        return Err(SystemError::EIO);
+    }
+    prepare_class_device_sysfs_move(
+        &(dev.clone() as Arc<dyn Device>),
+        new_name,
+        KernFSNamespaceTag::new(target.ns_common().nsid.data()),
+    )
+}
+
+/// Emits the best-effort kobject move notification after the sysfs and logical
+/// netdevice names have committed.
+pub(crate) fn netdev_emit_move_uevent(dev: Arc<dyn Iface>, old_devpath: String) {
+    netdev_emit_uevent_with_env(dev, "move", Some(("DEVPATH_OLD", old_devpath)));
+}
+
+/// Emit a netdevice lifecycle event after the corresponding structural state
+/// has been committed. Notification delivery is best effort, like Linux
+/// kobject and rtnetlink multicast: listener backpressure must not roll back a
+/// registered device or prevent an unregistered device from being removed.
+pub fn netdev_emit_uevent(dev: Arc<dyn Iface>, action: &'static str) {
+    netdev_emit_uevent_with_env(dev, action, None);
+}
+
+/// Builds the Linux netdevice-specific environment in one place and routes
+/// the event according to the device's namespace ownership. Event-specific
+/// fields are appended without duplicating the stable identity fields.
+fn netdev_emit_uevent_with_env(
+    dev: Arc<dyn Iface>,
+    action: &'static str,
+    action_env: Option<(&'static str, String)>,
+) {
+    let result = try_emit_netdev_uevent(&dev, action, action_env);
+    if let Err(error) = result {
+        warn!("failed to emit '{}' netdevice uevent: {:?}", action, error);
+    }
+}
+
+fn try_emit_netdev_uevent(
+    dev: &Arc<dyn Iface>,
+    action: &'static str,
+    action_env: Option<(&'static str, String)>,
+) -> Result<(), SystemError> {
+    let ifname = dev.common().with_iface_name(try_copy_string)?;
+    let Some(netns) = dev.net_namespace() else {
+        return Err(SystemError::ENODEV);
+    };
+    let inode = dev.inode().ok_or(SystemError::ENOENT)?;
+    let devpath = crate::filesystem::sysfs::sysfs_instance().try_kernfs_path(&inode)?;
+    let mut env = Vec::new();
+    env.try_reserve_exact(4 + usize::from(action_env.is_some()))
+        .map_err(|_| SystemError::ENOMEM)?;
+    env.push(("SUBSYSTEM", try_copy_string("net")?));
+    env.push(("DEVNAME", try_copy_string(&ifname)?));
+    env.push(("INTERFACE", ifname));
+    env.push(("IFINDEX", try_decimal_string(dev.nic_id())?));
+    if let Some(field) = action_env {
+        env.push(field);
+    }
+
+    <dyn KObject>::emit_uevent_in_netns(action, &devpath, &env, netns)
+}
+
+fn try_copy_string(source: &str) -> Result<String, SystemError> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(source.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    result.push_str(source);
+    Ok(result)
+}
+
+fn try_decimal_string(mut value: usize) -> Result<String, SystemError> {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let value = core::str::from_utf8(&digits[start..]).map_err(|_| SystemError::EINVAL)?;
+    try_copy_string(value)
 }
 
 // 参考：https://code.dragonos.org.cn/xref/linux-6.6.21/net/core/net-sysfs.c
@@ -518,25 +650,109 @@ impl Attribute for AttrOperstate {
 #[derive(Debug)]
 struct AttrMtu;
 
+/// Linux kstrtoul(base=0), including its overflow-before-suffix precedence.
+/// sysfs text is NUL terminated; embedded NUL also ends the parsed string.
+fn parse_mtu(buf: &[u8]) -> Result<i32, SystemError> {
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    let mut text = &buf[..end];
+    if text.first() == Some(&b'+') {
+        text = &text[1..];
+    }
+    let radix = if text.starts_with(b"0x") || text.starts_with(b"0X") {
+        text = &text[2..];
+        16u64
+    } else if text.first() == Some(&b'0') {
+        8
+    } else {
+        10
+    };
+    let mut value = 0u64;
+    let mut digits = 0;
+    let mut overflow = false;
+    for byte in text {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as u64,
+            b'a'..=b'f' => (byte - b'a' + 10) as u64,
+            b'A'..=b'F' => (byte - b'A' + 10) as u64,
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        digits += 1;
+        match value.checked_mul(radix).and_then(|n| n.checked_add(digit)) {
+            Some(next) => value = next,
+            None => overflow = true,
+        }
+    }
+    if overflow {
+        return Err(SystemError::ERANGE);
+    }
+    if digits == 0 || !matches!(&text[digits..], [] | [b'\n']) {
+        return Err(SystemError::EINVAL);
+    }
+    // Linux change_mtu converts unsigned long to int before dev_set_mtu.
+    Ok(value as i32)
+}
+
 impl Attribute for AttrMtu {
     fn name(&self) -> &str {
         "mtu"
     }
 
     fn mode(&self) -> InodeMode {
-        SYSFS_ATTR_MODE_RO
+        SYSFS_ATTR_MODE_RW
     }
 
     fn support(&self) -> SysFSOpsSupport {
-        SysFSOpsSupport::ATTR_SHOW
+        SysFSOpsSupport::ATTR_SHOW | SysFSOpsSupport::ATTR_STORE
     }
 
-    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!("AttrMtu::show")
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let iface = kobj.cast::<dyn Iface>().map_err(|_| SystemError::EINVAL)?;
+        if !iface
+            .net_state()
+            .contains(NetDeivceState::__LINK_STATE_PRESENT)
+        {
+            return Err(SystemError::ENODEV);
+        }
+        sysfs_emit_str(buf, &format!("{}\n", iface.mtu()))
     }
 
-    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        todo!("AttrMtu::store")
+    fn store(&self, kobj: Arc<dyn KObject>, buf: &[u8]) -> Result<usize, SystemError> {
+        use crate::net::link::{LinkMtuUpdate, LinkTarget, LinkUpdate};
+        use crate::process::cred::{ns_capable, CAPFlags};
+
+        let iface = kobj.cast::<dyn Iface>().map_err(|_| SystemError::EINVAL)?;
+        // A sysfs fd pins identity, not a name or namespace. Serialize with
+        // removal/movement and authorize against the device's current owner.
+        let rtnl = crate::net::rtnl::lock();
+        let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
+        if !ns_capable(netns.user_ns(), CAPFlags::CAP_NET_ADMIN) {
+            return Err(SystemError::EPERM);
+        }
+        let mtu = parse_mtu(buf)?;
+        if !iface
+            .net_state()
+            .contains(NetDeivceState::__LINK_STATE_PRESENT)
+            || !netns
+                .device_list()
+                .get(&iface.nic_id())
+                .is_some_and(|registered| Arc::ptr_eq(registered, &iface))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        let committed = crate::net::link::mutate_link(
+            &rtnl,
+            &netns,
+            LinkTarget::Index(iface.nic_id() as u32),
+            LinkUpdate {
+                mtu: Some(LinkMtuUpdate::Ioctl(mtu)),
+                ..Default::default()
+            },
+        )?;
+        crate::net::socket::netlink::notify_link_commit(&netns, committed);
+        Ok(buf.len())
     }
 }
 
@@ -599,12 +815,9 @@ impl Attribute for AttrTxQueueLen {
         SysFSOpsSupport::ATTR_SHOW
     }
 
-    fn show(&self, _kobj: Arc<dyn KObject>, _buf: &mut [u8]) -> Result<usize, SystemError> {
-        todo!("AttrTxQueueLen::show")
-    }
-
-    fn store(&self, _kobj: Arc<dyn KObject>, _buf: &[u8]) -> Result<usize, SystemError> {
-        todo!("AttrTxQueueLen::store")
+    fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let net_device = kobj.cast::<dyn Iface>().map_err(|_| SystemError::EINVAL)?;
+        sysfs_emit_str(buf, &format!("{}\n", net_device.common().tx_queue_len()))
     }
 }
 

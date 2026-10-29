@@ -1,37 +1,36 @@
-(_spinlock_doc)=
+<a id="_spinlock_doc"></a>
 
-:::{note}
-作者：龙进 <longjin@RinGoTek.cn>
+::: info Author
+Longjin `<longjin@RinGoTek.cn>`
 :::
 
-# 自旋锁
 
-## 1.简介
+# Spinlock
 
-&emsp;&emsp;自旋锁是用于多线程同步的一种锁，线程反复检查锁变量是否可用。由于线程在这一过程中保持运行的状态，因此是一种忙等待。一旦获取了自旋锁，线程会一直保持该锁，直至显式释放自旋锁。
+## 1. Introduction
 
-&emsp;&emsp;DragonOS在`kernel/src/lib/spinlock.rs`文件中，实现了自旋锁。根据功能特性的略微差异，分别提供了`RawSpinLock`和`SpinLock`两种自旋锁。
+A spinlock is a type of lock used for synchronization in multi-threaded environments. Threads repeatedly check if the lock variable is available. Since the thread remains in a running state during this process, it is a form of busy waiting. Once a spinlock is acquired, the thread will hold onto it until it is explicitly released.
 
-(_spinlock_doc_rawspinlock)=
-## 2. RawSpinLock - 原始自旋锁
+DragonOS implements spinlocks in the `kernel/src/lib/spinlock.rs` file. Based on slight differences in functional characteristics, two types of spinlocks, `RawSpinLock` and `SpinLock`, are provided.
 
-&emsp;&emsp;`RawSpinLock`是原始的自旋锁，其数据部分包含一个AtomicBool, 实现了自旋锁的基本功能。其加锁、放锁需要手动确定对应的时机，也就是说，和我们在其他语言中使用的自旋锁一样，
-需要先调用`lock()`方法，然后当离开临界区时，手动调用`unlock()`方法。我们并没有向编译器显式地指定该自旋锁到底保护的是哪些数据。
+## 2. RawSpinLock - Raw Spinlock {#_spinlock_doc_rawspinlock}
 
-&emsp;&emsp;RawSpinLock为程序员提供了非常自由的加锁、放锁控制。但是，正是由于它过于自由，因此在使用它的时候，我们很容易出错。很容易出现“未加锁就访问临界区的数据”、“忘记放锁”、“双重释放”等问题。当使用RawSpinLock时，编译器并不能对这些情况进行检查，这些问题只能在运行时被发现。
+`RawSpinLock` is a raw spinlock, whose data part contains an AtomicBool, implementing the basic functionality of a spinlock. Its locking and unlocking require manual determination of the corresponding timing, meaning that, like spinlocks used in other languages, you need to first call the `lock()` method, and then manually call the `unlock()` method when leaving the critical section. We do not explicitly inform the compiler of which data the spinlock is protecting.
 
-:::{warning}
-`RawSpinLock`与C版本的`spinlock_t`不具有二进制兼容性。如果由于暂时的兼容性的需求，要操作C版本的`spinlock_t`,请使用`spinlock.rs`中提供的C版本的spinlock_t的操作函数。
+RawSpinLock provides programmers with very flexible control over locking and unlocking. However, due to its excessive flexibility, it is easy to make mistakes when using it. Common issues include "accessing critical section data without locking", "forgetting to unlock", and "double unlocking". The compiler cannot check for these issues, and they can only be discovered at runtime.
 
-但是，对于新开发的功能，请不要使用C版本的`spinlock_t`，因为随着代码重构的进行，我们将会移除它。
+::: warning
+`RawSpinLock` is not binary compatible with the C version of `spinlock_t`. If you need to operate on the C version of `spinlock_t` for temporary compatibility reasons, please use the operation functions for the C version of spinlock_t provided in `spinlock.rs`.
+
+However, for newly developed features, please do not use the C version of `spinlock_t`, as it will be removed as code refactoring progresses.
 :::
 
-(_spinlock_doc_spinlock)=
-## 3. SpinLock - 具备守卫的自旋锁
 
-&emsp;&emsp;`SpinLock`在`RawSpinLock`的基础上，进行了封装，能够在编译期检查出“未加锁就访问临界区的数据”、“忘记放锁”、“双重释放”等问题；并且，支持数据的内部可变性。
+## 3. SpinLock - Spinlock with Guard {#_spinlock_doc_spinlock}
 
-&emsp;&emsp;其结构体原型如下：
+`SpinLock` is an encapsulation of `RawSpinLock`, enabling compile-time checks for issues such as "accessing critical section data without locking", "forgetting to unlock", and "double unlocking"; it also supports internal mutability of data.
+
+Its struct prototype is as follows:
 
 ```rust
 #[derive(Debug)]
@@ -42,19 +41,19 @@ pub struct SpinLock<T> {
 }
 ```
 
-### 3.1. 使用方法
+### 3.1. Usage
 
-&emsp;&emsp;您可以这样初始化一个SpinLock：
+You can initialize a SpinLock like this:
 
 ```rust
 let x = SpinLock::new(Vec::new());
 ```
 
-&emsp;&emsp;在初始化这个SpinLock时，必须把要保护的数据传入SpinLock，由SpinLock进行管理。
+When initializing this SpinLock, you must pass the data you want to protect into the SpinLock, which will then manage it.
 
-&emsp;&emsp;当需要读取、修改SpinLock保护的数据时，请先使用SpinLock的`lock()`方法。该方法会返回一个`SpinLockGuard`。您可以使用被保护的数据的成员函数来进行一些操作。或者是直接读取、写入被保护的数据。（相当于您获得了被保护的数据的可变引用）
+When you need to read or modify data protected by SpinLock, please first use the `lock()` method of SpinLock. This method will return a `SpinLockGuard`. You can use the member functions of the protected data to perform some operations, or directly read and write the protected data. (This is equivalent to obtaining a mutable reference to the protected data.)
 
-&emsp;&emsp;完整示例如下方代码所示：
+The complete example is shown in the code below:
 
 ```rust
 let x :SpinLock<Vec<i32>>= SpinLock::new(Vec::new());
@@ -71,7 +70,7 @@ let x :SpinLock<Vec<i32>>= SpinLock::new(Vec::new());
     debug!("x={:?}", x);
 ```
 
-&emsp;&emsp;对于结构体内部的变量，我们可以使用SpinLock进行细粒度的加锁，也就是使用SpinLock包裹需要细致加锁的成员变量，比如这样：
+For variables inside a struct, we can use SpinLock to perform fine-grained locking, that is, wrap the member variables that need to be locked in SpinLock, for example:
 
 ```rust
 pub struct a {
@@ -79,7 +78,7 @@ pub struct a {
 }
 ```
 
-&emsp;&emsp;当然，我们也可以对整个结构体进行加锁：
+Of course, we can also lock the entire struct:
 
 ```rust
 struct MyStruct {
@@ -89,16 +88,16 @@ struct MyStruct {
 pub struct LockedMyStruct(SpinLock<MyStruct>);
 ```
 
-### 3.2. 原理
+### 3.2. Principle
 
-&emsp;&emsp;`SpinLock`之所以能够实现编译期检查，是因为它引入了一个`SpinLockGuard`作为守卫。我们在编写代码的时候，保证只有调用`SpinLock`的`lock()`方法加锁后，才能生成一个`SpinLockGuard`。 并且，当我们想要访问受保护的数据的时候，都必须获得一个守卫。然后，我们为`SpinLockGuard`实现了`Drop` trait，当守卫的生命周期结束时，将会自动释放锁。除此以外，没有别的方法能够释放锁。因此我们能够得知，一个上下文中，只要`SpinLockGuard`的生命周期没有结束，那么它就拥有临界区数据的访问权，数据访问就是安全的。
+`SpinLock` can achieve compile-time checking because it introduces a `SpinLockGuard` as a guard. When writing code, we ensure that only after calling the `lock()` method of `SpinLock` to acquire the lock can a `SpinLockGuard` be generated. Moreover, whenever we want to access protected data, we must obtain a guard. We also implement the `Drop` trait for `SpinLockGuard`; when the guard's lifetime ends, the lock will be automatically released. There is no other way to release the lock. Therefore, we can know that, in a context, as long as the `SpinLockGuard`'s lifetime has not ended, it has the right to access the critical section data, and the data access is safe.
 
-### 3.3. 存在的问题
+### 3.3. Existing Issues
 
-#### 3.3.1. 双重加锁
+#### 3.3.1. Double Locking
 
-&emsp;&emsp;请注意，`SpinLock`支持的编译期检查并不是万能的。它目前无法在编译期检查出“双重加锁”问题。试看这样一个场景：函数A中，获得了锁。然后函数B中继续尝试加锁，那么就造成了“双重加锁”问题。这样在编译期是无法检测出来的。
+Please note that the compile-time checks supported by `SpinLock` are not omnipotent. It currently cannot detect the issue of "double locking" at compile time. Consider this scenario: function A acquires the lock, and then function B attempts to lock again, which results in a "double locking" issue. This kind of problem cannot be detected at compile time.
 
-&emsp;&emsp;针对这个问题，我们建议采用这样的编程方法：
+To address this issue, we recommend the following programming approach:
 
-- 如果函数B需要访问临界区内的数据，那么，函数B应当接收一个类型为`&SpinLockGuard`的参数，这个守卫由函数A获得。这样一来，函数B就能访问临界区内的数据。
+- If function B needs to access data within the critical section, function B should receive a parameter of type `&SpinLockGuard`, which is obtained by function A. In this way, function B can access the data within the critical section.

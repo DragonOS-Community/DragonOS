@@ -30,6 +30,10 @@ SECTIONS
 	.text (text_start_pa): AT(text_start_pa - KERNEL_VMA)
 	{
 		_text = .;
+		__text_no_patch_start = .;
+		KEEP(*(.text.no_patch))
+		KEEP(*(.text.no_patch.*))
+		__text_no_patch_end = .;
 
 		/* any files' .text */
 		*(.text)
@@ -61,6 +65,15 @@ SECTIONS
 		__relocate_kernel_end = .;
 		
 		_edata = .;
+	}
+
+	. = ALIGN(4096);
+	static_keys_start_pa = .;
+	.static_keys (static_keys_start_pa): AT(static_keys_start_pa - KERNEL_VMA)
+	{
+		__start___static_keys = .;
+		KEEP(*(__static_keys))
+		__stop___static_keys = .;
 	}
 
 	. = ALIGN(4096);

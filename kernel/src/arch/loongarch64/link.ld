@@ -39,6 +39,12 @@ SECTIONS
 
 		_etext = .;
 		__etext = .;
+
+		/* Exception table */
+		. = ALIGN(8);
+		__start___ex_table = .;
+		*(__ex_table)
+		__stop___ex_table = .;
 	}
 	. = ALIGN(32768);
 	data_start_pa = .;

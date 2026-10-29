@@ -10,7 +10,7 @@ use crate::syscall::table::Syscall;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use super::pread_pwrite_common::{do_pread_pwrite_at, PreadPwriteDir};
+use super::pread_common::do_pread_at;
 
 /// System call handler for the `pread64` syscall
 ///
@@ -36,10 +36,9 @@ impl Syscall for SysPread64Handle {
         let len = Self::len(args);
         let offset = Self::offset(args);
 
-        // 检查offset + len是否溢出 同时检查offset是否为负数
-
-        let end_pos = offset.checked_add(len).ok_or(SystemError::EINVAL)?;
-        if offset > i64::MAX as usize || end_pos > i64::MAX as usize {
+        // Linux rejects a negative explicit position before fd admission.
+        // Count/range checks follow the selected file's read capabilities.
+        if offset > i64::MAX as usize {
             return Err(SystemError::EINVAL);
         }
 
@@ -53,13 +52,12 @@ impl Syscall for SysPread64Handle {
         // Drop guard to avoid scheduling issues
         drop(fd_table_guard);
 
-        do_pread_pwrite_at(
+        do_pread_at(
             file.as_ref(),
             offset,
             buf_vaddr as usize,
             len,
             frame.is_from_user(),
-            PreadPwriteDir::Read,
         )
     }
 

@@ -1,14 +1,12 @@
-use alloc::vec;
-
+use crate::net::socket::recv_timeout::ReceiveTimeout;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 use system_error::SystemError;
 
-use crate::filesystem::vfs::iov::IoVecs;
-use crate::net::posix::{SockAddrIn, SockAddrIn6};
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::unix::utils::CmsgBuffer;
+use crate::net::socket::utils::extract_src_addr_from_ip_header;
 use crate::net::socket::utils::{IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN};
-use crate::net::socket::{IpOption, PIPV6, PSOL};
-use crate::syscall::user_access::UserBufferWriter;
+use crate::net::socket::{IpOption, PIPV6, PMSG, PSOL};
 
 use super::inner;
 use super::inner::RawInner;
@@ -16,16 +14,34 @@ use super::loopback::loopback_rx_mem_cost;
 use super::packet::ipv6_udp_checksum;
 use super::{RawSocket, RawSocketOptions};
 
-// 接收过滤重试时的宏：检查重试次数，超过限制则返回 EAGAIN
-macro_rules! filter_retry_or_break {
-    ($retries:expr, $max:expr, $result:expr) => {{
-        $retries += 1;
-        if $retries >= $max {
-            $result = Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            break;
-        }
-        continue;
-    }};
+/// Scalar receives copy a prefix directly; recvmsg stages the actual complete
+/// IP packet for checksum verification and ancillary header parsing.
+enum RawReceiveTarget<'a> {
+    Buffer(&'a mut [u8]),
+    Staged(&'a mut RecvBuffer),
+}
+
+impl RawReceiveTarget<'_> {
+    fn needs_buffer(&self, packet_len: usize) -> bool {
+        matches!(self, Self::Staged(buffer) if buffer.capacity() < packet_len)
+    }
+
+    fn copy_packet(&mut self, packet: &[u8]) -> usize {
+        let output = match self {
+            Self::Buffer(buffer) => &mut **buffer,
+            Self::Staged(buffer) => buffer.bytes_mut(packet.len()),
+        };
+        let copied = output.len().min(packet.len());
+        output[..copied].copy_from_slice(&packet[..copied]);
+        copied
+    }
+}
+
+struct RawReceived {
+    copied: usize,
+    original_len: usize,
+    source: IpAddress,
+    ifindex: u32,
 }
 
 #[repr(C)]
@@ -53,139 +69,174 @@ impl RawSocket {
         &self,
         buf: &mut [u8],
     ) -> Result<(usize, smoltcp::wire::IpAddress), SystemError> {
-        // 先消费回环注入队列（保留原始头字段，并实现 SO_RCVBUF 语义）。
-        if let Some(pkt) = {
-            let mut q = self.loopback_rx.lock();
-            let pkt = q.pkts.pop_front();
-            if let Some(ref p) = pkt {
-                q.bytes = q.bytes.saturating_sub(loopback_rx_mem_cost(p.len()));
+        self.try_recv_with_ifindex(buf)
+            .map(|(size, source, _)| (size, source))
+    }
+
+    fn try_recv_with_ifindex(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, IpAddress, u32), SystemError> {
+        match self.try_recv_packet(&mut RawReceiveTarget::Buffer(buf), false)? {
+            ReceiveAttempt::Ready(received) => {
+                Ok((received.copied, received.source, received.ifindex))
             }
-            pkt
-        } {
-            let len = pkt.len().min(buf.len());
-            buf[..len].copy_from_slice(&pkt[..len]);
-            let src_addr = match self.ip_version {
-                IpVersion::Ipv4 => {
-                    if pkt.len() >= 20 {
-                        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
-                            pkt[12], pkt[13], pkt[14], pkt[15],
-                        ))
-                    } else {
-                        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED)
-                    }
+            ReceiveAttempt::NeedBuffer(_) => unreachable!("scalar storage is already provided"),
+        }
+    }
+
+    fn packet_source(&self, packet: &[u8]) -> IpAddress {
+        extract_src_addr_from_ip_header(packet, self.ip_version).unwrap_or(match self.ip_version {
+            IpVersion::Ipv4 => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED),
+            IpVersion::Ipv6 => IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED),
+        })
+    }
+
+    /// Validate the borrowed complete packet, before truncation for any caller.
+    /// The same predicate serves scalar and vectored receive transactions.
+    fn accepts_packet(
+        &self,
+        packet: &[u8],
+        local: Option<IpAddress>,
+        options: &RawSocketOptions,
+    ) -> bool {
+        if let Some(local) = local.filter(|address| !address.is_unspecified()) {
+            if inner::extract_dst_addr_from_ip_header(packet, self.ip_version)
+                .is_some_and(|destination| destination != local)
+            {
+                return false;
+            }
+        }
+        if self.ip_version == IpVersion::Ipv6 && self.protocol == IpProtocol::Udp {
+            let offset = options.ipv6_checksum;
+            if offset >= 0 {
+                let offset = offset as usize;
+                let Some(payload) = packet.get(IPV6_HEADER_LEN..) else {
+                    return false;
+                };
+                let Some(checksum) = payload.get(offset..offset.saturating_add(2)) else {
+                    return false;
+                };
+                let got = u16::from_be_bytes([checksum[0], checksum[1]]);
+                if got == 0 || ipv6_udp_checksum(packet, offset) != Some(got) {
+                    return false;
                 }
-                IpVersion::Ipv6 => {
-                    if pkt.len() >= 40 {
-                        let b: [u8; 16] = pkt[8..24].try_into().unwrap_or([0; 16]);
-                        IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
-                            u16::from_be_bytes([b[0], b[1]]),
-                            u16::from_be_bytes([b[2], b[3]]),
-                            u16::from_be_bytes([b[4], b[5]]),
-                            u16::from_be_bytes([b[6], b[7]]),
-                            u16::from_be_bytes([b[8], b[9]]),
-                            u16::from_be_bytes([b[10], b[11]]),
-                            u16::from_be_bytes([b[12], b[13]]),
-                            u16::from_be_bytes([b[14], b[15]]),
-                        ))
-                    } else {
-                        IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)
-                    }
+            }
+        }
+        if self.protocol == IpProtocol::Icmp {
+            if let Some(&kind) = packet.get(self.get_ip_header_len(packet)) {
+                if options.icmp_filter.should_filter(kind) {
+                    return false;
                 }
-            };
-            return Ok((len, src_addr));
+            }
+        }
+        true
+    }
+
+    fn try_recv_packet(
+        &self,
+        target: &mut RawReceiveTarget<'_>,
+        peek: bool,
+    ) -> Result<ReceiveAttempt<RawReceived>, SystemError> {
+        self.take_pending_error()?;
+        {
+            let mut queue = self.loopback_rx.lock();
+            if let Some(packet) = queue.pkts.front() {
+                // Ingress already applied address, ICMP and checksum admission.
+                // Do not reinterpret queued packets after socket options change.
+                if target.needs_buffer(packet.bytes.len()) {
+                    return Ok(ReceiveAttempt::NeedBuffer(packet.bytes.len()));
+                }
+                if peek {
+                    let received = RawReceived {
+                        copied: target.copy_packet(&packet.bytes),
+                        original_len: packet.bytes.len(),
+                        source: self.packet_source(&packet.bytes),
+                        ifindex: packet.ingress_ifindex,
+                    };
+                    return Ok(ReceiveAttempt::Ready(received));
+                }
+                // Ownership fixes payload and metadata identity; keep the large
+                // copy and packet destruction outside the queue's critical section.
+                let packet = queue.pkts.pop_front().unwrap();
+                queue.bytes = queue
+                    .bytes
+                    .saturating_sub(loopback_rx_mem_cost(packet.bytes.len()));
+                drop(queue);
+                return Ok(ReceiveAttempt::Ready(RawReceived {
+                    copied: target.copy_packet(&packet.bytes),
+                    original_len: packet.bytes.len(),
+                    source: self.packet_source(&packet.bytes),
+                    ifindex: packet.ingress_ifindex,
+                }));
+            }
         }
 
+        // Identity/options guards never span a transport attachment operation.
+        let local = self.addresses.read().local;
+        let options = self.options.read().clone();
+        const MAX_FILTER_RETRIES: usize = 64;
         let inner_guard = self.inner.read();
-        match inner_guard.as_ref() {
-            None => Err(SystemError::ENOTCONN),
-            Some(RawInner::Bound(bound)) => {
-                // 接收数据，并按 Linux 语义应用 bind(2) 的目的地址过滤。
-                // gVisor raw_socket_test: RawSocketTest.BindReceive
-                // 添加最大重试次数限制，避免大量不匹配包导致的 busy-wait。
-                const MAX_FILTER_RETRIES: usize = 64;
-                let mut result;
-                let mut retries = 0;
-                loop {
-                    result = bound.try_recv(buf, self.ip_version);
-                    match &result {
-                        Ok((size, _src_addr)) => {
-                            if let Some(local) = bound.local_addr() {
-                                if let Some(dst) = inner::extract_dst_addr_from_ip_header(
-                                    &buf[..(*size).min(buf.len())],
-                                    self.ip_version,
-                                ) {
-                                    if dst != local {
-                                        // 丢弃不匹配的包，继续尝试读取下一包。
-                                        filter_retry_or_break!(retries, MAX_FILTER_RETRIES, result);
-                                    }
-                                }
-                            }
-
-                            // Linux 语义：若启用了 IPV6_CHECKSUM（用于 UDP），则在接收路径校验校验和。
-                            if self.ip_version == IpVersion::Ipv6
-                                && self.protocol == IpProtocol::Udp
-                            {
-                                let off = self.options.read().ipv6_checksum;
-                                if off >= 0 {
-                                    let size = (*size).min(buf.len());
-                                    let packet = &buf[..size];
-                                    let off = off as usize;
-                                    if packet.len() < 40 {
-                                        filter_retry_or_break!(retries, MAX_FILTER_RETRIES, result);
-                                    }
-                                    let payload = &packet[40..];
-                                    if off + 2 > payload.len() {
-                                        filter_retry_or_break!(retries, MAX_FILTER_RETRIES, result);
-                                    }
-                                    let got = u16::from_be_bytes([payload[off], payload[off + 1]]);
-                                    // IPv6/UDP: checksum 不能为 0。
-                                    if got == 0 {
-                                        filter_retry_or_break!(retries, MAX_FILTER_RETRIES, result);
-                                    }
-                                    match ipv6_udp_checksum(packet, off) {
-                                        Some(expect) if expect == got => {}
-                                        _ => {
-                                            filter_retry_or_break!(
-                                                retries,
-                                                MAX_FILTER_RETRIES,
-                                                result
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        Err(_) => break,
-                    }
+        let bound = match inner_guard.as_ref() {
+            Some(RawInner::Bound(bound)) | Some(RawInner::Wildcard(bound)) => bound,
+            Some(RawInner::Unbound(_)) | None => return Err(SystemError::ENOTCONN),
+        };
+        let ifindex = bound.inner().iface().nic_id() as u32;
+        let result = bound.with_mut_socket(|socket| {
+            for _ in 0..MAX_FILTER_RETRIES {
+                let packet = socket
+                    .peek()
+                    .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+                if !self.accepts_packet(packet, local, &options) {
+                    // Invalid packets must not permanently block a PEEK reader.
+                    let _ = socket.recv();
+                    continue;
                 }
-
-                // 应用 ICMP_FILTER
-                if let Ok((size, src_addr)) = &result {
-                    if self.protocol == IpProtocol::Icmp && *size > 0 {
-                        // 获取 ICMP type (IP 头后第一个字节)
-                        let ip_header_len = self.get_ip_header_len(buf);
-                        if buf.len() > ip_header_len {
-                            let icmp_type = buf[ip_header_len];
-                            if self.options.read().icmp_filter.should_filter(icmp_type) {
-                                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                            }
-                        }
-                    }
-                    // 触发 poll
-                    bound.inner().iface().poll();
-                    return Ok((*size, *src_addr));
+                if target.needs_buffer(packet.len()) {
+                    return Ok(ReceiveAttempt::NeedBuffer(packet.len()));
                 }
-                result
+                let received = RawReceived {
+                    copied: target.copy_packet(packet),
+                    original_len: packet.len(),
+                    source: self.packet_source(packet),
+                    ifindex,
+                };
+                if !peek {
+                    socket
+                        .recv()
+                        .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+                }
+                return Ok(ReceiveAttempt::Ready(received));
             }
-            Some(RawInner::Wildcard(bound)) => {
-                let result = bound.try_recv(buf, self.ip_version);
-                if let Ok((_size, _src_addr)) = &result {
-                    bound.inner().iface().poll();
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        });
+        let iface = bound.inner().iface().clone();
+        drop(inner_guard);
+        if matches!(&result, Ok(ReceiveAttempt::Ready(_))) {
+            iface.poll();
+        }
+        result
+    }
+
+    fn recv_packet_staged(
+        &self,
+        buffer: &mut RecvBuffer,
+        flags: PMSG,
+    ) -> Result<RawReceived, SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
+        loop {
+            match self.try_recv_packet(
+                &mut RawReceiveTarget::Staged(buffer),
+                flags.contains(PMSG::PEEK),
+            ) {
+                Ok(ReceiveAttempt::Ready(received)) => return Ok(received),
+                Ok(ReceiveAttempt::NeedBuffer(required)) => buffer.prepare(required)?,
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) if !nonblock => {
+                    timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                 }
-                result
+                Err(error) => return Err(error),
             }
-            Some(RawInner::Unbound(_)) => Err(SystemError::ENOTCONN),
         }
     }
 
@@ -194,24 +245,38 @@ impl RawSocket {
     pub(super) fn try_recv_user(
         &self,
         user_buf: &mut [u8],
-    ) -> Result<(usize, smoltcp::wire::IpAddress), SystemError> {
+    ) -> Result<(usize, crate::net::socket::endpoint::InetEndpoint), SystemError> {
         match self.ip_version {
-            IpVersion::Ipv4 => self.try_recv(user_buf),
+            IpVersion::Ipv4 => {
+                self.try_recv_with_ifindex(user_buf)
+                    .map(|(size, source, ifindex)| {
+                        (
+                            size,
+                            crate::net::socket::endpoint::InetEndpoint::from(
+                                smoltcp::wire::IpEndpoint::new(source, 0),
+                            )
+                            .with_scope(ifindex),
+                        )
+                    })
+            }
             IpVersion::Ipv6 => {
-                // 需要先接收完整 IPv6 包，用于解析 src addr / cmsg，随后只向用户拷贝 payload。
-                let mut tmp = vec![
-                    0u8;
-                    user_buf
-                        .len()
-                        .saturating_add(IPV6_HEADER_LEN)
-                        .max(IPV6_HEADER_LEN)
-                ];
-                let (recv_size, src_addr) = self.try_recv(&mut tmp)?;
+                let mut buffer = RecvBuffer::default();
+                let received = self.recv_packet_staged(&mut buffer, PMSG::DONTWAIT)?;
+                let recv_size = received.copied;
+                let src_addr = received.source;
+                let ifindex = received.ifindex;
+                let tmp = buffer.bytes(recv_size);
                 let start = IPV6_HEADER_LEN.min(recv_size);
                 let payload = &tmp[start..recv_size];
                 let to_copy = core::cmp::min(payload.len(), user_buf.len());
                 user_buf[..to_copy].copy_from_slice(&payload[..to_copy]);
-                Ok((to_copy, src_addr))
+                Ok((
+                    to_copy,
+                    crate::net::socket::endpoint::InetEndpoint::from(
+                        smoltcp::wire::IpEndpoint::new(src_addr, 0),
+                    )
+                    .with_scope(ifindex),
+                ))
             }
         }
     }
@@ -223,49 +288,17 @@ impl RawSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         src_addr: IpAddress,
+        ifindex: u32,
     ) -> Result<(), SystemError> {
-        if msg.msg_name.is_null() || msg.msg_namelen == 0 {
+        if msg.msg_name.is_null() {
             return Ok(());
         }
-
-        let port_be = 0u16.to_be();
-
-        match (self.ip_version, src_addr) {
-            (IpVersion::Ipv4, IpAddress::Ipv4(v4)) => {
-                let sa = SockAddrIn {
-                    sin_family: crate::net::socket::AddressFamily::INet as u16,
-                    sin_port: port_be,
-                    sin_addr: v4.to_bits().to_be(),
-                    sin_zero: [0; 8],
-                };
-                let want = core::mem::size_of::<SockAddrIn>().min(msg.msg_namelen as usize);
-                let mut w = UserBufferWriter::new(msg.msg_name as *mut u8, want, true)?;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts((&sa as *const SockAddrIn) as *const u8, want)
-                };
-                w.buffer_protected(0)?.write_to_user(0, bytes)?;
-                msg.msg_namelen = want as u32;
-            }
-            (IpVersion::Ipv6, IpAddress::Ipv6(v6)) => {
-                let sa = SockAddrIn6 {
-                    sin6_family: crate::net::socket::AddressFamily::INet6 as u16,
-                    sin6_port: port_be,
-                    sin6_flowinfo: 0,
-                    sin6_addr: v6.octets(),
-                    sin6_scope_id: 0,
-                };
-                let want = core::mem::size_of::<SockAddrIn6>().min(msg.msg_namelen as usize);
-                let mut w = UserBufferWriter::new(msg.msg_name as *mut u8, want, true)?;
-                let bytes = unsafe {
-                    core::slice::from_raw_parts((&sa as *const SockAddrIn6) as *const u8, want)
-                };
-                w.buffer_protected(0)?.write_to_user(0, bytes)?;
-                msg.msg_namelen = want as u32;
-            }
-            _ => {
-                msg.msg_namelen = 0;
-            }
-        }
+        let endpoint = crate::net::socket::endpoint::InetEndpoint::from(
+            smoltcp::wire::IpEndpoint::new(src_addr, 0),
+        )
+        .with_scope(ifindex);
+        msg.msg_namelen = crate::net::socket::endpoint::Endpoint::ip(endpoint)
+            .write_to_user_msghdr(msg.msg_name, msg.msg_namelen)?;
         Ok(())
     }
 
@@ -277,6 +310,7 @@ impl RawSocket {
         packet: &[u8],
         recv_size: usize,
         options: &RawSocketOptions,
+        ingress_ifindex: u32,
     ) -> Result<(), SystemError> {
         if recv_size < IPV4_MIN_HEADER_LEN {
             return Ok(());
@@ -288,19 +322,8 @@ impl RawSocket {
 
         // IP_PKTINFO -> in_pktinfo
         if options.recv_pktinfo_v4 {
-            let ifindex = self
-                .inner
-                .read()
-                .as_ref()
-                .and_then(|inner| match inner {
-                    RawInner::Bound(b) | RawInner::Wildcard(b) => {
-                        Some(b.inner().iface().nic_id() as i32)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(0);
             let pktinfo = InPktInfo {
-                ipi_ifindex: ifindex,
+                ipi_ifindex: ingress_ifindex as i32,
                 ipi_spec_dst: dst.to_be(),
                 ipi_addr: dst.to_be(),
             };
@@ -347,6 +370,7 @@ impl RawSocket {
         packet: &[u8],
         recv_size: usize,
         options: &RawSocketOptions,
+        ingress_ifindex: u32,
     ) -> Result<(), SystemError> {
         if recv_size < IPV6_HEADER_LEN {
             return Ok(());
@@ -358,20 +382,9 @@ impl RawSocket {
 
         // IPV6_RECVPKTINFO -> in6_pktinfo
         if options.recv_pktinfo_v6 {
-            let ifindex = self
-                .inner
-                .read()
-                .as_ref()
-                .and_then(|inner| match inner {
-                    RawInner::Bound(b) | RawInner::Wildcard(b) => {
-                        Some(b.inner().iface().nic_id() as u32)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(0);
             let mut pktinfo = In6PktInfo::default();
             pktinfo.ipi6_addr.copy_from_slice(dst);
-            pktinfo.ipi6_ifindex = ifindex;
+            pktinfo.ipi6_ifindex = ingress_ifindex;
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     (&pktinfo as *const In6PktInfo) as *const u8,
@@ -422,6 +435,7 @@ impl RawSocket {
         msg: &mut crate::net::posix::MsgHdr,
         packet: &[u8],
         recv_size: usize,
+        ingress_ifindex: u32,
     ) -> Result<usize, SystemError> {
         let mut write_off = 0usize;
         let mut cmsg_buf = CmsgBuffer {
@@ -439,6 +453,7 @@ impl RawSocket {
                 packet,
                 recv_size,
                 &options,
+                ingress_ifindex,
             )?,
             IpVersion::Ipv6 => self.build_ipv6_cmsgs(
                 &mut cmsg_buf,
@@ -446,6 +461,7 @@ impl RawSocket {
                 packet,
                 recv_size,
                 &options,
+                ingress_ifindex,
             )?,
         }
 
@@ -456,32 +472,50 @@ impl RawSocket {
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: crate::net::socket::PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        if flags.contains(PMSG::OOB) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if flags.contains(crate::net::socket::PMSG::ERRQUEUE) {
+            let entry = {
+                let mut errors = self.errors.lock();
+                let entry = errors.1.pop().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+                errors.0 = errors.1.pending_after_pop(&entry, errors.0);
+                entry
+            };
+            let options = self.options.read().clone();
+            let ipv6 = self.ip_version == IpVersion::Ipv6;
+            return entry.recv_msg_with_options(
+                msg,
+                super::super::common::error_queue::ErrorCmsgOptions {
+                    pktinfo: if ipv6 {
+                        options.recv_pktinfo_v6
+                    } else {
+                        options.recv_pktinfo_v4
+                    },
+                    ttl: if ipv6 {
+                        options.recv_hoplimit
+                    } else {
+                        options.recv_ttl
+                    },
+                    tos: if ipv6 {
+                        options.recv_tclass
+                    } else {
+                        options.recv_tos
+                    },
+                },
+                iovs,
+            );
+        }
 
-        // Linux 语义：IPv6 raw socket 接收时默认不向用户返回 IPv6 头；
-        // 但控制消息(cmsg)需要从 IPv6 头提取，因此这里总是预留 IPv6 头空间。
         let user_len = iovs.total_len();
-        let (need_head, extra_for_payload) = match self.ip_version {
-            IpVersion::Ipv4 => (IPV4_MIN_HEADER_LEN, 0usize),
-            IpVersion::Ipv6 => (IPV6_HEADER_LEN, IPV6_HEADER_LEN),
-        };
-        let mut tmp = vec![0u8; user_len.saturating_add(extra_for_payload).max(need_head)];
-
-        let nonblock = self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT);
-
-        let (recv_size, src_addr) = if nonblock {
-            self.try_recv(&mut tmp)
-        } else {
-            loop {
-                match self.try_recv(&mut tmp) {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
-                    }
-                    other => break other,
-                }
-            }
-        }?;
+        let mut buffer = RecvBuffer::default();
+        let received = self.recv_packet_staged(&mut buffer, flags)?;
+        let recv_size = received.copied;
+        let src_addr = received.source;
+        let ingress_ifindex = received.ifindex;
+        let tmp = buffer.bytes(recv_size);
 
         // IPv4: 向用户返回整个 IPv4 包(含 IPv4 头)。
         // IPv6: 向用户仅返回 payload（不含 IPv6 固定头）。
@@ -494,18 +528,28 @@ impl RawSocket {
             }
         };
         let user_recv_size = full_user_len.min(user_len);
-        iovs.scatter(&user_data[..user_recv_size])?;
+        iovs.scatter_exact(&user_data[..user_recv_size])?;
 
-        // 默认不设置任何 flags。
-        msg.msg_flags = 0;
+        msg.msg_flags = if user_recv_size < full_user_len {
+            PMSG::TRUNC.bits() as i32
+        } else {
+            0
+        };
 
         // 填充 peer 地址
-        self.fill_peer_addr(msg, src_addr)?;
+        self.fill_peer_addr(msg, src_addr, ingress_ifindex)?;
 
         // 构建控制消息
-        msg.msg_controllen = self.build_recv_cmsgs(msg, &tmp, recv_size)?;
+        msg.msg_controllen = self.build_recv_cmsgs(msg, tmp, recv_size, ingress_ifindex)?;
 
-        Ok(user_recv_size)
+        Ok(if flags.contains(PMSG::TRUNC) {
+            match self.ip_version {
+                IpVersion::Ipv4 => received.original_len,
+                IpVersion::Ipv6 => received.original_len.saturating_sub(IPV6_HEADER_LEN),
+            }
+        } else {
+            user_recv_size
+        })
     }
 
     pub fn validate_sendto_addr(
@@ -513,12 +557,8 @@ impl RawSocket {
         addr: *const crate::net::posix::SockAddr,
         addrlen: u32,
     ) -> Result<(), SystemError> {
-        // Linux 语义：对 AF_INET6 socket，若用户提供目标地址但 addrlen 小于 sockaddr_in6，返回 EINVAL。
-        // gVisor raw_socket_test: RawSocketTest.IPv6SendMsg
-        if !addr.is_null()
-            && self.is_ipv6()
-            && (addrlen as usize) < core::mem::size_of::<crate::net::posix::SockAddrIn6>()
-        {
+        // Linux also accepts RFC2133's 24-byte layout without a scope tail.
+        if !addr.is_null() && self.is_ipv6() && addrlen < 24 {
             return Err(SystemError::EINVAL);
         }
         Ok(())
@@ -529,13 +569,15 @@ impl RawSocket {
         buffer: &mut [u8],
         flags: crate::net::socket::PMSG,
     ) -> Result<usize, SystemError> {
-        if self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT) {
+        let nonblock = self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
+        if nonblock {
             self.try_recv_user(buffer).map(|(len, _)| len)
         } else {
             loop {
                 match self.try_recv_user(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                     }
                     result => return result.map(|(len, _)| len),
                 }
@@ -550,30 +592,20 @@ impl RawSocket {
         _address: Option<crate::net::socket::endpoint::Endpoint>,
     ) -> Result<(usize, crate::net::socket::endpoint::Endpoint), SystemError> {
         // Linux 语义：raw socket 的 recvfrom(2) 返回的 sockaddr_{in,in6}.port 为 0。
-        let port = 0u16;
-        if self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT) {
-            self.try_recv_user(buffer).map(|(len, addr)| {
-                (
-                    len,
-                    crate::net::socket::endpoint::Endpoint::Ip(smoltcp::wire::IpEndpoint::new(
-                        addr, port,
-                    )),
-                )
-            })
+        let nonblock = self.is_nonblock() || flags.contains(crate::net::socket::PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
+        if nonblock {
+            self.try_recv_user(buffer)
+                .map(|(len, addr)| (len, crate::net::socket::endpoint::Endpoint::ip(addr)))
         } else {
             loop {
                 match self.try_recv_user(buffer) {
                     Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.can_recv(), {})?;
+                        timeout.wait_io(&self.wait_queue, || self.can_recv())?;
                     }
                     result => {
                         return result.map(|(len, addr)| {
-                            (
-                                len,
-                                crate::net::socket::endpoint::Endpoint::Ip(
-                                    smoltcp::wire::IpEndpoint::new(addr, port),
-                                ),
-                            )
+                            (len, crate::net::socket::endpoint::Endpoint::ip(addr))
                         })
                     }
                 }

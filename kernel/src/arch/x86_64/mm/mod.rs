@@ -2,6 +2,7 @@
 
 pub mod barrier;
 pub mod bump;
+pub(crate) mod cache;
 pub mod fault;
 pub mod pkru;
 
@@ -17,7 +18,9 @@ use crate::libs::align::page_align_up;
 use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
 
-use crate::mm::allocator::page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage};
+use crate::mm::allocator::page_frame::{
+    FrameAllocationRequest, FrameAllocator, FramePlacement, PageFrameCount, PageFrameUsage,
+};
 use crate::mm::memblock::mem_block_manager;
 use crate::mm::ucontext::LockedVMA;
 use crate::{
@@ -53,6 +56,8 @@ pub struct X86_64MMBootstrapInfo {
     kernel_data_end: usize,
     kernel_rodata_start: usize,
     kernel_rodata_end: usize,
+    static_keys_start: usize,
+    static_keys_end: usize,
     start_brk: usize,
 }
 
@@ -114,6 +119,11 @@ impl MemoryManagementArch for X86_64MMArch {
     const ENTRY_FLAG_HUGE_PAGE: usize = 1 << 7;
     const ENTRY_FLAG_GLOBAL: usize = 1 << 8;
 
+    #[inline(always)]
+    fn entry_is_leaf(level: usize, flags: usize) -> bool {
+        level == 0 || flags & Self::ENTRY_FLAG_HUGE_PAGE != 0
+    }
+
     /// 物理地址与虚拟地址的偏移量
     /// 0xffff_8000_0000_0000
     const PHYS_OFFSET: usize = Self::PAGE_NEGATIVE_MASK + (Self::PAGE_ADDRESS_SIZE >> 1);
@@ -128,6 +138,7 @@ impl MemoryManagementArch for X86_64MMArch {
     const FIXMAP_START_VADDR: VirtAddr = VirtAddr::new(0xffffb00000000000);
     /// 设置FIXMAP区域大小为16M
     const FIXMAP_SIZE: usize = 256 * 4096 * 16;
+    const FIXMAP_RESERVED_TOP_PAGES: usize = 2;
 
     const MMIO_BASE: VirtAddr = VirtAddr::new(0xffffa10000000000);
     const MMIO_SIZE: usize = 1 << PAGE_1G_SHIFT;
@@ -140,6 +151,8 @@ impl MemoryManagementArch for X86_64MMArch {
             fn _edata();
             fn _rodata();
             fn _erodata();
+            fn __start___static_keys();
+            fn __stop___static_keys();
             fn _end();
             fn _default_kernel_load_base();
         }
@@ -153,6 +166,8 @@ impl MemoryManagementArch for X86_64MMArch {
             kernel_data_end: _edata as usize,
             kernel_rodata_start: _rodata as usize,
             kernel_rodata_end: _erodata as usize,
+            static_keys_start: __start___static_keys as usize,
+            static_keys_end: __stop___static_keys as usize,
             start_brk: _end as usize,
         };
 
@@ -229,11 +244,11 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 该函数会创建页表并复制内核的映射到新的页表中
     ///
     /// @return 新的页表
-    fn setup_new_usermapper() -> Result<crate::mm::ucontext::UserMapper, SystemError> {
-        let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> = unsafe {
-            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
-                .ok_or(SystemError::ENOMEM)?
-        };
+    fn setup_new_usermapper(
+        account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<crate::mm::ucontext::UserMapper, crate::mm::allocation::MemoryAllocationError> {
+        let new_umapper: crate::mm::page::PageMapper<X86_64MMArch, LockedFrameAllocator> =
+            unsafe { PageMapper::create_user(account)?.ok_or(SystemError::ENOMEM)? };
 
         let current_ktable: KernelMapper = KernelMapper::lock();
         let copy_mapping = |pml4_entry_no| unsafe {
@@ -295,6 +310,9 @@ impl MemoryManagementArch for X86_64MMArch {
 
     unsafe fn phys_2_virt(phys: PhysAddr) -> Option<VirtAddr> {
         if let Some(vaddr) = phys.data().checked_add(Self::PHYS_OFFSET) {
+            if crate::mm::vmalloc::contains(VirtAddr::new(vaddr)) {
+                return None;
+            }
             return Some(VirtAddr::new(vaddr));
         } else {
             return None;
@@ -302,6 +320,9 @@ impl MemoryManagementArch for X86_64MMArch {
     }
 
     unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
+        if crate::mm::vmalloc::contains(virt) {
+            return None;
+        }
         if let Some(paddr) = virt.data().checked_sub(Self::PHYS_OFFSET) {
             return Some(PhysAddr::new(paddr));
         } else {
@@ -331,8 +352,9 @@ impl MemoryManagementArch for X86_64MMArch {
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
-    const PAGE_NONE: usize =
-        Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
+    // PROT_NONE must fault even for supervisor reads. GLOBAL aliases the
+    // software PROTNONE bit while hardware PRESENT is clear (Linux PAGE_NONE).
+    const PAGE_NONE: usize = Self::ENTRY_FLAG_ACCESSED | Self::ENTRY_FLAG_GLOBAL;
 
     const PAGE_SHARED: usize = Self::ENTRY_FLAG_PRESENT
         | Self::ENTRY_FLAG_READWRITE
@@ -526,13 +548,20 @@ const fn protection_map() -> [EntryFlags<MMArch>; 16] {
 
 impl X86_64MMArch {
     pub(crate) fn init_current_cpu_nxe() -> bool {
-        // EFER 是每 CPU 状态。BSP 在 mm 初始化时会开启 NXE，AP 也必须分别开启，
-        // 否则访问带 NX 位的用户页会触发 #PF.RSVD。
+        if !raw_cpuid::CpuId::new()
+            .get_extended_processor_and_feature_identifiers()
+            .is_some_and(|features| features.has_execute_disable())
+        {
+            return false;
+        }
+        // EFER is per-CPU. The BSP enables NXE before publishing NX mappings;
+        // AP bootstrap assembly does so before loading the BSP page tables.
+        // A later AP call is idempotent, never the first enable boundary.
         let mut efer = x86_64::registers::model_specific::Efer::read();
         if !efer.contains(EferFlags::NO_EXECUTE_ENABLE) {
-            debug!("Enabling EFER.NXE on current CPU");
             efer.insert(EferFlags::NO_EXECUTE_ENABLE);
             unsafe { x86_64::registers::model_specific::Efer::write(efer) };
+            debug!("Enabling EFER.NXE on current CPU");
         }
 
         x86_64::registers::model_specific::Efer::read().contains(EferFlags::NO_EXECUTE_ENABLE)
@@ -540,7 +569,7 @@ impl X86_64MMArch {
 
     /// 初始化当前 CPU 的 XD/NX 能力状态。
     ///
-    /// BSP 在页表策略初始化前记录全局 XD_RESERVED；AP 只需要分别打开本地 EFER.NXE。
+    /// BSP 在页表策略初始化前记录全局 XD_RESERVED；AP 在汇编加载 BSP 页表前开启本地 NXE。
     pub(crate) fn init_xd_rsvd() {
         // BSP 在初始化页表策略前探测并开启 NXE，得到系统是否支持 NX 的结论。
         let xd_reserved = !Self::init_current_cpu_nxe();
@@ -581,6 +610,7 @@ unsafe fn allocator_init() {
 
     let phy_offset = unsafe { MMArch::virt_2_phys(virt_offset) }.unwrap();
 
+    bump::snapshot_reclaimable_prefix().expect("Failed to preserve bootstrap RAM ownership");
     mem_block_manager()
         .reserve_block(PhysAddr::new(0), phy_offset.data())
         .expect("Failed to reserve block");
@@ -635,6 +665,21 @@ unsafe fn allocator_init() {
                 // 暂时不刷新TLB
                 flusher.ignore();
             }
+        }
+
+        // User roots copy the kernel PML4 entries once. Fix their shared PDPT
+        // identities before publishing this root, so later device mappings in
+        // high physical-address slots are visible in every address space.
+        // These at most 256 bootstrap pages are permanent, not device-owned;
+        // no leaf mappings are installed for RAM holes or device memory here.
+        let slot_size = 1usize << (MMArch::PAGE_ADDRESS_SHIFT - MMArch::PAGE_ENTRY_SHIFT);
+        for index in MMArch::PAGE_KERNEL_INDEX..MMArch::PAGE_ENTRY_NUM {
+            let address = MMArch::PHYS_OFFSET
+                .checked_add((index - MMArch::PAGE_KERNEL_INDEX) * slot_size)
+                .expect("Kernel page-table slot address overflow");
+            mapper
+                .prepare_kernel_subtree(VirtAddr::new(address), MMArch::PAGE_LEVELS - 2)
+                .expect("Failed to prepare shared kernel page-table subtree");
         }
     }
 
@@ -770,14 +815,73 @@ pub fn test_buddy() {
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
 
+impl LockedFrameAllocator {
+    /// Run a short allocator operation; never retain this guard across migration.
+    pub(crate) fn with_buddy<T>(
+        operation: impl FnOnce(&mut BuddyAllocator<MMArch>) -> T,
+    ) -> Option<T> {
+        INNER_ALLOCATOR.lock_irqsave().as_mut().map(operation)
+    }
+
+    /// Relocation must not start reclaim or retry through the OOM victim path.
+    pub(crate) unsafe fn allocate_migration_target_no_reclaim() -> Option<PhysAddr> {
+        let request =
+            FrameAllocationRequest::kernel(PageFrameCount::ONE, PhysAddr::new(usize::MAX))
+                .with_placement(FramePlacement::Movable);
+        Self::with_buddy(|buddy| {
+            buddy.allocate_admitted(request, crate::mm::allocator::reserve::ReserveLevel::Kernel)
+        })
+        .flatten()
+        .map(|(physical, _)| physical)
+    }
+
+    pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_ref()
+            .map(BuddyAllocator::diagnostic_snapshot)
+    }
+
+    pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
+        Self::with_buddy(|buddy| buddy.pressure_snapshot()).unwrap_or_default()
+    }
+}
+
 impl FrameAllocator for LockedFrameAllocator {
-    unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        count = count.next_power_of_two();
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
-        } else {
-            return None;
+    unsafe fn allocate_request(
+        &mut self,
+        request: FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        let request = request.normalized()?;
+        let level = request.reserve_level();
+        let allocation =
+            Self::with_buddy(|buddy| buddy.allocate_admitted(request, level)).flatten();
+        if request.count.data() > 1 && level == crate::mm::allocator::reserve::ReserveLevel::Kernel
+        {
+            if let Some((physical, count)) = allocation {
+                crate::mm::compaction::background::observe_allocation(
+                    count,
+                    request.max_phys_addr,
+                    physical,
+                );
+            }
         }
+        allocation
+    }
+
+    unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
+        self.allocate_request(FrameAllocationRequest::kernel(
+            count,
+            PhysAddr::new(usize::MAX),
+        ))
+    }
+
+    unsafe fn allocate_below(
+        &mut self,
+        count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        self.allocate_request(FrameAllocationRequest::kernel(count, max_phys_addr))
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
@@ -801,11 +905,14 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(virt: VirtAddr) -> Entr
     let info: X86_64MMBootstrapInfo = BOOTSTRAP_MM_INFO.unwrap();
 
     if virt.data() >= info.kernel_code_start && virt.data() < info.kernel_code_end {
-        // Remap kernel code  execute
-        return EntryFlags::new().set_execute(true).set_write(true);
+        // Core text is executable through this read-only mapping. Runtime
+        // patching uses a short-lived, non-executable fixmap alias.
+        return EntryFlags::new().set_execute(true).set_write(false);
+    } else if virt.data() >= info.static_keys_start && virt.data() < info.static_keys_end {
+        return EntryFlags::new().set_write(true).set_execute(false);
     } else if virt.data() >= info.kernel_rodata_start && virt.data() < info.kernel_rodata_end {
         // Remap kernel rodata read only
-        return EntryFlags::new().set_execute(true);
+        return EntryFlags::new().set_execute(false);
     } else {
         return EntryFlags::new().set_write(true).set_execute(true);
     }
@@ -846,15 +953,19 @@ impl LowAddressRemapping {
     }
 
     /// 取消低地址的映射
-    pub unsafe fn unmap_at_low_address(mapper: &mut PageMapper, flush: bool) {
+    pub unsafe fn unmap_at_low_address(
+        mapper: &mut PageMapper,
+        gather: &mut crate::mm::mmu_gather::MmuGather<'_>,
+    ) {
         for i in 0..(Self::REMAP_SIZE / MMArch::PAGE_SIZE) {
             let vaddr = VirtAddr::new(i * MMArch::PAGE_SIZE);
             let (_, _, flusher) = mapper
-                .unmap_phys(vaddr, true)
+                .unmap_phys_gather(vaddr, true, gather)
                 .expect("Failed to unmap frame");
-            if !flush {
-                flusher.ignore();
-            }
+            // Identity-mapped leaf frames are not owned by this bootstrap mm.
+            // Only the detached intermediate-table receipts enter the gather.
+            flusher.ignore();
+            gather.accumulate_range(vaddr);
         }
     }
 }

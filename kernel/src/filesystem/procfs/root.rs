@@ -9,10 +9,10 @@ use crate::{
         procfs::{
             cmdline::CmdlineFileOps,
             cpuinfo::CpuInfoFileOps,
+            keys::{KeyUsersFileOps, KeysFileOps},
             kmsg_file::KmsgFileOps,
             loadavg::LoadavgFileOps,
             meminfo::MeminfoFileOps,
-            mounts::MountsFileOps,
             net::NetDirOps,
             pid::PidDirOps,
             self_::SelfSymOps,
@@ -23,14 +23,18 @@ use crate::{
                 ProcDirBuilder,
             },
             thread_self::ThreadSelfSymOps,
+            uptime::UptimeFileOps,
             version::VersionFileOps,
             version_signature::VersionSignatureFileOps,
             vmstat::VmstatFileOps,
             Builder, PROCFS_BLOCK_SIZE, PROCFS_MAX_NAMELEN,
         },
-        vfs::{FileSystemMakerData, IndexNode, InodeMode, FSMAKER},
+        vfs::{
+            FileSystemMakerData, FsCreationContext, IndexNode, InodeId, InodeMode, Metadata,
+            FSMAKER,
+        },
     },
-    process::{namespace::pid_namespace::PidNamespace, ProcessManager, RawPid},
+    process::{namespace::pid_namespace::PidNamespace, RawPid},
     register_mountable_fs,
 };
 use alloc::{
@@ -87,15 +91,22 @@ impl RootDirOps {
     )] = &[
         ("cmdline", CmdlineFileOps::new_inode),
         ("cpuinfo", CpuInfoFileOps::new_inode),
+        ("keys", KeysFileOps::new_inode),
+        ("key-users", KeyUsersFileOps::new_inode),
         ("kmsg", KmsgFileOps::new_inode),
         ("loadavg", LoadavgFileOps::new_inode),
         ("meminfo", MeminfoFileOps::new_inode),
-        ("mounts", MountsFileOps::new_inode),
+        (
+            "mounts",
+            crate::filesystem::procfs::mount::inode::MountsSymOps::new_inode,
+        ),
         ("net", NetDirOps::new_inode),
         ("self", SelfSymOps::new_inode),
         ("stat", StatFileOps::new_inode),
         ("sys", SysDirOps::new_inode),
+        ("sysrq-trigger", super::sysrq::SysrqFileOps::new_inode),
         ("thread-self", ThreadSelfSymOps::new_inode),
+        ("uptime", UptimeFileOps::new_inode),
         ("version", VersionFileOps::new_inode),
         ("version_signature", VersionSignatureFileOps::new_inode),
         ("vmstat", VmstatFileOps::new_inode),
@@ -103,15 +114,27 @@ impl RootDirOps {
 }
 
 impl DirOps for RootDirOps {
+    fn reported_ino(&self, _metadata: &Metadata) -> InodeId {
+        // Linux PROC_ROOT_INO. Keep the generated internal ID distinct across
+        // procfs instances; only the user-visible number is fixed.
+        InodeId::new(1)
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        // Lookup goes through the PID link, like Linux `proc_pid_lookup()`
+        // (`find_task_by_pid_ns()`), so any task that still holds a PID link can
+        // be named by its own tid. Directory listing keeps using the TGID link
+        // in `populate_children()` and therefore yields leaders only, matching
+        // Linux `next_tgid()`. The asymmetry between lookup and listing is
+        // intentional and matches Linux.
         // 首先检查是否是 PID 目录
         if let Ok(pid) = name.parse::<RawPid>() {
             // 检查进程是否存在
-            if let Some(target) = crate::filesystem::procfs::pid::ProcPidTarget::from_tgid_in_ns(
+            if let Some(target) = crate::filesystem::procfs::pid::ProcPidTarget::from_pid_in_ns(
                 self.pid_ns.clone(),
                 pid,
             ) {
@@ -161,8 +184,21 @@ impl DirOps for RootDirOps {
         // 获取缓存写锁并填充
         let mut cached_children = dir.cached_children().write();
 
+        // A numeric entry stays valid only while its tid still resolves as a
+        // thread group id. `lookup_child()` creates entries through the PID link
+        // (any live task), so without this filter a directory opened by looking
+        // up a non-leader tid would leak into the listing. Linux `next_tgid()`
+        // lists leaders only, and so must this.
         cached_children.retain(|name, child| {
-            name.parse::<RawPid>().is_err() || self.validate_child(child.as_ref())
+            let Ok(pid) = name.parse::<RawPid>() else {
+                return true;
+            };
+            self.validate_child(child.as_ref())
+                && crate::filesystem::procfs::pid::ProcPidTarget::from_tgid_in_ns(
+                    self.pid_ns.clone(),
+                    pid,
+                )
+                .is_some()
         });
 
         // 填充进程目录（只传递 PID）
@@ -236,6 +272,12 @@ impl ProcFS {
 }
 
 impl FileSystem for ProcFS {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_inode.clone()
     }
@@ -252,7 +294,7 @@ impl FileSystem for ProcFS {
     }
 
     fn name(&self) -> &str {
-        "procfs"
+        "proc"
     }
 
     fn super_block(&self) -> SuperBlock {
@@ -267,12 +309,25 @@ impl MountableFileSystem for ProcFS {
     /// 与需要挂载选项的文件系统（如带有大小限制的 tmpfs）不同，
     /// procfs 的行为完全由内核状态决定，不需要额外的配置参数。
     fn make_mount_data(
+        raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<
+        Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        Self::make_mount_data_in_context(raw_data, source, &FsCreationContext::current())
+    }
+
+    fn make_mount_data_in_context(
         _raw_data: Option<&str>,
         _source: &str,
-    ) -> Result<Option<Arc<dyn crate::filesystem::vfs::FileSystemMakerData + 'static>>, SystemError>
-    {
+        context: &FsCreationContext,
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
         Ok(Some(Arc::new(ProcMountData {
-            pid_ns: ProcessManager::current_pcb().active_pid_ns(),
+            pid_ns: context.pid_ns.clone(),
         })))
     }
 

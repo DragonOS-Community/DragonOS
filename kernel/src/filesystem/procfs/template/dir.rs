@@ -96,8 +96,16 @@ impl<Ops: DirOps> ProcDir<Ops> {
 
 #[inherit_methods(from = "self.common")]
 impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.inner.before_read_dir()
+    }
     fn fs(&self) -> Arc<dyn FileSystem>;
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError>;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.common.set_metadata(metadata).map_err(Into::into)
+    }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
@@ -105,11 +113,26 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let mut metadata = self.common.metadata()?;
-        if let Some((uid, gid)) = self.inner.owner() {
+        let owner = self.inner.owner();
+        self.inner.validate_inode()?;
+        if let Some((uid, gid)) = owner {
             metadata.uid = uid;
             metadata.gid = gid;
         }
         Ok(metadata)
+    }
+
+    fn reported_ino(&self, metadata: &Metadata) -> InodeId {
+        self.inner.reported_ino(metadata)
+    }
+
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        self.inner.validate_inode()?;
+        self.inner.check_dac_permission(metadata, mask)
     }
 
     fn read_at(
@@ -118,8 +141,8 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EISDIR.into())
     }
 
     fn write_at(
@@ -128,11 +151,12 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EISDIR)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EISDIR.into())
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
+        self.inner.before_read_dir()?;
         let mut keys = Vec::new();
         keys.push(String::from("."));
         keys.push(String::from(".."));
@@ -194,7 +218,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
                     .read()
                     .iter()
                     .filter_map(|(k, v)| {
-                        if v.metadata().unwrap().inode_id.into() == ino {
+                        if v.metadata().ok()?.inode_id.into() == ino {
                             Some(k.to_string())
                         } else {
                             None
@@ -228,7 +252,7 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         return Ok(());
     }
 
@@ -236,12 +260,40 @@ impl<Ops: DirOps + 'static> IndexNode for ProcDir<Ops> {
         return Ok(());
     }
 
-    fn link(&self, _name: &str, _other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        Err(SystemError::EPERM)
+    fn link(
+        &self,
+        _name: &str,
+        _other: &Arc<dyn IndexNode>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        Err(SystemError::EPERM.into())
     }
 }
 
 pub trait DirOps: Sync + Send + Sized + Debug {
+    /// Dynamic directories may outlive their backing table through retained
+    /// paths. Attributes and permissions must reject a retired identity too.
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+    /// Reject enumeration of a directory whose dynamic backing table is gone.
+    /// This also runs before emitting dot entries from the cached directory.
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: crate::filesystem::vfs::permission::PermissionMask,
+    ) -> Result<(), SystemError> {
+        crate::process::ProcessManager::current_pcb()
+            .cred()
+            .inode_permission(metadata, mask.bits())
+    }
+
+    fn reported_ino(&self, metadata: &Metadata) -> InodeId {
+        metadata.inode_id
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,

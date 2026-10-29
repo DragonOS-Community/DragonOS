@@ -13,6 +13,8 @@ pub enum ErrCode {
     ENOENT = 2,
     /// I/O error.
     EIO = 5,
+    /// Resource temporarily unavailable.
+    EAGAIN = 11,
     /// No such device or address.
     ENXIO = 6,
     /// Argument list too long.
@@ -43,16 +45,14 @@ pub enum ErrCode {
     EMLINK = 31,
     /// Math result not representable.
     ERANGE = 34,
+    /// File name too long.
+    ENAMETOOLONG = 36,
     /// Directory not empty.
     ENOTEMPTY = 39,
     /// No data available.
     ENODATA = 61,
     /// Not supported.
     ENOTSUP = 95,
-    /// Link failed.
-    ELINKFAIL = 97,
-    /// Inode alloc failed.
-    EALLOCFAIL = 98,
 }
 
 /// error used in this crate

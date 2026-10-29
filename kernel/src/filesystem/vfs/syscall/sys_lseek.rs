@@ -2,8 +2,7 @@
 
 use system_error::SystemError;
 
-use super::SEEK_MAX;
-use super::{SEEK_CUR, SEEK_END, SEEK_SET};
+use super::{SEEK_CUR, SEEK_DATA, SEEK_END, SEEK_HOLE, SEEK_MAX, SEEK_SET};
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_LSEEK;
 use crate::driver::base::block::SeekFrom;
@@ -37,15 +36,6 @@ impl Syscall for SysLseekHandle {
         let offset = Self::offset(args);
         let whence = Self::whence(args);
 
-        // Convert seek type to SeekFrom enum
-        let seek = match whence {
-            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
-            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
-            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
-            SEEK_MAX => Ok(SeekFrom::SeekEnd(0)),
-            _ => Err(SystemError::EINVAL),
-        }?;
-
         // Get file from file descriptor table
         let binding = ProcessManager::current_pcb().fd_table();
         let fd_table_guard = binding.read();
@@ -55,6 +45,21 @@ impl Syscall for SysLseekHandle {
 
         // Drop guard to avoid scheduling issues
         drop(fd_table_guard);
+
+        // Decode whence after the file descriptor lookup. Linux gives EBADF
+        // precedence when both the descriptor and whence are invalid.
+        if whence > SEEK_MAX {
+            return Err(SystemError::EINVAL);
+        }
+        let seek = match whence {
+            SEEK_SET => Ok(SeekFrom::SeekSet(offset)),
+            SEEK_CUR => Ok(SeekFrom::SeekCurrent(offset)),
+            SEEK_END => Ok(SeekFrom::SeekEnd(offset)),
+            SEEK_DATA => Ok(SeekFrom::SeekData(offset)),
+            SEEK_HOLE => Ok(SeekFrom::SeekHole(offset)),
+            _ => Err(SystemError::EINVAL),
+        }?;
+
         // Perform the seek operation
         return file.lseek(seek);
     }
@@ -121,7 +126,8 @@ impl SysLseekHandle {
             SEEK_SET => "SEEK_SET".to_string(),
             SEEK_CUR => "SEEK_CUR".to_string(),
             SEEK_END => "SEEK_END".to_string(),
-            SEEK_MAX => "SEEK_MAX".to_string(),
+            SEEK_DATA => "SEEK_DATA".to_string(),
+            SEEK_HOLE => "SEEK_HOLE".to_string(),
             _ => format!("UNKNOWN({})", whence),
         }
     }

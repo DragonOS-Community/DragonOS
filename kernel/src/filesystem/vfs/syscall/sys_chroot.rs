@@ -13,7 +13,8 @@ use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_CHROOT;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::{
-    utils::user_path_at, FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    utils::{user_path_at, ResolvedPath},
+    FileType, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
@@ -55,9 +56,12 @@ impl Syscall for SysChrootHandle {
             crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
             path,
         )?;
-        let target =
-            inode_begin.lookup_follow_symlink(&resolved_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let target = crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(&resolved_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
 
+        let resolved = ResolvedPath::new(target)?;
+        let target = resolved.inode();
         let meta = target.metadata()?;
         if meta.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
@@ -70,7 +74,7 @@ impl Syscall for SysChrootHandle {
         )?;
 
         // 更新进程 fs root；不改变 cwd（Linux 行为）
-        pcb.fs_struct_mut().set_root(target);
+        pcb.fs_struct().set_root_resolved(resolved);
         Ok(0)
     }
 

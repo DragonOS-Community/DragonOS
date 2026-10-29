@@ -17,7 +17,8 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 pub use point::{
-    CommonTracePointMeta, TraceEntry, TracePoint, TracePointCallBackFunc, TracePointFunc,
+    CommonTracePointMeta, TraceEntry, TraceEventField, TracePoint, TracePointCallBackFunc,
+    TracePointFunc,
 };
 use system_error::SystemError;
 pub use trace_pipe::{
@@ -216,21 +217,23 @@ impl TracePointEnableFile {
     ///
     /// Returns true if the tracepoint is enabled, false otherwise.
     pub fn read(&self) -> &'static str {
-        if self.tracepoint.is_enabled() {
+        if self.tracepoint.is_trace_pipe_enabled() {
             "1\n"
         } else {
             "0\n"
         }
     }
     /// Enable or disable the tracepoint
-    pub fn write(&self, enable: char) {
+    pub fn write(&self, enable: char) -> Result<(), SystemError> {
         match enable {
-            '1' => self.tracepoint.enable(),
-            '0' => self.tracepoint.disable(),
+            '1' => self.tracepoint.set_trace_pipe_enabled(true)?,
+            '0' => self.tracepoint.set_trace_pipe_enabled(false)?,
             _ => {
                 log::warn!("Invalid value for tracepoint enable: {}", enable);
+                return Err(SystemError::EINVAL);
             }
         }
+        Ok(())
     }
 }
 
@@ -259,6 +262,7 @@ extern "C" {
 
 /// Initialize the tracing events
 pub fn global_init_events() -> Result<TracingEventsManager, SystemError> {
+    point::tracepoint_srcu_init()?;
     static TRACE_POINT_ID: AtomicUsize = AtomicUsize::new(0);
     let events_manager = TracingEventsManager::new(TracePointMap::new());
     let tracepoint_data_start = _tracepoint as usize as *mut CommonTracePointMeta;
@@ -278,9 +282,9 @@ pub fn global_init_events() -> Result<TracingEventsManager, SystemError> {
     let mut tracepoint_map = events_manager.tracepoint_map();
     for tracepoint_meta in tracepoint_data {
         let tracepoint = tracepoint_meta.trace_point;
+        tracepoint.init_callbacks(tracepoint_meta.print_func, Box::new(()))?;
         let id = TRACE_POINT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         tracepoint.set_id(id as u32);
-        tracepoint.register(tracepoint_meta.print_func, Box::new(()));
         tracepoint_map.insert(id as u32, tracepoint);
         log::info!(
             "tracepoint registered: {}:{}",

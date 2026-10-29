@@ -1,15 +1,18 @@
 //! /proc/vmstat - 虚拟内存统计信息
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
+    arch::MMArch,
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_snapshot_operation, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    mm::page_cache_stats,
+    mm::{allocator::slab::slab_usage, fault, oom, page_cache_stats, MemoryManagementArch},
 };
 use alloc::{borrow::ToOwned, format, sync::Arc, sync::Weak, vec::Vec};
 use system_error::SystemError;
@@ -24,6 +27,11 @@ enum VmstatSource {
     Shmem,
     Unevictable,
     DropPagecache,
+    OomKill,
+    PageFaults,
+    PageMajorFaults,
+    SlabReclaimable,
+    SlabUnreclaimable,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,11 +102,11 @@ const VMSTAT_FIELDS: &[VmstatField] = &[
     },
     VmstatField {
         name: "nr_slab_reclaimable",
-        source: VmstatSource::Zero,
+        source: VmstatSource::SlabReclaimable,
     },
     VmstatField {
         name: "nr_slab_unreclaimable",
-        source: VmstatSource::Zero,
+        source: VmstatSource::SlabUnreclaimable,
     },
     VmstatField {
         name: "nr_isolated_anon",
@@ -300,11 +308,11 @@ const VMSTAT_FIELDS: &[VmstatField] = &[
     },
     VmstatField {
         name: "pgfault",
-        source: VmstatSource::Zero,
+        source: VmstatSource::PageFaults,
     },
     VmstatField {
         name: "pgmajfault",
-        source: VmstatSource::Zero,
+        source: VmstatSource::PageMajorFaults,
     },
     VmstatField {
         name: "pglazyfreed",
@@ -412,7 +420,7 @@ const VMSTAT_FIELDS: &[VmstatField] = &[
     },
     VmstatField {
         name: "oom_kill",
-        source: VmstatSource::Zero,
+        source: VmstatSource::OomKill,
     },
     VmstatField {
         name: "unevictable_pgs_culled",
@@ -458,6 +466,7 @@ impl VmstatFileOps {
 
     fn generate_vmstat_content() -> Vec<u8> {
         let stats = page_cache_stats::snapshot();
+        let slab_pages = slab_usage().total() / MMArch::PAGE_SIZE as u64;
         let mut data: Vec<u8> = Vec::new();
 
         for field in VMSTAT_FIELDS {
@@ -470,6 +479,11 @@ impl VmstatFileOps {
                 VmstatSource::Shmem => stats.shmem_pages,
                 VmstatSource::Unevictable => stats.unevictable,
                 VmstatSource::DropPagecache => stats.drop_pagecache,
+                VmstatSource::OomKill => oom::oom_kill_count(),
+                VmstatSource::PageFaults => fault::page_fault_count(),
+                VmstatSource::PageMajorFaults => fault::page_major_fault_count(),
+                VmstatSource::SlabReclaimable => 0,
+                VmstatSource::SlabUnreclaimable => slab_pages,
             };
             data.append(&mut format!("{} {}\n", field.name, value).as_bytes().to_owned());
         }
@@ -481,14 +495,20 @@ impl VmstatFileOps {
 }
 
 impl FileOps for VmstatFileOps {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_vmstat_content();
-        proc_read(offset, len, buf, &content)
+        // `seq_file` (Linux `proc_create_seq(&vmstat_op)`, `mm/vmstat.c`): one fd
+        // sees one rendered record.
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_vmstat_content()))
     }
 }

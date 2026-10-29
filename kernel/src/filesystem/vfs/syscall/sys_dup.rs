@@ -19,18 +19,22 @@ impl Syscall for SysDupHandle {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let oldfd = Self::oldfd(args);
-        let binding = ProcessManager::current_pcb().fd_table();
-        let mut fd_table_guard = binding.write();
-
-        let old_file = fd_table_guard
-            .get_file_by_fd(oldfd)
-            .ok_or(SystemError::EBADF)?;
+        let current = ProcessManager::current_pcb();
+        let binding = current.fd_table();
 
         // dup 共享同一个 open file description（Arc<File>），cloexec 默认 false
-        let res = fd_table_guard
-            .alloc_fd_arc(old_file, None, false)
-            .map(|x| x as usize);
-        return res;
+        // Pin the original OFD before descriptor allocation: an OOM wait must
+        // not change it through concurrent close/reuse of the source number.
+        let source = binding.get_file_by_fd(oldfd).ok_or(SystemError::EBADF)?;
+        let reservation = crate::filesystem::vfs::file::File::recover_io(|| {
+            binding.reserve::<1>(
+                current.nofile_soft_limit(),
+                0,
+                false,
+                &crate::cgroup::memory::object_for_task(&current),
+            )
+        })?;
+        Ok(reservation.commit_arc(source) as usize)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

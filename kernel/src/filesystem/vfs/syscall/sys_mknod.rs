@@ -61,9 +61,10 @@ impl Syscall for SysMknodHandle {
 
         let (inode_begin, remain_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), path)?;
 
-        if inode_begin
-            .lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
-            .is_ok()
+        if crate::filesystem::vfs::file::File::recover_io(|| {
+            inode_begin.lookup_follow_symlink(&remain_path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })
+        .is_ok()
         {
             return Err(SystemError::EEXIST);
         }
@@ -79,7 +80,7 @@ impl Syscall for SysMknodHandle {
         let parent_inode: Arc<dyn IndexNode> = resolve_parent_inode(inode_begin, parent_path)?;
 
         // 创建节点
-        parent_inode.mknod(filename, mode, dev)?;
+        super::mknod_utils::mknod_and_notify(&parent_inode, filename, mode, dev)?;
 
         Ok(0)
     }

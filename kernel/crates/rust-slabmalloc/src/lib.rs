@@ -23,6 +23,7 @@
 #![crate_name = "slabmalloc"]
 #![crate_type = "lib"]
 #![feature(maybe_uninit_as_bytes)]
+#![feature(allocator_api)]
 #![deny(clippy::all)]
 #![allow(clippy::needless_return)]
 extern crate alloc;

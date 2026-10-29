@@ -20,8 +20,58 @@ impl TcpSocket {
             let _ = self.flush_cork_buffer();
         }
 
-        let inner_guard = self.inner.read();
-        match inner_guard.as_ref() {
+        let mut inner_guard = self.inner.read();
+        if let Some(inner::Inner::Connecting(connecting)) = inner_guard.as_ref() {
+            let _ = connecting.update_io_events(&self.pollee);
+            if connecting.is_connected() {
+                // Completion belongs to the socket state machine, not to a
+                // subsequent send(). Otherwise a peer's first data/FIN stays
+                // hidden behind the Connecting event and receive paths.
+                drop(inner_guard);
+                {
+                    let mut writer = self.inner.write();
+                    if matches!(writer.as_ref(), Some(inner::Inner::Connecting(conn)) if conn.is_connected())
+                    {
+                        let Some(inner::Inner::Connecting(conn)) = writer.take() else {
+                            unreachable!();
+                        };
+                        let (established, _) = conn.into_result();
+                        writer.replace(established);
+                    }
+                }
+                inner_guard = self.inner.read();
+            }
+        }
+        if matches!(inner_guard.as_ref(), Some(inner::Inner::Listening(ls)) if ls.has_excess_slots())
+        {
+            // A pending handshake can return to LISTEN after RST without an
+            // accept. Reclaim its surplus slot through the existing event path.
+            // Never upgrade while retaining the read lock; close/listen may
+            // change the state before the write lock is acquired.
+            drop(inner_guard);
+            {
+                let mut writer = self.inner.write();
+                if let Some(inner::Inner::Listening(listening)) = writer.as_mut() {
+                    listening.trim_excess();
+                }
+            }
+            inner_guard = self.inner.read();
+        }
+        if matches!(inner_guard.as_ref(), Some(inner::Inner::Listening(_))) {
+            // Rearming an idle slot and requesting task-context refill mutate
+            // listener state. Never upgrade while retaining the read guard.
+            drop(inner_guard);
+            let mut writer = self.inner.write();
+            if let Some(inner::Inner::Listening(listening)) = writer.as_mut() {
+                listening.update_io_events(&self.pollee);
+                return false;
+            }
+            drop(writer);
+            // Concurrent close changed the state; use a fresh read rather
+            // than recursively retrying a racing event notification.
+            inner_guard = self.inner.read();
+        }
+        let changed = match inner_guard.as_ref() {
             None => false,
             Some(inner::Inner::Init(_)) => {
                 // Linux: POLLHUP is set on fresh socket.
@@ -42,68 +92,34 @@ impl TcpSocket {
             }
             Some(inner::Inner::Connecting(connecting)) => connecting.update_io_events(&self.pollee),
             Some(inner::Inner::Established(established)) => {
-                established.update_io_events(&self.pollee);
-
-                // If SHUT_WR was requested while there were pending TX bytes, send FIN once
-                // the TX queue drains to preserve Linux-like semantics.
-                if self.is_send_shutdown()
-                    && self
-                        .send_fin_deferred
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                {
-                    let pending = established.with(|socket| socket.send_queue());
-                    if pending == 0 {
-                        established.with_mut(|socket| socket.close());
-                        self.send_fin_deferred
-                            .store(false, core::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
-                // If SHUT_WR, set EPOLLOUT so send() wakes up and returns EPIPE.
-                if self.is_send_shutdown() {
-                    self.pollee.fetch_or(
-                        (EP::EPOLLOUT | EP::EPOLLWRNORM).bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-                // If SHUT_RD, set EPOLLIN so recv() wakes up and returns 0 (EOF).
-                if self.is_recv_shutdown() {
-                    self.pollee.fetch_or(
-                        (EP::EPOLLIN | EP::EPOLLRDNORM).bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-
-                // Note: EPOLLHUP/EPOLLRDHUP/EPOLLERR are now handled in
-                // Established::update_io_events() based on socket state.
-                false
-            }
-            Some(inner::Inner::SelfConnected(sc)) => {
-                // Self-connect is modeled by an internal receive queue. Readable becomes true
-                // when the queue has data OR after SHUT_WR (EOF). Writable depends on queue
-                // free space unless SHUT_WR (then send() returns EPIPE).
-                sc.update_io_events(&self.pollee);
-
-                // Match established behavior for shutdown bits.
-                if self.is_send_shutdown() {
-                    self.pollee.fetch_or(
-                        (EP::EPOLLOUT | EP::EPOLLWRNORM).bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-                if self.is_recv_shutdown() {
-                    self.pollee.fetch_or(
-                        (EP::EPOLLIN | EP::EPOLLRDNORM).bits() as usize,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                }
+                established.update_io_events(&self.pollee, self.shutdown_bits());
                 false
             }
             Some(inner::Inner::Listening(listening)) => {
-                listening.update_io_events(&self.pollee);
+                let _ = listening;
                 false
             }
+        };
+        if self.error_queue_ready() {
+            self.pollee.fetch_or(
+                EP::EPOLLERR.bits() as usize,
+                core::sync::atomic::Ordering::Release,
+            );
         }
+        changed
+    }
+
+    /// Normal receive must not wake repeatedly for an extended error queue:
+    /// MSG_ERRQUEUE owns that queue, while transport errors still wake recv.
+    pub(super) fn recv_wait_ready(&self) -> bool {
+        let events = self.check_io_event();
+        if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP) {
+            return true;
+        }
+        events.contains(EP::EPOLLERR)
+            && self.inner.read().as_ref().is_some_and(|inner| {
+                inner.with_socket(|socket| socket.pending_error().is_some()) == Some(true)
+            })
     }
 
     #[inline]

@@ -73,7 +73,6 @@ pub unsafe fn arch_switch_to_user(trap_frame: TrapFrame) -> ! {
     *(trap_frame_vaddr.data() as *mut TrapFrame) = trap_frame;
 
     compiler_fence(Ordering::SeqCst);
-    crate::rcu::note_exit_to_user_mode();
     ready_to_switch_to_user(trap_frame_vaddr.data(), new_pc.data());
 }
 
@@ -174,35 +173,56 @@ impl ProcessManager {
         Self::switch_local_context(&prev, &next);
 
         // 切换地址空间（无锁快速路径）
-        // 必须同时维护 mm-aware shootdown 的前置状态：
-        //   - 被切出的 mm：从 active_cpus 里摘掉当前 CPU；
-        //   - 被切入的 mm：在加载 satp 后写入 active_cpus 并更新 per-CPU TlbState.loaded_mm，
-        //     这样后续 `flush_tlb_mm_range` / `flush_tlb_multi` 才能正确把本 CPU 当成目标。
-        // 顺序：clear(prev) -> make_current(next) -> set(next) -> tlb_state_set_loaded_mm(next)
+        // 必须同时维护 mm-aware shootdown 的前置状态。切入新 mm 前先把
+        // 当前 CPU 加入 next active_cpus，加载 satp 后再清 prev active_cpus。
+        // 临时双 membership 只会多发 IPI；反向窗口会让 remote shootdown 漏掉
+        // 已经加载 next mm 的 CPU。
+        // 顺序：set(next) -> make_current(next) -> clear(prev) -> tlb_state_set_loaded_mm(next)
         // 与 x86_64 switch_process 保持一致 (见 kernel/src/arch/x86_64/process/mod.rs:switch_process)。
-        let next_addr_space = next.basic().user_vm().unwrap();
-        let prev_addr_space = prev.basic().user_vm();
+        // 如果 next 没有 user mm，则保留当前 CPU 已加载的 mm，进入 lazy-TLB 模式。
+        let next_addr_space = next.basic().user_vm();
+        let prev_user_vm = prev.basic().user_vm();
+        let prev_active_mm = prev_user_vm
+            .clone()
+            .or_else(crate::mm::tlb::tlb_state_loaded_mm);
         let cpu = crate::smp::core::smp_get_processor_id();
         compiler_fence(Ordering::SeqCst);
 
-        let same_mm = match prev_addr_space.as_ref() {
-            Some(p) => Arc::ptr_eq(p, &next_addr_space),
-            None => false,
+        let same_mm = match (prev_active_mm.as_ref(), next_addr_space.as_ref()) {
+            (Some(p), Some(n)) => Arc::ptr_eq(p, n),
+            _ => false,
         };
 
-        if !same_mm {
-            if let Some(prev_mm) = prev_addr_space.as_ref() {
-                prev_mm.active_cpus_clear(cpu);
+        let retire_lazy_mm = prev_user_vm.is_none() && next_addr_space.is_some() && !same_mm;
+
+        if let Some(next_mm) = next_addr_space {
+            if !same_mm {
+                next_mm.active_cpus_set(cpu);
             }
-        }
 
-        next_addr_space.make_current();
-        compiler_fence(Ordering::SeqCst);
+            next_mm.make_current();
+            compiler_fence(Ordering::SeqCst);
+            // Pairs with remote-user writers: active membership is published
+            // before this stale check, and no user instruction can execute
+            // until the eventual exception return.
+            next_mm.flush_stale_user_icache_on_switch(cpu);
 
-        if !same_mm {
-            next_addr_space.active_cpus_set(cpu);
+            if !same_mm {
+                if let Some(prev_mm) = prev_active_mm.as_ref() {
+                    prev_mm.active_cpus_clear(cpu);
+                }
+            }
+            unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone()) };
         }
-        unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(next_addr_space.clone()) };
+        // Do not strand temporary owners on a terminal switched-out stack.
+        drop(prev_user_vm);
+        if retire_lazy_mm {
+            if let Some(mm) = prev_active_mm {
+                crate::mm::lazy_mm_drop::enqueue(mm);
+            }
+        } else {
+            drop(prev_active_mm);
+        }
         compiler_fence(Ordering::SeqCst);
 
         // debug!("current sum={}, prev sum={}, next_sum={}", riscv::register::sstatus::read().sum(), prev.arch_info_irqsave().sstatus.sum(), next.arch_info_irqsave().sstatus.sum());
@@ -426,6 +446,36 @@ impl ArchPCBInfo {
         *self = from.clone();
     }
 
+    /// 公共 fork 路径克隆 ArchPCBInfo 前，先将当前硬件浮点状态同步到 PCB。
+    pub fn sync_current_state_before_fork(&mut self) {
+        let current = ProcessManager::current_pcb();
+        let frame = unsafe { ProcessManager::task_trapframe(&current) };
+        self.save_fp_state(frame);
+    }
+
+    /// 保存当前线程的浮点状态；调用者必须持有架构锁并关闭本地中断。
+    pub(super) fn save_fp_state(&mut self, frame: &mut TrapFrame) {
+        self.fp_state.save(frame);
+    }
+
+    /// 恢复当前线程的浮点状态；调用者必须持有架构锁并关闭本地中断。
+    pub(super) fn restore_fp_state(&mut self, frame: &mut TrapFrame) {
+        // 底层 restore 在 FS=Off 时跳过装载，先标记为可恢复，完成后转为 Clean。
+        frame
+            .status
+            .update_fs(riscv::register::sstatus::FS::Initial);
+        self.fp_state.restore(frame);
+    }
+
+    /// 获取 PCB 中的内核浮点格式；用户信号帧格式转换由信号模块负责。
+    pub(super) fn fp_state(&self) -> &FpDExtState {
+        &self.fp_state
+    }
+
+    pub(super) fn fp_state_mut(&mut self) -> &mut FpDExtState {
+        &mut self.fp_state
+    }
+
     pub fn set_stack(&mut self, stack: VirtAddr) {
         self.ksp = stack.data();
     }
@@ -433,9 +483,9 @@ impl ArchPCBInfo {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct FpDExtState {
-    f: [u64; 32],
-    fcsr: u32,
+pub(super) struct FpDExtState {
+    pub(super) f: [u64; 32],
+    pub(super) fcsr: u32,
 }
 
 impl FpDExtState {

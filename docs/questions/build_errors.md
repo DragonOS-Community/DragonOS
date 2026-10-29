@@ -1,44 +1,40 @@
-# 构建错误常见问题解答
+# Common Issues During Build
 
-在构建DragonOS时遇到的常见问题及其解决方法。
+Common issues encountered during the build of DragonOS and their solutions.
 
+## 1. Error Indicates Missing Toolchain
 
-## 1. 报错信息指示工具链缺失
+### Question Detail
 
-### question detail
-
-在构建中，如果出现比如`xxxx not found`这样的报错信息，通常是因为缺少必要的编译工具链。
+During the build, if you encounter an error like `xxxx not found`, it is typically due to the absence of the necessary compiler toolchain.
 
 ### Answer
 
-如果你之前是可以编译的，但是在拉取最新的代码后，出现了这个错误,那么大概率是因为上游代码更新了对工具链的要求。你可以尝试以下步骤来解决这个问题：
+If you were previously able to compile the code, but after pulling the latest code, you encounter this error, it is likely because the upstream code has updated its requirements for the toolchain. You can try the following steps to resolve this issue:
 
 ```shell
 cd tools
 bash bootstrap.sh
 ```
 
-接着，重启终端并重新运行构建命令。
+Then, restart the terminal and re-run the build command.
 
-*Note:* `bootstrap.sh`脚本被设计为：“可重复运行”的。他可以在任何时间点运行，把当前最新需要的工具链，安装到你的系统中。
+*Note:* The `bootstrap.sh` script is designed to be "re-runnable". It can be executed at any time to install the latest required toolchain on your system.
 
-## 2. 磁盘镜像写入失败了
+## 2. Disk Image Write Failure
 
-### question detail
+### Question Detail
 
-- 构建用户程序的时候，磁盘镜像里面的内容跟实际的不一致。
-- 报错符号链接相关的错误信息
-- 某些应用程序没有正确安装到镜像中
+- During the build of user programs, the content inside the disk image is inconsistent with the actual content.
+- Errors related to symbolic links are reported.
+- Some applications are not correctly installed into the image.
 
 ### Answer
 
+If you encounter a disk image write failure during the build process, it could be due to insufficient disk space or permission issues. It could also be due to changes in directory attributes.
 
-在构建过程中，如果遇到磁盘镜像写入失败的问题，可能是由于磁盘空间不足或者权限问题。或者是目录属性有些改变。
+A typical example is when a folder under `bin/sysroot/xxx` is actually a directory, but the new version of the application expects the directory `xxx` to be treated as a symbolic link.
 
-一种典型的例子，`bin/sysroot/xxx`下面的某个文件夹是个实际的目录，但是新版的应用程序期望把目录`xxx`当作一个符号链接来使用。
+In such a case, you can first check whether there is an issue with the script used to compile your application. If you confirm that there is no problem, you can try the following steps:
 
-对于这种情形，你可以先检查自己的应用程序编译的脚本是否有问题。如果确认没有问题，那么可以尝试以下步骤：
-
-- 删掉`bin/`目录，然后重新构建。这能够解决大部分的问题。
-
-
+- Delete the `bin/` directory and rebuild. This can resolve most of the issues.

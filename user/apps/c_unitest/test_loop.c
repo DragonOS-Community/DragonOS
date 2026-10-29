@@ -90,8 +90,9 @@ static void print_test_summary(void) {
 #define LO_FLAGS_READ_ONLY 0x1
 #define TEST_FILE_NAME "test_image.img"
 #define TEST_FILE_NAME_2 "test_image_2.img"
+#define TEST_SYNC_FILE_NAME "test_sync_image.img"
 #define TEST_FILE_SIZE (1024 * 1024)  // 1MB
-#define TEST_FILE_SIZE_2 (512 * 1024) // 512KB
+#define TEST_FILE_SIZE_2 (1024 * 1024) // 1MB
 
 // Loop 状态结构体
 // 必须与 Linux UAPI `include/uapi/linux/loop.h` 的 `struct loop_info64` 一致，
@@ -148,31 +149,18 @@ static int create_test_file(const char *filename, int size) {
   return 0;
 }
 
-// 使用重试机制创建 loop 设备
+// Allocate a new registered loop device atomically. LOOP_CTL_GET_FREE returns
+// an already registered reusable device and must not be followed by ADD of
+// the same minor.
 static int create_loop_device(int control_fd, int *out_minor) {
-  for (int retry = 0; retry < 10; retry++) {
-    // LOOP_CTL_GET_FREE 通过返回值返回 free 的 minor 号
-    int free_minor = ioctl(control_fd, LOOP_CTL_GET_FREE, 0);
-    if (free_minor < 0) {
-      LOG_ERROR("Failed to get free loop device: %s", strerror(errno));
-      return -1;
-    }
-
-    int ret = ioctl(control_fd, LOOP_CTL_ADD, free_minor);
-    if (ret >= 0) {
-      *out_minor = ret;
-      return 0;
-    }
-
-    if (errno != EEXIST) {
-      LOG_ERROR("Failed to add loop device: %s", strerror(errno));
-      return -1;
-    }
-    // 设备已存在，重试
+  int minor = ioctl(control_fd, LOOP_CTL_ADD, UINT32_MAX);
+  if (minor < 0) {
+    LOG_ERROR("Failed to add loop device: %s", strerror(errno));
+    return -1;
   }
 
-  LOG_ERROR("Failed to create loop device after 10 retries");
-  return -1;
+  *out_minor = minor;
+  return 0;
 }
 
 // ===================================================================
@@ -307,101 +295,119 @@ static int test_basic_read_write(int loop_fd, const char *loop_path,
   return TEST_PASS;
 }
 
-// 测试 2: 只读模式测试
-static int test_read_only_mode(int loop_fd, struct loop_status64 *status) {
-  const char *test_name = "Read-Only Mode";
+// 同步写和 fsync 必须使用 LOOP_SET_FD 时保留的 open file description；
+// 关闭用户传入的原始 backing fd 后仍应可用。
+static int test_sync_io_retains_backing_file(void) {
+  const char *test_name = "O_SYNC/O_DSYNC/fsync Retain Backing File";
   TEST_BEGIN(test_name);
 
-  char write_buf[512] = "Test data";
+  int minor = -1;
+  int backing_fd = -1;
+  int sync_fd = -1;
+  int dsync_fd = -1;
+  int verify_fd = -1;
+  char path[64];
+  char sync_data[512] = "loop O_SYNC retained backing";
+  char dsync_data[512] = "loop O_DSYNC retained backing";
+  char observed[1024] = {0};
 
-  // 设置只读标志
-  LOG_STEP("Setting read-only flag...");
+  if (create_test_file(TEST_SYNC_FILE_NAME, TEST_FILE_SIZE) < 0) {
+    goto fail;
+  }
+  backing_fd = open(TEST_SYNC_FILE_NAME, O_RDWR);
+  if (backing_fd < 0 || create_loop_device(g_control_fd, &minor) < 0) {
+    goto fail;
+  }
+  sprintf(path, "/dev/loop%d", minor);
+  sync_fd = open(path, O_RDWR | O_SYNC);
+  if (sync_fd < 0 || ioctl(sync_fd, LOOP_SET_FD, backing_fd) < 0) {
+    goto fail;
+  }
+
+  close(backing_fd);
+  backing_fd = -1;
+
+  dsync_fd = open(path, O_RDWR | O_DSYNC);
+  if (dsync_fd < 0 ||
+      pwrite(sync_fd, sync_data, sizeof(sync_data), 0) != sizeof(sync_data) ||
+      pwrite(dsync_fd, dsync_data, sizeof(dsync_data), 512) !=
+          sizeof(dsync_data) ||
+      fsync(sync_fd) != 0 || fdatasync(dsync_fd) != 0) {
+    goto fail;
+  }
+
+  verify_fd = open(TEST_SYNC_FILE_NAME, O_RDONLY);
+  if (verify_fd < 0 ||
+      pread(verify_fd, observed, sizeof(observed), 0) != sizeof(observed) ||
+      memcmp(observed, sync_data, sizeof(sync_data)) != 0 ||
+      memcmp(observed + 512, dsync_data, sizeof(dsync_data)) != 0) {
+    goto fail;
+  }
+
+  close(verify_fd);
+  close(dsync_fd);
+  ioctl(sync_fd, LOOP_CLR_FD, 0);
+  close(sync_fd);
+  ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+  unlink(TEST_SYNC_FILE_NAME);
+  TEST_END_PASS(test_name);
+  return TEST_PASS;
+
+fail:
+  if (verify_fd >= 0)
+    close(verify_fd);
+  if (dsync_fd >= 0)
+    close(dsync_fd);
+  if (sync_fd >= 0) {
+    ioctl(sync_fd, LOOP_CLR_FD, 0);
+    close(sync_fd);
+  }
+  if (backing_fd >= 0)
+    close(backing_fd);
+  if (minor >= 0)
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+  unlink(TEST_SYNC_FILE_NAME);
+  TEST_END_FAIL(test_name, "retained backing synchronous I/O failed");
+  return TEST_FAIL;
+}
+
+// 测试 2: status ioctl 不得修改绑定时确定的 READ_ONLY
+static int test_status_preserves_read_only(int loop_fd,
+                                           struct loop_status64 *status) {
+  const char *test_name = "Status Preserves Bind-Time Read-Only";
+  TEST_BEGIN(test_name);
+
+  LOG_STEP("Attempting to set READ_ONLY through LOOP_SET_STATUS64...");
   status->lo_flags |= LO_FLAGS_READ_ONLY;
   if (ioctl(loop_fd, LOOP_SET_STATUS64, status) < 0) {
-    TEST_END_FAIL(test_name, "failed to set read-only flag");
+    TEST_END_FAIL(test_name, "LOOP_SET_STATUS64 failed");
     return TEST_FAIL;
   }
 
-  // 尝试写入（应该失败）
-  LOG_STEP("Attempting write in read-only mode (should fail)...");
-  errno = 0;
-  if (lseek(loop_fd, 0, SEEK_SET) < 0) {
-    // lseek 失败不影响测试
-  }
-
-  if (write(loop_fd, write_buf, sizeof(write_buf)) >= 0 || errno != EROFS) {
-    status->lo_flags &= ~LO_FLAGS_READ_ONLY;
-    ioctl(loop_fd, LOOP_SET_STATUS64, status);
-    TEST_END_FAIL(test_name, "write should have failed with EROFS");
+  struct loop_status64 observed = {0};
+  if (ioctl(loop_fd, LOOP_GET_STATUS64, &observed) < 0) {
+    TEST_END_FAIL(test_name, "LOOP_GET_STATUS64 failed");
     return TEST_FAIL;
   }
-  LOG_STEP("Write correctly rejected with EROFS");
-
-  // 恢复可写模式
-  LOG_STEP("Restoring writable mode...");
+  if (observed.lo_flags & LO_FLAGS_READ_ONLY) {
+    TEST_END_FAIL(test_name, "status ioctl changed bind-time READ_ONLY");
+    return TEST_FAIL;
+  }
   status->lo_flags &= ~LO_FLAGS_READ_ONLY;
-  if (ioctl(loop_fd, LOOP_SET_STATUS64, status) < 0) {
-    TEST_END_FAIL(test_name, "failed to restore writable mode");
-    return TEST_FAIL;
-  }
 
   TEST_END_PASS(test_name);
   return TEST_PASS;
 }
 
-// 测试 3: LOOP_CHANGE_FD
-static int test_change_fd(int loop_fd, struct loop_status64 *status) {
-  const char *test_name = "LOOP_CHANGE_FD";
+// 测试 3: writable loop 必须拒绝 LOOP_CHANGE_FD
+static int test_writable_change_fd_rejected(int loop_fd) {
+  const char *test_name = "Writable LOOP_CHANGE_FD Rejected";
   TEST_BEGIN(test_name);
 
-  char write_buf[512] = "New Backing File Data!";
-  char verify_buf[512] = {0};
-
-  // 切换后端文件
-  LOG_STEP("Changing backing file to %s...", TEST_FILE_NAME_2);
-  if (ioctl(loop_fd, LOOP_CHANGE_FD, g_backing_fd_2) < 0) {
-    TEST_END_FAIL(test_name, "LOOP_CHANGE_FD failed");
-    return TEST_FAIL;
-  }
-  LOG_STEP("Backing file changed successfully");
-
-  // 获取新状态
-  struct loop_status64 new_status = {0};
-  if (ioctl(loop_fd, LOOP_GET_STATUS64, &new_status) < 0) {
-    TEST_END_FAIL(test_name, "failed to get status after change");
-    return TEST_FAIL;
-  }
-  LOG_STEP("New status - offset: %llu, sizelimit: %llu, flags: 0x%x",
-           (unsigned long long)new_status.lo_offset,
-           (unsigned long long)new_status.lo_sizelimit, new_status.lo_flags);
-
-  // 写入新后端文件
-  LOG_STEP("Writing to new backing file...");
-  if (lseek(loop_fd, 0, SEEK_SET) < 0 ||
-      write(loop_fd, write_buf, sizeof(write_buf)) != sizeof(write_buf)) {
-    TEST_END_FAIL(test_name, "write to new backing file failed");
-    return TEST_FAIL;
-  }
-  LOG_STEP("Write successful: '%s'", write_buf);
-
-  // 验证新后端文件内容
-  LOG_STEP("Verifying new backing file content...");
-  int verify_fd = open(TEST_FILE_NAME_2, O_RDONLY);
-  if (verify_fd < 0) {
-    TEST_END_FAIL(test_name, "cannot open new backing file");
-    return TEST_FAIL;
-  }
-
-  if (lseek(verify_fd, (off_t)status->lo_offset, SEEK_SET) < 0 ||
-      read(verify_fd, verify_buf, sizeof(write_buf)) != sizeof(write_buf)) {
-    close(verify_fd);
-    TEST_END_FAIL(test_name, "cannot read new backing file");
-    return TEST_FAIL;
-  }
-  close(verify_fd);
-
-  if (memcmp(write_buf, verify_buf, sizeof(write_buf)) != 0) {
-    TEST_END_FAIL(test_name, "new backing file content mismatch");
+  errno = 0;
+  if (ioctl(loop_fd, LOOP_CHANGE_FD, g_backing_fd_2) >= 0 ||
+      errno != EINVAL) {
+    TEST_END_FAIL(test_name, "writable change did not fail with EINVAL");
     return TEST_FAIL;
   }
 
@@ -409,20 +415,93 @@ static int test_change_fd(int loop_fd, struct loop_status64 *status) {
   return TEST_PASS;
 }
 
-// 测试 4: LOOP_SET_CAPACITY
+// 测试 4: read-only、同容量 backing 可以 CHANGE_FD
+static int test_read_only_equal_size_change_fd(void) {
+  const char *test_name = "Read-Only Equal-Size LOOP_CHANGE_FD";
+  TEST_BEGIN(test_name);
+
+  int minor = -1;
+  int loop_fd = -1;
+  int rw_loop_fd = -1;
+  char path[64];
+  char expected[512] = "second backing generation";
+  char observed[512] = {0};
+
+  if (pwrite(g_backing_fd_2, expected, sizeof(expected), 0) !=
+      sizeof(expected)) {
+    TEST_END_FAIL(test_name, "cannot initialize second backing");
+    return TEST_FAIL;
+  }
+  if (create_loop_device(g_control_fd, &minor) < 0) {
+    TEST_END_FAIL(test_name, "cannot create loop device");
+    return TEST_FAIL;
+  }
+  sprintf(path, "/dev/loop%d", minor);
+  loop_fd = open(path, O_RDONLY);
+  if (loop_fd < 0 || ioctl(loop_fd, LOOP_SET_FD, g_backing_fd_1) < 0) {
+    goto fail;
+  }
+  if (ioctl(loop_fd, LOOP_CHANGE_FD, g_backing_fd_2) < 0) {
+    goto fail;
+  }
+  if (pread(loop_fd, observed, sizeof(observed), 0) != sizeof(observed) ||
+      memcmp(expected, observed, sizeof(expected)) != 0) {
+    goto fail;
+  }
+
+  struct loop_status64 status = {0};
+  if (ioctl(loop_fd, LOOP_GET_STATUS64, &status) < 0 ||
+      !(status.lo_flags & LO_FLAGS_READ_ONLY)) {
+    goto fail;
+  }
+  status.lo_flags = 0;
+  if (ioctl(loop_fd, LOOP_SET_STATUS64, &status) < 0 ||
+      ioctl(loop_fd, LOOP_GET_STATUS64, &status) < 0 ||
+      !(status.lo_flags & LO_FLAGS_READ_ONLY)) {
+    goto fail;
+  }
+
+  rw_loop_fd = open(path, O_RDWR);
+  errno = 0;
+  if (rw_loop_fd < 0 ||
+      write(rw_loop_fd, expected, sizeof(expected)) >= 0 || errno != EROFS) {
+    goto fail;
+  }
+
+  close(rw_loop_fd);
+  ioctl(loop_fd, LOOP_CLR_FD, 0);
+  close(loop_fd);
+  ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+  TEST_END_PASS(test_name);
+  return TEST_PASS;
+
+fail:
+  if (rw_loop_fd >= 0)
+    close(rw_loop_fd);
+  if (loop_fd >= 0) {
+    ioctl(loop_fd, LOOP_CLR_FD, 0);
+    close(loop_fd);
+  }
+  if (minor >= 0)
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+  TEST_END_FAIL(test_name, "read-only equal-size change semantics failed");
+  return TEST_FAIL;
+}
+
+// 测试 5: LOOP_SET_CAPACITY
 static int test_set_capacity(int loop_fd, struct loop_status64 *status) {
   const char *test_name = "LOOP_SET_CAPACITY";
   TEST_BEGIN(test_name);
 
   // 扩大后端文件
-  LOG_STEP("Resizing backing file to %d bytes...", TEST_FILE_SIZE_2 * 2);
-  int resize_fd = open(TEST_FILE_NAME_2, O_RDWR);
+  LOG_STEP("Resizing backing file to %d bytes...", TEST_FILE_SIZE * 2);
+  int resize_fd = open(TEST_FILE_NAME, O_RDWR);
   if (resize_fd < 0) {
     TEST_END_FAIL(test_name, "cannot open backing file for resize");
     return TEST_FAIL;
   }
 
-  int new_size = TEST_FILE_SIZE_2 * 2;
+  int new_size = TEST_FILE_SIZE * 2;
   if (ftruncate(resize_fd, new_size) < 0) {
     close(resize_fd);
     TEST_END_FAIL(test_name, "ftruncate failed");
@@ -460,7 +539,7 @@ static int test_set_capacity(int loop_fd, struct loop_status64 *status) {
   // 尝试写入扩展区域
   LOG_STEP("Writing to extended region...");
   char extended_buf[512] = "Extended Data!";
-  if (lseek(loop_fd, TEST_FILE_SIZE_2, SEEK_SET) < 0 ||
+  if (lseek(loop_fd, TEST_FILE_SIZE, SEEK_SET) < 0 ||
       write(loop_fd, extended_buf, sizeof(extended_buf)) !=
           sizeof(extended_buf)) {
     TEST_END_FAIL(test_name, "write to extended region failed");
@@ -471,13 +550,13 @@ static int test_set_capacity(int loop_fd, struct loop_status64 *status) {
   // 验证扩展区域内容
   LOG_STEP("Verifying extended region content...");
   char verify_buf[512] = {0};
-  int verify_fd = open(TEST_FILE_NAME_2, O_RDONLY);
+  int verify_fd = open(TEST_FILE_NAME, O_RDONLY);
   if (verify_fd < 0) {
     TEST_END_FAIL(test_name, "cannot open backing file for verification");
     return TEST_FAIL;
   }
 
-  off_t verify_offset = (off_t)status->lo_offset + TEST_FILE_SIZE_2;
+  off_t verify_offset = (off_t)status->lo_offset + TEST_FILE_SIZE;
   if (lseek(verify_fd, verify_offset, SEEK_SET) < 0 ||
       read(verify_fd, verify_buf, sizeof(extended_buf)) !=
           sizeof(extended_buf)) {
@@ -496,9 +575,9 @@ static int test_set_capacity(int loop_fd, struct loop_status64 *status) {
   return TEST_PASS;
 }
 
-// 测试 5: 并发 I/O 期间删除设备
+// 已绑定且仍有 opener 的 loop 设备必须拒绝 LOOP_CTL_REMOVE。
 static int test_concurrent_io_deletion(void) {
-  const char *test_name = "Concurrent I/O During Deletion";
+  const char *test_name = "Bound Loop Removal During Concurrent I/O";
   TEST_BEGIN(test_name);
 
 #define NUM_IO_THREADS 4
@@ -547,6 +626,7 @@ static int test_concurrent_io_deletion(void) {
         io_args[j].should_stop = 1;
         pthread_join(io_threads[j], NULL);
       }
+      ioctl(test_fd, LOOP_CLR_FD, 0);
       close(test_fd);
       ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
       TEST_END_FAIL(test_name, "failed to create I/O thread");
@@ -554,10 +634,8 @@ static int test_concurrent_io_deletion(void) {
     }
   }
 
-  close(test_fd); // 关闭主 fd
-
-  // 启动删除线程
-  LOG_STEP("Starting deletion thread...");
+  // 保持主 fd 打开，并在其他 opener 正在执行 I/O 时尝试删除。
+  LOG_STEP("Starting removal attempt...");
   pthread_t delete_thread;
   struct delete_thread_args delete_args = {.control_fd = g_control_fd,
                                            .loop_minor = test_minor,
@@ -570,6 +648,8 @@ static int test_concurrent_io_deletion(void) {
       io_args[i].should_stop = 1;
       pthread_join(io_threads[i], NULL);
     }
+    ioctl(test_fd, LOOP_CLR_FD, 0);
+    close(test_fd);
     ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
     TEST_END_FAIL(test_name, "failed to create delete thread");
     return TEST_FAIL;
@@ -593,16 +673,40 @@ static int test_concurrent_io_deletion(void) {
   }
   LOG_STEP("I/O statistics: %d successful, %d errors", total_io, total_errors);
 
-  // 验证设备已删除
-  int verify_fd = open(test_path, O_RDWR);
-  if (verify_fd >= 0) {
-    close(verify_fd);
-    TEST_END_FAIL(test_name, "device still accessible after deletion");
+  if (delete_args.result >= 0 || delete_args.error_code != EBUSY) {
+    ioctl(test_fd, LOOP_CLR_FD, 0);
+    close(test_fd);
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
+    TEST_END_FAIL(test_name, "bound device removal did not fail with EBUSY");
     return TEST_FAIL;
   }
 
-  if (delete_args.result != 0) {
-    TEST_END_FAIL(test_name, "deletion failed");
+  // 失败的删除不得影响已绑定设备；清除绑定后才能真正删除。
+  char verify_buf[512];
+  if (pread(test_fd, verify_buf, sizeof(verify_buf), 0) != sizeof(verify_buf) ||
+      ioctl(test_fd, LOOP_CLR_FD, 0) < 0) {
+    close(test_fd);
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor);
+    TEST_END_FAIL(test_name, "failed removal damaged bound device");
+    return TEST_FAIL;
+  }
+  errno = 0;
+  if (ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor) >= 0 || errno != EBUSY) {
+    close(test_fd);
+    TEST_END_FAIL(test_name,
+                  "unbound device removal ignored the remaining opener");
+    return TEST_FAIL;
+  }
+  close(test_fd);
+  if (ioctl(g_control_fd, LOOP_CTL_REMOVE, test_minor) < 0) {
+    TEST_END_FAIL(test_name, "unbound device removal failed");
+    return TEST_FAIL;
+  }
+
+  int verify_fd = open(test_path, O_RDWR);
+  if (verify_fd >= 0) {
+    close(verify_fd);
+    TEST_END_FAIL(test_name, "device still accessible after successful removal");
     return TEST_FAIL;
   }
 
@@ -799,6 +903,7 @@ static int test_device_inaccessible_after_deletion(void) {
   // 执行一次成功的 I/O
   char buf[512] = "Test data";
   if (write(fd, buf, sizeof(buf)) != sizeof(buf)) {
+    ioctl(fd, LOOP_CLR_FD, 0);
     close(fd);
     ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
     TEST_END_FAIL(test_name, "initial write failed");
@@ -806,6 +911,14 @@ static int test_device_inaccessible_after_deletion(void) {
   }
   LOG_STEP("Initial I/O successful");
 
+  // Linux rejects LOOP_CTL_REMOVE while the device is still bound. Detach the
+  // backing file first, then close the final opener before removing the node.
+  if (ioctl(fd, LOOP_CLR_FD, 0) < 0) {
+    close(fd);
+    ioctl(g_control_fd, LOOP_CTL_REMOVE, minor);
+    TEST_END_FAIL(test_name, "failed to clear loop backing");
+    return TEST_FAIL;
+  }
   close(fd);
 
   // 删除设备
@@ -917,8 +1030,10 @@ int main(void) {
 
   // 基本功能测试
   test_basic_read_write(main_loop_fd, main_loop_path, &status);
-  test_read_only_mode(main_loop_fd, &status);
-  test_change_fd(main_loop_fd, &status);
+  test_status_preserves_read_only(main_loop_fd, &status);
+  test_writable_change_fd_rejected(main_loop_fd);
+  test_read_only_equal_size_change_fd();
+  test_sync_io_retains_backing_file();
   test_set_capacity(main_loop_fd, &status);
 
   // 资源回收测试

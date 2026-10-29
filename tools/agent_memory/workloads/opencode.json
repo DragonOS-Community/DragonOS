@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "share": "disabled",
+  "enabled_providers": ["deepseek"],
+  "model": "deepseek/deepseek-flash",
+  "small_model": "deepseek/deepseek-flash",
+  "provider": {
+    "deepseek": {
+      "npm": "@ai-sdk/deepseek",
+      "options": { "baseURL": "https://api.deepseek.com/v1" },
+      "models": {
+        "deepseek-flash": { "name": "DeepSeek Flash" }
+      }
+    }
+  },
+  "permission": {
+    "external_directory": "deny"
+  }
+}

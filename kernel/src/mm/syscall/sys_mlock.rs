@@ -7,7 +7,8 @@ use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MLOCK, MMArch},
     libs::align::page_align_down,
     mm::{
-        access_ok, can_do_mlock, ucontext::AddressSpace, MemoryManagementArch, VirtAddr, VmFlags,
+        access_ok, can_do_mlock, ucontext::AddressSpace, MemoryManagementArch, VirtAddr,
+        VirtRegion, VmFlags,
     },
     process::{cred::CAPFlags, resource::RLimitID, ProcessManager},
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -49,6 +50,10 @@ pub(super) fn do_mlock(
     len: usize,
     new_flags: VmFlags,
 ) -> Result<usize, SystemError> {
+    if !can_do_mlock() {
+        return Err(SystemError::EPERM);
+    }
+
     let (start, len) = normalize_mlock_range(start, len)?;
     if len == 0 {
         return Ok(0);
@@ -57,18 +62,38 @@ pub(super) fn do_mlock(
         return Err(SystemError::EINVAL);
     }
 
-    if !can_do_mlock() {
-        return Err(SystemError::EPERM);
-    }
-
     let vm = AddressSpace::current()?;
-    let mut guard = vm.write_interruptible()?;
+    let region = VirtRegion::new(start, len);
+    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    loop {
+        let creator =
+            crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
+        let mut guard = vm.write_interruptible()?;
+        if guard.mappings.first_reservation_conflict(region).is_some() {
+            drop(guard);
+            vm.wait_for_no_reservation_conflict_interruptible(region)?;
+            continue;
+        }
 
-    let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
-    check_mlock_rlimit(guard.locked_vm, new_pages)?;
+        let new_pages = guard.count_unlocked_pages_for_mlock(start, len)?;
+        check_mlock_rlimit(guard.locked_vm, new_pages)?;
 
-    guard.apply_vma_lock_flags(start, len, new_flags, false)?;
-    Ok(0)
+        match guard.apply_vma_lock_flags_collect(start, len, new_flags, &creator) {
+            Ok(()) => {
+                drop(guard);
+                vm.populate_mlock_range_post_commit(start, len)?;
+                return Ok(0);
+            }
+            Err(failure) => {
+                drop(guard);
+                crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                    failure.notifications,
+                );
+                failure.err.recover(&mut charge_recovery)?;
+                continue;
+            }
+        }
+    }
 }
 
 pub(super) fn check_mlock_rlimit(locked_vm: usize, new_pages: usize) -> Result<(), SystemError> {

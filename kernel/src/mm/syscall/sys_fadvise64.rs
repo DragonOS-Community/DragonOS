@@ -1,12 +1,14 @@
 use crate::arch::MMArch;
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_FADVISE64};
-use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::page_cache::PageCache;
+use crate::filesystem::vfs::file::{File, FileMode};
 use crate::filesystem::vfs::FileType;
 use crate::libs::align::page_align_up;
 use crate::mm::readahead::{force_page_cache_readahead, MAX_READAHEAD};
 use crate::mm::MemoryManagementArch;
 use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 use alloc::vec::Vec;
@@ -102,8 +104,10 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
         return Err(SystemError::ESPIPE);
     }
 
+    PosixFadviseFlag::from_i32(advise)?;
+
     // 根据POSIX规范，len == 0 表示从offset到文件结尾
-    if len < 0 || inode.page_cache().is_none() {
+    if offset < 0 || len < 0 {
         return Err(SystemError::EINVAL);
     }
 
@@ -112,14 +116,35 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
         return res;
     };
 
+    generic_fadvise(&file, offset, len, advise, |cache, first, last| {
+        cache.manager().writeback_range(first, last)
+    })
+}
+
+/// Shared advice semantics for mappings whose owner supplies a stronger I/O
+/// admission or stable-size writeback protocol than the generic inode path.
+pub(crate) fn generic_fadvise(
+    file: &Arc<File>,
+    offset: i64,
+    len: i64,
+    advise: i32,
+    sync_range: impl Fn(&PageCache, usize, usize) -> Result<(), SystemError>,
+) -> Result<usize, SystemError> {
+    let advice = PosixFadviseFlag::from_i32(advise)?;
+    if offset < 0 || len < 0 {
+        return Err(SystemError::EINVAL);
+    }
+    let inode = file.inode();
+
     // 后续需要考虑DAX和noop_backing_dev_info
 
-    let mut endbyte = offset.saturating_add(len) as usize;
-    if len == 0 {
-        endbyte = usize::MAX;
-    }
+    let endbyte = if len == 0 {
+        usize::MAX
+    } else {
+        offset.checked_add(len - 1).ok_or(SystemError::EINVAL)? as usize
+    };
 
-    match PosixFadviseFlag::from_i32(advise)? {
+    match advice {
         PosixFadviseFlag::Normal => {
             file.set_ra_pages(MAX_READAHEAD);
             file.remove_mode_flags(FileMode::FMODE_RANDOM | FileMode::FMODE_NOREUSE);
@@ -132,29 +157,55 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             file.remove_mode_flags(FileMode::FMODE_RANDOM);
         }
         PosixFadviseFlag::WillNeed => {
-            let start_page = (offset >> MMArch::PAGE_SHIFT) as usize;
-            let end_page = (endbyte - 1) >> MMArch::PAGE_SHIFT;
-            let mut page_num = end_page - start_page + 1;
-            if page_num == 0 {
-                page_num = usize::MAX;
-            }
+            let Some(page_cache) = inode.page_cache() else {
+                return Ok(0);
+            };
+            let start_page = (offset as usize) >> MMArch::PAGE_SHIFT;
+            let end_page = endbyte >> MMArch::PAGE_SHIFT;
+            let page_num = end_page.saturating_sub(start_page).saturating_add(1);
 
-            let inode = file.inode();
-            let page_cache = inode.page_cache().unwrap();
+            let task = crate::process::ProcessManager::current_pcb();
+            let owner = crate::cgroup::memory::account_for_task(&task);
+            let creator = crate::cgroup::memory::object_for_task(&task);
+            drop(task);
             let mut ra_state = file.get_ra_state();
-            force_page_cache_readahead(&page_cache, &inode, &mut ra_state, start_page, page_num)?;
-            file.set_ra_state(ra_state)?;
+            match force_page_cache_readahead(
+                &page_cache,
+                &inode,
+                &mut ra_state,
+                start_page,
+                page_num,
+                &owner,
+                &creator,
+            ) {
+                Ok(_) => file.set_ra_state(ra_state)?,
+                // Linux WILLNEED is advisory: failure to prefetch does not
+                // force OOM or make the subsequent required read succeed.
+                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => {}
+                Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                    return Err(error)
+                }
+            }
         }
         PosixFadviseFlag::NoReuse => {
-            file.remove_mode_flags(FileMode::FMODE_NOREUSE);
+            file.set_mode_flags(FileMode::FMODE_NOREUSE);
         }
         PosixFadviseFlag::DontNeed => {
+            let Some(page_cache) = inode.page_cache() else {
+                return Ok(0);
+            };
             let start_index = page_align_up(offset as usize) >> MMArch::PAGE_SHIFT;
             let mut end_index = endbyte >> MMArch::PAGE_SHIFT;
+            let metadata = inode.metadata()?;
+            let last_file_byte = if metadata.size > 0 {
+                Some(metadata.size as usize - 1)
+            } else {
+                None
+            };
 
             // 如果要驱逐的最后一页不是整页，则需要保留
             if (endbyte & MMArch::PAGE_OFFSET_MASK) != MMArch::PAGE_OFFSET_MASK
-                && endbyte != inode.metadata()?.size as usize - 1
+                && Some(endbyte) != last_file_byte
             {
                 if end_index == 0 {
                     return Ok(0);
@@ -165,11 +216,8 @@ pub fn do_fadvise(fd: i32, offset: i64, len: i64, advise: i32) -> Result<usize, 
             // 若以后实现了per-CPU LRU批处理，需要额外处理（lru_add_drain）
 
             if end_index >= start_index {
-                let page_cache = inode.page_cache().unwrap();
                 // 先写回脏页
-                page_cache
-                    .manager()
-                    .writeback_range(start_index, end_index)?;
+                sync_range(&page_cache, start_index, end_index)?;
                 // 再驱逐干净页
                 page_cache
                     .manager()

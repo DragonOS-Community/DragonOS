@@ -1,36 +1,37 @@
-# Rust应用开发快速入门
+# Quick Start Guide for Rust Application Development
 
-## 编译环境
+## Compilation Environment
 
-&emsp;&emsp;DragonOS与Linux具有部分二进制兼容性，因此可以使用Linux的Rust编译器进行编译。
+DragonOS has partial binary compatibility with Linux, so you can use the Rust compiler for Linux to compile.
 
-## 配置项目
+## Project Configuration
 
-### 从模板创建
+### Creating from a Template
 
-:::{note}
-该功能需要dadk 0.2.0及以上版本方能支持。旧版的请参考历史版本的DragonOS文档。
+::: info
+This feature requires dadk version 0.2.0 or higher. For older versions, please refer to the historical DragonOS documentation.
 :::
 
-1. 使用DragonOS的tools目录下的`bootstrap.sh`脚本初始化环境
-2. 在终端输入`cargo install cargo-generate`
-3. 在终端输入
+
+1. Use the `bootstrap.sh` script in the tools directory of DragonOS to initialize the environment.
+2. Enter `cargo install cargo-generate` in the terminal.
+3. Enter the following command in the terminal:
 
 ```shell
 cargo generate --git https://github.com/DragonOS-Community/Rust-App-Template
 ```
-即可创建项目。如果您的网络较慢，请使用镜像站
+To create the project. If your network is slow, please use a mirror site.
 ```shell
 cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-App-Template
 ```
 
-4. 使用`cargo run`来运行项目
-5. 在DragonOS的`user/dadk/config`目录下，参考模版[userapp_config.toml](https://github.com/DragonOS-Community/DADK/blob/main/dadk-config/templates/config/userapp_config.toml)，创建编译配置,安装到DragonOS的`/`目录下。 
-(在dadk的编译命令选项处，请使用Makefile里面的`make install`配置进行编译、安装)
-6. 编译DragonOS即可安装
+4. Use `cargo run` to run the project.
+5. In the `user/dadk/config` directory of DragonOS, refer to the template [userapp_config.toml](https://github.com/DragonOS-Community/DADK/blob/main/dadk-config/templates/config/userapp_config.toml) to create a compilation configuration, and install it to the `/` directory of DragonOS.
+(When using the compilation command options of dadk, please use the `make install` configuration in the Makefile for compilation and installation)
+6. Compile DragonOS to install.
 
-### 手动配置
+### Manual Configuration
 
-如果您需要移植别的库/程序到DragonOS，请参考模板内的配置。
+If you need to port other libraries or programs to DragonOS, please refer to the configuration in the template.
 
-由于DragonOS目前不支持动态链接，因此目前需要在RUSTFLAGS里面指定`-C target-feature=+crt-static -C link-arg=-no-pie`
+Since DragonOS currently does not support dynamic linking, you need to specify `-C target-feature=+crt-static -C link-arg=-no-pie` in RUSTFLAGS.

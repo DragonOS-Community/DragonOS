@@ -18,7 +18,10 @@ use crate::{
     },
     libs::spinlock::SpinLock,
     misc::reboot::{register_power_off_handler, PowerOffHandler},
-    time::{sleep::nanosleep, PosixTimeSpec},
+    time::{
+        sleep::{busy_wait_us, nanosleep},
+        PosixTimeSpec,
+    },
 };
 
 use super::{acpi_manager, AcpiHandlerImpl};
@@ -162,11 +165,7 @@ pub fn acpi_reboot() {
     }
 
     // 重启命令下达后，并非所有平台都会立即响应，为了防止与后续的重启机制发生竞争，代码在写入重置寄存器后延时15ms，确保系统有足够的时间执行重启操作
-    let sleep_time = PosixTimeSpec {
-        tv_sec: 0,
-        tv_nsec: 15_000_000, // 15ms
-    };
-    let _ = nanosleep(sleep_time);
+    busy_wait_us(15_000);
 }
 
 pub fn acpi_power_off() -> Result<(), SystemError> {
@@ -805,11 +804,7 @@ impl Handler for AcpiAmlHandler {
     }
 
     fn stall(&self, microseconds: u64) {
-        let time = PosixTimeSpec {
-            tv_sec: (microseconds / 1_000_000) as i64,
-            tv_nsec: ((microseconds % 1_000_000) * 1_000) as i64,
-        };
-        let _ = nanosleep(time);
+        busy_wait_us(microseconds);
     }
 
     fn sleep(&self, milliseconds: u64) {

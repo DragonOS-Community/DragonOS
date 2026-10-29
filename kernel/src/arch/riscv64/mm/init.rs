@@ -180,7 +180,11 @@ impl LowAddressRemapping {
     pub unsafe fn remap_at_low_address(
         mapper: &mut crate::mm::page::PageMapper<MMArch, &mut BumpAllocator<MMArch>>,
     ) {
-        let info = efi_manager().kernel_load_info().unwrap();
+        // Direct SBI boot has no DragonStub load info. Skip the low mapping
+        // used for SMP startup, which is not yet supported on riscv64.
+        let Some(info) = efi_manager().kernel_load_info() else {
+            return;
+        };
         let base = PhysAddr::new(info.paddr as usize);
         let size = info.size as usize;
 
@@ -202,7 +206,10 @@ impl LowAddressRemapping {
         let mut mapper = KernelMapper::lock();
         assert!(mapper.as_mut().is_some());
 
-        let info = efi_manager().kernel_load_info().unwrap();
+        // No low mapping was created without load info.
+        let Some(info) = efi_manager().kernel_load_info() else {
+            return;
+        };
         let base = PhysAddr::new(info.paddr as usize);
         let size = info.size as usize;
 

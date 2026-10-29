@@ -1,0 +1,1084 @@
+#include <gtest/gtest.h>
+
+#ifdef _WIN32
+
+TEST(ProcessSignalFork, PosixForkAndJobControlUnavailableOnWindows) {
+    GTEST_SKIP() << "Windows does not provide POSIX fork/SIGSTOP/SIGCONT semantics";
+}
+
+#else
+
+#include <errno.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+
+namespace {
+
+void SleepForMillis(long millis) {
+    timespec ts {};
+    ts.tv_sec = millis / 1000;
+    ts.tv_nsec = (millis % 1000) * 1000 * 1000;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+bool WaitForExit(pid_t child, int* status, int rounds) {
+    for (int i = 0; i < rounds; ++i) {
+        pid_t ret = waitpid(child, status, WNOHANG);
+        if (ret == child) {
+            return true;
+        }
+        if (ret < 0 && errno != EINTR) {
+            return false;
+        }
+        SleepForMillis(10);
+    }
+    return false;
+}
+
+void WriteByteOrExit(int fd, char value) {
+    ssize_t n = write(fd, &value, sizeof(value));
+    if (n != static_cast<ssize_t>(sizeof(value))) {
+        _exit(120);
+    }
+}
+
+bool ReadByte(int fd) {
+    char value = 0;
+    ssize_t n = read(fd, &value, sizeof(value));
+    return n == static_cast<ssize_t>(sizeof(value));
+}
+
+void WriteIntOrExit(int fd, int value) {
+    ssize_t n = write(fd, &value, sizeof(value));
+    if (n != static_cast<ssize_t>(sizeof(value))) {
+        _exit(120);
+    }
+}
+
+bool ReadInt(int fd, int* value) {
+    ssize_t n = read(fd, value, sizeof(*value));
+    return n == static_cast<ssize_t>(sizeof(*value));
+}
+
+void KillAndReap(pid_t child) {
+    if (child <= 0) {
+        return;
+    }
+    kill(child, SIGKILL);
+    while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+    }
+}
+
+class ChildProcessGuard {
+public:
+    explicit ChildProcessGuard(pid_t child) : child_(child) {}
+    ChildProcessGuard(const ChildProcessGuard&) = delete;
+    ChildProcessGuard& operator=(const ChildProcessGuard&) = delete;
+
+    ~ChildProcessGuard() { KillAndReap(child_); }
+
+    void Release() { child_ = -1; }
+
+private:
+    pid_t child_;
+};
+
+class SignalMaskGuard {
+public:
+    explicit SignalMaskGuard(const sigset_t& blocked) : valid_(false) {
+        valid_ = sigprocmask(SIG_BLOCK, &blocked, &old_mask_) == 0;
+    }
+    SignalMaskGuard(const SignalMaskGuard&) = delete;
+    SignalMaskGuard& operator=(const SignalMaskGuard&) = delete;
+
+    ~SignalMaskGuard() {
+        if (valid_) {
+            sigprocmask(SIG_SETMASK, &old_mask_, nullptr);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    sigset_t old_mask_ {};
+    bool valid_;
+};
+
+class SignalActionGuard {
+public:
+    SignalActionGuard(int signal, const struct sigaction& action) : signal_(signal), valid_(false) {
+        valid_ = sigaction(signal_, &action, &old_action_) == 0;
+    }
+    SignalActionGuard(const SignalActionGuard&) = delete;
+    SignalActionGuard& operator=(const SignalActionGuard&) = delete;
+
+    ~SignalActionGuard() {
+        if (valid_) {
+            sigaction(signal_, &old_action_, nullptr);
+        }
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    struct sigaction old_action_ {};
+    int signal_;
+    bool valid_;
+};
+
+volatile sig_atomic_t sigchld_expected_pid = -1;
+volatile sig_atomic_t sigchld_wait_result = -2;
+volatile sig_atomic_t sigchld_wait_errno = 0;
+volatile sig_atomic_t sigchld_wait_status = 0;
+volatile sig_atomic_t sigchld_handler_calls = 0;
+
+void ReapExpectedChildFromSigchld(int) {
+    const int saved_errno = errno;
+    int status = 0;
+    const pid_t result = waitpid(static_cast<pid_t>(sigchld_expected_pid), &status, WNOHANG);
+    sigchld_wait_result = static_cast<sig_atomic_t>(result);
+    sigchld_wait_errno = result < 0 ? errno : 0;
+    sigchld_wait_status = status;
+    ++sigchld_handler_calls;
+    errno = saved_errno;
+}
+
+struct LastThreadExitArgs {
+    int ready_fd;
+    pid_t leader_tid;
+};
+
+bool PinCurrentTaskToOneAllowedCpu() {
+    cpu_set_t available;
+    CPU_ZERO(&available);
+    if (sched_getaffinity(0, sizeof(available), &available) != 0) {
+        return false;
+    }
+
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &available)) {
+            continue;
+        }
+        cpu_set_t target;
+        CPU_ZERO(&target);
+        CPU_SET(cpu, &target);
+        return sched_setaffinity(0, sizeof(target), &target) == 0;
+    }
+    errno = EINVAL;
+    return false;
+}
+
+char ReadProcTaskState(pid_t tgid, pid_t tid) {
+    char path[128] {};
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", tgid, tid);
+    FILE* stat_file = fopen(path, "r");
+    if (stat_file == nullptr) {
+        return '\0';
+    }
+
+    char line[1024] {};
+    char state = '\0';
+    if (fgets(line, sizeof(line), stat_file) != nullptr) {
+        char* comm_end = strrchr(line, ')');
+        if (comm_end != nullptr && comm_end[1] == ' ') {
+            state = comm_end[2];
+        }
+    }
+    fclose(stat_file);
+    return state;
+}
+
+void* ExitAfterLeaderThread(void* raw_args) {
+    auto* args = static_cast<LastThreadExitArgs*>(raw_args);
+    const int ready_fd = args->ready_fd;
+    const pid_t leader_tid = args->leader_tid;
+    WriteIntOrExit(ready_fd, static_cast<int>(syscall(SYS_gettid)));
+
+    for (int i = 0; i < 5000; ++i) {
+        if (ReadProcTaskState(leader_tid, leader_tid) == 'Z') {
+            if (getuid() == 0 && syscall(SYS_setuid, 1234) != 0) {
+                _exit(124);
+            }
+            return nullptr;
+        }
+        SleepForMillis(1);
+    }
+    _exit(123);
+}
+
+void* PauseForeverThread(void*) {
+    for (;;) {
+        pause();
+    }
+    return nullptr;
+}
+
+void* ReadyPauseThread(void* arg) {
+    int ready_fd = *static_cast<int*>(arg);
+    WriteByteOrExit(ready_fd, 'R');
+    for (;;) {
+        pause();
+    }
+    return nullptr;
+}
+
+void RunMultithreadedSignalChild(int ready_fd) {
+    pthread_t threads[3] {};
+    for (pthread_t& thread : threads) {
+        if (pthread_create(&thread, nullptr, PauseForeverThread, nullptr) != 0) {
+            _exit(122);
+        }
+    }
+
+    WriteByteOrExit(ready_fd, 'R');
+    for (;;) {
+        pause();
+    }
+}
+
+volatile sig_atomic_t async_signal_seen = 0;
+volatile sig_atomic_t async_signal_stop = 0;
+
+void RecordAsyncSignal(int signal) {
+    if (signal == SIGUSR1) {
+        async_signal_seen = 1;
+    } else if (signal == SIGUSR2) {
+        async_signal_stop = 1;
+    }
+}
+
+void RunAsyncSignalReturnStress(bool syscall_heavy) {
+    int ready_pipe[2];
+    ASSERT_EQ(0, pipe(ready_pipe));
+    const pid_t child = fork();
+    if (child < 0) {
+        const int error = errno;
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        FAIL() << "fork failed: " << strerror(error);
+    }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        async_signal_seen = 0;
+        async_signal_stop = 0;
+        struct sigaction action {};
+        action.sa_handler = RecordAsyncSignal;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, nullptr) != 0 ||
+            sigaction(SIGUSR2, &action, nullptr) != 0) {
+            _exit(121);
+        }
+        action.sa_handler = SIG_DFL;
+        if (sigaction(SIGALRM, &action, nullptr) != 0) {
+            _exit(122);
+        }
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGUSR1);
+        sigaddset(&unblocked, SIGUSR2);
+        sigaddset(&unblocked, SIGALRM);
+        if (sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) {
+            _exit(123);
+        }
+        alarm(10);
+        WriteByteOrExit(ready_pipe[1], 'R');
+        close(ready_pipe[1]);
+
+        const pid_t expected_pid = getpid();
+        volatile unsigned long work = 1;
+        while (!async_signal_stop || !async_signal_seen) {
+            // Keep real userspace work between kernel entries, including in
+            // the syscall-heavy case. Unsigned arithmetic wraps intentionally.
+            const int iterations = syscall_heavy ? 32 : 32768;
+            for (int i = 0; i < iterations; ++i) {
+                work = work * 1664525UL + 1013904223UL;
+            }
+            if (syscall(SYS_getpid) != expected_pid || sched_yield() != 0) {
+                _exit(124);
+            }
+        }
+        // A successful exit must include a kernel entry after signal return.
+        _exit(syscall(SYS_getpid) == expected_pid ? 0 : 125);
+    }
+
+    ChildProcessGuard child_guard(child);
+    close(ready_pipe[1]);
+    bool ready = false;
+    pollfd descriptor {ready_pipe[0], POLLIN, 0};
+    for (int i = 0; i < 50; ++i) {
+        const int result = poll(&descriptor, 1, 100);
+        if (result > 0) {
+            ready = (descriptor.revents & POLLIN) && ReadByte(ready_pipe[0]);
+            break;
+        }
+        if (result < 0 && errno != EINTR) {
+            break;
+        }
+    }
+    close(ready_pipe[0]);
+    ASSERT_TRUE(ready) << "child did not install signal handlers within timeout";
+
+    // Ordinary signals may coalesce; require delivery, not a precise count.
+    for (int i = 0; i < 4096; ++i) {
+        ASSERT_EQ(0, kill(child, SIGUSR1)) << strerror(errno);
+        if (i % 16 == 15) {
+            SleepForMillis(1);
+        }
+    }
+    ASSERT_EQ(0, kill(child, SIGUSR2)) << strerror(errno);
+    int status = 0;
+    ASSERT_TRUE(WaitForExit(child, &status, 500)) << "signal return workload timed out";
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+// Each signal is acknowledged before the next send, so ordinary-signal
+// coalescing cannot turn a burst count into a false delivery assertion.
+class AckPipeGuard {
+public:
+    ~AckPipeGuard() {
+        CloseRead();
+        CloseWrite();
+    }
+    AckPipeGuard() = default;
+    AckPipeGuard(const AckPipeGuard&) = delete;
+    AckPipeGuard& operator=(const AckPipeGuard&) = delete;
+
+    bool Open() { return pipe(fds_) == 0; }
+    int ReadFd() const { return fds_[0]; }
+    int WriteFd() const { return fds_[1]; }
+    void CloseRead() {
+        if (fds_[0] >= 0) {
+            close(fds_[0]);
+            fds_[0] = -1;
+        }
+    }
+    void CloseWrite() {
+        if (fds_[1] >= 0) {
+            close(fds_[1]);
+            fds_[1] = -1;
+        }
+    }
+
+private:
+    int fds_[2] = {-1, -1};
+};
+
+int64_t SignalAckMillis() {
+    timespec now {};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+        static_cast<uint64_t>(now.tv_sec) > static_cast<uint64_t>(INT64_MAX - 999) / 1000) {
+        return -1;
+    }
+    return static_cast<int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+}
+
+bool ReadExpectedByteUntil(int fd, char expected, int64_t deadline_ms) {
+    for (;;) {
+        const int64_t now = SignalAckMillis();
+        if (now < 0 || now >= deadline_ms) {
+            return false;
+        }
+        pollfd descriptor {fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, static_cast<int>(deadline_ms - now));
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready <= 0 || !(descriptor.revents & POLLIN)) {
+            return false;
+        }
+        const int64_t observed = SignalAckMillis();
+        if (observed < 0 || observed >= deadline_ms) {
+            return false;
+        }
+        char value = 0;
+        const ssize_t size = read(fd, &value, sizeof(value));
+        if (size < 0 && errno == EINTR) {
+            continue;
+        }
+        return size == static_cast<ssize_t>(sizeof(value)) && value == expected;
+    }
+}
+
+volatile sig_atomic_t ack_signal_fd = -1;
+volatile sig_atomic_t ack_signal_count = 0;
+volatile sig_atomic_t ack_signal_write_failed = 0;
+
+void AcknowledgeSyscallReturnSignal(int) {
+    const int saved_errno = errno;
+    ++ack_signal_count;
+    const char ack = 'A';
+    if (write(static_cast<int>(ack_signal_fd), &ack, sizeof(ack)) !=
+        static_cast<ssize_t>(sizeof(ack))) {
+        ack_signal_write_failed = 1;
+    }
+    errno = saved_errno;
+}
+
+void RunAcknowledgedSyscallReturnSignals(bool thread_directed) {
+    constexpr int kSignals = 256;
+    AckPipeGuard acknowledgements;
+    ASSERT_TRUE(acknowledgements.Open()) << strerror(errno);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << strerror(errno);
+    if (child == 0) {
+        acknowledgements.CloseRead();
+        ack_signal_fd = acknowledgements.WriteFd();
+        ack_signal_count = 0;
+        ack_signal_write_failed = 0;
+        struct sigaction action {};
+        action.sa_handler = AcknowledgeSyscallReturnSignal;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, nullptr) != 0) {
+            _exit(121);
+        }
+        action.sa_handler = SIG_DFL;
+        if (sigaction(SIGALRM, &action, nullptr) != 0) {
+            _exit(122);
+        }
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigaddset(&unblocked, SIGUSR1);
+        sigaddset(&unblocked, SIGALRM);
+        if (sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) {
+            _exit(123);
+        }
+        // Independent safety exit, longer than the parent's whole-window limit.
+        alarm(15);
+        const pid_t expected = static_cast<pid_t>(syscall(SYS_getpid));
+        if (expected <= 0 || syscall(SYS_gettid) != expected) {
+            _exit(124);
+        }
+        WriteByteOrExit(acknowledgements.WriteFd(), 'R');
+        while (ack_signal_count < kSignals && !ack_signal_write_failed) {
+            if (syscall(SYS_getpid) != expected || syscall(SYS_gettid) != expected) {
+                _exit(125);
+            }
+        }
+        const bool success = !ack_signal_write_failed && ack_signal_count == kSignals &&
+            syscall(SYS_getpid) == expected && syscall(SYS_gettid) == expected;
+        alarm(0);
+        acknowledgements.CloseWrite();
+        _exit(success ? 0 : 126);
+    }
+
+    // Construct after the pipe so failure first kills/reaps this exact child,
+    // then closes the remaining read fd. No assertion leaks a live child/fd.
+    ChildProcessGuard child_guard(child);
+    acknowledgements.CloseWrite();
+    const int64_t begin = SignalAckMillis();
+    ASSERT_GE(begin, 0);
+    const int64_t total_deadline = begin + 10000;
+    ASSERT_TRUE(ReadExpectedByteUntil(acknowledgements.ReadFd(), 'R', begin + 2000))
+        << "child did not install handler and report READY";
+    for (int i = 0; i < kSignals; ++i) {
+        const int64_t now = SignalAckMillis();
+        ASSERT_GE(now, 0);
+        ASSERT_LT(now, total_deadline) << "whole 10-second signal window exceeded at " << i;
+        if (thread_directed) {
+            ASSERT_EQ(0, syscall(SYS_tgkill, child, child, SIGUSR1)) << strerror(errno);
+        } else {
+            ASSERT_EQ(0, kill(child, SIGUSR1)) << strerror(errno);
+        }
+        const int64_t per_signal_deadline = now + 1000;
+        const int64_t deadline = per_signal_deadline < total_deadline
+            ? per_signal_deadline : total_deadline;
+        // ACK proves handler entry/write, not completion. A subsequent signal
+        // may be pending until the preceding handler returns; only one is sent.
+        ASSERT_TRUE(ReadExpectedByteUntil(acknowledgements.ReadFd(), 'A', deadline))
+            << "missing per-signal ACK at " << i;
+    }
+    int status = 0;
+    ASSERT_TRUE(WaitForExit(child, &status, 300)) << "child did not exit after final ACK";
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    char extra = 0;
+    EXPECT_EQ(0, read(acknowledgements.ReadFd(), &extra, sizeof(extra)))
+        << "unexpected extra ACK after child exit";
+}
+
+}  // namespace
+
+TEST(ProcessSignalFork, AsyncSignalsDuringSyscallReturns) {
+    RunAsyncSignalReturnStress(true);
+}
+
+TEST(ProcessSignalFork, AsyncSignalsDuringUserspaceExecution) {
+    RunAsyncSignalReturnStress(false);
+}
+
+TEST(ProcessSignalFork, ThreadDirectedSignalAckDuringSyscallReturns) {
+    RunAcknowledgedSyscallReturnSignals(true);
+}
+
+TEST(ProcessSignalFork, ProcessDirectedSignalAckDuringSyscallReturns) {
+    RunAcknowledgedSyscallReturnSignals(false);
+}
+
+TEST(ProcessSignalFork, ZeroTimeoutPselectRestoresSignalMaskWithoutSignal) {
+    sigset_t blocked;
+    ASSERT_EQ(0, sigemptyset(&blocked));
+    ASSERT_EQ(0, sigaddset(&blocked, SIGUSR1));
+    SignalMaskGuard mask_guard(blocked);
+    ASSERT_TRUE(mask_guard.valid()) << strerror(errno);
+
+    sigset_t before;
+    ASSERT_EQ(0, sigprocmask(SIG_SETMASK, nullptr, &before));
+    ASSERT_EQ(1, sigismember(&before, SIGUSR1));
+    sigset_t temporary = before;
+    ASSERT_EQ(0, sigdelset(&temporary, SIGUSR1));
+    ASSERT_EQ(0, sigaddset(&temporary, SIGUSR2));
+    const timespec timeout {};
+    // No signal is sent and no handler count is involved: this is the normal
+    // zero-timeout return, which must restore the original mask independently.
+    ASSERT_EQ(0, pselect(0, nullptr, nullptr, nullptr, &timeout, &temporary)) << strerror(errno);
+    sigset_t after;
+    ASSERT_EQ(0, sigprocmask(SIG_SETMASK, nullptr, &after));
+    for (int signal = 1; signal < NSIG; ++signal) {
+        EXPECT_EQ(sigismember(&before, signal), sigismember(&after, signal))
+            << "mask mismatch for signal " << signal;
+    }
+}
+
+TEST(ProcessSignalFork, SigchldHandlerCanImmediatelyReapExitedChild) {
+    struct sigaction action {};
+    action.sa_handler = ReapExpectedChildFromSigchld;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    SignalActionGuard action_guard(SIGCHLD, action);
+    ASSERT_TRUE(action_guard.valid()) << "sigaction failed: errno=" << errno << " ("
+                                     << strerror(errno) << ")";
+
+    int gate[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(gate)) << "pipe failed: " << strerror(errno);
+
+    const pid_t child = fork();
+    if (child < 0) {
+        const int fork_errno = errno;
+        close(gate[0]);
+        close(gate[1]);
+        FAIL() << "fork failed: errno=" << fork_errno << " (" << strerror(fork_errno) << ")";
+        return;
+    }
+    if (child == 0) {
+        close(gate[1]);
+        char value = 0;
+        if (read(gate[0], &value, sizeof(value)) != static_cast<ssize_t>(sizeof(value))) {
+            _exit(120);
+        }
+        _exit(42);
+    }
+    ChildProcessGuard child_guard(child);
+
+    close(gate[0]);
+    sigchld_expected_pid = child;
+    sigchld_wait_result = -2;
+    sigchld_wait_errno = 0;
+    sigchld_wait_status = 0;
+    sigchld_handler_calls = 0;
+    const char gate_value = 'X';
+    const ssize_t gate_write = write(gate[1], &gate_value, sizeof(gate_value));
+    const int gate_errno = errno;
+    close(gate[1]);
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(gate_value)), gate_write)
+        << "write(gate) failed: errno=" << gate_errno << " (" << strerror(gate_errno) << ")";
+
+    for (int i = 0; i < 500 && sigchld_handler_calls == 0; ++i) {
+        SleepForMillis(1);
+    }
+
+    ASSERT_GT(sigchld_handler_calls, 0) << "SIGCHLD handler was not invoked";
+    EXPECT_EQ(child, static_cast<pid_t>(sigchld_wait_result))
+        << "waitpid(WNOHANG) in SIGCHLD handler did not observe the published exit; errno="
+        << sigchld_wait_errno;
+    if (sigchld_wait_result == child) {
+        child_guard.Release();
+        ASSERT_TRUE(WIFEXITED(sigchld_wait_status)) << "child status=" << sigchld_wait_status;
+        EXPECT_EQ(42, WEXITSTATUS(sigchld_wait_status));
+    }
+}
+
+TEST(ProcessSignalFork, SigchldInfoUsesGroupLeaderWhenLastNonleaderExits) {
+    const uid_t leader_uid = getuid();
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    SignalMaskGuard mask_guard(blocked);
+    ASSERT_TRUE(mask_guard.valid()) << "sigprocmask failed: errno=" << errno << " ("
+                                    << strerror(errno) << ")";
+
+    int ready_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe)) << "pipe failed: " << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        close(ready_pipe[0]);
+        if (!PinCurrentTaskToOneAllowedCpu()) {
+            _exit(120);
+        }
+        LastThreadExitArgs args {ready_pipe[1], getpid()};
+        pthread_t worker {};
+        if (pthread_create(&worker, nullptr, ExitAfterLeaderThread, &args) != 0) {
+            _exit(121);
+        }
+        syscall(SYS_exit, 0);
+        _exit(122);
+    }
+    ChildProcessGuard child_guard(child);
+
+    close(ready_pipe[1]);
+    int worker_tid = -1;
+    ASSERT_TRUE(ReadInt(ready_pipe[0], &worker_tid)) << "worker did not report its tid";
+    close(ready_pipe[0]);
+    ASSERT_GT(worker_tid, 0);
+    ASSERT_NE(worker_tid, child);
+
+    siginfo_t info {};
+    timespec timeout {};
+    timeout.tv_sec = 5;
+    ASSERT_EQ(SIGCHLD, sigtimedwait(&blocked, &info, &timeout))
+        << "sigtimedwait failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(child, info.si_pid);
+    EXPECT_NE(worker_tid, info.si_pid);
+    EXPECT_EQ(leader_uid, info.si_uid);
+    EXPECT_EQ(CLD_EXITED, info.si_code);
+    EXPECT_EQ(0, info.si_status);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(ProcessSignalFork, PtraceExitSignalCarriesChildSiginfo) {
+    const uid_t expected_uid = getuid();
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    SignalMaskGuard mask_guard(blocked);
+    ASSERT_TRUE(mask_guard.valid()) << "sigprocmask failed: errno=" << errno << " ("
+                                    << strerror(errno) << ")";
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) {
+            _exit(120);
+        }
+        _exit(47);
+    }
+    ChildProcessGuard child_guard(child);
+
+    siginfo_t info {};
+    timespec timeout {};
+    timeout.tv_sec = 5;
+    ASSERT_EQ(SIGCHLD, sigtimedwait(&blocked, &info, &timeout))
+        << "sigtimedwait failed: errno=" << errno << " (" << strerror(errno) << ")";
+    EXPECT_EQ(child, info.si_pid);
+    EXPECT_EQ(expected_uid, info.si_uid);
+    EXPECT_EQ(CLD_EXITED, info.si_code);
+    EXPECT_EQ(47, info.si_status);
+    EXPECT_GE(info.si_utime, 0);
+    EXPECT_GE(info.si_stime, 0);
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    child_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(47, WEXITSTATUS(status));
+}
+
+TEST(ProcessSignalFork, StopContinueRaceDoesNotLeaveChildStuck) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        for (;;) {
+            asm volatile("" ::: "memory");
+        }
+    }
+
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_EQ(0, kill(child, SIGSTOP))
+            << "SIGSTOP failed at iteration " << i << ": errno=" << errno << " ("
+            << strerror(errno) << ")";
+        sched_yield();
+        ASSERT_EQ(0, kill(child, SIGCONT))
+            << "SIGCONT failed at iteration " << i << ": errno=" << errno << " ("
+            << strerror(errno) << ")";
+
+        int event_status = 0;
+        while (waitpid(child, &event_status, WUNTRACED | WCONTINUED | WNOHANG) == child) {
+        }
+    }
+
+    ASSERT_EQ(0, kill(child, SIGCONT))
+        << "final SIGCONT failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_EQ(0, kill(child, SIGTERM))
+        << "SIGTERM failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int status = 0;
+    if (!WaitForExit(child, &status, 300)) {
+        kill(child, SIGKILL);
+        waitpid(child, &status, 0);
+        FAIL() << "child did not exit after SIGSTOP/SIGCONT race stress";
+    }
+
+    ASSERT_TRUE(WIFSIGNALED(status) || WIFEXITED(status)) << "child status=" << status;
+    if (WIFSIGNALED(status)) {
+        EXPECT_EQ(SIGTERM, WTERMSIG(status));
+    } else {
+        EXPECT_EQ(0, WEXITSTATUS(status));
+    }
+}
+
+TEST(ProcessSignalFork, ProcessDirectedSigkillKillsStoppedChildWithPendingStopEvent) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        for (;;) {
+            asm volatile("" ::: "memory");
+        }
+    }
+
+    ASSERT_EQ(0, kill(child, SIGSTOP))
+        << "SIGSTOP failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    siginfo_t info {};
+    bool observed_stop = false;
+    for (int i = 0; i < 300; ++i) {
+        memset(&info, 0, sizeof(info));
+        int ret = waitid(P_PID, static_cast<id_t>(child), &info, WSTOPPED | WNOWAIT | WNOHANG);
+        ASSERT_EQ(0, ret) << "waitid(WSTOPPED|WNOWAIT) failed: errno=" << errno << " ("
+                          << strerror(errno) << ")";
+        if (info.si_pid == child && info.si_code == CLD_STOPPED) {
+            observed_stop = true;
+            break;
+        }
+        SleepForMillis(10);
+    }
+    ASSERT_TRUE(observed_stop) << "child did not report a pending stop event";
+
+    ASSERT_EQ(0, kill(child, SIGKILL))
+        << "SIGKILL failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int status = 0;
+    if (!WaitForExit(child, &status, 300)) {
+        kill(child, SIGKILL);
+        waitpid(child, &status, 0);
+        FAIL() << "stopped child did not exit after process-directed SIGKILL";
+    }
+
+    ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+}
+
+TEST(ProcessSignalFork, ProcessGroupSignalIsDeliveredOncePerThreadGroup) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        if (setsid() < 0) {
+            _exit(120);
+        }
+
+        const int signal = SIGRTMIN;
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, signal);
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+            _exit(121);
+        }
+
+        int ready_pipe[2] = {-1, -1};
+        if (pipe(ready_pipe) != 0) {
+            _exit(122);
+        }
+        pthread_t thread {};
+        if (pthread_create(&thread, nullptr, ReadyPauseThread, &ready_pipe[1]) != 0
+            || !ReadByte(ready_pipe[0])) {
+            _exit(123);
+        }
+
+        if (kill(0, signal) != 0) {
+            _exit(124);
+        }
+
+        timespec timeout {};
+        timeout.tv_nsec = 10 * 1000 * 1000;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != signal) {
+            _exit(125);
+        }
+        errno = 0;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != -1 || errno != EAGAIN) {
+            _exit(126);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(ProcessSignalFork, ThreadCreationPreservesInheritedGroupAndSingleDelivery) {
+    int helper_ready[2] = {-1, -1};
+    int child_gate[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(helper_ready)) << "pipe failed: " << strerror(errno);
+    ASSERT_EQ(0, pipe(child_gate)) << "pipe failed: " << strerror(errno);
+
+    pid_t helper = fork();
+    ASSERT_GE(helper, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (helper == 0) {
+        if (setpgid(0, 0) != 0) {
+            _exit(127);
+        }
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGRTMIN);
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+            _exit(128);
+        }
+        WriteByteOrExit(helper_ready[1], 'R');
+        for (;;) {
+            pause();
+        }
+    }
+    ChildProcessGuard helper_guard(helper);
+    ASSERT_TRUE(ReadByte(helper_ready[0])) << "helper did not become ready";
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+    if (child == 0) {
+        if (!ReadByte(child_gate[0])) {
+            _exit(129);
+        }
+        const pid_t process_group = getpgrp();
+        const pid_t session = getsid(0);
+        if (process_group != helper || session < 0) {
+            _exit(130);
+        }
+
+        const int signal = SIGRTMIN;
+        sigset_t blocked;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, signal);
+        if (sigprocmask(SIG_BLOCK, &blocked, nullptr) != 0) {
+            _exit(131);
+        }
+
+        int ready_pipe[2] = {-1, -1};
+        if (pipe(ready_pipe) != 0) {
+            _exit(132);
+        }
+        pthread_t thread {};
+        if (pthread_create(&thread, nullptr, ReadyPauseThread, &ready_pipe[1]) != 0
+            || !ReadByte(ready_pipe[0])) {
+            _exit(133);
+        }
+
+        if (getpgrp() != process_group) {
+            _exit(134);
+        }
+        if (getsid(0) != session) {
+            _exit(135);
+        }
+        if (kill(0, signal) != 0) {
+            _exit(136);
+        }
+
+        timespec timeout {};
+        timeout.tv_nsec = 10 * 1000 * 1000;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != signal) {
+            _exit(137);
+        }
+        errno = 0;
+        if (sigtimedwait(&blocked, nullptr, &timeout) != -1 || errno != EAGAIN) {
+            _exit(138);
+        }
+        _exit(0);
+    }
+    ChildProcessGuard child_guard(child);
+
+    ASSERT_EQ(0, setpgid(child, helper))
+        << "setpgid failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_EQ(1, write(child_gate[1], "G", 1));
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    child_guard.Release();
+    ASSERT_EQ(0, kill(helper, SIGKILL));
+    int helper_status = 0;
+    ASSERT_EQ(helper, waitpid(helper, &helper_status, 0));
+    helper_guard.Release();
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(0, WEXITSTATUS(status));
+}
+
+TEST(ProcessSignalFork, ProcessDirectedSigkillKillsMultithreadedChild) {
+    int ready_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe)) << "pipe failed: " << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        close(ready_pipe[0]);
+        RunMultithreadedSignalChild(ready_pipe[1]);
+    }
+
+    close(ready_pipe[1]);
+    ASSERT_TRUE(ReadByte(ready_pipe[0])) << "child did not report pthread readiness";
+    close(ready_pipe[0]);
+
+    ASSERT_EQ(0, kill(child, SIGKILL))
+        << "SIGKILL failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int status = 0;
+    if (!WaitForExit(child, &status, 300)) {
+        kill(child, SIGKILL);
+        waitpid(child, &status, 0);
+        FAIL() << "multithreaded child did not exit after process-directed SIGKILL";
+    }
+
+    ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+}
+
+TEST(ProcessSignalFork, ProcessDirectedSigtermPreservesExitSignalForMultithreadedChild) {
+    int ready_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(ready_pipe)) << "pipe failed: " << strerror(errno);
+
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        close(ready_pipe[0]);
+        RunMultithreadedSignalChild(ready_pipe[1]);
+    }
+
+    close(ready_pipe[1]);
+    ASSERT_TRUE(ReadByte(ready_pipe[0])) << "child did not report pthread readiness";
+    close(ready_pipe[0]);
+
+    ASSERT_EQ(0, kill(child, SIGTERM))
+        << "SIGTERM failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    int status = 0;
+    if (!WaitForExit(child, &status, 300)) {
+        kill(child, SIGKILL);
+        waitpid(child, &status, 0);
+        FAIL() << "multithreaded child did not exit after process-directed SIGTERM";
+    }
+
+    ASSERT_TRUE(WIFSIGNALED(status)) << "child status=" << status;
+    EXPECT_EQ(SIGTERM, WTERMSIG(status));
+}
+
+TEST(ProcessSignalFork, AncestorPidNamespaceCanKillPidNamespaceInit) {
+    int pid_pipe[2] = {-1, -1};
+    int status_pipe[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pid_pipe)) << "pid pipe failed: " << strerror(errno);
+    ASSERT_EQ(0, pipe(status_pipe)) << "status pipe failed: " << strerror(errno);
+
+    pid_t supervisor = fork();
+    ASSERT_GE(supervisor, 0) << "fork supervisor failed: errno=" << errno << " ("
+                             << strerror(errno) << ")";
+
+    if (supervisor == 0) {
+        close(pid_pipe[0]);
+        close(status_pipe[0]);
+
+        if (unshare(CLONE_NEWPID) != 0) {
+            WriteIntOrExit(status_pipe[1], errno == EPERM ? -EPERM : -errno);
+            _exit(0);
+        }
+
+        pid_t init = fork();
+        if (init < 0) {
+            WriteIntOrExit(status_pipe[1], -errno);
+            _exit(0);
+        }
+
+        if (init == 0) {
+            for (;;) {
+                pause();
+            }
+        }
+
+        WriteIntOrExit(pid_pipe[1], static_cast<int>(init));
+
+        int status = 0;
+        if (waitpid(init, &status, 0) != init) {
+            WriteIntOrExit(status_pipe[1], -errno);
+            _exit(0);
+        }
+
+        WriteIntOrExit(status_pipe[1], status);
+        _exit(0);
+    }
+
+    close(pid_pipe[1]);
+    close(status_pipe[1]);
+
+    int init_pid = -1;
+    int reported_status = 0;
+    ASSERT_TRUE(ReadInt(pid_pipe[0], &init_pid) || ReadInt(status_pipe[0], &reported_status))
+        << "supervisor did not report pid namespace init pid or setup status";
+    close(pid_pipe[0]);
+
+    if (init_pid < 0) {
+        ASSERT_LT(reported_status, 0);
+        int err = -reported_status;
+        int supervisor_status = 0;
+        waitpid(supervisor, &supervisor_status, 0);
+        if (err == EPERM || err == EINVAL || err == ENOSYS) {
+            GTEST_SKIP() << "PID namespace unshare unsupported in this environment: errno=" << err;
+        }
+        FAIL() << "supervisor setup failed: errno=" << err << " (" << strerror(err) << ")";
+    }
+
+    ASSERT_EQ(0, kill(static_cast<pid_t>(init_pid), SIGKILL))
+        << "SIGKILL to pid namespace init from ancestor failed: errno=" << errno << " ("
+        << strerror(errno) << ")";
+
+    ASSERT_TRUE(ReadInt(status_pipe[0], &reported_status))
+        << "supervisor did not report pid namespace init wait status";
+    close(status_pipe[0]);
+
+    int supervisor_status = 0;
+    ASSERT_EQ(supervisor, waitpid(supervisor, &supervisor_status, 0));
+    ASSERT_TRUE(WIFEXITED(supervisor_status));
+    ASSERT_EQ(0, WEXITSTATUS(supervisor_status));
+
+    ASSERT_TRUE(WIFSIGNALED(reported_status)) << "init status=" << reported_status;
+    EXPECT_EQ(SIGKILL, WTERMSIG(reported_status));
+}
+
+#endif
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

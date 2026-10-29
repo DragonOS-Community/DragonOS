@@ -14,6 +14,8 @@ pause_test
 
 # 文件系统相关测试
 chroot_test
+mount_test
+pivot_root_test
 creat_test
 dup_test
 fuse_test
@@ -66,8 +68,10 @@ prctl_test
 exit_test
 setns_test
 eventfd_test
+timerfd_test
 poll_test
 rseq_test
+process_vm_read_write_test
 
 
 # 内存管理测试
@@ -138,6 +142,7 @@ pipe_test
 fifo_test
 unshare_test
 pty_root_test
+pty_test
 time_test
 timers_test
 clock_nanosleep_test
@@ -147,3 +152,4 @@ setgid_test
 uidgid_test
 partitial_bad_buffer_test
 sysinfo_test
+ptrace_test

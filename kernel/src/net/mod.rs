@@ -6,17 +6,33 @@ use core::sync::atomic::AtomicUsize;
 
 use crate::driver::net::Iface;
 
+pub(crate) mod address;
+pub(crate) mod conntrack;
+pub mod forward_mtu;
+pub mod icmp_error;
+pub(crate) mod ingress;
+pub(crate) mod ipv4_defrag;
+pub(crate) mod ipv6_defrag;
+pub(crate) mod link;
 pub mod neighbor;
-pub mod net_core;
+pub(crate) mod nftables;
+pub(crate) mod output;
 pub mod posix;
+pub(crate) mod route;
 pub mod routing;
+pub(crate) mod rtnl;
 pub mod socket;
 pub mod syscall;
+pub(crate) mod tcp_bounds;
 pub mod tcp_close_defer;
-pub mod tcp_listener_backlog;
+pub mod tcp_listener;
+pub mod tcp_stack;
+
+/// Linux reserves interface index 1 for the loopback device in every netns.
+pub const LOOPBACK_IFINDEX: usize = 1;
 
 /// 生成网络接口的id (全局自增)
 pub fn generate_iface_id() -> usize {
-    static IFACE_ID: AtomicUsize = AtomicUsize::new(1);
+    static IFACE_ID: AtomicUsize = AtomicUsize::new(LOOPBACK_IFINDEX + 1);
     return IFACE_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 }

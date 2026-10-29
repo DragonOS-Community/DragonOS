@@ -1,5 +1,6 @@
 use alloc::sync::{Arc, Weak};
 
+use crate::ipc::sem::SemManager;
 use crate::ipc::shm::ShmManager;
 use crate::libs::spinlock::SpinLock;
 use crate::process::namespace::{
@@ -7,20 +8,22 @@ use crate::process::namespace::{
 };
 use crate::process::ProcessManager;
 
-// 根 IPC 命名空间
+// Root IPC namespace
 lazy_static::lazy_static! {
     pub static ref INIT_IPC_NAMESPACE: Arc<IpcNamespace> = IpcNamespace::new_root();
 }
 
-/// DragonOS 的 IPC 命名空间
+/// DragonOS IPC namespace
 pub struct IpcNamespace {
     ns_common: NsCommon,
     self_ref: Weak<IpcNamespace>,
-    /// 关联的 user namespace (权限判断使用)
+    /// Associated user namespace (used for permission checks)
     pub user_ns: Arc<UserNamespace>,
 
-    /// SysV SHM 管理器（阶段一：仅支持 per-ns shm）
+    /// SysV SHM manager (phase one: per-namespace SHM only)
     pub shm: SpinLock<ShmManager>,
+    /// SysV semaphore manager
+    pub sem: SpinLock<SemManager>,
 }
 
 impl NamespaceOps for IpcNamespace {
@@ -36,10 +39,11 @@ impl IpcNamespace {
             self_ref: weak_self.clone(),
             user_ns: crate::process::namespace::user_namespace::INIT_USER_NAMESPACE.clone(),
             shm: SpinLock::new(ShmManager::new()),
+            sem: SpinLock::new(SemManager::new()),
         })
     }
 
-    /// 复制/创建 IPC 命名空间
+    /// Copy or create an IPC namespace
     pub fn copy_ipc_ns(
         &self,
         clone_flags: &crate::process::fork::CloneFlags,
@@ -49,12 +53,13 @@ impl IpcNamespace {
         if !clone_flags.contains(CloneFlags::CLONE_NEWIPC) {
             return self.self_ref.upgrade().unwrap();
         }
-        // 创建新的 IPC 命名空间，SHM 空间独立
+        // Create an independent IPC namespace with separate SHM and semaphore spaces.
         Arc::new_cyclic(|weak_self| IpcNamespace {
             ns_common: NsCommon::new(self.ns_common.level + 1, NamespaceType::Ipc),
             self_ref: weak_self.clone(),
             user_ns,
             shm: SpinLock::new(ShmManager::new()),
+            sem: SpinLock::new(SemManager::new()),
         })
     }
 }

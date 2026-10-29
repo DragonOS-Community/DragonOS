@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DragonOS的功能 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../" id="documentation_options" src="../_static/documentation_options.js"></script>
+        <script src="../_static/jquery.js"></script>
+        <script src="../_static/underscore.js"></script>
+        <script src="../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../_static/doctools.js"></script>
+        <script src="../_static/translations.js"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../genindex.html" />
+    <link rel="search" title="搜索" href="../search.html" />
+    <link rel="next" title="构建DragonOS" href="build_system.html" />
+    <link rel="prev" title="DragonOS简介" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">DragonOS简介</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">DragonOS的功能</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">规范</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">内核层</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id3">内存管理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id4">多核</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id5">进程管理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">调度</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#ipc">IPC</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id8">文件系统</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id9">异常及中断处理</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id10">内核数据结构</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id11">内核实用库</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id12">系统调用</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id13">测试框架</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id14">驱动程序</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id15">用户层</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#libc">LibC</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#shell">shell命令行程序</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id16">驱动程序</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id17">软件移植</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../kernel/cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../userland/libc/index.html">LibC文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS简介</a></li>
+      <li class="breadcrumb-item active">DragonOS的功能</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/3a23230/docs/introduction/features.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="dragonos">
+<span id="genreal-features"></span><h1>DragonOS的功能<a class="headerlink" href="#dragonos" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>规范<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 启动引导：Multiboot2</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 接口：posix 2008</p></li>
+</ul>
+</section>
+<section id="id2">
+<h2>内核层<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<section id="id3">
+<h3>内存管理<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 页分配器</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> slab分配器</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> VMA</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> MMIO地址空间自动分配</p></li>
+</ul>
+</section>
+<section id="id4">
+<h3>多核<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 多核引导</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ipi框架</p></li>
+</ul>
+</section>
+<section id="id5">
+<h3>进程管理<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 进程创建</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 进程回收</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 内核线程</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> fork</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> exec</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 进程睡眠（支持高精度睡眠）</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> kthread机制</p></li>
+</ul>
+<section id="id6">
+<h4>同步原语<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> mutex互斥量</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> semaphore信号量</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> atomic原子变量</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> spinlock自旋锁</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> wait_queue等待队列</p></li>
+</ul>
+</section>
+</section>
+<section id="id7">
+<h3>调度<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> CFS调度器</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 单核调度</p></li>
+</ul>
+</section>
+<section id="ipc">
+<h3>IPC<a class="headerlink" href="#ipc" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 匿名pipe管道</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> signal信号</p></li>
+</ul>
+</section>
+<section id="id8">
+<h3>文件系统<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> VFS</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> fat12/16/32</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> Devfs</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> RamFS</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> procfs</p></li>
+</ul>
+</section>
+<section id="id9">
+<h3>异常及中断处理<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> APIC</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> softirq 软中断</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 内核栈traceback</p></li>
+</ul>
+</section>
+<section id="id10">
+<h3>内核数据结构<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 普通二叉树</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> kfifo缓冲区</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 循环链表</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> IDR</p></li>
+</ul>
+</section>
+<section id="id11">
+<h3>内核实用库<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> LZ4压缩库（1.9.3）</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 字符串操作库</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ELF可执行文件支持</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> printk</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 基础数学库</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 屏幕管理器</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> textui框架</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> CRC函数库</p></li>
+</ul>
+</section>
+<section id="id12">
+<h3>系统调用<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h3>
+<p>  <a class="reference external" href="https://docs.dragonos.org/zh_CN/latest/syscall_api/index.html">请见系统调用文档</a></p>
+</section>
+<section id="id13">
+<h3>测试框架<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ktest</p></li>
+</ul>
+</section>
+<section id="id14">
+<h3>驱动程序<a class="headerlink" href="#id14" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ACPI 高级电源配置模块</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> IDE硬盘</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> AHCI硬盘</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> PCI</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> XHCI（usb3.0）</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ps/2 键盘</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ps/2 鼠标</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> HPET高精度定时器</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> RTC时钟</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> local apic定时器</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> UART串口</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> VBE显示</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> VirtIO网卡</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> x87FPU</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> TTY终端</p></li>
+</ul>
+</section>
+</section>
+<section id="id15">
+<h2>用户层<a class="headerlink" href="#id15" title="Permalink to this heading"></a></h2>
+<section id="libc">
+<h3>LibC<a class="headerlink" href="#libc" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 基础系统调用</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 基础标准库函数</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 部分数学函数</p></li>
+</ul>
+</section>
+<section id="shell">
+<h3>shell命令行程序<a class="headerlink" href="#shell" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 基于字符串匹配的解析</p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> 基本的几个命令</p></li>
+</ul>
+</section>
+<section id="id16">
+<h3>驱动程序<a class="headerlink" href="#id16" title="Permalink to this heading"></a></h3>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> ps/2键盘用户态驱动</p></li>
+</ul>
+</section>
+</section>
+<section id="id17">
+<h2>软件移植<a class="headerlink" href="#id17" title="Permalink to this heading"></a></h2>
+<ul class="contains-task-list simple">
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> GCC 11.3.0 （暂时只支持了x86_64的Cross Compiler）<a class="reference external" href="https://github.com/DragonOS-Community/gcc">https://github.com/DragonOS-Community/gcc</a></p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> binutils 2.38（暂时只支持了x86_64的Cross Compiler）<a class="reference external" href="https://github.com/DragonOS-Community/binutils">https://github.com/DragonOS-Community/binutils</a></p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> gmp 6.2.1 <a class="reference external" href="https://github.com/DragonOS-Community/gmp-6.2.1">https://github.com/DragonOS-Community/gmp-6.2.1</a></p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> mpfr 4.1.1 <a class="reference external" href="https://github.com/DragonOS-Community/mpfr">https://github.com/DragonOS-Community/mpfr</a></p></li>
+<li class="task-list-item"><p><input class="task-list-item-checkbox" checked="checked" disabled="disabled" type="checkbox"> mpc 1.2.1 <a class="reference external" href="https://github.com/DragonOS-Community/mpc">https://github.com/DragonOS-Community/mpc</a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="DragonOS简介" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="build_system.html" class="btn btn-neutral float-right" title="构建DragonOS" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>3a23230</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.7
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../V0.1.0/introduction/features.html">V0.1.0</a></dd>
+      <dd><a href="../../V0.1.1/introduction/features.html">V0.1.1</a></dd>
+      <dd><a href="../../V0.1.10/introduction/features.html">V0.1.10</a></dd>
+      <dd><a href="../../V0.1.2/introduction/features.html">V0.1.2</a></dd>
+      <dd><a href="../../V0.1.3/introduction/features.html">V0.1.3</a></dd>
+      <dd><a href="../../V0.1.4/introduction/features.html">V0.1.4</a></dd>
+      <dd><a href="../../V0.1.5/introduction/features.html">V0.1.5</a></dd>
+      <dd><a href="../../V0.1.6/introduction/features.html">V0.1.6</a></dd>
+      <dd><a href="features.html">V0.1.7</a></dd>
+      <dd><a href="../../V0.1.8/introduction/features.html">V0.1.8</a></dd>
+      <dd><a href="../../V0.1.9/introduction/features.html">V0.1.9</a></dd>
+      <dd><a href="../../V0.2.0/introduction/features.html">V0.2.0</a></dd>
+      <dd><a href="../../V0.3.0/introduction/features.html">V0.3.0</a></dd>
+      <dd><a href="../../V0.4.0/introduction/features.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../master/introduction/features.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

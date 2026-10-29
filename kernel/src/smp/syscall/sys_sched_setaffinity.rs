@@ -6,13 +6,11 @@ use system_error::SystemError;
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SCHED_SETAFFINITY;
 use crate::libs::cpumask::CpuMask;
-use crate::process::{ProcessManager, RawPid};
-use crate::sched::{
-    request_task_migration, select_task_rq, syscall::util::has_sched_setaffinity_permission,
-};
-use crate::smp::cpu::smp_cpu_manager;
+use crate::mm::VirtAddr;
+use crate::process::{kthread::KernelThreadFlags, ProcessFlags, ProcessManager, RawPid};
+use crate::sched::syscall::util::has_sched_setaffinity_permission;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
-use crate::syscall::user_access::UserBufferReader;
+use crate::syscall::user_access::copy_from_user_protected;
 
 pub struct SysSchedSetaffinity;
 
@@ -21,14 +19,23 @@ impl Syscall for SysSchedSetaffinity {
         3
     }
 
-    fn handle(&self, args: &[usize], frame: &mut TrapFrame) -> Result<usize, SystemError> {
+    fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pid = args[0] as i32;
-        let size = args[1];
+        let size = args[1] as u32 as usize;
         let set_vaddr = args[2];
 
-        if size == 0 {
-            return Err(SystemError::EINVAL);
+        // Linux copies the truncated user mask before looking up the task.
+        // A zero length does not touch the pointer, but PID/permission errors
+        // still take precedence over the eventual empty-mask error.
+        let kernel_mask_bytes = CpuMask::new().inner().size();
+        let copy_len = core::cmp::min(size, kernel_mask_bytes);
+        let mut user_set = vec![0u8; kernel_mask_bytes];
+        if copy_len != 0 {
+            unsafe {
+                copy_from_user_protected(&mut user_set[..copy_len], VirtAddr::new(set_vaddr))?
+            };
         }
+        let mask = Self::parse_user_mask(&user_set);
 
         let target_pcb = if pid == 0 {
             ProcessManager::current_pcb()
@@ -37,41 +44,25 @@ impl Syscall for SysSchedSetaffinity {
                 .ok_or(SystemError::ESRCH)?
         };
 
+        if target_pcb.flags().contains(ProcessFlags::KTHREAD) {
+            let worker_private = target_pcb.worker_private();
+            let is_per_cpu = worker_private
+                .as_ref()
+                .and_then(|private| private.kernel_thread())
+                .is_some_and(|private| private.flags().contains(KernelThreadFlags::IS_PER_CPU));
+            if is_per_cpu {
+                return Err(SystemError::EINVAL);
+            }
+        }
+
         let current_pcb = ProcessManager::current_pcb();
         if !has_sched_setaffinity_permission(&current_pcb, &target_pcb) {
             return Err(SystemError::EPERM);
         }
 
-        let reader = UserBufferReader::new(set_vaddr as *const u8, size, frame.is_from_user())?;
-        let user_set = reader.buffer(0)?;
-        let mask = Self::parse_user_mask(user_set)?;
-
-        if mask.is_empty() {
-            return Err(SystemError::EINVAL);
-        }
-
-        let possible_cpus = smp_cpu_manager().possible_cpus();
-        for cpu in mask.iter_cpu() {
-            if possible_cpus.get(cpu) != Some(true) {
-                return Err(SystemError::EINVAL);
-            }
-        }
-
-        {
-            let _placement_guard = target_pcb.sched_info().placement_lock();
-            target_pcb.sched_info().set_cpus_allowed(mask.clone());
-        }
-
-        if target_pcb.sched_info().is_new_task() {
-            return Ok(0);
-        }
-
-        if let Some(cpu) = target_pcb.sched_info().on_cpu() {
-            if !mask.get(cpu).unwrap_or(false) {
-                let dest_cpu = select_task_rq(&target_pcb, cpu, crate::sched::WakeupFlags::WF_TTWU);
-                request_task_migration(&target_pcb, dest_cpu)?;
-            }
-        }
+        // Keep affinity publication and the corresponding placement decision
+        // in one pi_lock critical section inside the process manager.
+        crate::cgroup::cpuset::set_user_affinity(&target_pcb, mask)?;
 
         Ok(0)
     }
@@ -86,12 +77,9 @@ impl Syscall for SysSchedSetaffinity {
 }
 
 impl SysSchedSetaffinity {
-    fn parse_user_mask(user_set: &[u8]) -> Result<CpuMask, SystemError> {
+    fn parse_user_mask(user_set: &[u8]) -> CpuMask {
         let mut mask = CpuMask::new();
-        let kernel_mask_bytes = unsafe { mask.inner().as_bytes().len() };
-        let parse_len = core::cmp::min(user_set.len(), kernel_mask_bytes);
-
-        for (byte_index, byte) in user_set[..parse_len].iter().enumerate() {
+        for (byte_index, byte) in user_set.iter().enumerate() {
             if *byte == 0 {
                 continue;
             }
@@ -103,17 +91,10 @@ impl SysSchedSetaffinity {
 
                 let cpu_index = byte_index * 8 + bit;
                 let cpu_id = crate::smp::cpu::ProcessorId::new(cpu_index as u32);
-                if mask.set(cpu_id, true).is_none() {
-                    return Err(SystemError::EINVAL);
-                }
+                mask.set(cpu_id, true);
             }
         }
-
-        if user_set[parse_len..].iter().any(|byte| *byte != 0) {
-            return Err(SystemError::EINVAL);
-        }
-
-        Ok(mask)
+        mask
     }
 }
 

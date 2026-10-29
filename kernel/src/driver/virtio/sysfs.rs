@@ -20,9 +20,8 @@ use crate::{
             kobject::KObject,
             subsys::SubSysPrivate,
         },
-        virtio::irq::{virtio_irq_manager, DefaultVirtioIrqHandler},
+        virtio::irq::virtio_irq_manager,
     },
-    exception::{irqdesc::IrqHandleFlags, manage::irq_manager},
     filesystem::{
         sysfs::{
             file::sysfs_emit_str, Attribute, AttributeGroup, SysFSOpsSupport, SYSFS_ATTR_MODE_RO,
@@ -98,8 +97,25 @@ impl Bus for VirtIOBus {
         return virtio_drv.probe(&virtio_dev);
     }
 
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let virtio_drv = drv.cast::<dyn VirtIODriver>().map_err(|_| {
+            error!(
+                "VirtIOBus::remove() failed: device.driver() is not a VirtioDriver. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        let virtio_dev = device.clone().cast::<dyn VirtIODevice>().map_err(|_| {
+            error!(
+                "VirtIOBus::remove() failed: device is not a VirtIODevice. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        return virtio_drv.remove(&virtio_dev);
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {
@@ -248,22 +264,6 @@ impl VirtIODeviceManager {
             return Ok(());
         }
         let irq = irq.unwrap();
-        if let Err(e) = irq_manager().request_irq(
-            irq,
-            dev.device_name(),
-            &DefaultVirtioIrqHandler,
-            IrqHandleFlags::IRQF_SHARED,
-            Some(dev.dev_id().clone()),
-        ) {
-            error!(
-                "Failed to request irq for virtio device '{}': irq: {:?}, error {:?}",
-                dev.device_name(),
-                irq,
-                e
-            );
-            return Err(e);
-        }
-
         virtio_irq_manager()
             .register_device(dev.clone())
             .map_err(|e| {

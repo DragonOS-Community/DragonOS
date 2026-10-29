@@ -22,6 +22,18 @@ fn debugfs_init() -> Result<(), SystemError> {
     }
     super::tracing::init_debugfs_tracing()?;
     super::rcu::init_debugfs_rcu()?;
+    super::errseq::init_debugfs_errseq()?;
+    super::block::init_debugfs_block()?;
+    super::bpf::init_debugfs_bpf()?;
+    super::ext4::init_debugfs_ext4()?;
+    super::fuse::init_debugfs_fuse()?;
+    super::kthread::init_debugfs_kthread()?;
+    super::rng::init_debugfs_rng()?;
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    super::mm::init_debugfs_mm()?;
+    super::page_cache::init_debugfs_page_cache()?;
+    super::timekeeping::init_debugfs_timekeeping()?;
+    super::vfs::init_debugfs_vfs()?;
     return Ok(());
 }
 

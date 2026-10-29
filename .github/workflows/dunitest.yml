@@ -9,7 +9,10 @@ on:
 
 env:
   ARCH: x86_64
+  KERNEL_FEATURES: mm_selftest,sched_selftest
   HOME: /root
+  # The CI container has no Docker daemon; use the archive-backed manifest.
+  ROOTFS_MANIFEST: default
   RUSTUP_DIST_SERVER: "https://rsproxy.cn"
   RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
 
@@ -17,17 +20,115 @@ jobs:
   dunitest:
     name: Dunitest
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Allow the 30-minute guest test budget plus build, cleanup, and diagnostics.
+    timeout-minutes: 50
     container:
-      image: dragonos/dragonos-dev:v1.23
+      image: dragonos/dragonos-dev:v1.24
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
         uses: actions/checkout@v4
 
+      - name: Validate memory acceptance tooling
+        run: python3 -m unittest discover -s tools/agent_memory -p 'test_*.py'
+
       - name: Change source
         run: |
-          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+          find . -type f \( -name "*.toml" -o -name "Makefile" -o -name "Cargo.lock" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+
+      - name: Validate VirtIO queue CPU storage
+        shell: bash -ileo pipefail {0}
+        run: |
+          source /root/.cargo/env
+          cargo test --manifest-path kernel/crates/virtio-drivers/Cargo.toml --locked
+          cargo check --manifest-path kernel/crates/virtio-drivers/Cargo.toml --locked --no-default-features
+
+      - name: Require MM regression tests
+        shell: bash
+        run: |
+          # MM selftests and migrated syscall coverage must execute, never silently skip.
+          # Do not append tests already required by the base no_skip.txt.
+          cat >> user/apps/tests/dunitest/no_skip.txt <<'EOF'
+          normal/vmalloc_selftest
+          normal/page_migration_prerequisites
+          normal/page_migration
+          normal/page_compaction
+          normal/test_tlb_shootdown
+          normal/shared_page_migration
+          normal/page_retirement
+          normal/kernel_buffer_selftest
+          normal/overlay_xattr_selftest
+          normal/xattr_syscall_selftest
+          normal/xattr_syscall
+          normal/read_buffer_semantics
+          normal/ext4_user_read
+          normal/shared_file_position
+          normal/read_fault_semantics
+          normal/fuse_read_fault
+          normal/fuse_write_privileges
+          normal/read_buffer_selftest
+          normal/recvmsg_record_buffer
+          normal/socket_receive_contracts
+          normal/tcp_waitall_flags
+          normal/unix_close_record_reset
+          normal/socket_receive_interrupt
+          normal/socket_receive_admission
+          normal/tcp_scalar_receive
+          normal/inet_bind_policy
+          normal/tcp_receive_window_reopen
+          normal/allocation_diagnostics
+          normal/dma_allocator_selftest
+          normal/ext4_orphan_recovery
+          normal/ext4_nested_writeback
+          normal/ext4_shared_xattr
+          normal/pipe_write_fault
+          normal/pipe_transfer_copy
+          normal/pipe_transfer_state
+          normal/pipe_metadata
+          normal/user_namespace_id_map
+          normal/user_namespace_admission
+          normal/direct_write_semantics
+          normal/direct_read_semantics
+          normal/directory_read_admission
+          normal/timerfd_semantics
+          normal/proc_write_admission
+          normal/pipe_empty_slot
+          normal/preadv2_flags
+          normal/pwritev2_flags
+          normal/pwritev2_sync
+          normal/legacy_writev_semantics
+          normal/position_read_semantics
+          normal/proc_write_position
+          normal/kernfs_write_policy
+          normal/sysfs_write_policy
+          normal/debugfs_write_policy
+          normal/iov_snapshot_semantics
+          normal/page_cache_accounting
+          normal/vector_write_privileges
+          normal/write_capability_admission
+          normal/primary_write_transaction
+          normal/fat_timestamps
+          normal/fat_directory_entries
+          normal/sysfs_statfs
+          normal/block_device_ioctl
+          normal/loop_lifecycle_io
+          normal/loop_legacy_status
+          normal/loop_backing_io
+          normal/loop_admission
+          normal/loop_partscan
+          normal/loop_block_cache
+          normal/block_ext4_cache
+          normal/inotify_read_order
+          normal/file_owner_notifications
+          normal/tcp_urgent
+          normal/tcp_icmp_errors
+          normal/loop_logical_block_size
+          normal/block_soft_size
+          normal/fat_rename_atomicity
+          normal/fat_rename_aliases
+          normal/mount_forced_readonly_selftest
+          normal/ext4_write_progress
+          EOF
 
       - name: Build DragonOS
         shell: bash -ileo pipefail {0}
@@ -41,3 +142,11 @@ jobs:
           DISK_SAVE_MODE: "1"
         run: |
           make test-dunit
+
+      - name: Preserve dunitest serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunitest-serial-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: serial_opt.txt
+          if-no-files-found: error

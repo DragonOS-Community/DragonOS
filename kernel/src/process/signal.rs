@@ -22,20 +22,59 @@ impl ProcessManager {
 }
 
 impl ProcessControlBlock {
+    pub fn process_signal(&self) -> Arc<crate::ipc::process_signal::ProcessSignalState> {
+        self.process_signal.load()
+    }
+
+    pub(super) fn replace_process_signal(
+        &self,
+        new: Arc<crate::ipc::process_signal::ProcessSignalState>,
+    ) {
+        let old = self.with_task_lock_irqsave(|| {
+            // SAFETY: task_lock serializes slot writers; `old` owns the
+            // removed slot reference until all RCU readers have finished.
+            unsafe { self.process_signal.swap(new) }
+        });
+        if let Err(old) = crate::rcu::try_rcu_defer_drop_arc(old) {
+            crate::rcu::synchronize_rcu_noalloc();
+            drop(old);
+        }
+    }
+
+    pub fn with_task_lock_irqsave<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _task_guard = self.task_lock.lock_irqsave();
+        f()
+    }
+
     pub fn sighand(&self) -> Arc<SigHand> {
         self.sighand.load()
     }
 
     pub fn replace_sighand(&self, new: Arc<SigHand>) {
-        let _task_guard = self.task_lock.lock_irqsave();
-        new.attach_task_ref();
-        let old = self.sighand.swap(new.clone());
-        if Arc::ptr_eq(&old, &new) {
-            new.detach_task_ref();
-            return;
-        }
+        let retired = self.with_task_lock_irqsave(|| {
+            new.attach_task_ref();
+            // SAFETY: task_lock serializes sighand writers. If old and new
+            // share an allocation, the replacement slot reference publishes
+            // it continuously. Otherwise the returned `old` keeps the removed
+            // allocation alive across the unlock-to-retire handoff below.
+            let old = unsafe { self.sighand.swap(new.clone()) };
+            if Arc::ptr_eq(&old, &new) {
+                new.detach_task_ref();
+                return None;
+            }
 
-        old.detach_task_ref();
-        crate::rcu::rcu_defer_drop(old);
+            old.detach_task_ref();
+            Some(old)
+        });
+
+        if let Some(old) = retired {
+            // Callback allocation/queueing and either fallback may run
+            // arbitrary allocator/destructor code. Keep all of them outside
+            // the irq-disabled task writer critical section.
+            if let Err(old) = crate::rcu::try_rcu_defer_drop_arc(old) {
+                crate::rcu::synchronize_rcu_noalloc();
+                drop(old);
+            }
+        }
     }
 }

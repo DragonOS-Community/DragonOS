@@ -123,8 +123,7 @@ fn collect_build_info() -> KernelBuildInfo {
 
 fn generate_rust_code(build_info: &KernelBuildInfo) -> String {
     format!(
-        r#"
-#![allow(dead_code)]
+        r#"#![allow(dead_code)]
 // Auto-generated version information file, do not modify
 // Generated at: {}
 

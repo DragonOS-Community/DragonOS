@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V0.2.0 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../../" id="documentation_options" src="../../../../../_static/documentation_options.js"></script>
+        <script src="../../../../../_static/jquery.js"></script>
+        <script src="../../../../../_static/underscore.js"></script>
+        <script src="../../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../../_static/doctools.js"></script>
+        <script src="../../../../../_static/translations.js"></script>
+    <script src="../../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../../search.html" />
+    <link rel="next" title="V0.1.10" href="../V0.1.x/V0.1.10.html" />
+    <link rel="prev" title="Release Notes" href="../index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/ipc/index.html">Inter-Process Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../kernel/syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html">Release Notes</a><ul class="current">
+<li class="toctree-l3 current"><a class="current reference internal" href="#">V0.2.0</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#executive-summary">📌 Executive Summary</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#major-changes-potential-incompatibilities-breaking-important-changes">⚠️ Major Changes &amp; Potential Incompatibilities (Breaking / Important Changes)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#new-enhanced-features-features-enhancements">✨ New / Enhanced Features (Features &amp; Enhancements)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#performance-resource-usage-performance-footprint">🚀 Performance &amp; Resource Usage (Performance &amp; Footprint)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#stability-critical-fixes-stability-fixes">🛠 Stability &amp; Critical Fixes (Stability &amp; Fixes)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#new-system-call-list-partial">🧾 New System Call List (Partial)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#development-build-experience-dev-experience">🧪 Development &amp; Build Experience (Dev Experience)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#contributors-partial-by-commit-activity-alphabetical">🙌 Contributors (Partial, by Commit Activity / Alphabetical)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#smoke-test-checklist">✅ Smoke Test Checklist</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#acknowledgements">🙏 Acknowledgements</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#appendix-keyword-index-for-easy-lookup">🔎 Appendix: Keyword Index (for Easy Lookup)</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.10.html">V0.1.10</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.9.html">V0.1.9</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.8.html">V0.1.8</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.7.html">V0.1.7</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.6.html">V0.1.6</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.5.html">V0.1.5</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.4.html">V0.1.4</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.3.html">V0.1.3</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.2.html">V0.1.2</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.1.html">V0.1.1</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../V0.1.x/V0.1.0.html">V0.1.0</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="../index.html">Release Notes</a></li>
+      <li class="breadcrumb-item active">V0.2.0</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/locales/en/community/ChangeLog/V0.2.x/V0.2.0.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: community/ChangeLog/V0.2.x/V0.2.0.md</p></li>
+<li><p>Translation time: 2025-08-22 15:19:44</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="v0-2-0">
+<h1>V0.2.0<a class="headerlink" href="#v0-2-0" title="Permalink to this heading"></a></h1>
+<blockquote>
+<div><p>Release Date: 2025-08-22</p>
+</div></blockquote>
+<blockquote>
+<div><p>Version Positioning: 0.2.0 is a milestone version of DragonOS in the three dimensions of “usability, observability, and extensibility” — introducing support for <strong>ext4, dynamic linking, eBPF, virtualization, namespaces (initial PID/Mount/User), multi-architecture (x86_64 / RISC-V64 / LoongArch64)</strong>, as well as significant restructuring of the system call subsystem and memory/file cache subsystems, laying the foundation for containerization, networking, and scheduling enhancements in subsequent 0.3.x versions.</p>
+</div></blockquote>
+<hr class="docutils" />
+<section id="executive-summary">
+<h2>📌 Executive Summary<a class="headerlink" href="#executive-summary" title="Permalink to this heading"></a></h2>
+<p><strong>Key Highlights:</strong></p>
+<ol class="arabic simple">
+<li><p><strong>File System &amp; Storage</strong>: Added ext4; completed mount/umount2; implemented gendisk/partition scanning; <code class="docutils literal notranslate"><span class="pre">/proc/mounts</span></code>; systematic page cache and file mapping; experimental overlayfs support; improved FAT &amp; VFS metadata (statx / newfstatat).</p></li>
+<li><p><strong>Processes &amp; Namespaces</strong>: Introduced PID Namespace, Mount Namespace, Namespace Proxy; implemented <code class="docutils literal notranslate"><span class="pre">unshare()</span></code>; improved process group / Session / TTY job control; enhanced <code class="docutils literal notranslate"><span class="pre">/proc</span></code> process information.</p></li>
+<li><p><strong>Memory &amp; Virtual Memory</strong>: mmap lazy allocation, <code class="docutils literal notranslate"><span class="pre">msync</span></code>, private/shared file mappings; PageCache dirty page synchronization/recycling; multiple stack usage optimizations and stack overflow fixes; improved SLAB and buddy recycling.</p></li>
+<li><p><strong>Observability &amp; Extensibility</strong>: Initial eBPF support (rbpf → mainline / kprobe / tracepoint / Aya ecosystem); tracepoint framework; static keys.</p></li>
+<li><p><strong>Virtualization</strong>: Introduced KVM/VMX basic framework and EPT; cleaned up old KVM code; improved boot stability.</p></li>
+<li><p><strong>Architecture</strong>: Added LoongArch64 boot &amp; early exception handling; RISC-V64 improvements; multi-boot protocol abstraction (Multiboot2 / HVM / Serial Console / Framebuffer).</p></li>
+<li><p><strong>System Calls &amp; Kernel Structure</strong>: Unified syscall table; modular migration of numerous subsystems; <code class="docutils literal notranslate"><span class="pre">ERESTARTSYS</span></code> mechanism; added/completed numerous system calls (poll/epoll/select, eventfd, execveat, unshare, msync, etc.).</p></li>
+<li><p><strong>Security &amp; Permissions</strong>: Cred framework (UID/GID/FSUID/permission determination); <code class="docutils literal notranslate"><span class="pre">set*id</span> <span class="pre">/</span> <span class="pre">setres*</span></code>; <code class="docutils literal notranslate"><span class="pre">chown/chmod</span></code> migration and fixes.</p></li>
+<li><p><strong>Devices &amp; I/O</strong>: virtio console, virtio blk partition recognition, loopback network card, TTY + epoll, HVC, PCI configuration space access, network device sysfs registration.</p></li>
+<li><p><strong>Toolchain &amp; Ecosystem</strong>: Dynamic linking (ELF interpreter); Dadk 0.2.0 accelerated builds; unified user-space program builds; experimental integration with Tokio single-threaded runtime; automated documentation translation and versioning.</p></li>
+<li><p><strong>Stability &amp; Quality</strong>: Fixed numerous stack frames/deadlocks/memory overflows/races/signals/wait semantics/PageCache issues; improved backtrace/unwind; unified logging system.</p></li>
+</ol>
+</section>
+<hr class="docutils" />
+<section id="major-changes-potential-incompatibilities-breaking-important-changes">
+<h2>⚠️ Major Changes &amp; Potential Incompatibilities (Breaking / Important Changes)<a class="headerlink" href="#major-changes-potential-incompatibilities-breaking-important-changes" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Dadk upgraded to 0.2.0: Legacy configurations are incompatible; migration required per new documentation.</p></li>
+<li><p>Syscall structure reorganization: Subsystems migrated to table-driven architecture; custom patches need adaptation.</p></li>
+<li><p>Default kernel stack size increased from 16K → 32K, with Guard Pages / write protection (x86_64).</p></li>
+<li><p>PageCache semantics upgraded: <code class="docutils literal notranslate"><span class="pre">mmap</span></code> + direct reads/writes now require <code class="docutils literal notranslate"><span class="pre">msync</span></code>; legacy behavior assumptions need adjustment.</p></li>
+<li><p>Namespace architecture initial: Interfaces may change in the future (still experimental).</p></li>
+<li><p>eBPF interface in early form: Maps / Helpers / type restrictions may change later.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="new-enhanced-features-features-enhancements">
+<h2>✨ New / Enhanced Features (Features &amp; Enhancements)<a class="headerlink" href="#new-enhanced-features-features-enhancements" title="Permalink to this heading"></a></h2>
+<section id="file-systems-vfs">
+<h3>1. File Systems &amp; VFS<a class="headerlink" href="#file-systems-vfs" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>ext4</strong>: Integrated based on another_ext4, mountable from block devices.</p></li>
+<li><p><strong>mount/umount2</strong>: Real block device mount chain + partition scanning (MBR); supports MountFlags; <code class="docutils literal notranslate"><span class="pre">/proc/mounts</span></code>.</p></li>
+<li><p><strong>overlayfs (experimental)</strong>: Multiple read-only layers + top-layer write copy-up + whiteout.</p></li>
+<li><p>gendisk abstraction; virtio disk as root filesystem; automatic block device registration in devfs.</p></li>
+<li><p>FAT/vfat: <code class="docutils literal notranslate"><span class="pre">rename/move</span></code> refactored; <code class="docutils literal notranslate"><span class="pre">statx</span></code> creation time (btime); file mapping; page cache sync fixes.</p></li>
+<li><p>VFS: <code class="docutils literal notranslate"><span class="pre">statx/newfstatat</span></code>, <code class="docutils literal notranslate"><span class="pre">faccessat2</span></code>, <code class="docutils literal notranslate"><span class="pre">linkat/renameat2</span></code>, <code class="docutils literal notranslate"><span class="pre">readlinkat</span></code>, etc.; split open/close/stat/ioctl; LookUpFlags; <code class="docutils literal notranslate"><span class="pre">/proc</span></code> extended (kthread marking / FD occupancy / exe link / run/start times / TTY info).</p></li>
+</ul>
+</section>
+<section id="processes-namespaces-sessions">
+<h3>2. Processes / Namespaces / Sessions<a class="headerlink" href="#processes-namespaces-sessions" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>PID Namespace: ID mapping and isolation; nsproxy unified mounting.</p></li>
+<li><p>Mount Namespace: Isolated root mount tree.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">unshare()</span></code>: New namespace creation (currently covers PID/Mount basics).</p></li>
+<li><p>Session / Process Group: Complete job control; TTY foreground process group signals (SIGINT, etc.); <code class="docutils literal notranslate"><span class="pre">wait4</span></code> fixes.</p></li>
+<li><p>Reboot process enhanced (magic verification / multiple cmd reservations).</p></li>
+</ul>
+</section>
+<section id="memory-management-mm">
+<h3>3. Memory Management (MM)<a class="headerlink" href="#memory-management-mm" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">mmap</span></code> lazy allocation / <code class="docutils literal notranslate"><span class="pre">msync</span></code> / <code class="docutils literal notranslate"><span class="pre">mprotect</span></code> fixes / <code class="docutils literal notranslate"><span class="pre">madvise</span></code> / <code class="docutils literal notranslate"><span class="pre">msync</span></code> table integration.</p></li>
+<li><p>PageCache: ID management, page writeback, dirty page cleaning, recycling thread, multi-mapping consistency fixes.</p></li>
+<li><p>SLAB → buddy release path completion; stack overflow detection (clippy); large function splitting to reduce stack usage.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mincore()</span></code> placeholder returns <code class="docutils literal notranslate"><span class="pre">ENOSYS</span></code>; <code class="docutils literal notranslate"><span class="pre">truncate_inode_pages</span></code> framework.</p></li>
+</ul>
+</section>
+<section id="observability-ebpf">
+<h3>4. Observability &amp; eBPF<a class="headerlink" href="#observability-ebpf" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">bpf()</span></code>: Initial Maps / kprobe / statistical examples; rbpf upgraded → mainline; Aya-compatible templates.</p></li>
+<li><p>Tracepoint framework; static key support for hotspot condition enabling.</p></li>
+</ul>
+</section>
+<section id="virtualization-platform">
+<h3>5. Virtualization &amp; Platform<a class="headerlink" href="#virtualization-platform" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Initial KVM/VMX + EPT; old KVM code cleaned up.</p></li>
+<li><p>HVM / Multiboot2 / boot command line parsing (Arg/KV/EarlyKV).</p></li>
+<li><p>LoongArch64: Boot into <code class="docutils literal notranslate"><span class="pre">kernel_main</span></code> + exception handling; RISC-V64 runs Rust HelloWorld; multi-platform serial/console abstraction; Serial Console + nographic.</p></li>
+</ul>
+</section>
+<section id="devices-i-o">
+<h3>6. Devices &amp; I/O<a class="headerlink" href="#devices-i-o" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>virtio console (HVC); virtio blk/net/console interrupt naming improvements; PCI configuration space access (portio).</p></li>
+<li><p>Loopback network card; network device sysfs nodes and attributes; DHCP stability.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">eventfd</span></code> / <code class="docutils literal notranslate"><span class="pre">epoll</span></code> / <code class="docutils literal notranslate"><span class="pre">poll</span></code> / <code class="docutils literal notranslate"><span class="pre">ppoll</span></code> / <code class="docutils literal notranslate"><span class="pre">select</span></code> / <code class="docutils literal notranslate"><span class="pre">pselect6</span></code>: Consistent wait/timeout/signal handling.</p></li>
+<li><p>TTY: Adapted to epoll; control character parsing; baud rate/termios; tab/erase fixes; SIGINT broadcasting.</p></li>
+</ul>
+</section>
+<section id="security-accounts">
+<h3>7. Security &amp; Accounts<a class="headerlink" href="#security-accounts" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Cred framework: UID/EUID/FSUID/GID/group lists; <code class="docutils literal notranslate"><span class="pre">seteuid/setegid/setres*</span></code>; <code class="docutils literal notranslate"><span class="pre">chown/chmod/fchownat/lchown</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get/setgroups</span></code>; <code class="docutils literal notranslate"><span class="pre">umask</span></code> type transformation; <code class="docutils literal notranslate"><span class="pre">/proc</span></code> status name refinement.</p></li>
+</ul>
+</section>
+<section id="system-call-subsystem">
+<h3>8. System Call Subsystem<a class="headerlink" href="#system-call-subsystem" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Unified syscall table; <code class="docutils literal notranslate"><span class="pre">ERESTARTSYS</span></code>; batch migration (process/mm/vfs/ipc).</p></li>
+<li><p>Added/completed: <code class="docutils literal notranslate"><span class="pre">mount</span></code>, <code class="docutils literal notranslate"><span class="pre">umount2</span></code>, <code class="docutils literal notranslate"><span class="pre">eventfd</span></code>, <code class="docutils literal notranslate"><span class="pre">poll/ppoll/select/pselect6</span></code>, <code class="docutils literal notranslate"><span class="pre">epoll</span></code> refactored, <code class="docutils literal notranslate"><span class="pre">fchdir</span></code>, <code class="docutils literal notranslate"><span class="pre">mkdirat/mkdirat2</span></code>, <code class="docutils literal notranslate"><span class="pre">utimensat/utimes</span></code>, <code class="docutils literal notranslate"><span class="pre">newfstatat/statx</span></code>, <code class="docutils literal notranslate"><span class="pre">execveat</span></code>, <code class="docutils literal notranslate"><span class="pre">unshare</span></code>, <code class="docutils literal notranslate"><span class="pre">set|getgroups</span></code>, <code class="docutils literal notranslate"><span class="pre">msync</span></code>, <code class="docutils literal notranslate"><span class="pre">madvise</span></code>, <code class="docutils literal notranslate"><span class="pre">mremap</span></code>, <code class="docutils literal notranslate"><span class="pre">mprotect</span></code>, <code class="docutils literal notranslate"><span class="pre">brk/sbrk</span></code>, <code class="docutils literal notranslate"><span class="pre">reboot</span></code> enhanced, <code class="docutils literal notranslate"><span class="pre">rt_sigpending</span></code>, <code class="docutils literal notranslate"><span class="pre">mincore(ENOSYS)</span></code>, etc.</p></li>
+</ul>
+</section>
+<section id="toolchain-build-documentation">
+<h3>9. Toolchain / Build / Documentation<a class="headerlink" href="#toolchain-build-documentation" title="Permalink to this heading"></a></h3>
+<ul class="simple">
+<li><p>Dadk 0.2.0: Image lifecycle management / build acceleration / profiling.</p></li>
+<li><p>Unified user program builds: Rust + C; example Rust applications.</p></li>
+<li><p>Dynamic linking ELF interpreter; busybox boot mode &amp; NovaShell/DragonReach evolution.</p></li>
+<li><p>Automated documentation translation, multilingual, multi-version Sphinx; footer shows commit; README / Q&amp;A / namespace docs updated.</p></li>
+<li><p>CI: Docker build caching, branch-triggered, auto image pushing, MinIO/S3 distribution, loongarch64 QEMU builds, toolchain nightly locking, backtrace/unwind upgrades, stack overflow tests.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="performance-resource-usage-performance-footprint">
+<h2>🚀 Performance &amp; Resource Usage (Performance &amp; Footprint)<a class="headerlink" href="#performance-resource-usage-performance-footprint" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Reduced multiple large stack frames: IRQ initialization split, ACPI table reading macro-ized, process create/memory pool structures rewritten (Vec replacing large arrays).</p></li>
+<li><p>PageCache secondary mapping write panic fixes → improved mmap IO coherence; reduced copies.</p></li>
+<li><p>SLAB free page recycling → buddy, reducing resident memory.</p></li>
+<li><p>Early detection of illegal writes via write protection + Guard Pages.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="stability-critical-fixes-stability-fixes">
+<h2>🛠 Stability &amp; Critical Fixes (Stability &amp; Fixes)<a class="headerlink" href="#stability-critical-fixes-stability-fixes" title="Permalink to this heading"></a></h2>
+<p>Representative fixes:</p>
+<ul class="simple">
+<li><p>Wait/process: <code class="docutils literal notranslate"><span class="pre">wait/wait4</span></code> semantics, <code class="docutils literal notranslate"><span class="pre">do_wait</span></code> lock release, blocked child process handling.</p></li>
+<li><p>I/O Multiplexing: epoll inode reference release, epoll timeout/wake broadcast, poll boundary/RestartBlock.</p></li>
+<li><p>Pipes/Signals: pipe/FIFO non-blocking + signal/kill semantics; blocked pipes can be killed; named pipes POSIX behavior.</p></li>
+<li><p>PageCache: mmap multi-instance consistency; panic on writeback of dropped address space; <code class="docutils literal notranslate"><span class="pre">unlink</span></code> post dirty page handling.</p></li>
+<li><p>Futex: User-space address safety <code class="docutils literal notranslate"><span class="pre">safe_read/safe_write</span></code>; robust list.</p></li>
+<li><p>Signals: Default handler restoration; SIGINT distribution; KILL pid=1 feedback; pending not masked checks; <code class="docutils literal notranslate"><span class="pre">execve</span></code> error propagation.</p></li>
+<li><p>TTY: Foreground process group null error; init early character input crash; tab expansion out-of-bounds.</p></li>
+<li><p>Timers: Insertion boundaries; <code class="docutils literal notranslate"><span class="pre">sleep</span></code> interrupted by signals <code class="docutils literal notranslate"><span class="pre">ERESTARTSYS</span></code>.</p></li>
+<li><p>Races/Memory: slab UAF/overflows; nttyData stack overflow; buddy construction large stack frames; incorrect kernel address RIP output.</p></li>
+<li><p>File Systems: <code class="docutils literal notranslate"><span class="pre">getcwd</span></code> semantics; <code class="docutils literal notranslate"><span class="pre">read</span> <span class="pre">O_PATH</span></code> validation; <code class="docutils literal notranslate"><span class="pre">unlink</span></code> post dirty cleanup; remount errors; <code class="docutils literal notranslate"><span class="pre">mprotect</span> <span class="pre">vm_flags</span></code>.</p></li>
+<li><p>ELF: Interpreter path read bounds; <code class="docutils literal notranslate"><span class="pre">execve</span></code> failure error codes.</p></li>
+<li><p>Multiplexing: <code class="docutils literal notranslate"><span class="pre">select/pselect6</span></code> early compilation issues.</p></li>
+<li><p>virtio/PCI: Multi-device interrupt conflicts; PCI initialization order; virtio net interrupt handling.</p></li>
+<li><p>Networking: DHCP NIC order; loopback / poll listen states.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="new-system-call-list-partial">
+<h2>🧾 New System Call List (Partial)<a class="headerlink" href="#new-system-call-list-partial" title="Permalink to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">mount</span></code>, <code class="docutils literal notranslate"><span class="pre">umount2</span></code>, <code class="docutils literal notranslate"><span class="pre">fchdir</span></code>, <code class="docutils literal notranslate"><span class="pre">mkdirat/mkdirat2</span></code>, <code class="docutils literal notranslate"><span class="pre">linkat/renameat/renameat2</span></code>, <code class="docutils literal notranslate"><span class="pre">newfstatat</span></code>, <code class="docutils literal notranslate"><span class="pre">statx</span></code>, <code class="docutils literal notranslate"><span class="pre">readlinkat</span></code>, <code class="docutils literal notranslate"><span class="pre">faccessat/faccessat2</span></code>, <code class="docutils literal notranslate"><span class="pre">eventfd</span></code>, <code class="docutils literal notranslate"><span class="pre">poll</span></code>, <code class="docutils literal notranslate"><span class="pre">ppoll</span></code>, <code class="docutils literal notranslate"><span class="pre">select</span></code>, <code class="docutils literal notranslate"><span class="pre">pselect6</span></code>, <code class="docutils literal notranslate"><span class="pre">epoll</span></code> (refactored), <code class="docutils literal notranslate"><span class="pre">utimensat</span></code>, <code class="docutils literal notranslate"><span class="pre">utimes</span></code>, <code class="docutils literal notranslate"><span class="pre">msync</span></code>, <code class="docutils literal notranslate"><span class="pre">madvise</span></code>, <code class="docutils literal notranslate"><span class="pre">mremap</span></code>, <code class="docutils literal notranslate"><span class="pre">mprotect</span></code>, <code class="docutils literal notranslate"><span class="pre">brk/sbrk</span></code> (tabled), <code class="docutils literal notranslate"><span class="pre">execveat</span></code>, <code class="docutils literal notranslate"><span class="pre">unshare</span></code>, <code class="docutils literal notranslate"><span class="pre">setgroups/getgroups</span></code>, <code class="docutils literal notranslate"><span class="pre">rt_sigpending</span></code>, <code class="docutils literal notranslate"><span class="pre">reboot</span></code> (enhanced), <code class="docutils literal notranslate"><span class="pre">mincore(ENOSYS)</span></code> …</p>
+</section>
+<hr class="docutils" />
+<section id="development-build-experience-dev-experience">
+<h2>🧪 Development &amp; Build Experience (Dev Experience)<a class="headerlink" href="#development-build-experience-dev-experience" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Dadk 0.2.0: Unified image creation / mounting / unmounting; build acceleration; profiling.</p></li>
+<li><p>User Programs: Unified Rust + C build pipelines; Rust examples.</p></li>
+<li><p>Toolchain: Fixed nightly versions &amp; upgrade scripts; multi-architecture cross-toolchain scripts.</p></li>
+<li><p>Documentation: Automated translation &amp; stale content cleanup; bilingual (EN/zh); FAQ / build issue guidance.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="contributors-partial-by-commit-activity-alphabetical">
+<h2>🙌 Contributors (Partial, by Commit Activity / Alphabetical)<a class="headerlink" href="#contributors-partial-by-commit-activity-alphabetical" title="Permalink to this heading"></a></h2>
+<p>Thanks to all contributors for their ongoing efforts in kernel subsystems, file systems, virtualization, documentation, and toolchains.</p>
+<p>Special thanks to the following core contributors:</p>
+<ul class="simple">
+<li><p><strong>longjin</strong> - Project lead, numerous core feature implementations and restructurings</p></li>
+<li><p><strong>chenlinfeng (Godones)</strong> - eBPF, networking, file systems, etc.</p></li>
+<li><p><strong>sparkzky</strong> - TTY, process management, system call restructurings</p></li>
+<li><p><strong>MemoryShore</strong> - File systems, memory management, VFS</p></li>
+<li><p><strong>Samuel Dai</strong> - KVM, networking, drivers</p></li>
+<li><p><strong>黄铭涛</strong> - PCI, drivers, kernel optimizations</p></li>
+<li><p>And all other contributors!</p></li>
+</ul>
+<section id="contributors-for-this-release">
+<h3>Contributors for This Release<a class="headerlink" href="#contributors-for-this-release" title="Permalink to this heading"></a></h3>
+<p>LoGin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;DragonOS&#46;org">longjin<span>&#64;</span>DragonOS<span>&#46;</span>org</a>, <a class="reference external" href="mailto:jinlong&#37;&#52;&#48;tencent&#46;com">jinlong<span>&#64;</span>tencent<span>&#46;</span>com</a><br>
+linfeng: <a class="reference external" href="mailto:chenlinfeng25&#37;&#52;&#48;outlook&#46;com">chenlinfeng25<span>&#64;</span>outlook<span>&#46;</span>com</a>, <a class="reference external" href="mailto:1925466036&#37;&#52;&#48;qq&#46;com">1925466036<span>&#64;</span>qq<span>&#46;</span>com</a><br>
+火花 <a class="reference external" href="mailto:sparkhhhhhhhhhh&#37;&#52;&#48;outlook&#46;com">sparkhhhhhhhhhh<span>&#64;</span>outlook<span>&#46;</span>com</a>, <a class="reference external" href="mailto:146502758+sparkzky&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">146502758+sparkzky<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+MemoryShore: <a class="reference external" href="mailto:1353318529&#37;&#52;&#48;qq&#46;com">1353318529<span>&#64;</span>qq<span>&#46;</span>com</a>, <a class="reference external" href="mailto:105195940+MemoryShore&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">105195940+MemoryShore<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+黄铭涛: <a class="reference external" href="mailto:1037827920&#37;&#52;&#48;qq&#46;com">1037827920<span>&#64;</span>qq<span>&#46;</span>com</a>, <a class="reference external" href="mailto:114841534+1037827920&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">114841534+1037827920<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+Jomo <a class="reference external" href="mailto:xuzihao&#37;&#52;&#48;dragonos&#46;org">xuzihao<span>&#64;</span>dragonos<span>&#46;</span>org</a><br>
+Samuel Dai: <a class="reference external" href="mailto:samuka007&#37;&#52;&#48;dragonos&#46;org">samuka007<span>&#64;</span>dragonos<span>&#46;</span>org</a>, <a class="reference external" href="mailto:dailvchen&#37;&#52;&#48;dragonos&#46;org">dailvchen<span>&#64;</span>dragonos<span>&#46;</span>org</a><br>
+曾俊 <a class="reference external" href="mailto:110876916+ZZJJWarth&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">110876916+ZZJJWarth<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+kaleidoscope416 <a class="reference external" href="mailto:2448956191&#37;&#52;&#48;qq&#46;com">2448956191<span>&#64;</span>qq<span>&#46;</span>com</a><br>
+github-actions[bot] &lt;41898282+github-actions[bot]&#64;users.noreply.github.com&gt;<br>
+DoL <a class="reference external" href="mailto:1240800466&#37;&#52;&#48;qq&#46;com">1240800466<span>&#64;</span>qq<span>&#46;</span>com</a><br>
+donjuanplatinum <a class="reference external" href="mailto:113148619+donjuanplatinum&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">113148619+donjuanplatinum<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+chiichen <a class="reference external" href="mailto:chiichen&#37;&#52;&#48;qq&#46;com">chiichen<span>&#64;</span>qq<span>&#46;</span>com</a><br>
+BrahmaMantra <a class="reference external" href="mailto:140599389+BrahmaMantra&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">140599389+BrahmaMantra<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+Vitus: <a class="reference external" href="mailto:zhzvitus&#37;&#52;&#48;gmail&#46;com">zhzvitus<span>&#64;</span>gmail<span>&#46;</span>com</a>, <a class="reference external" href="mailto:144411726+Vitus213&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">144411726+Vitus213<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+YJwu2023 <a class="reference external" href="mailto:yujianwu2019&#37;&#52;&#48;gmail&#46;com">yujianwu2019<span>&#64;</span>gmail<span>&#46;</span>com</a><br>
+GnoCiYeH <a class="reference external" href="mailto:heyicong&#37;&#52;&#48;dragonos&#46;org">heyicong<span>&#64;</span>dragonos<span>&#46;</span>org</a><br>
+LIU Yuwei <a class="reference external" href="mailto:22045841+Marsman1996&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">22045841+Marsman1996<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+yuyi2439 <a class="reference external" href="mailto:68320855+yuyi2439&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">68320855+yuyi2439<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+codeironman <a class="reference external" href="mailto:1553389239&#37;&#52;&#48;qq&#46;com">1553389239<span>&#64;</span>qq<span>&#46;</span>com</a><br>
+EMasi <a class="reference external" href="mailto:1176949486&#37;&#52;&#48;qq&#46;com">1176949486<span>&#64;</span>qq<span>&#46;</span>com</a><br>
+SMALLC <a class="reference external" href="mailto:121806694+smallcjy&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">121806694+smallcjy<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+laokengwt <a class="reference external" href="mailto:143977175+laokengwt&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">143977175+laokengwt<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a><br>
+Godones <a class="reference external" href="mailto:chenlinfeng25&#37;&#52;&#48;outlook&#46;com">chenlinfeng25<span>&#64;</span>outlook<span>&#46;</span>com</a><br>
+oeasy1412 <a class="reference external" href="mailto:oeasy1412&#37;&#52;&#48;gmail&#46;com">oeasy1412<span>&#64;</span>gmail<span>&#46;</span>com</a><br>
+dragonosbot <a class="reference external" href="mailto:bot&#37;&#52;&#48;dragonos&#46;org">bot<span>&#64;</span>dragonos<span>&#46;</span>org</a><br>
+xiaolin2004 <a class="reference external" href="mailto:1553367438&#37;&#52;&#48;qq&#46;com">1553367438<span>&#64;</span>qq<span>&#46;</span>com</a>, <a class="reference external" href="mailto:109840258+xiaolin2004&#37;&#52;&#48;users&#46;noreply&#46;github&#46;com">109840258+xiaolin2004<span>&#64;</span>users<span>&#46;</span>noreply<span>&#46;</span>github<span>&#46;</span>com</a></p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="smoke-test-checklist">
+<h2>✅ Smoke Test Checklist<a class="headerlink" href="#smoke-test-checklist" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Basic Boot: x86_64 / riscv64 / loongarch64 (serial/graphical); check <code class="docutils literal notranslate"><span class="pre">/proc/mounts</span></code> <code class="docutils literal notranslate"><span class="pre">/proc/*/status</span></code>.</p></li>
+<li><p>Dynamic Linking: Run dynamically linked busybox / Rust programs.</p></li>
+<li><p>File Systems: Mount ext4 &amp; vfat; create/delete/rename; <code class="docutils literal notranslate"><span class="pre">mmap</span></code> + direct writes + <code class="docutils literal notranslate"><span class="pre">msync</span></code>.</p></li>
+<li><p>Process Control: Multiple shells / Ctrl+C / foreground/background switching.</p></li>
+<li><p>Networking: loopback ping / DHCP initialization logs.</p></li>
+<li><p>eBPF: Load example kprobe statistics program; read <code class="docutils literal notranslate"><span class="pre">trace_pipe</span></code>.</p></li>
+<li><p>poll/epoll: Run <code class="docutils literal notranslate"><span class="pre">test_poll</span></code> / <code class="docutils literal notranslate"><span class="pre">test_epoll</span></code>.</p></li>
+<li><p>Reboot: Execute reboot syscall (simulated).</p></li>
+<li><p>Namespaces: Test <code class="docutils literal notranslate"><span class="pre">unshare</span></code> (mount isolation / PID observation).</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="acknowledgements">
+<h2>🙏 Acknowledgements<a class="headerlink" href="#acknowledgements" title="Permalink to this heading"></a></h2>
+<p>Thanks to all developers, testers, documentation contributors, and community users for their feedback. DragonOS 0.2.0 builds upon prior versions’ experiments and accumulations, also laying structural foundations for future containerization, resource isolation, and performance optimizations. Welcome to continue participating via Issues / PRs / Discussions.</p>
+</section>
+<hr class="docutils" />
+<section id="appendix-keyword-index-for-easy-lookup">
+<h2>🔎 Appendix: Keyword Index (for Easy Lookup)<a class="headerlink" href="#appendix-keyword-index-for-easy-lookup" title="Permalink to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">ext4</span></code> <code class="docutils literal notranslate"><span class="pre">overlayfs</span></code> <code class="docutils literal notranslate"><span class="pre">PageCache</span></code> <code class="docutils literal notranslate"><span class="pre">mmap</span></code> <code class="docutils literal notranslate"><span class="pre">PID</span> <span class="pre">namespace</span></code> <code class="docutils literal notranslate"><span class="pre">mount</span> <span class="pre">namespace</span></code> <code class="docutils literal notranslate"><span class="pre">unshare</span></code> <code class="docutils literal notranslate"><span class="pre">syscall</span> <span class="pre">table</span></code> <code class="docutils literal notranslate"><span class="pre">eBPF</span></code> <code class="docutils literal notranslate"><span class="pre">kprobe</span></code> <code class="docutils literal notranslate"><span class="pre">tracepoint</span></code> <code class="docutils literal notranslate"><span class="pre">Aya</span></code> <code class="docutils literal notranslate"><span class="pre">KVM</span></code> <code class="docutils literal notranslate"><span class="pre">VMX</span></code> <code class="docutils literal notranslate"><span class="pre">EPT</span></code> <code class="docutils literal notranslate"><span class="pre">LoongArch64</span></code> <code class="docutils literal notranslate"><span class="pre">RISC-V</span></code> <code class="docutils literal notranslate"><span class="pre">virtio</span> <span class="pre">console</span></code> <code class="docutils literal notranslate"><span class="pre">loopback</span></code> <code class="docutils literal notranslate"><span class="pre">eventfd</span></code> <code class="docutils literal notranslate"><span class="pre">poll</span></code> <code class="docutils literal notranslate"><span class="pre">epoll</span></code> <code class="docutils literal notranslate"><span class="pre">select</span></code> <code class="docutils literal notranslate"><span class="pre">pselect6</span></code> <code class="docutils literal notranslate"><span class="pre">ppoll</span></code> <code class="docutils literal notranslate"><span class="pre">statx</span></code> <code class="docutils literal notranslate"><span class="pre">newfstatat</span></code> <code class="docutils literal notranslate"><span class="pre">execveat</span></code> <code class="docutils literal notranslate"><span class="pre">dynamic</span> <span class="pre">linking</span></code> <code class="docutils literal notranslate"><span class="pre">Dadk</span> <span class="pre">0.2.0</span></code> <code class="docutils literal notranslate"><span class="pre">Cred</span></code> <code class="docutils literal notranslate"><span class="pre">chown</span></code> <code class="docutils literal notranslate"><span class="pre">msync</span></code> <code class="docutils literal notranslate"><span class="pre">mprotect</span></code> <code class="docutils literal notranslate"><span class="pre">utimensat</span></code> <code class="docutils literal notranslate"><span class="pre">reboot</span></code> <code class="docutils literal notranslate"><span class="pre">slab</span></code> <code class="docutils literal notranslate"><span class="pre">buddy</span></code> <code class="docutils literal notranslate"><span class="pre">Guard</span> <span class="pre">Page</span></code> <code class="docutils literal notranslate"><span class="pre">WP</span></code> <code class="docutils literal notranslate"><span class="pre">Tokio</span></code> <code class="docutils literal notranslate"><span class="pre">groupprocess/session</span></code></p>
+<p>– END OF DragonOS 0.2.0 Release Notes –</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="../index.html" class="btn btn-neutral float-left" title="Release Notes" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../V0.1.x/V0.1.10.html" class="btn btn-neutral float-right" title="V0.1.10" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="V0.2.0.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../../V0.3.0/locales/en/community/ChangeLog/V0.2.x/V0.2.0.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../../V0.4.0/locales/en/community/ChangeLog/V0.2.x/V0.2.0.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../../master/locales/en/community/ChangeLog/V0.2.x/V0.2.0.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

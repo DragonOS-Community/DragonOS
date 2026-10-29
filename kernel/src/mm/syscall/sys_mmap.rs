@@ -4,7 +4,7 @@ use super::ProtFlags;
 use crate::arch::{interrupt::TrapFrame, syscall::nr::SYS_MMAP, MMArch};
 use crate::mm::syscall::page_align_up;
 use crate::mm::syscall::MapFlags;
-use crate::mm::ucontext::DEFAULT_MMAP_MIN_ADDR;
+use crate::mm::ucontext::{check_mmap_min_addr, DEFAULT_MMAP_MIN_ADDR};
 use crate::mm::AddressSpace;
 use crate::mm::VirtAddr;
 use crate::mm::{access_ok, MemoryManagementArch};
@@ -12,7 +12,6 @@ use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use log::error;
 use system_error::SystemError;
 
-use crate::process::{resource::RLimitID, ProcessManager};
 use alloc::vec::Vec;
 
 /// Handler for the mmap system call, which maps files or devices into memory.
@@ -97,24 +96,6 @@ impl Syscall for SysMmapHandle {
             return Err(SystemError::EINVAL);
         }
 
-        // RLIMIT_AS 检查（粗略：累计 VMA 大小）
-        let rlim_as = ProcessManager::current_pcb()
-            .get_rlimit(RLimitID::As)
-            .rlim_cur as usize;
-        if rlim_as != usize::MAX {
-            let vm = AddressSpace::current()?;
-            let usage = vm.read().vma_usage_bytes();
-            // Allow a small one-page slack to mirror Linux rounding behaviour and
-            // avoid spuriously rejecting near-limit mappings.
-            let allowance = MMArch::PAGE_SIZE;
-            if usage
-                .checked_add(len)
-                .is_none_or(|v| v > rlim_as.saturating_add(allowance))
-            {
-                return Err(SystemError::ENOMEM);
-            }
-        }
-
         // MAP_FIXED 需页对齐
         if map_flags.contains(MapFlags::MAP_FIXED)
             && !start_vaddr.check_aligned(<MMArch as MemoryManagementArch>::PAGE_SIZE)
@@ -125,11 +106,7 @@ impl Syscall for SysMmapHandle {
         if start_vaddr < VirtAddr::new(DEFAULT_MMAP_MIN_ADDR)
             && map_flags.contains(MapFlags::MAP_FIXED)
         {
-            error!(
-                "mmap: MAP_FIXED is not supported for address below {}",
-                DEFAULT_MMAP_MIN_ADDR
-            );
-            return Err(SystemError::EINVAL);
+            check_mmap_min_addr(start_vaddr, VirtAddr::new(DEFAULT_MMAP_MIN_ADDR))?;
         }
 
         // 暂时不支持巨页映射
@@ -140,7 +117,7 @@ impl Syscall for SysMmapHandle {
         let current_address_space = AddressSpace::current()?;
         let start_page = if map_flags.contains(MapFlags::MAP_ANONYMOUS) {
             // 匿名映射
-            current_address_space.write().map_anonymous(
+            current_address_space.map_anonymous_wait(
                 start_vaddr,
                 len,
                 prot_flags,
@@ -150,7 +127,7 @@ impl Syscall for SysMmapHandle {
             )?
         } else {
             // 文件映射
-            current_address_space.write().file_mapping(
+            current_address_space.file_mapping(
                 start_vaddr,
                 len,
                 prot_flags,

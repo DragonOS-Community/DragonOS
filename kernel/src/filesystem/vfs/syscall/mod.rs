@@ -1,17 +1,20 @@
 use crate::time::PosixTimeSpec;
 
-use super::{fcntl::AtFlags, file::FileFlags, InodeMode, SuperBlock};
+use super::{fcntl::AtFlags, file::FileFlags, utils::OpenHowResolve, InodeMode, SuperBlock};
 mod dup2;
 mod faccessat2;
 mod link_utils;
+mod mknod_utils;
 mod newfstat;
 mod open_utils;
-mod pread_pwrite_common;
+mod pread_common;
+use super::read_buffer;
 mod readlink_at;
 mod rename_utils;
 mod sys_chdir;
 mod sys_chroot;
 mod sys_close;
+mod sys_close_range;
 mod sys_dup;
 mod sys_dup3;
 #[cfg(target_arch = "x86_64")]
@@ -23,6 +26,7 @@ mod sys_fallocate;
 mod sys_fchdir;
 mod sys_fchmod;
 mod sys_fchmodat;
+mod sys_fchmodat2;
 mod sys_fchown;
 mod sys_fchownat;
 mod sys_fcntl;
@@ -34,9 +38,11 @@ mod sys_getdents;
 mod sys_ioctl;
 mod sys_linkat;
 mod sys_lseek;
+mod sys_memfd_create;
 mod sys_mkdirat;
 pub mod sys_mknodat;
 mod sys_openat;
+mod sys_openat2;
 mod sys_pivot_root;
 #[cfg(target_arch = "x86_64")]
 mod sys_poll;
@@ -56,8 +62,11 @@ mod sys_select;
 mod sys_statfs;
 mod sys_statx;
 mod sys_symlinkat;
+mod sys_timerfd;
 mod sys_truncate;
 mod sys_unlinkat;
+#[cfg(target_arch = "x86_64")]
+mod sys_utime;
 mod sys_utimensat;
 mod sys_write;
 mod sys_writev;
@@ -67,6 +76,7 @@ mod epoll_utils;
 mod sys_epoll_create1;
 mod sys_epoll_ctl;
 mod sys_epoll_pwait;
+mod sys_epoll_pwait2;
 
 pub mod symlink_utils;
 mod sys_copy_file_range;
@@ -74,6 +84,8 @@ mod sys_copy_file_range;
 mod sys_fstat;
 mod sys_fsync;
 pub mod sys_mount;
+mod sys_mount_api;
+mod sys_mount_attributes;
 mod sys_sendfile;
 mod sys_splice;
 mod sys_sync;
@@ -130,21 +142,25 @@ mod sys_unlink;
 mod sys_utimes;
 
 mod sys_fgetxattr;
+mod sys_flistxattr;
+mod sys_fremovexattr;
 mod sys_fsetxattr;
 mod sys_getxattr;
 mod sys_lgetxattr;
+mod sys_listxattr;
+mod sys_llistxattr;
+mod sys_lremovexattr;
 mod sys_lsetxattr;
+mod sys_removexattr;
 mod sys_setxattr;
 mod xattr_utils;
 
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
-pub const SEEK_MAX: u32 = 3;
-
-// 扩展属性操作标志
-pub const XATTR_CREATE: i32 = 0x1; // 设置值，如果属性不存在则创建，已存在返回则失败
-pub const XATTR_REPLACE: i32 = 0x2; // 设置值，如果属性已存在则替换，不存在返回则失败
+pub const SEEK_DATA: u32 = 3;
+pub const SEEK_HOLE: u32 = 4;
+pub const SEEK_MAX: u32 = SEEK_HOLE;
 
 bitflags! {
     /// Flags used in the `renameat2` system call.
@@ -426,7 +442,7 @@ pub struct OpenHow {
 
 impl OpenHow {
     pub fn new(mut o_flags: FileFlags, mut mode: InodeMode, resolve: OpenHowResolve) -> Self {
-        if !o_flags.contains(FileFlags::O_CREAT) {
+        if !o_flags.intersects(FileFlags::O_CREAT | FileFlags::__O_TMPFILE) {
             mode = InodeMode::empty();
         }
 
@@ -439,43 +455,6 @@ impl OpenHow {
             mode,
             resolve,
         }
-    }
-}
-
-impl From<PosixOpenHow> for OpenHow {
-    fn from(posix_open_how: PosixOpenHow) -> Self {
-        let o_flags = FileFlags::from_bits_truncate(posix_open_how.flags as u32);
-        let mode = InodeMode::from_bits_truncate(posix_open_how.mode as u32);
-        let resolve = OpenHowResolve::from_bits_truncate(posix_open_how.resolve);
-        return Self::new(o_flags, mode, resolve);
-    }
-}
-
-bitflags! {
-    pub struct OpenHowResolve: u64{
-        /// Block mount-point crossings
-        ///     (including bind-mounts).
-        const RESOLVE_NO_XDEV = 0x01;
-
-        /// Block traversal through procfs-style
-        ///     "magic-links"
-        const RESOLVE_NO_MAGICLINKS = 0x02;
-
-        /// Block traversal through all symlinks
-        ///     (implies OEXT_NO_MAGICLINKS)
-        const RESOLVE_NO_SYMLINKS = 0x04;
-        /// Block "lexical" trickery like
-        ///     "..", symlinks, and absolute
-        const RESOLVE_BENEATH = 0x08;
-        /// Make all jumps to "/" and ".."
-        ///     be scoped inside the dirfd
-        ///     (similar to chroot(2)).
-        const RESOLVE_IN_ROOT = 0x10;
-        // Only complete if resolution can be
-        // 			completed through cached lookup. May
-        // 			return -EAGAIN if that's not
-        // 			possible.
-        const RESOLVE_CACHED = 0x20;
     }
 }
 
@@ -493,3 +472,18 @@ bitflags! {
         const SPLICE_F_GIFT = 0x08;
     }
 }
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use xattr_utils::selftest_report as xattr_syscall_selftest_report;
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) use read_buffer::selftest_report as read_buffer_selftest_report;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) use sys_read::count_selftest as read_count_selftest;

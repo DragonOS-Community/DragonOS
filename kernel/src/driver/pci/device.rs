@@ -21,6 +21,7 @@ use crate::{
 
 use super::{
     dev_id::PciDeviceID,
+    pci::PciDeviceStructureGeneralDevice,
     pci_irq::IrqType,
     subsys::{pci_bus, pci_bus_device},
 };
@@ -90,6 +91,12 @@ pub trait PciDevice: Device {
     fn irq_line(&self) -> u8;
     fn subclass(&self) -> u8;
     fn interface_code(&self) -> u8;
+
+    /// Return the standard PCI header and BAR resource object created by PCI
+    /// enumeration. Non-standard headers do not expose this resource type.
+    fn standard_device(&self) -> Option<Arc<PciDeviceStructureGeneralDevice>> {
+        None
+    }
 }
 
 /// #结构功能

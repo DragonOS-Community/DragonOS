@@ -54,21 +54,25 @@ impl ProcessManager {
             let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
-            unsafe {
-                idle_pcb
-                    .basic_mut()
-                    .set_user_vm(Some(IDLE_PROCESS_ADDRESS_SPACE()))
-            };
+            let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
+            idle_vm.user_count_inc();
+            unsafe { idle_pcb.basic_mut().set_user_vm(Some(idle_vm)) };
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
-            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
-            idle_pcb
-                .sched_info()
-                .set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
-            *idle_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::IDLE;
 
+            // 锁序：先取 pi_lock，再取 rq_lock（禁止反向）
+            let mut pi_guard = idle_pcb.sched_info().pi_lock_irqsave();
             let rq = cpu_rq(i as usize);
-            let (rq, _guard) = rq.self_lock();
+            let (rq, rq_guard) = rq.self_lock();
+
+            // 在双锁保护下设置 cpus_allowed 和 task_cpu
+            pi_guard.set_cpus_allowed(CpuMask::from_cpu(ProcessorId::new(i)));
+            idle_pcb.sched_info().set_on_cpu(Some(ProcessorId::new(i)));
+            assert!(
+                idle_pcb.sched_info().try_mark_running(),
+                "idle task must acquire its initial CPU ownership exactly once"
+            );
+
             rq.set_current(Arc::downgrade(&idle_pcb));
             rq.set_idle(Arc::downgrade(&idle_pcb));
             IDLE_CPUS.set(ProcessorId::new(i));
@@ -80,6 +84,15 @@ impl ProcessManager {
                 .sched_entity()
                 .force_mut()
                 .set_cfs(Arc::downgrade(&rq.cfs_rq()));
+
+            debug_assert_eq!(
+                idle_pcb.sched_info().sched_class(),
+                crate::sched::SchedClass::Idle
+            );
+
+            // 释放顺序：先 rq_lock，再 pi_lock
+            drop(rq_guard);
+            drop(pi_guard);
 
             v.push(idle_pcb);
         }

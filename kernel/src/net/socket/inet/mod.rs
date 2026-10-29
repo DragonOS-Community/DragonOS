@@ -7,8 +7,6 @@ pub mod datagram;
 pub mod stream;
 pub mod syscall;
 
-pub use common::BoundInner;
-pub use common::Types;
 pub use datagram::UdpSocket;
 pub use raw::RawSocket;
 
@@ -35,6 +33,14 @@ pub const UNSPECIFIED_LOCAL_ENDPOINT_V6: IpEndpoint =
     IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0);
 
 pub trait InetSocket: Socket {
+    /// Control feedback is delivered without holding the registry or TCP store.
+    /// Only TCP owners participate; UDP and RAW keep their native registries.
+    fn handle_tcp_icmp(&self, _feedback: &crate::net::icmp_error::IcmpErrorFeedback) {}
+    /// Prepare bounded passive-open capacity before the transport store is locked.
+    fn prepare_tcp_syn(&self, _local: smoltcp::wire::IpEndpoint, _device: u32) {}
+    /// Only the existing namespace task poller calls this outside poll locks.
+    fn refill_tcp_listener(&self) {}
+
     /// `on_iface_events`
     /// 通知socket发生的事件
     fn on_iface_events(&self);

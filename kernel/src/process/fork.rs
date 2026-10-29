@@ -1,39 +1,53 @@
-use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-
-use crate::arch::MMArch;
-use crate::cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst_with_src};
-use crate::filesystem::cgroup2::{cgroup2_check_attach_permissions, cgroup2_inode_to_node};
-use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::file::FileFlags;
-use crate::filesystem::vfs::file::FilePrivateData;
-use crate::filesystem::vfs::FileType;
-use crate::filesystem::vfs::InodeMode;
-use crate::mm::access_ok;
-use crate::mm::MemoryManagementArch;
-use crate::process::pid::PidPrivateData;
-use alloc::{string::ToString, sync::Arc};
-use log::{error, warn};
-use system_error::SystemError;
-
+use super::{
+    account_successful_fork, inc_visible_thread_count,
+    kthread::{KernelThreadFlags, KernelThreadPcbPrivate, WorkerPrivate},
+    lock_fs_refs_copy,
+    pid::{Pid, PidType},
+    FsRefsReadGuard, KernelStack, ProcessControlBlock, ProcessManager, RawPid,
+    PTRACE_RELATION_LOCK,
+};
 use crate::{
-    arch::{interrupt::TrapFrame, ipc::signal::Signal},
+    arch::{interrupt::TrapFrame, ipc::signal::Signal, MMArch},
+    cgroup::{cgroup_accounting_lock, cgroup_can_fork_in, cgroup_migrate_vet_dst},
+    filesystem::{
+        cgroup2::{
+            cgroup2_check_attach_namespace, cgroup2_check_attach_permissions, cgroup2_inode_to_node,
+        },
+        fs::FsStruct,
+        vfs::{
+            fdtable::FdReservation,
+            file::{File, FileFlags, PreparedFile},
+            FileType,
+        },
+    },
     ipc::signal_types::SignalFlags,
-    libs::{cpumask::CpuMask, rwsem::RwSem},
-    mm::VirtAddr,
-    process::ProcessFlags,
+    libs::cpumask::CpuMask,
+    mm::{access_ok, allocation::MemoryAllocationError, MemoryManagementArch, VirtAddr},
+    process::{
+        pidfd::PidFd,
+        ptrace::{
+            join_new_thread_group_stop_locked, ptrace_fork_session_snapshot_locked, PtraceEvent,
+            PtraceForkSession,
+        },
+        ProcessFlags,
+    },
     sched::{cpu_is_online, sched_cgroup_fork, sched_fork},
     smp::cpu::{smp_cpu_manager_initialized, ProcessorId},
-    syscall::user_access::UserBufferWriter,
+    syscall::user_access::{PreparedUserWrite, UserWriteCommitError},
 };
+use alloc::{string::ToString, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
+use log::warn;
+use system_error::SystemError;
 
-use super::{
-    account_successful_fork, alloc_pid, inc_visible_thread_count,
-    kthread::{KernelThreadPcbPrivate, WorkerPrivate},
-    pid::{Pid, PidType},
-    KernelStack, ProcessControlBlock, ProcessManager, RawPid,
-};
 pub const MAX_PID_NS_LEVEL: usize = 32;
+
+/// Pin both the destination and its original cgroupfs identity until final
+/// admission. A concurrently closed/reused fd must not redirect the clone.
+struct CloneCgroupTarget {
+    node: Arc<crate::cgroup::CgroupNode>,
+    file: Arc<File>,
+}
 
 bitflags! {
     /// 进程克隆标志
@@ -94,6 +108,62 @@ bitflags! {
     }
 }
 
+fn validate_semundo_clone_flags(clone_flags: CloneFlags) -> Result<(), SystemError> {
+    if (clone_flags & (CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM))
+        == (CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM)
+    {
+        Err(SystemError::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+/// Pure invalid combinations precede all charged task-resource births.
+fn validate_resource_clone_flags(flags: CloneFlags) -> Result<(), SystemError> {
+    validate_semundo_clone_flags(flags)?;
+    if (flags.contains(CloneFlags::CLONE_FS)
+        && flags.intersects(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER))
+        || (flags.contains(CloneFlags::CLONE_THREAD) && !flags.contains(CloneFlags::CLONE_SIGHAND))
+        || (flags.contains(CloneFlags::CLONE_SIGHAND) && !flags.contains(CloneFlags::CLONE_VM))
+        || (flags.contains(CloneFlags::CLONE_THREAD)
+            && flags.intersects(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID))
+        || (flags.contains(CloneFlags::CLONE_PIDFD)
+            && flags.intersects(CloneFlags::CLONE_DETACHED | CloneFlags::CLONE_THREAD))
+    {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_semundo_clone_flags_for_test(clone_flags: CloneFlags) -> Result<(), SystemError> {
+    validate_semundo_clone_flags(clone_flags)
+}
+
+enum ForkAttemptError {
+    Allocation(MemoryAllocationError),
+    RefaultRequired,
+}
+
+impl From<MemoryAllocationError> for ForkAttemptError {
+    fn from(error: MemoryAllocationError) -> Self {
+        Self::Allocation(error)
+    }
+}
+impl From<SystemError> for ForkAttemptError {
+    fn from(error: SystemError) -> Self {
+        Self::Allocation(error.into())
+    }
+}
+impl From<UserWriteCommitError> for ForkAttemptError {
+    fn from(error: UserWriteCommitError) -> Self {
+        match error {
+            UserWriteCommitError::RefaultRequired => Self::RefaultRequired,
+            UserWriteCommitError::System(error) => error.into(),
+        }
+    }
+}
+
 /// ## clone与clone3系统调用的参数载体
 ///
 /// 因为这两个系统调用的参数很多，所以有这样一个载体更灵活
@@ -110,10 +180,15 @@ pub struct KernelCloneArgs {
     pub pidfd: VirtAddr,
     pub child_tid: VirtAddr,
     pub parent_tid: VirtAddr,
-    pub set_tid: Vec<usize>,
+    pub set_tid: Vec<i32>,
 
-    /// 进程退出时发送的信号
-    pub exit_signal: Signal,
+    /// 进程退出时发送给父进程的信号。
+    ///
+    /// Linux 的 task_struct::exit_signal 使用整数语义：
+    /// - -1: 非线程组 leader（CLONE_THREAD），不可被普通 wait 回收；
+    /// - 0: 退出时不发送信号，但仍是可被 __WCLONE 等待的 clone 子进程；
+    /// - >0: 退出时发送对应信号。
+    pub exit_signal: i32,
 
     pub stack: usize,
     // clone3用到
@@ -125,6 +200,9 @@ pub struct KernelCloneArgs {
 
     pub io_thread: bool,
     pub kthread: bool,
+    /// Creation-time kernel-thread properties that must be visible before the
+    /// child is published in the task table.
+    pub kthread_flags: KernelThreadFlags,
     pub idle: bool,
     pub func: VirtAddr,
     pub fn_arg: VirtAddr,
@@ -142,7 +220,7 @@ impl KernelCloneArgs {
             child_tid: null_addr,
             parent_tid: null_addr,
             set_tid: Vec::with_capacity(MAX_PID_NS_LEVEL),
-            exit_signal: Signal::SIGCHLD,
+            exit_signal: Signal::SIGCHLD as i32,
             stack: 0,
             stack_size: 0,
             tls: 0,
@@ -150,6 +228,7 @@ impl KernelCloneArgs {
             cgroup: 0,
             io_thread: false,
             kthread: false,
+            kthread_flags: KernelThreadFlags::empty(),
             idle: false,
             func: null_addr,
             fn_arg: null_addr,
@@ -170,13 +249,13 @@ impl KernelCloneArgs {
     }
 
     #[inline]
-    fn target_cpu_is_allowed(allowed: &CpuMask, cpu: ProcessorId) -> bool {
+    fn target_cpu_is_allowed(cpu: ProcessorId, allowed: &CpuMask) -> bool {
         allowed.get(cpu).unwrap_or(false)
     }
 
     #[inline]
     fn validate_target_cpu(cpu: ProcessorId, allowed: &CpuMask) -> Result<(), SystemError> {
-        if Self::target_cpu_is_allowed(allowed, cpu) && Self::target_cpu_is_online(cpu) {
+        if Self::target_cpu_is_allowed(cpu, allowed) && Self::target_cpu_is_online(cpu) {
             Ok(())
         } else {
             Err(SystemError::EINVAL)
@@ -202,7 +281,7 @@ impl KernelCloneArgs {
         let target_cpu = if let Some(target_cpu) = self.target_cpu {
             Self::validate_target_cpu(target_cpu, allowed)?;
             target_cpu
-        } else if Self::target_cpu_is_allowed(allowed, default_cpu)
+        } else if Self::target_cpu_is_allowed(default_cpu, allowed)
             && Self::target_cpu_is_online(default_cpu)
         {
             default_cpu
@@ -221,14 +300,14 @@ impl KernelCloneArgs {
     ///
     /// ## 规则
     ///
-    /// 1. 如果设置了 CLONE_THREAD，进程是线程组成员，不应发送 exit_signal（设为 INVALID）
+    /// 1. 如果设置了 CLONE_THREAD，进程是线程组成员，不应发送 exit_signal（设为 -1）
     /// 2. 其他情况保持 exit_signal 不变
     ///
     /// 这个方法应该在 do_clone() 之前调用，确保 exit_signal 的语义正确。
     pub fn normalize_exit_signal(&mut self) {
         if self.flags.contains(CloneFlags::CLONE_THREAD) {
-            // 线程组成员不发送 exit_signal
-            self.exit_signal = Signal::INVALID;
+            // 线程组成员不是线程组 leader，Linux 中 exit_signal 为 -1。
+            self.exit_signal = -1;
         }
     }
 }
@@ -255,7 +334,7 @@ impl ProcessManager {
     ) -> Result<RawPid, SystemError> {
         let mut args = KernelCloneArgs::new();
         args.flags = clone_flags;
-        args.exit_signal = Signal::SIGCHLD;
+        args.exit_signal = Signal::SIGCHLD as i32;
         Self::fork_with_args(current_trapframe, args)
     }
 
@@ -264,61 +343,142 @@ impl ProcessManager {
         args: KernelCloneArgs,
     ) -> Result<RawPid, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
-
-        let new_kstack: KernelStack = KernelStack::new()?;
-
-        let name = current_pcb.basic().name().to_string();
+        let caller_pid_ns = if current_pcb.raw_pid().data() == 0 {
+            None
+        } else {
+            Some(current_pcb.active_pid_ns())
+        };
 
         args.verify()?;
-        let pcb = ProcessControlBlock::new(name, new_kstack);
-        Self::copy_process(&current_pcb, &pcb, args, current_trapframe).map_err(|e| {
-            error!(
-                "fork: Failed to copy process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(),
-                pcb.raw_pid(),
-                e
-            );
-            e
-        })?;
-        // if pcb.raw_pid().data() > 1 {
-        //     log::debug!(
-        //         "fork done, pid: {}, pgid: {:?}, tgid: {:?}, sid: {}",
-        //         pcb.raw_pid(),
-        //         pcb.task_pgrp().map(|x| x.pid_vnr().data()),
-        //         pcb.task_tgid_vnr(),
-        //         pcb.task_session().map_or(0, |s| s.pid_vnr().data())
-        //     );
-        // }
-
-        ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {
+        let (pcb, ptrace_fork_session) =
+            Self::prepare_unpublished_child(&current_pcb, &args, current_trapframe)?;
+        let child_vpid = if current_pcb.raw_pid().data() == 0 {
+            pcb.raw_pid()
+        } else {
+            pcb.task_pid_nr_ns(PidType::PID, caller_pid_ns)
+                .expect("published fork child must be visible in the caller's PID namespace")
+        };
+        ProcessManager::wake_up_new_task(&pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
                 pcb.raw_pid(),
                 e
             )
         });
+        Self::ptrace_report_fork_event(&current_pcb, &pcb, ptrace_fork_session.as_ref());
+        Ok(child_vpid)
+    }
 
-        if ProcessManager::current_pid().data() == 0 {
-            return Ok(pcb.raw_pid());
+    /// Both fork entry points retry only complete, unpublished transactions.
+    /// Preserve the exact target descriptor across recovery, but propagate its
+    /// captured lookup error at the original copy_process validation point.
+    pub(crate) fn prepare_unpublished_child(
+        current_pcb: &Arc<ProcessControlBlock>,
+        args: &KernelCloneArgs,
+        frame: &TrapFrame,
+    ) -> Result<(Arc<ProcessControlBlock>, Option<PtraceForkSession>), SystemError> {
+        validate_resource_clone_flags(args.flags)?;
+        let target = Self::resolve_clone_into_cgroup_target(args);
+        // Pin the operation's source MM once, not whatever MM a later retry
+        // happens to observe. Capture failure is deferred to put_user as well.
+        let pidfd_mm = args
+            .flags
+            .contains(CloneFlags::CLONE_PIDFD)
+            .then(crate::mm::ucontext::AddressSpace::current);
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            // Each failed unpublished birth releases both stacks and its
+            // body before recovery. Never enter copy_process locks to reclaim.
+            let birth = (|| {
+                let creator = crate::cgroup::memory::object_for_task(current_pcb);
+                let resources = super::task::PreparedTaskResources::try_for_fork(
+                    current_pcb,
+                    args.flags,
+                    &creator,
+                )?;
+                let stack = KernelStack::new_accounted(&creator)?;
+                let name = { current_pcb.basic().name().to_string() };
+                ProcessControlBlock::new(name, stack, args.kthread, resources)
+            })();
+            let pcb = match birth {
+                Ok(pcb) => pcb,
+                Err(error) => {
+                    error.recover(&mut recovery)?;
+                    continue;
+                }
+            };
+            match Self::copy_process(current_pcb, &pcb, args, frame, &target, pidfd_mm.as_ref()) {
+                Ok(session) => return Ok((pcb, session)),
+                Err(error) => {
+                    // Err is possible only before PID/ALL_PROCESS publication.
+                    // Namespace pid_map owns strong Pid references: abort the
+                    // private allocation explicitly, not by waiting for Drop.
+                    assert!(pcb.pid_links.iter().all(|link| !link.is_linked()));
+                    assert!(!pcb.visible_thread_accounted.load(Ordering::Acquire));
+                    pcb.detach_pid(PidType::PID);
+                    pcb.flags().insert(ProcessFlags::PID_UNHASHED);
+                    if args.flags.contains(CloneFlags::CLONE_NEWPID) {
+                        let child_ns = pcb.nsproxy().pid_ns_for_children.clone();
+                        // copy_namespaces may fail before installing its
+                        // candidate. Never cancel the inherited namespace.
+                        if !Arc::ptr_eq(&child_ns, &current_pcb.nsproxy().pid_ns_for_children) {
+                            child_ns.discard_unpublished();
+                        }
+                    }
+                    drop(pcb);
+                    match error {
+                        ForkAttemptError::Allocation(error) => error.recover(&mut recovery)?,
+                        ForkAttemptError::RefaultRequired => {
+                            if Signal::oom_fatal_signal_pending(current_pcb)
+                                || current_pcb.flags().contains(ProcessFlags::EXITING)
+                                || current_pcb
+                                    .process_signal()
+                                    .flags_contains(SignalFlags::GROUP_EXEC)
+                            {
+                                return Err(SystemError::EINTR);
+                            }
+                            let original_mm = pidfd_mm
+                                .as_ref()
+                                .expect("pidfd refault has captured MM")
+                                .as_ref()
+                                .map_err(Clone::clone)?;
+                            if !Arc::ptr_eq(
+                                original_mm,
+                                &crate::mm::ucontext::AddressSpace::current()?,
+                            ) {
+                                return Err(SystemError::EFAULT);
+                            }
+                            crate::sched::cond_resched();
+                            // The old private child, PID, File, FD marker and
+                            // pins have all been released. Normal fault/COW is
+                            // safe here; never replay a committed output.
+                            drop(PreparedUserWrite::<i32>::prepare(original_mm, args.pidfd)?);
+                        }
+                    }
+                }
+            }
         }
-
-        return Ok(pcb.pid().pid_vnr());
     }
 
     fn copy_flags(
         clone_flags: &CloneFlags,
+        kthread: bool,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), SystemError> {
-        // 先复制父进程的 flags
-        *new_pcb.flags.get_mut() = *ProcessManager::current_pcb().flags();
+        let parent_flags = ProcessManager::current_pcb().flags().load();
+        let mut child_flags = parent_flags.fork_inherited();
 
-        // 然后根据 clone_flags 设置需要的标志
-        if clone_flags.contains(CloneFlags::CLONE_VFORK) {
-            new_pcb.flags().insert(ProcessFlags::VFORK);
+        // KTHREAD 不通过继承传递，而是由创建参数显式赋予。
+        if kthread {
+            child_flags.insert(ProcessFlags::KTHREAD);
         }
 
-        // 标记新进程还未执行 exec
-        new_pcb.flags().insert(ProcessFlags::FORKNOEXEC);
+        if clone_flags.contains(CloneFlags::CLONE_VFORK) {
+            child_flags.insert(ProcessFlags::VFORK);
+        }
+        child_flags.insert(ProcessFlags::FORKNOEXEC);
+
+        new_pcb.flags.store(child_flags);
 
         return Ok(());
     }
@@ -343,62 +503,29 @@ impl ProcessManager {
         clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
+    ) -> Result<(), MemoryAllocationError> {
         let old_address_space = current_pcb.basic().user_vm().ok_or(SystemError::ENOMEM)?;
+
+        // Match Linux uprobe_copy_process: a new-stack CLONE_VM thread must
+        // not inherit its parent's returns; fork and vfork retain the user
+        // stack and need the matching instances before the child is published.
+        #[cfg(target_arch = "x86_64")]
+        if !clone_flags.contains(CloneFlags::CLONE_VM)
+            || clone_flags.contains(CloneFlags::CLONE_VFORK)
+        {
+            new_pcb.uprobe.inherit_urets(&current_pcb.uprobe)?;
+        }
 
         if clone_flags.contains(CloneFlags::CLONE_VM) {
             unsafe { new_pcb.basic_mut().set_user_vm(Some(old_address_space)) };
             return Ok(());
         }
-        let new_address_space = old_address_space
-            .write()
-            .try_clone()
-            .map_err(|_| SystemError::ENOMEM)?;
+        let new_address_space = old_address_space.try_clone_for_task(new_pcb)?;
         unsafe { new_pcb.basic_mut().set_user_vm(Some(new_address_space)) };
         return Ok(());
     }
 
     #[inline(never)]
-    fn copy_files(
-        clone_flags: &CloneFlags,
-        current_pcb: &Arc<ProcessControlBlock>,
-        new_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        // 如果不共享文件描述符表，则拷贝文件描述符表
-        if !clone_flags.contains(CloneFlags::CLONE_FILES) {
-            let new_fd_table = current_pcb.basic().try_fd_table().unwrap().read().clone();
-            let new_fd_table = Arc::new(RwSem::new(new_fd_table));
-            new_pcb.basic_mut().set_fd_table(Some(new_fd_table));
-        } else {
-            // 如果共享文件描述符表，则直接拷贝指针
-            new_pcb
-                .basic_mut()
-                .set_fd_table(current_pcb.basic().try_fd_table().clone());
-        }
-
-        return Ok(());
-    }
-
-    #[allow(dead_code)]
-    fn copy_sighand(
-        clone_flags: &CloneFlags,
-        current_pcb: &Arc<ProcessControlBlock>,
-        new_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
-        if clone_flags.contains(CloneFlags::CLONE_SIGHAND) {
-            new_pcb.replace_sighand(current_pcb.sighand());
-            return Ok(());
-        }
-
-        // log::debug!("Just copy sighand");
-        new_pcb.sighand().copy_handlers_from(&current_pcb.sighand());
-
-        if clone_flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
-            new_pcb.flush_signal_handlers(false);
-        }
-        return Ok(());
-    }
-
     /// 复制进程信号信息（sig_info）
     ///
     /// fork 时需要复制父进程的信号掩码（sig_blocked）等信息到子进程。
@@ -412,24 +539,69 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         // 只复制信号掩码 - POSIX 要求 fork 和 execve 都保留信号掩码
         // 注意：先读取父进程的，然后释放锁，再写入子进程的，避免死锁
-        let sig_blocked = {
-            let current_sig_info = current_pcb.sig_info_irqsave();
-            *current_sig_info.sig_blocked()
+        let oom_score_owner =
+            ProcessManager::find(current_pcb.raw_tgid()).unwrap_or_else(|| current_pcb.clone());
+        let sig_info_state = if Arc::ptr_eq(&oom_score_owner, current_pcb) {
+            let sig_info = current_pcb.sig_info_irqsave();
+            (
+                *sig_info.sig_blocked(),
+                sig_info.oom_score_adj(),
+                sig_info.oom_score_adj_min(),
+            )
+        } else {
+            let sig_blocked = {
+                let current_sig_info = current_pcb.sig_info_irqsave();
+                *current_sig_info.sig_blocked()
+            };
+            let (oom_score_adj, oom_score_adj_min) = {
+                let oom_score_owner_sig_info = oom_score_owner.sig_info_irqsave();
+                (
+                    oom_score_owner_sig_info.oom_score_adj(),
+                    oom_score_owner_sig_info.oom_score_adj_min(),
+                )
+            };
+            (sig_blocked, oom_score_adj, oom_score_adj_min)
         };
 
         {
             let mut new_sig_info = new_pcb.sig_info_mut();
-            *new_sig_info.sig_block_mut() = sig_blocked;
+            *new_sig_info.sig_block_mut() = sig_info_state.0;
+            new_sig_info.set_oom_score_adj(sig_info_state.1);
+            new_sig_info.set_oom_score_adj_min(sig_info_state.2);
         }
 
         Ok(())
     }
 
+    fn needs_oom_score_adj_clone_vm_sync(clone_flags: &CloneFlags) -> bool {
+        (*clone_flags & (CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VFORK))
+            == CloneFlags::CLONE_VM
+    }
+
+    fn sync_oom_score_adj_for_clone_vm(
+        current_pcb: &Arc<ProcessControlBlock>,
+        new_pcb: &Arc<ProcessControlBlock>,
+    ) {
+        let oom_score_owner =
+            ProcessManager::find(current_pcb.raw_tgid()).unwrap_or_else(|| current_pcb.clone());
+        let (oom_score_adj, oom_score_adj_min) = {
+            let current_sig_info = oom_score_owner.sig_info_irqsave();
+            (
+                current_sig_info.oom_score_adj(),
+                current_sig_info.oom_score_adj_min(),
+            )
+        };
+
+        let mut new_sig_info = new_pcb.sig_info_mut();
+        new_sig_info.set_oom_score_adj(oom_score_adj);
+        new_sig_info.set_oom_score_adj_min(oom_score_adj_min);
+    }
+
     /// 复制 prctl 相关的进程/线程状态。
     ///
     /// - no_new_privs：线程级语义，clone/fork 继承，execve 保持（execve 不走这里）。
-    /// - keepcaps：clone/fork 继承。
-    /// - dumpable：fork 继承。
+    /// - keepcaps：作为 Cred 字段由 copy_creds 自然继承。
+    /// - dumpable: inherited naturally via the shared or cloned AddressSpace.
     fn copy_prctl_state(
         _clone_flags: &CloneFlags,
         current_pcb: &Arc<ProcessControlBlock>,
@@ -440,11 +612,6 @@ impl ProcessManager {
             new_pcb.set_no_new_privs(true);
         }
 
-        // KEEPCAPS
-        new_pcb.set_keepcaps(current_pcb.keepcaps());
-
-        // DUMPABLE
-        new_pcb.set_dumpable(current_pcb.dumpable());
         Ok(())
     }
 
@@ -493,7 +660,7 @@ impl ProcessManager {
     ///
     /// ## panic:
     /// 某一步拷贝失败时会引发panic
-    /// 例如：copy_mm等失败时会触发panic
+    /// 内存地址空间拷贝失败通过 Result 返回；其他旧拷贝步骤仍有 panic 路径。
     ///
     /// ## 参数
     ///
@@ -502,51 +669,30 @@ impl ProcessManager {
     /// - pcb 目标pcb
     ///
     /// ## return
-    /// - 成功时返回Ok(())
+    /// - 成功时返回绑定到本次 child link 的 ptrace fork session（若有）
     /// - 发生错误时返回Err(SystemError)
     #[inline(never)]
-    pub fn copy_process(
+    fn copy_process(
         current_pcb: &Arc<ProcessControlBlock>,
         pcb: &Arc<ProcessControlBlock>,
-        mut clone_args: KernelCloneArgs,
+        clone_args: &KernelCloneArgs,
         current_trapframe: &TrapFrame,
-    ) -> Result<(), SystemError> {
+        captured_target: &Result<Option<CloneCgroupTarget>, SystemError>,
+        captured_pidfd_mm: Option<&Result<Arc<crate::mm::ucontext::AddressSpace>, SystemError>>,
+    ) -> Result<Option<PtraceForkSession>, ForkAttemptError> {
         let clone_flags = clone_args.flags;
         // 不允许与不同namespace的进程共享根目录
 
         // exec 去线程化期间不允许创建新线程
         if clone_flags.contains(CloneFlags::CLONE_THREAD)
             && (current_pcb
-                .sighand()
+                .process_signal()
                 .flags_contains(SignalFlags::GROUP_EXEC)
                 || current_pcb
-                    .sighand()
+                    .process_signal()
                     .flags_contains(SignalFlags::GROUP_EXIT))
         {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        if (clone_flags & (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
-            == (CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS))
-            || (clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS))
-                == (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 线程组必须共享信号，分离线程只能在线程组内启动。
-        if clone_flags.contains(CloneFlags::CLONE_THREAD)
-            && !clone_flags.contains(CloneFlags::CLONE_SIGHAND)
-        {
-            return Err(SystemError::EINVAL);
-        }
-
-        // 共享信号处理器意味着共享vm。
-        // 线程组也意味着共享vm。阻止这种情况可以简化其他代码。
-        if clone_flags.contains(CloneFlags::CLONE_SIGHAND)
-            && !clone_flags.contains(CloneFlags::CLONE_VM)
-        {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
         }
 
         // 当全局init进程或其容器内init进程的兄弟进程退出时，由于它们的父进程（swapper）不会回收它们，
@@ -554,23 +700,21 @@ impl ProcessManager {
         // 需要阻止全局init和容器内init进程创建兄弟进程。
         if clone_flags.contains(CloneFlags::CLONE_PARENT)
             && current_pcb
-                .sighand()
+                .process_signal()
                 .flags_contains(SignalFlags::UNKILLABLE)
         {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         // 如果新进程使用不同的 pid 或 namespace，
         // 则不允许它与分叉任务共享线程组。
         if clone_flags.contains(CloneFlags::CLONE_THREAD)
-            && (!((clone_flags & (CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID))
-                .is_empty())
-                || !Arc::ptr_eq(
-                    &current_pcb.active_pid_ns(),
-                    current_pcb.nsproxy().pid_namespace_for_children(),
-                ))
+            && !Arc::ptr_eq(
+                &current_pcb.active_pid_ns(),
+                current_pcb.nsproxy().pid_namespace_for_children(),
+            )
         {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
         // 如果新进程将处于不同的time namespace，
@@ -579,23 +723,27 @@ impl ProcessManager {
             // TODO: 判断time namespace，不同则返回错误
         }
 
-        if clone_flags.contains(CloneFlags::CLONE_PIDFD)
-            && !((clone_flags & (CloneFlags::CLONE_DETACHED | CloneFlags::CLONE_THREAD)).is_empty())
-        {
-            return Err(SystemError::EINVAL);
+        // Match Linux copy_process(): the check is intentionally not a
+        // reservation. Concurrent forks may slightly exceed the limit.
+        if crate::process::nr_threads() as usize >= crate::process::max_threads() {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into());
         }
 
         // TODO: 克隆前应该锁信号处理，等待克隆完成后再处理
 
         // 克隆架构相关
-        let guard = current_pcb.arch_info_irqsave();
-        unsafe { pcb.arch_info().clone_from(&guard) };
+        let mut guard = current_pcb.arch_info_irqsave();
+        guard.sync_current_state_before_fork();
+        unsafe {
+            pcb.arch_info().clone_from(&guard);
+        }
         drop(guard);
 
         // 为内核线程设置WorkerPrivate
-        if current_pcb.flags().contains(ProcessFlags::KTHREAD) {
-            *pcb.worker_private() =
-                Some(WorkerPrivate::KernelThread(KernelThreadPcbPrivate::new()));
+        if clone_args.kthread {
+            let mut private = KernelThreadPcbPrivate::new();
+            *private.flags_mut() |= clone_args.kthread_flags;
+            *pcb.worker_private() = Some(WorkerPrivate::KernelThread(private));
         }
 
         // 设置clear_child_tid，在线程结束时将其置0以通知父进程
@@ -615,13 +763,14 @@ impl ProcessManager {
             pcb.sched_info()
                 .set_cpus_allowed(current_pcb.sched_info().cpus_allowed());
         }
-        if let Some(cpus_allowed) = clone_args.cpus_allowed.take() {
-            pcb.sched_info().set_cpus_allowed(cpus_allowed);
+        if let Some(cpus_allowed) = clone_args.cpus_allowed.as_ref() {
+            pcb.sched_info()
+                .set_cpus_allowed(cpus_allowed.try_clone().map_err(|_| SystemError::ENOMEM)?);
         }
         clone_args.validate_requested_target_cpu(&pcb.sched_info().cpus_allowed())?;
 
         // 拷贝标志位
-        Self::copy_flags(&clone_flags, pcb).unwrap_or_else(|e| {
+        Self::copy_flags(&clone_flags, clone_args.kthread, pcb).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy flags from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
@@ -645,30 +794,6 @@ impl ProcessManager {
             &pcb.seccomp_filter,
         );
 
-        // 拷贝文件描述符表
-        Self::copy_files(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy files from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
-        // 拷贝文件系统信息
-        Self::copy_fs(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy fs from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
-        // 拷贝信号相关数据
-        Self::copy_sighand(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy sighand from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
         // 拷贝信号信息（sig_info，包括信号掩码）
         Self::copy_sig_info(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
             panic!(
@@ -686,31 +811,15 @@ impl ProcessManager {
         });
 
         // 拷贝用户地址空间
-        Self::copy_mm(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy mm from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
-
-        // 拷贝namespace
-        Self::copy_namespaces(&clone_flags, current_pcb, pcb).unwrap_or_else(|e| {
-            panic!(
-                "fork: Failed to copy namespaces from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
-                current_pcb.raw_pid(), pcb.raw_pid(), e
-            )
-        });
+        Self::copy_mm(&clone_flags, current_pcb, pcb)?;
 
         // 拷贝线程
-        Self::copy_thread(current_pcb, pcb, &clone_args, current_trapframe).unwrap_or_else(|e| {
+        Self::copy_thread(current_pcb, pcb, clone_args, current_trapframe).unwrap_or_else(|e| {
             panic!(
                 "fork: Failed to copy thread from current process, current pid: [{:?}], new pid: [{:?}]. Error: {:?}",
                 current_pcb.raw_pid(), pcb.raw_pid(), e
             )
         });
-
-        // 继承 rlimit
-        pcb.inherit_rlimits_from(current_pcb);
 
         // 继承 executable_path
         // 修复：fork时需要复制父进程的可执行文件路径，而不是使用进程名
@@ -718,261 +827,632 @@ impl ProcessManager {
         pcb.set_execute_path(current_pcb.execute_path());
 
         // 继承 cmdline（/proc/<pid>/cmdline 语义）
-        pcb.set_cmdline_bytes(current_pcb.cmdline_bytes());
-
-        // alloc_pid
-        if pcb.raw_pid() == RawPid::UNASSIGNED {
-            // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
-            let ns = pcb.nsproxy().pid_namespace_for_children().clone();
-
-            let main_pid_arc = alloc_pid(&ns)?;
-
-            // 根namespace中的PID号作为RawPid
-            let root_pid_nr = main_pid_arc
-                .first_upid()
-                .ok_or(SystemError::EINVAL)?
-                .nr
-                .data();
-            // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
-
-            unsafe {
-                pcb.force_set_raw_pid(RawPid(root_pid_nr));
-            }
-            pcb.init_task_pid(PidType::PID, main_pid_arc);
-        }
-
-        // log::debug!("fork: clone_flags: {:?}", clone_flags);
-        // 设置线程组id、组长
-        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            pcb.thread.write_irqsave().group_leader =
-                current_pcb.thread.read_irqsave().group_leader.clone();
-            unsafe {
-                let ptr = pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
-                (*ptr).tgid = current_pcb.tgid;
-            }
-        } else {
-            pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
-
-            let ptr: *mut ProcessControlBlock =
-                pcb.as_ref() as *const ProcessControlBlock as *mut ProcessControlBlock;
-            unsafe {
-                (*ptr).tgid = pcb.raw_pid();
-            }
-        }
+        pcb.set_cmdline_snapshot(current_pcb.cmdline_snapshot());
 
         let current_leader = {
             let ti = current_pcb.thread.read_irqsave();
             ti.group_leader().unwrap_or_else(|| current_pcb.clone())
         };
+        let clone_into_cgroup_target = captured_target.as_ref().map_err(Clone::clone)?;
 
-        *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
-
-        if clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
-            *pcb.real_parent_pcb.write_irqsave() =
-                current_pcb.real_parent_pcb.read_irqsave().clone();
-            pcb.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
-        } else {
-            if clone_flags.contains(CloneFlags::CLONE_PARENT) {
-                *pcb.parent_pcb.write_irqsave() = current_pcb.parent_pcb.read_irqsave().clone();
-                *pcb.real_parent_pcb.write_irqsave() =
-                    current_pcb.real_parent_pcb.read_irqsave().clone();
-            } else {
-                *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
-                *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
-            }
-            pcb.exit_signal
-                .store(clone_args.exit_signal, Ordering::SeqCst);
-
-            if let Some(parent) = pcb.parent_pcb() {
-                let ppid_in_child_ns = parent
-                    .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
-                    .unwrap_or(RawPid::new(0));
-                pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
-            }
+        // Linux copy_creds(): construct any child-only keyring while the PCB
+        // is still unpublished.  A failed allocation returns from clone
+        // without making a child visible or retaining partial keyring state.
+        if let Some(child_cred) = pcb
+            .cred()
+            .prepare_fork_keyrings(clone_flags.contains(CloneFlags::CLONE_THREAD))?
+        {
+            pcb.set_cred(child_cred)?;
         }
 
-        // 拷贝 pidfd
+        // The default CPU is selected by wake_up_new_task(). Preserve only an
+        // explicit hint here, outside the fs publication barrier.
+        pcb.sched_info().mark_new_task(clone_args.target_cpu);
+
+        // All quota-bearing pidfd storage and its complete private File are
+        // born before the namespace/publication barrier. A reserved marker
+        // exposes no File, including with CLONE_FILES. Binding the actual PID
+        // later is infallible. User output is prepared here, but committed at
+        // Linux's namespace/PID-success boundary below.
+        let mut reserved_pidfd: Option<FdReservation<1>> = None;
+        let mut pidfd_file: Option<Arc<File>> = None;
+        // The physical/cache pins live outside the fs_refs closure. EFAULT is
+        // deliberately observed at the original late put_user position, after
+        // namespace/PID errors have had their Linux ordering opportunity.
+        let mut pidfd_output: Option<Result<PreparedUserWrite<i32>, SystemError>> = None;
         if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
-            let pid = pcb.raw_pid().0 as i32;
-            let root_inode = ProcessManager::current_mntns().root_inode();
-            let name = format!(
-                "Pidfd(from {} to {})",
-                ProcessManager::current_pcb().raw_pid().data(),
-                pid
-            );
-            let new_inode = root_inode.create(&name, FileType::File, InodeMode::S_IRWXUGO)?;
-            let file = File::new(new_inode, FileFlags::O_RDWR | FileFlags::O_CLOEXEC)?;
-            {
-                let mut guard = file.private_data.lock();
-                *guard = FilePrivateData::Pid(PidPrivateData::new(pid));
-            }
-            let r = current_pcb.fd_table().write().alloc_fd(file, None, true)?;
-
-            let mut writer = UserBufferWriter::new(
-                clone_args.parent_tid.data() as *mut i32,
-                core::mem::size_of::<i32>(),
+            let creator = crate::cgroup::memory::object_for_task(current_pcb);
+            let reservation = current_pcb.fd_table().reserve::<1>(
+                current_pcb.nofile_soft_limit(),
+                0,
                 true,
+                &creator,
             )?;
-
-            writer.copy_one_to_user(&(r as i32), 0)?;
+            let storage = PreparedFile::try_new_for(&creator)?;
+            let file = Arc::try_new(PidFd::create_unbound_file_prepared(
+                FileFlags::empty(),
+                storage,
+            )?)
+            .map_err(|_| SystemError::ENOMEM)?;
+            let output = match captured_pidfd_mm.expect("pidfd captures its original MM") {
+                Ok(mm) => PreparedUserWrite::<i32>::prepare(mm, clone_args.pidfd),
+                Err(_) => Err(SystemError::EFAULT),
+            };
+            if let Err(error) = &output {
+                if *error != SystemError::EFAULT {
+                    return Err(error.clone().into());
+                }
+            }
+            pidfd_output = Some(output);
+            reserved_pidfd = Some(reservation);
+            pidfd_file = Some(file);
         }
 
-        let pid = pcb.pid();
-        if pcb.is_thread_group_leader() {
-            if pcb.raw_pid() == RawPid(1) {
-                pcb.init_task_pid(PidType::TGID, pid.clone());
-                pcb.init_task_pid(PidType::PGID, pid.clone());
-                pcb.init_task_pid(PidType::SID, pid.clone());
+        // This closure preserves the original fs_refs barrier through PID
+        // membership/ALL_PROCESS publication. Its complete contract is
+        // Only System errors and pre-output RefaultRequired are possible here:
+        // no admission or whole-operation retry follows a successful output.
+        let finish = (|| -> Result<Option<PtraceForkSession>, ForkAttemptError> {
+            // Keep only the fs/namespace snapshot and the remaining child
+            // publication path on the same side of pivot_root's exclusive
+            // migration barrier. Potentially slow address-space, signal and
+            // architecture state copies above do not depend on this protocol.
+            let fs_refs_copy = lock_fs_refs_copy();
+
+            // 拷贝文件系统信息
+            Self::copy_fs(&clone_flags, current_pcb, pcb, &fs_refs_copy)?;
+
+            // 拷贝namespace。CLONE_NEWNS 的 fs 路径投影依赖刚复制的 fs_struct，
+            // 因而这两步必须相邻且同处 publication barrier 内。
+            Self::copy_namespaces(&clone_flags, current_pcb, pcb, &fs_refs_copy)?;
+
+            // Pre-create the parent's group while allocation failures are still
+            // harmless. The extra child owner is acquired only at publication.
+            let shared_sem_undo_ipc_ns = if clone_flags.contains(CloneFlags::CLONE_SYSVSEM) {
+                let ipc_ns = current_pcb.nsproxy().ipc_ns.clone();
+                current_pcb.ensure_sem_undo_group(&ipc_ns)?;
+                Some(ipc_ns)
             } else {
-                pcb.init_task_pid(PidType::TGID, pid.clone());
-                pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
-                pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
+                None
+            };
+
+            // alloc_pid
+            if pcb.raw_pid() == RawPid::UNASSIGNED {
+                // 分层PID分配：在父进程的子PID namespace中为新任务分配PID
+                let ns = pcb.nsproxy().pid_namespace_for_children().clone();
+
+                let main_pid_arc = super::pid::alloc_pid_with_tids(&ns, &clone_args.set_tid)?;
+
+                // 根namespace中的PID号作为RawPid
+                let root_pid_nr = main_pid_arc
+                    .first_upid()
+                    .ok_or(SystemError::EINVAL)?
+                    .nr
+                    .data();
+                // log::debug!("fork: root_pid_nr: {}", root_pid_nr);
+
+                unsafe {
+                    pcb.force_set_raw_pid(RawPid(root_pid_nr));
+                }
+                pcb.init_task_pid(PidType::PID, main_pid_arc);
             }
 
-            if pid.is_child_reaper() {
-                pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
-                pcb.sighand().flags_insert(SignalFlags::UNKILLABLE);
+            if let Some(output) = pidfd_output.as_ref() {
+                let output = output.as_ref().map_err(Clone::clone)?;
+                output.write(&reserved_pidfd.as_ref().expect("prepared pidfd slot").fd(0))?;
             }
 
-            // child_subreaper 是线程组级语义：用线程组 leader 的 siginfo 决定。
-            let parent_leader = {
-                let ti = current_pcb.thread.read_irqsave();
-                ti.group_leader().unwrap_or_else(|| current_pcb.clone())
-            };
-            let parent_siginfo = parent_leader.sig_info_irqsave();
-            let parent_tty = parent_siginfo.tty();
-            let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
-            let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
-            drop(parent_siginfo);
-            let mut sig_info_guard = pcb.sig_info_mut();
-
-            // log::debug!("set tty: {:?}", parent_tty);
-            sig_info_guard.set_tty(parent_tty);
-
-            /*
-             * Inherit has_child_subreaper flag under the same
-             * tasklist_lock with adding child to the process tree
-             * for propagate_has_child_subreaper optimization.
-             */
-            sig_info_guard
-                .set_has_child_subreaper(parent_has_child_subreaper || parent_is_child_reaper);
-            drop(sig_info_guard);
-            pcb.attach_pid(PidType::TGID);
-            pcb.attach_pid(PidType::PGID);
-            pcb.attach_pid(PidType::SID);
-        } else {
-            let group_leader = pcb.threads_read_irqsave().group_leader().unwrap();
-            current_pcb.sighand().with_group_exec_check(|| {
-                pcb.task_join_group_stop();
-                group_leader
-                    .threads_write_irqsave()
-                    .group_tasks
-                    .push(Arc::downgrade(pcb));
-            })?;
-
-            // 确保非组长线程的 TGID 与组长一致
-            let leader_tgid_pid = group_leader.pid();
-            pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
-            pcb.init_task_pid(PidType::PGID, leader_tgid_pid.clone());
-            pcb.init_task_pid(PidType::SID, leader_tgid_pid.clone());
-            pcb.attach_pid(PidType::TGID);
-            pcb.attach_pid(PidType::PGID);
-            pcb.attach_pid(PidType::SID);
-        }
-
-        pcb.attach_pid(PidType::PID);
-
-        // 将当前pcb加入父进程的子进程哈希表中
-        // 注意：根据 Linux 语义，子进程应该被添加到 **线程组 leader** 的 children 列表中
-        // 而不是创建它的线程的 children 列表中。这样线程组中的任何线程都可以 wait 这个子进程。
-        if pcb.raw_pid() > RawPid(1) && !clone_flags.contains(CloneFlags::CLONE_THREAD) {
-            let parent = pcb.parent_pcb().unwrap_or_else(|| current_leader.clone());
-            let parent_leader = {
-                let ti = parent.thread.read_irqsave();
-                ti.group_leader().unwrap_or_else(|| parent.clone())
-            };
-            let mut children = parent_leader.children.write_irqsave();
-            let parent_ns = parent_leader.active_pid_ns();
-            let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
-            if let Some(vpid) = child_vpid {
-                if vpid.data() != 0 {
-                    children.push(vpid);
-                } else {
-                    warn!(
-                        "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
-                        parent_leader.raw_pid(),
-                        pcb.raw_pid()
-                    );
+            // log::debug!("fork: clone_flags: {:?}", clone_flags);
+            // 设置线程组id、组长
+            if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                let current_thread = current_pcb.thread.read_irqsave();
+                let group_leader = current_thread.group_leader.clone();
+                let thread_group_live = current_thread.thread_group_live.clone();
+                drop(current_thread);
+                let mut child_thread = pcb.thread.write_irqsave();
+                child_thread.group_leader = group_leader;
+                child_thread.thread_group_live = thread_group_live;
+                drop(child_thread);
+                unsafe {
+                    // All child guards are gone and no attach_pid/add_pcb or
+                    // scheduler publication has exposed the unborn body yet.
+                    ProcessControlBlock::initialize_unpublished_group(pcb, current_pcb.tgid);
                 }
             } else {
-                warn!(
-                    "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
-                    parent_leader.raw_pid(),
-                    pcb.raw_pid()
+                pcb.thread.write_irqsave().group_leader = Arc::downgrade(pcb);
+
+                unsafe {
+                    ProcessControlBlock::initialize_unpublished_group(pcb, pcb.raw_pid());
+                }
+            }
+
+            // No global registry allocation can occur in the final PID attach
+            // transaction. A cancelled fork can leave reusable capacity behind.
+            ProcessManager::reserve_process_slot()?;
+
+            // Serialize final membership/affinity inheritance with cpuset updates
+            // and thread-group migration, through ALL_PROCESS and cgroup publication.
+            let cpuset_guard = crate::cgroup::cpuset::lock();
+            if current_pcb.raw_pid() != RawPid(0) {
+                pcb.set_task_cgroup_node_for_fork(current_pcb.task_cgroup_node());
+                let parent_pi = current_pcb.sched_info().pi_lock_irqsave();
+                let mut child_pi = pcb.sched_info().pi_lock_irqsave();
+                child_pi.user_cpus_allowed = parent_pi.user_cpus_allowed.clone();
+                if !clone_args.kthread {
+                    child_pi.set_cpus_allowed(parent_pi.cpus_allowed.clone());
+                }
+            }
+            let reserved_cgroup = if pcb.raw_pid() > RawPid(0) {
+                if let Some(target) = clone_into_cgroup_target.as_ref() {
+                    let src = pcb.task_cgroup_node();
+                    let namespace = current_pcb.nsproxy().cgroup_ns.clone();
+                    target.file.with_io_fs(|fs| {
+                        cgroup2_check_attach_namespace(fs, &src, &target.node, &namespace)
+                    })?;
+                    if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        crate::cgroup::threaded::validate_thread_domain(&src, &target.node)?;
+                    }
+                    target.file.with_io_fs(|fs| {
+                        cgroup2_check_attach_permissions(fs.root_inode(), &src, &target.node)
+                    })?;
+                }
+                let charge_node = clone_into_cgroup_target
+                    .as_ref()
+                    .map(|target| &target.node)
+                    .unwrap_or(&pcb.task_cgroup_node())
+                    .clone();
+                charge_node.reserve_task_slots(1)?;
+                let guard = cgroup_accounting_lock().lock();
+                cgroup_can_fork_in(&charge_node, 1)?;
+                if let Some(target) = clone_into_cgroup_target.as_ref() {
+                    cgroup_migrate_vet_dst(&target.node)?;
+                    pcb.set_task_cgroup_node_for_fork(target.node.clone());
+                }
+                let cgroup = pcb.task_cgroup_node();
+                cgroup.charge_pids(1);
+                drop(guard);
+                Some(cgroup)
+            } else {
+                None
+            };
+
+            if clone_flags.contains(CloneFlags::CLONE_PIDFD) {
+                PidFd::bind_pid(
+                    pidfd_file.as_ref().expect("prepared private pidfd"),
+                    pcb.pid(),
                 );
             }
-        }
 
-        let clone_into_cgroup_target = Self::resolve_clone_into_cgroup_target(&clone_args)?;
-
-        if pcb.raw_pid() > RawPid(0) {
-            let charge_node = clone_into_cgroup_target
-                .as_ref()
-                .unwrap_or(&pcb.task_cgroup_node())
-                .clone();
-            let src_node = pcb.task_cgroup_node();
-            let _cgroup_guard = cgroup_accounting_lock().lock();
-            cgroup_can_fork_in(&charge_node, 1)?;
-            if let Some(target_node) = clone_into_cgroup_target {
-                cgroup_migrate_vet_dst_with_src(&src_node, &target_node, 1)?;
-                pcb.set_task_cgroup_node_for_fork(target_node);
+            if !clone_args.kthread {
+                crate::cgroup::cpuset::attach_locked(pcb);
             }
-            let cgroup = pcb.task_cgroup_node();
-            cgroup.charge_pids(1);
-            cgroup.add_task(pcb.raw_pid());
-            ProcessManager::add_pcb(pcb.clone());
-            pcb.mark_visible_thread_accounted();
-            inc_visible_thread_count();
-            account_successful_fork();
+            crate::cgroup::cpu::fork_locked(pcb);
+            sched_cgroup_fork(pcb);
+
+            // 处理 rseq 状态。按 Linux copy_process() 顺序，应在任务对外可见前完成。
+            crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
+
+            // Event classification uses exit_signal!=SIGCHLD to distinguish
+            // CLONE/FORK (Linux fork.c), not CLONE_THREAD. The actual tracing
+            // snapshot is taken under the existing publication relation lock, so
+            // an untraced fork adds only one flag test to that transaction.
+            let ptrace_event = if clone_flags.contains(CloneFlags::CLONE_UNTRACED) {
+                None
+            } else if clone_flags.contains(CloneFlags::CLONE_VFORK) {
+                Some(PtraceEvent::VFork)
+            } else if clone_args.exit_signal != Signal::SIGCHLD as i32 {
+                Some(PtraceEvent::Clone)
+            } else {
+                Some(PtraceEvent::Fork)
+            };
+
+            let mut sem_undo_guard = None;
+            let mut attach_sem_undo = || {
+                if let Some(ipc_ns) = shared_sem_undo_ipc_ns.as_ref() {
+                    let mut guard = current_pcb
+                        .prepare_shared_sem_undo_attachment(ipc_ns)
+                        .expect("parent undo group was prepared before publication");
+                    guard.install_into(pcb);
+                    sem_undo_guard = Some(guard);
+                }
+            };
+            let mut inherited_ptrace_session = None;
+            let needs_oom_score_adj_sync = Self::needs_oom_score_adj_clone_vm_sync(&clone_flags);
+            let publish_result: Result<(), SystemError> = loop {
+                let oom_score_adj_guard =
+                    needs_oom_score_adj_sync.then(ProcessManager::lock_oom_score_adj);
+                // Keep PGID/SID publication ordered before the relation lock, the
+                // same order used by de_thread's membership transaction.
+                let membership_guard = crate::process::pid::pid_membership_lock();
+                let relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+
+                if !pcb.active_pid_ns().accepts_new_tasks() {
+                    break Err(SystemError::ENOMEM);
+                }
+
+                // Linux copy_process() rejects a dying parent immediately before
+                // task-list publication. OOM commit owns this same PID lock, so
+                // an unpublished CLONE_VM child cannot slip past its shared-MM
+                // snapshot after SIGKILL and become exposed to reaping un-killed.
+                if Signal::oom_fatal_signal_pending(current_pcb)
+                    || current_pcb.flags().contains(ProcessFlags::EXITING)
+                    || current_pcb
+                        .process_signal()
+                        .flags_contains(SignalFlags::GROUP_EXEC)
+                {
+                    break Err(SystemError::EINTR);
+                }
+                if !ProcessManager::has_process_slot() {
+                    drop(relation_guard);
+                    drop(membership_guard);
+                    drop(oom_score_adj_guard);
+                    if let Err(error) = ProcessManager::reserve_process_slot() {
+                        break Err(error);
+                    }
+                    continue;
+                }
+
+                // UPDATE remains held from pids reservation through add_task.
+                // Match migration's PID -> accounting order for the final online
+                // check; do not reapply pids.max to an already admitted birth.
+                if let Some(cgroup) = reserved_cgroup.as_ref() {
+                    let _accounting = cgroup_accounting_lock().lock();
+                    if !crate::cgroup::cgroup_root().is_online(cgroup) {
+                        break Err(SystemError::ENOENT);
+                    }
+                }
+
+                let fork_session = ptrace_event.and_then(|event| {
+                    current_pcb
+                        .flags()
+                        .contains(ProcessFlags::PTRACED)
+                        .then(|| {
+                            ptrace_fork_session_snapshot_locked(
+                                current_pcb,
+                                event,
+                                clone_flags.contains(CloneFlags::CLONE_PTRACE),
+                            )
+                        })
+                        .flatten()
+                });
+                if let Some((session, false)) = fork_session.as_ref() {
+                    drop(relation_guard);
+                    drop(membership_guard);
+                    drop(oom_score_adj_guard);
+                    if let Err(err) =
+                        ProcessControlBlock::ptrace_reserve_fork_relation_slot(session)
+                    {
+                        break Err(err);
+                    }
+                    continue;
+                }
+                let fork_session = fork_session.map(|(session, _slot_available)| session);
+
+                let thread_group_leader =
+                    clone_flags.contains(CloneFlags::CLONE_THREAD).then(|| {
+                        pcb.threads_read_irqsave()
+                            .group_leader()
+                            .expect("CLONE_THREAD child must have a thread-group leader")
+                    });
+                if let Some(group_leader) = thread_group_leader.as_ref() {
+                    let slot_available = {
+                        let threads = group_leader.threads_read_irqsave();
+                        threads.group_tasks.len() < threads.group_tasks.capacity()
+                    };
+                    if !slot_available {
+                        drop(relation_guard);
+                        drop(membership_guard);
+                        drop(oom_score_adj_guard);
+                        if let Err(err) = group_leader.try_reserve_thread_group_slot() {
+                            break Err(err);
+                        }
+                        // Another fork can consume the reserved slot before this
+                        // transaction is reacquired, so capacity is rechecked on
+                        // every iteration.
+                        continue;
+                    }
+                }
+
+                let result = if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
+                    let inherited_real_parent = current_pcb.real_parent_pcb.read_irqsave().clone();
+                    *pcb.parent_pcb.write_irqsave() = inherited_parent;
+                    *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                    *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                    *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                    pcb.exit_signal.store(-1, Ordering::SeqCst);
+
+                    let group_leader = thread_group_leader
+                        .as_ref()
+                        .expect("CLONE_THREAD publication requires a group leader");
+                    // PCB construction happens before the membership transaction.
+                    // Refresh the per-thread tty here so session_clear_tty() and
+                    // thread publication have a single linearization order.
+                    let inherited_tty = current_pcb.sig_info_irqsave().tty();
+                    pcb.sig_info_mut().set_tty(inherited_tty);
+                    if let Err(err) = current_pcb.process_signal().with_group_exec_check(|| {
+                        attach_sem_undo();
+                        let live = pcb
+                            .threads_read_irqsave()
+                            .thread_group_live
+                            .fetch_add(1, Ordering::Relaxed);
+                        assert_ne!(live, 0, "cannot publish a thread into a dead group");
+                        pcb.attach_pid(PidType::PID);
+                        group_leader
+                            .threads_write_irqsave()
+                            .group_tasks
+                            .push(Arc::downgrade(pcb));
+                    }) {
+                        break Err(err);
+                    }
+
+                    let leader_tgid_pid = group_leader.pid();
+                    pcb.init_task_pid(PidType::TGID, leader_tgid_pid.clone());
+                    pcb.attach_pid(PidType::TGID);
+                    Ok(())
+                } else {
+                    attach_sem_undo();
+                    if clone_flags.contains(CloneFlags::CLONE_PARENT) {
+                        let inherited_parent = current_pcb.parent_pcb.read_irqsave().clone();
+                        let inherited_real_parent =
+                            current_pcb.real_parent_pcb.read_irqsave().clone();
+                        *pcb.parent_pcb.write_irqsave() = inherited_parent;
+                        *pcb.real_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                        *pcb.wait_parent_pcb.write_irqsave() = inherited_real_parent.clone();
+                        *pcb.fork_parent_pcb.write_irqsave() = inherited_real_parent;
+                        pcb.exit_signal.store(
+                            current_leader.exit_signal.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                        );
+                    } else {
+                        *pcb.parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                        *pcb.real_parent_pcb.write_irqsave() = Arc::downgrade(&current_leader);
+                        *pcb.wait_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                        *pcb.fork_parent_pcb.write_irqsave() = Arc::downgrade(current_pcb);
+                        pcb.exit_signal
+                            .store(clone_args.exit_signal, Ordering::SeqCst);
+                    }
+
+                    if let Some(parent) = pcb.parent_pcb() {
+                        let ppid_in_child_ns = parent
+                            .task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns()))
+                            .unwrap_or(RawPid::new(0));
+                        pcb.basic.write_irqsave().ppid = ppid_in_child_ns;
+                    }
+                    // The child inherits the parent's execution domain flags (personality)
+                    pcb.basic
+                        .write_irqsave()
+                        .set_personality(current_pcb.basic().personality());
+
+                    let pid = pcb.pid();
+                    if pcb.raw_pid() == RawPid(1) {
+                        pcb.init_task_pid(PidType::TGID, pid.clone());
+                        pcb.init_task_pid(PidType::PGID, pid.clone());
+                        pcb.init_task_pid(PidType::SID, pid.clone());
+                    } else {
+                        pcb.init_task_pid(PidType::TGID, pid.clone());
+                        pcb.init_task_pid(PidType::PGID, current_pcb.task_pgrp().unwrap());
+                        pcb.init_task_pid(PidType::SID, current_pcb.task_session().unwrap());
+                    }
+
+                    if pid.is_child_reaper() {
+                        pid.ns_of_pid().set_child_reaper(Arc::downgrade(pcb));
+                        pcb.process_signal().flags_insert(SignalFlags::UNKILLABLE);
+                    }
+
+                    let real_parent = pcb
+                        .real_parent_pcb()
+                        .unwrap_or_else(|| current_leader.clone());
+                    let parent_leader = {
+                        let ti = real_parent.thread.read_irqsave();
+                        ti.group_leader().unwrap_or_else(|| real_parent.clone())
+                    };
+                    let parent_siginfo = parent_leader.sig_info_irqsave();
+                    let parent_tty = parent_siginfo.tty();
+                    let parent_has_child_subreaper = parent_siginfo.has_child_subreaper();
+                    let parent_is_child_reaper = parent_siginfo.is_child_subreaper();
+                    drop(parent_siginfo);
+                    let mut sig_info_guard = pcb.sig_info_mut();
+                    sig_info_guard.set_tty(parent_tty);
+                    sig_info_guard.set_has_child_subreaper(
+                        parent_has_child_subreaper || parent_is_child_reaper,
+                    );
+                    drop(sig_info_guard);
+
+                    pcb.attach_pid(PidType::TGID);
+                    pcb.attach_pid(PidType::PGID);
+                    pcb.attach_pid(PidType::SID);
+                    pcb.attach_pid(PidType::PID);
+
+                    // Publish the child into the parent's children list. This must
+                    // happen inside the same relation-lock critical section as parent
+                    // field init and PID attach, to close the window where exit/adopt
+                    // sees a parent pointer but the children list is still empty.
+                    if pcb.raw_pid() > RawPid(1) {
+                        let parent = pcb.parent_pcb().unwrap_or_else(|| current_leader.clone());
+                        let parent_leader = {
+                            let ti = parent.thread.read_irqsave();
+                            ti.group_leader().unwrap_or_else(|| parent.clone())
+                        };
+                        let mut children = parent_leader.children.write_irqsave();
+                        let parent_ns = parent_leader.active_pid_ns();
+                        let child_vpid = pcb.task_pid_nr_ns(PidType::PID, Some(parent_ns));
+                        if let Some(vpid) = child_vpid {
+                            if vpid.data() != 0 {
+                                children.push(vpid);
+                            } else {
+                                warn!(
+                                "fork: child pid is 0 in parent pidns, parent pid={:?}, child pid={:?}",
+                                parent_leader.raw_pid(),
+                                pcb.raw_pid()
+                            );
+                            }
+                        } else {
+                            warn!(
+                            "fork: failed to resolve child pid in parent pidns, parent pid={:?}, child pid={:?}",
+                            parent_leader.raw_pid(),
+                            pcb.raw_pid()
+                        );
+                        }
+                    }
+
+                    Ok(())
+                };
+
+                if result.is_ok() {
+                    if pcb.raw_pid() > RawPid(0) {
+                        // Final population is part of the membership transaction.
+                        // Install it before publishing inherited stop/ptrace state.
+                        let _accounting = cgroup_accounting_lock().lock();
+                        let cgroup = pcb.task_cgroup_node();
+                        crate::cgroup::freezer::publish(pcb, cgroup);
+                        pcb.mark_visible_thread_accounted();
+                        inc_visible_thread_count();
+                        account_successful_fork();
+                    }
+                    if let Some(session) = fork_session {
+                        if pcb.ptrace_link_inherit_from_locked(current_pcb, &session) {
+                            inherited_ptrace_session = Some(session);
+                        }
+                    }
+                    if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        join_new_thread_group_stop_locked(pcb);
+                    }
+                    if pcb.raw_pid() > RawPid(0) {
+                        if needs_oom_score_adj_sync {
+                            Self::sync_oom_score_adj_for_clone_vm(current_pcb, pcb);
+                        }
+                        if clone_flags.contains(CloneFlags::CLONE_VM) {
+                            if let Some(shared_vm) = pcb.basic().user_vm() {
+                                shared_vm.user_count_inc();
+                            }
+                        }
+                        // Registry visibility and PID/thread-group membership are
+                        // one transaction. There are no fallible steps after this.
+                        ProcessManager::add_pcb(pcb.clone(), &fs_refs_copy);
+                    }
+                }
+                break result;
+            };
+            if let Err(err) = publish_result {
+                drop(reserved_pidfd.take());
+                Self::rollback_failed_fork(current_pcb, None, reserved_cgroup.as_ref());
+                return Err(err.into());
+            }
+
+            if let Some(guard) = sem_undo_guard {
+                guard.disarm();
+            }
+
+            drop(fs_refs_copy);
+            drop(cpuset_guard);
+
+            // 设置child_tid，意味着子线程能够知道自己的id。
+            // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。
+            if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
+                pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
+            }
+
+            // The shared user count was installed before registry publication.
+            // Owner handoff's sequence notification needs only its own short lock
+            // and is completed before the child can run.
+            if clone_flags.contains(CloneFlags::CLONE_VM) {
+                if let Some(shared_vm) = pcb.basic().user_vm() {
+                    shared_vm.note_shared_task_published(pcb);
+                }
+            }
+
+            // Linux installs pidfd only after copy_process() has fully initialized
+            // and published the child. The reserved slot cannot be consumed by
+            // another fd-table operation, so failure here would mean an internal
+            // reservation invariant was violated, not a recoverable fork error.
+            match (reserved_pidfd.take(), pidfd_file.take()) {
+                (Some(reservation), Some(file)) => {
+                    let expected = reservation.fd(0);
+                    let installed = reservation
+                        .install_arc(file)
+                        .expect("reserved pidfd slot changed before fork publication");
+                    assert_eq!(installed, expected);
+                }
+                (None, None) => {}
+                _ => unreachable!("pidfd reservation and file must be prepared together"),
+            }
+
+            Ok(inherited_ptrace_session)
+        })();
+        finish
+    }
+
+    /// Report the ptrace FORK/CLONE/VFORK event (parent-side ptrace-stop).
+    ///
+    /// On call, the parent enters ptrace_stop here, blocks, and notifies the tracer.
+    /// If called before wake_up_new_task, the child is not woken and tracer wait(child)
+    /// blocks forever.
+    pub fn ptrace_report_fork_event(
+        current_pcb: &Arc<ProcessControlBlock>,
+        pcb: &Arc<ProcessControlBlock>,
+        session: Option<&PtraceForkSession>,
+    ) {
+        let Some(session) = session.filter(|session| session.report_event()) else {
+            return;
+        };
+        // The event_message (child pid) is translated into the ptracer's pid namespace.
+        let child_vpid = pcb
+            .task_pid_nr_ns(PidType::PID, Some(session.tracer().active_pid_ns()))
+            .map(|p| p.data())
+            .unwrap_or(0);
+        current_pcb.ptrace_fork_event_bound(
+            session.event(),
+            child_vpid,
+            session.source_generation(),
+        );
+    }
+
+    fn rollback_failed_fork(
+        current_pcb: &Arc<ProcessControlBlock>,
+        installed_pidfd: Option<i32>,
+        reserved_cgroup: Option<&Arc<crate::cgroup::CgroupNode>>,
+    ) {
+        if let Some(fd) = installed_pidfd {
+            let dropped = current_pcb.fd_table().drop_fd(fd);
+            match dropped {
+                Ok(dropped) => {
+                    if let Err(err) = dropped.finish_close() {
+                        warn!("fork: failed to close rolled back pidfd: {:?}", err);
+                    }
+                }
+                Err(err) => {
+                    warn!("fork: failed to roll back pidfd {}: {:?}", fd, err);
+                }
+            }
         }
 
-        // 设置child_tid，意味着子线程能够知道自己的id。
-        // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。
-        if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
-            pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
+        if let Some(cgroup) = reserved_cgroup {
+            cgroup.uncharge_pids(1);
         }
-
-        // 新任务的默认落点 CPU 应在 wakeup_new_task() 时再选择；这里只保留显式 hint，
-        // 以避免 fork 长路径内父任务迁移导致的“过早采样当前 CPU”问题。
-        pcb.sched_info().mark_new_task(clone_args.target_cpu);
-        sched_cgroup_fork(pcb);
-
-        // 处理 rseq 状态
-        crate::process::rseq::rseq_fork(pcb, clone_flags.contains(CloneFlags::CLONE_VM));
-
-        Ok(())
     }
 
     fn copy_fs(
         clone_flags: &CloneFlags,
         parent_pcb: &Arc<ProcessControlBlock>,
         child_pcb: &Arc<ProcessControlBlock>,
-    ) -> Result<(), SystemError> {
+        fs_refs: &FsRefsReadGuard,
+    ) -> Result<(), MemoryAllocationError> {
         let fs = parent_pcb.fs_struct();
-        let mut guard = child_pcb.fs_struct_mut();
-        if clone_flags.contains(CloneFlags::CLONE_FS) {
-            *guard = fs.clone();
+        let child_fs = if clone_flags.contains(CloneFlags::CLONE_FS) {
+            fs
         } else {
-            let new_fs = (*fs).clone();
-            *guard = Arc::new(new_fs);
-        }
+            FsStruct::try_clone_for(&fs, &crate::cgroup::memory::object_for_task(parent_pcb))?
+        };
+        let retired = child_pcb.set_fs_struct(child_fs, fs_refs);
+        // First unpublished installation has no old slot or private stock.
+        assert!(retired.is_none(), "fork installed fs twice");
         Ok(())
     }
 
     fn resolve_clone_into_cgroup_target(
         clone_args: &KernelCloneArgs,
-    ) -> Result<Option<Arc<crate::cgroup::CgroupNode>>, SystemError> {
+    ) -> Result<Option<CloneCgroupTarget>, SystemError> {
         if !clone_args.flags.contains(CloneFlags::CLONE_INTO_CGROUP) {
             return Ok(None);
         }
@@ -990,32 +1470,39 @@ impl ProcessManager {
             .get_file_by_fd(fd)
             .ok_or(SystemError::EBADF)?;
 
-        if file.inode().fs().name() != "cgroup2" {
+        if file.with_io_fs(|fs| fs.name() != "cgroup2") {
             return Err(SystemError::EINVAL);
         }
         if file.inode().metadata()?.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
+        let _update_guard = crate::cgroup::lock();
         let node = cgroup2_inode_to_node(&file.inode())?;
-        let ns_root = current.nsproxy().cgroup_ns.root_cgroup().clone();
-        if !ns_root.is_ancestor_of(&node) {
-            return Err(SystemError::ENOENT);
-        }
         let src = current.task_cgroup_node();
-        if !ns_root.is_ancestor_of(&src) {
-            return Err(SystemError::ENOENT);
-        }
-        if Arc::ptr_eq(&src, &node) {
-            return Ok(None);
-        }
+        let namespace = current.nsproxy().cgroup_ns.clone();
+        file.with_io_fs(|fs| cgroup2_check_attach_namespace(fs, &src, &node, &namespace))?;
         if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
-            return Err(SystemError::EINVAL);
+            crate::cgroup::threaded::validate_thread_domain(&src, &node)?;
         }
-        cgroup2_check_attach_permissions(file.inode().fs().root_inode(), &src, &node)?;
-        cgroup_migrate_vet_dst_with_src(&src, &node, 1)?;
+        file.with_io_fs(|fs| cgroup2_check_attach_permissions(fs.root_inode(), &src, &node))?;
+        cgroup_migrate_vet_dst(&node)?;
 
-        Ok(Some(node))
+        Ok(Some(CloneCgroupTarget { node, file }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newipc_and_sysvsem_are_rejected_before_attachment_prepare() {
+        let flags = CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM;
+        assert_eq!(
+            validate_semundo_clone_flags_for_test(flags),
+            Err(SystemError::EINVAL)
+        );
     }
 }
 
@@ -1030,7 +1517,7 @@ impl ProcessControlBlock {
         if pid_type == PidType::PID {
             self.thread_pid.write().replace(pid);
         } else {
-            self.sighand().set_pid(pid_type, Some(pid));
+            self.process_signal().set_pid(pid_type, Some(pid));
         }
     }
 }

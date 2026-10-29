@@ -76,8 +76,25 @@ impl Bus for PlatformBus {
         return pdrv.probe(&pdev);
     }
 
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let pdrv = drv.cast::<dyn PlatformDriver>().map_err(|_| {
+            error!(
+                "PlatformBus::remove() failed: device.driver() is not a PlatformDriver. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        let pdev = device.clone().cast::<dyn PlatformDevice>().map_err(|_| {
+            error!(
+                "PlatformBus::remove() failed: device is not a PlatformDevice. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+
+        return pdrv.remove(&pdev);
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {

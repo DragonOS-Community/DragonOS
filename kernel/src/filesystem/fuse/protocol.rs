@@ -33,6 +33,10 @@ pub const FUSE_WRITE: u32 = 16;
 pub const FUSE_STATFS: u32 = 17;
 pub const FUSE_RELEASE: u32 = 18;
 pub const FUSE_FSYNC: u32 = 20;
+pub const FUSE_SETXATTR: u32 = 21;
+pub const FUSE_GETXATTR: u32 = 22;
+pub const FUSE_LISTXATTR: u32 = 23;
+pub const FUSE_REMOVEXATTR: u32 = 24;
 pub const FUSE_FLUSH: u32 = 25;
 pub const FUSE_INIT: u32 = 26;
 pub const FUSE_OPENDIR: u32 = 27;
@@ -43,8 +47,11 @@ pub const FUSE_ACCESS: u32 = 34;
 pub const FUSE_CREATE: u32 = 35;
 pub const FUSE_INTERRUPT: u32 = 36;
 pub const FUSE_DESTROY: u32 = 38; // no reply
+pub const FUSE_FALLOCATE: u32 = 43;
 pub const FUSE_READDIRPLUS: u32 = 44;
 pub const FUSE_RENAME2: u32 = 45;
+pub const FUSE_SETUPMAPPING: u32 = 48;
+pub const FUSE_REMOVEMAPPING: u32 = 49;
 
 // INIT flags (subset)
 pub const FUSE_ASYNC_READ: u64 = 1 << 0;
@@ -57,6 +64,7 @@ pub const FUSE_AUTO_INVAL_DATA: u64 = 1 << 12;
 pub const FUSE_DO_READDIRPLUS: u64 = 1 << 13;
 pub const FUSE_READDIRPLUS_AUTO: u64 = 1 << 14;
 pub const FUSE_ASYNC_DIO: u64 = 1 << 15;
+#[allow(dead_code)]
 pub const FUSE_WRITEBACK_CACHE: u64 = 1 << 16;
 pub const FUSE_NO_OPEN_SUPPORT: u64 = 1 << 17;
 pub const FUSE_PARALLEL_DIROPS: u64 = 1 << 18;
@@ -66,7 +74,46 @@ pub const FUSE_ABORT_ERROR: u64 = 1 << 21;
 pub const FUSE_MAX_PAGES: u64 = 1 << 22;
 pub const FUSE_NO_OPENDIR_SUPPORT: u64 = 1 << 24;
 pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
+pub const FUSE_MAP_ALIGNMENT: u64 = 1 << 26;
+/// Guest auto-mounts directories marked FUSE_ATTR_SUBMOUNT (Linux fuse.h: init->flags bit 27).
+pub const FUSE_SUBMOUNTS: u64 = 1 << 27;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
+pub const FUSE_HAS_INODE_DAX: u64 = 1 << 33;
+/// Kernel supports expiry-only entry invalidation (Linux 6.6 fuse.h bit 35).
+pub const FUSE_HAS_EXPIRE_ONLY: u64 = 1 << 35;
+/// Allow shared mmap for FOPEN_DIRECT_IO files (Linux 6.6 fuse.h bit 36).
+#[allow(dead_code)]
+pub const FUSE_DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
+
+/// fuse_attr.flags (Linux 6.6): directory is a submount root announced by virtiofsd.
+pub const FUSE_ATTR_SUBMOUNT: u32 = 1 << 0;
+/// fuse_attr.flags (Linux 6.6): enable DAX for this regular file in inode mode.
+pub const FUSE_ATTR_DAX: u32 = 1 << 1;
+
+// fuse_getattr_in.getattr_flags (Linux 6.6 uapi subset)
+pub const FUSE_GETATTR_FH: u32 = 1 << 0;
+
+// fuse_open_out.open_flags (Linux 6.6 uapi subset)
+pub const FOPEN_DIRECT_IO: u32 = 1 << 0;
+pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+#[allow(dead_code)]
+pub const FOPEN_NONSEEKABLE: u32 = 1 << 2;
+#[allow(dead_code)]
+pub const FOPEN_CACHE_DIR: u32 = 1 << 3;
+#[allow(dead_code)]
+pub const FOPEN_STREAM: u32 = 1 << 4;
+#[allow(dead_code)]
+pub const FOPEN_NOFLUSH: u32 = 1 << 5;
+#[allow(dead_code)]
+pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
+
+// fuse_write_in.write_flags (Linux 6.6 uapi subset)
+pub const FUSE_WRITE_CACHE: u32 = 1 << 0;
+pub const FUSE_WRITE_LOCKOWNER: u32 = 1 << 1;
+pub const FUSE_WRITE_KILL_SUIDGID: u32 = 1 << 2;
+
+// fuse_read_in.read_flags (Linux 6.6 uapi subset)
+pub const FUSE_READ_LOCKOWNER: u32 = 1 << 1;
 
 // getattr/setattr valid bits (subset)
 pub const FATTR_MODE: u32 = 1 << 0;
@@ -81,16 +128,43 @@ pub const FATTR_FH: u32 = 1 << 6;
 pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 #[allow(dead_code)]
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
+pub const FATTR_LOCKOWNER: u32 = 1 << 9;
 pub const FATTR_CTIME: u32 = 1 << 10;
 
 pub const FUSE_FSYNC_FDATASYNC: u32 = 1 << 0;
+
+pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
+pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 1 << 1;
 pub const FUSE_NOTIFY_POLL: i32 = 1;
 pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
 pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
 pub const FUSE_NOTIFY_STORE: i32 = 4;
 pub const FUSE_NOTIFY_RETRIEVE: i32 = 5;
 pub const FUSE_NOTIFY_DELETE: i32 = 6;
+pub const FUSE_EXPIRE_ONLY: u32 = 1 << 0;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalInodeOut {
+    pub ino: u64,
+    pub off: i64,
+    pub len: i64,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalEntryOut {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyDeleteOut {
+    pub parent: u64,
+    pub child: u64,
+    pub namelen: u32,
+    pub padding: u32,
+}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FuseInHeader {
@@ -140,6 +214,33 @@ pub struct FuseInitOut {
     pub flags2: u32,
     pub unused: [u32; 7],
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseSetupMappingIn {
+    pub fh: u64,
+    pub foffset: u64,
+    pub len: u64,
+    pub flags: u64,
+    pub moffset: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseRemoveMappingIn {
+    pub count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseRemoveMappingOne {
+    pub moffset: u64,
+    pub len: u64,
+}
+
+const _: [(); 40] = [(); size_of::<FuseSetupMappingIn>()];
+const _: [(); 4] = [(); size_of::<FuseRemoveMappingIn>()];
+const _: [(); 16] = [(); size_of::<FuseRemoveMappingOne>()];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -246,6 +347,16 @@ pub struct FuseWriteIn {
 #[derive(Debug, Clone, Copy)]
 pub struct FuseWriteOut {
     pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseFallocateIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub mode: u32,
     pub padding: u32,
 }
 
@@ -377,6 +488,27 @@ pub struct FuseFlushIn {
 pub struct FuseFsyncIn {
     pub fh: u64,
     pub fsync_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseSetxattrInCompat {
+    pub size: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseGetxattrIn {
+    pub size: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseGetxattrOut {
+    pub size: u32,
     pub padding: u32,
 }
 

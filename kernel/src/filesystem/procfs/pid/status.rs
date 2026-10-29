@@ -2,17 +2,19 @@
 //!
 //! 显示进程的详细状态信息
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     filesystem::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_snapshot_operation, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::pid::PidType,
+    process::{pid::PidType, RawPid},
 };
 use alloc::{
     borrow::ToOwned,
@@ -41,34 +43,38 @@ impl StatusFileOps {
             .unwrap()
     }
 
-    /// 生成 status 文件内容
+    /// Render the contents of `status` for the task this node points at.
+    ///
+    /// This mirrors Linux 6.6 `proc_pid_status()`, where the inode's `struct pid`
+    /// selects the task, so `/proc/<pid>/status` and `/proc/<pid>/task/<tid>/status`
+    /// share one implementation (`Tgid` still comes from the thread group). The
+    /// two selections differ only while `exec` hands the group over in de_thread.
     fn generate_status_content(&self) -> Result<Vec<u8>, SystemError> {
-        let pcb = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        let pcb = self.target.task().ok_or(SystemError::ESRCH)?;
         let view_pid_ns = self.target.view_pid_ns();
         let mut pdata = Vec::new();
 
-        let (name, user_vm, fd_table) = {
+        let (name, fd_table) = {
             let basic = pcb.basic();
-            (
-                basic.name().to_string(),
-                basic.user_vm(),
-                basic.try_fd_table(),
-            )
+            (basic.name().to_string(), basic.try_fd_table())
         };
 
-        let state = {
-            let sched_info = pcb.sched_info();
-            sched_info.inner_lock_read_irqsave().state()
-        };
-        let cpu_id = pcb
-            .sched_info()
+        let sched_info_guard = pcb.sched_info();
+        let state = sched_info_guard.state();
+        let cpu_id = sched_info_guard
             .on_cpu()
             .map(|cpu| cpu.data() as i32)
             .unwrap_or(-1);
-        let priority = pcb.sched_info().policy();
+        // Preserve this pre-existing DragonOS field while Linux policy and
+        // effective scheduler class are represented separately.
+        let priority = match sched_info_guard.sched_class() {
+            crate::sched::SchedClass::Idle => "IDLE",
+            _ => match sched_info_guard.policy() {
+                crate::sched::LinuxSchedPolicy::Normal => "CFS",
+                crate::sched::LinuxSchedPolicy::Fifo => "FIFO",
+                crate::sched::LinuxSchedPolicy::Rr => "RR",
+            },
+        };
         let vrtime = pcb.sched_info().sched_entity.vruntime;
         let time = pcb.sched_info().sched_entity.sum_exec_runtime;
         let start_time = pcb.sched_info().sched_entity.exec_start;
@@ -81,7 +87,25 @@ impl StatusFileOps {
         pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
 
         // Tgid
-        pdata.append(&mut format!("\nTgid:\t{}", self.target.tgid().data()).into());
+        //
+        // Mirror Linux 6.6 `task_tgid_nr_ns()` in proc_pid_status(): the group
+        // id is derived from the task pinned above, never from a second PID
+        // lookup. Re-resolving the link here would emit `Tgid:\t0` while `Pid`
+        // still names the task, if the thread detaches it in between.
+        let tgid = pcb
+            .task_pid_nr_ns(PidType::TGID, Some(view_pid_ns.clone()))
+            .unwrap_or(RawPid::new(0));
+        pdata.append(&mut format!("\nTgid:\t{}", tgid.data()).into());
+
+        // Like Linux task_sig(): all live records and timer reservations for
+        // this task's current real UID/user namespace, not its queue length.
+        let cred = pcb.cred();
+        let pending_signals =
+            crate::ipc::signal_quota::SignalAccount::usage(&cred.user_ns, cred.uid.data());
+        let pending_limit = pcb
+            .get_rlimit(crate::process::resource::RLimitID::Sigpending)
+            .rlim_cur;
+        pdata.append(&mut format!("\nSigQ:\t{}/{}", pending_signals, pending_limit).into());
 
         // Pid
         pdata.append(
@@ -101,6 +125,17 @@ impl StatusFileOps {
             )
             .as_bytes()
             .to_owned(),
+        );
+
+        // TracerPid (TID of the exact tracer task in the reader's PID namespace)
+        let tracer_pid = crate::process::ptrace::ptracer_of(&pcb)
+            .and_then(|t| t.task_pid_ptr(PidType::PID))
+            .map(|pid| pid.pid_nr_ns(view_pid_ns).data() as isize)
+            .unwrap_or(0);
+        pdata.append(
+            &mut format!("\nTracerPid:\t{}", tracer_pid)
+                .as_bytes()
+                .to_owned(),
         );
 
         // FDSize
@@ -133,35 +168,37 @@ impl StatusFileOps {
         // Kthread
         pdata.append(&mut format!("\nKthread:\t{}", pcb.is_kthread() as usize).into());
         pdata.append(&mut format!("\ncpu_id:\t{}", cpu_id).as_bytes().to_owned());
-        pdata.append(&mut format!("\npriority:\t{:?}", priority).as_bytes().to_owned());
-        pdata.append(
-            &mut format!("\npreempt:\t{}", pcb.preempt_count())
-                .as_bytes()
-                .to_owned(),
-        );
+        pdata.append(&mut format!("\npriority:\t{}", priority).as_bytes().to_owned());
 
         pdata.append(&mut format!("\nvrtime:\t{}", vrtime).as_bytes().to_owned());
 
-        if let Some(user_vm) = user_vm {
-            let address_space_guard = user_vm.read();
-            // todo: 当前进程运行过程中占用内存的峰值
-            let hiwater_vm: u64 = 0;
+        // Like Linux get_task_mm(), pin the mm's users, not just its Arc:
+        // exit/exec must not tear down mappings while this snapshot is taken.
+        if let Some(user_vm) = pcb.active_vm() {
+            let address_space_guard = user_vm.vm().read_guard_no_reservations();
+            // Match stat/statm: count committed virtual mappings, including
+            // untouched/PROT_NONE ranges, rather than resident physical pages.
+            let size = address_space_guard.vma_usage_bytes() / 1024;
+            let hiwater_vm = address_space_guard.mappings.peak_usage_bytes() / 1024;
             // 进程代码段的大小
             let text = (address_space_guard.end_code - address_space_guard.start_code) / 1024;
             // 进程数据段的大小
             let data = (address_space_guard.end_data - address_space_guard.start_data) / 1024;
             drop(address_space_guard);
+            // The last mmput can take the mm write lock during teardown.
+            drop(user_vm);
             pdata.append(
                 &mut format!("\nVmPeak:\t{} kB", hiwater_vm)
                     .as_bytes()
                     .to_owned(),
             );
+            pdata.append(&mut format!("\nVmSize:\t{} kB", size).as_bytes().to_owned());
             pdata.append(&mut format!("\nVmData:\t{} kB", data).as_bytes().to_owned());
             pdata.append(&mut format!("\nVmExe:\t{} kB", text).as_bytes().to_owned());
         }
 
         pdata.append(
-            &mut format!("\nflags: {:?}\n", pcb.flags().clone())
+            &mut format!("\nflags: {:?}\n", pcb.flags())
                 .as_bytes()
                 .to_owned(),
         );
@@ -184,6 +221,8 @@ impl StatusFileOps {
                 .to_owned(),
         );
 
+        pdata.extend_from_slice(crate::cgroup::cpuset::status(&pcb).as_bytes());
+
         // 去除多余的 \0 并在结尾添加 \0
         trim_string(&mut pdata);
 
@@ -192,16 +231,25 @@ impl StatusFileOps {
 }
 
 impl FileOps for StatusFileOps {
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let content = self.generate_status_content()?;
-        // log::info!("Generated /proc/[pid]/status content");
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
 
-        proc_read(offset, len, buf, &content)
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
+        &self,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // Linux serves `/proc/<pid>/status` through `single_open()`, so one fd
+        // sees one record: EOF stays EOF even while `Time`/`Stime`/`vrtime`
+        // keep growing, and repositioning re-renders.
+        proc_snapshot_operation(operation, data, || self.generate_status_content())
     }
 }

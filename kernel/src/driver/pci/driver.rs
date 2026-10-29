@@ -25,7 +25,10 @@ pub trait PciDriver: Driver {
     /// - Ok:probe成功
     /// - Err:probe失败
     fn probe(&self, device: &Arc<dyn PciDevice>, id: &PciDeviceID) -> Result<(), SystemError>;
-    fn remove(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
+    /// Final notification that the PCI function is being detached. Physical
+    /// removal cannot be vetoed, so implementations must quiesce resources and
+    /// leave stale references unable to access hardware.
+    fn remove(&self, device: &Arc<dyn PciDevice>);
     fn shutdown(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn suspend(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;
     fn resume(&self, device: &Arc<dyn PciDevice>) -> Result<(), SystemError>;

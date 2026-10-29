@@ -1,4 +1,5 @@
 use bitflags::bitflags;
+use system_error::SystemError;
 /// Loop 设备基础名称
 pub const LOOP_BASENAME: &str = "loop";
 
@@ -14,10 +15,6 @@ pub const LOOP_IO_DRAIN_TIMEOUT_MS: u32 = 30_000;
 /// I/O 排空检查间隔 (微秒)
 pub const LOOP_IO_DRAIN_CHECK_INTERVAL_US: u32 = 10_000;
 
-/// drain_active_io 最大重试次数
-/// 超过此次数后将强制进入 Deleting 状态，避免无限重试
-pub const LOOP_IO_DRAIN_MAX_RETRIES: u32 = 3;
-
 /// Loop 设备 ioctl 命令
 #[repr(u32)]
 #[derive(Debug, FromPrimitive)]
@@ -26,9 +23,9 @@ pub enum LoopIoctl {
     LoopSetFd = 0x4C00,
     /// 清除后端文件绑定
     LoopClrFd = 0x4C01,
-    /// 设置设备状态 (32位兼容)
+    /// 设置设备状态（native legacy ABI）
     LoopSetStatus = 0x4C02,
-    /// 获取设备状态 (32位兼容)
+    /// 获取设备状态（native legacy ABI）
     LoopGetStatus = 0x4C03,
     /// 设置设备状态 (64位)
     LoopSetStatus64 = 0x4C04,
@@ -64,6 +61,13 @@ bitflags! {
     pub struct LoopFlags: u32 {
         /// 只读模式
         const READ_ONLY = 1 << 0;
+        /// Clear the backing file after the last opener and mount holder leave.
+        const AUTOCLEAR = 1 << 2;
+        /// Enable partition scanning. Once enabled, status updates cannot
+        /// clear it; the complete binding teardown clears the flag.
+        const PARTSCAN = 1 << 3;
+        /// Effective direct-I/O mode, published by the loop configuration owner.
+        const DIRECT_IO = 1 << 4;
     }
 }
 
@@ -75,8 +79,11 @@ pub const LOOP_KEY_SIZE: usize = 32;
 
 /// Linux UAPI: `__kernel_old_dev_t`
 ///
-/// 在 DragonOS 的 Linux 兼容头中（`kernel/submodules/DragonStub/inc/dragonstub/linux/posix_types.h`）
-/// 该类型被定义为 `unsigned int`，即 4 字节。
+/// Native x86_64 overrides the asm-generic unsigned int with unsigned long.
+/// The other supported 64-bit architectures use the asm-generic definition.
+#[cfg(target_arch = "x86_64")]
+type KernelOldDevT = u64;
+#[cfg(not(target_arch = "x86_64"))]
 type KernelOldDevT = u32;
 
 /// Loop 设备状态信息结构体（legacy 版本，对应 Linux 的 `struct loop_info`）
@@ -87,6 +94,9 @@ type KernelOldDevT = u32;
 #[derive(Clone, Copy)]
 pub struct LoopStatus {
     pub lo_number: i32,
+    // Explicit C ABI padding keeps whole-structure copyout fully initialized.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) _pad_after_number: u32,
     pub lo_device: KernelOldDevT,
     pub lo_inode: u64,
     pub lo_rdevice: KernelOldDevT,
@@ -96,14 +106,19 @@ pub struct LoopStatus {
     pub lo_flags: i32,
     pub lo_name: [u8; LOOP_NAME_SIZE],
     pub lo_encrypt_key: [u8; LOOP_KEY_SIZE],
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(super) _pad_before_init: u32,
     pub lo_init: [u64; 2],
     pub reserved: [u8; 4],
+    pub(super) _pad_after_reserved: u32,
 }
 
 impl Default for LoopStatus {
     fn default() -> Self {
         Self {
             lo_number: 0,
+            #[cfg(target_arch = "x86_64")]
+            _pad_after_number: 0,
             lo_device: 0,
             lo_inode: 0,
             lo_rdevice: 0,
@@ -113,8 +128,11 @@ impl Default for LoopStatus {
             lo_flags: 0,
             lo_name: [0u8; LOOP_NAME_SIZE],
             lo_encrypt_key: [0u8; LOOP_KEY_SIZE],
+            #[cfg(not(target_arch = "x86_64"))]
+            _pad_before_init: 0,
             lo_init: [0u64; 2],
             reserved: [0u8; 4],
+            _pad_after_reserved: 0,
         }
     }
 }
@@ -166,6 +184,94 @@ impl Default for LoopStatus64 {
         }
     }
 }
+
+/// Native Linux `struct loop_config`, shared by CONFIGURE and legacy SET_FD.
+/// All initial mapping/status fields are committed with the binding itself.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LoopConfig {
+    pub fd: u32,
+    pub block_size: u32,
+    pub info: LoopStatus64,
+    pub reserved: [u64; 8],
+}
+
+impl LoopStatus64 {
+    /// Native legacy input is normalized before the configuration owner checks
+    /// state and parameters. Linux ignores its obsolete crypto fields and
+    /// resets sizelimit, which has no representation in this ABI.
+    // old_dev_t is u64 on x86_64 and u32 on the generic 64-bit ABIs.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn from_legacy(info: &LoopStatus) -> Self {
+        Self {
+            lo_number: info.lo_number as u32,
+            lo_device: info.lo_device as u64,
+            lo_inode: info.lo_inode,
+            lo_rdevice: info.lo_rdevice as u64,
+            // Preserve sign extension; the owner reports EOVERFLOW for a
+            // negative offset after checking that the device is bound.
+            lo_offset: info.lo_offset as i64 as u64,
+            lo_flags: info.lo_flags as u32,
+            lo_file_name: info.lo_name,
+            ..Self::default()
+        }
+    }
+}
+
+impl TryFrom<LoopStatus64> for LoopStatus {
+    type Error = SystemError;
+
+    fn try_from(info: LoopStatus64) -> Result<Self, Self::Error> {
+        Ok(Self {
+            lo_number: info.lo_number as i32,
+            lo_device: KernelOldDevT::try_from(info.lo_device)
+                .map_err(|_| SystemError::EOVERFLOW)?,
+            lo_inode: info.lo_inode,
+            lo_rdevice: KernelOldDevT::try_from(info.lo_rdevice)
+                .map_err(|_| SystemError::EOVERFLOW)?,
+            lo_offset: i32::try_from(info.lo_offset).map_err(|_| SystemError::EOVERFLOW)?,
+            lo_flags: info.lo_flags as i32,
+            lo_name: info.lo_file_name,
+            ..Self::default()
+        })
+    }
+}
+
+// These are native Linux UAPI layouts. Legacy is not a compat32 ABI; DragonOS
+// currently executes ELF64 only. There must be no implicit padding in the
+// structures sent through protected byte copyout.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(align_of::<LoopStatus>() == 8);
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(size_of::<LoopStatus>() == 168);
+        assert!(offset_of!(LoopStatus, lo_device) == 8);
+        assert!(offset_of!(LoopStatus, lo_offset) == 32);
+        assert!(offset_of!(LoopStatus, lo_name) == 48);
+        assert!(offset_of!(LoopStatus, lo_init) == 144);
+        assert!(offset_of!(LoopStatus, reserved) == 160);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        assert!(size_of::<LoopStatus>() == 160);
+        assert!(offset_of!(LoopStatus, lo_device) == 4);
+        assert!(offset_of!(LoopStatus, lo_offset) == 20);
+        assert!(offset_of!(LoopStatus, lo_name) == 36);
+        assert!(offset_of!(LoopStatus, lo_init) == 136);
+        assert!(offset_of!(LoopStatus, reserved) == 152);
+    }
+    assert!(size_of::<LoopConfig>() == 304);
+    assert!(align_of::<LoopConfig>() == 8);
+    assert!(offset_of!(LoopConfig, info) == 8);
+    assert!(offset_of!(LoopConfig, reserved) == 240);
+    assert!(size_of::<LoopStatus64>() == 232);
+    assert!(align_of::<LoopStatus64>() == 8);
+    assert!(offset_of!(LoopStatus64, lo_offset) == 24);
+    assert!(offset_of!(LoopStatus64, lo_flags) == 52);
+    assert!(offset_of!(LoopStatus64, lo_file_name) == 56);
+    assert!(offset_of!(LoopStatus64, lo_init) == 216);
+};
 
 /// Loop 设备状态
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

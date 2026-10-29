@@ -212,11 +212,16 @@ pub trait KvmFunc: Send + Sync + Debug {
 
     fn prepare_switch_to_guest(&self, vcpu: &mut VirtCpu);
 
+    fn prepare_switch_to_host(&self, vcpu: &mut VirtCpu);
+
     fn flush_tlb_all(&self, vcpu: &mut VirtCpu);
 
     fn vcpu_run(&self, vcpu: &mut VirtCpu) -> ExitFastpathCompletion;
 
     fn handle_exit_irqoff(&self, vcpu: &mut VirtCpu);
+
+    /// Caches VM-exit fields that are consumed after migration is allowed again.
+    fn cache_exit_info(&self, vcpu: &mut VirtCpu);
 
     fn handle_exit(
         &self,

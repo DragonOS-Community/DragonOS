@@ -15,6 +15,6 @@ install: all
 	mv about $(DADK_CURRENT_BUILD_DIR)/about.elf
 
 clean:
-	rm about *.o sys_version.h
+	rm -f about *.o sys_version.h
 
 fmt:

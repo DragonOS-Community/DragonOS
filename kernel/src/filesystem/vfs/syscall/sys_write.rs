@@ -2,12 +2,16 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_WRITE;
-use crate::mm::VirtAddr;
+use crate::arch::MMArch;
+use crate::filesystem::vfs::file::File;
+use crate::mm::{access_ok, MemoryManagementArch, VirtAddr};
 use crate::process::ProcessManager;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::{user_accessible_len, UserBufferReader};
+use crate::syscall::user_access::UserBufferReader;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// System call handler for the `write` syscall
@@ -39,37 +43,37 @@ impl Syscall for SysWriteHandle {
         let fd = Self::fd(args);
         let buf_vaddr = Self::buf(args);
         let len = Self::len(args);
+        // Retain the selected OFD across range validation and the write, rather
+        // than looking up a possibly reused fd a second time.
+        let file = get_file_by_fd(fd)?;
+        file.writeable()?;
+
+        // Numerical user-range admission also applies to count==0. This
+        // checks no mappings and copies no payload: NULL+0 remains valid.
+        if frame.is_from_user() {
+            access_ok(VirtAddr::new(buf_vaddr as usize), len).map_err(|_| SystemError::EFAULT)?;
+        }
 
         // Linux/POSIX: count==0 must not touch the user buffer, but it still must validate
         // the fd and perform the file/socket write semantics.
         // In particular, datagram sockets must deliver a zero-length datagram (gVisor tests).
         if len == 0 {
-            return do_write(fd, &[]);
+            return file.write(0, &[]);
         }
 
-        // 用户态：先检查可访问长度，避免直接触碰无效页；内核态直接使用
-        let user_buffer_reader = if frame.is_from_user() {
-            let accessible = user_accessible_len(
-                VirtAddr::new(buf_vaddr as usize),
-                len,
-                false, /*write?*/
-            );
-            if accessible == 0 {
-                return Err(SystemError::EFAULT);
-            }
-            UserBufferReader::new(buf_vaddr, accessible, true)?
+        if frame.is_from_user() {
+            // Linux checks the original numerical range before MAX_RW_COUNT.
+            // NULL is numerical input too: only the owner may attempt payload
+            // copying, after its EPIPE/EAGAIN decisions. No NULL slice is made.
+            let address = VirtAddr::new(buf_vaddr as usize);
+            let input = unsafe { UserBuffer::new(address, len) };
+            let count = len.min((i32::MAX as usize) & !(MMArch::PAGE_SIZE - 1));
+            file.write_user(count, &input)
         } else {
-            UserBufferReader::new(buf_vaddr, len, false)?
-        };
-
-        let kernel_buf = if frame.is_from_user() {
-            let protected_buf = user_buffer_reader.buffer_protected(0)?;
-            protected_buf.read_all()?
-        } else {
-            user_buffer_reader.read_from_user(0)?.to_vec()
-        };
-        // 可访问长度小于请求长度时，按可访问部分写入（短写），与 Linux 行为接近
-        do_write(fd, &kernel_buf)
+            let reader = UserBufferReader::new(buf_vaddr, len, false)?;
+            let kernel_buf = reader.read_from_user(0)?.to_vec();
+            file.write(kernel_buf.len(), &kernel_buf)
+        }
     }
 
     /// Formats the syscall parameters for display/debug purposes
@@ -107,16 +111,7 @@ impl SysWriteHandle {
 
 syscall_table_macros::declare_syscall!(SYS_WRITE, SysWriteHandle);
 
-/// Internal implementation of the write operation
-///
-/// # Arguments
-/// * `fd` - File descriptor to write to
-/// * `buf` - Buffer containing data to write
-///
-/// # Returns
-/// * `Ok(usize)` - Number of bytes successfully written
-/// * `Err(SystemError)` - Error code if operation fails
-pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
+pub(super) fn get_file_by_fd(fd: i32) -> Result<Arc<File>, SystemError> {
     let binding = ProcessManager::current_pcb().fd_table();
     let fd_table_guard = binding.read();
 
@@ -124,8 +119,8 @@ pub(super) fn do_write(fd: i32, buf: &[u8]) -> Result<usize, SystemError> {
         .get_file_by_fd(fd)
         .ok_or(SystemError::EBADF)?;
 
-    // drop guard 以避免无法调度的问题
+    // drop guard to avoid scheduling issues
     drop(fd_table_guard);
 
-    return file.write(buf.len(), buf);
+    Ok(file)
 }

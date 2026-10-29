@@ -4,13 +4,16 @@ mod consts;
 mod print;
 
 use crate::bpf::helper::print::trace_printf;
+use crate::bpf::map::ringbuf::{ringbuf_discard, ringbuf_reserve, ringbuf_submit};
 use crate::bpf::map::{BpfCallBackFn, BpfMap};
 use crate::include::bindings::linux_bpf::BPF_F_CURRENT_CPU;
 use crate::libs::lazy_init::Lazy;
+use crate::mm::VirtAddr;
+use crate::process::ProcessManager;
 use crate::smp::core::smp_get_processor_id;
-use crate::syscall::user_access::check_and_clone_cstr;
+use crate::syscall::user_access::copy_from_user_protected;
 use crate::time::Instant;
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::collections::BTreeMap;
 use core::ffi::c_void;
 use system_error::SystemError;
 
@@ -24,20 +27,16 @@ macro_rules! define_func {
 
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_lookup_elem/
 unsafe fn raw_map_lookup_elem(map: *mut c_void, key: *const c_void) -> *const c_void {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let key_size = map.key_size();
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let value = map_lookup_elem(&map, key);
-    // log::info!("<raw_map_lookup_elem>: {:x?}", value);
-    // warning: We need to keep the map alive, so we don't drop it here.
-    let _ = Arc::into_raw(map);
-    match value {
+    // The program holds the map alive; the helper only borrows it.
+    let map = unsafe { &*(map as *const BpfMap) };
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, map.key_size()) };
+    match map_lookup_elem(map, key) {
         Ok(Some(value)) => value as *const c_void,
         _ => core::ptr::null_mut(),
     }
 }
 
-pub fn map_lookup_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<Option<*const u8>> {
+pub fn map_lookup_elem(map: &BpfMap, key: &[u8]) -> Result<Option<*const u8>> {
     let mut binding = map.inner_map().lock();
     let value = binding.lookup_elem(key);
     match value {
@@ -56,24 +55,15 @@ unsafe fn raw_perf_event_output(
     data: *mut c_void,
     size: u64,
 ) -> i64 {
-    // log::info!("<raw_perf_event_output>: {:x?}", data);
-    let map = Arc::from_raw(map as *const BpfMap);
-    let data = core::slice::from_raw_parts(data as *const u8, size as usize);
-    let res = perf_event_output(ctx, &map, flags, data);
-    // warning: We need to keep the map alive, so we don't drop it here.
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let data = unsafe { core::slice::from_raw_parts(data as *const u8, size as usize) };
+    match perf_event_output(ctx, map, flags, data) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn perf_event_output(
-    ctx: *mut c_void,
-    map: &Arc<BpfMap>,
-    flags: u64,
-    data: &[u8],
-) -> Result<()> {
+pub fn perf_event_output(ctx: *mut c_void, map: &BpfMap, flags: u64, data: &[u8]) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let index = flags as u32;
     let flags = (flags >> 32) as u32;
@@ -125,21 +115,19 @@ unsafe fn raw_map_update_elem(
     value: *const c_void,
     flags: u64,
 ) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
+    let map = unsafe { &*(map as *const BpfMap) };
     let key_size = map.key_size();
     let value_size = map.value_size();
     // log::info!("<raw_map_update_elem>: flags: {:x?}", flags);
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let value = core::slice::from_raw_parts(value as *const u8, value_size);
-    let res = map_update_elem(&map, key, value, flags);
-    let _ = Arc::into_raw(map);
-    match res {
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, key_size) };
+    let value = unsafe { core::slice::from_raw_parts(value as *const u8, value_size) };
+    match map_update_elem(map, key, value, flags) {
         Ok(_) => 0,
         Err(e) => e as _,
     }
 }
 
-pub fn map_update_elem(map: &Arc<BpfMap>, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
+pub fn map_update_elem(map: &BpfMap, key: &[u8], value: &[u8], flags: u64) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.update_elem(key, value, flags);
     value
@@ -149,18 +137,15 @@ pub fn map_update_elem(map: &Arc<BpfMap>, key: &[u8], value: &[u8], flags: u64) 
 ///
 /// The delete map element helper call is used to delete values from maps.
 unsafe fn raw_map_delete_elem(map: *mut c_void, key: *const c_void) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let key_size = map.key_size();
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let res = map_delete_elem(&map, key);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, map.key_size()) };
+    match map_delete_elem(map, key) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_delete_elem(map: &Arc<BpfMap>, key: &[u8]) -> Result<()> {
+pub fn map_delete_elem(map: &BpfMap, key: &[u8]) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.delete_elem(key);
     value
@@ -188,18 +173,16 @@ unsafe fn raw_map_for_each_elem(
     ctx: *const c_void,
     flags: u64,
 ) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let cb = *core::mem::transmute::<*const c_void, *const BpfCallBackFn>(cb);
-    let res = map_for_each_elem(&map, cb, ctx as _, flags);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let cb = unsafe { *core::mem::transmute::<*const c_void, *const BpfCallBackFn>(cb) };
+    match map_for_each_elem(map, cb, ctx as _, flags) {
         Ok(v) => v as i64,
         Err(e) => e as i64,
     }
 }
 
 pub fn map_for_each_elem(
-    map: &Arc<BpfMap>,
+    map: &BpfMap,
     cb: BpfCallBackFn,
     ctx: *const u8,
     flags: u64,
@@ -217,23 +200,15 @@ unsafe fn raw_map_lookup_percpu_elem(
     key: *const c_void,
     cpu: u32,
 ) -> *const c_void {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let key_size = map.key_size();
-    let key = core::slice::from_raw_parts(key as *const u8, key_size);
-    let value = map_lookup_percpu_elem(&map, key, cpu);
-    // warning: We need to keep the map alive, so we don't drop it here.
-    let _ = Arc::into_raw(map);
-    match value {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let key = unsafe { core::slice::from_raw_parts(key as *const u8, map.key_size()) };
+    match map_lookup_percpu_elem(map, key, cpu) {
         Ok(Some(value)) => value as *const c_void,
         _ => core::ptr::null_mut(),
     }
 }
 
-pub fn map_lookup_percpu_elem(
-    map: &Arc<BpfMap>,
-    key: &[u8],
-    cpu: u32,
-) -> Result<Option<*const u8>> {
+pub fn map_lookup_percpu_elem(map: &BpfMap, key: &[u8], cpu: u32) -> Result<Option<*const u8>> {
     let mut binding = map.inner_map().lock();
     let value = binding.lookup_percpu_elem(key, cpu);
     match value {
@@ -245,18 +220,15 @@ pub fn map_lookup_percpu_elem(
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_push_elem/
 unsafe fn raw_map_push_elem(map: *mut c_void, value: *const c_void, flags: u64) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let value_size = map.value_size();
-    let value = core::slice::from_raw_parts(value as *const u8, value_size);
-    let res = map_push_elem(&map, value, flags);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let value = unsafe { core::slice::from_raw_parts(value as *const u8, map.value_size()) };
+    match map_push_elem(map, value, flags) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_push_elem(map: &Arc<BpfMap>, value: &[u8], flags: u64) -> Result<()> {
+pub fn map_push_elem(map: &BpfMap, value: &[u8], flags: u64) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.push_elem(value, flags);
     value
@@ -266,18 +238,15 @@ pub fn map_push_elem(map: &Arc<BpfMap>, value: &[u8], flags: u64) -> Result<()> 
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_pop_elem/
 unsafe fn raw_map_pop_elem(map: *mut c_void, value: *mut c_void) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let value_size = map.value_size();
-    let value = core::slice::from_raw_parts_mut(value as *mut u8, value_size);
-    let res = map_pop_elem(&map, value);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let value = unsafe { core::slice::from_raw_parts_mut(value as *mut u8, map.value_size()) };
+    match map_pop_elem(map, value) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_pop_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
+pub fn map_pop_elem(map: &BpfMap, value: &mut [u8]) -> Result<()> {
     let mut binding = map.inner_map().lock();
     let value = binding.pop_elem(value);
     value
@@ -287,18 +256,15 @@ pub fn map_pop_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
 ///
 /// See https://ebpf-docs.dylanreimerink.nl/linux/helper-function/bpf_map_peek_elem/
 unsafe fn raw_map_peek_elem(map: *mut c_void, value: *mut c_void) -> i64 {
-    let map = Arc::from_raw(map as *const BpfMap);
-    let value_size = map.value_size();
-    let value = core::slice::from_raw_parts_mut(value as *mut u8, value_size);
-    let res = map_peek_elem(&map, value);
-    let _ = Arc::into_raw(map);
-    match res {
+    let map = unsafe { &*(map as *const BpfMap) };
+    let value = unsafe { core::slice::from_raw_parts_mut(value as *mut u8, map.value_size()) };
+    match map_peek_elem(map, value) {
         Ok(_) => 0,
         Err(e) => e as i64,
     }
 }
 
-pub fn map_peek_elem(map: &Arc<BpfMap>, value: &mut [u8]) -> Result<()> {
+pub fn map_peek_elem(map: &BpfMap, value: &mut [u8]) -> Result<()> {
     let binding = map.inner_map().lock();
     let value = binding.peek_elem(value);
     value
@@ -332,12 +298,129 @@ unsafe fn raw_probe_read_user_str(dst: *mut c_void, size: u32, unsafe_ptr: *cons
 }
 
 pub fn probe_read_user_str(dst: &mut [u8], src: *const u8) -> Result<usize> {
-    let str = check_and_clone_cstr(src, None).unwrap();
-    let len = str.as_bytes().len();
-    let copy_len = len.min(dst.len() - 1); // Leave space for NULL terminator
-    dst[..copy_len].copy_from_slice(&str.as_bytes()[..copy_len]);
-    dst[copy_len] = 0; // Null-terminate the string
-    Ok(copy_len + 1) // Return length including NULL terminator
+    // A BPF program may pass any pointer. Match Linux strncpy_from_user
+    // semantics: stop at the first NUL (or at size-1), and stop cleanly at
+    // the first unreadable byte instead of faulting. A whole-buffer copy
+    // would fault past short strings that end near a page boundary and
+    // discard the readable prefix.
+    if dst.is_empty() {
+        return Err(SystemError::EFAULT);
+    }
+    let mut end = 0usize;
+    let limit = dst.len() - 1;
+    while end < limit {
+        let mut byte = [0u8; 1];
+        let ok = unsafe { copy_from_user_protected(&mut byte, VirtAddr::new(src as usize + end)) }
+            .is_ok();
+        if !ok || byte[0] == 0 {
+            break;
+        }
+        dst[end] = byte[0];
+        end += 1;
+    }
+    dst[end] = 0;
+    Ok(end + 1)
+}
+
+/// A helper function that returns the process ID of the current process
+/// (upper 32 bits, the thread group id) and the thread ID of the current
+/// thread (lower 32 bits).
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_pid_tgid/
+unsafe fn raw_get_current_pid_tgid() -> u64 {
+    let pcb = ProcessManager::current_pcb();
+    ((pcb.raw_tgid().data() as u64) << 32) | (pcb.raw_pid().data() as u64)
+}
+
+/// A helper function that returns the UID (lower 32 bits) and GID
+/// (upper 32 bits) of the current task.
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_uid_gid/
+unsafe fn raw_get_current_uid_gid() -> u64 {
+    let cred = ProcessManager::current_pcb().cred();
+    ((cred.gid.data() as u64) << 32) | (cred.uid.data() as u64)
+}
+
+/// Copy the comm attribute of the current task into buf (of size min(size,
+/// TASK_COMM_LEN)), NUL-terminated.
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_comm/
+unsafe fn raw_get_current_comm(buf: *mut c_void, size: u64) -> i64 {
+    if size == 0 {
+        return SystemError::EINVAL.to_posix_errno() as i64;
+    }
+    let pcb = ProcessManager::current_pcb();
+    let dst = core::slice::from_raw_parts_mut(buf as *mut u8, size as usize);
+    dst.fill(0);
+    let basic = pcb.basic();
+    let name = basic.name().as_bytes();
+    // Linux comm is the basename of argv[0], truncated to TASK_COMM_LEN-1;
+    // DragonOS stores the full argv[0] here.
+    let basename = match name.iter().rposition(|b| *b == b'/') {
+        Some(pos) => &name[pos + 1..],
+        None => name,
+    };
+    let copy_len = basename.len().min((size as usize - 1).min(15));
+    dst[..copy_len].copy_from_slice(&basename[..copy_len]);
+    dst[copy_len] = 0;
+    0
+}
+
+/// store the bytes in dst. Unlike `bpf_probe_read`, faults on the user address
+/// are caught (exception-table protected copy) and reported as -EFAULT instead
+/// of crashing the kernel.
+///
+/// See https://docs.ebpf.io/linux/helper-function/bpf_probe_read_user/
+unsafe fn raw_probe_read_user(dst: *mut c_void, size: u32, unsafe_ptr: *const c_void) -> i64 {
+    if size == 0 {
+        return 0;
+    }
+    let dst = core::slice::from_raw_parts_mut(dst as *mut u8, size as usize);
+    let _no_fault = crate::process::preempt::PageFaultDisabledGuard::new();
+    let res = copy_from_user_protected(dst, VirtAddr::new(unsafe_ptr as usize));
+    match res {
+        Ok(_) => 0,
+        Err(e) => {
+            dst.fill(0);
+            e.to_posix_errno() as i64
+        }
+    }
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_reserve/
+unsafe fn raw_ringbuf_reserve(map: *mut c_void, size: u64, flags: u64) -> u64 {
+    let map = unsafe { &*(map as *const BpfMap) };
+    ringbuf_reserve(map, size, flags) as u64
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_submit/
+unsafe fn raw_ringbuf_submit(data: *mut c_void, flags: u64) -> u64 {
+    ringbuf_submit(data as *mut u8, flags);
+    0
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_discard/
+unsafe fn raw_ringbuf_discard(data: *mut c_void, flags: u64) -> u64 {
+    ringbuf_discard(data as *mut u8, flags);
+    0
+}
+
+/// See https://docs.ebpf.io/linux/helper-function/bpf_ringbuf_output/
+unsafe fn raw_ringbuf_output(map: *mut c_void, data: *mut c_void, size: u64, flags: u64) -> u64 {
+    if flags & !3 != 0 {
+        return SystemError::EINVAL.to_posix_errno() as u64;
+    }
+    let map = unsafe { &*(map as *const BpfMap) };
+    let dst = ringbuf_reserve(map, size, 0);
+    if dst.is_null() {
+        return SystemError::EAGAIN_OR_EWOULDBLOCK.to_posix_errno() as u64;
+    }
+    let src = unsafe { core::slice::from_raw_parts(data as *const u8, size as usize) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+    ringbuf_submit(dst, flags);
+    0
 }
 
 pub static BPF_HELPER_FUN_SET: Lazy<BTreeMap<u32, RawBPFHelperFn>> = Lazy::new();
@@ -378,10 +461,28 @@ pub fn init_helper_functions() {
         map.insert(HELPER_MAP_PEEK_ELEM, define_func!(raw_map_peek_elem));
 
         // User access helpers
+        map.insert(HELPER_PROBE_READ_USER, define_func!(raw_probe_read_user));
         map.insert(
             HELPER_PROBE_READ_USER_STR,
             define_func!(raw_probe_read_user_str),
         );
+
+        // Current task helpers
+        map.insert(
+            HELPER_GET_CURRENT_PID_TGID,
+            define_func!(raw_get_current_pid_tgid),
+        );
+        map.insert(
+            HELPER_GET_CURRENT_UID_GID,
+            define_func!(raw_get_current_uid_gid),
+        );
+        map.insert(HELPER_GET_CURRENT_COMM, define_func!(raw_get_current_comm));
+
+        // Ring buffer helpers
+        map.insert(HELPER_RINGBUF_OUTPUT, define_func!(raw_ringbuf_output));
+        map.insert(HELPER_RINGBUF_RESERVE, define_func!(raw_ringbuf_reserve));
+        map.insert(HELPER_RINGBUF_SUBMIT, define_func!(raw_ringbuf_submit));
+        map.insert(HELPER_RINGBUF_DISCARD, define_func!(raw_ringbuf_discard));
     }
     BPF_HELPER_FUN_SET.init(map);
 }

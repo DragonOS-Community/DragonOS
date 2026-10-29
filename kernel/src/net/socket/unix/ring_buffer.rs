@@ -111,6 +111,11 @@ impl<T: Pod> RingBuffer<T> {
             .store(true, core::sync::atomic::Ordering::Release);
     }
 
+    pub fn has_connreset_pending(&self) -> bool {
+        self.connreset_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn take_connreset_pending(&self) -> bool {
         self.connreset_pending
             .swap(false, core::sync::atomic::Ordering::AcqRel)
@@ -203,16 +208,17 @@ impl<T: Pod> RingBuffer<T> {
         }
     }
 
-    pub(super) fn plan_stream_recvmsg(&self, max: usize, want_creds: bool) -> StreamRecvmsgPlan {
-        if max == 0 {
-            return StreamRecvmsgPlan {
-                bytes: 0,
-                cred: None,
-                rights: Vec::new(),
-                rights_start: None,
-            };
+    /// A zero-length non-PEEK stream recv sees the queued byte but discards
+    /// its attached rights, just like a nonzero read that starts this record.
+    pub fn discard_rights_at_head(&self) {
+        let head = self.head();
+        let mut q = self.scm_queue.lock();
+        if let Some(record) = q.iter_mut().find(|r| r.start <= head && r.end() > head) {
+            record.rights.clear();
         }
+    }
 
+    pub(super) fn plan_stream_recvmsg(&self, max: usize, want_creds: bool) -> StreamRecvmsgPlan {
         let head = self.head();
         let q = self.scm_queue.lock();
         if q.is_empty() {
@@ -251,6 +257,17 @@ impl<T: Pod> RingBuffer<T> {
         };
 
         let base_cred = if want_creds { q[i].cred } else { None };
+        if max == 0 {
+            let rights = q[i].rights.clone();
+            let rights_start = (!rights.is_empty()).then_some(q[i].start);
+            return StreamRecvmsgPlan {
+                bytes: 0,
+                cred: base_cred,
+                rights,
+                rights_start,
+            };
+        }
+
         let mut pos = head;
         let mut remaining = max;
         let mut bytes = 0usize;
@@ -478,6 +495,17 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     }
 
     pub fn push_slice(&mut self, items: &[T]) -> Option<()> {
+        self.push_slice_with_scm(items, None)
+    }
+
+    /// Publish a stream chunk and its ancillary metadata as one visible unit.
+    /// The consumer takes buffer.read before scm_queue, so preserve that lock
+    /// order and advance tail only after both bytes and metadata are ready.
+    pub fn push_slice_with_scm(
+        &mut self,
+        items: &[T],
+        scm: Option<(Option<UCred>, Vec<Arc<File>>)>,
+    ) -> Option<()> {
         let rb = &self.ring_buffer;
         let nitems = items.len();
 
@@ -512,6 +540,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         }
 
         write_guard[start..start + remaining_items.len()].copy_from_slice(remaining_items);
+
+        if let Some((cred, rights)) = scm {
+            rb.push_scm_at(tail, nitems, cred, rights);
+        }
 
         // Advance the tail by the number of items written
         rb.advance_tail(tail, nitems);
@@ -563,6 +595,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 }
 
 impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub fn has_connreset_pending(&self) -> bool {
+        self.ring_buffer.has_connreset_pending()
+    }
+
     pub fn take_connreset_pending(&self) -> bool {
         self.ring_buffer.take_connreset_pending()
     }
@@ -637,47 +673,47 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         Some(())
     }
 
-    /// Pop a slice while preserving record metadata for partially-consumed
-    /// records. This is used by recvmsg.
-    pub fn pop_slice_preserve_records(&mut self, buf: &mut [T]) -> Option<()> {
-        let rb = &self.ring_buffer;
-        let nitems = buf.len();
-
+    /// Advance the consumer without copying payload bytes.
+    ///
+    /// This is the commit operation for callers that already peeked and
+    /// delivered the bytes transactionally.
+    pub fn consume(&mut self, nitems: usize) -> Option<()> {
         if nitems == 0 {
             return Some(());
         }
 
-        // Synchronize with resize(): capacity/offset must match backing storage.
+        let rb = &self.ring_buffer;
         let read_guard = rb.buffer.read();
-        let capacity = read_guard.len();
-
         let head = rb.head();
-        let tail = rb.tail();
-        let available = (tail - head).0;
+        let available = (rb.tail() - head).0;
         if available < nitems {
             return None;
         }
 
-        let offset = head.0 & (capacity - 1);
+        rb.advance_head(head, nitems);
+        rb.advance_scm_to(head + Wrapping(nitems));
+        drop(read_guard);
+        Some(())
+    }
 
-        let mut start = offset;
-        let mut remaining_len = nitems;
-        let mut buf_start = 0;
-
-        if start + nitems > capacity {
-            let first_part_len = capacity - start;
-            buf[..first_part_len].copy_from_slice(&read_guard[start..start + first_part_len]);
-
-            start = 0;
-            remaining_len -= first_part_len;
-            buf_start = first_part_len;
+    /// Advance the consumer after a successful recvmsg copy while retaining
+    /// metadata for a record that was only partially consumed.
+    pub fn consume_preserve_records(&mut self, nitems: usize) -> Option<()> {
+        if nitems == 0 {
+            return Some(());
         }
 
-        buf[buf_start..buf_start + remaining_len]
-            .copy_from_slice(&read_guard[start..start + remaining_len]);
+        let rb = &self.ring_buffer;
+        let read_guard = rb.buffer.read();
+        let head = rb.head();
+        let available = (rb.tail() - head).0;
+        if available < nitems {
+            return None;
+        }
 
         rb.advance_head(head, nitems);
         rb.advance_records_to(head + Wrapping(nitems));
+        drop(read_guard);
         Some(())
     }
 
@@ -777,6 +813,14 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         self.ring_buffer.is_send_shutdown()
     }
 
+    /// No more bytes can arrive after the receive queue is drained.
+    ///
+    /// The consumer observes this both after its owner calls `SHUT_RD` and
+    /// after the producer calls `SHUT_WR`.
+    pub fn is_read_shutdown(&self) -> bool {
+        self.is_recv_shutdown() || self.is_send_shutdown()
+    }
+
     pub fn set_recv_shutdown(&self) {
         self.ring_buffer.set_recv_shutdown()
     }
@@ -795,6 +839,10 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     pub fn clear_rights_at(&self, start: Wrapping<usize>) {
         self.ring_buffer.clear_rights_at(start)
+    }
+
+    pub fn discard_rights_at_head(&self) {
+        self.ring_buffer.discard_rights_at_head()
     }
 
     pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {

@@ -60,7 +60,7 @@ def main() -> int:
         "--out-dir", default="artifacts", help="Artifact output directory"
     )
     parser.add_argument(
-        "--passes", type=int, default=8, help="Shuffle pass count for Stage1"
+        "--passes", type=int, default=4, help="Shuffle pass count for Stage1"
     )
     parser.add_argument(
         "--threshold", type=float, default=0.6, help="Consensus threshold"

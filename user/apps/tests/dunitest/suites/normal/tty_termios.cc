@@ -1,0 +1,1066 @@
+// tty_termios.cc — verify TCSAFLUSH / TCSADRAIN and legacy termio ioctls
+// on a valid TTY fd (PTY slave).
+//
+// Regression coverage for: "tcsetattr(0, TCSAFLUSH, &t) fails with ENOTTY"
+// and TCSETA/TCSETAW/TCSETAF/TCGETA returning ENOIOCTLCMD.
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <pty.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+namespace {
+
+/* Legacy SVR4 struct termio — not exposed by glibc's <termios.h>. */
+constexpr int kNcc = 8;
+struct TermioCompat {
+    unsigned short c_iflag;
+    unsigned short c_oflag;
+    unsigned short c_cflag;
+    unsigned short c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[kNcc];
+    unsigned char _pad = 0;  /* match kernel PosixTermio layout */
+};
+
+static_assert(sizeof(TermioCompat) == 18, "Linux generic termio ABI");
+
+#ifndef TCGETA
+#define TCGETA 0x5405
+#endif
+#ifndef TCSETA
+#define TCSETA 0x5406
+#endif
+#ifndef TCSETAW
+#define TCSETAW 0x5407
+#endif
+#ifndef TCSETAF
+#define TCSETAF 0x5408
+#endif
+
+// TCGETS/TCSETS use 19 control characters, even when libc NCCS is larger.
+constexpr size_t kKernelNccs = 19;
+constexpr int kSetCommands[] = {TCSETS, TCSETSW, TCSETSF, TCSETA, TCSETAW, TCSETAF};
+
+bool IsLegacySet(int cmd) {
+    return cmd == TCSETA || cmd == TCSETAW || cmd == TCSETAF;
+}
+
+int SetAttributes(int fd, int cmd, const struct termios& term) {
+    if (!IsLegacySet(cmd)) {
+        return ioctl(fd, cmd, &term);
+    }
+    TermioCompat legacy = {};
+    legacy.c_iflag = term.c_iflag;
+    legacy.c_oflag = term.c_oflag;
+    legacy.c_cflag = term.c_cflag;
+    legacy.c_lflag = term.c_lflag;
+    legacy.c_line = term.c_line;
+    memcpy(legacy.c_cc, term.c_cc, kNcc);
+    return ioctl(fd, cmd, &legacy);
+}
+
+class UniqueFd {
+public:
+    UniqueFd() = default;
+    explicit UniqueFd(int fd) : fd_(fd) {}
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+
+    UniqueFd(UniqueFd&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+
+    UniqueFd& operator=(UniqueFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+
+    ~UniqueFd() { reset(); }
+
+    int get() const { return fd_; }
+
+    void reset(int fd = -1) {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+class TermiosRestorer {
+public:
+    TermiosRestorer(int fd, const struct termios& term) : fd_(fd), term_(term) {}
+    TermiosRestorer(const TermiosRestorer&) = delete;
+    TermiosRestorer& operator=(const TermiosRestorer&) = delete;
+    ~TermiosRestorer() { tcsetattr(fd_, TCSANOW, &term_); }
+
+private:
+    int fd_;
+    struct termios term_;
+};
+
+struct PtyPair {
+    UniqueFd master;
+    UniqueFd slave;
+};
+
+PtyPair OpenRawPty() {
+    int master = -1;
+    int slave = -1;
+    if (openpty(&master, &slave, nullptr, nullptr, nullptr) < 0) {
+        ADD_FAILURE() << "openpty failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return {};
+    }
+
+    PtyPair pair{UniqueFd(master), UniqueFd(slave)};
+
+    struct termios term = {};
+    if (tcgetattr(pair.slave.get(), &term) < 0) {
+        ADD_FAILURE() << "tcgetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+        return {};
+    }
+
+    term.c_iflag = 0;
+    term.c_oflag = 0;
+    term.c_lflag = 0;
+    term.c_cflag |= CS8;
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+
+    if (tcsetattr(pair.slave.get(), TCSANOW, &term) < 0) {
+        ADD_FAILURE() << "tcsetattr failed: errno=" << errno << " (" << strerror(errno) << ")";
+    }
+
+    return pair;
+}
+
+bool SetNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return false;
+    }
+    int updated = fcntl(fd, F_GETFL, 0);
+    return updated >= 0 && (updated & O_NONBLOCK) != 0;
+}
+
+bool DrainNonBlocking(int fd) {
+    char buf[64];
+    while (read(fd, buf, sizeof(buf)) > 0) {
+    }
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+ssize_t ReadEventually(int fd, void* buf, size_t len, int timeout_ms = 1000) {
+    struct pollfd pfd = {fd, POLLIN | POLLPRI, 0};
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) {
+        errno = rc == 0 ? ETIMEDOUT : errno;
+        return -1;
+    }
+    return read(fd, buf, len);
+}
+
+struct BlockingWriterArgs {
+    int fd = -1;
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    ssize_t rc = -1;
+    int saved_errno = 0;
+};
+
+void* BlockingWrite(void* opaque) {
+    auto* args = static_cast<BlockingWriterArgs*>(opaque);
+    const char marker[] = "wake";
+    args->started.store(true, std::memory_order_release);
+    args->rc = write(args->fd, marker, sizeof(marker) - 1);
+    args->saved_errno = errno;
+    args->done.store(true, std::memory_order_release);
+    return nullptr;
+}
+
+bool WaitForAtomic(const std::atomic<bool>& flag, int timeout_ms) {
+    for (int elapsed = 0; elapsed < timeout_ms; ++elapsed) {
+        if (flag.load(std::memory_order_acquire)) {
+            return true;
+        }
+        usleep(1000);
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+TEST(TtyTermios, TcxoncActionsAndOutputFlow) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_GE(pty.slave.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+    ASSERT_TRUE(SetNonBlocking(pty.slave.get())) << strerror(errno);
+
+    EXPECT_EQ(tcflow(pty.slave.get(), TCOON), 0) << strerror(errno);
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCXONC, 4), -1);
+    EXPECT_EQ(errno, EINVAL);
+
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0) << strerror(errno);
+    const char marker[] = "flow";
+    errno = 0;
+    EXPECT_EQ(write(pty.slave.get(), marker, sizeof(marker) - 1), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+    char buf[sizeof(marker)] = {};
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), buf, sizeof(buf)), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOON), 0) << strerror(errno);
+    ASSERT_EQ(write(pty.slave.get(), marker, sizeof(marker) - 1),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+    ASSERT_EQ(ReadEventually(pty.master.get(), buf, sizeof(marker) - 1),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+    EXPECT_EQ(memcmp(buf, marker, sizeof(marker) - 1), 0);
+}
+
+TEST(TtyTermios, TcxoncStartWakesBlockedWriter) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_GE(pty.slave.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0) << strerror(errno);
+
+    BlockingWriterArgs args;
+    args.fd = pty.slave.get();
+    pthread_t writer;
+    ASSERT_EQ(pthread_create(&writer, nullptr, BlockingWrite, &args), 0);
+
+    // From this point onward every path restores flow and joins the thread.
+    const bool started = WaitForAtomic(args.started, 1000);
+    const bool remained_blocked = started && !WaitForAtomic(args.done, 20);
+    errno = 0;
+    const int start_rc = tcflow(pty.slave.get(), TCOON);
+    const int start_errno = errno;
+    const bool woke = WaitForAtomic(args.done, 1000);
+    if (!woke) {
+        // Closing the peer wakes the blocked slave writer with an error.
+        pty.master.reset();
+    }
+    const int join_rc = pthread_join(writer, nullptr);
+
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(remained_blocked);
+    EXPECT_EQ(start_rc, 0) << strerror(start_errno);
+    EXPECT_TRUE(woke);
+    EXPECT_EQ(join_rc, 0);
+    EXPECT_EQ(args.rc, 4) << "errno=" << args.saved_errno << " ("
+                          << strerror(args.saved_errno) << ")";
+    if (woke && args.rc == 4 && pty.master.get() >= 0) {
+        char marker[4] = {};
+        ASSERT_EQ(ReadEventually(pty.master.get(), marker, sizeof(marker)), 4);
+        EXPECT_EQ(memcmp(marker, "wake", sizeof(marker)), 0);
+    }
+}
+
+TEST(TtyTermios, TcxoncSendsRawConfiguredCharacters) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+
+    struct termios term = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+    term.c_cc[VSTOP] = 'X';
+    term.c_cc[VSTART] = 'Y';
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &term), 0);
+    ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+
+    char ch = 0;
+    ASSERT_EQ(tcflow(pty.slave.get(), TCIOFF), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &ch, 1), 1);
+    EXPECT_EQ(ch, 'X');
+    ASSERT_EQ(tcflow(pty.slave.get(), TCION), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &ch, 1), 1);
+    EXPECT_EQ(ch, 'Y');
+}
+
+TEST(TtyTermios, TcxoncPriorityCharacterBypassesOpost) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+
+    struct termios term = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+    term.c_oflag = OPOST | ONLCR;
+    term.c_cc[VSTOP] = '\n';
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &term), 0);
+    ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+
+    char bytes[2] = {};
+    ASSERT_EQ(tcflow(pty.slave.get(), TCIOFF), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), bytes, sizeof(bytes)), 1);
+    EXPECT_EQ(bytes[0], '\n');
+    usleep(20000);
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), bytes, sizeof(bytes)), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+}
+
+TEST(TtyTermios, TcxoncDisabledCharactersAreSilent) {
+    for (int action : {TCIOFF, TCION}) {
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.master.get(), 0);
+        ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+        struct termios term = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+        term.c_cc[action == TCIOFF ? VSTOP : VSTART] = _POSIX_VDISABLE;
+        ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &term), 0);
+        ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+        ASSERT_EQ(tcflow(pty.slave.get(), action), 0);
+        for (int i = 0; i < 20; ++i) {
+            char ch = 0;
+            errno = 0;
+            ASSERT_EQ(read(pty.master.get(), &ch, 1), -1);
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+            usleep(1000);
+        }
+    }
+}
+
+TEST(TtyTermios, TcxoncPacketModeReportsIdempotentTransitions) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_TRUE(SetNonBlocking(pty.master.get())) << strerror(errno);
+    int enabled = 1;
+    ASSERT_EQ(ioctl(pty.master.get(), TIOCPKT, &enabled), 0) << strerror(errno);
+    ASSERT_TRUE(DrainNonBlocking(pty.master.get())) << strerror(errno);
+
+    unsigned char status = 0;
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &status, 1), 1);
+    EXPECT_NE(status & TIOCPKT_STOP, 0);
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOOFF), 0);
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), &status, 1), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOON), 0);
+    ASSERT_EQ(ReadEventually(pty.master.get(), &status, 1), 1);
+    EXPECT_NE(status & TIOCPKT_START, 0);
+    ASSERT_EQ(tcflow(pty.slave.get(), TCOON), 0);
+    errno = 0;
+    EXPECT_EQ(read(pty.master.get(), &status, 1), -1);
+    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+}
+
+struct TcsetattrThreadArgs {
+    int fd = -1;
+    int action = TCSANOW;
+    struct termios term = {};
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    int rc = -1;
+    int saved_errno = 0;
+};
+
+void* TcsetattrThread(void* opaque) {
+    auto* args = static_cast<TcsetattrThreadArgs*>(opaque);
+    args->started.store(true, std::memory_order_release);
+    args->rc = tcsetattr(args->fd, args->action, &args->term);
+    args->saved_errno = errno;
+    args->done.store(true, std::memory_order_release);
+    return nullptr;
+}
+
+bool WaitForFlag(const std::atomic<bool>& flag, int timeout_ms) {
+    for (int elapsed = 0; elapsed < timeout_ms; ++elapsed) {
+        if (flag.load(std::memory_order_acquire)) {
+            return true;
+        }
+        usleep(1000);
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+/* --------------------------------------------------------------------------
+ * tcgetattr + tcsetattr(TCSANOW) round-trip
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, TcSanowRoundTrip) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+
+    tcflag_t orig = t.c_lflag;
+    t.c_lflag &= ~(ICANON | ECHO);
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &t), 0) << strerror(errno);
+
+    struct termios back = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &back), 0) << strerror(errno);
+    EXPECT_EQ(back.c_lflag & (ICANON | ECHO), 0u)
+        << "TCSANOW settings should survive";
+}
+
+/* --------------------------------------------------------------------------
+ * tcsetattr TCSADRAIN — must not fail with ENOTTY.
+ * TODO: add a stress test where master writes data → slave TCSADRAIN
+ * → verify drain actually waited for output to complete.
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, TcsadrainSucceeds) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+    EXPECT_EQ(tcsetattr(pty.slave.get(), TCSADRAIN, &t), 0) << strerror(errno);
+}
+
+/*
+ * DragonOS keeps bytes that the peer N_TTY buffer cannot yet accept in a
+ * driver-owned PTY queue analogous to Linux's peer flip-buffer. TCSADRAIN must
+ * not wait for either layer of the peer input path to be consumed.
+ */
+TEST(TtyTermios, TcsadrainDoesNotWaitForPtyInputBacklog) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+
+    int slave_flags = fcntl(pty.slave.get(), F_GETFL, 0);
+    ASSERT_GE(slave_flags, 0);
+    ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
+
+    char fill[1024];
+    memset(fill, 'q', sizeof(fill));
+    size_t accepted = 0;
+    for (;;) {
+        ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+        if (n > 0) {
+            accepted += static_cast<size_t>(n);
+            continue;
+        }
+        ASSERT_EQ(n, -1);
+        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        break;
+    }
+    ASSERT_GT(accepted, 0u);
+
+    TcsetattrThreadArgs args;
+    args.fd = pty.slave.get();
+    args.action = TCSADRAIN;
+    args.term = t;
+    pthread_t waiter;
+    ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
+    if (!WaitForFlag(args.started, 1000)) {
+        ADD_FAILURE() << "tcsetattr thread did not start";
+        pty.master.reset();
+        pthread_join(waiter, nullptr);
+        return;
+    }
+
+    if (!WaitForFlag(args.done, 1000)) {
+        ADD_FAILURE() << "TCSADRAIN waited for unread PTY input";
+        pty.master.reset();
+    }
+    ASSERT_EQ(pthread_join(waiter, nullptr), 0);
+    ASSERT_TRUE(args.done.load(std::memory_order_acquire));
+    EXPECT_EQ(args.rc, 0) << "errno=" << args.saved_errno << " ("
+                          << strerror(args.saved_errno) << ")";
+}
+
+TEST(TtyTermios, HungUpSlaveModeIoctlsReturnLinuxErrors) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.master.get(), 0);
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios term = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0) << strerror(errno);
+    TermioCompat legacy = {};
+    ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &legacy), 0) << strerror(errno);
+
+    pty.master.reset();
+
+    errno = 0;
+    EXPECT_EQ(tcgetattr(pty.slave.get(), &term), -1);
+    EXPECT_EQ(errno, EIO);
+
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCGETA, &legacy), -1);
+    EXPECT_EQ(errno, EIO);
+
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCSETA, &legacy), -1);
+    EXPECT_EQ(errno, EIO);
+
+    pid_t pgrp = getpgrp();
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TIOCSPGRP, &pgrp), -1);
+    EXPECT_EQ(errno, ENOTTY);
+}
+
+TEST(TtyTermios, PtyMasterDrainActionsSucceedAfterSlaveClose) {
+    for (int action : {TCSADRAIN, TCSAFLUSH}) {
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.master.get(), 0);
+        ASSERT_GE(pty.slave.get(), 0);
+
+        struct termios t = {};
+        ASSERT_EQ(tcgetattr(pty.master.get(), &t), 0) << strerror(errno);
+
+        int slave_flags = fcntl(pty.slave.get(), F_GETFL, 0);
+        ASSERT_GE(slave_flags, 0);
+        ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
+
+        char fill[1024];
+        memset(fill, 'z', sizeof(fill));
+        bool saturated = false;
+        for (int i = 0; i < 1024; ++i) {
+            ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                saturated = true;
+                break;
+            }
+            ASSERT_GT(n, 0) << strerror(errno);
+        }
+        ASSERT_TRUE(saturated);
+        pty.slave.reset();
+
+        TcsetattrThreadArgs args;
+        args.fd = pty.master.get();
+        args.action = action;
+        args.term = t;
+        pthread_t waiter;
+        ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
+        if (!WaitForFlag(args.started, 1000)) {
+            ADD_FAILURE() << "tcsetattr thread did not start";
+            pty.master.reset();
+            pthread_join(waiter, nullptr);
+            return;
+        }
+        if (!WaitForFlag(args.done, 1000)) {
+            ADD_FAILURE() << "PTY master drain action hung after slave close";
+            pty.master.reset();
+        }
+        ASSERT_EQ(pthread_join(waiter, nullptr), 0);
+        EXPECT_EQ(args.rc, 0) << "action=" << action << " errno=" << args.saved_errno
+                              << " (" << strerror(args.saved_errno) << ")";
+    }
+}
+
+/*
+ * DragonOS N_TTY can retain an echo step when the PTY bridge has no room.
+ * TCSADRAIN must wait for that ldisc-owned output to be submitted, but it
+ * must not wait for the master application to consume the entire PTY input.
+ */
+TEST(TtyTermios, TcsadrainWaitsForRetainedEchoOnly) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+    t.c_iflag = 0;
+    t.c_oflag = 0;
+    t.c_lflag = ECHO | ECHOCTL;
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSANOW, &t), 0) << strerror(errno);
+
+    int slave_flags = fcntl(pty.slave.get(), F_GETFL, 0);
+    ASSERT_GE(slave_flags, 0);
+    ASSERT_EQ(fcntl(pty.slave.get(), F_SETFL, slave_flags | O_NONBLOCK), 0);
+
+    // Fill both the peer N_TTY buffer and the PTY bridge so the two-byte
+    // ECHOCTL rendering remains owned by this line discipline. The bridge
+    // backlog itself must not keep TCSADRAIN waiting after that echo is
+    // submitted.
+    char fill[1024];
+    memset(fill, 'x', sizeof(fill));
+    size_t accepted = 0;
+    for (;;) {
+        ssize_t n = write(pty.slave.get(), fill, sizeof(fill));
+        if (n > 0) {
+            accepted += static_cast<size_t>(n);
+            continue;
+        }
+        ASSERT_EQ(n, -1);
+        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        break;
+    }
+    ASSERT_GT(accepted, 0u);
+
+    const char control = 0x01;  // ECHOCTL renders this as "^A" (two bytes).
+    ASSERT_EQ(write(pty.master.get(), &control, 1), 1) << strerror(errno);
+
+    // RX delivery and echo generation run asynchronously. Observe the byte on
+    // the slave before starting tcsetattr so the test cannot pass merely
+    // because the drain raced ahead of the retained echo step.
+    char received = 0;
+    bool input_delivered = false;
+    for (int i = 0; i < 1000; ++i) {
+        ssize_t n = read(pty.slave.get(), &received, 1);
+        if (n == 1) {
+            input_delivered = true;
+            break;
+        }
+        ASSERT_EQ(n, -1);
+        ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        usleep(1000);
+    }
+    ASSERT_TRUE(input_delivered) << "PTY input delivery timed out";
+    ASSERT_EQ(received, control);
+
+    int master_flags = fcntl(pty.master.get(), F_GETFL, 0);
+    ASSERT_GE(master_flags, 0);
+    ASSERT_EQ(fcntl(pty.master.get(), F_SETFL, master_flags | O_NONBLOCK), 0);
+
+    TcsetattrThreadArgs args;
+    args.fd = pty.slave.get();
+    args.action = TCSADRAIN;
+    args.term = t;
+    pthread_t waiter;
+    ASSERT_EQ(pthread_create(&waiter, nullptr, TcsetattrThread, &args), 0);
+    if (!WaitForFlag(args.started, 1000)) {
+        ADD_FAILURE() << "tcsetattr thread did not start";
+        pty.master.reset();
+        pthread_join(waiter, nullptr);
+        return;
+    }
+
+    // With no room for the retained two-byte echo step, the ioctl must not
+    // report completion. This catches the old bool drain / always-true wait.
+    EXPECT_FALSE(WaitForFlag(args.done, 20));
+
+    char echo_room[2];
+    for (size_t freed = 0; freed < sizeof(echo_room); ++freed) {
+        bool got_byte = false;
+        for (int i = 0; i < 1000; ++i) {
+            ssize_t n = read(pty.master.get(), &echo_room[freed], 1);
+            if (n == 1) {
+                got_byte = true;
+                break;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                ADD_FAILURE() << "master read failed: " << strerror(errno);
+                break;
+            }
+            usleep(1000);
+        }
+        if (!got_byte) {
+            ADD_FAILURE() << "failed to free echo byte " << freed;
+            pty.master.reset();
+            pthread_join(waiter, nullptr);
+            return;
+        }
+        if (freed == 0) {
+            EXPECT_FALSE(WaitForFlag(args.done, 20));
+        }
+    }
+    EXPECT_TRUE(WaitForFlag(args.done, 1000));
+
+    if (!args.done.load(std::memory_order_acquire)) {
+        // Closing the peer guarantees a bounded cleanup path even on failure.
+        pty.master.reset();
+    }
+    ASSERT_EQ(pthread_join(waiter, nullptr), 0);
+    ASSERT_TRUE(args.done.load(std::memory_order_acquire));
+    EXPECT_EQ(args.rc, 0) << "errno=" << args.saved_errno << " ("
+                          << strerror(args.saved_errno) << ")";
+
+    // TCSADRAIN waits for the retained echo to be accepted by the PTY driver,
+    // not for the peer to consume the already accepted backlog.
+    char backlog = 0;
+    EXPECT_EQ(read(pty.master.get(), &backlog, 1), 1);
+}
+
+/* --------------------------------------------------------------------------
+ * tcsetattr TCSAFLUSH — the dpkg/apt regression
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, TcsaflushSucceeds) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios t = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &t), 0) << strerror(errno);
+    t.c_lflag &= ~(ICANON | ECHO);
+    ASSERT_EQ(tcsetattr(pty.slave.get(), TCSAFLUSH, &t), 0) << strerror(errno);
+
+    struct termios back = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &back), 0) << strerror(errno);
+    EXPECT_EQ(back.c_lflag & (ICANON | ECHO), 0u)
+        << "TCSAFLUSH settings should survive";
+}
+
+/* --------------------------------------------------------------------------
+ * Legacy termio TCGETA — must not return ENOTTY
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, LegacyTcgeta) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    TermioCompat tio = {};
+    errno = 0;
+    ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio), 0)
+        << "TCGETA should succeed: errno=" << errno << " (" << strerror(errno) << ")";
+}
+
+/* --------------------------------------------------------------------------
+ * Legacy termio TCSETA / TCSETAW / TCSETAF
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, LegacyTcsetaFamily) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    TermioCompat tio = {};
+    tio.c_lflag |= ISIG;
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
+        << "TCSETA: errno=" << errno << " (" << strerror(errno) << ")";
+    /* Verify TCSETA was applied. */
+    {
+        TermioCompat rdback = {};
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &rdback), 0);
+        EXPECT_NE(rdback.c_lflag & ISIG, 0u) << "TCSETA ISIG flag applied";
+    }
+
+    tio.c_lflag &= ~static_cast<unsigned short>(ISIG);
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCSETAW, &tio), 0)
+        << "TCSETAW: errno=" << errno << " (" << strerror(errno) << ")";
+    /* Verify TCSETAW was applied. */
+    {
+        TermioCompat rdback = {};
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &rdback), 0);
+        EXPECT_EQ(rdback.c_lflag & ISIG, 0u) << "TCSETAW cleared ISIG";
+    }
+
+    tio.c_lflag |= ISIG;
+    errno = 0;
+    EXPECT_EQ(ioctl(pty.slave.get(), TCSETAF, &tio), 0)
+        << "TCSETAF: errno=" << errno << " (" << strerror(errno) << ")";
+    /* Verify TCSETAF was applied. */
+    {
+        TermioCompat rdback = {};
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &rdback), 0);
+        EXPECT_NE(rdback.c_lflag & ISIG, 0u) << "TCSETAF ISIG flag applied";
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Cross-check: TCGETA low 16 bits match TCGETS
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, TermioLow16Bits) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios full = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &full), 0);
+
+    TermioCompat tio = {};
+    ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio), 0);
+
+    EXPECT_EQ(full.c_lflag & 0xffff, tio.c_lflag)
+        << "termio c_lflag should be low 16 bits of termios c_lflag";
+    EXPECT_EQ(full.c_iflag & 0xffff, tio.c_iflag)
+        << "termio c_iflag should be low 16 bits of termios c_iflag";
+    EXPECT_EQ(full.c_cflag & 0xffff, tio.c_cflag)
+        << "termio c_cflag should be low 16 bits of termios c_cflag";
+    EXPECT_EQ(full.c_oflag & 0xffff, tio.c_oflag)
+        << "termio c_oflag should be low 16 bits of termios c_oflag";
+}
+
+/* --------------------------------------------------------------------------
+ * c_line round-trip: non-zero c_line survives TCSETA → TCGETA
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, CLineRoundtrip) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    TermioCompat tio = {};
+    tio.c_line = 42;
+    ASSERT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
+        << "TCSETA with c_line=42";
+
+    TermioCompat tio2 = {};
+    ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio2), 0);
+    EXPECT_EQ(tio2.c_line, 42u)
+        << "c_line should survive termio round-trip";
+}
+
+/* --------------------------------------------------------------------------
+ * Merge semantics: high 16 bits of c_cflag survive a TCSETA call
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, TermioMergeHighBits) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+
+    struct termios full = {};
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &full), 0);
+    tcflag_t orig_cflag = full.c_cflag;
+
+    TermioCompat tio = {};
+    ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, &tio), 0);
+    /* Set a flag bit we know is currently clear so the subsequent
+     * clear of that bit is a real operation, not a no-op. */
+    tio.c_lflag |= ECHO;
+    ASSERT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
+        << "TCSETA set ECHO before merge check";
+    tio.c_lflag &= ~static_cast<unsigned short>(ECHO); /* flip a low-16-bit flag */
+
+    ASSERT_EQ(ioctl(pty.slave.get(), TCSETA, &tio), 0)
+        << "TCSETA merge apply: errno=" << errno << " (" << strerror(errno) << ")";
+
+    ASSERT_EQ(tcgetattr(pty.slave.get(), &full), 0);
+    EXPECT_EQ(full.c_cflag & 0xffff0000u, orig_cflag & 0xffff0000u)
+        << "TCSETA should preserve high 16 bits of c_cflag";
+    EXPECT_EQ(full.c_lflag & ECHO, 0u)
+        << "TCSETA should apply low-16-bit change";
+}
+
+TEST(TtyTermios, SetFamilyPreservesRawFlagsAndLegacyTail) {
+    // Unnamed bits must survive the ABI boundary. Avoid flags normalized by
+    // the PTY driver and the core (CSIZE, PARENB, CREAD, baud masks and ADDRB).
+    constexpr tcflag_t high = 0x80000000u;
+    constexpr tcflag_t unnamed_input_low = 0x8000u;
+    for (int cmd : kSetCommands) {
+        SCOPED_TRACE(cmd);
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.slave.get(), 0);
+        struct termios initial = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &initial), 0);
+        initial.c_iflag |= high;
+        initial.c_oflag |= high;
+        initial.c_cflag |= high;
+        initial.c_lflag |= high;
+        for (size_t i = kNcc; i < kKernelNccs; ++i) {
+            initial.c_cc[i] = static_cast<cc_t>(0x60 + i);
+        }
+        // Exercise the kernel ABI directly: libc may reserve flag bits for
+        // its own speed bookkeeping before issuing TCSETS.
+        ASSERT_EQ(ioctl(pty.slave.get(), TCSETS, &initial), 0);
+
+        struct termios requested = initial;
+        requested.c_iflag |= unnamed_input_low;
+        requested.c_lflag |= ECHONL;
+        requested.c_cc[VINTR] = 0x1c;
+        ASSERT_EQ(SetAttributes(pty.slave.get(), cmd, requested), 0) << strerror(errno);
+        struct termios back = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &back), 0);
+        EXPECT_EQ(back.c_iflag & (high | unnamed_input_low), high | unnamed_input_low);
+        EXPECT_EQ(back.c_oflag & high, high);
+        EXPECT_EQ(back.c_cflag & high, high);
+        EXPECT_EQ(back.c_lflag & (high | ECHONL), high | ECHONL);
+        EXPECT_EQ(back.c_cc[VINTR], requested.c_cc[VINTR]);
+        for (size_t i = kNcc; i < kKernelNccs; ++i) {
+            EXPECT_EQ(back.c_cc[i], initial.c_cc[i]) << "c_cc[" << i << "]";
+        }
+    }
+}
+
+TEST(TtyTermios, SetFamilyFlushesOnlyForFlushCommands) {
+    for (int cmd : kSetCommands) {
+        SCOPED_TRACE(cmd);
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.slave.get(), 0);
+        ASSERT_TRUE(SetNonBlocking(pty.slave.get()));
+        struct termios term = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &term), 0);
+        const char old_input = 'a';
+        ASSERT_EQ(write(pty.master.get(), &old_input, 1), 1);
+        struct pollfd ready = {pty.slave.get(), POLLIN, 0};
+        ASSERT_EQ(poll(&ready, 1, 1000), 1);
+        ASSERT_NE(ready.revents & POLLIN, 0);
+
+        ASSERT_EQ(SetAttributes(pty.slave.get(), cmd, term), 0) << strerror(errno);
+        char ch = 0;
+        if (cmd == TCSETSF || cmd == TCSETAF) {
+            errno = 0;
+            EXPECT_EQ(read(pty.slave.get(), &ch, 1), -1);
+            EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK) << strerror(errno);
+        } else {
+            ASSERT_EQ(read(pty.slave.get(), &ch, 1), 1);
+            EXPECT_EQ(ch, old_input);
+        }
+        const char new_input = 'b';
+        ASSERT_EQ(write(pty.master.get(), &new_input, 1), 1);
+        ASSERT_EQ(ReadEventually(pty.slave.get(), &ch, 1), 1);
+        EXPECT_EQ(ch, new_input);
+    }
+}
+
+TEST(TtyTermios, BadSetPointerDoesNotChangeAttributesOrFlushInput) {
+    for (int cmd : kSetCommands) {
+        SCOPED_TRACE(cmd);
+        auto pty = OpenRawPty();
+        ASSERT_GE(pty.slave.get(), 0);
+        struct termios before = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &before), 0);
+        const char marker = 'x';
+        ASSERT_EQ(write(pty.master.get(), &marker, 1), 1);
+        struct pollfd ready = {pty.slave.get(), POLLIN, 0};
+        ASSERT_EQ(poll(&ready, 1, 1000), 1);
+        ASSERT_NE(ready.revents & POLLIN, 0);
+        errno = 0;
+        EXPECT_EQ(ioctl(pty.slave.get(), cmd, nullptr), -1);
+        EXPECT_EQ(errno, EFAULT);
+        struct termios after = {};
+        ASSERT_EQ(tcgetattr(pty.slave.get(), &after), 0);
+        EXPECT_EQ(after.c_iflag, before.c_iflag);
+        EXPECT_EQ(after.c_oflag, before.c_oflag);
+        EXPECT_EQ(after.c_cflag, before.c_cflag);
+        EXPECT_EQ(after.c_lflag, before.c_lflag);
+        EXPECT_EQ(after.c_line, before.c_line);
+        EXPECT_EQ(memcmp(after.c_cc, before.c_cc, kKernelNccs), 0);
+        char ch = 0;
+        ASSERT_EQ(ReadEventually(pty.slave.get(), &ch, 1), 1);
+        EXPECT_EQ(ch, marker);
+    }
+}
+
+TEST(TtyTermios, LegacyAbiAtPageBoundaryAndZeroPadding) {
+    auto pty = OpenRawPty();
+    ASSERT_GE(pty.slave.get(), 0);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, static_cast<long>(sizeof(TermioCompat)));
+    void* mapping = mmap(nullptr, 2 * page_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    // Release the mapping even if a fatal assertion below returns early.
+    struct UnmapOnExit {
+        void* addr;
+        size_t size;
+        ~UnmapOnExit() { munmap(addr, size); }
+    } unmap{mapping, static_cast<size_t>(2 * page_size)};
+    ASSERT_EQ(mprotect(static_cast<char*>(mapping) + page_size, page_size, PROT_NONE), 0);
+    auto* legacy = reinterpret_cast<TermioCompat*>(
+        static_cast<char*>(mapping) + page_size - sizeof(TermioCompat));
+    for (int cmd : {TCSETA, TCSETAW, TCSETAF}) {
+        SCOPED_TRACE(cmd);
+        memset(legacy, 0xa5, sizeof(*legacy));
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, legacy), 0) << strerror(errno);
+        EXPECT_EQ(legacy->_pad, 0);
+        legacy->_pad = 0xa5;
+        legacy->c_line = 42;
+        ASSERT_EQ(ioctl(pty.slave.get(), cmd, legacy), 0) << strerror(errno);
+        ASSERT_EQ(ioctl(pty.slave.get(), TCGETA, legacy), 0);
+        EXPECT_EQ(legacy->c_line, 42);
+        EXPECT_EQ(legacy->_pad, 0);
+    }
+}
+
+TEST(TtyTermios, StdinFlushAndLegacySettings) {
+    if (!isatty(STDIN_FILENO)) {
+        GTEST_SKIP() << "stdin is not a TTY; run from the QEMU console for acceptance";
+    }
+    struct termios original = {};
+    ASSERT_EQ(tcgetattr(STDIN_FILENO, &original), 0) << strerror(errno);
+    TermiosRestorer restore(STDIN_FILENO, original);
+    ASSERT_EQ(tcsetattr(STDIN_FILENO, TCSAFLUSH, &original), 0) << strerror(errno);
+    for (int cmd : {TCSETA, TCSETAW, TCSETAF}) {
+        EXPECT_EQ(SetAttributes(STDIN_FILENO, cmd, original), 0) << cmd << ": " << strerror(errno);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Serial8250 termios must reach the UART hardware callback. Before the
+ * regression fix the default ENOSYS callback made the TTY core restore all
+ * hardware-related c_cflag bits even though tcsetattr/ioctl returned success.
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, Serial8250AppliesModernAndLegacySettings) {
+    UniqueFd serial(open("/dev/ttyS0", O_RDWR | O_NOCTTY));
+    if (serial.get() < 0) {
+        GTEST_SKIP() << "cannot open /dev/ttyS0: " << strerror(errno);
+        return;
+    }
+
+    struct termios original = {};
+    ASSERT_EQ(tcgetattr(serial.get(), &original), 0) << strerror(errno);
+    TermiosRestorer restore(serial.get(), original);
+
+    struct termios modern = original;
+    modern.c_cflag &= ~(CSIZE | CSTOPB | PARODD);
+    modern.c_cflag |= CS7 | PARENB;
+    ASSERT_EQ(cfsetispeed(&modern, B9600), 0);
+    ASSERT_EQ(cfsetospeed(&modern, B9600), 0);
+    ASSERT_EQ(tcsetattr(serial.get(), TCSANOW, &modern), 0) << strerror(errno);
+
+    struct termios modern_back = {};
+    ASSERT_EQ(tcgetattr(serial.get(), &modern_back), 0) << strerror(errno);
+    EXPECT_EQ(cfgetospeed(&modern_back), static_cast<speed_t>(B9600));
+    EXPECT_EQ(modern_back.c_cflag & CSIZE, static_cast<tcflag_t>(CS7));
+    EXPECT_NE(modern_back.c_cflag & PARENB, 0u);
+    EXPECT_EQ(modern_back.c_cflag & PARODD, 0u);
+
+    TermioCompat legacy = {};
+    ASSERT_EQ(ioctl(serial.get(), TCGETA, &legacy), 0) << strerror(errno);
+    legacy.c_cflag &= ~static_cast<unsigned short>(CBAUD | CSIZE | PARENB | PARODD);
+    legacy.c_cflag |= static_cast<unsigned short>(B19200 | CS8);
+    ASSERT_EQ(ioctl(serial.get(), TCSETA, &legacy), 0) << strerror(errno);
+
+    struct termios legacy_back = {};
+    ASSERT_EQ(tcgetattr(serial.get(), &legacy_back), 0) << strerror(errno);
+    EXPECT_EQ(cfgetospeed(&legacy_back), static_cast<speed_t>(B19200));
+    EXPECT_EQ(legacy_back.c_cflag & CSIZE, static_cast<tcflag_t>(CS8));
+    EXPECT_EQ(legacy_back.c_cflag & PARENB, 0u);
+}
+
+TEST(TtyTermios, Serial8250CloseDoesNotWaitOnTcoStoppedQueue) {
+    UniqueFd serial(open("/dev/ttyS0", O_RDWR | O_NOCTTY));
+    if (serial.get() < 0) {
+        GTEST_SKIP() << "cannot open /dev/ttyS0: " << strerror(errno);
+        return;
+    }
+
+    ASSERT_EQ(tcflow(serial.get(), TCOOFF), 0) << strerror(errno);
+    constexpr char marker[] = "discard-on-paused-close";
+    ASSERT_EQ(write(serial.get(), marker, sizeof(marker) - 1),
+              static_cast<ssize_t>(sizeof(marker) - 1));
+
+    struct timespec started = {};
+    struct timespec finished = {};
+    ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &started), 0);
+    serial.reset();
+    ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
+
+    const int64_t elapsed_ms =
+        static_cast<int64_t>(finished.tv_sec - started.tv_sec) * 1000 +
+        (finished.tv_nsec - started.tv_nsec) / 1000000;
+    EXPECT_LT(elapsed_ms, 2000)
+        << "close waited for a software queue that TCOOFF cannot drain";
+}
+
+/* --------------------------------------------------------------------------
+ * tcsetattr on a non-TTY fd must fail with Linux's ENOTTY.
+ * -------------------------------------------------------------------------- */
+TEST(TtyTermios, NonTtyFails) {
+    struct termios t = {};
+    int fd = open("/dev/null", O_RDWR);
+    if (fd < 0) {
+        GTEST_SKIP() << "cannot open /dev/null: " << strerror(errno);
+        return;
+    }
+    errno = 0;
+    int rc = tcsetattr(fd, TCSANOW, &t);
+    int saved_errno = errno;
+    close(fd);
+    EXPECT_EQ(rc, -1) << "tcsetattr on non-TTY fd should fail";
+    EXPECT_EQ(saved_errno, ENOTTY)
+        << "tcsetattr on non-TTY fd should report ENOTTY";
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_MUNLOCK},
-    mm::{access_ok, ucontext::AddressSpace, VirtAddr, VmFlags},
+    mm::{access_ok, ucontext::AddressSpace, VirtAddr, VirtRegion, VmFlags},
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 
@@ -30,9 +30,30 @@ impl Syscall for SysMunlockHandle {
         }
 
         let vm = AddressSpace::current()?;
-        let mut guard = vm.write_interruptible()?;
-        guard.apply_vma_lock_flags(start, len, VmFlags::VM_NONE, false)?;
-        Ok(0)
+        let region = VirtRegion::new(start, len);
+        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        loop {
+            let creator = crate::cgroup::memory::object_for_task(
+                &crate::process::ProcessManager::current_pcb(),
+            );
+            let mut guard = vm.write_interruptible()?;
+            if guard.mappings.first_reservation_conflict(region).is_some() {
+                drop(guard);
+                vm.wait_for_no_reservation_conflict_interruptible(region)?;
+                continue;
+            }
+            match guard.apply_vma_lock_flags_collect(start, len, VmFlags::VM_NONE, &creator) {
+                Ok(()) => return Ok(0),
+                Err(failure) => {
+                    drop(guard);
+                    crate::mm::ucontext::InnerAddressSpace::notify_close_notifications(
+                        failure.notifications,
+                    );
+                    failure.err.recover(&mut charge_recovery)?;
+                    continue;
+                }
+            }
+        }
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

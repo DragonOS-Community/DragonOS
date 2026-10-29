@@ -1,46 +1,45 @@
-# 异常表安全内存拷贝方案设计
+# Secure Memory Copy Scheme Based on Exception Table
 
-:::{note}
-
-本文作者：龙进 <longjin@dragonos.org>
-
+::: info Author
+Long Jin `<longjin@dragonos.org>`
 :::
 
-## 概述
 
-本文档描述DragonOS中基于异常表(Exception Table)机制的安全内存拷贝方案的核心设计思想。该方案解决内核在系统调用上下文中安全访问用户空间内存的问题,防止因访问无效用户地址而导致的内核panic。
+## Overview
 
-## 设计背景与动机
+This document describes the core design of a secure memory copy scheme in DragonOS based on the Exception Table mechanism. This solution addresses the issue of safely accessing user-space memory in system call contexts, preventing kernel panics caused by accessing invalid user addresses.
 
-### 问题定义
+## Design Background and Motivation
 
-在系统调用处理中,内核需要访问用户空间传入的指针(如路径字符串、参数结构体等)。这些访问可能失败:
+### Problem Definition
 
-1. **地址未映射**: 用户传入的地址没有对应的VMA(Virtual Memory Area)
-2. **权限不足**: 页面存在但缺少所需权限
-3. **恶意输入**: 用户故意传入非法地址
+During system call processing, the kernel needs to access pointers passed from user space (such as path strings, parameter structures, etc.). These accesses may fail:
 
-### 传统方案的局限
+1. **Unmapped address**: The user-provided address has no corresponding VMA (Virtual Memory Area)
+2. **Insufficient permissions**: The page exists but lacks required permissions
+3. **Malicious input**: The user intentionally provides illegal addresses
 
-**预检查方案的TOCTTOU问题:**
-- 检查时地址有效,使用时可能已被其他线程修改
-- 存在竞态窗口
+### Limitations of Traditional Solutions
 
-**直接访问的困境:**
-- 无法区分"正常缺页"和"非法访问"
-- 页错误处理器无法判断是内核bug还是用户错误
+**TOCTTOU issues with pre-checking solutions:**
+- An address may be valid during check but modified by other threads when used
+- Race condition window exists
 
-## 异常表机制原理
+**Challenges with direct access:**
+- Cannot distinguish between "normal page fault" and "illegal access"
+- Page fault handler cannot determine whether it's a kernel bug or user error
 
-### 核心思想
+## Exception Table Mechanism Principles
 
-异常表机制通过**编译期标记 + 运行时查找**实现安全的用户空间访问:
+### Core Idea
 
-1. **编译期**: 在可能触发页错误的指令处生成异常表条目
-2. **运行时**: 页错误发生时,查找异常表并跳转到修复代码
-3. **零开销**: 正常路径无性能损失
+The exception table mechanism achieves secure user-space access through **compile-time marking + runtime lookup**:
 
-### 架构示意图
+1. **Compile-time**: Generate exception table entries for instructions that may trigger page faults
+2. **Runtime**: When a page fault occurs, search the exception table and jump to fix-up code
+3. **Zero overhead**: No performance loss on the normal path
+
+### Architectural Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -68,9 +67,9 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 核心数据结构
+### Core Data Structures
 
-**异常表条目 (8字节对齐):**
+**Exception table entry (8-byte aligned):**
 ```
 ┌─────────────────┬──────────────────┐
 │  指令相对偏移     │  修复代码相对偏移   │
@@ -78,12 +77,12 @@
 └─────────────────┴──────────────────┘
 ```
 
-**设计要点:**
-- 使用相对偏移支持ASLR(地址空间布局随机化)
-- 8字节对齐提高缓存性能
-- 存储于只读段防止篡改
+**Design highlights:**
+- Uses relative offsets to support ASLR (Address Space Layout Randomization)
+- 8-byte alignment improves cache performance
+- Stored in read-only segments to prevent tampering
 
-### 工作流程
+### Workflow
 
 ```
 编译期:
@@ -102,11 +101,11 @@
                     修改RIP到修复代码 ──→ 返回剩余未拷贝字节数
 ```
 
-## 典型执行场景
+## Typical Execution Scenarios
 
-### 场景: 系统调用传入无效地址
+### Scenario: System call with invalid address
 
-以`open()`系统调用为例,展示异常表的工作过程:
+Taking the `open()` system call as an example, demonstrating the exception table's operation:
 
 ```
 用户程序: open(0x1000, O_RDONLY)  // 0x1000未映射
@@ -147,105 +146,105 @@
 用户程序: fd = -1, errno = EFAULT
 ```
 
-**关键点:**
-- 无需预检查地址有效性
-- 页错误自动转换为返回剩余未拷贝字节数
-- 内核不会panic,用户程序收到明确的错误信息
+**Key points:**
+- No need for pre-checking address validity
+- Page faults are automatically converted to returning the number of remaining uncopied bytes
+- The kernel won't panic, and user programs receive clear error information
 
-## 使用场景分析
+## Usage Scenario Analysis
 
-### ✅ 适合使用异常表保护的场景
+### ✅ Scenarios Suitable for Exception Table Protection
 
-#### 1. 小数据的系统调用参数
+#### 1. Small system call parameter data
 
-**特征:**
-- 数据量小 (通常 < 4KB)
-- 一次性拷贝
-- 无法预知数据长度(如字符串)
+**Characteristics:**
+- Small data volume (typically < 4KB)
+- One-time copy
+- Unknown data length (e.g., strings)
 
-**典型应用:**
-- 路径字符串: `open()`, `stat()`, `execve()`等
-- 固定大小结构体: `sigaction`, `timespec`, `stat`等
-- 小型数组: `iovec[]`, `pollfd[]`等
+**Typical applications:**
+- Path strings: `open()`, `stat()`, `execve()`, etc.
+- Fixed-size structures: `sigaction`, `timespec`, `stat`, etc.
+- Small arrays: `iovec[]`, `pollfd[]`, etc.
 
-**优势:**
-- **避免TOCTTOU竞态**: 无需预检查
-- **高鲁棒性**: 用户错误不会导致内核panic
-- **性能可接受**: 数据量小,即使多拷贝一次也影响不大
+**Advantages:**
+- **Avoids TOCTTOU races**: No pre-checking needed
+- **High robustness**: User errors won't cause kernel panics
+- **Acceptable performance**: Small data volume; even multiple copies have minimal impact
 
-#### 2. 不确定地址有效性的场景
+#### 2. Scenarios with uncertain address validity
 
-当无法通过其他方式验证地址时,异常表是最安全的选择:
-- 用户直接传入的原始指针
-- 多线程环境下可能被并发修改的地址
-- 需要原子性保证的操作
+When address validity cannot be verified by other means, the exception table is the safest choice:
+- Raw pointers directly provided by users
+- Addresses that may be concurrently modified in multi-threaded environments
+- Operations requiring atomicity guarantees
 
-### ❌ 不适合使用异常表保护的场景
+### ❌ Scenarios Unsuitable for Exception Table Protection
 
-#### 1. 大数据传输
+#### 1. Large data transfers
 
-**反模式: read/write系统调用中双重缓冲**
+**Anti-pattern: Double buffering in read/write system calls**
 ```
 用户缓冲区 → 内核临时缓冲区 → 用户缓冲区  ❌
 ```
 
-**问题:**
-- 内存浪费: 需要额外的内核缓冲区
-- 双重拷贝: 数据被拷贝两次
-- OOM风险: 大量并发读写耗尽内存
+**Issues:**
+- Memory waste: Requires additional kernel buffers
+- Double copying: Data is copied twice
+- OOM risk: Large concurrent reads/writes exhaust memory
 
-**正确方案: 零拷贝**
-- 预先验证地址在有效VMA中
-- 直接在用户缓冲区上操作
-- 页错误触发正常的缺页处理(非错误)
+**Correct approach: Zero-copy**
+- Pre-validate addresses within valid VMAs
+- Operate directly on user buffers
+- Page faults trigger normal page fault handling (not errors)
 
-#### 2. 已验证的VMA内地址
+#### 2. Addresses already validated within VMAs
 
-如果地址已通过VMA检查,异常表是多余的:
-- `mmap()`后的立即访问
-- DMA缓冲区
-- 共享内存区域
+If addresses have been verified through VMA checks, the exception table is redundant:
+- Immediate access after `mmap()`
+- DMA buffers
+- Shared memory regions
 
-在这些场景下,页错误是**正常的缺页处理**(如COW),不是错误。
+In these scenarios, page faults are **normal page fault handling** (e.g., COW), not errors.
 
-#### 3. 性能敏感的热路径
+#### 3. Performance-critical hot paths
 
-避免在循环中频繁调用带异常表保护的函数:
-- **批量处理**: 一次拷贝整个数组,而非逐元素拷贝
-- **提前验证**: 在循环外验证地址,循环内直接访问
+Avoid frequently calling functions protected by exception tables in loops:
+- **Batch processing**: Copy entire arrays at once rather than element by element
+- **Pre-validation**: Validate addresses outside loops and access directly within loops
 
-### 决策矩阵
+### Decision Matrix
 
-| 场景特征 | 数据量 | 推荐方案 | 核心考虑 |
-|---------|--------|----------|---------|
-| 系统调用小参数 | < 4KB | 异常表保护 | 避免TOCTTOU,提高鲁棒性 |
-| 文件读写 | 可变(MB级) | 零拷贝 | 性能优先,避免双重缓冲 |
-| mmap后访问 | 任意 | 直接访问 | VMA已验证,正常缺页 |
-| 批量小数据 | 累计KB级 | 批量拷贝 | 减少系统调用次数 |
-| 字符串解析 | 未知 | 异常表保护 | 逐字节扫描,需要健壮性 |
+| Scenario Characteristics | Data Volume | Recommended Solution | Core Considerations |
+|--------------------------|-------------|----------------------|---------------------|
+| Small system call parameters | < 4KB | Exception table protection | Avoid TOCTTOU, improve robustness |
+| File read/write | Variable (MB-level) | Zero-copy | Performance priority, avoid double buffering |
+| Access after mmap | Arbitrary | Direct access | VMA already validated, normal page fault |
+| Batch small data | Cumulative KB-level | Batch copy | Reduce system call count |
+| String parsing | Unknown | Exception table protection | Byte-by-byte scanning, requires robustness |
 
-## 安全性分析
+## Security Analysis
 
-### 防御能力
+### Defensive Capabilities
 
-异常表机制可以防御:
+The exception table mechanism can defend against:
 
-1. **空指针解引用**: 返回EFAULT而非段错误
-2. **内核地址注入**: 用户传入内核地址被安全拒绝
-3. **竞态攻击**: TOCTTOU窗口被消除
-4. **越界访问**: 访问VMA外地址被捕获
+1. **Null pointer dereferencing**: Returns EFAULT instead of segmentation fault
+2. **Kernel address injection**: User-provided kernel addresses are safely rejected
+3. **Race attacks**: TOCTTOU windows are eliminated
+4. **Out-of-bounds access**: Accesses outside VMAs are captured
 
-### 安全边界
+### Security Boundaries
 
-异常表**不能**防御:
+The exception table **cannot** defend against:
 
-1. **内核自身bug**: 如野指针解引用
-2. **硬件故障**: 内存物理损坏
-3. **其他异常类型**: 仅处理页错误
+1. **Kernel bugs**: Such as wild pointer dereferencing
+2. **Hardware failures**: Physical memory damage
+3. **Other exception types**: Only handles page faults
 
-### 多层防御
+### Multi-layer Defense
 
-异常表是纵深防御的一部分:
+The exception table is part of defense in depth:
 
 ```
 ┌─────────────────────────────────────┐
@@ -259,21 +258,21 @@
 └─────────────────────────────────────┘
 ```
 
-## 实现要点
+## Implementation Essentials
 
-### 关键技术
+### Key Technologies
 
-1. **相对偏移编码**: 支持地址随机化(ASLR)
-2. **二分查找**: O(log n)时间复杂度快速定位
-3. **内联汇编**: 精确控制指令和异常表生成
-4. **零开销抽象**: 正常路径无性能损失
+1. **Relative offset encoding**: Supports address randomization (ASLR)
+2. **Binary search**: O(log n) time complexity for fast location
+3. **Inline assembly**: Precise control over instruction and exception table generation
+4. **Zero-overhead abstraction**: No performance loss on the normal path
 
-### 架构移植
+### Architecture Portability
 
-异常表机制可移植到其他架构:
+The exception table mechanism can be ported to other architectures:
 
-- **x86_64**: 使用`rep movsb`指令
-- **ARM64**: 使用`ldp/stp`指令序列
-- **RISC-V**: 使用`ld/sd`指令序列
+- **x86_64**: Uses `rep movsb` instruction
+- **ARM64**: Uses `ldp/stp` instruction sequence
+- **RISC-V**: Uses `ld/sd` instruction sequence
 
-核心思想保持不变,只需调整汇编语法。
+The core idea remains unchanged, requiring only adjustments to assembly syntax.

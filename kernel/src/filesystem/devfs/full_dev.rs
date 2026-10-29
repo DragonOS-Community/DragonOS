@@ -70,6 +70,10 @@ impl DeviceINode for LockedFullInode {
 }
 
 impl IndexNode for LockedFullInode {
+    fn supports_write_iter_flags(&self) -> bool {
+        false
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
@@ -78,8 +82,11 @@ impl IndexNode for LockedFullInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        return Ok(());
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -98,17 +105,29 @@ impl IndexNode for LockedFullInode {
         Err(SystemError::ENOSYS)
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut inode = self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.btime = metadata.btime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
 
-        return Ok(());
+            return Ok(());
+        })();
+        result.map_err(Into::into)
+    }
+
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
     }
 
     fn read_at(
@@ -117,16 +136,31 @@ impl IndexNode for LockedFullInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            if buf.len() < len {
+                return Err(SystemError::EINVAL);
+            }
 
-        for itr in buf.iter_mut().take(len) {
-            *itr = 0;
-        }
+            for itr in buf.iter_mut().take(len) {
+                *itr = 0;
+            }
 
-        return Ok(len);
+            return Ok(len);
+        })();
+        result.map_err(Into::into)
+    }
+
+    fn write_user_buffer_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _source: &crate::syscall::user_buffer::UserBuffer<'_>,
+        data: MutexGuard<FilePrivateData>,
+    ) -> Result<Option<usize>, crate::mm::allocation::MemoryAllocationError> {
+        drop(data);
+        // Linux write_full() rejects the operation without touching payload.
+        Err(SystemError::ENOSPC.into())
     }
 
     fn write_at(
@@ -135,8 +169,9 @@ impl IndexNode for LockedFullInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSPC)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSPC);
+        result.map_err(Into::into)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {

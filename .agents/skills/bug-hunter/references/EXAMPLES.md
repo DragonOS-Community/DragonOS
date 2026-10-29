@@ -25,17 +25,17 @@ python3 .agents/skills/bug-hunter/scripts/redact_sensitive.py \
 
 python3 .agents/skills/bug-hunter/scripts/shuffle_diff.py \
   artifacts/redacted.diff \
-  --passes 8 \
+  --passes 4 \
   -o artifacts/shuffled_passes.json
 ```
 
-说明：`artifacts/shuffled_passes.json` 交给外部 Stage2 编排器。编排器应为每个 persona 随机抽取 1 个 `passes[*].diff`，并把 8 个 agent 的输出汇总为 `artifacts/raw_findings.json`。
+说明：`artifacts/shuffled_passes.json` 交给外部 Stage2 编排器。编排器应为每个 persona 随机抽取 1 个 `passes[*].diff`，并把 3 个 agent 的输出汇总为 `artifacts/raw_findings.json`。
 
 3) 并行评审（外部编排器）后写入 `raw_findings.json`
 
 最小编排要求：
 
-- 8 个 agent 并行启动
+- 3 个 agent 并行启动
 - 每个 agent persona 固定
 - 每个 agent 从 `shuffled_passes.json` 随机选取 1 个 pass
 - 每个 agent 只返回 JSON findings
@@ -76,7 +76,7 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
       "description": "wait4 path forgets to propagate rusage error code",
       "fix_code": "return_errno!(Errno::ECHILD);",
       "confidence": 0.78,
-      "agent": "Diverse Reviewer C",
+      "agent": "Logic & Correctness Reviewer",
       "pass_id": 4
     }
   ]
@@ -95,12 +95,12 @@ python3 .agents/skills/bug-hunter/scripts/run_pipeline.py \
 ```json
 [
   {
-    "agent": "Security Sentinel",
+    "agent": "Security & Concurrency Sentinel",
     "status": "accepted",
     "bucket_id": "BUG-001"
   },
   {
-    "agent": "Diverse Reviewer B",
+    "agent": "Logic & Correctness Reviewer",
     "status": "rejected",
     "bucket_id": "BUG-007",
     "reason": "not reproducible"

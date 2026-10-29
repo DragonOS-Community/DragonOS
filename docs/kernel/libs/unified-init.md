@@ -1,21 +1,20 @@
-# unified-init 统一初始化库
+# unified-init Unified Initialization Library
 
-:::{note}
-本文作者：龙进 <longjin@DragonOS.org>
+::: info Author
+Longjin `<longjin@DragonOS.org>`
 
-2023年12月25日
+December 25, 2023
 :::
 
-## 1. 简介
 
-该库位于`kernel/crates/unified-init`中.
-提供统一初始化宏,用于将函数注册到统一初始化列表中. 便于统一进行初始化.
+## 1. Introduction
 
-需要注意的是，初始化器的数组是no_mangle的，因此其命名应当遵守`模块_初始化器`的规则，防止重名导致意想不到的错误.
+This library is located in `kernel/crates/unified-init`.
+It provides unified initialization macros to register functions into a unified initialization list. It facilitates unified initialization.
 
+It is important to note that the array of initializers is no_mangle, so its naming should follow the rules of `模块_初始化器` to prevent naming conflicts that could lead to unexpected errors.
 
-## 2. 用法
-
+## 2. Usage
 
 ```rust
 use system_error::SystemError;
@@ -41,14 +40,11 @@ fn main() {
 
 ```
 
-## 3.开发
+## 3. Development
 
-需要测试的时候可以在`main.rs`写测试代码，
-然后在当前目录执行 `cargo expand --bin unified-init-expand`
-就可以看到把proc macro展开后的代码了.
+When testing, you can write test code in `main.rs`,
+and then run `cargo expand --bin unified-init-expand` in the current directory to see the code after the proc macro has been expanded.
 
 ## 4. Maintainer
 
-龙进 <longjin@DragonOS.org>
-
-
+Longjin `<longjin@DragonOS.org>`

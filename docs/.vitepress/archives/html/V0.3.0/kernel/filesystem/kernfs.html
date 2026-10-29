@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KernFS &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="联合文件系统" href="unionfs/index.html" />
+    <link rel="prev" title="SysFS" href="sysfs.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">文件系统</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="overview.html">概述</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vfs/index.html">VFS虚拟文件系统</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sysfs.html">SysFS</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">KernFS</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">1. 简介</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">2. 使用方法</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="unionfs/index.html">联合文件系统</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">文件系统</a></li>
+      <li class="breadcrumb-item active">KernFS</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/kernel/filesystem/kernfs.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="kernfs">
+<h1>KernFS<a class="headerlink" href="#kernfs" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Maintainer:</p>
+<ul class="simple">
+<li><p>龙进 <a class="reference external" href="mailto:longjin&#37;&#52;&#48;dragonos&#46;org">longjin<span>&#64;</span>dragonos<span>&#46;</span>org</a></p></li>
+</ul>
+</div>
+<section id="id1">
+<h2>1. 简介<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<p>  KernFS是一个伪文件系统，它充当其它内核文件系统的容器，面向用户提供文件接口。其核心功能就是，当kernfs的文件被读/写或者触发回调点的时候，将会对预设的回调函数进行调用，触发其它内核文件系统的操作。</p>
+<p>  这种设计使得SysFS和文件系统的基本操作解耦，KernFS作为SysFS的承载物，使得SysFS能更专注于KObject的管理，让代码更加优雅。</p>
+<p>  在未来，DragonOS的内核子系统，或者其它的内核文件系统，可以使用KernFS作为文件系统操作的承载物，让系统管理的逻辑与具体的文件系统操作解除耦合。</p>
+</section>
+<section id="id2">
+<h2>2. 使用方法<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  以SysFS为例，新创建一个KernFS实例，作为SysFS的文件系统接口，然后挂载到<code class="docutils literal notranslate"><span class="pre">/sys</span></code>目录下。接着sysfs实现上层逻辑，管理KObject，每个上层的Kobject里面都需要包含KernFSInode。并且通过设置KernFSInode的PrivateData，使得KernFS能够根据Inode获取到其指向的KObject或者sysfs的attribute。并且在创建KernFSInode的时候，为具体的Inode传入不同的callback，以此实现“不同的Inode在读写时能够触发不同的回调行为”。</p>
+<p>  当发生回调时，KernFS会把回调信息、私有信息传入到回调函数中，让回调函数能够根据传入的信息，获取到对应的KObject或者sysfs的attribute，从而实现sysfs提供的高层功能。</p>
+<p>  从上述描述我们能够看出：KernFS就是通过存储上层文件系统的回调函数、回调信息，来实现“把具体文件操作与高层管理逻辑进行解耦”的目的。</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="sysfs.html" class="btn btn-neutral float-left" title="SysFS" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="unionfs/index.html" class="btn btn-neutral float-right" title="联合文件系统" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/filesystem/kernfs.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/kernel/filesystem/kernfs.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/filesystem/kernfs.html">V0.2.0</a></dd>
+      <dd><a href="kernfs.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/filesystem/kernfs.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/filesystem/kernfs.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

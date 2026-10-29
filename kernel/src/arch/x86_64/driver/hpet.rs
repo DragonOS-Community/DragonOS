@@ -79,6 +79,8 @@ struct InnerHpet {
     timer_registers_ptr: NonNull<HpetTimerRegisters>,
     /// 定时器启动时配置
     timer_boot_cfg: Vec<u64>,
+    /// 定时器启动时比较器值
+    timer_boot_comparator: Vec<u64>,
 }
 
 impl Hpet {
@@ -127,10 +129,12 @@ impl Hpet {
         .unwrap();
         // 记录hpet定时器启动时配置
         let mut timer_boot_cfg = Vec::with_capacity(tm_num as usize);
+        let mut timer_boot_comparator = Vec::with_capacity(tm_num as usize);
         for i in 0..tm_num {
             let timer_reg = unsafe { timer_ptr.as_ptr().add(i).as_ref().unwrap() };
             let cfg = timer_reg.config();
             timer_boot_cfg.push(cfg);
+            timer_boot_comparator.push(timer_reg.comparator_value());
         }
 
         let hpet = Hpet {
@@ -140,6 +144,7 @@ impl Hpet {
                 registers_ptr: ptr,
                 timer_registers_ptr: timer_ptr,
                 timer_boot_cfg,
+                timer_boot_comparator,
             }),
             enabled: AtomicBool::new(false),
             boot_cfg,
@@ -156,6 +161,21 @@ impl Hpet {
     pub fn hpet_enable(&self) -> Result<(), SystemError> {
         let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
 
+        let result = self.try_hpet_enable();
+        if result.is_err() {
+            // Hpet::new() disables the device, and try_hpet_enable() may also
+            // restart the counter or program timer 0 before reporting an
+            // error. Restore the firmware state even though `enabled` was
+            // never published, so fallback clocks cannot inherit a partially
+            // configured HPET.
+            self.restore_boot_configuration();
+        }
+
+        drop(irq_guard);
+        return result;
+    }
+
+    fn try_hpet_enable(&self) -> Result<(), SystemError> {
         // ！！！这里是临时糊代码的，需要在apic重构的时候修改！！！
         let (inner_guard, regs) = unsafe { self.hpet_regs_mut() };
         let freq = regs.frequency();
@@ -204,8 +224,6 @@ impl Hpet {
         drop(inner_guard);
 
         info!("HPET enabled");
-
-        drop(irq_guard);
         return Ok(());
     }
 
@@ -350,13 +368,10 @@ impl Hpet {
         unsafe { regs.write_general_config(cfg) };
     }
 
-    /// 关闭hpet
-    pub fn hpet_disable(&self) {
-        debug!("HPET disable");
-        if !is_hpet_enabled() {
-            return;
-        }
-
+    /// Restore every HPET register modified during initialization or enable.
+    /// This intentionally does not consult `enabled`: failed enable attempts
+    /// must be rolled back before that flag is set.
+    fn restore_boot_configuration(&self) {
         // 恢复启动时的配置
         let mut cfg = self.boot_cfg;
         cfg &= !HPET_CFG_ENABLE;
@@ -368,17 +383,27 @@ impl Hpet {
             let (inner_guard, timer_reg) = unsafe { self.timer_mut(i).unwrap() };
             unsafe {
                 timer_reg.write_config(inner_guard.timer_boot_cfg[i as usize]);
+                timer_reg.write_comparator_value(inner_guard.timer_boot_comparator[i as usize]);
             }
             drop(inner_guard);
         }
 
-        // 如果HPET在启动时已经启用了，重新启用它
-        if (self.boot_cfg & HPET_CFG_ENABLE) != 0 {
-            let (_, regs) = unsafe { self.hpet_regs_mut() };
-            unsafe { regs.write_general_config(self.boot_cfg) };
-        }
+        // Restore the complete firmware configuration last. This also
+        // restarts a counter that firmware left enabled.
+        let (_, regs) = unsafe { self.hpet_regs_mut() };
+        unsafe { regs.write_general_config(self.boot_cfg) };
 
         self.enabled.store(false, Ordering::SeqCst);
+    }
+
+    /// 关闭hpet
+    pub fn hpet_disable(&self) {
+        debug!("HPET disable");
+        if !is_hpet_enabled() {
+            return;
+        }
+
+        self.restore_boot_configuration();
     }
 }
 

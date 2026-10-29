@@ -1,14 +1,15 @@
-# 屏幕管理器（SCM）
+# Screen Manager (SCM)
 
-:::{note}
-作者: 周瀚杰 <2625553453@qq.com>
+::: info Author
+Zhou Hanjie `<2625553453@qq.com>`
 :::
-&emsp;&emsp;屏幕管理器用来管理控制所有ui框架，所有框架都必须先在屏幕管理器中注册才可使用，然后scm控制当前是哪个ui框架在使用
+
+The Screen Manager is used to control all UI frameworks. All frameworks must be registered with the Screen Manager before they can be used. Then, SCM controls which UI framework is currently in use.
 
 ## traits
 
 ### ScmUiFramework
-&emsp;&emsp;每个要注册到scm中的ui框架都必须实现这个trait中的方法，具体定义如下：
+Each UI framework that is to be registered with SCM must implement the methods defined in this trait, as follows:
 ```rust
 pub trait ScmUiFramework: Sync + Send + Debug {
     // 安装ui框架的回调函数
@@ -40,44 +41,43 @@ pub trait ScmUiFramework: Sync + Send + Debug {
     }
 }
 ```
-## 主要API
-### scm_init() -初始化屏幕管理模块
-#### 原型
+## Main APIs
+### scm_init() - Initialize the screen management module
+#### Prototype
 ```rust
 pub extern "C" fn scm_init()
 ```
-#### 说明
-&emsp;&emsp;scm_init()主要是初始化一些scm中使用的全局变量，例如是否使用双缓冲区标志位，textui未初始化时使用的一些全局变量
+#### Description
+scm_init() is mainly used to initialize some global variables used by SCM, such as the flag indicating whether double buffering is used, and some global variables used by textui when it is not initialized.
 
-### scm_reinit() -当内存管理单元被初始化之后，重新初始化屏幕管理模块
-#### 原型
+### scm_reinit() - Reinitialize the screen management module after the memory management unit is initialized
+#### Prototype
 ```rust
 pub extern "C" fn scm_reinit() -> i32
 ```
-#### 说明
-&emsp;&emsp;scm_reinit()用于当内存管理单元被初始化之后，重新处理帧缓冲区问题
+#### Description
+scm_reinit() is used to reprocess the frame buffer issues after the memory management unit has been initialized.
 
-### scm_enable_double_buffer() -允许双缓冲区
-#### 原型
+### scm_enable_double_buffer() - Enable double buffering
+#### Prototype
 ```rust
 pub extern "C" fn scm_enable_double_buffer() -> i32
 ```
-#### 说明
-&emsp;&emsp;scm_enable_double_buffer()用于启动双缓冲来往窗口输出打印信息。启用后，往窗口输出的信息会暂时放在一个缓冲区中，然后每次按一定时间将该缓冲区的信息输出到窗口帧缓冲区中，渲染显示到窗口上。
+#### Description
+scm_enable_double_buffer() is used to enable double buffering for outputting information to the window. After enabling, the information output to the window is temporarily stored in a buffer, and then this buffer's content is output to the window's frame buffer at regular intervals, rendering it to the window.
 
-### scm_framework_enable（） -启用某个ui框架，将它的帧缓冲区渲染到屏幕上
-#### 原型
+### scm_framework_enable() - Enable a specific UI framework and render its frame buffer to the screen
+#### Prototype
 ```rust
 pub fn scm_framework_enable(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError>
 ```
-#### 说明
-&emsp;&emsp;scm_framework_enable用于启用某个ui框架，将它的帧缓冲区渲染到屏幕上
+#### Description
+scm_framework_enable is used to enable a specific UI framework and render its frame buffer to the screen.
 
-
-### scm_register（） -向屏幕管理器注册UI框架
-#### 原型
+### scm_register() - Register a UI framework with the screen manager
+#### Prototype
 ```rust
 pub fn scm_register(framework: Arc<dyn ScmUiFramework>) -> Result<i32, SystemError> 
 ```
-#### 说明
-&emsp;&emsp;scm_register用于将ui框架注册到scm中，主要是调用ui框架的回调函数以安装ui框架，并将其激活
+#### Description
+scm_register is used to register a UI framework with SCM. It mainly calls the callback functions of the UI framework to install and activate it.

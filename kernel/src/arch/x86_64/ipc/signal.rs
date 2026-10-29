@@ -1,41 +1,73 @@
-use core::sync::atomic::{compiler_fence, Ordering};
-use core::{ffi::c_void, intrinsics::unlikely, mem::size_of};
-
-use defer::defer;
-use log::error;
-use system_error::SystemError;
-
 pub use crate::ipc::generic_signal::AtomicGenericSignal as AtomicSignal;
 pub use crate::ipc::generic_signal::GenericSigChildCode as SigChildCode;
 pub use crate::ipc::generic_signal::GenericSigSet as SigSet;
 pub use crate::ipc::generic_signal::GenericSigStackFlags as SigStackFlags;
 pub use crate::ipc::generic_signal::GenericSignal as Signal;
-
-use crate::process::rseq::Rseq;
 use crate::{
     arch::{
         fpu::{FpState, XFEATURE_AVX, XFEATURE_SSE, XFEATURE_X87},
         interrupt::TrapFrame,
-        process::table::{USER_CS, USER_DS},
+        process::table::USER_CS,
         syscall::nr::SYS_RESTART_SYSCALL,
         CurrentIrqArch, MMArch,
     },
     exception::InterruptArch,
     ipc::{
-        signal::{restore_saved_sigmask, set_current_blocked},
+        kill::send_signal_to_pid,
+        signal::{force_sig_fault_to_current, restore_saved_sigmask, set_current_blocked},
         signal_types::{
             PosixSigInfo, SaHandlerType, SigInfo, Sigaction, SigactionType, SignalArch, SignalFlags,
         },
     },
-    mm::MemoryManagementArch,
-    process::ProcessManager,
-    syscall::user_access::UserBufferWriter,
+    mm::{MemoryManagementArch, VirtAddr},
+    process::{ptrace, rseq::Rseq, ProcessControlBlock, ProcessFlags, ProcessManager},
+    syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
+use core::{
+    ffi::c_void,
+    intrinsics::unlikely,
+    mem::size_of,
+    sync::atomic::{compiler_fence, Ordering},
+};
+use defer::defer;
+use log::error;
+use system_error::SystemError;
 
 /// 信号处理的栈的栈指针的最小对齐数量
 pub const STACK_ALIGN: u64 = 16;
 /// 信号最大值
 pub const MAX_SIG_NUM: usize = 64;
+
+const UC_FP_XSTATE: u64 = 0x1;
+const UC_SIGCONTEXT_SS: u64 = 0x2;
+const UC_STRICT_RESTORE_SS: u64 = 0x4;
+
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+const FP_XSTATE_MAGIC2_SIZE: usize = size_of::<u32>();
+const FPSTATE_FRAME_SIZE: usize = size_of::<UserXState>() + FP_XSTATE_MAGIC2_SIZE;
+pub const MINSIGSTKSZ: usize = 2048;
+
+const X86_EFLAGS_CF: u64 = 1 << 0;
+const X86_EFLAGS_PF: u64 = 1 << 2;
+const X86_EFLAGS_AF: u64 = 1 << 4;
+const X86_EFLAGS_ZF: u64 = 1 << 6;
+const X86_EFLAGS_SF: u64 = 1 << 7;
+const X86_EFLAGS_TF: u64 = 1 << 8;
+const X86_EFLAGS_DF: u64 = 1 << 10;
+const X86_EFLAGS_OF: u64 = 1 << 11;
+const X86_EFLAGS_RF: u64 = 1 << 16;
+const X86_EFLAGS_AC: u64 = 1 << 18;
+const FIX_EFLAGS: u64 = X86_EFLAGS_AC
+    | X86_EFLAGS_OF
+    | X86_EFLAGS_DF
+    | X86_EFLAGS_TF
+    | X86_EFLAGS_SF
+    | X86_EFLAGS_ZF
+    | X86_EFLAGS_AF
+    | X86_EFLAGS_PF
+    | X86_EFLAGS_CF
+    | X86_EFLAGS_RF;
 
 // ===== Linux 兼容的信号栈帧结构 =====
 
@@ -76,6 +108,16 @@ struct UserFpState64 {
     pub xmm_space: [u32; 64], // 16个 XMM 寄存器，每个16字节
     pub reserved2: [u32; 12],
     pub reserved3: [u32; 12],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct FpxSwBytes {
+    magic1: u32,
+    extended_size: u32,
+    xfeatures: u64,
+    xstate_size: u32,
+    padding: [u32; 7],
 }
 
 /// 完整的 XSAVE 状态结构（包含 AVX 扩展）
@@ -162,11 +204,8 @@ impl UserSigSet {
     }
 }
 
-/// 与 Linux 兼容的 ucontext 结构
-/// 参考: /usr/include/bits/types/struct_ucontext.h
-///
-/// 注意：为了支持 AVX，我们扩展了 __fpregs_mem 以包含完整的 XSAVE 状态。
-/// 这与 Linux 的布局略有不同，但对用户态透明（通过 fpstate 指针访问）。
+/// 与 Linux x86_64 内核 sigframe 兼容的 ucontext 结构
+/// 参考: Linux arch/x86/include/uapi/asm/ucontext.h
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct UserUContext {
@@ -175,25 +214,43 @@ struct UserUContext {
     pub uc_stack: StackT,
     pub uc_mcontext: UserSigContext,
     pub uc_sigmask: UserSigSet, // 使用 Linux 兼容的 1024-bit sigset
-    /// 实际的 fpstate 数据（包含完整的 XSAVE 状态以支持 AVX）
-    pub __fpregs_mem: UserXState,
 }
 
 // 编译期校验关键字段偏移量与 Linux 的兼容性
-// 注意：uc_sigmask 之前的字段保持与 Linux 兼容
-// __fpregs_mem 由于 UserXState 需要 64 字节对齐，可能有填充
 const _: () = {
     assert!(core::mem::offset_of!(UserUContext, uc_stack) == 16);
     assert!(core::mem::offset_of!(UserUContext, uc_mcontext) == 40);
     assert!(core::mem::offset_of!(UserUContext, uc_sigmask) == 296);
-    // __fpregs_mem 需要 64 字节对齐，所以偏移量会被调整
-    // 424 + padding to 64-byte boundary = 448
-    assert!(core::mem::offset_of!(UserUContext, __fpregs_mem) % 64 == 0);
+    assert!(core::mem::size_of::<UserUContext>() == 424);
     // UserXState = 512 (FXSAVE) + 64 (header) + 256 (AVX) = 832 bytes
     assert!(core::mem::size_of::<UserXState>() == 832);
 };
 
 impl UserXState {
+    fn user_size() -> usize {
+        size_of::<UserXState>()
+    }
+
+    fn build_sw_bytes(&self) -> FpxSwBytes {
+        FpxSwBytes {
+            magic1: FP_XSTATE_MAGIC1,
+            extended_size: (Self::user_size() + FP_XSTATE_MAGIC2_SIZE) as u32,
+            xfeatures: self.header.xfeatures,
+            xstate_size: Self::user_size() as u32,
+            padding: [0; 7],
+        }
+    }
+
+    fn install_sw_bytes(&mut self) {
+        let sw_bytes = self.build_sw_bytes();
+        self.fpstate.reserved3[0] = sw_bytes.magic1;
+        self.fpstate.reserved3[1] = sw_bytes.extended_size;
+        self.fpstate.reserved3[2] = sw_bytes.xfeatures as u32;
+        self.fpstate.reserved3[3] = (sw_bytes.xfeatures >> 32) as u32;
+        self.fpstate.reserved3[4] = sw_bytes.xstate_size;
+        self.fpstate.reserved3[5..12].copy_from_slice(&sw_bytes.padding);
+    }
+
     fn validate_for_sigreturn(&self) -> Result<(), SystemError> {
         let mxcsr_mask = FpState::mxcsr_feature_mask();
         if self.fpstate.mxcsr & !mxcsr_mask != 0 {
@@ -290,11 +347,13 @@ impl UserXState {
             }
         }
 
-        Self {
+        let mut user_xstate = Self {
             fpstate,
             header,
             avx,
-        }
+        };
+        user_xstate.install_sw_bytes();
+        user_xstate
     }
 
     /// 从用户态 XSAVE 状态转换回内核 FpState
@@ -467,15 +526,21 @@ impl UserFpState64 {
 impl UserUContext {
     /// 从 TrapFrame 创建 UserUContext
     #[inline(never)]
-    pub fn from_trapframe(frame: &TrapFrame, oldset: &SigSet, cr2: u64) -> Self {
+    pub fn from_trapframe(
+        frame: &TrapFrame,
+        oldset: &SigSet,
+        cr2: u64,
+        sig_altstack: &X86SigStack,
+    ) -> Self {
+        let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
+        if FpState::is_xsave_enabled() {
+            uc_flags |= UC_FP_XSTATE;
+        }
+
         Self {
-            uc_flags: 0,
+            uc_flags,
             uc_link: core::ptr::null_mut(),
-            uc_stack: StackT {
-                ss_sp: core::ptr::null_mut(),
-                ss_flags: 0,
-                ss_size: 0,
-            },
+            uc_stack: sig_altstack.to_user_stack(),
             uc_mcontext: UserSigContext {
                 r8: frame.r8,
                 r9: frame.r9,
@@ -499,7 +564,11 @@ impl UserUContext {
                 gs: 0, // Linux 不保存 gs/fs 寄存器值
                 fs: 0,
                 ss: frame.ss as u16,
-                err: frame.errcode,
+                err: if frame.errcode == u64::MAX {
+                    0
+                } else {
+                    frame.errcode
+                },
                 trapno: 0,
                 oldmask: oldset.bits(),
                 cr2,
@@ -507,7 +576,6 @@ impl UserUContext {
                 reserved1: [0; 8],
             },
             uc_sigmask: UserSigSet::from_kernel_sigset(oldset),
-            __fpregs_mem: UserXState::default(),
         }
     }
 
@@ -530,8 +598,21 @@ impl UserUContext {
         frame.rcx = self.uc_mcontext.rcx;
         frame.rsp = self.uc_mcontext.rsp;
         frame.rip = self.uc_mcontext.rip;
-        frame.rflags = self.uc_mcontext.eflags;
+        frame.rflags = (frame.rflags & !FIX_EFLAGS) | (self.uc_mcontext.eflags & FIX_EFLAGS);
         // 注意: cs, ss 等段寄存器不恢复，由内核管理
+    }
+
+    /// Restore the full XSAVE state from the user fpstate pointed to by sigcontext.
+    fn restore_fpstate(&self) -> Result<Option<FpState>, SystemError> {
+        if self.uc_mcontext.fpstate.is_null() {
+            return Ok(None);
+        }
+
+        let fpstate_ptr = self.uc_mcontext.fpstate as *const UserXState;
+        let reader = UserBufferReader::new(fpstate_ptr, size_of::<UserXState>(), true)?;
+        let mut user_xstate = UserXState::default();
+        reader.copy_one_from_user(&mut user_xstate, 0)?;
+        user_xstate.to_kernel_fpstate().map(Some)
     }
 }
 
@@ -556,7 +637,7 @@ bitflags! {
 pub struct X86SigStack {
     pub sp: usize,
     pub flags: SigStackFlags,
-    pub size: u32,
+    pub size: usize,
 }
 
 impl X86SigStack {
@@ -571,7 +652,64 @@ impl X86SigStack {
     /// 检查给定的栈指针 `sp` 是否在当前备用信号栈的范围内。
     #[inline]
     pub fn on_sig_stack(&self, sp: usize) -> bool {
-        self.sp != 0 && self.size != 0 && (sp.wrapping_sub(self.sp) < self.size as usize)
+        !self.flags.contains(SigStackFlags::SS_AUTODISARM) && self.contains_sp(sp)
+    }
+
+    /// Pure range check, without considering `SS_AUTODISARM`.
+    #[inline]
+    fn contains_sp(&self, sp: usize) -> bool {
+        self.sp != 0 && self.size != 0 && sp > self.sp && sp.wrapping_sub(self.sp) <= self.size
+    }
+
+    #[inline]
+    fn to_user_stack(self) -> StackT {
+        StackT {
+            ss_sp: self.sp as *mut c_void,
+            ss_flags: self.flags.bits() as i32,
+            ss_size: self.size,
+        }
+    }
+
+    fn from_user_stack(user_stack: StackT, current_sp: usize) -> Result<Self, SystemError> {
+        let flags =
+            SigStackFlags::from_bits(user_stack.ss_flags as u32).ok_or(SystemError::EINVAL)?;
+        let ss_mode = flags.difference(SigStackFlags::SS_AUTODISARM);
+        if !(ss_mode.is_empty()
+            || ss_mode == SigStackFlags::SS_DISABLE
+            || ss_mode == SigStackFlags::SS_ONSTACK)
+        {
+            return Err(SystemError::EINVAL);
+        }
+
+        let pcb = ProcessManager::current_pcb();
+        let current_stack = pcb.sig_altstack();
+        if current_stack.on_sig_stack(current_sp) {
+            return Err(SystemError::EPERM);
+        }
+        drop(current_stack);
+
+        if flags.contains(SigStackFlags::SS_DISABLE) {
+            Ok(Self {
+                sp: 0,
+                flags,
+                size: 0,
+            })
+        } else {
+            if user_stack.ss_size < MINSIGSTKSZ {
+                return Err(SystemError::ENOMEM);
+            }
+            Ok(Self {
+                sp: user_stack.ss_sp as usize,
+                flags,
+                size: user_stack.ss_size,
+            })
+        }
+    }
+
+    fn reset_for_autodisarm(&mut self) {
+        self.sp = 0;
+        self.flags = SigStackFlags::SS_DISABLE;
+        self.size = 0;
     }
 }
 
@@ -582,56 +720,62 @@ impl Default for X86SigStack {
 }
 
 /// Linux 兼容的信号栈帧结构
-/// 这个结构布局与 Linux 完全兼容，用户态可以通过 ucontext 访问寄存器和 FP 状态
-#[repr(C, align(16))]
+/// x86_64 Linux 布局为 pretcode, ucontext, siginfo，FP/XSAVE 状态跟随在结构之后。
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct SigFrame {
     /// 指向restorer的地址的指针
     pub ret_code_ptr: *mut c_void,
+    /// ucontext_t 结构
+    pub ucontext: UserUContext,
     /// siginfo_t 结构
     pub siginfo: PosixSigInfo,
-    /// ucontext_t 结构（内含 fpstate 和 __ssp）
-    pub ucontext: UserUContext,
 }
 
 impl SigFrame {
-    /// 安全地设置 fpstate 指针，指向 ucontext 内的 __fpregs_mem 的 FXSAVE 兼容部分
-    pub fn setup_fpstate_pointer(&mut self) {
-        // fpstate 指针指向 UserXState 的 fpstate 字段（FXSAVE 兼容部分）
+    /// 设置 fpstate 指针，指向 sigframe 后方独立的 64 字节对齐 XSAVE 区域。
+    pub fn setup_fpstate_pointer(&mut self, fpstate_ptr: *mut UserXState) {
         self.ucontext.uc_mcontext.fpstate =
-            &mut self.ucontext.__fpregs_mem.fpstate as *mut UserFpState64;
+            unsafe { &mut (*fpstate_ptr).fpstate as *mut UserFpState64 };
     }
+}
 
-    /// 安全地获取完整 fpstate (包含 AVX) 的可变引用
-    pub fn fpstate_mut(&mut self) -> &mut UserXState {
-        &mut self.ucontext.__fpregs_mem
-    }
+const _: () = {
+    assert!(core::mem::offset_of!(SigFrame, ucontext) == 8);
+    assert!(core::mem::offset_of!(SigFrame, siginfo) == 432);
+    assert!(core::mem::size_of::<SigFrame>() == 560);
+};
 
-    /// 从栈帧恢复 fpstate，包含安全性检查（防止 SROP 攻击）
-    /// 返回包含完整 XSAVE 状态（包括 AVX）的 FpState
-    pub fn restore_fpstate(&self) -> Result<Option<FpState>, SystemError> {
-        if self.ucontext.uc_mcontext.fpstate.is_null() {
-            return Ok(None);
-        }
-
-        // 验证指针确实指向 ucontext 内的 __fpregs_mem.fpstate
-        let expected_addr = &self.ucontext.__fpregs_mem.fpstate as *const UserFpState64;
-        if !core::ptr::eq(self.ucontext.uc_mcontext.fpstate as *const _, expected_addr) {
-            // 指针被篡改，这可能是 SROP 攻击
-            error!(
-                "fpstate pointer mismatch: expected={:p}, got={:p}, possible SROP attack",
-                expected_addr, self.ucontext.uc_mcontext.fpstate
-            );
-            return Err(SystemError::EFAULT);
-        }
-
-        // 使用 UserXState::to_kernel_fpstate 恢复完整的 XSAVE 状态（包括 AVX）
-        self.ucontext.__fpregs_mem.to_kernel_fpstate().map(Some)
-    }
+struct SignalFrameLocation {
+    frame: *mut SigFrame,
+    fpstate: *mut UserXState,
 }
 
 unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let pcb = ProcessManager::current_pcb();
+
+    // Linux uprobe_deny_signal(): a normal asynchronous signal cannot build a
+    // signal frame in the middle of a single XOL instruction; a synchronous trap
+    // or fatal signal must first restore RIP to the original probe address.
+    if !crate::exception::uprobe::signal_gate(frame) {
+        return;
+    }
+
+    // Pending publication and current's clearing are serialized by the pending
+    // locks. The outer return path still handles stops, restart and saved masks
+    // even when there is no signal queue work to inspect here.
+    if !pcb.has_pending_signal_fast() {
+        return;
+    }
+
+    // Read the process-level shared_pending bitmap first (the sighand read lock
+    // is released right after).
+    // This must complete before taking the sig_info read lock: otherwise do_signal
+    // takes the sighand read lock while holding sig_info's, conflicting with the
+    // recalc_sigpending_tsk (sender context) sighand(read)→sig_info(read) lock order.
+    // DragonOS RwLock is writer-preferring; with concurrent sighand writers
+    // (sigaction) and sig_info writers (sigprocmask) this can form an AB-BA deadlock.
+    let shared_pending = pcb.process_signal().shared_pending_signal().bits();
 
     let siginfo = pcb.try_siginfo_irqsave(5);
 
@@ -644,7 +788,6 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
 
     // 检查 sigpending 是否为 0（需要同时检查线程级 pending 和进程级 shared_pending）
     let thread_pending = siginfo_read_guard.sig_pending().signal().bits();
-    let shared_pending = pcb.sighand().shared_pending_signal().bits();
     if (thread_pending == 0 && shared_pending == 0) || !frame.is_from_user() {
         // 若没有正在等待处理的信号，或者将要返回到的是内核态，则返回
         drop(siginfo_read_guard);
@@ -655,15 +798,47 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     let mut sig_number: Signal;
     let mut info: Option<SigInfo>;
     let mut sigaction: Option<Sigaction>;
-    let sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    let mut first_iter = true;
+    let mut sig_block: SigSet = *siginfo_read_guard.sig_blocked();
+    let mut frame_oldset: SigSet = if pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+        *siginfo_read_guard.saved_sigmask()
+    } else {
+        sig_block
+    };
     drop(siginfo_read_guard);
 
     loop {
+        if !first_iter {
+            let g = pcb.sig_info_irqsave();
+            sig_block = *g.sig_blocked();
+            if !pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+                frame_oldset = sig_block;
+            }
+        }
+        first_iter = false;
         (sig_number, info) = pcb.dequeue_pending_signal(&sig_block);
 
         // 如果信号非法，则直接返回
         if sig_number == Signal::INVALID {
             return;
+        }
+
+        // ptrace signal-delivery-stop
+        if pcb.is_traced() && sig_number != Signal::SIGKILL {
+            match ptrace::ptrace_signal(&pcb, sig_number, &mut info) {
+                None => continue,
+                Some(new_sig) => {
+                    sig_number = new_sig;
+                }
+            }
+        }
+
+        if !sig_number.kernel_only() {
+            let g = pcb.sig_info_irqsave();
+            sig_block = *g.sig_blocked();
+            if !pcb.flags().contains(ProcessFlags::RESTORE_SIG_MASK) {
+                frame_oldset = sig_block;
+            }
         }
 
         // 对 kernel-only 信号（如 SIGKILL/SIGSTOP）直接使用默认处理，避免任何用户帧构造
@@ -680,7 +855,7 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
             sig_number.handle_default();
             return;
         }
-        let sa = pcb.sighand().handler(sig_number).unwrap();
+        let sa = pcb.sighand().handler_for_delivery(sig_number).unwrap();
 
         match sa.action() {
             SigactionType::SaHandler(action_type) => match action_type {
@@ -710,11 +885,13 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
          * case, the signal cannot be dropped.
          */
         // todo: https://code.dragonos.org.cn/xref/linux-6.6.21/include/linux/signal.h?fi=sig_kernel_only#444
-        if ProcessManager::current_pcb()
-            .sighand()
-            .flags_contains(SignalFlags::UNKILLABLE)
+        let is_customized_action = sigaction
+            .as_ref()
+            .is_some_and(|action| action.action().is_customized());
+        let drop_for_unkillable = pcb.process_signal().flags_contains(SignalFlags::UNKILLABLE)
             && !sig_number.kernel_only()
-        {
+            && !is_customized_action;
+        if drop_for_unkillable {
             continue;
         }
 
@@ -723,8 +900,8 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
         }
     }
 
-    let oldset = sig_block;
     // no sig_struct guard to drop
+    pcb.flags().remove(ProcessFlags::RESTORE_SIG_MASK);
     drop(pcb);
     // 做完上面的检查后，开中断
     CurrentIrqArch::interrupt_enable();
@@ -753,11 +930,30 @@ unsafe fn do_signal(frame: &mut TrapFrame, got_signal: &mut bool) {
     }
     *got_signal = true;
 
+    let oldset = frame_oldset;
+    let mut blocked = sig_block | sigaction.mask();
+    if !sigaction.flags().contains(SigFlags::SA_NODEFER) {
+        blocked.insert(sig_number.into());
+    }
+    set_current_blocked(&mut blocked);
+
+    // Linux disables TIF_SINGLESTEP/forced TF before copying sigcontext and,
+    // after a successful frame setup, reports an immediate ptrace SIGTRAP.
+    // Re-arming TF on the handler would execute its first instruction before
+    // the tracer regains control and would recurse for SIGTRAP handlers.
+    let stepping = ProcessManager::current_pcb().prepare_single_step_signal_delivery(frame);
+
     // 注意！由于handle_signal里面可能会退出进程，
     // 因此这里需要检查清楚：上面所有的锁、arc指针都被释放了。否则会产生资源泄露的问题！
     let res: Result<i32, SystemError> =
         handle_signal(sig_number, &mut sigaction, &info.unwrap(), &oldset, frame);
     compiler_fence(Ordering::SeqCst);
+    if res.is_ok() && stepping {
+        // Linux signal_delivered() intentionally ignores ptrace_notify()'s
+        // resume signal for this synthetic post-frame single-step stop.
+        let _ =
+            ProcessControlBlock::ptrace_notify(Signal::SIGTRAP as usize, Signal::SIGTRAP as i32);
+    }
     if let Err(e) = res {
         let _ = if sig_number == Signal::SIGSEGV {
             crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV)
@@ -815,8 +1011,75 @@ impl SignalArch for X86_64SignalArch {
     ///
     /// 参考： https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/signal.c#865
     unsafe fn do_signal_or_restart(frame: &mut TrapFrame) {
+        crate::security::keys::apply_pending_session_keyring();
+        // Before returning to user space, check JOBCTL_TRAP_STOP and initiate a
+        // PTRACE_EVENT_STOP ptrace_stop.
+        // Sources: a fork'd seized child's initial stop, PTRACE_INTERRUPT, ptraced group-stop.
+        let pcb = ProcessManager::current_pcb();
+        let debug_restore = pcb.flags().contains(ProcessFlags::PENDING_DEBUG);
+        defer! {
+            if debug_restore {
+                crate::arch::process::restore_current_debug_regs();
+            }
+        }
+        if debug_restore {
+            if let Some(pending) = pcb.take_pending_debug_signal() {
+                let code = if pending.bits & ptrace::X86_DR_BS != 0 {
+                    ptrace::TRAP_TRACE
+                } else if pending.bits & ptrace::X86_DR_B_MASK != 0 {
+                    ptrace::TRAP_HWBKPT
+                } else if pending.icebp {
+                    ptrace::TRAP_BRKPT
+                } else {
+                    unreachable!("pending debug signal without a #DB cause")
+                };
+                // We are now at the task-context return boundary, where signal
+                // queueing and ptrace stops are permitted.
+                CurrentIrqArch::interrupt_enable();
+                if let Err(err) =
+                    force_sig_fault_to_current(Signal::SIGTRAP, code, VirtAddr::new(pending.addr))
+                {
+                    error!("failed to defer #DB SIGTRAP: {:?}", err);
+                }
+            }
+        }
+        // Before returning to user space, check PENDING_PTRACE_STOP and initiate a
+        // PTRACE_EVENT_STOP ptrace_stop.
+        loop {
+            while pcb.ptrace_handle_pending_stop() {}
+            pcb.handle_pending_group_stop();
+            crate::cgroup::freezer::handle_user_return();
+            if !pcb
+                .flags()
+                .load()
+                .intersects(ProcessFlags::PENDING_PTRACE_STOP | ProcessFlags::PENDING_GROUP_STOP)
+            {
+                break;
+            }
+        }
+
+        // A fatal default action does not return to this signal-entry frame.
+        drop(pcb);
+
         let mut got_signal = false;
         do_signal(frame, &mut got_signal);
+
+        // A stop or ptrace signal-delivery-stop may resume inside do_signal.
+        // Recheck the freezer before executing even a newly built user handler.
+        loop {
+            {
+                let current = ProcessManager::current_pcb();
+                while current.ptrace_handle_pending_stop() {}
+                current.handle_pending_group_stop();
+            }
+            crate::cgroup::freezer::handle_user_return();
+            let flags = ProcessManager::current_pcb().flags().load();
+            if !flags
+                .intersects(ProcessFlags::PENDING_GROUP_STOP | ProcessFlags::PENDING_PTRACE_STOP)
+            {
+                break;
+            }
+        }
 
         if got_signal {
             return;
@@ -826,26 +1089,39 @@ impl SignalArch for X86_64SignalArch {
 
     fn sys_rt_sigreturn(trap_frame: &mut TrapFrame) -> u64 {
         let frame_ptr = (trap_frame.rsp as usize - size_of::<u64>()) as *mut SigFrame;
+        let ucontext_ptr =
+            (frame_ptr as usize + core::mem::offset_of!(SigFrame, ucontext)) as *const UserUContext;
 
-        // 如果当前的rsp不来自用户态，则认为产生了错误（或被SROP攻击）
-        if UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).is_err() {
-            error!("sys_rt_sigreturn: rsp doesn't from user level");
-            let _ = crate::ipc::kill::send_signal_to_pid(
-                ProcessManager::current_pcb().raw_pid(),
-                Signal::SIGSEGV,
-            );
-            return trap_frame.rax;
-        }
+        let ucontext = match UserBufferReader::new(ucontext_ptr, size_of::<UserUContext>(), true)
+            .and_then(|reader| reader.read_one_from_user::<UserUContext>(0))
+        {
+            Ok(ucontext) => ucontext,
+            Err(err) => {
+                error!("sys_rt_sigreturn: failed to read ucontext: {:?}", err);
+                let _ = crate::ipc::signal::force_kernel_default_signal_to_current(Signal::SIGSEGV);
+                return 0;
+            }
+        };
 
-        let frame = unsafe { &*frame_ptr };
+        // Align with Linux restore_sigcontext(): after a signal handler returns, any pending
+        // restart block should degrade to no-restart state. Subsequent manual calls to
+        // restart_syscall should only get EINTR and must not continue consuming the old restart context.
+        let _ = ProcessManager::current_pcb().restart_block().take();
 
         // 1. 恢复信号掩码（从 1024-bit 用户态格式转换到 64-bit 内核格式）
-        let mut sigmask = frame.ucontext.uc_sigmask.to_kernel_sigset();
+        let mut sigmask = ucontext.uc_sigmask.to_kernel_sigset();
         set_current_blocked(&mut sigmask);
+
+        if let Ok(restored_stack) =
+            X86SigStack::from_user_stack(ucontext.uc_stack, trap_frame.rsp as usize)
+        {
+            let pcb = ProcessManager::current_pcb();
+            *pcb.sig_altstack_mut() = restored_stack;
+        }
 
         // 2. 先校验并构造 FP 状态。失败时按 Linux badframe 语义强制 SIGSEGV，
         // 避免把用户篡改的状态交给 FXRSTOR/XRSTOR 触发内核 #GP。
-        let kernel_fp = match frame.restore_fpstate() {
+        let kernel_fp = match ucontext.restore_fpstate() {
             Ok(kernel_fp) => kernel_fp,
             Err(err) => {
                 error!("sys_rt_sigreturn: failed to restore fpstate: {:?}", err);
@@ -855,17 +1131,14 @@ impl SignalArch for X86_64SignalArch {
         };
 
         // 3. 恢复通用寄存器
-        frame.ucontext.restore_to_trapframe(trap_frame);
+        ucontext.restore_to_trapframe(trap_frame);
 
-        // 4. 恢复 FP 状态
+        // 4. Restore FP state.
         if let Some(kernel_fp) = kernel_fp {
             let pcb = ProcessManager::current_pcb();
             let mut archinfo_guard = pcb.arch_info_irqsave();
             *archinfo_guard.fp_state_mut() = Some(kernel_fp);
             archinfo_guard.restore_fp_state();
-
-            // 恢复 cr2
-            *archinfo_guard.cr2_mut() = frame.ucontext.uc_mcontext.cr2 as usize;
         }
 
         // 返回恢复后的 rax 值
@@ -895,20 +1168,10 @@ fn handle_signal(
     if unsafe { frame.syscall_nr() }.is_some() {
         if let Some(syscall_err) = unsafe { frame.syscall_error() } {
             match syscall_err {
-                SystemError::ERESTARTNOHAND => {
+                SystemError::ERESTARTNOHAND | SystemError::ERESTART_RESTARTBLOCK => {
                     frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                 }
                 SystemError::ERESTARTSYS => {
-                    if !sigaction.flags().contains(SigFlags::SA_RESTART) {
-                        frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
-                    } else {
-                        frame.rax = frame.errcode;
-                        frame.rip -= 2;
-                    }
-                }
-                SystemError::ERESTART_RESTARTBLOCK => {
-                    // 为了让带 SA_RESTART 的时序（例如 clock_nanosleep 相对睡眠）也能自动重启，
-                    // 当 SA_RESTART 设置时，按 ERESTARTSYS 的语义处理；否则返回 EINTR。
                     if !sigaction.flags().contains(SigFlags::SA_RESTART) {
                         frame.rax = SystemError::EINTR.to_posix_errno() as i64 as u64;
                     } else {
@@ -951,7 +1214,7 @@ fn setup_frame(
                 // 如果handler地址大于等于用户空间末尾，说明它在内核空间，这是非法的。
                 if handler >= MMArch::USER_END_VADDR {
                     error!("attempting to execute a signal handler from kernel");
-                    let _ = crate::ipc::kill::send_signal_to_pid(
+                    let _ = send_signal_to_pid(
                         ProcessManager::current_pcb().raw_pid(),
                         Signal::SIGSEGV,
                     );
@@ -966,7 +1229,7 @@ fn setup_frame(
                             ProcessManager::current_pcb().raw_pid(),
                             sig as i32
                         );
-                        let _ = crate::ipc::kill::send_signal_to_pid(
+                        let _ = send_signal_to_pid(
                             ProcessManager::current_pcb().raw_pid(),
                             Signal::SIGSEGV,
                         );
@@ -986,9 +1249,11 @@ fn setup_frame(
     }
 
     // 分配新的信号栈帧
-    let frame_ptr: *mut SigFrame = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
+    let frame_location = get_stack(sigaction, trap_frame, size_of::<SigFrame>());
+    let frame_ptr = frame_location.frame;
 
-    // 验证地址位于用户空间
+    // Verify the address lies in user space (access check; the whole frame is
+    // written later by copy_to_user_protected).
     UserBufferWriter::new(frame_ptr, size_of::<SigFrame>(), true).map_err(|_| {
         error!("In setup_frame: access check failed");
         let _ = crate::ipc::kill::send_signal_to_pid(
@@ -997,15 +1262,25 @@ fn setup_frame(
         );
         SystemError::EFAULT
     })?;
+    UserBufferWriter::new(frame_location.fpstate, FPSTATE_FRAME_SIZE, true).map_err(|_| {
+        error!("In setup_frame: fpstate access check failed");
+        let _ = send_signal_to_pid(ProcessManager::current_pcb().raw_pid(), Signal::SIGSEGV);
+        SystemError::EFAULT
+    })?;
 
-    // 获取栈帧的可变引用（唯一需要 unsafe 的地方）
-    let frame = unsafe { &mut *frame_ptr };
+    // Build the complete SigFrame on the kernel stack, then write it to the user
+    // stack in one protected copy.
+    // This keeps all user pointer accesses concentrated in the protected
+    // copy_to_user_protected call, so a bad user stack pointer returns
+    // EFAULT/SIGSEGV rather than panicking.
+    let mut frame: SigFrame = unsafe { core::mem::zeroed() };
 
     // 1. 读取 arch 信息并生成用户态数据（避免持锁访问用户内存）
     let pcb = ProcessManager::current_pcb();
+    let sig_altstack = *pcb.sig_altstack();
     let mut archinfo_guard = pcb.arch_info_irqsave();
     let cr2 = *archinfo_guard.cr2_mut() as u64;
-    let user_ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2);
+    let user_ucontext = UserUContext::from_trapframe(trap_frame, oldset, cr2, &sig_altstack);
 
     // 2. 保存 FP 状态到 PCB，并准备用户态 XSAVE 数据
     archinfo_guard.save_fp_state();
@@ -1017,59 +1292,111 @@ fn setup_frame(
     archinfo_guard.clear_fp_state();
     drop(archinfo_guard);
 
-    // 3. 写入用户栈（可能触发缺页，必须在释放锁后进行）
+    // 3. Fill in the frame fields (pure kernel-side writes, no user deref)
     frame.ucontext = user_ucontext;
     if let Some(fpstate) = user_fpstate {
-        *frame.fpstate_mut() = fpstate;
+        unsafe {
+            crate::syscall::user_access::write_one_to_user_protected(
+                VirtAddr::new(frame_location.fpstate as usize),
+                &fpstate,
+            )?;
+        }
+        // FP_XSTATE_MAGIC2 follows immediately after fpstate.
+        let magic2_addr =
+            unsafe { (frame_location.fpstate as *mut u8).add(size_of::<UserXState>()) as usize };
+        unsafe {
+            crate::syscall::user_access::write_one_to_user_protected(
+                VirtAddr::new(magic2_addr),
+                &FP_XSTATE_MAGIC2,
+            )?;
+        }
     }
-    // 设置 fpstate 指针指向栈帧内的 fpstate
-    frame.setup_fpstate_pointer();
 
-    // 4. 复制 siginfo
-    info.copy_posix_siginfo_to_user(&mut frame.siginfo as *mut PosixSigInfo)
-        .inspect_err(|_| {
-            error!("In copy_posix_siginfo_to_user: failed");
-            let _ = crate::ipc::kill::send_signal_to_pid(
-                ProcessManager::current_pcb().raw_pid(),
-                Signal::SIGSEGV,
-            );
-        })?;
-
-    // 5. 设置返回地址
+    // 4. Fill the remaining frame fields (written on the stack; the whole frame
+    // is then written to the user stack under protection).
+    frame.siginfo = info.convert_to_posix_siginfo();
     frame.ret_code_ptr = ret_code_ptr;
+    // Point the fpstate pointer at the fpstate within the frame.
+    frame.setup_fpstate_pointer(frame_location.fpstate);
 
-    // 6. 设置 trap_frame，准备进入信号处理函数
+    if sig_altstack.flags.contains(SigStackFlags::SS_AUTODISARM) {
+        let pcb = ProcessManager::current_pcb();
+        pcb.sig_altstack_mut().reset_for_autodisarm();
+    }
+
+    // 6. Write the whole frame to the user stack in one go (exception-table protection)
+    let frame_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            &frame as *const SigFrame as *const u8,
+            size_of::<SigFrame>(),
+        )
+    };
+    unsafe {
+        crate::syscall::user_access::copy_to_user_protected(
+            VirtAddr::new(frame_ptr as usize),
+            frame_bytes,
+        )
+        .map_err(|_| {
+            error!("In setup_frame: failed to write sigframe to user stack");
+            let _ = send_signal_to_pid(ProcessManager::current_pcb().raw_pid(), Signal::SIGSEGV);
+            SystemError::EFAULT
+        })?;
+    }
+
+    // 7. Set up trap_frame to enter the signal handler.
+    // rsi/rdx point at the siginfo/ucontext on the user stack (the SigFrame offsets
+    // are asserted at compile time).
+    let frame_base = frame_ptr as usize;
+    let siginfo_uaddr = frame_base + core::mem::offset_of!(SigFrame, siginfo);
+    let ucontext_uaddr = frame_base + core::mem::offset_of!(SigFrame, ucontext);
     trap_frame.rdi = sig as u64; // 参数1: 信号编号
-    trap_frame.rsi = &frame.siginfo as *const _ as u64; // 参数2: siginfo_t*
-    trap_frame.rdx = &frame.ucontext as *const _ as u64; // 参数3: ucontext_t*
+    trap_frame.rax = 0; // Linux x86_64: support handlers declared without prototypes
+    trap_frame.rsi = siginfo_uaddr as u64; // siginfo_t*
+    trap_frame.rdx = ucontext_uaddr as u64; // ucontext_t*
     trap_frame.rsp = frame_ptr as u64;
     trap_frame.rip = handler_addr as u64;
     trap_frame.cs = (USER_CS.bits() | 0x3) as u64;
-    trap_frame.ds = (USER_DS.bits() | 0x3) as u64;
-
+    trap_frame.ds = 0;
+    trap_frame.rflags &= !(X86_EFLAGS_DF | X86_EFLAGS_RF | X86_EFLAGS_TF);
     Ok(0)
 }
 
 #[inline(always)]
-fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> *mut SigFrame {
+fn get_stack(sigaction: &mut Sigaction, frame: &TrapFrame, size: usize) -> SignalFrameLocation {
     let pcb = ProcessManager::current_pcb();
     let stack = pcb.sig_altstack();
 
     let mut rsp: usize;
+    let nested_altstack = stack.on_sig_stack(frame.rsp as usize);
+    let mut entering_altstack = false;
 
     // 检查是否使用备用栈
     if sigaction.flags().contains(SigFlags::SA_ONSTACK)
         && !stack.flags.contains(SigStackFlags::SS_DISABLE)
-        && !stack.on_sig_stack(frame.rsp as usize)
+        && !nested_altstack
     {
-        rsp = stack.sp + stack.size as usize - size;
+        rsp = stack.sp + stack.size;
+        entering_altstack = true;
     } else {
-        // 默认使用用户栈：rsp - 红区(128) - size
-        rsp = (frame.rsp as usize) - 128 - size;
+        // 默认使用用户栈：先跳过 x86_64 ABI red zone。
+        rsp = (frame.rsp as usize) - 128;
     }
 
-    // 16字节对齐，减8是为了保持 x86_64 ABI 的栈对齐约定
+    let fpstate = (rsp - FPSTATE_FRAME_SIZE) & !(64 - 1);
+    rsp = fpstate - size;
+
+    // 16字节对齐，减8是为了保持 x86_64 ABI 的栈对齐约定。
     rsp = (rsp & !(STACK_ALIGN - 1) as usize) - 8;
 
-    rsp as *mut SigFrame
+    if (nested_altstack || entering_altstack) && !stack.contains_sp(rsp) {
+        return SignalFrameLocation {
+            frame: usize::MAX as *mut SigFrame,
+            fpstate: usize::MAX as *mut UserXState,
+        };
+    }
+
+    SignalFrameLocation {
+        frame: rsp as *mut SigFrame,
+        fpstate: fpstate as *mut UserXState,
+    }
 }

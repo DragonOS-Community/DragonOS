@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       kernel_changed: ${{ steps.filter.outputs.kernel }}
+      ext4_tool_changed: ${{ steps.filter.outputs.ext4_tool }}
     steps:
       - uses: actions/checkout@v3
         with:
@@ -23,19 +24,87 @@ jobs:
           filters: |
             kernel:
               - 'kernel/**'
+            ext4_tool:
+              - 'kernel/crates/another_ext4/**'
+              - '.github/workflows/makefile.yml'
+
+  ext4-fuse-test:
+    name: Ext4 host FUSE regression
+    env:
+      HOME: /root
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
+    needs: changes
+    if: needs.changes.outputs.ext4_tool_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: dragonos/dragonos-dev:v1.24
+      options: --privileged -v /dev:/dev -v /lib/modules:/lib/modules:ro
+    steps:
+      - uses: actions/checkout@v3
+      - name: Change source
+        run: |
+          find . -type f \( -name "*.toml" -o -name "Makefile" \) -exec sed -i 's/git\.mirrors\.dragonos\.org\.cn/github\.com/g' {} +
+      - name: Prepare host FUSE
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends fuse3 kmod e2fsprogs python3
+          modprobe fuse
+          test -c /dev/fuse
+      - name: Build and test the host adapter
+        shell: bash -ileo pipefail {0}
+        run: |
+          source /root/.cargo/env
+          cargo build --manifest-path kernel/crates/another_ext4/ext4_fuse/Cargo.toml --locked --release --target-dir bin/ext4-fuse-build
+          mkdir -p bin/ext4-fuse-ci
+          python3 kernel/crates/another_ext4/ext4_fuse/tests/xattr_flags.py "$PWD/bin/ext4-fuse-build/release/ext4_fuse" "$PWD/bin/ext4-fuse-ci"
+
+      - name: Test snapshot owner and rollback
+        shell: bash -ileo pipefail {0}
+        run: |
+          source /root/.cargo/env
+          cargo test --manifest-path kernel/crates/another_ext4/ext4_fuse/Cargo.toml --locked --target-dir bin/ext4-fuse-build snapshot_tests
+
+      - name: Test snapshot restore through FUSE
+        shell: bash -ileo pipefail {0}
+        run: |
+          python3 kernel/crates/another_ext4/ext4_fuse/tests/snapshot_restore.py "$PWD/bin/ext4-fuse-build/release/ext4_fuse" "$PWD/bin/ext4-snapshot-ci"
+
+  sysconfig-payload-test:
+    name: Sysconfig payload generator test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run sysconfig payload generator unit tests
+        run: python3 tools/test_build_sysconfig_payload.py
+
+  agent-memory-tools-test:
+    name: Agent memory acceptance tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Test VM evidence handling
+        run: python3 -m unittest discover -s tools/agent_memory -p 'test_*.py'
+      - name: Test guest sampler parsing and cleanup
+        run: python3 user/apps/agent_memory/test_helper.py
+      - name: Test independent OpenCode result validation
+        run: |
+          bash -n tools/agent_memory/workloads/opencode.sh
+          node --test tools/agent_memory/workloads/test_check.cjs
 
   format-check:
     name: Format check ${{ matrix.arch }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.23
+    container: dragonos/dragonos-dev:v1.24
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.23"
+      - run: echo "Running in dragonos/dragonos-dev:v1.24"
       - uses: actions/checkout@v3
 
       - name: Change source
@@ -58,14 +127,14 @@ jobs:
     if: needs.changes.outputs.kernel_changed == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
-    container: dragonos/dragonos-dev:v1.23
+    container: dragonos/dragonos-dev:v1.24
 
     strategy:
       matrix:
         arch: [x86_64, riscv64, loongarch64]
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.23"
+      - run: echo "Running in dragonos/dragonos-dev:v1.24"
 
       - uses: actions/checkout@v3
 
@@ -83,7 +152,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    container: dragonos/dragonos-dev:v1.23
+    container: dragonos/dragonos-dev:v1.24
     continue-on-error: true
     strategy:
       matrix:
@@ -100,7 +169,7 @@ jobs:
             checkout_params: {}
 
     steps:
-      - run: echo "Running in dragonos/dragonos-dev:v1.23"
+      - run: echo "Running in dragonos/dragonos-dev:v1.24"
 
       - uses: actions/checkout@v3
         with: ${{ matrix.checkout_params }}

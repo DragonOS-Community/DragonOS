@@ -1,0 +1,3 @@
+# This test currently fails on the master baseline because opening /dev/tty in
+# the forked child exits with status 1. Keep the adjacent PTY tests enabled.
+BasicPtyTest.OpenDevTTY

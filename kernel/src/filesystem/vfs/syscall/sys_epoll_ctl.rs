@@ -32,8 +32,7 @@ impl Syscall for SysEpollCtlHandle {
                 return Err(SystemError::EFAULT);
             }
 
-            // 还是一样的问题，C标准的epoll_event大小为12字节，而内核实现的epoll_event内存对齐后为16字节
-            // 这样分别拷贝其实和整体拷贝差别不大，内核使用内存对其版本甚至可能提升性能
+            // EPollEvent follows the native ABI: packed on x86_64, natural alignment elsewhere.
             let epds_reader = UserBufferReader::new(
                 event.as_ptr::<EPollEvent>(),
                 core::mem::size_of::<EPollEvent>(),

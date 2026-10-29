@@ -262,15 +262,20 @@ impl TtyDriver {
     }
 
     #[inline]
-    fn lookup_tty(&self, index: usize) -> Option<Arc<TtyCore>> {
-        let ret = self
-            .driver_funcs()
-            .lookup(index, TtyDriverPrivateData::Unused);
-        if let Err(SystemError::ENOSYS) = ret {
-            let device_guard = self.ttys.lock();
-            return device_guard.get(&index).cloned();
+    fn lookup_tty(&self, index: usize) -> Result<Option<Arc<TtyCore>>, SystemError> {
+        // Match Linux tty_driver_lookup_tty(): a driver lookup error is distinct from "not
+        // found". Only an unimplemented lookup hook may fall back to the generic tty table.
+        let private_data = if self.tty_driver_type() == TtyDriverType::Pty {
+            TtyDriverPrivateData::Pty(self.tty_driver_sub_type() == TtyDriverSubType::PtyMaster)
+        } else {
+            TtyDriverPrivateData::Unused
+        };
+
+        match self.driver_funcs().lookup(index, private_data) {
+            Ok(tty) => Ok(Some(tty)),
+            Err(SystemError::ENOSYS) => Ok(self.ttys.lock().get(&index).cloned()),
+            Err(err) => Err(err),
         }
-        ret.ok()
     }
 
     pub fn standard_install(&self, tty_core: Arc<TtyCore>) -> Result<(), SystemError> {
@@ -307,21 +312,30 @@ impl TtyDriver {
     }
 
     pub fn init_tty_device(&self, index: Option<usize>) -> Result<Arc<TtyCore>, SystemError> {
-        // 如果传入的index为None，那么就自动分配index
-        let idx: usize;
-        if let Some(i) = index {
+        // Dynamic drivers (PTY, serial and virtio console) own explicit index
+        // lifetimes outside this IDA. Only an automatically allocated index is
+        // owned by this call and can be rolled back here.
+        let (idx, auto_allocated) = if let Some(i) = index {
+            if i >= self.device_count as usize {
+                return Err(SystemError::EINVAL);
+            }
             if self.ida.lock().exists(i) {
                 return Err(SystemError::EINVAL);
             }
-            idx = i;
+            (i, false)
         } else {
-            idx = self.ida.lock().alloc().ok_or(SystemError::EBUSY)?;
-        }
+            (self.ida.lock().alloc().ok_or(SystemError::EBUSY)?, true)
+        };
         // log::debug!("init_tty_device: create TtyCore");
         let tty = TtyCore::new(self.self_ref(), idx);
 
         // log::debug!("init_tty_device: to driver_install_tty");
-        self.driver_install_tty(tty.clone())?;
+        if let Err(err) = self.driver_install_tty(tty.clone()) {
+            if auto_allocated {
+                self.ida.lock().free(idx);
+            }
+            return Err(err);
+        }
         // log::debug!(
         //     "init_tty_device: driver_install_tty done, index: {}, dev_name: {:?}",
         //     idx,
@@ -336,7 +350,15 @@ impl TtyDriver {
             tty.set_port(ports[core.index()].clone());
         }
         // log::debug!("init_tty_device: to ldisc_setup");
-        TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link())?;
+        if let Err(err) = TtyLdiscManager::ldisc_setup(tty.clone(), tty.core().link()) {
+            if self.tty_driver_type == TtyDriverType::Pty {
+                self.ttys.lock().remove(&idx);
+                if let Some(other_driver) = self.other_pty_driver() {
+                    other_driver.ttys().remove(&idx);
+                }
+            }
+            return Err(err);
+        }
 
         // 对 PTY 来说，用户可见的设备节点由 devpts 挂载点下的动态节点提供，
         // 不应再向全局 devfs 注册（否则在新实例复用索引时会因已有的 ptm/ptsX 节点返回 EEXIST）。
@@ -363,7 +385,7 @@ impl TtyDriver {
         let mut tty: Option<Arc<TtyCore>> = None;
 
         if let Some(idx) = index {
-            if let Some(t) = self.lookup_tty(idx) {
+            if let Some(t) = self.lookup_tty(idx)? {
                 if t.core().port().is_none() {
                     warn!("{} port is None", t.core().name());
                 } else if t.core().port().unwrap().state() == TtyPortState::KOPENED {
@@ -498,6 +520,14 @@ pub trait TtyOperation: Sync + Send + Debug {
         self.write(tty, &[ch], 1).map(|_| ())
     }
 
+    /// Send a high-priority software flow-control character.
+    ///
+    /// Drivers without a priority path return `ENOSYS` so the TTY core can
+    /// use Linux's write-serialized fallback.
+    fn send_xchar(&self, _tty: &TtyCoreData, _ch: u8) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     fn start(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
         Err(SystemError::ENOSYS)
     }
@@ -512,8 +542,13 @@ pub trait TtyOperation: Sync + Send + Debug {
 
     fn ioctl(&self, tty: Arc<TtyCore>, cmd: u32, arg: usize) -> Result<(), SystemError>;
 
-    fn chars_in_buffer(&self) -> usize {
+    fn chars_in_buffer(&self, _tty: &TtyCoreData) -> usize {
         0
+    }
+
+    /// Wait until bytes accepted by the driver have physically left the device.
+    fn wait_until_sent(&self, _tty: &TtyCoreData) -> Result<(), SystemError> {
+        Ok(())
     }
 
     fn set_termios(&self, _tty: Arc<TtyCore>, _old_termios: Termios) -> Result<(), SystemError> {

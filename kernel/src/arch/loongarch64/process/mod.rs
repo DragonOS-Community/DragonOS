@@ -52,6 +52,10 @@ impl ArchPCBInfo {
     pub fn new(kstack: &KernelStack) -> Self {
         todo!("la64: ArchPCBInfo::new")
     }
+
+    /// Synchronize hardware-backed current-thread state before common fork code
+    /// clones `ArchPCBInfo`.
+    pub fn sync_current_state_before_fork(&mut self) {}
 }
 
 impl ProcessControlBlock {

@@ -1,11 +1,8 @@
-use super::super::signal_types::{SigInfo, SigType};
 use crate::arch::interrupt::TrapFrame;
 use crate::{
     alloc::vec::Vec,
-    arch::ipc::signal::Signal,
     arch::syscall::nr::SYS_RESTART_SYSCALL,
-    ipc::signal_types::SigCode,
-    process::{ProcessManager, RawPid},
+    process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use syscall_table_macros::declare_syscall;
@@ -22,14 +19,10 @@ pub(super) fn do_kernel_restart_syscall() -> Result<usize, SystemError> {
     if let Some(mut restart_block) = restart_block {
         return restart_block.restart_fn.call(&mut restart_block.data);
     } else {
-        // 不应该走到这里，因此kill掉当前进程及同组的进程
-        let pid = RawPid::new(0);
-        let sig = Signal::SIGKILL;
-        let mut info = SigInfo::new(sig, 0, SigCode::Kernel, SigType::Kill { pid, uid: 0 });
-
-        sig.send_signal_info(Some(&mut info), pid)
-            .expect("Failed to kill ");
-        return Ok(0);
+        // Align with Linux do_no_restart_syscall(): userspace can directly call
+        // restart_syscall, so the absence of a restart block is a normal EINTR return,
+        // not a kernel invariant violation that requires killing the process or panicking.
+        return Err(SystemError::EINTR);
     }
 }
 

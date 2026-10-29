@@ -114,6 +114,15 @@ impl IdAllocator {
     /// - `Some(id)`: 分配成功
     /// - `None`: id 越界、已被占用或无可用 id
     pub fn alloc_specific(&mut self, id: usize) -> Option<usize> {
+        let id = self.reserve_specific(id)?;
+
+        // Keep this API's existing cursor policy for non-PID users.
+        self.current_id = (id + 1).min(self.max_id.saturating_sub(1));
+        Some(id)
+    }
+
+    /// Reserve one ID without changing the cyclic allocation cursor.
+    pub fn reserve_specific(&mut self, id: usize) -> Option<usize> {
         if unlikely(self.available() == 0) {
             return None;
         }
@@ -129,9 +138,39 @@ impl IdAllocator {
         self.xarray.store(id as u64, EmptyIdaItem);
         self.used += 1;
 
-        // 为了让后续的 alloc() 更均匀地分配，尽量从下一个位置开始搜索
-        self.current_id = (id + 1).min(self.max_id.saturating_sub(1));
         Some(id)
+    }
+
+    /// Allocate cyclically within a caller-provided, upper-exclusive range.
+    /// IDs retained outside this range do not consume its search capacity.
+    pub fn alloc_range(&mut self, min_id: usize, max_id: usize) -> Option<usize> {
+        self.alloc_range_from(self.current_id, min_id, max_id)
+    }
+
+    /// Allocate cyclically from an explicit next candidate without changing
+    /// other users' cursor conventions. Bounds are inclusive/exclusive.
+    pub fn alloc_range_from(&mut self, next: usize, min_id: usize, max_id: usize) -> Option<usize> {
+        if min_id < self.min_id || max_id > self.max_id || min_id >= max_id {
+            return None;
+        }
+        let start = next.clamp(min_id, max_id);
+        let id = self
+            .do_find_first_free_index(start, max_id)
+            .or_else(|| self.do_find_first_free_index(min_id, start))?;
+        self.xarray.store(id as u64, EmptyIdaItem);
+        self.used += 1;
+        self.current_id = id;
+        Some(id)
+    }
+
+    /// Last cyclic selection (or the initial cursor before allocation).
+    pub fn cursor(&self) -> usize {
+        self.current_id
+    }
+
+    /// Restore the initial cyclic cursor after a cancelled first allocation.
+    pub fn reset_cursor(&mut self) {
+        self.current_id = self.min_id;
     }
 
     /// 检查id是否存在
@@ -243,5 +282,54 @@ mod tests {
         }
 
         assert_eq!(ida.used(), 0);
+    }
+
+    #[test]
+    fn requested_ids_preserve_cursor() {
+        let mut ida = IdAllocator::new(1, 100).unwrap();
+        assert_eq!(ida.alloc_range(1, 100), Some(1));
+        assert_eq!(ida.reserve_specific(80), Some(80));
+        assert_eq!(ida.cursor(), 1);
+        assert_eq!(ida.alloc_range(1, 100), Some(2));
+        assert_eq!(ida.reserve_specific(80), None);
+        assert_eq!(ida.reserve_specific(0), None);
+        assert_eq!(ida.reserve_specific(100), None);
+        assert_eq!(ida.cursor(), 2);
+        // The older API retains its independent cursor policy.
+        assert_eq!(ida.alloc_specific(90), Some(90));
+        assert_eq!(ida.cursor(), 91);
+    }
+
+    #[test]
+    fn bounded_allocation_ignores_retained_high_ids() {
+        let mut ida = IdAllocator::new(1, 20).unwrap();
+        for id in 10..20 {
+            assert_eq!(ida.reserve_specific(id), Some(id));
+        }
+        for id in 1..4 {
+            assert_eq!(ida.alloc_range(1, 4), Some(id));
+        }
+        assert_eq!(ida.alloc_range(1, 4), None);
+        ida.free(2);
+        assert_eq!(ida.alloc_range(1, 4), Some(2));
+        assert_eq!(ida.used(), 13);
+        assert_eq!(ida.reserve_specific(7), Some(7));
+        assert_eq!(ida.alloc_range(1, 10), Some(4));
+    }
+
+    #[test]
+    fn bounded_allocation_wrap_and_reset() {
+        let mut ida = IdAllocator::new(1, 20).unwrap();
+        assert_eq!(ida.alloc_specific(18), Some(18));
+        assert_eq!(ida.alloc_range(5, 10), Some(5));
+        assert_eq!(ida.alloc_range(0, 10), None);
+        assert_eq!(ida.alloc_range(1, 21), None);
+        assert_eq!(ida.alloc_range(10, 10), None);
+        assert_eq!(ida.cursor(), 5);
+        ida.reset_cursor();
+        assert_eq!(ida.cursor(), 1);
+        assert_eq!(ida.alloc_range(1, 10), Some(1));
+        assert!(ida.exists(5));
+        assert!(ida.exists(18));
     }
 }

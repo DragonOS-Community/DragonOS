@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Arg, Command};
 use std::path::PathBuf;
 
+mod gtest_xml;
 mod lib_sync;
 use lib_sync::{Config, TestRunner};
 
@@ -12,13 +13,6 @@ fn main() -> Result<()> {
     let app = Command::new("gvisor-test-runner")
         .version("0.1.0")
         .about("gvisor系统调用测试运行脚本 - Rust版本")
-        .arg(
-            Arg::new("help")
-                .short('h')
-                .long("help")
-                .action(clap::ArgAction::Help)
-                .help("显示此帮助信息"),
-        )
         .arg(
             Arg::new("list")
                 .short('l')
@@ -75,6 +69,12 @@ fn main() -> Result<()> {
                 .help("指定白名单文件路径（默认：whitelist.txt）"),
         )
         .arg(
+            Arg::new("required-tests")
+                .long("required-tests")
+                .value_name("FILE")
+                .help("指定 required 测试清单（默认：required_tests.txt）"),
+        )
+        .arg(
             Arg::new("test-patterns")
                 .value_name("PATTERN")
                 .action(clap::ArgAction::Append)
@@ -90,9 +90,10 @@ fn main() -> Result<()> {
     let matches = app.get_matches();
 
     // 解析配置
-    let mut config = Config::default();
-
-    config.verbose = matches.get_flag("verbose");
+    let mut config = Config {
+        verbose: matches.get_flag("verbose"),
+        ..Config::default()
+    };
 
     if let Some(timeout) = matches.get_one::<u64>("timeout") {
         config.timeout = *timeout;
@@ -105,23 +106,32 @@ fn main() -> Result<()> {
     config.use_blocklist = !matches.get_flag("no-blocklist");
     config.use_whitelist = !matches.get_flag("no-whitelist");
 
+    let custom_whitelist = matches.get_one::<String>("whitelist").is_some();
     if let Some(whitelist_file) = matches.get_one::<String>("whitelist") {
         config.whitelist_file = PathBuf::from(whitelist_file);
     }
+    if let Some(required_tests_file) = matches.get_one::<String>("required-tests") {
+        config.required_tests_file = PathBuf::from(required_tests_file);
+    }
 
     if let Some(extra_dirs) = matches.get_many::<String>("extra-blocklist") {
-        config.extra_blocklist_dirs = extra_dirs.map(|s| PathBuf::from(s)).collect();
+        config.extra_blocklist_dirs = extra_dirs.map(PathBuf::from).collect();
     }
 
     if let Some(patterns) = matches.get_many::<String>("test-patterns") {
         config.test_patterns = patterns.cloned().collect();
     }
 
+    config.enforce_required = config.use_whitelist
+        && !custom_whitelist
+        && config.test_patterns.is_empty()
+        && !matches.get_flag("list");
+
     // 设置输出方式（默认为true，--no-stdout 设为 false）
     config.output_to_stdout = !matches.get_flag("no-stdout");
 
     // 创建测试运行器
-    let runner = TestRunner::new(config);
+    let runner = TestRunner::new(config)?;
 
     // 处理特殊命令
     if matches.get_flag("list") {

@@ -1,15 +1,11 @@
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
-    sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
-use alloc::{
-    boxed::Box,
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{boxed::Box, sync::Arc};
 use log::{error, info, warn};
 use system_error::SystemError;
 
@@ -19,19 +15,26 @@ use crate::{
         softirq::{softirq_vectors, SoftirqNumber, SoftirqVec},
         InterruptArch,
     },
-    libs::spinlock::{SpinLock, SpinLockGuard},
+    libs::{
+        rbtree::{PreparedNode, RBTree},
+        spinlock::{SpinLock, SpinLockGuard},
+    },
     process::{ProcessControlBlock, ProcessManager},
     sched::{schedule, SchedMode},
 };
 
-use super::{jiffies::NSEC_PER_JIFFY, timekeeping::update_wall_time};
+use super::{
+    absolute_timer::{self, AbsoluteClock},
+    jiffies::NSEC_PER_JIFFY,
+};
 
 const MAX_TIMEOUT: i64 = i64::MAX;
 const TIMER_RUN_CYCLE_THRESHOLD: usize = 20;
 static TIMER_JIFFIES: AtomicU64 = AtomicU64::new(0);
 
 lazy_static! {
-    pub static ref TIMER_LIST: SpinLock<Vec<(u64, Arc<Timer>)>> = SpinLock::new(Vec::new());
+    pub static ref TIMER_LIST: SpinLock<RBTree<(u64, usize), Arc<Timer>>> =
+        SpinLock::new(RBTree::new());
 }
 
 /// 定时器要执行的函数的特征
@@ -105,7 +108,29 @@ impl TimerFunction for WakeUpHelper {
 
 #[derive(Debug)]
 pub struct Timer {
+    expire_jiffies: u64,
     inner: SpinLock<InnerTimer>,
+}
+
+/// Owns every allocation required to publish a timer. Kept outside Timer to
+/// avoid a self-cycle; dropping an unpublished activation releases everything.
+#[derive(Debug)]
+pub(crate) struct PreparedTimer {
+    timer: Arc<Timer>,
+    node: PreparedNode<(u64, usize), Arc<Timer>>,
+}
+
+impl PreparedTimer {
+    pub(crate) fn timer(&self) -> Arc<Timer> {
+        self.timer.clone()
+    }
+
+    pub(crate) fn activate(self) {
+        let mut timers = TIMER_LIST.lock_irqsave();
+        // This token exclusively owns the unpublished activation.
+        debug_assert!(timers.get(&self.timer.queue_key()).is_none());
+        timers.insert_prepared(self.node);
+    }
 }
 
 impl Timer {
@@ -117,59 +142,56 @@ impl Timer {
     ///
     /// @return 定时器结构体
     pub fn new(timer_func: Box<dyn TimerFunction>, expire_jiffies: u64) -> Arc<Self> {
-        let result: Arc<Timer> = Arc::new(Timer {
+        Self::try_new(timer_func, expire_jiffies).expect("timer allocation failed")
+    }
+
+    fn try_new(
+        timer_func: Box<dyn TimerFunction>,
+        expire_jiffies: u64,
+    ) -> Result<Arc<Self>, SystemError> {
+        Arc::try_new(Timer {
+            expire_jiffies,
             inner: SpinLock::new(InnerTimer {
-                expire_jiffies,
                 timer_func: Some(timer_func),
-                self_ref: Weak::default(),
                 triggered: false,
             }),
-        });
+        })
+        .map_err(|_| SystemError::ENOMEM)
+    }
 
-        result.inner.lock().self_ref = Arc::downgrade(&result);
-
-        return result;
+    pub(crate) fn try_prepare(
+        timer_func: Box<dyn TimerFunction>,
+        expire_jiffies: u64,
+    ) -> Result<PreparedTimer, SystemError> {
+        let timer = Self::try_new(timer_func, expire_jiffies)?;
+        let node = PreparedNode::try_new(timer.queue_key(), timer.clone())
+            .map_err(|_| SystemError::ENOMEM)?;
+        Ok(PreparedTimer { timer, node })
     }
 
     pub fn inner(&self) -> SpinLockGuard<'_, InnerTimer> {
         return self.inner.lock_irqsave();
     }
 
-    /// @brief 将定时器插入到定时器链表中
-    pub fn activate(&self) {
-        let mut timer_list = TIMER_LIST.lock_irqsave();
-        let inner_guard = self.inner();
+    fn queue_key(&self) -> (u64, usize) {
+        (self.expire_jiffies, self as *const Self as usize)
+    }
 
-        // 链表为空，则直接插入
-        if timer_list.is_empty() {
-            // FIXME push_timer
-            timer_list.push((
-                inner_guard.expire_jiffies,
-                inner_guard.self_ref.upgrade().unwrap(),
-            ));
+    pub fn expire_jiffies(&self) -> u64 {
+        self.expire_jiffies
+    }
 
-            drop(inner_guard);
-            drop(timer_list);
-            compiler_fence(Ordering::SeqCst);
-
+    /// @brief 将定时器插入到定时器队列中
+    pub fn activate(self: &Arc<Self>) {
+        let node = PreparedNode::try_new(self.queue_key(), self.clone())
+            .expect("timer queue allocation failed");
+        let mut timers = TIMER_LIST.lock_irqsave();
+        if timers.get(&self.queue_key()).is_some() {
+            drop(timers);
+            warn!("Timer already in list");
             return;
         }
-        let expire_jiffies = inner_guard.expire_jiffies;
-        let self_arc = inner_guard.self_ref.upgrade().unwrap();
-        drop(inner_guard);
-        let mut split_pos: usize = timer_list.len();
-        for (pos, elt) in timer_list.iter().enumerate() {
-            if Arc::ptr_eq(&self_arc, &elt.1) {
-                warn!("Timer already in list");
-            }
-            if elt.0 > expire_jiffies {
-                split_pos = pos;
-                break;
-            }
-        }
-        timer_list.insert(split_pos, (expire_jiffies, self_arc));
-
-        drop(timer_list);
+        timers.insert_prepared(node);
     }
 
     #[inline]
@@ -194,11 +216,8 @@ impl Timer {
 
     /// ## 取消定时器任务
     pub fn cancel(&self) -> bool {
-        let this_arc = self.inner().self_ref.upgrade().unwrap();
-        TIMER_LIST
-            .lock_irqsave()
-            .extract_if(.., |x| Arc::ptr_eq(&this_arc, &x.1))
-            .for_each(drop);
+        let removed = TIMER_LIST.lock_irqsave().remove(&self.queue_key());
+        drop(removed);
         true
     }
 }
@@ -206,12 +225,8 @@ impl Timer {
 /// 定时器类型
 #[derive(Debug)]
 pub struct InnerTimer {
-    /// 定时器结束时刻
-    pub expire_jiffies: u64,
     /// 定时器需要执行的函数结构体
     pub timer_func: Option<Box<dyn TimerFunction>>,
-    /// self_ref
-    self_ref: Weak<Timer>,
     /// 判断该计时器是否触发
     triggered: bool,
 }
@@ -244,31 +259,30 @@ impl SoftirqVec for DoTimerSoftirq {
         if !self.set_run() {
             return;
         }
-        // 最多只处理TIMER_RUN_CYCLE_THRESHOLD个计时器
-        for _ in 0..TIMER_RUN_CYCLE_THRESHOLD {
-            // debug!("DoTimerSoftirq run");
-            let timer_list = TIMER_LIST.try_lock_irqsave();
-            if timer_list.is_err() {
-                continue;
+        super::clocksource::run_due_watchdog();
+        // Round-robin all three domains. An empty ordinary queue must not
+        // suppress absolute timers, and one busy domain must not starve others.
+        let mut completed = 0;
+        let mut idle = 0;
+        let mut domain = 0;
+        while completed < TIMER_RUN_CYCLE_THRESHOLD && idle < 3 {
+            let ran = match domain {
+                0 => run_one_jiffies_timer(),
+                1 => absolute_timer::run_one_due(AbsoluteClock::Monotonic),
+                _ => absolute_timer::run_one_due(AbsoluteClock::Realtime),
+            };
+            domain = (domain + 1) % 3;
+            if ran {
+                completed += 1;
+                idle = 0;
+            } else {
+                idle += 1;
             }
-            let mut timer_list = timer_list.unwrap();
-
-            if timer_list.is_empty() {
-                break;
-            }
-
-            let (front_jiffies, timer_list_front) = timer_list.first().unwrap().clone();
-            // debug!("to lock timer_list_front");
-
-            if front_jiffies >= TIMER_JIFFIES.load(Ordering::SeqCst) {
-                break;
-            }
-            timer_list.remove(0);
-            drop(timer_list);
-            timer_list_front.run();
         }
-
         self.clear_run();
+        if completed == TIMER_RUN_CYCLE_THRESHOLD {
+            try_raise_timer_softirq();
+        }
     }
 }
 
@@ -286,14 +300,23 @@ pub fn timer_init() {
 /// 计算接下来n毫秒对应的定时器时间片
 #[allow(dead_code)]
 pub fn next_n_ms_timer_jiffies(expire_ms: u64) -> u64 {
-    return TIMER_JIFFIES.load(Ordering::SeqCst) + expire_ms * 1000000 / NSEC_PER_JIFFY as u64;
+    relative_timer_jiffies(clock(), u128::from(expire_ms) * 1_000_000)
 }
 /// 计算接下来n微秒对应的定时器时间片
 pub fn next_n_us_timer_jiffies(expire_us: u64) -> u64 {
-    let now = TIMER_JIFFIES.load(Ordering::SeqCst);
-    let ns = expire_us * 1000;
-    let jiffies = ns.div_ceil(NSEC_PER_JIFFY as u64);
-    now + jiffies
+    relative_timer_jiffies(clock(), u128::from(expire_us) * 1_000)
+}
+
+pub(super) fn relative_timer_jiffies(now: u64, duration_ns: u128) -> u64 {
+    if duration_ns == 0 {
+        return now;
+    }
+    let ticks = duration_ns
+        .div_ceil(NSEC_PER_JIFFY as u128)
+        .min(u64::MAX as u128) as u64;
+    // `now` identifies a tick already in progress. Include that partial tick
+    // so a positive real duration cannot expire before its requested deadline.
+    now.saturating_add(ticks.saturating_add(1))
 }
 
 /// @brief 让pcb休眠timeout个jiffies
@@ -345,31 +368,76 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     }
 }
 
-pub fn timer_get_first_expire() -> Result<u64, SystemError> {
-    // FIXME
-    // debug!("rs_timer_get_first_expire,timer_jif = {:?}", TIMER_JIFFIES);
-    for _ in 0..10 {
-        match TIMER_LIST.try_lock_irqsave() {
-            Ok(timer_list) => {
-                // debug!("rs_timer_get_first_expire TIMER_LIST lock successfully");
-                if timer_list.is_empty() {
-                    // debug!("timer_list is empty");
-                    return Ok(0);
-                } else {
-                    // debug!("timer_list not empty");
-                    return Ok(timer_list.first().unwrap().0);
-                }
+/// Return the earliest deadline, distinguishing an empty queue from deadline 0.
+/// Contention remains bounded because the caller runs in timer IRQ context.
+pub fn timer_get_first_expire() -> Result<Option<u64>, SystemError> {
+    earliest_expire([
+        first_expire_in(&TIMER_LIST),
+        absolute_timer::first_expire(AbsoluteClock::Monotonic),
+        absolute_timer::first_expire(AbsoluteClock::Realtime),
+    ])
+}
+
+fn earliest_expire(
+    candidates: [Result<Option<u64>, SystemError>; 3],
+) -> Result<Option<u64>, SystemError> {
+    let mut earliest: Option<u64> = None;
+    let mut contended = false;
+    for candidate in candidates {
+        match candidate {
+            Ok(Some(deadline)) => {
+                earliest = Some(earliest.map_or(deadline, |old| old.min(deadline)));
             }
-            // 加锁失败返回啥？？
-            Err(_) => continue,
+            Ok(None) => {}
+            Err(_) => contended = true,
         }
     }
-    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    if earliest.is_none() && contended {
+        Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    } else {
+        Ok(earliest)
+    }
+}
+
+fn run_one_jiffies_timer() -> bool {
+    let Ok(mut queue) = TIMER_LIST.try_lock_irqsave() else {
+        return false;
+    };
+    let timer = pop_expired(&mut queue, clock());
+    drop(queue);
+    let Some(timer) = timer else {
+        return false;
+    };
+    timer.run();
+    true
+}
+
+fn first_expire_in(
+    timers: &SpinLock<RBTree<(u64, usize), Arc<Timer>>>,
+) -> Result<Option<u64>, SystemError> {
+    for _ in 0..10 {
+        if let Ok(timer_list) = timers.try_lock_irqsave() {
+            return Ok(timer_list.get_first().map(|(key, _)| key.0));
+        }
+    }
+    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+}
+
+/// Select and retire one due timer while the caller holds the queue lock.
+fn pop_expired(timers: &mut RBTree<(u64, usize), Arc<Timer>>, now: u64) -> Option<Arc<Timer>> {
+    if timers.get_first().is_none_or(|(key, _)| key.0 > now) {
+        return None;
+    }
+    timers.pop_first().map(|(_, timer)| timer)
 }
 
 /// 检查是否需要触发定时器软中断，如果需要则触发
 pub fn try_raise_timer_softirq() {
-    if let Ok(first_expire) = timer_get_first_expire() {
+    if super::clocksource::watchdog_due(clock()) {
+        softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+        return;
+    }
+    if let Ok(Some(first_expire)) = timer_get_first_expire() {
         if first_expire <= clock() {
             softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
         }
@@ -382,16 +450,152 @@ pub fn run_local_timer() {
     try_raise_timer_softirq();
 }
 
-/// 更新系统时间片
-pub fn update_timer_jiffies(add_jiffies: u64) -> u64 {
-    let prev = TIMER_JIFFIES.fetch_add(add_jiffies, Ordering::SeqCst);
-    compiler_fence(Ordering::SeqCst);
-    update_wall_time();
+/// Pure count commit. Global timekeeping's write lock serializes all writers.
+/// No maintenance, clock read, wakeup or queue operation is allowed here.
+pub(super) fn add_timer_jiffies(add: u64) {
+    if add != 0 {
+        TIMER_JIFFIES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                now.checked_add(add)
+            })
+            .expect("jiffies counter overflow");
+    }
+}
 
-    compiler_fence(Ordering::SeqCst);
-    return prev + add_jiffies;
+/// CPU0 IRQ maintenance only, after releasing the timekeeper write lock.
+pub(super) fn timer_tick_maintenance() {
+    let now = clock();
+    crate::mm::page::reclaim_wait::tick(now);
+    #[cfg(target_arch = "x86_64")]
+    crate::mm::compaction::background::tick(now);
+    crate::driver::virtio::virtio_balloon::tick(now);
+    crate::mm::fault_recovery::tick();
 }
 
 pub fn clock() -> u64 {
     return TIMER_JIFFIES.load(Ordering::SeqCst);
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_activation_selftest() -> Result<bool, SystemError> {
+    use crate::mm::oom::denial;
+    #[derive(Debug)]
+    struct Noop;
+    impl TimerFunction for Noop {
+        fn run(&mut self) -> Result<(), SystemError> {
+            Ok(())
+        }
+    }
+    let callback = Box::try_new(Noop).map_err(|_| SystemError::ENOMEM)?;
+    let timer = Timer::try_new(callback, clock().saturating_add(u64::MAX / 2))?;
+    let prepared =
+        PreparedNode::try_new(timer.queue_key(), timer.clone()).map_err(|_| SystemError::ENOMEM)?;
+    let rejected = {
+        let _deny = denial::Scope::enter(true);
+        PreparedNode::try_new(timer.queue_key(), timer.clone()).is_err()
+    };
+    let token = PreparedTimer {
+        timer: timer.clone(),
+        node: prepared,
+    };
+    let _deny = denial::Scope::enter(true);
+    let before = denial::probe_denied();
+    token.activate();
+    let registered = TIMER_LIST.lock_irqsave().get(&timer.queue_key()).is_some();
+    timer.cancel();
+    let removed = TIMER_LIST.lock_irqsave().get(&timer.queue_key()).is_none();
+    Ok(before && rejected && registered && removed && denial::probe_denied())
+}
+
+/// Isolated queue checks invoked only by the existing feature selftest report.
+/// No production queue membership, jiffies, pending bits or callbacks are changed.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn queue_frontier_selftest() -> Result<bool, SystemError> {
+    if earliest_expire([Ok(None), Ok(None), Ok(Some(0))]) != Ok(Some(0))
+        || earliest_expire([
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+            Ok(Some(0)),
+            Ok(None),
+        ]) != Ok(Some(0))
+        || !absolute_timer::queue_selftest()?
+    {
+        return Ok(false);
+    }
+    #[derive(Debug)]
+    struct Noop;
+    impl TimerFunction for Noop {
+        fn run(&mut self) -> Result<(), SystemError> {
+            Ok(())
+        }
+    }
+
+    let tick_ns = NSEC_PER_JIFFY as u128;
+    let now = 7;
+    if relative_timer_jiffies(now, 0) != now
+        || relative_timer_jiffies(now, 1) != now + 2
+        || relative_timer_jiffies(now, tick_ns - 1) != now + 2
+        || relative_timer_jiffies(now, tick_ns) != now + 2
+        || relative_timer_jiffies(now, tick_ns + 1) != now + 3
+        || relative_timer_jiffies(u64::MAX - 1, 1) != u64::MAX
+        || relative_timer_jiffies(now, u128::MAX) != u64::MAX
+    {
+        return Ok(false);
+    }
+    // Convert wide before multiplication: saturating a millisecond value to
+    // u64 microseconds first would silently shorten a large legal timeout.
+    let max_us = relative_timer_jiffies(now, u128::from(u64::MAX) * 1_000);
+    let max_ms = relative_timer_jiffies(now, u128::from(u64::MAX) * 1_000_000);
+    if max_us <= now || max_ms <= max_us || max_ms == u64::MAX {
+        return Ok(false);
+    }
+
+    let timers = SpinLock::new(RBTree::new());
+    if first_expire_in(&timers) != Ok(None) {
+        return Ok(false);
+    }
+    let mut owners = alloc::vec::Vec::new();
+    owners
+        .try_reserve_exact(5)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for deadline in [20, 10, 10, 0, u64::MAX] {
+        let callback = Box::try_new(Noop).map_err(|_| SystemError::ENOMEM)?;
+        let timer = Timer::try_new(callback, deadline)?;
+        let node = PreparedNode::try_new(timer.queue_key(), timer.clone())
+            .map_err(|_| SystemError::ENOMEM)?;
+        timers.lock_irqsave().insert_prepared(node);
+        owners.push(timer);
+    }
+    if first_expire_in(&timers) != Ok(Some(0)) {
+        return Ok(false);
+    }
+    {
+        let mut queue = timers.lock_irqsave();
+        if first_expire_in(&timers) != Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+            || !pop_expired(&mut queue, 0).is_some_and(|timer| Arc::ptr_eq(&timer, &owners[3]))
+            || pop_expired(&mut queue, 9).is_some()
+        {
+            return Ok(false);
+        }
+        // Cancellation exposes the other timer at the same deadline.
+        queue.remove(&owners[1].queue_key());
+    }
+    if first_expire_in(&timers) != Ok(Some(10)) {
+        return Ok(false);
+    }
+    {
+        let mut queue = timers.lock_irqsave();
+        if !pop_expired(&mut queue, 10).is_some_and(|timer| Arc::ptr_eq(&timer, &owners[2]))
+            || pop_expired(&mut queue, 19).is_some()
+            || !pop_expired(&mut queue, 20).is_some_and(|timer| Arc::ptr_eq(&timer, &owners[0]))
+            || pop_expired(&mut queue, u64::MAX - 1).is_some()
+        {
+            return Ok(false);
+        }
+    }
+    if first_expire_in(&timers) != Ok(Some(u64::MAX)) {
+        return Ok(false);
+    }
+    let last = pop_expired(&mut timers.lock_irqsave(), u64::MAX);
+    Ok(last.is_some_and(|timer| Arc::ptr_eq(&timer, &owners[4]))
+        && first_expire_in(&timers) == Ok(None))
 }

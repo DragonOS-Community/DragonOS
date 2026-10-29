@@ -13,7 +13,7 @@ crate-type = ["staticlib"]
 members = ["crates/*"]
 
 [features]
-default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test"]
+default = ["fatfs", "kvm", "fatfs-secure", "static_keys_test", "kstack_protect"]
 # kvm
 kvm = []
 
@@ -24,6 +24,12 @@ driver_ps2_mouse = []
 # kprobe
 kprobe_test = []
 static_keys_test = []
+# Controlled MM/DMA stress tests and transaction-local fault injection.
+# Disabled in ordinary kernels; explicitly enabled by dunitest CI.
+mm_selftest = []
+# Scheduler group-selection and affinity-placement regression fixtures.
+# Disabled in ordinary kernels; explicitly enabled by dunitest CI.
+sched_selftest = []
 
 # kstack_protect 开启该功能后，会开启内核栈保护功能。用于辅助检测栈溢出。(内核栈占用会*2)
 kstack_protect = []
@@ -31,35 +37,42 @@ kstack_protect = []
 # initram
 initram = []
 
-# fifo_demo: 起一个使用FIFO测例的内核线程，每5秒打印1条消息
+# fifo_demo: run a bounded per-CPU FIFO/realtime-runqueue smoke test
 fifo_demo = []
 
 # 运行时依赖项
 [dependencies]
-acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
-aml = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "282df2af7b" }
+acpi = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "1bbdc9767ac72725fa7bdbc53260b5b6baa2bce1" }
+aml = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/acpi-rs.git", rev = "1bbdc9767ac72725fa7bdbc53260b5b6baa2bce1" }
 asm_macros = { path = "crates/asm_macros" }
 atomic_enum = "=0.2.0"
 bit_field = "=0.10"
 bitfield-struct = "=0.5.3"
 bitflags = "=1.3.2"
+bitflags2 = { package = "bitflags", version = "=2.9.1" }
 bitmap = { path = "crates/bitmap" }
 driver_base_macros = { "path" = "crates/driver_base_macros" }
 elf = { version = "=0.7.2", default-features = false }
 fdt = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/fdt", rev = "9862813020" }
 # 一个no_std的hashmap、hashset
-hashbrown = "=0.13.2"
+hashbrown = { version = "=0.14.5", features = ["raw"] }
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
 ida = { path = "crates/ida" }
 jhash = { path = "crates/rust-jhash" }
 intertrait = { path = "crates/intertrait" }
 kcmdline_macros = { path = "crates/kcmdline_macros" }
 kdepends = { path = "crates/kdepends" }
 klog_types = { path = "crates/klog_types" }
+net-gso = { path = "crates/net-gso" }
+kernel-rng = { path = "crates/kernel-rng" }
+zeroize = { version = "=1.8.2", default-features = false }
+napi-state = { path = "crates/napi-state" }
+net-poll-state = { path = "crates/net-poll-state" }
 linkme = "=0.3.27"
 num = { version = "=0.4.0", default-features = false }
 num-derive = "=0.3"
 num-traits = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/num-traits.git", rev = "1597c1c", default-features = false }
-smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/smoltcp", rev = "c65e776", default-features = false, features = [
+smoltcp = { version = "=0.12.0", git = "https://github.com/DragonOS-Community/smoltcp.git", rev = "51cf0f2a10503dcf5be6438a387b8116d8173b67", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "socket-raw",
@@ -71,10 +84,12 @@ smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/Drag
     "socket-dhcpv4",
     "socket-dns",
     "proto-ipv4",
+    "proto-ipv4-fragmentation",
     "proto-ipv6",
     "medium-ip",
     "log",
     "multicast",
+    "packetmeta-id",
     "iface-max-addr-count-8",
     "iface-max-route-count-8",
     "iface-max-multicast-group-count-8"
@@ -82,18 +97,20 @@ smoltcp = { version = "=0.12.0", git = "https://git.mirrors.dragonos.org.cn/Drag
 syscall_table_macros = { path = "crates/syscall_table_macros" }
 system_error = { path = "crates/system_error" }
 unified-init = { path = "crates/unified-init" }
-virtio-drivers = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/virtio-drivers", rev = "6dbe8d3" }
+virtio-drivers = { path = "crates/virtio-drivers" }
 wait_queue_macros = { path = "crates/wait_queue_macros" }
+tpacket = { path = "crates/tpacket" }
 paste = "=1.0.14"
 slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
 kprobe = { path = "crates/kprobe" }
+uprobe = { path = "crates/uprobe" }
 lru = "0.12.3"
 
 rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
 printf-compat = { version = "=0.3.1", default-features = false }
 
-static-keys = { version = "=0.7" }
+static-keys = { path = "crates/static-keys" }
 
 cpio_reader = "0.1.2"
 xz4rust = { version = "0.2.1", default-features = false, features = ["alloc"] }
@@ -103,6 +120,7 @@ cfg-if = { version = "1.0.0" }
 derive_builder = { version = "0.20.2", default-features = false, features = [
     "alloc",
 ] }
+device-output-buffer = { path = "crates/device-output-buffer" }
 
 inherit-methods-macro = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/inherit-methods-macro", rev = "98f7e3e" }
 

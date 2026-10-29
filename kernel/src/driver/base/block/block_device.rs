@@ -16,6 +16,15 @@ use log::error;
 use system_error::SystemError;
 
 use super::{disk_info::Partition, gendisk::GenDisk, manager::BlockDevMeta};
+use crate::{
+    filesystem::vfs::{
+        file::FileFlags, DelegatedWriteResult, FilePrivateData, InodeMode, WriteSyncIntent,
+    },
+    libs::mutex::MutexGuard,
+};
+
+mod geometry;
+pub use geometry::BlockDeviceIoLimits;
 
 // 该文件定义了 Device 和 BlockDevice 的接口
 // Notice 设备错误码使用 Posix 规定的 int32_t 的错误码表示，而不是自己定义错误enum
@@ -220,6 +229,39 @@ pub fn __lba_to_bytes(lba_id: usize, blk_size: usize) -> BlockId {
 
 /// @brief 块设备应该实现的操作
 pub trait BlockDevice: Device {
+    /// Optional provider-owned read-only access, never a bare unpinned PFN.
+    fn direct_access(
+        &self,
+    ) -> Result<Option<super::direct_access::DirectAccessRange>, SystemError> {
+        Ok(None)
+    }
+
+    /// Permissions used for the published devfs block node.
+    fn devfs_mode(&self) -> InodeMode {
+        InodeMode::from_bits_truncate(0o755)
+    }
+
+    fn file_open(
+        &self,
+        _data: MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Release per-open block-device state initialized by [`Self::file_open`].
+    fn file_close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Pin this block device for the lifetime of a mounted filesystem.
+    fn mount_holder_acquire(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    /// Release a mount pin previously acquired by [`Self::mount_holder_acquire`].
+    fn mount_holder_release(&self) {}
+
     /// # dev_name
     /// 返回块设备的名字
     fn dev_name(&self) -> &DevName;
@@ -228,6 +270,24 @@ pub trait BlockDevice: Device {
 
     /// 获取设备的扇区范围
     fn disk_range(&self) -> GeneralBlockRange;
+
+    /// Current device write protection, shared by whole-disk and partition
+    /// frontends. Drivers with immutable or binding-specific protection expose
+    /// their real state; this is independent of the caller's File access mode.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Queue geometry exposed by generic block-device queries.
+    ///
+    /// As in Linux's initial queue limits, the default makes no claim about
+    /// hardware topology: physical/minimum equal the logical block size and
+    /// no optimal size or alignment offset is specified. Drivers with actual
+    /// topology information override this snapshot instead of ioctl handlers.
+    fn io_limits(&self) -> BlockDeviceIoLimits {
+        let logical = 1u32.checked_shl(self.blk_size_log2().into()).unwrap_or(0);
+        BlockDeviceIoLimits::new(logical)
+    }
 
     /// @brief: 在块设备中，从第lba_id_start个块开始，读取count个块数据，存放到buf中
     ///
@@ -258,8 +318,30 @@ pub trait BlockDevice: Device {
         buf: &[u8],
     ) -> Result<usize, SystemError>;
 
+    /// Whether this device implements an atomic write plus optional flush
+    /// operation for a delegated VFS synchronous write.
+    fn uses_delegated_write_sync(&self) -> bool {
+        false
+    }
+
+    /// Execute a byte write and consume the requested sync intent in the same
+    /// device operation. The default must not emulate this as write-then-sync:
+    /// devices without a stable configuration snapshot use generic VFS sync.
+    fn write_at_bytes_with_sync(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _sync_intent: WriteSyncIntent,
+    ) -> Result<DelegatedWriteResult, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
     /// @brief: 同步磁盘信息，把所有的dirty数据写回硬盘 - 待实现
     fn sync(&self) -> Result<(), SystemError>;
+
+    /// Whether `sync()` issues a power-loss-safe cache flush/barrier.
+    fn supports_reliable_flush(&self) -> bool;
 
     /// @brief: 每个块设备都必须固定自己块大小，而且该块大小必须是2的幂次
     /// @return: 返回一个固定量，硬编码(编程的时候固定的常量).
@@ -290,11 +372,19 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        lba_id_start
+            .checked_add(count)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if buf.len() < expected {
+            return Err(SystemError::EINVAL);
+        }
         let bio = self.submit_bio_read(lba_id_start, count)?;
-        let data = bio.wait()?;
-        let copy_len = core::cmp::min(buf.len(), data.len());
-        buf[..copy_len].copy_from_slice(&data[..copy_len]);
-        Ok(copy_len)
+        bio.wait_read_into(&mut buf[..expected])?;
+        Ok(expected)
     }
 
     /// # 函数的功能
@@ -305,9 +395,19 @@ pub trait BlockDevice: Device {
         count: usize,
         buf: &[u8],
     ) -> Result<usize, SystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+        lba_id_start
+            .checked_add(count)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if buf.len() != expected {
+            return Err(SystemError::EINVAL);
+        }
         let bio = self.submit_bio_write(lba_id_start, count, buf)?;
-        let _ = bio.wait()?;
-        Ok(core::cmp::min(buf.len(), count * LBA_SIZE))
+        bio.wait_status()?;
+        Ok(expected)
     }
 
     fn write_at_bytes(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
@@ -400,15 +500,16 @@ pub trait BlockDevice: Device {
         lba_start: BlockId,
         count: usize,
     ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
-        let bio = super::bio::BioRequest::new_read(lba_start, count);
+        let bio = super::bio::BioRequest::try_new_read(lba_start, count)?;
         match self.submit_bio(bio.clone()) {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
                 log::trace!("BlockDevice submit_bio_read ENOSYS, falling back to sync read");
-                let buf_ptr = bio.buffer_mut();
+                let buf_ptr = unsafe { bio.buffer_mut() };
                 let buf = unsafe { &mut *buf_ptr };
-                self.read_at_sync(lba_start, count, &mut buf[..count * LBA_SIZE])?;
-                bio.complete(Ok(count * LBA_SIZE));
+                let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+                let completed = self.read_at_sync(lba_start, count, &mut buf[..expected])?;
+                bio.complete(Ok(completed));
                 Ok(bio)
             }
             Err(e) => Err(e),
@@ -422,14 +523,15 @@ pub trait BlockDevice: Device {
         count: usize,
         data: &[u8],
     ) -> Result<Arc<super::bio::BioRequest>, SystemError> {
-        let bio = super::bio::BioRequest::new_write(lba_start, count, data);
+        let bio = super::bio::BioRequest::try_new_write(lba_start, count, data)?;
         match self.submit_bio(bio.clone()) {
             Ok(()) => Ok(bio),
             Err(SystemError::ENOSYS) => {
                 let buf_ptr = bio.buffer();
                 let buf = unsafe { &*buf_ptr };
-                self.write_at_sync(lba_start, count, &buf[..count * LBA_SIZE])?;
-                bio.complete(Ok(count * LBA_SIZE));
+                let expected = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+                let completed = self.write_at_sync(lba_start, count, &buf[..expected])?;
+                bio.complete(Ok(completed));
                 Ok(bio)
             }
             Err(e) => Err(e),

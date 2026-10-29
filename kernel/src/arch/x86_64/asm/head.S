@@ -429,6 +429,22 @@ load_cr3:
     jmp to_switch_seg
 
 load_apu_cr3:
+    // APs must interpret NX entries before adopting the BSP's normal page
+    // tables. Even a data read from an NX page faults with RSVD when NXE=0.
+    // This bootstrap mapping has no NX bits and needs no stack here.
+    movl $0x80000000, %eax
+    cpuid
+    cmpl $0x80000001, %eax
+    jb .Lapu_nxe_ready
+    movl $0x80000001, %eax
+    cpuid
+    btl $20, %edx
+    jnc .Lapu_nxe_ready
+    movl $0xC0000080, %ecx
+    rdmsr
+    btsl $11, %eax
+    wrmsr
+.Lapu_nxe_ready:
     // 由于内存管理模块重置了页表，因此ap核心初始化的时候，需要使用新的内核页表。
     // 这个页表的值由smp模块设置到__APU_START_CR3变量中
     // 加载__APU_START_CR3中的值
@@ -638,7 +654,9 @@ GDT_Table:
     .quad 0x00affb000000ffff // 6 用户64位代码段描述符 0x30
     .quad 0x00cf9a000000ffff // 7 内核32位代码段描述符 0x38
     .quad 0x00cf92000000ffff // 8 内核32位数据段描述符 0x40
-    .fill 100, 8, 0           // 10-11 TSS(跳过了第9段)  重复十次填充8字节的空间，赋值为0   长模式下，每个TSS长度为128bit
+    // Entry 9 is reserved. Entries 10..41 hold 16 per-CPU TSS descriptors.
+    .fill 33, 8, 0
+.global GDT_END
 GDT_END:
 
 .global GDT_POINTER
@@ -733,4 +751,3 @@ gdt64_pointer:
 gdt64_pointer64:
     .short gdt64_pointer-gdt64-1
     .quad gdt64
-    

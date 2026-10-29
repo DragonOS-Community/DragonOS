@@ -1,90 +1,92 @@
-# 内核启动命令行参数
+# Kernel Boot Command Line Parameters
 
-:::{note}
-本文作者: 
-- 龙进 <longjin@DragonOS.org>
+::: info Author
+Longjin `<longjin@DragonOS.org>`
 :::
 
-## 概述
 
-&emsp;&emsp;DragonOS内核启动命令行参数解析模块旨在提供类似Linux的内核启动命令行参数解析支持，以便更灵活地让内核执行不同的行为。该模块允许内核在启动时接收并解析命令行参数，根据参数的不同类型执行相应的回调函数或设置环境变量。
+## Overview
 
-:::{note}
-暂时不支持设置回调函数
+The DragonOS kernel boot command line parameter parsing module aims to provide support for parsing kernel boot command line parameters similar to Linux, enabling more flexible behavior for the kernel. This module allows the kernel to receive and parse command line parameters at boot time, and execute corresponding callback functions or set environment variables based on the type of parameters.
+
+::: info
+Callback functions are not supported temporarily.
 :::
 
-## 设计方案
 
+## Design
 
-### 参数类型
+### Parameter Types
 
-内核启动命令行参数分为三种类型：
+Kernel boot command line parameters are divided into three types:
 
-- Arg类型
-- KV类型
-- EarlyKV类型
+- Arg type
+- KV type
+- EarlyKV type
 
-#### Arg类型
+#### Arg Type
 
-Arg类型的参数在命令行中只有名称，没有值。分为以下两种类型：
+Arg type parameters have only a name and no value. They are divided into the following two types:
 
-- ArgNormal：默认值为`false`，如果命令行中包含这个参数，则会设置为`true`。
-- ArgInv：默认值为`true`，如果命令行中包含这个参数，则会设置为`false`。
+- ArgNormal: The default value is `false`. If the parameter is present in the command line, it will be set to `true`.
+- ArgInv: The default value is `true`. If the parameter is present in the command line, it will be set to `false`.
 
-#### KV类型
+#### KV Type
 
-KV类型的参数在命令行中表现为`name=value`，`value`按照逗号分隔。内核模块可提供参数的默认值。
+KV type parameters are represented in the command line as `name=value`, `value` separated by commas. Kernel modules can provide default values for these parameters.
 
-#### EarlyKV类型
+#### EarlyKV Type
 
-EarlyKV类型的参数与KV类型类似，但它们在内存管理初始化之前被解析。
+EarlyKV type parameters are similar to KV type parameters, but they are parsed before memory management initialization.
 
-### Module标志
+### Module Flags
 
-Module标志类似于`usbprobe.xxxx`。
+Module flags are similar to `usbprobe.xxxx`.
 
-### 参数声明
-提供宏来声明内核命令行参数。
-### procfs支持
+### Parameter Declaration
 
-:::{note}
-TODO: 在`/proc/cmdline`下显示当前内核的启动命令行参数。
+Provides macros to declare kernel command line parameters.
+### procfs Support
+
+::: info
+TODO: Display the current kernel's boot command line parameters under `/proc/cmdline`.
 :::
 
-## 声明内核启动命令行参数的宏
 
-### Arg类型参数声明
+## Macros for Declaring Kernel Boot Command Line Parameters
+
+### Arg Type Parameter Declaration
 ```rust
 kernel_cmdline_param_arg!(varname, name, default_bool, inv);
 ```
-- `varname`：参数的变量名
-- `name`：参数的名称
-- `default_bool`：默认值
-- `inv`：是否反转
+- `varname`: The variable name of the parameter
+- `name`: The name of the parameter
+- `default_bool`: The default value
+- `inv`: Whether to invert
 
-### KV类型参数声明
+### KV Type Parameter Declaration
 
 ```rust
 kernel_cmdline_param_kv!(varname, name, default_str);
 ```
 
-- `varname`：参数的变量名
-- `name`：参数的名称
-- `default_str`：默认值
+- `varname`: The variable name of the parameter
+- `name`: The name of the parameter
+- `default_str`: The default value
 
-### 内存管理初始化之前的KV类型参数声明
+### KV Type Parameter Declaration Before Memory Management Initialization
 
 ```rust
 kernel_cmdline_param_early_kv!(varname, name, default_str);
 ```
 
-- `varname`：参数的变量名
-- `name`：参数的名称
-- `default_str`：默认值
+- `varname`: The variable name of the parameter
+- `name`: The name of the parameter
+- `default_str`: The default value
 
-## 示例
+## Example
 
-以下示例展示了如何声明和使用KV类型参数：
+The following example demonstrates how to declare and use KV type parameters:
 ```rust
 kernel_cmdline_param_kv!(ROOTFS_PATH_PARAM, root, "");
 if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
@@ -94,16 +96,15 @@ if let Some(rootfs_dev_path) = ROOTFS_PATH_PARAM.value_str() {
 };
 ```
 
-### 使用方式
+### Usage
 
-1. 在内核代码中，使用`kernel_cmdline_param_kv!`宏声明所需的KV类型参数。
-2. 在内核初始化过程中，通过参数的`value_str()`或者`value_bool()`方法获取参数值。
-3. 根据参数值执行相应的操作。
+1. In the kernel code, use the `kernel_cmdline_param_kv!` macro to declare the required KV type parameters.
+2. During kernel initialization, retrieve the parameter value through the `value_str()` or `value_bool()` method of the parameter.
+3. Execute corresponding operations based on the parameter value.
 
-通过以上步骤，开发者可以灵活地使用内核启动命令行参数来控制内核行为。
-
+By following these steps, developers can flexibly use kernel boot command line parameters to control kernel behavior.
 
 ## TODO
 
-- 支持在`/proc/cmdline`下显示当前内核的启动命令行参数。(需要在procfs重构后)
-- 支持设置回调函数，调用回调函数来设置参数值
+- Support displaying the current kernel's boot command line parameters under `/proc/cmdline` (requires procfs refactoring)
+- Support setting callback functions to set parameter values

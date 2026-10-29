@@ -115,10 +115,10 @@ ECHO:
 
 
 docs: ECHO
-	bash -c "cd docs && make html && cd .."
+	bash -c "cd docs && npm run docs:build && cd .."
 
 clean-docs:
-	bash -c "cd docs && make clean && cd .."
+	bash -c "cd docs && rm -rf .vitepress/dist .vitepress/cache && cd .."
 
 gdb: check_arch
 	@if [ -f "$(VMSTATE_DIR)/gdb" ]; then \
@@ -169,8 +169,14 @@ rootfs: check_nix
 	@echo "To change building image type, change the 'rootfsType' to 'vfat' in flake.nix"
 	nix run .#rootfs-x86_64
 
+# Build the deterministic sysconfig payload (bin/sysconfig.tar);
+# it must be up to date before writing the disk image.
+.PHONY: prepare_sysconfig_payload
+prepare_sysconfig_payload:
+	$(MAKE) -C ./user prepare_sysconfig_payload
+
 # 写入磁盘镜像
-write_diskimage: prepare_rootfs_manifest
+write_diskimage: prepare_rootfs_manifest prepare_sysconfig_payload
 ifeq ($(IN_NIX_ENV),1)
 	@echo "⚠️  警告: 在 Nix 环境中使用 'make write_diskimage' 已被弃用"
 	@echo "   请使用: nix run .#rootfs-$(ARCH)"
@@ -183,7 +189,7 @@ else
 endif
 
 # 写入磁盘镜像(uefi)
-write_diskimage-uefi: prepare_rootfs_manifest
+write_diskimage-uefi: prepare_rootfs_manifest prepare_sysconfig_payload
 	bash -c "export ARCH=$(ARCH); export ROOTFS_MANIFEST=$(ROOTFS_MANIFEST); cd tools && $(GRUB_PREPARE_CMD) && sudo DADK=$(DADK) $(GRUB_SKIP_ENV) ARCH=$(ARCH) ROOTFS_MANIFEST=$(ROOTFS_MANIFEST) bash $(ROOT_PATH)/tools/write_disk_image.sh --bios=uefi && cd .."
 # 不编译，直接启动QEMU
 qemu: check_arch
@@ -214,6 +220,10 @@ endif
 .PHONY: virtiofsd
 virtiofsd:
 	sh -c "cd tools/virtiofs && bash start_virtiofsd.sh && cd ../.."
+
+.PHONY: virtiofs-dax-preflight
+virtiofs-dax-preflight:
+	bash tools/virtiofs/virtiofs_dax_preflight.sh
 
 # 不编译，直接以nographic方式启动QEMU，并启用virtiofs设备
 .PHONY: qemu-virtiofs-nographic
@@ -293,7 +303,7 @@ test-syscall: prepare_rootfs_manifest
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
 		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi
-	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
+	SKIP_GRUB=1 $(MAKE) write_diskimage AUTO_TEST=syscall || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=syscall SYSCALL_TEST_DIR=/opt/tests/gvisor &
 	sleep 5
 	@{ \
@@ -310,7 +320,7 @@ test-dunit: prepare_rootfs_manifest
 		echo "磁盘节省模式启用，正在清理用户程序构建缓存..."; \
 		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi
-	SKIP_GRUB=1 $(MAKE) write_diskimage || exit 1
+	SKIP_GRUB=1 $(MAKE) write_diskimage AUTO_TEST=dunit || exit 1
 	$(MAKE) qemu-nographic AUTO_TEST=dunit DUNITEST_DIR=/opt/tests/dunitest &
 	sleep 5
 	@bash user/apps/tests/dunitest/monitor_test_results.sh

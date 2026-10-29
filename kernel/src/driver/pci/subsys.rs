@@ -23,7 +23,6 @@ use crate::{
 use super::{
     device::{PciBusDevice, PciDevice},
     driver::PciDriver,
-    test::pt_init,
 };
 
 static mut PCI_BUS_DEVICE: Option<Arc<PciBusDevice>> = None;
@@ -108,8 +107,24 @@ impl Bus for PciBus {
         pci_drv.probe(&pci_dev, &id)
     }
 
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        todo!()
+    fn remove(&self, device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let drv = device.driver().ok_or(SystemError::EINVAL)?;
+        let pci_drv = drv.cast::<dyn PciDriver>().map_err(|_| {
+            error!(
+                "PciBus::remove() failed: device.driver() is not a PciDriver. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+        let pci_dev = device.clone().cast::<dyn PciDevice>().map_err(|_| {
+            error!(
+                "PciBus::remove() failed: device is not a PciDevice. Device: '{:?}'",
+                device.name()
+            );
+            SystemError::EINVAL
+        })?;
+        pci_drv.remove(&pci_dev);
+        Ok(())
     }
 
     fn sync_state(&self, _device: &Arc<dyn Device>) {
@@ -211,6 +226,5 @@ pub(super) fn pci_bus_subsys_init() -> Result<(), SystemError> {
 
     set_pci_bus(pci_bus.clone());
     let r = bus_register(pci_bus.clone() as Arc<dyn Bus>);
-    pt_init()?;
     return r;
 }

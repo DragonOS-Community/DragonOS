@@ -73,8 +73,13 @@ pub fn send_signal_to_pcb(
 /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=kill_pgrp#1921
 #[inline(never)]
 pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, SystemError> {
-    // 先收集进程组中的所有进程，避免在持有锁时调用复杂操作
-    let tasks: Vec<Arc<ProcessControlBlock>> = pgid.tasks_iter(PidType::PGID).collect();
+    // As in Linux, PIDTYPE_PGID contains one physical link per thread group.
+    // CLONE_THREAD preserves the shared logical PGID without adding a link,
+    // while de_thread() transfers the old leader's link to the promoted leader.
+    let tasks: Vec<Arc<ProcessControlBlock>> = {
+        let _membership_guard = crate::process::pid::pid_membership_lock();
+        pgid.tasks_iter(PidType::PGID).collect()
+    };
 
     // 如果进程组中没有任何进程，返回 ESRCH
     if tasks.is_empty() {

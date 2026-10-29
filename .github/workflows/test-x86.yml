@@ -10,6 +10,9 @@ on:
 env:
   ARCH: x86_64
   HOME: /root
+  DISK_SAVE_MODE: "1"
+  # The CI container has no Docker daemon; use the archive-backed manifest.
+  ROOTFS_MANIFEST: default
   RUSTUP_DIST_SERVER: "https://rsproxy.cn"
   RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
 
@@ -17,9 +20,10 @@ jobs:
   integration-test:
     name: Integration Test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Allow the 55-minute guest test budget plus build, cleanup, and diagnostics.
+    timeout-minutes: 75
     container:
-      image: dragonos/dragonos-dev:v1.23
+      image: dragonos/dragonos-dev:v1.24
       options: --privileged -v /dev:/dev
     steps:
       - name: Checkout DragonOS code
@@ -38,10 +42,16 @@ jobs:
       - name: Run syscall test
         id: test-syscall
         shell: bash -ileo pipefail {0}
-        env:
-          DISK_SAVE_MODE: "1"
         run: |
           make test-syscall
+
+      - name: Preserve syscall serial log
+        if: always() && steps.test-syscall.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-serial-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: serial_opt.txt
+          if-no-files-found: error
 
       - name: Upload test results
         if: always() && github.repository == 'DragonOS-Community/DragonOS'

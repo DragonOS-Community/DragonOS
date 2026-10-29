@@ -1,0 +1,561 @@
+use core::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
+
+use alloc::{boxed::Box, sync::Arc};
+use system_error::SystemError;
+
+use crate::{
+    arch::cpu::current_cpu_id,
+    libs::{
+        cpumask::CpuMask,
+        rwlock::RwLock,
+        spinlock::{SpinLock, SpinLockGuard},
+    },
+    process::{ProcessControlBlock, ProcessState},
+    sched::{
+        cpu_is_online,
+        fair::FairSchedEntity,
+        prio::{PrioUtil, DEFAULT_PRIO},
+        LinuxSchedPolicy, OnRq, SchedClass, TaskGroup,
+    },
+    smp::cpu::{AtomicProcessorId, ProcessorId},
+};
+
+#[derive(Debug)]
+pub struct ProcessSchedulerInfo {
+    /// Runqueue CPU assigned to this task (`task_cpu` in Linux terminology).
+    ///
+    /// This is deliberately not the same thing as `running`: a sleeping task
+    /// keeps its last runqueue CPU, and a task being switched out remains
+    /// physically executing for a short interval after it has left the rq.
+    on_cpu: AtomicProcessorId,
+    /// Whether this task is currently executing or is still in the
+    /// switch-out tail on some CPU (`p->on_cpu` in Linux terminology).
+    ///
+    /// A remote wakeup must not enqueue an off-rq task on another CPU until
+    /// this becomes false, otherwise both CPUs can use the same kernel stack.
+    running: AtomicBool,
+    /// If the current process is waiting to be migrated to another CPU core
+    /// (i.e. PF_NEED_MIGRATE is set in flags), this field stores the target
+    /// processor core number.
+    migrate_to: AtomicProcessorId,
+    state_atomic: AtomicU32,
+    pi_lock: SpinLock<PiProtected>,
+    /// Scheduler priority of the process.
+    // priority: SchedPriority,
+    /// Virtual runtime of the current process.
+    // virtual_runtime: AtomicIsize,
+    /// Remaining SCHED_RR time slice in scheduler ticks.
+    ///
+    /// Semantic writes are serialized by the task's runqueue lock. The
+    /// atomic provides interior mutability consistent with the other
+    /// scheduler fields; it is not an independent synchronization domain.
+    rr_time_slice_remaining: AtomicU32,
+    pub sched_stat: RwLock<SchedInfo>,
+    /// Linux base scheduling policy (protected by rq_lock / pi_lock).
+    sched_policy: AtomicU8,
+    /// Effective scheduler class (protected by rq_lock / pi_lock).
+    sched_class: AtomicU8,
+    /// CFS scheduling entity.
+    pub sched_entity: Arc<FairSchedEntity>,
+    /// A task owns its empty RT node while detached. The owning runqueue
+    /// consumes it while queued, even when the task initially uses Fair.
+    rt_node: SpinLock<Option<Box<crate::sched::realtime::RtQueueNode>>>,
+    pub on_rq: SpinLock<OnRq>,
+    placement: SpinLock<NewTaskPlacement>,
+    /// Effective CPU controller css. None uses the boot-safe root CFS rq.
+    /// Semantic changes are serialized by pi_lock and the task's owner rq.
+    cpu_group: SpinLock<Option<Arc<TaskGroup>>>,
+
+    /// Protected by rq_lock.
+    prio: AtomicI32,
+    static_prio: AtomicI32,
+    normal_prio: AtomicI32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NewTaskPlacement {
+    is_new_task: bool,
+    target_cpu_hint: Option<ProcessorId>,
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct SchedInfo {
+    /// Number of times the task has run on a particular CPU.
+    pub pcount: usize,
+    /// Time the task has spent waiting on the run queue.
+    pub run_delay: usize,
+    /// Timestamp of when the task last ran on a CPU.
+    pub last_arrival: u64,
+    /// Timestamp of when the task was last added to the run queue.
+    pub last_queued: u64,
+}
+
+/// Fields protected by pi_lock.
+#[derive(Debug)]
+pub struct PiProtected {
+    pub cpus_allowed: CpuMask,
+    pub nr_cpus_allowed: usize,
+    /// Original userspace affinity request, separate from cpuset placement.
+    pub(crate) user_cpus_allowed: Option<CpuMask>,
+    sched_reset_on_fork: bool,
+    /// Effective priority of the top PI donor. Registry mutations take
+    /// pi_lock before publishing this cache and changing the task's rq.
+    inherited_priority: Option<i32>,
+}
+
+impl PiProtected {
+    pub fn new(cpus_allowed: CpuMask) -> Self {
+        let nr_cpus_allowed = cpus_allowed.iter_cpu().count();
+        Self {
+            cpus_allowed,
+            nr_cpus_allowed,
+            user_cpus_allowed: None,
+            sched_reset_on_fork: false,
+            inherited_priority: None,
+        }
+    }
+
+    pub fn set_cpus_allowed(&mut self, new_mask: CpuMask) {
+        self.cpus_allowed = new_mask;
+        self.nr_cpus_allowed = self.cpus_allowed.iter_cpu().count();
+    }
+
+    #[inline]
+    pub fn sched_reset_on_fork(&self) -> bool {
+        self.sched_reset_on_fork
+    }
+
+    #[inline]
+    pub fn set_sched_reset_on_fork(&mut self, reset: bool) {
+        self.sched_reset_on_fork = reset;
+    }
+
+    pub(crate) fn inherited_priority(&self) -> Option<i32> {
+        self.inherited_priority
+    }
+
+    pub(crate) fn set_inherited_priority(&mut self, priority: Option<i32>) {
+        self.inherited_priority = priority;
+    }
+
+    pub(crate) fn effective_priority(&self, normal: i32) -> i32 {
+        self.inherited_priority
+            .map_or(normal, |donor| normal.min(donor))
+    }
+}
+
+impl ProcessSchedulerInfo {
+    fn default_cpus_allowed() -> Result<CpuMask, SystemError> {
+        if crate::smp::cpu::smp_cpu_manager_initialized() {
+            return crate::smp::cpu::smp_cpu_manager()
+                .possible_cpus()
+                .try_clone()
+                .map_err(|_| SystemError::ENOMEM);
+        }
+
+        // Process management initialization happens before SMP topology
+        // initialization. Fall back to “runnable on the current boot CPU” here,
+        // and converge to a more precise mask later during explicit
+        // initialization (e.g. idle/per-cpu kthread).
+        CpuMask::try_from_cpu(current_cpu_id()).map_err(|_| SystemError::ENOMEM)
+    }
+
+    #[inline(never)]
+    pub fn new(on_cpu: Option<ProcessorId>, initial_class: SchedClass) -> Self {
+        Self::try_new(on_cpu, initial_class).expect("bootstrap scheduler preparation failed")
+    }
+
+    pub fn try_new(
+        on_cpu: Option<ProcessorId>,
+        initial_class: SchedClass,
+    ) -> Result<Self, SystemError> {
+        let cpu_id = on_cpu.unwrap_or(ProcessorId::INVALID);
+        let cpus_allowed = Self::default_cpus_allowed()?;
+        let sched_entity = FairSchedEntity::try_new().map_err(|_| SystemError::ENOMEM)?;
+        let rt_node =
+            crate::sched::realtime::RtQueueNode::try_new().map_err(|_| SystemError::ENOMEM)?;
+        Ok(Self {
+            on_cpu: AtomicProcessorId::new(cpu_id),
+            running: AtomicBool::new(false),
+            migrate_to: AtomicProcessorId::new(ProcessorId::INVALID),
+            state_atomic: AtomicU32::new(ProcessState::Blocked(false).to_u32()),
+            pi_lock: SpinLock::new(PiProtected::new(cpus_allowed)),
+            // virtual_runtime: AtomicIsize::new(0),
+            rr_time_slice_remaining: AtomicU32::new(crate::sched::realtime::RR_TIMESLICE_TICKS),
+            // priority: SchedPriority::new(100).unwrap(),
+            sched_stat: RwLock::new(SchedInfo::default()),
+            sched_policy: AtomicU8::new(LinuxSchedPolicy::Normal.to_u8()),
+            sched_class: AtomicU8::new(initial_class.to_u8()),
+            sched_entity,
+            rt_node: SpinLock::new(Some(rt_node)),
+            on_rq: SpinLock::new(OnRq::None),
+            placement: SpinLock::new(NewTaskPlacement::default()),
+            cpu_group: SpinLock::new(None),
+            // A task starts at the Linux default priority (nice 0). `sched_fork`
+            // then overwrites all three according to the parent's values and the
+            // reset-on-fork flag; this is only the pre-fork initial state.
+            prio: AtomicI32::new(DEFAULT_PRIO),
+            static_prio: AtomicI32::new(DEFAULT_PRIO),
+            normal_prio: AtomicI32::new(DEFAULT_PRIO),
+        })
+    }
+
+    /// Owner rq serializes all transfers; the spare lock is never held while
+    /// accessing a runqueue or dropping a queued task payload.
+    pub(crate) fn take_rt_node(&self) -> Box<crate::sched::realtime::RtQueueNode> {
+        self.rt_node
+            .lock_irqsave()
+            .take()
+            .expect("queued RT task has no spare node")
+    }
+
+    pub(crate) fn return_rt_node(&self, node: Box<crate::sched::realtime::RtQueueNode>) {
+        let mut spare = self.rt_node.lock_irqsave();
+        assert!(spare.is_none(), "duplicate RT spare node");
+        *spare = Some(node);
+    }
+
+    pub fn sched_entity(&self) -> Arc<FairSchedEntity> {
+        return self.sched_entity.clone();
+    }
+
+    pub(crate) fn cpu_group(&self) -> Option<Arc<TaskGroup>> {
+        self.cpu_group.lock_irqsave().clone()
+    }
+
+    pub(crate) fn set_cpu_group_locked(&self, group: Option<Arc<TaskGroup>>) {
+        *self.cpu_group.lock_irqsave() = group;
+    }
+
+    pub fn on_cpu(&self) -> Option<ProcessorId> {
+        let on_cpu = self.on_cpu.load(Ordering::SeqCst);
+        if on_cpu == ProcessorId::INVALID {
+            return None;
+        } else {
+            return Some(on_cpu);
+        }
+    }
+
+    /// Best-effort task CPU hint for sharding statistics only.
+    ///
+    /// This must not be used for scheduling or task ownership decisions.
+    pub(crate) fn statistics_cpu_hint(&self) -> Option<ProcessorId> {
+        let on_cpu = self.on_cpu.load(Ordering::Relaxed);
+        (on_cpu != ProcessorId::INVALID).then_some(on_cpu)
+    }
+
+    pub fn set_on_cpu(&self, on_cpu: Option<ProcessorId>) {
+        if let Some(cpu_id) = on_cpu {
+            self.on_cpu.store(cpu_id, Ordering::SeqCst);
+        } else {
+            self.on_cpu.store(ProcessorId::INVALID, Ordering::SeqCst);
+        }
+    }
+
+    /// Publish that this task is about to become the current task.
+    ///
+    /// Returns false if another CPU still owns the task. Callers hold the
+    /// destination rq lock, so a false result is a scheduler invariant
+    /// violation rather than ordinary contention.
+    pub fn try_mark_running(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Publish completion of the switch-out tail.
+    ///
+    /// Release pairs with `wait_until_not_running()` in the remote wakeup
+    /// path, after the old CPU has stopped using the task's kernel stack and
+    /// released its saved architecture context.
+    pub fn finish_running(&self) {
+        let was_running = self.running.swap(false, Ordering::Release);
+        debug_assert!(was_running, "finishing a task which was not running");
+    }
+
+    /// Wait until a task which has already left its rq has fully switched out.
+    pub fn wait_until_not_running(&self) {
+        while self.running.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn placement_lock(&self) -> SpinLockGuard<'_, NewTaskPlacement> {
+        self.placement.lock_irqsave()
+    }
+
+    pub fn mark_new_task(&self, target_cpu_hint: Option<ProcessorId>) {
+        let mut guard = self.placement.lock_irqsave();
+        guard.is_new_task = true;
+        guard.target_cpu_hint = target_cpu_hint;
+    }
+
+    /// # Parameters
+    /// - `allowed`: Borrow cpus_allowed from the caller's held pi_lock. This
+    ///   avoids both re-entering pi_lock and allocating a mask on the wake path.
+    pub fn consume_new_task_target_cpu(
+        &self,
+        current_cpu: ProcessorId,
+        allowed: &CpuMask,
+        default_selector: impl FnOnce(&CpuMask) -> Option<ProcessorId>,
+    ) -> Result<ProcessorId, SystemError> {
+        let mut placement = self.placement.lock_irqsave();
+        if !placement.is_new_task {
+            return Err(SystemError::EINVAL);
+        }
+        let selected_cpu = default_selector(allowed).filter(|&cpu| {
+            allowed.get(cpu).unwrap_or(false)
+                && (!crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(cpu))
+        });
+        let target_cpu = if let Some(target_cpu) = placement.target_cpu_hint {
+            if allowed.get(target_cpu).unwrap_or(false)
+                && (!crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(target_cpu))
+            {
+                target_cpu
+            } else if let Some(selected_cpu) = selected_cpu {
+                selected_cpu
+            } else if allowed.get(current_cpu).unwrap_or(false)
+                && (!crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(current_cpu))
+            {
+                current_cpu
+            } else {
+                allowed
+                    .iter_cpu()
+                    .find(|&cpu| {
+                        !crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(cpu)
+                    })
+                    .ok_or(SystemError::EINVAL)?
+            }
+        } else if let Some(selected_cpu) = selected_cpu {
+            selected_cpu
+        } else if allowed.get(current_cpu).unwrap_or(false)
+            && (!crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(current_cpu))
+        {
+            current_cpu
+        } else {
+            allowed
+                .iter_cpu()
+                .find(|&cpu| !crate::smp::cpu::smp_cpu_manager_initialized() || cpu_is_online(cpu))
+                .ok_or(SystemError::EINVAL)?
+        };
+
+        placement.is_new_task = false;
+        placement.target_cpu_hint = None;
+        Ok(target_cpu)
+    }
+
+    pub fn is_new_task(&self) -> bool {
+        self.placement.lock_irqsave().is_new_task
+    }
+
+    pub fn migrate_to(&self) -> Option<ProcessorId> {
+        let migrate_to = self.migrate_to.load(Ordering::SeqCst);
+        if migrate_to == ProcessorId::INVALID {
+            None
+        } else {
+            Some(migrate_to)
+        }
+    }
+
+    pub fn set_migrate_to(&self, migrate_to: Option<ProcessorId>) {
+        self.migrate_to
+            .store(migrate_to.unwrap_or(ProcessorId::INVALID), Ordering::SeqCst);
+    }
+
+    pub fn state(&self) -> ProcessState {
+        ProcessState::from_u32(self.state_atomic.load(Ordering::Acquire))
+    }
+
+    pub fn set_state(&self, state: ProcessState) {
+        self.state_atomic.store(state.to_u32(), Ordering::Release);
+    }
+
+    /// Acquire pi_lock (a spin lock), disabling interrupts and preemption.
+    /// Lock ordering: pi_lock may nest rq_lock (pi_lock -> rq_lock); the reverse is forbidden.
+    /// Acquiring the sighand lock while holding pi_lock is likewise forbidden; the global order is sighand -> pi_lock
+    pub fn pi_lock_irqsave(&self) -> SpinLockGuard<'_, PiProtected> {
+        self.pi_lock.lock_irqsave()
+    }
+
+    /// Conditionally restore the runnable state: only when the state is actually `Blocked`
+    /// (interruptible/uninterruptible sleep) promote it to `Runnable` inside the pi_lock critical section;
+    #[inline]
+    pub(crate) fn restore_runnable_if_blocked(&self) {
+        // Fast path: most callers are already in the Runnable state (e.g. page-fault entry); one Acquire atomic read returns, zero lock overhead.
+        if !self.state().is_blocked() {
+            return;
+        }
+
+        // Slow path: possibly Blocked; take pi_lock and re-check before deciding.
+        let _pi_guard = self.pi_lock_irqsave();
+        if self.state().is_blocked() {
+            self.set_state(ProcessState::Runnable);
+            fence(Ordering::SeqCst);
+        }
+    }
+
+    // pub fn virtual_runtime(&self) -> isize {
+    //     return self.virtual_runtime.load(Ordering::SeqCst);
+    // }
+
+    // pub fn set_virtual_runtime(&self, virtual_runtime: isize) {
+    //     self.virtual_runtime
+    //         .store(virtual_runtime, Ordering::SeqCst);
+    // }
+    // pub fn increase_virtual_runtime(&self, delta: isize) {
+    //     self.virtual_runtime.fetch_add(delta, Ordering::SeqCst);
+    // }
+
+    #[inline]
+    pub(crate) fn rr_time_slice_remaining(&self) -> u32 {
+        self.rr_time_slice_remaining.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn set_rr_time_slice_remaining(&self, remaining: u32) {
+        self.rr_time_slice_remaining
+            .store(remaining, Ordering::Relaxed);
+    }
+
+    /// Read the scheduling policy.
+    #[inline]
+    pub fn policy(&self) -> LinuxSchedPolicy {
+        LinuxSchedPolicy::from_u8(self.sched_policy.load(Ordering::Relaxed))
+    }
+
+    /// Set the Linux base policy without disturbing a PI class override.
+    ///
+    /// The task must either be unpublished or protected by the existing
+    /// scheduler policy-change lock domain (`pi_lock` and, when applicable,
+    /// its runqueue lock). The effective class is committed separately by
+    /// set_effective_priority(), after dequeuing from the old class.
+    #[inline]
+    pub(crate) fn set_policy(&self, policy: LinuxSchedPolicy) {
+        self.sched_policy.store(policy.to_u8(), Ordering::Relaxed);
+    }
+
+    /// Publish the scheduler's effective class and priority under pi_lock and
+    /// the stable owner rq lock (or before the task's first placement).
+    pub(crate) fn set_effective_priority(&self, priority: i32) {
+        let class = if PrioUtil::rt_prio(priority) {
+            SchedClass::Realtime
+        } else {
+            SchedClass::Fair
+        };
+        self.sched_class.store(class.to_u8(), Ordering::Relaxed);
+        self.set_prio(priority);
+    }
+
+    /// Read the scheduler class currently responsible for this task.
+    #[inline]
+    pub fn sched_class(&self) -> SchedClass {
+        SchedClass::from_u8(self.sched_class.load(Ordering::Relaxed))
+    }
+
+    /// Read the dynamic priority.
+    #[inline]
+    pub fn prio(&self) -> i32 {
+        self.prio.load(Ordering::Relaxed)
+    }
+
+    /// Set the dynamic priority.
+    #[inline]
+    pub fn set_prio(&self, val: i32) {
+        self.prio.store(val, Ordering::Relaxed);
+    }
+
+    /// Read the static priority.
+    #[inline]
+    pub fn static_prio(&self) -> i32 {
+        self.static_prio.load(Ordering::Relaxed)
+    }
+
+    /// Set the static priority.
+    #[inline]
+    pub fn set_static_prio(&self, val: i32) {
+        self.static_prio.store(val, Ordering::Relaxed);
+    }
+
+    /// Read the normal priority.
+    #[inline]
+    pub fn normal_prio(&self) -> i32 {
+        self.normal_prio.load(Ordering::Relaxed)
+    }
+
+    /// Set the normal priority.
+    #[inline]
+    pub fn set_normal_prio(&self, val: i32) {
+        self.normal_prio.store(val, Ordering::Relaxed);
+    }
+
+    /// Linux `task_struct::rt_priority`: the user visible realtime priority
+    /// (`1..=99`), or `0` for a task whose policy is not realtime.
+    ///
+    /// DragonOS does not keep a separate copy of that value. A realtime task's
+    /// [`ProcessSchedulerInfo::normal_prio`] is its internal realtime priority
+    /// (lower value wins), and the user visible value is the mirrored offset
+    /// computed by [`PrioUtil::internal_rt_prio_to_user`] -- the same
+    /// conversion `sched_getparam(2)` reports.
+    #[inline]
+    pub fn rt_priority(&self) -> u32 {
+        if !self.policy().is_realtime() {
+            return 0;
+        }
+
+        match PrioUtil::internal_rt_prio_to_user(self.normal_prio()) {
+            Some(priority) => priority as u32,
+            // `set_scheduler()` publishes the policy and the priorities as
+            // separate atomics, so a lock-free reader can briefly observe a
+            // realtime policy together with the previous fair `normal_prio`.
+            // Report the neutral value, which is what Linux stores for a task
+            // that is not realtime, instead of an out-of-range offset.
+            // `sched_getparam(2)` reads the same state under `pi_lock` and
+            // reports EIO for a lasting inconsistency: it can report an error,
+            // while a single procfs field cannot.
+            None => 0,
+        }
+    }
+
+    /// Set all priorities at once.
+    #[inline]
+    pub fn set_prio_all(&self, prio: i32, static_prio: i32, normal_prio: i32) {
+        self.prio.store(prio, Ordering::Relaxed);
+        self.static_prio.store(static_prio, Ordering::Relaxed);
+        self.normal_prio.store(normal_prio, Ordering::Relaxed);
+    }
+
+    pub fn cpus_allowed(&self) -> CpuMask {
+        self.pi_lock.lock_irqsave().cpus_allowed.clone()
+    }
+
+    pub fn nr_cpus_allowed(&self) -> usize {
+        self.pi_lock.lock_irqsave().nr_cpus_allowed
+    }
+
+    pub fn set_cpus_allowed(&self, cpus_allowed: CpuMask) {
+        self.pi_lock.lock_irqsave().set_cpus_allowed(cpus_allowed);
+    }
+}
+
+impl ProcessControlBlock {
+    #[inline]
+    pub(crate) fn debug_assert_fork_cpu_binding(&self) {
+        if cfg!(debug_assertions) {
+            let Some(on_cpu) = self.sched_info().on_cpu() else {
+                return;
+            };
+
+            debug_assert_eq!(
+                self.sched_info().sched_entity().cfs_rq().rq().cpu(),
+                on_cpu,
+                "fork target cpu and SE bound rq must stay consistent"
+            );
+        }
+    }
+}

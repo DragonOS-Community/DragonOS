@@ -1,0 +1,723 @@
+//! Transaction-local teardown evidence. No remapping/publication flush is used.
+//!
+//! The one registration slot only connects a private fixture to real munmap's
+//! gather; it is not an observer of ordinary mm traffic. The caller owns every
+//! observer before revoking PTEs, so skipping an entire flush is detectable.
+use super::*;
+use crate::{
+    libs::mutex::Mutex,
+    mm::{
+        allocator::page_frame::PageFrameCount,
+        page::page_manager_lock,
+        syscall::{MapFlags, ProtFlags},
+        vmalloc::VmAllocation,
+        PageTableKind,
+    },
+    process::{
+        kthread::{KernelThreadClosure, KernelThreadMechanism},
+        preempt::PreemptGuard,
+        ProcessManager,
+    },
+    sched::completion::Completion,
+    time::clocksource::HZ,
+};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+};
+use core::{
+    alloc::Layout,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+static USER_FIXTURE: SpinLock<Option<Arc<Observer>>> = SpinLock::new(None);
+// Bounded even when both CPUs have IRQs disabled and the timer cannot advance.
+const SPINS: usize = 20_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Normal,
+    SkipFlush,
+    SkipAck,
+}
+
+#[derive(Debug)]
+pub(crate) struct Observer {
+    pub(crate) start: VirtAddr,
+    pub(crate) end: VirtAddr,
+    mm_id: usize,
+    target: ProcessorId,
+    root: usize,
+    mode: Mode,
+    pub(crate) frame: AtomicUsize,
+    cleared: AtomicBool,
+    gate: AtomicBool,
+    pending: AtomicBool,
+    remote: AtomicBool,
+    returned: AtomicBool,
+    negative: AtomicBool,
+    failed: AtomicBool,
+    frees: AtomicUsize,
+    tables: AtomicUsize,
+}
+
+impl Observer {
+    fn new(
+        start: VirtAddr,
+        mm: Option<&Arc<AddressSpace>>,
+        target: ProcessorId,
+        mode: Mode,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            start,
+            end: start + MMArch::PAGE_SIZE,
+            mm_id: mm.map_or(0, |m| Arc::as_ptr(m) as usize),
+            target,
+            root: mm.map_or(0, |m| m.table_paddr().data()),
+            mode,
+            frame: AtomicUsize::new(0),
+            cleared: AtomicBool::new(false),
+            gate: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            remote: AtomicBool::new(false),
+            returned: AtomicBool::new(false),
+            negative: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            frees: AtomicUsize::new(0),
+            tables: AtomicUsize::new(0),
+        })
+    }
+    pub(crate) fn cleared(&self, absent: bool) {
+        if !absent {
+            self.failed.store(true, Ordering::Release);
+        }
+        self.cleared.store(absent, Ordering::Release);
+    }
+    pub(crate) fn skip_flush(&self) -> bool {
+        self.mode == Mode::SkipFlush
+    }
+    pub(crate) fn skip_ack(&self) -> bool {
+        self.mode == Mode::SkipAck
+    }
+    pub(crate) fn wait_pending(&self, cpu: ProcessorId) {
+        if cpu == self.target {
+            self.pending.store(true, Ordering::Release);
+            self.gate.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn before_remote(&self, info: &FlushTlbInfo) {
+        if smp_get_processor_id() != self.target {
+            return;
+        }
+        // The single observed frame already crossed its checked barrier and
+        // was physically freed. Later batches cover different addresses; do
+        // not require them to invalidate that old frame's address again.
+        if self.frees.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let identity = info.mm.as_ref().map_or(0, |mm| Arc::as_ptr(mm) as usize);
+        let loaded = info.mm.as_ref().is_none_or(|mm| {
+            tlb_state_force(self.target).loaded_is(mm)
+                && unsafe { MMArch::table(PageTableKind::User) }.data() == self.root
+        });
+        if identity != self.mm_id
+            || !loaded
+            || info.start > self.start
+            || (!info.is_flush_all() && info.end < self.end)
+            || !self.cleared.load(Ordering::Acquire)
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+        for _ in 0..SPINS {
+            if self.gate.load(Ordering::Acquire) {
+                return;
+            }
+            spin_loop();
+        }
+        self.failed.store(true, Ordering::Release);
+        // Fail the observation, but still execute the real invalidation/ack.
+    }
+    pub(crate) fn after_remote(&self) {
+        if smp_get_processor_id() == self.target {
+            self.remote.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn missing_ack(&self) {
+        // Called before FlushTlbInfo's stack frame can be left. This is an
+        // expected violation, not a completed successful shootdown.
+        if self.remote.load(Ordering::Acquire) || self.gate.load(Ordering::Acquire) {
+            self.failed.store(true, Ordering::Release);
+        } else {
+            self.negative.store(true, Ordering::Release);
+        }
+        self.gate.store(true, Ordering::Release);
+    }
+    pub(crate) fn flush_returned(&self) {
+        if !self.remote.load(Ordering::Acquire) {
+            self.failed.store(true, Ordering::Release);
+        }
+        self.returned.store(true, Ordering::Release);
+    }
+    /// Nonblocking check immediately before the actual retirement operation.
+    pub(crate) fn before_free(&self) -> bool {
+        let safe = self.cleared.load(Ordering::Acquire)
+            && self.remote.load(Ordering::Acquire)
+            && self.returned.load(Ordering::Acquire);
+        if !safe {
+            if self.mode == Mode::SkipFlush {
+                self.negative.store(true, Ordering::Release);
+            } else {
+                self.failed.store(true, Ordering::Release);
+            }
+        }
+        safe
+    }
+    pub(crate) fn frame_freed(&self) {
+        self.frees.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn tables_freed(&self) {
+        self.tables.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+    fn passed(&self) -> bool {
+        !self.failed.load(Ordering::Acquire)
+            && self.cleared.load(Ordering::Acquire)
+            && self.remote.load(Ordering::Acquire)
+            && self.returned.load(Ordering::Acquire)
+            && self.frees.load(Ordering::Acquire) == 1
+            && self.tables.load(Ordering::Acquire) > 0
+            && (self.mode == Mode::SkipFlush || self.mode == Mode::SkipAck)
+                == self.negative.load(Ordering::Acquire)
+            && (self.mode == Mode::SkipAck || self.pending.load(Ordering::Acquire))
+    }
+}
+
+pub(crate) fn observer_for(mm: &Arc<AddressSpace>) -> Option<Arc<Observer>> {
+    USER_FIXTURE
+        .lock()
+        .as_ref()
+        .filter(|o| o.mm_id == Arc::as_ptr(mm) as usize)
+        .cloned()
+}
+
+fn wait(c: &Completion) -> bool {
+    c.wait_for_completion_timeout((5 * HZ) as i64)
+        .is_ok_and(|n| n > 0)
+}
+
+/// Admission and holder lifetime are separate from the readiness completion.
+/// A late completion cannot authorize teardown after the holder has left.
+struct HolderSession(AtomicUsize);
+impl HolderSession {
+    const READY: usize = 0;
+    const ACTIVE: usize = 1;
+    const CANCELLED: usize = 2;
+    const DONE: usize = 3;
+
+    fn new() -> Self {
+        Self(AtomicUsize::new(Self::READY))
+    }
+    fn activate(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::READY,
+                Self::ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::READY,
+                Self::CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    fn finish(&self) {
+        self.0.store(Self::DONE, Ordering::Release);
+    }
+    fn done(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::DONE
+    }
+}
+
+fn holder_admission_check() -> bool {
+    // Model a completion delivered after the holder's admission deadline.
+    let late = HolderSession::new();
+    let late_rejected = late.cancel() && !late.activate();
+    // Once accepted, a deadline must not release the borrowed hardware root.
+    let active = HolderSession::new();
+    let held_until_done = active.activate() && !active.cancel() && !active.done();
+    active.finish();
+    late_rejected && held_until_done && active.done()
+}
+
+/// Only this fixture borrows a hardware mm: never scheduled while borrowed,
+/// with actual root/active/loaded tracking restored before preemption resumes.
+struct BorrowDiagnostic {
+    stage: AtomicUsize,
+    saved_is_idle: AtomicBool,
+    saved_active: AtomicBool,
+}
+
+struct BorrowedMm {
+    saved: Arc<AddressSpace>,
+    private: Arc<AddressSpace>,
+    saved_active: bool,
+}
+impl BorrowedMm {
+    fn enter(private: &Arc<AddressSpace>, diagnostic: &BorrowDiagnostic) -> Option<Self> {
+        let stage = &diagnostic.stage;
+        stage.store(1, Ordering::Release);
+        let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let saved = tlb_state_loaded_mm()?;
+        let hardware_root = unsafe { MMArch::table(PageTableKind::User) };
+        stage.store(21, Ordering::Release);
+        let cpu = smp_get_processor_id();
+        if hardware_root != saved.table_paddr() {
+            return None;
+        }
+        let saved_active = saved.active_cpus.lock().get(cpu).unwrap_or(false);
+        let saved_is_idle = Arc::ptr_eq(&saved, &crate::mm::IDLE_PROCESS_ADDRESS_SPACE());
+        diagnostic
+            .saved_active
+            .store(saved_active, Ordering::Release);
+        diagnostic
+            .saved_is_idle
+            .store(saved_is_idle, Ordering::Release);
+        stage.store(22, Ordering::Release);
+        // Like Linux init_mm, the immortal bootstrap idle root is excluded
+        // from user-mm target tracking (bootstrap retirement uses AllOnline).
+        // An ordinary user mm must still have its real holder bit published.
+        if !saved_active && !saved_is_idle {
+            return None;
+        }
+        stage.store(3, Ordering::Release);
+        private.active_cpus_set(cpu);
+        unsafe {
+            private.make_current();
+        }
+        if saved_active {
+            saved.active_cpus_clear(cpu);
+        }
+        unsafe {
+            tlb_state_set_loaded_mm(private.clone());
+        }
+        let borrowed = Self {
+            saved,
+            private: private.clone(),
+            saved_active,
+        };
+        if unsafe { MMArch::table(PageTableKind::User) } != private.table_paddr()
+            || !tlb_state_force(cpu).loaded_is(private)
+            || !private.active_cpus.lock().get(cpu).unwrap_or(false)
+        {
+            drop(borrowed);
+            drop(irq);
+            return None;
+        }
+        stage.store(4, Ordering::Release);
+        drop(irq);
+        Some(borrowed)
+    }
+}
+impl Drop for BorrowedMm {
+    fn drop(&mut self) {
+        let irq = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        let cpu = smp_get_processor_id();
+        // Restore the incoming init_mm bookkeeping exactly; do not invent
+        // an active bit merely to satisfy the fixture's admission checks.
+        if self.saved_active {
+            self.saved.active_cpus_set(cpu);
+        }
+        unsafe {
+            self.saved.make_current();
+        }
+        self.private.active_cpus_clear(cpu);
+        unsafe {
+            tlb_state_set_loaded_mm(self.saved.clone());
+        }
+        assert_eq!(
+            unsafe { MMArch::table(PageTableKind::User) },
+            self.saved.table_paddr()
+        );
+        assert_eq!(
+            self.saved.active_cpus.lock().get(cpu).unwrap_or(false),
+            self.saved_active
+        );
+        assert!(tlb_state_force(cpu).loaded_is(&self.saved));
+        assert!(!self.private.active_cpus.lock().get(cpu).unwrap_or(false));
+        drop(irq);
+    }
+}
+
+// Weak-only cleanup for failed LRU fixtures: it cannot influence the real
+// observer's unique-owner/frame-free verdict. Declared before the private MM,
+// so normal MM teardown completes before rescuing a leaked baseline owner.
+struct LruRescue(Option<alloc::sync::Weak<crate::mm::page::Page>>);
+impl Drop for LruRescue {
+    fn drop(&mut self) {
+        if let Some(page) = self.0.as_ref().and_then(alloc::sync::Weak::upgrade) {
+            if page.read().map_count() != 0 {
+                return;
+            }
+            crate::mm::page::detach_pages_from_manager_batched(core::iter::once(&page));
+            crate::mm::page::detach_pages_from_reclaimer_batched(core::iter::once(&page));
+        }
+    }
+}
+
+fn run(
+    user: bool,
+    lru: bool,
+    mode: Mode,
+    cpu: ProcessorId,
+    diagnostic: &mut String,
+    pages: usize,
+) -> bool {
+    use core::fmt::Write;
+    macro_rules! fail {
+        ($stage:literal, $error:expr) => {{
+            let _ = writeln!(diagnostic, "stage={} detail={:?}", $stage, $error);
+            return false;
+        }};
+    }
+    let mut lru_rescue = LruRescue(None);
+    let mut lru_account = None;
+    let current = ProcessManager::current_pcb();
+    let private = if user {
+        match AddressSpace::new(false, current.cred().user_ns.clone(), 0) {
+            Ok(mm) => Some(mm),
+            Err(error) => fail!("mm_new", error),
+        }
+    } else {
+        None
+    };
+    let mut allocation = None;
+    let start = if let Some(mm) = &private {
+        match mm.map_anonymous_wait(
+            VirtAddr::new(0x4000_0000),
+            pages * MMArch::PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            true,
+            !lru,
+        ) {
+            Ok(page) => page.virt_address(),
+            Err(error) => fail!("map_anonymous", error),
+        }
+    } else {
+        let layout = Layout::from_size_align(MMArch::PAGE_SIZE, MMArch::PAGE_SIZE).unwrap();
+        match VmAllocation::try_new_zeroed(layout) {
+            Ok(a) => {
+                let start = a.address();
+                allocation = Some(a);
+                start
+            }
+            Err(error) => fail!("vmalloc", error),
+        }
+    };
+    if lru {
+        use crate::{
+            cgroup::memory::{MemoryAccount, MemoryKind},
+            mm::page::{allocate_registered_data_page, EntryFlags, PageFlags, PageType},
+        };
+        let mm = private.as_ref().expect("LRU fixture requires a user MM");
+        let account = match MemoryAccount::new(0x0139_1000_0000_0000, None) {
+            Ok(account) => account,
+            Err(error) => fail!("lru_account", error),
+        };
+        let charge = match account.try_charge(MemoryKind::Anon, 1) {
+            Ok(charge) => charge,
+            Err(error) => fail!("lru_charge", error),
+        };
+        let page = match allocate_registered_data_page(
+            PageType::Normal,
+            PageFlags::PG_LRU,
+            Some(charge),
+        ) {
+            Ok(page) => page,
+            Err(error) => fail!("lru_allocate", error),
+        };
+        lru_rescue.0 = Some(Arc::downgrade(&page));
+        unsafe {
+            page.write().as_slice_mut().fill(0);
+        }
+        let mut space = mm.write();
+        let vma = space
+            .mappings
+            .contains(start)
+            .expect("new lazy VMA disappeared");
+        let _pt = mm.page_table_edit();
+        let flags = EntryFlags::<MMArch>::from_prot_flags(
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            true,
+        )
+        .set_write(true);
+        let Some(flush) = (unsafe {
+            space
+                .user_mapper
+                .utable
+                .map_phys(start, page.phys_address(), flags)
+        }) else {
+            fail!("lru_map", start);
+        };
+        vma.lock().set_mapped(true);
+        page.write().insert_vma(vma, start, false);
+        mm.account_present_page_add();
+        flush.flush();
+        lru_account = Some(account);
+    }
+    let observer = Observer::new(start, private.as_ref(), cpu, mode);
+    if let Some(mm) = &private {
+        let guard = mm.read();
+        let Some((phys, _)) = guard.user_mapper.utable.translate(start) else {
+            fail!("pte_not_present", start);
+        };
+        let Some(page) = page_manager_lock().get_registered(&phys) else {
+            fail!("page_unregistered", phys);
+        };
+        if !page.read().individually_owns_frame() {
+            fail!("frame_not_independent", phys);
+        }
+        observer.frame.store(phys.data(), Ordering::Release);
+        drop(page);
+        drop(guard);
+    }
+    let ready = Arc::new(Completion::new());
+    let session = Arc::new(HolderSession::new());
+    let read_ok = Arc::new(AtomicBool::new(false));
+    // One bounded diagnostic per fixture, never an IPI/event log:
+    // 1=no saved mm, 21=saved root mismatch, 22=saved active bit missing,
+    // 3=private identity rejected, 4=borrow established, 0=not entered.
+    let borrow_stage = Arc::new(BorrowDiagnostic {
+        stage: AtomicUsize::new(0),
+        saved_is_idle: AtomicBool::new(false),
+        saved_active: AtomicBool::new(false),
+    });
+    let worker_borrow_stage = borrow_stage.clone();
+    let worker_ready = ready.clone();
+    let worker_session = session.clone();
+    let worker_ok = read_ok.clone();
+    let worker_mm = private.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            let preempt = PreemptGuard::new();
+            let borrowed = match worker_mm.as_ref() {
+                Some(mm) => match BorrowedMm::enter(mm, &worker_borrow_stage) {
+                    Some(mm) => Some(mm),
+                    None => {
+                        worker_session.cancel();
+                        worker_ready.complete();
+                        return 1;
+                    }
+                },
+                None => None,
+            };
+            // Eagerly mapped before entering the non-sleepable borrow window.
+            let value = unsafe { core::ptr::read_volatile(start.as_ptr::<u8>()) };
+            worker_ok.store(
+                smp_get_processor_id() == cpu && value == 0,
+                Ordering::Release,
+            );
+            worker_ready.complete();
+            // A deadline can cancel admission, but cannot withdraw a holder
+            // already accepted by the initiator. IRQs remain enabled so the
+            // actual shootdown can run while the borrowed root stays loaded.
+            let began = crate::time::timer::clock();
+            let completed = loop {
+                if worker_session.done() {
+                    break true;
+                }
+                if crate::time::timer::clock().wrapping_sub(began) >= 5 * HZ
+                    && worker_session.cancel()
+                {
+                    break false;
+                }
+                spin_loop();
+            };
+            drop(borrowed);
+            drop(preempt);
+            i32::from(!completed)
+        }),
+        (),
+    ));
+    let Some(worker) =
+        KernelThreadMechanism::create_on_cpu(closure, "tlb-teardown".to_string(), cpu)
+    else {
+        return false;
+    };
+    if ProcessManager::wakeup(&worker).is_err() {
+        session.finish();
+        let _ = KernelThreadMechanism::stop(&worker);
+        return false;
+    }
+    let ready_ok = wait(&ready) && read_ok.load(Ordering::Acquire) && session.activate();
+    if ready_ok {
+        if let Some(mm) = &private {
+            *USER_FIXTURE.lock() = Some(observer.clone());
+            let result = mm.munmap_wait(
+                crate::mm::allocator::page_frame::VirtPageFrame::new(start),
+                PageFrameCount::new(pages),
+            );
+            *USER_FIXTURE.lock() = None;
+            if result.is_err() {
+                observer.fail();
+            }
+        } else {
+            allocation
+                .as_mut()
+                .unwrap()
+                .set_teardown_observer(observer.clone());
+            drop(allocation.take());
+        }
+    }
+    session.finish();
+    let stopped = matches!(KernelThreadMechanism::stop(&worker), Ok(0));
+    let passed = ready_ok
+        && stopped
+        && observer.passed()
+        && lru_account
+            .as_ref()
+            .is_none_or(|account| account.current_pages() == 0);
+    if !passed {
+        let _ = writeln!(diagnostic,
+            "stage=teardown ready={} stopped={} borrow={} saved_is_idle={} saved_active={} cleared={} pending={} remote={} returned={} negative={} failed={} frees={} tables={}",
+            ready_ok, stopped, borrow_stage.stage.load(Ordering::Acquire),
+            borrow_stage.saved_is_idle.load(Ordering::Acquire), borrow_stage.saved_active.load(Ordering::Acquire), observer.cleared.load(Ordering::Acquire),
+            observer.pending.load(Ordering::Acquire), observer.remote.load(Ordering::Acquire),
+            observer.returned.load(Ordering::Acquire), observer.negative.load(Ordering::Acquire),
+            observer.failed.load(Ordering::Acquire), observer.frees.load(Ordering::Acquire),
+            observer.tables.load(Ordering::Acquire));
+    }
+    if passed && user {
+        let _ = writeln!(
+            diagnostic,
+            "saved_is_idle={} saved_active={}",
+            borrow_stage.saved_is_idle.load(Ordering::Acquire),
+            borrow_stage.saved_active.load(Ordering::Acquire)
+        );
+    }
+    passed
+}
+
+fn run_report(target: ProcessorId) -> String {
+    let _vmalloc_serial = crate::mm::vmalloc::lock_teardown_fixture();
+    let mut report = String::new();
+    use core::fmt::Write;
+    let admission_ok = holder_admission_check();
+    let _ = writeln!(report, "smp_available=ok");
+    let _ = writeln!(
+        report,
+        "holder_admission={}",
+        if admission_ok { "ok" } else { "fail" }
+    );
+    let mut failures = usize::from(!admission_ok);
+    for (user, lru, mode, key) in [
+        (false, false, Mode::Normal, "kernel_teardown_order"),
+        (
+            false,
+            false,
+            Mode::SkipFlush,
+            "kernel_missing_flush_detected",
+        ),
+        (false, false, Mode::SkipAck, "kernel_missing_ack_detected"),
+        (true, false, Mode::Normal, "user_teardown_order"),
+        (true, false, Mode::SkipFlush, "user_missing_flush_detected"),
+        (true, false, Mode::SkipAck, "user_missing_ack_detected"),
+        (true, true, Mode::Normal, "user_lru_teardown_order"),
+        (
+            true,
+            true,
+            Mode::SkipFlush,
+            "user_lru_missing_flush_detected",
+        ),
+        (true, true, Mode::SkipAck, "user_lru_missing_ack_detected"),
+    ] {
+        let mut diagnostic = String::new();
+        let ok = run(user, lru, mode, target, &mut diagnostic, 1);
+        if !diagnostic.is_empty() {
+            let _ = write!(report, "{key}_diagnostic={diagnostic}");
+        }
+        failures += usize::from(!ok);
+        let _ = writeln!(report, "{key}={}", if ok { "ok" } else { "fail" });
+    }
+    let mut diagnostic = String::new();
+    let multibatch = run(true, false, Mode::Normal, target, &mut diagnostic, 65);
+    if !diagnostic.is_empty() {
+        let _ = write!(
+            report,
+            "user_multibatch_teardown_order_diagnostic={diagnostic}"
+        );
+    }
+    failures += usize::from(!multibatch);
+    let _ = writeln!(
+        report,
+        "user_multibatch_teardown_order={}",
+        if multibatch { "ok" } else { "fail" }
+    );
+    format!(
+        "status={}\n{}summary_fail={}\n",
+        if failures == 0 { "ok" } else { "fail" },
+        report,
+        failures
+    )
+}
+
+/// The report caller can sleep or migrate. Run all teardown initiations on a
+/// dedicated fixed CPU, distinct from the non-preemptible translation holder.
+/// In particular, never disable preemption across the sleepable munmap path.
+pub(super) fn report() -> String {
+    let _serial = TEST_LOCK.lock();
+    let mut online = smp_cpu_manager()
+        .present_cpus()
+        .iter_cpu()
+        .filter(|cpu| smp_cpu_manager().is_online_cpu(*cpu));
+    let Some(initiator_cpu) = online.next() else {
+        return "status=fail\nsmp_available=fail\nsummary_fail=1\n".to_string();
+    };
+    let Some(target) = online.next() else {
+        return "status=fail\nsmp_available=fail\nsummary_fail=1\n".to_string();
+    };
+    let result = Arc::new(Mutex::new(None));
+    let complete = Arc::new(Completion::new());
+    let worker_result = result.clone();
+    let worker_complete = complete.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            *worker_result.lock() = Some(run_report(target));
+            worker_complete.complete();
+            0
+        }),
+        (),
+    ));
+    let Some(initiator) =
+        KernelThreadMechanism::create_on_cpu(closure, "tlb-initiator".to_string(), initiator_cpu)
+    else {
+        return "status=fail\ninitiator_create=fail\nsummary_fail=1\n".to_string();
+    };
+    if ProcessManager::wakeup(&initiator).is_err() {
+        let _ = KernelThreadMechanism::stop(&initiator);
+        return "status=fail\ninitiator_wakeup=fail\nsummary_fail=1\n".to_string();
+    }
+    // Uninterruptible completion: retain every fixture owner until the pinned
+    // initiator has finished, then reap it before publishing the report.
+    let waited = complete.wait_for_completion().is_ok();
+    let stopped = matches!(KernelThreadMechanism::stop(&initiator), Ok(0));
+    if !waited || !stopped {
+        return "status=fail\ninitiator_complete=fail\nsummary_fail=1\n".to_string();
+    }
+    let report = result
+        .lock()
+        .take()
+        .expect("TLB initiator completed without report");
+    report
+}

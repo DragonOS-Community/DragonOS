@@ -1,23 +1,30 @@
 use core::intrinsics::likely;
 
 use crate::{
-    arch::driver::apic::{apic_timer::APIC_TIMER_IRQ_NUM, CurrentApic, LocalAPIC},
+    arch::driver::apic::{CurrentApic, LocalAPIC},
     exception::{irqdesc::irq_desc_manager, softirq::do_softirq, IrqNumber},
-    process::{utils::current_pcb_flags, ProcessFlags, ProcessManager},
-    sched::{SchedMode, SchedPolicy, __schedule},
+    process::{utils::current_pcb_flags, ProcessFlags},
+    sched::{SchedMode, __schedule},
 };
 
 use super::TrapFrame;
 
 #[no_mangle]
 unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
+    // A terminal stop must work even if the failed allocation retained task,
+    // scheduler or IRQ locks. Do not enter RCU, swapgs bookkeeping or irqdesc.
+    if vector == super::ipi::IPI_NUM_STOP_CPU.data() && crate::debug::fatal::is_active() {
+        crate::debug::fatal::halt_current_cpu();
+    }
     // swapgs
 
     if trap_frame.is_from_user() {
         x86_64::registers::segmentation::GS::swap();
+        crate::rcu::user_exit();
     }
 
-    crate::rcu::irq_enter();
+    let hardirq_guard = crate::exception::enter_hardirq();
+    let rcu_irq = crate::rcu::irq_enter();
 
     // 由于x86上面，虚拟中断号与物理中断号是一一对应的，所以这里直接使用vector作为中断号来查询irqdesc
 
@@ -35,16 +42,22 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         CurrentApic.send_eoi();
     }
 
-    do_softirq();
+    let irq_outermost = rcu_irq.is_outermost();
+    if irq_outermost {
+        do_softirq();
+    }
 
     // 检测当前进程是否可被调度
-    let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE)
-        || vector == APIC_TIMER_IRQ_NUM.data();
-    let resume_idle_eqs = !should_schedule
-        && ProcessManager::current_pcb().sched_info().policy() == SchedPolicy::IDLE;
-    crate::rcu::irq_exit(resume_idle_eqs);
+    let should_schedule = current_pcb_flags().contains(ProcessFlags::NEED_SCHEDULE);
+    let disposition = if should_schedule && irq_outermost {
+        crate::rcu::RcuIrqDisposition::ToKernel
+    } else {
+        crate::rcu::RcuIrqDisposition::ResumeInterrupted
+    };
+    crate::rcu::irq_exit(rcu_irq, disposition);
+    drop(hardirq_guard);
 
-    if should_schedule {
+    if should_schedule && irq_outermost {
         __schedule(SchedMode::SM_PREEMPT);
     }
 }

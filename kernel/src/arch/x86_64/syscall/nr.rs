@@ -360,6 +360,7 @@ pub const SYS_FACCESSAT2: usize = 439;
 pub const SYS_PROCESS_MADVISE: usize = 440;
 pub const SYS_EPOLL_PWAIT2: usize = 441;
 pub const SYS_MOUNT_SETATTR: usize = 442;
+pub const SYS_FCHMODAT2: usize = 452;
 
 pub fn syscall_number_to_str(syscall_number: usize) -> &'static str {
     match syscall_number {
@@ -718,6 +719,7 @@ pub fn syscall_number_to_str(syscall_number: usize) -> &'static str {
         440 => "SYS_PROCESS_MADVISE",
         441 => "SYS_EPOLL_PWAIT2",
         442 => "SYS_MOUNT_SETATTR",
+        452 => "SYS_FCHMODAT2",
         _ => "UNKNOWN",
     }
 }

@@ -25,22 +25,20 @@ fn cmin(a: usize, b: usize) -> usize {
 
 /// A slab allocator allocates elements of a fixed size.
 ///
-/// It maintains three internal lists of objects that implement `AllocablePage`
-/// from which it can allocate memory.
+/// It keeps empty and partial pages in lists, and counts full pages.
 ///
 ///  * `empty_slabs`: Is a list of pages that the SCAllocator maintains, but
 ///    has 0 allocations in them, these can be given back to a requestor in case
 ///    of reclamation.
 ///  * `slabs`: A list of pages partially allocated and still have room for more.
-///  * `full_slabs`: A list of pages that are completely allocated.
+///  * `full_count`: Full pages have no free objects and need no list membership.
 ///
 /// On allocation we allocate memory from `slabs`, however if the list is empty
 /// we try to reclaim a page from `empty_slabs` before we return with an out-of-memory
-/// error. If a page becomes full after the allocation we move it from `slabs` to
-/// `full_slabs`.
+/// error. A page that becomes full leaves the partial list until its first free.
 ///
-/// Similarly, on dealloaction we might move a page from `full_slabs` to `slabs`
-/// or from `slabs` to `empty_slabs` after we deallocated an object.
+/// On deallocation a full page becomes partial or empty; a partial page may
+/// become empty. The object pointer identifies its page without searching a list.
 ///
 /// If an allocation returns `OutOfMemory` a client using SCAllocator can refill
 /// it using the `refill` function.
@@ -55,8 +53,8 @@ pub struct SCAllocator<'a, P: AllocablePage> {
     pub(crate) empty_slabs: PageList<'a, P>,
     /// List of partially used ObjectPage (some objects allocated but pages are not full).
     pub(crate) slabs: PageList<'a, P>,
-    /// List of full ObjectPages (everything allocated in these don't need to search them).
-    pub(crate) full_slabs: PageList<'a, P>,
+    /// Full pages remain owned, but are absent from the allocation/reclaim lists.
+    pub(crate) full_count: usize,
     /// Free objects count
     pub(crate) free_obj_count: usize,
     /// Maximum free objects num for this `SCAllocator`.
@@ -74,7 +72,7 @@ macro_rules! new_sc_allocator {
             obj_per_page,
             empty_slabs: PageList::new(),
             slabs: PageList::new(),
-            full_slabs: PageList::new(),
+            full_count: 0,
             // TODO: 优化free_limit的计算: https://bbs.dragonos.org.cn/t/topic/358
             free_limit: 2 * obj_per_page,
             free_obj_count: 0,
@@ -97,6 +95,13 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
     /// Returns the maximum supported object size of this allocator.
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Returns the number of backing pages currently owned by this allocator.
+    ///
+    /// Every page is empty, partial or full, including detached full pages.
+    pub(crate) fn resident_pages(&self) -> usize {
+        self.empty_slabs.elements + self.slabs.elements + self.full_count
     }
 
     /// Add a new ObjectPage.
@@ -132,7 +137,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         self.empty_slabs.insert_front(page);
     }
 
-    /// Move a page from `full_slabs` to `slab`.
+    /// Detach a page that no longer has a free object.
     fn move_partial_to_full(&mut self, page: &'a mut P) {
         let page_ptr = page as *const P;
 
@@ -144,8 +149,14 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         );
 
         self.slabs.remove_from_list(page);
+        self.mark_full(page);
+    }
+
+    /// The previous list removal has already cleared this page's links.
+    /// A full page is found again through the first object freed from it.
+    fn mark_full(&mut self, page: &mut P) {
         page.set_page_state(PageState::Full);
-        self.full_slabs.insert_front(page);
+        self.full_count += 1;
     }
 
     /// Tries to allocate a block of memory with respect to the `layout`.
@@ -249,8 +260,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
                 );
                 // Move empty page to partial/full pages
                 if empty_page.is_full() {
-                    empty_page.set_page_state(PageState::Full);
-                    self.full_slabs.insert_front(empty_page);
+                    self.mark_full(empty_page);
                 } else {
                     self.insert_partial_slab(empty_page);
                 }
@@ -314,7 +324,7 @@ impl<'a, P: AllocablePage> SCAllocator<'a, P> {
         // Maintain page list membership in dealloc (DragonOS holds allocator lock).
         match old_state {
             PageState::Full => {
-                self.full_slabs.remove_from_list(slab_page);
+                self.full_count -= 1;
                 if is_empty_after_dealloc {
                     self.insert_empty(slab_page);
                 } else {

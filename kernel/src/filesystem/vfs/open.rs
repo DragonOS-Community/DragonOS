@@ -1,20 +1,26 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::{
     fcntl::AtFlags,
-    file::{File, FileFlags},
-    mount::MountFlags,
+    file::{File, FileFlags, PreopenedFile},
+    mount::{MountFSInode, MountFlags},
     permission::PermissionMask,
-    syscall::{OpenHow, OpenHowResolve},
-    utils::{rsplit_path, should_remove_sgid_on_chown, user_path_at},
-    vcore::{check_parent_dir_permission_inode, resolve_parent_inode},
-    FileType, FsPermissionPolicy, IndexNode, InodeMode, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+    syscall::OpenHow,
+    utils::{
+        should_remove_sgid_on_chown, user_path_at, user_resolved_path_at, OpenHowResolve,
+        OwnedLookupOutcome, ResolvedPath,
+    },
+    vcore::{check_parent_dir_permission_inode, prepare_open_truncate, vfs_open_truncate},
+    FileType, FsPermissionPolicy, IndexNode, InodeFlags, InodeMode, SetMetadataMask, MAX_PATHLEN,
+    VFS_MAX_FOLLOW_SYMLINK_TIMES,
 };
+use crate::libs::casting::DowncastArc;
+use crate::process::namespace::user_namespace::map_id_down;
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
 use crate::{
     process::cred::CAPFlags,
-    process::cred::GroupInfo,
     time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
@@ -68,10 +74,11 @@ pub(super) fn do_faccessat(
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
     // 如果找不到文件，则返回错误码ENOENT
-    let inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    if mode.bits() == 0 {
-        return Ok(0);
-    }
+    let inode = File::recover_io(|| {
+        inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
+    // Linux still checks device-cgroup policy for access(F_OK), with no
+    // READ/WRITE bits in the device access type.
 
     let mut mask = PermissionMask::empty();
     if mode.contains(InodeMode::S_IROTH) {
@@ -84,48 +91,116 @@ pub(super) fn do_faccessat(
         mask |= PermissionMask::MAY_EXEC;
     }
 
+    let resolved = ResolvedPath::new(inode)?;
+    let inode = resolved.inode();
     let metadata = inode.metadata()?;
     match inode.fs().permission_policy() {
         FsPermissionPolicy::Dac => {
             super::permission::check_inode_permission(&inode, &metadata, mask)?;
         }
-        FsPermissionPolicy::Remote => match inode.check_access(mask) {
-            Ok(()) => {}
-            Err(SystemError::ENOSYS) => {}
-            Err(e) => return Err(e),
-        },
+        FsPermissionPolicy::Remote => {
+            match inode.check_access(mask) {
+                Ok(()) => {}
+                Err(SystemError::ENOSYS) => {}
+                Err(e) => return Err(e),
+            }
+            super::permission::check_device_inode_permission(&metadata, mask)?;
+        }
     }
 
     return Ok(0);
 }
 
-pub fn do_fchmodat(dirfd: i32, path: *const u8, mode: InodeMode) -> Result<usize, SystemError> {
+/// The syscall ABI passes `umode_t` (16 bits), even though the register is wider.
+pub fn chmod_mode_from_user(mode: u32) -> InodeMode {
+    InodeMode::from_bits_truncate(mode as u16 as u32)
+}
+
+pub fn do_fchmodat(
+    dirfd: i32,
+    path: *const u8,
+    mode: u32,
+    flags: u32,
+) -> Result<usize, SystemError> {
+    let allowed = (AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH).bits() as u32;
+    if flags & !allowed != 0 {
+        return Err(SystemError::EINVAL);
+    }
     let path = vfs_check_and_clone_cstr(path, Some(MAX_PATHLEN))?;
     let path = path.to_str().map_err(|_| SystemError::EINVAL)?;
 
-    if path.is_empty() {
-        return Err(SystemError::ENOENT);
-    }
+    let current = ProcessManager::current_pcb();
+    let resolved = if path.is_empty() {
+        if flags & AtFlags::AT_EMPTY_PATH.bits() as u32 == 0 {
+            return Err(SystemError::ENOENT);
+        }
+        if dirfd == AtFlags::AT_FDCWD.bits() {
+            current.fs_struct().pwd_resolved()?
+        } else {
+            current
+                .fd_table()
+                .get_file_by_fd(dirfd)
+                .ok_or(SystemError::EBADF)?
+                .resolved_path()?
+        }
+    } else {
+        let (start, rest) = user_resolved_path_at(&current, dirfd, path)?;
+        File::recover_io(|| {
+            start.inode().lookup_follow_symlink_owned(
+                &start,
+                &rest,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                flags & AtFlags::AT_SYMLINK_NOFOLLOW.bits() as u32 == 0,
+            )
+        })?
+    };
 
-    let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-
-    let target_inode = inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-
-    do_fchmod(target_inode, mode)
+    do_fchmod(resolved.inode(), chmod_mode_from_user(mode))
 }
 
 /// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
 pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
     let cred = ProcessManager::current_pcb().cred();
-    let mut metadata = inode.metadata()?;
-
-    // Linux 语义：chmod/fchmod 需要是 inode 所有者，或具备 CAP_FOWNER
-    if cred.fsuid.data() != metadata.uid && !cred.has_capability(CAPFlags::CAP_FOWNER) {
-        return Err(SystemError::EPERM);
-    }
-
-    metadata.mode = chmod_preserve_type(metadata.mode, mode);
-    inode.set_metadata(&metadata)?;
+    let operation = inode
+        .clone()
+        .downcast_arc::<MountFSInode>()
+        .map(|inode| inode.op_context());
+    File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            if current
+                .flags
+                .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+            {
+                return Err(SystemError::EPERM);
+            }
+            // Linux 6.6 notify_change(ATTR_MODE) rejects chmod on a symlink.
+            if current.file_type == FileType::SymLink {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            let mut metadata = current.clone();
+            metadata.mode = chmod_preserve_type(current.mode, mode);
+            if let Some(operation) = &operation {
+                operation.validate_setattr_mapping(
+                    current,
+                    &metadata,
+                    SetMetadataMask::MODE | SetMetadataMask::CTIME,
+                )?;
+            }
+            // Permission is evaluated from the snapshot committed under the lock.
+            if !cred.is_owner_or_capable(current) {
+                return Err(SystemError::EPERM);
+            }
+            let gid = Kgid::from(current.gid);
+            let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
+            if !has_fsetid && cred.fsgid.data() != current.gid && !cred.getgroups().contains(&gid) {
+                metadata.mode.remove(InodeMode::S_ISGID);
+            }
+            metadata.ctime = PosixTimeSpec::now();
+            Ok((metadata, SetMetadataMask::MODE | SetMetadataMask::CTIME))
+        })
+    })?;
+    // fsnotify: attribute change → IN_ATTRIB.
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(0)
 }
 
@@ -137,89 +212,152 @@ pub fn do_fchownat(
     flag: AtFlags,
 ) -> Result<usize, SystemError> {
     // 检查flag是否合法
-    if flag.contains(!(AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH)) {
+    let allowed_flags = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+    if flag.intersects(!allowed_flags) {
         return Err(SystemError::EINVAL);
     }
 
-    let follow_symlink = flag.contains(!AtFlags::AT_SYMLINK_NOFOLLOW);
+    let follow_symlink = !flag.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
     let (inode, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
 
-    // 如果找不到文件，则返回错误码ENOENT
-    let inode = if follow_symlink {
-        inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
-    } else {
-        inode.lookup(path.as_str())
-    };
-
-    if inode.is_err() {
-        let errno = inode.clone().unwrap_err();
-        // 文件不存在
-        if errno == SystemError::ENOENT {
-            return Err(SystemError::ENOENT);
+    let inode = File::recover_io(|| {
+        if follow_symlink {
+            inode.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        } else {
+            inode.lookup_follow_symlink2(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
         }
-    }
-
-    let inode = inode.unwrap();
+    })?;
 
     return chown_common(inode, uid, gid);
 }
 
 fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usize, SystemError> {
-    let mut meta = inode.metadata()?;
+    // The syscall ABI declares these arguments as 32-bit uid_t/gid_t. Truncate
+    // register-width inputs before interpreting (uid_t)-1 as "no change".
+    let uid = uid as u32 as usize;
+    let gid = gid as u32 as usize;
     let cred = ProcessManager::current_pcb().cred();
-    let current_uid = cred.uid.data();
-    let current_gid = cred.gid.data();
-    let mut group_info = GroupInfo::default();
-    if let Some(info) = cred.group_info.as_ref() {
-        group_info = info.clone();
-    }
+    let fsuid = cred.fsuid.data();
+    let fsgid = cred.fsgid.data();
+    let operation = inode
+        .clone()
+        .downcast_arc::<MountFSInode>()
+        .map(|inode| inode.op_context());
 
-    // Linux 语义：uid/gid 传入 -1 表示“不更改”。在 syscall 入口处参数被提升为 usize，
-    // 因此这里以 usize::MAX 代表 (uid_t/gid_t)-1。
-    let change_uid = uid != usize::MAX;
-    let change_gid = gid != usize::MAX;
-    let old_uid = meta.uid;
-    let old_gid = meta.gid;
+    // Linux semantics: uid/gid passed in as (uid_t)-1/(gid_t)-1 mean "do not change".
+    let is_no_change = |id: usize| id == u32::MAX as usize;
+    let change_uid = !is_no_change(uid);
+    let change_gid = !is_no_change(gid);
+    // Syscall IDs are local to current_user_ns, while inode IDs are global.
+    // Linux make_kuid/make_kgid rejects unmapped requested IDs with EINVAL.
+    let (uid, gid) = {
+        let inner = cred.user_ns.inner.lock();
+        let uid = if change_uid {
+            map_id_down(&inner.uid_map, uid as u32).ok_or(SystemError::EINVAL)? as usize
+        } else {
+            uid
+        };
+        let gid = if change_gid {
+            map_id_down(&inner.gid_map, gid as u32).ok_or(SystemError::EINVAL)? as usize
+        } else {
+            gid
+        };
+        (uid, gid)
+    };
+    let mask = File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            let mut meta = current.clone();
+            let mut id_mask = SetMetadataMask::CTIME;
+            if change_uid {
+                meta.uid = uid;
+                id_mask.insert(SetMetadataMask::UID);
+            }
+            if change_gid {
+                meta.gid = gid;
+                id_mask.insert(SetMetadataMask::GID);
+            }
+            if (change_uid || change_gid)
+                && current
+                    .flags
+                    .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+            {
+                return Err(SystemError::EPERM);
+            }
+            if let Some(operation) = &operation {
+                operation.validate_setattr_mapping(current, &meta, id_mask)?;
+            }
+            let old_mode = current.mode;
+            let has_chown = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_CHOWN);
+            let owner_chown = operation.as_ref().is_some_and(|operation| {
+                cred.has_capability_in_ns(&operation.fs_userns, CAPFlags::CAP_CHOWN)
+            });
+            let has_fsetid = cred.has_capability_wrt_inode_uidgid(current, CAPFlags::CAP_FSETID);
 
-    // 检查权限
-    match current_uid {
-        0 => {
+            // Linux chown_ok/chgrp_ok: retaining one's own uid, or choosing an
+            // owned file's group, is allowed; arbitrary changes require CAP_CHOWN.
+            if change_uid
+                && !has_chown
+                && !(current.uid == u32::MAX as usize && owner_chown)
+                && (fsuid != current.uid || uid != current.uid)
+            {
+                return Err(SystemError::EPERM);
+            }
+            if change_gid
+                && !has_chown
+                && !(current.gid == u32::MAX as usize && owner_chown)
+                && (fsuid != current.uid
+                    || (gid != current.gid
+                        && gid != fsgid
+                        && !cred.getgroups().contains(&Kgid::from(gid))))
+            {
+                return Err(SystemError::EPERM);
+            }
             if change_uid {
                 meta.uid = uid;
             }
             if change_gid {
                 meta.gid = gid;
             }
-        }
-        _ => {
-            // 非文件所有者不能更改信息，且不能更改uid
-            if current_uid != meta.uid || (change_uid && uid != meta.uid) {
+
+            // Linux clears setid bits on chown of non-directories. A resulting
+            // MODE update still requires owner/CAP_FOWNER, even for (-1, -1).
+            if meta.file_type != FileType::Dir {
+                id_mask.insert(SetMetadataMask::KILL_PRIV);
+                meta.mode.remove(InodeMode::S_ISUID);
+                if should_remove_sgid_on_chown(meta.mode, current.gid, &cred, has_fsetid) {
+                    meta.mode.remove(InodeMode::S_ISGID);
+                }
+            }
+            // When clearing SUID turns chown into a MODE update, Linux
+            // setattr_prepare checks SGID against the requested *new* GID.
+            if meta.mode != old_mode
+                && meta.mode.contains(InodeMode::S_ISGID)
+                && !has_fsetid
+                && fsgid != meta.gid
+                && !cred.getgroups().contains(&Kgid::from(meta.gid))
+            {
+                meta.mode.remove(InodeMode::S_ISGID);
+            }
+            if meta.mode != old_mode && !cred.is_owner_or_capable(current) {
                 return Err(SystemError::EPERM);
             }
-            if change_gid {
-                if gid != current_gid && !group_info.gids.contains(&Kgid::from(gid)) {
-                    return Err(SystemError::EPERM);
-                }
-                meta.gid = gid;
+            let mut mask = id_mask;
+            if change_uid {
+                mask.insert(SetMetadataMask::UID);
             }
-        }
+            if change_gid {
+                mask.insert(SetMetadataMask::GID);
+            }
+            if meta.mode != old_mode {
+                mask.insert(SetMetadataMask::MODE);
+            }
+            meta.ctime = PosixTimeSpec::now();
+            Ok((meta, mask))
+        })
+    })?;
+    if mask.intersects(SetMetadataMask::UID | SetMetadataMask::GID | SetMetadataMask::MODE) {
+        fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     }
-
-    // Linux 语义：
-    // - chown 目录：不清除 suid/sgid（setgid 目录用于组继承）
-    // - chown 普通文件：总是清除 suid；sgid 按 Linux setattr_should_drop_sgid 规则清理
-    //   - 若 S_IXGRP 置位：无条件清除 sgid
-    //   - 否则（mandatory locking 语义）：仅当调用者不在文件所属组且无 CAP_FSETID 时清除
-    let ownership_changed = meta.uid != old_uid || meta.gid != old_gid;
-    if ownership_changed && meta.file_type != FileType::Dir {
-        // suid always must be killed on chown for non-directories
-        meta.mode.remove(InodeMode::S_ISUID);
-
-        if should_remove_sgid_on_chown(meta.mode, old_gid, current_gid, &cred, &group_info) {
-            meta.mode.remove(InodeMode::S_ISGID);
-        }
-    }
-    inode.set_metadata(&meta)?;
 
     return Ok(0);
 }
@@ -235,7 +373,7 @@ pub fn ksys_fchown(fd: i32, uid: usize, gid: usize) -> Result<usize, SystemError
         return Err(SystemError::EBADF);
     }
 
-    let inode = file.inode();
+    let inode = file.path_inode();
 
     drop(fd_table);
     return chown_common(inode, uid, gid);
@@ -252,162 +390,415 @@ pub fn do_sys_open(
     return do_sys_openat2(dfd, path, how);
 }
 
-fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
+pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usize, SystemError> {
     // log::debug!("openat2: dirfd: {}, path: {}, how: {:?}",dirfd, path, how);
-    let path = path.trim();
-    let follow_symlink = !how.o_flags.contains(FileFlags::O_NOFOLLOW);
-    // 检查空字符串路径
+    // Linux 6.6 rejects this contradictory creation request before lookup, so
+    // the result must not depend on whether the pathname already exists.
+    if how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_DIRECTORY) {
+        return Err(SystemError::EINVAL);
+    }
+    if how.o_flags.contains(FileFlags::__O_TMPFILE)
+        && (!how.o_flags.contains(FileFlags::O_DIRECTORY)
+            || how.o_flags.access_flags() == FileFlags::O_RDONLY)
+    {
+        return Err(SystemError::EINVAL);
+    }
+    // Match Linux's get_unused_fd_flags() ordering: reserve the descriptor
+    // before pathname lookup and before create/truncate/open side effects.
+    let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
+    let current = ProcessManager::current_pcb();
+    let fd_table = current.fd_table();
+    let reservation = File::recover_io(|| {
+        fd_table.reserve::<1>(
+            current.nofile_soft_limit(),
+            0,
+            cloexec,
+            &crate::cgroup::memory::object_for_task(&current),
+        )
+    })?;
     if path.is_empty() {
         return Err(SystemError::ENOENT);
     }
-
-    // 检查路径末尾斜杠 - 如果以斜杠结尾，目标必须是目录
-    let path_ends_with_slash = path.ends_with('/');
-
-    let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
-    let inode =
-        inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_symlink);
-    let mut created = false;
-    let inode: Arc<dyn IndexNode> = match inode {
-        Ok(inode) => inode,
-        Err(errno) => {
-            // 文件不存在，且需要创建
-            if how.o_flags.contains(FileFlags::O_CREAT)
-                && !how.o_flags.contains(FileFlags::O_DIRECTORY)
-                && errno == SystemError::ENOENT
-            {
-                // 如果路径以斜杠结尾，不能创建普通文件
-                if path_ends_with_slash {
-                    return Err(SystemError::EISDIR);
-                }
-
-                let (filename, parent_path) = rsplit_path(&path);
-                // 检查文件名长度
-                if filename.len() > crate::filesystem::vfs::NAME_MAX {
-                    return Err(SystemError::ENAMETOOLONG);
-                }
-                // 查找父目录
-                let parent_inode: Arc<dyn IndexNode> =
-                    resolve_parent_inode(inode_begin, parent_path)?;
-                let parent_md = parent_inode.metadata()?;
-                // 父节点必须是目录
-                if parent_md.file_type != FileType::Dir {
-                    return Err(SystemError::ENOTDIR);
-                }
-                // Linux 语义：创建文件需要对父目录拥有 W+X（写+搜索）权限
-                check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
-
-                // 计算创建 mode：应用 umask，遵循 open/creat 语义
-                let pcb = ProcessManager::current_pcb();
-                let umask = pcb.fs_struct().umask();
-                let create_mode = apply_umask_for_create(how.mode, umask);
-                // 创建文件
-                let inode: Arc<dyn IndexNode> =
-                    parent_inode.create(filename, FileType::File, create_mode)?;
-                created = true;
-                inode
-            } else {
-                // 不需要创建文件，因此返回错误码
-                return Err(errno);
-            }
+    // File storage is admitted before create/preopen. Its immutable receipt
+    // then follows this exact pathname result; an open retry never redoes
+    // lookup or O_EXCL creation.
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+    let storage = loop {
+        match super::file::PreparedFile::try_new() {
+            Ok(storage) => break storage,
+            Err(error) => error.recover(&mut recovery)?,
         }
     };
-    let metadata = inode.metadata()?;
-    let file_type: FileType = metadata.file_type;
+    let open_result = (|| -> Result<File, SystemError> {
+        // Linux makes O_CREAT|O_EXCL imply O_NOFOLLOW for the final component.
+        let follow_symlink = !(how.o_flags.contains(FileFlags::O_NOFOLLOW)
+            || how.o_flags.contains(FileFlags::O_CREAT) && how.o_flags.contains(FileFlags::O_EXCL));
+        // Check for an empty path
+        if path.is_empty() {
+            return Err(SystemError::ENOENT);
+        }
+        // Check for a trailing slash on the path: if it ends with a slash, the target must be a directory
+        let path_ends_with_slash = path.ends_with('/');
 
-    if !how.o_flags.contains(FileFlags::O_PATH)
-        && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
-        && inode.mount_flags().contains(MountFlags::NODEV)
-    {
-        return Err(SystemError::EACCES);
-    }
+        // IN_ROOT must select and validate dirfd even for an absolute pathname.
+        let (start_path, path) = if how.resolve.contains(OpenHowResolve::RESOLVE_IN_ROOT) {
+            let (start, _) = user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, ".")?;
+            (start, String::from(path))
+        } else {
+            user_resolved_path_at(&ProcessManager::current_pcb(), dirfd, path)?
+        };
+        let scope_root = if how
+            .resolve
+            .intersects(OpenHowResolve::RESOLVE_BENEATH | OpenHowResolve::RESOLVE_IN_ROOT)
+        {
+            Some(start_path.derive()?)
+        } else {
+            None
+        };
+        let walk_options = (!how.resolve.is_empty())
+            .then(|| super::utils::PathWalkOptions::new(how.resolve, scope_root));
+        let inode_begin = start_path.inode();
+        let resolved = File::recover_io(|| {
+            if let Some(options) = &walk_options {
+                inode_begin.lookup_openat2_owned(
+                    &start_path,
+                    &path,
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    follow_symlink,
+                    options,
+                )
+            } else {
+                inode_begin.lookup_follow_symlink_or_missing_owned(
+                    &start_path,
+                    &path,
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    follow_symlink,
+                )
+            }
+        });
+        let mut created = false;
+        let mut preopened: Option<PreopenedFile> = None;
+        let mut created_open = None;
+        let resolved = match resolved {
+            Ok(OwnedLookupOutcome::Found(resolved)) => resolved,
+            Ok(OwnedLookupOutcome::MissingFinal {
+                parent: parent_resolved,
+                name: filename,
+                must_be_dir,
+            }) => {
+                // The file does not exist and must be created
+                if how.o_flags.contains(FileFlags::O_CREAT)
+                    && !how.o_flags.contains(FileFlags::O_DIRECTORY)
+                {
+                    // A trailing slash may come from the expanded symlink target,
+                    // not only from the original userspace pathname.
+                    if must_be_dir {
+                        return Err(SystemError::EISDIR);
+                    }
 
-    if how.o_flags.contains(FileFlags::O_NOFOLLOW)
-        && !how.o_flags.contains(FileFlags::O_PATH)
-        && file_type == FileType::SymLink
-    {
-        return Err(SystemError::ELOOP);
-    }
+                    // Check the filename length
+                    if filename.len() > crate::filesystem::vfs::NAME_MAX {
+                        return Err(SystemError::ENAMETOOLONG);
+                    }
+                    let parent_inode = parent_resolved.inode();
+                    if let Some(options) = &walk_options {
+                        options.validate_path(&parent_resolved)?;
+                    }
+                    let parent_md = parent_inode.metadata()?;
+                    // The parent must be a directory
+                    if parent_md.file_type != FileType::Dir {
+                        return Err(SystemError::ENOTDIR);
+                    }
+                    // Linux semantics: creating a file requires write+search (W+X) permission on the parent directory
+                    check_parent_dir_permission_inode(&parent_inode, &parent_md)?;
 
-    // Linux semantics: socket inodes (S_IFSOCK) cannot be opened via open(2).
-    // Users must use socket(2)/connect(2) instead. Linux returns ENXIO.
-    if file_type == FileType::Socket {
-        return Err(SystemError::ENXIO);
-    }
-    // 如果路径以斜杠结尾，而目标不是目录，返回 ENOTDIR
-    if path_ends_with_slash && file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
-    // 已存在的文件且指定了 O_CREAT|O_EXCL
-    if how.o_flags.contains(FileFlags::O_CREAT)
-        && how.o_flags.contains(FileFlags::O_EXCL)
-        && !created
-    {
-        return Err(SystemError::EEXIST);
-    }
-    // 对已存在的目录使用 O_CREAT 视为错误
-    if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
-        return Err(SystemError::EISDIR);
-    }
-    // 目录相关检查
-    if file_type == FileType::Dir {
-        // 目录上不支持 O_TRUNC
-        if how.o_flags.contains(FileFlags::O_TRUNC) {
+                    // Compute the creation mode: apply umask, following open/creat semantics
+                    let pcb = ProcessManager::current_pcb();
+                    let umask = pcb.fs_struct().umask();
+                    let create_mode = apply_umask_for_create(how.mode, umask);
+                    // Let filesystems with an atomic create/open operation carry
+                    // the returned handle directly into the new File.  ENOSYS
+                    // preserves the generic create-then-open fallback.
+                    let mut create_flags = how.o_flags;
+                    if create_flags.contains(FileFlags::O_EXCL) {
+                        create_flags.remove(FileFlags::O_TRUNC);
+                    }
+                    let notify = || {
+                        fsnotify::fsnotify(
+                            FsEvent::CREATE,
+                            Some((&parent_inode, &filename)),
+                            None,
+                            0,
+                        );
+                    };
+                    if let Some(options) = &walk_options {
+                        options.validate_path(&parent_resolved)?;
+                    }
+                    let inode: Arc<dyn IndexNode> = if let Some(mounted) =
+                        parent_inode.clone().downcast_arc::<MountFSInode>()
+                    {
+                        let opened = File::recover_io(|| {
+                            mounted.create_file_with_post_commit(
+                                &filename,
+                                create_mode,
+                                &create_flags,
+                                notify,
+                            )
+                        })?;
+                        let inode = opened.inode();
+                        created_open = Some(opened);
+                        inode
+                    } else {
+                        let inode = match File::recover_io(|| {
+                            parent_inode.create_and_open(&filename, create_mode, &create_flags)
+                        }) {
+                            Ok(opened) => {
+                                let inode = opened.inode();
+                                preopened = Some(opened);
+                                inode
+                            }
+                            Err(SystemError::ENOSYS) => File::recover_io(|| {
+                                parent_inode.create(&filename, FileType::File, create_mode)
+                            })?,
+                            Err(err) => return Err(err),
+                        };
+                        fsnotify::fsnotify(
+                            FsEvent::CREATE,
+                            Some((&parent_inode, &filename)),
+                            Some(&inode),
+                            0,
+                        );
+                        inode
+                    };
+                    created = true;
+                    let created_path = ResolvedPath::new(inode)?;
+                    drop(parent_resolved);
+                    created_path
+                } else {
+                    return Err(SystemError::ENOENT);
+                }
+            }
+            Err(errno) => return Err(errno),
+        };
+        drop(start_path);
+        let inode = resolved.inode();
+        if !created {
+            if let Some(options) = &walk_options {
+                options.validate_path(&resolved)?;
+            }
+        }
+        let metadata = if how.resolve.contains(OpenHowResolve::RESOLVE_CACHED) {
+            inode.cached_metadata()?
+        } else {
+            inode.metadata()?
+        };
+        let file_type: FileType = metadata.file_type;
+
+        if how.o_flags.contains(FileFlags::__O_TMPFILE) {
+            if file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+            super::permission::check_inode_permission(
+                &inode,
+                &metadata,
+                PermissionMask::MAY_WRITE | PermissionMask::MAY_EXEC,
+            )?;
+            let umask = current.fs_struct().umask();
+            let create_mode = apply_umask_for_create(how.mode, umask);
+            let tmpfile = inode.tmpfile(create_mode, &how.o_flags)?;
+            let (_, mount_guard, _directory_operation) = resolved.into_parts();
+            let tmp_path = ResolvedPath::from_existing_mount(tmpfile.inode(), mount_guard)?;
+            let (_, mount_guard, operation_guard) = tmp_path.into_parts();
+            let mut file = File::new_unlinked_with_mount_guard(
+                storage,
+                tmpfile,
+                how.o_flags,
+                mount_guard,
+                operation_guard,
+            )?;
+            while let Err(error) = file.complete_open() {
+                error.recover(&mut recovery)?;
+            }
+            file.notify_open_event();
+            return Ok(file);
+        }
+
+        if !how.o_flags.contains(FileFlags::O_PATH)
+            && (file_type == FileType::CharDevice || file_type == FileType::BlockDevice)
+            && (inode.mount_flags().contains(MountFlags::NODEV)
+                // Linux SB_I_NODEV is intrinsic to a non-initial owner:
+                // clearing mount NODEV cannot make this filesystem a source
+                // of usable device nodes. O_PATH still bypasses device open.
+                || inode.try_fs().and_then(|fs| fs.mount_owner_user_ns()).is_some_and(|owner| {
+                    !alloc::sync::Arc::ptr_eq(&owner, &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE)
+                }))
+        {
+            return Err(SystemError::EACCES);
+        }
+
+        // If the path ends with a slash but the target is not a directory, return ENOTDIR
+        if path_ends_with_slash && file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        // The file already exists and O_CREAT|O_EXCL was specified
+        if how.o_flags.contains(FileFlags::O_CREAT)
+            && how.o_flags.contains(FileFlags::O_EXCL)
+            && !created
+        {
+            return Err(SystemError::EEXIST);
+        }
+        if how.o_flags.contains(FileFlags::O_NOFOLLOW)
+            && !how.o_flags.contains(FileFlags::O_PATH)
+            && file_type == FileType::SymLink
+        {
+            return Err(SystemError::ELOOP);
+        }
+        // Using O_CREAT on an existing directory is treated as an error
+        if how.o_flags.contains(FileFlags::O_CREAT) && !created && file_type == FileType::Dir {
             return Err(SystemError::EISDIR);
         }
-        // 目录上不允许写访问
-        let acc_mode = how.o_flags.access_flags();
-        if acc_mode == FileFlags::O_WRONLY || acc_mode == FileFlags::O_RDWR {
-            return Err(SystemError::EISDIR);
+        // Directory checks
+        if file_type == FileType::Dir {
+            // O_TRUNC is not supported on directories
+            if how.o_flags.contains(FileFlags::O_TRUNC) {
+                return Err(SystemError::EISDIR);
+            }
+            // Write access is not allowed on directories
+            let acc_mode = how.o_flags.access_flags();
+            if acc_mode != FileFlags::O_RDONLY {
+                return Err(SystemError::EISDIR);
+            }
         }
-        // 目录不支持 O_DIRECT
-        if how.o_flags.contains(FileFlags::O_DIRECT) {
+        // Non-O_PATH opens must check access permission (read/write/truncate)
+        // Linux semantics: if this open() triggered creation, it must not reject this
+        // open()'s access mode because of the "new inode's mode"; it takes effect on a subsequent reopen().
+        if !how.o_flags.contains(FileFlags::O_PATH) && !created {
+            let acc_mode = how.o_flags.access_flags();
+            let mut need = PermissionMask::empty();
+            match acc_mode {
+                FileFlags::O_RDONLY => need.insert(PermissionMask::MAY_READ),
+                FileFlags::O_WRONLY => need.insert(PermissionMask::MAY_WRITE),
+                FileFlags::O_RDWR => {
+                    need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE)
+                }
+                // Linux ACC_MODE(3) also requires read and write DAC checks,
+                // although a descriptor opened this way is not readable or
+                // writable through read(2)/write(2).
+                _ => need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE),
+            }
+            if how.o_flags.contains(FileFlags::O_TRUNC) {
+                need.insert(PermissionMask::MAY_WRITE);
+            }
+            if !need.is_empty() {
+                super::permission::check_inode_permission(&inode, &metadata, need)?;
+            }
+        }
+
+        // If a directory was to be opened but the target is not a directory
+        if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        // Linux resolves path/file-type and ordinary DAC errors before applying
+        // O_NOATIME's owner/CAP_FOWNER restriction. In particular, O_NOFOLLOW on
+        // a final symlink must report ELOOP rather than an ownership-based EPERM.
+        if how.o_flags.contains(FileFlags::O_NOATIME) {
+            super::permission::check_noatime_permission(&metadata)?;
+        }
+
+        // Linux rejects unsupported direct I/O from do_dentry_open(), after
+        // may_open() has enforced O_NOATIME ownership.
+        if file_type == FileType::Dir && how.o_flags.contains(FileFlags::O_DIRECT) {
             return Err(SystemError::EINVAL);
         }
-    }
-    // 非 O_PATH 需要检查访问权限（read/write/truncate）
-    // Linux 语义：若本次 open() 触发了创建，则不应因“新 inode 的 mode”而拒绝
-    // 当前这次 open() 的访问模式；权限在“后续 reopen()”时生效。
-    if !how.o_flags.contains(FileFlags::O_PATH) && !created {
-        let acc_mode = how.o_flags.access_flags();
-        let mut need = PermissionMask::empty();
-        match acc_mode {
-            FileFlags::O_RDONLY => need.insert(PermissionMask::MAY_READ),
-            FileFlags::O_WRONLY => need.insert(PermissionMask::MAY_WRITE),
-            FileFlags::O_RDWR => need.insert(PermissionMask::MAY_READ | PermissionMask::MAY_WRITE),
-            _ => {}
+
+        // Linux reaches the socket file operation only after DAC and O_NOATIME
+        // checks; sock_no_open() then rejects pathname-based opens with ENXIO.
+        if file_type == FileType::Socket {
+            return Err(SystemError::ENXIO);
         }
-        if how.o_flags.contains(FileFlags::O_TRUNC) {
-            need.insert(PermissionMask::MAY_WRITE);
+
+        // Existing regular files opened with O_TRUNC are modified after the
+        // filesystem open succeeds. Newly created files are already empty and
+        // Linux clears O_TRUNC for this phase.
+        let do_truncate =
+            !created && file_type == FileType::File && how.o_flags.contains(FileFlags::O_TRUNC);
+        // An open hook may perform atomic O_TRUNC even for O_RDONLY. Hold
+        // write access before invoking it and through the post-open truncate,
+        // without retaining a writer for the returned read-only description.
+        // This owner outlives the temporary writer even when constructing the
+        // File or truncating it fails and releases the File's mount pin.
+        let _truncate_path = do_truncate.then(|| resolved.derive_existing_owner());
+        let _truncate_mount_writer = if do_truncate {
+            inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .map(|mounted| mounted.mount_fs().want_write())
+                .transpose()?
+        } else {
+            None
+        };
+        let _truncate_write_access = if do_truncate {
+            Some(super::write_access::InodeWriteGuard::writer(inode.clone())?)
+        } else {
+            None
+        };
+        let truncate_metadata = do_truncate.then(|| metadata.clone());
+        if !created {
+            if let Some(options) = &walk_options {
+                options.validate_path(&resolved)?;
+            }
         }
-        if !need.is_empty() {
-            super::permission::check_inode_permission(&inode, &metadata, need)?;
+        let (inode, mount_guard, operation_guard) = resolved.into_parts();
+        let mut file: File = if let Some(created) = created_open {
+            File::new_created_with_mount_guard(
+                storage,
+                created,
+                how.o_flags,
+                mount_guard,
+                operation_guard,
+                how.resolve
+                    .contains(OpenHowResolve::RESOLVE_CACHED)
+                    .then_some(metadata),
+            )?
+        } else {
+            match preopened {
+                Some(opened) => File::new_preopened_with_mount_guard(
+                    storage,
+                    opened,
+                    how.o_flags,
+                    mount_guard,
+                    operation_guard,
+                )?,
+                None => File::new_with_mount_guard(
+                    storage,
+                    inode,
+                    how.o_flags,
+                    mount_guard,
+                    operation_guard,
+                    how.resolve
+                        .contains(OpenHowResolve::RESOLVE_CACHED)
+                        .then_some(metadata),
+                )?,
+            }
+        };
+        while let Err(error) = file.complete_open() {
+            error.recover(&mut recovery)?;
         }
-    }
 
-    // 如果要打开的是文件夹，而目标不是文件夹
-    if how.o_flags.contains(FileFlags::O_DIRECTORY) && file_type != FileType::Dir {
-        return Err(SystemError::ENOTDIR);
-    }
+        // Linux emits OPEN from do_dentry_open() before handle_truncate().
+        file.notify_open_event();
+        if let Some(metadata_before_open) = truncate_metadata {
+            let context = prepare_open_truncate(metadata_before_open);
+            while let Err(error) = vfs_open_truncate(&file, &context) {
+                error.recover(&mut recovery)?;
+            }
+        }
+        Ok(file)
+    })();
 
-    // 如果O_TRUNC，并且是普通文件，清空文件
-    // 注意：必须在创建 File 对象之前截断
-    // 因为 O_TRUNC 的截断基于文件系统权限，而不是打开模式
-    // 例如：open(file, O_RDONLY | O_TRUNC) 是合法的，只要用户对文件有写权限
-    if how.o_flags.contains(FileFlags::O_TRUNC) && file_type == FileType::File {
-        inode.resize(0)?;
-    }
-    let file: File = File::new(inode, how.o_flags)?;
-    let cloexec = how.o_flags.contains(FileFlags::O_CLOEXEC);
-
-    // 把文件对象存入pcb
-    let r = ProcessManager::current_pcb()
-        .fd_table()
-        .write()
-        .alloc_fd(file, None, cloexec)
-        .map(|fd| fd as usize);
-
-    return r;
+    let file = open_result?;
+    reservation.install(file).map(|fd| fd as usize)
 }
 
 /// 为exec打开可执行文件
@@ -450,14 +841,17 @@ pub fn do_open_execat_with_flags(
     } else {
         let (inode_begin, path) = user_path_at(&ProcessManager::current_pcb(), dirfd, path)?;
         if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
-            let inode =
-                inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)?;
+            let inode = File::recover_io(|| {
+                inode_begin.lookup_follow_symlink2(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES, false)
+            })?;
             if inode.metadata()?.file_type == FileType::SymLink {
                 return Err(SystemError::ELOOP);
             }
             inode
         } else {
-            inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+            File::recover_io(|| {
+                inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)
+            })?
         }
     };
 
@@ -474,10 +868,16 @@ pub fn do_open_execat_with_flags(
     }
 
     super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_EXEC)?;
-    super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ)?;
 
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
-    let file = File::new(inode, FileFlags::O_RDONLY | FileFlags::O_CLOEXEC)?;
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+    let file = loop {
+        match File::new(inode.clone(), FileFlags::O_RDONLY | FileFlags::O_CLOEXEC) {
+            Ok(file) => break file,
+            Err(error) => error.recover(&mut recovery)?,
+        }
+    };
+    file.notify_open_event();
 
     Ok(Arc::new(file))
 }
@@ -510,12 +910,15 @@ pub fn do_utimensat(
         Some(path) => {
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
-            let inode = if flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW) {
-                inode_begin.lookup(path.as_str())?
-            } else {
-                inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?
-            };
-            inode
+            // AT_SYMLINK_NOFOLLOW applies only to the final component;
+            // intermediate directory symlinks must still be followed.
+            File::recover_io(|| {
+                inode_begin.lookup_follow_symlink2(
+                    path.as_str(),
+                    VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                    !flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW),
+                )
+            })?
         }
         None => {
             // Linux-specific extension: pathname == NULL means operate on the
@@ -528,7 +931,7 @@ pub fn do_utimensat(
             }
 
             let binding = ProcessManager::current_pcb().fd_table();
-            let fd_table_guard = binding.write();
+            let fd_table_guard = binding.read();
             let file = fd_table_guard
                 .get_file_by_fd(dirfd)
                 .ok_or(SystemError::EBADF)?;
@@ -539,51 +942,112 @@ pub fn do_utimensat(
                 return Err(SystemError::EBADF);
             }
 
-            file.inode()
+            file.path_inode()
         }
     };
-    let now = PosixTimeSpec::now();
-    let mut meta = inode.metadata()?;
-
-    if let Some([atime, mtime]) = times {
-        if atime.tv_nsec == UTIME_NOW {
-            meta.atime = now;
-        } else if atime.tv_nsec != UTIME_OMIT {
-            meta.atime = atime;
-        }
-        if mtime.tv_nsec == UTIME_NOW {
-            meta.mtime = now;
-        } else if mtime.tv_nsec != UTIME_OMIT {
-            meta.mtime = mtime;
-        }
-        inode.set_metadata(&meta).unwrap();
-    } else {
-        meta.atime = now;
-        meta.mtime = now;
-        inode.set_metadata(&meta).unwrap();
-    }
+    let both_now =
+        times.is_none_or(|times| times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec == UTIME_NOW);
+    File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            check_timestamp_update_permission(&inode, current, both_now)?;
+            let mut meta = current.clone();
+            let now = PosixTimeSpec::now();
+            let mut mask = SetMetadataMask::empty();
+            if let Some([atime, mtime]) = times {
+                if atime.tv_nsec == UTIME_NOW {
+                    meta.atime = now;
+                    mask.insert(SetMetadataMask::ATIME);
+                } else if atime.tv_nsec != UTIME_OMIT {
+                    meta.atime = atime;
+                    mask.insert(SetMetadataMask::ATIME);
+                }
+                if mtime.tv_nsec == UTIME_NOW {
+                    meta.mtime = now;
+                    mask.insert(SetMetadataMask::MTIME);
+                } else if mtime.tv_nsec != UTIME_OMIT {
+                    meta.mtime = mtime;
+                    mask.insert(SetMetadataMask::MTIME);
+                }
+                meta.ctime = now;
+                mask.insert(SetMetadataMask::CTIME);
+                if both_now {
+                    mask.insert(SetMetadataMask::TIMES_BY_WRITE);
+                }
+            } else {
+                meta.atime = now;
+                meta.mtime = now;
+                meta.ctime = now;
+                mask = SetMetadataMask::ATIME
+                    | SetMetadataMask::MTIME
+                    | SetMetadataMask::CTIME
+                    | SetMetadataMask::TIMES_BY_WRITE;
+            }
+            Ok((meta, mask))
+        })
+    })?;
+    // fsnotify: timestamp change → IN_ATTRIB.
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }
 
 pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, SystemError> {
+    // Validate before converting microseconds to nanoseconds. Unlike timer
+    // intervals, file timestamps may legitimately have negative seconds.
+    if let Some(values) = times {
+        if values
+            .iter()
+            .any(|value| !(0..1_000_000).contains(&value.tv_usec))
+        {
+            return Err(SystemError::EINVAL);
+        }
+    }
     // log::debug!("do_utimes: path:{:?}, times:{:?}", path, times);
     let (inode_begin, path) = user_path_at(
         &ProcessManager::current_pcb(),
         AtFlags::AT_FDCWD.bits(),
         path,
     )?;
-    let inode = inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-    let mut meta = inode.metadata()?;
-
-    if let Some([atime, mtime]) = times {
-        meta.atime = PosixTimeSpec::from(atime);
-        meta.mtime = PosixTimeSpec::from(mtime);
-        inode.set_metadata(&meta)?;
-    } else {
-        let now = PosixTimeSpec::now();
-        meta.atime = now;
-        meta.mtime = now;
-        inode.set_metadata(&meta)?;
-    }
+    let inode = File::recover_io(|| {
+        inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
+    File::recover_io(|| {
+        inode.update_metadata_masked(&mut |current| {
+            check_timestamp_update_permission(&inode, current, times.is_none())?;
+            let mut meta = current.clone();
+            let now = PosixTimeSpec::now();
+            let mut mask = SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME;
+            if let Some([atime, mtime]) = times {
+                meta.atime = PosixTimeSpec::from(atime);
+                meta.mtime = PosixTimeSpec::from(mtime);
+            } else {
+                meta.atime = now;
+                meta.mtime = now;
+                mask.insert(SetMetadataMask::TIMES_BY_WRITE);
+            }
+            meta.ctime = now;
+            Ok((meta, mask))
+        })
+    })?;
+    // fsnotify: a successful utimes(2) timestamp update → IN_ATTRIB.
+    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
+}
+
+fn check_timestamp_update_permission(
+    inode: &Arc<dyn IndexNode>,
+    metadata: &super::Metadata,
+    may_use_write_permission: bool,
+) -> Result<(), SystemError> {
+    let cred = ProcessManager::current_pcb().cred();
+    if cred.is_owner_or_capable(metadata) {
+        return Ok(());
+    }
+    if may_use_write_permission {
+        return super::permission::check_inode_permission(
+            inode,
+            metadata,
+            PermissionMask::MAY_WRITE,
+        );
+    }
+    Err(SystemError::EPERM)
 }

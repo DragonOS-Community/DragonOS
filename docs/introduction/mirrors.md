@@ -1,7 +1,7 @@
-# DragonOS镜像站
+# DragonOS Mirror Site
 
-您可以从以下镜像站下载到DragonOS的源代码和其他文件：
+You can download the source code and other files of DragonOS from the following mirror sites:
 
-- [DragonOS镜像站 https://mirrors.dragonos.org/](https://mirrors.dragonos.org/)
-- [DragonOS国内镜像站 (RinGoTek)](https://mirrors.RinGoTek.cn)
-- [git镜像站](https://git.mirrors.dragonos.org/)
+- [DragonOS Mirror Site https://mirrors.dragonos.org/](https://mirrors.dragonos.org/)
+- [DragonOS Domestic Mirror Site (RinGoTek)](https://mirrors.RinGoTek.cn)
+- [Git Mirror Site](https://git.mirrors.dragonos.org/)

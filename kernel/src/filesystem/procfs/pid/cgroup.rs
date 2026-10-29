@@ -1,5 +1,7 @@
 //! /proc/[pid]/cgroup - cgroup membership (v2)
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::libs::mutex::MutexGuard;
 use crate::{
     cgroup::cgroup_path_from_view,
@@ -7,7 +9,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -34,10 +36,10 @@ impl CgroupFileOps {
     }
 
     fn generate_content(&self) -> Result<Vec<u8>, SystemError> {
-        let target = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        // Linux `proc_cgroup_show()` runs on `get_proc_task(inode)`, so a
+        // hidden tid and /proc/<tgid>/task/<tid>/cgroup report the leaf of the
+        // thread they name, even when cgroup.threads splits a thread group.
+        let target = self.target.task().ok_or(SystemError::ESRCH)?;
         let viewer = ProcessManager::current_pcb();
 
         let target_cg = target.task_cgroup_node();
@@ -49,14 +51,23 @@ impl CgroupFileOps {
 }
 
 impl FileOps for CgroupFileOps {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = self.generate_content()?;
-        proc_read(offset, len, buf, &content)
+        // `single_open()`: one fd sees one cgroup record.
+        proc_snapshot_operation(operation, data, || self.generate_content())
     }
 }

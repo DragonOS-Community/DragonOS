@@ -215,11 +215,7 @@ TEST(SpliceConcurrentIo, FileToPipeNotStarvedByMadvise) {
     EXPECT_EQ(0, state.failures.load(std::memory_order_relaxed));
 }
 
-TEST(SpliceConcurrentIo, FileToPipeShortReadNeedsOnlyAnyPipeSpace) {
-    if (!IsDragonOS()) {
-        GTEST_SKIP() << "DragonOS byte-ring pipe regression test";
-    }
-
+TEST(SpliceConcurrentIo, FileToPipeShortReadNeedsOnlyOneFreeSlot) {
     struct sigaction sa {};
     sa.sa_handler = AlarmHandler;
     ASSERT_EQ(0, sigaction(SIGALRM, &sa, nullptr)) << strerror(errno);
@@ -233,8 +229,8 @@ TEST(SpliceConcurrentIo, FileToPipeShortReadNeedsOnlyAnyPipeSpace) {
     int pipe_fds[2] = {-1, -1};
     ASSERT_EQ(0, pipe(pipe_fds)) << strerror(errno);
     const int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
-    ASSERT_GT(capacity, 1) << strerror(errno);
-    FillPipeLeavingSpace(pipe_fds[1], capacity, 1);
+    ASSERT_GE(capacity, 4096) << strerror(errno);
+    FillPipeLeavingSpace(pipe_fds[1], capacity, 4096);
 
     ASSERT_EQ(1, splice(file.fd(), nullptr, pipe_fds[1], nullptr, 4096, 0))
         << strerror(errno);
@@ -244,11 +240,7 @@ TEST(SpliceConcurrentIo, FileToPipeShortReadNeedsOnlyAnyPipeSpace) {
     alarm(0);
 }
 
-TEST(SpliceConcurrentIo, NonblockFileToPipeShortReadUsesAvailableSpace) {
-    if (!IsDragonOS()) {
-        GTEST_SKIP() << "DragonOS byte-ring pipe regression test";
-    }
-
+TEST(SpliceConcurrentIo, NonblockFileToPipeShortReadRequiresOneFreeSlot) {
     TempFile file;
     ASSERT_TRUE(file.valid()) << strerror(errno);
     ASSERT_EQ(1, write(file.fd(), &kByte, 1)) << strerror(errno);
@@ -260,6 +252,14 @@ TEST(SpliceConcurrentIo, NonblockFileToPipeShortReadUsesAvailableSpace) {
     ASSERT_GT(capacity, 1) << strerror(errno);
     FillPipeLeavingSpace(pipe_fds[1], capacity, 1);
 
+    errno = 0;
+    EXPECT_EQ(-1, splice(file.fd(), nullptr, pipe_fds[1], nullptr, 4096,
+                         SPLICE_F_NONBLOCK));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ(0, lseek(file.fd(), 0, SEEK_CUR));
+    std::vector<char> released(4096);
+    ASSERT_EQ(4096, read(pipe_fds[0], released.data(), released.size())) << strerror(errno);
+
     ASSERT_EQ(1,
               splice(file.fd(), nullptr, pipe_fds[1], nullptr, 4096,
                      SPLICE_F_NONBLOCK))
@@ -269,11 +269,7 @@ TEST(SpliceConcurrentIo, NonblockFileToPipeShortReadUsesAvailableSpace) {
     close(pipe_fds[1]);
 }
 
-TEST(SpliceConcurrentIo, NonblockFileToPipePipeBufNeedsCompleteSpace) {
-    if (!IsDragonOS()) {
-        GTEST_SKIP() << "DragonOS byte-ring pipe regression test";
-    }
-
+TEST(SpliceConcurrentIo, NonblockFileToPipeRequiresAFreeSlot) {
     TempFile file;
     ASSERT_TRUE(file.valid()) << strerror(errno);
     std::vector<char> bytes(4096, kByte);
@@ -323,7 +319,7 @@ TEST(SpliceConcurrentIo, ProcfsZeroSizeRegularFileCanSpliceData) {
     close(file_fd);
 }
 
-TEST(SpliceConcurrentIo, ProcfsShortReadNeedsOnlyActualPipeSpace) {
+TEST(SpliceConcurrentIo, ProcfsShortReadNeedsOnlyOneFreeSlot) {
     if (!IsDragonOS()) {
         GTEST_SKIP() << "DragonOS procfs splice regression test";
     }
@@ -349,8 +345,8 @@ TEST(SpliceConcurrentIo, ProcfsShortReadNeedsOnlyActualPipeSpace) {
     int pipe_fds[2] = {-1, -1};
     ASSERT_EQ(0, pipe(pipe_fds)) << strerror(errno);
     const int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
-    ASSERT_GT(capacity, static_cast<int>(expected.size())) << strerror(errno);
-    FillPipeLeavingSpace(pipe_fds[1], capacity, expected.size());
+    ASSERT_GE(capacity, 4096) << strerror(errno);
+    FillPipeLeavingSpace(pipe_fds[1], capacity, 4096);
 
     ASSERT_EQ(static_cast<ssize_t>(expected.size()),
               splice(file_fd, nullptr, pipe_fds[1], nullptr, 4096, 0))
@@ -362,7 +358,7 @@ TEST(SpliceConcurrentIo, ProcfsShortReadNeedsOnlyActualPipeSpace) {
     alarm(0);
 }
 
-TEST(SpliceConcurrentIo, NonblockProcfsShortReadUsesAvailablePipeSpace) {
+TEST(SpliceConcurrentIo, NonblockProcfsShortReadRequiresOneFreeSlot) {
     if (!IsDragonOS()) {
         GTEST_SKIP() << "DragonOS procfs splice regression test";
     }
@@ -385,6 +381,14 @@ TEST(SpliceConcurrentIo, NonblockProcfsShortReadUsesAvailablePipeSpace) {
     const int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
     ASSERT_GT(capacity, static_cast<int>(expected.size())) << strerror(errno);
     FillPipeLeavingSpace(pipe_fds[1], capacity, expected.size());
+
+    // All slots are occupied even though the final page has spare bytes.
+    errno = 0;
+    EXPECT_EQ(-1, splice(file_fd, nullptr, pipe_fds[1], nullptr, 4096,
+                         SPLICE_F_NONBLOCK));
+    EXPECT_EQ(EAGAIN, errno);
+    std::vector<char> released(4096);
+    ASSERT_EQ(4096, read(pipe_fds[0], released.data(), released.size())) << strerror(errno);
 
     ASSERT_EQ(static_cast<ssize_t>(expected.size()),
               splice(file_fd, nullptr, pipe_fds[1], nullptr, 4096,

@@ -4,7 +4,11 @@ use crate::{
     arch::filesystem::stat::PosixStat,
     driver::base::device::device_number::DeviceNumber,
     filesystem::vfs::{mount::is_mountpoint_root, vcore::do_file_lookup_at},
-    process::ProcessManager,
+    process::{
+        cred::{Kgid, Kuid},
+        namespace::user_namespace::{from_kgid_munged, from_kuid_munged},
+        ProcessManager,
+    },
     syscall::user_access::UserBufferWriter,
     time::PosixTimeSpec,
 };
@@ -163,7 +167,7 @@ pub fn vfs_statx(
         if dfd < 0 {
             return Err(SystemError::EBADF);
         }
-        return vfs_fstat(dfd);
+        return vfs_fstat_with_mask(dfd, request_mask, flags);
     }
 
     let inode = do_file_lookup_at(dfd, filename, lookup_flags)?;
@@ -225,8 +229,10 @@ pub fn vfs_getattr(
 
     // Derive directory link count dynamically only when metadata has no reliable value.
     if metadata.file_type == crate::filesystem::vfs::FileType::Dir {
-        // Many filesystems already maintain nlinks; use it when it looks valid (>=2 for dirs).
-        if metadata.nlinks < 2 {
+        // Zero is authoritative for an unlinked-but-live directory.  Only the
+        // legacy/default value one means the filesystem did not provide a
+        // usable directory link count and needs VFS derivation.
+        if metadata.nlinks == 1 {
             if let Ok(entries) = inode.list() {
                 let mut subdir_links = 0usize;
                 for name in entries {
@@ -287,24 +293,23 @@ pub fn vfs_getattr(
         kstat.ctime.tv_nsec = metadata.ctime.tv_nsec;
     }
     if request_mask.contains(PosixStatxMask::STATX_INO) {
-        kstat.ino = metadata.inode_id.into() as u64;
+        kstat.ino = inode.reported_ino(&metadata).into() as u64;
     }
     if request_mask.contains(PosixStatxMask::STATX_SIZE) {
         kstat.size = metadata.size as usize;
     }
     if request_mask.contains(PosixStatxMask::STATX_BLOCKS) {
-        let size_bytes = if metadata.size < 0 {
-            0
-        } else {
-            metadata.size as u64
-        };
-        kstat.blocks = size_bytes.div_ceil(blk_size as u64);
+        // Allocation is reported in 512-byte sectors, independently of the
+        // I/O hint above. Sparse files and preallocation cannot be inferred
+        // from logical EOF; zero is a meaningful allocation value.
+        kstat.blocks = metadata.blocks as u64;
     }
 
     if request_mask.contains(PosixStatxMask::STATX_BTIME) {
-        // btime是文件创建时间
-        kstat.btime.tv_sec = metadata.btime.tv_sec;
-        kstat.btime.tv_nsec = metadata.btime.tv_nsec;
+        if let Some(btime) = inode.birth_time(&metadata) {
+            kstat.btime = btime;
+            kstat.result_mask.insert(PosixStatxMask::STATX_BTIME);
+        }
     }
 
     // 即便调用者未显式请求 STATX_ALL，也填充 rdev、dev 以符合 Linux 语义。
@@ -313,12 +318,16 @@ pub fn vfs_getattr(
 
     if request_mask.contains(PosixStatxMask::STATX_ALL) {
         kstat.attributes = StxAttributes::STATX_ATTR_APPEND;
-        kstat.attributes_mask |=
-            StxAttributes::STATX_ATTR_AUTOMOUNT | StxAttributes::STATX_ATTR_DAX;
+        kstat.attributes_mask |= StxAttributes::STATX_ATTR_AUTOMOUNT;
     }
 
-    // 把文件类型加入mode里面 （todo: 在具体的文件系统里面去实现这个操作。这里只是权宜之计）
-    kstat.mode |= metadata.file_type.into();
+    // Attribute support is independent of the requested basic-stat mask.
+    kstat.attributes_mask.insert(StxAttributes::STATX_ATTR_DAX);
+    if inode.is_dax() {
+        kstat.attributes.insert(StxAttributes::STATX_ATTR_DAX);
+    }
+
+    kstat.mode = inode.stat_mode(&metadata);
 
     return Ok(kstat);
 }
@@ -350,6 +359,14 @@ pub fn vfs_fstatat(dfd: i32, filename: &str, flags: AtFlags) -> Result<KStat, Sy
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#190
 pub fn vfs_fstat(dfd: i32) -> Result<KStat, SystemError> {
+    vfs_fstat_with_mask(dfd, PosixStatxMask::STATX_BASIC_STATS, AtFlags::empty())
+}
+
+fn vfs_fstat_with_mask(
+    dfd: i32,
+    request_mask: PosixStatxMask,
+    flags: AtFlags,
+) -> Result<KStat, SystemError> {
     // Get the file from the file descriptor
     let pcb = ProcessManager::current_pcb();
     let fd_table = pcb.fd_table();
@@ -357,10 +374,9 @@ pub fn vfs_fstat(dfd: i32) -> Result<KStat, SystemError> {
         .read()
         .get_file_by_fd(dfd)
         .ok_or(SystemError::EBADF)?;
-    let inode = file.inode();
+    let inode = file.path_inode();
 
-    // Get attributes using vfs_getattr with basic stats mask
-    vfs_getattr(&inode, PosixStatxMask::STATX_BASIC_STATS, AtFlags::empty())
+    vfs_getattr(&inode, request_mask, flags)
 }
 
 pub(super) fn do_newfstatat(
@@ -419,8 +435,9 @@ fn cp_statx(kstat: KStat, user_buf_ptr: usize) -> Result<(), SystemError> {
     statx.stx_blksize = kstat.blksize;
     statx.stx_attributes = kstat.attributes & !StxAttributes::STATX_ATTR_CHANGE_MONOTONIC;
     statx.stx_nlink = kstat.nlink;
-    statx.stx_uid = kstat.uid;
-    statx.stx_gid = kstat.gid;
+    let user_ns = ProcessManager::current_user_ns();
+    statx.stx_uid = from_kuid_munged(&user_ns, Kuid::new(kstat.uid as usize));
+    statx.stx_gid = from_kgid_munged(&user_ns, Kgid::new(kstat.gid as usize));
     statx.stx_mode = kstat.mode;
     statx.stx_inode = kstat.ino;
     statx.stx_size = kstat.size as i64;
@@ -520,9 +537,9 @@ impl TryFrom<KStat> for GenericPosixStat {
         tmp.st_mode = kstat.mode.bits();
         tmp.st_nlink = kstat.nlink;
 
-        // todo: 处理user namespace (https://code.dragonos.org.cn/xref/linux-6.6.21/fs/stat.c#415)
-        tmp.st_uid = kstat.uid;
-        tmp.st_gid = kstat.gid;
+        let user_ns = ProcessManager::current_user_ns();
+        tmp.st_uid = from_kuid_munged(&user_ns, Kuid::new(kstat.uid as usize));
+        tmp.st_gid = from_kgid_munged(&user_ns, Kgid::new(kstat.gid as usize));
 
         // 兼容 Linux 的 dev 编码语义，使用 new_encode_dev 返回 gnu_dev_makedev 风格的值。
         tmp.st_rdev = kstat.rdev.new_encode_dev() as u64;

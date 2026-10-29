@@ -6,7 +6,7 @@ use crate::libs::futex::{constant::*, futex::Futex};
 
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_FUTEX},
-    mm::{access_ok, VirtAddr},
+    mm::VirtAddr,
     syscall::{
         table::{FormattedSyscallParam, Syscall},
         user_access::UserBufferReader,
@@ -61,6 +61,7 @@ impl Syscall for SysFutexHandle {
         let (timespec, val2): (Option<PosixTimeSpec>, u32) = match cmd {
             // 与 Linux 语义一致：WAIT 使用相对超时；WAIT_BITSET/LOCK_PI2/WAIT_REQUEUE_PI 使用绝对时间（若带 CLOCKRT）
             FutexArg::FUTEX_WAIT
+            | FutexArg::FUTEX_LOCK_PI
             | FutexArg::FUTEX_WAIT_BITSET
             | FutexArg::FUTEX_WAIT_REQUEUE_PI
             | FutexArg::FUTEX_LOCK_PI2 => {
@@ -70,7 +71,7 @@ impl Syscall for SysFutexHandle {
                         core::mem::size_of::<PosixTimeSpec>(),
                         frame.is_from_user(),
                     )?;
-                    (Some(*reader.read_one_from_user::<PosixTimeSpec>(0)?), 0)
+                    (Some(reader.read_one_from_user::<PosixTimeSpec>(0)?), 0)
                 } else {
                     (None, 0)
                 }
@@ -158,18 +159,6 @@ pub(super) fn do_futex(
     let cmd = FutexArg::from_bits(operation & FutexFlag::FUTEX_CMD_MASK.bits())
         .ok_or(SystemError::ENOSYS)?;
 
-    // 仅在需要 uaddr2 的操作中校验它
-    match cmd {
-        FutexArg::FUTEX_REQUEUE
-        | FutexArg::FUTEX_CMP_REQUEUE
-        | FutexArg::FUTEX_WAKE_OP
-        | FutexArg::FUTEX_WAIT_REQUEUE_PI
-        | FutexArg::FUTEX_CMP_REQUEUE_PI => {
-            access_ok(uaddr2, core::mem::size_of::<u32>())?;
-        }
-        _ => {}
-    }
-
     let mut flags = FutexFlag::FLAGS_MATCH_NONE;
 
     if (operation & FutexFlag::FUTEX_PRIVATE_FLAG.bits()) == 0 {
@@ -186,16 +175,8 @@ pub(super) fn do_futex(
         }
     }
 
-    // 对于 FUTEX_WAKE_OP 的私有 futex，允许 uaddr 为 NULL（Linux 兼容行为）。
-    // 仅在不满足该例外时才校验 uaddr。
-    let skip_uaddr_check = cmd == FutexArg::FUTEX_WAKE_OP
-        && (operation & FutexFlag::FUTEX_PRIVATE_FLAG.bits()) != 0
-        && uaddr.data() == 0;
-
-    if !skip_uaddr_check {
-        access_ok(uaddr, core::mem::size_of::<u32>())?;
-    }
-
+    // Each implemented operation resolves its key before touching a futex
+    // word. Keep alignment, range and mapping checks there, in Linux order.
     match cmd {
         FutexArg::FUTEX_WAIT => {
             return Futex::futex_wait(uaddr, flags, val, timeout, FUTEX_BITSET_MATCH_ANY);
@@ -205,28 +186,23 @@ pub(super) fn do_futex(
             // 这里将绝对截止时间转换为相对剩余时间，past 则立即 ETIMEDOUT。
             let adjusted_timeout = if let Some(deadline) = timeout {
                 // 校验 timespec 合法性
-                if deadline.tv_nsec < 0 || deadline.tv_nsec >= 1_000_000_000 {
+                if !deadline.is_valid_timeout() {
                     return Err(SystemError::EINVAL);
                 }
 
-                // 选择时钟：若带 FUTEX_CLOCK_REALTIME 则使用 realtime；否则使用 monotonic（当前实现等价）
-                let now = crate::time::timekeeping::getnstimeofday();
+                let now = if flags.contains(FutexFlag::FLAGS_CLOCKRT) {
+                    crate::time::timekeeping::realtime_now()
+                } else {
+                    crate::time::timekeeping::monotonic_now()
+                };
 
                 // 计算剩余时间 = deadline - now，若 <=0 则立即超时
-                let mut sec = deadline.tv_sec - now.tv_sec;
-                let mut nsec = deadline.tv_nsec - now.tv_nsec;
-                if nsec < 0 {
-                    nsec += 1_000_000_000;
-                    sec -= 1;
-                }
-                if sec < 0 || (sec == 0 && nsec == 0) {
+                let remaining = deadline.saturating_sub_timespec(&now);
+                if remaining.is_empty() {
                     return Err(SystemError::ETIMEDOUT);
                 }
 
-                Some(PosixTimeSpec {
-                    tv_sec: sec,
-                    tv_nsec: nsec,
-                })
+                Some(remaining)
             } else {
                 None
             };
@@ -272,11 +248,11 @@ pub(super) fn do_futex(
             );
         }
         FutexArg::FUTEX_LOCK_PI => {
-            return Futex::futex_lock_pi(uaddr, flags, timeout);
+            return Futex::futex_lock_pi(uaddr, flags | FutexFlag::FLAGS_CLOCKRT, timeout);
         }
         FutexArg::FUTEX_LOCK_PI2 => {
-            // FUTEX_LOCK_PI2 与 FUTEX_LOCK_PI 行为相同，只是支持 FUTEX_CLOCK_REALTIME
-            // 超时处理已在上层完成，这里直接调用 futex_lock_pi
+            // PI2 defaults to absolute CLOCK_MONOTONIC; the explicit flag
+            // selects absolute CLOCK_REALTIME. LOCK_PI always uses realtime.
             return Futex::futex_lock_pi(uaddr, flags, timeout);
         }
         FutexArg::FUTEX_UNLOCK_PI => {
@@ -285,11 +261,8 @@ pub(super) fn do_futex(
         FutexArg::FUTEX_TRYLOCK_PI => {
             return Futex::futex_trylock_pi(uaddr, flags);
         }
-        FutexArg::FUTEX_WAIT_REQUEUE_PI => {
-            todo!()
-        }
-        FutexArg::FUTEX_CMP_REQUEUE_PI => {
-            todo!()
+        FutexArg::FUTEX_WAIT_REQUEUE_PI | FutexArg::FUTEX_CMP_REQUEUE_PI => {
+            Err(SystemError::ENOSYS)
         }
         _ => {
             return Err(SystemError::ENOSYS);

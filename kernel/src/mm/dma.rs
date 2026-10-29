@@ -1,16 +1,30 @@
 use alloc::vec::Vec;
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+use alloc::{format, string::String};
 use core::ptr::NonNull;
+use system_error::SystemError;
 
-use crate::arch::mm::kernel_page_flags;
 use crate::arch::MMArch;
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+use crate::libs::mutex::Mutex;
 use crate::libs::spinlock::SpinLock;
-use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::EntryFlags;
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+use crate::mm::allocator::buddy::deterministic_buddy_selftest;
 use crate::mm::{
     allocator::page_frame::{
-        allocate_page_frames, deallocate_page_frames, PageFrameCount, PhysPageFrame,
+        allocate_page_frames, allocate_page_frames_below, deallocate_page_frames, PageFrameCount,
+        PhysPageFrame,
     },
-    MemoryManagementArch, PhysAddr, VirtAddr,
+    MemoryManagementArch, PhysAddr,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +42,27 @@ pub enum DmaCachePolicy {
     Cached,
 }
 
+/// Permission for bounded reclaim and synchronous compaction after a failed allocation.
+/// The caller must be in a sleepable task, outside MM, page/cache, allocator and
+/// device locks. This permission never applies to streaming share/bounce paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DmaCompaction {
+    #[default]
+    Disabled,
+    /// Recover only within this call's bounded synchronous budget.
+    Allowed,
+    /// Also authorize one background round after a real high-order fragmented
+    /// failure. This is best effort work, not an asynchronous allocation promise.
+    DirectAndBackground,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DmaCompaction {
+    fn direct_allowed(self) -> bool {
+        matches!(self, Self::Allowed | Self::DirectAndBackground)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct DmaAllocOptions {
@@ -36,16 +71,18 @@ pub struct DmaAllocOptions {
     pub zeroed: bool,
     pub dma_mask: Option<u64>,
     pub use_pool: bool,
+    pub compaction: DmaCompaction,
 }
 
 impl Default for DmaAllocOptions {
     fn default() -> Self {
         Self {
             direction: DmaDirection::Bidirectional,
-            cache_policy: DmaCachePolicy::Uncached,
+            cache_policy: DmaCachePolicy::Cached,
             zeroed: true,
             dma_mask: None,
             use_pool: true,
+            compaction: DmaCompaction::Disabled,
         }
     }
 }
@@ -63,9 +100,7 @@ pub struct DmaBuffer {
     vaddr: NonNull<u8>,
     len: usize,
     page_count: PageFrameCount,
-    #[allow(dead_code)]
-    cache_policy: DmaCachePolicy,
-    pool_pages: Option<usize>,
+    pool_key: Option<DmaPoolKey>,
 }
 
 unsafe impl Send for DmaBuffer {}
@@ -73,12 +108,23 @@ unsafe impl Sync for DmaBuffer {}
 
 impl DmaBuffer {
     pub fn alloc_bytes(size: usize, options: DmaAllocOptions) -> Self {
-        dma_allocator().alloc_bytes(size, options)
+        Self::try_alloc_bytes(size, options).expect("dma alloc bytes failed")
+    }
+
+    /// Allocate a physically contiguous DMA buffer without turning memory
+    /// pressure or invalid sizing into a kernel panic.
+    pub fn try_alloc_bytes(size: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
+        dma_allocator().try_alloc_bytes(size, options)
     }
 
     #[allow(dead_code)]
     pub fn alloc_pages(pages: usize, options: DmaAllocOptions) -> Self {
-        dma_allocator().alloc_pages(pages, options)
+        Self::try_alloc_pages(pages, options).expect("dma alloc pages failed")
+    }
+
+    #[allow(dead_code)]
+    pub fn try_alloc_pages(pages: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
+        dma_allocator().try_alloc_pages(pages, options)
     }
 
     #[allow(dead_code)]
@@ -115,18 +161,20 @@ impl DmaBuffer {
 
 impl Drop for DmaBuffer {
     fn drop(&mut self) {
-        if self.pool_pages.is_some()
-            && dma_allocator().return_to_pool(DmaRawAllocation {
-                paddr: PhysAddr::new(self.paddr),
-                vaddr: self.vaddr,
-                page_count: self.page_count,
-            })
-        {
-            return;
-        }
-        unsafe {
-            dma_dealloc_pages_raw(self.paddr, self.vaddr, self.page_count.data());
-        }
+        let raw = DmaRawAllocation {
+            paddr: PhysAddr::new(self.paddr),
+            vaddr: self.vaddr,
+            page_count: self.page_count,
+        };
+        let raw = if let Some(key) = self.pool_key {
+            match dma_allocator().return_to_pool(key, raw) {
+                Ok(()) => return,
+                Err(raw) => raw,
+            }
+        } else {
+            raw
+        };
+        unsafe { dma_dealloc_pages_raw(raw.paddr.data(), raw.vaddr, raw.page_count.data()) };
     }
 }
 
@@ -139,31 +187,98 @@ struct DmaRawAllocation {
 
 unsafe impl Send for DmaRawAllocation {}
 
+enum RawAllocationFailure {
+    System(SystemError),
+    #[cfg(target_arch = "x86_64")]
+    Frame(super::allocator::buddy::DmaAllocationFailure),
+}
+impl RawAllocationFailure {
+    fn errno(&self) -> SystemError {
+        match self {
+            Self::System(error) => error.clone(),
+            #[cfg(target_arch = "x86_64")]
+            Self::Frame(_) => SystemError::ENOMEM,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmaPoolDomain {
+    Dma32,
+    Unrestricted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DmaPoolKey {
+    pages: usize,
+    domain: DmaPoolDomain,
+}
+
 struct DmaPool {
     pages: usize,
     max: usize,
-    free_list: Vec<DmaRawAllocation>,
+    dma32_free_list: Vec<DmaRawAllocation>,
+    unrestricted_free_list: Vec<DmaRawAllocation>,
 }
 
 impl DmaPool {
     fn new(pages: usize, max: usize) -> Self {
+        let mut dma32_free_list = Vec::new();
+        let mut unrestricted_free_list = Vec::new();
+        // Pool metadata is optional. If reservation fails, put() observes the
+        // zero capacity and the allocator safely falls back to the buddy path.
+        let _ = dma32_free_list.try_reserve_exact(max);
+        let _ = unrestricted_free_list.try_reserve_exact(max);
         Self {
             pages,
             max,
-            free_list: Vec::new(),
+            dma32_free_list,
+            unrestricted_free_list,
         }
     }
 
-    fn take(&mut self) -> Option<DmaRawAllocation> {
-        self.free_list.pop()
+    fn take_fitting(
+        free_list: &mut Vec<DmaRawAllocation>,
+        mask: Option<u64>,
+    ) -> Option<DmaRawAllocation> {
+        let index = free_list
+            .iter()
+            .rposition(|alloc| allocation_fits_mask(alloc, mask))?;
+        Some(free_list.swap_remove(index))
     }
 
-    fn put(&mut self, alloc: DmaRawAllocation) -> bool {
-        if self.free_list.len() >= self.max {
-            return false;
+    fn take(&mut self, domain: DmaPoolDomain, mask: Option<u64>) -> Option<DmaRawAllocation> {
+        let free_list = match domain {
+            DmaPoolDomain::Dma32 => &mut self.dma32_free_list,
+            DmaPoolDomain::Unrestricted => &mut self.unrestricted_free_list,
+        };
+        Self::take_fitting(free_list, mask)
+    }
+
+    fn put(
+        &mut self,
+        domain: DmaPoolDomain,
+        alloc: DmaRawAllocation,
+    ) -> Result<(), DmaRawAllocation> {
+        if alloc.page_count.data() != self.pages {
+            return Err(alloc);
         }
-        self.free_list.push(alloc);
-        true
+        let Some(end) = allocation_end(&alloc) else {
+            return Err(alloc);
+        };
+        let free_list = match domain {
+            DmaPoolDomain::Dma32 if usize::BITS > 32 && end > u32::MAX as usize => {
+                return Err(alloc)
+            }
+            DmaPoolDomain::Dma32 => &mut self.dma32_free_list,
+            DmaPoolDomain::Unrestricted => &mut self.unrestricted_free_list,
+        };
+        if free_list.len() >= self.max || free_list.len() == free_list.capacity() {
+            return Err(alloc);
+        }
+        debug_assert!(free_list.len() < free_list.capacity());
+        free_list.push(alloc);
+        Ok(())
     }
 }
 
@@ -175,79 +290,240 @@ impl DmaAllocator {
     fn new() -> Self {
         let mut pools = Vec::new();
         for pages in DMA_POOL_CLASSES {
-            pools.push(SpinLock::new(DmaPool::new(*pages, DMA_POOL_MAX_PER_CLASS)));
+            pools.push(SpinLock::new(DmaPool::new(*pages, DMA_POOL_MAX_PER_DOMAIN)));
         }
         Self { pools }
     }
 
-    pub fn alloc_bytes(&self, size: usize, options: DmaAllocOptions) -> DmaBuffer {
-        let page_count = page_count_from_bytes(size);
-        self.alloc_with_pages(page_count, size, options)
+    pub fn try_alloc_bytes(
+        &self,
+        size: usize,
+        options: DmaAllocOptions,
+    ) -> Result<DmaBuffer, SystemError> {
+        let page_count = page_count_from_bytes(size).ok_or(SystemError::ENOMEM)?;
+        self.try_alloc_with_pages(page_count, size, options)
     }
 
     #[allow(dead_code)]
-    pub fn alloc_pages(&self, pages: usize, options: DmaAllocOptions) -> DmaBuffer {
-        let page_count = page_count_from_pages(pages);
-        let size = pages * MMArch::PAGE_SIZE;
-        self.alloc_with_pages(page_count, size, options)
+    pub fn try_alloc_pages(
+        &self,
+        pages: usize,
+        options: DmaAllocOptions,
+    ) -> Result<DmaBuffer, SystemError> {
+        let page_count = page_count_from_pages(pages).ok_or(SystemError::ENOMEM)?;
+        let size = pages
+            .checked_mul(MMArch::PAGE_SIZE)
+            .ok_or(SystemError::ENOMEM)?;
+        self.try_alloc_with_pages(page_count, size, options)
     }
 
-    fn alloc_with_pages(
+    fn try_alloc_with_pages(
         &self,
         page_count: PageFrameCount,
         len: usize,
         options: DmaAllocOptions,
-    ) -> DmaBuffer {
-        let pool_pages = self.pool_pages_for(page_count.data(), options.use_pool);
-        let raw = if let Some(pages) = pool_pages {
-            if let Some(raw) = self.take_from_pool(pages) {
-                if options.zeroed {
-                    self.zero_raw(&raw);
-                }
-                raw
-            } else {
-                self.alloc_raw(page_count, &options)
-            }
-        } else {
-            self.alloc_raw(page_count, &options)
-        };
-        DmaBuffer {
+    ) -> Result<DmaBuffer, SystemError> {
+        // DragonOS currently supports coherent DMA mappings only. Keep RAM in
+        // its normal write-back direct mapping, as Linux does for coherent
+        // devices; changing PAT/cacheability requires architecture-specific
+        // cache maintenance and cannot be emulated by rewriting PTE flags.
+        validate_cache_policy(options.cache_policy)?;
+        let pool_key = Self::pool_key_for(page_count.data(), options.use_pool, options.dma_mask);
+        let raw = self.try_alloc_from_pool_or_raw(page_count, pool_key, &options)?;
+        Ok(DmaBuffer {
             paddr: raw.paddr.data(),
             vaddr: raw.vaddr,
             len,
             page_count: raw.page_count,
-            cache_policy: options.cache_policy,
-            pool_pages,
-        }
+            pool_key,
+        })
     }
 
-    fn alloc_raw(&self, page_count: PageFrameCount, options: &DmaAllocOptions) -> DmaRawAllocation {
-        let (paddr, count) = unsafe { allocate_page_frames(page_count) }
-            .unwrap_or_else(|| panic!("dma alloc pages failed"));
-        let virt = unsafe { MMArch::phys_2_virt(paddr).unwrap() };
-        if options.zeroed {
-            unsafe {
-                core::ptr::write_bytes(virt.data() as *mut u8, 0, count.data() * MMArch::PAGE_SIZE);
+    fn try_alloc_from_pool_or_raw(
+        &self,
+        page_count: PageFrameCount,
+        pool_key: Option<DmaPoolKey>,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        if let Some(key) = pool_key {
+            if let Some(raw) = self.take_from_pool(key, options.dma_mask) {
+                if options.zeroed {
+                    self.zero_raw(&raw);
+                }
+                return Ok(raw);
             }
         }
-        let dma_flags: EntryFlags<MMArch> = match options.cache_policy {
-            DmaCachePolicy::Uncached => EntryFlags::mmio_flags(),
-            DmaCachePolicy::WriteCombined => EntryFlags::mmio_flags(),
-            DmaCachePolicy::Cached => EntryFlags::mmio_flags(),
+        let failure = match self.try_alloc_raw_attempt(page_count, options) {
+            Ok(raw) => return Ok(raw),
+            Err(failure) => failure,
         };
-        let mut kernel_mapper = KernelMapper::lock();
-        let kernel_mapper = kernel_mapper.as_mut().unwrap();
-        let flusher = unsafe {
-            kernel_mapper
-                .remap(virt, dma_flags)
-                .expect("dma remap failed")
-        };
-        flusher.flush();
-        DmaRawAllocation {
-            paddr,
-            vaddr: NonNull::new(virt.data() as *mut u8).unwrap(),
-            page_count: count,
+        // Exhaust every compatible cache before moving any pages. In
+        // particular preserve the one-way wide -> DMA32 cache fallback.
+        if failure.errno() == SystemError::ENOMEM
+            && pool_key.is_some_and(|key| key.domain == DmaPoolDomain::Dma32)
+        {
+            let key = DmaPoolKey {
+                pages: page_count.data(),
+                domain: DmaPoolDomain::Unrestricted,
+            };
+            if let Some(raw) = self.take_from_pool(key, options.dma_mask) {
+                if options.zeroed {
+                    self.zero_raw(&raw);
+                }
+                return Ok(raw);
+            }
         }
+        #[cfg(target_arch = "x86_64")]
+        if options.compaction.direct_allowed() && super::compaction::recovery::context_allowed() {
+            let mut failure = failure;
+            // This deadline is never renewed by reclamation or migration progress.
+            // No pool, recovery-service or allocator lock crosses the reclaim scan.
+            let deadline = crate::time::timer::next_n_us_timer_jiffies(50_000);
+            let max = PhysAddr::new(
+                options
+                    .dma_mask
+                    .and_then(|mask| usize::try_from(mask).ok())
+                    .unwrap_or(usize::MAX),
+            );
+            if let RawAllocationFailure::Frame(evidence) = &failure {
+                use super::allocator::buddy::AllocationFailure;
+                if matches!(
+                    evidence.reason,
+                    AllocationFailure::Capacity
+                        | AllocationFailure::Reserve
+                        | AllocationFailure::ZoneLimit
+                        | AllocationFailure::AddressLimit
+                ) {
+                    // Only complete pages reachable through this DMA mask may
+                    // satisfy the reclaim goal. The next typed attempt still
+                    // independently proves the requested zone's free capacity.
+                    let zones = super::allocator::watermark::ZonePressureSnapshot {
+                        dma32_deficit: 1,
+                        normal_deficit: usize::from(max.data() > u32::MAX as usize),
+                    };
+                    if crate::time::timer::clock() >= deadline {
+                        return Err(failure.errno());
+                    }
+                    let _ = super::page::PageReclaimer::try_shrink_global_below(
+                        page_count,
+                        4096,
+                        Some(zones),
+                        max,
+                    );
+                    if crate::time::timer::clock() >= deadline {
+                        return Err(failure.errno());
+                    }
+                    failure = match self.try_alloc_raw_attempt(page_count, options) {
+                        Ok(raw) => return Ok(raw),
+                        Err(failure) => failure,
+                    };
+                }
+            }
+            if let RawAllocationFailure::Frame(evidence) = &failure {
+                if let Some(zone) = evidence.zone.filter(|_| {
+                    evidence.reason == super::allocator::buddy::AllocationFailure::Fragmentation
+                }) {
+                    let order = page_count.data().trailing_zeros() as usize;
+                    if let Ok(run) =
+                        super::compaction::recovery::allocate(order, max, zone, deadline)
+                    {
+                        let (physical, count) = run.into_raw_parts();
+                        let raw = self.finish_raw(physical, count, options)?;
+                        super::compaction::background::observe_allocation(count, max, physical);
+                        return Ok(raw);
+                    }
+                    // The synchronous attempt consumed only its own budget.
+                    // A real fragmented failure authorizes one background round.
+                    if options.compaction == DmaCompaction::DirectAndBackground {
+                        super::compaction::background::request(order, max, zone);
+                    }
+                }
+            }
+            return Err(failure.errno());
+        }
+        Err(failure.errno())
+    }
+
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
+    fn try_alloc_raw(
+        &self,
+        page_count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        self.try_alloc_raw_attempt(page_count, options)
+            .map_err(|error| error.errno())
+    }
+
+    fn try_alloc_raw_attempt(
+        &self,
+        page_count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, RawAllocationFailure> {
+        validate_cache_policy(options.cache_policy).map_err(RawAllocationFailure::System)?;
+        #[cfg(target_arch = "x86_64")]
+        if options.compaction.direct_allowed() {
+            let max = PhysAddr::new(
+                options
+                    .dma_mask
+                    .and_then(|mask| usize::try_from(mask).ok())
+                    .unwrap_or(usize::MAX),
+            );
+            let level = crate::mm::allocator::reserve::kernel_level();
+            let (physical, count) = crate::arch::mm::LockedFrameAllocator::with_buddy(|buddy| {
+                buddy.try_allocate_for_dma_at_level(page_count, max, level)
+            })
+            .ok_or(RawAllocationFailure::System(SystemError::ENOMEM))?
+            .map_err(RawAllocationFailure::Frame)?;
+            let raw = self
+                .finish_raw(physical, count, options)
+                .map_err(RawAllocationFailure::System)?;
+            if level == crate::mm::allocator::reserve::ReserveLevel::Kernel {
+                super::compaction::background::observe_allocation(count, max, physical);
+            }
+            return Ok(raw);
+        }
+        let allocation = if let Some(mask) = options.dma_mask {
+            let max = usize::try_from(mask).unwrap_or(usize::MAX);
+            unsafe { allocate_page_frames_below(page_count, PhysAddr::new(max)) }
+        } else {
+            unsafe { allocate_page_frames(page_count) }
+        };
+        let (paddr, count) = allocation.ok_or(RawAllocationFailure::System(SystemError::ENOMEM))?;
+        self.finish_raw(paddr, count, options)
+            .map_err(RawAllocationFailure::System)
+    }
+
+    // Both ordinary allocation and compaction transfer exclusive frame
+    // ownership here. An invalid mapping or bound releases exactly that run.
+    fn finish_raw(
+        &self,
+        paddr: PhysAddr,
+        count: PageFrameCount,
+        options: &DmaAllocOptions,
+    ) -> Result<DmaRawAllocation, SystemError> {
+        let mapping = unsafe { MMArch::phys_2_virt(paddr) };
+        let end = count
+            .data()
+            .checked_mul(MMArch::PAGE_SIZE)
+            .and_then(|bytes| paddr.data().checked_add(bytes.checked_sub(1)?));
+        if mapping.is_none()
+            || end.is_none_or(|end| options.dma_mask.is_some_and(|mask| end as u64 > mask))
+        {
+            unsafe { deallocate_page_frames(PhysPageFrame::new(paddr), count) };
+            return Err(SystemError::ENOMEM);
+        }
+        let raw = DmaRawAllocation {
+            paddr,
+            vaddr: NonNull::new(mapping.unwrap().data() as *mut u8).unwrap(),
+            page_count: count,
+        };
+        if options.zeroed {
+            self.zero_raw(&raw);
+        }
+        Ok(raw)
     }
 
     fn zero_raw(&self, alloc: &DmaRawAllocation) {
@@ -260,78 +536,393 @@ impl DmaAllocator {
         }
     }
 
-    fn pool_pages_for(&self, pages: usize, use_pool: bool) -> Option<usize> {
+    fn pool_key_for(pages: usize, use_pool: bool, mask: Option<u64>) -> Option<DmaPoolKey> {
         if !use_pool {
             return None;
         }
         for class in DMA_POOL_CLASSES {
             if pages == *class {
-                return Some(*class);
+                let domain = if usize::BITS > 32 && mask.is_some_and(|mask| mask <= u32::MAX as u64)
+                {
+                    DmaPoolDomain::Dma32
+                } else {
+                    DmaPoolDomain::Unrestricted
+                };
+                return Some(DmaPoolKey {
+                    pages: *class,
+                    domain,
+                });
             }
         }
         None
     }
 
-    fn take_from_pool(&self, pages: usize) -> Option<DmaRawAllocation> {
-        for pool in &self.pools {
-            let mut guard = pool.lock_irqsave();
-            if guard.pages == pages {
-                return guard.take();
-            }
-        }
-        None
+    fn pool_for_pages(&self, pages: usize) -> Option<&SpinLock<DmaPool>> {
+        let index = DMA_POOL_CLASSES.iter().position(|class| *class == pages)?;
+        self.pools.get(index)
     }
 
-    fn return_to_pool(&self, alloc: DmaRawAllocation) -> bool {
-        for pool in &self.pools {
-            let mut guard = pool.lock_irqsave();
-            if guard.pages == alloc.page_count.data() {
-                return guard.put(alloc);
-            }
-        }
-        false
+    fn take_from_pool(&self, key: DmaPoolKey, mask: Option<u64>) -> Option<DmaRawAllocation> {
+        self.pool_for_pages(key.pages)?
+            .lock_irqsave()
+            .take(key.domain, mask)
+    }
+
+    fn return_to_pool(
+        &self,
+        key: DmaPoolKey,
+        alloc: DmaRawAllocation,
+    ) -> Result<(), DmaRawAllocation> {
+        let Some(pool) = self.pool_for_pages(key.pages) else {
+            return Err(alloc);
+        };
+        pool.lock_irqsave().put(key.domain, alloc)
     }
 }
 
-pub fn dma_alloc_pages_raw(pages: usize, mut options: DmaAllocOptions) -> (usize, NonNull<u8>) {
+fn allocation_end(allocation: &DmaRawAllocation) -> Option<usize> {
+    let bytes = allocation
+        .page_count
+        .data()
+        .checked_mul(MMArch::PAGE_SIZE)?;
+    allocation.paddr.data().checked_add(bytes.checked_sub(1)?)
+}
+
+fn allocation_fits_mask(allocation: &DmaRawAllocation, mask: Option<u64>) -> bool {
+    let Some(end) = allocation_end(allocation).and_then(|end| u64::try_from(end).ok()) else {
+        return false;
+    };
+    mask.is_none_or(|mask| end <= mask)
+}
+
+pub fn dma_alloc_pages_raw(pages: usize, options: DmaAllocOptions) -> (usize, NonNull<u8>) {
+    try_dma_alloc_pages_raw(pages, options).expect("dma alloc pages failed")
+}
+
+/// Fallible raw ownership transfer for HALs whose queue creation returns errors.
+/// On success the caller must pair it with `dma_dealloc_pages_raw` using the
+/// original requested pages; both interfaces apply the same power-of-two rounding.
+pub fn try_dma_alloc_pages_raw(
+    pages: usize,
+    mut options: DmaAllocOptions,
+) -> Result<(usize, NonNull<u8>), SystemError> {
     options.use_pool = false;
-    let page_count = page_count_from_pages(pages);
-    let raw = dma_allocator().alloc_raw(page_count, &options);
-    (raw.paddr.data(), raw.vaddr)
+    let page_count = page_count_from_pages(pages).ok_or(SystemError::EINVAL)?;
+    let raw = dma_allocator().try_alloc_from_pool_or_raw(page_count, None, &options)?;
+    Ok((raw.paddr.data(), raw.vaddr))
 }
 
 pub unsafe fn dma_dealloc_pages_raw(paddr: usize, vaddr: NonNull<u8>, pages: usize) -> i32 {
-    let page_count = page_count_from_pages(pages);
-    let vaddr = VirtAddr::new(vaddr.as_ptr() as usize);
-    let mut kernel_mapper = KernelMapper::lock();
-    let kernel_mapper = kernel_mapper.as_mut().unwrap();
-    let flusher = kernel_mapper
-        .remap(vaddr, kernel_page_flags(vaddr))
-        .expect("dma remap failed");
-    flusher.flush();
+    let page_count = page_count_from_pages(pages).expect("invalid dma deallocation page count");
+    debug_assert_eq!(
+        unsafe { MMArch::phys_2_virt(PhysAddr::new(paddr)) }.map(|addr| addr.data()),
+        Some(vaddr.as_ptr() as usize)
+    );
     unsafe {
         deallocate_page_frames(PhysPageFrame::new(PhysAddr::new(paddr)), page_count);
     }
     0
 }
 
-fn page_count_from_pages(pages: usize) -> PageFrameCount {
-    let pages = pages.max(1);
-    PageFrameCount::new(pages.next_power_of_two())
+fn validate_cache_policy(cache_policy: DmaCachePolicy) -> Result<(), SystemError> {
+    if cache_policy == DmaCachePolicy::Cached {
+        Ok(())
+    } else {
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
 }
 
-fn page_count_from_bytes(size: usize) -> PageFrameCount {
+fn page_count_from_pages(pages: usize) -> Option<PageFrameCount> {
+    let pages = pages.max(1);
+    Some(PageFrameCount::new(pages.checked_next_power_of_two()?))
+}
+
+fn page_count_from_bytes(size: usize) -> Option<PageFrameCount> {
     let pages = size.div_ceil(MMArch::PAGE_SIZE).max(1);
     page_count_from_pages(pages)
 }
 
-const DMA_POOL_MAX_PER_CLASS: usize = 64;
+/// Each size class keeps independent bounded caches for DMA32-constrained and
+/// wider requests. On 64-bit systems the combined worst-case cache is 15.5 MiB.
+const DMA_POOL_MAX_PER_DOMAIN: usize = 64;
 const DMA_POOL_CLASSES: &[usize] = &[1, 2, 4, 8, 16];
 
 lazy_static! {
     static ref DMA_ALLOCATOR: DmaAllocator = DmaAllocator::new();
 }
 
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+lazy_static! {
+    static ref DMA_SELFTEST_LOCK: Mutex<()> = Mutex::new(());
+}
+
 fn dma_allocator() -> &'static DmaAllocator {
     &DMA_ALLOCATOR
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn release_raw(raw: DmaRawAllocation) {
+    unsafe {
+        deallocate_page_frames(PhysPageFrame::new(raw.paddr), raw.page_count);
+    }
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn raw_fits_mask(raw: &DmaRawAllocation, mask: u64) -> bool {
+    allocation_fits_mask(raw, Some(mask))
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn selftest_bounded_orders() -> bool {
+    let options = DmaAllocOptions {
+        zeroed: false,
+        dma_mask: Some(u32::MAX as u64),
+        use_pool: false,
+        ..Default::default()
+    };
+
+    for pages in [1, 2, 4, 8, 16] {
+        let Ok(raw) = dma_allocator().try_alloc_raw(PageFrameCount::new(pages), &options) else {
+            return false;
+        };
+        let ok = raw.page_count.data() == pages && raw_fits_mask(&raw, u32::MAX as u64);
+        release_raw(raw);
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn selftest_raw(paddr: usize, pages: usize) -> DmaRawAllocation {
+    DmaRawAllocation {
+        paddr: PhysAddr::new(paddr),
+        vaddr: NonNull::dangling(),
+        page_count: PageFrameCount::new(pages),
+    }
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn selftest_pool_mask_separation() -> bool {
+    let mut pool = DmaPool::new(1, DMA_POOL_MAX_PER_DOMAIN);
+
+    // A narrow mask must skip, but not discard, an incompatible DMA32 entry.
+    if pool
+        .put(DmaPoolDomain::Dma32, selftest_raw(0x1000, 1))
+        .is_err()
+        || pool
+            .put(DmaPoolDomain::Dma32, selftest_raw(0x2000, 1))
+            .is_err()
+    {
+        return false;
+    }
+    let narrow = pool.take(DmaPoolDomain::Dma32, Some(0x1fff));
+    let narrow_preserved = pool.dma32_free_list.len() == 1;
+    let remaining_dma32 = pool.take(DmaPoolDomain::Dma32, Some(u32::MAX as u64));
+
+    // A finite mask above 32 bits still needs exact range filtering inside
+    // the unrestricted domain.
+    let forty_bit_mask = (1u64 << 40) - 1;
+    if pool
+        .put(DmaPoolDomain::Unrestricted, selftest_raw(1usize << 32, 1))
+        .is_err()
+        || pool
+            .put(DmaPoolDomain::Unrestricted, selftest_raw(1usize << 40, 1))
+            .is_err()
+    {
+        return false;
+    }
+    let forty_bit = pool.take(DmaPoolDomain::Unrestricted, Some(forty_bit_mask));
+    let forty_bit_preserved = pool.unrestricted_free_list.len() == 1;
+    let remaining_unrestricted = pool.take(DmaPoolDomain::Unrestricted, None);
+
+    // DMA32 admission uses the inclusive end of the whole allocation, not
+    // just its first page. Arithmetic overflow is never admitted to a pool.
+    let mut two_page_pool = DmaPool::new(2, DMA_POOL_MAX_PER_DOMAIN);
+    let crosses_dma32 = u32::MAX as usize - MMArch::PAGE_SIZE + 1;
+    let crossing_rejected_by_dma32 = two_page_pool
+        .put(DmaPoolDomain::Dma32, selftest_raw(crosses_dma32, 2))
+        .is_err();
+    let crossing_put =
+        two_page_pool.put(DmaPoolDomain::Unrestricted, selftest_raw(crosses_dma32, 2));
+    let crossing_available_unrestricted = two_page_pool
+        .take(DmaPoolDomain::Unrestricted, None)
+        .is_some();
+    let overflow_rejected = two_page_pool
+        .put(
+            DmaPoolDomain::Unrestricted,
+            selftest_raw(usize::MAX - MMArch::PAGE_SIZE + 1, 2),
+        )
+        .is_err();
+
+    narrow.is_some_and(|raw| raw.paddr.data() == 0x1000)
+        && narrow_preserved
+        && remaining_dma32.is_some_and(|raw| raw.paddr.data() == 0x2000)
+        && forty_bit.is_some_and(|raw| raw.paddr.data() == 1usize << 32)
+        && forty_bit_preserved
+        && remaining_unrestricted.is_some_and(|raw| raw.paddr.data() == 1usize << 40)
+        && crossing_put.is_ok()
+        && crossing_rejected_by_dma32
+        && crossing_available_unrestricted
+        && overflow_rejected
+}
+
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+fn selftest_pool_domain_separation() -> bool {
+    let key_selection_ok = DmaAllocator::pool_key_for(1, true, Some(u32::MAX as u64))
+        == Some(DmaPoolKey {
+            pages: 1,
+            domain: DmaPoolDomain::Dma32,
+        })
+        && DmaAllocator::pool_key_for(1, true, Some((1u64 << 40) - 1))
+            == Some(DmaPoolKey {
+                pages: 1,
+                domain: DmaPoolDomain::Unrestricted,
+            })
+        && DmaAllocator::pool_key_for(1, true, None)
+            == Some(DmaPoolKey {
+                pages: 1,
+                domain: DmaPoolDomain::Unrestricted,
+            })
+        && DmaAllocator::pool_key_for(1, true, Some(u64::MAX))
+            == Some(DmaPoolKey {
+                pages: 1,
+                domain: DmaPoolDomain::Unrestricted,
+            })
+        && DmaAllocator::pool_key_for(3, true, None).is_none()
+        && DmaAllocator::pool_key_for(1, false, None).is_none();
+    if !key_selection_ok {
+        return false;
+    }
+
+    let mut pool = DmaPool::new(1, 1);
+    if pool
+        .put(DmaPoolDomain::Dma32, selftest_raw(0x1000, 1))
+        .is_err()
+        || pool
+            .put(DmaPoolDomain::Unrestricted, selftest_raw(1usize << 32, 1))
+            .is_err()
+    {
+        return false;
+    }
+
+    let low = pool.take(DmaPoolDomain::Dma32, Some(u32::MAX as u64));
+    let high_untouched = pool.unrestricted_free_list.len() == 1;
+    let high = pool.take(DmaPoolDomain::Unrestricted, Some(u64::MAX));
+
+    // A wide request may receive low physical memory on a small system. It
+    // remains reusable in its logical domain without becoming visible to a
+    // DMA32 request.
+    if pool
+        .put(DmaPoolDomain::Unrestricted, selftest_raw(0x2000, 1))
+        .is_err()
+    {
+        return false;
+    }
+    let dma32_did_not_cross = pool
+        .take(DmaPoolDomain::Dma32, Some(u32::MAX as u64))
+        .is_none();
+    let low_wide_reused = pool.take(DmaPoolDomain::Unrestricted, None);
+
+    let per_domain_capacity = pool
+        .put(DmaPoolDomain::Dma32, selftest_raw(0x3000, 1))
+        .is_ok()
+        && pool
+            .put(DmaPoolDomain::Dma32, selftest_raw(0x4000, 1))
+            .is_err()
+        && pool
+            .put(DmaPoolDomain::Unrestricted, selftest_raw(0x5000, 1))
+            .is_ok()
+        && pool
+            .put(DmaPoolDomain::Unrestricted, selftest_raw(0x6000, 1))
+            .is_err();
+
+    // Under DMA32 pressure, a compatible low allocation may migrate out of
+    // the wide-request cache without discarding an incompatible high entry.
+    let mut migration_pool = DmaPool::new(1, DMA_POOL_MAX_PER_DOMAIN);
+    let migration_setup = migration_pool
+        .put(DmaPoolDomain::Unrestricted, selftest_raw(0x7000, 1))
+        .is_ok()
+        && migration_pool
+            .put(DmaPoolDomain::Unrestricted, selftest_raw(1usize << 32, 1))
+            .is_ok();
+    let migrated = migration_pool.take(DmaPoolDomain::Unrestricted, Some(u32::MAX as u64));
+    let incompatible_preserved = migration_pool.unrestricted_free_list.len() == 1;
+    let migration_returned = migrated
+        .map(|raw| migration_pool.put(DmaPoolDomain::Dma32, raw).is_ok())
+        .unwrap_or(false);
+    let migrated_reused = migration_pool
+        .take(DmaPoolDomain::Dma32, Some(u32::MAX as u64))
+        .is_some_and(|raw| raw.paddr.data() == 0x7000);
+
+    low.is_some_and(|raw| raw.paddr.data() == 0x1000)
+        && high_untouched
+        && high.is_some_and(|raw| raw.paddr.data() == 1usize << 32)
+        && dma32_did_not_cross
+        && low_wide_reused.is_some_and(|raw| raw.paddr.data() == 0x2000)
+        && per_domain_capacity
+        && migration_setup
+        && incompatible_preserved
+        && migration_returned
+        && migrated_reused
+}
+
+/// Run allocator checks against the live buddy allocator.  Every successful
+/// allocation is released before the function returns, so reading the report
+/// does not reserve memory or grow the normal DMA pools.
+#[cfg(all(
+    feature = "mm_selftest",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub(crate) fn dma_allocator_selftest_report() -> String {
+    let _guard = DMA_SELFTEST_LOCK.lock();
+    let (
+        bounded_candidate_selection,
+        split_free_merge,
+        fragmented_arena,
+        dma32_zone,
+        metadata_reuse,
+    ) = deterministic_buddy_selftest();
+    let cases = [
+        ("bounded_orders", selftest_bounded_orders()),
+        ("bounded_candidate_selection", bounded_candidate_selection),
+        ("split_free_merge", split_free_merge),
+        ("fragmented_arena", fragmented_arena),
+        ("dma32_zone", dma32_zone),
+        ("metadata_reuse", metadata_reuse),
+        ("pool_mask_separation", selftest_pool_mask_separation()),
+        ("pool_domain_separation", selftest_pool_domain_separation()),
+    ];
+    let failed = cases.iter().filter(|(_, passed)| !passed).count();
+    let mut report = format!("status={}\n", if failed == 0 { "ok" } else { "fail" });
+    for (name, passed) in cases {
+        report.push_str(&format!("{name}={}\n", if passed { "ok" } else { "fail" }));
+    }
+    report.push_str(&format!(
+        "summary_pass={}\nsummary_fail={failed}\n",
+        cases.len() - failed
+    ));
+    report
 }

@@ -1,15 +1,38 @@
 use core::{
     fmt,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::filesystem::fsnotify::{self, FsEvent};
 use alloc::{string::String, sync::Arc, vec::Vec};
 use log::error;
 use system_error::SystemError;
 
+use crate::cgroup::memory::{
+    accounting::KernelByteKind,
+    object_for_task,
+    owned::{AllocatedBox, OwnedBox},
+};
+use crate::mm::allocation::MemoryAllocationError;
+
+mod allocation;
+mod io;
+mod position;
+pub(crate) mod selftest;
+pub(crate) use allocation::PreparedFile;
+
 use super::{
-    append_lock::with_inode_append_lock, mount::MountFSInode, utils::should_remove_sgid, FileType,
-    IndexNode, InodeId, Metadata, SpecialNodeData,
+    append_lock::{with_inode_append_lock, AppendLockKey},
+    inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+    mount::{
+        writer::{is_special_file_type, MountWriteGuard},
+        MountExternalGuard, MountFSInode, MountFlags,
+    },
+    utils::should_remove_sgid,
+    write_access::InodeWriteGuard,
+    DirectoryEntry, FileSystem, FileType, IndexNode, InodeId, Metadata, PrimaryWriteSource,
+    SetMetadataMask, SpecialNodeData, WritePrivilegeStage,
 };
 use crate::{arch::ipc::signal::Signal, filesystem::vfs::InodeFlags, process::pid::PidPrivateData};
 use crate::{
@@ -20,49 +43,54 @@ use crate::{
         tty::tty_device::TtyFilePrivateData,
     },
     filesystem::{
-        epoll::{event_poll::EPollPrivateData, EPollItem},
+        devfs::{devfs_lookup_device_by_devnum, LockedDevFSInode},
+        epoll::{
+            event_poll::{EPollItemList, EPollPrivateData, EventPoll},
+            EPollItem,
+        },
+        ext4::inode::LockedExt4Inode,
+        fat::fs::LockedFATInode,
         fuse::private_data::FuseFilePrivateData,
         kernfs::callback::KernFilePrivateData,
+        overlayfs::OverlayFilePrivateData,
         page_cache::PageCache,
         procfs::ProcfsFilePrivateData,
+        ramfs::LockedRamFSInode,
+        tmpfs::LockedTmpfsInode,
         vfs::FilldirContext,
     },
     ipc::{kill::send_signal_to_pid, pipe::PipeFsPrivateData},
-    libs::{casting::DowncastArc, mutex::Mutex, rwsem::RwSem},
+    libs::{casting::DowncastArc, errseq::ErrSeqValue, mutex::Mutex, rwsem::RwSem},
     mm::{
         page::PageFlags,
         readahead::{page_cache_async_readahead, page_cache_sync_readahead, FileReadaheadState},
         MemoryManagementArch,
     },
     process::{
-        cred::{CAPFlags, Cred},
+        cred::{CAPFlags, Cred, Kuid},
         namespace::{
             cgroup_namespace::CgroupNamespace, ipc_namespace::IpcNamespace, mnt::MntNamespace,
             net_namespace::NetNamespace, pid_namespace::PidNamespace,
             user_namespace::UserNamespace, uts_namespace::UtsNamespace,
         },
+        pid::{Pid, PidType},
         resource::RLimitID,
         ProcessControlBlock, ProcessManager, RawPid,
     },
+    syscall::user_buffer::UserBuffer,
 };
 
 use crate::filesystem::vfs::InodeMode;
 
 const MAX_LFS_FILESIZE: i64 = i64::MAX;
 static NEXT_OPEN_FILE_ID: AtomicUsize = AtomicUsize::new(1);
-static NEXT_LOCK_OWNER_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[inline]
 fn alloc_open_file_id() -> usize {
     NEXT_OPEN_FILE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[inline]
-fn alloc_lock_owner_id() -> usize {
-    NEXT_LOCK_OWNER_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
+fn canonical_inode_for_file_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn IndexNode> {
     loop {
         match inode.clone().downcast_arc::<MountFSInode>() {
             Some(mnt_inode) => inode = mnt_inode.underlying_inode(),
@@ -71,53 +99,267 @@ fn canonical_inode_for_posix_lock(mut inode: Arc<dyn IndexNode>) -> Arc<dyn Inde
     }
 }
 
+/// Append-lock domain and the owner that keeps its allocation identity alive.
+///
+/// The inode part of the key is deliberately derived from current metadata at
+/// write time. A stacked filesystem may change backing identity during open
+/// (for example, overlayfs copy-up), so caching the complete key here can split
+/// concurrent appenders across two locks.
+#[derive(Clone, Debug)]
+struct AppendLockDomain {
+    fs_instance: usize,
+    fs_owner: Arc<dyn FileSystem>,
+}
+
+impl AppendLockDomain {
+    fn new(fs_owner: Arc<dyn FileSystem>) -> Self {
+        let fs_instance = Arc::as_ptr(&fs_owner) as *const () as usize;
+        Self {
+            fs_instance,
+            fs_owner,
+        }
+    }
+
+    fn key(&self, metadata: &Metadata) -> AppendLockKey {
+        debug_assert_eq!(
+            self.fs_instance,
+            Arc::as_ptr(&self.fs_owner) as *const () as usize
+        );
+        AppendLockKey::new(self.fs_instance, metadata.dev_id, metadata.inode_id)
+    }
+}
+
+fn is_plain_special_inode(inode: &Arc<dyn IndexNode>) -> bool {
+    inode
+        .as_any_ref()
+        .downcast_ref::<LockedDevFSInode>()
+        .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedTmpfsInode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedRamFSInode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedExt4Inode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<LockedFATInode>()
+            .is_some()
+        || inode
+            .as_any_ref()
+            .downcast_ref::<crate::filesystem::overlayfs::OvlInode>()
+            .is_some()
+}
+
+fn resolve_device_special_inode(
+    inode: Arc<dyn IndexNode>,
+    file_type: FileType,
+    path_metadata: Option<&Metadata>,
+) -> Result<Arc<dyn IndexNode>, SystemError> {
+    if !matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
+        return Ok(inode);
+    }
+
+    let raw_dev = match path_metadata {
+        Some(metadata) => metadata.raw_dev,
+        None => inode.metadata()?.raw_dev,
+    };
+    if raw_dev == Default::default() {
+        return Ok(inode);
+    }
+
+    if is_plain_special_inode(&inode) {
+        if let Some(device_inode) = devfs_lookup_device_by_devnum(file_type, raw_dev) {
+            return Ok(device_inode);
+        }
+
+        return Err(SystemError::ENXIO);
+    }
+
+    Ok(inode)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum OffsetUpdate {
     /// Sequential write path: advance file offset by written length.
     Add,
     /// Append path: set file offset to end-of-write (actual_offset + written_len).
     StoreEnd,
+    /// The owner supplied the next position for this operation.
+    SetPosition(usize),
 }
 
 #[derive(Clone, Debug)]
 pub struct FileOwnerSnapshot {
-    pub pcb: Option<Arc<ProcessControlBlock>>,
+    pub pid: Option<Arc<Pid>>,
+    pub pid_type: PidType,
     pub signum: i32,
+    pub uid: Kuid,
+    pub euid: Kuid,
 }
 
 #[derive(Debug)]
 struct FileOwner {
-    pcb: Option<Arc<ProcessControlBlock>>,
+    pid: Option<Arc<Pid>>,
+    pid_type: PidType,
     signum: i32,
+    uid: Kuid,
+    euid: Kuid,
 }
 
 impl FileOwner {
     fn new() -> Self {
         Self {
-            pcb: None,
+            pid: None,
+            pid_type: PidType::TGID,
             signum: 0,
+            uid: Kuid::from(0),
+            euid: Kuid::from(0),
         }
     }
 
     fn snapshot(&self) -> FileOwnerSnapshot {
         FileOwnerSnapshot {
-            pcb: self.pcb.clone(),
+            pid: self.pid.clone(),
+            pid_type: self.pid_type,
             signum: self.signum,
+            uid: self.uid,
+            euid: self.euid,
         }
     }
 }
 
 /// 写操作的配置参数
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct WriteConfig {
+    operation: Option<super::WriteOperation>,
     /// 是否更新文件偏移量
     update_offset: bool,
     /// 偏移量更新方式
     offset_update: OffsetUpdate,
-    /// 文件标志
-    flags: FileFlags,
-    /// inode 标志
-    inode_flags: InodeFlags,
+    /// Only consumed by a delegated write operation.
+    sync_intent: WriteSyncIntent,
+    /// Whether this operation owns the data-content MODIFY notification.
+    emit_data_fsnotify: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WriteCompletionPolicy {
+    operation: Option<super::WriteOperation>,
+    sync_intent: WriteSyncIntent,
+    emit_data_fsnotify: bool,
+}
+
+/// Determines which write operation owns Linux post-write synchronous-I/O
+/// semantics for one open file description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostWriteSyncPolicy {
+    /// The VFS calls the file-level range fsync operation after a positive write.
+    Generic,
+    /// The selected write operation consumes [`WriteSyncIntent`] itself.
+    Delegated,
+    /// The selected Linux write operation does not use `generic_write_sync()`.
+    NotApplicable,
+}
+
+/// Owner-selected direct I/O contract; no implicit fallback for unsupported inodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectIoPolicy {
+    Unsupported,
+    /// Memory files deliberately ignore O_DIRECT.
+    Buffered,
+    /// The ordinary typed operations own direct dispatch (stacking/devices/FUSE).
+    OwnerManaged,
+    /// The inode retains the legacy direct read operation.
+    Native,
+}
+
+/// Per-open behavior selected after the inode has initialized private data.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFileBehavior {
+    pub mode: FileMode,
+    pub post_write_sync: PostWriteSyncPolicy,
+    /// Apply ordinary data-file EOF append and RLIMIT_FSIZE checks.
+    pub data_file_write_checks: bool,
+    pub direct_io: DirectIoPolicy,
+}
+
+impl OpenFileBehavior {
+    fn new(mode: FileMode, file_type: FileType) -> Self {
+        let post_write_sync = match file_type {
+            FileType::File | FileType::BlockDevice => PostWriteSyncPolicy::Generic,
+            _ => PostWriteSyncPolicy::NotApplicable,
+        };
+        Self {
+            mode,
+            post_write_sync,
+            data_file_write_checks: file_type == FileType::File,
+            direct_io: DirectIoPolicy::Unsupported,
+        }
+    }
+}
+
+/// Synchronization requested as part of a delegated write operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteSyncIntent {
+    None,
+    Data,
+    Full,
+}
+
+impl WriteSyncIntent {
+    pub fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Data, _) | (_, Self::Data) => Self::Data,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Data progress survives sync errors, but successful-write effects do not.
+#[derive(Debug)]
+pub struct DelegatedWriteResult {
+    pub written_len: usize,
+    pub sync_result: Result<(), MemoryAllocationError>,
+    pub(crate) sync_range: Option<(usize, usize, bool)>,
+    completion: Option<WriteCompletion>,
+    // Only recoverable sync failures allocate entries for stacking owners.
+    deferred: Vec<(Arc<File>, WriteCompletion)>,
+}
+
+#[derive(Debug)]
+struct WriteCompletion {
+    offset: usize,
+    written_len: usize,
+    config: WriteConfig,
+}
+
+impl DelegatedWriteResult {
+    pub(crate) fn new(written_len: usize, sync_result: Result<(), MemoryAllocationError>) -> Self {
+        Self {
+            written_len,
+            sync_result,
+            sync_range: None,
+            completion: None,
+            deferred: Vec::new(),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    struct WriteRequestFlags: u32 {
+        const HIPRI = 1;
+        const DSYNC = 2;
+        const SYNC = 4;
+        const NOWAIT = 8;
+        const APPEND = 16;
+    }
 }
 /// Namespace fd backing data, typically created from /proc/thread-self/ns/* files.
 #[derive(Clone)]
@@ -160,6 +402,8 @@ impl fmt::Debug for NamespaceFilePrivateData {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum FilePrivateData {
+    /// Cgroup migration uses the opener's credentials and cgroup namespace.
+    Cgroup(crate::filesystem::cgroup2::CgroupOpenState),
     /// 管道文件私有信息
     Pipefs(PipeFsPrivateData),
     /// procfs文件私有信息
@@ -180,8 +424,20 @@ pub enum FilePrivateData {
     SocketCreate,
     /// FUSE file private data.
     Fuse(FuseFilePrivateData),
+    /// OverlayFS per-open backing file private data.
+    Overlayfs(OverlayFilePrivateData),
     /// kernfs/debugfs per-open callback state.
     Kernfs(Option<KernFilePrivateData>),
+    /// timerfd open-file-description flags (notably O_NONBLOCK).
+    TimerFd(FileFlags),
+    /// Shared /proc/kmsg stream flags, captured after its open-time capability check.
+    Kmsg(FileFlags),
+    /// random-device open-file-description flags, shared by dup/fork aliases.
+    Random(FileFlags),
+    /// Configurable filesystem context shared by dup/fork aliases.
+    FsContext(Arc<crate::filesystem::vfs::mount_api::context::FsContext>),
+    /// Ownership of a detached mount tree until it is attached or finally closed.
+    DetachedMount(Arc<crate::filesystem::vfs::mount::DetachedMountTree>),
     /// 不需要文件私有信息
     Unused,
 }
@@ -192,8 +448,89 @@ impl Default for FilePrivateData {
     }
 }
 
+/// Owns filesystem private data for an inode that has already been opened.
+///
+/// The guard stays armed until a [`File`] takes ownership.  This closes the
+/// filesystem handle on every error path between an atomic create/open and
+/// construction of the open file description.
+pub struct PreopenedFile {
+    inode: Arc<dyn IndexNode>,
+    private_data: Option<FilePrivateData>,
+    writer: Option<MountWriteGuard>,
+}
+
+/// Continuous create/open ownership, including backends without atomic open.
+/// The preopened handle owns the writer when present; the fallback keeps it
+/// here until the File performs the separate backend open.
+pub(crate) struct CreatedFile {
+    inode: Arc<dyn IndexNode>,
+    preopened: Option<PreopenedFile>,
+    writer: Option<MountWriteGuard>,
+}
+
+impl CreatedFile {
+    pub(crate) fn new(
+        inode: Arc<dyn IndexNode>,
+        mut preopened: Option<PreopenedFile>,
+        writer: MountWriteGuard,
+    ) -> Self {
+        let writer = if let Some(opened) = preopened.as_mut() {
+            opened.replace_inode(inode.clone());
+            opened.set_writer(writer);
+            None
+        } else {
+            Some(writer)
+        };
+        Self {
+            inode,
+            preopened,
+            writer,
+        }
+    }
+
+    pub(crate) fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+}
+
+impl PreopenedFile {
+    pub fn new(inode: Arc<dyn IndexNode>, private_data: FilePrivateData) -> Self {
+        Self {
+            inode,
+            private_data: Some(private_data),
+            writer: None,
+        }
+    }
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
+    pub fn replace_inode(&mut self, inode: Arc<dyn IndexNode>) {
+        self.inode = inode;
+    }
+
+    pub(crate) fn set_writer(&mut self, writer: MountWriteGuard) {
+        self.writer = Some(writer);
+    }
+
+    fn take_private_data(&mut self) -> FilePrivateData {
+        self.private_data
+            .take()
+            .expect("preopened file private data already consumed")
+    }
+}
+
+impl Drop for PreopenedFile {
+    fn drop(&mut self) {
+        if let Some(data) = self.private_data.take() {
+            let _ = self.inode.close(Mutex::new(data).lock());
+        }
+    }
+}
+
 impl FilePrivateData {
-    pub fn update_flags(&mut self, flags: FileFlags) {
+    pub fn update_flags(&mut self, flags: FileFlags) -> Result<(), SystemError> {
         match self {
             FilePrivateData::Pipefs(pdata) => {
                 pdata.set_flags(flags);
@@ -201,22 +538,26 @@ impl FilePrivateData {
             FilePrivateData::Tty(pdata) => {
                 pdata.flags = flags;
             }
+            FilePrivateData::Fuse(pdata) => {
+                pdata.set_flags(flags);
+            }
+            FilePrivateData::Overlayfs(pdata) => {
+                pdata.set_flags(flags)?;
+            }
+            FilePrivateData::TimerFd(current)
+            | FilePrivateData::Kmsg(current)
+            | FilePrivateData::Random(current) => *current = flags,
             _ => {}
         }
+        Ok(())
     }
+}
 
-    pub fn is_pid(&self) -> bool {
-        if let FilePrivateData::Pid(_data) = self {
-            return true;
-        }
-        false
-    }
-
-    pub fn get_pid(&self) -> i32 {
-        if let FilePrivateData::Pid(data) = self {
-            return data.pid();
-        }
-        -1
+impl File {
+    /// The File pins a particular first-open runtime. Never follow a FIFO
+    /// shell's current active slot after last-close/reopen.
+    pub(crate) fn pipe_runtime(&self) -> Result<Arc<crate::ipc::pipe::PipeRuntime>, SystemError> {
+        crate::ipc::pipe::LockedPipeInode::runtime(&self.private_data.lock())
     }
 }
 
@@ -270,6 +611,10 @@ bitflags! {
         const O_SYNC = Self::__O_SYNC.bits | Self::O_DSYNC.bits;
 
         const O_PATH = 0o10000000;
+
+        /// Raw high bit of O_TMPFILE; Linux also requires O_DIRECTORY.
+        const __O_TMPFILE = 0o20000000;
+        const O_TMPFILE = Self::__O_TMPFILE.bits | Self::O_DIRECTORY.bits;
 
         const O_PATH_FLAGS = Self::O_DIRECTORY.bits|Self::O_NOFOLLOW.bits|Self::O_CLOEXEC.bits|Self::O_PATH.bits;
     }
@@ -443,19 +788,60 @@ impl FileMode {
 /// @brief 抽象文件结构体
 #[derive(Debug)]
 pub struct File {
+    data: OwnedBox<FileData>,
+}
+
+impl Deref for File {
+    type Target = FileData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl DerefMut for File {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+/// Uniquely owned open-description storage. Thin Arc identity/weak handles
+/// retain no charged body after the last strong File owner closes it.
+#[derive(Debug)]
+pub struct FileData {
     /// 唯一 open file description id，用于 flock owner 标识。
     open_file_id: usize,
     inode: Arc<dyn IndexNode>,
+    /// Original pathname inode when open substitutes a runtime special inode
+    /// (for example, a named FIFO's LockedPipeInode).  Linux keeps this
+    /// identity in file->f_path for fsnotify even though I/O uses the special
+    /// inode.  Anonymous objects and ordinary files need no extra reference.
+    fsnotify_path_inode: Option<Arc<dyn IndexNode>>,
+    /// Filesystem selected when this open file description was created.
+    ///
+    /// Mount wrappers retain the mount selected by path lookup. Cache that
+    /// filesystem on the open file description so fd-based I/O and mmap fault
+    /// paths use the same identity directly without cloning an Arc while MM
+    /// locks are held.
+    io_fs: Option<Arc<dyn FileSystem>>,
     /// 对于文件，表示字节偏移量；对于文件夹，表示当前操作的子目录项偏移量
     offset: AtomicUsize,
     /// 文件的打开模式
     flags: RwSem<FileFlags>,
+    /// Serializes fasync registration with lifecycle-driven flag removal.
+    fasync_lock: Mutex<()>,
     /// 文件的访问模式
     mode: RwSem<FileMode>,
     /// 文件类型
     file_type: FileType,
-    /// readdir时候用的，暂存的本次循环中，所有子目录项的名字的数组
-    readdir_subdirs_name: Mutex<Vec<String>>,
+    /// Immutable write-operation policy selected for this open file description.
+    post_write_sync: PostWriteSyncPolicy,
+    data_file_write_checks: bool,
+    direct_io: DirectIoPolicy,
+    /// Pseudo allocation bypasses pathname open admission, as in alloc_file_pseudo.
+    internal_pseudo: bool,
+    /// Serializes current-position operations; also owns directory iteration state.
+    position_state: Mutex<ReaddirState>,
     pub private_data: Mutex<FilePrivateData>,
     /// 文件的凭证
     cred: Arc<Cred>,
@@ -464,13 +850,177 @@ pub struct File {
     /// Stable key for POSIX record locks. Cached at open time to avoid metadata fetch
     /// in close/drop_fd path (which can deadlock with user-space FUSE daemon).
     posix_lock_key: (usize, InodeId),
+    /// Stable identity of the final operation inode, including its mounted device.
+    /// Shared futex lookup must not call filesystem metadata under MM/VMA locks.
+    mapped_file_identity: (usize, InodeId),
+    /// Internal filesystem domain for serializing atomic append operations.
+    /// Only regular, non-O_PATH files retain one; the inode key is resolved
+    /// from current metadata when an append starts.
+    append_lock_domain: Option<AppendLockDomain>,
     /// 预读状态
     ra_state: Mutex<FileReadaheadState>,
     /// 当前 open file description 已观测到的 page cache 写回错误序列。
-    wb_error_seq: AtomicU64,
+    wb_error_seq: Mutex<ErrSeqValue>,
+    /// 当前 open file description 已观测到的 superblock 写回错误序列。
+    sb_error_seq: Mutex<ErrSeqValue>,
+    /// epoll items that reference this open file description.
+    ///
+    /// Linux removes these from their owning epoll instances during `__fput()`
+    /// via `eventpoll_release(file)`.  DragonOS keeps the same lifetime edge
+    /// here so fd numbers can be safely reused after close.
+    epitems: Arc<EPollItemList>,
+    /// Writer admission lasts through close and all shared descriptor/VMA owners.
+    /// Field destruction follows declaration order, after the explicit Drop body.
+    _write_access: Option<Arc<InodeWriteGuard>>,
+    _mount_writer: Option<MountWriteGuard>,
+    /// Unpublished pathname open keeps O_TRUNC writer admission until its
+    /// actual open hook completes, including lock-free admission recovery.
+    pending_truncate_writer: Option<MountWriteGuard>,
+    /// One semantic inode pin per open file description. Duplicated file
+    /// descriptors and VMAs share this `File`, while `O_PATH` still owns it.
+    _inode_retention: InodeRetentionGuard,
+    /// FIFO/device I/O uses another inode, but the original pathname must
+    /// remain live for file->f_path operations until this description closes.
+    _path_inode_retention: Option<InodeRetentionGuard>,
+    /// Release every inode owner before the mount pin can start final shutdown
+    /// and seal the filesystem's eviction queue.
+    _mount_guard: Option<MountExternalGuard>,
+}
+
+#[derive(Debug, Clone)]
+enum ReaddirSnapshot {
+    Typed(Arc<[DirectoryEntry]>),
+    Names(Arc<[String]>),
+}
+
+impl ReaddirSnapshot {
+    fn len(&self) -> usize {
+        match self {
+            Self::Typed(entries) => entries.len(),
+            Self::Names(names) => names.len(),
+        }
+    }
+
+    fn cookie_after(&self, index: usize) -> Option<u64> {
+        match self {
+            Self::Typed(entries) => entries.get(index).map(|entry| entry.next_cookie),
+            Self::Names(names) => (index < names.len()).then(|| (index + 1) as u64),
+        }
+    }
+
+    fn index_after_cookie(&self, cookie: u64) -> usize {
+        match self {
+            Self::Typed(entries) => entries
+                .iter()
+                .position(|entry| entry.next_cookie == cookie)
+                .map_or(entries.len(), |index| index + 1),
+            Self::Names(names) => usize::try_from(cookie)
+                .ok()
+                .filter(|index| *index <= names.len())
+                .unwrap_or(names.len()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReaddirState {
+    snapshot: Option<ReaddirSnapshot>,
+    next_index: usize,
+}
+
+impl ReaddirState {
+    fn resume_after_cookie(&mut self, cookie: u64) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            self.next_index = 0;
+            return;
+        };
+        self.next_index = snapshot.index_after_cookie(cookie);
+    }
+}
+
+fn checked_dirent_cookie(cookie: u64) -> Result<usize, SystemError> {
+    let cookie = i64::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)?;
+    usize::try_from(cookie).map_err(|_| SystemError::EOVERFLOW)
+}
+
+#[cfg(test)]
+mod readdir_tests {
+    use super::checked_dirent_cookie;
+    use system_error::SystemError;
+
+    #[test]
+    fn dirent_cookie_must_fit_signed_offset() {
+        assert_eq!(checked_dirent_cookie(1), Ok(1));
+        assert_eq!(
+            checked_dirent_cookie(i64::MAX as u64 + 1),
+            Err(SystemError::EOVERFLOW.into())
+        );
+    }
+}
+
+/// Only kernel-created pseudo-file descriptions bypass pathname writer
+/// accounting. A fresh VFS open of the same inode is always regular.
+enum FileOpenOrigin {
+    Regular(Option<Metadata>, Option<MountWriteGuard>),
+    InternalPseudo,
 }
 
 impl File {
+    fn configure_base_open_mode(
+        inode: &Arc<dyn IndexNode>,
+        file_type: FileType,
+        mode: &mut FileMode,
+    ) {
+        mode.remove(
+            FileMode::FMODE_CAN_ODIRECT
+                | FileMode::FMODE_STREAM
+                | FileMode::FMODE_LSEEK
+                | FileMode::FMODE_PREAD
+                | FileMode::FMODE_PWRITE
+                | FileMode::FMODE_ATOMIC_POS
+                | FileMode::FMODE_CAN_READ
+                | FileMode::FMODE_CAN_WRITE,
+        );
+        if inode.is_stream() {
+            mode.insert(FileMode::FMODE_STREAM);
+        }
+        if inode.supports_seek() {
+            mode.insert(FileMode::FMODE_LSEEK);
+        }
+        // Anonymous stream inodes may also report FileType::File.
+        if !mode.contains(FileMode::FMODE_STREAM)
+            && matches!(file_type, FileType::File | FileType::Dir)
+        {
+            mode.insert(FileMode::FMODE_ATOMIC_POS);
+        }
+        if inode.supports_pread() {
+            mode.insert(FileMode::FMODE_PREAD);
+        }
+        if inode.supports_pwrite() {
+            mode.insert(FileMode::FMODE_PWRITE);
+        }
+        // Establish default I/O capabilities before the provider configures
+        // its operation table. Owners without a read/write method can clear
+        // these bits, including when an existing description is reopened.
+        if mode.contains(FileMode::FMODE_READ) {
+            mode.insert(FileMode::FMODE_CAN_READ);
+        }
+        if mode.contains(FileMode::FMODE_WRITE) {
+            mode.insert(FileMode::FMODE_CAN_WRITE);
+        }
+    }
+
+    pub fn resolved_path(&self) -> Result<super::utils::ResolvedPath, SystemError> {
+        let mount_guard = self
+            ._mount_guard
+            .as_ref()
+            .map(MountExternalGuard::derive)
+            .transpose()?;
+        // `self.inode` can be the runtime I/O inode of a FIFO or device.
+        // Path-based operations must use the inode paired with this mount pin.
+        super::utils::ResolvedPath::from_existing_mount(self.path_inode(), mount_guard)
+    }
+
     #[inline]
     pub fn cred(&self) -> Arc<Cred> {
         self.cred.clone()
@@ -480,31 +1030,94 @@ impl File {
         &self,
         page_cache: &Arc<PageCache>,
     ) -> Result<(), SystemError> {
-        let since = self.wb_error_seq.load(Ordering::Acquire);
-        let Some((seq, error)) = page_cache.check_writeback_error_since(since) else {
+        let since = *self.wb_error_seq.lock();
+        if page_cache.check_writeback_error_since(since).is_none() {
             return Ok(());
-        };
-        self.wb_error_seq.store(seq, Ordering::Release);
-        Err(error)
+        }
+
+        let mut since = self.wb_error_seq.lock();
+        match page_cache.check_and_advance_writeback_error(&mut since) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    fn maybe_kill_suid_sgid_after_write(&self) -> Result<(), SystemError> {
+    pub fn check_and_advance_sb_wb_error(
+        &self,
+        mount_fs: &Arc<super::mount::MountFS>,
+    ) -> Result<(), SystemError> {
+        let mut since = self.sb_error_seq.lock();
+        match mount_fs.check_and_advance_wb_error(&mut since) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub fn sync_range_and_check_wb_error(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+    ) -> Result<(), SystemError> {
+        Self::recover_io(|| self.try_sync_range_and_check_wb_error(start, end, datasync))
+    }
+
+    pub(crate) fn try_sync_range_and_check_wb_error(
+        &self,
+        start: usize,
+        end: usize,
+        datasync: bool,
+    ) -> Result<(), MemoryAllocationError> {
+        let inode = self.inode();
+        let sync_result = inode.sync_file_range(start, end, datasync, self.private_data.lock());
+        // Charge is an internal retry, not the final fsync result. Preserve
+        // the OFD cursor until synchronization reaches a terminal result.
+        if matches!(&sync_result, Err(MemoryAllocationError::Charge(_))) {
+            return sync_result;
+        }
+        let wb_result = match inode.page_cache() {
+            Some(page_cache) => self.check_and_advance_wb_error(&page_cache),
+            None => Ok(()),
+        };
+
+        match sync_result {
+            Err(e) => Err(e),
+            Ok(()) => wb_result.map_err(Into::into),
+        }
+    }
+
+    pub fn flush_for_close(&self, lock_owner: u64) -> Result<(), SystemError> {
+        Self::recover_io(|| self.try_flush_for_close(lock_owner))
+    }
+
+    pub(crate) fn try_flush_for_close(&self, lock_owner: u64) -> Result<(), MemoryAllocationError> {
+        if self.mode().contains(FileMode::FMODE_PATH) {
+            return Ok(());
+        }
+        let inode = self.inode();
+        inode.flush_file(self.private_data.lock(), lock_owner)
+    }
+
+    fn maybe_kill_suid_sgid_after_write(
+        &self,
+    ) -> Result<bool, crate::mm::allocation::MemoryAllocationError> {
         // 仅对普通文件生效。
         if self.file_type != FileType::File {
-            return Ok(());
+            return Ok(false);
         }
 
         // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
         let cred = ProcessManager::current_pcb().cred();
         if cred.has_capability(CAPFlags::CAP_FSETID) {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut md = self.inode.metadata()?;
         if !md.mode.intersects(InodeMode::S_ISUID | InodeMode::S_ISGID) {
-            return Ok(());
+            return Ok(false);
         }
 
+        let original_mode = md.mode;
         // suid always must be killed on write/truncate when no CAP_FSETID.
         md.mode.remove(InodeMode::S_ISUID);
 
@@ -514,19 +1127,25 @@ impl File {
         if should_remove_sgid(md.mode, md.gid, &cred) {
             md.mode.remove(InodeMode::S_ISGID);
         }
+        if md.mode == original_mode {
+            return Ok(false);
+        }
 
-        self.inode.set_metadata(&md)?;
-        Ok(())
+        self.inode.set_metadata_masked(
+            &md,
+            SetMetadataMask::MODE | SetMetadataMask::WRITE_SIDE_EFFECT,
+        )?;
+        Ok(true)
     }
 
     #[inline(never)]
-    fn limit_write_len_by_fsize(
+    pub(crate) fn limit_write_len_by_fsize(
         &self,
         file_type: FileType,
         offset: usize,
         len: usize,
     ) -> Result<usize, SystemError> {
-        if !matches!(file_type, FileType::File) {
+        if len == 0 || !matches!(file_type, FileType::File) {
             return Ok(len);
         }
         let current_pcb = ProcessManager::current_pcb();
@@ -548,71 +1167,285 @@ impl File {
         Ok(len.min(limit.saturating_sub(offset)))
     }
 
-    fn maybe_sync_after_write(
+    fn mount_is_synchronous(&self) -> bool {
+        self._mount_guard.as_ref().map_or_else(
+            || self.inode.mount_flags().contains(MountFlags::SYNCHRONOUS),
+            MountExternalGuard::is_synchronous,
+        )
+    }
+
+    fn generic_sync_after_write(
         &self,
-        flags: FileFlags,
-        inode_flags: InodeFlags,
-    ) -> Result<(), SystemError> {
-        // O_SYNC 包含 O_DSYNC 位，所以只需检查 O_DSYNC 即可判断是否需要数据同步
-        let need_data_sync = flags.contains(FileFlags::O_DSYNC);
-        // 检查是否需要元数据同步（O_SYNC = __O_SYNC | O_DSYNC）
-        let need_metadata_sync = flags.contains(FileFlags::__O_SYNC);
-
-        // inode 级别的 S_SYNC 标志
-        let inode_sync = inode_flags.contains(InodeFlags::S_SYNC);
-
-        if need_data_sync || inode_sync {
-            if need_metadata_sync || inode_sync {
-                // O_SYNC 或 S_SYNC: 完整同步（数据 + 元数据）
-                self.inode.sync_file(false, self.private_data.lock())?;
-            } else {
-                // O_DSYNC: 仅数据同步
-                self.inode.sync_file(true, self.private_data.lock())?;
-            }
+        start: usize,
+        written_len: usize,
+        sync_intent: WriteSyncIntent,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        if written_len == 0
+            || sync_intent == WriteSyncIntent::None
+            || self.post_write_sync != PostWriteSyncPolicy::Generic
+        {
+            return Ok(());
         }
-        Ok(())
+
+        let end = start
+            .checked_add(written_len - 1)
+            .ok_or(SystemError::EOVERFLOW)?;
+        // Linux generic_write_sync() 只有 IOCB_SYNC 才请求完整 metadata sync；
+        // O_DSYNC、S_SYNC 与 SB_SYNCHRONOUS 都按 datasync 处理。
+        self.try_sync_range_and_check_wb_error(start, end, sync_intent != WriteSyncIntent::Full)
+    }
+
+    fn post_write_sync_intent(&self, flags: FileFlags, inode_flags: InodeFlags) -> WriteSyncIntent {
+        if self.post_write_sync == PostWriteSyncPolicy::NotApplicable {
+            return WriteSyncIntent::None;
+        }
+        if flags.contains(FileFlags::__O_SYNC) {
+            return WriteSyncIntent::Full;
+        }
+        if flags.contains(FileFlags::O_DSYNC)
+            || inode_flags.contains(InodeFlags::S_SYNC)
+            || self.mount_is_synchronous()
+        {
+            return WriteSyncIntent::Data;
+        }
+        WriteSyncIntent::None
     }
 
     #[inline(never)]
-    fn write_at_and_finalize(
+    fn write_source_at(
         &self,
         actual_offset: usize,
         actual_len: usize,
-        buf: &[u8],
-        config: WriteConfig,
-    ) -> Result<usize, SystemError> {
-        let written_len =
-            self.inode
-                .write_at(actual_offset, actual_len, buf, self.private_data.lock())?;
-
-        if written_len > 0 {
-            self.maybe_kill_suid_sgid_after_write()?;
+        source: PrimaryWriteSource<'_, '_>,
+        mut config: WriteConfig,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        if let PrimaryWriteSource::User(input, _) = source {
+            if let Some(result) =
+                self.write_user_buffer_at(actual_offset, actual_len, input, config)?
+            {
+                return Ok(result);
+            }
         }
-
-        if config.update_offset {
-            match config.offset_update {
-                OffsetUpdate::StoreEnd => {
-                    self.offset.store(
-                        actual_offset + written_len,
-                        core::sync::atomic::Ordering::SeqCst,
-                    );
+        let operation = config.operation.unwrap_or_else(|| super::WriteOperation {
+            io: self.write_io_intent(source, actual_len),
+            admission: super::WriteAdmission::User,
+        });
+        let mut publish = || {
+            if !self.mode.read().contains(FileMode::FMODE_NONOTIFY) {
+                self.notify_dentry_event(FsEvent::ATTRIB);
+            }
+        };
+        let mut stage = WritePrivilegeStage::new(&mut publish);
+        let mut result = match self.post_write_sync {
+            PostWriteSyncPolicy::Delegated => {
+                self.inode.write_primary_with_sync_with_privilege_stage(
+                    actual_offset,
+                    actual_len,
+                    source,
+                    operation,
+                    config.sync_intent,
+                    self.private_data.lock(),
+                    &mut stage,
+                )?
+            }
+            PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::NotApplicable => {
+                let primary = self.inode.write_primary_with_privilege_stage(
+                    actual_offset,
+                    actual_len,
+                    source,
+                    operation,
+                    self.private_data.lock(),
+                    &mut stage,
+                )?;
+                if primary.written_len > actual_len {
+                    return Err(SystemError::EIO.into());
                 }
-                OffsetUpdate::Add => {
-                    self.offset
-                        .fetch_add(written_len, core::sync::atomic::Ordering::SeqCst);
+                if let Some(next_position) = primary.next_position {
+                    config.offset_update = OffsetUpdate::SetPosition(next_position);
+                }
+                DelegatedWriteResult::new(primary.written_len, Ok(()))
+            }
+        };
+        self.prepare_write_completion(&mut result, actual_offset, config, stage.handled());
+        Ok(result)
+    }
+
+    fn write_user_buffer_at(
+        &self,
+        offset: usize,
+        len: usize,
+        input: &UserBuffer<'_>,
+        config: WriteConfig,
+    ) -> Result<Option<DelegatedWriteResult>, MemoryAllocationError> {
+        if self.post_write_sync == PostWriteSyncPolicy::Delegated {
+            return Ok(None);
+        }
+        let Some(written) =
+            self.inode
+                .write_user_buffer_at(offset, len, input, self.private_data.lock())?
+        else {
+            return Ok(None);
+        };
+        if written > len {
+            return Err(SystemError::EIO.into());
+        }
+        let mut result = DelegatedWriteResult::new(written, Ok(()));
+        self.prepare_write_completion(&mut result, offset, config, false);
+        Ok(Some(result))
+    }
+
+    fn prepare_write_completion(
+        &self,
+        result: &mut DelegatedWriteResult,
+        offset: usize,
+        config: WriteConfig,
+        privileges_handled: bool,
+    ) {
+        if result.written_len == 0 {
+            return;
+        }
+        if !privileges_handled {
+            match self.maybe_kill_suid_sgid_after_write() {
+                Ok(true) => {
+                    if !self.mode().contains(FileMode::FMODE_NONOTIFY) {
+                        self.notify_fs_event(FsEvent::ATTRIB);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Data is already committed. Never let a metadata Charge
+                    // escape to the primary-write recovery loop and replay it.
+                    result.sync_result = Err(match error {
+                        MemoryAllocationError::Charge(_) => SystemError::ENOMEM.into(),
+                        error => error,
+                    });
+                    return;
                 }
             }
         }
+        result.completion = Some(WriteCompletion {
+            offset,
+            written_len: result.written_len,
+            config,
+        });
+    }
 
-        self.maybe_sync_after_write(config.flags, config.inode_flags)?;
-        Ok(written_len)
+    fn publish_write_completion(&self, completion: WriteCompletion) {
+        let WriteCompletion {
+            offset,
+            written_len,
+            config,
+        } = completion;
+        if config.update_offset {
+            match config.offset_update {
+                OffsetUpdate::StoreEnd => {
+                    self.offset.store(offset + written_len, Ordering::SeqCst);
+                }
+                OffsetUpdate::SetPosition(next) => {
+                    self.offset.store(next, Ordering::SeqCst);
+                }
+                OffsetUpdate::Add => {
+                    self.offset.fetch_add(written_len, Ordering::SeqCst);
+                }
+            }
+        }
+        if config.emit_data_fsnotify {
+            self.notify_io_event(FsEvent::MODIFY);
+        }
     }
     /// @brief 创建一个新的文件对象
     ///
     /// @param inode 文件对象对应的inode
     /// @param flags 文件的打开模式
-    pub fn new(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+    pub fn new(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         Self::new_with_private_data(inode, flags, FilePrivateData::default())
+    }
+
+    pub(crate) fn new_prepared(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::new_with_private_data_prepared(inode, flags, FilePrivateData::default(), storage)
+    }
+
+    /// Only for guardless producers: storage was admitted before instance
+    /// side effects; resume an unfinished open on the same retained candidate.
+    pub(crate) fn new_prepared_recovering(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
+        Self::new_with_private_data_prepared_recovering(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            storage,
+        )
+    }
+
+    pub(crate) fn new_with_private_data_prepared_recovering(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        private_data: FilePrivateData,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
+        let mut candidate = Self::prepare_regular(inode, flags, private_data, storage)?;
+        Self::recover_io(|| candidate.complete_open())?;
+        Ok(candidate)
+    }
+
+    /// Construct an internal pseudo-file description without a pathname open.
+    ///
+    /// Like Linux `alloc_file_pseudo()` and `alloc_file_clone()`, this preserves
+    /// FMODE_WRITE but does not acquire the inode's pathname write-access count.
+    /// Reopening the inode through a path (including /proc/self/fd) must use
+    /// `File::new()` so executable write exclusion still applies.
+    pub(crate) fn new_pseudo(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        Self::new_pseudo_prepared(inode, flags, PreparedFile::try_new()?)
+    }
+
+    pub(crate) fn new_pseudo_prepared(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::prepare_pseudo(inode, flags, storage)
+            .map_err(MemoryAllocationError::System)
+            .and_then(Self::finish_open)
+    }
+
+    pub(crate) fn new_pseudo_prepared_recovering(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
+        let mut candidate = Self::prepare_pseudo(inode, flags, storage)?;
+        Self::recover_io(|| candidate.complete_open())?;
+        Ok(candidate)
+    }
+
+    fn prepare_pseudo(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
+        Self::prepare_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            None,
+            None,
+            None,
+            FileOpenOrigin::InternalPseudo,
+            storage,
+        )
     }
 
     /// Create a new file object with an explicit initial FilePrivateData.
@@ -621,39 +1454,209 @@ impl File {
     /// semantics (e.g. sockets created by socket syscalls).
     pub fn new_with_private_data(
         inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        private_data_init: FilePrivateData,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        let storage = PreparedFile::try_new()?;
+        Self::new_with_private_data_prepared(inode, flags, private_data_init, storage)
+    }
+
+    pub(crate) fn new_with_private_data_prepared(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        private_data_init: FilePrivateData,
+        storage: PreparedFile,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::prepare_regular(inode, flags, private_data_init, storage)
+            .map_err(MemoryAllocationError::System)
+            .and_then(Self::finish_open)
+    }
+
+    fn prepare_regular(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        private_data_init: FilePrivateData,
+        storage: PreparedFile,
+    ) -> Result<Self, SystemError> {
+        let mount_guard = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.mount_fs().pin_operation_owner())
+            .transpose()?;
+        Self::prepare_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            private_data_init,
+            mount_guard,
+            None,
+            None,
+            FileOpenOrigin::Regular(None, None),
+            storage,
+        )
+    }
+
+    /// Construct a pathname-backed file by consuming the mount pin acquired
+    /// during path resolution. This closes the lookup-to-open umount window.
+    pub fn new_with_mount_guard(
+        storage: PreparedFile,
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+        cached_path_metadata: Option<Metadata>,
+    ) -> Result<Self, SystemError> {
+        Self::prepare_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(operation_guard),
+            None,
+            FileOpenOrigin::Regular(cached_path_metadata, None),
+            storage,
+        )
+    }
+
+    /// Construct a pathname-backed file from an already-opened inode.
+    pub fn new_preopened_with_mount_guard(
+        storage: PreparedFile,
+        preopened: PreopenedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+    ) -> Result<Self, SystemError> {
+        let inode = preopened.inode();
+        Self::prepare_with_private_data_and_mount_guard(
+            inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(operation_guard),
+            Some(preopened),
+            FileOpenOrigin::Regular(None, None),
+            storage,
+        )
+    }
+
+    pub(crate) fn new_unlinked_with_mount_guard(
+        storage: PreparedFile,
+        mut unlinked: super::UnlinkedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+    ) -> Result<Self, SystemError> {
+        let writer = unlinked.take_mount_writer();
+        Self::prepare_with_private_data_and_mount_guard(
+            unlinked.inode(),
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(operation_guard),
+            None,
+            FileOpenOrigin::Regular(None, writer),
+            storage,
+        )
+    }
+
+    pub(crate) fn new_created_with_mount_guard(
+        storage: PreparedFile,
+        created: CreatedFile,
+        flags: FileFlags,
+        mount_guard: Option<MountExternalGuard>,
+        operation_guard: InodeRetentionGuard,
+        cached_path_metadata: Option<Metadata>,
+    ) -> Result<Self, SystemError> {
+        Self::prepare_with_private_data_and_mount_guard(
+            created.inode,
+            flags,
+            FilePrivateData::default(),
+            mount_guard,
+            Some(operation_guard),
+            created.preopened,
+            FileOpenOrigin::Regular(cached_path_metadata, created.writer),
+            storage,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Prepared resources have independent ownership and cancellation order"
+    )]
+    fn prepare_with_private_data_and_mount_guard(
+        inode: Arc<dyn IndexNode>,
         mut flags: FileFlags,
         private_data_init: FilePrivateData,
+        mount_guard: Option<MountExternalGuard>,
+        // Parameters drop in reverse order on failure: release the operation
+        // pin before the mount pin, just as the completed File does.
+        _operation_guard: Option<InodeRetentionGuard>,
+        mut preopened: Option<PreopenedFile>,
+        origin: FileOpenOrigin,
+        storage: PreparedFile,
     ) -> Result<Self, SystemError> {
+        let internal_pseudo = matches!(&origin, FileOpenOrigin::InternalPseudo);
+        let (cached_path_metadata, account_write_access, inherited_mount_writer) = match origin {
+            FileOpenOrigin::Regular(metadata, writer) => (metadata, true, writer),
+            FileOpenOrigin::InternalPseudo => (None, false, None),
+        };
         let mut inode = inode;
-        let file_type = inode.metadata()?.file_type;
-        // 检查是否为命名管道（FIFO）
-        let is_named_pipe = if file_type == FileType::Pipe {
-            if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
-                inode = pipe_inode;
-                true
+        let path_inode = inode.clone();
+        let mut file_type = match cached_path_metadata.as_ref() {
+            Some(metadata) => metadata.file_type,
+            None => inode.metadata()?.file_type,
+        };
+        let is_path = flags.contains(FileFlags::O_PATH);
+
+        if !is_path {
+            // 检查是否为命名管道（FIFO）
+            let is_named_pipe = if file_type == FileType::Pipe {
+                if let Some(SpecialNodeData::Pipe(pipe_inode)) = inode.special_node() {
+                    inode = pipe_inode;
+                    file_type = if cached_path_metadata.is_some() {
+                        inode.cached_metadata()?.file_type
+                    } else {
+                        inode.metadata()?.file_type
+                    };
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
-            }
-        } else {
-            false
-        };
+            };
 
-        // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
-        if is_named_pipe {
-            flags.insert(FileFlags::O_LARGEFILE);
+            // 对于命名管道，自动添加 O_LARGEFILE 标志（符合 Linux 行为）
+            if is_named_pipe {
+                flags.insert(FileFlags::O_LARGEFILE);
+            }
+
+            inode = resolve_device_special_inode(inode, file_type, cached_path_metadata.as_ref())?;
         }
 
-        let metadata = inode.metadata()?;
-        if metadata.flags.contains(InodeFlags::S_APPEND) {
+        let metadata = match cached_path_metadata.as_ref() {
+            Some(metadata) if Arc::ptr_eq(&inode, &path_inode) => metadata.clone(),
+            _ if cached_path_metadata.is_some() => inode.cached_metadata()?,
+            _ => inode.metadata()?,
+        };
+        if !is_path && metadata.flags.contains(InodeFlags::S_APPEND) {
             flags.insert(FileFlags::O_APPEND);
         }
 
-        let canonical_inode = canonical_inode_for_posix_lock(inode.clone());
-        let posix_lock_key = if Arc::ptr_eq(&canonical_inode, &inode) {
-            (metadata.dev_id, metadata.inode_id)
+        let canonical_inode = canonical_inode_for_file_lock(inode.clone());
+        let canonical_metadata = if Arc::ptr_eq(&canonical_inode, &inode) {
+            metadata.clone()
         } else {
-            let lock_md = canonical_inode.metadata()?;
-            (lock_md.dev_id, lock_md.inode_id)
+            if cached_path_metadata.is_some() {
+                canonical_inode.cached_metadata()?
+            } else {
+                canonical_inode.metadata()?
+            }
+        };
+        let posix_lock_key = (canonical_metadata.dev_id, canonical_metadata.inode_id);
+        let append_lock_domain = if file_type == FileType::File && !is_path {
+            canonical_inode.append_lock_fs().map(AppendLockDomain::new)
+        } else {
+            None
         };
 
         // O_CLOEXEC 是 per-fd 属性，由 alloc_fd/alloc_fd_arc 的 cloexec 参数控制，
@@ -661,44 +1664,91 @@ impl File {
         flags.remove(FileFlags::O_CLOEXEC);
 
         let mut mode = FileMode::open_fmode(flags);
+        // Pin the final operation inode before invoking filesystem open. If
+        // open fails, the local guard releases exactly once on this error path.
+        let inode_retention =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
+        let path_inode_retention = if Arc::ptr_eq(&inode, &path_inode) {
+            None
+        } else {
+            Some(InodeRetentionGuard::new(
+                path_inode.clone(),
+                InodeRetentionKind::OpenFileDescription,
+            )?)
+        };
 
-        let private_data = Mutex::new(private_data_init);
-        inode.open(private_data.lock(), &flags)?;
-
-        // 设置默认能力（由 inode 能力接口统一决定；避免 syscall 层/字符串特判）
-        if inode.is_stream() {
-            mode.insert(FileMode::FMODE_STREAM);
+        if is_path && preopened.is_some() {
+            return Err(SystemError::EINVAL);
         }
-        if inode.supports_seek() {
-            mode.insert(FileMode::FMODE_LSEEK | FileMode::FMODE_ATOMIC_POS);
-        }
-        if inode.supports_pread() {
-            mode.insert(FileMode::FMODE_PREAD);
-        }
-        if inode.supports_pwrite() {
-            mode.insert(FileMode::FMODE_PWRITE);
-        }
-
-        // TODO: 检查inode是否有read/write方法,设置FMODE_CAN_READ/WRITE
-        // 这需要在IndexNode trait中添加相应的检查方法
-        if mode.contains(FileMode::FMODE_READ) {
-            mode.insert(FileMode::FMODE_CAN_READ);
-        }
-        if mode.contains(FileMode::FMODE_WRITE) {
-            mode.insert(FileMode::FMODE_CAN_WRITE);
-        }
-
-        // 标记为已打开
-        mode.insert(FileMode::FMODE_OPENED);
-
-        // O_PATH特殊处理
-        if flags.contains(FileFlags::O_PATH) {
+        let already_open = preopened.is_some();
+        // Preserve a preopen's token until a successful File takes ownership.
+        // It also covers read-only creates; only writable regular OFDs retain it.
+        let needs_mount_writer = account_write_access
+            && !is_special_file_type(file_type)
+            && !is_path
+            && mode.contains(FileMode::FMODE_WRITE);
+        let mut mount_writer = if needs_mount_writer
+            && inherited_mount_writer.is_none()
+            && preopened
+                .as_ref()
+                .is_none_or(|opened| opened.writer.is_none())
+        {
+            path_inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .map(|mounted| match mount_guard.as_ref() {
+                    Some(pin) => mounted.mount_fs().want_write_from(pin),
+                    None => mounted.mount_fs().want_write(),
+                })
+                .transpose()?
+        } else {
+            inherited_mount_writer
+        };
+        let pending_truncate_writer = if !needs_mount_writer
+            && file_type == FileType::File
+            && !is_path
+            && flags.contains(FileFlags::O_TRUNC)
+            && mount_writer.is_none()
+        {
+            path_inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .map(|mounted| match mount_guard.as_ref() {
+                    Some(pin) => mounted.mount_fs().want_write_from(pin),
+                    None => mounted.mount_fs().want_write(),
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let write_access = if account_write_access
+            && file_type == FileType::File
+            && !is_path
+            && mode.contains(FileMode::FMODE_WRITE)
+        {
+            Some(InodeWriteGuard::writer(inode.clone())?)
+        } else {
+            None
+        };
+        let private_data = Mutex::new(match preopened.as_mut() {
+            Some(preopened) => preopened.take_private_data(),
+            None => private_data_init,
+        });
+        if is_path {
             mode = FileMode::FMODE_PATH | FileMode::FMODE_OPENED;
+        } else if already_open {
+            // The preopen's private token has transferred once. Any later
+            // cancellation must close it, never invoke open again.
+            mode.insert(FileMode::FMODE_OPENED);
         }
 
-        if mode.contains(FileMode::FMODE_WRITE) {
-            if let Some(mnt_inode) = inode.clone().downcast_arc::<MountFSInode>() {
-                mnt_inode.mount_fs().inc_write_count();
+        if needs_mount_writer {
+            if let Some(opened) = preopened.as_mut() {
+                if opened.writer.is_some() {
+                    mount_writer = opened.writer.take();
+                }
+            }
+            if mount_writer.is_some() {
                 mode.insert(FileMode::FMODE_WRITER);
             }
         }
@@ -707,31 +1757,210 @@ impl File {
             .page_cache()
             .map(|page_cache| page_cache.sample_writeback_error())
             .unwrap_or(0);
+        let sb_error_seq = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt_inode| mnt_inode.mount_fs().sample_wb_error())
+            .unwrap_or(0);
+        let io_fs = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mnt_inode| mnt_inode.mount_fs() as Arc<dyn FileSystem>);
 
-        let f = File {
+        let f = storage.init(|epitems| FileData {
             open_file_id: alloc_open_file_id(),
+            fsnotify_path_inode: (!Arc::ptr_eq(&inode, &path_inode)).then_some(path_inode),
             inode,
+            io_fs,
             offset: AtomicUsize::new(0),
             flags: RwSem::new(flags),
+            fasync_lock: Mutex::new(()),
             mode: RwSem::new(mode),
             file_type,
-            readdir_subdirs_name: Mutex::new(Vec::default()),
+            post_write_sync: PostWriteSyncPolicy::NotApplicable,
+            data_file_write_checks: false,
+            direct_io: DirectIoPolicy::Unsupported,
+            internal_pseudo,
+            position_state: Mutex::new(ReaddirState::default()),
             private_data,
             cred: ProcessManager::current_pcb().cred(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
+            mapped_file_identity: (metadata.dev_id, metadata.inode_id),
+            append_lock_domain,
             ra_state: Mutex::new(FileReadaheadState::new()),
-            wb_error_seq: AtomicU64::new(wb_error_seq),
-        };
+            wb_error_seq: Mutex::new(wb_error_seq),
+            sb_error_seq: Mutex::new(sb_error_seq),
+            epitems,
+            _write_access: write_access,
+            _mount_writer: mount_writer.filter(|_| needs_mount_writer),
+            pending_truncate_writer,
+            _inode_retention: inode_retention,
+            _path_inode_retention: path_inode_retention,
+            _mount_guard: mount_guard,
+        });
 
         return Ok(f);
+    }
+
+    fn finish_open(mut file: Self) -> Result<Self, MemoryAllocationError> {
+        file.complete_open()?;
+        Ok(file)
+    }
+
+    /// Resume only the unfinished open hook on this exact resolved inode.
+    /// The caller may recover a typed failure after the hook's guards unwind,
+    /// without replaying pathname resolution, create or a preopened handle.
+    pub(crate) fn complete_open(&mut self) -> Result<(), MemoryAllocationError> {
+        let mut mode = self.mode();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Ok(());
+        }
+        if !mode.contains(FileMode::FMODE_OPENED) {
+            self.inode.open(self.private_data.lock(), &self.flags())?;
+        }
+        // Open-time truncation/revalidation may advance writeback errors.
+        // Preserve the original constructor's post-open sampling boundary.
+        *self.wb_error_seq.lock() = self
+            .inode
+            .page_cache()
+            .map(|cache| cache.sample_writeback_error())
+            .unwrap_or(0);
+        *self.sb_error_seq.lock() = self
+            .inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|mounted| mounted.mount_fs().sample_wb_error())
+            .unwrap_or(0);
+        mode.remove(FileMode::FMODE_OPENED);
+        Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
+        let mut behavior = OpenFileBehavior::new(mode, self.file_type);
+        self.inode
+            .configure_open_file(&self.private_data.lock(), &mut behavior);
+        if behavior.direct_io != DirectIoPolicy::Unsupported {
+            behavior.mode.insert(FileMode::FMODE_CAN_ODIRECT);
+        }
+        mode = behavior.mode;
+        if self._mount_writer.is_some() {
+            mode.insert(FileMode::FMODE_WRITER);
+        }
+        mode.insert(FileMode::FMODE_OPENED);
+        // The open hook has transferred its handle. Record that ownership
+        // before any later fallible validation so cancellation closes it once.
+        *self.mode.write() = mode;
+        // Like Linux do_dentry_open(), consume creation-time input only after
+        // the open hook has succeeded. In particular, FUSE OPEN must still see
+        // O_TRUNC for atomic truncation, while later I/O and RELEASE use the
+        // completed OFD flags. This cannot call update_flags(): propagating a
+        // status change to an Overlay backing file is a separate, fallible op.
+        let mut flags = self.flags();
+        flags.remove(
+            FileFlags::O_CREAT | FileFlags::O_EXCL | FileFlags::O_NOCTTY | FileFlags::O_TRUNC,
+        );
+        if let FilePrivateData::Fuse(private) = &mut *self.private_data.lock() {
+            private.set_flags(flags);
+        }
+        *self.flags.write() = flags;
+        if flags.contains(FileFlags::O_DIRECT)
+            && !(self.internal_pseudo && self.file_type == FileType::Pipe)
+            && behavior.direct_io == DirectIoPolicy::Unsupported
+        {
+            return Err(SystemError::EINVAL.into());
+        }
+        self.direct_io = behavior.direct_io;
+        self.post_write_sync = behavior.post_write_sync;
+        self.data_file_write_checks = behavior.data_file_write_checks;
+        *self.mode.write() = mode;
+        drop(self.pending_truncate_writer.take());
+        Ok(())
+    }
+
+    /// Dispatch using one coherent dentry snapshot. This keeps the read/write
+    /// hot path free of namespace walks and temporary String allocations.
+    pub(crate) fn notify_fs_event(&self, mask: FsEvent) {
+        let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
+        if let Some(mounted) = event_inode.clone().downcast_arc::<MountFSInode>() {
+            let Some((child, parent)) = mounted.fsnotify_snapshot() else {
+                return;
+            };
+            // Linux deliberately withholds ACCESS/MODIFY child events from a
+            // special file's parent directory to avoid a side channel.  The
+            // special inode itself still receives the event through f_path.
+            let special_content_event = mask.intersects(FsEvent::ACCESS | FsEvent::MODIFY)
+                && matches!(
+                    self.file_type,
+                    FileType::BlockDevice
+                        | FileType::CharDevice
+                        | FileType::FramebufferDevice
+                        | FileType::KvmDevice
+                        | FileType::Pipe
+                        | FileType::Socket
+                );
+            if let Some((parent, name)) = parent.as_ref().filter(|_| !special_content_event) {
+                fsnotify::fsnotify_targets(
+                    mask,
+                    Some((parent, name.0.as_str())),
+                    Some(&child),
+                    0,
+                    true,
+                );
+            } else {
+                fsnotify::fsnotify_targets(mask, None, Some(&child), 0, true);
+            }
+        } else {
+            fsnotify::fsnotify(mask, None, Some(event_inode), 0);
+        }
+    }
+
+    /// Publish a dentry-data event such as ATTRIB/truncate. Unlike PATH I/O
+    /// events, this is not suppressed by IN_EXCL_UNLINK.
+    pub(crate) fn notify_dentry_event(&self, mask: FsEvent) {
+        let event_inode = self.fsnotify_path_inode.as_ref().unwrap_or(&self.inode);
+        fsnotify::fsnotify_inode(mask, event_inode);
+    }
+
+    /// Publish an I/O event when this open file description participates in
+    /// userspace-visible I/O.  Internal FMODE_NONOTIFY users must not recurse
+    /// into fsnotify, and O_PATH descriptors never perform such I/O.
+    pub(crate) fn notify_io_event(&self, mask: FsEvent) {
+        if fsnotify::has_any_watch()
+            && !self
+                .mode
+                .read()
+                .intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
+        {
+            self.notify_fs_event(mask);
+        }
+    }
+
+    /// Notify a successful userspace-visible open. Callers decide which File
+    /// constructions represent VFS open/exec rather than internal kernel I/O.
+    pub(crate) fn notify_open_event(&self) {
+        if !fsnotify::has_any_watch() {
+            return;
+        }
+        let mode = *self.mode.read();
+        if !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH) {
+            self.notify_fs_event(FsEvent::OPEN);
+        }
     }
 
     /// Create a file object for sockets created by socket syscalls.
     ///
     /// These should not be subject to open(2) pathname semantics.
-    pub fn new_socket(inode: Arc<dyn IndexNode>, flags: FileFlags) -> Result<Self, SystemError> {
+    pub fn new_socket(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
         Self::new_with_private_data(inode, flags, FilePrivateData::SocketCreate)
+    }
+
+    pub(crate) fn new_socket_prepared(
+        inode: Arc<dyn IndexNode>,
+        flags: FileFlags,
+        storage: PreparedFile,
+    ) -> Result<Self, MemoryAllocationError> {
+        Self::new_with_private_data_prepared(inode, flags, FilePrivateData::SocketCreate, storage)
     }
 
     /// ## 从文件中读取指定的字节数到buffer中
@@ -745,22 +1974,377 @@ impl File {
     /// - `Ok(usize)`: 成功读取的字节数
     /// - `Err(SystemError)`: 错误码
     pub fn read(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.do_read(
-            self.offset.load(core::sync::atomic::Ordering::SeqCst),
+        let _position = self.lock_position();
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_read(offset, len, buf, !stream)
+    }
+
+    /// Read a bounded chunk without committing the position before user copy.
+    /// The syscall holds the position transaction across every chunk.
+    /// Only the backing read is recoverable: copying and consumption must never
+    /// be replayed by charge recovery.
+    pub(crate) fn read_syscall_chunk(
+        &self,
+        buf: &mut [u8],
+        output: &mut UserBuffer<'_>,
+        output_offset: usize,
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, SystemError> {
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+        self.read_syscall_chunk_at(offset, buf, output, output_offset, !stream, intent)
+    }
+
+    /// Read at a syscall-owned explicit cursor without changing the OFD.
+    pub(crate) fn pread_into_user_syscall_chunk(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        output: &mut UserBuffer<'_>,
+        output_offset: usize,
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, SystemError> {
+        self.read_syscall_chunk_at(offset, buf, output, output_offset, false, intent)
+    }
+
+    fn read_syscall_chunk_at(
+        &self,
+        offset: usize,
+        buf: &mut [u8],
+        output: &mut UserBuffer<'_>,
+        output_offset: usize,
+        update_offset: bool,
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, SystemError> {
+        let read =
+            Self::recover_io(|| self.read_backing_with_io_intent(offset, buf.len(), buf, intent))?;
+        let result = output.write_prefix_to_user(output_offset, &buf[..read]);
+        // Backing access precedes protected copying, including EOF and faults.
+        // Only copied bytes advance the caller's cursor; ACCESS is syscall-owned.
+        self.finalize_read(
+            offset,
+            result.as_ref().copied().unwrap_or(0),
+            update_offset,
+            false,
+        );
+        result
+    }
+
+    /// Complete a buffered scalar zero-count request after syscall admission.
+    /// Preserve backing dispatch without allocating scratch, touching the user
+    /// buffer, or finalizing atime/position. Vector zero-count reads bypass this.
+    pub(crate) fn read_empty_syscall(&self) -> Result<usize, SystemError> {
+        Self::recover_io(|| self.read_backing(0, 0, &mut []))
+    }
+
+    /// Linux rw_verify_area's signed count/position checks. Stream descriptions
+    /// have no position; address-range admission belongs to the syscall.
+    /// The caller holds the position transaction through verification and I/O.
+    pub(crate) fn verify_read_range(&self, count: usize) -> Result<(), SystemError> {
+        if count > isize::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+        if !self.mode.read().contains(FileMode::FMODE_STREAM) {
+            let offset = self.offset.load(Ordering::SeqCst);
+            self.verify_pread_range(offset, count)?;
+        }
+        Ok(())
+    }
+
+    /// Let an inode consume a protected userspace buffer as one read syscall.
+    ///
+    /// `None` means the inode does not need this capability and the syscall
+    /// layer should use the normal bounded kernel-buffer fallback.
+    pub fn read_user(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        let _position = self.lock_position();
+        self.read_user_at_current_position(len, writer, true)
+    }
+
+    /// Read one userspace-buffer chunk for a vector syscall.
+    ///
+    /// The caller holds the whole syscall position transaction.
+    /// The vector syscall publishes ACCESS once at its completion boundary,
+    /// rather than once per iovec processed by the fallback `.read` loop.
+    pub(crate) fn read_user_syscall_chunk(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_current_position(len, writer, false)
+    }
+
+    /// Caller owns the whole current-position transaction.
+    pub(crate) fn read_user_at_current_position(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        emit_fsnotify: bool,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_current_position_with_intent(
             len,
-            buf,
-            true,
+            writer,
+            emit_fsnotify,
+            self.read_io_intent(),
         )
+    }
+
+    pub(crate) fn read_user_at_current_position_with_intent(
+        &self,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        emit_fsnotify: bool,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        let mode = *self.mode.read();
+        let stream = mode.contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.read_user_at_position(offset, len, writer, !stream, emit_fsnotify, intent)
+    }
+
+    /// One owner operation at an explicit cursor; the syscall owns ACCESS.
+    pub(crate) fn pread_user_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_position(offset, len, writer, false, false, self.read_io_intent())
+    }
+
+    pub(crate) fn pread_user_syscall_with_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.read_user_at_position(offset, len, writer, false, false, intent)
+    }
+
+    fn read_user_at_position(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        update_offset: bool,
+        emit_fsnotify: bool,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.readable()?;
+        if writer.len() < len {
+            return Err(SystemError::ENOBUFS);
+        }
+        let result = self.read_user_provider_at(offset, len, writer, intent);
+        // Linux direct regular-file readers call file_accessed even when
+        // their nonempty request fails admission or faults. Position and
+        // ACCESS completion still require a successful operation.
+        if result.is_err()
+            && len != 0
+            && intent == super::ReadIoIntent::Direct
+            && self.file_type == FileType::File
+        {
+            self.touch_atime_after_access();
+        }
+        let Some(read_len) = result? else {
+            return Ok(None);
+        };
+        if len != 0 {
+            self.finalize_read(offset, read_len, update_offset, emit_fsnotify);
+        }
+        Ok(Some(read_len))
+    }
+
+    pub(crate) fn read_io_intent(&self) -> super::ReadIoIntent {
+        if self.flags().contains(FileFlags::O_DIRECT) && self.direct_io != DirectIoPolicy::Buffered
+        {
+            super::ReadIoIntent::Direct
+        } else {
+            super::ReadIoIntent::Buffered
+        }
+    }
+
+    /// Whether this description accepts direct I/O. Buffered-only owners
+    /// such as tmpfs accept the intent and deliberately ignore it.
+    pub(crate) fn supports_direct_io(&self) -> bool {
+        self.direct_io != DirectIoPolicy::Unsupported
+    }
+
+    /// Positional backing read retaining the original OFD and typed admission.
+    /// A false force flag inherits O_DIRECT; it does not force buffered I/O.
+    pub(crate) fn try_pread_backing(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        force_direct: bool,
+    ) -> Result<usize, MemoryAllocationError> {
+        self.verify_pread_access()?;
+        self.readable()?;
+        if force_direct && !self.supports_direct_io() {
+            return Err(SystemError::EINVAL.into());
+        }
+        let intent = if force_direct && self.direct_io != DirectIoPolicy::Buffered {
+            super::ReadIoIntent::Direct
+        } else {
+            self.read_io_intent()
+        };
+        let result = self.read_backing_with_io_intent(offset, len, buf, intent);
+        if result.is_err()
+            && len != 0
+            && intent == super::ReadIoIntent::Direct
+            && self.file_type == FileType::File
+        {
+            self.touch_atime_after_access();
+        }
+        let read = result?;
+        if len != 0 {
+            self.finalize_read(offset, read, false, true);
+        }
+        Ok(read)
+    }
+
+    /// Provider-only stacking entry: retain the caller's original iterator,
+    /// without publishing a second position/atime/fsnotify completion.
+    pub(crate) fn read_user_provider_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        intent: super::ReadIoIntent,
+    ) -> Result<Option<usize>, SystemError> {
+        self.readable()?;
+        if self.file_type == FileType::Dir {
+            return Ok(None);
+        }
+        // Internal FileType also covers anonymous record descriptors. Their
+        // owners must see empty scalar requests (e.g. timerfd returns EINVAL).
+        let intent = if self.direct_io == DirectIoPolicy::Buffered {
+            super::ReadIoIntent::Buffered
+        } else {
+            intent
+        };
+        if len != 0
+            && intent == super::ReadIoIntent::Buffered
+            && self.file_type == FileType::File
+            && self.inode.user_read_mode() == super::UserReadMode::Iterator
+        {
+            self.file_readahead(offset, len.min(super::read_buffer::MAX_CHUNK))?;
+        }
+        let read = self.inode.read_user_with_io_intent(
+            offset,
+            len,
+            writer,
+            self.private_data.lock(),
+            intent,
+        )?;
+        if read.is_some()
+            || self.file_type != FileType::File
+            || self.user_read_mode_with_io_intent(intent) != super::UserReadMode::Buffered
+        {
+            return Ok(read);
+        }
+        // A stacking owner can delegate to a buffered-only backing (including
+        // tmpfs, which intentionally ignores O_DIRECT). Complete its protected
+        // copy here, without a second File completion or losing the snapshot.
+        self.read_buffered_user_provider_at(offset, len, writer, intent)
+            .map(Some)
+    }
+
+    fn read_buffered_user_provider_at(
+        &self,
+        offset: usize,
+        len: usize,
+        writer: &mut UserBuffer<'_>,
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, SystemError> {
+        let len = len.min(writer.len());
+        let mut scratch = super::read_buffer::ReadScratch::default();
+        let mut total = 0;
+        while total < len {
+            let want = (len - total).min(super::read_buffer::MAX_CHUNK);
+            let buffer = match scratch.prepare(want) {
+                Ok(buffer) => buffer,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            let position = offset.checked_add(total).ok_or(SystemError::EOVERFLOW)?;
+            let read = match Self::recover_io(|| {
+                self.read_backing_with_io_intent(position, want, buffer, intent)
+            }) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            // Only buffered fallback retains the ordinary copy-fault prefix.
+            // Native direct/record owners returning None never reach this path.
+            let copied = match writer.write_prefix_to_user(total, &buffer[..read]) {
+                Ok(copied) => copied,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            total += copied;
+            if copied != read || read < want {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    #[inline]
+    pub fn user_read_mode(&self) -> super::UserReadMode {
+        self.user_read_mode_with_io_intent(self.read_io_intent())
+    }
+
+    pub(crate) fn user_read_mode_with_io_intent(
+        &self,
+        intent: super::ReadIoIntent,
+    ) -> super::UserReadMode {
+        if self.file_type == FileType::Dir {
+            super::UserReadMode::Buffered
+        } else if intent == super::ReadIoIntent::Direct && self.direct_io == DirectIoPolicy::Native
+        {
+            super::UserReadMode::Iterator
+        } else {
+            self.inode.user_read_mode_with_io_intent(intent)
+        }
+    }
+
+    pub(crate) fn supports_read_iter_flags(&self) -> bool {
+        // Linux directory operations expose legacy generic_read_dir, even
+        // when the filesystem's ordinary files implement read_iter.
+        self.file_type != FileType::Dir && self.inode.supports_read_iter_flags()
     }
 
     /// Read from the current file position without advancing it.
     pub fn read_noadv(&self, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
-        self.do_read(
-            self.offset.load(core::sync::atomic::Ordering::SeqCst),
-            len,
-            buf,
-            false,
-        )
+        let _position = self.lock_position();
+        let offset = if self.mode.read().contains(FileMode::FMODE_STREAM) {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_read(offset, len, buf, false)
     }
 
     /// ## 从buffer向文件写入指定的字节数的数据
@@ -774,13 +2358,15 @@ impl File {
     /// - `Ok(usize)`: 成功写入的字节数
     /// - `Err(SystemError)`: 错误码
     pub fn write(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        self.do_write(
-            self.offset.load(core::sync::atomic::Ordering::SeqCst),
-            len,
-            buf,
-            true,
-            false,
-        )
+        let _position = self.lock_position();
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        self.do_write(offset, len, buf, !stream, false)
     }
 
     /// ## 从文件中指定的偏移处读取指定的字节数到buf中
@@ -793,6 +2379,10 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功读取的字节数
     pub fn pread(&self, offset: usize, len: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        Self::recover_io(|| self.pread_with_fsnotify(offset, len, buf, true))
+    }
+
+    pub(crate) fn verify_pread_access(&self) -> Result<(), SystemError> {
         // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
         let mode = *self.mode.read();
         if mode.contains(FileMode::FMODE_PATH) {
@@ -811,17 +2401,101 @@ impl File {
             return Err(SystemError::ESPIPE);
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn verify_pread_range(
+        &self,
+        offset: usize,
+        count: usize,
+    ) -> Result<(), SystemError> {
+        if count > isize::MAX as usize {
+            return Err(SystemError::EINVAL);
+        }
+        // Linux rw_verify_area(): unsigned-offset owners may cross the signed
+        // boundary, but a high-bit position must not reach or wrap through zero.
+        // Explicit negative pread/pwrite arguments are rejected separately by
+        // syscall admission, before this per-file capability check.
+        let unsigned = self.mode.read().contains(FileMode::FMODE_UNSIGNED_OFFSET);
+        if offset > isize::MAX as usize {
+            if !unsigned {
+                return Err(SystemError::EINVAL);
+            }
+            if count >= offset.wrapping_neg() {
+                return Err(SystemError::EOVERFLOW);
+            }
+        } else if !unsigned && count > isize::MAX as usize - offset {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn pread_with_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        emit_fsnotify: bool,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.verify_pread_access()?;
+        let mode = *self.mode.read();
+
         // 检查读权限
         if !mode.contains(FileMode::FMODE_READ) {
-            return Err(SystemError::EBADF);
+            return Err(SystemError::EBADF.into());
         }
 
         // 检查读能力
         if !mode.can_read() {
-            return Err(SystemError::EINVAL);
+            return Err(SystemError::EINVAL.into());
         }
 
-        self.do_read(offset, len, buf, false)
+        self.do_read_with_fsnotify(offset, len, buf, false, emit_fsnotify)
+    }
+
+    /// Read one internal `pread(2)` chunk while deferring ACCESS until the
+    /// syscall has determined its final, user-visible result.
+    pub(crate) fn pread_syscall_chunk(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        Self::recover_io(|| self.pread_with_fsnotify(offset, len, buf, false))
+    }
+
+    /// Read for splice while deferring ACCESS until the transfer commits.
+    /// This preserves the normal permission, readahead and atime behavior but
+    /// lets do_splice publish MODIFY(out) before ACCESS(in), as Linux does.
+    pub(crate) fn try_read_for_transfer(
+        &self,
+        offset: Option<usize>,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        match offset {
+            Some(offset) => self.pread_with_fsnotify(offset, len, buf, false),
+            None => {
+                let offset = if self.mode.read().contains(FileMode::FMODE_STREAM) {
+                    0
+                } else {
+                    self.offset.load(Ordering::SeqCst)
+                };
+                self.do_read_with_fsnotify(offset, len, buf, false, false)
+            }
+        }
+    }
+
+    /// Read a transfer's already validated local position without committing
+    /// f_pos or emitting a per-chunk notification. The syscall owns capability
+    /// checks and commits only the bytes accepted by its output.
+    pub(crate) fn try_read_at_for_transfer(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        self.do_read_with_fsnotify(offset, len, buf, false, false)
     }
 
     /// ## 从buf向文件中指定的偏移处写入指定的字节数的数据
@@ -834,34 +2508,149 @@ impl File {
     /// ### 返回值
     /// - `Ok(usize)`: 成功写入的字节数
     pub fn pwrite(&self, offset: usize, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
-        // Linux 语义：O_PATH fd 任何 I/O 都应返回 EBADF（优先于 ESPIPE）。
-        let mode = *self.mode.read();
-        if mode.contains(FileMode::FMODE_PATH) {
-            return Err(SystemError::EBADF);
-        }
+        let result = Self::recover_io(|| {
+            self.pwrite_with_sync_intent_and_fsnotify(offset, len, buf, WriteSyncIntent::None, true)
+        })?;
+        self.finish_write(result)
+    }
 
-        // 同 pread：流式对象不支持随机偏移写入，返回 ESPIPE（优先于权限 EBADF）。
-        if mode.contains(FileMode::FMODE_STREAM) {
-            return Err(SystemError::ESPIPE);
-        }
+    /// Perform a positional write while merging an operation-level sync
+    /// request with this file's own O_SYNC/S_SYNC/SB_SYNCHRONOUS semantics.
+    ///
+    /// Data progress is returned separately from the synchronization result so
+    /// stacking filesystems can preserve write side effects when fsync fails.
+    pub fn pwrite_with_sync_intent(
+        self: &Arc<Self>,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.pwrite_with_io_intent(offset, len, buf, requested_sync, None)
+    }
 
-        // 对于不支持随机访问的文件（如管道），应该返回 ESPIPE，而不是因为权限问题返回 EBADF
-        if !mode.contains(FileMode::FMODE_PWRITE) {
-            return Err(SystemError::ESPIPE);
+    fn write_io_intent(
+        &self,
+        source: PrimaryWriteSource<'_, '_>,
+        len: usize,
+    ) -> super::WriteIoIntent {
+        if self.flags().contains(FileFlags::O_DIRECT) && self.direct_io != DirectIoPolicy::Buffered
+        {
+            super::WriteIoIntent::Direct {
+                input_alignment: source.alignment(len),
+            }
+        } else {
+            super::WriteIoIntent::Buffered
         }
+    }
 
-        // 检查写权限
-        if !mode.contains(FileMode::FMODE_WRITE) {
-            return Err(SystemError::EBADF);
+    /// Loop publishes an already admitted device range. Linux does this from
+    /// its worker, without inheriting the submitting process's file-size limit.
+    /// Keep the backing description's direct/sync flags and all owner checks.
+    pub(crate) fn pwrite_backing_with_sync_intent(
+        self: &Arc<Self>,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        sync: WriteSyncIntent,
+        force_direct: bool,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        if force_direct && !self.supports_direct_io() {
+            return Err(SystemError::EINVAL.into());
         }
+        let io = if force_direct && self.direct_io != DirectIoPolicy::Buffered {
+            super::WriteIoIntent::Direct {
+                input_alignment: PrimaryWriteSource::Kernel(buf).alignment(len),
+            }
+        } else {
+            self.write_io_intent(PrimaryWriteSource::Kernel(buf), len)
+        };
+        self.pwrite_with_io_intent(
+            offset,
+            len,
+            buf,
+            sync,
+            Some(super::WriteOperation {
+                io,
+                admission: super::WriteAdmission::BackingStorage,
+            }),
+        )
+    }
 
-        self.do_write(offset, len, buf, false, false)
+    /// Stacking keeps the alignment of the original user iterator while
+    /// copying under caller credentials and publishing under backing credentials.
+    pub(crate) fn pwrite_with_io_intent(
+        self: &Arc<Self>,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+        intent: Option<super::WriteOperation>,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.verify_pwrite_access()?;
+        self.writeable()?;
+        let mut result = self.do_write_split(
+            offset,
+            len,
+            buf,
+            false,
+            false,
+            WriteCompletionPolicy {
+                operation: intent,
+                sync_intent: requested_sync,
+                emit_data_fsnotify: true,
+            },
+        )?;
+        match &result.sync_result {
+            Ok(()) => self.complete_write_success(&mut result),
+            Err(MemoryAllocationError::System(_)) => {
+                result.completion = None;
+                result.deferred.clear();
+            }
+            Err(MemoryAllocationError::Charge(_)) => {
+                if let Some(completion) = result.completion.take() {
+                    if result.deferred.try_reserve(1).is_err() {
+                        result.sync_result = Err(SystemError::ENOMEM.into());
+                        result.deferred.clear();
+                    } else {
+                        result.deferred.push((self.clone(), completion));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn pwrite_with_sync_intent_and_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        requested_sync: WriteSyncIntent,
+        emit_data_fsnotify: bool,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
+        self.verify_pwrite_access()?;
+        self.writeable()?;
+
+        self.do_write_split(
+            offset,
+            len,
+            buf,
+            false,
+            false,
+            WriteCompletionPolicy {
+                operation: None,
+                sync_intent: requested_sync,
+                emit_data_fsnotify,
+            },
+        )
     }
 
     /// 强制追加写（Linux `RWF_APPEND`/`IOCB_APPEND` 语义）：
     /// - 对常规文件：忽略当前偏移/给定偏移，追加到 EOF
     /// - 会推进本 fd 的文件偏移（类似 write）
     pub fn write_append(&self, len: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
         self.do_write(
             self.offset.load(core::sync::atomic::Ordering::SeqCst),
             len,
@@ -888,12 +2677,17 @@ impl File {
     }
 
     fn file_readahead(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        // DAX reads own their device access. The cache retained for sparse or
+        // partial mmap pages must not populate ordinary read-ahead pages.
+        if self.inode.is_dax() {
+            return Ok(());
+        }
         if self.mode().contains(FileMode::FMODE_RANDOM) {
             return Ok(());
         }
 
         // 检查文件系统是否支持 readahead
-        if !self.inode.fs().support_readahead() {
+        if !self.with_io_fs(|fs| fs.support_readahead()) {
             return Ok(());
         }
 
@@ -901,6 +2695,10 @@ impl File {
             Some(page_cahce) => page_cahce,
             None => return Ok(()),
         };
+        let task = ProcessManager::current_pcb();
+        let owner = crate::cgroup::memory::account_for_task(&task);
+        let creator = crate::cgroup::memory::object_for_task(&task);
+        drop(task);
 
         let start_page = offset >> MMArch::PAGE_SHIFT;
         let end_page = (offset + len - 1) >> MMArch::PAGE_SHIFT;
@@ -930,46 +2728,120 @@ impl File {
             let req_pages = end_page - index + 1;
             page.write().remove_flags(PageFlags::PG_READAHEAD);
 
-            page_cache_async_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
+            match page_cache_async_readahead(
+                &page_cache,
+                &self.inode,
+                &mut ra_state,
+                index,
+                req_pages,
+                &owner,
+                &creator,
+            ) {
+                Ok(_) => {}
+                // Speculative prefetch never kills a task for an optional page.
+                // Required read_at admission is handled by the inode outer.
+                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => return Ok(()),
+                Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                    return Err(error)
+                }
+            }
             *self.ra_state.lock() = ra_state;
         } else if let Some(index) = missing_page {
             let mut ra_state = self.ra_state.lock().clone();
             let req_pages = end_page - index + 1;
 
-            page_cache_sync_readahead(&page_cache, &self.inode, &mut ra_state, index, req_pages)?;
+            match page_cache_sync_readahead(
+                &page_cache,
+                &self.inode,
+                &mut ra_state,
+                index,
+                req_pages,
+                &owner,
+                &creator,
+            ) {
+                Ok(_) => {}
+                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => return Ok(()),
+                Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                    return Err(error)
+                }
+            }
             *self.ra_state.lock() = ra_state;
         }
         Ok(())
     }
 
-    pub fn do_read(
+    fn do_read(
         &self,
         offset: usize,
         len: usize,
         buf: &mut [u8],
         update_offset: bool,
     ) -> Result<usize, SystemError> {
+        Self::recover_io(|| self.do_read_with_fsnotify(offset, len, buf, update_offset, true))
+    }
+
+    fn do_read_with_fsnotify(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        update_offset: bool,
+        emit_fsnotify: bool,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let read = self.read_backing(offset, len, buf)?;
+        if len != 0 {
+            self.finalize_read(offset, read, update_offset, emit_fsnotify);
+        }
+        Ok(read)
+    }
+
+    fn read_backing(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, MemoryAllocationError> {
+        self.read_backing_with_io_intent(offset, len, buf, self.read_io_intent())
+    }
+
+    pub(crate) fn read_backing_with_io_intent(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        intent: super::ReadIoIntent,
+    ) -> Result<usize, MemoryAllocationError> {
         self.readable()?;
+        // generic_read_dir is a file operation, not a page-cache read. In
+        // particular a mounted ext4 root must not turn its backend EISDIR
+        // into a failed cache entry and then EIO.
+        if self.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR.into());
+        }
         // Linux/POSIX: count==0 must not touch the buffer and must not block.
         if len == 0 {
             return Ok(0);
         }
         if buf.len() < len {
-            return Err(SystemError::ENOBUFS);
+            return Err(SystemError::ENOBUFS.into());
         }
 
-        if self.file_type == FileType::File && !self.flags().contains(FileFlags::O_DIRECT) {
+        if self.file_type == FileType::File && intent == super::ReadIoIntent::Buffered {
             self.file_readahead(offset, len)?;
         }
 
-        let len = if self.flags().contains(FileFlags::O_DIRECT) {
-            self.inode
-                .read_direct(offset, len, buf, self.private_data.lock())
-        } else {
-            self.inode
-                .read_at(offset, len, buf, self.private_data.lock())
-        }?;
+        let len = self.inode.read_at_with_io_intent(
+            offset,
+            len,
+            buf,
+            self.private_data.lock(),
+            intent,
+        )?;
 
+        Ok(len)
+    }
+
+    fn finalize_read(&self, offset: usize, len: usize, update_offset: bool, emit_fsnotify: bool) {
         if len > 0 {
             let last_page_readed = (offset + len - 1) >> MMArch::PAGE_SHIFT;
             self.ra_state.lock().prev_index = last_page_readed as i64;
@@ -979,10 +2851,55 @@ impl File {
             self.offset
                 .fetch_add(len, core::sync::atomic::Ordering::SeqCst);
         }
-        Ok(len)
+        // Linux file_accessed() runs for every non-zero regular-file read
+        // request, including EOF. Zero-count reads returned above are exempt.
+        if len > 0 || self.file_type == FileType::File {
+            self.touch_atime_after_access();
+        }
+        // fsnotify: deliver IN_ACCESS only when data was actually read (len > 0) (FMODE_NONOTIFY short-circuits).
+        // An EOF read (len==0) does not deliver—independent of atime semantics.
+        if emit_fsnotify
+            && len > 0
+            && fsnotify::has_any_watch()
+            && !self.mode.read().contains(FileMode::FMODE_NONOTIFY)
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
+        }
     }
 
-    pub fn do_write(
+    /// Best-effort equivalent of Linux file_accessed()/touch_atime().
+    fn touch_atime_after_access(&self) {
+        use super::mount::{MountFS, MountFlags};
+
+        if self.flags().contains(FileFlags::O_NOATIME) {
+            return;
+        }
+        let mount_flags = self.inode.mount_flags();
+        if mount_flags.contains(MountFlags::NOATIME)
+            || (self.file_type == FileType::Dir && mount_flags.contains(MountFlags::NODIRATIME))
+        {
+            return;
+        }
+        let Some(fs) = self.inode.try_fs() else {
+            // Anonymous kernel objects such as sockets are represented by an
+            // IndexNode but are not backed by a filesystem or mount. Linux
+            // does not apply file_accessed() timestamp updates to their I/O.
+            return;
+        };
+        if fs
+            .downcast_arc::<MountFS>()
+            .is_some_and(|mount| mount.is_readonly())
+        {
+            return;
+        }
+
+        let now = crate::time::PosixTimeSpec::now();
+        let _ = self
+            .inode
+            .update_atime(now, mount_flags.contains(MountFlags::RELATIME));
+    }
+
+    fn do_write(
         &self,
         offset: usize,
         len: usize,
@@ -990,71 +2907,427 @@ impl File {
         update_offset: bool,
         force_append: bool,
     ) -> Result<usize, SystemError> {
+        let result = Self::recover_io(|| {
+            self.do_write_split(
+                offset,
+                len,
+                buf,
+                update_offset,
+                force_append,
+                WriteCompletionPolicy {
+                    operation: None,
+                    sync_intent: WriteSyncIntent::None,
+                    emit_data_fsnotify: true,
+                },
+            )
+        })?;
+        self.finish_write(result)
+    }
+
+    /// Write one internal transfer chunk while deferring its data-content
+    /// notification to the syscall that owns the complete transfer. Metadata
+    /// side effects such as setid removal are still reported immediately.
+    pub(crate) fn try_write_for_transfer(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        update_offset: bool,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.do_write_split(
+            offset,
+            len,
+            buf,
+            update_offset,
+            false,
+            WriteCompletionPolicy {
+                operation: None,
+                sync_intent: WriteSyncIntent::None,
+                emit_data_fsnotify: false,
+            },
+        )
+    }
+
+    fn do_write_split(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &[u8],
+        update_offset: bool,
+        force_append: bool,
+        completion: WriteCompletionPolicy,
+    ) -> Result<DelegatedWriteResult, MemoryAllocationError> {
+        self.try_do_write_source(
+            offset,
+            len,
+            PrimaryWriteSource::Kernel(buf),
+            update_offset,
+            force_append,
+            completion,
+        )
+    }
+
+    // A delegated owner performs its backing admission after its own privilege
+    // transaction (notably OverlayFS). Native owners use the VFS size check.
+    fn limit_primary_write_len(
+        &self,
+        file_type: FileType,
+        offset: usize,
+        len: usize,
+        admission: super::WriteAdmission,
+    ) -> Result<usize, SystemError> {
+        if admission == super::WriteAdmission::BackingStorage
+            || !self.data_file_write_checks
+            || self.post_write_sync == PostWriteSyncPolicy::Delegated
+        {
+            Ok(len)
+        } else {
+            self.limit_write_len_by_fsize(file_type, offset, len)
+        }
+    }
+
+    fn try_do_write_source(
+        &self,
+        offset: usize,
+        len: usize,
+        source: PrimaryWriteSource<'_, '_>,
+        update_offset: bool,
+        force_append: bool,
+        completion: WriteCompletionPolicy,
+    ) -> Result<DelegatedWriteResult, crate::mm::allocation::MemoryAllocationError> {
         self.writeable()?;
 
         let inode_flags = self.get_inode_flags()?;
         let flags = self.flags();
         // 检查 S_IMMUTABLE
         if inode_flags.contains(InodeFlags::S_IMMUTABLE) {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
         // S_APPEND 的 inode 只能追加写入
         if inode_flags.contains(InodeFlags::S_APPEND) && !flags.contains(FileFlags::O_APPEND) {
-            return Err(SystemError::EPERM);
+            return Err(SystemError::EPERM.into());
         }
 
-        if buf.len() < len {
-            return Err(SystemError::ENOBUFS);
+        if let PrimaryWriteSource::Kernel(buf) = source {
+            if buf.len() < len {
+                return Err(SystemError::ENOBUFS.into());
+            }
         }
         let md = self.inode.metadata()?;
         let file_type = md.file_type;
+        let sync_intent = match self.post_write_sync {
+            PostWriteSyncPolicy::Generic | PostWriteSyncPolicy::Delegated => self
+                .post_write_sync_intent(flags, inode_flags)
+                .combine(completion.sync_intent),
+            PostWriteSyncPolicy::NotApplicable => WriteSyncIntent::None,
+        };
 
-        let is_append = (flags.contains(FileFlags::O_APPEND) || force_append)
-            && matches!(file_type, FileType::File);
+        let admission = completion
+            .operation
+            .map_or(super::WriteAdmission::User, |operation| operation.admission);
+        let is_append = self.data_file_write_checks
+            && matches!(file_type, FileType::File)
+            && (flags.contains(FileFlags::O_APPEND) || force_append);
 
-        // Linux 语义要求 O_APPEND（以及 RWF_APPEND）在并发下满足“取 EOF + 写入”的原子性，
-        // 否则多个线程可能拿到相同 EOF 导致覆盖写，最终 size 比预期小。
+        // 普通文件始终按 EOF 执行 O_APPEND/RWF_APPEND；提供稳定锁域的文件系统
+        // 还会在 VFS 层串行化“取 EOF + 写入”，避免并发追加互相覆盖。
         if is_append {
-            let dev_id = md.dev_id;
-            let inode_id = md.inode_id;
-            return with_inode_append_lock(dev_id, inode_id, || {
+            let append_write = || {
                 // 在锁内刷新元数据，确保 EOF 是最新的。
                 let md = self.inode.metadata()?;
                 let actual_offset = md.size.max(0) as usize;
-                let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
+                let actual_len =
+                    self.limit_primary_write_len(file_type, actual_offset, len, admission)?;
 
-                self.write_at_and_finalize(
+                self.write_source_at(
                     actual_offset,
                     actual_len,
-                    buf,
+                    source,
                     WriteConfig {
+                        operation: completion.operation,
                         update_offset,
                         offset_update: OffsetUpdate::StoreEnd,
-                        flags,
-                        inode_flags,
+                        sync_intent,
+                        emit_data_fsnotify: completion.emit_data_fsnotify,
                     },
                 )
-            });
+                .map(|result| (actual_offset, result))
+            };
+            let (actual_offset, mut result) = match self.append_lock_domain.as_ref() {
+                Some(domain) => with_inode_append_lock(domain.key(&md), append_write),
+                None => append_write(),
+            }?;
+            let mut effective_sync = sync_intent;
+            if result.sync_result.is_ok() {
+                // generic_write_sync() observes IS_SYNC after the write.
+                // Re-sample the cheap mount atomic here while reusing the
+                // inode flags already fetched before I/O.
+                let current_sync_intent = self
+                    .post_write_sync_intent(flags, inode_flags)
+                    .combine(completion.sync_intent);
+                effective_sync = current_sync_intent;
+                result.sync_result = self.generic_sync_after_write(
+                    actual_offset,
+                    result.written_len,
+                    current_sync_intent,
+                );
+            }
+            Self::set_completed_sync_range(&mut result, actual_offset, effective_sync);
+            return Ok(result);
         }
 
         let actual_offset = offset;
-        let actual_len = self.limit_write_len_by_fsize(file_type, actual_offset, len)?;
+        let actual_len = self.limit_primary_write_len(file_type, actual_offset, len, admission)?;
 
-        if matches!(file_type, FileType::File) && actual_offset > md.size.max(0) as usize {
-            self.inode.resize(actual_offset)?;
-        }
-
-        self.write_at_and_finalize(
+        let mut result = self.write_source_at(
             actual_offset,
             actual_len,
-            buf,
+            source,
             WriteConfig {
+                operation: completion.operation,
                 update_offset,
                 offset_update: OffsetUpdate::Add,
-                flags,
-                inode_flags,
+                sync_intent,
+                emit_data_fsnotify: completion.emit_data_fsnotify,
             },
+        )?;
+        let mut effective_sync = sync_intent;
+        if result.sync_result.is_ok() {
+            let current_sync_intent = self
+                .post_write_sync_intent(flags, inode_flags)
+                .combine(completion.sync_intent);
+            effective_sync = current_sync_intent;
+            result.sync_result = self.generic_sync_after_write(
+                actual_offset,
+                result.written_len,
+                current_sync_intent,
+            );
+        }
+        Self::set_completed_sync_range(&mut result, actual_offset, effective_sync);
+        Ok(result)
+    }
+
+    fn do_write_user(
+        &self,
+        offset: usize,
+        len: usize,
+        input: &UserBuffer<'_>,
+        update_offset: bool,
+        force_append: bool,
+        requested_sync: WriteSyncIntent,
+    ) -> Result<usize, SystemError> {
+        let creator = object_for_task(&ProcessManager::current_pcb());
+        let result = Self::recover_io(|| {
+            self.try_do_write_source(
+                offset,
+                len,
+                PrimaryWriteSource::User(input, &creator),
+                update_offset,
+                force_append,
+                WriteCompletionPolicy {
+                    operation: None,
+                    sync_intent: requested_sync,
+                    emit_data_fsnotify: true,
+                },
+            )
+        })?;
+        self.finish_write(result)
+    }
+
+    /// Positional capability admission precedes payload or iovec import.
+    pub(crate) fn verify_pwrite_access(&self) -> Result<(), SystemError> {
+        let mode = self.mode();
+        if mode.contains(FileMode::FMODE_PATH) {
+            return Err(SystemError::EBADF);
+        }
+        if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_PWRITE) {
+            return Err(SystemError::ESPIPE);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pwrite_user(
+        &self,
+        offset: usize,
+        len: usize,
+        input: &UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        self.verify_pwrite_access()?;
+        self.writeable()?;
+        self.verify_pread_range(offset, len)?;
+        self.do_write_user(offset, len, input, false, false, WriteSyncIntent::None)
+    }
+
+    pub(crate) fn pwrite_user_vectored(
+        &self,
+        offset: usize,
+        vectors: &super::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
+        self.pwrite_user_vectored_with_flags(offset, vectors, 0)
+    }
+
+    pub(crate) fn pwrite_user_vectored_with_flags(
+        &self,
+        offset: usize,
+        vectors: &super::iov::IoVecs,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        self.verify_pwrite_access()?;
+        self.write_user_vectors_at(offset, vectors, false, flags)
+    }
+
+    fn write_user_vectors_at(
+        &self,
+        offset: usize,
+        vectors: &super::iov::IoVecs,
+        update_offset: bool,
+        raw_flags: u32,
+    ) -> Result<usize, SystemError> {
+        self.writeable()?;
+        let len = vectors.total_len();
+        if len == 0 {
+            return Ok(0);
+        }
+        if !self.mode().contains(FileMode::FMODE_STREAM) {
+            self.verify_pread_range(offset, len)?;
+        }
+        let flags =
+            WriteRequestFlags::from_bits(raw_flags).ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        // No owner currently implements per-operation nonblocking write
+        // admission across user faults, locks and allocation. Do not mutate
+        // shared O_NONBLOCK or silently fall back to a blocking operation.
+        let write_iter = self.inode.supports_write_iter_flags();
+        if flags.contains(WriteRequestFlags::NOWAIT)
+            || (!write_iter && flags.bits() & !WriteRequestFlags::HIPRI.bits() != 0)
+        {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let sync = if flags.contains(WriteRequestFlags::SYNC) {
+            WriteSyncIntent::Full
+        } else if flags.contains(WriteRequestFlags::DSYNC) {
+            WriteSyncIntent::Data
+        } else {
+            WriteSyncIntent::None
+        };
+        if !write_iter {
+            return self.write_user_legacy_vectors_at(offset, vectors.iter(), update_offset);
+        }
+        let input = UserBuffer::new_vectored(vectors, len);
+        self.do_write_user(
+            offset,
+            len,
+            &input,
+            update_offset,
+            flags.contains(WriteRequestFlags::APPEND),
+            sync,
         )
+    }
+
+    /// Linux's legacy vector loop: one owner call per current iovec, with
+    /// one successful-prefix publication for the complete syscall. Admission
+    /// and the implicit-position guard belong to the caller.
+    fn write_user_legacy_vectors_at<'a>(
+        &self,
+        offset: usize,
+        iovs: impl Iterator<Item = &'a super::iov::IoVec>,
+        update_offset: bool,
+    ) -> Result<usize, SystemError> {
+        let creator = object_for_task(&ProcessManager::current_pcb());
+        let mut total = 0;
+        let mut position = offset;
+        for (index, iov) in iovs.enumerate() {
+            // iov_iter_init retains a leading empty segment. Only advance
+            // after a complete owner call skips subsequent empty segments.
+            if index != 0 && iov.iov_len == 0 {
+                continue;
+            }
+            let input = unsafe {
+                UserBuffer::new(crate::mm::VirtAddr::new(iov.iov_base as usize), iov.iov_len)
+            };
+            // Recovery is scoped to this unpublished segment. An outer retry
+            // would replay earlier successful owner calls.
+            let attempt = Self::recover_io(|| {
+                self.try_do_write_source(
+                    position,
+                    iov.iov_len,
+                    PrimaryWriteSource::User(&input, &creator),
+                    false,
+                    false,
+                    WriteCompletionPolicy {
+                        operation: None,
+                        sync_intent: WriteSyncIntent::None,
+                        emit_data_fsnotify: false,
+                    },
+                )
+            })
+            .and_then(|result| {
+                let next = result.completion.as_ref().map(|completion| {
+                    match completion.config.offset_update {
+                        OffsetUpdate::Add => position + completion.written_len,
+                        OffsetUpdate::StoreEnd => completion.offset + completion.written_len,
+                        OffsetUpdate::SetPosition(next) => next,
+                    }
+                });
+                self.finish_write(result).map(|written| (written, next))
+            });
+            let (written, next) = match attempt {
+                Ok(completed) => completed,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            total += written;
+            if let Some(next) = next {
+                position = next;
+            }
+            if written != iov.iov_len {
+                break;
+            }
+        }
+        if total != 0 {
+            if update_offset {
+                self.commit_position(position);
+            }
+            self.notify_io_event(FsEvent::MODIFY);
+        }
+        Ok(total)
+    }
+
+    /// Write one scalar, contiguous userspace input. Vectors use the separate entry.
+    pub fn write_user(&self, len: usize, input: &UserBuffer<'_>) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
+        let stream = self.mode.read().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+
+        // Verify the original scalar count before MAX_RW_COUNT admission.
+        self.verify_read_range(input.len())?;
+        self.do_write_user(offset, len, input, !stream, false, WriteSyncIntent::None)
+    }
+
+    /// Preserve vector provenance until the owner chooses its copy units.
+    pub(crate) fn write_user_vectored(
+        &self,
+        vectors: &super::iov::IoVecs,
+    ) -> Result<usize, SystemError> {
+        self.write_user_vectored_with_flags(vectors, 0)
+    }
+
+    pub(crate) fn write_user_vectored_with_flags(
+        &self,
+        vectors: &super::iov::IoVecs,
+        flags: u32,
+    ) -> Result<usize, SystemError> {
+        let _position = self.lock_position();
+        let stream = self.mode().contains(FileMode::FMODE_STREAM);
+        let offset = if stream {
+            0
+        } else {
+            self.offset.load(Ordering::SeqCst)
+        };
+        self.write_user_vectors_at(offset, vectors, !stream, flags)
     }
 
     /// @brief 获取文件的元数据
@@ -1072,40 +3345,91 @@ impl File {
     ///
     /// @param origin 调整的起始位置
     pub fn lseek(&self, origin: SeekFrom) -> Result<usize, SystemError> {
+        let position = self.lock_position();
         let mode = self.mode();
         // Linux 语义：O_PATH fd 的 lseek 返回 EBADF（优先于 ESPIPE）。
         if mode.contains(FileMode::FMODE_PATH) {
             return Err(SystemError::EBADF);
         }
+        if self.inode.has_noop_llseek() {
+            return Ok(self.offset.load(Ordering::SeqCst));
+        }
         if mode.contains(FileMode::FMODE_STREAM) || !mode.contains(FileMode::FMODE_LSEEK) {
             return Err(SystemError::ESPIPE);
         }
 
-        let file_type = self.inode.metadata()?.file_type;
-        // Check for procfs private data. If this is a procfs pseudo-file, disallow SEEK_END
-        // and other unsupported seek modes.
+        // Position-only seeks use the immutable open-file type. In particular,
+        // sysctl llseek remains usable after its table has been unregistered;
+        // attributes are needed only for size-dependent regular-file seeks.
+        let file_type = self.file_type();
+        let mut custom_position = self.offset.load(Ordering::SeqCst);
+        if let Some(result) =
+            self.inode
+                .seek(&mut custom_position, &origin, self.private_data.lock())
         {
-            let pdata = self.private_data.lock();
-            if let FilePrivateData::Procfs(_) = &*pdata {
-                match origin {
-                    SeekFrom::SeekEnd(_) | SeekFrom::Invalid => {
-                        return Err(SystemError::EINVAL);
-                    }
-                    _ => {}
-                }
-            }
+            self.offset.store(custom_position, Ordering::SeqCst);
+            return result.map(|()| custom_position);
         }
-        let pos: i64 = match origin {
-            SeekFrom::SeekSet(offset) => offset,
-            SeekFrom::SeekCurrent(offset) => self.offset.load(Ordering::SeqCst) as i64 + offset,
-            SeekFrom::SeekEnd(offset) => {
-                if FileType::Dir == file_type {
-                    // 对目录，返回 Linux 常见语义：允许 SEEK_END 并返回 MAX_LFS_FILESIZE。
-                    // 测试接受 MAX_LFS_FILESIZE 或 EINVAL，但为通过当前测试选择返回 MAX_LFS_FILESIZE。
+        if file_type == FileType::Dir {
+            let mut state = position.unwrap_or_else(|| self.position_state.lock());
+            let pos = match origin {
+                SeekFrom::SeekSet(offset) => offset,
+                SeekFrom::SeekCurrent(0) => return Ok(self.offset.load(Ordering::SeqCst)),
+                SeekFrom::SeekCurrent(offset) => (self.offset.load(Ordering::SeqCst) as i64)
+                    .checked_add(offset)
+                    .ok_or(SystemError::EINVAL)?,
+                SeekFrom::SeekEnd(_) => {
+                    // Preserve the existing directory SEEK_END behavior.
                     return Ok(MAX_LFS_FILESIZE as usize);
                 }
-                let metadata = self.metadata()?;
-                metadata.size + offset
+                SeekFrom::SeekData(_) | SeekFrom::SeekHole(_) => {
+                    return Err(SystemError::EINVAL);
+                }
+                SeekFrom::Invalid => return Err(SystemError::EINVAL),
+            };
+            if pos < 0 {
+                return Err(SystemError::EINVAL);
+            }
+            if pos == 0 {
+                state.snapshot = None;
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(pos as u64);
+            }
+            self.offset.store(pos as usize, Ordering::SeqCst);
+            return Ok(pos as usize);
+        }
+
+        let pos: i64 = match origin {
+            SeekFrom::SeekSet(offset) => offset,
+            SeekFrom::SeekCurrent(offset) => (self.offset.load(Ordering::SeqCst) as i64)
+                .checked_add(offset)
+                .ok_or(SystemError::EINVAL)?,
+            SeekFrom::SeekEnd(offset) => self
+                .inode
+                .metadata()?
+                .size
+                .checked_add(offset)
+                .ok_or(SystemError::EINVAL)?,
+            SeekFrom::SeekData(offset) => {
+                let metadata = self.inode.metadata()?;
+                if file_type != FileType::File {
+                    return Err(SystemError::EINVAL);
+                }
+                if offset < 0 || offset >= metadata.size {
+                    return Err(SystemError::ENXIO);
+                }
+                offset
+            }
+            SeekFrom::SeekHole(offset) => {
+                let metadata = self.inode.metadata()?;
+                if file_type != FileType::File {
+                    return Err(SystemError::EINVAL);
+                }
+                if offset < 0 || offset >= metadata.size {
+                    return Err(SystemError::ENXIO);
+                }
+                metadata.size
             }
             SeekFrom::Invalid => {
                 return Err(SystemError::EINVAL);
@@ -1157,6 +3481,10 @@ impl File {
             return Err(SystemError::EBADF);
         }
 
+        if !mode.contains(FileMode::FMODE_CAN_WRITE) {
+            return Err(SystemError::EINVAL);
+        }
+
         Ok(())
     }
 
@@ -1165,20 +3493,42 @@ impl File {
     /// ## 参数
     /// - ctx 填充目录项的上下文
     pub fn read_dir(&self, ctx: &mut FilldirContext) -> Result<(), SystemError> {
-        // O_PATH 文件描述符只能用于有限的操作，getdents/getdents64
-        // 在 Linux 中会返回 EBADF。提前检测并返回相同语义。
+        // O_PATH file descriptors cannot be used by getdents/getdents64.
         if self.flags().contains(FileFlags::O_PATH) {
             return Err(SystemError::EBADF);
         }
 
-        // 仅目录允许读取目录项，其它类型遵循 POSIX 语义返回 ENOTDIR。
         if self.file_type() != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
 
-        let inode: &Arc<dyn IndexNode> = &self.inode;
-        let mut current_pos = self.offset.load(Ordering::SeqCst);
+        // Directory iteration state also needs serialization for providers
+        // which opt out of FMODE_ATOMIC_POS (for example a FUSE stream).
+        let mut position = self.position_state.lock();
+        let result = self.read_dir_impl(ctx, &mut position);
+        // Match Linux iterate_dir(): once filesystem iteration has started,
+        // reaching EOF or returning an error both count as directory access.
+        // Keep the position transaction through metadata/notification completion;
+        // the lock order remains position state before inode operations.
+        self.touch_atime_after_access();
+        if fsnotify::has_any_watch()
+            && !self
+                .mode
+                .read()
+                .intersects(FileMode::FMODE_PATH | FileMode::FMODE_NONOTIFY)
+        {
+            self.notify_fs_event(FsEvent::ACCESS);
+        }
+        result
+    }
 
+    fn read_dir_impl(
+        &self,
+        ctx: &mut FilldirContext,
+        state: &mut ReaddirState,
+    ) -> Result<(), SystemError> {
+        let inode: &Arc<dyn IndexNode> = &self.inode;
+        inode.before_read_dir()?;
         // POSIX 标准要求readdir应该返回. 和 ..
         // 但是观察到在现有的子目录中已经包含，不做处理也能正常返回. 和 .. 这里先不做处理
 
@@ -1186,37 +3536,84 @@ impl File {
         // 为了保证在目录内容动态变化（例如 /proc/self/fd）时不会因为重新
         // 创建列表而丢失尚未读取的目录项，这里缓存第一次生成的列表，在
         // 文件偏移被 seek 到 0 之前复用该缓存。
-        let mut cached_names = self.readdir_subdirs_name.lock();
-        if current_pos == 0 || cached_names.is_empty() {
-            *cached_names = inode.list()?;
+        let current_cookie = self.offset.load(Ordering::SeqCst) as u64;
+        if state.snapshot.is_none() {
+            state.snapshot = Some(match inode.list_entries()? {
+                Some(entries) => ReaddirSnapshot::Typed(Arc::from(entries)),
+                None => ReaddirSnapshot::Names(Arc::from(inode.list()?)),
+            });
+            if current_cookie == 0 {
+                state.next_index = 0;
+            } else {
+                state.resume_after_cookie(current_cookie);
+            }
+        } else {
+            let expected_cookie = state.snapshot.as_ref().and_then(|snapshot| {
+                state
+                    .next_index
+                    .checked_sub(1)
+                    .and_then(|index| snapshot.cookie_after(index))
+            });
+            if state.next_index > 0 && expected_cookie != Some(current_cookie) {
+                state.resume_after_cookie(current_cookie);
+            }
         }
-        let readdir_subdirs_name = cached_names.clone();
-        drop(cached_names);
 
-        let subdirs_name_len = readdir_subdirs_name.len();
-        while current_pos < subdirs_name_len {
-            let name = &readdir_subdirs_name[current_pos];
-            let sub_inode: Arc<dyn IndexNode> = match inode.find(name) {
-                Ok(i) => i,
-                Err(e) => {
-                    if e == SystemError::ENOENT {
-                        // 目录项在本次读取过程中被移除，跳过它，继续读取后续条目
-                        self.offset.fetch_add(1, Ordering::SeqCst);
-                        current_pos += 1;
-                        continue;
-                    }
-                    error!("Readdir error: Failed to find sub inode");
-                    return Err(e);
+        let snapshot = state
+            .snapshot
+            .as_ref()
+            .expect("readdir snapshot initialized")
+            .clone();
+        if state.next_index > snapshot.len() {
+            return Err(SystemError::EINVAL);
+        }
+        while state.next_index < snapshot.len() {
+            let index = state.next_index;
+            let (name, cookie, metadata) = match &snapshot {
+                ReaddirSnapshot::Typed(entries) => {
+                    let entry = &entries[index];
+                    (
+                        entry.name.as_slice(),
+                        entry.next_cookie,
+                        Some((entry.ino, entry.d_type)),
+                    )
+                }
+                ReaddirSnapshot::Names(names) => {
+                    let name = &names[index];
+                    (name.as_bytes(), (index + 1) as u64, None)
                 }
             };
-
-            let inode_metadata = sub_inode.metadata().unwrap();
-            let entry_ino = inode_metadata.inode_id.into() as u64;
-            let entry_d_type = inode_metadata.file_type.get_file_type_num() as u8;
-            match ctx.fill_dir(name, current_pos, entry_ino, entry_d_type) {
+            let next_cookie = checked_dirent_cookie(cookie)?;
+            let (ino, d_type) = if let Some(metadata) = metadata {
+                metadata
+            } else {
+                let entry = match name {
+                    b"." => inode.metadata().map(|md| (inode.reported_ino(&md), md)),
+                    b".." => inode.parent().and_then(|parent| {
+                        parent.metadata().map(|md| (parent.reported_ino(&md), md))
+                    }),
+                    _ => inode
+                        .find_bytes(name)
+                        .and_then(|child| child.metadata().map(|md| (child.reported_ino(&md), md))),
+                };
+                let (ino, metadata) = match entry {
+                    Ok(entry) => entry,
+                    Err(SystemError::ENOENT) => {
+                        state.next_index += 1;
+                        self.offset.store(next_cookie, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                (
+                    ino.into() as u64,
+                    metadata.file_type.get_file_type_num() as u8,
+                )
+            };
+            match ctx.fill_dir(name, next_cookie, ino, d_type) {
                 Ok(_) => {
-                    self.offset.fetch_add(1, Ordering::SeqCst);
-                    current_pos += 1;
+                    state.next_index += 1;
+                    self.offset.store(next_cookie, Ordering::SeqCst);
                 }
                 Err(SystemError::EINVAL) => {
                     return Ok(());
@@ -1234,36 +3631,125 @@ impl File {
         return self.inode.clone();
     }
 
+    /// Inode selected by the pathname that opened this file. Special-file I/O
+    /// may use a substituted runtime inode, but procfs fd links and fsnotify
+    /// must retain Linux file->f_path identity.
+    #[inline]
+    pub(crate) fn path_inode(&self) -> Arc<dyn IndexNode> {
+        self.fsnotify_path_inode
+            .clone()
+            .unwrap_or_else(|| self.inode.clone())
+    }
+
+    /// Invoke an operation on the filesystem selected for this open file.
+    ///
+    /// Pathname-backed files retain their selected mount and therefore avoid
+    /// both a topology lookup and an Arc refcount operation in fault hot paths.
+    /// Anonymous/pseudo files fall back lazily because several such inodes do
+    /// not implement `fs()` and must remain constructible (for example epoll).
+    #[inline]
+    pub fn with_io_fs<T>(&self, op: impl FnOnce(&dyn FileSystem) -> T) -> T {
+        if let Some(fs) = self.io_fs.as_ref() {
+            op(fs.as_ref())
+        } else {
+            let fs = self.inode.fs();
+            op(fs.as_ref())
+        }
+    }
+
     /// @brief 尝试克隆一个文件
     ///
-    /// @return Option<File> 克隆后的文件结构体。如果克隆失败，返回None
-    pub fn try_clone(&self) -> Option<File> {
-        let res = Self {
+    /// Allocation failures retain their admission scope until lock-free recovery.
+    pub fn try_clone(&self) -> Result<File, MemoryAllocationError> {
+        let position = self.position_state.lock();
+        let storage = PreparedFile::try_new()?;
+        let inode_retention =
+            InodeRetentionGuard::new(self.inode.clone(), InodeRetentionKind::OpenFileDescription)?;
+        let path_inode_retention = self
+            ._path_inode_retention
+            .as_ref()
+            .map(|retention| retention.derive_existing(InodeRetentionKind::OpenFileDescription));
+        let flags = self.flags();
+        let mut mode = self.mode();
+        let mount_writer = self
+            ._mount_writer
+            .as_ref()
+            .map(MountWriteGuard::derive)
+            .transpose()?;
+        let private_data = Mutex::new(self.private_data.lock().clone());
+        let mount_guard = self
+            ._mount_guard
+            .as_ref()
+            .map(MountExternalGuard::derive)
+            .transpose()?;
+
+        if !mode.contains(FileMode::FMODE_PATH) {
+            self.inode.open(private_data.lock(), &flags)?;
+        }
+
+        let (post_write_sync, data_file_write_checks, direct_io) =
+            if mode.contains(FileMode::FMODE_PATH) {
+                (
+                    PostWriteSyncPolicy::NotApplicable,
+                    false,
+                    DirectIoPolicy::Unsupported,
+                )
+            } else {
+                Self::configure_base_open_mode(&self.inode, self.file_type, &mut mode);
+                let mut behavior = OpenFileBehavior::new(mode, self.file_type);
+                self.inode
+                    .configure_open_file(&private_data.lock(), &mut behavior);
+                if behavior.direct_io != DirectIoPolicy::Unsupported {
+                    behavior.mode.insert(FileMode::FMODE_CAN_ODIRECT);
+                }
+                mode = behavior.mode;
+                if flags.contains(FileFlags::O_DIRECT)
+                    && !(self.internal_pseudo && self.file_type == FileType::Pipe)
+                    && behavior.direct_io == DirectIoPolicy::Unsupported
+                {
+                    self.inode.close(private_data.lock())?;
+                    return Err(SystemError::EINVAL.into());
+                }
+                (
+                    behavior.post_write_sync,
+                    behavior.data_file_write_checks,
+                    behavior.direct_io,
+                )
+            };
+
+        let res = storage.init(|epitems| FileData {
             open_file_id: alloc_open_file_id(),
             inode: self.inode.clone(),
+            fsnotify_path_inode: self.fsnotify_path_inode.clone(),
+            io_fs: self.io_fs.clone(),
             offset: AtomicUsize::new(self.offset.load(Ordering::SeqCst)),
-            flags: RwSem::new(self.flags()),
-            mode: RwSem::new(self.mode()),
+            flags: RwSem::new(flags),
+            fasync_lock: Mutex::new(()),
+            mode: RwSem::new(mode),
             file_type: self.file_type,
-            readdir_subdirs_name: Mutex::new(self.readdir_subdirs_name.lock().clone()),
-            private_data: Mutex::new(self.private_data.lock().clone()),
+            post_write_sync,
+            data_file_write_checks,
+            direct_io,
+            internal_pseudo: self.internal_pseudo,
+            position_state: Mutex::new(position.clone()),
+            private_data,
             cred: self.cred.clone(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key: self.posix_lock_key,
+            mapped_file_identity: self.mapped_file_identity,
+            append_lock_domain: self.append_lock_domain.clone(),
             ra_state: Mutex::new(self.ra_state.lock().clone()),
-            wb_error_seq: AtomicU64::new(self.wb_error_seq.load(Ordering::Acquire)),
-        };
-        // 调用inode的open方法，让inode知道有新的文件打开了这个inode
-        // TODO: reopen is not a good idea for some inodes, need a better design
-        if self
-            .inode
-            .open(res.private_data.lock(), &res.flags())
-            .is_err()
-        {
-            return None;
-        }
-
-        return Some(res);
+            wb_error_seq: Mutex::new(*self.wb_error_seq.lock()),
+            sb_error_seq: Mutex::new(*self.sb_error_seq.lock()),
+            epitems,
+            _write_access: self._write_access.clone(),
+            _mount_writer: mount_writer,
+            pending_truncate_writer: None,
+            _inode_retention: inode_retention,
+            _path_inode_retention: path_inode_retention,
+            _mount_guard: mount_guard,
+        });
+        return Ok(res);
     }
 
     /// @brief 获取文件的类型
@@ -1282,19 +3768,24 @@ impl File {
         self.posix_lock_key
     }
 
+    /// Immutable mapping identity; no filesystem operation or allocation.
+    #[inline]
+    pub(crate) fn mapped_file_identity(&self) -> (usize, InodeId) {
+        self.mapped_file_identity
+    }
+
     /// 获取当前文件偏移（等价于用户态的 file position）。
     #[inline]
     pub fn pos(&self) -> usize {
         self.offset.load(Ordering::SeqCst)
     }
 
-    /// 推进当前文件偏移。
-    #[inline]
-    pub fn advance_pos(&self, delta: usize) {
-        if delta == 0 {
-            return;
+    /// Commit a syscall-owned cursor. Stream objects have no file
+    /// position. The caller owns the implicit-position transaction.
+    pub(crate) fn commit_position(&self, position: usize) {
+        if !self.mode().contains(FileMode::FMODE_STREAM) {
+            self.offset.store(position, Ordering::SeqCst);
         }
-        self.offset.fetch_add(delta, Ordering::SeqCst);
     }
 
     /// 检查文件是否为普通文件或目录
@@ -1334,6 +3825,11 @@ impl File {
         // todo: 是否需要调用inode的open方法，以更新private data（假如它与flags有关的话）?
         // 也许需要加个更好的设计，让inode知晓文件的打开模式发生了变化，让它自己决定是否需要更新private data
 
+        // Preserve lifecycle-driven FASYNC changes while merging the other
+        // status flags. This lock is also held by fasync registration and TTY
+        // hangup cleanup.
+        let _fasync_guard = self.fasync_lock.lock();
+
         // 访问模式不可修改
         let old_flags = self.flags();
         let old_accflags = old_flags.access_flags();
@@ -1347,16 +3843,71 @@ impl File {
         const SETFL_MASK: u32 = FileFlags::O_APPEND.bits()
             | FileFlags::O_NONBLOCK.bits()
             | FileFlags::O_DIRECT.bits()
-            | FileFlags::O_NOATIME.bits()
-            | FileFlags::FASYNC.bits();
+            | FileFlags::O_NOATIME.bits();
 
         let new_bits = (new_flags.bits() & SETFL_MASK) | (old_flags.bits() & !SETFL_MASK);
         new_flags = FileFlags::from_bits_truncate(new_bits);
 
+        if new_flags.contains(FileFlags::O_DIRECT)
+            && self.file_type != FileType::Pipe
+            && self.direct_io == DirectIoPolicy::Unsupported
+        {
+            return Err(SystemError::EINVAL);
+        }
+        self.private_data.lock().update_flags(new_flags)?;
+        // Socket operations such as accept consult their cached mode. Keep it
+        // coherent for both F_SETFL and FIONBIO, under the same update lock.
+        if let Some(socket) = self.inode.as_socket() {
+            socket.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+        }
         // 更新文件的打开模式
         *self.flags.write() = new_flags;
-        self.private_data.lock().update_flags(new_flags);
+
+        // Sync the O_NONBLOCK change to the inotify fd (its read_at checks an internal AtomicBool rather than FileFlags,
+        // same as socket's set_nonblocking).
+        if new_flags.contains(FileFlags::O_NONBLOCK) != old_flags.contains(FileFlags::O_NONBLOCK) {
+            if let Some(ino) = self
+                .inode
+                .as_any_ref()
+                .downcast_ref::<crate::filesystem::inotify::InotifyInode>()
+            {
+                ino.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
+            }
+        }
         return Ok(());
+    }
+
+    /// Serialize a fasync registration update with the corresponding status
+    /// bit commit.
+    ///
+    /// Keeping the dedicated fasync lock across the inode callback lets inode
+    /// lifecycle paths (notably TTY hangup) clear a registered item and its
+    /// FASYNC bit without racing a delayed post-callback commit.
+    pub(crate) fn update_fasync_flag<F>(&self, enabled: bool, update: F) -> Result<(), SystemError>
+    where
+        F: FnOnce() -> Result<bool, SystemError>,
+    {
+        let _guard = self.fasync_lock.lock();
+        if self.flags().contains(FileFlags::FASYNC) == enabled {
+            return Ok(());
+        }
+
+        if update()? {
+            let mut flags = self.flags.write();
+            if enabled {
+                flags.insert(FileFlags::FASYNC);
+            } else {
+                flags.remove(FileFlags::FASYNC);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear the handler-owned FASYNC status bit during inode teardown.
+    pub(crate) fn clear_fasync_flag(&self) {
+        let _guard = self.fasync_lock.lock();
+        let mut flags = self.flags.write();
+        flags.remove(FileFlags::FASYNC);
     }
 
     /// @brief 重新设置文件的大小
@@ -1392,8 +3943,15 @@ impl File {
             return Err(SystemError::EFBIG);
         }
 
-        // 统一通过 VFS 封装，复用类型/只读检查
-        crate::filesystem::vfs::vcore::vfs_truncate(self.inode(), len)?;
+        // 统一通过 VFS 封装，复用类型/只读检查，同时保留 fd 上下文。
+        Self::recover_io(|| {
+            crate::filesystem::vfs::vcore::vfs_truncate_file(
+                self.inode(),
+                len,
+                crate::filesystem::vfs::vcore::current_file_lock_owner_id(),
+                || self.private_data.lock(),
+            )
+        })?;
         return Ok(());
     }
 
@@ -1402,15 +3960,20 @@ impl File {
         let private_data = self.private_data.lock();
         self.inode
             .as_pollable_inode()?
-            .add_epitem(epitem, &private_data)
+            .add_epitem(epitem.clone(), &private_data)?;
+        self.epitems.add(epitem);
+        Ok(())
     }
 
     /// Remove epitems associated with the epoll
     pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
         let private_data = self.private_data.lock();
-        self.inode
+        let result = self
+            .inode
             .as_pollable_inode()?
-            .remove_epitem(epitem, &private_data)
+            .remove_epitem(epitem, &private_data);
+        let _ = self.epitems.remove(epitem);
+        result
     }
 
     /// Poll the file for events
@@ -1425,17 +3988,29 @@ impl File {
         self.inode.as_pollable_inode().is_ok()
     }
 
-    pub fn owner(&self) -> Option<RawPid> {
-        self.owner
-            .lock()
-            .pcb
-            .as_ref()
-            .map(|pcb| pcb.pid().pid_vnr())
+    pub fn owner(&self) -> i32 {
+        let (kind, pid) = self.owner_identity();
+        if kind == PidType::PGID {
+            -pid
+        } else {
+            pid
+        }
     }
 
     /// Get the owner process control block
     pub fn get_owner(&self) -> Option<Arc<ProcessControlBlock>> {
-        self.owner.lock().pcb.clone()
+        let owner = self.owner_snapshot();
+        owner.pid.as_ref()?.pid_task(owner.pid_type)
+    }
+
+    pub(crate) fn owner_identity(&self) -> (PidType, i32) {
+        let owner = self.owner_snapshot();
+        let nr = owner
+            .pid
+            .as_ref()
+            .filter(|pid| pid.has_task(owner.pid_type))
+            .map_or(0, |pid| pid.pid_vnr().data() as i32);
+        (owner.pid_type, nr)
     }
 
     pub fn owner_snapshot(&self) -> FileOwnerSnapshot {
@@ -1444,11 +4019,34 @@ impl File {
 
     /// Set a process (group) as owner of the file descriptor.
     ///
-    /// Such that this process (group) will receive `SIGIO` and `SIGURG` signals
-    /// for I/O events on the file descriptor, if `O_ASYNC` status flag is set
-    /// on this file.
-    pub fn set_owner(&self, pid: Option<Arc<ProcessControlBlock>>) -> Result<(), SystemError> {
-        self.owner.lock().pcb = pid;
+    /// SIGIO additionally requires O_ASYNC; SIGURG does not.
+    pub fn set_owner(self: &Arc<Self>, nr: i32) -> Result<(), SystemError> {
+        let pid = nr.checked_abs().ok_or(SystemError::EINVAL)?;
+        let kind = if nr < 0 { PidType::PGID } else { PidType::TGID };
+        self.set_owner_identity(kind, pid)
+    }
+
+    pub(crate) fn set_owner_identity(
+        self: &Arc<Self>,
+        kind: PidType,
+        nr: i32,
+    ) -> Result<(), SystemError> {
+        let pid = if nr == 0 {
+            None
+        } else {
+            Some(ProcessManager::find_vpid(RawPid::from(nr as usize)).ok_or(SystemError::ESRCH)?)
+        };
+        // Publish the weak notification route before the target becomes live.
+        // Socket callbacks must not run while the file owner lock is held.
+        if let Ok(pollable) = self.inode.as_pollable_inode() {
+            pollable.set_owner_file(Arc::downgrade(self));
+        }
+        let cred = ProcessManager::current_pcb().cred();
+        let mut owner = self.owner.lock();
+        owner.pid = pid;
+        owner.pid_type = kind;
+        owner.uid = cred.uid;
+        owner.euid = cred.euid;
         Ok(())
     }
 
@@ -1492,419 +4090,53 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        super::flock::release_all_for_file(self);
-        if self.mode.read().contains(FileMode::FMODE_WRITER) {
-            if let Some(mnt_inode) = self.inode.clone().downcast_arc::<MountFSInode>() {
-                mnt_inode.mount_fs().dec_write_count();
-            }
+        // A pending open that failed never acquired an open handle, fasync
+        // registration or close event. Its owned resources still retire below.
+        if !self.mode().contains(FileMode::FMODE_OPENED) {
+            return;
         }
-        let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
-        // 打印错误信息
-        if let Err(e) = r {
-            error!(
-                "pid: {:?} failed to close file: {:?}, errno={:?}",
-                ProcessManager::current_pcb().raw_pid(),
-                self,
-                e
-            );
+        let epitems = self.epitems.take_all();
+        for epitem in epitems {
+            EventPoll::release_file_epitem(&epitem);
+            let _ = self.remove_epitem(&epitem);
         }
-    }
-}
-
-/// @brief pcb里面的文件描述符数组
-#[derive(Debug)]
-pub struct FileDescriptorVec {
-    /// 当前进程打开的文件描述符
-    fds: Vec<Option<Arc<File>>>,
-    /// per-fd 的 close_on_exec 标志（与 fds 并行，对应 Linux fdtable.close_on_exec 位图）
-    cloexec: Vec<bool>,
-    /// POSIX record lock owner id，对齐 Linux current->files 语义。
-    lock_owner_id: usize,
-    /// 下一个可能空闲的文件描述符号（用于优化分配，避免O(n²)扫描）
-    /// 类似于 Linux 的 fd_next_fd
-    next_fd: usize,
-}
-impl Default for FileDescriptorVec {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl FileDescriptorVec {
-    /// 文件描述符表的初始容量
-    pub const INITIAL_CAPACITY: usize = 1024;
-    /// 文件描述符表的最大容量限制（防止无限扩容）
-    pub const MAX_CAPACITY: usize = 1048576;
-
-    #[inline(never)]
-    pub fn new() -> FileDescriptorVec {
-        let mut data = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
-        data.resize(FileDescriptorVec::INITIAL_CAPACITY, None);
-
-        let mut cloexec = Vec::with_capacity(FileDescriptorVec::INITIAL_CAPACITY);
-        cloexec.resize(FileDescriptorVec::INITIAL_CAPACITY, false);
-
-        // 初始化文件描述符数组结构体
-        return FileDescriptorVec {
-            fds: data,
-            cloexec,
-            lock_owner_id: alloc_lock_owner_id(),
-            next_fd: 0,
-        };
-    }
-
-    /// @brief 克隆一个文件描述符数组
-    ///
-    /// 语义对齐 Linux dup_fd/new files_struct：
-    /// - 复制 fd 与 cloexec 状态
-    /// - 分配新的 record-lock owner（POSIX 锁 owner 绑定 files table）
-    ///   因此 fork 出来的新进程不会与父进程共享 POSIX record lock owner。
-    ///
-    /// @return FileDescriptorVec 克隆后的文件描述符数组
-    pub fn clone(&self) -> FileDescriptorVec {
-        let mut res = FileDescriptorVec::new();
-        // 调整容量以匹配源文件描述符表
-        let _ = res.resize_to_capacity(self.fds.len());
-
-        for i in 0..self.fds.len() {
-            if let Some(file) = &self.fds[i] {
-                res.fds[i] = Some(file.clone());
-                res.cloexec[i] = self.cloexec[i];
-            }
-        }
-        // 复制 next_fd 以保持相同的分配状态
-        res.next_fd = self.next_fd;
-        // 新 fd table 必须拥有新的 record-lock owner（对齐 Linux 新 files_struct）。
-        res.lock_owner_id = alloc_lock_owner_id();
-        return res;
-    }
-
-    /// 返回当前已占用的最高文件描述符索引（若无则为None）
-    #[inline]
-    fn highest_open_index(&self) -> Option<usize> {
-        // 从高到低查找第一个占用的槽位
-        (0..self.fds.len()).rev().find(|&i| self.fds[i].is_some())
-    }
-
-    /// 扩容文件描述符表到指定容量
-    ///
-    /// ## 参数
-    /// - `new_capacity`: 新的容量大小
-    ///
-    /// ## 返回值
-    /// - `Ok(())`: 扩容成功
-    /// - `Err(SystemError)`: 扩容失败
-    fn resize_to_capacity(&mut self, new_capacity: usize) -> Result<(), SystemError> {
-        if new_capacity > FileDescriptorVec::MAX_CAPACITY {
-            return Err(SystemError::EMFILE);
-        }
-
-        let current_len = self.fds.len();
-        if new_capacity > current_len {
-            // 扩容：扩展向量并填充None/false
-            // 使用 try_reserve 先检查内存分配是否可能成功
-            if self.fds.try_reserve(new_capacity - current_len).is_err() {
-                return Err(SystemError::ENOMEM);
-            }
-            if self
-                .cloexec
-                .try_reserve(new_capacity - current_len)
-                .is_err()
+        // fsnotify: the final close → IN_CLOSE_WRITE / IN_CLOSE_NOWRITE (FMODE_NONOTIFY short-circuits).
+        // At this point self.inode is still alive (Drop runs before inode.close()), so it is safe to take the inode_id.
+        if fsnotify::has_any_watch() {
+            let mode = *self.mode.read();
+            if mode.contains(FileMode::FMODE_OPENED)
+                && !mode.intersects(FileMode::FMODE_NONOTIFY | FileMode::FMODE_PATH)
             {
-                return Err(SystemError::ENOMEM);
-            }
-            self.fds.resize(new_capacity, None);
-            self.cloexec.resize(new_capacity, false);
-        } else if new_capacity < current_len {
-            // 缩容：允许，但不能丢弃仍在使用的高位fd。
-            // 若高位fd仍在使用，将缩容目标提升到 (最高已用fd + 1)。
-            let floor = self.highest_open_index().map(|idx| idx + 1).unwrap_or(0);
-            let target = core::cmp::max(new_capacity, floor);
-            if target < current_len {
-                self.fds.truncate(target);
-                self.cloexec.truncate(target);
-                // 确保 next_fd 不超过新的容量
-                if self.next_fd > target {
-                    self.next_fd = target;
-                }
+                let m = if mode.contains(FileMode::FMODE_WRITE) {
+                    FsEvent::CLOSE_WRITE
+                } else {
+                    FsEvent::CLOSE_NOWRITE
+                };
+                self.notify_fs_event(m);
             }
         }
-        Ok(())
-    }
 
-    /// 返回 `已经打开的` 文件描述符的数量
-    pub fn fd_open_count(&self) -> usize {
-        let mut size = 0;
-        for fd in &self.fds {
-            if fd.is_some() {
-                size += 1;
+        if self.flags().contains(FileFlags::FASYNC) {
+            if let Ok(pollable) = self.inode.as_pollable_inode() {
+                let private_data = self.private_data.lock();
+                let _ = pollable.release_fasync(self, &private_data);
             }
         }
-        return size;
-    }
 
-    /// @brief 判断文件描述符序号是否合法
-    ///
-    /// @return true 合法
-    ///
-    /// @return false 不合法
-    #[inline]
-    pub fn validate_fd(&self, fd: i32) -> bool {
-        return !(fd < 0 || fd as usize >= self.fds.len());
-    }
-
-    /// 申请文件描述符，并把文件对象存入其中。
-    ///
-    /// ## 参数
-    ///
-    /// - `file` 要存放的文件对象
-    /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符，如果这个文件描述符已经被使用，那么返回EBADF
-    /// - `cloexec` 是否设置 close_on_exec 标志（per-fd 属性）
-    ///
-    /// ## 返回值
-    ///
-    /// - `Ok(i32)` 申请成功，返回申请到的文件描述符
-    /// - `Err(SystemError)` 申请失败，返回错误码，并且，file对象将被drop掉
-    pub fn alloc_fd(
-        &mut self,
-        file: File,
-        fd: Option<i32>,
-        cloexec: bool,
-    ) -> Result<i32, SystemError> {
-        self.alloc_fd_arc(Arc::new(file), fd, cloexec)
-    }
-
-    /// 申请文件描述符，并把已有的 Arc<File> 存入其中。
-    ///
-    /// 用于 dup/dup2/dup3 等需要多个 fd 共享同一个 open file description 的场景。
-    ///
-    /// ## 参数
-    ///
-    /// - `file` 要存放的文件对象（Arc 引用）
-    /// - `fd` 如果为Some(i32)，表示指定要申请这个文件描述符
-    /// - `cloexec` 是否设置 close_on_exec 标志（per-fd 属性）
-    pub fn alloc_fd_arc(
-        &mut self,
-        file: Arc<File>,
-        fd: Option<i32>,
-        cloexec: bool,
-    ) -> Result<i32, SystemError> {
-        // 获取RLIMIT_NOFILE限制
-        let nofile_limit = crate::process::ProcessManager::current_pcb()
-            .get_rlimit(crate::process::resource::RLimitID::Nofile)
-            .rlim_cur as usize;
-
-        if let Some(new_fd) = fd {
-            // 检查指定的文件描述符是否在有效范围内
-            if new_fd < 0 || new_fd as usize >= nofile_limit {
-                return Err(SystemError::EMFILE);
-            }
-
-            // 如果指定的fd超出当前容量，需要扩容
-            if new_fd as usize >= self.fds.len() {
-                self.resize_to_capacity(new_fd as usize + 1)?;
-            }
-
-            let x = &mut self.fds[new_fd as usize];
-            if x.is_none() {
-                *x = Some(file);
-                self.cloexec[new_fd as usize] = cloexec;
-                // 更新 next_fd：如果分配的是 next_fd 位置，则推进到下一个
-                if new_fd as usize == self.next_fd {
-                    self.next_fd = new_fd as usize + 1;
-                }
-                return Ok(new_fd);
-            } else {
-                return Err(SystemError::EBADF);
-            }
-        } else {
-            // 没有指定要申请的文件描述符编号
-            // 使用 next_fd 作为起始搜索位置，避免每次都从0开始扫描 (O(n²) -> O(n))
-            let max_search = core::cmp::min(self.fds.len(), nofile_limit);
-
-            // 从 next_fd 开始查找空位
-            for i in self.next_fd..max_search {
-                if self.fds[i].is_none() {
-                    self.fds[i] = Some(file);
-                    self.cloexec[i] = cloexec;
-                    // 更新 next_fd 为下一个位置
-                    self.next_fd = i + 1;
-                    return Ok(i as i32);
-                }
-            }
-
-            // 当前容量内没有空位，尝试扩容
-            // 计算新的容量：当前容量翻倍，但不超过 nofile_limit
-            let current_len = self.fds.len();
-            if current_len < nofile_limit {
-                // 扩容策略：翻倍或增加到 nofile_limit，取较小值
-                let new_capacity = core::cmp::min(
-                    core::cmp::max(current_len * 2, current_len + 1),
-                    nofile_limit,
+        super::flock::release_all_for_file(self);
+        if self.mode().contains(FileMode::FMODE_OPENED)
+            && !self.mode().contains(FileMode::FMODE_PATH)
+        {
+            let r: Result<(), SystemError> = self.inode.close(self.private_data.lock());
+            // 打印错误信息
+            if let Err(e) = r {
+                error!(
+                    "pid: {:?} failed to close file: {:?}, errno={:?}",
+                    ProcessManager::current_pcb().raw_pid(),
+                    self,
+                    e
                 );
-                self.resize_to_capacity(new_capacity)?;
-
-                // 扩容后，第一个新位置就是空的
-                let new_fd = current_len;
-                self.fds[new_fd] = Some(file);
-                self.cloexec[new_fd] = cloexec;
-                // 更新 next_fd
-                self.next_fd = new_fd + 1;
-                return Ok(new_fd as i32);
-            }
-
-            return Err(SystemError::EMFILE);
-        }
-    }
-
-    /// 根据文件描述符序号，获取文件结构体的Arc指针
-    ///
-    /// ## 参数
-    ///
-    /// - `fd` 文件描述符序号
-    pub fn get_file_by_fd(&self, fd: i32) -> Option<Arc<File>> {
-        if !self.validate_fd(fd) {
-            return None;
-        }
-        self.fds[fd as usize].clone()
-    }
-
-    /// 根据文件描述符序号，获取文件结构体的Arc指针, 并检测FileMode
-    ///
-    /// ## 参数
-    ///
-    /// - `fd` 文件描述符序号
-    pub fn get_file_by_fd_not_raw(&self, fd: i32, mask: FileMode) -> Option<Arc<File>> {
-        if !self.validate_fd(fd) {
-            return None;
-        }
-        let file = self.fds[fd as usize].clone();
-        file.filter(|f| !f.mode().contains(mask))
-    }
-
-    /// 当RLIMIT_NOFILE变化时调整文件描述符表容量
-    ///
-    /// ## 参数
-    /// - `new_rlimit_nofile`: 新的RLIMIT_NOFILE值
-    ///
-    /// ## 返回值
-    /// - `Ok(())`: 调整成功
-    /// - `Err(SystemError)`: 调整失败
-    pub fn adjust_for_rlimit_change(
-        &mut self,
-        new_rlimit_nofile: usize,
-    ) -> Result<(), SystemError> {
-        // 目标容量不超过实现上限
-        let desired = core::cmp::min(new_rlimit_nofile, FileDescriptorVec::MAX_CAPACITY);
-        if desired >= self.fds.len() {
-            // rlimit 变大：扩容到 desired
-            self.resize_to_capacity(desired)
-        } else {
-            // rlimit 变小：按用户建议，缩容到 max(desired, 最高已用fd+1)
-            let floor = self.highest_open_index().map(|idx| idx + 1).unwrap_or(0);
-            let target = core::cmp::max(desired, floor);
-            self.resize_to_capacity(target)
-        }
-    }
-
-    /// 释放文件描述符，同时关闭文件。
-    ///
-    /// ## 参数
-    ///
-    /// - `fd` 文件描述符序号
-    pub fn drop_fd(&mut self, fd: i32) -> Result<Arc<File>, SystemError> {
-        self.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
-
-        // 把文件描述符数组对应位置设置为空
-        let file = self.fds[fd as usize].take().unwrap();
-        super::posix_lock::release_posix_for_file_owner(&file, self.lock_owner_id);
-        // 清除 per-fd close_on_exec 标志
-        self.cloexec[fd as usize] = false;
-
-        // 更新 next_fd：如果释放的fd比当前next_fd小，则更新next_fd
-        // 这确保下次分配时可以复用较小的fd号，符合POSIX语义
-        // （POSIX要求分配最小可用的fd号）
-        if (fd as usize) < self.next_fd {
-            self.next_fd = fd as usize;
-        }
-
-        return Ok(file);
-    }
-
-    #[allow(dead_code)]
-    pub fn iter(&self) -> FileDescriptorIterator<'_> {
-        return FileDescriptorIterator::new(self);
-    }
-
-    /// 获取指定 fd 的 close_on_exec 标志
-    #[inline]
-    pub fn get_cloexec(&self, fd: i32) -> bool {
-        if !self.validate_fd(fd) {
-            return false;
-        }
-        self.cloexec[fd as usize]
-    }
-
-    /// 设置指定 fd 的 close_on_exec 标志
-    #[inline]
-    pub fn set_cloexec(&mut self, fd: i32, val: bool) {
-        if self.validate_fd(fd) {
-            self.cloexec[fd as usize] = val;
-        }
-    }
-
-    #[inline]
-    pub fn lock_owner_id(&self) -> usize {
-        self.lock_owner_id
-    }
-
-    /// 在 execve 时关闭所有设置了 close_on_exec 的文件描述符
-    pub fn close_on_exec(&mut self) {
-        for i in 0..self.fds.len() {
-            if self.fds[i].is_some() && self.cloexec[i] {
-                if let Err(r) = self.drop_fd(i as i32) {
-                    error!(
-                        "Failed to close file: pid = {:?}, fd = {}, error = {:?}",
-                        ProcessManager::current_pcb().raw_pid(),
-                        i,
-                        r
-                    );
-                }
             }
         }
-    }
-}
-
-impl Drop for FileDescriptorVec {
-    fn drop(&mut self) {
-        for file in self.fds.iter().filter_map(|f| f.as_ref()) {
-            super::posix_lock::release_posix_for_file_owner(file, self.lock_owner_id);
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct FileDescriptorIterator<'a> {
-    fds: &'a FileDescriptorVec,
-    index: usize,
-}
-
-impl<'a> FileDescriptorIterator<'a> {
-    pub fn new(fds: &'a FileDescriptorVec) -> Self {
-        return Self { fds, index: 0 };
-    }
-}
-
-impl Iterator for FileDescriptorIterator<'_> {
-    type Item = (i32, Arc<File>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.fds.fds.len() {
-            let fd = self.index as i32;
-            self.index += 1;
-            if let Some(file) = self.fds.get_file_by_fd(fd) {
-                return Some((fd, file));
-            }
-        }
-        return None;
     }
 }

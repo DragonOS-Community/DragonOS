@@ -154,7 +154,7 @@
 ```json
 [
   {
-    "agent": "Security Sentinel",
+    "agent": "Security & Concurrency Sentinel",
     "status": "accepted",
     "bucket_id": "BUG-001",
     "reason": "fixed in follow-up patch",
@@ -173,8 +173,8 @@
 ```json
 {
   "suggested_weights": {
-    "Security Sentinel": 4.8,
-    "Diverse Reviewer A": 2.4
+    "Security & Concurrency Sentinel": 4.2,
+    "Logic & Correctness Reviewer": 3.1
   }
 }
 ```
@@ -182,4 +182,4 @@
 `weighted_vote.py` 同时兼容：
 
 - `{"suggested_weights": {...}}`
-- `{"Security Sentinel": 5.0, "Concurrency Engineer": 4.0}`
+- `{"Security & Concurrency Sentinel": 4.0, "Logic & Correctness Reviewer": 3.0}`

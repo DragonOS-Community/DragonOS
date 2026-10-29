@@ -1,13 +1,11 @@
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::rand::rand;
 use crate::arch::syscall::nr::SYS_GETRANDOM;
-use crate::libs::rand::GRandFlags;
+use crate::libs::rand::{read_random_output, GRandFlags};
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::UserBufferWriter;
+use crate::syscall::user_buffer::UserBuffer;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use core::cmp;
 use system_error::SystemError;
 
 /// System call handler for the `getrandom` syscall
@@ -28,8 +26,8 @@ impl SysGetRandomHandle {
     }
 
     /// Extracts the flags from syscall arguments
-    fn flags(args: &[usize]) -> u8 {
-        args[2] as u8
+    fn flags(args: &[usize]) -> u32 {
+        args[2] as u32
     }
 }
 
@@ -47,19 +45,21 @@ impl Syscall for SysGetRandomHandle {
     /// * `args` - Array containing:
     ///   - args[0]: Buffer pointer (*mut u8)
     ///   - args[1]: Buffer length (usize)
-    ///   - args[2]: Flags (u8): GRND_NONBLOCK, GRND_RANDOM, GRND_INSECURE
+    ///   - args[2]: Flags (u32): GRND_NONBLOCK, GRND_RANDOM, GRND_INSECURE
     /// * `_frame` - Trap frame (unused)
     ///
     /// # Returns
     /// * `Ok(usize)` - Number of bytes written on success
     /// * `Err(SystemError)` - Error code if operation fails
     ///
-    /// Note: This syscall implementation differs from Linux as there is currently
-    /// no other random source available.
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let buf = Self::buf(args);
         let len = Self::len(args);
-        let flags = GRandFlags::from_bits(Self::flags(args)).ok_or(SystemError::EINVAL)?;
+        let raw_flags = Self::flags(args);
+        if raw_flags & !(GRandFlags::all().bits() as u32) != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        let flags = GRandFlags::from_bits(raw_flags as u8).ok_or(SystemError::EINVAL)?;
 
         do_get_random(buf, len, flags)
     }
@@ -93,32 +93,19 @@ syscall_table_macros::declare_syscall!(SYS_GETRANDOM, SysGetRandomHandle);
 /// * `Ok(usize)` - Number of bytes written
 /// * `Err(SystemError)` - Error code if operation fails
 ///
-/// Note: This implementation differs from Linux as there is currently no other random source.
 pub fn do_get_random(buf: *mut u8, len: usize, flags: GRandFlags) -> Result<usize, SystemError> {
-    if flags.bits() == (GRandFlags::GRND_INSECURE.bits() | GRandFlags::GRND_RANDOM.bits()) {
+    if flags.contains(GRandFlags::GRND_INSECURE) && flags.contains(GRandFlags::GRND_RANDOM) {
         return Err(SystemError::EINVAL);
     }
-
-    let mut writer = UserBufferWriter::new(buf, len, true)?;
-    let mut buffer = writer.buffer_protected(0)?;
-
-    let mut count = 0;
-    while count < len {
-        // 对 len - count 的长度进行判断，remain_len 小于4则循环次数和 remain_len 相等
-        let remain_len = len - count;
-        let step = cmp::min(remain_len, 4);
-        let rand_value = rand();
-
-        // 生成随机字节并直接写入用户缓冲区
-        let mut random_bytes = [0u8; 4];
-        for (offset, byte) in random_bytes.iter_mut().enumerate().take(step) {
-            *byte = (rand_value >> (offset * 2)) as u8;
-        }
-
-        // 使用异常表保护的方式写入用户缓冲区
-        buffer.write_to_user(count, &random_bytes[..step])?;
-        count += step;
+    let len = len.min(crate::filesystem::vfs::MAX_RW_COUNT);
+    if len == 0 {
+        return Ok(0);
     }
-
-    Ok(len)
+    let mut writer = UserBuffer::new_protected(buf, len, true)?;
+    read_random_output(
+        len,
+        flags.contains(GRandFlags::GRND_INSECURE),
+        flags.contains(GRandFlags::GRND_NONBLOCK),
+        |offset, bytes| writer.write_prefix_to_user(offset, bytes),
+    )
 }

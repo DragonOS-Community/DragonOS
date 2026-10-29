@@ -1,37 +1,35 @@
-(_build_dragonos)=
-# 构建DragonOS
+# Building DragonOS {#_build_dragonos}
 
-## 0.快速体验
+## 0. Quick Experience
 
-&emsp;&emsp;如果您只是想快速体验DragonOS，而不需要进行本地开发，我们强烈推荐您使用 **DragonOS Playground** 进行云原生开发。这种方式**零配置、一键启动**，无需安装任何本地依赖，即可在云端体验DragonOS的最新nightly build版本。
+If you just want to quickly experience DragonOS without local development, we strongly recommend using **DragonOS Playground** for cloud-native development. This method is **zero-configuration and one-click startup**, requiring no local dependencies installation, allowing you to experience the latest nightly build of DragonOS in the cloud.
 
-### 使用DragonOS Playground
-   - 打开浏览器访问：<https://cnb.cool/DragonOS-Community/playground>
-   - 按照playground项目的指引，在CNB一键运行DragonOS!
+### Using DragonOS Playground
+   - Open your browser and visit: <https://cnb.cool/DragonOS-Community/playground>
+   - Follow the playground project instructions to run DragonOS with one click on CNB!
 
-**优势：**
-- ✅ **零配置** - 无需安装QEMU、Docker、Rust等依赖
-- ✅ **即时体验** - 几秒钟内即可运行DragonOS
-- ✅ **云端环境** - 随时随地访问，不占用本地资源
-- ✅ **每日更新** - 自动获取最新nightly build，体验最新开发版本
+**Advantages:**
+- ✅ **Zero Configuration** - No need to install QEMU, Docker, Rust, or other dependencies
+- ✅ **Instant Experience** - Run DragonOS within seconds
+- ✅ **Cloud Environment** - Access anytime, anywhere, without occupying local resources
+- ✅ **Daily Updates** - Automatically get the latest nightly build to experience the newest development version
 
-:::{note}
-
-如果您需要进行DragonOS的开发工作，或者希望深入了解DragonOS的构建过程，请继续阅读后续章节，了解如何在本地环境中构建DragonOS。
-
+::: info
+If you need to develop DragonOS or want to deeply understand its build process, please continue reading the following sections to learn how to build DragonOS in a local environment.
 :::
 
-## 1.写在前面
 
-&emsp;&emsp;无论您采用后文中的何种方式来编译DragonOS，您必须先按照本小节中的步骤，初始化您的开发环境。
+## 1. Preliminaries
 
-&emsp;&emsp;开始之前，您需要一台运行Linux或MacOS的计算机，并且处理器架构为X86-64.
+Regardless of which method you use to compile DragonOS from the following sections, you must first initialize your development environment by following the steps in this subsection.
 
-&emsp;&emsp;对于Linux发行版，建议使用Ubuntu22、Debian、Arch Linux这样的，仓库软件版本较新的发行版，这能为您减少很多麻烦。
+Before starting, you need a computer running Linux or MacOS with an X86-64 processor architecture.
 
-### 1.1 下载DragonOS的源代码
+For Linux distributions, it is recommended to use newer ones like Ubuntu 22, Debian, or Arch Linux, as they have more up-to-date repository software versions, which can save you a lot of trouble.
 
-使用https克隆：
+### 1.1 Downloading DragonOS Source Code
+
+Using HTTPS clone:
 
 ```shell
 git clone https://github.com/DragonOS-Community/DragonOS.git
@@ -40,10 +38,9 @@ cd DragonOS
 make update-submodules-by-mirror
 ```
 
-为了方便后续的开发，我们建议您使用ssh克隆（请先配置好github的SSH Key），以避免由于网络问题导致的克隆失败：
+For convenience in subsequent development, we recommend using SSH clone (please configure your GitHub SSH key first) to avoid cloning failures due to network issues:
 
-
-使用ssh克隆（请先配置好github的SSH Key）：
+Using SSH clone (please configure your GitHub SSH key first):
 
 ```shell
 # 使用ssh克隆
@@ -53,10 +50,9 @@ cd DragonOS
 make update-submodules-by-mirror
 ```
 
-## 2.使用一键初始化脚本进行安装（推荐）
+## 2. Installation via One-Click Initialization Script (Recommended)
 
-
-&emsp;&emsp;我们提供了一键初始化脚本，可以一键安装，只需要在控制台运行以下命令：
+We provide a one-click initialization script that can be installed with a single command. Just run the following command in the console:
 
 ```shell
 cd DragonOS
@@ -64,17 +60,17 @@ cd tools
 bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依赖包是安装在用户环境而非全局环境
 ```
 
-:::{note}
-一键配置脚本目前只支持以下系统：
+::: info
+The one-click configuration script currently only supports the following systems:
 
-- Ubuntu/Debian/Deepin/UOS 等基于Debian的衍生版本
-- Gentoo 由于Gentoo系统的特性 当gentoo出现USE或循环依赖问题时 请根据emerge提示信息进行对应的处理 官方的依赖处理实例[GentooWiki](https://wiki.gentoo.org/wiki/Handbook:AMD64/Full/Working/zh-cn#.E5.BD.93_Portage_.E6.8A.A5.E9.94.99.E7.9A.84.E6.97.B6.E5.80.99)
+- Ubuntu/Debian/Deepin/UOS and other Debian-based derivatives
+- Gentoo: Due to Gentoo's characteristics, when USE flags or circular dependency issues arise, please handle them according to the emerge prompts. For official dependency handling examples, see [GentooWiki](https://wiki.gentoo.org/wiki/Handbook:AMD64/Full/Working/zh-cn#.E5.BD.93_Portage_.E6.8A.A5.E9.94.99.E7.9A.84.E6.97.B6.E5.80.99)
 
-欢迎您为其他的系统完善构建脚本！
+Welcome to improve the build scripts for other systems!
 :::
 
-**如果一键初始化脚本能够正常运行，并输出最终的“祝贺”界面(如下所示)，请关闭当前终端，然后重新打开。**
 
+**If the one-click initialization script runs successfully and outputs the final "Congratulations" screen (as shown below), please close the current terminal and reopen it.**
 
 ```shell
 |-----------Congratulations!---------------|
@@ -89,15 +85,15 @@ bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依�
 |------------------------------------------|
 ```
 
-**接着，请直接跳到{ref}`编译命令讲解 <_build_system_command>`进行阅读！**
+**Then, please proceed directly to [Compilation Commands](/introduction/build_system.html#_build_system_command) for further reading!**
 
-## 3.手动安装
+## 3. Manual Installation
 
-### 3.1 依赖清单
+### 3.1 Dependency List
 
-&emsp;&emsp;如果自动安装脚本不能支持您的操作系统，那么您需要手动安装依赖程序。以下是依赖项的清单：
+If the automatic installation script does not support your operating system, you will need to manually install the dependency programs. The following is the dependency list:
 
-&emsp;&emsp;在以下依赖项中，除了`docker-ce`和`Rust及其工具链`以外，其他的都能通过系统自带的包管理器进行安装。关于docker以及rust的安装，请看后文。
+Among the following dependencies, except for `docker-ce` and `Rust及其工具链`, the others can be installed through the system's package manager. For Docker and Rust installation, please refer to the following sections.
 
 - docker-ce
 - llvm-dev
@@ -111,18 +107,16 @@ bash bootstrap.sh  # 这里请不要加上sudo, 因为需要安装的开发依�
 - git
 - dosfstools
 - unzip
-- Rust以及其工具链
+- Rust and its toolchain
 
-**请留意，若您的Linux系统是在虚拟机中运行的，还请您在您的VMware/Virtual Box虚拟机的处理器设置选项卡中，开启Intel VT-x或AMD-V选项，否则，DragonOS将无法运行。**
+**Please note: If your Linux system is running in a virtual machine, please enable the Intel VT-x or AMD-V option in the processor settings tab of your VMware/VirtualBox virtual machine; otherwise, DragonOS will not run.**
 
-:::{note}
+::: info
+*The Qemu built in some Linux distribution repositories may be incompatible with DragonOS due to its low version. If you encounter this issue, please uninstall Qemu and reinstall it by compiling from source.*
 
+Download the Qemu source code from this address: https://download.qemu.org/
 
-*在某些Linux发行版的软件仓库中构建的Qemu可能由于版本过低而不兼容DragonOS，如果遇到这种问题，请卸载Qemu，并采用编译安装的方式重新安装Qemu*
-
-在该地址下载Qemu源代码： https://download.qemu.org/
-
-解压后进入源代码目录，然后执行下列命令：
+After extracting, enter the source code directory and execute the following commands:
 
 ```shell
 # 安装编译依赖项
@@ -136,22 +130,24 @@ make -j 8
 sudo make install
 # 编译安装完成
 ```
-请注意，编译安装的QEMU，将通过VNC模式进行链接，因此，您还需要在您的计算机上安装VNC viewer以连接至QEMU虚拟机。
+Please note that the compiled QEMU will connect via VNC mode, so you will also need to install a VNC viewer on your computer to connect to the QEMU virtual machine.
 :::
 
-### 3.2 安装Docker
 
-&emsp;&emsp;您可以在docker官网下载安装docker-ce.
+### 3.2 Installing Docker
 
-> 详细信息请转到： [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
+You can download and install docker-ce from the Docker official website.
 
-### 3.3 安装Rust
+> For details, please go to: [https://docs.docker.com/engine/install/](https://docs.docker.com/engine/install/)
 
-:::{warning}
-**【常见误区】**：如果您打算采用docker进行编译，尽管docker镜像中已经安装了Rust编译环境，但是，为了能够在VSCode中使用Rust-Analyzer进行代码提示，以及`make clean`命令能正常运行，您的客户机上仍然需要安装rust环境。
+### 3.3 Installing Rust
+
+::: warning
+**【Common Misconception】**: If you plan to compile using Docker, although the Docker image already has the Rust compilation environment installed, your host machine still needs to have the Rust environment installed to enable Rust-Analyzer code hints in VSCode and for the `make clean` command to work properly.
 :::
 
-&emsp;&emsp;您可以在控制台输入以下命令，安装rust。
+
+You can install Rust by entering the following command in the console.
 
 ```shell
 # 这两行用于换源，加速Rust的安装过程
@@ -184,121 +180,120 @@ rustup target add x86_64-unknown-none
 # Rust安装完成
 ```
 
-**至此，公共依赖项已经安装完成，您可以根据自己的需要，阅读后续章节**
+**At this point, the common dependencies have been installed. You can proceed to the following sections based on your needs.**
 
-**关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
+**For the usage of compilation commands, please see: [Compilation Commands](/introduction/build_system.html#_build_system_command)**
 
-## 4.从Docker构建（不推荐）
+## 4. Building from Docker (Not Recommended)
 
-&emsp;&emsp;DragonOS发布了一个Docker编译环境，便于开发者运行DragonOS。但是，由于编码过程仍需要在客户机上进行，因此，您需要在客户机上安装Rust编译环境。
+DragonOS provides a Docker compilation environment to facilitate developers in running DragonOS. However, since the coding process still needs to be done on the host machine, you need to install the Rust compilation environment on the host machine.
 
-&emsp;&emsp;本节假设以下操作均在Linux下进行。
+This section assumes all operations are performed under Linux.
 
+### 4.1 Installing QEMU Virtual Machine
 
-### 4.1 安装qemu虚拟机
-
-&emsp;&emsp;在本节中，我们建议您采用命令行安装qemu：
+In this section, we recommend installing QEMU via the command line:
 
 ```shell
 sudo apt install -y qemu qemu-system qemu-kvm
 ```
 
-### 4.2 创建磁盘镜像
+### 4.2 Creating a Disk Image
 
-&emsp;&emsp;首先，您需要使用tools文件夹下的create_hdd_image.sh，创建一块虚拟磁盘镜像。您需要在tools文件夹下运行此命令。
+First, you need to create a virtual disk image using the create_hdd_image.sh script in the tools folder. You need to run this command in the tools folder.
 
 ```shell
 bash create_hdd_image.sh
 ```
 
-### 4.3 运行DragonOS
+### 4.3 Running DragonOS
 
-&emsp;&emsp;如果不出意外的话，这将是运行DragonOS的最后一步。您只需要在DragonOS的根目录下方，执行以下命令，即可运行DragonOS。
+If all goes well, this will be the final step to run DragonOS. You just need to execute the following command in the root directory of DragonOS to run it.
 
 ```shell
 make run-docker
 ```
 
-&emsp;&emsp;稍等片刻，DragonOS将会被运行。
+After a short wait, DragonOS will start running.
 
-&emsp;&emsp;在qemu虚拟机被启动后，我们需要在控制台输入字母`c`，然后回车。这样，虚拟机就会开始执行。
+After the QEMU virtual machine is launched, you need to enter the letter `c` in the console and press Enter. The virtual machine will then begin execution.
 
-:::{note}
-1. 首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！
-2. 输入命令可能需要加上sudo
+::: info
+1. During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size), so please be patient!
+2. The command may need to be prefixed with sudo.
 :::
 
-**关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
 
-## 5.其他注意事项
+**For the usage of compilation commands, please see: [Compilation Commands](/introduction/build_system.html#_build_system_command)**
 
-### 5.1 创建磁盘镜像
+## 5. Other Notes
 
-&emsp;&emsp;首先，您需要使用**普通用户**权限运行`tools/create_hdd_image.sh`，为DragonOS创建一块磁盘镜像文件。该脚本会自动完成创建磁盘镜像的工作，并将其移动到`bin/`目录下。
+### 5.1 Creating a Disk Image
 
-&emsp;&emsp;请注意，由于权限问题，请务必使用**普通用户**权限运行此脚本。（运行后，需要提升权限时，系统可能会要求您输入密码）
+First, you need to run `tools/create_hdd_image.sh` with **regular user** privileges to create a disk image file for DragonOS. This script will automatically complete the creation of the disk image and move it to the `bin/` directory.
 
+Please note that due to permission issues, you must run this script with **regular user** privileges. (When elevated privileges are required after running, the system may ask you for a password.)
 
-### 5.2 编译、运行DragonOS
+### 5.2 Compiling and Running DragonOS
 
-1. 安装编译及运行环境
-2. 进入DragonOS文件夹
-3. 输入`make run`即可编译并写入磁盘镜像，并运行
+1. Install the compilation and runtime environment
+2. Enter the DragonOS folder
+3. Enter `make run` to compile, write to the disk image, and run
 
+After the QEMU virtual machine is launched, you need to enter the letter `c` in the console and press Enter. The virtual machine will then begin execution.
 
-&emsp;&emsp;在qemu虚拟机被启动后，我们需要在控制台输入字母`c`，然后回车。这样，虚拟机就会开始执行。
-
-:::{note}
-首次编译时，由于需要下载Rust相关的索引（几百MB大小），因此需要一定的时间，请耐心等候！
+::: info
+During the first compilation, it may take some time to download Rust-related indexes (several hundred MB in size), so please be patient!
 :::
 
-**关于编译命令的用法，请见：{ref}`编译命令讲解 <_build_system_command>`**
 
-(_build_system_command)=
-## 6.编译命令讲解
+**For the usage of compilation commands, please see: [Compilation Commands](/introduction/build_system.html#_build_system_command)**
 
-**关于如何配置 RootFS（`ROOTFS_MANIFEST`、base 镜像、包集合切换），请先阅读：{ref}`DADK RootFS Manifest 配置（非 Nix） <_dadk_rootfs_manifest>`**
+## 6. Explanation of Compilation Commands {#_build_system_command}
 
-- 本地编译，不运行: `make all -j 您的CPU核心数`
-- 本地编译，并写入磁盘镜像，不运行: `make build`
-- 本地编译，写入磁盘镜像，并在QEMU中运行: `make run`
-- 本地编译，写入磁盘镜像，以无图形模式运行: 
+**For how to configure RootFS (`ROOTFS_MANIFEST`, base images, and package set switching), please read first: [DADK RootFS Manifest Configuration (Non-Nix)](/userland/rootfs/dadk-rootfs-manifest.html#_dadk_rootfs_manifest)**
+
+- Local compilation, no run: `make all -j 您的CPU核心数`
+- Local compilation, write to disk image, no run: `make build`
+- Local compilation, write to disk image, and run in QEMU: `make run`
+- Local compilation, write to disk image, run in non-graphical mode: 
 `make run-nographic`
-- Docker编译，并写入磁盘镜像,: `make docker`
-- Docker编译，写入磁盘镜像，并在QEMU中运行: `make run-docker`
-- 不编译，直接从已有的磁盘镜像启动: `make qemu`
-- 不编译，直接从已有的磁盘镜像启动（无图形模式）: `make qemu-nographic`
-- 清理编译产生的文件: `make clean`
-- 编译文档: `make docs` （需要手动安装sphinx以及docs下的`requirements.txt`中的依赖）
-- 清理文档: `make clean-docs`
-- 格式化代码: `make fmt`
-- 运行并执行syscall测试: `make test-syscall`
+- Docker compilation, write to disk image: `make docker`
+- Docker compilation, write to disk image, and run in QEMU: `make run-docker`
+- No compilation, directly boot from existing disk image: `make qemu`
+- No compilation, directly boot from existing disk image (non-graphical mode): `make qemu-nographic`
+- Clean compiled files: `make clean`
+- Compile documentation: `make docs` (requires Node.js 22+ and `npm install` in `docs/`)
+- Clean documentation: `make clean-docs`
+- Format code: `make fmt`
+- Run and execute syscall tests: `make test-syscall`
 
-:::{note}
-如果您需要在vnc中运行DragonOS，请在上述命令后加上`-vnc`后缀。如：`make run-vnc`
+::: info
+If you want to run DragonOS in VNC, add the `-vnc` suffix to the above commands. For example: `make run-vnc`
 
-qemu虚拟机将在5900端口监听vnc连接。您可以使用vnc viewer或者Remmina连接至qemu虚拟机。
+The QEMU virtual machine will listen for VNC connections on port 5900. You can use a VNC viewer or Remmina to connect to the QEMU virtual machine.
 :::
 
-## 7. 为riscv64编译
 
-由于目前DragonOS尚未完全移植到riscv64，因此编译需要这样做：
+## 7. Compiling for riscv64
 
-1. 修改`env.mk`和`.vscode/settings.json`
+Since DragonOS has not yet been fully ported to riscv64, compilation requires the following steps:
 
-把`env.mk`里面的`ARCH`的值改为`riscv64`，并且在`setting.json`里面注释`"rust-analyzer.cargo.target": "x86_64-unknown-none",`，改为启用riscv64的那行。
+1. Modify `env.mk` and `.vscode/settings.json`
 
-2. 重启rust-analyzer
+Change the value of `ARCH` in `env.mk` to `riscv64`, and comment out `"rust-analyzer.cargo.target": "x86_64-unknown-none",` in `setting.json`, replacing it with the line that enables riscv64.
 
-3. 清理编译缓存
+2. Restart rust-analyzer
 
-由于x86_64和riscv64架构差异，可能存在缓存导致的编译问题，确保运行前先清理缓存。
+3. Clean compilation cache
+
+Due to architectural differences between x86_64 and riscv64, there may be compilation issues caused by caching. Ensure the cache is cleared before running.
 
 ```shell
 make clean
 ```
 
-4. 为riscv64编译并运行
+4. Compile and run for riscv64
 
 ```shell
 # 下载DragonStub
@@ -307,4 +302,4 @@ git submodule update --init --recursive --force
 make run
 ```
 
-请注意，由于是在控制台运行qemu，当你想要退出的时候，输入`Ctrl+A`然后按`X`即可。
+Please note that since QEMU runs in the console, to exit, enter `Ctrl+A` and press `X`.

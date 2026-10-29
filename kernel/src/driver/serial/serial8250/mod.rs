@@ -35,8 +35,9 @@ use crate::{
 
 #[cfg(target_arch = "x86_64")]
 use self::serial8250_pio::{
-    send_to_default_serial8250_pio_port, serial8250_pio_port_early_init,
-    serial_8250_pio_register_tty_devices, Serial8250PIOTtyDriverInner,
+    retry_serial8250_pio_input, send_to_default_serial8250_pio_port,
+    serial8250_pio_port_early_init, serial_8250_pio_register_tty_devices,
+    Serial8250PIOTtyDriverInner,
 };
 
 use super::{uart_manager, UartDriver, UartManager, UartPort, TTY_SERIAL_DEFAULT_TERMIOS};
@@ -46,6 +47,11 @@ mod serial8250_pio;
 
 #[cfg(target_arch = "loongarch64")]
 mod serial8250_la64;
+
+pub fn retry_serial8250_input() {
+    #[cfg(target_arch = "x86_64")]
+    retry_serial8250_pio_input();
+}
 
 static mut SERIAL8250_ISA_DEVICES: Option<Arc<Serial8250ISADevices>> = None;
 static mut SERIAL8250_ISA_DRIVER: Option<Arc<Serial8250ISADriver>> = None;
@@ -462,7 +468,7 @@ impl PlatformDriver for Serial8250ISADriver {
     }
 
     fn remove(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
-        todo!()
+        Err(SystemError::ENOSYS)
     }
 
     fn shutdown(&self, _device: &Arc<dyn PlatformDevice>) -> Result<(), SystemError> {
@@ -577,4 +583,10 @@ pub fn send_to_default_serial8250_port(s: &[u8]) {
     {
         serial8250_la64::send_to_default_serial8250_la64_port(s);
     }
+}
+
+/// Bounded OOM diagnostics use the existing UART emergency transaction.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn emergency_output(s: &[u8], deadline: crate::time::Instant) -> usize {
+    serial8250_pio::emergency_output(s, deadline)
 }

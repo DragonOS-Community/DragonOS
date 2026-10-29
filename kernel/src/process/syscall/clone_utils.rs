@@ -1,15 +1,15 @@
 use core::intrinsics::unlikely;
 
 use crate::arch::interrupt::TrapFrame;
-use crate::arch::ipc::signal::Signal;
 use crate::arch::ipc::signal::MAX_SIG_NUM;
 use crate::arch::MMArch;
 use crate::mm::{MemoryManagementArch, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs, MAX_PID_NS_LEVEL};
-use crate::process::{KernelStack, ProcessControlBlock, ProcessManager};
+use crate::process::pid::PidType;
+use crate::process::ProcessManager;
 use crate::sched::completion::Completion;
 use crate::syscall::user_access::{write_one_to_user_protected, UserBufferReader};
-use alloc::{string::ToString, sync::Arc};
+use alloc::sync::Arc;
 use system_error::SystemError;
 
 #[repr(C)]
@@ -66,21 +66,24 @@ pub fn do_clone(
 
     let vfork = Arc::new(Completion::new());
 
-    if flags.contains(CloneFlags::CLONE_PIDFD) && flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
+    if flags.contains(CloneFlags::CLONE_PIDFD)
+        && flags.intersects(CloneFlags::CLONE_PARENT_SETTID | CloneFlags::CLONE_THREAD)
+    {
         return Err(SystemError::EINVAL);
     }
 
     let current_pcb = ProcessManager::current_pcb();
-    let new_kstack = KernelStack::new()?;
-    let name = current_pcb.basic().name().to_string();
+    let (pcb, ptrace_fork_session) =
+        ProcessManager::prepare_unpublished_child(&current_pcb, &clone_args, frame)?;
 
-    let pcb = ProcessControlBlock::new(name, new_kstack);
-    // 克隆pcb
-    ProcessManager::copy_process(&current_pcb, &pcb, clone_args, frame)?;
+    let child_vpid = pcb
+        .task_pid_nr_ns(PidType::PID, Some(current_pcb.active_pid_ns()))
+        .expect("published fork child must be visible in the caller's PID namespace")
+        .data();
 
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) {
         // 对齐 Linux：fork 已成功，不因 parent_tid 写回失败而撤销子任务。
-        let child_tid = pcb.pid().pid_vnr().data() as i32;
+        let child_tid = child_vpid as i32;
         let _ = unsafe { write_one_to_user_protected(parent_tid, &child_tid) };
     }
 
@@ -91,20 +94,36 @@ pub fn do_clone(
         pcb.thread.write_irqsave().vfork_done = Some(vfork.clone());
     }
 
-    ProcessManager::wakeup_new_task(&pcb).unwrap_or_else(|e| {
+    ProcessManager::wake_up_new_task(&pcb).unwrap_or_else(|e| {
         panic!(
             "fork: Failed to wakeup new process, pid: [{:?}]. Error: {:?}",
             pcb.raw_pid(),
             e
         )
     });
+    // Report the ptrace event only after wake_up_new_task.
+    ProcessManager::ptrace_report_fork_event(&current_pcb, &pcb, ptrace_fork_session.as_ref());
 
     if flags.contains(CloneFlags::CLONE_VFORK) {
-        // 等待子进程结束或者exec;
-        vfork.wait_for_completion_interruptible()?;
+        // Wait for the child to exit or exec
+        // Only a fatal signal can interrupt this wait
+        crate::cgroup::freezer::begin_safe_wait(&current_pcb);
+        let wait_result = vfork.wait_for_completion_killable();
+        crate::cgroup::freezer::end_safe_wait(&current_pcb);
+        if wait_result.is_err() {
+            // Clear the child's vfork_done: the waiter has given up, so the child
+            // must not complete() on a discarded completion during exec/exit.
+            pcb.thread.write_irqsave().vfork_done = None;
+            return Ok(child_vpid);
+        }
+        let done_vpid = crate::process::ptrace::ptracer_of(&current_pcb)
+            .and_then(|tracer| pcb.task_pid_nr_ns(PidType::PID, Some(tracer.active_pid_ns())))
+            .map(|p| p.data())
+            .unwrap_or(child_vpid);
+        current_pcb.ptrace_event(crate::process::ptrace::PtraceEvent::VForkDone, done_vpid);
     }
 
-    return Ok(pcb.raw_pid().0);
+    return Ok(child_vpid);
 }
 
 impl KernelCloneArgs {
@@ -163,7 +182,7 @@ impl KernelCloneArgs {
         self.pidfd = VirtAddr::new(args.pidfd as usize);
         self.child_tid = VirtAddr::new(args.child_tid as usize);
         self.parent_tid = VirtAddr::new(args.parent_tid as usize);
-        self.exit_signal = Signal::from(args.exit_signal as i32);
+        self.exit_signal = args.exit_signal as i32;
         self.stack = args.stack as usize;
         self.stack_size = args.stack_size as usize;
         self.tls = args.tls as usize;
@@ -178,8 +197,8 @@ impl KernelCloneArgs {
             )?;
             for i in 0..self.set_tid_size {
                 let byte_offset = i * core::mem::size_of::<core::ffi::c_int>();
-                let tid = *bufreader.read_one_from_user::<core::ffi::c_int>(byte_offset)?;
-                self.set_tid.push(tid as usize);
+                let tid = bufreader.read_one_from_user::<core::ffi::c_int>(byte_offset)?;
+                self.set_tid.push(tid);
             }
         }
 

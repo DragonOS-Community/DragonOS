@@ -25,7 +25,7 @@ use crate::filesystem::vfs::vcore::vfs_truncate;
 /// - 跟随符号链接定位最终 inode。
 /// - 目录返回 EISDIR；非普通文件返回 EINVAL。
 /// - 只读挂载点返回 EROFS。
-/// - 调用 inode.resize(length)。
+/// - 通过 VFS truncate 封装执行公共检查和文件系统 resize。
 pub struct SysTruncateHandle;
 
 impl Syscall for SysTruncateHandle {
@@ -48,8 +48,9 @@ impl Syscall for SysTruncateHandle {
         )?;
 
         // 跟随符号链接解析最终目标 inode
-        let target: Arc<dyn IndexNode> = begin_inode
-            .lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+        let target: Arc<dyn IndexNode> = crate::filesystem::vfs::file::File::recover_io(|| {
+            begin_inode.lookup_follow_symlink(remain_path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+        })?;
 
         let md = target.metadata()?;
         crate::filesystem::vfs::permission::check_inode_permission(
@@ -68,7 +69,10 @@ impl Syscall for SysTruncateHandle {
             }
         }
 
-        vfs_truncate(target, length)?;
+        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        while let Err(error) = vfs_truncate(target.clone(), length) {
+            error.recover(&mut recovery)?;
+        }
         Ok(0)
     }
 

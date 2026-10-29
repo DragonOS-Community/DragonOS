@@ -4,8 +4,8 @@
   nixpkgs,
   system,
   target,
-  fenix,
   testOpt,
+  nightlyRustPlatform,
 }:
 
 # Return a list of app derivations to be copied into the rootfs.
@@ -50,9 +50,15 @@ let
 
   gvisor-syscall-tests = (
     pkgs.callPackage ./tests/syscall/gvisor {
-      inherit fenix system;
       installDir = testOpt.syscall.testDir;
       version = testOpt.syscall.version;
+    }
+  );
+
+  dunitest = (
+    pkgs.callPackage ./tests/dunitest {
+      inherit nightlyRustPlatform;
+      installDir = testOpt.dunitest.testDir;
     }
   );
 in
@@ -60,19 +66,26 @@ in
   (static.busybox.override {
     extraConfig = ''
       CONFIG_FEATURE_DEFAULT_PASSWD_ALGO "sha512"
+      CONFIG_FEATURE_EDITING_MAX_LEN 8192
     '';
   })
   static.curl
   static.dropbear
   cross.glibc
+  static.strace
+  static.gdb
 
   # Simple C utilities
   (static.callPackage ./about { })
   (static.callPackage ./c_unitest { inherit target; })
+  (static.callPackage ./ebpf_smoke { inherit target; })
 
 ]
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [
   # gvisor test case only included on x86_64
   gvisor-syscall-tests
   # TODO: Add debian libcxx deps or FHS
+]
+++ lib.optionals (target == "x86_64" && testOpt.dunitest.enable) [
+  dunitest
 ]

@@ -2,6 +2,8 @@
 //!
 //! 以 Linux 兼容格式返回进程的 rlimit 快照。
 
+use crate::filesystem::procfs::template::configure_readonly_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use core::fmt::Write;
 
 use crate::libs::mutex::MutexGuard;
@@ -10,7 +12,7 @@ use crate::{
         procfs::{
             pid::ProcPidTarget,
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::proc_read,
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -154,14 +156,25 @@ impl LimitsFile {
 }
 
 impl FileOps for LimitsFile {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_readonly_seq_file(behavior);
+    }
+
+    fn supports_read_iter_flags(&self) -> bool {
+        false
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = self.generate_limits_content()?;
-        proc_read(offset, len, buf, content.as_bytes())
+        // `single_open()`: one fd sees one rlimit record.
+        proc_snapshot_operation(operation, data, || {
+            Ok(self.generate_limits_content()?.into_bytes())
+        })
     }
 }

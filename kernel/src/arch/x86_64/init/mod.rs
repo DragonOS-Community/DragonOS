@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{compiler_fence, Ordering},
 };
 
-use log::debug;
+use log::{debug, warn};
 use system_error::SystemError;
 use x86::dtables::DescriptorTablePointer;
 
@@ -27,6 +27,7 @@ use super::{
 mod boot;
 mod multiboot2;
 mod pvh;
+mod rsdp;
 
 mod boot_params;
 
@@ -93,7 +94,7 @@ pub fn early_setup_arch() -> Result<(), SystemError> {
         debug!("GDT_Table={:?}, IDT_Table={:?}\n", gdt_vaddr, idt_vaddr);
     }
 
-    set_current_core_tss(stack_start, 0);
+    set_current_core_tss(stack_start);
     unsafe { TSSManager::load_tr() };
     arch_trap_init().expect("arch_trap_init failed");
 
@@ -112,26 +113,69 @@ pub fn setup_arch_post() -> Result<(), SystemError> {
     // ============= 初始化时钟源硬件 =============
     // 1.先尝试初始化 kvm-clock（如果在 KVM 虚拟机中运行且 kvm-clock 可用的话）
     // 2.再尝试初始化 HPET（如果硬件支持的话）
-    // 3.如果 kvm-clock 和 HPET 都不可用，则回退到 ACPI PM Timer
+    // 3.独立尝试注册 ACPI PM Timer，保留可用的备用时钟源
     // 4.最后初始化 TSC 管理器 （既可以通过 kvm-clock 提供的 pvclock 确定 TSC 频率，也可以通过其他方法确定 TSC 频率）
     let kvmclock_ok = kvm_clock::kvmclock_init();
-    let ret = hpet_init();
-    if ret.is_ok() {
-        hpet_instance().hpet_enable().expect("hpet enable failed");
-    } else if !kvmclock_ok {
-        init_acpi_pm_clocksource().expect("acpi_pm_timer inits failed");
+    if let Err(error) = crate::arch::kvm_para::steal_time::init_current_cpu() {
+        warn!("KVM steal time unavailable: {:?}", error);
     }
-    TSCManager::init().expect("tsc init failed");
+    let hpet_ok = match hpet_init() {
+        Ok(()) => match hpet_instance().hpet_enable() {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    "HPET enable failed, retaining fallback clocksource: {:?}",
+                    error
+                );
+                false
+            }
+        },
+        Err(error) => {
+            warn!(
+                "HPET init failed, retaining fallback clocksource: {:?}",
+                error
+            );
+            false
+        }
+    };
+    // Register available fallback devices even when a higher-rated source is
+    // already working. The normal clocksource policy still chooses the source.
+    if let Err(error) = init_acpi_pm_clocksource() {
+        if !kvmclock_ok && !hpet_ok {
+            warn!(
+                "ACPI PM timer unavailable, continuing with jiffies: {:?}",
+                error
+            );
+        } else {
+            debug!("ACPI PM timer unavailable: {:?}", error);
+        }
+    }
+    if let Err(error) = TSCManager::init() {
+        if TSCManager::cpu_khz() == 0 {
+            // The scheduler clock and APIC timer still require CPU_KHZ even
+            // when POSIX timekeeping can remain on jiffies.
+            return Err(error);
+        }
+        warn!(
+            "TSC clocksource unavailable, continuing with registered clocksource: {:?}",
+            error
+        );
+    }
 
     return Ok(());
 }
 
-fn set_current_core_tss(stack_start: usize, ist0: usize) {
+fn set_current_core_tss(stack_start: usize) {
     let current_tss = unsafe { TSSManager::current_tss() };
+    let cpu = crate::smp::core::smp_get_processor_id().data();
+    let ist_top = crate::arch::x86_64::interrupt::ist::double_fault_stack_top(cpu).unwrap_or(0);
     debug!(
-        "set_current_core_tss: stack_start={:#x}, ist0={:#x}\n",
-        stack_start, ist0
+        "set_current_core_tss: stack_start={:#x}, ist1={:#x}\n",
+        stack_start, ist_top
     );
     current_tss.set_rsp(x86::Ring::Ring0, stack_start as u64);
-    current_tss.set_ist(0, ist0 as u64);
+    // TSS 的 IST 数组下标 0 对应描述符里的 IST1；#DF 门使用 ist=1。
+    if ist_top != 0 {
+        current_tss.set_ist(0, ist_top);
+    }
 }

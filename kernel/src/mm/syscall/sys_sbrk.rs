@@ -58,7 +58,6 @@ use system_error::SystemError;
 pub fn sys_sbrk(incr: isize) -> Result<usize, SystemError> {
     let address_space = AddressSpace::current()?;
     assert!(address_space.read().user_mapper.utable.is_current());
-    let mut address_space = address_space.write();
-    let r = unsafe { address_space.sbrk(incr) }?;
+    let r = address_space.sbrk_wait(incr)?;
     return Ok(r.data());
 }

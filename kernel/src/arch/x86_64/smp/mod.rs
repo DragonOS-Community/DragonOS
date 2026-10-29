@@ -89,6 +89,8 @@ unsafe extern "C" fn smp_ap_start_stage1() -> ! {
     let id = smp_get_processor_id();
     debug!("smp_ap_start_stage1: id: {}\n", id.data());
     X86_64MMArch::init_current_cpu_nxe();
+    // CR0.WP is per-CPU; establish write protection before this AP runs tasks.
+    X86_64MMArch::enable_kernel_wp();
 
     let current_idle = ProcessManager::idle_pcb()[smp_get_processor_id().data() as usize].clone();
 
@@ -98,6 +100,9 @@ unsafe extern "C" fn smp_ap_start_stage1() -> ! {
         x86::Ring::Ring0,
         current_idle.kernel_stack().stack_max_address().data() as u64,
     );
+    if let Some(ist_top) = crate::arch::x86_64::interrupt::ist::double_fault_stack_top(id.data()) {
+        tss.set_ist(0, ist_top);
+    }
     TSSManager::load_tr();
 
     CurrentIrqArch::arch_ap_early_irq_init().expect("arch_ap_early_irq_init failed");
@@ -218,12 +223,21 @@ impl SMPArch for X86_64SMPArch {
 
     fn post_init() -> Result<(), SystemError> {
         // AP核心启动完毕，取消低地址映射
-        unsafe {
-            LowAddressRemapping::unmap_at_low_address(
-                &mut IDLE_PROCESS_ADDRESS_SPACE().write().user_mapper.utable,
-                true,
-            )
+        let mm = IDLE_PROCESS_ADDRESS_SPACE();
+        let mut gather = crate::mm::mmu_gather::MmuGather::gather_all_online();
+        {
+            let mut inner = mm.write();
+            let _pt_edit = mm.page_table_edit();
+            unsafe {
+                LowAddressRemapping::unmap_at_low_address(
+                    &mut inner.user_mapper.utable,
+                    &mut gather,
+                );
+            }
         }
+        // AP startup loads this CR3 directly. Do not rely on active_cpus or
+        // loaded-mm tracking, and never wait for remote CPUs under MM locks.
+        gather.finish();
         return Ok(());
     }
 

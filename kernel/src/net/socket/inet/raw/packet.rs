@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use crate::driver::net::PacketBuffer;
 
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 use system_error::SystemError;
@@ -19,7 +19,7 @@ pub(super) struct IpPacketParams<'a> {
 }
 
 /// 构造 IPv4 数据包
-fn build_ipv4_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
+fn build_ipv4_packet(params: &IpPacketParams) -> Result<PacketBuffer, SystemError> {
     // IPv4 total length is u16.
     if params
         .payload
@@ -31,6 +31,26 @@ fn build_ipv4_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
         return Err(SystemError::EMSGSIZE);
     }
 
+    let len = IPV4_MIN_HEADER_LEN + params.payload.len();
+    let mut bytes = PacketBuffer::try_with_capacity(len)?;
+    bytes.resize(len, 0)?;
+    emit_ipv4_packet(&mut bytes, params, 0, false)?;
+    Ok(bytes)
+}
+
+/// Serialize directly into a previously reserved complete IPv4 datagram.
+/// The caller chooses ID/DF from its single route-and-MTU snapshot.
+pub(super) fn emit_ipv4_packet(
+    bytes: &mut [u8],
+    params: &IpPacketParams<'_>,
+    identification: u16,
+    dont_fragment: bool,
+) -> Result<(), SystemError> {
+    if Some(bytes.len()) != params.payload.len().checked_add(IPV4_MIN_HEADER_LEN)
+        || bytes.len() > u16::MAX as usize
+    {
+        return Err(SystemError::EMSGSIZE);
+    }
     let dst = match params.dst {
         IpAddress::Ipv4(v) => v,
         _ => return Err(SystemError::EAFNOSUPPORT),
@@ -41,13 +61,15 @@ fn build_ipv4_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
         _ => return Err(SystemError::EAFNOSUPPORT),
     };
 
-    let mut bytes = vec![0u8; IPV4_MIN_HEADER_LEN + params.payload.len()];
-    let mut pkt = Ipv4Packet::new_unchecked(&mut bytes);
+    let mut pkt = Ipv4Packet::new_unchecked(bytes);
     pkt.set_version(4);
     pkt.set_header_len(IPV4_MIN_HEADER_LEN as u8);
     pkt.set_total_len((IPV4_MIN_HEADER_LEN + params.payload.len()) as u16);
-    pkt.set_ident(0);
+    pkt.set_ident(identification);
     pkt.clear_flags();
+    if dont_fragment {
+        pkt.set_dont_frag(true);
+    }
     pkt.set_frag_offset(0);
     pkt.set_hop_limit(params.ttl);
     pkt.set_next_header(params.protocol);
@@ -57,11 +79,11 @@ fn build_ipv4_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
     pkt.set_ecn(params.tos & 0x3);
     pkt.payload_mut()[..params.payload.len()].copy_from_slice(params.payload);
     pkt.fill_checksum();
-    Ok(bytes)
+    Ok(())
 }
 
 /// 构造 IPv6 数据包
-fn build_ipv6_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
+fn build_ipv6_packet(params: &IpPacketParams) -> Result<PacketBuffer, SystemError> {
     // IPv6 payload length is u16; reject jumbograms.
     if params.payload.len() > u16::MAX as usize {
         return Err(SystemError::EMSGSIZE);
@@ -77,7 +99,9 @@ fn build_ipv6_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
         _ => return Err(SystemError::EAFNOSUPPORT),
     };
 
-    let mut bytes = vec![0u8; IPV6_HEADER_LEN + params.payload.len()];
+    let len = IPV6_HEADER_LEN + params.payload.len();
+    let mut bytes = PacketBuffer::try_with_capacity(len)?;
+    bytes.resize(len, 0)?;
     let mut pkt = Ipv6Packet::new_unchecked(&mut bytes);
     pkt.set_version(6);
     pkt.set_traffic_class(params.tos);
@@ -118,7 +142,7 @@ fn build_ipv6_packet(params: &IpPacketParams) -> Result<Vec<u8>, SystemError> {
 pub(super) fn build_ip_packet(
     ip_version: IpVersion,
     params: &IpPacketParams,
-) -> Result<Vec<u8>, SystemError> {
+) -> Result<PacketBuffer, SystemError> {
     match ip_version {
         IpVersion::Ipv4 => build_ipv4_packet(params),
         IpVersion::Ipv6 => build_ipv6_packet(params),

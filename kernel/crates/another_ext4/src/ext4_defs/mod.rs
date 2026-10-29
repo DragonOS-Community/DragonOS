@@ -17,7 +17,7 @@
 mod bitmap;
 mod block;
 mod block_group;
-mod crc;
+pub(crate) mod crc;
 mod dir;
 mod extent;
 mod inode;

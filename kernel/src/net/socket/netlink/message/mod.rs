@@ -1,5 +1,6 @@
 use crate::net::socket::netlink::{
-    message::segment::header::CMsgSegHdr, table::StandardNetlinkProtocol,
+    message::segment::header::CMsgSegHdr,
+    table::{MulticastMessage, StandardNetlinkProtocol},
 };
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -7,7 +8,7 @@ use system_error::SystemError;
 pub(super) mod attr;
 pub(super) mod segment;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message<T: ProtocolSegment> {
     segments: Vec<T>,
 }
@@ -77,5 +78,7 @@ pub trait ProtocolSegment: Sized + alloc::fmt::Debug {
     fn write_to(&self, writer: &mut [u8]) -> Result<usize, SystemError>;
     fn protocol(&self) -> StandardNetlinkProtocol;
 }
+
+impl<T: ProtocolSegment + Clone> MulticastMessage for Message<T> {}
 
 pub(super) const NLMSG_ALIGN: usize = 4;

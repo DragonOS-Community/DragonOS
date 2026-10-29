@@ -5,12 +5,11 @@ use system_error::SystemError;
 use crate::{
     filesystem::fs::FsStruct,
     process::{
-        cred::Cred,
+        cred::{ns_capable, CAPFlags, Cred},
         fork::CloneFlags,
-        namespace::nsproxy::{
-            create_new_namespaces, switch_task_namespaces, switch_task_namespaces_with_fs, NsProxy,
-        },
-        ProcessManager,
+        lock_fs_refs_copy,
+        namespace::nsproxy::{create_new_namespaces, NsProxy, PreparedNamespaceInstall},
+        FsRefsReadGuard, ProcessControlBlock, ProcessManager,
     },
 };
 
@@ -22,32 +21,77 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
     check_unshare_flags(flags)?;
 
     let current_pcb = ProcessManager::current_pcb();
-    let mut new_cred = unshare_user_cred(flags, &current_pcb)?;
-    let new_fs = unshare_fs_struct(flags, &current_pcb)?;
-    let new_nsproxy =
-        unshare_nsproxy_namespaces(flags, &current_pcb, new_cred.as_ref(), new_fs.as_ref())?;
-
-    if let Some(new_nsproxy) = new_nsproxy {
-        if let Some(new_fs) = new_fs.as_ref() {
-            switch_task_namespaces_with_fs(&current_pcb, new_fs, new_nsproxy)?;
-        } else {
-            switch_task_namespaces(&current_pcb, new_nsproxy)?;
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    loop {
+        let new_cred = unshare_user_cred(flags, &current_pcb)?.map(Cred::new_arc);
+        // Retain completed candidates outside the topology barrier, even if
+        // a later preparation step fails. No committed install is retried.
+        let mut new_fs = None;
+        let mut new_nsproxy = None;
+        let fs_refs = lock_fs_refs_copy();
+        let attempt = (|| {
+            new_fs = unshare_fs_struct(flags, &current_pcb, &fs_refs)?;
+            new_nsproxy = unshare_nsproxy_namespaces(
+                flags,
+                &current_pcb,
+                new_cred.as_deref(),
+                new_fs.as_ref(),
+            )?;
+            prepare_unshare_install(
+                &current_pcb,
+                flags,
+                &mut new_fs,
+                new_nsproxy.clone(),
+                new_cred.clone(),
+                &fs_refs,
+            )
+        })();
+        match attempt {
+            Ok(Some(prepared)) => return prepared.commit(&current_pcb, fs_refs),
+            Ok(None) => {
+                drop(fs_refs);
+                return Ok(());
+            }
+            Err(error) => {
+                drop(fs_refs);
+                if flags.contains(CloneFlags::CLONE_NEWPID) {
+                    if let Some(candidate) = new_nsproxy.as_ref() {
+                        candidate.pid_ns_for_children.discard_unpublished();
+                    }
+                }
+                drop(new_fs);
+                drop(new_nsproxy);
+                drop(new_cred);
+                error.recover(&mut recovery)?;
+            }
         }
     }
+}
 
-    if let Some(new_fs) = new_fs {
-        current_pcb.set_fs_struct(new_fs);
+fn prepare_unshare_install(
+    current: &Arc<ProcessControlBlock>,
+    flags: CloneFlags,
+    new_fs: &mut Option<Arc<FsStruct>>,
+    new_nsproxy: Option<Arc<NsProxy>>,
+    new_cred: Option<Arc<Cred>>,
+    fs_refs: &FsRefsReadGuard,
+) -> Result<Option<PreparedNamespaceInstall>, crate::mm::allocation::MemoryAllocationError> {
+    let detach_sysvsem = flags.intersects(CloneFlags::CLONE_SYSVSEM | CloneFlags::CLONE_NEWIPC);
+    // Match Linux's conditional install: a no-op must not allocate RCU retire
+    // storage or republish the same nsproxy. SYSVSEM detachment is itself work.
+    if new_fs.is_none() && new_nsproxy.is_none() && new_cred.is_none() && !detach_sysvsem {
+        return Ok(None);
     }
-
-    if let Some(new_cred) = new_cred.take() {
-        current_pcb.set_cred(Cred::new_arc(new_cred))?;
-    }
-
-    // TODO: 处理其他命名空间的 unshare 操作
-    // CLONE_FS, CLONE_FILES, CLONE_SIGHAND, CLONE_VM, CLONE_THREAD, CLONE_SYSVSEM,
-    // CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWNET, CLONE_NEWCGROUP, CLONE_NEWTIME
-
-    Ok(())
+    let new_nsproxy = new_nsproxy.unwrap_or_else(|| current.nsproxy());
+    PreparedNamespaceInstall::prepare_for_unshare(
+        current,
+        new_nsproxy,
+        new_fs,
+        new_cred,
+        detach_sysvsem,
+        fs_refs,
+    )
+    .map(Some)
 }
 
 #[inline(always)]
@@ -87,7 +131,8 @@ fn unshare_user_cred(
 fn unshare_fs_struct(
     unshare_flags: CloneFlags,
     current_pcb: &Arc<crate::process::ProcessControlBlock>,
-) -> Result<Option<Arc<FsStruct>>, SystemError> {
+    _fs_refs: &crate::process::FsRefsReadGuard,
+) -> Result<Option<Arc<FsStruct>>, crate::mm::allocation::MemoryAllocationError> {
     if !unshare_flags.contains(CloneFlags::CLONE_FS) {
         return Ok(None);
     }
@@ -97,7 +142,10 @@ fn unshare_fs_struct(
     }
 
     let current_fs = current_pcb.fs_struct();
-    Ok(Some(Arc::new((*current_fs).clone())))
+    Ok(Some(FsStruct::try_clone_for(
+        &current_fs,
+        &crate::cgroup::memory::object_for_task(current_pcb),
+    )?))
 }
 
 #[inline(never)]
@@ -123,6 +171,10 @@ fn unshare_nsproxy_namespaces(
     let user_ns = new_cred
         .map(|cred| cred.user_ns.clone())
         .unwrap_or_else(ProcessManager::current_user_ns);
+
+    if !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
+        return Err(SystemError::EPERM);
+    }
 
     let nsproxy = create_new_namespaces(&unshare_flags, current_pcb, user_ns)?;
 
@@ -180,4 +232,84 @@ fn check_unshare_flags(flags: CloneFlags) -> Result<(), SystemError> {
     // }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{KernelStack, ProcessControlBlock};
+
+    fn test_pcb() -> Arc<ProcessControlBlock> {
+        ProcessControlBlock::new_idle(0, KernelStack::new().unwrap())
+    }
+
+    #[test]
+    fn no_state_unshare_does_not_prepare_an_install() {
+        let pcb = test_pcb();
+        let fs_refs = lock_fs_refs_copy();
+        for flags in [CloneFlags::empty(), CloneFlags::CLONE_FS] {
+            assert!(
+                prepare_unshare_install(&pcb, flags, &mut None, None, None, &fs_refs)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn unshare_sysvsem_detaches_even_when_ipc_namespace_is_unchanged() {
+        let pcb = test_pcb();
+        let ipc_ns = pcb.nsproxy().ipc_ns.clone();
+        let old_group = pcb.ensure_sem_undo_group(&ipc_ns).unwrap();
+        let fs_refs = lock_fs_refs_copy();
+
+        let prepared = prepare_unshare_install(
+            &pcb,
+            CloneFlags::CLONE_SYSVSEM,
+            &mut None,
+            None,
+            None,
+            &fs_refs,
+        )
+        .unwrap()
+        .unwrap();
+        prepared.commit(&pcb, fs_refs).unwrap();
+
+        assert!(pcb.sem_undo_group().is_none());
+        let replacement = pcb.ensure_sem_undo_group(&ipc_ns).unwrap();
+        assert!(!Arc::ptr_eq(&replacement, &old_group));
+        assert_eq!(old_group.task_owners_for_test(), 0);
+        assert_eq!(old_group.replay_count_for_test(), 1);
+    }
+
+    #[test]
+    fn unshare_newipc_detaches_once_when_sysvsem_is_also_present() {
+        let pcb = test_pcb();
+        let old_nsproxy = pcb.nsproxy();
+        let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
+        let mut new_inner = old_nsproxy.clone_inner();
+        new_inner.ipc_ns = old_nsproxy.ipc_ns.copy_ipc_ns(
+            &CloneFlags::CLONE_NEWIPC,
+            old_nsproxy.ipc_ns.user_ns.clone(),
+        );
+        let new_ipc_ns = new_inner.ipc_ns.clone();
+        let fs_refs = lock_fs_refs_copy();
+
+        let prepared = prepare_unshare_install(
+            &pcb,
+            CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_SYSVSEM,
+            &mut None,
+            Some(Arc::new(new_inner)),
+            None,
+            &fs_refs,
+        )
+        .unwrap()
+        .unwrap();
+        prepared.commit(&pcb, fs_refs).unwrap();
+
+        assert!(pcb.sem_undo_group().is_none());
+        assert!(Arc::ptr_eq(&pcb.nsproxy().ipc_ns, &new_ipc_ns));
+        assert_eq!(old_group.task_owners_for_test(), 0);
+        assert_eq!(old_group.replay_count_for_test(), 1);
+    }
 }

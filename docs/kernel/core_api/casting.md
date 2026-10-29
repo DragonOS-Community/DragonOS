@@ -1,21 +1,20 @@
-# 类型转换库API
+# Type Conversion Library API
 
-&emsp;&emsp;内核提供了一些函数来帮助你在不同的类型之间进行转换。包括以下类型：
+The kernel provides some functions to help you convert between different types. These include the following types:
 
-- 数值类型转换 （使用`num-traits`库）
-- Arc类型转换
+- Numeric type conversion (using the `num-traits` library)
+- Arc type conversion
 
-&emsp;&emsp;上述没有特殊标明的函数，都是在`kernel/src/libs/casting.rs`中实现的。
+All functions not specially marked are implemented in `kernel/src/libs/casting.rs`.
 
+## 1. Numeric Type Conversion
 
-## 1. 数值类型转换
+### 1.1 Conversion Between Integer Types and Enum Types
 
-### 1.1. 整数类型与枚举类型之间的转换
+You can use macros provided by the `num-traits` library to convert between enum types and integer types.
+The SystemError enum type uses this approach, and you can find its usage in `kernel/src/syscall/mod.rs`.
 
-&emsp;&emsp;您可以使用`num-traits`库提供的宏，实现枚举类型和整数类型之间的转换。
-SystemError枚举类型使用了这种方式，您可以在`kernel/src/syscall/mod.rs`中找到它的用法。
-
-&emsp;&emsp;它首先继承了`FromPrimitive, ToPrimitive`两个trait，然后这样转换：
+It first inherits the `FromPrimitive, ToPrimitive` two traits, and then performs the conversion like this:
 
 ```rust
 impl SystemError {
@@ -35,15 +34,15 @@ impl SystemError {
 }
 ```
 
-&emsp;&emsp;这两个函数很好的说明了如何使用这两个trait。
+These two functions well illustrate how to use these two traits.
 
-## 2. Arc类型转换
+## 2. Arc Type Conversion
 
-### 2.1 从Arc<dyn U>转换为Arc<T>
+### 2.1 Conversion from Arc`<dyn U>` to Arc`<T>`
 
-&emsp;&emsp;当我们需要把一个`Arc<dyn U>`转换为`Arc<T>`的具体类型指针时，我们要为`U`这个trait实现`DowncastArc`trait。这个trait定义在`kernel/src/libs/casting.rs`中。它要求`trait U`实现`Any + Sync + Send`trait.
+When we need to convert an `Arc<dyn U>` to a specific type pointer of `Arc<T>`, we need to implement the `DowncastArc` trait for `U`. This trait is defined in `kernel/src/libs/casting.rs`. It requires `trait U` to implement the `Any + Sync + Send` trait.
 
-&emsp;&emsp;为`trait U: Any + Send + Sync`实现`DowncastArc`trait，需要这样做：
+To implement the `DowncastArc` trait for `trait U: Any + Send + Sync`, you need to do the following:
 
 ```rust
 impl DowncastArc for dyn U {
@@ -53,11 +52,12 @@ impl DowncastArc for dyn U {
 }
 ```
 
-&emsp;&emsp;使用`DowncastArc`trait，我们可以这样转换：
+Using the `DowncastArc` trait, we can convert like this:
 
 ```rust
 let arc: Arc<dyn U> = ...;
 let arc_t: Arc<T> = arc.downcast_arc::<T>().unwrap();
 ```
 
-&emsp;&emsp;如果`arc`的具体类型不是`Arc<T>`，那么`downcast_arc::<T>()`会返回`None`。
+If the specific type of `arc` is not `Arc<T>`, then `downcast_arc::``<T>``()` will return `None`.
+

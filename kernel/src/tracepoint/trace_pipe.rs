@@ -146,18 +146,19 @@ impl TraceCmdLineCache {
     /// If the command line exceeds 16 bytes, it will be truncated.
     /// If the cache exceeds the maximum record limit, the oldest entry will be removed.
     pub fn insert(&mut self, id: u32, cmdline: String) {
+        if self.max_record == 0 {
+            return;
+        }
         if self.cmdline.len() >= self.max_record {
             // Remove the oldest entry if we exceed the max record limit
             self.cmdline.remove(0);
         }
         let mut cmdline_bytes = [0u8; 16];
-        if cmdline.len() > 16 {
-            // Truncate to fit the fixed size
-            cmdline_bytes.copy_from_slice(&cmdline.as_bytes()[..16]);
-        } else {
-            // Copy the command line bytes into the fixed size array
-            cmdline_bytes[..cmdline.len()].copy_from_slice(cmdline.as_bytes());
+        let mut len = cmdline.len().min(15);
+        while len > 0 && !cmdline.is_char_boundary(len) {
+            len -= 1;
         }
+        cmdline_bytes[..len].copy_from_slice(&cmdline.as_bytes()[..len]);
         self.cmdline.push((id, cmdline_bytes));
     }
 
@@ -165,7 +166,11 @@ impl TraceCmdLineCache {
     pub fn get(&self, id: u32) -> Option<&str> {
         self.cmdline.iter().find_map(|(key, value)| {
             if *key == id {
-                Some(core::str::from_utf8(value).unwrap().trim_end_matches('\0'))
+                let len = value
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(value.len());
+                core::str::from_utf8(&value[..len]).ok()
             } else {
                 None
             }
@@ -176,7 +181,8 @@ impl TraceCmdLineCache {
     pub fn set_max_record(&mut self, max_len: usize) {
         self.max_record = max_len;
         if self.cmdline.len() > max_len {
-            self.cmdline.truncate(max_len); // Keep only the latest records
+            let remove = self.cmdline.len() - max_len;
+            self.cmdline.drain(..remove);
         }
     }
 
@@ -210,6 +216,48 @@ impl TraceCmdLineCacheSnapshot {
         } else {
             Some(self.0.remove(0))
         }
+    }
+}
+
+#[cfg(test)]
+mod cmdline_cache_tests {
+    use super::TraceCmdLineCache;
+    use alloc::string::ToString;
+
+    #[test]
+    fn truncates_at_utf8_boundary_and_keeps_nul_space() {
+        let mut cache = TraceCmdLineCache::new(4);
+        cache.insert(1, "abcdefghijklmnop".to_string());
+        assert_eq!(cache.get(1), Some("abcdefghijklmno"));
+
+        cache.insert(2, "abcdefghijklmn界".to_string());
+        assert_eq!(cache.get(2), Some("abcdefghijklmn"));
+    }
+
+    #[test]
+    fn invalid_cached_bytes_do_not_panic() {
+        let mut cache = TraceCmdLineCache::new(1);
+        let mut invalid = [0u8; 16];
+        invalid[0] = 0xff;
+        cache.cmdline.push((1, invalid));
+        assert_eq!(cache.get(1), None);
+    }
+
+    #[test]
+    fn zero_capacity_and_shrink_keep_cache_invariants() {
+        let mut disabled = TraceCmdLineCache::new(0);
+        disabled.insert(1, "ignored".to_string());
+        assert_eq!(disabled.get(1), None);
+
+        let mut cache = TraceCmdLineCache::new(4);
+        for id in 1..=4 {
+            cache.insert(id, id.to_string());
+        }
+        cache.set_max_record(2);
+        assert_eq!(cache.get(1), None);
+        assert_eq!(cache.get(2), None);
+        assert_eq!(cache.get(3), Some("3"));
+        assert_eq!(cache.get(4), Some("4"));
     }
 }
 

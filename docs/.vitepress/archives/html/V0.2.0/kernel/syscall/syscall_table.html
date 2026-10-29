@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>系统调用表实现方案 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+        <script type="module" src="https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs"></script>
+        <script type="module" src="https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.4/dist/mermaid-layout-elk.esm.min.mjs"></script>
+        <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs";import elkLayouts from "https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.4/dist/mermaid-layout-elk.esm.min.mjs";mermaid.registerLayoutLoaders(elkLayouts);mermaid.initialize({startOnLoad:false});</script>
+        <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+        <script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.2.0/dist/mermaid.esm.min.mjs";
+window.addEventListener("load", () => mermaid.run());
+</script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="应用程序开发文档" href="../../userland/appdev/index.html" />
+    <link rel="prev" title="系统调用" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">系统调用</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">系统调用表实现方案</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">概述</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">核心设计</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#syscall-trait">Syscall Trait</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#syscallhandle">SyscallHandle</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#syscalltable">SyscallTable</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">使用方式</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id5">实现系统调用</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id6">注册系统调用</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id7">初始化流程</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../locales/en/index.html">English</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">系统调用</a></li>
+      <li class="breadcrumb-item active">系统调用表实现方案</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/c0d0501/docs/kernel/syscall/syscall_table.rst" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="id1">
+<h1>系统调用表实现方案<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Author: longjin &lt;<a class="reference external" href="mailto:longjin&#37;&#52;&#48;dragonos&#46;org">longjin<span>&#64;</span>dragonos<span>&#46;</span>org</a>&gt;</p>
+<p>Date: 2025/05/13</p>
+</div>
+<section id="id2">
+<h2>概述<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<figure class="align-center" id="id8">
+<pre  class="mermaid">
+        classDiagram
+   class Syscall {
+      &lt;&lt;trait&gt;&gt;
+      +num_args() usize
+      +handle(args, from_user) Result&lt;usize, SystemError&gt;
+      +entry_format(args) Vec&lt;FormattedSyscallParam&gt;
+   }
+
+   class SyscallHandle {
+      +nr: usize
+      +inner_handle: &amp;dyn Syscall
+   }
+
+   class SyscallTable {
+      -entries: [Option&lt;&amp;SyscallHandle&gt;; 512]
+      +get(nr) Option&lt;&amp;dyn Syscall&gt;
+   }
+
+   Syscall &lt;|.. SysXXXXXXHandle
+   SyscallHandle &quot;1&quot; *-- &quot;1&quot; Syscall
+   SyscallTable &quot;1&quot; *-- &quot;512&quot; SyscallHandle
+    </pre><figcaption>
+<p><span class="caption-text">系统调用表架构</span><a class="headerlink" href="#id8" title="永久链接至图片"></a></p>
+</figcaption>
+</figure>
+<p>相比于将原本集中在一个大match中的系统调用分发，本方案采用基于trait和系统调用表的实现。主要优势包括：</p>
+<ul class="simple">
+<li><p>降低栈内存使用：避免单个大函数占用过多栈空间</p></li>
+<li><p>支持参数打印：通过统一的参数格式化接口</p></li>
+<li><p>更好的扩展性：新增系统调用无需修改分发逻辑</p></li>
+</ul>
+</section>
+<section id="id3">
+<h2>核心设计<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<section id="syscall-trait">
+<h3>Syscall Trait<a class="headerlink" href="#syscall-trait" title="Permalink to this heading"></a></h3>
+<p>所有系统调用处理函数都需要实现 <cite>Syscall</cite> trait：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">Syscall</span>: <span class="nb">Send</span> <span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">&#39;</span><span class="nb">static</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">num_args</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">usize</span><span class="p">;</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">handle</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">args</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">usize</span><span class="p">],</span><span class="w"> </span><span class="n">from_user</span>: <span class="kt">bool</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">SystemError</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">entry_format</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">args</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">usize</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Vec</span><span class="o">&lt;</span><span class="n">FormattedSyscallParam</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><cite>num_args()</cite>: 返回该系统调用需要的参数数量</p></li>
+<li><p><cite>handle()</cite>: 实际执行系统调用处理</p></li>
+<li><p><cite>entry_format()</cite>: 格式化参数用于调试打印</p></li>
+</ul>
+</section>
+<section id="syscallhandle">
+<h3>SyscallHandle<a class="headerlink" href="#syscallhandle" title="Permalink to this heading"></a></h3>
+<p><cite>SyscallHandle</cite> 结构体将系统调用号与处理函数关联：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">SyscallHandle</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">nr</span>: <span class="kt">usize</span><span class="p">,</span><span class="w">  </span><span class="c1">// 系统调用号</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">inner_handle</span>: <span class="kp">&amp;</span><span class="o">&#39;</span><span class="nb">static</span> <span class="nc">dyn</span><span class="w"> </span><span class="n">Syscall</span><span class="p">,</span><span class="w">  </span><span class="c1">// 处理函数</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">name</span>: <span class="kp">&amp;</span><span class="o">&#39;</span><span class="nb">static</span> <span class="kt">str</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="syscalltable">
+<h3>SyscallTable<a class="headerlink" href="#syscalltable" title="Permalink to this heading"></a></h3>
+<p><cite>SyscallTable</cite> 管理所有系统调用：</p>
+<ul class="simple">
+<li><p>固定大小512项</p></li>
+<li><p>编译时初始化</p></li>
+<li><p>通过系统调用号快速查找处理函数</p></li>
+</ul>
+</section>
+</section>
+<section id="id4">
+<h2>使用方式<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<section id="id5">
+<h3>实现系统调用<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p>定义实现``Syscall`` trait的结构体</p></li>
+<li><p>实现``handle()``和``entry_format()``方法</p></li>
+<li><p>使用``declare_syscall!``宏注册</p></li>
+</ol>
+<p>参考实现：<a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/blob/master/kernel/src/filesystem/vfs/syscall/sys_write.rs">sys_write.rs</a></p>
+</section>
+<section id="id6">
+<h3>注册系统调用<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h3>
+<p>使用``declare_syscall!``宏注册系统调用：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="n">syscall_table_macros</span>::<span class="n">declare_syscall</span><span class="o">!</span><span class="p">(</span><span class="n">SYS_WRITE</span><span class="p">,</span><span class="w"> </span><span class="n">SysWriteHandle</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>参数说明：</p>
+<ol class="arabic simple">
+<li><p>系统调用名称（用于生成符号）</p></li>
+<li><p>实现``Syscall`` trait的结构体</p></li>
+</ol>
+</section>
+</section>
+<section id="id7">
+<h2>初始化流程<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h2>
+<ol class="arabic simple">
+<li><p>内核启动时调用``syscall_table_init()``</p></li>
+<li><p>从链接器符号``_syscall_table``加载所有注册的系统调用</p></li>
+<li><p>填充系统调用表</p></li>
+</ol>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="index.html" class="btn btn-neutral float-left" title="系统调用" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../../userland/appdev/index.html" class="btn btn-neutral float-right" title="应用程序开发文档" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>c0d0501</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.2.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="syscall_table.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/syscall/syscall_table.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/syscall/syscall_table.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/syscall/syscall_table.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

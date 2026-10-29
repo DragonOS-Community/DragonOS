@@ -4,7 +4,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 
 use smoltcp::wire::{IpProtocol, IpVersion};
 
@@ -13,6 +13,7 @@ use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
+use crate::net::socket::inet::common::SocketDeviceBinding;
 use crate::process::namespace::net_namespace::NetNamespace;
 
 use inner::RawInner;
@@ -28,6 +29,7 @@ mod loopback;
 mod ops;
 mod options;
 mod packet;
+mod pmtu;
 mod recv;
 mod send;
 mod socket;
@@ -40,7 +42,10 @@ pub use constants::{SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF, SYSCTL_RMEM_MAX, SYSCTL_WM
 #[allow(unused_imports)]
 pub use options::{Icmp6Filter, IcmpFilter, RawSocketOptions};
 
-pub(crate) use loopback::deliver_udp_loopback_packet;
+pub(crate) use loopback::{
+    snapshot_raw_ingress_sockets, RawIngressBatch, RawIngressQueue, RawIngressWork,
+};
+pub(crate) use pmtu::handle_icmp_feedback;
 
 /// InetRawSocket - AF_INET/AF_INET6 SOCK_RAW 实现
 ///
@@ -52,8 +57,24 @@ pub(crate) use loopback::deliver_udp_loopback_packet;
 #[cast_to([sync] crate::net::socket::Socket)]
 #[derive(Debug)]
 pub struct RawSocket {
+    data: crate::libs::lazy_init::Lazy<crate::cgroup::memory::owned::OwnedBox<RawSocketData>>,
+}
+
+impl core::ops::Deref for RawSocket {
+    type Target = RawSocketData;
+    fn deref(&self) -> &Self::Target {
+        self.data.get()
+    }
+}
+
+#[derive(Debug)]
+pub struct RawSocketData {
+    memory: crate::net::socket::buffer::SocketMemory,
     /// 内部状态
     inner: RwSem<Option<RawInner>>,
+    /// Address identity belongs to the socket, not its transport attachment.
+    /// Guards never span an attachment, route, or registry operation.
+    addresses: RwSem<RawAddresses>,
     /// socket 选项
     options: RwSem<options::RawSocketOptions>,
     /// 非阻塞标志
@@ -64,10 +85,15 @@ pub struct RawSocket {
     inode_id: InodeId,
     /// 打开文件计数
     open_files: AtomicUsize,
+    fsnotify_watches: AtomicUsize,
     /// 自引用
-    self_ref: Weak<Self>,
+    self_ref: Weak<RawSocket>,
     /// 网络命名空间
     netns: Arc<NetNamespace>,
+    /// SO_BINDTODEVICE authoritative interface index.
+    device_binding: SocketDeviceBinding,
+    /// Bytes of complete IPv4 datagrams retained by the output owner.
+    send_account: Arc<super::common::output_account::SocketOutputAccount<RawSocket>>,
     /// epoll 项
     epoll_items: EPollItems,
     /// fasync 项
@@ -76,9 +102,15 @@ pub struct RawSocket {
     ip_version: IpVersion,
     /// 协议号
     protocol: IpProtocol,
+    /// IPv4 inet_dport is retained for LOCAL error queue msg_name only.
+    connected_port: AtomicU32,
 
     /// 回环快速路径：用于保留 TOS/TCLASS 等字段且实现 SO_RCVBUF 行为。
     loopback_rx: Mutex<LoopbackRxQueue>,
+    /// Socket error and extended-error queue share one lock so consuming a
+    /// queue entry cannot overwrite an error arriving concurrently.
+    errors: Mutex<(i32, super::common::error_queue::ErrorQueue)>,
+    output_path: Mutex<Option<pmtu::RawOutputPath>>,
 
     /// IP_MULTICAST_IF: interface index
     ip_multicast_ifindex: AtomicI32,
@@ -86,4 +118,19 @@ pub struct RawSocket {
     ip_multicast_addr: AtomicU32,
     /// IP_ADD_MEMBERSHIP/IP_DROP_MEMBERSHIP state (best-effort, no actual IGMP)
     ip_multicast_groups: Mutex<Vec<crate::net::socket::inet::common::Ipv4MulticastMembership>>,
+    ip_multicast_ttl: AtomicI32,
+    ip_multicast_loop: AtomicBool,
+    so_broadcast: AtomicBool,
+
+    /// SO_SNDTIMEO (microseconds). u64::MAX means "no timeout".
+    send_timeout_us: AtomicU64,
+    /// SO_RCVTIMEO (microseconds). u64::MAX means "no timeout".
+    recv_timeout_us: AtomicU64,
+}
+
+#[derive(Debug)]
+struct RawAddresses {
+    local: Option<smoltcp::wire::IpAddress>,
+    remote: Option<smoltcp::wire::IpAddress>,
+    live: bool,
 }

@@ -1,6 +1,7 @@
 pub mod bio;
 pub mod bio_queue;
 pub mod block_device;
+pub mod direct_access;
 pub mod disk_info;
 pub mod gendisk;
 pub mod manager;
@@ -11,5 +12,7 @@ pub enum SeekFrom {
     SeekSet(i64),
     SeekCurrent(i64),
     SeekEnd(i64),
+    SeekData(i64),
+    SeekHole(i64),
     Invalid,
 }

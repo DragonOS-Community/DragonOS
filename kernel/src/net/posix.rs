@@ -150,6 +150,12 @@ pub union SockAddr {
 
 impl From<smoltcp::wire::IpEndpoint> for SockAddr {
     fn from(value: smoltcp::wire::IpEndpoint) -> Self {
+        Self::from(crate::net::socket::endpoint::InetEndpoint::from(value))
+    }
+}
+
+impl From<crate::net::socket::endpoint::InetEndpoint> for SockAddr {
+    fn from(value: crate::net::socket::endpoint::InetEndpoint) -> Self {
         match value.addr {
             smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => Self {
                 addr_in: SockAddrIn {
@@ -167,7 +173,7 @@ impl From<smoltcp::wire::IpEndpoint> for SockAddr {
                         sin6_port: value.port.to_be(),
                         sin6_flowinfo: 0,
                         sin6_addr: addr,
-                        sin6_scope_id: 0,
+                        sin6_scope_id: value.with_scope(value.scope_id).scope_id,
                     },
                 }
             }
@@ -272,6 +278,24 @@ impl From<Endpoint> for SockAddr {
 impl SockAddr {
     /// @brief 把用户传入的SockAddr转换为Endpoint结构体
     pub fn to_endpoint(addr: *const SockAddr, len: u32) -> Result<Endpoint, SystemError> {
+        let mut endpoint = Self::to_endpoint_preserving_mapped(addr, len)?;
+        if let Endpoint::Ip(ip) = &mut endpoint {
+            if let smoltcp::wire::IpAddress::Ipv6(addr) = ip.addr {
+                if let Some(mapped) = addr.to_ipv4_mapped() {
+                    ip.addr = smoltcp::wire::IpAddress::Ipv4(mapped);
+                }
+            }
+        }
+        Ok(endpoint)
+    }
+
+    /// Preserve the sockaddr family until the protocol validates it. In
+    /// particular, TCP must distinguish AF_INET6 mapped input from AF_INET
+    /// input before applying IPV6_V6ONLY and normalizing the transport address.
+    pub fn to_endpoint_preserving_mapped(
+        addr: *const SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
         // 统一的上限检查：防止 addrlen 过大导致内核读取越界内存
         // 参考 Linux kernel net/socket.c:move_addr_to_kernel()
         if len > MAX_SOCKADDR_LEN {
@@ -316,7 +340,7 @@ impl SockAddr {
                 );
                 let port = u16::from_be(addr_in.sin_port);
 
-                return Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(ip, port)));
+                return Ok(Endpoint::ip(smoltcp::wire::IpEndpoint::new(ip, port)));
             }
 
             AddressFamily::Unspecified => {
@@ -325,28 +349,17 @@ impl SockAddr {
             }
 
             AddressFamily::INet6 => {
-                // 下限检查：至少需要包含完整的 sockaddr_in6 结构体
-                if len < size_of::<SockAddrIn6>() as u32 {
-                    log::error!(
-                        "len {} < sizeof(sockaddr_in6) {}",
-                        len,
-                        size_of::<SockAddrIn6>()
-                    );
-                    return Err(SystemError::EINVAL);
-                }
-
-                let addr_in6 = reader.buffer_protected(0)?.read_one::<SockAddrIn6>(0)?;
-
-                let addr = core::net::Ipv6Addr::from(addr_in6.sin6_addr);
-                // Handle IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
-                // These should be treated as IPv4 addresses for binding/connecting
-                let ip: smoltcp::wire::IpAddress = if let Some(ipv4) = addr.to_ipv4_mapped() {
-                    smoltcp::wire::IpAddress::Ipv4(ipv4)
-                } else {
-                    smoltcp::wire::IpAddress::Ipv6(addr)
-                };
-                let port = u16::from_be(addr_in6.sin6_port);
-                return Ok(Endpoint::Ip(smoltcp::wire::IpEndpoint::new(ip, port)));
+                // Snapshot the entire declared address as move_addr_to_kernel
+                // does. RFC2133's 24-byte form has no scope-id tail.
+                let mut snapshot = [0u8; MAX_SOCKADDR_LEN as usize];
+                reader
+                    .buffer_protected(0)?
+                    .read_from_user(0, &mut snapshot[..len as usize])?;
+                return Ok(Endpoint::Ip(
+                    crate::net::socket::endpoint::InetEndpoint::from_ipv6_sockaddr(
+                        &snapshot[..len as usize],
+                    )?,
+                ));
             }
             AddressFamily::Unix => {
                 // 在这里并没有分配抽象地址或者创建文件系统节点，这里只是简单的获取，等到bind时再创建

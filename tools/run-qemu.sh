@@ -12,26 +12,36 @@
 #
 # - AUTO_TEST: 自动测试选项
 # - SYSCALL_TEST_DIR: 系统调用测试目录
+# - DUNITEST_PATTERN: dunitest runner pattern filter
+# - DRAGONOS_QEMU_SMP: 覆盖 vCPU 拓扑，例如 1,cores=1,threads=1,sockets=1
+# - DRAGONOS_QEMU_SERIAL_SOCKET: nographic 模式下使用独立 Unix socket 承载 guest virtconsole
+# - DRAGONOS_QEMU_CONSOLE_TERM: x86_64 nographic 控制台使用的 guest terminfo 名称
+# - DRAGONOS_QEMU_ARGV_FILE: 以 JSON 数组记录实际执行的 QEMU argv（目标必须不存在）
+# - DRAGONOS_QEMU_DISK_IMAGE: 覆盖主磁盘镜像路径
+# - DRAGONOS_QEMU_SNAPSHOT: 设为1时以 QEMU snapshot 模式运行，避免修改基线镜像
+# - DRAGONOS_QEMU_TRACE: 覆盖传给 QEMU -d 的日志项；性能测试应设为 none
 # - DRAGONOS_VIRTIOFS_ENABLE: 是否启用 virtiofs（1启用，默认0）
 # - DRAGONOS_VIRTIOFS_SOCKET: virtiofsd socket路径
 # - DRAGONOS_VIRTIOFS_TAG: virtiofs 挂载tag
 # - DRAGONOS_VIRTIOFS_ENV_FILE: virtiofs配置文件路径（默认 ${ROOT_PATH}/tools/virtiofs/env.sh）
+# - DRAGONOS_VIRTIOFS_QUEUE_SIZE: (optional) queue-size passed to vhost-user-fs-pci
+# - DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES: (optional) num-request-queues passed to vhost-user-fs-pci
+# - DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE: DAX cache aperture in bytes; requires a preflight stamp
+# - DRAGONOS_VIRTIOFS_DAX_REQUIRED: fail rather than silently boot without a DAX cache
 #
 
 check_dependencies()
 {
-    # Check if qemu is installed
-    if [ -z "$(which qemu-system-x86_64)" ]; then
-        echo "Please install qemu first!"
-        exit 1
-    fi
-
-    if [ -z "$(which ${QEMU})" ]; then
+    # Check the selected QEMU, including a DAX-patched binary from env.sh.
+    if [ -z "${QEMU}" ] || [ ! -x "${QEMU}" ]; then
       if [ "$ARCH" == "loongarch64" ]; then
         echo -e "\nPlease install qemu-system-loongarch64 first!"
         echo -e "\nYou can install it by running:  (if you are using ubuntu)"
         echo -e "    ${ROOT_PATH}/tools/qemu/build-qemu-la64-for-ubuntu.sh"
         echo -e ""
+        exit 1
+      else
+        echo "Please install qemu-system-${ARCH} or configure an executable DRAGONOS_VIRTIOFS_QEMU_BIN"
         exit 1
       fi
     fi
@@ -114,7 +124,7 @@ EXT4_DISK_NAME="ext4.img"
 FAT_DISK_NAME="fat.img"
 
 QEMU=$(which qemu-system-${ARCH})
-QEMU_DISK_IMAGE="../bin/${DISK_NAME}"
+QEMU_DISK_IMAGE="${DRAGONOS_QEMU_DISK_IMAGE:-../bin/${DISK_NAME}}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
 QEMU_MEMORY="2G"
@@ -125,10 +135,20 @@ QEMU_NVDIMM_SLOTS="${QEMU_NVDIMM_SLOTS:-4}"
 QEMU_NVDIMM_MAXMEM="${QEMU_NVDIMM_MAXMEM:-4G}"
 PMEM_ENABLED=false
 PMEM_QEMU_ARGS=()
+DRAGONOS_VIRTIOFS_DAX_QEMU_OVERRIDE=${DRAGONOS_VIRTIOFS_QEMU_BIN:-}
+DRAGONOS_VIRTIOFS_DAX_CACHE_OVERRIDE=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE:-}
+DRAGONOS_VIRTIOFS_DAX_STAMP_OVERRIDE=${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP:-}
+DRAGONOS_VIRTIOFS_DAX_REQUIRED_OVERRIDE=${DRAGONOS_VIRTIOFS_DAX_REQUIRED:-}
+DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION_OVERRIDE=${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION:-}
 DRAGONOS_VIRTIOFS_ENABLE=${DRAGONOS_VIRTIOFS_ENABLE:=0}
 DRAGONOS_VIRTIOFS_SOCKET=${DRAGONOS_VIRTIOFS_SOCKET:=/tmp/dragonos-virtiofsd.sock}
 DRAGONOS_VIRTIOFS_TAG=${DRAGONOS_VIRTIOFS_TAG:=hostshare}
 DRAGONOS_VIRTIOFS_ENV_FILE=${DRAGONOS_VIRTIOFS_ENV_FILE:=}
+DRAGONOS_VIRTIOFS_QUEUE_SIZE=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:=}
+DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:=}
+DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE:=}
+DRAGONOS_VIRTIOFS_DAX_REQUIRED=${DRAGONOS_VIRTIOFS_DAX_REQUIRED:=0}
+DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP=${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP:=}
 
 # 检查必要的环境变量
 if [ -z "${ROOT_PATH}" ]; then
@@ -137,6 +157,41 @@ if [ -z "${ROOT_PATH}" ]; then
     exit 1
 fi
 PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-${ROOT_PATH}/bin/pmem.img}"
+
+# Load virtiofs configuration before dependency and device-model checks so a
+# DAX-patched QEMU selected by env.sh is the binary validated and launched.
+if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
+    if [ -z "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        DRAGONOS_VIRTIOFS_ENV_FILE="${ROOT_PATH}/tools/virtiofs/env.sh"
+    fi
+    if [ -f "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
+        # shellcheck source=/dev/null
+        . "${DRAGONOS_VIRTIOFS_ENV_FILE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_QEMU_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_QEMU_BIN="${DRAGONOS_VIRTIOFS_DAX_QEMU_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_CACHE_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE="${DRAGONOS_VIRTIOFS_DAX_CACHE_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_STAMP_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP="${DRAGONOS_VIRTIOFS_DAX_STAMP_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_DAX_REQUIRED_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_DAX_REQUIRED="${DRAGONOS_VIRTIOFS_DAX_REQUIRED_OVERRIDE}"
+        [ -z "${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION_OVERRIDE}" ] || \
+            DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION="${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION_OVERRIDE}"
+        if [ "${DRAGONOS_VIRTIOFS_SOCKET}" = "/tmp/dragonos-virtiofsd.sock" ] && [ -n "${SOCKET_PATH:-}" ]; then
+            DRAGONOS_VIRTIOFS_SOCKET="${SOCKET_PATH}"
+        fi
+        if [ "${DRAGONOS_VIRTIOFS_TAG}" = "hostshare" ] && [ -n "${VIRTIOFS_TAG:-}" ]; then
+            DRAGONOS_VIRTIOFS_TAG="${VIRTIOFS_TAG}"
+        fi
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_QEMU_BIN:-}" ]; then
+        if [ ! -x "${DRAGONOS_VIRTIOFS_QEMU_BIN}" ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_QEMU_BIN is not executable"
+            exit 1
+        fi
+        QEMU="${DRAGONOS_VIRTIOFS_QEMU_BIN}"
+    fi
+fi
 
 # 状态文件目录（优先使用环境变量，否则使用默认值）
 VMSTATE_DIR="${VMSTATE_DIR:-${ROOT_PATH}/bin/vmstate}"
@@ -332,14 +387,60 @@ GDB_PORT=$(find_free_port $((HOST_PORT + 1)))
 echo "${HOST_PORT}" > "${VMSTATE_DIR}/port"
 echo "${GDB_PORT}" > "${VMSTATE_DIR}/gdb"
 
-QEMU_SMP="2,cores=2,threads=1,sockets=1"
+QEMU_SMP="${DRAGONOS_QEMU_SMP:-2,cores=2,threads=1,sockets=1}"
+if ! [[ "${QEMU_SMP}" =~ ^[0-9]+(,(cores|threads|sockets|maxcpus)=[0-9]+)*$ ]]; then
+  echo "[错误] DRAGONOS_QEMU_SMP 格式无效: ${QEMU_SMP}"
+  exit 1
+fi
+IFS=',' read -r -a qemu_smp_fields <<< "${QEMU_SMP}"
+qemu_smp_cpus="${qemu_smp_fields[0]}"
+if [ "${qemu_smp_cpus}" -lt 1 ] || [ "${qemu_smp_cpus}" -gt 64 ]; then
+  echo "[错误] DRAGONOS_QEMU_SMP 的 vCPU 数必须位于 1..64: ${QEMU_SMP}"
+  exit 1
+fi
+declare -A qemu_smp_values=()
+for qemu_smp_field in "${qemu_smp_fields[@]:1}"; do
+  qemu_smp_key="${qemu_smp_field%%=*}"
+  qemu_smp_value="${qemu_smp_field#*=}"
+  if [ -n "${qemu_smp_values[${qemu_smp_key}]+set}" ] || \
+     [ "${qemu_smp_value}" -lt 1 ] || [ "${qemu_smp_value}" -gt 64 ]; then
+    echo "[错误] DRAGONOS_QEMU_SMP 含重复键或越界值: ${QEMU_SMP}"
+    exit 1
+  fi
+  qemu_smp_values["${qemu_smp_key}"]="${qemu_smp_value}"
+done
+if [ -n "${qemu_smp_values[maxcpus]+set}" ] && \
+   { [ "${qemu_smp_values[maxcpus]}" -lt "${qemu_smp_cpus}" ] || \
+     [ "${qemu_smp_values[maxcpus]}" -gt 64 ]; }; then
+  echo "[错误] DRAGONOS_QEMU_SMP 的 maxcpus 必须不小于当前 vCPU 数且不超过64: ${QEMU_SMP}"
+  exit 1
+fi
+if [ -n "${qemu_smp_values[cores]+set}" ] && \
+   [ -n "${qemu_smp_values[threads]+set}" ] && \
+   [ -n "${qemu_smp_values[sockets]+set}" ]; then
+  qemu_smp_product=$((qemu_smp_values[cores] * qemu_smp_values[threads] * qemu_smp_values[sockets]))
+  qemu_smp_expected_product="${qemu_smp_values[maxcpus]:-${qemu_smp_cpus}}"
+  if [ "${qemu_smp_product}" -ne "${qemu_smp_expected_product}" ]; then
+    echo "[错误] DRAGONOS_QEMU_SMP 的 cores*threads*sockets 必须等于 maxcpus（未指定时等于 vCPU 数）: ${QEMU_SMP}"
+    exit 1
+  fi
+fi
 QEMU_MONITOR_ARGS=(-monitor stdio)
-QEMU_TRACE="${qemu_trace_std}"
+QEMU_TRACE="${DRAGONOS_QEMU_TRACE:-${qemu_trace_std}}"
 QEMU_CPU_FEATURES=""
 QEMU_RTC_CLOCK=""
 QEMU_SERIAL_LOG_FILE="../serial_opt.txt"
 QEMU_SERIAL_ARGS=(-serial "file:${QEMU_SERIAL_LOG_FILE}")
-QEMU_DRIVE_ARGS=(-drive "id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw")
+QEMU_CONSOLE_CHARDEV_ID="mux"
+if [ "${DRAGONOS_QEMU_SNAPSHOT:-0}" != "0" ] && [ "${DRAGONOS_QEMU_SNAPSHOT:-0}" != "1" ]; then
+  echo "[错误] DRAGONOS_QEMU_SNAPSHOT 只能是0或1"
+  exit 1
+fi
+QEMU_DRIVE="id=disk,file=${QEMU_DISK_IMAGE},if=none,format=raw"
+if [ "${DRAGONOS_QEMU_SNAPSHOT:-0}" = "1" ]; then
+  QEMU_DRIVE+=",snapshot=on"
+fi
+QEMU_DRIVE_ARGS=(-drive "${QEMU_DRIVE}")
 QEMU_ACCEL_ARGS=()
 QEMU_DEVICE_ARGS=()
 QEMU_DISPLAY_ARGS=()
@@ -359,7 +460,7 @@ QEMU_VSOCK_DEVICE_MODEL="vhost-vsock-pci-non-transitional"
 # GDB调试支持：
 # - QEMU_GDB_WAIT=1: QEMU 启动后立即暂停CPU（等同 -S），等待 GDB/monitor 手动继续
 # - QEMU_GDB_WAIT=0: 默认不暂停
-QEMU_GDB_WAIT=0
+QEMU_GDB_WAIT="${QEMU_GDB_WAIT:-0}"
 
 if [ -f "${QEMU_EXT4_DISK_IMAGE}" ]; then
   QEMU_DRIVE_ARGS+=(-drive "id=ext4disk,file=${QEMU_EXT4_DISK_IMAGE},if=none,format=raw")
@@ -373,7 +474,7 @@ check_dependencies
 # 设置无图形界面模式
 QEMU_NOGRAPHIC=false
 
-KERNEL_CMDLINE=" "
+KERNEL_CMDLINE=" rw "
 
 # 自动测试选项，支持的选项：
 # - none: 不进行自动测试
@@ -384,6 +485,8 @@ AUTO_TEST=${AUTO_TEST:=none}
 SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR:=/opt/tests/gvisor}
 # dunitest测试目录
 DUNITEST_DIR=${DUNITEST_DIR:=/opt/tests/dunitest}
+# dunitest pattern过滤条件
+DUNITEST_PATTERN=${DUNITEST_PATTERN:=}
 
 BIOS_TYPE=""
 #这个变量为true则使用virtio磁盘
@@ -498,7 +601,7 @@ while true;do
 
 setup_kernel_init_program() {
     if [ ${ARCH} == "x86_64" ]; then
-        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} "
+        KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} DUNITEST_PATTERN=${DUNITEST_PATTERN} "
         # KERNEL_CMDLINE+=" init=/bin/dragonreach "
     elif [ ${ARCH} == "riscv64" ]; then
         KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "
@@ -514,6 +617,14 @@ setup_kernel_cmdline_from_env() {
     if [ -n "${DRAGONOS_LOGLEVEL}" ]; then
         KERNEL_CMDLINE+=" loglevel=${DRAGONOS_LOGLEVEL} "
         echo "[INFO] Setting kernel loglevel to ${DRAGONOS_LOGLEVEL} from environment variable"
+    fi
+
+    # Synthetic veth/bridge devices are test fixtures, not production boot
+    # devices. DUnit tests depend on them; manual test runs can opt in with
+    # DRAGONOS_NET_TEST_FIXTURES=1.
+    if [ "${DRAGONOS_NET_TEST_FIXTURES}" == "1" ] || [ "${AUTO_TEST}" == "dunit" ]; then
+        KERNEL_CMDLINE+=" dragonos.net_test_fixtures "
+        echo "[INFO] Enabling synthetic network test fixtures"
     fi
 
     # 检测其他环境变量可以在这里添加
@@ -535,48 +646,167 @@ if [ "${DRAGONOS_VIRTIOFS_ENABLE}" == "1" ]; then
         exit 1
     fi
 
-    if [ -z "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
-        DRAGONOS_VIRTIOFS_ENV_FILE="${ROOT_PATH}/tools/virtiofs/env.sh"
-    fi
-
-    if [ -f "${DRAGONOS_VIRTIOFS_ENV_FILE}" ]; then
-        # shellcheck source=/dev/null
-        . "${DRAGONOS_VIRTIOFS_ENV_FILE}"
-        if [ "${DRAGONOS_VIRTIOFS_SOCKET}" = "/tmp/dragonos-virtiofsd.sock" ] && [ -n "${SOCKET_PATH:-}" ]; then
-            DRAGONOS_VIRTIOFS_SOCKET="${SOCKET_PATH}"
-        fi
-        if [ "${DRAGONOS_VIRTIOFS_TAG}" = "hostshare" ] && [ -n "${VIRTIOFS_TAG:-}" ]; then
-            DRAGONOS_VIRTIOFS_TAG="${VIRTIOFS_TAG}"
-        fi
-    fi
-
     if [ ! -S "${DRAGONOS_VIRTIOFS_SOCKET}" ]; then
         echo "[错误] 未检测到virtiofsd socket: ${DRAGONOS_VIRTIOFS_SOCKET}"
         echo "[提示] 请先在另一个终端启动: tools/virtiofs/start_virtiofsd.sh"
         exit 1
     fi
 
-    echo "[INFO] 启用virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}"
+    virtiofs_device_opts="vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}"
+    if is_truthy "${DRAGONOS_VIRTIOFS_DAX_REQUIRED}" && [ -z "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" ]; then
+        echo "[ERROR] DAX is required but DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE is unset"
+        exit 1
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" ]; then
+        if ! [[ "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" =~ ^[0-9]+$ ]] || \
+           [ "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" -lt 2097152 ] || \
+           [ $((DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE & (DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE - 1))) -ne 0 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE must be a power-of-two byte count >= 2 MiB"
+            exit 1
+        fi
+
+        if [ -z "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}" ]; then
+            DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP="${RUNTIME_DIR:-${ROOT_PATH}/bin/virtiofs-runtime}/dax-preflight.stamp"
+        fi
+        if [ ! -r "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}" ]; then
+            echo "[ERROR] missing DAX preflight stamp: ${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}"
+            echo "[HINT] run make virtiofs-dax-preflight with the same env.sh"
+            exit 1
+        fi
+
+        stamp_qemu_sha="$(awk -F= '$1 == "QEMU_SHA256" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_virtiofsd_sha="$(awk -F= '$1 == "VIRTIOFSD_SHA256" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_config_sha="$(awk -F= '$1 == "CONFIG_SHA256" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_cache_size="$(awk -F= '$1 == "CACHE_SIZE" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        stamp_correctness_profile="$(awk -F= '$1 == "CORRECTNESS_PROFILE" { print $2 }' "${DRAGONOS_VIRTIOFS_DAX_PREFLIGHT_STAMP}")"
+        if [ "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" -le 8589934592 ]; then
+            current_correctness_profile=1
+        else
+            current_correctness_profile=0
+        fi
+        # shellcheck source=virtiofs/common.sh
+        . "${ROOT_PATH}/tools/virtiofs/common.sh"
+        current_virtiofsd="$(virtiofs_detect_daemon || true)"
+        if [ -z "${current_virtiofsd}" ]; then
+            echo "[ERROR] unable to identify the configured virtiofsd binary"
+            exit 1
+        fi
+        current_qemu_sha="$(sha256sum "${QEMU}" | awk '{print $1}')"
+        current_virtiofsd_sha="$(sha256sum "${current_virtiofsd}" | awk '{print $1}')"
+        current_config_sha="$(printf '%s\0%s\0%s\0' "${VIRTIOFSD_CACHE:-}" \
+          "${VIRTIOFSD_EXTRA_ARGS:-}" \
+          "cache-size=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE},modern-pio-notify=off" | \
+          sha256sum | awk '{print $1}')"
+        if [ "${stamp_cache_size}" != "${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE}" ] || \
+           [ "${stamp_qemu_sha}" != "${current_qemu_sha}" ] || \
+           [ "${stamp_virtiofsd_sha}" != "${current_virtiofsd_sha}" ] || \
+           [ "${stamp_config_sha}" != "${current_config_sha}" ] || \
+           [ "${stamp_correctness_profile}" != "${current_correctness_profile}" ]; then
+            echo "[ERROR] DAX preflight stamp does not match the current binaries and configuration"
+            exit 1
+        fi
+        if is_truthy "${DRAGONOS_VIRTIOFS_DAX_REQUIRED}" && [ "${current_correctness_profile}" != "1" ]; then
+            echo "[ERROR] DAX required correctness runs support at most 4096 cache ranges (8 GiB)"
+            exit 1
+        fi
+
+        backend_attestation="${DRAGONOS_VIRTIOFS_BACKEND_ATTESTATION:-${RUNTIME_DIR:-${ROOT_PATH}/bin/virtiofs-runtime}/virtiofsd.attestation}"
+        if [ ! -e "${backend_attestation}" ]; then
+            echo "[ERROR] missing live virtiofsd attestation: ${backend_attestation}"
+            echo "[HINT] restart tools/virtiofs/start_virtiofsd.sh with the same env.sh"
+            exit 1
+        fi
+        virtiofs_build_daemon_command "${current_virtiofsd}" "${DRAGONOS_VIRTIOFS_SOCKET}" \
+          "${HOST_SHARE_DIR}" "${VIRTIOFSD_CACHE:-auto}" "${VIRTIOFSD_EXTRA_ARGS:-}"
+        live_command_sha="$(virtiofs_command_sha256)"
+        if ! sudo bash "${ROOT_PATH}/tools/virtiofs/verify_backend_attestation.sh" \
+          "${backend_attestation}" "${DRAGONOS_VIRTIOFS_SOCKET}" \
+          "${current_virtiofsd_sha}" "${live_command_sha}"; then
+            echo "[ERROR] live virtiofsd process/socket does not match the DAX configuration"
+            exit 1
+        fi
+        virtiofs_device_opts="${virtiofs_device_opts},cache-size=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE},modern-pio-notify=off"
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" ]; then
+        if ! [[ "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" =~ ^[0-9]+$ ]] || [ "${DRAGONOS_VIRTIOFS_QUEUE_SIZE}" -eq 0 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_QUEUE_SIZE must be a positive integer"
+            exit 1
+        fi
+        virtiofs_device_opts="${virtiofs_device_opts},queue-size=${DRAGONOS_VIRTIOFS_QUEUE_SIZE}"
+    fi
+    if [ -n "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" ]; then
+        if ! [[ "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" =~ ^[0-9]+$ ]] || [ "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" -eq 0 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES must be a positive integer"
+            exit 1
+        fi
+        if [ "${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}" -gt 64 ]; then
+            echo "[ERROR] DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES cannot exceed 64"
+            exit 1
+        fi
+        virtiofs_device_opts="${virtiofs_device_opts},num-request-queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES}"
+    fi
+
+    echo "[INFO] Enabling virtiofs: tag=${DRAGONOS_VIRTIOFS_TAG}, socket=${DRAGONOS_VIRTIOFS_SOCKET}, queue_size=${DRAGONOS_VIRTIOFS_QUEUE_SIZE:-qemu-default}, request_queues=${DRAGONOS_VIRTIOFS_NUM_REQUEST_QUEUES:-qemu-default}, dax_cache=${DRAGONOS_VIRTIOFS_DAX_CACHE_SIZE:-disabled}"
 
     QEMU_OBJECT_ARGS+=(
       -object "memory-backend-memfd,id=mem,size=${QEMU_MEMORY},share=on"
     )
     QEMU_NUMA_ARGS+=(-numa "node,memdev=mem")
     QEMU_CHARDEV_ARGS+=(-chardev "socket,id=char_virtiofs,path=${DRAGONOS_VIRTIOFS_SOCKET}")
-    QEMU_DEVICE_ARGS+=(-device "vhost-user-fs-pci,chardev=char_virtiofs,tag=${DRAGONOS_VIRTIOFS_TAG}")
+    QEMU_DEVICE_ARGS+=(-device "${virtiofs_device_opts}")
 fi
 
 
 if [ ${QEMU_NOGRAPHIC} == true ]; then
-    QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    qemu_console_transport="stdio"
+    if [ -n "${DRAGONOS_QEMU_SERIAL_SOCKET:-}" ]; then
+      qemu_console_transport="socket"
+      qemu_serial_socket_dir="$(dirname "${DRAGONOS_QEMU_SERIAL_SOCKET}")"
+      qemu_serial_socket_real_dir="$(realpath -e -- "${qemu_serial_socket_dir}" 2>/dev/null || true)"
+      if [[ "${DRAGONOS_QEMU_SERIAL_SOCKET}" != /* ]] || \
+         [ ${#DRAGONOS_QEMU_SERIAL_SOCKET} -gt 100 ] || \
+         [ ! -d "${qemu_serial_socket_dir}" ] || \
+         [ -L "${qemu_serial_socket_dir}" ] || \
+         [ "${qemu_serial_socket_real_dir}" != "${qemu_serial_socket_dir}" ] || \
+         [ -e "${DRAGONOS_QEMU_SERIAL_SOCKET}" ]; then
+        echo "[错误] DRAGONOS_QEMU_SERIAL_SOCKET 必须位于已存在的非符号链接目录，长度不超过100且目标不存在"
+        exit 1
+      fi
+      if [ "$(stat -c '%u' "${qemu_serial_socket_dir}")" -ne "$(id -u)" ] || \
+         [ "$(stat -c '%a' "${qemu_serial_socket_dir}")" != "700" ]; then
+        echo "[错误] DRAGONOS_QEMU_SERIAL_SOCKET 父目录必须由当前用户拥有且权限严格为0700"
+        exit 1
+      fi
+      QEMU_CONSOLE_CHARDEV_ID="calib_console"
+      QEMU_SERIAL_ARGS=(-serial none -monitor none -chardev "socket,id=${QEMU_CONSOLE_CHARDEV_ID},path=${DRAGONOS_QEMU_SERIAL_SOCKET},server=on,wait=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    else
+      QEMU_SERIAL_ARGS=(-serial chardev:mux -monitor chardev:mux -chardev "stdio,id=mux,mux=on,signal=off,logfile=${QEMU_SERIAL_LOG_FILE}")
+    fi
+
+    if [ "${ARCH}" = "x86_64" ]; then
+      # shellcheck source=qemu/console-term.sh
+      if ! . "${ROOT_PATH}/tools/qemu/console-term.sh"; then
+        echo "[ERROR] failed to load the console TERM resolver"
+        exit 1
+      fi
+      if ! dragonos_resolve_console_term "${qemu_console_transport}"; then
+        exit 1
+      fi
+      if [ -n "${DRAGONOS_RESOLVED_CONSOLE_TERM}" ]; then
+        KERNEL_CMDLINE+=" TERM=${DRAGONOS_RESOLVED_CONSOLE_TERM} "
+        echo "[INFO] Guest console TERM=${DRAGONOS_RESOLVED_CONSOLE_TERM} (source=${DRAGONOS_RESOLVED_CONSOLE_TERM_SOURCE})"
+      else
+        echo "[INFO] Guest console TERM uses the current init fallback"
+      fi
+    fi
 
     # 添加 virtio console 设备
     if [ ${ARCH} == "x86_64" ]; then
-      QEMU_DEVICE_ARGS+=(-device virtio-serial -device virtconsole,chardev=mux)
+      QEMU_DEVICE_ARGS+=(-device virtio-serial -device "virtconsole,chardev=${QEMU_CONSOLE_CHARDEV_ID}")
     elif [ ${ARCH} == "loongarch64" ]; then
-      QEMU_DEVICE_ARGS+=(-device virtio-serial -device virtconsole,chardev=mux)
+      QEMU_DEVICE_ARGS+=(-device virtio-serial -device "virtconsole,chardev=${QEMU_CONSOLE_CHARDEV_ID}")
     elif [ ${ARCH} == "riscv64" ]; then
-      QEMU_DEVICE_ARGS+=(-device virtio-serial-device -device virtconsole,chardev=mux)
+      QEMU_DEVICE_ARGS+=(-device virtio-serial-device -device "virtconsole,chardev=${QEMU_CONSOLE_CHARDEV_ID}")
     fi
 
     KERNEL_CMDLINE=" console=/dev/hvc0 ${KERNEL_CMDLINE}"
@@ -598,6 +828,11 @@ fi
 # ps: 下面这条使用tap的方式，无法dhcp获取到ip，暂时不知道为什么
 # QEMU_DEVICES="-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -net nic,netdev=nic0 -netdev tap,id=nic0,model=virtio-net-pci,script=qemu/ifup-nat,downscript=qemu/ifdown-nat -usb -device qemu-xhci,id=xhci,p2=8,p3=4 "
 QEMU_DEVICE_ARGS+=("${QEMU_DEVICE_DISK_ARGS[@]}")
+if [ "${ARCH}" = "riscv64" ]; then
+  QEMU_DEVICE_ARGS+=(-device virtio-rng-device)
+else
+  QEMU_DEVICE_ARGS+=(-device virtio-rng-pci)
+fi
 QEMU_DEVICE_ARGS+=(
   -netdev "user,id=hostnet0,hostfwd=tcp::${HOST_PORT}-:12580"
   -device "virtio-net-pci,vectors=5,netdev=hostnet0,id=net0"
@@ -628,7 +863,9 @@ QEMU_ARGS+=(
 )
 QEMU_ARGS+=("${QEMU_MONITOR_ARGS[@]}")
 QEMU_ARGS+=("${QEMU_DISPLAY_ARGS[@]}")
-QEMU_ARGS+=(-d "${qemu_trace_std}")
+if [ "${QEMU_TRACE}" != "none" ]; then
+  QEMU_ARGS+=(-d "${QEMU_TRACE}")
+fi
 
 QEMU_ARGS+=(
   "${QEMU_MACHINE_ARGS[@]}"
@@ -697,6 +934,28 @@ if [ $flag_can_run -eq 1 ]; then
       echo "[QEMU] 等待GDB连接... (使用 'make gdb' 连接)"
     fi
     local -a cmd=("${QEMU}" "${bios_args[@]}" "${QEMU_ARGS[@]}")
+    if [ -n "${DRAGONOS_QEMU_ARGV_FILE:-}" ]; then
+      if [[ "${DRAGONOS_QEMU_ARGV_FILE}" != /* ]] || \
+         [ ! -d "$(dirname "${DRAGONOS_QEMU_ARGV_FILE}")" ] || \
+         [ -e "${DRAGONOS_QEMU_ARGV_FILE}" ]; then
+        echo "[错误] DRAGONOS_QEMU_ARGV_FILE 必须是父目录已存在且目标不存在的绝对路径"
+        return 1
+      fi
+      if ! python3 - "${DRAGONOS_QEMU_ARGV_FILE}" "${cmd[@]}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("x", encoding="utf-8") as output:
+    json.dump(sys.argv[2:], output, ensure_ascii=True, indent=2)
+    output.write("\n")
+PY
+      then
+        echo "[错误] 无法可靠记录 QEMU argv，终止启动"
+        return 1
+      fi
+    fi
     printf '[QEMU] 执行: sudo ' >&2
     printf '%q ' "${cmd[@]}" >&2
     printf '\n' >&2

@@ -7,8 +7,9 @@ use crate::filesystem::{
         pid::ProcPidTarget,
         template::{Builder, DirOps, ProcDir, ProcDirBuilder, ProcSymBuilder, SymOps},
     },
-    vfs::{IndexNode, InodeMode, SpecialNodeData},
+    vfs::{permission::PermissionMask, IndexNode, InodeMode, Metadata, SpecialNodeData},
 };
+use crate::libs::casting::DowncastArc;
 use alloc::{
     format,
     string::ToString,
@@ -33,11 +34,37 @@ impl FdDirOps {
     }
 
     fn get_process(&self) -> Option<Arc<crate::process::ProcessControlBlock>> {
-        self.target.thread_group_leader()
+        // Linux resolves the directory's `get_proc_task(inode)`, so a hidden
+        // tid shows the files table of *that thread*: a thread that took a
+        // private one with `close_range(CLOSE_RANGE_UNSHARE)` must not read the
+        // leader's. For `/proc/<tgid>` the two agree, because the tgid resolves
+        // to the leader.
+        self.target.task()
     }
 }
 
 impl DirOps for FdDirOps {
+    fn check_dac_permission(
+        &self,
+        metadata: &Metadata,
+        mask: PermissionMask,
+    ) -> Result<(), SystemError> {
+        let current = crate::process::ProcessManager::current_pcb();
+        let generic = current.cred().inode_permission(metadata, mask.bits());
+        if generic.is_ok() {
+            return generic;
+        }
+        // Linux proc_fd_permission(): introspection remains possible after
+        // setuid(), without granting another thread group a DAC bypass.
+        if self
+            .get_process()
+            .is_some_and(|target| target.raw_tgid() == current.raw_tgid())
+        {
+            return Ok(());
+        }
+        generic
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
@@ -47,11 +74,19 @@ impl DirOps for FdDirOps {
         let fd = name.parse::<i32>().map_err(|_| SystemError::ENOENT)?;
 
         // 获取进程引用
-        let process = self.get_process().ok_or(SystemError::ESRCH)?;
+        let process = self.get_process().ok_or(SystemError::ENOENT)?;
 
         // 检查文件描述符是否存在，并立即释放fd_table锁
         {
-            let fd_table = process.fd_table();
+            // A process can become a zombie after ProcPidTarget resolved it.
+            // exit_files() has already removed its descriptor table in that
+            // state, so /proc/<pid>/fd must report a disappearing entry rather
+            // than calling ProcessControlBlock::fd_table(), which unwraps.
+            let fd_table = process
+                .basic()
+                .try_fd_table()
+                .clone()
+                .ok_or(SystemError::ENOENT)?;
             let fd_table_guard = fd_table.read();
 
             if fd_table_guard.get_file_by_fd(fd).is_none() {
@@ -82,8 +117,10 @@ impl DirOps for FdDirOps {
         // 获取进程的所有文件描述符
         if let Some(process) = self.get_process() {
             // 先收集所有的fd，避免在持有锁时做复杂操作
+            let Some(fd_table) = process.basic().try_fd_table().clone() else {
+                return;
+            };
             let fds: Vec<i32> = {
-                let fd_table = process.fd_table();
                 let fd_table_guard = fd_table.read();
                 fd_table_guard.iter().map(|(fd, _)| fd).collect()
             };
@@ -100,6 +137,10 @@ impl DirOps for FdDirOps {
         }
         // 写锁在这里自动释放
     }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        child.special_node().is_some()
+    }
 }
 
 /// /proc/[pid]/fd/[fd] 符号链接的 SymOps 实现
@@ -110,6 +151,18 @@ pub struct FdSymOps {
 }
 
 impl FdSymOps {
+    fn checked_process(&self) -> Result<Arc<crate::process::ProcessControlBlock>, SystemError> {
+        // Linux proc_fd_access_allowed() returns false for a vanished task;
+        // get_link/readlink report EACCES before attempting to resolve its fd.
+        let target = self.target.task().ok_or(SystemError::EACCES)?;
+        if !crate::process::ProcessManager::current_pcb()
+            .has_permission_to_trace(&target, crate::process::ptrace::PtraceAccessCreds::FsCreds)
+        {
+            return Err(SystemError::EACCES);
+        }
+        Ok(target)
+    }
+
     pub fn new_inode(
         target: ProcPidTarget,
         fd: i32,
@@ -124,36 +177,62 @@ impl FdSymOps {
 }
 
 impl SymOps for FdSymOps {
+    fn check_symlink_access(&self) -> Result<(), SystemError> {
+        self.checked_process().map(|_| ())
+    }
+
+    fn is_magic_link(&self) -> bool {
+        true
+    }
+
     fn read_link(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let process = self
-            .target
-            .thread_group_leader()
-            .ok_or(SystemError::ESRCH)?;
+        // `proc_fd_link()` walks `get_proc_task(inode)->files`, so the link is
+        // resolved against the thread this node names, not the group leader.
+        let process = self.checked_process()?;
 
         // 先获取文件对象的 clone，然后立即释放 fd_table 锁
         // 避免在持有锁时调用可能获取其他锁的方法（如 absolute_path）
         let file = {
-            let fd_table = process.fd_table();
+            let fd_table = process
+                .basic()
+                .try_fd_table()
+                .clone()
+                .ok_or(SystemError::ENOENT)?;
             let fd_table_guard = fd_table.read();
 
             fd_table_guard
                 .get_file_by_fd(self.fd)
-                .ok_or(SystemError::EBADF)?
+                .ok_or(SystemError::ENOENT)?
         }; // fd_table 锁在这里被释放
 
         // 获取进程的 chroot 根路径
         let root_prefix = process
-            .fs_struct()
+            .try_fs_struct()
+            .ok_or(SystemError::ENOENT)?
             .root()
             .absolute_path()
             .unwrap_or_default();
 
         // 现在安全地获取文件的路径
-        let mut path = if let Ok(p) = file.inode().absolute_path() {
+        let inode = file.path_inode();
+        if let Some(target) = inode.proc_fd_link_target() {
+            let copy_len = target.len().min(buf.len());
+            buf[..copy_len].copy_from_slice(&target[..copy_len]);
+            return Ok(copy_len);
+        }
+        let path_result = if let Some(mount_inode) = inode
+            .clone()
+            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>(
+        ) {
+            mount_inode.procfs_path()
+        } else {
+            inode.absolute_path()
+        };
+        let mut path = if let Ok(p) = path_result {
             p
         } else {
             // 匿名文件或无法获取路径
-            let inode_id = file.inode().metadata()?.inode_id;
+            let inode_id = inode.metadata()?.inode_id;
             format!("anon_inode:[{}]", inode_id)
         };
 
@@ -179,16 +258,18 @@ impl SymOps for FdSymOps {
     }
 
     fn special_node(&self) -> Option<SpecialNodeData> {
-        let process = self.target.thread_group_leader()?;
+        let process = self.target.task()?;
 
         // 获取文件对象
         let file = {
-            let fd_table = process.fd_table();
+            let fd_table = process.basic().try_fd_table().clone()?;
             let fd_table_guard = fd_table.read();
             fd_table_guard.get_file_by_fd(self.fd)?
         };
 
-        // 返回文件的 inode 引用，使得 fstatat 等操作可以通过魔法链接工作
-        Some(SpecialNodeData::Reference(file.inode()))
+        // Keep the open file description alive until the path walker can
+        // retain the target inode. An inode Arc alone does not prevent a
+        // zero-link ext4 O_TMPFILE from entering final reclaim.
+        Some(SpecialNodeData::FileReference(file))
     }
 }

@@ -1,10 +1,10 @@
-# 内核编译配置说明
+# Kernel Compilation Configuration Guide
 
-## 原理
+## Principle
 
-&emsp;&emsp;在内核目录下，用kernel.config来设置内核编译配置信息，以类似解析toml文件的方式去解析该文件，然后接着去解析各模块下的d.config以获取feature的启用情况
+Within the kernel directory, the kernel configuration is set using `kernel.config`. This file is parsed in a manner similar to a TOML file, and then the configuration of each module's `d.config` is parsed to determine the status of features.
 
-## 示例
+## Example
 
 **kernel.config**
 
@@ -22,15 +22,13 @@ enable = "y"
 description = ""
 ```
 
-
-- **[[module.include]]:** 将模块加入到include列表中
-- **name:** 模块名
-- **path:** 模块路径，存放着d.config
+- **[[module.include]]:** Adds the module to the include list
+- **name:** Module name
+- **path:** Module path, where the `d.config` file is located
 - **enable:**
-  - **y:** 启用，解析模块下的d.config
-  - **n:** 不启用，不解析
-- **description:** 模块的描述信息
-
+  - **y:** Enabled, parse the `d.config` file of the module
+  - **n:** Disabled, do not parse
+- **description:** Description of the module
 
 **src/mm/d.config**
 
@@ -51,20 +49,18 @@ enable = "y"
 description = ""
 ```
 
+- **[module]:** Current module
+  - **name:** Name of the current module
+  - **description:** Description of the module
+- **[[module.include]]:** Modules included in the current module, same as in `kernel.config`
+- **[[module.features]]:** Features in the current module
+  - **name:** Feature name
+  - **enable:** Whether the feature is enabled
+    - **y:** Enabled
+    - **n:** Disabled
+  - **description:** Description of the feature
 
-- **\[module\]:** 当前模块
-  - **name:** 当前模块名称
-  - **description:** 模块的描述信息
-- **[[module.include]]:** 当前模块下所包含的模块，与kernel.config下的相同
-- **[[module.features]]:** 当前模块下的feature
-  - **name:** feature名
-  - **enable:** 是否开启
-    - **y:** 开启
-    - **n:** 不开启
-  - **description:** feature的描述信息
-
-
-*以下是其它模块下的d.config：*
+*The following are the `d.config` files of other modules:*
 
 **src/mm/allocator/d.config**
 
@@ -92,9 +88,7 @@ enable = "y"
 description = ""
 ```
 
-
-上面所有已开启模块的d.config中的feature，会最终生成到内核目录下的D.config文件，即D.config是最终内核编译的配置，如下：
-
+All features enabled in the `d.config` files of the activated modules will be ultimately generated into the `D.config` file in the kernel directory. That is, `D.config` is the final kernel compilation configuration, as follows:
 
 **D.config**
 

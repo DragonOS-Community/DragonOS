@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Secure Memory Copy Scheme Based on Exception Table &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="File System" href="../filesystem/index.html" />
+    <link rel="prev" title="MMIO" href="mmio.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../locking/index.html">Locks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Memory Management</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="intro.html">Introduction to the Memory Management Module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="allocate-memory.html">Memory Allocation Guide</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mmio.html">MMIO</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Secure Memory Copy Scheme Based on Exception Table</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#overview">Overview</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#design-background-and-motivation">Design Background and Motivation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#exception-table-mechanism-principles">Exception Table Mechanism Principles</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#typical-execution-scenarios">Typical Execution Scenarios</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#usage-scenario-analysis">Usage Scenario Analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#security-analysis">Security Analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#implementation-essentials">Implementation Essentials</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device/index.html">设备</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Memory Management</a></li>
+      <li class="breadcrumb-item active">Secure Memory Copy Scheme Based on Exception Table</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/locales/en/kernel/memory_management/extable_safe_copy_design.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/memory_management/extable_safe_copy_design.md</p></li>
+<li><p>Translation time: 2025-11-21 06:28:18</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">hunyuan-turbos-latest</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="secure-memory-copy-scheme-based-on-exception-table">
+<h1>Secure Memory Copy Scheme Based on Exception Table<a class="headerlink" href="#secure-memory-copy-scheme-based-on-exception-table" title="Permalink to this heading"></a></h1>
+<div class="admonition note">
+<p class="admonition-title">备注</p>
+<p>Author: Long Jin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;dragonos&#46;org">longjin<span>&#64;</span>dragonos<span>&#46;</span>org</a></p>
+</div>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Permalink to this heading"></a></h2>
+<p>This document describes the core design of a secure memory copy scheme in DragonOS based on the Exception Table mechanism. This solution addresses the issue of safely accessing user-space memory in system call contexts, preventing kernel panics caused by accessing invalid user addresses.</p>
+</section>
+<section id="design-background-and-motivation">
+<h2>Design Background and Motivation<a class="headerlink" href="#design-background-and-motivation" title="Permalink to this heading"></a></h2>
+<section id="problem-definition">
+<h3>Problem Definition<a class="headerlink" href="#problem-definition" title="Permalink to this heading"></a></h3>
+<p>During system call processing, the kernel needs to access pointers passed from user space (such as path strings, parameter structures, etc.). These accesses may fail:</p>
+<ol class="arabic simple">
+<li><p><strong>Unmapped address</strong>: The user-provided address has no corresponding VMA (Virtual Memory Area)</p></li>
+<li><p><strong>Insufficient permissions</strong>: The page exists but lacks required permissions</p></li>
+<li><p><strong>Malicious input</strong>: The user intentionally provides illegal addresses</p></li>
+</ol>
+</section>
+<section id="limitations-of-traditional-solutions">
+<h3>Limitations of Traditional Solutions<a class="headerlink" href="#limitations-of-traditional-solutions" title="Permalink to this heading"></a></h3>
+<p><strong>TOCTTOU issues with pre-checking solutions:</strong></p>
+<ul class="simple">
+<li><p>An address may be valid during check but modified by other threads when used</p></li>
+<li><p>Race condition window exists</p></li>
+</ul>
+<p><strong>Challenges with direct access:</strong></p>
+<ul class="simple">
+<li><p>Cannot distinguish between “normal page fault” and “illegal access”</p></li>
+<li><p>Page fault handler cannot determine whether it’s a kernel bug or user error</p></li>
+</ul>
+</section>
+</section>
+<section id="exception-table-mechanism-principles">
+<h2>Exception Table Mechanism Principles<a class="headerlink" href="#exception-table-mechanism-principles" title="Permalink to this heading"></a></h2>
+<section id="core-idea">
+<h3>Core Idea<a class="headerlink" href="#core-idea" title="Permalink to this heading"></a></h3>
+<p>The exception table mechanism achieves secure user-space access through <strong>compile-time marking + runtime lookup</strong>:</p>
+<ol class="arabic simple">
+<li><p><strong>Compile-time</strong>: Generate exception table entries for instructions that may trigger page faults</p></li>
+<li><p><strong>Runtime</strong>: When a page fault occurs, search the exception table and jump to fix-up code</p></li>
+<li><p><strong>Zero overhead</strong>: No performance loss on the normal path</p></li>
+</ol>
+</section>
+<section id="architectural-diagram">
+<h3>Architectural Diagram<a class="headerlink" href="#architectural-diagram" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────────────────────────────────────────────────┐
+│                      系统调用执行流程                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   用户空间                  内核空间                           │
+│  ┌──────┐         ┌──────────────────────────────┐          │
+│  │0x1000│         │ 1. 系统调用入口                │          │
+│  │(未映射)─────────→ 2. 拷贝用户数据(带标记)         │          │
+│  └──────┘         │    ├─ 正常完成 ──→ 返回成功     │          │
+│                   │    └─ 触发#PF                 │          │
+│                   │         ↓                    │          │
+│                   │ 3. 页错误处理器                │          │
+│                   │    ├─ 查找异常表               │          │
+│                   │    └─ 找到修复代码地址          │          │
+│                   │         ↓                    │          │
+│                   │ 4. 修改指令指针(RIP)           │          │
+│                   │         ↓                    │          │
+│                   │ 5. 执行修复代码                │          │
+│                   │    └─ 返回剩余未拷贝字节数      │          │
+│                   │         ↓                    │          │
+│                   │ 6. 返回EFAULT给用户            │          │
+│                   └──────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+</pre></div>
+</div>
+</section>
+<section id="core-data-structures">
+<h3>Core Data Structures<a class="headerlink" href="#core-data-structures" title="Permalink to this heading"></a></h3>
+<p><strong>Exception table entry (8-byte aligned):</strong></p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────┬──────────────────┐
+│  指令相对偏移     │  修复代码相对偏移   │
+│    (4 bytes)    │    (4 bytes)     │
+└─────────────────┴──────────────────┘
+</pre></div>
+</div>
+<p><strong>Design highlights:</strong></p>
+<ul class="simple">
+<li><p>Uses relative offsets to support ASLR (Address Space Layout Randomization)</p></li>
+<li><p>8-byte alignment improves cache performance</p></li>
+<li><p>Stored in read-only segments to prevent tampering</p></li>
+</ul>
+</section>
+<section id="workflow">
+<h3>Workflow<a class="headerlink" href="#workflow" title="Permalink to this heading"></a></h3>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>编译期:
+    源码 ──→ 带标记的指令 ──→ 生成异常表条目 ──→ 链接到内核镜像
+              (rep movsb)       (insn→fixup)
+
+运行期:
+    执行拷贝 ──→ 触发页错误? ─否→ 正常返回
+                     │
+                    是
+                     ↓
+              查找异常表 ──→ 找到? ─否→ 内核panic
+                              │
+                             是
+                              ↓
+                    修改RIP到修复代码 ──→ 返回剩余未拷贝字节数
+</pre></div>
+</div>
+</section>
+</section>
+<section id="typical-execution-scenarios">
+<h2>Typical Execution Scenarios<a class="headerlink" href="#typical-execution-scenarios" title="Permalink to this heading"></a></h2>
+<section id="scenario-system-call-with-invalid-address">
+<h3>Scenario: System call with invalid address<a class="headerlink" href="#scenario-system-call-with-invalid-address" title="Permalink to this heading"></a></h3>
+<p>Taking the <code class="docutils literal notranslate"><span class="pre">open()</span></code> system call as an example, demonstrating the exception table’s operation:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>用户程序: open(0x1000, O_RDONLY)  // 0x1000未映射
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 1. 进入系统调用                  │
+    │    ├─ 解析路径字符串             │
+    │    └─ 逐字节拷贝直到&#39;\0&#39;         │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 2. 拷贝第一个字节时触发页错误      │
+    │    (地址0x1000不在VMA中)         │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 3. 页错误处理器                  │
+    │    ├─ 检测到访问用户地址          │
+    │    ├─ 查找异常表                 │
+    │    └─ 找到对应的修复代码          │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 4. 修改指令指针到修复代码          │
+    │    └─ 设置返回值为剩余未拷贝字节数  │
+    └────────────────────────────────┘
+         │
+         ↓
+    ┌────────────────────────────────┐
+    │ 5. 系统调用返回EFAULT            │
+    └────────────────────────────────┘
+         │
+         ↓
+用户程序: fd = -1, errno = EFAULT
+</pre></div>
+</div>
+<p><strong>Key points:</strong></p>
+<ul class="simple">
+<li><p>No need for pre-checking address validity</p></li>
+<li><p>Page faults are automatically converted to returning the number of remaining uncopied bytes</p></li>
+<li><p>The kernel won’t panic, and user programs receive clear error information</p></li>
+</ul>
+</section>
+</section>
+<section id="usage-scenario-analysis">
+<h2>Usage Scenario Analysis<a class="headerlink" href="#usage-scenario-analysis" title="Permalink to this heading"></a></h2>
+<section id="scenarios-suitable-for-exception-table-protection">
+<h3>✅ Scenarios Suitable for Exception Table Protection<a class="headerlink" href="#scenarios-suitable-for-exception-table-protection" title="Permalink to this heading"></a></h3>
+<section id="small-system-call-parameter-data">
+<h4>1. Small system call parameter data<a class="headerlink" href="#small-system-call-parameter-data" title="Permalink to this heading"></a></h4>
+<p><strong>Characteristics:</strong></p>
+<ul class="simple">
+<li><p>Small data volume (typically &lt; 4KB)</p></li>
+<li><p>One-time copy</p></li>
+<li><p>Unknown data length (e.g., strings)</p></li>
+</ul>
+<p><strong>Typical applications:</strong></p>
+<ul class="simple">
+<li><p>Path strings: <code class="docutils literal notranslate"><span class="pre">open()</span></code>, <code class="docutils literal notranslate"><span class="pre">stat()</span></code>, <code class="docutils literal notranslate"><span class="pre">execve()</span></code>, etc.</p></li>
+<li><p>Fixed-size structures: <code class="docutils literal notranslate"><span class="pre">sigaction</span></code>, <code class="docutils literal notranslate"><span class="pre">timespec</span></code>, <code class="docutils literal notranslate"><span class="pre">stat</span></code>, etc.</p></li>
+<li><p>Small arrays: <code class="docutils literal notranslate"><span class="pre">iovec[]</span></code>, <code class="docutils literal notranslate"><span class="pre">pollfd[]</span></code>, etc.</p></li>
+</ul>
+<p><strong>Advantages:</strong></p>
+<ul class="simple">
+<li><p><strong>Avoids TOCTTOU races</strong>: No pre-checking needed</p></li>
+<li><p><strong>High robustness</strong>: User errors won’t cause kernel panics</p></li>
+<li><p><strong>Acceptable performance</strong>: Small data volume; even multiple copies have minimal impact</p></li>
+</ul>
+</section>
+<section id="scenarios-with-uncertain-address-validity">
+<h4>2. Scenarios with uncertain address validity<a class="headerlink" href="#scenarios-with-uncertain-address-validity" title="Permalink to this heading"></a></h4>
+<p>When address validity cannot be verified by other means, the exception table is the safest choice:</p>
+<ul class="simple">
+<li><p>Raw pointers directly provided by users</p></li>
+<li><p>Addresses that may be concurrently modified in multi-threaded environments</p></li>
+<li><p>Operations requiring atomicity guarantees</p></li>
+</ul>
+</section>
+</section>
+<section id="scenarios-unsuitable-for-exception-table-protection">
+<h3>❌ Scenarios Unsuitable for Exception Table Protection<a class="headerlink" href="#scenarios-unsuitable-for-exception-table-protection" title="Permalink to this heading"></a></h3>
+<section id="large-data-transfers">
+<h4>1. Large data transfers<a class="headerlink" href="#large-data-transfers" title="Permalink to this heading"></a></h4>
+<p><strong>Anti-pattern: Double buffering in read/write system calls</strong></p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>用户缓冲区 → 内核临时缓冲区 → 用户缓冲区  ❌
+</pre></div>
+</div>
+<p><strong>Issues:</strong></p>
+<ul class="simple">
+<li><p>Memory waste: Requires additional kernel buffers</p></li>
+<li><p>Double copying: Data is copied twice</p></li>
+<li><p>OOM risk: Large concurrent reads/writes exhaust memory</p></li>
+</ul>
+<p><strong>Correct approach: Zero-copy</strong></p>
+<ul class="simple">
+<li><p>Pre-validate addresses within valid VMAs</p></li>
+<li><p>Operate directly on user buffers</p></li>
+<li><p>Page faults trigger normal page fault handling (not errors)</p></li>
+</ul>
+</section>
+<section id="addresses-already-validated-within-vmas">
+<h4>2. Addresses already validated within VMAs<a class="headerlink" href="#addresses-already-validated-within-vmas" title="Permalink to this heading"></a></h4>
+<p>If addresses have been verified through VMA checks, the exception table is redundant:</p>
+<ul class="simple">
+<li><p>Immediate access after <code class="docutils literal notranslate"><span class="pre">mmap()</span></code></p></li>
+<li><p>DMA buffers</p></li>
+<li><p>Shared memory regions</p></li>
+</ul>
+<p>In these scenarios, page faults are <strong>normal page fault handling</strong> (e.g., COW), not errors.</p>
+</section>
+<section id="performance-critical-hot-paths">
+<h4>3. Performance-critical hot paths<a class="headerlink" href="#performance-critical-hot-paths" title="Permalink to this heading"></a></h4>
+<p>Avoid frequently calling functions protected by exception tables in loops:</p>
+<ul class="simple">
+<li><p><strong>Batch processing</strong>: Copy entire arrays at once rather than element by element</p></li>
+<li><p><strong>Pre-validation</strong>: Validate addresses outside loops and access directly within loops</p></li>
+</ul>
+</section>
+</section>
+<section id="decision-matrix">
+<h3>Decision Matrix<a class="headerlink" href="#decision-matrix" title="Permalink to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Scenario Characteristics</p></th>
+<th class="head"><p>Data Volume</p></th>
+<th class="head"><p>Recommended Solution</p></th>
+<th class="head"><p>Core Considerations</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Small system call parameters</p></td>
+<td><p>&lt; 4KB</p></td>
+<td><p>Exception table protection</p></td>
+<td><p>Avoid TOCTTOU, improve robustness</p></td>
+</tr>
+<tr class="row-odd"><td><p>File read/write</p></td>
+<td><p>Variable (MB-level)</p></td>
+<td><p>Zero-copy</p></td>
+<td><p>Performance priority, avoid double buffering</p></td>
+</tr>
+<tr class="row-even"><td><p>Access after mmap</p></td>
+<td><p>Arbitrary</p></td>
+<td><p>Direct access</p></td>
+<td><p>VMA already validated, normal page fault</p></td>
+</tr>
+<tr class="row-odd"><td><p>Batch small data</p></td>
+<td><p>Cumulative KB-level</p></td>
+<td><p>Batch copy</p></td>
+<td><p>Reduce system call count</p></td>
+</tr>
+<tr class="row-even"><td><p>String parsing</p></td>
+<td><p>Unknown</p></td>
+<td><p>Exception table protection</p></td>
+<td><p>Byte-by-byte scanning, requires robustness</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="security-analysis">
+<h2>Security Analysis<a class="headerlink" href="#security-analysis" title="Permalink to this heading"></a></h2>
+<section id="defensive-capabilities">
+<h3>Defensive Capabilities<a class="headerlink" href="#defensive-capabilities" title="Permalink to this heading"></a></h3>
+<p>The exception table mechanism can defend against:</p>
+<ol class="arabic simple">
+<li><p><strong>Null pointer dereferencing</strong>: Returns EFAULT instead of segmentation fault</p></li>
+<li><p><strong>Kernel address injection</strong>: User-provided kernel addresses are safely rejected</p></li>
+<li><p><strong>Race attacks</strong>: TOCTTOU windows are eliminated</p></li>
+<li><p><strong>Out-of-bounds access</strong>: Accesses outside VMAs are captured</p></li>
+</ol>
+</section>
+<section id="security-boundaries">
+<h3>Security Boundaries<a class="headerlink" href="#security-boundaries" title="Permalink to this heading"></a></h3>
+<p>The exception table <strong>cannot</strong> defend against:</p>
+<ol class="arabic simple">
+<li><p><strong>Kernel bugs</strong>: Such as wild pointer dereferencing</p></li>
+<li><p><strong>Hardware failures</strong>: Physical memory damage</p></li>
+<li><p><strong>Other exception types</strong>: Only handles page faults</p></li>
+</ol>
+</section>
+<section id="multi-layer-defense">
+<h3>Multi-layer Defense<a class="headerlink" href="#multi-layer-defense" title="Permalink to this heading"></a></h3>
+<p>The exception table is part of defense in depth:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌─────────────────────────────────────┐
+│  用户空间权限检查 (SELinux/AppArmor)   │  ← 权限层
+├─────────────────────────────────────┤
+│  系统调用参数验证                      │  ← 逻辑层
+├─────────────────────────────────────┤
+│  异常表机制                           │  ← 内存安全层
+├─────────────────────────────────────┤
+│  硬件页保护 (MMU)                     │  ← 硬件层
+└─────────────────────────────────────┘
+</pre></div>
+</div>
+</section>
+</section>
+<section id="implementation-essentials">
+<h2>Implementation Essentials<a class="headerlink" href="#implementation-essentials" title="Permalink to this heading"></a></h2>
+<section id="key-technologies">
+<h3>Key Technologies<a class="headerlink" href="#key-technologies" title="Permalink to this heading"></a></h3>
+<ol class="arabic simple">
+<li><p><strong>Relative offset encoding</strong>: Supports address randomization (ASLR)</p></li>
+<li><p><strong>Binary search</strong>: O(log n) time complexity for fast location</p></li>
+<li><p><strong>Inline assembly</strong>: Precise control over instruction and exception table generation</p></li>
+<li><p><strong>Zero-overhead abstraction</strong>: No performance loss on the normal path</p></li>
+</ol>
+</section>
+<section id="architecture-portability">
+<h3>Architecture Portability<a class="headerlink" href="#architecture-portability" title="Permalink to this heading"></a></h3>
+<p>The exception table mechanism can be ported to other architectures:</p>
+<ul class="simple">
+<li><p><strong>x86_64</strong>: Uses <code class="docutils literal notranslate"><span class="pre">rep</span> <span class="pre">movsb</span></code> instruction</p></li>
+<li><p><strong>ARM64</strong>: Uses <code class="docutils literal notranslate"><span class="pre">ldp/stp</span></code> instruction sequence</p></li>
+<li><p><strong>RISC-V</strong>: Uses <code class="docutils literal notranslate"><span class="pre">ld/sd</span></code> instruction sequence</p></li>
+</ul>
+<p>The core idea remains unchanged, requiring only adjustments to assembly syntax.</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="mmio.html" class="btn btn-neutral float-left" title="MMIO" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../filesystem/index.html" class="btn btn-neutral float-right" title="File System" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/kernel/memory_management/extable_safe_copy_design.html">V0.3.0</a></dd>
+      <dd><a href="extable_safe_copy_design.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/memory_management/extable_safe_copy_design.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

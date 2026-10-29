@@ -10,8 +10,9 @@ use crate::{
     driver::base::kobject::KObject,
     filesystem::{
         kernfs::{callback::KernInodePrivateData, KernFSInode},
-        vfs::InodeMode,
+        vfs::{FileType, IndexNode, InodeMode},
     },
+    libs::casting::DowncastArc,
 };
 
 use super::{SysFS, SysFSKernPrivateData};
@@ -76,6 +77,79 @@ impl SysFS {
         return Ok(dir);
     }
 
+    pub fn create_dir_ns(
+        &self,
+        kobj: Arc<dyn KObject>,
+        namespace: crate::filesystem::kernfs::KernFSNamespaceTag,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let parent = kobj
+            .parent()
+            .and_then(|parent| parent.upgrade())
+            .and_then(|parent| parent.inode())
+            .ok_or(SystemError::ENOENT)?;
+        let private = SysFSKernPrivateData::Dir(SysKernDirPriv::new(kobj.clone()));
+        let dir = parent.add_dir_ns(
+            kobj.name(),
+            InodeMode::from_bits_truncate(0o755),
+            Some(KernInodePrivateData::SysFS(private)),
+            None,
+            namespace,
+        )?;
+        kobj.set_inode(Some(dir.clone()));
+        Ok(dir)
+    }
+
+    pub fn ensure_mount_point_path(
+        &self,
+        components: &[&str],
+        mode: InodeMode,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let mut current = self.root_inode.clone();
+
+        for component in components {
+            current = self.ensure_mount_point_component(&current, component, mode)?;
+        }
+
+        Ok(current)
+    }
+
+    fn ensure_mount_point_component(
+        &self,
+        parent: &Arc<KernFSInode>,
+        name: &str,
+        mode: InodeMode,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        Self::validate_mount_point_component(name)?;
+
+        match parent.add_dir(name.to_string(), mode, None, None) {
+            Ok(inode) => Ok(inode),
+            Err(SystemError::EEXIST) => Self::existing_mount_point_dir(parent, name),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn validate_mount_point_component(name: &str) -> Result<(), SystemError> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(SystemError::EINVAL);
+        }
+
+        Ok(())
+    }
+
+    fn existing_mount_point_dir(
+        parent: &Arc<KernFSInode>,
+        name: &str,
+    ) -> Result<Arc<KernFSInode>, SystemError> {
+        let inode = parent.find(name)?;
+        if inode.metadata()?.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        inode
+            .downcast_arc::<KernFSInode>()
+            .ok_or(SystemError::EINVAL)
+    }
+
     /// 获取指定的kernfs inode在sysfs中的路径（不包含`/sys`）
     ///
     /// ## 参数
@@ -112,6 +186,101 @@ impl SysFS {
         }
 
         return path;
+    }
+
+    /// Builds the absolute path cached by a sysfs symlink before a child is
+    /// renamed. All fallible allocation belongs to the prepare phase.
+    pub(crate) fn child_absolute_path(
+        &self,
+        parent: &Arc<KernFSInode>,
+        child_name: &str,
+    ) -> Result<String, SystemError> {
+        let parent_path = self.try_kernfs_path(parent)?;
+        let mut path = String::new();
+        let capacity = "/sys"
+            .len()
+            .checked_add(parent_path.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(child_name.len()))
+            .ok_or(SystemError::ENOMEM)?;
+        path.try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        path.push_str("/sys");
+        path.push_str(&parent_path);
+        path.push('/');
+        path.push_str(child_name);
+        Ok(path)
+    }
+
+    /// Build a mount-independent relative link from `from_dir` to a child of
+    /// `target_parent`. Namespace-aware class links must not embed the boot
+    /// mount's `/sys` path because they are also exposed by later sysfs mounts.
+    pub(crate) fn child_relative_path(
+        &self,
+        from_dir: &Arc<KernFSInode>,
+        target_parent: &Arc<KernFSInode>,
+        child_name: &str,
+    ) -> Result<String, SystemError> {
+        let from_path = self.try_kernfs_path(from_dir)?;
+        let target_path = self.try_kernfs_path(target_parent)?;
+        let parent_depth = from_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .count();
+        let mut path = String::new();
+        let capacity = parent_depth
+            .checked_mul(3)
+            .and_then(|length| length.checked_add(target_path.len().saturating_sub(1)))
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(child_name.len()))
+            .ok_or(SystemError::ENOMEM)?;
+        path.try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for _ in 0..parent_depth {
+            path.push_str("../");
+        }
+        path.push_str(target_path.trim_start_matches('/'));
+        path.push('/');
+        path.push_str(child_name);
+        Ok(path)
+    }
+
+    /// Fallible counterpart used by prepared control-plane transactions.
+    /// Existing display-only callers retain `kernfs_path`; mutation prepare
+    /// must be able to report ENOMEM rather than enter the allocator handler.
+    pub(crate) fn try_kernfs_path(&self, inode: &Arc<KernFSInode>) -> Result<String, SystemError> {
+        let mut current = inode.clone();
+        let mut names = Vec::new();
+        let root = self.root_inode();
+        let mut detached = false;
+        while !Arc::ptr_eq(&current, root) {
+            names.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            names.push(current.try_name()?);
+            let Some(parent) = current.parent() else {
+                detached = true;
+                break;
+            };
+            current = parent;
+        }
+
+        let mut length = if detached { "(null)".len() } else { 0 };
+        for name in &names {
+            length = length
+                .checked_add(1)
+                .and_then(|value| value.checked_add(name.len()))
+                .ok_or(SystemError::ENOMEM)?;
+        }
+        let mut path = String::new();
+        path.try_reserve_exact(length)
+            .map_err(|_| SystemError::ENOMEM)?;
+        if detached {
+            path.push_str("(null)");
+        }
+        for name in names.iter().rev() {
+            path.push('/');
+            path.push_str(name);
+        }
+        Ok(path)
     }
 
     /// 从sysfs中删除一个kobject对应的目录（包括目录自身以及目录下的所有文件、文件夹）

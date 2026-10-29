@@ -1,24 +1,21 @@
-use core::sync::atomic::compiler_fence;
-
-use num_traits::FromPrimitive;
-
-use crate::ipc::signal_types::SignalFlags;
 use crate::{
     arch::{
         ipc::signal::{SigSet, Signal, MAX_SIG_NUM},
         CurrentIrqArch,
     },
     exception::InterruptArch,
-    process::ProcessManager,
+    ipc::signal_types::SignalFlags,
+    process::{ProcessFlags, ProcessManager},
     sched::{schedule, SchedMode},
 };
 use alloc::sync::Arc;
+use core::sync::atomic::compiler_fence;
+use num_traits::FromPrimitive;
 
 /// 信号处理的栈的栈指针的最小对齐
 #[allow(dead_code)]
 pub const GENERIC_STACK_ALIGN: u64 = 16;
 /// 信号最大值
-#[allow(dead_code)]
 pub const GENERIC_MAX_SIG_NUM: usize = 64;
 
 #[allow(dead_code)]
@@ -390,44 +387,49 @@ bitflags! {
     }
 }
 
-/// 信号默认处理函数——终止进程
+/// Signal default handler — terminate process
 fn sig_terminate(sig: Signal) {
-    if sig == Signal::SIGKILL {
-        let current = ProcessManager::current_pcb();
-        if !current.is_thread_group_leader() {
-            // 线程级 SIGKILL：仅终止当前线程，避免误杀整个线程组
-            ProcessManager::exit(sig as usize);
-        }
-        let sighand = current.sighand();
-        if sighand.flags_contains(SignalFlags::GROUP_EXEC) {
-            if let Some(exec_task) = sighand.group_exec_task() {
-                if !Arc::ptr_eq(&exec_task, &current) {
-                    ProcessManager::exit(sig as usize);
-                }
-            }
-        }
-    }
     let code = ProcessManager::current_pcb()
-        .sighand()
+        .process_signal()
         .group_exit_code_if_set();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    // 若线程组退出已经在进行中，则所有后续致命信号都应当使用统一的 group_exit_code，
-    // 避免多次触发 zap_other_threads 等逻辑。
+    // If a thread group exit is already in progress, all subsequent fatal signals
+    // must use the unified group_exit_code. During delivery, fatal group-exit injects
+    // a private SIGKILL into each thread; we must handle this check first here,
+    // otherwise a non-leader thread will mistake the injected SIGKILL for a
+    // thread-level SIGKILL and overwrite the exit code.
     if let Some(code) = code {
         ProcessManager::exit(code);
-    } else {
-        // 还未进入 group-exit：按照 Linux 语义，
-        // 第一个致命信号负责设置 group_exit_code 并终止整个线程组。
-        //
-        // 对于信号导致的退出，exit_code 不需要左移（低 7 位即为信号编号）。
-        ProcessManager::group_exit(sig as usize);
     }
+
+    if sig == Signal::SIGKILL {
+        let exec_sibling = {
+            let current = ProcessManager::current_pcb();
+            let signal_state = current.process_signal();
+            signal_state.flags_contains(SignalFlags::GROUP_EXEC)
+                && signal_state
+                    .group_exec_task()
+                    .is_some_and(|exec_task| !Arc::ptr_eq(&exec_task, &current))
+        };
+        if exec_sibling {
+            // de_thread() privately kills the siblings replaced by the exec
+            // owner. End the lookup owners before the non-returning exit.
+            ProcessManager::exit(0);
+        }
+    }
+    // Not yet in group-exit: per Linux semantics,
+    // the first fatal signal is responsible for setting group_exit_code and
+    // terminating the entire thread group.
+    //
+    // For signal-induced exits, exit_code does not need a left shift
+    // (the lower 7 bits are the signal number).
+    ProcessManager::group_exit(sig as usize);
 }
 
-/// 信号默认处理函数——终止进程并生成 core dump
+/// Signal default handler — terminate process and generate core dump
 fn sig_terminate_dump(sig: Signal) {
     let code = ProcessManager::current_pcb()
-        .sighand()
+        .process_signal()
         .group_exit_code_if_set();
     compiler_fence(core::sync::atomic::Ordering::SeqCst);
     if let Some(code) = code {
@@ -443,44 +445,50 @@ fn sig_terminate_dump(sig: Signal) {
 fn sig_stop(sig: Signal) {
     // 在接收者上下文设置停止标志，并让当前任务进入 Stopped
     let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    {
-        let pcb = ProcessManager::current_pcb();
-        // 标记停止事件，供 waitid(WSTOPPED) 可见
-        pcb.sighand().flags_insert(SignalFlags::CLD_STOPPED);
-        pcb.sighand().flags_insert(SignalFlags::STOP_STOPPED);
+    let pcb = ProcessManager::current_pcb();
+    if pcb.process_signal().flags_contains(SignalFlags::GROUP_EXIT) {
+        drop(guard);
+        return;
     }
-    ProcessManager::mark_stop().unwrap_or_else(|e| {
-        log::error!(
-            "sleep error :{:?},failed to sleep process :{:?}, with signal :{:?}",
-            e,
-            ProcessManager::current_pcb().pid(),
-            sig
-        );
-    });
+    // A ptraced tracee: stop signals report the group-stop to the tracer, not the real_parent
+    if pcb.flags().contains(ProcessFlags::PTRACED) {
+        if pcb.flags().contains(ProcessFlags::PT_SEIZED) {
+            drop(guard);
+            let _ = pcb.ptrace_event_stop(sig);
+            return;
+        }
+        // Non-SEIZED ptraced: report the group-stop to the tracer via ptrace_stop (CLD_STOPPED)
+        // Linux do_jobctl_trap() ignores the ptrace_stop return value for group-stops;
+        // resume data must not be re-queued as a new signal-delivery-stop.
+        let _ = pcb.ptrace_group_stop(sig);
+        drop(guard);
+        return;
+    }
+    // Ordinary members join the same generation/count transaction as ptraced
+    // members, and report to the real parent only once every participant stops.
+    let fresh_stop = crate::process::ptrace::stop_group_at_user_boundary(&pcb, sig);
     drop(guard);
+    // Completion is already committed. Notify before a subsequent ptrace
+    // attach can park this receiver waiting for its tracer to resume it.
+    if fresh_stop {
+        pcb.notify_natural_group_stop(sig);
+    }
+    pcb.handle_pending_group_stop();
+    // attach may convert this task to ptraced during the schedule inside mark_stop()
+    // and queue a trap. The STOPPED→TRACED transition must complete immediately before
+    // returning to user mode; it cannot wait for the next kernel entry.
+    while pcb.ptrace_handle_pending_stop() {}
     log::debug!(
         "sig_stop: pid={:?} entered Stopped; notifying parent and scheduler",
-        ProcessManager::current_pcb().raw_pid()
+        pcb.raw_pid()
     );
-    // 向父进程报告 SIGCHLD 并唤醒父进程可能阻塞的 wait
-    let pcb = ProcessManager::current_pcb();
-    if let Some(parent) = pcb.parent_pcb() {
-        let _ = crate::ipc::kill::send_signal_to_pcb(parent.clone(), Signal::SIGCHLD);
-        parent.wake_all_waiters();
-    }
-    // 唤醒等待在该子进程等待队列上的等待者
-    pcb.wake_all_waiters();
     schedule(SchedMode::SM_NONE);
 }
 /// 信号默认处理函数——继续进程
 fn sig_continue(_sig: Signal) {
     // 默认处理改为最小化：仅在已处于 Stopped 时唤醒停止，让进程继续运行。
     let pcb = ProcessManager::current_pcb();
-    let is_stopped = pcb
-        .sched_info()
-        .inner_lock_read_irqsave()
-        .state()
-        .is_stopped();
+    let is_stopped = pcb.sched_info().state().is_stopped();
     if is_stopped {
         let _ = ProcessManager::wakeup_stop(&pcb);
     }

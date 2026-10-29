@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{compiler_fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use alloc::{
@@ -17,7 +17,7 @@ use crate::{
     arch::CurrentIrqArch,
     exception::{irqdesc::IrqAction, InterruptArch},
     init::initial_kthread::{initial_kernel_thread, set_system_state, SystemState},
-    libs::{cpumask::CpuMask, once::Once, spinlock::SpinLock},
+    libs::{once::Once, spinlock::SpinLock, wait_queue::WaitQueue},
     process::{ProcessManager, ProcessState},
     sched::{completion::Completion, schedule, SchedMode},
     smp::cpu::ProcessorId,
@@ -29,7 +29,21 @@ use super::{fork::CloneFlags, ProcessControlBlock, ProcessFlags, RawPid};
 static KTHREAD_CREATE_LIST: SpinLock<LinkedList<Arc<KernelThreadCreateInfo>>> =
     SpinLock::new(LinkedList::new());
 
-static mut KTHREAD_DAEMON_PCB: Option<Arc<ProcessControlBlock>> = None;
+/// All work that can make kthreadd useful must use this notification path.
+/// The pending bit coalesces events because each daemon pass drains the full
+/// create list and reaps every zombie child.
+static KTHREAD_DAEMON_WAIT: WaitQueue = WaitQueue::default();
+static KTHREAD_DAEMON_WORK_PENDING: AtomicBool = AtomicBool::new(false);
+static KTHREAD_DAEMON_READY: AtomicBool = AtomicBool::new(false);
+static KTHREAD_SELFTEST_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct KthreadSelftestGuard;
+
+impl Drop for KthreadSelftestGuard {
+    fn drop(&mut self) {
+        KTHREAD_SELFTEST_RUNNING.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug)]
 pub enum WorkerPrivate {
@@ -115,6 +129,12 @@ pub enum KernelThreadClosure {
     StaticUsizeClosure((&'static fn(usize) -> i32, usize)),
     EmptyClosure((Box<dyn Fn() -> i32 + Send + Sync>, ())),
     StaticEmptyClosure((&'static fn() -> i32, ())),
+    /// A one-shot preparation step that returns a user trap frame. The
+    /// bootstrap drops the callback before switching to userspace, because
+    /// that switch never returns to run Rust destructors.
+    UserMode(
+        Box<dyn FnOnce() -> Result<crate::arch::interrupt::TrapFrame, SystemError> + Send + Sync>,
+    ),
     IrqThread(
         (
             &'static dyn Fn(Arc<IrqAction>) -> Result<(), SystemError>,
@@ -134,6 +154,7 @@ impl KernelThreadClosure {
             Self::EmptyClosure((func, _arg)) => func(),
             Self::StaticUsizeClosure((func, arg)) => func(arg),
             Self::StaticEmptyClosure((func, _arg)) => func(),
+            Self::UserMode(_) => unreachable!("user-mode closures run in the bootstrap"),
             Self::IrqThread((func, arg)) => {
                 func(arg).map(|_| 0).unwrap_or_else(|e| e.to_posix_errno())
             }
@@ -146,8 +167,9 @@ pub struct KernelThreadCreateInfo {
     closure: SpinLock<Option<Box<KernelThreadClosure>>>,
     /// 内核线程的名字
     name: String,
-    /// 是否已经完成创建 todo:使用comletion机制优化这里
+    /// 是否已经完成创建
     created: AtomicKernelThreadCreateStatus,
+    created_completion: Completion,
     result_pcb: SpinLock<Option<Arc<ProcessControlBlock>>>,
     /// 不安全的Arc引用计数，当内核线程创建失败时，需要减少这个计数
     has_unsafe_arc_instance: AtomicBool,
@@ -173,6 +195,7 @@ impl KernelThreadCreateInfo {
             closure: SpinLock::new(Some(Box::new(func))),
             name,
             created: AtomicKernelThreadCreateStatus::new(KernelThreadCreateStatus::NotCreated),
+            created_completion: Completion::new(),
             result_pcb: SpinLock::new(None),
             has_unsafe_arc_instance: AtomicBool::new(false),
             self_ref: Weak::new(),
@@ -197,23 +220,23 @@ impl KernelThreadCreateInfo {
     /// - Some(Arc<ProcessControlBlock>) 创建成功，返回新创建的内核线程的PCB
     /// - None 创建失败
     pub fn poll_result(&self) -> Option<Arc<ProcessControlBlock>> {
-        loop {
-            match self.created.load(Ordering::SeqCst) {
-                KernelThreadCreateStatus::Created => {
-                    return self.result_pcb.lock().take();
+        self.created_completion
+            .wait_for_completion()
+            .expect("kthread create completion wait failed");
+
+        match self.created.load(Ordering::SeqCst) {
+            KernelThreadCreateStatus::Created => self.result_pcb.lock().take(),
+            KernelThreadCreateStatus::ErrorOccured => {
+                // 创建失败，减少不安全的Arc引用计数
+                let to_delete = self.has_unsafe_arc_instance.swap(false, Ordering::SeqCst);
+                if to_delete {
+                    let self_ref = self.self_ref.upgrade().unwrap();
+                    unsafe { Arc::decrement_strong_count(&self_ref) };
                 }
-                KernelThreadCreateStatus::NotCreated => {
-                    spin_loop();
-                }
-                KernelThreadCreateStatus::ErrorOccured => {
-                    // 创建失败，减少不安全的Arc引用计数
-                    let to_delete = self.has_unsafe_arc_instance.swap(false, Ordering::SeqCst);
-                    if to_delete {
-                        let self_ref = self.self_ref.upgrade().unwrap();
-                        unsafe { Arc::decrement_strong_count(&self_ref) };
-                    }
-                    return None;
-                }
+                None
+            }
+            KernelThreadCreateStatus::NotCreated => {
+                panic!("kthread create completion published without a result")
             }
         }
     }
@@ -227,10 +250,16 @@ impl KernelThreadCreateInfo {
     }
 
     pub unsafe fn set_create_ok(&self, pcb: Arc<ProcessControlBlock>) {
-        // todo: 使用completion机制优化这里
         self.result_pcb.lock().replace(pcb);
         self.created
             .store(KernelThreadCreateStatus::Created, Ordering::SeqCst);
+        self.created_completion.complete();
+    }
+
+    pub fn set_create_error(&self) {
+        self.created
+            .store(KernelThreadCreateStatus::ErrorOccured, Ordering::SeqCst);
+        self.created_completion.complete();
     }
 
     /// 生成一个不安全的Arc指针（用于创建内核线程时传递参数）
@@ -297,18 +326,25 @@ impl KernelThreadCreateInfo {
             return;
         }
 
-        let mut worker_private_guard = pcb.worker_private();
+        let worker_private_guard = pcb.worker_private();
         let worker_private = worker_private_guard
-            .as_mut()
-            .and_then(|x| x.kernel_thread_mut())
+            .as_ref()
+            .and_then(|x| x.kernel_thread())
             .expect("kthread create: missing worker_private");
-        worker_private.flags |= flags;
+        assert!(
+            worker_private.flags.contains(flags),
+            "kthread create: creation flags were not published before the task"
+        );
         drop(worker_private_guard);
 
         if flags.contains(KernelThreadFlags::IS_PER_CPU) {
             let cpu = (*self.bound_cpu.lock())
                 .expect("kthread create: per-cpu thread missing target cpu");
-            pcb.sched_info().set_cpus_allowed(CpuMask::from_cpu(cpu));
+            let allowed = pcb.sched_info().cpus_allowed();
+            assert!(
+                allowed.get(cpu).unwrap_or(false) && allowed.iter_cpu().count() == 1,
+                "kthread create: per-cpu affinity was not installed before first run"
+            );
         }
     }
 
@@ -324,6 +360,15 @@ impl KernelThreadCreateInfo {
 pub struct KernelThreadMechanism;
 
 impl KernelThreadMechanism {
+    fn submit_create_info(info: Arc<KernelThreadCreateInfo>) -> Option<Arc<ProcessControlBlock>> {
+        while !KTHREAD_DAEMON_READY.load(Ordering::Acquire) {
+            spin_loop()
+        }
+        KTHREAD_CREATE_LIST.lock().push_back(info.clone());
+        Self::notify_daemon();
+        info.poll_result()
+    }
+
     pub fn init_stage1() {
         assert!(ProcessManager::current_pcb().raw_pid() == RawPid::new(0));
         info!("Initializing kernel thread mechanism stage1...");
@@ -339,8 +384,7 @@ impl KernelThreadMechanism {
             unsafe { CurrentIrqArch::save_and_disable_irq() };
         // 由于当前是pid=0的idle进程,而__inner_create要求当前是kthread,所以先临时设置为kthread
         ProcessManager::current_pcb()
-            .flags
-            .get_mut()
+            .flags()
             .insert(ProcessFlags::KTHREAD);
         create_info
             .set_to_mark_sleep(false)
@@ -353,8 +397,7 @@ impl KernelThreadMechanism {
         .unwrap_or_else(|e| panic!("Failed to create initial kernel thread, error: {:?}", e));
 
         ProcessManager::current_pcb()
-            .flags
-            .get_mut()
+            .flags()
             .remove(ProcessFlags::KTHREAD);
 
         drop(irq_guard);
@@ -374,16 +417,12 @@ impl KernelThreadMechanism {
             let info = KernelThreadCreateInfo::new(closure, "kthreadd".to_string());
             info.set_to_mark_sleep(false)
                 .expect("kthreadadd should be run first");
-            let kthreadd_pid: RawPid = Self::__inner_create(
+            Self::__inner_create(
                 &info,
                 CloneFlags::CLONE_VM | CloneFlags::CLONE_FS | CloneFlags::CLONE_FILES,
             )
             .expect("Failed to create kthread daemon");
-            let pcb = ProcessManager::find_task_by_vpid(kthreadd_pid).unwrap();
-            ProcessManager::wakeup(&pcb).expect("Failed to wakeup kthread daemon");
-            unsafe {
-                KTHREAD_DAEMON_PCB.replace(pcb);
-            }
+            KTHREAD_DAEMON_READY.store(true, Ordering::Release);
             info!("Initialize kernel thread mechanism stage2 complete");
         });
     }
@@ -401,15 +440,25 @@ impl KernelThreadMechanism {
     #[allow(dead_code)]
     pub fn create(func: KernelThreadClosure, name: String) -> Option<Arc<ProcessControlBlock>> {
         let info = KernelThreadCreateInfo::new(func, name);
-        while unsafe { KTHREAD_DAEMON_PCB.is_none() } {
-            // 等待kthreadd启动
-            spin_loop()
-        }
-        KTHREAD_CREATE_LIST.lock().push_back(info.clone());
-        compiler_fence(Ordering::SeqCst);
-        ProcessManager::wakeup(unsafe { KTHREAD_DAEMON_PCB.as_ref().unwrap() })
-            .expect("Failed to wakeup kthread daemon");
-        return info.poll_result();
+        Self::submit_create_info(info)
+    }
+
+    /// Creates a stopped per-CPU kthread whose affinity is installed before
+    /// its first instruction can run.
+    pub fn create_on_cpu(
+        func: KernelThreadClosure,
+        name: String,
+        cpu: ProcessorId,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let info = KernelThreadCreateInfo::new(func, name);
+        info.set_per_cpu(cpu).ok()?;
+        Self::submit_create_info(info)
+    }
+
+    /// Notify kthreadd after publishing create or zombie-reap work.
+    pub(crate) fn notify_daemon() {
+        KTHREAD_DAEMON_WORK_PENDING.store(true, Ordering::Release);
+        KTHREAD_DAEMON_WAIT.wakeup(None);
     }
 
     /// 创建并运行一个新的内核线程
@@ -431,6 +480,20 @@ impl KernelThreadMechanism {
         ProcessManager::wakeup(&pcb)
             .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.raw_pid()));
         return Some(pcb);
+    }
+
+    /// Creates and wakes a per-CPU kthread. Its affinity cannot be changed by
+    /// userspace after creation.
+    #[allow(dead_code)]
+    pub fn create_and_run_on_cpu(
+        func: KernelThreadClosure,
+        name: String,
+        cpu: ProcessorId,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        let pcb = Self::create_on_cpu(func, name, cpu)?;
+        ProcessManager::wakeup(&pcb)
+            .unwrap_or_else(|_| panic!("Failed to wakeup kthread: {:?}", pcb.raw_pid()));
+        Some(pcb)
     }
 
     /// 停止一个内核线程
@@ -466,7 +529,7 @@ impl KernelThreadMechanism {
 
         ProcessManager::wakeup(pcb).ok();
 
-        if let ProcessState::Exited(code) = pcb.sched_info().inner_lock_read_irqsave().state() {
+        if let ProcessState::Exited(code) = pcb.sched_info().state() {
             return Ok(code);
         }
 
@@ -477,13 +540,7 @@ impl KernelThreadMechanism {
             .as_ref()
             .and_then(|x| x.kernel_thread())
             .map(|x| x.result())
-            .unwrap_or_else(|| {
-                pcb.sched_info()
-                    .inner_lock_read_irqsave()
-                    .state()
-                    .exit_code()
-                    .unwrap_or(0)
-            });
+            .unwrap_or_else(|| pcb.sched_info().state().exit_code().unwrap_or(0));
         Ok(result)
     }
 
@@ -563,9 +620,17 @@ impl KernelThreadMechanism {
         drop(current_pcb);
 
         loop {
-            let mut list = KTHREAD_CREATE_LIST.lock();
-            while let Some(info) = list.pop_front() {
-                drop(list);
+            KTHREAD_DAEMON_WAIT
+                .wait_event_uninterruptible(
+                    || KTHREAD_DAEMON_WORK_PENDING.swap(false, Ordering::AcqRel),
+                    None::<fn()>,
+                )
+                .expect("kthreadd wait failed");
+
+            loop {
+                let Some(info) = KTHREAD_CREATE_LIST.lock().pop_front() else {
+                    break;
+                };
                 // create a new kernel thread
                 let result: Result<RawPid, SystemError> = Self::__inner_create(
                     &info,
@@ -573,19 +638,11 @@ impl KernelThreadMechanism {
                 );
                 if result.is_err() {
                     // 创建失败
-                    info.created
-                        .store(KernelThreadCreateStatus::ErrorOccured, Ordering::SeqCst);
+                    info.set_create_error();
                 };
-                list = KTHREAD_CREATE_LIST.lock();
             }
-            drop(list);
 
             Self::reap_zombie_kthreads(&kthreadd_pcb);
-
-            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-            ProcessManager::mark_sleep(true).ok();
-            drop(irq_guard);
-            schedule(SchedMode::SM_NONE);
         }
     }
 
@@ -612,6 +669,308 @@ impl KernelThreadMechanism {
     }
 }
 
+/// Exercise the externally visible kthread create/run/stop handshakes in a
+/// real DragonOS guest. This is intentionally invoked only through debugfs;
+/// production paths do not pay the stress-test cost.
+pub(crate) fn run_debug_selftests() -> Result<String, SystemError> {
+    if KTHREAD_SELFTEST_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(SystemError::EBUSY);
+    }
+    let _guard = KthreadSelftestGuard;
+
+    let mut report = String::new();
+    let mut failures = 0usize;
+
+    if crate::time::deadline::supported() {
+        crate::time::deadline::run_selftests();
+        append_kthread_selftest_case(&mut report, "deadline_generation", true, &mut failures);
+        append_kthread_selftest_case(
+            &mut report,
+            "deadline_fallback",
+            crate::time::deadline::run_fallback_selftest(),
+            &mut failures,
+        );
+    } else {
+        report
+            .push_str("deadline_generation=skip_unavailable\ndeadline_fallback=skip_unavailable\n");
+    }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    match crate::time::deadline::run_remote_owner_selftest() {
+        Some(ok) => {
+            append_kthread_selftest_case(&mut report, "deadline_remote_owner", ok, &mut failures)
+        }
+        None => report.push_str("deadline_remote_owner=skip_unavailable\n"),
+    }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    {
+        use crate::arch::driver::apic::{
+            apic_timer::LocalApicTimerMode, CurrentApic, LVTRegister, LocalAPIC,
+        };
+        // Snapshot the actual LVTT on one CPU, without reprogramming its timer.
+        // IRQ-off prevents migration; allocate/format only after restoring it.
+        let flags = crate::arch::asm::irqflags::local_irq_save();
+        let mode = CurrentApic.read_lvt(LVTRegister::Timer).timer_mode();
+        crate::arch::asm::irqflags::local_irq_restore(flags);
+        let name = match mode {
+            Some(LocalApicTimerMode::Deadline) => "tsc_deadline",
+            Some(LocalApicTimerMode::Oneshot) => "oneshot",
+            Some(LocalApicTimerMode::Periodic) => "periodic",
+            None => "unsupported",
+        };
+        report.push_str(&alloc::format!("deadline_apic_mode={name}\n"));
+    }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    match crate::arch::driver::apic::apic_timer::stop_clear_selftest() {
+        Some(ok) => {
+            append_kthread_selftest_case(&mut report, "deadline_stop_clear", ok, &mut failures)
+        }
+        None => report.push_str("deadline_stop_clear=skip_unavailable_or_not_observed\n"),
+    }
+    #[cfg(feature = "sched_selftest")]
+    match crate::sched::affinity_selftest::run() {
+        Some(result) => {
+            append_kthread_selftest_case(
+                &mut report,
+                "affinity_placement",
+                result.ok,
+                &mut failures,
+            );
+            report.push_str(&alloc::format!(
+                "affinity_placement_release_reason={} release_done={} registered={} rescued={}\n",
+                result.release_reason,
+                result.release_done,
+                result.registered,
+                result.rescued,
+            ));
+        }
+        None => report.push_str("affinity_placement=skip_unavailable\n"),
+    }
+    #[cfg(feature = "sched_selftest")]
+    match crate::sched::fair::run_group_switch_selftest() {
+        Ok(result) => {
+            append_kthread_selftest_case(&mut report, "group_switch", result.ok(), &mut failures);
+            report.push_str(&alloc::format!(
+                "group_switch_setup={} leaf_switch={} token_preserved={} b_eligible={} edf_b={} winner_b={} cleanup={} old_token={} observed_token={} deadline={}\n",
+                result.setup, result.leaf_switch, result.token_preserved, result.b_eligible,
+                result.edf_b, result.winner_b, result.cleanup, result.old_token,
+                result.observed_token, result.deadline,
+            ));
+        }
+        Err(_) => {
+            append_kthread_selftest_case(&mut report, "group_switch", false, &mut failures);
+            report.push_str("group_switch_setup=allocation_or_context_error\n");
+        }
+    }
+    #[cfg(not(feature = "sched_selftest"))]
+    report.push_str("group_switch=skip_sched_disabled\n");
+    crate::sched::pelt::run_selftests();
+    append_kthread_selftest_case(&mut report, "pelt_arithmetic", true, &mut failures);
+
+    append_kthread_selftest_case(
+        &mut report,
+        "pid_membership_lifetime",
+        super::pid::selftest_membership_lifetime().unwrap_or(false),
+        &mut failures,
+    );
+
+    let (destroyed, reaped, remaining_owners, entity_destroyed, entity_owners) =
+        selftest_task_destruction();
+    append_kthread_selftest_case(&mut report, "task_destruction", destroyed, &mut failures);
+    report.push_str(&alloc::format!(
+        "task_reaped={reaped} remaining_owners={remaining_owners}\n"
+    ));
+    append_kthread_selftest_case(
+        &mut report,
+        "sched_entity_destruction",
+        entity_destroyed,
+        &mut failures,
+    );
+    report.push_str(&alloc::format!(
+        "sched_entity_remaining_owners={entity_owners}\n"
+    ));
+
+    append_kthread_selftest_case(
+        &mut report,
+        "create_stopped_stop",
+        selftest_create_stopped_stop(),
+        &mut failures,
+    );
+    append_kthread_selftest_case(
+        &mut report,
+        "create_and_run_stop",
+        selftest_create_and_run_stop(),
+        &mut failures,
+    );
+
+    let (quick_exit_ok, quick_exit_completed) = selftest_quick_exit(512);
+    append_kthread_selftest_case(&mut report, "quick_exit_512", quick_exit_ok, &mut failures);
+    report.push_str(&alloc::format!(
+        "quick_exit_completed={quick_exit_completed}\n"
+    ));
+
+    if failures == 0 {
+        report.insert_str(0, "status=ok\n");
+    } else {
+        report.insert_str(0, &alloc::format!("status=fail failures={failures}\n"));
+    }
+    Ok(report)
+}
+
+fn selftest_create_stopped_stop() -> bool {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let entered_worker = entered.clone();
+    let name = "kthread-selftest-stopped".to_string();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            entered_worker.fetch_add(1, Ordering::AcqRel);
+            0
+        }),
+        (),
+    ));
+    let Some(pcb) = KernelThreadMechanism::create(closure, name.clone()) else {
+        return false;
+    };
+
+    let worker_private_ready = pcb
+        .worker_private()
+        .as_ref()
+        .and_then(|private| private.kernel_thread())
+        .is_some();
+    let ready_ok = entered.load(Ordering::Acquire) == 0
+        && pcb.sched_info().state() == ProcessState::Blocked(false)
+        && pcb.flags().contains(ProcessFlags::KTHREAD)
+        && pcb.basic().name() == name
+        && worker_private_ready;
+    let stop_ok = KernelThreadMechanism::stop(&pcb).is_ok();
+
+    ready_ok && stop_ok && entered.load(Ordering::Acquire) == 0 && Arc::strong_count(&entered) == 1
+}
+
+/// Stopping joins the worker, but does not join the scheduler's switch tail or
+/// kthreadd's reaper. Observe both without retaining a strong task reference.
+fn selftest_task_destruction() -> (bool, bool, usize, bool, usize) {
+    let entered = Arc::new(Completion::new());
+    let worker_entered = entered.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            worker_entered.complete();
+            91
+        }),
+        (),
+    ));
+    let Some(pcb) =
+        KernelThreadMechanism::create_and_run(closure, "kthread-selftest-destruction".to_string())
+    else {
+        return (false, false, 0, false, 0);
+    };
+    let pid = pcb.raw_pid();
+    let task = Arc::downgrade(&pcb);
+    // A scheduler-owned entity can keep the PCB allocation alive through a
+    // Weak even after the PCB payload has been destroyed. Observe both owners.
+    let entity = Arc::downgrade(&pcb.sched_info().sched_entity());
+    let _ = entered.wait_for_completion();
+    let stopped = KernelThreadMechanism::stop(&pcb) == Ok(91);
+    drop(pcb);
+
+    for _ in 0..200 {
+        if task.strong_count() == 0 && entity.strong_count() == 0 {
+            return (stopped, true, 0, true, 0);
+        }
+        let _ = crate::time::sleep::nanosleep(crate::time::PosixTimeSpec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        });
+    }
+    let reaped = ProcessManager::find_task_by_vpid(pid).is_none();
+    let task_owners = task.strong_count();
+    let entity_owners = entity.strong_count();
+    (
+        stopped && task_owners == 0,
+        reaped,
+        task_owners,
+        entity_owners == 0,
+        entity_owners,
+    )
+}
+
+fn selftest_create_and_run_stop() -> bool {
+    const RESULT: i32 = 73;
+
+    let entered = Arc::new(AtomicUsize::new(0));
+    let entered_worker = entered.clone();
+    let entered_completion = Arc::new(Completion::new());
+    let entered_completion_worker = entered_completion.clone();
+    let closure = KernelThreadClosure::EmptyClosure((
+        Box::new(move || {
+            entered_worker.fetch_add(1, Ordering::AcqRel);
+            entered_completion_worker.complete();
+            let current = ProcessManager::current_pcb();
+            while !KernelThreadMechanism::should_stop(&current) {
+                schedule(SchedMode::SM_NONE);
+            }
+            RESULT
+        }),
+        (),
+    ));
+    let Some(pcb) =
+        KernelThreadMechanism::create_and_run(closure, "kthread-selftest-running".to_string())
+    else {
+        return false;
+    };
+
+    if entered_completion.wait_for_completion().is_err() {
+        let _ = KernelThreadMechanism::stop(&pcb);
+        return false;
+    }
+    let result = KernelThreadMechanism::stop(&pcb);
+    entered.load(Ordering::Acquire) == 1 && result == Ok(RESULT as usize)
+}
+
+fn selftest_quick_exit(iterations: usize) -> (bool, usize) {
+    const RESULT: i32 = 91;
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    for _ in 0..iterations {
+        let entered_completion = Arc::new(Completion::new());
+        let entered_completion_worker = entered_completion.clone();
+        let completed_worker = completed.clone();
+        let closure = KernelThreadClosure::EmptyClosure((
+            Box::new(move || {
+                completed_worker.fetch_add(1, Ordering::AcqRel);
+                entered_completion_worker.complete();
+                RESULT
+            }),
+            (),
+        ));
+        let Some(pcb) = KernelThreadMechanism::create_and_run(
+            closure,
+            "kthread-selftest-quick-exit".to_string(),
+        ) else {
+            return (false, completed.load(Ordering::Acquire));
+        };
+        if entered_completion.wait_for_completion().is_err()
+            || KernelThreadMechanism::stop(&pcb) != Ok(RESULT as usize)
+        {
+            return (false, completed.load(Ordering::Acquire));
+        }
+    }
+
+    let completed = completed.load(Ordering::Acquire);
+    (completed == iterations, completed)
+}
+
+fn append_kthread_selftest_case(report: &mut String, name: &str, ok: bool, failures: &mut usize) {
+    if ok {
+        report.push_str(&alloc::format!("{name}=ok\n"));
+    } else {
+        *failures += 1;
+        report.push_str(&alloc::format!("{name}=fail\n"));
+    }
+}
+
 /// 内核线程启动的第二阶段
 ///
 /// 该函数只能被`kernel_thread_bootstrap_stage1`调用（jmp到该函数）
@@ -621,24 +980,55 @@ impl KernelThreadMechanism {
 /// - ptr: 传入的参数，是一个指向`Arc<KernelThreadCreateInfo>`的指针
 pub unsafe extern "C" fn kernel_thread_bootstrap_stage2(ptr: *const KernelThreadCreateInfo) -> ! {
     let info = KernelThreadCreateInfo::parse_unsafe_arc_ptr(ptr);
+    let current = ProcessManager::current_pcb();
 
-    let closure: Box<KernelThreadClosure> = info.take_closure().unwrap();
-    info.set_create_ok(ProcessManager::current_pcb());
+    // Complete all thread-visible setup before publishing Created. The arch
+    // fork path may already have scheduled this child, so post-fork setup in
+    // the parent cannot provide this ordering guarantee.
+    current.set_name(info.name().clone());
+    info.setup_pcb(&current);
+
+    // Moving out of Box releases the allocation before any non-returning
+    // user-mode switch. A Box kept on this stack would leak on every exec.
+    let closure: KernelThreadClosure = *info.take_closure().unwrap();
     let to_mark_sleep = info.to_mark_sleep();
-    drop(info);
 
     if to_mark_sleep {
-        // 进入睡眠状态
+        // Match Linux kthread(): publish the stopped state before publishing
+        // the creation result. A create_and_run wake racing with schedule()
+        // then either keeps this current task runnable or re-enqueues it after
+        // schedule has dequeued it; it can no longer be lost.
         let irq_guard = CurrentIrqArch::save_and_disable_irq();
-        ProcessManager::mark_sleep(true).expect("Failed to mark sleep");
+        ProcessManager::mark_sleep(false).expect("Failed to mark sleep");
+        info.set_create_ok(current.clone());
+        drop(info);
         drop(irq_guard);
         schedule(SchedMode::SM_NONE);
+    } else {
+        info.set_create_ok(current.clone());
+        drop(info);
     }
+    drop(current);
 
     let mut retval = SystemError::EINTR.to_posix_errno();
 
     if !KernelThreadMechanism::should_stop(&ProcessManager::current_pcb()) {
-        retval = closure.run();
+        retval = match closure {
+            KernelThreadClosure::UserMode(prepare) => match prepare() {
+                Ok(frame) => {
+                    let current = ProcessManager::current_pcb();
+                    current.worker_private().take();
+                    drop(current);
+                    unsafe { crate::arch::process::arch_switch_to_user(frame) }
+                }
+                Err(error) => error.to_posix_errno(),
+            },
+            other => other.run(),
+        };
+    } else {
+        // A stopped-before-run worker must release its unconsumed captures
+        // before entering the non-returning exit path.
+        drop(closure);
     }
 
     let current = ProcessManager::current_pcb();

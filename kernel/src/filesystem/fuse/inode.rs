@@ -1,95 +1,1384 @@
+mod directory;
+mod file;
+mod vfs;
+
 use alloc::{
+    collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::{mem::size_of, num::NonZeroUsize};
+use lru::LruCache;
 
 use system_error::SystemError;
 
-use crate::time::timekeep::ktime_get_real_ns;
 use crate::{
     driver::base::device::device_number::DeviceNumber,
-    filesystem::vfs::{
-        file::FileFlags, permission::PermissionMask, syscall::RenameFlags, FilePrivateData,
-        FileSystem, FileType, IndexNode, InodeFlags, InodeId, InodeMode, Metadata,
+    filesystem::{
+        page_cache::PageCache,
+        vfs::{
+            FileType, InodeFlags, InodeId, InodeMode, LinkMutationCoordinator, LinkRemovalOutcome,
+            Metadata,
+        },
     },
-    libs::mutex::{Mutex, MutexGuard},
-    time::PosixTimeSpec,
+    libs::{
+        mutex::Mutex,
+        rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
+        wait_queue::WaitQueue,
+    },
+    mm::{fault::FaultRetryWait, MemoryManagementArch},
+    time::{jiffies::NSEC_PER_JIFFY, timer::clock, PosixTimeSpec, NSEC_PER_SEC},
 };
 
+use super::reply::FuseReply;
 use super::{
     conn::FuseConn,
     fs::FuseFS,
-    private_data::{FuseFilePrivateData, FuseOpenPrivateData},
+    private_data::FuseWritebackHandle,
     protocol::{
-        fuse_pack_struct, fuse_read_struct, FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn,
-        FuseDirent, FuseDirentPlus, FuseEntryOut, FuseFlushIn, FuseFsyncIn, FuseGetattrIn,
-        FuseLinkIn, FuseMkdirIn, FuseMknodIn, FuseOpenIn, FuseOpenOut, FuseReadIn, FuseReleaseIn,
-        FuseRename2In, FuseRenameIn, FuseSetattrIn, FuseWriteIn, FuseWriteOut, FATTR_ATIME,
-        FATTR_CTIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID, FUSE_ACCESS,
-        FUSE_CREATE, FUSE_FLUSH, FUSE_FSYNC, FUSE_FSYNCDIR, FUSE_FSYNC_FDATASYNC, FUSE_GETATTR,
-        FUSE_LINK, FUSE_LOOKUP, FUSE_MKDIR, FUSE_MKNOD, FUSE_OPEN, FUSE_OPENDIR, FUSE_READ,
-        FUSE_READDIR, FUSE_READDIRPLUS, FUSE_READLINK, FUSE_RELEASE, FUSE_RELEASEDIR, FUSE_RENAME,
-        FUSE_RENAME2, FUSE_RMDIR, FUSE_ROOT_ID, FUSE_SETATTR, FUSE_SYMLINK, FUSE_UNLINK,
-        FUSE_WRITE,
+        fuse_pack_struct, fuse_read_struct, FuseAttr, FuseAttrOut, FuseEntryOut, FuseGetattrIn,
+        FuseWriteIn, FuseWriteOut, FUSE_GETATTR, FUSE_GETATTR_FH, FUSE_ROOT_ID, FUSE_WRITE,
+        FUSE_WRITE_KILL_SUIDGID, FUSE_WRITE_LOCKOWNER,
     },
 };
+
+use super::{
+    private_data::FuseOpenPrivateData,
+    virtiofs::dax::{
+        DaxAdmissionGuard, DaxAdmissionState, DaxRangeAllocator, OwnedToken, ReclaimCandidate,
+        ReclaimToken, DAX_RANGE_SIZE,
+    },
+};
+
+static NEXT_NODE_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+fn getattr_request_input(fh: Option<u64>) -> FuseGetattrIn {
+    FuseGetattrIn {
+        getattr_flags: if fh.is_some() { FUSE_GETATTR_FH } else { 0 },
+        dummy: 0,
+        fh: fh.unwrap_or(0),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxMapping {
+    file_offset: u64,
+    writable: AtomicBool,
+    token: OwnedToken,
+}
+
+#[derive(Debug, Default)]
+struct DaxMappingTree {
+    mappings: BTreeMap<u64, Arc<DaxMapping>>,
+    tombstones: BTreeMap<u64, Arc<DaxMapping>>,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxAccessGuard {
+    mapping: Arc<DaxMapping>,
+    allocator: Arc<DaxRangeAllocator>,
+    window: Arc<crate::driver::virtio::virtio_fs::VirtioFsCacheWindow>,
+    _admission: Option<DaxAdmissionGuard>,
+}
+
+/// A snapshot of the only current external user-PFN provider. It retains
+/// actual backing descriptors, not a promise that the user PTE stays present
+/// or writable. All holders must retire it outside their MM/PT guards.
+pub(crate) struct DaxUserWriteSnapshot {
+    _window: Arc<crate::driver::virtio::virtio_fs::VirtioFsCacheWindow>,
+    pub(crate) physical: Option<crate::mm::PhysAddr>,
+    _node: Arc<FuseNode>,
+    _mapping: Option<Arc<DaxMapping>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxReclaimTombstone {
+    file_offset: u64,
+    mapping: Arc<DaxMapping>,
+    token: ReclaimToken,
+}
+
+/// Blocks host-invalidated DAX contents from being consumed while keeping
+/// daemon requests outside the bounded active section.  A notification can
+/// therefore drain actual window users without waiting for a SETUPMAPPING
+/// request whose reply depends on that same notification returning.
+#[derive(Debug)]
+struct DaxHostInvalidationGate {
+    blockers: AtomicUsize,
+    active: AtomicUsize,
+    wait: WaitQueue,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxHostAccessGuard {
+    gate: Arc<DaxHostInvalidationGate>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DaxHostInvalidationBlocker {
+    gate: Arc<DaxHostInvalidationGate>,
+}
+
+#[derive(Debug)]
+struct DaxHostInvalidationRetryWait {
+    gate: Arc<DaxHostInvalidationGate>,
+}
+
+impl DaxHostInvalidationGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            blockers: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            wait: WaitQueue::default(),
+        })
+    }
+
+    fn try_enter(self: &Arc<Self>) -> Result<DaxHostAccessGuard, SystemError> {
+        if self.blockers.load(Ordering::Acquire) != 0 {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.blockers.load(Ordering::Acquire) != 0 {
+            self.leave_active();
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        Ok(DaxHostAccessGuard { gate: self.clone() })
+    }
+
+    fn begin(self: &Arc<Self>) -> Result<DaxHostInvalidationBlocker, SystemError> {
+        self.blockers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| SystemError::EOVERFLOW)?;
+        self.wait
+            .wait_until(|| (self.active.load(Ordering::Acquire) == 0).then_some(()));
+        Ok(DaxHostInvalidationBlocker { gate: self.clone() })
+    }
+
+    fn blocked(&self) -> bool {
+        self.blockers.load(Ordering::Acquire) != 0
+    }
+
+    fn wait_unblocked(&self) {
+        self.wait.wait_until(|| (!self.blocked()).then_some(()));
+    }
+
+    fn wait_unblocked_interruptible(&self) -> Result<(), SystemError> {
+        self.wait
+            .wait_until_interruptible(|| (!self.blocked()).then_some(()))
+    }
+
+    fn leave_active(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.wait.wakeup_all(None);
+        }
+    }
+
+    fn leave_blocker(&self) {
+        let previous = self.blockers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0);
+        if previous == 1 {
+            self.wait.wakeup_all(None);
+        }
+    }
+}
+
+impl Drop for DaxHostAccessGuard {
+    fn drop(&mut self) {
+        self.gate.leave_active();
+    }
+}
+
+impl Drop for DaxHostInvalidationBlocker {
+    fn drop(&mut self) {
+        self.gate.leave_blocker();
+    }
+}
+
+impl FaultRetryWait for DaxHostInvalidationRetryWait {
+    fn wait(&self) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.gate.wait_unblocked();
+        Ok(())
+    }
+}
+
+impl DaxMappingTree {
+    fn bump_sequence(&mut self) -> Result<(), SystemError> {
+        self.sequence = self.sequence.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+        Ok(())
+    }
+}
+
+impl DaxMapping {
+    pub(crate) fn window_offset(&self) -> usize {
+        self.token.window_offset()
+    }
+
+    pub(crate) fn writable(&self) -> bool {
+        self.writable.load(Ordering::Acquire)
+    }
+}
+
+impl DaxAccessGuard {
+    fn checked_window_offset(&self, offset: usize, len: usize) -> Result<usize, SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > DAX_RANGE_SIZE {
+            return Err(SystemError::ERANGE);
+        }
+        self.mapping
+            .window_offset()
+            .checked_add(offset)
+            .ok_or(SystemError::EOVERFLOW)
+    }
+
+    pub(crate) fn checked_paddr(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<crate::mm::PhysAddr, SystemError> {
+        self.window
+            .checked_paddr(self.checked_window_offset(offset, len)?, len)
+    }
+
+    pub(crate) fn copy_to(&self, offset: usize, dst: &mut [u8]) -> Result<(), SystemError> {
+        let window_offset = self.checked_window_offset(offset, dst.len())?;
+        let src = self.window.checked_vaddr(window_offset, dst.len())?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.data() as *const u8, dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_from(&self, offset: usize, src: &[u8]) -> Result<(), SystemError> {
+        if !self.mapping.writable() {
+            return Err(SystemError::EACCES);
+        }
+        let window_offset = self.checked_window_offset(offset, src.len())?;
+        let dst = self.window.checked_vaddr(window_offset, src.len())?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst.data() as *mut u8, src.len());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DaxAccessGuard {
+    fn drop(&mut self) {
+        let result = self.allocator.put(&self.mapping.token);
+        debug_assert!(result.is_ok() || result == Err(SystemError::EINVAL));
+    }
+}
 
 #[derive(Debug)]
 pub struct FuseNode {
     fs: Weak<FuseFS>,
     conn: Arc<FuseConn>,
+    self_ref: Weak<FuseNode>,
     nodeid: u64,
+    /// Kernel-local identity for this FuseNode object.  The daemon generation
+    /// alone is insufficient because a type mismatch retires a node even when
+    /// the daemon accidentally reuses the same (nodeid, generation) pair.
+    node_incarnation: u64,
     parent_nodeid: Mutex<u64>,
+    parent: Mutex<Option<Arc<FuseNode>>>,
+    name: Mutex<Option<String>>,
     cached_metadata: Mutex<Option<Metadata>>,
-    cached_metadata_deadline_ns: AtomicU64,
+    page_cache: Mutex<Option<Arc<PageCache>>>,
+    writeback_handles: Mutex<Vec<Arc<FuseWritebackHandle>>>,
+    lookup_cache: Mutex<LruCache<String, FuseLookupCacheEntry>>,
+    /// Linux FUSE_I_INIT_RDPLUS equivalent for the first cache use of a child.
+    readdirplus_init: AtomicBool,
+    /// Linux FUSE_I_ADVISE_RDPLUS equivalent for the next directory batch.
+    readdirplus_advised: AtomicBool,
+    /// Serializes dirty-page admission against operations which must drain and
+    /// invalidate the page cache (truncate and direct I/O).
+    writeback_barrier: RwSem<()>,
+    /// Serializes the complete two-zap/tombstone/REMOVEMAPPING transaction.
+    /// The layout semaphore is intentionally dropped between the two zaps, so
+    /// it cannot by itself prevent another layout breaker from observing and
+    /// passing a half-finished tombstone.
+    dax_reclaim_serial: Mutex<()>,
+    dax_mappings: RwSem<DaxMappingTree>,
+    dax_host_invalidation: Arc<DaxHostInvalidationGate>,
+    dax_pte_epoch: AtomicU64,
+    cached_metadata_deadline_ticks: AtomicU64,
+    attr_version: AtomicU64,
+    /// Inode write transaction gate: serializes complete primary writes with
+    /// SETATTR/truncate/fallocate and publication of returned attributes.
+    /// Read faults and writeback do not acquire it. Bounded primary writes
+    /// copy each userspace chunk before entering mapping exclusion, while
+    /// retaining this gate across the complete operation.
+    setattr_lock: Mutex<()>,
+    link_mutation_coordinator: LinkMutationCoordinator,
+    /// Version chain produced while short READ replies from one metadata
+    /// snapshot monotonically converge on the lowest observed EOF.
+    short_read_source_attr_version: AtomicU64,
+    short_read_chain_attr_version: AtomicU64,
+    /// Lowest EOF established by a short READ whose inode-wide cache truncate
+    /// is deferred out of the transport completion path.
+    pending_short_read_eof: AtomicU64,
     lookup_count: AtomicU64,
+    /// 最近一次 LOOKUP 回复中的 fuse_attr.flags（用于 announce-submounts）。
+    lookup_attr_flags: AtomicU32,
+    /// Fixed for this FuseNode incarnation, matching Linux inode S_DAX.
+    dax_active: bool,
+    /// Linux d_mark_dontcache equivalent for a per-inode DAX attribute change.
+    dax_dontcache: AtomicBool,
+    /// LOOKUP 返回的 generation，用于检测 virtiofsd 复用 nodeid。
+    generation: AtomicU64,
+    stale: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+struct FuseLookupCacheEntry {
+    child: Arc<FuseNode>,
+    generation: u64,
+    deadline_ticks: u64,
 }
 
 impl FuseNode {
     const FUSE_DIRENT_ALIGN: usize = 8;
+    const LOOKUP_CACHE_MAX_ENTRIES: usize = 1024;
+    const LOOKUP_CACHE_PRUNE_BUDGET: usize = 64;
+    const READDIR_BUFFER_SIZE: usize = 64 * 1024;
+    const XATTR_SIZE_MAX: usize = 65536;
+    const XATTR_LIST_MAX: usize = 65536;
 
     pub fn new(
         fs: Weak<FuseFS>,
         conn: Arc<FuseConn>,
         nodeid: u64,
         parent_nodeid: u64,
+        parent: Option<Arc<FuseNode>>,
         cached: Option<Metadata>,
+        attr_flags: u32,
     ) -> Arc<Self> {
+        let regular = cached
+            .as_ref()
+            .is_some_and(|md| md.file_type == FileType::File);
+        let dax_active = conn.dax_inode_active(attr_flags, regular);
+        let cached = cached.map(|md| Self::metadata_with_inode_flags(md, dax_active));
         let has_cached = cached.is_some();
-        Arc::new(Self {
+        let initial_attr_epoch = conn.sample_attr_epoch();
+        let node_incarnation = NEXT_NODE_INCARNATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(node_incarnation, 0, "FUSE node identity exhausted");
+        let node = Arc::new_cyclic(|self_ref| Self {
             fs,
             conn,
+            self_ref: self_ref.clone(),
             nodeid,
+            node_incarnation,
             parent_nodeid: Mutex::new(parent_nodeid),
+            parent: Mutex::new(parent),
+            name: Mutex::new(None),
             cached_metadata: Mutex::new(cached),
-            cached_metadata_deadline_ns: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
+            page_cache: Mutex::new(None),
+            writeback_handles: Mutex::new(Vec::new()),
+            lookup_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(Self::LOOKUP_CACHE_MAX_ENTRIES).unwrap(),
+            )),
+            readdirplus_init: AtomicBool::new(false),
+            readdirplus_advised: AtomicBool::new(false),
+            writeback_barrier: RwSem::new(()),
+            dax_reclaim_serial: Mutex::new(()),
+            dax_mappings: RwSem::new(DaxMappingTree::default()),
+            dax_host_invalidation: DaxHostInvalidationGate::new(),
+            dax_pte_epoch: AtomicU64::new(0),
+            cached_metadata_deadline_ticks: AtomicU64::new(if has_cached { u64::MAX } else { 0 }),
+            attr_version: AtomicU64::new(initial_attr_epoch),
+            setattr_lock: Mutex::new(()),
+            link_mutation_coordinator: LinkMutationCoordinator::new(),
+            short_read_source_attr_version: AtomicU64::new(0),
+            short_read_chain_attr_version: AtomicU64::new(0),
+            pending_short_read_eof: AtomicU64::new(u64::MAX),
             lookup_count: AtomicU64::new(0),
+            lookup_attr_flags: AtomicU32::new(0),
+            dax_active,
+            dax_dontcache: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            stale: AtomicBool::new(false),
+        });
+        if node.dax_active {
+            node.conn.register_dax_node(&node);
+        }
+        node
+    }
+
+    pub fn lookup_attr_flags(&self) -> u32 {
+        self.lookup_attr_flags.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn node_incarnation(&self) -> u64 {
+        self.node_incarnation
+    }
+
+    pub(crate) fn dax_mapping_owner(&self) -> super::virtiofs::dax::DaxMappingOwner {
+        super::virtiofs::dax::DaxMappingOwner::from_inode(self.nodeid, self.node_incarnation)
+            .expect("FuseNode has a valid DAX owner identity")
+    }
+
+    pub(crate) fn dax_active(&self) -> bool {
+        self.dax_active
+    }
+
+    pub(crate) fn dax_dontcache(&self) -> bool {
+        self.dax_dontcache.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_lookup_attr_flags(&self, flags: u32) {
+        self.lookup_attr_flags.store(flags, Ordering::Relaxed);
+    }
+
+    fn metadata_with_inode_flags(mut md: Metadata, dax_active: bool) -> Metadata {
+        // Linux fuse_iget(): access times are maintained by the daemon, not
+        // by additional client SETATTR requests on ordinary file access.
+        md.flags.insert(InodeFlags::S_NOATIME);
+        if dax_active {
+            md.flags.insert(InodeFlags::S_DAX);
+        } else {
+            md.flags.remove(InodeFlags::S_DAX);
+        }
+        md
+    }
+
+    fn note_dax_attr_change(&self, attr_flags: u32) {
+        if !self.conn.dax_mode().attr_change_requires_dontcache(
+            self.dax_active,
+            (attr_flags & super::protocol::FUSE_ATTR_DAX) != 0,
+        ) || self
+            .dax_dontcache
+            .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(node) = self.self_ref.upgrade() else {
+            return;
+        };
+        if let Some(fs) = self.fs.upgrade() {
+            fs.purge_lookup_aliases(&node);
+        }
+    }
+
+    pub(crate) fn dax_layout_read(&self) -> RwSemReadGuard<'_, ()> {
+        self.writeback_barrier.read()
+    }
+
+    pub(crate) fn dax_layout_write(&self) -> RwSemWriteGuard<'_, ()> {
+        self.writeback_barrier.write()
+    }
+
+    pub(crate) fn dax_try_host_access(&self) -> Result<DaxHostAccessGuard, SystemError> {
+        self.dax_host_invalidation.try_enter()
+    }
+
+    pub(crate) fn dax_begin_host_invalidation(
+        &self,
+    ) -> Result<DaxHostInvalidationBlocker, SystemError> {
+        self.dax_host_invalidation.begin()
+    }
+
+    pub(crate) fn dax_host_invalidation_blocked(&self) -> bool {
+        self.dax_host_invalidation.blocked()
+    }
+
+    pub(crate) fn dax_wait_host_invalidation_interruptible(&self) -> Result<(), SystemError> {
+        self.dax_host_invalidation.wait_unblocked_interruptible()
+    }
+
+    pub(crate) fn dax_host_invalidation_retry_wait(&self) -> Arc<dyn FaultRetryWait> {
+        Arc::new(DaxHostInvalidationRetryWait {
+            gate: self.dax_host_invalidation.clone(),
         })
+    }
+
+    pub(crate) fn dax_pte_epoch(&self) -> u64 {
+        self.dax_pte_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn dax_note_pte_published(&self) -> Result<u64, SystemError> {
+        self.dax_pte_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map(|old| old + 1)
+            .map_err(|_| SystemError::EOVERFLOW)
+    }
+
+    fn dax_aligned_offset(offset: u64) -> u64 {
+        offset & !(DAX_RANGE_SIZE as u64 - 1)
+    }
+
+    pub(crate) fn dax_access(
+        &self,
+        offset: u64,
+        writable: bool,
+    ) -> Result<DaxAccessGuard, SystemError> {
+        let admission = self.conn.enter_dax()?;
+        self.dax_access_inner(offset, writable, Some(admission))
+    }
+
+    /// Inspect an already established mapping only. No SETUPMAPPING, daemon
+    /// request, range admission or waiting is permitted with the caller's MM
+    /// locked. A concurrent tombstone is represented by physical=None, so the
+    /// caller can release the MM and use the ordinary fault/retry protocol.
+    pub(crate) fn snapshot_dax_user_write(
+        self: &Arc<Self>,
+        offset: usize,
+    ) -> Result<DaxUserWriteSnapshot, SystemError> {
+        let window = self.conn.dax_window()?;
+        let mapping = self.dax_mappings.try_read().and_then(|tree| {
+            tree.mappings
+                .get(&Self::dax_aligned_offset(offset as u64))
+                .cloned()
+        });
+        let physical = mapping.as_ref().and_then(|mapping| {
+            if !mapping.writable() || mapping.token.owner() != self.dax_mapping_owner() {
+                return None;
+            }
+            let in_mapping = offset & (DAX_RANGE_SIZE - 1);
+            let window_offset = mapping.window_offset().checked_add(in_mapping)?;
+            window
+                .checked_paddr(window_offset, crate::arch::MMArch::PAGE_SIZE)
+                .ok()
+        });
+        Ok(DaxUserWriteSnapshot {
+            _window: window,
+            physical,
+            _node: self.clone(),
+            _mapping: mapping,
+        })
+    }
+
+    fn dax_access_inner(
+        &self,
+        offset: u64,
+        writable: bool,
+        admission: Option<DaxAdmissionGuard>,
+    ) -> Result<DaxAccessGuard, SystemError> {
+        let file_offset = Self::dax_aligned_offset(offset);
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .cloned()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let window = self.conn.dax_window()?;
+
+        loop {
+            let mapping = {
+                let tree = self.dax_mappings.read();
+                if tree.tombstones.contains_key(&file_offset) {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
+                let mapping = tree.mappings.get(&file_offset).cloned();
+                if let Some(mapping) = mapping.as_ref() {
+                    // Pin while the tree read lock still prevents reclaim from
+                    // transitioning this exact token to Reclaiming.
+                    allocator.get(&mapping.token)?;
+                }
+                mapping
+            };
+
+            if let Some(mapping) = mapping {
+                if !writable || mapping.writable() {
+                    return Ok(DaxAccessGuard {
+                        mapping,
+                        allocator,
+                        window,
+                        _admission: admission,
+                    });
+                }
+
+                let mut tree = self.dax_mappings.write();
+                let current = tree.mappings.get(&file_offset).cloned();
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &mapping))
+                {
+                    drop(tree);
+                    allocator.put(&mapping.token)?;
+                    continue;
+                }
+                if !mapping.writable() {
+                    if let Err(error) = self.conn.setup_existing_dax_mapping(
+                        self.dax_mapping_owner(),
+                        &mapping.token,
+                        file_offset,
+                        true,
+                    ) {
+                        drop(tree);
+                        allocator.put(&mapping.token)?;
+                        return Err(error);
+                    }
+                    mapping.writable.store(true, Ordering::Release);
+                    tree.bump_sequence()?;
+                }
+                drop(tree);
+                return Ok(DaxAccessGuard {
+                    mapping,
+                    allocator,
+                    window,
+                    _admission: admission,
+                });
+            }
+
+            let mut tree = self.dax_mappings.write();
+            if tree.tombstones.contains_key(&file_offset) {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            if tree.mappings.contains_key(&file_offset) {
+                drop(tree);
+                continue;
+            }
+            let token =
+                self.conn
+                    .setup_dax_mapping(self.dax_mapping_owner(), file_offset, writable)?;
+            let mapping = Arc::new(DaxMapping {
+                file_offset,
+                writable: AtomicBool::new(writable),
+                token,
+            });
+            // The daemon mapping exists but cannot safely be published locally
+            // without the access reference. Retain allocator ownership on error;
+            // teardown will retire the connection range.
+            allocator.get(&mapping.token)?;
+            tree.bump_sequence()?;
+            tree.mappings.insert(file_offset, mapping.clone());
+            drop(tree);
+            return Ok(DaxAccessGuard {
+                mapping,
+                allocator,
+                window,
+                _admission: admission,
+            });
+        }
+    }
+
+    pub(crate) fn dax_isolate_reclaim(
+        &self,
+        candidate: &ReclaimCandidate,
+        expected_pte_epoch: u64,
+    ) -> Result<DaxReclaimTombstone, SystemError> {
+        let _layout = self.dax_layout_write();
+        self.dax_isolate_reclaim_locked(candidate, expected_pte_epoch)
+    }
+
+    fn dax_isolate_reclaim_locked(
+        &self,
+        candidate: &ReclaimCandidate,
+        expected_pte_epoch: u64,
+    ) -> Result<DaxReclaimTombstone, SystemError> {
+        if self.dax_pte_epoch() != expected_pte_epoch {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        }
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut tree = self.dax_mappings.write();
+        let Some((file_offset, mapping)) = tree
+            .mappings
+            .iter()
+            .find(|(_, mapping)| mapping.token.matches_candidate(candidate))
+            .map(|(offset, mapping)| (*offset, mapping.clone()))
+        else {
+            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        };
+        let token = allocator.begin_reclaim(candidate)?;
+        tree.mappings.remove(&file_offset);
+        tree.tombstones.insert(file_offset, mapping.clone());
+        tree.bump_sequence()?;
+        Ok(DaxReclaimTombstone {
+            file_offset,
+            mapping,
+            token,
+        })
+    }
+
+    fn dax_mapping_intersects(
+        mapping: &DaxMapping,
+        start: usize,
+        end_exclusive: Option<usize>,
+    ) -> Result<bool, SystemError> {
+        let mapping_start =
+            usize::try_from(mapping.file_offset).map_err(|_| SystemError::EOVERFLOW)?;
+        let mapping_end = mapping_start
+            .checked_add(DAX_RANGE_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        Ok(mapping_end > start && end_exclusive.is_none_or(|end| mapping_start < end))
+    }
+
+    /// Acquire the inode layout exclusively after revoking and removing every
+    /// DAX range intersecting `[start, end_exclusive)`. Sequence and PTE epochs
+    /// make the rmap-walk-to-lock transition retryable instead of racy.
+    fn dax_layout_write_for_range_with_restore(
+        &self,
+        start: usize,
+        end_exclusive: Option<usize>,
+        restore_on_failure: bool,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        if !self.dax_active() {
+            return Ok(self.dax_layout_write());
+        }
+        let _reclaim_serial = self.dax_reclaim_serial.lock();
+        'retry: loop {
+            let page_cache = self.cached_page_cache();
+            let (sequence, mappings) = {
+                let tree = self.dax_mappings.read();
+                let mut mappings = Vec::new();
+                for mapping in tree.mappings.values() {
+                    if Self::dax_mapping_intersects(mapping, start, end_exclusive)? {
+                        mappings.push(mapping.clone());
+                    }
+                }
+                (tree.sequence, mappings)
+            };
+            let epoch = self.dax_pte_epoch();
+            if let Some(cache) = page_cache.as_ref() {
+                for mapping in &mappings {
+                    let start = usize::try_from(mapping.file_offset)
+                        .map_err(|_| SystemError::EOVERFLOW)?
+                        >> crate::arch::MMArch::PAGE_SHIFT;
+                    let end = start
+                        .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+                        .ok_or(SystemError::EOVERFLOW)?;
+                    cache.unmap_mapping_pages(start, Some(end))?;
+                }
+            }
+            let layout = self.dax_layout_write();
+            if self.dax_pte_epoch() != epoch || self.dax_mappings.read().sequence != sequence {
+                drop(layout);
+                continue;
+            }
+            let allocator = self
+                .conn
+                .dax_allocator()
+                .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+            let total = allocator.snapshot().total;
+            let mut candidates = Vec::with_capacity(total);
+            allocator.reclaim_candidates(&mut candidates, total)?;
+            let mut tombstones = Vec::with_capacity(mappings.len());
+            for mapping in &mappings {
+                let Some(candidate) = candidates
+                    .iter()
+                    .find(|candidate| mapping.token.matches_candidate(candidate))
+                else {
+                    for tombstone in tombstones.drain(..) {
+                        let _ = self.dax_cancel_reclaim(tombstone);
+                    }
+                    drop(layout);
+                    continue 'retry;
+                };
+                match self.dax_isolate_reclaim_locked(candidate, epoch) {
+                    Ok(tombstone) => tombstones.push(tombstone),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        for tombstone in tombstones.drain(..) {
+                            let _ = self.dax_cancel_reclaim(tombstone);
+                        }
+                        drop(layout);
+                        continue 'retry;
+                    }
+                    Err(error) => {
+                        for tombstone in tombstones.drain(..) {
+                            let _ = self.dax_cancel_reclaim(tombstone);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            drop(layout);
+            let second_zap = (|| {
+                for tombstone in &tombstones {
+                    if let Some(cache) = page_cache.as_ref() {
+                        let start = usize::try_from(tombstone.file_offset)
+                            .map_err(|_| SystemError::EOVERFLOW)?
+                            >> crate::arch::MMArch::PAGE_SHIFT;
+                        let end = start
+                            .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+                            .ok_or(SystemError::EOVERFLOW)?;
+                        // The tombstone blocks new DAX faults. A second rmap
+                        // pass drains fork/mremap publishers that raced the
+                        // first zap.
+                        cache.unmap_mapping_pages(start, Some(end))?;
+                    }
+                }
+                Ok::<(), SystemError>(())
+            })();
+            if let Err(error) = second_zap {
+                for tombstone in tombstones.drain(..) {
+                    let _ = self.dax_cancel_reclaim(tombstone);
+                }
+                return Err(error);
+            }
+            let layout = self.dax_layout_write();
+            let mut remaining = tombstones.into_iter();
+            while let Some(tombstone) = remaining.next() {
+                if let Err(error) =
+                    self.dax_finish_reclaim_with_restore(tombstone, restore_on_failure)
+                {
+                    for unsubmitted in remaining {
+                        if restore_on_failure {
+                            let _ = self.dax_cancel_reclaim(unsubmitted);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+            return Ok(layout);
+        }
+    }
+
+    pub(crate) fn dax_layout_write_for_range(
+        &self,
+        start: usize,
+        end_exclusive: Option<usize>,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range_with_restore(start, end_exclusive, true)
+    }
+
+    pub(crate) fn dax_layout_write_for_truncate(
+        &self,
+        new_size: usize,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range(new_size, None)
+    }
+
+    pub(crate) fn dax_layout_write_for_all(&self) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range(0, None)
+    }
+
+    pub(crate) fn dax_layout_write_for_host_invalidation(
+        &self,
+        start: usize,
+        end_exclusive: Option<usize>,
+    ) -> Result<RwSemWriteGuard<'_, ()>, SystemError> {
+        self.dax_layout_write_for_range_with_restore(start, end_exclusive, false)
+    }
+
+    pub(crate) fn dax_teardown(&self) -> Result<(), SystemError> {
+        if self.dax_active() {
+            drop(self.dax_layout_write_for_all()?);
+        }
+        Ok(())
+    }
+
+    /// Disconnect-only local revocation. The daemon can no longer confirm
+    /// REMOVEMAPPING, so clear inode ownership after two PTE zaps and let the
+    /// connection retire every allocator entry globally.
+    pub(crate) fn dax_disconnect_revoke(&self) -> Result<(), SystemError> {
+        let page_cache = self.cached_page_cache();
+        let mappings = self
+            .dax_mappings
+            .read()
+            .mappings
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let zap = |mapping: &DaxMapping| -> Result<(), SystemError> {
+            let Some(cache) = page_cache.as_ref() else {
+                return Ok(());
+            };
+            let start = usize::try_from(mapping.file_offset).map_err(|_| SystemError::EOVERFLOW)?
+                >> crate::arch::MMArch::PAGE_SHIFT;
+            let end = start
+                .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+                .ok_or(SystemError::EOVERFLOW)?;
+            cache.unmap_mapping_pages(start, Some(end))
+        };
+        for mapping in &mappings {
+            zap(mapping)?;
+        }
+        {
+            let _layout = self.dax_layout_write();
+            let mut tree = self.dax_mappings.write();
+            tree.mappings.clear();
+            tree.tombstones.clear();
+            tree.bump_sequence()?;
+        }
+        for mapping in &mappings {
+            zap(mapping)?;
+        }
+        Ok(())
+    }
+
+    fn dax_abandon_mappings(&self) -> Result<(), SystemError> {
+        let mappings = self
+            .dax_mappings
+            .read()
+            .mappings
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.dax_disconnect_revoke()?;
+        let Some(allocator) = self.conn.dax_allocator() else {
+            return Ok(());
+        };
+        let total = allocator.snapshot().total;
+        let mut candidates = Vec::with_capacity(total);
+        allocator.reclaim_candidates(&mut candidates, total)?;
+        for mapping in mappings {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| mapping.token.matches_candidate(candidate))
+            {
+                let token = allocator.begin_reclaim(candidate)?;
+                allocator.retire_reclaim(&token)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dax_cancel_reclaim(
+        &self,
+        tombstone: DaxReclaimTombstone,
+    ) -> Result<(), SystemError> {
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut tree = self.dax_mappings.write();
+        if !tree
+            .tombstones
+            .get(&tombstone.file_offset)
+            .is_some_and(|mapping| Arc::ptr_eq(mapping, &tombstone.mapping))
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let restored = allocator.cancel_reclaim(&tombstone.token)?;
+        if !restored.same_identity(&tombstone.mapping.token) {
+            return Err(SystemError::EINVAL);
+        }
+        tree.tombstones.remove(&tombstone.file_offset);
+        tree.mappings
+            .insert(tombstone.file_offset, tombstone.mapping);
+        tree.bump_sequence()
+    }
+
+    pub(crate) fn dax_finish_reclaim(
+        &self,
+        tombstone: DaxReclaimTombstone,
+    ) -> Result<(), SystemError> {
+        self.dax_finish_reclaim_with_restore(tombstone, true)
+    }
+
+    fn dax_finish_reclaim_with_restore(
+        &self,
+        tombstone: DaxReclaimTombstone,
+        restore_on_failure: bool,
+    ) -> Result<(), SystemError> {
+        let result = self.conn.remove_dax_mappings(
+            self.dax_mapping_owner(),
+            core::slice::from_ref(&tombstone.token),
+        );
+        let allocator = self
+            .conn
+            .dax_allocator()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let restore =
+            restore_on_failure && result.is_err() && allocator.is_owned(&tombstone.mapping.token);
+        let mut tree = self.dax_mappings.write();
+        if tree
+            .tombstones
+            .get(&tombstone.file_offset)
+            .is_some_and(|mapping| Arc::ptr_eq(mapping, &tombstone.mapping))
+        {
+            if result.is_ok() || restore_on_failure {
+                tree.tombstones.remove(&tombstone.file_offset);
+            }
+            if restore {
+                tree.mappings
+                    .insert(tombstone.file_offset, tombstone.mapping);
+            }
+            if result.is_ok() || restore_on_failure {
+                tree.bump_sequence()?;
+            }
+        }
+        result
+    }
+
+    pub(crate) fn dax_file_size(&self) -> Result<usize, SystemError> {
+        usize::try_from(self.cached_or_fetch_metadata()?.size.max(0))
+            .map_err(|_| SystemError::EOVERFLOW)
+    }
+
+    /// Reclaim one daemon mapping after first revoking every PTE that can
+    /// reference its 2 MiB cache-window range.  The epoch closes the race
+    /// between the rmap walk and taking the inode layout lock.
+    pub(crate) fn dax_reclaim_candidate(
+        &self,
+        candidate: &ReclaimCandidate,
+    ) -> Result<(), SystemError> {
+        let _reclaim_serial = self.dax_reclaim_serial.lock();
+        let mapping = self
+            .dax_mappings
+            .read()
+            .mappings
+            .values()
+            .find(|mapping| mapping.token.matches_candidate(candidate))
+            .cloned()
+            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+        let expected_epoch = self.dax_pte_epoch();
+        let page_cache = self.cached_page_cache();
+        let start = usize::try_from(mapping.file_offset).map_err(|_| SystemError::EOVERFLOW)?
+            >> crate::arch::MMArch::PAGE_SHIFT;
+        let end = start
+            .checked_add(DAX_RANGE_SIZE >> crate::arch::MMArch::PAGE_SHIFT)
+            .ok_or(SystemError::EOVERFLOW)?;
+        if let Some(cache) = page_cache.as_ref() {
+            cache.unmap_mapping_pages(start, Some(end))?;
+        }
+        let tombstone = self.dax_isolate_reclaim(candidate, expected_epoch)?;
+        if let Some(cache) = page_cache.as_ref() {
+            if let Err(error) = cache.unmap_mapping_pages(start, Some(end)) {
+                let _ = self.dax_cancel_reclaim(tombstone);
+                return Err(error);
+            }
+        }
+        self.dax_finish_reclaim(tombstone)
+    }
+
+    pub(crate) fn dax_read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _admission = self.conn.enter_dax()?;
+        let _layout = self.dax_layout_read();
+        let size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
+        if offset >= size {
+            return Ok(0);
+        }
+        let requested = core::cmp::min(buf.len(), size - offset);
+        let mut done = 0usize;
+        while done < requested {
+            let current = offset.checked_add(done).ok_or(SystemError::EOVERFLOW)?;
+            let in_mapping = current & (DAX_RANGE_SIZE - 1);
+            let chunk = core::cmp::min(requested - done, DAX_RANGE_SIZE - in_mapping);
+            let access = match self.dax_access_inner(current as u64, false, None) {
+                Ok(access) => access,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            let _host_access = match self.dax_try_host_access() {
+                Ok(guard) => guard,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            if let Err(error) = access.copy_to(in_mapping, &mut buf[done..done + chunk]) {
+                return if done == 0 { Err(error) } else { Ok(done) };
+            }
+            done += chunk;
+        }
+        Ok(done)
+    }
+
+    /// Send ordinary FUSE WRITE while the caller owns the inode layout write lock.
+    /// This helper deliberately does not acquire `writeback_barrier` again.
+    pub(crate) fn fuse_write_locked(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        private: &FuseOpenPrivateData,
+        lock_owner: u64,
+    ) -> Result<usize, SystemError> {
+        let max_write = self.conn.max_write();
+        if max_write == 0 {
+            return Err(SystemError::EIO);
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let chunk = core::cmp::min(max_write, buf.len() - done);
+            let current = offset.checked_add(done).ok_or(SystemError::EOVERFLOW)?;
+            if current > i64::MAX as usize || chunk > u32::MAX as usize {
+                return if done == 0 {
+                    Err(SystemError::EFBIG)
+                } else {
+                    Ok(done)
+                };
+            }
+            let input = FuseWriteIn {
+                fh: private.fh,
+                offset: current as u64,
+                size: chunk as u32,
+                write_flags: Self::direct_write_flags(lock_owner),
+                lock_owner,
+                flags: private.open_flags,
+                padding: 0,
+            };
+            let payload_len = core::mem::size_of::<FuseWriteIn>()
+                .checked_add(chunk)
+                .ok_or(SystemError::EOVERFLOW)?;
+            let mut request = Vec::new();
+            if request.try_reserve_exact(payload_len).is_err() {
+                return if done == 0 {
+                    Err(SystemError::ENOMEM)
+                } else {
+                    Ok(done)
+                };
+            }
+            request.extend_from_slice(fuse_pack_struct(&input));
+            request.extend_from_slice(&buf[done..done + chunk]);
+            let output: FuseWriteOut = match self
+                .conn
+                .request(FUSE_WRITE, self.nodeid, &request)
+                .and_then(|payload| fuse_read_struct(&payload))
+            {
+                Ok(output) => output,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            let wrote = output.size as usize;
+            if wrote > chunk {
+                return if done == 0 {
+                    Err(SystemError::EIO)
+                } else {
+                    Ok(done)
+                };
+            }
+            self.note_successful_write(current, wrote)?;
+            if wrote != 0 {
+                self.expire_attributes_after_daemon_write();
+            }
+            done += wrote;
+            if wrote < chunk {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    pub(crate) fn dax_write_or_fuse_locked(
+        &self,
+        offset: usize,
+        buf: &[u8],
+        private: &FuseOpenPrivateData,
+        lock_owner: u64,
+    ) -> Result<usize, SystemError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _admission = self.conn.enter_dax()?;
+        let _layout = self.dax_layout_write();
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(SystemError::EOVERFLOW)?;
+        let size = self.cached_or_fetch_metadata()?.size.max(0) as usize;
+        if offset >= size || end > size {
+            return self.fuse_write_locked(offset, buf, private, lock_owner);
+        }
+
+        let mut done = 0usize;
+        while done < buf.len() {
+            let current = offset.checked_add(done).ok_or(SystemError::EOVERFLOW)?;
+            let in_mapping = current & (DAX_RANGE_SIZE - 1);
+            let chunk = core::cmp::min(buf.len() - done, DAX_RANGE_SIZE - in_mapping);
+            let access = match self.dax_access_inner(current as u64, true, None) {
+                Ok(access) => access,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            let _host_access = match self.dax_try_host_access() {
+                Ok(guard) => guard,
+                Err(error) if done == 0 => return Err(error),
+                Err(_) => return Ok(done),
+            };
+            if let Err(error) = access.copy_from(in_mapping, &buf[done..done + chunk]) {
+                return if done == 0 { Err(error) } else { Ok(done) };
+            }
+            self.note_successful_write(current, chunk)?;
+            done += chunk;
+        }
+        Ok(done)
+    }
+
+    pub(crate) fn set_generation(&self, gen: u64) {
+        self.generation.store(gen, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_stale(&self) {
+        self.stale.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn check_not_stale(&self) -> Result<(), SystemError> {
+        if self.stale.load(Ordering::Acquire) {
+            return Err(SystemError::ESTALE);
+        }
+        Ok(())
     }
 
     pub fn nodeid(&self) -> u64 {
         self.nodeid
     }
 
+    pub(crate) fn set_dname(&self, name: &str) {
+        *self.name.lock() = Some(name.to_string());
+    }
+
+    pub(crate) fn clear_dname_if(&self, name: &str) {
+        let mut dname = self.name.lock();
+        if dname.as_deref() == Some(name) {
+            *dname = None;
+        }
+    }
+
     pub fn set_parent_nodeid(&self, parent: u64) {
         *self.parent_nodeid.lock() = parent;
     }
 
-    pub fn set_cached_metadata(&self, md: Metadata) {
-        *self.cached_metadata.lock() = Some(md);
-        self.cached_metadata_deadline_ns
-            .store(u64::MAX, Ordering::Relaxed);
+    pub(crate) fn set_parent_if_absent(&self, parent: Option<Arc<FuseNode>>) {
+        let Some(parent) = parent else {
+            return;
+        };
+        if parent.nodeid() == self.nodeid {
+            return;
+        }
+        let mut guard = self.parent.lock();
+        if guard.is_none() {
+            *guard = Some(parent);
+        }
     }
 
-    pub fn set_cached_metadata_with_valid(&self, md: Metadata, valid: u64, valid_nsec: u32) {
-        *self.cached_metadata.lock() = Some(md);
-        self.cached_metadata_deadline_ns
+    pub(crate) fn set_parent(&self, parent: Option<Arc<FuseNode>>) {
+        if parent
+            .as_ref()
+            .is_some_and(|parent| parent.nodeid() == self.nodeid)
+        {
+            return;
+        }
+        *self.parent.lock() = parent;
+    }
+
+    pub(crate) fn clear_parent(&self) {
+        *self.parent.lock() = None;
+    }
+
+    pub(crate) fn cached_file_type(&self) -> Option<FileType> {
+        self.cached_metadata.lock().as_ref().map(|md| md.file_type)
+    }
+
+    pub fn set_cached_metadata_with_valid(
+        &self,
+        md: Metadata,
+        valid: u64,
+        valid_nsec: u32,
+        attr_flags: u32,
+    ) {
+        let md = Self::metadata_with_inode_flags(md, self.dax_active);
+        let mut metadata = self.cached_metadata.lock();
+        *metadata = Some(md);
+        self.bump_attr_version();
+        drop(metadata);
+        self.cached_metadata_deadline_ticks
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
+        self.note_dax_attr_change(attr_flags);
     }
 
+    /// Install an unsolicited/lookup/getattr daemon attribute snapshot.
+    /// With writeback cache negotiated, locally maintained size and cmtime are
+    /// authoritative and must not be rolled back by a stale daemon reply.
+    pub(crate) fn merge_cached_metadata_from_daemon(
+        &self,
+        mut md: Metadata,
+        valid: u64,
+        valid_nsec: u32,
+        request_epoch: u64,
+        attr_flags: u32,
+    ) -> Metadata {
+        md = Self::metadata_with_inode_flags(md, self.dax_active);
+        let mut metadata = self.cached_metadata.lock();
+        let stale_reply = self.attr_version() > request_epoch;
+        if stale_reply {
+            if let Some(local) = metadata.as_ref() {
+                md = local.clone();
+            }
+        }
+        if self
+            .conn
+            .has_init_flag(super::protocol::FUSE_WRITEBACK_CACHE)
+            && md.file_type == FileType::File
+        {
+            if let Some(local) = metadata.as_ref() {
+                md.size = local.size;
+                md.mtime = local.mtime;
+                md.ctime = local.ctime;
+            }
+        }
+        *metadata = Some(md.clone());
+        self.bump_attr_version();
+        drop(metadata);
+        self.cached_metadata_deadline_ticks.store(
+            if stale_reply {
+                0
+            } else {
+                Self::cache_deadline(valid, valid_nsec)
+            },
+            Ordering::Relaxed,
+        );
+        if !stale_reply {
+            self.note_dax_attr_change(attr_flags);
+        }
+        md
+    }
+
+    pub(crate) fn attr_version(&self) -> u64 {
+        self.attr_version.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_attr_version(&self) -> u64 {
+        let version = self.conn.next_attr_epoch();
+        self.attr_version.store(version, Ordering::Release);
+        if version == 0 {
+            self.short_read_source_attr_version
+                .store(u64::MAX, Ordering::Release);
+            self.short_read_chain_attr_version
+                .store(u64::MAX, Ordering::Release);
+        }
+        version
+    }
+
+    pub(crate) fn invalidate_cached_metadata(&self) {
+        self.bump_attr_version();
+        self.cached_metadata_deadline_ticks
+            .store(0, Ordering::Release);
+    }
+
+    /// Publish a successful namespace link-count mutation locally. FUSE
+    /// unlink/rmdir replies carry no attributes, so waiting for GETATTR would
+    /// leave stale nlink state and race an older reply over the mutation.
+    pub(crate) fn note_link_removed(
+        &self,
+        directory: bool,
+    ) -> Result<LinkRemovalOutcome, SystemError> {
+        let mut metadata = self.cached_metadata.lock();
+        let md = metadata.as_mut().ok_or(SystemError::EIO)?;
+        md.nlinks = if directory {
+            0
+        } else {
+            md.nlinks.checked_sub(1).ok_or(SystemError::EIO)?
+        };
+        let outcome = if md.nlinks == 0 {
+            LinkRemovalOutcome::LastLink
+        } else {
+            LinkRemovalOutcome::StillLinked
+        };
+        self.bump_attr_version();
+        self.cached_metadata_deadline_ticks
+            .store(0, Ordering::Release);
+        Ok(outcome)
+    }
+
+    /// 累计该 inode 在 userspace daemon 侧持有的 LOOKUP 引用。
+    ///
+    /// 对齐 Linux：每个成功的 LOOKUP/READDIRPLUS entry 都必须被记账，并在 inode
+    /// 释放或卸载时用对应的 `FUSE_FORGET(nlookup=...)` 归还。打开的文件句柄会在
+    /// `FuseOpenPrivateData` 中持有 `Arc<FuseNode>`，避免 fd 存活期间过早 FORGET。
     pub fn inc_lookup(&self, count: u64) {
         if self.nodeid == FUSE_ROOT_ID || count == 0 {
             return;
@@ -108,42 +1397,97 @@ impl FuseNode {
         let _ = self.conn.queue_forget(self.nodeid, nlookup);
     }
 
-    fn now_ns() -> u64 {
-        ktime_get_real_ns().max(0) as u64
+    fn now_ticks() -> u64 {
+        // FUSE cache expiry is an elapsed-time deadline, not wall-clock time.
+        // Match Linux fuse_time_to_jiffies(): use the monotonic timer tick
+        // counter so each hot-path attr/entry-cache check is an in-memory read
+        // and settimeofday cannot extend or prematurely expire the cache.
+        clock()
     }
 
-    fn cache_deadline(valid: u64, valid_nsec: u32) -> u64 {
+    fn cache_timeout_ticks(valid: u64, valid_nsec: u32) -> u64 {
         if valid == 0 && valid_nsec == 0 {
             return 0;
         }
-        let delta_ns = valid
-            .saturating_mul(1_000_000_000)
-            .saturating_add(valid_nsec as u64);
-        Self::now_ns().saturating_add(delta_ns)
+
+        // Linux clamps the daemon-provided nanosecond component before
+        // converting the relative timeout to jiffies.  Calculate in u128 so a
+        // malformed, extremely large finite timeout cannot overflow into the
+        // u64::MAX sentinel reserved for kernel-owned permanent snapshots.
+        let nsec = valid_nsec.min(NSEC_PER_SEC - 1) as u128;
+        let delta_ns = (valid as u128)
+            .saturating_mul(NSEC_PER_SEC as u128)
+            .saturating_add(nsec);
+        delta_ns
+            .div_ceil(NSEC_PER_JIFFY as u128)
+            .min((u64::MAX - 1) as u128) as u64
     }
 
-    fn conn(&self) -> &Arc<FuseConn> {
+    fn cache_deadline(valid: u64, valid_nsec: u32) -> u64 {
+        let delta_ticks = Self::cache_timeout_ticks(valid, valid_nsec);
+        if delta_ticks == 0 {
+            return 0;
+        }
+        Self::now_ticks()
+            .checked_add(delta_ticks)
+            .filter(|deadline| *deadline < u64::MAX)
+            .unwrap_or(u64::MAX - 1)
+    }
+
+    pub(crate) fn conn(&self) -> &Arc<FuseConn> {
         &self.conn
     }
 
-    fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<Vec<u8>, SystemError> {
-        let payload = Self::pack_name_payload(name);
+    pub(crate) fn fuse_fs(&self) -> Option<Arc<FuseFS>> {
+        self.fs.upgrade()
+    }
+
+    fn request_name(&self, opcode: u32, nodeid: u64, name: &str) -> Result<FuseReply, SystemError> {
+        self.request_name_bytes(opcode, nodeid, name.as_bytes())
+    }
+
+    fn request_name_bytes(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        name: &[u8],
+    ) -> Result<FuseReply, SystemError> {
+        self.check_not_stale()?;
+        let mut payload = Vec::with_capacity(name.len() + 1);
+        payload.extend_from_slice(name);
+        payload.push(0);
         self.conn().request(opcode, nodeid, &payload)
     }
 
-    fn pack_name_payload(name: &str) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(name.len() + 1);
-        payload.extend_from_slice(name.as_bytes());
+    fn pack_struct_and_name_payload<T: Copy>(inarg: &T, name: &str) -> Vec<u8> {
+        Self::pack_struct_and_name_bytes_payload(inarg, name.as_bytes())
+    }
+
+    fn pack_struct_and_name_bytes_payload<T: Copy>(inarg: &T, name: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(size_of::<T>() + name.len() + 1);
+        payload.extend_from_slice(fuse_pack_struct(inarg));
+        payload.extend_from_slice(name);
         payload.push(0);
         payload
     }
 
-    fn pack_struct_and_name_payload<T: Copy>(inarg: &T, name: &str) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(size_of::<T>() + name.len() + 1);
-        payload.extend_from_slice(fuse_pack_struct(inarg));
-        payload.extend_from_slice(name.as_bytes());
-        payload.push(0);
-        payload
+    fn fuse_xattr_unsupported(&self, opcode: u32) -> SystemError {
+        self.conn.mark_no_xattr(opcode);
+        SystemError::EOPNOTSUPP_OR_ENOTSUP
+    }
+
+    fn verify_xattr_list(list: &[u8]) -> Result<(), SystemError> {
+        let mut idx = 0usize;
+        while idx < list.len() {
+            let Some(end) = list[idx..].iter().position(|b| *b == 0) else {
+                return Err(SystemError::EIO);
+            };
+            if end == 0 {
+                return Err(SystemError::EIO);
+            }
+            idx += end + 1;
+        }
+        Ok(())
     }
 
     fn pack_two_names_payload(first: &str, second: &str) -> Vec<u8> {
@@ -155,137 +1499,41 @@ impl FuseNode {
         payload
     }
 
-    fn set_open_private_data(
-        &self,
-        data: &mut FilePrivateData,
-        opcode: u32,
-        fh: u64,
-        open_flags: u32,
-        no_open: bool,
-    ) -> Result<(), SystemError> {
-        let conn_any: Arc<dyn core::any::Any + Send + Sync> = self.conn.clone();
-        *data = match opcode {
-            FUSE_OPEN => FilePrivateData::Fuse(FuseFilePrivateData::File(FuseOpenPrivateData {
-                conn: conn_any,
-                fh,
-                open_flags,
-                no_open,
-            })),
-            FUSE_OPENDIR => FilePrivateData::Fuse(FuseFilePrivateData::Dir(FuseOpenPrivateData {
-                conn: conn_any,
-                fh,
-                open_flags,
-                no_open,
-            })),
-            _ => return Err(SystemError::EINVAL),
-        };
-        Ok(())
+    fn entry_file_type(attr: &FuseAttr) -> Result<FileType, SystemError> {
+        let mode = InodeMode::from_bits_truncate(attr.mode);
+        match mode & InodeMode::S_IFMT {
+            t if t == InodeMode::S_IFDIR => Ok(FileType::Dir),
+            t if t == InodeMode::S_IFREG => Ok(FileType::File),
+            t if t == InodeMode::S_IFLNK => Ok(FileType::SymLink),
+            t if t == InodeMode::S_IFCHR => Ok(FileType::CharDevice),
+            t if t == InodeMode::S_IFBLK => Ok(FileType::BlockDevice),
+            t if t == InodeMode::S_IFSOCK => Ok(FileType::Socket),
+            t if t == InodeMode::S_IFIFO => Ok(FileType::Pipe),
+            _ => Err(SystemError::EIO),
+        }
     }
 
-    fn align_dirent_record_len(base_len: usize) -> usize {
-        (base_len + Self::FUSE_DIRENT_ALIGN - 1) & !(Self::FUSE_DIRENT_ALIGN - 1)
-    }
-
-    fn cache_child_from_entry(&self, entry: &FuseEntryOut) {
+    fn metadata_from_valid_entry(
+        entry: &FuseEntryOut,
+        zero_nodeid_error: SystemError,
+        expected_type: Option<FileType>,
+    ) -> Result<Metadata, SystemError> {
         if entry.nodeid == 0 {
-            return;
+            return Err(zero_nodeid_error);
         }
-        if let Some(fs) = self.fs.upgrade() {
-            let md = Self::attr_to_metadata(&entry.attr);
-            let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md.clone()));
-            child.inc_lookup(1);
-            child.set_cached_metadata_with_valid(md, entry.attr_valid, entry.attr_valid_nsec);
+        if entry.attr.size > i64::MAX as u64 {
+            return Err(SystemError::EIO);
         }
-    }
-
-    fn parse_readdirplus_payload(
-        &self,
-        payload: &[u8],
-        names: &mut Vec<String>,
-        mut last_off: u64,
-    ) -> Result<u64, SystemError> {
-        let mut pos: usize = 0;
-        while pos + size_of::<FuseDirentPlus>() <= payload.len() {
-            let plus: FuseDirentPlus = fuse_read_struct(&payload[pos..])?;
-            let dirent = plus.dirent;
-            let name_start = pos + size_of::<FuseDirentPlus>();
-            let name_end = name_start + dirent.namelen as usize;
-            if name_end > payload.len() {
-                break;
-            }
-
-            let name_bytes = &payload[name_start..name_end];
-            if let Ok(name) = core::str::from_utf8(name_bytes) {
-                if !name.is_empty() && name != "." && name != ".." {
-                    names.push(name.to_string());
-                    self.cache_child_from_entry(&plus.entry_out);
-                }
-            }
-
-            last_off = dirent.off;
-            let rec_len = Self::align_dirent_record_len(
-                size_of::<FuseDirentPlus>() + dirent.namelen as usize,
-            );
-            if rec_len == 0 {
-                break;
-            }
-            pos = pos.saturating_add(rec_len);
+        let file_type = Self::entry_file_type(&entry.attr)?;
+        if expected_type.is_some_and(|expected| expected != file_type) {
+            return Err(SystemError::EIO);
         }
-        Ok(last_off)
-    }
-
-    fn parse_readdir_payload(
-        payload: &[u8],
-        names: &mut Vec<String>,
-        mut last_off: u64,
-    ) -> Result<u64, SystemError> {
-        let mut pos: usize = 0;
-        while pos + size_of::<FuseDirent>() <= payload.len() {
-            let dirent: FuseDirent = fuse_read_struct(&payload[pos..])?;
-            let name_start = pos + size_of::<FuseDirent>();
-            let name_end = name_start + dirent.namelen as usize;
-            if name_end > payload.len() {
-                break;
-            }
-
-            let name_bytes = &payload[name_start..name_end];
-            if let Ok(name) = core::str::from_utf8(name_bytes) {
-                if !name.is_empty() && name != "." && name != ".." {
-                    names.push(name.to_string());
-                }
-            }
-
-            last_off = dirent.off;
-            let rec_len =
-                Self::align_dirent_record_len(size_of::<FuseDirent>() + dirent.namelen as usize);
-            if rec_len == 0 {
-                break;
-            }
-            pos = pos.saturating_add(rec_len);
-        }
-        Ok(last_off)
+        Ok(Self::attr_to_metadata(&entry.attr))
     }
 
     fn attr_to_metadata(attr: &FuseAttr) -> Metadata {
         let mode = InodeMode::from_bits_truncate(attr.mode);
-        let ifmt = mode.bits() & InodeMode::S_IFMT.bits();
-        let file_type = if ifmt == InodeMode::S_IFDIR.bits() {
-            FileType::Dir
-        } else if ifmt == InodeMode::S_IFREG.bits() {
-            FileType::File
-        } else if ifmt == InodeMode::S_IFLNK.bits() {
-            FileType::SymLink
-        } else if ifmt == InodeMode::S_IFCHR.bits() {
-            FileType::CharDevice
-        } else if ifmt == InodeMode::S_IFBLK.bits() {
-            FileType::BlockDevice
-        } else if ifmt == InodeMode::S_IFSOCK.bits() {
-            FileType::Socket
-        } else if ifmt == InodeMode::S_IFIFO.bits() {
-            FileType::Pipe
-        } else {
-            FileType::File
-        };
+        let file_type = Self::entry_file_type(attr).unwrap_or(FileType::File);
 
         let inode_id = InodeId::new(attr.ino as usize);
 
@@ -301,7 +1549,7 @@ impl FuseNode {
             btime: PosixTimeSpec::default(),
             file_type,
             mode,
-            flags: InodeFlags::empty(),
+            flags: InodeFlags::S_NOATIME,
             nlinks: attr.nlink as usize,
             uid: attr.uid as usize,
             gid: attr.gid as usize,
@@ -309,689 +1557,191 @@ impl FuseNode {
         }
     }
 
-    fn fetch_attr(&self) -> Result<Metadata, SystemError> {
-        let getattr_in = FuseGetattrIn {
-            getattr_flags: 0,
-            dummy: 0,
-            fh: 0,
-        };
+    fn fetch_attr_with_file_handle(&self, fh: Option<u64>) -> Result<Metadata, SystemError> {
+        self.check_not_stale()?;
+        let request_epoch = self.conn.sample_attr_epoch();
+        let getattr_in = getattr_request_input(fh);
         let payload =
             self.conn()
                 .request(FUSE_GETATTR, self.nodeid, fuse_pack_struct(&getattr_in))?;
         let out: FuseAttrOut = fuse_read_struct(&payload)?;
         let md = Self::attr_to_metadata(&out.attr);
-        self.set_cached_metadata_with_valid(md.clone(), out.attr_valid, out.attr_valid_nsec);
-        Ok(md)
+        Ok(self.merge_cached_metadata_from_daemon(
+            md,
+            out.attr_valid,
+            out.attr_valid_nsec,
+            request_epoch,
+            out.attr.flags,
+        ))
+    }
+
+    /// Direct-I/O WRITE flags describe the primary caller, including DAX
+    /// growth fallback. Background WRITE_CACHE requests must not use them.
+    fn direct_write_flags(lock_owner: u64) -> u32 {
+        let mut flags = if lock_owner == 0 {
+            0
+        } else {
+            FUSE_WRITE_LOCKOWNER
+        };
+        if !crate::process::ProcessManager::current_pcb()
+            .cred()
+            .has_capability_in_ns(
+                &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+                crate::process::cred::CAPFlags::CAP_FSETID,
+            )
+        {
+            flags |= FUSE_WRITE_KILL_SUIDGID;
+        }
+        flags
+    }
+
+    fn fetch_attr(&self) -> Result<Metadata, SystemError> {
+        self.fetch_attr_with_file_handle(None)
     }
 
     fn cached_or_fetch_metadata(&self) -> Result<Metadata, SystemError> {
         self.conn.check_allow_current_process()?;
+        self.cached_or_fetch_metadata_with_file_handle(None)
+    }
+
+    fn cached_or_fetch_metadata_with_file_handle(
+        &self,
+        fh: Option<u64>,
+    ) -> Result<Metadata, SystemError> {
         if let Some(m) = self.cached_metadata.lock().clone() {
-            let deadline = self.cached_metadata_deadline_ns.load(Ordering::Relaxed);
-            if deadline == u64::MAX || (deadline != 0 && Self::now_ns() < deadline) {
+            let deadline = self.cached_metadata_deadline_ticks.load(Ordering::Relaxed);
+            if deadline == u64::MAX || (deadline != 0 && Self::now_ticks() < deadline) {
                 return Ok(m);
             }
         }
-        self.fetch_attr()
+        match fh {
+            Some(fh) => self.fetch_attr_with_file_handle(Some(fh)),
+            None => self.fetch_attr(),
+        }
     }
 
-    fn open_common(
+    /// Refresh attributes for I/O issued through an already-open file.
+    ///
+    /// Mount permission was checked when the file was opened.  Linux's
+    /// `fuse_update_attributes()` does not repeat that check for every cached
+    /// read, but it still honors the attribute timeout and may issue GETATTR.
+    pub(crate) fn update_cached_metadata_for_open_io(
         &self,
-        opcode: u32,
-        data: &mut FilePrivateData,
-        flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        if self.conn.should_skip_open(opcode) {
-            return self.set_open_private_data(data, opcode, 0, flags.bits(), true);
+        cached: Metadata,
+        fh: u64,
+    ) -> Result<Metadata, SystemError> {
+        // `read_at()` already took the inode metadata snapshot needed for the
+        // cached EOF/type checks. Re-locking the sleeping metadata mutex here
+        // for every AUTO_INVAL_DATA read dominates 4 KiB cached I/O. The TTL is
+        // independently published, so reuse that snapshot while it remains
+        // valid and issue GETATTR_FH only after expiry.
+        let deadline = self.cached_metadata_deadline_ticks.load(Ordering::Acquire);
+        if deadline == u64::MAX || (deadline != 0 && Self::now_ticks() < deadline) {
+            return Ok(cached);
         }
-
-        let open_in = FuseOpenIn {
-            flags: flags.bits(),
-            open_flags: 0,
-        };
-        let payload = match self
-            .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&open_in))
-        {
-            Ok(v) => v,
-            Err(SystemError::ENOSYS) if self.conn.open_enosys_is_supported(opcode) => {
-                self.conn.mark_no_open(opcode);
-                return self.set_open_private_data(data, opcode, 0, open_in.flags, true);
-            }
-            Err(e) => return Err(e),
-        };
-        let out: FuseOpenOut = fuse_read_struct(&payload)?;
-        self.set_open_private_data(data, opcode, out.fh, open_in.flags, false)
-    }
-
-    fn release_common(&self, opcode: u32, fh: u64, open_flags: u32) -> Result<(), SystemError> {
-        let inarg = FuseReleaseIn {
-            fh,
-            flags: open_flags,
-            release_flags: 0,
-            lock_owner: 0,
-        };
-        let _ = self
-            .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
-    }
-
-    fn ensure_dir(&self) -> Result<(), SystemError> {
-        let md = self.cached_or_fetch_metadata()?;
-        if md.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        Ok(())
-    }
-
-    fn ensure_regular(&self) -> Result<(), SystemError> {
-        let md = self.cached_or_fetch_metadata()?;
-        if md.file_type != FileType::File {
-            return Err(SystemError::EINVAL);
-        }
-        Ok(())
-    }
-
-    fn fsync_common(&self, datasync: bool) -> Result<(), SystemError> {
-        let md = self.cached_or_fetch_metadata()?;
-        let opcode = match md.file_type {
-            FileType::File => FUSE_FSYNC,
-            FileType::Dir => FUSE_FSYNCDIR,
-            _ => return Ok(()),
-        };
-        let inarg = FuseFsyncIn {
-            fh: 0,
-            fsync_flags: if datasync { FUSE_FSYNC_FDATASYNC } else { 0 },
-            padding: 0,
-        };
-        let _ = self
-            .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
-    }
-
-    fn fsync_with_file_data(
-        &self,
-        datasync: bool,
-        data: &FilePrivateData,
-    ) -> Result<(), SystemError> {
-        let (opcode, fh, no_open) = match data {
-            FilePrivateData::Fuse(FuseFilePrivateData::File(p)) => (FUSE_FSYNC, p.fh, p.no_open),
-            FilePrivateData::Fuse(FuseFilePrivateData::Dir(p)) => (FUSE_FSYNCDIR, p.fh, p.no_open),
-            _ => return self.fsync_common(datasync),
-        };
-
-        // Linux 对 no_open/no_opendir 语义允许缺省 open，fh 不可靠，直接成功返回。
-        if no_open {
-            return Ok(());
-        }
-
-        let inarg = FuseFsyncIn {
-            fh,
-            fsync_flags: if datasync { FUSE_FSYNC_FDATASYNC } else { 0 },
-            padding: 0,
-        };
-        let _ = self
-            .conn()
-            .request(opcode, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
-    }
-
-    fn parse_create_reply(payload: &[u8]) -> Result<(FuseEntryOut, FuseOpenOut), SystemError> {
-        let entry_size = size_of::<FuseEntryOut>();
-        let open_size = size_of::<FuseOpenOut>();
-        if payload.len() < entry_size + open_size {
-            return Err(SystemError::EINVAL);
-        }
-        let entry: FuseEntryOut = fuse_read_struct(&payload[..entry_size])?;
-        let open_out: FuseOpenOut = fuse_read_struct(&payload[entry_size..entry_size + open_size])?;
-        Ok((entry, open_out))
-    }
-
-    fn create_node_from_entry(
-        &self,
-        entry: &FuseEntryOut,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let md = Self::attr_to_metadata(&entry.attr);
-        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
-        child.inc_lookup(1);
-        child.set_cached_metadata_with_valid(
-            Self::attr_to_metadata(&entry.attr),
-            entry.attr_valid,
-            entry.attr_valid_nsec,
-        );
-        Ok(child)
-    }
-}
-
-impl IndexNode for FuseNode {
-    fn as_any_ref(&self) -> &dyn core::any::Any {
-        self
-    }
-
-    fn open(
-        &self,
-        mut data: MutexGuard<FilePrivateData>,
-        flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        let md = self.cached_or_fetch_metadata()?;
-        match md.file_type {
-            FileType::Dir => self.open_common(FUSE_OPENDIR, &mut data, flags),
-            FileType::File => self.open_common(FUSE_OPEN, &mut data, flags),
-            _ => Err(SystemError::EINVAL),
-        }
-    }
-
-    fn close(&self, data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
-        // `IndexNode::close()` is called from `File::drop()`, i.e. after the
-        // last `Arc<File>` reference is gone.  FUSE file/dir private data is
-        // immutable after open, so taking a snapshot here is not a TOCTOU
-        // window; it prevents holding the private-data mutex while waiting for
-        // userspace to reply to FLUSH/RELEASE.
-        let fuse_data = match &*data {
-            FilePrivateData::Fuse(data) => data.clone(),
-            _ => return Ok(()),
-        };
-        drop(data);
-
-        match fuse_data {
-            FuseFilePrivateData::File(p) => {
-                if p.no_open {
-                    return Ok(());
-                }
-                let flush_in = FuseFlushIn {
-                    fh: p.fh,
-                    unused: 0,
-                    padding: 0,
-                    lock_owner: 0,
-                };
-                let _ = self
-                    .conn()
-                    .request(FUSE_FLUSH, self.nodeid, fuse_pack_struct(&flush_in));
-                self.release_common(FUSE_RELEASE, p.fh, p.open_flags)
-            }
-            FuseFilePrivateData::Dir(p) => {
-                if p.no_open {
-                    Ok(())
-                } else {
-                    self.release_common(FUSE_RELEASEDIR, p.fh, p.open_flags)
-                }
-            }
-            FuseFilePrivateData::Dev(_) => Ok(()),
-        }
-    }
-
-    fn read_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-        let md = self.cached_or_fetch_metadata()?;
-        if md.file_type == FileType::SymLink {
-            if offset != 0 {
-                return Ok(0);
-            }
-            let payload = self.conn().request(FUSE_READLINK, self.nodeid, &[])?;
-            let n = core::cmp::min(payload.len(), len);
-            buf[..n].copy_from_slice(&payload[..n]);
-            return Ok(n);
-        }
-        self.ensure_regular()?;
-        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
-            return Err(SystemError::EBADF);
-        };
-        let read_in = FuseReadIn {
-            fh: p.fh,
-            offset: offset as u64,
-            size: len as u32,
-            read_flags: 0,
-            lock_owner: 0,
-            flags: 0,
-            padding: 0,
-        };
-        let payload = self
-            .conn()
-            .request(FUSE_READ, self.nodeid, fuse_pack_struct(&read_in))?;
-        let n = core::cmp::min(payload.len(), len);
-        buf[..n].copy_from_slice(&payload[..n]);
-        Ok(n)
-    }
-
-    fn write_at(
-        &self,
-        offset: usize,
-        len: usize,
-        buf: &[u8],
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        self.ensure_regular()?;
-        if buf.len() < len {
-            return Err(SystemError::EINVAL);
-        }
-        let FilePrivateData::Fuse(FuseFilePrivateData::File(p)) = &*data else {
-            return Err(SystemError::EBADF);
-        };
-        let max_write = self.conn().max_write();
-        let mut total_written = 0usize;
-
-        while total_written < len {
-            let chunk = core::cmp::min(max_write, len - total_written);
-            let chunk_offset = offset
-                .checked_add(total_written)
-                .ok_or(SystemError::EOVERFLOW)?;
-
-            let write_in = FuseWriteIn {
-                fh: p.fh,
-                offset: chunk_offset as u64,
-                size: chunk as u32,
-                write_flags: 0,
-                lock_owner: 0,
-                flags: 0,
-                padding: 0,
-            };
-            let mut payload_in = Vec::with_capacity(size_of::<FuseWriteIn>() + chunk);
-            payload_in.extend_from_slice(fuse_pack_struct(&write_in));
-            payload_in.extend_from_slice(&buf[total_written..total_written + chunk]);
-            let payload = self.conn().request(FUSE_WRITE, self.nodeid, &payload_in)?;
-            let out: FuseWriteOut = fuse_read_struct(&payload)?;
-            let wrote = core::cmp::min(out.size as usize, chunk);
-            total_written += wrote;
-            if wrote < chunk {
-                break;
-            }
-        }
-
-        Ok(total_written)
-    }
-
-    fn metadata(&self) -> Result<Metadata, SystemError> {
-        self.cached_or_fetch_metadata()
-    }
-
-    fn check_access(&self, mask: PermissionMask) -> Result<(), SystemError> {
-        let inarg = FuseAccessIn {
-            mask: mask.bits() & PermissionMask::MAY_RWX.bits(),
-            padding: 0,
-        };
-        let _ = self
-            .conn()
-            .request(FUSE_ACCESS, self.nodeid, fuse_pack_struct(&inarg))?;
-        Ok(())
-    }
-
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let old = self.cached_or_fetch_metadata()?;
-        let mut valid = 0u32;
-        if metadata.mode != old.mode {
-            valid |= FATTR_MODE;
-        }
-        if metadata.uid != old.uid {
-            valid |= FATTR_UID;
-        }
-        if metadata.gid != old.gid {
-            valid |= FATTR_GID;
-        }
-        if metadata.size != old.size {
-            valid |= FATTR_SIZE;
-        }
-        if metadata.atime != old.atime {
-            valid |= FATTR_ATIME;
-        }
-        if metadata.mtime != old.mtime {
-            valid |= FATTR_MTIME;
-        }
-        if metadata.ctime != old.ctime {
-            valid |= FATTR_CTIME;
-        }
-        if valid == 0 {
-            return Ok(());
-        }
-
-        let inarg = FuseSetattrIn {
-            valid,
-            padding: 0,
-            fh: 0,
-            size: metadata.size as u64,
-            lock_owner: 0,
-            atime: metadata.atime.tv_sec as u64,
-            mtime: metadata.mtime.tv_sec as u64,
-            ctime: metadata.ctime.tv_sec as u64,
-            atimensec: metadata.atime.tv_nsec as u32,
-            mtimensec: metadata.mtime.tv_nsec as u32,
-            ctimensec: metadata.ctime.tv_nsec as u32,
-            mode: metadata.mode.bits(),
-            unused4: 0,
-            uid: metadata.uid as u32,
-            gid: metadata.gid as u32,
-            unused5: 0,
-        };
-        let payload = self
-            .conn()
-            .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
-        let out: FuseAttrOut = fuse_read_struct(&payload)?;
-        let md = Self::attr_to_metadata(&out.attr);
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
-        Ok(())
-    }
-
-    fn resize(&self, len: usize) -> Result<(), SystemError> {
-        let inarg = FuseSetattrIn {
-            valid: FATTR_SIZE,
-            padding: 0,
-            fh: 0,
-            size: len as u64,
-            lock_owner: 0,
-            atime: 0,
-            mtime: 0,
-            ctime: 0,
-            atimensec: 0,
-            mtimensec: 0,
-            ctimensec: 0,
-            mode: 0,
-            unused4: 0,
-            uid: 0,
-            gid: 0,
-            unused5: 0,
-        };
-        let payload = self
-            .conn()
-            .request(FUSE_SETATTR, self.nodeid, fuse_pack_struct(&inarg))?;
-        let out: FuseAttrOut = fuse_read_struct(&payload)?;
-        let md = Self::attr_to_metadata(&out.attr);
-        self.set_cached_metadata_with_valid(md, out.attr_valid, out.attr_valid_nsec);
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<(), SystemError> {
-        self.fsync_common(false)
-    }
-
-    fn datasync(&self) -> Result<(), SystemError> {
-        self.fsync_common(true)
-    }
-
-    fn sync_file(
-        &self,
-        datasync: bool,
-        data: MutexGuard<FilePrivateData>,
-    ) -> Result<(), SystemError> {
-        self.fsync_with_file_data(datasync, &data)
-    }
-
-    fn fs(&self) -> Arc<dyn FileSystem> {
-        self.fs.upgrade().unwrap()
-    }
-
-    fn list(&self) -> Result<Vec<String>, SystemError> {
-        self.ensure_dir()?;
-
-        // OPENDIR
-        let mut pdata = FilePrivateData::Unused;
-        let flags = FileFlags::O_RDONLY;
-        self.open_common(FUSE_OPENDIR, &mut pdata, &flags)?;
-        let FilePrivateData::Fuse(FuseFilePrivateData::Dir(dir_p)) = &pdata else {
-            return Err(SystemError::EINVAL);
-        };
-        let fh = dir_p.fh;
-        let open_flags = dir_p.open_flags;
-        let mut use_readdirplus = self.conn.use_readdirplus();
-
-        let mut names: Vec<String> = Vec::new();
-        let mut offset: u64 = 0;
-
-        loop {
-            let read_in = FuseReadIn {
-                fh,
-                offset,
-                size: 64 * 1024,
-                read_flags: 0,
-                lock_owner: 0,
-                flags: 0,
-                padding: 0,
-            };
-            let opcode = if use_readdirplus {
-                FUSE_READDIRPLUS
-            } else {
-                FUSE_READDIR
-            };
-            let payload = match self
-                .conn()
-                .request(opcode, self.nodeid, fuse_pack_struct(&read_in))
-            {
-                Ok(v) => v,
-                Err(SystemError::ENOSYS) if use_readdirplus => {
-                    self.conn.disable_readdirplus();
-                    use_readdirplus = false;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            if payload.is_empty() {
-                break;
-            }
-
-            let mut last_off: u64 = offset;
-            if use_readdirplus {
-                last_off = self.parse_readdirplus_payload(&payload, &mut names, last_off)?;
-            } else {
-                last_off = Self::parse_readdir_payload(&payload, &mut names, last_off)?;
-            }
-
-            if last_off == offset {
-                // Avoid infinite loop if userspace doesn't advance offsets.
-                break;
-            }
-            offset = last_off;
-        }
-
-        // RELEASEDIR (best-effort)
-        if !dir_p.no_open {
-            let _ = self.release_common(FUSE_RELEASEDIR, fh, open_flags);
-        }
-        Ok(names)
-    }
-
-    fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_dir()?;
-        if name == "." {
-            let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-            return Ok(fs.get_or_create_node(self.nodeid, *self.parent_nodeid.lock(), None));
-        }
-        if name == ".." {
-            return self.parent();
-        }
-
-        let payload = self.request_name(FUSE_LOOKUP, self.nodeid, name)?;
-        let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        let md = Self::attr_to_metadata(&entry.attr);
-
-        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let child = fs.get_or_create_node(entry.nodeid, self.nodeid, Some(md));
-        child.inc_lookup(1);
-        child.set_cached_metadata_with_valid(
-            Self::attr_to_metadata(&entry.attr),
-            entry.attr_valid,
-            entry.attr_valid_nsec,
-        );
-        Ok(child)
-    }
-
-    fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let fs = self.fs.upgrade().ok_or(SystemError::ENOENT)?;
-        let parent_nodeid = *self.parent_nodeid.lock();
-        if parent_nodeid == self.nodeid {
-            return Ok(fs.root_node());
-        }
-        Ok(fs.get_or_create_node(parent_nodeid, parent_nodeid, None))
-    }
-
-    fn create(
-        &self,
-        name: &str,
-        file_type: FileType,
-        mode: InodeMode,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_dir()?;
-        if file_type != FileType::File {
-            return self.create_with_data(name, file_type, mode, 0);
-        }
-
-        let inarg = FuseCreateIn {
-            flags: FileFlags::O_RDONLY.bits(),
-            mode: (InodeMode::S_IFREG | mode).bits(),
-            umask: 0,
-            open_flags: 0,
-        };
-        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
-
-        let payload = match self.conn().request(FUSE_CREATE, self.nodeid, &payload_in) {
-            Ok(v) => v,
-            Err(SystemError::ENOSYS) => return self.create_with_data(name, file_type, mode, 0),
-            Err(e) => return Err(e),
-        };
-        let (entry, _) = Self::parse_create_reply(&payload)?;
-        self.create_node_from_entry(&entry)
-    }
-
-    fn create_with_data(
-        &self,
-        name: &str,
-        file_type: FileType,
-        mode: InodeMode,
-        _data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_dir()?;
-
-        match file_type {
-            FileType::Dir => {
-                let inarg = FuseMkdirIn {
-                    mode: (InodeMode::S_IFDIR | mode).bits(),
-                    umask: 0,
-                };
-                let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
-                let payload = self.conn().request(FUSE_MKDIR, self.nodeid, &payload_in)?;
-                let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry)
-            }
-            FileType::File => {
-                let inarg = FuseMknodIn {
-                    mode: (InodeMode::S_IFREG | mode).bits(),
-                    rdev: 0,
-                    umask: 0,
-                    padding: 0,
-                };
-                let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
-                let payload = self.conn().request(FUSE_MKNOD, self.nodeid, &payload_in)?;
-                let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry)
-            }
-            FileType::SymLink => {
-                let mut payload_in = Vec::with_capacity(name.len() + 2);
-                payload_in.push(0);
-                payload_in.extend_from_slice(name.as_bytes());
-                payload_in.push(0);
-                let payload = self
-                    .conn()
-                    .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
-                let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-                self.create_node_from_entry(&entry)
-            }
-            _ => Err(SystemError::ENOSYS),
-        }
-    }
-
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
-        self.ensure_dir()?;
-        let payload_in = Self::pack_two_names_payload(target, name);
-        let payload = self
-            .conn()
-            .request(FUSE_SYMLINK, self.nodeid, &payload_in)?;
-        let entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        self.create_node_from_entry(&entry)
-    }
-
-    fn link(&self, name: &str, other: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
-        self.ensure_dir()?;
-        let target = other
-            .as_any_ref()
-            .downcast_ref::<FuseNode>()
-            .ok_or(SystemError::EXDEV)?;
-        let inarg = FuseLinkIn {
-            oldnodeid: target.nodeid,
-        };
-        let payload_in = Self::pack_struct_and_name_payload(&inarg, name);
-        let payload = self.conn().request(FUSE_LINK, self.nodeid, &payload_in)?;
-        let _entry: FuseEntryOut = fuse_read_struct(&payload)?;
-        Ok(())
-    }
-
-    fn unlink(&self, name: &str) -> Result<(), SystemError> {
-        self.ensure_dir()?;
-        let _ = self.request_name(FUSE_UNLINK, self.nodeid, name)?;
-        Ok(())
-    }
-
-    fn rmdir(&self, name: &str) -> Result<(), SystemError> {
-        self.ensure_dir()?;
-        let _ = self.request_name(FUSE_RMDIR, self.nodeid, name)?;
-        Ok(())
-    }
-
-    fn move_to(
-        &self,
-        old_name: &str,
-        target: &Arc<dyn IndexNode>,
-        new_name: &str,
-        flag: RenameFlags,
-    ) -> Result<(), SystemError> {
-        self.ensure_dir()?;
-        let target_any = target
-            .as_any_ref()
-            .downcast_ref::<FuseNode>()
-            .ok_or(SystemError::EXDEV)?;
-
-        let mut payload_in = Vec::new();
-        let opcode = if flag.is_empty() {
-            let inarg = FuseRenameIn {
-                newdir: target_any.nodeid,
-            };
-            payload_in.extend_from_slice(fuse_pack_struct(&inarg));
-            FUSE_RENAME
-        } else {
-            let inarg = FuseRename2In {
-                newdir: target_any.nodeid,
-                flags: flag.bits(),
-                padding: 0,
-            };
-            payload_in.extend_from_slice(fuse_pack_struct(&inarg));
-            FUSE_RENAME2
-        };
-        payload_in.extend_from_slice(old_name.as_bytes());
-        payload_in.push(0);
-        payload_in.extend_from_slice(new_name.as_bytes());
-        payload_in.push(0);
-        let r = self.conn().request(opcode, self.nodeid, &payload_in);
-        if opcode == FUSE_RENAME2 && matches!(r, Err(SystemError::ENOSYS)) {
-            return Err(SystemError::EINVAL);
-        }
-        let _ = r?;
-        Ok(())
-    }
-
-    fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(format!("fuse:{}", self.nodeid))
+        self.fetch_attr_with_file_handle(Some(fh))
     }
 }
 
 impl Drop for FuseNode {
     fn drop(&mut self) {
+        if self.dax_active() {
+            let revoke = if self.conn.dax_admission_state() == DaxAdmissionState::Active {
+                match self.dax_teardown() {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        log::warn!(
+                            "fuse: inode {} dropped with DAX teardown error: {:?}",
+                            self.nodeid,
+                            error
+                        );
+                        // The daemon did not confirm removal. Revoke local
+                        // PTEs/tree and retire the ranges before unregistering.
+                        self.dax_abandon_mappings()
+                    }
+                }
+            } else {
+                self.dax_disconnect_revoke()
+            };
+            if let Err(ref error) = revoke {
+                log::warn!(
+                    "fuse: inode {} dropped with local DAX revoke error: {:?}",
+                    self.nodeid,
+                    error
+                );
+            }
+            if self.conn.dax_admission_state() != DaxAdmissionState::Active || revoke.is_err() {
+                self.conn
+                    .finish_dax_node_drop(self.dax_mapping_owner(), revoke);
+            } else {
+                self.conn.unregister_dax_node(self.dax_mapping_owner());
+            }
+        }
+        self.clear_lookup_cache_tree();
         self.flush_forget();
+        self.clear_parent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn getattr_request_uses_fh_only_for_open_file_queries() {
+        let path_query = getattr_request_input(None);
+        assert_eq!(path_query.getattr_flags, 0);
+        assert_eq!(path_query.fh, 0);
+
+        let open_file_query = getattr_request_input(Some(0x1234_5678));
+        assert_eq!(open_file_query.getattr_flags, FUSE_GETATTR_FH);
+        assert_eq!(open_file_query.fh, 0x1234_5678);
+    }
+
+    #[test]
+    fn cache_timeout_matches_linux_jiffy_and_nsec_rules() {
+        assert_eq!(FuseNode::cache_timeout_ticks(0, 0), 0);
+        assert_eq!(FuseNode::cache_timeout_ticks(0, 1), 1);
+
+        let clamped = FuseNode::cache_timeout_ticks(0, NSEC_PER_SEC - 1);
+        assert_eq!(FuseNode::cache_timeout_ticks(0, u32::MAX), clamped);
+        assert_eq!(
+            FuseNode::cache_timeout_ticks(1, 0),
+            (NSEC_PER_SEC as u64).div_ceil(NSEC_PER_JIFFY as u64)
+        );
+    }
+
+    #[test]
+    fn finite_cache_timeout_never_becomes_permanent_sentinel() {
+        assert_eq!(
+            FuseNode::cache_timeout_ticks(u64::MAX, u32::MAX),
+            u64::MAX - 1
+        );
+        assert_ne!(FuseNode::cache_deadline(u64::MAX, u32::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn dax_host_invalidation_gate_blocks_until_last_notification_finishes() {
+        let gate = DaxHostInvalidationGate::new();
+        let access = gate.try_enter().unwrap();
+        assert_eq!(gate.active.load(Ordering::Acquire), 1);
+        drop(access);
+
+        let first = gate.begin().unwrap();
+        let second = gate.begin().unwrap();
+        assert!(gate.blocked());
+        assert!(matches!(
+            gate.try_enter(),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        ));
+        drop(first);
+        assert!(gate.blocked());
+        drop(second);
+        assert!(!gate.blocked());
+
+        let access = gate.try_enter().unwrap();
+        assert_eq!(gate.active.load(Ordering::Acquire), 1);
+        drop(access);
+        assert_eq!(gate.active.load(Ordering::Acquire), 0);
     }
 }

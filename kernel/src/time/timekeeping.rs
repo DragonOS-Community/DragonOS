@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
-use core::intrinsics::{likely, unlikely};
 use core::sync::atomic::{AtomicBool, Ordering};
-use log::{debug, info, warn};
+
+use log::{info, warn};
 use system_error::SystemError;
 
 use crate::{
@@ -15,298 +15,452 @@ use crate::{
     },
 };
 
-use super::timekeep::{ktime_t, timespec_to_ktime};
 use super::{
-    clocksource::{clocksource_cyc2ns, Clocksource, CycleNum, HZ},
+    clocksource::{Clocksource, ClocksourceData, ClocksourceFlags, ClocksourceMask, HZ},
     syscall::PosixTimeval,
     NSEC_PER_SEC,
 };
-/// NTP周期频率
-pub const NTP_INTERVAL_FREQ: u64 = HZ;
-/// NTP周期长度
-pub const NTP_INTERVAL_LENGTH: u64 = NSEC_PER_SEC as u64 / NTP_INTERVAL_FREQ;
-/// NTP转换比例
-pub const NTP_SCALE_SHIFT: u32 = 32;
 
-/// timekeeping休眠标志，false为未休眠
 pub static TIMEKEEPING_SUSPENDED: AtomicBool = AtomicBool::new(false);
-/// timekeeper全局变量，用于管理timekeeper模块
+
 static mut __TIMEKEEPER: Option<Timekeeper> = None;
+
+const JIFFY_NS: u64 = 1_000_000_000 / HZ;
+
+const TIME_SETTOD_SEC_MAX: i64 = i64::MAX / NSEC_PER_SEC as i64 - 30 * 365 * 24 * 60 * 60;
+
+#[derive(Debug, Clone)]
+struct TimekeeperReadBase {
+    clock: Arc<dyn Clocksource>,
+    mask: ClocksourceMask,
+    cycle_last: u64,
+    mult: u32,
+    shift: u32,
+    max_cycles: u64,
+    base_ns: u64,
+    fraction: u64,
+}
+
+impl TimekeeperReadBase {
+    fn new(
+        clock: Arc<dyn Clocksource>,
+        data: &super::clocksource::ClocksourceData,
+        cycle_last: u64,
+        base_ns: u64,
+    ) -> Option<Self> {
+        if data.mask.bits() == 0
+            || data.mult == 0
+            || data.shift >= u64::BITS
+            || data.max_cycles == 0
+            || data.max_cycles > data.mask.bits()
+            || !mask_is_contiguous(data.mask.bits())
+        {
+            return None;
+        }
+
+        Some(Self {
+            clock,
+            mask: data.mask,
+            cycle_last,
+            mult: data.mult,
+            shift: data.shift,
+            max_cycles: data.max_cycles,
+            base_ns,
+            fraction: 0,
+        })
+    }
+
+    #[inline]
+    fn delta(&self, cycle_now: u64) -> u64 {
+        clocksource_delta(
+            cycle_now,
+            self.cycle_last,
+            self.mask.bits(),
+            self.max_cycles,
+        )
+        .expect("installed timekeeper has invalid clocksource conversion bounds")
+    }
+
+    #[inline]
+    fn read_ns(&self, cycle_now: u64) -> u64 {
+        let (elapsed, _) = scale_delta(self.delta(cycle_now), self.mult, self.shift, self.fraction)
+            .expect("validated timekeeper conversion became invalid");
+        add_elapsed(self.base_ns, elapsed).expect("timekeeper read overflow")
+    }
+
+    fn forward(&mut self, cycle_now: u64) {
+        let (elapsed, fraction) =
+            scale_delta(self.delta(cycle_now), self.mult, self.shift, self.fraction)
+                .expect("validated timekeeper conversion became invalid");
+        self.base_ns = add_elapsed(self.base_ns, elapsed).expect("timekeeper forward overflow");
+        self.fraction = fraction;
+        self.cycle_last = cycle_now;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TimekeeperData {
+    mono: Option<TimekeeperReadBase>,
+    raw: Option<TimekeeperReadBase>,
+    realtime_offset_ns: i128,
+    boottime_offset_ns: u64,
+    clock_was_set_seq: u64,
+    clocksource_generation: u64,
+    // Global jiffy progress, independent of per-CPU clockevent capability.
+    next_jiffy_ns: Option<u64>,
+}
+
+impl TimekeeperData {
+    const fn new() -> Self {
+        Self {
+            mono: None,
+            raw: None,
+            realtime_offset_ns: 0,
+            boottime_offset_ns: 0,
+            clock_was_set_seq: 0,
+            clocksource_generation: 0,
+            next_jiffy_ns: None,
+        }
+    }
+
+    fn forward(&mut self) {
+        let Some(mono) = self.mono.as_mut() else {
+            return;
+        };
+        let raw = self.raw.as_mut().expect("raw timekeeper base missing");
+        debug_assert!(Arc::ptr_eq(&mono.clock, &raw.clock));
+        debug_assert_eq!(mono.cycle_last, raw.cycle_last);
+        let cycle_now = mono.clock.read().data();
+        mono.forward(cycle_now);
+        raw.forward(cycle_now);
+        debug_assert_eq!(mono.cycle_last, raw.cycle_last);
+    }
+
+    // Caller has forwarded the old base and validated the new conversion.
+    fn install_forwarded(&mut self, clock: Arc<dyn Clocksource>, data: &ClocksourceData) {
+        let mono_base_ns = self.mono.as_ref().map_or(0, |base| base.base_ns);
+        let raw_base_ns = self.raw.as_ref().map_or(0, |base| base.base_ns);
+        let old_mono_fraction = self.mono.as_ref().map_or(0, |base| base.fraction);
+        let old_raw_fraction = self.raw.as_ref().map_or(0, |base| base.fraction);
+        let old_shift = self.mono.as_ref().map(|base| base.shift);
+
+        let cycle_last = clock.read().data();
+        let mut mono = TimekeeperReadBase::new(clock.clone(), data, cycle_last, mono_base_ns)
+            .expect("validated clocksource became invalid");
+        let mut raw = TimekeeperReadBase::new(clock, data, cycle_last, raw_base_ns)
+            .expect("validated clocksource became invalid");
+        if let Some(old_shift) = old_shift {
+            mono.fraction = rescale_fraction(old_mono_fraction, old_shift, mono.shift);
+            raw.fraction = rescale_fraction(old_raw_fraction, old_shift, raw.shift);
+        }
+        self.mono = Some(mono);
+        self.raw = Some(raw);
+        self.clocksource_generation = self.clocksource_generation.wrapping_add(1);
+    }
+
+    fn monotonic_ns(&self) -> u64 {
+        let mono = self.mono.as_ref().expect("timekeeper not initialized");
+        mono.read_ns(mono.clock.read().data())
+    }
+
+    fn raw_ns(&self) -> u64 {
+        let raw = self.raw.as_ref().expect("raw timekeeper not initialized");
+        raw.read_ns(raw.clock.read().data())
+    }
+
+    fn boottime_ns(&self) -> u64 {
+        self.monotonic_ns()
+            .checked_add(self.boottime_offset_ns)
+            .expect("boottime overflow")
+    }
+
+    fn realtime_ns(&self) -> i128 {
+        self.monotonic_ns() as i128 + self.realtime_offset_ns
+    }
+}
 
 #[derive(Debug)]
 pub struct Timekeeper {
     inner: RwLock<TimekeeperData>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct TimekeeperData {
-    /// 用于计时的当前时钟源。
-    clock: Option<Arc<dyn Clocksource>>,
-    /// 当前时钟源的移位值。
-    shift: i32,
-    /// 一个NTP间隔中的时钟周期数。
-    cycle_interval: CycleNum,
-    /// 一个NTP间隔中时钟移位的纳秒数。
-    xtime_interval: u64,
-    xtime_remainder: i64,
-    /// 每个NTP间隔累积的原始纳米秒
-    raw_interval: i64,
-    /// 时钟移位纳米秒余数
-    xtime_nsec: u64,
-    /// 积累时间和ntp时间在ntp位移纳秒量上的差距
-    ntp_error: i64,
-    /// 用于转换时钟偏移纳秒和ntp偏移纳秒的偏移量
-    ntp_error_shift: i32,
-    /// NTP调整时钟乘法器
-    mult: u32,
-    raw_time: PosixTimeSpec,
-    wall_to_monotonic: PosixTimeSpec,
-    total_sleep_time: PosixTimeSpec,
-    xtime: PosixTimeSpec,
-    /// 单调时间和实时时间的偏移量
-    real_time_offset: ktime_t,
-}
-impl TimekeeperData {
-    pub fn new() -> Self {
-        Self {
-            clock: None,
-            shift: Default::default(),
-            cycle_interval: CycleNum::new(0),
-            xtime_interval: Default::default(),
-            xtime_remainder: Default::default(),
-            raw_interval: Default::default(),
-            xtime_nsec: Default::default(),
-            ntp_error: Default::default(),
-            ntp_error_shift: Default::default(),
-            mult: Default::default(),
-            xtime: PosixTimeSpec {
-                tv_nsec: 0,
-                tv_sec: 0,
-            },
-            wall_to_monotonic: PosixTimeSpec {
-                tv_nsec: 0,
-                tv_sec: 0,
-            },
-            total_sleep_time: PosixTimeSpec {
-                tv_nsec: 0,
-                tv_sec: 0,
-            },
-            raw_time: PosixTimeSpec {
-                tv_nsec: 0,
-                tv_sec: 0,
-            },
-            real_time_offset: 0,
-        }
-    }
-}
 impl Timekeeper {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             inner: RwLock::new(TimekeeperData::new()),
         }
     }
 
-    /// # 设置timekeeper的参数
-    ///
-    /// ## 参数
-    ///
-    /// * 'clock' - 指定的时钟实际类型。初始为ClocksourceJiffies
-    pub fn timekeeper_setup_internals(&self, clock: Arc<dyn Clocksource>) {
-        let mut timekeeper = self.inner.write_irqsave();
-        // 更新clock
-        let mut clock_data = clock.clocksource_data();
-        clock_data.cycle_last = clock.read();
-        if clock.update_clocksource_data(clock_data).is_err() {
-            debug!("timekeeper_setup_internals:update_clocksource_data run failed");
-        }
-        timekeeper.clock.replace(clock.clone());
-
-        let clock_data = clock.clocksource_data();
-        let mut temp = NTP_INTERVAL_LENGTH << clock_data.shift;
-        let ntpinterval = temp;
-        temp += (clock_data.mult / 2) as u64;
-        // do div
-
-        timekeeper.cycle_interval = CycleNum::new(temp);
-        timekeeper.xtime_interval = temp * clock_data.mult as u64;
-        // 这里可能存在下界溢出问题，debug模式下会报错panic
-        timekeeper.xtime_remainder = (ntpinterval - timekeeper.xtime_interval) as i64;
-        timekeeper.raw_interval = (timekeeper.xtime_interval >> clock_data.shift) as i64;
-        timekeeper.xtime_nsec = 0;
-        timekeeper.shift = clock_data.shift as i32;
-
-        timekeeper.ntp_error = 0;
-        timekeeper.ntp_error_shift = (NTP_SCALE_SHIFT - clock_data.shift) as i32;
-
-        timekeeper.mult = clock_data.mult;
-    }
-
-    pub fn timekeeping_get_ns(&self) -> i64 {
-        let timekeeper = self.inner.read_irqsave();
-        let clock = timekeeper.clock.clone().unwrap();
-
-        let cycle_now = clock.read();
-        let clock_data = clock.clocksource_data();
-        let cycle_delta = (cycle_now.div(clock_data.cycle_last)).data() & clock_data.mask.bits();
-
-        return clocksource_cyc2ns(
-            CycleNum::new(cycle_delta),
-            timekeeper.mult,
-            timekeeper.shift as u32,
-        ) as i64;
-    }
-
-    /// # 处理大幅度调整
-    pub fn timekeeping_bigadjust(&self, error: i64, interval: i64, offset: i64) -> (i64, i64, i32) {
-        let mut error = error;
-        let mut interval = interval;
-        let mut offset = offset;
-
-        // TODO: 计算look_head并调整ntp误差
-
-        let tmp = interval;
-        let mut mult = 1;
-        let mut adj = 0;
-        if error < 0 {
-            error = -error;
-            interval = -interval;
-            offset = -offset;
-            mult = -1;
-        }
-        while error > tmp {
-            adj += 1;
-            error >>= 1;
-        }
-
-        interval <<= adj;
-        offset <<= adj;
-        mult <<= adj;
-
-        return (interval, offset, mult);
-    }
-
-    /// # 调整时钟的mult减少ntp_error
-    pub fn timekeeping_adjust(&self, offset: i64) -> i64 {
-        let mut timekeeper = self.inner.write_irqsave();
-        let mut interval = timekeeper.cycle_interval.data() as i64;
-        let mut offset = offset;
-        let adj: i32;
-
-        // 计算误差
-        let mut error = timekeeper.ntp_error >> (timekeeper.ntp_error_shift - 1);
-
-        // 误差超过一个interval，就要进行调整
-        if error >= 0 {
-            if error > interval {
-                error >>= 2;
-                if likely(error <= interval) {
-                    adj = 1;
-                } else {
-                    (interval, offset, adj) = self.timekeeping_bigadjust(error, interval, offset);
-                }
-            } else {
-                // 不需要校准
-                return offset;
+    pub fn timekeeper_setup_internals(
+        &self,
+        clock: Arc<dyn Clocksource>,
+    ) -> Result<(), SystemError> {
+        let data = validated_clocksource_data(&clock)?;
+        let mut tk = self.inner.write_irqsave();
+        if let Some(current) = tk.mono.as_ref() {
+            if Arc::ptr_eq(&current.clock, &clock) {
+                return Ok(());
             }
-        } else if -error > interval {
-            if likely(-error <= interval) {
-                adj = -1;
-                interval = -interval;
-                offset = -offset;
-            } else {
-                (interval, offset, adj) = self.timekeeping_bigadjust(error, interval, offset);
-            }
-        } else {
-            // 不需要校准
-            return offset;
+            tk.forward();
         }
 
-        // 检查最大调整值，确保调整值不会超过时钟源允许的最大值
-        let clock_data = timekeeper.clock.clone().unwrap().clocksource_data();
-        if unlikely(
-            clock_data.maxadj != 0
-                && (timekeeper.mult as i32 + adj
-                    > clock_data.mult as i32 + clock_data.maxadj as i32),
-        ) {
-            warn!(
-                "Adjusting {:?} more than ({} vs {})",
-                clock_data.name,
-                timekeeper.mult as i32 + adj,
-                clock_data.mult as i32 + clock_data.maxadj as i32
-            );
-        }
-
-        if error > 0 {
-            timekeeper.mult += adj as u32;
-            timekeeper.xtime_interval += interval as u64;
-            timekeeper.xtime_nsec -= offset as u64;
-        } else {
-            timekeeper.mult -= adj as u32;
-            timekeeper.xtime_interval -= interval as u64;
-            timekeeper.xtime_nsec += offset as u64;
-        }
-        timekeeper.ntp_error -= (interval - offset) << timekeeper.ntp_error_shift;
-
-        return offset;
+        tk.install_forwarded(clock, &data);
+        drop(tk);
+        Ok(())
     }
-    /// # 用于累积时间间隔，并将其转换为纳秒时间
-    pub fn logarithmic_accumulation(&self, offset: u64, shift: i32) -> u64 {
-        let mut timekeeper = self.inner.write_irqsave();
-        let clock = timekeeper.clock.clone().unwrap();
-        let clock_data = clock.clocksource_data();
-        let nsecps = (NSEC_PER_SEC as u64) << timekeeper.shift;
-        let mut offset = offset;
 
-        // 检查offset是否小于一个NTP周期间隔
-        if offset < timekeeper.cycle_interval.data() << shift {
-            return offset;
-        }
+    pub fn current_clocksource(&self) -> Option<Arc<dyn Clocksource>> {
+        self.inner
+            .read_irqsave()
+            .mono
+            .as_ref()
+            .map(|base| base.clock.clone())
+    }
+}
 
-        // 累积一个移位的interval
-        offset -= timekeeper.cycle_interval.data() << shift;
-        clock_data
-            .cycle_last
-            .add(CycleNum::new(timekeeper.cycle_interval.data() << shift));
-        if clock.update_clocksource_data(clock_data).is_err() {
-            debug!("logarithmic_accumulation:update_clocksource_data run failed");
-        }
-        timekeeper.clock.replace(clock.clone());
+fn validated_clocksource_data(
+    clock: &Arc<dyn Clocksource>,
+) -> Result<ClocksourceData, SystemError> {
+    let data = clock.clocksource_data();
+    if data.mask.bits() == 0
+        || data.mult == 0
+        || data.shift >= u64::BITS
+        || data.max_cycles == 0
+        || data.max_cycles > data.mask.bits()
+        || !mask_is_contiguous(data.mask.bits())
+    {
+        warn!(
+            "refusing invalid clocksource {}: mask={:#x} mult={} shift={}",
+            data.name,
+            data.mask.bits(),
+            data.mult,
+            data.shift
+        );
+        return Err(SystemError::EINVAL);
+    }
 
-        // 更新xime_nsec
-        timekeeper.xtime_nsec += timekeeper.xtime_interval << shift;
-        while timekeeper.xtime_nsec >= nsecps {
-            timekeeper.xtime_nsec -= nsecps;
-            timekeeper.xtime.tv_sec += 1;
-            // TODO: 处理闰秒
-        }
+    Ok(data)
+}
 
-        // TODO：更新raw_time
+#[inline]
+const fn mask_is_contiguous(mask: u64) -> bool {
+    mask != 0 && (mask & mask.wrapping_add(1)) == 0
+}
 
-        // TODO：计算ntp_error
+#[inline]
+fn clocksource_delta(
+    cycle_now: u64,
+    cycle_last: u64,
+    mask: u64,
+    max_cycles: u64,
+) -> Result<u64, SystemError> {
+    if !mask_is_contiguous(mask) || max_cycles == 0 || max_cycles > mask {
+        return Err(SystemError::EINVAL);
+    }
+    let delta = cycle_now.wrapping_sub(cycle_last) & mask;
+    // Linux x86 selects CLOCKSOURCE_VALIDATE_LAST_CYCLE: reject a delta
+    // outside the counter's forward half before applying conversion bounds.
+    if cfg!(target_arch = "x86_64") && delta & !(mask >> 1) != 0 {
+        return Ok(0);
+    }
+    // Cap accepted forward intervals, as Linux DEBUG_TIMEKEEPING does, to
+    // avoid conversion overflow. A writer still advances cycle_last to the
+    // current sample, including when the validated delta is zero.
+    Ok(delta.min(max_cycles))
+}
 
-        return offset;
+#[inline]
+const fn fraction_mask(shift: u32) -> u128 {
+    if shift == 0 {
+        0
+    } else {
+        (1u128 << shift) - 1
+    }
+}
+
+#[inline]
+fn scale_delta(
+    delta: u64,
+    mult: u32,
+    shift: u32,
+    fraction: u64,
+) -> Result<(u64, u64), SystemError> {
+    if mult == 0 || shift >= u64::BITS || fraction as u128 > fraction_mask(shift) {
+        return Err(SystemError::EINVAL);
+    }
+    let scaled = delta as u128 * mult as u128 + fraction as u128;
+    let elapsed = (scaled >> shift)
+        .try_into()
+        .map_err(|_| SystemError::EOVERFLOW)?;
+    Ok((elapsed, (scaled & fraction_mask(shift)) as u64))
+}
+
+#[inline]
+fn add_elapsed(base_ns: u64, elapsed_ns: u64) -> Result<u64, SystemError> {
+    base_ns
+        .checked_add(elapsed_ns)
+        .ok_or(SystemError::EOVERFLOW)
+}
+
+#[inline]
+fn rescale_fraction(fraction: u64, old_shift: u32, new_shift: u32) -> u64 {
+    if new_shift >= old_shift {
+        fraction
+            .checked_shl(new_shift - old_shift)
+            .expect("timekeeper fraction shift overflow")
+    } else {
+        fraction >> (old_shift - new_shift)
+    }
+}
+
+#[inline]
+fn ns_to_timespec(ns: i128) -> PosixTimeSpec {
+    let sec = ns.div_euclid(NSEC_PER_SEC as i128);
+    let nsec = ns.rem_euclid(NSEC_PER_SEC as i128);
+    PosixTimeSpec {
+        tv_sec: sec.try_into().expect("timekeeper seconds overflow"),
+        tv_nsec: nsec as i64,
     }
 }
 
 #[inline(always)]
 pub fn timekeeper() -> &'static Timekeeper {
-    let r = unsafe { __TIMEKEEPER.as_ref().unwrap() };
+    unsafe { __TIMEKEEPER.as_ref().unwrap() }
+}
 
-    return r;
+/// Only installing the global source may change hardware clockevent mode.
+/// Independent Timekeeper instances (including selftests) have no such effect.
+pub(crate) fn install_clocksource(clock: Arc<dyn Clocksource>) -> Result<(), SystemError> {
+    let data = validated_clocksource_data(&clock)?;
+    {
+        let mut tk = timekeeper().inner.write_irqsave();
+        if !tk
+            .mono
+            .as_ref()
+            .is_some_and(|base| Arc::ptr_eq(&base.clock, &clock))
+        {
+            // A few Arc/scalar clones on the rare control path, never per tick.
+            // Prove the new phase before publishing any counter/base change.
+            let mut candidate = tk.clone();
+            let old_flags = candidate
+                .mono
+                .as_ref()
+                .map(|base| base.clock.clocksource_data().flags);
+            // As before, switching sources forwards the old base exactly once.
+            candidate.forward();
+            if let Some(next) = candidate.next_jiffy_ns {
+                let now = candidate
+                    .mono
+                    .as_ref()
+                    .expect("tick source missing")
+                    .base_ns;
+                let flags = old_flags.expect("tick source flags missing");
+                let (add, next) = jiffy_handoff(next, now, &flags).expect("jiffy phase overflow");
+                // New-source cycle_last must be sampled after this pure commit.
+                super::timer::add_timer_jiffies(add);
+                candidate.next_jiffy_ns = Some(next);
+            }
+            candidate.install_forwarded(clock.clone(), &data);
+            *tk = candidate;
+        }
+    }
+    let flags = clock.clocksource_data().flags;
+    super::deadline::clocksource_changed(
+        flags.contains(super::clocksource::ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS)
+            && !flags.contains(super::clocksource::ClocksourceFlags::CLOCK_SOURCE_UNSTABLE),
+    );
+    Ok(())
+}
+
+fn continuous_source(flags: &ClocksourceFlags) -> bool {
+    flags.contains(ClocksourceFlags::CLOCK_SOURCE_IS_CONTINUOUS)
+        && !flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE)
+}
+
+// Settle only a reliable old source; a failed source starts a new phase.
+fn jiffy_handoff(next: u64, now: u64, flags: &ClocksourceFlags) -> Result<(u64, u64), SystemError> {
+    if flags.contains(ClocksourceFlags::CLOCK_SOURCE_UNSTABLE) {
+        Ok((0, now.checked_add(JIFFY_NS).ok_or(SystemError::EOVERFLOW)?))
+    } else {
+        jiffy_advance(next, now, continuous_source(flags), false)
+    }
+}
+
+// A pure phase calculation: a non-continuous source cannot drive its own ticks.
+fn jiffy_advance(
+    next: u64,
+    now: u64,
+    continuous: bool,
+    local_tick: bool,
+) -> Result<(u64, u64), SystemError> {
+    let add = if continuous {
+        if now < next {
+            0
+        } else {
+            (now - next) / JIFFY_NS + 1
+        }
+    } else {
+        u64::from(local_tick)
+    };
+    let next = add
+        .checked_mul(JIFFY_NS)
+        .and_then(|elapsed| next.checked_add(elapsed))
+        .ok_or(SystemError::EOVERFLOW)?;
+    Ok((add, next))
+}
+
+// CPU0 initializes once, outside the deadline queue lock. AP init is a no-op.
+pub(crate) fn init_jiffies_tick() {
+    if crate::smp::core::smp_get_processor_id().data() != 0 {
+        return;
+    }
+    let mut tk = timekeeper().inner.write_irqsave();
+    if tk.next_jiffy_ns.is_none() {
+        tk.next_jiffy_ns = Some(
+            tk.monotonic_ns()
+                .checked_add(JIFFY_NS)
+                .expect("jiffy phase overflow"),
+        );
+    }
+}
+
+// Normal IRQ updates are CPU0-only. The source control path above may settle
+// old elapsed time under this same lock; it never runs timer maintenance.
+pub(crate) fn advance_jiffies(local_tick: bool) -> bool {
+    let mut tk = timekeeper().inner.write_irqsave();
+    let next = tk.next_jiffy_ns.expect("jiffy tick not initialized");
+    let flags = tk
+        .mono
+        .as_ref()
+        .expect("tick source missing")
+        .clock
+        .clocksource_data()
+        .flags;
+    let (add, next) = jiffy_advance(
+        next,
+        tk.monotonic_ns(),
+        continuous_source(&flags),
+        local_tick,
+    )
+    .expect("jiffy phase overflow");
+    super::timer::add_timer_jiffies(add);
+    tk.next_jiffy_ns = Some(next);
+    // Preserve update_wall_time's original suspend guard. In particular a
+    // jiffies source must be forwarded after publishing its new count.
+    if (add != 0 || local_tick) && !TIMEKEEPING_SUSPENDED.load(Ordering::Acquire) {
+        tk.forward();
+    }
+    add != 0
 }
 
 pub fn boottime_seconds() -> i64 {
     let tk = timekeeper().inner.read_irqsave();
-    let nsec_per_sec = NSEC_PER_SEC as i128;
-    let boottime_ns = (tk.xtime.tv_sec as i128) * nsec_per_sec
-        + (tk.xtime.tv_nsec as i128)
-        + (tk.wall_to_monotonic.tv_sec as i128) * nsec_per_sec
-        + (tk.wall_to_monotonic.tv_nsec as i128)
-        + (tk.total_sleep_time.tv_sec as i128) * nsec_per_sec
-        + (tk.total_sleep_time.tv_nsec as i128);
-
-    boottime_ns.div_euclid(nsec_per_sec) as i64
+    tk.realtime_offset_ns
+        .checked_sub(tk.boottime_offset_ns as i128)
+        .expect("boot epoch overflow")
+        .div_euclid(NSEC_PER_SEC as i128)
+        .try_into()
+        .expect("boot epoch seconds overflow")
 }
 
 pub fn timekeeping_is_initialized() -> bool {
@@ -317,165 +471,142 @@ pub fn timekeeper_init() {
     unsafe { __TIMEKEEPER = Some(Timekeeper::new()) };
 }
 
-/// # 获取1970.1.1至今的UTC时间戳(最小单位:nsec)
-///
-/// ## 返回值
-///
-/// * 'TimeSpec' - 时间戳
-pub fn getnstimeofday() -> PosixTimeSpec {
-    // debug!("enter getnstimeofday");
-
-    let nsecs;
-    let mut xtime: PosixTimeSpec;
-    loop {
-        match timekeeper().inner.try_read_irqsave() {
-            None => continue,
-            Some(tk) => {
-                xtime = tk.xtime;
-                drop(tk);
-
-                nsecs = timekeeper().timekeeping_get_ns();
-
-                // TODO 不同架构可能需要加上不同的偏移量
-                break;
-            }
-        }
-    }
-    xtime.tv_nsec += nsecs;
-    xtime.tv_sec += xtime.tv_nsec / NSEC_PER_SEC as i64;
-    xtime.tv_nsec %= NSEC_PER_SEC as i64;
-    // debug!("getnstimeofday: xtime = {:?}, nsecs = {:}", xtime, nsecs);
-
-    // TODO 将xtime和当前时间源的时间相加
-
-    return xtime;
+pub fn realtime_now() -> PosixTimeSpec {
+    let tk = timekeeper().inner.read_irqsave();
+    ns_to_timespec(tk.realtime_ns())
 }
 
-/// # 获取1970.1.1至今的UTC时间戳(最小单位:usec)
-///
-/// ## 返回值
-///
-/// * 'PosixTimeval' - 时间戳
+/// Return realtime and the wall-clock change epoch from one snapshot.
+/// Timerfd uses the epoch to distinguish a delayed notification from a clock
+/// change that happened before the timer was armed.
+pub fn realtime_now_with_clock_set_seq() -> (PosixTimeSpec, u64) {
+    let tk = timekeeper().inner.read_irqsave();
+    (ns_to_timespec(tk.realtime_ns()), tk.clock_was_set_seq)
+}
+
+pub fn monotonic_now() -> PosixTimeSpec {
+    let tk = timekeeper().inner.read_irqsave();
+    ns_to_timespec(tk.monotonic_ns() as i128)
+}
+
+pub fn monotonic_raw_now() -> PosixTimeSpec {
+    let tk = timekeeper().inner.read_irqsave();
+    ns_to_timespec(tk.raw_ns() as i128)
+}
+
+pub fn boottime_now() -> PosixTimeSpec {
+    let tk = timekeeper().inner.read_irqsave();
+    ns_to_timespec(tk.boottime_ns() as i128)
+}
+
+pub fn realtime_coarse() -> PosixTimeSpec {
+    let tk = timekeeper().inner.read_irqsave();
+    let mono = tk.mono.as_ref().expect("timekeeper not initialized");
+    ns_to_timespec(mono.base_ns as i128 + tk.realtime_offset_ns)
+}
+
+pub fn monotonic_coarse() -> PosixTimeSpec {
+    let tk = timekeeper().inner.read_irqsave();
+    let mono = tk.mono.as_ref().expect("timekeeper not initialized");
+    ns_to_timespec(mono.base_ns as i128)
+}
+
+pub fn getnstimeofday() -> PosixTimeSpec {
+    realtime_now()
+}
+
 pub fn do_gettimeofday() -> PosixTimeval {
-    let tp = getnstimeofday();
-    return PosixTimeval {
+    let tp = realtime_now();
+    PosixTimeval {
         tv_sec: tp.tv_sec,
-        tv_usec: (tp.tv_nsec / 1000) as i32,
-    };
+        tv_usec: tp.tv_nsec / 1000,
+    }
 }
 
 pub fn do_settimeofday64(time: PosixTimeSpec) -> Result<(), SystemError> {
-    timekeeper().inner.write_irqsave().xtime = time;
-    // todo: 模仿linux，实现时间误差校准。
-    // https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/time/timekeeping.c?fi=do_settimeofday64#1312
-    return Ok(());
+    let requested = validate_settimeofday(time)?;
+    {
+        let mut tk = timekeeper().inner.write_irqsave();
+        settimeofday_locked(&mut tk, requested)?;
+    }
+    // timerfd may read the timekeeper while rebasing its monotonic backend;
+    // never call into it while holding the timekeeper write lock.
+    crate::filesystem::timerfd::timerfd_clock_was_set();
+    super::absolute_timer::clock_was_set();
+    Ok(())
 }
 
-/// # 初始化timekeeping模块
+pub(super) fn validate_settimeofday(time: PosixTimeSpec) -> Result<i128, SystemError> {
+    if time.tv_sec < 0
+        || time.tv_sec >= TIME_SETTOD_SEC_MAX
+        || time.tv_nsec < 0
+        || time.tv_nsec >= NSEC_PER_SEC as i64
+    {
+        return Err(SystemError::EINVAL);
+    }
+
+    Ok(time.tv_sec as i128 * NSEC_PER_SEC as i128 + time.tv_nsec as i128)
+}
+
+/// Apply a validated wall-clock value while the caller owns the timekeeper
+/// write side.  As in Linux, forwarding happens before rejecting a formatted
+/// value that would place realtime before monotonic; only the wall offset is
+/// transactional on that error path.
+fn settimeofday_locked(tk: &mut TimekeeperData, requested: i128) -> Result<(), SystemError> {
+    tk.forward();
+    let monotonic = tk
+        .mono
+        .as_ref()
+        .expect("timekeeper not initialized")
+        .base_ns as i128;
+    let realtime_offset = requested
+        .checked_sub(monotonic)
+        .ok_or(SystemError::EOVERFLOW)?;
+    // Linux rejects only wall-clock values earlier than CLOCK_MONOTONIC.
+    // CLOCK_BOOTTIME may legitimately be ahead after suspend.
+    if realtime_offset < 0 {
+        return Err(SystemError::EINVAL);
+    }
+    // Prove all derived public values are representable before publishing the
+    // offset.  `requested` was already bounded by validate_settimeofday().
+    let _boot_epoch = realtime_offset
+        .checked_sub(tk.boottime_offset_ns as i128)
+        .ok_or(SystemError::EOVERFLOW)?;
+    if tk.realtime_offset_ns != realtime_offset {
+        tk.realtime_offset_ns = realtime_offset;
+        tk.clock_was_set_seq = tk.clock_was_set_seq.wrapping_add(1);
+    }
+    Ok(())
+}
+
 #[inline(never)]
 pub fn timekeeping_init() {
     info!("Initializing timekeeping module...");
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     timekeeper_init();
 
-    // TODO 有ntp模块后 在此初始化ntp模块
+    // Registration computes max_cycles/max_idle_ns.  The default source must
+    // be fully registered before its conversion snapshot is installed, so
+    // non-KVM/TCG boots never depend on a later source replacing it.
+    jiffies_init();
 
     let clock = clocksource_default_clock();
     clock
         .enable()
         .expect("clocksource_default_clock enable failed");
-    timekeeper().timekeeper_setup_internals(clock);
-    // 暂时不支持其他架构平台对时间的设置 所以使用x86平台对应值初始化
-    let mut timekeeper = timekeeper().inner.write_irqsave();
-    timekeeper.xtime.tv_nsec = ktime_get_real_ns();
+    install_clocksource(clock).expect("default clocksource has invalid conversion data");
 
-    //参考https://elixir.bootlin.com/linux/v4.4/source/kernel/time/timekeeping.c#L1251 对wtm进行初始化
-    (
-        timekeeper.wall_to_monotonic.tv_nsec,
-        timekeeper.wall_to_monotonic.tv_sec,
-    ) = (-timekeeper.xtime.tv_nsec, -timekeeper.xtime.tv_sec);
+    let initial_realtime = ktime_get_real_ns();
+    if initial_realtime > 0 {
+        do_settimeofday64(ns_to_timespec(initial_realtime as i128))
+            .expect("initial realtime is invalid");
+    }
 
     drop(irq_guard);
-    drop(timekeeper);
-    jiffies_init();
     info!("timekeeping_init successfully");
 }
 
-/// # 使用当前时钟源增加wall time
-/// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#1041
-pub fn update_wall_time() {
-    // debug!("enter update_wall_time, stack_use = {:}",stack_use);
-    let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-    // 如果在休眠那就不更新
-    if TIMEKEEPING_SUSPENDED.load(Ordering::SeqCst) {
-        return;
-    }
+#[path = "timekeeping_selftest.rs"]
+mod selftest;
 
-    let mut tk = timekeeper().inner.write_irqsave();
-    // 获取当前时钟源
-    let clock = tk.clock.clone().unwrap();
-    let clock_data = clock.clocksource_data();
-    // 计算从上一次更新周期以来经过的时钟周期数
-    let mut offset = (clock.read().div(clock_data.cycle_last).data()) & clock_data.mask.bits();
-    // 检查offset是否达到了一个NTP周期间隔
-    if offset < tk.cycle_interval.data() {
-        return;
-    }
-
-    // 将纳秒部分转换为更高精度的格式
-    tk.xtime_nsec = (tk.xtime.tv_nsec as u64) << tk.shift;
-
-    let mut shift = (offset.ilog2() - tk.cycle_interval.data().ilog2()) as i32;
-    shift = shift.max(0);
-    // let max_shift = (64 - (ntp_tick_length().ilog2()+1)) - 1;
-    // shift = min(shift, max_shift)
-    while offset >= tk.cycle_interval.data() {
-        offset = timekeeper().logarithmic_accumulation(offset, shift);
-        if offset < tk.cycle_interval.data() << shift {
-            shift -= 1;
-        }
-    }
-
-    timekeeper().timekeeping_adjust(offset as i64);
-
-    // 处理xtime_nsec下溢问题，并对NTP误差进行调整
-    if unlikely((tk.xtime_nsec as i64) < 0) {
-        let neg = -(tk.xtime_nsec as i64);
-        tk.xtime_nsec = 0;
-        tk.ntp_error += neg << tk.ntp_error_shift;
-    }
-
-    // 将纳秒部分舍入后存储在xtime.tv_nsec中
-    tk.xtime.tv_nsec = ((tk.xtime_nsec as i64) >> tk.shift) + 1;
-    tk.xtime_nsec -= (tk.xtime.tv_nsec as u64) << tk.shift;
-
-    // 确保经过舍入后的xtime.tv_nsec不会大于NSEC_PER_SEC，并在超过1秒的情况下进行适当的调整
-    if unlikely(tk.xtime.tv_nsec >= NSEC_PER_SEC.into()) {
-        tk.xtime.tv_nsec -= NSEC_PER_SEC as i64;
-        tk.xtime.tv_sec += 1;
-        // TODO: 处理闰秒
-    }
-
-    // 更新时间的相关信息
-    timekeeping_update(&mut tk);
-
-    drop(irq_guard);
-}
-// TODO wall_to_monotic
-
-/// 参考：https://code.dragonos.org.cn/xref/linux-3.4.99/kernel/time/timekeeping.c#190
-pub fn timekeeping_update(timekeeper: &mut TimekeeperData) {
-    // TODO：如果clearntp为true，则会清除NTP错误并调用ntp_clear()
-
-    // 更新实时时钟偏移量，用于跟踪硬件时钟与系统时间的差异，以便进行时间校正
-    update_rt_offset(timekeeper);
-}
-
-/// # 更新实时偏移量(墙上之间与单调时间的差值)
-pub fn update_rt_offset(timekeeper: &mut TimekeeperData) {
-    let ts = PosixTimeSpec::new(
-        -timekeeper.wall_to_monotonic.tv_sec,
-        -timekeeper.wall_to_monotonic.tv_nsec,
-    );
-    timekeeper.real_time_offset = timespec_to_ktime(ts);
-}
+pub(crate) use selftest::run_timekeeping_selftests;

@@ -3,18 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
-    fenix = {
-      url = "github:nix-community/fenix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      fenix,
-      flake-utils,
     }:
     let
       pkgs = import nixpkgs { inherit system; };
@@ -23,7 +17,7 @@
     in
     {
       packages.${system}.default = pkgs.callPackage ./default.nix {
-        inherit fenix system installDir;
+        inherit installDir;
       };
     };
 }

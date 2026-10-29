@@ -3,11 +3,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, fmt::Debug};
+use core::{
+    any::Any,
+    fmt::Debug,
+    sync::atomic::{compiler_fence, Ordering},
+};
 use system_error::SystemError;
 
 use crate::{
-    arch::MMArch,
     driver::base::{
         block::{
             block_device::{BlockDevice, BlockId, GeneralBlockRange, LBA_SIZE},
@@ -37,12 +40,15 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
     mm::{
-        mmio_buddy::{mmio_pool, MMIOSpaceGuard},
-        MemoryManagementArch, PhysAddr, VirtAddr,
+        device_linear::DeviceLinearMapping, mmio_buddy::mmio_pool, page::EntryFlags,
+        MemoryManagementArch, PhysAddr,
     },
 };
 
+use super::{PmemAccessMode, PmemProvider, PmemRegion, PmemRegionSource, PmemReservation};
+
 const PMEM_BASENAME: &str = "pmem";
+const PMEM_WINDOW_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct InnerPmemBlockDevice {
@@ -50,7 +56,7 @@ struct InnerPmemBlockDevice {
     kobject_common: KObjectCommonData,
 }
 
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct PmemBlockDevice {
     blkdev_meta: BlockDevMeta,
     inner: SpinLock<InnerPmemBlockDevice>,
@@ -61,8 +67,13 @@ pub struct PmemBlockDevice {
     metadata: Metadata,
     region_start: PhysAddr,
     usable_size: usize,
-    mapped_start: Option<VirtAddr>,
-    _mmio_guard: Option<MMIOSpaceGuard>,
+    access: PmemAccessMode,
+    provider: Option<Arc<dyn PmemProvider>>,
+    mapping: Option<DeviceLinearMapping>,
+    #[cfg(target_arch = "x86_64")]
+    writeback: Option<crate::arch::x86_64::mm::cache::CacheWriteback>,
+    // Field order matters: the mapping is torn down before its physical reservation.
+    _reservation: PmemReservation,
 }
 
 impl Debug for PmemBlockDevice {
@@ -71,21 +82,46 @@ impl Debug for PmemBlockDevice {
             .field("devname", &self.blkdev_meta.devname)
             .field("region_start", &self.region_start)
             .field("usable_size", &self.usable_size)
-            .field("mapped_start", &self.mapped_start)
+            .field("access", &self.access)
             .finish()
     }
 }
 
 impl PmemBlockDevice {
-    pub fn new(region_start: PhysAddr, region_size: usize, id: usize) -> Arc<Self> {
-        let usable_size = region_size / LBA_SIZE * LBA_SIZE;
+    pub(super) fn new(
+        region: PmemRegion,
+        id: usize,
+        reservation: PmemReservation,
+    ) -> Result<Arc<Self>, SystemError> {
+        let usable_size = region.size / LBA_SIZE * LBA_SIZE;
         let devname = DevName::new(format!("{PMEM_BASENAME}{id}"), id);
-        let (mmio_guard, mapped_start) = match Self::try_map_region(region_start, usable_size) {
-            Ok((guard, start)) => (Some(guard), Some(start)),
-            Err(_) => (None, None),
-        };
 
-        Arc::new_cyclic(|self_ref| {
+        #[cfg(target_arch = "x86_64")]
+        let writeback = if region.source == PmemRegionSource::Virtio
+            && region.start.check_aligned(crate::arch::MMArch::PAGE_SIZE)
+            && region.size.is_multiple_of(crate::arch::MMArch::PAGE_SIZE)
+        {
+            crate::arch::x86_64::mm::cache::CacheWriteback::detect()
+        } else {
+            None
+        };
+        #[cfg(target_arch = "x86_64")]
+        let mapping = if writeback.is_some() {
+            let flags = EntryFlags::new()
+                .set_user(false)
+                .set_write(true)
+                .set_execute(false)
+                .set_page_cache_disable(false)
+                .set_page_write_through(false)
+                .set_page_global(false);
+            Some(DeviceLinearMapping::new(region.start, region.size, flags)?)
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let mapping = None;
+
+        Ok(Arc::new_cyclic(|self_ref| {
             let blkdev_meta = BlockDevMeta::new(devname, Major::PMEM_BLK_MAJOR);
             let raw_dev = DeviceNumber::new(blkdev_meta.major, blkdev_meta.base_minor);
 
@@ -117,33 +153,16 @@ impl PmemBlockDevice {
                     gid: 0,
                     raw_dev,
                 },
-                region_start,
+                region_start: region.start,
                 usable_size,
-                mapped_start,
-                _mmio_guard: mmio_guard,
+                access: region.access,
+                provider: region.provider,
+                mapping,
+                #[cfg(target_arch = "x86_64")]
+                writeback,
+                _reservation: reservation,
             }
-        })
-    }
-
-    fn try_map_region(
-        region_start: PhysAddr,
-        usable_size: usize,
-    ) -> Result<(MMIOSpaceGuard, VirtAddr), SystemError> {
-        if usable_size == 0 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let paddr_base = page_align_down(region_start.data());
-        let offset = region_start.data() - paddr_base;
-        let map_size = page_align_up(
-            usable_size
-                .checked_add(offset)
-                .ok_or(SystemError::EOVERFLOW)?,
-        );
-
-        let mmio_guard = mmio_pool().create_mmio(map_size)?;
-        let mapped_start = unsafe { mmio_guard.map_any_phys(region_start, usable_size)? };
-        Ok((mmio_guard, mapped_start))
+        }))
     }
 
     pub fn region_start(&self) -> PhysAddr {
@@ -156,6 +175,102 @@ impl PmemBlockDevice {
 
     fn inner(&self) -> SpinLockGuard<'_, InnerPmemBlockDevice> {
         self.inner.lock_irqsave()
+    }
+
+    fn checked_io_range(&self, offset: usize, len: usize) -> Result<(), SystemError> {
+        let end = offset.checked_add(len).ok_or(SystemError::EOVERFLOW)?;
+        if end > self.usable_size {
+            return Err(SystemError::ENOSPC);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_direct_mapping(&self) -> bool {
+        self.mapping.is_some()
+    }
+
+    pub(crate) fn direct_paddr(&self, offset: usize, len: usize) -> Result<PhysAddr, SystemError> {
+        self.checked_io_range(offset, len)?;
+        self.mapping
+            .as_ref()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?
+            .checked_paddr(offset, len)
+    }
+
+    pub(crate) fn copy_from_pmem(&self, offset: usize, buf: &mut [u8]) -> Result<(), SystemError> {
+        self.checked_io_range(offset, buf.len())?;
+        if let Some(mapping) = &self.mapping {
+            let src = mapping.checked_vaddr(offset, buf.len())?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.data() as *const u8,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+            }
+            return Ok(());
+        }
+        self.copy_pmem_window(offset, buf)
+    }
+
+    fn copy_to_pmem(&self, offset: usize, buf: &[u8]) -> Result<(), SystemError> {
+        self.checked_io_range(offset, buf.len())?;
+        if let Some(mapping) = &self.mapping {
+            let dst = mapping.checked_vaddr(offset, buf.len())?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst.data() as *mut u8, buf.len());
+                #[cfg(target_arch = "x86_64")]
+                self.writeback
+                    .as_ref()
+                    .expect("WB mapping without cache writeback")
+                    .flush(dst.data(), buf.len())?;
+            }
+            return Ok(());
+        }
+        let mut owned = buf;
+        let mut copied = 0;
+        while !owned.is_empty() {
+            let phys = self.region_start.add(offset + copied);
+            let page_base = page_align_down(phys.data());
+            let page_offset = phys.data() - page_base;
+            let chunk_len = owned.len().min(PMEM_WINDOW_CHUNK_SIZE - page_offset);
+            let map_size = page_align_up(page_offset + chunk_len);
+            let guard = mmio_pool().create_mmio(map_size)?;
+            let mapped = unsafe { guard.map_any_phys(PhysAddr::new(page_base), map_size)? };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    owned.as_ptr(),
+                    (mapped.data() + page_offset) as *mut u8,
+                    chunk_len,
+                );
+            }
+            compiler_fence(Ordering::SeqCst);
+            owned = &owned[chunk_len..];
+            copied += chunk_len;
+        }
+        Ok(())
+    }
+
+    fn copy_pmem_window(&self, offset: usize, buf: &mut [u8]) -> Result<(), SystemError> {
+        let mut copied = 0;
+        while copied < buf.len() {
+            let phys = self.region_start.add(offset + copied);
+            let page_base = page_align_down(phys.data());
+            let page_offset = phys.data() - page_base;
+            let chunk_len = (buf.len() - copied).min(PMEM_WINDOW_CHUNK_SIZE - page_offset);
+            let map_size = page_align_up(page_offset + chunk_len);
+            let guard = mmio_pool().create_mmio(map_size)?;
+            let mapped = unsafe { guard.map_any_phys(PhysAddr::new(page_base), map_size)? };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (mapped.data() + page_offset) as *const u8,
+                    buf[copied..].as_mut_ptr(),
+                    chunk_len,
+                );
+            }
+            copied += chunk_len;
+        }
+        Ok(())
     }
 }
 
@@ -171,14 +286,25 @@ impl IndexNode for PmemBlockDevice {
         self
     }
 
+    fn sync_file(
+        &self,
+        _datasync: bool,
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            <Self as BlockDevice>::sync(self);
+        result.map_err(Into::into)
+    }
+
     fn read_at(
         &self,
         _offset: usize,
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -187,8 +313,9 @@ impl IndexNode for PmemBlockDevice {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::EROFS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::EROFS);
+        result.map_err(Into::into)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -219,8 +346,9 @@ impl IndexNode for PmemBlockDevice {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &crate::filesystem::vfs::file::FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 }
 
@@ -235,6 +363,19 @@ impl DeviceINode for PmemBlockDevice {
 }
 
 impl BlockDevice for PmemBlockDevice {
+    fn direct_access(
+        &self,
+    ) -> Result<Option<crate::driver::base::block::direct_access::DirectAccessRange>, SystemError>
+    {
+        let Some(provider) = &self.provider else {
+            return Ok(None);
+        };
+        let block = self.self_ref.upgrade().ok_or(SystemError::ENODEV)?;
+        Ok(provider
+            .direct_access(block)?
+            .map(crate::driver::base::block::direct_access::DirectAccessRange::new))
+    }
+
     fn dev_name(&self) -> &DevName {
         &self.blkdev_meta.devname
     }
@@ -275,36 +416,46 @@ impl BlockDevice for PmemBlockDevice {
             return Err(SystemError::ENOSPC);
         }
 
-        let src = if let Some(mapped_start) = self.mapped_start {
-            let src_vaddr = VirtAddr::new(
-                mapped_start
-                    .data()
-                    .checked_add(offset)
-                    .ok_or(SystemError::EOVERFLOW)?,
-            );
-            src_vaddr
-        } else {
-            let paddr = self.region_start.add(offset);
-            unsafe { MMArch::phys_2_virt(paddr) }.ok_or(SystemError::EFAULT)?
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.data() as *const u8, buf.as_mut_ptr(), len);
-        }
+        self.copy_from_pmem(offset, &mut buf[..len])?;
 
         Ok(len)
     }
 
     fn write_at_sync(
         &self,
-        _lba_id_start: BlockId,
-        _count: usize,
-        _buf: &[u8],
+        lba_id_start: BlockId,
+        count: usize,
+        buf: &[u8],
     ) -> Result<usize, SystemError> {
-        Err(SystemError::EROFS)
+        if count == 0 {
+            return Ok(0);
+        }
+        if self.access == PmemAccessMode::ReadOnly {
+            return Err(SystemError::EROFS);
+        }
+
+        let offset = lba_id_start
+            .checked_mul(LBA_SIZE)
+            .ok_or(SystemError::EOVERFLOW)?;
+        let len = count.checked_mul(LBA_SIZE).ok_or(SystemError::EOVERFLOW)?;
+
+        if len > buf.len() {
+            return Err(SystemError::EINVAL);
+        }
+        self.checked_io_range(offset, len)?;
+        self.copy_to_pmem(offset, &buf[..len])?;
+        Ok(len)
     }
 
     fn sync(&self) -> Result<(), SystemError> {
+        if let Some(provider) = &self.provider {
+            provider.flush()?;
+        }
         Ok(())
+    }
+
+    fn supports_reliable_flush(&self) -> bool {
+        self.provider.is_some()
     }
 
     fn blk_size_log2(&self) -> u8 {

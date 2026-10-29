@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spinlock &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="Mutex (Mutual Exclusion)" href="mutex.html" />
+    <link rel="prev" title="Types of Locks and Their Rules" href="locks.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/device/index.html">Device</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Locks</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="locks.html">Types of Locks and Their Rules</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Spinlock</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#introduction">1. Introduction</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#rawspinlock-raw-spinlock">2. RawSpinLock - Raw Spinlock</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#spinlock-spinlock-with-guard">3. SpinLock - Spinlock with Guard</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="mutex.html">Mutex (Mutual Exclusion)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rwlock.html">RwLock Read-Write Lock</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../device/index.html">设备</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Locks</a></li>
+      <li class="breadcrumb-item active">Spinlock</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/ac64a32/docs/locales/en/kernel/locking/spinlock.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/locking/spinlock.md</p></li>
+<li><p>Translation time: 2025-05-19 01:43:03</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<div class="admonition note" id="translated-label-spinlock-doc-en">
+<p class="admonition-title">备注</p>
+<p>Author: Longjin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;RinGoTek&#46;cn">longjin<span>&#64;</span>RinGoTek<span>&#46;</span>cn</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="spinlock">
+<h1>Spinlock<a class="headerlink" href="#spinlock" title="Permalink to this heading"></a></h1>
+<section id="introduction">
+<h2>1. Introduction<a class="headerlink" href="#introduction" title="Permalink to this heading"></a></h2>
+<p>  A spinlock is a type of lock used for synchronization in multi-threaded environments. Threads repeatedly check if the lock variable is available. Since the thread remains in a running state during this process, it is a form of busy waiting. Once a spinlock is acquired, the thread will hold onto it until it is explicitly released.</p>
+<p>  DragonOS implements spinlocks in the <code class="docutils literal notranslate"><span class="pre">kernel/src/lib/spinlock.rs</span></code> file. Based on slight differences in functional characteristics, two types of spinlocks, <code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code> and <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code>, are provided.</p>
+</section>
+<section id="rawspinlock-raw-spinlock">
+<span id="translated-label-spinlock-doc-rawspinlock-en"></span><h2>2. RawSpinLock - Raw Spinlock<a class="headerlink" href="#rawspinlock-raw-spinlock" title="Permalink to this heading"></a></h2>
+<p>  <code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code> is a raw spinlock, whose data part contains an AtomicBool, implementing the basic functionality of a spinlock. Its locking and unlocking require manual determination of the corresponding timing, meaning that, like spinlocks used in other languages, you need to first call the <code class="docutils literal notranslate"><span class="pre">lock()</span></code> method, and then manually call the <code class="docutils literal notranslate"><span class="pre">unlock()</span></code> method when leaving the critical section. We do not explicitly inform the compiler of which data the spinlock is protecting.</p>
+<p>  RawSpinLock provides programmers with very flexible control over locking and unlocking. However, due to its excessive flexibility, it is easy to make mistakes when using it. Common issues include “accessing critical section data without locking”, “forgetting to unlock”, and “double unlocking”. The compiler cannot check for these issues, and they can only be discovered at runtime.</p>
+<div class="admonition warning">
+<p class="admonition-title">警告</p>
+<p><code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code> is not binary compatible with the C version of <code class="docutils literal notranslate"><span class="pre">spinlock_t</span></code>. If you need to operate on the C version of <code class="docutils literal notranslate"><span class="pre">spinlock_t</span></code> for temporary compatibility reasons, please use the operation functions for the C version of spinlock_t provided in <code class="docutils literal notranslate"><span class="pre">spinlock.rs</span></code>.</p>
+<p>However, for newly developed features, please do not use the C version of <code class="docutils literal notranslate"><span class="pre">spinlock_t</span></code>, as it will be removed as code refactoring progresses.</p>
+</div>
+</section>
+<section id="spinlock-spinlock-with-guard">
+<span id="translated-label-spinlock-doc-spinlock-en"></span><h2>3. SpinLock - Spinlock with Guard<a class="headerlink" href="#spinlock-spinlock-with-guard" title="Permalink to this heading"></a></h2>
+<p>  <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code> is an encapsulation of <code class="docutils literal notranslate"><span class="pre">RawSpinLock</span></code>, enabling compile-time checks for issues such as “accessing critical section data without locking”, “forgetting to unlock”, and “double unlocking”; it also supports internal mutability of data.</p>
+<p>  Its struct prototype is as follows:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="cp">#[derive(Debug)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">SpinLock</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">lock</span>: <span class="nc">RawSpinlock</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// 自旋锁保护的数据</span>
+<span class="w">    </span><span class="n">data</span>: <span class="nc">UnsafeCell</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<section id="usage">
+<h3>3.1. Usage<a class="headerlink" href="#usage" title="Permalink to this heading"></a></h3>
+<p>  You can initialize a SpinLock like this:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SpinLock</span>::<span class="n">new</span><span class="p">(</span><span class="nb">Vec</span>::<span class="n">new</span><span class="p">());</span>
+</pre></div>
+</div>
+<p>  When initializing this SpinLock, you must pass the data you want to protect into the SpinLock, which will then manage it.</p>
+<p>  When you need to read or modify data protected by SpinLock, please first use the <code class="docutils literal notranslate"><span class="pre">lock()</span></code> method of SpinLock. This method will return a <code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>. You can use the member functions of the protected data to perform some operations, or directly read and write the protected data. (This is equivalent to obtaining a mutable reference to the protected data.)</p>
+<p>  The complete example is shown in the code below:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span>:<span class="nc">SpinLock</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="n">SpinLock</span>::<span class="n">new</span><span class="p">(</span><span class="nb">Vec</span>::<span class="n">new</span><span class="p">());</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">g</span><span class="w"> </span>:<span class="nc">SpinLockGuard</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="n">x</span><span class="p">.</span><span class="n">lock</span><span class="p">();</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert!</span><span class="p">(</span><span class="n">g</span><span class="p">.</span><span class="n">as_slice</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">as_slice</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">[</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">]);</span>
+<span class="w">        </span><span class="c1">// 在此处，SpinLock是加锁的状态</span>
+<span class="w">        </span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;x={:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// 由于上方的变量`g`，也就是SpinLock守卫的生命周期结束，自动释放了SpinLock。因此，在此处，SpinLock是放锁的状态</span>
+<span class="w">    </span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;x={:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  For variables inside a struct, we can use SpinLock to perform fine-grained locking, that is, wrap the member variables that need to be locked in SpinLock, for example:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">a</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="n">data</span>: <span class="nc">SpinLock</span><span class="o">&lt;</span><span class="n">data_struct</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  Of course, we can also lock the entire struct:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span> <span class="nc">MyStruct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="n">data</span>: <span class="nc">data_struct</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="sd">/// 被全局加锁的结构体</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">LockedMyStruct</span><span class="p">(</span><span class="n">SpinLock</span><span class="o">&lt;</span><span class="n">MyStruct</span><span class="o">&gt;</span><span class="p">);</span>
+</pre></div>
+</div>
+</section>
+<section id="principle">
+<h3>3.2. Principle<a class="headerlink" href="#principle" title="Permalink to this heading"></a></h3>
+<p>  <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code> can achieve compile-time checking because it introduces a <code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code> as a guard. When writing code, we ensure that only after calling the <code class="docutils literal notranslate"><span class="pre">lock()</span></code> method of <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code> to acquire the lock can a <code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code> be generated. Moreover, whenever we want to access protected data, we must obtain a guard. We also implement the <code class="docutils literal notranslate"><span class="pre">Drop</span></code> trait for <code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>; when the guard’s lifetime ends, the lock will be automatically released. There is no other way to release the lock. Therefore, we can know that, in a context, as long as the <code class="docutils literal notranslate"><span class="pre">SpinLockGuard</span></code>’s lifetime has not ended, it has the right to access the critical section data, and the data access is safe.</p>
+</section>
+<section id="existing-issues">
+<h3>3.3. Existing Issues<a class="headerlink" href="#existing-issues" title="Permalink to this heading"></a></h3>
+<section id="double-locking">
+<h4>3.3.1. Double Locking<a class="headerlink" href="#double-locking" title="Permalink to this heading"></a></h4>
+<p>  Please note that the compile-time checks supported by <code class="docutils literal notranslate"><span class="pre">SpinLock</span></code> are not omnipotent. It currently cannot detect the issue of “double locking” at compile time. Consider this scenario: function A acquires the lock, and then function B attempts to lock again, which results in a “double locking” issue. This kind of problem cannot be detected at compile time.</p>
+<p>  To address this issue, we recommend the following programming approach:</p>
+<ul class="simple">
+<li><p>If function B needs to access data within the critical section, function B should receive a parameter of type <code class="docutils literal notranslate"><span class="pre">&amp;SpinLockGuard</span></code>, which is obtained by function A. In this way, function B can access the data within the critical section.</p></li>
+</ul>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="locks.html" class="btn btn-neutral float-left" title="Types of Locks and Their Rules" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="mutex.html" class="btn btn-neutral float-right" title="Mutex (Mutual Exclusion)" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>ac64a32</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.4.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/kernel/locking/spinlock.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/locales/en/kernel/locking/spinlock.html">V0.3.0</a></dd>
+      <dd><a href="spinlock.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/locking/spinlock.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

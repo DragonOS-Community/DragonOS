@@ -6,14 +6,12 @@ use super::pci_irq::{IrqType, PciIrqError};
 use super::raw_device::PciGeneralDevice;
 use super::root::{pci_root_0, PciRoot};
 
-use crate::arch::{PciArch, TraitPciArch};
+pub use super::bar::*;
+
 use crate::driver::pci::subsys::pci_bus_subsys_init;
 use crate::exception::IrqNumber;
+use crate::libs::mutex::Mutex;
 use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-use crate::mm::mmio_buddy::{mmio_pool, MMIOSpaceGuard};
-
-use crate::mm::VirtAddr;
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -22,10 +20,7 @@ use alloc::{boxed::Box, collections::LinkedList};
 use bitflags::bitflags;
 use log::{debug, error, info, warn};
 
-use core::{
-    convert::TryFrom,
-    fmt::{self, Debug, Display, Formatter},
-};
+use core::fmt::{self, Debug, Display, Formatter};
 // PCI_DEVICE_LINKEDLIST 添加了读写锁的全局链表，里面存储了检索到的PCI设备结构体
 lazy_static! {
     pub static ref PCI_DEVICE_LINKEDLIST: PciDeviceLinkedList = PciDeviceLinkedList::new();
@@ -184,10 +179,8 @@ pub fn get_pci_device_structure<'a>(
     result
 }
 
-//Bar0寄存器的offset
-const BAR0_OFFSET: u8 = 0x10;
 //Status、Command寄存器的offset
-const STATUS_COMMAND_OFFSET: u8 = 0x04;
+pub(super) const STATUS_COMMAND_OFFSET: u8 = 0x04;
 /// ID for vendor-specific PCI capabilities.(Virtio Capabilities)
 pub const PCI_CAP_ID_VNDR: u8 = 0x09;
 pub const PCI_CAP_ID_MSI: u8 = 0x05;
@@ -282,6 +275,7 @@ impl From<u8> for HeaderType {
 pub enum PciError {
     /// The device reported an invalid BAR type.
     InvalidBarType,
+    InvalidBarRange,
     CreateMmioError,
     InvalidBusDeviceFunction,
     SegmentNotFound,
@@ -296,6 +290,7 @@ impl Display for PciError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Self::InvalidBarType => write!(f, "Invalid PCI BAR type."),
+            Self::InvalidBarRange => write!(f, "Invalid PCI BAR range."),
             Self::CreateMmioError => write!(f, "Error occurred while creating mmio."),
             Self::InvalidBusDeviceFunction => write!(f, "Found invalid BusDeviceFunction."),
             Self::SegmentNotFound => write!(f, "Target segment not found"),
@@ -375,6 +370,16 @@ pub trait PciDeviceStructure: Send + Sync {
     fn bar_ioremap(&self) -> Option<Result<u8, PciError>> {
         None
     }
+    fn bar_ioremap_excluding(&self, _metadata_only_bars: &[u8]) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap_with_mappings(_metadata_only_bars, &[])
+    }
+    fn bar_ioremap_with_mappings(
+        &self,
+        _metadata_only_bars: &[u8],
+        _required_mappings: &[PciBarMappingRequest],
+    ) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap()
+    }
     /// @brief 获取PCI设备的bar寄存器的引用
     /// @return
     #[inline(always)]
@@ -393,6 +398,50 @@ pub trait PciDeviceStructure: Send + Sync {
             }
         }
         None
+    }
+    /// Return the BAR subranges required by the MSI-X table and pending-bit array.
+    fn msix_mapping_requests(&self) -> Result<Vec<PciBarMappingRequest>, PciError> {
+        let Some(capability) = self
+            .capabilities()
+            .and_then(|mut caps| caps.find(|cap| cap.id == PCI_CAP_ID_MSIX))
+        else {
+            return Ok(Vec::new());
+        };
+        let table_offset = capability
+            .offset
+            .checked_add(4)
+            .ok_or(PciError::InvalidBarRange)?;
+        let pba_offset = capability
+            .offset
+            .checked_add(8)
+            .ok_or(PciError::InvalidBarRange)?;
+        let bus_device_function = self.common_header().bus_device_function;
+        let table = pci_root_0().read_config(bus_device_function, table_offset.into());
+        let pba = pci_root_0().read_config(bus_device_function, pba_offset.into());
+        let table_bar = (table & 0x7) as u8;
+        let pba_bar = (pba & 0x7) as u8;
+        if table_bar >= 6 || pba_bar >= 6 {
+            return Err(PciError::InvalidBarType);
+        }
+        let vectors = u64::from(capability.private_header & 0x7ff) + 1;
+        let table_length = vectors.checked_mul(16).ok_or(PciError::InvalidBarRange)?;
+        let pba_length = vectors
+            .checked_add(63)
+            .and_then(|count| count.checked_div(64))
+            .and_then(|entries| entries.checked_mul(8))
+            .ok_or(PciError::InvalidBarRange)?;
+        Ok(vec![
+            PciBarMappingRequest {
+                bar: table_bar,
+                offset: u64::from(table & !0x7),
+                length: table_length,
+            },
+            PciBarMappingRequest {
+                bar: pba_bar,
+                offset: u64::from(pba & !0x7),
+                length: pba_length,
+            },
+        ])
     }
     /// @brief 寻找设备的msi空间的offset
     fn msi_capability_offset(&self) -> Option<u8> {
@@ -426,10 +475,13 @@ pub struct PciDeviceStructureHeader {
     pub latency_timer: u8,   // 延迟计时器：以 PCI 总线时钟为单位指定延迟计时器。
     pub header_type: u8, // 标头类型 a value of 0x0 specifies a general device, a value of 0x1 specifies a PCI-to-PCI bridge, and a value of 0x2 specifies a CardBus bridge. If bit 7 of this register is set, the device has multiple functions; otherwise, it is a single function device.
     pub bist: u8, // Represents that status and allows control of a devices BIST (built-in self test).
-                  // Here is the layout of the BIST register:
-                  // |     bit7     |    bit6    | Bits 5-4 |     Bits 3-0    |
-                  // | BIST Capable | Start BIST | Reserved | Completion Code |
-                  // for more details, please visit https://wiki.osdev.org/PCI
+    /// Serializes the complete IRQ setup/teardown lifecycle without holding a
+    /// preemption-disabling lock across synchronous handler retirement.
+    pub(crate) irq_lifecycle: Mutex<()>,
+    // Here is the layout of the BIST register:
+    // |     bit7     |    bit6    | Bits 5-4 |     Bits 3-0    |
+    // | BIST Capable | Start BIST | Reserved | Completion Code |
+    // for more details, please visit https://wiki.osdev.org/PCI
 }
 
 /// Pci_Device_Structure_General_Device PCI标准设备结构体
@@ -479,8 +531,22 @@ impl PciDeviceStructure for PciDeviceStructureGeneralDevice {
         })
     }
     fn bar_ioremap(&self) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap_excluding(&[])
+    }
+    fn bar_ioremap_excluding(&self, metadata_only_bars: &[u8]) -> Option<Result<u8, PciError>> {
+        self.bar_ioremap_with_mappings(metadata_only_bars, &[])
+    }
+    fn bar_ioremap_with_mappings(
+        &self,
+        metadata_only_bars: &[u8],
+        required_mappings: &[PciBarMappingRequest],
+    ) -> Option<Result<u8, PciError>> {
         let common_header = &self.common_header;
-        match pci_bar_init(common_header.bus_device_function) {
+        match pci_bar_init(
+            common_header.bus_device_function,
+            metadata_only_bars,
+            required_mappings,
+        ) {
             Ok(bar) => {
                 *self.standard_device_bar.write() = bar;
                 Some(Ok(0))
@@ -710,6 +776,7 @@ fn pci_read_header(
         latency_timer,
         header_type,
         bist,
+        irq_lifecycle: Mutex::new(()),
     };
     match HeaderType::from(header_type & 0x7f) {
         HeaderType::Standard => {
@@ -1151,275 +1218,6 @@ impl Display for BusDeviceFunction {
         )
     }
 }
-/// The location allowed for a memory BAR.
-/// memory BAR的三种情况
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum MemoryBarType {
-    /// The BAR has a 32-bit address and can be mapped anywhere in 32-bit address space.
-    Width32,
-    /// The BAR must be mapped below 1MiB.
-    Below1MiB,
-    /// The BAR has a 64-bit address and can be mapped anywhere in 64-bit address space.
-    Width64,
-}
-///实现MemoryBarType与u8的类型转换
-impl From<MemoryBarType> for u8 {
-    fn from(bar_type: MemoryBarType) -> Self {
-        match bar_type {
-            MemoryBarType::Width32 => 0,
-            MemoryBarType::Below1MiB => 1,
-            MemoryBarType::Width64 => 2,
-        }
-    }
-}
-///实现MemoryBarType与u8的类型转换
-impl TryFrom<u8> for MemoryBarType {
-    type Error = PciError;
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Width32),
-            1 => Ok(Self::Below1MiB),
-            2 => Ok(Self::Width64),
-            _ => Err(PciError::InvalidBarType),
-        }
-    }
-}
-
-/// Information about a PCI Base Address Register.
-/// BAR的三种类型 Memory/IO/Unused
-#[derive(Clone, Debug)]
-pub enum BarInfo {
-    /// The BAR is for a memory region.
-    Memory {
-        /// The size of the BAR address and where it can be located.
-        address_type: MemoryBarType,
-        /// If true, then reading from the region doesn't have side effects. The CPU may cache reads
-        /// and merge repeated stores.
-        prefetchable: bool,
-        /// The memory address, always 16-byte aligned.
-        address: u64,
-        /// The size of the BAR in bytes.
-        size: u32,
-        /// The virtaddress for a memory bar(mapped).
-        mmio_guard: Arc<MMIOSpaceGuard>,
-    },
-    /// The BAR is for an I/O region.
-    IO {
-        /// The I/O address, always 4-byte aligned.
-        address: u32,
-        /// The size of the BAR in bytes.
-        size: u32,
-    },
-    Unused,
-}
-
-impl BarInfo {
-    /// Returns the address and size of this BAR if it is a memory bar, or `None` if it is an IO
-    /// BAR.
-    ///@brief 得到某个bar的memory_address与size(前提是他的类型为Memory Bar)
-    ///@param self
-    ///@return Option<(u64, u32) 是Memory Bar返回内存地址与大小，不是则返回None
-    pub fn memory_address_size(&self) -> Option<(u64, u32)> {
-        if let Self::Memory { address, size, .. } = self {
-            Some((*address, *size))
-        } else {
-            None
-        }
-    }
-    ///@brief 得到某个bar的virtaddress(前提是他的类型为Memory Bar)
-    ///@param self
-    ///@return Option<(u64) 是Memory Bar返回映射的虚拟地址，不是则返回None
-    pub fn virtual_address(&self) -> Option<VirtAddr> {
-        if let Self::Memory { mmio_guard, .. } = self {
-            Some(mmio_guard.vaddr())
-        } else {
-            None
-        }
-    }
-}
-///实现BarInfo的Display trait，自定义输出
-impl Display for BarInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Memory {
-                address_type,
-                prefetchable,
-                address,
-                size,
-                mmio_guard,
-            } => write!(
-                f,
-                "Memory space at {:#010x}, size {}, type {:?}, prefetchable {}, mmio_guard: {:?}",
-                address, size, address_type, prefetchable, mmio_guard
-            ),
-            Self::IO { address, size } => {
-                write!(f, "I/O space at {:#010x}, size {}", address, size)
-            }
-            Self::Unused => {
-                write!(f, "Unused bar")
-            }
-        }
-    }
-}
-// todo 增加对桥的bar的支持
-pub trait PciDeviceBar {}
-
-///一个普通PCI设备（非桥）有6个BAR寄存器，PciStandardDeviceBar存储其全部信息
-#[derive(Clone, Debug)]
-pub struct PciStandardDeviceBar {
-    bar0: BarInfo,
-    bar1: BarInfo,
-    bar2: BarInfo,
-    bar3: BarInfo,
-    bar4: BarInfo,
-    bar5: BarInfo,
-}
-
-impl PciStandardDeviceBar {
-    ///@brief 得到某个bar的barinfo
-    ///@param self ，bar_index(0-5)
-    ///@return Result<&BarInfo, PciError> bar_index在0-5则返回对应的bar_info结构体，超出范围则返回错误
-    pub fn get_bar(&self, bar_index: u8) -> Result<&BarInfo, PciError> {
-        match bar_index {
-            0 => Ok(&self.bar0),
-            1 => Ok(&self.bar1),
-            2 => Ok(&self.bar2),
-            3 => Ok(&self.bar3),
-            4 => Ok(&self.bar4),
-            5 => Ok(&self.bar5),
-            _ => Err(PciError::InvalidBarType),
-        }
-    }
-}
-///实现PciStandardDeviceBar的Display trait，使其可以直接输出
-impl Display for PciStandardDeviceBar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "\r\nBar0:{}\r\nBar1:{}\r\nBar2:{}\r\nBar3:{}\r\nBar4:{}\r\nBar5:{}",
-            self.bar0, self.bar1, self.bar2, self.bar3, self.bar4, self.bar5
-        )
-    }
-}
-///实现PciStandardDeviceBar的Default trait，使其可以简单初始化
-impl Default for PciStandardDeviceBar {
-    fn default() -> Self {
-        PciStandardDeviceBar {
-            bar0: BarInfo::Unused,
-            bar1: BarInfo::Unused,
-            bar2: BarInfo::Unused,
-            bar3: BarInfo::Unused,
-            bar4: BarInfo::Unused,
-            bar5: BarInfo::Unused,
-        }
-    }
-}
-
-///@brief 将某个pci设备的bar寄存器读取值后映射到虚拟地址
-///@param self ，bus_device_function PCI设备的唯一标识符
-///@return Result<PciStandardDeviceBar, PciError> 成功则返回对应的PciStandardDeviceBar结构体，失败则返回错误类型
-pub fn pci_bar_init(
-    bus_device_function: BusDeviceFunction,
-) -> Result<PciStandardDeviceBar, PciError> {
-    let mut device_bar: PciStandardDeviceBar = PciStandardDeviceBar::default();
-    let mut bar_index_ignore: u8 = 255;
-    for bar_index in 0..6 {
-        if bar_index == bar_index_ignore {
-            continue;
-        }
-        let bar_info;
-        let bar_orig =
-            pci_root_0().read_config(bus_device_function, (BAR0_OFFSET + 4 * bar_index).into());
-        pci_root_0().write_config(
-            bus_device_function,
-            (BAR0_OFFSET + 4 * bar_index).into(),
-            0xffffffff,
-        );
-        let size_mask =
-            pci_root_0().read_config(bus_device_function, (BAR0_OFFSET + 4 * bar_index).into());
-        // A wrapping add is necessary to correctly handle the case of unused BARs, which read back
-        // as 0, and should be treated as size 0.
-        let size = (!(size_mask & 0xfffffff0)).wrapping_add(1);
-        //debug!("bar_orig:{:#x},size: {:#x}", bar_orig,size);
-        // Restore the original value.
-        pci_root_0().write_config(
-            bus_device_function,
-            (BAR0_OFFSET + 4 * bar_index).into(),
-            bar_orig,
-        );
-        if size == 0 {
-            continue;
-        }
-        if bar_orig & 0x00000001 == 0x00000001 {
-            // I/O space
-            let address = bar_orig & 0xfffffffc;
-            bar_info = BarInfo::IO { address, size };
-        } else {
-            // Memory space
-            let mut address = u64::from(bar_orig & 0xfffffff0);
-            let prefetchable = bar_orig & 0x00000008 != 0;
-            let address_type = MemoryBarType::try_from(((bar_orig & 0x00000006) >> 1) as u8)?;
-            if address_type == MemoryBarType::Width64 {
-                if bar_index >= 5 {
-                    return Err(PciError::InvalidBarType);
-                }
-                let address_top = pci_root_0().read_config(
-                    bus_device_function,
-                    (BAR0_OFFSET + 4 * (bar_index + 1)).into(),
-                );
-                address |= u64::from(address_top) << 32;
-                bar_index_ignore = bar_index + 1; //下个bar跳过，因为64位的memory bar覆盖了两个bar
-            }
-            let pci_address = PciAddr::new(address as usize);
-            let paddr = PciArch::address_pci_to_physical(pci_address); //PCI总线域物理地址转换为存储器域物理地址
-
-            let space_guard: Arc<MMIOSpaceGuard>;
-            unsafe {
-                let size_want = size as usize;
-                let tmp = mmio_pool()
-                    .create_mmio(size_want)
-                    .map_err(|_| PciError::CreateMmioError)?;
-                space_guard = Arc::new(tmp);
-                //debug!("Pci bar init: mmio space: {space_guard:?}, paddr={paddr:?}, size_want={size_want}");
-                assert!(
-                    space_guard.map_phys(paddr, size_want).is_ok(),
-                    "pci_bar_init: map_phys failed"
-                );
-            }
-            bar_info = BarInfo::Memory {
-                address_type,
-                prefetchable,
-                address,
-                size,
-                mmio_guard: space_guard,
-            };
-        }
-        match bar_index {
-            0 => {
-                device_bar.bar0 = bar_info;
-            }
-            1 => {
-                device_bar.bar1 = bar_info;
-            }
-            2 => {
-                device_bar.bar2 = bar_info;
-            }
-            3 => {
-                device_bar.bar3 = bar_info;
-            }
-            4 => {
-                device_bar.bar4 = bar_info;
-            }
-            5 => {
-                device_bar.bar5 = bar_info;
-            }
-            _ => {}
-        }
-    }
-    //debug!("pci_device_bar:{}", device_bar);
-    return Ok(device_bar);
-}
-
 /// Information about a PCI device capability.
 /// PCI设备的capability的信息
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

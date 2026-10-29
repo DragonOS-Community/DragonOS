@@ -1,33 +1,33 @@
-# 挂载传播性机制
+# Mount Propagation Mechanism
 
-## 1. 概述
+## 1. Overview
 
-挂载传播性（Mount Propagation）是 Linux 内核在 2.6.15 版本引入的一项重要特性，DragonOS 对此进行了完整实现。该机制控制在一个挂载点上发生的挂载/卸载事件是否以及如何传播到其他相关的挂载点。
+Mount Propagation is an important feature introduced in Linux kernel version 2.6.15, which has been fully implemented in DragonOS. This mechanism controls whether and how mount/unmount events occurring on one mount point propagate to other related mount points.
 
-### 1.1 为什么需要挂载传播性？
+### 1.1 Why Mount Propagation is Needed?
 
-在容器化和命名空间隔离的场景下，不同进程可能拥有不同的挂载命名空间（Mount Namespace）。传统的挂载行为无法满足以下需求：
+In containerized and namespace-isolated scenarios, different processes may have different mount namespaces (Mount Namespace). Traditional mount behavior cannot meet the following requirements:
 
-1. **共享存储**：多个容器需要看到相同的存储变化
-2. **隔离性**：某些容器的挂载变化不应影响其他容器
-3. **灵活配置**：不同目录树需要不同的传播策略
+1. **Shared Storage**: Multiple containers need to see the same storage changes
+2. **Isolation**: Mount changes in some containers should not affect other containers
+3. **Flexible Configuration**: Different directory trees require different propagation policies
 
-### 1.2 核心概念
+### 1.2 Core Concepts
 
-挂载传播性引入了以下核心概念：
+Mount Propagation introduces the following core concepts:
 
-| 概念 | 说明 |
-|------|------|
-| **Peer Group** | 一组共享挂载事件的挂载点集合 |
-| **传播类型** | 定义挂载点如何参与事件传播 |
-| **Bind Mount** | 将一个目录树绑定到另一个位置 |
-| **命名空间** | 挂载点的隔离边界 |
+| Concept | Description |
+|---------|-------------|
+| **Peer Group** | A collection of mount points that share mount events |
+| **Propagation Type** | Defines how a mount point participates in event propagation |
+| **Bind Mount** | Binds a directory tree to another location |
+| **Namespace** | The isolation boundary of mount points |
 
-## 2. 传播类型
+## 2. Propagation Types
 
-DragonOS 支持四种传播类型，每种类型定义了不同的事件传播行为：
+DragonOS supports four propagation types, each defining different event propagation behaviors:
 
-### 2.1 Shared（共享）
+### 2.1 Shared
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -42,16 +42,16 @@ DragonOS 支持四种传播类型，每种类型定义了不同的事件传播�
 └─────────────────────────────────────────────────────────┘
 ```
 
-**特性**：
-- 属于同一 Peer Group 的挂载点双向传播事件
-- 在任一 Peer 上的 mount/umount 操作会传播到所有其他 Peer
-- 通过 `MS_SHARED` 标志设置
+**Characteristics**:
+- Mount points in the same Peer Group bidirectionally propagate events
+- mount/umount operations on any Peer propagate to all other Peers
+- Set via `MS_SHARED` flag
 
-**典型用例**：
-- 多个容器需要共享相同的存储视图
-- 跨命名空间的实时同步
+**Typical Use Cases**:
+- Multiple containers needing to share the same storage view
+- Real-time synchronization across namespaces
 
-### 2.2 Private（私有）
+### 2.2 Private
 
 ```
 ┌─────────────┐         ┌─────────────┐
@@ -62,16 +62,16 @@ DragonOS 支持四种传播类型，每种类型定义了不同的事件传播�
       不传播任何事件
 ```
 
-**特性**：
-- 挂载事件既不发送也不接收
-- 每个挂载点完全独立
-- 这是新建挂载的默认类型
+**Characteristics**:
+- Mount events are neither sent nor received
+- Each mount point is completely independent
+- This is the default type for newly created mounts
 
-**典型用例**：
-- 需要完全隔离的容器
-- 临时挂载点
+**Typical Use Cases**:
+- Containers requiring complete isolation
+- Temporary mount points
 
-### 2.3 Slave（从属）
+### 2.3 Slave
 
 ```
 ┌─────────────┐         ┌─────────────┐
@@ -82,16 +82,16 @@ DragonOS 支持四种传播类型，每种类型定义了不同的事件传播�
     单向传播：Master → Slave
 ```
 
-**特性**：
-- 只接收来自 Master 的事件，不向外传播
-- 可以有自己的本地挂载变化，但不影响 Master
-- Master 必须是 Shared 类型
+**Characteristics**:
+- Only receives events from the Master, does not propagate outward
+- Can have its own local mount changes, but does not affect the Master
+- The Master must be of Shared type
 
-**典型用例**：
-- 只读共享视图
-- 容器需要看到主机的挂载变化，但不能影响主机
+**Typical Use Cases**:
+- Read-only shared views
+- Containers needing to see host mount changes without affecting the host
 
-### 2.4 Unbindable（不可绑定）
+### 2.4 Unbindable
 
 ```
 ┌─────────────┐         ┌─────────────┐
@@ -101,20 +101,20 @@ DragonOS 支持四种传播类型，每种类型定义了不同的事件传播�
 └─────────────┘         └─────────────┘
 ```
 
-**特性**：
-- 不能被 bind mount
-- 不参与任何传播
-- 最强的隔离级别
+**Characteristics**:
+- Cannot be bind mounted
+- Does not participate in any propagation
+- The strongest level of isolation
 
-**典型用例**：
-- 敏感数据目录
-- 防止意外暴露的系统目录
+**Typical Use Cases**:
+- Sensitive data directories
+- System directories that need to prevent accidental exposure
 
-## 3. Peer Group 机制
+## 3. Peer Group Mechanism
 
-### 3.1 什么是 Peer Group？
+### 3.1 What is a Peer Group?
 
-Peer Group 是共享挂载传播关系的挂载点集合。同一 Peer Group 内的所有 Shared 挂载点会双向传播挂载事件。
+A Peer Group is a collection of mount points that share mount propagation relationships. All Shared mount points within the same Peer Group bidirectionally propagate mount events.
 
 ```
                     ┌──────────────────────────────────┐
@@ -138,17 +138,17 @@ Peer Group 是共享挂载传播关系的挂载点集合。同一 Peer Group 内
                     └──────────────────────────────────┘
 ```
 
-### 3.2 Peer Group 的形成
+### 3.2 Formation of Peer Groups
 
-Peer Group 在以下情况形成或扩展：
+Peer Groups are formed or expanded in the following situations:
 
-1. **设置 Shared 类型**：当挂载点首次被设为 Shared，分配新的 Group ID
-2. **Bind Mount**：对 Shared 挂载执行 bind mount，新挂载加入同一 Peer Group
-3. **命名空间复制**：`unshare(CLONE_NEWNS)` 时，Shared 挂载被复制并加入同一 Peer Group
+1. **Setting Shared Type**: When a mount point is first set to Shared, a new Group ID is assigned
+2. **Bind Mount**: Performing a bind mount on a Shared mount causes the new mount to join the same Peer Group
+3. **Namespace Copy**: During `unshare(CLONE_NEWNS)`, Shared mounts are copied and join the same Peer Group
 
-### 3.3 Group ID 分配
+### 3.3 Group ID Assignment
 
-每个 Peer Group 由唯一的 Group ID 标识：
+Each Peer Group is identified by a unique Group ID:
 
 ```
 Group ID 分配器
@@ -160,15 +160,15 @@ Group ID 分配器
 └─────────────────────────────────────┘
 ```
 
-- Group ID 从 1 开始分配
-- 0 表示无效/未加入任何组
-- 当 Peer Group 为空时，ID 可回收
+- Group IDs are assigned starting from 1
+- 0 indicates invalid/not part of any group
+- When a Peer Group is empty, the ID can be recycled
 
-## 4. 事件传播流程
+## 4. Event Propagation Process
 
-### 4.1 Mount 事件传播
+### 4.1 Mount Event Propagation
 
-当在 Shared 挂载点上创建新挂载时：
+When creating a new mount on a Shared mount point:
 
 ```
 步骤 1: 在源挂载点创建子挂载
@@ -201,9 +201,9 @@ Group ID 分配器
       源               复制               复制
 ```
 
-### 4.2 Umount 事件传播
+### 4.2 Umount Event Propagation
 
-当在 Shared 挂载点上卸载子挂载时：
+When unmounting a sub-mount on a Shared mount point:
 
 ```
 步骤 1: umount("/mnt/a/sub")
@@ -227,9 +227,9 @@ Group ID 分配器
   已卸载            传播卸载          传播卸载
 ```
 
-### 4.3 传播到 Slave
+### 4.3 Propagation to Slave
 
-Slave 挂载点单向接收事件：
+Slave mount points unidirectionally receive events:
 
 ```
 ┌──────────────┐         ┌──────────────┐
@@ -246,11 +246,11 @@ Slave 挂载点单向接收事件：
                          不会传播回 Master
 ```
 
-## 5. 命名空间交互
+## 5. Namespace Interaction
 
-### 5.1 命名空间复制
+### 5.1 Namespace Copy
 
-当调用 `unshare(CLONE_NEWNS)` 创建新的挂载命名空间时：
+When calling `unshare(CLONE_NEWNS)` to create a new mount namespace:
 
 ```
 复制前（父进程的命名空间）:
@@ -283,13 +283,13 @@ unshare(CLONE_NEWNS) 后:
 └─────────────────────────────────────┘
 ```
 
-**关键行为**：
-- Private 挂载：简单复制，无 Peer 关系
-- Shared 挂载：复制后加入同一 Peer Group，建立跨命名空间传播
-- Slave 挂载：保持 Slave 关系
-- Unbindable 挂载：不可复制到新命名空间
+**Key Behaviors**:
+- Private Mounts: Simple copy, no Peer relationships
+- Shared Mounts: Copied and joined to the same Peer Group, establishing cross-namespace propagation
+- Slave Mounts: Maintain Slave relationships
+- Unbindable Mounts: Cannot be copied to new namespaces
 
-### 5.2 跨命名空间传播示例
+### 5.2 Cross-Namespace Propagation Example
 
 ```
 时间线:
@@ -312,9 +312,9 @@ T3: 父进程在 /mnt/shared/sub 挂载
 T4: 子进程也能看到 /mnt/shared/sub
 ```
 
-## 6. 传播类型转换
+## 6. Propagation Type Conversion
 
-### 6.1 状态转换图
+### 6.1 State Transition Diagram
 
 ```
                     ┌───────────────┐
@@ -333,52 +333,51 @@ T4: 子进程也能看到 /mnt/shared/sub
                      MS_PRIVATE            MS_UNBINDABLE
 ```
 
-### 6.2 转换规则
+### 6.2 Conversion Rules
 
-| 源类型 | 目标类型 | 操作 | 副作用 |
-|--------|----------|------|--------|
-| Private | Shared | `mount --make-shared` | 分配新 Group ID |
-| Shared | Private | `mount --make-private` | 从 Peer Group 移除 |
-| Shared | Slave | `mount --make-slave` | 变为 Peer Group 的接收者 |
-| Slave | Shared | `mount --make-shared` | 断开与 Master 的连接 |
-| * | Unbindable | `mount --make-unbindable` | 清除所有关系 |
+| Source Type | Target Type | Operation | Side Effects |
+|-------------|-------------|-----------|--------------|
+| Private | Shared | `mount --make-shared` | Assigns new Group ID |
+| Shared | Private | `mount --make-private` | Removes from Peer Group |
+| Shared | Slave | `mount --make-slave` | Becomes a receiver of the Peer Group |
+| Slave | Shared | `mount --make-shared` | Disconnects from the Master |
+| * | Unbindable | `mount --make-unbindable` | Clears all relationships |
 
-## 7. 设计原则
+## 7. Design Principles
 
-### 7.1 最小惊讶原则
+### 7.1 Principle of Least Surprise
 
-- 新挂载默认为 Private，不产生意外的副作用
-- 只有显式设置 Shared 才参与传播
-- 传播行为明确且可预测
+- New mounts default to Private, avoiding unexpected side effects
+- Only explicitly setting Shared participates in propagation
+- Propagation behavior is clear and predictable
 
-### 7.2 性能考虑
+### 7.2 Performance Considerations
 
-- Peer Group 使用全局注册表管理，O(1) 查找
-- 传播操作使用延迟执行，避免阻塞挂载操作
-- 弱引用（Weak）避免循环引用和内存泄漏
+- Peer Groups use a global registry for management, with O(1) lookup
+- Propagation operations use deferred execution to avoid blocking mount operations
+- Weak references prevent circular references and memory leaks
 
-### 7.3 一致性保证
+### 7.3 Consistency Guarantees
 
-- 使用原子操作和锁保护传播状态
-- 传播失败不影响原始操作
-- 支持部分传播后的状态恢复
+- Atomic operations and locks protect propagation states
+- Propagation failures do not affect the original operation
+- Supports state recovery after partial propagation
 
-## 8. 与 Linux 的兼容性
+## 8. Compatibility with Linux
 
-DragonOS 的挂载传播性实现遵循 Linux 语义：
+DragonOS's mount propagation implementation follows Linux semantics:
 
-| 特性 | Linux | DragonOS |
-|------|-------|----------|
-| Shared 传播 | ✓ | ✓ |
-| Private 隔离 | ✓ | ✓ |
-| Slave 单向传播 | ✓ | ✓ |
+| Feature | Linux | DragonOS |
+|---------|-------|----------|
+| Shared Propagation | ✓ | ✓ |
+| Private Isolation | ✓ | ✓ |
+| Slave Unidirectional Propagation | ✓ | ✓ |
 | Unbindable | ✓ | ✓ |
-| 跨命名空间传播 | ✓ | ✓ |
-| 递归传播 (MS_REC) | ✓ | ✓ |
-| /proc/self/mountinfo | ✓ | 部分 |
+| Cross-Namespace Propagation | ✓ | ✓ |
+| Recursive Propagation (MS_REC) | ✓ | ✓ |
+| /proc/self/mountinfo | ✓ | Partial |
 
-## 9. 参考资料
+## 9. References
 
 1. [Linux Kernel Documentation: Shared Subtrees](https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt)
 2. [LWN.net: Shared subtrees](https://lwn.net/Articles/159077/)
-

@@ -1,17 +1,15 @@
 use crate::arch::ipc::signal::Signal;
 use crate::arch::syscall::nr::SYS_FCNTL;
-use crate::filesystem::vfs::fasync::set_file_fasync;
+use crate::filesystem::vfs::fasync::{set_file_fasync, FAsyncHandlerPolicy};
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::InodeFlags;
-use crate::ipc::pipe::LockedPipeInode;
-use crate::process::RawPid;
+use crate::process::pid::PidType;
 use crate::{
     arch::interrupt::TrapFrame,
     filesystem::vfs::{
-        fcntl::{FcntlCommand, PosixFlock, FD_CLOEXEC, F_UNLCK},
+        fcntl::{FcntlCommand, FileOwnerEx, PosixFlock, FD_CLOEXEC, F_UNLCK},
         file::FileFlags,
         posix_lock::{get_posix_lock, set_posix_lock},
-        syscall::dup2::{do_dup2, do_dup3},
     },
     process::ProcessManager,
     syscall::table::{FormattedSyscallParam, Syscall},
@@ -87,33 +85,24 @@ impl SysFcntlHandle {
         // debug!("fcntl ({cmd:?}) fd: {fd}, arg={arg}");
         match cmd {
             FcntlCommand::DupFd | FcntlCommand::DupFdCloexec => {
-                // RLIMIT_NOFILE 检查
-                let nofile = ProcessManager::current_pcb()
-                    .get_rlimit(crate::process::resource::RLimitID::Nofile)
-                    .rlim_cur as usize;
-                let arg_i32 = arg as i32;
-                if arg_i32 < 0 || arg >= nofile {
-                    return Err(SystemError::EBADF);
+                let current = ProcessManager::current_pcb();
+                let nofile = current.nofile_soft_limit();
+                let table = current.fd_table();
+                let cloexec = cmd == FcntlCommand::DupFdCloexec;
+                let source = table.get_file_by_fd(fd).ok_or(SystemError::EBADF)?;
+                let minimum = arg as i32;
+                if minimum < 0 || minimum as usize >= nofile {
+                    return Err(SystemError::EINVAL);
                 }
-                let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
-
-                // 在RLIMIT_NOFILE范围内查找可用的文件描述符
-                for i in arg..nofile {
-                    if fd_table_guard.get_file_by_fd(i as i32).is_none() {
-                        if cmd == FcntlCommand::DupFd {
-                            return do_dup2(fd, i as i32, &mut fd_table_guard);
-                        } else {
-                            return do_dup3(
-                                fd,
-                                i as i32,
-                                FileFlags::O_CLOEXEC,
-                                &mut fd_table_guard,
-                            );
-                        }
-                    }
-                }
-                return Err(SystemError::EMFILE);
+                let reservation = crate::filesystem::vfs::file::File::recover_io(|| {
+                    table.reserve::<1>(
+                        nofile,
+                        minimum as usize,
+                        cloexec,
+                        &crate::cgroup::memory::object_for_task(&current),
+                    )
+                })?;
+                Ok(reservation.commit_arc(source) as usize)
             }
             FcntlCommand::GetFd => {
                 // Get file descriptor flags (close_on_exec is per-fd).
@@ -131,15 +120,11 @@ impl SysFcntlHandle {
             }
             FcntlCommand::SetFd => {
                 // Set file descriptor flags (close_on_exec is per-fd).
-                let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
-
-                if fd_table_guard.get_file_by_fd(fd).is_some() {
-                    let arg = arg as u32;
-                    fd_table_guard.set_cloexec(fd, arg & FD_CLOEXEC != 0);
-                    return Ok(0);
-                }
-                return Err(SystemError::EBADF);
+                let arg = arg as u32;
+                ProcessManager::current_pcb()
+                    .fd_table()
+                    .set_cloexec(fd, arg & FD_CLOEXEC != 0)?;
+                Ok(0)
             }
 
             FcntlCommand::GetFlags => {
@@ -162,7 +147,7 @@ impl SysFcntlHandle {
                 // File access mode (O_RDONLY, O_WRONLY, O_RDWR) and file creation flags
                 // (O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC) in arg are ignored.
                 let binding = ProcessManager::current_pcb().fd_table();
-                let fd_table_guard = binding.write();
+                let fd_table_guard = binding.read();
 
                 if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
                     let arg = arg as u32;
@@ -182,23 +167,37 @@ impl SysFcntlHandle {
                     {
                         return Err(SystemError::EPERM);
                     }
+                    if new_flags.contains(FileFlags::O_NOATIME)
+                        && !current_flags.contains(FileFlags::O_NOATIME)
+                    {
+                        let metadata = file.inode().metadata()?;
+                        crate::filesystem::vfs::permission::check_noatime_permission(&metadata)?;
+                    }
                     let old_fasync = current_flags.contains(FileFlags::FASYNC);
                     let new_fasync = new_flags.contains(FileFlags::FASYNC);
-                    file.set_flags(new_flags)?;
-                    if old_fasync != new_fasync {
-                        set_file_fasync(&file, fd, new_fasync)?;
-                    }
 
-                    // Keep socket object nonblocking state in sync with file flags.
-                    // Some socket implementations consult an internal AtomicBool rather than
-                    // the FileFlags, so fcntl(F_SETFL,O_NONBLOCK) must be propagated.
-                    if file.file_type() == FileType::Socket {
-                        if let Ok(inode) = ProcessManager::current_pcb().get_socket_inode(fd) {
-                            if let Some(sock) = inode.as_socket() {
-                                sock.set_nonblocking(new_flags.contains(FileFlags::O_NONBLOCK));
-                            }
+                    // Apply every potentially failing non-FASYNC flag update
+                    // before invoking the fasync handler. Linux likewise
+                    // validates flags first and lets the handler own FASYNC.
+                    let mut non_fasync_flags = new_flags;
+                    if old_fasync {
+                        non_fasync_flags.insert(FileFlags::FASYNC);
+                    } else {
+                        non_fasync_flags.remove(FileFlags::FASYNC);
+                    }
+                    file.set_flags(non_fasync_flags)?;
+
+                    if old_fasync != new_fasync {
+                        if let Err(err) =
+                            set_file_fasync(&file, fd, new_fasync, FAsyncHandlerPolicy::Optional)
+                        {
+                            // A failed fasync transition must not commit the
+                            // other status flags from this F_SETFL request.
+                            file.set_flags(current_flags)?;
+                            return Err(err);
                         }
                     }
+
                     return Ok(0);
                 }
 
@@ -259,39 +258,60 @@ impl SysFcntlHandle {
                 }
                 Ok(0)
             }
-            FcntlCommand::SetOwn => {
-                // arg 作为 pid_t（有符号整数）处理
-                let arg_i32 = arg as i32;
-                let pid = arg_i32.unsigned_abs();
-                if pid > i32::MAX as u32 {
-                    return Err(SystemError::EINVAL);
+            FcntlCommand::SetOwn
+            | FcntlCommand::GetOwn
+            | FcntlCommand::SetOwnEx
+            | FcntlCommand::GetOwnEx => {
+                let file = ProcessManager::current_pcb()
+                    .fd_table()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                if file.flags().contains(FileFlags::O_PATH) {
+                    return Err(SystemError::EBADF);
                 }
-                let pb = if pid == 0 {
-                    None
-                } else {
-                    let pb = ProcessManager::find_task_by_vpid(RawPid::from(pid as _))
-                        .ok_or(SystemError::ESRCH)?;
-                    Some(pb)
-                };
-                let binding = ProcessManager::current_pcb().fd_table();
-                let file = binding
-                    .read()
-                    .get_file_by_fd(fd)
-                    .ok_or(SystemError::EBADF)?;
-                file.set_owner(pb)?;
-                Ok(0)
+                match cmd {
+                    FcntlCommand::SetOwn => {
+                        file.set_owner(arg as i32)?;
+                        Ok(0)
+                    }
+                    FcntlCommand::GetOwn => Ok(file.owner() as isize as usize),
+                    FcntlCommand::SetOwnEx => {
+                        let reader = UserBufferReader::new(
+                            arg as *const FileOwnerEx,
+                            size_of::<FileOwnerEx>(),
+                            true,
+                        )?;
+                        let owner = reader.buffer_protected(0)?.read_one::<FileOwnerEx>(0)?;
+                        let kind = match owner.kind {
+                            0 => PidType::PID,
+                            1 => PidType::TGID,
+                            2 => PidType::PGID,
+                            _ => return Err(SystemError::EINVAL),
+                        };
+                        file.set_owner_identity(kind, owner.pid)?;
+                        Ok(0)
+                    }
+                    FcntlCommand::GetOwnEx => {
+                        let (kind, pid) = file.owner_identity();
+                        let kind = match kind {
+                            PidType::PID => 0,
+                            PidType::TGID => 1,
+                            PidType::PGID => 2,
+                            _ => unreachable!("invalid asynchronous file owner type"),
+                        };
+                        let owner = FileOwnerEx { kind, pid };
+                        let mut writer = UserBufferWriter::new(
+                            arg as *mut FileOwnerEx,
+                            size_of::<FileOwnerEx>(),
+                            true,
+                        )?;
+                        writer.buffer_protected(0)?.write_one(0, &owner)?;
+                        Ok(0)
+                    }
+                    _ => unreachable!(),
+                }
             }
 
-            FcntlCommand::GetOwn => {
-                let binding = ProcessManager::current_pcb().fd_table();
-                let file = binding
-                    .read()
-                    .get_file_by_fd(fd)
-                    .ok_or(SystemError::EBADF)?;
-                let owner = file.owner().unwrap_or(RawPid::from(0));
-
-                return Ok(owner.data());
-            }
             FcntlCommand::SetSig => {
                 let binding = ProcessManager::current_pcb().fd_table();
                 let file = binding
@@ -327,11 +347,7 @@ impl SysFcntlHandle {
                 }
 
                 // 获取 pipe inode 并返回实际大小
-                let inode = file.inode();
-                let pipe_inode = inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedPipeInode>()
-                    .ok_or(SystemError::EBADF)?;
+                let pipe_inode = file.pipe_runtime()?;
 
                 return Ok(pipe_inode.get_pipe_size());
             }
@@ -350,14 +366,30 @@ impl SysFcntlHandle {
                 }
 
                 // 获取 pipe inode 并设置大小
-                let inode = file.inode();
-                let pipe_inode = inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedPipeInode>()
-                    .ok_or(SystemError::EBADF)?;
+                let pipe_inode = file.pipe_runtime()?;
 
                 // set_pipe_size 内部会验证大小是否合法
-                return pipe_inode.set_pipe_size(arg);
+                return crate::filesystem::vfs::file::File::recover_io(|| {
+                    pipe_inode.set_pipe_size(arg)
+                });
+            }
+            FcntlCommand::GetSeals | FcntlCommand::AddSeals => {
+                let binding = ProcessManager::current_pcb().fd_table();
+                let file = binding
+                    .read()
+                    .get_file_by_fd(fd)
+                    .ok_or(SystemError::EBADF)?;
+                if cmd == FcntlCommand::GetSeals {
+                    return file.inode().get_seals().map(|bits| bits as usize);
+                }
+                if !file
+                    .mode()
+                    .contains(crate::filesystem::vfs::file::FileMode::FMODE_WRITE)
+                {
+                    return Err(SystemError::EPERM);
+                }
+                file.inode().add_seals(arg as u32)?;
+                return Ok(0);
             }
             _ => {
                 // TODO: unimplemented

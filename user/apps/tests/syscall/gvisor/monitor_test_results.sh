@@ -13,14 +13,25 @@ if [ -z "${VMSTATE_DIR}" ]; then
     exit 1
 fi
 
+# QEMU 可能以 root（tools/run-qemu.sh）或当前用户（nix）身份运行，仅当进程不属于当前用户时才使用 sudo
+qemu_kill() {
+    for _pid in "$@"; do :; done
+    [ -d "/proc/$_pid" ] || return 1
+    if [ "$(stat -c %u "/proc/$_pid")" = "$(id -u)" ]; then
+        kill "$@"
+    else
+        sudo kill "$@"
+    fi
+}
+
 # 串口文件路径
 SERIAL_FILE="serial_opt.txt"
 # 超时配置（秒）
 BOOT_TIMEOUT=300        # DragonOS开机超时（5分钟）
 TEST_START_TIMEOUT=600  # 测试程序启动超时（10分钟）
-TEST_TIMEOUT=1800       # 整个测试超时（30分钟）
-IDLE_TIMEOUT=120        # 无输出超时（5分钟）
-SINGLE_TEST_TIMEOUT=60 # 单个测试用例超时（1分钟）
+TEST_TIMEOUT=3300        # 整个测试超时（55分钟，CI job 仍保留构建与收尾时间）
+IDLE_TIMEOUT=300         # 无输出超时（5分钟）
+SINGLE_TEST_TIMEOUT=300  # mount 压力用例允许5分钟，仍对卡死保持有界
 
 # 从PID文件读取QEMU进程
 get_qemu_pid() {
@@ -48,7 +59,7 @@ if [ -z "$QEMU_PID" ]; then
     exit 1
 fi
 
-if ! sudo kill -0 $QEMU_PID 2>/dev/null; then
+if ! qemu_kill -0 $QEMU_PID 2>/dev/null; then
     echo "[监控] 错误: QEMU进程 (PID: $QEMU_PID) 不存在"
     exit 1
 fi
@@ -70,13 +81,13 @@ clean_up() {
     # 从PID文件读取QEMU进程
     if [ -f "${VMSTATE_DIR}/pid" ]; then
         QEMU_PID=$(cat "${VMSTATE_DIR}/pid")
-        if [ -n "$QEMU_PID" ] && sudo kill -0 $QEMU_PID 2>/dev/null; then
+        if [ -n "$QEMU_PID" ] && qemu_kill -0 $QEMU_PID 2>/dev/null; then
             echo "[监控] 终止QEMU进程 (PID: $QEMU_PID)"
-            sudo kill -TERM $QEMU_PID 2>/dev/null
+            qemu_kill -TERM $QEMU_PID 2>/dev/null
             sleep 3
-            if sudo kill -0 $QEMU_PID 2>/dev/null; then
+            if qemu_kill -0 $QEMU_PID 2>/dev/null; then
                 echo "[监控] 强制终止QEMU进程 (PID: $QEMU_PID)"
-                sudo kill -9 $QEMU_PID 2>/dev/null
+                qemu_kill -9 $QEMU_PID 2>/dev/null
             fi
         else
             echo "[监控] QEMU进程 (PID: $QEMU_PID) 已不存在"
@@ -115,7 +126,7 @@ show_diagnostic_info() {
 check_qemu_alive() {
     local current_pid=$(get_qemu_pid)
     if [ -n "$current_pid" ]; then
-        sudo kill -0 "$current_pid" 2>/dev/null
+        qemu_kill -0 "$current_pid" 2>/dev/null
     else
         false
     fi
@@ -123,8 +134,8 @@ check_qemu_alive() {
 
 # 检查系统是否已启动
 check_boot_complete() {
-    [ -f "$SERIAL_FILE" ] && (grep -aq "[rcS] Running system init script..." "$SERIAL_FILE" 2>/dev/null || \
-                             grep -aq "开始运行gvisor系统调用测试" "$SERIAL_FILE" 2>/dev/null)
+    [ -f "$SERIAL_FILE" ] && (grep -aFq "[rcS] Running system init script..." "$SERIAL_FILE" 2>/dev/null || \
+                             grep -aFq "开始运行gvisor系统调用测试" "$SERIAL_FILE" 2>/dev/null)
 }
 
 # 检查测试是否已开始执行

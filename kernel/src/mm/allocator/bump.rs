@@ -39,63 +39,38 @@ impl<MMA: MemoryManagementArch> BumpAllocator<MMA> {
         return self.offset;
     }
 
-    /// 返回剩余的尚未被分配的物理内存区域
-    ///
-    /// ## 返回值
-    ///
-    /// - `result_area`：剩余的尚未被分配的物理内存区域的数组
-    /// - `offset_aligned`：返回的第一个物理内存区域内，已经分配的偏移量(相对于物理内存区域的已对齐的起始地址)
-    pub fn remain_areas(&self, result_area: &mut [PhysMemoryArea]) -> Option<usize> {
+    /// Return the valid output count and the consumed offset in its first
+    /// ordinary region. Architecture additions follow those ordinary regions;
+    /// callers must apply this offset before sorting the valid output slice.
+    pub fn remain_areas(&self, result_area: &mut [PhysMemoryArea]) -> Option<(usize, usize)> {
         let mut offset = self.offset();
-
-        let iter = mem_block_manager().to_iter_available();
-
-        let mut ret_offset_aligned = 0;
-
-        let mut res_cnt = 0;
-
+        let mut first_offset = 0;
+        let mut count = 0;
         let mut found_start = false;
-        // 遍历所有的物理内存区域
-        for area in iter {
+        for area in mem_block_manager().to_iter_available() {
+            let mask = MMA::PAGE_SIZE.checked_sub(1)?;
+            let base = area.base.data().checked_add(mask)? & !mask;
+            let end = area.base.data().checked_add(area.size)? & !mask;
+            if base >= end {
+                continue;
+            }
             if !found_start {
-                // 将area的base地址与PAGE_SIZE对齐，对齐时向上取整
-                // let area_base = (area.base.data() + MMA::PAGE_SHIFT) & !(MMA::PAGE_SHIFT);
-                let area_base = area.area_base_aligned().data();
-                // 将area的末尾地址与PAGE_SIZE对齐，对齐时向下取整
-                // let area_end = (area.base.data() + area.size) & !(MMA::PAGE_SHIFT);
-                let area_end = area.area_end_aligned().data();
-
-                // 如果offset大于area_end，说明当前的物理内存区域已经分配完了，需要跳到下一个物理内存区域
-                if offset >= area_end {
+                if offset >= end {
                     continue;
                 }
-
-                // 如果offset小于area_base ,说明当前的物理内存区域还没有分配过页帧，将offset设置为area_base
-                if offset < area_base {
-                    offset = area_base;
-                } else if offset < area_end {
-                    // 将offset对齐到PAGE_SIZE
-                    offset = (offset + (MMA::PAGE_SIZE - 1)) & !(MMA::PAGE_SIZE - 1);
+                offset = offset.max(base).checked_add(mask)? & !mask;
+                if offset.checked_add(MMA::PAGE_SIZE)? > end {
+                    continue;
                 }
-                // found
-                if offset + MMA::PAGE_SIZE <= area_end {
-                    ret_offset_aligned = offset - area.area_base_aligned().data();
-                    found_start = true;
-                }
+                first_offset = offset - base;
+                found_start = true;
             }
-
-            if found_start && area.area_base_aligned() < area.area_end_aligned() {
-                result_area[res_cnt] = area;
-                res_cnt += 1;
-            }
+            *result_area.get_mut(count)? = area;
+            count += 1;
         }
-
-        let res_cnt = unsafe { Self::arch_remain_areas(result_area, res_cnt) };
-        if res_cnt == 0 {
-            return None;
-        } else {
-            return Some(ret_offset_aligned);
-        }
+        // The memblock iterator/guard has gone before architecture handoff.
+        let count = unsafe { Self::arch_remain_areas(result_area, count)? };
+        (count != 0).then_some((count, first_offset))
     }
 
     #[inline(never)]

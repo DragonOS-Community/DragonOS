@@ -3,30 +3,46 @@ use core::{fmt::Debug, ptr::null, sync::atomic::Ordering};
 use alloc::{collections::BTreeMap, ffi::CString, string::String, sync::Arc, vec::Vec};
 use system_error::SystemError;
 
-use crate::process::Signal;
-
 use crate::{
+    arch::ipc::signal::Signal,
     driver::base::block::SeekFrom,
-    filesystem::vfs::{fcntl::AtFlags, file::File, open::do_open_execat},
+    filesystem::vfs::{
+        fcntl::AtFlags,
+        fdtable::FileDescriptorTable,
+        file::File,
+        open::do_open_execat,
+        permission::{check_inode_permission, PermissionMask},
+    },
+    ipc::{process_signal::GroupExecCancelResult, sighand::SigHand},
     libs::elf::ELF_LOADER,
     mm::{
         ucontext::{AddressSpace, UserStack},
         VirtAddr,
     },
+    syscall::user_access::copy_to_user_protected,
 };
+
+// Keep unsupported architectures on their existing fallible heap path; this
+// consumer does not imply a vmalloc port for those platforms.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+type ExecPointers = crate::mm::kernel_buffer::KernelSlice<VirtAddr>;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+type ExecPointers = Vec<VirtAddr>;
+
+use super::exec_args::{ExecArguments, ExecStrings};
 
 use super::{
-    namespace::nsproxy::exec_task_namespaces,
+    namespace::{nsproxy::exec_task_namespaces, user_namespace::map_id_up},
     pid::PidType,
     shebang::{ShebangLoader, SHEBANG_LOADER, SHEBANG_MAX_RECURSION_DEPTH},
-    ProcessControlBlock, ProcessFlags, ProcessManager,
+    ProcessControlBlock, ProcessFlags, ProcessManager, PTRACE_RELATION_LOCK,
 };
 
-/// 系统支持的所有二进制文件加载器的列表
+/// List of all binary format loaders supported by the system.
 const BINARY_LOADERS: [&'static dyn BinaryLoader; 1] = [&ELF_LOADER];
 
 pub trait BinaryLoader: 'static + Debug {
-    /// 检查二进制文件是否为当前加载器支持的格式
+    /// Checks whether the binary file is in a format supported by this loader.
     fn probe(&'static self, param: &ExecParam, buf: &[u8]) -> Result<(), ExecError>;
 
     fn load(
@@ -36,10 +52,10 @@ pub trait BinaryLoader: 'static + Debug {
     ) -> Result<BinaryLoaderResult, ExecError>;
 }
 
-/// 二进制文件加载结果
+/// Result of loading a binary file.
 #[derive(Debug)]
 pub struct BinaryLoaderResult {
-    /// 程序入口地址
+    /// Program entry point address.
     entry_point: VirtAddr,
 }
 
@@ -53,19 +69,20 @@ impl BinaryLoaderResult {
     }
 }
 
-/// 二进制文件加载的完整结果
+/// The complete result of loading a binary file.
 ///
-/// 用于区分正常加载和需要重新执行(shebang场景)的情况
+/// Used to distinguish between a normal load and the need for re-execution
+/// (the shebang scenario).
 #[derive(Debug)]
 pub enum LoadBinaryResult {
-    /// 正常加载完成，返回入口点
+    /// Normal load completed; returns the entry point.
     Loaded(BinaryLoaderResult),
-    /// 需要重新执行解释器 (shebang场景)
+    /// Re-execution of an interpreter is needed (shebang scenario).
     NeedReexec {
-        /// 下一轮 exec 的启动信息
+        /// Start information for the next exec round.
         next: ExecStartInfo,
-        /// 新的argv (解释器路径 + [可选参数] + 脚本路径 + 原始参数)
-        new_argv: Vec<CString>,
+        /// Bounded shebang metadata; argv is rebuilt outside exec_update.
+        interpreter_arg: Option<String>,
     },
 }
 
@@ -115,10 +132,10 @@ impl ExecStartInfo {
     }
 }
 
-/// 执行上下文，用于跟踪递归执行状态
+/// Execution context used to track recursive execution state.
 #[derive(Debug, Clone)]
 pub struct ExecContext {
-    /// 当前递归深度
+    /// Current recursion depth.
     pub recursion_depth: usize,
 }
 
@@ -133,7 +150,7 @@ impl ExecContext {
         Self { recursion_depth: 0 }
     }
 
-    /// 检查是否超过最大递归深度
+    /// Checks whether the maximum recursion depth has been exceeded.
     pub fn check_recursion_limit(&self) -> Result<(), SystemError> {
         if self.recursion_depth >= SHEBANG_MAX_RECURSION_DEPTH {
             return Err(SystemError::ELOOP);
@@ -151,21 +168,21 @@ impl ExecContext {
 #[derive(Debug)]
 pub enum ExecError {
     SystemError(SystemError),
-    /// 二进制文件不可执行
+    /// Binary file is not executable.
     NotExecutable,
-    /// 二进制文件不是当前架构的
+    /// Binary file is for a different architecture.
     WrongArchitecture,
-    /// 访问权限不足
+    /// Insufficient access permissions.
     PermissionDenied,
-    /// 不支持的操作
+    /// Unsupported operation.
     NotSupported,
-    /// 解析文件本身的时候出现错误（比如一些字段本身不合法）
+    /// Error while parsing the file itself (e.g. some fields are invalid).
     ParseError,
-    /// 内存不足
+    /// Out of memory.
     OutOfMemory,
-    /// 参数错误
+    /// Invalid parameter.
     InvalidParemeter,
-    /// 无效的地址
+    /// Invalid address.
     BadAddress(Option<VirtAddr>),
     Other(String),
 }
@@ -189,59 +206,75 @@ impl From<ExecError> for SystemError {
 
 bitflags! {
     pub struct ExecParamFlags: u32 {
-        // 是否以可执行文件的形式加载
+        // Whether to load as an executable file.
         const EXEC = 1 << 0;
     }
 }
 
 #[derive(Debug)]
 pub struct ExecParam {
+    // Release loading protection before the File can drop its mount pin,
+    // including failed loads and interpreter parameters.
+    exec_write_guard: Arc<crate::filesystem::vfs::write_access::InodeWriteGuard>,
     file: Arc<File>,
     vm: Arc<AddressSpace>,
-    /// 一些标志位
+    /// Flags.
     flags: ExecParamFlags,
     filename: CString,
     execfn: CString,
     interp_flags: ExecInterpFlags,
-    /// 用来初始化进程的一些信息。这些信息由二进制加载器和exec机制来共同填充
+    /// Information used to initialize the process. Filled jointly by the binary
+    /// loader and the exec mechanism.
     init_info: ProcInitInfo,
+    /// Whether exec has crossed the point where the old program may no longer
+    /// resume. Errors after this point must terminate the current task.
+    point_of_no_return: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExecLoadMode {
-    /// 以可执行文件的形式加载
+    /// Load as an executable file.
     Exec,
-    /// 以动态链接库的形式加载
+    /// Load as a dynamic shared object.
     DSO,
 }
 
 #[allow(dead_code)]
 impl ExecParam {
-    /// 使用已打开的文件创建ExecParam
+    /// Create an `ExecParam` using an already-opened file.
     ///
-    /// ## 参数
-    /// - `file`: 通过do_open_execat打开的可执行文件
-    /// - `vm`: 地址空间
-    /// - `flags`: 执行标志
-    pub fn new(
+    /// ## Parameters
+    /// - `file`: The executable file opened via `do_open_execat`.
+    /// - `vm`: The address space.
+    /// - `flags`: Execution flags.
+    pub(crate) fn new(
         file: Arc<File>,
         vm: Arc<AddressSpace>,
         flags: ExecParamFlags,
         filename: CString,
         execfn: CString,
         interp_flags: ExecInterpFlags,
-    ) -> Self {
-        let mut init_info = ProcInitInfo::new(execfn.to_string_lossy().as_ref());
+        arguments: &ExecArguments,
+    ) -> Result<Self, SystemError> {
+        let exec_write_guard =
+            crate::filesystem::vfs::write_access::InodeWriteGuard::deny_write(file.inode())?;
+        let mut init_info = ProcInitInfo::new(
+            execfn.to_string_lossy().as_ref(),
+            arguments.args.clone(),
+            arguments.envs.clone(),
+        );
         init_info.execfn = Some(execfn.clone());
-        Self {
+        Ok(Self {
             file,
+            exec_write_guard,
             vm,
             flags,
             filename,
             execfn,
             interp_flags,
             init_info,
-        }
+            point_of_no_return: false,
+        })
     }
 
     pub fn vm(&self) -> &Arc<AddressSpace> {
@@ -260,7 +293,11 @@ impl ExecParam {
         &mut self.init_info
     }
 
-    /// 获取加载模式
+    pub fn point_of_no_return(&self) -> bool {
+        self.point_of_no_return
+    }
+
+    /// Returns the load mode.
     pub fn load_mode(&self) -> ExecLoadMode {
         if self.flags.contains(ExecParamFlags::EXEC) {
             ExecLoadMode::Exec
@@ -273,7 +310,7 @@ impl ExecParam {
         &self.file
     }
 
-    /// 获取File的Arc引用
+    /// Returns an `Arc` reference to the `File`.
     pub fn file(&self) -> Arc<File> {
         self.file.clone()
     }
@@ -290,9 +327,46 @@ impl ExecParam {
         self.interp_flags
     }
 
-    /// 消费ExecParam并获取File的所有权（用于将文件加入文件描述符表）
+    /// Apply Linux `would_dump()` semantics to this executable or interpreter.
+    /// Main executables and interpreters share the prospective AddressSpace,
+    /// so namespace promotion converges without another process-init builder.
+    pub(crate) fn would_dump_current_file(&self) -> Result<(), SystemError> {
+        Self::would_dump_file(&self.file, &self.vm)
+    }
+
+    pub(crate) fn would_dump_file(
+        file: &Arc<File>,
+        vm: &Arc<AddressSpace>,
+    ) -> Result<(), SystemError> {
+        let inode = file.inode();
+        let metadata = file.metadata()?;
+        if check_inode_permission(&inode, &metadata, PermissionMask::MAY_READ).is_ok() {
+            return Ok(());
+        }
+
+        let mut user_ns = vm.user_ns();
+        loop {
+            let maps_ids = {
+                let inner = user_ns.inner.lock();
+                map_id_up(&inner.uid_map, metadata.uid as u32).is_some()
+                    && map_id_up(&inner.gid_map, metadata.gid as u32).is_some()
+            };
+            if maps_ids {
+                break;
+            }
+            let Some(parent) = user_ns.parent_ns() else {
+                break;
+            };
+            user_ns = parent;
+        }
+        vm.enforce_exec_nondump_in(user_ns);
+        Ok(())
+    }
+
+    /// Consume the `ExecParam` and take ownership of the `File` (used for adding
+    /// the file to the file descriptor table).
     ///
-    /// 如果Arc有多个引用，会panic
+    /// Panics if the `Arc` has multiple references.
     pub fn into_file(self) -> File {
         Arc::try_unwrap(self.file).expect("Cannot unwrap Arc<File>: multiple references exist")
     }
@@ -304,12 +378,80 @@ impl ExecParam {
     /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1246
     pub fn begin_new_exec(&mut self) -> Result<(), ExecError> {
         let me = ProcessManager::current_pcb();
-        // todo: 补充linux的逻辑
-        de_thread(&me).map_err(ExecError::SystemError)?;
+        // TODO: Implement the remaining Linux logic.
+        de_thread(&me, &mut self.point_of_no_return).map_err(ExecError::SystemError)?;
+        // A successful de_thread has committed the exec transaction even when
+        // there were no sibling threads to signal.
+        self.point_of_no_return = true;
+
+        // POSIX timer IDs belong to the old image's thread group. Detach the
+        // registry before cancelling events and releasing notification slots.
+        let group = me.process_signal();
+        let timers = group.posix_timers().lock_irqsave().take_all();
+        for (_, timer) in timers {
+            timer.delete();
+        }
+        {
+            let mut pending = group.lock_irqsave();
+            pending.flush_timer_signals();
+        }
+        me.sig_info_mut().sig_pending_mut().flush_timer_signals();
+
+        if me.sighand().is_shared() {
+            let old_sighand = me.sighand();
+            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let new_sighand = loop {
+                let creator = crate::cgroup::memory::object_for_task(&me);
+                match SigHand::try_new_for(&creator) {
+                    Ok(sighand) => break sighand,
+                    Err(error) => error
+                        .recover(&mut recovery)
+                        .map_err(ExecError::SystemError)?,
+                }
+            };
+            new_sighand.copy_handlers_from(&old_sighand);
+            me.replace_sighand(new_sighand);
+        }
+
+        let (fd_table, shared) = me
+            .basic()
+            .fd_table_snapshot()
+            .expect("exec task has no fd table");
+        if shared {
+            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let private = loop {
+                let creator = crate::cgroup::memory::object_for_task(&me);
+                match FileDescriptorTable::try_clone(&fd_table, None, &creator) {
+                    Ok(table) => break table,
+                    Err(error) => error
+                        .recover(&mut recovery)
+                        .map_err(ExecError::SystemError)?,
+                }
+            };
+            let replaced = me.basic_mut().set_fd_table(Some(private));
+            // Dropping a final table reference can flush files. Never do that
+            // while holding the PCB basic-info or an fd-table guard.
+            drop(replaced);
+        }
+        drop(fd_table);
+
+        // exec no longer returns to the old user context.  Drop any in-flight
+        // XOL transaction before the old mm can be replaced so its site and
+        // slot lease cannot survive into the new image.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::exception::uprobe::cleanup_task_active_xol(&me);
+            // Live uretprobe hijacks reference the old address space's
+            // trampoline; their user stacks are discarded with the image.
+            me.uprobe.clear_urets();
+        }
 
         me.flags().remove(ProcessFlags::FORKNOEXEC);
 
         exec_task_namespaces().map_err(ExecError::SystemError)?;
+        // The main image stays protected for the mm's user lifetime, including
+        // fork. Interpreter ExecParams never call begin_new_exec().
+        self.vm.write().exec_write_guard = Some((self.exec_write_guard.clone(), self.file.clone()));
         Ok(())
     }
 
@@ -320,210 +462,314 @@ impl ExecParam {
 }
 
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/fs/exec.c#1044
-fn de_thread(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
+fn de_thread(
+    pcb: &Arc<ProcessControlBlock>,
+    point_of_no_return: &mut bool,
+) -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
     if !Arc::ptr_eq(&current, pcb) {
         return Err(SystemError::EINVAL);
     }
 
-    let sighand = current.sighand();
-    // 与 group-exit/并发 exec 互斥
-    sighand.start_group_exec(&current)?;
+    let signal_state = current.process_signal();
+    let leader = {
+        let ti = current.threads_read_irqsave();
+        ti.group_leader().unwrap_or_else(|| current.clone())
+    };
+    let old_leader = (!Arc::ptr_eq(&leader, &current)).then_some(leader.clone());
 
-    let result = (|| {
-        // log::info!(
-        //     "de_thread: start pid={:?} tgid={:?}",
-        //     current.raw_pid(),
-        //     current.raw_tgid()
-        // );
+    // Collection and per-task token assignment share SigHand::inner with the
+    // unhash-tail completion path. An already exiting/ptraced zombie sibling
+    // remains pending until it has stopped touching identity-bearing lists.
+    let (kill_list, invalid_old_leader) =
+        signal_state.start_group_exec_transaction(&current, old_leader.as_ref(), |generation| {
+            let invalid_old_leader = old_leader
+                .as_ref()
+                .map(|old| old.is_dead())
+                .unwrap_or(false);
+            let mut kill_list = Vec::new();
+            let mut pending = 0;
 
-        if current.threads_read_irqsave().thread_group_empty() {
-            // log::info!(
-            //     "de_thread: single-thread fast path pid={:?}",
-            //     current.raw_pid()
-            // );
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
-            return Ok(());
-        }
+            if let Some(old) = old_leader.as_ref() {
+                if !old.flags().contains(ProcessFlags::EXITING)
+                    && !old.is_exited()
+                    && !old.is_zombie()
+                    && !old.is_dead()
+                {
+                    kill_list.push(old.clone());
+                }
+            }
 
-        let leader = {
-            let ti = current.threads_read_irqsave();
-            ti.group_leader().unwrap_or_else(|| current.clone())
-        };
-
-        // log::info!(
-        //     "de_thread: leader pid={:?}, current_is_leader={}",
-        //     leader.raw_pid(),
-        //     Arc::ptr_eq(&leader, &current)
-        // );
-
-        let mut kill_list: Vec<Arc<ProcessControlBlock>> = Vec::new();
-        let mut leader_in_kill_list = false;
-        if !Arc::ptr_eq(&leader, &current)
-            && !leader.flags().contains(ProcessFlags::EXITING)
-            && !leader.is_exited()
-            && !leader.is_zombie()
-            && !leader.is_dead()
-        {
-            kill_list.push(leader.clone());
-            leader_in_kill_list = true;
-        }
-        {
             let ti = leader.threads_read_irqsave();
             for weak in &ti.group_tasks {
-                if let Some(task) = weak.upgrade() {
-                    if Arc::ptr_eq(&task, &current) {
-                        continue;
-                    }
-                    if task.flags().contains(ProcessFlags::EXITING)
-                        || task.is_exited()
-                        || task.is_zombie()
-                        || task.is_dead()
-                    {
-                        continue;
-                    }
+                let Some(task) = weak.upgrade() else {
+                    continue;
+                };
+                if Arc::ptr_eq(&task, &current)
+                    || old_leader
+                        .as_ref()
+                        .map(|old| Arc::ptr_eq(old, &task))
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                if !task.identity_unhash_complete() {
+                    task.assign_group_exec_generation(generation);
+                    pending += 1;
+                }
+                if !task.flags().contains(ProcessFlags::EXITING)
+                    && !task.is_exited()
+                    && !task.is_zombie()
+                    && !task.is_dead()
+                {
                     kill_list.push(task);
                 }
             }
-        }
+            ((kill_list, invalid_old_leader), pending)
+        })?;
 
-        let mut notify_count = kill_list.len() as isize;
-        // 非 leader exec：notify_count 不包含 leader 本身
-        if !Arc::ptr_eq(&leader, &current) && leader_in_kill_list {
-            notify_count -= 1;
+    if invalid_old_leader {
+        match signal_state.try_cancel_group_exec(&current) {
+            GroupExecCancelResult::Canceled => {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            GroupExecCancelResult::Committed => {
+                panic!("invalid old leader reached committed group-exec state");
+            }
+            GroupExecCancelResult::NotOwner => {
+                panic!("group-exec ownership disappeared during cleanup");
+            }
         }
-        sighand.set_group_exec_notify_count(notify_count);
+    }
 
-        for task in kill_list {
-            let _ = Signal::SIGKILL.send_signal_info_to_pcb(None, task, PidType::PID);
+    // From this point the published group-exec transaction may be observed by
+    // the old leader, and the loop below can queue irreversible SIGKILLs. Any
+    // later error must terminate the current task instead of resuming the old
+    // program. Transaction-acquisition and invalid-leader failures above are
+    // still fully cancelable and remain ordinary exec errors.
+    *point_of_no_return = true;
+
+    for task in kill_list {
+        Signal::queue_private_sigkill_to_thread(&task);
+    }
+
+    let pending_wait = signal_state.wait_group_exec_event_killable(
+        || {
+            Signal::fatal_signal_pending(&current)
+                || signal_state.group_exec_pending_complete(&current)
+        },
+        None::<fn()>,
+    );
+    if pending_wait.is_err() || Signal::fatal_signal_pending(&current) {
+        match signal_state.try_cancel_group_exec(&current) {
+            GroupExecCancelResult::Canceled | GroupExecCancelResult::NotOwner => {
+                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+            GroupExecCancelResult::Committed => {
+                signal_state
+                    .wait_group_exec_event_uninterruptible(
+                        || signal_state.group_exec_handoff_ready(&current),
+                        None::<fn()>,
+                    )
+                    .expect("uninterruptible group-exec wait failed");
+            }
         }
+    }
 
-        // 先等待除 leader 外的线程退出（notify_count == 0）
-        let wait_res = sighand.wait_group_exec_event_killable(
-            || {
-                if Signal::fatal_signal_pending(&current) {
-                    return true;
-                }
-                sighand.group_exec_notify_count() == 0
-            },
-            None::<fn()>,
-        );
-        if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-        }
-
-        // 非 leader exec：等待 leader 进入 zombie 后再交换 tid/raw_pid
-        if !Arc::ptr_eq(&leader, &current) {
-            // 标记等待 leader 退出（notify_count < 0），由 exit_notify 唤醒。
-            // 必须先发布等待状态再检查 leader，否则 leader 可能在检查与设置之间
-            // 退出，导致 exit_notify 看不到 notify_count < 0 而丢失唤醒。
-            sighand.set_group_exec_notify_count(-1);
-            let wait_res = sighand.wait_group_exec_event_killable(
+    if let Some(leader) = old_leader.as_ref() {
+        if !signal_state.group_exec_handoff_ready(&current) {
+            let leader_wait = signal_state.wait_group_exec_event_killable(
                 || {
-                    if Signal::fatal_signal_pending(&current) {
-                        return true;
-                    }
-                    leader.is_zombie() || leader.is_dead()
+                    Signal::fatal_signal_pending(&current)
+                        || signal_state.group_exec_handoff_ready(&current)
                 },
                 None::<fn()>,
             );
-            if wait_res.is_err() || Signal::fatal_signal_pending(&current) {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            ProcessManager::exchange_tid_and_raw_pids(&current, &leader)?;
-
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
-            leader.exit_signal.store(Signal::INVALID, Ordering::SeqCst);
-
-            // 将当前线程提升为线程组 leader，并清空 group_tasks（已无其他线程）
-            {
-                let mut cur_ti = current.threads_write_irqsave();
-                cur_ti.group_leader = Arc::downgrade(&current);
-                cur_ti.group_tasks.clear();
-            }
-            {
-                let mut leader_ti = leader.threads_write_irqsave();
-                leader_ti.group_leader = Arc::downgrade(&current);
-                leader_ti.group_tasks.clear();
-            }
-
-            // 将旧 leader 的 children 列表转移给新 leader
-            {
-                let (first, second) =
-                    if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(&leader) as usize) {
-                        (current.clone(), leader.clone())
-                    } else {
-                        (leader.clone(), current.clone())
-                    };
-
-                let mut first_children = first.children.write_irqsave();
-                let mut second_children = second.children.write_irqsave();
-
-                if Arc::ptr_eq(&leader, &first) {
-                    let moved = core::mem::take(&mut *first_children);
-                    second_children.extend(moved);
-                } else {
-                    let moved = core::mem::take(&mut *second_children);
-                    first_children.extend(moved);
+            if leader_wait.is_err() || Signal::fatal_signal_pending(&current) {
+                match signal_state.try_cancel_group_exec(&current) {
+                    GroupExecCancelResult::Canceled | GroupExecCancelResult::NotOwner => {
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    GroupExecCancelResult::Committed => {
+                        signal_state
+                            .wait_group_exec_event_uninterruptible(
+                                || signal_state.group_exec_handoff_ready(&current),
+                                None::<fn()>,
+                            )
+                            .expect("uninterruptible group-exec wait failed");
+                    }
                 }
             }
-
-            // 继承 old leader 的父进程关系
-            let leader_parent = leader.real_parent_pcb.read().clone();
-            *current.parent_pcb.write() = leader_parent.clone();
-            *current.real_parent_pcb.write() = leader_parent;
-            *current.fork_parent_pcb.write() = current.self_ref.clone();
-
-            // log::info!("de_thread: reparented current to old leader's parent");
-
-            // 补做旧 leader 在退出阶段延迟的 PID/TGID/PGID/SID unhash
-            leader.finish_deferred_unhash_for_exec();
-
-            // 旧 leader 应由 exec 线程回收，避免父进程在交换前/后提前回收
-            if leader.is_zombie() {
-                if leader.try_mark_dead_from_zombie() {
-                    unsafe { ProcessManager::release(leader.raw_pid()) };
-                }
-            } else if leader.is_dead() {
-                unsafe { ProcessManager::release(leader.raw_pid()) };
-            }
-        } else {
-            current.exit_signal.store(Signal::SIGCHLD, Ordering::SeqCst);
         }
 
-        Ok(())
-    })();
+        assert!(
+            signal_state.group_exec_handoff_ready(&current),
+            "committed group-exec handoff is not ready"
+        );
+        assert!(leader.is_zombie(), "old exec leader must be zombie");
 
-    sighand.finish_group_exec();
-    result
+        // Linux keeps these values in the shared signal_struct, so de_thread()
+        // naturally preserves them. DragonOS stores them on the leader PCB and
+        // must transfer the accumulated history before changing leader identity.
+        current.inherit_exited_thread_group_cputime_from(leader);
+        current.inherit_thread_group_rusage_from(leader);
+
+        let _cpuset_guard = crate::cgroup::cpuset::lock();
+        let membership_guard = crate::process::pid::pid_membership_lock();
+        ProcessManager::exchange_tid_and_raw_pids(&current, leader);
+
+        current
+            .exit_signal
+            .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
+
+        // PGID/SID physical indices contain leaders only. Transfer both links
+        // after promoting the new leader and before demoting the old one, so a
+        // concurrent group lookup always has a valid representative.
+        leader.transfer_pid_link_to_locked(&current, PidType::PGID);
+        leader.transfer_pid_link_to_locked(&current, PidType::SID);
+        leader.exit_signal.store(-1, Ordering::SeqCst);
+
+        // Session-leader ownership is process-wide in Linux, but DragonOS
+        // currently stores the marker on the leader PCB. Move it together
+        // with the leader identity so job-control checks keep observing the
+        // same process after a non-leader exec.
+        let (leader_is_session_leader, leader_tty) = {
+            let mut leader_signal = leader.sig_info_mut();
+            let state = (leader_signal.is_session_leader, leader_signal.tty());
+            leader_signal.is_session_leader = false;
+            leader_signal.set_tty(None);
+            state
+        };
+        if leader_is_session_leader {
+            let mut current_signal = current.sig_info_mut();
+            current_signal.is_session_leader = true;
+            if current_signal.tty().is_none() {
+                current_signal.set_tty(leader_tty);
+            }
+        }
+
+        // Promote the current thread to thread-group leader and clear
+        // group_tasks (no other threads remain).
+        {
+            let mut cur_ti = current.threads_write_irqsave();
+            cur_ti.group_leader = Arc::downgrade(&current);
+            cur_ti.group_tasks.clear();
+        }
+        {
+            let mut leader_ti = leader.threads_write_irqsave();
+            leader_ti.group_leader = Arc::downgrade(&current);
+            leader_ti.group_tasks.clear();
+        }
+        drop(membership_guard);
+
+        // Transfer the old leader's children list and parent links as one
+        // tasklist-like transaction. A concurrent release must observe both
+        // the new owner and its index entry, or neither.
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        let leader_pid_ns = leader.active_pid_ns();
+        let moved_child_pids = {
+            let (first, second) =
+                if (Arc::as_ptr(&current) as usize) <= (Arc::as_ptr(leader) as usize) {
+                    (current.clone(), leader.clone())
+                } else {
+                    (leader.clone(), current.clone())
+                };
+
+            let mut first_children = first.children.write_irqsave();
+            let mut second_children = second.children.write_irqsave();
+
+            if Arc::ptr_eq(leader, &first) {
+                let moved = core::mem::take(&mut *first_children);
+                second_children.extend(moved.iter().copied());
+                moved
+            } else {
+                let moved = core::mem::take(&mut *second_children);
+                first_children.extend(moved.iter().copied());
+                moved
+            }
+        };
+        let moved_children = moved_child_pids
+            .into_iter()
+            .filter_map(|pid| ProcessManager::find_task_by_pid_ns(pid, &leader_pid_ns))
+            .collect::<Vec<_>>();
+        for child in moved_children {
+            ProcessControlBlock::reparent_child_links_from_thread_group_locked(
+                &child,
+                current.tgid,
+                &current,
+            );
+        }
+
+        // Inherit parent process relationships from the old leader.
+        {
+            let leader_parent = leader.real_parent_pcb.read_irqsave().clone();
+            *current.parent_pcb.write_irqsave() = leader_parent.clone();
+            *current.real_parent_pcb.write_irqsave() = leader_parent.clone();
+            *current.wait_parent_pcb.write_irqsave() = leader_parent.clone();
+            *current.fork_parent_pcb.write_irqsave() = leader_parent;
+        }
+        drop(_relation_guard);
+
+        // log::info!("de_thread: reparented current to old leader's parent");
+
+        // The old leader should be reaped by the exec thread to prevent the
+        // parent from reaping it prematurely before/after the swap.
+        let mut release_leader = false;
+        if leader.is_zombie() {
+            if leader.try_mark_dead_from_zombie() {
+                release_leader = true;
+            }
+        } else if leader.is_dead() {
+            release_leader = true;
+        }
+
+        if release_leader {
+            // Remove the old PCB from ALL_PROCESS before generic release can
+            // return its swapped-out TID to the PID allocator. Otherwise a
+            // concurrent fork can reuse that number and a late release would
+            // remove the newly published child under the same map key.
+            unsafe { ProcessManager::release(leader.raw_pid()) };
+        }
+    } else {
+        current
+            .exit_signal
+            .store(Signal::SIGCHLD as i32, Ordering::SeqCst);
+    }
+
+    assert!(
+        signal_state.finish_group_exec_owned(&current),
+        "group-exec owner could not finish a completed transaction"
+    );
+    Ok(())
 }
 
-/// ## 加载二进制文件
+/// ## Load a binary file.
 ///
+/// ## Parameters
+/// - `param`: Execution parameters.
+/// - `ctx`: Execution context used to track recursion depth.
 ///
-/// ## 参数
-/// - `param`: 执行参数
-/// - `ctx`: 执行上下文，用于跟踪递归深度
-///
-/// ## 返回值
-/// - `LoadBinaryResult::Loaded`: 正常加载完成
-/// - `LoadBinaryResult::NeedReexec`: 需要递归执行解释器（shebang场景）
+/// ## Returns
+/// - `LoadBinaryResult::Loaded`: Normal load completed.
+/// - `LoadBinaryResult::NeedReexec`: Re-execution of an interpreter is needed
+///   (shebang scenario).
 pub fn load_binary_file_with_context(
     param: &mut ExecParam,
     ctx: &ExecContext,
 ) -> Result<LoadBinaryResult, SystemError> {
-    // 检查递归深度
+    // Check the recursion depth.
     ctx.check_recursion_limit()?;
 
-    // 读取文件头部，用于判断文件类型
+    param.would_dump_current_file()?;
+
+    // Read the file header to determine the file type.
     let mut head_buf = [0u8; 512];
     param.file_ref().lseek(SeekFrom::SeekSet(0))?;
     let _bytes = param.file_ref().read(512, &mut head_buf)?;
 
-    // 首先检查是否为shebang脚本
+    // First, check if this is a shebang script.
     if SHEBANG_LOADER.probe(param, &head_buf).is_ok() {
-        // 解析shebang行
+        // Parse the shebang line.
         let shebang_info =
             ShebangLoader::parse_shebang_line(&head_buf).map_err(|_| SystemError::ENOEXEC)?;
 
@@ -534,7 +780,7 @@ pub fn load_binary_file_with_context(
             return Err(SystemError::ENOENT);
         }
 
-        // 通过正常的open流程打开解释器文件
+        // Open the interpreter file through the normal open path.
         let interpreter_file =
             do_open_execat(AtFlags::AT_FDCWD.bits(), &shebang_info.interpreter_path).inspect_err(
                 |_e| {
@@ -546,32 +792,6 @@ pub fn load_binary_file_with_context(
                 },
             )?;
 
-        // 获取脚本路径
-        let script_path = param.filename().to_string_lossy().into_owned();
-
-        // 构建新的argv
-        // Linux语义: [interpreter, optional_arg, script_path, original_args[1:]...]
-        let mut new_argv = Vec::new();
-
-        // argv[0] = 解释器路径
-        new_argv.push(
-            CString::new(shebang_info.interpreter_path.clone()).map_err(|_| SystemError::EINVAL)?,
-        );
-
-        // argv[1] = 可选参数 (如果存在)
-        if let Some(ref arg) = shebang_info.interpreter_arg {
-            new_argv.push(CString::new(arg.clone()).map_err(|_| SystemError::EINVAL)?);
-        }
-
-        // argv[N] = 脚本路径
-        new_argv.push(CString::new(script_path).map_err(|_| SystemError::EINVAL)?);
-
-        // 追加原始参数 (跳过argv[0]，因为已经用脚本路径替换)
-        let original_args = &param.init_info().args;
-        if original_args.len() > 1 {
-            new_argv.extend(original_args[1..].iter().cloned());
-        }
-
         return Ok(LoadBinaryResult::NeedReexec {
             next: ExecStartInfo::new(
                 interpreter_file,
@@ -579,11 +799,11 @@ pub fn load_binary_file_with_context(
                 param.execfn().to_string_lossy().into_owned(),
                 ExecInterpFlags::empty(),
             ),
-            new_argv,
+            interpreter_arg: shebang_info.interpreter_arg,
         });
     }
 
-    // 然后尝试其他加载器 (ELF等)
+    // Then try other loaders (ELF, etc.)
     let mut loader = None;
     for bl in BINARY_LOADERS.iter() {
         let probe_result = bl.probe(param, &head_buf);
@@ -605,63 +825,94 @@ pub fn load_binary_file_with_context(
     Ok(LoadBinaryResult::Loaded(result))
 }
 
-/// 程序初始化信息，这些信息会被压入用户栈中
+/// Per-exec CPU pointer storage prepared before acquiring exec_update. Its
+/// admission may reclaim/wait; stack population must only borrow this owner.
+/// Keep it outside ExecParam so final vmalloc release also occurs after the
+/// exec transaction guard, including every early error and shebang restart.
+pub(crate) struct ExecStackPointers {
+    args: ExecPointers,
+    envs: ExecPointers,
+}
+
+impl ExecStackPointers {
+    pub(crate) fn prepare(argc: usize, envc: usize) -> Result<Self, SystemError> {
+        Ok(Self {
+            args: Self::allocate(argc)?,
+            envs: Self::allocate(envc)?,
+        })
+    }
+
+    fn allocate(len: usize) -> Result<ExecPointers, SystemError> {
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        {
+            File::recover_io(|| ExecPointers::try_filled(len, VirtAddr::new(0)))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let mut storage = Vec::new();
+            storage
+                .try_reserve_exact(len)
+                .map_err(|_| SystemError::ENOMEM)?;
+            storage.resize(len, VirtAddr::new(0));
+            Ok(storage)
+        }
+    }
+}
+
+/// Program initialization information. These values are pushed onto the user
+/// stack.
 #[derive(Debug)]
 pub struct ProcInitInfo {
     pub proc_name: CString,
-    pub args: Vec<CString>,
-    pub envs: Vec<CString>,
+    pub args: Arc<ExecStrings>,
+    pub envs: Arc<ExecStrings>,
     pub auxv: BTreeMap<u8, usize>,
     pub execfn: Option<CString>,
     pub rand_num: [u8; 16],
 }
 
 impl ProcInitInfo {
-    pub fn new(proc_name: &str) -> Self {
+    pub fn new(proc_name: &str, args: Arc<ExecStrings>, envs: Arc<ExecStrings>) -> Self {
         Self {
             proc_name: CString::new(proc_name).unwrap_or(CString::new("").unwrap()),
-            args: Vec::new(),
-            envs: Vec::new(),
+            args,
+            envs,
             auxv: BTreeMap::new(),
             execfn: None,
             rand_num: [0u8; 16],
         }
     }
 
-    /// 把程序初始化信息压入用户栈中
-    /// 这个函数会把参数、环境变量、auxv等信息压入用户栈中
+    /// Push the program initialization information onto the user stack.
+    /// This function pushes arguments, environment variables, auxv, etc. onto
+    /// the user stack.
     ///
-    /// ## 返回值
+    /// ## Returns
     ///
-    /// 返回值是一个元组，第一个元素是最终的用户栈顶地址，第二个元素是环境变量pointer数组的起始地址     
-    pub unsafe fn push_at(
+    /// A tuple where the first element is the final user stack pointer and the
+    /// second element is the starting address of the `argv` pointer array.
+    pub(crate) unsafe fn push_at(
         &mut self,
         ustack: &mut UserStack,
+        pointers: &mut ExecStackPointers,
     ) -> Result<(VirtAddr, VirtAddr), SystemError> {
-        // 先把程序的名称压入栈中
+        // Reject a stale preparation before any stack write. A script restarts
+        // exec with its final argument list and prepares fresh storage there.
+        if pointers.args.len() != self.args.len() || pointers.envs.len() != self.envs.len() {
+            return Err(SystemError::EINVAL);
+        }
+        let envps = &mut pointers.envs;
+        let argps = &mut pointers.args;
+        // First, push the program name onto the stack.
         self.push_str(ustack, &self.proc_name)?;
 
-        // 然后把环境变量压入栈中
-        let envps = self
-            .envs
-            .iter()
-            .map(|s| {
-                self.push_str(ustack, s).expect("push_str failed");
-                ustack.sp()
-            })
-            .collect::<Vec<_>>();
+        // Then push the environment variables onto the stack.
+        self.push_strings(ustack, &self.envs, envps)?;
 
-        // 然后把参数压入栈中
-        let argps = self
-            .args
-            .iter()
-            .map(|s| {
-                self.push_str(ustack, s).expect("push_str failed");
-                ustack.sp()
-            })
-            .collect::<Vec<_>>();
+        // Then push the arguments onto the stack.
+        self.push_strings(ustack, &self.args, argps)?;
 
-        // 压入随机数，把指针放入auxv
+        // Push the random number and store its pointer in auxv.
         self.push_slice(ustack, &[self.rand_num])?;
         self.auxv
             .insert(super::abi::AtType::Random as u8, ustack.sp().data());
@@ -672,41 +923,60 @@ impl ProcInitInfo {
                 .insert(super::abi::AtType::ExecFn as u8, ustack.sp().data());
         }
 
-        // 实现栈的16字节对齐
-        // 后续要压入的内容都是 `usize` 宽度：
-        // - auxv 终止项: 2 words
-        // - auxv 条目: 2 words / entry
+        // Align the stack to 16 bytes.
+        // The remaining content to push is all `usize` width:
+        // - auxv terminator: 2 words
+        // - auxv entries: 2 words / entry
         // - envp NULL: 1 word
-        // - envp 指针数组: envps.len() words
+        // - envp pointer array: envps.len() words
         // - argv NULL: 1 word
-        // - argv 指针数组: argps.len() words
+        // - argv pointer array: argps.len() words
         // - argc: 1 word
         let length_to_push =
             self.remaining_stack_words(envps.len(), argps.len()) * core::mem::size_of::<usize>();
-        self.push_slice(
-            ustack,
-            &vec![0u8; (ustack.sp().data() - length_to_push) & 0xF],
-        )?;
+        let padding = (ustack.sp().data() - length_to_push) & 0xF;
+        self.push_slice(ustack, &[0u8; 15][..padding])?;
 
-        // 压入auxv
+        // Push auxv.
         self.push_slice(ustack, &[null::<u8>(), null::<u8>()])?;
         for (&k, &v) in self.auxv.iter() {
             self.push_slice(ustack, &[k as usize, v])?;
         }
 
-        // 把环境变量指针压入栈中
+        // Push the environment variable pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
-        self.push_slice(ustack, envps.as_slice())?;
+        self.push_slice(ustack, envps)?;
 
-        // 把参数指针压入栈中
+        // Push the argument pointers onto the stack.
         self.push_slice(ustack, &[null::<u8>()])?;
-        self.push_slice(ustack, argps.as_slice())?;
+        self.push_slice(ustack, argps)?;
         let argv_ptr = ustack.sp();
 
-        // 把argc压入栈中
+        // Push argc onto the stack.
         self.push_slice(ustack, &[self.args.len()])?;
 
         return Ok((ustack.sp(), argv_ptr));
+    }
+
+    /// Copy strings in reverse onto the downward-growing stack, matching Linux's
+    /// contiguous, ascending-address string layout. Process-title implementations
+    /// rely on this layout when computing the writable argument string span.
+    /// Record pointers in the original logical order, not the copy order.
+    fn push_strings(
+        &self,
+        ustack: &mut UserStack,
+        strings: &ExecStrings,
+        pointers: &mut [VirtAddr],
+    ) -> Result<(), SystemError> {
+        // Lengths were validated together before push_at made any stack write.
+        // No allocation or admission recovery runs under the exec-update lock.
+        for (index, range) in (0..strings.len()).rev().zip(strings.ranges().rev()) {
+            for part in strings.chunks(range).rev() {
+                self.push_slice(ustack, part)?;
+            }
+            pointers[index] = ustack.sp();
+        }
+        Ok(())
     }
 
     fn remaining_stack_words(&self, envc: usize, argc: usize) -> usize {
@@ -718,12 +988,20 @@ impl ProcInitInfo {
     }
 
     fn push_slice<T: Copy>(&self, ustack: &mut UserStack, slice: &[T]) -> Result<(), SystemError> {
-        let mut sp = ustack.sp();
-        sp -= core::mem::size_of_val(slice);
-        sp -= sp.data() % core::mem::align_of::<T>();
+        let len = core::mem::size_of_val(slice);
+        let address = ustack
+            .sp()
+            .data()
+            .checked_sub(len)
+            .ok_or(SystemError::E2BIG)?;
+        let sp = VirtAddr::new(address - address % core::mem::align_of::<T>());
 
-        unsafe { core::slice::from_raw_parts_mut(sp.data() as *mut T, slice.len()) }
-            .copy_from_slice(slice);
+        // The stack VMA is lazy: even a valid address may fail to acquire a
+        // physical page. Never turn userspace into a Rust slice and memcpy
+        // through an unprotected kernel fault. Exec's existing error path
+        // retires the failed image after these owners have unwound normally.
+        let bytes = unsafe { core::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), len) };
+        unsafe { copy_to_user_protected(sp, bytes)? };
         unsafe {
             ustack.set_sp(sp);
         }

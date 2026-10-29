@@ -1,35 +1,75 @@
-use alloc::{collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use alloc::{
+    collections::BTreeMap,
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+};
 
-use num_traits::FromPrimitive;
+use hashbrown::HashMap;
 use system_error::SystemError;
 
+use crate::filesystem::page_cache::{
+    PageCacheDomainIoPermit, PageCacheReadDmaReservation, PageCacheWritebackDomain,
+};
 use crate::{
     arch::MMArch,
-    filesystem::epoll::{
-        event_poll::EventPoll, event_poll::LockedEPItemLinkedList, EPollEventType, EPollItem,
-    },
+    filesystem::epoll::{event_poll::EPollItemList, event_poll::EventPoll, EPollEventType},
     libs::{
         mutex::Mutex,
+        resource_wait,
+        spinlock::SpinLock,
         wait_queue::{WaitQueue, Waiter},
     },
     mm::MemoryManagementArch,
     process::ProcessManager,
 };
 
+use super::virtiofs::dax::{
+    DaxAdmission, DaxAdmissionGuard, DaxAdmissionState, DaxMappingOwner, DaxMountMode,
+    DaxRangeAllocator, DAX_RANGE_SIZE,
+};
+use crate::driver::virtio::virtio_fs::VirtioFsCacheWindow;
+use crate::mm::fault::FaultRetryWait;
 use crate::process::cred::CAPFlags;
 
 use super::protocol::{
-    fuse_pack_struct, fuse_read_struct, FuseForgetIn, FuseInHeader, FuseInitIn, FuseInitOut,
-    FuseInterruptIn, FuseOutHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
+    FuseInHeader, FuseWriteIn, FUSE_ABORT_ERROR, FUSE_ASYNC_DIO, FUSE_ASYNC_READ,
     FUSE_ATOMIC_O_TRUNC, FUSE_AUTO_INVAL_DATA, FUSE_BIG_WRITES, FUSE_DESTROY, FUSE_DONT_MASK,
-    FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLUSH, FUSE_FORGET,
-    FUSE_HANDLE_KILLPRIV, FUSE_INIT, FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_KERNEL_MINOR_VERSION,
-    FUSE_KERNEL_VERSION, FUSE_LOOKUP, FUSE_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_NOTIFY_DELETE,
-    FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, FUSE_NOTIFY_POLL, FUSE_NOTIFY_RETRIEVE,
-    FUSE_NOTIFY_STORE, FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS,
-    FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_WRITEBACK_CACHE,
+    FUSE_DO_READDIRPLUS, FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FORGET, FUSE_FSYNC,
+    FUSE_FSYNCDIR, FUSE_GETXATTR, FUSE_HANDLE_KILLPRIV, FUSE_HAS_EXPIRE_ONLY, FUSE_HAS_INODE_DAX,
+    FUSE_INIT_EXT, FUSE_INTERRUPT, FUSE_LISTXATTR, FUSE_MAP_ALIGNMENT, FUSE_MAX_PAGES,
+    FUSE_NO_OPENDIR_SUPPORT, FUSE_NO_OPEN_SUPPORT, FUSE_PARALLEL_DIROPS, FUSE_POSIX_ACL,
+    FUSE_POSIX_LOCKS, FUSE_READDIRPLUS_AUTO, FUSE_REMOVEXATTR, FUSE_SETXATTR, FUSE_SUBMOUNTS,
+    FUSE_WRITEBACK_CACHE,
 };
+#[cfg(any(test, feature = "mm_selftest"))]
+use super::reply::FuseReadPagesReply;
+use super::reply::FuseReply;
+
+#[derive(Debug)]
+struct DaxRangeRetryWait {
+    conn: Arc<FuseConn>,
+}
+
+impl FaultRetryWait for DaxRangeRetryWait {
+    fn wait(&self) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.conn
+            .reclaim_one_dax_range_for_fault()
+            .map_err(crate::mm::allocation::MemoryAllocationError::System)
+    }
+}
+use super::{stats, trace};
+
+mod daemon;
+mod request;
+mod retirement;
+pub(crate) use request::BackgroundReadPagesCtx;
+pub(crate) use request::FuseDaxRequestOutcome;
+use retirement::{remove_requests, Retired};
 
 fn wait_with_recheck<T, F>(waitq: &WaitQueue, mut check: F) -> Result<T, SystemError>
 where
@@ -56,32 +96,482 @@ where
 }
 
 #[derive(Debug)]
+struct FuseBridgeWake {
+    active: AtomicBool,
+    events: AtomicU32,
+    wait: WaitQueue,
+}
+
+impl FuseBridgeWake {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            events: AtomicU32::new(0),
+            wait: WaitQueue::default(),
+        }
+    }
+
+    fn install(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn clear(&self) {
+        self.active.store(false, Ordering::Release);
+        self.events.store(0, Ordering::Release);
+        self.wait.wakeup(None);
+    }
+
+    fn signal(&self, source: stats::VirtioFsBridgeWakeSource, trace_allowed: bool) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        self.events.fetch_or(source.bit(), Ordering::Release);
+        stats::on_virtiofs_bridge_wake(source);
+        if trace_allowed {
+            trace::trace_virtiofs_bridge_wake(source.trace_id());
+        }
+        self.wait.wakeup(None);
+    }
+
+    fn take_events(&self) -> u32 {
+        self.events.swap(0, Ordering::AcqRel)
+    }
+
+    fn events(&self) -> u32 {
+        self.events.load(Ordering::Acquire)
+    }
+
+    fn wait_until<F, R>(&self, mut cond: F) -> R
+    where
+        F: FnMut(u32) -> Option<R>,
+    {
+        self.wait.wait_until(|| cond(self.events()))
+    }
+}
+
+#[derive(Debug)]
 pub struct FuseRequest {
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+    unique: u64,
+    opcode: u32,
+    reply_contract: FuseReplyContract,
+    read_pages_destination: Option<Arc<PageCacheReadDmaReservation>>,
+    track_direct_read_stats: bool,
+    /// Tracks which observable pipeline gauge currently owns this request:
+    /// 0 untracked, 1 connection queue, 2 bridge dispatch, 3 retired/transport.
+    stats_owner: AtomicU8,
+    retired_next: SpinLock<Option<Arc<FuseRequest>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReplyCapacitySource {
+    Exact,
+    RequestBounded,
+    ExplicitFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FuseReplyCapacity {
+    pub(crate) bytes: usize,
+    pub(crate) retained_bytes: usize,
+    pub(crate) source: FuseReplyCapacitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReplyContract {
+    NoReply,
+    Reply { capacity: Option<FuseReplyCapacity> },
+}
+
+impl FuseRequest {
+    pub(crate) fn stats_mark_queued(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_queue_owner_acquired();
+        }
+    }
+
+    pub(crate) fn stats_mark_dispatched(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_dispatch_owner_acquired();
+            stats::on_fuse_queue_owner_released();
+        }
+    }
+
+    pub(crate) fn stats_mark_external_dequeued(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_queue_owner_released();
+        }
+    }
+
+    pub(crate) fn stats_mark_transport_owned(&self) {
+        if self
+            .stats_owner
+            .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            stats::on_fuse_dispatch_owner_released();
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn unique(&self) -> u64 {
+        self.unique
+    }
+
+    pub(crate) fn opcode(&self) -> u32 {
+        self.opcode
+    }
+
+    pub(crate) fn reply_contract(&self) -> FuseReplyContract {
+        self.reply_contract
+    }
+
+    pub(crate) fn read_pages_destination(&self) -> Option<&Arc<PageCacheReadDmaReservation>> {
+        self.read_pages_destination.as_ref()
+    }
+
+    pub(crate) fn tracks_direct_read_stats(&self) -> bool {
+        self.track_direct_read_stats
+    }
+}
+
+impl Drop for FuseRequest {
+    fn drop(&mut self) {
+        match self.stats_owner.swap(3, Ordering::AcqRel) {
+            1 => stats::on_fuse_queue_owner_released(),
+            2 => stats::on_fuse_dispatch_owner_released(),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FuseRequestCred {
-    uid: u32,
-    gid: u32,
-    pid: u32,
+pub struct FuseRequestCred {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
+
+impl FuseRequestCred {
+    pub(crate) fn nocreds() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    pub(crate) fn from_current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
+        Self {
+            uid: cred.fsuid.data() as u32,
+            gid: cred.fsgid.data() as u32,
+            pid,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct FusePendingState {
     unique: u64,
     opcode: u32,
-    response: Mutex<Option<Result<Vec<u8>, SystemError>>>,
-    wait: WaitQueue,
+    response: SpinLock<PendingCompletion>,
+    background_credit: SpinLock<Option<FuseBackgroundCredit>>,
+    read_completion: Option<FuseReadCompletion>,
+    outcome_unknown: AtomicBool,
+    processing_owner: AtomicBool,
+    delivery: AtomicU8,
+    retired_next: SpinLock<Option<Arc<FusePendingState>>>,
+}
+
+#[derive(Debug)]
+struct FuseReadCompletion {
+    target: Arc<PageCacheReadDmaReservation>,
+    node: Weak<super::inode::FuseNode>,
+    start_page: usize,
+    requested: usize,
+    observed_size: usize,
+    observed_attr_version: u64,
+    open_pin: SpinLock<Option<super::private_data::FuseOpenLifetimePin>>,
+    domain_io: SpinLock<Option<PageCacheDomainIoPermit>>,
+}
+
+impl FuseReadCompletion {
+    fn belongs_to_domain(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
+        self.domain_io
+            .lock_irqsave()
+            .as_ref()
+            .is_some_and(|permit| permit.belongs_to(domain))
+    }
+
+    fn release_io_ownership(&self) {
+        let open_pin = self.open_pin.lock_irqsave().take();
+        drop(open_pin);
+        let domain_io = self.domain_io.lock_irqsave().take();
+        drop(domain_io);
+    }
+
+    fn finish(&self, result: &Result<FusePendingResult, SystemError>) -> Result<(), SystemError> {
+        let node = self.node.upgrade();
+        if let Some(node) = &node {
+            let start = self.start_page.saturating_mul(MMArch::PAGE_SIZE);
+            if node.attr_version() != self.observed_attr_version
+                && node
+                    .cached_metadata_snapshot()
+                    .is_some_and(|metadata| metadata.size.max(0) as usize <= start)
+            {
+                let _ = self.target.rollback(SystemError::EIO);
+                return Ok(());
+            }
+        }
+        let bytes = match result {
+            Ok(FusePendingResult::Reply(reply)) => {
+                if reply.len() > self.requested {
+                    self.target.rollback(SystemError::EIO)?;
+                    return Err(SystemError::EIO);
+                }
+                let bytes = reply.len();
+                self.target.publish_contiguous(reply)?;
+                bytes
+            }
+            Ok(FusePendingResult::ReadPagesDirect { bytes }) => {
+                if *bytes > self.requested {
+                    self.target.rollback(SystemError::EIO)?;
+                    return Err(SystemError::EIO);
+                }
+                self.target.publish_completed(*bytes)?;
+                if self.target.tracks_direct_read_stats() {
+                    stats::on_virtiofs_direct_read_completed(*bytes);
+                }
+                *bytes
+            }
+            Err(error) => {
+                let _ = self.target.rollback(error.clone());
+                return Ok(());
+            }
+        };
+        if bytes < self.requested {
+            stats::on_readahead_short_read();
+            if let Some(node) = node {
+                let (eof, _) = node.note_short_read_eof(
+                    self.start_page,
+                    bytes,
+                    self.observed_size,
+                    self.observed_attr_version,
+                )?;
+                node.discard_completed_pages_beyond(&self.target, eof);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FuseBackgroundInner {
+    connected: bool,
+    max: usize,
+    congestion: usize,
+    inflight: usize,
+}
+
+#[derive(Debug)]
+struct FuseBackgroundState {
+    inner: SpinLock<FuseBackgroundInner>,
+}
+
+#[derive(Debug)]
+struct FuseBackgroundCredit {
+    state: Arc<FuseBackgroundState>,
+}
+
+impl Drop for FuseBackgroundCredit {
+    fn drop(&mut self) {
+        let mut inner = self.state.inner.lock_irqsave();
+        inner.inflight = inner.inflight.saturating_sub(1);
+        drop(inner);
+        stats::on_background_released();
+        self.state.notify_waiters();
+    }
+}
+
+impl FuseBackgroundState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: SpinLock::new(FuseBackgroundInner {
+                connected: true,
+                max: FuseConn::DEFAULT_MAX_BACKGROUND,
+                congestion: FuseConn::DEFAULT_CONGESTION_THRESHOLD,
+                inflight: 0,
+            }),
+        })
+    }
+
+    fn wait_key(&self) -> usize {
+        &self.inner as *const SpinLock<FuseBackgroundInner> as usize
+    }
+
+    fn notify_waiters(&self) {
+        resource_wait::notify_resource_all(self.wait_key());
+    }
+
+    fn configure(&self, max: usize, congestion: usize) {
+        let mut inner = self.inner.lock_irqsave();
+        inner.max = core::cmp::max(1, max);
+        inner.congestion = core::cmp::min(core::cmp::max(1, congestion), inner.max);
+        drop(inner);
+        self.notify_waiters();
+    }
+
+    fn disconnect(&self) {
+        self.inner.lock_irqsave().connected = false;
+        self.notify_waiters();
+    }
+
+    /// None is an exhausted mandatory gate; Some(None) suppresses speculation.
+    fn try_acquire(
+        self: &Arc<Self>,
+        speculative: bool,
+    ) -> Result<Option<Option<FuseBackgroundCredit>>, SystemError> {
+        let mut inner = self.inner.lock_irqsave();
+        if !inner.connected {
+            return Err(SystemError::ENOTCONN);
+        }
+        let limit = if speculative {
+            inner.congestion
+        } else {
+            inner.max
+        };
+        if inner.inflight < limit {
+            inner.inflight += 1;
+            stats::on_background_acquired();
+            return Ok(Some(Some(FuseBackgroundCredit {
+                state: self.clone(),
+            })));
+        }
+        stats::on_background_pressure(speculative);
+        Ok(speculative.then_some(None))
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        speculative: bool,
+    ) -> Result<Option<FuseBackgroundCredit>, SystemError> {
+        if let Some(result) = self.try_acquire(speculative)? {
+            return Ok(result);
+        }
+        // Only mandatory reads reach this wait. Neither its predicate nor
+        // its registration allocates; the Arc borrow pins the key throughout.
+        match resource_wait::wait_for_resource_killable(self.wait_key(), || {
+            self.try_acquire(false).transpose()
+        }) {
+            Ok(result) => result,
+            Err(error) => match self.try_acquire(false)? {
+                Some(result) => Ok(result),
+                None => Err(error),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PendingCompletion {
+    Waiting,
+    Completing,
+    Ready(Result<FusePendingResult, SystemError>, FuseCompletionKind),
+    Consumed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FuseCompletionKind {
+    Success,
+    NeverSubmitted,
+    DaemonError,
+    OutcomeUnknown,
+    Disconnected,
+}
+
+#[derive(Debug)]
+pub(crate) enum FusePendingResult {
+    Reply(FuseReply),
+    ReadPagesDirect { bytes: usize },
+}
+
+#[derive(Clone, Copy)]
+enum FuseWaitMode {
+    Interruptible,
+    Killable,
+    Uninterruptible,
+}
+
+#[cfg(any(test, feature = "mm_selftest"))]
+enum FuseReadWaitOutcome {
+    Complete(Result<FuseReadPagesReply, SystemError>),
+    Interrupted,
 }
 
 impl FusePendingState {
+    const SENT: u8 = 1;
+    const INTERRUPTED: u8 = 2;
+
+    // Either the sender or the waiter observes the other bit first. Exactly
+    // that side queues the initial INTERRUPT, after successful delivery.
+    fn mark_sent(&self) -> bool {
+        self.delivery.fetch_or(Self::SENT, Ordering::AcqRel) == Self::INTERRUPTED
+    }
+
+    fn mark_interrupted(&self) -> bool {
+        self.delivery.fetch_or(Self::INTERRUPTED, Ordering::AcqRel) == Self::SENT
+    }
+
+    fn belongs_to_page_cache_domain(&self, domain: &Arc<PageCacheWritebackDomain>) -> bool {
+        self.read_completion
+            .as_ref()
+            .is_some_and(|completion| completion.belongs_to_domain(domain))
+    }
+
     pub fn new(unique: u64, opcode: u32) -> Self {
+        Self::new_with_credit(unique, opcode, None, None)
+    }
+
+    fn new_with_credit(
+        unique: u64,
+        opcode: u32,
+        background_credit: Option<FuseBackgroundCredit>,
+        read_completion: Option<FuseReadCompletion>,
+    ) -> Self {
         Self {
             unique,
             opcode,
-            response: Mutex::new(None),
-            wait: WaitQueue::default(),
+            response: SpinLock::new(PendingCompletion::Waiting),
+            background_credit: SpinLock::new(background_credit),
+            read_completion,
+            outcome_unknown: AtomicBool::new(false),
+            processing_owner: AtomicBool::new(false),
+            delivery: AtomicU8::new(0),
+            retired_next: SpinLock::new(None),
+        }
+    }
+
+    pub(crate) fn mark_processing_owner(&self) {
+        if !self.processing_owner.swap(true, Ordering::AcqRel) {
+            stats::on_fuse_processing_begin();
         }
     }
 
@@ -89,25 +579,169 @@ impl FusePendingState {
         self.unique
     }
 
-    pub fn complete(&self, v: Result<Vec<u8>, SystemError>) {
-        let mut guard = self.response.lock();
-        if guard.is_some() {
-            // Duplicate replies are ignored (Linux does similarly).
-            return;
-        }
-        *guard = Some(v);
-        drop(guard);
-        self.wait.wakeup(None);
+    pub fn complete(&self, v: Result<FuseReply, SystemError>) -> bool {
+        let kind = if v.is_ok() {
+            FuseCompletionKind::Success
+        } else {
+            FuseCompletionKind::OutcomeUnknown
+        };
+        self.complete_result(v.map(FusePendingResult::Reply), kind)
     }
 
-    pub fn wait_complete(&self) -> Result<Vec<u8>, SystemError> {
-        wait_with_recheck(&self.wait, || {
-            let mut guard = self.response.lock();
-            if let Some(res) = guard.take() {
-                return Ok(Some(res));
+    pub(crate) fn complete_daemon_error(&self, error: SystemError) -> bool {
+        let kind = if self.outcome_unknown.load(Ordering::Acquire) {
+            FuseCompletionKind::OutcomeUnknown
+        } else {
+            FuseCompletionKind::DaemonError
+        };
+        self.complete_result(Err(error), kind)
+    }
+
+    pub(crate) fn complete_never_submitted(&self, error: SystemError) -> bool {
+        self.complete_result(Err(error), FuseCompletionKind::NeverSubmitted)
+    }
+
+    pub(crate) fn complete_disconnected(&self, error: SystemError) -> bool {
+        self.complete_result(Err(error), FuseCompletionKind::Disconnected)
+    }
+
+    pub(crate) fn mark_outcome_unknown(&self) {
+        self.outcome_unknown.store(true, Ordering::Release);
+    }
+
+    /// Complete a page-cache read whose payload was written into its owned
+    /// destination.  This deliberately shares the ordinary pending state so
+    /// duplicate replies, disconnect and teardown have one retirement point.
+    pub(crate) fn complete_read_pages_direct(&self, bytes: usize) -> bool {
+        self.complete_result(
+            Ok(FusePendingResult::ReadPagesDirect { bytes }),
+            FuseCompletionKind::Success,
+        )
+    }
+
+    fn complete_result(
+        &self,
+        mut v: Result<FusePendingResult, SystemError>,
+        mut kind: FuseCompletionKind,
+    ) -> bool {
+        let mut guard = self.response.lock_irqsave();
+        if !matches!(*guard, PendingCompletion::Waiting) {
+            // Duplicate replies are ignored (Linux does similarly).
+            return false;
+        }
+        *guard = PendingCompletion::Completing;
+        drop(guard);
+        if let Some(completion) = &self.read_completion {
+            if let Err(error) = completion.finish(&v) {
+                v = Err(error);
+                kind = FuseCompletionKind::OutcomeUnknown;
             }
-            Ok(None)
-        })?
+            completion.release_io_ownership();
+        }
+        let mut guard = self.response.lock_irqsave();
+        *guard = PendingCompletion::Ready(v, kind);
+        drop(guard);
+        if self.processing_owner.swap(false, Ordering::AcqRel) {
+            stats::on_fuse_processing_end();
+        }
+        // Linux releases a background slot at request completion, not when a
+        // waiter later consumes the result.  Taking the token makes this
+        // exactly-once across replies, abort and teardown.
+        let credit = self.background_credit.lock_irqsave().take();
+        drop(credit);
+        resource_wait::notify_resource_all(self.wait_key());
+        true
+    }
+
+    pub fn wait_complete(&self) -> Result<FuseReply, SystemError> {
+        match self.wait_result()? {
+            FusePendingResult::Reply(reply) => Ok(reply),
+            // A direct completion is a request-contract violation for ordinary
+            // callers.  Do not expose an empty reply that could look valid.
+            FusePendingResult::ReadPagesDirect { .. } => Err(SystemError::EIO),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_read_pages_complete(&self) -> Result<FuseReadPagesReply, SystemError> {
+        match self.wait_result()? {
+            FusePendingResult::Reply(reply) => Ok(FuseReadPagesReply::Contiguous(reply)),
+            FusePendingResult::ReadPagesDirect { bytes } => {
+                Ok(FuseReadPagesReply::Direct { bytes })
+            }
+        }
+    }
+
+    fn wait_key(&self) -> usize {
+        &self.response as *const SpinLock<PendingCompletion> as usize
+    }
+
+    fn take_ready(&self) -> Option<(Result<FusePendingResult, SystemError>, FuseCompletionKind)> {
+        let mut guard = self.response.lock_irqsave();
+        if matches!(*guard, PendingCompletion::Ready(_, _)) {
+            let ready = core::mem::replace(&mut *guard, PendingCompletion::Consumed);
+            if let PendingCompletion::Ready(result, kind) = ready {
+                return Some((result, kind));
+            }
+        }
+        None
+    }
+
+    fn wait_terminal(
+        &self,
+        mode: FuseWaitMode,
+    ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
+        // Like Linux wait_event, an already published terminal result wins
+        // over interruption. The post-error recheck covers concurrent publish.
+        if let Some(ready) = self.take_ready() {
+            return Ok(ready);
+        }
+        let waited = match mode {
+            FuseWaitMode::Interruptible => {
+                resource_wait::wait_for_resource(self.wait_key(), true, || self.take_ready())
+            }
+            FuseWaitMode::Killable => {
+                resource_wait::wait_for_resource_killable(self.wait_key(), || self.take_ready())
+            }
+            FuseWaitMode::Uninterruptible => {
+                resource_wait::wait_for_resource(self.wait_key(), false, || self.take_ready())
+            }
+        };
+        match waited {
+            Ok(ready) => Ok(ready),
+            Err(error) => self.take_ready().ok_or(error),
+        }
+    }
+
+    #[cfg(any(test, feature = "mm_selftest"))]
+    fn wait_read_pages_once(&self) -> FuseReadWaitOutcome {
+        match self.wait_terminal(FuseWaitMode::Interruptible) {
+            Ok((result, _)) => FuseReadWaitOutcome::Complete(result.map(|result| match result {
+                FusePendingResult::Reply(reply) => FuseReadPagesReply::Contiguous(reply),
+                FusePendingResult::ReadPagesDirect { bytes } => {
+                    FuseReadPagesReply::Direct { bytes }
+                }
+            })),
+            Err(_) => FuseReadWaitOutcome::Interrupted,
+        }
+    }
+
+    fn wait_result(&self) -> Result<FusePendingResult, SystemError> {
+        self.wait_terminal(FuseWaitMode::Interruptible)?.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_result_with_kind(
+        &self,
+    ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
+        self.wait_terminal(FuseWaitMode::Interruptible)
+    }
+
+    pub(crate) fn wait_result_with_kind_uninterruptible(
+        &self,
+    ) -> Result<(Result<FusePendingResult, SystemError>, FuseCompletionKind), SystemError> {
+        // Mapping/DMA lifecycle ownership stays live until a terminal result.
+        self.wait_terminal(FuseWaitMode::Uninterruptible)
     }
 }
 
@@ -119,6 +753,7 @@ struct FuseInitNegotiated {
     time_gran: u32,
     max_pages: u16,
     flags: u64,
+    map_alignment: u16,
 }
 
 impl Default for FuseInitNegotiated {
@@ -129,8 +764,9 @@ impl Default for FuseInitNegotiated {
             // Linux guarantees max_write >= 4096 after init; before init keep sane default.
             max_write: 4096,
             time_gran: 0,
-            max_pages: 1,
+            max_pages: FuseConn::DEFAULT_MAX_PAGES as u16,
             flags: 0,
+            map_alignment: 0,
         }
     }
 }
@@ -143,86 +779,567 @@ struct FuseConnInner {
     owner_uid: u32,
     owner_gid: u32,
     allow_other: bool,
+    max_read: u32,
+    init_flags: u64,
     init: FuseInitNegotiated,
     no_open: bool,
     no_opendir: bool,
+    no_create: bool,
     no_readdirplus: bool,
+    no_fallocate: bool,
+    no_flush: bool,
+    no_fsync: bool,
+    no_fsyncdir: bool,
+    no_getxattr: bool,
+    no_setxattr: bool,
+    no_listxattr: bool,
+    no_removexattr: bool,
+    no_interrupt: bool,
     max_write_cap: usize,
+    max_pages_limit: usize,
+    separate_hiprio_pending: bool,
+    teardown_started: bool,
+    hiprio_pending: VecDeque<Arc<FuseRequest>>,
     pending: VecDeque<Arc<FuseRequest>>,
-    processing: BTreeMap<u64, Arc<FusePendingState>>,
+    processing: HashMap<u64, Arc<FusePendingState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaxCleanupState {
+    Active,
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug)]
+struct DaxCleanup {
+    state: DaxCleanupState,
+    nodes: BTreeMap<DaxMappingOwner, Weak<super::inode::FuseNode>>,
+    revoke_failed: bool,
 }
 
 /// FUSE connection object (roughly equivalent to Linux `struct fuse_conn`).
 #[derive(Debug)]
 pub struct FuseConn {
-    inner: Mutex<FuseConnInner>,
+    inner: resource_wait::ResourceMutex<FuseConnInner>,
     next_unique: AtomicU64,
+    attr_epoch: AtomicU64,
     dev_count: AtomicUsize,
     read_wait: WaitQueue,
     init_wait: WaitQueue,
-    epitems: LockedEPItemLinkedList,
+    bridge_wake: FuseBridgeWake,
+    epitems: EPollItemList,
+    backend_reply_limit: Option<usize>,
+    reply_layout_minor: AtomicU32,
+    background: Arc<FuseBackgroundState>,
+    filesystems: Mutex<Vec<Weak<super::fs::FuseFS>>>,
+    dax_mode: DaxMountMode,
+    dax_allocator: Option<Arc<DaxRangeAllocator>>,
+    dax_window: Mutex<Option<Arc<VirtioFsCacheWindow>>>,
+    dax_admission: Arc<DaxAdmission>,
+    dax_cleanup: Mutex<DaxCleanup>,
+    dax_cleanup_wait: WaitQueue,
 }
 
 impl FuseConn {
+    /// Every acquisition must use this guard so contended lifecycle waits
+    /// can sleep without allocating and every unlock notifies them.
+    fn lock_inner(&self) -> resource_wait::ResourceMutexGuard<'_, FuseConnInner> {
+        resource_wait::ResourceMutexGuard::lock(&self.inner)
+    }
+
+    const FUSE_INT_REQ_BIT: u64 = 1;
     // Keep this in sync with `sys_read.rs` userspace chunking size.
     const USER_READ_CHUNK: usize = 64 * 1024;
     const MIN_MAX_WRITE: usize = 4096;
+    const DEFAULT_MAX_PAGES: usize = 32;
+    const MAX_MAX_PAGES: usize = 256;
+    const DEFAULT_MAX_READAHEAD: usize = 128 * MMArch::PAGE_SIZE;
+    const DEFAULT_MAX_BACKGROUND: usize = 12;
+    const DEFAULT_CONGESTION_THRESHOLD: usize = 9;
+    const XATTR_SIZE_MAX: usize = 64 * 1024;
+    const FUSE_COMPAT_ENTRY_OUT_SIZE: usize = 120;
+    const FUSE_COMPAT_ATTR_OUT_SIZE: usize = 96;
+    const FUSE_COMPAT_STATFS_SIZE: usize = 48;
+    const FUSE_COMPAT_INIT_OUT_SIZE: usize = 8;
 
     pub fn new() -> Arc<Self> {
-        Self::new_with_max_write_cap(Self::max_write_cap_for_user_read_chunk())
+        Self::new_with_max_write_cap(
+            Self::max_write_cap_for_user_read_chunk(),
+            Self::kernel_init_flags(),
+            false,
+            None,
+            None,
+            DaxMountMode::Never,
+        )
     }
 
-    pub fn new_for_virtiofs(max_message_size: usize) -> Arc<Self> {
-        let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
-        let cap = if max_message_size > overhead {
-            core::cmp::max(Self::MIN_MAX_WRITE, max_message_size - overhead)
+    pub fn new_for_virtiofs(max_request_size: usize, max_reply_size: usize) -> Arc<Self> {
+        Self::new_for_virtiofs_with_dax(max_request_size, max_reply_size, None, DaxMountMode::Never)
+    }
+
+    pub(crate) fn new_for_virtiofs_with_dax(
+        max_request_size: usize,
+        max_reply_size: usize,
+        cache_window_len: Option<usize>,
+        dax_mode: DaxMountMode,
+    ) -> Arc<Self> {
+        Self::try_new_for_virtiofs_with_dax(
+            max_request_size,
+            max_reply_size,
+            cache_window_len,
+            dax_mode,
+        )
+        .expect("test DAX allocator construction must succeed")
+    }
+
+    pub(crate) fn try_new_for_virtiofs_with_dax(
+        max_request_size: usize,
+        max_reply_size: usize,
+        cache_window_len: Option<usize>,
+        dax_mode: DaxMountMode,
+    ) -> Result<Arc<Self>, SystemError> {
+        let overhead = size_of::<FuseInHeader>() + size_of::<FuseWriteIn>();
+        let cap = if max_request_size > overhead {
+            core::cmp::max(Self::MIN_MAX_WRITE, max_request_size - overhead)
         } else {
             Self::MIN_MAX_WRITE
         };
-        Self::new_with_max_write_cap(cap)
+        let dax_allocator = (dax_mode != DaxMountMode::Never)
+            .then_some(cache_window_len)
+            .flatten()
+            .filter(|len| *len >= DAX_RANGE_SIZE)
+            .map(DaxRangeAllocator::new)
+            .transpose()?
+            .map(Arc::new);
+        let mut init_flags = Self::virtiofs_init_flags();
+        if dax_allocator.is_some() {
+            init_flags |= FUSE_MAP_ALIGNMENT;
+        }
+        if dax_mode.is_inode_mode() {
+            init_flags |= FUSE_HAS_INODE_DAX;
+        }
+        Ok(Self::new_with_max_write_cap(
+            cap,
+            init_flags,
+            true,
+            Some(max_reply_size),
+            dax_allocator,
+            dax_mode,
+        ))
     }
 
-    fn new_with_max_write_cap(max_write_cap: usize) -> Arc<Self> {
+    fn new_with_max_write_cap(
+        max_write_cap: usize,
+        init_flags: u64,
+        separate_hiprio_pending: bool,
+        backend_reply_limit: Option<usize>,
+        dax_allocator: Option<Arc<DaxRangeAllocator>>,
+        dax_mode: DaxMountMode,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(FuseConnInner {
+            inner: resource_wait::ResourceMutex::new(FuseConnInner {
                 connected: true,
                 mounted: false,
                 initialized: false,
                 owner_uid: 0,
                 owner_gid: 0,
                 allow_other: false,
+                max_read: u32::MAX,
+                init_flags,
                 init: FuseInitNegotiated::default(),
                 no_open: false,
                 no_opendir: false,
+                no_create: false,
                 no_readdirplus: false,
+                no_fallocate: false,
+                no_flush: false,
+                no_fsync: false,
+                no_fsyncdir: false,
+                no_getxattr: false,
+                no_setxattr: false,
+                no_listxattr: false,
+                no_removexattr: false,
+                no_interrupt: false,
                 max_write_cap,
+                max_pages_limit: Self::MAX_MAX_PAGES,
+                separate_hiprio_pending,
+                teardown_started: false,
+                hiprio_pending: VecDeque::new(),
                 pending: VecDeque::new(),
-                processing: BTreeMap::new(),
+                processing: HashMap::new(),
             }),
             // Use non-zero unique, keep even IDs for "ordinary" requests as Linux does.
             next_unique: AtomicU64::new(2),
+            attr_epoch: AtomicU64::new(1),
             dev_count: AtomicUsize::new(1),
             read_wait: WaitQueue::default(),
             init_wait: WaitQueue::default(),
-            epitems: LockedEPItemLinkedList::default(),
+            bridge_wake: FuseBridgeWake::new(),
+            epitems: EPollItemList::default(),
+            backend_reply_limit,
+            reply_layout_minor: AtomicU32::new(0),
+            background: FuseBackgroundState::new(),
+            filesystems: Mutex::new(Vec::new()),
+            dax_mode,
+            dax_allocator,
+            dax_window: Mutex::new(None),
+            dax_admission: DaxAdmission::new(),
+            dax_cleanup: Mutex::new(DaxCleanup {
+                state: DaxCleanupState::Active,
+                nodes: BTreeMap::new(),
+                revoke_failed: false,
+            }),
+            dax_cleanup_wait: WaitQueue::default(),
         })
+    }
+
+    pub(crate) fn new_for_virtiofs_with_dax_window(
+        max_request_size: usize,
+        max_reply_size: usize,
+        cache_window: Option<Arc<VirtioFsCacheWindow>>,
+        dax_mode: DaxMountMode,
+    ) -> Result<Arc<Self>, SystemError> {
+        let len = cache_window.as_ref().map(|window| window.len());
+        let conn =
+            Self::try_new_for_virtiofs_with_dax(max_request_size, max_reply_size, len, dax_mode)?;
+        if conn.dax_allocator.is_some() {
+            if let Some(window) = cache_window {
+                conn.install_dax_window(window)
+                    .expect("validated virtiofs DAX window must match its allocator");
+            }
+        }
+        Ok(conn)
+    }
+
+    pub(crate) fn dax_mode(&self) -> DaxMountMode {
+        self.dax_mode
+    }
+
+    pub(crate) fn dax_inode_active(&self, attr_flags: u32, regular: bool) -> bool {
+        if !regular || self.dax_mode == DaxMountMode::Never {
+            return false;
+        }
+        let connection_capable = self.dax_enabled();
+        let inode_capability_negotiated = connection_capable
+            && self.dax_mode.is_inode_mode()
+            && self.has_init_flag(FUSE_HAS_INODE_DAX);
+        self.dax_mode.inode_enabled(
+            connection_capable,
+            inode_capability_negotiated,
+            (attr_flags & super::protocol::FUSE_ATTR_DAX) != 0,
+            true,
+        )
+    }
+
+    pub(crate) fn dax_allocator(&self) -> Option<&Arc<DaxRangeAllocator>> {
+        self.dax_allocator.as_ref()
+    }
+
+    pub(crate) fn dax_enabled(&self) -> bool {
+        self.dax_allocator.is_some() && self.dax_window.lock().is_some()
+    }
+
+    pub(crate) fn install_dax_window(
+        &self,
+        window: Arc<VirtioFsCacheWindow>,
+    ) -> Result<(), SystemError> {
+        let allocator = self
+            .dax_allocator
+            .as_ref()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        if window.len() < DAX_RANGE_SIZE
+            || allocator.snapshot().total != window.len() / DAX_RANGE_SIZE
+        {
+            return Err(SystemError::EINVAL);
+        }
+        let mut slot = self.dax_window.lock();
+        if slot.is_some() {
+            return Err(SystemError::EBUSY);
+        }
+        *slot = Some(window);
+        Ok(())
+    }
+
+    pub(crate) fn dax_window(&self) -> Result<Arc<VirtioFsCacheWindow>, SystemError> {
+        self.dax_window
+            .lock()
+            .clone()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+    }
+
+    pub(crate) fn enter_dax(&self) -> Result<DaxAdmissionGuard, SystemError> {
+        self.dax_admission.enter()
+    }
+
+    pub(crate) fn dax_admission_state(&self) -> DaxAdmissionState {
+        self.dax_admission.state()
+    }
+
+    pub(crate) fn begin_dax_quiesce(&self) {
+        self.dax_admission.begin_quiesce();
+    }
+
+    pub(crate) fn wait_dax_drained(&self) {
+        self.dax_admission.wait_drained();
+    }
+
+    pub(crate) fn mark_dax_dead(&self) {
+        self.dax_admission.mark_dead();
+    }
+
+    pub(crate) fn register_dax_node(&self, node: &Arc<super::inode::FuseNode>) {
+        let owner = node.dax_mapping_owner();
+        let mut cleanup = self.dax_cleanup.lock();
+        if cleanup.state == DaxCleanupState::Active {
+            cleanup.nodes.insert(owner, Arc::downgrade(node));
+        }
+    }
+
+    pub(crate) fn unregister_dax_node(&self, owner: DaxMappingOwner) {
+        self.dax_cleanup.lock().nodes.remove(&owner);
+        self.dax_cleanup_wait.wakeup_all(None);
+    }
+
+    pub(crate) fn finish_dax_node_drop(
+        &self,
+        owner: DaxMappingOwner,
+        revoke: Result<(), SystemError>,
+    ) {
+        let mut cleanup = self.dax_cleanup.lock();
+        if revoke.is_err()
+            && matches!(
+                cleanup.state,
+                DaxCleanupState::Active | DaxCleanupState::InProgress
+            )
+        {
+            cleanup.revoke_failed = true;
+        }
+        cleanup.nodes.remove(&owner);
+        drop(cleanup);
+        self.dax_cleanup_wait.wakeup_all(None);
+    }
+
+    pub(crate) fn dax_node(&self, owner: DaxMappingOwner) -> Option<Arc<super::inode::FuseNode>> {
+        self.dax_cleanup
+            .lock()
+            .nodes
+            .get(&owner)
+            .and_then(Weak::upgrade)
+    }
+
+    fn revoke_registered_dax_nodes(&self) -> Result<(), SystemError> {
+        loop {
+            let node = {
+                let cleanup = self.dax_cleanup.lock();
+                cleanup
+                    .nodes
+                    .iter()
+                    .find_map(|(owner, node)| node.upgrade().map(|node| (*owner, node)))
+            };
+            if let Some((owner, node)) = node {
+                let result = node.dax_disconnect_revoke();
+                if let Err(ref error) = result {
+                    log::warn!(
+                        "fuse: failed to revoke DAX PTEs for node {} during disconnect: {:?}",
+                        node.nodeid(),
+                        error
+                    );
+                }
+                self.finish_dax_node_drop(owner, result);
+                continue;
+            }
+
+            self.dax_cleanup_wait.wait_until(|| {
+                let cleanup = self.dax_cleanup.lock();
+                cleanup.nodes.is_empty().then_some(())
+            });
+            let cleanup = self.dax_cleanup.lock();
+            if cleanup.nodes.is_empty() {
+                return if cleanup.revoke_failed {
+                    Err(SystemError::EIO)
+                } else {
+                    Ok(())
+                };
+            }
+        }
+    }
+
+    pub(crate) fn dax_fault_retry_wait(self: &Arc<Self>) -> Arc<dyn FaultRetryWait> {
+        Arc::new(DaxRangeRetryWait { conn: self.clone() })
+    }
+
+    pub(crate) fn reclaim_one_dax_range_interruptible(&self) -> Result<(), SystemError> {
+        self.reclaim_one_dax_range(true)
+    }
+
+    fn reclaim_one_dax_range_for_fault(&self) -> Result<(), SystemError> {
+        self.reclaim_one_dax_range(false)
+    }
+
+    fn reclaim_one_dax_range(&self, interruptible: bool) -> Result<(), SystemError> {
+        let allocator = self
+            .dax_allocator
+            .as_ref()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut candidates = Vec::with_capacity(16);
+        loop {
+            let snapshot = allocator.snapshot();
+            if snapshot.shutdown {
+                return Err(SystemError::ENODEV);
+            }
+            if snapshot.free > 0 {
+                return Ok(());
+            }
+            allocator.reclaim_candidates(&mut candidates, 16)?;
+            if candidates.is_empty() {
+                if interruptible {
+                    allocator.wait_available_interruptible()?;
+                } else {
+                    allocator.wait_available()?;
+                }
+                continue;
+            }
+            for candidate in &candidates {
+                let Some(node) = self.dax_node(candidate.owner()) else {
+                    // A Weak cannot be upgraded while FuseNode::drop() is
+                    // running. Do not race that teardown by changing the token
+                    // state behind its mapping tree.
+                    continue;
+                };
+                match node.dax_reclaim_candidate(candidate) {
+                    Ok(()) => {
+                        stats::on_virtiofs_dax_pressure_reclaim();
+                        return Ok(());
+                    }
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            if interruptible
+                && crate::arch::ipc::signal::Signal::signal_pending_state(
+                    true,
+                    false,
+                    &ProcessManager::current_pcb(),
+                )
+            {
+                return Err(SystemError::ERESTARTSYS);
+            }
+            crate::sched::sched_yield();
+        }
+    }
+
+    pub(crate) fn dax_map_alignment(&self) -> Option<u16> {
+        self.dax_allocator.as_ref()?;
+        Some(self.lock_inner().init.map_alignment)
+    }
+
+    fn dax_map_alignment_valid(enabled_flags: u64, map_alignment: u16) -> bool {
+        (enabled_flags & FUSE_MAP_ALIGNMENT) == 0
+            || u32::from(map_alignment) <= super::virtiofs::dax::DAX_RANGE_SIZE.trailing_zeros()
+    }
+
+    fn begin_shutdown_dax_allocator(&self) {
+        let Some(allocator) = self.dax_allocator.as_ref() else {
+            return;
+        };
+        allocator.begin_shutdown();
+    }
+
+    fn disconnect_cleanup_dax_allocator(&self) {
+        let Some(allocator) = self.dax_allocator.as_ref() else {
+            return;
+        };
+        allocator.disconnect_cleanup();
+    }
+
+    pub(crate) fn register_filesystem(&self, fs: Weak<super::fs::FuseFS>) {
+        let mut filesystems = self.filesystems.lock();
+        filesystems.retain(|entry| entry.strong_count() != 0);
+        filesystems.push(fs);
+    }
+
+    pub(crate) fn filesystems(&self) -> Vec<Arc<super::fs::FuseFS>> {
+        let mut filesystems = self.filesystems.lock();
+        let live = filesystems.iter().filter_map(Weak::upgrade).collect();
+        filesystems.retain(|entry| entry.strong_count() != 0);
+        live
     }
 
     #[allow(dead_code)]
     pub fn is_mounted(&self) -> bool {
-        self.inner.lock().mounted
+        self.lock_inner().mounted
     }
 
     pub fn is_connected(&self) -> bool {
-        self.inner.lock().connected
+        self.lock_inner().connected
+    }
+
+    pub(crate) fn sample_attr_epoch(&self) -> u64 {
+        self.attr_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn next_attr_epoch(&self) -> u64 {
+        self.attr_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 
     pub fn has_pending_requests(&self) -> bool {
-        !self.inner.lock().pending.is_empty()
+        let g = self.lock_inner();
+        !g.hiprio_pending.is_empty() || !g.pending.is_empty()
+    }
+
+    pub fn has_pending_high_priority_requests(&self) -> bool {
+        !self.lock_inner().hiprio_pending.is_empty()
+    }
+
+    pub fn has_pending_ordinary_requests(&self) -> bool {
+        !self.lock_inner().pending.is_empty()
+    }
+
+    pub fn has_processing_request(&self, unique: u64) -> bool {
+        self.lock_inner().processing.contains_key(&unique)
+    }
+
+    pub fn interrupt_target_unique(unique: u64) -> u64 {
+        unique & !Self::FUSE_INT_REQ_BIT
+    }
+
+    pub fn bridge_wake_events(&self) -> u32 {
+        self.bridge_wake.events()
+    }
+
+    pub fn take_bridge_wake_events(&self) -> u32 {
+        self.bridge_wake.take_events()
+    }
+
+    pub fn wait_bridge_until<F, R>(&self, cond: F) -> R
+    where
+        F: FnMut(u32) -> Option<R>,
+    {
+        self.bridge_wake.wait_until(cond)
+    }
+
+    pub fn install_bridge_wake(&self) {
+        self.bridge_wake.install();
+    }
+
+    pub fn clear_bridge_wake(&self) {
+        self.bridge_wake.clear();
+    }
+
+    pub fn wake_bridge(&self, source: stats::VirtioFsBridgeWakeSource) {
+        self.bridge_wake.signal(source, true);
+    }
+
+    pub fn wake_bridge_irq_safe(&self, source: stats::VirtioFsBridgeWakeSource) {
+        self.bridge_wake.signal(source, false);
     }
 
     pub fn mark_mounted(&self) -> Result<(), SystemError> {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         if !g.connected {
             return Err(SystemError::ENOTCONN);
         }
@@ -237,28 +1354,35 @@ impl FuseConn {
     /// Roll back a mount reservation when mount setup fails before
     /// the filesystem is actually attached to the mount tree.
     pub fn rollback_mount_setup(&self) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         g.mounted = false;
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.inner.lock().initialized
+        self.lock_inner().initialized
     }
 
-    pub fn configure_mount(&self, owner_uid: u32, owner_gid: u32, allow_other: bool) {
-        let mut g = self.inner.lock();
+    pub fn configure_mount(
+        &self,
+        owner_uid: u32,
+        owner_gid: u32,
+        allow_other: bool,
+        max_read: u32,
+    ) {
+        let mut g = self.lock_inner();
         g.owner_uid = owner_uid;
         g.owner_gid = owner_gid;
         g.allow_other = allow_other;
+        g.max_read = core::cmp::max(Self::MIN_MAX_WRITE as u32, max_read);
     }
 
-    fn has_init_flag(&self, flag: u64) -> bool {
-        let g = self.inner.lock();
+    pub(crate) fn has_init_flag(&self, flag: u64) -> bool {
+        let g = self.lock_inner();
         (g.init.flags & flag) != 0
     }
 
     pub fn should_skip_open(&self, opcode: u32) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         match opcode {
             super::protocol::FUSE_OPEN => g.no_open,
             super::protocol::FUSE_OPENDIR => g.no_opendir,
@@ -275,7 +1399,7 @@ impl FuseConn {
     }
 
     pub fn mark_no_open(&self, opcode: u32) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         match opcode {
             super::protocol::FUSE_OPEN => g.no_open = true,
             super::protocol::FUSE_OPENDIR => g.no_opendir = true,
@@ -283,22 +1407,89 @@ impl FuseConn {
         }
     }
 
+    pub fn no_create(&self) -> bool {
+        self.lock_inner().no_create
+    }
+
+    pub fn mark_no_create(&self) {
+        self.lock_inner().no_create = true;
+    }
+
     pub fn use_readdirplus(&self) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         !g.no_readdirplus && (g.init.flags & FUSE_DO_READDIRPLUS) != 0
     }
 
+    pub fn readdirplus_auto(&self) -> bool {
+        let g = self.lock_inner();
+        !g.no_readdirplus
+            && (g.init.flags & (FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO))
+                == (FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO)
+    }
+
     pub fn disable_readdirplus(&self) {
-        let mut g = self.inner.lock();
+        let mut g = self.lock_inner();
         g.no_readdirplus = true;
     }
 
-    fn alloc_unique(&self) -> u64 {
-        self.next_unique.fetch_add(2, Ordering::Relaxed)
+    pub fn no_fallocate(&self) -> bool {
+        self.lock_inner().no_fallocate
+    }
+
+    pub fn mark_no_fallocate(&self) {
+        self.lock_inner().no_fallocate = true;
+    }
+
+    pub fn no_flush(&self) -> bool {
+        self.lock_inner().no_flush
+    }
+
+    pub fn mark_no_flush(&self) {
+        self.lock_inner().no_flush = true;
+    }
+
+    pub fn no_fsync(&self, opcode: u32) -> bool {
+        let g = self.lock_inner();
+        match opcode {
+            FUSE_FSYNC => g.no_fsync,
+            FUSE_FSYNCDIR => g.no_fsyncdir,
+            _ => false,
+        }
+    }
+
+    pub fn mark_no_fsync(&self, opcode: u32) {
+        let mut g = self.lock_inner();
+        match opcode {
+            FUSE_FSYNC => g.no_fsync = true,
+            FUSE_FSYNCDIR => g.no_fsyncdir = true,
+            _ => {}
+        }
+    }
+
+    pub fn no_xattr(&self, opcode: u32) -> bool {
+        let g = self.lock_inner();
+        match opcode {
+            FUSE_GETXATTR => g.no_getxattr,
+            FUSE_SETXATTR => g.no_setxattr,
+            FUSE_LISTXATTR => g.no_listxattr,
+            FUSE_REMOVEXATTR => g.no_removexattr,
+            _ => false,
+        }
+    }
+
+    pub fn mark_no_xattr(&self, opcode: u32) {
+        let mut g = self.lock_inner();
+        match opcode {
+            FUSE_GETXATTR => g.no_getxattr = true,
+            FUSE_SETXATTR => g.no_setxattr = true,
+            FUSE_LISTXATTR => g.no_listxattr = true,
+            FUSE_REMOVEXATTR => g.no_removexattr = true,
+            _ => {}
+        }
     }
 
     fn allow_current_process(&self, cred: &crate::process::cred::Cred) -> bool {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
 
         if !g.mounted {
             return true;
@@ -332,32 +1523,72 @@ impl FuseConn {
     }
 
     fn wait_initialized(&self) -> Result<(), SystemError> {
-        wait_with_recheck(&self.init_wait, || {
-            let g = self.inner.lock();
+        self.init_wait.wait_until_killable(|| {
+            let g = self.lock_inner();
             if !g.connected {
-                return Err(SystemError::ENOTCONN);
+                Some(Err(SystemError::ENOTCONN))
+            } else {
+                g.initialized.then_some(Ok(()))
             }
-            if g.initialized {
-                return Ok(Some(()));
-            }
-            Ok(None)
-        })
+        })?
     }
 
-    pub fn abort(&self) {
-        let processing: Vec<Arc<FusePendingState>> = {
-            let mut g = self.inner.lock();
+    fn claim_dax_cleanup(&self) -> Result<bool, SystemError> {
+        loop {
+            let state = {
+                let mut cleanup = self.dax_cleanup.lock();
+                match cleanup.state {
+                    DaxCleanupState::Active => {
+                        cleanup.state = DaxCleanupState::InProgress;
+                        return Ok(true);
+                    }
+                    DaxCleanupState::Succeeded => return Ok(false),
+                    DaxCleanupState::Failed => return Err(SystemError::EIO),
+                    DaxCleanupState::InProgress => cleanup.state,
+                }
+            };
+            debug_assert_eq!(state, DaxCleanupState::InProgress);
+            self.dax_cleanup_wait.wait_until(|| {
+                let state = self.dax_cleanup.lock().state;
+                (state != DaxCleanupState::InProgress).then_some(())
+            });
+        }
+    }
+
+    fn disconnect_requests(&self) {
+        self.begin_dax_quiesce();
+        self.background.disconnect();
+        let (processing, pending, hiprio_pending, pending_noreply_count) = {
+            let mut g = self.lock_inner();
+            if !g.connected {
+                return;
+            }
             g.connected = false;
             g.mounted = false;
-            g.pending.clear();
-            let processing = g.processing.values().cloned().collect();
-            g.processing.clear();
-            processing
+            // Close allocator acquisition before releasing the connection lock.
+            self.begin_shutdown_dax_allocator();
+            let pending_noreply_count = g
+                .pending
+                .iter()
+                .chain(g.hiprio_pending.iter())
+                .filter(|req| matches!(req.opcode, FUSE_FORGET | FUSE_INTERRUPT))
+                .count();
+            (
+                core::mem::take(&mut g.processing),
+                core::mem::take(&mut g.pending),
+                core::mem::take(&mut g.hiprio_pending),
+                pending_noreply_count,
+            )
         };
-        for p in processing {
-            p.complete(Err(SystemError::ENOTCONN));
+        stats::on_fuse_requests_aborted(processing.len() + pending_noreply_count);
+        // Release queued bytes and complete complex DMA/page-cache owners only
+        // after releasing the connection lock, without a temporary allocation.
+        drop((pending, hiprio_pending));
+        for (_, p) in processing {
+            p.complete_disconnected(SystemError::ENOTCONN);
         }
         self.read_wait.wakeup(None);
+        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Disconnect);
         self.init_wait.wakeup(None);
         let _ = EventPoll::wakeup_epoll(
             &self.epitems,
@@ -365,25 +1596,101 @@ impl FuseConn {
         );
     }
 
+    /// Disconnect the protocol and synchronously revoke every local DAX DMA
+    /// owner before a virtio transport reset may release its DMA resources.
+    pub(crate) fn abort_and_revoke_dax(&self) -> Result<(), SystemError> {
+        // Close admission before the cleanup-state lock rejects registrations.
+        // A node constructed before this point either registers while Active,
+        // or registers after InProgress but can no longer create a mapping.
+        self.begin_dax_quiesce();
+        self.begin_shutdown_dax_allocator();
+        if !self.claim_dax_cleanup()? {
+            return Ok(());
+        }
+
+        self.disconnect_requests();
+        // Pending SETUP/REMOVEMAPPING requests were completed above, so admitted
+        // callers can now drop their guards without depending on the daemon.
+        self.wait_dax_drained();
+        let revoke = self.revoke_registered_dax_nodes();
+        let result = {
+            let mut cleanup = self.dax_cleanup.lock();
+            let failed = revoke.is_err() || cleanup.revoke_failed || !cleanup.nodes.is_empty();
+            if failed {
+                cleanup.state = DaxCleanupState::Failed;
+                Err(SystemError::EIO)
+            } else {
+                self.disconnect_cleanup_dax_allocator();
+                self.dax_window.lock().take();
+                cleanup.state = DaxCleanupState::Succeeded;
+                Ok(())
+            }
+        };
+        self.mark_dax_dead();
+        self.dax_cleanup_wait.wakeup_all(None);
+        result
+    }
+
+    pub fn abort(&self) {
+        if let Err(error) = self.abort_and_revoke_dax() {
+            log::error!(
+                "fuse: disconnect DAX cleanup failed; transport resources must remain quarantined: {:?}",
+                error
+            );
+        }
+    }
+
     /// Unmount path: fail in-flight requests and best-effort queue DESTROY.
     ///
     /// Keep the connection readable for daemon-side teardown; actual disconnect
     /// happens when /dev/fuse is closed or explicit abort path is triggered.
     pub fn on_umount(&self) {
-        let processing: Vec<Arc<FusePendingState>>;
-        let should_destroy: bool;
-        {
-            let mut g = self.inner.lock();
-            should_destroy = g.connected && g.initialized;
+        self.begin_dax_quiesce();
+        self.background.disconnect();
+        let mut retired_requests = Retired::new();
+        let (processing, should_destroy, dropped_pending, queued_reply_count) = {
+            let mut g = self.lock_inner();
+            if g.teardown_started {
+                return;
+            }
+            g.teardown_started = true;
+            let should_destroy = g.connected && g.initialized;
             g.mounted = false;
-            g.pending.clear();
-            processing = g.processing.values().cloned().collect();
-            g.processing.clear();
-        }
-
-        for p in processing {
+            // Keep FORGET in the original queues: neither order nor reserved
+            // capacity changes before the later DESTROY publication.
+            let mut dropped_noreply = 0usize;
+            let mut queued_reply_count = 0usize;
+            for req in g.hiprio_pending.iter().chain(g.pending.iter()) {
+                if req.opcode == FUSE_FORGET {
+                    continue;
+                }
+                if matches!(req.opcode, FUSE_DESTROY | FUSE_INTERRUPT) {
+                    dropped_noreply += 1;
+                } else if g.processing.contains_key(&req.unique) {
+                    queued_reply_count += 1;
+                }
+            }
+            remove_requests(&mut g.hiprio_pending, &mut retired_requests, |req| {
+                req.opcode != FUSE_FORGET
+            });
+            remove_requests(&mut g.pending, &mut retired_requests, |req| {
+                req.opcode != FUSE_FORGET
+            });
+            (
+                core::mem::take(&mut g.processing),
+                should_destroy,
+                dropped_noreply + queued_reply_count,
+                queued_reply_count,
+            )
+        };
+        drop(retired_requests);
+        stats::on_fuse_requests_dropped_umount(dropped_pending);
+        stats::on_fuse_requests_aborted(processing.len().saturating_sub(queued_reply_count));
+        for (_, p) in processing {
             p.complete(Err(SystemError::ENOTCONN));
         }
+        self.wait_dax_drained();
+        self.begin_shutdown_dax_allocator();
         self.init_wait.wakeup(None);
 
         if !should_destroy {
@@ -391,42 +1698,65 @@ impl FuseConn {
             return;
         }
 
-        if self.enqueue_noreply(FUSE_DESTROY, 0, &[]).is_err() {
+        if self
+            .enqueue_request_with_cred(FUSE_DESTROY, 0, &[], FuseRequestCred::nocreds())
+            .is_err()
+        {
             self.abort();
             return;
         }
+        self.wake_bridge(stats::VirtioFsBridgeWakeSource::Teardown);
     }
 
-    /// Queue a FORGET message (no reply expected).
-    pub fn queue_forget(&self, nodeid: u64, nlookup: u64) -> Result<(), SystemError> {
-        if nodeid == 0 || nlookup == 0 {
-            return Ok(());
-        }
-        let can_send = {
-            let g = self.inner.lock();
-            g.connected && g.mounted && g.initialized
+    /// Cancel page-cache reads owned by one filesystem shutdown domain.
+    ///
+    /// FUSE readahead may leave speculative READs outstanding after the
+    /// foreground read has completed.  Those requests own Loading page-cache
+    /// entries, so they must reach a terminal state before generic cache
+    /// retirement can wait on and remove the entries.  Domain admission is
+    /// closed by the caller before this scan, which prevents a new matching
+    /// request from being published after the cancellation snapshot.
+    pub(crate) fn cancel_page_cache_reads(&self, domain: &Arc<PageCacheWritebackDomain>) {
+        let mut pending_reads = Retired::new();
+        let mut retired_requests = Retired::new();
+        let (queued_count, cancelled_count) = {
+            let mut inner = self.lock_inner();
+            let FuseConnInner {
+                hiprio_pending,
+                pending,
+                processing,
+                ..
+            } = &mut *inner;
+            // Match against the still-published pending table before extracting
+            // it. One expected O(1) hash lookup per queued request replaces the
+            // former quadratic unique-vector membership checks.
+            let belongs = |request: &FuseRequest| {
+                processing
+                    .get(&request.unique)
+                    .is_some_and(|pending| pending.belongs_to_page_cache_domain(domain))
+            };
+            let queued_count = remove_requests(hiprio_pending, &mut retired_requests, belongs)
+                + remove_requests(pending, &mut retired_requests, belongs);
+            let mut cancelled_count = 0usize;
+            processing.retain(|_, pending| {
+                if pending.belongs_to_page_cache_domain(domain) {
+                    // Pin before retain drops the table's owner under the lock.
+                    pending_reads.push(pending.clone());
+                    cancelled_count += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            (queued_count, cancelled_count)
         };
-        if !can_send {
-            return Ok(());
-        }
-        let inarg = FuseForgetIn { nlookup };
-        self.enqueue_noreply(FUSE_FORGET, nodeid, fuse_pack_struct(&inarg))
-    }
 
-    fn queue_interrupt(&self, unique: u64) -> Result<(), SystemError> {
-        if unique == 0 {
-            return Ok(());
+        drop(retired_requests);
+        stats::on_fuse_requests_dropped_umount(queued_count);
+        stats::on_fuse_requests_aborted(cancelled_count.saturating_sub(queued_count));
+        while let Some(pending) = pending_reads.pop() {
+            pending.complete_disconnected(SystemError::ENOTCONN);
         }
-        let can_send = {
-            let g = self.inner.lock();
-            g.connected && g.mounted && g.initialized
-        };
-        if !can_send {
-            return Ok(());
-        }
-        let inarg = FuseInterruptIn { unique };
-        let _ = self.enqueue_request(FUSE_INTERRUPT, 0, fuse_pack_struct(&inarg))?;
-        Ok(())
     }
 
     /// Acquire a new `/dev/fuse` file handle reference to this connection.
@@ -442,47 +1772,6 @@ impl FuseConn {
         }
     }
 
-    pub fn poll_mask(&self, have_pending: bool) -> EPollEventType {
-        let mut events = EPollEventType::EPOLLOUT | EPollEventType::EPOLLWRNORM;
-        let g = self.inner.lock();
-        if !g.connected {
-            return EPollEventType::EPOLLERR;
-        }
-        if have_pending {
-            events |= EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM;
-        }
-        events
-    }
-
-    pub fn poll(&self) -> EPollEventType {
-        let g = self.inner.lock();
-        let have_pending = !g.pending.is_empty();
-        drop(g);
-        self.poll_mask(have_pending)
-    }
-
-    pub fn add_epitem(&self, epitem: Arc<EPollItem>) -> Result<(), SystemError> {
-        self.epitems.lock().push_back(epitem);
-        Ok(())
-    }
-
-    pub fn remove_epitem(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
-        let mut guard = self.epitems.lock();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if len != guard.len() {
-            return Ok(());
-        }
-        Err(SystemError::ENOENT)
-    }
-
-    fn calc_min_read_buffer(max_write: usize) -> usize {
-        core::cmp::max(
-            FUSE_MIN_READ_BUFFER,
-            core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>() + max_write,
-        )
-    }
-
     fn max_write_cap_for_user_read_chunk() -> usize {
         let overhead = core::mem::size_of::<FuseInHeader>() + core::mem::size_of::<FuseWriteIn>();
         if Self::USER_READ_CHUNK <= overhead {
@@ -492,76 +1781,16 @@ impl FuseConn {
         }
     }
 
-    fn max_write_cap(&self) -> usize {
-        let g = self.inner.lock();
-        core::cmp::max(Self::MIN_MAX_WRITE, g.max_write_cap)
-    }
-
-    fn min_read_buffer(&self) -> usize {
-        let g = self.inner.lock();
-        Self::calc_min_read_buffer(g.init.max_write as usize)
-    }
-
-    fn pop_pending_nonblock(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        let mut g = self.inner.lock();
-        if !g.connected {
-            return Err(SystemError::ENOTCONN);
-        }
-        g.pending
-            .pop_front()
-            .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)
-    }
-
-    fn pop_pending_blocking(&self) -> Result<Arc<FuseRequest>, SystemError> {
-        wait_with_recheck(&self.read_wait, || {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            if let Some(req) = g.pending.pop_front() {
-                return Ok(Some(req));
-            }
-            Ok(None)
-        })
-    }
-
-    pub fn read_request(&self, nonblock: bool, out: &mut [u8]) -> Result<usize, SystemError> {
-        // Linux: require a sane minimum read buffer for all reads.
-        let min_read = self.min_read_buffer();
-        if out.len() < min_read {
-            log::warn!(
-                "fuse: read buffer too small: got={} min={} nonblock={}",
-                out.len(),
-                min_read,
-                nonblock
-            );
+    pub fn set_max_pages_limit(&self, max_pages_limit: usize) -> Result<(), SystemError> {
+        if max_pages_limit == 0 {
             return Err(SystemError::EINVAL);
         }
-
-        // Linux: if O_NONBLOCK and no pending request, return EAGAIN.
-        let req = if nonblock {
-            self.pop_pending_nonblock()?
-        } else {
-            self.pop_pending_blocking()?
-        };
-
-        if out.len() < req.bytes.len() {
-            // Put it back and report EINVAL: userspace must provide a sufficiently large buffer.
-            let req_len = req.bytes.len();
-            let mut g = self.inner.lock();
-            if g.connected {
-                g.pending.push_front(req);
-            }
-            log::warn!(
-                "fuse: read buffer smaller than queued request: got={} need={}",
-                out.len(),
-                req_len
-            );
-            return Err(SystemError::EINVAL);
+        let mut g = self.lock_inner();
+        if g.initialized {
+            return Err(SystemError::EBUSY);
         }
-
-        out[..req.bytes.len()].copy_from_slice(&req.bytes);
-        Ok(req.bytes.len())
+        g.max_pages_limit = core::cmp::min(max_pages_limit, Self::MAX_MAX_PAGES);
+        Ok(())
     }
 
     fn kernel_init_flags() -> u64 {
@@ -575,302 +1804,31 @@ impl FuseConn {
             | FUSE_DO_READDIRPLUS
             | FUSE_READDIRPLUS_AUTO
             | FUSE_ASYNC_DIO
-            | FUSE_WRITEBACK_CACHE
             | FUSE_NO_OPEN_SUPPORT
+            | FUSE_NO_OPENDIR_SUPPORT
             | FUSE_PARALLEL_DIROPS
             | FUSE_HANDLE_KILLPRIV
             | FUSE_POSIX_ACL
             | FUSE_ABORT_ERROR
             | FUSE_MAX_PAGES
-            | FUSE_NO_OPENDIR_SUPPORT
             | FUSE_EXPLICIT_INVAL_DATA
             | FUSE_INIT_EXT
+            | FUSE_HAS_EXPIRE_ONLY
+            | FUSE_WRITEBACK_CACHE
     }
 
-    pub fn enqueue_init(&self) -> Result<(), SystemError> {
-        let flags = Self::kernel_init_flags();
-        let init_in = FuseInitIn {
-            major: FUSE_KERNEL_VERSION,
-            minor: FUSE_KERNEL_MINOR_VERSION,
-            max_readahead: 0,
-            flags: flags as u32,
-            flags2: (flags >> 32) as u32,
-            unused: [0; 11],
-        };
-        self.enqueue_request(FUSE_INIT, 0, fuse_pack_struct(&init_in))
-            .map(|_| ())
+    /// virtiofs uses the normal FUSE capability request plus Linux's submount bit.
+    fn virtiofs_init_flags() -> u64 {
+        Self::kernel_init_flags() | FUSE_SUBMOUNTS
     }
 
-    pub fn request(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, SystemError> {
-        if opcode != FUSE_INIT {
-            let cred = ProcessManager::current_pcb().cred();
-            if !self.allow_current_process(&cred) {
-                return Err(SystemError::EACCES);
-            }
-            self.wait_initialized()?;
-        }
-        let pending = self.enqueue_request(opcode, nodeid, payload)?;
-        match pending.wait_complete() {
-            Err(SystemError::EINTR) | Err(SystemError::ERESTARTSYS) => {
-                if opcode != FUSE_INTERRUPT {
-                    let _ = self.queue_interrupt(pending.unique());
-                }
-                Err(SystemError::EINTR)
-            }
-            x => x,
-        }
-    }
-
-    fn enqueue_noreply(&self, opcode: u32, nodeid: u64, payload: &[u8]) -> Result<(), SystemError> {
-        let unique = self.alloc_unique();
-        let req = self.build_request(
-            unique,
-            opcode,
-            nodeid,
-            payload,
-            FuseRequestCred {
-                uid: 0,
-                gid: 0,
-                pid: 0,
-            },
-        );
-        self.push_request(req, None, unique)?;
-        Ok(())
-    }
-
-    fn enqueue_request(
-        &self,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-    ) -> Result<Arc<FusePendingState>, SystemError> {
-        let unique = self.alloc_unique();
-
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
-        if !self.allow_current_process(&cred) {
-            return Err(SystemError::EACCES);
-        }
-        let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
-        let pending_state = Arc::new(FusePendingState::new(unique, opcode));
-        let req = self.build_request(
-            unique,
-            opcode,
-            nodeid,
-            payload,
-            FuseRequestCred {
-                uid: cred.fsuid.data() as u32,
-                gid: cred.fsgid.data() as u32,
-                pid,
-            },
-        );
-        self.push_request(req, Some(pending_state.clone()), unique)?;
-        Ok(pending_state)
-    }
-
-    fn build_request(
-        &self,
-        unique: u64,
-        opcode: u32,
-        nodeid: u64,
-        payload: &[u8],
-        req_cred: FuseRequestCred,
-    ) -> Arc<FuseRequest> {
-        let hdr = FuseInHeader {
-            len: (core::mem::size_of::<FuseInHeader>() + payload.len()) as u32,
-            opcode,
-            unique,
-            nodeid,
-            uid: req_cred.uid,
-            gid: req_cred.gid,
-            pid: req_cred.pid,
-            total_extlen: 0,
-            padding: 0,
-        };
-
-        let mut bytes = Vec::with_capacity(hdr.len as usize);
-        bytes.extend_from_slice(fuse_pack_struct(&hdr));
-        bytes.extend_from_slice(payload);
-        Arc::new(FuseRequest { bytes })
-    }
-
-    fn push_request(
-        &self,
-        req: Arc<FuseRequest>,
-        pending_state: Option<Arc<FusePendingState>>,
-        unique: u64,
-    ) -> Result<(), SystemError> {
-        {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOTCONN);
-            }
-            g.pending.push_back(req);
-            if let Some(pending) = pending_state {
-                g.processing.insert(unique, pending);
-            }
-        }
-
-        self.read_wait.wakeup(None);
-        let _ = EventPoll::wakeup_epoll(
-            &self.epitems,
-            EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-        );
-        Ok(())
-    }
-
-    pub fn write_reply(&self, data: &[u8]) -> Result<usize, SystemError> {
-        if data.len() < core::mem::size_of::<FuseOutHeader>() {
-            return Err(SystemError::EINVAL);
-        }
-
-        let out_hdr: FuseOutHeader = fuse_read_struct(data)?;
-        if out_hdr.len as usize != data.len() {
-            return Err(SystemError::EINVAL);
-        }
-
-        if out_hdr.unique == 0 {
-            let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
-            self.handle_notify(out_hdr.error, payload)?;
-            return Ok(data.len());
-        }
-
-        let pending = {
-            let mut g = self.inner.lock();
-            if !g.connected {
-                return Err(SystemError::ENOENT);
-            }
-            g.processing
-                .remove(&out_hdr.unique)
-                .ok_or(SystemError::ENOENT)?
-        };
-
-        let payload = &data[core::mem::size_of::<FuseOutHeader>()..];
-        let error = out_hdr.error;
-
-        if error != 0 {
-            // Negative errno from userspace.
-            let errno = -error;
-            let e = SystemError::from_i32(errno).unwrap_or(SystemError::EIO);
-            if Self::is_expected_reply_error(pending.opcode, errno) {
-                log::trace!(
-                    "fuse: reply error opcode={} unique={} errno={}",
-                    pending.opcode,
-                    out_hdr.unique,
-                    errno
-                );
-            } else {
-                log::warn!(
-                    "fuse: reply error opcode={} unique={} errno={}",
-                    pending.opcode,
-                    out_hdr.unique,
-                    errno
-                );
-            }
-            pending.complete(Err(e));
-            if pending.opcode == FUSE_INIT {
-                self.abort();
-            }
-            return Ok(data.len());
-        }
-
-        if pending.opcode == FUSE_INIT {
-            let init_out: FuseInitOut = match fuse_read_struct(payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    pending.complete(Err(e));
-                    self.abort();
-                    return Ok(data.len());
-                }
-            };
-
-            if init_out.major != FUSE_KERNEL_VERSION {
-                pending.complete(Err(SystemError::EINVAL));
-                self.abort();
-                return Ok(data.len());
-            }
-
-            let mut negotiated_flags = init_out.flags as u64;
-            if (negotiated_flags & FUSE_INIT_EXT) != 0 {
-                negotiated_flags |= (init_out.flags2 as u64) << 32;
-            }
-            let negotiated_minor = core::cmp::min(init_out.minor, FUSE_KERNEL_MINOR_VERSION);
-            let negotiated_max_pages_raw =
-                if (negotiated_flags & FUSE_MAX_PAGES) != 0 && init_out.max_pages != 0 {
-                    init_out.max_pages
-                } else {
-                    1
-                };
-            let negotiated_max_write = core::cmp::max(4096usize, init_out.max_write as usize);
-            let max_write_cap = self.max_write_cap();
-            let capped_max_write = core::cmp::min(negotiated_max_write, max_write_cap);
-            if capped_max_write < negotiated_max_write {
-                log::trace!(
-                    "fuse: cap negotiated max_write from {} to {} due backend read buffer limit",
-                    negotiated_max_write,
-                    capped_max_write
-                );
-            }
-            let pages_from_write =
-                core::cmp::max(1usize, capped_max_write.div_ceil(MMArch::PAGE_SIZE)) as u16;
-            let negotiated_max_pages = core::cmp::min(negotiated_max_pages_raw, pages_from_write);
-
-            {
-                let mut g = self.inner.lock();
-                if g.connected {
-                    g.initialized = true;
-                    g.init = FuseInitNegotiated {
-                        minor: negotiated_minor,
-                        max_readahead: init_out.max_readahead,
-                        max_write: capped_max_write as u32,
-                        time_gran: init_out.time_gran,
-                        max_pages: negotiated_max_pages,
-                        flags: negotiated_flags,
-                    };
-                }
-            }
-            self.init_wait.wakeup(None);
-        }
-
-        pending.complete(Ok(payload.to_vec()));
-        Ok(data.len())
-    }
-
-    fn handle_notify(&self, code: i32, payload: &[u8]) -> Result<(), SystemError> {
-        if code <= 0 {
-            return Err(SystemError::EINVAL);
-        }
-        match code {
-            FUSE_NOTIFY_POLL
-            | FUSE_NOTIFY_INVAL_INODE
-            | FUSE_NOTIFY_INVAL_ENTRY
-            | FUSE_NOTIFY_STORE
-            | FUSE_NOTIFY_RETRIEVE
-            | FUSE_NOTIFY_DELETE => {
-                log::debug!("fuse: notify code={} len={}", code, payload.len());
-                Ok(())
-            }
-            _ => Err(SystemError::EINVAL),
-        }
-    }
-
-    fn is_expected_reply_error(opcode: u32, errno: i32) -> bool {
-        matches!(
-            (opcode, SystemError::from_i32(errno)),
-            (FUSE_LOOKUP, Some(SystemError::ENOENT))
-                | (FUSE_FLUSH, Some(SystemError::ENOSYS))
-                | (FUSE_INTERRUPT, Some(SystemError::EAGAIN_OR_EWOULDBLOCK))
-        )
+    pub fn supports_submounts(&self) -> bool {
+        self.has_init_flag(FUSE_SUBMOUNTS)
     }
 
     #[allow(dead_code)]
     pub fn negotiated_state(&self) -> (u32, u32, u32, u32, u16, u64) {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         (
             g.init.minor,
             g.init.max_readahead,
@@ -882,7 +1840,419 @@ impl FuseConn {
     }
 
     pub fn max_write(&self) -> usize {
-        let g = self.inner.lock();
+        let g = self.lock_inner();
         core::cmp::max(4096usize, g.init.max_write as usize)
     }
+
+    pub fn max_read(&self) -> usize {
+        let g = self.lock_inner();
+        core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize)
+    }
+
+    pub fn max_pages(&self) -> usize {
+        let g = self.lock_inner();
+        core::cmp::max(1, g.init.max_pages as usize)
+    }
+
+    /// Maximum payload accepted by the ordinary READ request builder after
+    /// applying both the negotiated byte cap and the backend/SG page cap.
+    pub fn effective_read_payload_limit(&self) -> usize {
+        core::cmp::min(
+            self.max_read(),
+            self.max_pages().saturating_mul(MMArch::PAGE_SIZE),
+        )
+    }
+
+    pub fn max_readahead_pages(&self) -> usize {
+        let g = self.lock_inner();
+        let bytes = if g.init.max_readahead == 0 {
+            Self::DEFAULT_MAX_READAHEAD
+        } else {
+            g.init.max_readahead as usize
+        };
+        core::cmp::max(1, bytes >> MMArch::PAGE_SHIFT)
+    }
+
+    /// Snapshot immutable FUSE_INIT read capabilities under one connection
+    /// lock acquisition for use by an open file's cached-I/O hot path.
+    pub(crate) fn open_io_config(&self) -> super::private_data::FuseOpenIoConfig {
+        let g = self.lock_inner();
+        let max_readahead = if g.init.max_readahead == 0 {
+            Self::DEFAULT_MAX_READAHEAD
+        } else {
+            g.init.max_readahead as usize
+        };
+        super::private_data::FuseOpenIoConfig {
+            async_read: (g.init.flags & FUSE_ASYNC_READ) != 0,
+            auto_inval_data: (g.init.flags & FUSE_AUTO_INVAL_DATA) != 0,
+            writeback_cache: (g.init.flags & FUSE_WRITEBACK_CACHE) != 0,
+            max_read: core::cmp::max(Self::MIN_MAX_WRITE, g.max_read as usize),
+            max_pages: core::cmp::max(1, g.init.max_pages as usize),
+            max_readahead_pages: core::cmp::max(1, max_readahead >> MMArch::PAGE_SHIFT),
+        }
+    }
+
+    fn acquire_background_credit(
+        &self,
+        speculative: bool,
+    ) -> Result<Option<FuseBackgroundCredit>, SystemError> {
+        {
+            let inner = self.lock_inner();
+            if !inner.connected || inner.teardown_started {
+                return Err(SystemError::ENOTCONN);
+            }
+        }
+        self.background.acquire(speculative)
+    }
+}
+
+#[cfg(feature = "mm_selftest")]
+#[path = "conn/selftest_wait.rs"]
+mod selftest_wait;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_fuse_wait_selftest() -> Result<bool, SystemError> {
+    selftest_wait::run()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use core::{mem::size_of, sync::atomic::Ordering};
+
+    use hashbrown::HashMap;
+    use system_error::SystemError;
+
+    use crate::arch::{MMArch, MemoryManagementArch};
+
+    use super::super::protocol::{
+        FuseEntryOut, FuseOpenOut, FuseOutHeader, FuseStatfsOut, FUSE_CREATE, FUSE_DESTROY,
+        FUSE_GETATTR, FUSE_HAS_INODE_DAX, FUSE_LOOKUP, FUSE_MAP_ALIGNMENT, FUSE_REMOVEMAPPING,
+        FUSE_SETUPMAPPING, FUSE_STATFS,
+    };
+    use super::super::virtiofs::dax::{DaxMountMode, DAX_RANGE_SIZE};
+    use super::{
+        daemon, request, stats, FuseCompletionKind, FuseConn, FusePendingState,
+        FuseReplyCapacitySource, FuseReplyContract, FuseRequest,
+    };
+
+    #[test]
+    fn quiescence_owners_are_tracked_in_off_mode() {
+        let previous_mode = stats::stats_mode();
+        stats::set_stats_mode(stats::FuseStatsMode::Off);
+        let before = stats::fuse_snapshot();
+
+        let request = FuseRequest {
+            bytes: vec![],
+            unique: 1,
+            opcode: FUSE_DESTROY,
+            reply_contract: FuseReplyContract::NoReply,
+            read_pages_destination: None,
+            track_direct_read_stats: false,
+            stats_owner: Default::default(),
+            retired_next: SpinLock::new(None),
+        };
+        request.stats_mark_queued();
+        assert_eq!(request.stats_owner.load(Ordering::Acquire), 1);
+        assert_eq!(
+            stats::fuse_snapshot().request_queue_current,
+            before.request_queue_current + 1
+        );
+        request.stats_mark_dispatched();
+        assert_eq!(request.stats_owner.load(Ordering::Acquire), 2);
+        let dispatched = stats::fuse_snapshot();
+        assert_eq!(
+            dispatched.request_queue_current,
+            before.request_queue_current
+        );
+        assert_eq!(dispatched.dispatch_current, before.dispatch_current + 1);
+        request.stats_mark_transport_owned();
+        assert_eq!(request.stats_owner.load(Ordering::Acquire), 3);
+        assert_eq!(
+            stats::fuse_snapshot().dispatch_current,
+            before.dispatch_current
+        );
+
+        let pending = FusePendingState::new(2, FUSE_GETATTR);
+        pending.mark_processing_owner();
+        assert!(pending.processing_owner.load(Ordering::Acquire));
+        assert_eq!(
+            stats::fuse_snapshot().processing_current,
+            before.processing_current + 1
+        );
+        assert!(pending.complete_never_submitted(SystemError::EIO));
+        assert!(!pending.processing_owner.load(Ordering::Acquire));
+        assert_eq!(
+            stats::fuse_snapshot().processing_current,
+            before.processing_current
+        );
+
+        stats::set_stats_mode(previous_mode);
+    }
+
+    fn set_minor(conn: &FuseConn, minor: u32) {
+        conn.lock_inner().init.minor = minor;
+        conn.reply_layout_minor.store(minor, Ordering::Release);
+    }
+
+    #[test]
+    fn effective_read_payload_limit_applies_byte_and_page_caps() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        {
+            let mut inner = conn.lock_inner();
+            inner.max_read = 64 * 1024;
+            inner.init.max_pages = 4;
+        }
+        assert_eq!(conn.effective_read_payload_limit(), 4 * MMArch::PAGE_SIZE);
+
+        {
+            let mut inner = conn.lock_inner();
+            inner.max_read = 8 * 1024;
+            inner.init.max_pages = 64;
+        }
+        assert_eq!(conn.effective_read_payload_limit(), 8 * 1024);
+    }
+
+    fn capacity(conn: &FuseConn, opcode: u32, payload: &[u8]) -> (usize, FuseReplyCapacitySource) {
+        let capacity = request::reply_capacity_for_test(conn, opcode, payload)
+            .unwrap()
+            .unwrap();
+        (capacity.bytes, capacity.source)
+    }
+
+    #[test]
+    fn dax_init_policy_is_internal_and_window_gated() {
+        let never = FuseConn::new_for_virtiofs_with_dax(
+            8192,
+            8192,
+            Some(DAX_RANGE_SIZE),
+            DaxMountMode::Never,
+        );
+        assert!(never.dax_allocator().is_none());
+        assert_eq!(never.lock_inner().init_flags & FUSE_MAP_ALIGNMENT, 0);
+
+        let always = FuseConn::new_for_virtiofs_with_dax(
+            8192,
+            8192,
+            Some(DAX_RANGE_SIZE),
+            DaxMountMode::Always,
+        );
+        assert!(always.dax_allocator().is_some());
+        assert_ne!(always.lock_inner().init_flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_eq!(always.lock_inner().init_flags & FUSE_HAS_INODE_DAX, 0);
+
+        let inode = FuseConn::new_for_virtiofs_with_dax(
+            8192,
+            8192,
+            Some(DAX_RANGE_SIZE),
+            DaxMountMode::Inode,
+        );
+        let flags = inode.lock_inner().init_flags;
+        assert_ne!(flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
+
+        let no_window = FuseConn::new_for_virtiofs_with_dax(8192, 8192, None, DaxMountMode::Always);
+        assert!(no_window.dax_allocator().is_none());
+        assert_eq!(no_window.lock_inner().init_flags & FUSE_MAP_ALIGNMENT, 0);
+
+        let inode_without_window =
+            FuseConn::new_for_virtiofs_with_dax(8192, 8192, None, DaxMountMode::Inode);
+        let flags = inode_without_window.lock_inner().init_flags;
+        assert_eq!(flags & FUSE_MAP_ALIGNMENT, 0);
+        assert_ne!(flags & FUSE_HAS_INODE_DAX, 0);
+    }
+
+    #[test]
+    fn empty_dax_cleanup_is_terminal_and_idempotent() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        assert_eq!(conn.abort_and_revoke_dax(), Ok(()));
+        assert_eq!(conn.dax_admission_state(), super::DaxAdmissionState::Dead);
+        assert_eq!(
+            conn.dax_cleanup.lock().state,
+            super::DaxCleanupState::Succeeded
+        );
+        assert_eq!(conn.abort_and_revoke_dax(), Ok(()));
+    }
+
+    #[test]
+    fn mapping_requests_have_exact_empty_reply_contracts() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        assert_eq!(
+            capacity(&conn, FUSE_SETUPMAPPING, &[]).0,
+            size_of::<FuseOutHeader>()
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_REMOVEMAPPING, &[]).0,
+            size_of::<FuseOutHeader>()
+        );
+    }
+
+    #[test]
+    fn dax_alignment_rejects_daemon_requirement_above_range_shift() {
+        assert!(FuseConn::dax_map_alignment_valid(FUSE_MAP_ALIGNMENT, 21));
+        assert!(!FuseConn::dax_map_alignment_valid(FUSE_MAP_ALIGNMENT, 22));
+        assert!(FuseConn::dax_map_alignment_valid(0, u16::MAX));
+    }
+
+    #[test]
+    fn bridge_wake_events_are_ignored_until_bridge_is_installed() {
+        let conn = FuseConn::new();
+
+        conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
+        assert_eq!(conn.bridge_wake_events(), 0);
+
+        conn.install_bridge_wake();
+        conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
+        assert_eq!(
+            conn.bridge_wake_events(),
+            stats::VirtioFsBridgeWakeSource::Request.bit()
+        );
+        assert_eq!(
+            conn.take_bridge_wake_events(),
+            stats::VirtioFsBridgeWakeSource::Request.bit()
+        );
+
+        conn.clear_bridge_wake();
+        conn.wake_bridge(stats::VirtioFsBridgeWakeSource::Request);
+        assert_eq!(conn.bridge_wake_events(), 0);
+    }
+
+    #[test]
+    fn negotiated_minor_tightens_and_normalizes_compat_replies() {
+        let conn = FuseConn::new_for_virtiofs(256 * 1024, 256 * 1024);
+        let header = size_of::<FuseOutHeader>();
+        set_minor(&conn, 3);
+        let statfs_capacity = request::reply_capacity_for_test(&conn, FUSE_STATFS, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            statfs_capacity.bytes,
+            header + FuseConn::FUSE_COMPAT_STATFS_SIZE
+        );
+        assert_eq!(statfs_capacity.retained_bytes, size_of::<FuseStatfsOut>());
+        assert_eq!(
+            capacity(&conn, FUSE_LOOKUP, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_GETATTR, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ATTR_OUT_SIZE
+        );
+        assert_eq!(
+            capacity(&conn, FUSE_CREATE, &[]).0,
+            header + FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE + size_of::<FuseOpenOut>()
+        );
+
+        let compat_entry = vec![0x5a; FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE];
+        let normalized =
+            daemon::normalize_compat_reply_for_test(3, FUSE_LOOKUP, &compat_entry).unwrap();
+        assert_eq!(normalized.len(), size_of::<FuseEntryOut>());
+        assert_eq!(
+            &normalized[..FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE],
+            &compat_entry
+        );
+        assert!(normalized[FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE..]
+            .iter()
+            .all(|byte| *byte == 0));
+
+        let compat_create_len = FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE + size_of::<FuseOpenOut>();
+        let compat_create = vec![0xa5; compat_create_len];
+        let normalized =
+            daemon::normalize_compat_reply_for_test(3, FUSE_CREATE, &compat_create).unwrap();
+        assert_eq!(
+            &normalized[size_of::<FuseEntryOut>()..],
+            &compat_create[FuseConn::FUSE_COMPAT_ENTRY_OUT_SIZE..]
+        );
+    }
+
+    #[test]
+    fn teardown_gate_is_idempotent_and_rejects_late_business_requests() {
+        let conn = FuseConn::new_for_virtiofs(8192, 8192);
+        {
+            let mut g = conn.lock_inner();
+            g.initialized = true;
+            g.mounted = true;
+        }
+
+        conn.on_umount();
+        conn.on_umount();
+        {
+            let g = conn.lock_inner();
+            assert!(g.teardown_started);
+            assert_eq!(
+                g.pending
+                    .iter()
+                    .filter(|req| req.opcode == FUSE_DESTROY)
+                    .count(),
+                1
+            );
+        }
+
+        assert_eq!(
+            conn.request_nocreds(FUSE_LOOKUP, 1, b"late\0"),
+            Err(SystemError::ENOTCONN)
+        );
+    }
+
+    #[test]
+    fn pending_read_pages_preserves_direct_and_contiguous_results() {
+        let direct = FusePendingState::new(1, super::super::protocol::FUSE_READ);
+        assert!(direct.complete_read_pages_direct(4097));
+        assert!(!direct.complete_read_pages_direct(1));
+        assert!(matches!(
+            direct.wait_read_pages_complete().unwrap(),
+            super::super::reply::FuseReadPagesReply::Direct { bytes: 4097 }
+        ));
+
+        let contiguous = FusePendingState::new(3, super::super::protocol::FUSE_READ);
+        assert!(contiguous.complete(Ok(super::super::reply::FuseReply::from_bytes(vec![1, 2]))));
+        assert!(matches!(
+            contiguous.wait_read_pages_complete().unwrap(),
+            super::super::reply::FuseReadPagesReply::Contiguous(reply) if &*reply == [1, 2]
+        ));
+    }
+
+    #[test]
+    fn dax_completion_distinguishes_daemon_reply_from_synthetic_error() {
+        let daemon = FusePendingState::new(2, FUSE_SETUPMAPPING);
+        assert!(daemon.complete_daemon_error(SystemError::EIO));
+        let (result, kind) = daemon.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::EIO);
+        assert_eq!(kind, FuseCompletionKind::DaemonError);
+
+        let synthetic = FusePendingState::new(4, FUSE_SETUPMAPPING);
+        synthetic.mark_outcome_unknown();
+        assert!(synthetic.complete_daemon_error(SystemError::EIO));
+        let (result, kind) = synthetic.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::EIO);
+        assert_eq!(kind, FuseCompletionKind::OutcomeUnknown);
+
+        let local = FusePendingState::new(5, FUSE_REMOVEMAPPING);
+        assert!(local.complete_never_submitted(SystemError::ENOMEM));
+        let (result, kind) = local.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::ENOMEM);
+        assert_eq!(kind, FuseCompletionKind::NeverSubmitted);
+
+        let disconnected = FusePendingState::new(6, FUSE_REMOVEMAPPING);
+        assert!(disconnected.complete_disconnected(SystemError::ENOTCONN));
+        let (result, kind) = disconnected.wait_result_with_kind().unwrap();
+        assert_eq!(result.unwrap_err(), SystemError::ENOTCONN);
+        assert_eq!(kind, FuseCompletionKind::Disconnected);
+    }
+
+    #[test]
+    fn ordinary_wait_rejects_direct_completion() {
+        let pending = FusePendingState::new(1, super::super::protocol::FUSE_READ);
+        assert!(pending.complete_read_pages_direct(1));
+        assert_eq!(pending.wait_complete(), Err(SystemError::EIO));
+    }
+}
+
+#[cfg(feature = "mm_selftest")]
+#[path = "conn/selftest_retirement.rs"]
+mod selftest_retirement;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_fuse_birth_selftest() -> Result<bool, SystemError> {
+    Ok(request::heap_denied_birth_selftest()? && selftest_retirement::run()?)
 }

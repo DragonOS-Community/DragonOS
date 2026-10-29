@@ -43,6 +43,11 @@ pub trait Class: Debug + Send + Sync {
     /// 获取类的名称
     fn name(&self) -> &'static str;
 
+    /// Whether direct device entries in this class are keyed by a namespace.
+    fn namespace_children(&self) -> bool {
+        false
+    }
+
     /// 属于该类的设备的基本属性。
     fn dev_groups(&self) -> &'static [&'static dyn AttributeGroup] {
         return &[];
@@ -130,6 +135,13 @@ impl ClassManager {
         subsystem.set_class(Some(Arc::downgrade(class)));
 
         subsys.register()?;
+
+        if class.namespace_children() {
+            subsys
+                .inode()
+                .ok_or(SystemError::ENOENT)?
+                .enable_namespace_children()?;
+        }
 
         sysfs_instance().create_groups(&(subsys as Arc<dyn KObject>), class.class_groups())?;
 

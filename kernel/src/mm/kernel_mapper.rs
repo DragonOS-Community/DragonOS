@@ -9,6 +9,7 @@ use crate::{
     exception::InterruptArch,
     libs::align::page_align_up,
     mm::{allocator::page_frame::PageFrameCount, MMArch, MemoryManagementArch},
+    process::preempt::PreemptGuard,
     smp::{
         core::smp_get_processor_id,
         cpu::{AtomicProcessorId, ProcessorId},
@@ -33,40 +34,78 @@ pub struct KernelMapper {
     mapper: PageMapper,
     /// 标记当前映射器是否为只读
     readonly: bool,
+    // Pin CPU ownership until Drop has released owner/count.
+    _preempt_guard: PreemptGuard,
 }
 
+impl !Send for KernelMapper {}
+
 impl KernelMapper {
-    fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper) -> Self {
+    fn lock_cpu(cpuid: ProcessorId, mapper: PageMapper, preempt_guard: PreemptGuard) -> Self {
+        // Update owner/count together with local interrupts disabled. Otherwise,
+        // an interrupt can reenter after the owner CAS but before the count
+        // increment, observe owner == cpuid with count == 0, and obtain a
+        // writable guard. Dropping that guard clears the owner and count.
+        // When the interrupted caller resumes, it increments count to 1 while
+        // owner remains INVALID. Another CPU can then acquire ownership and
+        // incorrectly receive a readonly guard because the previous count is
+        // nonzero, causing MMIO release to fail with EAGAIN and panic.
+        //
+        // Disable interrupts only for each acquisition attempt. If another CPU
+        // owns the lock, restore the prior interrupt state before spinning.
         loop {
-            match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
+            let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+            let already_owned = match KERNEL_MAPPER_LOCK_OWNER.compare_exchange_weak(
                 KERNEL_MAPPER_NO_PROCESSOR,
                 cpuid,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => false,
                 // 当前处理器已经持有了锁
-                Err(id) if id == cpuid => break,
+                Err(id) if id == cpuid => true,
                 // either CAS failed, or some other hardware thread holds the lock
-                Err(_) => core::hint::spin_loop(),
-            }
+                Err(_) => {
+                    drop(irq_guard);
+                    core::hint::spin_loop();
+                    continue;
+                }
+            };
+
+            let prev_count = KERNEL_MAPPER_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+            compiler_fence(Ordering::Acquire);
+
+            // With interrupts disabled, a new owner must observe count == 0,
+            // while reentry must observe count > 0. Report any other state in
+            // debug builds rather than hiding the corruption in a readonly guard.
+            debug_assert_eq!(
+                already_owned,
+                prev_count > 0,
+                "kernel mapper lock invariant violated: owner={:?}, count={}",
+                KERNEL_MAPPER_LOCK_OWNER.load(Ordering::Relaxed),
+                prev_count
+            );
+
+            // Reentrant acquisition on this CPU only permits read access.
+            let readonly = prev_count > 0;
+            drop(irq_guard);
+
+            return Self {
+                mapper,
+                readonly,
+                _preempt_guard: preempt_guard,
+            };
         }
-
-        let prev_count = KERNEL_MAPPER_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
-        compiler_fence(Ordering::Acquire);
-
-        // 本地核心已经持有过锁，因此标记当前加锁获得的映射器为只读
-        let readonly = prev_count > 0;
-
-        return Self { mapper, readonly };
     }
 
     /// @brief 锁定内核映射器, 并返回一个内核映射器对象
     #[inline(always)]
     pub fn lock() -> Self {
+        // CPU identity must remain stable during acquisition and ownership.
+        let preempt_guard = PreemptGuard::new();
         let cpuid = smp_get_processor_id();
         let mapper = unsafe { PageMapper::current(PageTableKind::Kernel, LockedFrameAllocator) };
-        return Self::lock_cpu(cpuid, mapper);
+        return Self::lock_cpu(cpuid, mapper, preempt_guard);
     }
 
     /// @brief 获取内核映射器的page mapper的可变引用。如果当前映射器为只读，则返回 None

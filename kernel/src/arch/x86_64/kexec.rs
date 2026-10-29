@@ -12,8 +12,11 @@ use alloc::rc::Rc;
 use core::mem::transmute;
 use system_error::SystemError;
 
-type RelocateKernelFn =
-    unsafe extern "C" fn(indirection_page: usize, start_address: usize, stack_page_address: usize);
+type RelocateKernelFn = unsafe extern "C" fn(
+    indirection_page: usize,
+    start_address: usize,
+    stack_page_address: usize,
+) -> !;
 
 pub fn machine_kexec_prepare(kimage: Rc<SpinLock<Kimage>>) -> Result<(), SystemError> {
     unsafe {
@@ -169,7 +172,17 @@ pub fn machine_kexec(kimage: Rc<SpinLock<Kimage>>) {
         .phys_address()
         .data();
 
-    unsafe { relocate_kernel_func(arg1, arg2, arg3) };
-
-    panic!("Kexec should not run to here!");
+    // KVM can keep writing to PV clock/steal GPAs even after their CPU stops
+    // executing. Every peer must revoke those registrations before publishing
+    // its terminal state, and before relocation can overwrite old kernel RAM.
+    if !crate::arch::reboot::stop_other_cpus() {
+        // Panic may unwind and exit just this task. Once any peer has stopped,
+        // do not return to ordinary execution or reuse RAM with peers active.
+        crate::arch::process::stop_this_cpu();
+    }
+    crate::arch::kvm_para::shutdown_time();
+    crate::arch::driver::apic::CurrentApic.lapic_shutdown();
+    // The assembly replaces the stack and returns into the replacement
+    // kernel's entry point, never into this kernel's caller.
+    unsafe { relocate_kernel_func(arg1, arg2, arg3) }
 }

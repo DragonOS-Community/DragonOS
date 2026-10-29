@@ -51,11 +51,17 @@ impl Syscall for SysTimerCreateHandle {
             Some(reader.buffer_protected(0)?.read_one::<PosixSigevent>(0)?)
         };
 
-        let id = pcb.posix_timers_irqsave().create(&pcb, clockid, sev)?;
-
-        let mut writer = UserBufferWriter::new(timeridp, size_of::<i32>(), true)?;
-        // 用异常表保护版本写回
-        writer.buffer_protected(0)?.write_one::<i32>(0, &id)?;
+        let id = crate::process::posix_timer::ProcessPosixTimers::create(&pcb, clockid, sev)?;
+        let copyout = (|| {
+            let mut writer = UserBufferWriter::new(timeridp, size_of::<i32>(), true)?;
+            writer.buffer_protected(0)?.write_one::<i32>(0, &id)
+        })();
+        if let Err(error) = copyout {
+            let group = pcb.process_signal();
+            let timer = group.posix_timers().lock_irqsave().remove(id)?;
+            timer.delete();
+            return Err(error);
+        }
         Ok(0)
     }
 

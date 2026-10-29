@@ -1,12 +1,12 @@
 use crate::{
     arch::MMArch,
+    cgroup::memory::{object::ObjectAccount, MemoryAccount},
     filesystem::{page_cache::PageCache, vfs::IndexNode},
     libs::ranges::merge_ranges,
-    mm::{page::PageFlags, MemoryManagementArch},
+    mm::{allocation::MemoryAllocationError, page::PageFlags, MemoryManagementArch},
 };
 use alloc::{sync::Arc, vec::Vec};
 use num_traits::abs_sub;
-use system_error::SystemError;
 
 // TODO: 以后其他方面提高了io速度，可以减小到32
 pub const MAX_READAHEAD: usize = 128;
@@ -54,6 +54,8 @@ impl Default for FileReadaheadState {
 /// 预读控制器 - 用于单次预读请求
 /// 是栈上的对象，且只会出现在一个线程里面
 pub struct ReadaheadControl<'a> {
+    pub owner: &'a Arc<MemoryAccount>,
+    pub creator: &'a Arc<ObjectAccount>,
     /// 关联的 PageCache
     pub page_cache: &'a Arc<PageCache>,
     /// 关联的 Inode
@@ -65,26 +67,26 @@ pub struct ReadaheadControl<'a> {
 }
 
 impl<'a> ReadaheadControl<'a> {
-    fn get_init_ra_size(req_size: usize, max_pages: usize) -> usize {
+    pub(crate) fn get_init_ra_size(req_size: usize, max_pages: usize) -> usize {
         let newsize = match req_size.checked_next_power_of_two() {
             Some(newsize) => newsize,
             None => req_size,
         };
 
         if newsize < max_pages / 32 {
-            newsize * 4
+            newsize.saturating_mul(4)
         } else if newsize < max_pages / 4 {
-            newsize * 2
+            newsize.saturating_mul(2)
         } else {
             newsize
         }
     }
 
-    fn get_next_ra_size(cur_ra_size: usize, max_pages: usize) -> usize {
+    pub(crate) fn get_next_ra_size(cur_ra_size: usize, max_pages: usize) -> usize {
         if cur_ra_size < max_pages / 16 {
-            return 4 * cur_ra_size;
+            return cur_ra_size.saturating_mul(4);
         }
-        core::cmp::min(cur_ra_size * 2, max_pages)
+        core::cmp::min(cur_ra_size.saturating_mul(2), max_pages)
     }
 
     /// 执行实际的页缓存预读
@@ -94,7 +96,7 @@ impl<'a> ReadaheadControl<'a> {
         &self,
         number_to_read: usize,
         mut set_flag: bool,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         let page_cache = self.page_cache;
         let start_index = self.index;
 
@@ -129,7 +131,7 @@ impl<'a> ReadaheadControl<'a> {
             }
             let actual_page_count =
                 (end_offset - start_offset + MMArch::PAGE_SIZE - 1) >> MMArch::PAGE_SHIFT;
-            page_cache.read_pages(page_index, actual_page_count)?;
+            page_cache.try_read_pages(page_index, actual_page_count, self.owner, self.creator)?;
             total_read += actual_page_count;
         }
 
@@ -162,7 +164,7 @@ impl<'a> ReadaheadControl<'a> {
         &mut self,
         req_size: usize,
         is_async: bool,
-    ) -> Result<usize, SystemError> {
+    ) -> Result<usize, MemoryAllocationError> {
         let ra_state = &mut *self.ra_state;
         let start_index = self.index;
         let max_pages = core::cmp::max(ra_state.ra_pages, req_size);
@@ -242,8 +244,12 @@ pub fn page_cache_sync_readahead(
     ra_state: &mut FileReadaheadState,
     index: usize,
     req_size: usize,
-) -> Result<usize, SystemError> {
+    owner: &Arc<MemoryAccount>,
+    creator: &Arc<ObjectAccount>,
+) -> Result<usize, MemoryAllocationError> {
     let mut ractl = ReadaheadControl {
+        owner,
+        creator,
         page_cache,
         inode,
         ra_state,
@@ -260,8 +266,12 @@ pub fn page_cache_async_readahead(
     ra_state: &mut FileReadaheadState,
     index: usize,
     req_size: usize,
-) -> Result<usize, SystemError> {
+    owner: &Arc<MemoryAccount>,
+    creator: &Arc<ObjectAccount>,
+) -> Result<usize, MemoryAllocationError> {
     let mut ractl = ReadaheadControl {
+        owner,
+        creator,
         page_cache,
         inode,
         ra_state,
@@ -277,7 +287,9 @@ pub fn force_page_cache_readahead(
     ra_state: &mut FileReadaheadState,
     start_index: usize,
     page_num: usize,
-) -> Result<usize, SystemError> {
+    owner: &Arc<MemoryAccount>,
+    creator: &Arc<ObjectAccount>,
+) -> Result<usize, MemoryAllocationError> {
     const CHUNK_SIZE: usize = (2 * 1024 * 1024) >> MMArch::PAGE_SHIFT; // 2MB / 4KB = 512 页
 
     let file_size = inode.metadata()?.size;
@@ -286,6 +298,8 @@ pub fn force_page_cache_readahead(
     }
 
     let mut ractl = ReadaheadControl {
+        owner,
+        creator,
         page_cache,
         inode,
         ra_state,

@@ -52,7 +52,7 @@ pub enum AtType {
     /// Filename of program.
     ExecFn = 31,
     /// Minimal stack size for signal delivery.
-    MinSigStackSize,
+    MinSigStackSize = 51,
 }
 
 impl TryFrom<u32> for AtType {

@@ -1,37 +1,36 @@
-# RwLock读写锁
-:::{note}
-本文作者: sujintao
+# RwLock Read-Write Lock
+::: info Author
+sujintao
 
-Email: <sujintao@dragonos.org>
+Email: `<sujintao@dragonos.org>`
 :::
 
-## 1. 简介
-&emsp;&emsp;读写锁是一种在并发环境下保护多进程间共享数据的机制.  相比于普通的spinlock,读写锁将对
-共享数据的访问分为读和写两种类型: 只读取共享数据的访问使用读锁控制,修改共享数据的访问使用
-写锁控制. 读写锁设计允许同时存在多个"读者"(只读取共享数据的访问)和一个"写者"(修改共享数据
-的访问), 对于一些大部分情况都是读访问的共享数据来说,使用读写锁控制访问可以一定程度上提升性能.
 
-## 2. DragonOS中读写锁的实现
-### 2.1 读写锁的机理
-&emsp;&emsp;读写锁的目的是维护多线程系统中的共享变量的一致性. 数据会被包裹在一个RwLock的数据结构中, 一切的访问必须通过RwLock的数据结构进行访问和修改. 每个要访问共享数据的会获得一个守卫(guard), 只读进程获得READER(读者守卫),需要修改共享变量的进程获得WRITER(写者守卫),作为RwLock的"影子", 线程都根据guard来进行访问和修改操作.
+## 1. Introduction
+A read-write lock is a mechanism used in a concurrent environment to protect shared data among multiple processes. Compared to a regular spinlock, a read-write lock divides access to shared data into two types: read access and write access. Read access to shared data is controlled by a read lock, while write access to shared data is controlled by a write lock. The design of a read-write lock allows for multiple "readers" (read-only access) and a single "writer" (write access) to coexist simultaneously. For shared data that is mostly read-only, using a read-write lock to control access can improve performance to some extent.
 
-&emsp;&emsp;在实践中, 读写锁除了READER, WRITER, 还增加了UPGRADER; 这是一种介于READER和WRITER之间的守卫, 这个守卫的作用就是防止WRITER的饿死(Staration).当进程获得UPGRADER时,进程把它当成READER来使用;但是UPGRADER可以进行升级处理,升级后的UPGRADER相当于是一个WRITER守卫,可以对共享数据执行写操作.
+## 2. Implementation of Read-Write Lock in DragonOS
+### 2.1 Mechanism of Read-Write Lock
+The purpose of a read-write lock is to maintain the consistency of shared variables in a multi-threaded system. Data is wrapped in an RwLock data structure, and all access and modification must be done through this structure. Each process that accesses shared data will obtain a guard. A read-only process obtains a READER (reader guard), while a process that needs to modify a shared variable obtains a WRITER (writer guard). As a "shadow" of the RwLock, threads perform access and modification operations based on the guard.
 
-&emsp;&emsp;所有守卫都满足rust原生的RAII机理,当守卫所在的作用域结束时,守卫将自动释放.
+In practice, in addition to READER and WRITER, a read-write lock also introduces an UPGRADER. This is a guard that lies between READER and WRITER. The role of the UPGRADER is to prevent WRITER starvation. When a process obtains an UPGRADER, it treats it as a READER. However, the UPGRADER can be upgraded, and after upgrading, it becomes a WRITER guard, allowing write operations on shared data.
 
-### 2.2 读写锁守卫之间的关系
-&emsp;&emsp;同一时间点, 可以存在多个READER, 即可以同时有多个进程对共享数据进行访问;同一时间只能存在一个WRITER,而且当有一个进程获得WRITER时,不能存在READER和UPGRADER;进程获得UPGRADER的前提条件是,不能有UPGRADER或WRITER存在,但是当有一个进程获得UPGRADER时,进程无法成功申请READER.
+All guards satisfy the RAII mechanism native to Rust. When the scope of a guard ends, the guard will automatically release.
 
-### 2.3 设计的细节
+### 2.2 Relationship Between Read-Write Lock Guards
+At any given time, multiple READERS can exist, meaning that multiple processes can access shared data simultaneously. However, only one WRITER can exist at a time, and when a process obtains a WRITER, no READERS or UPGRADERS can exist. A process can obtain an UPGRADER only if there are no existing UPGRADERS or WRITERS. However, once a process obtains an UPGRADER, it cannot successfully apply for a READER.
 
-#### 2.3.1 RwLock数据结构
+### 2.3 Design Details
+
+#### 2.3.1 RwLock Data Structure
 ```rust
 pub struct RwLock<T> {
     lock: AtomicU32,//原子变量
     data: UnsafeCell<T>,
 }
 ```
-#### 2.3.2 READER守卫的数据结构
+
+#### 2.3.2 READER Guard Data Structure
 ```rust
 pub struct RwLockReadGuard<'a, T: 'a> {
     data: *const T,
@@ -39,7 +38,7 @@ pub struct RwLockReadGuard<'a, T: 'a> {
 }
 ```
 
-#### 2.3.3 UPGRADER守卫的数据结构
+#### 2.3.3 UPGRADER Guard Data Structure
 ```rust
 pub struct RwLockUpgradableGuard<'a, T: 'a> {
     data: *const T,
@@ -47,7 +46,7 @@ pub struct RwLockUpgradableGuard<'a, T: 'a> {
 }
 ```
 
-#### 2.3.4 WRITER守卫的数据结构
+#### 2.3.4 WRITER Guard Data Structure
 ```rust
 pub struct RwLockWriteGuard<'a, T: 'a> {
     data: *mut T,
@@ -55,8 +54,8 @@ pub struct RwLockWriteGuard<'a, T: 'a> {
 }
 ```
 
-#### 2.3.5 RwLock的lock的结构介绍
-lock是一个32位原子变量AtomicU32, 它的比特位分配如下:
+#### 2.3.5 Introduction to the lock Structure in RwLock
+The lock is a 32-bit atomic variable AtomicU32, and its bit allocation is as follows:
 ```
                                                        UPGRADER_BIT     WRITER_BIT
                                                          ^                   ^
@@ -72,11 +71,10 @@ OVERFLOW_BIT                                             +------+    +-------+
   31  30                                                    2   1    0
 ```
 
-&emsp;&emsp;(从右到左)第0位表征WRITER是否有效,若WRITER_BIT=1, 则存在一个进程获得了WRITER守卫; 若UPGRADER_BIT=1, 则存在一个进程获得了UPGRADER守卫,第2位到第30位用来二进制表示获得READER守卫的进程数; 第31位是溢出判断位, 若OVERFLOW_BIT=1, 则不再接受新的读者守卫的获得申请.
+(From right to left) The 0th bit represents whether WRITER is valid. If WRITER_BIT = 1, it indicates that a process has obtained a WRITER guard. If UPGRADER_BIT = 1, it indicates that a process has obtained an UPGRADER guard. Bits 2 to 30 are used to represent the number of processes that have obtained READER guards in binary form. The 31st bit is an overflow detection bit. If OVERFLOW_BIT = 1, new requests for obtaining READER guards will be rejected.
 
-
-## 3.  读写锁的主要API
-### 3.1 RwLock的主要API
+## 3. Main APIs of Read-Write Lock
+### 3.1 Main APIs of RwLock
 ```rust
 ///功能:  输入需要保护的数据类型data,返回一个新的RwLock类型.
 pub const fn new(data: T) -> Self
@@ -105,7 +103,7 @@ pub fn upgradeable_read(&self) -> RwLockUpgradableGuard<T>
 ///功能: 尝试获得UPGRADER守卫
 pub fn try_upgradeable_read(&self) -> Option<RwLockUpgradableGuard<T>>
 ```
-### 3.2 WRITER守卫RwLockWriteGuard的主要API
+### 3.2 Main APIs of the WRITER Guard RwLockWriteGuard
 ```rust
 ///功能: 将WRITER降级为READER
 pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T>
@@ -114,7 +112,7 @@ pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T>
 ///功能: 将WRITER降级为UPGRADER
 pub fn downgrade_to_upgradeable(self) -> RwLockUpgradableGuard<'rwlock, T>
 ```
-### 3.3 UPGRADER守卫RwLockUpgradableGuard的主要API
+### 3.3 Main APIs of the UPGRADER Guard RwLockUpgradableGuard
 ```rust
 ///功能: 将UPGRADER升级为WRITER
 pub fn upgrade(mut self) -> RwLockWriteGuard<'rwlock, T> 
@@ -124,7 +122,7 @@ pub fn upgrade(mut self) -> RwLockWriteGuard<'rwlock, T>
 pub fn downgrade(self) -> RwLockReadGuard<'rwlock, T>
 ```
 
-## 4. 用法实例
+## 4. Usage Examples
 ```rust
 static LOCK: RwLock<u32> = RwLock::new(100 as u32);
 

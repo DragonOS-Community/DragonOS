@@ -7,6 +7,7 @@ use system_error::SystemError;
 
 use crate::init::version_info::get_kernel_build_info;
 use crate::libs::spinlock::SpinLockGuard;
+use crate::process::cred::{ns_capable, CAPFlags};
 use crate::process::fork::CloneFlags;
 use crate::process::namespace::user_namespace::INIT_USER_NAMESPACE;
 use crate::process::namespace::{NamespaceOps, NamespaceType};
@@ -187,14 +188,21 @@ impl UtsNamespace {
         &self._user_ns
     }
 
+    pub fn hostname(&self) -> [u8; NewUtsName::MAXLEN] {
+        self.utsname.lock().node_name
+    }
+
+    pub fn domainname(&self) -> [u8; NewUtsName::MAXLEN] {
+        self.utsname.lock().domain_name
+    }
+
     pub fn set_hostname(&self, hostname: &[u8]) -> Result<(), SystemError> {
         // 验证长度
         if !NewUtsName::validate_len(hostname.len()) {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        // 检查权限（需要 CAP_SYS_ADMIN）
-        // TODO: 实现完整的 capability 检查
+        // 需要在该 UTS namespace 的 owning user namespace 中具有 CAP_SYS_ADMIN。
         if !self.check_uts_modify_permission() {
             return Err(SystemError::EPERM);
         }
@@ -209,8 +217,7 @@ impl UtsNamespace {
             return Err(SystemError::ENAMETOOLONG);
         }
 
-        // 检查权限（需要 CAP_SYS_ADMIN）
-        // TODO: 实现完整的 capability 检查
+        // 需要在该 UTS namespace 的 owning user namespace 中具有 CAP_SYS_ADMIN。
         if !self.check_uts_modify_permission() {
             return Err(SystemError::EPERM);
         }
@@ -221,10 +228,7 @@ impl UtsNamespace {
 
     /// 检查是否有权限修改 UTS 信息
     pub fn check_uts_modify_permission(&self) -> bool {
-        // 检查当前进程是否具有 CAP_SYS_ADMIN 权限
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
-        cred.has_cap_sys_admin()
+        ns_capable(self.user_ns(), CAPFlags::CAP_SYS_ADMIN)
     }
 }
 

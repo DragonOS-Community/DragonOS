@@ -288,6 +288,14 @@ pub enum SystemError {
     /// restart by calling sys restart syscall
     ERESTART_RESTARTBLOCK = 516,
 
+    /// Linux-internal "operation not supported" (`-ENOTSUPP`).
+    ///
+    /// This is deliberately distinct from the POSIX `EOPNOTSUPP`/`ENOTSUP`
+    /// (95): the kernel returns `-524` from paths such as
+    /// `array_map_direct_value_addr()`, and userspace observes that exact
+    /// value.
+    ENOTSUPP = 524,
+
     // === TODO: 这几个KVM的错误码不要放在这里 ===
 
     // VMX on 虚拟化开启指令出错

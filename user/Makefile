@@ -10,6 +10,12 @@ DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 # 统一使用由 tools/rootfs_manifest_resolve.sh 生成的 manifest
 DADK_MANIFEST_FILE ?= $(ROOT_PATH)/dadk-manifest.generated.toml
 SYSROOT_INSTALL_MARKER = $(ROOT_PATH)/bin/sysroot/.dadk_install_marker
+# Sysroot layout version. Layout 1 is the legacy layout where sysconfig was
+# copied into bin/sysroot via cp -r, leaking host metadata into the image.
+# Bumping this version triggers a one-time removal and DADK reinstall of
+# bin/sysroot (keeping bin/dadk_cache), so stale files left by the old
+# copy_sysconfig step are not imported into the image again as app files.
+SYSROOT_LAYOUT_VERSION = 2
 ROOTFS_MANIFEST ?= default
 
 ECHO:
@@ -44,7 +50,7 @@ endif
 dadk_run: install_dadk
 	@test -f "$(DADK_MANIFEST_FILE)" || (echo "Error: missing $(DADK_MANIFEST_FILE), run 'make prepare_rootfs_manifest' at repo root first." && exit 1)
 	mkdir -p $(DADK_CACHE_DIR)
-	@marker_expected="manifest=$(ROOTFS_MANIFEST)"; \
+	@marker_expected="manifest=$(ROOTFS_MANIFEST);layout=$(SYSROOT_LAYOUT_VERSION)"; \
 	if [ -f "$(ROOT_PATH)/config/rootfs.generated.toml" ]; then \
 		rootfs_hash="$$(sha256sum "$(ROOT_PATH)/config/rootfs.generated.toml" | awk '{print $$1}')"; \
 		marker_expected="$$marker_expected;rootfs=$$rootfs_hash"; \
@@ -69,7 +75,7 @@ dadk_run: install_dadk
 	fi
 	$(DADK) -f $(DADK_MANIFEST_FILE) user build -w $(ROOT_PATH)
 	$(DADK) -f $(DADK_MANIFEST_FILE) user install -w $(ROOT_PATH)
-	@marker_expected="manifest=$(ROOTFS_MANIFEST)"; \
+	@marker_expected="manifest=$(ROOTFS_MANIFEST);layout=$(SYSROOT_LAYOUT_VERSION)"; \
 	if [ -f "$(ROOT_PATH)/config/rootfs.generated.toml" ]; then \
 		rootfs_hash="$$(sha256sum "$(ROOT_PATH)/config/rootfs.generated.toml" | awk '{print $$1}')"; \
 		marker_expected="$$marker_expected;rootfs=$$rootfs_hash"; \
@@ -86,20 +92,25 @@ dadk_clean: install_dadk
 
 all:
 	mkdir -p $(ROOT_PATH)/bin/sysroot
-	
+
 	$(MAKE) dadk_run
-	$(MAKE) copy_sysconfig
+	$(MAKE) prepare_sysconfig_payload
 
 	@echo 用户态程序编译完成
 
-.PHONY: copy_sysconfig
-copy_sysconfig:
-	cp -r sysconfig/* $(ROOT_PATH)/bin/sysroot/
+# Build the deterministic sysconfig payload (bin/sysconfig.tar).
+# sysconfig no longer goes into bin/sysroot; tools/write_disk_image.sh
+# imports it last when writing the disk image. The output is insensitive
+# to the host UID/GID/umask.
+.PHONY: prepare_sysconfig_payload
+prepare_sysconfig_payload:
+	python3 $(ROOT_PATH)/tools/build_sysconfig_payload.py
 
 
 .PHONY: clean
 clean:
 	$(MAKE) dadk_clean
+	rm -f $(ROOT_PATH)/bin/sysconfig.tar
 	@list='$(user_sub_dirs)'; for subdir in $$list; do \
 		echo "Clean in dir: $$subdir";\
 		cd $$subdir && $(MAKE) clean;\

@@ -6,8 +6,12 @@ use log::warn;
 use system_error::SystemError;
 
 use crate::{
-    libs::{rwlock::RwLock, spinlock::SpinLock},
-    rcu::{rcu_read_lock_held, synchronize_rcu, RcuArcSlot},
+    libs::{mutex::Mutex, rwlock::RwLock, spinlock::SpinLock},
+    rcu::{
+        rcu_read_lock_held,
+        srcu::{SrcuArcSlot, SrcuDomain},
+        synchronize_rcu, RcuArcSlot,
+    },
 };
 
 bitflags! {
@@ -77,9 +81,19 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
             index += 1;
         }
 
+        self.0.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
         // 插入 notifier chain
         self.0.insert(index, block);
         return Ok(());
+    }
+
+    fn try_clone(&self) -> Result<Self, SystemError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.0.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        entries.extend(self.0.iter().cloned());
+        Ok(Self(entries))
     }
 
     /// @brief 在通知链中取消注册节点
@@ -120,6 +134,113 @@ impl<V: Clone + Copy, T> NotifierChain<V, T> {
             }
         }
         return (ret, nr_calls);
+    }
+}
+
+/// A sleepable notifier chain whose readers are protected by a private SRCU
+/// domain. Callbacks run without the update mutex and may block.
+pub struct SrcuNotifierChain<V, T>
+where
+    V: Clone + Copy + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    update_lock: Mutex<()>,
+    domain: SrcuDomain,
+    chain: SrcuArcSlot<NotifierChain<V, T>>,
+}
+
+impl<V, T> core::fmt::Debug for SrcuNotifierChain<V, T>
+where
+    V: Clone + Copy + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SrcuNotifierChain")
+            .field("domain", &self.domain)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<V, T> SrcuNotifierChain<V, T>
+where
+    V: Clone + Copy + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+{
+    pub fn try_new(name: &'static str) -> Result<Self, SystemError> {
+        Ok(Self {
+            update_lock: Mutex::new(()),
+            domain: SrcuDomain::try_new(name)?,
+            chain: SrcuArcSlot::new(
+                Arc::try_new(NotifierChain::new()).map_err(|_| SystemError::ENOMEM)?,
+            ),
+        })
+    }
+
+    fn update_and_synchronize(
+        &self,
+        change: impl FnOnce(&mut NotifierChain<V, T>) -> Result<(), SystemError>,
+    ) -> Result<(), SystemError> {
+        self.domain.validate_update_context()?;
+        let old = {
+            let _update = self.update_lock.lock();
+            let mut new_chain = self
+                .chain
+                .with_read(&self.domain, NotifierChain::try_clone)?;
+            change(&mut new_chain)?;
+            let new_chain = Arc::try_new(new_chain).map_err(|_| SystemError::ENOMEM)?;
+            // SAFETY: this mutex serializes writers; the following GP protects old readers.
+            unsafe { self.chain.swap(new_chain) }
+        };
+        self.domain.synchronize_after_publication();
+        drop(old);
+        Ok(())
+    }
+
+    pub fn register(&self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
+        let retained = block.clone();
+        let result = self.update_and_synchronize(|chain| chain.register(block, false));
+        drop(retained);
+        result
+    }
+
+    pub fn register_unique_prio(
+        &self,
+        block: Arc<dyn NotifierBlock<V, T>>,
+    ) -> Result<(), SystemError> {
+        let retained = block.clone();
+        let result = self.update_and_synchronize(|chain| chain.register(block, true));
+        drop(retained);
+        result
+    }
+
+    pub fn unregister(&self, block: Arc<dyn NotifierBlock<V, T>>) -> Result<(), SystemError> {
+        let retained = block.clone();
+        let result = self.update_and_synchronize(|chain| chain.unregister(block));
+        drop(retained);
+        result
+    }
+
+    pub fn call_chain(
+        &self,
+        action: V,
+        data: Option<&T>,
+        nr_to_call: Option<usize>,
+    ) -> (i32, usize) {
+        self.chain.with_read(&self.domain, |chain| {
+            chain.call_chain(action, data, nr_to_call)
+        })
+    }
+
+    /// Consumes an unused chain and unregisters its private SRCU domain.
+    pub fn try_cleanup(self) -> Result<(), (Self, SystemError)> {
+        if let Err(error) = self.domain.barrier() {
+            return Err((self, error));
+        }
+        // SAFETY: consuming the chain removes every public path to its private domain.
+        match unsafe { self.domain.try_cleanup_in_place() } {
+            Ok(()) => Ok(()),
+            Err(error) => Err((self, error)),
+        }
     }
 }
 

@@ -23,6 +23,7 @@ pub mod reboot;
 pub mod sched;
 pub mod smp;
 pub mod syscall;
+pub mod text_patch;
 pub mod time;
 pub mod vm;
 

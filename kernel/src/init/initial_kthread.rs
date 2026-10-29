@@ -13,10 +13,9 @@ use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::net::e1000e::e1000e::e1000e_init,
     filesystem::vfs::vcore::mount_root_fs,
-    net::net_core::net_init,
     process::{
-        exec::ProcInitInfo, execve::do_execve, kthread::KernelThreadMechanism, stdio::stdio_init,
-        ProcessFlags, ProcessManager,
+        exec_args::ExecArguments, execve::do_execve, kthread::KernelThreadMechanism,
+        stdio::stdio_init, ProcessFlags, ProcessManager,
     },
     rcu,
     smp::smp_init,
@@ -25,9 +24,9 @@ use crate::{
 use super::{cmdline::kenrel_cmdline_param_manager, initcall::do_initcalls};
 
 const INIT_PROC_TRYLIST: [(&str, Option<&str>); 5] = [
-    ("/bin/dragonreach", None),
     ("/bin/busybox", Some("init")),
     ("/bin/init", None),
+    ("/sbin/init", None),
     ("/bin/sh", None),
     ("/bin/riscv_rust_init", None), // 对vf2, 目前没做cmdline的适配, 加个默认寻找
 ];
@@ -70,13 +69,9 @@ pub fn initial_kernel_thread() -> i32 {
 fn kernel_init() -> Result<(), SystemError> {
     KernelThreadMechanism::init_stage2();
     rcu::start_worker();
+    crate::misc::reboot::reboot_notifier_init()?;
     kenrel_init_freeable()?;
     set_system_state(SystemState::FreeingInitMem);
-    #[cfg(target_arch = "x86_64")]
-    crate::driver::disk::ahci::ahci_init()
-        .inspect_err(|e| log::error!("ahci_init failed: {:?}", e))
-        .ok();
-
     if super::initramfs_enabled() {
         // 使用 initramfs, 迁移文件系统
         #[cfg(feature = "initram")]
@@ -91,9 +86,6 @@ fn kernel_init() -> Result<(), SystemError> {
     stdio_init().expect("Failed to initialize stdio");
 
     e1000e_init();
-    net_init().unwrap_or_else(|err| {
-        error!("Failed to initialize network: {:?}", err);
-    });
 
     #[cfg(feature = "fifo_demo")]
     crate::sched::fifo_demo::fifo_demo_init();
@@ -110,11 +102,27 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
     smp_init();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Err(error) = crate::text_patch::init_live() {
+            log::warn!("runtime text patching unavailable: {:?}", error);
+        } else if let Err(error) = crate::debug::jump_label::static_keys_live_selftest() {
+            panic!("static-key live selftest failed: {:?}", error);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = crate::text_patch::init_live();
     crate::exception::workqueue::workqueue_init();
+    crate::filesystem::page_cache::init_read_completion_queue();
+    crate::filesystem::page_cache::init_writeback_executor()?;
+    crate::security::keys::object::init();
+    crate::perf::release::init();
     return Ok(());
 }
 
 /// 切换到用户态
+///
+/// 将 init 内核线程切换到用户态。
 #[inline(never)]
 fn switch_to_user() -> ! {
     let current_pcb = ProcessManager::current_pcb();
@@ -123,20 +131,20 @@ fn switch_to_user() -> ! {
     current_pcb.flags().remove(ProcessFlags::KTHREAD);
     current_pcb.worker_private().take();
 
-    *current_pcb.sched_info().sched_policy.write_irqsave() = crate::sched::SchedPolicy::CFS;
     drop(current_pcb);
 
-    let mut proc_init_info = ProcInitInfo::new("");
+    let mut proc_init_info = InitCommand::new("");
     // 设置默认环境变量
-    proc_init_info.envs.push(CString::new("HOME=/").unwrap());
-    proc_init_info
-        .envs
-        .push(CString::new("TERM=linux").unwrap());
+    set_init_env(&mut proc_init_info.envs, CString::new("HOME=/").unwrap());
+    set_init_env(
+        &mut proc_init_info.envs,
+        CString::new("TERM=linux").unwrap(),
+    );
     proc_init_info.args = kenrel_cmdline_param_manager().init_proc_args();
     // 命令行管理器提供的环境变量会追加到默认环境变量之后
-    proc_init_info
-        .envs
-        .extend(kenrel_cmdline_param_manager().init_proc_envs());
+    for env in kenrel_cmdline_param_manager().init_proc_envs() {
+        set_init_env(&mut proc_init_info.envs, env);
+    }
 
     let mut trap_frame = TrapFrame::new();
 
@@ -183,9 +191,26 @@ fn switch_to_user() -> ! {
     unsafe { arch_switch_to_user(trap_frame) };
 }
 
+/// Mutable boot configuration is separate from frozen exec snapshots.
+struct InitCommand {
+    proc_name: CString,
+    args: alloc::vec::Vec<CString>,
+    envs: alloc::vec::Vec<CString>,
+}
+
+impl InitCommand {
+    fn new(name: &str) -> Self {
+        Self {
+            proc_name: CString::new(name).unwrap(),
+            args: alloc::vec::Vec::new(),
+            envs: alloc::vec::Vec::new(),
+        }
+    }
+}
+
 fn try_to_run_init_process(
     path: &str,
-    proc_init_info: &mut ProcInitInfo,
+    proc_init_info: &mut InitCommand,
     ext_args: &Option<&str>,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
@@ -217,20 +242,36 @@ fn try_to_run_init_process(
 
     Ok(())
 }
+
+fn set_init_env(envs: &mut alloc::vec::Vec<CString>, env: CString) {
+    let key_len = env
+        .as_bytes()
+        .iter()
+        .position(|&byte| byte == b'=')
+        .unwrap_or(env.as_bytes().len());
+    if let Some(slot) = envs
+        .iter_mut()
+        .find(|candidate| init_env_key_matches(candidate, &env.as_bytes()[..key_len]))
+    {
+        *slot = env;
+    } else {
+        envs.push(env);
+    }
+}
+
+fn init_env_key_matches(env: &CString, key: &[u8]) -> bool {
+    let bytes = env.as_bytes();
+    bytes.len() > key.len() && bytes.starts_with(key) && bytes[key.len()] == b'='
+}
+
 fn run_init_process(
-    proc_init_info: &ProcInitInfo,
+    proc_init_info: &InitCommand,
     trap_frame: &mut TrapFrame,
 ) -> Result<(), SystemError> {
     compiler_fence(Ordering::SeqCst);
     let path = proc_init_info.proc_name.to_str().unwrap();
 
-    do_execve(
-        path,
-        proc_init_info.args.clone(),
-        proc_init_info.envs.clone(),
-        trap_frame,
-    )?;
-    // 初始化阶段直接调用 do_execve（绕过 sys_execve），因此这里补齐 cmdline 存储
-    ProcessManager::current_pcb().set_cmdline_from_argv(&proc_init_info.args);
+    let arguments = ExecArguments::from_kernel(path, &proc_init_info.args, &proc_init_info.envs)?;
+    do_execve(path, arguments, trap_frame).map_err(crate::process::execve::ExecFailure::finish)?;
     Ok(())
 }

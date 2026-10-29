@@ -60,7 +60,7 @@ download:
 BLOCKLIST_FILES := $(shell find blocklists -type f 2>/dev/null)
 
 # 安装到目标目录
-install: build download whitelist.txt $(BLOCKLIST_FILES)
+install: build download whitelist.txt required_tests.txt $(BLOCKLIST_FILES)
 	@echo "安装gvisor测试套件到 $(INSTALL_DIR)"
 	@mkdir -p $(INSTALL_DIR)
 	# 安装Rust测试运行器二进制文件
@@ -68,6 +68,7 @@ install: build download whitelist.txt $(BLOCKLIST_FILES)
 	@chmod +x $(INSTALL_DIR)/gvisor-test-runner
 	# 安装测试配置文件
 	@cp -f whitelist.txt $(INSTALL_DIR)/
+	@cp -f required_tests.txt $(INSTALL_DIR)/
 	@cp -rf blocklists $(INSTALL_DIR)/
 	@cp -rf tests $(INSTALL_DIR)/
 	@cp -f run_tests.sh $(INSTALL_DIR)/

@@ -3,7 +3,6 @@ use crate::arch::syscall::nr::SYS_CLONE;
 use crate::mm::{access_ok, VirtAddr};
 use crate::process::fork::{CloneFlags, KernelCloneArgs};
 use crate::process::syscall::clone_utils::do_clone;
-use crate::process::Signal;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 use alloc::vec::Vec;
 use system_error::SystemError;
@@ -54,13 +53,16 @@ impl Syscall for SysClone {
         let mut clone_args = KernelCloneArgs::new();
         clone_args.flags = flags;
         clone_args.stack = stack;
+        // legacy clone() 复用 parent_tid 作为 CLONE_PIDFD 的输出地址；
+        // clone3() 则通过独立的 pidfd 字段传入。
+        clone_args.pidfd = parent_tid;
         clone_args.parent_tid = parent_tid;
         clone_args.child_tid = child_tid;
         clone_args.tls = tls;
 
         // 旧版 clone() 系统调用中，flags 的低 8 位用于指定 exit_signal
         let exit_signal_num = (args[0] & 0xFF) as i32;
-        clone_args.exit_signal = Signal::from(exit_signal_num);
+        clone_args.exit_signal = exit_signal_num;
 
         do_clone(clone_args, frame)
     }

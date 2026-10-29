@@ -4,6 +4,11 @@ use system_error::SystemError;
 use alloc::sync::Arc;
 use core::{ffi::c_long, sync::atomic::Ordering};
 
+use crate::{
+    arch::MMArch,
+    mm::{ucontext::AddressSpace, MemoryManagementArch},
+};
+
 use super::{ProcessControlBlock, ProcessManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -174,8 +179,15 @@ pub enum RLimitID {
     Sigpending = 11,
     /// Max bytes in POSIX mqueues
     Msgqueue = 12,
-    /// Max nice prio allowed to raise to
-    ///  0-39 for nice level 19 .. -20
+    /// Max nice prio allowed to raise to, in the encoding produced by
+    /// [`crate::sched::prio::PrioUtil::nice_to_rlimit`]: `1` for nice 19 up to
+    /// `40` for nice -20. The default `{0, 0}` therefore denies any nice
+    /// reduction to an unprivileged task, which matches Linux.
+    ///
+    /// Linux's `include/uapi/asm-generic/resource.h` documents this as `0-39`;
+    /// that comment is off by one relative to its own `nice_to_rlimit()`
+    /// helper, which yields `[1, 40]`. The helper is what the kernel compares
+    /// against, so `[1, 40]` is the range that matters here.
     Nice = 13,
     /// Max realtime priority
     Rtprio = 14,
@@ -193,6 +205,13 @@ impl TryFrom<usize> for RLimitID {
 }
 
 impl ProcessControlBlock {
+    /// Account one successfully completed page fault to this task.
+    #[inline]
+    pub(crate) fn account_page_fault(&self, major: bool) {
+        let counter = if major { &self.maj_flt } else { &self.min_flt };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn leader_for_rusage(&self) -> Arc<ProcessControlBlock> {
         if self.is_thread_group_leader() {
             return self
@@ -207,25 +226,62 @@ impl ProcessControlBlock {
             .unwrap_or_else(ProcessManager::current_pcb)
     }
 
-    fn task_rusage(&self) -> RUsage {
+    fn task_raw_rusage(&self) -> RUsage {
         let ct = self.cputime();
         RUsage {
             ru_utime: RUsageTimeval::from_ns(ct.utime.load(Ordering::Relaxed)),
             ru_stime: RUsageTimeval::from_ns(ct.stime.load(Ordering::Relaxed)),
+            ru_minflt: self.min_flt.load(Ordering::Relaxed) as usize,
+            ru_majflt: self.maj_flt.load(Ordering::Relaxed) as usize,
             ..RUsage::default()
         }
     }
 
+    fn task_rusage(&self) -> RUsage {
+        let (user, system) = self.adjusted_thread_cputime();
+        let mut usage = self.task_raw_rusage();
+        usage.ru_utime = RUsageTimeval::from_ns(user);
+        usage.ru_stime = RUsageTimeval::from_ns(system);
+        usage
+    }
+
+    /// Released-sibling history also feeds SIGCHLD's raw classified times.
+    /// Group getrusage overwrites these CPU fields with its adjusted total.
+    pub(super) fn exit_resource_snapshot(&self) -> RUsage {
+        let mut usage = self.task_raw_rusage();
+        usage.ru_maxrss = self.maxrss_kib();
+        usage
+    }
+
     fn thread_group_rusage(&self) -> RUsage {
+        let (user, system) = self.adjusted_process_cputime();
         let leader = self.leader_for_rusage();
         let ti = leader.threads_read_irqsave();
         let mut usage = *leader.exited_thread_group_rusage.lock();
-        usage.add_assign_saturating(&leader.task_rusage());
+        usage.add_assign_saturating(&leader.task_raw_rusage());
         for task in &ti.group_tasks {
             if let Some(task) = task.upgrade() {
-                usage.add_assign_saturating(&task.task_rusage());
+                usage.add_assign_saturating(&task.task_raw_rusage());
             }
         }
+        // Aggregate CPU time once at group scope; do not sum per-task
+        // adjusted/timeval-rounded values or charge exited members twice.
+        usage.ru_utime = RUsageTimeval::from_ns(user);
+        usage.ru_stime = RUsageTimeval::from_ns(system);
+        usage
+    }
+
+    /// CPU/resource usage reported with an exit notification.
+    ///
+    /// Match Linux's `task_cputime(tsk) + tsk->signal->{u,s}time`: include the
+    /// exiting task and already released siblings, but not siblings that are
+    /// still alive. `exit_notify()` runs before `__exit_signal()` accounts the
+    /// current task into `exited_thread_group_rusage`, so the current task is
+    /// not counted twice.
+    pub(crate) fn exit_notification_rusage(&self) -> RUsage {
+        let leader = self.leader_for_rusage();
+        let mut usage = *leader.exited_thread_group_rusage.lock();
+        usage.add_assign_saturating(&self.task_raw_rusage());
         usage
     }
 
@@ -242,23 +298,59 @@ impl ProcessControlBlock {
         leader.children_rusage.lock().add_assign_saturating(rusage);
     }
 
+    /// Preserve signal_struct-like group statistics across a non-leader exec
+    /// leader handoff. All other group members are quiesced before this runs.
+    pub(crate) fn inherit_thread_group_rusage_from(&self, old_leader: &ProcessControlBlock) {
+        self.historical_maxrss_pages.fetch_max(
+            old_leader.historical_maxrss_pages.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        let exited = *old_leader.exited_thread_group_rusage.lock();
+        self.exited_thread_group_rusage
+            .lock()
+            .add_assign_saturating(&exited);
+
+        let children = *old_leader.children_rusage.lock();
+        self.children_rusage.lock().add_assign_saturating(&children);
+    }
+
+    /// Preserve the old mm's peak before exec/exit drops its user reference.
+    pub(crate) fn preserve_maxrss(&self, mm: &AddressSpace) {
+        self.leader_for_rusage()
+            .historical_maxrss_pages
+            .fetch_max(mm.peak_resident_pages(), Ordering::Relaxed);
+    }
+
+    /// RSS is shared even for RUSAGE_THREAD; do not sum it across tasks.
+    fn maxrss_kib(&self) -> usize {
+        let leader = self.leader_for_rusage();
+        let history = leader.historical_maxrss_pages.load(Ordering::Relaxed);
+        let mm = self.basic().user_vm();
+        let pages = mm
+            .as_ref()
+            .map_or(history, |mm| history.max(mm.peak_resident_pages()));
+        pages.saturating_mul(MMArch::PAGE_SIZE / 1024)
+    }
+
     /// 获取进程资源使用情况
     pub fn get_rusage(&self, who: RUsageWho) -> Option<RUsage> {
-        match who {
-            RUsageWho::RUsageSelf => Some(self.thread_group_rusage()),
+        let mut usage = match who {
+            RUsageWho::RUsageSelf => self.thread_group_rusage(),
             RUsageWho::RUsageBoth => {
                 let mut rusage = self.thread_group_rusage();
                 let leader = self.leader_for_rusage();
                 let children = *leader.children_rusage.lock();
                 rusage.add_assign_saturating(&children);
-                Some(rusage)
+                rusage
             }
-            RUsageWho::RusageThread => Some(self.task_rusage()),
+            RUsageWho::RusageThread => self.task_rusage(),
             RUsageWho::RUsageChildren => {
                 let leader = self.leader_for_rusage();
                 let rusage = *leader.children_rusage.lock();
-                Some(rusage)
+                return Some(rusage);
             }
-        }
+        };
+        usage.ru_maxrss = usage.ru_maxrss.max(self.maxrss_kib());
+        Some(usage)
     }
 }

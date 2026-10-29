@@ -13,7 +13,7 @@ use crate::{
         },
         video::fbdev::base::{
             CopyAreaData, FbCursor, FbCursorSetMode, FbImage, FbVisual, FillRectData, FillRectROP,
-            FrameBuffer, ScrollMode, FRAME_BUFFER_SET,
+            FrameBuffer, ScrollMode,
         },
     },
     libs::{
@@ -26,7 +26,7 @@ use super::{FbConAttr, FrameBufferConsole, FrameBufferConsoleData};
 
 #[derive(Debug)]
 pub struct BlittingFbConsole {
-    fb: SpinLock<Option<Arc<dyn FrameBuffer>>>,
+    fb: Arc<dyn FrameBuffer>,
     fbcon_data: SpinLock<FrameBufferConsoleData>,
 }
 
@@ -34,15 +34,15 @@ unsafe impl Send for BlittingFbConsole {}
 unsafe impl Sync for BlittingFbConsole {}
 
 impl BlittingFbConsole {
-    pub fn new() -> Result<Self, SystemError> {
-        Ok(Self {
-            fb: SpinLock::new(None),
+    pub fn new(fb: Arc<dyn FrameBuffer>) -> Self {
+        Self {
+            fb,
             fbcon_data: SpinLock::new(FrameBufferConsoleData::default()),
-        })
+        }
     }
 
     fn fb(&self) -> Arc<dyn FrameBuffer> {
-        self.fb.lock().clone().unwrap()
+        self.fb.clone()
     }
 
     fn get_color(&self, vc_data: &VirtualConsoleData, c: u16, is_fg: bool) -> u32 {
@@ -178,22 +178,7 @@ impl ConsoleSwitch for BlittingFbConsole {
         vc_data: &mut VirtualConsoleData,
         init: bool,
     ) -> Result<(), system_error::SystemError> {
-        let fb_set_guard = FRAME_BUFFER_SET.read();
-        let fb = fb_set_guard.get(vc_data.index);
-        if fb.is_none() {
-            return Err(SystemError::EINVAL);
-        }
-        let fb = fb.unwrap();
-        if fb.is_none() {
-            log::warn!(
-                "The Framebuffer with FbID {} has not been initialized yet.",
-                vc_data.index
-            );
-
-            return Err(SystemError::ENODEV);
-        }
-
-        let fb = fb.as_ref().unwrap().clone();
+        let fb = self.fb();
 
         if init {
             // 初始化字体
@@ -232,9 +217,6 @@ impl ConsoleSwitch for BlittingFbConsole {
         } else {
             unimplemented!("Resize is not supported at the moment!");
         }
-
-        // 初始化fb
-        *self.fb.lock() = Some(fb);
 
         Ok(())
     }

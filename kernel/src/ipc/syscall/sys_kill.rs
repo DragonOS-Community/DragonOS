@@ -31,7 +31,7 @@ pub enum PidConverter {
 }
 
 impl PidConverter {
-    /// ### 为 `wait` 和 `kill` 调用使用
+    /// ### For `kill` syscall use
     pub fn from_id(id: i32) -> Option<Self> {
         if id < -1 {
             let pgid = ProcessManager::find_vpid(RawPid::from(-id as usize));
@@ -44,33 +44,6 @@ impl PidConverter {
         } else {
             let pid = ProcessManager::find_vpid(RawPid::from(id as usize))?;
             Some(PidConverter::Pid(pid))
-        }
-    }
-
-    /// ### 为 `waitid` 使用：which/upid 已在封装层基本校验
-    /// 约定：which: 0=P_ALL, 1=P_PID(id>0), 2=P_PGID(id>=0; 0=当前组)
-    pub fn from_waitid(which: u32, upid: i32) -> Option<Self> {
-        match which {
-            0 => Some(PidConverter::All),
-            1 => {
-                if upid <= 0 {
-                    return None;
-                }
-                Self::from_id(upid)
-            }
-            2 => {
-                if upid < 0 {
-                    return None;
-                }
-                // P_PGID: upid==0 -> 当前进程组；>0 -> 指定pgid
-                // from_id: id< -1 为 pgid，因此这里将正 pgid 映射为负数传入
-                if upid == 0 {
-                    Self::from_id(0)
-                } else {
-                    Self::from_id(-upid)
-                }
-            }
-            _ => None,
         }
     }
 }
@@ -101,13 +74,12 @@ pub fn check_signal_permission_pcb_with_sig(
     let current_cred = current_pcb.cred();
     let target_cred = target.cred();
 
-    // CAP_KILL allows sending signal to any process
-    if current_cred.has_capability(CAPFlags::CAP_KILL) {
+    if Arc::ptr_eq(&current_pcb.process_signal(), &target.process_signal()) {
         return Ok(());
     }
-
-    // Root can signal any process
-    if current_cred.euid.data() == 0 {
+    // A capability must apply to the target's owner namespace. UID 0 and
+    // capabilities in a private child namespace are not global bypasses.
+    if current_cred.has_capability_in_ns(&target_cred.user_ns, CAPFlags::CAP_KILL) {
         return Ok(());
     }
 

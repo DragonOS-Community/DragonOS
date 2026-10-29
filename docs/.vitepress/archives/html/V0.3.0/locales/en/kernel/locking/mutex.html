@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mutex (Mutual Exclusion) &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="RwLock Read-Write Lock" href="rwlock.html" />
+    <link rel="prev" title="Spinlock" href="spinlock.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/container/index.html">容器化</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/libs/index.html">其他内核库</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/net/index.html">网络子系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/trace/index.html">内核跟踪机制</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/syscall/index.html">系统调用</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Q&amp;A</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../questions/index.html">常见问题解答</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Translations</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">English</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/index.html">Introduction to DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/build_system.html">Building DragonOS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS Mirror Site</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../configuration/index.html">Kernel Compilation Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../boot/index.html">Bootloader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../core_api/index.html">Core API Documentation</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="index.html">Locks</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="locks.html">Types of Locks and Their Rules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="spinlock.html">Spinlock</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">Mutex (Mutual Exclusion)</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#features">1. Features</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#definition">2. Definition</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#usage">3. Usage</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#api">4. API</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#c-version-of-mutex-will-be-deprecated-in-the-future">5. C Version of Mutex (Will be deprecated in the future)</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="rwlock.html">RwLock Read-Write Lock</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../process_management/index.html">Process Management Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../sched/index.html">DragonOS Scheduling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ipc/index.html">Interprocess Communication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../memory_management/index.html">Memory Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../filesystem/index.html">File System</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../debug/index.html">Kernel Debug Module</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ktest/index.html">Kernel Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cpu_arch/index.html">Processor Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../container/index.html">Containerization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../libs/index.html">Other Kernel Libraries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../net/index.html">Network Subsystem</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../trace/index.html">Kernel Tracing Mechanism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../syscall/index.html">System Calls</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../userland/appdev/index.html">Application Development Documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../questions/index.html">Frequently Asked Questions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/code_contribution/index.html">Contributing to Development</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/contact/index.html">Get in Touch with the Community</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../community/ChangeLog/index.html">Release Notes</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">English</a></li>
+          <li class="breadcrumb-item"><a href="index.html">Locks</a></li>
+      <li class="breadcrumb-item active">Mutex (Mutual Exclusion)</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/1c53c97/docs/locales/en/kernel/locking/mutex.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <div class="admonition note">
+<p class="admonition-title">备注</p>
+<p><strong>AI Translation Notice</strong></p>
+<p>This document was automatically translated by <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code> model, for reference only.</p>
+<ul class="simple">
+<li><p>Source document: kernel/locking/mutex.md</p></li>
+<li><p>Translation time: 2025-05-19 01:41:16</p></li>
+<li><p>Translation model: <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></li>
+</ul>
+<p>Please report issues via <a class="reference external" href="https://github.com/DragonOS-Community/DragonOS/issues">Community Channel</a></p>
+</div>
+<div class="admonition note" id="translated-label-mutex-doc-en">
+<p class="admonition-title">备注</p>
+<p>Author: Longjin <a class="reference external" href="mailto:longjin&#37;&#52;&#48;RinGoTek&#46;cn">longjin<span>&#64;</span>RinGoTek<span>&#46;</span>cn</a></p>
+</div>
+<section class="tex2jax_ignore mathjax_ignore" id="mutex-mutual-exclusion">
+<h1>Mutex (Mutual Exclusion)<a class="headerlink" href="#mutex-mutual-exclusion" title="Permalink to this heading"></a></h1>
+<p>  A mutex is a lightweight synchronization primitive, with only two states: locked and idle.</p>
+<p>  When a mutex is occupied, any process attempting to lock it will be put to sleep until the resource becomes available.</p>
+<section id="features">
+<h2>1. Features<a class="headerlink" href="#features" title="Permalink to this heading"></a></h2>
+<ul class="simple">
+<li><p>Only one task can hold the mutex at a time.</p></li>
+<li><p>Recursive locking and unlocking are not allowed.</p></li>
+<li><p>Mutex can only be operated through its API.</p></li>
+<li><p>Mutex cannot be used in hard interrupts or soft interrupts.</p></li>
+</ul>
+</section>
+<section id="definition">
+<h2>2. Definition<a class="headerlink" href="#definition" title="Permalink to this heading"></a></h2>
+<p>  The mutex is defined in <code class="docutils literal notranslate"><span class="pre">lib/mutex.rs</span></code>, as shown below:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// @brief Mutex互斥量结构体</span>
+<span class="sd">/// 请注意！由于Mutex属于休眠锁，因此，如果您的代码可能在中断上下文内执行，请勿采用Mutex！</span>
+<span class="cp">#[derive(Debug)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">Mutex</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 该Mutex保护的数据</span>
+<span class="w">    </span><span class="n">data</span>: <span class="nc">UnsafeCell</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// Mutex内部的信息</span>
+<span class="w">    </span><span class="n">inner</span>: <span class="nc">SpinLock</span><span class="o">&lt;</span><span class="n">MutexInner</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="cp">#[derive(Debug)]</span>
+<span class="k">struct</span> <span class="nc">MutexInner</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 当前Mutex是否已经被上锁(上锁时，为true)</span>
+<span class="w">    </span><span class="n">is_locked</span>: <span class="kt">bool</span><span class="p">,</span>
+<span class="w">    </span><span class="sd">/// 等待获得这个锁的进程的链表</span>
+<span class="w">    </span><span class="n">wait_list</span>: <span class="nc">LinkedList</span><span class="o">&lt;&amp;&#39;</span><span class="nb">static</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">process_control_block</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="usage">
+<h2>3. Usage<a class="headerlink" href="#usage" title="Permalink to this heading"></a></h2>
+<p>  Similar to SpinLock, the Rust version of Mutex has a guard. When using it, you need to transfer the ownership of the data to be protected to the Mutex. Moreover, the guard can only be generated after a successful lock, so at any moment, each Mutex can have at most one guard.</p>
+<p>  When you need to read or modify the data protected by the Mutex, you should first use the <code class="docutils literal notranslate"><span class="pre">lock()</span></code> method of the Mutex. This method returns a <code class="docutils literal notranslate"><span class="pre">MutexGuard</span></code>. You can use the member functions of the protected data to perform some operations, or directly read or write the protected data. (This is equivalent to obtaining a mutable reference to the protected data.)</p>
+<p>  A complete example is shown in the code below:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span>:<span class="nc">Mutex</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="n">Mutex</span>::<span class="n">new</span><span class="p">(</span><span class="nb">Vec</span>::<span class="n">new</span><span class="p">());</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">g</span><span class="w"> </span>:<span class="nc">MutexGuard</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="n">x</span><span class="p">.</span><span class="n">lock</span><span class="p">();</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">        </span><span class="n">g</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert!</span><span class="p">(</span><span class="n">g</span><span class="p">.</span><span class="n">as_slice</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">[</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">g</span><span class="p">.</span><span class="n">as_slice</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">[</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">]);</span>
+<span class="w">        </span><span class="c1">// 在此处，Mutex是加锁的状态</span>
+<span class="w">        </span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;x={:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// 由于上方的变量`g`，也就是Mutex守卫的生命周期结束，自动释放了Mutex。因此，在此处，Mutex是放锁的状态</span>
+<span class="w">    </span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">&quot;x={:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>  For variables inside a structure, we can use Mutex to perform fine-grained locking, that is, wrap the member variables that need to be locked in detail with Mutex, for example:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">a</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="n">data</span>: <span class="nc">Mutex</span><span class="o">&lt;</span><span class="n">data_struct</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  Of course, we can also lock the entire structure:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span> <span class="nc">MyStruct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="n">data</span>: <span class="nc">data_struct</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="sd">/// 被全局加锁的结构体</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span> <span class="nc">LockedMyStruct</span><span class="p">(</span><span class="n">Mutex</span><span class="o">&lt;</span><span class="n">MyStruct</span><span class="o">&gt;</span><span class="p">);</span>
+</pre></div>
+</div>
+</section>
+<section id="api">
+<h2>4. API<a class="headerlink" href="#api" title="Permalink to this heading"></a></h2>
+<section id="new-initialize-mutex">
+<h3>4.1. new - Initialize Mutex<a class="headerlink" href="#new-initialize-mutex" title="Permalink to this heading"></a></h3>
+<section id="prototype">
+<h4>Prototype<a class="headerlink" href="#prototype" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">(</span><span class="n">value</span>: <span class="nc">T</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">Self</span>
+</pre></div>
+</div>
+</section>
+<section id="description">
+<h4>Description<a class="headerlink" href="#description" title="Permalink to this heading"></a></h4>
+<p>  The <code class="docutils literal notranslate"><span class="pre">new()</span></code> method is used to initialize a Mutex. This method requires a protected data as a parameter. It returns a Mutex.</p>
+</section>
+</section>
+<section id="lock-lock">
+<h3>4.2. lock - Lock<a class="headerlink" href="#lock-lock" title="Permalink to this heading"></a></h3>
+<section id="id1">
+<h4>Prototype<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">lock</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">MutexGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+</section>
+<section id="id2">
+<h4>Description<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h4>
+<p>  Lock the Mutex, returns the guard of the Mutex. You can use this guard to operate the protected data.</p>
+<p>  If the Mutex is already locked, this method will block the current process until the Mutex is released.</p>
+</section>
+</section>
+<section id="try-lock-try-to-lock">
+<h3>4.3. try_lock - Try to Lock<a class="headerlink" href="#try-lock-try-to-lock" title="Permalink to this heading"></a></h3>
+<section id="id3">
+<h4>Prototype<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">try_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="n">MutexGuard</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+</section>
+<section id="id4">
+<h4>Description<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h4>
+<p>  Try to lock the Mutex. If the lock fails, the current process will not be added to the waiting queue. If the lock is successful, it returns the guard of the Mutex; if the Mutex is already locked, it returns <code class="docutils literal notranslate"><span class="pre">Err(错误码)</span></code>.</p>
+</section>
+</section>
+</section>
+<section id="c-version-of-mutex-will-be-deprecated-in-the-future">
+<h2>5. C Version of Mutex (Will be deprecated in the future)<a class="headerlink" href="#c-version-of-mutex-will-be-deprecated-in-the-future" title="Permalink to this heading"></a></h2>
+<p>  The mutex is defined in <code class="docutils literal notranslate"><span class="pre">common/mutex.h</span></code>. Its data type is as follows:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">typedef</span><span class="w"> </span><span class="k">struct</span>
+<span class="p">{</span>
+
+<span class="w">    </span><span class="n">atomic_t</span><span class="w"> </span><span class="n">count</span><span class="p">;</span><span class="w"> </span><span class="c1">// 锁计数。1-&gt;已解锁。 0-&gt;已上锁,且有可能存在等待者</span>
+<span class="w">    </span><span class="n">spinlock_t</span><span class="w"> </span><span class="n">wait_lock</span><span class="p">;</span><span class="w">   </span><span class="c1">// mutex操作锁，用于对mutex的list的操作进行加锁</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">List</span><span class="w"> </span><span class="n">wait_list</span><span class="p">;</span><span class="w">  </span><span class="c1">// Mutex的等待队列</span>
+<span class="p">}</span><span class="w"> </span><span class="n">mutex_t</span><span class="p">;</span>
+</pre></div>
+</div>
+<section id="id5">
+<h3>5.1. API<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h3>
+<section id="mutex-init">
+<h4>mutex_init<a class="headerlink" href="#mutex-init" title="Permalink to this heading"></a></h4>
+<p><strong><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mutex_init(mutex_t</span> <span class="pre">*lock)</span></code></strong></p>
+<p>  Initialize a mutex object.</p>
+</section>
+<section id="mutex-lock">
+<h4>mutex_lock<a class="headerlink" href="#mutex-lock" title="Permalink to this heading"></a></h4>
+<p><strong><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mutex_lock(mutex_t</span> <span class="pre">*lock)</span></code></strong></p>
+<p>  Lock a mutex object. If the mutex is currently held by another process, the current process will enter a sleep state.</p>
+</section>
+<section id="mutex-unlock">
+<h4>mutex_unlock<a class="headerlink" href="#mutex-unlock" title="Permalink to this heading"></a></h4>
+<p><strong><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mutex_unlock(mutex_t</span> <span class="pre">*lock)</span></code></strong></p>
+<p>  Unlock a mutex object. If there are other processes in the mutex’s waiting queue, the next process will be awakened.</p>
+</section>
+<section id="mutex-trylock">
+<h4>mutex_trylock<a class="headerlink" href="#mutex-trylock" title="Permalink to this heading"></a></h4>
+<p><strong><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mutex_trylock(mutex_t</span> <span class="pre">*lock)</span></code></strong></p>
+<p>  Try to lock a mutex object. If the mutex is currently held by another process, it returns 0. Otherwise, the lock is successful and returns 1.</p>
+</section>
+<section id="mutex-is-locked">
+<h4>mutex_is_locked<a class="headerlink" href="#mutex-is-locked" title="Permalink to this heading"></a></h4>
+<p><strong><code class="docutils literal notranslate"><span class="pre">void</span> <span class="pre">mutex_is_locked(mutex_t</span> <span class="pre">*lock)</span></code></strong></p>
+<p>  Determine if the mutex is already locked. If the given mutex is in a locked state, it returns 1; otherwise, it returns 0.</p>
+</section>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="spinlock.html" class="btn btn-neutral float-left" title="Spinlock" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="rwlock.html" class="btn btn-neutral float-right" title="RwLock Read-Write Lock" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>1c53c97</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.3.0
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/index.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/index.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/locales/en/kernel/locking/mutex.html">V0.2.0</a></dd>
+      <dd><a href="mutex.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/locales/en/kernel/locking/mutex.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/locales/en/kernel/locking/mutex.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

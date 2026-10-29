@@ -8,7 +8,181 @@ use system_error::SystemError;
 use crate::process::cred::{Cred, Kgid};
 use crate::process::ProcessControlBlock;
 
-use super::{fcntl::AtFlags, FileType, IndexNode, InodeMode};
+use super::{
+    fcntl::AtFlags,
+    inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+    mount::{MountExternalGuard, MountFSInode},
+    FileType, IndexNode, InodeMode,
+};
+use crate::libs::casting::DowncastArc;
+
+bitflags! {
+    /// Path-walk restrictions shared by openat2 and the VFS resolver.
+    pub struct OpenHowResolve: u64 {
+        const RESOLVE_NO_XDEV = 0x01;
+        const RESOLVE_NO_MAGICLINKS = 0x02;
+        const RESOLVE_NO_SYMLINKS = 0x04;
+        const RESOLVE_BENEATH = 0x08;
+        const RESOLVE_IN_ROOT = 0x10;
+        const RESOLVE_CACHED = 0x20;
+    }
+}
+
+/// A resolved inode plus the mount and operation ownership required while a
+/// syscall performs permission, truncate, and open work on it.
+#[derive(Debug)]
+pub struct ResolvedPath {
+    inode: Arc<dyn IndexNode>,
+    // Publish final inode eviction before the mount pin can trigger shutdown.
+    _operation_guard: InodeRetentionGuard,
+    mount_guard: Option<MountExternalGuard>,
+}
+
+/// Result of a pathname walk that may stop at a missing final component.
+///
+/// `MissingFinal` retains the resolved parent, including its mount ownership,
+/// so create-style operations act on the final pathname after symlink
+/// expansion instead of reparsing the original userspace string.
+#[derive(Debug)]
+pub enum OwnedLookupOutcome {
+    Found(ResolvedPath),
+    MissingFinal {
+        parent: ResolvedPath,
+        name: String,
+        must_be_dir: bool,
+    },
+}
+
+/// Optional pathname-walk constraints. Ordinary VFS lookups retain their
+/// existing fast path when no constraints are requested.
+#[derive(Debug)]
+pub struct PathWalkOptions {
+    pub resolve: OpenHowResolve,
+    pub scope_root: Option<ResolvedPath>,
+    /// Suppress a new automount at the final component, not existing mounts
+    /// or traversal needed for an intermediate component/trailing slash.
+    pub(crate) no_automount: bool,
+    epoch: usize,
+}
+
+impl PathWalkOptions {
+    pub fn new(resolve: OpenHowResolve, scope_root: Option<ResolvedPath>) -> Self {
+        let epoch = if scope_root.is_some() {
+            super::mount::topology_epoch_snapshot()
+        } else {
+            0
+        };
+        Self {
+            resolve,
+            scope_root,
+            no_automount: false,
+            epoch,
+        }
+    }
+
+    pub fn validate_inode(&self, inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        if let Some(root) = &self.scope_root {
+            let root = root
+                .inode()
+                .downcast_arc::<MountFSInode>()
+                .ok_or(SystemError::ESTALE)?;
+            let inode = inode
+                .clone()
+                .downcast_arc::<MountFSInode>()
+                .ok_or(SystemError::ESTALE)?;
+            if !super::mount::validate_scoped_path(&root, &inode, self.epoch)? {
+                return Err(SystemError::EXDEV);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_path(&self, path: &ResolvedPath) -> Result<(), SystemError> {
+        self.validate_inode(&path.inode())
+    }
+
+    pub fn is_scope_root(&self, inode: &Arc<dyn IndexNode>) -> bool {
+        let Some(root) = &self.scope_root else {
+            return false;
+        };
+        match (
+            root.inode().downcast_arc::<MountFSInode>(),
+            inode.clone().downcast_arc::<MountFSInode>(),
+        ) {
+            (Some(root), Some(inode)) => inode.same_path_ref(&root),
+            _ => false,
+        }
+    }
+}
+
+impl ResolvedPath {
+    pub fn new(inode: Arc<dyn IndexNode>) -> Result<Self, SystemError> {
+        let mount_guard = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .map(|inode| inode.mount_fs().try_pin_external())
+            .transpose()?;
+        let operation_guard =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Operation)?;
+        Ok(Self {
+            inode,
+            mount_guard,
+            _operation_guard: operation_guard,
+        })
+    }
+
+    pub(crate) fn from_existing_mount(
+        inode: Arc<dyn IndexNode>,
+        mount_guard: Option<MountExternalGuard>,
+    ) -> Result<Self, SystemError> {
+        let operation_guard =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::Operation)?;
+        Ok(Self {
+            inode,
+            mount_guard,
+            _operation_guard: operation_guard,
+        })
+    }
+
+    pub fn inode(&self) -> Arc<dyn IndexNode> {
+        self.inode.clone()
+    }
+
+    pub fn derive(&self) -> Result<Self, SystemError> {
+        let mount_guard = self
+            .mount_guard
+            .as_ref()
+            .map(MountExternalGuard::derive)
+            .transpose()?;
+        Self::from_existing_mount(self.inode.clone(), mount_guard)
+    }
+
+    /// Infallibly derive another operation owner from this live resolved path.
+    /// This does not perform initial mount-pin admission and therefore never
+    /// acquires the global mount topology lock.
+    pub(crate) fn derive_existing_owner(&self) -> Self {
+        Self {
+            inode: self.inode.clone(),
+            mount_guard: self
+                .mount_guard
+                .as_ref()
+                .map(MountExternalGuard::derive_existing),
+            _operation_guard: self
+                ._operation_guard
+                .derive_existing(InodeRetentionKind::Operation),
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<dyn IndexNode>,
+        Option<MountExternalGuard>,
+        InodeRetentionGuard,
+    ) {
+        (self.inode.clone(), self.mount_guard, self._operation_guard)
+    }
+}
 
 /// @brief 切分路径字符串，返回最左侧那一级的目录名和剩余的部分。
 ///
@@ -79,6 +253,31 @@ pub fn user_path_at(
     }
 
     Ok((pcb.pwd_inode(), ret_path))
+}
+
+/// Resolve the starting point while retaining its mount for the complete path walk.
+pub fn user_resolved_path_at(
+    pcb: &Arc<ProcessControlBlock>,
+    dirfd: i32,
+    path: &str,
+) -> Result<(ResolvedPath, String), SystemError> {
+    let ret_path = String::from(path);
+    if path.is_empty() {
+        return Ok((pcb.fs_struct().pwd_resolved()?, ret_path));
+    }
+    if path.as_bytes()[0] == b'/' {
+        return Ok((pcb.fs_struct().root_resolved()?, ret_path));
+    }
+    if dirfd != AtFlags::AT_FDCWD.bits() {
+        let binding = pcb.fd_table();
+        let fd_table = binding.read();
+        let file = fd_table.get_file_by_fd(dirfd).ok_or(SystemError::EBADF)?;
+        if file.file_type() != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        return Ok((file.resolved_path()?, ret_path));
+    }
+    Ok((pcb.fs_struct().pwd_resolved()?, ret_path))
 }
 
 pub fn is_ancestor(ancestor: &Arc<dyn IndexNode>, node: &Arc<dyn IndexNode>) -> bool {
@@ -198,14 +397,10 @@ impl AsRef<str> for DName {
 /// 如果调用者在指定组内，返回 `true`；否则返回 `false`
 pub fn is_caller_in_group(cred: &Arc<Cred>, gid: usize) -> bool {
     let kgid = Kgid::from(gid);
-    let mut in_group = cred.fsgid.data() == gid
+    let in_group = cred.fsgid.data() == gid
         || cred.gid.data() == gid
         || cred.egid.data() == gid
         || cred.getgroups().contains(&kgid);
-
-    if let Some(info) = cred.group_info.as_ref() {
-        in_group |= info.gids.contains(&kgid);
-    }
 
     in_group
 }
@@ -248,7 +443,6 @@ pub fn should_remove_sgid(mode: InodeMode, gid: usize, cred: &Arc<Cred>) -> bool
 /// - `old_gid`: chown 前的原组 ID
 /// - `current_gid`: 当前调用者的 gid
 /// - `cred`: 调用者的凭证
-/// - `group_info`: 调用者的组信息
 ///
 /// # 返回值
 ///
@@ -261,12 +455,9 @@ pub fn should_remove_sgid(mode: InodeMode, gid: usize, cred: &Arc<Cred>) -> bool
 pub fn should_remove_sgid_on_chown(
     mode: InodeMode,
     old_gid: usize,
-    current_gid: usize,
     cred: &Arc<Cred>,
-    group_info: &crate::process::cred::GroupInfo,
+    has_cap_fsetid: bool,
 ) -> bool {
-    use crate::process::cred::CAPFlags;
-
     if !mode.contains(InodeMode::S_ISGID) {
         return false;
     }
@@ -278,12 +469,8 @@ pub fn should_remove_sgid_on_chown(
 
     // 注意：Linux 这里检查的是"原 inode gid"，在 notify_change 前尚未更新。
     let kgid = Kgid::from(old_gid);
-    let in_group = cred.fsgid.data() == old_gid
-        || cred.egid.data() == old_gid
-        || current_gid == old_gid
-        || cred.getgroups().contains(&kgid)
-        || group_info.gids.contains(&kgid)
-        || cred.has_capability(CAPFlags::CAP_FSETID);
+    let in_group =
+        cred.fsgid.data() == old_gid || cred.getgroups().contains(&kgid) || has_cap_fsetid;
 
     // 仅当调用者不在原文件所属组且无 CAP_FSETID 时清除
     !in_group

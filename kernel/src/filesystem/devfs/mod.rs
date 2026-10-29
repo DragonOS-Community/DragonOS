@@ -8,12 +8,13 @@ use super::{
     devpts::{DevPtsFs, LockedDevPtsFSInode},
     vfs::{
         file::FileFlags, utils::DName, vcore::generate_inode_id, FilePrivateData, FileSystem,
-        FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata, SuperBlock,
+        FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic, Metadata,
+        MountableFileSystem, SuperBlock, FSMAKER,
     },
 };
 
 use crate::{
-    driver::base::{block::gendisk::GenDisk, device::device_number::DeviceNumber},
+    driver::base::device::device_number::DeviceNumber,
     filesystem::{
         devfs::zero_dev::LockedZeroInode,
         vfs::{mount::MountFlags, produce_fs},
@@ -28,6 +29,7 @@ use crate::{
         VmFaultReason,
     },
     process::ProcessManager,
+    register_mountable_fs,
     time::PosixTimeSpec,
 };
 use alloc::{
@@ -36,17 +38,91 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use linkme::distributed_slice;
 use log::{error, info, warn};
 use system_error::SystemError;
 
-const DEVFS_BLOCK_SIZE: u64 = 512;
+const DEVFS_BLOCK_SIZE: u64 = 4096;
 const DEVFS_MAX_NAMELEN: usize = 255;
+
+static DEVFS_INIT: Once = Once::new();
+static mut DEVFS_INSTANCE: Option<Arc<DevFS>> = None;
+
+fn devfs_global_instance() -> Arc<DevFS> {
+    DEVFS_INIT.call_once(|| unsafe {
+        DEVFS_INSTANCE = Some(DevFS::new());
+    });
+
+    unsafe { DEVFS_INSTANCE.as_ref().unwrap().clone() }
+}
+
+#[derive(Debug)]
+struct DevNodePath {
+    dirs: Vec<DName>,
+    basename: DName,
+}
+
+impl DevNodePath {
+    fn parse(name: &str) -> Result<Self, SystemError> {
+        let normalized = name.replace('!', "/");
+        let normalized = normalized.trim_start_matches('/');
+        if normalized.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+
+        let mut components = Vec::new();
+        for component in normalized.split('/') {
+            if component.is_empty() || component == "." || component == ".." {
+                return Err(SystemError::EINVAL);
+            }
+            if component.len() > DEVFS_MAX_NAMELEN {
+                return Err(SystemError::ENAMETOOLONG);
+            }
+            components.push(DName::from(component));
+        }
+
+        let basename = components.pop().ok_or(SystemError::EINVAL)?;
+        Ok(Self {
+            dirs: components,
+            basename,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DeviceIndexKind {
+    Char,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DeviceIndexKey {
+    kind: DeviceIndexKind,
+    dev_t: DeviceNumber,
+}
+
+impl DeviceIndexKey {
+    fn from_file_type(file_type: FileType, dev_t: DeviceNumber) -> Option<Self> {
+        let kind = match file_type {
+            FileType::BlockDevice => DeviceIndexKind::Block,
+            FileType::CharDevice | FileType::KvmDevice | FileType::FramebufferDevice => {
+                DeviceIndexKind::Char
+            }
+            _ => return None,
+        };
+
+        Some(Self { kind, dev_t })
+    }
+}
+
 /// @brief dev文件系统
 #[derive(Debug)]
 pub struct DevFS {
     // 文件系统根节点
     root_inode: Arc<LockedDevFSInode>,
     super_block: SuperBlock,
+    operation_lock: Mutex<()>,
+    device_by_devnum: Mutex<BTreeMap<DeviceIndexKey, Vec<Arc<dyn IndexNode>>>>,
 }
 
 fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
@@ -65,6 +141,12 @@ fn is_zero_inode(pfm: &PageFaultMessage) -> bool {
 }
 
 impl FileSystem for DevFS {
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn as_any_ref(&self) -> &dyn core::any::Any {
         self
     }
@@ -81,7 +163,7 @@ impl FileSystem for DevFS {
     }
 
     fn name(&self) -> &str {
-        "devfs"
+        "devtmpfs"
     }
 
     fn super_block(&self) -> SuperBlock {
@@ -93,6 +175,13 @@ impl FileSystem for DevFS {
             return VmFaultReason::VM_FAULT_SIGBUS;
         }
         PageFaultHandler::zero_fault(pfm)
+    }
+
+    unsafe fn page_mkwrite(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
+        if !is_zero_inode(pfm) {
+            return VmFaultReason::VM_FAULT_SIGBUS;
+        }
+        VmFaultReason::empty()
     }
 
     unsafe fn map_pages(
@@ -111,7 +200,7 @@ impl FileSystem for DevFS {
 impl DevFS {
     pub fn new() -> Arc<Self> {
         let super_block = SuperBlock::new(
-            Magic::DEVFS_MAGIC,
+            Magic::TMPFS_MAGIC,
             DEVFS_BLOCK_SIZE,
             DEVFS_MAX_NAMELEN as u64,
         );
@@ -127,6 +216,8 @@ impl DevFS {
         let devfs: Arc<DevFS> = Arc::new(DevFS {
             root_inode: root,
             super_block,
+            operation_lock: Mutex::new(()),
+            device_by_devnum: Mutex::new(BTreeMap::new()),
         });
 
         // 对root inode加锁，并继续完成初始化工作
@@ -137,15 +228,7 @@ impl DevFS {
         // 释放锁
         drop(root_guard);
 
-        // 创建文件夹
         let root: &Arc<LockedDevFSInode> = &devfs.root_inode;
-        root.add_dir("char")
-            .expect("DevFS: Failed to create /dev/char");
-
-        root.add_dir("block")
-            .expect("DevFS: Failed to create /dev/block");
-        // 预创建 /dev/ptmx 符号链接指向 devpts 内部节点，避免早期 ENOENT
-        let _ = root.add_dev_symlink("pts/ptmx", "ptmx");
         // Linux 用户态会通过 /dev/fd/N[/path] 重新访问 fd 派生的可见路径。
         // DragonOS 的真实对象解析能力在 /proc/self/fd，因此这里补兼容入口。
         root.add_dev_symlink("/proc/self/fd", "fd")
@@ -158,7 +241,13 @@ impl DevFS {
 
     /// @brief 注册系统内部自带的设备
     fn register_bultinin_device(&self) {
-        use crate::driver::base::device::device_number::{DeviceNumber, Major};
+        use crate::driver::{
+            base::device::{
+                device_number::{DeviceNumber, Major},
+                IdTable,
+            },
+            tty::tty_device::{PtyType, TtyDevice, TtyType},
+        };
         use crate::filesystem::fuse::dev::LockedFuseDevInode;
         use full_dev::LockedFullInode;
         use null_dev::LockedNullInode;
@@ -183,6 +272,22 @@ impl DevFS {
         .expect("DevFS: Failed to register /dev/urandom");
         self.register_builtin_root_device("fuse", LockedFuseDevInode::new())
             .expect("DevFS: Failed to register /dev/fuse");
+
+        let ptmx_devnum = DeviceNumber::new(Major::TTYAUX_MAJOR, 2);
+        let ptmx = TtyDevice::new(
+            "ptmx".to_string(),
+            IdTable::new("ptmx".to_string(), Some(ptmx_devnum)),
+            TtyType::Pty(PtyType::Ptm),
+        );
+        let mut metadata = ptmx
+            .metadata()
+            .expect("DevFS: Failed to read /dev/ptmx metadata");
+        metadata.mode = InodeMode::from_bits_truncate(0o666) | InodeMode::S_IFCHR;
+        metadata.raw_dev = ptmx_devnum;
+        ptmx.set_metadata(&metadata)
+            .expect("DevFS: Failed to set /dev/ptmx metadata");
+        self.register_builtin_root_device("ptmx", ptmx)
+            .expect("DevFS: Failed to register /dev/ptmx");
     }
 
     fn register_builtin_root_device<T: DeviceINode + 'static>(
@@ -193,176 +298,163 @@ impl DevFS {
         let dev_root = self.root_inode.clone();
         device.set_fs(dev_root.0.lock().fs.clone());
         device.set_parent(Arc::downgrade(&dev_root));
-        dev_root.add_dev(name, device)
+        let device_inode: Arc<dyn IndexNode> = device;
+        dev_root.add_dev_or_same(name, device_inode.clone())?;
+        self.remember_device_node(device_inode)?;
+        Ok(())
+    }
+
+    fn remember_device_node(&self, device: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let metadata = device.metadata()?;
+        let raw_dev = metadata.raw_dev;
+        if raw_dev != DeviceNumber::default() {
+            let Some(key) = DeviceIndexKey::from_file_type(metadata.file_type, raw_dev) else {
+                return Ok(());
+            };
+
+            let mut devices = self.device_by_devnum.lock();
+            let entries = devices.entry(key).or_default();
+            if !entries
+                .iter()
+                .any(|registered| Arc::ptr_eq(registered, &device))
+            {
+                entries.push(device);
+            }
+        }
+        Ok(())
+    }
+
+    fn forget_device_node_if_same(&self, device: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let metadata = device.metadata()?;
+        let raw_dev = metadata.raw_dev;
+        if raw_dev == DeviceNumber::default() {
+            return Ok(());
+        }
+        let Some(key) = DeviceIndexKey::from_file_type(metadata.file_type, raw_dev) else {
+            return Ok(());
+        };
+
+        let mut devices = self.device_by_devnum.lock();
+        if let Some(entries) = devices.get_mut(&key) {
+            entries.retain(|registered| !Arc::ptr_eq(registered, device));
+            if entries.is_empty() {
+                devices.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_device_by_devnum(
+        &self,
+        file_type: FileType,
+        dev_t: DeviceNumber,
+    ) -> Option<Arc<dyn IndexNode>> {
+        let key = DeviceIndexKey::from_file_type(file_type, dev_t)?;
+        self.device_by_devnum
+            .lock()
+            .get(&key)
+            .and_then(|entries| entries.first().cloned())
+    }
+
+    fn create_symlink(
+        &self,
+        link_name: &str,
+        target: &str,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        let _guard = self.operation_lock.lock();
+        let path = DevNodePath::parse(link_name)?;
+        let parent = self.root_inode.ensure_kernel_parent_dir(&path)?;
+        parent.create_dev_symlink(target, path.basename.as_ref())
+    }
+
+    fn remove_symlink_if_same(
+        &self,
+        link_name: &str,
+        expected: &Arc<LockedDevFSInode>,
+    ) -> Result<(), SystemError> {
+        let _guard = self.operation_lock.lock();
+        let path = DevNodePath::parse(link_name)?;
+        let Some(parent) = self.root_inode.find_parent_dir_if_exists(&path)? else {
+            return Ok(());
+        };
+
+        if parent.unlink_if_same(path.basename.as_ref(), expected)? {
+            self.root_inode.prune_kernel_dirs(&path)?;
+        }
+        Ok(())
     }
 
     /// @brief 在devfs内注册设备
     ///
     /// @param name 设备名称
     /// @param device 设备节点的结构体
-    pub fn register_device<T: DeviceINode>(
+    pub fn register_device<T: DeviceINode + 'static>(
         &self,
         name: &str,
         device: Arc<T>,
     ) -> Result<(), SystemError> {
+        self.register_device_dyn(name, device).map(|_| ())
+    }
+
+    /// @brief Register a dynamic device node in devfs
+    ///
+    /// This interface is used by the device core layer to register a node after
+    /// dynamic conversion from `Arc<dyn Device>`.
+    pub fn register_device_dyn(
+        &self,
+        name: &str,
+        device: Arc<dyn DeviceINode>,
+    ) -> Result<bool, SystemError> {
+        let _guard = self.operation_lock.lock();
         let dev_root_inode = self.root_inode.clone();
         let metadata = device.metadata()?;
-        match metadata.file_type {
-            // 字节设备挂载在 /dev/char
-            FileType::CharDevice => {
-                // 对 ptmx 使用符号链接至 devpts 内部节点，避免重复注册字符设备。
-                if name == "ptmx" {
-                    dev_root_inode.add_dev_symlink("pts/ptmx", name)?;
-                    return Ok(());
-                }
-
-                if dev_root_inode.find("char").is_err() {
-                    dev_root_inode.create(
-                        "char",
-                        FileType::Dir,
-                        InodeMode::from_bits_truncate(0o755),
-                    )?;
-                }
-
-                let any_char_inode = dev_root_inode.find("char")?;
-                let dev_char_inode = any_char_inode.downcast_arc::<LockedDevFSInode>().unwrap();
-
-                device.set_fs(dev_root_inode.0.lock().fs.clone());
-                device.set_parent(Arc::downgrade(&dev_root_inode));
-                // 特殊处理 tty 设备，挂载在 /dev 下
-                if name.starts_with("tty") && name.len() >= 3 {
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name.starts_with("hvc") && name.len() > 3 {
-                    // 特殊处理 hvc 设备，挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name == "console" {
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name == "ptmx" {
-                    // ptmx设备
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name == "loop-control" {
-                    // loop-control设备
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else {
-                    // 在 /dev/char 下创建设备节点
-                    dev_char_inode.add_dev(name, device.clone())?;
-                    device.set_parent(Arc::downgrade(&dev_char_inode));
-                }
-            }
-            FileType::BlockDevice => {
-                if dev_root_inode.find("block").is_err() {
-                    dev_root_inode.create(
-                        "block",
-                        FileType::Dir,
-                        InodeMode::from_bits_truncate(0o755),
-                    )?;
-                }
-
-                let any_block_inode = dev_root_inode.find("block")?;
-                let dev_block_inode = any_block_inode.downcast_arc::<LockedDevFSInode>().unwrap();
-
-                // default parent is dev_root_inode
-                device.set_parent(Arc::downgrade(&dev_root_inode));
-                device.set_fs(dev_root_inode.0.lock().fs.clone());
-
-                if name.starts_with("vd") && name.len() > 2 {
-                    // 虚拟磁盘设备挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
-                    let path = format!("/dev/{}", name);
-                    let symlink_name = device
-                        .as_any_ref()
-                        .downcast_ref::<GenDisk>()
-                        .unwrap()
-                        .symlink_name();
-
-                    dev_block_inode.add_dev_symlink(&path, &symlink_name)?;
-                } else if name.starts_with("nvme") {
-                    // NVMe设备挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name.starts_with("loop")
-                    && name.len() > 4
-                    && name[4..].chars().all(|c| c.is_ascii_digit())
-                {
-                    // loop块设备 (loop0, loop1, ...) 挂载在 /dev 下
-                    // 注意：不能简单用 starts_with("loop")，因为会与网络 loopback 设备冲突
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else if name.starts_with("pmem")
-                    && name.len() > 4
-                    && name[4..].chars().all(|c| c.is_ascii_digit())
-                {
-                    // PMEM 块设备 (pmem0, pmem1, ...) 挂载在 /dev 下
-                    dev_root_inode.add_dev(name, device.clone())?;
-                } else {
-                    dev_block_inode.add_dev(name, device.clone())?;
-                    device.set_parent(Arc::downgrade(&dev_block_inode));
-                }
-            }
-            FileType::KvmDevice | FileType::FramebufferDevice => {
-                dev_root_inode
-                    .add_dev(name, device.clone())
-                    .unwrap_or_else(|_| panic!("DevFS: Failed to register /dev/{}", name));
-
-                // default parent is dev_root_inode
-                device.set_parent(Arc::downgrade(&dev_root_inode));
-                device.set_fs(dev_root_inode.0.lock().fs.clone());
-            }
-            _ => {
-                return Err(SystemError::ENOSYS);
-            }
+        if !matches!(
+            metadata.file_type,
+            FileType::CharDevice
+                | FileType::BlockDevice
+                | FileType::KvmDevice
+                | FileType::FramebufferDevice
+        ) {
+            return Err(SystemError::ENOSYS);
         }
-        return Ok(());
+
+        let path = DevNodePath::parse(name)?;
+        let parent = dev_root_inode.ensure_kernel_parent_dir(&path)?;
+        device.set_fs(parent.0.lock().fs.clone());
+        device.set_parent(Arc::downgrade(&parent));
+        let device_inode: Arc<dyn IndexNode> = device;
+        let inserted = parent.add_dev_or_same(path.basename.as_ref(), device_inode.clone())?;
+        self.remember_device_node(device_inode)?;
+        Ok(inserted)
     }
 
     /// @brief 卸载设备
-    pub fn unregister_device<T: DeviceINode>(
+    pub fn unregister_device<T: DeviceINode + 'static>(
         &self,
         name: &str,
         device: Arc<T>,
     ) -> Result<(), SystemError> {
+        self.unregister_device_dyn(name, device)
+    }
+
+    /// @brief Unregister a dynamic device node
+    pub fn unregister_device_dyn(
+        &self,
+        name: &str,
+        device: Arc<dyn DeviceINode>,
+    ) -> Result<(), SystemError> {
+        let _guard = self.operation_lock.lock();
         let dev_root_inode: Arc<LockedDevFSInode> = self.root_inode.clone();
-        match device.metadata().unwrap().file_type {
-            // 字节设备挂载在 /dev/char
-            FileType::CharDevice => {
-                if dev_root_inode.find("char").is_err() {
-                    return Err(SystemError::ENOENT);
-                }
+        let expected: Arc<dyn IndexNode> = device.clone();
+        self.forget_device_node_if_same(&expected)?;
+        let path = DevNodePath::parse(name)?;
+        let Some(parent) = dev_root_inode.find_parent_dir_if_exists(&path)? else {
+            return Ok(());
+        };
 
-                let any_char_inode = dev_root_inode.find("char")?;
-                let dev_char_inode = any_char_inode
-                    .as_any_ref()
-                    .downcast_ref::<LockedDevFSInode>()
-                    .unwrap();
-                // TODO： 调用设备的卸载接口（当引入卸载接口之后）
-                dev_char_inode.remove(name)?;
-            }
-            FileType::BlockDevice => {
-                // 检查是否是 loop 块设备 (loop0, loop1, ...)
-                let is_loop_block_device = name.starts_with("loop")
-                    && name.len() > 4
-                    && name[4..].chars().all(|c| c.is_ascii_digit());
-
-                if is_loop_block_device {
-                    dev_root_inode.remove(name)?;
-                } else {
-                    if dev_root_inode.find("block").is_err() {
-                        return Err(SystemError::ENOENT);
-                    }
-
-                    let any_block_inode = dev_root_inode.find("block")?;
-                    let dev_block_inode = any_block_inode
-                        .as_any_ref()
-                        .downcast_ref::<LockedDevFSInode>()
-                        .unwrap();
-
-                    dev_block_inode.remove(name)?;
-                }
-            }
-            _ => {
-                return Err(SystemError::ENOSYS);
-            }
-        }
-
-        return Ok(());
+        parent.remove_if_same(path.basename.as_ref(), &expected)?;
+        dev_root_inode.prune_kernel_dirs(&path)?;
+        Ok(())
     }
 }
 
@@ -379,6 +471,8 @@ pub struct DevFSInode {
     self_ref: Weak<LockedDevFSInode>,
     /// 子Inode的B树
     children: BTreeMap<DName, Arc<dyn IndexNode>>,
+    /// Whether this devfs-owned inode was created by kernel device management.
+    kernel_managed: bool,
     /// 指向inode所在的文件系统对象的指针
     fs: Weak<DevFS>,
     /// INode 元数据
@@ -404,6 +498,7 @@ impl DevFSInode {
             parent,
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            kernel_managed: false,
             metadata: Metadata {
                 dev_id: 1,
                 inode_id: generate_inode_id(),
@@ -430,38 +525,131 @@ impl DevFSInode {
 }
 
 impl LockedDevFSInode {
-    pub fn add_dir(&self, name: &str) -> Result<(), SystemError> {
-        let guard: MutexGuard<DevFSInode> = self.0.lock();
-
-        if guard.children.contains_key(&DName::from(name)) {
-            return Err(SystemError::EEXIST);
-        }
-
-        match self.do_create_with_data(
-            guard,
-            name,
-            FileType::Dir,
-            InodeMode::from_bits_truncate(0o755),
-            0,
-        ) {
-            Ok(inode) => inode,
-            Err(err) => {
-                return Err(err);
-            }
-        };
-
-        return Ok(());
-    }
-
-    pub fn add_dev(&self, name: &str, dev: Arc<dyn IndexNode>) -> Result<(), SystemError> {
+    fn add_dev_or_same(&self, name: &str, dev: Arc<dyn IndexNode>) -> Result<bool, SystemError> {
         let mut this = self.0.lock();
         let name = DName::from(name);
-        if this.children.contains_key(&name) {
+        if let Some(existing) = this.children.get(&name) {
+            if Arc::ptr_eq(existing, &dev) {
+                return Ok(false);
+            }
             return Err(SystemError::EEXIST);
         }
 
         this.children.insert(name, dev);
-        return Ok(());
+        return Ok(true);
+    }
+
+    fn ensure_kernel_parent_dir(
+        &self,
+        path: &DevNodePath,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        let mut current = self.0.lock().self_ref.upgrade().ok_or(SystemError::EIO)?;
+
+        for component in &path.dirs {
+            let next = match current.find(component.as_ref()) {
+                Ok(inode) => inode
+                    .downcast_arc::<LockedDevFSInode>()
+                    .ok_or(SystemError::ENOTDIR)?,
+                Err(SystemError::ENOENT) => {
+                    let inode = current.do_create_with_data(
+                        component.as_ref(),
+                        FileType::Dir,
+                        InodeMode::from_bits_truncate(0o755),
+                        0,
+                        Vec::new(),
+                        false,
+                    )?;
+                    inode.0.lock().kernel_managed = true;
+                    inode
+                }
+                Err(e) => return Err(e),
+            };
+
+            if next.metadata()?.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+            current = next;
+        }
+
+        Ok(current)
+    }
+
+    fn find_parent_dir_if_exists(
+        &self,
+        path: &DevNodePath,
+    ) -> Result<Option<Arc<LockedDevFSInode>>, SystemError> {
+        let mut current = self.0.lock().self_ref.upgrade().ok_or(SystemError::EIO)?;
+
+        for component in &path.dirs {
+            let inode = match current.find(component.as_ref()) {
+                Ok(inode) => inode,
+                Err(SystemError::ENOENT) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+
+            let Some(next) = inode.downcast_arc::<LockedDevFSInode>() else {
+                return Ok(None);
+            };
+            if next.metadata()?.file_type != FileType::Dir {
+                return Ok(None);
+            }
+            current = next;
+        }
+
+        Ok(Some(current))
+    }
+
+    fn remove_kernel_dir_if_empty(&self, name: &DName) -> Result<bool, SystemError> {
+        let child = {
+            let inode = self.0.lock();
+            inode.children.get(name).cloned()
+        };
+
+        let Some(child) = child else {
+            return Ok(false);
+        };
+        let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>() else {
+            return Ok(false);
+        };
+
+        let should_remove = {
+            let child = child.0.lock();
+            child.kernel_managed
+                && child.metadata.file_type == FileType::Dir
+                && child.children.is_empty()
+        };
+        if !should_remove {
+            return Ok(false);
+        }
+
+        self.0.lock().children.remove(name);
+        Ok(true)
+    }
+
+    fn prune_kernel_dirs(&self, path: &DevNodePath) -> Result<(), SystemError> {
+        let mut current = self.0.lock().self_ref.upgrade().ok_or(SystemError::EIO)?;
+        let mut chain: Vec<(Arc<LockedDevFSInode>, DName)> = Vec::new();
+
+        for component in &path.dirs {
+            let inode = match current.find(component.as_ref()) {
+                Ok(inode) => inode,
+                Err(SystemError::ENOENT) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let Some(next) = inode.downcast_arc::<LockedDevFSInode>() else {
+                return Ok(());
+            };
+            chain.push((current.clone(), component.clone()));
+            current = next;
+        }
+
+        for (parent, name) in chain.into_iter().rev() {
+            if !parent.remove_kernel_dir_if_empty(&name)? {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// # 在devfs中添加一个符号链接
@@ -470,38 +658,89 @@ impl LockedDevFSInode {
     /// - `path`: 符号链接指向的路径
     /// - `symlink_name`: 符号链接的名称
     pub fn add_dev_symlink(&self, path: &str, symlink_name: &str) -> Result<(), SystemError> {
-        let new_inode =
-            self.create_with_data(symlink_name, FileType::SymLink, InodeMode::S_IRWXUGO, 0)?;
-
-        let buf = path.as_bytes();
-        let len = buf.len();
-        new_inode
-            .downcast_ref::<LockedDevFSInode>()
-            .unwrap()
-            .write_at(0, len, buf, Mutex::new(FilePrivateData::Unused).lock())?;
+        self.create_dev_symlink(path, symlink_name)?;
         Ok(())
     }
 
-    pub fn remove(&self, name: &str) -> Result<(), SystemError> {
-        let x = self
-            .0
-            .lock()
-            .children
-            .remove(&DName::from(name))
-            .ok_or(SystemError::ENOENT)?;
+    fn create_dev_symlink(
+        &self,
+        path: &str,
+        symlink_name: &str,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        self.do_create_with_data(
+            symlink_name,
+            FileType::SymLink,
+            InodeMode::S_IRWXUGO,
+            0,
+            path.as_bytes().to_vec(),
+            true,
+        )
+    }
 
-        drop(x);
-        return Ok(());
+    fn remove_if_same(&self, name: &str, expected: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        let dname = DName::from(name);
+        let should_remove = inode
+            .children
+            .get(&dname)
+            .is_some_and(|child| Arc::ptr_eq(child, expected));
+
+        if should_remove {
+            inode.children.remove(&dname);
+        }
+
+        Ok(())
+    }
+
+    fn unlink_if_same(
+        &self,
+        name: &str,
+        expected: &Arc<LockedDevFSInode>,
+    ) -> Result<bool, SystemError> {
+        let mut inode = self.0.lock();
+        if inode.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+
+        let dname = DName::from(name);
+        let Some(child) = inode.children.get(&dname).cloned() else {
+            return Ok(false);
+        };
+        let expected_node: Arc<dyn IndexNode> = expected.clone();
+        if !Arc::ptr_eq(&child, &expected_node) {
+            return Ok(false);
+        }
+
+        let mut child_inode = expected.0.lock();
+        if child_inode.metadata.file_type == FileType::Dir {
+            return Err(SystemError::EISDIR);
+        }
+
+        child_inode.metadata.nlinks = child_inode
+            .metadata
+            .nlinks
+            .checked_sub(1)
+            .ok_or(SystemError::EINVAL)?;
+        let now = PosixTimeSpec::now();
+        child_inode.metadata.ctime = now;
+        drop(child_inode);
+
+        inode.children.remove(&dname);
+        inode.metadata.mtime = now;
+        inode.metadata.ctime = now;
+        Ok(true)
     }
 
     fn do_create_with_data(
         &self,
-        mut guard: MutexGuard<DevFSInode>,
         name: &str,
         file_type: FileType,
         mode: InodeMode,
         dev: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        initial_data: Vec<u8>,
+        kernel_managed: bool,
+    ) -> Result<Arc<LockedDevFSInode>, SystemError> {
+        let mut guard = self.0.lock();
         if guard.metadata.file_type != FileType::Dir {
             return Err(SystemError::ENOTDIR);
         }
@@ -516,10 +755,11 @@ impl LockedDevFSInode {
             parent: guard.self_ref.clone(),
             self_ref: Weak::default(),
             children: BTreeMap::new(),
+            kernel_managed,
             metadata: Metadata {
                 dev_id: 0,
                 inode_id: generate_inode_id(),
-                size: 0,
+                size: initial_data.len() as i64,
                 blk_size: 0,
                 blocks: 0,
                 atime: PosixTimeSpec::default(),
@@ -536,7 +776,7 @@ impl LockedDevFSInode {
             },
             fs: guard.fs.clone(),
             dname: name.clone(),
-            data: Vec::new(),
+            data: initial_data,
         })));
 
         // 初始化inode的自引用的weak指针
@@ -557,8 +797,11 @@ impl IndexNode for LockedDevFSInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        return Ok(());
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            return Ok(());
+        })();
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -571,11 +814,8 @@ impl IndexNode for LockedDevFSInode {
         file_type: FileType,
         mode: InodeMode,
         data: usize,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        // 获取当前inode
-        let guard: MutexGuard<DevFSInode> = self.0.lock();
-        // 如果当前inode不是文件夹，则返回
-        return self.do_create_with_data(guard, name, file_type, mode, data);
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
+        return Ok(self.do_create_with_data(name, file_type, mode, data, Vec::new(), false)?);
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -601,6 +841,68 @@ impl IndexNode for LockedDevFSInode {
                     .clone());
             }
         }
+    }
+
+    fn unlink(
+        &self,
+        name: &str,
+    ) -> Result<
+        crate::filesystem::vfs::LinkRemovalOutcome,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut inode = self.0.lock();
+            if inode.metadata.file_type != FileType::Dir {
+                return Err(SystemError::ENOTDIR);
+            }
+
+            if name.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
+            if name == "." || name == ".." {
+                return Err(SystemError::EISDIR);
+            }
+
+            let dname = DName::from(name);
+            let child = inode
+                .children
+                .get(&dname)
+                .cloned()
+                .ok_or(SystemError::ENOENT)?;
+
+            let outcome = if let Some(child) = child.as_any_ref().downcast_ref::<LockedDevFSInode>()
+            {
+                let mut child_inode = child.0.lock();
+                if child_inode.metadata.file_type == FileType::Dir {
+                    return Err(SystemError::EISDIR);
+                }
+
+                child_inode.metadata.nlinks = child_inode
+                    .metadata
+                    .nlinks
+                    .checked_sub(1)
+                    .ok_or(SystemError::EINVAL)?;
+                child_inode.metadata.ctime = PosixTimeSpec::now();
+                if child_inode.metadata.nlinks == 0 {
+                    crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+                } else {
+                    crate::filesystem::vfs::LinkRemovalOutcome::StillLinked
+                }
+            } else if child.metadata()?.file_type == FileType::Dir {
+                return Err(SystemError::EISDIR);
+            } else {
+                // Externally registered device nodes have a single devfs edge.
+                crate::filesystem::vfs::LinkRemovalOutcome::LastLink
+            };
+
+            inode.children.remove(&dname);
+            let now = PosixTimeSpec::now();
+            inode.metadata.mtime = now;
+            inode.metadata.ctime = now;
+
+            Ok(outcome)
+        })();
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -658,8 +960,9 @@ impl IndexNode for LockedDevFSInode {
         _cmd: u32,
         _data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn list(&self) -> Result<Vec<String>, SystemError> {
@@ -688,17 +991,29 @@ impl IndexNode for LockedDevFSInode {
         return Ok(self.0.lock().metadata.clone());
     }
 
-    fn set_metadata(&self, metadata: &Metadata) -> Result<(), SystemError> {
-        let mut inode = self.0.lock();
-        inode.metadata.atime = metadata.atime;
-        inode.metadata.mtime = metadata.mtime;
-        inode.metadata.ctime = metadata.ctime;
-        inode.metadata.btime = metadata.btime;
-        inode.metadata.mode = metadata.mode;
-        inode.metadata.uid = metadata.uid;
-        inode.metadata.gid = metadata.gid;
+    fn set_metadata(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let mut inode = self.0.lock();
+            inode.metadata.atime = metadata.atime;
+            inode.metadata.mtime = metadata.mtime;
+            inode.metadata.ctime = metadata.ctime;
+            inode.metadata.btime = metadata.btime;
+            inode.metadata.mode = metadata.mode;
+            inode.metadata.uid = metadata.uid;
+            inode.metadata.gid = metadata.gid;
 
-        return Ok(());
+            return Ok(());
+        })();
+        result.map_err(Into::into)
+    }
+
+    fn update_atime(&self, now: PosixTimeSpec, relatime: bool) -> Result<(), SystemError> {
+        let mut inode = self.0.lock();
+        crate::filesystem::vfs::update_atime_locked(&mut inode.metadata, now, relatime);
+        Ok(())
     }
 
     /// 读设备 - 应该调用设备的函数读写，而不是通过文件系统读写，仅支持符号链接的读取
@@ -708,39 +1023,42 @@ impl IndexNode for LockedDevFSInode {
         len: usize,
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let meta = self.metadata()?;
-        match meta.file_type {
-            FileType::SymLink => {
-                if buf.len() < len {
-                    return Err(SystemError::EINVAL);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let meta = self.metadata()?;
+            match meta.file_type {
+                FileType::SymLink => {
+                    if buf.len() < len {
+                        return Err(SystemError::EINVAL);
+                    }
+                    // 加锁
+                    let inode = self.0.lock();
+
+                    // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
+                    if inode.metadata.file_type == FileType::Dir {
+                        return Err(SystemError::EISDIR);
+                    }
+
+                    let start = inode.data.len().min(offset);
+                    let end = inode.data.len().min(offset + len);
+
+                    // buffer空间不足
+                    if buf.len() < (end - start) {
+                        return Err(SystemError::ENOBUFS);
+                    }
+
+                    // 拷贝数据
+                    let src = &inode.data[start..end];
+                    buf[0..src.len()].copy_from_slice(src);
+                    return Ok(src.len());
                 }
-                // 加锁
-                let inode = self.0.lock();
-
-                // 检查当前inode是否为一个文件夹，如果是的话，就返回错误
-                if inode.metadata.file_type == FileType::Dir {
-                    return Err(SystemError::EISDIR);
+                _ => {
+                    error!("DevFS: read_at is not supported!");
+                    Err(SystemError::ENOSYS)
                 }
-
-                let start = inode.data.len().min(offset);
-                let end = inode.data.len().min(offset + len);
-
-                // buffer空间不足
-                if buf.len() < (end - start) {
-                    return Err(SystemError::ENOBUFS);
-                }
-
-                // 拷贝数据
-                let src = &inode.data[start..end];
-                buf[0..src.len()].copy_from_slice(src);
-                return Ok(src.len());
             }
-            _ => {
-                error!("DevFS: read_at is not supported!");
-                Err(SystemError::ENOSYS)
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     /// 写设备 - 应该调用设备的函数读写，而不是通过文件系统读写，仅支持符号链接的写入
@@ -750,35 +1068,38 @@ impl IndexNode for LockedDevFSInode {
         len: usize,
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let meta = self.metadata()?;
-        match meta.file_type {
-            FileType::SymLink => {
-                if buf.len() < len {
-                    return Err(SystemError::EINVAL);
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = (|| {
+            let meta = self.metadata()?;
+            match meta.file_type {
+                FileType::SymLink => {
+                    if buf.len() < len {
+                        return Err(SystemError::EINVAL);
+                    }
+                    let mut inode = self.0.lock();
+
+                    if inode.metadata.file_type == FileType::Dir {
+                        return Err(SystemError::EISDIR);
+                    }
+
+                    let data: &mut Vec<u8> = &mut inode.data;
+
+                    // 如果文件大小比原来的大，那就resize这个数组
+                    if offset + len > data.len() {
+                        data.resize(offset + len, 0);
+                    }
+
+                    let target = &mut data[offset..offset + len];
+                    target.copy_from_slice(&buf[0..len]);
+                    return Ok(len);
                 }
-                let mut inode = self.0.lock();
-
-                if inode.metadata.file_type == FileType::Dir {
-                    return Err(SystemError::EISDIR);
+                _ => {
+                    error!("DevFS: read_at is not supported!");
+                    Err(SystemError::ENOSYS)
                 }
-
-                let data: &mut Vec<u8> = &mut inode.data;
-
-                // 如果文件大小比原来的大，那就resize这个数组
-                if offset + len > data.len() {
-                    data.resize(offset + len, 0);
-                }
-
-                let target = &mut data[offset..offset + len];
-                target.copy_from_slice(&buf[0..len]);
-                return Ok(len);
             }
-            _ => {
-                error!("DevFS: read_at is not supported!");
-                Err(SystemError::ENOSYS)
-            }
-        }
+        })();
+        result.map_err(Into::into)
     }
 
     fn parent(&self) -> Result<Arc<dyn IndexNode>, SystemError> {
@@ -798,27 +1119,48 @@ impl IndexNode for LockedDevFSInode {
         filename: &str,
         mode: InodeMode,
         dev_t: DeviceNumber,
-    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+    ) -> Result<Arc<dyn IndexNode>, crate::mm::allocation::MemoryAllocationError> {
         let inode = self.0.lock();
         if inode.metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
+            return Err(SystemError::ENOTDIR.into());
         }
 
         // 判断需要创建的类型
-        let file_type = if mode.contains(InodeMode::S_IFCHR) {
-            FileType::CharDevice
-        } else if mode.contains(InodeMode::S_IFBLK) {
-            FileType::BlockDevice
-        } else if mode.contains(InodeMode::S_IFIFO) {
-            FileType::Pipe
-        } else {
-            return Err(SystemError::EINVAL);
+        let file_type = match FileType::from(mode) {
+            FileType::CharDevice => FileType::CharDevice,
+            FileType::BlockDevice => FileType::BlockDevice,
+            FileType::Pipe => FileType::Pipe,
+            FileType::Socket => FileType::Socket,
+            _ => return Err(SystemError::EINVAL.into()),
         };
 
         drop(inode);
         self.create_with_data(filename, file_type, mode, dev_t.data() as usize)
     }
 }
+
+impl MountableFileSystem for DevFS {
+    fn make_mount_data(
+        raw_data: Option<&str>,
+        _source: &str,
+    ) -> Result<
+        Option<Arc<dyn FileSystemMakerData + 'static>>,
+        crate::mm::allocation::MemoryAllocationError,
+    > {
+        if raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL.into());
+        }
+        Ok(None)
+    }
+
+    fn make_fs(
+        _data: Option<&dyn FileSystemMakerData>,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        Ok(devfs_global_instance())
+    }
+}
+
+register_mountable_fs!(DevFS, DEVTMPFSMAKER, "devtmpfs");
 
 /// @brief 所有的设备INode都需要额外实现这个trait
 pub trait DeviceINode: IndexNode {
@@ -833,69 +1175,72 @@ pub trait DeviceINode: IndexNode {
     // TODO: 增加 unregister 方法
 }
 
-/// @brief 获取devfs实例的强类型不可变引用
-macro_rules! devfs_exact_ref {
-    () => {{
-        let devfs_inode: Result<Arc<dyn IndexNode>, SystemError> =
-            crate::process::ProcessManager::current_mntns()
-                .root_inode()
-                .find("dev");
-        if let Err(e) = devfs_inode {
-            error!("failed to get DevFS ref. errcode = {:?}", e);
-            return Err(SystemError::ENOENT);
-        }
-
-        let binding = devfs_inode.unwrap();
-        let devfs_inode: &LockedDevFSInode = binding
-            .as_any_ref()
-            .downcast_ref::<LockedDevFSInode>()
-            .unwrap();
-        let binding = devfs_inode.fs();
-        binding
-    }
-    .as_any_ref()
-    .downcast_ref::<DevFS>()
-    .unwrap()};
+/// @brief devfs device registration function
+pub fn devfs_register<T: DeviceINode + 'static>(
+    name: &str,
+    device: Arc<T>,
+) -> Result<(), SystemError> {
+    return devfs_global_instance().register_device(name, device);
 }
-/// @brief devfs的设备注册函数
-pub fn devfs_register<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
-    return devfs_exact_ref!().register_device(name, device);
+
+/// @brief devfs dynamic device unregistration function
+pub fn devfs_unregister_dyn(name: &str, device: Arc<dyn DeviceINode>) -> Result<(), SystemError> {
+    return devfs_global_instance().unregister_device_dyn(name, device);
+}
+
+/// @brief devfs dynamic device creation function; returns whether this call actually inserted a directory entry
+pub fn devfs_create_node_dyn(
+    name: &str,
+    device: Arc<dyn DeviceINode>,
+) -> Result<bool, SystemError> {
+    return devfs_global_instance().register_device_dyn(name, device);
 }
 
 /// 在 /dev 下创建符号链接
-#[allow(dead_code)]
-pub fn devfs_add_symlink(link_name: &str, target: &str) -> Result<(), SystemError> {
-    let dev_inode = ProcessManager::current_mntns()
-        .root_inode()
-        .find("dev")
-        .map_err(|_| SystemError::ENOENT)?;
-    let dev_inode = dev_inode
-        .downcast_arc::<LockedDevFSInode>()
-        .ok_or(SystemError::ENOENT)?;
-    dev_inode.add_dev_symlink(target, link_name)
+pub fn devfs_add_symlink(
+    link_name: &str,
+    target: &str,
+) -> Result<Arc<LockedDevFSInode>, SystemError> {
+    devfs_global_instance().create_symlink(link_name, target)
+}
+
+pub fn devfs_remove_symlink_if_same(
+    link_name: &str,
+    expected: &Arc<LockedDevFSInode>,
+) -> Result<(), SystemError> {
+    devfs_global_instance().remove_symlink_if_same(link_name, expected)
 }
 
 /// @brief devfs的设备卸载函数
 #[allow(dead_code)]
 pub fn devfs_unregister<T: DeviceINode>(name: &str, device: Arc<T>) -> Result<(), SystemError> {
-    return devfs_exact_ref!().unregister_device(name, device);
+    return devfs_global_instance().unregister_device(name, device);
+}
+
+pub fn devfs_lookup_device_by_devnum(
+    file_type: FileType,
+    dev_t: DeviceNumber,
+) -> Option<Arc<dyn IndexNode>> {
+    devfs_global_instance().lookup_device_by_devnum(file_type, dev_t)
 }
 
 pub fn devfs_init() -> Result<(), SystemError> {
-    static INIT: Once = Once::new();
-    let mut result = None;
-    INIT.call_once(|| {
-        info!("Initializing DevFS...");
-        // 创建 devfs 实例
-        let devfs: Arc<DevFS> = DevFS::new();
+    info!("Initializing devtmpfs...");
+    let devfs = devfs_global_instance();
+    static MOUNT_INIT: Once = Once::new();
+    let mut result = Ok(());
+    MOUNT_INIT.call_once(|| {
         // devfs 挂载
         let root_inode = ProcessManager::current_mntns().root_inode();
-        root_inode
+        if let Err(e) = root_inode
             .mkdir("dev", InodeMode::from_bits_truncate(0o755))
             .expect("Unabled to find /dev")
-            .mount(devfs, MountFlags::empty())
-            .expect("Failed to mount at /dev");
-        info!("DevFS mounted.");
+            .mount(devfs.clone(), MountFlags::empty())
+        {
+            result = Err(e);
+            return;
+        }
+        info!("devtmpfs mounted.");
         // 挂载 /dev/shm 为 tmpfs，符合 linux 语义
         if let Ok(dev_inode) = ProcessManager::current_mntns().root_inode().find("dev") {
             let shm_inode = dev_inode
@@ -903,7 +1248,7 @@ pub fn devfs_init() -> Result<(), SystemError> {
                 .or_else(|_| dev_inode.mkdir("shm", InodeMode::from_bits_truncate(0o1777)));
             if let Ok(shm_inode) = shm_inode {
                 let flags = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
-                match produce_fs("tmpfs", Some("mode=1777"), "tmpfs") {
+                match produce_fs("tmpfs", Some("mode=1777"), "tmpfs", flags) {
                     Ok(fs) => {
                         if let Err(e) = shm_inode.mount(fs, flags) {
                             if e != SystemError::EBUSY {
@@ -920,8 +1265,8 @@ pub fn devfs_init() -> Result<(), SystemError> {
             warn!("Cannot find /dev mountpoint for /dev/shm");
         }
 
-        result = Some(Ok(()));
+        result = Ok(());
     });
 
-    return result.unwrap();
+    return result;
 }

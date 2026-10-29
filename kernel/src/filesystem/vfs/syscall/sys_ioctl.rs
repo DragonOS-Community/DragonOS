@@ -2,7 +2,7 @@
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_IOCTL;
-use crate::filesystem::vfs::fasync::set_file_fasync;
+use crate::filesystem::vfs::fasync::{set_file_fasync, FAsyncHandlerPolicy};
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::file::FileFlags;
 use crate::syscall::table::FormattedSyscallParam;
@@ -13,7 +13,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::process::{ProcessManager, RawPid};
+use crate::process::ProcessManager;
 use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 
 // 通用文件描述符ioctl命令常量
@@ -73,9 +73,9 @@ impl Syscall for SysIoctlHandle {
             }
             FIONCLEX | FIOCLEX => {
                 // close_on_exec 是 per-fd 属性，需要通过 fd 表设置
-                let binding = ProcessManager::current_pcb().fd_table();
-                let mut fd_table_guard = binding.write();
-                fd_table_guard.set_cloexec(fd as i32, cmd == FIOCLEX);
+                ProcessManager::current_pcb()
+                    .fd_table()
+                    .set_cloexec(fd as i32, cmd == FIOCLEX)?;
                 return Ok(0);
             }
             FIOASYNC => {
@@ -89,18 +89,20 @@ impl Syscall for SysIoctlHandle {
             }
             _ => {
                 // 其他命令转发给inode处理
-                let r = file
-                    .inode()
-                    .ioctl(cmd, data, file.private_data.lock())
-                    .map_err(|e| {
-                        // 将内部错误码 ENOIOCTLCMD 转换为用户空间错误码 ENOTTY
-                        if e == SystemError::ENOIOCTLCMD {
-                            SystemError::ENOTTY
-                        } else {
-                            e
-                        }
-                    });
-                return r;
+                let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+                loop {
+                    // The single attempt owns the private guard. It is gone
+                    // before recovery, and drivers admit resources before
+                    // their irreversible VM/peer/fd publication.
+                    let result = file.inode().ioctl(cmd, data, file.private_data.lock());
+                    match result {
+                        Ok(value) => return Ok(value),
+                        Err(crate::mm::allocation::MemoryAllocationError::System(
+                            SystemError::ENOIOCTLCMD,
+                        )) => return Err(SystemError::ENOTTY),
+                        Err(error) => error.recover(&mut recovery)?,
+                    }
+                }
             }
         }
     }
@@ -168,12 +170,12 @@ impl SysIoctlHandle {
             UserBufferReader::new(data as *const i32, core::mem::size_of::<i32>(), true)?;
         let value = user_reader.buffer_protected(0)?.read_one::<i32>(0)?;
 
-        set_file_fasync(file, fd, value != 0)?;
+        set_file_fasync(file, fd, value != 0, FAsyncHandlerPolicy::Required)?;
         Ok(0)
     }
 
     /// Handle FIOSETOWN command: set file owner for SIGIO/SIGURG signals
-    fn handle_fiosetown(file: &File, data: usize) -> Result<usize, SystemError> {
+    fn handle_fiosetown(file: &Arc<File>, data: usize) -> Result<usize, SystemError> {
         // 检查data指针是否为null
         if data == 0 {
             return Err(SystemError::EFAULT);
@@ -184,23 +186,7 @@ impl SysIoctlHandle {
             UserBufferReader::new(data as *const i32, core::mem::size_of::<i32>(), true)?;
         let pid_value = user_reader.buffer_protected(0)?.read_one::<i32>(0)?;
 
-        // 处理pid值，逻辑与fcntl F_SETOWN相同
-        let pid = pid_value.unsigned_abs();
-        if pid > i32::MAX as u32 {
-            return Err(SystemError::EINVAL);
-        }
-
-        let pb = if pid == 0 {
-            None
-        } else {
-            // 注意：这里只处理进程ID，不处理进程组ID（负值）
-            // 在Linux中，负值表示进程组，但DragonOS当前可能不支持
-            let pb = ProcessManager::find_task_by_vpid(RawPid::from(pid as _))
-                .ok_or(SystemError::ESRCH)?;
-            Some(pb)
-        };
-
-        file.set_owner(pb)?;
+        file.set_owner(pid_value)?;
         Ok(0)
     }
 
@@ -211,13 +197,7 @@ impl SysIoctlHandle {
             return Err(SystemError::EFAULT);
         }
 
-        // 获取所有者pid（如果没有所有者则返回0）
-        let owner = file.owner().unwrap_or(RawPid::from(0));
-        let pid_value: i32 = owner.data() as i32;
-
-        // 注意：Linux中FIOGETOWN和SIOCGPGRP可能对进程组ID有不同符号处理
-        // 这里简单返回pid值，与fcntl F_GETOWN保持一致
-        let value_to_write = pid_value;
+        let value_to_write = file.owner();
 
         // 将pid值写入用户空间
         let mut user_writer =

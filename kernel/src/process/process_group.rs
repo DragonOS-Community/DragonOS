@@ -21,6 +21,7 @@ impl ProcessManager {
         pgrp: &Arc<Pid>,
         ignored_pcb: Option<&Arc<ProcessControlBlock>>,
     ) -> bool {
+        let _membership_guard = crate::process::pid::pid_membership_lock();
         for pcb in pgrp.tasks_iter(PidType::PGID) {
             let real_parent = pcb.real_parent_pcb().unwrap();
             if ignored_pcb.is_some() && Arc::ptr_eq(&pcb, ignored_pcb.unwrap()) {
@@ -45,15 +46,10 @@ impl ProcessManager {
 
 impl ProcessControlBlock {
     pub fn task_pgrp(&self) -> Option<Arc<Pid>> {
-        self.sighand().pid(PidType::PGID)
+        self.process_signal().pid(PidType::PGID)
     }
 
     pub fn task_session(&self) -> Option<Arc<Pid>> {
-        self.sighand().pid(PidType::SID)
-    }
-
-    /// 参考 https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393
-    pub(super) fn task_join_group_stop(&self) {
-        // todo: 实现  https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/signal.c?fi=task_join_group_stop#393
+        self.process_signal().pid(PidType::SID)
     }
 }

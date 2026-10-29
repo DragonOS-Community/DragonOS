@@ -18,6 +18,8 @@ namespace {
 constexpr char kExecExit42[] = "--proc-self-exec-cmdline-exit42";
 constexpr char kLeaderExec[] = "--proc-self-exec-cmdline-leader";
 constexpr char kSiblingExec[] = "--proc-self-exec-cmdline-sibling";
+constexpr char kSessionSiblingExec[] = "--proc-self-exec-session-sibling";
+constexpr char kSessionCheck[] = "--proc-self-exec-session-check";
 
 bool read_all(int fd, std::string* out) {
     out->clear();
@@ -102,6 +104,15 @@ void* sibling_exec_thread(void*) {
     return nullptr;
 }
 
+void* session_sibling_exec_thread(void*) {
+    char arg0[] = "/proc/self/exe";
+    char arg1[] = "--proc-self-exec-session-check";
+    char* const argv[] = {arg0, arg1, nullptr};
+    char* const envp[] = {nullptr};
+    execve("/proc/self/exe", argv, envp);
+    _exit(errno);
+}
+
 void run_sibling_exec_helper() {
     pthread_t thread;
     if (pthread_create(&thread, nullptr, sibling_exec_thread, nullptr) != 0) {
@@ -111,6 +122,33 @@ void run_sibling_exec_helper() {
     for (;;) {
         pause();
     }
+}
+
+void run_session_sibling_exec_helper() {
+    if (setsid() < 0) {
+        _exit(errno);
+    }
+
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, session_sibling_exec_thread, nullptr) != 0) {
+        _exit(1);
+    }
+
+    for (;;) {
+        pause();
+    }
+}
+
+int validate_session_leader_after_exec() {
+    if (getsid(0) != getpid()) {
+        return 1;
+    }
+
+    errno = 0;
+    if (setsid() != -1 || errno != EPERM) {
+        return 2;
+    }
+    return 43;
 }
 
 void expect_helper_exits_42(const char* mode) {
@@ -142,6 +180,25 @@ TEST(ProcSelfExecCmdline, SiblingThreadExecKeepsProcSelfCmdlineCurrent) {
     expect_helper_exits_42(kSiblingExec);
 }
 
+TEST(ProcSelfExecCmdline, SiblingThreadExecPreservesSessionLeadership) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0) << "fork failed: errno=" << errno << " (" << strerror(errno) << ")";
+
+    if (child == 0) {
+        char arg0[] = "/proc/self/exe";
+        char* const argv[] = {arg0, const_cast<char*>(kSessionSiblingExec), nullptr};
+        char* const envp[] = {nullptr};
+        execve("/proc/self/exe", argv, envp);
+        _exit(errno);
+    }
+
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0))
+        << "waitpid failed: errno=" << errno << " (" << strerror(errno) << ")";
+    ASSERT_TRUE(WIFEXITED(status)) << "child did not exit normally, status=" << status;
+    EXPECT_EQ(43, WEXITSTATUS(status));
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], kExecExit42) == 0) {
         return validate_cmdline_and_exit42(argc, argv);
@@ -153,6 +210,13 @@ int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], kSiblingExec) == 0) {
         run_sibling_exec_helper();
         return 1;
+    }
+    if (argc >= 2 && strcmp(argv[1], kSessionSiblingExec) == 0) {
+        run_session_sibling_exec_helper();
+        return 1;
+    }
+    if (argc >= 2 && strcmp(argv[1], kSessionCheck) == 0) {
+        return validate_session_leader_after_exec();
     }
 
     ::testing::InitGoogleTest(&argc, argv);

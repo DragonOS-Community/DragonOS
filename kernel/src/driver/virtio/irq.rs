@@ -11,7 +11,7 @@ use crate::{
         IrqNumber,
     },
     init::initcall::INITCALL_CORE,
-    libs::rwlock::RwLock,
+    libs::{rwlock::RwLock, spinlock::SpinLock},
 };
 
 use super::VirtIODevice;
@@ -24,27 +24,39 @@ pub fn virtio_irq_manager() -> &'static VirtIOIrqManager {
 }
 
 pub struct VirtIOIrqManager {
+    registration_lock: SpinLock<()>,
     map: RwLock<HashMap<Arc<DeviceId>, Arc<dyn VirtIODevice>>>,
+    callbacks: RwLock<HashMap<Arc<DeviceId>, Arc<dyn VirtioIrqCallback>>>,
+}
+
+pub trait VirtioIrqCallback: Send + Sync {
+    fn handle_irq(&self, irq: IrqNumber) -> Result<IrqReturn, SystemError>;
 }
 
 impl VirtIOIrqManager {
     fn new() -> Self {
         VirtIOIrqManager {
+            registration_lock: SpinLock::new(()),
             map: RwLock::new(HashMap::new()),
+            callbacks: RwLock::new(HashMap::new()),
         }
     }
 
-    /// 注册一个新的设备到virtio中断请求（IRQ）映射中。
+    /// Registers a new device in the virtio interrupt request (IRQ) mapping.
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `device` - 实现了 `VirtIODevice` trait 的设备对象，被封装在 `Arc` 智能指针中。
+    /// - `device` - The device object implementing the `VirtIODevice` trait, wrapped in an `Arc` smart pointer.
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// - 如果设备成功注册，返回 `Ok(())`。
-    /// - 如果设备ID已经存在于映射中，返回 `Err(SystemError::EEXIST)`。
+    /// - If the device is successfully registered, returns `Ok(())`.
+    /// - If the device ID already exists in the mapping, returns `Err(SystemError::EEXIST)`.
     pub fn register_device(&self, device: Arc<dyn VirtIODevice>) -> Result<(), SystemError> {
+        let _guard = self.registration_lock.lock_irqsave();
+        if self.callbacks.read_irqsave().contains_key(device.dev_id()) {
+            return Err(SystemError::EEXIST);
+        }
         let mut map = self.map.write_irqsave();
 
         if map.contains_key(device.dev_id()) {
@@ -56,30 +68,60 @@ impl VirtIOIrqManager {
         return Ok(());
     }
 
-    /// 取消注册设备
+    /// Unregisters a device.
     ///
-    /// 这个函数会从内部映射中移除指定的设备。设备是通过设备ID来识别的。
+    /// This function removes the specified device from the internal mapping. The device is identified by its device ID.
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `device` - 需要被取消注册的设备，它是一个实现了 `VirtIODevice` trait 的智能指针。
+    /// - `dev_id` - The device ID of the device to be unregistered.
     #[allow(dead_code)]
     pub fn unregister_device(&self, dev_id: &Arc<DeviceId>) {
+        let _guard = self.registration_lock.lock_irqsave();
         let mut map = self.map.write_irqsave();
         map.remove(dev_id);
     }
 
-    /// 查找并返回指定设备ID的设备。
+    pub fn register_callback(
+        &self,
+        dev_id: Arc<DeviceId>,
+        callback: Arc<dyn VirtioIrqCallback>,
+    ) -> Result<(), SystemError> {
+        let _guard = self.registration_lock.lock_irqsave();
+        if self.map.read_irqsave().contains_key(&dev_id) {
+            return Err(SystemError::EEXIST);
+        }
+
+        let mut callbacks = self.callbacks.write_irqsave();
+        if callbacks.contains_key(&dev_id) {
+            return Err(SystemError::EEXIST);
+        }
+        callbacks.insert(dev_id, callback);
+        Ok(())
+    }
+
+    pub fn unregister_callback(&self, dev_id: &Arc<DeviceId>) {
+        let _guard = self.registration_lock.lock_irqsave();
+        let mut callbacks = self.callbacks.write_irqsave();
+        callbacks.remove(dev_id);
+    }
+
+    /// Looks up and returns the device with the specified device ID.
     ///
-    /// # 参数
-    /// - `dev_id` - 我们要查找的设备的设备ID。
+    /// # Parameters
+    /// - `dev_id` - The device ID of the device to look up.
     ///
-    /// # 返回
-    /// - 如果找到了设备，返回一个包含设备的`Option<Arc<dyn VirtIODevice>>`。
-    /// - 如果没有找到设备，返回`None`。
+    /// # Returns
+    /// - If the device is found, returns `Some` containing the device.
+    /// - If no device is found, returns `None`.
     pub fn lookup_device(&self, dev_id: &Arc<DeviceId>) -> Option<Arc<dyn VirtIODevice>> {
         let map = self.map.read_irqsave();
         map.get(dev_id).cloned()
+    }
+
+    pub fn lookup_callback(&self, dev_id: &Arc<DeviceId>) -> Option<Arc<dyn VirtioIrqCallback>> {
+        let callbacks = self.callbacks.read_irqsave();
+        callbacks.get(dev_id).cloned()
     }
 }
 
@@ -92,13 +134,14 @@ fn init_virtio_irq_manager() -> Result<(), SystemError> {
     return Ok(());
 }
 
-/// `DefaultVirtioIrqHandler` 是一个默认的virtio设备中断处理程序。
+/// `DefaultVirtioIrqHandler` is the default interrupt handler for virtio devices.
 ///
-/// 当虚拟设备产生中断时，该处理程序会被调用。
+/// This handler is invoked when a virtio device raises an interrupt.
 ///
-/// 它首先检查设备ID是否存在，然后尝试查找与设备ID关联的设备。
-/// 如果找到设备，它会调用设备的 `handle_irq` 方法来处理中断。
-/// 如果没有找到设备，它会记录一条警告并返回 `IrqReturn::NotHandled`，表示中断未被处理。
+/// It first checks whether the device ID exists, then attempts to look up the device
+/// (or callback) associated with the device ID. If a device or callback is found, it
+/// delegates interrupt handling to it. Otherwise it returns `IrqReturn::NotHandled`,
+/// indicating that the interrupt was not handled.
 #[derive(Debug)]
 pub(super) struct DefaultVirtioIrqHandler;
 
@@ -117,8 +160,10 @@ impl IrqHandler for DefaultVirtioIrqHandler {
 
         if let Some(dev) = virtio_irq_manager().lookup_device(&dev_id) {
             return dev.handle_irq(irq);
+        } else if let Some(callback) = virtio_irq_manager().lookup_callback(&dev_id) {
+            return callback.handle_irq(irq);
         } else {
-            // 未绑定具体设备，因此无法处理中断
+            // No device or callback bound, so the interrupt cannot be handled
             // warn!("No device found for IRQ: {:?}", irq);
             return Ok(IrqReturn::NotHandled);
         }

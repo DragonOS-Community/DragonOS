@@ -23,7 +23,10 @@ pub fn send_ipi(kind: IpiKind, target: IpiTarget) {
     match kind {
         IpiKind::KickCpu => todo!(),
         IpiKind::StopCpu => todo!(),
-        IpiKind::FlushTLB => RiscV64MMArch::remote_invalidate_all_with_mask(mask).ok(),
+        IpiKind::FlushTLB => {
+            RiscV64MMArch::remote_invalidate_all_with_mask(mask)
+                .expect("SBI remote TLB invalidation failed; refusing unsafe page retirement");
+        }
         IpiKind::SpecVector(_) => todo!(),
     };
 }

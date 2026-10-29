@@ -1,0 +1,1028 @@
+use super::*;
+use crate::net::conntrack::CtPacketContext;
+
+kernel_cmdline_param_arg!(
+    NET_TEST_FIXTURES_PARAM,
+    "dragonos.net_test_fixtures",
+    false,
+    false
+);
+
+/// Whether boot-only networking fixtures should be installed in the initial
+/// network namespace. Production boots leave this disabled; test runners opt
+/// in explicitly so synthetic veth and bridge devices cannot pollute the
+/// system route table or device namespace.
+pub(crate) fn net_test_fixtures_enabled() -> bool {
+    NET_TEST_FIXTURES_PARAM.value_bool().unwrap_or(false)
+}
+
+bitflags! {
+    pub struct NetDeivceState: u16 {
+        /// 表示网络设备已经启动
+        const __LINK_STATE_START = 1 << 0;
+        /// 表示网络设备在系统中存在，即注册到sysfs中
+        const __LINK_STATE_PRESENT = 1 << 1;
+        /// 表示网络设备没有检测到载波信号
+        const __LINK_STATE_NOCARRIER = 1 << 2;
+        /// 表示设备的链路监视操作处于挂起状态
+        const __LINK_STATE_LINKWATCH_PENDING = 1 << 3;
+        /// 表示设备处于休眠状态
+        const __LINK_STATE_DORMANT = 1 << 4;
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+#[allow(dead_code, non_camel_case_types)]
+pub enum Operstate {
+    /// 网络接口的状态未知
+    IF_OPER_UNKNOWN = 0,
+    /// 网络接口不存在
+    IF_OPER_NOTPRESENT = 1,
+    /// 网络接口已禁用或未连接
+    IF_OPER_DOWN = 2,
+    /// 网络接口的下层接口已关闭
+    IF_OPER_LOWERLAYERDOWN = 3,
+    /// 网络接口正在测试
+    IF_OPER_TESTING = 4,
+    /// 网络接口处于休眠状态
+    IF_OPER_DORMANT = 5,
+    /// 网络接口已启用
+    IF_OPER_UP = 6,
+}
+
+/// Runtime IP-MTU limits supported by one interface implementation.
+///
+/// The control plane owns validation; drivers only describe the bounds that
+/// their current buffers and the smoltcp projection can safely represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtuBounds {
+    pub min: usize,
+    pub max: usize,
+}
+
+/// Control-plane metadata attached to one configured interface address.
+///
+/// `label == None` means the interface's current primary name. Keeping that
+/// distinction avoids stale labels after a device rename while preserving an
+/// explicitly supplied Linux IFA_LABEL alias verbatim.
+#[derive(Debug, Clone)]
+pub(crate) struct AddressMetadata {
+    pub cidr: smoltcp::wire::IpCidr,
+    pub label: Option<CString>,
+    /// The explicit IPv4 IFA_BROADCAST value, independent of the CIDR-derived broadcast.
+    pub broadcast: Option<smoltcp::wire::Ipv4Address>,
+}
+
+/// Lossless route state accumulated while an interface is being constructed.
+///
+/// This is only a hand-off buffer: once the interface is published, its
+/// network namespace FIB owns the route and the smoltcp table is a projection
+/// of that FIB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BootstrapRoute {
+    pub destination: smoltcp::wire::IpCidr,
+    pub source: Option<smoltcp::wire::IpCidr>,
+    pub preferred_source: Option<smoltcp::wire::IpAddress>,
+    pub table: u32,
+    pub priority: u32,
+    pub tos: u8,
+    pub protocol: u8,
+    pub scope: u8,
+    pub kind: u8,
+    pub oif: u32,
+    pub gateway: Option<smoltcp::wire::IpAddress>,
+    pub nexthop_flags: u8,
+}
+
+#[derive(Debug)]
+pub enum RouteSendError {
+    /// Neighbor discovery has started; retrying before this deadline cannot progress it.
+    RetryAt {
+        retry_at: smoltcp::time::Instant,
+        probe_sent: bool,
+    },
+    /// A device or packet error with normal errno semantics.
+    Failed(SystemError),
+}
+
+impl From<SystemError> for RouteSendError {
+    fn from(error: SystemError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Why an IP datagram enters another local protocol stack. Output-originated
+/// local delivery enters the receive path as loopback input and traverses
+/// PRE_ROUTING once. An inter-interface handoff preserves whether that hook
+/// has already executed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalPacketOrigin {
+    LinkIngressPending,
+    LinkIngressPreRouted,
+    LocalOutput,
+    LocalInputDone,
+}
+
+/// Internal handoff keeps an unconfirmed connection identity with its packet
+/// without exposing conntrack internals through the public `Iface` trait.
+/// Local output can carry that identity into loopback PRE_ROUTING; a fresh
+/// link-ingress packet must never inherit one.
+pub(crate) fn inject_owned_local_ip_packet_with_context<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: PacketBuffer,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+) -> Result<(), SystemError> {
+    inject_owned_local_ip_packet_with_context_and_mark(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance at local handoff"
+)]
+pub(crate) fn inject_owned_local_ip_packet_with_context_and_mark<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: PacketBuffer,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+) -> Result<(), SystemError> {
+    inject_owned_local_ip_packet_if_epoch(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        mark,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance and device ownership at local handoff"
+)]
+pub(crate) fn inject_owned_local_ip_packet_if_epoch<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: PacketBuffer,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+    expected_epoch: Option<u64>,
+) -> Result<(), SystemError> {
+    inject_owned_local_ip_packet_if_epoch_with_fragment(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        mark,
+        expected_epoch,
+        None,
+    )
+}
+
+/// Only a completed defragmentation may supply `forward_fragment`; ordinary
+/// local handoffs retain their existing ingress provenance and behavior.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance and device ownership at local handoff"
+)]
+pub(crate) fn inject_owned_local_ip_packet_if_epoch_with_fragment<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: PacketBuffer,
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+    expected_epoch: Option<u64>,
+    forward_fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+) -> Result<(), SystemError> {
+    if ct_context.is_some() && origin == LocalPacketOrigin::LinkIngressPending {
+        return Err(SystemError::EINVAL);
+    }
+    let packet = LocalInputPacket {
+        ingress_ifindex,
+        ingress_stage: match origin {
+            LocalPacketOrigin::LinkIngressPending => IngressStage::Pending,
+            LocalPacketOrigin::LinkIngressPreRouted => IngressStage::PreRoutingDone,
+            LocalPacketOrigin::LocalOutput => IngressStage::LocalOutput,
+            LocalPacketOrigin::LocalInputDone => IngressStage::LocalInputDone,
+        },
+        broadcast,
+        destination_mac: if broadcast {
+            smoltcp::wire::EthernetAddress::BROADCAST
+        } else {
+            iface.mac()
+        },
+        source_mac,
+        ip_packet,
+        ct_context,
+        mark,
+        forward_fragment,
+    };
+
+    let napi = iface.napi_struct();
+    let netns = napi.is_none().then(|| iface.net_namespace()).flatten();
+    if napi.is_none() && netns.is_none() {
+        return Err(SystemError::ENODEV);
+    }
+    iface.common().enqueue_local_input(packet, expected_epoch)?;
+    iface
+        .common()
+        .namespace_routed_stack
+        .store(true, Ordering::Release);
+    if let Some(napi) = napi {
+        napi::napi_schedule(napi);
+    } else if let Some(netns) = netns {
+        netns.wakeup_poll_thread();
+    }
+    Ok(())
+}
+
+/// Copy only the wire bytes when the output queue must retain its original
+/// datagram (for example, a fragment that may be retried). The CT identity is
+/// cloned by the caller so this handoff cannot consume the original's state.
+pub(crate) fn inject_local_ip_packet_with_context<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: &[u8],
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+) -> Result<(), SystemError> {
+    inject_local_ip_packet_with_context_and_mark(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        ip_packet,
+        broadcast,
+        origin,
+        ct_context,
+        0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit packet provenance at local handoff"
+)]
+pub(crate) fn inject_local_ip_packet_with_context_and_mark<I: Iface + ?Sized>(
+    iface: &I,
+    ingress_ifindex: u32,
+    source_mac: smoltcp::wire::EthernetAddress,
+    ip_packet: &[u8],
+    broadcast: bool,
+    origin: LocalPacketOrigin,
+    ct_context: Option<CtPacketContext>,
+    mark: u32,
+) -> Result<(), SystemError> {
+    let owned_packet = PacketBuffer::try_from_slice(ip_packet)?;
+    inject_owned_local_ip_packet_with_context_and_mark(
+        iface,
+        ingress_ifindex,
+        source_mac,
+        owned_packet,
+        broadcast,
+        origin,
+        ct_context,
+        mark,
+    )
+}
+
+#[allow(dead_code)]
+pub trait Iface: crate::driver::base::device::Device {
+    /// # `common`
+    /// 获取网卡的公共信息
+    fn common(&self) -> &IfaceCommon;
+
+    /// Whether this software device may be destroyed when its owning
+    /// non-initial network namespace reaches final release. Devices which
+    /// require Linux-style migration back to init_net keep the default.
+    fn destroy_on_netns_exit(&self) -> bool {
+        false
+    }
+
+    /// # `mac`
+    /// 获取网卡的MAC地址
+    ///
+    /// This method is used from the RX data path while the caller may already
+    /// hold [`IfaceCommon::smol_iface`]. Implementations must therefore read
+    /// device metadata directly and must not acquire `smol_iface` again.
+    fn mac(&self) -> smoltcp::wire::EthernetAddress;
+
+    /// # `name`
+    /// 获取网卡名
+    fn iface_name(&self) -> String;
+
+    /// # `nic_id`
+    /// 获取网卡id
+    fn nic_id(&self) -> usize {
+        self.common().iface_id
+    }
+
+    /// # `poll`
+    /// 用于轮询网卡，处理网络事件
+    /// ## 返回值
+    /// - `true`：表示有网络事件发生
+    /// - `false`：表示没有网络事件
+    fn poll(&self) -> bool;
+
+    /// # `poll_napi`
+    /// NAPI（类似 Linux softirq/ksoftirqd）使用的 bounded poll。
+    ///
+    /// 返回本次实际处理量，以及是否需要立即再次 poll。
+    fn poll_napi(&self, budget: usize) -> napi::NapiPollResult;
+
+    /// Called after this NAPI instance acquires `SCHED`, before it is published.
+    /// Devices with interrupt mitigation may mask callbacks here.
+    #[inline]
+    fn napi_poll_begin(&self) {}
+
+    /// Complete one NAPI ownership cycle. Devices may override this to pair
+    /// callback re-enabling with the `SCHED/MISSED` transition.
+    #[inline]
+    fn napi_complete(&self, napi: Arc<napi::NapiStruct>) {
+        napi::napi_complete(napi);
+    }
+
+    /// # `raw_transmit`
+    /// Send a raw Ethernet frame (for AF_PACKET).
+    ///
+    /// By default returns `ENOSYS`; concrete NIC drivers should override this
+    /// method to send frames directly through the underlying `phy::Device`
+    /// TX channel, bypassing the smoltcp stack.
+    fn raw_transmit(&self, _frame: &[u8]) -> Result<(), SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    /// Submit a frame whose allocation may be transferred to the driver.
+    /// Drivers with an owned receive queue can override this to avoid copying;
+    /// borrowed-only DMA drivers keep the common fallback.
+    fn raw_transmit_owned(&self, frame: PacketBuffer) -> Result<(), SystemError> {
+        self.raw_transmit(&frame)
+    }
+
+    /// Sends an already-routed IP packet through this interface.
+    ///
+    /// Ethernet devices share this implementation so FIB eligibility cannot
+    /// drift from driver-specific forwarding hooks. smoltcp resolves the
+    /// explicit next hop (or uses a permanent rtnetlink neighbor) while the
+    /// caller-owned token only prepares a frame. The driver is invoked after
+    /// releasing the smoltcp lock.
+    fn route_and_send(
+        &self,
+        next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+    ) -> Result<(), RouteSendError> {
+        // A short original packet may instead emit an ARP request or an
+        // IPv6 Neighbor Solicitation (Ethernet + IPv6 + NS with SLLAO).
+        let frame_capacity = ip_packet
+            .len()
+            .checked_add(14)
+            .ok_or(SystemError::ENOMEM)?
+            .max(86);
+        let mut frame = PacketBuffer::try_with_capacity(frame_capacity)?;
+        let frame_prepared = Cell::new(false);
+        let permanent_neighbor = match next_hop {
+            smoltcp::wire::IpAddress::Ipv4(address)
+                if self.common().has_explicit_ipv4_broadcast(*address) =>
+            {
+                Some(smoltcp::wire::HardwareAddress::Ethernet(
+                    smoltcp::wire::EthernetAddress::BROADCAST,
+                ))
+            }
+            _ => self
+                .net_namespace()
+                .and_then(|netns| {
+                    crate::net::neighbor::lookup(&netns, self.nic_id() as u32, *next_hop)
+                })
+                .map(smoltcp::wire::HardwareAddress::Ethernet),
+        };
+
+        let dispatch = {
+            // Linux arp_announce=0 announces a namespace-local IP source,
+            // including an address owned by another interface. Forwarded
+            // remote sources must instead use the egress interface fallback.
+            let arp_source = smoltcp::wire::Ipv4Packet::new_checked(ip_packet)
+                .ok()
+                .filter(|packet| packet.version() == 4)
+                .map(|packet| packet.src_addr())
+                .filter(|source| {
+                    self.net_namespace().is_some_and(|netns| {
+                        crate::net::route::ipv4_addr_type(&netns, *source)
+                            == crate::net::route::RTN_LOCAL
+                    })
+                })
+                .map(smoltcp::wire::IpAddress::Ipv4);
+            let mut interface = self.smol_iface().lock();
+            interface.dispatch_ip_packet_with_arp_source(
+                crate::time::Instant::now().into(),
+                PreparedFrameTxToken {
+                    frame: &mut frame,
+                    prepared: &frame_prepared,
+                },
+                *next_hop,
+                permanent_neighbor,
+                ip_packet,
+                arp_source,
+            )
+        };
+
+        let probe_sent = frame_prepared.get();
+        if probe_sent {
+            self.raw_transmit_owned(frame)
+                .map_err(RouteSendError::Failed)?;
+        }
+        match dispatch {
+            Ok(()) => Ok(()),
+            Err(smoltcp::iface::IpPacketDispatchError::NeighborPending { retry_at }) => {
+                Err(RouteSendError::RetryAt {
+                    retry_at,
+                    probe_sent,
+                })
+            }
+            Err(smoltcp::iface::IpPacketDispatchError::NoRoute) => {
+                Err(SystemError::ENETUNREACH.into())
+            }
+            Err(smoltcp::iface::IpPacketDispatchError::Exhausted) => {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK.into())
+            }
+            Err(smoltcp::iface::IpPacketDispatchError::Malformed)
+            | Err(smoltcp::iface::IpPacketDispatchError::InvalidHardwareAddress) => {
+                Err(SystemError::EINVAL.into())
+            }
+        }
+    }
+
+    /// Send an already-routed IP packet, transferring ownership to this
+    /// interface's bounded output queue when immediate progress is impossible.
+    /// The caller may consume the ingress packet after this returns `Ok(())`.
+    fn route_and_send_or_queue(
+        &self,
+        next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+    ) -> Result<(), SystemError> {
+        self.route_and_send_or_queue_with_fragment(next_hop, ip_packet, None, None)
+    }
+
+    /// Keep reassembly provenance with a forwarded datagram through queue
+    /// admission; a plain packet must never gain the router-only exception.
+    fn route_and_send_or_queue_with_fragment(
+        &self,
+        next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+        fragment_info: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
+        feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
+    ) -> Result<(), SystemError> {
+        let next_hop = *next_hop;
+        if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 && self.mtu() < 1280 {
+            // A static route can survive an MTU change which disabled IPv6
+            // addresses on this link. It must not forward over that link.
+            return Err(SystemError::ENETDOWN);
+        }
+        let napi = self.napi_struct();
+        let owner_netns = self.net_namespace();
+        let scheduler_netns = napi.is_none().then(|| owner_netns.clone()).flatten();
+        if napi.is_none() && scheduler_netns.is_none() {
+            return Err(SystemError::ENODEV);
+        }
+        if ip_packet.len() > self.mtu()
+            || fragment_info.is_some_and(|info| {
+                ip_packet.len()
+                    > if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 {
+                        info.max_original_fragment_len.max(1280)
+                    } else {
+                        info.max_original_fragment_len
+                    }
+            })
+        {
+            // A forwarded datagram has already passed the packet hooks. Admit
+            // it whole and let the existing bounded output queue emit its
+            // fragments after resolving the next hop.
+            let (packet, reservation) = self.common().prepare_routed_output(
+                self.nic_id() as u32,
+                next_hop,
+                ip_packet,
+                fragment_info,
+                feedback,
+            )?;
+            reservation.requeue_ready(packet);
+            self.common().schedule_local_output(
+                crate::time::Instant::now().into(),
+                napi,
+                scheduler_netns,
+            );
+            return Ok(());
+        }
+        if let Some(retry_at) = self.common().enqueue_existing_routed_output(
+            self.nic_id() as u32,
+            next_hop,
+            ip_packet,
+            fragment_info,
+            feedback,
+        )? {
+            self.common()
+                .schedule_local_output(retry_at, napi, scheduler_netns);
+            return Ok(());
+        }
+        let tx_generation = self.common().tx_completion_generation();
+        let (retry_at, probe_sent) = match self.route_and_send(&next_hop, ip_packet) {
+            Ok(()) => return Ok(()),
+            Err(RouteSendError::RetryAt {
+                retry_at,
+                probe_sent,
+            }) => (retry_at, probe_sent),
+            Err(RouteSendError::Failed(SystemError::ENOBUFS))
+            | Err(RouteSendError::Failed(SystemError::EAGAIN_OR_EWOULDBLOCK)) => {
+                let now: smoltcp::time::Instant = crate::time::Instant::now().into();
+                let delay_us = self.common().next_local_output_tx_backoff_us();
+                let retry_at = now + smoltcp::time::Duration::from_micros(delay_us);
+                let (packet, reservation) = self.common().prepare_routed_output(
+                    self.nic_id() as u32,
+                    next_hop,
+                    ip_packet,
+                    fragment_info,
+                    feedback,
+                )?;
+                reservation.requeue_backpressured(packet, retry_at);
+                let retry_at = if self.common().release_tx_backpressure_after(tx_generation) {
+                    now
+                } else {
+                    retry_at
+                };
+                self.common()
+                    .schedule_local_output(retry_at, napi, scheduler_netns);
+                return Ok(());
+            }
+            Err(RouteSendError::Failed(error)) => return Err(error),
+        };
+
+        self.common().enqueue_routed_output(
+            self.nic_id() as u32,
+            next_hop,
+            ip_packet,
+            retry_at,
+            probe_sent,
+            fragment_info,
+            feedback,
+        )?;
+        let retry_at = if owner_netns.as_ref().is_some_and(|netns| {
+            crate::net::neighbor::release_deferred_after_enqueue(
+                netns,
+                self.common(),
+                self.nic_id() as u32,
+                next_hop,
+            )
+        }) {
+            crate::time::Instant::now().into()
+        } else {
+            retry_at
+        };
+        self.common()
+            .schedule_local_output(retry_at, napi, scheduler_netns);
+        Ok(())
+    }
+
+    /// Hands a namespace-local IP packet to this interface's protocol stack
+    /// without emitting it on the link. The shared queue in `IfaceCommon`
+    /// makes local delivery a protocol-stack capability rather than an
+    /// optional device-driver feature.
+    fn inject_local_ip_packet(
+        &self,
+        ingress_ifindex: u32,
+        source_mac: smoltcp::wire::EthernetAddress,
+        ip_packet: &[u8],
+        broadcast: bool,
+        origin: LocalPacketOrigin,
+    ) -> Result<(), SystemError> {
+        inject_local_ip_packet_with_context(
+            self,
+            ingress_ifindex,
+            source_mac,
+            ip_packet,
+            broadcast,
+            origin,
+            None,
+        )
+    }
+
+    /// Move an IP datagram to its local socket owner without another copy.
+    /// The caller supplies the packet's trusted ingress provenance. A routed
+    /// packet marked PRE_ROUTING-complete keeps its original interface/MAC
+    /// and must not execute that hook again at the owner.
+    fn inject_owned_local_ip_packet(
+        &self,
+        ingress_ifindex: u32,
+        source_mac: smoltcp::wire::EthernetAddress,
+        ip_packet: PacketBuffer,
+        broadcast: bool,
+        origin: LocalPacketOrigin,
+    ) -> Result<(), SystemError> {
+        inject_owned_local_ip_packet_with_context(
+            self,
+            ingress_ifindex,
+            source_mac,
+            ip_packet,
+            broadcast,
+            origin,
+            None,
+        )
+    }
+
+    /// @brief 获取smoltcp的网卡接口类型
+    #[inline(always)]
+    fn smol_iface(&self) -> &Mutex<smoltcp::iface::Interface> {
+        &self.common().smol_iface
+    }
+    // fn as_any_ref(&'static self) -> &'static dyn core::any::Any;
+
+    /// # `sockets`
+    /// 获取网卡的套接字集
+    fn sockets(&self) -> Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>> {
+        self.common().sockets.read().clone()
+    }
+
+    fn addr_assign_type(&self) -> u8;
+
+    fn net_device_type(&self) -> u16;
+
+    fn net_state(&self) -> NetDeivceState;
+
+    fn set_net_state(&self, state: NetDeivceState);
+
+    /// Clear lifecycle state bits previously set with `set_net_state`.
+    fn clear_net_state(&self, state: NetDeivceState);
+
+    fn operstate(&self) -> Operstate;
+
+    fn set_operstate(&self, state: Operstate);
+
+    fn net_namespace(&self) -> Option<Arc<NetNamespace>> {
+        self.common().net_namespace()
+    }
+
+    fn set_net_namespace(&self, ns: Arc<NetNamespace>) -> Result<(), SystemError> {
+        self.common().set_net_namespace(ns)
+    }
+
+    fn clear_net_namespace(&self) {
+        self.common().clear_net_namespace();
+    }
+
+    fn flags(&self) -> InterfaceFlags {
+        self.common().flags()
+    }
+
+    /// Flags exported through Linux network-device user APIs.
+    ///
+    /// Like Linux `dev_get_flags()`, runtime flags are derived from the
+    /// device lifecycle, operational state, and carrier state instead of
+    /// exposing their cached initialization values.
+    fn user_visible_flags(&self) -> InterfaceFlags {
+        self.project_user_visible_flags(self.common().configured_flags())
+    }
+
+    /// Project one configured-flags snapshot into the Linux userspace view.
+    fn project_user_visible_flags(&self, mut flags: InterfaceFlags) -> InterfaceFlags {
+        flags.remove(InterfaceFlags::RUNNING | InterfaceFlags::LOWER_UP | InterfaceFlags::DORMANT);
+
+        let state = self.net_state();
+        if !state.contains(NetDeivceState::__LINK_STATE_START) {
+            return flags;
+        }
+
+        if matches!(
+            self.operstate(),
+            Operstate::IF_OPER_UP | Operstate::IF_OPER_UNKNOWN
+        ) {
+            flags.insert(InterfaceFlags::RUNNING);
+        }
+        if !state.contains(NetDeivceState::__LINK_STATE_NOCARRIER) {
+            flags.insert(InterfaceFlags::LOWER_UP);
+        }
+        if state.contains(NetDeivceState::__LINK_STATE_DORMANT) {
+            flags.insert(InterfaceFlags::DORMANT);
+        }
+        flags
+    }
+
+    fn type_(&self) -> InterfaceType {
+        self.common().type_()
+    }
+
+    fn mtu(&self) -> usize;
+
+    /// Inclusive runtime IP-MTU limits for this device.
+    fn mtu_bounds(&self) -> MtuBounds;
+
+    /// Project a userspace-visible device MTU into the shared network stack.
+    ///
+    /// Most devices have an identity projection. Implementations whose ABI
+    /// MTU exceeds a protocol limit supported by the stack may derive a
+    /// smaller value here; the configured MTU remains the sole stored state.
+    /// Every value accepted by `mtu_bounds()` must project to a value accepted
+    /// by this interface's smoltcp device capabilities.
+    fn stack_mtu(&self, configured_mtu: usize) -> usize {
+        configured_mtu
+    }
+
+    /// Stop new device notifications or software ingress admission before the
+    /// shared NAPI owner is paused. This must not fail, allocate, or block.
+    fn begin_admin_down(&self) {}
+
+    /// Wait for device-private ingress which started before administrative
+    /// DOWN to finish, then discard queued software ingress. The shared link
+    /// core invokes this after pausing NAPI and before taking the FIB writer,
+    /// so implementations may block but must not acquire RTNL.
+    fn quiesce_admin_down(&self) {}
+
+    /// Publishes device-private data-path state for a real administrative
+    /// UP/DOWN transition. Implementations must not allocate, fail, sleep, or
+    /// acquire RTNL/FIB/smoltcp locks: the caller holds RTNL and the FIB writer
+    /// after all preparation has succeeded. NAPI lifecycle is managed by the
+    /// shared link core rather than by this driver hook.
+    fn publish_admin_state(&self, _is_up: bool) {}
+
+    /// # 获取当前iface的napi结构体
+    /// 默认返回None，表示不支持napi
+    fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
+        self.common().napi_struct.read().clone()
+    }
+
+    fn router_common(&self) -> &RouterEnableDeviceCommon {
+        &self.common().router_common_data
+    }
+}
+
+struct PreparedFrameTxToken<'a> {
+    frame: &'a mut PacketBuffer,
+    prepared: &'a Cell<bool>,
+}
+
+impl SmolTxToken for PreparedFrameTxToken<'_> {
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), smoltcp::phy::TxEgressError> {
+        if len > self.frame.capacity() {
+            return Err(smoltcp::phy::TxEgressError::Exhausted);
+        }
+        Ok(())
+    }
+
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        self.frame
+            .resize(len, 0)
+            .expect("TX consume must fit the prepared frame");
+        let result = f(self.frame.as_mut_slice());
+        self.prepared.set(true);
+        result
+    }
+}
+
+/// 网络设备的公共数据
+#[derive(Debug)]
+pub struct NetDeviceCommonData {
+    /// 表示网络接口的地址分配类型
+    pub addr_assign_type: u8,
+    /// 表示网络接口的类型
+    pub net_device_type: u16,
+    /// 表示网络接口的状态
+    pub state: NetDeivceState,
+    /// 表示网络接口的操作状态
+    pub operstate: Operstate,
+}
+
+impl Default for NetDeviceCommonData {
+    fn default() -> Self {
+        Self {
+            addr_assign_type: 0,
+            net_device_type: 1,
+            state: NetDeivceState::empty(),
+            operstate: Operstate::IF_OPER_UNKNOWN,
+        }
+    }
+}
+
+/// 将网络设备注册到sysfs中
+/// 参考：https://code.dragonos.org.cn/xref/linux-2.6.39/net/core/dev.c?fi=register_netdev#5373
+pub(crate) fn register_netdevice(
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    let rtnl = crate::net::rtnl::lock();
+    register_netdevice_locked(&rtnl, netns, dev)
+}
+
+/// Register while RTNL is already held by a rtnetlink control operation.
+pub(crate) fn register_netdevice_locked(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    if !Arc::ptr_eq(
+        netns,
+        &crate::process::namespace::net_namespace::INIT_NET_NAMESPACE,
+    ) && !dev.destroy_on_netns_exit()
+    {
+        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    }
+
+    // Register driver-core/sysfs first. Until PRESENT and the namespace/FIB
+    // transaction both commit, the object is provisional and unannounced.
+    netdev_register_kobject(netns, dev.clone())?;
+    if let Err(error) = register_netdevice_in_namespace_locked(rtnl, netns, dev.clone()) {
+        // No add uevent has been sent, so rollback is structural and must not
+        // allocate notification state before removing the provisional object.
+        netdev_unregister_kobject(dev);
+        return Err(error);
+    }
+
+    if let Some(napi) = dev.napi_struct() {
+        napi::napi_enable(&napi);
+    }
+
+    netdev_emit_uevent(dev, "add");
+
+    Ok(())
+}
+
+/// Publishes a netdevice in one network namespace without creating a global
+/// sysfs projection. This is the common registration lifecycle used by
+/// per-netns devices: PRESENT is owned here and rolled back if topology/FIB
+/// insertion fails.
+pub(crate) fn register_netdevice_in_namespace(
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    let rtnl = crate::net::rtnl::lock();
+    register_netdevice_in_namespace_locked(&rtnl, netns, dev)
+}
+
+pub(crate) fn register_netdevice_in_namespace_locked(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    dev.set_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+    if let Err(error) = netns.add_device_locked(rtnl, dev.clone()) {
+        dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Remove a software netdevice from a live namespace. RTNL serializes the
+/// topology change; no NAPI owner or TX admission may survive publication.
+pub(crate) fn unregister_netdevice_locked(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    dev: Arc<dyn Iface>,
+) -> Result<(), SystemError> {
+    let prepared = prepare_unregister_netdevices_locked(rtnl, netns, core::slice::from_ref(&dev))?;
+    prepared.quiesce();
+    prepared.publish_quiesced();
+    Ok(())
+}
+
+/// A removal whose FIB and namespace-map work is already prepared. RTNL must
+/// remain held until publication; no allocation may be needed after quiesce.
+pub(crate) struct PreparedNetdeviceRemoval<'rtnl> {
+    devices: Vec<Arc<dyn Iface>>,
+    namespace: crate::process::namespace::net_namespace::PreparedNetnsDeviceRemoval<'rtnl>,
+}
+
+impl PreparedNetdeviceRemoval<'_> {
+    pub(crate) fn quiesce(&self) {
+        for dev in &self.devices {
+            dev.common().close_tx_and_wait();
+            dev.begin_admin_down();
+        }
+        for dev in &self.devices {
+            if let Some(napi) = dev.napi_struct() {
+                napi::napi_pause_and_wait(&napi);
+            }
+            dev.quiesce_admin_down();
+        }
+    }
+
+    /// The caller has already stopped every device, for example by shutting
+    /// down both veth endpoints together before either is unpublished.
+    pub(crate) fn publish_quiesced(self) {
+        for dev in &self.devices {
+            if let Some(napi) = dev.napi_struct() {
+                if !napi::napi_is_disabled(&napi) {
+                    napi::napi_disable(&napi);
+                }
+            }
+            dev.common().retire_for_device_removal();
+        }
+        self.namespace.publish();
+        for dev in self.devices {
+            // Keep the old namespace and sysfs identity through the event.
+            netdev_emit_uevent(dev.clone(), "remove");
+            dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
+            netdev_unregister_kobject(dev.clone());
+            dev.clear_net_namespace();
+        }
+    }
+
+    /// A namespace move preserves the netdevice and its sysfs inode. The
+    /// prepared target addition publishes the new owner after this step.
+    pub(crate) fn publish_moving(self) {
+        self.namespace.publish();
+        for dev in self.devices {
+            dev.clear_net_namespace();
+        }
+    }
+}
+
+pub(crate) fn prepare_unregister_netdevices_locked<'rtnl>(
+    rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    devices: &[Arc<dyn Iface>],
+) -> Result<PreparedNetdeviceRemoval<'rtnl>, SystemError> {
+    prepare_unregister_netdevices_from_locked(rtnl, netns, devices, None)
+}
+
+pub(crate) fn prepare_unregister_netdevices_from_locked<'rtnl>(
+    rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    devices: &[Arc<dyn Iface>],
+    staged_before: Option<crate::net::link::StagedLinkFib<'_>>,
+) -> Result<PreparedNetdeviceRemoval<'rtnl>, SystemError> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(devices.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for dev in devices {
+        if !dev
+            .net_namespace()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
+        {
+            return Err(SystemError::ENODEV);
+        }
+        owned.push(dev.clone());
+    }
+    let namespace = netns.prepare_remove_devices_from_locked(rtnl, &owned, staged_before)?;
+    Ok(PreparedNetdeviceRemoval {
+        devices: owned,
+        namespace,
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct ReceiveModeState {
+    pub(super) configured_flags: u32,
+    pub(super) packet_promiscuity: u32,
+    pub(super) packet_allmulti: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinkFlagsSnapshot {
+    pub configured: InterfaceFlags,
+    pub promiscuity: u32,
+    pub allmulti: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedConfiguredFlags {
+    pub(super) old: InterfaceFlags,
+    pub(super) new: InterfaceFlags,
+}
+
+impl PreparedConfiguredFlags {
+    pub(crate) fn old_flags(self) -> InterfaceFlags {
+        self.old
+    }
+
+    pub(crate) fn new_flags(self) -> InterfaceFlags {
+        self.new
+    }
+}

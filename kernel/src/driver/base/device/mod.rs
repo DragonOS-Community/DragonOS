@@ -2,6 +2,7 @@ use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use intertrait::cast::CastArc;
 use log::{error, warn};
@@ -13,6 +14,7 @@ use crate::{
     },
     exception::irqdata::IrqHandlerData,
     filesystem::{
+        devfs::{devfs_create_node_dyn, devfs_unregister_dyn, DeviceINode},
         kernfs::KernFSInode,
         sysfs::{
             file::sysfs_emit_str, sysfs_instance, Attribute, AttributeGroup, SysFSOps,
@@ -21,6 +23,7 @@ use crate::{
         vfs::InodeMode,
     },
     libs::{
+        mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::{SpinLock, SpinLockGuard},
     },
@@ -31,7 +34,8 @@ use core::{fmt::Display, intrinsics::unlikely, ops::Deref};
 use system_error::SystemError;
 
 use self::{
-    bus::{bus_add_device, bus_probe_device, Bus},
+    bus::{bus_add_device, bus_probe_device, Bus, BusNotifyEvent},
+    dd::{block_device_bindings_and_wait, DeviceAttrCoredump, DeviceAttrStateSynced},
     device_number::{DeviceNumber, Major},
     driver::Driver,
 };
@@ -69,6 +73,56 @@ lazy_static! {
     // 全局设备管理实例
     pub static ref DEVMAP: Arc<LockedKObjMap> = Arc::new(LockedKObjMap::default());
 
+    static ref REMOVING_DEVICES: SpinLock<Vec<Weak<dyn Device>>> = SpinLock::new(Vec::new());
+
+    /// Serializes probe, unbind and removal for each device.
+    ///
+    /// Device implementations currently keep [`DeviceCommonData`] behind their own locks, so the
+    /// driver core cannot borrow a sleeping lock from that data without changing every device
+    /// type.  Keep the lock in the core, keyed by the allocation identity of the device instead.
+    /// The weak reference prevents this table from extending a device's lifetime.
+    static ref DEVICE_LIFECYCLE_LOCKS: Mutex<DeviceLifecycleLocks> =
+        Mutex::new(DeviceLifecycleLocks::new());
+}
+
+const LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS: usize = 64;
+
+#[derive(Debug)]
+struct DeviceLifecycleLocks {
+    entries: BTreeMap<usize, DeviceLifecycleLock>,
+    insertions_until_cleanup: usize,
+}
+
+impl DeviceLifecycleLocks {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            insertions_until_cleanup: LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS,
+        }
+    }
+
+    fn insert(&mut self, identity: usize, entry: DeviceLifecycleLock) {
+        self.entries.insert(identity, entry);
+        debug_assert!(self.insertions_until_cleanup > 0);
+        self.insertions_until_cleanup -= 1;
+
+        if self.insertions_until_cleanup == 0 {
+            self.entries
+                .retain(|_, entry| entry.device.strong_count() != 0);
+            // Scan at most once per current table size.  This keeps cleanup work amortized while
+            // still reclaiming dead identities in workloads which repeatedly create devices.
+            self.insertions_until_cleanup = self
+                .entries
+                .len()
+                .max(LIFECYCLE_LOCK_CLEANUP_MIN_INSERTIONS);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeviceLifecycleLock {
+    device: Weak<dyn Device>,
+    lock: Arc<Mutex<()>>,
 }
 
 /// `/sys/devices` 的 kset 实例
@@ -539,6 +593,11 @@ impl SysFSOps for DeviceSysFSOps {
 #[derive(Debug)]
 pub struct DeviceManager;
 
+struct DevtmpfsNode {
+    name: String,
+    inode: Arc<dyn DeviceINode>,
+}
+
 impl DeviceManager {
     /// @brief: 创建一个新的设备管理器
     /// @parameter: None
@@ -546,6 +605,36 @@ impl DeviceManager {
     #[inline]
     const fn new() -> DeviceManager {
         return Self;
+    }
+
+    /// Return the sleeping lock which serializes binding lifecycle operations for `dev`.
+    ///
+    /// The erased data pointer is stable for the lifetime of an `Arc`.  We still validate the weak
+    /// reference with `Arc::ptr_eq` so a stale entry can never be reused after allocator address
+    /// reuse.
+    pub(super) fn lifecycle_lock(&self, dev: &Arc<dyn Device>) -> Arc<Mutex<()>> {
+        let identity = Arc::as_ptr(dev) as *const () as usize;
+        let mut locks = DEVICE_LIFECYCLE_LOCKS.lock();
+
+        if let Some(entry) = locks.entries.get(&identity) {
+            if entry
+                .device
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, dev))
+            {
+                return entry.lock.clone();
+            }
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(
+            identity,
+            DeviceLifecycleLock {
+                device: Arc::downgrade(dev),
+                lock: lock.clone(),
+            },
+        );
+        lock
     }
 
     pub fn register(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
@@ -564,6 +653,22 @@ impl DeviceManager {
     #[inline(never)]
     #[allow(dead_code)]
     pub fn add_device(&self, device: Arc<dyn Device>) -> Result<(), SystemError> {
+        self.add_device_with_optional_namespace(device, None)
+    }
+
+    pub fn add_device_with_namespace(
+        &self,
+        device: Arc<dyn Device>,
+        namespace: crate::filesystem::kernfs::KernFSNamespaceTag,
+    ) -> Result<(), SystemError> {
+        self.add_device_with_optional_namespace(device, Some(namespace))
+    }
+
+    fn add_device_with_optional_namespace(
+        &self,
+        device: Arc<dyn Device>,
+        namespace: Option<crate::filesystem::kernfs::KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         // 在这里处理与parent相关的逻辑
         let deivce_parent = device.dev_parent().and_then(|x| x.upgrade());
         if let Some(ref dev) = deivce_parent {
@@ -587,7 +692,13 @@ impl DeviceManager {
             device.set_parent(Some(Arc::downgrade(&kobject_parent)));
         }
 
-        KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>).map_err(|e| {
+        let add_result = match namespace {
+            Some(namespace) => {
+                KObjectManager::add_kobj_ns(device.clone() as Arc<dyn KObject>, namespace)
+            }
+            None => KObjectManager::add_kobj(device.clone() as Arc<dyn KObject>),
+        };
+        add_result.map_err(|e| {
             error!("add device '{:?}' failed: {:?}", device.name(), e);
             e
         })?;
@@ -606,6 +717,8 @@ impl DeviceManager {
             self.create_sys_dev_entry(&device)?;
         }
 
+        let devtmpfs_node = self.devtmpfs_create_node(&device);
+
         // 通知客户端有关设备添加的信息。此调用必须在 dpm_sysfs_add() 之后且在 kobject_uevent() 之前执行。
         if let Some(bus) = device.bus().and_then(|bus| bus.upgrade()) {
             bus.subsystem().bus_notifier().call_chain(
@@ -615,16 +728,47 @@ impl DeviceManager {
             );
         }
 
-        // todo: 发送uevent: KOBJ_ADD
-        // kobject_uevent();
+        if let Some(subsystem) = device
+            .class()
+            .map(|class| class.name().to_string())
+            .or_else(|| {
+                device
+                    .bus()
+                    .and_then(|bus| bus.upgrade())
+                    .map(|bus| bus.name())
+            })
+        {
+            if subsystem != "net" {
+                let devname = device.name();
+                let _ = <dyn KObject>::kobject_uevent(
+                    &(device.clone() as Arc<dyn KObject>),
+                    "add",
+                    &[("SUBSYSTEM", subsystem), ("DEVNAME", devname)],
+                );
+            }
+        }
+
         // probe drivers for a new device
         bus_probe_device(&device);
 
         if let Some(class) = device.class() {
-            class.subsystem().add_device_to_vec(&device)?;
-
-            for class_interface in class.subsystem().interfaces() {
-                class_interface.add_device(&device).ok();
+            match class.subsystem().add_device_to_vec(&device) {
+                Ok(()) => {
+                    for class_interface in class.subsystem().interfaces() {
+                        class_interface.add_device(&device).ok();
+                    }
+                }
+                Err(SystemError::EEXIST) => {
+                    warn!(
+                        "device '{}' is already present in class '{}'",
+                        device.name(),
+                        class.name()
+                    );
+                }
+                Err(err) => {
+                    self.devtmpfs_delete_node(devtmpfs_node.as_ref());
+                    return Err(err);
+                }
             }
         }
 
@@ -637,7 +781,7 @@ impl DeviceManager {
         &self,
         class: Arc<dyn Class>,
         kobject_parent: Arc<dyn KObject>,
-    ) -> Arc<dyn KObject> {
+    ) -> Result<Arc<dyn KObject>, SystemError> {
         let mut guard = CLASS_DIR_KSET_INSTANCE.write();
         let class_name: String = class.name().to_string();
         let kobject_parent_name = kobject_parent.name();
@@ -645,7 +789,7 @@ impl DeviceManager {
 
         // 检查设备类目录是否已经存在
         if let Some(class_dir) = guard.get(&key) {
-            return class_dir.clone();
+            return Ok(class_dir.clone());
         }
 
         let class_dir: Arc<ClassDir> = ClassDir::new();
@@ -654,12 +798,21 @@ impl DeviceManager {
         class_dir.set_kobj_type(Some(&ClassKObjbectType));
         class_dir.set_parent(Some(Arc::downgrade(&kobject_parent)));
 
-        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>)
-            .expect("add class dir failed");
+        KObjectManager::add_kobj(class_dir.clone() as Arc<dyn KObject>)?;
+        if class.namespace_children() {
+            let enable_result = class_dir
+                .inode()
+                .ok_or(SystemError::ENOENT)
+                .and_then(|inode| inode.enable_namespace_children());
+            if let Err(error) = enable_result {
+                KObjectManager::remove_kobj(class_dir.clone() as Arc<dyn KObject>);
+                return Err(error);
+            }
+        }
 
         guard.insert(key, class_dir.clone());
 
-        return class_dir;
+        return Ok(class_dir);
     }
 
     /// 获取设备真实的parent kobject
@@ -695,7 +848,7 @@ impl DeviceManager {
             // 是否需要glue dir?
 
             let kobject_parent =
-                self.class_dir_create_and_add(device.class().unwrap(), kobject_parent.clone());
+                self.class_dir_create_and_add(device.class().unwrap(), kobject_parent.clone())?;
 
             return Ok(Some(kobject_parent));
         }
@@ -728,9 +881,73 @@ impl DeviceManager {
         todo!()
     }
 
-    /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?fi=driver_attach#542
-    pub fn remove(&self, _dev: &Arc<dyn Device>) {
-        todo!("DeviceManager::remove")
+    /// Remove a registered device from DragonOS driver-core containers.
+    ///
+    /// This mirrors the core teardown of Linux `device_del()` / `bus_remove_device()` as far as the
+    /// current DragonOS fallible driver `remove()` API allows. Bound devices are detached before
+    /// core containers are removed, so a failing driver callback cannot leave driver-private state
+    /// alive while sysfs/notifier state says the device is unbound.
+    ///
+    /// Reference: Linux 6.6.139:
+    /// - drivers/base/core.c:device_del()
+    /// - drivers/base/bus.c:bus_remove_device()
+    #[inline(never)]
+    pub fn remove(&self, dev: &Arc<dyn Device>) {
+        let lifecycle = self.lifecycle_lock(dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // Probe and remove use the same lifecycle lock.  All state must be checked after taking it
+        // because either operation may have completed while this caller was sleeping.
+        if !dev.is_registered() {
+            return;
+        }
+
+        if !self.mark_device_removing(dev) {
+            return;
+        }
+
+        // `device_is_bound()` becomes true only after driver_bound().  Looking only at that list
+        // used to miss the interval where really_probe() had set dev.driver but had not published
+        // the reverse driver->device link yet.
+        if dev.driver().is_some() {
+            if let Err(err) = self.release_driver_locked(dev) {
+                warn!(
+                    "skip removing bound device '{}': driver detach failed: {:?}",
+                    dev.name(),
+                    err
+                );
+                self.unmark_device_removing(dev);
+                return;
+            }
+        }
+
+        if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+            bus.subsystem()
+                .bus_notifier()
+                .call_chain(BusNotifyEvent::DelDevice, Some(dev), None);
+        }
+
+        self.devtmpfs_delete_node_for_device(dev);
+
+        if dev.id_table().device_number().major() != Major::UNNAMED_MAJOR {
+            self.remove_sys_dev_entry(dev);
+            self.remove_file(dev, &DeviceAttrDev);
+        }
+
+        self.remove_class_device(dev);
+        self.remove_attrs(dev);
+        self.remove_bus_device(dev);
+
+        if let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+            bus.subsystem().bus_notifier().call_chain(
+                BusNotifyEvent::RemovedDevice,
+                Some(dev),
+                None,
+            );
+        }
+
+        KObjectManager::remove_kobj(dev.clone() as Arc<dyn KObject>);
+        self.unmark_device_removing(dev);
     }
 
     /// @brief: 获取设备
@@ -745,6 +962,40 @@ impl DeviceManager {
     fn device_platform_notify(&self, dev: &Arc<dyn Device>) {
         acpi_device_notify(dev);
         software_node_notify(dev);
+    }
+
+    pub fn is_device_removing(&self, dev: &Arc<dyn Device>) -> bool {
+        let mut removing = REMOVING_DEVICES.lock();
+        removing.retain(|weak_dev| weak_dev.upgrade().is_some());
+        removing
+            .iter()
+            .filter_map(|weak_dev| weak_dev.upgrade())
+            .any(|removing_dev| Arc::ptr_eq(&removing_dev, dev))
+    }
+
+    fn mark_device_removing(&self, dev: &Arc<dyn Device>) -> bool {
+        let mut removing = REMOVING_DEVICES.lock();
+        removing.retain(|weak_dev| weak_dev.upgrade().is_some());
+
+        if removing
+            .iter()
+            .filter_map(|weak_dev| weak_dev.upgrade())
+            .any(|removing_dev| Arc::ptr_eq(&removing_dev, dev))
+        {
+            return false;
+        }
+
+        removing.push(Arc::downgrade(dev));
+        true
+    }
+
+    fn unmark_device_removing(&self, dev: &Arc<dyn Device>) {
+        let mut removing = REMOVING_DEVICES.lock();
+        removing.retain(|weak_dev| {
+            weak_dev
+                .upgrade()
+                .is_some_and(|removing_dev| !Arc::ptr_eq(&removing_dev, dev))
+        });
     }
 
     // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#3224
@@ -900,6 +1151,117 @@ impl DeviceManager {
         return sysfs_instance().create_file(&kobj, attr);
     }
 
+    /// Remove an attribute file from the device's sysfs directory.
+    ///
+    /// Linux's `device_remove_file()` uses void/best-effort semantics; DragonOS follows the same strategy,
+    /// because the removal path may be triggered during rollback after a partial initialization failure.
+    pub fn remove_file(&self, dev: &Arc<dyn Device>, attr: &'static dyn Attribute) {
+        let kobj = dev.clone() as Arc<dyn KObject>;
+        sysfs_instance().remove_file(&kobj, attr);
+    }
+
+    fn remove_attrs(&self, dev: &Arc<dyn Device>) {
+        self.remove_groups(dev, dev.attribute_groups().unwrap_or(&[]));
+
+        if let Some(kobj_type) = dev.kobj_type() {
+            self.remove_groups(dev, kobj_type.attribute_groups().unwrap_or(&[]));
+        }
+
+        if let Some(class) = dev.class() {
+            self.remove_groups(dev, class.dev_groups());
+        }
+    }
+
+    fn remove_class_device(&self, dev: &Arc<dyn Device>) {
+        let Some(class) = dev.class() else {
+            return;
+        };
+
+        let dev_kobj = dev.clone() as Arc<dyn KObject>;
+        if dev.dev_parent().and_then(|x| x.upgrade()).is_some() {
+            sysfs_instance().remove_link(&dev_kobj, "device".to_string());
+        }
+        sysfs_instance().remove_link(&dev_kobj, "subsystem".to_string());
+
+        let subsys_kobj = class.subsystem().subsys() as Arc<dyn KObject>;
+        sysfs_instance().remove_link_to(
+            &subsys_kobj,
+            &(dev.clone() as Arc<dyn KObject>),
+            dev.name(),
+        );
+
+        for class_interface in class.subsystem().interfaces() {
+            class_interface.remove_device(dev);
+        }
+        class.subsystem().remove_device_from_vec(dev);
+    }
+
+    fn remove_bus_device(&self, dev: &Arc<dyn Device>) {
+        let Some(bus) = dev.bus().and_then(|bus| bus.upgrade()) else {
+            return;
+        };
+
+        for interface in bus.subsystem().interfaces() {
+            interface.remove_device(dev);
+        }
+
+        let dev_kobj = dev.clone() as Arc<dyn KObject>;
+        sysfs_instance().remove_link(&dev_kobj, "subsystem".to_string());
+
+        if let Some(bus_devices_kset) = bus.subsystem().devices_kset() {
+            sysfs_instance().remove_link(&bus_devices_kset.as_kobject(), dev.name());
+        }
+
+        self.remove_groups(dev, bus.dev_groups());
+        bus.subsystem().remove_device_from_vec(dev);
+    }
+
+    fn remove_driver_sysfs_binding(&self, dev: &Arc<dyn Device>, driver: &Arc<dyn Driver>) {
+        let driver_kobj = driver.clone() as Arc<dyn KObject>;
+        let dev_kobj = dev.clone() as Arc<dyn KObject>;
+
+        sysfs_instance().remove_file(&dev_kobj, &DeviceAttrStateSynced);
+        sysfs_instance().remove_file(&dev_kobj, &DeviceAttrCoredump);
+        self.remove_groups(dev, driver.dev_groups());
+        sysfs_instance().remove_link(&dev_kobj, "driver".to_string());
+        sysfs_instance().remove_link(&driver_kobj, dev.name());
+    }
+
+    /// Release a bound driver while the caller holds this device's lifecycle lock.
+    ///
+    /// Keep this separate from the public locking entry point: `remove()` already owns the lock
+    /// and recursively acquiring a sleeping mutex would deadlock.
+    fn release_driver_locked(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
+        let driver = dev.driver().ok_or(SystemError::ENODEV)?;
+        let bus = dev
+            .bus()
+            .and_then(|bus| bus.upgrade())
+            .ok_or(SystemError::ENODEV)?;
+
+        bus.remove(dev).inspect_err(|err| {
+            warn!(
+                "failed to remove device '{}' from bus '{}': {:?}",
+                dev.name(),
+                bus.name(),
+                err
+            );
+        })?;
+
+        bus.subsystem()
+            .bus_notifier()
+            .call_chain(BusNotifyEvent::UnbindDriver, Some(dev), None);
+
+        self.remove_driver_sysfs_binding(dev, &driver);
+        driver.delete_device(dev);
+        dev.set_driver(None);
+
+        bus.subsystem()
+            .bus_notifier()
+            .call_chain(BusNotifyEvent::UnboundDriver, Some(dev), None);
+
+        Ok(())
+    }
+
     /// 在/sys/dev下，或者设备所属的class下，为指定的设备创建链接
     fn create_sys_dev_entry(&self, dev: &Arc<dyn Device>) -> Result<(), SystemError> {
         let target_kobj = self.device_to_dev_kobj(dev);
@@ -909,7 +1271,6 @@ impl DeviceManager {
     }
 
     /// Delete symlink for device in `/sys/dev` or `/sys/class/<class_name>`
-    #[allow(dead_code)]
     fn remove_sys_dev_entry(&self, dev: &Arc<dyn Device>) {
         let kobj = self.device_to_dev_kobj(dev);
         let name = dev.id_table().name();
@@ -923,10 +1284,79 @@ impl DeviceManager {
     /// ## 参数
     ///
     /// - `dev`: 设备
-    fn device_to_dev_kobj(&self, _dev: &Arc<dyn Device>) -> Arc<dyn KObject> {
-        // todo: 处理class的逻辑
-        let kobj = sys_dev_char_kobj() as Arc<dyn KObject>;
-        return kobj;
+    fn device_to_dev_kobj(&self, dev: &Arc<dyn Device>) -> Arc<dyn KObject> {
+        match dev.dev_type() {
+            DeviceType::Block => sys_dev_block_kobj() as Arc<dyn KObject>,
+            _ => sys_dev_char_kobj() as Arc<dyn KObject>,
+        }
+    }
+
+    /// Create the `/dev` node for a registered device, matching Linux device_add() ordering.
+    ///
+    /// Linux treats devtmpfs population as best-effort: failures are reported but do not fail
+    /// device registration. DragonOS keeps the same policy here.
+    fn devtmpfs_create_node(&self, dev: &Arc<dyn Device>) -> Option<DevtmpfsNode> {
+        let node = self.devtmpfs_node_from_device(dev)?;
+
+        match devfs_create_node_dyn(&node.name, node.inode.clone()) {
+            Ok(true) => Some(node),
+            Ok(false) => None,
+            Err(err) => {
+                warn!(
+                    "failed to create devtmpfs node '{}' for {:?}: {:?}",
+                    dev.name(),
+                    dev.id_table(),
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    fn devtmpfs_node_from_device(&self, dev: &Arc<dyn Device>) -> Option<DevtmpfsNode> {
+        let kobj = dev.clone() as Arc<dyn KObject>;
+        let Ok(device_inode) = kobj.cast::<dyn DeviceINode>() else {
+            return None;
+        };
+
+        let metadata = match device_inode.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                warn!(
+                    "failed to read device metadata for devtmpfs node '{}': {:?}",
+                    dev.name(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        if metadata.raw_dev.major() == Major::UNNAMED_MAJOR {
+            return None;
+        }
+
+        Some(DevtmpfsNode {
+            name: dev.name(),
+            inode: device_inode,
+        })
+    }
+
+    fn devtmpfs_delete_node(&self, node: Option<&DevtmpfsNode>) {
+        if let Some(node) = node {
+            if let Err(err) = devfs_unregister_dyn(&node.name, node.inode.clone()) {
+                warn!("failed to delete devtmpfs node '{}': {:?}", node.name, err);
+            }
+        }
+    }
+
+    /// Delete the `/dev` node for a registered device.
+    ///
+    /// This helper mirrors the devtmpfs part of Linux `device_del()`. DragonOS still lacks a
+    /// complete `device_del()` implementation; when that lifecycle is added, call this after
+    /// DEL_DEVICE notification and before removing `/sys/dev/{char,block}` links.
+    fn devtmpfs_delete_node_for_device(&self, dev: &Arc<dyn Device>) {
+        let node = self.devtmpfs_node_from_device(dev);
+        self.devtmpfs_delete_node(node.as_ref());
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c?fi=device_links_force_bind#1226
@@ -953,8 +1383,21 @@ impl DeviceManager {
     }
 
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/dd.c?r=&mo=35401&fi=1313#1313
-    pub fn device_driver_detach(&self, _dev: &Arc<dyn Device>) {
-        todo!("device_driver_detach")
+    pub fn device_driver_detach(
+        &self,
+        dev: &Arc<dyn Device>,
+        expected_driver: &Arc<dyn Driver>,
+    ) -> Result<(), SystemError> {
+        let lifecycle = self.lifecycle_lock(dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // The driver observed by the sysfs caller may have changed while it waited for an active
+        // probe.  Never let an unbind request for one driver detach a later binding to another.
+        let current_driver = dev.driver().ok_or(SystemError::ENODEV)?;
+        if !Arc::ptr_eq(&current_driver, expected_driver) {
+            return Err(SystemError::ENODEV);
+        }
+        self.release_driver_locked(dev)
     }
 }
 
@@ -968,22 +1411,19 @@ pub fn device_register<T: Device>(device: Arc<T>) -> Result<(), SystemError> {
 /// @brief: 设备卸载
 /// @parameter: name: 设备名
 /// @return: 操作成功，返回()，操作失败，返回错误码
-pub fn device_unregister<T: Device>(_device: Arc<T>) {
-    // DEVICE_MANAGER.add_device(device.id_table(), device.clone());
-    // match sys_device_unregister(&device.id_table().name()) {
-    //     Ok(_) => {
-    //         device.set_inode(None);
-    //         return Ok(());
-    //     }
-    //     Err(_) => Err(DeviceError::RegisterError),
-    // }
-    todo!("device_unregister")
+pub fn device_unregister<T: Device + 'static>(device: Arc<T>) {
+    device_manager().remove(&(device as Arc<dyn Device>));
 }
 
 /// # 关闭所有设备
 ///
 /// 参考: https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/core.c#4611
 pub fn device_shutdown() {
+    // Stabilize the reverse-registration order before removing the first
+    // device from the kset.  In particular, an admitted controller probe may
+    // still register child disks which must be shut down before their parent.
+    block_device_bindings_and_wait();
+
     let devices_kset = sys_devices_kset();
 
     loop {
@@ -1002,8 +1442,16 @@ pub fn device_shutdown() {
             }
         };
 
-        if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
-            dev_bus.shutdown(&dev);
+        let lifecycle = device_manager().lifecycle_lock(&dev);
+        let _lifecycle_guard = lifecycle.lock();
+
+        // The driver pointer is assigned before probe runs, while the reverse
+        // driver->device relation is published only after a successful commit.
+        // Never call shutdown on a preset or partially initialized driver.
+        if dev.is_registered() && device_manager().device_is_bound(&dev) {
+            if let Some(dev_bus) = dev.bus().and_then(|bus| bus.upgrade()) {
+                dev_bus.shutdown(&dev);
+            }
         }
     }
 }

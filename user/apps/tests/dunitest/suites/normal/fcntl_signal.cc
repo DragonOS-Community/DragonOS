@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -85,6 +86,26 @@ TEST(FcntlSignal, GetSigDefaultsToZero) {
 
     close(fds[0]);
     close(fds[1]);
+}
+
+TEST(FcntlSignal, UnsupportedFasyncDoesNotCommitFlag) {
+    int fd = open("/dev/null", O_RDONLY);
+    ASSERT_GE(fd, 0);
+
+    int before = fcntl(fd, F_GETFL);
+    ASSERT_GE(before, 0);
+    ASSERT_EQ(0, fcntl(fd, F_SETFL, before | O_ASYNC));
+
+    int after = fcntl(fd, F_GETFL);
+    ASSERT_GE(after, 0);
+    EXPECT_EQ(0, after & O_ASYNC);
+
+    int enabled = 1;
+    errno = 0;
+    EXPECT_EQ(-1, ioctl(fd, FIOASYNC, &enabled));
+    EXPECT_EQ(ENOTTY, errno);
+
+    close(fd);
 }
 
 TEST(FcntlSignal, SetSigRoundTripAndValidation) {

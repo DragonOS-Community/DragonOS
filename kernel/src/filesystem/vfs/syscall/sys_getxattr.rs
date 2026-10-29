@@ -3,7 +3,6 @@
 use super::xattr_utils::path_getxattr;
 use crate::{
     arch::{interrupt::TrapFrame, syscall::nr::SYS_GETXATTR},
-    filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES,
     syscall::table::{FormattedSyscallParam, Syscall},
 };
 use alloc::{string::ToString, vec::Vec};
@@ -22,13 +21,7 @@ impl Syscall for SysGetxattrHandle {
         let buf_ptr = Self::buf(args);
         let size = Self::size(args);
 
-        path_getxattr(
-            path_ptr,
-            name_ptr,
-            buf_ptr,
-            size,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-        )
+        path_getxattr(path_ptr, name_ptr, buf_ptr, size, true)
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

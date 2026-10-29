@@ -2,6 +2,7 @@
 //!
 //! 提供内核参数配置接口
 
+use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::{
     debug::klog::loglevel::KERNEL_LOG_LEVEL,
     filesystem::{
@@ -9,9 +10,10 @@ use crate::{
             template::{Builder, DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
             utils::proc_read,
         },
-        vfs::{FilePrivateData, IndexNode, InodeMode},
+        vfs::{FilePrivateData, IndexNode, InodeMode, PrimaryWriteResult},
     },
     libs::mutex::MutexGuard,
+    process::{cred::CAP_LAST_CAP, namespace::uts_namespace::NewUtsName, ProcessManager},
 };
 use alloc::{
     format,
@@ -19,13 +21,14 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 use system_error::SystemError;
 
-static OVERFLOW_UID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
-static OVERFLOW_GID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_ID);
+use super::keys::KeysDirOps;
+use super::numeric::parse_numeric_sysctl;
 
-const DEFAULT_OVERFLOW_ID: u32 = 65534;
+use crate::process::namespace::user_namespace::{OVERFLOW_GID, OVERFLOW_UID};
+
 const MAX_OVERFLOW_ID: u32 = 65535;
 
 /// /proc/sys/kernel 目录的 DirOps 实现
@@ -48,6 +51,43 @@ impl DirOps for KernelDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         match name {
+            "keys" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+                let inode = KeysDirOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
+            "cap_last_cap" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+
+                let inode = CapLastCapFileOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
+            "threads-max" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+                let inode = ThreadsMaxFileOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
+            "pid_max" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+                let inode = PidMaxFileOps::new_inode(dir.self_ref_weak().clone());
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
             "printk" => {
                 let mut cached_children = dir.cached_children().write();
                 if let Some(child) = cached_children.get(name) {
@@ -73,12 +113,39 @@ impl DirOps for KernelDirOps {
                 cached_children.insert(name.to_string(), inode.clone());
                 return Ok(inode);
             }
+            "hostname" | "domainname" => {
+                let mut cached_children = dir.cached_children().write();
+                if let Some(child) = cached_children.get(name) {
+                    return Ok(child.clone());
+                }
+
+                let kind = if name == "hostname" {
+                    UtsStringKind::Hostname
+                } else {
+                    UtsStringKind::Domainname
+                };
+                let inode = UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), kind);
+                cached_children.insert(name.to_string(), inode.clone());
+                return Ok(inode);
+            }
             _ => Err(SystemError::ENOENT),
         }
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let mut cached_children = dir.cached_children().write();
+        cached_children
+            .entry("keys".to_string())
+            .or_insert_with(|| KeysDirOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("cap_last_cap".to_string())
+            .or_insert_with(|| CapLastCapFileOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("threads-max".to_string())
+            .or_insert_with(|| ThreadsMaxFileOps::new_inode(dir.self_ref_weak().clone()));
+        cached_children
+            .entry("pid_max".to_string())
+            .or_insert_with(|| PidMaxFileOps::new_inode(dir.self_ref_weak().clone()));
         cached_children
             .entry("printk".to_string())
             .or_insert_with(|| PrintkFileOps::new_inode(dir.self_ref_weak().clone()));
@@ -92,6 +159,293 @@ impl DirOps for KernelDirOps {
             .or_insert_with(|| {
                 OverflowIdFileOps::new_inode(dir.self_ref_weak().clone(), OverflowIdKind::Gid)
             });
+        cached_children
+            .entry("hostname".to_string())
+            .or_insert_with(|| {
+                UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), UtsStringKind::Hostname)
+            });
+        cached_children
+            .entry("domainname".to_string())
+            .or_insert_with(|| {
+                UtsStringFileOps::new_inode(dir.self_ref_weak().clone(), UtsStringKind::Domainname)
+            });
+    }
+}
+
+#[derive(Debug)]
+struct CapLastCapFileOps;
+
+impl CapLastCapFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o444))
+            .parent(parent)
+            .read_only_sysctl()
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for CapLastCapFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // Linux proc_dointvec treats every non-zero read position as EOF,
+        // including a short first read.
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{CAP_LAST_CAP}\n");
+        proc_read(0, len, buf, content.as_bytes())
+    }
+}
+
+#[derive(Debug)]
+struct ThreadsMaxFileOps;
+
+impl ThreadsMaxFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .sysctl_permissions()
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for ThreadsMaxFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{}\n", crate::process::max_threads());
+        proc_read(0, len, buf, content.as_bytes())
+    }
+}
+
+impl ThreadsMaxFileOps {
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+            return Err(SystemError::EPERM);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if offset != 0 {
+            return Ok(buf.len());
+        }
+        let (value, consumed) = parse_numeric_sysctl(buf)?;
+        let value = usize::try_from(value).map_err(|_| SystemError::EINVAL)?;
+        crate::process::set_max_threads(value)?;
+        Ok(consumed)
+    }
+}
+
+#[derive(Debug)]
+struct PidMaxFileOps;
+
+impl PidMaxFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .sysctl_permissions()
+            .build()
+            .unwrap()
+    }
+}
+
+impl FileOps for PidMaxFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        if offset != 0 {
+            return Ok(0);
+        }
+        let content = format!("{}\n", crate::process::pid::pid_max());
+        proc_read(0, len, buf, content.as_bytes())
+    }
+}
+
+impl PidMaxFileOps {
+    fn write_at(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        // This is a host-global setting, including when an already-open fd
+        // is inherited by a task in a child user namespace.
+        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+            return Err(SystemError::EPERM);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if offset != 0 {
+            return Ok(buf.len());
+        }
+        let (value, consumed) = parse_numeric_sysctl(buf)?;
+        let value = usize::try_from(value).map_err(|_| SystemError::EINVAL)?;
+        crate::process::pid::set_pid_max(value)?;
+        Ok(consumed)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UtsStringKind {
+    Hostname,
+    Domainname,
+}
+
+#[derive(Debug)]
+struct UtsStringFileOps {
+    kind: UtsStringKind,
+}
+
+impl UtsStringFileOps {
+    fn new_inode(parent: Weak<dyn IndexNode>, kind: UtsStringKind) -> Arc<dyn IndexNode> {
+        ProcFileBuilder::new(Self { kind }, InodeMode::from_bits_truncate(0o644))
+            .parent(parent)
+            .build()
+            .unwrap()
+    }
+
+    fn snapshot(&self) -> [u8; NewUtsName::MAXLEN] {
+        let uts_ns = ProcessManager::current_utsns();
+        match self.kind {
+            UtsStringKind::Hostname => uts_ns.hostname(),
+            UtsStringKind::Domainname => uts_ns.domainname(),
+        }
+    }
+    fn write_value(&self, offset: usize, buf: &[u8]) -> Result<PrimaryWriteResult, SystemError> {
+        if buf.is_empty() {
+            return Ok(PrimaryWriteResult::new(0));
+        }
+
+        let uts_ns = ProcessManager::current_utsns();
+        let old = match self.kind {
+            UtsStringKind::Hostname => uts_ns.hostname(),
+            UtsStringKind::Domainname => uts_ns.domainname(),
+        };
+        let old_len = old.iter().position(|byte| *byte == 0).unwrap_or(old.len());
+        if offset > old_len {
+            return Ok(PrimaryWriteResult {
+                written_len: buf.len(),
+                next_position: Some(offset),
+            });
+        }
+
+        let input_len = buf
+            .iter()
+            .position(|byte| *byte == 0 || *byte == b'\n')
+            .unwrap_or(buf.len());
+        let copy_len = input_len.min((NewUtsName::MAXLEN - 1).saturating_sub(offset));
+        let mut value = [0u8; NewUtsName::MAXLEN];
+        value[..offset].copy_from_slice(&old[..offset]);
+        value[offset..offset + copy_len].copy_from_slice(&buf[..copy_len]);
+        match self.kind {
+            UtsStringKind::Hostname => uts_ns.set_hostname(&value[..offset + copy_len])?,
+            UtsStringKind::Domainname => uts_ns.set_domainname(&value[..offset + copy_len])?,
+        }
+        Ok(PrimaryWriteResult::new(buf.len()))
+    }
+}
+
+impl FileOps for UtsStringFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(Self::write_at_with_position)
+    }
+
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
+    fn read_at(
+        &self,
+        offset: usize,
+        len: usize,
+        buf: &mut [u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        let value = self.snapshot();
+        let value_len = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        let mut content = Vec::with_capacity(value_len + 1);
+        content.extend_from_slice(&value[..value_len]);
+        content.push(b'\n');
+        proc_read(offset, len, buf, &content)
+    }
+}
+
+impl UtsStringFileOps {
+    fn write_at_with_position(
+        &self,
+        offset: usize,
+        _len: usize,
+        buf: &[u8],
+        _data: MutexGuard<FilePrivateData>,
+    ) -> Result<PrimaryWriteResult, SystemError> {
+        self.write_value(offset, buf)
     }
 }
 
@@ -141,6 +495,20 @@ impl PrintkFileOps {
 }
 
 impl FileOps for PrintkFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -151,7 +519,9 @@ impl FileOps for PrintkFileOps {
         let content = Self::read_config();
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl PrintkFileOps {
     fn write_at(
         &self,
         _offset: usize,
@@ -184,6 +554,20 @@ impl OverflowIdFileOps {
 }
 
 impl FileOps for OverflowIdFileOps {
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Default;
+
+    fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
+        Some(|ops, offset, len, buf, data| {
+            ops.write_at(offset, len, buf, data)
+                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        })
+    }
+
+    fn supports_write_iter_flags(&self) -> bool {
+        true
+    }
+
     fn read_at(
         &self,
         offset: usize,
@@ -198,7 +582,9 @@ impl FileOps for OverflowIdFileOps {
         let content = alloc::format!("{}\n", val);
         proc_read(offset, len, buf, content.as_bytes())
     }
+}
 
+impl OverflowIdFileOps {
     fn write_at(
         &self,
         offset: usize,

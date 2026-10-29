@@ -1,22 +1,21 @@
 #![allow(function_casts_as_integer)]
 
-use log::{error, trace, warn};
-use system_error::SystemError;
-
 use super::{
-    entry::{set_intr_gate, set_system_trap_gate},
+    entry::{set_intr_gate, set_system_intr_gate},
     TrapFrame,
 };
-use crate::exception::debug::DebugException;
-use crate::exception::ebreak::EBreak;
 use crate::{
-    arch::{ipc::signal::Signal, CurrentIrqArch, MMArch},
-    exception::InterruptArch,
-    ipc::signal::force_kernel_signal_to_current,
+    arch::{ipc::signal::Signal, x86_64::process::debugreg, CurrentIrqArch, MMArch},
+    exception::{
+        debug::DebugException, ebreak::EBreak, extable::ExceptionTableManager, InterruptArch,
+    },
+    ipc::signal::{force_kernel_signal_to_current, force_sig_fault_to_current},
     mm::VirtAddr,
-    process::ProcessManager,
+    process::{ptrace, ProcessManager},
     smp::core::smp_get_processor_id,
 };
+use log::{error, trace, warn};
+use system_error::SystemError;
 
 extern "C" {
     fn trap_divide_error();
@@ -87,12 +86,21 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
         set_intr_gate(0, 0, VirtAddr::new(trap_divide_error as usize));
         set_intr_gate(1, 0, VirtAddr::new(trap_debug as usize));
         set_intr_gate(2, 0, VirtAddr::new(trap_nmi as usize));
-        set_system_trap_gate(3, 0, VirtAddr::new(trap_int3 as usize));
-        set_system_trap_gate(4, 0, VirtAddr::new(trap_overflow as usize));
-        set_system_trap_gate(5, 0, VirtAddr::new(trap_bounds as usize));
+        // #BP must enter with maskable interrupts disabled. Uprobe teardown
+        // uses a synchronous IPI as the grace point between restoring the
+        // opcode and removing its hit-table entry; a trap gate could
+        // acknowledge that IPI before do_int3 acquires the entry. The user
+        // uprobe path reenables interrupts after capturing its XOL slot lease.
+        set_system_intr_gate(3, 0, VirtAddr::new(trap_int3 as usize));
+        // Context tracking requires every userspace entry to run with
+        // maskable interrupts disabled until user_exit() has made RCU watch
+        // the CPU. Keep DPL3, but use interrupt gates so an IRQ cannot nest in
+        // the low-level entry window with a kernel-mode frame.
+        set_system_intr_gate(4, 0, VirtAddr::new(trap_overflow as usize));
+        set_system_intr_gate(5, 0, VirtAddr::new(trap_bounds as usize));
         set_intr_gate(6, 0, VirtAddr::new(trap_undefined_opcode as usize));
         set_intr_gate(7, 0, VirtAddr::new(trap_dev_not_avaliable as usize));
-        set_intr_gate(8, 0, VirtAddr::new(trap_double_fault as usize));
+        set_intr_gate(8, 1, VirtAddr::new(trap_double_fault as usize));
         set_intr_gate(
             9,
             0,
@@ -115,7 +123,22 @@ pub fn arch_trap_init() -> Result<(), SystemError> {
 
 /// 处理除法错误 0 #DE
 #[no_mangle]
-unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_divide_error(regs: &'static mut TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        // A divide fault from an XOL instruction is a synchronous user fault,
+        // not a kernel failure.  Mark the transaction trapped so the signal
+        // gate restores the original probe context before building sigframe.
+        let fault_addr = crate::exception::uprobe::mark_current_xol_trapped_and_get_probe_addr()
+            .unwrap_or(regs.rip as usize);
+        CurrentIrqArch::interrupt_enable();
+        const FPE_INTDIV: i32 = 1;
+        if let Err(err) =
+            force_sig_fault_to_current(Signal::SIGFPE, FPE_INTDIV, VirtAddr::new(fault_addr))
+        {
+            error!("failed to send SIGFPE for user divide error: {:?}", err);
+        }
+        return;
+    }
     error!(
         "do_divide_error(0), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -130,15 +153,127 @@ unsafe extern "C" fn do_divide_error(regs: &'static TrapFrame, error_code: u64) 
 /// 处理调试异常 1 #DB
 #[no_mangle]
 unsafe extern "C" fn do_debug(regs: &'static mut TrapFrame, error_code: u64) {
+    // DR6 can report BS (single-step) and B0-B3 (hardware breakpoint) together.
+    // It must be saved and reset before any handler runs, so a stale cause cannot
+    // pollute the next #DB.
+    let dr6 = read_and_reset_dr6() & !ptrace::DR6_RESERVED;
+    let from_user = regs.is_from_user();
+    let dr7: u64;
+    core::arch::asm!(
+        "mov {}, dr7",
+        out(reg) dr7,
+        options(nomem, nostack, preserves_flags)
+    );
+    let owner_generation = crate::arch::process::cpu_debug_owner_generation()
+        .load(core::sync::atomic::Ordering::Relaxed);
+    // Disable hardware breakpoints before touching any kernel state. They stay
+    // disabled across signal/ptrace work and are restored from the current
+    // task state only at the final return-to-user boundary.
+    debugreg::write_dr7(0);
+    crate::arch::process::cpu_dr7().store(0, core::sync::atomic::Ordering::Relaxed);
     trace!(
-        "do_debug(1), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
+        "do_debug(1), \tError code: {:#x},\tdr6: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
+        dr6,
         regs.rsp,
         regs.rip,
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    DebugException::handle(regs).unwrap();
+    if from_user {
+        // User-mode #DB: a completed uprobe XOL single-step takes priority (whether
+        // the handler consumes it is reviewed in R4); an unconsumed user single-step
+        // goes to SIGTRAP/ptrace via the unified signal path. DebugException only
+        // consults the kernel kprobe table and cannot handle user-mode #DB, otherwise
+        // it would silently swallow the debug exception.
+        let current = ProcessManager::current_pcb();
+        let uprobe = crate::exception::uprobe::uprobe_debug_handler(regs, dr6).unwrap();
+        let (active_generation, current_generation) =
+            ptrace::ptrace_debug_session_snapshot(&current);
+        // Uprobe consumes only its XOL single-step reason. A simultaneous
+        // hardware B0-B3 hit is independent and must still be reported.
+        let report_bits = if uprobe.consumed {
+            (dr6 & ptrace::X86_DR_B_MASK)
+                | if uprobe.report_single_step {
+                    ptrace::X86_DR_BS
+                } else {
+                    0
+                }
+        } else {
+            dr6 & (ptrace::X86_DR_B_MASK | ptrace::X86_DR_BS)
+        };
+        let icebp = !uprobe.consumed && dr6 == 0;
+        let forced_step = current.record_ptrace_debug_status(report_bits);
+        let breakpoint_bits = report_bits & ptrace::X86_DR_B_MASK;
+        let owned_breakpoints =
+            if active_generation.is_some() || owner_generation != current_generation {
+                breakpoint_bits
+            } else {
+                0
+            };
+        let owned_step = if active_generation.is_some() && forced_step {
+            report_bits & ptrace::X86_DR_BS
+        } else {
+            0
+        };
+        let owned_bits = owned_breakpoints | owned_step;
+        let unowned_bits = report_bits & !owned_bits;
+
+        // Execution breakpoints require RF or the same instruction would
+        // immediately retrigger when DR7 is restored.
+        if report_bits & ptrace::X86_DR_BS == 0 {
+            for i in 0..4u32 {
+                if (breakpoint_bits & (1u64 << i)) != 0 && ((dr7 >> (16 + i * 4)) & 0b11) == 0 {
+                    regs.rflags |= ptrace::X86_EFLAGS_RF;
+                    break;
+                }
+            }
+        }
+        // Record even a fully consumed uprobe #DB so DR7 restoration remains
+        // deferred until all return-to-user work has completed.
+        current.record_pending_debug(
+            owned_bits,
+            unowned_bits,
+            icebp,
+            regs.rip as usize,
+            active_generation.unwrap_or(owner_generation),
+        );
+    } else {
+        let current = ProcessManager::current_pcb();
+        let breakpoint_bits = dr6 & ptrace::X86_DR_B_MASK;
+        if breakpoint_bits != 0 {
+            // Match Linux exc_debug_kernel()/ptrace_triggered(): remember the
+            // virtual DR6 cause, but do not synthesize a signal at syscall
+            // return. A later user #DB starts a fresh virtual DR6 report.
+            current.merge_ptrace_debug_status(breakpoint_bits);
+        }
+        // B0-B3 belong to the user ptrace watchpoint. Preserve any coexisting
+        // BS reason for the kernel kprobe single-step handler.
+        if dr6 & !ptrace::X86_DR_B_MASK != 0 {
+            DebugException::handle(regs).unwrap();
+        }
+        // local_db_restore() semantics: kernel #DB handling must leave the
+        // current task's breakpoint state armed, including after a B0-B3 hit.
+        crate::arch::process::restore_current_debug_regs();
+    }
+}
+
+#[inline]
+unsafe fn read_and_reset_dr6() -> u64 {
+    let dr6: u64;
+    core::arch::asm!(
+        "mov {}, dr6",
+        out(reg) dr6,
+        options(nomem, nostack, preserves_flags)
+    );
+    // Intel/Linux requires preserving DR6's fixed 1 bits and clearing the writable status bits.
+    const DR6_RESET: u64 = 0xffff_0ff0;
+    core::arch::asm!(
+        "mov dr6, {}",
+        in(reg) DR6_RESET,
+        options(nomem, nostack, preserves_flags)
+    );
+    dr6
 }
 
 /// 处理NMI中断 2 NMI
@@ -166,7 +301,20 @@ unsafe extern "C" fn do_int3(regs: &'static mut TrapFrame, error_code: u64) {
         smp_get_processor_id().data(),
         ProcessManager::current_pid()
     );
-    EBreak::handle(regs).unwrap();
+    if regs.is_from_user() {
+        // User-mode #BP: an uprobe hit or an unconsumed #BP (→ SIGTRAP).
+        crate::exception::uprobe::uprobe_breakpoint_handler(regs).unwrap();
+    } else {
+        // Vector 3 is now an interrupt gate for the user-uprobe entry race.
+        // Preserve the old trap-gate behavior for kernel breakpoints: a
+        // context entered with IF set may run kprobe callbacks with interrupts
+        // enabled, while an irq-off context remains irq-off.
+        if regs.rflags & (1 << 9) != 0 {
+            CurrentIrqArch::interrupt_enable();
+        }
+        // Kernel-mode #BP: a kprobe hit.
+        EBreak::handle(regs).unwrap();
+    }
 }
 
 /// 处理溢出异常 4 #OF
@@ -199,7 +347,25 @@ unsafe extern "C" fn do_bounds(regs: &'static TrapFrame, error_code: u64) {
 
 /// 处理未定义操作码异常 6 #UD
 #[no_mangle]
-unsafe extern "C" fn do_undefined_opcode(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_undefined_opcode(regs: &'static mut TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        // #UD is unrecoverable and SIGILL is definitely delivered below; if it
+        // happens in XOL, the signal frame must see the original probe address
+        // rather than the slot address.
+        crate::exception::uprobe::mark_current_xol_trapped();
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGILL) {
+            error!(
+                "failed to send SIGILL for user undefined opcode, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     error!(
         "do_undefined_opcode(6), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -226,17 +392,38 @@ unsafe extern "C" fn do_dev_not_avaliable(regs: &'static TrapFrame, error_code: 
 }
 
 /// 处理双重错误 8 #DF
+///
+/// 运行在 IST 栈上：栈底没有 PCB 槽，任何 `current_pcb()`/`log!`/分配都会
+/// 再次失败（递归放大为三重错误）。这里只使用零分配的串口通道并停机。
+#[repr(C)]
+struct DoubleFaultFrame {
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
 #[no_mangle]
-unsafe extern "C" fn do_double_fault(regs: &'static TrapFrame, error_code: u64) {
-    error!(
-        "do_double_fault(8), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
-        error_code,
-        regs.rsp,
-        regs.rip,
-        smp_get_processor_id().data(),
-        ProcessManager::current_pid()
-    );
-    panic!("Double Fault");
+unsafe extern "C" fn do_double_fault(regs: &DoubleFaultFrame) -> ! {
+    use crate::libs::printk::{emergency_print_hex_noalloc, emergency_print_noalloc};
+    // #DF 时 CR2 不会被更新，它保存的是触发本次级联的最近一次缺页地址；
+    // 在只可能来自“压栈失败”的场景里，这个值就是缺失的栈页地址。
+    let cr2: u64;
+    core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+    emergency_print_noalloc("\n[#DF] double fault (IST): err=");
+    emergency_print_hex_noalloc(regs.error_code);
+    emergency_print_noalloc(" cr2=");
+    emergency_print_hex_noalloc(cr2);
+    emergency_print_noalloc(" rsp=");
+    emergency_print_hex_noalloc(regs.rsp);
+    emergency_print_noalloc(" rip=");
+    emergency_print_hex_noalloc(regs.rip);
+    emergency_print_noalloc(" -- halted\n");
+    loop {
+        core::arch::asm!("cli; hlt", options(nomem, nostack));
+    }
 }
 
 /// 处理协处理器段越界 9 #MF
@@ -291,7 +478,26 @@ unsafe extern "C" fn do_invalid_TSS(regs: &'static TrapFrame, error_code: u64) {
 
 /// 处理段不存在 11 #NP
 #[no_mangle]
-unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_segment_not_exists(regs: &'static mut TrapFrame, error_code: u64) {
+    if try_fixup_kernel_exception(regs) {
+        return;
+    }
+
+    if regs.is_from_user() {
+        crate::exception::uprobe::mark_current_xol_trapped();
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGBUS) {
+            error!(
+                "failed to send SIGBUS for user segment-not-present fault, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     error!(
         "do_segment_not_exists(11), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -305,7 +511,22 @@ unsafe extern "C" fn do_segment_not_exists(regs: &'static TrapFrame, error_code:
 
 /// 处理栈段错误 12 #SS
 #[no_mangle]
-unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_stack_segment_fault(regs: &'static mut TrapFrame, error_code: u64) {
+    if regs.is_from_user() {
+        crate::exception::uprobe::mark_current_xol_trapped();
+        CurrentIrqArch::interrupt_enable();
+        if let Err(err) = force_kernel_signal_to_current(Signal::SIGBUS) {
+            error!(
+                "failed to send SIGBUS for user stack-segment fault, pid: {:?}, rip: {:#x}, error_code: {:#x}, err: {:?}",
+                ProcessManager::current_pid(),
+                regs.rip,
+                error_code,
+                err
+            );
+        }
+        return;
+    }
+
     error!(
         "do_stack_segment_fault(12), \tError code: {:#x},\trsp: {:#x},\trip: {:#x},\t CPU: {}, \tpid: {:?}",
         error_code,
@@ -319,8 +540,16 @@ unsafe extern "C" fn do_stack_segment_fault(regs: &'static TrapFrame, error_code
 
 /// 处理一般保护异常 13 #GP
 #[no_mangle]
-unsafe extern "C" fn do_general_protection(regs: &'static TrapFrame, error_code: u64) {
+unsafe extern "C" fn do_general_protection(regs: &'static mut TrapFrame, error_code: u64) {
+    if try_fixup_kernel_exception(regs) {
+        return;
+    }
+
     if regs.is_from_user() {
+        // A user #GP is definitively converted to SIGSEGV here; do not abort
+        // unconditionally at the exception entry, only mark the actual signal
+        // delivery path.
+        crate::exception::uprobe::mark_current_xol_trapped();
         CurrentIrqArch::interrupt_enable();
         if let Err(err) = force_kernel_signal_to_current(Signal::SIGSEGV) {
             error!(
@@ -376,6 +605,18 @@ Segment Selector Index: {:#x}\n
         error_code & 0xfff8
     );
     panic!("General Protection");
+}
+
+#[inline]
+fn try_fixup_kernel_exception(regs: &mut TrapFrame) -> bool {
+    if regs.is_from_user() {
+        return false;
+    }
+    let Some(fixup_addr) = ExceptionTableManager::search_exception_table(regs.rip as usize) else {
+        return false;
+    };
+    regs.rip = fixup_addr as u64;
+    true
 }
 
 /// 处理页错误 14 #PF

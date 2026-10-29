@@ -17,7 +17,7 @@ install: all
 
 
 clean:
-	rm init *.o
+	rm -f init *.o
 	$(MAKE) -C riscv_rust_init ARCH=$(ARCH) clean
 
 fmt:

@@ -304,6 +304,7 @@ pub const SYS_FACCESSAT2: usize = 439;
 pub const SYS_PROCESS_MADVISE: usize = 440;
 pub const SYS_EPOLL_PWAIT2: usize = 441;
 pub const SYS_MOUNT_SETATTR: usize = 442;
+pub const SYS_FCHMODAT2: usize = 452;
 pub const SYS_SYSCALLS: usize = 443;
 
 // ===以下是为了代码一致性，才定义的调用号===
@@ -614,6 +615,7 @@ pub fn syscall_number_to_str(syscall_number: usize) -> &'static str {
         440 => "SYS_PROCESS_MADVISE",
         441 => "SYS_EPOLL_PWAIT2",
         442 => "SYS_MOUNT_SETATTR",
+        452 => "SYS_FCHMODAT2",
         443 => "SYS_SYSCALLS",
         _ => "UNKNOWN",
     }

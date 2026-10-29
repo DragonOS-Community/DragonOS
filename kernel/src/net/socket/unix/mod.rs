@@ -7,13 +7,23 @@ pub mod utils;
 use system_error::SystemError;
 
 use self::utils::*;
+use crate::libs::casting::DowncastArc;
 
-use super::PSOCK;
-use crate::process::namespace::net_namespace::NetNamespace;
+use super::{PSO, PSOCK};
+use crate::process::{
+    cred::{Kgid, Kuid},
+    namespace::{
+        net_namespace::NetNamespace,
+        user_namespace::{from_kgid_munged, from_kuid_munged},
+    },
+    pid::{Pid, PidType},
+};
 use crate::{
     filesystem::vfs::{
+        inode_lifecycle::{InodeRetentionGuard, InodeRetentionKind},
+        mount::MountFSInode,
         utils::{rsplit_path, DName},
-        InodeMode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+        FileType, IndexNode, InodeId, InodeMode, VFS_MAX_FOLLOW_SYMLINK_TIMES,
     },
     net::socket::{
         endpoint::Endpoint,
@@ -26,6 +36,44 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hash::Hash;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// SOL_SOCKET reuse options shared by AF_UNIX socket types. Unix address
+/// binding does not use SO_REUSEADDR, but the setting is observable per socket.
+#[derive(Debug, Default)]
+pub(super) struct UnixReuseOptions {
+    reuse_addr: AtomicBool,
+}
+
+impl UnixReuseOptions {
+    pub(super) fn set(&self, option: PSO, value: &[u8]) -> Result<(), SystemError> {
+        let source = value.get(..4).ok_or(SystemError::EINVAL)?;
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(source);
+        let enabled = i32::from_ne_bytes(bytes) != 0;
+        match option {
+            PSO::REUSEADDR => {
+                self.reuse_addr.store(enabled, Ordering::Relaxed);
+                Ok(())
+            }
+            PSO::REUSEPORT if enabled => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            PSO::REUSEPORT => Ok(()),
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    pub(super) fn get(&self, option: PSO, value: &mut [u8]) -> Result<usize, SystemError> {
+        let enabled = match option {
+            PSO::REUSEADDR => self.reuse_addr.load(Ordering::Relaxed),
+            PSO::REUSEPORT => false,
+            _ => return Err(SystemError::ENOPROTOOPT),
+        };
+        Ok(super::common::write_i32_getsockopt(
+            value,
+            i32::from(enabled),
+        ))
+    }
+}
 
 /// Unix domain credential payload for SCM_CREDENTIALS.
 ///
@@ -36,6 +84,62 @@ pub struct UCred {
     pub pid: i32,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// Identity fixed when a Unix peer relationship is established. Holding the
+/// PID object, rather than the task, keeps namespace identity after exit.
+#[derive(Debug, Clone)]
+pub(super) struct PeerCred {
+    pid: Option<Arc<Pid>>,
+    euid: Kuid,
+    egid: Kgid,
+}
+
+impl PeerCred {
+    pub(super) fn current() -> Self {
+        let pcb = ProcessManager::current_pcb();
+        let cred = pcb.cred();
+        Self {
+            pid: pcb.task_pid_ptr(PidType::TGID),
+            euid: cred.euid,
+            egid: cred.egid,
+        }
+    }
+
+    fn visible(&self) -> UCred {
+        let pcb = ProcessManager::current_pcb();
+        let user_ns = pcb.cred().user_ns.clone();
+        let pid_ns = pcb.active_pid_ns();
+        UCred {
+            pid: self
+                .pid
+                .as_ref()
+                .map_or(0, |pid| pid.pid_nr_ns(&pid_ns).data() as i32),
+            uid: from_kuid_munged(&user_ns, self.euid),
+            gid: from_kgid_munged(&user_ns, self.egid),
+        }
+    }
+}
+
+pub(super) fn write_peercred_option(value: &mut [u8], peer: Option<&PeerCred>) -> usize {
+    let cred = peer.map_or(
+        UCred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        },
+        PeerCred::visible,
+    );
+    let bytes = [
+        cred.pid.to_ne_bytes(),
+        cred.uid.to_ne_bytes(),
+        cred.gid.to_ne_bytes(),
+    ];
+    let len = value.len().min(core::mem::size_of::<UCred>());
+    for (dst, src) in value[..len].iter_mut().zip(bytes.into_iter().flatten()) {
+        *dst = src;
+    }
+    len
 }
 
 /// Return current task credentials used for unix-domain SCM_CREDENTIALS.
@@ -79,19 +183,112 @@ impl TryFrom<Endpoint> for UnixEndpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum UnixSocketType {
+    Stream,
+    Datagram,
+    SeqPacket,
+}
+
+#[derive(Debug)]
+pub(super) struct PathAddress {
+    name: DName,
+    identity: (usize, InodeId, u64),
+    _retention: InodeRetentionGuard,
+}
+
+impl PathAddress {
+    fn new(inode: Arc<dyn IndexNode>, name: DName) -> Result<Arc<Self>, SystemError> {
+        let retention =
+            InodeRetentionGuard::new(inode.clone(), InodeRetentionKind::OpenFileDescription)?;
+        let mounted = inode
+            .clone()
+            .downcast_arc::<MountFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+        let identity = mounted.inode_object_identity();
+        Ok(Arc::new(Self {
+            name,
+            identity,
+            _retention: retention,
+        }))
+    }
+}
+
+/// Cloneable address identity. This never owns an abstract-name reservation.
 #[derive(Clone, Debug)]
 pub(super) enum UnixEndpointBound {
-    Path(DName),
-    Abstract(Arc<AbstractHandle>),
+    Path(Arc<PathAddress>),
+    Abstract {
+        nsid: usize,
+        socket_type: UnixSocketType,
+        name: Arc<[u8]>,
+        incarnation: u64,
+    },
+}
+
+/// The only owner of an abstract-name reservation follows the bound socket
+/// through its state changes. Address snapshots and table keys never own it.
+#[derive(Debug)]
+pub(super) struct UnixBinding {
+    pub(super) address: UnixEndpointBound,
+    _abstract_handle: Option<Arc<AbstractHandle>>,
+}
+
+impl UnixBinding {
+    fn path(address: Arc<PathAddress>) -> Self {
+        Self {
+            address: UnixEndpointBound::Path(address),
+            _abstract_handle: None,
+        }
+    }
+
+    pub(super) fn abstract_name(handle: Arc<AbstractHandle>) -> Self {
+        let address = UnixEndpointBound::Abstract {
+            nsid: handle.nsid(),
+            socket_type: handle.socket_type(),
+            name: handle.name(),
+            incarnation: handle.incarnation(),
+        };
+        Self {
+            address,
+            _abstract_handle: Some(handle),
+        }
+    }
+
+    pub(super) fn address(&self) -> UnixEndpointBound {
+        self.address.clone()
+    }
+
+    /// The accepted half of a connection has the listener's address but does
+    /// not become another owner of the listener's abstract-name reservation.
+    pub(super) fn borrowed(address: UnixEndpointBound) -> Self {
+        Self {
+            address,
+            _abstract_handle: None,
+        }
+    }
 }
 
 impl PartialEq for UnixEndpointBound {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (UnixEndpointBound::Path(path1), UnixEndpointBound::Path(path2)) => path1 == path2,
-            (UnixEndpointBound::Abstract(handle1), UnixEndpointBound::Abstract(handle2)) => {
-                handle1.nsid() == handle2.nsid() && handle1.name() == handle2.name()
+            (UnixEndpointBound::Path(path1), UnixEndpointBound::Path(path2)) => {
+                path1.identity == path2.identity
             }
+            (
+                UnixEndpointBound::Abstract {
+                    nsid: n1,
+                    socket_type: t1,
+                    name: a1,
+                    incarnation: i1,
+                },
+                UnixEndpointBound::Abstract {
+                    nsid: n2,
+                    socket_type: t2,
+                    name: a2,
+                    incarnation: i2,
+                },
+            ) => (n1, t1, a1, i1) == (n2, t2, a2, i2),
             _ => false,
         }
     }
@@ -102,14 +299,27 @@ impl Eq for UnixEndpointBound {}
 impl Ord for UnixEndpointBound {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         match (self, other) {
-            (UnixEndpointBound::Path(path1), UnixEndpointBound::Path(path2)) => path1.cmp(path2),
-            (UnixEndpointBound::Abstract(handle1), UnixEndpointBound::Abstract(handle2)) => {
-                (handle1.nsid(), handle1.name()).cmp(&(handle2.nsid(), handle2.name()))
+            (UnixEndpointBound::Path(path1), UnixEndpointBound::Path(path2)) => {
+                path1.identity.cmp(&path2.identity)
             }
-            (UnixEndpointBound::Path(_), UnixEndpointBound::Abstract(_)) => {
+            (
+                UnixEndpointBound::Abstract {
+                    nsid: n1,
+                    socket_type: t1,
+                    name: a1,
+                    incarnation: i1,
+                },
+                UnixEndpointBound::Abstract {
+                    nsid: n2,
+                    socket_type: t2,
+                    name: a2,
+                    incarnation: i2,
+                },
+            ) => (n1, t1, a1, i1).cmp(&(n2, t2, a2, i2)),
+            (UnixEndpointBound::Path(_), UnixEndpointBound::Abstract { .. }) => {
                 core::cmp::Ordering::Less
             }
-            (UnixEndpointBound::Abstract(_), UnixEndpointBound::Path(_)) => {
+            (UnixEndpointBound::Abstract { .. }, UnixEndpointBound::Path(_)) => {
                 core::cmp::Ordering::Greater
             }
         }
@@ -126,11 +336,17 @@ impl Hash for UnixEndpointBound {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         match self {
             UnixEndpointBound::Path(path) => {
-                path.hash(state);
+                0u8.hash(state);
+                path.identity.hash(state);
             }
-            UnixEndpointBound::Abstract(handle) => {
-                handle.nsid().hash(state);
-                handle.name().hash(state);
+            UnixEndpointBound::Abstract {
+                nsid,
+                socket_type,
+                name,
+                incarnation,
+            } => {
+                1u8.hash(state);
+                (nsid, socket_type, name, incarnation).hash(state);
             }
         }
     }
@@ -139,8 +355,8 @@ impl Hash for UnixEndpointBound {
 impl From<UnixEndpointBound> for UnixEndpoint {
     fn from(endpoint: UnixEndpointBound) -> Self {
         match endpoint {
-            UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(path.as_ref())),
-            UnixEndpointBound::Abstract(handle) => UnixEndpoint::Abstract(handle.name().to_vec()),
+            UnixEndpointBound::Path(path) => UnixEndpoint::File(String::from(path.name.as_ref())),
+            UnixEndpointBound::Abstract { name, .. } => UnixEndpoint::Abstract(name.to_vec()),
         }
     }
 }
@@ -164,22 +380,26 @@ impl UnixEndpoint {
     pub(super) fn bind_in(
         self,
         netns: &Arc<NetNamespace>,
-    ) -> Result<UnixEndpointBound, SystemError> {
+        socket_type: UnixSocketType,
+    ) -> Result<UnixBinding, crate::mm::allocation::MemoryAllocationError> {
         let bound = match self {
-            Self::Unnamed => UnixEndpointBound::Abstract(
+            Self::Unnamed => UnixBinding::abstract_name(
                 netns
                     .unix_abstract_table()
-                    .alloc_ephemeral_abstract_name()?,
+                    .alloc_ephemeral_abstract_name(socket_type)?,
             ),
             Self::File(path) => {
+                let (inode_begin, _) = crate::filesystem::vfs::utils::user_path_at(
+                    &ProcessManager::current_pcb(),
+                    crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
+                    &path,
+                )?;
                 let (filename, parent_path) = rsplit_path(&path);
-                // 查找父目录
-                let parent_inode = ProcessManager::current_mntns()
-                    .root_inode()
-                    .lookup_follow_symlink(
-                        parent_path.unwrap_or("/"),
-                        VFS_MAX_FOLLOW_SYMLINK_TIMES,
-                    )?;
+                let parent_inode = if let Some(parent) = parent_path {
+                    inode_begin.lookup_follow_symlink(parent, VFS_MAX_FOLLOW_SYMLINK_TIMES)?
+                } else {
+                    inode_begin
+                };
                 // 创建 socket inode
                 let inode = parent_inode
                     .create(
@@ -190,15 +410,17 @@ impl UnixEndpoint {
                     .map_err(|e| match e {
                         // Linux/Posix bind 语义：地址已被占用应返回 EADDRINUSE。
                         // VFS 创建节点遇到同名条目通常返回 EEXIST，需要在 socket 层进行语义映射。
-                        SystemError::EEXIST => SystemError::EADDRINUSE,
+                        crate::mm::allocation::MemoryAllocationError::System(
+                            SystemError::EEXIST,
+                        ) => SystemError::EADDRINUSE.into(),
                         other => other,
                     })?;
-                UnixEndpointBound::Path(DName::from(inode.absolute_path()?))
+                UnixBinding::path(PathAddress::new(inode, DName::from(path))?)
             }
-            Self::Abstract(name) => UnixEndpointBound::Abstract(
+            Self::Abstract(name) => UnixBinding::abstract_name(
                 netns
                     .unix_abstract_table()
-                    .create_abstract_name_bytes(&name)?,
+                    .create_abstract_name_bytes(socket_type, &name)?,
             ),
         };
 
@@ -215,27 +437,57 @@ impl UnixEndpoint {
     pub(super) fn connect_in(
         &self,
         netns: &Arc<NetNamespace>,
+        socket_type: UnixSocketType,
     ) -> Result<UnixEndpointBound, SystemError> {
         let bound = match self {
             Self::Unnamed => return Err(SystemError::EINVAL),
-            Self::Abstract(name) => UnixEndpointBound::Abstract(
-                netns
-                    .unix_abstract_table()
-                    .lookup_abstract_name_bytes(name)?,
-            ),
+            Self::Abstract(name) => {
+                UnixBinding::abstract_name(
+                    netns
+                        .unix_abstract_table()
+                        .lookup_abstract_name_bytes(socket_type, name)?,
+                )
+                .address
+            }
             Self::File(path) => {
                 let (inode_begin, path) = crate::filesystem::vfs::utils::user_path_at(
                     &ProcessManager::current_pcb(),
                     crate::filesystem::vfs::fcntl::AtFlags::AT_FDCWD.bits(),
                     path.trim(),
                 )?;
-                let inode =
-                    inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-                let abso_path = inode.absolute_path()?;
+                // All connect_in callers resolve before taking socket/backend
+                // guards. Lookup has not published the connection, so quota
+                // recovery may retry this read-only resolution stage only.
+                let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+                let inode = loop {
+                    match inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
+                        Ok(inode) => break inode,
+                        Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
+                            return Err(error);
+                        }
+                        Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
+                            use crate::cgroup::memory::runtime::{
+                                recover_charge, MemoryAllocPolicy, RecoveryDecision,
+                            };
+                            match recover_charge(
+                                &failure,
+                                MemoryAllocPolicy::ReclaimThenOom,
+                                0,
+                                &mut recovery,
+                            )? {
+                                RecoveryDecision::RetryOperation => continue,
+                                RecoveryDecision::Exhausted => return Err(SystemError::ENOMEM),
+                            }
+                        }
+                    }
+                };
+                if inode.metadata()?.file_type != FileType::Socket {
+                    return Err(SystemError::ECONNREFUSED);
+                }
                 // let inode = ProcessManager::current_mntns()
                 //     .root_inode()
                 //     .lookup_follow_symlink(path, VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
-                UnixEndpointBound::Path(DName::from(abso_path))
+                UnixEndpointBound::Path(PathAddress::new(inode, DName::from(path))?)
             }
         };
 

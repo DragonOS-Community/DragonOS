@@ -3,6 +3,7 @@ pub mod char;
 pub mod class;
 pub mod cpu;
 pub mod device;
+pub(crate) mod device_rename;
 pub mod firmware;
 pub mod hypervisor;
 pub mod init;

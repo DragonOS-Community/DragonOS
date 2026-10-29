@@ -1,3 +1,5 @@
+use core::arch::asm;
+
 use riscv::register::satp;
 use sbi_rt::{HartMask, SbiRet};
 use system_error::SystemError;
@@ -22,6 +24,7 @@ use crate::{
 use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
 
 pub mod bump;
+mod fault;
 pub(super) mod init;
 
 pub type PageMapper = crate::mm::page::PageMapper<RiscV64MMArch, LockedFrameAllocator>;
@@ -42,6 +45,25 @@ pub(self) static INNER_ALLOCATOR: SpinLock<Option<BuddyAllocator<MMArch>>> = Spi
 pub struct RiscV64MMArch;
 
 impl RiscV64MMArch {
+    /// Synchronize this hart's instruction stream with prior data writes.
+    #[inline]
+    pub fn local_flush_icache_all() {
+        unsafe { asm!("fence.i", options(nostack)) };
+    }
+
+    /// Execute a synchronous `fence.i` on one remote hart through SBI RFENCE.
+    /// A successful return is the acknowledgement required before a remote
+    /// memory writer may report completion to userspace.
+    pub fn remote_flush_icache(cpu: ProcessorId) -> Result<(), SbiRet> {
+        let mask = <ProcessorId as Into<HartMask>>::into(cpu);
+        let result = sbi_rt::remote_fence_i(mask);
+        if result.is_ok() {
+            Ok(())
+        } else {
+            Err(result)
+        }
+    }
+
     /// 使远程cpu的TLB中，指定地址范围的页失效
     #[allow(dead_code)]
     pub fn remote_invalidate_page(
@@ -147,6 +169,12 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const ENTRY_FLAG_HUGE_PAGE: usize = Self::ENTRY_FLAG_PRESENT | Self::ENTRY_FLAG_READWRITE;
 
+    #[inline(always)]
+    fn entry_is_leaf(_level: usize, flags: usize) -> bool {
+        flags & (Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE | Self::ENTRY_FLAG_EXEC)
+            != 0
+    }
+
     #[inline(never)]
     unsafe fn init() {
         riscv_mm_init().expect("init kernel memory management architecture failed");
@@ -182,6 +210,86 @@ impl MemoryManagementArch for RiscV64MMArch {
         satp::set(satp::Mode::Sv39, 0, ppn);
     }
 
+    unsafe fn copy_with_exception_table(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
+        let mut dst = dst;
+        let mut src = src;
+        let mut remaining = len;
+        let mut fault = 0usize;
+
+        asm!(
+            "beqz {remaining}, 3f",
+            "2:",
+            "lb {tmp}, 0({src})",
+            "5:",
+            "sb {tmp}, 0({dst})",
+            "addi {src}, {src}, 1",
+            "addi {dst}, {dst}, 1",
+            "addi {remaining}, {remaining}, -1",
+            "bnez {remaining}, 2b",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".quad 5b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            dst = inout(reg) dst,
+            src = inout(reg) src,
+            remaining = inout(reg) remaining,
+            tmp = out(reg) _,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+
+        if fault == 0 {
+            0
+        } else {
+            remaining
+        }
+    }
+
+    unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
+        let _pagefault_guard = crate::process::preempt::PageFaultDisabledGuard::new();
+        let mut dst = dst;
+        let mut remaining = len;
+        let value = value as usize;
+        let mut fault = 0usize;
+
+        asm!(
+            "beqz {remaining}, 3f",
+            "2:",
+            "sb {value}, 0({dst})",
+            "addi {dst}, {dst}, 1",
+            "addi {remaining}, {remaining}, -1",
+            "bnez {remaining}, 2b",
+            "j 3f",
+            "4:",
+            "li {fault}, 1",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b - .",
+            ".quad 4b - . + 8",
+            ".popsection",
+            dst = inout(reg) dst,
+            remaining = inout(reg) remaining,
+            value = in(reg) value,
+            fault = inout(reg) fault,
+            options(nostack)
+        );
+
+        if fault == 0 {
+            0
+        } else {
+            remaining
+        }
+    }
+
     fn virt_is_valid(virt: VirtAddr) -> bool {
         virt.is_canonical()
     }
@@ -190,11 +298,11 @@ impl MemoryManagementArch for RiscV64MMArch {
         unsafe { INITIAL_PGTABLE_VALUE }
     }
 
-    fn setup_new_usermapper() -> Result<UserMapper, SystemError> {
-        let new_umapper: crate::mm::page::PageMapper<MMArch, LockedFrameAllocator> = unsafe {
-            PageMapper::create(PageTableKind::User, LockedFrameAllocator)
-                .ok_or(SystemError::ENOMEM)?
-        };
+    fn setup_new_usermapper(
+        account: Option<&alloc::sync::Arc<crate::cgroup::memory::object::ObjectAccount>>,
+    ) -> Result<UserMapper, crate::mm::allocation::MemoryAllocationError> {
+        let new_umapper: crate::mm::page::PageMapper<MMArch, LockedFrameAllocator> =
+            unsafe { PageMapper::create_user(account)?.ok_or(SystemError::ENOMEM)? };
 
         let current_ktable: KernelMapper = KernelMapper::lock();
         let copy_mapping = |pml4_entry_no| unsafe {
@@ -222,6 +330,9 @@ impl MemoryManagementArch for RiscV64MMArch {
         }
 
         if let Some(vaddr) = phys.data().checked_add(Self::PHYS_OFFSET) {
+            if crate::mm::vmalloc::contains(VirtAddr::new(vaddr)) {
+                return None;
+            }
             return Some(VirtAddr::new(vaddr));
         } else {
             return None;
@@ -229,6 +340,9 @@ impl MemoryManagementArch for RiscV64MMArch {
     }
 
     unsafe fn virt_2_phys(virt: VirtAddr) -> Option<PhysAddr> {
+        if crate::mm::vmalloc::contains(virt) {
+            return None;
+        }
         if virt >= KERNEL_BEGIN_VA && virt < KERNEL_END_VA {
             let r = KERNEL_BEGIN_PA + (virt - KERNEL_BEGIN_VA);
             return Some(r);
@@ -261,8 +375,14 @@ impl MemoryManagementArch for RiscV64MMArch {
 
     const PAGE_READ: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY;
 
-    const PAGE_WRITE: usize =
-        PAGE_ENTRY_BASE | Self::ENTRY_FLAG_READONLY | Self::ENTRY_FLAG_WRITEABLE;
+    // Writable entries carry `DIRTY`: riscv64 has no user page-fault handler to
+    // set `D` lazily (`PAGE_FAULT_ENABLED == false`), so a `W=1, D=0` entry
+    // would fault on the first store. `PAGE_SHARED`/`PAGE_SHARED_EXEC` alias
+    // these constants, so private and shared writable mappings behave alike.
+    const PAGE_WRITE: usize = PAGE_ENTRY_BASE
+        | Self::ENTRY_FLAG_READONLY
+        | Self::ENTRY_FLAG_WRITEABLE
+        | Self::ENTRY_FLAG_DIRTY;
 
     const PAGE_EXEC: usize = PAGE_ENTRY_BASE | Self::ENTRY_FLAG_EXEC;
 
@@ -272,16 +392,21 @@ impl MemoryManagementArch for RiscV64MMArch {
     const PAGE_WRITE_EXEC: usize = PAGE_ENTRY_BASE
         | Self::ENTRY_FLAG_READONLY
         | Self::ENTRY_FLAG_EXEC
-        | Self::ENTRY_FLAG_WRITEABLE;
+        | Self::ENTRY_FLAG_WRITEABLE
+        | Self::ENTRY_FLAG_DIRTY;
 
     const PAGE_COPY: usize = Self::PAGE_READ;
     const PAGE_COPY_EXEC: usize = Self::PAGE_READ_EXEC;
     const PAGE_SHARED: usize = Self::PAGE_WRITE;
     const PAGE_SHARED_EXEC: usize = Self::PAGE_WRITE_EXEC;
 
-    const PAGE_COPY_NOEXEC: usize = 0;
-    const PAGE_READONLY: usize = 0;
-    const PAGE_READONLY_EXEC: usize = 0;
+    // These are used by `vm_get_page_prot`/`VMA::set_flags` when a mapping's
+    // protection is recomputed (e.g. the ELF loader's temporary-write ->
+    // final-protection mprotect). They must carry the present/user/accessed
+    // base bits; zeroing them made every R/RX remap publish a non-present PTE.
+    const PAGE_COPY_NOEXEC: usize = Self::PAGE_COPY;
+    const PAGE_READONLY: usize = Self::PAGE_READ;
+    const PAGE_READONLY_EXEC: usize = Self::PAGE_READ_EXEC;
 
     const PROTECTION_MAP: [EntryFlags<MMArch>; 16] = protection_map();
 
@@ -292,15 +417,31 @@ impl MemoryManagementArch for RiscV64MMArch {
 
 const fn protection_map() -> [EntryFlags<MMArch>; 16] {
     let mut map = [0; 16];
+    // riscv64 has no user page-fault handler (`PAGE_FAULT_ENABLED == false`), so
+    // a private writable mapping cannot rely on a write fault to become
+    // writable and must be published writable directly. Fault-capable
+    // architectures keep the read-only COW encoding. `PAGE_WRITE` and
+    // `PAGE_WRITE_EXEC` already carry `DIRTY`, so shared writable entries are
+    // consistent with these.
+    let private_write = if MMArch::PAGE_FAULT_ENABLED {
+        MMArch::PAGE_COPY
+    } else {
+        MMArch::PAGE_WRITE
+    };
+    let private_write_exec = if MMArch::PAGE_FAULT_ENABLED {
+        MMArch::PAGE_COPY_EXEC
+    } else {
+        MMArch::PAGE_WRITE_EXEC
+    };
     map[VmFlags::VM_NONE.bits()] = MMArch::PAGE_NONE;
     map[VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
-    map[VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY;
-    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_COPY;
+    map[VmFlags::VM_WRITE.bits()] = private_write;
+    map[VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] = private_write;
     map[VmFlags::VM_EXEC.bits()] = MMArch::PAGE_READONLY_EXEC;
     map[VmFlags::VM_EXEC.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY_EXEC;
-    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_COPY_EXEC;
+    map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits()] = private_write_exec;
     map[VmFlags::VM_EXEC.bits() | VmFlags::VM_WRITE.bits() | VmFlags::VM_READ.bits()] =
-        MMArch::PAGE_COPY_EXEC;
+        private_write_exec;
     map[VmFlags::VM_SHARED.bits()] = MMArch::PAGE_NONE;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_READ.bits()] = MMArch::PAGE_READONLY;
     map[VmFlags::VM_SHARED.bits() | VmFlags::VM_WRITE.bits()] = MMArch::PAGE_SHARED;
@@ -350,13 +491,56 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> Ent
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
 
+impl LockedFrameAllocator {
+    pub(crate) fn with_buddy<T>(
+        operation: impl FnOnce(&mut BuddyAllocator<MMArch>) -> T,
+    ) -> Option<T> {
+        INNER_ALLOCATOR.lock_irqsave().as_mut().map(operation)
+    }
+    pub(crate) fn pressure_snapshot() -> crate::mm::allocator::watermark::ZonePressureSnapshot {
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_ref()
+            .map(BuddyAllocator::pressure_snapshot)
+            .unwrap_or_default()
+    }
+    pub(crate) fn diagnostic_snapshot() -> Option<crate::mm::allocator::buddy::BuddySnapshot> {
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_ref()
+            .map(BuddyAllocator::diagnostic_snapshot)
+    }
+}
+
 impl FrameAllocator for LockedFrameAllocator {
+    unsafe fn allocate_request(
+        &mut self,
+        request: crate::mm::allocator::page_frame::FrameAllocationRequest,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        let request = request.normalized()?;
+        let level = request.reserve_level();
+        INNER_ALLOCATOR
+            .lock_irqsave()
+            .as_mut()
+            .and_then(|buddy| buddy.allocate_admitted(request, level))
+    }
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
-        } else {
-            return None;
-        }
+        self.allocate_request(
+            crate::mm::allocator::page_frame::FrameAllocationRequest::kernel(
+                count,
+                PhysAddr::new(usize::MAX),
+            ),
+        )
+    }
+
+    unsafe fn allocate_below(
+        &mut self,
+        count: PageFrameCount,
+        max_phys_addr: PhysAddr,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        self.allocate_request(
+            crate::mm::allocator::page_frame::FrameAllocationRequest::kernel(count, max_phys_addr),
+        )
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {

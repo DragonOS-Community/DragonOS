@@ -1,38 +1,38 @@
 # Internet Protocol Socket
 
-众所都周之，这个 Inet Socket 常用的分为 TCP, UDP 和 ICMP。基于实用性，目前实现的是 TCP 和 UDP。
+As is well known, the commonly used Inet Sockets are divided into TCP, UDP, and ICMP. For practical purposes, only TCP and UDP have been implemented so far.
 
-整个 Inet 网络协议栈与网卡的交互基于 `smoltcp` crate 来实现。
+The entire Inet network protocol stack interacts with the network card based on the `smoltcp` crate.
 
 ## Roadmap
 
 - [ ] TCP
-  - [x] 接受连接
-  - [ ] 发起连接
-  - [ ] 半双工关闭
+  - [x] Accept connections
+  - [ ] Initiate connections
+  - [ ] Half-duplex close
 - [x] UDP
-  - [x] 传输数据
+  - [x] Transmit data
 - [ ] ICMP
 - [ ] ioctl
 - [ ] Misc
-  - [ ] 硬中断转软中断的锁处理（避免死锁）
-  - [ ] epoll_item 优化
-  - [ ] 优化 `inet port` 资源管理
+  - [ ] Lock handling for converting hardware interrupts to software interrupts (to avoid deadlocks)
+  - [ ] epoll_item optimization
+  - [ ] Optimize `inet port` resource management
 
 ## TCP
 
-根据 TCP 状态机来 TCP Socket 的几个状态类
-- `Init`: 裸状态
-  - `Unbound`: 创建出来的状态
-  - `Bound`: 绑定了地址
-- `Listening`: 监听状态
-- `Connecting`: 连接中状态
-- `Established`: 连接建立状态
+Several state classes of the TCP Socket are defined according to the TCP state machine:
+- `Init`: Raw state
+  - `Unbound`: State after creation
+  - `Bound`: State after binding an address
+- `Listening`: Listening state
+- `Connecting`: Connecting state
+- `Established`: Connected state
 
 ## UDP
 
-UDP 是无连接的，所以没有连接状态。UDP 的状态只有 `Unbound` 和 `Bound` 两种。
+UDP is connectionless, so there is no connection state. The UDP state only includes `Unbound` and `Bound`.
 
 ## BoundInner
 
-另一个对于 Inet Socket 的抽象，用于处理绑定网卡的 `socket`，从而封装 `smoltcp` 的接口，提供统一的资源管理。
+Another abstraction for the Inet Socket, used to handle the `socket` bound to the network card, thereby encapsulating the `smoltcp` interface and providing unified resource management.

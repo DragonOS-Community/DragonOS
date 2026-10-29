@@ -5,39 +5,34 @@ use core::{
     ops::Range,
 };
 
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use elf::{
     abi::{ET_DYN, ET_EXEC, PT_GNU_PROPERTY, PT_INTERP, PT_LOAD},
     endian::AnyEndian,
     file::FileHeader,
     segment::{ProgramHeader, SegmentTable},
 };
-use log::error;
 use system_error::SystemError;
 
 use crate::{
     arch::{CurrentElfArch, MMArch},
     driver::base::block::SeekFrom,
-    filesystem::vfs::{fcntl::AtFlags, open::do_open_execat},
-    libs::align::page_align_up,
+    filesystem::vfs::{
+        fcntl::AtFlags, file::File, open::do_open_execat, write_access::InodeWriteGuard,
+    },
     mm::{
         allocator::page_frame::{PageFrameCount, VirtPageFrame},
         syscall::{MapFlags, ProtFlags},
-        ucontext::InnerAddressSpace,
+        ucontext::AddressSpace,
         MemoryManagementArch, VirtAddr,
     },
     process::{
         abi::AtType,
-        exec::{
-            BinaryLoader, BinaryLoaderResult, ExecError, ExecInterpFlags, ExecLoadMode, ExecParam,
-            ExecParamFlags,
-        },
+        exec::{BinaryLoader, BinaryLoaderResult, ExecError, ExecLoadMode, ExecParam},
         ProcessFlags, ProcessManager,
     },
-    syscall::user_access::{clear_user, copy_to_user},
+    syscall::user_access::{clear_user_protected, copy_to_user_protected},
 };
-
-use crate::libs::rwsem::RwSemWriteGuard;
 
 // 存放跟架构相关的Elf属性，
 pub trait ElfArch: Clone + Copy + Debug {
@@ -49,6 +44,71 @@ pub trait ElfArch: Clone + Copy + Debug {
 pub struct ElfLoader;
 
 pub const ELF_LOADER: ElfLoader = ElfLoader::new();
+
+/// Per-exec metadata, prepared before the old image is committed. The table is
+/// borrowed on demand so this owner never contains a self-reference.
+struct PreparedElf {
+    header: FileHeader<AnyEndian>,
+    headers: Vec<u8>,
+}
+
+impl PreparedElf {
+    fn prepare(file: &File, header: FileHeader<AnyEndian>) -> Result<Self, SystemError> {
+        let headers = ElfLoader::read_program_headers(file, &header)?;
+        Ok(Self { header, headers })
+    }
+
+    fn segments(&self) -> SegmentTable<'_, AnyEndian> {
+        SegmentTable::new(self.header.endianness, self.header.class, &self.headers)
+    }
+}
+
+/// The interpreter needs an executable file and metadata, not another process
+/// argument/auxv builder. Release write exclusion before the file mount pin.
+struct PreparedInterpreter {
+    _write_guard: Arc<InodeWriteGuard>,
+    file: Arc<File>,
+    elf: PreparedElf,
+}
+
+impl PreparedInterpreter {
+    fn prepare(file: Arc<File>, vm: &Arc<AddressSpace>) -> Result<Self, ExecError> {
+        let guard = InodeWriteGuard::deny_write(file.inode()).map_err(ExecError::SystemError)?;
+        ExecParam::would_dump_file(&file, vm).map_err(ExecError::SystemError)?;
+        let mut bytes = [0; 64];
+        if file
+            .pread(0, bytes.len(), &mut bytes)
+            .map_err(ExecError::SystemError)?
+            != bytes.len()
+        {
+            return Err(ExecError::SystemError(SystemError::EIO));
+        }
+        let bad = || ExecError::SystemError(SystemError::ELIBBAD);
+        let header = ElfLoader::parse_ehdr(&bytes).map_err(|_| bad())?;
+        // Interpreter validation is complete before begin_new_exec(), as in
+        // Linux load_elf_binary(), rather than in the mapping phase.
+        #[cfg(target_arch = "x86_64")]
+        let arch_matches = ElfMachine::from(header.e_machine) == ElfMachine::X86_64;
+        #[cfg(target_arch = "riscv64")]
+        let arch_matches = ElfMachine::from(header.e_machine) == ElfMachine::RiscV;
+        #[cfg(target_arch = "loongarch64")]
+        let arch_matches = ElfMachine::from(header.e_machine) == ElfMachine::LoongArch;
+        if header.class != elf::file::Class::ELF64
+            || !arch_matches
+            || (header.e_type != ET_EXEC && header.e_type != ET_DYN)
+        {
+            return Err(bad());
+        }
+        // Linux load_elf_phdrs folds allocation/read failures into ELIBBAD for
+        // an interpreter (and ENOEXEC for the main executable).
+        let elf = PreparedElf::prepare(&file, header).map_err(|_| bad())?;
+        Ok(Self {
+            _write_guard: guard,
+            file,
+            elf,
+        })
+    }
+}
 
 impl ElfLoader {
     /// 读取文件的缓冲区大小
@@ -129,10 +189,10 @@ impl ElfLoader {
     /// - `user_vm_guard` - 用户虚拟地址空间
     /// - `start` - 本次映射的起始地址
     /// - `end` - 本次映射的结束地址（不包含）
-    /// - `prot_flags` - 本次映射的权限
+    /// - `prot_flags` - BSS 所属 PT_LOAD 段的权限
     fn set_elf_brk(
         &self,
-        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
+        mm: &Arc<crate::mm::ucontext::AddressSpace>,
         start: VirtAddr,
         end: VirtAddr,
         prot_flags: ProtFlags,
@@ -141,20 +201,17 @@ impl ElfLoader {
         let end = Self::elf_page_align_up(end);
         // debug!("set_elf_brk: start={:?}, end={:?}", start, end);
         if end > start {
-            let r = user_vm_guard.map_anonymous(
+            mm.map_anonymous_wait(
                 start,
                 end - start,
-                prot_flags,
+                Self::elf_brk_prot_flags(prot_flags),
                 MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
                 false,
                 true,
-            );
-            // debug!("set_elf_brk: map_anonymous: r={:?}", r);
-            if r.is_err() {
-                error!("set_elf_brk: map_anonymous failed, err={:?}", r);
-                return Err(ExecError::OutOfMemory);
-            }
+            )
+            .map_err(ExecError::SystemError)?;
         }
+        let mut user_vm_guard = mm.write();
         user_vm_guard.elf_brk_start = end;
         user_vm_guard.elf_brk = end;
         return Ok(());
@@ -176,88 +233,16 @@ impl ElfLoader {
         )
     }
 
-    /// 映射只读ELF段（文件映射）
+    /// 生成 ELF brk/BSS 匿名映射权限。
     ///
-    /// 对"非写段"(PF_W=0，包括代码段与只读段)改为文件映射：
-    /// - 通过 pagecache + 用户态缺页同步读盘实现按需加载
-    /// - 最终用户态权限严格按 make_prot() 生成（无 PF_W -> 不含 PROT_WRITE）
-    ///
-    /// ## 参数
-    ///
-    /// - `user_vm_guard`：用户空间地址空间
-    /// - `param`：执行参数
-    /// - `addr_to_map`：映射的虚拟地址
-    /// - `prot`：保护标志
-    /// - `map_flags`：映射标志
-    /// - `file_offset`：段在文件中的偏移
-    /// - `beginning_page_offset`：页内偏移
-    /// - `map_size`：映射大小
-    /// - `total_size`：ELF文件总大小
-    /// - `map_err_handler`：错误处理函数
-    ///
-    /// ## 返回值
-    ///
-    /// 返回映射的虚拟地址和成功标志
-    #[allow(clippy::too_many_arguments)]
-    fn map_readonly_segment(
-        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
-        param: &ExecParam,
-        addr_to_map: VirtAddr,
-        prot: ProtFlags,
-        map_flags: MapFlags,
-        file_offset: usize,
-        beginning_page_offset: usize,
-        map_size: usize,
-        total_size: usize,
-        map_err_handler: impl FnOnce(SystemError) -> SystemError,
-    ) -> Result<(VirtAddr, bool), SystemError> {
-        // Linux: off = p_offset - ELF_PAGEOFFSET(p_vaddr)
-        let file_page_offset = file_offset
-            .checked_sub(beginning_page_offset)
-            .ok_or(SystemError::ENOEXEC)?;
-
-        // ELF 约束：p_offset % PAGE == p_vaddr % PAGE，保证 off 页对齐
-        if (file_page_offset & (CurrentElfArch::ELF_PAGE_SIZE - 1)) != 0 {
-            return Err(SystemError::ENOEXEC);
+    /// Linux `vm_brk_flags()` 只从 PT_LOAD 权限中额外透传 exec 位；
+    /// 基础 data VMA 权限来自 `VM_DATA_DEFAULT_FLAGS`，这里显式表达为可读写。
+    fn elf_brk_prot_flags(load_prot_flags: ProtFlags) -> ProtFlags {
+        let mut prot = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        if load_prot_flags.contains(ProtFlags::PROT_EXEC) {
+            prot |= ProtFlags::PROT_EXEC;
         }
-
-        // total_size 逻辑保持与原实现一致：首段先映射 total_size 再 munmap 空洞尾部
-        let map_len = if total_size != 0 {
-            Self::elf_page_align_up(VirtAddr::new(total_size)).data()
-        } else {
-            map_size
-        };
-        if map_len < map_size {
-            return Err(SystemError::EINVAL);
-        }
-
-        let file = param.file();
-        let start_page = user_vm_guard
-            .file_mapping_with_file(
-                file,
-                addr_to_map,
-                map_len,
-                prot,
-                map_flags,
-                file_page_offset,
-                false,
-                false,
-            )
-            .map_err(map_err_handler)?;
-        let mapped = start_page.virt_address();
-
-        if total_size != 0 {
-            let to_unmap = mapped + map_size;
-            let to_unmap_size = map_len - map_size;
-            if to_unmap_size > 0 {
-                user_vm_guard.munmap(
-                    VirtPageFrame::new(to_unmap),
-                    PageFrameCount::from_bytes(to_unmap_size).unwrap(),
-                )?;
-            }
-        }
-
-        Ok((mapped, true))
+        prot
     }
 
     /// 根据ELF的p_flags生成对应的ProtFlags
@@ -279,202 +264,141 @@ impl ElfLoader {
         return prot;
     }
 
-    /// 加载ELF文件到用户空间
-    ///
-    /// 参考Linux的elf_map函数
-    /// https://code.dragonos.org.cn/xref/linux-5.19.10/fs/binfmt_elf.c?r=&mo=22652&fi=824#365
-    /// ## 参数
-    ///
-    /// - `user_vm_guard`：用户空间地址空间
-    /// - `param`：执行参数
-    /// - `phent`：ELF文件的ProgramHeader
-    /// - `addr_to_map`：当前段应该被加载到的内存地址
-    /// - `prot`：保护标志
-    /// - `map_flags`：映射标志
-    /// - `total_size`：ELF文件的总大小
-    ///
-    /// ## 返回值
-    ///
-    /// - `Ok((VirtAddr, bool))`：如果成功加载，则bool值为true，否则为false. VirtAddr为加载的地址
-    #[allow(clippy::too_many_arguments)]
+    /// Map a PT_LOAD through the normal file-mmap lifecycle. The caller must
+    /// not hold the address-space lock: mmap hooks, population and BSS writes
+    /// can fault or acquire that lock themselves.
     fn load_elf_segment(
-        user_vm_guard: &mut RwSemWriteGuard<'_, InnerAddressSpace>,
-        param: &mut ExecParam,
+        file: &Arc<File>,
+        vm: &Arc<AddressSpace>,
         phent: &ProgramHeader,
-        mut addr_to_map: VirtAddr,
-        prot: &ProtFlags,
-        map_flags: &MapFlags,
+        addr_to_map: VirtAddr,
+        prot: ProtFlags,
+        map_flags: MapFlags,
         total_size: usize,
-    ) -> Result<(VirtAddr, bool), SystemError> {
-        // log::debug!("load_elf_segment: addr_to_map={:?}", addr_to_map);
-        // defer!({
-        //     log::debug!("load_elf_segment done");
-        // });
-
-        // 映射位置的偏移量（页内偏移）
-        // 按 Linux 语义：使用 p_vaddr 的页内偏移（ELF_PAGEOFFSET(p_vaddr)）
-        let beginning_page_offset = (phent.p_vaddr as usize) & (CurrentElfArch::ELF_PAGE_SIZE - 1);
-        addr_to_map = Self::elf_page_start(addr_to_map);
-        // 计算要映射的内存的大小
-        let map_size = phent.p_filesz as usize + beginning_page_offset;
-        let map_size = Self::elf_page_align_up(VirtAddr::new(map_size)).data();
-        // 当前段在文件中的大小
-        let seg_in_file_size = phent.p_filesz as usize;
-        // 当前段在文件中的偏移量
-        let file_offset = phent.p_offset as usize;
-
-        // 如果当前段的大小为0，则直接返回.
-        // 段在文件中的大小为0,是合法的，但是段在内存中的大小不能为0
-        if map_size == 0 {
-            return Ok((addr_to_map, true));
+    ) -> Result<VirtAddr, SystemError> {
+        let page_offset = Self::elf_page_offset(VirtAddr::new(phent.p_vaddr as usize));
+        let addr_to_map = Self::elf_page_start(addr_to_map);
+        if phent.p_filesz > phent.p_memsz
+            || phent.p_vaddr.checked_add(phent.p_memsz).is_none()
+            || phent.p_vaddr.saturating_add(phent.p_memsz) > MMArch::USER_END_VADDR.data() as u64
+        {
+            return Err(SystemError::ENOEXEC);
         }
-
-        let map_err_handler = |err: SystemError| {
-            if err == SystemError::EEXIST {
-                error!(
-                    "Pid: {:?}, elf segment at {:p} overlaps with existing mapping",
-                    ProcessManager::current_pcb().raw_pid(),
-                    addr_to_map.as_ptr::<u8>()
-                );
-            }
-            err
+        let align_len = |len: usize| {
+            len.checked_add(CurrentElfArch::ELF_PAGE_SIZE - 1)
+                .map(|len| len & !(CurrentElfArch::ELF_PAGE_SIZE - 1))
+                .ok_or(SystemError::ENOEXEC)
         };
-
-        // 对"非写段"(PF_W=0，包括代码段与只读段)改为文件映射
-        // - 通过 pagecache + 用户态缺页同步读盘实现按需加载
-        // - 最终用户态权限严格按 make_prot() 生成（无 PF_W -> 不含 PROT_WRITE）
-        // 解释器(PT_INTERP 对应 ld.so)也同样适用：其只读段可安全走 filemap
-        let is_readonly_load = (phent.p_flags & elf::abi::PF_W) == 0;
-        if is_readonly_load {
-            return Self::map_readonly_segment(
-                user_vm_guard,
-                param,
+        // A pure BSS segment has no file mapping, including its partial first
+        // page. The existing BSS path maps the subsequent whole pages.
+        let map_size = if phent.p_filesz == 0 {
+            if phent.p_memsz == 0 {
+                0
+            } else {
+                align_len(page_offset)?
+            }
+        } else {
+            align_len(
+                (phent.p_filesz as usize)
+                    .checked_add(page_offset)
+                    .ok_or(SystemError::ENOEXEC)?,
+            )?
+        };
+        let map_len = if total_size != 0 {
+            align_len(total_size)?
+        } else {
+            map_size
+        };
+        if map_len < map_size {
+            return Err(SystemError::ENOEXEC);
+        }
+        if map_len == 0 {
+            return Ok(addr_to_map);
+        }
+        let mapped = if phent.p_filesz == 0 {
+            vm.map_anonymous_wait(
                 addr_to_map,
-                *prot,
-                *map_flags,
-                file_offset,
-                beginning_page_offset,
-                map_size,
-                total_size,
-                map_err_handler,
-            );
-        }
-
-        // 由于后面需要把ELF文件的内容加载到内存，因此暂时把当前段的权限设置为可写
-        let tmp_prot = if !prot.contains(ProtFlags::PROT_WRITE) {
-            *prot | ProtFlags::PROT_WRITE
+                map_len,
+                Self::elf_brk_prot_flags(prot),
+                map_flags | MapFlags::MAP_ANONYMOUS,
+                false,
+                false,
+            )?
+            .virt_address()
         } else {
-            *prot
+            let file_offset = (phent.p_offset as usize)
+                .checked_sub(page_offset)
+                .ok_or(SystemError::ENOEXEC)?;
+            if file_offset & (CurrentElfArch::ELF_PAGE_SIZE - 1) != 0
+                || file_offset
+                    .checked_add(map_len)
+                    .is_none_or(|end| end > isize::MAX as usize)
+            {
+                return Err(SystemError::ENOEXEC);
+            }
+            let load_prot = if MMArch::PAGE_FAULT_ENABLED {
+                prot
+            } else {
+                prot | ProtFlags::PROT_WRITE
+            };
+            let mapped = vm
+                .file_mapping_with_file(
+                    file.clone(),
+                    addr_to_map,
+                    map_len,
+                    load_prot,
+                    map_flags,
+                    file_offset,
+                    false,
+                    false,
+                )?
+                .virt_address();
+            // Architectures without user page faults still need explicit
+            // population. Copy the file-mapped prefix/tail too, not just the
+            // segment bytes; zeroed allocation supplies bytes past EOF.
+            if !MMArch::PAGE_FAULT_ENABLED {
+                let file_size = file.metadata()?.size.max(0) as usize;
+                let read_len = min(map_size, file_size.saturating_sub(file_offset));
+                Self::do_load_file(mapped, read_len, file_offset, file)?;
+                if load_prot != prot {
+                    vm.mprotect_wait(
+                        VirtPageFrame::new(mapped),
+                        PageFrameCount::from_bytes(map_size).unwrap(),
+                        prot,
+                    )?;
+                }
+            }
+            mapped
         };
-
-        // 映射到的虚拟地址。请注意，这个虚拟地址是user_vm_guard这个地址空间的虚拟地址。不一定是当前进程地址空间的
-        let map_addr: VirtAddr;
-
-        // total_size is the size of the ELF (interpreter) image.
-        // The _first_ mmap needs to know the full size, otherwise
-        // randomization might put this image into an overlapping
-        // position with the ELF binary image. (since size < total_size)
-        // So we first map the 'big' image - and unmap the remainder at
-        // the end. (which unmap is needed for ELF images with holes.)
-        if total_size != 0 {
-            let total_size = Self::elf_page_align_up(VirtAddr::new(total_size)).data();
-
-            // log::debug!("total_size={}", total_size);
-
-            map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, total_size, tmp_prot, *map_flags, false, true)
-                .map_err(map_err_handler)?
-                .virt_address();
-
-            let to_unmap = map_addr + map_size;
-            let to_unmap_size = total_size - map_size;
-
-            user_vm_guard.munmap(
-                VirtPageFrame::new(to_unmap),
-                PageFrameCount::from_bytes(to_unmap_size).unwrap(),
+        // Only the first PT_LOAD reserves the whole image for address choice.
+        // For an aligned pure-BSS first segment, retain no page here; the BSS
+        // path below will establish its anonymous range at the chosen address.
+        if map_len > map_size {
+            vm.munmap_wait(
+                VirtPageFrame::new(mapped + map_size),
+                PageFrameCount::from_bytes(map_len - map_size).unwrap(),
             )?;
-
-            // 加载文件到内存
-            Self::do_load_file(
-                map_addr + beginning_page_offset,
-                seg_in_file_size,
-                file_offset,
-                param,
-            )?;
-            if tmp_prot != *prot {
-                user_vm_guard.mprotect(
-                    VirtPageFrame::new(map_addr),
-                    PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
-                    *prot,
-                )?;
-            }
-        } else {
-            // debug!("total size = 0");
-
-            map_addr = user_vm_guard
-                .map_anonymous(addr_to_map, map_size, tmp_prot, *map_flags, false, true)?
-                .virt_address();
-            // debug!(
-            //     "map ok: addr_to_map={:?}, map_addr={map_addr:?},beginning_page_offset={beginning_page_offset:?}",
-            //     addr_to_map
-            // );
-
-            // 加载文件到内存
-            Self::do_load_file(
-                map_addr + beginning_page_offset,
-                seg_in_file_size,
-                file_offset,
-                param,
-            )?;
-
-            if tmp_prot != *prot {
-                user_vm_guard.mprotect(
-                    VirtPageFrame::new(map_addr),
-                    PageFrameCount::from_bytes(page_align_up(map_size)).unwrap(),
-                    *prot,
-                )?;
-            }
         }
-        // debug!("load_elf_segment OK: map_addr={:?}", map_addr);
-        return Ok((map_addr, true));
+        Ok(mapped)
     }
 
     /// 加载elf动态链接器
     ///
     /// ## 参数
     ///
-    /// - `interp_elf_ex`:动态链接器
+    /// - `interpreter`:已准备的动态链接器文件及元数据
     /// - `load_bias`偏移量
     ///
     /// ## TODO
     ///
     /// 添加一个Arch state抽象，描述架构相关的elf state(参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#592)
     fn load_elf_interp(
-        interp_elf_ex: &mut ExecParam,
+        interpreter: &PreparedInterpreter,
+        vm: &Arc<AddressSpace>,
         load_bias: usize,
-    ) -> Result<BinaryLoaderResult, ExecError> {
-        // log::debug!("loading elf interp");
-        // defer!({
-        //     log::debug!("load_elf_interp done");
-        // });
-        let mut head_buf = [0u8; 512];
-        interp_elf_ex
-            .file_ref()
-            .lseek(SeekFrom::SeekSet(0))
-            .map_err(|_| ExecError::NotSupported)?;
-        let _bytes = interp_elf_ex
-            .file_ref()
-            .read(512, &mut head_buf)
-            .map_err(|_| ExecError::NotSupported)?;
-        let interp_hdr =
-            Self::parse_ehdr(head_buf.as_ref()).map_err(|_| ExecError::NotExecutable)?;
-        if interp_hdr.e_type != ET_EXEC && interp_hdr.e_type != ET_DYN {
-            return Err(ExecError::NotExecutable);
-        }
-        let mut phdr_buf = Vec::new();
-        let phdr_table = Self::parse_segments(interp_elf_ex, &interp_hdr, &mut phdr_buf)
-            .map_err(|_| ExecError::ParseError)?
-            .ok_or(ExecError::ParseError)?;
+    ) -> Result<(BinaryLoaderResult, VirtAddr), ExecError> {
+        let interp_hdr = &interpreter.elf.header;
+        let phdr_table = interpreter.elf.segments();
         //TODO 架构相关检查 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#610
         let mut total_size = Self::total_mapping_size(&phdr_table);
 
@@ -500,22 +424,15 @@ impl ElfLoader {
                     addr_to_map = VirtAddr::new(0);
                 }
                 let map_addr = Self::load_elf_segment(
-                    &mut interp_elf_ex.vm().clone().write(),
-                    interp_elf_ex,
+                    &interpreter.file,
+                    vm,
                     &section,
                     addr_to_map,
-                    &elf_prot,
-                    &elf_type,
+                    elf_prot,
+                    elf_type,
                     total_size,
                 )
-                .map_err(|e| {
-                    log::error!("Failed to load elf interpreter :{:?}", e);
-                    return ExecError::InvalidParemeter;
-                })?;
-                if !map_addr.1 {
-                    return Err(ExecError::BadAddress(Some(map_addr.0)));
-                }
-                let map_addr = map_addr.0;
+                .map_err(ExecError::SystemError)?;
                 total_size = 0;
                 if !load_addr_set && interp_hdr.e_type == ET_DYN {
                     load_addr =
@@ -523,22 +440,25 @@ impl ElfLoader {
                     load_addr_set = true;
                 }
                 let addr = load_addr + TryInto::<usize>::try_into(section.p_vaddr).unwrap();
-                if addr >= MMArch::USER_END_VADDR
+                // Validate segment parameters (aligned with main load() function)
+                let seg_end = section.p_vaddr.checked_add(section.p_memsz);
+                if seg_end.is_none()
+                    || addr >= MMArch::USER_END_VADDR
                     || section.p_filesz > section.p_memsz
-                    || TryInto::<usize>::try_into(section.p_memsz).unwrap()
-                        > MMArch::USER_END_VADDR.data()
-                    || MMArch::USER_END_VADDR - TryInto::<usize>::try_into(section.p_memsz).unwrap()
-                        < addr
+                    || (section.p_memsz as usize) > MMArch::USER_END_VADDR.data()
+                    || MMArch::USER_END_VADDR.data() - (section.p_memsz as usize) < addr.data()
                 {
                     return Err(ExecError::OutOfMemory);
                 }
 
+                // Safety: validation above ensures p_vaddr + p_filesz <= p_vaddr + p_memsz does not overflow
                 let addr = load_addr
                     + TryInto::<usize>::try_into(section.p_vaddr + section.p_filesz).unwrap();
                 if addr > elf_bss {
                     elf_bss = addr;
                 }
 
+                // Safety: validation above ensures p_vaddr + p_memsz does not overflow u64
                 let addr = load_addr
                     + TryInto::<usize>::try_into(section.p_vaddr + section.p_memsz).unwrap();
                 if addr > last_bss {
@@ -554,38 +474,24 @@ impl ElfLoader {
             if bss_prot.is_none() {
                 return Err(ExecError::InvalidParemeter);
             }
-            let mut bss_prot = bss_prot.unwrap();
-            if bss_prot.contains(ProtFlags::PROT_EXEC) {
-                bss_prot = ProtFlags::PROT_EXEC;
-            } else {
-                bss_prot = ProtFlags::PROT_NONE;
-            }
-            interp_elf_ex
-                .vm()
-                .clone()
-                .write()
-                .map_anonymous(
-                    elf_bss,
-                    last_bss - elf_bss,
-                    bss_prot,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
-                    false,
-                    true,
-                )
-                .map_err(|e| match e {
-                    SystemError::EINVAL => ExecError::InvalidParemeter,
-                    SystemError::ENOMEM => ExecError::OutOfMemory,
-                    _ => return ExecError::InvalidParemeter,
-                })?;
+            let bss_prot = Self::elf_brk_prot_flags(bss_prot.unwrap());
+            vm.map_anonymous_wait(
+                elf_bss,
+                last_bss - elf_bss,
+                bss_prot,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
+                false,
+                true,
+            )
+            .map_err(ExecError::SystemError)?;
         }
-        load_addr += TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
-        if load_addr > MMArch::USER_END_VADDR {
-            return Err(ExecError::BadAddress(Some(
-                load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap(),
-            )));
+        let interp_base = load_addr;
+        let entry = load_addr + TryInto::<usize>::try_into(interp_hdr.e_entry).unwrap();
+        if entry > MMArch::USER_END_VADDR {
+            return Err(ExecError::BadAddress(Some(entry)));
         }
         // log::debug!("sucessfully load elf interp");
-        return Ok(BinaryLoaderResult::new(load_addr));
+        return Ok((BinaryLoaderResult::new(entry), interp_base));
     }
 
     /// 加载ELF文件到用户空间
@@ -595,19 +501,42 @@ impl ElfLoader {
     /// - `vaddr`：要加载到的虚拟地址
     /// - `size`：要加载的大小
     /// - `offset_in_file`：在文件内的偏移量
-    /// - `param`：执行参数
+    /// - `file`：待填充映射对应的文件
     fn do_load_file(
+        vaddr: VirtAddr,
+        size: usize,
+        offset_in_file: usize,
+        file: &File,
+    ) -> Result<(), SystemError> {
+        Self::do_load_file_with(vaddr, size, offset_in_file, file, |buf_size| {
+            #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+            {
+                crate::mm::kernel_buffer::KernelBuffer::new_zeroed_recovering(buf_size)
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+            {
+                let mut buffer = Vec::new();
+                buffer
+                    .try_reserve_exact(buf_size)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                buffer.resize(buf_size, 0);
+                Ok(buffer)
+            }
+        })
+    }
+
+    fn do_load_file_with<B: core::ops::DerefMut<Target = [u8]>>(
         mut vaddr: VirtAddr,
         size: usize,
         offset_in_file: usize,
-        param: &mut ExecParam,
+        file: &crate::filesystem::vfs::file::File,
+        allocate: impl FnOnce(usize) -> Result<B, SystemError>,
     ) -> Result<(), SystemError> {
-        let file = param.file_ref();
         if (file.metadata()?.size as usize) < offset_in_file + size {
             return Err(SystemError::ENOEXEC);
         }
         let buf_size = min(size, Self::FILE_READ_BUF_SIZE);
-        let mut buf = vec![0u8; buf_size];
+        let mut buf = allocate(buf_size)?;
 
         let mut remain = size;
 
@@ -615,10 +544,13 @@ impl ElfLoader {
 
         while remain > 0 {
             let read_size = min(remain, buf_size);
-            file.read(read_size, &mut buf[..read_size])?;
-            // debug!("copy_to_user: vaddr={:?}, read_size = {read_size}", vaddr);
+            let read_size = file.read(read_size, &mut buf[..read_size])?;
+            if read_size == 0 {
+                return Err(SystemError::ENOEXEC);
+            }
             unsafe {
-                copy_to_user(vaddr, &buf[..read_size]).map_err(|_| SystemError::EFAULT)?;
+                copy_to_user_protected(vaddr, &buf[..read_size])
+                    .map_err(|_| SystemError::EFAULT)?;
             }
 
             vaddr += read_size;
@@ -632,12 +564,15 @@ impl ElfLoader {
         let nbyte = Self::elf_page_offset(elf_bss);
         if nbyte > 0 {
             let nbyte = CurrentElfArch::ELF_PAGE_SIZE - nbyte;
-            unsafe { clear_user(elf_bss, nbyte).map_err(|_| SystemError::EFAULT) }?;
+            unsafe { clear_user_protected(elf_bss, nbyte).map_err(|_| SystemError::EFAULT) }?;
         }
         return Ok(());
     }
 
-    /// 参考https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1158，获取要加载的total_size
+    /// Compute total mapping size for all PT_LOAD segments.
+    /// Ref: https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1158
+    ///
+    /// Returns 0 if any PT_LOAD segment has `p_vaddr + p_memsz` overflow (malformed ELF).
     fn total_mapping_size(ehdr_table: &SegmentTable<'_, AnyEndian>) -> usize {
         let mut has_load = false;
         let mut min_address = VirtAddr::new(usize::MAX);
@@ -646,18 +581,15 @@ impl ElfLoader {
             .into_iter()
             .filter(|seg| seg.p_type == elf::abi::PT_LOAD);
         for seg_to_load in loadable_sections {
-            min_address = min(
-                min_address,
-                Self::elf_page_start(VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap())),
-            );
-            max_address = max(
-                max_address,
-                VirtAddr::new(
-                    (seg_to_load.p_vaddr + seg_to_load.p_memsz)
-                        .try_into()
-                        .unwrap(),
-                ),
-            );
+            // On 64-bit platforms, u64 -> usize never overflows
+            let vaddr: usize = seg_to_load.p_vaddr.try_into().unwrap();
+            // Detect u64 overflow in p_vaddr + p_memsz (malformed ELF)
+            let end = match seg_to_load.p_vaddr.checked_add(seg_to_load.p_memsz) {
+                Some(v) => v,
+                None => return 0, // overflow -> invalid ELF, return 0 so loader rejects it
+            };
+            min_address = min(min_address, Self::elf_page_start(VirtAddr::new(vaddr)));
+            max_address = max(max_address, VirtAddr::new(end.try_into().unwrap()));
             has_load = true;
         }
         let total_size = if has_load {
@@ -681,6 +613,7 @@ impl ElfLoader {
         param: &mut ExecParam,
         entrypoint_vaddr: VirtAddr,
         phdr_vaddr: Option<VirtAddr>,
+        interpreter_base: Option<VirtAddr>,
         ehdr: &elf::file::FileHeader<AnyEndian>,
     ) -> Result<(), ExecError> {
         use crate::process::rseq::{ORIG_RSEQ_SIZE, RSEQ_ALIGN};
@@ -694,6 +627,7 @@ impl ElfLoader {
         init_info
             .auxv
             .insert(AtType::PageSize as u8, MMArch::PAGE_SIZE);
+        init_info.auxv.insert(AtType::Flags as u8, 0);
         init_info.auxv.insert(AtType::Phdr as u8, phdr_vaddr.data());
         init_info
             .auxv
@@ -701,6 +635,20 @@ impl ElfLoader {
         init_info
             .auxv
             .insert(AtType::Entry as u8, entrypoint_vaddr.data());
+        init_info.auxv.insert(
+            AtType::Base as u8,
+            interpreter_base.unwrap_or(VirtAddr::new(0)).data(),
+        );
+        let cred = crate::process::ProcessManager::current_pcb().cred();
+        init_info.auxv.insert(AtType::Uid as u8, cred.uid.data());
+        init_info.auxv.insert(AtType::EUid as u8, cred.euid.data());
+        init_info.auxv.insert(AtType::Gid as u8, cred.gid.data());
+        init_info.auxv.insert(AtType::EGid as u8, cred.egid.data());
+        init_info.auxv.insert(AtType::HwCap as u8, 0);
+        init_info.auxv.insert(AtType::ClkTck as u8, 100);
+        init_info.auxv.insert(AtType::Secure as u8, 0);
+        init_info.auxv.insert(AtType::HwCap2 as u8, 0);
+        init_info.auxv.insert(AtType::MinSigStackSize as u8, 2048);
 
         // 添加 rseq 相关的 auxv
         init_info
@@ -729,82 +677,49 @@ impl ElfLoader {
         return Ok(ehdr);
     }
 
-    /// 解析文件的program header table
-    ///
-    /// ## 参数
-    ///
-    /// - `param`：执行参数
-    /// - `ehdr`：文件头
-    /// - `data_buf`：用于缓存SegmentTable的Vec。
-    ///   这是因为SegmentTable的生命周期与data_buf一致。初始化这个Vec的大小为0即可。
-    ///
-    /// ## 说明
-    ///
-    /// 这个函数由elf库的`elf::elf_bytes::find_phdrs`修改而来。
-    fn parse_segments<'a>(
-        param: &mut ExecParam,
-        ehdr: &FileHeader<AnyEndian>,
-        data_buf: &'a mut Vec<u8>,
-    ) -> Result<Option<elf::segment::SegmentTable<'a, AnyEndian>>, elf::ParseError> {
-        // It's Ok to have no program headers
-        if ehdr.e_phoff == 0 {
-            return Ok(None);
-        }
-        let file = param.file_ref();
-        // If the number of segments is greater than or equal to PN_XNUM (0xffff),
-        // e_phnum is set to PN_XNUM, and the actual number of program header table
-        // entries is contained in the sh_info field of the section header at index 0.
-        let mut phnum = ehdr.e_phnum as usize;
-        if phnum == elf::abi::PN_XNUM as usize {
-            let shoff: usize = ehdr.e_shoff.try_into()?;
-
-            // 从磁盘读取shdr的前2个entry
-            file.lseek(SeekFrom::SeekSet(shoff as i64))
-                .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
-            let shdr_buf_size = ehdr.e_shentsize * 2;
-            let mut shdr_buf = vec![0u8; shdr_buf_size as usize];
-            file.read(shdr_buf_size as usize, &mut shdr_buf)
-                .map_err(|_| elf::ParseError::BadOffset(shoff as u64))?;
-
-            let mut offset = 0;
-            let shdr0 = <elf::section::SectionHeader as elf::parse::ParseAt>::parse_at(
-                ehdr.endianness,
-                ehdr.class,
-                &mut offset,
-                &shdr_buf,
-            )?;
-            phnum = shdr0.sh_info.try_into()?;
-        }
-
-        // Validate phentsize before trying to read the table so that we can error early for corrupted files
-        let entsize = <ProgramHeader as elf::parse::ParseAt>::validate_entsize(
+    /// Linux executable program-header tables fit in one ELF alignment unit
+    /// and at most 64 KiB. PN_XNUM is a core-file convention, not exec input.
+    fn program_headers_size(ehdr: &FileHeader<AnyEndian>) -> Result<usize, SystemError> {
+        let entry = <ProgramHeader as elf::parse::ParseAt>::validate_entsize(
             ehdr.class,
             ehdr.e_phentsize as usize,
-        )?;
-        let phoff: usize = ehdr.e_phoff.try_into()?;
-        let size = entsize
-            .checked_mul(phnum)
-            .ok_or(elf::ParseError::IntegerOverflow)?;
-        phoff
+        )
+        .map_err(|_| SystemError::ENOEXEC)?;
+        let size = entry
+            .checked_mul(ehdr.e_phnum as usize)
+            .ok_or(SystemError::ENOEXEC)?;
+        if size == 0 || size > min(65536, CurrentElfArch::ELF_PAGE_SIZE) {
+            return Err(SystemError::ENOEXEC);
+        }
+        let offset = usize::try_from(ehdr.e_phoff).map_err(|_| SystemError::ENOEXEC)?;
+        if offset
             .checked_add(size)
-            .ok_or(elf::ParseError::IntegerOverflow)?;
+            .is_none_or(|end| end > isize::MAX as usize)
+        {
+            return Err(SystemError::ENOEXEC);
+        }
+        Ok(size)
+    }
 
-        // 读取program header table
+    fn zeroed_metadata(size: usize) -> Result<Vec<u8>, SystemError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| SystemError::ENOMEM)?;
+        bytes.resize(size, 0);
+        Ok(bytes)
+    }
 
-        file.lseek(SeekFrom::SeekSet(phoff as i64))
-            .map_err(|_| elf::ParseError::BadOffset(phoff as u64))?;
-        data_buf.clear();
-        data_buf.resize(size, 0);
-
-        file.read(size, data_buf)
-            .expect("read program header table failed");
-        let buf = data_buf.get_bytes(0..size)?;
-
-        return Ok(Some(elf::segment::SegmentTable::new(
-            ehdr.endianness,
-            ehdr.class,
-            buf,
-        )));
+    fn read_program_headers(
+        file: &File,
+        ehdr: &FileHeader<AnyEndian>,
+    ) -> Result<Vec<u8>, SystemError> {
+        let size = Self::program_headers_size(ehdr)?;
+        let mut bytes = Self::zeroed_metadata(size)?;
+        if file.pread(ehdr.e_phoff as usize, size, &mut bytes)? != size {
+            return Err(SystemError::ENOEXEC);
+        }
+        Ok(bytes)
     }
 
     // 解析 PT_GNU_PROPERTY 类型的段
@@ -853,18 +768,17 @@ impl BinaryLoader for ElfLoader {
         // debug!("ehdr = {:?}", ehdr);
 
         let binding = param.vm().clone();
-        let mut user_vm = binding.write();
 
         // todo: 增加对user stack上的内存是否具有可执行权限的处理（方法：寻找phdr里面的PT_GNU_STACK段）
 
         // debug!("to parse segments");
         // 加载ELF文件并映射到用户空间
-        let mut phdr_buf = Vec::new();
-        let phdr_table = Self::parse_segments(param, &ehdr, &mut phdr_buf)
-            .map_err(|_| ExecError::ParseError)?
-            .ok_or(ExecError::ParseError)?;
+        let prepared =
+            PreparedElf::prepare(param.file_ref(), ehdr).map_err(|_| ExecError::NotExecutable)?;
+        let ehdr = &prepared.header;
+        let phdr_table = prepared.segments();
         let mut _gnu_property_data: Option<ProgramHeader> = None;
-        let mut interpreter: Option<ExecParam> = None;
+        let mut interpreter = None;
         for seg in phdr_table {
             if seg.p_type == PT_GNU_PROPERTY {
                 _gnu_property_data = Some(seg);
@@ -873,68 +787,45 @@ impl BinaryLoader for ElfLoader {
             if seg.p_type != PT_INTERP {
                 continue;
             }
-
-            // 接下来处理这个 .interpreter 段以及动态链接器
-            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#881
-
             if seg.p_filesz > 4096 || seg.p_filesz < 2 {
                 return Err(ExecError::NotExecutable);
             }
-            let mut buffer = vec![0; seg.p_filesz.try_into().unwrap()];
-            let r = param
-                .file_ref()
-                .pread(
-                    seg.p_offset.try_into().unwrap(),
-                    seg.p_filesz.try_into().unwrap(),
-                    buffer.as_mut_slice(),
-                )
-                .map_err(|e| {
-                    log::error!("Failed to load interpreter :{:?}", e);
-                    return ExecError::NotSupported;
-                })?;
-            if r != seg.p_filesz.try_into().unwrap() {
-                log::error!("Failed to load interpreter ");
-                return Err(ExecError::NotSupported);
+            let size = seg.p_filesz as usize;
+            let offset = usize::try_from(seg.p_offset).map_err(|_| ExecError::NotExecutable)?;
+            if offset
+                .checked_add(size)
+                .is_none_or(|end| end > isize::MAX as usize)
+            {
+                return Err(ExecError::NotExecutable);
             }
-            let interpreter_path = core::str::from_utf8(
-                &buffer[0..TryInto::<usize>::try_into(seg.p_filesz).unwrap() - 1],
-            )
-            .map_err(|e| {
-                ExecError::Other(format!(
-                    "Failed to parse the path of dynamic linker with error {}",
-                    e
-                ))
-            })?;
-            // 使用 do_open_execat 打开解释器文件
-            let interpreter_file = do_open_execat(AtFlags::AT_FDCWD.bits(), interpreter_path)
-                .map_err(|e| {
-                    // Linux 语义：动态链接器（解释器）路径不存在时，execve 需返回 ENOENT。
-                    log::error!(
-                        "Failed to open interpreter file: {} (err={:?})",
-                        interpreter_path,
-                        e
-                    );
-                    ExecError::SystemError(SystemError::ENOENT)
-                })?;
-            // log::debug!("opening interpreter at :{}", interpreter_path);
-            interpreter = Some(ExecParam::new(
-                interpreter_file,
-                param.vm().clone(),
-                ExecParamFlags::EXEC,
-                CString::new(interpreter_path).map_err(|_| ExecError::InvalidParemeter)?,
-                param.execfn().clone(),
-                ExecInterpFlags::empty(),
-            ));
-        }
-        //TODO 缺少一部分逻辑 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#931
-
-        if interpreter.is_some() {
-            /* Some simple consistency checks for the interpreter */
-            // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#950
+            let mut buffer = Self::zeroed_metadata(size).map_err(ExecError::SystemError)?;
+            if param
+                .file_ref()
+                .pread(offset, size, &mut buffer)
+                .map_err(ExecError::SystemError)?
+                != size
+            {
+                return Err(ExecError::SystemError(SystemError::EIO));
+            }
+            if buffer[size - 1] != 0 {
+                return Err(ExecError::NotExecutable);
+            }
+            let end = buffer.iter().position(|byte| *byte == 0).unwrap();
+            let path =
+                core::str::from_utf8(&buffer[..end]).map_err(|_| ExecError::NotExecutable)?;
+            let file =
+                do_open_execat(AtFlags::AT_FDCWD.bits(), path).map_err(ExecError::SystemError)?;
+            interpreter = Some(PreparedInterpreter::prepare(file, param.vm())?);
+            // Linux uses the first PT_INTERP; later entries are not reopened.
+            break;
         }
         Self::parse_gnu_property()?;
 
         param.begin_new_exec()?;
+        // begin_new_exec() may de-thread, clone/install the files table and
+        // drop old table references. None of those operations may run while an
+        // address-space write guard is held.
+        let mut user_vm = binding.write();
 
         // todo: 补充逻辑：https://code.dragonos.org.cn/xref/linux-6.6.21/fs/binfmt_elf.c#1007
         param.setup_new_exec();
@@ -978,12 +869,14 @@ impl BinaryLoader for ElfLoader {
                 let bss_start_page = Self::elf_page_align_up(elf_bss);
                 let brk_end_page = Self::elf_page_align_up(elf_brk);
                 if brk_end_page > bss_start_page {
+                    drop(user_vm);
                     self.set_elf_brk(
-                        &mut user_vm,
+                        &binding,
                         bss_start_page + load_bias,
                         brk_end_page + load_bias,
                         bss_prot_flags,
                     )?;
+                    user_vm = binding.write();
                 }
 
                 // 处理“BSS 落在最后一个文件页内”的尾部清零（Linux: padzero）
@@ -995,7 +888,7 @@ impl BinaryLoader for ElfLoader {
                     drop(user_vm);
                     unsafe {
                         // 这里清零理论上不应失败：BSS 所属段应为可写；失败时忽略以兼容 Linux 行为
-                        clear_user(elf_bss + load_bias, nbyte).ok();
+                        clear_user_protected(elf_bss + load_bias, nbyte).ok();
                     }
                     user_vm = binding.write();
                 }
@@ -1007,6 +900,25 @@ impl BinaryLoader for ElfLoader {
             let mut elf_map_flags = MapFlags::MAP_PRIVATE;
 
             let vaddr = VirtAddr::new(seg_to_load.p_vaddr.try_into().unwrap());
+
+            // Validate segment parameters before loading to prevent malformed ELF
+            // from triggering kernel panic. Ref: Linux 6.6.139 fs/binfmt_elf.c:1243-1249
+            //
+            // Checks:
+            // 1. p_vaddr + p_memsz does not overflow u64 (checked_add)
+            // 2. p_vaddr is within user address space
+            // 3. p_filesz <= p_memsz
+            // 4. p_memsz <= USER_END_VADDR (TASK_SIZE)
+            // 5. p_vaddr + p_memsz <= USER_END_VADDR (range check without overflow)
+            let seg_end = seg_to_load.p_vaddr.checked_add(seg_to_load.p_memsz);
+            if seg_end.is_none()
+                || !vaddr.check_user()
+                || seg_to_load.p_filesz > seg_to_load.p_memsz
+                || (seg_to_load.p_memsz as usize) > MMArch::USER_END_VADDR.data()
+                || MMArch::USER_END_VADDR.data() - (seg_to_load.p_memsz as usize) < vaddr.data()
+            {
+                return Err(ExecError::InvalidParemeter);
+            }
 
             #[allow(clippy::if_same_then_else)]
             if !first_pt_load {
@@ -1043,31 +955,28 @@ impl BinaryLoader for ElfLoader {
             // 加载这个段到用户空间
 
             // log::debug!("bias: {load_bias}");
-            let e = Self::load_elf_segment(
-                &mut user_vm,
-                param,
+            drop(user_vm);
+            let mapped = Self::load_elf_segment(
+                &param.file(),
+                param.vm(),
                 &seg_to_load,
                 vaddr + load_bias,
-                &elf_prot_flags,
-                &elf_map_flags,
-                total_size,
+                elf_prot_flags,
+                elf_map_flags,
+                if first_pt_load { total_size } else { 0 },
             )
             .map_err(|e| match e {
                 SystemError::EFAULT => ExecError::BadAddress(None),
                 SystemError::ENOMEM => ExecError::OutOfMemory,
                 _ => ExecError::Other(format!("load_elf_segment failed: {:?}", e)),
             })?;
-            // log::debug!("e.0={:?}", e.0);
-            // 如果地址不对，那么就报错
-            if !e.1 {
-                return Err(ExecError::BadAddress(Some(e.0)));
-            }
+            user_vm = binding.write();
 
             if first_pt_load {
                 first_pt_load = false;
                 if elf_type == ElfType::DSO {
                     // todo: 在这里增加对load_bias和reloc_func_desc的更新代码
-                    load_bias += e.0.data()
+                    load_bias += mapped.data()
                         - Self::elf_page_start(VirtAddr::new(
                             load_bias + TryInto::<usize>::try_into(seg_to_load.p_vaddr).unwrap(),
                         ))
@@ -1097,28 +1006,21 @@ impl BinaryLoader for ElfLoader {
             }
 
             if start_data.is_none()
-                || (start_data.is_some() && start_data.as_ref().unwrap() > &p_vaddr)
+                || (start_data.is_some() && start_data.as_ref().unwrap() < &p_vaddr)
             {
                 start_data = Some(p_vaddr);
             }
 
-            // 如果程序段要加载的目标地址不在用户空间内，或者是其他不合法的情况，那么就报错
-            if !p_vaddr.check_user()
-                || seg_to_load.p_filesz > seg_to_load.p_memsz
-                || Self::elf_page_align_up(p_vaddr + seg_to_load.p_memsz as usize)
-                    >= MMArch::USER_END_VADDR
-            {
-                // debug!("ERR:     p_vaddr={p_vaddr:?}");
-                return Err(ExecError::InvalidParemeter);
-            }
-
-            // 文件部分结束的“字节端点”（用于 BSS/padzero 语义）
+            // Byte endpoint of the file portion (for BSS/padzero semantics)
+            // Safety: validation above ensures p_vaddr + p_filesz <= p_vaddr + p_memsz <= USER_END_VADDR,
+            // so this addition cannot overflow.
             let seg_file_end = VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_filesz) as usize);
             if seg_file_end > elf_bss {
                 elf_bss = seg_file_end;
             }
 
-            // 统计 end_code/end_data 使用页对齐后的文件端点（更贴近 /proc/maps 的 VMA 粒度）
+            // Keep the existing code statistic page-granular, but Linux data
+            // boundaries use exact PT_LOAD file endpoints for RLIMIT_DATA.
             let seg_end_vaddr_f = Self::elf_page_align_up(seg_file_end);
 
             if ((seg_to_load.p_flags & elf::abi::PF_X) != 0)
@@ -1129,11 +1031,12 @@ impl BinaryLoader for ElfLoader {
             }
 
             if end_data.is_none()
-                || (end_data.is_some() && end_data.as_ref().unwrap() < &seg_end_vaddr_f)
+                || (end_data.is_some() && end_data.as_ref().unwrap() < &seg_file_end)
             {
-                end_data = Some(seg_end_vaddr_f);
+                end_data = Some(seg_file_end);
             }
 
+            // Safety: validation above ensures p_vaddr + p_memsz does not overflow u64
             let seg_end_vaddr = VirtAddr::new((seg_to_load.p_vaddr + seg_to_load.p_memsz) as usize);
 
             if seg_end_vaddr > elf_brk {
@@ -1152,6 +1055,7 @@ impl BinaryLoader for ElfLoader {
         start_data = start_data.map(|v| v + load_bias);
         end_data = end_data.map(|v| v + load_bias);
         let mut interp_load_addr: Option<VirtAddr> = None;
+        let mut interpreter_base: Option<VirtAddr> = None;
         // debug!(
         //     "to set brk: elf_bss: {:?}, elf_brk: {:?}, bss_prot_flags: {:?}",
         //     elf_bss,
@@ -1169,20 +1073,30 @@ impl BinaryLoader for ElfLoader {
         let bss_start_page = Self::elf_page_align_up(elf_bss);
         let brk_end_page = Self::elf_page_align_up(elf_brk);
         if brk_end_page > bss_start_page {
-            self.set_elf_brk(&mut user_vm, bss_start_page, brk_end_page, bss_prot_flags)?;
+            drop(user_vm);
+            self.set_elf_brk(&binding, bss_start_page, brk_end_page, bss_prot_flags)?;
+            user_vm = binding.write();
         }
         drop(user_vm);
-        if let Some(mut interpreter) = interpreter {
+        if let Some(interpreter) = interpreter {
             // 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1249
-            let elf_entry = Self::load_elf_interp(&mut interpreter, load_bias)?.entry_point();
+            let interp = Self::load_elf_interp(&interpreter, param.vm(), load_bias)?;
+            let elf_entry = interp.0.entry_point();
             interp_load_addr = Some(elf_entry);
+            interpreter_base = Some(interp.1);
             _reloc_func_desc = elf_entry.data();
             //参考 https://code.dragonos.org.cn/xref/linux-6.1.9/fs/binfmt_elf.c#1269
             //TODO allow_write_access(interpreter);
         }
         // debug!("to create auxv");
         let mut user_vm = binding.write();
-        self.create_auxv(param, program_entrypoint, phdr_vaddr, &ehdr)?;
+        self.create_auxv(
+            param,
+            program_entrypoint,
+            phdr_vaddr,
+            interpreter_base,
+            ehdr,
+        )?;
 
         // debug!("auxv create ok");
         user_vm.start_code = start_code.unwrap_or(VirtAddr::new(0));
@@ -1191,6 +1105,7 @@ impl BinaryLoader for ElfLoader {
         user_vm.end_data = end_data.unwrap_or(VirtAddr::new(0));
 
         let result = BinaryLoaderResult::new(interp_load_addr.unwrap_or(program_entrypoint));
+        drop(user_vm);
         // kdebug!("elf load OK!!!");
         return Ok(result);
     }
@@ -1264,3 +1179,8 @@ impl<'data> ReadBytesExt<'data> for &'data [u8] {
             .ok_or(elf::ParseError::SliceReadError((start, end)))
     }
 }
+
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+mod scratch_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) use scratch_selftest::run as scratch_birth_selftest;

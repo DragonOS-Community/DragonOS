@@ -2,7 +2,7 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SOCKETPAIR;
-use crate::filesystem::vfs::file::{File, FileFlags};
+use crate::filesystem::vfs::file::FileFlags;
 use crate::net::posix::PosixArgsSocketType;
 use crate::net::socket;
 use crate::net::socket::{unix::datagram::UnixDatagramSocket, unix::stream::UnixStreamSocket};
@@ -123,9 +123,6 @@ pub(super) fn do_socketpair(
         Err(err) => return Err(err),
     };
 
-    let binding = ProcessManager::current_pcb().fd_table();
-    let mut fd_table_guard = binding.write();
-
     // Linux socketpair(2) semantics:
     // - known non-UNIX families with a valid type return EOPNOTSUPP
     // - invalid/unsupported type returns ESOCKTNOSUPPORT before family-specific pairing logic
@@ -143,7 +140,37 @@ pub(super) fn do_socketpair(
         return Err(SystemError::EPROTONOSUPPORT);
     }
 
+    let current = ProcessManager::current_pcb();
+    let cloexec = socket_type.contains(PosixArgsSocketType::CLOEXEC);
+    let reservation = super::reserve_socket_descriptors::<2>(&current, cloexec)?;
+    fds[0] = reservation.fd(0);
+    fds[1] = reservation.fd(1);
+
     let nonblocking = socket_type.contains(PosixArgsSocketType::NONBLOCK);
+
+    if !matches!(
+        stype,
+        PSOCK::Stream | PSOCK::SeqPacket | PSOCK::Datagram | PSOCK::Raw
+    ) {
+        return Err(SystemError::ESOCKTNOSUPPORT);
+    }
+    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let (prepared_a, prepared_b) = loop {
+        let a = match crate::filesystem::vfs::file::PreparedFile::try_new() {
+            Ok(storage) => storage,
+            Err(error) => {
+                error.recover(&mut recovery)?;
+                continue;
+            }
+        };
+        match crate::filesystem::vfs::file::PreparedFile::try_new() {
+            Ok(b) => break (a, b),
+            Err(error) => {
+                drop(a);
+                error.recover(&mut recovery)?;
+            }
+        }
+    };
 
     let (socket_a, socket_b): (
         alloc::sync::Arc<dyn socket::Socket>,
@@ -158,12 +185,12 @@ pub(super) fn do_socketpair(
             (a, b)
         }
         (AddressFamily::Unix, PSOCK::Datagram) => {
-            let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+            let (a, b) = UnixDatagramSocket::new_pair(nonblocking)?;
             (a, b)
         }
         // Linux supports AF_UNIX + SOCK_RAW and maps it to SOCK_DGRAM.
         (AddressFamily::Unix, PSOCK::Raw) => {
-            let (a, b) = UnixDatagramSocket::new_pair(nonblocking);
+            let (a, b) = UnixDatagramSocket::new_pair(nonblocking)?;
             (a, b)
         }
         _ => {
@@ -171,19 +198,20 @@ pub(super) fn do_socketpair(
         }
     };
 
-    let cloexec = socket_type.contains(PosixArgsSocketType::CLOEXEC);
-
-    fds[0] = fd_table_guard.alloc_fd(
-        File::new_socket(socket_a, FileFlags::O_RDWR)?,
-        None,
-        cloexec,
-    )?;
-    fds[1] = fd_table_guard.alloc_fd(
-        File::new_socket(socket_b, FileFlags::O_RDWR)?,
-        None,
-        cloexec,
-    )?;
-
-    drop(fd_table_guard);
+    let mut file_flags = FileFlags::O_RDWR;
+    if nonblocking {
+        file_flags.insert(FileFlags::O_NONBLOCK);
+    }
+    let file_a = match super::finish_socket_file(socket_a, file_flags, prepared_a) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = socket_b.do_close();
+            return Err(error);
+        }
+    };
+    let file_b = super::finish_socket_file(socket_b, file_flags, prepared_b)?;
+    let file_a = alloc::sync::Arc::try_new(file_a).map_err(|_| SystemError::ENOMEM)?;
+    let file_b = alloc::sync::Arc::try_new(file_b).map_err(|_| SystemError::ENOMEM)?;
+    reservation.install_arc_pair(file_a, file_b)?;
     Ok(0)
 }

@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>unistd.h &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../../../" id="documentation_options" src="../../../../_static/documentation_options.js"></script>
+        <script src="../../../../_static/jquery.js"></script>
+        <script src="../../../../_static/underscore.js"></script>
+        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../../../_static/doctools.js"></script>
+        <script src="../../../../_static/translations.js"></script>
+    <script src="../../../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../../../genindex.html" />
+    <link rel="search" title="搜索" href="../../../../search.html" />
+    <link rel="next" title="设计文档" href="../../design/index.html" />
+    <link rel="prev" title="time.h" href="time.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/sched/index.html">DragonOS调度</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/memory_management/index.html">内存管理文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../kernel/cpu_arch/index.html">处理器架构</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="reference internal" href="../../index.html">LibC文档</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="../../intro.html">简介</a></li>
+<li class="toctree-l2 current"><a class="reference internal" href="../index.html">API文档</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="ctype.html">ctype.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="dirent.html">dirent.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="errno.html">errno.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="fcntl.html">fcntl.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="math.html">math.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="stdio.html">stdio.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="printf.html">printf.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="stddef.html">stddef.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="stdlib.html">stdlib.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="string.html">string.h</a></li>
+<li class="toctree-l3"><a class="reference internal" href="time.html">time.h</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">unistd.h</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#id1">简介：</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id2">函数列表：</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../design/index.html">设计文档</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../../index.html">LibC文档</a></li>
+          <li class="breadcrumb-item"><a href="../index.html">API文档</a></li>
+      <li class="breadcrumb-item active">unistd.h</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/34e05fe/docs/userland/libc/apis/api-list/unistd.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="unistd-h">
+<h1>unistd.h<a class="headerlink" href="#unistd-h" title="Permalink to this heading"></a></h1>
+<section id="id1">
+<h2>简介：<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>也是一些常用函数
+</pre></div>
+</div>
+</section>
+<section id="id2">
+<h2>函数列表：<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>``int close(int fd)`` ： 关闭文件
+
+``ssize_t read(int fd,void *buf,size_t count)`` : 从文件读取
+    
+    传入文件id，缓冲区，以及字节数
+    
+    返回成功读取的字节数
+
+``ssize_t write(int fd,void const *buf,size_t count)`` ： 写入文件
+
+    传入文件id，缓冲区，字节数
+
+    返回成功写入的字节数
+
+``off_t lseek(int fd,off_t offset,int whence)`` : 调整文件访问位置
+
+    传入文件id，偏移量，调整模式
+
+    返回结束后的文件访问位置
+
+``pid_t fork(void)`` ： fork 当前进程
+
+``pid_t vfork(void)`` ： fork 当前进程，与父进程共享 VM,flags,fd
+
+``uint64_t brk(uint64_t end_brk)`` : 将堆内存调整为end_brk
+    
+    若end_brk 为 -1，返回堆区域的起始地址
+
+    若end_brk 为 -2，返回堆区域的结束地址
+
+    否则调整堆区的结束地址域，并返回错误码
+
+``void *sbrk(int64_t increment)`` :  
+    
+    将堆内存空间加上offset（注意，该系统调用只应在普通进程中调用，而不能是内核线程）
+
+    increment ： 偏移量
+
+``int64_t chdir(char *dest_path)``
+
+    切换工作目录（传入目录路径）
+
+``int execv(const char* path,char * const argv[])`` : 执行文件
+    path ： 路径
+    argv ： 执行参数列表
+
+``extern int usleep(useconds_t usec)`` ： 睡眠usec微秒
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="time.html" class="btn btn-neutral float-left" title="time.h" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../../design/index.html" class="btn btn-neutral float-right" title="设计文档" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>34e05fe</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.4
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../../../V0.1.0/userland/libc/apis/api-list/unistd.html">V0.1.0</a></dd>
+      <dd><a href="../../../../../V0.1.1/userland/libc/apis/api-list/unistd.html">V0.1.1</a></dd>
+      <dd><a href="../../../../../V0.1.10/index.html">V0.1.10</a></dd>
+      <dd><a href="../../../../../V0.1.2/userland/libc/apis/api-list/unistd.html">V0.1.2</a></dd>
+      <dd><a href="../../../../../V0.1.3/userland/libc/apis/api-list/unistd.html">V0.1.3</a></dd>
+      <dd><a href="unistd.html">V0.1.4</a></dd>
+      <dd><a href="../../../../../V0.1.5/userland/libc/apis/api-list/unistd.html">V0.1.5</a></dd>
+      <dd><a href="../../../../../V0.1.6/userland/libc/apis/api-list/unistd.html">V0.1.6</a></dd>
+      <dd><a href="../../../../../V0.1.7/userland/libc/apis/api-list/unistd.html">V0.1.7</a></dd>
+      <dd><a href="../../../../../V0.1.8/userland/libc/apis/api-list/unistd.html">V0.1.8</a></dd>
+      <dd><a href="../../../../../V0.1.9/index.html">V0.1.9</a></dd>
+      <dd><a href="../../../../../V0.2.0/index.html">V0.2.0</a></dd>
+      <dd><a href="../../../../../V0.3.0/index.html">V0.3.0</a></dd>
+      <dd><a href="../../../../../V0.4.0/index.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../../../master/index.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

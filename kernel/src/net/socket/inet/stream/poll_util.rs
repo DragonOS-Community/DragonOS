@@ -1,14 +1,13 @@
-use crate::sched;
-
-/// Number of consecutive `Iface::poll()` rounds per batch in a syscall fast-path.
+/// Number of consecutive `TcpStack::poll()` rounds per batch in a syscall fast-path.
 ///
 /// Rationale:
-/// - `Iface::poll()` typically returns `true` only while there is immediate work to do.
+/// - `TcpStack::poll()` typically returns `true` only while there is immediate work to do.
 /// - However, in pathological cases (e.g. a very large backlog), an unbounded `while poll() {}`
 ///   tight loop can cause long syscall latency and starve other tasks.
 ///
-/// We poll in batches and call `sched_yield()` between batches to avoid
-/// monopolizing the CPU.
+/// Only a finite batch belongs to a syscall. Other connections in the same
+/// namespace may remain active indefinitely; their traffic must not delay
+/// this socket's nonblocking, signal or timeout checks.
 ///
 /// Important:
 /// signal interruption must be handled at the actual blocking wait sites
@@ -19,26 +18,15 @@ use crate::sched;
 /// processed. Linux `tcp_sendmsg()` only converts signals into EINTR/short-write
 /// at its real wait points; the fast-path protocol progress itself is not
 /// prematurely aborted.
-pub(super) const IFACE_POLL_BATCH_ROUNDS: usize = 128;
+pub(super) const STACK_POLL_BATCH_ROUNDS: usize = 128;
 
-/// Poll the interface until quiescent, with cooperative yielding.
+/// Help the transport for a finite batch, then leave remaining work to its worker.
 #[inline]
-pub(super) fn poll_iface_until_quiescent(iface: &dyn crate::net::Iface) {
-    loop {
-        let mut progressed = false;
-        for _ in 0..IFACE_POLL_BATCH_ROUNDS {
-            if !iface.poll() {
-                return;
-            }
-            progressed = true;
-        }
-
-        // If we keep making progress, yield so other tasks get CPU time.
-        // This also helps keep syscall latency bounded without relying on a background poller.
-        if progressed {
-            sched::sched_yield();
-        } else {
+pub(super) fn poll_stack_batch(stack: &crate::net::tcp_stack::TcpStack) {
+    for _ in 0..STACK_POLL_BATCH_ROUNDS {
+        if !stack.poll() {
             return;
         }
     }
+    stack.request_poll();
 }

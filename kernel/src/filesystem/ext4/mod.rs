@@ -2,3 +2,5 @@
 pub mod filesystem;
 pub mod gendisk;
 pub mod inode;
+
+pub(super) mod journal;

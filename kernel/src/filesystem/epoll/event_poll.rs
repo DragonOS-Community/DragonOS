@@ -5,23 +5,22 @@ use crate::{
     },
     libs::{
         mutex::{Mutex, MutexGuard},
+        prepared_queue::Queue,
         rbtree::RBTree,
         spinlock::SpinLock,
         wait_queue::{TimeoutWaker, WaitQueue, Waiter},
     },
     process::ProcessManager,
     time::{
+        timekeeping::monotonic_now,
         timer::{next_n_us_timer_jiffies, Timer},
-        Duration, Instant, PosixTimeSpec,
+        PosixTimeSpec,
     },
 };
-use core::{
-    fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::fmt::Debug;
 
 use alloc::{
-    collections::{BTreeSet, LinkedList},
+    collections::BTreeSet,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -29,24 +28,71 @@ use system_error::SystemError;
 
 use super::{fs::EPollInode, EPollCtlOption, EPollEvent, EPollEventType, EPollItem};
 
-/// epoll 就绪状态，由独立的 irqsave SpinLock 保护。
-///
-/// 对标 Linux 6.6 中由 `ep->lock`（rwlock_t）保护的 `rdllist` + `ovflist` + `wq`。
-/// 回调路径（`wakeup_epoll`，等价于 Linux `ep_poll_callback`）仅获取此 SpinLock，
-/// 不碰外层 Mutex，因此完全 hardirq-safe。
+use super::epitem::{ReadyNode, ReadyQueue, Registration};
+
+/// Linux ep->lock boundary. Ready/overflow nodes are charged and prepared
+/// at registration birth; callbacks neither allocate nor acquire ep->mtx.
 pub(crate) struct ReadyState {
-    /// 就绪列表（正常路径）
-    ready_list: LinkedList<Arc<EPollItem>>,
-    /// 溢出列表 — 在 `ep_send_events` 扫描期间累积回调事件。
-    /// - `None` = 正常模式（回调直接加入 ready_list）
-    /// - `Some(vec)` = 扫描模式（回调推入 ovflist）
-    ///
-    /// 对标 Linux `ep->ovflist`：
-    /// - `EP_UNACTIVE_PTR` (-1) ↔ `None`
-    /// - `NULL` / chain ↔ `Some(vec)`
-    ovflist: Option<Vec<Arc<EPollItem>>>,
-    /// epoll_wait 等待者
+    ready_list: ReadyQueue,
+    ovflist: Option<ReadyQueue>,
     epoll_wq: WaitQueue,
+}
+
+impl ReadyState {
+    /// The owning ready lock also serializes membership and spare ownership.
+    fn enqueue(&mut self, item: &Arc<EPollItem>) -> bool {
+        let mut links = item.links.lock_irqsave();
+        let overflow = self.ovflist.is_some();
+        let queued = if overflow {
+            &mut links.overflow
+        } else {
+            &mut links.ready
+        };
+        if *queued {
+            return false;
+        }
+        *queued = true;
+        let mut node = links
+            .spare
+            .pop_node()
+            .expect("at most one ready and one overflow node");
+        node.value_mut().item = Arc::downgrade(item);
+        match self.ovflist.as_mut() {
+            Some(queue) => queue.push_node(node),
+            None => self.ready_list.push_node(node),
+        }
+        true
+    }
+}
+
+fn retire_ready_queue(mut queue: ReadyQueue) {
+    while let Some(node) = queue.pop_node() {
+        drop(node.into_value());
+    }
+}
+
+impl Drop for ReadyState {
+    fn drop(&mut self) {
+        retire_ready_queue(core::mem::take(&mut self.ready_list));
+        if let Some(queue) = self.ovflist.take() {
+            retire_ready_queue(queue);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EPollKey {
+    open_file_id: usize,
+    fd: i32,
+}
+
+impl EPollKey {
+    pub(super) fn new(file: &File, fd: i32) -> Self {
+        Self {
+            open_file_id: file.open_file_id(),
+            fd,
+        }
+    }
 }
 
 impl Debug for ReadyState {
@@ -72,13 +118,11 @@ impl Debug for ReadyState {
 #[derive(Debug)]
 pub struct EventPoll {
     /// 维护所有添加进来的socket的红黑树（由外层 Mutex 保护）
-    ep_items: RBTree<i32, Arc<EPollItem>>,
+    ep_items: RBTree<EPollKey, Arc<EPollItem>>,
     /// 就绪状态（由内层 irqsave SpinLock 保护）
     ready_state: Arc<SpinLock<ReadyState>>,
     /// 监听本 epollfd 的 epitems（用于支持 epoll 嵌套：epollfd 被加入另一个 epoll）
-    pub(super) poll_epitems: Arc<LockedEPItemLinkedList>,
-    /// 是否已经关闭
-    shutdown: AtomicBool,
+    pub(super) poll_epitems: Arc<EPollItemList>,
     self_ref: Option<Weak<Mutex<EventPoll>>>,
 }
 
@@ -91,37 +135,27 @@ impl EventPoll {
         Self {
             ep_items: RBTree::new(),
             ready_state: Arc::new(SpinLock::new(ReadyState {
-                ready_list: LinkedList::new(),
+                ready_list: Queue::new(),
                 ovflist: None,
                 epoll_wq: WaitQueue::default(),
             })),
-            poll_epitems: Arc::new(LockedEPItemLinkedList::default()),
-            shutdown: AtomicBool::new(false),
+            poll_epitems: Arc::new(EPollItemList::default()),
             self_ref: None,
         }
     }
 
     /// 关闭epoll时，执行的逻辑
     pub(super) fn close(&mut self) -> Result<(), SystemError> {
-        // 唤醒epoll上面等待的所有进程
-        self.shutdown.store(true, Ordering::SeqCst);
-        {
-            let rs = self.ready_state.lock_irqsave();
-            rs.epoll_wq.wakeup_all(None);
-        }
-
-        let fds: Vec<i32> = self.ep_items.keys().cloned().collect::<Vec<_>>();
-        // 清理红黑树里面的epitems
-        for fd in fds {
-            let fdtable = ProcessManager::current_pcb().basic().try_fd_table().clone();
-            let file = fdtable.and_then(|fdtable| fdtable.read().get_file_by_fd(fd));
-
-            if let Some(file) = file {
-                let epitm = self.ep_items.get(&fd).unwrap();
-                // 尝试移除epitem，忽略错误（对于普通文件，我们没有添加epitem，所以会失败）
-                let _ = file.remove_epitem(epitm);
+        let keys: Vec<EPollKey> = self.ep_items.keys().copied().collect();
+        for key in keys {
+            let Some(epitem) = self.ep_items.get(&key).cloned() else {
+                continue;
+            };
+            if let Some(file) = epitem.file().upgrade() {
+                let _ = file.remove_epitem(&epitem);
             }
-            self.ep_items.remove(&fd);
+            Self::deactivate_and_remove_ready(self, &epitem);
+            self.ep_items.remove(&key);
         }
 
         Ok(())
@@ -140,9 +174,15 @@ impl EventPoll {
 
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();
-        let mut fd_table_guard = fd_table.write();
-
-        let fd = fd_table_guard.alloc_fd(ep_file, None, cloexec)?;
+        let ep_file = Arc::try_new(ep_file).map_err(|_| SystemError::ENOMEM)?;
+        let fd = File::recover_io(|| {
+            fd_table.alloc_fd_arc(
+                ep_file.clone(),
+                cloexec,
+                current_pcb.nofile_soft_limit(),
+                &crate::cgroup::memory::object_for_task(&current_pcb),
+            )
+        })?;
 
         Ok(fd as usize)
     }
@@ -154,14 +194,16 @@ impl EventPoll {
         }
 
         // 创建epoll
+        let storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
         let epoll = Self::do_create_epoll();
 
         // 创建epoll的inode对象
         let epoll_inode = EPollInode::new(epoll.clone());
 
-        let mut ep_file = File::new(
+        let mut ep_file = File::new_prepared_recovering(
             epoll_inode,
             FileFlags::O_RDWR | (flags & FileFlags::O_CLOEXEC),
+            storage,
         )?;
 
         // 设置ep_file的FilePrivateData
@@ -222,9 +264,7 @@ impl EventPoll {
 
             // 不支持嵌套的独占唤醒
             if op == EPollCtlOption::Add && Self::is_epoll_file(&dst_file)
-                || !events
-                    .difference(EPollEventType::EPOLLEXCLUSIVE_OK_BITS)
-                    .is_empty()
+                || epds.events & !EPollEventType::EPOLLEXCLUSIVE_OK_BITS.bits() != 0
             {
                 return Err(SystemError::EINVAL);
             }
@@ -251,6 +291,60 @@ impl EventPoll {
             Self::ep_loop_check(&src_epoll, &dst_epoll)?;
         }
 
+        let key = EPollKey::new(&dst_file, dstfd);
+        let candidate = if op == EPollCtlOption::Add {
+            // Linux validates the target's poll operation before epitem
+            // allocation. Do not replace these errors with quota ENOMEM.
+            if dst_file.is_always_ready() {
+                return Err(SystemError::EPERM);
+            }
+            if !dst_file.supports_poll() {
+                return Err(SystemError::ENOSYS);
+            }
+            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            loop {
+                let (ready_state, poll_epitems) = {
+                    let guard = if nonblock {
+                        epoll_data
+                            .epoll
+                            .0
+                            .try_lock()
+                            .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?
+                    } else {
+                        epoll_data.epoll.0.lock()
+                    };
+                    // Existing registrations must fail before birth/charge.
+                    if guard.ep_items.get(&key).is_some() {
+                        return Err(SystemError::EEXIST);
+                    }
+                    (
+                        Arc::downgrade(&guard.ready_state),
+                        Arc::downgrade(&guard.poll_epitems),
+                    )
+                };
+                let creator =
+                    crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
+                match EPollItem::try_new(
+                    &creator,
+                    Arc::downgrade(&epoll_data.epoll.0),
+                    ready_state,
+                    poll_epitems,
+                    key,
+                    epds,
+                    Arc::downgrade(&dst_file),
+                ) {
+                    Ok(item) => break Some(item),
+                    // The failed entity and all its receipts already dropped;
+                    // this is outside source/private/IRQ resource guards.
+                    Err(error) => error.recover(&mut recovery)?,
+                }
+            }
+        } else {
+            None
+        };
+        // Pins outlive the commit guard on every error/rollback path. In
+        // particular DEL must not free an accounted body under the mutex.
+        let mut retired = None;
         let notify_nested = {
             let mut epoll_guard = {
                 if nonblock {
@@ -265,7 +359,7 @@ impl EventPoll {
                 }
             };
 
-            let ep_item = epoll_guard.ep_items.get(&dstfd).cloned();
+            let ep_item = epoll_guard.ep_items.get(&key).cloned();
             let notify_nested = match op {
                 EPollCtlOption::Add => {
                     // 如果已经存在，则返回错误
@@ -273,21 +367,20 @@ impl EventPoll {
                         return Err(SystemError::EEXIST);
                     }
 
-                    // 设置epoll
-                    let epitem = Arc::new(EPollItem::new(
-                        Arc::downgrade(&epoll_data.epoll.0),
-                        Arc::downgrade(&epoll_guard.ready_state),
-                        Arc::downgrade(&epoll_guard.poll_epitems),
-                        epds,
-                        dstfd,
-                        Arc::downgrade(&dst_file),
-                    ));
-                    Self::ep_insert(&mut epoll_guard, dst_file, epitem)?
+                    Self::ep_insert(
+                        &mut epoll_guard,
+                        dst_file.clone(),
+                        candidate
+                            .as_ref()
+                            .expect("ADD has prepared candidate")
+                            .clone(),
+                    )?
                 }
                 EPollCtlOption::Del => match ep_item {
                     Some(ref ep_item) => {
+                        retired = Some(ep_item.clone());
                         // 删除
-                        Self::ep_remove(&mut epoll_guard, dstfd, Some(dst_file), ep_item)?;
+                        Self::ep_remove(&mut epoll_guard, key, Some(dst_file.clone()), ep_item)?;
                         false
                     }
                     None => {
@@ -302,11 +395,12 @@ impl EventPoll {
                     }
                     let ep_item = ep_item.unwrap().clone();
 
-                    // EPOLLEXCLUSIVE 只能在 ADD 时设置；如果已有该位，MOD 需要保留它。
+                    // Linux rejects MOD of an existing exclusive registration,
+                    // even when the new request omits EPOLLEXCLUSIVE.
                     if (ep_item.event.lock_irqsave().events & EPollEventType::EPOLLEXCLUSIVE.bits())
                         != 0
                     {
-                        epds.events |= EPollEventType::EPOLLEXCLUSIVE.bits();
+                        return Err(SystemError::EINVAL);
                     }
 
                     Self::ep_modify(&mut epoll_guard, ep_item, &epds)?
@@ -319,6 +413,8 @@ impl EventPoll {
                 None
             }
         };
+        drop(retired);
+        drop(candidate);
 
         if let Some(poll_epitems) = notify_nested {
             let _ = Self::wakeup_epoll(
@@ -375,9 +471,9 @@ impl EventPoll {
 
     pub fn epoll_wait(
         epfd: i32,
-        epoll_event: &mut [EPollEvent],
         max_events: i32,
-        timespec: Option<PosixTimeSpec>,
+        deadline: Option<PosixTimeSpec>,
+        output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
         let fd_table = current_pcb.fd_table();
@@ -389,7 +485,7 @@ impl EventPoll {
             .ok_or(SystemError::EBADF)?;
 
         drop(fd_table_guard);
-        Self::epoll_wait_with_file(ep_file, epoll_event, max_events, timespec)
+        Self::wait_with_output(ep_file, max_events, deadline, output)
     }
 
     /// ## epoll_wait的具体实现
@@ -398,6 +494,36 @@ impl EventPoll {
         epoll_event: &mut [EPollEvent],
         max_events: i32,
         timespec: Option<PosixTimeSpec>,
+    ) -> Result<usize, SystemError> {
+        if max_events <= 0 || epoll_event.len() < max_events as usize {
+            return Err(SystemError::EINVAL);
+        }
+        Self::wait_with_output(
+            ep_file,
+            max_events,
+            timespec.map(Self::timeout_to_deadline),
+            &mut |index, event| {
+                epoll_event[index] = *event;
+                Ok(())
+            },
+        )
+    }
+
+    /// Convert a valid relative timeout once; zero remains the polling sentinel.
+    pub(crate) fn timeout_to_deadline(timeout: PosixTimeSpec) -> PosixTimeSpec {
+        if timeout.is_empty() {
+            timeout
+        } else {
+            monotonic_now().saturating_add_ktime(&timeout)
+        }
+    }
+
+    /// Shared wait engine. The deadline is absolute CLOCK_MONOTONIC.
+    fn wait_with_output(
+        ep_file: Arc<File>,
+        max_events: i32,
+        deadline: Option<PosixTimeSpec>,
+        output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
     ) -> Result<usize, SystemError> {
         let current_pcb = ProcessManager::current_pcb();
 
@@ -420,28 +546,14 @@ impl EventPoll {
                 ep_guard.ready_state.clone()
             };
 
-            let mut timeout = false;
-            let mut deadline: Option<Instant> = None;
-            if let Some(timespec) = timespec {
-                if !(timespec.tv_sec > 0 || timespec.tv_nsec > 0) {
-                    // 非阻塞情况
-                    timeout = true;
-                } else {
-                    let timeout_us =
-                        (timespec.tv_sec * 1_000_000 + timespec.tv_nsec / 1_000) as u64;
-                    deadline = Some(Instant::now() + Duration::from_micros(timeout_us));
-                }
-            } else if timespec.is_none() {
-                // 非阻塞情况
-                timeout = false;
-            }
+            let mut timeout = deadline.is_some_and(|time| time.is_empty());
             // 判断epoll上有没有就绪事件（仅需 SpinLock）
             let mut available = Self::ep_events_available_rs(&rs_arc);
 
             loop {
                 if available {
                     // 如果有就绪的事件，则直接返回就绪事件
-                    let sent = Self::ep_send_events(epoll.clone(), epoll_event, max_events)?;
+                    let sent = Self::ep_send_events(epoll.clone(), output, max_events)?;
 
                     // Linux 语义：阻塞等待时，被唤醒但没有可返回事件应继续等待。
                     // 这会发生在并发读/状态变化导致 ready_list 中项目在 poll 时已不再就绪。
@@ -455,20 +567,24 @@ impl EventPoll {
                     continue;
                 }
 
-                if epoll.0.lock().shutdown.load(Ordering::SeqCst) {
-                    // 如果已经关闭
-                    return Err(SystemError::EBADF);
-                }
-
                 // 如果超时
                 if timeout {
                     return Ok(0);
                 }
 
-                if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        return Ok(0);
-                    }
+                // 如果有未处理且未被屏蔽的信号则返回错误
+                if current_pcb.has_pending_signal_fast()
+                    && current_pcb.has_pending_not_masked_signal()
+                {
+                    // Linux epoll_wait(2): interrupted by signal handler -> EINTR.
+                    // Returning ERESTARTSYS would cause userspace to restart the syscall
+                    // (SA_RESTART), which breaks gVisor's UnblockWithSignal expectation.
+                    return Err(SystemError::EINTR);
+                }
+
+                if deadline.is_some_and(|time| monotonic_now().to_ktime_ns() >= time.to_ktime_ns())
+                {
+                    return Ok(0);
                 }
 
                 // 自旋等待一段时间（仅需 SpinLock）
@@ -490,16 +606,6 @@ impl EventPoll {
                     continue;
                 }
 
-                // 如果有未处理且未被屏蔽的信号则返回错误
-                if current_pcb.has_pending_signal_fast()
-                    && current_pcb.has_pending_not_masked_signal()
-                {
-                    // Linux epoll_wait(2): interrupted by signal handler -> EINTR.
-                    // Returning ERESTARTSYS would cause userspace to restart the syscall
-                    // (SA_RESTART), which breaks gVisor's UnblockWithSignal expectation.
-                    return Err(SystemError::EINTR);
-                }
-
                 // 还未等待到事件发生，则睡眠
                 // 构造一次等待（先构造 Waiter/Waker，超时需要通过 Waker::wake 触发）
                 let (waiter, waker) = Waiter::new_pair();
@@ -507,11 +613,13 @@ impl EventPoll {
                 // 注册定时器：用 waker.wake() 来触发 waiter 退出等待（而不是仅唤醒 PCB）
                 let mut timer = None;
                 if let Some(deadline) = deadline {
-                    let remain = deadline.saturating_sub(Instant::now());
-                    if remain == Duration::ZERO {
+                    let remain_ns = deadline
+                        .to_ktime_ns()
+                        .saturating_sub(monotonic_now().to_ktime_ns());
+                    if remain_ns == 0 {
                         timeout = true;
                     } else {
-                        let jiffies = next_n_us_timer_jiffies(remain.total_micros());
+                        let jiffies = next_n_us_timer_jiffies(remain_ns.div_ceil(1_000));
                         let inner: Arc<Timer> =
                             Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
                         timer = Some(inner);
@@ -524,9 +632,7 @@ impl EventPoll {
                 {
                     // 注册前再次检查，避免错过事件（仅需 SpinLock）
                     let rs = rs_arc.lock_irqsave();
-                    if Self::ready_state_has_events(&rs)
-                        || epoll.0.lock().shutdown.load(Ordering::SeqCst)
-                    {
+                    if Self::ready_state_has_events(&rs) {
                         available = true;
                         // 不注册，直接继续
                     } else {
@@ -555,18 +661,15 @@ impl EventPoll {
                     let rs = rs_arc.lock_irqsave();
                     rs.epoll_wq.remove_waker(&waker);
                     available = Self::ready_state_has_events(&rs);
-                    if epoll.0.lock().shutdown.load(Ordering::SeqCst) {
-                        // epoll 被关闭，直接退出
-                        return Err(SystemError::EINVAL);
-                    }
                 }
 
                 if let Some(timer) = timer {
-                    if timer.as_ref().timeout() {
-                        timeout = true;
-                    } else {
-                        timer.cancel();
-                    }
+                    // A coarse timer firing alone does not establish expiry.
+                    timeout = timer.timeout()
+                        && deadline.is_some_and(|time| {
+                            monotonic_now().to_ktime_ns() >= time.to_ktime_ns()
+                        });
+                    timer.cancel();
                 }
 
                 wait_res?;
@@ -587,108 +690,110 @@ impl EventPoll {
         !rs.ready_list.is_empty() || rs.ovflist.is_some()
     }
 
-    /// 开始就绪列表扫描：偷取 ready_list 到返回的 Vec 中，
-    /// 激活 ovflist 使回调期间的新事件进入溢出列表。
-    ///
-    /// 对标 Linux `ep_start_scan()`。调用者必须持有外层 Mutex。
-    fn ep_start_scan(&self) -> Vec<Arc<EPollItem>> {
+    /// ep_start_scan: transfer existing nodes without allocation.
+    fn ep_start_scan(&self) -> ReadyQueue {
         let mut rs = self.ready_state.lock_irqsave();
-        let mut stolen = Vec::new();
-        while let Some(item) = rs.ready_list.pop_front() {
-            stolen.push(item);
-        }
-        rs.ovflist = Some(Vec::new());
+        let stolen = core::mem::take(&mut rs.ready_list);
+        rs.ovflist = Some(Queue::new());
         stolen
     }
 
-    /// 结束就绪列表扫描：将 ovflist 排空回 ready_list，
-    /// 将剩余的扫描项（水平触发需要重入队的）也加回去，关闭 ovflist。
-    ///
-    /// 对标 Linux `ep_done_scan()`。调用者必须持有外层 Mutex。
-    fn ep_done_scan(&self, remaining: Vec<Arc<EPollItem>>) {
-        let mut rs = self.ready_state.lock_irqsave();
-
-        // 将扫描期间溢出列表中积累的事件合并回 ready_list
-        if let Some(ovf) = rs.ovflist.take() {
-            for epi in ovf {
-                if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epi)) {
-                    rs.ready_list.push_back(epi);
+    /// ep_done_scan: overflow callbacks survive, but duplicate nodes return to
+    /// the registration. The caller holds ep->mtx, so each live registration
+    /// is pinned by ep_items throughout the short ready-state critical section.
+    fn ep_done_scan(&self, mut remaining: ReadyQueue, mut delivered_lt: ReadyQueue) {
+        let mut retired = Queue::new();
+        {
+            let mut rs = self.ready_state.lock_irqsave();
+            let mut overflow = rs.ovflist.take().expect("matching ep_start_scan");
+            while let Some(node) = overflow.pop_node() {
+                let Some(item) = node.value().item.upgrade() else {
+                    retired.push_node(node);
+                    continue;
+                };
+                let mut links = item.links.lock_irqsave();
+                links.overflow = false;
+                if links.ready {
+                    links.spare.push_node(node);
+                } else {
+                    links.ready = true;
+                    rs.ready_list.push_node(node);
                 }
             }
-        }
-        // ovflist 已经是 None（关闭溢出模式）
-
-        // 将水平触发等需要重入队的项加回 ready_list
-        for epi in remaining {
-            if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epi)) {
-                rs.ready_list.push_back(epi);
+            // Linux ep_done_scan puts unprocessed txlist first, concurrent
+            // overflow next, and already-delivered LT entries last. Continuous
+            // callbacks must not starve the unprocessed tail at maxevents=1.
+            rs.ready_list.append(&mut delivered_lt);
+            remaining.append(&mut rs.ready_list);
+            rs.ready_list = remaining;
+            if !rs.ready_list.is_empty() {
+                rs.epoll_wq.wakeup_all(None);
             }
         }
-
-        // 如果 ready_list 非空且有等待者，唤醒他们
-        if !rs.ready_list.is_empty() {
-            rs.epoll_wq.wakeup_all(None);
-        }
+        retire_ready_queue(retired);
     }
 
-    /// ## 将已经准备好的事件拷贝到用户空间
-    ///
-    /// 使用三阶段扫描协议（对标 Linux ep_send_events + ep_start/done_scan）：
-    /// 1. ep_start_scan: 偷取 ready_list，激活 ovflist
-    /// 2. 遍历偷取的列表，调用 ep_item_poll 收集事件（此时回调进入 ovflist）
-    /// 3. ep_done_scan: 将 ovflist 合并回 ready_list，重入队水平触发项
+    fn recycle_scanned(&self, item: &Arc<EPollItem>, node: ReadyNode) {
+        let _rs = self.ready_state.lock_irqsave();
+        let mut links = item.links.lock_irqsave();
+        links.ready = false;
+        links.spare.push_node(node);
+    }
+
     fn ep_send_events(
         epoll: LockedEventPoll,
-        user_event: &mut [EPollEvent],
+        output: &mut dyn FnMut(usize, &EPollEvent) -> Result<(), SystemError>,
         max_events: i32,
     ) -> Result<usize, SystemError> {
-        if user_event.len() < max_events as usize {
-            return Err(SystemError::EINVAL);
-        }
         let ep_guard = epoll.0.lock();
-        let mut res: usize = 0;
-
-        // Phase 1: 偷取 ready_list，激活 ovflist
-        let stolen = ep_guard.ep_start_scan();
-
-        // Phase 2: 遍历偷取的列表（此时 ovflist 吸收并发回调）
-        let mut push_back = Vec::new();
-        for epitem in stolen {
-            if res >= max_events as usize {
-                push_back.push(epitem);
+        let mut res = 0;
+        let mut pending = ep_guard.ep_start_scan();
+        let mut delivered_lt = Queue::new();
+        let mut error = None;
+        while res < max_events as usize {
+            let Some(node) = pending.pop_node() else {
                 break;
-            }
+            };
+            let Some(epitem) = node.value().item.upgrade() else {
+                drop(node.into_value());
+                continue;
+            };
             let revents = epitem.ep_item_poll();
-
-            // 如果没有就绪事件，跳过此项
             if revents.is_empty() {
+                ep_guard.recycle_scanned(&epitem, node);
                 continue;
             }
-
             let registered = EPollEventType::from_bits_truncate(epitem.event.lock_irqsave().events);
             let is_oneshot = registered.contains(EPollEventType::EPOLLONESHOT);
             let is_edge = registered.contains(EPollEventType::EPOLLET);
-
             let event = EPollEvent {
                 events: revents.bits,
                 data: epitem.event.lock_irqsave().data,
             };
-
-            user_event[res] = event;
+            if let Err(err) = output(res, &event) {
+                // Fault must not consume ET/ONESHOT or rotate this entry.
+                pending.push_front_node(node);
+                error = Some(err);
+                break;
+            }
             res += 1;
-
             if is_oneshot {
                 let mut event_guard = epitem.event.lock_irqsave();
                 let new_event = event_guard.events & EPollEventType::EP_PRIVATE_BITS.bits;
                 event_guard.set_events(new_event);
-            } else if !is_edge {
-                push_back.push(epitem);
+            }
+            if is_oneshot || is_edge {
+                ep_guard.recycle_scanned(&epitem, node);
+            } else {
+                delivered_lt.push_node(node);
             }
         }
-
-        // Phase 3: 将 ovflist 合并回 ready_list，重入队水平触发项
-        ep_guard.ep_done_scan(push_back);
-
+        ep_guard.ep_done_scan(pending, delivered_lt);
+        if res == 0 {
+            if let Some(err) = error {
+                return Err(err);
+            }
+        }
         Ok(res)
     }
 
@@ -724,13 +829,13 @@ impl EventPoll {
             return Err(SystemError::ENOSYS);
         }
 
-        epoll_guard.ep_items.insert(epitem.fd, epitem.clone());
+        epoll_guard.ep_items.insert(epitem.key(), epitem.clone());
 
         // 先将 epitem 添加到目标文件的 epoll_items 中，这样之后的 notify/wakeup_epoll
         // 才能找到并唤醒这个 epitem。
         if let Err(e) = dst_file.add_epitem(epitem.clone()) {
             // 如果添加失败，需要清理 ep_items 中已插入的项
-            epoll_guard.ep_items.remove(&epitem.fd);
+            epoll_guard.ep_items.remove(&epitem.key());
             return Err(e);
         }
 
@@ -739,9 +844,8 @@ impl EventPoll {
         let mut notify_nested = false;
         if !event.is_empty() {
             let mut rs = epoll_guard.ready_state.lock_irqsave();
-            if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epitem)) {
-                let was_empty = rs.ready_list.is_empty();
-                rs.ready_list.push_back(epitem.clone());
+            let was_empty = rs.ready_list.is_empty();
+            if rs.enqueue(&epitem) {
                 notify_nested = was_empty;
                 rs.epoll_wq.wakeup(None);
             }
@@ -750,22 +854,64 @@ impl EventPoll {
         Ok(notify_nested)
     }
 
-    pub fn ep_remove(
+    fn ep_remove(
         epoll: &mut MutexGuard<EventPoll>,
-        fd: i32,
+        key: EPollKey,
         dst_file: Option<Arc<File>>,
         epitem: &Arc<EPollItem>,
     ) -> Result<(), SystemError> {
+        let removed = epoll.ep_items.remove(&key).ok_or(SystemError::ENOENT)?;
+        Self::deactivate_and_remove_ready(epoll, &removed);
         if let Some(dst_file) = dst_file {
-            dst_file.remove_epitem(epitem)?;
-        }
-
-        if let Some(removed) = epoll.ep_items.remove(&fd) {
-            let mut rs = epoll.ready_state.lock_irqsave();
-            rs.ready_list.retain(|item| !Arc::ptr_eq(item, &removed));
+            let _ = dst_file.remove_epitem(epitem);
         }
 
         Ok(())
+    }
+
+    /// Remove an epoll item when the referenced file is being released.
+    ///
+    /// This is the DragonOS equivalent of Linux `eventpoll_release_file()`,
+    /// called from the file cleanup path rather than from `epoll_ctl(DEL)`.
+    pub fn release_file_epitem(epitem: &Arc<EPollItem>) {
+        let Some(epoll) = epitem.epoll().upgrade() else {
+            return;
+        };
+        let mut epoll = epoll.lock();
+        let key = epitem.key();
+        let Some(current) = epoll.ep_items.get(&key).cloned() else {
+            return;
+        };
+        if !Arc::ptr_eq(&current, epitem) {
+            return;
+        }
+
+        epoll.ep_items.remove(&key);
+        Self::deactivate_and_remove_ready(&epoll, &current);
+    }
+
+    fn deactivate_and_remove_ready(epoll: &EventPoll, epitem: &Arc<EPollItem>) {
+        let retired;
+        let overflow;
+        {
+            let mut rs = epoll.ready_state.lock_irqsave();
+            epitem.deactivate();
+            retired = rs
+                .ready_list
+                .extract_if(|registration| registration.item.ptr_eq(&Arc::downgrade(epitem)));
+            overflow = rs.ovflist.as_mut().map(|queue| {
+                queue.extract_if(|registration| registration.item.ptr_eq(&Arc::downgrade(epitem)))
+            });
+            let mut links = epitem.links.lock_irqsave();
+            links.ready = false;
+            links.overflow = false;
+        }
+        // No scan can coexist with DEL/close while ep->mtx is held. Retiring
+        // the charged detached nodes is safe only after releasing ep->lock.
+        retire_ready_queue(retired);
+        if let Some(queue) = overflow {
+            retire_ready_queue(queue);
+        }
     }
 
     /// ## 修改已经注册的监听事件
@@ -791,9 +937,8 @@ impl EventPoll {
         let mut notify_nested = false;
         if !event.is_empty() {
             let mut rs = epoll_guard.ready_state.lock_irqsave();
-            if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, &epitem)) {
-                let was_empty = rs.ready_list.is_empty();
-                rs.ready_list.push_back(epitem.clone());
+            let was_empty = rs.ready_list.is_empty();
+            if rs.enqueue(&epitem) {
                 notify_nested = was_empty;
                 rs.epoll_wq.wakeup(None);
             }
@@ -855,98 +1000,212 @@ impl EventPoll {
         Ok(())
     }
 
-    /// ### epoll的回调，支持epoll的文件有事件到来时直接调用该方法即可
+    /// Processes notifications from files that support epoll.
     ///
-    /// 对标 Linux `ep_poll_callback()`。仅获取内层 SpinLock（irqsave），
-    /// **不获取外层 Mutex**，因此完全 hardirq-safe。
-    ///
-    /// 回调路径通过 `EPollItem::ready_state()` 直接访问 `ReadyState`，
-    /// 绕过 `Mutex<EventPoll>`。
+    /// Like Linux `ep_poll_callback()`, this path never acquires the outer
+    /// sleeping `Mutex<EventPoll>`. Registration and ready-state locks use
+    /// irqsave discipline. Source and ready nodes were prepared before
+    /// registration publication; the callback path performs no allocation.
     pub fn wakeup_epoll(
-        epitems: &LockedEPItemLinkedList,
+        epitems: &EPollItemList,
         pollflags: EPollEventType,
     ) -> Result<(), SystemError> {
-        // 在 epitems 锁下复制一份快照，然后释放锁，再逐个处理。
-        // 避免持有 epitems 锁时再去获取其他锁导致 ABBA 死锁。
-        let epitems_snapshot: Vec<Arc<EPollItem>> = {
-            let epitems_guard = epitems.lock_irqsave();
-            epitems_guard.iter().cloned().collect()
-        };
+        Self::dispatch_notifications(epitems, pollflags, false)
+    }
 
-        for epitem in epitems_snapshot.iter() {
-            // 通过 EPollItem 的 ready_state Weak 直接访问 ReadyState — 不需要 Mutex
-            let Some(rs_arc) = epitem.ready_state().upgrade() else {
-                continue;
-            };
+    /// A source broadcast (e.g. the last pipe endpoint closing) must visit
+    /// every exclusive registration, independently of callback wake success.
+    pub fn wakeup_epoll_all(
+        epitems: &EPollItemList,
+        pollflags: EPollEventType,
+    ) -> Result<(), SystemError> {
+        Self::dispatch_notifications(epitems, pollflags, true)
+    }
 
-            // 读取注册事件掩码（irqsave SpinLock — hardirq-safe）
-            let ep_events = {
-                let event_guard = epitem.event().lock_irqsave();
-                EPollEventType::from_bits_truncate(event_guard.events())
-            };
-
-            // 对齐 Linux 6.6 `ep_poll_callback()`：
-            // 1) 若该 epitem 不包含任何 poll(2) 事件（仅剩 EP_PRIVATE_BITS），视为"被禁用"
-            // 2) 若驱动/文件系统传入了具体的 pollflags（非空），则必须与已注册的事件掩码匹配才入队
-            let enabled_mask = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
-            if enabled_mask.is_empty() && !pollflags.contains(EPollEventType::POLLFREE) {
-                continue;
-            }
-
-            if !pollflags.is_empty()
-                && !pollflags.contains(EPollEventType::POLLFREE)
-                && pollflags.intersection(ep_events).is_empty()
-            {
-                continue;
-            }
-
-            {
-                // 仅获取 SpinLock（irqsave）— hardirq-safe
-                let mut rs = rs_arc.lock_irqsave();
-
-                if let Some(ref mut ovflist) = rs.ovflist {
-                    // 扫描进行中 — 推入溢出列表
-                    if !ovflist.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                        ovflist.push(epitem.clone());
-                    }
-                } else {
-                    // 正常模式 — 推入 ready_list
-                    if !rs.ready_list.iter().any(|e| Arc::ptr_eq(e, epitem)) {
-                        rs.ready_list.push_back(epitem.clone());
-                    }
+    fn dispatch_notifications(
+        epitems: &EPollItemList,
+        pollflags: EPollEventType,
+        broadcast: bool,
+    ) -> Result<(), SystemError> {
+        // Release the source lock before any callback or nested notification.
+        let through = epitems.last_id();
+        // Linux places ordinary callbacks before exclusive callbacks. The
+        // classification is immutable: exclusive may only be added, never MOD.
+        for exclusive in [false, true] {
+            let mut after = 0;
+            while let Some((id, item)) = epitems.next(after, through) {
+                after = id;
+                let Some(epitem) = item.upgrade() else {
+                    continue;
+                };
+                let is_exclusive = epitem.event().lock_irqsave().events()
+                    & EPollEventType::EPOLLEXCLUSIVE.bits()
+                    != 0;
+                if is_exclusive != exclusive {
+                    continue;
                 }
-
-                if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
-                    && !pollflags.contains(EPollEventType::POLLFREE)
-                {
-                    // 避免惊群
-                    rs.epoll_wq.wakeup(None);
-                } else {
-                    rs.epoll_wq.wakeup_all(None);
+                if Self::notify_epitem(&epitem, pollflags) && !broadcast {
+                    break;
                 }
-            }
-
-            if let Some(poll_epitems) = epitem.poll_epitems().upgrade() {
-                let _ = Self::wakeup_epoll(
-                    poll_epitems.as_ref(),
-                    EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
-                );
             }
         }
         Ok(())
     }
+
+    /// Publish a single registration and report a consumed source wake quota.
+    /// Ordinary callbacks and POLLFREE never stop source traversal.
+    fn notify_epitem(epitem: &Arc<EPollItem>, pollflags: EPollEventType) -> bool {
+        // 通过 EPollItem 的 ready_state Weak 直接访问 ReadyState — 不需要 Mutex
+        let Some(rs_arc) = epitem.ready_state().upgrade() else {
+            return false;
+        };
+
+        // 读取注册事件掩码（irqsave SpinLock — hardirq-safe）
+        let ep_events = {
+            let event_guard = epitem.event().lock_irqsave();
+            EPollEventType::from_bits_truncate(event_guard.events())
+        };
+
+        // 对齐 Linux 6.6 `ep_poll_callback()`：
+        // 1) 若该 epitem 不包含任何 poll(2) 事件（仅剩 EP_PRIVATE_BITS），视为"被禁用"
+        // 2) 若驱动/文件系统传入了具体的 pollflags（非空），则必须与已注册的事件掩码匹配才入队
+        let enabled_mask = ep_events.difference(EPollEventType::EP_PRIVATE_BITS);
+        if enabled_mask.is_empty() && !pollflags.contains(EPollEventType::POLLFREE) {
+            return false;
+        }
+
+        if !pollflags.is_empty()
+            && !pollflags.contains(EPollEventType::POLLFREE)
+            && pollflags.intersection(ep_events).is_empty()
+        {
+            return false;
+        }
+
+        let consumed = {
+            // 仅获取 SpinLock（irqsave）— hardirq-safe
+            let mut rs = rs_arc.lock_irqsave();
+            if !epitem.is_active() {
+                return false;
+            }
+
+            rs.enqueue(epitem);
+
+            if ep_events.contains(EPollEventType::EPOLLEXCLUSIVE)
+                && !pollflags.contains(EPollEventType::POLLFREE)
+            {
+                let woken = rs.epoll_wq.wake_one();
+                // ep_poll_callback's ewake: combined IN|OUT does not stop
+                // source traversal, and an absent/cancelled waiter costs no quota.
+                let direction = pollflags.intersection(EPollEventType::EPOLLINOUT_BITS);
+                woken
+                    && (direction.is_empty()
+                        || direction == EPollEventType::EPOLLIN && ep_events.contains(direction)
+                        || direction == EPollEventType::EPOLLOUT && ep_events.contains(direction))
+            } else {
+                rs.epoll_wq.wakeup_all(None);
+                false
+            }
+        };
+
+        if let Some(poll_epitems) = epitem.poll_epitems().upgrade() {
+            let _ = Self::wakeup_epoll(
+                poll_epitems.as_ref(),
+                EPollEventType::EPOLLIN | EPollEventType::EPOLLRDNORM,
+            );
+        }
+        consumed
+    }
 }
 
-/// LockedEPItemLinkedList — 使用 irqsave SpinLock 保护的 epitem 链表。
-///
-/// 从 Mutex 改为 SpinLock 使得 `wakeup_epoll` 中的快照操作在 hardirq
-/// 上下文中也是安全的。链表操作（push_back、retain、snapshot clone）
-/// 临界区都很短，适合 SpinLock。
-pub type LockedEPItemLinkedList = SpinLock<LinkedList<Arc<EPollItem>>>;
+/// Source registrations, prepared at epoll_ctl birth. Notification never
+/// allocates and invokes callbacks only after releasing the source lock.
+#[derive(Debug)]
+pub struct EPollItemList {
+    // Published nodes own the item until explicit source removal, matching
+    // Linux waitqueue registration lifetime across File/epoll close races.
+    items: SpinLock<RBTree<u64, Registration>>,
+}
 
-impl Default for LockedEPItemLinkedList {
+impl EPollItemList {
+    pub const fn new() -> Self {
+        Self {
+            items: SpinLock::new(RBTree::new()),
+        }
+    }
+
+    pub fn add(&self, epitem: Arc<EPollItem>) {
+        // All possible source memberships (pipe read/write + File) were
+        // prepared and charged before the first publication.
+        let mut items = self.items.lock_irqsave();
+        if !items.contains_key(&epitem.registration_id) {
+            // No links lock is ever held while acquiring a source lock.
+            items.insert_prepared(epitem.take_source_node());
+        }
+    }
+
+    pub fn remove(&self, epitem: &Arc<EPollItem>) -> Result<(), SystemError> {
+        let node = self.items.lock_irqsave().extract(&epitem.registration_id);
+        match node {
+            Some(node) => {
+                epitem.return_source_node(node);
+                Ok(())
+            }
+            None => Err(SystemError::ENOENT),
+        }
+    }
+
+    fn last_id(&self) -> u64 {
+        self.items
+            .lock_irqsave()
+            .get_last()
+            .map_or(0, |(id, _)| *id)
+    }
+
+    fn next(&self, after: u64, through: u64) -> Option<(u64, Weak<EPollItem>)> {
+        let items = self.items.lock_irqsave();
+        let (id, registration) = items.upper_bound(&after)?;
+        (*id <= through).then(|| (*id, registration.item.clone()))
+    }
+
+    pub fn take_all(&self) -> EPollItemDrain {
+        EPollItemDrain {
+            items: core::mem::take(&mut *self.items.lock_irqsave()),
+        }
+    }
+}
+
+impl Default for EPollItemList {
     fn default() -> Self {
-        SpinLock::new(LinkedList::new())
+        Self::new()
+    }
+}
+impl Drop for EPollItemList {
+    fn drop(&mut self) {
+        drop(self.take_all());
+    }
+}
+
+/// Detached source storage: free node memory before its charge receipt.
+pub struct EPollItemDrain {
+    items: RBTree<u64, Registration>,
+}
+impl Iterator for EPollItemDrain {
+    type Item = Arc<EPollItem>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let id = *self.items.get_first()?.0;
+            let (_, mut registration) = self.items.extract(&id).unwrap().into_pair();
+            if let Some(item) = registration.published_pin.take() {
+                return Some(item);
+            }
+        }
+    }
+}
+impl Drop for EPollItemDrain {
+    fn drop(&mut self) {
+        while let Some((&id, _)) = self.items.get_first() {
+            drop(self.items.extract(&id).unwrap().into_pair());
+        }
     }
 }
 

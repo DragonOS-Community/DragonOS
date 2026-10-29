@@ -41,8 +41,12 @@ impl KernelThreadMechanism {
         frame.rip = kernel_thread_bootstrap_stage1 as usize as u64;
 
         // fork失败的话，子线程不会执行。否则将导致内存安全问题。
+        // Kernel threads must not be traced by ptrace, nor report
+        // fork/clone ptrace events.
         let mut clone_args = KernelCloneArgs::new();
-        clone_args.flags = clone_flags;
+        clone_args.flags = clone_flags | CloneFlags::CLONE_UNTRACED;
+        clone_args.kthread = true;
+        clone_args.kthread_flags = info.flags();
         if info
             .flags()
             .contains(crate::process::kthread::KernelThreadFlags::IS_PER_CPU)
@@ -57,10 +61,6 @@ impl KernelThreadMechanism {
         let pid = ProcessManager::fork_with_args(&frame, clone_args).inspect_err(|_e| {
             unsafe { KernelThreadCreateInfo::parse_unsafe_arc_ptr(create_info) };
         })?;
-
-        let pcb = ProcessManager::find_task_by_vpid(pid).unwrap();
-        pcb.set_name(info.name().clone());
-        info.setup_pcb(&pcb);
 
         return Ok(pid);
     }

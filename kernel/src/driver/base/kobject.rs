@@ -1,8 +1,15 @@
-use core::{any::Any, fmt::Debug, hash::Hash, ops::Deref};
+use core::{
+    any::Any,
+    fmt::Debug,
+    hash::Hash,
+    ops::Deref,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use alloc::{
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use driver_base_macros::get_weak_or_clear;
 use intertrait::CastFromSync;
@@ -10,7 +17,7 @@ use log::{debug, error};
 
 use crate::{
     filesystem::{
-        kernfs::KernFSInode,
+        kernfs::{KernFSInode, KernFSNamespaceTag},
         sysfs::{sysfs_instance, Attribute, AttributeGroup, SysFSOps, SysFSOpsSupport},
     },
     libs::{
@@ -18,11 +25,22 @@ use crate::{
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
     },
+    net::socket::netlink::{
+        addr::multicast::GroupIdSet,
+        kobject::message::KobjectUeventMessage,
+        table::{NetlinkKobjectUeventProtocol, SupportedNetlinkProtocol},
+    },
+    process::{
+        namespace::net_namespace::{NetNamespace, INIT_NET_NAMESPACE},
+        ProcessManager,
+    },
 };
 
 use system_error::SystemError;
 
 use super::kset::KSet;
+
+static UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(1);
 
 pub trait KObject: Any + Send + Sync + Debug + CastFromSync {
     fn as_any_ref(&self) -> &dyn core::any::Any;
@@ -67,12 +85,139 @@ impl dyn KObject {
         let mut state = self.kobj_state_mut();
         *state = (*state | insert) & !remove;
     }
+
+    pub fn kobject_uevent(
+        kobj: &Arc<dyn KObject>,
+        action: &str,
+        extra_env: &[(&str, String)],
+    ) -> Result<(), SystemError> {
+        let devpath = Self::devpath(kobj)?;
+        Self::emit_uevent(action, &devpath, extra_env)
+    }
+
+    /// Emits a kobject event into an explicitly selected network namespace.
+    ///
+    /// Most kobjects are not namespace-aware and use [`Self::kobject_uevent`].
+    /// Namespaced object classes, such as network devices, must select the
+    /// namespace from the object rather than from the calling task.
+    pub fn kobject_uevent_in_netns(
+        kobj: &Arc<dyn KObject>,
+        action: &str,
+        extra_env: &[(&str, String)],
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        let devpath = Self::devpath(kobj)?;
+        Self::emit_uevent_in_netns(action, &devpath, extra_env, netns)
+    }
+
+    pub fn emit_uevent(
+        action: &str,
+        devpath: &str,
+        extra_env: &[(&str, String)],
+    ) -> Result<(), SystemError> {
+        let netns = if ProcessManager::initialized() {
+            ProcessManager::current_netns()
+        } else {
+            INIT_NET_NAMESPACE.clone()
+        };
+        Self::emit_uevent_in_netns(action, devpath, extra_env, netns)
+    }
+
+    pub fn emit_uevent_in_netns(
+        action: &str,
+        devpath: &str,
+        extra_env: &[(&str, String)],
+        netns: Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        let mut payload = Vec::new();
+        try_push_env_components(&mut payload, &[action.as_bytes(), b"@", devpath.as_bytes()])?;
+        try_push_env_components(&mut payload, &[b"ACTION=", action.as_bytes()])?;
+        try_push_env_components(&mut payload, &[b"DEVPATH=", devpath.as_bytes()])?;
+        for (key, value) in extra_env {
+            try_push_env_components(&mut payload, &[key.as_bytes(), b"=", value.as_bytes()])?;
+        }
+        let seqnum = UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed);
+        let mut digits = [0u8; 20];
+        let seqnum = decimal_bytes(seqnum, &mut digits);
+        try_push_env_components(&mut payload, &[b"SEQNUM=", seqnum])?;
+
+        NetlinkKobjectUeventProtocol::multicast(
+            GroupIdSet::new(1),
+            KobjectUeventMessage::try_from_vec(payload)?,
+            netns,
+        )
+    }
+
+    pub fn devpath(kobj: &Arc<dyn KObject>) -> Result<String, SystemError> {
+        kobject_devpath(kobj)
+    }
 }
 
 impl DowncastArc for dyn KObject {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any> {
         self
     }
+}
+
+fn try_push_env_components(payload: &mut Vec<u8>, components: &[&[u8]]) -> Result<(), SystemError> {
+    let length = components.iter().try_fold(1usize, |length, component| {
+        length.checked_add(component.len())
+    });
+    payload
+        .try_reserve(length.ok_or(SystemError::ENOMEM)?)
+        .map_err(|_| SystemError::ENOMEM)?;
+    for component in components {
+        payload.extend_from_slice(component);
+    }
+    payload.push(0);
+    Ok(())
+}
+
+fn decimal_bytes(mut value: u64, storage: &mut [u8; 20]) -> &[u8] {
+    let mut start = storage.len();
+    loop {
+        start -= 1;
+        storage[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &storage[start..];
+        }
+    }
+}
+
+fn kobject_devpath(kobj: &Arc<dyn KObject>) -> Result<String, SystemError> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = Some(kobj.clone());
+
+    while let Some(node) = current {
+        let name = node.name();
+        if !name.is_empty() {
+            parts.push(name);
+        }
+
+        let Some(parent) = node.parent().and_then(|parent| parent.upgrade()) else {
+            break;
+        };
+
+        if Arc::ptr_eq(&parent, &node) {
+            break;
+        }
+
+        current = Some(parent);
+    }
+
+    parts.reverse();
+    let mut path = String::new();
+    for part in parts {
+        path.push('/');
+        path.push_str(&part);
+    }
+
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
+
+    Ok(path)
 }
 
 /// kobject的公共数据
@@ -191,6 +336,20 @@ impl KObjectManager {
     }
 
     pub fn add_kobj(kobj: Arc<dyn KObject>) -> Result<(), SystemError> {
+        Self::add_kobj_with_namespace(kobj, None)
+    }
+
+    pub fn add_kobj_ns(
+        kobj: Arc<dyn KObject>,
+        namespace: KernFSNamespaceTag,
+    ) -> Result<(), SystemError> {
+        Self::add_kobj_with_namespace(kobj, Some(namespace))
+    }
+
+    fn add_kobj_with_namespace(
+        kobj: Arc<dyn KObject>,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         if let Some(kset) = kobj.kset() {
             kset.join(&kobj);
             // 如果kobject没有parent，那么就将这个kset作为parent
@@ -199,7 +358,7 @@ impl KObjectManager {
             }
         }
 
-        let r = Self::create_dir(kobj.clone());
+        let r = Self::create_dir(kobj.clone(), namespace);
 
         if let Err(e) = r {
             // https://code.dragonos.org.cn/xref/linux-6.1.9/lib/kobject.c?r=&mo=10426&fi=394#224
@@ -218,9 +377,15 @@ impl KObjectManager {
         return Ok(());
     }
 
-    fn create_dir(kobj: Arc<dyn KObject>) -> Result<(), SystemError> {
+    fn create_dir(
+        kobj: Arc<dyn KObject>,
+        namespace: Option<KernFSNamespaceTag>,
+    ) -> Result<(), SystemError> {
         // create dir in sysfs
-        sysfs_instance().create_dir(kobj.clone())?;
+        match namespace {
+            Some(namespace) => sysfs_instance().create_dir_ns(kobj.clone(), namespace)?,
+            None => sysfs_instance().create_dir(kobj.clone())?,
+        };
 
         // create default attributes in sysfs
         if let Some(ktype) = kobj.kobj_type() {

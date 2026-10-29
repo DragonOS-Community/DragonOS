@@ -9,6 +9,7 @@ use system_error::SystemError;
 use super::constants;
 use super::info;
 use super::inner;
+use crate::net::socket::inet::InetSocket;
 
 use crate::libs::byte_parser;
 use crate::net::socket::common::{parse_timeval_opt, write_timeval_opt, ShutdownBit};
@@ -107,6 +108,152 @@ impl From<Options> for i32 {
 
 /// TCP socket option setters.
 impl super::TcpSocket {
+    fn set_pmtu_discover_option(
+        &self,
+        version: smoltcp::wire::IpVersion,
+        val: &[u8],
+    ) -> Result<(), SystemError> {
+        let value = byte_parser::read_i32(val)?;
+        if !(0..=5).contains(&value) {
+            return Err(SystemError::EINVAL);
+        }
+        // Same inner -> SocketSet order as bind/connect/passive-open setup.
+        let mut guard = self.inner.write();
+        let atomic = match version {
+            smoltcp::wire::IpVersion::Ipv4 => &self.options.ip_mtu_discover,
+            smoltcp::wire::IpVersion::Ipv6 => &self.options.ipv6_mtu_discover,
+        };
+        if let Some(state) = guard.as_mut() {
+            match state {
+                inner::Inner::Listening(listener) => {
+                    listener.set_pmtu_discover(version, value as u8)
+                }
+                state => state.for_each_socket_mut(|socket| {
+                    let family = socket
+                        .local_endpoint()
+                        .map_or(self.ip_version, |local| local.addr.version());
+                    if family == version {
+                        socket
+                            .set_pmtu_discover(value as u8)
+                            .expect("validated PMTU policy");
+                    }
+                }),
+            }
+        }
+        atomic.store(value, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Snapshot transport identity first, then resolve the current path after
+    /// dropping protocol locks. Route lookup must never follow SocketSet locks.
+    fn socket_path_mtu(&self) -> Result<usize, SystemError> {
+        let (local, remote) = {
+            let guard = self.inner.read();
+            let state = guard.as_ref().ok_or(SystemError::ENOTCONN)?;
+            if !matches!(
+                state,
+                inner::Inner::Connecting(_) | inner::Inner::Established(_)
+            ) {
+                return Err(SystemError::ENOTCONN);
+            }
+            (
+                state.local_endpoint(),
+                state
+                    .transport_remote_endpoint()
+                    .ok_or(SystemError::ENOTCONN)?,
+            )
+        };
+        let netns = self.netns();
+        let (source, destination) = crate::net::icmp_error::routed_output_flow(
+            &netns,
+            local,
+            remote,
+            smoltcp::wire::IpProtocol::Tcp,
+        );
+        let router = netns.router();
+        let routes = crate::net::route::lock_output_routes(&router, netns.device_list());
+        let required_oif =
+            u32::try_from(self.device_binding.ifindex()).map_err(|_| SystemError::ENODEV)?;
+        let route = routes
+            .lookup(destination, (required_oif != 0).then_some(required_oif))
+            .ok_or(SystemError::ENOTCONN)?;
+        Ok(crate::net::route::pmtu::path_mtu(&netns, route, source, destination).path)
+    }
+
+    pub(super) fn set_ipv6_option(&self, name: usize, val: &[u8]) -> Result<(), SystemError> {
+        use crate::net::socket::PIPV6;
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+        match name {
+            name if name == PIPV6::RECVERR as usize => {
+                self.set_recv_error_policy(
+                    smoltcp::wire::IpVersion::Ipv6,
+                    byte_parser::read_i32(val)? != 0,
+                );
+                Ok(())
+            }
+            name if name == PIPV6::V6ONLY as usize => self.set_ipv6_only(val),
+            name if name == PIPV6::MTU_DISCOVER as usize => {
+                self.set_pmtu_discover_option(smoltcp::wire::IpVersion::Ipv6, val)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    pub(super) fn get_ipv6_option(
+        &self,
+        name: usize,
+        value: &mut [u8],
+    ) -> Result<usize, SystemError> {
+        use crate::net::socket::PIPV6;
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            // IPv4 TCP delegates non-TCP getsockopt levels to ip_getsockopt,
+            // which rejects non-SOL_IP levels with EOPNOTSUPP (Linux 6.6).
+            // setsockopt deliberately retains its distinct ENOPROTOOPT errno.
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        match name {
+            name if name == PIPV6::RECVERR as usize => Self::write_i32_opt(
+                value,
+                i32::from(self.recv_error_policy(smoltcp::wire::IpVersion::Ipv6)),
+            ),
+            name if name == PIPV6::V6ONLY as usize => self.get_ipv6_only(value),
+            name if name == PIPV6::MTU_DISCOVER as usize => {
+                Self::write_atomic_i32(value, &self.options.ipv6_mtu_discover)
+            }
+            name if name == PIPV6::MTU as usize => {
+                Self::write_i32_opt(value, self.socket_path_mtu()?.min(i32::MAX as usize) as i32)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    pub(super) fn set_ipv6_only(&self, val: &[u8]) -> Result<(), SystemError> {
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            return Err(SystemError::ENOPROTOOPT);
+        }
+        let value = byte_parser::read_i32(val)? != 0;
+        let guard = self.inner.write();
+        if !matches!(
+            guard.as_ref(),
+            Some(inner::Inner::Init(inner::Init::Unbound(_)))
+        ) {
+            return Err(SystemError::EINVAL);
+        }
+        self.options
+            .ipv6_only
+            .store(value, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn get_ipv6_only(&self, value: &mut [u8]) -> Result<usize, SystemError> {
+        if self.ip_version != smoltcp::wire::IpVersion::Ipv6 {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        Self::write_bool_opt_i32(value, &self.options.ipv6_only)
+    }
+
     const MAX_TCP_KEEPIDLE: i32 = 32767;
     const MAX_TCP_KEEPINTVL: i32 = 32767;
     const MAX_TCP_KEEPCNT: i32 = 127;
@@ -151,28 +298,21 @@ impl super::TcpSocket {
     /// Helper to write a u32 value to an option buffer.
     #[inline]
     fn write_u32_opt(value: &mut [u8], v: u32) -> Result<usize, SystemError> {
-        if value.len() < 4 {
-            return Err(SystemError::EINVAL);
-        }
-        value[..4].copy_from_slice(&v.to_ne_bytes());
-        Ok(4)
+        Ok(crate::net::socket::common::write_u32_getsockopt(value, v))
     }
 
     /// Helper to write an i32 value to an option buffer.
     #[inline]
     fn write_i32_opt(value: &mut [u8], v: i32) -> Result<usize, SystemError> {
-        Self::write_u32_opt(value, v as u32)
+        Ok(crate::net::socket::common::write_i32_getsockopt(value, v))
     }
 
     /// Helper to write a linger struct (two i32 fields) to an option buffer.
     #[inline]
     fn write_linger_opt(value: &mut [u8], onoff: i32, linger: i32) -> Result<usize, SystemError> {
-        if value.len() < 8 {
-            return Err(SystemError::EINVAL);
-        }
-        value[..4].copy_from_slice(&onoff.to_ne_bytes());
-        value[4..8].copy_from_slice(&linger.to_ne_bytes());
-        Ok(8)
+        Ok(crate::net::socket::common::write_linger_getsockopt(
+            value, onoff, linger,
+        ))
     }
 
     /// Helper to read an atomic usize value and write as u32 to an option buffer.
@@ -195,17 +335,17 @@ impl super::TcpSocket {
         Self::write_i32_opt(value, v)
     }
 
-    /// Helper to get a socket property with a default for closed/self-connected/none states.
+    /// Helper to get a socket property with a default for closed/uninitialized states.
     ///
     /// This pattern is repeated when getting socket options that need to handle
-    /// cases where the socket is closed, self-connected, or not yet initialized.
+    /// cases where the socket is closed or not yet initialized.
     #[inline]
     fn with_socket_property<F, R>(&self, default: R, f: F) -> R
     where
         F: FnOnce(&inner::Inner) -> R,
     {
         match self.inner.read().as_ref() {
-            Some(inner::Inner::Closed(_)) | Some(inner::Inner::SelfConnected(_)) | None => default,
+            Some(inner::Inner::Closed(_)) | None => default,
             Some(inner) => f(inner),
         }
     }
@@ -225,6 +365,19 @@ impl super::TcpSocket {
     /// Sets a SOL_SOCKET option.
     pub(super) fn set_socket_option(&self, opt: PSO, val: &[u8]) -> Result<(), SystemError> {
         match opt {
+            PSO::BINDTODEVICE => {
+                let mut inner = self.inner.write();
+                let mut update = self.device_binding.prepare_update(&self.netns, val)?;
+                let device = update
+                    .target_iface()
+                    .and_then(|iface| core::num::NonZeroU32::new(iface.nic_id() as u32));
+                match inner.as_mut().expect("TCP state is present") {
+                    inner::Inner::Listening(listener) => listener.set_bound_device(device),
+                    state => state.for_each_socket_mut(|socket| socket.set_bound_device(device)),
+                }
+                update.commit();
+                Ok(())
+            }
             PSO::SNDTIMEO_OLD | PSO::SNDTIMEO_NEW => {
                 let d = parse_timeval_opt(val)?;
                 let us = d.map(|v| v.total_micros()).unwrap_or(u64::MAX);
@@ -260,9 +413,7 @@ impl super::TcpSocket {
                         constants::MAX_SOCKET_BUFFER,
                     )
                 };
-                self.send_buf_size()
-                    .store(size, core::sync::atomic::Ordering::Relaxed);
-                self.update_inner_buffers(size, self.recv_buf_size_loaded());
+                self.update_send_buffer(size)?;
                 crate::net::socket::base::Socket::wait_queue(self).wakeup(None);
                 Ok(())
             }
@@ -284,9 +435,7 @@ impl super::TcpSocket {
                         constants::MAX_SOCKET_BUFFER,
                     )
                 };
-                self.recv_buf_size()
-                    .store(size, core::sync::atomic::Ordering::Relaxed);
-                self.update_inner_buffers(self.send_buf_size_loaded(), size);
+                self.update_receive_buffer(size)?;
                 crate::net::socket::base::Socket::wait_queue(self).wakeup(None);
                 Ok(())
             }
@@ -317,7 +466,11 @@ impl super::TcpSocket {
                 self.apply_keepalive(interval);
                 Ok(())
             }),
-            PSO::REUSEADDR => Self::set_bool_option(self.so_reuseaddr(), val, |_| Ok(())),
+            PSO::REUSEADDR => {
+                self.port_owner
+                    .set_reuse_addr(byte_parser::read_i32(val)? != 0);
+                Ok(())
+            }
             PSO::BROADCAST => Self::set_bool_option(self.so_broadcast(), val, |_| Ok(())),
             PSO::PASSCRED => Self::set_bool_option(self.so_passcred(), val, |_| Ok(())),
             PSO::NO_CHECK => Self::set_bool_option(self.so_no_check(), val, |_| Ok(())),
@@ -349,7 +502,18 @@ impl super::TcpSocket {
                     .store(v, core::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            PSO::OOBINLINE => Self::set_bool_option(self.so_oobinline_enabled(), val, |_| Ok(())),
+            PSO::OOBINLINE => {
+                let enabled = byte_parser::read_bool_flag(val)?;
+                let mut inner = self.inner.write();
+                self.so_oobinline_enabled()
+                    .store(enabled, core::sync::atomic::Ordering::Relaxed);
+                if let Some(inner) = inner.as_mut() {
+                    inner.for_each_socket_mut(|socket| socket.set_urgent_inline(enabled));
+                }
+                drop(inner);
+                self.notify();
+                Ok(())
+            }
             _ => Ok(()), // Accept and ignore other SOL_SOCKET options
         }
     }
@@ -357,11 +521,15 @@ impl super::TcpSocket {
     /// Sets a SOL_IP option.
     pub(super) fn set_ip_option(&self, opt: IpOption, val: &[u8]) -> Result<(), SystemError> {
         match opt {
-            IpOption::MTU_DISCOVER => {
-                let v = byte_parser::read_i32(val)?;
-                self.ip_mtu_discover()
-                    .store(v, core::sync::atomic::Ordering::Relaxed);
+            IpOption::RECVERR => {
+                self.set_recv_error_policy(
+                    smoltcp::wire::IpVersion::Ipv4,
+                    byte_parser::read_i32(val)? != 0,
+                );
                 Ok(())
+            }
+            IpOption::MTU_DISCOVER => {
+                self.set_pmtu_discover_option(smoltcp::wire::IpVersion::Ipv4, val)
             }
             IpOption::MULTICAST_TTL => {
                 let v = byte_parser::read_i32(val)?;
@@ -385,6 +553,9 @@ impl super::TcpSocket {
             Options::NoDelay => {
                 let nagle_enabled = !byte_parser::read_bool_flag(val)?;
                 let mut inner = self.inner.write();
+                self.options
+                    .nagle_enabled
+                    .store(nagle_enabled, core::sync::atomic::Ordering::Relaxed);
                 if let Some(inner) = inner.as_mut() {
                     inner.for_each_socket_mut(|s| s.set_nagle_enabled(nagle_enabled));
                 }
@@ -443,6 +614,11 @@ impl super::TcpSocket {
                 self.apply_congestion_control(cc);
                 Ok(())
             }
+            // The copy layer accepts TCP_ULP's bounded string ABI, but no ULP
+            // registry or attachment mechanism exists yet. Linux reports
+            // ENOENT when the requested ULP cannot be found; never claim that
+            // an unsupported transport transform was installed.
+            Options::ULP => Err(SystemError::ENOENT),
             Options::MaxSegment => {
                 let v = byte_parser::read_u32(val)?;
                 if !(constants::TCP_MIN_MSS..=constants::MAX_TCP_WINDOW).contains(&v) {
@@ -521,6 +697,10 @@ impl super::TcpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match opt {
+            PSO::BINDTODEVICE => {
+                let _state = self.inner.read();
+                self.device_binding.get(&self.netns, value)
+            }
             PSO::ACCEPTCONN => {
                 let shutdown = self.shutdown.load(core::sync::atomic::Ordering::Acquire);
                 let is_listening = self.is_listening();
@@ -533,16 +713,11 @@ impl super::TcpSocket {
                 Self::write_i32_opt(value, v)
             }
             PSO::ERROR => {
-                let err = match self.inner.read().as_ref() {
-                    Some(inner::Inner::Connecting(c)) => {
-                        let err = c.failure_reason().map(|e| -e.to_posix_errno()).unwrap_or(0);
-                        if err != 0 {
-                            c.consume_error();
-                        }
-                        err
-                    }
-                    _ => 0,
-                };
+                let err = self
+                    .take_socket_option_error()
+                    .map(|error| -error.to_posix_errno())
+                    .unwrap_or(0);
+                self.update_events();
                 Self::write_i32_opt(value, err)
             }
             PSO::TYPE => Self::write_i32_opt(value, PSOCK::Stream as i32),
@@ -559,14 +734,14 @@ impl super::TcpSocket {
                     .send_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVTIMEO_OLD | PSO::RCVTIMEO_NEW => {
                 let us = self
                     .recv_timeout_us()
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let us = if us == u64::MAX { 0 } else { us };
-                write_timeval_opt(value, us)
+                Ok(write_timeval_opt(value, us))
             }
             PSO::RCVLOWAT => {
                 let v = self
@@ -576,7 +751,7 @@ impl super::TcpSocket {
                 Self::write_i32_opt(value, v)
             }
             PSO::KEEPALIVE => Self::write_bool_opt_i32(value, self.so_keepalive_enabled()),
-            PSO::REUSEADDR => Self::write_bool_opt_i32(value, self.so_reuseaddr()),
+            PSO::REUSEADDR => Self::write_i32_opt(value, i32::from(self.port_owner.reuse_addr())),
             PSO::BROADCAST => Self::write_bool_opt_i32(value, self.so_broadcast()),
             PSO::PASSCRED => Self::write_bool_opt_i32(value, self.so_passcred()),
             PSO::NO_CHECK => Self::write_bool_opt_i32(value, self.so_no_check()),
@@ -604,7 +779,14 @@ impl super::TcpSocket {
         value: &mut [u8],
     ) -> Result<usize, SystemError> {
         match opt {
+            IpOption::RECVERR => Self::write_i32_opt(
+                value,
+                i32::from(self.recv_error_policy(smoltcp::wire::IpVersion::Ipv4)),
+            ),
             IpOption::MTU_DISCOVER => Self::write_atomic_i32(value, self.ip_mtu_discover()),
+            IpOption::MTU => {
+                Self::write_i32_opt(value, self.socket_path_mtu()?.min(i32::MAX as usize) as i32)
+            }
             IpOption::MULTICAST_TTL => Self::write_atomic_i32(value, self.ip_multicast_ttl()),
             IpOption::MULTICAST_LOOP => Self::write_bool_opt_i32(value, self.ip_multicast_loop()),
             _ => Err(SystemError::ENOPROTOOPT),
@@ -620,7 +802,9 @@ impl super::TcpSocket {
         match opt {
             Options::NoDelay => {
                 let nagle_enabled = self
-                    .with_socket_property(true, |inner| inner.with_socket(|s| s.nagle_enabled()));
+                    .options
+                    .nagle_enabled
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 let nodelay: u32 = if nagle_enabled { 0 } else { 1 };
                 Self::write_u32_opt(value, nodelay)
             }
@@ -628,10 +812,7 @@ impl super::TcpSocket {
             Options::QuickAck => Self::write_bool_opt_u32(value, self.tcp_quickack_enabled()),
             Options::Cork => Self::write_bool_opt_i32(value, &self.options.tcp_cork),
             Options::Congestion => {
-                let cc_name = self
-                    .with_socket_property(smoltcp::socket::tcp::CongestionControl::Reno, |inner| {
-                        inner.with_socket(|s| s.congestion_control())
-                    });
+                let cc_name = *self.options.congestion_control.lock_irqsave();
 
                 let name = match cc_name {
                     smoltcp::socket::tcp::CongestionControl::Reno => "reno",
@@ -684,7 +865,15 @@ impl super::TcpSocket {
 
         // For closed/unconnected sockets, return default info
         let info = self.with_socket_property(info::PosixTcpInfo::default(), |inner| {
-            inner.with_socket(|socket| TcpInfoCollector::new(socket).collect())
+            inner
+                .with_socket(|socket| TcpInfoCollector::new(socket).collect())
+                .unwrap_or_else(|| {
+                    let mut info = info::PosixTcpInfo::default();
+                    if matches!(inner, super::inner::Inner::Listening(_)) {
+                        info.tcpi_state = info::TcpState::Listen as u8;
+                    }
+                    info
+                })
         });
 
         // Copy the info struct to the output buffer

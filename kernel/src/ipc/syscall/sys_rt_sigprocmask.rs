@@ -57,7 +57,7 @@ pub(super) fn do_kernel_rt_sigprocmask(
             true,
         )?;
         let nset = reader.read_one_from_user::<u64>(0)?;
-        let mut new_set = SigSet::from_bits_truncate(*nset);
+        let mut new_set = SigSet::from_bits_truncate(nset);
         // debug!("Get Newset: {}", &new_set.bits());
         let to_remove: SigSet =
             <Signal as Into<SigSet>>::into(Signal::SIGKILL) | Signal::SIGSTOP.into();

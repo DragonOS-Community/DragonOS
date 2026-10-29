@@ -1,3 +1,5 @@
+use crate::filesystem::vfs::file::FileMode;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::{
     driver::base::{
         class::Class,
@@ -49,7 +51,7 @@ use super::{
 /// - 设备分配和查找
 /// - 设备绑定和解绑
 /// - 设备状态查询和配置（配置设备参数，如偏移量、大小限制等）
-#[cast_to([sync] Device)]
+#[cast_to([sync] Device, DeviceINode)]
 pub struct LoopControlDevice {
     inner: SpinLock<LoopControlDeviceInner>,
     locked_kobj_state: LockedKObjectState,
@@ -102,12 +104,25 @@ impl Debug for LoopControlDevice {
 }
 
 impl IndexNode for LoopControlDevice {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        // Linux loop_ctl_fops has no read/write method and its
+        // nonseekable_open clears positional access after generic open setup.
+        behavior.mode.remove(
+            FileMode::FMODE_CAN_READ
+                | FileMode::FMODE_CAN_WRITE
+                | FileMode::FMODE_LSEEK
+                | FileMode::FMODE_PREAD
+                | FileMode::FMODE_PWRITE,
+        );
+    }
+
     fn open(
         &self,
         _data: MutexGuard<FilePrivateData>,
         _mode: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -170,38 +185,39 @@ impl IndexNode for LoopControlDevice {
         cmd: u32,
         data: usize,
         _private_data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        match LoopControlIoctl::from_u32(cmd) {
-            Some(LoopControlIoctl::Add) => {
-                log::info!("Starting LOOP_CTL_ADD ioctl");
-                let requested_index = data as u32;
-                let loop_dev = if requested_index == u32::MAX {
-                    self.loop_mgr.loop_add(None)?
-                } else {
-                    self.loop_mgr.loop_add(Some(requested_index))?
-                };
-                let minor = {
-                    let inner = loop_dev.inner();
-                    let minor = inner.device_number.minor();
-                    log::info!(
-                        "LOOP_CTL_ADD ioctl succeeded, allocated loop device loop{}",
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> =
+            (|| match LoopControlIoctl::from_u32(cmd) {
+                Some(LoopControlIoctl::Add) => {
+                    log::info!("Starting LOOP_CTL_ADD ioctl");
+                    let requested_index = data as u32;
+                    let loop_dev = if requested_index == u32::MAX {
+                        self.loop_mgr.loop_add_new()?
+                    } else {
+                        self.loop_mgr.loop_add(Some(requested_index))?
+                    };
+                    let minor = {
+                        let inner = loop_dev.inner();
+                        let minor = inner.device_number.minor();
+                        log::info!(
+                            "LOOP_CTL_ADD ioctl succeeded, allocated loop device loop{}",
+                            minor
+                        );
                         minor
-                    );
-                    minor
-                };
-                Ok(minor as usize)
-            }
-            Some(LoopControlIoctl::Remove) => {
-                let minor_to_remove = data as u32;
-                self.loop_mgr.loop_remove(minor_to_remove)?;
-                Ok(0)
-            }
-            Some(LoopControlIoctl::GetFree) => match self.loop_mgr.find_free_minor() {
-                Some(minor) => Ok(minor as usize),
-                None => Err(SystemError::ENOSPC),
-            },
-            _ => Err(SystemError::ENOSYS),
-        }
+                    };
+                    Ok(minor as usize)
+                }
+                Some(LoopControlIoctl::Remove) => {
+                    let minor_to_remove = data as u32;
+                    self.loop_mgr.loop_remove(minor_to_remove)?;
+                    Ok(0)
+                }
+                Some(LoopControlIoctl::GetFree) => {
+                    Ok(self.loop_mgr.find_or_add_free_minor()? as usize)
+                }
+                _ => Err(SystemError::ENOSYS),
+            })();
+        result.map_err(Into::into)
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -214,8 +230,9 @@ impl IndexNode for LoopControlDevice {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -224,8 +241,9 @@ impl IndexNode for LoopControlDevice {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<crate::filesystem::vfs::FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {

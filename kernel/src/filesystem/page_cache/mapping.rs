@@ -1,0 +1,1155 @@
+use crate::mm::allocation::MemoryAllocationError;
+
+use super::{
+    detach_pages_from_reclaimer_batched, page_align_up, page_manager_lock, AddressSpace, Arc,
+    FaultRetryWait, HashMap, LockedVMA, MMArch, MemoryManagementArch, MmuGather, Ordering,
+    PageCache, PageCacheManager, PageCachePagePin, PageEntry, PageState, RwSemReadGuard,
+    RwSemWriteGuard, SystemError, Vec, Weak,
+};
+use crate::mm::page::{Page, PageFlags};
+use crate::mm::VmFlags;
+
+/// Only removes mappings. Cache membership and the physical owner stay alive
+/// until the caller performs the final clean-cache retirement check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageCacheReclaimMapOutcome {
+    Unmapped,
+    Dirty,
+    Busy,
+}
+
+/// Carries no entry pin or inode lock. Wait only after releasing invalidate_write.
+pub(crate) struct PageCacheRangeRetry {
+    cache: Weak<PageCache>,
+    reason: RangeRetryReason,
+}
+
+enum RangeRetryReason {
+    Entry(Arc<PageEntry>),
+    Load(usize),
+    Unmap,
+}
+
+pub(crate) enum PageCacheRangeResult<T> {
+    Ready(T),
+    Retry(PageCacheRangeRetry),
+}
+
+impl PageCacheRangeRetry {
+    pub(crate) fn wait(self) -> Result<(), SystemError> {
+        match self.reason {
+            RangeRetryReason::Entry(entry) => entry.wait_until(|| match entry.state() {
+                PageState::Loading | PageState::Writeback => None,
+                PageState::Error => Some(Err(SystemError::EIO)),
+                _ if entry.active_users() != 0 => None,
+                _ => Some(Ok(())),
+            }),
+            RangeRetryReason::Load(index) => {
+                let cache = self.cache.upgrade().ok_or(SystemError::EIO)?;
+                let _invalidate = cache.invalidate_read();
+                drop(cache.get_or_create_page_for_read_pinned(index)?);
+                Ok(())
+            }
+            RangeRetryReason::Unmap => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FileVmaIndex {
+    vmas: HashMap<usize, Weak<LockedVMA>>,
+}
+
+impl FileVmaIndex {
+    fn register(&mut self, vma: &Arc<LockedVMA>) {
+        self.vmas.insert(vma.id(), Arc::downgrade(vma));
+    }
+
+    fn unregister(&mut self, vma_id: usize) {
+        self.vmas.remove(&vma_id);
+    }
+
+    fn collect_all(&mut self) -> Vec<Arc<LockedVMA>> {
+        let mut result = Vec::new();
+        self.vmas.retain(|_, weak| {
+            if let Some(vma) = weak.upgrade() {
+                result.push(vma);
+                true
+            } else {
+                false
+            }
+        });
+        result
+    }
+}
+
+struct MmFileRangeGroup {
+    mm: Arc<AddressSpace>,
+    ranges: Vec<(Arc<LockedVMA>, crate::mm::VirtRegion)>,
+}
+
+impl MmFileRangeGroup {
+    fn new(mm: Arc<AddressSpace>) -> Self {
+        Self {
+            mm,
+            ranges: Vec::new(),
+        }
+    }
+}
+
+struct MmFilePageGroup {
+    mm: Arc<AddressSpace>,
+    items: Vec<(Arc<LockedVMA>, crate::mm::VirtAddr)>,
+}
+
+impl MmFilePageGroup {
+    fn new(mm: Arc<AddressSpace>) -> Self {
+        Self {
+            mm,
+            items: Vec::new(),
+        }
+    }
+}
+
+/// Policy for zapping page-cache backed file mappings.
+///
+/// This mirrors Linux's `unmap_mapping_pages(..., even_cows)`: cache invalidation
+/// must preserve private COW data, while truncate must also drop COWed private
+/// PTEs so future access faults against the new file size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnmapMappingMode {
+    CacheOnly,
+    EvenCow,
+}
+
+struct PageCacheInvalidateRetryWait {
+    cache: Arc<PageCache>,
+}
+
+impl core::fmt::Debug for PageCacheInvalidateRetryWait {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PageCacheInvalidateRetryWait").finish()
+    }
+}
+
+impl FaultRetryWait for PageCacheInvalidateRetryWait {
+    fn wait(&self) -> Result<(), MemoryAllocationError> {
+        let _invalidate = self.cache.invalidate_read();
+        Ok(())
+    }
+}
+
+/// Result of the nonblocking invalidation decision made before a file-backed
+/// write fault enters filesystem code.
+///
+/// `Retry` is deliberately an owned wait token rather than a boolean. The
+/// caller must return `VM_FAULT_RETRY`, release its `AddressSpace::write()`
+/// guard in the outer fault loop, and only then call `wait()`. Keeping that
+/// decision with PageCache makes the writer-preference rule and its retry
+/// predicate single-sourced for both shared and private file faults.
+#[must_use = "a file-fault invalidation decision must be held or returned as VM_FAULT_RETRY"]
+pub(crate) enum PageCacheFaultInvalidateRead<'a> {
+    Acquired(RwSemReadGuard<'a, ()>),
+    Retry(Arc<dyn FaultRetryWait>),
+}
+
+impl PageCacheManager {
+    pub fn resize(&self, len: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        cache.truncate(len)
+    }
+}
+
+impl PageCacheManager {
+    pub fn invalidate_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<usize, SystemError> {
+        Ok(self
+            .upgrade()?
+            .evict_clean_pages_for_invalidate(Some((start_index, end_index))))
+    }
+
+    pub fn discard_clean_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<usize, SystemError> {
+        self.discard_clean_range_inner(start_index, end_index, true)
+    }
+
+    /// Discard immediately reclaimable clean pages without waiting for I/O.
+    ///
+    /// This is used while acknowledging a FUSE notification: waiting for a
+    /// Loading page there can deadlock the daemon that must complete that load.
+    pub(crate) fn discard_clean_range_nowait(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> Result<usize, SystemError> {
+        self.discard_clean_range_inner(start_index, end_index, false)
+    }
+
+    fn discard_clean_range_inner(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        wait_loading: bool,
+    ) -> Result<usize, SystemError> {
+        let cache = self.upgrade()?;
+        if cache.is_shmem() {
+            return Ok(0);
+        }
+        let indices = cache.clean_evict_indices(Some((start_index, end_index)));
+
+        let mut discarded = 0;
+        for page_index in indices {
+            if let Some(page) = cache.remove_clean_page_candidate(page_index, wait_loading) {
+                let can_remove_from_manager = page.read().can_deallocate();
+                detach_pages_from_reclaimer_batched(core::iter::once(&page));
+                if can_remove_from_manager {
+                    let removed = page_manager_lock().remove_page_if_same(&page);
+                    drop(removed);
+                }
+                discarded += 1;
+            }
+        }
+
+        Ok(discarded)
+    }
+
+    pub fn invalidate_all_clean(&self) -> Result<usize, SystemError> {
+        let cache = self.upgrade()?;
+        if cache.is_shmem() {
+            return Ok(0);
+        }
+        let dropped = cache.evict_clean_pages_for_invalidate(None);
+        Ok(dropped)
+    }
+
+    pub(crate) fn discard_clean_page(&self, page_index: usize) -> Result<(), SystemError> {
+        let cache = self.upgrade()?;
+        if cache.is_shmem() {
+            return Ok(());
+        }
+        if let Some(page) = cache.remove_clean_page_candidate(page_index, true) {
+            cache.discard_unlinked_page(&page);
+        }
+        Ok(())
+    }
+}
+
+impl PageCache {
+    /// A bounded, fallible snapshot; unlike the general mapping walker this
+    /// cannot allocate while holding the IRQ-safe VMA index lock.
+    fn try_reclaim_vma_snapshot(&self) -> Result<(u64, Vec<Arc<LockedVMA>>), SystemError> {
+        let _index_read = self.i_mmap_read();
+        let capacity = self.file_vmas.lock_irqsave().vmas.len();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(capacity)
+            .map_err(|_| SystemError::ENOMEM)?;
+        {
+            let index = self.file_vmas.lock_irqsave();
+            for weak in index.vmas.values() {
+                if let Some(vma) = weak.upgrade() {
+                    snapshot.push(vma);
+                }
+            }
+        }
+        Ok((self.file_vma_seq(), snapshot))
+    }
+
+    /// Called with the page locked, preserving the existing page -> cache
+    /// publication order. An untracked dirty page must not cause a new dirty
+    /// index allocation in reclaim: leave it and its PTEs intact instead.
+    fn reclaim_mapping_state(
+        &self,
+        inner: &super::InnerPageCache,
+        index: usize,
+        expected: &Arc<Page>,
+        flags: PageFlags,
+    ) -> Option<PageCacheReclaimMapOutcome> {
+        let Some(entry) = inner.get_entry(index) else {
+            return Some(PageCacheReclaimMapOutcome::Busy);
+        };
+        if !Arc::ptr_eq(&entry.page, expected)
+            || entry.active_users() != 0
+            || self.mapping_unevictable()
+            || self.is_shmem()
+            || flags.intersects(PageFlags::PG_UNEVICTABLE | PageFlags::PG_WRITEBACK)
+            || inner.writeback_pages.contains(&index)
+        {
+            return Some(PageCacheReclaimMapOutcome::Busy);
+        }
+        let tracked_dirty = entry.state() == PageState::Dirty && inner.dirty_pages.contains(&index);
+        if tracked_dirty {
+            return Some(PageCacheReclaimMapOutcome::Dirty);
+        }
+        if entry.state() != PageState::UpToDate
+            || flags.contains(PageFlags::PG_DIRTY)
+            || inner.dirty_pages.contains(&index)
+        {
+            return Some(PageCacheReclaimMapOutcome::Busy);
+        }
+        None
+    }
+
+    /// Remove only this cache page's clean, managed file mappings. In
+    /// particular this is not truncate: private COW and raw PFN PTEs survive.
+    /// Preflight the complete snapshot before clearing anything; races in the
+    /// commit pass yield Busy and let the caller put the retained page back.
+    pub(crate) fn unmap_clean_page_for_reclaim(
+        self: &Arc<Self>,
+        index: usize,
+        expected: &Arc<Page>,
+    ) -> Result<PageCacheReclaimMapOutcome, SystemError> {
+        {
+            let page = expected.read();
+            let inner = self.lock();
+            if let Some(outcome) =
+                self.reclaim_mapping_state(&inner, index, expected, *page.flags())
+            {
+                return Ok(outcome);
+            }
+            if page.map_count() == 0 {
+                return Ok(PageCacheReclaimMapOutcome::Unmapped);
+            }
+        }
+        // Architectures without implemented leaf permission bits cannot prove
+        // clean read-only mappings. Do not treat a zero bit mask as evidence.
+        if MMArch::ENTRY_FLAG_WRITEABLE == 0 || MMArch::ENTRY_FLAG_DIRTY == 0 {
+            return Ok(PageCacheReclaimMapOutcome::Busy);
+        }
+        let (seq, snapshot) = self.try_reclaim_vma_snapshot()?;
+        let phys = expected.phys_address();
+        for commit in [false, true] {
+            if self.file_vma_seq() != seq {
+                return Ok(PageCacheReclaimMapOutcome::Busy);
+            }
+            for vma in &snapshot {
+                // Never wait for an MM while holding the VMA or page lock.
+                let Some(mm) = vma.lock().address_space().and_then(|space| space.upgrade()) else {
+                    continue;
+                };
+                let mm_guard = mm.read();
+                let _pt_edit = mm.page_table_edit();
+                let vma_guard = vma.lock();
+                if vma_guard
+                    .address_space()
+                    .and_then(|space| space.upgrade())
+                    .is_none_or(|current| !Arc::ptr_eq(&current, &mm))
+                    || vma_guard.backing_page_offset().is_none()
+                    || vma_guard
+                        .vm_file()
+                        .and_then(|file| file.inode().page_cache())
+                        .is_none_or(|cache| !Arc::ptr_eq(&cache, self))
+                {
+                    continue;
+                }
+                let Ok(virt) = vma_guard.page_address(index) else {
+                    continue;
+                };
+                // page_address historically accepts end(); reclaim must not
+                // touch the next VMA's first PTE at that exclusive boundary.
+                if virt >= vma_guard.region().end() {
+                    continue;
+                }
+                let Some((actual, pte_flags)) = mm_guard.user_mapper.utable.translate(virt) else {
+                    continue;
+                };
+                if actual != phys {
+                    continue;
+                }
+                if vma_guard.vm_flags().intersects(
+                    VmFlags::VM_LOCKED | VmFlags::VM_IO | VmFlags::VM_PFNMAP | VmFlags::VM_MIXEDMAP,
+                ) {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                }
+                if page_manager_lock()
+                    .get(&actual)
+                    .is_none_or(|managed| !Arc::ptr_eq(&managed, expected))
+                {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                }
+                let mut page = expected.write();
+                let inner = self.lock();
+                if let Some(outcome) =
+                    self.reclaim_mapping_state(&inner, index, expected, *page.flags())
+                {
+                    return Ok(outcome);
+                }
+                // Normal mkwrite publishes tracked dirty state before write
+                // permission; anomalous untracked writable/dirty PTEs stay.
+                if pte_flags.has_write() || pte_flags.has_flag(MMArch::ENTRY_FLAG_DIRTY) {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                }
+                if !commit {
+                    continue;
+                }
+                let Some((_actual, _flags, flush)) = (unsafe {
+                    mm_guard.user_mapper.utable.unmap_phys_preserve_tables_if(
+                        virt,
+                        |address, flags| {
+                            address == phys
+                                && !flags.has_write()
+                                && !flags.has_flag(MMArch::ENTRY_FLAG_DIRTY)
+                        },
+                    )
+                }) else {
+                    return Ok(PageCacheReclaimMapOutcome::Busy);
+                };
+                page.remove_vma(vma);
+                mm.account_present_pages_sub(1);
+                drop(inner);
+                drop(page);
+                drop(vma_guard);
+                unsafe { flush.ignore() };
+                let mut tlb = MmuGather::gather(&mm);
+                tlb.accumulate_range(virt);
+                tlb.finish();
+            }
+        }
+        // TLB acknowledgements precede this final page/cache check. A racing
+        // fault, dirty publication or pin leaves ownership with the caller.
+        let page = expected.read();
+        let inner = self.lock();
+        if let Some(outcome) = self.reclaim_mapping_state(&inner, index, expected, *page.flags()) {
+            return Ok(outcome);
+        }
+        if self.file_vma_seq() != seq || page.map_count() != 0 {
+            return Ok(PageCacheReclaimMapOutcome::Busy);
+        }
+        Ok(PageCacheReclaimMapOutcome::Unmapped)
+    }
+
+    fn range_retry(&self, reason: RangeRetryReason) -> PageCacheRangeRetry {
+        PageCacheRangeRetry {
+            cache: self.manager.owner.clone(),
+            reason,
+        }
+    }
+
+    /// Caller owns invalidate_write and has unmapped this ordinary file page.
+    /// No blocking entry wait is allowed under that guard.
+    pub(crate) fn try_prepare_range_page_locked(
+        &self,
+        index: usize,
+    ) -> Result<PageCacheRangeResult<PageCachePagePin>, SystemError> {
+        let entry = self.inner.lock().get_entry(index);
+        let Some(entry) = entry else {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Load(index)),
+            ));
+        };
+        if entry.state() == PageState::Error {
+            return Err(SystemError::EIO);
+        }
+        if matches!(entry.state(), PageState::Loading | PageState::Writeback)
+            || entry.active_users() != 0
+        {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Entry(entry)),
+            ));
+        }
+        let page = entry.page.read();
+        if page.map_count() != 0 {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Unmap),
+            ));
+        }
+        let inner = self.inner.lock();
+        if !inner
+            .get_entry(index)
+            .is_some_and(|current| Arc::ptr_eq(&current, &entry))
+        {
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Unmap),
+            ));
+        }
+        if matches!(entry.state(), PageState::Loading | PageState::Writeback)
+            || entry.active_users() != 0
+        {
+            drop(inner);
+            drop(page);
+            return Ok(PageCacheRangeResult::Retry(
+                self.range_retry(RangeRetryReason::Entry(entry)),
+            ));
+        }
+        let pin = entry.pin();
+        Ok(PageCacheRangeResult::Ready(PageCachePagePin::new(
+            entry.page.clone(),
+            pin,
+        )))
+    }
+
+    /// Removes only full pages. Boundary pages are pinned/prepared by the
+    /// caller first. Retain invalidate_write through lower mapping removal.
+    pub(crate) fn try_discard_range_locked(
+        &self,
+        first: usize,
+        end: usize,
+    ) -> Result<PageCacheRangeResult<()>, SystemError> {
+        let mut retry = None;
+        if self.remove_page_range_with_retry_locked(first, Some(end), None, Some(&mut retry))? {
+            Ok(PageCacheRangeResult::Ready(()))
+        } else {
+            Ok(PageCacheRangeResult::Retry(retry.unwrap_or_else(|| {
+                self.range_retry(RangeRetryReason::Unmap)
+            })))
+        }
+    }
+    pub fn i_mmap_read(&self) -> RwSemReadGuard<'_, ()> {
+        self.i_mmap_rwsem.read()
+    }
+
+    pub fn i_mmap_write(&self) -> RwSemWriteGuard<'_, ()> {
+        self.i_mmap_rwsem.write()
+    }
+
+    pub fn invalidate_read(&self) -> RwSemReadGuard<'_, ()> {
+        self.invalidate_lock.read()
+    }
+
+    pub fn try_invalidate_read(&self) -> Option<RwSemReadGuard<'_, ()>> {
+        self.invalidate_lock.try_read()
+    }
+
+    /// Acquire the file-fault invalidation read side without sleeping, or
+    /// return the precise retry predicate that the outer fault loop may wait
+    /// on after it has released `AddressSpace::write()`.
+    ///
+    /// This is the sole admission decision for shared writable and private
+    /// COW file faults. Do not replace it with `invalidate_read()` in a fault
+    /// handler: a queued buffered writer may otherwise turn a writeback
+    /// snapshot's `invalidate_read() -> AddressSpace::read()` edge into an
+    /// MM/writeback/buffered-write cycle.
+    pub(crate) fn file_fault_invalidate_read(self: &Arc<Self>) -> PageCacheFaultInvalidateRead<'_> {
+        match self.try_invalidate_read() {
+            Some(guard) => PageCacheFaultInvalidateRead::Acquired(guard),
+            None => PageCacheFaultInvalidateRead::Retry(self.invalidate_retry_wait()),
+        }
+    }
+
+    /// Build a fault retry token after a nonblocking invalidation-read attempt
+    /// failed. The caller must return to the architecture fault loop, which
+    /// drops `AddressSpace::write()` before invoking the token's blocking
+    /// `wait()` method.
+    pub(crate) fn invalidate_retry_wait(self: &Arc<Self>) -> Arc<dyn FaultRetryWait> {
+        Arc::new(PageCacheInvalidateRetryWait {
+            cache: self.clone(),
+        })
+    }
+
+    pub fn invalidate_write(&self) -> RwSemWriteGuard<'_, ()> {
+        self.invalidate_lock.write()
+    }
+
+    fn note_file_vma_mutation(&self) {
+        self.file_vma_seq.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn file_vma_seq(&self) -> u64 {
+        self.file_vma_seq.load(Ordering::Acquire)
+    }
+
+    pub fn register_file_vma(&self, vma: &Arc<LockedVMA>) {
+        let _guard = self.i_mmap_write();
+        self.file_vmas.lock_irqsave().register(vma);
+        self.note_file_vma_mutation();
+    }
+
+    pub fn unregister_file_vma(&self, vma_id: usize) {
+        let _guard = self.i_mmap_write();
+        self.file_vmas.lock_irqsave().unregister(vma_id);
+        self.note_file_vma_mutation();
+    }
+
+    pub fn collect_file_vmas(&self) -> Vec<Arc<LockedVMA>> {
+        let _guard = self.i_mmap_read();
+        self.file_vmas.lock_irqsave().collect_all()
+    }
+
+    pub fn collect_file_vmas_in_page_range(
+        &self,
+        start_page_index: usize,
+        end_page_index: usize,
+    ) -> Vec<Arc<LockedVMA>> {
+        let _guard = self.i_mmap_read();
+        self.file_vmas
+            .lock_irqsave()
+            .collect_all()
+            .into_iter()
+            .filter(|vma| {
+                let guard = vma.lock();
+                let Some(vma_pgoff) = guard.backing_page_offset() else {
+                    return false;
+                };
+                let vma_pages = guard.region().size() >> MMArch::PAGE_SHIFT;
+                let vma_end = vma_pgoff.saturating_add(vma_pages);
+                start_page_index < vma_end && vma_pgoff <= end_page_index
+            })
+            .collect()
+    }
+
+    fn collect_file_vmas_snapshot(
+        &self,
+        page_range: Option<(usize, Option<usize>)>,
+    ) -> (u64, Vec<Arc<LockedVMA>>) {
+        let _guard = self.i_mmap_read();
+        let seq = self.file_vma_seq();
+        let mut vmas = self.file_vmas.lock_irqsave().collect_all();
+        if let Some((start_page_index, end_page_index_exclusive)) = page_range {
+            vmas.retain(|vma| {
+                vma.file_pgoff_intersection(start_page_index, end_page_index_exclusive)
+                    .is_some()
+            });
+        }
+        (seq, vmas)
+    }
+
+    pub fn collect_mapped_vmas_for_page(&self, page_index: usize) -> Vec<Arc<LockedVMA>> {
+        self.collect_file_vmas_in_page_range(page_index, page_index)
+    }
+
+    pub fn unmap_mapping_pages(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+    ) -> Result<(), SystemError> {
+        self.unmap_mapping_pages_with_mode(
+            start_page_index,
+            end_page_index_exclusive,
+            UnmapMappingMode::CacheOnly,
+        )
+    }
+
+    pub fn unmap_mapping_pages_even_cow(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+    ) -> Result<(), SystemError> {
+        self.unmap_mapping_pages_with_mode(
+            start_page_index,
+            end_page_index_exclusive,
+            UnmapMappingMode::EvenCow,
+        )
+    }
+
+    fn unmap_mapping_pages_with_mode(
+        &self,
+        start_page_index: usize,
+        end_page_index_exclusive: Option<usize>,
+        mode: UnmapMappingMode,
+    ) -> Result<(), SystemError> {
+        loop {
+            let (seq, snapshot) =
+                self.collect_file_vmas_snapshot(Some((start_page_index, end_page_index_exclusive)));
+            let mut mm_groups: HashMap<u64, MmFileRangeGroup> = HashMap::new();
+
+            for vma in snapshot {
+                let Some(region) =
+                    vma.file_pgoff_intersection(start_page_index, end_page_index_exclusive)
+                else {
+                    continue;
+                };
+                let Some(mm) = vma.lock().address_space().and_then(|space| space.upgrade()) else {
+                    continue;
+                };
+                mm_groups
+                    .entry(mm.id())
+                    .or_insert_with(|| MmFileRangeGroup::new(mm.clone()))
+                    .ranges
+                    .push((vma, region));
+            }
+
+            for (_id, group) in mm_groups {
+                let mm_guard = group.mm.read();
+                let _pt_edit = group.mm.page_table_edit();
+                let mut tlb = MmuGather::gather(&group.mm);
+                for (vma, region) in group.ranges {
+                    vma.unmap_range(region, &mm_guard.user_mapper.utable, &mut tlb, mode);
+                }
+                tlb.finish();
+            }
+
+            if self.file_vma_seq() == seq {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn truncate(&self, new_size: usize) -> Result<(), SystemError> {
+        let hole_start_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
+        loop {
+            // Keep the MM lock order out of invalidate_write:
+            // first tear down existing PTEs, then block new faults while removing cache pages.
+            self.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+
+            let truncate_committed = {
+                let _invalidate = self.invalidate_write();
+                self.truncate_locked(new_size)?
+            };
+
+            if truncate_committed {
+                // Match Linux truncate_pagecache(): private COW pages can appear after
+                // the first unmap and before cache truncation commits, so unmap again
+                // after releasing invalidate_write to preserve the global lock order.
+                self.unmap_mapping_pages_even_cow(hole_start_page, None)?;
+                return Ok(());
+            }
+        }
+    }
+
+    /// Deallocate a shmem byte range without changing i_size.  Full pages
+    /// become sparse holes; a partial boundary is zeroed in its existing page.
+    /// The caller serializes content mutations and validates file seals.
+    pub fn punch_hole(&self, start: usize, end: usize) -> Result<(), SystemError> {
+        if start >= end {
+            return Ok(());
+        }
+        let affected_first = start >> MMArch::PAGE_SHIFT;
+        let affected_end = page_align_up(end) >> MMArch::PAGE_SHIFT;
+        let full_first = page_align_up(start) >> MMArch::PAGE_SHIFT;
+        let full_end = end >> MMArch::PAGE_SHIFT;
+        loop {
+            // Never acquire invalidate_write while holding an MM lock.  The
+            // removal pass rechecks map_count and retries any fault race.
+            self.unmap_mapping_pages(affected_first, Some(affected_end))?;
+            let committed = {
+                let _invalidate = self.invalidate_write();
+                if !self.remove_page_range_locked(full_first, Some(full_end), None)? {
+                    false
+                } else {
+                    if !start.is_multiple_of(MMArch::PAGE_SIZE) {
+                        let page_end = ((affected_first + 1) << MMArch::PAGE_SHIFT).min(end);
+                        self.zero_existing_page_bytes(
+                            affected_first,
+                            start % MMArch::PAGE_SIZE,
+                            page_end - (affected_first << MMArch::PAGE_SHIFT),
+                        )?;
+                    }
+                    if !end.is_multiple_of(MMArch::PAGE_SIZE) && affected_end - 1 != affected_first
+                    {
+                        self.zero_existing_page_bytes(
+                            affected_end - 1,
+                            0,
+                            end % MMArch::PAGE_SIZE,
+                        )?;
+                    } else if start.is_multiple_of(MMArch::PAGE_SIZE)
+                        && !end.is_multiple_of(MMArch::PAGE_SIZE)
+                    {
+                        self.zero_existing_page_bytes(affected_first, 0, end % MMArch::PAGE_SIZE)?;
+                    }
+                    true
+                }
+            };
+            if committed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn zero_existing_page_bytes(
+        &self,
+        index: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<(), SystemError> {
+        if start >= end {
+            return Ok(());
+        }
+        loop {
+            let entry = { self.inner.lock().get_entry(index) };
+            let Some(entry) = entry else {
+                return Ok(());
+            };
+            match entry.state() {
+                PageState::Loading => {
+                    let _ = entry.wait_ready();
+                    continue;
+                }
+                PageState::Writeback => {
+                    let _ = entry.wait_until(|| match entry.state() {
+                        PageState::Writeback => None,
+                        PageState::Error => Some(Err(SystemError::EIO)),
+                        _ => Some(Ok(())),
+                    });
+                    continue;
+                }
+                PageState::Error => return Err(SystemError::EIO),
+                _ => {}
+            }
+            let mut page = entry.page.write();
+            let same_entry = self
+                .inner
+                .lock()
+                .get_entry(index)
+                .is_some_and(|current| Arc::ptr_eq(&current, &entry));
+            if !same_entry {
+                continue;
+            }
+            unsafe { page.as_slice_mut()[start..end].fill(0) };
+            page.add_flags(PageFlags::PG_DIRTY);
+            self.mark_page_dirty_page_locked(index, &page)?;
+            return Ok(());
+        }
+    }
+
+    /// Drop budget tickets whose last frozen page was removed by truncate.
+    ///
+    /// A budget-saturated WRITE leaves its page Dirty/tagged until a permit is
+    /// handed to its retry.  Truncate may remove that page without ever
+    /// entering the normal submit/retire path, so cancellation must recheck
+    /// both tagged predicates under their shared linearization lock.  A
+    /// partially truncated generation that still has a tag or a submission
+    /// record remains queued.
+    fn cancel_truncated_tagged_writeback_budget_retries(&self) {
+        let cancelled = {
+            let _tagged_writeback_transition = self.tagged_writeback_lock.lock();
+            // This snapshot is deliberately inside the tagged-state
+            // transition lock. `arm_tagged_writeback_budget_retry()` holds
+            // that same lock across its predicate and insertion, while the
+            // final page removal below also holds it. Consequently a drain
+            // cannot insert a ticket after truncate removes its last tag but
+            // before this sweep observes the cache-side retry map.
+            let candidates = {
+                let retries = self.tagged_writeback_budget_retries.lock();
+                retries
+                    .iter()
+                    .map(|(epoch, retry)| (*epoch, retry.start_index, retry.frozen_end))
+                    .collect::<Vec<_>>()
+            };
+            candidates
+                .into_iter()
+                .filter_map(|(epoch, start_index, frozen_end)| {
+                    (!PageCacheManager::has_exact_tagged_writeback(
+                        self,
+                        start_index,
+                        frozen_end,
+                        epoch,
+                    ) && !PageCacheManager::has_exact_tagged_writeback_submission(
+                        self,
+                        start_index,
+                        frozen_end,
+                        epoch,
+                    ))
+                    .then_some(epoch)
+                })
+                .collect::<Vec<_>>()
+        };
+        for epoch in cancelled {
+            PageCacheManager::cancel_tagged_writeback_budget_retry(self, epoch);
+        }
+    }
+
+    /// Remove cached pages while the caller holds `invalidate_write()`.
+    ///
+    /// Filesystems that must serialize their on-disk size update with page
+    /// invalidation use this after unmapping PTEs.  Callers must repeat the
+    /// unmap-and-lock sequence when this returns `false`.
+    pub(crate) fn truncate_locked(&self, new_size: usize) -> Result<bool, SystemError> {
+        let first_full_truncate_page = page_align_up(new_size) >> MMArch::PAGE_SHIFT;
+        self.remove_page_range_locked(first_full_truncate_page, None, Some(new_size))
+    }
+
+    /// Common removal engine for truncate and shmem hole punching.  The
+    /// caller owns invalidate_write and has unmapped the affected PTE range.
+    fn remove_page_range_locked(
+        &self,
+        first_page: usize,
+        end_page: Option<usize>,
+        truncate_tail_at: Option<usize>,
+    ) -> Result<bool, SystemError> {
+        self.remove_page_range_with_retry_locked(first_page, end_page, truncate_tail_at, None)
+    }
+
+    fn remove_page_range_with_retry_locked(
+        &self,
+        first_page: usize,
+        end_page: Option<usize>,
+        truncate_tail_at: Option<usize>,
+        mut retry: Option<&mut Option<PageCacheRangeRetry>>,
+    ) -> Result<bool, SystemError> {
+        let mut removed_tagged_page = false;
+        let truncate_indices: Vec<usize> = {
+            let guard = self.inner.lock();
+            if let Some(end) =
+                end_page.filter(|end| end.saturating_sub(first_page) < guard.pages.len())
+            {
+                (first_page..end)
+                    .filter(|index| guard.pages.contains_key(index))
+                    .collect()
+            } else {
+                guard
+                    .pages
+                    .keys()
+                    .copied()
+                    .filter(|index| *index >= first_page && end_page.is_none_or(|end| *index < end))
+                    .collect()
+            }
+        };
+
+        for page_index in truncate_indices {
+            loop {
+                let entry = {
+                    let guard = self.inner.lock();
+                    guard.get_entry(page_index)
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                match entry.state() {
+                    PageState::Loading => {
+                        if let Some(retry) = retry.as_deref_mut() {
+                            *retry = Some(self.range_retry(RangeRetryReason::Entry(entry)));
+                            self.finish_removed_range_tags(removed_tagged_page);
+                            return Ok(false);
+                        }
+                        let _ = entry.wait_ready();
+                        continue;
+                    }
+                    PageState::Writeback => {
+                        if let Some(retry) = retry.as_deref_mut() {
+                            *retry = Some(self.range_retry(RangeRetryReason::Entry(entry)));
+                            self.finish_removed_range_tags(removed_tagged_page);
+                            return Ok(false);
+                        }
+                        let _ = entry.wait_until(|| match entry.state() {
+                            PageState::Writeback => None,
+                            PageState::Error => Some(Err(SystemError::EIO)),
+                            _ => Some(Ok(())),
+                        });
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if entry.active_users() != 0 {
+                    if let Some(retry) = retry.as_deref_mut() {
+                        *retry = Some(self.range_retry(RangeRetryReason::Entry(entry)));
+                        self.finish_removed_range_tags(removed_tagged_page);
+                        return Ok(false);
+                    }
+                    entry.wait_inactive();
+                    continue;
+                }
+
+                let mut retry_after_unmap = false;
+                let removed_page = {
+                    let page_guard = entry.page.read();
+                    if page_guard.map_count() != 0 {
+                        retry_after_unmap = true;
+                        None
+                    } else {
+                        // invalidate_write prevents a new mapping after this
+                        // zero-map observation. Drop the page lock before
+                        // taking the tagged transition and membership locks,
+                        // then revalidate every mutable entry property.
+                        // This is the removal side of the retry-ticket
+                        // linearization: a budget retry may be inserted only
+                        // while it still observes a matching tag or
+                        // submission record.
+                        drop(page_guard);
+                        let _tagged_writeback_transition = self.tagged_writeback_lock.lock();
+                        let mut guard = self.inner.lock();
+                        let Some(current) = guard.get_entry(page_index) else {
+                            break;
+                        };
+                        if !Arc::ptr_eq(&current, &entry) {
+                            continue;
+                        }
+                        if current.active_users() != 0 {
+                            drop(guard);
+                            drop(_tagged_writeback_transition);
+                            if let Some(retry) = retry.as_deref_mut() {
+                                *retry = Some(self.range_retry(RangeRetryReason::Entry(current)));
+                                self.finish_removed_range_tags(removed_tagged_page);
+                                return Ok(false);
+                            }
+                            current.wait_inactive();
+                            continue;
+                        }
+                        match current.state() {
+                            PageState::Loading => {
+                                drop(guard);
+                                drop(_tagged_writeback_transition);
+                                if let Some(retry) = retry.as_deref_mut() {
+                                    *retry =
+                                        Some(self.range_retry(RangeRetryReason::Entry(current)));
+                                    self.finish_removed_range_tags(removed_tagged_page);
+                                    return Ok(false);
+                                }
+                                let _ = current.wait_ready();
+                                continue;
+                            }
+                            PageState::Writeback => {
+                                drop(guard);
+                                drop(_tagged_writeback_transition);
+                                if let Some(retry) = retry.as_deref_mut() {
+                                    *retry =
+                                        Some(self.range_retry(RangeRetryReason::Entry(current)));
+                                    self.finish_removed_range_tags(removed_tagged_page);
+                                    return Ok(false);
+                                }
+                                let _ = current.wait_until(|| match current.state() {
+                                    PageState::Writeback => None,
+                                    PageState::Error => Some(Err(SystemError::EIO)),
+                                    _ => Some(Ok(())),
+                                });
+                                continue;
+                            }
+                            _ => {
+                                let tag = current.writeback_tag();
+                                guard.remove_entry(page_index).map(|page| (page, tag))
+                            }
+                        }
+                    }
+                };
+
+                if retry_after_unmap {
+                    self.finish_removed_range_tags(removed_tagged_page);
+                    return Ok(false);
+                }
+
+                if let Some((page, tag)) = removed_page {
+                    removed_tagged_page |= tag != 0;
+                    self.discard_unlinked_page(&page.page);
+                }
+                drop(self.detach_dirty_retention_if_idle());
+                break;
+            }
+        }
+
+        self.finish_removed_range_tags(removed_tagged_page);
+
+        if let Some(new_size) =
+            truncate_tail_at.filter(|size| *size > 0 && !size.is_multiple_of(MMArch::PAGE_SIZE))
+        {
+            let last_page_index = (new_size - 1) >> MMArch::PAGE_SHIFT;
+            let last_len = new_size - (last_page_index << MMArch::PAGE_SHIFT);
+            loop {
+                let entry = {
+                    let guard = self.inner.lock();
+                    guard.get_entry(last_page_index)
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                match entry.state() {
+                    PageState::Loading => {
+                        let _ = entry.wait_ready();
+                        continue;
+                    }
+                    PageState::Writeback => {
+                        let _ = entry.wait_until(|| match entry.state() {
+                            PageState::Writeback => None,
+                            PageState::Error => Some(Err(SystemError::EIO)),
+                            _ => Some(Ok(())),
+                        });
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                let mut page_guard = entry.page.write();
+                let inner = self.inner.lock();
+                let Some(current) = inner.pages.get(&last_page_index) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(current, &entry) {
+                    continue;
+                }
+                match current.state() {
+                    PageState::Loading | PageState::Writeback => continue,
+                    _ => unsafe {
+                        page_guard.truncate(last_len);
+                    },
+                }
+                break;
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn finish_removed_range_tags(&self, removed: bool) {
+        if removed {
+            self.cancel_truncated_tagged_writeback_budget_retries();
+            PageCacheManager::notify_tagged_writeback_progress(self);
+        }
+    }
+
+    pub fn mkclean_page(
+        &self,
+        page_index: usize,
+        unmap: bool,
+    ) -> Result<Vec<Arc<LockedVMA>>, SystemError> {
+        loop {
+            let (seq, snapshot) =
+                self.collect_file_vmas_snapshot(Some((page_index, Some(page_index + 1))));
+            let mut mm_groups: HashMap<u64, MmFilePageGroup> = HashMap::new();
+
+            for vma in snapshot {
+                let (Some(mm), Ok(virt)) = ({
+                    let guard = vma.lock();
+                    (
+                        guard.address_space().and_then(|space| space.upgrade()),
+                        guard.page_address(page_index),
+                    )
+                }) else {
+                    continue;
+                };
+
+                mm_groups
+                    .entry(mm.id())
+                    .or_insert_with(|| MmFilePageGroup::new(mm.clone()))
+                    .items
+                    .push((vma, virt));
+            }
+
+            let mut unmapped = Vec::new();
+            for (_id, group) in mm_groups {
+                let mm_guard = group.mm.read();
+                let _pt_edit = group.mm.page_table_edit();
+                let mut tlb = MmuGather::gather(&group.mm);
+                for (vma, virt) in group.items {
+                    if unmap {
+                        if let Some((_paddr, _flags, flush)) =
+                            unsafe { mm_guard.user_mapper.utable.unmap_phys_preserve_tables(virt) }
+                        {
+                            unsafe { flush.ignore() };
+                            tlb.accumulate_range(virt);
+                            unmapped.push(vma);
+                        }
+                        continue;
+                    }
+
+                    let Some((_paddr, flags)) = mm_guard.user_mapper.utable.translate(virt) else {
+                        continue;
+                    };
+                    if !flags.has_write() {
+                        continue;
+                    }
+                    if let Some(flush) = unsafe {
+                        mm_guard
+                            .user_mapper
+                            .utable
+                            .remap_present(virt, flags.set_write(false).set_dirty(false))
+                    } {
+                        unsafe { flush.ignore() };
+                        tlb.accumulate_range(virt);
+                    }
+                }
+                tlb.finish();
+            }
+
+            if self.file_vma_seq() == seq {
+                return Ok(unmapped);
+            }
+        }
+    }
+}

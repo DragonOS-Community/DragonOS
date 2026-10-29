@@ -1,20 +1,26 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicUsize;
 use system_error::SystemError;
 
 use crate::filesystem::vfs::iov::IoVecs;
 use crate::filesystem::vfs::{fasync::FAsyncItems, InodeId};
 use crate::libs::wait_queue::WaitQueue;
+use crate::mm::MemoryManagementArch;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::posix::IpOption;
 use crate::net::socket::unix::utils::{CmsgBuffer, SOL_SOCKET};
 use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSO, PSOL};
 use crate::time::syscall::PosixTimeval;
 
+mod bound;
 mod constants;
+mod icmp_error;
 mod info;
 mod inner;
 mod option;
+mod registration;
+mod urgent;
 pub use option::Options as TcpOption;
 use option::Options;
 
@@ -24,172 +30,69 @@ type EP = crate::filesystem::epoll::EPollEventType;
 
 mod events;
 mod io;
+use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
+use crate::net::socket::recv_timeout::ReceiveTimeout;
+use io::{TcpPeekCursor, TcpReceiveTarget};
 mod lifecycle;
 mod poll_util;
-mod shutdown;
 mod stream_core;
 
 pub use stream_core::TcpSocket;
 
-impl Socket for TcpSocket {
-    fn set_nonblocking(&self, nonblocking: bool) {
-        self.nonblock
-            .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn recvfrom_addr_behavior(&self) -> crate::net::socket::RecvFromAddrBehavior {
-        // Linux/gVisor: for TCP (SOCK_STREAM), recvfrom(2) ignores the source
-        // address output parameters. If addrlen is provided, kernel writes back 0.
-        crate::net::socket::RecvFromAddrBehavior::Ignore
-    }
-
-    fn open_file_counter(&self) -> &AtomicUsize {
-        &self.open_files
-    }
-
-    fn wait_queue(&self) -> &WaitQueue {
-        &self.wait_queue
-    }
-
-    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
-        let inner = self.inner.read();
-        let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
-        Ok(Endpoint::Ip(inner.local_endpoint()))
-    }
-
-    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
-        let inner = self.inner.read();
-        let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
-        inner
-            .remote_endpoint()
-            .map(Endpoint::Ip)
-            .ok_or(SystemError::ENOTCONN)
-    }
-
-    fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
-        match level {
-            PSOL::IP => {
-                let optname =
-                    IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-                self.get_ip_option(optname, value)
-            }
-            PSOL::TCP => {
-                let opt = Options::try_from(name as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
-                self.get_tcp_option(opt, value)
-            }
-            PSOL::SOCKET => {
-                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
-                self.get_socket_option(opt, value)
-            }
-            _ => Err(SystemError::ENOPROTOOPT),
-        }
-    }
-
-    fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        if let Endpoint::Ip(addr) = endpoint {
-            return self.do_bind(addr);
-        }
-        // log::debug!("TcpSocket::bind: invalid endpoint");
-        return Err(SystemError::EINVAL);
-    }
-
-    fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
-        let Endpoint::Ip(endpoint) = endpoint else {
-            // log::debug!("TcpSocket::connect: invalid endpoint");
-            return Err(SystemError::EINVAL);
-        };
-        self.start_connect(endpoint)?; // Only Nonblock or error will return error.
-
-        return loop {
-            match self.check_connect() {
-                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                    // log::debug!("TcpSocket::connect: wait for Established");
-                    wq_wait_event_interruptible!(
-                        self.wait_queue(),
-                        {
-                            // 关键：不要等待 `self.inner` 变成 Established。
-                            // `self.inner` 的状态转换是由 check_connect() 完成的；
-                            // 如果 iface.poll() 在入睡前已经推进到 Established 并触发过 notify/wakeup，
-                            // 再等 “inner 已 Established” 会陷入先唤后睡的丢唤醒。
-                            // 这里把 check_connect() 本身作为条件的一部分：
-                            // - 入队 waker 后再次检查时会主动 poll 并完成状态转换
-                            // - 即使错过了一次 wake，也不会永远睡下去
-                            !matches!(
-                                self.check_connect(),
-                                Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
-                            )
-                        },
-                        {}
-                    )?;
-                }
-                result => {
-                    // log::debug!("TcpSocket::connect: done -> {:?}", result);
-                    break result;
-                }
-            }
-        };
-    }
-
-    fn listen(&self, backlog: usize) -> Result<(), SystemError> {
-        self.do_listen(backlog)
-    }
-
-    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
-        if self.is_nonblock() {
-            self.try_accept()
-        } else {
-            loop {
-                match self.try_accept() {
-                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
-                        wq_wait_event_interruptible!(self.wait_queue, self.incoming(), {})?;
-                    }
-                    result => break result,
-                }
-            }
-        }
-        .map(|(sock, ep)| (sock as Arc<dyn Socket>, Endpoint::Ip(ep)))
-    }
-
-    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
-        if self.is_recv_shutdown() {
-            let limit = self.recv_shutdown.limit();
-            if limit == 0 {
-                return Ok(0);
-            }
-        }
-
-        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            let ret = self.try_recv_with_flags(buffer, flags);
-            if let Ok(n) = ret {
-                if n > 0 {
-                    self.notify();
-                }
-            }
-            return ret;
-        }
-
-        let waitall = flags.contains(PMSG::WAITALL)
-            && !flags.contains(PMSG::PEEK)
-            && !flags.contains(PMSG::TRUNC);
+impl TcpSocket {
+    fn recv_with_target(
+        &self,
+        target: &mut TcpReceiveTarget<'_, '_>,
+        flags: PMSG,
+    ) -> Result<usize, SystemError> {
+        let nonblock = self.is_nonblock() || flags.contains(PMSG::DONTWAIT);
+        let mut timeout = ReceiveTimeout::new(self.recv_timeout());
+        let waitall = flags.contains(PMSG::WAITALL);
+        let mut cursor = TcpPeekCursor::default();
         let mut total_read = 0usize;
 
         let ret = loop {
-            match self.try_recv_with_flags(&mut buffer[total_read..], flags) {
-                Ok(n) => {
+            match self.try_recv_target(target, total_read, flags, &mut cursor) {
+                Ok(ReceiveAttempt::NeedBuffer(required)) => {
+                    // No protocol bytes have been consumed; all receive and
+                    // SocketSet guards were released by the admission attempt.
+                    if let Err(error) = target.prepare(required) {
+                        break if total_read > 0 {
+                            Ok(total_read)
+                        } else {
+                            Err(error)
+                        };
+                    }
+                    continue;
+                }
+                Ok(ReceiveAttempt::Ready(n)) => {
                     total_read += n;
+                    if cursor.boundary {
+                        break Ok(total_read);
+                    }
                     if n == 0 {
                         // EOF or no more bytes available.
                         break Ok(total_read);
                     }
-                    if total_read == buffer.len() {
+                    if total_read == target.len() {
                         break Ok(total_read);
                     }
-                    if !waitall {
+                    // A bounded PEEK staging window is not a protocol short
+                    // read. Keep copying queued suffixes; only a real EAGAIN
+                    // decides whether this call may wait for more data.
+                    if !flags.contains(PMSG::PEEK) && (nonblock || !waitall) {
                         break Ok(total_read);
                     }
                     continue;
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if nonblock {
+                        break if total_read > 0 {
+                            Ok(total_read)
+                        } else {
+                            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                        };
+                    }
                     if total_read > 0 && !waitall {
                         break Ok(total_read);
                     }
@@ -197,27 +100,12 @@ impl Socket for TcpSocket {
                     // - Poll 1: TX sends data to loopback queue, RX processes existing packets
                     // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
                     // Without this loop, we'd wait for the poll thread to complete the roundtrip.
-                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
-                    {
-                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        poll_util::poll_stack_batch(iface.as_ref());
                     }
-                    // 与 connect() 同理，不能只依赖缓存的 pollee 位。
-                    // 否则若“最后一次 notify() 先发生、而当前线程尚未真正入睡”，
-                    // 后续没有新事件时就会因为错过唤醒而永久睡眠。
-                    // 这里在入睡前主动重新检查真实 socket 状态，避免先唤后睡。
-                    let events = self.check_io_event();
-                    if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR)
-                    {
-                        continue; // Data available now, retry recv
-                    }
-                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
-                        || {
-                            self.check_io_event().intersects(
-                                EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR,
-                            )
-                        },
-                        self.recv_timeout(),
-                    );
+                    let wait_ret = timeout
+                        .wait_io(&self.wait_queue, || self.recv_target_ready(flags, &cursor));
+                    cursor.waited();
                     if let Err(e) = wait_ret {
                         if total_read > 0 {
                             break Ok(total_read);
@@ -242,21 +130,48 @@ impl Socket for TcpSocket {
         ret
     }
 
-    fn read_to_user_buffer(
+    /// Shared scalar/vectored receive-source admission and protected payload
+    /// policy; recvmsg adapts error-queue and urgent ancillary output.
+    fn recv_user_buffer(
         &self,
-        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        flags: PMSG,
     ) -> Result<usize, SystemError> {
-        self.read_to_user_buffer_impl(user_buffer)
+        if flags.contains(PMSG::OOB) {
+            return self.recv_urgent_to_user(buffer, flags);
+        }
+        if flags.contains(PMSG::TRUNC) {
+            self.recv_with_target(&mut TcpReceiveTarget::Discard(buffer.len()), flags)
+        } else if flags.contains(PMSG::PEEK) {
+            self.recv_with_target(
+                &mut TcpReceiveTarget::Peek {
+                    user_buffer: buffer,
+                    staging: RecvBuffer::default(),
+                },
+                flags,
+            )
+        } else {
+            self.recv_to_user_buffer_impl(
+                buffer,
+                self.is_nonblock() || flags.contains(PMSG::DONTWAIT),
+                flags.contains(PMSG::WAITALL),
+            )
+        }
     }
 
-    fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
+    fn send_with_progress(
+        &self,
+        buffer: &[u8],
+        flags: PMSG,
+        report_error: bool,
+    ) -> Result<usize, SystemError> {
         if buffer.is_empty() {
             // Linux 语义：write(fd, "", 0) / send(fd, ..., 0) 直接返回 0。
             return Ok(0);
         }
 
-        if self.is_nonblock() || _flags.contains(PMSG::DONTWAIT) {
-            let ret = self.try_send(buffer);
+        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+            let ret = self.try_send(buffer, flags, report_error);
             if let Ok(n) = ret {
                 if n > 0 {
                     self.notify();
@@ -272,7 +187,11 @@ impl Socket for TcpSocket {
         let mut total_sent = 0usize;
 
         while total_sent < buffer.len() {
-            match self.try_send(&buffer[total_sent..]) {
+            match self.try_send(
+                &buffer[total_sent..],
+                flags,
+                report_error && total_sent == 0,
+            ) {
                 Ok(n) => {
                     if n == 0 {
                         if total_sent > 0 {
@@ -286,9 +205,8 @@ impl Socket for TcpSocket {
                 }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
                     // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
-                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
-                    {
-                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    if let Some(iface) = self.stack_poll_snapshot() {
+                        poll_util::poll_stack_batch(iface.as_ref());
                     }
 
                     // 与 recv/connect 同理，不能只看缓存事件位；等待前需要主动刷新。
@@ -323,20 +241,222 @@ impl Socket for TcpSocket {
         Ok(total_sent)
     }
 
+    /// Keep on-wire IPv4 addresses internally, and preserve AF_INET6 at the
+    /// sockaddr ABI boundary for mapped connections accepted by dual-stack TCP.
+    fn name_endpoint(&self, mut endpoint: smoltcp::wire::IpEndpoint) -> Endpoint {
+        if self.ip_version == smoltcp::wire::IpVersion::Ipv6 {
+            if let smoltcp::wire::IpAddress::Ipv4(addr) = endpoint.addr {
+                endpoint.addr = smoltcp::wire::IpAddress::Ipv6(addr.to_ipv6_mapped());
+            }
+        }
+        Endpoint::ip(
+            crate::net::socket::endpoint::InetEndpoint::from(endpoint)
+                .with_scope(self.device_binding.ifindex() as u32),
+        )
+    }
+}
+
+impl Socket for TcpSocket {
+    fn bind_endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        super::common::bind::endpoint_from_user_preserving_mapped(addr, len, self.ip_version)
+    }
+    fn endpoint_from_user(
+        &self,
+        addr: *const crate::net::posix::SockAddr,
+        len: u32,
+    ) -> Result<Endpoint, SystemError> {
+        crate::net::posix::SockAddr::to_endpoint_preserving_mapped(addr, len)
+    }
+
+    fn netns(&self) -> Arc<crate::process::namespace::net_namespace::NetNamespace> {
+        TcpSocket::netns(self)
+    }
+
+    fn fsnotify_watch_counter(&self) -> &AtomicUsize {
+        &self.fsnotify_watches
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.nonblock
+            .store(nonblocking, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn recvfrom_addr_behavior(&self, flags: PMSG) -> crate::net::socket::RecvFromAddrBehavior {
+        // Extended errors report the original destination. Keep the ordinary
+        // stream adapter's existing ignored-address contract independent.
+        if flags.contains(PMSG::ERRQUEUE) {
+            crate::net::socket::RecvFromAddrBehavior::Write
+        } else {
+            crate::net::socket::RecvFromAddrBehavior::Ignore
+        }
+    }
+
+    fn open_file_counter(&self) -> &AtomicUsize {
+        &self.open_files
+    }
+
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wait_queue
+    }
+
+    fn local_endpoint(&self) -> Result<Endpoint, SystemError> {
+        let inner = self.inner.read();
+        let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
+        Ok(self.name_endpoint(inner.local_endpoint()))
+    }
+
+    fn remote_endpoint(&self) -> Result<Endpoint, SystemError> {
+        let inner = self.inner.read();
+        let inner = inner.as_ref().ok_or(SystemError::ENOTCONN)?;
+        inner
+            .peer_endpoint()
+            .map(|endpoint| self.name_endpoint(endpoint))
+            .ok_or(SystemError::ENOTCONN)
+    }
+
+    fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {
+        match level {
+            PSOL::IPV6 => self.get_ipv6_option(name, value),
+            PSOL::IP => {
+                let optname =
+                    IpOption::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_ip_option(optname, value)
+            }
+            PSOL::TCP => {
+                let opt = Options::try_from(name as i32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_tcp_option(opt, value)
+            }
+            PSOL::SOCKET => {
+                let opt = PSO::try_from(name as u32).map_err(|_| SystemError::ENOPROTOOPT)?;
+                self.get_socket_option(opt, value)
+            }
+            _ => Err(SystemError::ENOPROTOOPT),
+        }
+    }
+
+    fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        if let Endpoint::Ip(addr) = endpoint {
+            return self.do_bind_scoped(addr);
+        }
+        // log::debug!("TcpSocket::bind: invalid endpoint");
+        return Err(SystemError::EINVAL);
+    }
+
+    fn connect(&self, endpoint: Endpoint) -> Result<(), SystemError> {
+        let Endpoint::Ip(endpoint) = endpoint else {
+            // log::debug!("TcpSocket::connect: invalid endpoint");
+            return Err(SystemError::EINVAL);
+        };
+        self.start_connect_scoped(endpoint)?; // Only Nonblock or error will return error.
+
+        return loop {
+            match self.check_connect() {
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    // log::debug!("TcpSocket::connect: wait for Established");
+                    let mut completed = None;
+                    wq_wait_event_interruptible!(
+                        self.wait_queue(),
+                        {
+                            // 关键：不要等待 `self.inner` 变成 Established。
+                            // `self.inner` 的状态转换是由 check_connect() 完成的；
+                            // 如果 iface.poll() 在入睡前已经推进到 Established 并触发过 notify/wakeup，
+                            // 再等 “inner 已 Established” 会陷入先唤后睡的丢唤醒。
+                            // 这里把 check_connect() 本身作为条件的一部分：
+                            // - 入队 waker 后再次检查时会主动 poll 并完成状态转换
+                            // - 即使错过了一次 wake，也不会永远睡下去
+                            if completed.is_some() {
+                                true
+                            } else {
+                                let result = self.check_connect();
+                                if matches!(result, Err(SystemError::EAGAIN_OR_EWOULDBLOCK)) {
+                                    false
+                                } else {
+                                    completed = Some(result);
+                                    true
+                                }
+                            }
+                        },
+                        {}
+                    )?;
+                    // The wait predicate performs the state transition from
+                    // Connecting. Return that exact one-shot result instead
+                    // of calling check_connect() again after it has replaced
+                    // the state with Init or Established.
+                    if let Some(result) = completed {
+                        break result;
+                    }
+                }
+                result => {
+                    // log::debug!("TcpSocket::connect: done -> {:?}", result);
+                    break result;
+                }
+            }
+        };
+    }
+
+    fn listen(&self, backlog: usize) -> Result<(), SystemError> {
+        self.do_listen(backlog)
+    }
+
+    fn accept(&self) -> Result<(Arc<dyn Socket>, Endpoint), SystemError> {
+        if self.is_nonblock() {
+            self.try_accept()
+        } else {
+            loop {
+                match self.try_accept() {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        wq_wait_event_interruptible!(self.wait_queue, self.incoming(), {})?;
+                    }
+                    result => break result,
+                }
+            }
+        }
+        .map(|(sock, ep)| {
+            let endpoint = sock.name_endpoint(ep);
+            (sock as Arc<dyn Socket>, endpoint)
+        })
+    }
+
+    fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_error_to_buffer(buffer).map(|(len, _)| len);
+        }
+        if flags.contains(PMSG::OOB) {
+            let byte = self.take_urgent_for_receive(flags)?;
+            return Ok(match (byte, buffer.first_mut()) {
+                (Some(byte), Some(output)) => {
+                    if !flags.contains(PMSG::TRUNC) {
+                        *output = byte;
+                    }
+                    1
+                }
+                _ => 0,
+            });
+        }
+        self.recv_with_target(&mut TcpReceiveTarget::Buffer(buffer), flags)
+    }
+
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        self.read_to_user_buffer_impl(user_buffer)
+    }
+
+    fn send(&self, buffer: &[u8], flags: PMSG) -> Result<usize, SystemError> {
+        self.send_with_progress(buffer, flags, true)
+    }
+
     fn send_buffer_size(&self) -> usize {
-        self.inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-            .send_buffer_size()
+        self.send_buf_size_loaded()
     }
 
     fn recv_buffer_size(&self) -> usize {
-        self.inner
-            .read()
-            .as_ref()
-            .expect("Tcp inner::Inner is None")
-            .recv_buffer_size()
+        self.recv_buf_size_loaded()
     }
 
     fn recv_bytes_available(&self) -> usize {
@@ -359,6 +479,7 @@ impl Socket for TcpSocket {
 
     fn set_option(&self, level: PSOL, name: usize, val: &[u8]) -> Result<(), SystemError> {
         match level {
+            PSOL::IPV6 => self.set_ipv6_option(name, val),
             PSOL::IP => {
                 let opt = crate::net::socket::IpOption::try_from(name as u32)
                     .map_err(|_| SystemError::ENOPROTOOPT)?;
@@ -383,42 +504,75 @@ impl Socket for TcpSocket {
         flags: PMSG,
         _address: Option<Endpoint>,
     ) -> Result<(usize, Endpoint), SystemError> {
-        // Linux 语义：对 SOCK_STREAM(TCP) 的 recvfrom(2)，addr 参数被忽略。
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_error_to_buffer(buffer);
+        }
+        // Linux 语义：对普通 SOCK_STREAM(TCP) 的 recvfrom(2)，addr 参数被忽略。
         // “不写回 sockaddr” 的行为在 syscall 层做特殊处理，避免修改用户缓冲区。
         let n = self.recv(buffer, flags)?;
         // 返回值仅用于统一接口；不会被写回给用户。
         let ep = self.remote_endpoint().unwrap_or_else(|_| {
             self.local_endpoint()
-                .unwrap_or(Endpoint::Ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+                .unwrap_or(Endpoint::ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
         });
         Ok((n, ep))
+    }
+
+    fn recv_from_user_buffer(
+        &self,
+        buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+        flags: PMSG,
+    ) -> Result<(usize, Endpoint), SystemError> {
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_error_to_user(buffer);
+        }
+        let n = self.recv_user_buffer(buffer, flags)?;
+        // TCP ignores source-address output, as in the kernel-buffer adapter.
+        let endpoint = self.remote_endpoint().unwrap_or_else(|_| {
+            self.local_endpoint()
+                .unwrap_or(Endpoint::ip(UNSPECIFIED_LOCAL_ENDPOINT_V4))
+        });
+        Ok((n, endpoint))
+    }
+
+    fn recv_needs_pre_wait(&self, flags: PMSG) -> bool {
+        !flags.intersects(PMSG::ERRQUEUE | PMSG::OOB)
     }
 
     fn recv_msg(
         &self,
         msg: &mut crate::net::posix::MsgHdr,
         flags: PMSG,
+        iovs: &crate::syscall::iov::IoVecs,
     ) -> Result<usize, SystemError> {
-        // TCP: 不返回 peer 地址。
-        let iovs = unsafe { IoVecs::from_user(msg.msg_iov, msg.msg_iovlen, true)? };
+        if flags.contains(PMSG::ERRQUEUE) {
+            return self.recv_icmp_error(msg, iovs);
+        }
+        // One logical buffer serves ordinary and urgent receives; ancillary
+        // TCP_INQ observes the protocol sequence space in both cases.
         let total = iovs.total_len();
-        let mut tmp = vec![0u8; total];
-        let n = self.recv(&mut tmp, flags)?;
-        let written = iovs.scatter(&tmp[..n])?;
-
-        msg.msg_flags = 0;
+        let mut user_buffer = crate::syscall::user_buffer::UserBuffer::new_vectored(iovs, total);
+        let (written, output_flags) = if flags.contains(PMSG::OOB) {
+            self.recv_urgent_msg(&mut user_buffer, flags)?
+        } else {
+            (
+                self.recv_user_buffer(&mut user_buffer, flags)?,
+                PMSG::empty(),
+            )
+        };
+        msg.msg_flags = output_flags.bits() as i32;
         msg.msg_namelen = 0;
 
         // Ancillary data: SO_TIMESTAMP and TCP_INQ.
         let mut cmsg_write_off = 0usize;
-        if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
+        if (!msg.msg_control.is_null() && msg.msg_controllen != 0) || self.inq_enabled() {
             let mut cbuf = CmsgBuffer {
                 ptr: msg.msg_control,
                 len: msg.msg_controllen,
                 write_off: &mut cmsg_write_off,
             };
 
-            if self.timestamp_enabled() {
+            if self.timestamp_enabled() && !flags.contains(PMSG::OOB) {
                 let now_ns = crate::time::timekeeping::do_gettimeofday().to_ns();
                 let tv = PosixTimeval::from_ns(now_ns);
                 let tv_bytes: &[u8] = unsafe {
@@ -439,7 +593,7 @@ impl Socket for TcpSocket {
             }
 
             if self.inq_enabled() {
-                let inq = TcpSocket::clamp_usize_to_i32(self.recv_queue_len());
+                let inq = TcpSocket::clamp_usize_to_i32(self.tcp_inq_hint());
                 let inq_bytes = inq.to_ne_bytes();
                 cbuf.put(
                     &mut msg.msg_flags,
@@ -472,8 +626,50 @@ impl Socket for TcpSocket {
         self.send(buffer, flags)
     }
 
+    fn send_user_buffer(
+        &self,
+        reader: &crate::syscall::user_access::UserBufferReader<'_>,
+        len: usize,
+        flags: PMSG,
+        _address: Option<Endpoint>,
+    ) -> Result<usize, SystemError> {
+        const STREAM_SEND_CHUNK: usize = crate::arch::MMArch::PAGE_SIZE;
+        if len == 0 {
+            return self.send_with_progress(&[], flags, true);
+        }
+        // Retain bounded user-memory staging while carrying progress across
+        // chunks: an error following an earlier chunk must remain pending.
+        let scratch_len = core::cmp::min(STREAM_SEND_CHUNK, len);
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve(scratch_len)
+            .map_err(|_| SystemError::ENOMEM)?;
+        scratch.resize(scratch_len, 0);
+        let mut total = 0;
+        while total < len {
+            let want = core::cmp::min(scratch.len(), len - total);
+            if let Err(error) = reader.copy_from_user(&mut scratch[..want], total) {
+                return if total == 0 { Err(error) } else { Ok(total) };
+            }
+            match self.send_with_progress(&scratch[..want], flags, total == 0) {
+                Ok(sent) => {
+                    total += sent;
+                    if sent < want {
+                        break;
+                    }
+                }
+                Err(error) => return if total == 0 { Err(error) } else { Ok(total) },
+            }
+        }
+        Ok(total)
+    }
+
     fn epoll_items(&self) -> &EPollItems {
         &self.epoll_items
+    }
+
+    fn set_owner_file(&self, file: alloc::sync::Weak<crate::filesystem::vfs::file::File>) {
+        *self.owner_file.lock() = file;
     }
 
     fn fasync_items(&self) -> &FAsyncItems {
@@ -487,22 +683,61 @@ impl Socket for TcpSocket {
 
     fn ioctl(
         &self,
-        _cmd: u32,
-        _arg: usize,
+        cmd: u32,
+        arg: usize,
         _private_data: &crate::filesystem::vfs::FilePrivateData,
     ) -> Result<usize, SystemError> {
+        if cmd == 0x8905 {
+            // SIOCATMARK
+            let at_mark = self
+                .inner
+                .read()
+                .as_ref()
+                .and_then(|inner| inner.with_socket(|socket| socket.at_urgent_mark()))
+                .unwrap_or(false) as i32;
+            let mut output = crate::syscall::user_access::UserBufferWriter::new(
+                arg as *mut i32,
+                core::mem::size_of::<i32>(),
+                true,
+            )?;
+            output.buffer_protected(0)?.write_one(0, &at_mark)?;
+            return Ok(0);
+        }
         Err(SystemError::ENOSYS)
     }
 }
 
 impl InetSocket for TcpSocket {
+    fn handle_tcp_icmp(&self, feedback: &crate::net::icmp_error::IcmpErrorFeedback) {
+        self.receive_icmp_error(feedback);
+    }
+    fn refill_tcp_listener(&self) {
+        self.refill_listener_once();
+    }
+    fn prepare_tcp_syn(&self, local: smoltcp::wire::IpEndpoint, device: u32) {
+        let needs_refill = {
+            let mut inner = self.inner.write();
+            match inner.as_mut() {
+                Some(inner::Inner::Listening(listener)) => listener.prepare_syn(local, device),
+                _ => false,
+            }
+        };
+        if needs_refill {
+            // Prepare outside inner/SocketSet guards, then revalidate and
+            // commit before the current SYN is dispatched. TcpStack retains
+            // poll serialization so competing ingress cannot steal this slot.
+            self.refill_listener_once();
+        }
+    }
+
     fn on_iface_events(&self) {
-        // Iface::poll() 在网络轮询线程/中断上下文中推进 smoltcp socket 状态。
+        // TcpStack::poll() 在网络轮询任务或系统调用上下文中推进 smoltcp socket 状态。
         // 这里负责把 smoltcp 的状态变化同步到 TcpSocket 的 pollee/Connecting 结果中，
         // 以便 connect/accept/epoll 等等待者能被正确唤醒并观察到状态前进。
         //
         // 重要：driver/net/mod.rs 已保证 notify() 调用时不再持有 bounds 读锁，
         // 因此这里可以安全地获取 self.inner 的 RwLock 并更新事件。
         let _ = self.update_events();
+        self.notify_urgent_owner();
     }
 }

@@ -1,39 +1,42 @@
 use crate::net::socket::netlink::{
+    addr::multicast::GroupIdSet,
     message::{
         segment::{
-            ack::DoneSegment,
             header::{CMsgSegHdr, SegHdrCommonFlags},
+            CSegmentType,
         },
-        ProtocolSegment,
+        Message,
     },
-    route::message::segment::RouteNlSegment,
+    route::message::{segment::RouteNlSegment, RouteNlPacket},
+    table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
 };
-use alloc::vec::Vec;
+use crate::process::namespace::net_namespace::NetNamespace;
+use alloc::sync::Arc;
 
-pub fn finish_response(
-    request_header: &CMsgSegHdr,
-    dump_all: bool,
-    response_segments: &mut Vec<RouteNlSegment>,
-) {
-    if !dump_all {
-        assert_eq!(response_segments.len(), 1);
-        return;
+pub const RTMGRP_LINK: u32 = 0x1;
+pub const RTMGRP_NEIGH: u32 = 0x4;
+pub const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+pub const RTMGRP_IPV4_ROUTE: u32 = 0x40;
+pub const RTMGRP_IPV6_IFADDR: u32 = 0x100;
+pub const RTMGRP_IPV6_ROUTE: u32 = 0x400;
+
+pub fn kernel_notify_header(type_: CSegmentType) -> CMsgSegHdr {
+    CMsgSegHdr {
+        len: 0,
+        type_: type_ as u16,
+        flags: SegHdrCommonFlags::empty().bits(),
+        seq: 0,
+        pid: 0,
     }
-
-    append_done_segment(request_header, response_segments);
-    add_multi_flag(response_segments);
 }
 
-fn append_done_segment(header: &CMsgSegHdr, response_segments: &mut Vec<RouteNlSegment>) {
-    let done_segment = DoneSegment::new_from_request(header, None);
-    response_segments.push(RouteNlSegment::Done(done_segment));
-}
-
-fn add_multi_flag(responce_segment: &mut [RouteNlSegment]) {
-    for segment in responce_segment.iter_mut() {
-        let header = segment.header_mut();
-        let mut flags = SegHdrCommonFlags::from_bits_truncate(header.flags);
-        flags |= SegHdrCommonFlags::MULTI;
-        header.flags = flags.bits();
+pub fn multicast_notify(netns: Arc<NetNamespace>, group_mask: u32, segment: RouteNlSegment) {
+    let message = Message::new(vec![segment]);
+    for group_index in GroupIdSet::new(group_mask).ids_iter() {
+        let group_id = group_index + 1;
+        match RouteNlPacket::notification(message.clone(), 1 << group_index) {
+            Ok(packet) => NetlinkRouteProtocol::notify_group(group_id, 0, packet, netns.clone()),
+            Err(_) => NetlinkRouteProtocol::report_group_overrun(group_id, 0, netns.clone()),
+        }
     }
 }

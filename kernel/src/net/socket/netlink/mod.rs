@@ -11,8 +11,9 @@ use system_error::SystemError;
 
 pub mod addr;
 mod common;
-mod kobject;
+pub(crate) mod kobject;
 mod message;
+mod netfilter;
 mod receiver;
 mod route;
 pub mod table;
@@ -34,6 +35,9 @@ pub fn create_netlink_socket(
         Ok(StandardNetlinkProtocol::KOBJECT_UEVENT) => {
             NetlinkKobjectUeventSocket::new(is_nonblock, socket_type, protocol)
         }
+        Ok(StandardNetlinkProtocol::NETFILTER) => {
+            netfilter::NetlinkNetfilterSocket::new(is_nonblock, socket_type, protocol)
+        }
         Ok(_) => {
             log::warn!(
                 "standard netlink families {} is not supported yet",
@@ -52,4 +56,30 @@ pub fn create_netlink_socket(
     };
 
     Ok(inode)
+}
+
+pub(crate) fn notify_link_commit(
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    committed: crate::net::link::LinkMutationCommit,
+) {
+    route::kern::notify_link_commit(netns, committed);
+}
+
+pub(crate) fn notify_link_change(iface: &Arc<dyn crate::driver::net::Iface>) {
+    route::kern::notify_link_change(iface);
+}
+
+pub(crate) use route::kern::PreparedLinkDelete;
+
+pub(crate) fn prepare_link_delete(
+    iface: &Arc<dyn crate::driver::net::Iface>,
+) -> Result<PreparedLinkDelete, SystemError> {
+    route::kern::prepare_link_delete(iface)
+}
+
+pub(crate) fn notify_link_delete(
+    netns: Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    message: PreparedLinkDelete,
+) {
+    route::kern::notify_link_delete(netns, message);
 }

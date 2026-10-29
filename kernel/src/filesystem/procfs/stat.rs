@@ -1,10 +1,12 @@
 //! /proc/stat - 系统统计信息
 
+use crate::filesystem::procfs::template::configure_seq_file;
+use crate::filesystem::vfs::OpenFileBehavior;
 use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_read, trim_string},
+            utils::{proc_snapshot_operation, trim_string},
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -130,14 +132,20 @@ impl StatFileOps {
 }
 
 impl FileOps for StatFileOps {
-    fn read_at(
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        configure_seq_file(behavior);
+    }
+
+    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
+        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
+
+    fn seq_operation(
         &self,
-        offset: usize,
-        len: usize,
-        buf: &mut [u8],
-        _data: MutexGuard<FilePrivateData>,
+        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let content = Self::generate_stat_content();
-        proc_read(offset, len, buf, &content)
+        // `seq_file`: Linux opens `/proc/stat` through `single_open_size()`
+        // (`fs/proc/stat.c`), so one fd sees one rendered record.
+        proc_snapshot_operation(operation, data, || Ok(Self::generate_stat_content()))
     }
 }

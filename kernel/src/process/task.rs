@@ -1,0 +1,2563 @@
+use core::sync::atomic::{
+    fence, AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
+
+use alloc::{
+    string::{String, ToString},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use log::warn;
+use system_error::SystemError;
+
+use crate::{
+    arch::{
+        ipc::signal::{AtomicSignal, SigSet, Signal},
+        process::ArchPCBInfo,
+        CurrentIrqArch, SigStackArch,
+    },
+    cgroup::{cgroup_root_node, CgroupNode, TaskCgroupRef},
+    driver::tty::tty_core::TtyCore,
+    exception::InterruptArch,
+    filesystem::{
+        fs::{FsAttachment, FsStruct},
+        vfs::{fdtable::FileDescriptorTable, IndexNode},
+    },
+    ipc::{
+        process_signal::NaturalParentNotifyPhase,
+        sem_undo::{SemUndoAttachment, SemUndoGroup, UnpublishedSemUndoAttachmentGuard},
+        sighand::SigHand,
+        signal::RestartBlock,
+    },
+    libs::{
+        futex::futex::RobustListHead,
+        mutex::{Mutex, MutexGuard},
+        rwlock::{RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard},
+        rwsem::RwSem,
+        spinlock::{SpinLock, SpinLockGuard},
+        wait_queue::WaitQueue,
+    },
+    process::{
+        cred::{cred_cap_issubset, Cred, INIT_CRED, SUID_DUMPABLE, SUID_DUMP_DISABLE},
+        kthread::WorkerPrivate,
+        namespace::{ipc_namespace::IpcNamespace, nsproxy::NsProxy},
+        pid::{Pid, PidLink, PidType},
+        resource::{RLimit64, RLimitID, RUsage},
+        AtomicProcessFlags, AtomicRawPid, ExitState, KernelStack, ProcessBasicInfo, ProcessCpuTime,
+        ProcessFlags, ProcessItimers, ProcessManager, ProcessSchedulerInfo, ProcessSignalInfo,
+        ProcessState, RawPid, ThreadInfo, PTRACE_RELATION_LOCK,
+    },
+    rcu::{rcu_defer_drop, PreparedRcuArcRetire, RcuArcSlot, RcuOptionArcSlot},
+};
+
+use crate::cgroup::memory::owned::OwnedBox;
+use crate::process::itimer::ItimerState;
+use crate::process::{ptrace, rseq, seccomp};
+
+type TaskResourceLimits = RwLock<OwnedBox<[RLimit64; RLimitID::Nlimits as usize]>>;
+
+const SRCU_TASK_SLOTS: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct SrcuTaskSlot {
+    domain: u64,
+    depth: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct SrcuTaskState {
+    slots: [SrcuTaskSlot; SRCU_TASK_SLOTS],
+    overflow_depth: usize,
+}
+
+impl SrcuTaskState {
+    const fn new() -> Self {
+        Self {
+            slots: [SrcuTaskSlot {
+                domain: 0,
+                depth: 0,
+            }; SRCU_TASK_SLOTS],
+            overflow_depth: 0,
+        }
+    }
+
+    pub(crate) fn enter(&mut self, domain: u64) -> bool {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.depth != 0 && slot.domain == domain)
+        {
+            slot.depth = slot.depth.checked_add(1).expect("SRCU task depth overflow");
+            return true;
+        }
+        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.depth == 0) {
+            slot.domain = domain;
+            slot.depth = 1;
+            return true;
+        }
+        self.overflow_depth = self
+            .overflow_depth
+            .checked_add(1)
+            .expect("SRCU untracked depth overflow");
+        false
+    }
+
+    pub(crate) fn leave(&mut self, domain: u64, tracked: bool) {
+        if !tracked {
+            assert!(self.overflow_depth != 0, "SRCU untracked depth underflow");
+            self.overflow_depth -= 1;
+            return;
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.depth != 0 && slot.domain == domain)
+            .expect("SRCU task tracking mismatch");
+        slot.depth -= 1;
+        if slot.depth == 0 {
+            slot.domain = 0;
+        }
+    }
+
+    pub(crate) fn may_wait(&self, domain: u64) -> bool {
+        // Reader entry must remain infallible and allocation-free. Once the
+        // fixed tracking slots overflow, domain identity is unavailable, so
+        // fail closed: a false negative here would deadlock synchronously.
+        self.overflow_depth != 0
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.depth != 0 && slot.domain == domain)
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessControlBlock {
+    data: crate::libs::lazy_init::Lazy<
+        crate::cgroup::memory::owned::OwnedBox<ProcessControlBlockData>,
+    >,
+}
+
+impl core::ops::Deref for ProcessControlBlock {
+    type Target = ProcessControlBlockData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl core::ops::DerefMut for ProcessControlBlock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+/// The uniquely owned task body is freed at the last strong PCB reference,
+/// before its objcg receipt; weak PID/stack links only retain the thin header.
+#[derive(Debug)]
+pub struct ProcessControlBlockData {
+    pub(crate) memory_high_debt: AtomicU64,
+    pub(crate) memory_high_wait: SpinLock<Option<Arc<crate::cgroup::memory::high::HighWait>>>,
+    /// Temporary stacked-I/O allocation ownership, not cgroup membership.
+    pub(crate) memory_io_context: SpinLock<Option<crate::cgroup::memory::io::MemoryIoContext>>,
+    pub(crate) freezer: crate::cgroup::freezer::TaskState,
+    /// Generation-bound job-control ticket, written under the group signal lock.
+    pub(crate) pending_group_stop_generation: AtomicU64,
+    /// Whether this ticket owns one outstanding group-stop participant.
+    pub(crate) pending_group_stop_counted: AtomicBool,
+    /// The PID of the current process.
+    pub(super) pid: AtomicRawPid,
+    /// The thread group ID of the current process (this value never changes
+    /// within the same thread group).
+    pub(super) tgid: RawPid,
+
+    pub(super) thread_pid: RwLock<Option<Arc<Pid>>>,
+    /// Array of PID links.
+    pub(super) pid_links: [PidLink; PidType::PIDTYPE_MAX],
+
+    /// Namespace proxy.
+    pub(super) nsproxy: RcuOptionArcSlot<NsProxy>,
+    /// The cgroup (v2) this task belongs to.
+    pub(super) task_cgroup: RwLock<TaskCgroupRef>,
+    /// Stable charging target, replaced with runtime settlement under owner rq.
+    /// Interrupt accounting must never read the sleeping membership RwLock.
+    cpu_accounting: SpinLock<Arc<crate::cgroup::cpu::accounting::CpuAccounting>>,
+
+    pub(super) sem_undo: SpinLock<Option<SemUndoAttachment>>,
+
+    pub(super) basic: RwLock<ProcessBasicInfo>,
+    pub(super) exec_update_lock: RwSem<()>,
+    pub(super) preempt_count: AtomicUsize,
+    /// Nesting count for no-fault user access sections.
+    pub(super) pagefault_disabled: AtomicUsize,
+    /// RCU read-side nesting depth of the current process.
+    pub(super) rcu_read_depth: AtomicUsize,
+    pub(crate) srcu_task_state: SpinLock<SrcuTaskState>,
+    pub(crate) tracepoint_srcu_depth: AtomicUsize,
+    pub(crate) srcu_callback_domain: AtomicU64,
+
+    pub(super) flags: AtomicProcessFlags,
+    /// Per-task uprobe XOL state. Kept in the process subsystem so exception
+    /// routing does not become process state ownership.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) uprobe: super::uprobe::TaskXolState,
+    /// Whether the current task has been counted in the global visible thread
+    /// count.
+    pub(super) visible_thread_accounted: AtomicBool,
+    /// Serializes task-local pointer publication for RCU-protected metadata
+    /// such as `cred`, `nsproxy`, and `sighand`.
+    pub(super) task_lock: SpinLock<()>,
+    /// Intrusive allocation-free global OOM wait registration.
+    pub(crate) futex_lifecycle: core::sync::atomic::AtomicU8,
+    pub(crate) futex_cleanup_wait: crate::libs::resource_wait::ResourceWaitQueue,
+    pub(crate) resource_wait_link: SpinLock<crate::libs::resource_wait::ResourceWaitLink>,
+    pub(super) worker_private: SpinLock<Option<WorkerPrivate>>,
+    /// Kernel stack of the process.
+    pub(super) kernel_stack: RwLock<KernelStack>,
+
+    /// System call stack.
+    pub(super) syscall_stack: RwLock<KernelStack>,
+
+    /// Scheduling-related information.
+    pub(super) sched_info: ProcessSchedulerInfo,
+    /// Architecture-specific information.
+    pub(super) arch_info: SpinLock<ArchPCBInfo>,
+    /// Signal-handling related information (could potentially be lock-free).
+    pub(super) sig_info: RwLock<ProcessSignalInfo>,
+    pub(super) sighand: RcuArcSlot<SigHand>,
+    pub(super) process_signal: RcuArcSlot<crate::ipc::process_signal::ProcessSignalState>,
+    /// Alternate signal stack.
+    pub(super) sig_altstack: RwLock<SigStackArch>,
+    /// Exit state (Running / Zombie / Dead).
+    pub(super) exit_state: AtomicU8,
+    /// `exit_notify()` has finished all producer-side work for this task.
+    ///
+    /// This is separate from `exit_state`: publishing Zombie does not imply
+    /// that pidfd or parent/tracer notification work has completed.
+    exit_notify_complete: AtomicBool,
+    /// Release/unhash has finished all identity-sensitive operations.
+    identity_unhash_complete: AtomicBool,
+    /// Group-exec transaction generation that currently accounts this task.
+    /// Zero means that no transaction owns a completion token for the task.
+    group_exec_generation: AtomicU64,
+    /// Per-leader natural-parent exit notification state. `CLONE_SIGHAND`
+    /// may share SigHand between distinct thread groups, so this state cannot
+    /// live in SigHand's single shared slot.
+    natural_parent_notify_phase: AtomicU8,
+
+    /// Linux task_struct::exit_signal semantics:
+    /// - -1: Non-thread-group leader (CLONE_THREAD);
+    /// - 0: No exit signal sent, but still a waitable clone child;
+    /// - >0: Signal number to send to the parent on exit.
+    pub(super) exit_signal: AtomicI32,
+    /// Signal to send to the current process when its parent exits
+    /// (PR_SET_PDEATHSIG).
+    pub(super) pdeath_signal: AtomicSignal,
+
+    /// prctl(PR_SET/GET_NO_NEW_PRIVS) state: thread-level (task) semantics.
+    pub(super) no_new_privs: AtomicBool,
+
+    /// prctl(PR_SET/GET_KEEPCAPS) state: thread-level (task) semantics.
+    /// When true, the process retains capabilities after changing UID/GID.
+    pub(super) seccomp_mode: AtomicU8,
+    pub(super) seccomp_filter: SpinLock<Option<Arc<seccomp::SeccompFilter>>>,
+
+    /// Parent process pointer.
+    ///
+    /// Per-task: every task gets its own copy at fork (see the `CLONE_PARENT` /
+    /// `CLONE_THREAD` branches in `fork.rs`), and re-parenting updates the
+    /// whole thread group member by member, the way Linux
+    /// `forget_original_parent()` walks `for_each_thread()`.
+    pub(super) parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// Real (original) parent process pointer. Per-task, see `parent_pcb`.
+    pub(super) real_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// The natural parent pointer for wait operations.
+    ///
+    /// Linux's wait_task_zombie()/wait_consider_task() `__WNOTHREAD` depends on
+    /// task_struct::parent, whereas DragonOS models parent_pcb/real_parent_pcb
+    /// on the thread-group leader. This field preserves the thread-level parent
+    /// relationship required by wait.
+    ///
+    /// Re-parenting updates it together with the other three pointers. The only
+    /// Linux difference is the `if (likely(!t->ptrace))` guard: a traced task's
+    /// `->parent` is its tracer. DragonOS keeps tracing in the ptrace relation
+    /// table instead, so there is nothing to guard here today.
+    pub(super) wait_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+    /// Thread-level natural-parent compensation for PTRACE_TRACEME.
+    ///
+    /// On normal fork it points to the creating thread, compensating for the
+    /// fact that real_parent_pcb is still modeled on the thread-group leader.
+    /// After CLONE_PARENT, reparent, and de_thread it must be updated to follow
+    /// Linux real_parent semantics. It is NOT an immutable “first-fork creator”
+    /// record.
+    pub(super) fork_parent_pcb: RwLock<Weak<ProcessControlBlock>>,
+
+    /// Linked list of children processes.
+    pub(super) children: RwLock<Vec<RawPid>>,
+    /// Ptrace relation ownership and the per-tracee stop/event state machine.
+    /// The header preserves the existing inner locks and field order.
+    pub(super) ptrace: ptrace::PtraceTask,
+
+    /// Task-local ptrace trapping queue. Child waits belong to ProcessSignalState.
+    pub(super) wait_queue: WaitQueue,
+
+    /// CPU-time wait queue: used for clock_nanosleep with
+    /// CLOCK_{PROCESS,THREAD}_CPUTIME_ID.
+
+    /// Thread information.
+    pub(super) thread: RwLock<ThreadInfo>,
+
+    /// Process filesystem state.
+    pub(super) fs: RwLock<Option<FsAttachment>>,
+    /// Serializes replacement/removal of `fs` with pivot_root's exact-path
+    /// migration. Ordinary readers intentionally stay off this cold-path lock.
+    fs_slot_update_lock: Mutex<()>,
+
+    /// Alarm timer.
+    pub(super) itimers: Arc<ItimerState>,
+    /// POSIX interval timers (timer_create / timer_settime / ...).
+
+    /// CPU time accounting.
+    pub(super) cpu_time: ProcessCpuTime,
+    /// Minor page faults completed by this task.
+    pub(super) min_flt: AtomicU64,
+    /// Major page faults completed by this task.
+    pub(super) maj_flt: AtomicU64,
+    /// Raw CPU time accumulated from threads that have left this thread group.
+    ///
+    /// This remains in nanoseconds for CLOCK_PROCESS_CPUTIME_ID.  The separate
+    /// rusage accumulator uses timeval precision for the userspace ABI.
+    pub(super) exited_thread_group_cputime_ns: SpinLock<super::cputime::CpuTimeSnapshot>,
+    /// Thread-group-level resource accumulation for exited threads. Aligns with
+    /// Linux signal_struct's exited thread statistics.
+    pub(super) exited_thread_group_rusage: SpinLock<RUsage>,
+    /// Leader-owned RSS peak (in pages) retained from detached address spaces.
+    pub(super) historical_maxrss_pages: AtomicUsize,
+    /// Resource accumulation for children successfully reaped by the wait family;
+    /// aligns with getrusage(RUSAGE_CHILDREN).
+    pub(super) children_rusage: SpinLock<RUsage>,
+
+    /// Process robust lock list.
+    pub(super) robust_list: RwLock<Option<RobustListHead>>,
+
+    /// rseq (Restartable Sequences) state.
+    pub(super) rseq_state: RwLock<rseq::RseqState>,
+
+    /// Credential set for the process as a subject.
+    pub(super) cred: RcuArcSlot<Cred>,
+    /// KEYCTL_SESSION_TO_PARENT handoff.  Consumed by this task at its next
+    /// return-to-userspace boundary, never by the child in another context.
+    pending_session_keyring: SpinLock<Option<crate::security::keys::KeyRef>>,
+    pub(super) self_ref: Weak<ProcessControlBlock>,
+
+    pub(super) restart_block: SpinLock<Option<RestartBlock>>,
+
+    /// Path to the process's executable file.
+    pub(super) executable_path: RwLock<String>,
+    /// Process command line (used for /proc/<pid>/cmdline; Linux semantics: argv
+    /// entries are separated by '\0').
+    pub(super) cmdline: RwLock<Option<Arc<super::exec_args::ExecStrings>>>,
+    /// Resource limits are shared by a thread group, like Linux's
+    /// `signal_struct::rlim`. A process fork receives a copied Arc.
+    pub(super) rlimits: Arc<TaskResourceLimits>,
+}
+
+/// The namespace state of a task, taken as one pair.
+///
+/// `nsproxy` and the `fs` slot describe the same generation of a task: a mount
+/// namespace switch (`setns()`/`unshare(CLONE_NEWNS)`, and the same switch
+/// performed by `execve()`) replaces the task's root together with its
+/// `nsproxy`, so a reader that took the two slots in separate critical sections
+/// could combine the old mount namespace with the new root, and
+/// `/proc/[pid]/{mounts,mountinfo,mountstats}` would then render paths and
+/// topology from two different namespaces.
+///
+/// [`ProcessControlBlock::namespace_state()`] and
+/// [`ProcessControlBlock::install_prepared_namespace_state()`] are the read and
+/// write sides of that pair.  The other writer of the `nsproxy` slot,
+/// [`ProcessControlBlock::set_nsproxy()`], publishes it alone. Neither of its
+/// callers can be observed mid-transition: a forked child rebinds its root in
+/// the same fork, before the child is reachable through `/proc`, and a kernel
+/// thread moved to the initial namespace already has that namespace's
+/// filesystem context, because kernel threads share the kthread daemon's `fs`
+/// (the daemon clones them with `CLONE_FS`, see `kthread.rs`).
+pub(crate) struct TaskNamespaceState {
+    /// Namespace proxy the task had when the pair was taken.
+    pub nsproxy: Option<Arc<NsProxy>>,
+    /// Filesystem context of the same instant; `None` after `exit_fs()`.
+    pub fs: Option<Arc<FsStruct>>,
+}
+
+/// Final task resources, prepared without creating throwaway private copies
+/// for a sharing fork. Observation Arcs do not count as task attachments.
+pub(crate) struct PreparedTaskResources {
+    files: Arc<FileDescriptorTable>,
+    sighand: Arc<SigHand>,
+    process_signal: Arc<crate::ipc::process_signal::ProcessSignalState>,
+    rlimits: Arc<TaskResourceLimits>,
+    itimers: Arc<ItimerState>,
+}
+
+impl PreparedTaskResources {
+    fn try_limits(
+        value: [RLimit64; RLimitID::Nlimits as usize],
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Arc<TaskResourceLimits>, crate::mm::allocation::MemoryAllocationError> {
+        let body = OwnedBox::prepare(
+            creator,
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+        )?
+        .try_init(value)
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Arc::try_new(RwLock::new(body)).map_err(|_| SystemError::ENOMEM)?)
+    }
+
+    fn try_itimers(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Arc<ItimerState>, crate::mm::allocation::MemoryAllocationError> {
+        let body = OwnedBox::prepare(
+            creator,
+            crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+        )?
+        .try_init(ProcessItimers::default())
+        .map_err(|_| SystemError::ENOMEM)?;
+        Ok(Arc::try_new(SpinLock::new(body)).map_err(|_| SystemError::ENOMEM)?)
+    }
+
+    pub(super) fn try_private(
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        Ok(Self {
+            files: Arc::try_new(FileDescriptorTable::try_new(
+                crate::filesystem::vfs::fdtable::FdTableState::new(),
+                creator,
+            )?)
+            .map_err(|_| SystemError::ENOMEM)?,
+            sighand: SigHand::try_new_for(creator)?,
+            process_signal: crate::ipc::process_signal::ProcessSignalState::try_new_for(creator)?,
+            rlimits: Self::try_limits(ProcessControlBlock::default_rlimits(), creator)?,
+            itimers: Self::try_itimers(creator)?,
+        })
+    }
+
+    pub(super) fn try_for_fork(
+        parent: &Arc<ProcessControlBlock>,
+        flags: crate::process::fork::CloneFlags,
+        creator: &Arc<crate::cgroup::memory::object::ObjectAccount>,
+    ) -> Result<Self, crate::mm::allocation::MemoryAllocationError> {
+        use crate::process::fork::CloneFlags;
+        let (source_sighand, source_signal) =
+            parent.with_task_lock_irqsave(|| (parent.sighand(), parent.process_signal()));
+        let source_files = parent
+            .basic()
+            .try_fd_table()
+            .expect("fork parent has no fd table");
+        let files = if flags.contains(CloneFlags::CLONE_FILES) {
+            source_files
+        } else {
+            FileDescriptorTable::try_clone(&source_files, None, creator)?
+        };
+        let sighand = if flags.contains(CloneFlags::CLONE_SIGHAND) {
+            source_sighand
+        } else {
+            let private = SigHand::try_new_for(creator)?;
+            private.copy_handlers_from(&source_sighand);
+            if flags.contains(CloneFlags::CLONE_CLEAR_SIGHAND) {
+                private.flush_handlers(false);
+            }
+            private
+        };
+        let process_signal = if flags.contains(CloneFlags::CLONE_THREAD) {
+            source_signal
+        } else {
+            crate::ipc::process_signal::ProcessSignalState::try_new_for(creator)?
+        };
+        let (rlimits, itimers) = if flags.contains(CloneFlags::CLONE_THREAD) {
+            (parent.rlimits.clone(), parent.itimers.clone())
+        } else {
+            let snapshot = { **parent.rlimits.read_irqsave() };
+            (
+                Self::try_limits(snapshot, creator)?,
+                Self::try_itimers(creator)?,
+            )
+        };
+        Ok(Self {
+            files,
+            sighand,
+            process_signal,
+            rlimits,
+            itimers,
+        })
+    }
+}
+
+/// Exercise real final-resource births without publishing a synthetic task.
+/// This does not substitute for fork/exec concurrency or user quota tests.
+pub(crate) fn run_resource_birth_selftest(
+) -> Result<bool, crate::mm::allocation::MemoryAllocationError> {
+    use crate::cgroup::memory::{
+        accounting::{MemoryAccount, MemoryPolicy, KERNEL_BYTE_KIND_COUNT},
+        object::ObjectAccount,
+    };
+    use crate::process::fork::CloneFlags;
+    // Arc::try_new drops its input if header allocation fails. Exercise that
+    // same uninitialized value's destructor without reading task state or
+    // fabricating a published PCB. This is not allocator fault injection.
+    let identity = Arc::try_new(ProcessControlBlock {
+        data: crate::libs::lazy_init::Lazy::new(),
+    })
+    .map_err(|_| SystemError::ENOMEM)?;
+    let identity_weak = Arc::downgrade(&identity);
+    drop(identity);
+    if identity_weak.upgrade().is_some() {
+        return Ok(false);
+    }
+    drop(identity_weak);
+    let root = MemoryAccount::new(0x776631, None)?;
+    let leaf = MemoryAccount::new(0x776632, Some(root.clone()))?;
+    let creator = ObjectAccount::new(&leaf)?;
+    let parent = ProcessManager::current_pcb();
+    let files = parent.fd_table();
+    let sighand = parent.sighand();
+    let signal = parent.process_signal();
+    let limits = parent.rlimits.clone();
+    let timers = parent.itimers.clone();
+    let users = files.task_user_count();
+    let refs = sighand.load_count();
+    leaf.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..MemoryPolicy::default()
+    });
+    let shared = PreparedTaskResources::try_for_fork(
+        &parent,
+        CloneFlags::CLONE_FILES
+            | CloneFlags::CLONE_SIGHAND
+            | CloneFlags::CLONE_THREAD
+            | CloneFlags::CLONE_VM,
+        &creator,
+    )?;
+    if !Arc::ptr_eq(&shared.files, &files)
+        || !Arc::ptr_eq(&shared.sighand, &sighand)
+        || !Arc::ptr_eq(&shared.process_signal, &signal)
+        || !Arc::ptr_eq(&shared.rlimits, &limits)
+        || !Arc::ptr_eq(&shared.itimers, &timers)
+        || files.task_user_count() != users
+        || sighand.load_count() != refs
+        || leaf.snapshot().current != 0
+    {
+        return Ok(false);
+    }
+    drop(shared);
+    if !matches!(
+        PreparedTaskResources::try_for_fork(&parent, CloneFlags::empty(), &creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || files.task_user_count() != users
+        || sighand.load_count() != refs
+        || leaf.snapshot().current != 0
+    {
+        return Ok(false);
+    }
+    leaf.set_policy(MemoryPolicy::default());
+    let private =
+        PreparedTaskResources::try_for_fork(&parent, CloneFlags::CLONE_CLEAR_SIGHAND, &creator)?;
+    if Arc::ptr_eq(&private.files, &files)
+        || Arc::ptr_eq(&private.sighand, &sighand)
+        || Arc::ptr_eq(&private.process_signal, &signal)
+        || Arc::ptr_eq(&private.rlimits, &limits)
+        || Arc::ptr_eq(&private.itimers, &timers)
+        || private.files.task_user_count() != 0
+        || private.sighand.load_count() != 0
+        || leaf.snapshot().current == 0
+    {
+        return Ok(false);
+    }
+    for raw in 1..=crate::arch::ipc::signal::MAX_SIG_NUM {
+        let sig = Signal::from(raw as i32);
+        let old = sighand.handler(sig).expect("valid signal index");
+        let new = private.sighand.handler(sig).expect("valid signal index");
+        if new.is_ignore() != old.is_ignore()
+            || (!old.is_ignore()
+                && !matches!(
+                    new.action(),
+                    crate::ipc::signal_types::SigactionType::SaHandler(
+                        crate::ipc::signal_types::SaHandlerType::Default
+                    )
+                ))
+            || !new.flags().is_empty()
+            || new.mask() != SigSet::empty()
+            || new.restorer().is_some()
+        {
+            return Ok(false);
+        }
+    }
+    drop(private);
+    if leaf.snapshot().current != 0
+        || files.task_user_count() != users
+        || sighand.load_count() != refs
+    {
+        return Ok(false);
+    }
+    // Test each actual auxiliary allocation rather than letting another
+    // private resource's early admission failure stand in for these bodies.
+    leaf.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..MemoryPolicy::default()
+    });
+    if !matches!(
+        PreparedTaskResources::try_limits(ProcessControlBlock::default_rlimits(), &creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || !matches!(
+        PreparedTaskResources::try_itimers(&creator),
+        Err(crate::mm::allocation::MemoryAllocationError::Charge(_))
+    ) || leaf.snapshot().current != 0
+    {
+        return Ok(false);
+    }
+    leaf.set_policy(MemoryPolicy::default());
+    let limits =
+        PreparedTaskResources::try_limits(ProcessControlBlock::default_rlimits(), &creator)?;
+    let timers = PreparedTaskResources::try_itimers(&creator)?;
+    let limits_weak = Arc::downgrade(&limits);
+    let timers_weak = Arc::downgrade(&timers);
+    if leaf.snapshot().current == 0 {
+        return Ok(false);
+    }
+    drop(limits);
+    drop(timers);
+    if leaf.snapshot().current != 0
+        || limits_weak.upgrade().is_some()
+        || timers_weak.upgrade().is_some()
+        || leaf.snapshot().kernel_bytes != [0; KERNEL_BYTE_KIND_COUNT]
+    {
+        return Ok(false);
+    }
+    drop(limits_weak);
+    drop(timers_weak);
+    let private_signal = crate::ipc::process_signal::ProcessSignalState::try_new_for(&creator)?;
+    let weak = Arc::downgrade(&private_signal);
+    if leaf.snapshot().current == 0 {
+        return Ok(false);
+    }
+    drop(private_signal);
+    let result = weak.upgrade().is_none()
+        && leaf.snapshot().current == 0
+        && root.snapshot().current == 0
+        && leaf.snapshot().kernel_bytes == [0; KERNEL_BYTE_KIND_COUNT];
+    drop(weak);
+    Ok(result)
+}
+
+impl ProcessControlBlock {
+    /// Complete the legacy fork-only immutable group fields before any PID,
+    /// task-list, scheduler or stack-user publication can expose this task.
+    ///
+    /// # Safety
+    /// The caller owns this unborn task and has released every entity borrow,
+    /// including the child thread guard. No simultaneous body access may exist;
+    /// unpublished alone is not sufficient. This never borrows the entire PCB
+    /// or Data mutably, nor stores a raw pointer past this initialization.
+    pub(super) unsafe fn initialize_unpublished_group(pcb: &Arc<Self>, tgid: RawPid) {
+        let header = Arc::as_ptr(pcb).cast_mut();
+        let body = unsafe {
+            let slot = &mut *core::ptr::addr_of_mut!((*header).data);
+            crate::cgroup::memory::owned::OwnedBox::unpublished_value_ptr(slot.get_mut())
+        };
+        unsafe { core::ptr::addr_of_mut!((*body).tgid).write(tgid) };
+    }
+
+    /// Create a new PCB.
+    ///
+    /// ## Parameters
+    ///
+    /// - `name`: The process name.
+    /// - `kstack`: The kernel stack for the process.
+    /// - `resources`: the final shared or private resources prepared for this
+    ///   birth; no temporary replacement resource is created here.
+    ///
+    /// ## Returns
+    ///
+    /// A new PCB.
+    pub(crate) fn new(
+        name: String,
+        kstack: KernelStack,
+        is_kthread: bool,
+        resources: PreparedTaskResources,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
+        let current = ProcessManager::current_pcb();
+        let stack_account = crate::cgroup::memory::object_for_task(&current);
+        let syscall_stack = KernelStack::new_accounted(&stack_account)?;
+        Self::do_create_pcb(name, kstack, syscall_stack, false, is_kthread, resources)
+    }
+
+    /// Create a new idle process.
+    ///
+    /// Note: This function must only be called during process manager
+    /// initialization.
+    pub fn new_idle(cpu_id: u32, kstack: KernelStack) -> Arc<Self> {
+        let name = format!("idle-{}", cpu_id);
+        let syscall_stack = KernelStack::new().expect("idle syscall stack allocation failed");
+        let creator = cgroup_root_node()
+            .effective_memory_generation()
+            .object_account;
+        let resources =
+            PreparedTaskResources::try_private(&creator).expect("idle resource preparation failed");
+        return Self::do_create_pcb(name, kstack, syscall_stack, true, true, resources)
+            .expect("idle scheduler preparation failed");
+    }
+
+    /// Returns whether the process is a kernel thread.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the process is a kernel thread, `false` otherwise.
+    pub fn is_kthread(&self) -> bool {
+        self.flags().contains(ProcessFlags::KTHREAD)
+    }
+
+    /// Get a reference to this task's currently installed, active user address space.
+    pub fn active_vm(&self) -> Option<crate::mm::ucontext::MmUserRef> {
+        if self.is_kthread() {
+            return None;
+        }
+        let basic = self.basic();
+        let vm = basic.user_vm()?;
+        vm.try_acquire()
+    }
+
+    pub fn sem_undo_group(&self) -> Option<Arc<SemUndoGroup>> {
+        self.sem_undo
+            .lock_irqsave()
+            .as_ref()
+            .map(SemUndoAttachment::group)
+    }
+
+    pub fn ensure_sem_undo_group(
+        &self,
+        ipc_ns: &Arc<IpcNamespace>,
+    ) -> Result<Arc<SemUndoGroup>, SystemError> {
+        if let Some(group) = self.sem_undo_group() {
+            group.verify_ipc_ns(ipc_ns)?;
+            return Ok(group);
+        }
+
+        let candidate = SemUndoGroup::new(ipc_ns)?;
+        let group = {
+            let mut slot = self.sem_undo.lock_irqsave();
+            if let Some(attachment) = slot.as_ref() {
+                attachment.group()
+            } else {
+                *slot = Some(SemUndoAttachment::new(candidate.clone()));
+                candidate
+            }
+        };
+        group.verify_ipc_ns(ipc_ns)?;
+        Ok(group)
+    }
+
+    pub fn take_sem_undo_attachment(&self) -> Option<SemUndoAttachment> {
+        self.sem_undo.lock_irqsave().take()
+    }
+
+    pub(crate) fn prepare_shared_sem_undo_attachment(
+        &self,
+        ipc_ns: &Arc<IpcNamespace>,
+    ) -> Result<UnpublishedSemUndoAttachmentGuard, SystemError> {
+        let group = self.ensure_sem_undo_group(ipc_ns)?;
+        group.verify_ipc_ns(ipc_ns)?;
+        Ok(UnpublishedSemUndoAttachmentGuard::new(group))
+    }
+
+    pub(crate) fn install_unpublished_sem_undo_attachment(
+        &self,
+        attachment: SemUndoAttachment,
+    ) -> Arc<Self> {
+        let child = self
+            .self_ref
+            .upgrade()
+            .expect("unpublished PCB lost its owning Arc");
+        let mut slot = self.sem_undo.lock_irqsave();
+        assert!(
+            slot.is_none(),
+            "unpublished child already has a SEM_UNDO attachment"
+        );
+        *slot = Some(attachment);
+        child
+    }
+
+    #[inline(never)]
+    fn do_create_pcb(
+        name: String,
+        kstack: KernelStack,
+        syscall_stack: KernelStack,
+        is_idle: bool,
+        is_kthread: bool,
+        resources: PreparedTaskResources,
+    ) -> Result<Arc<Self>, crate::mm::allocation::MemoryAllocationError> {
+        // Initialize the namespace proxy.
+        let nsproxy = if is_idle {
+            // The idle process uses the root namespace.
+            NsProxy::new_root()
+        } else {
+            // Other processes inherit their parent's namespace.
+            ProcessManager::current_pcb().nsproxy().clone()
+        };
+        let task_cgroup = if is_idle {
+            TaskCgroupRef::new(cgroup_root_node())
+        } else {
+            ProcessManager::current_pcb().task_cgroup_ref()
+        };
+        let cpu_accounting = task_cgroup.node().cpu_accounting();
+        let creator = task_cgroup
+            .node()
+            .effective_memory_generation()
+            .object_account;
+        let initial_fs = if is_idle {
+            Some(FsAttachment::new(FsStruct::try_new_for(
+                nsproxy.mnt_namespace().root_inode(),
+                &creator,
+            )?))
+        } else {
+            // An unborn fork gets its one final fs under FsRefsReadGuard.
+            None
+        };
+        let prepared_body =
+            crate::cgroup::memory::owned::OwnedBox::<ProcessControlBlockData>::prepare(
+                &creator,
+                crate::cgroup::memory::accounting::KernelByteKind::SlabUnreclaimable,
+            )?
+            .try_allocate()
+            .map_err(|_| SystemError::ENOMEM)?;
+
+        let (raw_pid, ppid, cred, tty): (RawPid, RawPid, Arc<Cred>, Option<Arc<TtyCore>>) =
+            if is_idle {
+                let cred = INIT_CRED.clone();
+                (RawPid(0), RawPid(0), cred, None)
+            } else {
+                let ppid = ProcessManager::current_pcb().task_pid_vnr();
+                let cred = ProcessManager::current_pcb().cred();
+
+                let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
+
+                // Here, UNASSIGNED is used to represent an unallocated pid,
+                // which will be allocated later in `copy_process`.
+                let raw_pid = RawPid::UNASSIGNED;
+
+                (raw_pid, ppid, cred, tty)
+            };
+
+        // The actual fd-table body is admitted before any task/sighand or
+        // registry publication. Failure drops the private body and stacks;
+        // the fork/creation owner decides whether recovery is permitted.
+        let PreparedTaskResources {
+            files: fd_table,
+            sighand: initial_sighand,
+            process_signal,
+            rlimits,
+            itimers,
+        } = resources;
+        let basic_info = ProcessBasicInfo::new(ppid, name.clone(), None, fd_table);
+        let preempt_count = AtomicUsize::new(0);
+        let pagefault_disabled = AtomicUsize::new(0);
+        let rcu_read_depth = AtomicUsize::new(0);
+        let flags = AtomicProcessFlags::new();
+        let initial_sched_class = if is_idle {
+            crate::sched::SchedClass::Idle
+        } else {
+            crate::sched::SchedClass::Fair
+        };
+        // All newly fallible scheduler preparation precedes the task's
+        // logical sighand reference. No error may leak an attached task ref.
+        let sched_info = ProcessSchedulerInfo::try_new(None, initial_sched_class)?;
+
+        let ppcb: Weak<ProcessControlBlock> = ProcessManager::find_task_by_vpid(ppid)
+            .map(|p| Arc::downgrade(&p))
+            .unwrap_or_default();
+
+        let cpu_time = ProcessCpuTime::try_new_for(&creator)?;
+        // No weak identity may escape or be upgraded before init. A failed
+        // thin-header allocation drops an uninitialized PCB without entering
+        // task cleanup; its still-private resources remain local RAII owners.
+        let pcb = Arc::try_new(Self {
+            data: crate::libs::lazy_init::Lazy::new(),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        let weak = Arc::downgrade(&pcb);
+        initial_sighand.attach_task_ref();
+        {
+            let arch_info = SpinLock::new(ArchPCBInfo::new(&kstack));
+
+            let data = ProcessControlBlockData {
+                pid: AtomicRawPid::new(raw_pid),
+                tgid: raw_pid,
+                thread_pid: RwLock::new(None),
+                basic: basic_info,
+                exec_update_lock: RwSem::new(()),
+                pid_links: core::array::from_fn(|_| PidLink::default()),
+                nsproxy: RcuOptionArcSlot::new_some(nsproxy),
+                task_cgroup: RwLock::new(task_cgroup),
+                cpu_accounting: SpinLock::new(cpu_accounting),
+                memory_high_debt: AtomicU64::new(0),
+                memory_io_context: SpinLock::new(None),
+                freezer: crate::cgroup::freezer::TaskState::default(),
+                pending_group_stop_generation: AtomicU64::new(0),
+                pending_group_stop_counted: AtomicBool::new(false),
+                memory_high_wait: SpinLock::new(None),
+                sem_undo: SpinLock::new(None),
+                preempt_count,
+                pagefault_disabled,
+                rcu_read_depth,
+                srcu_task_state: SpinLock::new(SrcuTaskState::new()),
+                tracepoint_srcu_depth: AtomicUsize::new(0),
+                srcu_callback_domain: AtomicU64::new(0),
+                flags,
+                visible_thread_accounted: AtomicBool::new(false),
+                task_lock: SpinLock::new(()),
+                futex_lifecycle: core::sync::atomic::AtomicU8::new(0),
+                futex_cleanup_wait: crate::libs::resource_wait::ResourceWaitQueue::new(),
+                resource_wait_link: SpinLock::new(Default::default()),
+                kernel_stack: RwLock::new(kstack),
+                syscall_stack: RwLock::new(syscall_stack),
+                worker_private: SpinLock::new(None),
+                sched_info,
+                arch_info,
+                sig_info: RwLock::new(ProcessSignalInfo::default()),
+                sighand: RcuArcSlot::new(initial_sighand.clone()),
+                process_signal: RcuArcSlot::new(process_signal),
+                sig_altstack: RwLock::new(SigStackArch::new()),
+                exit_state: AtomicU8::new(ExitState::Running as u8),
+                exit_notify_complete: AtomicBool::new(false),
+                identity_unhash_complete: AtomicBool::new(false),
+                group_exec_generation: AtomicU64::new(0),
+                natural_parent_notify_phase: AtomicU8::new(NaturalParentNotifyPhase::Idle as u8),
+                exit_signal: AtomicI32::new(Signal::SIGCHLD as i32),
+                pdeath_signal: AtomicSignal::new(Signal::INVALID),
+
+                no_new_privs: AtomicBool::new(false),
+                seccomp_mode: AtomicU8::new(seccomp::SeccompMode::Disabled as u8),
+                seccomp_filter: SpinLock::new(None),
+                parent_pcb: RwLock::new(ppcb.clone()),
+                real_parent_pcb: RwLock::new(ppcb.clone()),
+                wait_parent_pcb: RwLock::new(ppcb.clone()),
+                fork_parent_pcb: RwLock::new(ppcb),
+                children: RwLock::new(Vec::new()),
+                ptrace: ptrace::PtraceTask::new(),
+                wait_queue: WaitQueue::default(),
+                thread: RwLock::new(ThreadInfo::new()),
+                fs: RwLock::new(initial_fs),
+                fs_slot_update_lock: Mutex::new(()),
+                itimers,
+                cpu_time,
+                min_flt: AtomicU64::new(0),
+                maj_flt: AtomicU64::new(0),
+                exited_thread_group_cputime_ns: SpinLock::new(Default::default()),
+                exited_thread_group_rusage: SpinLock::new(RUsage::default()),
+                historical_maxrss_pages: AtomicUsize::new(0),
+                children_rusage: SpinLock::new(RUsage::default()),
+                robust_list: RwLock::new(None),
+                rseq_state: RwLock::new(rseq::RseqState::new()),
+                cred: RcuArcSlot::new(cred),
+                pending_session_keyring: SpinLock::new(None),
+                self_ref: weak.clone(),
+                restart_block: SpinLock::new(None),
+                executable_path: RwLock::new(name),
+                cmdline: RwLock::new(None),
+                rlimits,
+                #[cfg(target_arch = "x86_64")]
+                uprobe: super::uprobe::TaskXolState::new(),
+            };
+
+            pcb.data.init(prepared_body.init(data));
+            pcb.sig_info.write().set_tty(tty);
+
+            // Initialize the system call stack.
+            #[cfg(target_arch = "x86_64")]
+            pcb.arch_info
+                .lock()
+                .init_syscall_stack(&pcb.syscall_stack.read());
+        }
+
+        // A user task cannot start charging and then discover it has no
+        // memory.high waiter under pressure. Birth is fallible while this PCB
+        // is still unpublished, before PID relations or stack weak links.
+        if !is_idle && !is_kthread {
+            if let Err(error) = crate::cgroup::memory::high::prepare_for_task(&pcb) {
+                // No PID or thread-group membership has been published. Do
+                // not run exit identity cleanup against shared group state.
+                // PCB Drop still retires its own sighand/files attachments.
+                pcb.flags().insert(ProcessFlags::PID_UNHASHED);
+                return Err(error.into());
+            }
+        }
+        pcb.sched_info()
+            .sched_entity()
+            .force_mut()
+            .set_pcb(Arc::downgrade(&pcb));
+        // Store the process's Arc pointer at the lowest address of the kernel
+        // stack and system call stack.
+        unsafe {
+            pcb.kernel_stack
+                .write()
+                .set_pcb(Arc::downgrade(&pcb))
+                .unwrap();
+
+            pcb.syscall_stack
+                .write()
+                .set_pcb(Arc::downgrade(&pcb))
+                .unwrap()
+        };
+
+        return Ok(pcb);
+    }
+
+    fn default_rlimits() -> [crate::process::resource::RLimit64; RLimitID::Nlimits as usize] {
+        use crate::mm::ucontext::UserStack;
+        use crate::process::resource::{RLimit64, RLimitID};
+
+        let mut arr = [RLimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        }; RLimitID::Nlimits as usize];
+
+        // Preserve DragonOS's established userspace limit. The fd table is
+        // now allocated on demand, so a high logical limit no longer implies
+        // a large per-process allocation.
+        const DEFAULT_NOFILE_LIMIT: u64 = 1024 * 1024;
+        arr[RLimitID::Nofile as usize] = RLimit64 {
+            rlim_cur: DEFAULT_NOFILE_LIMIT,
+            rlim_max: DEFAULT_NOFILE_LIMIT,
+        };
+
+        arr[RLimitID::Stack as usize] = RLimit64 {
+            rlim_cur: UserStack::DEFAULT_USER_STACK_SIZE as u64,
+            rlim_max: UserStack::DEFAULT_USER_STACK_SIZE as u64,
+        };
+
+        arr[RLimitID::As as usize] = {
+            let end = <crate::arch::MMArch as crate::mm::MemoryManagementArch>::USER_END_VADDR;
+            RLimit64 {
+                rlim_cur: end.data() as u64,
+                rlim_max: end.data() as u64,
+            }
+        };
+        arr[RLimitID::Rss as usize] = arr[RLimitID::As as usize];
+
+        // Linux INIT_RLIMITS allows heap growth unless userspace explicitly
+        // lowers RLIMIT_DATA. Leaving this at zero rejects every brk growth.
+        arr[RLimitID::Data as usize] = RLimit64 {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+
+        // Set the default file size limit (Linux typically defaults to unlimited).
+        arr[RLimitID::Fsize as usize] = RLimit64 {
+            rlim_cur: u64::MAX,
+            rlim_max: u64::MAX,
+        };
+
+        // Linux commonly defaults RLIMIT_MEMLOCK to 64 KiB. Keeping the hard
+        // limit non-zero also allows unprivileged tests to lower the soft limit.
+        arr[RLimitID::Memlock as usize] = RLimit64 {
+            rlim_cur: 64 * 1024,
+            rlim_max: 64 * 1024,
+        };
+
+        // Linux fork_init() derives this finite default from the boot-time
+        // thread capacity. Fork inherits the parent's limits afterwards.
+        let pending_signals = (super::max_threads() / 2).max(1) as u64;
+        arr[RLimitID::Sigpending as usize] = RLimit64 {
+            rlim_cur: pending_signals,
+            rlim_max: pending_signals,
+        };
+        // Match Linux fork_init(): initialize both RLIMIT_NPROC limits to
+        // max_threads / 2 for the init task (kernel/fork.c).
+        arr[RLimitID::Nproc as usize] = RLimit64 {
+            rlim_cur: pending_signals,
+            rlim_max: pending_signals,
+        };
+
+        arr
+    }
+
+    #[inline(always)]
+    pub fn get_rlimit(&self, res: RLimitID) -> crate::process::resource::RLimit64 {
+        self.rlimits.read_irqsave()[res as usize]
+    }
+
+    #[inline]
+    pub fn nofile_soft_limit(&self) -> usize {
+        self.get_rlimit(RLimitID::Nofile).rlim_cur as usize
+    }
+
+    pub fn set_rlimit(
+        &self,
+        res: RLimitID,
+        newv: crate::process::resource::RLimit64,
+    ) -> Result<crate::process::resource::RLimit64, system_error::SystemError> {
+        use system_error::SystemError;
+        if newv.rlim_cur > newv.rlim_max {
+            return Err(SystemError::EINVAL);
+        }
+
+        // Note: RLIMIT_NOFILE is allowed to be 0, as expected by test cases.
+        // When rlim_cur is 0, no new file descriptors can be allocated, but
+        // existing fds remain usable.
+
+        // Linux rejects a hard nofile limit above fs.nr_open with EPERM. The
+        // soft limit is already constrained by soft <= hard above.
+        if res == RLimitID::Nofile
+            && newv.rlim_max > crate::filesystem::vfs::fdtable::nr_open() as u64
+        {
+            return Err(SystemError::EPERM);
+        }
+
+        // The whole thread group shares this lock. Compare the hard limit and
+        // publish the replacement in one critical section, matching Linux's
+        // group-leader task_lock serialization. Otherwise a writer authorized
+        // against a stale hard limit could restore a concurrently lowered one.
+        let can_raise_hard =
+            crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE);
+        let cur = {
+            // Signal admission reads this lock from timer/IRQ callbacks.
+            // Readers and writers must both exclude same-CPU IRQ reentry.
+            let mut rlimits = self.rlimits.write_irqsave();
+            let cur = rlimits[res as usize];
+            if newv.rlim_max > cur.rlim_max && !can_raise_hard {
+                return Err(SystemError::EPERM);
+            }
+            rlimits[res as usize] = newv;
+            cur
+        };
+
+        Ok(cur)
+    }
+
+    /// Returns the current process's lock hold count.
+    #[inline(always)]
+    pub fn preempt_count(&self) -> usize {
+        return self.preempt_count.load(Ordering::SeqCst);
+    }
+
+    /// Returns the current task's no-fault user access nesting depth.
+    #[inline(always)]
+    pub fn pagefault_disabled(&self) -> usize {
+        self.pagefault_disabled.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn rcu_read_depth(&self) -> usize {
+        self.rcu_read_depth.load(Ordering::SeqCst)
+    }
+
+    /// Increments the current process's lock hold count.
+    #[inline(always)]
+    pub fn preempt_disable(&self) {
+        self.preempt_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the current process's lock hold count.
+    #[inline(always)]
+    pub fn preempt_enable(&self) {
+        self.preempt_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn pagefault_disable(&self) {
+        self.pagefault_disabled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn pagefault_enable(&self) {
+        self.pagefault_disabled.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn rcu_read_lock(&self) {
+        self.rcu_read_depth.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn rcu_read_unlock(&self) {
+        let mut current = self.rcu_read_depth.load(Ordering::SeqCst);
+        loop {
+            assert!(current > 0, "rcu_read_unlock underflow");
+            match self.rcu_read_depth.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn set_preempt_count(&self, count: usize) {
+        self.preempt_count.store(count, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn contain_child(&self, pid: &RawPid) -> bool {
+        let children = self.children.read();
+        return children.contains(pid);
+    }
+
+    #[inline(always)]
+    pub fn flags(&self) -> &AtomicProcessFlags {
+        &self.flags
+    }
+
+    #[inline(always)]
+    pub(crate) fn mark_visible_thread_accounted(&self) {
+        self.visible_thread_accounted.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub(crate) fn take_visible_thread_accounted(&self) -> bool {
+        self.visible_thread_accounted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Note: this value can be read from interrupt context, but must not be
+    /// modified from interrupt context, otherwise a deadlock will occur.
+    #[inline(always)]
+    pub fn basic(&self) -> RwLockReadGuard<'_, ProcessBasicInfo> {
+        return self.basic.read_irqsave();
+    }
+
+    /// Non-blocking basic-info snapshot guard for lockup diagnostics.
+    pub(crate) fn try_basic(&self) -> Option<RwLockReadGuard<'_, ProcessBasicInfo>> {
+        self.basic.try_read_irqsave()
+    }
+
+    /// Acquire the exec_update_lock read lock
+    pub fn exec_update_read(&self) -> crate::libs::rwsem::RwSemReadGuard<'_, ()> {
+        self.exec_update_lock.read()
+    }
+
+    /// Acquire the exec_update_lock write lock: the critical sections where execve swaps mm/cred/dumpable hold this lock.
+    #[inline(always)]
+    pub fn exec_update_write(&self) -> crate::libs::rwsem::RwSemWriteGuard<'_, ()> {
+        self.exec_update_lock.write()
+    }
+
+    #[inline(always)]
+    pub fn set_name(&self, name: String) {
+        self.basic.write().set_name(name);
+    }
+
+    #[inline(always)]
+    pub fn set_pdeath_signal(&self, signal: Signal) {
+        self.pdeath_signal.store(signal, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn pdeath_signal(&self) -> Signal {
+        self.pdeath_signal.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn no_new_privs(&self) -> usize {
+        if self.no_new_privs.load(Ordering::SeqCst) {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_no_new_privs(&self, value: bool) {
+        // Linux semantics: once no_new_privs is set, it cannot be cleared.
+        if value {
+            self.no_new_privs.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[inline(always)]
+    pub fn keepcaps(&self) -> bool {
+        self.cred().keepcaps
+    }
+
+    #[inline(always)]
+    pub fn set_keepcaps(&self, value: bool) -> Result<(), SystemError> {
+        let mut cred = (*self.cred()).clone();
+        cred.keepcaps = value;
+        self.commit_cred(Cred::new_arc(cred))
+    }
+
+    #[inline(always)]
+    pub fn dumpable(&self) -> u8 {
+        self.basic()
+            .user_vm()
+            .map(|mm| mm.dumpable())
+            .unwrap_or(SUID_DUMP_DISABLE as u8)
+    }
+
+    #[inline(always)]
+    pub fn set_dumpable(&self, value: u8) {
+        if let Some(mm) = self.basic().user_vm() {
+            mm.set_dumpable(value);
+        }
+    }
+
+    #[inline(always)]
+    pub fn seccomp_mode(&self) -> seccomp::SeccompMode {
+        seccomp::SeccompMode::from(self.seccomp_mode.load(Ordering::Relaxed))
+    }
+
+    #[inline(always)]
+    pub fn set_seccomp_mode(&self, mode: seccomp::SeccompMode) {
+        self.seccomp_mode.store(mode as u8, Ordering::SeqCst);
+    }
+
+    #[inline(always)]
+    pub fn seccomp_filter_lock(&self) -> SpinLockGuard<'_, Option<Arc<seccomp::SeccompFilter>>> {
+        self.seccomp_filter.lock()
+    }
+
+    #[inline(always)]
+    pub fn basic_mut(&self) -> RwLockWriteGuard<'_, ProcessBasicInfo> {
+        return self.basic.write_irqsave();
+    }
+
+    /// Acquires the arch_info lock with interrupts disabled.
+    #[inline(always)]
+    pub fn arch_info_irqsave(&self) -> SpinLockGuard<'_, ArchPCBInfo> {
+        return self.arch_info.lock_irqsave();
+    }
+
+    /// Acquires the arch_info lock without disabling interrupts.
+    ///
+    /// Because arch_info is used during context switching, acquiring it outside
+    /// of interrupt context without irqsave is unsafe.
+    ///
+    /// This function may only be used in the following cases:
+    /// - In interrupt context (interrupts already disabled).
+    /// - Immediately after creating a new PCB.
+    #[inline(always)]
+    pub unsafe fn arch_info(&self) -> SpinLockGuard<'_, ArchPCBInfo> {
+        return self.arch_info.lock();
+    }
+
+    #[inline(always)]
+    pub fn kernel_stack(&self) -> RwLockReadGuard<'_, KernelStack> {
+        return self.kernel_stack.read();
+    }
+
+    pub unsafe fn kernel_stack_force_ref(&self) -> &KernelStack {
+        self.kernel_stack.force_get_ref()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn kernel_stack_mut(&self) -> RwLockWriteGuard<'_, KernelStack> {
+        return self.kernel_stack.write();
+    }
+
+    #[inline(always)]
+    pub fn sched_info(&self) -> &ProcessSchedulerInfo {
+        return &self.sched_info;
+    }
+
+    pub fn sig_altstack(&self) -> RwLockReadGuard<'_, SigStackArch> {
+        self.sig_altstack.read_irqsave()
+    }
+
+    pub fn sig_altstack_mut(&self) -> RwLockWriteGuard<'_, SigStackArch> {
+        self.sig_altstack.write_irqsave()
+    }
+
+    #[inline(always)]
+    pub fn worker_private(&self) -> SpinLockGuard<'_, Option<WorkerPrivate>> {
+        return self.worker_private.lock();
+    }
+
+    #[inline(always)]
+    pub fn raw_pid(&self) -> RawPid {
+        return self.pid.load(Ordering::Acquire);
+    }
+
+    #[inline(always)]
+    pub fn raw_tgid(&self) -> RawPid {
+        return self.tgid;
+    }
+
+    #[inline(always)]
+    pub fn fs_struct(&self) -> Arc<FsStruct> {
+        self.try_fs_struct()
+            .expect("live task must have an fs_struct")
+    }
+
+    /// Return the filesystem context when the task has not passed exit_fs().
+    pub fn try_fs_struct(&self) -> Option<Arc<FsStruct>> {
+        self.fs.read().as_ref().map(FsAttachment::observer)
+    }
+
+    #[inline(always)]
+    pub fn fs_struct_is_shared(&self) -> bool {
+        self.fs_struct().task_users() > 1
+    }
+
+    pub(crate) fn set_fs_struct(
+        &self,
+        fs: Arc<FsStruct>,
+        _fs_refs: &super::FsRefsReadGuard,
+    ) -> Option<Arc<FsStruct>> {
+        let _slot_update = self.fs_slot_update_lock.lock();
+        self.swap_fs_slot_locked(fs)
+    }
+
+    /// Replace the fs slot with `fs` and hand the previous owner back.
+    ///
+    /// The caller must hold `fs_slot_update_lock`, so the transition is
+    /// serialized with an operation that rewrites the referenced `FsStruct` in
+    /// place. A replacement that also republishes the task's `nsproxy` (a mount
+    /// namespace switch) additionally holds `task_lock`: see
+    /// [`Self::install_prepared_namespace_state()`].
+    ///
+    /// The previous owner is returned rather than dropped here, because its
+    /// path-pin destructors may enqueue deferred cleanup work.
+    fn swap_fs_slot_locked(&self, fs: Arc<FsStruct>) -> Option<Arc<FsStruct>> {
+        let mut guard = self.fs.write();
+        let retired = guard.replace(FsAttachment::new(fs));
+        drop(guard);
+        retired.map(FsAttachment::retire)
+    }
+
+    /// Drop this task's reference to its filesystem context during exit.
+    ///
+    /// This mirrors Linux `exit_fs()`: a zombie retains process metadata for
+    /// wait(2), but must no longer pin its root or working-directory mounts.
+    pub(super) fn exit_fs(&self) {
+        let _slot_update = self.fs_slot_update_lock.lock();
+        let fs = self.fs.write().take();
+        // Release the slot guard before dropping the final FsStruct
+        // owner, whose path-pin destructors may enqueue deferred cleanup work.
+        drop(_slot_update);
+        drop(fs);
+    }
+
+    /// Stabilize this task's fs slot across an operation that may sleep while
+    /// updating the referenced FsStruct.
+    pub(crate) fn lock_fs_slot_update(&self) -> MutexGuard<'_, ()> {
+        self.fs_slot_update_lock.lock()
+    }
+
+    pub fn pwd_inode(&self) -> Arc<dyn IndexNode> {
+        self.fs_struct().pwd()
+    }
+
+    /// Returns an `Arc` pointer to the file descriptor table.
+    #[inline(always)]
+    pub fn fd_table(&self) -> Arc<FileDescriptorTable> {
+        return self.basic.read().try_fd_table().unwrap();
+    }
+
+    #[inline(always)]
+    pub fn cred(&self) -> Arc<Cred> {
+        self.cred.load()
+    }
+
+    /// Atomically replace the current process's credential set (cred).
+    ///
+    /// - Uses irqsave write lock for concurrency safety.
+    /// - Returns `Result` so that callers can extend error handling as needed.
+    pub fn set_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        self.install_cred(new);
+        Ok(())
+    }
+
+    /// Install credentials after every fallible preparation step has completed.
+    pub(crate) fn install_cred(&self, new: Arc<Cred>) {
+        if new.thread_keyring.is_some() {
+            new.sync_thread_keyring_owner(&self.cred());
+        }
+        let _task_guard = self.task_lock.lock_irqsave();
+        self.cred.store_deferred(new);
+    }
+
+    /// Snapshot the namespace state of this task as one coherent pair, the way
+    /// Linux `mounts_open_common()` reads `task->nsproxy` and `task->fs` under
+    /// one `task_lock()`.
+    ///
+    /// Both slots are read inside the same `task_lock` critical section that
+    /// publishes them ([`Self::install_prepared_namespace_state()`]), so the
+    /// result is exactly one generation: it never mixes the mount namespace of
+    /// one publication with the root of the next.
+    pub(crate) fn namespace_state(&self) -> TaskNamespaceState {
+        let _task_guard = self.task_lock.lock_irqsave();
+        TaskNamespaceState {
+            nsproxy: self.try_nsproxy(),
+            fs: self.fs.read().as_ref().map(FsAttachment::observer),
+        }
+    }
+
+    /// Publish prepared namespace state without allocating under task_lock.
+    ///
+    /// `new_fs` and `new_nsproxy` are installed in the same `task_lock` critical
+    /// section, because a mount namespace switch replaces the task's root and
+    /// its `nsproxy` as one unit: [`Self::namespace_state()`] readers must never
+    /// observe half of that pair. The replaced `fs` owner is returned instead of
+    /// being dropped here, so its path-pin destructors run after the caller
+    /// released the locks.
+    ///
+    /// The caller holds `fs_slot_update_lock` when `new_fs` is `Some`, which is
+    /// what serializes the slot transition with an in-place rewrite of the
+    /// replaced `FsStruct`; `_fs_refs` is not read here, and is the caller's
+    /// proof of the same contract as [`Self::set_fs_struct()`]: the mount
+    /// references of the fs context are stabilized while the slot is replaced.
+    pub(crate) fn install_prepared_namespace_state(
+        &self,
+        new_nsproxy: Arc<NsProxy>,
+        nsproxy_retire: PreparedRcuArcRetire<NsProxy>,
+        new_cred: Option<(Arc<Cred>, PreparedRcuArcRetire<Cred>)>,
+        new_fs: Option<Arc<FsStruct>>,
+        _fs_refs: &super::FsRefsReadGuard,
+    ) -> Option<Arc<FsStruct>> {
+        // Only credential publication needs to stabilize the active mm. Pure
+        // namespace publication also runs inside exec, which already owns the
+        // write side and must not recursively acquire this read lock.
+        let _exec_guard = new_cred.as_ref().map(|_| self.exec_update_read());
+        let active_mm = new_cred.as_ref().and_then(|_| self.basic().user_vm());
+        if let Some((cred, _)) = new_cred.as_ref() {
+            if cred.thread_keyring.is_some() {
+                cred.sync_thread_keyring_owner(&self.cred());
+            }
+        }
+        let (retired_fs, nsproxy_retirement, cred_retirement) = {
+            let _task_guard = self.task_lock.lock_irqsave();
+            let retired_fs = new_fs.and_then(|fs| self.swap_fs_slot_locked(fs));
+            let nsproxy_retirement = self.nsproxy.swap_prepared(new_nsproxy, nsproxy_retire);
+            let cred_retirement = new_cred.map(|(cred, retire)| {
+                self.commit_cred_side_effects(&self.cred(), &cred, active_mm.as_ref());
+                self.cred.swap_prepared(cred, retire)
+            });
+            (retired_fs, nsproxy_retirement, cred_retirement)
+        };
+
+        nsproxy_retirement.enqueue();
+        if let Some(retirement) = cred_retirement {
+            retirement.enqueue();
+        }
+        retired_fs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn namespace_unprepared_rcu_stores_for_test(&self) -> usize {
+        self.nsproxy.unprepared_store_count_for_test() + self.cred.unprepared_store_count_for_test()
+    }
+
+    /// Commit new creds, updating dumpability accordingly
+    pub fn commit_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        // Stabilize the active mm across the credential publication. Linux
+        // publishes a dumpability downgrade before readers can observe the new
+        // credentials; exec uses the write side of this same lock.
+        let _exec_guard = self.exec_update_read();
+        let active_mm = self.basic().user_vm();
+        if new.thread_keyring.is_some() {
+            new.sync_thread_keyring_owner(&self.cred());
+        }
+        let _task_guard = self.task_lock.lock_irqsave();
+        let old = self.cred();
+        self.commit_cred_side_effects(&old, &new, active_mm.as_ref());
+        self.cred.store_deferred(new);
+        Ok(())
+    }
+
+    /// Queue a child-requested session handoff.  A later request replaces the
+    /// previous one, matching Linux task_work_cancel_func() + task_work_add().
+    pub(crate) fn queue_session_keyring(
+        &self,
+        ring: crate::security::keys::KeyRef,
+    ) -> Option<crate::security::keys::KeyRef> {
+        self.pending_session_keyring.lock().replace(ring)
+    }
+
+    pub(crate) fn take_pending_session_keyring(&self) -> Option<crate::security::keys::KeyRef> {
+        self.pending_session_keyring.lock().take()
+    }
+
+    /// Keep a queued handoff across a transient allocation failure without
+    /// replacing a newer child request that arrived meanwhile.
+    pub(crate) fn restore_pending_session_keyring_if_empty(
+        &self,
+        ring: crate::security::keys::KeyRef,
+    ) {
+        let mut pending = self.pending_session_keyring.lock();
+        if pending.is_none() {
+            *pending = Some(ring);
+        }
+    }
+
+    /// Caller holds exec_update_lock and task_lock; publish these effects before creds.
+    fn commit_cred_side_effects(
+        &self,
+        old: &Cred,
+        new: &Cred,
+        active_mm: Option<&Arc<crate::mm::ucontext::AddressSpace>>,
+    ) {
+        // Trigger: any of euid/egid/fsuid/fsgid changes, or new permitted is not a subset of old (privilege raise)
+        if old.euid != new.euid
+            || old.egid != new.egid
+            || old.fsuid != new.fsuid
+            || old.fsgid != new.fsgid
+            || !cred_cap_issubset(old, new)
+        {
+            // Publish dumpability before creds; with the read-side fence, checks never see new creds with old dumpable
+            if let Some(mm) = active_mm {
+                mm.set_dumpable(SUID_DUMPABLE.load(Ordering::SeqCst) as u8);
+            }
+            // Also clear the parent-death signal on identity change
+            self.set_pdeath_signal(Signal::INVALID);
+            fence(Ordering::Release);
+        }
+    }
+
+    pub fn set_execute_path(&self, path: String) {
+        *self.executable_path.write() = path;
+    }
+
+    pub fn execute_path(&self) -> String {
+        self.executable_path.read().clone()
+    }
+
+    /// Immutable argv snapshot: sharing it never duplicates the argument bytes.
+    pub(crate) fn cmdline_snapshot(&self) -> Option<Arc<super::exec_args::ExecStrings>> {
+        self.cmdline.read().clone()
+    }
+
+    pub(crate) fn set_cmdline_snapshot(&self, data: Option<Arc<super::exec_args::ExecStrings>>) {
+        let old = core::mem::replace(&mut *self.cmdline.write(), data);
+        // Last-page release must not run while holding the PCB publication lock.
+        drop(old);
+    }
+
+    pub fn real_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        return self.real_parent_pcb.read_irqsave().upgrade();
+    }
+
+    pub fn ptracer_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        ptrace::ptracer_of(&self.self_ref.upgrade()?)
+    }
+
+    pub fn is_ptraced(&self) -> bool {
+        ptrace::is_ptraced(self)
+    }
+
+    pub fn ptraced_pids(&self) -> Vec<RawPid> {
+        let Some(this) = self.self_ref.upgrade() else {
+            return Vec::new();
+        };
+        ptrace::tracees_of(&this)
+    }
+
+    pub fn fork_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.fork_parent_pcb.read_irqsave().upgrade()
+    }
+
+    pub fn wait_parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.wait_parent_pcb.read_irqsave().upgrade()
+    }
+
+    /// Returns whether the current process is the global init process.
+    pub fn is_global_init(&self) -> bool {
+        self.task_tgid_vnr().unwrap() == RawPid(1)
+    }
+
+    fn is_alive_reparent_target(pcb: &Arc<ProcessControlBlock>) -> bool {
+        !pcb.flags().contains(ProcessFlags::EXITING)
+            && !pcb.is_exited()
+            && !pcb.is_zombie()
+            && !pcb.is_dead()
+    }
+
+    fn find_alive_thread_in_group(
+        pcb: Arc<ProcessControlBlock>,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        ProcessManager::thread_group_tasks_snapshot(pcb)
+            .into_iter()
+            .find(ProcessControlBlock::is_alive_reparent_target)
+    }
+
+    fn find_alive_thread_reaper(
+        exiting: &Arc<ProcessControlBlock>,
+    ) -> Option<Arc<ProcessControlBlock>> {
+        ProcessManager::thread_group_tasks_snapshot(exiting.clone())
+            .into_iter()
+            .find(|task| {
+                !Arc::ptr_eq(task, exiting) && ProcessControlBlock::is_alive_reparent_target(task)
+            })
+    }
+
+    /// Called with PID_MEMBERSHIP_LOCK after consuming this task's live token.
+    /// Keep namespace reaper handoff ordered with fork publication and other
+    /// init threads entering exit; the final live thread alone owns shutdown.
+    pub(super) fn prepare_pid_namespace_exit(
+        self: &Arc<Self>,
+        group_dead: bool,
+    ) -> Option<Arc<crate::process::namespace::pid_namespace::PidNamespace>> {
+        if !self.task_pid_ptr(PidType::TGID)?.is_child_reaper() {
+            return None;
+        }
+        let namespace = self.active_pid_ns();
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        if group_dead {
+            namespace.set_child_reaper(Arc::downgrade(self));
+            namespace.disable_pid_allocation();
+            return Some(namespace);
+        }
+        let owns_reaper = namespace
+            .child_reaper()
+            .and_then(|reaper| reaper.upgrade())
+            .is_some_and(|reaper| Arc::ptr_eq(&reaper, self));
+        if owns_reaper {
+            let next = Self::find_alive_thread_reaper(self)
+                .expect("non-final namespace init exit must have a live sibling");
+            namespace.set_child_reaper(Arc::downgrade(&next));
+        }
+        None
+    }
+
+    fn child_wait_parent_is(
+        child: &Arc<ProcessControlBlock>,
+        parent: &Arc<ProcessControlBlock>,
+    ) -> bool {
+        child
+            .wait_parent_pcb()
+            .as_ref()
+            .map(|wait_parent| Arc::ptr_eq(wait_parent, parent))
+            .unwrap_or(false)
+    }
+
+    fn link_child_to_parent_list(
+        child: &Arc<ProcessControlBlock>,
+        parent: &Arc<ProcessControlBlock>,
+    ) {
+        let child_vpid = child
+            .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+        if child_vpid.data() == 0 {
+            return;
+        }
+
+        let mut children = parent.children.write_irqsave();
+        if !children.contains(&child_vpid) {
+            children.push(child_vpid);
+        }
+    }
+
+    /// Update the parent links of one task.
+    ///
+    /// The four parent pointers are per-task state (`fork.rs` copies them into
+    /// every newly created task, and `CLONE_THREAD` children inherit them
+    /// independently), so a thread group is only fully re-parented when every
+    /// member is updated. Linux does the same with `for_each_thread()` in
+    /// `forget_original_parent()`.
+    ///
+    /// Linux additionally guards the wait parent with `if (likely(!t->ptrace))`:
+    /// a traced task's `->parent` is its tracer, not the new parent. DragonOS
+    /// keeps the tracer relationship in `process::ptrace`'s relation table
+    /// (`ptracer_of()`) and never writes it into `wait_parent_pcb`, so the
+    /// unconditional update is equivalent today. If tracing is ever modelled
+    /// through these fields, the guard has to be added here as well.
+    fn reparent_one_task_locked(
+        task: &Arc<ProcessControlBlock>,
+        new_parent: &Arc<ProcessControlBlock>,
+        parent_pid_in_child_ns: RawPid,
+    ) {
+        *task.parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.real_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.wait_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+        *task.fork_parent_pcb.write_irqsave() = Arc::downgrade(new_parent);
+
+        // `basic.ppid` has no reader today (`stat`/`status` derive Ppid from
+        // `parent_pcb()`), but it belongs to the same parent record and must
+        // stay consistent with the pointers above.
+        task.basic.write_irqsave().ppid = parent_pid_in_child_ns;
+    }
+
+    /// Attach a whole child thread group to `new_parent`.
+    ///
+    /// Only the group leader is registered in `children`, so the caller passes
+    /// the leader; the leader's group list is then walked to update every
+    /// member. Updating just the leader would make
+    /// `/proc/<pid>/task/<tid>/status` report a different `Ppid` than
+    /// `/proc/<pid>/status` for the same thread group.
+    fn reparent_child_to_locked(
+        child: &Arc<ProcessControlBlock>,
+        new_parent: &Arc<ProcessControlBlock>,
+    ) {
+        let parent_pid_in_child_ns = new_parent
+            .task_pid_nr_ns(PidType::PID, Some(child.active_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+
+        for task in ProcessManager::thread_group_tasks_snapshot(child.clone()) {
+            Self::reparent_one_task_locked(&task, new_parent, parent_pid_in_child_ns);
+        }
+
+        ProcessControlBlock::link_child_to_parent_list(child, new_parent);
+
+        // Linux reparent_leader() notifies the new parent when a zombie child
+        // becomes wait-visible through reparenting. DragonOS keeps per-task wait
+        // queues, so wake both the concrete new parent and its group leader.
+        if child.is_zombie() {
+            ProcessManager::wake_wait_parent(new_parent);
+        }
+    }
+
+    /// Update a child's parent links during a thread-group identity handoff.
+    ///
+    /// The caller must hold `PTRACE_RELATION_LOCK`, DragonOS's tasklist-like
+    /// relationship lock, so the parent pointers and the owning `children`
+    /// index change as one transaction with concurrent release/reparent.
+    pub(crate) fn reparent_child_links_from_thread_group_locked(
+        child: &Arc<ProcessControlBlock>,
+        old_tgid: RawPid,
+        new_parent: &Arc<ProcessControlBlock>,
+    ) {
+        let should_reparent = child
+            .parent_pcb()
+            .as_ref()
+            .map(|parent| parent.tgid == old_tgid)
+            .unwrap_or(false)
+            || child
+                .real_parent_pcb()
+                .as_ref()
+                .map(|parent| parent.tgid == old_tgid)
+                .unwrap_or(false)
+            || child
+                .wait_parent_pcb()
+                .as_ref()
+                .map(|parent| parent.tgid == old_tgid)
+                .unwrap_or(false);
+
+        if should_reparent {
+            ProcessControlBlock::reparent_child_to_locked(child, new_parent);
+        }
+    }
+
+    fn collect_children_for_exit(
+        exiting: &Arc<ProcessControlBlock>,
+    ) -> Vec<Arc<ProcessControlBlock>> {
+        // Caller holds PTRACE_RELATION_LOCK so collecting children, selecting a
+        // reaper, and moving children form one tasklist-lock-like transaction.
+        let mut result = Vec::new();
+        let mut seen = Vec::new();
+        // All members of a thread group share the active PID namespace. A
+        // concurrently exiting sibling may already have detached its PID, so
+        // derive the namespace once from the still-attached exit notifier.
+        let owner_ns = exiting.active_pid_ns();
+
+        let mut push_reparent_child =
+            |child: Arc<ProcessControlBlock>, result: &mut Vec<Arc<ProcessControlBlock>>| {
+                if seen.iter().any(|pid| *pid == child.raw_pid()) {
+                    return;
+                }
+                seen.push(child.raw_pid());
+                result.push(child);
+            };
+
+        for owner in ProcessManager::thread_group_tasks_snapshot(exiting.clone()) {
+            let pids_to_rehome: Vec<RawPid> = if Arc::ptr_eq(&owner, exiting) {
+                let mut children = owner.children.write_irqsave();
+                core::mem::take(&mut *children)
+            } else {
+                let mut children = owner.children.write_irqsave();
+                let mut removed = Vec::new();
+                children.retain(|pid| {
+                    let should_remove = ProcessManager::find_task_by_pid_ns(*pid, &owner_ns)
+                        .as_ref()
+                        .map(|child| ProcessControlBlock::child_wait_parent_is(child, exiting))
+                        .unwrap_or(false);
+                    if should_remove {
+                        removed.push(*pid);
+                    }
+                    !should_remove
+                });
+                removed
+            };
+
+            for pid in pids_to_rehome {
+                let Some(child) = ProcessManager::find_task_by_pid_ns(pid, &owner_ns) else {
+                    continue;
+                };
+
+                if let Some(wait_parent) = child.wait_parent_pcb() {
+                    if !Arc::ptr_eq(&wait_parent, exiting)
+                        && wait_parent.tgid == exiting.tgid
+                        && ProcessControlBlock::is_alive_reparent_target(&wait_parent)
+                    {
+                        ProcessControlBlock::reparent_child_to_locked(&child, &wait_parent);
+                        continue;
+                    }
+                }
+
+                push_reparent_child(child, &mut result);
+            }
+        }
+
+        result
+    }
+
+    /// When the current process exits, have another thread, a subreaper, or init
+    /// adopt its children.
+    pub(super) unsafe fn adopt_childen(&self) -> Result<(), SystemError> {
+        let exiting = self.self_ref.upgrade().ok_or(SystemError::ESRCH)?;
+        let _relation_guard = PTRACE_RELATION_LOCK.lock_irqsave();
+        let children = ProcessControlBlock::collect_children_for_exit(&exiting);
+
+        if children.is_empty() {
+            return Ok(());
+        }
+
+        self.notify_parent_exit_for_children(&children);
+
+        if let Some(reaper) = ProcessControlBlock::find_alive_thread_reaper(&exiting) {
+            for child in children {
+                ProcessControlBlock::reparent_child_to_locked(&child, &reaper);
+            }
+            return Ok(());
+        }
+
+        let exiting_ns = exiting.active_pid_ns();
+        let init_pcb = exiting_ns
+            .child_reaper()
+            .and_then(|reaper| reaper.upgrade())
+            .ok_or(SystemError::ECHILD)?;
+
+        // Normal case: preferentially reparent to the “nearest ancestor
+        // subreaper,” otherwise reparent to init.
+        let mut reaper: Arc<ProcessControlBlock> = init_pcb.clone();
+        let mut cursor = self.real_parent_pcb();
+        while let Some(p) = cursor {
+            // Linux semantics: child_subreaper is thread-group-level; the
+            // thread-group leader is used uniformly for the check here.
+            let leader = {
+                let ti = p.threads_read_irqsave();
+                ti.group_leader().unwrap_or_else(|| p.clone())
+            };
+
+            let visible_in_exiting_ns = leader
+                .task_pid_nr_ns(PidType::PID, Some(exiting_ns.clone()))
+                .is_some_and(|pid| pid.data() != 0);
+            // Linux uses task_pid(reaper)->level == ns_level. DragonOS exposes
+            // this through active pidns level plus visibility in exiting_ns.
+            if !visible_in_exiting_ns || leader.active_pid_ns().level() != exiting_ns.level() {
+                break;
+            }
+
+            if leader.sig_info_irqsave().is_child_subreaper() {
+                if let Some(alive) = ProcessControlBlock::find_alive_thread_in_group(leader.clone())
+                {
+                    reaper = alive;
+                    break;
+                }
+            }
+
+            if Arc::ptr_eq(&leader, &init_pcb) {
+                break;
+            }
+
+            cursor = leader.real_parent_pcb();
+        }
+
+        let mut notifications = Vec::new();
+        for child in &children {
+            // Reparenting across thread groups always changes the exit signal
+            // to SIGCHLD, including children originally created as clones.
+            child
+                .exit_signal
+                .store(Signal::SIGCHLD as i32, Ordering::Release);
+            ProcessControlBlock::reparent_child_to_locked(child, &reaper);
+            if let Some(event) = ProcessManager::prepare_reparented_zombie_locked(child) {
+                notifications.push(event);
+            }
+        }
+
+        drop(_relation_guard);
+        for event in notifications {
+            ProcessManager::finish_reparented_zombie(event);
+        }
+
+        Ok(())
+    }
+
+    fn notify_parent_exit_for_children(&self, children: &[Arc<ProcessControlBlock>]) {
+        for child in children {
+            let sig = child.pdeath_signal();
+            if sig == Signal::INVALID {
+                continue;
+            }
+            if let Err(e) = crate::ipc::kill::send_signal_to_pcb(child.clone(), sig) {
+                warn!(
+                    "adopt_childen: failed to deliver pdeath_signal {:?} to child {:?}: {:?}",
+                    sig,
+                    child.raw_pid(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Generate the process name from a program path.
+    pub fn generate_name(program_path: &str) -> String {
+        // Extract just the basename from the program path
+        let name = program_path.split('/').next_back().unwrap_or(program_path);
+        name.to_string()
+    }
+
+    pub fn sig_info_irqsave(&self) -> RwLockReadGuard<'_, ProcessSignalInfo> {
+        self.sig_info.read_irqsave()
+    }
+
+    pub fn sig_info_upgradable(&self) -> RwLockUpgradableGuard<'_, ProcessSignalInfo> {
+        self.sig_info.upgradeable_read_irqsave()
+    }
+
+    pub fn try_siginfo_irqsave(&self, times: u8) -> Option<RwLockReadGuard<'_, ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_read_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
+    pub fn sig_info_mut(&self) -> RwLockWriteGuard<'_, ProcessSignalInfo> {
+        self.sig_info.write_irqsave()
+    }
+
+    pub fn is_active_vfork(&self) -> bool {
+        self.thread.read_irqsave().vfork_done.is_some()
+    }
+
+    /// Returns a read-only reference to the rseq state.
+    #[inline]
+    pub fn rseq_state(&self) -> RwLockReadGuard<'_, rseq::RseqState> {
+        self.rseq_state.read_irqsave()
+    }
+
+    /// Returns a mutable reference to the rseq state.
+    #[inline]
+    pub fn rseq_state_mut(&self) -> RwLockWriteGuard<'_, rseq::RseqState> {
+        self.rseq_state.write_irqsave()
+    }
+
+    pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {
+        for _ in 0..times {
+            if let Some(r) = self.sig_info.try_write_irqsave() {
+                return Some(r);
+            }
+        }
+
+        return None;
+    }
+
+    /// Returns whether the current process has any pending signals.
+    pub fn has_pending_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let has_pending_thread = sig_info.sig_pending().has_pending();
+        drop(sig_info);
+        if has_pending_thread {
+            return true;
+        }
+        // Also check the thread group's process-directed pending queue.
+        let shared = self.process_signal().shared_pending_signal();
+        return !shared.is_empty();
+    }
+
+    /// Fast check using PCB flags: whether the current process has any pending signals.
+    pub fn has_pending_signal_fast(&self) -> bool {
+        self.flags.contains(ProcessFlags::HAS_PENDING_SIGNAL)
+    }
+
+    /// Checks whether the current process has pending signals that are not
+    /// blocked.
+    ///
+    /// Note: This function is relatively slow and should be used together with
+    /// `has_pending_signal_fast`.
+    pub fn has_pending_not_masked_signal(&self) -> bool {
+        let sig_info = self.sig_info_irqsave();
+        let blocked: SigSet = *sig_info.sig_blocked();
+        let mut pending: SigSet = sig_info.sig_pending().signal();
+        drop(sig_info);
+        // Also check shared_pending.
+        pending |= self.process_signal().shared_pending_signal();
+        pending.remove(blocked);
+        // log::debug!(
+        //     "pending and not masked:{:?}, masked: {:?}",
+        //     pending,
+        //     blocked
+        // );
+        let has_not_masked = !pending.is_empty();
+        return has_not_masked;
+    }
+
+    #[inline(always)]
+    pub fn get_robust_list(&self) -> RwLockReadGuard<'_, Option<RobustListHead>> {
+        return self.robust_list.read_irqsave();
+    }
+
+    #[inline(always)]
+    pub fn set_robust_list(&self, new_robust_list: Option<RobustListHead>) {
+        *self.robust_list.write_irqsave() = new_robust_list;
+    }
+
+    #[inline(always)]
+    pub fn take_robust_list(&self) -> Option<RobustListHead> {
+        self.robust_list.write_irqsave().take()
+    }
+
+    #[inline(always)]
+    pub(crate) fn itimers_irqsave(&self) -> SpinLockGuard<'_, OwnedBox<ProcessItimers>> {
+        return self.itimers.lock_irqsave();
+    }
+
+    /// Clean up the timers of the current process/thread.
+    ///
+    /// References the timer cleanup logic in Linux's `do_exit()`:
+    /// ```c
+    /// if (group_dead) {
+    ///     hrtimer_cancel(&tsk->signal->real_timer);
+    ///     exit_itimers(tsk);
+    /// }
+    /// ```
+    ///
+    /// Traditional interval timers survive until the last live group member.
+    pub(super) fn exit_timers(&self, group_dead: bool) {
+        if group_dead {
+            self.itimers.lock_irqsave().exit();
+        }
+
+        if group_dead {
+            let group = self.process_signal();
+            let timers = group.posix_timers().lock_irqsave().take_all();
+            for (_, timer) in timers {
+                timer.delete();
+            }
+        }
+    }
+
+    /// Exit fd table when process exit
+    pub(super) fn exit_files(&self) {
+        // Close the file descriptor table.
+        // This is written this way to avoid deadlocks: some inodes need to access
+        // the current process's basic info when being closed.
+        let mut guard = self.basic.write_irqsave();
+        let old = guard.set_fd_table(None);
+        drop(guard);
+        drop(old)
+    }
+
+    pub fn children_read_irqsave(&self) -> RwLockReadGuard<'_, Vec<RawPid>> {
+        self.children.read_irqsave()
+    }
+
+    pub fn threads_read_irqsave(&self) -> RwLockReadGuard<'_, ThreadInfo> {
+        self.thread.read_irqsave()
+    }
+
+    pub fn threads_write_irqsave(&self) -> RwLockWriteGuard<'_, ThreadInfo> {
+        self.thread.write_irqsave()
+    }
+
+    /// Reserve one leader-owned thread-list slot without allocating while the
+    /// IRQ-safe membership lock is held. Timer signal delivery can inspect the
+    /// list from hardirq context, so using a non-irqsave writer would deadlock
+    /// if that interrupt arrived while the process-context writer was active.
+    /// Publication must still recheck capacity under pid-membership ordering.
+    pub(crate) fn try_reserve_thread_group_slot(&self) -> Result<(), SystemError> {
+        loop {
+            let required_capacity = {
+                let threads = self.thread.read_irqsave();
+                if threads.group_tasks.len() < threads.group_tasks.capacity() {
+                    return Ok(());
+                }
+                let required = threads
+                    .group_tasks
+                    .len()
+                    .checked_add(1)
+                    .ok_or(SystemError::ENOMEM)?;
+                threads
+                    .group_tasks
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+            };
+
+            // All allocator work happens before taking the IRQ-safe writer.
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(required_capacity)
+                .map_err(|_| SystemError::ENOMEM)?;
+
+            let installed = {
+                let mut threads = self.thread.write_irqsave();
+                if threads.group_tasks.len() < threads.group_tasks.capacity() {
+                    false
+                } else if replacement.capacity() < threads.group_tasks.len().saturating_add(1) {
+                    // A concurrent publisher consumed more capacity than the
+                    // lock-free preparation anticipated. Retry with its size.
+                    false
+                } else {
+                    // Capacity is already sufficient, so append only moves
+                    // Weak values; swap leaves the old empty buffer to be
+                    // dropped after IRQs are restored.
+                    replacement.append(&mut threads.group_tasks);
+                    core::mem::swap(&mut replacement, &mut threads.group_tasks);
+                    true
+                }
+            };
+            drop(replacement);
+
+            if installed {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn restart_block(&self) -> SpinLockGuard<'_, Option<RestartBlock>> {
+        self.restart_block.lock()
+    }
+
+    pub fn set_restart_fn(
+        &self,
+        restart_block: Option<RestartBlock>,
+    ) -> Result<usize, SystemError> {
+        *self.restart_block.lock() = restart_block;
+        return Err(SystemError::ERESTART_RESTARTBLOCK);
+    }
+
+    pub fn parent_pcb(&self) -> Option<Arc<ProcessControlBlock>> {
+        self.parent_pcb.read().upgrade()
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.sched_info.state().is_exited()
+    }
+
+    /// DragonOS sets `ProcessState::Exited` after the task has left user-visible
+    /// execution, before `ExitState::Zombie`; it is no longer a live thread-group
+    /// member for wait/pidfd readiness.
+    pub(crate) fn is_live_thread_group_member(&self) -> bool {
+        !self.is_exited() && !self.is_zombie() && !self.is_dead()
+    }
+
+    pub fn exit_code(&self) -> Option<usize> {
+        self.sched_info.state().exit_code()
+    }
+
+    pub fn exit_state(&self) -> ExitState {
+        ExitState::from_u8(self.exit_state.load(Ordering::Acquire))
+    }
+
+    pub fn is_zombie(&self) -> bool {
+        self.exit_state() == ExitState::Zombie
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.exit_state() == ExitState::Dead
+    }
+
+    pub fn set_exit_state_zombie(&self) {
+        self.exit_state
+            .store(ExitState::Zombie as u8, Ordering::Release);
+    }
+
+    pub fn try_mark_dead_from_zombie(&self) -> bool {
+        self.exit_state
+            .compare_exchange(
+                ExitState::Zombie as u8,
+                ExitState::Dead as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Acquire the unique consuming ownership used by ptrace zombie wait.
+    pub(crate) fn try_claim_trace_zombie(&self) -> bool {
+        self.exit_state
+            .compare_exchange(
+                ExitState::Zombie as u8,
+                ExitState::TraceClaimed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn release_trace_zombie_claim(&self) {
+        self.exit_state
+            .compare_exchange(
+                ExitState::TraceClaimed as u8,
+                ExitState::Zombie as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .expect("only the ptrace zombie owner may release its claim");
+    }
+
+    pub(crate) fn finish_trace_zombie_claim(&self) {
+        self.exit_state
+            .compare_exchange(
+                ExitState::TraceClaimed as u8,
+                ExitState::Dead as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("only the ptrace zombie owner may finish its claim");
+    }
+
+    /// Publish completion of `exit_notify()` after all producer-side effects.
+    #[inline(always)]
+    pub fn mark_exit_notify_complete(&self) {
+        self.exit_notify_complete.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn exit_notify_complete(&self) -> bool {
+        self.exit_notify_complete.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn natural_parent_notify_phase(&self) -> NaturalParentNotifyPhase {
+        match self.natural_parent_notify_phase.load(Ordering::Acquire) {
+            value if value == NaturalParentNotifyPhase::Idle as u8 => {
+                NaturalParentNotifyPhase::Idle
+            }
+            value if value == NaturalParentNotifyPhase::Pending as u8 => {
+                NaturalParentNotifyPhase::Pending
+            }
+            value if value == NaturalParentNotifyPhase::Done as u8 => {
+                NaturalParentNotifyPhase::Done
+            }
+            _ => panic!("invalid natural-parent notification phase"),
+        }
+    }
+
+    pub(crate) fn try_claim_natural_parent_notify(&self) -> bool {
+        self.natural_parent_notify_phase
+            .compare_exchange(
+                NaturalParentNotifyPhase::Idle as u8,
+                NaturalParentNotifyPhase::Pending as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn complete_natural_parent_notify(&self) -> bool {
+        self.natural_parent_notify_phase
+            .compare_exchange(
+                NaturalParentNotifyPhase::Pending as u8,
+                NaturalParentNotifyPhase::Done as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Publish the tail of release/unhash after PID and thread-group identity
+    /// structures no longer reference this task as a live member.
+    #[inline(always)]
+    pub fn mark_identity_unhash_complete(&self) {
+        self.identity_unhash_complete.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn identity_unhash_complete(&self) -> bool {
+        self.identity_unhash_complete.load(Ordering::Acquire)
+    }
+
+    /// Assign this task to a group-exec transaction. The caller serializes
+    /// assignment with completion using `SigHand::inner`.
+    #[inline(always)]
+    pub fn assign_group_exec_generation(&self, generation: u64) {
+        debug_assert_ne!(generation, 0);
+        self.group_exec_generation
+            .store(generation, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn group_exec_generation(&self) -> u64 {
+        self.group_exec_generation.load(Ordering::Acquire)
+    }
+
+    /// Consume the task's single completion token. This must be called while
+    /// holding the associated `SigHand::inner` write lock.
+    #[inline(always)]
+    pub(crate) fn take_group_exec_generation(&self) -> u64 {
+        self.group_exec_generation.swap(0, Ordering::AcqRel)
+    }
+
+    pub fn mark_exiting(&self) {
+        self.flags().insert(ProcessFlags::EXITING);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Returns the process's namespace proxy.
+    pub fn nsproxy(&self) -> Arc<NsProxy> {
+        self.try_nsproxy()
+            .expect("only a live task may access its namespace proxy")
+    }
+
+    /// Returns None once do_exit has detached this task's namespaces. A
+    /// zombie may still be discoverable by PID until its parent reaps it.
+    pub fn try_nsproxy(&self) -> Option<Arc<NsProxy>> {
+        self.nsproxy.load()
+    }
+
+    /// Sets the process's namespace proxy.
+    ///
+    /// ## Parameters
+    /// - `nsproxy`: The new namespace proxy.
+    pub fn set_nsproxy(&self, nsproxy: Arc<NsProxy>) {
+        let _task_guard = self.task_lock.lock_irqsave();
+        self.nsproxy.store_deferred(Some(nsproxy));
+    }
+
+    /// Linux exit_task_namespaces(): release namespace references before the
+    /// task becomes a zombie rather than waiting for its PCB to be reaped.
+    pub(crate) fn exit_task_namespaces(&self) {
+        let old = {
+            let _task_guard = self.task_lock.lock_irqsave();
+            // SAFETY: the slot-owned reference is transferred to an RCU
+            // deferred drop after releasing task_lock.
+            unsafe { self.nsproxy.swap(None) }
+        };
+        if let Some(old) = old {
+            rcu_defer_drop(old);
+        }
+    }
+
+    pub fn task_cgroup_ref(&self) -> TaskCgroupRef {
+        self.task_cgroup.read().clone()
+    }
+
+    pub fn task_cgroup_node(&self) -> Arc<CgroupNode> {
+        self.task_cgroup.read().node()
+    }
+
+    pub(crate) fn account_cgroup_runtime(&self, delta_ns: u64) {
+        self.cpu_accounting.lock_irqsave().account_runtime(delta_ns);
+    }
+
+    pub(crate) fn account_cgroup_cputime(&self, user: bool, delta_ns: u64) {
+        self.cpu_accounting
+            .lock_irqsave()
+            .account_cputime(user, delta_ns);
+    }
+
+    /// The caller holds owner rq and has settled execution on the old target.
+    /// Resolve the new target before taking rq; this method never reads the
+    /// sleeping membership lock from a scheduler or interrupt critical section.
+    pub(crate) fn replace_cpu_accounting_locked(
+        &self,
+        accounting: Arc<crate::cgroup::cpu::accounting::CpuAccounting>,
+    ) {
+        *self.cpu_accounting.lock_irqsave() = accounting;
+    }
+
+    /// Set the cgroup node that this task belongs to.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `cgroup_accounting_lock` to avoid deadlocks and race
+    /// conditions.
+    pub fn set_task_cgroup_node(&self, node: Arc<CgroupNode>) {
+        // First, use a read lock to get the old node.
+        let old = {
+            let task_cgroup = self.task_cgroup.read();
+            let old = task_cgroup.node();
+            if Arc::ptr_eq(&old, &node) {
+                return;
+            }
+            old
+        }; // Release the read lock.
+
+        // Perform the migration without holding the task_cgroup lock; the caller
+        // must hold cgroup_accounting_lock to guarantee that visible membership
+        // and pids charging switch together.
+        crate::cgroup::freezer::migrate(self, &old, &node);
+        CgroupNode::transfer_pids_charge(&old, &node, 1);
+
+        // Use a write lock to update task_cgroup.
+        let mut task_cgroup = self.task_cgroup.write();
+        *task_cgroup = TaskCgroupRef::new(node);
+    }
+
+    /// Set the task's cgroup node for fork only.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `cgroup_accounting_lock`.
+    ///
+    /// # Note
+    ///
+    /// This function only updates the task_cgroup reference and does not call
+    /// `add_task()`. The final fork publication transaction installs population
+    /// before releasing PID membership and publishing the ALL_PROCESS entry.
+    pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
+        *self.cpu_accounting.lock_irqsave() = node.cpu_accounting();
+        *self.task_cgroup.write() = TaskCgroupRef::new(node);
+    }
+
+    /// Linux `task_struct::exit_signal`: `-1` for a thread group member, `0`
+    /// for a clone child that sends no signal, `>0` for the signal delivered to
+    /// the parent on exit.
+    ///
+    /// Only clone, `de_thread()` and the exit paths rewrite it; a task that has
+    /// exited keeps the value it was created with.
+    #[inline]
+    pub fn exit_signal(&self) -> i32 {
+        self.exit_signal.load(Ordering::SeqCst)
+    }
+
+    pub fn is_thread_group_leader(&self) -> bool {
+        self.exit_signal() >= 0
+    }
+
+    pub(crate) fn thread_group_has_live_nonleader_threads(&self) -> bool {
+        if !self.is_thread_group_leader() {
+            return false;
+        }
+
+        self.threads_read_irqsave()
+            .group_tasks_clone()
+            .into_iter()
+            .filter_map(|task| task.upgrade())
+            .any(|task| task.is_live_thread_group_member())
+    }
+
+    /// Wake task-level observers and thread-group child-state observers.
+    /// Job-control and ptrace publishers use this compatibility entry point;
+    /// the trapping queue remains task-owned, unlike wait(2)'s group queue.
+    pub fn wake_all_waiters(&self) {
+        self.wait_queue
+            .wakeup_all(Some(ProcessState::Blocked(true)));
+        self.process_signal().child_wait_queue().wake_all();
+    }
+}
+
+impl Drop for ProcessControlBlock {
+    fn drop(&mut self) {
+        if !self.data.initialized() {
+            return;
+        }
+        let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+        // log::debug!("Drop ProcessControlBlock: pid: {}", self.raw_pid(),);
+        self.__exit_signal();
+        self.sighand().detach_task_ref();
+        // The new ProcFS is dynamic: process directories are created on demand
+        // when accessed. Explicit registration/deregistration of processes is no
+        // longer needed.
+        if let Some(ppcb) = self.parent_pcb.read_irqsave().upgrade() {
+            ppcb.children
+                .write_irqsave()
+                .retain(|pid| *pid != self.raw_pid());
+        }
+
+        // log::debug!("Drop pid: {:?}", self.pid());
+        drop(irq_guard);
+    }
+}

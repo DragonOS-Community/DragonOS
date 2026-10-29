@@ -4,11 +4,11 @@ use log::error;
 use system_error::SystemError;
 
 use crate::libs::{
-    align::{page_align_down, page_align_up},
+    align::page_align_down,
     spinlock::{SpinLock, SpinLockGuard},
 };
 
-use super::{PhysAddr, PhysMemoryArea};
+use super::{MemoryManagementArch, PhysAddr, PhysMemoryArea};
 
 pub const INITIAL_MEMORY_REGIONS_NUM: usize = 128;
 
@@ -278,16 +278,33 @@ impl MemBlockManager {
         base: PhysAddr,
         size: usize,
     ) -> Result<(usize, usize), SystemError> {
-        let end = base + size;
-
-        let mut idx = 0;
-
-        let mut start_index = 0;
-        let mut end_index = 0;
-
+        let end = base.data().checked_add(size).ok_or(SystemError::EINVAL)?;
         if size == 0 {
             return Ok((0, 0));
         }
+        // A boundary strictly inside an existing region needs one new slot.
+        // Prepay both splits under the same lock, before changing any region;
+        // otherwise the fixed array could overflow after a partial mutation.
+        let mut splits = 0usize;
+        for area in &inner.initial_memory_regions[..inner.initial_memory_regions_num] {
+            let region_start = area.base.data();
+            let region_end = region_start
+                .checked_add(area.size)
+                .ok_or(SystemError::EINVAL)?;
+            splits += usize::from(region_start < base.data() && base.data() < region_end);
+            splits += usize::from(region_start < end && end < region_end);
+        }
+        if inner
+            .initial_memory_regions_num
+            .checked_add(splits)
+            .is_none_or(|count| count > INITIAL_MEMORY_REGIONS_NUM)
+        {
+            return Err(SystemError::ENOMEM);
+        }
+        let end = PhysAddr::new(end);
+        let mut idx = 0;
+        let mut start_index = 0;
+        let mut end_index = 0;
 
         while idx < inner.initial_memory_regions_num {
             let range_base = inner.initial_memory_regions[idx].base;
@@ -368,11 +385,52 @@ impl MemBlockManager {
         set: bool,
         flags: MemoryAreaAttr,
     ) -> Result<(), SystemError> {
+        base.data().checked_add(size).ok_or(SystemError::EINVAL)?;
+        if size == 0 {
+            return Ok(());
+        }
         let rsvd_base = PhysAddr::new(page_align_down(base.data()));
-        size = page_align_up(size + base.data() - rsvd_base.data());
+        size = size
+            .checked_add(base.data() - rsvd_base.data())
+            .and_then(|bytes| bytes.checked_add(crate::arch::MMArch::PAGE_SIZE - 1))
+            .ok_or(SystemError::EINVAL)?
+            & !(crate::arch::MMArch::PAGE_SIZE - 1);
         base = rsvd_base;
 
+        let end = base.data().checked_add(size).ok_or(SystemError::EINVAL)?;
         let mut inner = self.inner.lock();
+        let mut changed_range: Option<(usize, usize)> = None;
+        for area in &inner.initial_memory_regions[..inner.initial_memory_regions_num] {
+            let area_end = area
+                .base
+                .data()
+                .checked_add(area.size)
+                .ok_or(SystemError::EINVAL)?;
+            if area.base.data() < end && base.data() < area_end {
+                let needs_change = if set {
+                    !area.flags.contains(flags)
+                } else {
+                    area.flags.intersects(flags)
+                };
+                if needs_change {
+                    let first = base.data().max(area.base.data());
+                    let last = end.min(area_end);
+                    match &mut changed_range {
+                        Some((_, previous_end)) => *previous_end = last,
+                        None => changed_range = Some((first, last)),
+                    }
+                }
+            }
+        }
+        // Only split the envelope that needs changed flags. An already
+        // satisfied prefix/suffix requires no new boundary, even when the
+        // fixed region table is full. Existing flags within the envelope are
+        // changed idempotently and physical holes are never added as RAM.
+        let Some((first, last)) = changed_range else {
+            return Ok(());
+        };
+        base = PhysAddr::new(first);
+        size = last - first;
         let (start_index, end_index) = self.isolate_range(&mut inner, base, size)?;
         for i in start_index..end_index {
             if set {
@@ -537,4 +595,146 @@ bitflags! {
         /// Memory is reserved
         const RESERVED = (1 << 4);
     }
+}
+
+/// Real fixed-region reservation boundaries; this private manager never changes
+/// the live boot map. Static storage also avoids a large kernel-stack array.
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn reservation_selftest() -> bool {
+    static MANAGER: MemBlockManager = MemBlockManager::new();
+    static SERIAL: SpinLock<()> = SpinLock::new(());
+    let _serial = SERIAL.lock();
+    let page = crate::arch::MMArch::PAGE_SIZE;
+    let reset = |count: usize| {
+        let mut inner = MANAGER.inner.lock();
+        inner.initial_memory_regions_num = count;
+        for (index, area) in inner.initial_memory_regions[..count].iter_mut().enumerate() {
+            *area = PhysMemoryArea::new(
+                PhysAddr::new(index * 8 * page),
+                4 * page,
+                MemoryAreaAttr::empty(),
+            );
+        }
+    };
+    let unchanged = |first_flags: MemoryAreaAttr, second_flags: MemoryAreaAttr| {
+        let inner = MANAGER.inner.lock();
+        inner.initial_memory_regions_num == INITIAL_MEMORY_REGIONS_NUM
+            && inner
+                .initial_memory_regions
+                .iter()
+                .enumerate()
+                .all(|(index, area)| {
+                    area.base.data() == index * 8 * page
+                        && area.size == 4 * page
+                        && area.flags
+                            == match index {
+                                0 => first_flags,
+                                1 => second_flags,
+                                _ => MemoryAreaAttr::empty(),
+                            }
+                })
+    };
+    reset(INITIAL_MEMORY_REGIONS_NUM);
+    // One or two new boundary slots must be refused before the first split.
+    for (start, size) in [(0, page), (page, 3 * page), (page, page)] {
+        if MANAGER.reserve_block(PhysAddr::new(start), size) != Err(SystemError::ENOMEM)
+            || !unchanged(MemoryAreaAttr::empty(), MemoryAreaAttr::empty())
+        {
+            return false;
+        }
+    }
+    for (start, size) in [(usize::MAX - page + 1, page), (0, usize::MAX)] {
+        if MANAGER.reserve_block(PhysAddr::new(start), size) != Err(SystemError::EINVAL)
+            || !unchanged(MemoryAreaAttr::empty(), MemoryAreaAttr::empty())
+        {
+            return false;
+        }
+    }
+    if MANAGER.reserve_block(PhysAddr::new(1), 0).is_err()
+        || !unchanged(MemoryAreaAttr::empty(), MemoryAreaAttr::empty())
+    {
+        return false;
+    }
+    MANAGER.inner.lock().initial_memory_regions[0].flags = MemoryAreaAttr::RESERVED;
+    if MANAGER.reserve_block(PhysAddr::new(page), page).is_err()
+        || MANAGER.reserve_block(PhysAddr::new(1), 0).is_err()
+        || !unchanged(MemoryAreaAttr::RESERVED, MemoryAreaAttr::empty())
+        || MANAGER.mark_nomap(PhysAddr::new(page), page) != Err(SystemError::ENOMEM)
+        || !unchanged(MemoryAreaAttr::RESERVED, MemoryAreaAttr::empty())
+    {
+        return false;
+    }
+    // Already satisfied first/last regions must not consume boundary slots.
+    // Preserve NOMAP while setting and clearing RESERVED through the real
+    // common flag operation, including gaps between the affected regions.
+    reset(INITIAL_MEMORY_REGIONS_NUM);
+    MANAGER.inner.lock().initial_memory_regions[0].flags =
+        MemoryAreaAttr::RESERVED | MemoryAreaAttr::NOMAP;
+    if MANAGER
+        .reserve_block(PhysAddr::new(page), 11 * page)
+        .is_err()
+        || !unchanged(
+            MemoryAreaAttr::RESERVED | MemoryAreaAttr::NOMAP,
+            MemoryAreaAttr::RESERVED,
+        )
+    {
+        return false;
+    }
+    reset(INITIAL_MEMORY_REGIONS_NUM);
+    MANAGER.inner.lock().initial_memory_regions[1].flags =
+        MemoryAreaAttr::RESERVED | MemoryAreaAttr::NOMAP;
+    if MANAGER.reserve_block(PhysAddr::new(0), 9 * page).is_err()
+        || !unchanged(
+            MemoryAreaAttr::RESERVED,
+            MemoryAreaAttr::RESERVED | MemoryAreaAttr::NOMAP,
+        )
+    {
+        return false;
+    }
+    for trailing_satisfied in [false, true] {
+        reset(INITIAL_MEMORY_REGIONS_NUM);
+        {
+            let mut inner = MANAGER.inner.lock();
+            inner.initial_memory_regions[0].flags = MemoryAreaAttr::NOMAP;
+            inner.initial_memory_regions[1].flags = MemoryAreaAttr::NOMAP;
+            inner.initial_memory_regions[usize::from(!trailing_satisfied)].flags |=
+                MemoryAreaAttr::RESERVED;
+        }
+        let (base, size) = if trailing_satisfied {
+            (0, 9 * page)
+        } else {
+            (page, 11 * page)
+        };
+        if MANAGER
+            .set_or_clear_flags(PhysAddr::new(base), size, false, MemoryAreaAttr::RESERVED)
+            .is_err()
+            || !unchanged(MemoryAreaAttr::NOMAP, MemoryAreaAttr::NOMAP)
+        {
+            return false;
+        }
+    }
+    // Exactly two spare slots permit both splits. A later overlapping reserve
+    // is idempotent and must preserve a pre-existing non-RAM-eligibility flag.
+    reset(INITIAL_MEMORY_REGIONS_NUM - 2);
+    if MANAGER.mark_nomap(PhysAddr::new(page), page).is_err()
+        || MANAGER.reserve_block(PhysAddr::new(page), page).is_err()
+        || MANAGER.reserve_block(PhysAddr::new(page), page).is_err()
+        || MANAGER
+            .reserve_block(PhysAddr::new(4 * page), 4 * page)
+            .is_err()
+    {
+        return false;
+    }
+    let inner = MANAGER.inner.lock();
+    inner.initial_memory_regions_num == INITIAL_MEMORY_REGIONS_NUM
+        && inner.initial_memory_regions[0].base.data() == 0
+        && inner.initial_memory_regions[0].size == page
+        && inner.initial_memory_regions[0].flags.is_empty()
+        && inner.initial_memory_regions[1].base.data() == page
+        && inner.initial_memory_regions[1].size == page
+        && inner.initial_memory_regions[1].flags
+            == (MemoryAreaAttr::NOMAP | MemoryAreaAttr::RESERVED)
+        && inner.initial_memory_regions[2].base.data() == 2 * page
+        && inner.initial_memory_regions[2].size == 2 * page
+        && inner.initial_memory_regions[2].flags.is_empty()
 }

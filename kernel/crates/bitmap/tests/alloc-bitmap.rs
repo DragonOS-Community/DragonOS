@@ -3,6 +3,20 @@
 use bitmap::{traits::BitMapOps, AllocBitmap};
 
 #[test]
+fn test_try_birth_and_clone_preserve_partial_word_and_independence() {
+    let mut original = AllocBitmap::try_new(65).unwrap();
+    original.set(0, true);
+    original.set(64, true);
+    let mut copy = original.try_clone().unwrap();
+    assert_eq!(copy.len(), 65);
+    assert_eq!(copy.data(), original.data());
+    copy.set(64, false);
+    assert_eq!(original.get(64), Some(true));
+    assert_eq!(copy.get(64), Some(false));
+    assert_eq!(AllocBitmap::try_new(0).unwrap().len(), 0);
+}
+
+#[test]
 fn test_alloc_bitmap_as_bytes_matches_bitmap_payload() {
     let mut bitmap = AllocBitmap::new(128);
     bitmap.set(0, true);

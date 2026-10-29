@@ -21,9 +21,9 @@ use crate::{
     sched::{request_task_migration, schedule, SchedMode},
     smp::{
         core::smp_get_processor_id,
-        cpu::{smp_cpu_manager, ProcessorId},
+        cpu::{smp_cpu_manager, CpuHpState, ProcessorId},
     },
-    time::{sleep::nanosleep, PosixTimeSpec},
+    time::sleep::busy_wait_us,
 };
 use core::{
     arch::asm,
@@ -76,7 +76,8 @@ pub(crate) fn machine_restart(_cmd: Option<&str>) -> ! {
     debug!("machine restart");
 
     if !(unsafe { REBOOT_FORCE }) {
-        machine_shutdown();
+        let _text_patch_guard = machine_shutdown();
+        emergency_restart()
     }
 
     emergency_restart()
@@ -86,15 +87,16 @@ pub(crate) fn machine_restart(_cmd: Option<&str>) -> ! {
 ///
 /// 执行系统停止操作
 pub(crate) fn machine_halt() -> ! {
-    machine_shutdown();
+    let _text_patch_guard = machine_shutdown();
 
     stop_this_cpu();
 }
 
 // 参考: https://elixir.bootlin.com/linux/v6.6/source/arch/x86/kernel/reboot.c#L782
 pub(crate) fn machine_power_off() -> ! {
+    let mut text_patch_guard = None;
     if !(unsafe { REBOOT_FORCE }) {
-        machine_shutdown();
+        text_patch_guard = Some(machine_shutdown());
     }
 
     if let Err(e) = do_machine_power_off() {
@@ -108,6 +110,7 @@ pub(crate) fn machine_power_off() -> ! {
         );
     }
 
+    let _text_patch_guard = text_patch_guard;
     stop_this_cpu();
 }
 
@@ -116,8 +119,11 @@ pub(crate) fn machine_power_off() -> ! {
 /// 执行系统关闭操作
 ///
 /// 参考：https://code.dragonos.org.cn/xref/linux-6.1.9/arch/x86/kernel/reboot.c#675
-fn machine_shutdown() {
+fn machine_shutdown() -> crate::libs::mutex::MutexGuard<'static, ()> {
     debug!("machine shutdown");
+    // Close the patch gate and wait for an in-flight transaction before IRQs
+    // and peer CPUs are stopped. Keep this guard until reset/halt.
+    let text_patch_guard = crate::text_patch::quiesce();
     // 在禁用本地APIC之前禁用IO APIC
     IOAPIC().lock_irqsave().disable_all();
 
@@ -131,6 +137,7 @@ fn machine_shutdown() {
 
     // 禁用HPET
     hpet_disable();
+    text_patch_guard
 }
 
 /// Migrate the current shutdown task to the reboot CPU.
@@ -166,44 +173,71 @@ pub(crate) fn migrate_to_reboot_cpu() {
     }
 }
 
-fn stop_other_cpus() {
-    if STOPPING_CPUS.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
+/// True only when peers have completed terminal teardown. Kexec must not reuse
+/// RAM after a timeout, unlike a restart that can still attempt hardware reset.
+pub(crate) fn stop_other_cpus() -> bool {
     let this_cpu = smp_get_processor_id();
     let mut targets = CpuMask::new();
 
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
-        if cpu != this_cpu && smp_cpu_manager().is_online_cpu(cpu) {
+        if cpu != this_cpu && cpu_needs_stop(smp_cpu_manager().cpuhp_state(cpu).state()) {
             targets.set(cpu, true);
         }
     }
 
-    if targets.is_empty() {
-        return;
+    if STOPPING_CPUS.swap(true, Ordering::SeqCst) || targets.is_empty() {
+        return targets.is_empty();
     }
 
-    crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Other);
+    for cpu in targets.iter_cpu() {
+        crate::arch::interrupt::ipi::send_ipi(IpiKind::StopCpu, IpiTarget::Specified(cpu));
+    }
 
     for _ in 0..STOP_OTHER_CPUS_TIMEOUT_LOOPS {
         if targets
             .iter_cpu()
-            .all(|cpu| !smp_cpu_manager().is_online_cpu(cpu))
+            .all(|cpu| !cpu_needs_stop(smp_cpu_manager().cpuhp_state(cpu).state()))
         {
-            return;
+            return true;
         }
         spin_loop();
     }
 
     for cpu in targets.iter_cpu() {
-        if smp_cpu_manager().is_online_cpu(cpu) {
+        if cpu_needs_stop(smp_cpu_manager().cpuhp_state(cpu).state()) {
             log::warn!(
-                "stop_other_cpus: CPU {} did not stop before timeout",
-                cpu.data()
+                "stop_other_cpus: CPU {} did not reach Dead before timeout (state: {:?})",
+                cpu.data(),
+                smp_cpu_manager().cpuhp_state(cpu).state()
             );
         }
     }
+    false
+}
+
+fn cpu_needs_stop(state: CpuHpState) -> bool {
+    matches!(
+        state,
+        CpuHpState::Online | CpuHpState::Starting | CpuHpState::Dying
+    )
+}
+
+pub(crate) fn run_kvm_shutdown_selftests() -> Result<(), &'static str> {
+    for state in [CpuHpState::Online, CpuHpState::Starting, CpuHpState::Dying] {
+        if !cpu_needs_stop(state) {
+            return Err("active CPU accepted as stopped before RAM reuse");
+        }
+    }
+    for state in [
+        CpuHpState::Offline,
+        CpuHpState::Dead,
+        CpuHpState::FailedParked,
+    ] {
+        if cpu_needs_stop(state) {
+            return Err("terminal CPU teardown not accepted");
+        }
+    }
+    Ok(())
 }
 
 /// # 功能
@@ -244,18 +278,10 @@ fn emergency_restart() -> ! {
                 // 重试10次键盘重启，每次等待50微妙
                 for _ in 0..10 {
                     kb_wait();
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50_000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                     // 发送0xfe到键盘控制器以触发重启
                     unsafe { CurrentPortIOArch::out8(0x64, 0xfe) };
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50_000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                 }
 
                 // 如果这是第一次尝试键盘重启，且原始重启类型是ACPI，则再次尝试ACPI重启
@@ -301,20 +327,12 @@ fn emergency_restart() -> ! {
                     unsafe {
                         CurrentPortIOArch::out8(0xcf9, cf9 | 2);
                     }
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                     // 执行实际的重启
                     unsafe {
                         CurrentPortIOArch::out8(0xcf9, cf9 | reboot_code);
                     }
-                    let sleep_time = PosixTimeSpec {
-                        tv_sec: 0,
-                        tv_nsec: 50_000, // 50000ns
-                    };
-                    let _ = nanosleep(sleep_time);
+                    busy_wait_us(50);
                 }
                 // CF9重启失败后，转到三重重启方式
                 reboot_type = RebootType::Triple;
@@ -345,11 +363,7 @@ fn kb_wait() {
         }
     }
     // 延迟2微妙，避免过度占用CPU
-    let sleep_time = PosixTimeSpec {
-        tv_sec: 0,
-        tv_nsec: 2_000, // 2000ns
-    };
-    let _ = nanosleep(sleep_time);
+    busy_wait_us(2);
 }
 
 /// # BIOS重启

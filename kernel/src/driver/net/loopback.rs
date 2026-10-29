@@ -1,3 +1,4 @@
+use super::PacketBuffer;
 use crate::arch::rand::rand;
 use crate::driver::base::class::Class;
 use crate::driver::base::device::bus::Bus;
@@ -11,18 +12,16 @@ use crate::driver::net::types::InterfaceFlags;
 use crate::driver::net::{napi::napi_schedule, napi::NapiStruct};
 use crate::filesystem::kernfs::KernFSInode;
 use crate::init::initcall::INITCALL_DEVICE;
+use crate::libs::prepared_queue::{Node, Queue};
 use crate::libs::rwsem::{RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
-use crate::net::generate_iface_id;
+use crate::net::LOOPBACK_IFINDEX;
 use crate::process::namespace::net_namespace::INIT_NET_NAMESPACE;
 use crate::time::Instant;
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::fmt::Debug;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
 use smoltcp::wire::HardwareAddress;
 use smoltcp::{
     phy::{self},
@@ -35,14 +34,25 @@ use crate::libs::once::Once;
 
 use super::{register_netdevice, NetDeivceState, NetDeviceCommonData, Operstate};
 
-use super::{Iface, IfaceCommon};
+use super::{Iface, IfaceCommon, MtuBounds};
 
 const DEVICE_NAME: &str = "loopback";
+/// Linux's userspace-visible loopback MTU and packet-buffer capacity.
+const LOOPBACK_MTU: usize = 64 * 1024;
+/// IPv4 requires room for its minimum header. smoltcp also uses this lower
+/// bound for its shared IPv4/IPv6 MTU, independently of Linux's administrative
+/// loopback MTU range.
+const LOOPBACK_STACK_MIN_MTU: usize = 68;
+/// smoltcp currently shares one MTU across IPv4 and IPv6. Keep its projection
+/// within IPv4's 16-bit total-length field while the device retains Linux's
+/// 64 KiB administrative MTU and packet-buffer capacity.
+const LOOPBACK_STACK_MTU: usize = u16::MAX as usize;
 
 /// ## 环回接收令牌
 /// 用于储存lo网卡接收到的数据
 pub struct LoopbackRxToken {
-    buffer: Vec<u8>,
+    buffer: PacketBuffer,
+    driver: LoopbackDriver,
 }
 
 impl phy::RxToken for LoopbackRxToken {
@@ -59,6 +69,13 @@ impl phy::RxToken for LoopbackRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_ip_to_packet_sockets(
+                &iface,
+                &self.buffer,
+                crate::net::socket::packet::PacketType::Loopback,
+            );
+        }
         f(self.buffer.as_slice())
     }
 }
@@ -67,137 +84,118 @@ impl phy::RxToken for LoopbackRxToken {
 /// 返回驱动用于操作lo设备
 pub struct LoopbackTxToken {
     driver: LoopbackDriver,
+    prepared: Option<LoopbackReservation>,
 }
 
 impl phy::TxToken for LoopbackTxToken {
-    /// ## 实现TxToken的consume函数
-    /// 向lo的队列推入待发送的数据报，实现环回
-    ///
-    /// ## 参数
-    /// - self
-    /// - len：数据包的长度
-    /// - f：接受一个可变的 u8 切片，并返回类型 `R` 的结果。
-    ///
-    /// ## 返回值
-    /// 返回f对数据包操纵的结果
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn prepare_buffer(&mut self, len: usize) -> Result<(), phy::TxEgressError> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes == len)
+        {
+            return Ok(());
+        }
+        // Publish a replacement only after preparation succeeds. On failure
+        // the earlier exact-size reservation remains valid for its old frame.
+        let mut prepared = self
+            .driver
+            .reserve_slot(len)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        let mut buffer =
+            PacketBuffer::try_with_capacity(len).map_err(|_| phy::TxEgressError::Exhausted)?;
+        buffer
+            .resize(len, 0)
+            .map_err(|_| phy::TxEgressError::Exhausted)?;
+        *prepared.node.as_mut().unwrap().value_mut() = buffer;
+        self.prepared = Some(prepared);
+        Ok(())
+    }
+
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0; len];
+        let mut prepared = self
+            .prepared
+            .take()
+            .expect("loopback TX requires exact preparation");
+        assert_eq!(prepared.bytes, len);
+        let buffer = prepared.node.as_mut().unwrap().value_mut();
         let result = f(buffer.as_mut_slice());
-        {
-            let mut device = self.driver.inner.lock();
-            device.loopback_transmit(buffer);
-        }
-
-        // Linux 语义：lo 发送应尽快在本地“收到”并分发给 socket。
-        // 优先走 NAPI schedule（bounded work），避免唤醒 netns 线程去做全量扫描。
         if let Some(iface) = self.driver.iface() {
-            if let Some(napi) = iface.napi_struct() {
-                napi_schedule(napi);
-            } else if let Some(netns) = iface.common().net_namespace() {
-                // 兼容兜底：若未配置 NAPI，则仍唤醒 netns 线程推进一次 poll。
-                netns.wakeup_poll_thread();
-            }
+            crate::net::socket::packet::deliver_ip_to_packet_sockets(
+                &iface,
+                buffer,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
         }
-        // debug!("lo transmit!");
+        let _ = prepared.commit();
         result
     }
 }
 
+const LOOPBACK_QUEUE_FRAMES: usize = 1024;
+const LOOPBACK_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Default)]
-/// ## Loopback设备
-/// 成员是一个队列，用来存放接受到的数据包。
-/// 当使用lo发送数据包时，不会把数据包传到link层，而是直接发送到该队列，实现环回。
 pub struct Loopback {
-    //回环设备的缓冲区,接受的数据包会存放在这里，发送的数据包也会发送到这里，实现环回
-    queue: VecDeque<Vec<u8>>,
+    queue: Queue<PacketBuffer>,
+    queued_bytes: usize,
+    reserved_frames: usize,
+    reserved_bytes: usize,
 }
 
 impl Loopback {
-    /// ## Loopback处理接受到的数据包函数
-    /// Loopback接受到数据后会调用这个函数来弹出接收的数据，返回给协议栈
-    ///
-    /// ## 参数
-    /// - &mut self ：自身可变引用
-    ///
-    /// ## 返回值
-    /// - queue的头部数据包
-    pub fn loopback_receive(&mut self) -> Vec<u8> {
-        let buffer = self.queue.pop_front();
-        match buffer {
-            Some(buffer) => {
-                // log::debug!(
-                //     "lo receive: {} bytes, remaining_queue_len={}, self_ptr={:p}",
-                //     buffer.len(),
-                //     self.queue.len(),
-                //     self
-                // );
-                return buffer;
-            }
-            None => {
-                if !self.queue.is_empty() {
-                    log::warn!("lo receive: queue not empty but pop_front returned None!");
-                }
-                return Vec::new();
-            }
+    fn loopback_receive(&mut self) -> Option<PacketBuffer> {
+        let node = self.queue.pop_node()?;
+        self.queued_bytes -= node.value().capacity();
+        Some(node.into_value())
+    }
+}
+
+struct LoopbackReservation {
+    driver: LoopbackDriver,
+    node: Option<Box<Node<PacketBuffer>>>,
+    bytes: usize,
+}
+
+impl LoopbackReservation {
+    fn commit(mut self) -> Result<(), SystemError> {
+        // An MTU change invalidates emission but never its prepared resources.
+        self.driver
+            .validate_frame_len(self.node.as_ref().unwrap().value().len())?;
+        debug_assert_eq!(self.node.as_ref().unwrap().value().capacity(), self.bytes);
+        let node = self.node.take().unwrap();
+        {
+            let mut inner = self.driver.inner.lock();
+            inner.reserved_frames -= 1;
+            inner.reserved_bytes -= self.bytes;
+            inner.queued_bytes += self.bytes;
+            inner.queue.push_node(node);
         }
-    }
-    /// ## Loopback发送数据包的函数
-    /// Loopback发送数据包给自己的接收队列，实现环回
-    ///
-    /// ## 参数
-    /// - &mut self：自身可变引用
-    /// - buffer：需要发送的数据包
-    pub fn loopback_transmit(&mut self, buffer: Vec<u8>) {
-        // log::debug!(
-        //     "lo transmit: {} bytes, queue_len={}, self_ptr={:p}",
-        //     buffer.len(),
-        //     self.queue.len(),
-        //     self
-        // );
-        self.queue.push_back(buffer);
+        self.driver.notify_rx();
+        Ok(())
     }
 }
 
-/// ## driver的包裹器
-/// 为实现获得不可变引用的Interface的内部可变性，故为Driver提供UnsafeCell包裹器
-///
-/// 参考virtio_net.rs
-struct LoopbackDriverWapper(UnsafeCell<LoopbackDriver>);
-unsafe impl Send for LoopbackDriverWapper {}
-unsafe impl Sync for LoopbackDriverWapper {}
-
-/// ## deref 方法返回一个指向 `LoopbackDriver` 的引用。
-impl Deref for LoopbackDriverWapper {
-    type Target = LoopbackDriver;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.0.get() }
-    }
-}
-/// ## `deref_mut` 方法返回一个指向可变 `LoopbackDriver` 的引用。
-impl DerefMut for LoopbackDriverWapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-impl LoopbackDriverWapper {
-    /// ## force_get_mut返回一个指向可变 `LoopbackDriver` 的引用。
-    #[allow(clippy::mut_from_ref)]
-    #[allow(clippy::mut_from_ref)]
-    fn force_get_mut(&self) -> &mut LoopbackDriver {
-        unsafe { &mut *self.0.get() }
+impl Drop for LoopbackReservation {
+    fn drop(&mut self) {
+        if self.node.is_some() {
+            let mut inner = self.driver.inner.lock();
+            inner.reserved_frames -= 1;
+            inner.reserved_bytes -= self.bytes;
+        }
     }
 }
 
 /// ## Loopback驱动
 /// 负责操作Loopback设备实现基本的网卡功能
+#[derive(Clone)]
 pub struct LoopbackDriver {
     pub inner: Arc<SpinLock<Loopback>>,
     /// 指向所属网络接口的弱引用，用于唤醒 netns 轮询线程
-    iface: SpinLock<Option<Weak<dyn Iface>>>,
+    iface: Arc<SpinLock<Option<Weak<dyn Iface>>>>,
 }
 
 impl Default for LoopbackDriver {
@@ -206,16 +204,7 @@ impl Default for LoopbackDriver {
         let inner = Arc::new(SpinLock::new(Loopback::default()));
         LoopbackDriver {
             inner,
-            iface: SpinLock::new(None),
-        }
-    }
-}
-
-impl Clone for LoopbackDriver {
-    fn clone(&self) -> Self {
-        LoopbackDriver {
-            inner: self.inner.clone(),
-            iface: SpinLock::new(self.iface.lock().clone()),
+            iface: Arc::new(SpinLock::new(None)),
         }
     }
 }
@@ -230,10 +219,11 @@ impl phy::Device for LoopbackDriver {
     where
         Self: 'a;
     /// ## 返回设备的物理层特性。
-    /// lo设备的最大传输单元为65535，最大突发大小为1，传输介质默认为Ethernet
+    /// smoltcp 的共享 IPv4/IPv6 MTU 能力使用 IPv4 可表示上限；
+    /// Linux 可见的 64 KiB loopback MTU 由 `LoopbackInterface` 单独公布。
     fn capabilities(&self) -> phy::DeviceCapabilities {
         let mut result = phy::DeviceCapabilities::default();
-        result.max_transmission_unit = 65535;
+        result.max_transmission_unit = LOOPBACK_STACK_MTU;
         result.max_burst_size = Some(1);
         result.medium = smoltcp::phy::Medium::Ip;
         return result;
@@ -252,26 +242,17 @@ impl phy::Device for LoopbackDriver {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        loop {
-            let buffer = self.inner.lock().loopback_receive();
-            // receive 队列为空，返回 None 以通知上层没有可以 receive 的包
-            if buffer.is_empty() {
-                return None;
-            }
+        let buffer = self.inner.lock().loopback_receive()?;
 
-            if let Some(iface) = self.iface() {
-                if iface.should_drop_rx_packet(&buffer) {
-                    // Drop this packet and try the next one in the queue.
-                    continue;
-                }
-            }
-
-            let rx = LoopbackRxToken { buffer };
-            let tx = LoopbackTxToken {
-                driver: self.clone(),
-            };
-            return Some((rx, tx));
-        }
+        let rx = LoopbackRxToken {
+            buffer,
+            driver: self.clone(),
+        };
+        let tx = LoopbackTxToken {
+            driver: self.clone(),
+            prepared: None,
+        };
+        Some((rx, tx))
     }
     /// ## Loopback驱动处理发送数据包事件
     /// Loopback驱动在需要发送数据时会调用这个函数来获取一个发送令牌。
@@ -285,6 +266,7 @@ impl phy::Device for LoopbackDriver {
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(LoopbackTxToken {
             driver: self.clone(),
+            prepared: None,
         })
     }
 }
@@ -301,6 +283,62 @@ impl LoopbackDriver {
     pub fn has_pending_rx(&self) -> bool {
         !self.inner.lock().queue.is_empty()
     }
+
+    fn packet_len_limit(&self) -> usize {
+        self.iface().map_or(LOOPBACK_MTU, |iface| iface.mtu())
+    }
+
+    fn validate_frame_len(&self, len: usize) -> Result<(), SystemError> {
+        if len > self.packet_len_limit() {
+            return Err(SystemError::EMSGSIZE);
+        }
+        Ok(())
+    }
+
+    fn reserve_slot(&self, len: usize) -> Result<LoopbackReservation, SystemError> {
+        self.reserve_storage(len, len)
+    }
+
+    fn reserve_storage(
+        &self,
+        wire_len: usize,
+        bytes: usize,
+    ) -> Result<LoopbackReservation, SystemError> {
+        self.validate_frame_len(wire_len)?;
+        let node = Node::try_new(PacketBuffer::new())?;
+        let mut inner = self.inner.lock();
+        if inner.queue.len() + inner.reserved_frames >= LOOPBACK_QUEUE_FRAMES
+            || bytes
+                > LOOPBACK_QUEUE_BYTES.saturating_sub(inner.queued_bytes + inner.reserved_bytes)
+        {
+            return Err(SystemError::ENOBUFS);
+        }
+        inner.reserved_frames += 1;
+        inner.reserved_bytes += bytes;
+        drop(inner);
+        Ok(LoopbackReservation {
+            driver: self.clone(),
+            node: Some(node),
+            bytes,
+        })
+    }
+
+    fn notify_rx(&self) {
+        if let Some(iface) = self.iface() {
+            if let Some(napi) = iface.napi_struct() {
+                napi_schedule(napi);
+            } else if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+        }
+    }
+
+    pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        self.validate_frame_len(frame.len())?;
+        let mut prepared = self.reserve_slot(frame.len())?;
+        *prepared.node.as_mut().unwrap().value_mut() = PacketBuffer::try_from_slice(frame)?;
+        prepared.commit()
+    }
 }
 
 /// ## LoopbackInterface结构
@@ -308,7 +346,7 @@ impl LoopbackDriver {
 #[cast_to([sync] Iface)]
 #[cast_to([sync] Device)]
 pub struct LoopbackInterface {
-    driver: LoopbackDriverWapper,
+    driver: LoopbackDriver,
     common: IfaceCommon,
     inner: SpinLock<InnerLoopbackInterface>,
     locked_kobj_state: LockedKObjectState,
@@ -332,17 +370,23 @@ impl LoopbackInterface {
     pub const DEVICE_NAME: &str = "lo";
 
     /// ## `new` 是一个公共函数，用于创建一个新的 `LoopbackInterface` 实例。
-    /// 生成一个新的接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
+    /// 使用 Linux 约定的 loopback 接口 ID。创建一个新的接口配置，设置其硬件地址和随机种子，使用接口配置和驱动器创建一个新的 `smoltcp::iface::Interface` 实例。
     /// 设置接口的 IP 地址为 127.0.0.1。
-    /// 创建一个新的 `LoopbackDriverWapper` 实例，包装驱动器。
+    /// Saves a cloneable driver handle; the underlying queue and the interface
+    /// back-reference are protected by a shared lock.
     /// 创建一个新的 `LoopbackInterface` 实例，包含驱动器、接口 ID、接口和名称，并将其封装在一个 `Arc` 中。
     /// ## 参数
     /// - `driver`：一个 `LoopbackDriver` 实例，用于驱动网络环回操作。
     ///
     /// ## 返回值
     /// 返回一个 `Arc<Self>`，即一个指向新创建的 `LoopbackInterface` 实例的智能指针。
-    pub fn new(mut driver: LoopbackDriver) -> Arc<Self> {
-        let iface_id = generate_iface_id();
+    pub fn new(driver: LoopbackDriver) -> Arc<Self> {
+        Self::new_with_ifindex(driver, LOOPBACK_IFINDEX)
+    }
+
+    /// 在指定网络命名空间中创建 loopback，使用给定的 per-netns ifindex（Linux 新 netns 中 lo 通常为 1）。
+    pub fn new_with_ifindex(mut driver: LoopbackDriver, ifindex: usize) -> Arc<Self> {
+        let iface_id = ifindex;
 
         // let hardware_addr = HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([
         //     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -353,9 +397,13 @@ impl LoopbackInterface {
         let mut iface_config = smoltcp::iface::Config::new(hardware_addr);
 
         iface_config.random_seed = rand() as u64;
+        iface_config.is_loopback = true;
 
-        let mut iface =
-            smoltcp::iface::Interface::new(iface_config, &mut driver, Instant::now().into());
+        let mut iface = crate::driver::net::packet_storage::new_interface(
+            iface_config,
+            &mut driver,
+            Instant::now().into(),
+        );
 
         iface.set_any_ip(true);
 
@@ -372,36 +420,19 @@ impl LoopbackInterface {
             ip_addrs.push(cidr6).expect("Push ipCidr failed: full");
         });
 
-        iface.routes_mut().update(|routes_map| {
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr,
-                    via_router: addr,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default ipv4 route failed: full");
-
-            routes_map
-                .push(smoltcp::iface::Route {
-                    cidr: cidr6,
-                    via_router: addr6,
-                    preferred_until: None,
-                    expires_at: None,
-                })
-                .expect("Add default ipv6 route failed: full");
-        });
-
-        let flags = InterfaceFlags::LOOPBACK
-            | InterfaceFlags::UP
-            | InterfaceFlags::RUNNING
-            | InterfaceFlags::LOWER_UP;
+        // Like Linux's gen_lo_setup(), construction records only the
+        // device-intrinsic flag. Registration owns PRESENT, administrative
+        // policy owns UP, and user_visible_flags() derives runtime flags.
+        let flags = InterfaceFlags::LOOPBACK;
+        let mtu = LOOPBACK_MTU;
 
         let iface = Arc::new(LoopbackInterface {
-            driver: LoopbackDriverWapper(UnsafeCell::new(driver)),
+            driver,
             common: IfaceCommon::new(
                 iface_id,
                 super::types::InterfaceType::LOOPBACK,
+                Self::DEVICE_NAME.to_string(),
+                mtu,
                 flags,
                 iface,
             ),
@@ -415,10 +446,7 @@ impl LoopbackInterface {
 
         // 记录 iface 弱引用，用于 lo 发送时唤醒 netns 轮询线程
         let iface_dyn = iface.clone() as Arc<dyn Iface>;
-        iface
-            .driver
-            .force_get_mut()
-            .set_iface(Arc::downgrade(&iface_dyn));
+        iface.driver.set_iface(Arc::downgrade(&iface_dyn));
 
         // 设置 NAPI：让 loopback 也走 bounded poll（对齐 Linux）。
         let napi_struct = NapiStruct::new(iface.clone(), 10);
@@ -467,11 +495,11 @@ impl KObject for LoopbackInterface {
     }
 
     fn name(&self) -> String {
-        Self::DEVICE_NAME.to_string()
+        self.common.name()
     }
 
-    fn set_name(&self, _name: String) {
-        // do nothing
+    fn set_name(&self, name: String) {
+        self.common.set_name(name);
     }
 
     fn kobj_state(&self) -> RwSemReadGuard<'_, KObjectState> {
@@ -561,12 +589,16 @@ impl Device for LoopbackInterface {
 }
 
 impl Iface for LoopbackInterface {
+    fn destroy_on_netns_exit(&self) -> bool {
+        true
+    }
+
     fn common(&self) -> &IfaceCommon {
         &self.common
     }
 
     fn iface_name(&self) -> String {
-        Self::DEVICE_NAME.to_string()
+        self.common.name()
     }
 
     /// 由于lo网卡设备不是实际的物理设备，其mac地址需要手动设置为一个默认值，这里默认为00:00:00:00:00
@@ -580,18 +612,68 @@ impl Iface for LoopbackInterface {
         // 一次 `poll()` 的 egress 阶段可能会把新包重新塞回 lo 的本地接收队列。
         // 即使 smoltcp 没返回 `SocketStateChanged` / `poll_at == Now`，
         // 这些新包也需要立刻再 poll 一轮才能被当前线程吃掉。
-        let progressed = self.common.poll(self.driver.force_get_mut());
+        let mut driver = self.driver.clone();
+        let progressed = self.common.poll(&mut driver);
         progressed || self.driver.has_pending_rx()
     }
 
-    fn poll_napi(&self, budget: usize) -> bool {
+    fn poll_napi(&self, budget: usize) -> super::napi::NapiPollResult {
         // 与普通 poll 相同：若 egress 刚把包送回 lo 队列，则 NAPI 也必须继续自驱动。
-        let has_work_left = self.common.poll_napi(self.driver.force_get_mut(), budget);
-        has_work_left || self.driver.has_pending_rx()
+        let mut driver = self.driver.clone();
+        let mut result = self.common.poll_napi(&mut driver, budget);
+        result.poll_again |= self.driver.has_pending_rx();
+        result
     }
 
-    fn should_drop_rx_packet(&self, packet: &[u8]) -> bool {
-        self.common.should_drop_rx_packet(packet)
+    fn raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
+        if frame.len() < 14 {
+            return Err(SystemError::EINVAL);
+        }
+        self.driver.try_raw_transmit(&frame[14..])?;
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        Ok(())
+    }
+
+    fn raw_transmit_owned(&self, mut frame: PacketBuffer) -> Result<(), SystemError> {
+        let len = frame.len().checked_sub(14).ok_or(SystemError::EINVAL)?;
+        // Preserve the existing allocation while removing the synthetic
+        // Ethernet header. Residency is capacity, MTU validation is wire len.
+        let mut prepared = self.driver.reserve_storage(len, frame.capacity())?;
+        if let Some(iface) = self.driver.iface() {
+            crate::net::socket::packet::deliver_to_packet_sockets(
+                &iface,
+                &frame,
+                crate::net::socket::packet::PacketType::Outgoing,
+            );
+        }
+        frame.as_mut_slice().copy_within(14.., 0);
+        frame.truncate(len);
+        *prepared.node.as_mut().unwrap().value_mut() = frame;
+        prepared.commit()
+    }
+
+    fn route_and_send(
+        &self,
+        _next_hop: &smoltcp::wire::IpAddress,
+        ip_packet: &[u8],
+    ) -> Result<(), super::RouteSendError> {
+        if ip_packet.len() > self.mtu() {
+            return Err(SystemError::EMSGSIZE.into());
+        }
+        self.inject_local_ip_packet(
+            LOOPBACK_IFINDEX as u32,
+            self.mac(),
+            ip_packet,
+            false,
+            crate::driver::net::LocalPacketOrigin::LocalOutput,
+        )
+        .map_err(Into::into)
     }
 
     fn addr_assign_type(&self) -> u8 {
@@ -611,6 +693,10 @@ impl Iface for LoopbackInterface {
         self.inner().netdevice_common.state |= state;
     }
 
+    fn clear_net_state(&self, state: NetDeivceState) {
+        self.inner().netdevice_common.state &= !state;
+    }
+
     fn operstate(&self) -> Operstate {
         return self.inner().netdevice_common.operstate;
     }
@@ -620,21 +706,37 @@ impl Iface for LoopbackInterface {
     }
 
     fn mtu(&self) -> usize {
-        use smoltcp::phy::Device;
+        self.common.mtu()
+    }
 
-        self.driver
-            .force_get_mut()
-            .capabilities()
-            .max_transmission_unit
+    fn mtu_bounds(&self) -> MtuBounds {
+        MtuBounds {
+            // Match Linux's standard loopback MTU while retaining the
+            // protocol-safe smoltcp projection in stack_mtu().
+            min: 0,
+            max: LOOPBACK_MTU,
+        }
+    }
+
+    fn stack_mtu(&self, configured_mtu: usize) -> usize {
+        configured_mtu.clamp(LOOPBACK_STACK_MIN_MTU, LOOPBACK_STACK_MTU)
     }
 }
 
 pub fn generate_loopback_iface_default() -> Arc<LoopbackInterface> {
     let iface = LoopbackInterface::new(LoopbackDriver::default());
-    // 标识网络设备已经启动
-    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
 
-    register_netdevice(iface.clone()).expect("register lo device failed");
+    // Preserve DragonOS's initial-netns bootstrap policy explicitly. Fresh
+    // network namespaces follow Linux and leave lo administratively down;
+    // neither policy belongs in the device constructor.
+    let prepared = iface
+        .common
+        .prepare_configured_flags(InterfaceFlags::UP, InterfaceFlags::UP)
+        .expect("initial loopback flags must be representable");
+    iface.common.publish_configured_flags(prepared);
+    iface.set_net_state(NetDeivceState::__LINK_STATE_START);
+    iface.set_operstate(Operstate::IF_OPER_UP);
+    iface.common.open_tx();
 
     iface
 }
@@ -655,9 +757,9 @@ pub fn loopback_driver_init() {
 
         let iface = generate_loopback_iface_default();
 
-        INIT_NET_NAMESPACE.add_device(iface.clone());
+        register_netdevice(&INIT_NET_NAMESPACE, iface.clone())
+            .expect("register loopback in root netns");
         INIT_NET_NAMESPACE.set_loopback_iface(iface.clone());
-        iface.common.set_net_namespace(INIT_NET_NAMESPACE.clone());
     });
 }
 
@@ -667,4 +769,96 @@ pub fn loopback_init() -> Result<(), SystemError> {
     loopback_probe();
     log::debug!("Successfully init loopback device");
     return Ok(());
+}
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn buffer_selftest() -> bool {
+    fn run() -> Result<bool, SystemError> {
+        let mut driver = LoopbackDriver::default();
+        let mut tx = <LoopbackDriver as phy::Device>::transmit(
+            &mut driver,
+            smoltcp::time::Instant::from_millis(0),
+        )
+        .unwrap();
+        phy::TxToken::prepare_buffer(&mut tx, 17).map_err(|_| SystemError::ENOMEM)?;
+        phy::TxToken::prepare_buffer(&mut tx, 17).map_err(|_| SystemError::ENOMEM)?;
+        if phy::TxToken::prepare_buffer(&mut tx, usize::MAX).is_ok() {
+            return Ok(false);
+        }
+        {
+            let inner = driver.inner.lock();
+            if inner.reserved_frames != 1 || inner.reserved_bytes != 17 {
+                return Ok(false);
+            }
+        }
+        phy::TxToken::consume(tx, 17, |bytes| bytes.fill(0xa5));
+        let rx = driver
+            .inner
+            .lock()
+            .loopback_receive()
+            .ok_or(SystemError::EIO)?;
+        if rx.len() != 17 || rx.iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+        drop(rx);
+
+        if !super::local_output::native_output_selftest(&mut driver, true)? {
+            return Ok(false);
+        }
+        let native = driver
+            .inner
+            .lock()
+            .loopback_receive()
+            .ok_or(SystemError::EIO)?;
+        if native.len() != 64 || native[14..].iter().any(|byte| *byte != 0xa5) {
+            return Ok(false);
+        }
+        drop(native);
+        let mut reservations = Queue::new();
+        for _ in 0..LOOPBACK_QUEUE_FRAMES {
+            reservations.push_node(Node::try_new(driver.reserve_slot(1)?)?);
+        }
+        if !matches!(driver.reserve_slot(1), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        if !super::local_output::native_output_selftest(&mut driver, false)? {
+            return Ok(false);
+        }
+        drop(reservations.pop_node());
+        drop(driver.reserve_slot(1)?);
+        drop(reservations);
+        let mut reservations = Queue::new();
+        for _ in 0..LOOPBACK_QUEUE_BYTES / LOOPBACK_MTU {
+            reservations.push_node(Node::try_new(driver.reserve_slot(LOOPBACK_MTU)?)?);
+        }
+        if !matches!(driver.reserve_slot(1), Err(SystemError::ENOBUFS)) {
+            return Ok(false);
+        }
+        drop(reservations);
+        let iface = LoopbackInterface::new(driver.clone());
+        *iface.common.napi_struct.write() = Some(NapiStruct::new_disabled(iface.clone(), 10));
+        let mut frame = PacketBuffer::try_with_capacity(128)?;
+        frame.resize(17, 0)?;
+        frame[14..].copy_from_slice(b"own");
+        let pointer = frame.as_ptr();
+        iface.raw_transmit_owned(frame)?;
+        if driver.inner.lock().queued_bytes != 128 {
+            return Ok(false);
+        }
+        let frame = driver
+            .inner
+            .lock()
+            .loopback_receive()
+            .ok_or(SystemError::EIO)?;
+        if frame.as_slice() != b"own" || frame.as_ptr() != pointer || frame.capacity() != 128 {
+            return Ok(false);
+        }
+        drop(frame);
+        let inner = driver.inner.lock();
+        Ok(inner.queue.is_empty()
+            && inner.queued_bytes == 0
+            && inner.reserved_frames == 0
+            && inner.reserved_bytes == 0)
+    }
+    run().unwrap_or(false)
 }

@@ -1,13 +1,19 @@
+use crate::filesystem::fsnotify::{self, FsEvent};
+use crate::filesystem::vfs::mount::{MountFS, MountFSInode};
+use crate::filesystem::vfs::permission::check_inode_permission;
 use crate::filesystem::vfs::permission::PermissionMask;
 use crate::filesystem::vfs::syscall::AtFlags;
 use crate::filesystem::vfs::utils::rsplit_path;
 use crate::filesystem::vfs::utils::user_path_at;
+use crate::filesystem::vfs::utils::ResolvedPath;
 use crate::filesystem::vfs::FileType;
 use crate::filesystem::vfs::IndexNode;
+use crate::filesystem::vfs::InodeFlags;
 use crate::filesystem::vfs::InodeMode;
 use crate::filesystem::vfs::Metadata;
 use crate::filesystem::vfs::SystemError;
 use crate::filesystem::vfs::VFS_MAX_FOLLOW_SYMLINK_TIMES;
+use crate::libs::casting::DowncastArc;
 use crate::process::cred::CAPFlags;
 use crate::process::ProcessManager;
 use alloc::sync::Arc;
@@ -52,51 +58,123 @@ pub fn do_linkat(
     let follow_last_symlink = flags.contains(AtFlags::AT_SYMLINK_FOLLOW);
     let pcb = ProcessManager::current_pcb();
 
+    // Hold the open file description across linkat. The bare inode Arc does
+    // not count as an ext4 semantic owner: a concurrent close could otherwise
+    // begin final zero-link eviction before link_with_post_commit starts.
+    let old_file = if old.is_empty() && flags.contains(AtFlags::AT_EMPTY_PATH) {
+        let binding = pcb.fd_table();
+        let file = binding
+            .read()
+            .get_file_by_fd(oldfd)
+            .ok_or(SystemError::EBADF)?;
+        Some(file)
+    } else {
+        None
+    };
+
     // 得到源路径的inode
-    let old_inode: Arc<dyn IndexNode> = if old.is_empty() {
+    let (old_inode, _old_path_guard): (Arc<dyn IndexNode>, Option<ResolvedPath>) = if old.is_empty()
+    {
         if flags.contains(AtFlags::AT_EMPTY_PATH) {
             // 在AT_EMPTY_PATH启用时，old可以为空，old_inode实际为oldfd所指文件，但该文件不能为目录。
-            let binding = pcb.fd_table();
-            let fd_table_guard = binding.read();
-            let file = fd_table_guard
-                .get_file_by_fd(oldfd)
-                .ok_or(SystemError::EBADF)?;
-            let old_inode = file.inode();
-            old_inode
+            // The fd's path inode retains the selected mount identity even
+            // when the runtime I/O inode differs for a special file.
+            (old_file.as_ref().unwrap().path_inode(), None)
         } else {
             return Err(SystemError::ENOENT);
         }
     } else {
         let (old_begin_inode, old_remain_path) = user_path_at(&pcb, oldfd, old)?;
-        old_begin_inode.lookup_follow_symlink2(
-            &old_remain_path,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
-            follow_last_symlink,
-        )?
+        let start = ResolvedPath::new(old_begin_inode.clone())?;
+        let resolved = crate::filesystem::vfs::file::File::recover_io(|| {
+            old_begin_inode.lookup_follow_symlink_owned(
+                &start,
+                &old_remain_path,
+                VFS_MAX_FOLLOW_SYMLINK_TIMES,
+                follow_last_symlink,
+            )
+        })?;
+        (resolved.inode(), Some(resolved))
     };
-
-    // old_inode为目录时返回EPERM
-    if old_inode.metadata()?.file_type == FileType::Dir {
-        return Err(SystemError::EPERM);
-    }
-    // 硬链接安全检查
-    may_linkat(&old_inode)?;
 
     // 得到新创建节点的父节点
     let (new_begin_inode, new_remain_path) = user_path_at(&pcb, newfd, new)?;
     let (new_name, new_parent_path) = rsplit_path(&new_remain_path);
-    let new_parent = new_begin_inode
-        .lookup_follow_symlink(new_parent_path.unwrap_or("/"), VFS_MAX_FOLLOW_SYMLINK_TIMES)?;
+    let new_parent = crate::filesystem::vfs::file::File::recover_io(|| {
+        new_begin_inode
+            .lookup_follow_symlink(new_parent_path.unwrap_or("."), VFS_MAX_FOLLOW_SYMLINK_TIMES)
+    })?;
+
+    let new_parent_metadata = new_parent.metadata()?;
+    if new_parent_metadata.file_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+
+    // Match Linux may_create() error ordering: search permission is needed to
+    // inspect the target, an existing target wins over a missing write bit,
+    // and write permission is checked only for a negative target.
+    check_inode_permission(&new_parent, &new_parent_metadata, PermissionMask::MAY_EXEC)?;
+    match new_parent.find(new_name) {
+        Ok(_) => return Err(SystemError::EEXIST),
+        Err(SystemError::ENOENT) => {}
+        Err(err) => return Err(err),
+    }
+
+    // Linux filename_create() lets an existing target win over a read-only
+    // mount, but returns EROFS for a negative target before later EXDEV and
+    // inode permission checks.
+    let new_parent_fs = new_parent.fs();
+    if let Some(mount_fs) = new_parent_fs.clone().downcast_arc::<MountFS>() {
+        if mount_fs.is_readonly() {
+            return Err(SystemError::EROFS);
+        }
+    }
 
     // 跨文件系统检查：类似 Linux 的 "if (dir->i_sb != inode->i_sb) return -EXDEV;"
     // 通过比较文件系统指针地址判断是否为同一文件系统实例
-    let new_parent_fs = new_parent.fs();
     let old_inode_fs = old_inode.fs();
     if !Arc::ptr_eq(&new_parent_fs, &old_inode_fs) {
         return Err(SystemError::EXDEV);
     }
 
-    return new_parent.link(new_name, &old_inode).map(|_| 0);
+    // Linux do_linkat() checks protected-hardlink policy after preparing the
+    // negative target and checking the target mount identity.
+    may_linkat(&old_inode)?;
+    check_inode_permission(&new_parent, &new_parent_metadata, PermissionMask::MAY_WRITE)?;
+
+    let old_metadata = old_inode.metadata()?;
+    if old_metadata
+        .flags
+        .intersects(InodeFlags::S_APPEND | InodeFlags::S_IMMUTABLE)
+    {
+        return Err(SystemError::EPERM);
+    }
+    if old_metadata.file_type == FileType::Dir {
+        return Err(SystemError::EPERM);
+    }
+
+    let notify = || {
+        // Linux reports the source inode's changed link count before the
+        // destination directory entry becomes visible to fsnotify consumers.
+        fsnotify::fsnotify(FsEvent::ATTRIB, None, Some(&old_inode), 0);
+        // fsnotify: the parent directory receives IN_CREATE (the hard-link target is not a directory, so IN_ISDIR is not set).
+        fsnotify::fsnotify(
+            FsEvent::CREATE,
+            Some((&new_parent, new_name)),
+            Some(&old_inode),
+            0,
+        );
+    };
+    if let Some(mounted) = new_parent.clone().downcast_arc::<MountFSInode>() {
+        super::super::file::File::recover_io(|| {
+            mounted.link_with_post_commit(new_name, &old_inode, notify)
+        })?;
+    } else {
+        super::super::file::File::recover_io(|| new_parent.link(new_name, &old_inode))?;
+        notify();
+    }
+    drop(old_file);
+    Ok(0)
 }
 
 /// 检查是否允许创建硬链接（对应Linux的may_linkat）
@@ -111,6 +189,9 @@ pub fn do_linkat(
 fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
     let metadata = old_inode.metadata()?;
     let cred = ProcessManager::current_pcb().cred();
+    if metadata.uid == u32::MAX as usize || metadata.gid == u32::MAX as usize {
+        return Err(SystemError::EOVERFLOW);
+    }
 
     // TODO: 检查sysctl_protected_hardlinks是否启用
     // 目前假设始终启用（更安全的默认值）
@@ -120,12 +201,7 @@ fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
     // }
 
     // 文件所有者可以创建硬链接
-    if cred.is_owner(&metadata) {
-        return Ok(());
-    }
-
-    // 拥有CAP_FOWNER能力可以创建硬链接
-    if cred.has_capability(CAPFlags::CAP_FOWNER) {
+    if cred.is_owner_or_capable(&metadata) {
         return Ok(());
     }
 

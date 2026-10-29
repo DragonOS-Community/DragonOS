@@ -1,5 +1,6 @@
 use crate::*;
 use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU64, Ordering};
 /// A trait defining bitfield operations we need for tracking allocated objects within a page.
 pub(crate) trait Bitfield {
@@ -172,9 +173,9 @@ pub trait AllocablePage {
     where
         Self: core::marker::Sized;
 
-    /// Returns which list this page currently belongs to inside [`SCAllocator`].
+    /// Returns the allocator occupancy state of this page.
     fn page_state(&self) -> PageState;
-    /// Updates the state of this page (must be kept consistent with list membership).
+    /// Updates the state (empty/partial lists and the full count must agree).
     fn set_page_state(&mut self, state: PageState);
 
     /// Tries to find a free block within `data` that satisfies `alignment` requirement.
@@ -241,7 +242,7 @@ pub trait AllocablePage {
     }
 }
 
-/// Which list a page currently belongs to inside an [`SCAllocator`].
+/// Allocator occupancy state; full pages are detached from the free-page lists.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PageState {
@@ -265,7 +266,7 @@ pub enum PageState {
 pub struct ObjectPage<'a> {
     /// Holds memory objects.
     #[allow(dead_code)]
-    data: [u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD],
+    data: MaybeUninit<[u8; OBJECT_PAGE_SIZE - OBJECT_PAGE_METADATA_OVERHEAD]>,
 
     /// Next element in list (used by `PageList`).
     next: Rawlink<ObjectPage<'a>>,
@@ -282,7 +283,32 @@ pub struct ObjectPage<'a> {
 }
 impl<'a> ObjectPage<'a> {
     pub fn new() -> Box<ObjectPage<'a>> {
-        unsafe { Box::new_uninit().assume_init() }
+        Self::try_new()
+            .unwrap_or_else(|_| alloc::alloc::handle_alloc_error(Layout::new::<ObjectPage<'a>>()))
+    }
+
+    /// Allocate a slab page without aborting when its backing allocation fails.
+    pub fn try_new() -> Result<Box<ObjectPage<'a>>, alloc::alloc::AllocError> {
+        Ok(Self::init_boxed(Box::<ObjectPage<'a>>::try_new_uninit()?))
+    }
+
+    /// Initialize already allocated storage without recursively allocating a page.
+    pub fn init_boxed(mut page: Box<MaybeUninit<Self>>) -> Box<Self> {
+        unsafe {
+            // The data area is intentionally uninitialized object storage.  It
+            // is wrapped in MaybeUninit so constructing ObjectPage is sound;
+            // initialize only the allocator metadata that refill() consumes.
+            // Doing this in place avoids both a 4 KiB stack temporary and a
+            // redundant full-page clear on the slab refill hot path.
+            let raw = page.as_mut_ptr();
+            core::ptr::addr_of_mut!((*raw).next).write(Rawlink::none());
+            core::ptr::addr_of_mut!((*raw).prev).write(Rawlink::none());
+            core::ptr::addr_of_mut!((*raw).state).write(PageState::Empty);
+            core::ptr::addr_of_mut!((*raw)._state_pad).write([0; 7]);
+            core::ptr::addr_of_mut!((*raw).bitfield)
+                .write(core::array::from_fn(|_| AtomicU64::new(0)));
+            page.assume_init()
+        }
     }
 }
 

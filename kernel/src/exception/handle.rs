@@ -261,13 +261,13 @@ fn handle_irq_event<'a>(
 fn do_handle_irq_event(desc: &Arc<IrqDesc>) -> Result<(), SystemError> {
     let desc_inner_guard = desc.inner();
     let irq_data = desc_inner_guard.irq_data().clone();
-    let actions = desc_inner_guard.actions().clone();
+    let actions = desc_inner_guard.actions_snapshot();
     drop(desc_inner_guard);
 
     let irq = irq_data.irq();
     let mut r = Ok(IrqReturn::NotHandled);
 
-    for action in actions {
+    for action in actions.iter() {
         let mut action_inner: SpinLockGuard<'_, InnerIrqAction> = action.inner();
         // debug!("do_handle_irq_event: action: {:?}", action_inner.name());
         let dynamic_data = action_inner
@@ -415,4 +415,13 @@ impl IrqFlowHandler for PerCpuDevIdIrqHandler {
 
         chip.irq_eoi(&irq_data);
     }
+}
+
+#[cfg(feature = "mm_selftest")]
+#[path = "handle/selftest.rs"]
+mod selftest;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn heap_denied_irq_dispatch_selftest() -> Result<bool, SystemError> {
+    selftest::run()
 }

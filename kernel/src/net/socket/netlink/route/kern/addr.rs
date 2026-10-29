@@ -3,13 +3,15 @@ use crate::{
     net::socket::{
         netlink::{
             message::segment::{
-                header::{CMsgSegHdr, GetRequestFlags, NewRequestFlags, SegHdrCommonFlags},
+                header::{CMsgSegHdr, NewRequestFlags, SegHdrCommonFlags},
                 CSegmentType,
             },
             route::{
-                kern::utils::finish_response,
+                kern::utils::{
+                    kernel_notify_header, multicast_notify, RTMGRP_IPV4_IFADDR, RTMGRP_IPV6_IFADDR,
+                },
                 message::{
-                    attr::addr::AddrAttr,
+                    attr::{addr::AddrAttr, IFNAME_SIZE},
                     segment::{
                         addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, RtScope},
                         RouteNlSegment,
@@ -18,6 +20,10 @@ use crate::{
             },
         },
         AddressFamily,
+    },
+    net::{
+        address::{AddressMutation, AddressMutationOutcome},
+        rtnl::RtnlGuard,
     },
     process::namespace::net_namespace::NetNamespace,
 };
@@ -28,125 +34,86 @@ use core::num::NonZeroU32;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use system_error::SystemError;
 
-pub(super) fn do_get_addr(
+pub(super) fn do_new_addr(
+    rtnl: &RtnlGuard,
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    let dump_all = {
-        let flags = GetRequestFlags::from_bits_truncate(request_segment.header().flags);
-        flags.contains(GetRequestFlags::DUMP)
-    };
+    // Linux applies the IPv4 attribute policy before address, device, and
+    // special-case validation. Preserve that errno priority here.
+    let broadcast = parse_request_broadcast(request_segment)?;
+    let label = parse_request_label(request_segment)?;
+    let cidr = parse_new_cidr(request_segment)?;
+    let iface = lookup_iface_by_index(request_segment, &netns)?;
 
-    if !dump_all {
-        log::error!("GetAddr request without DUMP flag is not supported yet");
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    match cidr.address() {
+        // Linux accepts an IPv4 local address of zero but does not insert an
+        // in_ifaddr object or emit RTM_NEWADDR for it.
+        IpAddress::Ipv4(address) if address.is_unspecified() => return Ok(Vec::new()),
+        // inet6_addr_add() rejects IPV6_ADDR_ANY as a configured object.
+        IpAddress::Ipv6(address) if address.is_unspecified() => {
+            return Err(SystemError::EADDRNOTAVAIL)
+        }
+        _ => {}
     }
 
-    let mut responce: Vec<RouteNlSegment> = netns
-        .device_list()
-        .iter()
-        .flat_map(|(_, iface)| iface_to_new_addr(request_segment.header(), iface))
-        .map(RouteNlSegment::NewAddr)
-        .collect();
-
-    finish_response(request_segment.header(), dump_all, &mut responce);
-
-    Ok(responce)
-}
-
-pub(super) fn do_new_addr(
-    request_segment: &AddrSegment,
-    netns: Arc<NetNamespace>,
-) -> Result<Vec<RouteNlSegment>, SystemError> {
-    add_addr(request_segment, netns)?;
+    let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
+    let mutation =
+        if flags.contains(NewRequestFlags::REPLACE) && !flags.contains(NewRequestFlags::EXCL) {
+            AddressMutation::Replace(cidr)
+        } else {
+            AddressMutation::Add(cidr)
+        };
+    let commit =
+        crate::net::address::mutate_labeled_address(rtnl, &iface, mutation, label, broadcast)?;
+    notify_address_outcome(netns.clone(), &iface, commit.outcome);
+    notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
 }
 
 pub(super) fn do_del_addr(
+    rtnl: &RtnlGuard,
     request_segment: &AddrSegment,
     netns: Arc<NetNamespace>,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
-    del_addr(request_segment, netns)?;
+    // Linux validates the IPv4 attribute policy even though IFA_BROADCAST
+    // does not participate in the delete selector.
+    let _ = parse_request_broadcast(request_segment)?;
+    let label = parse_request_label(request_segment)?;
+    let selector = parse_delete_selector(request_segment, label)?;
+    let iface = lookup_iface_by_index(request_segment, &netns)?;
+    let cidr = resolve_delete_cidr(&iface, selector)?;
+    let deleted_label = crate::net::address::address_label(&iface, cidr)?;
+    let deleted_broadcast = crate::net::address::address_broadcast(&iface, cidr);
+    let commit = crate::net::address::mutate_address(rtnl, &iface, AddressMutation::Delete(cidr))?;
+    notify_address_outcome_with_label(
+        netns.clone(),
+        &iface,
+        commit.outcome,
+        Some(&deleted_label),
+        deleted_broadcast,
+    );
+    notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
 }
 
-fn add_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(), SystemError> {
-    let iface = lookup_iface_by_index(request_segment, netns)?;
-    let cidr = parse_cidr(request_segment)?;
-    let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
-
-    let mut exists = false;
-    let mut pushed = false;
-
-    iface.smol_iface().lock().update_ip_addrs(|ip_addrs| {
-        exists = ip_addrs.contains(&cidr);
-        if !exists {
-            let insert_index = match cidr.address() {
-                IpAddress::Ipv4(_) => ip_addrs
-                    .iter()
-                    .position(|configured| matches!(configured.address(), IpAddress::Ipv6(_)))
-                    .unwrap_or(ip_addrs.len()),
-                IpAddress::Ipv6(_) => ip_addrs.len(),
-            };
-
-            if ip_addrs.insert(insert_index, cidr).is_ok() {
-                pushed = true;
-            }
-        }
-    });
-
-    if exists {
-        if flags.contains(NewRequestFlags::REPLACE) {
-            return Ok(());
-        }
-        return Err(SystemError::EEXIST);
+fn notify_route_changes(netns: &Arc<NetNamespace>, changes: crate::net::route::RouteNotifications) {
+    for removed in changes.removed {
+        super::route::notify_route(netns, CSegmentType::DELROUTE, removed);
     }
-
-    if !pushed {
-        return Err(SystemError::ENOSPC);
+    for added in changes.added {
+        super::route::notify_route(netns, CSegmentType::NEWROUTE, added);
     }
-
-    if let Err(err) = add_local_route(&iface, cidr) {
-        rollback_added_addr(&iface, cidr);
-        return Err(err);
-    }
-
-    sync_router_ip_addrs(&iface);
-
-    Ok(())
-}
-
-fn del_addr(request_segment: &AddrSegment, netns: Arc<NetNamespace>) -> Result<(), SystemError> {
-    let iface = lookup_iface_by_index(request_segment, netns)?;
-    let cidr = parse_cidr(request_segment)?;
-
-    let mut removed = false;
-
-    iface.smol_iface().lock().update_ip_addrs(|ip_addrs| {
-        if let Some(index) = ip_addrs.iter().position(|configured| *configured == cidr) {
-            ip_addrs.remove(index);
-            removed = true;
-        }
-    });
-
-    if !removed {
-        return Err(SystemError::EADDRNOTAVAIL);
-    }
-
-    remove_local_route(&iface, cidr);
-    sync_router_ip_addrs(&iface);
-
-    Ok(())
 }
 
 fn lookup_iface_by_index(
     request_segment: &AddrSegment,
-    netns: Arc<NetNamespace>,
+    netns: &Arc<NetNamespace>,
 ) -> Result<Arc<dyn Iface>, SystemError> {
     let index = request_segment
         .body()
         .index
-        .ok_or(SystemError::EINVAL)?
+        .ok_or(SystemError::ENODEV)?
         .get() as usize;
 
     netns
@@ -156,159 +123,372 @@ fn lookup_iface_by_index(
         .ok_or(SystemError::ENODEV)
 }
 
-fn parse_cidr(request_segment: &AddrSegment) -> Result<IpCidr, SystemError> {
+fn parse_new_cidr(request_segment: &AddrSegment) -> Result<IpCidr, SystemError> {
     let family = AddressFamily::try_from(request_segment.body().family as u16)
         .map_err(|_| SystemError::EAFNOSUPPORT)?;
-
-    let addr = request_segment
-        .attrs()
-        .iter()
-        .find_map(|attr| match attr {
-            AddrAttr::Local(addr) | AddrAttr::Address(addr) => Some(addr.as_slice()),
-            AddrAttr::Label(_) => None,
-        })
-        .ok_or(SystemError::EINVAL)?;
-
     let prefix_len = request_segment.body().prefix_len;
+    let local = find_address_attr(request_segment, true);
+    let address = find_address_attr(request_segment, false);
 
     match family {
         AddressFamily::INet => {
-            if addr.len() != 4 || prefix_len > 32 {
-                return Err(SystemError::EINVAL);
+            let local = local.ok_or(SystemError::EINVAL)?;
+            if let Some(address) = address {
+                if address != local {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
             }
-            let ip = Ipv4Address::new(addr[0], addr[1], addr[2], addr[3]);
-            Ok(IpCidr::new(IpAddress::Ipv4(ip), prefix_len))
+            parse_ip_cidr(family, local, prefix_len)
         }
         AddressFamily::INet6 => {
-            if addr.len() != 16 || prefix_len > 128 {
-                return Err(SystemError::EINVAL);
+            let bytes = address.or(local).ok_or(SystemError::EINVAL)?;
+            if let (Some(local), Some(address)) = (local, address) {
+                if local != address {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
             }
-            let ip = Ipv6Address::new(
-                u16::from_be_bytes([addr[0], addr[1]]),
-                u16::from_be_bytes([addr[2], addr[3]]),
-                u16::from_be_bytes([addr[4], addr[5]]),
-                u16::from_be_bytes([addr[6], addr[7]]),
-                u16::from_be_bytes([addr[8], addr[9]]),
-                u16::from_be_bytes([addr[10], addr[11]]),
-                u16::from_be_bytes([addr[12], addr[13]]),
-                u16::from_be_bytes([addr[14], addr[15]]),
-            );
-            Ok(IpCidr::new(IpAddress::Ipv6(ip), prefix_len))
+            parse_ip_cidr(family, bytes, prefix_len)
         }
         _ => Err(SystemError::EAFNOSUPPORT),
     }
 }
 
-fn iface_to_new_addr(request_header: &CMsgSegHdr, iface: &Arc<dyn Iface>) -> Vec<AddrSegment> {
-    let ifname = CString::new(iface.iface_name()).unwrap();
-    let mut segments = Vec::new();
-    let ip_addrs: Vec<IpCidr> = {
-        let smol_iface = iface.smol_iface().lock();
-        smol_iface.ip_addrs().to_vec()
+enum DeleteMatch {
+    Ipv4 {
+        local: Option<Ipv4Address>,
+        prefix: Option<IpCidr>,
+    },
+    Exact(IpCidr),
+}
+
+struct DeleteSelector {
+    match_: DeleteMatch,
+    label: Option<CString>,
+}
+
+fn parse_delete_selector(
+    request_segment: &AddrSegment,
+    label: Option<CString>,
+) -> Result<DeleteSelector, SystemError> {
+    let family = AddressFamily::try_from(request_segment.body().family as u16)
+        .map_err(|_| SystemError::EAFNOSUPPORT)?;
+    let prefix_len = request_segment.body().prefix_len;
+    let local = find_address_attr(request_segment, true);
+    let address = find_address_attr(request_segment, false);
+    let match_ = match family {
+        AddressFamily::INet => {
+            let local = local
+                .map(|bytes| parse_ip_cidr(family, bytes, 32))
+                .transpose()?
+                .map(|cidr| match cidr.address() {
+                    IpAddress::Ipv4(address) => address,
+                    _ => unreachable!(),
+                });
+            let prefix = if let Some(address) = address {
+                if prefix_len > 32 {
+                    return Err(SystemError::EINVAL);
+                }
+                Some(parse_ip_cidr(family, address, prefix_len)?)
+            } else {
+                None
+            };
+            if local.is_none() && prefix.is_none() {
+                return Err(SystemError::EINVAL);
+            }
+            DeleteMatch::Ipv4 { local, prefix }
+        }
+        AddressFamily::INet6 => {
+            let bytes = address.or(local).ok_or(SystemError::EINVAL)?;
+            if let (Some(local), Some(address)) = (local, address) {
+                if local != address {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+            }
+            DeleteMatch::Exact(parse_ip_cidr(family, bytes, prefix_len)?)
+        }
+        _ => return Err(SystemError::EAFNOSUPPORT),
     };
 
-    for cidr in &ip_addrs {
-        let (family, octets): (i32, Vec<u8>) = match cidr.address() {
-            IpAddress::Ipv4(addr) => (AddressFamily::INet as i32, addr.octets().to_vec()),
-            IpAddress::Ipv6(addr) => (AddressFamily::INet6 as i32, addr.octets().to_vec()),
+    Ok(DeleteSelector { match_, label })
+}
+
+fn resolve_delete_cidr(
+    iface: &Arc<dyn Iface>,
+    selector: DeleteSelector,
+) -> Result<IpCidr, SystemError> {
+    let smol_iface = iface.smol_iface().lock();
+    smol_iface
+        .ip_addrs()
+        .iter()
+        .find(|configured| {
+            if let Some(requested) = selector.label.as_ref() {
+                let Ok(actual) = crate::net::address::address_label(iface, **configured) else {
+                    return false;
+                };
+                if actual.as_bytes() != requested.as_bytes() {
+                    return false;
+                }
+            }
+            match selector.match_ {
+                DeleteMatch::Ipv4 { local, prefix } => {
+                    let IpAddress::Ipv4(configured_address) = configured.address() else {
+                        return false;
+                    };
+                    local.is_none_or(|local| local == configured_address)
+                        && prefix.is_none_or(|prefix| {
+                            prefix.prefix_len() == configured.prefix_len()
+                                && prefix.contains_addr(&configured.address())
+                        })
+                }
+                DeleteMatch::Exact(cidr) => **configured == cidr,
+            }
+        })
+        .copied()
+        .ok_or(SystemError::EADDRNOTAVAIL)
+}
+
+fn find_address_attr(request_segment: &AddrSegment, local: bool) -> Option<&[u8]> {
+    request_segment.attrs().iter().find_map(|attr| match attr {
+        AddrAttr::Local(bytes) if local => Some(bytes.as_slice()),
+        AddrAttr::Address(bytes) if !local => Some(bytes.as_slice()),
+        _ => None,
+    })
+}
+
+fn parse_ipv4_label_attr(request_segment: &AddrSegment) -> Result<Option<CString>, SystemError> {
+    let mut parsed = None;
+    for attr in request_segment.attrs() {
+        if let AddrAttr::Label(payload) = attr {
+            parsed = Some(parse_ipv4_label(payload)?);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_request_label(request_segment: &AddrSegment) -> Result<Option<CString>, SystemError> {
+    // IFA_LABEL is an IPv4 alias attribute. Linux's IPv6 policy leaves it
+    // untyped and the IPv6 handlers ignore it, regardless of payload length.
+    match AddressFamily::try_from(request_segment.body().family as u16) {
+        Ok(AddressFamily::INet) => parse_ipv4_label_attr(request_segment),
+        _ => Ok(None),
+    }
+}
+
+fn parse_request_broadcast(
+    request_segment: &AddrSegment,
+) -> Result<Option<Ipv4Address>, SystemError> {
+    if !matches!(
+        AddressFamily::try_from(request_segment.body().family as u16),
+        Ok(AddressFamily::INet)
+    ) {
+        return Ok(None);
+    }
+    let mut broadcast = None;
+    for attr in request_segment.attrs() {
+        if let AddrAttr::Broadcast(bytes) = attr {
+            if bytes.len() < 4 {
+                return Err(SystemError::ERANGE);
+            }
+            broadcast = Some(Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]));
+        }
+    }
+    Ok(broadcast)
+}
+
+fn parse_ipv4_label(payload: &[u8]) -> Result<CString, SystemError> {
+    if payload.is_empty() {
+        return Err(SystemError::ERANGE);
+    }
+    let effective_len = payload.len() - usize::from(payload.last() == Some(&0));
+    if effective_len >= IFNAME_SIZE {
+        return Err(SystemError::ERANGE);
+    }
+    let nul_pos = payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(payload.len());
+    CString::new(&payload[..nul_pos]).map_err(|_| SystemError::EINVAL)
+}
+
+fn parse_ip_cidr(
+    family: AddressFamily,
+    addr: &[u8],
+    prefix_len: u8,
+) -> Result<IpCidr, SystemError> {
+    match family {
+        AddressFamily::INet => {
+            if addr.len() != 4 || prefix_len > 32 {
+                return Err(SystemError::EINVAL);
+            }
+            Ok(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::new(addr[0], addr[1], addr[2], addr[3])),
+                prefix_len,
+            ))
+        }
+        AddressFamily::INet6 => {
+            if addr.len() != 16 || prefix_len > 128 {
+                return Err(SystemError::EINVAL);
+            }
+            Ok(IpCidr::new(
+                IpAddress::Ipv6(Ipv6Address::new(
+                    u16::from_be_bytes([addr[0], addr[1]]),
+                    u16::from_be_bytes([addr[2], addr[3]]),
+                    u16::from_be_bytes([addr[4], addr[5]]),
+                    u16::from_be_bytes([addr[6], addr[7]]),
+                    u16::from_be_bytes([addr[8], addr[9]]),
+                    u16::from_be_bytes([addr[10], addr[11]]),
+                    u16::from_be_bytes([addr[12], addr[13]]),
+                    u16::from_be_bytes([addr[14], addr[15]]),
+                )),
+                prefix_len,
+            ))
+        }
+        _ => Err(SystemError::EAFNOSUPPORT),
+    }
+}
+
+pub(super) fn addr_to_segment(
+    request_header: &CMsgSegHdr,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    msg_type: CSegmentType,
+    label_override: Option<&CString>,
+    broadcast: Option<Ipv4Address>,
+) -> Result<AddrSegment, SystemError> {
+    let (family, octets): (i32, Vec<u8>) = match cidr.address() {
+        IpAddress::Ipv4(addr) => (AddressFamily::INet as i32, addr.octets().to_vec()),
+        IpAddress::Ipv6(addr) => (AddressFamily::INet6 as i32, addr.octets().to_vec()),
+    };
+
+    let header = CMsgSegHdr {
+        len: 0,
+        type_: msg_type as _,
+        flags: SegHdrCommonFlags::empty().bits(),
+        seq: request_header.seq,
+        pid: request_header.pid,
+    };
+
+    let addr_message = AddrSegmentBody {
+        family,
+        prefix_len: cidr.prefix_len(),
+        flags: AddrMessageFlags::PERMANENT,
+        scope: if iface.type_() == crate::driver::net::types::InterfaceType::LOOPBACK {
+            RtScope::HOST
+        } else {
+            RtScope::UNIVERSE
+        },
+        index: NonZeroU32::new(iface.nic_id() as u32),
+    };
+
+    // Match Linux inet_fill_ifaddr(): IPv4 ADDRESS, LOCAL, BROADCAST, LABEL.
+    let mut attrs = vec![AddrAttr::Address(octets.clone()), AddrAttr::Local(octets)];
+    if matches!(cidr.address(), IpAddress::Ipv4(_)) {
+        if let Some(broadcast) = broadcast.filter(|address| !address.is_unspecified()) {
+            attrs.push(AddrAttr::Broadcast(broadcast.octets().to_vec()));
+        }
+        let label = match label_override {
+            Some(label) => label.clone(),
+            None => crate::net::address::address_label(iface, cidr)?,
         };
-
-        let header = CMsgSegHdr {
-            len: 0,
-            type_: CSegmentType::NEWADDR as _,
-            flags: SegHdrCommonFlags::empty().bits(),
-            seq: request_header.seq,
-            pid: request_header.pid,
-        };
-
-        let addr_message = AddrSegmentBody {
-            family,
-            prefix_len: cidr.prefix_len(),
-            flags: AddrMessageFlags::PERMANENT,
-            scope: RtScope::HOST,
-            index: NonZeroU32::new(iface.nic_id() as u32),
-        };
-
-        let attrs = vec![
-            AddrAttr::Address(octets.clone()),
-            AddrAttr::Label(ifname.clone()),
-            AddrAttr::Local(octets),
-        ];
-
-        segments.push(AddrSegment::new(header, addr_message, attrs));
+        // Linux keeps an explicit empty label for IPv4 delete matching but
+        // inet_fill_ifaddr() omits IFA_LABEL when ifa_label[0] is NUL.
+        if !label.as_bytes().is_empty() {
+            attrs.push(AddrAttr::Label(label.to_bytes_with_nul().to_vec()));
+        }
     }
 
-    segments
+    Ok(AddrSegment::new(header, addr_message, attrs))
 }
 
-fn sync_router_ip_addrs(iface: &Arc<dyn Iface>) {
-    let smol_ip_addrs: Vec<IpCidr> = {
-        let smol_iface = iface.smol_iface().lock();
-        smol_iface.ip_addrs().to_vec()
+pub(in crate::net::socket::netlink::route) fn notify_address_outcome(
+    netns: Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    outcome: AddressMutationOutcome,
+) {
+    notify_address_outcome_with_label(netns, iface, outcome, None, None)
+}
+
+pub(super) fn notify_address_change(
+    netns: Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+) {
+    notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None, None);
+}
+
+pub(super) fn notify_removed_address(
+    netns: Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    label: &CString,
+    broadcast: Option<Ipv4Address>,
+) {
+    notify_one(
+        netns,
+        iface,
+        cidr,
+        CSegmentType::DELADDR,
+        Some(label),
+        broadcast,
+    );
+}
+
+fn notify_address_outcome_with_label(
+    netns: Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    outcome: AddressMutationOutcome,
+    deleted_label: Option<&CString>,
+    deleted_broadcast: Option<Ipv4Address>,
+) {
+    match outcome {
+        AddressMutationOutcome::Added(cidr) | AddressMutationOutcome::Replaced(cidr) => {
+            notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None, None)
+        }
+        AddressMutationOutcome::Deleted(cidr) => notify_one(
+            netns,
+            iface,
+            cidr,
+            CSegmentType::DELADDR,
+            deleted_label,
+            deleted_broadcast,
+        ),
+    }
+}
+
+fn notify_one(
+    netns: Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    msg_type: CSegmentType,
+    label_override: Option<&CString>,
+    broadcast_override: Option<Ipv4Address>,
+) {
+    let header = kernel_notify_header(msg_type);
+    let broadcast = if msg_type == CSegmentType::DELADDR {
+        broadcast_override
+    } else {
+        crate::net::address::address_broadcast(iface, cidr)
     };
-
-    let mut router_ip_addrs = iface.router_common().ip_addrs.write();
-    router_ip_addrs.clear();
-    router_ip_addrs.extend_from_slice(&smol_ip_addrs);
-}
-
-fn add_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) -> Result<(), SystemError> {
-    let mut pushed = false;
-    let via_router = cidr.address();
-
-    iface.smol_iface().lock().routes_mut().update(|routes| {
-        let exists = routes
-            .iter()
-            .any(|route| is_same_local_route(route, cidr, via_router));
-        if exists {
-            pushed = true;
+    let segment = match addr_to_segment(&header, iface, cidr, msg_type, label_override, broadcast) {
+        Ok(segment) => segment,
+        Err(err) => {
+            // Notification encoding is best effort after a successful commit;
+            // it must not turn the request ACK into an error for committed state.
+            log::warn!("failed to encode address notification for {cidr}: {err:?}");
             return;
         }
+    };
+    let segment = if msg_type == CSegmentType::DELADDR {
+        RouteNlSegment::DelAddr(segment)
+    } else {
+        RouteNlSegment::NewAddr(segment)
+    };
+    multicast_notify(netns, addr_notify_group(cidr.address()), segment);
+}
 
-        pushed = routes
-            .push(smoltcp::iface::Route {
-                cidr,
-                via_router,
-                preferred_until: None,
-                expires_at: None,
-            })
-            .is_ok();
-    });
-
-    if !pushed {
-        log::warn!(
-            "netlink add_addr: route table full while adding local route {} via {}",
-            cidr,
-            via_router
-        );
-        return Err(SystemError::ENOSPC);
+fn addr_notify_group(ip: IpAddress) -> u32 {
+    match ip {
+        IpAddress::Ipv4(_) => RTMGRP_IPV4_IFADDR,
+        IpAddress::Ipv6(_) => RTMGRP_IPV6_IFADDR,
     }
-
-    Ok(())
-}
-
-fn remove_local_route(iface: &Arc<dyn Iface>, cidr: IpCidr) {
-    let via_router = cidr.address();
-    iface.smol_iface().lock().routes_mut().update(|routes| {
-        if let Some(index) = routes
-            .iter()
-            .position(|route| is_same_local_route(route, cidr, via_router))
-        {
-            routes.remove(index);
-        }
-    });
-}
-
-fn rollback_added_addr(iface: &Arc<dyn Iface>, cidr: IpCidr) {
-    iface.smol_iface().lock().update_ip_addrs(|ip_addrs| {
-        if let Some(index) = ip_addrs.iter().position(|configured| *configured == cidr) {
-            ip_addrs.remove(index);
-        }
-    });
-    sync_router_ip_addrs(iface);
-}
-
-#[inline]
-fn is_same_local_route(route: &smoltcp::iface::Route, cidr: IpCidr, via_router: IpAddress) -> bool {
-    route.cidr == cidr && route.via_router == via_router
 }

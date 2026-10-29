@@ -1,13 +1,8 @@
+use crate::virt::vm::kvm_host::{vcpu::VirtCpu, Vm};
 use bitfield_struct::bitfield;
 use system_error::SystemError;
-use x86::vmx::vmcs::{guest, ro};
 
-use crate::{
-    arch::vm::asm::{IntrInfo, VmxAsm},
-    virt::vm::kvm_host::{vcpu::VirtCpu, Vm},
-};
-
-use super::{ept::EptViolationExitQual, vmx_info, PageFaultErr};
+use super::{ept::EptViolationExitQual, PageFaultErr};
 extern crate num_traits;
 
 #[bitfield(u32)]
@@ -289,14 +284,7 @@ impl VmxExitHandlers {
                                                        // 在下一次 VM 进入之前必须设置 "blocked by NMI" 位。
                                                        // 有一些错误可能会导致该位未被设置：
                                                        // AAK134, BY25。
-        let vmx = vcpu.vmx();
-        if vmx.idt_vectoring_info.bits() & IntrInfo::INTR_INFO_VALID_MASK.bits() != 0
-            && vmx_info().enable_vnmi
-            && exit_qualification & IntrInfo::INTR_INFO_UNBLOCK_NMI.bits() as u64 != 0
-        {
-            VmxAsm::vmx_vmwrite(guest::INTERRUPTIBILITY_STATE, 0x8); //GUEST_INTR_STATE_NMI
-        }
-        let gpa = VmxAsm::vmx_vmread(ro::GUEST_PHYSICAL_ADDR_FULL);
+        let gpa = vcpu.vmx().get_exit_gpa();
         //let exit_qualification = VmxAsm::vmx_vmread(ro::EXIT_QUALIFICATION);
         // trace_kvm_page_fault(vcpu, gpa, exit_qualification);//
 

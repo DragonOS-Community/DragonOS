@@ -1,9 +1,14 @@
+use crate::filesystem::anon_inode::{anon_inode_metadata, anon_inode_path, AnonInodeFs};
+use crate::filesystem::vfs::file::FileMode;
 use alloc::string::String;
 
 use crate::{
     filesystem::{
         epoll::EPollEventType,
-        vfs::{file::FileFlags, FilePrivateData, IndexNode, Metadata, PollableInode},
+        vfs::{
+            file::FileFlags, FilePrivateData, IndexNode, Metadata, OpenFileBehavior, PollableInode,
+            PostWriteSyncPolicy,
+        },
     },
     libs::mutex::MutexGuard,
 };
@@ -27,6 +32,13 @@ impl EPollInode {
 }
 
 impl IndexNode for EPollInode {
+    fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
+        behavior
+            .mode
+            .remove(FileMode::FMODE_CAN_READ | FileMode::FMODE_CAN_WRITE);
+        behavior.post_write_sync = PostWriteSyncPolicy::NotApplicable;
+    }
+
     fn is_stream(&self) -> bool {
         // epollfd 不支持 seek/pread/pwrite，按流式对象处理，统一返回 ESPIPE。
         true
@@ -38,8 +50,9 @@ impl IndexNode for EPollInode {
         _len: usize,
         _buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn write_at(
@@ -48,12 +61,13 @@ impl IndexNode for EPollInode {
         _len: usize,
         _buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        Err(SystemError::ENOSYS)
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Err(SystemError::ENOSYS);
+        result.map_err(Into::into)
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        todo!()
+        AnonInodeFs::instance()
     }
 
     fn as_any_ref(&self) -> &dyn core::any::Any {
@@ -65,7 +79,13 @@ impl IndexNode for EPollInode {
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
-        Ok(Metadata::default())
+        Ok(anon_inode_metadata(
+            crate::filesystem::vfs::InodeMode::S_IRUSR | crate::filesystem::vfs::InodeMode::S_IWUSR,
+        ))
+    }
+
+    fn stat_mode(&self, metadata: &Metadata) -> crate::filesystem::vfs::InodeMode {
+        metadata.mode
     }
 
     fn close(&self, _data: MutexGuard<FilePrivateData>) -> Result<(), SystemError> {
@@ -81,12 +101,13 @@ impl IndexNode for EPollInode {
         &self,
         _data: MutexGuard<FilePrivateData>,
         _flags: &FileFlags,
-    ) -> Result<(), SystemError> {
-        Ok(())
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        let result: core::result::Result<_, system_error::SystemError> = Ok(());
+        result.map_err(Into::into)
     }
 
     fn absolute_path(&self) -> Result<String, SystemError> {
-        Ok(String::from("epoll"))
+        Ok(anon_inode_path("[eventpoll]"))
     }
 
     fn as_pollable_inode(&self) -> Result<&dyn PollableInode, SystemError> {
@@ -110,7 +131,7 @@ impl PollableInode for EPollInode {
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         let poll_epitems = { self.epoll.0.lock().poll_epitems.clone() };
-        poll_epitems.lock_irqsave().push_back(epitem);
+        poll_epitems.add(epitem);
         Ok(())
     }
 
@@ -120,13 +141,6 @@ impl PollableInode for EPollInode {
         _private_data: &FilePrivateData,
     ) -> Result<(), SystemError> {
         let poll_epitems = { self.epoll.0.lock().poll_epitems.clone() };
-        let mut guard = poll_epitems.lock_irqsave();
-        let len = guard.len();
-        guard.retain(|x| !Arc::ptr_eq(x, epitem));
-        if guard.len() != len {
-            Ok(())
-        } else {
-            Err(SystemError::ENOENT)
-        }
+        poll_epitems.remove(epitem)
     }
 }

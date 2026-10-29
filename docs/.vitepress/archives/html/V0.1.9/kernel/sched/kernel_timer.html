@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="zh-CN">
+<head>
+  <meta charset="utf-8" /><meta name="generator" content="Docutils 0.18.1: http://docutils.sourceforge.net/" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>内核定时器 &mdash; DragonOS dev 文档</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css" />
+
+  
+  <!--[if lt IE 9]>
+    <script src="../../_static/js/html5shiv.min.js"></script>
+  <![endif]-->
+  
+        <script data-url_root="../../" id="documentation_options" src="../../_static/documentation_options.js"></script>
+        <script src="../../_static/jquery.js"></script>
+        <script src="../../_static/underscore.js"></script>
+        <script src="../../_static/_sphinx_javascript_frameworks_compat.js"></script>
+        <script src="../../_static/doctools.js"></script>
+        <script src="../../_static/translations.js"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="索引" href="../../genindex.html" />
+    <link rel="search" title="搜索" href="../../search.html" />
+    <link rel="next" title="进程间通信" href="../ipc/index.html" />
+    <link rel="prev" title="实时进程调度器相关的api" href="rt.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            DragonOS
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="搜索文档" aria-label="搜索文档" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="导航菜单">
+              <p class="caption" role="heading"><span class="caption-text">入门</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/index.html">DragonOS简介</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/build_system.html">构建DragonOS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../introduction/mirrors.html">DragonOS镜像站</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">内核层</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../configuration/index.html">内核编译配置</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../boot/index.html">引导加载</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../core_api/index.html">核心API文档</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../locking/index.html">锁</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../process_management/index.html">进程管理模块</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">DragonOS调度</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="c_waiting.html">与“等待”相关的api（C语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rust_waiting.html">与“等待”相关的api（rust语言）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="core.html">进程调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cfs.html">完全公平调度器相关的api</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rt.html">实时进程调度器相关的api</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">内核定时器</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id2">1. 简介</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id3">2. 设计思路</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id4">3. 定时器应实现的特性</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#api">4. 定时器API</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#timerapi">4.1. Timer的API</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#id7">4.2. 其余API</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#id13">5. 创建定时器实例</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ipc/index.html">进程间通信</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../memory_management/index.html">内存管理</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../filesystem/index.html">文件系统</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../debug/index.html">内核调试模块</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../ktest/index.html">内核测试</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cpu_arch/index.html">处理器架构</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../libs/index.html">其他内核库</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">应用层</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../userland/appdev/index.html">应用程序开发文档</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">系统调用api文档</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../syscall_api/index.html">系统调用API</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">DragonOS社区</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../community/code_contribution/index.html">参与开发</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/contact/index.html">与社区建立联系</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../community/ChangeLog/index.html">发行日志</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="移动版导航菜单" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">DragonOS</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="页面导航">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">DragonOS调度</a></li>
+      <li class="breadcrumb-item active">内核定时器</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/DragonOS-Community/DragonOS/blob/e3b8983/docs/kernel/sched/kernel_timer.md" class="fa fa-github"> 在 GitHub 上编辑</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>内核定时器<a class="headerlink" href="#id1" title="Permalink to this heading"></a></h1>
+<section id="id2">
+<h2>1. 简介<a class="headerlink" href="#id2" title="Permalink to this heading"></a></h2>
+<p>  内核定时器是内核中的一种定时器，内核定时器的工作方式是：添加定时器到队列，为每个定时器设置到期时间。当定时器到期时，会执行定时器对应的函数。</p>
+</section>
+<section id="id3">
+<h2>2. 设计思路<a class="headerlink" href="#id3" title="Permalink to this heading"></a></h2>
+<p>  定时器类型为<code class="docutils literal notranslate"><span class="pre">Timer</span></code>结构体，而<code class="docutils literal notranslate"><span class="pre">Timer</span></code>由<code class="docutils literal notranslate"><span class="pre">SpinLock&lt;InnerTimer&gt;</span></code>组成。全局中使用元素类型为<code class="docutils literal notranslate"><span class="pre">Arc&lt;Timer&gt;</span></code>的队列<code class="docutils literal notranslate"><span class="pre">TIMER_LIST</span></code>存储系统创建的定时器。创建定时器时，应调用<code class="docutils literal notranslate"><span class="pre">Timer::new(timer_func,expire_jiffies)</span></code>，timer_func为定时器要执行的操作，expire_jiffies为定时器的结束时间，<code class="docutils literal notranslate"><span class="pre">timer_func</span></code>参数的类型是实现了<code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code>特性的结构体。在创建定时器后，应使用<code class="docutils literal notranslate"><span class="pre">Timer::activate()</span></code>将定时器插入到<code class="docutils literal notranslate"><span class="pre">TIMER_LIST</span></code>中。</p>
+<p>  <strong>如果只是希望当前pcb休眠一段时间，应调用<code class="docutils literal notranslate"><span class="pre">schedule_timeout(timeout)</span></code>，timeout指定pcb休眠的时间长度。</strong></p>
+</section>
+<section id="id4">
+<h2>3. 定时器应实现的特性<a class="headerlink" href="#id4" title="Permalink to this heading"></a></h2>
+<p>  定时器要执行的函数应实现<code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code>特性，其定义如下：</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="sd">/// 定时器要执行的函数的特征</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">trait</span><span class="w"> </span><span class="n">TimerFunction</span>: <span class="nb">Send</span> <span class="o">+</span><span class="w"> </span><span class="nb">Sync</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">run</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">);</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>  一种典型的实现方式是：新建一个零长的结构体，实现<code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code>特性，然后在<code class="docutils literal notranslate"><span class="pre">run</span></code>函数中实现定时器要执行的操作。</p>
+</section>
+<section id="api">
+<h2>4. 定时器API<a class="headerlink" href="#api" title="Permalink to this heading"></a></h2>
+<section id="timerapi">
+<h3>4.1. Timer的API<a class="headerlink" href="#timerapi" title="Permalink to this heading"></a></h3>
+<section id="id5">
+<h4>4.1.1. 创建一个定时器<a class="headerlink" href="#id5" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">(</span><span class="n">timer_func</span>: <span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">TimerFunction</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">expire_jiffies</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nc">Arc</span><span class="o">&lt;</span><span class="bp">Self</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p><strong>参数</strong></p>
+<ul class="simple">
+<li><p>timer_func：定时器需要执行的函数对应的结构体，其实现了<code class="docutils literal notranslate"><span class="pre">TimerFunction</span></code>特性</p></li>
+<li><p>expire_jiffies：定时器结束时刻（单位：<strong>jiffies</strong>）</p></li>
+</ul>
+<p><strong>返回</strong></p>
+<ul class="simple">
+<li><p>定时器结构体指针</p></li>
+</ul>
+</section>
+<section id="id6">
+<h4>4.1.2. 将定时器插入到定时器链表中<a class="headerlink" href="#id6" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">activate</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id7">
+<h3>4.2. 其余API<a class="headerlink" href="#id7" title="Permalink to this heading"></a></h3>
+<p>  <strong>若想要在.c的模块中使用以下函数，请在函数名之前加上rs_</strong></p>
+<section id="id8">
+<h4>4.2.1. 让进程休眠一段时间<a class="headerlink" href="#id8" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">schedule_timeout</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">timeout</span>: <span class="kt">i64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="n">SystemError</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p><strong>功能</strong></p>
+<p>  让进程休眠timeout个jiffies</p>
+<p><strong>参数</strong></p>
+<ul class="simple">
+<li><p>timeout：需要休眠的时间 （单位：<strong>jiffies</strong>）</p></li>
+</ul>
+<p><strong>返回值</strong></p>
+<ul class="simple">
+<li><p>Ok(i64)：剩余需要休眠的时间 （单位：<strong>jiffies</strong>）</p></li>
+<li><p>Err(SystemError)：错误码</p></li>
+</ul>
+</section>
+<section id="id9">
+<h4>4.2.2. 获取队列中第一个定时器的结束时间<a class="headerlink" href="#id9" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">timer_get_first_expire</span><span class="p">()</span><span class="w"> </span>-&gt; <span class="nb">Result</span><span class="o">&lt;</span><span class="kt">u64</span><span class="p">,</span><span class="w"> </span><span class="n">SystemError</span><span class="o">&gt;</span>
+</pre></div>
+</div>
+<p><strong>功能</strong></p>
+<p>  获取队列中第一个定时器的结束时间，即最早结束的定时器的结束时间</p>
+<p><strong>返回值</strong></p>
+<ul class="simple">
+<li><p>Ok(i64)：最早结束的定时器的结束时间 （单位：<strong>jiffies</strong>）</p></li>
+<li><p>Err(SystemError)：错误码</p></li>
+</ul>
+</section>
+<section id="id10">
+<h4>4.2.3. 获取当前系统时间<a class="headerlink" href="#id10" title="Permalink to this heading"></a></h4>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">clock</span><span class="p">()</span><span class="w"> </span>-&gt; <span class="kt">u64</span> 
+</pre></div>
+</div>
+<p><strong>功能</strong></p>
+<p>  获取当前系统时间（单位：<strong>jiffies</strong>）</p>
+</section>
+<section id="n">
+<h4>4.2.4. 计算接下来n毫秒或者微秒对应的定时器时间片<a class="headerlink" href="#n" title="Permalink to this heading"></a></h4>
+<section id="id11">
+<h5>4.2.4.1. 毫秒<a class="headerlink" href="#id11" title="Permalink to this heading"></a></h5>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">next_n_ms_timer_jiffies</span><span class="p">(</span><span class="n">expire_ms</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">u64</span>
+</pre></div>
+</div>
+<p><strong>功能</strong></p>
+<p>  计算接下来n<strong>毫秒</strong>对应的定时器时间片</p>
+<p><strong>参数</strong></p>
+<ul class="simple">
+<li><p>expire_ms：n毫秒</p></li>
+</ul>
+<p><strong>返回值</strong></p>
+<p>  对应的定时器时间片（单位：<strong>毫秒</strong>）</p>
+</section>
+<section id="id12">
+<h5>4.2.4.2. 微秒<a class="headerlink" href="#id12" title="Permalink to this heading"></a></h5>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">next_n_us_timer_jiffies</span><span class="p">(</span><span class="n">expire_us</span>: <span class="kt">u64</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">u64</span>
+</pre></div>
+</div>
+<p><strong>功能</strong></p>
+<p>  计算接下来n<strong>微秒</strong>对应的定时器时间片</p>
+<p><strong>参数</strong></p>
+<ul class="simple">
+<li><p>expire_ms：n微秒</p></li>
+</ul>
+<p><strong>返回值</strong></p>
+<p>  对应的定时器时间片（单位：<strong>微秒</strong>）</p>
+</section>
+</section>
+</section>
+</section>
+<section id="id13">
+<h2>5. 创建定时器实例<a class="headerlink" href="#id13" title="Permalink to this heading"></a></h2>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">struct</span> <span class="nc">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// 结构体的成员对应函数的形参</span>
+<span class="w">    </span><span class="n">example_parameter</span>: <span class="kt">i32</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span> <span class="nf">new</span><span class="p">(</span><span class="n">para</span>: <span class="kt">i32</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Box</span><span class="o">&lt;</span><span class="n">TimerExample</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nb">Box</span>::<span class="n">new</span><span class="p">(</span><span class="n">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">example_parameter</span>: <span class="nc">para</span><span class="p">,</span>
+<span class="w">        </span><span class="p">});</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="sd">/// 为结构体实现TimerFunction特性</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">TimerFunction</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">TimerExample</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// TimerFunction特性中的函数run</span>
+<span class="w">    </span><span class="k">fn</span> <span class="nf">run</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 定时器需要执行的操作</span>
+<span class="w">        </span><span class="n">example_func</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">example_parameter</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="k">fn</span> <span class="nf">example_func</span><span class="p">(</span><span class="n">para</span>: <span class="kt">i32</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;para is {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">para</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="k">fn</span> <span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">timer_example</span>: <span class="nb">Box</span><span class="o">&lt;</span><span class="n">TimerExample</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TimerExample</span>::<span class="n">new</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 创建一个定时器</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">timer</span>: <span class="nc">Arc</span><span class="o">&lt;</span><span class="n">Timer</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Timer</span>::<span class="n">new</span><span class="p">(</span><span class="n">timer_example</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 将定时器插入队列</span>
+<span class="w">    </span><span class="n">timer</span><span class="p">.</span><span class="n">activate</span><span class="p">();</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="页脚">
+        <a href="rt.html" class="btn btn-neutral float-left" title="实时进程调度器相关的api" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> 上一页</a>
+        <a href="../ipc/index.html" class="btn btn-neutral float-right" title="进程间通信" accesskey="n" rel="next">下一页 <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; 版权所有 2022-2025, DragonOS Community.
+      <span class="commit">版本 <code>e3b8983</code>.
+      </span></p>
+  </div>
+
+  利用 <a href="https://www.sphinx-doc.org/">Sphinx</a> 构建，使用的 
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">主题</a>
+    由 <a href="https://readthedocs.org">Read the Docs</a> 开发.
+  
+<div>
+    <br>
+    官网 <a href="https://dragonos.org">https://dragonos.org</a> | 论坛 <a href="https://bbs.dragonos.org.cn">https://bbs.dragonos.org.cn</a> |  <a href="https://dragonos.org">赞助DragonOS，成就未来！</a>
+</div>
+
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  
+<div class="rst-versions" data-toggle="rst-versions" role="note" aria-label="versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    <span class="fa fa-book"> Other Versions</span>
+    v: V0.1.9
+    <span class="fa fa-caret-down"></span>
+  </span>
+  <div class="rst-other-versions">
+    <dl>
+      <dt>Tags</dt>
+      <dd><a href="../../../V0.1.0/index.html">V0.1.0</a></dd>
+      <dd><a href="../../../V0.1.1/index.html">V0.1.1</a></dd>
+      <dd><a href="../../../V0.1.10/kernel/sched/kernel_timer.html">V0.1.10</a></dd>
+      <dd><a href="../../../V0.1.2/index.html">V0.1.2</a></dd>
+      <dd><a href="../../../V0.1.3/index.html">V0.1.3</a></dd>
+      <dd><a href="../../../V0.1.4/index.html">V0.1.4</a></dd>
+      <dd><a href="../../../V0.1.5/index.html">V0.1.5</a></dd>
+      <dd><a href="../../../V0.1.6/index.html">V0.1.6</a></dd>
+      <dd><a href="../../../V0.1.7/kernel/sched/kernel_timer.html">V0.1.7</a></dd>
+      <dd><a href="../../../V0.1.8/kernel/sched/kernel_timer.html">V0.1.8</a></dd>
+      <dd><a href="kernel_timer.html">V0.1.9</a></dd>
+      <dd><a href="../../../V0.2.0/kernel/sched/kernel_timer.html">V0.2.0</a></dd>
+      <dd><a href="../../../V0.3.0/kernel/sched/kernel_timer.html">V0.3.0</a></dd>
+      <dd><a href="../../../V0.4.0/kernel/sched/kernel_timer.html">V0.4.0</a></dd>
+    </dl>
+    <dl>
+      <dt>Branches</dt>
+      <dd><a href="../../../master/kernel/sched/kernel_timer.html">master</a></dd>
+    </dl>
+  </div>
+</div><script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script>  
+
+  <style>
+         .wy-nav-content { max-width: 90%; }
+  </style>
+
+
+
+</body>
+</html>

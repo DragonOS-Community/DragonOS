@@ -6,11 +6,12 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+// Include glibc's mount flag enum before linux/fs.h defines the MS_* macros.
+#include <sys/mount.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
 #include <string>
 #include <sys/ioctl.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 

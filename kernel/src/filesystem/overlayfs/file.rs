@@ -303,8 +303,24 @@ pub(super) fn mmap_effective_file(
     inode: &OvlInode,
     file: &Arc<File>,
 ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
-    let (backing_file, _) = backing_file_for_io(inode, file.private_data.lock())?;
-    Ok(backing_file)
+    match backing_file_for_io(inode, file.private_data.lock()) {
+        Ok((backing_file, _)) => Ok(backing_file),
+        // A shared mapping may outlive the descriptor that created it: after
+        // close() the file no longer carries overlay private data (EBADF),
+        // yet the VMA must keep binding a *real* backing file. OverlayFS has
+        // no page cache of its own, so a mapping bound to the overlay inode
+        // cannot be faulted at all.
+        //
+        // Resolve the current real inode here, once, at mapping creation:
+        // this mirrors ovl_mmap()'s vma_set_file(vma, realfile). Resolving
+        // once also keeps the binding stable, so a later copy-up cannot move
+        // an existing mapping to a different inode.
+        Err(crate::mm::allocation::MemoryAllocationError::System(SystemError::EBADF)) => {
+            let (real_inode, _) = inode.current_realdata_inode()?;
+            open_real_file_with_cred(real_inode, backing_open_flags(file.flags()), file.cred())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn mmap_file(

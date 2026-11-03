@@ -14,6 +14,8 @@ pub mod page_cache;
 pub mod panic;
 pub mod rcu;
 pub mod rng;
+#[cfg(feature = "sched_selftest")]
+pub mod sched;
 pub mod sysfs;
 pub mod task_dump;
 pub mod timekeeping;

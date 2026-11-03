@@ -596,7 +596,7 @@ TEST(TlbShootdown, TeardownRetainsRemoteHolderUntilAcknowledged) {
     EXPECT_NE(std::string::npos, report.find("status=ok\n")) << report;
     EXPECT_NE(std::string::npos, report.find("summary_fail=0\n")) << report;
     for (const char* key : {
-            "smp_available", "holder_admission",
+            "smp_available", "holder_admission", "csd_terminal_retirement",
             "kernel_teardown_order", "kernel_missing_flush_detected", "kernel_missing_ack_detected",
             "user_teardown_order", "user_missing_flush_detected", "user_missing_ack_detected",
             "user_lru_teardown_order", "user_lru_missing_flush_detected", "user_lru_missing_ack_detected", "user_multibatch_teardown_order"}) {

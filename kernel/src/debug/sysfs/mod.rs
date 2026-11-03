@@ -29,6 +29,8 @@ fn debugfs_init() -> Result<(), SystemError> {
     super::fuse::init_debugfs_fuse()?;
     super::kthread::init_debugfs_kthread()?;
     super::rng::init_debugfs_rng()?;
+    #[cfg(feature = "sched_selftest")]
+    super::sched::init_debugfs_sched()?;
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     super::mm::init_debugfs_mm()?;
     super::page_cache::init_debugfs_page_cache()?;

@@ -608,18 +608,84 @@ fn run(
     passed
 }
 
+/// Exercise request retirement with a private slot, never falsifying a live
+/// CPU's lifecycle or installing pointers into the production per-CPU slots.
+fn csd_terminal_retirement_check() -> bool {
+    let slot = CsdFlushTlb::new();
+    let make_info = || FlushTlbInfo {
+        mm: None,
+        start: VirtAddr::new(0),
+        end: VirtAddr::new(0),
+        new_tlb_gen: 0,
+        stride_shift: MMArch::PAGE_SHIFT as u8,
+        freed_tables: false,
+        initiating_cpu: smp_get_processor_id(),
+        observer: None,
+    };
+    // No page-table operations are needed: an empty kernel range still runs
+    // the real claim/complete protocol, with no TlbState changes or invalidation.
+    let _irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+    for claimed_before_stop in [false, true] {
+        {
+            let info = make_info();
+            slot.publish(&info);
+            if slot.done.load(Ordering::Acquire) {
+                return false;
+            }
+            if claimed_before_stop && slot.take() != Some(&info as *const FlushTlbInfo) {
+                return false;
+            }
+            // SAFETY: this fixture has no receiver at all, so no execution
+            // can resume with a claimed pointer. Publication is private.
+            unsafe { slot.retire_dead_target() };
+            if !slot.done.load(Ordering::Acquire) || !slot.info.load(Ordering::Acquire).is_null() {
+                return false;
+            }
+        }
+        // A delayed handler after the old stack object's lifetime must find
+        // nothing. Never dereference a pointer if cancellation was broken.
+        if slot.take().is_some() {
+            return false;
+        }
+        let next = make_info();
+        slot.publish(&next);
+        if slot.done.load(Ordering::Acquire) {
+            return false;
+        }
+        // A delayed old IPI may claim the new request: IPIs have no request
+        // identity. It must complete that request once, without a stale ack.
+        let Some(pointer) = slot.take() else {
+            return false;
+        };
+        if !core::ptr::eq(pointer, &next) || slot.take().is_some() {
+            return false;
+        }
+        slot.complete(pointer, false);
+        if !slot.done.load(Ordering::Acquire) || slot.take().is_some() {
+            return false;
+        }
+    }
+    true
+}
+
 fn run_report(target: ProcessorId) -> String {
     let _vmalloc_serial = crate::mm::vmalloc::lock_teardown_fixture();
     let mut report = String::new();
     use core::fmt::Write;
     let admission_ok = holder_admission_check();
+    let retirement_ok = csd_terminal_retirement_check();
     let _ = writeln!(report, "smp_available=ok");
     let _ = writeln!(
         report,
         "holder_admission={}",
         if admission_ok { "ok" } else { "fail" }
     );
-    let mut failures = usize::from(!admission_ok);
+    let _ = writeln!(
+        report,
+        "csd_terminal_retirement={}",
+        if retirement_ok { "ok" } else { "fail" }
+    );
+    let mut failures = usize::from(!admission_ok) + usize::from(!retirement_ok);
     for (user, lru, mode, key) in [
         (false, false, Mode::Normal, "kernel_teardown_order"),
         (

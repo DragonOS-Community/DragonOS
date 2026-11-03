@@ -2,6 +2,7 @@
 //! it never waits for user memory or task exit while held. Only contended locks
 //! have state: the last frontend reference retires it, allowing libc fastpaths.
 use crate::{
+    arch::ipc::signal::Signal,
     libs::{
         futex::{
             constant::*,
@@ -645,6 +646,7 @@ impl Futex {
                 &mut prepared.registration,
                 false,
             );
+            refresh_priority_locked(&mut registry, &owner);
             if let Some(activation) = prepared.activation.take() {
                 activation.activate();
             }
@@ -654,6 +656,8 @@ impl Futex {
     }
     // Capacity and user-word validation precede this allocation-free graph
     // publication. Direct LOCK_PI and proxy requeue share the same ownership.
+    // The caller refreshes donation after publishing its entire batch, including
+    // a committed prefix on error; each blocked edge is visible immediately.
     fn register_pi_waiter(
         registry: &mut FutexRegistry,
         key: &FutexKey,
@@ -696,7 +700,6 @@ impl Futex {
                 .pi_waiters
                 .push_node(prepared.node.take().expect("prepared waiter link"));
         }
-        refresh_priority_locked(registry, owner);
     }
     fn wait_pi_registered(
         uaddr: VirtAddr,
@@ -706,14 +709,15 @@ impl Futex {
         loop {
             let waited = if prepared.object.handoff.load(Ordering::Acquire) == PENDING
                 && !prepared.timer.as_ref().is_some_and(|timer| timer.fired())
-                && !ProcessManager::current_pcb().has_pending_signal()
+                && !Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
             {
                 prepared.waiter.wait(true)
             } else {
                 Ok(())
             };
             let expired = prepared.timer.as_ref().is_some_and(|timer| timer.fired());
-            let interrupted = waited.is_err() || ProcessManager::current_pcb().has_pending_signal();
+            let interrupted = waited.is_err()
+                || Signal::signal_pending_state(true, false, &ProcessManager::current_pcb());
             let mut registry = FutexData::futex_map();
             match prepared.object.handoff.load(Ordering::Acquire) {
                 ACQUIRED => {

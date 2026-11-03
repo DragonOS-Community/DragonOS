@@ -145,7 +145,8 @@ impl Futex {
             }
             Phase::Source => {
                 let expired = prepared.timer.as_ref().is_some_and(|timer| timer.fired());
-                let interrupted = waited.is_err() || task.has_pending_signal();
+                let interrupted =
+                    waited.is_err() || Signal::signal_pending_state(true, false, &task);
                 let (_, retired, location) = Self::unqueue_waiter(&mut registry, &object)?;
                 drop(registry);
                 drop(retired);
@@ -347,6 +348,13 @@ impl Futex {
                 }
                 Ok(count)
             })();
+            // Source waiters have no PI blocked edge yet; each new edge to the
+            // same owner is cycle-checked above against the published graph.
+            // Publish donation once for the whole batch, even when a later
+            // waiter failed validation after an already committed prefix.
+            if !retired_nodes.is_empty() {
+                refresh_priority_locked(&mut registry, &owner);
+            }
             let retired_bucket = FutexData::remove_empty_locked(&mut registry, &source_key);
             drop(registry);
             // Also drain after a partial-error prefix: an already transferred

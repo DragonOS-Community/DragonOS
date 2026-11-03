@@ -46,6 +46,27 @@ int64_t Now() {
     return int64_t(value.tv_sec) * 1000000000 + value.tv_nsec;
 }
 
+char TaskState(pid_t tid) {
+    if (!tid) return '?';
+    const std::string path = "/proc/" + std::to_string(tid) + "/stat";
+    FILE* file = fopen(path.c_str(), "r");
+    if (!file) return '?';
+    char line[2048]{};
+    const bool read = fgets(line, sizeof(line), file) != nullptr;
+    fclose(file);
+    const char* end_name = read ? strrchr(line, ')') : nullptr;
+    return end_name && end_name[1] == ' ' ? end_name[2] : '?';
+}
+
+bool AwaitSleeping(pid_t tid) {
+    const int64_t end = Now() + 1000000000;
+    while (Now() < end) {
+        if (TaskState(tid) == 'S') return true;
+        usleep(1000);
+    }
+    return false;
+}
+
 // Every waiter has a kernel deadline. In particular, ordinary FUTEX_WAKE is
 // not a cleanup operation for WAIT_REQUEUE_PI: Linux rejects that mismatch.
 class Waiter {
@@ -91,18 +112,7 @@ public:
         const int64_t end = Now() + 1000000000;
         while (Now() < end) {
             const uint32_t id = tid.load();
-            if (id) {
-                const std::string path = "/proc/" + std::to_string(id) + "/stat";
-                FILE* file = fopen(path.c_str(), "r");
-                if (file) {
-                    char line[2048]{};
-                    const bool read = fgets(line, sizeof(line), file) != nullptr;
-                    fclose(file);
-                    char* end_name = read ? strrchr(line, ')') : nullptr;
-                    if (end_name && end_name[1] == ' ' && end_name[2] == 'S')
-                        return true;
-                }
-            }
+            if (id && TaskState(id) == 'S') return true;
             usleep(1000);
         }
         return false;
@@ -342,6 +352,65 @@ TEST_P(RequeuePi, SignalAfterTransferReturnsWouldBlock) {
     EXPECT_EQ(EAGAIN, task.error);
     EXPECT_EQ(0, Futex(&target, FUTEX_UNLOCK_PI | Flags()));
     EXPECT_EQ(0, Requeue(source, target));
+}
+
+TEST_P(RequeuePi, BlockedPendingSignalKeepsPiWaitersAsleep) {
+    for (int operation : {FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_WAIT_REQUEUE_PI}) {
+        SCOPED_TRACE(operation);
+        Word source{0}, target{0};
+        ASSERT_EQ(0, Futex(&target, FUTEX_LOCK_PI | Flags()));
+        std::atomic<uint32_t> tid{0};
+        std::atomic<bool> pending{false};
+        long result = -2, released = -2;
+        uint32_t owner = 0;
+        int error = 0;
+        std::thread worker([&] {
+            sigset_t mask, waiting;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGUSR1);
+            const bool blocked = pthread_sigmask(SIG_BLOCK, &mask, nullptr) == 0;
+            const bool sent = blocked && pthread_kill(pthread_self(), SIGUSR1) == 0;
+            pending.store(sent && sigpending(&waiting) == 0 &&
+                          sigismember(&waiting, SIGUSR1) == 1);
+            tid.store(static_cast<uint32_t>(syscall(SYS_gettid)));
+            if (!pending.load()) return;
+            const timespec deadline = Deadline(3000, operation == FUTEX_LOCK_PI
+                                                           ? CLOCK_REALTIME
+                                                           : CLOCK_MONOTONIC);
+            result = Futex(operation == FUTEX_WAIT_REQUEUE_PI ? &source : &target,
+                           operation | Flags(), 0, &deadline, &target);
+            error = errno;
+            if (result == 0) {
+                owner = target.load() & FUTEX_TID_MASK;
+                released = Futex(&target, FUTEX_UNLOCK_PI | Flags());
+            }
+            // Leave SIGUSR1 blocked until thread exit: the default disposition
+            // must never become a process-wide termination during cleanup.
+        });
+        const int64_t ready = Now() + 1000000000;
+        while (!tid.load() && Now() < ready) usleep(1000);
+        EXPECT_TRUE(pending.load());
+        if (operation == FUTEX_WAIT_REQUEUE_PI) {
+            EXPECT_TRUE(AwaitSleeping(tid.load()));  // Original source wait.
+            EXPECT_EQ(1, AwaitTransfer(source, target));
+        }
+        EXPECT_TRUE(AwaitSleeping(tid.load()));
+        int asleep = 0;
+        // A final successful lock alone misses the regression: a raw pending
+        // bit can cause repeated interrupted/restarted syscalls while masked.
+        // Observe the held-lock interval, where a correct waiter stays asleep.
+        for (int sample = 0; sample < 32; ++sample) {
+            if (TaskState(tid.load()) == 'S') ++asleep;
+            usleep(2000);
+        }
+        EXPECT_GE(asleep, 24);
+        EXPECT_EQ(0, Futex(&target, FUTEX_UNLOCK_PI | Flags()));
+        worker.join();
+        EXPECT_EQ(0, result) << error;
+        EXPECT_EQ(tid.load(), owner);
+        EXPECT_EQ(0, released);
+        EXPECT_EQ(0u, target.load());
+    }
 }
 
 TEST_P(RequeuePi, MismatchedOperationsAndDestinationAreRejected) {

@@ -7,7 +7,7 @@ use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     libs::cpumask::CpuMask,
-    mm::{percpu::PerCpu, VirtAddr, IDLE_PROCESS_ADDRESS_SPACE},
+    mm::{percpu::PerCpu, VirtAddr},
     process::KernelStack,
     sched::{cpu_rq, OnRq, IDLE_CPUS},
     smp::cpu::ProcessorId,
@@ -28,16 +28,12 @@ impl ProcessManager {
             panic!("Idle process already initialized");
         }
 
-        // TODO: 这里需要修正一下判断逻辑
-        // 在 riscv-vf2 中, boot hart 不一定是0, 他可能是1, 因此会过不了
-        //assert!(
-        //    smp_get_processor_id() == ProcessorId::new(0),
-        //    "Idle process must be initialized on the first processor"
-        //);
+        let boot_cpu = crate::smp::core::smp_get_processor_id();
+        assert!(boot_cpu.data() < PerCpu::MAX_CPU_NUM);
         let mut v: Vec<Arc<ProcessControlBlock>> = Vec::with_capacity(PerCpu::MAX_CPU_NUM as usize);
 
         for i in 0..PerCpu::MAX_CPU_NUM {
-            let kstack = if unlikely(i == 0) {
+            let kstack = if unlikely(i == boot_cpu.data()) {
                 let stack_ptr =
                     VirtAddr::new(Self::stack_ptr().data() & (!(KernelStack::ALIGN - 1)));
                 // 初始化bsp的idle进程
@@ -54,9 +50,7 @@ impl ProcessManager {
             let idle_pcb = ProcessControlBlock::new_idle(i, kstack);
 
             assert!(idle_pcb.basic().user_vm().is_none());
-            let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
-            idle_vm.user_count_inc();
-            unsafe { idle_pcb.basic_mut().set_user_vm(Some(idle_vm)) };
+            // Idle borrows the CPU-loaded root, not a counted user mm.
 
             assert!(idle_pcb.sched_info().on_cpu().is_none());
 

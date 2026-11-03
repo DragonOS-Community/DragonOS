@@ -24,6 +24,8 @@ use core::{
 };
 
 #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+pub(crate) mod null_mm_selftest;
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 pub(crate) mod selftest;
 #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 pub(crate) fn teardown_selftest_report() -> alloc::string::String {
@@ -105,7 +107,7 @@ impl FlushTlbInfo {
 /// Per-CPU TLB state
 #[derive(Debug)]
 pub struct TlbState {
-    /// The mm currently loaded in hardware on this CPU (weak reference; drop does not prevent mm release)
+    /// The mm currently loaded in hardware on this CPU; a strong root-lifetime pin.
     loaded_mm: Option<Arc<AddressSpace>>,
     /// The mm tlb_gen this CPU has caught up to
     loaded_tlb_gen: u64,
@@ -360,6 +362,21 @@ pub fn tlb_state_local_mut() -> &'static mut TlbState {
 #[inline]
 pub fn tlb_state_force(cpu: ProcessorId) -> &'static TlbState {
     unsafe { tlb_state().force_get(cpu) }
+}
+
+/// Install the permanent idle root on the current boot CPU before scheduling.
+/// No task lookup or user-mm reference is needed; TLB storage must exist.
+///
+/// # Safety
+/// Caller must be IRQ-off, before this CPU can schedule or publish Online.
+pub(crate) unsafe fn initialize_idle_root() {
+    debug_assert!(!CurrentIrqArch::is_irq_enabled());
+    let cpu = smp_get_processor_id();
+    assert!(tlb_state_force(cpu).loaded_mm.is_none());
+    let idle = crate::mm::IDLE_PROCESS_ADDRESS_SPACE();
+    idle.active_cpus_set(cpu);
+    idle.make_current();
+    tlb_state_set_loaded_mm(idle);
 }
 
 /// After context switch, update this CPU's TlbState to the new mm.

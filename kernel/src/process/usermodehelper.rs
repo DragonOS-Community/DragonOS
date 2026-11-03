@@ -30,6 +30,9 @@ use crate::{
     sched::completion::Completion,
 };
 
+#[cfg(feature = "mm_selftest")]
+pub(crate) mod selftest;
+
 struct HelperResult {
     done: Completion,
     status: SpinLock<Option<Result<i32, SystemError>>>,
@@ -77,6 +80,25 @@ impl UserModeHelper {
         cred: Option<Arc<Cred>>,
         on_exit: Option<HelperExit>,
     ) -> Result<Self, SystemError> {
+        Self::start_internal(
+            path,
+            argv,
+            envp,
+            cred,
+            on_exit,
+            #[cfg(feature = "mm_selftest")]
+            None,
+        )
+    }
+
+    fn start_internal(
+        path: String,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+        cred: Option<Arc<Cred>>,
+        on_exit: Option<HelperExit>,
+        #[cfg(feature = "mm_selftest")] observation: Option<Arc<selftest::Observation>>,
+    ) -> Result<Self, SystemError> {
         // This architecture still has no kthread bootstrap or user switch.
         // Refuse the request instead of reaching either platform todo!().
         if cfg!(target_arch = "loongarch64") {
@@ -93,7 +115,14 @@ impl UserModeHelper {
             Box::new(move || {
                 let (path, argv, envp, cred, on_exit) =
                     args.lock().take().expect("helper closure ran twice");
-                let status = run_supervisor(path, argv, envp, cred);
+                let status = run_supervisor(
+                    path,
+                    argv,
+                    envp,
+                    cred,
+                    #[cfg(feature = "mm_selftest")]
+                    observation.clone(),
+                );
                 if let Some(callback) = on_exit {
                     callback(&status);
                 }
@@ -127,6 +156,7 @@ fn run_supervisor(
     argv: Vec<CString>,
     envp: Vec<CString>,
     cred: Option<Arc<Cred>>,
+    #[cfg(feature = "mm_selftest")] observation: Option<Arc<selftest::Observation>>,
 ) -> Result<i32, SystemError> {
     let parent = ProcessManager::current_pcb();
     // A real SIGCHLD disposition (without SA_NOCLDWAIT) is required for
@@ -138,7 +168,15 @@ fn run_supervisor(
     let exec_error = Arc::try_new(SpinLock::new(None)).map_err(|_| SystemError::ENOMEM)?;
     let child_error = exec_error.clone();
     let closure = KernelThreadClosure::UserMode(Box::new(move || {
-        run_child_prepare(path, argv, envp, cred, child_error)
+        run_child_prepare(
+            path,
+            argv,
+            envp,
+            cred,
+            child_error,
+            #[cfg(feature = "mm_selftest")]
+            observation,
+        )
     }));
     let info = KernelThreadCreateInfo::new(closure, "usermode-helper-exec".into());
     // Calling create() here would reparent the child to kthreadd. The direct
@@ -166,8 +204,13 @@ fn run_child_prepare(
     envp: Vec<CString>,
     cred: Option<Arc<Cred>>,
     exec_error: Arc<SpinLock<Option<SystemError>>>,
+    #[cfg(feature = "mm_selftest")] observation: Option<Arc<selftest::Observation>>,
 ) -> Result<TrapFrame, SystemError> {
     let child = ProcessManager::current_pcb();
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    crate::mm::tlb::null_mm_selftest::prepare_helper(&child, &path)?;
+    #[cfg(feature = "mm_selftest")]
+    let _observation = selftest::observe_child(&child, observation)?;
     if let Some(cred) = cred {
         child.install_cred(cred);
     }
@@ -213,11 +256,16 @@ fn run_child_prepare(
         Err(error) => Err(error.into()),
     };
     drop(path);
+    #[cfg(feature = "mm_selftest")]
+    selftest::prepared(result.is_ok());
     match result {
         Ok(()) => Ok(frame),
         Err(failure) => {
             *exec_error.lock() = Some(failure.error());
             drop(exec_error);
+            // Fatal post-exec failures exit without unwinding this stack.
+            #[cfg(feature = "mm_selftest")]
+            drop(_observation);
             let error = failure.finish();
             // The kthread bootstrap still owns the closure's return path.
             ProcessManager::current_pcb()
@@ -261,5 +309,14 @@ pub(crate) fn run_debug_selftest() -> Result<String, SystemError> {
     if !matches!(failed_exec, Err(SystemError::ENOENT)) {
         return Err(SystemError::EIO);
     }
+    #[cfg(feature = "mm_selftest")]
+    {
+        let mut report = String::from("exec=ok\nmissing_exec=enoent\nwait_reap=ok\n");
+        report.push_str(&selftest::run()?);
+        #[cfg(target_arch = "x86_64")]
+        report.push_str(&crate::mm::tlb::null_mm_selftest::report()?);
+        Ok(report)
+    }
+    #[cfg(not(feature = "mm_selftest"))]
     Ok("exec=ok\nmissing_exec=enoent\nwait_reap=ok\n".into())
 }

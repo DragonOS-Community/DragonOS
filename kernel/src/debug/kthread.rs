@@ -21,6 +21,14 @@ static USERMODE_SELFTEST: KthreadSelftestCallback = KthreadSelftestCallback { us
 
 impl KernFSCallback for KthreadSelftestCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
+        // The parent is executing the other inode's open callback. A real,
+        // registered UMH child uses this inode only for its fixture commands.
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if !self.usermode && crate::mm::tlb::null_mm_selftest::is_control_child() {
+            data.file_private_data_mut()
+                .replace(KernFilePrivateData::DebugTextSnapshot(String::new()));
+            return Ok(());
+        }
         let report = if self.usermode {
             crate::process::usermodehelper::run_debug_selftest()?
         } else {
@@ -53,9 +61,14 @@ impl KernFSCallback for KthreadSelftestCallback {
     fn write(
         &self,
         _data: KernCallbackData,
-        _buf: &[u8],
-        _offset: usize,
+        buf: &[u8],
+        offset: usize,
     ) -> Result<usize, SystemError> {
+        #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+        if !self.usermode && offset == 0 {
+            return crate::mm::tlb::null_mm_selftest::control_write(buf);
+        }
+        let _ = (buf, offset);
         Err(SystemError::EPERM)
     }
 
@@ -73,9 +86,12 @@ pub fn init_debugfs_kthread() -> Result<(), SystemError> {
         None,
         None,
     )?;
+    let selftest_mode = InodeMode::S_IRUSR;
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
+    let selftest_mode = selftest_mode | InodeMode::S_IWUSR;
     kthread.add_file(
         "selftest".to_string(),
-        InodeMode::S_IRUSR,
+        selftest_mode,
         Some(4096),
         None,
         Some(&KTHREAD_SELFTEST),

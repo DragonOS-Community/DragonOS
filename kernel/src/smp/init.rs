@@ -28,6 +28,8 @@ pub fn smp_ap_start_stage2() -> ! {
         park_failed_ap();
     }
 
+    // Register only this AP's actual root before scheduling/Online publication.
+    unsafe { crate::mm::tlb::initialize_idle_root() };
     CurrentSchedArch::initial_setup_sched_local();
     CurrentSchedArch::enable_sched_local();
 

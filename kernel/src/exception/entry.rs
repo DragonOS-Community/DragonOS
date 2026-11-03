@@ -60,6 +60,21 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
         if process_flags_work.contains(ProcessFlags::NEED_SCHEDULE) {
             schedule(SchedMode::SM_PREEMPT);
         } else {
+            if process_flags_work.contains(ProcessFlags::NEED_CHILD_TID) {
+                let pcb = ProcessManager::current_pcb();
+                pcb.flags().remove(ProcessFlags::NEED_CHILD_TID);
+                let addr = pcb.take_set_child_tid();
+                if let Some(addr) = addr {
+                    let child_tid = pcb.task_pid_vnr().data() as i32;
+                    // Like Linux schedule_tail(), write before delivering
+                    // signals, outside the switch locks and with faults enabled.
+                    CurrentIrqArch::interrupt_enable();
+                    let _ =
+                        crate::syscall::user_access::write_one_to_user_protected(addr, &child_tid);
+                    CurrentIrqArch::interrupt_disable();
+                }
+                process_flags_work = pcb.flags().load();
+            }
             if process_flags_work.contains(ProcessFlags::NEED_MEMORY_HIGH) {
                 CurrentIrqArch::interrupt_enable();
                 crate::cgroup::memory::high::handle_user_return();
@@ -69,7 +84,14 @@ unsafe fn exit_to_user_mode_loop(frame: &mut TrapFrame, mut process_flags_work: 
             // 优先处理 rseq，因为信号递送会保存 trapframe 到 sigframe
             // rseq 的 IP fixup 必须在信号递送之前完成
             if process_flags_work.contains(ProcessFlags::NEED_RSEQ) {
+                // Consume before enabling IRQs: preemption/migration while
+                // touching user memory must leave a new notification pending.
+                ProcessManager::current_pcb()
+                    .flags()
+                    .remove(ProcessFlags::NEED_RSEQ);
+                CurrentIrqArch::interrupt_enable();
                 let _ = Rseq::handle_notify_resume(Some(frame));
+                CurrentIrqArch::interrupt_disable();
                 process_flags_work = ProcessManager::current_pcb().flags().load();
             }
 

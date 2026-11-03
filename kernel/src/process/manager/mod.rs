@@ -26,7 +26,6 @@ use crate::{
     },
     sched::{cpu_rq, enqueue_task_on_cpu, select_task_rq, OnRq, SchedClass, WakeupFlags},
     smp::{core::smp_get_processor_id, cpu::ProcessorId, kick_cpu},
-    syscall::user_access::write_one_to_user_protected,
 };
 
 mod exit;
@@ -707,14 +706,6 @@ impl ProcessManager {
         }
 
         crate::sched::notify_cpu_placement(&prev_pcb);
-        let set_child_tid = next_pcb.thread.write_irqsave().set_child_tid.take();
-        if let Some(addr) = set_child_tid {
-            // Align with Linux schedule_tail semantics: best-effort write of tid
-            // when the child task runs for the first time. Failure does not
-            // prevent the thread from continuing.
-            let child_tid = next_pcb.task_pid_vnr().data() as i32;
-            let _ = unsafe { write_one_to_user_protected(addr, &child_tid) };
-        }
     }
 
     /// If the target process is running on a remote CPU, force that CPU into

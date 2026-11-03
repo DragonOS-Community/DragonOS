@@ -1353,9 +1353,11 @@ impl ProcessManager {
             drop(cpuset_guard);
 
             // 设置child_tid，意味着子线程能够知道自己的id。
-            // 按 Linux schedule_tail 语义，在子任务首次运行时再 best-effort 写入。
+            // Publish before the child is woken. The first user-return boundary
+            // writes with IRQs enabled, like Linux schedule_tail().
             if clone_flags.contains(CloneFlags::CLONE_CHILD_SETTID) {
                 pcb.thread.write_irqsave().set_child_tid = Some(clone_args.child_tid);
+                pcb.flags().insert(ProcessFlags::NEED_CHILD_TID);
             }
 
             // The shared user count was installed before registry publication.

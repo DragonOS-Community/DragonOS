@@ -11,7 +11,8 @@
 //! - INV-1: At any point, if CPU `c`'s hardware page table equals `mm.table_paddr`, then bit `c` in `mm.active_cpus` is 1.
 //! - INV-2: `flush_tlb_*` must publish page table writes first, then `inc_mm_tlb_gen`, then read `active_cpus`.
 //! - INV-3: Freeing physical pages / page-table pages must happen after shootdown completion (guaranteed by `MmuGather`).
-//! - INV-4: When `flush_tlb_multi` returns, all target CPUs have finished executing `local_flush_tlb_func`.
+//! - INV-4: On return, each selected target has acknowledged invalidation or entered irreversible `Dead` state;
+//!   no CSD retains the request's stack pointer.
 //! - INV-5: When `freed_tables == true`, the receiving end must handle it (simplified: in this iteration the sender
 //!   sends to all active CPUs regardless, and the receiver unconditionally executes).
 
@@ -52,6 +53,8 @@ use crate::{
 
 #[cfg(target_arch = "x86_64")]
 use crate::libs::spinlock::{SpinLock, SpinLockGuard};
+#[cfg(target_arch = "x86_64")]
+use crate::smp::cpu::CpuHpState;
 
 /// Sentinel end value meaning "flush the entire mm"; combined with start=0 it means "do not use range-based flush".
 pub const TLB_FLUSH_ALL: VirtAddr = VirtAddr::new(usize::MAX);
@@ -170,13 +173,17 @@ pub fn tlb_state_loaded_mm() -> Option<Arc<AddressSpace>> {
 /// 这在语义上仍然正确：页表写入发生在 `done=false`（Release）之前，
 /// handler 的 Acquire 读保证能看到新页表，提前失效不会漏掉任何过期 TLB 项。
 ///
+/// A target that irreversibly stops cannot acknowledge. After observing its
+/// `Dead` publication with Acquire, the sender retires the pointer before
+/// ending the wait. `Dying` is insufficient: teardown still accesses memory.
+///
 /// x86_64 only; RISC-V's `send_ipi(FlushTLB, ..)` uses synchronous SBI `remote_sfence_vma`
 /// and does not need CSD.
 #[cfg(target_arch = "x86_64")]
 pub struct CsdFlushTlb {
     /// 指向本次请求的 `FlushTlbInfo`（发起方栈上对象）；`null` 表示无请求。
     info: AtomicPtr<FlushTlbInfo>,
-    /// 目标 CPU 完成失效后置 `true`。
+    /// Set after invalidation, or after retiring an irreversibly stopped target.
     done: AtomicBool,
 }
 
@@ -213,6 +220,23 @@ impl CsdFlushTlb {
         } else {
             Some(p as *const FlushTlbInfo)
         }
+    }
+
+    /// Retire a request whose target can no longer consume or complete it.
+    ///
+    /// # Safety
+    /// The caller must guarantee no receiver can still consume or complete
+    /// this request. For a published per-CPU slot, this requires an Acquire
+    /// observation of irreversible `Dead` and publication serialization with
+    /// `FLUSH_TLB_GLOBAL_LOCK`. CPU stop must never resume ordinary execution,
+    /// including a suspended receiver. Supporting CPU restart requires a new
+    /// lifecycle handshake before reuse.
+    unsafe fn retire_dead_target(&self) {
+        // Clear even an unclaimed pointer before the sender's stack can unwind.
+        // A pointer already claimed by a terminally stopped receiver will never
+        // be dereferenced again; no live receiver may race this cancellation.
+        let _ = self.info.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        self.done.store(true, Ordering::Release);
     }
 
     /// 执行已取走的请求（调用方保证 `p` 在 `done` 置位前有效）。
@@ -482,15 +506,30 @@ pub fn remote_flush_tlb_on_ipi() {
 /// 1. Page table writes are complete and `inc_mm_tlb_gen` has been called.
 /// 2. `target_cpus` must not include this CPU (local flush is done by the caller after sending IPIs).
 ///
-/// Upon return, all CPUs in `target_cpus` have completed this shootdown (INV-4).
+/// On return, every selected CPU has acknowledged or irreversibly stopped,
+/// and no CSD retains `info` (INV-4).
 fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
     // Filter out offline CPUs to avoid sending IPIs to not-yet-started / offline APICs.
-    // Capture online eligibility once. Every CSD preparation, IPI send and
+    // Capture eligibility once. Every CSD preparation, IPI send and
     // acknowledgement below uses this same private, immutable stack mask.
     let active = AtomicCpuMask::new();
     let my_cpu = smp_get_processor_id();
     for cpu in smp_cpu_manager().present_cpus().iter_cpu() {
-        if cpu != my_cpu && target_cpus.get(cpu) && smp_cpu_manager().is_online_cpu(cpu) {
+        if cpu == my_cpu || !target_cpus.get(cpu) {
+            continue;
+        }
+        // Dying x86 CPUs still execute teardown with IRQs disabled. Include
+        // them until Dead, servicing via lock-contention hooks or retiring the
+        // request after terminal shutdown. Other architectures use synchronous
+        // firmware invalidation and retain their existing online-only policy.
+        #[cfg(target_arch = "x86_64")]
+        let eligible = matches!(
+            smp_cpu_manager().cpuhp_state(cpu).state(),
+            CpuHpState::Online | CpuHpState::Dying
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        let eligible = smp_cpu_manager().is_online_cpu(cpu);
+        if eligible {
             active.set(cpu);
         }
     }
@@ -544,6 +583,13 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
                 spins += 1;
                 if spins & 1023 == 0 {
                     service_pending_inbound_flush();
+                    if smp_cpu_manager().is_dead_cpu(cpu) {
+                        // Acquire observes terminal teardown. Dead cannot be
+                        // restarted by cpu_up(), and stop_this_cpu() will not
+                        // return to a receiver that could still use `info`.
+                        unsafe { csd.retire_dead_target() };
+                        break;
+                    }
                 }
                 #[cfg(feature = "mm_selftest")]
                 if let Some(observer) = &info.observer {
@@ -560,8 +606,8 @@ fn flush_tlb_multi(target_cpus: &AtomicCpuMask, info: &FlushTlbInfo) {
                 }
                 spin_loop();
             }
-            // No cleanup needed: the receiver already swapped the pointer out
-            // (`take`), so the slot is empty once `done` is observed.
+            // Both acknowledgement and terminal retirement leave the slot
+            // empty before the request's stack frame can be released.
         }
     }
 

@@ -12,6 +12,9 @@
 //!
 //! 参考: Linux 6.6.21 kernel/rseq.c
 
+#[cfg(feature = "sched_selftest")]
+pub(crate) mod selftest;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use system_error::SystemError;
@@ -557,6 +560,10 @@ impl Rseq {
     /// 处理 notify-resume
     ///
     /// 在返回用户态前调用，执行 IP 修正和 cpu_id 更新
+    ///
+    /// The user-return caller consumes NEED_RSEQ before calling with IRQs
+    /// enabled. Never clear it here: a preemption/migration during user access
+    /// requires another pass, including when called from signal delivery.
     pub fn handle_notify_resume<F: RseqTrapFrame>(frame: Option<&mut F>) -> Result<(), ()> {
         use crate::{arch::MMArch, mm::MemoryManagementArch};
 
@@ -572,7 +579,6 @@ impl Rseq {
             match rseq_state.registration() {
                 Some(reg) => (reg.ptr, reg.sig),
                 None => {
-                    pcb.flags().remove(ProcessFlags::NEED_RSEQ);
                     return Ok(());
                 }
             }
@@ -585,7 +591,6 @@ impl Rseq {
         if let Some(frame) = frame {
             if let Err(e) = Self::ip_fixup(frame, &access, sig, user_end, &pcb) {
                 log::debug!("rseq ip_fixup failed: {:?}", e);
-                pcb.flags().remove(ProcessFlags::NEED_RSEQ);
                 let _ = crate::ipc::signal::force_kernel_signal_to_current(
                     crate::arch::ipc::signal::Signal::SIGSEGV,
                 );
@@ -595,16 +600,16 @@ impl Rseq {
 
         // 更新 cpu_id 等字段
         let cpu_id = smp_get_processor_id().data() as u32;
+        #[cfg(feature = "sched_selftest")]
+        selftest::after_cpu_id_capture(&pcb);
         if let Err(_e) = unsafe { access.update_cpu_node_id(cpu_id, 0, 0) } {
             // log::debug!("rseq update_cpu_node_id failed: {:?}", e);
-            pcb.flags().remove(ProcessFlags::NEED_RSEQ);
             let _ = crate::ipc::signal::force_kernel_signal_to_current(
                 crate::arch::ipc::signal::Signal::SIGSEGV,
             );
             return Err(());
         }
 
-        pcb.flags().remove(ProcessFlags::NEED_RSEQ);
         Ok(())
     }
 

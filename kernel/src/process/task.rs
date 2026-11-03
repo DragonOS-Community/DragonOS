@@ -2065,6 +2065,12 @@ impl ProcessControlBlock {
         self.rseq_state.write_irqsave()
     }
 
+    /// Consume the first-run child TID address before faultable user access.
+    #[inline]
+    pub(crate) fn take_set_child_tid(&self) -> Option<crate::mm::VirtAddr> {
+        self.thread.write_irqsave().set_child_tid.take()
+    }
+
     pub fn try_siginfo_mut(&self, times: u8) -> Option<RwLockWriteGuard<'_, ProcessSignalInfo>> {
         for _ in 0..times {
             if let Some(r) = self.sig_info.try_write_irqsave() {

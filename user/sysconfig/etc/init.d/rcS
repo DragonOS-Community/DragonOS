@@ -15,7 +15,7 @@ mount -t tmpfs tmpfs /tmp || /bin/busybox mount -t tmpfs tmpfs /tmp
 if [ ! -d /run ]; then
     mkdir -p /run
 fi
-if ! /bin/busybox mountpoint -q /run; then
+if [ "$(/bin/busybox stat -f -c %T /run 2>/dev/null)" != tmpfs ]; then
     if mount -t tmpfs tmpfs /run || /bin/busybox mount -t tmpfs tmpfs /run; then
         /bin/busybox chmod 0755 /run
     else

@@ -281,7 +281,7 @@ control_lock="$DN_IFACE_RUN/control.lock"
 : > "$control_lock" || exit 1
 $DN_BUSYBOX chmod 0600 "$control_lock" || exit 1
 exec 9>"$control_lock" || exit 1
-$DN_BUSYBOX flock -x 9 || exit 1
+$DN_FLOCK -x 9 || exit 1
 
 case "$command" in
     start)

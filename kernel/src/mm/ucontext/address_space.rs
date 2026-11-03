@@ -858,12 +858,10 @@ impl AddressSpace {
 
     /// Get the current process's address space Arc pointer from the PCB
     pub fn current() -> Result<Arc<AddressSpace>, SystemError> {
-        let vm = ProcessManager::current_pcb()
+        ProcessManager::current_pcb()
             .basic()
             .user_vm()
-            .expect("Current process has no address space");
-
-        return Ok(vm);
+            .ok_or(SystemError::EFAULT)
     }
 
     /// Mark this address space as explicitly torn down
@@ -968,7 +966,7 @@ impl AddressSpace {
 
     /// Remove the specified CPU from `active_cpus`.
     ///
-    /// The caller should invoke this before switching the hardware page table to a different mm,
+    /// The caller must invoke this after switching the hardware page table to a different mm,
     /// ensuring that any subsequent shootdown will no longer consider this CPU a target.
     #[inline]
     pub fn active_cpus_clear(&self, cpu: crate::smp::cpu::ProcessorId) {

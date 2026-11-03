@@ -522,22 +522,29 @@ impl ProcessManager {
                 // The CPU-visible active mm is switched to idle here and tracked by
                 // per-CPU TlbState. The PCB-visible user_vm becomes None, matching
                 // Linux task->mm == NULL after exit_mm().
-                let old_user_vm = pcb.with_task_lock_irqsave(|| {
+                let (old_user_vm, retired_loaded) = pcb.with_task_lock_irqsave(|| {
                     let idle_vm = IDLE_PROCESS_ADDRESS_SPACE();
                     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
                     let cpu = smp_get_processor_id();
+                    let old_loaded = crate::mm::tlb::tlb_state_loaded_mm();
                     let mut basic = pcb.basic_mut();
                     let old_vm = unsafe { basic.replace_user_vm(None) };
                     idle_vm.active_cpus_set(cpu);
                     unsafe { idle_vm.make_current() };
-                    if let Some(old_vm) = old_vm.as_ref() {
-                        old_vm.active_cpus_clear(cpu);
+                    if let Some(old) = old_loaded.as_ref() {
+                        if !Arc::ptr_eq(old, &idle_vm) {
+                            old.active_cpus_clear(cpu);
+                        }
                     }
-                    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm) };
+                    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(idle_vm.clone()) };
+                    let retired_loaded = old_loaded.filter(|old| !Arc::ptr_eq(old, &idle_vm));
                     drop(basic);
                     drop(irq_guard);
-                    old_vm
+                    (old_vm, retired_loaded)
                 });
+                if let Some(mm) = retired_loaded {
+                    crate::mm::lazy_mm_drop::enqueue(mm);
+                }
                 if let Some(old_vm) = old_user_vm.as_ref() {
                     // live-- precedes faultable exit cleanup, so every exiting
                     // task preserves the peak, not just the last entrant.

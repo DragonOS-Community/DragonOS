@@ -405,7 +405,18 @@ impl X86_64MMArch {
             VirtAddr::new(address.data() & !MMArch::PAGE_OFFSET_MASK),
             MMArch::PAGE_SIZE,
         );
-        let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
+        let current_address_space: Arc<AddressSpace> = match AddressSpace::current() {
+            Ok(mm) => mm,
+            Err(_) => {
+                // NULL-mm kernel tasks cannot fault in borrowed user mappings.
+                // Preserve exception-table recovery and the existing fatal
+                // boundary for unannotated kernel accesses.
+                if handle_kernel_access_failed(regs) {
+                    return;
+                }
+                panic!("User fault without a current user address space");
+            }
+        };
 
         let mut global_recovery = crate::mm::fault_recovery::GlobalFaultRecoveryState::new();
         let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();

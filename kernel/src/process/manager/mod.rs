@@ -370,6 +370,9 @@ impl ProcessManager {
         debug!("process arch init done.");
         Self::init_idle();
         debug!("process idle init done.");
+        // The current boot stack is now bound to this CPU's idle PCB. This
+        // helper must not call current_pcb before initialization is published.
+        unsafe { crate::mm::tlb::initialize_idle_root() };
 
         unsafe { __PROCESS_MANAGEMENT_INIT_DONE = true };
         info!("Process Manager initialized.");

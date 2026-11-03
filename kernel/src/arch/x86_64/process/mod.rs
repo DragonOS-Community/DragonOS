@@ -780,11 +780,11 @@ impl ProcessManager {
                 next_mm.active_cpus_set(cpu);
             }
 
-            // Ordinary threads sharing the hardware-loaded mm need no CR3
-            // reload. Lazy returns still use the full activation path.
-            let reuse_loaded_mm = prev_user_vm.is_some()
-                && same_mm
-                && crate::mm::tlb::tlb_state_force(cpu).loaded_is(&next_mm);
+            // Lazy borrowers remain active shootdown targets: matching loaded
+            // roots can be reused, including returns from NULL-mm workers.
+            // Do not refresh generation without a real hardware invalidation.
+            let reuse_loaded_mm =
+                same_mm && crate::mm::tlb::tlb_state_force(cpu).loaded_is(&next_mm);
             if !reuse_loaded_mm {
                 next_mm.make_current();
             }

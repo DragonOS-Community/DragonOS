@@ -72,7 +72,7 @@ impl LockedVm {
         let source_mm = {
             let task = ProcessManager::current_pcb();
             let basic = task.basic();
-            basic.user_vm().unwrap()
+            basic.user_vm().ok_or(SystemError::EFAULT)?
         };
         let cloned_mm = source_mm.try_clone_for_task(&ProcessManager::current_pcb())?;
         let kvm = Vm {

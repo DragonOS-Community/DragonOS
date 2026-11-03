@@ -200,7 +200,13 @@ impl ProcessManager {
                 next_mm.active_cpus_set(cpu);
             }
 
-            next_mm.make_current();
+            // NULL-mm borrowers remain active shootdown targets, so a return
+            // to the hardware-loaded root needs no satp reload.
+            let reuse_loaded_mm =
+                same_mm && crate::mm::tlb::tlb_state_force(cpu).loaded_is(&next_mm);
+            if !reuse_loaded_mm {
+                next_mm.make_current();
+            }
             compiler_fence(Ordering::SeqCst);
             // Pairs with remote-user writers: active membership is published
             // before this stale check, and no user instruction can execute
@@ -212,7 +218,11 @@ impl ProcessManager {
                     prev_mm.active_cpus_clear(cpu);
                 }
             }
-            unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone()) };
+            // Preserve the recorded generation when no hardware invalidation
+            // occurred; eager shootdowns still flush before acknowledging.
+            if !reuse_loaded_mm {
+                crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone());
+            }
         }
         // Do not strand temporary owners on a terminal switched-out stack.
         drop(prev_user_vm);

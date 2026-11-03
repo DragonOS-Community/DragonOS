@@ -504,7 +504,12 @@ impl ProcessManager {
         current_pcb: &Arc<ProcessControlBlock>,
         new_pcb: &Arc<ProcessControlBlock>,
     ) -> Result<(), MemoryAllocationError> {
-        let old_address_space = current_pcb.basic().user_vm().ok_or(SystemError::ENOMEM)?;
+        // Like Linux copy_mm: kernel parents have no user-mm to copy.
+        // A Some parent retains the original CLONE_VM/dup semantics.
+        let Some(old_address_space) = current_pcb.basic().user_vm() else {
+            debug_assert!(new_pcb.basic().user_vm().is_none());
+            return Ok(());
+        };
 
         // Match Linux uprobe_copy_process: a new-stack CLONE_VM thread must
         // not inherit its parent's returns; fork and vfork retain the user

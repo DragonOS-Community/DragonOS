@@ -187,6 +187,8 @@ fn do_execve_internal(
     )?;
 
     let old_vm = do_execve_switch_user_vm(address_space.clone());
+    #[cfg(feature = "mm_selftest")]
+    super::usermodehelper::selftest::installed(&address_space, old_vm.as_ref());
 
     // Capture sched_process_exec's old_pid before load_binary_file_with_context:
     // begin_new_exec -> de_thread may swap current's raw_pid with the old
@@ -351,9 +353,10 @@ fn do_execve_internal(
         }) => {
             // Shebang场景：需要递归执行解释器
             // 恢复旧的地址空间
-            if let Some(old_vm) = old_vm {
-                do_execve_switch_user_vm(old_vm);
-            }
+            do_execve_restore_user_vm(old_vm);
+            ProcessManager::release_old_user_vm_if_last(Some(param.vm()));
+            #[cfg(feature = "mm_selftest")]
+            super::usermodehelper::selftest::restored(param.vm(), true, false);
             drop(exec_guard);
             // Release the script's temporary deny before loading its interpreter.
             drop(param);
@@ -393,11 +396,13 @@ fn finish_exec_error(
     error: SystemError,
 ) -> Result<(), ExecFailure> {
     let post_point_of_no_return = param.point_of_no_return();
+    do_execve_restore_user_vm(old_vm.cloned());
+    // The prospective mm has exactly one user reference, also for a NULL-mm
+    // caller. Release it only after restoring the original task/root state.
+    ProcessManager::release_old_user_vm_if_last(Some(param.vm()));
+    #[cfg(feature = "mm_selftest")]
+    super::usermodehelper::selftest::restored(param.vm(), false, post_point_of_no_return);
     if let Some(old_vm) = old_vm {
-        do_execve_switch_user_vm(old_vm.clone());
-        // Drop the failed prospective mm only after switching back to the old
-        // address space, then restore any uprobe state lost to a concurrent scan.
-        ProcessManager::release_old_user_vm_if_last(Some(param.vm()));
         // DragonOS publishes the prospective mm before ELF validation. If a
         // concurrent ENABLE scanned that temporary mm, a recoverable exec
         // failure must provide the complementary replay after restoring the
@@ -429,60 +434,53 @@ fn finish_exec_error(
 /// # 错误处理
 /// 如果地址空间切换失败，函数会触发断言失败，并输出错误信息。
 fn do_execve_switch_user_vm(new_vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+    do_execve_restore_user_vm(Some(new_vm))
+}
+
+/// None restores a kernel caller without attributing its borrowed mm to it.
+fn do_execve_restore_user_vm(new_vm: Option<Arc<AddressSpace>>) -> Option<Arc<AddressSpace>> {
     let pcb = ProcessManager::current_pcb();
-    // Serialize task->mm replacement with mm owner handoff, as exit_mm does.
-    // All callers are outside task_lock; no allocation or faultable cleanup is
-    // performed in this short installation/TLB publication critical section.
-    pcb.with_task_lock_irqsave(|| do_execve_switch_user_vm_locked(new_vm, &pcb))
+    let (old_user, retired_loaded) =
+        pcb.with_task_lock_irqsave(|| do_execve_switch_user_vm_locked(new_vm, &pcb));
+    // Never release a potentially final hardware owner under task/basic locks.
+    if let Some(mm) = retired_loaded {
+        crate::mm::lazy_mm_drop::enqueue(mm);
+    }
+    old_user
 }
 
 fn do_execve_switch_user_vm_locked(
-    new_vm: Arc<AddressSpace>,
+    new_vm: Option<Arc<AddressSpace>>,
     pcb: &Arc<ProcessControlBlock>,
-) -> Option<Arc<AddressSpace>> {
-    // 关中断，防止在设置地址空间的时候，发生中断，然后进调度器，出现错误。
+) -> (Option<Arc<AddressSpace>>, Option<Arc<AddressSpace>>) {
     let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
     let cpu = crate::smp::core::smp_get_processor_id();
-
-    let mut basic_info = pcb.basic_mut();
-    // 暂存原本的用户地址空间的引用(因为如果在切换页表之前释放了它，可能会造成内存use after free)
-    let old_address_space = basic_info.user_vm();
-
-    // Match the scheduler's address-space switch invariant. The temporary
-    // double membership can cause an extra shootdown, but cannot miss one.
-    new_vm.active_cpus_set(cpu);
-
-    // 在pcb中原来的用户地址空间
-    unsafe {
-        basic_info.set_user_vm(None);
-    }
-    // 创建新的地址空间并设置为当前地址空间
-    unsafe {
-        basic_info.set_user_vm(Some(new_vm.clone()));
-    }
-
-    // to avoid deadlock
-    drop(basic_info);
-
-    assert!(
-        AddressSpace::is_current(&new_vm),
-        "Failed to set address space"
-    );
-
-    // 切换到新的用户地址空间
-    unsafe { new_vm.make_current() };
-
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    if let Some(old_vm) = old_address_space.as_ref() {
-        if !Arc::ptr_eq(old_vm, &new_vm) {
-            old_vm.active_cpus_clear(cpu);
+    let target = new_vm
+        .clone()
+        .unwrap_or_else(crate::mm::IDLE_PROCESS_ADDRESS_SPACE);
+    let old_loaded = crate::mm::tlb::tlb_state_loaded_mm();
+    let mut basic = pcb.basic_mut();
+    #[cfg(feature = "mm_selftest")]
+    let restoring_none = new_vm.is_none();
+    let old_user = unsafe { basic.replace_user_vm(new_vm) };
+    target.active_cpus_set(cpu);
+    drop(basic);
+    unsafe { target.make_current() };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    if let Some(old) = old_loaded.as_ref() {
+        if !Arc::ptr_eq(old, &target) {
+            old.active_cpus_clear(cpu);
         }
     }
-    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(new_vm.clone()) };
-
+    // old_loaded keeps the displaced owner alive through this replacement.
+    unsafe { crate::mm::tlb::tlb_state_set_loaded_mm(target.clone()) };
+    #[cfg(feature = "mm_selftest")]
+    if restoring_none {
+        super::usermodehelper::selftest::restoring_none_root(&target);
+    }
+    let retired_loaded = old_loaded.filter(|old| !Arc::ptr_eq(old, &target));
     drop(irq_guard);
-
-    old_address_space
+    (old_user, retired_loaded)
 }
 
 fn commit_exec_futex_state(

@@ -25,8 +25,7 @@ impl Syscall for SysGetGroups {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         let size = args[0] as i32;
         if size < 0 {
             return Err(SystemError::EINVAL);
@@ -79,7 +78,7 @@ impl Syscall for SysSetGroups {
         let pcb = ProcessManager::current_pcb();
 
         // Linux: requires CAP_SETGID in the current user namespace.
-        let current_cred = pcb.cred();
+        let current_cred = pcb.objective_cred();
         let user_ns = current_cred.user_ns.clone();
         if !crate::process::cred::ns_capable_setid(&user_ns, CAPFlags::CAP_SETGID) {
             return Err(SystemError::EPERM);

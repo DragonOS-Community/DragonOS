@@ -40,8 +40,7 @@ impl Syscall for SysGetResUid {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
 
         let ruid = from_kuid_munged(&cred.user_ns, cred.uid);
         let euid = from_kuid_munged(&cred.user_ns, cred.euid);

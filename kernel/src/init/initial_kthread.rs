@@ -102,6 +102,7 @@ fn kenrel_init_freeable() -> Result<(), SystemError> {
         panic!("Failed to initialize subsystems: {:?}", err);
     });
     smp_init();
+    crate::exception::softirq::start_workers()?;
     #[cfg(target_arch = "x86_64")]
     {
         if let Err(error) = crate::text_patch::init_live() {

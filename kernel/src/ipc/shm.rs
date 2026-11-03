@@ -479,7 +479,7 @@ impl ShmManager {
         let shm_id = ShmId::new(ipc_id.raw);
 
         // 创建共享内存段信息结构体
-        let current_cred = ProcessManager::current_pcb().cred();
+        let current_cred = ProcessManager::current_cred();
         let kern_ipc_perm = KernIpcPerm::new_with_cred(
             shm_id,
             key,
@@ -589,7 +589,7 @@ impl ShmManager {
             .checked_add(MMArch::PAGE_SIZE - 1)
             .ok_or(SystemError::ENOMEM)?
             & !(MMArch::PAGE_SIZE - 1);
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         let uid = cred.uid.data();
         let account_user_ns = cred.user_ns.clone();
         let account_key = SysVShmMemlockAccountKey::new(&account_user_ns, uid);

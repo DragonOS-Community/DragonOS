@@ -24,7 +24,7 @@ impl Syscall for SysSetFsgid {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let old_fsgid = old_cred.fsgid;
         let old_visible = from_kgid_munged(&old_cred.user_ns, old_fsgid) as usize;
         let Ok(fsgid) = make_kgid(&old_cred.user_ns, Self::fsgid(args) as u32) else {

@@ -374,9 +374,14 @@ impl CpuTimeFunc {
             pcb.account_utime(accounted_cputime);
             pcb.account_cgroup_cputime(true, accounted_cputime);
         } else {
-            // 系统态时间：记入 SYSTEM
-            // IRQ 和 SOFTIRQ 通过 account_other_time() 在 tick 中单独记账
-            kcpustat.account(CpuUsageStat::System, accounted_cputime);
+            // Daemon execution remains task stime, but Linux classifies its
+            // global CPU time as SOFTIRQ instead of SYSTEM.
+            let index = if crate::exception::softirq::is_current_softirqd() {
+                CpuUsageStat::Softirq
+            } else {
+                CpuUsageStat::System
+            };
+            kcpustat.account(index, accounted_cputime);
             pcb.account_stime(accounted_cputime);
             pcb.account_cgroup_cputime(false, accounted_cputime);
         }

@@ -2160,6 +2160,16 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         self.find(name)
     }
 
+    /// Read the live inode number and type of an ordinary directory entry.
+    /// Enumeration describes this directory's backing entry; it must not
+    /// follow child mounts or trigger automounts as pathname lookup does.
+    /// The caller handles dot entries using the opened directory's projection.
+    fn directory_entry_metadata(&self, name: &[u8]) -> Result<(InodeId, FileType), SystemError> {
+        let child = self.find_bytes(name)?;
+        let metadata = child.metadata()?;
+        Ok((child.reported_ino(&metadata), metadata.file_type))
+    }
+
     /// @brief 根据inode号，获取子目录项的名字
     ///
     /// @param ino inode号
@@ -2491,9 +2501,7 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
         metadata: &Metadata,
         mask: PermissionMask,
     ) -> Result<(), SystemError> {
-        ProcessManager::current_pcb()
-            .cred()
-            .inode_permission(metadata, mask.bits())
+        ProcessManager::current_cred().inode_permission(metadata, mask.bits())
     }
 
     /// Authorize following a dynamic symlink without changing O_PATH|NOFOLLOW.
@@ -2960,8 +2968,8 @@ impl dyn IndexNode {
 
         // 处理绝对路径
         // result: 上一个被找到的inode
-        // rest_path: 还没有查找的路径
-        let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+        // path_buffer owns the path while cursor advances over borrowed components.
+        let (mut result, mut path_buffer) = if let Some(rest) = path.strip_prefix('/') {
             if options.is_some_and(|options| {
                 options
                     .resolve
@@ -2990,13 +2998,14 @@ impl dyn IndexNode {
             (start, String::from(path))
         };
 
+        let mut cursor = 0;
         let mut symlink_follows_remaining = max_follow_times;
         // Allocate the PATH_MAX read buffer lazily and reuse it for the whole
         // walk. A symlink chain must not amplify allocator work per hop.
         let mut symlink_buffer: Option<Vec<u8>> = None;
 
         // 逐级查找文件
-        while !rest_path.is_empty() {
+        while cursor < path_buffer.len() {
             // Reuse one metadata snapshot for the directory and permission
             // checks. Uncached FUSE/virtiofs attributes otherwise require
             // two GETATTR round trips for this path component.
@@ -3009,18 +3018,20 @@ impl dyn IndexNode {
             // 这确保了进程有权限遍历到此目录（对 Remote 权限模型的 FS，该检查会被绕过）
             permission::check_inode_permission(&result, &metadata, PermissionMask::MAY_EXEC)?;
 
-            let name;
-            // 寻找"/"
-            match rest_path.find('/') {
+            // Slash offsets are UTF-8 boundaries. Borrow the component and
+            // suffix instead of copying the remaining path at every level.
+            let remaining = &path_buffer[cursor..];
+            let name = match remaining.find('/') {
                 Some(pos) => {
-                    name = String::from(&rest_path[0..pos]);
-                    rest_path = String::from(&rest_path[pos + 1..]);
+                    cursor += pos + 1;
+                    &remaining[..pos]
                 }
                 None => {
-                    name = rest_path;
-                    rest_path = String::new();
+                    cursor = path_buffer.len();
+                    remaining
                 }
-            }
+            };
+            let rest_path = &path_buffer[cursor..];
 
             // 遇到连续多个"/"的情况
             if name.is_empty() {
@@ -3052,7 +3063,7 @@ impl dyn IndexNode {
             let lookup = if let Some(mounted) = result.clone().downcast_arc::<mount::MountFSInode>()
             {
                 mounted.lookup_from_resolved(
-                    &name,
+                    name,
                     no_xdev,
                     !has_more_components
                         && !trailing_slash
@@ -3068,14 +3079,14 @@ impl dyn IndexNode {
             } {
                 Ok(result.clone())
             } else if cache_only {
-                result.cached_find(&name)
+                result.cached_find(name)
             } else if !has_more_components
                 && !trailing_slash
                 && options.is_some_and(|options| options.no_automount)
             {
-                result.find_no_automount(&name)
+                result.find_no_automount(name)
             } else {
-                result.find(&name)
+                result.find(name)
             };
             let inode = match lookup {
                 Ok(inode) => inode,
@@ -3086,7 +3097,7 @@ impl dyn IndexNode {
                 {
                     return Ok(PathWalkOutcome::MissingFinal {
                         ownership: parent_ownership,
-                        name,
+                        name: String::from(name),
                         must_be_dir: trailing_slash,
                     });
                 }
@@ -3243,7 +3254,7 @@ impl dyn IndexNode {
                 let new_path = if rest_path.is_empty() {
                     link_path
                 } else {
-                    link_path + "/" + &rest_path
+                    link_path + "/" + rest_path
                 };
                 // A slash required by the unresolved suffix (for example the
                 // original `link/`) remains authoritative after expansion;
@@ -3253,7 +3264,7 @@ impl dyn IndexNode {
                 // 处理 symlink 目标为绝对路径或相对路径
                 // 绝对路径：从进程 root 开始
                 // 相对路径：从当前 result（symlink 所在目录）开始
-                if let Some(rest) = new_path.strip_prefix('/') {
+                if new_path.starts_with('/') {
                     if options.is_some_and(|options| {
                         options
                             .resolve
@@ -3284,10 +3295,12 @@ impl dyn IndexNode {
                                 .derive()?,
                         );
                     }
-                    rest_path = String::from(rest);
+                    cursor = 1;
+                    path_buffer = new_path;
                 } else {
                     ownership = parent_ownership;
-                    rest_path = new_path;
+                    cursor = 0;
+                    path_buffer = new_path;
                 }
 
                 // 继续迭代（不递归）
@@ -4173,7 +4186,7 @@ impl FsCreationContext {
     pub fn current() -> Self {
         let pcb = ProcessManager::current_pcb();
         Self {
-            cred: pcb.cred(),
+            cred: ProcessManager::current_cred(),
             pid_ns: pcb.active_pid_ns(),
             net_ns: ProcessManager::current_netns(),
             mnt_ns: ProcessManager::current_mntns(),
@@ -4329,6 +4342,8 @@ pub struct FilldirContext<'a> {
     remain_size: usize,
     error: Option<SystemError>,
     format: DirentFormat,
+    // Reuse one record buffer for this syscall, without retaining directory data.
+    dirent_data: Vec<u8>,
 }
 
 impl<'a> FilldirContext<'a> {
@@ -4340,6 +4355,7 @@ impl<'a> FilldirContext<'a> {
             current_pos: 0,
             error: None,
             format,
+            dirent_data: Vec::new(),
         }
     }
 
@@ -4385,7 +4401,10 @@ impl<'a> FilldirContext<'a> {
         // 获取当前写入位置的偏移量
         let buf_start = self.current_pos;
         // 在内核空间构建完整的 dirent 数据
-        let mut dirent_data = vec![0u8; align_up_reclen];
+        // Reset every byte, including padding, when reusing a previous record.
+        self.dirent_data.clear();
+        self.dirent_data.resize(align_up_reclen, 0);
+        let dirent_data = &mut self.dirent_data;
 
         // 根据格式填充结构
         match self.format {
@@ -4438,7 +4457,7 @@ impl<'a> FilldirContext<'a> {
         }
         // 使用受保护的方法写入用户缓冲区
         // 如果写入失败（例如访问不可写页面），应当返回 EFAULT
-        if let Err(_e) = self.user_buf.write_to_user(buf_start, &dirent_data) {
+        if let Err(_e) = self.user_buf.write_to_user(buf_start, dirent_data) {
             self.error = Some(SystemError::EFAULT);
             return Err(SystemError::EFAULT);
         }

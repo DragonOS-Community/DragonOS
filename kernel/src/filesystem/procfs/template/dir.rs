@@ -285,9 +285,7 @@ pub trait DirOps: Sync + Send + Sized + Debug {
         metadata: &Metadata,
         mask: crate::filesystem::vfs::permission::PermissionMask,
     ) -> Result<(), SystemError> {
-        crate::process::ProcessManager::current_pcb()
-            .cred()
-            .inode_permission(metadata, mask.bits())
+        crate::process::ProcessManager::current_cred().inode_permission(metadata, mask.bits())
     }
 
     fn reported_ino(&self, metadata: &Metadata) -> InodeId {

@@ -154,7 +154,7 @@ impl ProcessManager {
         }
 
         let user_ns = if clone_flags.contains(CloneFlags::CLONE_NEWUSER) {
-            let mut new_cred = (*child_pcb.cred()).clone();
+            let mut new_cred = (*child_pcb.objective_cred()).clone();
             let new_user_ns =
                 crate::process::namespace::user_namespace::UserNamespace::create_user_ns(
                     &new_cred,
@@ -163,7 +163,7 @@ impl ProcessManager {
             child_pcb.set_cred(Cred::new_arc(new_cred))?;
             new_user_ns
         } else {
-            child_pcb.cred().user_ns.clone()
+            child_pcb.objective_cred().user_ns.clone()
         };
 
         /*
@@ -304,7 +304,7 @@ impl Default for NsCommon {
 /// https://code.dragonos.org.cn/xref/linux-6.6.21/kernel/nsproxy.c?fi=exec_task_namespaces#259
 pub fn exec_task_namespaces() -> Result<(), SystemError> {
     let tsk = ProcessManager::current_pcb();
-    let user_ns = tsk.cred().user_ns.clone();
+    let user_ns = tsk.objective_cred().user_ns.clone();
     let new_nsproxy = create_new_namespaces(&CloneFlags::empty(), &tsk, user_ns)?;
     // todo: time_ns的逻辑
     let fs_refs = crate::process::lock_fs_refs_copy();
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn namespace_only_commit_does_not_reacquire_exec_lock() {
         let pcb = test_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let new_nsproxy = Arc::new(pcb.nsproxy().clone_inner());
         let _exec_guard = pcb.exec_update_write();
         let fs_refs = crate::process::lock_fs_refs_copy();
@@ -542,7 +542,7 @@ mod tests {
 
         prepared.commit(&pcb, fs_refs).unwrap();
         assert!(Arc::ptr_eq(&pcb.nsproxy(), &new_nsproxy));
-        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+        assert!(Arc::ptr_eq(&pcb.objective_cred(), &old_cred));
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
         let old_fs = pcb.fs_struct();
         // An observation Arc is not a second task. Model a real shared slot.
         let _shared_user = crate::filesystem::fs::FsAttachment::new(old_fs.clone());
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
 
         let mut target = old_nsproxy.clone_inner();
@@ -580,7 +580,7 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
         assert!(Arc::ptr_eq(&pcb.fs_struct(), &old_fs));
-        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+        assert!(Arc::ptr_eq(&pcb.objective_cred(), &old_cred));
         assert!(Arc::ptr_eq(&pcb.sem_undo_group().unwrap(), &old_group));
         assert_eq!(old_group.task_owners_for_test(), 1);
         assert_eq!(old_group.replay_count_for_test(), 0);
@@ -591,7 +591,7 @@ mod tests {
         let pcb = test_pcb();
         let old_nsproxy = pcb.nsproxy();
         let old_fs = pcb.fs_struct();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let old_group = pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
         let prepared_cred = Cred::new_arc((*old_cred).clone());
         let fs_refs = crate::process::lock_fs_refs_copy();
@@ -614,7 +614,7 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&pcb.nsproxy(), &old_nsproxy));
         assert!(Arc::ptr_eq(&pcb.fs_struct(), &old_fs));
-        assert!(Arc::ptr_eq(&pcb.cred(), &old_cred));
+        assert!(Arc::ptr_eq(&pcb.objective_cred(), &old_cred));
         assert!(Arc::ptr_eq(&pcb.sem_undo_group().unwrap(), &old_group));
         assert_eq!(old_group.task_owners_for_test(), 1);
         assert_eq!(old_group.replay_count_for_test(), 0);
@@ -625,7 +625,7 @@ mod tests {
         let pcb = test_pcb();
         let old_nsproxy = pcb.nsproxy();
         pcb.ensure_sem_undo_group(&old_nsproxy.ipc_ns).unwrap();
-        let prepared_cred = Cred::new_arc((*pcb.cred()).clone());
+        let prepared_cred = Cred::new_arc((*pcb.objective_cred()).clone());
         let fs_refs = crate::process::lock_fs_refs_copy();
         let prepared = PreparedNamespaceInstall::prepare_for_setns(
             &pcb,

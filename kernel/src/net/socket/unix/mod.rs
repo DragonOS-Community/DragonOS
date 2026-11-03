@@ -98,7 +98,7 @@ pub(super) struct PeerCred {
 impl PeerCred {
     pub(super) fn current() -> Self {
         let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         Self {
             pid: pcb.task_pid_ptr(PidType::TGID),
             euid: cred.euid,
@@ -108,7 +108,7 @@ impl PeerCred {
 
     fn visible(&self) -> UCred {
         let pcb = ProcessManager::current_pcb();
-        let user_ns = pcb.cred().user_ns.clone();
+        let user_ns = ProcessManager::current_cred().user_ns.clone();
         let pid_ns = pcb.active_pid_ns();
         UCred {
             pid: self
@@ -145,7 +145,7 @@ pub(super) fn write_peercred_option(value: &mut [u8], peer: Option<&PeerCred>) -
 /// Return current task credentials used for unix-domain SCM_CREDENTIALS.
 pub fn current_ucred() -> UCred {
     let pcb = ProcessManager::current_pcb();
-    let cred = pcb.cred();
+    let cred = ProcessManager::current_cred();
     UCred {
         pid: pcb.raw_tgid().data() as i32,
         uid: cred.uid.data() as u32,

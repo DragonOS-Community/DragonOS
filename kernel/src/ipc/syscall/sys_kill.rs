@@ -71,8 +71,8 @@ pub fn check_signal_permission_pcb_with_sig(
     sig: Option<Signal>,
 ) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
-    let current_cred = current_pcb.cred();
-    let target_cred = target.cred();
+    let current_cred = ProcessManager::current_cred();
+    let target_cred = target.objective_cred();
 
     if Arc::ptr_eq(&current_pcb.process_signal(), &target.process_signal()) {
         return Ok(());

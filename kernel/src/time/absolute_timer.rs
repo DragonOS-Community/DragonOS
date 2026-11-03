@@ -16,7 +16,10 @@ use crate::{
         rbtree::{PreparedNode, RBTree},
         spinlock::SpinLock,
     },
+    smp::cpu::ProcessorId,
 };
+
+use super::deadline::{self, DeadlineCallback, DeadlineEvent};
 
 const PREPARED: u8 = 0;
 const QUEUED: u8 = 1;
@@ -24,11 +27,133 @@ const FIRED: u8 = 2;
 const CANCELLED: u8 = 3;
 const CLOCK_SET_BUDGET: usize = 20;
 type Key = (u64, usize);
-type Queue = SpinLock<RBTree<Key, Arc<AbsoluteTimer>>>;
+type TimerTree = RBTree<Key, Arc<AbsoluteTimer>>;
+type TimerNode = PreparedNode<Key, Arc<AbsoluteTimer>>;
+
+struct AbsoluteBase {
+    monotonic: TimerTree,
+    realtime: TimerTree,
+    // Installed once and never removed: event.cancel cannot retire its last Arc.
+    driver: Option<Arc<DeadlineEvent>>,
+}
+
+impl AbsoluteBase {
+    fn new() -> Self {
+        Self {
+            monotonic: RBTree::new(),
+            realtime: RBTree::new(),
+            driver: None,
+        }
+    }
+
+    fn tree(&self, domain: AbsoluteClock) -> &TimerTree {
+        match domain {
+            AbsoluteClock::Monotonic => &self.monotonic,
+            AbsoluteClock::Realtime => &self.realtime,
+        }
+    }
+
+    fn head_deadline(&self, domain: AbsoluteClock) -> Option<u64> {
+        self.tree(domain).get_first().map(|(key, _)| key.0)
+    }
+
+    fn tree_mut(&mut self, domain: AbsoluteClock) -> &mut TimerTree {
+        match domain {
+            AbsoluteClock::Monotonic => &mut self.monotonic,
+            AbsoluteClock::Realtime => &mut self.realtime,
+        }
+    }
+}
 
 lazy_static! {
-    static ref MONOTONIC: Queue = SpinLock::new(RBTree::new());
-    static ref REALTIME: Queue = SpinLock::new(RBTree::new());
+    static ref BASE: SpinLock<AbsoluteBase> = SpinLock::new(AbsoluteBase::new());
+}
+
+#[derive(Debug)]
+struct TimerNotification;
+
+impl DeadlineCallback for TimerNotification {
+    fn expire(&self, _now_ns: u64) -> Option<u64> {
+        softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+        None
+    }
+}
+
+/// Called once, after registering TIMER softirq and outside resource locks.
+/// Failure leaves the existing periodic service available.
+pub(super) fn init_deadline_driver() -> Result<(), SystemError> {
+    let callback = Arc::try_new(TimerNotification).map_err(|_| SystemError::ENOMEM)?;
+    let event =
+        DeadlineEvent::try_new(ProcessorId::new(0), callback).map_err(|_| SystemError::ENOMEM)?;
+    let mut base = BASE.lock_irqsave();
+    assert!(
+        base.driver.is_none(),
+        "absolute timer driver initialized twice"
+    );
+    base.driver = Some(event);
+    drop(base);
+    refresh_deadline_driver();
+    Ok(())
+}
+
+/// Callers must release timekeeper/owner queue locks before acquiring BASE.
+pub(crate) fn refresh_deadline_driver() {
+    let base = BASE.lock_irqsave();
+    let raise = refresh_locked(&base);
+    drop(base);
+    if raise {
+        softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+    }
+}
+
+// TK read is released before event.arm/cancel: owner queue programming itself
+// reads TK. Never carry a TK guard into the deadline owner queue.
+fn refresh_locked(base: &AbsoluteBase) -> bool {
+    let driver = &base.driver;
+    let mono_head = base.monotonic.get_first().map(|(key, _)| key.0);
+    let real_head = base.realtime.get_first().map(|(key, _)| key.0);
+    if mono_head.is_none() && real_head.is_none() {
+        if let Some(event) = driver.as_ref() {
+            event.cancel();
+        }
+        return false;
+    }
+
+    let (mono_now, real_now) = timekeeping::timer_clock_snapshot();
+    let due = mono_head.is_some_and(|head| head <= mono_now)
+        || real_head.is_some_and(|head| i128::from(head) <= real_now);
+    if due {
+        // Never turn an expired frontier into a stream of 1ns hardware IRQs.
+        // The softirq's running owner rechecks this frontier after releasing
+        // its gate, including when another CPU consumed a pending notification.
+        if let Some(event) = driver.as_ref() {
+            event.cancel();
+        }
+        return true;
+    }
+
+    let Some(event) = driver.as_ref() else {
+        return false;
+    };
+    if !deadline::global_timer_capable() {
+        event.cancel();
+        return false;
+    }
+    let real_projected = real_head.map(|head| {
+        let remaining = (i128::from(head) - real_now).min(i128::from(u64::MAX)) as u64;
+        mono_now.saturating_add(remaining)
+    });
+    let next = match (mono_head, real_projected) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => unreachable!(),
+    };
+    // A capability/initialization transition can race admission. Keep the
+    // original queue published and periodically serviced if arming fails.
+    if event.arm(next).is_err() {
+        event.cancel();
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,13 +169,6 @@ impl AbsoluteClock {
             Self::Realtime => timekeeping::realtime_now(),
         }
         .to_ktime_ns()
-    }
-
-    fn queue(self) -> &'static Queue {
-        match self {
-            Self::Monotonic => &MONOTONIC,
-            Self::Realtime => &REALTIME,
-        }
     }
 }
 
@@ -76,12 +194,13 @@ impl PreparedAbsoluteTimer {
     /// Infallible, one-shot publication. An earlier cancellation stays cancelled.
     pub(crate) fn activate(self) -> Arc<AbsoluteTimer> {
         let timer = self.timer;
-        publish(timer.clock.queue(), &timer, self.node);
-        // Sampling outside the queue lock prevents timekeeper/queue nesting.
-        // A concurrent clock change is also covered by the next periodic tick.
-        if timer.state.load(Ordering::Acquire) == QUEUED
-            && timer.deadline_ns <= timer.clock.now_ns()
-        {
+        let mut base = BASE.lock_irqsave();
+        let before = base.head_deadline(timer.clock);
+        let rejected = publish(base.tree_mut(timer.clock), &timer, self.node);
+        let raise = before != base.head_deadline(timer.clock) && refresh_locked(&base);
+        drop(base);
+        drop(rejected);
+        if raise {
             softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
         }
         timer
@@ -118,7 +237,16 @@ impl AbsoluteTimer {
 
     /// A callback already selected for expiry may still run after cancellation.
     pub(crate) fn cancel(&self) -> bool {
-        cancel_in(self.clock.queue(), self)
+        let mut base = BASE.lock_irqsave();
+        let before = base.head_deadline(self.clock);
+        let (cancelled, retired) = cancel_in(base.tree_mut(self.clock), self);
+        let raise = cancelled && before != base.head_deadline(self.clock) && refresh_locked(&base);
+        drop(base);
+        drop(retired);
+        if raise {
+            softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
+        }
+        cancelled
     }
 
     fn key(&self) -> Key {
@@ -134,76 +262,78 @@ impl AbsoluteTimer {
     }
 }
 
-fn publish(queue: &Queue, timer: &Arc<AbsoluteTimer>, node: PreparedNode<Key, Arc<AbsoluteTimer>>) {
-    let mut queue = queue.lock_irqsave();
+// Caller retires returned storage outside the base lock.
+fn publish(tree: &mut TimerTree, timer: &Arc<AbsoluteTimer>, node: TimerNode) -> Option<TimerNode> {
     if timer.state.load(Ordering::Relaxed) == PREPARED {
         timer.state.store(QUEUED, Ordering::Release);
-        queue.insert_prepared(node);
+        tree.insert_prepared(node);
+        None
     } else {
-        drop(queue);
-        drop(node);
+        Some(node)
     }
 }
 
-fn cancel_in(queue: &Queue, timer: &AbsoluteTimer) -> bool {
-    let mut queue = queue.lock_irqsave();
+fn cancel_in(tree: &mut TimerTree, timer: &AbsoluteTimer) -> (bool, Option<TimerNode>) {
     let state = timer.state.load(Ordering::Relaxed);
     if state == FIRED || state == CANCELLED {
-        return false;
+        return (false, None);
     }
     timer.state.store(CANCELLED, Ordering::Release);
-    let retired = queue.remove(&timer.key());
-    drop(queue);
-    drop(retired);
-    true
+    (true, tree.extract(&timer.key()))
 }
 
-fn pin_head(queue: &Queue) -> Result<Option<Arc<AbsoluteTimer>>, SystemError> {
+fn pin_head(domain: AbsoluteClock) -> Result<Option<Arc<AbsoluteTimer>>, SystemError> {
     for _ in 0..10 {
-        if let Ok(queue) = queue.try_lock_irqsave() {
-            return Ok(queue.get_first().map(|(_, timer)| timer.clone()));
+        if let Ok(base) = BASE.try_lock_irqsave() {
+            return Ok(base
+                .tree(domain)
+                .get_first()
+                .map(|(_, timer)| timer.clone()));
         }
     }
     Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
 }
 
-/// The candidate must have existed before the caller sampled its domain clock.
-/// Pinning it prevents address reuse; one-shot timers cannot rearm the same key.
+// Validate and sample under the same base guard. The detached node must be
+// consumed after unlocking, including its allocation and last callback owner.
 fn take_sampled_due(
-    queue: &Queue,
+    tree: &mut TimerTree,
     candidate: &Arc<AbsoluteTimer>,
-    now: u64,
-) -> Option<Arc<AbsoluteTimer>> {
-    if candidate.deadline_ns > now {
-        return None;
-    }
-    let mut queue = queue.try_lock_irqsave().ok()?;
-    if queue
+    sample_clock: impl FnOnce() -> u64,
+) -> Option<TimerNode> {
+    if tree
         .get_first()
         .is_none_or(|(_, timer)| !Arc::ptr_eq(timer, candidate))
     {
         return None;
     }
-    let (_, timer) = queue.pop_first().expect("pinned absolute timer head");
-    timer.state.store(FIRED, Ordering::Release);
-    Some(timer)
+    if candidate.deadline_ns > sample_clock() {
+        return None;
+    }
+    candidate.state.store(FIRED, Ordering::Release);
+    tree.extract(&candidate.key())
 }
 
 pub(super) fn run_one_due(domain: AbsoluteClock) -> bool {
-    let Ok(Some(candidate)) = pin_head(domain.queue()) else {
+    let Ok(Some(candidate)) = pin_head(domain) else {
         return false;
     };
-    let now = domain.now_ns();
-    let Some(timer) = take_sampled_due(domain.queue(), &candidate, now) else {
+    let retired = {
+        let Ok(mut base) = BASE.try_lock_irqsave() else {
+            return false;
+        };
+        take_sampled_due(base.tree_mut(domain), &candidate, || domain.now_ns())
+    };
+    let Some(node) = retired else {
         return false;
     };
-    // Both callback invocation and last references retire outside queue locks.
+    let (_, timer) = node.into_pair();
     timer.run();
     true
 }
 
 pub(super) fn first_expire(domain: AbsoluteClock) -> Result<Option<u64>, SystemError> {
-    let Some(candidate) = pin_head(domain.queue())? else {
+    let Some(candidate) = pin_head(domain)? else {
         return Ok(None);
     };
     let remaining = candidate.deadline_ns.saturating_sub(domain.now_ns());
@@ -224,6 +354,7 @@ pub(super) fn clock_was_set() {
     {
         softirq_vectors().raise_softirq(SoftirqNumber::TIMER);
     }
+    refresh_deadline_driver();
 }
 
 /// Isolated clocks and queues: these checks never set wall time, publish a real
@@ -251,12 +382,32 @@ pub(super) fn queue_selftest() -> Result<bool, SystemError> {
             callback,
         )
     }
+    type Queue = SpinLock<TimerTree>;
     fn activate_in(queue: &Queue, prepared: PreparedAbsoluteTimer) -> Arc<AbsoluteTimer> {
         let PreparedAbsoluteTimer { timer, node } = prepared;
-        publish(queue, &timer, node);
+        let rejected = super::absolute_timer::publish(&mut queue.lock_irqsave(), &timer, node);
+        drop(rejected);
         timer
     }
-
+    fn cancel_in(queue: &Queue, timer: &AbsoluteTimer) -> bool {
+        let (changed, retired) = super::absolute_timer::cancel_in(&mut queue.lock_irqsave(), timer);
+        drop(retired);
+        changed
+    }
+    fn pin_head(queue: &Queue) -> Result<Option<Arc<AbsoluteTimer>>, SystemError> {
+        Ok(queue
+            .lock_irqsave()
+            .get_first()
+            .map(|(_, timer)| timer.clone()))
+    }
+    fn take_sampled_due(
+        queue: &Queue,
+        timer: &Arc<AbsoluteTimer>,
+        now: impl FnOnce() -> u64,
+    ) -> Option<Arc<AbsoluteTimer>> {
+        let node = super::absolute_timer::take_sampled_due(&mut queue.lock_irqsave(), timer, now);
+        node.map(|node| node.into_pair().1)
+    }
     let queue = SpinLock::new(RBTree::new());
     let counter = Arc::try_new(AtomicU32::new(0)).map_err(|_| SystemError::ENOMEM)?;
     let old = activate_in(&queue, prepare(100, &counter)?);
@@ -267,14 +418,14 @@ pub(super) fn queue_selftest() -> Result<bool, SystemError> {
     // A clock step and a newly published earlier event invalidate the old
     // candidate: its old sample of 100 cannot expire the new deadline of 75.
     let new = activate_in(&queue, prepare(75, &counter)?);
-    if take_sampled_due(&queue, &sampled, 100).is_some() || new.fired() {
+    if take_sampled_due(&queue, &sampled, || 100).is_some() || new.fired() {
         return Ok(false);
     }
     let sampled = pin_head(&queue)?.ok_or(SystemError::EINVAL)?;
-    if take_sampled_due(&queue, &sampled, 50).is_some() {
+    if take_sampled_due(&queue, &sampled, || 50).is_some() {
         return Ok(false);
     }
-    let due = take_sampled_due(&queue, &sampled, 75).ok_or(SystemError::EINVAL)?;
+    let due = take_sampled_due(&queue, &sampled, || 75).ok_or(SystemError::EINVAL)?;
     if !due.fired() || cancel_in(&queue, &due) || pin_head(&queue)?.is_some() {
         return Ok(false);
     }
@@ -305,7 +456,7 @@ pub(super) fn queue_selftest() -> Result<bool, SystemError> {
         return Ok(false);
     }
     let sampled = pin_head(&queue)?.ok_or(SystemError::EINVAL)?;
-    let due = take_sampled_due(&queue, &sampled, 100).ok_or(SystemError::EINVAL)?;
+    let due = take_sampled_due(&queue, &sampled, || 100).ok_or(SystemError::EINVAL)?;
     due.run();
     Ok(Arc::ptr_eq(&due, &fired)
         && due.fired()

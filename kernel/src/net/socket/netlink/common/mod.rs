@@ -119,7 +119,7 @@ where
         let wait_queue = Arc::new(WaitQueue::default());
         let epoll_items = Arc::new(EPollItems::default());
         let fasync_items = Arc::new(FAsyncItems::default());
-        let opener_cred = ProcessManager::current_pcb().cred();
+        let opener_cred = ProcessManager::current_cred();
         let receive_queue = P::new_message_queue();
         let unbound = UnboundNetlink::new(
             epoll_items.clone(),
@@ -614,8 +614,7 @@ where
                             SOCK_MIN_RCVBUF
                         };
                         let size = if force {
-                            if !ProcessManager::current_pcb()
-                                .cred()
+                            if !ProcessManager::current_cred()
                                 .has_capability_in_ns(&INIT_USER_NAMESPACE, CAPFlags::CAP_NET_ADMIN)
                             {
                                 return Err(SystemError::EPERM);
@@ -689,7 +688,7 @@ where
                 Inner::Unbound(UnboundNetlink::new(
                     self.epoll_items.clone(),
                     self.fasync_items.clone(),
-                    ProcessManager::current_pcb().cred(),
+                    ProcessManager::current_cred(),
                     self.receive_queue.clone(),
                 )),
             )

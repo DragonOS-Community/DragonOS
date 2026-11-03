@@ -38,8 +38,8 @@ impl SysSchedSetparam {
         target: &Arc<ProcessControlBlock>,
         user_priority: i32,
     ) -> Result<PreparedUpdate, SystemError> {
-        let current = ProcessManager::current_pcb();
-        let same_owner = same_sched_owner(&current.cred(), &target.cred());
+        let same_owner =
+            same_sched_owner(&ProcessManager::current_cred(), &target.objective_cred());
         let rtprio_limit = target.get_rlimit(RLimitID::Rtprio).rlim_cur;
 
         let pi_guard = target.sched_info().pi_lock_irqsave();

@@ -15,7 +15,6 @@ use crate::libs::mutex::MutexGuard;
 use alloc::{
     string::ToString,
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use system_error::SystemError;
 
@@ -85,28 +84,9 @@ impl DirOps for FdInfoDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let mut cached_children = dir.cached_children().write();
-
-        // 清空现有缓存
-        cached_children.clear();
-
-        // 获取进程的所有文件描述符
-        if let Some(process) = self.get_process() {
-            let Some(fd_table) = process.basic().try_fd_table().clone() else {
-                return;
-            };
-            let fds: Vec<i32> = {
-                let fd_table_guard = fd_table.read();
-                fd_table_guard.iter().map(|(fd, _)| fd).collect()
-            };
-
-            for fd in fds {
-                let fd_str = fd.to_string();
-                cached_children.entry(fd_str.clone()).or_insert_with(|| {
-                    FdInfoFileOps::new_inode(self.target.clone(), fd, dir.self_ref_weak().clone())
-                });
-            }
-        }
+        super::fd::refresh_fd_children(&self.target, dir, |fd, parent| {
+            FdInfoFileOps::new_inode(self.target.clone(), fd, parent)
+        });
     }
 
     fn validate_child(&self, child: &dyn IndexNode) -> bool {

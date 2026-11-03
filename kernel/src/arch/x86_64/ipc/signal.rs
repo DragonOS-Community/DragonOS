@@ -987,21 +987,17 @@ fn try_restart_syscall(frame: &mut TrapFrame) {
     }
     let syscall_err = syscall_err.unwrap();
 
-    let mut restart = false;
     match syscall_err {
         SystemError::ERESTARTSYS | SystemError::ERESTARTNOHAND | SystemError::ERESTARTNOINTR => {
             frame.rax = frame.errcode;
             frame.rip -= 2;
-            restart = true;
         }
         SystemError::ERESTART_RESTARTBLOCK => {
             frame.rax = SYS_RESTART_SYSCALL as u64;
             frame.rip -= 2;
-            restart = true;
         }
         _ => {}
     }
-    log::debug!("try restart syscall: {:?}", restart);
 }
 
 pub struct X86_64SignalArch;

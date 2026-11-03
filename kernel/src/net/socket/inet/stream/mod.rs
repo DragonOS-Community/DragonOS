@@ -363,10 +363,10 @@ impl Socket for TcpSocket {
                         {
                             // 关键：不要等待 `self.inner` 变成 Established。
                             // `self.inner` 的状态转换是由 check_connect() 完成的；
-                            // 如果 iface.poll() 在入睡前已经推进到 Established 并触发过 notify/wakeup，
-                            // 再等 “inner 已 Established” 会陷入先唤后睡的丢唤醒。
+                            // 协议栈可能已经完成握手并发出通知，但外层 inner 尚未转换。
+                            // 只等待 “inner 已 Established” 会错过这次状态变化。
                             // 这里把 check_connect() 本身作为条件的一部分：
-                            // - 入队 waker 后再次检查时会主动 poll 并完成状态转换
+                            // - 入队 waker 后再次读取协议状态并完成外层状态转换
                             // - 即使错过了一次 wake，也不会永远睡下去
                             if completed.is_some() {
                                 true

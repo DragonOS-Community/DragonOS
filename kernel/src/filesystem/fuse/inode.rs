@@ -1583,13 +1583,10 @@ impl FuseNode {
         } else {
             FUSE_WRITE_LOCKOWNER
         };
-        if !crate::process::ProcessManager::current_pcb()
-            .cred()
-            .has_capability_in_ns(
-                &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
-                crate::process::cred::CAPFlags::CAP_FSETID,
-            )
-        {
+        if !crate::process::ProcessManager::current_cred().has_capability_in_ns(
+            &crate::process::namespace::user_namespace::INIT_USER_NAMESPACE,
+            crate::process::cred::CAPFlags::CAP_FSETID,
+        ) {
             flags |= FUSE_WRITE_KILL_SUIDGID;
         }
         flags

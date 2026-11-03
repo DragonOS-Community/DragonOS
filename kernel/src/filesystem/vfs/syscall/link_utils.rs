@@ -49,8 +49,7 @@ pub fn do_linkat(
     // AT_EMPTY_PATH 需要调用者具有 CAP_DAC_READ_SEARCH 能力
     // 参考 Linux: "To use null names we require CAP_DAC_READ_SEARCH"
     if flags.contains(AtFlags::AT_EMPTY_PATH) {
-        let pcb = ProcessManager::current_pcb();
-        if !pcb.cred().has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
+        if !ProcessManager::current_cred().has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
             return Err(SystemError::ENOENT);
         }
     }
@@ -188,7 +187,7 @@ pub fn do_linkat(
 /// 除非调用者是文件所有者或拥有CAP_FOWNER能力
 fn may_linkat(old_inode: &Arc<dyn IndexNode>) -> Result<(), SystemError> {
     let metadata = old_inode.metadata()?;
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     if metadata.uid == u32::MAX as usize || metadata.gid == u32::MAX as usize {
         return Err(SystemError::EOVERFLOW);
     }

@@ -38,8 +38,7 @@ impl Syscall for SysInitModule {
         // 在Linux中，真正的root在root用户命名空间中有CAP_SYS_MODULE能力
         // 非root用户命名空间中的CAP_SYS_ADMIN没有CAP_SYS_MODULE
         // 对于DragonOS，我们简化：如果有CAP_SYS_ADMIN，认为有CAP_SYS_MODULE
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
 
         if !cred.has_capability(CAPFlags::CAP_SYS_ADMIN) {
             // 没有CAP_SYS_ADMIN能力，返回EPERM

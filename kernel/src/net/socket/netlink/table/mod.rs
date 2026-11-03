@@ -442,8 +442,7 @@ impl NetlinkRouteProtocol {
         netns: &Arc<NetNamespace>,
     ) -> Result<(), SystemError> {
         use crate::process::cred::CAPFlags;
-        if ProcessManager::current_pcb()
-            .cred()
+        if ProcessManager::current_cred()
             .has_capability_in_ns(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
         {
             Ok(())

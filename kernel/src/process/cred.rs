@@ -353,8 +353,7 @@ pub fn cap_capable(cred: &Cred, targ_ns: &Arc<UserNamespace>, cap: CAPFlags) -> 
 
 /// 检查当前进程在指定 ns 中是否有某 capability
 pub fn ns_capable(ns: &Arc<UserNamespace>, cap: CAPFlags) -> bool {
-    let pcb = ProcessManager::current_pcb();
-    cap_capable(&pcb.cred(), ns, cap)
+    cap_capable(&ProcessManager::current_cred(), ns, cap)
 }
 
 /// Check whether the current process has a capability in the initial user namespace.
@@ -416,4 +415,95 @@ pub fn set_cred_user_ns(cred: &mut Cred, user_ns: Arc<UserNamespace>) {
     cred.cap_ambient = CAPFlags::CAP_EMPTY_SET;
     cred.cap_bset = CAPFlags::CAP_FULL_SET;
     cred.user_ns = user_ns;
+}
+
+/// A subjective credential override belongs to this synchronous call stack.
+/// Keeping the guard private prevents callers from forgetting or reordering it.
+struct CurrentCredentialGuard {
+    pcb: Arc<super::ProcessControlBlock>,
+    saved: Option<Arc<Cred>>,
+    _not_send_sync: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for CurrentCredentialGuard {
+    fn drop(&mut self) {
+        assert!(
+            !crate::exception::in_interrupt(),
+            "credential override in interrupt context"
+        );
+        assert!(Arc::ptr_eq(&self.pcb, &ProcessManager::current_pcb()));
+        let retired = {
+            let mut slot = self.pcb.credential_override.lock_irqsave();
+            let retired = core::mem::replace(&mut *slot, self.saved.take());
+            self.pcb
+                .credential_override_active
+                .store(slot.is_some(), core::sync::atomic::Ordering::Release);
+            retired
+        };
+        // Cred destruction can release keys and other objects: never under the
+        // subjective slot lock or its IRQ guard.
+        drop(retired);
+    }
+}
+
+impl ProcessManager {
+    /// Pin the current task's subjective credentials. Not callable from NMI.
+    /// Interrupt readers may observe the interrupted task's current override;
+    /// only task context may create or restore an override.
+    #[inline]
+    pub fn current_cred() -> Arc<Cred> {
+        let pcb = Self::current_pcb();
+        if !pcb
+            .credential_override_active
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return pcb.objective_cred();
+        }
+        // No other task can modify this slot, and local IRQs cannot observe an
+        // intermediate update. Return an owned reference, never a borrowed raw
+        // pointer. The inactive path retains the original lock-free RCU load.
+        let slot = pcb.credential_override.lock_irqsave();
+        slot.as_ref()
+            .expect("active credential override is missing")
+            .clone()
+    }
+
+    /// Execute synchronous backing work with temporary subjective credentials.
+    /// The closure may block or migrate, but must not exec, exit, or commit
+    /// permanent credentials. Returned work (e.g. a future) does not inherit
+    /// this scope. Nested calls restore in lexical order, including errors.
+    pub(crate) fn with_current_credentials<R>(cred: Arc<Cred>, f: impl FnOnce() -> R) -> R {
+        assert!(
+            !crate::exception::in_interrupt(),
+            "credential override in interrupt context"
+        );
+        let pcb = Self::current_pcb();
+        let saved = {
+            let mut slot = pcb.credential_override.lock_irqsave();
+            let saved = slot.replace(cred);
+            pcb.credential_override_active
+                .store(true, core::sync::atomic::Ordering::Release);
+            saved
+        };
+        let _guard = CurrentCredentialGuard {
+            pcb,
+            saved,
+            _not_send_sync: core::marker::PhantomData,
+        };
+        f()
+    }
+}
+
+impl super::ProcessControlBlock {
+    /// Check before any permanent credential side effect, exec, or task exit.
+    /// The writer is current, or exclusively owns an unpublished child; this
+    /// check does not authorize remote updates to a running task.
+    pub(crate) fn assert_no_credential_override(&self) {
+        assert!(
+            !self
+                .credential_override_active
+                .load(core::sync::atomic::Ordering::Acquire),
+            "permanent task transition during a credential override"
+        );
+    }
 }

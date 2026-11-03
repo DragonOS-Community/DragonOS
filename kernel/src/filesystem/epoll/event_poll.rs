@@ -8,14 +8,10 @@ use crate::{
         prepared_queue::Queue,
         rbtree::RBTree,
         spinlock::SpinLock,
-        wait_queue::{TimeoutWaker, WaitQueue, Waiter},
+        wait_queue::{WaitQueue, WaitTimeout, Waiter},
     },
     process::ProcessManager,
-    time::{
-        timekeeping::monotonic_now,
-        timer::{next_n_us_timer_jiffies, Timer},
-        PosixTimeSpec,
-    },
+    time::{timekeeping::monotonic_now, PosixTimeSpec},
 };
 use core::fmt::Debug;
 
@@ -488,25 +484,20 @@ impl EventPoll {
         Self::wait_with_output(ep_file, max_events, deadline, output)
     }
 
-    /// ## epoll_wait的具体实现
-    pub fn epoll_wait_with_file(
+    /// Internal poll adapter; deadline is already absolute CLOCK_MONOTONIC.
+    pub(crate) fn epoll_wait_with_file(
         ep_file: Arc<File>,
         epoll_event: &mut [EPollEvent],
         max_events: i32,
-        timespec: Option<PosixTimeSpec>,
+        deadline: Option<PosixTimeSpec>,
     ) -> Result<usize, SystemError> {
         if max_events <= 0 || epoll_event.len() < max_events as usize {
             return Err(SystemError::EINVAL);
         }
-        Self::wait_with_output(
-            ep_file,
-            max_events,
-            timespec.map(Self::timeout_to_deadline),
-            &mut |index, event| {
-                epoll_event[index] = *event;
-                Ok(())
-            },
-        )
+        Self::wait_with_output(ep_file, max_events, deadline, &mut |index, event| {
+            epoll_event[index] = *event;
+            Ok(())
+        })
     }
 
     /// Convert a valid relative timeout once; zero remains the polling sentinel.
@@ -549,6 +540,10 @@ impl EventPoll {
             let mut timeout = deadline.is_some_and(|time| time.is_empty());
             // 判断epoll上有没有就绪事件（仅需 SpinLock）
             let mut available = Self::ep_events_available_rs(&rs_arc);
+            // Allocate lazily after the ready/zero-timeout fast paths. Reuse
+            // the same Waker and timer even when a notified item is no longer ready.
+            let mut wait_pair = None;
+            let mut timer: Option<WaitTimeout> = None;
 
             loop {
                 if available {
@@ -606,28 +601,18 @@ impl EventPoll {
                     continue;
                 }
 
-                // 还未等待到事件发生，则睡眠
-                // 构造一次等待（先构造 Waiter/Waker，超时需要通过 Waker::wake 触发）
-                let (waiter, waker) = Waiter::new_pair();
-
-                // 注册定时器：用 waker.wake() 来触发 waiter 退出等待（而不是仅唤醒 PCB）
-                let mut timer = None;
-                if let Some(deadline) = deadline {
-                    let remain_ns = deadline
-                        .to_ktime_ns()
-                        .saturating_sub(monotonic_now().to_ktime_ns());
-                    if remain_ns == 0 {
-                        timeout = true;
-                    } else {
-                        let jiffies = next_n_us_timer_jiffies(remain_ns.div_ceil(1_000));
-                        let inner: Arc<Timer> =
-                            Timer::new(TimeoutWaker::new(waker.clone()), jiffies);
-                        timer = Some(inner);
+                let (waiter, waker) = wait_pair.get_or_insert_with(Waiter::new_pair);
+                if timer.is_none() {
+                    if let Some(deadline) = deadline {
+                        timer = Some(WaitTimeout::start(deadline, waker)?);
                     }
                 }
-
-                if timeout {
-                    return Ok(0);
+                if timer.as_ref().is_some_and(WaitTimeout::fired)
+                    || deadline.is_some_and(WaitTimeout::deadline_reached)
+                {
+                    timeout = true;
+                    available = Self::ep_events_available_rs(&rs_arc);
+                    continue;
                 }
                 {
                     // 注册前再次检查，避免错过事件（仅需 SpinLock）
@@ -641,14 +626,7 @@ impl EventPoll {
                 }
 
                 if available {
-                    if let Some(timer) = timer {
-                        timer.cancel();
-                    }
                     continue;
-                }
-
-                if let Some(ref t) = timer {
-                    t.activate();
                 }
 
                 let wait_res = match waiter.wait(true) {
@@ -663,14 +641,7 @@ impl EventPoll {
                     available = Self::ready_state_has_events(&rs);
                 }
 
-                if let Some(timer) = timer {
-                    // A coarse timer firing alone does not establish expiry.
-                    timeout = timer.timeout()
-                        && deadline.is_some_and(|time| {
-                            monotonic_now().to_ktime_ns() >= time.to_ktime_ns()
-                        });
-                    timer.cancel();
-                }
+                timeout = timer.as_ref().is_some_and(WaitTimeout::fired);
 
                 wait_res?;
             }

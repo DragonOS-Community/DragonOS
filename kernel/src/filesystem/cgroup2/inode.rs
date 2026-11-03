@@ -171,8 +171,7 @@ impl Cgroup2Inode {
         src_cgroup: &Arc<CgroupNode>,
         dst_cgroup: &Arc<CgroupNode>,
     ) -> Result<(), SystemError> {
-        let current = ProcessManager::current_pcb();
-        let cred = current.cred();
+        let cred = ProcessManager::current_cred();
 
         super::permissions::check_procs_write(dst_cgroup, &cred)?;
         super::permissions::check_common_ancestor(src_cgroup, dst_cgroup, &cred)
@@ -806,7 +805,7 @@ impl IndexNode for Cgroup2Inode {
                 super::CgroupReadState::None
             };
             *data = FilePrivateData::Cgroup(super::CgroupOpenState {
-                cred: current.cred(),
+                cred: ProcessManager::current_cred(),
                 namespace: current.nsproxy().cgroup_ns.clone(),
                 read,
             });
@@ -1022,7 +1021,7 @@ impl IndexNode for Cgroup2Inode {
                 }
             };
 
-            let cred = ProcessManager::current_pcb().cred();
+            let cred = ProcessManager::current_cred();
             let mut prepared_inode = None;
             cgroup_root().create_child_exclusive_with_init(&cgroup, name, |node| {
                 // Parent metadata and child publication share UPDATE_LOCK.

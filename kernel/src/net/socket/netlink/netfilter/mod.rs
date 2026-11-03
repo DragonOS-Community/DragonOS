@@ -202,7 +202,7 @@ impl SupportedNetlinkProtocol for NetlinkNetfilterProtocol {
     }
 
     fn check_membership(netns: &Arc<NetNamespace>) -> Result<(), SystemError> {
-        require_net_admin(netns, &ProcessManager::current_pcb().cred())
+        require_net_admin(netns, &ProcessManager::current_cred())
     }
 }
 
@@ -289,7 +289,7 @@ impl NetfilterKernelSocket {
         let Some(first) = Request::parse(bytes) else {
             return Ok(());
         };
-        let sender = ProcessManager::current_pcb().cred();
+        let sender = ProcessManager::current_cred();
         if require_net_admin(&netns, &sender).is_err()
             || (!explicit && require_net_admin(&netns, opener).is_err())
         {

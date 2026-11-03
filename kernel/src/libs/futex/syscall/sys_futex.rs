@@ -82,6 +82,20 @@ impl Syscall for SysFutexHandle {
             }
         };
 
+        // Linux validates copied timeouts before key/word checks. Convert WAIT's
+        // relative budget once, before any fault-in or registration work.
+        let timespec = timespec
+            .map(|time| {
+                if !time.is_valid_timeout() {
+                    return Err(SystemError::EINVAL);
+                }
+                Ok(if cmd == FutexArg::FUTEX_WAIT {
+                    crate::time::timekeeping::monotonic_now().saturating_add_ktime(&time)
+                } else {
+                    time
+                })
+            })
+            .transpose()?;
         do_futex(uaddr, operation, val, timespec, uaddr2, val2, val3)
     }
 
@@ -182,32 +196,9 @@ pub(super) fn do_futex(
             return Futex::futex_wait(uaddr, flags, val, timeout, FUTEX_BITSET_MATCH_ANY);
         }
         FutexArg::FUTEX_WAIT_BITSET => {
-            // Linux 语义：WAIT_BITSET 的超时为绝对时间（clock_nanosleep 风格）。
-            // 这里将绝对截止时间转换为相对剩余时间，past 则立即 ETIMEDOUT。
-            let adjusted_timeout = if let Some(deadline) = timeout {
-                // 校验 timespec 合法性
-                if !deadline.is_valid_timeout() {
-                    return Err(SystemError::EINVAL);
-                }
-
-                let now = if flags.contains(FutexFlag::FLAGS_CLOCKRT) {
-                    crate::time::timekeeping::realtime_now()
-                } else {
-                    crate::time::timekeeping::monotonic_now()
-                };
-
-                // 计算剩余时间 = deadline - now，若 <=0 则立即超时
-                let remaining = deadline.saturating_sub_timespec(&now);
-                if remaining.is_empty() {
-                    return Err(SystemError::ETIMEDOUT);
-                }
-
-                Some(remaining)
-            } else {
-                None
-            };
-
-            return Futex::futex_wait(uaddr, flags, val, adjusted_timeout, val3);
+            // Keep the absolute deadline in its original clock domain. The
+            // wait path checks the user word before testing a valid past date.
+            return Futex::futex_wait(uaddr, flags, val, timeout, val3);
         }
         FutexArg::FUTEX_WAKE => {
             return Futex::futex_wake(uaddr, flags, val, FUTEX_BITSET_MATCH_ANY);

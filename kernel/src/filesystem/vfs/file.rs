@@ -1107,7 +1107,7 @@ impl File {
         }
 
         // Linux 语义：若调用者具备 CAP_FSETID，则写/截断不会清除 suid/sgid。
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         if cred.has_capability(CAPFlags::CAP_FSETID) {
             return Ok(false);
         }
@@ -1783,7 +1783,7 @@ impl File {
             internal_pseudo,
             position_state: Mutex::new(ReaddirState::default()),
             private_data,
-            cred: ProcessManager::current_pcb().cred(),
+            cred: ProcessManager::current_cred(),
             owner: Mutex::new(FileOwner::new()),
             posix_lock_key,
             mapped_file_identity: (metadata.dev_id, metadata.inode_id),
@@ -3588,15 +3588,17 @@ impl File {
                 metadata
             } else {
                 let entry = match name {
-                    b"." => inode.metadata().map(|md| (inode.reported_ino(&md), md)),
+                    b"." => inode
+                        .metadata()
+                        .map(|md| (inode.reported_ino(&md), md.file_type)),
                     b".." => inode.parent().and_then(|parent| {
-                        parent.metadata().map(|md| (parent.reported_ino(&md), md))
+                        parent
+                            .metadata()
+                            .map(|md| (parent.reported_ino(&md), md.file_type))
                     }),
-                    _ => inode
-                        .find_bytes(name)
-                        .and_then(|child| child.metadata().map(|md| (child.reported_ino(&md), md))),
+                    _ => inode.directory_entry_metadata(name),
                 };
-                let (ino, metadata) = match entry {
+                let (ino, file_type) = match entry {
                     Ok(entry) => entry,
                     Err(SystemError::ENOENT) => {
                         state.next_index += 1;
@@ -3605,10 +3607,7 @@ impl File {
                     }
                     Err(error) => return Err(error),
                 };
-                (
-                    ino.into() as u64,
-                    metadata.file_type.get_file_type_num() as u8,
-                )
+                (ino.into() as u64, file_type.get_file_type_num() as u8)
             };
             match ctx.fill_dir(name, next_cookie, ino, d_type) {
                 Ok(_) => {
@@ -4041,7 +4040,7 @@ impl File {
         if let Ok(pollable) = self.inode.as_pollable_inode() {
             pollable.set_owner_file(Arc::downgrade(self));
         }
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         let mut owner = self.owner.lock();
         owner.pid = pid;
         owner.pid_type = kind;

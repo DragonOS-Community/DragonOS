@@ -14,8 +14,7 @@ impl Syscall for SysGetGid {
     }
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         Ok(from_kgid_munged(&cred.user_ns, cred.gid) as usize)
     }
 

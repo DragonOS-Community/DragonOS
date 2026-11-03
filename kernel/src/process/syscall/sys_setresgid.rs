@@ -31,7 +31,7 @@ impl Syscall for SysSetResGid {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let rgid = id_utils::map_gid_arg(&old_cred.user_ns, Self::rgid(args), true)?;
         let egid = id_utils::map_gid_arg(&old_cred.user_ns, Self::egid(args), true)?;
         let sgid = id_utils::map_gid_arg(&old_cred.user_ns, Self::sgid(args), true)?;

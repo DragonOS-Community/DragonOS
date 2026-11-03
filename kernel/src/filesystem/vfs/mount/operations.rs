@@ -12,7 +12,7 @@ impl MountFSInode {
     /// enter a different mount and must capture that inner mount's own context.
     pub(crate) fn op_context(&self) -> InodeOpContext {
         InodeOpContext {
-            cred: ProcessManager::initialized().then(|| ProcessManager::current_pcb().cred()),
+            cred: ProcessManager::initialized().then(|| ProcessManager::current_cred()),
             idmap: self.mount_fs.idmap(),
             fs_userns: self.mount_fs.super_block_state.owner_user_ns().clone(),
         }

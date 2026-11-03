@@ -50,7 +50,7 @@ impl Notification {
         // Linux alloc_posix_timer reserves a sigqueue even for SIGEV_NONE.
         // The creator's identity is fixed here; later credential changes do not
         // move the reservation or charge timer expiry a second time.
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         let account = SignalAccount::get(&cred.user_ns, cred.uid.data())
             .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
         let charge = SignalCharge::acquire(

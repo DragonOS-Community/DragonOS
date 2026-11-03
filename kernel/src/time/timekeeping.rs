@@ -489,6 +489,14 @@ pub fn monotonic_now() -> PosixTimeSpec {
     ns_to_timespec(tk.monotonic_ns() as i128)
 }
 
+/// Sample one monotonic instant and derive its realtime value using the same
+/// offset snapshot. Hardware programming must not mix reads across clock_set.
+pub(crate) fn timer_clock_snapshot() -> (u64, i128) {
+    let tk = timekeeper().inner.read_irqsave();
+    let monotonic = tk.monotonic_ns();
+    (monotonic, i128::from(monotonic) + tk.realtime_offset_ns)
+}
+
 pub fn monotonic_raw_now() -> PosixTimeSpec {
     let tk = timekeeper().inner.read_irqsave();
     ns_to_timespec(tk.raw_ns() as i128)

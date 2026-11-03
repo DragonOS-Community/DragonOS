@@ -321,8 +321,8 @@ impl Signal {
         pcb: Arc<ProcessControlBlock>,
         pt: PidType,
     ) -> Result<i32, SystemError> {
-        let sender = ProcessManager::current_pcb().cred();
-        let receiver = pcb.cred();
+        let sender = ProcessManager::current_cred();
+        let receiver = pcb.objective_cred();
         if !Arc::ptr_eq(&sender.user_ns, &receiver.user_ns) {
             info.remap_sender_uid(&sender.user_ns, &receiver.user_ns);
         }
@@ -381,7 +381,7 @@ impl Signal {
                 // No explicit siginfo was provided, so fill in the default values
                 let current_pcb = ProcessManager::current_pcb();
                 let sender_pid = current_pcb.raw_pid();
-                let sender_uid = current_pcb.cred().uid.data() as u32;
+                let sender_uid = ProcessManager::current_cred().uid.data() as u32;
                 SigInfo::new(
                     *self,
                     0,
@@ -396,7 +396,7 @@ impl Signal {
 
         // Resolve identity outside pending locks. The account pins the exact
         // credential/namespace generation, including across later setuid.
-        let cred = pcb.cred();
+        let cred = pcb.objective_cred();
         let account =
             crate::ipc::signal_quota::SignalAccount::get(&cred.user_ns, cred.uid.data()).ok();
         let limit = pcb.get_rlimit(RLimitID::Sigpending).rlim_cur;
@@ -885,8 +885,8 @@ pub(crate) fn replay_deferred_fatal_wake(pcb: Arc<ProcessControlBlock>) {
     let state = pcb.sched_info().state();
     let r = if state.is_stopped() {
         ProcessManager::wakeup_stop(&pcb)
-    } else if state.is_blocked_interruptable() {
-        // Interruptible sleeps (including killable waits) are woken directly
+    } else if state.is_blocked_interruptable() || state.is_killable() {
+        // Interruptible and fatal-only sleeps are woken directly
         // to take the exit path.
         ProcessManager::wakeup(&pcb)
     } else {

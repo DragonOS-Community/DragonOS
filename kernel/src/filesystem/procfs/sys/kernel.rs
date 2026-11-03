@@ -261,7 +261,7 @@ impl ThreadsMaxFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+        if ProcessManager::current_cred().euid.data() != 0 {
             return Err(SystemError::EPERM);
         }
         if buf.is_empty() {
@@ -330,7 +330,7 @@ impl PidMaxFileOps {
     ) -> Result<usize, SystemError> {
         // This is a host-global setting, including when an already-open fd
         // is inherited by a task in a child user namespace.
-        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+        if ProcessManager::current_cred().euid.data() != 0 {
             return Err(SystemError::EPERM);
         }
         if buf.is_empty() {

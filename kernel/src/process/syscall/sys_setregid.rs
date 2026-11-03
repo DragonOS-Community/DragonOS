@@ -33,7 +33,7 @@ impl Syscall for SysSetReGid {
     /// - 如果设置了 rgid，或者 egid 被设置为与旧 rgid 不同的值，则 sgid = new_egid
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let rgid = id_utils::map_gid_arg(&old_cred.user_ns, Self::rgid(args), true)?;
         let egid = id_utils::map_gid_arg(&old_cred.user_ns, Self::egid(args), true)?;
 

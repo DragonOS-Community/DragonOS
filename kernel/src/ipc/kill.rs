@@ -20,7 +20,7 @@ pub fn send_signal_to_pid(pid: RawPid, sig: Signal) -> Result<usize, SystemError
     // 初始化signal info
     let current_pcb = ProcessManager::current_pcb();
     let sender_pid = current_pcb.raw_pid();
-    let sender_uid = current_pcb.cred().uid.data() as u32;
+    let sender_uid = ProcessManager::current_cred().uid.data() as u32;
     let mut info = SigInfo::new(
         sig,
         0,
@@ -51,7 +51,7 @@ pub fn send_signal_to_pcb(
     // 初始化signal info
     let current_pcb = ProcessManager::current_pcb();
     let sender_pid = current_pcb.raw_pid();
-    let sender_uid = current_pcb.cred().uid.data() as u32;
+    let sender_uid = ProcessManager::current_cred().uid.data() as u32;
     let mut info = SigInfo::new(
         sig,
         0,
@@ -101,7 +101,7 @@ pub fn send_signal_to_pgid(pgid: &Arc<Pid>, sig: Signal) -> Result<usize, System
         // 初始化signal info
         let current_pcb = ProcessManager::current_pcb();
         let sender_pid = current_pcb.raw_pid();
-        let sender_uid = current_pcb.cred().uid.data() as u32;
+        let sender_uid = ProcessManager::current_cred().uid.data() as u32;
         let mut info = SigInfo::new(
             sig,
             0,

@@ -15,8 +15,7 @@ impl Syscall for SysGetUid {
     }
 
     fn handle(&self, _args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         Ok(from_kuid_munged(&cred.user_ns, cred.uid) as usize)
     }
 

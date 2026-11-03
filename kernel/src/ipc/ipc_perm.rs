@@ -143,7 +143,7 @@ pub fn ipc_permission<P: IpcPermView>(
         return Ok(());
     }
 
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let mut granted = perm.mode();
     if cred.euid == perm.cuid() || cred.euid == perm.uid() {
         granted >>= 6;
@@ -164,7 +164,7 @@ pub fn check_control_permission<P: IpcPermView>(
     perm: &P,
     target_user_ns: &Arc<UserNamespace>,
 ) -> Result<(), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     if cred.euid == perm.cuid()
         || cred.euid == perm.uid()
         || ns_capable(target_user_ns, CAPFlags::CAP_SYS_ADMIN)
@@ -180,7 +180,7 @@ pub fn check_lock_permission<P: IpcPermView>(
     perm: &P,
     target_user_ns: &Arc<UserNamespace>,
 ) -> Result<(), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     if cred.euid == perm.cuid()
         || cred.euid == perm.uid()
         || ns_capable(target_user_ns, CAPFlags::CAP_IPC_LOCK)

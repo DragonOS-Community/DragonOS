@@ -72,7 +72,7 @@ fn with_owner_targets(
 ) {
     let Some(pid) = &owner.pid else { return };
     let permitted = |task: &crate::process::ProcessControlBlock| {
-        let cred = task.cred();
+        let cred = task.objective_cred();
         owner.euid.data() == 0
             || owner.euid == cred.uid
             || owner.euid == cred.suid

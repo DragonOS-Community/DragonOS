@@ -255,7 +255,7 @@ impl SemManager {
         debug_assert!(key == IPC_PRIVATE || self.key2id.capacity() > self.key2id.len());
         let ipc_id = self.id_allocator.alloc()?;
         let sem_id = SemId::new(ipc_id.raw);
-        let current_cred = ProcessManager::current_pcb().cred();
+        let current_cred = ProcessManager::current_cred();
         let kern_ipc_perm = IpcPerm::new_with_cred(
             sem_id.data(),
             key.data(),

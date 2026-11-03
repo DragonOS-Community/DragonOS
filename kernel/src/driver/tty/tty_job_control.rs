@@ -214,7 +214,7 @@ impl TtyJobCtrlManager {
                 // tty被其他会话占用
                 if arg == 1 {
                     // 强制窃取控制终端，需要CAP_SYS_ADMIN权限
-                    let cred = current.cred();
+                    let cred = ProcessManager::current_cred();
                     if !cred.has_capability(CAPFlags::CAP_SYS_ADMIN) {
                         return Err(SystemError::EPERM);
                     }

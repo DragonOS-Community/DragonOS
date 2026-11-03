@@ -86,7 +86,7 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
         }
 
         let context = RtnlRequestContext::new(
-            ProcessManager::current_pcb().cred(),
+            ProcessManager::current_cred(),
             self.opener_cred(),
             netns.clone(),
             local_port,

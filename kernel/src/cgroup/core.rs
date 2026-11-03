@@ -274,7 +274,7 @@ impl CgroupNode {
     }
 
     pub(crate) fn reset_file_permissions(&self, name: &str, default_mode: u32) {
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         let parent = self.file_permissions("", 0o755);
         let mut attrs = self.file_permissions.write();
         let generation = attrs
@@ -302,7 +302,7 @@ impl CgroupNode {
         name: &'static str,
         default_mode: u32,
     ) -> Result<PreparedFilePermission, SystemError> {
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         let parent = self.file_permissions.read().get("").map_or(
             CgroupFilePermissions {
                 uid: 0,

@@ -118,7 +118,7 @@ impl CgroupNamespace {
         // runtimes to function while maintaining the interface for
         // future full implementation.
 
-        if !ProcessManager::current_pcb().cred().has_cap_sys_admin() {
+        if !ProcessManager::current_cred().has_cap_sys_admin() {
             return Err(SystemError::EPERM);
         }
         if !self.user_ns.is_ancestor_of(&user_ns) {

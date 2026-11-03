@@ -86,7 +86,7 @@ pub struct ProcfsFilePrivateData {
 impl ProcfsFilePrivateData {
     pub fn new() -> Self {
         ProcfsFilePrivateData {
-            open_cred: ProcessManager::current_pcb().cred(),
+            open_cred: ProcessManager::current_cred(),
             pinned_vm: None,
             seq: utils::ProcfsSeq::default(),
             mount_view: None,

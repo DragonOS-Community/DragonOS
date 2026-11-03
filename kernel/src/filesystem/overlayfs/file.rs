@@ -1,4 +1,3 @@
-use super::cred::CredOverrideGuard;
 use super::inode::OvlInode;
 use crate::filesystem::vfs::file::{File, FileFlags, FilePrivateData};
 use crate::filesystem::vfs::{self, FileType, Metadata, SetMetadataMask};
@@ -175,7 +174,7 @@ pub(super) fn write_primary_with_sync(
         return backing_file.pwrite_with_sync_intent(offset, 0, &[], sync_intent);
     }
 
-    let caller = crate::process::ProcessManager::current_pcb().cred();
+    let caller = crate::process::ProcessManager::current_cred();
     let _privilege_guard = inode.content_privilege_lock.lock();
     let (backing_file, _) = backing_file_for_io(inode, data)?;
     let fs = inode.overlay_fs()?;
@@ -206,14 +205,15 @@ pub(super) fn write_primary_with_sync(
     };
     let intent = vfs::WriteOperation { io, ..intent };
     source.with_buffer(len, |buffer| {
-        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-        backing_file.pwrite_with_io_intent(
-            offset,
-            len.min(buffer.len()),
-            buffer,
-            sync_intent,
-            Some(intent),
-        )
+        crate::process::ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+            backing_file.pwrite_with_io_intent(
+                offset,
+                len.min(buffer.len()),
+                buffer,
+                sync_intent,
+                Some(intent),
+            )
+        })
     })
 }
 
@@ -373,8 +373,9 @@ fn open_real_file_with_cred(
     flags: FileFlags,
     cred: Arc<Cred>,
 ) -> Result<Arc<File>, crate::mm::allocation::MemoryAllocationError> {
-    let _cred_guard = CredOverrideGuard::new(cred)?;
-    Ok(Arc::new(File::new(inode, flags)?))
+    crate::process::ProcessManager::with_current_credentials(cred, || {
+        Ok(Arc::new(File::new(inode, flags)?))
+    })
 }
 
 fn backing_file_for_io(

@@ -1412,7 +1412,7 @@ impl Tmpfs {
         // Logical size is not resident tmpfs quota. PageCache membership
         // reserves/releases actual pages, including creation failure rollback.
         let inode_id = generate_inode_id();
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         let result: Arc<LockedTmpfsInode> = Arc::new(LockedTmpfsInode::new_with_memfd(
             TmpfsInode {
                 parent: Weak::default(),

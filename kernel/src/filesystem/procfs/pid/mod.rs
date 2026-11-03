@@ -154,7 +154,7 @@ impl ProcPidTarget {
         }
         // Keep owned snapshots, not exec_update_lock: exec holds its write
         // side while resolving paths such as /proc/self/fd/N.
-        let cred = pcb.cred();
+        let cred = pcb.objective_cred();
         // Credential commits publish the dumpability downgrade first. Pair
         // with that publication before reading mm state, as ptrace does.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);

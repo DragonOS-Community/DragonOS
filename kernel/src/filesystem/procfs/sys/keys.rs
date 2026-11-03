@@ -170,7 +170,7 @@ impl KeySettingFileOps {
     ) -> Result<usize, SystemError> {
         // These sysctls are global. Child user namespace capabilities must
         // never authorize modifying host-wide key quotas or GC behaviour.
-        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+        if ProcessManager::current_cred().euid.data() != 0 {
             return Err(SystemError::EPERM);
         }
         if buf.is_empty() {

@@ -1241,6 +1241,10 @@ pub(crate) fn report() -> String {
             resource_wait::resource_mutex_protocol,
         ),
         (
+            "heap_denied_resource_split_queue",
+            resource_wait::resource_split_queue_protocol,
+        ),
+        (
             "heap_denied_page_entry_wait",
             crate::filesystem::page_cache::heap_denied_entry_wait_selftest,
         ),

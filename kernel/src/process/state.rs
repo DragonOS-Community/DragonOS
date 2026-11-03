@@ -38,10 +38,12 @@ pub enum ProcessState {
     Runnable,
     /// The process is waiting for an event to occur.
     /// The bool indicates whether the wait is interruptible.
-    /// - If true, hardware interrupts, signals, and other system events can
-    ///   interrupt the wait and transition the process back to Runnable.
-    /// - If false, the process must be explicitly woken up to return to Runnable.
+    /// - If true, pending signals may interrupt the wait.
+    /// - If false, only an explicit resource wake completes the sleep.
     Blocked(bool),
+    /// An uninterruptible resource wait that fatal signals may wake.
+    /// Corresponds to Linux TASK_UNINTERRUPTIBLE | TASK_WAKEKILL.
+    BlockedKillable,
     /// The process was stopped by a signal.
     Stopped,
     /// The process has exited; usize holds the raw wait status used by Linux wait(2) family.
@@ -77,6 +79,8 @@ mod state_bits {
     pub const TASK_RUNNING: u32 = 0x0000;
     pub const TASK_INTERRUPTIBLE: u32 = 0x0001;
     pub const TASK_UNINTERRUPTIBLE: u32 = 0x0002;
+    pub const TASK_WAKEKILL: u32 = 0x0100;
+    pub const TASK_KILLABLE: u32 = TASK_UNINTERRUPTIBLE | TASK_WAKEKILL;
     pub const TASK_STOPPED: u32 = 0x0004;
     pub const TASK_DEAD_MARKER: u32 = 0x0080;
     pub const EXIT_CODE_SHIFT: u32 = 12;
@@ -90,13 +94,28 @@ impl ProcessState {
     }
 
     #[inline(always)]
-    pub fn is_blocked(&self) -> bool {
-        return matches!(self, ProcessState::Blocked(_));
+    pub const fn is_blocked(&self) -> bool {
+        return matches!(
+            self,
+            ProcessState::Blocked(_) | ProcessState::BlockedKillable
+        );
     }
 
     #[inline(always)]
     pub fn is_blocked_interruptable(&self) -> bool {
         return matches!(self, ProcessState::Blocked(true));
+    }
+
+    /// A fatal-only sleep; ordinary signals and return-to-user work do not wake it.
+    #[inline(always)]
+    pub const fn is_killable(&self) -> bool {
+        matches!(self, Self::BlockedKillable)
+    }
+
+    /// Sleeps contributing to the runqueue's uninterruptible load count.
+    #[inline(always)]
+    pub const fn is_uninterruptible(&self) -> bool {
+        matches!(self, Self::Blocked(false) | Self::BlockedKillable)
     }
 
     /// Returns `true` if the process state is [`Exited`].
@@ -133,11 +152,12 @@ impl ProcessState {
     }
 
     #[inline]
-    pub fn to_u32(self) -> u32 {
+    pub const fn to_u32(self) -> u32 {
         match self {
             ProcessState::Runnable => state_bits::TASK_RUNNING,
             ProcessState::Blocked(true) => state_bits::TASK_INTERRUPTIBLE,
             ProcessState::Blocked(false) => state_bits::TASK_UNINTERRUPTIBLE,
+            ProcessState::BlockedKillable => state_bits::TASK_KILLABLE,
             ProcessState::Stopped => state_bits::TASK_STOPPED,
             ProcessState::Exited(code) => {
                 state_bits::TASK_DEAD_MARKER | ((code as u32) << state_bits::EXIT_CODE_SHIFT)
@@ -155,6 +175,7 @@ impl ProcessState {
                 v if v == state_bits::TASK_RUNNING => ProcessState::Runnable,
                 v if v == state_bits::TASK_INTERRUPTIBLE => ProcessState::Blocked(true),
                 v if v == state_bits::TASK_UNINTERRUPTIBLE => ProcessState::Blocked(false),
+                v if v == state_bits::TASK_KILLABLE => ProcessState::BlockedKillable,
                 v if v == state_bits::TASK_STOPPED => ProcessState::Stopped,
                 _ => {
                     panic!(
@@ -166,6 +187,17 @@ impl ProcessState {
         }
     }
 }
+
+// State storage must not confuse TASK_KILLABLE with the exited-state marker.
+const _: () = {
+    assert!(ProcessState::BlockedKillable.to_u32() == 0x102);
+    assert!(state_bits::TASK_KILLABLE & state_bits::TASK_DEAD_MARKER == 0);
+    assert!(ProcessState::BlockedKillable.is_blocked());
+    assert!(ProcessState::BlockedKillable.is_uninterruptible());
+    assert!(ProcessState::BlockedKillable.is_killable());
+    assert!(!ProcessState::Blocked(true).is_uninterruptible());
+    assert!(!ProcessState::Blocked(false).is_killable());
+};
 
 bitflags! {
     /// Process control block flags.

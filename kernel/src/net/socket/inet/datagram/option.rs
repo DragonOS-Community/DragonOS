@@ -75,7 +75,7 @@ impl UdpSocket {
                 Ok(())
             }
             PSO::SNDBUFFORCE => {
-                let cred = ProcessManager::current_pcb().cred();
+                let cred = ProcessManager::current_cred();
                 if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
                     return Err(SystemError::EPERM);
                 }
@@ -84,7 +84,7 @@ impl UdpSocket {
                 self.resize_buffer(false, size)
             }
             PSO::RCVBUFFORCE => {
-                let cred = ProcessManager::current_pcb().cred();
+                let cred = ProcessManager::current_cred();
                 if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
                     return Err(SystemError::EPERM);
                 }

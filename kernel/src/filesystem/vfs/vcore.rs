@@ -862,7 +862,7 @@ pub(crate) fn prepare_write_side_effect_metadata(
     md: Metadata,
     new_size: usize,
 ) -> (Metadata, SetMetadataMask) {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     prepare_write_side_effect_metadata_with_cred(md, new_size, &cred)
 }
 

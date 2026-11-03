@@ -110,7 +110,7 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
     ) -> FuseDaxRequestOutcome {
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         if !self.allow_current_process(&cred) {
             return FuseDaxRequestOutcome::NeverSubmitted(SystemError::EACCES);
         }
@@ -235,7 +235,7 @@ impl FuseConn {
         payload: &[u8],
     ) -> Result<FuseReply, SystemError> {
         if opcode != FUSE_INIT {
-            let cred = ProcessManager::current_pcb().cred();
+            let cred = ProcessManager::current_cred();
             if !self.allow_current_process(&cred) {
                 return Err(SystemError::EACCES);
             }
@@ -515,8 +515,7 @@ impl FuseConn {
         nodeid: u64,
         payload: &[u8],
     ) -> Result<Arc<FusePendingState>, SystemError> {
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         if !self.allow_current_process(&cred) {
             return Err(SystemError::EACCES);
         }

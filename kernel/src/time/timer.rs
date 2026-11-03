@@ -280,6 +280,10 @@ impl SoftirqVec for DoTimerSoftirq {
             }
         }
         self.clear_run();
+        // Another CPU may have consumed a notification while running was set.
+        // Recheck after releasing it, even when this pass did not exhaust its
+        // budget. Publication after this check supplies its own notification.
+        absolute_timer::refresh_deadline_driver();
         if completed == TIMER_RUN_CYCLE_THRESHOLD {
             try_raise_timer_softirq();
         }
@@ -294,6 +298,9 @@ pub fn timer_init() {
     softirq_vectors()
         .register_softirq(SoftirqNumber::TIMER, do_timer_softirq)
         .expect("Failed to register timer softirq");
+    if let Err(error) = absolute_timer::init_deadline_driver() {
+        warn!("absolute timer clockevent unavailable: {error:?}");
+    }
     info!("timer initialized successfully");
 }
 

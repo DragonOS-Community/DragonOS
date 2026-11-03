@@ -55,7 +55,7 @@ pub struct InodeOpContext {
 impl InodeOpContext {
     pub fn legacy() -> Self {
         Self {
-            cred: ProcessManager::initialized().then(|| ProcessManager::current_pcb().cred()),
+            cred: ProcessManager::initialized().then(|| ProcessManager::current_cred()),
             idmap: None,
             fs_userns: INIT_USER_NAMESPACE.clone(),
         }
@@ -600,7 +600,7 @@ pub fn check_inode_permission(
         return Err(SystemError::EACCES);
     }
 
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     if metadata.flags.contains(super::InodeFlags::S_PROC_SYSCTL) {
         // Linux proc_sys_permission uses global euid/egid and does not grant
         // CAP_DAC_OVERRIDE a bypass (including caps in a child userns).
@@ -665,7 +665,7 @@ pub(crate) fn check_device_inode_permission(
 /// read another user's file does not imply permission to hide that access from
 /// its timestamp metadata.
 pub fn check_noatime_permission(metadata: &Metadata) -> Result<(), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     if cred.is_owner_or_capable(metadata) {
         Ok(())
     } else {
@@ -701,7 +701,7 @@ impl Cred {
     ///
     /// ```rust
     /// let metadata = inode.metadata()?;
-    /// let cred = ProcessManager::current_pcb().cred();
+    /// let cred = ProcessManager::current_cred();
     /// inode_permission(&metadata, &cred, MAY_EXEC)?;
     /// ```
     pub fn inode_permission(&self, metadata: &Metadata, mask: u32) -> Result<(), SystemError> {

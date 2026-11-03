@@ -278,7 +278,7 @@ impl FuseRequestCred {
 
     pub(crate) fn from_current() -> Self {
         let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         let pid = pcb.task_tgid_vnr().map(|p| p.data() as u32).unwrap_or(0);
         Self {
             uid: cred.fsuid.data() as u32,
@@ -1515,7 +1515,7 @@ impl FuseConn {
     }
 
     pub fn check_allow_current_process(&self) -> Result<(), SystemError> {
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         if !self.allow_current_process(&cred) {
             return Err(SystemError::EACCES);
         }

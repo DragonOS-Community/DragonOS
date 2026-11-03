@@ -93,7 +93,7 @@ fn add_key(args: &[usize]) -> Result<usize, SystemError> {
                 drop(state);
                 permission::check_permission(
                     &existing,
-                    &ProcessManager::current_pcb().cred(),
+                    &ProcessManager::current_cred(),
                     KeyPermission::Write,
                 )?;
                 state = existing.state.lock();
@@ -115,7 +115,7 @@ fn add_key(args: &[usize]) -> Result<usize, SystemError> {
         }
     }
 
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let mut permissions = DEFAULT_PERMISSION;
     if key_type != KeyType::Logon {
         permissions |= DEFAULT_READ;

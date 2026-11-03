@@ -1894,12 +1894,12 @@ pub struct MountFSInode {
 /// A pathname renderer only needs existing mount/dentry edges. Using an inode
 /// wrapper as its cursor would populate the wrapper cache on ordinary misses.
 #[derive(Clone)]
-struct CwdCursor {
+struct PathCursor {
     mount: Arc<MountFS>,
     dentry: Arc<VfsDentry>,
 }
 
-impl CwdCursor {
+impl PathCursor {
     fn from_inode(inode: &MountFSInode) -> Self {
         Self {
             mount: inode.mount_fs.clone(),
@@ -5086,8 +5086,8 @@ impl MountFSInode {
         if self.dentry.is_disconnected() {
             return Err(SystemError::ENOENT);
         }
-        let mut current = CwdCursor::from_inode(self);
-        let root = CwdCursor::from_inode(root);
+        let mut current = PathCursor::from_inode(self);
+        let root = PathCursor::from_inode(root);
         let mut fast = Some(current.clone());
         let mut parts: Vec<Arc<String>> = Vec::new();
         let mut bytes = 1usize;
@@ -6133,10 +6133,13 @@ impl MountFSInode {
     }
 
     fn do_absolute_path(&self) -> Result<String, SystemError> {
-        self.do_absolute_path_impl(false)
+        self.do_absolute_path_impl(false, None)
+            .map(|(path, _)| path)
     }
 
-    pub(crate) fn procfs_path(&self) -> Result<String, SystemError> {
+    /// Render a procfs path in the reader's root view, as Linux d_path does.
+    /// Root identity includes its mount; textual prefixes cannot identify it.
+    pub(crate) fn procfs_path(&self, reader_root: &MountFSInode) -> Result<String, SystemError> {
         // Anonymous magic-link targets have no namespace path. Render the
         // stable identity captured when the target was resolved, mirroring
         // Linux d_dname() handling for namespace file descriptors.
@@ -6150,96 +6153,127 @@ impl MountFSInode {
                 .map(|name| name.to_string())
                 .ok_or(SystemError::EINVAL);
         }
-        let mut path = self.do_absolute_path_impl(true)?;
-        if self.dentry.is_disconnected() {
+        let (mut path, disconnected) = self.do_absolute_path_impl(true, Some(reader_root))?;
+        if disconnected {
             path.push_str(" (deleted)");
         }
         Ok(path)
     }
 
     #[inline(never)]
-    fn do_absolute_path_impl(&self, allow_disconnected: bool) -> Result<String, SystemError> {
-        // Mount moves and dentry rename take this lock before changing either
-        // half of the object chain. Rendering under the same lock prevents a
-        // mixed old-parent/new-name namespace path.
-        let _topology = MOUNT_LIFECYCLE_LOCK.lock();
-        let _path_snapshot = DENTRY_TOPOLOGY_LOCK.read();
-        let mut current = self.self_ref.upgrade().unwrap();
+    fn do_absolute_path_impl(
+        &self,
+        allow_disconnected: bool,
+        reader_root: Option<&MountFSInode>,
+    ) -> Result<(String, bool), SystemError> {
+        let (parts, disconnected) = loop {
+            // As in cwd_path_from, the namespace pin must outlive the topology
+            // guard: dropping its final reference can acquire the mount lock.
+            let namespace = self.mount_fs.namespace();
+            let _topology = lock_mount_topology();
+            let membership = self.mount_fs.namespace.read();
+            let owner = membership
+                .owner
+                .as_ref()
+                .and_then(|owner| (owner.strong_count() != 0).then_some(owner.as_ptr()));
+            let stable = owner == namespace.as_ref().map(Arc::as_ptr);
+            drop(membership);
+            if !stable {
+                continue;
+            }
+            let namespace_root = namespace.as_ref().map(|ns| ns.root_mntfs());
+            break self.absolute_path_snapshot(
+                allow_disconnected,
+                namespace_root.as_ref(),
+                reader_root,
+            )?;
+        };
+        // Names are immutable Arc snapshots. Formatting does not need to
+        // serialize other pathname readers or mount/rename transactions.
+        let bytes = parts
+            .iter()
+            .try_fold(0usize, |total, part| {
+                total.checked_add(part.len()).and_then(|n| n.checked_add(1))
+            })
+            .ok_or(SystemError::ENAMETOOLONG)?
+            .max(1);
+        let mut path = String::new();
+        path.try_reserve_exact(bytes)
+            .map_err(|_| SystemError::ENOMEM)?;
+        for part in parts.iter().rev() {
+            path.push('/');
+            path.push_str(part);
+        }
+        if path.is_empty() {
+            path.push('/');
+        }
+        Ok((path, disconnected))
+    }
 
-        let current_state = current.dentry.state.lock();
-        if current_state.disconnected && !allow_disconnected {
+    /// Caller holds the complete mount/dentry snapshot. Validate each mount
+    /// segment by reaching its root once, rather than rewalking every parent's
+    /// ancestry and constructing inode wrappers along the way.
+    fn absolute_path_snapshot(
+        &self,
+        allow_disconnected: bool,
+        namespace_root: Option<&Arc<MountFS>>,
+        reader_root: Option<&MountFSInode>,
+    ) -> Result<(Vec<Arc<String>>, bool), SystemError> {
+        let disconnected = self.dentry.is_disconnected();
+        if disconnected && !allow_disconnected {
             return Err(SystemError::ENOENT);
         }
-        drop(current_state);
-
-        let mut path_parts = Vec::new();
-
-        // Note: different filesystems may have independent inode_id spaces, so “global root inode_id” cannot be used as a termination condition.
-        // The correct approach is to walk up the mount tree until reaching the “namespace root” (i.e., the rootfs mount where self_mountpoint is None).
+        let mut current = PathCursor::from_inode(self);
+        let root = reader_root.map(PathCursor::from_inode);
+        let mut visited = hashbrown::HashSet::new();
+        let mut parts = Vec::new();
         loop {
-            // Linux d_path crosses mount roots before emitting a dentry name.
-            // A mount stacked on the namespace root must stop at that root,
-            // not append its (empty) name as another path component.
-            current = current.visible_mountpoint()?;
-            // Reached the current namespace root: stop.
-            if current.is_mountpoint_root()?
-                && current.mount_fs.namespace().is_some_and(|ns| {
-                    let ns_root = ns.root_mntfs();
-                    Arc::ptr_eq(&current.mount_fs, &ns_root)
-                })
-            {
+            // Match before crossing a mount root. A root in another mount
+            // view does not truncate this path, even if its names are equal.
+            if root.as_ref().is_some_and(|root| current.same_path(root)) {
                 break;
             }
-
-            // Compatibility with the old model: if the mount has no mount point, treat it as root.
-            if current.is_mountpoint_root()? && current.mount_fs.self_mountpoint().is_none() {
-                break;
+            // Include the mount identity: bind mounts can project one dentry
+            // more than once along a valid path.
+            visited.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            if !visited.insert((current.mount.mount_id, current.dentry.id)) {
+                return Err(SystemError::ELOOP);
             }
-
-            let name = current.dname()?;
-            path_parts.push(name.0);
-
-            // Loop prevention: if path depth exceeds 1024, emit a warning
-            if path_parts.len() > 1024 {
-                #[inline(never)]
-                fn __log_warn(cur: usize) {
-                    log::warn!(
-                        "Path depth exceeds 1024, possible infinite loop. cur: {}",
-                        cur
-                    );
+            if current.dentry.id == current.mount.root_dentry.id {
+                if namespace_root.is_some_and(|root| Arc::ptr_eq(root, &current.mount)) {
+                    break;
                 }
-                __log_warn(current.metadata().unwrap().inode_id.data());
+                let Some(mountpoint) = current.mount.self_mountpoint() else {
+                    break;
+                };
+                current = PathCursor::from_inode(&mountpoint);
+                continue;
+            }
+            let (parent, name) = {
+                let state = current.dentry.state.lock();
+                // A retained dentry may have been moved outside a bind root.
+                // Do not render it as though it still belonged to that mount.
+                let Some(parent) = state.parent.clone() else {
+                    // Linux d_path discards collected names when the dentry
+                    // escaped its bind root. This is not a reachable path in
+                    // that mount; procfs reports "/" (plus any deleted suffix).
+                    if reader_root.is_some() {
+                        parts.clear();
+                        break;
+                    }
+                    return Err(SystemError::EXDEV);
+                };
+                let name = state.name.as_ref().ok_or(SystemError::ENOENT)?.0.clone();
+                (parent, name)
+            };
+            if parts.len() == 1024 {
                 return Err(SystemError::ELOOP);
             }
-
-            let parent = current.do_parent()?;
-            if Arc::ptr_eq(&parent, &current) {
-                // parent == self but haven't reached the global root, indicating incomplete mount tree info or a cycle
-                log::warn!(
-                    "absolute_path: parent == self before reaching namespace root, inode_id={}",
-                    current.metadata().unwrap().inode_id.data()
-                );
-                return Err(SystemError::ELOOP);
-            }
-            current = parent;
+            parts.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+            parts.push(name);
+            current.dentry = parent;
         }
-
-        // Since we traversed from leaf to root, reverse the path parts
-        path_parts.reverse();
-
-        // Build the final absolute path string
-        let mut absolute_path = String::with_capacity(
-            path_parts.iter().map(|s| s.len()).sum::<usize>() + path_parts.len(),
-        );
-        for part in path_parts {
-            absolute_path.push('/');
-            absolute_path.push_str(&part);
-        }
-
-        if absolute_path.is_empty() {
-            absolute_path.push('/');
-        }
-        Ok(absolute_path)
+        Ok((parts, disconnected))
     }
 
     pub fn clone_with_new_mount_fs(&self, mount_fs: Arc<MountFS>) -> Arc<MountFSInode> {
@@ -6827,7 +6861,7 @@ impl IndexNode for MountFSInode {
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
             .clone();
         let context = super::permission::InodeOpContext {
-            cred: ProcessManager::initialized().then(|| ProcessManager::current_pcb().cred()),
+            cred: ProcessManager::initialized().then(|| ProcessManager::current_cred()),
             idmap,
             fs_userns: self.mount_fs.super_block_state.owner_user_ns().clone(),
         };
@@ -7292,6 +7326,29 @@ impl IndexNode for MountFSInode {
         self.mount_fs
             .inner_filesystem
             .find_bytes_in_view(&self.dentry.inode, name)
+    }
+
+    fn directory_entry_metadata(
+        &self,
+        name: &[u8],
+    ) -> Result<(InodeId, super::FileType), SystemError> {
+        let child = if let Ok(name) = core::str::from_utf8(name) {
+            // Keep the normal directory/view lookup serialization, but do not
+            // create an alias or wrapper merely to emit its inode and type.
+            let _children = self.dentry.children_gate.lock();
+            let _namespace = self.mount_fs.super_block_state.dentry_namespace_lock.read();
+            self.mount_fs
+                .inner_filesystem
+                .find_in_view(&self.dentry.inode, name)?
+        } else {
+            self.mount_fs
+                .inner_filesystem
+                .find_bytes_in_view(&self.dentry.inode, name)?
+        };
+        // Use the opened directory's backing view, including when it or its
+        // child is overmounted. Metadata remains live for each emitted entry.
+        let metadata = child.metadata()?;
+        Ok((child.reported_ino(&metadata), metadata.file_type))
     }
 
     #[inline]

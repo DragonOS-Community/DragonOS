@@ -230,8 +230,8 @@ impl ProcessManager {
         let pid = child
             .task_pid_nr_ns(PidType::PID, Some(parent.active_pid_ns()))
             .unwrap_or(RawPid::new(0));
-        let parent_user_ns = parent.cred().user_ns.clone();
-        let uid = from_kuid_munged(&parent_user_ns, child.cred().uid);
+        let parent_user_ns = parent.objective_cred().user_ns.clone();
+        let uid = from_kuid_munged(&parent_user_ns, child.objective_cred().uid);
         let rusage = child.exit_notification_rusage();
         let utime = i64::try_from(ns_to_clock_t(rusage.ru_utime.to_ns())).unwrap_or(i64::MAX);
         let stime = i64::try_from(ns_to_clock_t(rusage.ru_stime.to_ns())).unwrap_or(i64::MAX);
@@ -420,6 +420,7 @@ impl ProcessManager {
     /// Therefore, the caller must ensure that the passed `exit_code` has already
     /// been shifted as appropriate.
     pub fn exit(exit_code: usize) -> ! {
+        ProcessManager::current_pcb().assert_no_credential_override();
         // Check if the init process is attempting to exit; panic if so.
         let current_pcb = ProcessManager::current_pcb();
 
@@ -653,6 +654,7 @@ impl ProcessManager {
     ///   - For fatal signals: the low 7 bits hold the signal number; no shift is
     ///     needed.
     pub fn group_exit(exit_code: usize) -> ! {
+        ProcessManager::current_pcb().assert_no_credential_override();
         let final_exit_code: usize;
 
         // Use a closure to ensure all pointers held here are dropped.

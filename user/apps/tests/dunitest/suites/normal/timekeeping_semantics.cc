@@ -718,17 +718,21 @@ TEST(TimekeepingSemantics, SleepAdvancesMonotonicAndRawConsistently) {
               10000000LL);
 }
 
-TEST(TimekeepingSemantics, ReportedResolutionMatchesLowResolutionTimer) {
+TEST(TimekeepingSemantics, PreciseClocksReportHighResolution) {
+    // This normal-guest regression runs with a continuous clocksource and a
+    // high-resolution clockevent. 1ns is nominal, not a wakeup latency bound.
     const clockid_t clocks[] = {CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW,
-                                CLOCK_BOOTTIME};
+                                CLOCK_BOOTTIME, CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM};
     for (clockid_t clock_id : clocks) {
         timespec resolution = {};
         ASSERT_EQ(0, clock_getres(clock_id, &resolution));
         ExpectNormalized(resolution);
         const int64_t resolution_ns = DiffNs(timespec{}, resolution);
-        EXPECT_EQ(4000000LL, resolution_ns);
+        EXPECT_EQ(1LL, resolution_ns);
     }
+}
 
+TEST(TimekeepingSemantics, CoarseClocksKeepTickResolution) {
     const clockid_t coarse_clocks[] = {CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE};
     for (clockid_t clock_id : coarse_clocks) {
         timespec resolution = {};
@@ -736,6 +740,14 @@ TEST(TimekeepingSemantics, ReportedResolutionMatchesLowResolutionTimer) {
         const int64_t resolution_ns = DiffNs(timespec{}, resolution);
         EXPECT_EQ(4000000LL, resolution_ns);
     }
+}
+
+TEST(TimekeepingSemantics, ClockGetresNullOutputStillValidatesClock) {
+    EXPECT_EQ(0, syscall(SYS_clock_getres, CLOCK_MONOTONIC, nullptr));
+    EXPECT_EQ(0, syscall(SYS_clock_getres, CLOCK_THREAD_CPUTIME_ID, nullptr));
+    errno = 0;
+    EXPECT_EQ(-1, syscall(SYS_clock_getres, 0x7fffffff, nullptr));
+    EXPECT_EQ(EINVAL, errno);
 }
 
 TEST(TimekeepingSemantics, ClockNanosleepRejectsUnsupportedClockDomains) {

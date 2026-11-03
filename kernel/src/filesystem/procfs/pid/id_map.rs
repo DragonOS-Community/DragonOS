@@ -126,7 +126,7 @@ impl IdMapFileOps {
             .target
             .thread_group_leader()
             .ok_or(SystemError::ESRCH)?;
-        Ok(pcb.cred().user_ns.clone())
+        Ok(pcb.objective_cred().user_ns.clone())
     }
 
     fn open_cred_from_data(data: &MutexGuard<FilePrivateData>) -> Result<Arc<Cred>, SystemError> {
@@ -598,7 +598,7 @@ impl FileOps for SetgroupsFileOps {
             .target
             .thread_group_leader()
             .ok_or(SystemError::ESRCH)?;
-        let user_ns = pcb.cred().user_ns.clone();
+        let user_ns = pcb.objective_cred().user_ns.clone();
         if !flags.is_read_only() && !ns_capable(&user_ns, CAPFlags::CAP_SYS_ADMIN) {
             return Err(SystemError::EACCES);
         }

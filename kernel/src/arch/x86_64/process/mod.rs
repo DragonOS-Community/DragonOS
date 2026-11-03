@@ -780,7 +780,14 @@ impl ProcessManager {
                 next_mm.active_cpus_set(cpu);
             }
 
-            next_mm.make_current();
+            // Ordinary threads sharing the hardware-loaded mm need no CR3
+            // reload. Lazy returns still use the full activation path.
+            let reuse_loaded_mm = prev_user_vm.is_some()
+                && same_mm
+                && crate::mm::tlb::tlb_state_force(cpu).loaded_is(&next_mm);
+            if !reuse_loaded_mm {
+                next_mm.make_current();
+            }
             compiler_fence(Ordering::SeqCst);
 
             if !same_mm {
@@ -788,8 +795,11 @@ impl ProcessManager {
                     prev_mm.active_cpus_clear(cpu);
                 }
             }
-            // Update per-CPU TlbState: hardware-loaded mm and generation
-            crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone());
+            // Without a hardware reload, preserve the recorded generation;
+            // concurrent shootdowns still perform their flush before ack.
+            if !reuse_loaded_mm {
+                crate::mm::tlb::tlb_state_set_loaded_mm(next_mm.clone());
+            }
         }
         // Hardware/per-CPU ownership is established. A terminal switch cannot
         // leave temporary mm owners awaiting destruction on the abandoned stack.

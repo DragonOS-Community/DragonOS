@@ -38,7 +38,11 @@ impl MemFileOps {
     /// Permission check (called only once at open time).
     fn check_access(target: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
         let current = crate::process::ProcessManager::current_pcb();
-        if current.has_permission_to_trace(target, PtraceAccessCreds::FsCreds) {
+        if current.has_permission_to_trace(
+            target,
+            PtraceAccessCreds::FsCreds,
+            &crate::process::ProcessManager::current_cred(),
+        ) {
             Ok(())
         } else {
             Err(SystemError::EACCES)

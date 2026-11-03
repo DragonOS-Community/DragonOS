@@ -123,7 +123,8 @@ fn prepared_stages() -> Result<bool, SystemError> {
         waker: waker.clone(),
         key: SpinLock::new(None),
         bitset: u32::MAX,
-        tid: 0,
+        source_priority: core::sync::atomic::AtomicI32::new(100),
+        requeue_pi: None,
     })
     .map_err(|_| SystemError::ENOMEM)?;
     let callback = Box::try_new(WakerTimer {
@@ -138,7 +139,8 @@ fn prepared_stages() -> Result<bool, SystemError> {
                 waker: object.waker.clone(),
                 key: SpinLock::new(object.key.lock().clone()),
                 bitset: u32::MAX,
-                tid: 0,
+                source_priority: core::sync::atomic::AtomicI32::new(100),
+                requeue_pi: None,
             })
             .is_err()
             && WaitNode::try_new(object).is_err()

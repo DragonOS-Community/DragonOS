@@ -42,6 +42,7 @@ normal/open_dangling_symlink
 normal/openat2_semantics
 normal/retained_dirfd_mount
 normal/futex_registration
+normal/futex_requeue_pi
 normal/memfd_semantics
 normal/utimensat_symlink
 normal/mount_move

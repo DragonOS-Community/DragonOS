@@ -121,7 +121,7 @@ lazy_static::lazy_static! {
 }
 
 fn current_quota_keys() -> Result<Vec<InotifyQuotaKey>, SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let mut namespace = cred.user_ns.clone();
     let mut keys = Vec::new();
     keys.try_reserve(namespace.level() as usize + 1)

@@ -106,7 +106,7 @@ impl Syscall for SysPidfdSendSignalHandle {
         } else {
             let current_pcb = ProcessManager::current_pcb();
             let sender_pid = current_pcb.raw_pid();
-            let sender_uid = current_pcb.cred().uid.data() as u32;
+            let sender_uid = ProcessManager::current_cred().uid.data() as u32;
             SigInfo::new(
                 sig,
                 0,

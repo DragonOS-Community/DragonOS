@@ -72,8 +72,7 @@ impl SysSchedSetscheduler {
         target: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
         request: SchedChangeRequest,
     ) -> Result<bool, SystemError> {
-        let current = ProcessManager::current_pcb();
-        if !same_sched_owner(&current.cred(), &target.cred()) {
+        if !same_sched_owner(&ProcessManager::current_cred(), &target.objective_cred()) {
             return Ok(false);
         }
 

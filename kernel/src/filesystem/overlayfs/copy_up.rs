@@ -1,5 +1,5 @@
 use super::inode::OvlInode;
-use super::{cred::CredOverrideGuard, metadata};
+use super::metadata;
 use crate::filesystem::vfs::{
     self,
     file::{File, FileFlags, FilePrivateData},
@@ -110,161 +110,168 @@ impl OvlInode {
     ) -> Result<CopyUpOutcome, crate::mm::allocation::MemoryAllocationError> {
         let fs = self.overlay_fs()?;
         fs.require_upper()?;
-        let caller_cred = ProcessManager::current_pcb().cred();
-        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-        let mut upper_inode = self.upper_inode.lock();
-        if upper_inode.is_some() {
-            return Ok(CopyUpOutcome::Existing);
-        }
-
-        let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
-
-        let mut metadata = lower_inode.metadata()?;
-        Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size, &caller_cred);
-        if self.redirect.is_empty() {
-            let inode = self.upper_root_inode()?;
-            self.install_upper_inode(&mut upper_inode, inode)?;
-            return Ok(CopyUpOutcome::Existing);
-        }
-
-        let (parent_path, name) = self.upper_parent_path_and_name();
-        let parent_inode = self.ensure_upper_dir_path(parent_path, context)?;
-        // Directory copy-up and publication of this path as another object's
-        // ancestor share the same exact-path commit domain.  Parent ancestor
-        // guards have already been released by ensure_upper_dir_path().
-        let _ancestor_publish_guard = (metadata.file_type == FileType::Dir)
-            .then(|| fs.ancestor_copy_up_lock(&self.redirect).lock());
-        match super::lookup::lookup_backing(&parent_inode, name) {
-            Ok(existing)
-                if metadata.file_type == FileType::Dir
-                    && fs.matches_ancestor_publication(
-                        &self.redirect,
-                        &self.lower_inodes,
-                        &existing,
-                    )? =>
-            {
-                let existing = Self::validate_existing_upper(existing, &metadata)?;
-                self.set_origin(metadata::load_origin(self, &existing)?);
-                self.install_upper_inode(&mut upper_inode, existing)?;
+        let caller_cred = ProcessManager::current_cred();
+        ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+            let mut upper_inode = self.upper_inode.lock();
+            if upper_inode.is_some() {
                 return Ok(CopyUpOutcome::Existing);
             }
-            // The redirect stripe is held for the whole copy-up, so another
-            // copy-up of this object cannot have published this entry.  An
-            // unexpected upper therefore belongs to a newer namespace
-            // object; adopting it would let a stale lower inode modify that
-            // replacement.
-            Ok(_) => return Err(SystemError::ESTALE.into()),
-            Err(SystemError::ENOENT) => {}
-            Err(err) => return Err(err.into()),
-        }
 
-        let symlink_target = if metadata.file_type == FileType::SymLink {
-            Some(Self::read_symlink_target(lower_inode.clone())?)
-        } else {
-            None
-        };
+            let lower_inode = self.lower_inodes.first().ok_or(SystemError::ENOENT)?;
 
-        let (workdir, temp_inode, temp_name) = self.create_workdir_temp(|workdir, temp_name| {
-            Self::create_copy_up_temp(workdir, temp_name, &metadata, symlink_target.as_deref())
-        })?;
-
-        if let Err(err) = Self::copy_data_if_needed(
-            lower_inode.clone(),
-            temp_inode.clone(),
-            &metadata,
-            copy_size,
-        ) {
-            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-            return Err(err);
-        }
-
-        if let Err(err) = metadata::copy_xattrs(lower_inode, &temp_inode) {
-            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-            return Err(err);
-        }
-
-        // A length-aware copy-up already contains the post-truncate data.
-        // Drop capabilities before publishing that changed content so lookup
-        // and exec can never observe a stale capability on the new upper.
-        if copy_size.is_some() && metadata.file_type == FileType::File {
-            if let Err(err) = metadata::remove_security_capability(&temp_inode) {
-                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err);
-            }
-        }
-
-        let origin = match metadata::prepare_origin(self, lower_inode, &temp_inode, &metadata) {
-            Ok(origin) => origin,
-            Err(err) => {
-                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err);
-            }
-        };
-
-        if let Err(err) = Self::restore_copy_up_metadata(&temp_inode, &metadata) {
-            let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-            return Err(err);
-        }
-
-        let publish_outcome = if copy_size == Some(0) && metadata.file_type == FileType::File {
-            if let Err(err) = vfs::vcore::vfs_truncate(temp_inode.clone(), 0) {
-                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err);
-            }
-            CopyUpOutcome::PublishedAfterTruncate
-        } else {
-            CopyUpOutcome::Published
-        };
-
-        // The temp inode keeps its identity across the final rename. Publish
-        // the lightweight lower-origin connector before that namespace
-        // commit; allocation failure can still remove the temp and return
-        // ENOMEM without exposing an upper inode that has lost its origin.
-        let link_seed_publication = match self.prepare_copy_up_link_seed(&temp_inode) {
-            Ok(publication) => publication,
-            Err(err) => {
-                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err.into());
-            }
-        };
-
-        let parent_metadata = match parent_inode.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                return Err(err.into());
-            }
-        };
-        match Self::move_backing(
-            &workdir,
-            &temp_name,
-            &parent_inode,
-            name,
-            RenameFlags::NOREPLACE,
-            context,
-        ) {
-            Ok(()) => {
-                if let Some(publication) = link_seed_publication {
-                    publication.commit();
-                }
-                Self::restore_parent_timestamps(&parent_inode, &parent_metadata);
-                self.set_origin(origin);
-                let inode = Self::validate_existing_upper(temp_inode, &metadata)?;
+            let mut metadata = lower_inode.metadata()?;
+            Self::adjust_metadata_for_truncate_copy_up(&mut metadata, copy_size, &caller_cred);
+            if self.redirect.is_empty() {
+                let inode = self.upper_root_inode()?;
                 self.install_upper_inode(&mut upper_inode, inode)?;
-                return Ok(publish_outcome);
+                return Ok(CopyUpOutcome::Existing);
             }
-            Err(crate::mm::allocation::MemoryAllocationError::System(SystemError::EEXIST)) => {
-                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
-                // NOREPLACE can fail here only if the parent namespace changed
-                // after the absence check above.  Never bind this stale lower
-                // inode to the replacement that won the race.
-                return Err(SystemError::ESTALE.into());
+
+            let (parent_path, name) = self.upper_parent_path_and_name();
+            let parent_inode = self.ensure_upper_dir_path(parent_path, context)?;
+            // Directory copy-up and publication of this path as another object's
+            // ancestor share the same exact-path commit domain.  Parent ancestor
+            // guards have already been released by ensure_upper_dir_path().
+            let _ancestor_publish_guard = (metadata.file_type == FileType::Dir)
+                .then(|| fs.ancestor_copy_up_lock(&self.redirect).lock());
+            match super::lookup::lookup_backing(&parent_inode, name) {
+                Ok(existing)
+                    if metadata.file_type == FileType::Dir
+                        && fs.matches_ancestor_publication(
+                            &self.redirect,
+                            &self.lower_inodes,
+                            &existing,
+                        )? =>
+                {
+                    let existing = Self::validate_existing_upper(existing, &metadata)?;
+                    self.set_origin(metadata::load_origin(self, &existing)?);
+                    self.install_upper_inode(&mut upper_inode, existing)?;
+                    return Ok(CopyUpOutcome::Existing);
+                }
+                // The redirect stripe is held for the whole copy-up, so another
+                // copy-up of this object cannot have published this entry.  An
+                // unexpected upper therefore belongs to a newer namespace
+                // object; adopting it would let a stale lower inode modify that
+                // replacement.
+                Ok(_) => return Err(SystemError::ESTALE.into()),
+                Err(SystemError::ENOENT) => {}
+                Err(err) => return Err(err.into()),
             }
-            Err(err) => {
+
+            let symlink_target = if metadata.file_type == FileType::SymLink {
+                Some(Self::read_symlink_target(lower_inode.clone())?)
+            } else {
+                None
+            };
+
+            let (workdir, temp_inode, temp_name) =
+                self.create_workdir_temp(|workdir, temp_name| {
+                    Self::create_copy_up_temp(
+                        workdir,
+                        temp_name,
+                        &metadata,
+                        symlink_target.as_deref(),
+                    )
+                })?;
+
+            if let Err(err) = Self::copy_data_if_needed(
+                lower_inode.clone(),
+                temp_inode.clone(),
+                &metadata,
+                copy_size,
+            ) {
                 let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
                 return Err(err);
             }
-        }
+
+            if let Err(err) = metadata::copy_xattrs(lower_inode, &temp_inode) {
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                return Err(err);
+            }
+
+            // A length-aware copy-up already contains the post-truncate data.
+            // Drop capabilities before publishing that changed content so lookup
+            // and exec can never observe a stale capability on the new upper.
+            if copy_size.is_some() && metadata.file_type == FileType::File {
+                if let Err(err) = metadata::remove_security_capability(&temp_inode) {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    return Err(err);
+                }
+            }
+
+            let origin = match metadata::prepare_origin(self, lower_inode, &temp_inode, &metadata) {
+                Ok(origin) => origin,
+                Err(err) => {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    return Err(err);
+                }
+            };
+
+            if let Err(err) = Self::restore_copy_up_metadata(&temp_inode, &metadata) {
+                let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                return Err(err);
+            }
+
+            let publish_outcome = if copy_size == Some(0) && metadata.file_type == FileType::File {
+                if let Err(err) = vfs::vcore::vfs_truncate(temp_inode.clone(), 0) {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    return Err(err);
+                }
+                CopyUpOutcome::PublishedAfterTruncate
+            } else {
+                CopyUpOutcome::Published
+            };
+
+            // The temp inode keeps its identity across the final rename. Publish
+            // the lightweight lower-origin connector before that namespace
+            // commit; allocation failure can still remove the temp and return
+            // ENOMEM without exposing an upper inode that has lost its origin.
+            let link_seed_publication = match self.prepare_copy_up_link_seed(&temp_inode) {
+                Ok(publication) => publication,
+                Err(err) => {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    return Err(err.into());
+                }
+            };
+
+            let parent_metadata = match parent_inode.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    return Err(err.into());
+                }
+            };
+            match Self::move_backing(
+                &workdir,
+                &temp_name,
+                &parent_inode,
+                name,
+                RenameFlags::NOREPLACE,
+                context,
+            ) {
+                Ok(()) => {
+                    if let Some(publication) = link_seed_publication {
+                        publication.commit();
+                    }
+                    Self::restore_parent_timestamps(&parent_inode, &parent_metadata);
+                    self.set_origin(origin);
+                    let inode = Self::validate_existing_upper(temp_inode, &metadata)?;
+                    self.install_upper_inode(&mut upper_inode, inode)?;
+                    return Ok(publish_outcome);
+                }
+                Err(crate::mm::allocation::MemoryAllocationError::System(SystemError::EEXIST)) => {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    // NOREPLACE can fail here only if the parent namespace changed
+                    // after the absence check above.  Never bind this stale lower
+                    // inode to the replacement that won the race.
+                    return Err(SystemError::ESTALE.into());
+                }
+                Err(err) => {
+                    let _ = Self::cleanup_workdir_temp_with_context(&workdir, &temp_name, context);
+                    return Err(err);
+                }
+            }
+        })
     }
 
     fn upper_parent_path_and_name(&self) -> (&str, &str) {

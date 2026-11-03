@@ -56,7 +56,7 @@ fn namespace_snapshot(
         NsFileType::Time | NsFileType::TimeForChildren => {
             return Err(SystemError::ENOSYS);
         }
-        NsFileType::User => NamespaceFilePrivateData::User(pcb.cred().user_ns.clone()),
+        NsFileType::User => NamespaceFilePrivateData::User(pcb.objective_cred().user_ns.clone()),
         NsFileType::Cgroup => NamespaceFilePrivateData::Cgroup(nsproxy.cgroup_ns.clone()),
     };
 

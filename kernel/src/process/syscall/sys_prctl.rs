@@ -166,7 +166,7 @@ impl Syscall for SysPrctl {
 
             PrctlOption::SetMm => {
                 // gVisor: PR_SET_MM 在缺少 CAP_SYS_RESOURCE 时必须返回 EPERM。
-                let cred = current.cred();
+                let cred = ProcessManager::current_cred();
                 if !cred.has_capability(crate::process::cred::CAPFlags::CAP_SYS_RESOURCE) {
                     return Err(SystemError::EPERM);
                 }
@@ -200,7 +200,7 @@ impl Syscall for SysPrctl {
                 // PR_CAPBSET_READ: 检查某个 capability 是否在 bounding set 中
                 // arg2 是 capability 的编号 (0-40)
                 let cap_flag = capability_from_index(arg2)?;
-                let cred = current.cred();
+                let cred = ProcessManager::current_cred();
                 let has_cap = cred.cap_bset.contains(cap_flag);
                 Ok(if has_cap { 1 } else { 0 })
             }
@@ -210,7 +210,7 @@ impl Syscall for SysPrctl {
                 // 需要 CAP_SETPCAP 权限
                 let cap_flag = capability_from_index(arg2)?;
 
-                let old_cred = current.cred();
+                let old_cred = current.objective_cred();
                 // Linux: PR_CAPBSET_DROP 需要 CAP_SETPCAP 权限
                 if !old_cred.has_capability(CAPFlags::CAP_SETPCAP) {
                     return Err(SystemError::EPERM);

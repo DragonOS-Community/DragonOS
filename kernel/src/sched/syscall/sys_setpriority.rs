@@ -86,9 +86,8 @@ impl SysSetpriority {
     /// target's real or effective uid, or the caller has to hold
     /// `CAP_SYS_NICE` in the *target's* user namespace.
     fn permits(target: &Arc<ProcessControlBlock>) -> bool {
-        let current = ProcessManager::current_pcb();
-        same_sched_owner(&current.cred(), &target.cred())
-            || ns_capable(&target.cred().user_ns, CAPFlags::CAP_SYS_NICE)
+        same_sched_owner(&ProcessManager::current_cred(), &target.objective_cred())
+            || ns_capable(&target.objective_cred().user_ns, CAPFlags::CAP_SYS_NICE)
     }
 
     /// Linux `can_nice()`: the requested nice value, re-encoded as

@@ -120,7 +120,8 @@ fn unshare_user_cred(
         return Ok(None);
     }
 
-    let mut new_cred = (*current_pcb.cred()).clone();
+    current_pcb.assert_no_credential_override();
+    let mut new_cred = (*current_pcb.objective_cred()).clone();
     let new_user_ns =
         crate::process::namespace::user_namespace::UserNamespace::create_user_ns(&new_cred)?;
     crate::process::cred::set_cred_user_ns(&mut new_cred, new_user_ns);

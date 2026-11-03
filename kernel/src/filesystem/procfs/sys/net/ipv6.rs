@@ -180,8 +180,7 @@ impl ForwardingFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let netns = ProcessManager::current_netns();
-        if !ProcessManager::current_pcb()
-            .cred()
+        if !ProcessManager::current_cred()
             .has_capability_in_ns(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
         {
             return Err(SystemError::EPERM);

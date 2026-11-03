@@ -2,8 +2,9 @@
 //!
 //! 返回进程的内存映射信息，格式兼容 Linux procfs
 
+use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::procfs::template::configure_readonly_seq_file;
-use crate::filesystem::vfs::OpenFileBehavior;
+use crate::filesystem::vfs::{mount::MountFSInode, OpenFileBehavior};
 use crate::libs::{casting::DowncastArc, mutex::MutexGuard};
 use crate::{
     arch::MMArch,
@@ -73,17 +74,19 @@ fn perms_from_vm_flags(vm_flags: VmFlags) -> [u8; 4] {
 #[inline(never)]
 fn format_dev_inode_and_path(
     file_inode: Option<&Arc<dyn IndexNode>>,
-    root_prefix: &str,
+    reader_root: &MountFSInode,
 ) -> (String, String) {
     if let Some(inode) = file_inode {
         let (dev, ino, path) = match inode.metadata() {
             Ok(md) => {
-                let dev = format!("{:02x}:{:02x}", (md.dev_id >> 8) & 0xff, md.dev_id & 0xff);
+                // Metadata stores the kernel device number, not Linux ABI dev_t.
+                let device = DeviceNumber::from(md.dev_id as u32);
+                let dev = format!("{:02x}:{:02x}", device.major().data(), device.minor());
                 let ino = md.inode_id.into();
                 let mut path = inode
                     .clone()
                     .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
-                    .map(|inode| inode.procfs_path())
+                    .map(|inode| inode.procfs_path(reader_root))
                     .unwrap_or_else(|| inode.absolute_path())
                     .unwrap_or_default();
                 // An unlinked internal inode has a diagnostic dname but no
@@ -92,18 +95,6 @@ fn format_dev_inode_and_path(
                 if diagnostic {
                     if let Ok(name) = inode.dname() {
                         path = format!("/{} (deleted)", name.as_ref());
-                    }
-                }
-                // 尊重进程的 chroot：去掉根目录前缀
-                if !diagnostic && !root_prefix.is_empty() && root_prefix != "/" {
-                    if let Some(rest) = path.strip_prefix(root_prefix) {
-                        path = if rest.is_empty() {
-                            "/".to_string()
-                        } else if rest.starts_with('/') {
-                            rest.to_string()
-                        } else {
-                            format!("/{}", rest)
-                        };
                     }
                 }
                 (dev, ino, path)
@@ -146,7 +137,7 @@ fn render_maps_slice(
     // Linux `m_start()` resolves the task for every record it produces, so a
     // target that is gone ends the stream with `-ESRCH` even though the address
     // space itself is pinned by `open()`.
-    let target_pcb = target.thread_group_leader().ok_or(SystemError::ESRCH)?;
+    let _target_pcb = target.thread_group_leader().ok_or(SystemError::ESRCH)?;
 
     // A task without an address space (kernel thread) has no record to render.
     let Some(vm) = vm else {
@@ -161,10 +152,14 @@ fn render_maps_slice(
     let Some(_mm_user) = vm.try_acquire() else {
         return Ok(None);
     };
-    let Some(fs) = target_pcb.try_fs_struct() else {
-        return Ok(None);
-    };
-    let root_prefix = fs.root().absolute_path().unwrap_or_default();
+    // seq_path/d_path resolve against the task actually reading this slice,
+    // not the mapped task or the task that originally opened the proc file.
+    let reader_root = crate::process::ProcessManager::current_pcb()
+        .try_fs_struct()
+        .ok_or(SystemError::ENOENT)?
+        .root()
+        .downcast_arc::<MountFSInode>()
+        .ok_or(SystemError::EINVAL)?;
 
     let as_guard = vm.read_guard_no_reservations();
 
@@ -191,7 +186,7 @@ fn render_maps_slice(
             resume = Some(vma.lock().region().start().data());
             break;
         }
-        append_map_line(&vma, &root_prefix, out);
+        append_map_line(&vma, &reader_root, out);
     }
 
     if out.is_empty() && cursor.is_none() {
@@ -202,7 +197,7 @@ fn render_maps_slice(
 }
 
 /// Appends one line of the mapping table, as Linux `show_map_vma()` writes it.
-fn append_map_line(vma: &Arc<LockedVMA>, root_prefix: &str, out: &mut Vec<u8>) {
+fn append_map_line(vma: &Arc<LockedVMA>, reader_root: &MountFSInode, out: &mut Vec<u8>) {
     {
         let g = vma.lock();
         let region = *g.region();
@@ -216,9 +211,9 @@ fn append_map_line(vma: &Arc<LockedVMA>, root_prefix: &str, out: &mut Vec<u8>) {
 
         let (dev_ino, path_tail) = if let Some(f) = g.vm_file() {
             let inode = f.inode();
-            format_dev_inode_and_path(Some(&inode), root_prefix)
+            format_dev_inode_and_path(Some(&inode), reader_root)
         } else {
-            format_dev_inode_and_path(None, root_prefix)
+            format_dev_inode_and_path(None, reader_root)
         };
 
         let line = format!(

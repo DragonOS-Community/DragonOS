@@ -83,7 +83,7 @@ impl ProcessManager {
             }
             return Ok(());
         }
-        let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
+        let was_uninterruptible = state.is_uninterruptible();
 
         pcb.sched_info().set_state(ProcessState::Runnable);
         fence(Ordering::SeqCst);
@@ -797,7 +797,7 @@ impl ProcessManager {
         let target_cpu = pcb.sched_info().on_cpu().unwrap_or_else(current_cpu_id);
         let update_clock = target_cpu == smp_get_processor_id();
         let was_off_rq = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
-        let was_uninterruptible = matches!(prev_state, ProcessState::Blocked(false));
+        let was_uninterruptible = prev_state.is_uninterruptible();
         let was_iowait = pcb.flags().contains(ProcessFlags::IN_IOWAIT);
 
         if was_off_rq && (was_uninterruptible || was_iowait) {
@@ -863,6 +863,16 @@ impl ProcessManager {
     /// - After entering this function, the caller must ensure logical
     ///   correctness to prevent the task from being re-added to the run queue.
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
+        Self::mark_sleep_state(ProcessState::Blocked(interruptable))
+    }
+
+    /// Publish a fatal-signal-only resource wait under the usual sleep protocol.
+    /// Like `mark_sleep`, this requires interrupts to be disabled.
+    pub fn mark_sleep_killable() -> Result<(), SystemError> {
+        Self::mark_sleep_state(ProcessState::BlockedKillable)
+    }
+
+    fn mark_sleep_state(sleep_state: ProcessState) -> Result<(), SystemError> {
         assert!(
             !CurrentIrqArch::is_irq_enabled(),
             "interrupt must be disabled before enter ProcessManager::mark_sleep()"
@@ -876,8 +886,7 @@ impl ProcessManager {
         if state.is_stopped() {
             return Ok(());
         }
-        pcb.sched_info()
-            .set_state(ProcessState::Blocked(interruptable));
+        pcb.sched_info().set_state(sleep_state);
         pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
         fence(Ordering::SeqCst);
         return Ok(());

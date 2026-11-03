@@ -488,7 +488,7 @@ impl MountableFileSystem for RamFS {
             .ok_or(SystemError::EINVAL)?;
         // Linux ramfs_get_inode uses inode_init_owner/current_fsuid at
         // get_tree, unlike tmpfs which explicitly uses fc->cred's saved IDs.
-        let cred = crate::process::ProcessManager::current_pcb().cred();
+        let cred = crate::process::ProcessManager::current_cred();
         Ok(Self::new_in_context(
             data.mode,
             cred.fsuid.data(),

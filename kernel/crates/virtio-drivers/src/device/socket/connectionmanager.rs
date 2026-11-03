@@ -7,7 +7,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::cmp::min;
 use core::convert::TryInto;
 use core::hint::spin_loop;
-use log::debug;
+use log::trace;
 use zerocopy::FromZeroes;
 
 const PER_CONNECTION_BUFFER_CAPACITY: usize = 1024;
@@ -109,7 +109,7 @@ impl<H: Hal, T: Transport> VsockConnectionManager<H, T> {
         let new_connection = Connection::new(destination, src_port);
 
         self.driver.connect(&new_connection.info)?;
-        debug!("Connection requested: {:?}", new_connection.info);
+        trace!("Connection requested: {:?}", new_connection.info);
         self.connections.push(new_connection);
         Ok(())
     }

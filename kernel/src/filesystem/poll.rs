@@ -3,15 +3,11 @@ use core::ffi::c_int;
 use crate::{
     filesystem::epoll::{event_poll::EventPoll, EPollCtlOption, EPollEvent, EPollEventType},
     ipc::signal::{restore_saved_sigmask_unless, RestartBlock, RestartBlockData, RestartFn},
-    libs::wait_queue::{TimeoutWaker, Waiter},
+    libs::wait_queue::{WaitTimeout, Waiter},
     process::ProcessManager,
     syscall::user_access::UserBufferWriter,
     syscall::user_buffer::UserBuffer,
-    time::{
-        syscall::PosixTimeval,
-        timer::{next_n_us_timer_jiffies, Timer},
-        Duration, Instant, PosixTimeSpec,
-    },
+    time::{syscall::PosixTimeval, Duration, Instant, PosixTimeSpec},
 };
 
 use super::vfs::file::{File, FileFlags};
@@ -227,13 +223,17 @@ impl<'a> PollAdapter<'a> {
 
         // 如果已经有无效 fd，使用非阻塞模式检查有效 fd
         // 这样可以立即返回所有结果，而不会因等待有效 fd 而延迟报告无效 fd
-        let remain_timeout = if has_invalid_fds {
-            Some(PosixTimeSpec::default()) // timeout=0，非阻塞
+        let deadline = if has_invalid_fds {
+            Some(PosixTimeSpec::default()) // polling sentinel
         } else {
-            timeout.map(|t| {
-                t.duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO)
-                    .into()
+            timeout.map(|end| {
+                if end <= Instant::now() {
+                    // Preserve the original nonblocking/past-budget sentinel
+                    // and its ready/signal ordering, without restarting time.
+                    PosixTimeSpec::default()
+                } else {
+                    instant_deadline(end)
+                }
             })
         };
 
@@ -241,7 +241,7 @@ impl<'a> PollAdapter<'a> {
             self.ep_file.clone(),
             &mut epoll_events,
             len,
-            remain_timeout,
+            deadline,
         )?;
 
         // 处理返回的事件，将它们映射回所有相关的 pollfd 条目
@@ -292,6 +292,13 @@ pub fn do_sys_poll(
     Ok(nevents)
 }
 
+fn instant_deadline(end: Instant) -> PosixTimeSpec {
+    // Instant is an absolute monotonic microsecond value. Do not subtract now
+    // and add it again inside epoll: preparation consumes the original budget.
+    let ns = (end.total_micros().max(0) as u128 * 1_000).min(i64::MAX as u128) as u64;
+    PosixTimeSpec::from_ns(ns)
+}
+
 /// Handle a poll request with no ready result and no event source.
 ///
 /// 根据 Linux 语义：
@@ -300,77 +307,40 @@ pub fn do_sys_poll(
 /// - 如果 timeout>0，等待指定时间后返回 0
 /// - 如果 timeout=-1(None)，无限等待直到被信号中断，返回 ERESTARTNOHAND
 fn poll_wait_timeout_only(timeout: Option<Instant>) -> Result<usize, SystemError> {
+    let deadline = timeout.map(instant_deadline);
+    let mut wait_pair = None;
+    let mut timer: Option<WaitTimeout> = None;
     loop {
-        // 检查是否有未被掩码屏蔽的待处理信号
-        // ppoll 应该只被未被屏蔽的信号中断，被屏蔽的信号应保持 pending 状态
         let current_pcb = ProcessManager::current_pcb();
         if current_pcb.has_pending_signal_fast() && current_pcb.has_pending_not_masked_signal() {
             return Err(SystemError::ERESTARTNOHAND);
         }
-
-        // 检查超时
-        if let Some(end_time) = timeout {
-            if Instant::now() >= end_time {
-                return Ok(0);
-            }
-        }
-
-        // 计算剩余等待时间
-        let sleep_duration = if let Some(end_time) = timeout {
-            let remain = end_time
-                .duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            if remain == Duration::ZERO {
-                return Ok(0);
-            }
-            remain
-        } else {
-            // 无限等待时，设置一个较长的时间（比如1秒），然后循环检查信号
-            Duration::from_secs(1)
-        };
-
-        // 创建 Waiter/Waker 对
-        let (waiter, waker) = Waiter::new_pair();
-
-        // 创建定时器唤醒
-        let sleep_us = sleep_duration.total_micros();
-        let timer: Arc<Timer> = Timer::new(
-            TimeoutWaker::new(waker.clone()),
-            next_n_us_timer_jiffies(sleep_us),
-        );
-
-        // 激活定时器
-        timer.activate();
-
-        // 使用标准的 Waiter.wait() - 它内部已经正确处理了中断禁用等逻辑
-        let wait_res = waiter.wait(true);
-
-        // 醒来后检查原因
-        let was_timeout = timer.timeout();
-        if !was_timeout {
-            timer.cancel();
-        }
-
-        // 处理等待结果（可能是信号中断）
-        // 注意：waiter.wait() 返回 ERESTARTSYS，但 poll 需要 ERESTARTNOHAND
-        // 以便正确设置 restart block
-        if let Err(SystemError::ERESTARTSYS) = wait_res {
-            return Err(SystemError::ERESTARTNOHAND);
-        }
-        wait_res?;
-
-        // 检查是否因未被掩码屏蔽的信号而醒来
-        let current_pcb = ProcessManager::current_pcb();
-        if current_pcb.has_pending_signal_fast() && current_pcb.has_pending_not_masked_signal() {
-            return Err(SystemError::ERESTARTNOHAND);
-        }
-
-        // 如果超时且有超时设置，返回 0
-        if was_timeout && timeout.is_some() {
+        if deadline.is_some_and(WaitTimeout::deadline_reached)
+            || timer.as_ref().is_some_and(WaitTimeout::fired)
+        {
             return Ok(0);
         }
 
-        // 无限等待时继续循环（重新检查信号）
+        let (waiter, waker) = wait_pair.get_or_insert_with(Waiter::new_pair);
+        if timer.is_none() {
+            if let Some(deadline) = deadline {
+                timer = Some(WaitTimeout::start(deadline, waker)?);
+            }
+        }
+        // Preparation consumes the same deadline; do not sleep if it expired
+        // while allocating, even when softirq has not run the callback yet.
+        if deadline.is_some_and(WaitTimeout::deadline_reached)
+            || timer.as_ref().is_some_and(WaitTimeout::fired)
+        {
+            continue; // retain the loop's signal-before-timeout priority
+        }
+        // No timeout means no timer or periodic polling. Waiter's interruptible
+        // sleep handshake checks pending signals after publishing Blocked.
+        match waiter.wait(true) {
+            Err(SystemError::ERESTARTSYS) => return Err(SystemError::ERESTARTNOHAND),
+            other => other?,
+        }
+        // Recheck signal before timeout, preserving ppoll's original priority.
     }
 }
 

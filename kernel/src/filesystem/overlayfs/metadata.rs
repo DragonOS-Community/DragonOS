@@ -1,4 +1,3 @@
-use super::cred::CredOverrideGuard;
 use super::inode::OvlInode;
 use crate::filesystem::vfs::{
     merge_metadata_masked, permission::PermissionMask, FilePrivateData, FileType, IndexNode,
@@ -120,13 +119,11 @@ fn is_private_xattr(name: &[u8]) -> bool {
 
 fn caller_may_access_xattr(name: &[u8]) -> bool {
     !name.starts_with(XATTR_TRUSTED_PREFIX)
-        || ProcessManager::current_pcb()
-            .cred()
-            .has_capability(CAPFlags::CAP_SYS_ADMIN)
+        || ProcessManager::current_cred().has_capability(CAPFlags::CAP_SYS_ADMIN)
 }
 
 fn check_xattr_mutation_permission(inode: &OvlInode, name: &[u8]) -> Result<(), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let metadata = inode.metadata()?;
     if metadata
         .flags
@@ -184,9 +181,7 @@ fn check_xattr_read_permission(inode: &OvlInode, name: &[u8]) -> Result<(), Syst
     if !matches!(metadata.file_type, FileType::File | FileType::Dir) {
         return Err(SystemError::ENODATA);
     }
-    ProcessManager::current_pcb()
-        .cred()
-        .inode_permission(&metadata, PermissionMask::MAY_READ.bits())
+    ProcessManager::current_cred().inode_permission(&metadata, PermissionMask::MAY_READ.bits())
 }
 
 fn must_copy_xattr(name: &[u8]) -> bool {
@@ -209,26 +204,27 @@ pub(super) fn prepare_primary_write_locked(
     caller: &Arc<crate::process::Cred>,
     stage: &mut crate::filesystem::vfs::WritePrivilegeStage<'_>,
 ) -> Result<(), MemoryAllocationError> {
-    let _cred_guard = CredOverrideGuard::new(backing_cred.clone())?;
-    let current = backing.metadata()?;
-    let (requested, derived) =
-        crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
-            current.clone(),
-            current.size.max(0) as usize,
-            caller,
-        );
-    // Linux setattr_prepare kills security privileges before committing the
-    // mode change. A failed killpriv must not clear setid or publish ATTRIB.
-    remove_security_capability(backing)?;
-    if derived.contains(SetMetadataMask::MODE) {
-        backing.set_metadata_masked(
-            &requested,
-            SetMetadataMask::MODE | SetMetadataMask::CTIME | SetMetadataMask::WRITE_SIDE_EFFECT,
-        )?;
-        stage.commit_attrib();
-    }
-    stage.complete();
-    Ok(())
+    ProcessManager::with_current_credentials(backing_cred.clone(), || {
+        let current = backing.metadata()?;
+        let (requested, derived) =
+            crate::filesystem::vfs::vcore::prepare_write_side_effect_metadata_with_cred(
+                current.clone(),
+                current.size.max(0) as usize,
+                caller,
+            );
+        // Linux setattr_prepare kills security privileges before committing the
+        // mode change. A failed killpriv must not clear setid or publish ATTRIB.
+        remove_security_capability(backing)?;
+        if derived.contains(SetMetadataMask::MODE) {
+            backing.set_metadata_masked(
+                &requested,
+                SetMetadataMask::MODE | SetMetadataMask::CTIME | SetMetadataMask::WRITE_SIDE_EFFECT,
+            )?;
+            stage.commit_attrib();
+        }
+        stage.complete();
+        Ok(())
+    })
 }
 
 /// Internal killpriv for a stacked overlay backing. Keep copy-up and backing
@@ -239,12 +235,13 @@ pub(super) fn remove_security_privileges(
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
     if !inode.has_upper() {
-        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-        match inode
-            .current_realdata_inode()?
-            .0
-            .getxattr(XATTR_SECURITY_CAPABILITY, &mut [])
-        {
+        let capability = ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+            inode
+                .current_realdata_inode()?
+                .0
+                .getxattr(XATTR_SECURITY_CAPABILITY, &mut [])
+        });
+        match capability {
             Err(SystemError::ENODATA) => return Ok(()),
             Err(error) if is_unsupported(&error) => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -254,8 +251,9 @@ pub(super) fn remove_security_privileges(
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    upper.remove_security_privileges()
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        upper.remove_security_privileges()
+    })
 }
 
 fn metadata_change_kills_capability(mask: SetMetadataMask) -> bool {
@@ -447,77 +445,80 @@ pub(super) fn load_origin(
     upper: &Arc<dyn IndexNode>,
 ) -> Result<Option<OvlOrigin>, MemoryAllocationError> {
     let fs = inode.overlay_fs()?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    let mut value = XattrBuffer::default();
-    match value.read(|buf| upper.getxattr(OVL_XATTR_ORIGIN, buf)) {
-        Ok(()) => {}
-        Err(MemoryAllocationError::System(SystemError::ENODATA)) => return Ok(None),
-        // Keep this symmetric with prepare_origin(): if the backing
-        // filesystem cannot store the private origin xattr, a later inode
-        // instantiation must use the upper identity instead of exposing the
-        // backing xattr error through lookup/stat.
-        Err(MemoryAllocationError::System(err)) if is_origin_xattr_unavailable(&err) => {
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        let mut value = XattrBuffer::default();
+        match value.read(|buf| upper.getxattr(OVL_XATTR_ORIGIN, buf)) {
+            Ok(()) => {}
+            Err(MemoryAllocationError::System(SystemError::ENODATA)) => return Ok(None),
+            // Keep this symmetric with prepare_origin(): if the backing
+            // filesystem cannot store the private origin xattr, a later inode
+            // instantiation must use the upper identity instead of exposing the
+            // backing xattr error through lookup/stat.
+            Err(MemoryAllocationError::System(err)) if is_origin_xattr_unavailable(&err) => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
+        let Some(origin) = decode_origin(value.as_slice()) else {
+            return Ok(None);
+        };
+        if origin.file_type != inode.file_type
+            || !fs.backing_fsid_matches_device(origin.fsid, origin.dev_id)?
+        {
             return Ok(None);
         }
-        Err(err) => return Err(err),
-    }
-    let Some(origin) = decode_origin(value.as_slice()) else {
-        return Ok(None);
-    };
-    if origin.file_type != inode.file_type
-        || !fs.backing_fsid_matches_device(origin.fsid, origin.dev_id)?
-    {
-        return Ok(None);
-    }
 
-    if !inode.lower_inodes.is_empty() {
-        let mut matched = false;
-        for lower in &inode.lower_inodes {
-            if fs.backing_fsid(lower)? != origin.fsid {
-                continue;
+        if !inode.lower_inodes.is_empty() {
+            let mut matched = false;
+            for lower in &inode.lower_inodes {
+                if fs.backing_fsid(lower)? != origin.fsid {
+                    continue;
+                }
+                let metadata = lower.metadata()?;
+                if metadata.dev_id == origin.dev_id
+                    && metadata.inode_id == origin.inode_id
+                    && metadata.file_type == origin.file_type
+                {
+                    matched = true;
+                    break;
+                }
             }
-            let metadata = lower.metadata()?;
-            if metadata.dev_id == origin.dev_id
-                && metadata.inode_id == origin.inode_id
-                && metadata.file_type == origin.file_type
-            {
-                matched = true;
-                break;
+            if !matched {
+                return Ok(None);
             }
         }
-        if !matched {
-            return Ok(None);
-        }
-    }
 
-    Ok(Some(origin))
+        Ok(Some(origin))
+    })
 }
 
 pub(super) fn metadata(inode: &OvlInode) -> Result<Metadata, SystemError> {
     let fs = inode.overlay_fs()?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    let (real_inode, _) = inode.current_realdata_inode()?;
-    let mut metadata = real_inode.metadata()?;
-    let origin = inode.origin();
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        let (real_inode, _) = inode.current_realdata_inode()?;
+        let mut metadata = real_inode.metadata()?;
+        let origin = inode.origin();
 
-    if fs.samefs {
-        metadata.dev_id = 0;
-        if let Some(origin) = origin {
+        if fs.samefs {
+            metadata.dev_id = 0;
+            if let Some(origin) = origin {
+                metadata.inode_id = origin.inode_id;
+            }
+        } else if inode.file_type == FileType::Dir {
+            metadata.dev_id = 0;
+            metadata.inode_id = inode.overlay_inode_id.ok_or(SystemError::EIO)?;
+        } else if let Some(origin) = origin {
+            metadata.dev_id = origin.dev_id;
             metadata.inode_id = origin.inode_id;
         }
-    } else if inode.file_type == FileType::Dir {
-        metadata.dev_id = 0;
-        metadata.inode_id = inode.overlay_inode_id.ok_or(SystemError::EIO)?;
-    } else if let Some(origin) = origin {
-        metadata.dev_id = origin.dev_id;
-        metadata.inode_id = origin.inode_id;
-    }
 
-    let real_dir_count = inode.lower_inodes.len() + usize::from(inode.upper_inode.lock().is_some());
-    if inode.file_type == FileType::Dir && real_dir_count > 1 {
-        metadata.nlinks = 1;
-    }
-    Ok(metadata)
+        let real_dir_count =
+            inode.lower_inodes.len() + usize::from(inode.upper_inode.lock().is_some());
+        if inode.file_type == FileType::Dir && real_dir_count > 1 {
+            metadata.nlinks = 1;
+        }
+        Ok(metadata)
+    })
 }
 
 pub(super) fn resize_with_lock_owner(
@@ -530,9 +531,10 @@ pub(super) fn resize_with_lock_owner(
     inode.copy_up_locked_for_truncate(len)?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    remove_security_capability(&upper)?;
-    upper.resize_with_lock_owner(len, lock_owner)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        remove_security_capability(&upper)?;
+        upper.resize_with_lock_owner(len, lock_owner)
+    })
 }
 
 pub(super) fn set_metadata_masked(
@@ -551,12 +553,13 @@ pub(super) fn set_metadata_masked(
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    if kill_capability {
-        remove_security_capability(&upper)?;
-    }
-    let upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
-    upper.set_metadata_masked(&upper_metadata, mask)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        if kill_capability {
+            remove_security_capability(&upper)?;
+        }
+        let upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
+        upper.set_metadata_masked(&upper_metadata, mask)
+    })
 }
 
 fn prepare_upper_metadata(
@@ -583,11 +586,12 @@ pub(super) fn resize_with_metadata(
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    remove_security_capability(&upper)?;
-    let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
-    upper_metadata.size = len as i64;
-    upper.resize_with_metadata(len, lock_owner, &upper_metadata, mask)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        remove_security_capability(&upper)?;
+        let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
+        upper_metadata.size = len as i64;
+        upper.resize_with_metadata(len, lock_owner, &upper_metadata, mask)
+    })
 }
 
 fn check_metadata_mutation_permission(
@@ -603,7 +607,7 @@ fn check_metadata_mutation_permission(
     if current.flags.contains(InodeFlags::S_IMMUTABLE) {
         return Err(SystemError::EPERM);
     }
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
 
     if mask.intersects(SetMetadataMask::UID | SetMetadataMask::GID) {
         if cred.uid.data() == 0 {
@@ -666,11 +670,12 @@ pub(super) fn resize_file_with_metadata(
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
     check_metadata_mutation_permission(inode, requested, mask)?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    remove_security_capability(&upper)?;
-    let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
-    upper_metadata.size = len as i64;
-    super::file::resize_file_with_metadata(inode, data, len, lock_owner, &upper_metadata, mask)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        remove_security_capability(&upper)?;
+        let mut upper_metadata = prepare_upper_metadata(&upper, requested, mask)?;
+        upper_metadata.size = len as i64;
+        super::file::resize_file_with_metadata(inode, data, len, lock_owner, &upper_metadata, mask)
+    })
 }
 
 pub(super) fn getxattr(
@@ -686,8 +691,9 @@ pub(super) fn getxattr(
     }
     check_xattr_read_permission(inode, name)?;
     let fs = inode.overlay_fs()?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    inode.current_realdata_inode()?.0.getxattr(name, buf)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        inode.current_realdata_inode()?.0.getxattr(name, buf)
+    })
 }
 
 pub(super) fn setxattr(
@@ -709,21 +715,21 @@ pub(super) fn setxattr(
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
     check_xattr_mutation_permission(inode, name)?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    upper.setxattr(name, value, flags)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        upper.setxattr(name, value, flags)
+    })
 }
 
 pub(super) fn listxattr(inode: &OvlInode, buf: &mut [u8]) -> Result<usize, SystemError> {
-    let may_list_trusted = ProcessManager::current_pcb()
-        .cred()
-        .has_capability(CAPFlags::CAP_SYS_ADMIN);
+    let may_list_trusted = ProcessManager::current_cred().has_capability(CAPFlags::CAP_SYS_ADMIN);
     let fs = inode.overlay_fs()?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    let real = inode.current_realdata_inode()?.0;
-    let mut list = XattrBuffer::default();
-    list.read(|buf| real.listxattr(buf))
-        .map_err(xattr_read_error)?;
-    copy_visible_xattr_names(list.as_slice(), buf, may_list_trusted)
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        let real = inode.current_realdata_inode()?.0;
+        let mut list = XattrBuffer::default();
+        list.read(|buf| real.listxattr(buf))
+            .map_err(xattr_read_error)?;
+        copy_visible_xattr_names(list.as_slice(), buf, may_list_trusted)
+    })
 }
 
 fn copy_visible_xattr_names(
@@ -778,34 +784,37 @@ pub(super) fn removexattr(
     check_xattr_mutation_permission(inode, name)?;
     let copied_up_for_remove = !inode.has_upper();
     if copied_up_for_remove {
-        let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-        inode.current_realdata_inode()?.0.getxattr(name, &mut [])?;
+        ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+            inode.current_realdata_inode()?.0.getxattr(name, &mut [])
+        })?;
     }
 
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
     check_xattr_mutation_permission(inode, name)?;
-    let _cred_guard = CredOverrideGuard::new(fs.backing_cred.clone())?;
-    match upper.removexattr(name) {
-        Ok(size) => Ok(size),
-        Err(crate::mm::allocation::MemoryAllocationError::System(err))
-            if copied_up_for_remove && (err == SystemError::ENODATA || is_unsupported(&err)) =>
-        {
-            // Optional lower xattrs may be intentionally discarded when the
-            // upper backing does not support their namespace. The attribute
-            // existed in the merged view before copy-up, so report a
-            // completed removal only after confirming that it is no longer
-            // observable through the published upper inode.
-            match upper.getxattr(name, &mut []) {
-                Err(SystemError::ENODATA) => Ok(0),
-                Err(probe_err) if is_unsupported(&probe_err) => Ok(0),
-                Ok(_) => Err(err.into()),
-                Err(probe_err) => Err(probe_err.into()),
+    ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
+        match upper.removexattr(name) {
+            Ok(size) => Ok(size),
+            Err(crate::mm::allocation::MemoryAllocationError::System(err))
+                if copied_up_for_remove
+                    && (err == SystemError::ENODATA || is_unsupported(&err)) =>
+            {
+                // Optional lower xattrs may be intentionally discarded when the
+                // upper backing does not support their namespace. The attribute
+                // existed in the merged view before copy-up, so report a
+                // completed removal only after confirming that it is no longer
+                // observable through the published upper inode.
+                match upper.getxattr(name, &mut []) {
+                    Err(SystemError::ENODATA) => Ok(0),
+                    Err(probe_err) if is_unsupported(&probe_err) => Ok(0),
+                    Ok(_) => Err(err.into()),
+                    Err(probe_err) => Err(probe_err.into()),
+                }
             }
+            Err(err) => Err(err),
         }
-        Err(err) => Err(err),
-    }
+    })
 }
 
 #[cfg(all(

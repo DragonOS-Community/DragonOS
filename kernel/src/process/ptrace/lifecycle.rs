@@ -32,8 +32,8 @@ fn traceme_allowed(
     if parent.flags().contains(ProcessFlags::EXITING) {
         return Err(SystemError::EPERM);
     }
-    let parent_cred = parent.cred();
-    let child_cred = child.cred();
+    let parent_cred = parent.objective_cred();
+    let child_cred = ProcessManager::current_cred();
     let allowed = parent_cred
         .has_capability_in_ns(&child_cred.user_ns, cred::CAPFlags::CAP_SYS_PTRACE)
         || (Arc::ptr_eq(&parent_cred.user_ns, &child_cred.user_ns)
@@ -1043,8 +1043,11 @@ impl ProcessControlBlock {
         let _exec_guard = self.exec_update_read();
         let is_same_thread_group = tracer.tgid == self.tgid;
 
-        if !tracer.has_permission_to_trace(self, PtraceAccessCreds::RealCreds)
-            || self.flags().contains(ProcessFlags::KTHREAD)
+        if !tracer.has_permission_to_trace(
+            self,
+            PtraceAccessCreds::RealCreds,
+            &ProcessManager::current_cred(),
+        ) || self.flags().contains(ProcessFlags::KTHREAD)
             || is_same_thread_group
         {
             return Err(SystemError::EPERM);
@@ -1104,8 +1107,11 @@ impl ProcessControlBlock {
         let _exec_guard = self.exec_update_read();
         validate_ptrace_options(options)?;
         let is_same_thread_group = tracer.tgid == self.tgid;
-        if !tracer.has_permission_to_trace(self, PtraceAccessCreds::RealCreds)
-            || self.flags().contains(ProcessFlags::KTHREAD)
+        if !tracer.has_permission_to_trace(
+            self,
+            PtraceAccessCreds::RealCreds,
+            &ProcessManager::current_cred(),
+        ) || self.flags().contains(ProcessFlags::KTHREAD)
             || is_same_thread_group
         {
             return Err(SystemError::EPERM);

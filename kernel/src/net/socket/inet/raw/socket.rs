@@ -43,7 +43,7 @@ impl RawSocket {
         nonblock: bool,
     ) -> Result<Arc<Self>, SystemError> {
         // CAP_NET_RAW 权限检查
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         if !cred.has_capability(CAPFlags::CAP_NET_RAW) {
             log::warn!("RawSocket::new: CAP_NET_RAW check failed");
             return Err(SystemError::EPERM);

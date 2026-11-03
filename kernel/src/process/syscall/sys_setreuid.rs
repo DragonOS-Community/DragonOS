@@ -33,7 +33,7 @@ impl Syscall for SysSetReUid {
     /// - 如果设置了 ruid，或者 euid 被设置为与旧 ruid 不同的值，则 suid = new_euid
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let ruid = id_utils::map_uid_arg(&old_cred.user_ns, Self::ruid(args), true)?;
         let euid = id_utils::map_uid_arg(&old_cred.user_ns, Self::euid(args), true)?;
 

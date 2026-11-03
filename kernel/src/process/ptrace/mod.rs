@@ -61,10 +61,10 @@ pub fn ptrace_signal(
                 .and_then(|parent| parent.task_pid_nr_ns(PidType::PID, Some(pcb.active_pid_ns())))
                 .map(|p| p.data())
                 .unwrap_or(0);
-            let tracer_ns = pcb.cred().user_ns.clone();
+            let tracer_ns = pcb.objective_cred().user_ns.clone();
             let sender_uid = sender
                 .as_ref()
-                .map(|p| from_kuid_munged(&tracer_ns, p.cred().uid))
+                .map(|p| from_kuid_munged(&tracer_ns, p.objective_cred().uid))
                 .unwrap_or_else(|| from_kuid_munged(&tracer_ns, Kuid::new(usize::MAX)));
             *i = SigInfo::new(
                 injected,

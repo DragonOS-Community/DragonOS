@@ -251,8 +251,7 @@ pub fn request_key_from_user(args: [usize; 4]) -> Result<usize, SystemError> {
         return Err(SystemError::EINVAL);
     }
     let dest_id = args[3] as i32;
-    let current = ProcessManager::current_pcb();
-    let cred = current.cred();
+    let cred = ProcessManager::current_cred();
     let explicit = if dest_id == 0 {
         None
     } else {
@@ -605,7 +604,7 @@ struct UserIovec {
 }
 
 fn current_auth(target_serial: i32) -> Result<(KeyRef, Arc<RequestAuth>), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let auth_key = cred.request_key_auth.as_ref().ok_or(SystemError::EPERM)?;
     let auth = active_auth(auth_key)?;
     if auth.target.serial != target_serial {
@@ -638,7 +637,8 @@ fn completion_destination(ring_id: i32, auth: &RequestAuth) -> Result<Option<Key
 
 fn clear_authority() -> Result<(), SystemError> {
     let current = ProcessManager::current_pcb();
-    let original = current.cred();
+    current.assert_no_credential_override();
+    let original = current.objective_cred();
     if original.request_key_auth.is_none() {
         return Ok(());
     }
@@ -657,7 +657,8 @@ fn assume_authority(target_serial: i32) -> Result<usize, SystemError> {
         return Ok(0);
     }
     let current = ProcessManager::current_pcb();
-    let cred = current.cred();
+    current.assert_no_credential_override();
+    let cred = current.objective_cred();
     let description = format!("{:x}", target_serial);
     let auth_key = search_roots(&cred, KeyType::RequestKeyAuth, description.as_bytes())?
         .ok_or(SystemError::ENOKEY)?;
@@ -673,10 +674,11 @@ fn assume_authority(target_serial: i32) -> Result<usize, SystemError> {
 
 fn set_default_keyring(setting: i32) -> Result<usize, SystemError> {
     let current = ProcessManager::current_pcb();
-    let old = current.cred().jit_keyring;
+    let old = ProcessManager::current_cred().jit_keyring;
     if setting == -1 {
         return Ok(old as usize);
     }
+    current.assert_no_credential_override();
     match setting {
         0 | 3 | 4 | 5 | 7 => {}
         1 => {
@@ -687,7 +689,7 @@ fn set_default_keyring(setting: i32) -> Result<usize, SystemError> {
         }
         _ => return Err(SystemError::EINVAL),
     }
-    let mut next = (*current.cred()).clone();
+    let mut next = (*current.objective_cred()).clone();
     next.jit_keyring = setting;
     current.commit_cred(Cred::try_new_arc(next)?)?;
     Ok(old as usize)

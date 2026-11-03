@@ -337,7 +337,7 @@ unsafe fn raw_get_current_pid_tgid() -> u64 {
 ///
 /// See https://docs.ebpf.io/linux/helper-function/bpf_get_current_uid_gid/
 unsafe fn raw_get_current_uid_gid() -> u64 {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     ((cred.gid.data() as u64) << 32) | (cred.uid.data() as u64)
 }
 

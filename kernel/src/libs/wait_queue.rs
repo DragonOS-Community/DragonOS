@@ -29,8 +29,10 @@ use crate::{
     process::{ProcessControlBlock, ProcessManager, ProcessState},
     sched::{io_schedule, schedule, SchedMode},
     time::{
-        timer::{clock, next_n_us_timer_jiffies, Timer},
-        Duration, Instant,
+        absolute_timer::{AbsoluteClock, AbsoluteTimer},
+        timekeeping::monotonic_now,
+        timer::{clock, Timer},
+        Duration, PosixTimeSpec,
     },
 };
 
@@ -395,9 +397,15 @@ impl WaitQueue {
 
         // Compute one fixed deadline for the whole wait. Reusing it across wakeups
         // prevents timer re-registration or preemption from extending the budget.
-        let deadline_ticks = timeout_ticks
-            .map(|ticks| clock().saturating_add(ticks))
-            .or_else(|| timeout.map(|duration| next_n_us_timer_jiffies(duration.total_micros())));
+        let deadline_ticks = timeout_ticks.map(|ticks| clock().saturating_add(ticks));
+        let deadline = if timeout_ticks.is_none() {
+            timeout.map(WaitTimeout::deadline_after)
+        } else {
+            None
+        };
+        // Prepared only after the original before_sleep hook has released any
+        // caller-owned lock. Kept across notifications for this operation.
+        let mut highres_timer: Option<WaitTimeout> = None;
 
         // Create only ONE waiter/waker pair (key difference from old implementation)
         let (waiter, waker) = Waiter::new_pair_tagged(tag);
@@ -420,7 +428,10 @@ impl WaitQueue {
 
         loop {
             // Check timeout
-            if deadline_ticks.is_some_and(|deadline| clock() >= deadline) {
+            if deadline_ticks.is_some_and(|deadline| clock() >= deadline)
+                || deadline.is_some_and(WaitTimeout::deadline_reached)
+                || highres_timer.as_ref().is_some_and(WaitTimeout::fired)
+            {
                 self.remove_waker(&waker);
                 return cancel_or_timeout(&mut cond, &waker, SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
@@ -429,6 +440,9 @@ impl WaitQueue {
             // This ensures that if condition becomes true after our check,
             // the subsequent wake_one() will find our waker in the queue.
             if self.register_waker(waker.clone()).is_err() {
+                // Preserve the existing dead-queue behavior, but retire this
+                // operation's timer before entering that path.
+                drop(highres_timer.take());
                 // Queue is dead, spin until condition is met
                 loop {
                     if let Some(res) = cond() {
@@ -464,7 +478,27 @@ impl WaitQueue {
                 hook();
             }
 
-            // Setup timeout timer if needed
+            // A Duration timeout uses one timer for the entire operation.
+            // Allocation stays after before_sleep, as in the original path.
+            if highres_timer.is_none() {
+                if let Some(deadline) = deadline {
+                    match WaitTimeout::start(deadline, &waker) {
+                        Ok(timer) => highres_timer = Some(timer),
+                        Err(error) => {
+                            self.remove_waker(&waker);
+                            return cancel_or_timeout(&mut cond, &waker, error);
+                        }
+                    }
+                }
+            }
+            if highres_timer.as_ref().is_some_and(WaitTimeout::fired)
+                || deadline.is_some_and(WaitTimeout::deadline_reached)
+            {
+                self.remove_waker(&waker);
+                return cancel_or_timeout(&mut cond, &waker, SystemError::EAGAIN_OR_EWOULDBLOCK);
+            }
+
+            // Explicit scheduler-tick APIs retain their original coarse path.
             let timer = if let Some(deadline) = deadline_ticks {
                 if clock() >= deadline {
                     self.remove_waker(&waker);
@@ -1183,6 +1217,16 @@ fn block_current_impl(
             drop(irq_guard);
             return Ok(());
         }
+        // A signal sender may have seen Runnable just before mark_sleep and
+        // only kicked the task. Recheck after publishing Blocked, as in the
+        // killable handshake, so an infinite wait needs no polling timer.
+        if interruptible
+            && Signal::signal_pending_state(true, false, &ProcessManager::current_pcb())
+        {
+            ProcessManager::undo_mark_sleep();
+            drop(irq_guard);
+            return Err(SystemError::ERESTARTSYS);
+        }
         drop(irq_guard);
 
         // 根据是否是 IO 等待选择不同的调度函数
@@ -1223,7 +1267,7 @@ fn block_current_waker_killable(waker: &Waker) -> Result<(), SystemError> {
             WakerSleepState::Sleeping => {}
         }
 
-        ProcessManager::mark_sleep(true)?;
+        ProcessManager::mark_sleep_killable()?;
 
         // A sender can queue SIGKILL and observe Runnable just before the
         // blocked-state publication. Rechecking after mark_sleep pairs with
@@ -1351,10 +1395,13 @@ impl EventWaitQueue {
             return Ok(());
         }
 
-        let deadline = Instant::now() + timeout;
+        let deadline = WaitTimeout::deadline_after(timeout);
         let (waiter, waker) = Waiter::new_pair();
+        let mut timer: Option<WaitTimeout> = None;
         loop {
-            if Instant::now() >= deadline {
+            if WaitTimeout::deadline_reached(deadline)
+                || timer.as_ref().is_some_and(WaitTimeout::fired)
+            {
                 self.remove_waker(&waker);
                 waker.close();
                 if cond() {
@@ -1379,29 +1426,32 @@ impl EventWaitQueue {
                 return Err(SystemError::ERESTARTSYS);
             }
 
-            let remain = deadline
-                .duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            if remain == Duration::ZERO {
+            if timer.is_none() {
+                match WaitTimeout::start(deadline, &waker) {
+                    Ok(started) => timer = Some(started),
+                    Err(error) => {
+                        self.remove_waker(&waker);
+                        waker.close();
+                        return if cond() { Ok(()) } else { Err(error) };
+                    }
+                }
+            }
+            // A timer notification can be consumed by an earlier iteration;
+            // its sticky state must prevent sleeping again after expiry.
+            if timer.as_ref().is_some_and(WaitTimeout::fired)
+                || WaitTimeout::deadline_reached(deadline)
+            {
                 self.remove_waker(&waker);
                 waker.close();
-                if cond() {
-                    return Ok(());
-                }
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                return if cond() {
+                    Ok(())
+                } else {
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+                };
             }
-
-            let timer: Arc<Timer> = Timer::new(
-                TimeoutWaker::new(waker.clone()),
-                next_n_us_timer_jiffies(remain.total_micros()),
-            );
-            timer.activate();
 
             let wait_result = waiter.wait(true);
-            let was_timeout = timer.timeout();
-            if !was_timeout {
-                timer.cancel();
-            }
+            let was_timeout = timer.as_ref().is_some_and(WaitTimeout::fired);
 
             if was_timeout {
                 self.remove_waker(&waker);
@@ -1475,8 +1525,40 @@ impl EventWaitQueue {
     }
 }
 
-/// 通用的超时唤醒辅助结构
-///
+/// One monotonic timer owned by one logical wait operation. Dropping it
+/// cancels queued work; an already-selected callback owns its Waker safely.
+pub(crate) struct WaitTimeout(Arc<AbsoluteTimer>);
+
+impl WaitTimeout {
+    pub(crate) fn deadline_after(duration: Duration) -> PosixTimeSpec {
+        let ns = (duration.total_micros() as u128 * 1_000).min(i64::MAX as u128) as u64;
+        monotonic_now().saturating_add_ktime(&PosixTimeSpec::from_ns(ns))
+    }
+
+    pub(crate) fn deadline_reached(deadline: PosixTimeSpec) -> bool {
+        monotonic_now().to_ktime_ns() >= deadline.to_ktime_ns()
+    }
+
+    pub(crate) fn start(deadline: PosixTimeSpec, waker: &Arc<Waker>) -> Result<Self, SystemError> {
+        let callback = Box::try_new(TimeoutWaker {
+            waker: waker.clone(),
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        let prepared = AbsoluteTimer::try_prepare(AbsoluteClock::Monotonic, deadline, callback)?;
+        Ok(Self(prepared.activate()))
+    }
+
+    pub(crate) fn fired(&self) -> bool {
+        self.0.fired()
+    }
+}
+
+impl Drop for WaitTimeout {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// 用于定时器超时时唤醒等待队列中的 Waiter。
 /// 相比直接唤醒 PCB，通过 Waker 唤醒可以：
 /// 1. 与 Waiter::wait() 正确配合，避免竞态条件

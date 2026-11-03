@@ -142,10 +142,7 @@ pub struct PacketSocket {
 
 impl PacketSocket {
     pub fn new(sock_type: PSOCK, protocol: u16, nonblock: bool) -> Result<Arc<Self>, SystemError> {
-        if !ProcessManager::current_pcb()
-            .cred()
-            .has_capability(CAPFlags::CAP_NET_RAW)
-        {
+        if !ProcessManager::current_cred().has_capability(CAPFlags::CAP_NET_RAW) {
             return Err(SystemError::EPERM);
         }
         let sock_type = match sock_type {

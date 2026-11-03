@@ -183,7 +183,8 @@ pub fn user_keyrings(cred: &Cred) -> Result<(KeyRef, KeyRef), SystemError> {
 
 fn install_credential_ring(kind: SpecialKeyringKind) -> Result<KeyRef, SystemError> {
     let current = ProcessManager::current_pcb();
-    let old = current.cred();
+    current.assert_no_credential_override();
+    let old = current.objective_cred();
     let mut next = (*old).clone();
     let ring = create_special_keyring(&next, kind)?;
     match kind {
@@ -197,7 +198,8 @@ fn install_credential_ring(kind: SpecialKeyringKind) -> Result<KeyRef, SystemErr
 
 fn install_user_session_keyring() -> Result<KeyRef, SystemError> {
     let current = ProcessManager::current_pcb();
-    let old = current.cred();
+    current.assert_no_credential_override();
+    let old = current.objective_cred();
     let (_, session) = user_keyrings(&old)?;
     let mut next = (*old).clone();
     next.session_keyring = Some(session.clone());
@@ -248,8 +250,7 @@ pub(crate) fn is_possessed_by_process(key: &KeyRef, cred: &Cred) -> bool {
 /// Status and required permission are checked by the operation after this
 /// lookup; some keyctl commands deliberately accept partial/revoked keys.
 pub fn resolve_key(id: i32, create: bool) -> Result<KeyRef, SystemError> {
-    let current = ProcessManager::current_pcb();
-    let cred = current.cred();
+    let cred = ProcessManager::current_cred();
     match id {
         -1 => cred.thread_keyring.clone().map(Ok).unwrap_or_else(|| {
             if create {
@@ -326,7 +327,7 @@ pub fn lookup_key_raw(
     }
     permission::validate_key(&key).map_err(|error| error.to_posix_errno())?;
     if let Some(needed) = permission {
-        permission::check_permission(&key, &ProcessManager::current_pcb().cred(), needed)
+        permission::check_permission(&key, &ProcessManager::current_cred(), needed)
             .map_err(|error| error.to_posix_errno())?;
     }
     Ok(key)
@@ -337,7 +338,8 @@ pub fn lookup_key_raw(
 /// upgrades a live weak entry and checks SEARCH permission before reuse.
 pub fn join_session_keyring(name: Option<Vec<u8>>) -> Result<i32, SystemError> {
     let current = ProcessManager::current_pcb();
-    let old = current.cred();
+    current.assert_no_credential_override();
+    let old = current.objective_cred();
     let named_request = name.is_some();
     let ring = if let Some(name) = name {
         if name.is_empty() {
@@ -424,8 +426,8 @@ pub fn session_to_parent() -> Result<usize, SystemError> {
         return Err(SystemError::EPERM);
     }
 
-    let my_cred = current.cred();
-    let parent_cred = parent.cred();
+    let my_cred = ProcessManager::current_cred();
+    let parent_cred = parent.objective_cred();
     let uid = my_cred.euid;
     let gid = my_cred.egid;
     if ring.state.lock().uid != uid
@@ -451,7 +453,7 @@ pub fn session_to_parent() -> Result<usize, SystemError> {
     // The owner checks above take key mutexes, so do them before disabling
     // IRQs for the thread-list read lock.  If credentials changed meanwhile,
     // require the child to retry with a fresh authorization snapshot.
-    if !alloc::sync::Arc::ptr_eq(&parent_cred, &parent.cred()) {
+    if !alloc::sync::Arc::ptr_eq(&parent_cred, &parent.objective_cred()) {
         return Err(SystemError::EPERM);
     }
     if alloc::sync::Arc::ptr_eq(&my_cred, &parent_cred)
@@ -483,13 +485,14 @@ pub fn session_to_parent() -> Result<usize, SystemError> {
 /// reference is transferred; UID/caps/other keyrings remain current.
 pub fn apply_pending_session_keyring() {
     let current = ProcessManager::current_pcb();
+    current.assert_no_credential_override();
     let Some(ring) = current.take_pending_session_keyring() else {
         return;
     };
     if current.is_exited() {
         return;
     }
-    let mut next = (*current.cred()).clone();
+    let mut next = (*current.objective_cred()).clone();
     next.session_keyring = Some(ring.clone());
     match Cred::try_new_arc(next).and_then(|new| current.commit_cred(new)) {
         Ok(()) => {}

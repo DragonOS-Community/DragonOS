@@ -59,7 +59,7 @@ fn copy_out(user: usize, data: &[u8]) -> Result<(), SystemError> {
 }
 
 fn current_cred() -> alloc::sync::Arc<Cred> {
-    ProcessManager::current_pcb().cred()
+    ProcessManager::current_cred()
 }
 
 fn can_use_root_override(key: &KeyRef, flag: KeyFlags) -> bool {

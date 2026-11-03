@@ -3,8 +3,8 @@ use crate::{
     arch::ipc::signal::Signal,
     libs::rwlock::RwLock,
     process::{
-        abi::WaitOption, cred, ExitState, ProcessControlBlock, ProcessFlags, RawPid,
-        PTRACE_RELATION_LOCK,
+        abi::WaitOption, cred, ExitState, ProcessControlBlock, ProcessFlags, ProcessManager,
+        RawPid, PTRACE_RELATION_LOCK,
     },
 };
 use alloc::{
@@ -420,14 +420,21 @@ pub enum PtraceAccessCreds {
 
 // PCB ptrace methods -- relation establishment/teardown, attach/seize/detach, TRAPPING synchronization
 impl ProcessControlBlock {
-    pub fn has_permission_to_trace(&self, tracee: &Self, creds: PtraceAccessCreds) -> bool {
+    /// `caller_cred` is the initiating task's subjective snapshot; `self`
+    /// remains the caller for thread-group identity. Targets always use their
+    /// objective credentials, even when procfs resolves a self PID.
+    pub fn has_permission_to_trace(
+        &self,
+        tracee: &Self,
+        creds: PtraceAccessCreds,
+        caller_cred: &crate::process::Cred,
+    ) -> bool {
         // 1. The same thread group is always allowed access (introspection)
         if self.tgid == tracee.tgid {
             return true;
         }
 
-        let caller_cred = self.cred();
-        let tracee_cred = tracee.cred();
+        let tracee_cred = tracee.objective_cred();
         let same_user_ns = Arc::ptr_eq(&caller_cred.user_ns, &tracee_cred.user_ns);
         let tracee_mm = tracee.basic().user_vm();
         // The caller's identity is selected according to the credential mode.
@@ -485,7 +492,11 @@ impl ProcessControlBlock {
     /// Establish a tracing relation (called on the tracee side).
     /// The caller need not hold `PTRACE_RELATION_LOCK`; the function acquires it itself.
     pub fn ptrace_link(&self, tracer: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        if !tracer.has_permission_to_trace(self, PtraceAccessCreds::RealCreds) {
+        if !tracer.has_permission_to_trace(
+            self,
+            PtraceAccessCreds::RealCreds,
+            &ProcessManager::current_cred(),
+        ) {
             return Err(SystemError::EPERM);
         }
         // ATTACH publishes its empty option set together with the relation.

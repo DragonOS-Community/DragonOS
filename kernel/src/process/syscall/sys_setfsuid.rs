@@ -24,7 +24,7 @@ impl Syscall for SysSetFsuid {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let old_fsuid = old_cred.fsuid;
         let old_visible = from_kuid_munged(&old_cred.user_ns, old_fsuid) as usize;
         let Ok(fsuid) = make_kuid(&old_cred.user_ns, Self::fsuid(args) as u32) else {

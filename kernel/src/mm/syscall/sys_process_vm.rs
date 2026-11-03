@@ -143,7 +143,11 @@ fn find_target_process(pid: usize) -> Result<Arc<ProcessControlBlock>, SystemErr
 /// Check whether the current process may access the target's memory.
 fn check_process_vm_access(target_pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
     let current_pcb = ProcessManager::current_pcb();
-    if !current_pcb.has_permission_to_trace(target_pcb, PtraceAccessCreds::RealCreds) {
+    if !current_pcb.has_permission_to_trace(
+        target_pcb,
+        PtraceAccessCreds::RealCreds,
+        &ProcessManager::current_cred(),
+    ) {
         return Err(SystemError::EPERM);
     }
     Ok(())

@@ -130,7 +130,7 @@ impl MountMaxFileOps {
         // Linux rechecks a 0644 sysctl against the caller's global effective
         // UID on every write. In particular, capabilities gained by entering
         // a child user namespace must not authorize this global parameter.
-        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+        if ProcessManager::current_cred().euid.data() != 0 {
             return Err(SystemError::EPERM);
         }
         // Linux strict numeric sysctls consume non-zero-offset writes without
@@ -197,7 +197,7 @@ impl NrOpenFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        if ProcessManager::current_pcb().cred().euid.data() != 0 {
+        if ProcessManager::current_cred().euid.data() != 0 {
             return Err(SystemError::EPERM);
         }
         if offset != 0 {
@@ -262,7 +262,7 @@ impl SuidDumpableFileOps {
         buf: &[u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let cred = ProcessManager::current_pcb().cred();
+        let cred = ProcessManager::current_cred();
         if cred.fsuid.data() != 0
             && !crate::process::cred::capable(crate::process::cred::CAPFlags::CAP_DAC_OVERRIDE)
         {

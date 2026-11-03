@@ -1,3 +1,6 @@
+#[path = "softirqd.rs"]
+mod softirqd;
+
 use core::{
     fmt::Debug,
     intrinsics::unlikely,
@@ -275,8 +278,11 @@ impl Softirq {
             {
                 continue;
             }
-            // Pending work left after the time/restart budget remains set for
-            // the next IRQ exit (or a future softirqd implementation).
+            // Handlers and their guards have returned. Continue residual work
+            // on this CPU without adding scheduler calls to atomic-only raises.
+            if has_pending {
+                softirqd::kick_local();
+            }
             break;
         }
     }
@@ -351,8 +357,25 @@ pub(crate) fn do_softirq() {
     }
 
     fence(Ordering::SeqCst);
-    IrqTime::irqtime_start();
+    // Like Linux ksoftirqd, charge daemon work to its schedulable task.
+    // Identity also covers IRQ-exit softirqs outside its draining section.
+    let account_irq = !is_current_softirqd();
+    if account_irq {
+        IrqTime::irqtime_start();
+    }
     softirq_vectors().do_softirq();
-    IrqTime::irqtime_account_irq(ProcessManager::current_pcb(), false);
+    if account_irq {
+        IrqTime::irqtime_account_irq(ProcessManager::current_pcb(), false);
+    }
     fence(Ordering::SeqCst);
+}
+
+/// Start permanent per-CPU residual-work executors after SMP initialization.
+pub(crate) fn start_workers() -> Result<(), SystemError> {
+    softirqd::start()
+}
+
+/// Local permanent daemon identity shared by IRQ and task CPU accounting.
+pub(crate) fn is_current_softirqd() -> bool {
+    softirqd::is_current_worker()
 }

@@ -398,7 +398,7 @@ impl super::TcpSocket {
             PSO::SNDBUF | PSO::SNDBUFFORCE => {
                 let requested = byte_parser::read_u32(val)? as usize;
                 if matches!(opt, PSO::SNDBUFFORCE) {
-                    let cred = ProcessManager::current_pcb().cred();
+                    let cred = ProcessManager::current_cred();
                     if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
                         return Err(SystemError::EPERM);
                     }
@@ -420,7 +420,7 @@ impl super::TcpSocket {
             PSO::RCVBUF | PSO::RCVBUFFORCE => {
                 let requested = byte_parser::read_u32(val)? as usize;
                 if matches!(opt, PSO::RCVBUFFORCE) {
-                    let cred = ProcessManager::current_pcb().cred();
+                    let cred = ProcessManager::current_cred();
                     if !cred.has_capability(CAPFlags::CAP_NET_ADMIN) {
                         return Err(SystemError::EPERM);
                     }

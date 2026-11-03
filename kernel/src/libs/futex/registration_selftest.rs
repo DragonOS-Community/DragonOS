@@ -34,10 +34,12 @@ pub(super) fn run() -> Result<bool, SystemError> {
         // fallible preparation path. No bucket or timer may become visible.
         for timeout in [
             None,
-            Some(PosixTimeSpec {
-                tv_sec: 1,
-                tv_nsec: 0,
-            }),
+            Some(
+                crate::time::timekeeping::monotonic_now().saturating_add_ktime(&PosixTimeSpec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                }),
+            ),
         ] {
             if Futex::futex_wait(address, FutexFlag::empty(), 0, timeout, u32::MAX)
                 != Err(SystemError::ENOMEM)
@@ -87,10 +89,14 @@ pub(super) fn run() -> Result<bool, SystemError> {
                 uaddr,
                 FutexFlag::empty(),
                 0,
-                Some(PosixTimeSpec {
-                    tv_sec: 0,
-                    tv_nsec: 1_000_000,
-                }),
+                Some(
+                    crate::time::timekeeping::monotonic_now().saturating_add_ktime(
+                        &PosixTimeSpec {
+                            tv_sec: 0,
+                            tv_nsec: 1_000_000,
+                        },
+                    ),
+                ),
                 u32::MAX,
             ) != Err(SystemError::ETIMEDOUT)
             {
@@ -115,15 +121,7 @@ fn prepared_stages() -> Result<bool, SystemError> {
     let (_, waker) = Waiter::try_new_pair()?;
     let object = Arc::try_new(FutexObj {
         waker: waker.clone(),
-        key: SpinLock::new(FutexKey {
-            ptr: 0,
-            word: 0,
-            offset: 0,
-            key: InnerFutexKey::Private(PrivateKey {
-                address_space: None,
-                address: 0,
-            }),
-        }),
+        key: SpinLock::new(None),
         bitset: u32::MAX,
         tid: 0,
     })
@@ -144,7 +142,12 @@ fn prepared_stages() -> Result<bool, SystemError> {
             })
             .is_err()
             && WaitNode::try_new(object).is_err()
-            && Timer::try_prepare(callback, crate::time::timer::clock() + 100).is_err()
+            && AbsoluteTimer::try_prepare(
+                AbsoluteClock::Monotonic,
+                PosixTimeSpec::KTIME_MAX,
+                callback,
+            )
+            .is_err()
             && denial::probe_denied()
     };
     Ok(stages && crate::time::timer::heap_denied_activation_selftest()?)

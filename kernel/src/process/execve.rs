@@ -150,6 +150,7 @@ fn do_execve_internal(
     ctx: ExecContext,
 ) -> Result<(), ExecFailure> {
     let exec_pcb = ProcessManager::current_pcb();
+    exec_pcb.assert_no_credential_override();
     crate::cgroup::memory::high::prepare_for_task(&exec_pcb)?;
     // The final strings for this loader iteration are already known. Prepare
     // recoverable CPU metadata before any exec-update transaction is held.
@@ -159,7 +160,7 @@ fn do_execve_internal(
     // Prospective MM admission may reclaim or wait. Never do it while the
     // exec-update lock protects the irreversible exec transaction.
     let (address_space, exec_guard) = loop {
-        let captured_ns = exec_pcb.cred().user_ns.clone();
+        let captured_ns = exec_pcb.objective_cred().user_ns.clone();
         let mm = AddressSpace::new_for_task(
             &exec_pcb,
             true,
@@ -167,7 +168,7 @@ fn do_execve_internal(
             SUID_DUMP_DISABLE as u8,
         )?;
         let guard = exec_pcb.exec_update_write();
-        let current_ns = exec_pcb.cred().user_ns.clone();
+        let current_ns = exec_pcb.objective_cred().user_ns.clone();
         if Arc::ptr_eq(&captured_ns, &current_ns) {
             break (mm, guard);
         }
@@ -233,7 +234,7 @@ fn do_execve_internal(
             address_space.write().user_stack = Some(ustack_message);
 
             let pcb = ProcessManager::current_pcb();
-            let prepared_exec_cred = match pcb.cred().prepare_exec_keyrings() {
+            let prepared_exec_cred = match pcb.objective_cred().prepare_exec_keyrings() {
                 Ok(prepared) => prepared,
                 Err(err) => return finish_exec_error(&param, old_vm.as_ref(), err),
             };
@@ -281,7 +282,7 @@ fn do_execve_internal(
             // A successful exec does not inherit ptrace hardware debug state.
             exec_pcb.flush_ptrace_hw_debug_regs();
             // After commit, reset dumpability according to the new credentials.
-            let cred = exec_pcb.cred();
+            let cred = exec_pcb.objective_cred();
             let dump = if address_space.exec_enforces_nondump()
                 || cred.euid != cred.uid
                 || cred.egid != cred.gid

@@ -454,7 +454,7 @@ impl ProcessManager {
     /// 获取当前进程的 user_ns
     pub fn current_user_ns() -> Arc<UserNamespace> {
         if Self::initialized() {
-            ProcessManager::current_pcb().cred().user_ns.clone()
+            ProcessManager::current_cred().user_ns.clone()
         } else {
             INIT_USER_NAMESPACE.clone()
         }

@@ -413,7 +413,7 @@ impl InnerAddressSpace {
     pub(super) fn has_mlock_quota() -> bool {
         let pcb = ProcessManager::current_pcb();
         pcb.get_rlimit(RLimitID::Memlock).rlim_cur != 0
-            || pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK)
+            || ProcessManager::current_cred().has_capability(CAPFlags::CAP_IPC_LOCK)
     }
 
     pub(super) fn check_mlock_rlimit_for_pages(
@@ -422,7 +422,7 @@ impl InnerAddressSpace {
         error: SystemError,
     ) -> Result<(), SystemError> {
         let pcb = ProcessManager::current_pcb();
-        if pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
+        if ProcessManager::current_cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
             return Ok(());
         }
 

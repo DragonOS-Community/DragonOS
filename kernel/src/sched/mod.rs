@@ -1304,11 +1304,11 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     let mut prev_state = prev.sched_info().state();
     if !prev_state.is_runnable() {
         let interruptible = prev_state.is_blocked_interruptable();
-        let wake_kill = prev_state.is_stopped();
+        let wake_kill = prev_state.is_stopped() || prev_state.is_killable();
 
         // signal_pending_state 仅对 SM_NONE（自愿调度）生效：
         //   TASK_INTERRUPTIBLE → 有任意信号 → 恢复 RUNNING
-        //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
+        //   TASK_STOPPED / TASK_KILLABLE → 仅 SIGKILL → 恢复 RUNNING
         //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
         // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
         let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
@@ -1322,7 +1322,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 
             if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
                 // sched_contributes_to_load 在 deactivate_task 之前
-                if matches!(prev_state, ProcessState::Blocked(false)) {
+                if prev_state.is_uninterruptible() {
                     rq.nr_uninterruptible += 1;
                     loadavg::inc_nr_uninterruptible(1);
                 }

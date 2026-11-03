@@ -48,7 +48,7 @@ impl Syscall for SysTkillHandle {
 /// tkill/tgkill synthesize their source identity; queued callers provide it.
 pub fn do_tkill(tgid: i32, tid: i32, sig: c_int) -> Result<usize, SystemError> {
     let current = ProcessManager::current_pcb();
-    let cred = current.cred();
+    let cred = ProcessManager::current_cred();
     let mut info = SigInfo::new(
         Signal::from(sig),
         0,

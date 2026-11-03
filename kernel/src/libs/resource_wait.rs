@@ -20,61 +20,57 @@ use crate::{
 pub(crate) struct ResourceWaitLink {
     next: Option<Arc<ProcessControlBlock>>,
     registered: bool,
-    linked: bool,
+    class: Option<QueueClass>,
     notifying: usize,
     notify_next: Option<Arc<ProcessControlBlock>>,
     notify_queued: bool,
     resource_key: usize,
 }
 
-struct Queue {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueClass {
+    Oom,
+    Resource,
+}
+
+impl QueueClass {
+    fn for_key(key: usize) -> Self {
+        if key == 0 {
+            Self::Oom
+        } else {
+            Self::Resource
+        }
+    }
+}
+
+struct Chain {
     head: Option<Arc<ProcessControlBlock>>,
     tail: Option<Arc<ProcessControlBlock>>,
     len: usize,
 }
 
-static QUEUE: SpinLock<Queue> = SpinLock::new(Queue {
-    head: None,
-    tail: None,
-    len: 0,
-});
-static REGISTERED: AtomicUsize = AtomicUsize::new(0);
-
-impl Queue {
-    fn register(&mut self, task: &Arc<ProcessControlBlock>, resource_key: usize) {
-        let mut link = task.resource_wait_link.lock();
-        if link.linked {
-            debug_assert!(!link.registered || link.resource_key == resource_key);
-            link.registered = true;
-            link.resource_key = resource_key;
-            return;
+impl Chain {
+    const fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            len: 0,
         }
-        debug_assert!(link.next.is_none() && link.notifying == 0);
-        link.registered = true;
-        link.linked = true;
-        link.resource_key = resource_key;
+    }
+
+    fn append(&mut self, task: &Arc<ProcessControlBlock>) {
+        debug_assert!(task.resource_wait_link.lock().next.is_none());
         if let Some(tail) = self.tail.as_ref() {
             tail.resource_wait_link.lock().next = Some(task.clone());
         } else {
             self.head = Some(task.clone());
         }
-        // The previous tail remains pinned by the linked queue.
         self.tail = Some(task.clone());
         self.len += 1;
-        REGISTERED.store(self.len, Ordering::Release);
     }
 
-    /// Return removed owners for retirement after the caller unlocks the queue.
-    fn unlink(
-        &mut self,
-        target: &Arc<ProcessControlBlock>,
-    ) -> (
-        Option<Arc<ProcessControlBlock>>,
-        Option<Arc<ProcessControlBlock>>,
-    ) {
-        if !target.resource_wait_link.lock().linked {
-            return (None, None);
-        }
+    /// Only physical links move here. Notification pins/registration survive migration.
+    fn detach(&mut self, target: &Arc<ProcessControlBlock>) -> RetiredOwners {
         let mut previous: Option<Arc<ProcessControlBlock>> = None;
         let mut cursor = self.head.clone();
         while let Some(task) = cursor {
@@ -90,9 +86,6 @@ impl Queue {
                     self.head = link.next.take();
                     removed
                 };
-                debug_assert_eq!(link.notifying, 0);
-                link.registered = false;
-                link.linked = false;
                 let old_tail = if self
                     .tail
                     .as_ref()
@@ -103,9 +96,6 @@ impl Queue {
                     None
                 };
                 self.len -= 1;
-                REGISTERED.store(self.len, Ordering::Release);
-                // `removed` pins task; previous stays linked. Neither local
-                // observer can be the final owner while the queue is locked.
                 return (removed, old_tail);
             }
             cursor = link.next.clone();
@@ -114,13 +104,101 @@ impl Queue {
         }
         (None, None)
     }
+}
 
-    /// Snapshot matching waiters in one pass. Separate embedded notification
-    /// links survive concurrent rotation/cancellation of the physical queue.
+type RetiredOwners = (
+    Option<Arc<ProcessControlBlock>>,
+    Option<Arc<ProcessControlBlock>>,
+);
+
+struct Queue {
+    oom: Chain,
+    resource: Chain,
+    #[cfg(feature = "mm_selftest")]
+    isolated: bool,
+}
+
+static QUEUE: SpinLock<Queue> = SpinLock::new(Queue::new());
+static REGISTERED: AtomicUsize = AtomicUsize::new(0);
+
+impl Queue {
+    const fn new() -> Self {
+        Self {
+            oom: Chain::new(),
+            resource: Chain::new(),
+            #[cfg(feature = "mm_selftest")]
+            isolated: false,
+        }
+    }
+
+    fn chain_mut(&mut self, class: QueueClass) -> &mut Chain {
+        match class {
+            QueueClass::Oom => &mut self.oom,
+            QueueClass::Resource => &mut self.resource,
+        }
+    }
+
+    fn publish_len(&self) {
+        #[cfg(feature = "mm_selftest")]
+        if self.isolated {
+            return;
+        }
+        REGISTERED.store(self.oom.len + self.resource.len, Ordering::Release);
+    }
+
+    /// Return displaced chain owners; caller must retire them after dropping QUEUE.
+    fn register(&mut self, task: &Arc<ProcessControlBlock>, resource_key: usize) -> RetiredOwners {
+        let class = QueueClass::for_key(resource_key);
+        let mut link = task.resource_wait_link.lock();
+        if link.registered {
+            debug_assert_eq!(link.resource_key, resource_key);
+            debug_assert_eq!(link.class, Some(class));
+            // Same Registration after a spurious notification keeps FIFO position.
+            return (None, None);
+        }
+        let previous_class = link.class;
+        drop(link);
+        // A new Registration must append even when old notification pins kept
+        // this task linked in the same class. Never inherit the old FIFO slot.
+        let retired = if let Some(old) = previous_class {
+            let retired = self.chain_mut(old).detach(task);
+            debug_assert!(retired.0.is_some());
+            retired
+        } else {
+            (None, None)
+        };
+        let mut link = task.resource_wait_link.lock();
+        debug_assert!(link.next.is_none());
+        link.registered = true;
+        link.resource_key = resource_key;
+        link.class = Some(class);
+        drop(link);
+        self.chain_mut(class).append(task);
+        // No transient lower count/false zero is published during migration.
+        self.publish_len();
+        retired
+    }
+
+    fn unlink(&mut self, task: &Arc<ProcessControlBlock>) -> RetiredOwners {
+        let mut link = task.resource_wait_link.lock();
+        let Some(class) = link.class else {
+            return (None, None);
+        };
+        debug_assert_eq!(link.notifying, 0);
+        link.registered = false;
+        link.class = None;
+        drop(link);
+        let retired = self.chain_mut(class).detach(task);
+        debug_assert!(retired.0.is_some());
+        self.publish_len();
+        retired
+    }
+
+    /// The independent notification chain survives cancellation and class migration.
     fn notifications(&mut self, key: usize, all: bool) -> Option<Arc<ProcessControlBlock>> {
         debug_assert_ne!(key, 0);
         let mut pending = None;
-        let mut cursor = self.head.clone();
+        let mut cursor = self.resource.head.clone();
         while let Some(task) = cursor {
             let mut link = task.resource_wait_link.lock();
             cursor = link.next.clone();
@@ -141,8 +219,7 @@ impl Queue {
         pending
     }
 
-    /// One O(1) front operation per initial node. Busy notification pins and
-    /// active resource waiters rotate; only the worker retires cancelled pins.
+    /// Only OOM waiters rotate; resource FIFO order is untouched by maintenance.
     fn process_front(
         &mut self,
     ) -> Option<(
@@ -150,15 +227,21 @@ impl Queue {
         Option<Arc<ProcessControlBlock>>,
         bool,
     )> {
-        let task = self.head.as_ref()?.clone();
+        let task = self.oom.head.as_ref()?.clone();
         let mut link = task.resource_wait_link.lock();
-        if link.notifying != 0 || (link.registered && link.resource_key != 0) {
-            if self.len > 1 {
-                let old_head = self.head.take();
-                self.head = link.next.take();
-                self.tail.as_ref().unwrap().resource_wait_link.lock().next = old_head;
-                // The old tail remains pinned through the new head's chain.
-                self.tail = Some(task.clone());
+        debug_assert_eq!(link.class, Some(QueueClass::Oom));
+        if link.notifying != 0 {
+            if self.oom.len > 1 {
+                let old_head = self.oom.head.take();
+                self.oom.head = link.next.take();
+                self.oom
+                    .tail
+                    .as_ref()
+                    .unwrap()
+                    .resource_wait_link
+                    .lock()
+                    .next = old_head;
+                self.oom.tail = Some(task.clone());
             }
             return None;
         }
@@ -166,6 +249,25 @@ impl Queue {
         drop(link);
         let (removed, old_tail) = self.unlink(&task);
         Some((removed.expect("linked memory waiter"), old_tail, wake))
+    }
+
+    /// Last notification retires cancelled nodes directly, including resource
+    /// nodes which the OOM worker deliberately never visits.
+    fn finish_notification(&mut self, task: &Arc<ProcessControlBlock>) -> (RetiredOwners, bool) {
+        let mut link = task.resource_wait_link.lock();
+        debug_assert!(link.class.is_some() && link.notifying != 0);
+        link.notifying -= 1;
+        let retire = link.notifying == 0 && !link.registered;
+        // Preserve the old general progress kick even when direct retirement
+        // makes worker-assisted cleanup of this particular node unnecessary.
+        let needs_worker = link.notifying == 0 && (!link.registered || link.resource_key == 0);
+        drop(link);
+        let retired = if retire {
+            self.unlink(task)
+        } else {
+            (None, None)
+        };
+        (retired, needs_worker)
     }
 }
 
@@ -233,18 +335,12 @@ impl Notification {
 impl Drop for Notification {
     fn drop(&mut self) {
         let task = self.task.take().unwrap();
-        let needs_worker = {
-            let _queue = QUEUE.lock_irqsave();
-            let mut link = task.resource_wait_link.lock();
-            debug_assert!(link.linked && link.notifying != 0);
-            link.notifying -= 1;
-            let needs_worker = link.notifying == 0 && (!link.registered || link.resource_key == 0);
-            drop(link);
-            // QUEUE excludes any unlink until this observer is gone. Its
-            // physical chain owner prevents final PCB destruction here.
-            drop(task);
-            needs_worker
+        let (retired, needs_worker) = {
+            let mut queue = QUEUE.lock_irqsave();
+            queue.finish_notification(&task)
         };
+        drop(retired);
+        drop(task);
         if needs_worker {
             crate::mm::memory_notify::request_oom_progress();
         }
@@ -354,19 +450,28 @@ fn wait_outcome<R>(
         // on SM_PREEMPT. Prevent an IRQ from scheduling between prepare_sleep
         // and the outside-queue predicate which might already be satisfied.
         let preempt = crate::process::preempt::PreemptGuard::new();
-        {
+        let retired_registration = {
             let mut queue = QUEUE.lock_irqsave();
-            queue.register(&registration.task, resource_key);
+            let retired = queue.register(&registration.task, resource_key);
             fence(Ordering::SeqCst);
             if mode.interrupted(&registration.task) {
                 drop(queue);
+                drop(retired);
                 return Err(SystemError::ERESTARTSYS);
             }
-            if let Err(error) = ProcessManager::mark_sleep(mode != WaitMode::Uninterruptible) {
+            let sleep = match mode {
+                WaitMode::Killable => ProcessManager::mark_sleep_killable(),
+                WaitMode::Interruptible => ProcessManager::mark_sleep(true),
+                WaitMode::Uninterruptible => ProcessManager::mark_sleep(false),
+            };
+            if let Err(error) = sleep {
                 drop(queue);
+                drop(retired);
                 return Err(error);
             }
-        }
+            retired
+        };
+        drop(retired_registration);
         // Ordinary RwSem rollback can notify recursively, so no queue lock
         // may cover this predicate. Sleeping state was published beforehand.
         if let Some(result) = condition() {
@@ -604,9 +709,10 @@ pub(crate) fn has_waiters() -> bool {
 
 /// FIFO ordering makes the initial population a finite broadcast bound. New
 /// registrations append behind it, so a reawakened task cannot hide old waiters.
-/// Call only from the resource-lock-free memory notifier task.
+/// Call without resource locks. Memory and balloon callers may run concurrently;
+/// each front operation is serialized by QUEUE, not by a single worker.
 pub(crate) fn wake_all() {
-    let limit = QUEUE.lock_irqsave().len;
+    let limit = QUEUE.lock_irqsave().oom.len;
     for _ in 0..limit {
         let popped = QUEUE.lock_irqsave().process_front();
         let Some((task, old_tail, wake)) = popped else {
@@ -637,3 +743,6 @@ mod selftest;
 
 #[cfg(feature = "mm_selftest")]
 pub(crate) use selftest::mutex_protocol as resource_mutex_protocol;
+
+#[cfg(feature = "mm_selftest")]
+pub(crate) use selftest::split_queue_protocol as resource_split_queue_protocol;

@@ -11,7 +11,7 @@ use crate::{Error, Result};
 use alloc::boxed::Box;
 use core::mem::size_of;
 use core::ptr::{null_mut, NonNull};
-use log::debug;
+use log::{debug, trace};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub(crate) const RX_QUEUE_IDX: u16 = 0;
@@ -140,7 +140,7 @@ impl VsockEvent {
             }
             VirtioVsockOp::Rst | VirtioVsockOp::Shutdown => {
                 header.check_data_is_empty()?;
-                debug!("Disconnected from the peer");
+                trace!("Disconnected from the peer");
                 let reason = if op == VirtioVsockOp::Rst {
                     DisconnectReason::Reset
                 } else {
@@ -490,7 +490,7 @@ impl<H: Hal, T: Transport> VirtIOSocket<H, T> {
             header_result
         }?;
 
-        debug!("Received packet {:?}. Op {:?}", header, header.op());
+        trace!("Received packet {:?}. Op {:?}", header, header.op());
         Ok(Some((header, body, token)))
     }
 }

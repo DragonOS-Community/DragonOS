@@ -455,8 +455,8 @@ fn wait_visible_pid(child_pcb: &Arc<ProcessControlBlock>) -> RawPid {
 }
 
 fn waitid_visible_uid(child_pcb: &Arc<ProcessControlBlock>) -> u32 {
-    let child_uid = child_pcb.cred().uid.data();
-    let current_user_ns = ProcessManager::current_pcb().cred().user_ns.clone();
+    let child_uid = child_pcb.objective_cred().uid.data();
+    let current_user_ns = ProcessManager::current_cred().user_ns.clone();
     from_kuid_munged(&current_user_ns, Kuid::new(child_uid))
 }
 

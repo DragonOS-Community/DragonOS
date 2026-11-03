@@ -612,7 +612,7 @@ pub(super) fn alloc_pid_with_tids(
     if chain.len() != ns.level() as usize + 1 {
         return Err(SystemError::ENOMEM);
     }
-    let caller = (!requested.is_empty()).then(|| ProcessManager::current_pcb().cred());
+    let caller = (!requested.is_empty()).then(ProcessManager::current_cred);
     let allowed: Vec<bool> = chain
         .iter()
         .take(requested.len())

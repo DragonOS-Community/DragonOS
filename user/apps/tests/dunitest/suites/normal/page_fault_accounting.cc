@@ -2,6 +2,8 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -10,6 +12,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -128,6 +131,236 @@ void* FaultWorker(void* arg) {
   if (!WriteExact(context->done_write, &status, sizeof(status))) return nullptr;
   (void)ReadByte(context->finish_read);
   return nullptr;
+}
+
+// Reuse this exact code and stack path before the measured first writes.
+__attribute__((noinline)) void WriteFaultPages(volatile uint8_t* bytes,
+                                             size_t pages, uint8_t value) {
+  for (size_t page = 0; page < pages; ++page) bytes[page * kPageSize] = value;
+}
+
+TEST(PageFaultAccounting, AnonymousFirstWriteNeedsOneFaultPerPage) {
+  constexpr size_t kPages = 64;
+  constexpr size_t kLength = kPages * kPageSize;
+  void* scratch = mmap(nullptr, kLength, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(MAP_FAILED, scratch) << strerror(errno);
+  void* target = mmap(nullptr, kLength, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (target == MAP_FAILED) {
+    const int saved = errno;
+    munmap(scratch, kLength);
+    FAIL() << strerror(saved);
+    return;
+  }
+  // Multi-size THP can be smaller than 2 MiB; page count alone is insufficient.
+  const int advice = madvise(target, kLength, MADV_NOHUGEPAGE);
+  const int advice_errno = errno;
+  auto* bytes = static_cast<volatile uint8_t*>(target);
+  struct rusage usage[5] {};
+  long results[5] {};
+  for (auto& u : usage) (void)syscall(SYS_getrusage, RUSAGE_THREAD, &u);
+  WriteFaultPages(static_cast<volatile uint8_t*>(scratch), kPages, 0x5a);
+
+  // No assertions, allocation, formatting or setup inside the counter window.
+  results[0] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[0]);
+  results[1] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[1]);
+  results[2] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[2]);
+  WriteFaultPages(bytes, kPages, 0x5a);
+  results[3] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[3]);
+  WriteFaultPages(bytes, kPages, 0xa5);
+  results[4] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[4]);
+
+  bool contents_ok = true;
+  for (size_t page = 0; page < kPages; ++page)
+    contents_ok = contents_ok && bytes[page * kPageSize] == 0xa5;
+  const int target_unmap = munmap(target, kLength);
+  const int scratch_unmap = munmap(scratch, kLength);
+  ASSERT_EQ(0, advice) << strerror(advice_errno);
+  for (long result : results) ASSERT_EQ(0, result);
+  EXPECT_EQ(0, usage[1].ru_minflt - usage[0].ru_minflt);
+  EXPECT_EQ(0, usage[2].ru_minflt - usage[1].ru_minflt);
+  EXPECT_EQ(static_cast<long>(kPages), usage[3].ru_minflt - usage[2].ru_minflt);
+  EXPECT_EQ(0, usage[4].ru_minflt - usage[3].ru_minflt);
+  EXPECT_EQ(0, usage[4].ru_majflt - usage[0].ru_majflt);
+  EXPECT_TRUE(contents_ok);
+  EXPECT_EQ(0, target_unmap);
+  EXPECT_EQ(0, scratch_unmap);
+}
+
+// Parent bounds the wait and always reaps its own child, including failures.
+bool ReapProtectionChild(pid_t child, int* status) {
+  struct timespec begin {};
+  const bool have_clock = clock_gettime(CLOCK_MONOTONIC, &begin) == 0;
+  for (;;) {
+    const pid_t result = waitpid(child, status, WNOHANG);
+    if (result == child) return true;
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      // ECHILD (or another wait error) does not certify a live owned PID.
+      // Never signal a PID after ownership has been lost.
+      return false;
+    }
+    struct timespec now {};
+    if (!have_clock || clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        now.tv_sec - begin.tv_sec >= 3) break;
+    struct timespec delay {0, 1000000};
+    nanosleep(&delay, nullptr);
+  }
+  // No other thread reaps this child; the last WNOHANG result was zero.
+  kill(child, SIGKILL);
+  while (waitpid(child, status, 0) < 0 && errno == EINTR) {}
+  return false;
+}
+
+TEST(PageFaultAccounting, AnonymousFirstFaultPreservesProtection) {
+  for (int protection : {PROT_READ, PROT_NONE}) {
+    void* mapping = mmap(nullptr, kPageSize, protection,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, mapping) << strerror(errno);
+    const pid_t child = fork();
+    if (child == 0) {
+      struct rlimit limit {0, 0};
+      (void)setrlimit(RLIMIT_CORE, &limit);
+      struct sigaction action {};
+      action.sa_handler = SIG_DFL;
+      sigemptyset(&action.sa_mask);
+      sigset_t unblocked;
+      sigemptyset(&unblocked);
+      sigaddset(&unblocked, SIGSEGV);
+      if (sigaction(SIGSEGV, &action, nullptr) != 0 ||
+          sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+      *static_cast<volatile uint8_t*>(mapping) = 0x5a;
+      _exit(1);
+    }
+    int status = 0;
+    const bool reaped = child > 0 && ReapProtectionChild(child, &status);
+    const int writable = mprotect(mapping, kPageSize, PROT_READ | PROT_WRITE);
+    bool zero_and_writable = false;
+    if (writable == 0) {
+      auto* byte = static_cast<volatile uint8_t*>(mapping);
+      const bool zero = *byte == 0;
+      *byte = 0xa5;
+      zero_and_writable = zero && *byte == 0xa5;
+    }
+    const int unmapped = munmap(mapping, kPageSize);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(reaped);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+    EXPECT_EQ(0, writable);
+    EXPECT_TRUE(zero_and_writable);
+    EXPECT_EQ(0, unmapped);
+  }
+}
+
+// A cached private-file first write must install its new anonymous copy writable.
+TEST(PageFaultAccounting, PrivateFileFirstWriteNeedsOneFaultPerPage) {
+  constexpr size_t kPages = 64;
+  constexpr size_t kLength = kPages * kPageSize;
+  std::vector<uint8_t> file_bytes(kLength, 0x31);
+  int fd = -1;
+  void* target = MAP_FAILED;
+  void* view = MAP_FAILED;
+  void* scratch = MAP_FAILED;
+  char path[] = "/tmp/dunitest-private-fault-XXXXXX";
+  bool linked = false;
+
+  // Fatal assertions leave this scope, then the common cleanup below runs.
+  [&] {
+    fd = mkstemp(path);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    linked = true;
+    ASSERT_EQ(0, unlink(path)) << strerror(errno);
+    linked = false;
+    size_t done = 0;
+    while (done < kLength) {
+      const ssize_t n = pwrite(fd, file_bytes.data() + done, kLength - done, done);
+      if (n < 0 && errno == EINTR) continue;
+      ASSERT_GT(n, 0) << strerror(errno);
+      done += static_cast<size_t>(n);
+    }
+    view = mmap(nullptr, kLength, PROT_READ, MAP_SHARED, fd, 0);
+    ASSERT_NE(MAP_FAILED, view) << strerror(errno);
+    const auto* original = static_cast<volatile const uint8_t*>(view);
+    // Populate the file cache and independent view before creating the target.
+    for (size_t i = 0; i < kLength; ++i) ASSERT_EQ(0x31, original[i]);
+    target = mmap(nullptr, kLength, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    ASSERT_NE(MAP_FAILED, target) << strerror(errno);
+    ASSERT_EQ(0, madvise(target, kLength, MADV_NOHUGEPAGE)) << strerror(errno);
+    scratch = mmap(nullptr, kLength, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(MAP_FAILED, scratch) << strerror(errno);
+    auto* bytes = static_cast<volatile uint8_t*>(target);
+    struct rusage usage[5] {};
+    long results[5] {};
+    for (auto& u : usage) ASSERT_EQ(0, syscall(SYS_getrusage, RUSAGE_THREAD, &u));
+    WriteFaultPages(static_cast<volatile uint8_t*>(scratch), kPages, 0x5a);
+
+    // No target pre-read, assertions, allocation or file I/O in this window.
+    results[0] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[0]);
+    results[1] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[1]);
+    results[2] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[2]);
+    WriteFaultPages(bytes, kPages, 0x5a);
+    results[3] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[3]);
+    WriteFaultPages(bytes, kPages, 0xa5);
+    results[4] = syscall(SYS_getrusage, RUSAGE_THREAD, &usage[4]);
+
+    for (long result : results) ASSERT_EQ(0, result);
+    EXPECT_EQ(0, usage[1].ru_minflt - usage[0].ru_minflt);
+    EXPECT_EQ(0, usage[2].ru_minflt - usage[1].ru_minflt);
+    EXPECT_EQ(static_cast<long>(kPages), usage[3].ru_minflt - usage[2].ru_minflt);
+    EXPECT_EQ(0, usage[4].ru_minflt - usage[3].ru_minflt);
+    EXPECT_EQ(0, usage[4].ru_majflt - usage[0].ru_majflt);
+    done = 0;
+    while (done < kLength) {
+      const ssize_t n = pread(fd, file_bytes.data() + done, kLength - done, done);
+      if (n < 0 && errno == EINTR) continue;
+      ASSERT_GT(n, 0) << strerror(errno);
+      done += static_cast<size_t>(n);
+    }
+    bool isolated = true;
+    bool private_contents = true;
+    for (size_t i = 0; i < kLength; ++i) {
+      isolated = isolated && file_bytes[i] == 0x31 && original[i] == 0x31;
+      private_contents = private_contents &&
+          bytes[i] == (i % kPageSize == 0 ? 0xa5 : 0x31);
+    }
+    EXPECT_TRUE(isolated);
+    EXPECT_TRUE(private_contents);
+    // Downgrading the newly writable private page must revoke write access.
+    ASSERT_EQ(0, mprotect(target, kLength, PROT_READ));
+    const pid_t child = fork();
+    if (child == 0) {
+      struct rlimit limit {0, 0};
+      (void)setrlimit(RLIMIT_CORE, &limit);
+      struct sigaction action {};
+      action.sa_handler = SIG_DFL;
+      sigemptyset(&action.sa_mask);
+      sigset_t unblocked;
+      sigemptyset(&unblocked);
+      sigaddset(&unblocked, SIGSEGV);
+      if (sigaction(SIGSEGV, &action, nullptr) != 0 ||
+          sigprocmask(SIG_UNBLOCK, &unblocked, nullptr) != 0) _exit(2);
+      bytes[0] = 0x77;
+      _exit(1);
+    }
+    int status = 0;
+    const bool reaped = child > 0 && ReapProtectionChild(child, &status);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(reaped);
+    ASSERT_TRUE(WIFSIGNALED(status));
+    EXPECT_EQ(SIGSEGV, WTERMSIG(status));
+    ASSERT_EQ(0, mprotect(target, kLength, PROT_READ | PROT_WRITE));
+    bytes[0] = 0x77;
+    EXPECT_EQ(0x77, bytes[0]);
+    EXPECT_EQ(0x31, original[0]);
+  }();
+  if (scratch != MAP_FAILED) EXPECT_EQ(0, munmap(scratch, kLength));
+  if (target != MAP_FAILED) EXPECT_EQ(0, munmap(target, kLength));
+  if (view != MAP_FAILED) EXPECT_EQ(0, munmap(view, kLength));
+  if (fd >= 0) EXPECT_EQ(0, close(fd));
+  if (linked) EXPECT_EQ(0, unlink(path));
 }
 
 TEST(PageFaultAccounting, AnonymousWriteUpdatesTaskAndVmstat) {

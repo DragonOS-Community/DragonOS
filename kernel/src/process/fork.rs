@@ -839,7 +839,7 @@ impl ProcessManager {
         // is still unpublished.  A failed allocation returns from clone
         // without making a child visible or retaining partial keyring state.
         if let Some(child_cred) = pcb
-            .cred()
+            .objective_cred()
             .prepare_fork_keyrings(clone_flags.contains(CloneFlags::CLONE_THREAD))?
         {
             pcb.set_cred(child_cred)?;

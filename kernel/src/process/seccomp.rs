@@ -668,9 +668,7 @@ pub fn seccomp_set_mode_filter(fprog_ptr: u64, flags: u32) -> Result<(), SystemE
     let current = ProcessManager::current_pcb();
 
     // Linux: CAP_SYS_ADMIN 或 no_new_privs
-    if !current
-        .cred()
-        .has_capability(crate::process::cred::CAPFlags::CAP_SYS_ADMIN)
+    if !ProcessManager::current_cred().has_capability(crate::process::cred::CAPFlags::CAP_SYS_ADMIN)
         && current.no_new_privs() == 0
     {
         return Err(SystemError::EACCES);

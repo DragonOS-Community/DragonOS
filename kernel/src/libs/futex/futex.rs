@@ -35,7 +35,8 @@ use crate::{
     process::{preempt::PageFaultDisabledGuard, ProcessControlBlock, ProcessManager, RawPid},
     syscall::user_access::{UserBufferReader, UserBufferWriter},
     time::{
-        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
+        absolute_timer::{AbsoluteClock, AbsoluteTimer},
+        timer::TimerFunction,
         PosixTimeSpec,
     },
 };
@@ -147,14 +148,15 @@ impl FutexHashBucket {
             .push_node(WaitNode::try_new(futex_q).expect("futex test node allocation failed"));
     }
 
-    /// ## 唤醒队列中的最多nr_wake个进程
-    ///
-    /// return: 唤醒的进程数
-    pub fn wake_up(
+    /// Select and detach at most nr_wake matching waiters without notifying.
+    /// The caller must drain pending after releasing the registry, even on error.
+    /// Returns the number selected, independent of Waker notification state.
+    pub fn select_wake(
         &mut self,
         key: FutexKey,
         bitset: Option<u32>,
         nr_wake: u32,
+        pending: &mut WaitQueueNodes<Arc<FutexObj>>,
     ) -> Result<usize, SystemError> {
         if self.pi_refs != 0 {
             return Err(SystemError::EINVAL);
@@ -169,12 +171,19 @@ impl FutexHashBucket {
                 break;
             };
             let waiter = node.value();
-            let matches =
-                *waiter.key.lock() == key && bitset.is_none_or(|mask| waiter.bitset & mask != 0);
+            let mut location = waiter.key.lock();
+            let matches = location.as_ref() == Some(&key)
+                && bitset.is_none_or(|mask| waiter.bitset & mask != 0);
+            let retired_location = if matches { location.take() } else { None };
+            drop(location);
+            // The selection argument owns the same key while this old copy retires.
+            drop(retired_location);
             if matches {
-                if waiter.waker.wake() {
-                    count += 1;
-                }
+                // Selection/unqueue wins against timeout or signal even if
+                // their notification already made the task runnable. Count the
+                // selected futex waiter, not a Waker state transition.
+                pending.push_node(node);
+                count += 1;
             } else {
                 retained.push_node(node);
             }
@@ -201,8 +210,9 @@ impl FutexHashBucket {
 #[derive(Debug)]
 pub struct FutexObj {
     pub(super) waker: Arc<Waker>,
-    // The map lock precedes this lock. Requeue updates the cancellation location.
-    pub(super) key: SpinLock<FutexKey>,
+    // Registry -> location lock. Some is a published queue location. None is
+    // unpublished or unqueued; only a published wait-return may treat it as WAKE.
+    pub(super) key: SpinLock<Option<FutexKey>>,
     pub(super) bitset: u32,
     pub(super) tid: u32,
     // TODO: 优先级继承
@@ -407,11 +417,13 @@ impl Futex {
             return Err(SystemError::EINVAL);
         }
 
-        // Capture the expiry once: refault retries consume the original budget.
-        // Keep validation/error precedence below the locked value comparison.
-        let timer_deadline = abs_time
-            .filter(PosixTimeSpec::is_valid_timeout)
-            .map(|time| next_n_us_timer_jiffies(time.to_ktime_ns().div_ceil(1000)));
+        // All callers provide one absolute deadline; no timeout takes no clock.
+        let clock = if flags.contains(FutexFlag::FLAGS_CLOCKRT) {
+            AbsoluteClock::Realtime
+        } else {
+            AbsoluteClock::Monotonic
+        };
+        let expired = || abs_time.is_some_and(|time| time.to_ktime_ns() <= clock.now_ns());
         let (key, futex_map_guard, uval) = loop {
             let key = Self::get_futex_key(
                 uaddr,
@@ -447,135 +459,138 @@ impl Futex {
             if !time.is_valid_timeout() {
                 return Err(SystemError::EINVAL);
             }
-            if timer_deadline.is_some_and(|deadline| deadline <= crate::time::timer::clock()) {
+            if expired() {
                 return Err(SystemError::ETIMEDOUT);
             }
         }
         // Preparation may allocate, so release the resource lock and keep all
         // unpublished owners outside the final registration guard's lifetime.
         drop(futex_map_guard);
+        drop(key); // Final publication resolves the key again after preparation.
         let (waiter, waker) = Waiter::try_new_pair()?;
-        let prepared_timer = if let Some(jiffies) = timer_deadline {
+        let mut prepared_timer = if let Some(deadline) = abs_time {
             let callback = Box::try_new(WakerTimer {
                 waker: waker.clone(),
             })
             .map_err(|_| SystemError::ENOMEM)?;
-            Some(Timer::try_prepare(callback, jiffies)?)
+            Some(AbsoluteTimer::try_prepare(clock, deadline, callback)?)
         } else {
             None
         };
         let timer = prepared_timer.as_ref().map(|prepared| prepared.timer());
+        defer::defer!({
+            if let Some(timer) = &timer {
+                timer.cancel();
+            }
+        });
         let futex_q = Arc::try_new(FutexObj {
             waker: waker.clone(),
-            key: SpinLock::new(key),
+            key: SpinLock::new(None),
             bitset,
             tid: 0,
         })
         .map_err(|_| SystemError::ENOMEM)?;
-        let node = WaitNode::try_new(futex_q.clone())?;
+        loop {
+            // A spurious wake may require another node, but never another timer or
+            // Waker. Preparation remains outside the registry lock.
+            let node = WaitNode::try_new(futex_q.clone())?;
 
-        // Both the shared mapping identity and the value may have changed while
-        // preparing. Refault without the map guard, then resolve both anew.
-        let (key, mut futex_map_guard) = loop {
-            let key = Self::get_futex_key(
-                uaddr,
-                flags.contains(FutexFlag::FLAGS_SHARED),
-                FutexAccess::FutexRead,
-            )?;
-            let map = FutexData::futex_map();
-            match Self::read_user_u32_nofault(uaddr) {
-                Ok(value) if value != val => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-                Ok(_) => break (key, map),
-                Err(SystemError::EFAULT) => {
-                    drop(map);
-                    let reader = UserBufferReader::new(
-                        uaddr.as_ptr::<u32>(),
-                        core::mem::size_of::<u32>(),
-                        true,
-                    )?;
-                    let _ = reader.read_one_from_user::<u32>(0)?;
+            // Both the shared mapping identity and the value may have changed while
+            // preparing. Refault without the map guard, then resolve both anew.
+            let (key, mut futex_map_guard) = loop {
+                let key = Self::get_futex_key(
+                    uaddr,
+                    flags.contains(FutexFlag::FLAGS_SHARED),
+                    FutexAccess::FutexRead,
+                )?;
+                let map = FutexData::futex_map();
+                match Self::read_user_u32_nofault(uaddr) {
+                    Ok(value) if value != val => return Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+                    Ok(_) => break (key, map),
+                    Err(SystemError::EFAULT) => {
+                        drop(map);
+                        let reader = UserBufferReader::new(
+                            uaddr.as_ptr::<u32>(),
+                            core::mem::size_of::<u32>(),
+                            true,
+                        )?;
+                        let _ = reader.read_one_from_user::<u32>(0)?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
+            };
+            if expired() {
+                return Err(SystemError::ETIMEDOUT);
             }
-        };
-        if timer_deadline.is_some_and(|deadline| deadline <= crate::time::timer::clock()) {
-            return Err(SystemError::ETIMEDOUT);
-        }
-        if !futex_map_guard.contains_key(&key) {
+            if !futex_map_guard.contains_key(&key) {
+                futex_map_guard
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+            }
+            if futex_map_guard
+                .get(&key)
+                .is_some_and(|bucket| bucket.pi_refs != 0)
+            {
+                return Err(SystemError::EINVAL);
+            }
+            *futex_q.key.lock() = Some(key.clone());
             futex_map_guard
-                .try_reserve(1)
-                .map_err(|_| SystemError::ENOMEM)?;
+                .entry(key)
+                .or_insert_with(FutexHashBucket::new)
+                .chain
+                .push_node(node);
+            // Queue publication and timer activation are now allocation-free.
+            if let Some(prepared) = prepared_timer.take() {
+                prepared.activate();
+            }
+            drop(futex_map_guard);
+            // 阻塞等待
+            // A prior iteration may have consumed the callback's notification.
+            // Sticky expiry prevents sleeping again without a future wake edge.
+            let wait_res = if timer.as_ref().is_some_and(|t| t.fired()) {
+                Ok(())
+            } else {
+                waiter.wait(true)
+            };
+
+            // ========== 被唤醒后的检查 ==========
+            // 进程被唤醒可能有以下几种情况：
+            // 1. futex_wake 显式唤醒（正常情况）- futex_q 已从队列移除
+            // 2. 超时唤醒 - futex_q 仍在队列中
+            // 3. 信号唤醒 - futex_q 仍在队列中
+            // 4. 伪唤醒 - futex_q 仍在队列中
+
+            // Only this already-published iteration may interpret None as WAKE.
+            // Drop the short location guard before taking the registry (never reverse).
+            if futex_q.key.lock().is_none() {
+                return Ok(0);
+            }
+            let mut futex_map_guard = FutexData::futex_map();
+            let (in_queue, retired, retired_location) =
+                Self::unqueue_waiter(&mut futex_map_guard, &futex_q)?;
+            drop(futex_map_guard);
+            drop(retired);
+            drop(retired_location);
+
+            // Linux gives successful unqueue by WAKE priority over a racing timer
+            // or signal. Only a waiter still queued can report either interruption.
+            if !in_queue {
+                return Ok(0);
+            }
+
+            // 处理等待结果
+            if timer.as_ref().is_some_and(|t| t.fired()) || expired() {
+                return Err(SystemError::ETIMEDOUT);
+            }
+
+            if wait_res.is_err() || ProcessManager::current_pcb().has_pending_signal() {
+                // 按 Linux 语义，将可中断唤醒视为 EINTR 而非内部重启错误
+                return Err(SystemError::EINTR);
+            }
+
+            // No signal and no expiry: a spurious notification is not EINTR.
+            // Re-resolve the original uaddr/key/value without extending the budget.
         }
-        if futex_map_guard
-            .get(&key)
-            .is_some_and(|bucket| bucket.pi_refs != 0)
-        {
-            return Err(SystemError::EINVAL);
-        }
-        *futex_q.key.lock() = key.clone();
-        futex_map_guard
-            .entry(key)
-            .or_insert_with(FutexHashBucket::new)
-            .chain
-            .push_node(node);
-        // Queue publication and timer activation are now allocation-free.
-        if let Some(prepared) = prepared_timer {
-            prepared.activate();
-        }
-        drop(futex_map_guard);
-        // 阻塞等待
-        let wait_res = waiter.wait(true);
-
-        // ========== 被唤醒后的检查 ==========
-        // 进程被唤醒可能有以下几种情况：
-        // 1. futex_wake 显式唤醒（正常情况）- futex_q 已从队列移除
-        // 2. 超时唤醒 - futex_q 仍在队列中
-        // 3. 信号唤醒 - futex_q 仍在队列中
-        // 4. 伪唤醒 - futex_q 仍在队列中
-
-        let mut futex_map_guard = FutexData::futex_map();
-
-        // 首先检查超时
-        let is_timeout = timer.as_ref().is_some_and(|t| t.timeout());
-
-        // 从队列中移除自身（如果仍在队列）
-        let current_key = futex_q.key.lock().clone();
-        let in_queue = futex_map_guard
-            .get_mut(&current_key)
-            .map(|bucket| bucket.remove_by_waker(&waker))
-            .unwrap_or(false);
-        let retired = FutexData::remove_empty_locked(&mut futex_map_guard, &current_key);
-
-        drop(futex_map_guard);
-        drop(retired);
-
-        // 取消定时器
-        if let Some(timer) = timer {
-            timer.cancel();
-        }
-
-        // Linux gives successful unqueue by WAKE priority over a racing timer
-        // or signal. Only a waiter still queued can report either interruption.
-        if !in_queue {
-            return Ok(0);
-        }
-
-        // 处理等待结果
-        if is_timeout {
-            return Err(SystemError::ETIMEDOUT);
-        }
-
-        if wait_res.is_err() || ProcessManager::current_pcb().has_pending_signal() {
-            // 按 Linux 语义，将可中断唤醒视为 EINTR 而非内部重启错误
-            return Err(SystemError::EINTR);
-        }
-
-        if in_queue {
-            // 未被正常唤醒，视为伪唤醒/信号
-            return Err(SystemError::EINTR);
-        }
-
-        Ok(0)
     }
 
     // ### 唤醒指定futex上挂起的最多nr_wake个进程
@@ -600,16 +615,50 @@ impl Futex {
             FutexAccess::FutexRead,
         )?;
 
+        let mut pending = WaitQueueNodes::new();
         let mut binding = FutexData::futex_map();
-        let Some(count) = Self::wake_existing(&mut binding, &key, nr_wake, bitset)? else {
-            return Ok(0);
+        let result = Self::wake_existing(&mut binding, &key, nr_wake, bitset, &mut pending);
+        let retired = if matches!(result, Ok(Some(_))) {
+            FutexData::remove_empty_locked(&mut binding, &key)
+        } else {
+            None
         };
-
-        let retired = FutexData::remove_empty_locked(&mut binding, &key);
         drop(binding);
+        Self::notify_selected(&mut pending);
         drop(retired);
+        result.map(|count| count.unwrap_or(0))
+    }
 
-        Ok(count)
+    /// Fulfil selections only after the registry guard has been released.
+    /// Moving existing nodes here allocates nothing and pins each Waker until
+    /// notification. A closed/already notified Waker still consumed its slot.
+    fn notify_selected(pending: &mut WaitQueueNodes<Arc<FutexObj>>) {
+        while let Some(node) = pending.pop_node() {
+            node.value().waker.wake();
+        }
+    }
+
+    /// Registry held: re-read location after the unlocked fast check, since
+    /// WAKE or REQUEUE may have won. Return owners for retirement after unlock.
+    fn unqueue_waiter(
+        map: &mut HashMap<FutexKey, FutexHashBucket>,
+        waiter: &Arc<FutexObj>,
+    ) -> Result<(bool, Option<FutexHashBucket>, Option<FutexKey>), SystemError> {
+        let current_key = waiter.key.lock().clone();
+        let Some(current_key) = current_key else {
+            return Ok((false, None, None));
+        };
+        let removed = map
+            .get_mut(&current_key)
+            .is_some_and(|bucket| bucket.remove_by_waker(&waiter.waker));
+        // Some with no node violates publication: never report a false WAKE success.
+        if !removed {
+            return Err(SystemError::EINVAL);
+        }
+        let retired_location = waiter.key.lock().take();
+        let retired = FutexData::remove_empty_locked(map, &current_key);
+        // retired_location keeps the private Weak alive past this local clone.
+        Ok((true, retired, retired_location))
     }
 
     /// Wake only an already registered key. Some(0) also covers an existing
@@ -619,6 +668,7 @@ impl Futex {
         key: &FutexKey,
         nr_wake: u32,
         bitset: u32,
+        pending: &mut WaitQueueNodes<Arc<FutexObj>>,
     ) -> Result<Option<usize>, SystemError> {
         let Some(bucket) = map.get_mut(key) else {
             return Ok(None);
@@ -627,7 +677,7 @@ impl Futex {
         // users (for example requeue) retain their literal zero-wake budget.
         let effective_nr_wake = nr_wake.max(1);
         bucket
-            .wake_up(key.clone(), Some(bitset), effective_nr_wake)
+            .select_wake(key.clone(), Some(bitset), effective_nr_wake, pending)
             .map(Some)
     }
 
@@ -694,14 +744,18 @@ impl Futex {
             }
             break (key1, key2, map);
         };
-        let (count, retired) = Self::requeue_existing(
+        let mut pending = WaitQueueNodes::new();
+        let result = Self::requeue_existing(
             &mut map,
             &key1,
             &key2,
             nr_wake as usize,
             nr_requeue as usize,
-        )?;
+            &mut pending,
+        );
         drop(map);
+        Self::notify_selected(&mut pending);
+        let (count, retired) = result?;
         drop(retired);
         Ok(count)
     }
@@ -714,6 +768,7 @@ impl Futex {
         key2: &FutexKey,
         nr_wake: usize,
         nr_requeue: usize,
+        pending: &mut WaitQueueNodes<Arc<FutexObj>>,
     ) -> Result<(usize, Option<FutexHashBucket>), SystemError> {
         let Some(source) = map.get(key1) else {
             return Ok((0, None));
@@ -727,13 +782,15 @@ impl Futex {
             map.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
         }
         let source = map.get_mut(key1).unwrap();
-        let woken = source.wake_up(key1.clone(), None, nr_wake as u32)?;
+        let woken = source.select_wake(key1.clone(), None, nr_wake as u32, pending)?;
         let count = source.chain.len().min(nr_requeue);
         if key1 != key2 && count > 0 {
             let rest = source.chain.split_off(count);
             let mut moved = mem::replace(&mut source.chain, rest);
             for waiter in &moved {
-                *waiter.key.lock() = key2.clone();
+                let retired_location = waiter.key.lock().replace(key2.clone());
+                // key1/map still own the old identity; no final Weak drop under location.
+                drop(retired_location);
             }
             map.entry(key2.clone())
                 .or_insert_with(FutexHashBucket::new)
@@ -776,29 +833,54 @@ impl Futex {
                 Err(e) => return Err(e),
             };
 
-            let mut wake_count = 0;
+            let mut pending = WaitQueueNodes::new();
             let nr_wake = if nr_wake <= 0 { 1 } else { nr_wake as u32 };
             let nr_wake2 = if nr_wake2 <= 0 { 1 } else { nr_wake2 as u32 };
-            // If uaddr1 has no associated waiters, return 0 instead of EINVAL per Linux behavior.
-            if let Some(bucket1) = futex_data_guard.get_mut(&key1) {
-                // Wake up processes in uaddr1
-                wake_count += bucket1.wake_up(key1.clone(), None, nr_wake)?;
-            }
-
-            // If the operation succeeds, wake up processes in uaddr2
-            if op_ret {
-                // If uaddr2 has no associated waiters, skip the wake instead of returning EINVAL per Linux behavior.
-                if let Some(bucket2) = futex_data_guard.get_mut(&key2) {
-                    wake_count += bucket2.wake_up(key2.clone(), None, nr_wake2)?;
-                }
-            }
-
-            let retired1 = FutexData::remove_empty_locked(&mut futex_data_guard, &key1);
-            let retired2 = FutexData::remove_empty_locked(&mut futex_data_guard, &key2);
+            // Keep partial selections even if the second key rejects PI mixing.
+            // No function-level `?` may bypass their post-unlock notification.
+            let result = (|| {
+                let count = Self::select_wake_op(
+                    &mut futex_data_guard,
+                    &key1,
+                    &key2,
+                    nr_wake,
+                    nr_wake2,
+                    op_ret,
+                    &mut pending,
+                )?;
+                let retired1 = FutexData::remove_empty_locked(&mut futex_data_guard, &key1);
+                let retired2 = FutexData::remove_empty_locked(&mut futex_data_guard, &key2);
+                Ok::<_, SystemError>((count, retired1, retired2))
+            })();
             drop(futex_data_guard);
+            Self::notify_selected(&mut pending);
+            let (count, retired1, retired2) = result?;
             drop((retired1, retired2));
-            return Ok(wake_count);
+            return Ok(count);
         }
+    }
+
+    /// Selection half of WAKE_OP; the caller must notify pending on both success
+    /// and error, after releasing the registry. The user atomic op precedes this.
+    fn select_wake_op(
+        map: &mut HashMap<FutexKey, FutexHashBucket>,
+        key1: &FutexKey,
+        key2: &FutexKey,
+        nr_wake: u32,
+        nr_wake2: u32,
+        op_ret: bool,
+        pending: &mut WaitQueueNodes<Arc<FutexObj>>,
+    ) -> Result<usize, SystemError> {
+        let mut count = 0;
+        if let Some(bucket) = map.get_mut(key1) {
+            count += bucket.select_wake(key1.clone(), None, nr_wake, pending)?;
+        }
+        if op_ret {
+            if let Some(bucket) = map.get_mut(key2) {
+                count += bucket.select_wake(key2.clone(), None, nr_wake2, pending)?;
+            }
+        }
+        Ok(count)
     }
 
     pub(super) fn get_futex_key(

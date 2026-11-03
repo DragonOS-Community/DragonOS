@@ -228,6 +228,33 @@ pub(crate) fn all_online_supported() -> bool {
             .all(|cpu| CAPABLE[cpu.data() as usize].load(Ordering::Acquire))
 }
 
+/// Admission for the global absolute-timer notification owner, independently
+/// of which CPU publishes a timer. Unsupported remote backends keep using the
+/// periodic timer service.
+pub(crate) fn global_timer_supported() -> bool {
+    global_timer_capable() && QUEUES[0].lock_irqsave().ready
+}
+
+/// Queue readiness is checked authoritatively by arm under its owner lock.
+pub(crate) fn global_timer_capable() -> bool {
+    let owner = ProcessorId::new(0);
+    if !cfg!(any(target_arch = "x86_64", target_arch = "riscv64"))
+        || !CONTINUOUS.load(Ordering::Acquire)
+        || !crate::smp::cpu::smp_cpu_manager_initialized()
+        || !CAPABLE[0].load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let manager = crate::smp::cpu::smp_cpu_manager();
+    if !manager.is_online_cpu(owner) {
+        return false;
+    }
+    if !remote_supported() && manager.present_cpus_count() > 1 {
+        return false;
+    }
+    true
+}
+
 /// Called after dropping the timekeeper write lock. An event deadline must
 /// never be driven by jiffies itself: that would stop the tick which advances it.
 pub(crate) fn clocksource_changed(continuous: bool) {
@@ -241,6 +268,7 @@ pub(crate) fn clocksource_changed(continuous: bool) {
         }
     }
     reprogram_local();
+    super::absolute_timer::refresh_deadline_driver();
 }
 
 pub fn init_local() {
@@ -257,6 +285,8 @@ pub fn init_local() {
     queue.next_tick = now_ns().saturating_add(TICK_NS);
     queue.ready = true;
     program_locked(&queue);
+    drop(queue);
+    super::absolute_timer::refresh_deadline_driver();
 }
 
 pub fn reprogram_local() {

@@ -188,6 +188,78 @@ TEST(PiExecContract, ContendedOwnerExecRecoversOldLockAndAcceptsNewState) {
 
 class PiContract : public ::testing::TestWithParam<int> {};
 
+TEST_P(PiContract, WakeOpPiSecondKeyErrorStillNotifiesFirstWaiter) {
+    const int flags = GetParam();
+    ASSERT_TRUE(Isolated([=] {
+        std::atomic<uint32_t> normal{0};
+        std::atomic<uint32_t> pi{0};
+        ASSERT_EQ(0, Futex(&pi, FUTEX_LOCK_PI | flags));
+        ASSERT_EQ(Tid(), pi.load() & FUTEX_TID_MASK);
+
+        long waited = -2;
+        int wait_error = 0;
+        std::thread ordinary([&] {
+            // No timeout: a later timer must not hide a lost notification.
+            waited = Futex(&normal, FUTEX_WAIT | flags);
+            wait_error = errno;
+        });
+        long queued = 0;
+        int queue_error = 0;
+        const bool observed = Await([&] {
+            queued = syscall(SYS_futex, &normal, FUTEX_REQUEUE | flags,
+                             0, 1, &normal, 0);
+            queue_error = errno;
+            return queued != 0;
+        });
+        if (!observed || queued != 1) {
+            EXPECT_TRUE(observed);
+            EXPECT_EQ(1, queued) << "errno=" << queue_error;
+            EXPECT_EQ(0, Futex(&pi, FUTEX_UNLOCK_PI | flags));
+            // Exit the isolated process, without destructing a joinable
+            // waiter or rescuing it with an ordinary FUTEX_WAKE.
+            _exit(1);
+        }
+
+        long acquired = -2;
+        long contender_unlock = -2;
+        std::thread contender([&] {
+            acquired = Futex(&pi, FUTEX_LOCK_PI | flags);
+            if (acquired == 0)
+                contender_unlock = Futex(&pi, FUTEX_UNLOCK_PI | flags);
+        });
+        const bool registered = Registered(pi);
+        const bool owner_matches = (pi.load() & FUTEX_TID_MASK) == Tid();
+        if (!registered || !owner_matches) {
+            EXPECT_TRUE(registered);
+            EXPECT_TRUE(owner_matches);
+            EXPECT_EQ(0, Futex(&pi, FUTEX_UNLOCK_PI | flags));
+            contender.join();
+            _exit(1);
+        }
+
+        // OR 0 preserves the PI word; old != 0 reaches the second key.
+        // Linux returns EINVAL there but still notifies the first key.
+        errno = 0;
+        const long result = syscall(SYS_futex, &normal, FUTEX_WAKE_OP | flags,
+                                    1, 1, &pi,
+                                    FUTEX_OP(FUTEX_OP_OR, 0, FUTEX_OP_CMP_NE, 0));
+        const int error = errno;
+        EXPECT_EQ(0, Futex(&pi, FUTEX_UNLOCK_PI | flags));
+        contender.join();
+        EXPECT_EQ(0, acquired);
+        EXPECT_EQ(0, contender_unlock);
+        EXPECT_EQ(0u, pi.load());
+        EXPECT_EQ(-1, result);
+        EXPECT_EQ(EINVAL, error);
+
+        // A missed first-key notification hangs here and fails Isolated's
+        // outer watchdog. Never issue a rescue wake before this join.
+        ordinary.join();
+        EXPECT_EQ(0, waited) << "errno=" << wait_error;
+        EXPECT_EQ(0u, normal.load());
+    }));
+}
+
 TEST_P(PiContract, RawOwnerDiedSucceedsAndOrdinaryUnlockClearsIt) {
     const int flags = GetParam();
     ASSERT_TRUE(Isolated([=] {

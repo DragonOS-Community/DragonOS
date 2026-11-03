@@ -193,7 +193,7 @@ pub fn can_do_mlock() -> bool {
     if rlim.rlim_cur != 0 {
         return true;
     }
-    if pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
+    if ProcessManager::current_cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
         return true;
     }
     false

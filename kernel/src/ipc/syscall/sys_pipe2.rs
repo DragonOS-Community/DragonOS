@@ -25,7 +25,7 @@ pub(super) fn do_kernel_pipe2(fd: *mut i32, flags: FileFlags) -> Result<usize, S
     }
 
     let mut user_buffer = UserBufferWriter::new(fd, core::mem::size_of::<[c_int; 2]>(), true)?;
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let read_storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let write_storage = crate::filesystem::vfs::file::PreparedFile::new_recovering()?;
     let pipe_ptr = File::recover_io(|| {

@@ -392,9 +392,8 @@ fn run(
     }
     let mut lru_rescue = LruRescue(None);
     let mut lru_account = None;
-    let current = ProcessManager::current_pcb();
     let private = if user {
-        match AddressSpace::new(false, current.cred().user_ns.clone(), 0) {
+        match AddressSpace::new(false, ProcessManager::current_cred().user_ns.clone(), 0) {
             Ok(mm) => Some(mm),
             Err(error) => fail!("mm_new", error),
         }

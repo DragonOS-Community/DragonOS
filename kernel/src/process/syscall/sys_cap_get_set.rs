@@ -121,7 +121,7 @@ impl Syscall for SysCapset {
         let (p_e_new, p_p_new, p_i_new) = aggregate_u32s_to_u64(&kdata);
 
         // 获取旧凭据
-        let old = pcb.cred();
+        let old = pcb.objective_cred();
         let p_p_old = old.cap_permitted.bits();
         let p_i_old = old.cap_inheritable.bits();
         let bset = old.cap_bset.bits();
@@ -233,12 +233,12 @@ impl Syscall for SysCapget {
             if let Some(task) =
                 ProcessManager::find_task_by_vpid(crate::process::RawPid(pid as usize))
             {
-                task.cred()
+                task.objective_cred()
             } else {
                 return Err(SystemError::ESRCH);
             }
         } else {
-            ProcessManager::current_pcb().cred()
+            ProcessManager::current_pcb().objective_cred()
         };
         let e = cred.cap_effective.bits();
         let p = cred.cap_permitted.bits();

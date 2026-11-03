@@ -17,7 +17,7 @@ use super::nsproxy::{NsProxy, PreparedNamespaceInstall};
 
 fn can_setns_cgroup(target: &crate::process::namespace::cgroup_namespace::CgroupNamespace) -> bool {
     let current = ProcessManager::current_pcb();
-    let cred = current.cred();
+    let cred = ProcessManager::current_cred();
     if !cred.has_cap_sys_admin() {
         return false;
     }
@@ -93,13 +93,12 @@ fn install_setns(
 fn can_setns_target_userns(
     target_user_ns: &Arc<crate::process::namespace::user_namespace::UserNamespace>,
 ) -> bool {
-    let current = ProcessManager::current_pcb();
-    let cred = current.cred();
+    let cred = ProcessManager::current_cred();
     cred.has_cap_sys_admin() && cred.user_ns.is_ancestor_of(target_user_ns)
 }
 
 fn can_setns_uts(target: &crate::process::namespace::uts_namespace::UtsNamespace) -> bool {
-    let current_user_ns = ProcessManager::current_pcb().cred().user_ns.clone();
+    let current_user_ns = ProcessManager::current_cred().user_ns.clone();
     ns_capable(target.user_ns(), CAPFlags::CAP_SYS_ADMIN)
         && ns_capable(&current_user_ns, CAPFlags::CAP_SYS_ADMIN)
 }
@@ -110,12 +109,12 @@ fn can_access_pidfd_setns_target(target: &Arc<crate::process::ProcessControlBloc
         return true;
     }
 
-    let current_cred = current.cred();
+    let current_cred = ProcessManager::current_cred();
     if current_cred.has_capability(CAPFlags::CAP_SYS_PTRACE) {
         return true;
     }
 
-    let target_cred = target.cred();
+    let target_cred = target.objective_cred();
     current_cred.uid == target_cred.euid
         && current_cred.uid == target_cred.suid
         && current_cred.uid == target_cred.uid
@@ -206,7 +205,9 @@ pub fn ksys_setns(fd: i32, nstype: i32) -> Result<(), SystemError> {
         if !can_access_pidfd_setns_target(&target) {
             return Err(SystemError::EPERM);
         }
-        if flags != CloneFlags::CLONE_NEWUTS && !can_setns_target_userns(&target.cred().user_ns) {
+        if flags != CloneFlags::CLONE_NEWUTS
+            && !can_setns_target_userns(&target.objective_cred().user_ns)
+        {
             return Err(SystemError::EPERM);
         }
 
@@ -333,7 +334,7 @@ fn prepare_userns_cred(
     user_ns: Arc<super::user_namespace::UserNamespace>,
 ) -> Result<Arc<Cred>, SystemError> {
     // 1. 不能与当前 ns 相同（防止重复获得能力）
-    if Arc::ptr_eq(&current.cred().user_ns, &user_ns) {
+    if Arc::ptr_eq(&ProcessManager::current_cred().user_ns, &user_ns) {
         return Err(SystemError::EINVAL);
     }
 
@@ -353,7 +354,8 @@ fn prepare_userns_cred(
     }
 
     // 5. Prepare new credentials after every validation has passed.
-    let mut new_cred = (*current.cred()).clone();
+    current.assert_no_credential_override();
+    let mut new_cred = (*current.objective_cred()).clone();
     crate::process::cred::set_cred_user_ns(&mut new_cred, user_ns);
     Ok(Cred::new_arc(new_cred))
 }

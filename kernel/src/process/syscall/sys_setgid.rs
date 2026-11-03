@@ -23,7 +23,7 @@ impl Syscall for SysSetGid {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let gid = id_utils::map_gid_arg(&old_cred.user_ns, Self::gid(args), false)?;
         let mut new_cred: Cred = (*old_cred).clone();
 

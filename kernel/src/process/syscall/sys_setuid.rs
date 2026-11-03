@@ -23,7 +23,7 @@ impl Syscall for SysSetUid {
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
         let pcb = ProcessManager::current_pcb();
-        let old_cred = pcb.cred();
+        let old_cred = pcb.objective_cred();
         let uid = id_utils::map_uid_arg(&old_cred.user_ns, Self::uid(args), false)?;
 
         let old_ruid = old_cred.uid.data();

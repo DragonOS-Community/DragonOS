@@ -160,7 +160,7 @@ pub fn do_fchmodat(
 
 /// fchmod：对已解析的 inode 进行 chmod（供 `sys_fchmod` 复用）。
 pub fn do_fchmod(inode: Arc<dyn IndexNode>, mode: InodeMode) -> Result<usize, SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let operation = inode
         .clone()
         .downcast_arc::<MountFSInode>()
@@ -236,7 +236,7 @@ fn chown_common(inode: Arc<dyn IndexNode>, uid: usize, gid: usize) -> Result<usi
     // register-width inputs before interpreting (uid_t)-1 as "no change".
     let uid = uid as u32 as usize;
     let gid = gid as u32 as usize;
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     let fsuid = cred.fsuid.data();
     let fsgid = cred.fsgid.data();
     let operation = inode
@@ -1038,7 +1038,7 @@ fn check_timestamp_update_permission(
     metadata: &super::Metadata,
     may_use_write_permission: bool,
 ) -> Result<(), SystemError> {
-    let cred = ProcessManager::current_pcb().cred();
+    let cred = ProcessManager::current_cred();
     if cred.is_owner_or_capable(metadata) {
         return Ok(());
     }

@@ -43,7 +43,7 @@ impl Syscall for SysChrootHandle {
         }
 
         let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
 
         // 权限：CAP_SYS_CHROOT
         if !cred.has_capability(CAPFlags::CAP_SYS_CHROOT) {

@@ -1,6 +1,5 @@
 mod config;
 mod copy_up;
-mod cred;
 mod dir;
 mod entry;
 mod file;

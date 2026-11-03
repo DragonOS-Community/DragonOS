@@ -99,7 +99,7 @@ impl StatusFileOps {
 
         // Like Linux task_sig(): all live records and timer reservations for
         // this task's current real UID/user namespace, not its queue length.
-        let cred = pcb.cred();
+        let cred = pcb.objective_cred();
         let pending_signals =
             crate::ipc::signal_quota::SignalAccount::usage(&cred.user_ns, cred.uid.data());
         let pending_limit = pcb

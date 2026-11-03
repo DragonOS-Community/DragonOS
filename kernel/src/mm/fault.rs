@@ -841,7 +841,12 @@ impl PageFaultHandler {
         let _pt_edit = mm.page_table_edit();
         let (flags, mlocked) = {
             let guard = vma.lock();
-            (guard.flags(), guard.vm_flags().contains(VmFlags::VM_LOCKED))
+            let mut flags = guard.flags();
+            // This fault installs a new private page, not a shared COW page.
+            if guard.vm_flags().contains(VmFlags::VM_WRITE) {
+                flags = flags.set_write(true).set_dirty(true);
+            }
+            (flags, guard.vm_flags().contains(VmFlags::VM_LOCKED))
         };
         let mapped = match pfm.map_new_anonymous_page(address, flags) {
             Ok(mapped) => mapped,
@@ -1828,7 +1833,8 @@ impl PageFaultHandler {
 
         let is_private_file_vma =
             vma_guard.vm_file().is_some() && !vma_guard.vm_flags().contains(VmFlags::VM_SHARED);
-        let page_to_map = if flags.contains(FaultFlags::FAULT_FLAG_WRITE) && is_private_file_vma {
+        let is_private_cow = flags.contains(FaultFlags::FAULT_FLAG_WRITE) && is_private_file_vma;
+        let page_to_map = if is_private_cow {
             // 私有文件映射的写时复制
             cow_page.expect("no cow_page in PageFaultMessage")
         } else {
@@ -1840,7 +1846,13 @@ impl PageFaultHandler {
         let mlocked = vma_guard.vm_flags().contains(VmFlags::VM_LOCKED);
 
         let mut map_flags = vma_guard.flags();
-        if (is_private_file_vma
+        if is_private_cow {
+            // COW already produced a private page. Publish its write permission
+            // now instead of faulting and copying it again on the same write.
+            map_flags = map_flags
+                .set_write(vma_guard.vm_flags().contains(VmFlags::VM_WRITE))
+                .set_dirty(true);
+        } else if (is_private_file_vma
             || vma_guard
                 .vm_flags()
                 .contains(VmFlags::VM_SHARED | VmFlags::VM_WRITE))

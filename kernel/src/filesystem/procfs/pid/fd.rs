@@ -50,7 +50,8 @@ impl DirOps for FdDirOps {
         mask: PermissionMask,
     ) -> Result<(), SystemError> {
         let current = crate::process::ProcessManager::current_pcb();
-        let generic = current.cred().inode_permission(metadata, mask.bits());
+        let generic =
+            crate::process::ProcessManager::current_cred().inode_permission(metadata, mask.bits());
         if generic.is_ok() {
             return generic;
         }
@@ -109,37 +110,48 @@ impl DirOps for FdDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let mut cached_children = dir.cached_children().write();
-
-        // 清空现有缓存
-        cached_children.clear();
-
-        // 获取进程的所有文件描述符
-        if let Some(process) = self.get_process() {
-            // 先收集所有的fd，避免在持有锁时做复杂操作
-            let Some(fd_table) = process.basic().try_fd_table().clone() else {
-                return;
-            };
-            let fds: Vec<i32> = {
-                let fd_table_guard = fd_table.read();
-                fd_table_guard.iter().map(|(fd, _)| fd).collect()
-            };
-
-            // 现在fd_table锁已经释放，我们可以安全地创建inodes
-            for fd in fds {
-                let fd_str = fd.to_string();
-
-                // 创建或获取缓存的符号链接（传递 PID 和 fd）
-                cached_children.entry(fd_str.clone()).or_insert_with(|| {
-                    FdSymOps::new_inode(self.target.clone(), fd, dir.self_ref_weak().clone())
-                });
-            }
-        }
-        // 写锁在这里自动释放
+        refresh_fd_children(&self.target, dir, |fd, parent| {
+            FdSymOps::new_inode(self.target.clone(), fd, parent)
+        });
     }
 
     fn validate_child(&self, child: &dyn IndexNode) -> bool {
         child.special_node().is_some()
+    }
+}
+
+/// Refresh fd/fdinfo names without discarding live slot inodes. Like Linux's
+/// proc_fill_cache, an inode names a stable PID object and an fd number, not
+/// the open file description currently installed there. Reads still resolve
+/// the live table, so close/reuse never pins an obsolete file or link target.
+pub(super) fn refresh_fd_children<Ops: DirOps + 'static>(
+    target: &ProcPidTarget,
+    dir: &ProcDir<Ops>,
+    create: impl Fn(i32, Weak<dyn IndexNode>) -> Arc<dyn IndexNode>,
+) {
+    let fds: Vec<i32> = target
+        .task()
+        .and_then(|task| task.basic().try_fd_table().clone())
+        .map(|table| table.read().iter().map(|(fd, _)| fd).collect())
+        .unwrap_or_default();
+    // FileDescriptorIterator visits installed slots in increasing order.
+    // Release the table lock before taking the cache lock or constructing nodes.
+    let mut children = dir.cached_children().write();
+    children.retain(|name, _| {
+        // Lookup may have cached a parseable alias ("03", "+3"). Only
+        // canonical decimal names belong in the directory listing.
+        if !name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            || (name.len() > 1 && name.starts_with('0'))
+        {
+            return false;
+        }
+        name.parse::<i32>()
+            .is_ok_and(|fd| fds.binary_search(&fd).is_ok())
+    });
+    for fd in fds {
+        children
+            .entry(fd.to_string())
+            .or_insert_with(|| create(fd, dir.self_ref_weak().clone()));
     }
 }
 
@@ -155,9 +167,11 @@ impl FdSymOps {
         // Linux proc_fd_access_allowed() returns false for a vanished task;
         // get_link/readlink report EACCES before attempting to resolve its fd.
         let target = self.target.task().ok_or(SystemError::EACCES)?;
-        if !crate::process::ProcessManager::current_pcb()
-            .has_permission_to_trace(&target, crate::process::ptrace::PtraceAccessCreds::FsCreds)
-        {
+        if !crate::process::ProcessManager::current_pcb().has_permission_to_trace(
+            &target,
+            crate::process::ptrace::PtraceAccessCreds::FsCreds,
+            &crate::process::ProcessManager::current_cred(),
+        ) {
             return Err(SystemError::EACCES);
         }
         Ok(target)
@@ -205,49 +219,33 @@ impl SymOps for FdSymOps {
                 .ok_or(SystemError::ENOENT)?
         }; // fd_table 锁在这里被释放
 
-        // 获取进程的 chroot 根路径
-        let root_prefix = process
-            .try_fs_struct()
-            .ok_or(SystemError::ENOENT)?
-            .root()
-            .absolute_path()
-            .unwrap_or_default();
-
-        // 现在安全地获取文件的路径
         let inode = file.path_inode();
         if let Some(target) = inode.proc_fd_link_target() {
             let copy_len = target.len().min(buf.len());
             buf[..copy_len].copy_from_slice(&target[..copy_len]);
             return Ok(copy_len);
         }
-        let path_result = if let Some(mount_inode) = inode
+        // proc_fd_link resolves the target file, but d_path uses the reader's
+        // fs root. Anonymous targets above do not require a pathname view.
+        let reader_root = crate::process::ProcessManager::current_pcb()
+            .try_fs_struct()
+            .ok_or(SystemError::ENOENT)?
+            .root()
+            .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>()
+            .ok_or(SystemError::EINVAL)?;
+        let path = if let Some(mount_inode) = inode
             .clone()
             .downcast_arc::<crate::filesystem::vfs::mount::MountFSInode>(
         ) {
-            mount_inode.procfs_path()
+            // A mounted file is not anonymous when rendering fails. Preserve
+            // allocation/topology errors instead of inventing a link target.
+            mount_inode.procfs_path(&reader_root)?
+        } else if let Ok(path) = inode.absolute_path() {
+            path
         } else {
-            inode.absolute_path()
-        };
-        let mut path = if let Ok(p) = path_result {
-            p
-        } else {
-            // 匿名文件或无法获取路径
             let inode_id = inode.metadata()?.inode_id;
             format!("anon_inode:[{}]", inode_id)
         };
-
-        // 尊重进程的 chroot：去掉根目录前缀
-        if !root_prefix.is_empty() && root_prefix != "/" {
-            if let Some(rest) = path.strip_prefix(&root_prefix) {
-                path = if rest.is_empty() {
-                    "/".to_string()
-                } else if rest.starts_with('/') {
-                    rest.to_string()
-                } else {
-                    format!("/{}", rest)
-                };
-            }
-        }
 
         // 复制路径到缓冲区
         let path_bytes = path.as_bytes();

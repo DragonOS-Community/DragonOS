@@ -248,8 +248,7 @@ impl FuseFS {
         }
 
         let fd = fd.ok_or(SystemError::EINVAL)?;
-        let pcb = ProcessManager::current_pcb();
-        let cred = pcb.cred();
+        let cred = ProcessManager::current_cred();
         let user_id = user_id.unwrap_or(cred.fsuid.data() as u32);
         let group_id = group_id.unwrap_or(cred.fsgid.data() as u32);
         // Default root mode: directory 0755 (with type bit).

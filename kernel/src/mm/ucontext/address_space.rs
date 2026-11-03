@@ -679,7 +679,7 @@ impl AddressSpace {
         let account = crate::cgroup::memory::MemoryAccount::new(0, None)?;
         let creator = crate::cgroup::memory::object::ObjectAccount::new(&account)?;
         let current = ProcessManager::current_pcb();
-        let user_ns = current.cred().user_ns.clone();
+        let user_ns = ProcessManager::current_cred().user_ns.clone();
         let mm = match Self::new_for_task_with_creator(
             &current,
             false,

@@ -98,7 +98,7 @@ pub(super) fn do_mlock(
 
 pub(super) fn check_mlock_rlimit(locked_vm: usize, new_pages: usize) -> Result<(), SystemError> {
     let pcb = ProcessManager::current_pcb();
-    if pcb.cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
+    if ProcessManager::current_cred().has_capability(CAPFlags::CAP_IPC_LOCK) {
         return Ok(());
     }
 

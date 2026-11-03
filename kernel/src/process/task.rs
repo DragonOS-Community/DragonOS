@@ -342,8 +342,11 @@ pub struct ProcessControlBlockData {
     /// rseq (Restartable Sequences) state.
     pub(super) rseq_state: RwLock<rseq::RseqState>,
 
-    /// Credential set for the process as a subject.
+    /// Published objective credentials, visible to other tasks under RCU.
     pub(super) cred: RcuArcSlot<Cred>,
+    /// Current-task-only subjective override; never read by task observers.
+    pub(super) credential_override: SpinLock<Option<Arc<Cred>>>,
+    pub(super) credential_override_active: AtomicBool,
     /// KEYCTL_SESSION_TO_PARENT handoff.  Consumed by this task at its next
     /// return-to-userspace boundary, never by the child in another context.
     pending_session_keyring: SpinLock<Option<crate::security::keys::KeyRef>>,
@@ -833,7 +836,7 @@ impl ProcessControlBlock {
                 (RawPid(0), RawPid(0), cred, None)
             } else {
                 let ppid = ProcessManager::current_pcb().task_pid_vnr();
-                let cred = ProcessManager::current_pcb().cred();
+                let cred = ProcessManager::current_cred();
 
                 let tty = ProcessManager::current_pcb().sig_info_irqsave().tty();
 
@@ -955,6 +958,8 @@ impl ProcessControlBlock {
                 robust_list: RwLock::new(None),
                 rseq_state: RwLock::new(rseq::RseqState::new()),
                 cred: RcuArcSlot::new(cred),
+                credential_override: SpinLock::new(None),
+                credential_override_active: AtomicBool::new(false),
                 pending_session_keyring: SpinLock::new(None),
                 self_ref: weak.clone(),
                 restart_block: SpinLock::new(None),
@@ -1274,12 +1279,21 @@ impl ProcessControlBlock {
 
     #[inline(always)]
     pub fn keepcaps(&self) -> bool {
-        self.cred().keepcaps
+        assert!(core::ptr::eq(
+            self,
+            Arc::as_ptr(&ProcessManager::current_pcb())
+        ));
+        ProcessManager::current_cred().keepcaps
     }
 
     #[inline(always)]
     pub fn set_keepcaps(&self, value: bool) -> Result<(), SystemError> {
-        let mut cred = (*self.cred()).clone();
+        assert!(core::ptr::eq(
+            self,
+            Arc::as_ptr(&ProcessManager::current_pcb())
+        ));
+        self.assert_no_credential_override();
+        let mut cred = (*self.objective_cred()).clone();
         cred.keepcaps = value;
         self.commit_cred(Cred::new_arc(cred))
     }
@@ -1453,7 +1467,7 @@ impl ProcessControlBlock {
     }
 
     #[inline(always)]
-    pub fn cred(&self) -> Arc<Cred> {
+    pub fn objective_cred(&self) -> Arc<Cred> {
         self.cred.load()
     }
 
@@ -1467,9 +1481,13 @@ impl ProcessControlBlock {
     }
 
     /// Install credentials after every fallible preparation step has completed.
+    /// Only the current task or the owner of an unpublished child may install
+    /// credentials. Child setup precedes mark_new_task(), so scheduler state is
+    /// not an authorization predicate for this publication.
     pub(crate) fn install_cred(&self, new: Arc<Cred>) {
+        self.assert_no_credential_override();
         if new.thread_keyring.is_some() {
-            new.sync_thread_keyring_owner(&self.cred());
+            new.sync_thread_keyring_owner(&self.objective_cred());
         }
         let _task_guard = self.task_lock.lock_irqsave();
         self.cred.store_deferred(new);
@@ -1513,6 +1531,9 @@ impl ProcessControlBlock {
         new_fs: Option<Arc<FsStruct>>,
         _fs_refs: &super::FsRefsReadGuard,
     ) -> Option<Arc<FsStruct>> {
+        if new_cred.is_some() {
+            self.assert_no_credential_override();
+        }
         // Only credential publication needs to stabilize the active mm. Pure
         // namespace publication also runs inside exec, which already owns the
         // write side and must not recursively acquire this read lock.
@@ -1520,7 +1541,7 @@ impl ProcessControlBlock {
         let active_mm = new_cred.as_ref().and_then(|_| self.basic().user_vm());
         if let Some((cred, _)) = new_cred.as_ref() {
             if cred.thread_keyring.is_some() {
-                cred.sync_thread_keyring_owner(&self.cred());
+                cred.sync_thread_keyring_owner(&self.objective_cred());
             }
         }
         let (retired_fs, nsproxy_retirement, cred_retirement) = {
@@ -1528,7 +1549,7 @@ impl ProcessControlBlock {
             let retired_fs = new_fs.and_then(|fs| self.swap_fs_slot_locked(fs));
             let nsproxy_retirement = self.nsproxy.swap_prepared(new_nsproxy, nsproxy_retire);
             let cred_retirement = new_cred.map(|(cred, retire)| {
-                self.commit_cred_side_effects(&self.cred(), &cred, active_mm.as_ref());
+                self.commit_cred_side_effects(&self.objective_cred(), &cred, active_mm.as_ref());
                 self.cred.swap_prepared(cred, retire)
             });
             (retired_fs, nsproxy_retirement, cred_retirement)
@@ -1548,16 +1569,17 @@ impl ProcessControlBlock {
 
     /// Commit new creds, updating dumpability accordingly
     pub fn commit_cred(&self, new: Arc<Cred>) -> Result<(), SystemError> {
+        self.assert_no_credential_override();
         // Stabilize the active mm across the credential publication. Linux
         // publishes a dumpability downgrade before readers can observe the new
         // credentials; exec uses the write side of this same lock.
         let _exec_guard = self.exec_update_read();
         let active_mm = self.basic().user_vm();
         if new.thread_keyring.is_some() {
-            new.sync_thread_keyring_owner(&self.cred());
+            new.sync_thread_keyring_owner(&self.objective_cred());
         }
         let _task_guard = self.task_lock.lock_irqsave();
-        let old = self.cred();
+        let old = self.objective_cred();
         self.commit_cred_side_effects(&old, &new, active_mm.as_ref());
         self.cred.store_deferred(new);
         Ok(())

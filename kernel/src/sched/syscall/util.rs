@@ -123,7 +123,7 @@ pub(super) fn resolve_prio_targets(which: i32, who: i32) -> Result<PrioTargets, 
             Ok(PrioTargets::Many(tasks.into_iter()))
         }
         PRIO_USER => {
-            let current_cred = ProcessManager::current_pcb().cred();
+            let current_cred = ProcessManager::current_cred();
             let uid = if who == 0 {
                 // Linux bypasses make_kuid() for zero and selects the caller's
                 // kernel-global real uid directly.
@@ -144,7 +144,9 @@ pub(super) fn resolve_prio_targets(which: i32, who: i32) -> Result<PrioTargets, 
             // and anything living outside the caller's PID namespace drops out
             // of the `for_each_process_thread()` walk.
             let mut tasks = snapshot_all_processes()?;
-            tasks.retain(|pcb| pcb.task_pid_vnr().data() != 0 && pcb.cred().uid.data() == uid);
+            tasks.retain(|pcb| {
+                pcb.task_pid_vnr().data() != 0 && pcb.objective_cred().uid.data() == uid
+            });
             if tasks.is_empty() {
                 return Err(SystemError::ESRCH);
             }
@@ -190,8 +192,8 @@ pub fn has_sched_setaffinity_permission(
         return true;
     }
 
-    let current_cred = current_pcb.cred();
-    let target_cred = target_pcb.cred();
+    let current_cred = ProcessManager::current_cred();
+    let target_cred = target_pcb.objective_cred();
     if current_cred.has_capability_in_ns(&target_cred.user_ns, CAPFlags::CAP_SYS_NICE) {
         return true;
     }

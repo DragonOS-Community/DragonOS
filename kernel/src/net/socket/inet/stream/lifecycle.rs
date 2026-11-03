@@ -762,11 +762,10 @@ impl TcpSocket {
     }
 
     pub fn check_connect(&self) -> Result<(), SystemError> {
-        // 主动推进协议栈：connect 阻塞等待期间也要持续 poll，否则状态不会从 Connecting 前进。
-        if let Some(iface) = self.stack_poll_snapshot() {
-            iface.poll();
-        }
-
+        // This is also the register-before-check wait predicate. Polling here
+        // broadcasts socket notifications and would wake our own waiter even
+        // when the handshake has not progressed. start_connect sends the first
+        // SYN; ingress and protocol deadlines are serviced by the netns worker.
         self.update_events();
         let mut write_state = self.inner.write();
         let inner = write_state.take().expect("Tcp inner::Inner is None");

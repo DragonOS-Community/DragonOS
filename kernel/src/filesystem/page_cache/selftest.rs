@@ -2203,7 +2203,7 @@ fn run_ramfs_truncate_metadata_selftest() -> Result<bool, MemoryAllocationError>
         InodeMode::from_bits_truncate(0o600),
     )?;
     let data = Mutex::new(FilePrivateData::Unused);
-    let mut unprivileged = (*crate::process::ProcessManager::current_pcb().cred()).clone();
+    let mut unprivileged = (*crate::process::ProcessManager::current_cred()).clone();
     unprivileged.cap_effective = CAPFlags::CAP_EMPTY_SET;
     let unprivileged = Arc::new(unprivileged);
     let mut ok = true;

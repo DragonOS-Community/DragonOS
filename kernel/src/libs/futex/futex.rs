@@ -13,6 +13,7 @@ use core::{
     intrinsics::unlikely,
     mem,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicI32, Ordering},
 };
 use log::warn;
 
@@ -141,11 +142,74 @@ impl FutexHashBucket {
             && self.pi_refs == 0
     }
 
+    pub(super) fn enqueue_node(&mut self, node: Box<WaitNode<Arc<FutexObj>>>) {
+        let priority = node.value().source_priority.load(Ordering::Relaxed);
+        if self
+            .chain
+            .back()
+            .is_none_or(|tail| tail.source_priority.load(Ordering::Relaxed) <= priority)
+        {
+            self.chain.push_node(node);
+            return;
+        }
+        let mut prefix = WaitQueueNodes::new();
+        while self
+            .chain
+            .front()
+            .is_some_and(|head| head.source_priority.load(Ordering::Relaxed) <= priority)
+        {
+            prefix.push_node(self.chain.pop_node().unwrap());
+        }
+        prefix.push_node(node);
+        prefix.append(&mut self.chain);
+        self.chain = prefix;
+    }
+
+    // Both inputs are sorted. Merge a requeued prefix once, rather than
+    // repeatedly rescanning already moved RT members under the registry lock.
+    fn merge_chain(&mut self, moved: &mut WaitQueueNodes<Arc<FutexObj>>) {
+        if moved.is_empty() {
+            return;
+        }
+        if self.chain.back().is_none_or(|tail| {
+            tail.source_priority.load(Ordering::Relaxed)
+                <= moved
+                    .front()
+                    .unwrap()
+                    .source_priority
+                    .load(Ordering::Relaxed)
+        }) {
+            self.chain.append(moved);
+            return;
+        }
+        let mut merged = WaitQueueNodes::new();
+        while !self.chain.is_empty() && !moved.is_empty() {
+            let take_existing = self
+                .chain
+                .front()
+                .unwrap()
+                .source_priority
+                .load(Ordering::Relaxed)
+                <= moved
+                    .front()
+                    .unwrap()
+                    .source_priority
+                    .load(Ordering::Relaxed);
+            merged.push_node(if take_existing {
+                self.chain.pop_node().unwrap()
+            } else {
+                moved.pop_node().unwrap()
+            });
+        }
+        merged.append(&mut self.chain);
+        merged.append(moved);
+        self.chain = merged;
+    }
+
     #[cfg(feature = "mm_selftest")]
     #[inline(always)]
     pub fn enqueue(&mut self, futex_q: Arc<FutexObj>) {
-        self.chain
-            .push_node(WaitNode::try_new(futex_q).expect("futex test node allocation failed"));
+        self.enqueue_node(WaitNode::try_new(futex_q).expect("futex test node allocation failed"));
     }
 
     /// Select and detach at most nr_wake matching waiters without notifying.
@@ -166,11 +230,17 @@ impl FutexHashBucket {
         // then splice the untouched suffix back in O(1), preserving FIFO and
         // avoiding a full-bucket scan when the first waiter can be woken.
         let mut retained = WaitQueueNodes::new();
+        let mut invalid = false;
         while count < nr_wake {
             let Some(node) = self.chain.pop_node() else {
                 break;
             };
             let waiter = node.value();
+            if waiter.requeue_pi.is_some() {
+                retained.push_node(node);
+                invalid = true;
+                break;
+            }
             let mut location = waiter.key.lock();
             let matches = location.as_ref() == Some(&key)
                 && bitset.is_none_or(|mask| waiter.bitset & mask != 0);
@@ -191,7 +261,11 @@ impl FutexHashBucket {
         retained.append(&mut self.chain);
         self.chain = retained;
 
-        Ok(count as usize)
+        if invalid {
+            Err(SystemError::EINVAL)
+        } else {
+            Ok(count as usize)
+        }
     }
 
     /// 将FutexObj从bucket中删除
@@ -214,8 +288,10 @@ pub struct FutexObj {
     // unpublished or unqueued; only a published wait-return may treat it as WAKE.
     pub(super) key: SpinLock<Option<FutexKey>>,
     pub(super) bitset: u32,
-    pub(super) tid: u32,
-    // TODO: 优先级继承
+    // Linux source plist priority is captured at registration, independently
+    // of target PI effective priority and subsequent donation changes.
+    pub(super) source_priority: AtomicI32,
+    pub(super) requeue_pi: Option<Arc<super::pi_futex::RequeuePiWaiter>>,
 }
 
 #[derive(Debug)]
@@ -487,7 +563,8 @@ impl Futex {
             waker: waker.clone(),
             key: SpinLock::new(None),
             bitset,
-            tid: 0,
+            source_priority: AtomicI32::new(100),
+            requeue_pi: None,
         })
         .map_err(|_| SystemError::ENOMEM)?;
         loop {
@@ -533,12 +610,18 @@ impl Futex {
             {
                 return Err(SystemError::EINVAL);
             }
+            futex_q.source_priority.store(
+                ProcessManager::current_pcb()
+                    .sched_info()
+                    .normal_prio()
+                    .min(100),
+                Ordering::Relaxed,
+            );
             *futex_q.key.lock() = Some(key.clone());
             futex_map_guard
                 .entry(key)
                 .or_insert_with(FutexHashBucket::new)
-                .chain
-                .push_node(node);
+                .enqueue_node(node);
             // Queue publication and timer activation are now allocation-free.
             if let Some(prepared) = prepared_timer.take() {
                 prepared.activate();
@@ -640,7 +723,7 @@ impl Futex {
 
     /// Registry held: re-read location after the unlocked fast check, since
     /// WAKE or REQUEUE may have won. Return owners for retirement after unlock.
-    fn unqueue_waiter(
+    pub(super) fn unqueue_waiter(
         map: &mut HashMap<FutexKey, FutexHashBucket>,
         waiter: &Arc<FutexObj>,
     ) -> Result<(bool, Option<FutexHashBucket>, Option<FutexKey>), SystemError> {
@@ -705,9 +788,15 @@ impl Futex {
             return Err(SystemError::EINVAL);
         }
 
-        // 暂时不支持优先级继承
         if requeue_pi {
-            return Err(SystemError::ENOSYS);
+            return Self::futex_cmp_requeue_pi(
+                uaddr1,
+                flags,
+                uaddr2,
+                nr_wake,
+                nr_requeue,
+                cmpval.ok_or(SystemError::EINVAL)?,
+            );
         }
 
         let (key1, key2, mut map) = loop {
@@ -784,18 +873,25 @@ impl Futex {
         let source = map.get_mut(key1).unwrap();
         let woken = source.select_wake(key1.clone(), None, nr_wake as u32, pending)?;
         let count = source.chain.len().min(nr_requeue);
-        if key1 != key2 && count > 0 {
-            let rest = source.chain.split_off(count);
+        let eligible = source
+            .chain
+            .iter()
+            .take(count)
+            .take_while(|waiter| waiter.requeue_pi.is_none())
+            .count();
+        if key1 != key2 && eligible != 0 {
+            let rest = source.chain.split_off(eligible);
             let mut moved = mem::replace(&mut source.chain, rest);
             for waiter in &moved {
-                let retired_location = waiter.key.lock().replace(key2.clone());
-                // key1/map still own the old identity; no final Weak drop under location.
-                drop(retired_location);
+                let old_location = waiter.key.lock().replace(key2.clone());
+                drop(old_location);
             }
             map.entry(key2.clone())
                 .or_insert_with(FutexHashBucket::new)
-                .chain
-                .append(&mut moved);
+                .merge_chain(&mut moved);
+        }
+        if eligible != count {
+            return Err(SystemError::EINVAL);
         }
         let retired = FutexData::remove_empty_locked(map, key1);
         Ok((woken + count, retired))

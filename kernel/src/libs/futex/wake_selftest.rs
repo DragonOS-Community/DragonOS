@@ -28,7 +28,8 @@ pub(super) fn run() -> Result<bool, SystemError> {
                 target.clone()
             })),
             bitset: if index == 1 || index == 5 { 2 } else { 1 },
-            tid: 0,
+            source_priority: core::sync::atomic::AtomicI32::new(100),
+            requeue_pi: None,
         })
     });
     // A previously notified entry still consumes one selected-waiter slot.
@@ -109,7 +110,8 @@ fn requeue() -> Result<bool, SystemError> {
             waker: pairs[index].1.clone(),
             key: SpinLock::new(Some(source.clone())),
             bitset: u32::MAX,
-            tid: 0,
+            source_priority: core::sync::atomic::AtomicI32::new(100),
+            requeue_pi: None,
         })
     });
     let mut map = HashMap::with_capacity(3);
@@ -234,7 +236,8 @@ fn deferred_selection() -> Result<bool, SystemError> {
             waker: waker.clone(),
             key: SpinLock::new(Some(first.clone())),
             bitset: u32::MAX,
-            tid: 0,
+            source_priority: core::sync::atomic::AtomicI32::new(100),
+            requeue_pi: None,
         }));
     }
     map.insert(first.clone(), bucket);
@@ -247,7 +250,8 @@ fn deferred_selection() -> Result<bool, SystemError> {
         waker: extra_waker.clone(),
         key: SpinLock::new(Some(first.clone())),
         bitset: u32::MAX,
-        tid: 0,
+        source_priority: core::sync::atomic::AtomicI32::new(100),
+        requeue_pi: None,
     });
     let extra_node = WaitNode::try_new(extra.clone())?;
     let mut pending = WaitQueueNodes::new();
@@ -288,7 +292,8 @@ fn requeue_selected_transfer() -> Result<bool, SystemError> {
             waker: pairs[i].1.clone(),
             key: SpinLock::new(Some(source.clone())),
             bitset: u32::MAX,
-            tid: 0,
+            source_priority: core::sync::atomic::AtomicI32::new(100),
+            requeue_pi: None,
         })
     });
     let mut map = HashMap::with_capacity(2);
@@ -345,7 +350,8 @@ fn location_return() -> Result<bool, SystemError> {
             waker: pairs[i].1.clone(),
             key: SpinLock::new(Some(source.clone())),
             bitset: u32::MAX,
-            tid: 0,
+            source_priority: core::sync::atomic::AtomicI32::new(100),
+            requeue_pi: None,
         })
     });
     let mut map = HashMap::with_capacity(2);

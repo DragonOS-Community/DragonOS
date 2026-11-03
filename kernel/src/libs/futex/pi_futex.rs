@@ -316,13 +316,16 @@ impl PiWaiter {
         self.order_priority.load(Ordering::Relaxed)
     }
 }
-struct PreparedPiWait {
-    waiter: Waiter,
-    object: Arc<PiWaiter>,
+struct PiRegistration {
     node: Option<Box<Node<Arc<PiWaiter>>>>,
     task_node: Option<Box<Node<PiTask>>>,
     owner_node: Option<Box<Node<PiTask>>>,
     owned_node: Option<Box<Node<FutexKey>>>,
+}
+struct PreparedPiWait {
+    waiter: Waiter,
+    object: Arc<PiWaiter>,
+    registration: PiRegistration,
     activation: Option<PreparedAbsoluteTimer>,
     timer: Option<Arc<AbsoluteTimer>>,
 }
@@ -330,6 +333,16 @@ impl PreparedPiWait {
     fn try_new(
         task: Arc<ProcessControlBlock>,
         owner: Arc<ProcessControlBlock>,
+        key: &FutexKey,
+        clock: AbsoluteClock,
+        deadline: Option<PosixTimeSpec>,
+    ) -> Result<Self, SystemError> {
+        let mut prepared = Self::for_task(task, key, clock, deadline)?;
+        prepared.registration.owner_node = Some(PiTask::prepare(owner)?);
+        Ok(prepared)
+    }
+    fn for_task(
+        task: Arc<ProcessControlBlock>,
         key: &FutexKey,
         clock: AbsoluteClock,
         deadline: Option<PosixTimeSpec>,
@@ -356,10 +369,12 @@ impl PreparedPiWait {
         Ok(Self {
             waiter,
             object,
-            node,
-            task_node: Some(PiTask::prepare(task)?),
-            owner_node: Some(PiTask::prepare(owner)?),
-            owned_node: Some(Node::try_new(key.clone())?),
+            registration: PiRegistration {
+                node,
+                task_node: Some(PiTask::prepare(task)?),
+                owner_node: None,
+                owned_node: Some(Node::try_new(key.clone())?),
+            },
             activation,
             timer,
         })
@@ -582,10 +597,12 @@ impl Futex {
             }
             let valid_preparation = prepared.as_ref().is_some_and(|prepared| {
                 prepared
+                    .registration
                     .owner_node
                     .as_ref()
                     .is_some_and(|node| Arc::ptr_eq(&node.value().task, &owner))
                     && prepared
+                        .registration
                         .owned_node
                         .as_ref()
                         .is_some_and(|node| node.value() == &key)
@@ -620,30 +637,14 @@ impl Futex {
                 Err(error) => return Err(error),
             }
             let prepared = prepared.as_mut().unwrap();
-            registry
-                .tasks
-                .entry(identity(&owner))
-                .or_insert_with(|| prepared.owner_node.take().unwrap());
-            registry
-                .tasks
-                .entry(identity(&task))
-                .or_insert_with(|| prepared.task_node.take().unwrap());
-            registry
-                .buckets
-                .entry(key.clone())
-                .or_insert_with(FutexHashBucket::new);
-            if registry.buckets.get(&key).unwrap().pi_owner.is_none() {
-                registry.move_owner(&key, Some(owner.clone()), &mut prepared.owned_node);
-            }
-            registry.task_mut(&task).unwrap().blocked = Some(key.clone());
-            let bucket = registry.buckets.get_mut(&key).unwrap();
-            bucket.pi_refs += 1;
-            prepared
-                .object
-                .order_priority
-                .store(PiWaiter::task_order_priority(&task), Ordering::Relaxed);
-            bucket.pi_waiters.push_node(prepared.node.take().unwrap());
-            refresh_priority_locked(&mut registry, &owner);
+            Self::register_pi_waiter(
+                &mut registry,
+                &key,
+                &owner,
+                &prepared.object,
+                &mut prepared.registration,
+                false,
+            );
             if let Some(activation) = prepared.activation.take() {
                 activation.activate();
             }
@@ -651,13 +652,62 @@ impl Futex {
             return Self::wait_pi_registered(uaddr, &key, prepared);
         }
     }
+    // Capacity and user-word validation precede this allocation-free graph
+    // publication. Direct LOCK_PI and proxy requeue share the same ownership.
+    fn register_pi_waiter(
+        registry: &mut FutexRegistry,
+        key: &FutexKey,
+        owner: &Arc<ProcessControlBlock>,
+        object: &Arc<PiWaiter>,
+        prepared: &mut PiRegistration,
+        acquired: bool,
+    ) {
+        registry.tasks.entry(identity(owner)).or_insert_with(|| {
+            if Arc::ptr_eq(owner, &object.task) {
+                prepared.task_node.take().expect("prepared acquiring owner")
+            } else {
+                prepared.owner_node.take().expect("prepared owner")
+            }
+        });
+        registry
+            .tasks
+            .entry(identity(&object.task))
+            .or_insert_with(|| prepared.task_node.take().expect("prepared waiter"));
+        registry
+            .buckets
+            .entry(key.clone())
+            .or_insert_with(FutexHashBucket::new);
+        if registry.buckets.get(key).unwrap().pi_owner.is_none() {
+            registry.move_owner(key, Some(owner.clone()), &mut prepared.owned_node);
+        }
+        if !acquired {
+            registry.task_mut(&object.task).unwrap().blocked = Some(key.clone());
+        }
+        let bucket = registry.buckets.get_mut(key).unwrap();
+        bucket.pi_refs += 1;
+        object.order_priority.store(
+            PiWaiter::task_order_priority(&object.task),
+            Ordering::Relaxed,
+        );
+        if acquired {
+            object.handoff.store(ACQUIRED, Ordering::Release);
+        } else {
+            bucket
+                .pi_waiters
+                .push_node(prepared.node.take().expect("prepared waiter link"));
+        }
+        refresh_priority_locked(registry, owner);
+    }
     fn wait_pi_registered(
         uaddr: VirtAddr,
         key: &FutexKey,
         prepared: &PreparedPiWait,
     ) -> Result<usize, SystemError> {
         loop {
-            let waited = if prepared.object.handoff.load(Ordering::Acquire) == PENDING {
+            let waited = if prepared.object.handoff.load(Ordering::Acquire) == PENDING
+                && !prepared.timer.as_ref().is_some_and(|timer| timer.fired())
+                && !ProcessManager::current_pcb().has_pending_signal()
+            {
                 prepared.waiter.wait(true)
             } else {
                 Ok(())
@@ -810,3 +860,7 @@ impl Futex {
         }
     }
 }
+
+#[path = "requeue_pi.rs"]
+mod requeue_pi;
+pub(super) use requeue_pi::RequeuePiWaiter;

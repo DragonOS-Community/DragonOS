@@ -89,22 +89,26 @@ pub(super) fn run() -> Result<bool, SystemError> {
             .map_err(|_| SystemError::ENOMEM)?;
         let published = {
             let _scope = denial::Scope::enter(true);
-            graph
-                .tasks
-                .insert(identity(&owner), prepared.owner_node.take().unwrap());
-            graph
-                .tasks
-                .insert(identity(&task), prepared.task_node.take().unwrap());
+            graph.tasks.insert(
+                identity(&owner),
+                prepared.registration.owner_node.take().unwrap(),
+            );
+            graph.tasks.insert(
+                identity(&task),
+                prepared.registration.task_node.take().unwrap(),
+            );
             let mut bucket = super::super::futex::FutexHashBucket::new();
             bucket.pi_owner = Some(owner.clone());
             bucket.pi_refs = 1;
-            bucket.pi_waiters.push_node(prepared.node.take().unwrap());
+            bucket
+                .pi_waiters
+                .push_node(prepared.registration.node.take().unwrap());
             graph.buckets.insert(key.clone(), bucket);
             graph
                 .task_mut(&owner)
                 .unwrap()
                 .owned
-                .push_node(prepared.owned_node.take().unwrap());
+                .push_node(prepared.registration.owned_node.take().unwrap());
             graph.task_mut(&task).unwrap().blocked = Some(key.clone());
             prepared.activation.take().unwrap().activate();
             let published = graph

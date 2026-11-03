@@ -252,8 +252,11 @@ pub(super) fn do_futex(
         FutexArg::FUTEX_TRYLOCK_PI => {
             return Futex::futex_trylock_pi(uaddr, flags);
         }
-        FutexArg::FUTEX_WAIT_REQUEUE_PI | FutexArg::FUTEX_CMP_REQUEUE_PI => {
-            Err(SystemError::ENOSYS)
+        FutexArg::FUTEX_WAIT_REQUEUE_PI => {
+            Futex::futex_wait_requeue_pi(uaddr, flags, val, timeout, uaddr2)
+        }
+        FutexArg::FUTEX_CMP_REQUEUE_PI => {
+            Futex::futex_cmp_requeue_pi(uaddr, flags, uaddr2, val as i32, val2 as i32, val3)
         }
         _ => {
             return Err(SystemError::ENOSYS);

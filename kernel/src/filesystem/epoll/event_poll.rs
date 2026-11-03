@@ -637,7 +637,7 @@ impl EventPoll {
                 {
                     // 清理 waker（仅需 SpinLock）
                     let rs = rs_arc.lock_irqsave();
-                    rs.epoll_wq.remove_waker(&waker);
+                    rs.epoll_wq.remove_waker(waker);
                     available = Self::ready_state_has_events(&rs);
                 }
 

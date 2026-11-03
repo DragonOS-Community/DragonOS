@@ -48,10 +48,10 @@ pub fn do_linkat(
 
     // AT_EMPTY_PATH 需要调用者具有 CAP_DAC_READ_SEARCH 能力
     // 参考 Linux: "To use null names we require CAP_DAC_READ_SEARCH"
-    if flags.contains(AtFlags::AT_EMPTY_PATH) {
-        if !ProcessManager::current_cred().has_capability(CAPFlags::CAP_DAC_READ_SEARCH) {
-            return Err(SystemError::ENOENT);
-        }
+    if flags.contains(AtFlags::AT_EMPTY_PATH)
+        && !ProcessManager::current_cred().has_capability(CAPFlags::CAP_DAC_READ_SEARCH)
+    {
+        return Err(SystemError::ENOENT);
     }
 
     let follow_last_symlink = flags.contains(AtFlags::AT_SYMLINK_FOLLOW);

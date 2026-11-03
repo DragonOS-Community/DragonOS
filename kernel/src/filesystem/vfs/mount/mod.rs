@@ -6861,7 +6861,7 @@ impl IndexNode for MountFSInode {
             .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
             .clone();
         let context = super::permission::InodeOpContext {
-            cred: ProcessManager::initialized().then(|| ProcessManager::current_cred()),
+            cred: ProcessManager::initialized().then(ProcessManager::current_cred),
             idmap,
             fs_userns: self.mount_fs.super_block_state.owner_user_ns().clone(),
         };

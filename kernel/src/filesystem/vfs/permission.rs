@@ -55,7 +55,7 @@ pub struct InodeOpContext {
 impl InodeOpContext {
     pub fn legacy() -> Self {
         Self {
-            cred: ProcessManager::initialized().then(|| ProcessManager::current_cred()),
+            cred: ProcessManager::initialized().then(ProcessManager::current_cred),
             idmap: None,
             fs_userns: INIT_USER_NAMESPACE.clone(),
         }

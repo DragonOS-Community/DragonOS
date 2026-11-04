@@ -54,7 +54,7 @@ impl KernelBuffer {
     /// Prepare local scratch at a resource-lock-free task boundary. Only the
     /// unpublished allocation is retried; callers must perform I/O afterwards.
     pub(crate) fn new_zeroed_recovering(len: usize) -> Result<Self, SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
         loop {
             match Self::try_new_zeroed(len) {
                 Ok(buffer) => return Ok(buffer),
@@ -188,6 +188,11 @@ impl KernelBuffer {
         // high-order pressure and rounding waste. Otherwise retain the heap
         // backend for all sizes, with the same admission and no-retry policy.
         if heap_supported && (len <= 2 * MMArch::PAGE_SIZE || !virtual_supported) {
+            if !crate::mm::allocator::kernel_allocator::KernelAllocator::supports_physical_layout(
+                layout,
+            ) {
+                return Err(SystemError::ENOMEM.into());
+            }
             let charge = owner.try_charge_allocation(KernelByteKind::SlabUnreclaimable, layout)?;
             #[cfg(feature = "mm_selftest")]
             let pointer = if fail_heap {
@@ -210,7 +215,7 @@ impl KernelBuffer {
             // above is propagated, not converted into a fallback opportunity.
             drop(charge);
             if len <= MMArch::PAGE_SIZE || !virtual_supported {
-                return Err(SystemError::ENOMEM.into());
+                return Err(MemoryAllocationError::Physical);
             }
         }
         #[cfg(feature = "mm_selftest")]

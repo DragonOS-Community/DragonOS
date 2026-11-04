@@ -90,11 +90,8 @@ impl CpuBuffer {
                 #[cfg(feature = "mm_selftest")]
                 retired: None,
             })?;
-            let buffer =
-                KernelBuffer::try_new_zeroed_virtual(capacity).map_err(|error| match error {
-                    super::allocation::MemoryAllocationError::System(error) => error,
-                    super::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-                })?;
+            let buffer = KernelBuffer::try_new_zeroed_virtual(capacity)
+                .map_err(|error| error.into_errno())?;
             node.value_mut().buffer = Some(buffer);
             return Ok(Self {
                 backend: Backend::Mapped(Some(node)),

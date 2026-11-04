@@ -434,7 +434,7 @@ fn fault_in_remote_page(
     force: bool,
 ) -> Result<PinnedRemotePage, SystemError> {
     let mut tried = false;
-    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         let creator =
             crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());
@@ -574,6 +574,18 @@ fn fault_in_remote_page(
                     continue;
                 }
                 Err(crate::mm::allocation::MemoryAllocationError::System(error)) => Err(error),
+                Err(error @ crate::mm::allocation::MemoryAllocationError::Physical) => {
+                    if let Err(error) = error.recover(&mut charge_recovery) {
+                        crate::mm::fault::account_fault_recovery_failure(
+                            &data_account,
+                            retry_flags,
+                            error.clone(),
+                        );
+                        return Err(error);
+                    }
+                    tried = true;
+                    continue;
+                }
                 Ok(()) => Ok(()),
             };
             if let Err(error) = result {

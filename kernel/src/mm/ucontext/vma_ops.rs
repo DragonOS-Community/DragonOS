@@ -725,10 +725,7 @@ impl InnerAddressSpace {
                             notifications: rollback_notifications,
                         });
                     }
-                    terminal_error = Some(match err {
-                        MemoryAllocationError::System(err) => err,
-                        MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-                    });
+                    terminal_error = Some(err.into_errno());
                     break;
                 }
             };

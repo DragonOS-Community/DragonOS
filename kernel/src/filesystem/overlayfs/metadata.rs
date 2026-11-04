@@ -349,10 +349,7 @@ impl XattrBuffer {
 /// backing errno, and report rejected scratch admission without reclaim/OOM
 /// under the caller's resource locks or overridden backing credentials.
 pub(super) fn xattr_read_error(error: MemoryAllocationError) -> SystemError {
-    match error {
-        MemoryAllocationError::System(error) => error,
-        MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-    }
+    error.into_errno()
 }
 
 fn for_each_xattr_name<E: From<SystemError>>(

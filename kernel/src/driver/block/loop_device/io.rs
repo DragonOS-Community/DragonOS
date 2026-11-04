@@ -168,8 +168,19 @@ impl LoopDevice {
         })
         .map_err(Self::backing_error)?;
         result.sync_result = Self::normalize_backing_sync_result(result.sync_result);
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
         while let Err(error) = core::mem::replace(&mut result.sync_result, Ok(())) {
+            if matches!(error, MemoryAllocationError::Physical) {
+                // The loop pin/gate and NOIO scope still belong to our caller.
+                // Let its lock-free boundary finish the retained sync range;
+                // never consume the deferred completions or replay payload.
+                result.sync_result = Err(if result.sync_range.is_some() {
+                    error
+                } else {
+                    error.into_errno().into()
+                });
+                break;
+            }
             // Payload is committed: recover only its retained exact sync range.
             if let Err(error) = error.recover(&mut recovery) {
                 result.sync_result = Err(error.into());
@@ -254,7 +265,12 @@ impl LoopDevice {
                 Ok(result) => result,
                 // This is a data error, not a recoverable sync failure. No
                 // invented sync_range may replay an unsubmitted remainder.
-                Err(error) if done != 0 => return Ok(DelegatedWriteResult::new(done, Err(error))),
+                Err(error) if done != 0 => {
+                    return Ok(DelegatedWriteResult::new(
+                        done,
+                        Err(error.into_errno().into()),
+                    ))
+                }
                 Err(error) => return Err(error),
             };
             let expected = if full { count } else { LBA_SIZE };
@@ -317,13 +333,33 @@ impl LoopDevice {
     fn recover_backing_io<T>(
         mut attempt: impl FnMut() -> Result<T, MemoryAllocationError>,
     ) -> Result<T, MemoryAllocationError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
         loop {
             match attempt() {
                 Ok(value) => return Ok(value),
+                // Every caller retains loop admission and a NOIO scope. A
+                // physical failure must escape with its provenance intact so
+                // the outer transaction can reclaim after releasing them.
+                Err(error @ MemoryAllocationError::Physical) => return Err(error),
                 Err(error) => error.recover(&mut recovery)?,
             }
         }
+    }
+
+    #[cfg(feature = "mm_selftest")]
+    pub(crate) fn physical_boundary_selftest() -> bool {
+        let _noio = crate::cgroup::memory::io::MemoryIoScope::enter_noio();
+        let mut attempts = 0;
+        let result: Result<(), MemoryAllocationError> = Self::recover_backing_io(|| {
+            attempts += 1;
+            Err(MemoryAllocationError::Physical)
+        });
+        attempts == 1
+            && matches!(result, Err(MemoryAllocationError::Physical))
+            && matches!(
+                Self::normalize_backing_sync_result(Err(MemoryAllocationError::Physical)),
+                Err(MemoryAllocationError::Physical)
+            )
     }
 
     fn normalize_backing_sync_result(
@@ -333,7 +369,9 @@ impl LoopDevice {
         // it to BLK_STS_IOERR. No backing flush error is a successful flush.
         match result {
             Ok(()) => Ok(()),
-            Err(error @ MemoryAllocationError::Charge(_)) => Err(error),
+            Err(error @ (MemoryAllocationError::Charge(_) | MemoryAllocationError::Physical)) => {
+                Err(error)
+            }
             Err(MemoryAllocationError::System(_)) => Err(SystemError::EIO.into()),
         }
     }
@@ -361,14 +399,16 @@ impl LoopDevice {
                 | SystemError::ETIME => error.into(),
                 _ => SystemError::EIO.into(),
             },
-            error @ MemoryAllocationError::Charge(_) => error,
+            error @ (MemoryAllocationError::Charge(_) | MemoryAllocationError::Physical) => error,
         }
     }
 
     pub(super) fn legacy_io_terminal(error: MemoryAllocationError) -> SystemError {
         match error {
             MemoryAllocationError::System(error) => error,
-            MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
+            MemoryAllocationError::Charge(_) | MemoryAllocationError::Physical => {
+                SystemError::ENOMEM
+            }
         }
     }
 }

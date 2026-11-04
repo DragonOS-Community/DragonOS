@@ -422,7 +422,7 @@ pub(crate) fn do_sys_openat2(dirfd: i32, path: &str, how: OpenHow) -> Result<usi
     // File storage is admitted before create/preopen. Its immutable receipt
     // then follows this exact pathname result; an open retry never redoes
     // lookup or O_EXCL creation.
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
     let storage = loop {
         match super::file::PreparedFile::try_new() {
             Ok(storage) => break storage,
@@ -870,7 +870,7 @@ pub fn do_open_execat_with_flags(
     super::permission::check_inode_permission(&inode, &metadata, PermissionMask::MAY_EXEC)?;
 
     // 创建File对象，使用O_RDONLY | O_CLOEXEC
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
     let file = loop {
         match File::new(inode.clone(), FileFlags::O_RDONLY | FileFlags::O_CLOEXEC) {
             Ok(file) => break file,

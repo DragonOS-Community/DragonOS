@@ -297,7 +297,7 @@ impl EventPoll {
             if !dst_file.supports_poll() {
                 return Err(SystemError::ENOSYS);
             }
-            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
             loop {
                 let (ready_state, poll_epitems) = {
                     let guard = if nonblock {

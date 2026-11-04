@@ -747,7 +747,7 @@ impl Socket for UnixStreamSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let addr = UnixEndpoint::try_from(endpoint)?;
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let candidate = addr.clone();
             let result = {

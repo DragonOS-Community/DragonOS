@@ -202,7 +202,7 @@ pub struct UdpSocketData {
 impl UdpSocket {
     pub fn new(nonblock: bool, version: IpVersion) -> Result<Arc<Self>, SystemError> {
         let netns = ProcessManager::current_netns();
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let task = ProcessManager::current_pcb();
             let account = crate::cgroup::memory::account_for_task(&task);
@@ -445,7 +445,7 @@ impl UdpSocket {
         &self,
         iface: Arc<dyn Iface>,
     ) -> Result<super::common::registration::PreparedIfaceSocket, SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             match super::common::registration::PreparedIfaceSocket::try_new(
@@ -747,7 +747,7 @@ impl UdpSocket {
         if limit > 1 << 30 {
             return Err(SystemError::ENOBUFS);
         }
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let operation = self.resize_lock.lock();
             // IPv4 RX belongs to receive_queue, not the TX-only smoltcp entry.

@@ -102,7 +102,7 @@ fn prefault_user_range_mode(
         };
         let mut current = start_page;
         let mut retried = false;
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         'retry: loop {
             let creator = crate::cgroup::memory::object_for_task(
                 &crate::process::ProcessManager::current_pcb(),
@@ -184,6 +184,19 @@ fn prefault_user_range_mode(
                                         &data_account,
                                         fault_flags,
                                     )?;
+                                    continue 'retry;
+                                }
+                                Err(
+                                    error @ crate::mm::allocation::MemoryAllocationError::Physical,
+                                ) => {
+                                    if let Err(error) = error.recover(&mut charge_recovery) {
+                                        crate::mm::fault::account_fault_recovery_failure(
+                                            &data_account,
+                                            fault_flags,
+                                            error.clone(),
+                                        );
+                                        return Err(error);
+                                    }
                                     continue 'retry;
                                 }
                                 Err(crate::mm::allocation::MemoryAllocationError::System(

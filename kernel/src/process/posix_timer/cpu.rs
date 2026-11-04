@@ -28,7 +28,7 @@ impl CpuBackend {
         } else {
             task.process_signal().cpu_event_domain()
         };
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
         let registration = loop {
             match CpuEventDomain::prepare_registration(&object_for_task(pcb), callback.clone()) {
                 Ok(registration) => break registration,

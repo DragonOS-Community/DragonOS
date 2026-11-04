@@ -255,7 +255,7 @@ impl TcpSocket {
     pub(super) fn prepare_bound_slot(
         &self,
     ) -> Result<crate::net::tcp_bounds::BoundSlotReservation, SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             match self.netns.tcp_stack().reserve_bound_slot(&creator) {
@@ -361,7 +361,7 @@ impl TcpSocket {
 
     pub fn new(nonblock: bool, ver: smoltcp::wire::IpVersion) -> Result<Arc<Self>, SystemError> {
         let netns = ProcessManager::current_netns();
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let task = ProcessManager::current_pcb();
             let account = crate::cgroup::memory::account_for_task(&task);
@@ -471,7 +471,7 @@ impl TcpSocket {
                 Some(inner::Inner::Init(inner::Init::Unbound(_)))
             )
         };
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         while needs_handle() {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             match self.netns.tcp_stack().prepare_socket_capacity(&creator) {
@@ -710,7 +710,7 @@ impl TcpSocket {
     }
 
     fn update_socket_buffer(&self, size: usize, send: bool) -> Result<(), SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             // Domain lookup precedes even the task-only resize mutex.
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());

@@ -21,7 +21,7 @@ pub fn ksys_unshare(flags: CloneFlags) -> Result<(), SystemError> {
     check_unshare_flags(flags)?;
 
     let current_pcb = ProcessManager::current_pcb();
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         let new_cred = unshare_user_cred(flags, &current_pcb)?.map(Cred::new_arc);
         // Retain completed candidates outside the topology barrier, even if

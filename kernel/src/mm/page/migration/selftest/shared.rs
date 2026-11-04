@@ -28,10 +28,8 @@ impl CacheFixture {
             (None, None)
         } else {
             let fs = crate::filesystem::ramfs::RamFS::new();
-            let fixture_error = |error| match error {
-                crate::mm::allocation::MemoryAllocationError::System(error) => error,
-                crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-            };
+            let fixture_error =
+                |error: crate::mm::allocation::MemoryAllocationError| error.into_errno();
             let inode = fs
                 .root_inode()
                 .create(

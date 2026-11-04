@@ -385,7 +385,7 @@ impl ProcessManager {
             .flags
             .contains(CloneFlags::CLONE_PIDFD)
             .then(crate::mm::ucontext::AddressSpace::current);
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             // Each failed unpublished birth releases both stacks and its
             // body before recovery. Never enter copy_process locks to reclaim.

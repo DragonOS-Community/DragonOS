@@ -52,10 +52,9 @@ where
         };
         let confirmed_mask = (((1u16 << confirmed_last) - 1) ^ ((1u16 << first) - 1)) as u8;
         *remaining &= !confirmed_mask;
-        result.sync_result.map_err(|error| match error {
-            MemoryAllocationError::System(error) => error,
-            MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-        })?;
+        result
+            .sync_result
+            .map_err(crate::mm::allocation::MemoryAllocationError::into_errno)?;
         if result.written_len != end - start {
             return Err(SystemError::EIO);
         }
@@ -149,10 +148,9 @@ impl PageCacheBackend for RawBlockBackend {
         // A completed result belongs to the lower owner's exact-sync protocol
         // (loop's write_piece already performs that recovery); never replay it.
         let result = File::recover_io(|| disk.write_payload(offset, bytes, WriteSyncIntent::None))?;
-        result.sync_result.map_err(|error| match error {
-            MemoryAllocationError::System(error) => error,
-            MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-        })?;
+        result
+            .sync_result
+            .map_err(crate::mm::allocation::MemoryAllocationError::into_errno)?;
         Ok(result.written_len)
     }
 

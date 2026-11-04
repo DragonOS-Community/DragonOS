@@ -69,7 +69,7 @@ impl Syscall for SysTruncateHandle {
             }
         }
 
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
         while let Err(error) = vfs_truncate(target.clone(), length) {
             error.recover(&mut recovery)?;
         }

@@ -395,7 +395,7 @@ impl Futex {
         );
         let current_address_space = AddressSpace::current()?;
         let mut flags = FaultFlags::FAULT_FLAG_WRITE;
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
 
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
@@ -457,6 +457,17 @@ impl Futex {
                                 &data_account,
                                 flags,
                             )?;
+                            continue;
+                        }
+                        Err(error @ crate::mm::allocation::MemoryAllocationError::Physical) => {
+                            if let Err(error) = error.recover(&mut charge_recovery) {
+                                crate::mm::fault::account_fault_recovery_failure(
+                                    &data_account,
+                                    flags,
+                                    error.clone(),
+                                );
+                                return Err(error);
+                            }
                             continue;
                         }
                         Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {

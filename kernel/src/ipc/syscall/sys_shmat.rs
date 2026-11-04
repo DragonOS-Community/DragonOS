@@ -79,7 +79,7 @@ pub(super) fn do_kernel_shmat(
     let readonly = shmflg.contains(ShmFlags::SHM_RDONLY);
     // attach_guard pins the exact segment; attach_begin's manager guard was
     // released above. Retrying private File birth must not relookup a reused ID.
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     let sysv_attach = loop {
         match attach_guard.create_attach(readonly) {
             Ok(attach) => break attach,

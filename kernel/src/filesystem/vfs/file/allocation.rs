@@ -17,7 +17,7 @@ impl PreparedFile {
     /// Guardless storage-only recovery. Call before instance reservations,
     /// inode open side effects and publication; this does not open a File.
     pub(crate) fn new_recovering() -> Result<Self, system_error::SystemError> {
-        let mut state = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+        let mut state = crate::mm::allocation::AllocationRecoveryState::default();
         loop {
             match Self::try_new() {
                 Ok(storage) => return Ok(storage),

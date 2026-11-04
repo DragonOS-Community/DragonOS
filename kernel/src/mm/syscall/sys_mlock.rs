@@ -64,7 +64,7 @@ pub(super) fn do_mlock(
 
     let vm = AddressSpace::current()?;
     let region = VirtRegion::new(start, len);
-    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         let creator =
             crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());

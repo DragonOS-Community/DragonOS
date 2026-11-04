@@ -55,6 +55,13 @@ pub(super) fn large_allocation_bytes() -> u64 {
 }
 
 impl KernelAllocator {
+    /// Structural limit of the direct backend, independent of current pressure.
+    pub(crate) fn supports_physical_layout(layout: Layout) -> bool {
+        !super::footprint::uses_buddy(layout)
+            || super::footprint::buddy_frame_count(layout)
+                <= (1usize << (super::buddy::BUDDY_ORDER_COUNT - 1))
+    }
+
     unsafe fn alloc_in_buddy(
         &self,
         layout: Layout,

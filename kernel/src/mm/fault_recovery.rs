@@ -1,4 +1,5 @@
-//! Physical allocation recovery at the resource-lock-free user fault boundary.
+//! Shared physical allocation reclaim at resource-lock-free transaction boundaries.
+//! User faults own their OOM handoff; fallible operations own a fixed total deadline.
 //! Charge/memcg failures retain their separate policy and limiting account.
 
 use core::sync::atomic::{AtomicUsize, Ordering};

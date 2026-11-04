@@ -154,7 +154,7 @@ pub(super) fn do_socketpair(
     ) {
         return Err(SystemError::ESOCKTNOSUPPORT);
     }
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     let (prepared_a, prepared_b) = loop {
         let a = match crate::filesystem::vfs::file::PreparedFile::try_new() {
             Ok(storage) => storage,

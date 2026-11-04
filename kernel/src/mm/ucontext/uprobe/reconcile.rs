@@ -538,7 +538,8 @@ fn uprobe_register_best_effort_once(
             crate::mm::allocation::MemoryAllocationError::System(error),
         )) => Err(error),
         Err(LockedRegisterError::Allocation(
-            crate::mm::allocation::MemoryAllocationError::Charge(_),
+            crate::mm::allocation::MemoryAllocationError::Charge(_)
+            | crate::mm::allocation::MemoryAllocationError::Physical,
         )) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
     }
 }

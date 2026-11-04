@@ -89,7 +89,7 @@ impl Syscall for SysIoctlHandle {
             }
             _ => {
                 // 其他命令转发给inode处理
-                let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+                let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
                 loop {
                     // The single attempt owns the private guard. It is gone
                     // before recovery, and drivers admit resources before

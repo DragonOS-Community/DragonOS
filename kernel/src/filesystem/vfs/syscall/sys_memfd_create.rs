@@ -62,7 +62,7 @@ impl Syscall for SysMemfdCreate {
             return Err(SystemError::ENOSYS);
         }
 
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let file = loop {
             let mut attempt_name = Vec::new();
             attempt_name

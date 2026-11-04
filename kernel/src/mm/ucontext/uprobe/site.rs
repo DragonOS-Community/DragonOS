@@ -541,7 +541,7 @@ pub(super) fn uprobe_register(
     consumer: &Arc<UprobeConsumer>,
     expected_mapping: &ExpectedProbeMapping,
 ) -> Result<Option<UprobeHandle>, SystemError> {
-    let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
     let result = loop {
         let creator =
             crate::cgroup::memory::object_for_task(&crate::process::ProcessManager::current_pcb());

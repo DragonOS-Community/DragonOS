@@ -456,29 +456,13 @@ impl UnixEndpoint {
                     path.trim(),
                 )?;
                 // All connect_in callers resolve before taking socket/backend
-                // guards. Lookup has not published the connection, so quota
+                // guards. Lookup has not published the connection, so allocation
                 // recovery may retry this read-only resolution stage only.
-                let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+                let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
                 let inode = loop {
                     match inode_begin.lookup_follow_symlink(&path, VFS_MAX_FOLLOW_SYMLINK_TIMES) {
                         Ok(inode) => break inode,
-                        Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
-                            return Err(error);
-                        }
-                        Err(crate::mm::allocation::MemoryAllocationError::Charge(failure)) => {
-                            use crate::cgroup::memory::runtime::{
-                                recover_charge, MemoryAllocPolicy, RecoveryDecision,
-                            };
-                            match recover_charge(
-                                &failure,
-                                MemoryAllocPolicy::ReclaimThenOom,
-                                0,
-                                &mut recovery,
-                            )? {
-                                RecoveryDecision::RetryOperation => continue,
-                                RecoveryDecision::Exhausted => return Err(SystemError::ENOMEM),
-                            }
-                        }
+                        Err(error) => error.recover(&mut recovery)?,
                     }
                 };
                 if inode.metadata()?.file_type != FileType::Socket {

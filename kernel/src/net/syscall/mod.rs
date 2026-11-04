@@ -26,7 +26,7 @@ pub(super) fn reserve_socket_descriptors<const N: usize>(
     task: &alloc::sync::Arc<crate::process::ProcessControlBlock>,
     cloexec: bool,
 ) -> Result<crate::filesystem::vfs::fdtable::FdReservation<N>, system_error::SystemError> {
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         let creator = crate::cgroup::memory::object_for_task(task);
         match task
@@ -43,7 +43,7 @@ pub(super) fn reserve_socket_descriptors<const N: usize>(
 /// socket pair. Descriptor reservations are owners, not held fd-table locks.
 pub(super) fn prepare_socket_file(
 ) -> Result<crate::filesystem::vfs::file::PreparedFile, system_error::SystemError> {
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         match crate::filesystem::vfs::file::PreparedFile::try_new() {
             Ok(prepared) => return Ok(prepared),
@@ -61,7 +61,7 @@ pub(super) fn finish_socket_file(
     flags: crate::filesystem::vfs::file::FileFlags,
     mut prepared: crate::filesystem::vfs::file::PreparedFile,
 ) -> Result<crate::filesystem::vfs::file::File, system_error::SystemError> {
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         let result =
             crate::filesystem::vfs::file::File::new_socket_prepared(inode.clone(), flags, prepared);

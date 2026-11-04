@@ -181,7 +181,10 @@ pub(crate) fn generic_fadvise(
                 Ok(_) => file.set_ra_state(ra_state)?,
                 // Linux WILLNEED is advisory: failure to prefetch does not
                 // force OOM or make the subsequent required read succeed.
-                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => {}
+                Err(
+                    crate::mm::allocation::MemoryAllocationError::Charge(_)
+                    | crate::mm::allocation::MemoryAllocationError::Physical,
+                ) => {}
                 Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
                     return Err(error)
                 }

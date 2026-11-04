@@ -346,7 +346,7 @@ impl TcpSocket {
     }
 
     pub fn do_listen(&self, backlog: usize) -> Result<(), SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let unbound = matches!(
                 self.inner.read().as_ref(),
@@ -476,7 +476,7 @@ impl TcpSocket {
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
         // Poll outside `inner`: protocol notification may acquire it again.
         self.netns().tcp_stack().poll();
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let (handle, identity) = {
                 let reader = self.inner.read();

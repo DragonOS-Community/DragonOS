@@ -214,7 +214,7 @@ fn run_child_prepare(
     if let Some(cred) = cred {
         child.install_cred(cred);
     }
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     let fd_table = loop {
         // No PCB basic-info, fd-table, or helper-result guard spans admission
         // or recovery. Preserve the old table until the private one is ready.

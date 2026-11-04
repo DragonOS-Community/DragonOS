@@ -95,6 +95,17 @@ impl ReconfigureTarget {
 }
 
 impl FsContextState {
+    fn creation_failed(&mut self, error: &crate::mm::allocation::MemoryAllocationError) {
+        // Typed allocation failures come only from private mount-data
+        // preparation. Backend construction returns terminal System errors.
+        // The caller releases this state guard before recovering and retrying.
+        self.phase = if error.is_recoverable() {
+            Phase::CreateParams
+        } else {
+            Phase::Failed
+        };
+    }
+
     fn new(phase: Phase) -> Self {
         Self {
             phase,
@@ -294,6 +305,82 @@ pub fn configure_fs_context(fd: i32, cmd: FsConfigCommand) -> Result<(), SystemE
     File::recover_io(|| try_configure_fs_context(&context, &cmd))
 }
 
+#[cfg(feature = "mm_selftest")]
+pub(crate) fn run_creation_retry_selftest() -> Result<Option<&'static str>, SystemError> {
+    use crate::{
+        cgroup::memory::{MemoryAccount, MemoryKind, MemoryPolicy},
+        mm::allocation::MemoryAllocationError,
+    };
+
+    let root = MemoryAccount::new(0x6673636f6e666966, None)?;
+    let account = MemoryAccount::new(0x6673636f6e666967, Some(root.clone()))?;
+    account.set_policy(MemoryPolicy {
+        max: Some(0),
+        ..Default::default()
+    });
+    let charge_failure = match account.try_charge(MemoryKind::Anon, 1) {
+        Err(error) => error,
+        Ok(_) => return Ok(Some("charge_fixture")),
+    };
+    account.set_policy(MemoryPolicy::default());
+
+    for (index, error) in [
+        MemoryAllocationError::Charge(charge_failure),
+        MemoryAllocationError::Physical,
+        MemoryAllocationError::System(SystemError::ENOMEM),
+        MemoryAllocationError::System(SystemError::EIO),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = ["charge", "physical", "system_enomem", "system_eio"][index];
+        let context = Arc::new(FsContext {
+            fs_type: "tmpfs".into(),
+            creation: FsCreationContext::current(),
+            state: Mutex::new(FsContextState::new(Phase::CreateParams)),
+        });
+        try_configure_fs_context(
+            &context,
+            &FsConfigCommand::SetString("mode".into(), "0700".into()),
+        )
+        .map_err(MemoryAllocationError::into_errno)?;
+        let prepared = context.state.lock().prepared.clone();
+        {
+            let mut state = context.state.lock();
+            // Inject the failure at the private preparation boundary, before
+            // any filesystem is published. The next CREATE uses the real maker.
+            state.phase = Phase::Creating;
+            state.creation_failed(&error);
+            if state.fs.is_some()
+                || state.fs_active.is_some()
+                || state.options.len() != 1
+                || !state
+                    .prepared
+                    .as_ref()
+                    .zip(prepared.as_ref())
+                    .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+            {
+                return Ok(Some(case));
+            }
+        }
+        let retry = try_configure_fs_context(&context, &FsConfigCommand::Create);
+        let state = context.state.lock();
+        if index < 2 {
+            if retry.is_err() || state.phase != Phase::AwaitingMount || state.fs.is_none() {
+                return Ok(Some(case));
+            }
+        } else if !matches!(
+            retry,
+            Err(MemoryAllocationError::System(SystemError::EBUSY))
+        ) || state.phase != Phase::Failed
+            || state.fs.is_some()
+        {
+            return Ok(Some(case));
+        }
+    }
+    Ok((account.current_pages() != 0 || root.current_pages() != 0).then_some("account_cleanup"))
+}
+
 fn copy_parameter(value: &str) -> Result<String, SystemError> {
     let mut copy = String::new();
     copy.try_reserve_exact(value.len())
@@ -438,17 +525,7 @@ fn try_configure_fs_context(
                     Ok(())
                 }
                 Err(error) => {
-                    // A charge failure comes only from private mount-data
-                    // preparation, before the System-only backend builder.
-                    // Let the outer recover after this state guard unwinds.
-                    state.phase = if matches!(
-                        &error,
-                        crate::mm::allocation::MemoryAllocationError::Charge(_)
-                    ) {
-                        Phase::CreateParams
-                    } else {
-                        Phase::Failed
-                    };
+                    state.creation_failed(&error);
                     Err(error)
                 }
             }

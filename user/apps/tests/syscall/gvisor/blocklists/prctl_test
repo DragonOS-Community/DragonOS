@@ -1,4 +1,2 @@
-# 缺少 SYS_PTRACE
-PrctlTest.PDeathSig
 # 缺少测试文件
 PrctlTest.OrphansReparentedToSubreaper

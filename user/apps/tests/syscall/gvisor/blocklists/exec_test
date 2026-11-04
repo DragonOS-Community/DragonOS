@@ -1,21 +1,2 @@
-# 需要rootfs支持符号链接
-ExecTest.InterpreterScript
-ExecTest.InterpreterScriptArgSplit
-ExecTest.InterpreterScriptArgvZero
-ExecTest.InterpreterScriptArgvZeroRelative
-ExecTest.InterpreterScriptArgvZeroAdded
-ExecTest.InterpreterScriptArgNUL
-ExecTest.InterpreterScriptArgWhitespace
-
-# 需要支持ptrace
-ExecTest.Setpgid
-
-# 需要/bin/echo,而fat不支持符号链接
-ExecTest.ExecFn
+# 解释器脚本的 stderr 透传仍与 Linux 不一致
 ExecTest.ExecNameScript
-ExecTest.SymlinkLimitRefreshedForInterpreter
-ExecveatTest.SymlinkNoFollowIgnoreSymlinkAncestor
-ExecveatTest.SymlinkNoFollowWithNormalFile
-
-# 需要set priority
-GetpriorityTest.ExecveMaintainsPriority

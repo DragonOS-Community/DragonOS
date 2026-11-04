@@ -6,7 +6,7 @@ use system_error::SystemError;
 
 use crate::filesystem::vfs::vcore::generate_inode_id;
 use crate::net::socket::endpoint::Endpoint;
-use crate::net::socket::Socket;
+use crate::net::socket::{Socket, SocketInodeMetadata};
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -108,6 +108,7 @@ impl RawSocket {
                     Err(error) => error.recover(&mut recovery)?,
                 }
             };
+        let inode_id = generate_inode_id();
         sock.data.init(
             body.init(RawSocketData {
                 memory,
@@ -120,7 +121,8 @@ impl RawSocket {
                 options: crate::libs::rwsem::RwSem::new(options),
                 nonblock: core::sync::atomic::AtomicBool::new(nonblock),
                 wait_queue: crate::libs::wait_queue::WaitQueue::default(),
-                inode_id: generate_inode_id(),
+                inode_id,
+                inode_metadata: SocketInodeMetadata::new(inode_id),
                 open_files: core::sync::atomic::AtomicUsize::new(0),
                 fsnotify_watches: core::sync::atomic::AtomicUsize::new(0),
                 self_ref: me.clone(),

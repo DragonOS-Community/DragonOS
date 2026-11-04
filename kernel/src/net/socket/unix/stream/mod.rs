@@ -119,6 +119,7 @@ pub struct UnixStreamSocket {
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
+    inode_metadata: SocketInodeMetadata,
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
     netns: Arc<NetNamespace>,
@@ -169,10 +170,12 @@ impl UnixStreamSocket {
         is_seqpacket: bool,
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
+        let inode_id = generate_inode_id();
         Arc::new_cyclic(|self_weak| Self {
             inner: RwSem::new(Some(Inner::Init(init))),
             wait_queue: Arc::new(WaitQueue::default()),
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             netns,
@@ -202,10 +205,12 @@ impl UnixStreamSocket {
         is_seqpacket: bool,
         netns: Arc<NetNamespace>,
     ) -> Arc<Self> {
+        let inode_id = generate_inode_id();
         Arc::new_cyclic(|self_weak| Self {
             inner: RwSem::new(Some(Inner::Connected(connected))),
             wait_queue: Arc::new(WaitQueue::default()),
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             netns,
@@ -747,15 +752,18 @@ impl Socket for UnixStreamSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let addr = UnixEndpoint::try_from(endpoint)?;
+        let socket_mode = self.inode_metadata.mode();
         let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let candidate = addr.clone();
             let result = {
                 let mut writer = self.inner.write();
                 match writer.as_mut().expect("UnixStreamSocket inner is None") {
-                    Inner::Init(init) => init.bind(candidate, &self.netns, self.unix_socket_type()),
+                    Inner::Init(init) => {
+                        init.bind(candidate, &self.netns, self.unix_socket_type(), socket_mode)
+                    }
                     Inner::Connected(connected) => {
-                        connected.bind(candidate, &self.netns, self.unix_socket_type())
+                        connected.bind(candidate, &self.netns, self.unix_socket_type(), socket_mode)
                     }
                     Inner::Listener(_) => candidate.bind_unnamed().map_err(Into::into),
                 }
@@ -1801,5 +1809,9 @@ impl Socket for UnixStreamSocket {
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 }

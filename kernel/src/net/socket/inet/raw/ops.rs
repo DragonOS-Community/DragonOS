@@ -5,7 +5,7 @@ use system_error::SystemError;
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::net::socket::endpoint::Endpoint;
-use crate::net::socket::{PMSG, PSOL};
+use crate::net::socket::{SocketInodeMetadata, PMSG, PSOL};
 
 use super::inner::RawInner;
 use super::{InetSocket, RawSocket};
@@ -296,6 +296,10 @@ impl crate::net::socket::Socket for RawSocket {
 
     fn socket_inode_id(&self) -> crate::filesystem::vfs::InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 
     fn option(&self, level: PSOL, name: usize, value: &mut [u8]) -> Result<usize, SystemError> {

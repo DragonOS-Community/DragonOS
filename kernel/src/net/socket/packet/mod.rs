@@ -21,7 +21,7 @@ use crate::filesystem::vfs::{fasync::FAsyncItems, vcore::generate_inode_id, Inod
 use crate::libs::{mutex::Mutex, rwsem::RwSem, wait_queue::WaitQueue};
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::endpoint::Endpoint;
-use crate::net::socket::{Socket, PMSG, PSOCK, PSOL};
+use crate::net::socket::{Socket, SocketInodeMetadata, PMSG, PSOCK, PSOL};
 use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -115,6 +115,7 @@ pub struct PacketSocket {
     pub(super) wait_queue: WaitQueue,
     memberships: Mutex<mreq::PacketMembershipState>,
     inode_id: InodeId,
+    inode_metadata: SocketInodeMetadata,
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
     pub(super) self_ref: Weak<Self>,
@@ -151,6 +152,7 @@ impl PacketSocket {
             _ => return Err(SystemError::ESOCKTNOSUPPORT),
         };
         let netns = ProcessManager::current_netns();
+        let inode_id = generate_inode_id();
         let socket = Arc::new_cyclic(|me| Self {
             sock_type,
             binding: binding::PacketBinding::new(0, protocol),
@@ -168,7 +170,8 @@ impl PacketSocket {
             recv_timeout_ticks: AtomicU64::new(crate::net::socket::common::INFINITE_TIMEOUT_TICKS),
             wait_queue: WaitQueue::default(),
             memberships: Mutex::new(mreq::PacketMembershipState::default()),
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             self_ref: me.clone(),
@@ -402,6 +405,9 @@ impl Socket for PacketSocket {
     }
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
     fn option(&self, l: PSOL, n: usize, v: &mut [u8]) -> Result<usize, SystemError> {
         self.packet_option(l, n, v)

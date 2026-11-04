@@ -10,7 +10,9 @@ use crate::mm::MemoryManagementArch;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::posix::IpOption;
 use crate::net::socket::unix::utils::{CmsgBuffer, SOL_SOCKET};
-use crate::net::socket::{common::ShutdownBit, endpoint::Endpoint, Socket, PMSG, PSO, PSOL};
+use crate::net::socket::{
+    common::ShutdownBit, endpoint::Endpoint, Socket, SocketInodeMetadata, PMSG, PSO, PSOL,
+};
 use crate::time::syscall::PosixTimeval;
 
 mod bound;
@@ -471,6 +473,10 @@ impl Socket for TcpSocket {
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 
     fn do_close(&self) -> Result<(), SystemError> {

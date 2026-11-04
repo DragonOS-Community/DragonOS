@@ -14,6 +14,7 @@ use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::inet::common::SocketDeviceBinding;
+use crate::net::socket::SocketInodeMetadata;
 use crate::process::namespace::net_namespace::NetNamespace;
 
 use inner::RawInner;
@@ -83,6 +84,7 @@ pub struct RawSocketData {
     wait_queue: WaitQueue,
     /// inode id
     inode_id: InodeId,
+    inode_metadata: SocketInodeMetadata,
     /// 打开文件计数
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,

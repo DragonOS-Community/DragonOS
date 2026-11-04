@@ -381,6 +381,7 @@ impl UnixEndpoint {
         self,
         netns: &Arc<NetNamespace>,
         socket_type: UnixSocketType,
+        socket_mode: InodeMode,
     ) -> Result<UnixBinding, crate::mm::allocation::MemoryAllocationError> {
         let bound = match self {
             Self::Unnamed => UnixBinding::abstract_name(
@@ -400,13 +401,15 @@ impl UnixEndpoint {
                 } else {
                     inode_begin
                 };
+                // Linux unix_bind_bsd() derives the path socket mode from the
+                // socket inode mode and the caller's current umask.
+                let umask = ProcessManager::current_pcb().fs_struct().umask();
+                let create_mode =
+                    InodeMode::from_bits_truncate(socket_mode.bits() & InodeMode::S_IALLUGO.bits())
+                        & !umask;
                 // 创建 socket inode
                 let inode = parent_inode
-                    .create(
-                        filename,
-                        crate::filesystem::vfs::FileType::Socket,
-                        InodeMode::S_IWUSR,
-                    )
+                    .create(filename, FileType::Socket, create_mode)
                     .map_err(|e| match e {
                         // Linux/Posix bind 语义：地址已被占用应返回 EADDRINUSE。
                         // VFS 创建节点遇到同名条目通常返回 EEXIST，需要在 socket 层进行语义映射。

@@ -1,9 +1,11 @@
 use crate::{
     filesystem::vfs::{
-        fasync::FAsyncItem, file::File, FilePrivateData, FileType, IndexNode, InodeMode, Metadata,
-        PollableInode,
+        fasync::FAsyncItem, file::File, merge_metadata_masked, FilePrivateData, FileType,
+        IndexNode, InodeId, InodeMode, Metadata, MetadataUpdate, PollableInode, SetMetadataMask,
     },
     libs::mutex::MutexGuard,
+    libs::spinlock::SpinLock,
+    process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -21,6 +23,65 @@ use super::{
 // Socket ioctl commands
 const FIONREAD: u32 = 0x541B; // Get number of bytes available to read
 const TIOCOUTQ: u32 = 0x5411; // Get output queue size
+
+/// Mutable inode attributes shared by every socket protocol.
+///
+/// Linux stores these fields directly in the sockfs inode. Keeping them on the
+/// socket object gives the generic VFS `fstat`/`fchmod` paths a single owner
+/// without a global inode-id table.
+#[derive(Debug)]
+pub struct SocketInodeMetadata {
+    metadata: SpinLock<Metadata>,
+}
+
+impl SocketInodeMetadata {
+    pub fn new(inode_id: InodeId) -> Self {
+        let (uid, gid) = if ProcessManager::initialized() {
+            let cred = ProcessManager::current_cred();
+            (cred.fsuid.data(), cred.fsgid.data())
+        } else {
+            (0, 0)
+        };
+        let mut metadata =
+            Metadata::new(FileType::Socket, InodeMode::S_IFSOCK | InodeMode::S_IRWXUGO);
+        metadata.inode_id = inode_id;
+        metadata.uid = uid;
+        metadata.gid = gid;
+        Self {
+            metadata: SpinLock::new(metadata),
+        }
+    }
+
+    pub fn snapshot(&self, inode_id: InodeId) -> Metadata {
+        let mut metadata = self.metadata.lock().clone();
+        metadata.inode_id = inode_id;
+        metadata
+    }
+
+    /// Current socket mode, including the `S_IFSOCK` type bits.
+    pub fn mode(&self) -> InodeMode {
+        self.metadata.lock().mode
+    }
+
+    pub fn set_metadata_masked(&self, requested: &Metadata, mask: SetMetadataMask) {
+        merge_metadata_masked(&mut self.metadata.lock(), requested, mask);
+    }
+
+    /// Run the caller's check-and-compute step while holding the metadata
+    /// lock, so permission checks and the committed mode cannot race.
+    ///
+    /// The callback runs under a spinlock and must therefore stay in-memory:
+    /// it may not sleep, block, or allocate.
+    pub fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, SystemError> {
+        let mut metadata = self.metadata.lock();
+        let (requested, mask) = update(&metadata)?;
+        merge_metadata_masked(&mut *metadata, &requested, mask);
+        Ok(mask)
+    }
+}
 
 impl<T: Socket + 'static> IndexNode for T {
     fn fsnotify_watch_count(&self) -> Option<&core::sync::atomic::AtomicUsize> {
@@ -120,10 +181,12 @@ impl<T: Socket + 'static> IndexNode for T {
     }
 
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
-        super::base::Socket::mmap_fs(self)
-            .unwrap_or_else(|| unreachable!("Socket does not have a file system"))
+        super::base::Socket::mmap_fs(self).unwrap_or_else(super::fs::SockFs::instance)
     }
 
+    /// Sockets expose a `SockFs` identity for `fstatfs`, but they are not
+    /// attached to a mount. Keeping `try_fs()` empty preserves the VFS
+    /// fast path that skips mount-backed atime handling for socket I/O.
     fn try_fs(&self) -> Option<Arc<dyn crate::filesystem::vfs::FileSystem>> {
         None
     }
@@ -140,11 +203,26 @@ impl<T: Socket + 'static> IndexNode for T {
         Ok(self)
     }
 
-    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        let mut md = Metadata::new(FileType::Socket, InodeMode::from_bits_truncate(0o755));
-        md.inode_id = self.socket_inode_id();
-        md.mode |= InodeMode::S_IFSOCK;
-        Ok(md)
+    fn metadata(&self) -> Result<Metadata, SystemError> {
+        Ok(self.inode_metadata().snapshot(self.socket_inode_id()))
+    }
+
+    fn set_metadata_masked(
+        &self,
+        metadata: &Metadata,
+        mask: SetMetadataMask,
+    ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+        self.inode_metadata().set_metadata_masked(metadata, mask);
+        Ok(())
+    }
+
+    fn update_metadata_masked(
+        &self,
+        update: &mut MetadataUpdate<'_>,
+    ) -> Result<SetMetadataMask, crate::mm::allocation::MemoryAllocationError> {
+        self.inode_metadata()
+            .update_metadata_masked(update)
+            .map_err(Into::into)
     }
 
     /// 这里应该实现 通用 Socket 作为 IndexNode 的 ioctl 选项

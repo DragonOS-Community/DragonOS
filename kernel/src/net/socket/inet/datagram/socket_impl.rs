@@ -1,5 +1,6 @@
 use super::*;
 use crate::net::socket::recv_timeout::ReceiveTimeout;
+use crate::net::socket::SocketInodeMetadata;
 
 impl UdpSocket {
     /// Keep the socket's address family at the name-query ABI boundary while
@@ -797,6 +798,10 @@ impl Socket for UdpSocket {
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 
     fn send_bytes_available(&self) -> Result<usize, SystemError> {

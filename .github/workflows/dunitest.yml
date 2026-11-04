@@ -43,6 +43,10 @@ jobs:
           cargo test --manifest-path kernel/crates/virtio-drivers/Cargo.toml --locked
           cargo check --manifest-path kernel/crates/virtio-drivers/Cargo.toml --locked --no-default-features
 
+      - name: Require credential regression tests
+        shell: bash
+        run: echo normal/credential_override_selftest >> user/apps/tests/dunitest/no_skip.txt
+
       - name: Require MM regression tests
         shell: bash
         run: |

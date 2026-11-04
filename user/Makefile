@@ -1,6 +1,7 @@
 user_sub_dirs = apps
 
 ROOT_PATH ?= $(abspath ..)
+export ROOT_PATH
 DADK ?= dadk
 
 DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')

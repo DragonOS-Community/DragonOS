@@ -81,6 +81,11 @@ in
   (static.callPackage ./ebpf_smoke { inherit target; })
 
 ]
+++ lib.optionals (target == "x86_64") [
+  # ocm-agent requires CGO (sqlite3), so it is built through pkgsStatic and
+  # only on x86_64 for now.
+  (static.callPackage ./ocm-agent { })
+]
 ++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [
   # gvisor test case only included on x86_64
   gvisor-syscall-tests

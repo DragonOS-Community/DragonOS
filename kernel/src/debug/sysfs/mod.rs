@@ -28,6 +28,8 @@ fn debugfs_init() -> Result<(), SystemError> {
     super::ext4::init_debugfs_ext4()?;
     super::fuse::init_debugfs_fuse()?;
     super::kthread::init_debugfs_kthread()?;
+    #[cfg(feature = "cred_selftest")]
+    super::credentials::init_debugfs_credentials()?;
     super::rng::init_debugfs_rng()?;
     #[cfg(feature = "sched_selftest")]
     super::sched::init_debugfs_sched()?;

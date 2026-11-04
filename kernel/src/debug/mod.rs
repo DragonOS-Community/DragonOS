@@ -1,5 +1,7 @@
 pub mod block;
 pub mod bpf;
+#[cfg(feature = "cred_selftest")]
+pub(crate) mod credentials;
 pub mod errseq;
 pub mod ext4;
 pub(crate) mod fatal;

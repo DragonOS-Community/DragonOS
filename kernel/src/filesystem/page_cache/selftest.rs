@@ -3705,6 +3705,13 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         }
     }
 
+    #[cfg(feature = "mm_selftest")]
+    if let Some(case) = crate::filesystem::vfs::mount_api::context::run_creation_retry_selftest()? {
+        return Ok(alloc::format!(
+            "status=fail stage=fsconfig_creation_{case}\n"
+        ));
+    }
+
     match crate::filesystem::vfs::file::selftest::run_body_lifetime() {
         Ok(true) => {}
         Ok(false) => return Ok("status=fail stage=memcg_file_body_lifetime\n".into()),
@@ -5890,7 +5897,12 @@ pub(crate) fn run_accounting_debug_selftest() -> Result<alloc::string::String, S
         ));
     }
 
-    Ok(fdtable_layout_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
+    let fsconfig_retry_report = if cfg!(feature = "mm_selftest") {
+        "fsconfig_creation_retry=ok\n"
+    } else {
+        ""
+    };
+    Ok(fdtable_layout_report + fsconfig_retry_report + "memcg_noio_reclaim=ok\n" + &alloc::format!(
         "status=ok\ndirty_accounting_capability=ok\nresident_backing_writeback=ok\nsubpage_buffers=ok\nmemcg_as_body_lifetime=ok\nmemcg_vma_body_lifetime=ok\nmemcg_file_body_lifetime=ok\nfile_write_completion=ok\nlegacy_writev_completion=ok\ncustom_fill_fault_pin=ok\nfault_cache_snapshot=ok\nmemcg_page_state=ok\nmemcg_reclaim=ok\nmemcg_reclaim_scan_budget=ok\nregistry_churn=ok\nregistry_batch_retire=ok\nregistry_snapshot_lifetime=ok\nregistry_concurrent_snapshot=ok\nramfs_fallocate_range=ok\nramfs_truncate_metadata=ok\nwrite_prepare_rollback=ok\npreallocate_rollback=ok\nclean_unlink_liveness=ok\nwriteback_domain_lifecycle=ok\ndetached_read_batch_completion=ok\nread_user_batch=ok\npreallocated_batch_lifecycle=ok\nfile_membership=ok\nshmem_membership=ok\ndirty_membership=ok\ndirty_incarnation=ok\nremote_dirty_publish=ok\nwriteback_membership=ok\nwriteback_admission_order=ok\nwriteback_submission_token=ok\nwriteback_defer_progress=ok\nwriteback_budget_retry=ok\nsubmitted_writeback=ok\nfault_invalidate_retry_order=ok\ntag_scan_chunk_release=ok\nunevictable_membership=ok\ninflight_teardown=ok\nlate_completion=ok\nglobal_wiring=ok\nlayout=ok\nfile_drop_drift={file_drop_drift}\nshmem_drop_drift={shmem_drop_drift}\ndirty_drop_drift={dirty_drop_drift}\nwriteback_drop_drift={writeback_drop_drift}\nunevictable_drop_drift={unevictable_drop_drift}\nentry_size={entry_size}\nbaseline_size={baseline_size}\n"
     ))
 }

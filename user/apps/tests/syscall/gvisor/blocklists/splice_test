@@ -1,4 +1,2 @@
 # 缺少memfd支持
-SpliceTest.NegativeOffset
-# 缺少memfd支持
 SpliceTest.WriteOverflow

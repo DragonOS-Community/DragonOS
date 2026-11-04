@@ -1,8 +1,5 @@
-SocketTest.UnixSocketPairProtocol
-# SocketTest.ProtocolInet # Only Inet sockets are enabled
-SocketTest.ProtocolUnix
+# fchmod/fstatfs 在 Unix socket 上尚未实现；fstatfs 还会触发内核 panic
 SocketTest.UnixSocketStat
 SocketTest.UnixSocketStatFS
-SocketTest.UnixSCMRightsOnlyPassedOnce
+# socket 文件的权限位与 Linux 不一致
 SocketTest.Permission
-OpenModes/*.Unix/*

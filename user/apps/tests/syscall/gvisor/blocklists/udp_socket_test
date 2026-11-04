@@ -1,15 +1,43 @@
-**/1
-**/2
-UdpInet6SocketTest.ConnectInet4Sockaddr
-**SoTimestamp**
-**TimestampIoctl**
-**RecvBufLimits**
-**UdpSocketControlMessagesTest**
-**SetSocketDetachFilter**
-# ICMP
-**ConnectWriteToInvalidPort**
-**ConnectAndSendNoReceiver**
-# Message Queue
-**RecvErrorConnRefused**
-# AF Option Isolation
-**RecvErrorRefusedOtherAFSockOpt**
+# 以下用例在当前 DragonOS 上仍失败，保留屏蔽。
+# 时间戳选项（SO_TIMESTAMP / SIOCGSTAMP）
+AllInetTests/UdpSocketTest.SoTimestampOffByDefault/0
+AllInetTests/UdpSocketTest.SoTimestampOffByDefault/1
+AllInetTests/UdpSocketTest.SoTimestamp/0
+AllInetTests/UdpSocketTest.SoTimestamp/1
+AllInetTests/UdpSocketTest.TimestampIoctl/0
+AllInetTests/UdpSocketTest.TimestampIoctl/1
+AllInetTests/UdpSocketTest.TimestampIoctlNothingRead/0
+AllInetTests/UdpSocketTest.TimestampIoctlNothingRead/1
+AllInetTests/UdpSocketTest.TimestampIoctlPersistence/0
+AllInetTests/UdpSocketTest.TimestampIoctlPersistence/1
+
+# 接收缓冲区上限与空缓冲区语义
+AllInetTests/UdpSocketTest.RecvBufLimitsEmptyRcvBuf/0
+AllInetTests/UdpSocketTest.RecvBufLimitsEmptyRcvBuf/1
+AllInetTests/UdpSocketTest.RecvBufLimits/1
+
+# SO_ATTACH_FILTER / SO_DETACH_FILTER
+AllInetTests/UdpSocketTest.SetSocketDetachFilter/0
+AllInetTests/UdpSocketTest.SetSocketDetachFilter/1
+AllInetTests/UdpSocketTest.SetSocketDetachFilterNoInstalledFilter/0
+AllInetTests/UdpSocketTest.SetSocketDetachFilterNoInstalledFilter/1
+
+# MSG_ERRQUEUE
+AllInetTests/UdpSocketTest.RecvErrorConnRefused/1
+AllInetTests/UdpSocketTest.RecvErrorConnRefusedOtherAFSockOpt/0
+
+# IP_TOS / IP_TTL / IP_PKTINFO 控制消息
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceiveTOSOrTClass/0
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceiveTOSOrTClass/1
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceiveTOSOrTClass/2
+AllInetTests/UdpSocketControlMessagesTest.SendAndReceiveTOSorTClass/0
+AllInetTests/UdpSocketControlMessagesTest.SendAndReceiveTOSorTClass/1
+AllInetTests/UdpSocketControlMessagesTest.SendAndReceiveTOSorTClass/2
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceiveTTLOrHopLimit/0
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceiveTTLOrHopLimit/1
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceiveTTLOrHopLimit/2
+AllInetTests/UdpSocketControlMessagesTest.SendAndReceiveTTLOrHopLimit/0
+AllInetTests/UdpSocketControlMessagesTest.SendAndReceiveTTLOrHopLimit/1
+AllInetTests/UdpSocketControlMessagesTest.SendAndReceiveTTLOrHopLimit/2
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceivePktInfo/1
+AllInetTests/UdpSocketControlMessagesTest.SetAndReceivePktInfo/2

@@ -1,1 +1,3 @@
+# JoinSubnet/1 单独运行可以通过，但与 JoinSubnet/0 在同一网络命名空间中
+# 连续运行时，会因为 JoinSubnet/0 已添加的本地地址而返回 EEXIST。
 IPv6UDPSockets/IPv6UDPUnboundSocketNetlinkTest.JoinSubnet/1

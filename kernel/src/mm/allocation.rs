@@ -7,6 +7,19 @@ use crate::cgroup::memory::{
     runtime::{recover_charge, ChargeRecoveryState, MemoryAllocPolicy, RecoveryDecision},
 };
 use crate::mm::oom_reaper::JobBirthError;
+use crate::{
+    arch::CurrentIrqArch,
+    exception::{in_interrupt, InterruptArch},
+    process::ProcessManager,
+};
+
+/// Common eligibility for sleepable allocation work, independent of the VA backend.
+pub(crate) fn task_context() -> bool {
+    CurrentIrqArch::is_irq_enabled()
+        && !in_interrupt()
+        && ProcessManager::initialized()
+        && ProcessManager::current_pcb().preempt_count() == 0
+}
 
 #[derive(Debug)]
 pub(crate) enum MemoryAllocationError {
@@ -56,7 +69,7 @@ impl AllocationRecoveryState {
 
     fn recover_physical(&mut self) -> Result<(), SystemError> {
         // Check task/IRQ/preemption before reading any task-local NOIO state.
-        if !super::vmalloc::task_context() || crate::cgroup::memory::io::noio_active() {
+        if !task_context() || crate::cgroup::memory::io::noio_active() {
             return Err(SystemError::ENOMEM);
         }
         let deadline = *self
@@ -123,7 +136,7 @@ impl MemoryAllocationError {
 
 #[cfg(feature = "mm_selftest")]
 pub(crate) fn recovery_selftest() -> bool {
-    if !super::vmalloc::task_context() {
+    if !task_context() {
         return false;
     }
     let mut state = AllocationRecoveryState::new();

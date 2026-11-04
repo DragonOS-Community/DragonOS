@@ -4,6 +4,7 @@
 //! uses only non-recursive local metadata storage; interrupt-side destruction
 //! transfers its existing record to the permanent memory notification worker.
 
+pub(crate) use super::allocation::task_context;
 #[cfg(feature = "mm_selftest")]
 use crate::cgroup::memory::object_for_task;
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
         accounting::KernelByteKind,
         object::{ObjectAccount, ObjectCharge},
     },
-    exception::{in_interrupt, InterruptArch},
+    exception::InterruptArch,
     libs::{
         rbtree::{PreparedNode, RBTree},
         spinlock::SpinLock,
@@ -292,13 +293,6 @@ impl DerefMut for VmAllocation {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.record.as_mut().unwrap()
     }
-}
-
-pub(crate) fn task_context() -> bool {
-    CurrentIrqArch::is_irq_enabled()
-        && !in_interrupt()
-        && ProcessManager::initialized()
-        && ProcessManager::current_pcb().preempt_count() == 0
 }
 
 #[derive(Clone, Copy)]

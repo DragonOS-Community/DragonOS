@@ -4,6 +4,7 @@
 //! uses only non-recursive local metadata storage; interrupt-side destruction
 //! transfers its existing record to the permanent memory notification worker.
 
+pub(crate) use super::allocation::task_context;
 #[cfg(feature = "mm_selftest")]
 use crate::cgroup::memory::object_for_task;
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
         accounting::KernelByteKind,
         object::{ObjectAccount, ObjectCharge},
     },
-    exception::{in_interrupt, InterruptArch},
+    exception::InterruptArch,
     libs::{
         rbtree::{PreparedNode, RBTree},
         spinlock::SpinLock,
@@ -79,12 +80,12 @@ pub(crate) fn overlaps(start: VirtAddr, end: VirtAddr) -> bool {
     start < end && start.data() < BASE + SIZE && end.data() > BASE
 }
 
-unsafe fn metadata_box<T>(value: T) -> Result<Box<T>, SystemError> {
+unsafe fn metadata_box<T>(value: T) -> Result<Box<T>, MemoryAllocationError> {
     let pointer = KERNEL_ALLOCATOR
         .alloc_metadata(Layout::new::<T>())
         .cast::<T>();
     if pointer.is_null() {
-        return Err(SystemError::ENOMEM);
+        return Err(MemoryAllocationError::Physical);
     }
     pointer.write(value);
     Ok(Box::from_raw(pointer))
@@ -292,13 +293,6 @@ impl DerefMut for VmAllocation {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.record.as_mut().unwrap()
     }
-}
-
-pub(crate) fn task_context() -> bool {
-    CurrentIrqArch::is_irq_enabled()
-        && !in_interrupt()
-        && ProcessManager::initialized()
-        && ProcessManager::current_pcb().preempt_count() == 0
 }
 
 #[derive(Clone, Copy)]
@@ -564,7 +558,7 @@ fn allocate_record(
             |layout| KERNEL_ALLOCATOR.alloc_metadata(layout),
         )
     }
-    .map_err(|_| SystemError::ENOMEM)?;
+    .map_err(|_| MemoryAllocationError::Physical)?;
     let reservation = {
         POOL.lock_irqsave().reserve(
             plan.pages,
@@ -615,9 +609,15 @@ fn allocate_record(
             #[cfg(feature = "mm_selftest")]
             test.step()?;
             #[cfg(feature = "mm_selftest")]
-            let frame = data_frame()?;
+            let frame = data_frame().map_err(|error| {
+                if error == SystemError::ENOMEM {
+                    MemoryAllocationError::Physical
+                } else {
+                    error.into()
+                }
+            })?;
             #[cfg(not(feature = "mm_selftest"))]
-            let frame = frame_zeroed()?;
+            let frame = frame_zeroed().map_err(|_| MemoryAllocationError::Physical)?;
             chunk.frames[index] = frame;
             chunk.acquired += 1;
             DATA_PAGES.fetch_add(1, Ordering::Relaxed);
@@ -679,7 +679,7 @@ fn map_page(
     )?;
     #[cfg(feature = "mm_selftest")]
     test.step()?;
-    let frame = frame_zeroed()?;
+    let frame = frame_zeroed().map_err(|_| MemoryAllocationError::Physical)?;
     let table = LeafTable {
         record: None,
         frame,
@@ -692,7 +692,7 @@ fn map_page(
                 KERNEL_ALLOCATOR.alloc_metadata(layout)
             })
         }
-        .map_err(|_| SystemError::ENOMEM)?,
+        .map_err(|_| MemoryAllocationError::Physical)?,
     );
     let result;
     {

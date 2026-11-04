@@ -69,7 +69,7 @@ impl RawSocket {
         // 但为了让未 bind 的 raw socket 能接收数据包、且 poll/epoll 能正确唤醒，
         // 在存在 iface 时优先以“通配接收”方式附着到 loopback/默认 iface。
         // 若当前 netns 尚无可用 iface，则退化为 Unbound，允许后续 bind/connect/sendto 再完成选址与附着。
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let (memory, body, unbound, sock, me, send_account) =
             loop {
                 let task = ProcessManager::current_pcb();
@@ -193,7 +193,7 @@ impl RawSocket {
         &self,
         iface: Arc<dyn crate::net::Iface>,
     ) -> Result<super::super::common::registration::PreparedIfaceSocket, SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             match super::super::common::registration::PreparedIfaceSocket::try_new(

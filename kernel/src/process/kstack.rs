@@ -190,6 +190,7 @@ impl KernelStack {
     pub fn new() -> Result<Self, SystemError> {
         Self::new_with_account(None).map_err(|error| match error {
             crate::mm::allocation::MemoryAllocationError::System(error) => error,
+            crate::mm::allocation::MemoryAllocationError::Physical => SystemError::ENOMEM,
             crate::mm::allocation::MemoryAllocationError::Charge(_) => {
                 unreachable!("unaccounted stack cannot fail admission")
             }
@@ -216,7 +217,14 @@ impl KernelStack {
             .transpose()?;
         if cfg!(feature = "kstack_protect") {
             unsafe {
-                let (kstack_vaddr, kstack_paddr, count) = alloc_from_kernel_space()?;
+                let (kstack_vaddr, kstack_paddr, count) =
+                    alloc_from_kernel_space().map_err(|error| {
+                        if error == SystemError::ENOMEM {
+                            crate::mm::allocation::MemoryAllocationError::Physical
+                        } else {
+                            error.into()
+                        }
+                    })?;
                 let real_kstack_vaddr = kstack_vaddr + KernelStack::SIZE;
                 Ok(Self {
                     stack: Some(
@@ -234,7 +242,7 @@ impl KernelStack {
                 stack: None,
                 dynamic_stack: Some(unsafe {
                     PhysicalBox::<StackBytes>::try_new_zeroed()
-                        .map_err(|_| SystemError::ENOMEM)?
+                        .map_err(|_| crate::mm::allocation::MemoryAllocationError::Physical)?
                         .assume_init()
                 }),
                 ty: KernelStackType::Dynamic,

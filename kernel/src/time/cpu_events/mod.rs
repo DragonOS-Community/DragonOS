@@ -3,6 +3,7 @@
 //! Producers only publish counters and schedule one preborn tasklet. The lock
 //! order is domain queues -> registration state. Callbacks and final drops are
 //! outside both guards; registrations do not retain their domain.
+use crate::mm::allocation::AllocationRecoveryState;
 mod queue;
 
 use alloc::sync::Arc;
@@ -10,10 +11,7 @@ use core::sync::atomic::{fence, AtomicU64, Ordering};
 use system_error::SystemError;
 
 use crate::{
-    cgroup::memory::{
-        accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox,
-        runtime::ChargeRecoveryState,
-    },
+    cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, owned::OwnedBox},
     exception::tasklet::{tasklet_schedule, Tasklet},
     libs::{
         spinlock::SpinLock,
@@ -349,7 +347,7 @@ impl CpuEventDomain {
             return Ok(());
         }
         let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
-        let mut recovery = ChargeRecoveryState::new();
+        let mut recovery = AllocationRecoveryState::new();
         loop {
             match self.wait_once(kind, deadline, &mut condition, &creator) {
                 Ok(()) => return Ok(()),

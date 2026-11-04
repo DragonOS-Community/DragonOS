@@ -688,7 +688,7 @@ impl Socket for UnixDatagramSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let (mut inner, was_unbound) = loop {
             let candidate = unix_endpoint.clone();
             let mut inner = self.inner.lock();

@@ -97,10 +97,7 @@ struct CpioEntryInfo {
 pub fn initramfs_init() -> Result<(), SystemError> {
     // The initcall ABI is a terminal bootstrap boundary, not a task-context
     // reclaim/retry site. Keep admission errors typed throughout extraction.
-    initramfs_init_typed().map_err(|error| match error {
-        crate::mm::allocation::MemoryAllocationError::System(error) => error,
-        crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-    })
+    initramfs_init_typed().map_err(|error| error.into_errno())
 }
 
 fn initramfs_init_typed() -> Result<(), crate::mm::allocation::MemoryAllocationError> {

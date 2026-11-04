@@ -5,7 +5,7 @@ use super::*;
 use crate::process::KernelStack;
 
 pub(crate) fn task() -> Result<Arc<ProcessControlBlock>, SystemError> {
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     let task = loop {
         let birth = (|| {
             let resources = crate::process::task::PreparedTaskResources::try_for_fork(

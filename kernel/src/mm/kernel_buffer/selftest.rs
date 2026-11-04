@@ -121,10 +121,7 @@ fn failure_policy() -> bool {
             calls += 1;
             Err(SystemError::ENOMEM.into())
         });
-        let rejected = matches!(
-            &result,
-            Err(MemoryAllocationError::System(SystemError::ENOMEM))
-        );
+        let rejected = matches!(&result, Err(MemoryAllocationError::Physical));
         drop(result);
         if !rejected || calls != 0 || !empty(&account) {
             return false;
@@ -235,15 +232,20 @@ fn unsupported_virtual() -> bool {
             return false;
         }
         let result = KernelBuffer::allocate_in(len, owner, false, true, &mut unexpected);
-        if !matches!(
-            result,
-            Err(MemoryAllocationError::System(SystemError::ENOMEM))
-        ) || !empty(&account)
-        {
+        if !matches!(result, Err(MemoryAllocationError::Physical)) || !empty(&account) {
             return false;
         }
     }
-    // Even a valid Layout too large for buddy must fail without leaking charge.
+    // A valid Layout can exceed the backend's structural capacity. Reclaim
+    // cannot satisfy it, and it must never acquire a charge or retry authority.
+    let supported =
+        crate::mm::allocator::kernel_allocator::KernelAllocator::supports_physical_layout;
+    if !supported(Layout::from_size_align(1usize << 30, 1).unwrap())
+        || supported(Layout::from_size_align((1usize << 30) + 1, 1).unwrap())
+        || supported(Layout::from_size_align(1usize << 32, 1).unwrap())
+    {
+        return false;
+    }
     let result = KernelBuffer::allocate_in(1usize << 32, owner, false, false, &mut unexpected);
     if !matches!(
         result,
@@ -506,6 +508,8 @@ fn typed_failure_rollback() -> bool {
         return false;
     };
     let owner = prepared.object_account();
+    // An injected data-frame ENOMEM represents a real Physical failure,
+    // unlike a generic errno returned by the virtual backend itself.
     // Fail every data-frame boundary in a four-page typed slice. Successfully
     // donated frames must be unmapped/freed before the charge is released.
     for fail_after in 0..4 {
@@ -530,10 +534,7 @@ fn typed_failure_rollback() -> bool {
                 },
             )
             .map(|storage| KernelSlice::initialize(storage, 1537, 9usize));
-            let failed = matches!(
-                &result,
-                Err(MemoryAllocationError::System(SystemError::ENOMEM))
-            );
+            let failed = matches!(&result, Err(MemoryAllocationError::Physical));
             drop(result);
             failed && calls == fail_after + 1 && storage_released(&account)
         });

@@ -152,6 +152,7 @@ struct SyncProbeInode {
     syncs: AtomicUsize,
     valid: AtomicBool,
     terminal_error: bool,
+    physical_error: bool,
     synchronous_after_write: bool,
 }
 
@@ -222,6 +223,9 @@ impl IndexNode for SyncProbeInode {
             );
         }
         if attempt == 0 {
+            if self.physical_error {
+                return Err(MemoryAllocationError::Physical);
+            }
             // Generate an actual typed quota failure on an isolated account.
             // Restore its margin before returning: real recovery can then
             // retry safely without reclaiming or selecting any OOM victim.
@@ -276,12 +280,14 @@ impl IndexNode for SyncProbeInode {
     }
 }
 
-/// Post-commit Charge retries synchronization only, preserving the strongest
+/// Post-commit Charge/Physical retries synchronization only, preserving the strongest
 /// intent, translated exact range, unpublished position and typed errseq.
 /// The owning deferred completions must also release every retained File.
 pub(crate) fn run_write_completion() -> Result<bool, MemoryAllocationError> {
-    let mut valid = true;
-    for (terminal_error, mapping_error, full_sync, synchronous_after_write) in [
+    let mut valid = !MemoryAllocationError::System(SystemError::ENOMEM).is_recoverable()
+        && MemoryAllocationError::Physical.is_recoverable()
+        && MemoryAllocationError::Physical.into_errno() == SystemError::ENOMEM;
+    for (physical_error, (terminal_error, mapping_error, full_sync, synchronous_after_write)) in [
         (false, false, true, false),
         (true, false, true, false),
         (false, true, true, false),
@@ -289,7 +295,10 @@ pub(crate) fn run_write_completion() -> Result<bool, MemoryAllocationError> {
         // Neither OFD requests sync initially. Only the leaf's post-write
         // mount-policy resample can discover Data and retain its retry range.
         (false, false, false, true),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|case| [false, true].map(|physical| (physical, case)))
+    {
         // Root accounts intentionally bypass controller limits. Use an
         // isolated child so max=0 really produces a recoverable quota error.
         let root = MemoryAccount::new(0x776602, None)?;
@@ -306,6 +315,7 @@ pub(crate) fn run_write_completion() -> Result<bool, MemoryAllocationError> {
             syncs: AtomicUsize::new(0),
             valid: AtomicBool::new(true),
             terminal_error,
+            physical_error,
             synchronous_after_write,
         })
         .map_err(|_| SystemError::ENOMEM)?;
@@ -333,6 +343,7 @@ pub(crate) fn run_write_completion() -> Result<bool, MemoryAllocationError> {
             syncs: AtomicUsize::new(0),
             valid: AtomicBool::new(true),
             terminal_error: false,
+            physical_error: false,
             synchronous_after_write: false,
         })
         .map_err(|_| SystemError::ENOMEM)?;
@@ -370,7 +381,7 @@ pub(crate) fn run_write_completion() -> Result<bool, MemoryAllocationError> {
             && root.current_pages() == 0;
         if !outcome_valid || !progress_valid {
             log::error!(
-                "File completion selftest: terminal={terminal_error} mapping={mapping_error} \
+                "File completion selftest: physical={physical_error} terminal={terminal_error} mapping={mapping_error} \
                  full={full_sync} resample={synchronous_after_write} outcome={outcome:?} \
                  pos={} writes={}/{} syncs={}/{} ranges={}/{}",
                 outer.pos(),

@@ -54,7 +54,7 @@ impl Syscall for SysPidFdOpen {
         if pid.pid_task(PidType::TGID).is_none() {
             return Err(SystemError::EINVAL);
         }
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let prepared = loop {
             match PidFd::prepare(&current, pid.clone(), file_flags, false) {
                 Ok(prepared) => break prepared,

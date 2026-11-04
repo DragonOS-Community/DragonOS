@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/statfs.h>
@@ -9,9 +10,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -30,10 +33,93 @@ uint64_t MemTotalKiB() {
 
 // Keep this capacity workload unchanged between baseline and fixed kernels.
 // Dirty mode additionally exercises writeback progress before physical retry.
-int ExerciseReclaim(int fd, bool dirty) {
-  constexpr size_t file_bytes = 192 * kMiB;
+int ExerciseReclaim(int fd, bool dirty, bool syscall_io) {
+  const size_t file_bytes = (syscall_io ? 128 : 192) * kMiB;
   constexpr size_t anonymous_bytes = 700 * kMiB;
   if (ftruncate(fd, file_bytes) != 0) return 10;
+  if (syscall_io) {
+    // Materialize extents before pressure so this regression measures cache
+    // admission rather than per-block sparse-growth metadata transactions.
+    // The pressure phase must still allocate cache pages for these extents.
+    {
+      unsigned char initial[64 * 1024] = {};
+      for (size_t offset = 0; offset < file_bytes; offset += sizeof(initial)) {
+        if (pwrite(fd, initial, sizeof(initial), offset) != sizeof(initial))
+          return 29;
+      }
+      if (fsync(fd) != 0) return 30;
+      if (posix_fadvise(fd, 0, file_bytes, POSIX_FADV_DONTNEED) != 0) return 31;
+    }
+    fprintf(stderr, "file reclaim preparation complete\n");
+    // Keep anonymous memory resident while the backing cache competes for
+    // frames. Unlike the mmap tests below, every new file page is allocated
+    // by pread/pwrite, outside the user page-fault recovery path.
+    void* anonymous = mmap(nullptr, anonymous_bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (anonymous == MAP_FAILED) return 20;
+    auto* resident = static_cast<volatile unsigned char*>(anonymous);
+    for (size_t offset = 0; offset < anonymous_bytes; offset += 4096)
+      resident[offset] = 37;
+    unsigned char buffer[4096];
+    for (size_t offset = 0; offset < file_bytes; offset += sizeof(buffer)) {
+      const unsigned char pattern =
+          static_cast<unsigned char>(offset / sizeof(buffer));
+      memset(buffer, pattern, sizeof(buffer));
+      const ssize_t written = pwrite(fd, buffer, sizeof(buffer), offset);
+      if (written != sizeof(buffer)) {
+        const int error = written < 0 ? errno : 0;
+        fprintf(stderr, "pwrite offset=%zu result=%zd errno=%d\n",
+                offset, written, error);
+        return 21;
+      }
+    }
+    fprintf(stderr, "file reclaim write complete\n");
+    if (fsync(fd) != 0) {
+      fprintf(stderr, "fsync errno=%d\n", errno);
+      return 22;
+    }
+    fprintf(stderr, "file reclaim fsync complete\n");
+    // Exercise short thread lifetimes while anonymous memory remains
+    // resident and the file cache has just been populated. This covers
+    // usability under pressure, not deterministic stack fragmentation.
+    for (unsigned int attempt = 0; attempt < 4; ++attempt) {
+      pthread_t thread;
+      int error = pthread_create(
+          &thread, nullptr, [](void* value) -> void* { return value; }, buffer);
+      if (error != 0) {
+        fprintf(stderr, "pthread_create attempt=%u error=%d\n", attempt, error);
+        return 27;
+      }
+      void* returned = nullptr;
+      error = pthread_join(thread, &returned);
+      if (error != 0 || returned != buffer) {
+        fprintf(stderr, "pthread_join attempt=%u error=%d value_matches=%d\n",
+                attempt, error, returned == buffer);
+        return 28;
+      }
+    }
+    fprintf(stderr, "file reclaim threads complete\n");
+    for (size_t end = file_bytes; end != 0; end -= sizeof(buffer)) {
+      const size_t offset = end - sizeof(buffer);
+      const unsigned char pattern =
+          static_cast<unsigned char>(offset / sizeof(buffer));
+      const ssize_t read = pread(fd, buffer, sizeof(buffer), offset);
+      if (read != sizeof(buffer)) {
+        const int error = read < 0 ? errno : 0;
+        fprintf(stderr, "pread offset=%zu result=%zd errno=%d\n",
+                offset, read, error);
+        return 23;
+      }
+      for (unsigned char value : buffer) {
+        if (value != pattern) return 24;
+      }
+    }
+    fprintf(stderr, "file reclaim read complete\n");
+    for (size_t offset = 0; offset < anonymous_bytes; offset += 4096) {
+      if (resident[offset] != 37) return 25;
+    }
+    return munmap(anonymous, anonymous_bytes) == 0 ? 0 : 26;
+  }
   void* file = mmap(nullptr, file_bytes, PROT_READ | (dirty ? PROT_WRITE : 0),
                     MAP_SHARED, fd, 0);
   if (file == MAP_FAILED) return 11;
@@ -83,7 +169,7 @@ bool WriteText(const std::string& path, const std::string& value) {
   return written && closed;
 }
 
-void CheckReclaim(bool dirty, bool protect_low = false) {
+void CheckReclaim(bool dirty, bool protect_low = false, bool syscall_io = false) {
   // A capacity regression, run in the dedicated 1 GiB guest. Larger guests
   // would pass without entering physical reclaim and provide false coverage.
   const uint64_t total = MemTotalKiB();
@@ -135,7 +221,7 @@ void CheckReclaim(bool dirty, bool protect_low = false) {
   if (child == 0) {
     if (protect_low && !WriteText(group + "/cgroup.procs", std::to_string(getpid())))
       _exit(19);
-    _exit(ExerciseReclaim(fd, dirty));
+    _exit(ExerciseReclaim(fd, dirty, syscall_io));
   }
   if (child < 0) {
     close(fd);
@@ -146,7 +232,12 @@ void CheckReclaim(bool dirty, bool protect_low = false) {
   }
   int status = 0;
   pid_t result = 0;
-  for (int i = 0; i < 12000 && result == 0; ++i) {
+  // The syscall case includes extent preparation and two full syncs. This is
+  // its whole-test budget, independent of the kernel's physical retry bound.
+  const int timeout_seconds = syscall_io ? 300 : 120;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(timeout_seconds);
+  while (result == 0 && std::chrono::steady_clock::now() < deadline) {
     result = waitpid(child, &status, WNOHANG);
     if (result < 0 && errno == EINTR) result = 0;
     if (result == 0) usleep(10000);
@@ -167,10 +258,12 @@ void CheckReclaim(bool dirty, bool protect_low = false) {
     EXPECT_GT(low, 0u) << "must exercise low-protection fallback";
     events.close();
     EXPECT_EQ(rmdir(group.c_str()), 0) << errno;
-    if (enabled_memory)
+    if (enabled_memory) {
       EXPECT_TRUE(WriteText("/sys/fs/cgroup/cgroup.subtree_control", "-memory"));
+    }
   }
-  ASSERT_EQ(result, child) << "reclaim child failed to finish within 120s";
+  ASSERT_EQ(result, child) << "reclaim child failed to finish within "
+                           << timeout_seconds << "s";
   ASSERT_TRUE(WIFEXITED(status)) << "unexpected signal: " << status;
   EXPECT_EQ(WEXITSTATUS(status), 0);
   EXPECT_EQ(OomKills(), before) << "reclaimable cache must not cause an OOM kill";
@@ -182,6 +275,12 @@ TEST(GlobalReclaim, CleanCacheRemainsReclaimableWhenPreparationCannotAllocate) {
 
 TEST(GlobalReclaim, DirtyCacheMakesProgressBeforeGlobalOom) {
   CheckReclaim(true);
+}
+TEST(GlobalReclaim, FileSyscallAllocationsRecoverUnderGlobalPressure) {
+  // 128 MiB crosses the reproduced file-allocation failure point while
+  // keeping this syscall regression bounded. The separate 192 MiB mmap
+  // cases above exercise the larger reclaim inventory.
+  CheckReclaim(false, false, true);
 }
 TEST(GlobalReclaim, GlobalPressureCanBreachLowAcrossBoundedScanBatches) {
   // 192 MiB is 49,152 pages, well beyond one 4,096-candidate scan.

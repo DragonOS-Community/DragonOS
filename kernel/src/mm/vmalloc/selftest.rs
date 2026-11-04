@@ -776,7 +776,7 @@ fn global_header_footprint() -> bool {
 // Private records contain no mapped resources. This exercises the actual
 // intrusive queue, including producers arriving between worker pops.
 fn retirement_fifo() -> bool {
-    fn record(id: usize) -> Result<Box<AllocationRecord>, SystemError> {
+    fn record(id: usize) -> Result<Box<AllocationRecord>, MemoryAllocationError> {
         unsafe {
             metadata_box(AllocationRecord {
                 start: 0,

@@ -51,7 +51,7 @@ impl Syscall for SysFallocateHandle {
         if let Some(file) = fd_table_guard.get_file_by_fd(fd) {
             drop(fd_table_guard);
 
-            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::default();
+            let mut recovery = crate::mm::allocation::AllocationRecoveryState::default();
             loop {
                 match crate::filesystem::vfs::vcore::vfs_fallocate_file(
                     file.clone(),

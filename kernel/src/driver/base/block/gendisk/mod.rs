@@ -280,10 +280,9 @@ impl GenDisk {
         })?;
         // The lower owner has already submitted this prefix and owns exact
         // sync recovery. Its completion error must never replay the payload.
-        result.sync_result.map_err(|error| match error {
-            crate::mm::allocation::MemoryAllocationError::System(error) => error,
-            crate::mm::allocation::MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-        })?;
+        result
+            .sync_result
+            .map_err(crate::mm::allocation::MemoryAllocationError::into_errno)?;
         Ok(result.written_len)
     }
 

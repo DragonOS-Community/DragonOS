@@ -1070,9 +1070,12 @@ impl File {
     ) -> Result<(), MemoryAllocationError> {
         let inode = self.inode();
         let sync_result = inode.sync_file_range(start, end, datasync, self.private_data.lock());
-        // Charge is an internal retry, not the final fsync result. Preserve
+        // Recoverable allocation failure is not the final fsync result. Preserve
         // the OFD cursor until synchronization reaches a terminal result.
-        if matches!(&sync_result, Err(MemoryAllocationError::Charge(_))) {
+        if sync_result
+            .as_ref()
+            .is_err_and(|error| error.is_recoverable())
+        {
             return sync_result;
         }
         let wb_result = match inode.page_cache() {
@@ -1313,12 +1316,10 @@ impl File {
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    // Data is already committed. Never let a metadata Charge
-                    // escape to the primary-write recovery loop and replay it.
-                    result.sync_result = Err(match error {
-                        MemoryAllocationError::Charge(_) => SystemError::ENOMEM.into(),
-                        error => error,
-                    });
+                    // Data is already committed and there is no continuation
+                    // for this metadata operation. A sync retry cannot finish
+                    // it, and a primary-write retry would duplicate the data.
+                    result.sync_result = Err(error.into_errno().into());
                     return;
                 }
             }
@@ -2607,7 +2608,7 @@ impl File {
                 result.completion = None;
                 result.deferred.clear();
             }
-            Err(MemoryAllocationError::Charge(_)) => {
+            Err(MemoryAllocationError::Charge(_) | MemoryAllocationError::Physical) => {
                 if let Some(completion) = result.completion.take() {
                     if result.deferred.try_reserve(1).is_err() {
                         result.sync_result = Err(SystemError::ENOMEM.into());
@@ -2740,7 +2741,9 @@ impl File {
                 Ok(_) => {}
                 // Speculative prefetch never kills a task for an optional page.
                 // Required read_at admission is handled by the inode outer.
-                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => return Ok(()),
+                Err(MemoryAllocationError::Charge(_) | MemoryAllocationError::Physical) => {
+                    return Ok(())
+                }
                 Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
                     return Err(error)
                 }
@@ -2760,7 +2763,9 @@ impl File {
                 &creator,
             ) {
                 Ok(_) => {}
-                Err(crate::mm::allocation::MemoryAllocationError::Charge(_)) => return Ok(()),
+                Err(MemoryAllocationError::Charge(_) | MemoryAllocationError::Physical) => {
+                    return Ok(())
+                }
                 Err(crate::mm::allocation::MemoryAllocationError::System(error)) => {
                     return Err(error)
                 }

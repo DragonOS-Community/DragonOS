@@ -419,7 +419,7 @@ impl X86_64MMArch {
         };
 
         let mut global_recovery = crate::mm::fault_recovery::GlobalFaultRecoveryState::new();
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
 
         'fault_retry: loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
@@ -717,7 +717,8 @@ impl X86_64MMArch {
                             }
                             Err(crate::mm::allocation::MemoryAllocationError::System(
                                 SystemError::ENOMEM,
-                            )) => {
+                            ))
+                            | Err(crate::mm::allocation::MemoryAllocationError::Physical) => {
                                 fault = VmFaultReason::VM_FAULT_OOM;
                                 crate::mm::fault::account_fault_result(&data_account, flags, fault);
                                 space_guard = current_address_space.write();

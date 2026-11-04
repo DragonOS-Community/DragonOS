@@ -82,7 +82,7 @@ pub(crate) fn account_fault_result(
 /// PGFAULT, but an interrupted incomplete fault is not an OOM/minor/major fault.
 pub(crate) fn recover_fault_charge(
     failure: ChargeFailure,
-    state: &mut crate::cgroup::memory::runtime::ChargeRecoveryState,
+    state: &mut crate::mm::allocation::AllocationRecoveryState,
     account: &MemoryAccount,
     flags: FaultFlags,
 ) -> Result<(), SystemError> {
@@ -343,9 +343,8 @@ impl<'a> PageFaultMessage<'a> {
             crate::mm::allocation::MemoryAllocationError::Charge(failure) => {
                 self.fail_charge(failure)
             }
-            crate::mm::allocation::MemoryAllocationError::System(SystemError::ENOMEM) => {
-                VmFaultReason::VM_FAULT_OOM
-            }
+            crate::mm::allocation::MemoryAllocationError::System(SystemError::ENOMEM)
+            | crate::mm::allocation::MemoryAllocationError::Physical => VmFaultReason::VM_FAULT_OOM,
             crate::mm::allocation::MemoryAllocationError::System(_) => {
                 VmFaultReason::VM_FAULT_SIGBUS
             }

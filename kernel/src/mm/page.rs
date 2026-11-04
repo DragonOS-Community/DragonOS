@@ -10,6 +10,7 @@ use core::{
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
+use super::allocation::MemoryAllocationError;
 use super::page_lru::{PageLru, PreparedPageLruCapacity};
 pub(crate) use super::page_rmap::PageMapping;
 use super::page_rmap::PageVmaSet;
@@ -457,7 +458,25 @@ pub(crate) fn allocate_registered_data_page(
     flags: PageFlags,
     charge: Option<MemoryCharge>,
 ) -> Result<Arc<Page>, SystemError> {
-    allocate_registered_data_page_initialized(page_type, flags, charge, |_| Ok(()))
+    allocate_registered_data_page_typed(page_type, flags, charge)
+        .map_err(MemoryAllocationError::into_errno)
+}
+
+/// Preserve physical pressure until the cache caller reaches its lock-free
+/// recovery boundary. Legacy fault callers retain their original errno API.
+pub(crate) fn allocate_registered_data_page_typed(
+    page_type: PageType,
+    flags: PageFlags,
+    charge: Option<MemoryCharge>,
+) -> Result<Arc<Page>, MemoryAllocationError> {
+    let request = data_frame_request(PageFrameCount::ONE, charge.as_ref());
+    allocate_registered_data_page_initialized_with_request(
+        page_type,
+        flags,
+        charge,
+        |_| Ok(()),
+        request,
+    )
 }
 
 /// Copy before publication: the source Arc pins its frame without a registry
@@ -494,6 +513,7 @@ pub(crate) fn allocate_registered_data_page_initialized(
     allocate_registered_data_page_initialized_with_request(
         page_type, flags, charge, initialize, request,
     )
+    .map_err(MemoryAllocationError::into_errno)
 }
 
 fn reclaim_io_backing(
@@ -537,6 +557,7 @@ pub(crate) fn reclaim_io_admission_selftest() -> bool {
         && !reclaim_io_backing(MemoryKind::File, true, ReserveLevel::OomExit)
         && scan_visit_budget_selftest()
         && crate::mm::fault_recovery::budget_selftest()
+        && crate::mm::allocation::recovery_selftest()
 }
 
 /// Only PageCache's File path may identify a necessary stacked-I/O backing
@@ -546,9 +567,9 @@ pub(crate) fn allocate_registered_file_cache_page(
     page_type: PageType,
     flags: PageFlags,
     charge: MemoryCharge,
-) -> Result<Arc<Page>, SystemError> {
+) -> Result<Arc<Page>, MemoryAllocationError> {
     if !matches!(&page_type, PageType::File(_)) || charge.kind() != MemoryKind::File {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
     let request = if reclaim_io_backing(
         charge.kind(),
@@ -590,12 +611,12 @@ fn allocate_registered_data_page_initialized_with_request(
     charge: Option<MemoryCharge>,
     initialize: impl FnOnce(PhysAddr) -> Result<(), SystemError>,
     request: FrameAllocationRequest,
-) -> Result<Arc<Page>, SystemError> {
+) -> Result<Arc<Page>, MemoryAllocationError> {
     if charge
         .as_ref()
         .is_some_and(|charge| charge.pages() != 1 || !page_type.accepts_memory_kind(charge.kind()))
     {
-        return Err(SystemError::EINVAL);
+        return Err(SystemError::EINVAL.into());
     }
     // Only this registered single-page path has the audited data lifecycle.
     // Raw/contiguous/legacy-manager callers keep their original default. This
@@ -612,7 +633,7 @@ fn allocate_registered_data_page_initialized_with_request(
         LockedFrameAllocator
             .allocate_request(request)
             .map(|(paddr, _)| paddr)
-            .ok_or(SystemError::ENOMEM)?
+            .ok_or(MemoryAllocationError::Physical)?
     };
     let mut raw = RawFrameExtent {
         next: paddr,
@@ -623,7 +644,7 @@ fn allocate_registered_data_page_initialized_with_request(
     initialize(paddr)?;
     // The constructor takes ownership on success AND Arc allocation failure.
     raw.remaining = 0;
-    let page = Page::try_new_with_charge(paddr, page_type, flags, charge)?;
+    let page = Page::try_new_with_charge_typed(paddr, page_type, flags, charge)?;
     loop {
         let mut manager_capacity = prepare_manager_capacity()?;
         let mut lru_capacity = if flags.contains(PageFlags::PG_LRU) {
@@ -695,7 +716,7 @@ fn allocate_registered_data_page_initialized_with_request(
         drop(manager_capacity);
         match result {
             Some(Ok(())) => return Ok(page),
-            Some(Err(error)) => return Err(error),
+            Some(Err(error)) => return Err(error.into()),
             None => {}
         }
     }
@@ -2079,6 +2100,16 @@ impl Page {
         flags: PageFlags,
         memory_charge: Option<MemoryCharge>,
     ) -> Result<Arc<Page>, SystemError> {
+        Self::try_new_with_charge_typed(phys_addr, page_type, flags, memory_charge)
+            .map_err(MemoryAllocationError::into_errno)
+    }
+
+    fn try_new_with_charge_typed(
+        phys_addr: PhysAddr,
+        page_type: PageType,
+        flags: PageFlags,
+        memory_charge: Option<MemoryCharge>,
+    ) -> Result<Arc<Page>, MemoryAllocationError> {
         let inner = InnerPage::new(
             phys_addr,
             page_type,
@@ -2095,7 +2126,7 @@ impl Page {
             contiguous_owner: None,
             memory_charge,
         })
-        .map_err(|_| SystemError::ENOMEM)?;
+        .map_err(|_| MemoryAllocationError::Physical)?;
         // The unlocked birth API publishes manager/LRU together. Construction
         // alone must not expose a page through either registry.
         Ok(page)

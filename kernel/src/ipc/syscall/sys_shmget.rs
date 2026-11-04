@@ -54,7 +54,7 @@ pub(super) fn do_kernel_shmget(
     }
 
     let ipcns = ProcessManager::current_ipcns();
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
 
     match key {
         IPC_PRIVATE => {

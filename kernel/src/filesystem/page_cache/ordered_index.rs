@@ -5,7 +5,6 @@ use crate::cgroup::memory::{accounting::KernelByteKind, object::ObjectAccount, o
 use crate::mm::allocation::MemoryAllocationError;
 use alloc::sync::Arc;
 use core::ops::{Bound, RangeBounds};
-use system_error::SystemError;
 
 #[derive(Debug)]
 pub(super) struct Node {
@@ -27,7 +26,7 @@ impl Node {
                 right: None,
                 height: 1,
             })
-            .map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))
+            .map_err(|_| MemoryAllocationError::Physical)
     }
 
     fn height(node: &Option<OwnedBox<Self>>) -> i32 {

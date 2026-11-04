@@ -2,7 +2,7 @@
 //! use the typed single-attempt methods instead, preserving their transaction.
 
 use super::{DelegatedWriteResult, File, MemoryAllocationError, SystemError};
-use crate::cgroup::memory::runtime::ChargeRecoveryState;
+use crate::mm::allocation::AllocationRecoveryState;
 
 impl File {
     pub(super) fn set_completed_sync_range(
@@ -53,7 +53,7 @@ impl File {
     pub(crate) fn recover_io<T>(
         mut attempt: impl FnMut() -> Result<T, MemoryAllocationError>,
     ) -> Result<T, SystemError> {
-        let mut recovery = ChargeRecoveryState::default();
+        let mut recovery = AllocationRecoveryState::default();
         loop {
             match attempt() {
                 Ok(value) => return Ok(value),
@@ -68,7 +68,7 @@ impl File {
         &self,
         mut result: DelegatedWriteResult,
     ) -> Result<usize, SystemError> {
-        let mut recovery = ChargeRecoveryState::default();
+        let mut recovery = AllocationRecoveryState::default();
         loop {
             match core::mem::replace(&mut result.sync_result, Ok(())) {
                 Ok(()) => {
@@ -95,8 +95,7 @@ impl File {
                 self.complete_write_success(&mut result);
                 Ok(result.written_len)
             }
-            Err(MemoryAllocationError::System(error)) => Err(error),
-            Err(MemoryAllocationError::Charge(_)) => Err(SystemError::ENOMEM),
+            Err(error) => Err(error.into_errno()),
         }
     }
 

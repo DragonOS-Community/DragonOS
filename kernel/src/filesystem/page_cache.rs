@@ -2081,7 +2081,7 @@ impl PageEntry {
                 accounted_unevictable: AtomicBool::new(false),
                 active_users: AtomicUsize::new(0),
             })
-            .map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))?;
+            .map_err(|_| MemoryAllocationError::Physical)?;
         Ok(Self { storage })
     }
 
@@ -2635,6 +2635,8 @@ impl PageCache {
         let mut pages = AccountedPageMap::new_in(HeapPlanAllocator::Auto);
         pages
             .try_reserve(required)
+            // Auto backing may fail its virtual-address reservation. Preserve
+            // that opaque allocation failure rather than guessing physical.
             .map_err(|_| SystemError::ENOMEM)?;
         let (pointer, layout) = pages.raw_table().allocation_info();
         let charge = match unsafe {
@@ -2658,9 +2660,12 @@ impl PageCache {
                     HeapPlan::Physical.footprint(layout),
                 )?;
                 pages = AccountedPageMap::new_in(HeapPlanAllocator::Physical);
-                pages
-                    .try_reserve(required)
-                    .map_err(|_| SystemError::ENOMEM)?;
+                pages.try_reserve(required).map_err(|error| match error {
+                    hashbrown::TryReserveError::CapacityOverflow => SystemError::ENOMEM.into(),
+                    hashbrown::TryReserveError::AllocError { .. } => {
+                        MemoryAllocationError::Physical
+                    }
+                })?;
                 let (direct_pointer, actual_layout) = pages.raw_table().allocation_info();
                 assert_eq!(
                     actual_layout, layout,
@@ -3196,10 +3201,7 @@ impl PageCache {
     }
 
     fn legacy_allocation_error(error: MemoryAllocationError) -> SystemError {
-        match error {
-            MemoryAllocationError::Charge(_) => SystemError::ENOMEM,
-            MemoryAllocationError::System(error) => error,
-        }
+        error.into_errno()
     }
 
     fn allocate_page_with_owner(
@@ -3227,13 +3229,12 @@ impl PageCache {
                 charge,
             )
         } else {
-            crate::mm::page::allocate_registered_data_page(
+            crate::mm::page::allocate_registered_data_page_typed(
                 page_type,
                 self.page_flags(),
                 Some(charge),
             )
         }
-        .map_err(MemoryAllocationError::System)
     }
 
     fn prepare_entry(
@@ -3242,9 +3243,8 @@ impl PageCache {
         state: PageState,
         creator: &Arc<ObjectAccount>,
     ) -> Result<Arc<PageEntry>, MemoryAllocationError> {
-        let result = PageEntry::try_new(page.clone(), state, creator).and_then(|entry| {
-            Arc::try_new(entry).map_err(|_| MemoryAllocationError::System(SystemError::ENOMEM))
-        });
+        let result = PageEntry::try_new(page.clone(), state, creator)
+            .and_then(|entry| Arc::try_new(entry).map_err(|_| MemoryAllocationError::Physical));
         if result.is_err() {
             self.discard_unlinked_page(page);
         }

@@ -1,6 +1,6 @@
+use crate::mm::allocation::AllocationRecoveryState;
 use crate::{
     arch::ipc::signal::Signal,
-    cgroup::memory::runtime::ChargeRecoveryState,
     ipc::signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
     mm::{
         allocation::MemoryAllocationError,
@@ -72,7 +72,7 @@ impl RiscV64MMArch {
             }
             _ => unreachable!("not a user page fault"),
         };
-        let mut charge_recovery = ChargeRecoveryState::new();
+        let mut charge_recovery = AllocationRecoveryState::new();
         let mut global_recovery = GlobalFaultRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
@@ -122,7 +122,8 @@ impl RiscV64MMArch {
                         Err(MemoryAllocationError::System(
                             SystemError::EINTR | SystemError::ERESTARTSYS,
                         )) => return Ok(()),
-                        Err(MemoryAllocationError::System(SystemError::ENOMEM)) => {
+                        Err(MemoryAllocationError::System(SystemError::ENOMEM))
+                        | Err(MemoryAllocationError::Physical) => {
                             reason = VmFaultReason::VM_FAULT_OOM
                         }
                         Err(MemoryAllocationError::System(_)) => {
@@ -179,7 +180,7 @@ impl RiscV64MMArch {
 /// recovery yields to pending signals and a later hardware fault, as on x86.
 fn recover_charge(
     failure: crate::cgroup::memory::accounting::ChargeFailure,
-    state: &mut ChargeRecoveryState,
+    state: &mut AllocationRecoveryState,
     account: &crate::cgroup::memory::MemoryAccount,
     flags: FaultFlags,
 ) -> bool {

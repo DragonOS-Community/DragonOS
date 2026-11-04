@@ -331,7 +331,7 @@ impl AddressSpace {
 
         let mut addr = start;
         let mut retried = false;
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         while addr.data() < end {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = self.memory_account();
@@ -442,6 +442,18 @@ impl AddressSpace {
                         continue;
                     }
                     Err(crate::mm::allocation::MemoryAllocationError::System(error)) => Err(error),
+                    Err(error @ crate::mm::allocation::MemoryAllocationError::Physical) => {
+                        if let Err(error) = error.recover(&mut charge_recovery) {
+                            crate::mm::fault::account_fault_recovery_failure(
+                                &data_account,
+                                retry_flags,
+                                error.clone(),
+                            );
+                            return Err(error);
+                        }
+                        retried = true;
+                        continue;
+                    }
                     Ok(()) => Ok(()),
                 };
                 if let Err(error) = result {
@@ -546,7 +558,7 @@ impl AddressSpace {
         user_ns: Arc<UserNamespace>,
         dumpable: u8,
     ) -> Result<Arc<Self>, SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             match Self::new_for_task_with_creator(
@@ -689,6 +701,7 @@ impl AddressSpace {
         ) {
             Ok(mm) => mm,
             Err(MemoryAllocationError::System(error)) => return Err(error),
+            Err(MemoryAllocationError::Physical) => return Err(SystemError::ENOMEM),
             // An unlimited private fixture must not reject admission. This is
             // a failed assertion, not production scope-to-errno conversion.
             Err(MemoryAllocationError::Charge(_)) => return Ok(false),
@@ -1329,7 +1342,7 @@ impl AddressSpace {
         round_to_min: bool,
         allocate_at_once: bool,
     ) -> Result<VirtPageFrame, SystemError> {
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let len = page_align_up(len);
         if map_flags.contains(MapFlags::MAP_SHARED) {
             if len == 0 {
@@ -1524,7 +1537,7 @@ impl AddressSpace {
         self: &Arc<Self>,
         args: FileMappingWithFileArgs,
     ) -> Result<VirtPageFrame, SystemError> {
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let FileMappingWithFileArgs {
             file,
             start_vaddr,
@@ -2046,7 +2059,7 @@ impl AddressSpace {
         page_count: PageFrameCount,
     ) -> Result<(), SystemError> {
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let mut guard = self.write();
@@ -2103,7 +2116,7 @@ impl AddressSpace {
         prot_flags: ProtFlags,
     ) -> Result<(), SystemError> {
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = self.memory_account();
@@ -2167,7 +2180,7 @@ impl AddressSpace {
         behavior: MadvFlags,
     ) -> Result<(), SystemError> {
         let region = VirtRegion::new(start_page.virt_address(), page_count.bytes());
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = self.memory_account();
@@ -2251,7 +2264,7 @@ impl AddressSpace {
         mremap_flags: MremapFlags,
         new_vaddr: VirtAddr,
     ) -> Result<VirtAddr, SystemError> {
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = self.memory_account();
@@ -2459,7 +2472,7 @@ impl AddressSpace {
     }
 
     pub fn set_brk_wait(self: &Arc<Self>, new_addr: VirtAddr) -> Result<usize, SystemError> {
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = self.memory_account();
@@ -2537,7 +2550,7 @@ impl AddressSpace {
     }
 
     pub fn sbrk_wait(self: &Arc<Self>, incr: isize) -> Result<VirtAddr, SystemError> {
-        let mut charge_recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut charge_recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             let creator = crate::cgroup::memory::object_for_task(&ProcessManager::current_pcb());
             let data_account = self.memory_account();
@@ -2608,7 +2621,7 @@ impl AddressSpace {
         self: &Arc<Self>,
         owner: &Arc<ProcessControlBlock>,
     ) -> Result<Arc<AddressSpace>, SystemError> {
-        let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+        let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         loop {
             match self.try_clone_for_task(owner) {
                 Ok(child) => return Ok(child),

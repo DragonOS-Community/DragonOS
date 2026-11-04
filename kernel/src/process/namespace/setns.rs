@@ -68,7 +68,7 @@ fn install_setns(
     new_cred: Option<Arc<Cred>>,
     flags: CloneFlags,
 ) -> Result<(), SystemError> {
-    let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+    let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
     loop {
         let mut new_fs = None;
         let fs_refs = lock_fs_refs_copy();

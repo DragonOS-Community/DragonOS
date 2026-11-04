@@ -399,7 +399,7 @@ impl ExecParam {
 
         if me.sighand().is_shared() {
             let old_sighand = me.sighand();
-            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
             let new_sighand = loop {
                 let creator = crate::cgroup::memory::object_for_task(&me);
                 match SigHand::try_new_for(&creator) {
@@ -418,7 +418,7 @@ impl ExecParam {
             .fd_table_snapshot()
             .expect("exec task has no fd table");
         if shared {
-            let mut recovery = crate::cgroup::memory::runtime::ChargeRecoveryState::new();
+            let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
             let private = loop {
                 let creator = crate::cgroup::memory::object_for_task(&me);
                 match FileDescriptorTable::try_clone(&fd_table, None, &creator) {

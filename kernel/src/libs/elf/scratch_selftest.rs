@@ -9,7 +9,7 @@ use crate::{
             FileSystem, FileType, InodeMode,
         },
     },
-    mm::kernel_buffer::KernelBuffer,
+    mm::{allocation::MemoryAllocationError, kernel_buffer::KernelBuffer},
 };
 
 pub(crate) fn run() -> bool {
@@ -31,18 +31,21 @@ pub(crate) fn run() -> bool {
             ElfLoader::FILE_READ_BUF_SIZE + 1,
             0,
             &file,
-            |size| {
+            |size| -> Result<KernelBuffer, SystemError> {
                 requested = size;
-                File::recover_io(|| {
-                    KernelBuffer::try_new_zeroed_in_with(
-                        size,
-                        prepared.object_account(),
-                        &mut || {
-                            backing_attempts += 1;
-                            Err(SystemError::ENOMEM)
-                        },
-                    )
-                })
+                // This fixture checks a single refused scratch birth before
+                // population, independently of global recovery policy.
+                match KernelBuffer::try_new_zeroed_in_with(
+                    size,
+                    prepared.object_account(),
+                    &mut || {
+                        backing_attempts += 1;
+                        Err(SystemError::ENOMEM)
+                    },
+                ) {
+                    Err(error @ MemoryAllocationError::Physical) => Err(error.into_errno()),
+                    _ => Err(SystemError::EINVAL),
+                }
             },
         );
         Ok(matches!(result, Err(SystemError::ENOMEM))

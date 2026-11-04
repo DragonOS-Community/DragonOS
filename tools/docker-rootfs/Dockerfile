@@ -20,6 +20,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         "docker-ce=${DOCKER_VERSION}" "docker-ce-cli=${DOCKER_VERSION}" \
         "containerd.io=${CONTAINERD_VERSION}" \
+    && apt-get install -y --no-install-recommends python3 python-is-python3 nodejs \
+    && python3 --version && node --version \
     && update-alternatives --set iptables /usr/sbin/iptables-nft \
     && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft \
     && test -s /etc/ssl/certs/ca-certificates.crt \

@@ -35,6 +35,8 @@ $(bin): $(busybox_dir) Makefile
 	sed -i '/CONFIG_STATIC/s/.*/CONFIG_STATIC=y/' .config && \
 	sed -i '/CONFIG_FEATURE_EDITING_MAX_LEN/s/.*/CONFIG_FEATURE_EDITING_MAX_LEN=8192/' .config && \
 	sed -i '/CONFIG_PIE/d' .config && \
+	sed -i 's/^CONFIG_BASH_IS_NONE=y$$/# CONFIG_BASH_IS_NONE is not set/' .config && \
+	sed -i 's/^# CONFIG_BASH_IS_ASH is not set$$/CONFIG_BASH_IS_ASH=y/' .config && \
 	echo "CONFIG_CROSS_COMPILER_PREFIX=\"$(prefix)\"" >> .config && \
 	echo "CONFIG_FEATURE_STATIC=y" >> .config && \
 	echo "CONFIG_STATIC_LIBGCC=y" >> .config && \

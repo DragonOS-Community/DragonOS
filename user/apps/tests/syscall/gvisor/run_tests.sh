@@ -1,6 +1,41 @@
 #!/bin/busybox sh
 source /etc/profile
 
+ensure_exec_test_fixtures() {
+    # exec_test resolves /bin/echo and /bin/bash directly. The default image is
+    # built on FAT32 from BusyBox, which cannot store applet symlinks, so
+    # materialize those entry points when the rootfs does not provide them.
+    # Existing files (for example a base image's real bash) are never replaced.
+    if [ ! -x /bin/busybox ]; then
+        echo "[gvisor] cannot prepare exec fixtures: /bin/busybox missing or not executable" >&2
+        return 1
+    fi
+
+    for applet in echo bash; do
+        if [ -e "/bin/$applet" ]; then
+            if [ ! -x "/bin/$applet" ]; then
+                echo "[gvisor] /bin/$applet exists but is not executable" >&2
+                return 1
+            fi
+            continue
+        fi
+
+        if ! /bin/busybox --list | /bin/busybox grep -qx "$applet"; then
+            echo "[gvisor] busybox does not provide the '$applet' applet" >&2
+            return 1
+        fi
+        if ! /bin/busybox cp /bin/busybox "/bin/$applet"; then
+            echo "[gvisor] failed to install /bin/$applet from busybox" >&2
+            return 1
+        fi
+        if [ ! -x "/bin/$applet" ]; then
+            echo "[gvisor] /bin/$applet is not executable after install" >&2
+            return 1
+        fi
+        echo "[gvisor] installed /bin/$applet from busybox"
+    done
+}
+
 adjust_readv_blocklist() {
     # Constants and variables for readv_test memory-based adjustment
     local THRESHOLD_KB=2621440  # 2.5GiB in kB
@@ -51,6 +86,7 @@ adjust_readv_blocklist() {
 
 }
 
+ensure_exec_test_fixtures || exit 1
 adjust_readv_blocklist
 
 cd "$SYSCALL_TEST_DIR" || exit 1

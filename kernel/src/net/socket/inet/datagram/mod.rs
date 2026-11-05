@@ -19,7 +19,7 @@ use crate::net::posix::{SockAddr, SockAddrIn};
 use crate::net::socket::common::{EPollItems, ShutdownBit};
 use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::unix::utils::CmsgBuffer;
-use crate::net::socket::{AddressFamily, Socket, PMSG, PSO, PSOL};
+use crate::net::socket::{AddressFamily, Socket, SocketInodeMetadata, PMSG, PSO, PSOL};
 use crate::net::socket::{IpOption, PIPV6};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
@@ -111,6 +111,7 @@ pub struct UdpSocketData {
     shutdown: AtomicU8,
     wait_queue: WaitQueue,
     inode_id: InodeId,
+    inode_metadata: SocketInodeMetadata,
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
     self_ref: Weak<UdpSocket>,
@@ -245,6 +246,7 @@ impl UdpSocket {
             };
             // Weak is only saved into private owners; no registration or
             // upgrade may observe the thin identity before body initialization.
+            let inode_id = generate_inode_id();
             socket.data.init(body.init(UdpSocketData {
                 memory,
                 resize_lock: Mutex::new(()),
@@ -253,7 +255,8 @@ impl UdpSocket {
                 nonblock: AtomicBool::new(nonblock),
                 shutdown: AtomicU8::new(0),
                 wait_queue: WaitQueue::default(),
-                inode_id: generate_inode_id(),
+                inode_id,
+                inode_metadata: SocketInodeMetadata::new(inode_id),
                 open_files: AtomicUsize::new(0),
                 fsnotify_watches: AtomicUsize::new(0),
                 self_ref: me.clone(),

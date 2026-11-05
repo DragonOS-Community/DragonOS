@@ -1,5 +1,5 @@
 use crate::filesystem::epoll::EPollEventType;
-use crate::filesystem::vfs::file::File;
+use crate::filesystem::vfs::{file::File, InodeMode};
 use crate::libs::mutex::Mutex;
 use crate::libs::rwsem::RwSem;
 use crate::libs::wait_queue::WaitQueue;
@@ -118,13 +118,14 @@ impl Init {
         endpoint_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
         socket_type: UnixSocketType,
+        socket_mode: InodeMode,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.addr.is_some() {
             log::error!("the socket is already bound");
             return endpoint_to_bind.bind_unnamed().map_err(Into::into);
         }
 
-        let bound_addr = endpoint_to_bind.bind_in(netns, socket_type)?;
+        let bound_addr = endpoint_to_bind.bind_in(netns, socket_type, socket_mode)?;
         self.addr = Some(bound_addr);
 
         Ok(())
@@ -246,12 +247,13 @@ impl Connected {
         addr_to_bind: UnixEndpoint,
         netns: &Arc<NetNamespace>,
         socket_type: UnixSocketType,
+        socket_mode: InodeMode,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.addr.is_some() {
             return addr_to_bind.bind_unnamed().map_err(Into::into);
         }
 
-        let bound_addr = addr_to_bind.bind_in(netns, socket_type)?;
+        let bound_addr = addr_to_bind.bind_in(netns, socket_type, socket_mode)?;
         self.set_endpoint(Some(bound_addr));
 
         Ok(())

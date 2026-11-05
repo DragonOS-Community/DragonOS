@@ -19,7 +19,7 @@ use system_error::SystemError;
 use crate::arch::MMArch;
 use crate::filesystem::page_cache::PageCache;
 use crate::filesystem::vfs::file::File;
-use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, Magic, SuperBlock, VmaOpenRollback};
+use crate::filesystem::vfs::{FileSystem, FsInfo, IndexNode, SuperBlock, VmaOpenRollback};
 use crate::mm::allocator::page_frame::PageFrameCount;
 use crate::mm::fault::{PageFaultHandler, PageFaultMessage};
 use crate::mm::page::{allocate_registered_intrinsic_unevictable_pages_exact, PageFlags};
@@ -66,7 +66,7 @@ impl FileSystem for PacketFakeFs {
         "packet"
     }
     fn super_block(&self) -> SuperBlock {
-        SuperBlock::new(Magic::SOCKFS_MAGIC, PAGE_SIZE as u64, 255)
+        crate::net::socket::fs::socket_super_block()
     }
     unsafe fn fault(&self, pfm: &mut PageFaultMessage) -> VmFaultReason {
         let inode_ref = {

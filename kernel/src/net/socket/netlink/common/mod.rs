@@ -24,7 +24,7 @@ use crate::{
                 table::SupportedNetlinkProtocol,
             },
             utils::datagram_common::{Bound, Inner},
-            AddressFamily, Socket, PMSG, PSO, PSOCK, PSOL,
+            AddressFamily, Socket, SocketInodeMetadata, PMSG, PSO, PSOCK, PSOL,
         },
     },
     process::{
@@ -80,6 +80,7 @@ pub struct NetlinkSocket<P: SupportedNetlinkProtocol> {
     recv_timeout_ticks: AtomicU64,
     fasync_items: Arc<FAsyncItems>,
     inode_id: InodeId,
+    inode_metadata: SocketInodeMetadata,
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
     send_buffer: AtomicUsize,
@@ -121,6 +122,7 @@ where
         let fasync_items = Arc::new(FAsyncItems::default());
         let opener_cred = ProcessManager::current_cred();
         let receive_queue = P::new_message_queue();
+        let inode_id = generate_inode_id();
         let unbound = UnboundNetlink::new(
             epoll_items.clone(),
             fasync_items.clone(),
@@ -139,7 +141,8 @@ where
             send_timeout_us: AtomicU64::new(u64::MAX),
             recv_timeout_ticks: AtomicU64::new(INFINITE_TIMEOUT_TICKS),
             fasync_items,
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             send_buffer: AtomicUsize::new(SYSCTL_WMEM_MAX as usize),
@@ -725,6 +728,10 @@ where
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 }
 

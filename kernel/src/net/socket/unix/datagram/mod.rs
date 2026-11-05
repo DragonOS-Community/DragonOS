@@ -5,7 +5,7 @@ use crate::{
     filesystem::vfs::{
         fasync::{FAsyncItems, FASYNC_POLL_IN},
         vcore::generate_inode_id,
-        InodeId,
+        InodeId, InodeMode,
     },
     libs::mutex::Mutex,
     libs::rwsem::RwSem,
@@ -21,7 +21,7 @@ use crate::{
             endpoint::Endpoint,
             recv_buffer::{ReceiveAttempt, RecvBuffer},
             unix::{UnixBinding, UnixEndpoint, UnixEndpointBound, UnixSocketType},
-            AddressFamily, Socket, PMSG, PSOCK, PSOL,
+            AddressFamily, Socket, SocketInodeMetadata, PMSG, PSOCK, PSOL,
         },
     },
 };
@@ -126,11 +126,12 @@ impl Inner {
         &mut self,
         endpoint: UnixEndpoint,
         netns: &Arc<NetNamespace>,
+        socket_mode: InodeMode,
     ) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
         if self.local_addr.is_some() {
             return endpoint.bind_unnamed().map_err(Into::into);
         }
-        let bound_addr = endpoint.bind_in(netns, UnixSocketType::Datagram)?;
+        let bound_addr = endpoint.bind_in(netns, UnixSocketType::Datagram, socket_mode)?;
         self.local_addr = Some(bound_addr);
         Ok(())
     }
@@ -220,6 +221,7 @@ pub struct UnixDatagramSocket {
     fasync_items: FAsyncItems,
     wait_queue: Arc<WaitQueue>,
     inode_id: InodeId,
+    inode_metadata: SocketInodeMetadata,
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
     netns: Arc<NetNamespace>,
@@ -258,12 +260,14 @@ impl UnixDatagramSocket {
 
     pub fn new(is_nonblocking: bool) -> Arc<Self> {
         let netns = ProcessManager::current_netns();
+        let inode_id = generate_inode_id();
         Arc::new_cyclic(|weak| Self {
             inner: Mutex::new(Inner::new()),
             epitems: EPollItems::default(),
             fasync_items: FAsyncItems::default(),
             wait_queue: Arc::new(WaitQueue::default()),
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             netns: netns.clone(),
@@ -688,6 +692,7 @@ impl Socket for UnixDatagramSocket {
 
     fn bind(&self, endpoint: Endpoint) -> Result<(), SystemError> {
         let unix_endpoint = UnixEndpoint::try_from(endpoint)?;
+        let socket_mode = self.inode_metadata.mode();
         let mut recovery = crate::mm::allocation::AllocationRecoveryState::new();
         let (mut inner, was_unbound) = loop {
             let candidate = unix_endpoint.clone();
@@ -696,7 +701,7 @@ impl Socket for UnixDatagramSocket {
                 return Err(SystemError::EBADF);
             }
             let was_unbound = inner.local_addr.is_none();
-            match inner.bind(candidate, &self.netns) {
+            match inner.bind(candidate, &self.netns, socket_mode) {
                 Ok(()) => break (inner, was_unbound),
                 Err(error) => {
                     drop(inner);
@@ -1331,6 +1336,10 @@ impl Socket for UnixDatagramSocket {
 
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 }
 

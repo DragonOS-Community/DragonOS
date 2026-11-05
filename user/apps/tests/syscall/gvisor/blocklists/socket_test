@@ -1,5 +1,4 @@
-# fchmod/fstatfs 在 Unix socket 上尚未实现；fstatfs 还会触发内核 panic
-SocketTest.UnixSocketStat
-SocketTest.UnixSocketStatFS
-# socket 文件的权限位与 Linux 不一致
-SocketTest.Permission
+# Socket inode metadata and sockfs behavior are covered by:
+# - kernel/src/net/socket/fs.rs
+# - kernel/src/net/socket/inode.rs
+# - normal/unix_socket_stat

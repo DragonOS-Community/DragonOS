@@ -24,7 +24,7 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::mm::MemoryManagementArch;
 use crate::net::socket::common::{write_i32_getsockopt, EPollItems, ShutdownBit};
 use crate::net::socket::endpoint::Endpoint;
-use crate::net::socket::{RecvFromAddrBehavior, Socket, PMSG, PSO, PSOL};
+use crate::net::socket::{RecvFromAddrBehavior, Socket, SocketInodeMetadata, PMSG, PSO, PSOL};
 
 use super::addr::{ConnectionId, VsockEndpoint, VMADDR_CID_ANY, VMADDR_CID_LOCAL, VMADDR_PORT_ANY};
 use super::global::global_vsock_space;
@@ -152,6 +152,8 @@ pub struct VsockStreamSocket {
     wait_queue: WaitQueue,
     /// VFS 层 inode 标识
     inode_id: InodeId,
+    /// sockfs inode 元数据（权限、属主、时间戳）
+    inode_metadata: SocketInodeMetadata,
     /// 打开该 socket 的文件引用计数
     open_files: AtomicUsize,
     fsnotify_watches: AtomicUsize,
@@ -179,11 +181,13 @@ impl VsockStreamSocket {
     /// - 绑定到全局 `VsockSpace`
     /// - 初始化 waitqueue/epoll/fasync 元数据
     pub fn new(nonblock: bool) -> Result<Arc<Self>, SystemError> {
+        let inode_id = generate_inode_id();
         Ok(Arc::new_cyclic(|me| Self {
             inner: Mutex::new(VsockStreamInner::default()),
             space: global_vsock_space(),
             wait_queue: WaitQueue::default(),
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             nonblock: AtomicBool::new(nonblock),
@@ -1501,6 +1505,10 @@ impl Socket for VsockStreamSocket {
     /// 返回 socket inode 标识。
     fn socket_inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    fn inode_metadata(&self) -> &SocketInodeMetadata {
+        &self.inode_metadata
     }
 
     /// 获取 socket 选项。

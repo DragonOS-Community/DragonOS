@@ -126,6 +126,11 @@ pub(crate) fn do_accept(
 
     let prepared = super::prepare_socket_file()?;
     let (new_socket, remote_endpoint) = sock.socket()?.accept()?;
+    // Linux allocates the accepted sockfs inode in `do_accept()`'s caller
+    // (`sock_alloc()` in net/socket.c), so its owner is the accepting task.
+    // Unix stream children are materialized by the connecting task's
+    // `connect()`, so refresh the owner before publishing the descriptor.
+    new_socket.inode_metadata().reset_owner_to_current();
     let new_file = super::finish_socket_file(new_socket, file_mode, prepared)?;
 
     if !addr.is_null() {

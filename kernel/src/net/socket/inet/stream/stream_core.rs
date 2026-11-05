@@ -10,7 +10,7 @@ use crate::libs::wait_queue::WaitQueue;
 use crate::net::socket::common::EPollItems;
 use crate::net::socket::inet::common::port::TcpPortOwner;
 use crate::net::socket::inet::common::SocketDeviceBinding;
-use crate::net::socket::Socket;
+use crate::net::socket::{Socket, SocketInodeMetadata};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
@@ -228,6 +228,7 @@ pub struct TcpSocketData {
     pub(crate) nonblock: AtomicBool,
     pub(crate) wait_queue: WaitQueue,
     pub(crate) inode_id: InodeId,
+    pub(crate) inode_metadata: SocketInodeMetadata,
     pub(crate) open_files: AtomicUsize,
     pub(crate) fsnotify_watches: AtomicUsize,
     pub(crate) self_ref: Weak<TcpSocket>,
@@ -330,6 +331,7 @@ impl TcpSocket {
             };
             atomic.store(policy as i32, core::sync::atomic::Ordering::Relaxed);
         }
+        let inode_id = generate_inode_id();
         TcpSocketData {
             memory,
             inner: RwSem::new(inner),
@@ -337,7 +339,8 @@ impl TcpSocket {
             send_fin_deferred: AtomicBool::new(false),
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::default(),
-            inode_id: generate_inode_id(),
+            inode_id,
+            inode_metadata: SocketInodeMetadata::new(inode_id),
             open_files: AtomicUsize::new(0),
             fsnotify_watches: AtomicUsize::new(0),
             self_ref: me.clone(),

@@ -328,6 +328,9 @@ pub trait Socket: PollableInode + IndexNode {
     /// 唯一且稳定的 socket inode 号，由 socket 创建时分配
     fn socket_inode_id(&self) -> InodeId;
 
+    /// Mutable sockfs inode attributes owned by this socket instance.
+    fn inode_metadata(&self) -> &super::inode::SocketInodeMetadata;
+
     /// 验证 sendto/sendmsg 的目标地址
     ///
     /// 用于在发送数据前验证用户提供的目标地址是否有效。

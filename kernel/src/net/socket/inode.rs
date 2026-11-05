@@ -36,12 +36,7 @@ pub struct SocketInodeMetadata {
 
 impl SocketInodeMetadata {
     pub fn new(inode_id: InodeId) -> Self {
-        let (uid, gid) = if ProcessManager::initialized() {
-            let cred = ProcessManager::current_cred();
-            (cred.fsuid.data(), cred.fsgid.data())
-        } else {
-            (0, 0)
-        };
+        let (uid, gid) = current_socket_owner();
         let mut metadata =
             Metadata::new(FileType::Socket, InodeMode::S_IFSOCK | InodeMode::S_IRWXUGO);
         metadata.inode_id = inode_id;
@@ -64,7 +59,23 @@ impl SocketInodeMetadata {
     }
 
     pub fn set_metadata_masked(&self, requested: &Metadata, mask: SetMetadataMask) {
-        merge_metadata_masked(&mut self.metadata.lock(), requested, mask);
+        let mut metadata = self.metadata.lock();
+        merge_metadata_masked(&mut metadata, requested, mask);
+    }
+
+    /// Reinitialize the owner of an inode that is being published by
+    /// `accept(2)`.
+    ///
+    /// Linux allocates the accepted socket's sockfs inode inside the accepting
+    /// task (`sock_alloc()` in `net/socket.c`), so `i_uid`/`i_gid` come from
+    /// the acceptor's fsuid/fsgid. Protocols that materialize the passive peer
+    /// on `connect()` (Unix streams) must refresh the owner before exposing the
+    /// child descriptor.
+    pub fn reset_owner_to_current(&self) {
+        let (uid, gid) = current_socket_owner();
+        let mut metadata = self.metadata.lock();
+        metadata.uid = uid;
+        metadata.gid = gid;
     }
 
     /// Run the caller's check-and-compute step while holding the metadata
@@ -78,8 +89,17 @@ impl SocketInodeMetadata {
     ) -> Result<SetMetadataMask, SystemError> {
         let mut metadata = self.metadata.lock();
         let (requested, mask) = update(&metadata)?;
-        merge_metadata_masked(&mut *metadata, &requested, mask);
+        merge_metadata_masked(&mut metadata, &requested, mask);
         Ok(mask)
+    }
+}
+
+fn current_socket_owner() -> (usize, usize) {
+    if ProcessManager::initialized() {
+        let cred = ProcessManager::current_cred();
+        (cred.fsuid.data(), cred.fsgid.data())
+    } else {
+        (0, 0)
     }
 }
 

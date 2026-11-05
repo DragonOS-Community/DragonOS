@@ -3,12 +3,15 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <string>
@@ -41,6 +44,18 @@ std::string UniquePath(const char* tag) {
     snprintf(path, sizeof(path), "/tmp/dunitest-%s-%d", tag, getpid());
     return path;
 }
+
+struct AbstractAddress {
+    sockaddr_un addr{};
+    socklen_t len;
+
+    explicit AbstractAddress(int suffix) {
+        addr.sun_family = AF_UNIX;
+        const int written = snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1,
+                                     "dunitest-stat-%d-%d", getpid(), suffix);
+        len = offsetof(sockaddr_un, sun_path) + 1 + written;
+    }
+};
 
 class ScopedUmask {
 public:
@@ -139,6 +154,53 @@ TEST(UnixSocketStat, DatagramPathBindUsesCurrentSocketMode) {
     EXPECT_TRUE(S_ISSOCK(st.st_mode));
     EXPECT_EQ(0744U, PermissionBits(st.st_mode));
     EXPECT_EQ(0, unlink(path.c_str())) << strerror(errno);
+}
+
+TEST(UnixSocketStat, AcceptedSocketIsOwnedByAcceptor) {
+    if (geteuid() != 0) GTEST_SKIP() << "requires root to change euid";
+    const AbstractAddress address(1);
+    Fd listener(socket(AF_UNIX, SOCK_STREAM, 0));
+    ASSERT_GE(listener.fd, 0) << strerror(errno);
+    ASSERT_EQ(0, bind(listener.fd, reinterpret_cast<const sockaddr*>(&address.addr), address.len))
+        << strerror(errno);
+    ASSERT_EQ(0, listen(listener.fd, 1)) << strerror(errno);
+
+    int ready[2];
+    ASSERT_EQ(0, pipe(ready)) << strerror(errno);
+    const pid_t client_pid = fork();
+    ASSERT_GE(client_pid, 0) << strerror(errno);
+    if (client_pid == 0) {
+        close(ready[0]);
+        close(listener.fd);
+        Fd client(socket(AF_UNIX, SOCK_STREAM, 0));
+        const bool connected =
+            client.fd >= 0 && seteuid(12345) == 0 &&
+            connect(client.fd, reinterpret_cast<const sockaddr*>(&address.addr), address.len) == 0 &&
+            seteuid(0) == 0;
+        const char status = connected ? 'Y' : 'N';
+        const ssize_t written = write(ready[1], &status, 1);
+        _exit(connected && written == 1 ? 0 : 1);
+    }
+
+    close(ready[1]);
+    char status = 0;
+    ASSERT_EQ(1, read(ready[0], &status, 1)) << strerror(errno);
+    close(ready[0]);
+    if (status != 'Y') {
+        int wait_status = 0;
+        waitpid(client_pid, &wait_status, 0);
+        FAIL() << "client failed to connect after switching euid";
+    }
+
+    Fd accepted(accept(listener.fd, nullptr, nullptr));
+    ASSERT_GE(accepted.fd, 0) << strerror(errno);
+    // Linux allocates the accepted inode in the accepting task, so the
+    // connecting task's fsuid/fsgid must not leak into this descriptor.
+    ExpectUnixSocketStat(accepted.fd);
+
+    int wait_status = 0;
+    ASSERT_EQ(client_pid, waitpid(client_pid, &wait_status, 0)) << strerror(errno);
+    EXPECT_TRUE(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
 }
 
 int main(int argc, char** argv) {

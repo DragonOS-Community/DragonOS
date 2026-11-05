@@ -689,8 +689,18 @@ fi
 # 安装rust
 rustInstall
 
-# 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.1 --locked || exit 1
+# 安装dadk。源码在脚本旁边的 dadk/，二进制安装到 cargo bin。
+# 不进入该目录，避免 rust-toolchain.toml 改掉当前的 +nightly。
+# cargo install --path 在同版本已安装时仍会重编，因此先按版本跳过。
+dadk_src="$(cd "$(dirname "$0")" && pwd)/dadk"
+test -f "$dadk_src/Cargo.toml" || (echo "dadk source not found: $dadk_src" && exit 1)
+min_dadk_version=0.6.1
+installed_dadk_version="$(dadk -V 2>/dev/null | awk 'END {print $2}')"
+if [ -n "$installed_dadk_version" ] && [ "$(printf '%s\n%s' "$installed_dadk_version" "$min_dadk_version" | sort -V | head -n1)" = "$min_dadk_version" ]; then
+	echo "dadk version ${installed_dadk_version} installed"
+else
+	cargo +nightly install --path "$dadk_src/dadk" --locked || exit 1
+fi
 
 bashpath=$(cd `dirname $0`; pwd)
 

@@ -26,7 +26,7 @@ cargo generate --git https://git.mirrors.dragonos.org/DragonOS-Community/Rust-Ap
 ```
 
 4. 使用`cargo run`来运行项目
-5. 在DragonOS的`user/dadk/config`目录下，参考模版[userapp_config.toml](https://github.com/DragonOS-Community/DADK/blob/main/dadk-config/templates/config/userapp_config.toml)，创建编译配置,安装到DragonOS的`/`目录下。 
+5. 在DragonOS的`user/dadk/config`目录下，参考模版 `tools/dadk/dadk-config/templates/config/userapp_config.toml`，创建编译配置,安装到DragonOS的`/`目录下。 
 (在dadk的编译命令选项处，请使用Makefile里面的`make install`配置进行编译、安装)
 6. 编译DragonOS即可安装
 

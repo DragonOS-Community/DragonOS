@@ -1,0 +1,30 @@
+{
+  "name": "app_target_arch_x86_64_uppercase",
+  "version": "0.1.0",
+  "description": "An app targets x86_64(upper case and empty space)",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url": "1",
+        "branch": "1",
+        "revision": null
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "1"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "1"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": [
+    "X86_64 "
+  ]
+}

@@ -7,12 +7,15 @@
 #include <string>
 #include <sys/mount.h>
 #include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 namespace {
 constexpr long kSysfsMagic = 0x62656572;
 constexpr long kProcMagic = 0x9fa0;
 constexpr long kCgroup2Magic = 0x63677270;
+// glibc does not expose ST_VALID; value from Linux include/linux/statfs.h.
+constexpr unsigned long kStatFsValid = 0x0020;
 
 void ExpectIdentity(const std::string& path, long magic) {
     struct statfs by_path {}, by_fd {};
@@ -78,6 +81,28 @@ TEST(SysfsStatfs, OtherFilesystemOwnersKeepTheirOwnIdentity) {
     ASSERT_EQ(0, cgroup.Mount("none", "cgroup2")) << strerror(errno);
     ASSERT_NO_FATAL_FAILURE(ExpectIdentity(cgroup.path(), kCgroup2Magic));
     ASSERT_NO_FATAL_FAILURE(ExpectIdentity("/sys", kSysfsMagic));
+}
+
+TEST(StatfsFlags, MountFlagsUseStatfsAbi) {
+    MountPoint tmpfs;
+    ASSERT_FALSE(tmpfs.path().empty());
+    ASSERT_EQ(0, tmpfs.Mount("none", "tmpfs", MS_RELATIME | MS_NOSYMFOLLOW))
+        << strerror(errno);
+
+    struct statfs by_path {}, by_fd {};
+    ASSERT_EQ(0, statfs(tmpfs.path().c_str(), &by_path)) << strerror(errno);
+    int fd = open(tmpfs.path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(fd, 0) << strerror(errno);
+    const int result = fstatfs(fd, &by_fd);
+    const int error = errno;
+    EXPECT_EQ(0, close(fd));
+    ASSERT_EQ(0, result) << strerror(error);
+
+    EXPECT_EQ(by_path.f_flags, by_fd.f_flags);
+    // MS_RELATIME/MS_NOSYMFOLLOW differ numerically from their ST_*
+    // counterparts; a raw flag passthrough would fail this assertion.
+    EXPECT_EQ(kStatFsValid | ST_RELATIME | ST_NOSYMFOLLOW,
+              static_cast<unsigned long>(by_path.f_flags));
 }
 } // namespace
 

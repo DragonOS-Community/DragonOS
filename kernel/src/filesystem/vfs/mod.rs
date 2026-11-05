@@ -3422,7 +3422,8 @@ pub struct SuperBlock {
     pub namelen: u64,
     // fragment size
     pub frsize: u64,
-    // mount flags of filesystem
+    // mount flags of filesystem; MountFS merges per-mount and superblock flags
+    // here, and statfs(2) translates them into the `ST_*` ABI.
     pub flags: u64,
 }
 

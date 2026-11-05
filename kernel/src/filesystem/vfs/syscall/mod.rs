@@ -1,6 +1,9 @@
 use crate::time::PosixTimeSpec;
 
-use super::{fcntl::AtFlags, file::FileFlags, utils::OpenHowResolve, InodeMode, SuperBlock};
+use super::{
+    fcntl::AtFlags, file::FileFlags, mount::MountFlags, utils::OpenHowResolve, InodeMode,
+    SuperBlock,
+};
 mod dup2;
 mod faccessat2;
 mod link_utils;
@@ -365,6 +368,74 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// Flags reported in `statfs(2)`'s `f_flags`.
+    ///
+    /// Values are the Linux UAPI ones from `include/linux/statfs.h`. They are
+    /// not reusable copies of `MountFlags`: the kernel translates mount and
+    /// superblock flags before exposing them, and several values differ
+    /// (`MS_NOSYMFOLLOW` is 0x100 while `ST_NOSYMFOLLOW` is 0x2000).
+    pub struct StatFsFlags: u64 {
+        const RDONLY = 0x0001;
+        const NOSUID = 0x0002;
+        const NODEV = 0x0004;
+        const NOEXEC = 0x0008;
+        const SYNCHRONOUS = 0x0010;
+        const VALID = 0x0020;
+        const MANDLOCK = 0x0040;
+        const NOATIME = 0x0400;
+        const NODIRATIME = 0x0800;
+        const RELATIME = 0x1000;
+        const NOSYMFOLLOW = 0x2000;
+    }
+}
+
+impl StatFsFlags {
+    /// Translate the VFS flag word returned in `SuperBlock::flags`.
+    ///
+    /// `MountFS` fills that field with the merged per-mount and superblock
+    /// flags, so this mirrors Linux's `calculate_f_flags()`. The superblock
+    /// having provided a statfs view is what `ST_VALID` advertises, so it is
+    /// always set. Only flags with a `ST_*` representation are exposed;
+    /// `MS_DIRSYNC` is intentionally omitted because Linux does not translate
+    /// it either (0x0080 belongs to `ST_WRITE`).
+    fn from_vfs_flags(flags: u64) -> Self {
+        let flags = MountFlags::from_bits_truncate(flags as u32);
+        let mut f_flags = StatFsFlags::VALID;
+        if flags.contains(MountFlags::RDONLY) {
+            f_flags |= StatFsFlags::RDONLY;
+        }
+        if flags.contains(MountFlags::NOSUID) {
+            f_flags |= StatFsFlags::NOSUID;
+        }
+        if flags.contains(MountFlags::NODEV) {
+            f_flags |= StatFsFlags::NODEV;
+        }
+        if flags.contains(MountFlags::NOEXEC) {
+            f_flags |= StatFsFlags::NOEXEC;
+        }
+        if flags.contains(MountFlags::SYNCHRONOUS) {
+            f_flags |= StatFsFlags::SYNCHRONOUS;
+        }
+        if flags.contains(MountFlags::MANDLOCK) {
+            f_flags |= StatFsFlags::MANDLOCK;
+        }
+        if flags.contains(MountFlags::NOATIME) {
+            f_flags |= StatFsFlags::NOATIME;
+        }
+        if flags.contains(MountFlags::NODIRATIME) {
+            f_flags |= StatFsFlags::NODIRATIME;
+        }
+        if flags.contains(MountFlags::RELATIME) {
+            f_flags |= StatFsFlags::RELATIME;
+        }
+        if flags.contains(MountFlags::NOSYMFOLLOW) {
+            f_flags |= StatFsFlags::NOSYMFOLLOW;
+        }
+        f_flags
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PosixStatfs {
@@ -395,7 +466,7 @@ impl From<SuperBlock> for PosixStatfs {
             f_fsid: super_block.fsid,
             f_namelen: super_block.namelen,
             f_frsize: super_block.frsize,
-            f_flags: super_block.flags,
+            f_flags: StatFsFlags::from_vfs_flags(super_block.flags).bits(),
             f_spare: [0u64; 4],
         }
     }

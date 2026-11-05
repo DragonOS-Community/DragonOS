@@ -150,6 +150,6 @@ clock_getres_test
 clock_gettime_test
 setgid_test
 uidgid_test
-partitial_bad_buffer_test
+partial_bad_buffer_test
 sysinfo_test
 ptrace_test

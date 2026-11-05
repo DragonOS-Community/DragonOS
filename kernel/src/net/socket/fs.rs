@@ -5,7 +5,7 @@
 //! only supplies the stable filesystem identity used by `fstatfs(2)` and the
 //! mandatory `FileSystem` contract.
 
-use alloc::{string::String, sync::Arc};
+use alloc::sync::Arc;
 use core::any::Any;
 
 use crate::{

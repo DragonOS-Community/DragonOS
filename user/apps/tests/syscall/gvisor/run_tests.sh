@@ -66,22 +66,41 @@ adjust_readv_blocklist() {
         return 0
     fi
 
+    local unblock=0
     if [ "$avail_kb" -ge "$THRESHOLD_KB" ]; then
         echo "[gvisor] MemAvailable=${avail_kb}kB >= ${THRESHOLD_KB}kB, enable ${HEAVY_TEST}"
-        # Comment out the entry so runner will NOT block it.
-        /bin/busybox awk -v t="$HEAVY_TEST" '
-            {
-                line=$0
-                gsub(/[ \t\r]+$/, "", line)
-                if (line == t) {
-                    print "# " t
-                    next
-                }
-                print $0
-            }
-        ' "$BLOCKLIST_FILE" > "$BLOCKLIST_FILE"
+        unblock=1
     else
-        echo "[gvisor] MemAvailable=${avail_kb}kB < ${THRESHOLD_KB}kB, keep ${HEAVY_TEST} blocked"
+        echo "[gvisor] MemAvailable=${avail_kb}kB < ${THRESHOLD_KB}kB, keep/force ${HEAVY_TEST} blocked"
+    fi
+
+    # Normalize the entry in both directions so reusing a persisted rootfs
+    # across machines with different memory sizes cannot leave the 2GiB case
+    # enabled below the threshold. Rewrite through a sibling file: directing
+    # awk output at $BLOCKLIST_FILE truncates the input before awk reads it.
+    local tmp_file="${BLOCKLIST_FILE}.tmp.$$"
+    if /bin/busybox awk -v t="$HEAVY_TEST" -v unblock="$unblock" '
+        {
+            line=$0
+            trimmed=line
+            gsub(/^[ \t]+/, "", trimmed)
+            gsub(/[ \t\r]+$/, "", trimmed)
+            entry=trimmed
+            sub(/^#[ \t]*/, "", entry)
+            if (entry == t) {
+                print (unblock == 1 ? "# " t : t)
+                next
+            }
+            print $0
+        }
+    ' "$BLOCKLIST_FILE" > "$tmp_file"; then
+        if ! /bin/busybox mv -f "$tmp_file" "$BLOCKLIST_FILE"; then
+            /bin/busybox rm -f "$tmp_file"
+            echo "[gvisor] failed to replace ${BLOCKLIST_FILE}" >&2
+        fi
+    else
+        /bin/busybox rm -f "$tmp_file"
+        echo "[gvisor] failed to rewrite ${BLOCKLIST_FILE}" >&2
     fi
 
 }

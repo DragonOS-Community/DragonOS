@@ -1,10 +1,12 @@
 use crate::{
+    arch::MMArch,
     filesystem::vfs::{
         fasync::FAsyncItem, file::File, merge_metadata_masked, FilePrivateData, FileType,
         IndexNode, InodeId, InodeMode, Metadata, MetadataUpdate, PollableInode, SetMetadataMask,
     },
     libs::mutex::MutexGuard,
     libs::spinlock::SpinLock,
+    mm::MemoryManagementArch,
     process::ProcessManager,
     syscall::user_access::{UserBufferReader, UserBufferWriter},
 };
@@ -40,6 +42,9 @@ impl SocketInodeMetadata {
         let mut metadata =
             Metadata::new(FileType::Socket, InodeMode::S_IFSOCK | InodeMode::S_IRWXUGO);
         metadata.inode_id = inode_id;
+        // Linux places sockets on the pseudo `sockfs`, whose block size is
+        // PAGE_SIZE, so `i_blocksize()` (and therefore `st_blksize`) is a page.
+        metadata.blk_size = MMArch::PAGE_SIZE;
         metadata.uid = uid;
         metadata.gid = gid;
         Self {

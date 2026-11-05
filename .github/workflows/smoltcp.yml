@@ -1,0 +1,124 @@
+name: smoltcp
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "kernel/crates/smoltcp/**"
+      - ".github/workflows/smoltcp.yml"
+  pull_request:
+    branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "kernel/crates/smoltcp/**"
+      - ".github/workflows/smoltcp.yml"
+
+# kernel/rust-toolchain.toml would otherwise pin every cargo invocation under
+# kernel/ to the kernel nightly. Each job sets RUSTUP_TOOLCHAIN so this crate
+# keeps the toolchain its own CI expects.
+env:
+  RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+  RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: kernel/crates/smoltcp
+
+jobs:
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+  clippy:
+    name: Clippy (MSRV 1.80)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80.0
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo +1.80.0 clippy --locked --tests --examples -- -D warnings
+
+  test:
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.80.0", "stable"]
+        features:
+          - default
+          - std,proto-ipv4
+          - std,medium-ethernet,phy-raw_socket,proto-ipv6,socket-udp,socket-dns
+          - std,medium-ethernet,phy-tuntap_interface,proto-ipv6,socket-udp
+          - std,medium-ethernet,proto-ipv4,proto-ipv4-fragmentation,socket-raw,socket-dns
+          - std,medium-ethernet,proto-ipv4,multicast,socket-raw,socket-dns
+          - std,medium-ethernet,proto-ipv4,socket-udp,socket-tcp,socket-dns
+          - std,medium-ethernet,proto-ipv4,proto-dhcpv4,socket-udp
+          - std,medium-ethernet,medium-ip,medium-ieee802154,proto-ipv6,multicast,proto-rpl,socket-udp,socket-dns
+          - std,medium-ethernet,proto-ipv6,socket-tcp
+          - std,medium-ethernet,medium-ip,proto-ipv4,socket-icmp,socket-tcp
+          - std,medium-ip,proto-ipv6,socket-icmp,socket-tcp
+          - std,medium-ieee802154,proto-sixlowpan,socket-udp
+          - std,medium-ieee802154,proto-sixlowpan,proto-sixlowpan-fragmentation,socket-udp
+          - std,medium-ieee802154,proto-rpl,proto-sixlowpan,proto-sixlowpan-fragmentation,socket-udp
+          - std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-udp
+          - std,medium-ethernet,medium-ip,medium-ieee802154,proto-ipv4,proto-ipv6,multicast,proto-rpl,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async
+          - std,medium-ieee802154,medium-ip,proto-ipv4,socket-raw
+          - std,medium-ethernet,proto-ipv4,proto-ipsec,socket-raw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Test
+        run: cargo +${{ matrix.toolchain }} test --locked --no-default-features --features "${{ matrix.features }}"
+
+  test-nightly:
+    name: Test (nightly)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Test nightly-only features
+        run: cargo +nightly test --locked --no-default-features --features "alloc,medium-ethernet,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp,socket-icmp"
+
+  check:
+    name: Check (MSRV 1.80)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80.0
+      - name: Check feature combinations and examples
+        run: |
+          set -euo pipefail
+          features=(
+            "medium-ip,medium-ethernet,medium-ieee802154,proto-ipv6,proto-ipv6,multicast,proto-dhcpv4,proto-ipsec,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async"
+            "defmt,medium-ip,medium-ethernet,proto-ipv6,proto-ipv6,multicast,proto-dhcpv4,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async"
+            "defmt,alloc,medium-ip,medium-ethernet,proto-ipv6,proto-ipv6,multicast,proto-dhcpv4,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async"
+          )
+          for feature_set in "${features[@]}"; do
+            cargo +1.80.0 check --locked --no-default-features --features "$feature_set"
+          done
+          cargo +1.80.0 check --locked --examples
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz packet parser
+        run: cargo +nightly fuzz run packet_parser -- -max_len=1536 -max_total_time=30

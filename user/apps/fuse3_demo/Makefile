@@ -15,8 +15,7 @@ MESON ?= meson
 
 LIBFUSE_VERSION ?= 3.18.1
 LIBFUSE_NAME := fuse-$(LIBFUSE_VERSION)
-LIBFUSE_REPO ?= https://cnb.cool/DragonOS-Community/libfuse.git
-LIBFUSE_URL_MIRROR ?= https://github.com/libfuse/libfuse/releases/download/fuse-$(LIBFUSE_VERSION)/$(LIBFUSE_NAME).tar.gz
+LIBFUSE_URL ?= https://github.com/libfuse/libfuse/releases/download/fuse-$(LIBFUSE_VERSION)/$(LIBFUSE_NAME).tar.gz
 
 LIBFUSE_CACHE_DIR := $(CURDIR)/.cache
 LIBFUSE_ARCHIVE ?= $(LIBFUSE_CACHE_DIR)/$(LIBFUSE_NAME).tar.gz
@@ -44,14 +43,10 @@ $(LIBFUSE_ARCHIVE):
 		exit 0; \
 	fi
 	@echo "[libfuse] downloading $(LIBFUSE_VERSION)"
-	@tmp_dir=$$(mktemp -d); trap 'rm -rf "$$tmp_dir"' EXIT; \
-	if git clone --depth 1 --branch "$(LIBFUSE_NAME)" "$(LIBFUSE_REPO)" "$$tmp_dir/libfuse" && \
-		git -C "$$tmp_dir/libfuse" archive --format=tar.gz --prefix="$(LIBFUSE_NAME)/" -o "$@.tmp" HEAD; then \
-		:; \
-	elif command -v curl >/dev/null 2>&1; then \
-		curl -fL --retry 3 --retry-delay 1 -o "$@.tmp" "$(LIBFUSE_URL_MIRROR)"; \
+	@if command -v curl >/dev/null 2>&1; then \
+		curl -fL --retry 3 --retry-delay 1 -o "$@.tmp" "$(LIBFUSE_URL)"; \
 	elif command -v wget >/dev/null 2>&1; then \
-		wget -O "$@.tmp" "$(LIBFUSE_URL_MIRROR)"; \
+		wget -O "$@.tmp" "$(LIBFUSE_URL)"; \
 	else \
 		echo "error: neither curl nor wget found"; \
 		exit 1; \

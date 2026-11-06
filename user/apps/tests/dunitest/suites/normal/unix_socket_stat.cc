@@ -20,6 +20,8 @@ namespace {
 
 constexpr unsigned long kSockfsMagic = 0x534f434b;
 constexpr unsigned long kSockfsNameMax = 255;
+// musl does not expose ST_VALID; value from Linux include/linux/statfs.h.
+constexpr unsigned long kStatFsValid = 0x0020;
 constexpr unsigned kSocketPermissionMask = 07777;
 
 struct Fd {
@@ -80,6 +82,9 @@ void ExpectUnixSocketStat(int fd) {
     EXPECT_EQ(static_cast<unsigned>(geteuid()), st.st_uid);
     EXPECT_EQ(static_cast<unsigned>(getegid()), st.st_gid);
     EXPECT_NE(0U, st.st_ino);
+    // sockfs inodes carry the pseudo filesystem block size, not the 512-byte
+    // fallback used by block devices.
+    EXPECT_EQ(static_cast<blksize_t>(getpagesize()), st.st_blksize);
 }
 
 }  // namespace
@@ -97,12 +102,18 @@ TEST(UnixSocketStat, FchmodUpdatesModeAndCtime) {
     Fd fd(socket(AF_UNIX, SOCK_STREAM, 0));
     ASSERT_GE(fd.fd, 0) << strerror(errno);
 
+    struct stat before = {};
+    ASSERT_EQ(0, fstat(fd.fd, &before)) << strerror(errno);
     ASSERT_EQ(0, fchmod(fd.fd, 0765)) << strerror(errno);
     struct stat st = {};
     ASSERT_EQ(0, fstat(fd.fd, &st)) << strerror(errno);
     EXPECT_EQ(static_cast<mode_t>(S_IFSOCK), st.st_mode & S_IFMT);
     EXPECT_EQ(0765U, PermissionBits(st.st_mode));
     EXPECT_NE(0, st.st_ctime);
+    // chmod updates mode and ctime only; Linux leaves access/modify times
+    // untouched.
+    EXPECT_EQ(before.st_atime, st.st_atime);
+    EXPECT_EQ(before.st_mtime, st.st_mtime);
 }
 
 TEST(UnixSocketStat, FstatfsReportsSockfs) {
@@ -115,6 +126,8 @@ TEST(UnixSocketStat, FstatfsReportsSockfs) {
     EXPECT_EQ(static_cast<unsigned long>(getpagesize()), static_cast<unsigned long>(st.f_bsize));
     EXPECT_EQ(kSockfsNameMax, static_cast<unsigned long>(st.f_namelen));
     EXPECT_EQ(static_cast<unsigned long>(st.f_bsize), static_cast<unsigned long>(st.f_frsize));
+    // sockfs is not mounted, so the only flag Linux reports is ST_VALID.
+    EXPECT_EQ(kStatFsValid, static_cast<unsigned long>(st.f_flags));
 }
 
 TEST(UnixSocketStat, PathBindAppliesSocketModeAndUmask) {

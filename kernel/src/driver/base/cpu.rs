@@ -312,8 +312,7 @@ impl Attribute for AttrCpuPossible {
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let cpu_manager = crate::smp::cpu::smp_cpu_manager();
-        let cpus = cpu_manager.possible_cpus_count();
-        let data = format!("0-{}", cpus - 1);
+        let data = cpu_manager.possible_cpus().to_cpulist();
         sysfs_emit_str(buf, &data)
     }
 }
@@ -336,8 +335,7 @@ impl Attribute for AttrCpuPresent {
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let cpu_manager = crate::smp::cpu::smp_cpu_manager();
-        let cpus = cpu_manager.present_cpus_count();
-        let data = format!("0-{}", cpus - 1);
+        let data = cpu_manager.present_cpus().to_cpulist();
         sysfs_emit_str(buf, &data)
     }
 }
@@ -360,8 +358,7 @@ impl Attribute for AttrCpuOnline {
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let cpu_manager = crate::smp::cpu::smp_cpu_manager();
-        let cpus = cpu_manager.present_cpus_count();
-        let data = format!("0-{}", cpus - 1);
+        let data = cpu_manager.online_cpus().to_cpulist();
         sysfs_emit_str(buf, &data)
     }
 }

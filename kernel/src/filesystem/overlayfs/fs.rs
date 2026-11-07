@@ -74,7 +74,10 @@ pub(super) struct RealInodeIdentity {
 impl RealInodeIdentity {
     pub(super) fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
         let fs = OverlayFS::canonical_backing_fs(inode);
-        let metadata = inode.metadata()?;
+        // 身份字段（dev_id/inode_id）在 inode 生命周期内不变，优先用
+        // 缓存元数据（ext4 实现无堆分配），未实现的文件系统再回退
+        // 完整 getattr。挂载与每次 lower 解析都会走到这里。
+        let metadata = inode.cached_metadata().or_else(|_| inode.metadata())?;
         Ok(Self {
             filesystem: Arc::as_ptr(&fs) as *const () as usize,
             dev_id: metadata.dev_id,
@@ -982,7 +985,15 @@ impl OverlayFS {
             return Ok(false);
         }
 
-        Ok(left.metadata()?.inode_id == right.metadata()?.inode_id)
+        let left_id = left
+            .cached_metadata()
+            .or_else(|_| left.metadata())?
+            .inode_id;
+        let right_id = right
+            .cached_metadata()
+            .or_else(|_| right.metadata())?
+            .inode_id;
+        Ok(left_id == right_id)
     }
 
     fn is_mount_ancestor(

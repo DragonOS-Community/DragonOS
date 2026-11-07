@@ -9,7 +9,7 @@
 
 let
   gtest = pkgs.fetchgit {
-    url = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest";
+    url = "https://cnb.cool/DragonOS-Community/googletest";
     rev = "v1.17.0";
     sha256 = "sha256-HIHMxAUR4bjmFLoltJeIAVSulVQ6kVuIT2Ku+lwAx/4=";
   };

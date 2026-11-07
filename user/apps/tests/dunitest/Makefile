@@ -43,7 +43,7 @@ FAT16_DIRECTORY_FIXTURE = $(BUILD_DIR)/fixtures/fat16_directory.img
 SUITES = demo normal fuse
 
 GTEST_ROOT = third_party/googletest
-GTEST_REPO = https://git.mirrors.dragonos.org.cn/DragonOS-Community/googletest
+GTEST_REPO = https://cnb.cool/DragonOS-Community/googletest
 GTEST_TAG = v1.17.0
 GTEST_SRC = $(GTEST_ROOT)/googletest/src/gtest-all.cc
 GTEST_OBJ = $(BUILD_DIR)/gtest/gtest-all.o

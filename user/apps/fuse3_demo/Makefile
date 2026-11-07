@@ -15,11 +15,10 @@ MESON ?= meson
 
 LIBFUSE_VERSION ?= 3.18.1
 LIBFUSE_NAME := fuse-$(LIBFUSE_VERSION)
-LIBFUSE_URL_PRIMARY ?= https://git.mirrors.dragonos.org.cn/DragonOS-Community/libfuse/archive/fuse-$(LIBFUSE_VERSION).tar.gz
-LIBFUSE_URL_MIRROR ?= https://github.com/libfuse/libfuse/releases/download/fuse-$(LIBFUSE_VERSION)/$(LIBFUSE_NAME).tar.gz
+LIBFUSE_URL ?= https://cnb.cool/DragonOS-Community/libfuse/-/git/archive/$(LIBFUSE_NAME).tar.gz
 
 LIBFUSE_CACHE_DIR := $(CURDIR)/.cache
-LIBFUSE_ARCHIVE ?= $(LIBFUSE_CACHE_DIR)/$(LIBFUSE_NAME).tar.gz
+LIBFUSE_ARCHIVE ?= $(LIBFUSE_CACHE_DIR)/cnb-$(LIBFUSE_NAME).tar.gz
 LIBFUSE_SRC_ROOT := $(CURDIR)/.build/libfuse-src
 LIBFUSE_SRC_DIR := $(LIBFUSE_SRC_ROOT)/$(LIBFUSE_NAME)
 LIBFUSE_BUILD_DIR := $(CURDIR)/.build/libfuse-build-$(ARCH)
@@ -45,11 +44,9 @@ $(LIBFUSE_ARCHIVE):
 	fi
 	@echo "[libfuse] downloading $(LIBFUSE_VERSION)"
 	@if command -v curl >/dev/null 2>&1; then \
-		curl -fL --retry 3 --retry-delay 1 -o "$@.tmp" "$(LIBFUSE_URL_PRIMARY)" || \
-		curl -fL --retry 3 --retry-delay 1 -o "$@.tmp" "$(LIBFUSE_URL_MIRROR)"; \
+		curl -fL --retry 3 --retry-delay 1 -o "$@.tmp" "$(LIBFUSE_URL)"; \
 	elif command -v wget >/dev/null 2>&1; then \
-		wget -O "$@.tmp" "$(LIBFUSE_URL_PRIMARY)" || \
-		wget -O "$@.tmp" "$(LIBFUSE_URL_MIRROR)"; \
+		wget -O "$@.tmp" "$(LIBFUSE_URL)"; \
 	else \
 		echo "error: neither curl nor wget found"; \
 		exit 1; \
@@ -60,7 +57,7 @@ $(LIBFUSE_SRC_DIR): $(LIBFUSE_ARCHIVE)
 	@mkdir -p $(LIBFUSE_SRC_ROOT)
 	@rm -rf "$(LIBFUSE_SRC_DIR)"
 	@mkdir -p "$(LIBFUSE_SRC_DIR)"
-	@tar -xzf "$(LIBFUSE_ARCHIVE)" -C "$(LIBFUSE_SRC_DIR)" --strip-components=1
+	@tar -xzf "$(LIBFUSE_ARCHIVE)" -C "$(LIBFUSE_SRC_DIR)"
 	@test -f "$(LIBFUSE_SRC_DIR)/meson.build" || ( \
 		echo "error: libfuse source tree missing meson.build in $(LIBFUSE_SRC_DIR)"; \
 		exit 1 \
@@ -75,7 +72,7 @@ $(LIBFUSE_STAMP): $(LIBFUSE_ARCHIVE)
 		mkdir -p "$(LIBFUSE_SRC_ROOT)"; \
 		rm -rf "$(LIBFUSE_SRC_DIR)"; \
 		mkdir -p "$(LIBFUSE_SRC_DIR)"; \
-		tar -xzf "$(LIBFUSE_ARCHIVE)" -C "$(LIBFUSE_SRC_DIR)" --strip-components=1; \
+		tar -xzf "$(LIBFUSE_ARCHIVE)" -C "$(LIBFUSE_SRC_DIR)"; \
 	fi
 	@test -f "$(LIBFUSE_SRC_DIR)/meson.build" || ( \
 		echo "error: libfuse source tree missing meson.build in $(LIBFUSE_SRC_DIR)"; \

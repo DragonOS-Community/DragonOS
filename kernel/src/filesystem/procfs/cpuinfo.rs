@@ -110,18 +110,27 @@ fn generate_cpu_info(cpu_id: crate::smp::cpu::ProcessorId) -> String {
         // 微代码版本（在虚拟化环境中通常无法获取真实值 && raw_cpuid 库只支持amd cpu获取microcode）
         // info.push_str("microcode\t: 0xffffffff\n");
 
-        // CPU 频率
-        if let Some(cpu_fre) = cpuid.get_processor_frequency_info() {
-            let cpu_mhz = cpu_fre.processor_base_frequency() as f64;
-            info.push_str(&format!("cpu MHz\t\t: {}\n", cpu_mhz));
+        // CPU 频率。
+        // 某些虚拟化环境会返回 CPUID 0x16 但把 base frequency 填成 0，
+        // 此时必须回退到已经由 kvm-clock/PIT 校准出的 TSC 频率，而不是
+        // 直接把 0 暴露给用户态。
+        let cpu_mhz = cpuid
+            .get_processor_frequency_info()
+            .map(|cpu_fre| cpu_fre.processor_base_frequency())
+            .filter(|mhz| *mhz > 0)
+            .map(|mhz| mhz as f64)
+            .or_else(|| {
+                let tsc_khz = crate::arch::driver::tsc::TSCManager::cpu_khz();
+                if tsc_khz > 0 {
+                    Some(tsc_khz as f64 / 1000.0)
+                } else {
+                    None
+                }
+            });
+        if let Some(cpu_mhz) = cpu_mhz {
+            info.push_str(&format!("cpu MHz\t\t: {:.3}\n", cpu_mhz));
         } else {
-            let tsc_khz = crate::arch::driver::tsc::TSCManager::cpu_khz();
-            if tsc_khz > 0 {
-                let cpu_mhz = tsc_khz as f64 / 1000.0;
-                info.push_str(&format!("cpu MHz\t\t: {:.3}\n", cpu_mhz));
-            } else {
-                info.push_str("cpu MHz\t\t: unknown\n");
-            }
+            info.push_str("cpu MHz\t\t: unknown\n");
         }
 
         // L3缓存大小
@@ -140,15 +149,26 @@ fn generate_cpu_info(cpu_id: crate::smp::cpu::ProcessorId) -> String {
 
         let boot_data = &crate::arch::x86_64::smp::SMP_BOOT_DATA;
 
-        // // 物理 CPU 封装 ID
+        // 物理 CPU 封装 ID、同封装逻辑处理器数量、core ID 以及每封装核心数。
+        // 这些值由 CPUID 拓扑层级和 MADT 中的 APIC ID 推导，不能直接用
+        // 当前 CPU 的 CPUID 结果代表其他逻辑 CPU。
+        let topology = crate::arch::x86_64::cpu::cpu_topology_entry(cpu_id.data());
+        let (physical_id, siblings, core_id, cpu_cores) = if let Some(topology) = topology {
+            (
+                topology.package_id,
+                topology.core_siblings.len(),
+                topology.core_id,
+                topology.cores_per_package.max(1),
+            )
+        } else {
+            let cpus = smp_cpu_manager().present_cpus_count();
+            (0, cpus as usize, cpu_id.data(), cpus)
+        };
 
-        // siblings - 同一个物理cpu中的逻辑处理器数量
-        let siblings = smp_cpu_manager().present_cpus_count();
+        info.push_str(&format!("physical id\t: {}\n", physical_id));
         info.push_str(&format!("siblings\t: {}\n", siblings));
-
-        // // core id - 在同一个物理cpu内的核心ID
-
-        // // cpu cores - 每个物理cpu中的核心数
+        info.push_str(&format!("core id\t\t: {}\n", core_id));
+        info.push_str(&format!("cpu cores\t: {}\n", cpu_cores));
 
         // APIC ID // 不确定是哪个
         let apic_id = boot_data.phys_id(cpu_id.data() as usize);

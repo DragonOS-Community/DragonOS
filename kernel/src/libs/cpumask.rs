@@ -3,6 +3,8 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use alloc::{format, string::String};
+
 use bitmap::{traits::BitMapOps, AllocBitmap};
 
 use crate::{mm::percpu::PerCpu, smp::cpu::ProcessorId};
@@ -123,6 +125,37 @@ impl CpuMask {
         &self.bmp
     }
 
+    /// 将掩码格式化为 Linux cpulist（如 `0,2-3`），非空时以换行结尾。
+    pub fn to_cpulist(&self) -> String {
+        let mut out = String::new();
+        let mut start: Option<u32> = None;
+        let mut prev = 0u32;
+
+        for cpu in self.iter_cpu() {
+            let id = cpu.data();
+            match start {
+                None => {
+                    start = Some(id);
+                }
+                Some(range_start) => {
+                    if id != prev.saturating_add(1) {
+                        push_cpu_range(&mut out, range_start, prev);
+                        start = Some(id);
+                    }
+                }
+            }
+            prev = id;
+        }
+
+        if let Some(range_start) = start {
+            push_cpu_range(&mut out, range_start, prev);
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn bitand_assign(&mut self, rhs: &CpuMask) {
         self.bmp.bitand_assign(&rhs.bmp);
     }
@@ -140,6 +173,17 @@ impl BitAnd for &CpuMask {
 impl Default for CpuMask {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn push_cpu_range(out: &mut String, start: u32, end: u32) {
+    if !out.is_empty() {
+        out.push(',');
+    }
+    if start == end {
+        out.push_str(&format!("{start}"));
+    } else {
+        out.push_str(&format!("{start}-{end}"));
     }
 }
 

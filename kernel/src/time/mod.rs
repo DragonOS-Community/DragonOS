@@ -11,6 +11,7 @@ use self::timekeeping::{getnstimeofday, monotonic_now};
 
 pub(crate) mod absolute_timer;
 pub mod clocksource;
+mod clocksource_sysfs;
 pub(crate) mod cpu_clock;
 pub(crate) mod cpu_events;
 pub mod deadline;

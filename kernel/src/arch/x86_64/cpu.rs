@@ -127,49 +127,49 @@ static CPU_TOPOLOGY: Lazy<Vec<CpuTopologyEntry>> = Lazy::new();
 /// 保持 `cpuN` 与 `cpuN/topology` 两层 kobject 存活。
 static CPU_KOBS: Lazy<Vec<(Arc<CommonKobj>, Arc<CommonKobj>)>> = Lazy::new();
 
-/// 探测 CPUID 0xB 给出的 SMT/Core 层级位移。
-///
-/// 返回 `(has_core_level, smt_shift, core_shift, cores_per_package)`。
-/// 没有可用的 Core 层级时返回平坦拓扑，每个逻辑 CPU 视为一个独立核心。
-fn detect_topology_layout() -> (bool, u32, u32, u32) {
+/// 选择 CPUID 扩展拓扑叶子：优先 0x1F，回退到 0xB。
+fn extended_topology_leaf() -> Option<u32> {
     let cpuid = CpuId::new();
-    let mut smt_shift = 0u32;
-    let mut core_shift = 0u32;
-    let mut smt_processors = 1u32;
-    let mut core_processors = 0u32;
-    let mut has_core_level = false;
+    if cpuid.get_extended_topology_info_v2().is_some() {
+        Some(0x1f)
+    } else if cpuid.get_extended_topology_info().is_some() {
+        Some(0x0b)
+    } else {
+        None
+    }
+}
 
-    if let Some(levels) = cpuid.get_extended_topology_info() {
-        for level in levels {
-            match level.level_type() {
-                raw_cpuid::TopologyType::SMT => {
-                    smt_shift = level.shift_right_for_next_apic_id();
-                    smt_processors = u32::from(level.processors()).max(1);
-                }
-                raw_cpuid::TopologyType::Core => {
-                    core_shift = level.shift_right_for_next_apic_id();
-                    core_processors = u32::from(level.processors());
-                    has_core_level = true;
-                }
-                _ => {}
-            }
+/// 读取 SMT 层级的 APIC ID 位移。
+///
+/// 这里手工解析 CPUID，避免 raw-cpuid 在遇到未知层级类型（例如
+/// 0x1F 的 DieGrp）时 panic。0x1F 与 0xB 的 SMT 层级字段布局一致。
+fn detect_smt_shift() -> u32 {
+    let Some(leaf) = extended_topology_leaf() else {
+        return 0;
+    };
+
+    for subleaf in 0..16 {
+        let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+        let level_type = (result.ecx >> 8) & 0xff;
+        if level_type == 0 {
+            break;
+        }
+        if level_type == 1 {
+            // SMT 层的 shift_right_for_next_apic_id，位于 EAX[4:0]。
+            return result.eax & 0x1f;
         }
     }
 
-    // Core 层级必须位于 SMT 之上，否则说明拓扑信息不可用。
-    if !has_core_level || core_shift <= smt_shift || core_shift > 31 {
-        return (false, 0, 0, 0);
-    }
-
-    let cores_per_package = if core_processors == 0 {
-        0
-    } else {
-        core_processors / smt_processors
-    };
-    (true, smt_shift, core_shift, cores_per_package)
+    // 没有 SMT 层级（threads=1）或拓扑信息不可用。
+    0
 }
 
 /// 初始化并缓存所有 present CPU 的拓扑。
+///
+/// DragonOS 面向容器/沙箱 guest，当前按单 socket 约定导出拓扑：
+/// `physical_package_id` 固定为 0，`core_id` 吸收 SMT 以上的 Die/Tile
+/// 位，因此多 Die 的单 socket 仍能保持 core ID 唯一。多 socket guest
+/// 不在该 ABI 的覆盖范围内，会被报告为一个 socket。
 pub fn init_cpu_topology() -> Result<(), SystemError> {
     if CPU_TOPOLOGY.initialized() {
         return Ok(());
@@ -183,57 +183,39 @@ pub fn init_cpu_topology() -> Result<(), SystemError> {
         return Err(SystemError::ENODEV);
     }
 
-    let (has_core_level, smt_shift, core_shift, cores_per_package) = detect_topology_layout();
+    let smt_shift = detect_smt_shift();
     let mut entries = Vec::with_capacity(cpus.len());
     for cpu in &cpus {
         let apic_id = SMP_BOOT_DATA.phys_id(cpu.data() as usize) as u32;
-        let (package_id, core_id) = if has_core_level {
-            let core_width = core_shift - smt_shift;
-            let core_id = if core_width == 0 {
-                0
-            } else {
-                (apic_id >> smt_shift) & ((1u32 << core_width) - 1)
-            };
-            (apic_id >> core_shift, core_id)
-        } else {
-            (0, apic_id)
-        };
-
         entries.push(CpuTopologyEntry {
             cpu_id: cpu.data(),
-            core_id,
-            package_id,
+            core_id: apic_id >> smt_shift,
+            package_id: 0,
             thread_siblings: Vec::new(),
             core_siblings: Vec::new(),
-            cores_per_package: if has_core_level && cores_per_package > 0 {
-                cores_per_package
-            } else {
-                cpus.len() as u32
-            },
+            cores_per_package: 0,
         });
     }
 
+    let mut distinct_cores: Vec<u32> = Vec::new();
+    for entry in &entries {
+        if !distinct_cores.contains(&entry.core_id) {
+            distinct_cores.push(entry.core_id);
+        }
+    }
+    let cores_per_package = distinct_cores.len() as u32;
+    let all_cpus: Vec<u32> = entries.iter().map(|entry| entry.cpu_id).collect();
+
     for i in 0..entries.len() {
         let mut thread_siblings = Vec::new();
-        let mut core_siblings = Vec::new();
         for other in entries.iter() {
-            if has_core_level {
-                if other.package_id == entries[i].package_id && other.core_id == entries[i].core_id
-                {
-                    thread_siblings.push(other.cpu_id);
-                }
-                if other.package_id == entries[i].package_id {
-                    core_siblings.push(other.cpu_id);
-                }
-            } else {
-                // 无拓扑信息时，每个逻辑 CPU 单独构成一个 core，
-                // package 内的所有 CPU 共享同一个 package。
-                thread_siblings.push(entries[i].cpu_id);
-                core_siblings.push(other.cpu_id);
+            if other.core_id == entries[i].core_id {
+                thread_siblings.push(other.cpu_id);
             }
         }
         entries[i].thread_siblings = thread_siblings;
-        entries[i].core_siblings = core_siblings;
+        entries[i].core_siblings = all_cpus.clone();
+        entries[i].cores_per_package = cores_per_package.max(1);
     }
 
     CPU_TOPOLOGY.init(entries);
@@ -392,6 +374,8 @@ impl Attribute for AttrCoreSiblingsList {
 fn cpumask_hex(cpus: &[u32]) -> String {
     let mut mask = 0u64;
     for &cpu in cpus {
+        // 单 u64 cpumask 的硬上限；当前 PerCpu::MAX_CPU_NUM=16。
+        debug_assert!((cpu as usize) < 64, "cpu {cpu} exceeds 64-bit cpumask");
         if (cpu as usize) < 64 {
             mask |= 1u64 << cpu;
         }

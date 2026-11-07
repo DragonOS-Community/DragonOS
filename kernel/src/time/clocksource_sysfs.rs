@@ -25,7 +25,7 @@ use crate::{
     init::initcall::INITCALL_POSTCORE,
     libs::lazy_init::Lazy,
     time::{
-        clocksource::CLOCKSOURCE_LIST,
+        clocksource::{Clocksource, CLOCKSOURCE_LIST},
         timekeeping::{timekeeper, timekeeping_is_initialized},
     },
 };
@@ -52,19 +52,20 @@ impl Attribute for AttrAvailableClocksource {
     }
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
-        let mut names: Vec<Arc<str>> = Vec::new();
+        // 在锁外预留容量，锁内只克隆 Arc；读取 clocksource_data()
+        // 放到释放 list 锁之后，缩短关中断的临界区。
+        let mut sources: Vec<Arc<dyn Clocksource>> = Vec::with_capacity(16);
         {
             let list = CLOCKSOURCE_LIST.lock_irqsave();
-            names.reserve(list.len());
             for cs in list.iter() {
-                names.push(cs.clocksource_data().name.clone());
+                sources.push(cs.clone());
             }
         }
 
         // Linux 使用空格分隔每个 clocksource，并在末尾保留一个空格。
         let mut out = String::new();
-        for name in names {
-            out.push_str(&name);
+        for cs in sources {
+            out.push_str(&cs.clocksource_data().name);
             out.push(' ');
         }
         out.push('\n');

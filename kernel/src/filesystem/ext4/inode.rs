@@ -3206,6 +3206,17 @@ impl IndexNode for LockedExt4Inode {
         ))
     }
 
+    fn stable_identity(&self) -> Option<vfs::InodeIdentity> {
+        // ext4's cached snapshot is purely local (no device I/O); the identity
+        // pair is immutable, so the freshness of the rest does not matter.
+        self.cached_metadata()
+            .ok()
+            .map(|metadata| vfs::InodeIdentity {
+                dev_id: metadata.dev_id,
+                inode_id: metadata.inode_id,
+            })
+    }
+
     fn close(&self, _: PrivateData) -> Result<(), SystemError> {
         Ok(())
     }

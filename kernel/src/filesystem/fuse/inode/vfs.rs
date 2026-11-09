@@ -13,9 +13,9 @@ use crate::{
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode,
-            LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior, RenameOutcome,
-            SetMetadataMask, XattrFlags,
+            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeIdentity,
+            InodeMode, LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior,
+            RenameOutcome, SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -874,6 +874,19 @@ impl IndexNode for FuseNode {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         self.check_not_stale()?;
         self.cached_or_fetch_metadata()
+    }
+
+    /// Identity-only hook: `dev_id`/`inode_id` are stable for the inode's
+    /// lifetime, so a resident attribute snapshot is sufficient regardless of
+    /// TTL, invalidation or stale state — none of which affect these fields.
+    /// `cached_metadata` is deliberately *not* overridden: its contract is a
+    /// freshness-qualified snapshot for cached-lookup paths.
+    fn stable_identity(&self) -> Option<InodeIdentity> {
+        self.cached_metadata_snapshot()
+            .map(|metadata| InodeIdentity {
+                dev_id: metadata.dev_id,
+                inode_id: metadata.inode_id,
+            })
     }
 
     fn check_access(&self, mask: PermissionMask) -> Result<(), SystemError> {

@@ -84,6 +84,20 @@ impl Display for InodeId {
     }
 }
 
+/// Identity fields that are stable for an inode's whole lifetime.
+///
+/// Used by layers that key caches (rmap, overlay origins, dentry identity) on
+/// device + inode number only. Returning this from `IndexNode::stable_identity`
+/// is cheaper than a full `metadata()` and carries none of the freshness
+/// semantics a timestamped attribute snapshot needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InodeIdentity {
+    /// Device number of the filesystem owning the inode.
+    pub dev_id: usize,
+    /// Inode number inside that filesystem.
+    pub inode_id: InodeId,
+}
+
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -1599,6 +1613,17 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// Implementations must not start device/remote I/O; uncertainty is EAGAIN.
     fn cached_metadata(&self) -> Result<Metadata, SystemError> {
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// Stable device + inode identity, produced without device or remote I/O.
+    ///
+    /// Unlike `cached_metadata`, freshness is irrelevant here: only the
+    /// immutable identity pair is consumed, so a resident attribute snapshot
+    /// is sufficient even when it is stale or outside its TTL. Implementations
+    /// without a resident snapshot return `None` and the caller falls back to
+    /// a full `metadata()`.
+    fn stable_identity(&self) -> Option<InodeIdentity> {
+        None
     }
 
     /// An already resident symlink target. Never fall back to read_at here.

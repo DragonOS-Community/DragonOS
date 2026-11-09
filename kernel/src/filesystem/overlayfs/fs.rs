@@ -74,11 +74,20 @@ pub(super) struct RealInodeIdentity {
 impl RealInodeIdentity {
     pub(super) fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
         let fs = OverlayFS::canonical_backing_fs(inode);
-        let metadata = inode.metadata()?;
+        // 身份字段（dev_id/inode_id）在 inode 生命周期内不变：优先用仅含
+        // 身份字段的无 I/O 钩子（快照新鲜度与 TTL 无关）；未提供常驻
+        // 快照的文件系统回退完整 getattr。挂载与每次 lower 解析都会走到这里。
+        let (dev_id, inode_id) = match inode.stable_identity() {
+            Some(identity) => (identity.dev_id, identity.inode_id),
+            None => {
+                let metadata = inode.metadata()?;
+                (metadata.dev_id, metadata.inode_id)
+            }
+        };
         Ok(Self {
             filesystem: Arc::as_ptr(&fs) as *const () as usize,
-            dev_id: metadata.dev_id,
-            inode_id: metadata.inode_id,
+            dev_id,
+            inode_id,
         })
     }
 }
@@ -982,7 +991,15 @@ impl OverlayFS {
             return Ok(false);
         }
 
-        Ok(left.metadata()?.inode_id == right.metadata()?.inode_id)
+        let left_id = match left.stable_identity() {
+            Some(identity) => identity.inode_id,
+            None => left.metadata()?.inode_id,
+        };
+        let right_id = match right.stable_identity() {
+            Some(identity) => identity.inode_id,
+            None => right.metadata()?.inode_id,
+        };
+        Ok(left_id == right_id)
     }
 
     fn is_mount_ancestor(

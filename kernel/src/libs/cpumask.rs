@@ -150,9 +150,7 @@ impl CpuMask {
         if let Some(range_start) = start {
             push_cpu_range(&mut out, range_start, prev);
         }
-        if !out.is_empty() {
-            out.push('\n');
-        }
+        out.push('\n');
         out
     }
 

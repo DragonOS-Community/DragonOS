@@ -37,6 +37,10 @@ pub struct CpuDeviceManager {
 }
 
 impl CpuDeviceManager {
+    pub fn root_device(&self) -> Arc<CpuSubSystemFakeRootDevice> {
+        self._root_device.clone()
+    }
+
     /// 初始化设备驱动模型的CPU子系统
     ///
     /// 参考 https://code.dragonos.org.cn/xref/linux-6.1.9/drivers/base/cpu.c?fi=get_cpu_device#622
@@ -55,6 +59,17 @@ impl CpuDeviceManager {
         CPU_DEVICE_MANAGER.init(manager);
         return Ok(());
     }
+}
+
+/// 返回 `/sys/devices/system/cpu` 对应的kobject。
+///
+/// 该目录由 `CpuDeviceManager::init()` 在 `driver_init()` 阶段注册，
+/// 后续架构相关的CPU拓扑代码可以向它挂载 `cpuN` 子目录。
+pub fn cpu_root_kobj() -> Option<Arc<dyn KObject>> {
+    if !CPU_DEVICE_MANAGER.initialized() {
+        return None;
+    }
+    Some(CPU_DEVICE_MANAGER.root_device() as Arc<dyn KObject>)
 }
 
 /// cpu子系统
@@ -268,7 +283,7 @@ impl AttributeGroup for AttrGroupCpu {
         None
     }
     fn attrs(&self) -> &[&'static dyn Attribute] {
-        &[&AttrCpuPossible, &AttrCpuOnline]
+        &[&AttrCpuPossible, &AttrCpuPresent, &AttrCpuOnline]
     }
     fn is_visible(
         &self,
@@ -297,8 +312,30 @@ impl Attribute for AttrCpuPossible {
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let cpu_manager = crate::smp::cpu::smp_cpu_manager();
-        let cpus = cpu_manager.possible_cpus_count();
-        let data = format!("0-{}", cpus - 1);
+        let data = cpu_manager.possible_cpus().to_cpulist();
+        sysfs_emit_str(buf, &data)
+    }
+}
+
+#[derive(Debug)]
+pub struct AttrCpuPresent;
+
+impl Attribute for AttrCpuPresent {
+    fn name(&self) -> &str {
+        "present"
+    }
+
+    fn mode(&self) -> InodeMode {
+        InodeMode::S_IRUGO
+    }
+
+    fn support(&self) -> SysFSOpsSupport {
+        SysFSOpsSupport::ATTR_SHOW
+    }
+
+    fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
+        let cpu_manager = crate::smp::cpu::smp_cpu_manager();
+        let data = cpu_manager.present_cpus().to_cpulist();
         sysfs_emit_str(buf, &data)
     }
 }
@@ -321,8 +358,7 @@ impl Attribute for AttrCpuOnline {
 
     fn show(&self, _kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let cpu_manager = crate::smp::cpu::smp_cpu_manager();
-        let cpus = cpu_manager.present_cpus_count();
-        let data = format!("0-{}", cpus - 1);
+        let data = cpu_manager.online_cpus().to_cpulist();
         sysfs_emit_str(buf, &data)
     }
 }

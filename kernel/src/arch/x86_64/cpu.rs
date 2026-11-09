@@ -127,40 +127,42 @@ static CPU_TOPOLOGY: Lazy<Vec<CpuTopologyEntry>> = Lazy::new();
 /// 保持 `cpuN` 与 `cpuN/topology` 两层 kobject 存活。
 static CPU_KOBS: Lazy<Vec<(Arc<CommonKobj>, Arc<CommonKobj>)>> = Lazy::new();
 
-/// 选择 CPUID 扩展拓扑叶子：优先 0x1F，回退到 0xB。
-fn extended_topology_leaf() -> Option<u32> {
-    let cpuid = CpuId::new();
-    if cpuid.get_extended_topology_info_v2().is_some() {
-        Some(0x1f)
-    } else if cpuid.get_extended_topology_info().is_some() {
-        Some(0x0b)
-    } else {
-        None
-    }
-}
-
-/// 读取 SMT 层级的 APIC ID 位移。
+/// 从指定 CPUID 拓扑叶子读取 SMT 层级的 APIC ID 位移。
 ///
-/// 这里手工解析 CPUID，避免 raw-cpuid 在遇到未知层级类型（例如
-/// 0x1F 的 DieGrp）时 panic。0x1F 与 0xB 的 SMT 层级字段布局一致。
-fn detect_smt_shift() -> u32 {
-    let Some(leaf) = extended_topology_leaf() else {
-        return 0;
-    };
-
+/// `CPUID.1F` 只表示该叶子被 CPU 支持，并不保证其内容有效：QEMU/KVM
+/// 可能返回全零的子叶。因此必须检查 subleaf 0 的 level type；内容无效
+/// 时返回 None，让调用方回退到 0xB。
+fn smt_shift_from_leaf(leaf: u32) -> Option<u32> {
     for subleaf in 0..16 {
         let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
         let level_type = (result.ecx >> 8) & 0xff;
+
         if level_type == 0 {
+            // subleaf 0 都没有有效层级，说明该叶子不可用。
+            if subleaf == 0 {
+                return None;
+            }
             break;
         }
         if level_type == 1 {
             // SMT 层的 shift_right_for_next_apic_id，位于 EAX[4:0]。
-            return result.eax & 0x1f;
+            return Some(result.eax & 0x1f);
+        }
+        if subleaf == 0 {
+            // 有效拓扑，但首个层级不是 SMT（threads=1）。
+            return Some(0);
         }
     }
+    None
+}
 
-    // 没有 SMT 层级（threads=1）或拓扑信息不可用。
+/// 读取 SMT 层级的 APIC ID 位移：优先使用有效的 0x1F，回退到 0xB。
+fn detect_smt_shift() -> u32 {
+    for leaf in [0x1f, 0x0b] {
+        if let Some(shift) = smt_shift_from_leaf(leaf) {
+            return shift;
+        }
+    }
     0
 }
 

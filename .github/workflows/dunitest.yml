@@ -147,6 +147,17 @@ jobs:
         run: |
           make test-dunit
 
+      - name: Run SMT topology regression
+        shell: bash -ileo pipefail {0}
+        env:
+          DRAGONOS_QEMU_SMP: "4,cores=2,threads=2,sockets=1"
+          DUNITEST_PATTERN: "cpu_topology_sysfs"
+        run: |
+          rm -f serial_opt.txt
+          make qemu-nographic AUTO_TEST=dunit DUNITEST_DIR=/opt/tests/dunitest DUNITEST_PATTERN=cpu_topology_sysfs &
+          sleep 5
+          bash user/apps/tests/dunitest/monitor_test_results.sh
+
       - name: Preserve dunitest serial log
         if: always()
         uses: actions/upload-artifact@v4

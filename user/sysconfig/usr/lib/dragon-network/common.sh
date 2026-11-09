@@ -4,6 +4,10 @@
 # Configuration and lease files are parsed as data; they are never sourced.
 
 DN_BUSYBOX=/bin/busybox
+# Prefer the distribution flock: the Ubuntu busybox-static bundled in the
+# docker rootfs does not build the flock applet.
+DN_FLOCK="flock"
+command -v flock >/dev/null 2>&1 || DN_FLOCK="$DN_BUSYBOX flock"
 DN_RUN=/run/dragon-network
 DN_INTERFACES_RUN="$DN_RUN/interfaces"
 DN_RESOLV_CONF=/etc/resolv.conf
@@ -343,11 +347,14 @@ dn_init_runtime() {
         dn_log runtime "/run is not a safe directory"
         return 1
     }
-    $DN_BUSYBOX mountpoint -q /run || {
+    # Do not depend on the busybox `mountpoint` applet: the Ubuntu busybox-static
+    # shipped in the rootfs does not build it, which previously made every
+    # runtime initialization fail with "applet not found". A tmpfs check is the
+    # property we actually need here, and stat is already the authority below.
+    fs_type=$($DN_BUSYBOX stat -f -c %T /run 2>/dev/null) || {
         dn_log runtime "/run is not a mount point"
         return 1
     }
-    fs_type=$($DN_BUSYBOX stat -f -c %T /run 2>/dev/null) || return 1
     [ "$fs_type" = tmpfs ] || {
         dn_log runtime "/run must be tmpfs, found $fs_type"
         return 1
@@ -451,7 +458,7 @@ dn_acquire_state_lock() {
     : > "$lock" || return 1
     $DN_BUSYBOX chmod 0600 "$lock" || return 1
     exec 7>"$lock" || return 1
-    $DN_BUSYBOX flock -x 7
+    $DN_FLOCK -x 7
 }
 
 dn_reset_lease_vars() {
@@ -939,7 +946,7 @@ dn_rebuild_dns() {
     : > "$lock" || return 1
     $DN_BUSYBOX chmod 0600 "$lock" || return 1
     exec 8>"$lock" || return 1
-    $DN_BUSYBOX flock -x 8 || {
+    $DN_FLOCK -x 8 || {
         exec 8>&-
         return 1
     }

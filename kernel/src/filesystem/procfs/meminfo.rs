@@ -60,6 +60,20 @@ impl MeminfoFileOps {
                 .to_owned(),
         );
 
+        // MemAvailable：估算可供新进程立即使用的内存（KB）。
+        // Linux 语义（mm/page_alloc.c::si_mem_available()）为
+        //   MemFree - low watermark + 可回收 page cache + SReclaimable，
+        // 并钳制在 reserve + page cache + SReclaimable 以内。
+        // DragonOS 目前没有 zone 水位和可回收 slab 分类，因此近似为
+        //   MemFree + 文件页缓存（不含 shmem）+ SReclaimable（当前恒 0）。
+        // busybox free 等工具依赖该字段选择输出格式并计算 available 列。
+        let mem_available_kb = (usage.free().bytes() >> 10) + (cached_pages * page_kb) as usize;
+        data.append(
+            &mut format!("MemAvailable:\t{} kB\n", mem_available_kb)
+                .as_bytes()
+                .to_owned(),
+        );
+
         data.append(&mut format!("Buffers:\t{} kB\n", 0u64).as_bytes().to_owned());
         data.append(
             &mut format!("Cached:\t\t{} kB\n", cached_pages * page_kb)

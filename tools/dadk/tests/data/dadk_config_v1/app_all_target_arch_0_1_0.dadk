@@ -1,0 +1,32 @@
+{
+  "name": "app_all_target_arch_0_1_0",
+  "version": "0.1.0",
+  "description": "An app targets to all arch",
+  "task_type": {
+    "BuildFromSource": {
+      "Git": {
+        "url": "1",
+        "branch": "1",
+        "revision": null
+      }
+    }
+  },
+  "depends": [],
+  "build": {
+    "build_command": "1"
+  },
+  "install": {
+    "in_dragonos_path": "/"
+  },
+  "clean": {
+    "clean_command": "1"
+  },
+  "envs": [],
+  "build_once": false,
+  "install_once": false,
+  "target_arch": [
+    "riscv64",
+    "x86_64",
+    "aarch64"
+  ]
+}

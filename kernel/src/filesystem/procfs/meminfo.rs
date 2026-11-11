@@ -40,7 +40,7 @@ impl MeminfoFileOps {
     fn generate_meminfo_content() -> Vec<u8> {
         use crate::arch::MMArch;
 
-        let usage = crate::mm::balloon::managed_usage();
+        let (usage, available) = crate::mm::memory_availability::managed_usage_with_available();
         let slab_kb = slab_usage().total() >> 10;
         let stats = page_cache_stats::snapshot();
         let page_kb = (MMArch::PAGE_SIZE >> 10) as u64;
@@ -56,6 +56,12 @@ impl MeminfoFileOps {
 
         data.append(
             &mut format!("MemFree:\t{} kB\n", usage.free().bytes() >> 10)
+                .as_bytes()
+                .to_owned(),
+        );
+
+        data.append(
+            &mut format!("MemAvailable:\t{} kB\n", available.bytes() >> 10)
                 .as_bytes()
                 .to_owned(),
         );

@@ -76,6 +76,9 @@ TEST(SlabMemoryAccounting, SysinfoReportsSaneBuddyMemory) {
   std::unordered_map<std::string, uint64_t> values;
   ASSERT_TRUE(ReadMeminfo(&values));
   ASSERT_TRUE(values.count("MemFree"));
+  ASSERT_TRUE(values.count("MemTotal"));
+  ASSERT_TRUE(values.count("MemAvailable"));
+  EXPECT_LE(values["MemAvailable"], values["MemTotal"]);
   ASSERT_EQ(sysinfo(&after), 0);
 
   EXPECT_GT(before.mem_unit, 0U);

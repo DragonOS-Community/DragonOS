@@ -12,10 +12,14 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <fstream>
+#include <memory>
+#include <optional>
 #include <string>
 
 #ifndef SYS_mlock2
@@ -118,9 +122,9 @@ class ScopedMemlockLimit {
 
 class TempFilePage {
   public:
-    TempFilePage() {
-        char tmpl[] = "/tmp/dunitest_mlock_XXXXXX";
-        fd_ = mkstemp(tmpl);
+    explicit TempFilePage(const char* directory = "/tmp") {
+        std::string tmpl = std::string(directory) + "/dunitest_mlock_XXXXXX";
+        fd_ = mkstemp(tmpl.data());
         if (fd_ >= 0) {
             path_ = tmpl;
         }
@@ -155,6 +159,27 @@ class TempFilePage {
     std::string path_;
     int fd_ = -1;
 };
+
+struct AvailableMemory {
+    int64_t available;
+    int64_t free;
+
+    int64_t AvailableMinusFree() const { return available - free; }
+};
+
+std::optional<AvailableMemory> ReadAvailableMemory() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::optional<int64_t> available;
+    std::optional<int64_t> free;
+    std::string key, unit;
+    int64_t value;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "MemAvailable:" && unit == "kB") available = value;
+        if (key == "MemFree:" && unit == "kB") free = value;
+        if (available && free) return AvailableMemory{*available, *free};
+    }
+    return std::nullopt;
+}
 
 }  // namespace
 
@@ -279,6 +304,56 @@ TEST(Mlock, PopulatesFileMappingBeforeFault) {
     EXPECT_EQ(static_cast<char>(0x5a), addr[0]);
     EXPECT_EQ(0, munlock(addr, ps));
     EXPECT_EQ(0, munmap(addr, ps));
+}
+
+TEST(Mlock, LockedFileCacheIsExcludedFromMemAvailable) {
+    constexpr int64_t size_kib = 4 * 1024;
+    constexpr size_t length = size_kib * 1024;
+    const char* directory = getenv("DUNITEST_MEMORY_FILE_DIR");
+    if (directory == nullptr || directory[0] == '\0') directory = "/var/tmp";
+    TempFilePage file(directory);
+    ASSERT_TRUE(file.valid()) << strerror(errno);
+    struct statfs fs;
+    ASSERT_EQ(fstatfs(file.fd(), &fs), 0) << strerror(errno);
+    if (fs.f_type != 0xef53) GTEST_SKIP() << "requires ext4 scratch storage";
+
+    ScopedMemlockLimit limit;
+    ASSERT_TRUE(limit.valid());
+    if (limit.hard_limit() < length) {
+        if (!limit.set_exact(length, length)) {
+            GTEST_SKIP() << "requires a 4 MiB memlock budget";
+        }
+    } else {
+        ASSERT_TRUE(limit.set_bytes(length)) << strerror(errno);
+    }
+    ASSERT_TRUE(file.write_pattern(length, 0x5a));
+    ASSERT_EQ(fsync(file.fd()), 0) << strerror(errno);
+    auto* address = static_cast<char*>(mmap(nullptr, length, PROT_READ, MAP_SHARED, file.fd(), 0));
+    ASSERT_NE(address, MAP_FAILED) << strerror(errno);
+    auto unmap = [](char* start) { munmap(start, length); };
+    std::unique_ptr<char, decltype(unmap)> mapping(address, unmap);
+    // Fault the same file pages before sampling so the mlock transition
+    // changes eligibility, independent of populating the cache.
+    auto* resident = static_cast<volatile char*>(address);
+    const size_t page_size = PageSize();
+    for (size_t offset = 0; offset < length; offset += page_size) {
+        ASSERT_EQ(resident[offset], 0x5a);
+    }
+    const auto before = ReadAvailableMemory();
+    ASSERT_TRUE(before.has_value());
+    if (before->available < 2 * size_kib) {
+        GTEST_SKIP() << "requires enough available memory to observe the cache delta";
+    }
+    ASSERT_EQ(mlock(address, length), 0) << strerror(errno);
+    const auto locked = ReadAvailableMemory();
+    ASSERT_EQ(munlock(address, length), 0) << strerror(errno);
+    const auto after = ReadAvailableMemory();
+    ASSERT_TRUE(locked.has_value());
+    ASSERT_TRUE(after.has_value());
+    // At least half the eligible cache contributes before unrelated cache
+    // activity. Allow 1 MiB of noise in this system-wide estimate.
+    EXPECT_GE(before->AvailableMinusFree() - locked->AvailableMinusFree(), 1024);
+    EXPECT_GE(after->AvailableMinusFree() - locked->AvailableMinusFree(), 1024);
 }
 
 TEST(Mlock, ProtNoneReturnsEnomemButKeepsVmaLocked) {

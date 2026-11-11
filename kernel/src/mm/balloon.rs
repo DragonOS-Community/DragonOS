@@ -36,7 +36,11 @@ pub(crate) fn non_reclaimable_pages() -> usize {
 /// span those operations; clamp against its older used snapshot accordingly.
 pub(crate) fn managed_usage() -> PageFrameUsage {
     let usage = unsafe { LockedFrameAllocator.usage() };
-    adjusted_usage(&usage, non_reclaimable_pages())
+    adjust_managed_usage(&usage)
+}
+
+pub(super) fn adjust_managed_usage(usage: &PageFrameUsage) -> PageFrameUsage {
+    adjusted_usage(usage, non_reclaimable_pages())
 }
 
 fn adjusted_usage(usage: &PageFrameUsage, excluded: usize) -> PageFrameUsage {

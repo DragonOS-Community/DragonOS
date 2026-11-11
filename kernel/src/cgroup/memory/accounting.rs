@@ -474,6 +474,12 @@ impl MemoryAccount {
         });
     }
 
+    pub(super) fn file_lru_pages(&self) -> u64 {
+        let active = self.stats[MemoryStat::ActiveFile as usize].load(Ordering::Relaxed);
+        let inactive = self.stats[MemoryStat::InactiveFile as usize].load(Ordering::Relaxed);
+        active.saturating_add(inactive)
+    }
+
     /// Concurrent counter snapshots are approximate, as with Linux vmstats.
     /// Policy admission itself is serialized and does not use this snapshot.
     pub fn snapshot(&self) -> MemorySnapshot {

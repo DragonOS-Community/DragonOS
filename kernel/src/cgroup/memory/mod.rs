@@ -23,3 +23,8 @@ pub(crate) use accounting::{
     ChargeFailure, ChargeFailureReason, MemoryAccount, MemoryCharge, MemoryEvent, MemoryKind,
     MemoryPolicy, MemoryStat,
 };
+
+/// The permanent root account includes live pages charged to all descendants.
+pub(crate) fn global_file_lru_pages() -> u64 {
+    super::cgroup_root_node().memory_account().file_lru_pages()
+}

@@ -27,6 +27,7 @@ use crate::syscall::user_access::{UserBufferReader, UserBufferWriter};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt::Debug;
@@ -436,9 +437,9 @@ pub fn bpf_map_update_elem(attr: &bpf_attr) -> Result<usize> {
     let key_buf = UserBufferReader::new(arg.key as *const u8, key_size, true)?;
     let value_buf = UserBufferReader::new(arg.value as *const u8, value_size, true)?;
 
-    let key = key_buf.read_from_user(0)?;
-    let value = value_buf.read_from_user(0)?;
-    map.inner_map.lock().update_elem(key, value, arg.flags)?;
+    let key = key_buf.read_from_user(0)?.to_vec();
+    let value = value_buf.read_from_user(0)?.to_vec();
+    map.inner_map.lock().update_elem(&key, &value, arg.flags)?;
     Ok(0)
 }
 
@@ -464,12 +465,13 @@ pub fn bpf_lookup_elem(attr: &bpf_attr) -> Result<usize> {
     let key_buf = UserBufferReader::new(arg.key as *const u8, key_size, true)?;
     let mut value_buf = UserBufferWriter::new(arg.value as *mut u8, value_size, true)?;
 
-    let key = key_buf.read_from_user(0)?;
+    let key = key_buf.read_from_user(0)?.to_vec();
 
     let mut inner = map.inner_map.lock();
-    let r_value = inner.lookup_elem(key)?;
+    let r_value = inner.lookup_elem(&key)?.map(|v| v.to_vec());
+    drop(inner);
     if let Some(r_value) = r_value {
-        value_buf.copy_to_user(r_value, 0)?;
+        value_buf.copy_to_user(&r_value, 0)?;
         Ok(0)
     } else {
         Err(SystemError::ENOENT)
@@ -498,9 +500,11 @@ pub fn bpf_map_get_next_key(attr: &bpf_attr) -> Result<usize> {
     };
     let key = key.as_deref();
     let mut next_key_buf = UserBufferWriter::new(arg.next_key as *mut u8, key_size, true)?;
+    let mut next_key = vec![0u8; key_size];
     let inner = map.inner_map.lock();
-    let next_key = next_key_buf.buffer(0)?;
-    inner.get_next_key(key, next_key)?;
+    inner.get_next_key(key, &mut next_key)?;
+    drop(inner);
+    next_key_buf.copy_to_user(&next_key, 0)?;
     // info!("next_key: {:?}", next_key);
     Ok(0)
 }
@@ -521,8 +525,8 @@ pub fn bpf_map_delete_elem(attr: &bpf_attr) -> Result<usize> {
     let key_size = meta.key_size as usize;
 
     let key_buf = UserBufferReader::new(arg.key as *const u8, key_size, true)?;
-    let key = key_buf.read_from_user(0)?;
-    map.inner_map.lock().delete_elem(key)?;
+    let key = key_buf.read_from_user(0)?.to_vec();
+    map.inner_map.lock().delete_elem(&key)?;
     Ok(0)
 }
 
@@ -560,10 +564,12 @@ pub fn bpf_map_lookup_and_delete_elem(attr: &bpf_attr) -> Result<usize> {
     let key_buf = UserBufferReader::new(arg.key as *const u8, key_size, true)?;
     let mut value_buf = UserBufferWriter::new(arg.value as *mut u8, value_size, true)?;
 
-    let value = value_buf.buffer(0)?;
-    let key = key_buf.read_from_user(0)?;
+    let mut value = vec![0u8; value_size];
+    let key = key_buf.read_from_user(0)?.to_vec();
     let mut inner = map.inner_map.lock();
-    inner.lookup_and_delete_elem(key, value)?;
+    inner.lookup_and_delete_elem(&key, &mut value)?;
+    drop(inner);
+    value_buf.copy_to_user(&value, 0)?;
     Ok(0)
 }
 

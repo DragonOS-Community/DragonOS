@@ -325,3 +325,4 @@ normal/fork_mapping_holes
 normal/user_return_work
 normal/unix_socket_stat
 normal/tty_fionread
+normal/bpf_map_lookup_fault

@@ -4,6 +4,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cstdint>
+
 namespace {
 enum class Scenario { Whole, Middle, Adjacent, Prefix, Suffix, DoFork, Hint, NoReplace, FixedFailure, Grandchild };
 
@@ -119,6 +121,47 @@ TEST(ForkMappingHoles, HintUsesExcludedRange) { RunScenario(Scenario::Hint); }
 TEST(ForkMappingHoles, NoReplaceUsesExcludedRange) { RunScenario(Scenario::NoReplace); }
 TEST(ForkMappingHoles, FailedFixedMappingPreservesFreeRange) { RunScenario(Scenario::FixedFailure); }
 TEST(ForkMappingHoles, GrandchildRetainsFreeRange) { RunScenario(Scenario::Grandchild); }
+
+TEST(ForkMappingHoles, SparseUnalignedMappingAcrossPageTables) {
+    ASSERT_EQ(sysconf(_SC_PAGESIZE), 4096);
+    constexpr size_t page = 4096;
+    constexpr size_t span = 2 * 1024 * 1024;
+    constexpr size_t length = 5 * span;
+    auto* mapping = static_cast<char*>(Map(nullptr, length));
+    ASSERT_NE(mapping, MAP_FAILED);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mapping);
+    auto* aligned = reinterpret_cast<char*>((base + span - 1) & ~(span - 1));
+    auto* excluded = aligned + page;
+    *excluded = 42;
+    ASSERT_EQ(madvise(excluded, page, MADV_DONTFORK), 0);
+
+    // One resident page on each side of a table boundary, followed by a
+    // wholly empty table span and another resident page.
+    char* const points[] = {excluded + page, aligned + span - page,
+                            aligned + span, aligned + 3 * span + page};
+    for (char* point : points) *point = 17;
+    auto* shared = static_cast<char*>(
+        mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    ASSERT_NE(shared, MAP_FAILED);
+    *shared = 1;
+
+    const pid_t child = fork();
+    if (child == 0) {
+        unsigned char resident = 0;
+        if (mincore(excluded, page, &resident) != -1 || errno != ENOMEM) _exit(1);
+        for (char* point : points) {
+            if (mincore(point, page, &resident) || !(resident & 1) || *point != 17) _exit(2);
+            *point = 23;
+        }
+        *shared = 2;
+        _exit(0);
+    }
+    EXPECT_EQ(Wait(child), 0);
+    for (char* point : points) EXPECT_EQ(*point, 17);
+    EXPECT_EQ(*shared, 2);
+    EXPECT_EQ(munmap(shared, page), 0);
+    EXPECT_EQ(munmap(mapping, length), 0);
+}
 }  // namespace
 
 int main(int argc, char** argv) {

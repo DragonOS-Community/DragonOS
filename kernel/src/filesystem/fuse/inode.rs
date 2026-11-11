@@ -1274,9 +1274,9 @@ impl FuseNode {
         let mut metadata = self.cached_metadata.lock();
         *metadata = Some(md);
         self.bump_attr_version();
-        drop(metadata);
         self.cached_metadata_deadline_ticks
             .store(Self::cache_deadline(valid, valid_nsec), Ordering::Relaxed);
+        drop(metadata);
         self.note_dax_attr_change(attr_flags);
     }
 
@@ -1312,7 +1312,6 @@ impl FuseNode {
         }
         *metadata = Some(md.clone());
         self.bump_attr_version();
-        drop(metadata);
         self.cached_metadata_deadline_ticks.store(
             if stale_reply {
                 0
@@ -1321,6 +1320,7 @@ impl FuseNode {
             },
             Ordering::Relaxed,
         );
+        drop(metadata);
         if !stale_reply {
             self.note_dax_attr_change(attr_flags);
         }
@@ -1601,15 +1601,20 @@ impl FuseNode {
         self.cached_or_fetch_metadata_with_file_handle(None)
     }
 
+    fn with_valid_cached_metadata<T>(&self, read: impl FnOnce(&Metadata) -> T) -> Option<T> {
+        let metadata = self.cached_metadata.lock();
+        let metadata = metadata.as_ref()?;
+        let deadline = self.cached_metadata_deadline_ticks.load(Ordering::Acquire);
+        (deadline == u64::MAX || (deadline != 0 && Self::now_ticks() < deadline))
+            .then(|| read(metadata))
+    }
+
     fn cached_or_fetch_metadata_with_file_handle(
         &self,
         fh: Option<u64>,
     ) -> Result<Metadata, SystemError> {
-        if let Some(m) = self.cached_metadata.lock().clone() {
-            let deadline = self.cached_metadata_deadline_ticks.load(Ordering::Relaxed);
-            if deadline == u64::MAX || (deadline != 0 && Self::now_ticks() < deadline) {
-                return Ok(m);
-            }
+        if let Some(metadata) = self.with_valid_cached_metadata(Metadata::clone) {
+            return Ok(metadata);
         }
         match fh {
             Some(fh) => self.fetch_attr_with_file_handle(Some(fh)),

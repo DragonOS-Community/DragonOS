@@ -876,17 +876,15 @@ impl IndexNode for FuseNode {
         self.cached_or_fetch_metadata()
     }
 
-    /// Identity-only hook: `dev_id`/`inode_id` are stable for the inode's
-    /// lifetime, so a resident attribute snapshot is sufficient regardless of
-    /// TTL, invalidation or stale state — none of which affect these fields.
-    /// `cached_metadata` is deliberately *not* overridden: its contract is a
-    /// freshness-qualified snapshot for cached-lookup paths.
-    fn stable_identity(&self) -> Option<InodeIdentity> {
-        self.cached_metadata_snapshot()
-            .map(|metadata| InodeIdentity {
-                dev_id: metadata.dev_id,
-                inode_id: metadata.inode_id,
-            })
+    fn cached_identity(&self) -> Option<InodeIdentity> {
+        self.check_not_stale().ok()?;
+        self.conn.check_allow_current_process().ok()?;
+        // The daemon can update attr.ino, so identity uses the same deadline
+        // as getattr rather than treating the last reply as immutable.
+        self.with_valid_cached_metadata(|metadata| InodeIdentity {
+            dev_id: metadata.dev_id,
+            inode_id: metadata.inode_id,
+        })
     }
 
     fn check_access(&self, mask: PermissionMask) -> Result<(), SystemError> {

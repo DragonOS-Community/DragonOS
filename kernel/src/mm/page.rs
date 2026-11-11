@@ -4098,6 +4098,31 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> PageMapper<Arch, F> {
         }
     }
 
+    /// Walk to the base-page table without treating a large leaf as a table.
+    ///
+    /// # Safety
+    /// The caller keeps the mapper and its table hierarchy stable through
+    /// both this walk and use of the returned table.
+    pub(crate) unsafe fn base_page_table(
+        &self,
+        virt: VirtAddr,
+    ) -> Result<Option<PageTable<Arch>>, SystemError> {
+        let mut table = self.table();
+        while table.level() != 0 {
+            let index = table.index_of(virt).ok_or(SystemError::EFAULT)?;
+            let entry = table.entry(index).ok_or(SystemError::EFAULT)?;
+            let Ok(physical) = entry.address() else {
+                return Ok(None);
+            };
+            if Arch::entry_is_leaf(table.level(), entry.flags().data()) {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            let base = table.entry_base(index).ok_or(SystemError::EFAULT)?;
+            table = PageTable::new(base, physical, table.level() - 1);
+        }
+        Ok(Some(table))
+    }
+
     /// 获取虚拟地址在指定层级页表的PageEntry
     /// ## 参数
     ///

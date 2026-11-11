@@ -1822,6 +1822,11 @@ impl SuperBlockState {
         self.umount_lock.write()
     }
 
+    fn cached_unnamed_dev(&self) -> Option<DeviceNumber> {
+        let minor = (*self.unnamed_dev_minor.try_lock().ok()?)?;
+        Some(DeviceNumber::new(Major::UNNAMED_MAJOR, minor))
+    }
+
     /// 返回该 superblock 的匿名设备号，首次需要时才分配。
     ///
     /// 锁覆盖“检查并分配”全过程，确保并发 metadata 查询只消耗一个 minor。
@@ -6845,14 +6850,12 @@ impl IndexNode for MountFSInode {
     fn cached_metadata(&self) -> Result<super::Metadata, SystemError> {
         let mut md = self.dentry.inode.cached_metadata()?;
         if md.dev_id == 0 {
-            let minor = self
+            md.dev_id = self
                 .mount_fs
                 .super_block_state
-                .unnamed_dev_minor
-                .try_lock()
-                .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-            let minor = (*minor).ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
-            md.dev_id = DeviceNumber::new(Major::UNNAMED_MAJOR, minor).data() as usize;
+                .cached_unnamed_dev()
+                .ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?
+                .data() as usize;
         }
         let idmap = self
             .mount_fs
@@ -6866,6 +6869,14 @@ impl IndexNode for MountFSInode {
             fs_userns: self.mount_fs.super_block_state.owner_user_ns().clone(),
         };
         Ok(context.view_metadata(&md))
+    }
+
+    fn cached_identity(&self) -> Option<super::InodeIdentity> {
+        let mut identity = self.dentry.inode.cached_identity()?;
+        if identity.dev_id == 0 {
+            identity.dev_id = self.mount_fs.super_block_state.cached_unnamed_dev()?.data() as usize;
+        }
+        Some(identity)
     }
 
     fn cached_symlink_target(&self) -> Result<String, SystemError> {

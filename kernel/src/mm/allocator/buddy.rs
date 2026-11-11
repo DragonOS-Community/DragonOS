@@ -114,6 +114,12 @@ pub(crate) struct BuddySnapshot {
     diagnostics: BuddyDiagnostics,
 }
 
+pub(crate) struct UserAllocationSnapshot {
+    pub usage: PageFrameUsage,
+    pub low_watermark_pages: usize,
+    pub reserve_pages: usize,
+}
+
 #[cfg(feature = "mm_selftest")]
 impl BuddySnapshot {
     /// Pressure fixtures must budget against the address zone they consume.
@@ -387,6 +393,21 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         match zone {
             BuddyZone::Dma32 => self.dma32_free_pages,
             BuddyZone::Normal => self.normal_free_pages,
+        }
+    }
+
+    fn frame_usage(&self) -> PageFrameUsage {
+        let free = PageFrameCount::new(self.dma32_free_pages + self.normal_free_pages);
+        PageFrameUsage::new(self.total - free, self.total)
+    }
+
+    pub(crate) fn user_allocation_snapshot(&self) -> UserAllocationSnapshot {
+        let dma32_low = self.floor(BuddyZone::Dma32, ReserveLevel::User);
+        let normal_low = self.floor(BuddyZone::Normal, ReserveLevel::User);
+        UserAllocationSnapshot {
+            usage: self.frame_usage(),
+            low_watermark_pages: dma32_low + normal_low,
+            reserve_pages: dma32_low.max(self.dma32_fallback_floor()) + normal_low,
         }
     }
 
@@ -1141,14 +1162,19 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         self.buddy_alloc_result(count).ok()
     }
 
+    fn dma32_fallback_floor(&self) -> usize {
+        if self.has_normal_memory {
+            DMA32_FALLBACK_RESERVE_PAGES + DMA32_ALLOCATION_METADATA_HEADROOM
+        } else {
+            0
+        }
+    }
+
     /// Whether an unrestricted allocation may consume low memory. A run
     /// already held outside the free lists passes zero at final handoff.
     pub(crate) fn dma32_fallback_allowed(&self, needed: usize) -> bool {
         !self.has_normal_memory
-            || self.dma32_free_pages
-                >= needed
-                    .saturating_add(DMA32_FALLBACK_RESERVE_PAGES)
-                    .saturating_add(DMA32_ALLOCATION_METADATA_HEADROOM)
+            || self.dma32_free_pages >= needed.saturating_add(self.dma32_fallback_floor())
     }
 
     fn buddy_alloc_result(
@@ -1542,6 +1568,10 @@ pub(crate) fn allocation_diagnostics_selftest_report() -> alloc::string::String 
         ("zone_reserve_and_address_diagnostics", zones),
         ("metadata_count_conservation", metadata),
         ("reserve_scope_irq_fork", super::reserve::selftest()),
+        (
+            "memory_availability",
+            crate::mm::memory_availability::selftest(),
+        ),
     ];
     let failures = checks.iter().filter(|(_, passed)| !passed).count();
     let mut report = alloc::string::String::new();
@@ -1917,6 +1947,9 @@ pub(crate) fn deterministic_buddy_selftest() -> (bool, bool, bool, bool, bool) {
 ))]
 fn watermark_selftest(fresh: impl Fn() -> BuddyAllocator<MMArch>, arena: PhysAddr) -> bool {
     let mut allocator = fresh();
+    allocator.watermarks[BuddyZone::Dma32.index()].low = 4;
+    let dma_only = allocator.user_allocation_snapshot();
+    let dma_only_reserve = dma_only.low_watermark_pages == 4 && dma_only.reserve_pages == 4;
     let low = PhysAddr::new(0x0200_0000);
     let high = PhysAddr::new(1usize << 32);
     unsafe {
@@ -1928,6 +1961,10 @@ fn watermark_selftest(fresh: impl Fn() -> BuddyAllocator<MMArch>, arena: PhysAdd
         low: 4,
         high: 6,
     }; 2];
+    let dual_zone = allocator.user_allocation_snapshot();
+    let fallback_floor = DMA32_FALLBACK_RESERVE_PAGES + DMA32_ALLOCATION_METADATA_HEADROOM;
+    let fallback_reserve =
+        dual_zone.low_watermark_pages == 8 && dual_zone.reserve_pages == fallback_floor + 4;
     let max = PhysAddr::new(DMA32_LIMIT);
     let allocate = |allocator: &mut BuddyAllocator<MMArch>, count, level| {
         allocator
@@ -1995,6 +2032,8 @@ fn watermark_selftest(fresh: impl Fn() -> BuddyAllocator<MMArch>, arena: PhysAdd
             == Ok((arena, PageFrameCount::ONE))
             && split.zone_free(source_zone) == free - 2;
     let marks = super::watermark::calculate([262144, 0], 4096);
+    allocator.watermarks[BuddyZone::Dma32.index()].low = fallback_floor + 1;
+    let high_watermark = allocator.user_allocation_snapshot();
     first
         && denied
         && kernel
@@ -2005,6 +2044,9 @@ fn watermark_selftest(fresh: impl Fn() -> BuddyAllocator<MMArch>, arena: PhysAdd
         && metadata_denial
         && headroom == 1
         && metadata_boundary
+        && fallback_reserve
+        && dma_only_reserve
+        && high_watermark.reserve_pages == high_watermark.low_watermark_pages
         && marks[0].min == 1024
         && marks[0].low == 1286
         && marks[0].high == 1548
@@ -2047,8 +2089,7 @@ impl<A: MemoryManagementArch> FrameAllocator for BuddyAllocator<A> {
     }
 
     unsafe fn usage(&self) -> PageFrameUsage {
-        let free = PageFrameCount::new(self.dma32_free_pages + self.normal_free_pages);
-        PageFrameUsage::new(self.total - free, self.total)
+        self.frame_usage()
     }
 }
 

@@ -40,6 +40,7 @@ pub mod kernel_mapper;
 pub(crate) mod lazy_mm_drop;
 pub mod madvise;
 pub mod memblock;
+pub(crate) mod memory_availability;
 pub(crate) mod memory_notify;
 pub mod mincore;
 pub mod mmio_buddy;

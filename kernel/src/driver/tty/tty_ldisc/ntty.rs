@@ -2435,6 +2435,8 @@ impl TtyLineDiscipline for NTtyLinediscipline {
                 } else {
                     retval = ldata.read_cnt();
                 }
+                drop(termios);
+                drop(ldata);
 
                 let mut user_writer = UserBufferWriter::new(
                     VirtAddr::new(arg).as_ptr::<i32>(),

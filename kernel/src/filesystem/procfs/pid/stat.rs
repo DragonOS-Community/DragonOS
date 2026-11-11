@@ -102,6 +102,8 @@ struct ProcStatSnapshot {
     policy: u32,
     utime: u64,
     stime: u64,
+    cutime: u64,
+    cstime: u64,
     minflt: usize,
     cminflt: usize,
     majflt: usize,
@@ -186,8 +188,8 @@ fn generate_linux_proc_stat_line(snapshot: &ProcStatSnapshot) -> String {
     // `/proc/<pid>/task/<tid>/stat` reports the thread alone.
     line.push_ull(snapshot.utime); // 14 utime
     line.push_ull(snapshot.stime); // 15 stime
-    line.push_ll(0); // 16 cutime
-    line.push_ll(0); // 17 cstime
+    line.push_ll(snapshot.cutime as i64); // 16 cutime
+    line.push_ll(snapshot.cstime as i64); // 17 cstime
 
     // Field 18 is Linux `task_prio()` and field 19 is the nice value itself: a
     // fair task at nice 0 reports 20 and 0, which is the PRI/NI pair `ps`
@@ -275,6 +277,13 @@ impl StatFileOps {
         let child_usage = pcb
             .get_rusage(RUsageWho::RUsageChildren)
             .unwrap_or_default();
+        // Fields 16/17: CPU time consumed by waited-for children. wait4(2)
+        // already reports this data (busybox time shows it), so /proc must
+        // expose it too instead of hardcoding 0.
+        let (cutime, cstime) = (
+            ns_to_clock_t(child_usage.ru_utime.to_ns()),
+            ns_to_clock_t(child_usage.ru_stime.to_ns()),
+        );
         // Field 18 is Linux's `task_prio()`, the dynamic priority offset into
         // the realtime range, and field 19 is the nice value itself. They are
         // two different numbers: a fair task at nice 0 reports `20` and `0`,
@@ -333,6 +342,8 @@ impl StatFileOps {
             policy,
             utime,
             stime,
+            cutime,
+            cstime,
             minflt: usage.ru_minflt,
             cminflt: child_usage.ru_minflt,
             majflt: usage.ru_majflt,

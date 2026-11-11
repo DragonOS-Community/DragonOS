@@ -71,14 +71,25 @@ pub(super) struct RealInodeIdentity {
     inode_id: InodeId,
 }
 
+fn backing_identity(inode: &dyn IndexNode) -> Result<vfs::InodeIdentity, SystemError> {
+    if let Some(identity) = inode.cached_identity() {
+        return Ok(identity);
+    }
+    let metadata = inode.metadata()?;
+    Ok(vfs::InodeIdentity {
+        dev_id: metadata.dev_id,
+        inode_id: metadata.inode_id,
+    })
+}
+
 impl RealInodeIdentity {
     pub(super) fn from_inode(inode: &Arc<dyn IndexNode>) -> Result<Self, SystemError> {
         let fs = OverlayFS::canonical_backing_fs(inode);
-        let metadata = inode.metadata()?;
+        let identity = backing_identity(inode.as_ref())?;
         Ok(Self {
             filesystem: Arc::as_ptr(&fs) as *const () as usize,
-            dev_id: metadata.dev_id,
-            inode_id: metadata.inode_id,
+            dev_id: identity.dev_id,
+            inode_id: identity.inode_id,
         })
     }
 }
@@ -982,7 +993,7 @@ impl OverlayFS {
             return Ok(false);
         }
 
-        Ok(left.metadata()?.inode_id == right.metadata()?.inode_id)
+        Ok(backing_identity(left.as_ref())?.inode_id == backing_identity(right.as_ref())?.inode_id)
     }
 
     fn is_mount_ancestor(

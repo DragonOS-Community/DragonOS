@@ -13,9 +13,9 @@ use crate::{
             permission::PermissionMask,
             syscall::RenameFlags,
             utils::DName,
-            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeMode,
-            LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior, RenameOutcome,
-            SetMetadataMask, XattrFlags,
+            DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeIdentity,
+            InodeMode, LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior,
+            RenameOutcome, SetMetadataMask, XattrFlags,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -874,6 +874,17 @@ impl IndexNode for FuseNode {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         self.check_not_stale()?;
         self.cached_or_fetch_metadata()
+    }
+
+    fn cached_identity(&self) -> Option<InodeIdentity> {
+        self.check_not_stale().ok()?;
+        self.conn.check_allow_current_process().ok()?;
+        // The daemon can update attr.ino, so identity uses the same deadline
+        // as getattr rather than treating the last reply as immutable.
+        self.with_valid_cached_metadata(|metadata| InodeIdentity {
+            dev_id: metadata.dev_id,
+            inode_id: metadata.inode_id,
+        })
     }
 
     fn check_access(&self, mask: PermissionMask) -> Result<(), SystemError> {

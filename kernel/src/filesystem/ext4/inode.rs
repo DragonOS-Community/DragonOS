@@ -3206,6 +3206,15 @@ impl IndexNode for LockedExt4Inode {
         ))
     }
 
+    fn cached_identity(&self) -> Option<vfs::InodeIdentity> {
+        let _operation = self.lifecycle.try_begin_operation().ok()?;
+        let inode = self.inner.try_lock().ok()?;
+        Some(vfs::InodeIdentity {
+            dev_id: inode.concret_fs().raw_dev.data() as usize,
+            inode_id: inode.vfs_inode_id,
+        })
+    }
+
     fn close(&self, _: PrivateData) -> Result<(), SystemError> {
         Ok(())
     }

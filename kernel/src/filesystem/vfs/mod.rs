@@ -84,6 +84,18 @@ impl Display for InodeId {
     }
 }
 
+/// Device and inode numbers as reported by this inode view.
+///
+/// Used by layers that key caches (rmap, overlay origins, dentry identity) on
+/// device + inode number only, without constructing a full attribute snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InodeIdentity {
+    /// Device number of the filesystem owning the inode.
+    pub dev_id: usize,
+    /// Inode number inside that filesystem.
+    pub inode_id: InodeId,
+}
+
 /// 文件的类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -1599,6 +1611,15 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// Implementations must not start device/remote I/O; uncertainty is EAGAIN.
     fn cached_metadata(&self) -> Result<Metadata, SystemError> {
         Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+    }
+
+    /// Return the current identity without device or remote I/O.
+    ///
+    /// A hit must honor this inode view's lifetime, access and freshness rules.
+    /// On a miss callers use `metadata()` to resolve the identity or get the
+    /// original error.
+    fn cached_identity(&self) -> Option<InodeIdentity> {
+        None
     }
 
     /// An already resident symlink target. Never fall back to read_at here.

@@ -186,8 +186,6 @@ impl InnerAddressSpace {
                 // Apply different page copy strategies based on VMA type
                 let start_page = region.start();
                 let end_page = region.end();
-                let mut current_page = start_page;
-
                 {
                     let _parent_pt_edit = parent_mm.page_table_edit();
                     let old_mapper = &mut self.user_mapper.utable;
@@ -195,72 +193,75 @@ impl InnerAddressSpace {
                     let new_vma_mlocked = new_vma.lock().vm_flags().contains(VmFlags::VM_LOCKED);
                     // COW 写保护标志与具体页无关，VMA 级一次计算。
                     let cow_flags = page_flags.set_write(false);
-                    let mut page_manager_guard = page_manager_lock();
+                    // One parent walk per base-page table, including empty
+                    // spans. User large leaves require a separate copy path.
+                    let pmd_stride = MMArch::PAGE_ENTRY_NUM * MMArch::PAGE_SIZE;
+                    let mut chunk = start_page.data() & !(pmd_stride - 1);
+                    while chunk < end_page.data() {
+                        let chunk_end = (chunk + pmd_stride).min(end_page.data());
+                        let first = VirtAddr::new(chunk.max(start_page.data()));
+                        chunk = chunk_end;
 
-                    while current_page < end_page {
-                        if let Some((phys_addr, old_flags)) = old_mapper.translate(current_page) {
-                            unsafe {
-                                if is_shared {
-                                    let child_flags = if vm_flags.contains(VmFlags::VM_PFNMAP)
-                                        || (page_manager_guard.get(&phys_addr).is_none()
-                                            && vm_flags.contains(VmFlags::VM_MIXEDMAP))
-                                    {
-                                        // Preserve the actual external PTE permission. Using
-                                        // VMA page flags here could make a deliberately RO DAX
-                                        // PFN writable in the child without pfn_mkwrite.
-                                        old_flags
-                                    } else {
-                                        page_flags
-                                    };
-                                    if new_mapper
-                                        .try_map_phys(
-                                            current_page,
-                                            phys_addr,
-                                            child_flags,
-                                            Some(creator),
-                                        )?
-                                        .is_none()
-                                    {
-                                        return Err(SystemError::ENOMEM.into());
-                                    }
-                                } else {
-                                    if old_flags.has_write() {
-                                        if let Some(flush) =
-                                            old_mapper.remap(current_page, cow_flags)
-                                        {
-                                            flush.ignore();
-                                            parent_tlb.accumulate_range(current_page);
-                                            parent_cow_remaps.push((current_page, old_flags));
-                                        }
-                                    }
+                        // Parent MM write and PT edit guards pin the hierarchy.
+                        let Some(table) = (unsafe { old_mapper.base_page_table(first) })? else {
+                            continue;
+                        };
+                        let first_index = table.index_of(first).ok_or(SystemError::EFAULT)?;
+                        let last = VirtAddr::new(chunk_end - MMArch::PAGE_SIZE);
+                        let last_index = table.index_of(last).ok_or(SystemError::EFAULT)?;
+                        for index in first_index..=last_index {
+                            let entry = unsafe { table.entry(index) }.ok_or(SystemError::EFAULT)?;
+                            let Ok(phys) = entry.address() else {
+                                continue;
+                            };
+                            let current = table.entry_base(index).ok_or(SystemError::EFAULT)?;
+                            let old_flags = entry.flags();
 
-                                    if new_mapper
-                                        .try_map_phys(
-                                            current_page,
-                                            phys_addr,
-                                            cow_flags,
-                                            Some(creator),
-                                        )?
-                                        .is_none()
-                                    {
-                                        return Err(SystemError::ENOMEM.into());
-                                    }
-                                }
-                                if let PresentPfn::Managed(page) = LockedVMA::classify_present_pfn(
-                                    &page_manager_guard,
-                                    phys_addr,
+                            // The parent mapping stays pinned while the child
+                            // PTE and rmap are installed. Classification clones
+                            // the managed page without touching the LRU.
+                            let pfn = if vm_flags.contains(VmFlags::VM_PFNMAP) {
+                                PresentPfn::External
+                            } else {
+                                LockedVMA::classify_present_pfn(
+                                    &page_manager_lock(),
+                                    phys,
                                     vm_flags,
-                                ) {
-                                    page.write().insert_vma(
-                                        new_vma.clone(),
-                                        current_page,
-                                        new_vma_mlocked,
-                                    );
-                                    child_present_pages += 1;
+                                )
+                            };
+                            let child_flags = if is_shared {
+                                match &pfn {
+                                    PresentPfn::Managed(_) => page_flags,
+                                    // Retain the permission on external PTEs,
+                                    // including DAX pages awaiting pfn_mkwrite.
+                                    PresentPfn::External => old_flags,
                                 }
+                            } else {
+                                if old_flags.has_write() {
+                                    if let Some(flush) =
+                                        unsafe { old_mapper.remap(current, cow_flags) }
+                                    {
+                                        unsafe { flush.ignore() };
+                                        parent_tlb.accumulate_range(current);
+                                        parent_cow_remaps.push((current, old_flags));
+                                    }
+                                }
+                                cow_flags
+                            };
+
+                            if unsafe {
+                                new_mapper.try_map_phys(current, phys, child_flags, Some(creator))
+                            }?
+                            .is_none()
+                            {
+                                return Err(SystemError::ENOMEM.into());
+                            }
+                            if let PresentPfn::Managed(page) = pfn {
+                                page.write()
+                                    .insert_vma(new_vma.clone(), current, new_vma_mlocked);
+                                child_present_pages += 1;
                             }
                         }
-                        current_page = VirtAddr::new(current_page.data() + MMArch::PAGE_SIZE);
                     }
                 }
             }
@@ -290,6 +291,10 @@ impl InnerAddressSpace {
             Ok(())
         })();
 
+        // Publish installed rmap entries before unlocking the child. On
+        // failure its normal teardown must account for the same entries.
+        new_addr_space.account_present_pages_add(child_present_pages);
+
         if let Err(err) = clone_result {
             {
                 let _parent_pt_edit = parent_mm.page_table_edit();
@@ -309,7 +314,6 @@ impl InnerAddressSpace {
         }
 
         drop(new_guard);
-        new_addr_space.account_present_pages_add(child_present_pages);
         // Complete the parent mm's mm-aware shootdown: INV-3 requires TLB completion before continuing with subsequent logic;
         // since no pages enter pending_pages here, this actually only triggers flush_tlb_mm_range.
         parent_tlb.finish();

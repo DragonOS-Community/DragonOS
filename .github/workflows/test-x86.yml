@@ -60,6 +60,7 @@ jobs:
           API_KEY: ${{ secrets.CI_DASHBOARD_UPLOAD_API_KEY }}
         run: |
           # 更新包列表并安装pip
+          sed -Ei 's#^URIs: https?://(archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?[[:blank:]]*$#URIs: https://mirror.math.princeton.edu/pub/ubuntu/#' /etc/apt/sources.list.d/ubuntu.sources
           apt-get update
           apt-get install -y python3-pip python3-venv
 

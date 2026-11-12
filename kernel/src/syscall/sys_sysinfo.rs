@@ -100,11 +100,7 @@ fn do_sysinfo(info: *mut PosixSysInfo) -> Result<usize, SystemError> {
     let mem = crate::mm::balloon::managed_usage();
 
     sysinfo.uptime = uptime_secs();
-    // Linux fills loads[] with the 1/5/15-minute averages in FIXED_1
-    // (1 << SI_LOAD_SHIFT == 1 << 16) units, i.e. the same scale that
-    // getloadavg() consumers expect. Report the values maintained by the
-    // scheduler instead of a hard-coded zero, which made getloadavg()-based
-    // tools (busybox uptime) print "0.00, 0.00, 0.00".
+    // Convert scheduler averages from FSHIFT fractional bits to the sysinfo ABI scale.
     sysinfo.loads = loadavg::get_avenrun(0, SI_LOAD_SHIFT - loadavg::FSHIFT);
     sysinfo.totalram = mem.total().bytes() as u64;
     // Linux reports buddy-allocator free pages here. Free object slots inside

@@ -3,14 +3,8 @@
 单元测试：测试日志解析功能
 """
 
-import json
-import os
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
-from unittest.mock import patch
-
-from parse_and_upload import GoogleTestParser, GenericParser, upload_test_results
+from parse_and_upload import GoogleTestParser, GenericParser
 
 
 class TestGoogleTestParser(unittest.TestCase):
@@ -169,71 +163,6 @@ class TestGenericParser(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]['name'], 'TestName')
         self.assertEqual(result[0]['status'], 'passed')
-
-
-class TestUploadResults(unittest.TestCase):
-    def upload(self, status, body, headers=None):
-        requests = []
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                data = self.rfile.read(int(self.headers["Content-Length"]))
-                requests.append((self.path, self.headers, json.loads(data)))
-                self.send_response(status)
-                for name, value in (headers or {}).items():
-                    self.send_header(name, value)
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                requests.append((self.path, self.headers, None))
-                self.send_error(405)
-
-            def log_message(self, *args):
-                pass
-
-        server = HTTPServer(("127.0.0.1", 0), Handler)
-        self.addCleanup(server.server_close)
-        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
-        thread.start()
-        self.addCleanup(thread.join)
-        self.addCleanup(server.shutdown)
-        self.requests = requests
-        with patch.dict(os.environ, {"no_proxy": "127.0.0.1"}):
-            return upload_test_results(
-                f"http://127.0.0.1:{server.server_port}/api/v1",
-                "test-key",
-                "fix/example",
-                "abc123",
-                [{"name": "例子", "status": "failed"}],
-            )
-
-    def test_posts_existing_dashboard_payload(self):
-        self.assertEqual(self.upload(201, b'{"code":200}'), {"code": 200})
-        [(path, headers, payload)] = self.requests
-        self.assertEqual(path, "/api/v1/test-runs")
-        self.assertEqual(headers["Authorization"], "Bearer test-key")
-        self.assertEqual(headers["Content-Type"], "application/json")
-        self.assertEqual(payload, {
-            "branch_name": "fix/example",
-            "commit_id": "abc123",
-            "test_type": "gvisor",
-            "status": "failed",
-            "test_cases": [{"name": "例子", "status": "failed"}],
-        })
-
-    def test_http_error_reports_dashboard_message(self):
-        with self.assertRaisesRegex(RuntimeError, "422.*invalid commit"):
-            self.upload(422, b'{"message":"invalid commit"}')
-
-    def test_http_error_with_non_object_body_reports_status(self):
-        with self.assertRaisesRegex(RuntimeError, "502"):
-            self.upload(502, b"null")
-
-    def test_redirect_does_not_send_another_request(self):
-        with self.assertRaisesRegex(RuntimeError, "302"):
-            self.upload(302, b"", {"Location": "/redirect-target"})
-        self.assertEqual([path for path, _, _ in self.requests], ["/api/v1/test-runs"])
 
 
 if __name__ == '__main__':

@@ -25,10 +25,9 @@ import sys
 import re
 import argparse
 import json
+import requests
 from typing import List, Dict, Optional
 from pathlib import Path
-from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 class TestCaseParser:
@@ -447,13 +446,6 @@ def parse_log_file(file_path: str) -> List[Dict]:
     return test_cases
 
 
-class RejectRedirects(HTTPRedirectHandler):
-    """Keep the authenticated POST on the configured dashboard endpoint."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 def upload_test_results(
     api_url: str,
     api_key: str,
@@ -507,22 +499,21 @@ def upload_test_results(
         "Content-Type": "application/json"
     }
     
-    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    # 发送请求
     try:
-        with build_opener(RejectRedirects).open(request, timeout=30) as response:
-            return json.load(response)
-    except HTTPError as error:
-        detail = str(error)
-        with error:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        if hasattr(e, 'response') and e.response is not None:
             try:
-                error_data = json.load(error)
-            except (ValueError, OSError):
-                error_data = None
-            if isinstance(error_data, dict) and error_data.get("message"):
-                detail = f"{detail}: {error_data['message']}"
-        raise RuntimeError(f"上传失败: {detail}") from error
-    except (OSError, ValueError) as error:
-        raise RuntimeError(f"上传失败: {error}") from error
+                error_data = e.response.json()
+                error_msg = error_data.get('message', str(e))
+            except (ValueError, json.JSONDecodeError):
+                error_msg = e.response.text or str(e)
+        else:
+            error_msg = str(e)
+        raise Exception(f"上传失败: {error_msg}")
 
 
 def print_test_cases_details(test_cases: List[Dict]):

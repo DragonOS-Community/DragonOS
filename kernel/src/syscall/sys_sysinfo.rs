@@ -1,12 +1,16 @@
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_SYSINFO;
 use crate::process::ProcessManager;
+use crate::sched::loadavg;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
 use crate::syscall::user_access::UserBufferWriter;
 use crate::time::uptime_secs;
 use alloc::vec::Vec;
 use system_error::SystemError;
+
+/// Linux `SI_LOAD_SHIFT`: fixed-point shift used by `sysinfo.loads`.
+const SI_LOAD_SHIFT: u32 = 16;
 
 /// 系统信息结构体
 /// 这里的Posix的意思指的是对齐Linux的面向用户态的结构体。避免内核态把他混淆使用。
@@ -96,7 +100,8 @@ fn do_sysinfo(info: *mut PosixSysInfo) -> Result<usize, SystemError> {
     let mem = crate::mm::balloon::managed_usage();
 
     sysinfo.uptime = uptime_secs();
-    sysinfo.loads = [0; 3];
+    // Convert scheduler averages from FSHIFT fractional bits to the sysinfo ABI scale.
+    sysinfo.loads = loadavg::get_avenrun(0, SI_LOAD_SHIFT - loadavg::FSHIFT);
     sysinfo.totalram = mem.total().bytes() as u64;
     // Linux reports buddy-allocator free pages here. Free object slots inside
     // resident slab pages are not free physical memory.

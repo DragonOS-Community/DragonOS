@@ -102,6 +102,12 @@ bool Snapshot(VmSnapshot* out, pid_t pid = 0) {
            ParseVmField(data, "VmPeak:", &out->peak);
 }
 
+bool ParseStatFlags(const char* data, unsigned long long* flags) {
+    const char* comm_end = strrchr(data, ')');
+    // Skip fields 3–8. Field 9 is unsigned decimal.
+    return comm_end && sscanf(comm_end + 1, " %*c %*d %*d %*d %*d %*d %llu", flags) == 1;
+}
+
 bool ParseStatSize(char* data, size_t* bytes) {
     char* field = strrchr(data, ')');
     if (!field) return false;
@@ -496,6 +502,8 @@ int ExecHelper(int report, int control) {
 }
 
 TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
+    constexpr unsigned long long kPfExiting = 0x00000004;
+    constexpr unsigned long long kPfForkNoExec = 0x00000040;
     int report[2], control[2];
     ASSERT_EQ(pipe(report), 0);
     Fd report_read(report[0]), report_write(report[1]);
@@ -532,6 +540,11 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     VmSnapshot old_snapshot;
     ASSERT_TRUE(Snapshot(&old_snapshot, child));
     snprintf(path, sizeof(path), "/proc/%d/stat", child);
+    char data[16384];
+    unsigned long long flags = 0;
+    ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatFlags(data, &flags));
+    EXPECT_EQ(kPfForkNoExec, flags & (kPfForkNoExec | kPfExiting));
     Fd stat_fd(open(path, O_RDONLY));
     snprintf(path, sizeof(path), "/proc/%d/statm", child);
     Fd statm_fd(open(path, O_RDONLY));
@@ -541,7 +554,6 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     VmSnapshot expected;
     size_t observed = 0;
     ASSERT_TRUE(Transfer(report[0], &expected, sizeof(expected), false));
-    char data[16384];
     ASSERT_TRUE(ReadFd(status.get(), data, sizeof(data)));
     ASSERT_TRUE(ParseVmSize(data, &observed));
     EXPECT_EQ(observed, expected.size);
@@ -551,6 +563,8 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     EXPECT_GE(peak, expected.size);
     EXPECT_LT(peak, old_snapshot.peak);
     ASSERT_TRUE(ReadFd(stat_fd.get(), data, sizeof(data)));
+    ASSERT_TRUE(ParseStatFlags(data, &flags));
+    EXPECT_EQ(0u, flags & (kPfForkNoExec | kPfExiting));
     ASSERT_TRUE(ParseStatSize(data, &observed));
     EXPECT_EQ(observed, expected.size);
     ASSERT_TRUE(ReadFd(statm_fd.get(), data, sizeof(data)));
@@ -566,6 +580,8 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     EXPECT_FALSE(ParseVmSize(data, &observed));
     snprintf(path, sizeof(path), "/proc/%d/stat", child);
     ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
+    ASSERT_TRUE(ParseStatFlags(data, &flags));
+    EXPECT_EQ(kPfExiting, flags & (kPfForkNoExec | kPfExiting));
     ASSERT_TRUE(ParseStatSize(data, &observed));
     EXPECT_EQ(observed, 0u);
     snprintf(path, sizeof(path), "/proc/%d/statm", child);

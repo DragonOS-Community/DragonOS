@@ -198,7 +198,7 @@ impl StatusFileOps {
         }
 
         pdata.append(
-            &mut format!("\nflags: {:?}\n", pcb.flags())
+            &mut format!("\nflags:\t{:#x}", pcb.flags().load().bits())
                 .as_bytes()
                 .to_owned(),
         );

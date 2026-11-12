@@ -16,7 +16,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{pid::PidType, resource::RUsageWho, ProcessState, RawPid},
+    process::{pid::PidType, resource::RUsageWho, ProcessFlags, ProcessState, RawPid},
     sched::{cputime::ns_to_clock_t, prio::PrioUtil},
 };
 use alloc::{
@@ -73,6 +73,25 @@ fn state_to_linux_char(state: ProcessState) -> char {
     }
 }
 
+/// Linux 6.6 include/linux/sched.h defines the PF_* bits exported by stat.
+fn linux_task_flags(flags: ProcessFlags) -> u32 {
+    const PF_EXITING: u32 = 0x0000_0004;
+    const PF_FORKNOEXEC: u32 = 0x0000_0040;
+    const PF_KTHREAD: u32 = 0x0020_0000;
+
+    let mut linux_flags = 0;
+    for (internal, exported) in [
+        (ProcessFlags::EXITING, PF_EXITING),
+        (ProcessFlags::FORKNOEXEC, PF_FORKNOEXEC),
+        (ProcessFlags::KTHREAD, PF_KTHREAD),
+    ] {
+        if flags.contains(internal) {
+            linux_flags |= exported;
+        }
+    }
+    linux_flags
+}
+
 /// 清理 comm 字段，避免包含 ')' 导致解析问题
 fn sanitize_comm_for_proc_stat(comm: &str) -> String {
     comm.chars()
@@ -86,6 +105,7 @@ struct ProcStatSnapshot {
     state: ProcessState,
     ppid: RawPid,
     tty_nr: i32,
+    flags: u32,
     priority: i64,
     nice: i64,
     num_threads: i64,
@@ -176,7 +196,7 @@ fn generate_linux_proc_stat_line(snapshot: &ProcStatSnapshot) -> String {
     line.push_ll(0); // 6 session
     line.push_ll(snapshot.tty_nr as i64); // 7 tty_nr
     line.push_ll(0); // 8 tpgid
-    line.push_ull(0); // 9 flags
+    line.push_ull(u64::from(snapshot.flags)); // 9 flags
     line.push_ull(snapshot.minflt as u64); // 10 minflt
     line.push_ull(snapshot.cminflt as u64); // 11 cminflt
     line.push_ull(snapshot.majflt as u64); // 12 majflt
@@ -253,6 +273,7 @@ impl StatFileOps {
         // Match get_task_mm(): keep mappings alive through exec/exit sampling.
         let user_vm = pcb.active_vm();
         let state = pcb.sched_info().state();
+        let flags = linux_task_flags(pcb.flags().load());
         let tty_nr = {
             pcb.sig_info_irqsave()
                 .tty()
@@ -331,6 +352,7 @@ impl StatFileOps {
             state,
             ppid,
             tty_nr,
+            flags,
             priority,
             nice,
             num_threads,

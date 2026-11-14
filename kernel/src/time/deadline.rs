@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{
     alloc::AllocError,
     fmt::Debug,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 #[path = "deadline_queue.rs"]
@@ -39,6 +39,11 @@ static PROGRAM_ATTEMPTS: [core::sync::atomic::AtomicU64; PerCpu::MAX_CPU_NUM as 
 static CONTINUOUS: AtomicBool = AtomicBool::new(false);
 static CAPABLE: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
     [const { AtomicBool::new(false) }; PerCpu::MAX_CPU_NUM as usize];
+/// CPUs currently inside the idle halt window. CPU0 is the timekeeping /
+/// global-timer owner and may only stop its tick when every other online CPU
+/// is idle too; otherwise jiffies and the ordinary timer wheel would stall
+/// while other CPUs run.
+static IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
 static QUEUES: [SpinLock<Queue>; PerCpu::MAX_CPU_NUM as usize] =
     [const { SpinLock::new(Queue::new()) }; PerCpu::MAX_CPU_NUM as usize];
 
@@ -317,6 +322,25 @@ pub fn reprogram_local() {
     }
 }
 
+fn other_online_cpus_idle(cpu: ProcessorId) -> bool {
+    let manager = crate::smp::cpu::smp_cpu_manager();
+    let idle = IDLE_CPUS.load(Ordering::Acquire);
+    manager
+        .online_cpus()
+        .iter_cpu()
+        .filter(|other| *other != cpu)
+        .all(|other| idle & (1u64 << other.data()) != 0)
+}
+
+fn set_cpu_idle(cpu: ProcessorId, idle: bool) {
+    let bit = 1u64 << cpu.data();
+    if idle {
+        IDLE_CPUS.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        IDLE_CPUS.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
 /// Enter the idle halt window: the periodic tick stops being an independent
 /// wakeup source until [`exit_idle`] runs. The clockevent is programmed to the
 /// earliest queued deadline, or to a bounded maintenance cap when none is due.
@@ -364,6 +388,14 @@ pub(crate) fn enter_idle() {
     } else {
         cap
     };
+    // CPU0 also owns jiffies and the global timer wheel. While any other CPU
+    // is running, keep the periodic tick so jiffies/timers cannot stall; only
+    // skip it when every online CPU is idle.
+    if cpu.data() == 0 && !other_online_cpus_idle(cpu) {
+        program_locked(&queue);
+        return;
+    }
+    set_cpu_idle(cpu, true);
     queue.idle = true;
     queue.idle_wake = wake;
     if wake <= now {
@@ -383,6 +415,7 @@ pub(crate) fn enter_idle() {
 /// Leave the idle halt window and restore the periodic tick phase.
 pub(crate) fn exit_idle() {
     let cpu = smp_get_processor_id();
+    set_cpu_idle(cpu, false);
     let was_idle = {
         let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
         if !queue.idle {

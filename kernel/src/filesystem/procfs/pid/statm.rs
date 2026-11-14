@@ -61,8 +61,7 @@ impl FileOps for StatmFileOps {
 
             let user_vm = pcb.active_vm();
 
-            // Process memory information (simplified: no shared/text/lib/data).
-            let (size_pages, resident_pages) = user_vm
+            let (size_pages, resident_pages, text_pages) = user_vm
                 .map(|mm| {
                     let vm = mm.vm();
                     let guard = vm.read_guard_no_reservations();
@@ -72,16 +71,20 @@ impl FileOps for StatmFileOps {
                         .saturating_add(MMArch::PAGE_SIZE - 1))
                         >> MMArch::PAGE_SHIFT;
                     let resident_pages = vm.resident_pages();
+                    // Match Linux task_statm(): round the start down and the end up.
+                    let start_page = guard.start_code.data() >> MMArch::PAGE_SHIFT;
+                    let end_page = guard.end_code.data().div_ceil(MMArch::PAGE_SIZE);
+                    let text_pages = end_page.saturating_sub(start_page);
                     drop(guard);
                     // Never let final mmput re-enter the write lock under a read guard.
                     drop(mm);
-                    (size_pages, resident_pages)
+                    (size_pages, resident_pages, text_pages)
                 })
-                .unwrap_or((0, 0));
+                .unwrap_or((0, 0, 0));
 
             // statm layout: size resident shared text lib data dt.
-            // Only size/resident are implemented; the remaining fields stay 0.
-            let content = format!("{} {} 0 0 0 0 0\n", size_pages, resident_pages);
+            // Shared and data are not accounted for here.
+            let content = format!("{size_pages} {resident_pages} 0 {text_pages} 0 0 0\n");
 
             Ok(content.into_bytes())
         })

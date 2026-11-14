@@ -437,9 +437,7 @@ fn program_locked(queue: &Queue) {
     // A far-past deadline must not turn into a one-nanosecond clockevent:
     // repeated immediate interrupts cannot make progress on the queue and
     // would starve the CPU. One half tick is the minimum reprogram delay.
-    let delta = next
-        .saturating_sub(now_ns())
-        .max(TICK_NS / 2);
+    let delta = next.saturating_sub(now_ns()).max(TICK_NS / 2);
     #[cfg(target_arch = "x86_64")]
     crate::arch::driver::apic::apic_timer::program_deadline_delta(delta);
     #[cfg(target_arch = "riscv64")]

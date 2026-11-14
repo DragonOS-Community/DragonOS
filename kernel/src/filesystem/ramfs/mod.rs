@@ -57,6 +57,11 @@ fn ramfs_move_entry_between_dirs(
         return Err(SystemError::ENOTDIR);
     }
 
+    // A retained directory inode is not necessarily a live namespace parent.
+    if src_dir.metadata.nlinks == 0 || dst_dir.metadata.nlinks == 0 {
+        return Err(SystemError::ENOENT);
+    }
+
     let src_self = src_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
     let dst_self = dst_dir.self_ref.upgrade().ok_or(SystemError::EIO)?;
     let inode_to_move = src_dir
@@ -1262,6 +1267,10 @@ impl IndexNode for LockedRamFSInode {
             return Err(SystemError::ENOTDIR.into());
         }
 
+        if inode.metadata.nlinks == 0 {
+            return Err(SystemError::ENOENT.into());
+        }
+
         // 如果另一个inode是文件夹，那么也报错
         if other_locked.metadata.file_type == FileType::Dir {
             return Err(SystemError::EISDIR.into());
@@ -1332,7 +1341,10 @@ impl IndexNode for LockedRamFSInode {
             return Err(SystemError::ENOTDIR.into());
         }
 
-        to_delete.0.lock().metadata.nlinks -= 1;
+        // The directory has lost both its parent entry and its self link.
+        // Open descriptors may retain the inode, but it is no longer a live
+        // parent for namespace creation. Zero is also authoritative to stat.
+        to_delete.0.lock().metadata.nlinks = 0;
         // 在当前目录中删除这个子目录项
         inode.children.remove(&name);
         // 父目录链接计数相应减少

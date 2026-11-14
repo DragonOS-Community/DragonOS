@@ -17,9 +17,11 @@ use system_error::SystemError;
 
 mod arp;
 mod protocols;
+mod route;
 
 use arp::ArpFileOps;
 use protocols::ProtocolsFileOps;
+use route::RouteFileOps;
 
 /// /proc/net 目录 DirOps
 #[derive(Debug)]
@@ -43,6 +45,7 @@ impl NetDirOps {
     )] = &[
         ("arp", ArpFileOps::new_inode),
         ("protocols", ProtocolsFileOps::new_inode),
+        ("route", RouteFileOps::new_inode),
     ];
 }
 

@@ -908,6 +908,12 @@ pub fn do_utimensat(
 
     let inode = match pathname {
         Some(path) => {
+            // Empty pathnames are not the NULL-path fd extension. Reject them
+            // before user_path_at can resolve an empty path to the cwd.
+            // Keep this after the UTIME_OMIT no-op above, as Linux does.
+            if path.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
             // AT_SYMLINK_NOFOLLOW applies only to the final component;
@@ -1000,6 +1006,11 @@ pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, 
         {
             return Err(SystemError::EINVAL);
         }
+    }
+    // As with utimensat, an empty pathname must not select the cwd.
+    // Preserve the timeval validation error precedence above.
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
     }
     // log::debug!("do_utimes: path:{:?}, times:{:?}", path, times);
     let (inode_begin, path) = user_path_at(

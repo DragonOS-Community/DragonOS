@@ -10,7 +10,7 @@ use crate::{
     filesystem::{
         procfs::{
             template::{Builder, FileOps, ProcFileBuilder},
-            utils::{proc_snapshot_operation, trim_string},
+            utils::proc_snapshot_operation,
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
@@ -126,9 +126,6 @@ impl MeminfoFileOps {
                 .as_bytes(),
             );
         }
-
-        // 去除多余的 \0 并在结尾添加 \0
-        trim_string(&mut data);
 
         data
     }

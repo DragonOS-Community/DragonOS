@@ -15,6 +15,9 @@ impl ProcessManager {
         loop {
             let pcb = ProcessManager::current_pcb();
             if pcb.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+                // A runnable task on this CPU means the timekeeper (CPU0) must
+                // not keep skipping its tick, or jiffies/timers would stall.
+                crate::time::deadline::notify_timekeeper_resume();
                 __schedule(SchedMode::SM_NONE);
             }
             if CurrentIrqArch::is_irq_enabled() {

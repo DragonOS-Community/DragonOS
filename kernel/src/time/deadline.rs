@@ -332,6 +332,25 @@ fn other_online_cpus_idle(cpu: ProcessorId) -> bool {
         .all(|other| idle & (1u64 << other.data()) != 0)
 }
 
+/// A non-timekeeper CPU is about to run a task after leaving idle. If CPU0
+/// has stopped its tick, wake it so jiffies and the global timer wheel resume
+/// while another CPU is executing.
+pub(crate) fn notify_timekeeper_resume() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if smp_get_processor_id().data() == 0 {
+            return;
+        }
+        if IDLE_CPUS.load(Ordering::Acquire) & 1 == 0 {
+            return;
+        }
+        crate::arch::interrupt::ipi::send_ipi(
+            crate::exception::ipi::IpiKind::KickCpu,
+            crate::exception::ipi::IpiTarget::Specified(ProcessorId::new(0)),
+        );
+    }
+}
+
 fn set_cpu_idle(cpu: ProcessorId, idle: bool) {
     let bit = 1u64 << cpu.data();
     if idle {

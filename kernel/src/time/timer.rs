@@ -126,10 +126,16 @@ impl PreparedTimer {
     }
 
     pub(crate) fn activate(self) {
-        let mut timers = TIMER_LIST.lock_irqsave();
-        // This token exclusively owns the unpublished activation.
-        debug_assert!(timers.get(&self.timer.queue_key()).is_none());
-        timers.insert_prepared(self.node);
+        let expire = self.timer.expire_jiffies();
+        {
+            let mut timers = TIMER_LIST.lock_irqsave();
+            // This token exclusively owns the unpublished activation.
+            debug_assert!(timers.get(&self.timer.queue_key()).is_none());
+            timers.insert_prepared(self.node);
+        }
+        // Publishing a timer can shorten an idle CPU0's clockevent target.
+        #[cfg(target_arch = "x86_64")]
+        crate::time::deadline::kick_timer_owner(expire);
     }
 }
 
@@ -185,13 +191,18 @@ impl Timer {
     pub fn activate(self: &Arc<Self>) {
         let node = PreparedNode::try_new(self.queue_key(), self.clone())
             .expect("timer queue allocation failed");
-        let mut timers = TIMER_LIST.lock_irqsave();
-        if timers.get(&self.queue_key()).is_some() {
-            drop(timers);
-            warn!("Timer already in list");
-            return;
+        {
+            let mut timers = TIMER_LIST.lock_irqsave();
+            if timers.get(&self.queue_key()).is_some() {
+                drop(timers);
+                warn!("Timer already in list");
+                return;
+            }
+            timers.insert_prepared(node);
         }
-        timers.insert_prepared(node);
+        // Publishing a timer can shorten an idle CPU0's clockevent target.
+        #[cfg(target_arch = "x86_64")]
+        crate::time::deadline::kick_timer_owner(self.expire_jiffies());
     }
 
     #[inline]

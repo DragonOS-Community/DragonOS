@@ -26,6 +26,10 @@ use crate::{
 };
 
 const TICK_NS: u64 = 1_000_000_000 / HZ;
+/// Upper bound on how long an idle CPU may skip the periodic tick when no
+/// earlier clockevent work is queued. Keeps jiffies, clocksource watchdog and
+/// periodic global maintenance within a bounded delay.
+const MAX_IDLE_NS: u64 = TICK_NS.saturating_mul(125);
 const MAX_CALLBACKS: usize = 32;
 // Regression-only count of ready-queue programming attempts, including fallback.
 // Ordinary kernels have no counter or accounting on this path.
@@ -47,6 +51,12 @@ struct Pending {
 struct Queue {
     ready: bool,
     next_tick: u64,
+    /// The local CPU is inside the idle halt window; the periodic tick is not
+    /// an independent wakeup source until the CPU leaves idle.
+    idle: bool,
+    /// Absolute monotonic deadline of the next wakeup that an idle CPU must
+    /// still honor (queued deadline events, ordinary timers / watchdog cap).
+    idle_wake: u64,
     pending: DeadlineQueue,
 }
 impl Queue {
@@ -54,16 +64,27 @@ impl Queue {
         Self {
             ready: false,
             next_tick: 0,
+            idle: false,
+            idle_wake: 0,
             pending: DeadlineQueue::new(),
         }
     }
 
-    /// The periodic tick shares the clockevent with queued deadlines.
+    /// The periodic tick shares the clockevent with queued deadlines. An
+    /// idle wakeup is a one-shot target: once it expires, fall back to the
+    /// tick deadline instead of arming a far-past deadline repeatedly.
     fn next_deadline(&self) -> u64 {
-        self.pending
-            .first_key()
-            .map_or(self.next_tick, |key| key.0.min(self.next_tick))
+        let earliest = self.pending.first_key().map_or(u64::MAX, |key| key.0);
+        if self.idle && self.idle_wake > now_ns() {
+            earliest.min(self.idle_wake)
+        } else {
+            earliest.min(self.next_tick)
+        }
     }
+}
+
+fn jiffies_to_ns(jiffies: u64) -> u64 {
+    ((jiffies as u128 * super::jiffies::NSEC_PER_JIFFY as u128).min(u64::MAX as u128)) as u64
 }
 
 /// The callback runs on the event owner with IRQs disabled, without queue or
@@ -296,6 +317,109 @@ pub fn reprogram_local() {
     }
 }
 
+/// Enter the idle halt window: the periodic tick stops being an independent
+/// wakeup source until [`exit_idle`] runs. The clockevent is programmed to the
+/// earliest queued deadline, or to a bounded maintenance cap when none is due.
+pub(crate) fn enter_idle() {
+    let cpu = smp_get_processor_id();
+    let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
+    if !queue.ready || queue.idle || !supported() {
+        return;
+    }
+    let now = now_ns();
+    let cap = now.saturating_add(MAX_IDLE_NS);
+    // CPU0 owns both timekeeping and the ordinary timer wheel. Include the
+    // earliest timer so an idle CPU0 still services it precisely; when the
+    // timer queue is contended, fall back to one tick so the next idle attempt
+    // recomputes instead of oversleeping.
+    let wake = if cpu.data() == 0 {
+        match super::timer::timer_get_first_expire() {
+            Ok(Some(expire)) => {
+                let remaining = expire.saturating_sub(super::timer::clock());
+                cap.min(now.saturating_add(jiffies_to_ns(remaining)))
+            }
+            Ok(None) => cap,
+            Err(_) => now.saturating_add(TICK_NS),
+        }
+    } else {
+        cap
+    };
+    queue.idle = true;
+    queue.idle_wake = wake;
+    if wake <= now {
+        // A timer is already due. Programming a one-nanosecond clockevent
+        // here would spin between HLT and the IRQ without advancing jiffies,
+        // because the tick path only runs timers after jiffies move. Keep the
+        // periodic tick and make the timer softirq check run now instead.
+        queue.idle = false;
+        program_locked(&queue);
+        drop(queue);
+        super::timer::run_local_timer();
+        return;
+    }
+    program_locked(&queue);
+}
+
+/// Leave the idle halt window and restore the periodic tick phase.
+pub(crate) fn exit_idle() {
+    let cpu = smp_get_processor_id();
+    let was_idle = {
+        let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
+        if !queue.idle {
+            false
+        } else {
+            queue.idle = false;
+            queue.next_tick = now_ns().saturating_add(TICK_NS);
+            true
+        }
+    };
+    if !was_idle {
+        return;
+    }
+    // CPU0 owns jiffies and global per-tick maintenance. Bring them forward
+    // before installing the next periodic deadline; a long idle window is
+    // accounted in one batch by advance_jiffies().
+    if cpu.data() == 0 {
+        tick_handle_global(false);
+        // A short halt may wake without advancing jiffies, but a timer can
+        // still have expired. Always re-check the timer queues so an expired
+        // timer cannot keep the CPU bouncing between enter_idle and exit_idle.
+        super::timer::run_local_timer();
+    }
+    reprogram_local();
+}
+
+/// A timer was just published. An idle CPU0 must be woken to reprogram its
+/// clockevent if the new deadline is earlier than its current idle wakeup;
+/// otherwise the timer would wait for the bounded maintenance cap.
+pub(crate) fn kick_timer_owner(expire_jiffies: u64) {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = expire_jiffies;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let owner = ProcessorId::new(0);
+        let wake = {
+            let queue = QUEUES[0].lock_irqsave();
+            if !queue.idle {
+                return;
+            }
+            queue.idle_wake
+        };
+        let now = now_ns();
+        let remaining = expire_jiffies.saturating_sub(super::timer::clock());
+        let expire_ns = now.saturating_add(jiffies_to_ns(remaining));
+        if expire_ns >= wake {
+            return;
+        }
+        // Dropping the queue guard first avoids re-entering the owner on a
+        // self-IPI after IRQs are enabled.
+        crate::arch::interrupt::ipi::send_ipi(
+            crate::exception::ipi::IpiKind::KickCpu,
+            crate::exception::ipi::IpiTarget::Specified(owner),
+        );
+    }
+}
+
 fn program_locked(queue: &Queue) {
     if !queue.ready {
         return;
@@ -310,7 +434,12 @@ fn program_locked(queue: &Queue) {
         return;
     }
     let next = queue.next_deadline();
-    let delta = next.saturating_sub(now_ns()).max(1);
+    // A far-past deadline must not turn into a one-nanosecond clockevent:
+    // repeated immediate interrupts cannot make progress on the queue and
+    // would starve the CPU. One half tick is the minimum reprogram delay.
+    let delta = next
+        .saturating_sub(now_ns())
+        .max(TICK_NS / 2);
     #[cfg(target_arch = "x86_64")]
     crate::arch::driver::apic::apic_timer::program_deadline_delta(delta);
     #[cfg(target_arch = "riscv64")]

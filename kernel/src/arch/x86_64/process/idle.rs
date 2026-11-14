@@ -26,8 +26,13 @@ impl ProcessManager {
                 // idle_enter() can itself wake a local RCU worker without an
                 // IPI, so check after entering EQS as well as before it.
                 if !pcb.flags().contains(ProcessFlags::NEED_SCHEDULE) {
+                    // While halted with no runnable task, the periodic tick is
+                    // not a wakeup source: the clockevent is programmed to the
+                    // earliest queued event instead (NOHZ-idle style).
+                    crate::time::deadline::enter_idle();
                     unsafe { x86_64::instructions::interrupts::enable_and_hlt() };
                     unsafe { CurrentIrqArch::interrupt_disable() };
+                    crate::time::deadline::exit_idle();
                 }
                 crate::rcu::idle_exit(rcu_idle);
                 drop(irq_guard);

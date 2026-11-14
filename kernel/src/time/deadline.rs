@@ -333,14 +333,34 @@ pub(crate) fn enter_idle() {
     // timer queue is contended, fall back to one tick so the next idle attempt
     // recomputes instead of oversleeping.
     let wake = if cpu.data() == 0 {
-        match super::timer::timer_get_first_expire() {
-            Ok(Some(expire)) => {
+        let mut wake = cap;
+        // Absolute deadlines are exact (nanoseconds); queued DeadlineEvents
+        // are also covered by next_deadline(), so a contended query is safe
+        // to skip here.
+        for domain in [
+            super::absolute_timer::AbsoluteClock::Monotonic,
+            super::absolute_timer::AbsoluteClock::Realtime,
+        ] {
+            if let Ok(Some(expire)) = super::absolute_timer::first_expire(domain) {
                 let remaining = expire.saturating_sub(super::timer::clock());
-                cap.min(now.saturating_add(jiffies_to_ns(remaining)))
+                wake = wake.min(now.saturating_add(jiffies_to_ns(remaining)));
             }
-            Ok(None) => cap,
-            Err(_) => now.saturating_add(TICK_NS),
         }
+        // The ordinary timer wheel is jiffies-based and coarse. Wait one
+        // extra jiffy so a timer serviced at the expire boundary never runs
+        // its callback with `now < deadline` (timerfd would drop the periodic
+        // chain in that case).
+        match super::timer::timer_list_first_expire() {
+            Ok(Some(expire)) => {
+                let remaining = expire
+                    .saturating_sub(super::timer::clock())
+                    .saturating_add(1);
+                wake = wake.min(now.saturating_add(jiffies_to_ns(remaining)));
+            }
+            Ok(None) => {}
+            Err(_) => wake = wake.min(now.saturating_add(TICK_NS)),
+        }
+        wake
     } else {
         cap
     };

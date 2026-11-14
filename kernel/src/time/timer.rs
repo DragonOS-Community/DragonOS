@@ -386,6 +386,15 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     }
 }
 
+/// Earliest ordinary timer-wheel deadline, in absolute jiffies.
+///
+/// Kept separate from [`timer_get_first_expire`] so the idle path can add one
+/// jiffy of slack to coarse (jiffies-based) timers without delaying the
+/// nanosecond-based absolute timers that share the clockevent.
+pub(crate) fn timer_list_first_expire() -> Result<Option<u64>, SystemError> {
+    first_expire_in(&TIMER_LIST)
+}
+
 /// Return the earliest deadline, distinguishing an empty queue from deadline 0.
 /// Contention remains bounded because the caller runs in timer IRQ context.
 pub fn timer_get_first_expire() -> Result<Option<u64>, SystemError> {

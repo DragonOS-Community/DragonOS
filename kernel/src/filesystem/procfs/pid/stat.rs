@@ -67,7 +67,9 @@ fn state_to_linux_char(state: ProcessState) -> char {
                 'D'
             }
         }
-        ProcessState::BlockedKillable => 'D',
+        ProcessState::Blocked(false)
+        | ProcessState::BlockedIdle
+        | ProcessState::BlockedKillable => 'D',
         ProcessState::Stopped => 'T',
         ProcessState::Exited(_) => 'Z',
     }

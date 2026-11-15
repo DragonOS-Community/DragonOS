@@ -44,6 +44,8 @@ pub enum ProcessState {
     /// An uninterruptible resource wait that fatal signals may wake.
     /// Corresponds to Linux TASK_UNINTERRUPTIBLE | TASK_WAKEKILL.
     BlockedKillable,
+    /// An idle uninterruptible wait that does not contribute to load average.
+    BlockedIdle,
     /// The process was stopped by a signal.
     Stopped,
     /// The process has exited; usize holds the raw wait status used by Linux wait(2) family.
@@ -79,6 +81,8 @@ mod state_bits {
     pub const TASK_RUNNING: u32 = 0x0000;
     pub const TASK_INTERRUPTIBLE: u32 = 0x0001;
     pub const TASK_UNINTERRUPTIBLE: u32 = 0x0002;
+    pub const TASK_NOLOAD: u32 = 0x0400;
+    pub const TASK_IDLE: u32 = TASK_UNINTERRUPTIBLE | TASK_NOLOAD;
     pub const TASK_WAKEKILL: u32 = 0x0100;
     pub const TASK_KILLABLE: u32 = TASK_UNINTERRUPTIBLE | TASK_WAKEKILL;
     pub const TASK_STOPPED: u32 = 0x0004;
@@ -95,12 +99,13 @@ impl ProcessState {
 
     #[inline(always)]
     pub const fn is_blocked(&self) -> bool {
-        return matches!(
+        matches!(
             self,
-            ProcessState::Blocked(_) | ProcessState::BlockedKillable
-        );
+            ProcessState::Blocked(_)
+                | ProcessState::BlockedKillable
+                | ProcessState::BlockedIdle
+        )
     }
-
     #[inline(always)]
     pub fn is_blocked_interruptable(&self) -> bool {
         return matches!(self, ProcessState::Blocked(true));
@@ -158,6 +163,7 @@ impl ProcessState {
             ProcessState::Blocked(true) => state_bits::TASK_INTERRUPTIBLE,
             ProcessState::Blocked(false) => state_bits::TASK_UNINTERRUPTIBLE,
             ProcessState::BlockedKillable => state_bits::TASK_KILLABLE,
+            ProcessState::BlockedIdle => state_bits::TASK_IDLE,
             ProcessState::Stopped => state_bits::TASK_STOPPED,
             ProcessState::Exited(code) => {
                 state_bits::TASK_DEAD_MARKER | ((code as u32) << state_bits::EXIT_CODE_SHIFT)
@@ -175,6 +181,7 @@ impl ProcessState {
                 v if v == state_bits::TASK_RUNNING => ProcessState::Runnable,
                 v if v == state_bits::TASK_INTERRUPTIBLE => ProcessState::Blocked(true),
                 v if v == state_bits::TASK_UNINTERRUPTIBLE => ProcessState::Blocked(false),
+                v if v == state_bits::TASK_IDLE => ProcessState::BlockedIdle,
                 v if v == state_bits::TASK_KILLABLE => ProcessState::BlockedKillable,
                 v if v == state_bits::TASK_STOPPED => ProcessState::Stopped,
                 _ => {

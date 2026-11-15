@@ -866,6 +866,11 @@ impl ProcessManager {
         Self::mark_sleep_state(ProcessState::Blocked(interruptable))
     }
 
+    /// Mark the current task as idle-sleeping without contributing to load average.
+    pub fn mark_sleep_idle() -> Result<(), SystemError> {
+        Self::mark_sleep_state(ProcessState::BlockedIdle)
+    }
+
     /// Publish a fatal-signal-only resource wait under the usual sleep protocol.
     /// Like `mark_sleep`, this requires interrupts to be disabled.
     pub fn mark_sleep_killable() -> Result<(), SystemError> {

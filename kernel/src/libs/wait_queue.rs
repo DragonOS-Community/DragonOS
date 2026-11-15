@@ -990,7 +990,10 @@ impl Waiter {
     pub fn wait(&self, interruptible: bool) -> Result<(), SystemError> {
         block_current(self, interruptible)
     }
-
+    /// Wait without contributing to system load average.
+    pub fn wait_idle(&self) -> Result<(), SystemError> {
+        block_current_idle(self)
+    }
     pub fn wait_io(&self, interruptible: bool) -> Result<(), SystemError> {
         block_current_io(self, interruptible)
     }
@@ -1180,17 +1183,22 @@ fn before_sleep_check(max_preempt: usize) {
 
 /// 统一封装"标记阻塞 + 调度 + 信号检查"，避免各调用点重复逻辑
 fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
-    block_current_impl(waiter, interruptible, false)
+    block_current_impl(waiter, interruptible, false, false)
+}
+
+fn block_current_idle(waiter: &Waiter) -> Result<(), SystemError> {
+    block_current_impl(waiter, false, false, true)
 }
 
 fn block_current_io(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
-    block_current_impl(waiter, interruptible, true)
+    block_current_impl(waiter, interruptible, true, false)
 }
 
 fn block_current_impl(
     waiter: &Waiter,
     interruptible: bool,
     is_io: bool,
+    is_idle: bool,
 ) -> Result<(), SystemError> {
     loop {
         // 快路径：被提前唤醒
@@ -1209,7 +1217,11 @@ fn block_current_impl(
             WakerSleepState::Sleeping => {}
         }
 
-        ProcessManager::mark_sleep(interruptible)?;
+        if is_idle {
+            ProcessManager::mark_sleep_idle()?;
+        } else {
+            ProcessManager::mark_sleep(interruptible)?;
+        }
 
         // Handle a wake racing between prepare_sleep and mark_sleep.
         if waiter.waker.consume_notification() {

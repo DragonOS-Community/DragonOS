@@ -125,7 +125,7 @@ impl CpuMask {
         &self.bmp
     }
 
-    /// 将掩码格式化为 Linux cpulist（如 `0,2-3`），非空时以换行结尾。
+    /// 将掩码格式化为 Linux cpulist（如 `0,2-3`），以换行结尾。
     pub fn to_cpulist(&self) -> String {
         let mut out = String::new();
         let mut start: Option<u32> = None;

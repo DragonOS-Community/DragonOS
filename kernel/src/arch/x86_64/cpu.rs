@@ -19,7 +19,8 @@ use crate::{
         vfs::InodeMode,
     },
     init::initcall::INITCALL_POSTCORE,
-    libs::lazy_init::Lazy,
+    libs::{cpumask::CpuMask, lazy_init::Lazy},
+    mm::percpu::PerCpu,
     smp::cpu::{smp_cpu_manager, ProcessorId},
 };
 
@@ -109,115 +110,197 @@ pub unsafe fn cpu_reset() -> ! {
     }
 }
 
-/// 单个逻辑CPU的拓扑信息。
-///
-/// 这些值来自 CPUID 拓扑叶子与 ACPI MADT 中的 APIC ID，供
-/// `/sys/devices/system/cpu/cpuN/topology/*` 和 `/proc/cpuinfo` 使用。
-#[derive(Clone, Debug)]
+/// Package-local topology shared by sysfs and /proc/cpuinfo.
+#[derive(Debug)]
 pub struct CpuTopologyEntry {
     pub cpu_id: u32,
     pub core_id: u32,
     pub package_id: u32,
-    pub thread_siblings: Vec<u32>,
-    pub core_siblings: Vec<u32>,
-    pub cores_per_package: u32,
+    pub thread_siblings: CpuMask,
+    pub package_siblings: CpuMask,
+    pub cores_per_package: usize,
 }
 
 static CPU_TOPOLOGY: Lazy<Vec<CpuTopologyEntry>> = Lazy::new();
 /// 保持 `cpuN` 与 `cpuN/topology` 两层 kobject 存活。
 static CPU_KOBS: Lazy<Vec<(Arc<CommonKobj>, Arc<CommonKobj>)>> = Lazy::new();
 
-/// 从指定 CPUID 拓扑叶子读取 SMT 层级的 APIC ID 位移。
-///
-/// `CPUID.1F` 只表示该叶子被 CPU 支持，并不保证其内容有效：QEMU/KVM
-/// 可能返回全零的子叶。因此必须检查 subleaf 0 的 level type；内容无效
-/// 时返回 None，让调用方回退到 0xB。
-fn smt_shift_from_leaf(leaf: u32) -> Option<u32> {
-    for subleaf in 0..16 {
-        let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
-        let level_type = (result.ecx >> 8) & 0xff;
+#[derive(Clone, Copy, Default)]
+struct ApicIdLayout {
+    smt_shift: u32,
+    package_shift: u32,
+}
 
-        if level_type == 0 {
-            // subleaf 0 都没有有效层级，说明该叶子不可用。
-            if subleaf == 0 {
-                return None;
-            }
-            break;
+impl ApicIdLayout {
+    fn package_and_core(self, apic_id: u32) -> (u32, u32) {
+        let package_id = apic_id >> self.package_shift;
+        let package_local_id = apic_id ^ (package_id << self.package_shift);
+        (package_id, package_local_id >> self.smt_shift)
+    }
+}
+
+/// Parse the SMT level and the highest valid topology level. With leaf 0x1F,
+/// the latter can include modules, tiles or dies above the Core level.
+fn extended_apic_id_layout(leaf: u32) -> Option<ApicIdLayout> {
+    use core::arch::x86_64::__cpuid_count;
+
+    let first = __cpuid_count(leaf, 0);
+    if first.ebx & 0xffff == 0 || (first.ecx >> 8) & 0xff != 1 {
+        return None;
+    }
+
+    let smt_shift = first.eax & 0x1f;
+    let mut package_shift = smt_shift;
+    for subleaf in 1..32 {
+        let level = __cpuid_count(leaf, subleaf);
+        if level.ebx & 0xffff == 0 || (level.ecx >> 8) & 0xff == 0 {
+            return Some(ApicIdLayout {
+                smt_shift,
+                package_shift,
+            });
         }
-        if level_type == 1 {
-            // SMT 层的 shift_right_for_next_apic_id，位于 EAX[4:0]。
-            return Some(result.eax & 0x1f);
+
+        let shift = level.eax & 0x1f;
+        if shift < package_shift {
+            return None;
         }
-        if subleaf == 0 {
-            // 有效拓扑，但首个层级不是 SMT（threads=1）。
-            return Some(0);
-        }
+        package_shift = shift;
     }
     None
 }
 
-/// 读取 SMT 层级的 APIC ID 位移：优先使用有效的 0x1F，回退到 0xB。
-fn detect_smt_shift() -> u32 {
-    for leaf in [0x1f, 0x0b] {
-        if let Some(shift) = smt_shift_from_leaf(leaf) {
-            return shift;
-        }
-    }
-    0
+fn apic_id_width(count: u32) -> u32 {
+    u32::BITS - count.saturating_sub(1).leading_zeros()
 }
 
-/// 初始化并缓存所有 present CPU 的拓扑。
-///
-/// DragonOS 面向容器/沙箱 guest，当前按单 socket 约定导出拓扑：
-/// `physical_package_id` 固定为 0，`core_id` 吸收 SMT 以上的 Die/Tile
-/// 位，因此多 Die 的单 socket 仍能保持 core ID 唯一。多 socket guest
-/// 不在该 ABI 的覆盖范围内，会被报告为一个 socket。
-pub fn init_cpu_topology() -> Result<(), SystemError> {
+fn detect_apic_id_layout() -> ApicIdLayout {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+    let max_leaf = __cpuid(0).eax;
+    for leaf in [0x1f, 0x0b] {
+        if max_leaf >= leaf {
+            if let Some(layout) = extended_apic_id_layout(leaf) {
+                return layout;
+            }
+        }
+    }
+
+    let cpuid = CpuId::new();
+    let Some(features) = cpuid.get_feature_info() else {
+        return ApicIdLayout::default();
+    };
+    match cpuid
+        .get_vendor_info()
+        .as_ref()
+        .map(|vendor| vendor.as_str())
+    {
+        Some("AuthenticAMD" | "HygonGenuine") => {
+            let Some(capacity) = cpuid.get_processor_capacity_feature_info() else {
+                return ApicIdLayout::default();
+            };
+            let package_shift = match capacity.apic_id_size() {
+                0 => apic_id_width(capacity.num_phys_threads() as u32),
+                width => width as u32,
+            };
+            // Before Zen, this field describes cores per compute unit.
+            let smt_shift = if features.family_id() >= 0x17
+                && cpuid
+                    .get_extended_processor_and_feature_identifiers()
+                    .is_some_and(|features| features.has_topology_extensions())
+                && __cpuid(0x8000_0000).eax >= 0x8000_001e
+            {
+                let topology = __cpuid(0x8000_001e);
+                apic_id_width(((topology.ebx >> 8) & 0xff) + 1)
+            } else {
+                0
+            };
+            if smt_shift <= package_shift {
+                return ApicIdLayout {
+                    smt_shift,
+                    package_shift,
+                };
+            }
+        }
+        Some("GenuineIntel") if features.has_htt() => {
+            let logical = u32::from(features.max_logical_processor_ids());
+            let cores = if max_leaf >= 4 {
+                let cache = __cpuid_count(4, 0);
+                if cache.eax & 0x1f == 0 {
+                    1
+                } else {
+                    (cache.eax >> 26) + 1
+                }
+            } else {
+                1
+            };
+            if logical >= cores {
+                return ApicIdLayout {
+                    smt_shift: apic_id_width(logical / cores),
+                    package_shift: apic_id_width(logical),
+                };
+            }
+        }
+        _ => {}
+    }
+
+    // Without a topology description, each APIC ID is a standalone processor.
+    ApicIdLayout::default()
+}
+
+fn init_cpu_topology() -> Result<(), SystemError> {
     if CPU_TOPOLOGY.initialized() {
         return Ok(());
     }
 
-    let mut cpus: Vec<ProcessorId> = smp_cpu_manager().present_cpus().iter_cpu().collect();
-    if cpus.is_empty() {
-        cpus = smp_cpu_manager().possible_cpus().iter_cpu().collect();
-    }
+    let cpus = smp_cpu_manager().present_cpus();
     if cpus.is_empty() {
         return Err(SystemError::ENODEV);
     }
 
-    let smt_shift = detect_smt_shift();
-    let mut entries = Vec::with_capacity(cpus.len());
-    for cpu in &cpus {
-        let apic_id = SMP_BOOT_DATA.phys_id(cpu.data() as usize) as u32;
-        entries.push(CpuTopologyEntry {
-            cpu_id: cpu.data(),
-            core_id: apic_id >> smt_shift,
-            package_id: 0,
-            thread_siblings: Vec::new(),
-            core_siblings: Vec::new(),
-            cores_per_package: 0,
-        });
-    }
+    // POSTCORE runs before AP bring-up. All vCPUs in a guest use the same
+    // APIC ID layout, while MADT provides each present CPU's full APIC ID.
+    let layout = detect_apic_id_layout();
+    let mut entries: Vec<_> = cpus
+        .iter_cpu()
+        .map(|cpu| {
+            let apic_id = SMP_BOOT_DATA.phys_id(cpu.data() as usize) as u32;
+            let (package_id, core_id) = layout.package_and_core(apic_id);
+            CpuTopologyEntry {
+                cpu_id: cpu.data(),
+                core_id,
+                package_id,
+                thread_siblings: CpuMask::new(),
+                package_siblings: CpuMask::new(),
+                cores_per_package: 0,
+            }
+        })
+        .collect();
 
-    let mut distinct_cores: Vec<u32> = Vec::new();
-    for entry in &entries {
-        if !distinct_cores.contains(&entry.core_id) {
-            distinct_cores.push(entry.core_id);
-        }
-    }
-    let cores_per_package = distinct_cores.len() as u32;
-    let all_cpus: Vec<u32> = entries.iter().map(|entry| entry.cpu_id).collect();
-
-    for i in 0..entries.len() {
-        let mut thread_siblings = Vec::new();
-        for other in entries.iter() {
-            if other.core_id == entries[i].core_id {
-                thread_siblings.push(other.cpu_id);
+    let ids: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                ProcessorId::new(entry.cpu_id),
+                entry.package_id,
+                entry.core_id,
+            )
+        })
+        .collect();
+    for entry in &mut entries {
+        let mut cores = Vec::new();
+        for &(cpu, package_id, core_id) in &ids {
+            if package_id != entry.package_id {
+                continue;
+            }
+            entry.package_siblings.set(cpu, true);
+            if core_id == entry.core_id {
+                entry.thread_siblings.set(cpu, true);
+            }
+            if !cores.contains(&core_id) {
+                cores.push(core_id);
             }
         }
-        entries[i].thread_siblings = thread_siblings;
-        entries[i].core_siblings = all_cpus.clone();
-        entries[i].cores_per_package = cores_per_package.max(1);
+        entry.cores_per_package = cores.len();
     }
 
     CPU_TOPOLOGY.init(entries);
@@ -225,38 +308,11 @@ pub fn init_cpu_topology() -> Result<(), SystemError> {
 }
 
 /// 获取指定逻辑 CPU 的拓扑信息。
-pub fn cpu_topology_entry(cpu_id: u32) -> Option<CpuTopologyEntry> {
+pub fn cpu_topology_entry(cpu_id: u32) -> Option<&'static CpuTopologyEntry> {
     if !CPU_TOPOLOGY.initialized() {
         return None;
     }
-    CPU_TOPOLOGY
-        .iter()
-        .find(|entry| entry.cpu_id == cpu_id)
-        .cloned()
-}
-
-/// 将 CPU 编号列表格式化为 Linux 的 cpulist 形式（如 `0,2-3`）。
-fn format_cpu_list(cpus: &[u32]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < cpus.len() {
-        let start = cpus[i];
-        let mut end = start;
-        while i + 1 < cpus.len() && cpus[i + 1] == end + 1 {
-            i += 1;
-            end = cpus[i];
-        }
-        if !out.is_empty() {
-            out.push(',');
-        }
-        if start == end {
-            out.push_str(&format!("{start}"));
-        } else {
-            out.push_str(&format!("{start}-{end}"));
-        }
-        i += 1;
-    }
-    out
+    CPU_TOPOLOGY.iter().find(|entry| entry.cpu_id == cpu_id)
 }
 
 fn parse_cpu_id(name: &str) -> Option<u32> {
@@ -276,7 +332,7 @@ fn cpu_id_from_kobj(kobj: &Arc<dyn KObject>) -> Result<u32, SystemError> {
     Err(SystemError::EINVAL)
 }
 
-fn topology_from_kobj(kobj: &Arc<dyn KObject>) -> Result<CpuTopologyEntry, SystemError> {
+fn topology_from_kobj(kobj: &Arc<dyn KObject>) -> Result<&'static CpuTopologyEntry, SystemError> {
     let cpu_id = cpu_id_from_kobj(kobj)?;
     cpu_topology_entry(cpu_id).ok_or(SystemError::ENOENT)
 }
@@ -343,10 +399,7 @@ impl Attribute for AttrThreadSiblingsList {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let topo = topology_from_kobj(&kobj)?;
-        sysfs_emit_str(
-            buf,
-            &format!("{}\n", format_cpu_list(&topo.thread_siblings)),
-        )
+        sysfs_emit_str(buf, &topo.thread_siblings.to_cpulist())
     }
 }
 
@@ -368,21 +421,22 @@ impl Attribute for AttrCoreSiblingsList {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let topo = topology_from_kobj(&kobj)?;
-        sysfs_emit_str(buf, &format!("{}\n", format_cpu_list(&topo.core_siblings)))
+        sysfs_emit_str(buf, &topo.package_siblings.to_cpulist())
     }
 }
 
 /// Linux 的 `thread_siblings`/`core_siblings` 是十六进制 cpumask 文本。
-fn cpumask_hex(cpus: &[u32]) -> String {
-    let mut mask = 0u64;
-    for &cpu in cpus {
-        // 单 u64 cpumask 的硬上限；当前 PerCpu::MAX_CPU_NUM=16。
-        debug_assert!((cpu as usize) < 64, "cpu {cpu} exceeds 64-bit cpumask");
-        if (cpu as usize) < 64 {
-            mask |= 1u64 << cpu;
-        }
-    }
-    format!("{mask:x}\n")
+fn cpumask_hex(cpus: &CpuMask) -> String {
+    // Linux prints up to 32 bits per group, padded to nr_cpu_ids.
+    const { assert!(PerCpu::MAX_CPU_NUM <= u32::BITS) };
+    let width = smp_cpu_manager()
+        .possible_cpus()
+        .last()
+        .map_or(1, |cpu| (cpu.data() as usize + 1).div_ceil(4));
+    let mask = cpus
+        .iter_cpu()
+        .fold(0u32, |mask, cpu| mask | (1 << cpu.data()));
+    format!("{mask:0width$x}\n")
 }
 
 #[derive(Debug)]
@@ -425,7 +479,7 @@ impl Attribute for AttrCoreSiblings {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let topo = topology_from_kobj(&kobj)?;
-        sysfs_emit_str(buf, &cpumask_hex(&topo.core_siblings))
+        sysfs_emit_str(buf, &cpumask_hex(&topo.package_siblings))
     }
 }
 

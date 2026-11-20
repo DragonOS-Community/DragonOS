@@ -152,23 +152,20 @@ fn generate_cpu_info(cpu_id: crate::smp::cpu::ProcessorId) -> String {
         // 物理 CPU 封装 ID、同封装逻辑处理器数量、core ID 以及每封装核心数。
         // 这些值由 CPUID 拓扑层级和 MADT 中的 APIC ID 推导，不能直接用
         // 当前 CPU 的 CPUID 结果代表其他逻辑 CPU。
-        let topology = crate::arch::x86_64::cpu::cpu_topology_entry(cpu_id.data());
-        let (physical_id, siblings, core_id, cpu_cores) = if let Some(topology) = topology {
-            (
-                topology.package_id,
-                topology.core_siblings.len(),
-                topology.core_id,
-                topology.cores_per_package.max(1),
-            )
+        if let Some(topology) = crate::arch::x86_64::cpu::cpu_topology_entry(cpu_id.data()) {
+            info.push_str(&format!("physical id\t: {}\n", topology.package_id));
+            info.push_str(&format!(
+                "siblings\t: {}\n",
+                topology.package_siblings.iter_cpu().count()
+            ));
+            info.push_str(&format!("core id\t\t: {}\n", topology.core_id));
+            info.push_str(&format!("cpu cores\t: {}\n", topology.cores_per_package));
         } else {
-            let cpus = smp_cpu_manager().present_cpus_count();
-            (0, cpus as usize, cpu_id.data(), cpus)
-        };
-
-        info.push_str(&format!("physical id\t: {}\n", physical_id));
-        info.push_str(&format!("siblings\t: {}\n", siblings));
-        info.push_str(&format!("core id\t\t: {}\n", core_id));
-        info.push_str(&format!("cpu cores\t: {}\n", cpu_cores));
+            info.push_str(&format!(
+                "siblings\t: {}\n",
+                smp_cpu_manager().present_cpus_count()
+            ));
+        }
 
         // APIC ID // 不确定是哪个
         let apic_id = boot_data.phys_id(cpu_id.data() as usize);

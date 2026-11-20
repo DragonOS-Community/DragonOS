@@ -39,11 +39,8 @@ pub use transport::{
     VsockTransport, VsockTransportEvent,
 };
 
-// 事件到达现在以 virtqueue 中断唤醒为主（见 virtio_vsock.rs 的 IRQ 注册），
-// 下面的空闲睡眠保留为兜底：中断丢失或未启用的平台上，事件延迟上界仍为 100ms。
-// 10ms 的旧兜底会让空闲 vCPU 每 10ms 被唤醒一次（约 1% 单核/沙箱），而中断路径
-// 已经可靠；100ms 在保持兜底语义的同时把空闲唤醒降低一个数量级。
-const VSOCK_EVENT_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(100);
+const VSOCK_EVENT_WORKER_POLL: Duration = Duration::from_millis(10);
+const VSOCK_EVENT_WORKER_IRQ_FALLBACK: Duration = Duration::from_millis(100);
 
 static VSOCK_EVENT_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static VSOCK_EVENT_WORKER_SLEEP_QUEUE: WaitQueue = WaitQueue::default();
@@ -84,9 +81,14 @@ fn vsock_event_worker() -> i32 {
         }
 
         match transport::transport_poll_events() {
-            Ok(events) => {
+            Ok((events, irq_ready)) => {
                 if events.is_empty() {
-                    vsock_event_worker_sleep(VSOCK_EVENT_WORKER_IDLE_SLEEP);
+                    let delay = if irq_ready {
+                        VSOCK_EVENT_WORKER_IRQ_FALLBACK
+                    } else {
+                        VSOCK_EVENT_WORKER_POLL
+                    };
+                    vsock_event_worker_sleep(delay);
                     continue;
                 }
                 stream::dispatch_transport_events(events);

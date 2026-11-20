@@ -3752,40 +3752,6 @@ impl IndexNode for LockedExt4Inode {
         fs.retry_metadata_read_contention(|| ext4.getxattr(inode_num, name, buf))
     }
 
-    fn setxattr(
-        &self,
-        name: &[u8],
-        value: &[u8],
-        flags: XattrFlags,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let _operation = self.begin_operation()?;
-        let _size_change = self.size_change_lock.write();
-        let guard = self.inner.lock();
-        let fs = guard.concret_fs();
-        let ext4 = &fs.fs;
-        let inode_num = guard.inner_inode_num;
-
-        if fs
-            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
-            .ftype
-            == FileType::SymLink
-        {
-            return Err(SystemError::EPERM.into());
-        }
-
-        fs.retry_metadata_contention(|| {
-            ext4.setxattr_with_flags(
-                inode_num,
-                name,
-                value,
-                flags.contains(XattrFlags::CREATE),
-                flags.contains(XattrFlags::REPLACE),
-            )
-        })?;
-
-        Ok(0)
-    }
-
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         let _operation = self.begin_operation()?;
         let guard = self.inner.lock();
@@ -3796,26 +3762,45 @@ impl IndexNode for LockedExt4Inode {
         fs.retry_metadata_read_contention(|| ext4.listxattr(inode_num, buf))
     }
 
-    fn removexattr(
+    fn mutate_xattr(
         &self,
         name: &[u8],
+        mutation: vfs::XattrMutation<'_>,
+        check: Option<&vfs::XattrWriteCheck<'_>>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let _operation = self.begin_operation()?;
         let _size_change = self.size_change_lock.write();
         let guard = self.inner.lock();
         let fs = guard.concret_fs();
-        let ext4 = &fs.fs;
         let inode_num = guard.inner_inode_num;
+        let attr = fs.retry_metadata_read_contention(|| fs.fs.getattr(inode_num))?;
 
-        if fs
-            .retry_metadata_read_contention(|| ext4.getattr(inode_num))?
-            .ftype
-            == FileType::SymLink
-        {
+        if let Some(check) = check {
+            let metadata = Self::metadata_from_attr(
+                &fs,
+                guard.vfs_inode_id,
+                guard.cached_file_size,
+                guard.cached_times,
+                attr,
+            );
+            check(&metadata)?;
+            if metadata.file_type == vfs::FileType::SymLink {
+                return Err(SystemError::EPERM.into());
+            }
+        } else if attr.ftype == FileType::SymLink {
             return Err(SystemError::EPERM.into());
         }
 
-        fs.retry_metadata_contention(|| ext4.removexattr(inode_num, name))?;
+        fs.retry_metadata_contention(|| match mutation {
+            vfs::XattrMutation::Set(value, flags) => fs.fs.setxattr_with_flags(
+                inode_num,
+                name,
+                value,
+                flags.contains(XattrFlags::CREATE),
+                flags.contains(XattrFlags::REPLACE),
+            ),
+            vfs::XattrMutation::Remove => fs.fs.removexattr(inode_num, name),
+        })?;
         Ok(0)
     }
 

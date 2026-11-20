@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -76,6 +77,96 @@ class XattrSyscall : public ::testing::Test {
     int fd = -1;
     std::string path;
 };
+
+TEST_F(XattrSyscall, AttributeChangesRequireInodeWritePermission) {
+    ASSERT_EQ(0, fchmod(fd, 0444));
+    ASSERT_EQ(0, Set(Access::Path, kValue, sizeof(kValue), 0, "user.check"));
+    ASSERT_EQ(0, close(fd));
+    fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+
+    const std::string sticky = path + ".dir";
+    const std::string owned = sticky + "/owned";
+    const std::string link = path + ".link";
+    ASSERT_EQ(0, mkdir(sticky.c_str(), 0700));
+    ASSERT_EQ(0, chmod(sticky.c_str(), 01777));
+    ASSERT_EQ(0, setxattr(sticky.c_str(), kName, kValue, sizeof(kValue), 0));
+    ASSERT_EQ(0, symlink(path.c_str(), link.c_str()));
+    EXPECT_EQ(-1, lsetxattr(link.c_str(), kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(EPERM, errno);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (setresgid(12345, 12345, 12345) || setresuid(12345, 12345, 12345)) _exit(1);
+        EXPECT_EQ(-1, open(path.c_str(), O_WRONLY));
+        EXPECT_EQ(EACCES, errno);
+        for (Access mode : kAccess) {
+            EXPECT_EQ(-1, Set(mode, kValue, sizeof(kValue), 0, "user.created"));
+            EXPECT_EQ(EACCES, errno);
+            EXPECT_EQ(-1, Remove(mode, "user.check"));
+            EXPECT_EQ(EACCES, errno);
+            EXPECT_EQ(static_cast<ssize_t>(sizeof(kValue)), Get(mode, nullptr, 0, "user.check"));
+        }
+        EXPECT_EQ(-1, setxattr(sticky.c_str(), kName, kValue, sizeof(kValue), 0));
+        EXPECT_EQ(EPERM, errno);
+        int writable = open(owned.c_str(), O_CREAT | O_RDONLY | O_EXCL, 0644);
+        EXPECT_GE(writable, 0);
+        EXPECT_EQ(0, fsetxattr(writable, kName, kValue, sizeof(kValue), 0));
+        EXPECT_EQ(0, fremovexattr(writable, kName));
+        EXPECT_EQ(-1, fsetxattr(writable, "trusted.check", kValue, sizeof(kValue), 0));
+        EXPECT_EQ(EPERM, errno);
+        _exit(HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(child, waitpid(child, &status, 0));
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+    std::array<char, sizeof(kValue)> value = {};
+    ASSERT_EQ(static_cast<ssize_t>(value.size()),
+              Get(Access::Path, value.data(), value.size(), "user.check"));
+    EXPECT_EQ(0, memcmp(kValue, value.data(), value.size()));
+    EXPECT_EQ(-1, Get(Access::Path, nullptr, 0, "user.created"));
+    EXPECT_EQ(ENODATA, errno);
+    EXPECT_EQ(-1, getxattr(owned.c_str(), "trusted.check", nullptr, 0));
+    EXPECT_EQ(ENODATA, errno);
+    EXPECT_EQ(0, unlink(owned.c_str()));
+    EXPECT_EQ(0, rmdir(sticky.c_str()));
+    EXPECT_EQ(0, unlink(link.c_str()));
+}
+
+TEST_F(XattrSyscall, ReadonlyMountRejectsMutationBeforeNamespaceChecks) {
+    const std::string link = path + ".link";
+    ASSERT_EQ(0, symlink(path.c_str(), link.c_str()));
+    ASSERT_EQ(0, close(fd));
+    fd = -1;
+    ASSERT_NO_FATAL_FAILURE(filesystem.Unmount());
+    ASSERT_NO_FATAL_FAILURE(filesystem.Mount(MS_RDONLY));
+    fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    EXPECT_EQ(-1, lsetxattr(link.c_str(), kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(EROFS, errno);
+    EXPECT_EQ(-1, lremovexattr(link.c_str(), kName));
+    EXPECT_EQ(EROFS, errno);
+    EXPECT_EQ(-1, Remove(Access::Fd, kName));
+    EXPECT_EQ(EROFS, errno);
+    ExpectOriginal();
+}
+
+TEST_F(XattrSyscall, MutationRequiresPathOrOpenFile) {
+    EXPECT_EQ(-1, setxattr("", kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, removexattr("", kName));
+    EXPECT_EQ(ENOENT, errno);
+    const int path_fd = open(path.c_str(), O_PATH);
+    ASSERT_GE(path_fd, 0);
+    EXPECT_EQ(-1, fsetxattr(path_fd, kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(EBADF, errno);
+    EXPECT_EQ(-1, fremovexattr(path_fd, kName));
+    EXPECT_EQ(EBADF, errno);
+    EXPECT_EQ(0, close(path_fd));
+    ExpectOriginal();
+}
 
 TEST_F(XattrSyscall, ReadOnlyOutputReturnsEFAULT) {
     const size_t page = sysconf(_SC_PAGESIZE);

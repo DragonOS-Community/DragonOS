@@ -15,7 +15,7 @@ use crate::{
             utils::DName,
             DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode, InodeIdentity,
             InodeMode, LinkMutationCoordinator, LinkRemovalOutcome, Metadata, OpenFileBehavior,
-            RenameOutcome, SetMetadataMask, XattrFlags,
+            RenameOutcome, SetMetadataMask, XattrMutation, XattrWriteCheck,
         },
     },
     libs::{casting::DowncastArc, mutex::MutexGuard},
@@ -496,13 +496,19 @@ impl IndexNode for FuseNode {
         Ok(payload.len())
     }
 
-    fn setxattr(
+    fn mutate_xattr(
         &self,
         name: &[u8],
-        value: &[u8],
-        flags: XattrFlags,
+        mutation: XattrMutation<'_>,
+        check: Option<&XattrWriteCheck<'_>>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
         let _setattr_guard = self.setattr_lock.lock();
+        if let Some(check) = check {
+            check(&self.metadata()?)?;
+        }
+        let XattrMutation::Set(value, flags) = mutation else {
+            return self.removexattr_locked(name);
+        };
         self.check_not_stale()?;
         if self.conn.no_xattr(FUSE_SETXATTR) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
@@ -556,14 +562,6 @@ impl IndexNode for FuseNode {
         Self::verify_xattr_list(&payload)?;
         buf[..payload.len()].copy_from_slice(&payload);
         Ok(payload.len())
-    }
-
-    fn removexattr(
-        &self,
-        name: &[u8],
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let _setattr_guard = self.setattr_lock.lock();
-        self.removexattr_locked(name)
     }
 
     fn resize_open_truncate(

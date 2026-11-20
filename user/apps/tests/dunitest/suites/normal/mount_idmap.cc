@@ -684,6 +684,29 @@ class MountIdmapExt4CapsTest : public MountIdmapTest {};
 
 class MountIdmapTmpfsQuotaTest : public MountIdmapTest {};
 
+TEST_P(MountIdmapExt4CapsTest, UserXattrsUseMappedIdentityAndRejectUnmappedOwners) {
+    constexpr char key[] = "user.idmap";
+    ASSERT_NO_FATAL_FAILURE(raw_file("owned", 3, 4, 0600));
+    ASSERT_NO_FATAL_FAILURE(as_user(1003, 2004, [&] {
+        Fd fd(open((view_ + "/owned").c_str(), O_RDONLY));
+        WORKER_CHECK(fd.get() >= 0);
+        WORKER_CHECK(fsetxattr(fd.get(), key, "x", 1, 0) == 0);
+        WORKER_CHECK(fremovexattr(fd.get(), key) == 0);
+        return WorkerResult{};
+    }));
+    ASSERT_NO_FATAL_FAILURE(raw_file("hole", 3, 160, 0666));
+    const auto raw = raw_ + "/hole";
+    const auto view = view_ + "/hole";
+    ASSERT_EQ(0, setxattr(raw.c_str(), key, "x", 1, 0));
+    EXPECT_EQ(-1, setxattr(view.c_str(), key, "y", 1, 0));
+    EXPECT_EQ(EPERM, errno);
+    EXPECT_EQ(-1, removexattr(view.c_str(), key));
+    EXPECT_EQ(EPERM, errno);
+    char value = 0;
+    ASSERT_EQ(1, getxattr(raw.c_str(), key, &value, 1));
+    EXPECT_EQ('x', value);
+}
+
 TEST_P(MountIdmapTmpfsQuotaTest, QuotaFailureAfterPrivilegeStageNotifiesOnlyAttrib) {
     const long page = sysconf(_SC_PAGESIZE); ASSERT_GT(page, 0);
     const std::string options = "size=" + std::to_string(page);

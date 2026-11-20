@@ -122,9 +122,16 @@ fn caller_may_access_xattr(name: &[u8]) -> bool {
         || ProcessManager::current_cred().has_capability(CAPFlags::CAP_SYS_ADMIN)
 }
 
-fn check_xattr_mutation_permission(inode: &OvlInode, name: &[u8]) -> Result<(), SystemError> {
+fn check_xattr_mutation_permission(
+    inode: &OvlInode,
+    name: &[u8],
+    check: Option<&crate::filesystem::vfs::XattrWriteCheck<'_>>,
+) -> Result<(), SystemError> {
     let cred = ProcessManager::current_cred();
     let metadata = inode.metadata()?;
+    if let Some(check) = check {
+        check(&metadata)?;
+    }
     if metadata
         .flags
         .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
@@ -698,6 +705,7 @@ pub(super) fn setxattr(
     name: &[u8],
     value: &[u8],
     flags: XattrFlags,
+    check: Option<&crate::filesystem::vfs::XattrWriteCheck<'_>>,
 ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     if is_private_xattr(name) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
@@ -707,11 +715,11 @@ pub(super) fn setxattr(
     }
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
-    check_xattr_mutation_permission(inode, name)?;
+    check_xattr_mutation_permission(inode, name, check)?;
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
-    check_xattr_mutation_permission(inode, name)?;
+    check_xattr_mutation_permission(inode, name, check)?;
     ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
         upper.setxattr(name, value, flags)
     })
@@ -769,6 +777,7 @@ fn copy_visible_xattr_names(
 pub(super) fn removexattr(
     inode: &OvlInode,
     name: &[u8],
+    check: Option<&crate::filesystem::vfs::XattrWriteCheck<'_>>,
 ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
     if is_private_xattr(name) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
@@ -778,7 +787,7 @@ pub(super) fn removexattr(
     }
     let fs = inode.overlay_fs()?;
     let _privilege_guard = inode.content_privilege_lock.lock();
-    check_xattr_mutation_permission(inode, name)?;
+    check_xattr_mutation_permission(inode, name, check)?;
     let copied_up_for_remove = !inode.has_upper();
     if copied_up_for_remove {
         ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
@@ -789,7 +798,7 @@ pub(super) fn removexattr(
     inode.copy_up_locked()?;
     let upper = inode.upper_inode.lock().clone().ok_or(SystemError::EIO)?;
     let _content_guard = fs.content_lock(&upper)?.lock();
-    check_xattr_mutation_permission(inode, name)?;
+    check_xattr_mutation_permission(inode, name, check)?;
     ProcessManager::with_current_credentials(fs.backing_cred.clone(), || {
         match upper.removexattr(name) {
             Ok(size) => Ok(size),

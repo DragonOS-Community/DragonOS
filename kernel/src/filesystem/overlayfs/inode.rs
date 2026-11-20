@@ -12,7 +12,7 @@ use crate::filesystem::vfs::utils::DName;
 use crate::filesystem::vfs::{
     self, inode_lifecycle::InodeRetentionGuard, DirectoryEntry, FileSystem, FileType, IndexNode,
     InodeId, InodeRetentionKind, LinkMutationCoordinator, Metadata, OpenFileBehavior,
-    PostWriteSyncPolicy, SetMetadataMask, XattrFlags,
+    PostWriteSyncPolicy, SetMetadataMask,
 };
 use crate::libs::casting::DowncastArc;
 use crate::libs::mutex::{Mutex, MutexGuard};
@@ -853,24 +853,24 @@ impl IndexNode for OvlInode {
         super::metadata::getxattr(self, name, buf)
     }
 
-    fn setxattr(
-        &self,
-        name: &[u8],
-        value: &[u8],
-        flags: XattrFlags,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        super::metadata::setxattr(self, name, value, flags)
-    }
-
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         super::metadata::listxattr(self, buf)
     }
 
-    fn removexattr(
+    fn mutate_xattr(
         &self,
         name: &[u8],
+        mutation: crate::filesystem::vfs::XattrMutation<'_>,
+        check: Option<&crate::filesystem::vfs::XattrWriteCheck<'_>>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        super::metadata::removexattr(self, name)
+        use crate::filesystem::vfs::XattrMutation;
+
+        match mutation {
+            XattrMutation::Set(value, flags) => {
+                super::metadata::setxattr(self, name, value, flags, check)
+            }
+            XattrMutation::Remove => super::metadata::removexattr(self, name, check),
+        }
     }
 
     fn remove_security_privileges(

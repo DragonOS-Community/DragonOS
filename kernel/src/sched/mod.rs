@@ -1322,7 +1322,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
 
             if *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
                 // sched_contributes_to_load 在 deactivate_task 之前
-                if prev_state.is_uninterruptible() {
+                if prev_state.contributes_to_load() {
                     rq.nr_uninterruptible += 1;
                     loadavg::inc_nr_uninterruptible(1);
                 }
@@ -1545,7 +1545,7 @@ pub fn enqueue_task_on_cpu(
     pcb: &Arc<ProcessControlBlock>,
     target_cpu: ProcessorId,
     wake_flags: WakeupFlags,
-    was_uninterruptible: bool,
+    contributed_to_load: bool,
 ) {
     assert!(
         !pcb.sched_info().is_running(),
@@ -1559,7 +1559,7 @@ pub fn enqueue_task_on_cpu(
 
     rq.update_rq_clock();
 
-    if was_uninterruptible {
+    if contributed_to_load {
         rq.dec_nr_uninterruptible();
     }
 

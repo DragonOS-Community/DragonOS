@@ -988,11 +988,14 @@ impl Waiter {
     }
 
     pub fn wait(&self, interruptible: bool) -> Result<(), SystemError> {
-        block_current(self, interruptible)
+        block_current(self, WaitMode::Normal(interruptible))
     }
-
+    /// Wait without contributing to system load average.
+    pub fn wait_idle(&self) -> Result<(), SystemError> {
+        block_current(self, WaitMode::Idle)
+    }
     pub fn wait_io(&self, interruptible: bool) -> Result<(), SystemError> {
-        block_current_io(self, interruptible)
+        block_current(self, WaitMode::Io(interruptible))
     }
 
     pub fn wait_killable(&self) -> Result<(), SystemError> {
@@ -1178,20 +1181,19 @@ fn before_sleep_check(max_preempt: usize) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WaitMode {
+    Normal(bool),
+    Io(bool),
+    Idle,
+}
+
 /// 统一封装"标记阻塞 + 调度 + 信号检查"，避免各调用点重复逻辑
-fn block_current(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
-    block_current_impl(waiter, interruptible, false)
-}
-
-fn block_current_io(waiter: &Waiter, interruptible: bool) -> Result<(), SystemError> {
-    block_current_impl(waiter, interruptible, true)
-}
-
-fn block_current_impl(
-    waiter: &Waiter,
-    interruptible: bool,
-    is_io: bool,
-) -> Result<(), SystemError> {
+fn block_current(waiter: &Waiter, mode: WaitMode) -> Result<(), SystemError> {
+    let interruptible = match mode {
+        WaitMode::Normal(interruptible) | WaitMode::Io(interruptible) => interruptible,
+        WaitMode::Idle => false,
+    };
     loop {
         // 快路径：被提前唤醒
         if waiter.waker.consume_notification() {
@@ -1209,7 +1211,10 @@ fn block_current_impl(
             WakerSleepState::Sleeping => {}
         }
 
-        ProcessManager::mark_sleep(interruptible)?;
+        match mode {
+            WaitMode::Idle => ProcessManager::mark_sleep_idle()?,
+            WaitMode::Normal(_) | WaitMode::Io(_) => ProcessManager::mark_sleep(interruptible)?,
+        }
 
         // Handle a wake racing between prepare_sleep and mark_sleep.
         if waiter.waker.consume_notification() {
@@ -1230,7 +1235,7 @@ fn block_current_impl(
         drop(irq_guard);
 
         // 根据是否是 IO 等待选择不同的调度函数
-        if is_io {
+        if matches!(mode, WaitMode::Io(_)) {
             io_schedule();
         } else {
             schedule(SchedMode::SM_NONE);

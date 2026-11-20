@@ -227,7 +227,7 @@ fn notification_loop() -> i32 {
         // the check-to-sleep race and notifications received while processing.
         if !WORK_PENDING.load(Ordering::Acquire) {
             waiter
-                .wait(false)
+                .wait_idle()
                 .expect("permanent memory notifier wait failed");
         }
     }

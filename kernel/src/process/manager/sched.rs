@@ -83,7 +83,7 @@ impl ProcessManager {
             }
             return Ok(());
         }
-        let was_uninterruptible = state.is_uninterruptible();
+        let contributed_to_load = state.contributes_to_load();
 
         pcb.sched_info().set_state(ProcessState::Runnable);
         fence(Ordering::SeqCst);
@@ -123,10 +123,10 @@ impl ProcessManager {
         let target_cpu =
             select_task_rq(pcb, prev_cpu, WakeupFlags::WF_TTWU, &pi_guard.cpus_allowed);
 
-        if was_uninterruptible || pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
+        if contributed_to_load || pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
             let prev_rq = cpu_rq(prev_cpu.data() as usize);
             let (prev_rq, _prev_rq_guard) = prev_rq.self_lock();
-            if was_uninterruptible {
+            if contributed_to_load {
                 prev_rq.dec_nr_uninterruptible();
             }
             if pcb.flags().contains(ProcessFlags::IN_IOWAIT) {
@@ -797,13 +797,13 @@ impl ProcessManager {
         let target_cpu = pcb.sched_info().on_cpu().unwrap_or_else(current_cpu_id);
         let update_clock = target_cpu == smp_get_processor_id();
         let was_off_rq = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
-        let was_uninterruptible = prev_state.is_uninterruptible();
+        let contributed_to_load = prev_state.contributes_to_load();
         let was_iowait = pcb.flags().contains(ProcessFlags::IN_IOWAIT);
 
-        if was_off_rq && (was_uninterruptible || was_iowait) {
+        if was_off_rq && (contributed_to_load || was_iowait) {
             let prev_rq = cpu_rq(target_cpu.data() as usize);
             let (prev_rq, _prev_rq_guard) = prev_rq.self_lock();
-            if was_uninterruptible {
+            if contributed_to_load {
                 prev_rq.dec_nr_uninterruptible();
             }
             if was_iowait {
@@ -864,6 +864,11 @@ impl ProcessManager {
     ///   correctness to prevent the task from being re-added to the run queue.
     pub fn mark_sleep(interruptable: bool) -> Result<(), SystemError> {
         Self::mark_sleep_state(ProcessState::Blocked(interruptable))
+    }
+
+    /// Mark the current task as idle-sleeping without contributing to load average.
+    pub fn mark_sleep_idle() -> Result<(), SystemError> {
+        Self::mark_sleep_state(ProcessState::BlockedIdle)
     }
 
     /// Publish a fatal-signal-only resource wait under the usual sleep protocol.

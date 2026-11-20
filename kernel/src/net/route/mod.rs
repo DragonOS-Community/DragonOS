@@ -552,10 +552,29 @@ fn lookup_output_fib(
     Some(route)
 }
 
-pub(crate) fn snapshot(
-    netns: &Arc<NetNamespace>,
-) -> Result<alloc::vec::Vec<RouteEntry>, SystemError> {
-    netns.router().fib.read().snapshot()
+pub(crate) struct Ipv4MainRoute {
+    pub(crate) entry: RouteEntry,
+    order: fib_index::AliasOrder,
+}
+
+/// Read-only display order. Neither the route lookup index nor formatted
+/// records are copied, and sorting runs after releasing the FIB lock.
+pub(crate) fn snapshot_ipv4_main(netns: &NetNamespace) -> Result<Vec<Ipv4MainRoute>, SystemError> {
+    use core::cmp::Reverse;
+
+    let mut entries = netns.router().fib.read().snapshot_ipv4_main()?;
+    entries.sort_unstable_by_key(|row| {
+        let route = row.entry;
+        // Linux walks numeric IPv4 trie keys, then the leaf's aliases from
+        // shortest suffix (longest prefix), highest DSCP and lowest metric.
+        (
+            route.destination.address(),
+            Reverse(route.destination.prefix_len()),
+            Reverse(route.tos),
+            row.order,
+        )
+    });
+    Ok(entries)
 }
 
 /// One live-dump item, without cloning the FIB or its lookup index.

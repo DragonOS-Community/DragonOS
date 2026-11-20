@@ -309,8 +309,21 @@ impl FibTable {
         })
     }
 
-    pub(super) fn snapshot(&self) -> Result<Vec<RouteEntry>, SystemError> {
-        Ok(self.try_clone()?.entries)
+    pub(super) fn snapshot_ipv4_main(&self) -> Result<Vec<super::Ipv4MainRoute>, SystemError> {
+        let visible = self.entries.iter().enumerate().filter(|(_, entry)| {
+            entry.table == RT_TABLE_MAIN
+                && is_ipv4(entry.destination.address())
+                && !matches!(entry.kind, super::RTN_BROADCAST | super::RTN_MULTICAST)
+        });
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(visible.clone().count())
+            .map_err(|_| SystemError::ENOMEM)?;
+        entries.extend(visible.map(|(index, entry)| super::Ipv4MainRoute {
+            entry: *entry,
+            order: self.index.order_key(index),
+        }));
+        Ok(entries)
     }
 
     pub(super) fn projection_for_iface(

@@ -2893,7 +2893,7 @@ impl IndexNode for LockedFATInode {
             FATDirEntry::Dir(dir) => dir,
             _ => return Err(SystemError::ENOTDIR.into()),
         };
-        dir.check_existence(name, Some(false), fs.clone())?;
+        dir.find_entry(name, Some(false), None, fs.clone())?;
         let removed = target.remove_file_name(dir, fs, name);
         let detached = {
             let mut victim = target.0.lock();

@@ -139,9 +139,75 @@ protected:
         }
     }
 
+    void mount_tmpfs_with_marker(const std::string& path) {
+        ASSERT_EQ(0, mount("mount_control", path.c_str(), "tmpfs", 0, nullptr))
+            << strerror(errno);
+        // A trailing slash also lets teardown address the exact directory on
+        // kernels that still trim whitespace from umount targets.
+        mounts_.push_back(path + "/");
+        Fd marker(open((path + "/marker").c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600));
+        ASSERT_GE(marker.get(), 0) << strerror(errno);
+    }
+
     std::string root_, src_, alias_;
     std::vector<std::string> mounts_;
 };
+
+TEST_F(MountControlTest, UmountDoesNotTrimMissingTargets) {
+    const std::string target = src_ + "/m";
+    const std::string marker = target + "/marker";
+    ASSERT_EQ(0, mkdir(target.c_str(), 0700)) << strerror(errno);
+    const struct {
+        std::string path;
+        int flags;
+    } cases[] = {
+        {target + " ", 0},
+        {target + "\t", 0},
+        {target + "\n", 0},
+        {target + "\r", 0},
+        {target + "\xc2\xa0", 0},
+        {target + "\xe3\x80\x80", 0},
+        {" " + target, 0},
+        {target + " ", MNT_DETACH},
+        {"", 0},
+    };
+    for (const auto& test : cases) {
+        SCOPED_TRACE(::testing::PrintToString(test.path) + ", flags=" + std::to_string(test.flags));
+        ASSERT_NO_FATAL_FAILURE(mount_tmpfs_with_marker(target));
+        const int rc = umount2(test.path.c_str(), test.flags);
+        const int error = errno;
+        EXPECT_EQ(-1, rc);
+        EXPECT_EQ(ENOENT, error);
+        EXPECT_EQ(0, access(marker.c_str(), F_OK));
+        if (rc != 0) {
+            ASSERT_EQ(0, umount2(target.c_str(), 0)) << strerror(errno);
+        }
+        mounts_.pop_back();
+    }
+}
+
+TEST_F(MountControlTest, UmountDistinguishesAdjacentTargetsWithWhitespace) {
+    const std::string plain = src_ + "/m";
+    const std::string spaced = plain + " ";
+    const std::string plain_marker = plain + "/marker";
+    const std::string spaced_marker = spaced + "/marker";
+    ASSERT_EQ(0, mkdir(plain.c_str(), 0700)) << strerror(errno);
+    ASSERT_EQ(0, mkdir((spaced + "/").c_str(), 0700)) << strerror(errno);
+    ASSERT_NO_FATAL_FAILURE(mount_tmpfs_with_marker(plain));
+    ASSERT_NO_FATAL_FAILURE(mount_tmpfs_with_marker(spaced));
+    const std::string link = root_ + "/link";
+    ASSERT_EQ(0, symlink(spaced.c_str(), link.c_str())) << strerror(errno);
+
+    const int rc = umount2(link.c_str(), UMOUNT_NOFOLLOW);
+    const int error = errno;
+    EXPECT_EQ(-1, rc);
+    EXPECT_EQ(EINVAL, error);
+    EXPECT_EQ(0, access(spaced_marker.c_str(), F_OK));
+    ASSERT_EQ(0, umount2(spaced.c_str(), 0)) << strerror(errno);
+    EXPECT_EQ(0, access(plain_marker.c_str(), F_OK));
+    EXPECT_EQ(-1, access(spaced_marker.c_str(), F_OK));
+    EXPECT_EQ(ENOENT, errno);
+}
 
 TEST_F(MountControlTest, PickFlagsRootSymlinkAndEmptyPath) {
     Fd plain(pick(AT_FDCWD, src_.c_str()));

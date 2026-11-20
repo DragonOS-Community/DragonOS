@@ -85,7 +85,7 @@ syscall_table_macros::declare_syscall!(SYS_UMOUNT2, SysUmount2Handle);
 ///
 /// 如果指定的路径没有对应的文件系统，或者在尝试卸载时发生错误，将返回错误。
 pub fn do_umount2(dirfd: i32, target: &str, flag: UmountFlag) -> Result<Arc<MountFS>, SystemError> {
-    let target = target.trim();
+    // Whitespace is part of a pathname; trimming can select a different mount.
     if target.is_empty() {
         return Err(SystemError::ENOENT);
     }

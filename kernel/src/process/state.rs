@@ -101,13 +101,11 @@ impl ProcessState {
     pub const fn is_blocked(&self) -> bool {
         matches!(
             self,
-            ProcessState::Blocked(_)
-                | ProcessState::BlockedKillable
-                | ProcessState::BlockedIdle
+            ProcessState::Blocked(_) | ProcessState::BlockedKillable | ProcessState::BlockedIdle
         )
     }
     #[inline(always)]
-    pub fn is_blocked_interruptable(&self) -> bool {
+    pub const fn is_blocked_interruptable(&self) -> bool {
         return matches!(self, ProcessState::Blocked(true));
     }
 
@@ -119,7 +117,7 @@ impl ProcessState {
 
     /// Sleeps contributing to the runqueue's uninterruptible load count.
     #[inline(always)]
-    pub const fn is_uninterruptible(&self) -> bool {
+    pub const fn contributes_to_load(&self) -> bool {
         matches!(self, Self::Blocked(false) | Self::BlockedKillable)
     }
 
@@ -200,10 +198,16 @@ const _: () = {
     assert!(ProcessState::BlockedKillable.to_u32() == 0x102);
     assert!(state_bits::TASK_KILLABLE & state_bits::TASK_DEAD_MARKER == 0);
     assert!(ProcessState::BlockedKillable.is_blocked());
-    assert!(ProcessState::BlockedKillable.is_uninterruptible());
+    assert!(ProcessState::BlockedKillable.contributes_to_load());
     assert!(ProcessState::BlockedKillable.is_killable());
-    assert!(!ProcessState::Blocked(true).is_uninterruptible());
+    assert!(!ProcessState::Blocked(true).contributes_to_load());
     assert!(!ProcessState::Blocked(false).is_killable());
+    assert!(ProcessState::BlockedIdle.to_u32() == 0x402);
+    assert!(state_bits::TASK_IDLE & state_bits::TASK_DEAD_MARKER == 0);
+    assert!(ProcessState::BlockedIdle.is_blocked());
+    assert!(!ProcessState::BlockedIdle.contributes_to_load());
+    assert!(!ProcessState::BlockedIdle.is_blocked_interruptable());
+    assert!(!ProcessState::BlockedIdle.is_killable());
 };
 
 bitflags! {

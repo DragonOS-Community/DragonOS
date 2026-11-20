@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -334,6 +335,50 @@ const char* const kStableStatusFields[] = {
 };
 
 }  // namespace
+
+TEST(ProcTaskStatus, MemoryNotifierReportsIdleState) {
+    int error = 0;
+    std::string text;
+    if (!ReadProcSnapshot("/proc/version_signature", &text, &error) ||
+        text.compare(0, 9, "DragonOS ") != 0) {
+        GTEST_SKIP() << "requires the DragonOS memory notification worker";
+    }
+
+    DIR* entries = opendir("/proc");
+    ASSERT_NE(nullptr, entries);
+    std::string worker;
+    while (dirent* entry = readdir(entries)) {
+        if (strspn(entry->d_name, "0123456789") != strlen(entry->d_name)) {
+            continue;
+        }
+        const std::string path = std::string("/proc/") + entry->d_name;
+        if (ReadProcSnapshot(path + "/status", &text, &error) &&
+            text.compare(0, sizeof("Name:\tmemory_notify\n") - 1, "Name:\tmemory_notify\n") == 0) {
+            worker = path;
+            break;
+        }
+    }
+    EXPECT_EQ(0, closedir(entries));
+    ASSERT_FALSE(worker.empty()) << "memory_notify process was not found";
+
+    std::string status;
+    char state = '\0';
+    const auto deadline = Clock::now() + std::chrono::milliseconds(kPollTimeoutMs);
+    do {
+        status.clear();
+        state = '\0';
+        if (ReadProcSnapshot(worker + "/status", &text, &error)) {
+            status = Field(ParseStatus(text), "State");
+        }
+        if (ReadProcSnapshot(worker + "/stat", &text, &error)) {
+            state = ParseStatState(text);
+        }
+        if (status == "I (idle)" && state == 'I') return;
+        usleep(5000);
+    } while (Clock::now() < deadline);
+    EXPECT_EQ("I (idle)", status);
+    EXPECT_EQ('I', state);
+}
 
 // ---------------------------------------------------------------------------
 // Case 1: the leader's thread view matches the process view

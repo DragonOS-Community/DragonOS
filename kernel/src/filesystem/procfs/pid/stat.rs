@@ -60,16 +60,9 @@ impl StatFileOps {
 fn state_to_linux_char(state: ProcessState) -> char {
     match state {
         ProcessState::Runnable => 'R',
-        ProcessState::Blocked(interruptable) => {
-            if interruptable {
-                'S'
-            } else {
-                'D'
-            }
-        }
-        ProcessState::Blocked(false)
-        | ProcessState::BlockedIdle
-        | ProcessState::BlockedKillable => 'D',
+        ProcessState::Blocked(true) => 'S',
+        ProcessState::Blocked(false) | ProcessState::BlockedKillable => 'D',
+        ProcessState::BlockedIdle => 'I',
         ProcessState::Stopped => 'T',
         ProcessState::Exited(_) => 'Z',
     }

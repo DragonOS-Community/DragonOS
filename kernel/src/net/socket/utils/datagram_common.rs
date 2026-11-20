@@ -1,13 +1,9 @@
 use crate::filesystem::epoll::EPollEventType;
 use crate::process::namespace::net_namespace::NetNamespace;
-use crate::{
-    libs::{rwsem::RwSem, wait_queue::WaitQueue},
-    net::socket::PMSG,
-};
+use crate::{libs::wait_queue::WaitQueue, net::socket::PMSG};
 use alloc::fmt::Debug;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::panic;
 use system_error::SystemError;
 
 //todo netlink和udp的操作相同，目前只是为netlink实现了下面的trait，后续为 UdpSocket实现下面的trait，提高复用性
@@ -47,12 +43,6 @@ pub trait Bound {
     fn remote_endpoint(&self) -> Option<Self::Endpoint>;
 
     fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint);
-
-    fn try_recv(
-        &self,
-        writer: &mut [u8],
-        flags: PMSG,
-    ) -> Result<(usize, usize, Self::Endpoint), SystemError>;
 
     fn try_send(
         &self,
@@ -164,57 +154,5 @@ where
         }
     }
 
-    pub fn try_recv(
-        &self,
-        writer: &mut [u8],
-        flags: PMSG,
-    ) -> Result<(usize, usize, UnboundSocket::Endpoint), SystemError> {
-        match self {
-            Inner::Unbound(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
-            Inner::Bound(bound) => bound.try_recv(writer, flags),
-        }
-    }
-
     // try_send 在下面:)
-}
-
-pub fn select_remote_and_bind<UnboundSocket, BoundSocket, B, F, R>(
-    inner_lock: &RwSem<Inner<UnboundSocket, BoundSocket>>,
-    remote: Option<UnboundSocket::Endpoint>,
-    bind_ephemeral: B,
-    op: F,
-) -> Result<R, SystemError>
-where
-    UnboundSocket: Unbound<Endpoint = BoundSocket::Endpoint, Bound = BoundSocket>,
-    BoundSocket: Bound,
-    B: FnOnce() -> Result<(), SystemError>,
-    F: FnOnce(&BoundSocket, UnboundSocket::Endpoint) -> Result<R, SystemError>,
-{
-    let mut inner = inner_lock.read();
-
-    // 这里用 loop 只是为了用 break :)
-    #[expect(clippy::never_loop)]
-    let bound = loop {
-        if let Inner::Bound(bound) = &*inner {
-            break bound;
-        }
-
-        drop(inner);
-        bind_ephemeral()?;
-
-        inner = inner_lock.read();
-
-        if let Inner::Bound(bound_datagram) = &*inner {
-            break bound_datagram;
-        }
-
-        panic!("Socket binding state inconsistent after bind_ephemeral");
-    };
-
-    let remote_endpoint = match remote {
-        Some(r) => r.clone(),
-        None => bound.remote_endpoint().ok_or(SystemError::EDESTADDRREQ)?,
-    };
-
-    op(bound, remote_endpoint)
 }

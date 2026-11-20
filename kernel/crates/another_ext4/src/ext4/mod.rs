@@ -73,6 +73,7 @@ impl InodeCache {
         self.entries.insert(inode_ref.id, inode_ref);
     }
 
+    #[cfg(test)]
     fn invalidate(&mut self, id: InodeId) {
         self.entries.remove(&id);
     }
@@ -382,21 +383,8 @@ impl AllocationState {
         }
     }
 
-    /// claim 的 `data_blocks` 变化后同步索引（消耗/回滚路径）。
-    pub(super) fn sync_claim_owner_blocks(
-        &mut self,
-        id: DelallocReservationId,
-        claim: &DelallocClaim,
-    ) {
-        if let Some((inode, generation)) = claim.inode_owner {
-            if let Some(slot) = self.inode_delalloc_data.get_mut(&(inode, generation, id)) {
-                *slot = claim.data_blocks;
-            }
-        }
-    }
-
     /// claim 被移除时清理索引。
-    pub(super) fn forget_claim_owner(&mut self, id: DelallocReservationId, claim: &DelallocClaim) {
+    fn forget_claim_owner(&mut self, id: DelallocReservationId, claim: &DelallocClaim) {
         if let Some((inode, generation)) = claim.inode_owner {
             self.inode_delalloc_data.remove(&(inode, generation, id));
         }

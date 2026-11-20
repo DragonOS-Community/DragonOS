@@ -507,7 +507,7 @@ impl LockedVMA {
                         }
                     }
 
-                    let Some((paddr, old_flags, flush)) =
+                    let Some((_, old_flags, flush)) =
                         (unsafe { mapper.unmap_phys_preserve_tables(virt) })
                     else {
                         continue;
@@ -650,7 +650,7 @@ impl LockedVMA {
         }
 
         // Reassign the anon_vma of the physical pages in the before and after VMAs
-        let mut page_manager_guard = page_manager_lock();
+        let page_manager_guard = page_manager_lock();
         if let Some(before) = before.clone() {
             let virt_iter = before.lock().region.iter_pages();
             for frame in virt_iter {

@@ -151,25 +151,6 @@ pub(in crate::net) fn address_label(
         .unwrap_or_else(|| CString::new(iface.iface_name()).map_err(|_| SystemError::EINVAL))
 }
 
-pub(in crate::net) fn address_snapshot(
-    iface: &Arc<dyn Iface>,
-) -> Result<Vec<(IpCidr, CString, Option<Ipv4Address>)>, SystemError> {
-    let smol_iface = iface.smol_iface().lock();
-    let metadata = iface.common().address_metadata().lock();
-    let default_label = CString::new(iface.iface_name()).map_err(|_| SystemError::EINVAL)?;
-    smol_iface
-        .ip_addrs()
-        .iter()
-        .map(|cidr| {
-            let entry = metadata.iter().find(|entry| entry.cidr == *cidr);
-            let label = entry
-                .and_then(|entry| entry.label.clone())
-                .unwrap_or_else(|| default_label.clone());
-            Ok((*cidr, label, entry.and_then(|entry| entry.broadcast)))
-        })
-        .collect()
-}
-
 /// Read one live RTNL dump item without cloning all configured addresses.
 pub(in crate::net) fn address_at(
     iface: &Arc<dyn Iface>,

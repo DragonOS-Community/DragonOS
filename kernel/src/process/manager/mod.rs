@@ -670,7 +670,7 @@ impl ProcessManager {
             let pi_guard = prev_pcb.sched_info().pi_lock_irqsave();
             // DEQUEUE_MOVE keeps on_rq=Migrating until this owner holds
             // pi_lock. This excludes task_rq_lock-style mutations against the
-            // old rq throughout the switch tail. stop_task() may still make
+            // old rq throughout the switch tail. A task stop may still make
             // the task non-runnable first; wakeup_stop() may make it runnable
             // again, but leaves the migration enqueue to this owner.
             let still_owns_migration = prev_pcb.sched_info().state().is_runnable()

@@ -1,6 +1,5 @@
 #![allow(dead_code)]
-use crate::filesystem::fat::fs::LockedFATInode;
-use crate::filesystem::vfs::{IndexNode, Metadata};
+use crate::filesystem::vfs::Metadata;
 use crate::time::PosixTimeSpec;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},

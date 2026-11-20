@@ -57,6 +57,10 @@ pub(super) struct PlacementMap {
 }
 
 impl PlacementMap {
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
     /// Old private structural fixtures have no movable consumers. Their
     /// unlisted address ranges retain the conservative unmovable preference.
     pub(super) const fn empty() -> Self {

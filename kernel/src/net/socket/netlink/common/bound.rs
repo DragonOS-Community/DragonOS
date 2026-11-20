@@ -54,18 +54,6 @@ impl<P: SupportedNetlinkProtocol> BoundNetlink<P> {
         Ok(message)
     }
 
-    pub fn try_recv_common(
-        &self,
-        writer: &mut [u8],
-        flags: PMSG,
-    ) -> Result<(usize, usize, NetlinkSocketAddr), SystemError> {
-        let message = self.try_recv_packet(flags)?;
-        let bytes = P::message_bytes(&message);
-        let copied = writer.len().min(bytes.len());
-        writer[..copied].copy_from_slice(&bytes[..copied]);
-        Ok((copied, bytes.len(), P::message_source(&message)))
-    }
-
     pub(super) fn new(
         handle: BoundHandle<P::Message>,
         message_queue: MessageQueue<P::Message>,

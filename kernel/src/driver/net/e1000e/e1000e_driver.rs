@@ -24,13 +24,12 @@ use crate::{
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
-    vec::Vec,
 };
 use core::{
     fmt::Debug,
     sync::atomic::{AtomicBool, Ordering},
 };
-use log::{error, info};
+use log::info;
 use smoltcp::{phy, wire::HardwareAddress};
 use system_error::SystemError;
 

@@ -30,7 +30,7 @@ struct ObjectState {
 }
 
 #[derive(Debug)]
-pub(crate) struct ObjectAccount {
+pub struct ObjectAccount {
     state: SpinLock<ObjectState>,
 }
 
@@ -131,6 +131,7 @@ impl ObjectAccount {
         Ok(Self::prepare(account)?.publish())
     }
 
+    #[cfg(test)]
     fn new_in(
         account: &Arc<MemoryAccount>,
         registry: &ObjectRegistry,
@@ -138,7 +139,9 @@ impl ObjectAccount {
         Ok(Self::prepare(account)?.publish_in(registry))
     }
 
-    pub fn prepare(account: &Arc<MemoryAccount>) -> Result<PreparedObjectAccount, SystemError> {
+    pub(crate) fn prepare(
+        account: &Arc<MemoryAccount>,
+    ) -> Result<PreparedObjectAccount, SystemError> {
         let budget = account
             .try_charge(MemoryKind::KernelObject, 0)
             .map_err(|_| SystemError::ENOMEM)?;
@@ -160,7 +163,7 @@ impl ObjectAccount {
 
     /// Classify the actual allocation using the allocator's own route. Large
     /// kmalloc-equivalent storage is kernel memory, but not slab memory.
-    pub fn try_charge_allocation(
+    pub(crate) fn try_charge_allocation(
         self: &Arc<Self>,
         kind: KernelByteKind,
         layout: core::alloc::Layout,
@@ -173,7 +176,7 @@ impl ObjectAccount {
     }
 
     /// Nonblocking admission only. Reclaim/OOM retry belongs outside this lock.
-    pub fn try_charge(
+    pub(crate) fn try_charge(
         self: &Arc<Self>,
         kind: KernelByteKind,
         bytes: u64,
@@ -186,6 +189,7 @@ impl ObjectAccount {
             .ok_or_else(|| ChargeFailure {
                 account: state.budget.account().clone(),
                 reason: ChargeFailureReason::CounterOverflow,
+                #[cfg(test)]
                 request_kind: MemoryKind::KernelObject,
                 requested_pages: pages(bytes),
             })?;

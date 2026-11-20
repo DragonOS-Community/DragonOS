@@ -114,10 +114,6 @@ impl<T> PhysicalBox<[MaybeUninit<T>]> {
 }
 
 impl<T: ?Sized> PhysicalBox<T> {
-    pub(crate) fn into_inner(self) -> Box<T> {
-        self.0
-    }
-
     pub(crate) fn phys_addr(&self) -> Option<PhysAddr> {
         if core::mem::size_of_val(&**self) == 0 {
             return None;

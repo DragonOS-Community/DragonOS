@@ -219,9 +219,23 @@ enum ProactiveState {
     Healthy,
     Cooling(u64),
     Discovery,
-    Progress { refilling: bool },
-    Failed(Stop),
+    Progress {
+        refilling: bool,
+    },
+    Failed {
+        #[cfg(feature = "mm_selftest")]
+        reason: Stop,
+    },
     Expired,
+}
+
+impl ProactiveState {
+    fn failed(_reason: Stop) -> Self {
+        Self::Failed {
+            #[cfg(feature = "mm_selftest")]
+            reason: _reason,
+        }
+    }
 }
 struct ProactiveResult {
     state: ProactiveState,
@@ -329,7 +343,7 @@ impl Proactive {
                 CHECK_US
             }
             ProactiveState::Discovery => DISCOVERY_US,
-            ProactiveState::Failed(_) => {
+            ProactiveState::Failed { .. } => {
                 slot.failures = slot.failures.saturating_add(1).min(7);
                 (CHECK_US << slot.failures.saturating_sub(1)).min(PROACTIVE_MAX_BACKOFF_US)
             }
@@ -337,7 +351,7 @@ impl Proactive {
         };
         // Only increased usable inventory resets history. Healthy observations
         // and registry cursor progress cannot erase a genuine failed pass.
-        if matches!(result.state, ProactiveState::Failed(_)) {
+        if matches!(result.state, ProactiveState::Failed { .. }) {
             slot.not_before = after(now, delay);
         }
         if let Some(endpoint) = &mut slot.endpoints[work.endpoint] {
@@ -679,7 +693,7 @@ fn run_proactive(work: ProactiveWork) -> ProactiveResult {
     };
     let before = match sample() {
         Ok(value) => value,
-        Err(stop) => return result(ProactiveState::Failed(stop), false),
+        Err(stop) => return result(ProactiveState::failed(stop), false),
     };
     let refilling = if work.refilling {
         before.runs < HIGH_RUNS
@@ -702,7 +716,7 @@ fn run_proactive(work: ProactiveWork) -> ProactiveResult {
         .saturating_add(8);
     if before.free_pages < before.high {
         crate::mm::page::reclaim_wait::request_pressure();
-        return result(ProactiveState::Failed(Stop::NoMemory), false);
+        return result(ProactiveState::failed(Stop::NoMemory), false);
     }
     if !before.admitted || before.free_pages < required {
         let deficit = required.saturating_sub(before.free_pages).max(1);
@@ -725,8 +739,8 @@ fn run_proactive(work: ProactiveWork) -> ProactiveResult {
                 },
                 true,
             ),
-            Ok(_) => result(ProactiveState::Failed(Stop::NoMemory), true),
-            Err(stop) => result(ProactiveState::Failed(stop), true),
+            Ok(_) => result(ProactiveState::failed(Stop::NoMemory), true),
+            Err(stop) => result(ProactiveState::failed(stop), true),
         };
     }
     let zone = if normal {
@@ -736,7 +750,7 @@ fn run_proactive(work: ProactiveWork) -> ProactiveResult {
     };
     let mut services = match SERVICES.try_lock() {
         Ok(services) => services,
-        Err(_) => return result(ProactiveState::Failed(Stop::Busy), false),
+        Err(_) => return result(ProactiveState::failed(Stop::Busy), false),
     };
     let outcome =
         services[work.work.slot].replenish(work.work.order(), work.work.max, zone, Some(deadline));
@@ -748,7 +762,7 @@ fn run_proactive(work: ProactiveWork) -> ProactiveResult {
     drop(services);
     match outcome {
         Err(ServiceError::DiscoveryProgress) => result(ProactiveState::Discovery, false),
-        Err(ServiceError::Stopped(stop)) => result(ProactiveState::Failed(stop), true),
+        Err(ServiceError::Stopped(stop)) => result(ProactiveState::failed(stop), true),
         Ok(_) => match sample() {
             Ok(after) if after.runs > before.runs => result(
                 ProactiveState::Progress {
@@ -756,8 +770,8 @@ fn run_proactive(work: ProactiveWork) -> ProactiveResult {
                 },
                 true,
             ),
-            Ok(_) => result(ProactiveState::Failed(Stop::Blocked), true),
-            Err(stop) => result(ProactiveState::Failed(stop), true),
+            Ok(_) => result(ProactiveState::failed(Stop::Blocked), true),
+            Err(stop) => result(ProactiveState::failed(stop), true),
         },
     }
 }

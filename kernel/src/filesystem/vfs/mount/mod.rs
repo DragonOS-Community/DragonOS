@@ -3476,17 +3476,6 @@ impl MountFS {
         self.super_block_state.lifecycle.lock().external_pins
     }
 
-    pub(crate) fn subtree_has_external_pins(&self) -> bool {
-        let mut pending = vec![self.self_ref()];
-        while let Some(mount) = pending.pop() {
-            if mount.has_external_pins() {
-                return true;
-            }
-            pending.extend(mount.mount_children());
-        }
-        false
-    }
-
     pub(crate) fn is_live(&self) -> bool {
         self.lifecycle.lock().state == MountLifecycleState::Live
     }

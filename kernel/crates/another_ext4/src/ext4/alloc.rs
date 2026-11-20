@@ -791,23 +791,6 @@ fn extent_tail_batch_limit(
     Some(core::cmp::min(count, in_last_group as u32))
 }
 
-fn linked_orphan_tail_remove_limit(
-    keep_blocks: u64,
-    tail_start: u32,
-    tail_blocks: u32,
-    group_limit: u32,
-) -> Option<u32> {
-    let tail_end = tail_start as u64 + tail_blocks as u64;
-    if tail_end <= keep_blocks {
-        return None;
-    }
-    let beyond_eof = tail_end - core::cmp::max(keep_blocks, tail_start as u64);
-    Some(core::cmp::min(
-        group_limit,
-        core::cmp::min(beyond_eof, u32::MAX as u64) as u32,
-    ))
-}
-
 impl Ext4 {
     /// Bind both immutable lease and ledger provenance under the same lock.
     /// Both head and projected follower admission use this path.
@@ -1842,6 +1825,7 @@ impl Ext4 {
         self.transaction_stage_super_block(transaction, &sb)
     }
 
+    #[cfg(test)]
     /// Create a new inode with its final owner.
     #[inline(never)]
     pub(super) fn create_inode_with_owner(
@@ -1952,6 +1936,7 @@ impl Ext4 {
         Ok(root)
     }
 
+    #[cfg(test)]
     /// Roll back an allocated inode that has not been published in a directory.
     ///
     /// The validated in-memory extent tree is authoritative here: an inode
@@ -2439,6 +2424,7 @@ impl Ext4 {
         return_error!(ErrCode::ENOSPC, "No free blocks in filesystem");
     }
 
+    #[cfg(test)]
     /// Allocate and initialize a data block before any extent can publish it.
     /// Extent-tree and xattr metadata allocations deliberately use
     /// `alloc_block()` directly because their callers construct metadata
@@ -2726,9 +2712,8 @@ impl Ext4 {
 #[cfg(test)]
 mod allocation_tests {
     use super::{
-        extent_tail_batch_limit, linked_orphan_tail_remove_limit, transaction_range_probe_limit,
-        AllocationClass, AllocationState, DelallocReservationUse,
-        TRANSACTION_RANGE_MAX_GROUP_PROBES,
+        extent_tail_batch_limit, transaction_range_probe_limit, AllocationClass, AllocationState,
+        DelallocReservationUse, TRANSACTION_RANGE_MAX_GROUP_PROBES,
     };
     use crate::ErrCode;
 
@@ -3052,13 +3037,5 @@ mod allocation_tests {
         assert_eq!(extent_tail_batch_limit(1, 8, 0, 1), None);
         assert_eq!(extent_tail_batch_limit(0, 8, u64::MAX, 2), None);
         assert_eq!(extent_tail_batch_limit(0, 0, 1, 1), None);
-    }
-
-    #[test]
-    fn linked_orphan_trim_preserves_eof_block_and_honors_group_batch() {
-        assert_eq!(linked_orphan_tail_remove_limit(5, 3, 6, 6), Some(4));
-        assert_eq!(linked_orphan_tail_remove_limit(5, 3, 6, 2), Some(2));
-        assert_eq!(linked_orphan_tail_remove_limit(5, 8, 3, 3), Some(3));
-        assert_eq!(linked_orphan_tail_remove_limit(12, 8, 3, 3), None);
     }
 }

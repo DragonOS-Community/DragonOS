@@ -35,16 +35,6 @@ impl Partition {
         });
     }
 
-    pub fn new_raw(start_sector: SectorT, lba_start: u64, sectors_num: u64, partno: u16) -> Self {
-        return Partition {
-            start_sector,
-            lba_start,
-            sectors_num,
-            disk: None,
-            partno,
-        };
-    }
-
     /// @brief 获取当前分区所属的磁盘的Arc指针
     #[inline]
     pub fn disk(&self) -> Arc<dyn BlockDevice> {

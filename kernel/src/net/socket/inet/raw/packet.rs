@@ -212,10 +212,3 @@ fn ipv6_upperlayer_checksum(
     checksum_add(&mut sum, &payload[checksum_off_in_payload + 2..]);
     Some(checksum_finish(sum))
 }
-
-#[inline]
-pub(super) fn checksum16(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    checksum_add(&mut sum, data);
-    checksum_finish(sum)
-}

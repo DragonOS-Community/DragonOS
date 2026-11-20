@@ -316,10 +316,6 @@ pub(super) struct LocalInputPacket {
 }
 
 impl LocalInputPacket {
-    pub(super) fn len(&self) -> usize {
-        self.ip_packet.len()
-    }
-
     fn resident_bytes(&self) -> usize {
         self.ip_packet.capacity()
     }
@@ -1358,7 +1354,7 @@ pub(crate) fn input_residency_selftest() -> bool {
         }
         let input = queue.pop().ok_or(SystemError::EIO)?;
         if input.ip_packet.as_ptr() != pointer
-            || input.len() != 20
+            || input.ip_packet.len() != 20
             || input.resident_bytes() != LocalInputQueue::MAX_BYTES
             || input.ip_packet.iter().any(|byte| *byte != 0xa5)
             || queue.state.lock().bytes != 0

@@ -1924,18 +1924,6 @@ impl IfaceCommon {
             .store(Self::LOCAL_OUTPUT_TX_BACKOFF_MIN_US, Ordering::Release);
     }
 
-    pub(crate) fn unbind_socket(
-        &self,
-        socket: Arc<dyn InetSocket>,
-    ) -> crate::net::socket::inet::common::registration::RetiredIfaceBinding {
-        let registry = self.bounds.read().clone();
-        let retired = registry.take_bound(&socket);
-        crate::net::socket::inet::common::registration::RetiredIfaceBinding {
-            socket: retired,
-            registry: Some(registry),
-        }
-    }
-
     /// Notify all bound sockets unconditionally.
     /// This is used after listener shutdown to ensure all client sockets
     /// are woken up even if the interface poll didn't detect any events.
@@ -1985,45 +1973,6 @@ impl IfaceCommon {
         *namespace = Weak::new();
         sockets.set_udp_ingress_handler(None);
         sockets.set_tcp_ingress_handler(None);
-    }
-
-    /// Capture the SocketSet belonging to this device's current namespace.
-    /// A concurrent netns move may retire the set after this returns, but
-    /// the caller's Arc keeps it alive and it will never receive destination
-    /// namespace ingress.
-    pub(crate) fn add_smol_socket_in_netns<T>(
-        &self,
-        socket: T,
-        netns: &Arc<NetNamespace>,
-    ) -> Result<(InterfaceSocketSet, smoltcp::iface::SocketHandle), (T, SystemError)>
-    where
-        T: smoltcp::socket::AnySocket<'static>,
-    {
-        let owner = self.net_namespace.read();
-        if !owner
-            .upgrade()
-            .is_some_and(|current| Arc::ptr_eq(&current, netns))
-        {
-            return Err((socket, SystemError::ENODEV));
-        }
-        let set = self.sockets.read().clone();
-        drop(owner);
-        let handle = set.lock().add(socket);
-        Ok((set, handle))
-    }
-
-    pub(crate) fn socket_set_in_netns(
-        &self,
-        netns: &Arc<NetNamespace>,
-    ) -> Result<InterfaceSocketSet, SystemError> {
-        let owner = self.net_namespace.read();
-        if !owner
-            .upgrade()
-            .is_some_and(|current| Arc::ptr_eq(&current, netns))
-        {
-            return Err(SystemError::ENODEV);
-        }
-        Ok(self.sockets.read().clone())
     }
 
     pub(crate) fn socket_registration_snapshot(

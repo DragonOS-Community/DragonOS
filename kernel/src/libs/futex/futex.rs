@@ -81,10 +81,6 @@ impl FutexData {
             None
         }
     }
-
-    pub fn try_remove(key: &FutexKey) -> Option<FutexHashBucket> {
-        Self::remove_empty_locked(&mut Self::futex_map(), key)
-    }
 }
 
 /// Registry entries retired in a transaction keep tasks pinned until after the

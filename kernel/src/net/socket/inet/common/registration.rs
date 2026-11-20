@@ -143,24 +143,18 @@ impl PreparedIfaceSocket {
         drop(reserved.publish(socket));
     }
 
-    pub(crate) fn iface(&self) -> &Arc<dyn Iface> {
-        &self.iface
-    }
-    pub(crate) fn socket_set(&self) -> &InterfaceSocketSet {
-        &self.set
-    }
-
     pub(crate) fn take_slot(&mut self) -> smoltcp::iface::SocketHandle {
         self.slot.take().expect("protocol vacancy consumed once")
     }
 
-    /// Move the actual protocol into both pre-born target vacancies. The
-    /// returned owner pins the original vacancies for an allocation-free return.
+    /// Move the protocol into the prepared target slots. The returned owner
+    /// retains the old slots and references for retirement outside the caller's
+    /// placement and socket locks.
     pub(crate) fn move_bound(
         &mut self,
         bound: &mut BoundInner,
         socket: Arc<dyn InetSocket>,
-    ) -> Result<Option<IfaceSocketReturn>, SystemError> {
+    ) -> Result<Option<RetiredIfaceSocket>, SystemError> {
         if Arc::ptr_eq(&bound.socket_set, &self.set) {
             return Ok(None);
         }
@@ -202,58 +196,28 @@ impl PreparedIfaceSocket {
                 Arc::downgrade(&target.registry),
             );
             target.publish(socket.clone());
-            IfaceSocketReturn {
+            RetiredIfaceSocket {
                 old: Some(old),
-                notification,
-                socket,
-                source_registry,
+                _notification: notification,
+                _socket: socket,
+                _source_registry: source_registry,
             }
         });
         result.map(Some)
     }
 }
 
-/// A temporary move retains the actual original slots, not spare capacity.
-/// Drop cancels empty slots only; restoring is always an explicit operation.
-pub(crate) struct IfaceSocketReturn {
+/// Owns the old registration after a socket move. Drop cancels the vacant
+/// slots and then releases the references pinning the old binding.
+pub(crate) struct RetiredIfaceSocket {
     old: Option<BoundInner>,
-    notification: Option<(BoundSlotReservation, Arc<dyn InetSocket>)>,
-    socket: Arc<dyn InetSocket>,
+    _notification: Option<(BoundSlotReservation, Arc<dyn InetSocket>)>,
+    _socket: Arc<dyn InetSocket>,
     // Even an already-unregistered old registry must not lose its final pin
     // under the caller's placement/inner guard after Weak::upgrade.
-    source_registry: Option<Arc<BoundRegistry>>,
+    _source_registry: Option<Arc<BoundRegistry>>,
 }
-impl IfaceSocketReturn {
-    pub(crate) fn restore(&mut self, bound: &mut BoundInner) -> RetiredIfaceBinding {
-        // Return to the retained exact slot, even if either device has been
-        // removed or moved meanwhile. This does not publish into a new current
-        // holder, and requires no admission to permanently retired devices.
-        let old = self.old.take().expect("return consumed once");
-        let target_registry = bound.registry.upgrade();
-        let retired = target_registry
-            .as_ref()
-            .and_then(|registry| registry.take_bound(&self.socket));
-        // Remove target Strong before publishing source, including same-registry.
-        if Arc::as_ptr(&old.socket_set) < Arc::as_ptr(&bound.socket_set) {
-            let mut source = old.socket_set.lock();
-            let mut target = bound.socket_set.lock();
-            source.add_reserved_socket(old.handle, target.remove(bound.handle));
-        } else {
-            let mut target = bound.socket_set.lock();
-            let mut source = old.socket_set.lock();
-            source.add_reserved_socket(old.handle, target.remove(bound.handle));
-        }
-        if let Some((reserved, socket)) = self.notification.take() {
-            drop(reserved.publish(socket));
-        }
-        *bound = old;
-        RetiredIfaceBinding {
-            socket: retired,
-            registry: target_registry,
-        }
-    }
-}
-impl Drop for IfaceSocketReturn {
+impl Drop for RetiredIfaceSocket {
     fn drop(&mut self) {
         if let Some(old) = self.old.take() {
             old.socket_set.lock().cancel_reserved(old.handle);
@@ -272,6 +236,6 @@ impl Drop for PreparedIfaceSocket {
 /// Take ownership under short registry locks; retire the last socket and the
 /// potentially retired registry only after the caller's placement/inner locks.
 pub(crate) struct RetiredIfaceBinding {
-    pub(crate) socket: Option<Arc<dyn InetSocket>>,
-    pub(crate) registry: Option<Arc<BoundRegistry>>,
+    pub(super) _socket: Option<Arc<dyn InetSocket>>,
+    pub(super) _registry: Option<Arc<BoundRegistry>>,
 }

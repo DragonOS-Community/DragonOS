@@ -564,16 +564,6 @@ impl<T: Pod, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         self.ring_buffer.set_send_shutdown()
     }
 
-    pub fn push_scm_at(
-        &self,
-        offset: Wrapping<usize>,
-        len: usize,
-        cred: Option<UCred>,
-        rights: Vec<Arc<File>>,
-    ) {
-        self.ring_buffer.push_scm_at(offset, len, cred, rights)
-    }
-
     pub fn resize(&self, new_capacity: usize) -> Result<(), SystemError> {
         self.ring_buffer.resize(new_capacity)
     }

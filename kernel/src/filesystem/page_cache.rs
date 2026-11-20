@@ -69,7 +69,6 @@ pub(crate) use mapping::PageCacheFaultInvalidateRead;
 pub(crate) use mapping::PageCacheRangeResult;
 pub(crate) use mapping::PageCacheReclaimMapOutcome;
 pub use mapping::UnmapMappingMode;
-pub(crate) use migration::PageCacheMigrationGuard;
 use ordered_index::{CacheIndex, Node as CacheIndexNode};
 pub use read_batch::{PageCacheReadBatchCompletion, PageCacheReadBatchRequest};
 pub use read_dma::PageCacheReadDmaReservation;
@@ -3517,18 +3516,6 @@ impl PageCache {
                 Err(e.into())
             }
         }
-    }
-
-    fn get_or_create_entry_pinned(
-        &self,
-        page_index: usize,
-        populate_backend: bool,
-    ) -> Result<(Arc<PageEntry>, PageEntryPin, bool), SystemError> {
-        let task = crate::process::ProcessManager::current_pcb();
-        let owner = crate::cgroup::memory::account_for_task(&task);
-        let creator = crate::cgroup::memory::object_for_task(&task);
-        self.try_get_or_create_entry_pinned(page_index, populate_backend, &owner, &creator)
-            .map_err(Self::legacy_allocation_error)
     }
 
     fn try_get_or_create_entry_pinned(

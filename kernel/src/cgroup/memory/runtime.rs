@@ -27,7 +27,6 @@ const PAGE_ALLOC_COSTLY_ORDER: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MemoryAllocPolicy {
     TryOnly,
-    ReclaimThenFail,
     ReclaimThenOom,
     /// A stacked I/O caller may retain FS/MM resources. Never start I/O,
     /// unmap a user MM, or wait for an OOM victim from this recovery path.

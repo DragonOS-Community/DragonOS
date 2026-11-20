@@ -98,7 +98,6 @@ struct CommittedOomVictim {
 #[derive(Debug, Clone)]
 struct OomVictimState {
     generation: u64,
-    tgid: RawPid,
     mm_id: u64,
 }
 
@@ -518,7 +517,6 @@ fn commit_oom_kill(
         if scope.is_none() {
             OOM_STATE.lock_irqsave().inflight = Some(OomVictimState {
                 generation,
-                tgid: candidate.tgid,
                 mm_id: candidate.mm.id(),
             });
         }

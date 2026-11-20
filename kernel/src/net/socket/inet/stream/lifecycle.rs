@@ -546,13 +546,6 @@ impl TcpSocket {
         }
     }
 
-    pub fn start_connect(
-        &self,
-        remote_endpoint: smoltcp::wire::IpEndpoint,
-    ) -> Result<(), SystemError> {
-        self.start_connect_scoped(remote_endpoint.into())
-    }
-
     pub(super) fn start_connect_scoped(
         &self,
         address: crate::net::socket::endpoint::InetEndpoint,

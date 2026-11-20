@@ -551,12 +551,6 @@ pub fn child_inode_init_with_context(
     Ok(ChildInodeInit { uid, gid, mode })
 }
 
-/// Compute owner and directory-SGID inheritance before publishing a child.
-pub fn child_inode_init(parent: &Metadata, file_type: FileType, mode: InodeMode) -> ChildInodeInit {
-    child_inode_init_with_context(parent, file_type, mode, &InodeOpContext::legacy())
-        .expect("identity credentials must contain valid filesystem IDs")
-}
-
 /// VFS permission check wrapper that respects per-filesystem policy.
 ///
 /// This is the single entry point that should be used by VFS/pathwalk/syscalls

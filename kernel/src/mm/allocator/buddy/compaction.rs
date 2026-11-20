@@ -34,15 +34,6 @@ pub(crate) struct IsolationKey {
     pages: usize,
 }
 
-impl IsolationKey {
-    pub(crate) fn start(&self) -> PhysAddr {
-        self.start
-    }
-    pub(crate) fn pages(&self) -> usize {
-        self.pages
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct IsolationState {
     id: u64,

@@ -57,6 +57,7 @@ impl HookProgram {
         })
     }
 
+    #[cfg(test)]
     fn evaluate(&self, packet: &NftPacket<'_>) -> NftVerdict {
         self.evaluate_with_tracking(packet, || true)
     }
@@ -1118,10 +1119,6 @@ impl RulesetSnapshot {
         self.ipv6_iface_name_hooks[hook.index()]
     }
 
-    pub(crate) fn allows_ipv6_hook(&self, hook: NftIpv4Hook, packet: &NftPacket<'_>) -> bool {
-        self.ipv6_hooks[hook.index()].evaluate(packet) == NftVerdict::Accept
-    }
-
     pub(crate) fn allows_ipv6_hook_with_tracking(
         &self,
         hook: NftIpv4Hook,
@@ -1129,10 +1126,6 @@ impl RulesetSnapshot {
         track: impl FnMut() -> bool,
     ) -> bool {
         self.ipv6_hooks[hook.index()].evaluate_with_tracking(packet, track) == NftVerdict::Accept
-    }
-
-    pub(crate) fn allows_ipv4_hook(&self, hook: NftIpv4Hook, packet: &NftPacket<'_>) -> bool {
-        self.ipv4_hooks[hook.index()].evaluate(packet) == NftVerdict::Accept
     }
 
     pub(crate) fn allows_ipv4_hook_with_tracking(

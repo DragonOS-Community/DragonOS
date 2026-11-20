@@ -16,7 +16,6 @@ use crate::{
 use super::nsproxy::{NsProxy, PreparedNamespaceInstall};
 
 fn can_setns_cgroup(target: &crate::process::namespace::cgroup_namespace::CgroupNamespace) -> bool {
-    let current = ProcessManager::current_pcb();
     let cred = ProcessManager::current_cred();
     if !cred.has_cap_sys_admin() {
         return false;

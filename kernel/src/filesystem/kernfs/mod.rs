@@ -405,11 +405,11 @@ impl IndexNode for KernFSInode {
     }
 
     fn resize(&self, _len: usize) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
-        let result: core::result::Result<_, system_error::SystemError> = (match self.inode_type {
+        let result: core::result::Result<_, system_error::SystemError> = match self.inode_type {
             KernInodeType::File => Ok(()),
             KernInodeType::Dir => Err(SystemError::EISDIR),
             KernInodeType::SymLink => Err(SystemError::EINVAL),
-        });
+        };
         result.map_err(Into::into)
     }
 

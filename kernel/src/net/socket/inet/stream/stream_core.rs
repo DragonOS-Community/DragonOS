@@ -682,11 +682,6 @@ impl TcpSocket {
     }
 
     #[inline]
-    pub(crate) fn recv_buf_size(&self) -> &AtomicUsize {
-        &self.options.recv_buf_size
-    }
-
-    #[inline]
     pub(crate) fn send_buf_size_loaded(&self) -> usize {
         self.options
             .send_buf_size

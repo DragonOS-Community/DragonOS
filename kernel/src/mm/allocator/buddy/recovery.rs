@@ -117,6 +117,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         Ok(snapshot)
     }
 
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
     /// One ordinary buddy attempt, without reclaim, followed only on a
     /// constrained miss by bounded evidence gathering. No cumulative counters
     /// are used to infer the reason for this request.

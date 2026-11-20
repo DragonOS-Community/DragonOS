@@ -537,10 +537,6 @@ impl VethInterface {
         self.inner.lock().peer_veth.upgrade()
     }
 
-    pub fn new(driver: VethDriver) -> Arc<Self> {
-        Self::new_with_initial_state(driver, true)
-    }
-
     fn new_with_initial_state(driver: VethDriver, initially_up: bool) -> Arc<Self> {
         let iface_id = generate_iface_id();
         let mac = [

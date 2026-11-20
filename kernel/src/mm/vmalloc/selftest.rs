@@ -725,7 +725,7 @@ fn sparse_full_window() -> bool {
             0,
             Reservation {
                 end: PAGES - 2,
-                charge: None,
+                _charge: None,
             },
             |layout| KERNEL_ALLOCATOR.alloc_metadata(layout),
         )

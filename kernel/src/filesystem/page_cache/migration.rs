@@ -33,6 +33,7 @@ impl PageCacheMigrationGuard<'_> {
 }
 
 impl PageCache {
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     /// Capture the fixed-PFN owner, including Loading pages. The transaction's
     /// later entry admission distinguishes an I/O conflict from a missing key.
     pub(crate) fn try_migration_source(

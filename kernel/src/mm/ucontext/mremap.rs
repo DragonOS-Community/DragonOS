@@ -879,7 +879,7 @@ impl InnerAddressSpace {
 
         {
             let _pt_edit = mm.page_table_edit();
-            let mut page_manager_guard = page_manager_lock();
+            let page_manager_guard = page_manager_lock();
             let mut off = 0usize;
             while err.is_none() && off < move_len {
                 let src = old_vaddr + off;

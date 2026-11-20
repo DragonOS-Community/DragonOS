@@ -8,10 +8,11 @@ use super::{
     try_page_manager_lock, try_page_reclaimer_lock, Page, PageEntry, PageFlags, PageMapping,
     PageType, RawFrameExtent,
 };
+#[cfg(feature = "mm_selftest")]
+use crate::filesystem::page_cache::PageCache;
 use crate::{
     arch::{mm::LockedFrameAllocator, CurrentIrqArch, MMArch},
     exception::{in_interrupt, InterruptArch},
-    filesystem::page_cache::PageCache,
     libs::mutex::Mutex,
     mm::{ucontext::AddressSpace, MemoryManagementArch, PhysAddr, VirtAddr, VirtRegion, VmFlags},
     process::ProcessManager,
@@ -37,6 +38,7 @@ pub(crate) enum MigrationError {
     Unsupported(PageIsolationUnsupported),
     InvalidMapping,
     NoMemory,
+    #[cfg(feature = "mm_selftest")]
     Injected,
 }
 impl From<PageIsolationError> for MigrationError {
@@ -47,13 +49,6 @@ impl From<PageIsolationError> for MigrationError {
             PageIsolationError::StaleMapping => Self::InvalidMapping,
         }
     }
-}
-
-/// Diagnostic identities, never permission to dereference either PFN.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MigrationResult {
-    pub(crate) old_phys: PhysAddr,
-    pub(crate) new_phys: PhysAddr,
 }
 
 #[cfg(feature = "mm_selftest")]
@@ -70,12 +65,14 @@ pub(crate) mod selftest;
 
 #[derive(Clone, Copy)]
 enum Scope {
+    #[cfg(feature = "mm_selftest")]
     Private,
     Data,
 }
 
 fn resident_leaf(entry: PageEntry<MMArch>, scope: Scope) -> bool {
     match scope {
+        #[cfg(feature = "mm_selftest")]
         Scope::Private => entry.flags().present() && entry.flags().has_user(),
         Scope::Data => entry.present() && (entry.protnone() || entry.flags().has_user()),
     }
@@ -87,37 +84,13 @@ fn context_allowed() -> bool {
         && ProcessManager::current_pcb().preempt_count() == 0
 }
 
-pub(crate) fn migrate_private_page(
-    mm: &Arc<AddressSpace>,
-    address: VirtAddr,
-) -> Result<MigrationResult, MigrationError> {
-    migrate_address(
-        mm,
-        address,
-        Scope::Private,
-        #[cfg(feature = "mm_selftest")]
-        None,
-    )
-}
-pub(crate) fn migrate_data_page(
-    mm: &Arc<AddressSpace>,
-    address: VirtAddr,
-) -> Result<MigrationResult, MigrationError> {
-    migrate_address(
-        mm,
-        address,
-        Scope::Data,
-        #[cfg(feature = "mm_selftest")]
-        None,
-    )
-}
-
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 /// Relocate an existing cache page even when no user PTE references it.
 /// Lookup owns only a fixed-PFN Page Arc; cache identity is frozen at commit.
 pub(crate) fn migrate_cached_page(
     cache: &Arc<PageCache>,
     index: usize,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     if !context_allowed() {
         return Err(MigrationError::Busy);
     }
@@ -142,10 +115,7 @@ pub(crate) fn migrate_cached_page(
 /// observer Arc. The caller owns target-range isolation; this transaction
 /// owns its one destination frame and all mapping/ownership handoff.
 /// Mapping limits and contention refuse bounded work before PTE changes.
-pub(crate) fn migrate_frame(
-    physical: PhysAddr,
-    max_mappings: usize,
-) -> Result<MigrationResult, MigrationError> {
+pub(crate) fn migrate_frame(physical: PhysAddr, max_mappings: usize) -> Result<(), MigrationError> {
     use MigrationError::{Busy, InvalidMapping};
     if !context_allowed() {
         return Err(Busy);
@@ -172,7 +142,7 @@ pub(crate) fn migrate_with_control(
     mm: &Arc<AddressSpace>,
     address: VirtAddr,
     control: &selftest::Control,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     migrate_address(mm, address, Scope::Private, Some(control))
 }
 #[cfg(feature = "mm_selftest")]
@@ -180,16 +150,17 @@ pub(crate) fn migrate_data_with_control(
     mm: &Arc<AddressSpace>,
     address: VirtAddr,
     control: &selftest::Control,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     migrate_address(mm, address, Scope::Data, Some(control))
 }
 
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 fn migrate_address(
     mm: &Arc<AddressSpace>,
     address: VirtAddr,
     scope: Scope,
     #[cfg(feature = "mm_selftest")] control: Option<&selftest::Control>,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     use MigrationError::{Busy, InvalidMapping};
     if !context_allowed() {
         return Err(Busy);
@@ -338,7 +309,7 @@ fn relocate(
     scope: Scope,
     max_mappings: usize,
     #[cfg(feature = "mm_selftest")] control: Option<&selftest::Control>,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     use MigrationError::{Busy, InvalidMapping, NoMemory, Unsupported};
     let _budget = MIGRATION.try_lock().map_err(|_| Busy)?;
     let old_phys = source.phys_address();
@@ -442,13 +413,18 @@ fn relocate(
         mms.binary_search_by_key(&mm.id(), |other| other.id())
             .unwrap()
     });
-    let isolation = if matches!(scope, Scope::Private) {
+    let private = match scope {
+        #[cfg(feature = "mm_selftest")]
+        Scope::Private => true,
+        Scope::Data => false,
+    };
+    let isolation = if private {
         let (_, address) = origin.ok_or(InvalidMapping)?;
         source.try_isolate_for_migration(&spaces[origin_index.unwrap()], address)?
     } else {
         source.try_isolate_shared()?
     };
-    if matches!(scope, Scope::Private) && isolation.flags().contains(PageFlags::PG_LRU) {
+    if private && isolation.flags().contains(PageFlags::PG_LRU) {
         return Err(Unsupported(PageIsolationUnsupported::Lru));
     }
     let mut revoked = Revoked {
@@ -670,8 +646,5 @@ fn relocate(
     if let Some(control) = control {
         control.committed(old_phys, frame);
     }
-    Ok(MigrationResult {
-        old_phys,
-        new_phys: frame,
-    })
+    Ok(())
 }

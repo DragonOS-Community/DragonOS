@@ -105,7 +105,8 @@ fn charge(
 #[derive(Debug)]
 struct Reservation {
     end: usize,
-    charge: Option<ObjectCharge>,
+    // Dropping the interval node releases its metadata charge.
+    _charge: Option<ObjectCharge>,
 }
 type ReservationNode = PreparedNode<usize, Reservation>;
 type TableNode = PreparedNode<usize, LeafTable>;
@@ -472,6 +473,7 @@ impl VmAllocation {
     pub fn address(&self) -> VirtAddr {
         self.deref().address()
     }
+    #[cfg(feature = "mm_selftest")]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -553,7 +555,7 @@ fn allocate_record(
             0,
             Reservation {
                 end: 0,
-                charge: reservation_charge,
+                _charge: reservation_charge,
             },
             |layout| KERNEL_ALLOCATOR.alloc_metadata(layout),
         )
@@ -840,7 +842,9 @@ fn destroy(mut record: Box<AllocationRecord>) {
     drop(record);
     drop(metadata_charge);
     drop(data_charge);
-    drop(attached_charge);
+    if let Some(charge) = attached_charge {
+        charge.release();
+    }
 }
 
 // Metadata must stay within the explicitly provisioned local size classes.

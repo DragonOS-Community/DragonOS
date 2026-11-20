@@ -82,18 +82,6 @@ impl CpuDeadlineQueue {
         Some(node.key)
     }
 
-    pub(super) fn contains_key(&self, key: &Key) -> bool {
-        let mut node = self.root.as_deref();
-        while let Some(current) = node {
-            match key.cmp(&current.key) {
-                core::cmp::Ordering::Less => node = current.left.as_deref(),
-                core::cmp::Ordering::Greater => node = current.right.as_deref(),
-                core::cmp::Ordering::Equal => return true,
-            }
-        }
-        false
-    }
-
     pub(super) fn insert(&mut self, node: OwnedBox<Node>) {
         assert!(node.left.is_none() && node.right.is_none() && node.height == 1);
         self.root = Some(Self::insert_node(self.root.take(), node));

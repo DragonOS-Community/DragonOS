@@ -1444,7 +1444,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 destination,
                 protocol,
                 ingress_ifindex,
-                netns: self.netns.clone(),
+                _netns: self.netns.clone(),
             };
             // Nonmatching candidates and all resource-pressure paths retain
             // their pins locally until the interface and poll guards are gone.

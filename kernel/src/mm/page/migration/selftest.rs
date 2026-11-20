@@ -1,6 +1,6 @@
 //! Private migration fixtures and per-invocation diagnostic controls.
 //! Default kernels contain neither this command interface nor fault observation.
-use super::{migrate_with_control, MigrationError, MigrationResult, MigrationStage};
+use super::{migrate_with_control, MigrationError, MigrationStage};
 use crate::{
     arch::MMArch,
     cgroup::memory::{accounting::MemoryPolicy, MemoryAccount, MemoryKind},
@@ -203,7 +203,7 @@ fn migrate(
     mm: &Arc<AddressSpace>,
     address: VirtAddr,
     control: &Control,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     migrate_scoped(mm, address, control, false)
 }
 
@@ -212,7 +212,7 @@ fn migrate_scoped(
     address: VirtAddr,
     control: &Control,
     general: bool,
-) -> Result<MigrationResult, MigrationError> {
+) -> Result<(), MigrationError> {
     // Retry only unrelated lock contention, outside every resource guard.
     for _ in 0..128 {
         match if general {

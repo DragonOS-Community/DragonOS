@@ -550,30 +550,6 @@ pub unsafe fn clear_user_protected(dest: VirtAddr, len: usize) -> Result<usize, 
     return Ok(len);
 }
 
-/// Clear data in the specified range of user space
-///
-/// ## Arguments
-///
-/// - `dest`: Destination address in user space
-/// - `len`: Length of data to clear
-///
-/// ## Returns
-///
-/// Returns the length of cleared data
-///
-/// ## Errors
-///
-/// - `EFAULT`: Destination address is invalid
-pub unsafe fn clear_user(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
-    access_ok(dest, len).map_err(|_| SystemError::EFAULT)?;
-
-    let p = dest.data() as *mut u8;
-    // Clear user space data
-    p.write_bytes(0, len);
-    compiler_fence(Ordering::SeqCst);
-    return Ok(len);
-}
-
 /// 使用异常表保护清零用户空间，同时保持 CR0.WP，使只读/COW 用户页仍会触发正常缺页处理。
 pub unsafe fn clear_user_cow_protected(dest: VirtAddr, len: usize) -> Result<usize, SystemError> {
     if len == 0 {

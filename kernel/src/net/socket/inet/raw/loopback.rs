@@ -4,20 +4,12 @@ use alloc::vec::Vec;
 
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion};
 
-use crate::driver::net::Iface;
 use crate::libs::rwsem::RwSem;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessState;
 
-use super::constants::{
-    ICMPV6_CHECKSUM_OFFSET, ICMPV6_ECHO_REPLY, ICMPV6_ECHO_REQUEST, ICMP_ECHO_REPLY,
-    ICMP_ECHO_REQUEST,
-};
-use super::options::DEFAULT_IP_TTL;
-use super::packet::{
-    build_ip_packet, checksum16, ipv6_icmpv6_checksum, ipv6_udp_checksum, IpPacketParams,
-};
+use super::packet::ipv6_udp_checksum;
 use super::{InetSocket, RawSocket};
 use crate::net::socket::utils::{IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN};
 
@@ -120,22 +112,12 @@ pub(crate) fn snapshot_raw_ingress_sockets(
     Ok(result)
 }
 
-/// 检查目标地址是否为 loopback
-#[inline]
-pub(super) fn is_loopback_addr(addr: IpAddress) -> bool {
-    match addr {
-        IpAddress::Ipv4(v4) => v4.is_loopback(),
-        IpAddress::Ipv6(v6) => v6.is_loopback(),
-    }
-}
-
 /// Loopback 投递上下文
 pub(super) struct LoopbackDeliverContext<'a> {
     pub(super) packet: &'a [u8],
     pub(super) dest: IpAddress,
     pub(super) ip_version: IpVersion,
     pub(super) protocol: IpProtocol,
-    pub(super) netns: &'a Arc<NetNamespace>,
 }
 
 /// 检查 socket 是否应该接收该 loopback 数据包
@@ -232,20 +214,6 @@ fn should_deliver_to_socket(
     true
 }
 
-/// 向同一 netns 下所有匹配的 raw socket 投递 loopback 数据包
-pub(super) fn deliver_loopback_packet(ctx: &LoopbackDeliverContext) {
-    let sockets = snapshot_raw_ingress_sockets(ctx.netns).unwrap_or_default();
-    let ingress_ifindex = ctx
-        .netns
-        .loopback_iface()
-        .map(|lo| lo.nic_id() as u32)
-        .unwrap_or(0);
-    deliver_raw_to_sockets(ctx, ingress_ifindex, &sockets);
-
-    // Linux 语义：本机收到 ICMP/ICMPv6 Echo Request 时自动回复 Echo Reply
-    handle_loopback_echo_request(ctx);
-}
-
 fn deliver_raw_to_sockets(
     ctx: &LoopbackDeliverContext,
     ingress_ifindex: u32,
@@ -301,7 +269,8 @@ pub(crate) struct RawIngressWork {
     pub(crate) destination: IpAddress,
     pub(crate) protocol: IpProtocol,
     pub(crate) ingress_ifindex: u32,
-    pub(crate) netns: Arc<NetNamespace>,
+    // Keep the ingress namespace pinned through deferred packet delivery.
+    pub(crate) _netns: Arc<NetNamespace>,
 }
 
 impl RawIngressWork {
@@ -315,7 +284,6 @@ impl RawIngressWork {
             dest: self.destination,
             ip_version: self.source.version(),
             protocol: self.protocol,
-            netns: &self.netns,
         };
         deliver_raw_to_sockets(&ctx, self.ingress_ifindex, &self.sockets[..self.matched]);
     }
@@ -497,152 +465,6 @@ impl RawIngressBatch {
                 crate::sched::cond_resched();
             }
         }
-    }
-}
-
-/// Echo Reply 构建参数
-struct EchoReplyParams {
-    reply_payload: crate::driver::net::PacketBuffer,
-    /// 原始目的地址，作为 reply 的源
-    src: IpAddress,
-    /// 原始源地址，作为 reply 的目的
-    dst: IpAddress,
-}
-
-/// 尝试从 IPv4 ICMP 包提取 Echo Request 并构建 Reply 参数
-fn try_build_icmp_echo_reply(packet: &[u8]) -> Option<EchoReplyParams> {
-    if packet.len() < IPV4_MIN_HEADER_LEN {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    if ihl < IPV4_MIN_HEADER_LEN || packet.len() < ihl + 8 {
-        return None;
-    }
-    let payload = &packet[ihl..];
-
-    // 检查是否为 Echo Request (type=8, code=0)
-    if payload[0] != ICMP_ECHO_REQUEST || payload[1] != 0 {
-        return None;
-    }
-    // 校验和正确时才回复（BadChecksum 测例要求没有 reply）
-    if checksum16(payload) != 0xffff {
-        return None;
-    }
-    if packet.len() < 20 {
-        return None;
-    }
-
-    let src = smoltcp::wire::Ipv4Address::new(packet[12], packet[13], packet[14], packet[15]);
-    let dst = smoltcp::wire::Ipv4Address::new(packet[16], packet[17], packet[18], packet[19]);
-
-    // 构建 reply payload
-    let mut reply_payload = crate::driver::net::PacketBuffer::try_from_slice(payload).ok()?;
-    reply_payload[0] = ICMP_ECHO_REPLY;
-    reply_payload[2] = 0;
-    reply_payload[3] = 0;
-    let xsum = checksum16(&reply_payload);
-    reply_payload[2..4].copy_from_slice(&xsum.to_be_bytes());
-
-    Some(EchoReplyParams {
-        reply_payload,
-        src: IpAddress::Ipv4(dst),
-        dst: IpAddress::Ipv4(src),
-    })
-}
-
-/// 尝试从 IPv6 ICMPv6 包提取 Echo Request 并构建 Reply 参数
-fn try_build_icmpv6_echo_reply(packet: &[u8]) -> Option<EchoReplyParams> {
-    if packet.len() < IPV6_HEADER_LEN + 4 {
-        return None;
-    }
-    let payload = &packet[IPV6_HEADER_LEN..];
-
-    // 检查是否为 Echo Request (type=128, code=0)
-    if payload[0] != ICMPV6_ECHO_REQUEST || payload[1] != 0 {
-        return None;
-    }
-    // 校验和验证
-    let got = u16::from_be_bytes([payload[2], payload[3]]);
-    if got == 0 {
-        return None;
-    }
-    match ipv6_icmpv6_checksum(packet, ICMPV6_CHECKSUM_OFFSET as usize) {
-        Some(expect) if expect == got => {}
-        _ => return None,
-    }
-    if packet.len() < 40 {
-        return None;
-    }
-
-    let src_bytes: [u8; 16] = packet[8..24].try_into().ok()?;
-    let dst_bytes: [u8; 16] = packet[24..40].try_into().ok()?;
-    let src = smoltcp::wire::Ipv6Address::new(
-        u16::from_be_bytes([src_bytes[0], src_bytes[1]]),
-        u16::from_be_bytes([src_bytes[2], src_bytes[3]]),
-        u16::from_be_bytes([src_bytes[4], src_bytes[5]]),
-        u16::from_be_bytes([src_bytes[6], src_bytes[7]]),
-        u16::from_be_bytes([src_bytes[8], src_bytes[9]]),
-        u16::from_be_bytes([src_bytes[10], src_bytes[11]]),
-        u16::from_be_bytes([src_bytes[12], src_bytes[13]]),
-        u16::from_be_bytes([src_bytes[14], src_bytes[15]]),
-    );
-    let dst = smoltcp::wire::Ipv6Address::new(
-        u16::from_be_bytes([dst_bytes[0], dst_bytes[1]]),
-        u16::from_be_bytes([dst_bytes[2], dst_bytes[3]]),
-        u16::from_be_bytes([dst_bytes[4], dst_bytes[5]]),
-        u16::from_be_bytes([dst_bytes[6], dst_bytes[7]]),
-        u16::from_be_bytes([dst_bytes[8], dst_bytes[9]]),
-        u16::from_be_bytes([dst_bytes[10], dst_bytes[11]]),
-        u16::from_be_bytes([dst_bytes[12], dst_bytes[13]]),
-        u16::from_be_bytes([dst_bytes[14], dst_bytes[15]]),
-    );
-
-    // 构建 reply payload (校验和由 build_ipv6_packet 计算)
-    let mut reply_payload = crate::driver::net::PacketBuffer::try_from_slice(payload).ok()?;
-    reply_payload[0] = ICMPV6_ECHO_REPLY;
-    reply_payload[2] = 0;
-    reply_payload[3] = 0;
-
-    Some(EchoReplyParams {
-        reply_payload,
-        src: IpAddress::Ipv6(dst),
-        dst: IpAddress::Ipv6(src),
-    })
-}
-
-/// 处理 loopback Echo Request，生成并投递 Echo Reply
-fn handle_loopback_echo_request(ctx: &LoopbackDeliverContext) {
-    let reply_params = match (ctx.ip_version, ctx.protocol) {
-        (IpVersion::Ipv4, IpProtocol::Icmp) => try_build_icmp_echo_reply(ctx.packet),
-        (IpVersion::Ipv6, IpProtocol::Icmpv6) => try_build_icmpv6_echo_reply(ctx.packet),
-        _ => return,
-    };
-
-    let Some(params) = reply_params else { return };
-
-    let ip_params = IpPacketParams {
-        payload: &params.reply_payload,
-        src: params.src,
-        dst: params.dst,
-        protocol: ctx.protocol,
-        ttl: DEFAULT_IP_TTL,
-        tos: 0,
-        ipv6_checksum: if ctx.ip_version == IpVersion::Ipv6 {
-            ICMPV6_CHECKSUM_OFFSET
-        } else {
-            -1
-        },
-    };
-
-    if let Ok(reply_packet) = build_ip_packet(ctx.ip_version, &ip_params) {
-        let reply_ctx = LoopbackDeliverContext {
-            packet: &reply_packet,
-            dest: params.dst,
-            ip_version: ctx.ip_version,
-            protocol: ctx.protocol,
-            netns: ctx.netns,
-        };
-        deliver_loopback_packet(&reply_ctx);
     }
 }
 

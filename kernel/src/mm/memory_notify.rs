@@ -65,7 +65,7 @@ pub(crate) fn request_oom_progress() {
         return;
     }
     WORK_PENDING.store(true, Ordering::Release);
-    softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
 }
 
 /// Deferred MM/CPU-buffer retirement is work without OOM/event waiters. Keep pending
@@ -73,7 +73,7 @@ pub(crate) fn request_oom_progress() {
 pub(crate) fn request_deferred_drop() {
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
-        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+        softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
     }
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn request_high_deadline() {
     }
     HIGH_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
-    softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
 }
 
 /// The one permanent reclaimer uses a reusable waiter and a tick deadline.
@@ -94,7 +94,7 @@ pub(crate) fn request_reclaim_deadline() {
     RECLAIM_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
-        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+        softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
     }
 }
 
@@ -104,7 +104,7 @@ pub(crate) fn request_compaction() {
     COMPACTION_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
-        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+        softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
     }
 }
 
@@ -113,7 +113,7 @@ pub(crate) fn request_balloon_deadline() {
     BALLOON_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
     if is_ready() {
-        softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+        softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
     }
 }
 
@@ -131,7 +131,7 @@ pub(crate) fn request_file_events() {
     }
     FILE_EVENTS_PENDING.store(true, Ordering::Release);
     WORK_PENDING.store(true, Ordering::Release);
-    softirq_vectors().raise_softirq(SoftirqNumber::MEMORY_NOTIFY);
+    softirq_vectors().raise_softirq(SoftirqNumber::MemoryNotify);
 }
 
 #[derive(Debug)]
@@ -174,7 +174,7 @@ fn start_memory_notifier() -> Result<(), SystemError> {
     )
     .ok_or(SystemError::ENOMEM)?;
     *WORKER.lock_irqsave() = Some(worker.clone());
-    softirq_vectors().register_softirq(SoftirqNumber::MEMORY_NOTIFY, handler)?;
+    softirq_vectors().register_softirq(SoftirqNumber::MemoryNotify, handler)?;
     ProcessManager::wakeup(&worker)?;
     STARTED.wait_for_completion()?;
     assert!(

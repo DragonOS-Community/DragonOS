@@ -45,7 +45,9 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::SocketSet;
-use crate::config::{IFACE_MAX_ADDR_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT};
+use crate::config::IFACE_MAX_ADDR_COUNT;
+#[cfg(feature = "proto-sixlowpan")]
+use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::iface::Routes;
 use crate::phy::PacketMeta;
 use crate::phy::{

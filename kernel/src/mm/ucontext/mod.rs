@@ -34,7 +34,6 @@ use crate::{
     libs::{
         align::page_align_up,
         cpumask::CpuMask,
-        mutex::Mutex,
         rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard},
         spinlock::SpinLock,
         wait_queue::WaitQueue,

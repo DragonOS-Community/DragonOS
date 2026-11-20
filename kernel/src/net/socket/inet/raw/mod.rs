@@ -70,7 +70,8 @@ impl core::ops::Deref for RawSocket {
 
 #[derive(Debug)]
 pub struct RawSocketData {
-    memory: crate::net::socket::buffer::SocketMemory,
+    // Keep both socket memory accounts alive until the socket is destroyed.
+    _memory: crate::net::socket::buffer::SocketMemory,
     /// 内部状态
     inner: RwSem<Option<RawInner>>,
     /// Address identity belongs to the socket, not its transport attachment.

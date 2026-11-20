@@ -299,7 +299,7 @@ impl BoundRegistry {
         }
     }
 
-    /// Reuse the original physical notification slot for an explicit return.
+    /// Keep the original notification slot reserved until the caller releases its locks.
     pub(crate) fn take_bound_reserved(
         self: &Arc<Self>,
         socket: &Arc<dyn InetSocket>,

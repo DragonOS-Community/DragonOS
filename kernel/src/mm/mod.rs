@@ -60,7 +60,6 @@ pub mod remote_access;
 pub mod syscall;
 pub mod sysfs;
 pub mod tlb;
-pub mod truncate;
 pub mod ucontext;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 pub mod vmalloc;

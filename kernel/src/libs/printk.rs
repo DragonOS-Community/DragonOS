@@ -165,24 +165,6 @@ pub fn emergency_print_noalloc(s: &str) {
     }
 }
 
-/// 零分配地输出一个 u64 的十进制表示（栈上格式化）。
-#[cfg(target_arch = "x86_64")]
-pub fn emergency_print_u64_noalloc(mut value: u64) {
-    let mut buf = [0u8; 20];
-    let mut end = buf.len();
-    if value == 0 {
-        end -= 1;
-        buf[end] = b'0';
-    }
-    while value > 0 {
-        end -= 1;
-        buf[end] = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    let s = core::str::from_utf8(&buf[end..]).unwrap_or("?");
-    emergency_print_noalloc(s);
-}
-
 /// 零分配地输出一个 u64 的十六进制表示（`0x` 前缀，小写）。
 #[cfg(target_arch = "x86_64")]
 pub fn emergency_print_hex_noalloc(value: u64) {

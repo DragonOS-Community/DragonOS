@@ -873,18 +873,6 @@ pub(crate) fn register_netdevice_locked(
     Ok(())
 }
 
-/// Publishes a netdevice in one network namespace without creating a global
-/// sysfs projection. This is the common registration lifecycle used by
-/// per-netns devices: PRESENT is owned here and rolled back if topology/FIB
-/// insertion fails.
-pub(crate) fn register_netdevice_in_namespace(
-    netns: &Arc<NetNamespace>,
-    dev: Arc<dyn Iface>,
-) -> Result<(), SystemError> {
-    let rtnl = crate::net::rtnl::lock();
-    register_netdevice_in_namespace_locked(&rtnl, netns, dev)
-}
-
 pub(crate) fn register_netdevice_in_namespace_locked(
     rtnl: &crate::net::rtnl::RtnlGuard,
     netns: &Arc<NetNamespace>,
@@ -895,19 +883,6 @@ pub(crate) fn register_netdevice_in_namespace_locked(
         dev.clear_net_state(NetDeivceState::__LINK_STATE_PRESENT);
         return Err(error);
     }
-    Ok(())
-}
-
-/// Remove a software netdevice from a live namespace. RTNL serializes the
-/// topology change; no NAPI owner or TX admission may survive publication.
-pub(crate) fn unregister_netdevice_locked(
-    rtnl: &crate::net::rtnl::RtnlGuard,
-    netns: &Arc<NetNamespace>,
-    dev: Arc<dyn Iface>,
-) -> Result<(), SystemError> {
-    let prepared = prepare_unregister_netdevices_locked(rtnl, netns, core::slice::from_ref(&dev))?;
-    prepared.quiesce();
-    prepared.publish_quiesced();
     Ok(())
 }
 

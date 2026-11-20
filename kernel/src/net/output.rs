@@ -436,14 +436,6 @@ impl<'a> LocalOutputCt<'a> {
     }
 }
 
-pub(crate) fn submit_prepared_ipv6(
-    netns: &Arc<NetNamespace>,
-    reservation: PreparedIpOutputReservation<'_>,
-    route: OutputRouteDecision,
-) -> Result<(), SystemError> {
-    submit_prepared_ipv6_with_related(netns, reservation, route, None)
-}
-
 pub(crate) fn submit_prepared_ipv6_with_related(
     netns: &Arc<NetNamespace>,
     reservation: PreparedIpOutputReservation<'_>,
@@ -638,26 +630,6 @@ fn submit_ipv6(
         })?;
     let local_delivery = route.kind == RTN_LOCAL || !physical_egress || clone_local;
     Ok(local_delivery.then_some(egress))
-}
-
-/// Submit an IPv4 datagram after its complete buffer and source-owner queue
-/// slot have been reserved. A local multicast/broadcast copy runs its own
-/// POST_ROUTING hook before the original, as in Linux's ip_mc_output().
-pub(crate) fn submit_prepared_ipv4(
-    netns: &Arc<NetNamespace>,
-    reservation: PreparedIpOutputReservation<'_>,
-    route: OutputRouteDecision,
-    multicast_loop: bool,
-    may_fragment: bool,
-) -> Result<Option<Arc<dyn Iface>>, SystemError> {
-    submit_prepared_ipv4_with_related(
-        netns,
-        reservation,
-        route,
-        multicast_loop,
-        may_fragment,
-        None,
-    )
 }
 
 pub(crate) fn submit_prepared_ipv4_with_related(

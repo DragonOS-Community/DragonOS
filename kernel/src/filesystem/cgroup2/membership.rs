@@ -135,7 +135,7 @@ impl MembershipRead {
                 };
                 // These identity owners also retire after both cgroup locks.
                 let mut display = None;
-                let mut representative_tgid = None;
+                let representative_tgid;
                 let emit = {
                     let _update = crate::cgroup::lock();
                     files::check_live_file(cgroup, ty, generation)?;

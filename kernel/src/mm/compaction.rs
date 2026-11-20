@@ -54,6 +54,7 @@ impl CompactedFrames {
     pub(crate) fn start(&self) -> PhysAddr {
         self.start
     }
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     pub(crate) fn pages(&self) -> usize {
         self.pages
     }
@@ -187,8 +188,8 @@ pub(crate) struct Stats {
 #[derive(Debug)]
 pub(crate) struct Attempt {
     pub outcome: Result<CompactedFrames, Stop>,
+    #[cfg(feature = "mm_selftest")]
     pub stats: Stats,
-    pub next: PhysAddr,
 }
 
 /// Replenishment returns ordinary free inventory, never an allocated owner.
@@ -232,21 +233,21 @@ impl Compactor {
         }
     }
     pub(crate) fn allocate(&mut self, request: Request) -> Attempt {
-        let (outcome, stats, next) = self.attempt(request, Goal::Allocate);
+        let (outcome, _stats) = self.attempt(request, Goal::Allocate);
         Attempt {
             outcome: outcome.map(|completion| match completion {
                 Completion::Allocated(run) => run,
                 Completion::Released => unreachable!("allocation completed without ownership"),
             }),
-            stats,
-            next,
+            #[cfg(feature = "mm_selftest")]
+            stats: _stats,
         }
     }
 
     /// Prepare ordinary free inventory without consuming an existing run or
     /// retagging its placement for a device owner. The caller supplies policy.
     pub(crate) fn replenish(&mut self, request: Request) -> ReplenishAttempt {
-        let (outcome, stats, _) = self.attempt(request, Goal::Replenish);
+        let (outcome, stats) = self.attempt(request, Goal::Replenish);
         ReplenishAttempt {
             outcome: outcome.map(|completion| match completion {
                 Completion::Released => (),
@@ -256,14 +257,9 @@ impl Compactor {
         }
     }
 
-    fn attempt(
-        &mut self,
-        request: Request,
-        goal: Goal,
-    ) -> (Result<Completion, Stop>, Stats, PhysAddr) {
+    fn attempt(&mut self, request: Request, goal: Goal) -> (Result<Completion, Stop>, Stats) {
         let mut stats = Stats::default();
-        let mut next = request.start;
-        let result = self.execute(request, goal, &mut stats, &mut next);
+        let result = self.execute(request, goal, &mut stats);
         if result.is_ok() {
             self.defer_shift = 0;
             self.defer_left = 0;
@@ -271,14 +267,13 @@ impl Compactor {
             self.defer_shift = (self.defer_shift + 1).min(MAX_DEFER_SHIFT);
             self.defer_left = (1u8 << self.defer_shift) - 1;
         }
-        (result, stats, next)
+        (result, stats)
     }
     fn execute(
         &mut self,
         request: Request,
         goal: Goal,
         stats: &mut Stats,
-        next: &mut PhysAddr,
     ) -> Result<Completion, Stop> {
         if !CurrentIrqArch::is_irq_enabled()
             || in_interrupt()
@@ -330,7 +325,6 @@ impl Compactor {
         {
             return Err(Stop::Invalid);
         }
-        *next = PhysAddr::new(candidate);
         let expired = || deadline.is_some_and(|until| crate::time::timer::clock() >= until);
         if expired() {
             return Err(Stop::Timeout);
@@ -427,7 +421,6 @@ impl Compactor {
                 no_progress = 0;
             }
             drop(lease);
-            *next = PhysAddr::new(candidate + bytes);
             if stopped == Stop::NoMemory {
                 return Err(stopped);
             }
@@ -435,7 +428,6 @@ impl Compactor {
                 return Err(if saw_busy { Stop::Busy } else { Stop::Blocked });
             }
             candidate += bytes;
-            *next = PhysAddr::new(candidate);
         }
         Err(if saw_busy { Stop::Busy } else { Stop::Blocked })
     }

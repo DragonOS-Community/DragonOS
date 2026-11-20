@@ -46,6 +46,39 @@ const RAMFS_MAX_NAMELEN: usize = 64;
 const RAMFS_BLOCK_SIZE: u64 = 512;
 const WHITEOUT_DEV: DeviceNumber = DeviceNumber::new(Major::UNNAMED_MAJOR, 0);
 
+/// The caller holds the parent lock. Keep the victim locked from the
+/// emptiness check through the transition to an unlinked directory.
+fn ramfs_remove_rename_target(
+    parent: &mut RamFSInode,
+    key: &DName,
+    old_type: FileType,
+    target: &LockedRamFSInode,
+) -> Result<LinkRemovalOutcome, SystemError> {
+    let mut target = target.0.lock();
+    let target_type = target.metadata.file_type;
+    if old_type == FileType::Dir && target_type != FileType::Dir {
+        return Err(SystemError::ENOTDIR);
+    }
+    if old_type != FileType::Dir && target_type == FileType::Dir {
+        return Err(SystemError::EISDIR);
+    }
+
+    let outcome = if target_type == FileType::Dir {
+        target.mark_empty_directory_removed()?;
+        parent.metadata.nlinks = parent.metadata.nlinks.saturating_sub(1);
+        LinkRemovalOutcome::LastLink
+    } else {
+        target.metadata.nlinks = target.metadata.nlinks.saturating_sub(1);
+        if target.metadata.nlinks == 0 {
+            LinkRemovalOutcome::LastLink
+        } else {
+            LinkRemovalOutcome::StillLinked
+        }
+    };
+    parent.children.remove(key);
+    Ok(outcome)
+}
+
 fn ramfs_move_entry_between_dirs(
     src_dir: &mut RamFSInode,
     dst_dir: &mut RamFSInode,
@@ -77,6 +110,9 @@ fn ramfs_move_entry_between_dirs(
             .get(new_key)
             .cloned()
             .ok_or(SystemError::ENOENT)?;
+        if Arc::ptr_eq(&existing, &src_self) {
+            return Err(SystemError::EINVAL);
+        }
         if Arc::ptr_eq(&inode_to_move, &existing) {
             return Ok(RenameOutcome::NoOp);
         }
@@ -113,42 +149,17 @@ fn ramfs_move_entry_between_dirs(
         if flags.contains(RenameFlags::NOREPLACE) {
             return Err(SystemError::EEXIST);
         }
-
-        let (existing_id, existing_type, existing_dir_nonempty) = {
-            let guard = existing.0.lock();
-            let t = guard.metadata.file_type;
-            let nonempty = t == FileType::Dir && !guard.children.is_empty();
-            (guard.metadata.inode_id, t, nonempty)
-        };
-        let to_move_id = inode_to_move.0.lock().metadata.inode_id;
-        if existing_id == to_move_id {
-            return Ok(RenameOutcome::NoOp);
-        }
-
-        if old_type == FileType::Dir && existing_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR);
-        }
-        if old_type != FileType::Dir && existing_type == FileType::Dir {
-            return Err(SystemError::EISDIR);
-        }
-        if old_type == FileType::Dir && existing_dir_nonempty {
+        // The source parent is locked already and contains the source entry.
+        if Arc::ptr_eq(&existing, &src_self) {
             return Err(SystemError::ENOTEMPTY);
         }
 
-        dst_dir.children.remove(new_key);
-        let mut existing_guard = existing.0.lock();
-        if existing_type == FileType::Dir {
-            dst_dir.metadata.nlinks = dst_dir.metadata.nlinks.saturating_sub(1);
-            existing_guard.metadata.nlinks = 0;
-            replaced = Some(LinkRemovalOutcome::LastLink);
-        } else {
-            existing_guard.metadata.nlinks = existing_guard.metadata.nlinks.saturating_sub(1);
-            replaced = Some(if existing_guard.metadata.nlinks == 0 {
-                LinkRemovalOutcome::LastLink
-            } else {
-                LinkRemovalOutcome::StillLinked
-            });
+        if Arc::ptr_eq(&existing, &inode_to_move) {
+            return Ok(RenameOutcome::NoOp);
         }
+        replaced = Some(ramfs_remove_rename_target(
+            dst_dir, new_key, old_type, &existing,
+        )?);
     }
 
     src_dir.children.remove(old_key);
@@ -278,6 +289,18 @@ pub struct RamFSInode {
 }
 
 impl RamFSInode {
+    fn mark_empty_directory_removed(&mut self) -> Result<(), SystemError> {
+        if self.metadata.file_type != FileType::Dir {
+            return Err(SystemError::ENOTDIR);
+        }
+        if !self.children.is_empty() {
+            return Err(SystemError::ENOTEMPTY);
+        }
+        // A retained inode has lost both its parent entry and its self link.
+        self.metadata.nlinks = 0;
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             parent: Weak::default(),
@@ -1337,14 +1360,7 @@ impl IndexNode for LockedRamFSInode {
         }
         // 获得要删除的文件夹的inode
         let to_delete = inode.children.get(&name).ok_or(SystemError::ENOENT)?;
-        if to_delete.0.lock().metadata.file_type != FileType::Dir {
-            return Err(SystemError::ENOTDIR.into());
-        }
-
-        // The directory has lost both its parent entry and its self link.
-        // Open descriptors may retain the inode, but it is no longer a live
-        // parent for namespace creation. Zero is also authoritative to stat.
-        to_delete.0.lock().metadata.nlinks = 0;
+        to_delete.0.lock().mark_empty_directory_removed()?;
         // 在当前目录中删除这个子目录项
         inode.children.remove(&name);
         // 父目录链接计数相应减少
@@ -1371,6 +1387,9 @@ impl IndexNode for LockedRamFSInode {
 
         if self_id == target_id {
             let mut dir = self.0.lock();
+            if dir.metadata.nlinks == 0 {
+                return Err(SystemError::ENOENT.into());
+            }
             let inode_to_move = dir
                 .children
                 .get(&old_key)
@@ -1403,38 +1422,12 @@ impl IndexNode for LockedRamFSInode {
                     return Err(SystemError::EEXIST.into());
                 }
 
-                let existing_id = existing.0.lock().metadata.inode_id;
-                let to_move_id = inode_to_move.0.lock().metadata.inode_id;
-                if existing_id == to_move_id {
+                if Arc::ptr_eq(&existing, &inode_to_move) {
                     return Ok(RenameOutcome::NoOp);
                 }
-
-                let existing_type = existing.0.lock().metadata.file_type;
-                if old_type == FileType::Dir && existing_type != FileType::Dir {
-                    return Err(SystemError::ENOTDIR.into());
-                }
-                if old_type != FileType::Dir && existing_type == FileType::Dir {
-                    return Err(SystemError::EISDIR.into());
-                }
-                if old_type == FileType::Dir && !existing.0.lock().children.is_empty() {
-                    return Err(SystemError::ENOTEMPTY.into());
-                }
-
-                dir.children.remove(&new_name);
-                let mut existing_guard = existing.0.lock();
-                if existing_type == FileType::Dir {
-                    dir.metadata.nlinks = dir.metadata.nlinks.saturating_sub(1);
-                    existing_guard.metadata.nlinks = 0;
-                    replaced = Some(LinkRemovalOutcome::LastLink);
-                } else {
-                    existing_guard.metadata.nlinks =
-                        existing_guard.metadata.nlinks.saturating_sub(1);
-                    replaced = Some(if existing_guard.metadata.nlinks == 0 {
-                        LinkRemovalOutcome::LastLink
-                    } else {
-                        LinkRemovalOutcome::StillLinked
-                    });
-                }
+                replaced = Some(ramfs_remove_rename_target(
+                    &mut dir, &new_name, old_type, &existing,
+                )?);
             }
 
             dir.children.remove(&old_key);

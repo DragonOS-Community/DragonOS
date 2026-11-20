@@ -100,6 +100,36 @@ pub fn initramfs_init() -> Result<(), SystemError> {
     initramfs_init_typed().map_err(|error| error.into_errno())
 }
 
+fn clear_mountpoint_directory(
+    dir: Arc<dyn IndexNode>,
+) -> Result<(), crate::mm::allocation::MemoryAllocationError> {
+    // Finish each directory before removing it, without recursing on the
+    // kernel stack for deeply nested archive paths.
+    let mut stack = Vec::new();
+    let entries = dir.list()?.into_iter();
+    stack.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+    stack.push((dir, entries, None));
+    while let Some((dir, entries, _)) = stack.last_mut() {
+        if let Some(name) = entries.next() {
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child = dir.find(&name)?;
+            if child.metadata()?.file_type == FileType::Dir {
+                let entries = child.list()?.into_iter();
+                stack.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                stack.push((child, entries, Some(name)));
+            } else {
+                dir.unlink(&name)?;
+            }
+        } else if let Some((_, _, Some(name))) = stack.pop() {
+            let (parent, _, _) = stack.last().expect("child directory has a parent");
+            parent.rmdir(&name)?;
+        }
+    }
+    Ok(())
+}
+
 fn initramfs_init_typed() -> Result<(), crate::mm::allocation::MemoryAllocationError> {
     log::info!("initramfs_init start");
 
@@ -242,30 +272,29 @@ fn initramfs_init_typed() -> Result<(), crate::mm::allocation::MemoryAllocationE
     // 检查是否使用 initramfs 作为根文件系统启动
     // 判断标准: 是否存在 /init 程序, 与 Linux 相同
     // 查找考虑链接
-    unsafe {
-        __INIT_ROOT_ENABLED = INIT_ROOT_INODE().find("init").is_ok();
-        if !__INIT_ROOT_ENABLED {
+    if INIT_ROOT_INODE().find("init").is_err() {
+        unsafe {
             // TODO: drop 掉所有的资源
             // 此分支未做测试, 可能有内存释放不完全
             let old_root_inode = __INIT_ROOT_INODE.take().unwrap();
             drop(old_root_inode);
-            log::info!("Rootfs: will not use initramfs");
-            log::info!("initramfs_init done!");
-            return Ok(());
         }
+        log::info!("Rootfs: will not use initramfs");
+        log::info!("initramfs_init done!");
+        return Ok(());
     }
 
     // 清除 dev, proc, sys 三个文件夹, 后续直接迁移根文件系统的过来
     // 这里是因为 linux 默认不挂载这些文件夹, 通常交给 init 程序完成, 但是 DragonOS 会默认挂载
-    INIT_ROOT_INODE()
-        .rmdir("dev")
-        .expect("initramfs: Unable to remove /dev");
-    INIT_ROOT_INODE()
-        .rmdir("proc")
-        .expect("initramfs: Unable to remove /proc");
-    INIT_ROOT_INODE()
-        .rmdir("sys")
-        .expect("initramfs: Unable to remove /sys");
+    let root = INIT_ROOT_INODE();
+    for name in ["dev", "proc", "sys"] {
+        let dir = root.find(name)?;
+        clear_mountpoint_directory(dir)?;
+        root.rmdir(name)?;
+    }
+    unsafe {
+        __INIT_ROOT_ENABLED = true;
+    }
 
     log::info!("initramfs_init done!");
     Ok(())

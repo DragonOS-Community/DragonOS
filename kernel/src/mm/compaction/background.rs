@@ -490,6 +490,16 @@ pub(crate) fn observe_allocation(count: PageFrameCount, max: PhysAddr, physical:
 }
 
 /// Timer IRQ only queues a deferred notification; it never consumes the slot.
+pub(crate) fn next_deadline() -> Option<u64> {
+    [
+        NEXT_DEADLINE.load(Ordering::Acquire),
+        PROACTIVE_DEADLINE.load(Ordering::Acquire),
+    ]
+    .into_iter()
+    .filter(|deadline| *deadline != 0)
+    .min()
+}
+
 pub(crate) fn tick(now: u64) {
     let deadline = NEXT_DEADLINE.load(Ordering::Acquire);
     let proactive = PROACTIVE_DEADLINE.load(Ordering::Acquire);

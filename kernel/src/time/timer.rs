@@ -126,6 +126,7 @@ impl PreparedTimer {
     }
 
     pub(crate) fn activate(self) {
+        #[cfg(target_arch = "x86_64")]
         let expire = self.timer.expire_jiffies();
         {
             let mut timers = TIMER_LIST.lock_irqsave();
@@ -386,13 +387,25 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
     }
 }
 
-/// Earliest ordinary timer-wheel deadline, in absolute jiffies.
-///
-/// Kept separate from [`timer_get_first_expire`] so the idle path can add one
-/// jiffy of slack to coarse (jiffies-based) timers without delaying the
-/// nanosecond-based absolute timers that share the clockevent.
-pub(crate) fn timer_list_first_expire() -> Result<Option<u64>, SystemError> {
-    first_expire_in(&TIMER_LIST)
+/// Earliest CPU0 coarse expiry, including maintenance outside TIMER_LIST.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn idle_wake_jiffies() -> Result<Option<u64>, SystemError> {
+    // These sleepers have no individual deadline published to the timer
+    // owner. Absolute timers likewise need the periodic service if their
+    // precise notification driver is unavailable.
+    if crate::mm::fault_recovery::needs_periodic_tick() || !absolute_timer::idle_deadline_ready() {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+    Ok([
+        first_expire_in(&TIMER_LIST)?,
+        super::clocksource::watchdog_deadline()?,
+        crate::mm::page::reclaim_wait::next_deadline(),
+        crate::mm::compaction::background::next_deadline(),
+        crate::driver::virtio::virtio_balloon::next_deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min())
 }
 
 /// Return the earliest deadline, distinguishing an empty queue from deadline 0.

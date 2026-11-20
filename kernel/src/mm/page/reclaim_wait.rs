@@ -97,6 +97,12 @@ impl ReclaimWait {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn next_deadline() -> Option<u64> {
+    let deadline = DEADLINE.load(Ordering::Acquire);
+    (deadline != 0).then_some(deadline)
+}
+
 /// Called after the common jiffy counter advances, on its existing tick owner.
 /// Never consumes DEADLINE: a stale tick must not erase the task's new arm.
 pub(crate) fn tick(now: u64) {

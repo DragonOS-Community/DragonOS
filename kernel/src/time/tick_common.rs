@@ -18,10 +18,14 @@ pub(crate) fn tick_handle_global(local_tick: bool) {
     }
     let advanced = timekeeping::advance_jiffies(local_tick);
     if advanced || local_tick {
-        timer_tick_maintenance();
-        loadavg::calc_global_load(clock());
-        run_local_timer();
+        run_global_maintenance();
     }
+}
+
+pub(super) fn run_global_maintenance() {
+    timer_tick_maintenance();
+    loadavg::calc_global_load(clock());
+    run_local_timer();
 }
 
 /// # 函数的功能

@@ -25,6 +25,19 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
 
     let hardirq_guard = crate::exception::enter_hardirq();
     let rcu_irq = crate::rcu::irq_enter();
+    let irq_outermost = rcu_irq.is_outermost();
+    if irq_outermost {
+        // The IRQ may arm timers or schedule another task before HLT returns.
+        use crate::time::deadline::IdleWake;
+        let wake = if vector == crate::arch::driver::apic::apic_timer::APIC_TIMER_IRQ_NUM.data() {
+            IdleWake::Timer
+        } else if vector == super::ipi::IPI_NUM_CLOCKEVENT.data() {
+            IdleWake::ClockeventIpi
+        } else {
+            IdleWake::Other
+        };
+        crate::time::deadline::exit_idle(wake);
+    }
 
     // 由于x86上面，虚拟中断号与物理中断号是一一对应的，所以这里直接使用vector作为中断号来查询irqdesc
 
@@ -42,7 +55,6 @@ unsafe extern "C" fn x86_64_do_irq(trap_frame: &mut TrapFrame, vector: u32) {
         CurrentApic.send_eoi();
     }
 
-    let irq_outermost = rcu_irq.is_outermost();
     if irq_outermost {
         do_softirq();
     }

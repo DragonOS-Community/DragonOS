@@ -976,6 +976,14 @@ pub fn clocksource_suspend() {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(super) fn watchdog_deadline() -> Result<Option<u64>, SystemError> {
+    let state = CLOCKSOURCE_WATCHDOG
+        .try_lock_irqsave()
+        .map_err(|_| SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    Ok((state.is_running && state.watchdog.is_some()).then_some(state.timer_expires))
+}
+
 /// Cheap bounded check used by the existing timer IRQ/softirq path. A busy
 /// watchdog transaction leaves the deadline armed for a later tick.
 pub(super) fn watchdog_due(now: u64) -> bool {

@@ -7,6 +7,7 @@ use crate::{
     exception::InterruptArch,
     process::{ProcessFlags, ProcessManager},
     sched::{SchedMode, __schedule},
+    time::deadline::{self, IdleWake},
 };
 
 impl ProcessManager {
@@ -15,9 +16,6 @@ impl ProcessManager {
         loop {
             let pcb = ProcessManager::current_pcb();
             if pcb.flags().contains(ProcessFlags::NEED_SCHEDULE) {
-                // A runnable task on this CPU means the timekeeper (CPU0) must
-                // not keep skipping its tick, or jiffies/timers would stall.
-                crate::time::deadline::notify_timekeeper_resume();
                 __schedule(SchedMode::SM_NONE);
             }
             if CurrentIrqArch::is_irq_enabled() {
@@ -25,19 +23,16 @@ impl ProcessManager {
                 // region. A remote wakeup then either sets the flag before the
                 // check or leaves an IPI pending to wake the halted CPU.
                 let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                deadline::enter_idle();
                 let rcu_idle = crate::rcu::idle_enter();
                 // idle_enter() can itself wake a local RCU worker without an
                 // IPI, so check after entering EQS as well as before it.
                 if !pcb.flags().contains(ProcessFlags::NEED_SCHEDULE) {
-                    // While halted with no runnable task, the periodic tick is
-                    // not a wakeup source: the clockevent is programmed to the
-                    // earliest queued event instead (NOHZ-idle style).
-                    crate::time::deadline::enter_idle();
                     unsafe { x86_64::instructions::interrupts::enable_and_hlt() };
                     unsafe { CurrentIrqArch::interrupt_disable() };
-                    crate::time::deadline::exit_idle();
                 }
                 crate::rcu::idle_exit(rcu_idle);
+                deadline::exit_idle(IdleWake::Other);
                 drop(irq_guard);
             } else {
                 error!("Idle process should not be scheduled with IRQs disabled.");

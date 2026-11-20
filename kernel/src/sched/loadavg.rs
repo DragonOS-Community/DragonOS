@@ -92,14 +92,26 @@ pub fn calc_global_load_tick(rq: &mut CpuRunQueue) {
         return;
     }
 
+    fold_active(rq);
+    rq.calc_load_update = rq.calc_load_update.saturating_add(LOAD_FREQ);
+}
+
+fn fold_active(rq: &mut CpuRunQueue) {
     let nr_active = rq.nr_running() as isize + rq.nr_uninterruptible as isize;
     let delta = nr_active - rq.calc_load_active;
     if delta != 0 {
         CALC_LOAD_TASKS.fetch_add(delta, Ordering::SeqCst);
         rq.calc_load_active = nr_active;
     }
+}
 
-    rq.calc_load_update = rq.calc_load_update.saturating_add(LOAD_FREQ);
+/// Fold the local contribution before the CPU can miss a sampling window.
+/// The deadline queue must not be held: the scheduler can arm a deadline.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn fold_idle_cpu(cpu: usize) {
+    let queue = super::cpu_rq(cpu);
+    let (rq, _guard) = queue.self_lock();
+    fold_active(rq);
 }
 
 pub fn calc_global_load(now_jiffies: u64) {

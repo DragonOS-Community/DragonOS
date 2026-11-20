@@ -4,7 +4,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{
     alloc::AllocError,
     fmt::Debug,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[path = "deadline_queue.rs"]
@@ -29,6 +29,7 @@ const TICK_NS: u64 = 1_000_000_000 / HZ;
 /// Upper bound on how long an idle CPU may skip the periodic tick when no
 /// earlier clockevent work is queued. Keeps jiffies, clocksource watchdog and
 /// periodic global maintenance within a bounded delay.
+#[cfg(target_arch = "x86_64")]
 const MAX_IDLE_NS: u64 = TICK_NS.saturating_mul(125);
 const MAX_CALLBACKS: usize = 32;
 // Regression-only count of ready-queue programming attempts, including fallback.
@@ -39,11 +40,10 @@ static PROGRAM_ATTEMPTS: [core::sync::atomic::AtomicU64; PerCpu::MAX_CPU_NUM as 
 static CONTINUOUS: AtomicBool = AtomicBool::new(false);
 static CAPABLE: [AtomicBool; PerCpu::MAX_CPU_NUM as usize] =
     [const { AtomicBool::new(false) }; PerCpu::MAX_CPU_NUM as usize];
-/// CPUs currently inside the idle halt window. CPU0 is the timekeeping /
-/// global-timer owner and may only stop its tick when every other online CPU
-/// is idle too; otherwise jiffies and the ordinary timer wheel would stall
-/// while other CPUs run.
-static IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+// Shared handshake: CPU0 publishes its intent to stop before sampling the
+// APs. An AP atomically clears its bit and observes the previous CPU0 bit.
+#[cfg(target_arch = "x86_64")]
+static IDLE_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static QUEUES: [SpinLock<Queue>; PerCpu::MAX_CPU_NUM as usize] =
     [const { SpinLock::new(Queue::new()) }; PerCpu::MAX_CPU_NUM as usize];
 
@@ -56,12 +56,8 @@ struct Pending {
 struct Queue {
     ready: bool,
     next_tick: u64,
-    /// The local CPU is inside the idle halt window; the periodic tick is not
-    /// an independent wakeup source until the CPU leaves idle.
-    idle: bool,
-    /// Absolute monotonic deadline of the next wakeup that an idle CPU must
-    /// still honor (queued deadline events, ordinary timers / watchdog cap).
-    idle_wake: u64,
+    #[cfg(target_arch = "x86_64")]
+    idle_wake: Option<u64>,
     pending: DeadlineQueue,
 }
 impl Queue {
@@ -69,27 +65,19 @@ impl Queue {
         Self {
             ready: false,
             next_tick: 0,
-            idle: false,
-            idle_wake: 0,
+            #[cfg(target_arch = "x86_64")]
+            idle_wake: None,
             pending: DeadlineQueue::new(),
         }
     }
 
-    /// The periodic tick shares the clockevent with queued deadlines. An
-    /// idle wakeup is a one-shot target: once it expires, fall back to the
-    /// tick deadline instead of arming a far-past deadline repeatedly.
+    /// The periodic tick shares the clockevent with queued deadlines.
     fn next_deadline(&self) -> u64 {
-        let earliest = self.pending.first_key().map_or(u64::MAX, |key| key.0);
-        if self.idle && self.idle_wake > now_ns() {
-            earliest.min(self.idle_wake)
-        } else {
-            earliest.min(self.next_tick)
-        }
+        let tick = self.next_tick;
+        #[cfg(target_arch = "x86_64")]
+        let tick = self.idle_wake.unwrap_or(tick);
+        self.pending.first_key().map_or(tick, |key| key.0.min(tick))
     }
-}
-
-fn jiffies_to_ns(jiffies: u64) -> u64 {
-    ((jiffies as u128 * super::jiffies::NSEC_PER_JIFFY as u128).min(u64::MAX as u128)) as u64
 }
 
 /// The callback runs on the event owner with IRQs disabled, without queue or
@@ -322,173 +310,125 @@ pub fn reprogram_local() {
     }
 }
 
-fn other_online_cpus_idle(cpu: ProcessorId) -> bool {
+#[cfg(target_arch = "x86_64")]
+fn all_other_online_cpus_idle(idle: u64) -> bool {
     let manager = crate::smp::cpu::smp_cpu_manager();
-    let idle = IDLE_CPUS.load(Ordering::Acquire);
     manager
-        .online_cpus()
+        .possible_cpus()
         .iter_cpu()
-        .filter(|other| *other != cpu)
-        .all(|other| idle & (1u64 << other.data()) != 0)
+        .all(|cpu| cpu.data() == 0 || !manager.is_online_cpu(cpu) || idle & (1 << cpu.data()) != 0)
 }
 
-/// A non-timekeeper CPU is about to run a task after leaving idle. If CPU0
-/// has stopped its tick, wake it so jiffies and the global timer wheel resume
-/// while another CPU is executing.
-pub(crate) fn notify_timekeeper_resume() {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if smp_get_processor_id().data() == 0 {
-            return;
-        }
-        if IDLE_CPUS.load(Ordering::Acquire) & 1 == 0 {
-            return;
-        }
-        crate::arch::interrupt::ipi::send_ipi(
-            crate::exception::ipi::IpiKind::KickCpu,
-            crate::exception::ipi::IpiTarget::Specified(ProcessorId::new(0)),
-        );
-    }
-}
-
-fn set_cpu_idle(cpu: ProcessorId, idle: bool) {
-    let bit = 1u64 << cpu.data();
-    if idle {
-        IDLE_CPUS.fetch_or(bit, Ordering::AcqRel);
-    } else {
-        IDLE_CPUS.fetch_and(!bit, Ordering::AcqRel);
-    }
-}
-
-/// Enter the idle halt window: the periodic tick stops being an independent
-/// wakeup source until [`exit_idle`] runs. The clockevent is programmed to the
-/// earliest queued deadline, or to a bounded maintenance cap when none is due.
+/// Prepare the local clockevent before the IRQ-off final idle check.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn enter_idle() {
-    let cpu = smp_get_processor_id();
-    let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
-    if !queue.ready || queue.idle || !supported() {
+    if !supported() || crate::exception::softirq::softirq_vectors().local_pending() {
         return;
     }
-    let now = now_ns();
-    let cap = now.saturating_add(MAX_IDLE_NS);
-    // CPU0 owns both timekeeping and the ordinary timer wheel. Include the
-    // earliest timer so an idle CPU0 still services it precisely; when the
-    // timer queue is contended, fall back to one tick so the next idle attempt
-    // recomputes instead of oversleeping.
-    let wake = if cpu.data() == 0 {
-        let mut wake = cap;
-        // Absolute deadlines are exact (nanoseconds); queued DeadlineEvents
-        // are also covered by next_deadline(), so a contended query is safe
-        // to skip here.
-        for domain in [
-            super::absolute_timer::AbsoluteClock::Monotonic,
-            super::absolute_timer::AbsoluteClock::Realtime,
-        ] {
-            if let Ok(Some(expire)) = super::absolute_timer::first_expire(domain) {
-                let remaining = expire.saturating_sub(super::timer::clock());
-                wake = wake.min(now.saturating_add(jiffies_to_ns(remaining)));
-            }
-        }
-        // The ordinary timer wheel is jiffies-based and coarse. Wait one
-        // extra jiffy so a timer serviced at the expire boundary never runs
-        // its callback with `now < deadline` (timerfd would drop the periodic
-        // chain in that case).
-        match super::timer::timer_list_first_expire() {
-            Ok(Some(expire)) => {
-                let remaining = expire
-                    .saturating_sub(super::timer::clock())
-                    .saturating_add(1);
-                wake = wake.min(now.saturating_add(jiffies_to_ns(remaining)));
-            }
-            Ok(None) => {}
-            Err(_) => wake = wake.min(now.saturating_add(TICK_NS)),
-        }
+    let cpu = smp_get_processor_id().data();
+    crate::sched::loadavg::fold_idle_cpu(cpu as usize);
+    let mut queue = QUEUES[cpu as usize].lock_irqsave();
+    if !queue.ready {
+        return;
+    }
+
+    const { assert!(PerCpu::MAX_CPU_NUM <= u64::BITS) };
+    let bit = 1u64 << cpu;
+    let idle = IDLE_CPUS.fetch_or(bit, Ordering::AcqRel);
+    let cap = now_ns().saturating_add(MAX_IDLE_NS);
+    let wake = if cpu == 0 {
+        // Once the intent is visible, an AP leaving idle either invalidates
+        // our snapshot or sends a clockevent IPI, including during these reads.
+        let wake = all_other_online_cpus_idle(idle)
+            .then(super::timer::idle_wake_jiffies)
+            .and_then(Result::ok)
+            .map(|expire| {
+                expire.map_or(cap, |expire| {
+                    timekeeping::jiffies_deadline_ns(expire).min(cap)
+                })
+            });
+        let Some(wake) = wake.filter(|wake| *wake > now_ns()) else {
+            IDLE_CPUS.fetch_and(!bit, Ordering::Release);
+            return;
+        };
         wake
     } else {
         cap
     };
-    // CPU0 also owns jiffies and the global timer wheel. While any other CPU
-    // is running, keep the periodic tick so jiffies/timers cannot stall; only
-    // skip it when every online CPU is idle.
-    if cpu.data() == 0 && !other_online_cpus_idle(cpu) {
-        program_locked(&queue);
-        return;
-    }
-    set_cpu_idle(cpu, true);
-    queue.idle = true;
-    queue.idle_wake = wake;
-    if wake <= now {
-        // A timer is already due. Programming a one-nanosecond clockevent
-        // here would spin between HLT and the IRQ without advancing jiffies,
-        // because the tick path only runs timers after jiffies move. Keep the
-        // periodic tick and make the timer softirq check run now instead.
-        queue.idle = false;
-        program_locked(&queue);
-        drop(queue);
-        super::timer::run_local_timer();
-        return;
-    }
+    queue.idle_wake = Some(wake);
     program_locked(&queue);
 }
 
-/// Leave the idle halt window and restore the periodic tick phase.
-pub(crate) fn exit_idle() {
-    let cpu = smp_get_processor_id();
-    set_cpu_idle(cpu, false);
-    let was_idle = {
-        let mut queue = QUEUES[cpu.data() as usize].lock_irqsave();
-        if !queue.idle {
-            false
-        } else {
-            queue.idle = false;
-            queue.next_tick = now_ns().saturating_add(TICK_NS);
-            true
-        }
-    };
-    if !was_idle {
-        return;
-    }
-    // CPU0 owns jiffies and global per-tick maintenance. Bring them forward
-    // before installing the next periodic deadline; a long idle window is
-    // accounted in one batch by advance_jiffies().
-    if cpu.data() == 0 {
-        tick_handle_global(false);
-        // A short halt may wake without advancing jiffies, but a timer can
-        // still have expired. Always re-check the timer queues so an expired
-        // timer cannot keep the CPU bouncing between enter_idle and exit_idle.
-        super::timer::run_local_timer();
-    }
-    reprogram_local();
+#[cfg(target_arch = "x86_64")]
+pub(crate) enum IdleWake {
+    Timer,
+    ClockeventIpi,
+    Other,
 }
 
-/// A timer was just published. An idle CPU0 must be woken to reprogram its
-/// clockevent if the new deadline is earlier than its current idle wakeup;
-/// otherwise the timer would wait for the bounded maintenance cap.
-pub(crate) fn kick_timer_owner(expire_jiffies: u64) {
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = expire_jiffies;
-    #[cfg(target_arch = "x86_64")]
-    {
-        let owner = ProcessorId::new(0);
-        let wake = {
-            let queue = QUEUES[0].lock_irqsave();
-            if !queue.idle {
-                return;
-            }
-            queue.idle_wake
-        };
-        let now = now_ns();
-        let remaining = expire_jiffies.saturating_sub(super::timer::clock());
-        let expire_ns = now.saturating_add(jiffies_to_ns(remaining));
-        if expire_ns >= wake {
-            return;
-        }
-        // Dropping the queue guard first avoids re-entering the owner on a
-        // self-IPI after IRQs are enabled.
-        crate::arch::interrupt::ipi::send_ipi(
-            crate::exception::ipi::IpiKind::KickCpu,
-            crate::exception::ipi::IpiTarget::Specified(owner),
+/// Leave the halted interval before an IRQ handler or scheduling can run.
+/// A clockevent IRQ or IPI programs the device itself.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn exit_idle(wake: IdleWake) {
+    let cpu = smp_get_processor_id().data();
+    let bit = 1u64 << cpu;
+    if IDLE_CPUS.load(Ordering::Relaxed) & bit == 0 {
+        return;
+    }
+    // An AP that sees CPU0's bit clear must be able to use the refreshed
+    // jiffies immediately. Publish the catch-up before clearing that bit.
+    if cpu == 0 {
+        timekeeping::advance_jiffies(false);
+    }
+    let idle = IDLE_CPUS.fetch_and(!bit, Ordering::AcqRel);
+    let skipped_ticks = {
+        let mut queue = QUEUES[cpu as usize].lock_irqsave();
+        queue.idle_wake = None;
+        // Only a timer IRQ will account the last boundary before returning
+        // to the scheduler. For any other wakeup, consume it here too, so
+        // a later tick cannot charge an idle interval to the new task.
+        let skipped = now_ns().checked_sub(queue.next_tick).map_or(0, |overdue| {
+            overdue / TICK_NS + u64::from(!matches!(wake, IdleWake::Timer))
+        });
+        queue.next_tick = queue
+            .next_tick
+            .saturating_add(skipped.saturating_mul(TICK_NS));
+        skipped
+    };
+    if skipped_ticks != 0 {
+        crate::sched::cputime::CpuTimeFunc::irqtime_account_process_tick(
+            &crate::process::ProcessManager::current_pcb(),
+            false,
+            skipped_ticks,
         );
+    }
+
+    if cpu == 0 {
+        // An AP may already have advanced jiffies before the IPI arrived.
+        // The maintenance associated with that advance still belongs to CPU0.
+        super::tick_common::run_global_maintenance();
+    } else if idle & 1 != 0 {
+        // The IPI is asynchronous. Refresh the coarse time base locally
+        // before an IRQ handler or a new task can arm a relative timer.
+        timekeeping::advance_jiffies(false);
+        notify_owner(ProcessorId::new(0));
+    }
+    if matches!(wake, IdleWake::Other) {
+        reprogram_local();
+    }
+}
+
+/// Timer publication releases the timer-list lock before checking the owner
+/// queue. It either precedes the idle snapshot or sees the armed idle wakeup.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn kick_timer_owner(expire_jiffies: u64) {
+    let queue = QUEUES[0].lock_irqsave();
+    if queue
+        .idle_wake
+        .is_some_and(|wake| timekeeping::jiffies_deadline_ns(expire_jiffies) < wake)
+    {
+        drop(queue);
+        notify_owner(ProcessorId::new(0));
     }
 }
 
@@ -506,10 +446,7 @@ fn program_locked(queue: &Queue) {
         return;
     }
     let next = queue.next_deadline();
-    // A far-past deadline must not turn into a one-nanosecond clockevent:
-    // repeated immediate interrupts cannot make progress on the queue and
-    // would starve the CPU. One half tick is the minimum reprogram delay.
-    let delta = next.saturating_sub(now_ns()).max(TICK_NS / 2);
+    let delta = next.saturating_sub(now_ns()).max(1);
     #[cfg(target_arch = "x86_64")]
     crate::arch::driver::apic::apic_timer::program_deadline_delta(delta);
     #[cfg(target_arch = "riscv64")]
@@ -529,7 +466,9 @@ fn notify_owner(owner: ProcessorId) {
     let _ = owner;
     #[cfg(target_arch = "x86_64")]
     crate::arch::interrupt::ipi::send_ipi(
-        crate::exception::ipi::IpiKind::SpecVector(crate::exception::HardwareIrqNumber::new(205)),
+        crate::exception::ipi::IpiKind::SpecVector(crate::exception::HardwareIrqNumber::new(
+            crate::arch::interrupt::ipi::IPI_NUM_CLOCKEVENT.data(),
+        )),
         crate::exception::ipi::IpiTarget::Specified(owner),
     );
 }

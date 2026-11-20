@@ -19,10 +19,7 @@ use super::{
 use crate::libs::casting::DowncastArc;
 use crate::process::namespace::user_namespace::map_id_down;
 use crate::{filesystem::vfs::syscall::UtimensFlags, process::cred::Kgid};
-use crate::{
-    process::cred::CAPFlags,
-    time::{syscall::PosixTimeval, PosixTimeSpec},
-};
+use crate::{process::cred::CAPFlags, time::PosixTimeSpec};
 use crate::{process::ProcessManager, syscall::user_access::vfs_check_and_clone_cstr};
 use alloc::string::String;
 
@@ -882,6 +879,9 @@ pub fn do_open_execat_with_flags(
     Ok(Arc::new(file))
 }
 
+const UTIME_NOW: i64 = (1 << 30) - 1;
+pub(super) const UTIME_OMIT: i64 = (1 << 30) - 2;
+
 /// On Linux, futimens() is a library function implemented on top of
 /// the utimensat() system call.  To support this, the Linux
 /// utimensat() system call implements a nonstandard feature: if
@@ -894,20 +894,12 @@ pub fn do_utimensat(
     times: Option<[PosixTimeSpec; 2]>,
     flags: UtimensFlags,
 ) -> Result<usize, SystemError> {
-    const UTIME_NOW: i64 = (1i64 << 30) - 1i64;
-    const UTIME_OMIT: i64 = (1i64 << 30) - 2i64;
-    // log::debug!("do_utimensat: dirfd:{}, pathname:{:?}, times:{:?}, flags:{:?}", dirfd, pathname, times, flags);
-
-    // Linux semantics: if both timestamps are UTIME_OMIT, the call succeeds
-    // without accessing the file at all (OmitNoop test).
-    if let Some([atime, mtime]) = times {
-        if atime.tv_nsec == UTIME_OMIT && mtime.tv_nsec == UTIME_OMIT {
-            return Ok(0);
-        }
-    }
-
     let inode = match pathname {
         Some(path) => {
+            // An empty pathname must not resolve to the current directory.
+            if path.is_empty() {
+                return Err(SystemError::ENOENT);
+            }
             let (inode_begin, path) =
                 user_path_at(&ProcessManager::current_pcb(), dirfd, path.as_str())?;
             // AT_SYMLINK_NOFOLLOW applies only to the final component;
@@ -930,6 +922,10 @@ pub fn do_utimensat(
                 return Err(SystemError::EFAULT);
             }
 
+            if !flags.is_empty() {
+                return Err(SystemError::EINVAL);
+            }
+
             let binding = ProcessManager::current_pcb().fd_table();
             let fd_table_guard = binding.read();
             let file = fd_table_guard
@@ -945,6 +941,16 @@ pub fn do_utimensat(
             file.path_inode()
         }
     };
+    // Linux validates nanoseconds after resolving the target.
+    if times.is_some_and(|values| {
+        values.iter().any(|value| {
+            let nsec = value.tv_nsec;
+            !(0..1_000_000_000).contains(&nsec) && nsec != UTIME_NOW && nsec != UTIME_OMIT
+        })
+    }) {
+        return Err(SystemError::EINVAL);
+    }
+
     let both_now =
         times.is_none_or(|times| times[0].tv_nsec == UTIME_NOW && times[1].tv_nsec == UTIME_NOW);
     File::recover_io(|| {
@@ -986,49 +992,6 @@ pub fn do_utimensat(
         })
     })?;
     // fsnotify: timestamp change → IN_ATTRIB.
-    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
-    return Ok(0);
-}
-
-pub fn do_utimes(path: &str, times: Option<[PosixTimeval; 2]>) -> Result<usize, SystemError> {
-    // Validate before converting microseconds to nanoseconds. Unlike timer
-    // intervals, file timestamps may legitimately have negative seconds.
-    if let Some(values) = times {
-        if values
-            .iter()
-            .any(|value| !(0..1_000_000).contains(&value.tv_usec))
-        {
-            return Err(SystemError::EINVAL);
-        }
-    }
-    // log::debug!("do_utimes: path:{:?}, times:{:?}", path, times);
-    let (inode_begin, path) = user_path_at(
-        &ProcessManager::current_pcb(),
-        AtFlags::AT_FDCWD.bits(),
-        path,
-    )?;
-    let inode = File::recover_io(|| {
-        inode_begin.lookup_follow_symlink(path.as_str(), VFS_MAX_FOLLOW_SYMLINK_TIMES)
-    })?;
-    File::recover_io(|| {
-        inode.update_metadata_masked(&mut |current| {
-            check_timestamp_update_permission(&inode, current, times.is_none())?;
-            let mut meta = current.clone();
-            let now = PosixTimeSpec::now();
-            let mut mask = SetMetadataMask::ATIME | SetMetadataMask::MTIME | SetMetadataMask::CTIME;
-            if let Some([atime, mtime]) = times {
-                meta.atime = PosixTimeSpec::from(atime);
-                meta.mtime = PosixTimeSpec::from(mtime);
-            } else {
-                meta.atime = now;
-                meta.mtime = now;
-                mask.insert(SetMetadataMask::TIMES_BY_WRITE);
-            }
-            meta.ctime = now;
-            Ok((meta, mask))
-        })
-    })?;
-    // fsnotify: a successful utimes(2) timestamp update → IN_ATTRIB.
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     return Ok(0);
 }

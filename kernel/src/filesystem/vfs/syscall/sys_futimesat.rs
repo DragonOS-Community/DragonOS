@@ -1,12 +1,39 @@
 use crate::arch::syscall::nr::SYS_FUTIMESAT;
 use crate::{
     arch::interrupt::TrapFrame,
-    filesystem::vfs::syscall::UtimensFlags,
-    syscall::table::{FormattedSyscallParam, Syscall},
-    time::PosixTimeSpec,
+    filesystem::vfs::{open::do_utimensat, syscall::UtimensFlags},
+    syscall::{
+        table::{FormattedSyscallParam, Syscall},
+        user_access::UserBufferReader,
+    },
+    time::{syscall::PosixTimeval, PosixTimeSpec},
 };
 use alloc::vec::Vec;
 use system_error::SystemError;
+
+pub(super) fn do_sys_futimesat(
+    dirfd: i32,
+    pathname: *const u8,
+    times: *const PosixTimeval,
+) -> Result<usize, SystemError> {
+    let times = if times.is_null() {
+        None
+    } else {
+        let reader = UserBufferReader::new(times, size_of::<[PosixTimeval; 2]>(), true)?;
+        let values = reader.read_one_from_user::<[PosixTimeval; 2]>(0)?;
+        // Legacy timeval syscalls validate microseconds before path lookup.
+        if values
+            .iter()
+            .any(|time| !(0..1_000_000).contains(&time.tv_usec))
+        {
+            return Err(SystemError::EINVAL);
+        }
+        Some(values.map(PosixTimeSpec::from))
+    };
+    let path = super::utimensat::read_timestamp_path(pathname)?;
+    do_utimensat(dirfd, path, times, UtimensFlags::empty())
+}
+
 pub struct SysFutimesatHandle;
 
 impl Syscall for SysFutimesatHandle {
@@ -15,11 +42,7 @@ impl Syscall for SysFutimesatHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let dirfd = Self::dirfd(args);
-        let pathname = Self::pathname(args);
-        let times = Self::times(args);
-        let flags = UtimensFlags::empty();
-        super::utimensat::do_sys_utimensat(dirfd, pathname, times, flags.bits())
+        do_sys_futimesat(Self::dirfd(args), Self::pathname(args), Self::times(args))
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {
@@ -40,8 +63,8 @@ impl SysFutimesatHandle {
         args[1] as *const u8
     }
 
-    fn times(args: &[usize]) -> *const PosixTimeSpec {
-        args[2] as *const PosixTimeSpec
+    fn times(args: &[usize]) -> *const PosixTimeval {
+        args[2] as *const PosixTimeval
     }
 }
 

@@ -11,6 +11,9 @@
 #include <limits.h>
 #include <string>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <utime.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -48,6 +51,10 @@ protected:
     }
 
     void TearDown() override {
+        if (saved_cwd_ >= 0) {
+            EXPECT_EQ(0, fchdir(saved_cwd_));
+            EXPECT_EQ(0, close(saved_cwd_));
+        }
         if (dirfd_ >= 0) close(dirfd_);
         if (dir_.empty()) return;
         for (const char* name : {"real/link", "real/file", "alias", "absolute", "loop"}) {
@@ -66,6 +73,25 @@ protected:
         EXPECT_EQ(times[1].tv_sec, st.st_mtim.tv_sec);
     }
 
+    void EnterTestDirectory() {
+        saved_cwd_ = open(".", O_RDONLY | O_DIRECTORY);
+        ASSERT_GE(saved_cwd_, 0);
+        ASSERT_EQ(0, fchdir(dirfd_));
+        ASSERT_EQ(0, utimensat(AT_FDCWD, ".", kOldTimes, 0));
+    }
+
+    static void ExpectSameTimestamps(const char* path, const struct stat& before) {
+        SCOPED_TRACE(path);
+        struct stat after = {};
+        ASSERT_EQ(0, stat(path, &after));
+        EXPECT_EQ(before.st_atim.tv_sec, after.st_atim.tv_sec);
+        EXPECT_EQ(before.st_atim.tv_nsec, after.st_atim.tv_nsec);
+        EXPECT_EQ(before.st_mtim.tv_sec, after.st_mtim.tv_sec);
+        EXPECT_EQ(before.st_mtim.tv_nsec, after.st_mtim.tv_nsec);
+        EXPECT_EQ(before.st_ctim.tv_sec, after.st_ctim.tv_sec);
+        EXPECT_EQ(before.st_ctim.tv_nsec, after.st_ctim.tv_nsec);
+    }
+
     void MakeFinalLink(const char* target) {
         ASSERT_EQ(0, symlink(target, Path("real/link").c_str()));
         ASSERT_EQ(0, utimensat(AT_FDCWD, Path("real/link").c_str(), kOldTimes,
@@ -74,6 +100,7 @@ protected:
 
     std::string dir_;
     int dirfd_ = -1;
+    int saved_cwd_ = -1;
     dunitest::LoopExt4 ext4_;
 };
 
@@ -232,6 +259,90 @@ TEST_P(UtimensatSymlinkTest, FutimensFdPathRemainsUnchanged) {
     EXPECT_EQ(0, close(fd));
     ExpectTimes("real/file", kNewTimes);
 }
+
+TEST_P(UtimensatSymlinkTest, EmptyPathDoesNotMutateCwdOrFd) {
+    ASSERT_NO_FATAL_FAILURE(EnterTestDirectory());
+    struct stat cwd = {}, file = {};
+    ASSERT_EQ(0, stat(".", &cwd));
+    ASSERT_EQ(0, stat("real/file", &file));
+    const int fd = open("real/file", O_RDONLY);
+    ASSERT_GE(fd, 0);
+
+    for (const int dirfd : {AT_FDCWD, dirfd_, fd, -1}) {
+        for (const int flags : {0, AT_SYMLINK_NOFOLLOW}) {
+            SCOPED_TRACE(::testing::Message() << "dirfd=" << dirfd << ", flags=" << flags);
+            EXPECT_EQ(-1, syscall(SYS_utimensat, dirfd, "", kNewTimes, flags));
+            EXPECT_EQ(ENOENT, errno);
+            ExpectSameTimestamps(".", cwd);
+            ExpectSameTimestamps("real/file", file);
+        }
+    }
+    EXPECT_EQ(-1, syscall(SYS_utimensat, fd, nullptr, kNewTimes, AT_SYMLINK_NOFOLLOW));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(0, close(fd));
+
+    EXPECT_EQ(-1, syscall(SYS_utimensat, AT_FDCWD, "", nullptr, 0));
+    EXPECT_EQ(ENOENT, errno);
+    const timespec invalid[2] = {{0, 1000000000}, kNewTimes[1]};
+    EXPECT_EQ(-1, syscall(SYS_utimensat, AT_FDCWD, "", invalid, 0));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, syscall(SYS_utimensat, dirfd_, "real/file", invalid, 0));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(-1, syscall(SYS_utimensat, AT_FDCWD, "", kNewTimes, -1));
+    EXPECT_EQ(EINVAL, errno);
+
+    const timespec omitted[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+    EXPECT_EQ(0, syscall(SYS_utimensat, -1, "", omitted, 0));
+    EXPECT_EQ(0, syscall(SYS_utimensat, -1, "", omitted, -1));
+    ExpectSameTimestamps(".", cwd);
+    ExpectSameTimestamps("real/file", file);
+}
+
+#if defined(SYS_utime) && defined(SYS_utimes) && defined(SYS_futimesat)
+TEST_P(UtimensatSymlinkTest, LegacyEmptyPathPreservesTimevalErrorPrecedence) {
+    ASSERT_NO_FATAL_FAILURE(EnterTestDirectory());
+    struct stat cwd = {};
+    ASSERT_EQ(0, stat(".", &cwd));
+    const utimbuf seconds = {kNewTimes[0].tv_sec, kNewTimes[1].tv_sec};
+    EXPECT_EQ(-1, syscall(SYS_utime, "", &seconds));
+    EXPECT_EQ(ENOENT, errno);
+    ExpectSameTimestamps(".", cwd);
+
+    const timeval valid[2] = {{kNewTimes[0].tv_sec, 123}, {kNewTimes[1].tv_sec, 999999}};
+    const timeval invalid[2] = {{0, 1000000}, {0, 0}};
+    EXPECT_EQ(-1, syscall(SYS_utimes, "", invalid));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(-1, syscall(SYS_utimes, "", valid));
+    EXPECT_EQ(ENOENT, errno);
+    ExpectSameTimestamps(".", cwd);
+
+    EXPECT_EQ(-1, syscall(SYS_futimesat, dirfd_, "", invalid));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(-1, syscall(SYS_futimesat, dirfd_, "", valid));
+    EXPECT_EQ(ENOENT, errno);
+    ExpectSameTimestamps(".", cwd);
+
+    ASSERT_EQ(0, syscall(SYS_futimesat, dirfd_, "real/file", valid));
+    struct stat file = {};
+    ASSERT_EQ(0, stat("real/file", &file));
+    EXPECT_EQ(valid[0].tv_sec, file.st_atim.tv_sec);
+    EXPECT_EQ(valid[1].tv_sec, file.st_mtim.tv_sec);
+
+    const timespec converted[2] = {{valid[0].tv_sec, 123000}, {valid[1].tv_sec, 999999000}};
+    // Compare the two syscalls on the same filesystem, at its timestamp precision.
+    const timespec reset[2] = {kOldTimes[0], kOldTimes[1]};
+    ASSERT_EQ(0, utimensat(dirfd_, "real/file", reset, 0));
+    ASSERT_EQ(0, utimensat(dirfd_, "real/file", converted, 0));
+    struct stat reference = {};
+    ASSERT_EQ(0, stat("real/file", &reference));
+    EXPECT_EQ(reference.st_atim.tv_nsec, file.st_atim.tv_nsec);
+    EXPECT_EQ(reference.st_mtim.tv_nsec, file.st_mtim.tv_nsec);
+    if (std::strcmp(GetParam(), "/tmp") == 0) {
+        EXPECT_EQ(converted[0].tv_nsec, file.st_atim.tv_nsec);
+        EXPECT_EQ(converted[1].tv_nsec, file.st_mtim.tv_nsec);
+    }
+}
+#endif
 
 INSTANTIATE_TEST_SUITE_P(Filesystems, UtimensatSymlinkTest, ::testing::Values("/tmp", "ext4"),
                         [](const ::testing::TestParamInfo<const char*>& info) {

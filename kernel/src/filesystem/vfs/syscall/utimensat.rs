@@ -1,47 +1,44 @@
+use alloc::string::String;
 use system_error::SystemError;
 
 use crate::{
-    filesystem::vfs::{open::do_utimensat, syscall::UtimensFlags, MAX_PATHLEN},
+    filesystem::vfs::{
+        open::{do_utimensat, UTIME_OMIT},
+        syscall::UtimensFlags,
+        MAX_PATHLEN,
+    },
     syscall::user_access::{vfs_check_and_clone_cstr, UserBufferReader},
     time::PosixTimeSpec,
 };
 
-pub fn do_sys_utimensat(
+pub(super) fn read_timestamp_path(pathname: *const u8) -> Result<Option<String>, SystemError> {
+    if pathname.is_null() {
+        return Ok(None);
+    }
+
+    vfs_check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
+        .into_string()
+        .map(Some)
+        .map_err(|_| SystemError::EINVAL)
+}
+
+pub(super) fn do_sys_utimensat(
     dirfd: i32,
     pathname: *const u8,
     times: *const PosixTimeSpec,
     flags: u32,
 ) -> Result<usize, SystemError> {
-    let pathname = if pathname.is_null() {
-        None
-    } else {
-        let pathname = vfs_check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        Some(pathname)
-    };
-    let flags = UtimensFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
     let times = if times.is_null() {
         None
     } else {
-        let times_reader = UserBufferReader::new(times, size_of::<PosixTimeSpec>() * 2, true)?;
-        let times = times_reader.read_from_user::<PosixTimeSpec>(0)?;
-        let atime = times[0];
-        let mtime = times[1];
-
-        // Validate tv_nsec: it must be in [0, 1e9) or be UTIME_NOW/UTIME_OMIT.
-        const UTIME_NOW: i64 = (1i64 << 30) - 1i64;
-        const UTIME_OMIT: i64 = (1i64 << 30) - 2i64;
-
-        let valid_nsec = |nsec: i64| -> bool {
-            (0..1_000_000_000).contains(&nsec) || nsec == UTIME_NOW || nsec == UTIME_OMIT
-        };
-
-        if !valid_nsec(atime.tv_nsec) || !valid_nsec(mtime.tv_nsec) {
-            return Err(SystemError::EINVAL);
+        let reader = UserBufferReader::new(times, size_of::<[PosixTimeSpec; 2]>(), true)?;
+        let values = reader.read_one_from_user::<[PosixTimeSpec; 2]>(0)?;
+        // A double UTIME_OMIT short-circuits even pathname and flag validation.
+        if values.iter().all(|time| time.tv_nsec == UTIME_OMIT) {
+            return Ok(0);
         }
-
-        Some([atime, mtime])
+        Some(values)
     };
-    do_utimensat(dirfd, pathname, times, flags)
+    let flags = UtimensFlags::from_bits(flags).ok_or(SystemError::EINVAL)?;
+    do_utimensat(dirfd, read_timestamp_path(pathname)?, times, flags)
 }

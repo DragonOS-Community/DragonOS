@@ -2,12 +2,9 @@ use system_error::SystemError;
 
 use crate::arch::interrupt::TrapFrame;
 use crate::arch::syscall::nr::SYS_UTIMES;
-use crate::filesystem::vfs::open::do_utimes;
-use crate::filesystem::vfs::MAX_PATHLEN;
+use crate::filesystem::vfs::fcntl::AtFlags;
 use crate::syscall::table::FormattedSyscallParam;
 use crate::syscall::table::Syscall;
-use crate::syscall::user_access::vfs_check_and_clone_cstr;
-use crate::syscall::user_access::UserBufferReader;
 use crate::time::syscall::PosixTimeval;
 use alloc::vec::Vec;
 
@@ -19,20 +16,11 @@ impl Syscall for SysUtimesHandle {
     }
 
     fn handle(&self, args: &[usize], _frame: &mut TrapFrame) -> Result<usize, SystemError> {
-        let pathname = Self::pathname(args);
-        let times = Self::times(args);
-
-        let pathname = vfs_check_and_clone_cstr(pathname, Some(MAX_PATHLEN))?
-            .into_string()
-            .map_err(|_| SystemError::EINVAL)?;
-        let times = if times.is_null() {
-            None
-        } else {
-            let times_reader = UserBufferReader::new(times, size_of::<PosixTimeval>() * 2, true)?;
-            let times = times_reader.read_from_user::<PosixTimeval>(0)?;
-            Some([times[0], times[1]])
-        };
-        do_utimes(&pathname, times)
+        super::sys_futimesat::do_sys_futimesat(
+            AtFlags::AT_FDCWD.bits(),
+            Self::pathname(args),
+            Self::times(args),
+        )
     }
 
     fn entry_format(&self, args: &[usize]) -> Vec<FormattedSyscallParam> {

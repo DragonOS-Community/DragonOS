@@ -37,6 +37,111 @@ protected:
     std::string path_;
 };
 
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ~ScopedFd() { if (fd_ >= 0) close(fd_); }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    int get() const { return fd_; }
+private:
+    int fd_;
+};
+
+TEST_F(TmpfsIdentityTest, RamfsRemovedDirectoryFdRejectsNamespaceMutations) {
+    ASSERT_EQ(0, mount("ramfs", path_.c_str(), "ramfs", 0, nullptr));
+    ScopedFd root(open(path_.c_str(), O_RDONLY | O_DIRECTORY));
+    ASSERT_GE(root.get(), 0);
+    ScopedFd file(openat(root.get(), "source", O_CREAT | O_RDWR, 0600));
+    ASSERT_GE(file.get(), 0);
+    ASSERT_EQ(0, mkdirat(root.get(), "gone", 0700));
+    ScopedFd dir(openat(root.get(), "gone", O_RDONLY | O_DIRECTORY));
+    ASSERT_GE(dir.get(), 0);
+    struct stat st {};
+    ASSERT_EQ(0, fstat(dir.get(), &st));
+    EXPECT_EQ(2u, st.st_nlink);
+    ASSERT_EQ(0, unlinkat(root.get(), "gone", AT_REMOVEDIR));
+    ASSERT_EQ(0, fstat(dir.get(), &st));
+    EXPECT_EQ(0u, st.st_nlink);
+
+    const int created = openat(dir.get(), "file", O_CREAT | O_RDWR, 0600);
+    const int open_error = errno;
+    if (created >= 0) close(created);
+    EXPECT_EQ(-1, created);
+    EXPECT_EQ(ENOENT, open_error);
+    EXPECT_EQ(-1, mkdirat(dir.get(), "child", 0700));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, symlinkat("source", dir.get(), "sym"));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, mknodat(dir.get(), "fifo", S_IFIFO | 0600, 0));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, linkat(root.get(), "source", dir.get(), "hard", 0));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, renameat(root.get(), "source", dir.get(), "moved"));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, renameat(dir.get(), "missing", dir.get(), "other"));
+    EXPECT_EQ(ENOENT, errno);
+    ASSERT_EQ(0, fstatat(root.get(), "source", &st, 0));
+    EXPECT_EQ(1u, st.st_nlink);
+
+    ScopedFd cwd(open(".", O_RDONLY | O_DIRECTORY));
+    ASSERT_GE(cwd.get(), 0);
+    ASSERT_EQ(0, fchdir(dir.get()));
+    EXPECT_EQ(0, stat(".", &st));
+    EXPECT_EQ(0u, st.st_nlink);
+    EXPECT_EQ(-1, mkdir("cwd-child", 0700));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(0, fchdir(cwd.get()));
+}
+
+TEST_F(TmpfsIdentityTest, RamfsRmdirPreservesNonemptyDirectory) {
+    ASSERT_EQ(0, mount("ramfs", path_.c_str(), "ramfs", 0, nullptr));
+    const std::string dir = path_ + "/parent";
+    const std::string child = dir + "/child";
+    ASSERT_EQ(0, mkdir(dir.c_str(), 0700));
+    ASSERT_EQ(0, mkdir(child.c_str(), 0700));
+    EXPECT_EQ(-1, rmdir(dir.c_str()));
+    EXPECT_EQ(ENOTEMPTY, errno);
+    struct stat st {};
+    ASSERT_EQ(0, stat(dir.c_str(), &st));
+    EXPECT_EQ(3u, st.st_nlink);
+    EXPECT_EQ(0, stat(child.c_str(), &st));
+    ASSERT_EQ(0, rmdir(child.c_str()));
+    EXPECT_EQ(0, rmdir(dir.c_str()));
+}
+
+TEST_F(TmpfsIdentityTest, RamfsRenameReplacesOnlyEmptyDirectories) {
+    ASSERT_EQ(0, mount("ramfs", path_.c_str(), "ramfs", 0, nullptr));
+    const std::string other = path_ + "/other";
+    ASSERT_EQ(0, mkdir(other.c_str(), 0700));
+    for (const auto& parent : {path_, other}) {
+        SCOPED_TRACE(parent);
+        const std::string source = parent + "/source";
+        const std::string target = path_ + "/target";
+        const std::string child = target + "/child";
+        ASSERT_EQ(0, mkdir(source.c_str(), 0700));
+        ASSERT_EQ(0, mkdir(target.c_str(), 0700));
+        ASSERT_EQ(0, mkdir(child.c_str(), 0700));
+        ScopedFd victim(open(target.c_str(), O_RDONLY | O_DIRECTORY));
+        ASSERT_GE(victim.get(), 0);
+        EXPECT_EQ(-1, rename(source.c_str(), target.c_str()));
+        EXPECT_EQ(ENOTEMPTY, errno);
+        EXPECT_EQ(0, access(source.c_str(), F_OK));
+        ASSERT_EQ(0, rmdir(child.c_str()));
+        ASSERT_EQ(0, rename(source.c_str(), target.c_str()));
+        EXPECT_EQ(-1, access(source.c_str(), F_OK));
+        EXPECT_EQ(ENOENT, errno);
+        struct stat st {};
+        ASSERT_EQ(0, fstat(victim.get(), &st));
+        EXPECT_EQ(0u, st.st_nlink);
+        EXPECT_EQ(-1, mkdirat(victim.get(), "detached", 0700));
+        EXPECT_EQ(ENOENT, errno);
+        ASSERT_EQ(0, mkdir(child.c_str(), 0700));
+        ASSERT_EQ(0, rmdir(child.c_str()));
+        ASSERT_EQ(0, rmdir(target.c_str()));
+    }
+}
+
 TEST_F(TmpfsIdentityTest, LegacyDefaultRootIsSticky) {
     ASSERT_EQ(0, mount("tmpfs", path_.c_str(), "tmpfs", 0, nullptr));
     struct stat st {};

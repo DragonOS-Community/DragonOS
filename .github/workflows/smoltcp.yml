@@ -17,8 +17,6 @@ on:
 # kernel/ to the kernel nightly. Each job sets RUSTUP_TOOLCHAIN so this crate
 # keeps the toolchain its own CI expects.
 env:
-  RUSTUP_DIST_SERVER: "https://rsproxy.cn"
-  RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
   CARGO_TERM_COLOR: always
 
 defaults:

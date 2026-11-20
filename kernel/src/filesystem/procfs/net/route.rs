@@ -1,48 +1,34 @@
-//! /proc/net/route - IPv4 主路由表
-//!
-//! Linux 6.6: `net/ipv4/fib_trie.c` 的 `fib_route_seq_show()`，只导出
-//! `RT_TABLE_MAIN` 的 IPv4 路由。输出格式（seq_file，每行补空格到 127 列）：
-//!
-//! ```text
-//! Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
-//! eth0\t00000000\t019018AC\t0003\t0\t0\t0\t00000000\t0\t0\t0
-//! ```
-//!
-//! 其中地址/掩码是网络字节序的 8 位大写十六进制（等价于 `u32::from_le_bytes`）。
+//! Linux's legacy IPv4 main-table view of the namespace FIB.
 
-use crate::filesystem::procfs::template::configure_seq_file;
-use crate::filesystem::vfs::OpenFileBehavior;
-use crate::filesystem::{
-    procfs::{
-        template::{Builder, FileOps, ProcFileBuilder},
-        utils::proc_seq_operation,
-    },
-    vfs::{FilePrivateData, IndexNode, InodeMode},
-};
-use crate::libs::mutex::MutexGuard;
-use crate::net::route::{self, RouteEntry, RT_TABLE_MAIN};
-use crate::process::namespace::net_namespace::NetNamespace;
-use crate::process::ProcessManager;
-use alloc::collections::BTreeMap;
-use alloc::{format, string::String, sync::Arc, sync::Weak, vec::Vec};
-use smoltcp::wire::{IpCidr, Ipv4Address};
+use core::fmt::{self, Write};
+
+use alloc::sync::{Arc, Weak};
+use smoltcp::wire::{IpAddress, IpCidr};
 use system_error::SystemError;
 
-/// Header row, byte for byte the `seq_puts()` of Linux `fib_route_seq_show()`.
-const ROUTE_HEADER: &[u8] =
+use crate::{
+    arch::MMArch,
+    filesystem::{
+        procfs::{
+            template::{configure_seq_file, Builder, FileOps, ProcFileBuilder, ProcfsSeekKind},
+            utils::{proc_seq_operation, ProcfsSeqOperation},
+        },
+        vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode, OpenFileBehavior},
+    },
+    libs::mutex::MutexGuard,
+    mm::MemoryManagementArch,
+    net::route::{self, RouteEntry},
+    process::{namespace::net_namespace::NetNamespace, ProcessManager},
+};
+
+const HEADER: &[u8] =
     b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
-
-/// Linux `seq_setwidth(seq, 127)`: every row is padded to 127 columns.
-const ROUTE_LINE_WIDTH: usize = 127;
-
-/// Linux `RTF_UP` (include/uapi/linux/route.h)。
+const LINE_WIDTH: usize = 127;
+const RECORD_SIZE: usize = LINE_WIDTH + 1;
 const RTF_UP: u16 = 0x0001;
-/// Linux `RTF_GATEWAY`。
 const RTF_GATEWAY: u16 = 0x0002;
-/// Linux `RTF_HOST`：目的地址是单个主机（前缀长度 32）。
 const RTF_HOST: u16 = 0x0004;
 
-/// /proc/net/route 文件的 FileOps 实现
 #[derive(Debug)]
 pub struct RouteFileOps;
 
@@ -55,144 +41,63 @@ impl RouteFileOps {
     }
 }
 
-/// 网络字节序地址按 Linux `%08X` 的形式打印：等价于小端解释同一批字节。
-fn format_addr_hex(address: Ipv4Address) -> String {
-    format!("{:08X}", u32::from_le_bytes(address.octets()))
+/// A Linux route record is padded in bytes, including with UTF-8 device names.
+struct LineWriter<'a>(&'a mut [u8]);
+
+impl Write for LineWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let (field, remaining) = core::mem::take(&mut self.0)
+            .split_at_mut_checked(text.len())
+            .ok_or(fmt::Error)?;
+        field.copy_from_slice(text.as_bytes());
+        self.0 = remaining;
+        Ok(())
+    }
 }
 
-/// 前缀长度对应的点分掩码，再按 Linux 的十六进制形式打印。
-fn format_mask_hex(prefix_len: u8) -> String {
-    let prefix_len = prefix_len.min(32);
-    let mask = if prefix_len == 0 {
-        0u32
-    } else {
-        u32::MAX << (32 - prefix_len)
+fn write_entry(
+    line: &mut [u8],
+    netns: &NetNamespace,
+    entry: &RouteEntry,
+) -> Result<(), SystemError> {
+    let IpCidr::Ipv4(destination) = entry.destination else {
+        return Err(SystemError::EINVAL);
     };
-    format!("{:08X}", u32::from_le_bytes(mask.to_be_bytes()))
-}
-
-/// 由内核路由项推导 Linux 用户态看到的 rt_flags。
-///
-/// DragonOS 的 `RouteEntry` 没有直接的 flags 字段，这三个位是 Linux 在
-/// `fib_route_seq_show()` 里等价表达的信息：主表里能查到的路由都是 UP；
-/// 有下一跳就是 GATEWAY；前缀 32 是 HOST 路由。
-fn linux_route_flags(entry: &RouteEntry, prefix_len: u8) -> u16 {
+    // Linux prints the native integer representation of the network-order bytes.
+    let address = u32::from_ne_bytes(destination.address().octets());
+    let gateway = match entry.gateway {
+        Some(IpAddress::Ipv4(gateway)) => u32::from_ne_bytes(gateway.octets()),
+        _ => 0,
+    };
+    let prefix = destination.prefix_len();
+    let netmask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+    let mask = u32::from_ne_bytes(netmask.to_be_bytes());
     let mut flags = RTF_UP;
-    if entry.gateway.is_some() {
+    if gateway != 0 {
         flags |= RTF_GATEWAY;
     }
-    if prefix_len == 32 {
+    if prefix == 32 {
         flags |= RTF_HOST;
     }
-    flags
-}
 
-/// 取当前命名空间的 ifindex -> 接口名映射。
-///
-/// Linux 的 `fib_route_seq_show()` 打印 `dev->name`，没有设备时打印 `*`。
-fn device_names(netns: &Arc<NetNamespace>) -> BTreeMap<u32, String> {
-    let mut names = BTreeMap::new();
-    for iface in netns.device_list().iter().map(|(_, iface)| iface) {
-        names.insert(iface.nic_id() as u32, iface.iface_name());
-    }
-    names
-}
-
-/// Formats one row the way Linux `fib_route_seq_show()` does.
-///
-/// Returns the sort key Linux's trie walk produces (prefix length, then
-/// destination address) together with the rendered row: `fib_route_seq_show()`
-/// walks the trie leaves in ascending prefix order, so the default route is
-/// printed before more specific ones.
-fn format_route_entry(
-    entry: &RouteEntry,
-    names: &BTreeMap<u32, String>,
-) -> Option<((u8, u32), String)> {
-    let IpCidr::Ipv4(destination) = entry.destination else {
-        // /proc/net/route 只导出 IPv4；IPv6 在 /proc/net/ipv6_route。
-        return None;
+    let iface = netns.device_list().get(&(entry.oif as usize)).cloned();
+    let mut write_line = |name: &str| {
+        write!(
+            LineWriter(line),
+            "{name}\t{address:08X}\t{gateway:08X}\t{flags:04X}\t0\t0\t{}\t{mask:08X}\t0\t0\t0",
+            entry.priority as i32,
+        )
     };
-    if entry.table != RT_TABLE_MAIN {
-        // Linux 只遍历主表（RT_TABLE_MAIN），local/default 表不导出。
-        return None;
+    match iface {
+        Some(iface) => iface.common().with_iface_name(write_line),
+        None => write_line("*"),
     }
-
-    let iface = names.get(&entry.oif).map(String::as_str).unwrap_or("*");
-    let gateway = match entry.gateway {
-        Some(smoltcp::wire::IpAddress::Ipv4(gateway)) => format_addr_hex(gateway),
-        _ => format!("{:08X}", 0u32),
-    };
-    let address = destination.address();
-    let prefix_len = destination.prefix_len();
-    let line = format!(
-        "{}\t{}\t{}\t{:04X}\t0\t0\t{}\t{}\t0\t0\t0",
-        iface,
-        format_addr_hex(address),
-        gateway,
-        linux_route_flags(entry, prefix_len),
-        entry.priority,
-        format_mask_hex(prefix_len),
-    );
-    Some((
-        (prefix_len, u32::from_le_bytes(address.octets())),
-        format!("{:<width$}", line, width = ROUTE_LINE_WIDTH),
-    ))
-}
-
-/// Renders the route table from `cursor` on, the way Linux `fib_route_seq_ops`
-/// walks it, and stops once `want` bytes are out.
-///
-/// `cursor` is the index of the next entry to render; it is `None` for the
-/// first slice of a record, which also emits the header padded to 127 columns
-/// just like `seq_setwidth()` does.
-fn render_route_slice(
-    netns: &Arc<NetNamespace>,
-    cursor: Option<usize>,
-    want: usize,
-    out: &mut Vec<u8>,
-) -> Option<usize> {
-    let entries = match route::snapshot(netns) {
-        Ok(entries) => entries,
-        Err(error) => {
-            log::warn!("failed to snapshot routes: {:?}", error);
-            return None;
-        }
-    };
-    let names = device_names(netns);
-
-    // 过滤在取设备名之后做，避免把非主表/非 IPv4 的行计入 cursor。
-    let mut keyed: Vec<((u8, u32), String)> = entries
-        .iter()
-        .filter_map(|entry| format_route_entry(entry, &names))
-        .collect();
-    keyed.sort_by_key(|(key, _)| *key);
-    let rows: Vec<String> = keyed.into_iter().map(|(_, line)| line).collect();
-
-    let mut index = cursor.unwrap_or(0);
-    if cursor.is_none() {
-        out.extend_from_slice(
-            format!("{:<width$}\n", core::str::from_utf8(ROUTE_HEADER).unwrap_or(""), width = ROUTE_LINE_WIDTH)
-                .as_bytes(),
-        );
-    }
-
-    while index < rows.len() {
-        let line = format!("{}\n", rows[index]);
-        if !out.is_empty() && out.len() + line.len() > want {
-            break;
-        }
-        out.extend_from_slice(line.as_bytes());
-        index += 1;
-    }
-
-    if index < rows.len() {
-        Some(index)
-    } else {
-        None
-    }
+    .map_err(|_| SystemError::EOVERFLOW)
 }
 
 impl FileOps for RouteFileOps {
+    const SEEK_KIND: ProcfsSeekKind = ProcfsSeekKind::Seq;
+
     fn configure_open_file(&self, _data: &FilePrivateData, behavior: &mut OpenFileBehavior) {
         configure_seq_file(behavior);
     }
@@ -204,33 +109,64 @@ impl FileOps for RouteFileOps {
     fn open(
         &self,
         data: &mut MutexGuard<FilePrivateData>,
-        _flags: &crate::filesystem::vfs::file::FileFlags,
+        flags: &FileFlags,
     ) -> Result<(), SystemError> {
-        // Linux `seq_open_net()`：open() 时把 netns 钉在这个 fd 上，
-        // 之后 setns() 不能让同一个 fd 读到两个命名空间的表。
+        if flags.access_flags() != FileFlags::O_RDONLY {
+            return Err(SystemError::EACCES);
+        }
         let FilePrivateData::Procfs(pdata) = &mut **data else {
             return Err(SystemError::EINVAL);
         };
+        // /proc/net belongs to the opener's netns in DragonOS. Keep that view
+        // alive across setns(), unshare() and descriptor transfer.
         pdata.net_ns = Some(ProcessManager::current_netns());
         Ok(())
     }
 
-    const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
-        crate::filesystem::procfs::template::ProcfsSeekKind::Seq;
-
     fn seq_operation(
         &self,
-        operation: crate::filesystem::procfs::utils::ProcfsSeqOperation<'_>,
+        operation: ProcfsSeqOperation<'_>,
         data: &mut MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
-        let netns = {
-            let FilePrivateData::Procfs(pdata) = &**data else {
-                return Err(SystemError::EINVAL);
-            };
-            pdata.net_ns.clone().ok_or(SystemError::EINVAL)?
+        let FilePrivateData::Procfs(pdata) = &**data else {
+            return Err(SystemError::EINVAL);
         };
+        let netns = pdata.net_ns.clone().ok_or(SystemError::EINVAL)?;
+        let seek = matches!(operation, ProcfsSeqOperation::Seek { .. });
+        // At most one compact snapshot per syscall, even when seeking through
+        // many records. Only the unfinished text slice survives in the fd.
+        let mut snapshot = None;
         proc_seq_operation(operation, data, |cursor, want, out| {
-            Ok(render_route_slice(&netns, cursor, want, out))
+            let Some(index) = cursor else {
+                out.try_reserve_exact(RECORD_SIZE)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                out.extend_from_slice(HEADER);
+                out.resize(LINE_WIDTH, b' ');
+                out.push(b'\n');
+                return Ok(Some(0));
+            };
+            let entries = match &mut snapshot {
+                Some(entries) => entries,
+                slot => slot.insert(route::snapshot_ipv4_main(&netns)?),
+            };
+            // A regular read caches one page even for a single-byte request.
+            // Seek traversal still stops at the record containing its offset.
+            let bytes = if seek { want } else { MMArch::PAGE_SIZE };
+            let count = (bytes / RECORD_SIZE)
+                .max(1)
+                .min(entries.len().saturating_sub(index));
+            if count == 0 {
+                return Ok(None);
+            }
+            let end = index + count;
+            out.try_reserve_exact(count * RECORD_SIZE)
+                .map_err(|_| SystemError::ENOMEM)?;
+            out.resize(count * RECORD_SIZE, b' ');
+            for (line, row) in out.chunks_exact_mut(RECORD_SIZE).zip(&entries[index..end]) {
+                line[LINE_WIDTH] = b'\n';
+                write_entry(&mut line[..LINE_WIDTH], &netns, &row.entry)?;
+            }
+            Ok((end < entries.len()).then_some(end))
         })
     }
 }

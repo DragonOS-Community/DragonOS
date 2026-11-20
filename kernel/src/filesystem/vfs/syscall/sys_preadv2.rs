@@ -43,6 +43,10 @@ pub(super) fn validate_read_flags(file: &File, flags: u32) -> Result<(), SystemE
     Ok(())
 }
 
+/// Positional vectored read with per-operation RWF flags.
+///
+/// An offset of -1 uses and advances the file position. Nonnegative offsets
+/// read at the supplied position without updating the file position.
 pub struct SysPreadV2Handle;
 
 impl Syscall for SysPreadV2Handle {
@@ -112,8 +116,4 @@ impl SysPreadV2Handle {
     }
 }
 
-/// preadv2 的核心实现
-///
-/// - `offset == -1` 时行为等同于 `readv`，会推进文件偏移量
-/// - 其它非负 offset 走已有的 `preadv` 实现，不会修改文件偏移量
 syscall_table_macros::declare_syscall!(SYS_PREADV2, SysPreadV2Handle);

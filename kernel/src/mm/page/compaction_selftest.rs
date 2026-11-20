@@ -1211,7 +1211,7 @@ fn dma_recovery_attempt_bound(buckets: usize, mask_entries: usize) -> Option<usi
 /// This snapshot is an acceptance budget for the controlled fixture, not an
 /// arbitrary concurrent workload's liveness guarantee. No Page owner escapes.
 fn dma_recovery_inventory(max: PhysAddr) -> Result<(usize, usize, usize, usize), SystemError> {
-    let mut manager = page_manager_lock();
+    let manager = page_manager_lock();
     let len = manager.phys2page.len();
     let buckets = manager.phys2page.raw_table().buckets();
     // Count every same-mask identity as an upper bound. Repeating the runtime
@@ -1257,7 +1257,7 @@ fn dma_discovery_deferral_progress() -> Result<bool, SystemError> {
     fixture.release_holes();
     let source = fixture.sources[0].physical;
     let (buckets, seeded_cursor) = {
-        let mut manager = page_manager_lock();
+        let manager = page_manager_lock();
         let table = manager.phys2page.raw_table();
         let buckets = table.buckets();
         let mut seeded_cursor = None;
@@ -1758,7 +1758,7 @@ fn pin_foreign_dma_sources(
         let mut pins = Vec::new();
         pins.try_reserve_exact(len)
             .map_err(|_| SystemError::ENOMEM)?;
-        let Some(mut manager) = try_page_manager_lock() else {
+        let Some(manager) = try_page_manager_lock() else {
             crate::sched::sched_yield();
             continue;
         };
@@ -2226,7 +2226,7 @@ fn dma_background_recovery() -> ((bool, bool, bool), alloc::string::String) {
 
 pub(crate) fn report() -> alloc::string::String {
     let _serial = TEST_LOCK.lock();
-    let mut deferred_detail = alloc::string::String::new();
+    let deferred_detail;
     let (capacity_recovery, capacity_detail) = dma_capacity_recovery(0);
     let (capacity_occupied, capacity_occupied_detail) = dma_capacity_occupied_prefix();
     let mut checks = alloc::vec![
@@ -2315,7 +2315,7 @@ pub(crate) fn report() -> alloc::string::String {
     ]);
     checks.extend(crate::mm::allocator::buddy::compaction::selftest_checks());
     let (discovery_buckets, zero_absent) = {
-        let mut manager = page_manager_lock();
+        let manager = page_manager_lock();
         (
             manager.phys2page.raw_table().buckets(),
             !manager.contains(&PhysAddr::new(0)),
@@ -2325,7 +2325,7 @@ pub(crate) fn report() -> alloc::string::String {
         discovery_buckets,
     ));
     let discovery_shape_stable = {
-        let mut manager = page_manager_lock();
+        let manager = page_manager_lock();
         zero_absent
             && !manager.contains(&PhysAddr::new(0))
             && manager.phys2page.raw_table().buckets() == discovery_buckets

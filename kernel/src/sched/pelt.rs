@@ -248,11 +248,6 @@ bitflags! {
     }
 }
 
-pub fn add_positive(x: &mut isize, y: isize) {
-    let res = *x + y;
-    *x = res.max(0);
-}
-
 pub fn sub_positive(x: &mut usize, y: usize) {
     if *x > y {
         *x -= y;

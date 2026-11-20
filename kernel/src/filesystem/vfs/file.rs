@@ -1498,7 +1498,7 @@ impl File {
 
     /// Construct a pathname-backed file by consuming the mount pin acquired
     /// during path resolution. This closes the lookup-to-open umount window.
-    pub fn new_with_mount_guard(
+    pub(super) fn new_with_mount_guard(
         storage: PreparedFile,
         inode: Arc<dyn IndexNode>,
         flags: FileFlags,
@@ -1519,7 +1519,7 @@ impl File {
     }
 
     /// Construct a pathname-backed file from an already-opened inode.
-    pub fn new_preopened_with_mount_guard(
+    pub(super) fn new_preopened_with_mount_guard(
         storage: PreparedFile,
         preopened: PreopenedFile,
         flags: FileFlags,

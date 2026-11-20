@@ -8,9 +8,9 @@ use alloc::sync::Arc;
 
 use crate::{arch::MMArch, libs::spinlock::SpinLock, mm::MemoryManagementArch};
 
-use super::accounting::{
-    ChargeFailure, ChargeFailureReason, MemoryAccount, MemoryCharge, MemoryKind,
-};
+#[cfg(test)]
+use super::accounting::MemoryKind;
+use super::accounting::{ChargeFailure, ChargeFailureReason, MemoryAccount, MemoryCharge};
 
 const PAGE_BYTES: u64 = MMArch::PAGE_SIZE as u64;
 
@@ -102,6 +102,7 @@ impl SockAccount {
         let total = new.bytes.checked_add(bytes).ok_or_else(|| ChargeFailure {
             account: new.budget.account().clone(),
             reason: ChargeFailureReason::CounterOverflow,
+            #[cfg(test)]
             request_kind: MemoryKind::Sock,
             requested_pages: pages(bytes),
         })?;
@@ -140,6 +141,7 @@ impl SockAccount {
             .ok_or_else(|| ChargeFailure {
                 account: state.budget.account().clone(),
                 reason: ChargeFailureReason::CounterOverflow,
+                #[cfg(test)]
                 request_kind: MemoryKind::Sock,
                 requested_pages: pages(bytes),
             })?;

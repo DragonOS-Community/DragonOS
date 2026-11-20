@@ -17,7 +17,7 @@ use crate::{arch::MMArch, libs::spinlock::SpinLock, mm::MemoryManagementArch};
 /// byte statistics backed by these page reservations below LONG_MAX.
 pub(crate) const PAGE_COUNTER_MAX: u64 = (isize::MAX as u64) / MMArch::PAGE_SIZE as u64;
 
-const KIND_COUNT: usize = 7;
+const KIND_COUNT: usize = MemoryKind::Sock as usize + 1;
 const EVENT_COUNT: usize = 6;
 pub(crate) const KERNEL_BYTE_KIND_COUNT: usize = 6;
 const STAT_COUNT: usize = 15;
@@ -86,6 +86,7 @@ pub(crate) enum MemoryKind {
     Anon,
     File,
     Shmem,
+    #[cfg(test)]
     KernelStack,
     PageTables,
     KernelObject,
@@ -106,12 +107,14 @@ pub(crate) enum MemoryEvent {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MemorySnapshot {
     pub current: u64,
+    #[cfg(test)]
     pub local_current: u64,
     pub peak: u64,
     pub anon: u64,
     /// Includes shmem, matching memory.stat. Never sum file + shmem for usage.
     pub file: u64,
     pub shmem: u64,
+    #[cfg(test)]
     pub kernel_stack: u64,
     pub pagetables: u64,
     pub kernel_object: u64,
@@ -125,8 +128,9 @@ pub(crate) struct MemorySnapshot {
 }
 
 #[derive(Debug)]
-pub(crate) struct MemoryAccount {
-    id: u64,
+pub struct MemoryAccount {
+    // Included in the account’s diagnostic Debug output.
+    _id: u64,
     parent: Option<Arc<Self>>,
     policy: SpinLock<MemoryPolicy>,
     online: AtomicBool,
@@ -155,11 +159,12 @@ pub(crate) enum ChargeFailureReason {
 
 /// Pins the actual limiting ancestor so callers can act after dropping locks.
 #[derive(Debug)]
-pub(crate) struct ChargeFailure {
-    pub account: Arc<MemoryAccount>,
-    pub reason: ChargeFailureReason,
-    pub request_kind: MemoryKind,
-    pub requested_pages: u64,
+pub struct ChargeFailure {
+    pub(crate) account: Arc<MemoryAccount>,
+    pub(crate) reason: ChargeFailureReason,
+    #[cfg(test)]
+    pub(crate) request_kind: MemoryKind,
+    pub(crate) requested_pages: u64,
 }
 
 /// Unique ownership of a reservation. Not Clone: shared pages share the Page,
@@ -176,7 +181,7 @@ impl MemoryAccount {
     /// Construction is fallible and belongs to a sleepable topology transaction.
     pub fn new(id: u64, parent: Option<Arc<Self>>) -> Result<Arc<Self>, SystemError> {
         let account = Arc::try_new(Self {
-            id,
+            _id: id,
             parent,
             policy: SpinLock::new(MemoryPolicy::default()),
             online: AtomicBool::new(true),
@@ -195,10 +200,6 @@ impl MemoryAccount {
         .map_err(|_| SystemError::ENOMEM)?;
         super::registry::register(&account)?;
         Ok(account)
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
     }
 
     pub fn parent(&self) -> Option<&Arc<Self>> {
@@ -242,12 +243,12 @@ impl MemoryAccount {
         }
     }
 
-    pub fn policy(&self) -> MemoryPolicy {
+    pub(crate) fn policy(&self) -> MemoryPolicy {
         *self.policy.lock_irqsave()
     }
 
     /// Publish only; reclaim/high handling occurs in the caller after unlocking.
-    pub fn set_policy(&self, policy: MemoryPolicy) {
+    pub(crate) fn set_policy(&self, policy: MemoryPolicy) {
         *self.policy.lock_irqsave() = policy;
         crate::mm::memory_notify::request_oom_progress();
     }
@@ -265,7 +266,7 @@ impl MemoryAccount {
         crate::mm::memory_notify::request_oom_progress();
     }
 
-    pub fn try_charge(
+    pub(crate) fn try_charge(
         self: &Arc<Self>,
         kind: MemoryKind,
         pages: u64,
@@ -282,6 +283,7 @@ impl MemoryAccount {
             return Err(ChargeFailure {
                 account: self.clone(),
                 reason: ChargeFailureReason::Offline,
+                #[cfg(test)]
                 request_kind: MemoryKind::Sock,
                 requested_pages: 0,
             });
@@ -331,6 +333,7 @@ impl MemoryAccount {
                 return Err(ChargeFailure {
                     account: node.clone(),
                     reason,
+                    #[cfg(test)]
                     request_kind: kind,
                     requested_pages: pages,
                 });
@@ -445,7 +448,7 @@ impl MemoryAccount {
 
     /// Events are recorded by policy slow paths, not every failed speculative
     /// reservation (a caller may retry with a smaller batch).
-    pub fn record_event(&self, event: MemoryEvent) {
+    pub(crate) fn record_event(&self, event: MemoryEvent) {
         self.events_local[event as usize].fetch_add(1, Ordering::Relaxed);
         self.local_event_sequence.fetch_add(1, Ordering::Release);
         self.for_each(|node| {
@@ -463,7 +466,7 @@ impl MemoryAccount {
         }
     }
 
-    pub fn adjust_stat(&self, stat: MemoryStat, amount: u64, add: bool) {
+    pub(crate) fn adjust_stat(&self, stat: MemoryStat, amount: u64, add: bool) {
         self.for_each(|node| {
             let counter = &node.stats[stat as usize];
             if add {
@@ -482,7 +485,7 @@ impl MemoryAccount {
 
     /// Concurrent counter snapshots are approximate, as with Linux vmstats.
     /// Policy admission itself is serialized and does not use this snapshot.
-    pub fn snapshot(&self) -> MemorySnapshot {
+    pub(crate) fn snapshot(&self) -> MemorySnapshot {
         // Capture the generation before the counters. A read may acknowledge
         // this generation, but must not consume an event arriving while its
         // snapshot is being built.
@@ -490,11 +493,13 @@ impl MemoryAccount {
         let local_event_sequence = self.local_event_sequence.load(Ordering::Acquire);
         MemorySnapshot {
             current: self.current.load(Ordering::Acquire),
+            #[cfg(test)]
             local_current: self.local_current.load(Ordering::Relaxed),
             peak: self.peak.load(Ordering::Relaxed),
             anon: self.kinds[MemoryKind::Anon as usize].load(Ordering::Relaxed),
             file: self.kinds[MemoryKind::File as usize].load(Ordering::Relaxed),
             shmem: self.kinds[MemoryKind::Shmem as usize].load(Ordering::Relaxed),
+            #[cfg(test)]
             kernel_stack: self.kinds[MemoryKind::KernelStack as usize].load(Ordering::Relaxed),
             pagetables: self.kinds[MemoryKind::PageTables as usize].load(Ordering::Relaxed),
             kernel_object: self.kinds[MemoryKind::KernelObject as usize].load(Ordering::Relaxed),
@@ -547,6 +552,7 @@ impl MemoryCharge {
             .ok_or_else(|| ChargeFailure {
                 account: target.account.clone(),
                 reason: ChargeFailureReason::CounterOverflow,
+                #[cfg(test)]
                 request_kind: MemoryKind::Sock,
                 requested_pages: added,
             })?;
@@ -615,6 +621,7 @@ impl MemoryCharge {
                     return Err(ChargeFailure {
                         account: node.clone(),
                         reason,
+                        #[cfg(test)]
                         request_kind: MemoryKind::Sock,
                         requested_pages: amount,
                     });
@@ -726,11 +733,13 @@ impl MemoryCharge {
     /// would double-count or spuriously fail a newly lowered limit. Ordinary
     /// data pages and socket accounting retain their separate lifetime rules.
     pub fn reparent_to_ancestor(&mut self, target: &Arc<MemoryAccount>) -> Result<(), SystemError> {
-        if !matches!(
-            self.kind,
-            MemoryKind::KernelStack | MemoryKind::PageTables | MemoryKind::KernelObject
-        ) || !self.account.is_descendant_of(target)
-        {
+        let can_reparent = match self.kind {
+            #[cfg(test)]
+            MemoryKind::KernelStack => true,
+            MemoryKind::PageTables | MemoryKind::KernelObject => true,
+            _ => false,
+        };
+        if !can_reparent || !self.account.is_descendant_of(target) {
             return Err(SystemError::EINVAL);
         }
         if Arc::ptr_eq(&self.account, target) {

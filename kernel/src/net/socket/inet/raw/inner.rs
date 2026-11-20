@@ -132,27 +132,6 @@ impl BoundRaw {
         }
     }
 
-    /// 尝试发送数据包
-    pub fn try_send(&self, buf: &[u8], to: Option<IpAddress>) -> Result<usize, SystemError> {
-        let dest_addr = to.or(self.remote_addr());
-
-        // 对于 raw socket，目标地址可以从数据包中获取
-        // 如果没有指定目标地址且没有连接的远程地址，
-        // smoltcp 会尝试从数据包的 IP 头中获取目标地址
-        let _ = dest_addr; // 目前 smoltcp raw socket 不需要显式指定目标地址
-
-        self.with_mut_socket(|socket| {
-            if socket.can_send() {
-                match socket.send_slice(buf) {
-                    Ok(()) => Ok(buf.len()),
-                    Err(_) => Err(SystemError::ENOBUFS),
-                }
-            } else {
-                Err(SystemError::ENOBUFS)
-            }
-        })
-    }
-
     pub fn inner(&self) -> &BoundInner {
         &self.inner
     }

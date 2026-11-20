@@ -23,7 +23,7 @@ use crate::{
 };
 use alloc::{
     format,
-    string::{String, ToString},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };

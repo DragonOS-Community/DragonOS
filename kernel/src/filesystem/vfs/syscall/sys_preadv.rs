@@ -6,7 +6,6 @@ use system_error::SystemError;
 use crate::arch::syscall::nr::SYS_PREADV;
 use crate::filesystem::vfs::file::File;
 use crate::filesystem::vfs::iov::{IoVec, IoVecs};
-use crate::process::ProcessManager;
 use crate::syscall::table::{FormattedSyscallParam, Syscall};
 
 pub struct SysPreadVHandle;

@@ -3504,12 +3504,6 @@ pub struct KvmVmx {
     pid_table: Option<Arc<PhysicalBox<[u64]>>>,
 }
 
-impl KvmVmx {
-    pub fn pid_table(&self) -> &[u64] {
-        self.pid_table.as_ref().unwrap().as_ref()
-    }
-}
-
 impl VmxVCpuPriv {
     pub const PML_ENTITY_NUM: usize = 512;
 

@@ -50,6 +50,7 @@ pub enum DmaCompaction {
     #[default]
     Disabled,
     /// Recover only within this call's bounded synchronous budget.
+    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     Allowed,
     /// Also authorize one background round after a real high-order fragmented
     /// failure. This is best effort work, not an asynchronous allocation promise.
@@ -59,7 +60,12 @@ pub enum DmaCompaction {
 #[cfg(target_arch = "x86_64")]
 impl DmaCompaction {
     fn direct_allowed(self) -> bool {
-        matches!(self, Self::Allowed | Self::DirectAndBackground)
+        match self {
+            Self::Disabled => false,
+            #[cfg(feature = "mm_selftest")]
+            Self::Allowed => true,
+            Self::DirectAndBackground => true,
+        }
     }
 }
 
@@ -107,10 +113,6 @@ unsafe impl Send for DmaBuffer {}
 unsafe impl Sync for DmaBuffer {}
 
 impl DmaBuffer {
-    pub fn alloc_bytes(size: usize, options: DmaAllocOptions) -> Self {
-        Self::try_alloc_bytes(size, options).expect("dma alloc bytes failed")
-    }
-
     /// Allocate a physically contiguous DMA buffer without turning memory
     /// pressure or invalid sizing into a kernel panic.
     pub fn try_alloc_bytes(size: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
@@ -152,10 +154,6 @@ impl DmaBuffer {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.vaddr.as_ptr(), self.len) }
-    }
-
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.as_slice().to_vec()
     }
 }
 

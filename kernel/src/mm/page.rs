@@ -193,7 +193,7 @@ impl Drop for PendingPageFrames<'_> {
 #[derive(Debug)]
 struct ContiguousFrameOwner {
     // Field order is significant: free the physical run before uncharging.
-    frames: RawFrameExtent,
+    _frames: RawFrameExtent,
     memory_charge: Option<MemoryCharge>,
 }
 
@@ -240,6 +240,7 @@ pub fn allocate_registered_intrinsic_unevictable_pages_exact(
     allocate_registered_intrinsic_unevictable_pages_exact_inner(requested, None)
 }
 
+#[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
 /// Consume a reservation made before taking any page/cache publication locks.
 /// The entire exact run stays charged until its last physical owner disappears.
 pub(crate) fn allocate_charged_intrinsic_unevictable_pages_exact(
@@ -315,7 +316,7 @@ fn allocate_registered_intrinsic_unevictable_pages_exact_inner(
     }
 
     let extent_owner = Arc::try_new(ContiguousFrameOwner {
-        frames: raw,
+        _frames: raw,
         memory_charge: charge,
     })
     .map_err(|_| SystemError::ENOMEM)?;
@@ -779,7 +780,7 @@ pub(crate) fn compaction_candidate(
     min: PhysAddr,
     max: PhysAddr,
 ) -> Result<Option<PhysAddr>, SystemError> {
-    let mut manager = try_page_manager_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
+    let manager = try_page_manager_lock().ok_or(SystemError::EAGAIN_OR_EWOULDBLOCK)?;
     let table = manager.phys2page.raw_table();
     let buckets = table.buckets();
     if buckets == 0 {
@@ -948,23 +949,6 @@ impl PageManager {
         self.create_pages_inner(page_type, flags, allocator, count, None)
     }
 
-    /// Charge reservation is supplied by the caller. No reclaim or policy
-    /// wait is permitted under the manager lock.
-    pub(crate) fn create_charged_pages(
-        &mut self,
-        page_type: PageType,
-        flags: PageFlags,
-        allocator: &mut dyn FrameAllocator,
-        count: PageFrameCount,
-        kind: MemoryKind,
-        charge: MemoryCharge,
-    ) -> Result<(PhysAddr, Vec<Arc<Page>>), SystemError> {
-        if charge.kind() != kind || !page_type.accepts_memory_kind(kind) {
-            return Err(SystemError::EINVAL);
-        }
-        self.create_pages_inner(page_type, flags, allocator, count, Some(charge))
-    }
-
     fn create_pages_inner(
         &mut self,
         page_type: PageType,
@@ -1050,43 +1034,12 @@ impl PageManager {
         }
     }
 
-    /// # 拷贝管理器中原有页面并加入管理器，同时拷贝原页面内容
-    ///
-    /// ## 参数
-    ///
-    /// - `old_phys`: 原页面的物理地址
-    /// - `allocator`: 物理页帧分配器
-    ///
-    /// ## 返回值
-    ///
-    /// - `Ok(Arc<Page>)`: 新页面
-    /// - `Err(SystemError)`: 错误码
-    pub fn copy_page(
-        &mut self,
-        old_phys: &PhysAddr,
-        allocator: &mut dyn FrameAllocator,
-    ) -> Result<Arc<Page>, SystemError> {
-        self.copy_page_with_type(old_phys, allocator, None, None)
-    }
-
     pub fn copy_page_as_normal(
         &mut self,
         old_phys: &PhysAddr,
         allocator: &mut dyn FrameAllocator,
     ) -> Result<Arc<Page>, SystemError> {
         self.copy_page_with_type(old_phys, allocator, Some(PageType::Normal), None)
-    }
-
-    pub(crate) fn copy_charged_page_as_normal(
-        &mut self,
-        old_phys: &PhysAddr,
-        allocator: &mut dyn FrameAllocator,
-        charge: MemoryCharge,
-    ) -> Result<Arc<Page>, SystemError> {
-        if charge.pages() != 1 || charge.kind() != MemoryKind::Anon {
-            return Err(SystemError::EINVAL);
-        }
-        self.copy_page_with_type(old_phys, allocator, Some(PageType::Normal), Some(charge))
     }
 
     fn copy_page_with_type(
@@ -2299,7 +2252,7 @@ pub struct InnerPage {
 }
 
 impl InnerPage {
-    pub fn new(
+    fn new(
         phys_addr: PhysAddr,
         page_type: PageType,
         flags: PageFlags,

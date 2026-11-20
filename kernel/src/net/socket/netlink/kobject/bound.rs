@@ -98,14 +98,6 @@ impl datagram_common::Bound for BoundNetlink<NetlinkKobjectUeventProtocol> {
         send_userspace(buf, *to, self.netns(), true, None)
     }
 
-    fn try_recv(
-        &self,
-        writer: &mut [u8],
-        flags: PMSG,
-    ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
-        self.try_recv_common(writer, flags)
-    }
-
     fn check_io_events(&self) -> EPollEventType {
         self.check_io_events_common()
     }

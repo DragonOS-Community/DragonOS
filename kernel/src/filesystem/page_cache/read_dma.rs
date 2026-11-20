@@ -380,7 +380,7 @@ impl PageCacheManager {
         .map_err(PageCache::legacy_allocation_error)
     }
 
-    pub fn try_reserve_read_dma(
+    pub(crate) fn try_reserve_read_dma(
         &self,
         start_page_index: usize,
         page_count: usize,

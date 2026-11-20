@@ -5,9 +5,11 @@
 //! never sleeps and never invokes callbacks while holding its state lock.
 //! It must only be selected after *all* runtime metadata access uses this view.
 
+#[cfg(test)]
+use super::journal_transaction::JournalContext;
 use super::journal_transaction::{
-    CachePublisher, CommitError, JournalContext, JournalTransactionCore, MetadataBlockSource,
-    StagedBlock, Transaction, TransactionCoreRef,
+    CachePublisher, CommitError, JournalTransactionCore, MetadataBlockSource, StagedBlock,
+    Transaction, TransactionCoreRef,
 };
 use super::MetadataMutationWaker;
 use crate::constants::BLOCK_SIZE;
@@ -155,6 +157,7 @@ pub struct JournalBatchCore {
 }
 
 impl JournalBatchCore {
+    #[cfg(test)]
     /// `block_budget` bounds each live image set and each private operation.
     /// The effective limit is additionally constrained by descriptor/tag space
     /// and the journal ring, using the same calculation as the disk encoder.
@@ -489,10 +492,12 @@ impl JournalBatchCore {
         pending
     }
 
+    #[cfg(test)]
     pub fn block_range_reusable(&self, start: PBlockId, count: u64) -> Result<bool> {
         Ok(self.resource_reusable(RetiredRange::blocks(start, count)?))
     }
 
+    #[cfg(test)]
     pub fn inode_reusable(&self, id: InodeId) -> bool {
         self.resource_reusable(RetiredRange::inode(id))
     }
@@ -528,6 +533,7 @@ impl JournalBatchCore {
         self.wake();
     }
 
+    #[cfg(test)]
     /// Execute at most one requested batch. None means no work is ready; the
     /// mount waits for generation/deadline changes rather than busy polling.
     /// A returned disk error is always post-publication, regardless of its

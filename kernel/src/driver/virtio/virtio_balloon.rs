@@ -696,7 +696,7 @@ fn initialize(mut transport: VirtIOTransport, dev_id: Arc<DeviceId>) -> Result<(
         .unwrap_or((None, None));
     let dedicated_irq = irq_lease.is_some();
     let transport = Arc::new(BalloonTransport(SpinLock::new(transport)));
-    let mut device = Device {
+    let device = Device {
         transport: transport.clone(),
         features,
         inflate,

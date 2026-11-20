@@ -151,6 +151,7 @@ impl<T, const LIMIT: usize> PagedVec<T, LIMIT> {
         unsafe { core::ptr::swap(first, second) };
     }
 
+    #[cfg(any(test, feature = "mm_selftest"))]
     pub(crate) fn swap_remove(&mut self, index: usize) -> T {
         assert!(index < self.len);
         self.swap(index, self.len - 1);
@@ -201,6 +202,7 @@ impl<T, const LIMIT: usize> PagedVec<T, LIMIT> {
         (0..self.len).map(|index| &self[index])
     }
 
+    #[cfg(test)]
     pub(crate) fn last(&self) -> Option<&T> {
         self.len.checked_sub(1).map(|index| &self[index])
     }

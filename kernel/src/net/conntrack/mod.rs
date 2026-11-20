@@ -578,10 +578,12 @@ impl CtFlow {
     pub(crate) fn translated(&self) -> CtTuple {
         self.translated
     }
+    #[cfg(test)]
     pub(crate) fn reply(&self) -> CtTuple {
         self.reply
     }
 
+    #[cfg(test)]
     pub(crate) fn masquerade_ifindex(&self) -> Option<u32> {
         self.masquerade_ifindex
     }
@@ -640,9 +642,11 @@ impl CtCandidate {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn original(&self) -> CtTuple {
         self.original
     }
+    #[cfg(test)]
     pub(crate) fn translated(&self) -> CtTuple {
         self.translated
     }
@@ -896,6 +900,7 @@ impl CtPacketContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_candidate(self) -> Option<CtCandidate> {
         match self {
             Self::Candidate(candidate) => Some(candidate),

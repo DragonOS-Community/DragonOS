@@ -1670,31 +1670,6 @@ impl FATFileSystem {
             as usize;
     }
 
-    /// @brief 获取每个扇区占用多少个LBA
-    #[inline]
-    pub fn lba_per_sector(&self) -> usize {
-        return self.bpb.bytes_per_sector as usize / LBA_SIZE;
-    }
-
-    /// @brief 将分区内字节偏移量转换为扇区偏移量
-    #[inline]
-    pub fn bytes_to_sector(&self, in_partition_bytes_offset: u64) -> u64 {
-        return in_partition_bytes_offset / (self.bpb.bytes_per_sector as u64);
-    }
-
-    /// @brief 根据字节偏移量计算在逻辑块内的字节偏移量
-    #[inline]
-    pub fn get_in_block_offset(&self, bytes_offset: u64) -> u64 {
-        return bytes_offset % LBA_SIZE as u64;
-    }
-
-    /// @brief 获取在FAT表中，以start_cluster开头的FAT链的所有簇的信息
-    ///
-    /// @param start_cluster 整个FAT链的起始簇号
-    pub fn clusters(&self, start_cluster: Cluster) -> Vec<Cluster> {
-        return self.cluster_iter(start_cluster).collect();
-    }
-
     /// @brief 获取在FAT表中，以start_cluster开头的FAT链的长度（总计经过多少个簇）
     ///
     /// @param start_cluster 整个FAT链的起始簇号
@@ -2918,7 +2893,7 @@ impl IndexNode for LockedFATInode {
             FATDirEntry::Dir(dir) => dir,
             _ => return Err(SystemError::ENOTDIR.into()),
         };
-        dir.check_existence(name, Some(false), fs.clone())?;
+        dir.find_entry(name, Some(false), None, fs.clone())?;
         let removed = target.remove_file_name(dir, fs, name);
         let detached = {
             let mut victim = target.0.lock();

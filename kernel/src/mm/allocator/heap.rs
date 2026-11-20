@@ -22,6 +22,15 @@ pub(crate) enum AllocationCharge {
     Socket(SockCharge),
 }
 
+impl AllocationCharge {
+    pub(in crate::mm) fn release(self) {
+        match self {
+            Self::Object(charge) => drop(charge),
+            Self::Socket(charge) => drop(charge),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeapPlan {
     Physical,
@@ -267,7 +276,9 @@ pub(crate) unsafe fn drop_storage_with_charge<T>(
     }
     let _ = (pointer, layout);
     drop(storage);
-    drop(charge);
+    if let Some(charge) = charge {
+        charge.release();
+    }
 }
 
 pub(crate) fn drop_box<T: ?Sized>(storage: Box<T>, charge: Option<AllocationCharge>) {

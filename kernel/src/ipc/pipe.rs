@@ -773,21 +773,6 @@ impl PipeRuntime {
         Arc::try_new(Self { data }).map_err(|_| SystemError::ENOMEM.into())
     }
 
-    /// 标记此管道为命名管道（FIFO）
-    /// 只有 FIFO 才需要在 open 时阻塞等待另一端
-    pub fn set_fifo(&self) {
-        self.inner.lock().is_fifo = true;
-    }
-
-    /// 检查是否为命名管道（FIFO）
-    pub fn is_fifo(&self) -> bool {
-        self.inner.lock().is_fifo
-    }
-
-    pub fn inner(&self) -> &SpinLock<InnerPipeInode> {
-        &self.inner
-    }
-
     fn readable(&self) -> bool {
         let inode = self.inner.lock();
         !inode.read_reserved() && (inode.has_slots() || inode.writer == 0)
@@ -978,21 +963,6 @@ impl PipeRuntime {
         Ok(())
     }
 
-    /// 当前管道中可读的字节数（不阻塞、不睡眠）
-    pub fn readable_len(&self) -> usize {
-        let guard = self.inner.lock();
-        if guard.read_reserved() {
-            return 0;
-        }
-        guard.valid_cnt.max(0) as usize
-    }
-
-    /// Free logical-slot byte capacity, excluding possible tail merges.
-    pub fn writable_len(&self) -> usize {
-        let guard = self.inner.lock();
-        guard.writable_bytes()
-    }
-
     fn write_bytes(inner_guard: &mut InnerPipeInode, buf: &[u8], to_write: usize) {
         let buf_size = inner_guard.buf_size;
         let start = inner_guard.write_pos as usize;
@@ -1151,50 +1121,6 @@ impl PipeRuntime {
             return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
         }
         Ok(wanted.map_or(space, |len| len.min(space)))
-    }
-
-    /// 从管道中“窥视”最多 `len` 字节数据到 `buf`，但不消耗管道数据。
-    ///
-    /// 返回实际拷贝的字节数（可能小于 `len`）。不会睡眠。
-    pub fn peek_into(&self, len: usize, buf: &mut [u8]) -> usize {
-        self.peek_into_from(0, len, buf)
-    }
-
-    /// 从管道中“窥视”从当前 read_pos 起偏移 `skip` 字节后的内容（不消耗）。
-    ///
-    /// `skip` 必须小于等于当前可读字节数（否则返回 0）。不会睡眠。
-    pub fn peek_into_from(&self, skip: usize, len: usize, buf: &mut [u8]) -> usize {
-        if len == 0 {
-            return 0;
-        }
-        let guard = self.inner.lock();
-        if guard.valid_cnt <= 0 {
-            return 0;
-        }
-        if guard.data.is_empty() {
-            return 0;
-        }
-
-        let available = guard.valid_cnt as usize;
-        if skip > available {
-            return 0;
-        }
-        if skip == available {
-            return 0;
-        }
-
-        let available = available - skip;
-        let num = core::cmp::min(len, available).min(buf.len());
-        let buf_size = guard.buf_size;
-        let start = (guard.read_pos as usize + skip) % buf_size;
-
-        let first = core::cmp::min(num, buf_size - start);
-        let second = num.saturating_sub(first);
-        buf[0..first].copy_from_slice(&guard.data[start..start + first]);
-        if second > 0 {
-            buf[first..num].copy_from_slice(&guard.data[0..second]);
-        }
-        num
     }
 
     pub(crate) fn splice_peek_hold_from_blocking(
@@ -1514,20 +1440,6 @@ impl PipeRuntime {
                 }
             }
         }
-    }
-
-    /// 是否存在写端（用于判断空管道时返回 EOF 还是 EAGAIN）
-    pub fn has_buffered_slots(&self) -> bool {
-        self.inner.lock().has_slots()
-    }
-
-    pub fn has_writers(&self) -> bool {
-        self.inner.lock().writer > 0
-    }
-
-    /// 是否存在读端（用于判断满管道时返回 EPIPE 还是 EAGAIN）
-    pub fn has_readers(&self) -> bool {
-        self.inner.lock().reader > 0
     }
 }
 

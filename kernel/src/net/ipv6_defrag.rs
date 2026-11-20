@@ -119,7 +119,19 @@ pub(crate) enum ReassemblyResult<M> {
     Pending,
     Duplicate,
     Complete(ReassembledIpv6<M>),
-    Rejected(ReassemblyError),
+    Rejected {
+        #[cfg(test)]
+        reason: ReassemblyError,
+    },
+}
+
+impl<M> ReassemblyResult<M> {
+    fn rejected(_reason: ReassemblyError) -> Self {
+        Self::Rejected {
+            #[cfg(test)]
+            reason: _reason,
+        }
+    }
 }
 
 /// Caller-owned and caller-serialized; no FIB, device, socket or rule locks
@@ -339,7 +351,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         let parsed = match Parsed::parse(bytes, domain) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => return ReassemblyResult::NotFragment,
-            Err(error) => return ReassemblyResult::Rejected(error),
+            Err(error) => return ReassemblyResult::rejected(error),
         };
         // Once the fragment key is known, malformed data must not leave a
         // partially received datagram alive under that same key.
@@ -348,14 +360,14 @@ impl<M: Clone> Ipv6Defragmenter<M> {
             if let Some(index) = existing {
                 self.remove(index);
             }
-            return ReassemblyResult::Rejected(ReassemblyError::Malformed);
+            return ReassemblyResult::rejected(ReassemblyError::Malformed);
         }
         if parsed.offset == 0 && !parsed.more {
             // Atomic fragments do not create or join a queue. Removing the
             // Fragment Header is still required for downstream matching.
             return match assemble_atomic(&parsed, origin) {
                 Ok(packet) => ReassemblyResult::Complete(packet),
-                Err(error) => ReassemblyResult::Rejected(error),
+                Err(error) => ReassemblyResult::rejected(error),
             };
         }
 
@@ -371,10 +383,10 @@ impl<M: Clone> Ipv6Defragmenter<M> {
                 self.charged_bytes += self.queues.allocated_bytes() - old_storage;
                 self.evict_until_room(None, 0);
                 if reserve.is_err() {
-                    return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+                    return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
                 }
                 if self.charged_bytes > MAX_STORED_BYTES {
-                    return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
+                    return ReassemblyResult::rejected(ReassemblyError::ResourceLimit);
                 }
                 self.queues.push(Queue {
                     key: parsed.key,
@@ -404,7 +416,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
                     || queue.final_end.is_some_and(|final_end| final_end != end)))
         {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::InconsistentLength);
+            return ReassemblyResult::rejected(ReassemblyError::InconsistentLength);
         }
         // Linux records the final datagram length before classifying a
         // duplicate range. Such a duplicate does not complete reassembly,
@@ -436,18 +448,18 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         }
         if overlaps {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::Overlap);
+            return ReassemblyResult::rejected(ReassemblyError::Overlap);
         }
         if queue.fragments.len() >= MAX_FRAGMENTS_PER_QUEUE {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
+            return ReassemblyResult::rejected(ReassemblyError::ResourceLimit);
         }
 
         let mut first_prefix = if parsed.offset == 0 {
             let mut prefix = PacketBuffer::new();
             if prefix.try_reserve_exact(parsed.prefix.len()).is_err() {
                 self.remove(index);
-                return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+                return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
             }
             prefix
                 .extend_from_slice(parsed.prefix)
@@ -459,7 +471,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         let mut payload = PacketBuffer::new();
         if payload.try_reserve_exact(parsed.payload.len()).is_err() {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+            return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
         }
         payload
             .extend_from_slice(parsed.payload)
@@ -467,7 +479,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         let old_capacity = self.queues[index].fragments.allocated_bytes();
         if self.queues[index].fragments.try_reserve(1).is_err() {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+            return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
         }
         let charge = payload
             .capacity()
@@ -476,7 +488,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         self.evict_until_room(Some(&mut index), charge);
         if self.charged_bytes.saturating_add(charge) > MAX_STORED_BYTES {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
+            return ReassemblyResult::rejected(ReassemblyError::ResourceLimit);
         }
         let queue = &mut self.queues[index];
         queue.charged_bytes += charge;
@@ -514,7 +526,7 @@ impl<M: Clone> Ipv6Defragmenter<M> {
         let queue = self.remove(index);
         match assemble(queue, origin) {
             Ok(packet) => ReassemblyResult::Complete(packet),
-            Err(error) => ReassemblyResult::Rejected(error),
+            Err(error) => ReassemblyResult::rejected(error),
         }
     }
 
@@ -789,7 +801,9 @@ mod tests {
         ));
         assert!(matches!(
             defrag.submit(&overlap, DOMAIN, 3, 2),
-            ReassemblyResult::Rejected(ReassemblyError::Overlap)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::Overlap
+            }
         ));
         assert_eq!(defrag.charged_bytes, 0);
     }
@@ -846,7 +860,9 @@ mod tests {
         let bad = fragment(5, 0, true, b"123456789", 0, false);
         assert!(matches!(
             defrag.submit(&bad, DOMAIN, 1, 0),
-            ReassemblyResult::Rejected(ReassemblyError::Malformed)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::Malformed
+            }
         ));
         let first = fragment(5, 0, true, b"abcdefgh", 0, false);
         assert!(matches!(
@@ -855,7 +871,9 @@ mod tests {
         ));
         assert!(matches!(
             defrag.submit(&bad, DOMAIN, 1, 2),
-            ReassemblyResult::Rejected(ReassemblyError::Malformed)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::Malformed
+            }
         ));
         assert_eq!(defrag.queues.len(), 0);
         let last = fragment(5, 8, false, b"ijklmnop", 3, false);
@@ -865,7 +883,9 @@ mod tests {
         ));
         assert!(matches!(
             defrag.submit(&last, DOMAIN, 1, 4),
-            ReassemblyResult::Rejected(ReassemblyError::InconsistentEcn)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::InconsistentEcn
+            }
         ));
         assert_eq!(defrag.queues.len(), 0);
         let first = fragment(6, 0, true, b"abcdefgh", 2, false);
@@ -939,7 +959,9 @@ mod tests {
         ));
         assert!(matches!(
             defrag.submit(&conflicting, DOMAIN, 1, 2),
-            ReassemblyResult::Rejected(ReassemblyError::InconsistentLength)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::InconsistentLength
+            }
         ));
         assert_eq!(defrag.charged_bytes, 0);
     }

@@ -20,7 +20,6 @@ use crate::{
             table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
         },
         utils::datagram_common,
-        PMSG,
     },
     process::{namespace::net_namespace::NetNamespace, ProcessManager},
 };
@@ -212,14 +211,6 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
         }
 
         Ok(sum_lens)
-    }
-
-    fn try_recv(
-        &self,
-        writer: &mut [u8],
-        flags: crate::net::socket::PMSG,
-    ) -> Result<(usize, usize, Self::Endpoint), SystemError> {
-        self.try_recv_common(writer, flags)
     }
 
     fn check_io_events(&self) -> EPollEventType {

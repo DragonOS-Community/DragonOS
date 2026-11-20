@@ -11,7 +11,7 @@ use crate::process::cred::CAPFlags;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::ProcessManager;
 
-use super::super::common::registration::{IfaceSocketReturn, PreparedIfaceSocket};
+use super::super::common::registration::{PreparedIfaceSocket, RetiredIfaceSocket};
 use super::constants::ICMPV6_CHECKSUM_OFFSET;
 use super::inner::{RawInner, UnboundRaw};
 use super::loopback::{register_raw_socket, unregister_raw_socket};
@@ -111,7 +111,7 @@ impl RawSocket {
         let inode_id = generate_inode_id();
         sock.data.init(
             body.init(RawSocketData {
-                memory,
+                _memory: memory,
                 inner: crate::libs::rwsem::RwSem::new(Some(RawInner::Unbound(unbound))),
                 addresses: crate::libs::rwsem::RwSem::new(super::RawAddresses {
                     local: None,
@@ -267,11 +267,6 @@ impl RawSocket {
             (IpVersion::Ipv4, smoltcp::wire::IpAddress::Ipv4(_))
                 | (IpVersion::Ipv6, smoltcp::wire::IpAddress::Ipv6(_))
         )
-    }
-
-    /// 绑定到本地地址
-    pub fn do_bind(&self, local_addr: smoltcp::wire::IpAddress) -> Result<(), SystemError> {
-        self.do_bind_scoped(smoltcp::wire::IpEndpoint::new(local_addr, 0).into())
     }
 
     pub(super) fn do_bind_scoped(
@@ -493,7 +488,7 @@ impl RawSocket {
         prepared: &mut PreparedIfaceSocket,
         local: IpAddress,
         allow_bound: bool,
-        retired: &mut Option<IfaceSocketReturn>,
+        retired: &mut Option<RetiredIfaceSocket>,
     ) -> Result<(), SystemError> {
         match inner.as_mut().ok_or(SystemError::EINVAL)? {
             RawInner::Bound(bound) => {
@@ -551,32 +546,37 @@ impl RawSocket {
         if let Some(me) = self.self_ref.upgrade() {
             unregister_raw_socket(&me);
         }
-        let mut retired = None;
-        let mut inner = self.inner.write();
-        match &mut *inner {
-            Some(RawInner::Bound(bound)) => {
-                retired = Some(
-                    bound
-                        .inner()
-                        .retire_notification(self.self_ref.upgrade().unwrap()),
-                );
-                bound.close();
-                inner.take();
+        let retired;
+        {
+            let mut inner = self.inner.write();
+            match &mut *inner {
+                Some(RawInner::Bound(bound)) => {
+                    retired = Some(
+                        bound
+                            .inner()
+                            .retire_notification(self.self_ref.upgrade().unwrap()),
+                    );
+                    bound.close();
+                    inner.take();
+                }
+                Some(RawInner::Wildcard(bound)) => {
+                    retired = Some(
+                        bound
+                            .inner()
+                            .retire_notification(self.self_ref.upgrade().unwrap()),
+                    );
+                    bound.close();
+                    inner.take();
+                }
+                Some(RawInner::Unbound(_)) => {
+                    retired = None;
+                    inner.take();
+                }
+                None => retired = None,
             }
-            Some(RawInner::Wildcard(bound)) => {
-                retired = Some(
-                    bound
-                        .inner()
-                        .retire_notification(self.self_ref.upgrade().unwrap()),
-                );
-                bound.close();
-                inner.take();
-            }
-            Some(RawInner::Unbound(_)) => {
-                inner.take();
-            }
-            None => {}
         }
+        // The retired registry and socket are released after the inner lock.
+        drop(retired);
     }
 
     #[allow(dead_code)]

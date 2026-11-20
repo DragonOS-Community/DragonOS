@@ -96,7 +96,6 @@ pub const PTRACE_EVENTMSG_SYSCALL_EXIT: usize = 2;
 // The ptrace tracer (gdb) distinguishes single-step / hardware breakpoint / software breakpoint via si_code.
 pub const TRAP_BRKPT: i32 = 1; // software breakpoint (int3)
 pub const TRAP_TRACE: i32 = 2; // single-step (RFLAGS.TF)
-pub const SI_KERNEL: i32 = 0x80;
 /// DragonOS-v does not implement BTS (branch tracing) yet; kept for future use.
 #[allow(dead_code)]
 pub const TRAP_BRANCH: i32 = 3; // branch trap (BTS)

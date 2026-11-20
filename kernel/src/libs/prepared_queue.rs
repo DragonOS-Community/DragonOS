@@ -83,6 +83,7 @@ impl<T> Queue<T> {
         self.head.as_ref().map(|n| &n.value)
     }
 
+    #[cfg(test)]
     pub(crate) fn front_mut(&mut self) -> Option<&mut T> {
         self.head.as_mut().map(|node| &mut node.value)
     }

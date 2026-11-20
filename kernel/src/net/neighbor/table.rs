@@ -57,20 +57,6 @@ pub(super) struct PreparedNeighborPurge {
 }
 
 impl NeighborSnapshot {
-    pub(crate) fn empty() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &NeighborEntry> {
-        self.entries.iter()
-    }
-
     pub(crate) fn contains(&self, ifindex: u32, destination: IpAddress) -> bool {
         find(&self.entries, ifindex, destination).is_ok()
     }

@@ -106,7 +106,7 @@ fn pattern(index: usize, dirty: bool) -> u8 {
     }
 }
 
-fn migrate_cached(cache: &Arc<PageCache>) -> Result<MigrationResult, MigrationError> {
+fn migrate_cached(cache: &Arc<PageCache>) -> Result<(), MigrationError> {
     for _ in 0..128 {
         match super::super::migrate_cached_page(cache, 0) {
             Err(MigrationError::Busy) => crate::sched::sched_yield(),

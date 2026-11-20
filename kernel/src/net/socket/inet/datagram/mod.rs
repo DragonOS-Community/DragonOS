@@ -1,4 +1,4 @@
-use inner::{BoundUdp, UdpBindContext, UdpInner, UnboundUdp};
+use inner::{UdpBindContext, UdpInner, UnboundUdp};
 use smoltcp;
 use smoltcp::wire::IpAddress;
 use system_error::SystemError;
@@ -347,30 +347,33 @@ impl UdpSocket {
                 Some(target) => Some(self.prepare_iface_socket(target.clone())?),
                 None => None,
             };
-            let mut retired = None;
-            let mut update = self.device_binding.prepare_update(&self.netns, value)?;
-            let _placement = self.iface_placement.write();
-            let current = self.device_placement_target(&update)?;
-            if !match (&target, &current) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            } {
-                continue;
-            }
-            let mut inner = self.inner.write();
-            if let Some(UdpInner::Bound(bound)) = inner.as_mut() {
-                if let Some(prepared) = prepared.as_mut() {
-                    retired =
-                        prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?;
+            let retired;
+            {
+                let mut update = self.device_binding.prepare_update(&self.netns, value)?;
+                let _placement = self.iface_placement.write();
+                let current = self.device_placement_target(&update)?;
+                if !match (&target, &current) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                } {
+                    continue;
                 }
-            } else if inner.is_none() {
-                return Err(SystemError::EBADF);
+                let mut inner = self.inner.write();
+                retired = match (inner.as_mut(), prepared.as_mut()) {
+                    (Some(UdpInner::Bound(bound)), Some(prepared)) => {
+                        prepared.move_bound(bound.inner_mut(), self.self_ref.upgrade().unwrap())?
+                    }
+                    (None, _) => return Err(SystemError::EBADF),
+                    _ => None,
+                };
+                update.commit();
+                if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
+                    bound.update_receive_filter(self.bound_device_ifindex());
+                }
             }
-            update.commit();
-            if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
-                bound.update_receive_filter(self.bound_device_ifindex());
-            }
+            // Cancel the old vacancies after releasing placement and inner.
+            drop(retired);
             return Ok(());
         }
     }
@@ -420,28 +423,6 @@ impl UdpSocket {
             IpVersion::Ipv4 => smoltcp::wire::IpAddress::v4(0, 0, 0, 0),
             IpVersion::Ipv6 => smoltcp::wire::IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 0),
         }
-    }
-
-    /// A netdevice move retires its old SocketSet. A live socket remains in
-    /// its source namespace, so any later operation that needs a polled
-    /// SocketSet chooses an interface still owned by that namespace.
-    fn active_owner_for_bound(&self, bound: &BoundUdp) -> Result<Arc<dyn Iface>, SystemError> {
-        let old = bound.inner().iface();
-        if old
-            .net_namespace()
-            .is_some_and(|owner| Arc::ptr_eq(&owner, &self.netns))
-        {
-            return Ok(old.clone());
-        }
-        let local = bound.endpoint().addr;
-        local
-            .filter(|addr| !addr.is_unspecified())
-            .and_then(|addr| {
-                crate::net::socket::inet::common::get_iface_for_local_bind(&addr, &self.netns)
-            })
-            .or_else(|| self.netns.default_iface())
-            .or_else(|| self.netns.loopback_iface().map(|lo| lo as Arc<dyn Iface>))
-            .ok_or(SystemError::ENODEV)
     }
 
     fn prepare_iface_socket(
@@ -733,14 +714,6 @@ impl UdpSocket {
         }
     }
 
-    pub fn is_bound(&self) -> bool {
-        let inner = self.inner.read();
-        if let Some(UdpInner::Bound(_)) = &*inner {
-            return true;
-        }
-        return false;
-    }
-
     /// Replace only the selected physical ring. Binding, peer and queued
     /// datagrams stay on the same protocol instance throughout the operation.
     fn resize_buffer(&self, receive: bool, size: usize) -> Result<(), SystemError> {
@@ -853,71 +826,81 @@ impl UdpSocket {
     }
 
     pub fn close(&self) {
-        let mut retired_binding = None;
-        let _placement = self.iface_placement.write();
-        self.receive_queue.close();
-        self.drop_ipv6_memberships();
-        multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
-        crate::net::socket::inet::common::multicast::drop_ipv4_memberships(
-            &self.netns,
-            &self.ip_multicast_groups,
-        );
+        let retired_binding;
         {
-            let mut errors = self.errqueue.lock();
-            errors.0 = 0;
-            errors.1.clear();
-        }
-        let mut inner = self.inner.write();
-        if let Some(UdpInner::Bound(bound)) = &mut *inner {
-            self.netns
-                .udp_bindings()
-                .unbind(bound.endpoint().port, self.bind_id());
-            retired_binding = Some(
-                bound
-                    .inner()
-                    .retire_notification(self.self_ref.upgrade().unwrap()),
+            let _placement = self.iface_placement.write();
+            self.receive_queue.close();
+            self.drop_ipv6_memberships();
+            multicast_loopback::multicast_registry().unregister_all(&self.self_ref);
+            crate::net::socket::inet::common::multicast::drop_ipv4_memberships(
+                &self.netns,
+                &self.ip_multicast_groups,
             );
-            bound.close();
-            inner.take();
+            {
+                let mut errors = self.errqueue.lock();
+                errors.0 = 0;
+                errors.1.clear();
+            }
+            let mut inner = self.inner.write();
+            if let Some(UdpInner::Bound(bound)) = &mut *inner {
+                self.netns
+                    .udp_bindings()
+                    .unbind(bound.endpoint().port, self.bind_id());
+                retired_binding = Some(
+                    bound
+                        .inner()
+                        .retire_notification(self.self_ref.upgrade().unwrap()),
+                );
+                bound.close();
+                inner.take();
+            } else {
+                // Unbound sockets only need their memory reclaimed.
+                retired_binding = None;
+            }
         }
-        // unbound socket just drop (only need to free memory)
+        drop(retired_binding);
     }
 
     fn disconnect_udp(&self) -> Result<(), SystemError> {
-        let mut retired_binding = None;
-        let mut device_clear = self.device_binding.prepare_clear();
-        let _placement = self.iface_placement.write();
-        let mut inner_guard = self.inner.write();
-        let should_unbind = match inner_guard.as_ref() {
-            Some(UdpInner::Bound(bound)) => {
-                bound.disconnect();
-                self.receive_queue.disconnect();
-                bound.update_receive_filter(0);
-                bound.should_unbind_on_disconnect()
-            }
-            Some(UdpInner::Unbound(_)) => {
-                device_clear.commit();
-                return Ok(());
-            }
-            None => return Err(SystemError::EBADF),
-        };
-
-        if should_unbind {
-            let Some(UdpInner::Bound(bound)) = inner_guard.take() else {
-                unreachable!();
+        let retired_binding;
+        {
+            let mut device_clear = self.device_binding.prepare_clear();
+            let _placement = self.iface_placement.write();
+            let mut inner_guard = self.inner.write();
+            let should_unbind = match inner_guard.as_ref() {
+                Some(UdpInner::Bound(bound)) => {
+                    bound.disconnect();
+                    self.receive_queue.disconnect();
+                    bound.update_receive_filter(0);
+                    bound.should_unbind_on_disconnect()
+                }
+                Some(UdpInner::Unbound(_)) => {
+                    device_clear.commit();
+                    return Ok(());
+                }
+                None => return Err(SystemError::EBADF),
             };
-            self.netns
-                .udp_bindings()
-                .unbind(bound.endpoint().port, self.bind_id());
-            retired_binding = Some(
-                bound
-                    .inner()
-                    .retire_notification(self.self_ref.upgrade().unwrap()),
-            );
-            inner_guard.replace(UdpInner::Unbound(bound.into_unbound_after_disconnect()));
-            self.receive_queue.invalidate_binding();
+
+            if should_unbind {
+                let Some(UdpInner::Bound(bound)) = inner_guard.take() else {
+                    unreachable!();
+                };
+                self.netns
+                    .udp_bindings()
+                    .unbind(bound.endpoint().port, self.bind_id());
+                retired_binding = Some(
+                    bound
+                        .inner()
+                        .retire_notification(self.self_ref.upgrade().unwrap()),
+                );
+                inner_guard.replace(UdpInner::Unbound(bound.into_unbound_after_disconnect()));
+                self.receive_queue.invalidate_binding();
+            } else {
+                retired_binding = None;
+            }
+            device_clear.commit();
         }
-        device_clear.commit();
+        drop(retired_binding);
         Ok(())
     }
 
@@ -935,7 +918,7 @@ impl UdpSocket {
         ))
     }
 
-    pub(super) fn try_recv_with_meta(
+    fn try_recv_with_meta(
         &self,
         buf: &mut [u8],
         peek: bool,
@@ -1804,28 +1787,6 @@ impl UdpSocket {
         self.netns.clone()
     }
 
-    /// Inject a loopback packet into this socket's receive buffer
-    ///
-    /// Returns true if the packet was successfully injected
-    pub fn inject_loopback_packet(
-        &self,
-        generation: u64,
-        src_endpoint: IpEndpoint,
-        dst_addr: smoltcp::wire::IpAddress,
-        dst_port: u16,
-        ifindex: i32,
-        payload: &[u8],
-    ) -> bool {
-        self.inject_ingress_packet(
-            generation,
-            src_endpoint,
-            IpEndpoint::new(dst_addr, dst_port),
-            ifindex,
-            smoltcp::phy::PacketMeta::default(),
-            payload,
-        )
-    }
-
     pub(crate) fn ingress_match(
         &self,
         generation: u64,
@@ -1864,22 +1825,6 @@ impl UdpSocket {
         true
     }
 
-    /// Get the interface index this socket is bound to (for multicast send interface)
-    pub fn get_multicast_ifindex(&self) -> i32 {
-        // First check if IP_MULTICAST_IF was explicitly set
-        let ifindex = self.ip_multicast_ifindex.load(Ordering::Relaxed);
-        if ifindex != 0 {
-            return ifindex;
-        }
-
-        // Otherwise, use the interface the socket is bound to
-        let inner = self.inner.read();
-        match inner.as_ref() {
-            Some(UdpInner::Bound(bound)) => bound.inner().iface().nic_id() as i32,
-            _ => 0,
-        }
-    }
-
     pub fn has_ipv4_multicast_membership(&self, multiaddr: u32, ifindex: i32) -> bool {
         if ifindex <= 0 {
             return false;
@@ -1888,10 +1833,5 @@ impl UdpSocket {
         groups
             .iter()
             .any(|g| g.multiaddr == multiaddr && g.ifindex == ifindex)
-    }
-
-    /// Check if multicast loopback is enabled for this socket
-    pub fn is_multicast_loopback_enabled(&self) -> bool {
-        self.ip_multicast_loop.load(Ordering::Relaxed)
     }
 }

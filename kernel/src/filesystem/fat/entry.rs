@@ -1,6 +1,5 @@
 #![allow(dead_code)]
-use crate::filesystem::fat::fs::LockedFATInode;
-use crate::filesystem::vfs::{IndexNode, Metadata};
+use crate::filesystem::vfs::Metadata;
 use crate::time::PosixTimeSpec;
 use crate::{
     driver::base::block::{block_device::LBA_SIZE, SeekFrom},
@@ -704,7 +703,8 @@ impl FATDir {
         mut short_name_gen: Option<&mut ShortNameGenerator>,
         fs: Arc<FATFileSystem>,
     ) -> Result<FATDirEntry, SystemError> {
-        LongDirEntry::validate_long_name(name)?;
+        // Look up the exact component. Name creation rules apply only
+        // when choosing a name for a new directory entry.
         // 迭代当前目录下的文件/文件夹
         for e in self.to_iter(fs) {
             let e = e?;
@@ -760,8 +760,6 @@ impl FATDir {
 
         match r.unwrap() {
             FATDirEntryOrShortName::ShortName(short_name) => {
-                // 确认名称是一个可行的长文件名
-                LongDirEntry::validate_long_name(name)?;
                 // 创建目录项
                 let x: Result<FATFile, SystemError> = self
                     .create_dir_entries(
@@ -800,7 +798,6 @@ impl FATDir {
         match r.unwrap() {
             // 文件夹不存在，创建文件夹
             FATDirEntryOrShortName::ShortName(short_name) => {
-                LongDirEntry::validate_long_name(name)?;
                 // 目标目录项
                 let mut short_entry = ShortDirEntry::default();
                 let now = crate::time::timekeeping::realtime_now();
@@ -893,6 +890,7 @@ impl FATDir {
         expect_dir: Option<bool>,
         fs: Arc<FATFileSystem>,
     ) -> Result<FATDirEntryOrShortName, SystemError> {
+        LongDirEntry::validate_long_name(name)?;
         let mut sng = ShortNameGenerator::new(name);
 
         loop {
@@ -1128,7 +1126,6 @@ impl FATDir {
             return Ok(FATDirEntry::Dir(self.clone()));
         }
 
-        LongDirEntry::validate_long_name(name)?;
         return self.find_entry(name, None, None, fs);
     }
 

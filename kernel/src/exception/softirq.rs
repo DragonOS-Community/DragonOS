@@ -81,7 +81,7 @@ pub enum SoftirqNumber {
     TASKLET = 2,
     RCU = 3,
     SRCU = 4,
-    MEMORY_NOTIFY = 5,
+    MemoryNotify = 5,
 }
 
 impl From<u64> for SoftirqNumber {

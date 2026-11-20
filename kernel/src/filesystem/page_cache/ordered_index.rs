@@ -73,14 +73,6 @@ impl CacheIndex {
         visit(&self.root, None, None).0
     }
 
-    pub(super) fn first_key(&self) -> Option<usize> {
-        let mut node = self.root.as_deref()?;
-        while let Some(left) = node.left.as_deref() {
-            node = left;
-        }
-        Some(node.key)
-    }
-
     pub(super) fn contains_key(&self, key: &usize) -> bool {
         let mut node = self.root.as_deref();
         while let Some(current) = node {
@@ -102,13 +94,6 @@ impl CacheIndex {
         let (root, removed) = Self::remove_node(self.root.take(), *key);
         self.root = root;
         removed
-    }
-
-    pub(super) fn pop_first(&mut self) -> Option<OwnedBox<Node>> {
-        let root = self.root.take()?;
-        let (root, first) = Self::remove_min(root);
-        self.root = root;
-        Some(first)
     }
 
     fn insert_node(root: Option<OwnedBox<Node>>, node: OwnedBox<Node>) -> OwnedBox<Node> {

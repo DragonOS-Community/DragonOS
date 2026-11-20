@@ -149,7 +149,7 @@ impl Queue {
     /// Return displaced chain owners; caller must retire them after dropping QUEUE.
     fn register(&mut self, task: &Arc<ProcessControlBlock>, resource_key: usize) -> RetiredOwners {
         let class = QueueClass::for_key(resource_key);
-        let mut link = task.resource_wait_link.lock();
+        let link = task.resource_wait_link.lock();
         if link.registered {
             debug_assert_eq!(link.resource_key, resource_key);
             debug_assert_eq!(link.class, Some(class));

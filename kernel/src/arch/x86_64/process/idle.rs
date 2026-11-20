@@ -28,7 +28,7 @@ impl ProcessManager {
                 // idle_enter() can itself wake a local RCU worker without an
                 // IPI, so check after entering EQS as well as before it.
                 if !pcb.flags().contains(ProcessFlags::NEED_SCHEDULE) {
-                    unsafe { x86_64::instructions::interrupts::enable_and_hlt() };
+                    x86_64::instructions::interrupts::enable_and_hlt();
                     unsafe { CurrentIrqArch::interrupt_disable() };
                 }
                 crate::rcu::idle_exit(rcu_idle);

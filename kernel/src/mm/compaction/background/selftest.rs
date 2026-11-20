@@ -254,7 +254,7 @@ pub(super) fn record_proactive(result: &ProactiveResult) {
         ProactiveState::Progress { .. } => {
             PRO_INCREASED.fetch_add(1, Ordering::Relaxed);
         }
-        ProactiveState::Failed(stop) => {
+        ProactiveState::Failed { reason: stop } => {
             PRO_FAILURES.fetch_add(1, Ordering::Relaxed);
             let index = match stop {
                 Stop::Invalid => 0,
@@ -498,7 +498,7 @@ fn proactive_gates() -> bool {
     state.finish(
         second,
         &ProactiveResult {
-            state: ProactiveState::Failed(Stop::Blocked),
+            state: ProactiveState::failed(Stop::Blocked),
             used_slice: true,
         },
         next,
@@ -528,7 +528,7 @@ fn proactive_backoff_expiry() -> bool {
         state.finish(
             work,
             &ProactiveResult {
-                state: ProactiveState::Failed(Stop::Blocked),
+                state: ProactiveState::failed(Stop::Blocked),
                 used_slice: true,
             },
             now,

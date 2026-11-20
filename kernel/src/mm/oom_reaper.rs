@@ -292,13 +292,6 @@ impl OomReapQueue {
         *head = Some(job);
     }
 
-    pub(crate) fn pop(&self) -> Option<OwnedBox<OomReapJob>> {
-        let mut head = self.head.lock_irqsave();
-        let mut job = head.take()?;
-        *head = job.next.take();
-        Some(job)
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.head.lock_irqsave().is_none()
     }

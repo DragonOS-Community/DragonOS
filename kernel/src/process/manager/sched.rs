@@ -627,6 +627,7 @@ impl ProcessManager {
         Ok(())
     }
 
+    #[cfg(feature = "fifo_demo")]
     /// Set a trusted kernel thread to the SCHED_FIFO policy.
     pub fn set_fifo_policy(pcb: &Arc<ProcessControlBlock>, prio: i32) -> Result<(), SystemError> {
         if !pcb.flags().contains(ProcessFlags::KTHREAD) {
@@ -757,98 +758,6 @@ impl ProcessManager {
             enqueue_task_on_cpu(pcb, target_cpu, WakeupFlags::empty(), false);
         }
 
-        Ok(())
-    }
-
-    /// Asynchronously place the target process in the stopped state (used for
-    /// job-control stops such as SIGSTOP/SIGTSTP).
-    ///
-    /// Note: This function marks the **target process** as stopped and does not
-    /// need to be called in the target's context. It is the counterpart of
-    /// `mark_stop` (which only operates on the current process).
-    ///
-    /// In Linux, stop is synchronous: the target thread calls
-    /// set_special_state(TASK_STOPPED) + schedule() from within its own context
-    /// (get_signal() → do_signal_stop()). DragonOS uses an asynchronous approach,
-    /// so it must actively dequeue a queued task here to prevent `pick_next_task()`
-    /// from briefly running a task with state=Stopped.
-    ///
-    /// Lock ordering: pi_lock → rq_lock, consistent with wakeup() /
-    /// set_fifo_policy() serialization.
-    pub fn stop_task(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        let _guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
-
-        // Align with Linux set_special_state(TASK_STOPPED): pi_lock protects the
-        // state write and exit check, serializing with concurrent operations also
-        // protected by pi_lock in wakeup()/wakeup_stop()/do_exit().
-        //
-        // In Linux, stop is synchronous: the target thread calls
-        // set_special_state(TASK_STOPPED) + schedule() from within
-        // get_signal() → do_signal_stop().
-        // DragonOS uses an asynchronous approach (stopping the target thread from
-        // the sender's context), so it must actively dequeue and kick the remote
-        // CPU. This is an architectural difference from Linux, but the lock
-        // ordering and dequeue semantics match.
-        let pi_guard = pcb.sched_info().pi_lock_irqsave();
-        let prev_state = pcb.sched_info().state();
-        if prev_state.is_exited() {
-            return Err(SystemError::EINTR);
-        }
-        let target_cpu = pcb.sched_info().on_cpu().unwrap_or_else(current_cpu_id);
-        let update_clock = target_cpu == smp_get_processor_id();
-        let was_off_rq = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::None;
-        let contributed_to_load = prev_state.contributes_to_load();
-        let was_iowait = pcb.flags().contains(ProcessFlags::IN_IOWAIT);
-
-        if was_off_rq && (contributed_to_load || was_iowait) {
-            let prev_rq = cpu_rq(target_cpu.data() as usize);
-            let (prev_rq, _prev_rq_guard) = prev_rq.self_lock();
-            if contributed_to_load {
-                prev_rq.dec_nr_uninterruptible();
-            }
-            if was_iowait {
-                prev_rq.dec_nr_iowait();
-            }
-        }
-
-        pcb.sched_info().set_state(ProcessState::Stopped);
-        pcb.flags().insert(ProcessFlags::NEED_SCHEDULE);
-
-        let rq = cpu_rq(target_cpu.data() as usize);
-
-        // Lock ordering: pi_lock → rq_lock, consistent with wakeup().
-        let (rq, rq_guard) = rq.self_lock();
-        if update_clock {
-            rq.update_rq_clock();
-        }
-
-        let is_current = Arc::ptr_eq(&rq.current(), pcb);
-
-        if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued {
-            // Queued and not current → proactively dequeue.
-            if !is_current {
-                rq.deactivate_task(
-                    pcb.clone(),
-                    DequeueFlag::DEQUEUE_STOPPED | DequeueFlag::DEQUEUE_NOCLOCK,
-                );
-            } else if !update_clock {
-                // Current task on a remote CPU: only set state + kick; the sender
-                // does not dequeue here.
-                //
-                // Matches Linux signal_wake_up_state() + kick_process():
-                //   The sender only sets TIF_SIGPENDING / NEED_SCHEDULE and kicks;
-                //   it does not dequeue. The remote CPU's __schedule() handles
-                //   the single dequeue when it sees a non-runnable prev.
-                //
-                // The unified dequeue path in __schedule_inner plus the on_rq
-                // guard guarantee idempotency.
-                kick_cpu(target_cpu).ok();
-            }
-        }
-
-        drop(rq_guard);
-        crate::cgroup::freezer::stopped_off_cpu_locked(pcb);
-        drop(pi_guard);
         Ok(())
     }
 

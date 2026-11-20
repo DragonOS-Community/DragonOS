@@ -167,14 +167,9 @@ impl BoundInner {
             .as_ref()
             .and_then(|registry| registry.take_bound(&socket));
         registration::RetiredIfaceBinding {
-            socket: retired,
-            registry,
+            _socket: retired,
+            _registry: registry,
         }
-    }
-
-    #[inline]
-    pub fn handle(&self) -> smoltcp::iface::SocketHandle {
-        self.handle
     }
 
     pub fn release(&self) {
@@ -183,10 +178,6 @@ impl BoundInner {
 
     pub fn into_socket(self) -> smoltcp::socket::Socket<'static> {
         self.socket_set.lock().remove(self.handle)
-    }
-
-    pub fn netns(&self) -> Arc<NetNamespace> {
-        self.netns.clone()
     }
 }
 

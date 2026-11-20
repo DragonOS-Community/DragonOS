@@ -309,23 +309,6 @@ impl TcpStack {
         self.bounds.reserve(creator)
     }
 
-    pub(crate) fn publish_bound_slot(
-        &self,
-        index: usize,
-        id: u64,
-        socket: Arc<dyn InetSocket>,
-    ) -> bool {
-        self.bounds.publish(index, id, socket)
-    }
-
-    pub(crate) fn unpublish_bound_slot(&self, index: usize, id: u64) {
-        self.bounds.unpublish(index, id);
-    }
-
-    pub(crate) fn cancel_bound_slot(&self, index: usize, id: u64) {
-        self.bounds.cancel(index, id);
-    }
-
     pub fn unbind_socket(&self, socket: Arc<dyn InetSocket>) {
         self.bounds.unbind(&socket);
     }

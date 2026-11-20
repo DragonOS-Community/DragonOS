@@ -3146,6 +3146,7 @@ fn run_memcg_noio_reclaim_selftest() -> Result<bool, SystemError> {
     let overflow = MemoryAllocationError::Charge(ChargeFailure {
         account: root.clone(),
         reason: ChargeFailureReason::CounterOverflow,
+        #[cfg(test)]
         request_kind: crate::cgroup::memory::MemoryKind::File,
         requested_pages: 1,
     });

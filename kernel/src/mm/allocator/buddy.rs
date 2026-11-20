@@ -427,6 +427,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             .is_some_and(|remaining| remaining >= self.floor(zone, level).saturating_add(metadata))
     }
 
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
     /// Only destinations of this split can start metadata growth. The source
     /// order is removed, never inserted, and its occupied list is irrelevant.
     fn split_metadata_headroom(&self, zone: BuddyZone, requested: u8, source: u8) -> usize {
@@ -463,20 +467,6 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
             }
         }
         0
-    }
-
-    fn class_blocks(&self, zone: BuddyZone, order: usize, class: FramePlacement) -> usize {
-        let index = order - MIN_ORDER;
-        let movable = if order < BLOCK_ORDER {
-            self.movable_blocks[zone.index()][index]
-        } else {
-            0
-        };
-        if class == FramePlacement::Movable {
-            movable
-        } else {
-            self.diagnostics.zones[zone.index()].free_blocks[index] - movable
-        }
     }
 
     fn record_placement_fallback(&mut self, base: PhysAddr, class: FramePlacement) {
@@ -1255,6 +1245,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         ))
     }
 
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
     /// Allocate from a free block whose returned range fits below a physical
     /// address limit. The selected larger buddy block may cross the limit;
     /// only its low split is returned and the remaining halves go back to the
@@ -1267,6 +1261,10 @@ impl<A: MemoryManagementArch> BuddyAllocator<A> {
         self.buddy_alloc_below_result(count, max_phys_addr).ok()
     }
 
+    #[cfg(all(
+        feature = "mm_selftest",
+        any(target_arch = "x86_64", target_arch = "riscv64")
+    ))]
     fn buddy_alloc_below_result(
         &mut self,
         count: PageFrameCount,

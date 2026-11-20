@@ -653,6 +653,7 @@ impl FusePendingState {
         true
     }
 
+    #[cfg(test)]
     pub fn wait_complete(&self) -> Result<FuseReply, SystemError> {
         match self.wait_result()? {
             FusePendingResult::Reply(reply) => Ok(reply),
@@ -726,6 +727,7 @@ impl FusePendingState {
         }
     }
 
+    #[cfg(test)]
     fn wait_result(&self) -> Result<FusePendingResult, SystemError> {
         self.wait_terminal(FuseWaitMode::Interruptible)?.0
     }

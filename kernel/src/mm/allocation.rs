@@ -22,7 +22,7 @@ pub(crate) fn task_context() -> bool {
 }
 
 #[derive(Debug)]
-pub(crate) enum MemoryAllocationError {
+pub enum MemoryAllocationError {
     /// A real frame or fixed-layout heap allocation failed. Never infer this from errno.
     Physical,
     Charge(ChargeFailure),

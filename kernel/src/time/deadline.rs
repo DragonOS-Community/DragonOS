@@ -242,13 +242,6 @@ pub(crate) fn all_online_supported() -> bool {
             .all(|cpu| CAPABLE[cpu.data() as usize].load(Ordering::Acquire))
 }
 
-/// Admission for the global absolute-timer notification owner, independently
-/// of which CPU publishes a timer. Unsupported remote backends keep using the
-/// periodic timer service.
-pub(crate) fn global_timer_supported() -> bool {
-    global_timer_capable() && QUEUES[0].lock_irqsave().ready
-}
-
 /// Queue readiness is checked authoritatively by arm under its owner lock.
 pub(crate) fn global_timer_capable() -> bool {
     let owner = ProcessorId::new(0);

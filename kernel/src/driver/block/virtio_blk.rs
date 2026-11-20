@@ -307,6 +307,7 @@ impl BioTokenMap {
         }
     }
 
+    #[cfg(feature = "mm_selftest")]
     fn pop(&self) -> Option<BioContext> {
         self.inner.lock_irqsave().iter_mut().find_map(Option::take)
     }

@@ -1294,7 +1294,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     //   ——非抢占 + prev 非 RUNNING 时进入 deactivate 分支。
     //
     // DragonOS 扩展：SM_PREEMPT 路径也需处理非 runnable 的 prev，
-    // 因为异步 stop_task() 可在发送端上下文将远端 current 设为 Stopped（仅 kick 不 dequeue），
+    // 因为异步任务停止可在发送端上下文将远端 current 设为 Stopped（仅 kick 不 dequeue），
     // 导致远端 IPI 退出时 prev 已非 runnable 但仍在 runqueue 上。
     // 此时必须在这里完成唯一一次出队。
     //

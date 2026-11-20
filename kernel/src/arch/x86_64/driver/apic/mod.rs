@@ -54,7 +54,7 @@ static LOCAL_APIC_ENABLE_TYPE: AtomicLocalApicEnableType =
 /// Never use the normal ICR writer: it waits without a bound and its xAPIC
 /// lookup may panic on a nested RefCell borrow or incomplete CPU bootstrap.
 pub(crate) fn try_fatal_stop_others() {
-    if unsafe { core::arch::x86_64::__cpuid(1) }.edx & (1 << 9) == 0 {
+    if core::arch::x86_64::__cpuid(1).edx & (1 << 9) == 0 {
         return;
     }
     let base = unsafe { rdmsr(IA32_APIC_BASE) };

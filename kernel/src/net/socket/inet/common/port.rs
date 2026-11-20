@@ -9,7 +9,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpVersion};
 use system_error::SystemError;
 
 use super::device_binding::SocketDeviceBinding;
-use crate::{arch::rand::rand, libs::mutex::Mutex, process::ProcessManager};
+use crate::{arch::rand::rand, libs::mutex::Mutex};
 
 /// A normalized TCP receive domain. Mapped IPv6 addresses are normalized to
 /// IPv4 before construction; only the IPv6 wildcard may cover both families.
@@ -284,6 +284,7 @@ impl TcpPortReservation {
         self.identity.observer()
     }
 
+    #[cfg(test)]
     pub fn prepare_child(
         &self,
         device: Arc<SocketDeviceBinding>,
@@ -613,6 +614,7 @@ impl PortManager {
         TcpPortOwner(identity)
     }
 
+    #[cfg(test)]
     pub fn claim_fd(&self, id: u64) -> Result<TcpPortReservation, SystemError> {
         let mut table = self.bindings.lock();
         let entry = table.owners.get_mut(&id).ok_or(SystemError::EINVAL)?;
@@ -634,14 +636,6 @@ impl PortManager {
             domain: entry.domain.unwrap(),
             locked_bind_domain: entry.port_locked.then_some(entry.domain.unwrap()),
         })
-    }
-
-    pub fn local_port_range() -> (u16, u16) {
-        ProcessManager::current_netns().local_port_range()
-    }
-
-    pub fn set_local_port_range(min: u16, max: u16) -> Result<(), SystemError> {
-        ProcessManager::current_netns().set_local_port_range(min, max)
     }
 
     fn reserve_owner(

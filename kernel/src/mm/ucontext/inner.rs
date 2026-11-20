@@ -469,7 +469,7 @@ impl InnerAddressSpace {
     pub(super) fn add_present_page_mlock_ref(&mut self, addr: VirtAddr, vma: &Arc<LockedVMA>) {
         if let Some((paddr, _)) = self.user_mapper.utable.translate(addr) {
             let vm_flags = *vma.lock().vm_flags();
-            let mut page_manager_guard = page_manager_lock();
+            let page_manager_guard = page_manager_lock();
             if let PresentPfn::Managed(page) =
                 LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags)
             {
@@ -495,7 +495,7 @@ impl InnerAddressSpace {
             if let Some((paddr, _)) = self.user_mapper.utable.translate(vaddr) {
                 let vm_flags = *vma.lock().vm_flags();
                 let page = {
-                    let mut page_manager_guard = page_manager_lock();
+                    let page_manager_guard = page_manager_lock();
                     match LockedVMA::classify_present_pfn(&page_manager_guard, paddr, vm_flags) {
                         PresentPfn::Managed(page) => Some(page),
                         PresentPfn::External => None,

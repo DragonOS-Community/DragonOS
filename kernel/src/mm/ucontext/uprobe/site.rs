@@ -148,15 +148,12 @@ impl UprobeParticipantNode {
     /// Visit the live entry (non-retprobe) participants in one pinned
     /// snapshot. Entries are never reactivated, so observing `false` cannot
     /// hide a later membership.
-    pub(crate) fn for_each_active(&self, mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot)) {
+    pub(crate) fn for_each_active(&self, visit: impl FnMut(&UprobeConsumerRuntimeSnapshot)) {
         self.for_each_matching(false, visit);
     }
 
     /// Visit the live uretprobe participants in one pinned snapshot.
-    pub(crate) fn for_each_active_ret(
-        &self,
-        mut visit: impl FnMut(&UprobeConsumerRuntimeSnapshot),
-    ) {
+    pub(crate) fn for_each_active_ret(&self, visit: impl FnMut(&UprobeConsumerRuntimeSnapshot)) {
         self.for_each_matching(true, visit);
     }
 

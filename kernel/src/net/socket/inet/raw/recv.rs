@@ -60,19 +60,6 @@ struct In6PktInfo {
 }
 
 impl RawSocket {
-    /// 尝试接收数据包
-    ///
-    /// # 返回
-    /// - `Ok((size, src_addr))`: 接收到的数据大小和源地址
-    /// - `Err(SystemError::EAGAIN_OR_EWOULDBLOCK)`: 没有数据可读
-    pub fn try_recv(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<(usize, smoltcp::wire::IpAddress), SystemError> {
-        self.try_recv_with_ifindex(buf)
-            .map(|(size, source, _)| (size, source))
-    }
-
     fn try_recv_with_ifindex(
         &self,
         buf: &mut [u8],

@@ -77,6 +77,7 @@ impl RtBucket {
         self.head.as_ref().and_then(|node| node.task.as_ref())
     }
 
+    #[cfg(any(debug_assertions, feature = "fifo_demo"))]
     fn iter(&self) -> impl Iterator<Item = &Arc<ProcessControlBlock>> {
         let mut current = self.head.as_deref();
         core::iter::from_fn(move || {

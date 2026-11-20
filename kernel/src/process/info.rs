@@ -143,6 +143,7 @@ impl FdTableAttachment {
         Self { table: Some(table) }
     }
 
+    #[cfg(test)]
     fn share_for_task(&self) -> Self {
         Self::new(
             self.table
@@ -238,12 +239,6 @@ impl ProcessBasicInfo {
         self.fd_table
             .as_ref()
             .map(|attachment| (attachment.observer(), attachment.is_shared()))
-    }
-
-    pub(crate) fn share_fd_table_for_task(&self) -> Option<FdTableAttachment> {
-        self.fd_table
-            .as_ref()
-            .map(FdTableAttachment::share_for_task)
     }
 
     pub fn set_fd_table(

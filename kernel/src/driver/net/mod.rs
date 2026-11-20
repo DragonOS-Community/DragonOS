@@ -19,7 +19,6 @@ use crate::net::routing::RouterEnableDeviceCommon;
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::{
     libs::{mutex::Mutex, rwlock::RwLock},
-    net::socket::inet::InetSocket,
     process::ProcessState,
 };
 use smoltcp::phy::{

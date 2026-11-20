@@ -1,5 +1,4 @@
 use crate::{
-    arch::MMArch,
     driver::base::{
         firmware::sys_firmware_kobj,
         kobject::{CommonKobj, DynamicKObjKType, KObject, KObjectManager},
@@ -9,7 +8,7 @@ use crate::{
     mm::{
         allocator::physical::PhysicalBox,
         mmio_buddy::{mmio_pool, MMIOSpaceGuard},
-        MemoryManagementArch, PhysAddr, VirtAddr,
+        PhysAddr, VirtAddr,
     },
 };
 use acpi::{AcpiHandler, AcpiTables, PlatformInfo};

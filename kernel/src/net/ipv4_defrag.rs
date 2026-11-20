@@ -118,7 +118,19 @@ pub(crate) enum ReassemblyResult<M> {
     Pending,
     Duplicate,
     Complete(ReassembledIpv4<M>),
-    Rejected(ReassemblyError),
+    Rejected {
+        #[cfg(test)]
+        reason: ReassemblyError,
+    },
+}
+
+impl<M> ReassemblyResult<M> {
+    fn rejected(_reason: ReassemblyError) -> Self {
+        Self::Rejected {
+            #[cfg(test)]
+            reason: _reason,
+        }
+    }
 }
 
 /// The caller serializes this small state (for example with the namespace's
@@ -255,7 +267,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         self.expire(now_us);
         let parsed = match Parsed::parse(bytes, domain) {
             Ok(parsed) => parsed,
-            Err(error) => return ReassemblyResult::Rejected(error),
+            Err(error) => return ReassemblyResult::rejected(error),
         };
         // Linux ip_frag_queue() discards the entire queue when MF truncation
         // leaves an empty fragment. The key must be parsed first so a prior
@@ -265,7 +277,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
             if let Some(index) = existing {
                 self.remove(index);
             }
-            return ReassemblyResult::Rejected(ReassemblyError::Malformed);
+            return ReassemblyResult::rejected(ReassemblyError::Malformed);
         }
         let existing = self.queues.iter().position(|queue| queue.key == parsed.key);
         let mut index = match existing {
@@ -279,10 +291,10 @@ impl<M: Clone> Ipv4Defragmenter<M> {
                 self.charged_bytes += self.queues.allocated_bytes() - old_storage;
                 self.evict_until_room(None, 0);
                 if reserve.is_err() {
-                    return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+                    return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
                 }
                 if self.charged_bytes > MAX_STORED_BYTES {
-                    return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
+                    return ReassemblyResult::rejected(ReassemblyError::ResourceLimit);
                 }
                 self.queues.push(Queue {
                     key: parsed.key,
@@ -317,7 +329,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
                 .is_some_and(|header| end > MAX_DATAGRAM_LEN - header.len()))
         {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::InconsistentLength);
+            return ReassemblyResult::rejected(ReassemblyError::InconsistentLength);
         }
 
         // Linux's inet_frag_queue_insert ignores a fragment wholly covered by
@@ -343,17 +355,17 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         }
         if overlaps {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::Overlap);
+            return ReassemblyResult::rejected(ReassemblyError::Overlap);
         }
         if queue.fragments.len() >= MAX_FRAGMENTS_PER_QUEUE {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
+            return ReassemblyResult::rejected(ReassemblyError::ResourceLimit);
         }
 
         let mut payload = PacketBuffer::new();
         if payload.try_reserve_exact(parsed.payload.len()).is_err() {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+            return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
         }
         payload
             .extend_from_slice(parsed.payload)
@@ -363,7 +375,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
             let mut first = PacketBuffer::new();
             if first.try_reserve_exact(parsed.header.len()).is_err() {
                 self.remove(index);
-                return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+                return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
             }
             first
                 .extend_from_slice(parsed.header)
@@ -373,7 +385,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         let old_fragment_capacity = self.queues[index].fragments.allocated_bytes();
         if self.queues[index].fragments.try_reserve(1).is_err() {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::OutOfMemory);
+            return ReassemblyResult::rejected(ReassemblyError::OutOfMemory);
         }
         let fragment_capacity_delta =
             self.queues[index].fragments.allocated_bytes() - old_fragment_capacity;
@@ -384,7 +396,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         self.evict_until_room(Some(&mut index), charge);
         if self.charged_bytes.saturating_add(charge) > MAX_STORED_BYTES {
             self.remove(index);
-            return ReassemblyResult::Rejected(ReassemblyError::ResourceLimit);
+            return ReassemblyResult::rejected(ReassemblyError::ResourceLimit);
         }
 
         let queue = &mut self.queues[index];
@@ -426,7 +438,7 @@ impl<M: Clone> Ipv4Defragmenter<M> {
         let queue = self.remove(index);
         match assemble(queue, origin) {
             Ok(packet) => ReassemblyResult::Complete(packet),
-            Err(error) => ReassemblyResult::Rejected(error),
+            Err(error) => ReassemblyResult::rejected(error),
         }
     }
 
@@ -680,7 +692,9 @@ mod tests {
         ));
         assert!(matches!(
             assembler.submit(&partial_overlap, DOMAIN, 3, 2),
-            ReassemblyResult::Rejected(ReassemblyError::Overlap)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::Overlap
+            }
         ));
         assert_eq!(assembler.charged_bytes, 0);
         assert!(matches!(
@@ -736,7 +750,9 @@ mod tests {
         ));
         assert!(matches!(
             assembler.submit(&empty_after_trim, DOMAIN, 1, 1),
-            ReassemblyResult::Rejected(ReassemblyError::Malformed)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::Malformed
+            }
         ));
         assert_eq!(assembler.queues.len(), 0);
         assert_eq!(assembler.charged_bytes, 0);
@@ -758,7 +774,9 @@ mod tests {
         ));
         assert!(matches!(
             assembler.submit(&incompatible, DOMAIN, 1, 2),
-            ReassemblyResult::Rejected(ReassemblyError::InconsistentLength)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::InconsistentLength
+            }
         ));
         assert_eq!(assembler.charged_bytes, 0);
     }
@@ -782,7 +800,9 @@ mod tests {
         ));
         assert!(matches!(
             assembler.submit(&ce, DOMAIN, 1, 3),
-            ReassemblyResult::Rejected(ReassemblyError::InconsistentEcn)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::InconsistentEcn
+            }
         ));
     }
 
@@ -795,7 +815,9 @@ mod tests {
         bad[8] ^= 1;
         assert!(matches!(
             assembler.submit(&bad, DOMAIN, 1, 0),
-            ReassemblyResult::Rejected(ReassemblyError::Malformed)
+            ReassemblyResult::Rejected {
+                reason: ReassemblyError::Malformed
+            }
         ));
         assert!(matches!(
             assembler.submit(&first, DOMAIN, 1, 0),

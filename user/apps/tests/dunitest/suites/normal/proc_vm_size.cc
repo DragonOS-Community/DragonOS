@@ -3,6 +3,8 @@
 // change its address space through stdio or C++ heap allocation.
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -12,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -191,6 +194,45 @@ TEST(ProcVmSize, MatchesStatAndStatm) {
     }
     EXPECT_EQ(size, strtoull(field, &end, 10));
     EXPECT_NE(end, field);
+}
+
+TEST(ProcVmSize, StatmTextCountsMainElfCodeSpan) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    const auto page = static_cast<uint64_t>(page_size);
+    ASSERT_EQ(sizeof(Elf64_Phdr), getauxval(AT_PHENT));
+    const auto* headers = reinterpret_cast<const Elf64_Phdr*>(getauxval(AT_PHDR));
+    const auto count = getauxval(AT_PHNUM);
+    ASSERT_NE(nullptr, headers);
+    ASSERT_GT(count, 0u);
+
+    // The auxiliary vector describes the main executable, including for PIE.
+    // The page-aligned load bias cancels when subtracting the page indices.
+    uint64_t start = UINT64_MAX, end = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& header = headers[i];
+        if (header.p_type == PT_LOAD && (header.p_flags & PF_X)) {
+            start = std::min(start, header.p_vaddr);
+            end = std::max(end, header.p_vaddr + header.p_filesz);
+        }
+    }
+    ASSERT_LT(start, end);
+    const uint64_t expected_pages = (end - 1) / page + 1 - start / page;
+    const auto expect_text = [&] {
+        char data[256], extra;
+        unsigned long long fields[7];
+        ASSERT_TRUE(ReadFile("/proc/self/statm", data, sizeof(data)));
+        ASSERT_EQ(7, sscanf(data, "%llu %llu %llu %llu %llu %llu %llu %c", &fields[0],
+                            &fields[1], &fields[2], &fields[3], &fields[4],
+                            &fields[5], &fields[6], &extra));
+        EXPECT_EQ(expected_pages, fields[3]);
+    };
+    ASSERT_NO_FATAL_FAILURE(expect_text());
+
+    Mapping extra_code(page_size);
+    ASSERT_NE(MAP_FAILED, extra_code.get());
+    ASSERT_EQ(0, mprotect(extra_code.get(), page_size, PROT_READ | PROT_EXEC));
+    ASSERT_NO_FATAL_FAILURE(expect_text());
 }
 
 TEST(ProcVmSize, UntouchedMappingsSplitsAndPartialUnmap) {
@@ -586,8 +628,7 @@ TEST(ProcVmSize, StatusTracksExecAndOmitsMemoryAfterExit) {
     EXPECT_EQ(observed, 0u);
     snprintf(path, sizeof(path), "/proc/%d/statm", child);
     ASSERT_TRUE(ReadFile(path, data, sizeof(data)));
-    ASSERT_TRUE(ParseStatmSize(data, &observed));
-    EXPECT_EQ(observed, 0u);
+    EXPECT_STREQ("0 0 0 0 0 0 0\n", data);
 }
 
 } // namespace

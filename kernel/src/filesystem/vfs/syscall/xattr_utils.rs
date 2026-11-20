@@ -8,7 +8,8 @@ use crate::{
             permission::{check_inode_permission, PermissionMask},
             syscall::AtFlags,
             utils::user_path_at,
-            FileType, IndexNode, XattrFlags, MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            FileType, IndexNode, InodeFlags, InodeMode, XattrFlags, MAX_PATHLEN,
+            VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     mm::{allocation::MemoryAllocationError, VirtAddr},
@@ -197,29 +198,65 @@ pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, Syst
 }
 
 fn do_removexattr(inode: Arc<dyn IndexNode>, name: &[u8]) -> Result<usize, SystemError> {
-    let result = crate::filesystem::vfs::file::File::recover_io(|| inode.removexattr(name))?;
+    let result = File::recover_io(|| {
+        check_xattr_permission(&inode, name, PermissionMask::MAY_WRITE)?;
+        inode.removexattr(name)
+    })?;
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(result)
 }
 
-// Linux xattr_permission(MAY_READ). Namespace policy belongs at the syscall
-// boundary; filesystem-internal attribute lookups retain their own credentials.
-fn check_xattr_get_permission(inode: &Arc<dyn IndexNode>, name: &[u8]) -> Result<(), SystemError> {
+// Apply Linux xattr_permission at the syscall boundary.
+fn check_xattr_permission(
+    inode: &Arc<dyn IndexNode>,
+    name: &[u8],
+    mask: PermissionMask,
+) -> Result<(), SystemError> {
+    let write = mask.contains(PermissionMask::MAY_WRITE);
+    let metadata = if write {
+        let metadata = inode.metadata()?;
+        if metadata
+            .flags
+            .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+        {
+            return Err(SystemError::EPERM);
+        }
+        Some(metadata)
+    } else {
+        None
+    };
     if name.starts_with(b"security.") || name.starts_with(b"system.") {
         return Ok(());
     }
+    let denied = if write {
+        SystemError::EPERM
+    } else {
+        SystemError::ENODATA
+    };
     if name.starts_with(b"trusted.") {
         return if capable(CAPFlags::CAP_SYS_ADMIN) {
             Ok(())
         } else {
-            Err(SystemError::ENODATA)
+            Err(denied)
         };
     }
-    let metadata = inode.metadata()?;
-    if name.starts_with(b"user.") && !matches!(metadata.file_type, FileType::File | FileType::Dir) {
-        return Err(SystemError::ENODATA);
+    let metadata = match metadata {
+        Some(metadata) => metadata,
+        None => inode.metadata()?,
+    };
+    if name.starts_with(b"user.") {
+        if !matches!(metadata.file_type, FileType::File | FileType::Dir) {
+            return Err(denied);
+        }
+        if write
+            && metadata.file_type == FileType::Dir
+            && metadata.mode.contains(InodeMode::S_ISVTX)
+            && !ProcessManager::current_cred().is_owner_or_capable(&metadata)
+        {
+            return Err(SystemError::EPERM);
+        }
     }
-    check_inode_permission(inode, &metadata, PermissionMask::MAY_READ)
+    check_inode_permission(inode, &metadata, mask)
 }
 
 fn do_getxattr(
@@ -231,7 +268,7 @@ fn do_getxattr(
     let name = clone_xattr_name(name_ptr)?;
 
     File::recover_io(|| {
-        check_xattr_get_permission(&inode, name.as_bytes())?;
+        check_xattr_permission(&inode, name.as_bytes(), PermissionMask::MAY_READ)?;
         copy_xattr_output(
             size,
             XATTR_SIZE_MAX,
@@ -290,6 +327,7 @@ pub(super) fn fd_setxattr(
 
 fn do_setxattr(inode: Arc<dyn IndexNode>, xattr: SetxattrArgs) -> Result<usize, SystemError> {
     let result = crate::filesystem::vfs::file::File::recover_io(|| {
+        check_xattr_permission(&inode, xattr.name.as_bytes(), PermissionMask::MAY_WRITE)?;
         inode.setxattr(
             xattr.name.as_bytes(),
             xattr.value.as_deref().unwrap_or(&[]),

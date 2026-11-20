@@ -424,8 +424,22 @@ pub(crate) fn init_jiffies_tick() {
     }
 }
 
-// Normal IRQ updates are CPU0-only. The source control path above may settle
-// old elapsed time under this same lock; it never runs timer maintenance.
+/// Project a coarse expiry using the same phase and count that the tick
+/// commits together. Zero marks a timer whose jiffy is already published.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn jiffies_deadline_ns(expire: u64) -> u64 {
+    let tk = timekeeper().inner.read_irqsave();
+    let remaining = expire.saturating_sub(super::timer::clock());
+    if remaining == 0 {
+        return 0;
+    }
+    tk.next_jiffy_ns
+        .expect("jiffy tick not initialized")
+        .saturating_add((remaining - 1).saturating_mul(JIFFY_NS))
+}
+
+// CPU0 is the ordinary update owner. An AP leaving tickless idle may
+// catch up before CPU0 gets its wakeup IPI, under the same write lock.
 pub(crate) fn advance_jiffies(local_tick: bool) -> bool {
     let mut tk = timekeeper().inner.write_irqsave();
     let next = tk.next_jiffy_ns.expect("jiffy tick not initialized");

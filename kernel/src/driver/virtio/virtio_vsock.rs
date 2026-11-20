@@ -1,6 +1,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::convert::TryFrom;
+use core::{
+    convert::TryFrom,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use system_error::SystemError;
 use virtio_drivers::device::socket::{
@@ -33,6 +36,7 @@ unsafe impl Send for UnsafeVsockManager {}
 struct VirtioVsockTransport {
     manager: Mutex<UnsafeVsockManager>,
     guest_cid: u32,
+    irq_ready: AtomicBool,
 }
 
 impl VirtioVsockTransport {
@@ -48,6 +52,7 @@ impl VirtioVsockTransport {
         Self {
             manager: Mutex::new(UnsafeVsockManager(manager)),
             guest_cid,
+            irq_ready: AtomicBool::new(false),
         }
     }
 
@@ -83,6 +88,10 @@ impl VirtioVsockTransport {
 }
 
 impl VsockTransport for VirtioVsockTransport {
+    fn event_interrupts_ready(&self) -> bool {
+        self.irq_ready.load(Ordering::Acquire)
+    }
+
     fn local_cid(&self) -> u32 {
         self.guest_cid
     }
@@ -302,9 +311,7 @@ fn map_vsock_error(error: VirtioError) -> SystemError {
 
 /// virtqueue 中断回调：事件到达时立即唤醒事件轮询线程。
 ///
-/// 此前 vsock 事件完全依赖 10ms 定时轮询（无中断），每个宿主→guest 的
-/// 包平均要等 ~5ms，多帧往返累计出 ~40-50ms 的固定延迟。现在中断到达
-/// 即唤醒 worker，轮询保留为兜底（中断丢失/未启用时延迟上界仍为 10ms）。
+/// 成功注册中断时轮询只负责兜底。初始化失败的后端继续使用短轮询周期。
 ///
 /// MSI-X 为边沿消息中断，无需读写 ISR 状态寄存器（与 virtio-blk 的
 /// msix 分支一致，不在此 ack）。
@@ -373,7 +380,7 @@ pub fn virtio_vsock(
 
     let manager = VsockConnectionManager::new(socket);
     let transport = Arc::new(VirtioVsockTransport::new(manager, guest_cid));
-    if let Err(err) = register_transport(transport as Arc<dyn VsockTransport>) {
+    if let Err(err) = register_transport(transport.clone() as Arc<dyn VsockTransport>) {
         log::warn!(
             "virtio-vsock transport registration rejected for device {:?}, guest_cid={}: {:?}",
             dev_id.id(),
@@ -382,27 +389,37 @@ pub fn virtio_vsock(
         );
         return;
     }
-    ensure_transport_event_worker_started();
     if let Some(setup) = irq_setup {
-        // Installed(PCI) 变体经 into_deferred 泄漏化（永久保留安装，不回滚）；
-        // Deferred(MMIO) 变体在设备构造完成后立即安装。
-        if let Some(deferred) = setup.into_deferred() {
-            if let Err(err) = deferred.install(dev_id.clone()) {
-                log::warn!(
-                    "virtio-vsock deferred irq install failed for {:?}: {:?}",
+        let deferred = setup.into_deferred();
+        let pci_irq = deferred.is_none();
+        let installed = match deferred {
+            Some(deferred) => match deferred.install(dev_id.clone()) {
+                Ok(_) => true,
+                Err(err) => {
+                    log::warn!(
+                        "virtio-vsock deferred irq install failed for {:?}: {:?}",
+                        dev_id.id(),
+                        err
+                    );
+                    false
+                }
+            },
+            None => true,
+        };
+        if installed {
+            match super::irq::virtio_irq_manager()
+                .register_callback(dev_id.clone(), Arc::new(VsockIrqCallback))
+            {
+                // The PCI interrupt is MSI-X. MMIO keeps the short
+                // polling interval until it has a level-IRQ ack path.
+                Ok(_) => transport.irq_ready.store(pci_irq, Ordering::Release),
+                Err(err) => log::warn!(
+                    "virtio-vsock irq callback registration failed for {:?}: {:?}",
                     dev_id.id(),
                     err
-                );
+                ),
             }
         }
-        if let Err(err) = super::irq::virtio_irq_manager()
-            .register_callback(dev_id.clone(), Arc::new(VsockIrqCallback))
-        {
-            log::warn!(
-                "virtio-vsock irq callback registration failed for {:?}: {:?}",
-                dev_id.id(),
-                err
-            );
-        }
     }
+    ensure_transport_event_worker_started();
 }

@@ -287,6 +287,13 @@ impl Softirq {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn local_pending(&self) -> bool {
+        self.pending_for(smp_get_processor_id())
+            .load(Ordering::Acquire)
+            != 0
+    }
+
     pub fn raise_softirq(&self, softirq_num: SoftirqNumber) {
         let guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
         let processor_id = smp_get_processor_id();

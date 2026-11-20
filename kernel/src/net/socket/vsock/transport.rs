@@ -78,6 +78,11 @@ pub trait VsockTransport: Send + Sync {
         true
     }
 
+    /// Whether receive notifications can wake the event worker directly.
+    fn event_interrupts_ready(&self) -> bool {
+        false
+    }
+
     /// 发起远端连接。
     ///
     /// # 参数
@@ -354,6 +359,7 @@ pub fn transport_reset(local: VsockEndpoint, peer: VsockEndpoint) -> Result<(), 
 ///
 /// # 行为
 /// - transport 非 `Ready` 时返回 `ENODEV`
-pub fn transport_poll_events() -> Result<Vec<VsockTransportEvent>, SystemError> {
-    ready_backend()?.poll_events()
+pub(super) fn transport_poll_events() -> Result<(Vec<VsockTransportEvent>, bool), SystemError> {
+    let backend = ready_backend()?;
+    Ok((backend.poll_events()?, backend.event_interrupts_ready()))
 }

@@ -96,6 +96,14 @@ pub(super) fn init_deadline_driver() -> Result<(), SystemError> {
     Ok(())
 }
 
+/// An idle snapshot may already hold the owner queue. A publisher holding
+/// BASE can be waiting for that queue, so this check must never block.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn idle_deadline_ready() -> bool {
+    BASE.try_lock_irqsave()
+        .is_ok_and(|base| base.driver.is_some())
+}
+
 /// Callers must release timekeeper/owner queue locks before acquiring BASE.
 pub(crate) fn refresh_deadline_driver() {
     let base = BASE.lock_irqsave();

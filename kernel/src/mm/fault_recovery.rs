@@ -178,6 +178,11 @@ fn wait_for_progress(observed: u64, writeback: bool, timeout_us: u64) -> Result<
     })
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn needs_periodic_tick() -> bool {
+    WAITERS.load(Ordering::Acquire) != 0
+}
+
 /// The common tick only queues the existing memory-notifier worker. It never
 /// wakes arbitrary tasks under the timer's locks or borrows reserve access.
 pub(crate) fn tick() {

@@ -7,6 +7,7 @@ use crate::{
     exception::InterruptArch,
     process::{ProcessFlags, ProcessManager},
     sched::{SchedMode, __schedule},
+    time::deadline::{self, IdleWake},
 };
 
 impl ProcessManager {
@@ -22,6 +23,7 @@ impl ProcessManager {
                 // region. A remote wakeup then either sets the flag before the
                 // check or leaves an IPI pending to wake the halted CPU.
                 let irq_guard = unsafe { CurrentIrqArch::save_and_disable_irq() };
+                deadline::enter_idle();
                 let rcu_idle = crate::rcu::idle_enter();
                 // idle_enter() can itself wake a local RCU worker without an
                 // IPI, so check after entering EQS as well as before it.
@@ -30,6 +32,7 @@ impl ProcessManager {
                     unsafe { CurrentIrqArch::interrupt_disable() };
                 }
                 crate::rcu::idle_exit(rcu_idle);
+                deadline::exit_idle(IdleWake::Other);
                 drop(irq_guard);
             } else {
                 error!("Idle process should not be scheduled with IRQs disabled.");

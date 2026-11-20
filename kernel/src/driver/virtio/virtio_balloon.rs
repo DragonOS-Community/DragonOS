@@ -207,6 +207,12 @@ fn request_work() {
 }
 
 /// Tick never calls a scheduler or acquires a device/queue/page lock.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn next_deadline() -> Option<u64> {
+    let deadline = DEADLINE.load(Ordering::Acquire);
+    (deadline != 0).then_some(deadline)
+}
+
 pub(crate) fn tick(now: u64) {
     let deadline = DEADLINE.load(Ordering::Acquire);
     if deadline != 0 && now >= deadline {

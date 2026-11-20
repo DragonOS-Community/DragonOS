@@ -126,10 +126,17 @@ impl PreparedTimer {
     }
 
     pub(crate) fn activate(self) {
-        let mut timers = TIMER_LIST.lock_irqsave();
-        // This token exclusively owns the unpublished activation.
-        debug_assert!(timers.get(&self.timer.queue_key()).is_none());
-        timers.insert_prepared(self.node);
+        #[cfg(target_arch = "x86_64")]
+        let expire = self.timer.expire_jiffies();
+        {
+            let mut timers = TIMER_LIST.lock_irqsave();
+            // This token exclusively owns the unpublished activation.
+            debug_assert!(timers.get(&self.timer.queue_key()).is_none());
+            timers.insert_prepared(self.node);
+        }
+        // Publishing a timer can shorten an idle CPU0's clockevent target.
+        #[cfg(target_arch = "x86_64")]
+        crate::time::deadline::kick_timer_owner(expire);
     }
 }
 
@@ -185,13 +192,18 @@ impl Timer {
     pub fn activate(self: &Arc<Self>) {
         let node = PreparedNode::try_new(self.queue_key(), self.clone())
             .expect("timer queue allocation failed");
-        let mut timers = TIMER_LIST.lock_irqsave();
-        if timers.get(&self.queue_key()).is_some() {
-            drop(timers);
-            warn!("Timer already in list");
-            return;
+        {
+            let mut timers = TIMER_LIST.lock_irqsave();
+            if timers.get(&self.queue_key()).is_some() {
+                drop(timers);
+                warn!("Timer already in list");
+                return;
+            }
+            timers.insert_prepared(node);
         }
-        timers.insert_prepared(node);
+        // Publishing a timer can shorten an idle CPU0's clockevent target.
+        #[cfg(target_arch = "x86_64")]
+        crate::time::deadline::kick_timer_owner(self.expire_jiffies());
     }
 
     #[inline]
@@ -373,6 +385,27 @@ pub fn schedule_timeout(mut timeout: i64) -> Result<i64, SystemError> {
             return Ok(0);
         }
     }
+}
+
+/// Earliest CPU0 coarse expiry, including maintenance outside TIMER_LIST.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn idle_wake_jiffies() -> Result<Option<u64>, SystemError> {
+    // These sleepers have no individual deadline published to the timer
+    // owner. Absolute timers likewise need the periodic service if their
+    // precise notification driver is unavailable.
+    if crate::mm::fault_recovery::needs_periodic_tick() || !absolute_timer::idle_deadline_ready() {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+    Ok([
+        first_expire_in(&TIMER_LIST)?,
+        super::clocksource::watchdog_deadline()?,
+        crate::mm::page::reclaim_wait::next_deadline(),
+        crate::mm::compaction::background::next_deadline(),
+        crate::driver::virtio::virtio_balloon::next_deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min())
 }
 
 /// Return the earliest deadline, distinguishing an empty queue from deadline 0.

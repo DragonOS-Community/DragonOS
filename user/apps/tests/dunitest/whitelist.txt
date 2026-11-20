@@ -326,3 +326,4 @@ normal/user_return_work
 normal/unix_socket_stat
 normal/tty_fionread
 normal/bpf_map_lookup_fault
+normal/cpu_topology_sysfs

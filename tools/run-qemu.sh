@@ -13,6 +13,8 @@
 # - AUTO_TEST: 自动测试选项
 # - SYSCALL_TEST_DIR: 系统调用测试目录
 # - DUNITEST_PATTERN: dunitest runner pattern filter
+# - DUNITEST_EXPECT_CPU_TOPOLOGY: expected sockets x cores x threads (e.g. 2x2x2)
+# - DRAGONOS_QEMU_CPU_MODEL: override the x86 QEMU CPU model
 # - DRAGONOS_QEMU_SMP: 覆盖 vCPU 拓扑，例如 1,cores=1,threads=1,sockets=1
 # - DRAGONOS_QEMU_SERIAL_SOCKET: nographic 模式下使用独立 Unix socket 承载 guest virtconsole
 # - DRAGONOS_QEMU_CONSOLE_TERM: x86_64 nographic 控制台使用的 guest terminfo 名称
@@ -514,6 +516,7 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     QEMU_MACHINE_ARGS=(-machine "${qemu_machine}")
     # 根据加速方式选择CPU型号：KVM使用host，TCG使用IvyBridge
     cpu_model=$([ "${qemu_accel}" == "kvm" ] && echo "host" || echo "IvyBridge")
+    cpu_model="${DRAGONOS_QEMU_CPU_MODEL:-$cpu_model}"
     if [ -n "${allflags}" ]; then
       QEMU_CPU_ARGS=(-cpu "${cpu_model},apic,x2apic,+fpu,check,+vmx,${allflags}")
     else
@@ -602,6 +605,9 @@ while true;do
 setup_kernel_init_program() {
     if [ ${ARCH} == "x86_64" ]; then
         KERNEL_CMDLINE+=" init=/bin/busybox init AUTO_TEST=${AUTO_TEST} SYSCALL_TEST_DIR=${SYSCALL_TEST_DIR} DUNITEST_DIR=${DUNITEST_DIR} DUNITEST_PATTERN=${DUNITEST_PATTERN} "
+        if [ "${AUTO_TEST}" = dunit ] && [ -n "${DUNITEST_EXPECT_CPU_TOPOLOGY:-}" ]; then
+            KERNEL_CMDLINE+=" DUNITEST_EXPECT_CPU_TOPOLOGY=${DUNITEST_EXPECT_CPU_TOPOLOGY} "
+        fi
         # KERNEL_CMDLINE+=" init=/bin/dragonreach "
     elif [ ${ARCH} == "riscv64" ]; then
         KERNEL_CMDLINE+=" init=/bin/riscv_rust_init "

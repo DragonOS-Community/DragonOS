@@ -321,8 +321,12 @@ test-dunit: prepare_rootfs_manifest
 		$(DADK) -f $(ROOT_PATH)/dadk-manifest.generated.toml user clean --level in-src -w $(ROOT_PATH); \
 	fi
 	SKIP_GRUB=1 $(MAKE) write_diskimage AUTO_TEST=dunit || exit 1
+	$(MAKE) run-dunit
+
+.PHONY: run-dunit
+run-dunit:
+	rm -f serial_opt.txt "$(VMSTATE_DIR)/pid"
 	$(MAKE) qemu-nographic AUTO_TEST=dunit DUNITEST_DIR=/opt/tests/dunitest &
-	sleep 5
 	@bash user/apps/tests/dunitest/monitor_test_results.sh
 
 test-dunit-local:

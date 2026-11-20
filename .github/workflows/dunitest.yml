@@ -147,6 +147,16 @@ jobs:
         run: |
           make test-dunit
 
+      - name: Run SMT and multi-socket topology regression
+        shell: bash -ileo pipefail {0}
+        env:
+          DRAGONOS_QEMU_ACCEL: kvm
+          DRAGONOS_QEMU_CPU_MODEL: IvyBridge
+          DRAGONOS_QEMU_SMP: "4,cores=1,threads=2,sockets=2"
+          DRAGONOS_QEMU_SNAPSHOT: "1"
+          DUNITEST_EXPECT_CPU_TOPOLOGY: "2x1x2"
+        run: make run-dunit DUNITEST_PATTERN=cpu_topology_sysfs
+
       - name: Preserve dunitest serial log
         if: always()
         uses: actions/upload-artifact@v4

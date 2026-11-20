@@ -873,6 +873,16 @@ pub enum UserReadMode {
     Iterator,
 }
 
+/// Xattr mutation for the selected inode. Internal callers omit the check.
+#[derive(Clone, Copy)]
+pub enum XattrMutation<'a> {
+    Set(&'a [u8], XattrFlags),
+    Remove,
+}
+
+/// Validate a metadata snapshot while the backend serializes inode changes.
+pub type XattrWriteCheck<'a> = dyn Fn(&Metadata) -> Result<(), SystemError> + 'a;
+
 pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// Namespace-specific proc sysctl mode bits for the current credentials.
     /// None preserves the ordinary global-root proc sysctl permission policy.
@@ -2603,11 +2613,11 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     ///         失败：Err(错误码)
     fn setxattr(
         &self,
-        _name: &[u8],
-        _value: &[u8],
-        _flags: XattrFlags,
+        name: &[u8],
+        value: &[u8],
+        flags: XattrFlags,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        self.mutate_xattr(name, XattrMutation::Set(value, flags), None)
     }
 
     /// @brief 列出扩展属性名，返回实际列表长度。
@@ -2620,9 +2630,27 @@ pub trait IndexNode: Any + Sync + Send + Debug + CastFromSync {
     /// @brief 删除指定扩展属性。
     fn removexattr(
         &self,
-        _name: &[u8],
+        name: &[u8],
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
+        self.mutate_xattr(name, XattrMutation::Remove, None)
+    }
+
+    /// A supporting backend calls `check` under the lock that serializes
+    /// metadata changes and xattr writes, before committing the mutation.
+    fn mutate_xattr(
+        &self,
+        _name: &[u8],
+        _mutation: XattrMutation<'_>,
+        check: Option<&XattrWriteCheck<'_>>,
+    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        if let Some(check) = check {
+            match self.metadata() {
+                Ok(metadata) => check(&metadata)?,
+                Err(SystemError::ENOSYS | SystemError::EOPNOTSUPP_OR_ENOTSUP) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into())
     }
 
     /// Internal privilege removal after a content/ownership mutation has been

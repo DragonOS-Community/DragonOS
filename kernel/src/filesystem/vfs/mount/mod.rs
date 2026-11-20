@@ -3,7 +3,7 @@ use super::{
     utils::DName,
     DelegatedWriteResult, DirectoryEntry, FilePrivateData, FileSystem, FileType, IndexNode,
     InodeId, InodeMode, InodeRetentionKind, LinkRemovalOutcome, PollableInode, RenameOutcome,
-    SetMetadataMask, SuperBlock, VmaOpenRollback, WriteSyncIntent, XattrFlags,
+    SetMetadataMask, SuperBlock, VmaOpenRollback, WriteSyncIntent,
 };
 use crate::{
     driver::base::device::device_number::{DeviceNumber, Major},
@@ -7569,41 +7569,46 @@ impl IndexNode for MountFSInode {
         self.dentry.inode.getxattr(name, buf)
     }
 
-    fn setxattr(
-        &self,
-        name: &[u8],
-        value: &[u8],
-        flags: XattrFlags,
-    ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
-        let _writer = self.ensure_mount_writable()?;
-        let context = self.op_context();
-        if context.is_idmapped() && filecaps::is_acl(name) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
-        }
-        if name == filecaps::NAME {
-            let value = filecaps::for_storage(&context, &self.dentry.inode.metadata()?, value)?;
-            return self.dentry.inode.setxattr(name, value.bytes(), flags);
-        }
-        self.dentry.inode.setxattr(name, value, flags)
-    }
-
     fn listxattr(&self, buf: &mut [u8]) -> Result<usize, SystemError> {
         self.dentry.inode.listxattr(buf)
     }
 
-    fn removexattr(
+    fn mutate_xattr(
         &self,
         name: &[u8],
+        mutation: super::XattrMutation<'_>,
+        check: Option<&super::XattrWriteCheck<'_>>,
     ) -> Result<usize, crate::mm::allocation::MemoryAllocationError> {
+        use super::XattrMutation;
+
         let _writer = self.ensure_mount_writable()?;
         let context = self.op_context();
         if context.is_idmapped() && filecaps::is_acl(name) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP.into());
         }
-        if name == filecaps::NAME {
-            filecaps::check_setfcap(&context, &self.dentry.inode.metadata()?)?;
+
+        let inode = &self.dentry.inode;
+        let check_mounted = |raw: &super::Metadata| {
+            if let Some(check) = check {
+                check(&context.view_metadata(raw))?;
+            }
+            if name == filecaps::NAME {
+                filecaps::check_setfcap(&context, raw)?;
+            }
+            Ok(())
+        };
+        let check = if check.is_some() || name == filecaps::NAME {
+            Some(&check_mounted as &super::XattrWriteCheck<'_>)
+        } else {
+            None
+        };
+        if let XattrMutation::Set(value, flags) = mutation {
+            if name == filecaps::NAME {
+                let value = filecaps::for_storage(&context, &inode.metadata()?, value)?;
+                return inode.mutate_xattr(name, XattrMutation::Set(value.bytes(), flags), check);
+            }
         }
-        self.dentry.inode.removexattr(name)
+        inode.mutate_xattr(name, mutation, check)
     }
 
     fn remove_security_privileges(

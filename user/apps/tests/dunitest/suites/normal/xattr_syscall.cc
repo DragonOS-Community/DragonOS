@@ -110,7 +110,7 @@ TEST_F(XattrSyscall, AttributeChangesRequireInodeWritePermission) {
         }
         EXPECT_EQ(-1, setxattr(sticky.c_str(), kName, kValue, sizeof(kValue), 0));
         EXPECT_EQ(EPERM, errno);
-        int writable = open(owned.c_str(), O_CREAT | O_WRONLY | O_EXCL, 0644);
+        int writable = open(owned.c_str(), O_CREAT | O_RDONLY | O_EXCL, 0644);
         EXPECT_GE(writable, 0);
         EXPECT_EQ(0, fsetxattr(writable, kName, kValue, sizeof(kValue), 0));
         EXPECT_EQ(0, fremovexattr(writable, kName));
@@ -133,6 +133,39 @@ TEST_F(XattrSyscall, AttributeChangesRequireInodeWritePermission) {
     EXPECT_EQ(0, unlink(owned.c_str()));
     EXPECT_EQ(0, rmdir(sticky.c_str()));
     EXPECT_EQ(0, unlink(link.c_str()));
+}
+
+TEST_F(XattrSyscall, ReadonlyMountRejectsMutationBeforeNamespaceChecks) {
+    const std::string link = path + ".link";
+    ASSERT_EQ(0, symlink(path.c_str(), link.c_str()));
+    ASSERT_EQ(0, close(fd));
+    fd = -1;
+    ASSERT_NO_FATAL_FAILURE(filesystem.Unmount());
+    ASSERT_NO_FATAL_FAILURE(filesystem.Mount(MS_RDONLY));
+    fd = open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    EXPECT_EQ(-1, lsetxattr(link.c_str(), kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(EROFS, errno);
+    EXPECT_EQ(-1, lremovexattr(link.c_str(), kName));
+    EXPECT_EQ(EROFS, errno);
+    EXPECT_EQ(-1, Remove(Access::Fd, kName));
+    EXPECT_EQ(EROFS, errno);
+    ExpectOriginal();
+}
+
+TEST_F(XattrSyscall, MutationRequiresPathOrOpenFile) {
+    EXPECT_EQ(-1, setxattr("", kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(ENOENT, errno);
+    EXPECT_EQ(-1, removexattr("", kName));
+    EXPECT_EQ(ENOENT, errno);
+    const int path_fd = open(path.c_str(), O_PATH);
+    ASSERT_GE(path_fd, 0);
+    EXPECT_EQ(-1, fsetxattr(path_fd, kName, kValue, sizeof(kValue), 0));
+    EXPECT_EQ(EBADF, errno);
+    EXPECT_EQ(-1, fremovexattr(path_fd, kName));
+    EXPECT_EQ(EBADF, errno);
+    EXPECT_EQ(0, close(path_fd));
+    ExpectOriginal();
 }
 
 TEST_F(XattrSyscall, ReadOnlyOutputReturnsEFAULT) {

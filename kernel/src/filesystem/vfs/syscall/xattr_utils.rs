@@ -4,12 +4,12 @@ use crate::{
     filesystem::{
         fsnotify::{self, FsEvent},
         vfs::{
-            file::File,
+            file::{File, FileFlags},
             permission::{check_inode_permission, PermissionMask},
             syscall::AtFlags,
             utils::user_path_at,
-            FileType, IndexNode, InodeFlags, InodeMode, XattrFlags, MAX_PATHLEN,
-            VFS_MAX_FOLLOW_SYMLINK_TIMES,
+            FileType, IndexNode, InodeFlags, InodeMode, Metadata, XattrFlags, XattrMutation,
+            MAX_PATHLEN, VFS_MAX_FOLLOW_SYMLINK_TIMES,
         },
     },
     mm::{allocation::MemoryAllocationError, VirtAddr},
@@ -175,13 +175,16 @@ pub(super) fn path_removexattr(
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = crate::filesystem::vfs::file::File::recover_io(|| {
         current_node.lookup_follow_symlink2(&rest_path, VFS_MAX_FOLLOW_SYMLINK_TIMES, follow_final)
     })?;
 
-    do_removexattr(inode, name.as_bytes())
+    mutate_xattr(inode, name.as_bytes(), XattrMutation::Remove)
 }
 
 pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, SystemError> {
@@ -191,40 +194,33 @@ pub(super) fn fd_removexattr(fd: i32, name_ptr: *const u8) -> Result<usize, Syst
         .fd_table()
         .get_file_by_fd(fd)
         .ok_or(SystemError::EBADF)?;
-    let inode = file.inode();
+    if file.flags().contains(FileFlags::O_PATH) {
+        return Err(SystemError::EBADF);
+    }
+    let inode = file.path_inode();
 
     let name = clone_xattr_name(name_ptr)?;
-    do_removexattr(inode, name.as_bytes())
+    mutate_xattr(inode, name.as_bytes(), XattrMutation::Remove)
 }
 
-fn do_removexattr(inode: Arc<dyn IndexNode>, name: &[u8]) -> Result<usize, SystemError> {
-    let result = File::recover_io(|| {
-        check_xattr_permission(&inode, name, PermissionMask::MAY_WRITE)?;
-        inode.removexattr(name)
-    })?;
-    fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
-    Ok(result)
-}
-
-// Apply Linux xattr_permission at the syscall boundary.
+// Use a locked snapshot for writes, and fetch metadata lazily for reads.
 fn check_xattr_permission(
     inode: &Arc<dyn IndexNode>,
     name: &[u8],
     mask: PermissionMask,
+    snapshot: Option<&Metadata>,
 ) -> Result<(), SystemError> {
     let write = mask.contains(PermissionMask::MAY_WRITE);
-    let metadata = if write {
-        let metadata = inode.metadata()?;
-        if metadata
-            .flags
-            .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
+    if let Some(metadata) = snapshot {
+        if metadata.uid == u32::MAX as usize
+            || metadata.gid == u32::MAX as usize
+            || metadata
+                .flags
+                .intersects(InodeFlags::S_IMMUTABLE | InodeFlags::S_APPEND)
         {
             return Err(SystemError::EPERM);
         }
-        Some(metadata)
-    } else {
-        None
-    };
+    }
     if name.starts_with(b"security.") || name.starts_with(b"system.") {
         return Ok(());
     }
@@ -240,9 +236,13 @@ fn check_xattr_permission(
             Err(denied)
         };
     }
-    let metadata = match metadata {
+    let fetched;
+    let metadata = match snapshot {
         Some(metadata) => metadata,
-        None => inode.metadata()?,
+        None => {
+            fetched = inode.metadata()?;
+            &fetched
+        }
     };
     if name.starts_with(b"user.") {
         if !matches!(metadata.file_type, FileType::File | FileType::Dir) {
@@ -251,12 +251,12 @@ fn check_xattr_permission(
         if write
             && metadata.file_type == FileType::Dir
             && metadata.mode.contains(InodeMode::S_ISVTX)
-            && !ProcessManager::current_cred().is_owner_or_capable(&metadata)
+            && !ProcessManager::current_cred().is_owner_or_capable(metadata)
         {
             return Err(SystemError::EPERM);
         }
     }
-    check_inode_permission(inode, &metadata, mask)
+    check_inode_permission(inode, metadata, mask)
 }
 
 fn do_getxattr(
@@ -268,7 +268,7 @@ fn do_getxattr(
     let name = clone_xattr_name(name_ptr)?;
 
     File::recover_io(|| {
-        check_xattr_permission(&inode, name.as_bytes(), PermissionMask::MAY_READ)?;
+        check_xattr_permission(&inode, name.as_bytes(), PermissionMask::MAY_READ, None)?;
         copy_xattr_output(
             size,
             XATTR_SIZE_MAX,
@@ -297,6 +297,9 @@ pub(super) fn path_setxattr(
         .into_string()
         .map_err(|_| SystemError::EINVAL)?;
 
+    if path.is_empty() {
+        return Err(SystemError::ENOENT);
+    }
     let pcb = ProcessManager::current_pcb();
     let (current_node, rest_path) = user_path_at(&pcb, AtFlags::AT_FDCWD.bits(), &path)?;
     let inode = crate::filesystem::vfs::file::File::recover_io(|| {
@@ -319,21 +322,32 @@ pub(super) fn fd_setxattr(
         .fd_table()
         .get_file_by_fd(fd)
         .ok_or(SystemError::EBADF)?;
-    let inode = file.inode();
+    if file.flags().contains(FileFlags::O_PATH) {
+        return Err(SystemError::EBADF);
+    }
+    let inode = file.path_inode();
 
     let xattr = prepare_setxattr_args(name_ptr, value_ptr, size, flags)?;
     do_setxattr(inode, xattr)
 }
 
 fn do_setxattr(inode: Arc<dyn IndexNode>, xattr: SetxattrArgs) -> Result<usize, SystemError> {
-    let result = crate::filesystem::vfs::file::File::recover_io(|| {
-        check_xattr_permission(&inode, xattr.name.as_bytes(), PermissionMask::MAY_WRITE)?;
-        inode.setxattr(
-            xattr.name.as_bytes(),
-            xattr.value.as_deref().unwrap_or(&[]),
-            xattr.flags,
-        )
-    })?;
+    mutate_xattr(
+        inode,
+        xattr.name.as_bytes(),
+        XattrMutation::Set(xattr.value.as_deref().unwrap_or(&[]), xattr.flags),
+    )
+}
+
+fn mutate_xattr(
+    inode: Arc<dyn IndexNode>,
+    name: &[u8],
+    mutation: XattrMutation<'_>,
+) -> Result<usize, SystemError> {
+    let check = |metadata: &Metadata| {
+        check_xattr_permission(&inode, name, PermissionMask::MAY_WRITE, Some(metadata))
+    };
+    let result = File::recover_io(|| inode.mutate_xattr(name, mutation, Some(&check)))?;
     fsnotify::fsnotify_inode(FsEvent::ATTRIB, &inode);
     Ok(result)
 }

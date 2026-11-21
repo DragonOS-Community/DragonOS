@@ -2,5 +2,6 @@
 members = [
     "debugging/logmonitor",
 ]
+exclude = ["dadk"]
 
 resolver = "2"

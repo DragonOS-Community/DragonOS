@@ -84,11 +84,21 @@ impl StatusFileOps {
         pdata.append(&mut format!("Name:\t{}", name).as_bytes().to_owned());
 
         // State
-        if state == ProcessState::BlockedIdle {
-            pdata.extend_from_slice(b"\nState:\tI (idle)");
-        } else {
-            pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
-        }
+        //
+        // Linux 6.6 `fs/proc/array.c::proc_pid_status()` renders this with
+        // `task_state_array[]`, i.e. "<char> (<description>)". Printing the Rust
+        // `Debug` representation here leaked `Runnable` / `Blocked(true)` to
+        // user space, which no Linux tool can parse.
+        let state_str = match state {
+            ProcessState::Runnable => "R (running)",
+            ProcessState::Blocked(true) => "S (sleeping)",
+            ProcessState::Blocked(false) => "D (disk sleep)",
+            ProcessState::BlockedKillable => "D (disk sleep)",
+            ProcessState::BlockedIdle => "I (idle)",
+            ProcessState::Stopped => "T (stopped)",
+            ProcessState::Exited(_) => "Z (zombie)",
+        };
+        pdata.append(&mut format!("\nState:\t{}", state_str).into());
 
         // Tgid
         //

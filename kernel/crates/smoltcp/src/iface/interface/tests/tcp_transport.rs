@@ -329,7 +329,7 @@ fn tcp_transport_mtu_retry_preserves_sequence_and_avoids_neighbor_wait() {
     }
     struct RetryToken<'a>(&'a mut RetryDevice);
     impl TxToken for RetryToken<'_> {
-        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+        fn deferred_ip_output(&self, _: IpVersion, _: crate::phy::IpOutputClass) -> bool {
             true
         }
         fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, _: usize, _: F) -> R {

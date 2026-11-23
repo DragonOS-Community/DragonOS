@@ -251,7 +251,7 @@ fn deferred_ipv4_output_serializes_before_neighbor_and_fragmentation() {
     struct DeferredToken(Rc<RefCell<Vec<u8>>>);
 
     impl TxToken for DeferredToken {
-        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+        fn deferred_ip_output(&self, _: IpVersion, _: crate::phy::IpOutputClass) -> bool {
             true
         }
 

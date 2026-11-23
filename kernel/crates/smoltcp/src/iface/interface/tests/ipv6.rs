@@ -9,7 +9,7 @@ fn deferred_ipv6_output_serializes_without_neighbor_lookup() {
     struct DeferredToken(Rc<RefCell<Vec<u8>>>);
 
     impl TxToken for DeferredToken {
-        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+        fn deferred_ip_output(&self, _: IpVersion, _: crate::phy::IpOutputClass) -> bool {
             true
         }
 

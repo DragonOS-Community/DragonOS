@@ -51,6 +51,10 @@ impl<'a> BridgeIpHooks<'a> {
         }
     }
 
+    pub(crate) fn version(&self) -> IpVersion {
+        self.version
+    }
+
     pub(crate) fn has_hooks(&self) -> bool {
         [
             NftIpv4Hook::PreRouting,

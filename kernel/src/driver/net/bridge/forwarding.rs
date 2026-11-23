@@ -230,6 +230,15 @@ impl Bridge {
         self.retain_learned_order();
     }
 
+    pub(super) fn learn_source(&mut self, port_id: BridgePortId, source: EthernetAddress) -> bool {
+        if !self.ports.contains_key(&port_id) {
+            return false;
+        }
+        self.sweep_if_due();
+        self.insert_or_update_mac_entry(source, port_id);
+        true
+    }
+
     pub(super) fn select_egress(
         &mut self,
         ingress_port_id: BridgePortId,
@@ -256,7 +265,7 @@ impl Bridge {
                 });
             }
         };
-        if !self.ports.contains_key(&ingress_port_id) {
+        if !self.learn_source(ingress_port_id, ether_frame.src_addr()) {
             return Ok(BridgeDecision {
                 local: false,
                 local_stack_dst: None,
@@ -264,13 +273,7 @@ impl Bridge {
             });
         }
 
-        self.sweep_if_due();
-
         let dst_mac = ether_frame.dst_addr();
-        let src_mac = ether_frame.src_addr();
-
-        self.insert_or_update_mac_entry(src_mac, ingress_port_id);
-
         let port_local = self.port_local_macs.contains_key(&dst_mac);
         let local = dst_mac.is_broadcast()
             || dst_mac.as_bytes()[0] & 1 != 0

@@ -29,12 +29,17 @@ use smoltcp::wire::{
 };
 use system_error::SystemError;
 
+#[derive(Debug, Clone, Copy)]
+struct BridgeIngressPort {
+    id: BridgePortId,
+    generation: u64,
+}
+
 /// The unresolved MAC is the only asynchronous step after PRE_ROUTING.
 #[derive(Debug)]
 pub(in crate::driver::net) struct BridgeDnat {
-    ingress_port: BridgePortId,
+    ingress_port: BridgeIngressPort,
     generation: usize,
-    port_generation: u64,
     context: BridgePacketContext,
     fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
     version: IpVersion,
@@ -117,11 +122,12 @@ impl BridgeDriver {
             self.handle_bridge_dnat(
                 &bridge,
                 &hooks,
-                ingress_port,
-                port_generation,
+                BridgeIngressPort {
+                    id: ingress_port,
+                    generation: port_generation,
+                },
                 frame,
                 context,
-                version,
                 fragment,
             );
         } else {
@@ -228,14 +234,14 @@ impl BridgeDriver {
         &self,
         bridge: &Arc<BridgeIface>,
         hooks: &BridgeIpHooks<'_>,
-        ingress_port: BridgePortId,
-        port_generation: u64,
+        ingress_port: BridgeIngressPort,
         mut frame: IpFrame<'_>,
         context: BridgePacketContext,
-        version: IpVersion,
         fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
     ) {
-        use crate::net::route::{lookup_ingress, RTN_LOCAL, RTN_UNICAST};
+        use crate::net::route::{lookup_ingress, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST};
+
+        let version = hooks.version();
 
         let Some(netns) = bridge.net_namespace() else {
             return;
@@ -245,12 +251,17 @@ impl BridgeDriver {
         else {
             return;
         };
-        if route.matched.kind == RTN_LOCAL
+        if matches!(route.matched.kind, RTN_LOCAL | RTN_BROADCAST)
             || (route.matched.kind == RTN_UNICAST && route.oif != bridge.nic_id() as u32)
         {
-            if frame.set_destination_mac(bridge.mac()).is_ok() {
-                self.enqueue_bridge_ip(bridge, &frame, None, context, fragment);
+            if frame.set_destination_mac(bridge.mac()).is_err() {
+                return;
             }
+            let source = EthernetFrame::new_unchecked(frame.bytes()).src_addr();
+            if !self.inner.lock().learn_source(ingress_port.id, source) {
+                return;
+            }
+            self.enqueue_bridge_ip(bridge, &frame, None, context, fragment);
         } else if route.matched.kind == RTN_UNICAST {
             match probe_next_hop(bridge.as_ref(), &netns, route.next_hop, frame.ip()) {
                 Ok(mac) => {
@@ -258,7 +269,7 @@ impl BridgeDriver {
                         self.finish_bridge_ip(
                             bridge,
                             hooks,
-                            ingress_port,
+                            ingress_port.id,
                             &frame,
                             context,
                             fragment,
@@ -272,7 +283,6 @@ impl BridgeDriver {
                     let pending = BridgeDnat {
                         ingress_port,
                         generation: self.ingress_generation.load(Ordering::Acquire),
-                        port_generation,
                         context,
                         fragment,
                         version,
@@ -356,7 +366,12 @@ impl BridgeDriver {
         if self.ingress_generation.load(Ordering::Acquire) != pending.generation {
             return Err(SystemError::ENODEV.into());
         }
-        let ingress = self.inner.lock().ports.get(&pending.ingress_port).cloned();
+        let ingress = self
+            .inner
+            .lock()
+            .ports
+            .get(&pending.ingress_port.id)
+            .cloned();
         let _ingress_activity = ingress
             .as_ref()
             .and_then(BridgePort::enter)
@@ -366,7 +381,7 @@ impl BridgeDriver {
             .unwrap()
             .bridge_enable
             .bridge_ingress_generation()
-            != pending.port_generation
+            != pending.ingress_port.generation
         {
             return Err(SystemError::ENODEV.into());
         }
@@ -391,7 +406,7 @@ impl BridgeDriver {
         self.finish_bridge_ip(
             &local,
             &hooks,
-            pending.ingress_port,
+            pending.ingress_port.id,
             &frame,
             pending.context.fork(),
             pending.fragment,

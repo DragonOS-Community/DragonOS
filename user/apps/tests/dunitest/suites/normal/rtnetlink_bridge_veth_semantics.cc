@@ -24,6 +24,7 @@
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -132,9 +133,20 @@ std::optional<uint8_t> ReadOperstate(const nlmsghdr* message) {
 }
 
 std::optional<uint8_t> WaitForLinkOperstate(int fd, uint16_t kind, uint32_t index) {
-    for (int attempt = 0; attempt < 8; ++attempt) {
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        const auto remaining_time = deadline - Clock::now();
+        if (remaining_time <= Clock::duration::zero()) return std::nullopt;
+        const auto timeout = std::chrono::ceil<std::chrono::milliseconds>(remaining_time);
+        pollfd ready{fd, POLLIN, 0};
+        const int polled = poll(&ready, 1, static_cast<int>(timeout.count()));
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled <= 0) return std::nullopt;
+
         std::array<uint8_t, 4096> reply{};
-        const ssize_t count = recv(fd, reply.data(), reply.size(), 0);
+        const ssize_t count = recv(fd, reply.data(), reply.size(), MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
         if (count <= 0) return std::nullopt;
         int remaining = static_cast<int>(count);
         for (auto* message = reinterpret_cast<nlmsghdr*>(reply.data());
@@ -146,7 +158,6 @@ std::optional<uint8_t> WaitForLinkOperstate(int fd, uint16_t kind, uint32_t inde
             if (body->ifi_index == static_cast<int>(index)) return ReadOperstate(message);
         }
     }
-    return std::nullopt;
 }
 
 std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t seq) {

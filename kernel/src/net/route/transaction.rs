@@ -9,6 +9,7 @@ use crate::{
 
 use super::{
     fib::{FibEdit, PlannedFibMutation},
+    fib_index::smol_route,
     FibEditor, FibTable,
 };
 
@@ -19,8 +20,22 @@ pub(super) struct ProjectionPlan {
 struct ProjectionUpdate {
     iface: Arc<dyn Iface>,
     cidr: smoltcp::wire::IpCidr,
-    after: Option<SmolRoute>,
-    had_entry: bool,
+    after: ProjectedRoutes,
+    existing: usize,
+}
+
+enum ProjectedRoutes {
+    Single(Option<SmolRoute>),
+    Learned(Vec<SmolRoute>),
+}
+
+impl ProjectedRoutes {
+    fn as_slice(&self) -> &[SmolRoute] {
+        match self {
+            Self::Single(route) => route.as_slice(),
+            Self::Learned(routes) => routes,
+        }
+    }
 }
 
 struct IncrementalProjectionPlan {
@@ -55,9 +70,17 @@ impl IncrementalProjectionPlan {
             .try_reserve_exact(2)
             .map_err(|_| SystemError::ENOMEM)?;
         for key in FibTable::projection_keys(edit).into_iter().flatten() {
-            let before = fib.projection_winner(key, None).map(smol_route);
-            let after = fib.projection_winner(key, Some(edit)).map(smol_route);
-            if same_projection(before, after) {
+            let before = match fib.learned_projection_after(key, FibEdit::None)? {
+                Some(defaults) => ProjectedRoutes::Learned(defaults),
+                None => ProjectedRoutes::Single(fib.projection_winner(key, None).map(smol_route)),
+            };
+            let after = match fib.learned_projection_after(key, edit)? {
+                Some(defaults) => ProjectedRoutes::Learned(defaults),
+                None => {
+                    ProjectedRoutes::Single(fib.projection_winner(key, Some(edit)).map(smol_route))
+                }
+            };
+            if projections_equal(before.as_slice(), after.as_slice()) {
                 continue;
             }
             let iface = devices
@@ -66,15 +89,19 @@ impl IncrementalProjectionPlan {
                 .cloned()
                 .ok_or(SystemError::ENODEV)?;
             let cidr = key.cidr();
-            let mut had_entry = false;
+            let mut existing = 0;
             iface.smol_iface().lock().routes_mut().update(|routes| {
-                had_entry = routes.iter().any(|route| route.cidr == cidr);
+                existing = if matches!(before, ProjectedRoutes::Learned(_)) {
+                    routes.iter().filter(|route| route.cidr == cidr).count()
+                } else {
+                    usize::from(routes.iter().any(|route| route.cidr == cidr))
+                };
             });
             updates.push(ProjectionUpdate {
                 iface,
                 cidr,
                 after,
-                had_entry,
+                existing,
             });
         }
 
@@ -87,12 +114,15 @@ impl IncrementalProjectionPlan {
             }
             let additions = updates
                 .iter()
-                .filter(|candidate| {
-                    candidate.iface.nic_id() == updates[index].iface.nic_id()
-                        && candidate.after.is_some()
-                        && !candidate.had_entry
+                .filter(|candidate| candidate.iface.nic_id() == updates[index].iface.nic_id())
+                .map(|candidate| {
+                    candidate
+                        .after
+                        .as_slice()
+                        .len()
+                        .saturating_sub(candidate.existing)
                 })
-                .count();
+                .sum();
             if additions == 0 {
                 continue;
             }
@@ -120,34 +150,25 @@ impl IncrementalProjectionPlan {
                 .lock()
                 .routes_mut()
                 .update(|routes| {
-                    let existing = routes.iter().position(|route| route.cidr == update.cidr);
-                    match (existing, update.after) {
-                        (Some(index), Some(route)) => routes[index] = route,
-                        (Some(index), None) => {
-                            routes.remove(index);
+                    if update.existing <= 1 {
+                        if let ProjectedRoutes::Single(after) = &update.after {
+                            let existing =
+                                routes.iter().position(|route| route.cidr == update.cidr);
+                            match (existing, *after) {
+                                (Some(index), Some(route)) => routes[index] = route,
+                                (Some(index), None) => {
+                                    routes.remove(index);
+                                }
+                                (None, Some(route)) => routes.push(route),
+                                (None, None) => {}
+                            }
+                            return;
                         }
-                        (None, Some(route)) => routes.push(route),
-                        (None, None) => {}
                     }
+                    routes.retain(|route| route.cidr != update.cidr);
+                    routes.extend_from_slice(update.after.as_slice());
                 });
         }
-    }
-}
-
-fn smol_route(route: super::RouteEntry) -> SmolRoute {
-    SmolRoute {
-        cidr: super::canonical_cidr(route.destination),
-        via_router: route.gateway,
-        preferred_until: None,
-        expires_at: None,
-    }
-}
-
-fn same_projection(left: Option<SmolRoute>, right: Option<SmolRoute>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.cidr == right.cidr && left.via_router == right.via_router,
-        (None, None) => true,
-        (Some(_), None) | (None, Some(_)) => false,
     }
 }
 
@@ -326,8 +347,10 @@ pub(super) fn projection_for_iface(
 
 fn projections_equal(left: &[SmolRoute], right: &[SmolRoute]) -> bool {
     left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.cidr == right.cidr && left.via_router == right.via_router)
+        && left.iter().zip(right).all(|(left, right)| {
+            left.cidr == right.cidr
+                && left.via_router == right.via_router
+                && left.expires_at == right.expires_at
+                && left.preferred_until == right.preferred_until
+        })
 }

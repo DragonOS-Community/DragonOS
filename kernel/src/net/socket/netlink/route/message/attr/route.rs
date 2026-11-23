@@ -16,7 +16,9 @@ enum RouteAttrClass {
     PREFSRC = 7,
     METRICS = 8,
     MULTIPATH = 9,
+    CACHEINFO = 12,
     TABLE = 15,
+    PREF = 20,
 }
 
 impl TryFrom<u16> for RouteAttrClass {
@@ -34,7 +36,9 @@ impl TryFrom<u16> for RouteAttrClass {
             7 => Ok(RouteAttrClass::PREFSRC),
             8 => Ok(RouteAttrClass::METRICS),
             9 => Ok(RouteAttrClass::MULTIPATH),
+            12 => Ok(RouteAttrClass::CACHEINFO),
             15 => Ok(RouteAttrClass::TABLE),
+            20 => Ok(RouteAttrClass::PREF),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -50,6 +54,10 @@ pub enum RouteAttr {
     Priority(u32),
     Prefsrc(Vec<u8>),
     Table(u32),
+    /// These attributes describe a learned route in replies and multicast
+    /// notifications. Request parsing keeps ignoring them.
+    CacheInfo([u8; 32]),
+    Preference(u8),
     /// Known nested attributes whose semantics are not implemented yet. The
     /// operation layer only needs their presence, so do not duplicate an
     /// attacker-sized payload that will be ignored or rejected.
@@ -68,6 +76,8 @@ impl RouteAttr {
             RouteAttr::Priority(_) => RouteAttrClass::PRIORITY,
             RouteAttr::Prefsrc(_) => RouteAttrClass::PREFSRC,
             RouteAttr::Table(_) => RouteAttrClass::TABLE,
+            RouteAttr::CacheInfo(_) => RouteAttrClass::CACHEINFO,
+            RouteAttr::Preference(_) => RouteAttrClass::PREF,
             RouteAttr::Metrics => RouteAttrClass::METRICS,
             RouteAttr::Multipath => RouteAttrClass::MULTIPATH,
         }
@@ -85,6 +95,8 @@ impl Attribute for RouteAttr {
             | RouteAttr::Src(addr)
             | RouteAttr::Gateway(addr)
             | RouteAttr::Prefsrc(addr) => addr.as_slice(),
+            RouteAttr::CacheInfo(info) => info,
+            RouteAttr::Preference(preference) => core::slice::from_ref(preference),
             RouteAttr::Metrics | RouteAttr::Multipath => &[],
             RouteAttr::Oif(idx)
             | RouteAttr::Iif(idx)
@@ -142,7 +154,9 @@ impl Attribute for RouteAttr {
             RouteAttrClass::METRICS if payload_len == 0 || payload_len >= 4 => RouteAttr::Metrics,
             // struct rtnexthop is 8 bytes in Linux's UAPI.
             RouteAttrClass::MULTIPATH if payload_len >= 8 => RouteAttr::Multipath,
-            RouteAttrClass::UNSPEC => return Ok(None),
+            RouteAttrClass::UNSPEC | RouteAttrClass::CACHEINFO | RouteAttrClass::PREF => {
+                return Ok(None);
+            }
             _ => return Err(SystemError::EINVAL),
         };
 

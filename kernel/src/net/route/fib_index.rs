@@ -6,8 +6,8 @@ use smoltcp::wire::{IpAddress, IpCidr};
 use system_error::SystemError;
 
 use super::{
-    canonical_cidr, RouteEntry, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_UNICAST,
-    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_LOCAL,
+    canonical_cidr, RouteEntry, RouterPreference, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST,
+    RTN_UNICAST, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_LOCAL,
 };
 
 mod alias;
@@ -273,14 +273,18 @@ impl ProjectionKey {
     pub(super) fn oif(self) -> u32 {
         self.oif
     }
+
+    pub(super) fn is_ipv6_default(self) -> bool {
+        self.family == AddressFamily::Ipv6 && self.prefix_len == 0
+    }
 }
 
 /// Derived lookup and projection indexes for the authoritative route vector.
 ///
 /// `all` buckets contain authoritative vector positions in insertion order.
-/// `winners` preselects every selector used by packet-path lookups, so an
-/// exact-prefix lookup never scans an attacker-controlled alias list while
-/// holding the FIB lock. Lifecycle edits rebuild only affected prefix winners.
+/// `winners` preselects each packet-path selector. Only an expired learned
+/// default can require inspecting the same prefix for a live alternative.
+/// Lifecycle edits rebuild only affected prefix winners.
 /// `alias_order` keeps semantic alias order independent of authoritative
 /// vector slots moved by `swap_remove`, without shifting a whole prefix on
 /// prepend.
@@ -586,8 +590,12 @@ impl FibIndex {
     }
 
     pub(super) fn prefix_candidates(&self, route: RouteEntry) -> &[usize] {
+        self.prefix_candidates_for(route.table, route.destination)
+    }
+
+    pub(super) fn prefix_candidates_for(&self, table: u32, destination: IpCidr) -> &[usize] {
         self.all
-            .get(&PrefixKey::new(route.table, route.destination))
+            .get(&PrefixKey::new(table, destination))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -617,20 +625,32 @@ impl FibIndex {
         projection
             .try_reserve_exact(count)
             .map_err(|_| SystemError::ENOMEM)?;
+        let mut learned_defaults = None;
         for (key, winner) in self
             .projection_winners
             .iter()
             .filter(|(key, _)| key.oif == ifindex)
         {
+            if key.is_ipv6_default() {
+                let candidates = self
+                    .projection_candidates(*key)
+                    .iter()
+                    .map(|&index| (routes[index], self.order_key(index)));
+                if let Some(defaults) = learned_projection(candidates)? {
+                    learned_defaults = Some(defaults);
+                    continue;
+                }
+            }
             let route = routes[*winner];
-            projection.push(SmolRoute {
-                cidr: key.cidr(),
-                via_router: route.gateway,
-                preferred_until: None,
-                expires_at: None,
-            });
+            projection.push(smol_route(route));
         }
         projection.sort_unstable_by_key(|route| route.cidr);
+        if let Some(defaults) = learned_defaults {
+            projection
+                .try_reserve(defaults.len())
+                .map_err(|_| SystemError::ENOMEM)?;
+            projection.extend(defaults);
+        }
         Ok(projection)
     }
 
@@ -656,7 +676,27 @@ impl FibIndex {
             let Some(winners) = self.winners.get(&key) else {
                 continue;
             };
-            let standard = winners.standard.get(required_oif, scope);
+            let mut standard = winners.standard.get(required_oif, scope);
+            if domain.family == AddressFamily::Ipv6
+                && prefix_len == 0
+                && standard.is_some_and(|index| routes[index].learned_default.is_some())
+            {
+                let now_us = crate::time::Instant::now().total_micros();
+                if standard.is_some_and(|index| !routes[index].is_live_at(now_us)) {
+                    standard = self.all[&key]
+                        .iter()
+                        .copied()
+                        .filter(|&index| {
+                            let route = routes[index];
+                            indexable(route)
+                                && route.kind != RTN_BROADCAST
+                                && required_oif.is_none_or(|oif| oif == route.oif)
+                                && scope.matches(route.scope)
+                                && route.is_live_at(now_us)
+                        })
+                        .min_by_key(|&index| route_order(routes[index], self.alias.order(index)));
+                }
+            }
             let broadcast = match broadcast {
                 BroadcastLookup::Exclude => None,
                 BroadcastLookup::Any => winners.broadcast.get(None, scope),
@@ -1002,10 +1042,58 @@ where
 fn route_precedes(
     candidate: usize,
     current: usize,
-    _routes: &[RouteEntry],
+    routes: &[RouteEntry],
     alias_order: &[AliasOrder],
 ) -> bool {
-    alias_order[candidate] < alias_order[current]
+    route_order(routes[candidate], alias_order[candidate])
+        < route_order(routes[current], alias_order[current])
+}
+
+fn route_order(route: RouteEntry, order: AliasOrder) -> (u32, RouterPreference, AliasOrder) {
+    (route.priority, route.preference(), order)
+}
+
+pub(super) fn smol_route(route: RouteEntry) -> SmolRoute {
+    SmolRoute {
+        cidr: canonical_cidr(route.destination),
+        via_router: route.gateway,
+        preferred_until: None,
+        expires_at: route.learned_default.map(|learned| {
+            // smoltcp stores the last usable microsecond, while the FIB
+            // stores the first expired microsecond.
+            smoltcp::time::Instant::from_micros(learned.expires_at_us.saturating_sub(1))
+        }),
+    }
+}
+
+pub(super) fn learned_projection(
+    candidates: impl Iterator<Item = (RouteEntry, AliasOrder)> + Clone,
+) -> Result<Option<Vec<SmolRoute>>, SystemError> {
+    if !candidates
+        .clone()
+        .any(|(route, _)| route.learned_default.is_some())
+    {
+        return Ok(None);
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(candidates.clone().count())
+        .map_err(|_| SystemError::ENOMEM)?;
+    ordered.extend(candidates);
+    // smoltcp selects the last route among equally specific prefixes.
+    // Retain alternatives so it can fall back even before physical cleanup.
+    ordered.sort_unstable_by_key(|&(route, order)| {
+        core::cmp::Reverse((
+            u8::from(route.table != RT_TABLE_LOCAL),
+            route_order(route, order),
+        ))
+    });
+    let mut projection = Vec::new();
+    projection
+        .try_reserve_exact(ordered.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    projection.extend(ordered.into_iter().map(|(route, _)| smol_route(route)));
+    Ok(Some(projection))
 }
 
 fn projection_order(
@@ -1134,11 +1222,12 @@ fn indexable(route: RouteEntry) -> bool {
 mod tests {
     use alloc::vec::Vec;
 
-    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+    use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     use super::{AliasPlacement, BroadcastLookup, FibIndex};
     use crate::net::route::{
-        RouteEntry, RTN_BROADCAST, RTN_UNICAST, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_MAIN,
+        LearnedDefaultRoute, RouteEntry, RouterPreference, RTN_BROADCAST, RTN_UNICAST,
+        RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_MAIN,
     };
 
     fn route(address: [u8; 4], prefix_len: u8, priority: u32, kind: u8) -> RouteEntry {
@@ -1160,6 +1249,7 @@ mod tests {
             oif: 1,
             gateway: None,
             nexthop_flags: 0,
+            learned_default: None,
         }
     }
 
@@ -1185,6 +1275,78 @@ mod tests {
             ),
             Some(2)
         );
+    }
+
+    #[test]
+    fn learned_default_projection_falls_back_at_expiry() {
+        let static_gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into();
+        let learned_gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2).into();
+        let default = RouteEntry {
+            destination: IpCidr::new(Ipv6Address::UNSPECIFIED.into(), 0),
+            gateway: Some(static_gateway),
+            ..route([0; 4], 0, 1024, RTN_UNICAST)
+        };
+        let learned = RouteEntry {
+            gateway: Some(learned_gateway),
+            learned_default: Some(LearnedDefaultRoute {
+                expires_at_us: 10,
+                preference: RouterPreference::High,
+            }),
+            ..default
+        };
+        let entries = [default, learned];
+        let mut fib = FibIndex::build(&entries).unwrap();
+        let projection = fib.projection_for_iface(&entries, default.oif).unwrap();
+        let destination = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into();
+        let mut smoltcp = smoltcp::iface::Routes::new();
+        smoltcp.update(|routes| *routes = projection);
+        assert_eq!(
+            smoltcp.lookup(&destination, smoltcp::time::Instant::from_micros(9)),
+            Some(learned_gateway)
+        );
+        assert_eq!(
+            smoltcp.lookup(&destination, smoltcp::time::Instant::from_micros(10)),
+            Some(static_gateway)
+        );
+
+        let mut expired_entries = entries;
+        expired_entries[1]
+            .learned_default
+            .as_mut()
+            .unwrap()
+            .expires_at_us = 0;
+        assert_eq!(
+            fib.lookup(
+                &expired_entries,
+                destination,
+                RT_TABLE_MAIN,
+                None,
+                None,
+                BroadcastLookup::Exclude,
+            ),
+            Some(0)
+        );
+
+        let mut refreshed = entries;
+        refreshed[1].learned_default.as_mut().unwrap().expires_at_us = i64::MAX;
+        fib.prepare_insert(refreshed[1]).unwrap();
+        fib.commit_replace(1, learned, refreshed[1], &refreshed);
+        let selected = |fib: &FibIndex, entries: &[RouteEntry]| {
+            fib.lookup(
+                entries,
+                destination,
+                RT_TABLE_MAIN,
+                None,
+                None,
+                BroadcastLookup::Exclude,
+            )
+        };
+        assert_eq!(selected(&fib, &refreshed), Some(1));
+        let old = refreshed[1];
+        refreshed[1].learned_default.as_mut().unwrap().preference = RouterPreference::Low;
+        fib.prepare_insert(refreshed[1]).unwrap();
+        fib.commit_replace(1, old, refreshed[1], &refreshed);
+        assert_eq!(selected(&fib, &refreshed), Some(0));
     }
 
     #[test]
@@ -1214,7 +1376,18 @@ mod tests {
 
         let removed = routes.swap_remove(2);
         index.commit_remove(2, removed, None, &routes);
-        assert_eq!(index, FibIndex::build(&routes).unwrap());
+        let rebuilt = FibIndex::build(&routes).unwrap();
+        // An incremental index keeps advancing its alias group allocator.
+        // Compare live ordering and derived caches with the fresh build.
+        assert_eq!(index.all, rebuilt.all);
+        assert_eq!(index.winners, rebuilt.winners);
+        assert_eq!(index.projection, rebuilt.projection);
+        assert_eq!(index.projection_winners, rebuilt.projection_winners);
+        assert_eq!(index.prefix_counts, rebuilt.prefix_counts);
+        for (slot, route) in routes.into_iter().enumerate() {
+            assert_eq!(index.order_key(slot), rebuilt.order_key(slot));
+            assert_eq!(index.analyze_insert(route).exact, Some(slot));
+        }
     }
 
     #[test]
@@ -1254,8 +1427,8 @@ mod tests {
 
     #[test]
     fn bulk_alias_insert_keeps_constant_time_metadata_and_semantic_order() {
-        let mut routes = Vec::new();
-        let mut semantic_order = Vec::new();
+        let mut routes: Vec<RouteEntry> = Vec::new();
+        let mut semantic_order: Vec<usize> = Vec::new();
         let mut index = FibIndex::default();
 
         for ordinal in 0..512_u32 {

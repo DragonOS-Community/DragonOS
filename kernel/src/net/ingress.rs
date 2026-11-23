@@ -10,7 +10,7 @@ use super::{
 };
 use crate::driver::net::{
     inject_owned_local_ip_packet_if_epoch, types::InterfaceFlags, veth::VethInterface, Iface,
-    LocalPacketOrigin, PacketBuffer,
+    IfaceCommon, LocalPacketOrigin, PacketBuffer,
 };
 use crate::process::namespace::net_namespace::{
     DefragSource, NetNamespace, PendingIpFragment, PendingIpv4Fragment, PendingIpv6Fragment,
@@ -50,6 +50,8 @@ pub(crate) struct NetIngressFilter<'a> {
     ruleset: &'a Arc<RulesetSnapshot>,
     netns: &'a Arc<NetNamespace>,
     owner_ifindex: u32,
+    owner_epoch: u64,
+    owner: &'a IfaceCommon,
     device_names: &'a NftDeviceNames,
     stage: &'a Cell<IngressStage>,
     /// Packet-owned route classification installed only by a local RX token.
@@ -75,6 +77,8 @@ pub(crate) struct NetIngressFilterInit<'a> {
     pub(crate) ruleset: &'a Arc<RulesetSnapshot>,
     pub(crate) netns: &'a Arc<NetNamespace>,
     pub(crate) owner_ifindex: u32,
+    pub(crate) owner_epoch: u64,
+    pub(crate) owner: &'a IfaceCommon,
     pub(crate) device_names: &'a NftDeviceNames,
     pub(crate) stage: &'a Cell<IngressStage>,
     pub(crate) handoff_broadcast: &'a Cell<bool>,
@@ -92,6 +96,10 @@ pub(crate) struct NetIngressFilterInit<'a> {
 /// callback together. No target interface is entered while the source's
 /// smoltcp, socket-set, or FIB locks are held.
 pub(crate) enum RoutedIngressWork {
+    RouterAdvertisement {
+        netns: Arc<NetNamespace>,
+        advertisement: super::route::ra::Advertisement,
+    },
     IcmpError {
         netns: Arc<NetNamespace>,
         feedback: super::icmp_error::IcmpErrorFeedback,
@@ -136,6 +144,13 @@ pub(crate) enum RoutedIngressWork {
 impl RoutedIngressWork {
     pub(crate) fn execute(self) {
         let result = match self {
+            Self::RouterAdvertisement {
+                netns,
+                advertisement,
+            } => {
+                netns.queue_router_advertisement(advertisement);
+                return;
+            }
             Self::IcmpError { netns, feedback } => {
                 super::icmp_error::execute(&netns, feedback);
                 return;
@@ -272,6 +287,8 @@ impl<'a> NetIngressFilter<'a> {
             ruleset,
             netns,
             owner_ifindex,
+            owner_epoch,
+            owner,
             device_names,
             stage,
             handoff_broadcast,
@@ -288,6 +305,8 @@ impl<'a> NetIngressFilter<'a> {
             ruleset,
             netns,
             owner_ifindex,
+            owner_epoch,
+            owner,
             device_names,
             stage,
             handoff_broadcast,
@@ -988,7 +1007,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         protocol: IpProtocol,
-        _transport_offset: usize,
+        transport_offset: usize,
     ) -> LocalInputVerdict {
         let version = match IpVersion::of_packet(packet.bytes()) {
             Ok(version) => version,
@@ -1078,6 +1097,31 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         }
 
         let packet = packet.bytes();
+        // RA is link control, so use the same device that delivered the
+        // packet locally (the bridge master for bridged advertisements).
+        if protocol == IpProtocol::Icmpv6
+            && ingress_ifindex == self.owner_ifindex
+            && !matches!(
+                self.stage.get(),
+                IngressStage::LocalInputDone | IngressStage::LocalOutput
+            )
+            && self.forward_fragment.get().is_none()
+        {
+            if let Some(advertisement) = super::route::ra::parse(
+                packet,
+                transport_offset,
+                ingress_ifindex,
+                self.owner_epoch,
+                self.owner,
+            ) {
+                if self.work.try_reserve(1).is_ok() {
+                    self.work.push(RoutedIngressWork::RouterAdvertisement {
+                        netns: self.netns.clone(),
+                        advertisement,
+                    });
+                }
+            }
+        }
         // Control admission precedes allocation. Ordinary raw delivery below
         // remains independent when the ICMP control budget is exhausted.
         if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6)

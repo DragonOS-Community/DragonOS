@@ -29,12 +29,12 @@ pub(super) struct Ipv6DirOps(SysctlNamespace);
 struct ConfDirOps(SysctlNamespace);
 
 #[derive(Debug, Clone, Copy)]
-enum NamespaceForwarding {
+enum NamespaceConfScope {
     All,
     Default,
 }
 
-impl NamespaceForwarding {
+impl NamespaceConfScope {
     fn from_dir_name(name: &str) -> Option<Self> {
         match name {
             "all" => Some(Self::All),
@@ -47,7 +47,7 @@ impl NamespaceForwarding {
 #[derive(Debug)]
 struct NamespaceConfDirOps {
     namespace: SysctlNamespace,
-    target: NamespaceForwarding,
+    target: NamespaceConfScope,
 }
 
 impl Ipv6DirOps {
@@ -79,7 +79,7 @@ impl NamespaceConfDirOps {
     fn new_inode(
         parent: Weak<dyn IndexNode>,
         namespace: SysctlNamespace,
-        target: NamespaceForwarding,
+        target: NamespaceConfScope,
     ) -> Arc<dyn IndexNode> {
         ProcDirBuilder::new(
             Self { namespace, target },
@@ -134,7 +134,7 @@ impl DirOps for ConfDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.0.upgrade()?;
-        if let Some(target) = NamespaceForwarding::from_dir_name(name) {
+        if let Some(target) = NamespaceConfScope::from_dir_name(name) {
             return Ok(dir
                 .cached_children()
                 .write()
@@ -174,18 +174,21 @@ impl DirOps for NamespaceConfDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.validate_inode()?;
-        if name != "forwarding" {
-            return Err(SystemError::ENOENT);
-        }
+        let field = match name {
+            "forwarding" => NamespaceConfField::Forwarding,
+            "accept_ra" => NamespaceConfField::AcceptRa,
+            _ => return Err(SystemError::ENOENT),
+        };
         Ok(dir
             .cached_children()
             .write()
             .entry(name.to_string())
             .or_insert_with(|| {
                 ProcFileBuilder::new(
-                    ForwardingFileOps {
+                    NamespaceConfFileOps {
                         namespace: self.namespace.clone(),
                         target: self.target,
+                        field,
                     },
                     InodeMode::from_bits_truncate(0o644),
                 )
@@ -199,16 +202,24 @@ impl DirOps for NamespaceConfDirOps {
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let _ = self.lookup_child(dir, "forwarding");
+        let _ = self.lookup_child(dir, "accept_ra");
     }
 }
 
 #[derive(Debug)]
-struct ForwardingFileOps {
-    namespace: SysctlNamespace,
-    target: NamespaceForwarding,
+enum NamespaceConfField {
+    Forwarding,
+    AcceptRa,
 }
 
-impl FileOps for ForwardingFileOps {
+#[derive(Debug)]
+struct NamespaceConfFileOps {
+    namespace: SysctlNamespace,
+    target: NamespaceConfScope,
+    field: NamespaceConfField,
+}
+
+impl FileOps for NamespaceConfFileOps {
     const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
         crate::filesystem::procfs::template::ProcfsSeekKind::Default;
 
@@ -244,9 +255,19 @@ impl FileOps for ForwardingFileOps {
             let (value, consumed) = parse_numeric_sysctl(buf)?;
             let value = i32::try_from(value).map_err(|_| SystemError::EINVAL)?;
             let rtnl = rtnl::lock();
-            match ops.target {
-                NamespaceForwarding::All => netns.set_ipv6_forwarding(&rtnl, value),
-                NamespaceForwarding::Default => netns.set_ipv6_default_forwarding(&rtnl, value),
+            match (&ops.field, ops.target) {
+                (NamespaceConfField::Forwarding, NamespaceConfScope::All) => {
+                    crate::net::route::ra::set_forwarding(&rtnl, &netns, None, value)?;
+                }
+                (NamespaceConfField::Forwarding, NamespaceConfScope::Default) => {
+                    netns.set_ipv6_default_forwarding(&rtnl, value);
+                }
+                (NamespaceConfField::AcceptRa, NamespaceConfScope::All) => {
+                    netns.set_ipv6_all_accept_ra(&rtnl, value);
+                }
+                (NamespaceConfField::AcceptRa, NamespaceConfScope::Default) => {
+                    netns.set_ipv6_default_accept_ra(&rtnl, value);
+                }
             }
             Ok(PrimaryWriteResult::new(consumed))
         })
@@ -267,9 +288,17 @@ impl FileOps for ForwardingFileOps {
         if offset != 0 {
             return Ok(0);
         }
-        let value = match self.target {
-            NamespaceForwarding::All => netns.ipv6_forwarding_value(),
-            NamespaceForwarding::Default => netns.ipv6_default_forwarding(),
+        let value = match (&self.field, self.target) {
+            (NamespaceConfField::Forwarding, NamespaceConfScope::All) => {
+                netns.ipv6_forwarding_value()
+            }
+            (NamespaceConfField::Forwarding, NamespaceConfScope::Default) => {
+                netns.ipv6_default_forwarding()
+            }
+            (NamespaceConfField::AcceptRa, NamespaceConfScope::All) => netns.ipv6_all_accept_ra(),
+            (NamespaceConfField::AcceptRa, NamespaceConfScope::Default) => {
+                netns.ipv6_default_accept_ra()
+            }
         };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }

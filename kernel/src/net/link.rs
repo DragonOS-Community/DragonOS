@@ -387,6 +387,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             // before the FIB writer so a classifier holding a FIB reader can
             // finish instead of deadlocking the control-plane transaction.
             iface.quiesce_admin_down();
+            iface.common().invalidate_router_advertisements();
         }
 
         let mut removed_addresses = Vec::new();

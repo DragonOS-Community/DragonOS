@@ -16,7 +16,7 @@ use crate::{
 };
 
 const IPV4_MIN_MTU: usize = 68;
-const IPV6_MIN_MTU: usize = 1280;
+pub(crate) const IPV6_MIN_MTU: usize = 1280;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddressMutation {
@@ -138,6 +138,7 @@ pub(crate) fn set_device_ipv6_disabled(
             was_up: up,
             is_up: up,
             ipv6_enabled: Some(enabled),
+            discard_learned_defaults: false,
         },
     )?;
     let neighbors = if enabled {
@@ -434,7 +435,10 @@ pub(in crate::net) fn prepare_link_address_change(
             IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
         })
     };
-    if restored.is_none() && !mirror.iter().copied().any(needs_removal) {
+    let discard_learned_defaults =
+        mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && iface.mtu() >= IPV6_MIN_MTU);
+    if !discard_learned_defaults && restored.is_none() && !mirror.iter().copied().any(needs_removal)
+    {
         return Ok(None);
     }
     let before = try_clone_copy_slice(&mirror, 0)?;
@@ -465,6 +469,7 @@ pub(in crate::net) fn prepare_link_address_change(
         was_up,
         is_up,
         ipv6_enabled: None,
+        discard_learned_defaults,
     };
     let routes = match staged_before {
         Some(staged) => {

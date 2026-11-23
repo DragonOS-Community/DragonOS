@@ -17,6 +17,7 @@ use crate::net::ipv6_defrag::{
 };
 use crate::net::neighbor::NeighborTable;
 use crate::net::nftables::NftNamespaceState;
+use crate::net::route::ra::{self, Advertisement, PendingAdvertisements, ADVERTISEMENT_BATCH};
 use crate::net::routing::Router;
 use crate::net::socket::inet::datagram::udp_bindings::UdpBindingTable;
 use crate::net::socket::netlink::table::{
@@ -306,6 +307,8 @@ pub struct NetNamespace {
     /// Linux /proc/sys/net/ipv6/conf/all/forwarding. Never shares IPv4 state.
     ipv6_forwarding: AtomicI32,
     ipv6_default_forwarding: AtomicI32,
+    ipv6_all_accept_ra: AtomicI32,
+    ipv6_default_accept_ra: AtomicI32,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -771,6 +774,7 @@ struct NetnsPoller {
     defrag_pending: SpinLock<Option<DefragPending>>,
     defrag_enabled: AtomicBool,
     ipv6_defrag_enabled: AtomicBool,
+    router_advertisements: SpinLock<PendingAdvertisements>,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -786,6 +790,7 @@ impl NetnsPoller {
             defrag_pending: SpinLock::new(None),
             defrag_enabled: AtomicBool::new(false),
             ipv6_defrag_enabled: AtomicBool::new(false),
+            router_advertisements: SpinLock::new(PendingAdvertisements::default()),
             thread: RwSem::new(None),
         })
     }
@@ -1054,6 +1059,7 @@ impl NetnsPoller {
     fn polling(&self) {
         let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
         let mut cleanup_retry_at = None;
+        let mut ra_deadline = None;
         // The namespace poller owns reassembly exclusively. Neither NAPI nor
         // the pending-ring spinlock performs fragment allocation or expiry.
         let mut ipv4_defrag = Ipv4Defragmenter::new();
@@ -1102,6 +1108,24 @@ impl NetnsPoller {
             let deadline_now = Instant::now();
             let mut deadline_now_us = deadline_now.total_micros() as u64;
             netns.conntrack.expire_due(deadline_now);
+            let mut processed_advertisement = false;
+            for _ in 0..ADVERTISEMENT_BATCH {
+                let pending = self.router_advertisements.lock().pop();
+                let Some(advertisement) = pending else {
+                    break;
+                };
+                ra::apply(&netns, advertisement);
+                processed_advertisement = true;
+            }
+            if processed_advertisement {
+                ra_deadline = ra::next_deadline_us(&netns);
+            }
+            if let Some(deadline) = ra_deadline {
+                let now_us = Instant::now().total_micros();
+                if deadline <= now_us {
+                    ra_deadline = ra::expire(&netns, now_us);
+                }
+            }
             if ipv4_defrag
                 .next_deadline_us()
                 .is_some_and(|deadline| deadline <= deadline_now_us)
@@ -1173,6 +1197,13 @@ impl NetnsPoller {
                     Some(next_us.map_or(defrag_deadline, |current| current.min(defrag_deadline)));
             }
             if self.has_pending_ip_fragments() {
+                next_us = Some(deadline_now_us);
+            }
+            if let Some(deadline) = ra_deadline {
+                let deadline = deadline.max(0) as u64;
+                next_us = Some(next_us.map_or(deadline, |current| current.min(deadline)));
+            }
+            if !self.router_advertisements.lock().is_empty() {
                 next_us = Some(deadline_now_us);
             }
             let mut direct_due = Vec::new();
@@ -1377,6 +1408,8 @@ impl NetNamespace {
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
             ipv6_default_forwarding: AtomicI32::new(0),
+            ipv6_all_accept_ra: AtomicI32::new(1),
+            ipv6_default_accept_ra: AtomicI32::new(1),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1437,6 +1470,8 @@ impl NetNamespace {
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
             ipv6_default_forwarding: AtomicI32::new(0),
+            ipv6_all_accept_ra: AtomicI32::new(1),
+            ipv6_default_accept_ra: AtomicI32::new(1),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1960,6 +1995,26 @@ impl NetNamespace {
         self.ipv6_default_forwarding.load(Ordering::Acquire)
     }
 
+    pub(crate) fn ipv6_all_accept_ra(&self) -> i32 {
+        self.ipv6_all_accept_ra.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ipv6_default_accept_ra(&self) -> i32 {
+        self.ipv6_default_accept_ra.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_ipv6_all_accept_ra(&self, _rtnl: &crate::net::rtnl::RtnlGuard, value: i32) {
+        self.ipv6_all_accept_ra.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_ipv6_default_accept_ra(
+        &self,
+        _rtnl: &crate::net::rtnl::RtnlGuard,
+        value: i32,
+    ) {
+        self.ipv6_default_accept_ra.store(value, Ordering::Release);
+    }
+
     pub(crate) fn set_ipv6_default_forwarding(
         &self,
         _rtnl: &crate::net::rtnl::RtnlGuard,
@@ -2058,6 +2113,13 @@ impl NetNamespace {
         fragment: PendingIpFragment,
     ) -> Result<(), PendingIpFragment> {
         self.poller.queue_ip_fragment(fragment)
+    }
+
+    pub(crate) fn queue_router_advertisement(&self, advertisement: Advertisement) {
+        let queued = self.poller.router_advertisements.lock().push(advertisement);
+        if queued {
+            self.notify_deadline_changed();
+        }
     }
 
     /// Confirmation may establish a new GC deadline. Wake the namespace

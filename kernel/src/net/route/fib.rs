@@ -1,11 +1,15 @@
 use alloc::vec::Vec;
 
-use smoltcp::wire::{IpAddress, Ipv4Address};
+use smoltcp::iface::Route as SmolRoute;
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use system_error::SystemError;
 
 use super::{
     builtin_rule_tables,
-    fib_index::{projection_key, AliasPlacement, BroadcastLookup, FibIndex, ProjectionKey},
+    fib_index::{
+        learned_projection, projection_key, AliasPlacement, BroadcastLookup, FibIndex,
+        ProjectionKey,
+    },
     is_ipv4, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
     RouteNewFlags, RouteNotifications, RouteSourcePolicy, RT_SCOPE_LINK, RT_TABLE_DEFAULT,
     RT_TABLE_LOCAL, RT_TABLE_MAIN,
@@ -341,12 +345,19 @@ impl FibTable {
         let analysis = self.index.analyze_insert(route);
         let first = analysis.first;
         let exact = analysis.exact;
+        let matching_metric = || {
+            self.index
+                .prefix_candidates(route)
+                .iter()
+                .copied()
+                .filter(|&index| self.entries[index].priority == route.priority)
+        };
 
         if flags.excl && first.is_some() {
             return Err(SystemError::EEXIST);
         }
         if flags.replace {
-            if let Some(first) = first {
+            if let Some(mut first) = first {
                 if is_ipv4(route.destination.address()) {
                     if exact == Some(first) {
                         return Ok(PlannedFibMutation {
@@ -356,6 +367,30 @@ impl FibTable {
                     }
                     if exact.is_some() {
                         return Err(SystemError::EEXIST);
+                    }
+                } else if route.destination.prefix_len() == 0
+                    && matching_metric().any(|index| self.entries[index].learned_default.is_some())
+                {
+                    // Linux finds a route with the same nexthop class before
+                    // falling back to the first alias. A learned default is
+                    // not an ECMP-eligible gateway route.
+                    first = matching_metric()
+                        .filter(|&index| {
+                            let current = self.entries[index];
+                            let gateway_route =
+                                current.learned_default.is_none() && current.gateway.is_some();
+                            gateway_route == route.gateway.is_some()
+                        })
+                        .min_by_key(|&index| self.index.order_key(index))
+                        .unwrap_or(first);
+                    if exact.is_some_and(|slot| slot != first) {
+                        return Err(SystemError::EEXIST);
+                    }
+                    if self.entries[first].learned_default.is_some()
+                        && matching_metric()
+                            .any(|index| self.entries[index].learned_default.is_none())
+                    {
+                        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                     }
                 }
                 let old = self.entries[first];
@@ -379,7 +414,22 @@ impl FibTable {
             return Err(SystemError::ENOENT);
         }
         if !is_ipv4(route.destination.address()) && first.is_some() {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            if !matching_metric().any(|index| self.entries[index].learned_default.is_some()) {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            if !flags.append
+                || matching_metric().any(|index| {
+                    let current = self.entries[index];
+                    current.oif == route.oif && current.gateway == route.gateway
+                })
+            {
+                return Err(SystemError::EEXIST);
+            }
+            // RA aliases may coexist with one configured route. Admitting a
+            // second would expose unsupported IPv6 multipath after RA expiry.
+            if matching_metric().any(|index| self.entries[index].learned_default.is_none()) {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
         }
 
         let placement = if flags.append {
@@ -400,6 +450,51 @@ impl FibTable {
         })
     }
 
+    /// A learned default is owned by the advertising gateway and interface.
+    /// An administrator's equal-metric route to that same next hop wins the
+    /// slot even if the administrator chose the same protocol number.
+    pub(super) fn plan_learned_default(&self, route: RouteEntry, withdraw: bool) -> FibEdit {
+        debug_assert!(route.learned_default.is_some());
+        let mut learned = None;
+        for &index in self.index.prefix_candidates(route) {
+            let current = self.entries[index];
+            if current.oif != route.oif
+                || current.gateway != route.gateway
+                || current.priority != route.priority
+            {
+                continue;
+            }
+            if current.learned_default.is_some() {
+                learned = Some((index, current));
+            } else if !withdraw && current.kind == route.kind && current.source.is_none() {
+                return FibEdit::None;
+            }
+        }
+        match (learned, withdraw) {
+            (Some((index, old)), false) if old != route => FibEdit::Replace {
+                index,
+                old,
+                new: route,
+            },
+            (Some((index, route)), true) => FibEdit::Delete { index, route },
+            (None, false) => FibEdit::Insert {
+                index: self.entries.len(),
+                route,
+                placement: self.index.append_placement(route),
+            },
+            _ => FibEdit::None,
+        }
+    }
+
+    pub(super) fn learned_defaults(&self) -> impl Iterator<Item = RouteEntry> + '_ {
+        let default = IpCidr::new(smoltcp::wire::Ipv6Address::UNSPECIFIED.into(), 0);
+        self.index
+            .prefix_candidates_for(RT_TABLE_MAIN, default)
+            .iter()
+            .map(|&index| self.entries[index])
+            .filter(|route| route.learned_default.is_some())
+    }
+
     pub(super) fn plan_delete(
         &self,
         selector: RouteDeleteSelector,
@@ -417,6 +512,7 @@ impl FibTable {
             oif: 0,
             gateway: None,
             nexthop_flags: 0,
+            learned_default: None,
         };
         let index = self
             .index
@@ -583,6 +679,34 @@ impl FibTable {
             });
         }
         winner.map(|index| self.entries[index])
+    }
+
+    pub(super) fn learned_projection_after(
+        &self,
+        key: ProjectionKey,
+        edit: FibEdit,
+    ) -> Result<Option<Vec<SmolRoute>>, SystemError> {
+        if !key.is_ipv6_default() {
+            return Ok(None);
+        }
+        let existing = self
+            .index
+            .projection_candidates(key)
+            .iter()
+            .copied()
+            .filter(|&index| !edit.removes_index(index))
+            .map(|index| (self.entries[index], self.index.order_key(index)));
+        let new = edit
+            .inserted_route()
+            .filter(|(_, route)| projection_key(*route) == Some(key))
+            .map(|(index, route)| {
+                let order = match edit {
+                    FibEdit::Insert { placement, .. } => self.index.planned_order(route, placement),
+                    _ => self.index.order_key(index),
+                };
+                (route, order)
+            });
+        learned_projection(existing.chain(new))
     }
 
     fn lookup_key(&self, key: FibLookupKey) -> Option<RouteLookupResult> {

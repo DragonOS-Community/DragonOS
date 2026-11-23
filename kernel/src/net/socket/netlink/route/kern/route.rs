@@ -124,6 +124,7 @@ pub(super) fn do_new_route(
         } else {
             0
         },
+        learned_default: None,
     };
     let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);
     let outcome = route::add_route(
@@ -241,7 +242,10 @@ impl ParsedRouteRequest {
                 RouteAttr::Priority(metric) => parsed.priority = Some(*metric),
                 RouteAttr::Table(table) => parsed.table = Some(*table),
                 RouteAttr::Iif(index) => parsed.iif = Some(*index),
-                RouteAttr::Metrics | RouteAttr::Multipath => {}
+                RouteAttr::Metrics
+                | RouteAttr::Multipath
+                | RouteAttr::CacheInfo(_)
+                | RouteAttr::Preference(_) => {}
             }
         }
         Ok(parsed)
@@ -487,7 +491,11 @@ fn lookup_route(
         source: requested_source.map(host_cidr),
         preferred_source: selected_source,
         table: decision.table,
-        protocol: RouteProtocol::Unspec as u8,
+        protocol: if decision.matched.learned_default.is_some() {
+            decision.matched.protocol
+        } else {
+            RouteProtocol::Unspec as u8
+        },
         scope: RouteScope::Universe as u8,
         ..decision.matched
     };
@@ -508,6 +516,25 @@ pub(super) fn notify_route(netns: &Arc<NetNamespace>, kind: CSegmentType, route:
         0
     };
     notify_route_with_flags(netns, kind, route, flags)
+}
+
+pub(crate) fn notify_learned_default(
+    netns: &Arc<NetNamespace>,
+    route: RouteEntry,
+    removed: bool,
+    replaced: bool,
+) {
+    let (kind, flags) = if removed {
+        (CSegmentType::DELROUTE, 0)
+    } else if replaced {
+        (CSegmentType::NEWROUTE, NewRequestFlags::REPLACE.bits())
+    } else {
+        (
+            CSegmentType::NEWROUTE,
+            (NewRequestFlags::CREATE | NewRequestFlags::EXCL).bits(),
+        )
+    };
+    notify_route_with_flags(netns, kind, route, flags);
 }
 
 fn notify_route_with_flags(
@@ -598,6 +625,21 @@ pub(super) fn route_to_segment(
     if route.priority != 0 && (!output || matches!(route.destination.address(), IpAddress::Ipv6(_)))
     {
         attrs.push(RouteAttr::Priority(route.priority))?;
+    }
+    if let Some(learned) = route.learned_default {
+        // Linux rta_cacheinfo stores signed remaining time in USER_HZ ticks.
+        let now = crate::time::Instant::now().total_micros();
+        let ticks = learned.expires_at_us.saturating_sub(now) / 10_000;
+        let expires = ticks.clamp(-(i32::MAX as i64), i32::MAX as i64) as i32;
+        let mut cache_info = [0; 32];
+        cache_info[8..12].copy_from_slice(&expires.to_ne_bytes());
+        attrs.push(RouteAttr::CacheInfo(cache_info))?;
+        let preference = match learned.preference {
+            route::RouterPreference::High => 1,
+            route::RouterPreference::Medium => 0,
+            route::RouterPreference::Low => 3,
+        };
+        attrs.push(RouteAttr::Preference(preference))?;
     }
     Ok(RouteSegment::new(header, body, attrs.into_inner()))
 }

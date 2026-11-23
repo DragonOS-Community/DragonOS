@@ -7,6 +7,7 @@ mod fib;
 mod fib_index;
 mod lifecycle;
 pub(crate) mod pmtu;
+pub(crate) mod ra;
 mod source;
 mod transaction;
 mod types;

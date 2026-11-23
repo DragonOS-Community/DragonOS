@@ -35,6 +35,16 @@ pub(crate) struct NewSetSpec<'a> {
     pub(crate) exclusive: bool,
 }
 
+pub(crate) struct NewRuleSpec<'a> {
+    pub(crate) family: u8,
+    pub(crate) table_name: &'a [u8],
+    pub(crate) chain_name: &'a [u8],
+    pub(crate) expressions: &'a [NftExpressionInput<'a>],
+    pub(crate) userdata: &'a [u8],
+    pub(crate) append: bool,
+    pub(crate) position: Option<u64>,
+}
+
 type CreatedSet = (Arc<NftTable>, Arc<NftSet>);
 
 impl NftNamespaceState {
@@ -842,13 +852,17 @@ impl NftTransaction<'_> {
 
     pub(crate) fn new_ip_rule(
         &mut self,
-        family: u8,
-        table_name: &[u8],
-        chain_name: &[u8],
-        inputs: &[NftExpressionInput<'_>],
-        append: bool,
-        position: Option<u64>,
+        spec: NewRuleSpec<'_>,
     ) -> Result<CreatedRule, SystemError> {
+        let NewRuleSpec {
+            family,
+            table_name,
+            chain_name,
+            expressions: inputs,
+            userdata,
+            append,
+            position,
+        } = spec;
         let table_index = self
             .candidate
             .tables
@@ -1373,6 +1387,8 @@ impl NftTransaction<'_> {
         let rule = Arc::try_new(NftRule {
             handle,
             expressions,
+            // copy_bytes fills its exact reservation, so boxing reuses it.
+            userdata: copy_bytes(userdata)?.into_boxed_slice(),
         })
         .map_err(|_| SystemError::ENOMEM)?;
         let mut pending_ct_hook_order = self.pending_ct_hook_order;

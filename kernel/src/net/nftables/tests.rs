@@ -46,6 +46,7 @@ mod ct_state_tests {
     fn native_ct_state_register_drives_rule_comparison() {
         let rule = NftRule {
             handle: 1,
+            userdata: Default::default(),
             expressions: alloc::vec![
                 NftExpression::CtState { dreg: 0 },
                 NftExpression::Cmp {
@@ -138,7 +139,15 @@ mod ct_state_tests {
             NftExpressionInput::Immediate(NftRuleInput::Accept),
         ];
         let (_, _, rule) = transaction
-            .new_ip_rule(2, b"filter", b"input", &expressions, true, None)
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &expressions,
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         assert!(matches!(
             rule.expressions()[0],
@@ -150,7 +159,15 @@ mod ct_state_tests {
             direction: None,
         }];
         assert!(matches!(
-            transaction.new_ip_rule(2, b"filter", b"input", &unsupported, true, None),
+            transaction.new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &unsupported,
+                userdata: &[],
+                append: true,
+                position: None,
+            }),
             Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
         ));
         let invalid = [NftExpressionInput::Ct {
@@ -159,7 +176,15 @@ mod ct_state_tests {
             direction: Some(0),
         }];
         assert!(matches!(
-            transaction.new_ip_rule(2, b"filter", b"input", &invalid, true, None),
+            transaction.new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &invalid,
+                userdata: &[],
+                append: true,
+                position: None,
+            }),
             Err(SystemError::EINVAL)
         ));
     }
@@ -208,7 +233,15 @@ mod ct_state_tests {
             },
         ];
         let (_, _, rule) = transaction
-            .new_ip_rule(2, b"nat", b"output", &expressions, true, None)
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"nat",
+                chain_name: b"output",
+                expressions: &expressions,
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         let packet = [0x45u8; 20];
         let addr_type = |_| 0;
@@ -226,7 +259,15 @@ mod ct_state_tests {
             flags: 0,
         }];
         assert!(matches!(
-            transaction.new_ip_rule(2, b"nat", b"output", &unsupported, true, None),
+            transaction.new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"nat",
+                chain_name: b"output",
+                expressions: &unsupported,
+                userdata: &[],
+                append: true,
+                position: None,
+            }),
             Err(SystemError::ENODATA)
         ));
     }
@@ -254,7 +295,15 @@ mod ct_state_tests {
             direction: None,
         }];
         transaction
-            .new_ip_rule(2, b"filter", b"older", &ct, true, None)
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"older",
+                expressions: &ct,
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         let registration = transaction.pending_ct_hook_order[0].unwrap();
         let (_, newer) = transaction
@@ -366,7 +415,15 @@ mod ct_state_tests {
             NftExpressionInput::Immediate(NftRuleInput::Drop),
         ];
         let (_, _, rule) = transaction
-            .new_ip_rule(2, b"filter", b"input", &expressions, true, None)
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &expressions,
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         let packet = [0x45u8; 20];
         let addr_type = |_| 0;
@@ -438,7 +495,15 @@ mod ct_state_tests {
             },
         ];
         let (_, _, rule) = transaction
-            .new_ip_rule(2, b"filter", b"input", &expressions, true, None)
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &expressions,
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         let packet = [0x45u8; 20];
         let addr_type = |_| 0;
@@ -513,22 +578,23 @@ mod ct_state_tests {
             Err(SystemError::EBUSY)
         ));
         transaction
-            .new_ip_rule(
-                2,
-                b"filter",
-                b"target",
-                &[NftExpressionInput::Immediate(NftRuleInput::Drop)],
-                true,
-                None,
-            )
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"target",
+                expressions: &[NftExpressionInput::Immediate(NftRuleInput::Drop)],
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         let key = [127, 0, 0, 1];
         transaction
-            .new_ip_rule(
-                2,
-                b"filter",
-                b"input",
-                &[
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &[
                     NftExpressionInput::ImmediateData {
                         dreg: 8,
                         data: &key,
@@ -541,9 +607,10 @@ mod ct_state_tests {
                         invert: false,
                     },
                 ],
-                true,
-                None,
-            )
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         let table = &transaction.candidate.tables[0];
         let packet = [0x45u8; 20];
@@ -632,7 +699,15 @@ mod ct_state_tests {
                 NftExpressionInput::Immediate(NftRuleInput::Drop),
             ];
             let (_, _, rule) = transaction
-                .new_ip_rule(2, b"filter", b"input", &expressions, true, None)
+                .new_ip_rule(NewRuleSpec {
+                    family: 2,
+                    table_name: b"filter",
+                    chain_name: b"input",
+                    expressions: &expressions,
+                    userdata: &[],
+                    append: true,
+                    position: None,
+                })
                 .unwrap();
             assert_eq!(
                 matches!(
@@ -758,6 +833,7 @@ mod ct_state_tests {
         ] {
             let rule = NftRule {
                 handle: 1,
+                userdata: Default::default(),
                 expressions: alloc::vec![
                     NftExpression::ImmediateData {
                         dreg: 0,
@@ -926,11 +1002,11 @@ mod ct_state_tests {
                 )
                 .unwrap();
             let (_, _, rule) = transaction
-                .new_ip_rule(
-                    2,
-                    b"filter",
-                    b"input",
-                    &[
+                .new_ip_rule(NewRuleSpec {
+                    family: 2,
+                    table_name: b"filter",
+                    chain_name: b"input",
+                    expressions: &[
                         NftExpressionInput::ImmediateData {
                             dreg: 8,
                             data: &key,
@@ -943,9 +1019,10 @@ mod ct_state_tests {
                             invert: false,
                         },
                     ],
-                    true,
-                    None,
-                )
+                    userdata: &[],
+                    append: true,
+                    position: None,
+                })
                 .unwrap();
             handles[index] = rule.handle;
             assert!(matches!(
@@ -1180,6 +1257,7 @@ mod register_expression_tests {
     fn meta_mark_write_is_packet_scoped_and_missing_sidecar_drops() {
         let rule = NftRule {
             handle: 1,
+            userdata: Default::default(),
             expressions: alloc::vec![
                 NftExpression::ImmediateData {
                     dreg: 0,
@@ -1216,6 +1294,7 @@ mod register_expression_tests {
     fn meta_protocol_and_nfproto_follow_packet_family() {
         let rule = NftRule {
             handle: 1,
+            userdata: Default::default(),
             expressions: alloc::vec![
                 NftExpression::Meta {
                     key: NftMetaKey::Protocol,
@@ -1262,11 +1341,11 @@ mod register_expression_tests {
             .new_ip_chain(2, b"filter", b"input", None, false, false)
             .unwrap();
         transaction
-            .new_ip_rule(
-                2,
-                b"filter",
-                b"input",
-                &[
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"filter",
+                chain_name: b"input",
+                expressions: &[
                     NftExpressionInput::Meta { key: 1, dreg: 8 },
                     NftExpressionInput::Cmp {
                         sreg: 8,
@@ -1275,9 +1354,10 @@ mod register_expression_tests {
                     },
                     NftExpressionInput::Immediate(NftRuleInput::Drop),
                 ],
-                true,
-                None,
-            )
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
     }
 
@@ -1285,6 +1365,7 @@ mod register_expression_tests {
     fn byteorder_converts_meta_style_host_value_before_comparison() {
         let rule = NftRule {
             handle: 1,
+            userdata: Default::default(),
             expressions: alloc::vec![
                 NftExpression::ImmediateData {
                     dreg: 0,
@@ -1325,6 +1406,7 @@ mod register_expression_tests {
         ] {
             let rule = NftRule {
                 handle: 1,
+                userdata: Default::default(),
                 expressions: alloc::vec![
                     NftExpression::ImmediateData {
                         dreg: 0,

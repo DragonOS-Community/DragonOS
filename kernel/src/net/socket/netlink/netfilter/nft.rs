@@ -46,7 +46,9 @@ const RULE_HANDLE: u16 = 3;
 const RULE_EXPRESSIONS: u16 = 4;
 const RULE_COMPAT: u16 = 5;
 const RULE_POSITION: u16 = 6;
+const RULE_USERDATA: u16 = 7;
 const RULE_PAD: u16 = 8;
+const RULE_USERDATA_MAX_LEN: usize = 256;
 const LIST_ELEM: u16 = 1;
 const EXPR_NAME: u16 = 1;
 const EXPR_DATA: u16 = 2;
@@ -298,6 +300,7 @@ pub(super) struct RuleAttrs<'a> {
     pub(super) position: Option<u64>,
     pub(super) expressions: Option<Vec<NftExpressionInput<'a>>>,
     pub(super) compat: Option<&'a [u8]>,
+    pub(super) userdata: &'a [u8],
 }
 
 #[derive(Default)]
@@ -1311,6 +1314,10 @@ pub(super) fn rule_attrs<'a>(request: &'a Request<'_>) -> Result<RuleAttrs<'a>, 
                 return Err(SystemError::EINVAL);
             }
             RULE_POSITION => {}
+            RULE_USERDATA if nla.value.len() > RULE_USERDATA_MAX_LEN => {
+                return Err(SystemError::ERANGE);
+            }
+            RULE_USERDATA => attrs.userdata = nla.value,
             RULE_EXPRESSIONS => {
                 if attrs.expressions.is_some() {
                     return Err(SystemError::EINVAL);
@@ -2344,6 +2351,9 @@ pub(super) fn rule_message(
         append_attr(&mut expressions, LIST_ELEM, &expression)?;
     }
     append_attr(&mut bytes, RULE_EXPRESSIONS, &expressions)?;
+    if !rule.userdata().is_empty() {
+        append_attr(&mut bytes, RULE_USERDATA, rule.userdata())?;
+    }
 
     let message_len = u32::try_from(bytes.len()).map_err(|_| SystemError::EMSGSIZE)?;
     bytes[..4].copy_from_slice(&message_len.to_ne_bytes());

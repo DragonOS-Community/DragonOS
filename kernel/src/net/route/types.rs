@@ -32,6 +32,12 @@ pub(crate) struct LearnedDefaultRoute {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RaRoute {
+    Default(LearnedDefaultRoute),
+    OnLinkPrefix { expires_at_us: Option<i64> },
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RouteEntry {
     pub destination: IpCidr,
     pub source: Option<IpCidr>,
@@ -45,18 +51,37 @@ pub(crate) struct RouteEntry {
     pub oif: u32,
     pub gateway: Option<IpAddress>,
     pub nexthop_flags: u8,
-    pub learned_default: Option<LearnedDefaultRoute>,
+    pub ra_route: Option<RaRoute>,
 }
 
 impl RouteEntry {
+    pub(crate) fn learned_default(self) -> Option<LearnedDefaultRoute> {
+        match self.ra_route {
+            Some(RaRoute::Default(default)) => Some(default),
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_ra_prefix(self) -> bool {
+        matches!(self.ra_route, Some(RaRoute::OnLinkPrefix { .. }))
+    }
+
+    pub(crate) fn expires_at_us(self) -> Option<i64> {
+        match self.ra_route {
+            Some(RaRoute::Default(default)) => Some(default.expires_at_us),
+            Some(RaRoute::OnLinkPrefix { expires_at_us }) => expires_at_us,
+            None => None,
+        }
+    }
+
     pub(super) fn preference(self) -> RouterPreference {
-        self.learned_default
+        self.learned_default()
             .map_or(RouterPreference::Medium, |learned| learned.preference)
     }
 
     pub(super) fn is_live_at(self, now_us: i64) -> bool {
-        self.learned_default
-            .is_none_or(|learned| learned.expires_at_us > now_us)
+        self.expires_at_us()
+            .is_none_or(|deadline| deadline > now_us)
     }
 }
 
@@ -156,7 +181,7 @@ impl RouteLookupResult {
             oif,
             gateway: None,
             nexthop_flags: 0,
-            learned_default: None,
+            ra_route: None,
         };
         Self {
             oif,

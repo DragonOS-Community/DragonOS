@@ -29,7 +29,7 @@ pub(in crate::net::socket::netlink) mod dump;
 mod link;
 mod neigh;
 mod route;
-pub(crate) use route::notify_learned_default;
+pub(crate) use route::notify_ra_route;
 mod utils;
 
 pub(crate) use link::{

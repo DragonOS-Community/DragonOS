@@ -274,16 +274,16 @@ impl ProjectionKey {
         self.oif
     }
 
-    pub(super) fn is_ipv6_default(self) -> bool {
-        self.family == AddressFamily::Ipv6 && self.prefix_len == 0
+    pub(super) fn is_ipv6(self) -> bool {
+        self.family == AddressFamily::Ipv6
     }
 }
 
 /// Derived lookup and projection indexes for the authoritative route vector.
 ///
 /// `all` buckets contain authoritative vector positions in insertion order.
-/// `winners` preselects each packet-path selector. Only an expired learned
-/// default can require inspecting the same prefix for a live alternative.
+/// `winners` preselects each packet-path selector. An expired learned route
+/// can require inspecting the same prefix for a live alternative.
 /// Lifecycle edits rebuild only affected prefix winners.
 /// `alias_order` keeps semantic alias order independent of authoritative
 /// vector slots moved by `swap_remove`, without shifting a whole prefix on
@@ -625,19 +625,22 @@ impl FibIndex {
         projection
             .try_reserve_exact(count)
             .map_err(|_| SystemError::ENOMEM)?;
-        let mut learned_defaults = None;
+        let mut alternatives = Vec::new();
         for (key, winner) in self
             .projection_winners
             .iter()
             .filter(|(key, _)| key.oif == ifindex)
         {
-            if key.is_ipv6_default() {
+            if key.is_ipv6() {
                 let candidates = self
                     .projection_candidates(*key)
                     .iter()
                     .map(|&index| (routes[index], self.order_key(index)));
-                if let Some(defaults) = learned_projection(candidates)? {
-                    learned_defaults = Some(defaults);
+                if let Some(group) = learned_projection(candidates)? {
+                    alternatives
+                        .try_reserve(group.len())
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    alternatives.extend(group);
                     continue;
                 }
             }
@@ -645,12 +648,10 @@ impl FibIndex {
             projection.push(smol_route(route));
         }
         projection.sort_unstable_by_key(|route| route.cidr);
-        if let Some(defaults) = learned_defaults {
-            projection
-                .try_reserve(defaults.len())
-                .map_err(|_| SystemError::ENOMEM)?;
-            projection.extend(defaults);
-        }
+        projection
+            .try_reserve(alternatives.len())
+            .map_err(|_| SystemError::ENOMEM)?;
+        projection.extend(alternatives);
         Ok(projection)
     }
 
@@ -677,10 +678,7 @@ impl FibIndex {
                 continue;
             };
             let mut standard = winners.standard.get(required_oif, scope);
-            if domain.family == AddressFamily::Ipv6
-                && prefix_len == 0
-                && standard.is_some_and(|index| routes[index].learned_default.is_some())
-            {
+            if standard.is_some_and(|index| routes[index].expires_at_us().is_some()) {
                 let now_us = crate::time::Instant::now().total_micros();
                 if standard.is_some_and(|index| !routes[index].is_live_at(now_us)) {
                     standard = self.all[&key]
@@ -1058,10 +1056,10 @@ pub(super) fn smol_route(route: RouteEntry) -> SmolRoute {
         cidr: canonical_cidr(route.destination),
         via_router: route.gateway,
         preferred_until: None,
-        expires_at: route.learned_default.map(|learned| {
+        expires_at: route.expires_at_us().map(|deadline| {
             // smoltcp stores the last usable microsecond, while the FIB
             // stores the first expired microsecond.
-            smoltcp::time::Instant::from_micros(learned.expires_at_us.saturating_sub(1))
+            smoltcp::time::Instant::from_micros(deadline.saturating_sub(1))
         }),
     }
 }
@@ -1071,10 +1069,13 @@ pub(super) fn learned_projection(
 ) -> Result<Option<Vec<SmolRoute>>, SystemError> {
     if !candidates
         .clone()
-        .any(|(route, _)| route.learned_default.is_some())
+        .any(|(route, _)| route.expires_at_us().is_some())
     {
         return Ok(None);
     }
+    let router_defaults = candidates
+        .clone()
+        .any(|(route, _)| route.learned_default().is_some());
     let mut ordered = Vec::new();
     ordered
         .try_reserve_exact(candidates.clone().count())
@@ -1083,9 +1084,16 @@ pub(super) fn learned_projection(
     // smoltcp selects the last route among equally specific prefixes.
     // Retain alternatives so it can fall back even before physical cleanup.
     ordered.sort_unstable_by_key(|&(route, order)| {
+        let (priority, preference, alias) = if router_defaults {
+            route_order(route, order)
+        } else {
+            (0, RouterPreference::Medium, order)
+        };
         core::cmp::Reverse((
             u8::from(route.table != RT_TABLE_LOCAL),
-            route_order(route, order),
+            priority,
+            preference,
+            alias,
         ))
     });
     let mut projection = Vec::new();
@@ -1249,7 +1257,7 @@ mod tests {
             oif: 1,
             gateway: None,
             nexthop_flags: 0,
-            learned_default: None,
+            ra_route: None,
         }
     }
 
@@ -1288,10 +1296,10 @@ mod tests {
         };
         let learned = RouteEntry {
             gateway: Some(learned_gateway),
-            learned_default: Some(LearnedDefaultRoute {
+            ra_route: Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
                 expires_at_us: 10,
                 preference: RouterPreference::High,
-            }),
+            })),
             ..default
         };
         let entries = [default, learned];
@@ -1310,11 +1318,9 @@ mod tests {
         );
 
         let mut expired_entries = entries;
-        expired_entries[1]
-            .learned_default
-            .as_mut()
-            .unwrap()
-            .expires_at_us = 0;
+        let mut default = learned.learned_default().unwrap();
+        default.expires_at_us = 0;
+        expired_entries[1].ra_route = Some(crate::net::route::RaRoute::Default(default));
         assert_eq!(
             fib.lookup(
                 &expired_entries,
@@ -1328,7 +1334,8 @@ mod tests {
         );
 
         let mut refreshed = entries;
-        refreshed[1].learned_default.as_mut().unwrap().expires_at_us = i64::MAX;
+        default.expires_at_us = i64::MAX;
+        refreshed[1].ra_route = Some(crate::net::route::RaRoute::Default(default));
         fib.prepare_insert(refreshed[1]).unwrap();
         fib.commit_replace(1, learned, refreshed[1], &refreshed);
         let selected = |fib: &FibIndex, entries: &[RouteEntry]| {
@@ -1343,10 +1350,60 @@ mod tests {
         };
         assert_eq!(selected(&fib, &refreshed), Some(1));
         let old = refreshed[1];
-        refreshed[1].learned_default.as_mut().unwrap().preference = RouterPreference::Low;
+        default.preference = RouterPreference::Low;
+        refreshed[1].ra_route = Some(crate::net::route::RaRoute::Default(default));
         fib.prepare_insert(refreshed[1]).unwrap();
         fib.commit_replace(1, old, refreshed[1], &refreshed);
         assert_eq!(selected(&fib, &refreshed), Some(0));
+    }
+
+    #[test]
+    fn on_link_prefix_falls_back_before_cleanup() {
+        let prefix = Ipv6Address::new(0xfd42, 0x2324, 0x47, 1, 0, 0, 0, 0);
+        let destination = Ipv6Address::new(0xfd42, 0x2324, 0x47, 1, 0, 0, 0, 2).into();
+        let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into();
+        let fallback = RouteEntry {
+            destination: IpCidr::new(prefix.into(), 64),
+            gateway: Some(gateway),
+            ..route([0; 4], 0, 512, RTN_UNICAST)
+        };
+        let learned = RouteEntry {
+            priority: 256,
+            gateway: None,
+            ra_route: Some(crate::net::route::RaRoute::OnLinkPrefix {
+                expires_at_us: Some(10),
+            }),
+            ..fallback
+        };
+        let mut entries = [fallback, learned];
+        let fib = FibIndex::build(&entries).unwrap();
+        let projection = fib.projection_for_iface(&entries, fallback.oif).unwrap();
+        let mut smoltcp = smoltcp::iface::Routes::new();
+        smoltcp.update(|routes| *routes = projection);
+        assert_eq!(
+            smoltcp.lookup(&destination, smoltcp::time::Instant::from_micros(9)),
+            Some(destination)
+        );
+        assert_eq!(
+            smoltcp.lookup(&destination, smoltcp::time::Instant::from_micros(10)),
+            Some(gateway)
+        );
+
+        // Leave the stale entry published so lookup must resolve its alias.
+        entries[1].ra_route = Some(crate::net::route::RaRoute::OnLinkPrefix {
+            expires_at_us: Some(i64::MIN),
+        });
+        assert_eq!(
+            fib.lookup(
+                &entries,
+                destination,
+                RT_TABLE_MAIN,
+                None,
+                None,
+                BroadcastLookup::Exclude
+            ),
+            Some(0)
+        );
     }
 
     #[test]

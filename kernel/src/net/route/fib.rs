@@ -18,6 +18,7 @@ use super::{
 // Router advertisements must not grow the namespace FIB without bound.
 // All learned defaults belong to the main table's IPv6 default prefix.
 const MAX_LEARNED_DEFAULT_ROUTES: usize = 64;
+const MAX_LEARNED_PREFIX_ROUTES: usize = 256;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::net) struct FibTable {
@@ -347,7 +348,8 @@ impl FibTable {
         flags: RouteNewFlags,
     ) -> Result<PlannedFibMutation<RouteMutationOutcome>, SystemError> {
         let analysis = self.index.analyze_insert(route);
-        let first = analysis.first;
+        let pio_slot = self.prefix_route_slot(route);
+        let first = pio_slot.or(analysis.first);
         let exact = analysis.exact;
         let matching_metric = || {
             self.index
@@ -372,8 +374,10 @@ impl FibTable {
                     if exact.is_some() {
                         return Err(SystemError::EEXIST);
                     }
-                } else if route.destination.prefix_len() == 0
-                    && matching_metric().any(|index| self.entries[index].learned_default.is_some())
+                } else if pio_slot.is_none()
+                    && route.destination.prefix_len() == 0
+                    && matching_metric()
+                        .any(|index| self.entries[index].learned_default().is_some())
                 {
                     // Linux finds a route with the same nexthop class before
                     // falling back to the first alias. A learned default is
@@ -382,7 +386,7 @@ impl FibTable {
                         .filter(|&index| {
                             let current = self.entries[index];
                             let gateway_route =
-                                current.learned_default.is_none() && current.gateway.is_some();
+                                current.learned_default().is_none() && current.gateway.is_some();
                             gateway_route == route.gateway.is_some()
                         })
                         .min_by_key(|&index| self.index.order_key(index))
@@ -390,9 +394,9 @@ impl FibTable {
                     if exact.is_some_and(|slot| slot != first) {
                         return Err(SystemError::EEXIST);
                     }
-                    if self.entries[first].learned_default.is_some()
+                    if self.entries[first].learned_default().is_some()
                         && matching_metric()
-                            .any(|index| self.entries[index].learned_default.is_none())
+                            .any(|index| self.entries[index].learned_default().is_none())
                     {
                         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                     }
@@ -410,7 +414,7 @@ impl FibTable {
             if !flags.create {
                 return Err(SystemError::ENOENT);
             }
-        } else if exact.is_some() {
+        } else if exact.is_some() || pio_slot.is_some() {
             return Err(SystemError::EEXIST);
         }
 
@@ -418,7 +422,7 @@ impl FibTable {
             return Err(SystemError::ENOENT);
         }
         if !is_ipv4(route.destination.address()) && first.is_some() {
-            if !matching_metric().any(|index| self.entries[index].learned_default.is_some()) {
+            if !matching_metric().any(|index| self.entries[index].learned_default().is_some()) {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
             if !flags.append
@@ -431,7 +435,7 @@ impl FibTable {
             }
             // RA aliases may coexist with one configured route. Admitting a
             // second would expose unsupported IPv6 multipath after RA expiry.
-            if matching_metric().any(|index| self.entries[index].learned_default.is_none()) {
+            if matching_metric().any(|index| self.entries[index].learned_default().is_none()) {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
         }
@@ -458,12 +462,12 @@ impl FibTable {
     /// An administrator's equal-metric route to that same next hop wins the
     /// slot even if the administrator chose the same protocol number.
     pub(super) fn plan_learned_default(&self, route: RouteEntry, withdraw: bool) -> FibEdit {
-        debug_assert!(route.learned_default.is_some());
+        debug_assert!(route.learned_default().is_some());
         let mut learned = None;
         let mut learned_count = 0;
         for &index in self.index.prefix_candidates(route) {
             let current = self.entries[index];
-            let is_learned = current.learned_default.is_some();
+            let is_learned = current.learned_default().is_some();
             learned_count += usize::from(is_learned);
             if current.oif != route.oif
                 || current.gateway != route.gateway
@@ -499,7 +503,69 @@ impl FibTable {
             .prefix_candidates_for(RT_TABLE_MAIN, default)
             .iter()
             .map(|&index| self.entries[index])
-            .filter(|route| route.learned_default.is_some())
+            .filter(|route| route.learned_default().is_some())
+    }
+
+    pub(super) fn expiring_ra_routes(&self) -> impl Iterator<Item = RouteEntry> + '_ {
+        self.entries
+            .iter()
+            .copied()
+            .filter(|route| route.expires_at_us().is_some())
+    }
+
+    fn prefix_route_slot(&self, route: RouteEntry) -> Option<usize> {
+        self.index
+            .prefix_candidates(route)
+            .iter()
+            .copied()
+            .find(|&index| {
+                let current = self.entries[index];
+                current.is_ra_prefix() && same_on_link_alias(current, route)
+            })
+    }
+
+    pub(super) fn learned_prefix_slots(&self) -> usize {
+        MAX_LEARNED_PREFIX_ROUTES.saturating_sub(
+            self.entries
+                .iter()
+                .filter(|route| route.is_ra_prefix())
+                .count(),
+        )
+    }
+
+    pub(super) fn plan_learned_prefix(
+        &self,
+        route: RouteEntry,
+        withdraw: bool,
+        may_insert: bool,
+    ) -> FibEdit {
+        debug_assert!(route.is_ra_prefix());
+        let mut existing = None;
+        for &index in self.index.prefix_candidates(route) {
+            let current = self.entries[index];
+            if !same_on_link_alias(current, route) {
+                continue;
+            }
+            if current.is_ra_prefix() {
+                existing = Some((index, current));
+            } else if !withdraw && current.ra_route.is_none() {
+                return FibEdit::None;
+            }
+        }
+        match (existing, withdraw) {
+            (Some((index, old)), false) if old != route => FibEdit::Replace {
+                index,
+                old,
+                new: route,
+            },
+            (Some((index, route)), true) => FibEdit::Delete { index, route },
+            (None, false) if may_insert => FibEdit::Insert {
+                index: self.entries.len(),
+                route,
+                placement: self.index.append_placement(route),
+            },
+            _ => FibEdit::None,
+        }
     }
 
     pub(super) fn plan_delete(
@@ -519,7 +585,7 @@ impl FibTable {
             oif: 0,
             gateway: None,
             nexthop_flags: 0,
-            learned_default: None,
+            ra_route: None,
         };
         let index = self
             .index
@@ -693,7 +759,7 @@ impl FibTable {
         key: ProjectionKey,
         edit: FibEdit,
     ) -> Result<Option<Vec<SmolRoute>>, SystemError> {
-        if !key.is_ipv6_default() {
+        if !key.is_ipv6() {
             return Ok(None);
         }
         let existing = self
@@ -866,6 +932,22 @@ impl FibTable {
         if analysis.exact.is_some() {
             return Ok(false);
         }
+        if let Some(index) = self.prefix_route_slot(route) {
+            let old = self.entries[index];
+            // Linux admits a permanent connected route over an expiring
+            // PIO alias. An already permanent PIO occupies the slot.
+            if old.expires_at_us().is_none() {
+                return Ok(false);
+            }
+            let edit = FibEdit::Replace {
+                index,
+                old,
+                new: route,
+            };
+            self.reserve_edit(edit)?;
+            self.apply_edit(edit);
+            return Ok(true);
+        }
         // Linux installs address-derived routes with NLM_F_APPEND: an
         // existing equal-metric alias keeps precedence over the new kernel
         // route.
@@ -1021,6 +1103,15 @@ fn same_derived_slot(left: RouteEntry, right: RouteEntry) -> bool {
         && left.oif == right.oif
 }
 
+fn same_on_link_alias(left: RouteEntry, right: RouteEntry) -> bool {
+    same_derived_slot(left, right)
+        && left.priority == right.priority
+        && left.gateway.is_none()
+        && right.gateway.is_none()
+        && left.source.is_none()
+        && right.source.is_none()
+}
+
 fn delete_matches(route: RouteEntry, selector: RouteDeleteSelector) -> bool {
     route.destination == selector.destination
         && route.table == selector.table
@@ -1061,10 +1152,10 @@ mod tests {
             oif: u32::from(id % 2) + 1,
             gateway: Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, id).into()),
             nexthop_flags: 0,
-            learned_default: Some(LearnedDefaultRoute {
+            ra_route: Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
                 expires_at_us: 30_000_000,
                 preference: RouterPreference::Medium,
-            }),
+            })),
         };
         let mut fib = FibTable::default();
         for id in 1..=MAX_LEARNED_DEFAULT_ROUTES {
@@ -1080,7 +1171,9 @@ mod tests {
         ));
 
         let mut refreshed = route(1);
-        refreshed.learned_default.as_mut().unwrap().expires_at_us += 1_000_000;
+        let mut default = refreshed.learned_default().unwrap();
+        default.expires_at_us += 1_000_000;
+        refreshed.ra_route = Some(crate::net::route::RaRoute::Default(default));
         let edit = fib.plan_learned_default(refreshed, false);
         assert!(matches!(edit, FibEdit::Replace { .. }));
         fib.reserve_edit(edit).unwrap();

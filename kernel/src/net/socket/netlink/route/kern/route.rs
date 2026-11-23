@@ -124,7 +124,7 @@ pub(super) fn do_new_route(
         } else {
             0
         },
-        learned_default: None,
+        ra_route: None,
     };
     let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);
     let outcome = route::add_route(
@@ -491,7 +491,7 @@ fn lookup_route(
         source: requested_source.map(host_cidr),
         preferred_source: selected_source,
         table: decision.table,
-        protocol: if decision.matched.learned_default.is_some() {
+        protocol: if decision.matched.ra_route.is_some() {
             decision.matched.protocol
         } else {
             RouteProtocol::Unspec as u8
@@ -518,7 +518,7 @@ pub(super) fn notify_route(netns: &Arc<NetNamespace>, kind: CSegmentType, route:
     notify_route_with_flags(netns, kind, route, flags)
 }
 
-pub(crate) fn notify_learned_default(
+pub(crate) fn notify_ra_route(
     netns: &Arc<NetNamespace>,
     route: RouteEntry,
     removed: bool,
@@ -626,14 +626,16 @@ pub(super) fn route_to_segment(
     {
         attrs.push(RouteAttr::Priority(route.priority))?;
     }
-    if let Some(learned) = route.learned_default {
+    if let Some(deadline) = route.expires_at_us() {
         // Linux rta_cacheinfo stores signed remaining time in USER_HZ ticks.
         let now = crate::time::Instant::now().total_micros();
-        let ticks = learned.expires_at_us.saturating_sub(now) / 10_000;
+        let ticks = deadline.saturating_sub(now) / 10_000;
         let expires = ticks.clamp(-(i32::MAX as i64), i32::MAX as i64) as i32;
         let mut cache_info = [0; 32];
         cache_info[8..12].copy_from_slice(&expires.to_ne_bytes());
         attrs.push(RouteAttr::CacheInfo(cache_info))?;
+    }
+    if let Some(learned) = route.learned_default() {
         let preference = match learned.preference {
             route::RouterPreference::High => 1,
             route::RouterPreference::Medium => 0,

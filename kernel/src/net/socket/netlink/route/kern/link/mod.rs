@@ -1,6 +1,8 @@
+mod bridge_port;
 mod create;
 mod query;
 
+pub(super) use bridge_port::port_to_link_message;
 pub(super) use create::do_new_link;
 pub(super) use query::do_get_link;
 pub(super) use query::iface_to_link_message;
@@ -290,6 +292,10 @@ pub(super) fn do_set_link(
     context: &RtnlRequestContext,
 ) -> Result<Vec<RouteNlSegment>, SystemError> {
     let source_netns = context.netns();
+    if request_segment.body().family == AddressFamily::Bridge {
+        bridge_port::set_hairpin(rtnl, request_segment, source_netns)?;
+        return Ok(Vec::new());
+    }
     if request_segment
         .attrs()
         .iter()

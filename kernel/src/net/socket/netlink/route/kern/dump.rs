@@ -216,6 +216,10 @@ impl DumpSession {
                     return Ok(Some(self.done(position)));
                 };
                 position.key = key.saturating_add(1);
+                if request.body().family == AddressFamily::Bridge {
+                    return Ok(link::port_to_link_message(request.header(), &device)?
+                        .map(RouteNlSegment::NewLink));
+                }
                 Ok(Some(RouteNlSegment::NewLink(link::iface_to_link_message(
                     request.header(),
                     CSegmentType::NEWLINK,

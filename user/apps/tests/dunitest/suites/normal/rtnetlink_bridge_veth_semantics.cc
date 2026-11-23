@@ -999,6 +999,138 @@ TEST(RtnetlinkBridgeVethSemantics, CreateAttachedUpVethNotifiesBridgeCarrier) {
     EXPECT_TRUE(SawBridgeCarrierEvent(monitor.fd, bridge_index, true));
 }
 
+std::optional<uint8_t> ReadBridgePortMode(int fd, uint32_t index, uint32_t master,
+                                         uint32_t seq, bool dump) {
+    std::optional<uint8_t> mode;
+    std::array<uint8_t, 8192> reply {};
+    for (;;) {
+        const ssize_t count = recv(fd, reply.data(), reply.size(), 0);
+        if (count < 0) {
+            ADD_FAILURE() << "bridge link receive: " << errno;
+            return std::nullopt;
+        }
+        int remaining = static_cast<int>(count);
+        for (auto* message = reinterpret_cast<nlmsghdr*>(reply.data());
+             NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
+            if (message->nlmsg_seq != seq) continue;
+            if (message->nlmsg_type == NLMSG_DONE) return mode;
+            if (message->nlmsg_type == NLMSG_ERROR) {
+                ADD_FAILURE() << "bridge link request failed";
+                return std::nullopt;
+            }
+            if (message->nlmsg_type != RTM_NEWLINK) continue;
+            const auto* body = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
+            if (body->ifi_family != AF_BRIDGE || body->ifi_index != static_cast<int>(index)) {
+                continue;
+            }
+            uint32_t reported_master = 0;
+            int bytes = IFLA_PAYLOAD(message);
+            for (auto* attr = IFLA_RTA(body); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
+                if (attr->rta_type == IFLA_MASTER && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
+                    std::memcpy(&reported_master, RTA_DATA(attr), sizeof(reported_master));
+                } else if (attr->rta_type == (IFLA_PROTINFO | NLA_F_NESTED)) {
+                    int nested_bytes = RTA_PAYLOAD(attr);
+                    for (auto* port = static_cast<rtattr*>(RTA_DATA(attr));
+                         RTA_OK(port, nested_bytes); port = RTA_NEXT(port, nested_bytes)) {
+                        if (port->rta_type == IFLA_BRPORT_MODE && RTA_PAYLOAD(port) == 1) {
+                            mode = *static_cast<const uint8_t*>(RTA_DATA(port));
+                        }
+                    }
+                }
+            }
+            EXPECT_EQ(reported_master, master);
+            if (!dump) return mode;
+        }
+    }
+}
+
+TEST(RtnetlinkBridgeVethSemantics, BridgePortHairpinFollowsMembership) {
+    RouteFd route;
+    ASSERT_GE(route.fd, 0);
+    const std::string bridge = UniqueName("hb");
+    const std::string host = UniqueName("hh");
+    const std::string peer = UniqueName("hp");
+    CleanupLinks cleanup {route.fd, bridge, host};
+    uint32_t seq = 4600;
+
+    LinkRequest create_bridge(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, seq++);
+    ASSERT_TRUE(create_bridge.name(bridge));
+    AddKind(create_bridge, "bridge");
+    const int result = SendAck(route.fd, create_bridge);
+    if (result == EPERM) GTEST_SKIP() << "CAP_NET_ADMIN unavailable";
+    ASSERT_EQ(result, 0);
+
+    std::vector<uint8_t> peer_payload(sizeof(ifinfomsg), 0);
+    AppendAttr(peer_payload, IFLA_IFNAME, peer.c_str(), peer.size() + 1);
+    std::vector<uint8_t> veth_data;
+    AppendAttr(veth_data, VETH_INFO_PEER, peer_payload.data(), peer_payload.size());
+    LinkRequest create_veth(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, seq++);
+    ASSERT_TRUE(create_veth.name(host));
+    AddKind(create_veth, "veth", veth_data);
+    ASSERT_EQ(SendAck(route.fd, create_veth), 0);
+
+    const uint32_t bridge_index = if_nametoindex(bridge.c_str());
+    const uint32_t host_index = if_nametoindex(host.c_str());
+    ASSERT_NE(bridge_index, 0u);
+    ASSERT_NE(host_index, 0u);
+
+    auto set_mode = [&](const std::vector<uint8_t>& payload, bool append_empty = false) {
+        LinkRequest request(RTM_SETLINK, 0, seq++);
+        request.body()->ifi_family = AF_BRIDGE;
+        request.body()->ifi_index = host_index;
+        if (!request.add(IFLA_PROTINFO | NLA_F_NESTED, payload.data(), payload.size())) {
+            return EMSGSIZE;
+        }
+        if (append_empty && !request.add(IFLA_PROTINFO | NLA_F_NESTED, nullptr, 0)) {
+            return EMSGSIZE;
+        }
+        return SendAck(route.fd, request);
+    };
+    auto dump_mode = [&]() -> std::optional<uint8_t> {
+        LinkRequest request(RTM_GETLINK, NLM_F_DUMP, seq++);
+        request.header()->nlmsg_flags &= ~NLM_F_ACK;
+        request.body()->ifi_family = AF_BRIDGE;
+        if (send(route.fd, request.bytes.data(), request.header()->nlmsg_len, 0) < 0) {
+            ADD_FAILURE() << "bridge link dump: " << errno;
+            return std::nullopt;
+        }
+        return ReadBridgePortMode(route.fd, host_index, bridge_index, request.header()->nlmsg_seq,
+                                  true);
+    };
+    const uint8_t enabled[] = {2, 0};
+    std::vector<uint8_t> payload;
+    AppendAttr(payload, IFLA_BRPORT_MODE, enabled, sizeof(enabled));
+    EXPECT_EQ(set_mode(payload), EOPNOTSUPP);
+    ASSERT_EQ(SetLinkMaster(route.fd, host_index, bridge_index, seq++), 0);
+    EXPECT_EQ(dump_mode(), 0);
+
+    RouteFd monitor(RTMGRP_LINK);
+    ASSERT_GE(monitor.fd, 0);
+    ASSERT_EQ(set_mode(payload, true), 0);
+    EXPECT_EQ(ReadBridgePortMode(monitor.fd, host_index, bridge_index, 0, false), 1);
+    EXPECT_EQ(dump_mode(), 1);
+
+    std::vector<uint8_t> invalid;
+    AppendAttr(invalid, IFLA_BRPORT_MODE, nullptr, 0);
+    EXPECT_EQ(set_mode(invalid), ERANGE);
+    EXPECT_EQ(dump_mode(), 1);
+    ASSERT_EQ(SetLinkUp(route.fd, host_index, true, seq++), 0);
+    ASSERT_EQ(SetLinkUp(route.fd, host_index, false, seq++), 0);
+    EXPECT_EQ(dump_mode(), 1);
+
+    const uint8_t disabled = 0;
+    AppendAttr(payload, IFLA_BRPORT_MODE, &disabled, sizeof(disabled));
+    ASSERT_EQ(set_mode(payload), 0);
+    EXPECT_EQ(dump_mode(), 0);
+    payload.clear();
+    AppendAttr(payload, IFLA_BRPORT_MODE, enabled, 1);
+    ASSERT_EQ(set_mode(payload), 0);
+    ASSERT_EQ(SetLinkMaster(route.fd, host_index, 0, seq++), 0);
+    EXPECT_EQ(dump_mode(), std::nullopt);
+    ASSERT_EQ(SetLinkMaster(route.fd, host_index, bridge_index, seq++), 0);
+    EXPECT_EQ(dump_mode(), 0);
+}
+
 TEST(RtnetlinkBridgeVethSemantics, BridgeAllowsVlanHeaderBeyondMtu) {
     RouteFd route;
     ASSERT_GE(route.fd, 0);

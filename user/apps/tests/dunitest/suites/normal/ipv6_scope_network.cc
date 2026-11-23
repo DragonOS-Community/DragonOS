@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <atomic>
 #include <thread>
 
@@ -662,6 +663,133 @@ TEST_F(Ipv6ScopeNetwork, RawHdrinclRespectsPerMessageScopeOnBothLinks) {
     ASSERT_EQ(sendmsg(tx.Get(), &message, 0), sizeof(packet));
     Receive(second.Get(), d, true);
 }
+TEST_F(Ipv6ScopeNetwork, RawMulticastHopLimitUsesSocketAndPerMessageSettings) {
+    FdGuard tx(socket(AF_INET6, SOCK_RAW, 253));
+    FdGuard capture(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)));
+    ASSERT_GE(tx.Get(), 0);
+    ASSERT_GE(capture.Get(), 0);
+    sockaddr_ll peer{};
+    peer.sll_family = AF_PACKET;
+    peer.sll_protocol = htons(ETH_P_IPV6);
+    peer.sll_ifindex = b;
+    ASSERT_EQ(bind(capture.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), 0);
+
+    const auto expect_hops = [&](char tag, int hops) {
+        for (int attempt = 0; attempt < 32; ++attempt) {
+            pollfd ready{capture.Get(), POLLIN, 0};
+            ASSERT_EQ(poll(&ready, 1, 2000), 1);
+            uint8_t packet[256]{};
+            const ssize_t length = recv(capture.Get(), packet, sizeof(packet), MSG_DONTWAIT);
+            if (length >= 41 && packet[6] == 253 && packet[40] == tag) {
+                EXPECT_EQ(packet[7], hops) << "packet tag " << tag;
+                return;
+            }
+        }
+        FAIL() << "missing raw IPv6 packet " << tag;
+    };
+    const auto set = [&](int option, int value) {
+        return setsockopt(tx.Get(), IPPROTO_IPV6, option, &value, sizeof(value));
+    };
+    const auto get = [&](int expected) {
+        int value = -99;
+        socklen_t length = sizeof(value);
+        ASSERT_EQ(getsockopt(tx.Get(), IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &value, &length), 0);
+        EXPECT_EQ(length, sizeof(value));
+        EXPECT_EQ(value, expected);
+    };
+    const auto multicast = Address("ff02::1", a);
+    const auto unicast = Address("fe80::92b", a);
+    const auto send_tag = [&](const sockaddr_in6& destination, char tag) {
+        return sendto(tx.Get(), &tag, 1, 0, reinterpret_cast<const sockaddr*>(&destination),
+                      sizeof(destination));
+    };
+    const auto send_with_hops = [&](void* payload, size_t length, int hops,
+                                   size_t control_length = CMSG_LEN(sizeof(int)),
+                                   size_t control_capacity = CMSG_SPACE(sizeof(int)),
+                                   int type = IPV6_HOPLIMIT) {
+        alignas(cmsghdr) unsigned char control[CMSG_SPACE(sizeof(int))]{};
+        auto destination = multicast;
+        iovec vector{payload, length};
+        msghdr message{};
+        message.msg_name = &destination;
+        message.msg_namelen = sizeof(destination);
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control;
+        message.msg_controllen = control_capacity;
+        auto* header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = IPPROTO_IPV6;
+        header->cmsg_type = type;
+        header->cmsg_len = control_length;
+        memcpy(CMSG_DATA(header), &hops, sizeof(hops));
+        return sendmsg(tx.Get(), &message, 0);
+    };
+    ASSERT_NO_FATAL_FAILURE(get(1));
+    ASSERT_EQ(set(IPV6_UNICAST_HOPS, 43), 0);
+    ASSERT_EQ(send_tag(multicast, 'D'), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('D', 1));
+    ASSERT_EQ(set(IPV6_MULTICAST_LOOP, 0), 0);
+    ASSERT_EQ(set(IPV6_MULTICAST_HOPS, 0), 0);
+    ASSERT_NO_FATAL_FAILURE(get(0));
+    ASSERT_EQ(send_tag(multicast, 'Z'), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('Z', 0));
+    ASSERT_EQ(set(IPV6_MULTICAST_HOPS, 255), 0);
+    ASSERT_EQ(send_tag(multicast, 'M'), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('M', 255));
+    ASSERT_EQ(send_tag(unicast, 'U'), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('U', 43));
+
+    char tag = 'O';
+    ASSERT_EQ(send_with_hops(&tag, 1, 19), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('O', 19));
+    ASSERT_EQ(send_tag(multicast, 'N'), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('N', 255));
+    tag = 'L';
+    ASSERT_EQ(send_with_hops(&tag, 1, 23, CMSG_LEN(sizeof(int)), CMSG_SPACE(sizeof(int)),
+                             IPV6_2292HOPLIMIT), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('L', 23));
+    tag = 'F';
+    ASSERT_EQ(send_with_hops(&tag, 1, -1), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('F', 255));
+    EXPECT_EQ(send_with_hops(&tag, 1, 256), -1);
+    EXPECT_EQ(errno, EINVAL);
+    // The control header advertises more bytes than the buffer supplies.
+    EXPECT_EQ(send_with_hops(&tag, 1, 19, CMSG_LEN(sizeof(int)) + 1, CMSG_LEN(sizeof(int))), -1);
+    EXPECT_EQ(errno, EINVAL);
+    EXPECT_EQ(send_with_hops(&tag, 1, 23, sizeof(cmsghdr) - 1, CMSG_SPACE(sizeof(int)), IPV6_TCLASS), -1);
+    EXPECT_EQ(errno, EINVAL);
+    EXPECT_EQ(set(IPV6_MULTICAST_HOPS, -2), -1);
+    EXPECT_EQ(errno, EINVAL);
+    const int short_value = 3;
+    EXPECT_EQ(setsockopt(tx.Get(), IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
+                         &short_value, sizeof(short_value) - 1), -1);
+    EXPECT_EQ(errno, EINVAL);
+    ASSERT_NO_FATAL_FAILURE(get(255));
+
+    ASSERT_EQ(connect(tx.Get(), reinterpret_cast<const sockaddr*>(&multicast), sizeof(multicast)), 0);
+    ASSERT_EQ(send(tx.Get(), "C", 1, 0), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('C', 255));
+    ASSERT_EQ(set(IPV6_MULTICAST_HOPS, -1), 0);
+    ASSERT_NO_FATAL_FAILURE(get(1));
+    ASSERT_EQ(send(tx.Get(), "R", 1, 0), 1);
+    ASSERT_NO_FATAL_FAILURE(expect_hops('R', 1));
+
+    ASSERT_EQ(set(IPV6_HDRINCL, 1), 0);
+    uint8_t packet[41]{};
+    packet[0] = 0x60;
+    packet[5] = 1;
+    packet[6] = 253;
+    packet[7] = 71;
+    packet[40] = 'H';
+    const auto source = Address("fe80::92a", a);
+    memcpy(packet + 8, &source.sin6_addr, 16);
+    memcpy(packet + 24, &multicast.sin6_addr, 16);
+    ASSERT_EQ(send_with_hops(packet, sizeof(packet), 19), sizeof(packet));
+    ASSERT_NO_FATAL_FAILURE(expect_hops('H', 71));
+    EXPECT_EQ(send_with_hops(packet, sizeof(packet), -2), -1);
+    EXPECT_EQ(errno, EINVAL);
+}
+
 TEST_F(Ipv6ScopeNetwork, ErrorQueueDestinationAndOffenderUseIcmpIngressScope) {
     const size_t page = sysconf(_SC_PAGESIZE);
     auto* memory = static_cast<unsigned char*>(mmap(nullptr, page * 2,

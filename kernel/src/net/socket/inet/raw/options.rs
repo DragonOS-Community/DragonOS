@@ -4,6 +4,7 @@ use super::constants::{SYSCTL_RMEM_MAX, SYSCTL_WMEM_MAX};
 
 /// 默认 IP TTL/Hop Limit (RFC 1340)
 pub(super) const DEFAULT_IP_TTL: u8 = 64;
+pub(super) const DEFAULT_IPV6_MULTICAST_HOPS: u8 = 1;
 
 /// ICMP 过滤器 (32位位掩码)
 ///
@@ -76,6 +77,7 @@ pub struct RawSocketOptions {
     /// IPV6_MTU source fragmentation ceiling; zero means use route MTU.
     pub ipv6_frag_size: usize,
     pub ipv6_multicast_loop: bool,
+    pub ipv6_multicast_hops: u8,
     /// IP_TOS: Type of Service
     pub ip_tos: u8,
     /// IP_TTL: Time to Live
@@ -130,6 +132,7 @@ impl Default for RawSocketOptions {
             recv_err_v6: false,
             ipv6_frag_size: 0,
             ipv6_multicast_loop: true,
+            ipv6_multicast_hops: DEFAULT_IPV6_MULTICAST_HOPS,
             ip_tos: 0,
             ip_ttl: DEFAULT_IP_TTL,
             recv_pktinfo_v4: false,

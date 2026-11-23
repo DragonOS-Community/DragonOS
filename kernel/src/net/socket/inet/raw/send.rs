@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use smoltcp::wire::{IpAddress, IpProtocol, IpVersion, Ipv4Packet};
 use system_error::SystemError;
@@ -57,6 +58,7 @@ impl RawSocket {
         to: Option<IpAddress>,
         options: &super::options::RawSocketOptions,
         scope_oif: Option<u32>,
+        hop_limit: Option<u8>,
     ) -> Result<usize, SystemError> {
         self.take_pending_error()?;
         if self.protocol == IpProtocol::Unknown(255) {
@@ -139,7 +141,11 @@ impl RawSocket {
                 src: source.expect("non-HDRINCL output selected a source").into(),
                 dst: destination,
                 protocol: self.protocol,
-                ttl: options.ip_ttl,
+                ttl: hop_limit.unwrap_or(if destination.is_multicast() {
+                    options.ipv6_multicast_hops
+                } else {
+                    options.ip_ttl
+                }),
                 tos: options.ip_tos,
                 ipv6_checksum: options.ipv6_checksum,
             };
@@ -429,7 +435,7 @@ impl RawSocket {
         }
 
         let options = self.options.read().clone();
-        self.try_send_ipv6_prepared(buf, to, &options, None)
+        self.try_send_ipv6_prepared(buf, to, &options, None, None)
     }
 
     fn can_retry_ipv4_send(&self, packet_len: usize) -> bool {
@@ -480,6 +486,7 @@ impl RawSocket {
                     Some(remote.addr),
                     &options,
                     remote.scope_oif(),
+                    None,
                 );
             }
             if flags.contains(PMSG::DONTWAIT) || self.is_nonblock() {
@@ -541,11 +548,16 @@ impl RawSocket {
         // Clone current options and apply per-send overrides from cmsgs.
         let mut options = self.options.read().clone();
         let mut ipv4_ttl_override = None;
+        let mut ipv6_hop_limit = None;
+        let is_ipv6 = self.is_ipv6();
 
         if !msg.msg_control.is_null() && msg.msg_controllen != 0 {
             let reader =
                 UserBufferReader::new(msg.msg_control as *const u8, msg.msg_controllen, true)?;
-            let mut cbuf = vec![0u8; msg.msg_controllen];
+            let mut cbuf = Vec::new();
+            cbuf.try_reserve_exact(msg.msg_controllen)
+                .map_err(|_| SystemError::ENOMEM)?;
+            cbuf.resize(msg.msg_controllen, 0u8);
             reader.copy_from_user(&mut cbuf, 0)?;
 
             let hdr_len = core::mem::size_of::<Cmsghdr>();
@@ -562,6 +574,18 @@ impl RawSocket {
             while off + hdr_len <= cbuf.len() {
                 let hdr: Cmsghdr =
                     unsafe { core::ptr::read_unaligned(cbuf.as_ptr().add(off) as *const Cmsghdr) };
+                let ipv6_hop_control = is_ipv6
+                    && hdr.cmsg_level == PSOL::IPV6 as i32
+                    && (hdr.cmsg_type == PIPV6::HOPLIMIT as i32
+                        || hdr.cmsg_type == PIPV6::RFC2292_HOPLIMIT as i32);
+                if is_ipv6 && (hdr.cmsg_len < hdr_len || hdr.cmsg_len > cbuf.len() - off) {
+                    return Err(SystemError::EINVAL);
+                }
+                if ipv6_hop_control
+                    && hdr.cmsg_len != cmsg_align(hdr_len) + core::mem::size_of::<i32>()
+                {
+                    return Err(SystemError::EINVAL);
+                }
                 if hdr.cmsg_len < hdr_len {
                     break;
                 }
@@ -577,11 +601,11 @@ impl RawSocket {
                 };
 
                 match (hdr.cmsg_level, hdr.cmsg_type) {
-                    (level, t) if level == PSOL::IP as i32 && t == IpOption::TTL as i32 => {
+                    (level, t)
+                        if !is_ipv6 && level == PSOL::IP as i32 && t == IpOption::TTL as i32 =>
+                    {
                         if let Some(v) = read_i32(data) {
-                            let ttl = v.clamp(0, 255) as u8;
-                            options.ip_ttl = ttl;
-                            ipv4_ttl_override = Some(ttl);
+                            ipv4_ttl_override = Some(v.clamp(0, 255) as u8);
                         }
                     }
                     (level, t) if level == PSOL::IP as i32 && t == IpOption::TOS as i32 => {
@@ -590,10 +614,13 @@ impl RawSocket {
                             options.ip_tos = v;
                         }
                     }
-                    (level, t) if level == PSOL::IPV6 as i32 && t == PIPV6::HOPLIMIT as i32 => {
-                        if let Some(v) = read_i32(data) {
-                            options.ip_ttl = v.clamp(0, 255) as u8;
-                        }
+                    _ if ipv6_hop_control => {
+                        let hops = read_i32(data).ok_or(SystemError::EINVAL)?;
+                        ipv6_hop_limit = if hops == -1 {
+                            None
+                        } else {
+                            Some(u8::try_from(hops).map_err(|_| SystemError::EINVAL)?)
+                        };
                     }
                     (level, t) if level == PSOL::IPV6 as i32 && t == PIPV6::TCLASS as i32 => {
                         if let Some(v) = read_i32(data) {
@@ -649,6 +676,6 @@ impl RawSocket {
             }
         }
 
-        self.try_send_ipv6_prepared(&buf, Some(dest), &options, scope_oif)
+        self.try_send_ipv6_prepared(&buf, Some(dest), &options, scope_oif, ipv6_hop_limit)
     }
 }

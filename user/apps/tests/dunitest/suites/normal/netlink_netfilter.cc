@@ -7709,11 +7709,13 @@ void CheckAtomicRuleRollback() {
 
   constexpr uint32_t seq = 264700;
   ASSERT_NO_FATAL_FAILURE(InstallAtomicRule(nft.get(), seq, denied.address.sin_port));
+  ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 0x20, 100));
   const auto before = AtomicRuleDump(nft.get(), seq + 5);
   ASSERT_EQ(1u, before.size());
   ASSERT_NE(0u, before[0].handle);
-
-  ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 0x20, 100));
+  ASSERT_TRUE(before[0].has_counter);
+  ASSERT_EQ(1u, before[0].packets);
+  ASSERT_GT(before[0].bytes, 0u);
 
   // Re-creating the existing table with EXCL aborts the preceding deletion.
   const auto failed = MutationBatch(
@@ -7727,6 +7729,9 @@ void CheckAtomicRuleRollback() {
   ASSERT_EQ(1u, rolled_back.size());
   EXPECT_EQ(before[0].handle, rolled_back[0].handle);
   EXPECT_EQ(before[0].generation, rolled_back[0].generation);
+  ASSERT_TRUE(rolled_back[0].has_counter);
+  EXPECT_EQ(before[0].packets, rolled_back[0].packets);
+  EXPECT_EQ(before[0].bytes, rolled_back[0].bytes);
   ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 0x30, 100));
   const auto counted = AtomicRuleDump(nft.get(), seq + 11);
   ASSERT_EQ(1u, counted.size());

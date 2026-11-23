@@ -2139,8 +2139,122 @@ fn disabled_neighbor_discovery_rejects_invalid_ns_source_lladdr(
                 target_addr: local_ip_addr,
                 lladdr: Some(source_lladdr),
             },
+            false,
         ),
         None
+    );
+}
+
+#[cfg(all(feature = "alloc", feature = "medium-ethernet"))]
+#[rstest]
+#[case::host(false, LocalInputVerdict::Pass, false)]
+#[case::router(true, LocalInputVerdict::Pass, false)]
+#[case::input_drop(true, LocalInputVerdict::Drop, false)]
+#[case::input_rewrite(false, LocalInputVerdict::Pass, true)]
+fn dad_solicitation_uses_local_input_and_multicast_advertisement(
+    #[case] router: bool,
+    #[case] verdict: LocalInputVerdict,
+    #[case] rewrite_destination: bool,
+) {
+    struct DadInput {
+        router: bool,
+        verdict: LocalInputVerdict,
+        rewrite_destination: bool,
+        input_calls: usize,
+    }
+
+    impl IpIngressFilter for DadInput {
+        fn ipv6_ndisc_router(&self) -> bool {
+            self.router
+        }
+
+        fn pre_routing(
+            &mut self,
+            _: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+        ) -> PreRoutingVerdict {
+            PreRoutingVerdict::Pass
+        }
+
+        fn local_input(
+            &mut self,
+            packet: &mut IngressPacket<'_>,
+            _: PacketMeta,
+            _: HardwareAddress,
+            protocol: IpProtocol,
+            _: usize,
+        ) -> LocalInputVerdict {
+            assert_eq!(protocol, IpProtocol::Icmpv6);
+            self.input_calls += 1;
+            if self.rewrite_destination {
+                let mut ip = Ipv6Packet::new_checked(packet.writable().unwrap()).unwrap();
+                ip.set_dst_addr(IPV6_LINK_LOCAL_ALL_NODES);
+                Icmpv6Packet::new_unchecked(ip.payload_mut())
+                    .fill_checksum(&Ipv6Address::UNSPECIFIED, &IPV6_LINK_LOCAL_ALL_NODES);
+            }
+            self.verdict
+        }
+    }
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    let src = Ipv6Address::UNSPECIFIED;
+    let target = Ipv6Address::new(0xfdbe, 0, 0, 0, 0, 0, 0, 1);
+    let dst = target.solicited_node();
+    let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+        target_addr: target,
+        lladdr: None,
+    });
+    let ip = Ipv6Repr {
+        src_addr: src,
+        dst_addr: dst,
+        next_header: IpProtocol::Icmpv6,
+        hop_limit: 255,
+        payload_len: solicitation.buffer_len(),
+    };
+    let mut bytes = [0; 64];
+    ip.emit(&mut Ipv6Packet::new_unchecked(&mut bytes[..]));
+    solicitation.emit(
+        &src,
+        &dst,
+        &mut Icmpv6Packet::new_unchecked(&mut bytes[ip.buffer_len()..]),
+        &ChecksumCapabilities::default(),
+    );
+    let mut filter = DadInput {
+        router,
+        verdict,
+        rewrite_destination,
+        input_calls: 0,
+    };
+    let mut scratch = crate::storage::PacketBytes::new();
+    let reply = iface.inner.process_ipv6_filtered(
+        &mut sockets,
+        PacketMeta::default(),
+        HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 9])),
+        &Ipv6Packet::new_checked(&bytes[..]).unwrap(),
+        &mut scratch,
+        &mut filter,
+    );
+    assert_eq!(filter.input_calls, 1);
+    let mut flags = NdiscNeighborFlags::OVERRIDE;
+    flags.set(NdiscNeighborFlags::ROUTER, router);
+    let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        target_addr: target,
+        lladdr: Some(EthernetAddress([2; 6]).into()),
+        flags,
+    });
+    assert_eq!(
+        reply,
+        (verdict == LocalInputVerdict::Pass && !rewrite_destination).then(|| Packet::new_ipv6(
+            Ipv6Repr {
+                src_addr: target,
+                dst_addr: IPV6_LINK_LOCAL_ALL_NODES,
+                next_header: IpProtocol::Icmpv6,
+                hop_limit: 255,
+                payload_len: advert.buffer_len(),
+            },
+            IpPayload::Icmpv6(advert),
+        ))
     );
 }
 

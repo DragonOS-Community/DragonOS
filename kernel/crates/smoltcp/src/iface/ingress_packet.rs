@@ -42,6 +42,12 @@ pub enum LocalInputVerdict {
 }
 
 pub trait IpIngressFilter {
+    /// Whether the receive interface acts as an IPv6 router for NDP replies.
+    #[cfg(feature = "proto-ipv6")]
+    fn ipv6_ndisc_router(&self) -> bool {
+        false
+    }
+
     /// Override ARP reply authorization with the integration's address policy.
     /// `None` preserves the interface's standalone `any_ip` behavior. This
     /// decision controls replies only, not neighbor-cache learning. A local

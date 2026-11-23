@@ -305,6 +305,40 @@ TEST(TimerFdSemantics, AbsoluteAndPastDeadlines) {
     EXPECT_EQ(1u, ticks);
 }
 
+TEST(TimerFdSemantics, BoottimeOneShotsReachTheirClockDeadline) {
+    UniqueFd fd(timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK | TFD_CLOEXEC));
+    ASSERT_GE(fd.get(), 0) << strerror(errno);
+
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        SCOPED_TRACE(iteration);
+        itimerspec timer = {};
+        ASSERT_EQ(0, clock_gettime(CLOCK_BOOTTIME, &timer.it_value));
+        timer.it_value = AddMilliseconds(timer.it_value, 11);
+        ASSERT_EQ(0, timerfd_settime(fd.get(), TFD_TIMER_ABSTIME, &timer, nullptr));
+
+        pollfd ready = {fd.get(), POLLIN, 0};
+        ASSERT_EQ(1, poll(&ready, 1, 1000));
+        ASSERT_NE(0, ready.revents & POLLIN);
+        timespec after = {};
+        ASSERT_EQ(0, clock_gettime(CLOCK_BOOTTIME, &after));
+        EXPECT_TRUE(after.tv_sec > timer.it_value.tv_sec ||
+                    (after.tv_sec == timer.it_value.tv_sec && after.tv_nsec >= timer.it_value.tv_nsec));
+
+        uint64_t ticks = 0;
+        ASSERT_EQ(8, read(fd.get(), &ticks, sizeof(ticks)));
+        EXPECT_EQ(1u, ticks);
+    }
+
+    itimerspec past = {};
+    past.it_value.tv_nsec = 1;
+    ASSERT_EQ(0, timerfd_settime(fd.get(), TFD_TIMER_ABSTIME, &past, nullptr));
+    pollfd ready = {fd.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 0));
+    uint64_t ticks = 0;
+    ASSERT_EQ(8, read(fd.get(), &ticks, sizeof(ticks)));
+    EXPECT_EQ(1u, ticks);
+}
+
 TEST(TimerFdSemantics, SameDeadlineTimersRemainIndependent) {
     constexpr int kTimerCount = 32;
     UniqueFd fds[kTimerCount];

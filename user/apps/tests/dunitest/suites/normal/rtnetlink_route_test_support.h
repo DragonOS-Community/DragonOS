@@ -599,7 +599,8 @@ struct Ipv6RouteMetadata {
 };
 
 std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
-                                               uint8_t prefix_len, uint32_t oif, uint32_t seq) {
+                                               uint8_t prefix_len, uint32_t oif, uint32_t seq,
+                                               uint8_t kind = RTN_UNSPEC) {
     alignas(nlmsghdr) char req_buf[NLMSG_LENGTH(sizeof(rtmsg))] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(req_buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -638,6 +639,9 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
             }
             auto* route_msg = reinterpret_cast<rtmsg*>(NLMSG_DATA(msg));
             if (route_msg->rtm_family != AF_INET6 || route_msg->rtm_dst_len != prefix_len) {
+                continue;
+            }
+            if (kind != RTN_UNSPEC && route_msg->rtm_type != kind) {
                 continue;
             }
             in6_addr actual = {};

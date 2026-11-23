@@ -10,10 +10,13 @@ pub(crate) const RTPROT_BOOT: u8 = 3;
 pub(crate) const RT_SCOPE_UNIVERSE: u8 = 0;
 pub(crate) const RT_SCOPE_LINK: u8 = 253;
 pub(crate) const RT_SCOPE_HOST: u8 = 254;
+pub(crate) const RTN_UNSPEC: u8 = 0;
 pub(crate) const RTN_UNICAST: u8 = 1;
 pub(crate) const RTN_LOCAL: u8 = 2;
 pub(crate) const RTN_BROADCAST: u8 = 3;
+pub(crate) const RTN_ANYCAST: u8 = 4;
 pub(crate) const RTN_MULTICAST: u8 = 5;
+pub(crate) const RTN_UNREACHABLE: u8 = 7;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RouteEntry {

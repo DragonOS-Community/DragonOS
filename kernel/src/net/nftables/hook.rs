@@ -100,7 +100,7 @@ impl HookProgram {
             iifname,
             oifname,
             ipv4_addr_type,
-            ipv6_local_destination,
+            ipv6_route_lookup,
         } = packet;
         for step in &self.steps {
             match step {
@@ -127,8 +127,8 @@ impl HookProgram {
                     } else {
                         packet
                     };
-                    let packet = if let Some(lookup) = ipv6_local_destination {
-                        packet.with_ipv6_local_destination(lookup)
+                    let packet = if let Some(lookup) = ipv6_route_lookup {
+                        packet.with_ipv6_route_lookup(lookup)
                     } else {
                         packet
                     };
@@ -157,8 +157,8 @@ impl HookProgram {
                             } else {
                                 packet
                             };
-                            let packet = if let Some(lookup) = ipv6_local_destination {
-                                packet.with_ipv6_local_destination(lookup)
+                            let packet = if let Some(lookup) = ipv6_route_lookup {
+                                packet.with_ipv6_route_lookup(lookup)
                             } else {
                                 packet
                             };
@@ -205,14 +205,27 @@ mod hook_program_tests {
             rule.evaluate(&NftPacket::new_ipv6(&bytes), &[]),
             RuleResult::Verdict(NftRuleVerdict::Drop)
         ));
-        let local = |address: Ipv6Address| address == Ipv6Address::LOCALHOST;
-        let view = NftPacket::new_ipv6(&bytes).with_ipv6_local_destination(&local);
+        let local = |address, _| {
+            if address == Ipv6Address::LOCALHOST {
+                crate::net::route::RTN_LOCAL
+            } else {
+                crate::net::route::RTN_UNREACHABLE
+            }
+        };
+        let local = NftIpv6RouteLookup {
+            resolve: &local,
+            device: None,
+        };
+        let view = NftPacket::new_ipv6(&bytes).with_ipv6_route_lookup(local);
         assert_eq!(matcher.evaluate(&view), Some(true));
-        let nonlocal = |_address: Ipv6Address| false;
-        let view = NftPacket::new_ipv6(&bytes).with_ipv6_local_destination(&nonlocal);
+        let nonlocal = NftIpv6RouteLookup {
+            resolve: &|_, _| crate::net::route::RTN_UNREACHABLE,
+            device: None,
+        };
+        let view = NftPacket::new_ipv6(&bytes).with_ipv6_route_lookup(nonlocal);
         assert_eq!(matcher.evaluate(&view), Some(false));
         bytes[39] = 2;
-        let view = NftPacket::new_ipv6(&bytes).with_ipv6_local_destination(&local);
+        let view = NftPacket::new_ipv6(&bytes).with_ipv6_route_lookup(local);
         assert_eq!(matcher.evaluate(&view), Some(false));
     }
 
@@ -232,8 +245,8 @@ mod hook_program_tests {
         }));
         let mut ruleset = snapshot(alloc::vec![table]);
         ruleset.compile_ipv4_hooks().unwrap();
-        assert!(ruleset.ipv6_hook_requires_local_destination(NftIpv4Hook::PreRouting));
-        assert!(!ruleset.ipv6_hook_requires_local_destination(NftIpv4Hook::LocalOut));
+        assert!(ruleset.ipv6_hook_requires_route_lookup(NftIpv4Hook::PreRouting));
+        assert!(!ruleset.ipv6_hook_requires_route_lookup(NftIpv4Hook::LocalOut));
         assert!(!ruleset.ipv4_hook_requires_route_lookup(NftIpv4Hook::PreRouting));
         assert!(!ruleset.ipv4_hook_requires_route_lookup(NftIpv4Hook::LocalOut));
     }
@@ -268,7 +281,7 @@ mod hook_program_tests {
         assert!(ruleset.ipv4_hook_requires_route_lookup(NftIpv4Hook::LocalIn));
         assert!(!ruleset.ipv4_hook_requires_route_lookup(NftIpv4Hook::PreRouting));
         assert!(!ruleset.ipv4_hook_requires_route_lookup(NftIpv4Hook::LocalOut));
-        assert!(!ruleset.ipv6_hook_requires_local_destination(NftIpv4Hook::LocalIn));
+        assert!(!ruleset.ipv6_hook_requires_route_lookup(NftIpv4Hook::LocalIn));
     }
 
     fn table_with_chain(
@@ -323,7 +336,7 @@ mod hook_program_tests {
             iface_name_hooks: [false; NftIpv4Hook::COUNT],
             ipv4_route_lookup_hooks: [false; NftIpv4Hook::COUNT],
             ipv6_iface_name_hooks: [false; NftIpv4Hook::COUNT],
-            ipv6_local_destination_hooks: [false; NftIpv4Hook::COUNT],
+            ipv6_route_lookup_hooks: [false; NftIpv4Hook::COUNT],
             ipv4_hooks: core::array::from_fn(|_| HookProgram::empty()),
             ipv6_hooks: core::array::from_fn(|_| HookProgram::empty()),
         }
@@ -1001,7 +1014,7 @@ pub(crate) struct RulesetSnapshot {
     pub(super) iface_name_hooks: [bool; NftIpv4Hook::COUNT],
     pub(super) ipv4_route_lookup_hooks: [bool; NftIpv4Hook::COUNT],
     pub(super) ipv6_iface_name_hooks: [bool; NftIpv4Hook::COUNT],
-    pub(super) ipv6_local_destination_hooks: [bool; NftIpv4Hook::COUNT],
+    pub(super) ipv6_route_lookup_hooks: [bool; NftIpv4Hook::COUNT],
     /// Hook order is compiled once when the candidate becomes immutable.
     /// Packet evaluation never sorts or takes the writer lock.
     pub(super) ipv4_hooks: [HookProgram; NftIpv4Hook::COUNT],
@@ -1105,9 +1118,9 @@ impl RulesetSnapshot {
     }
 
     /// A protected FIB view is needed only when an IPv6 hook can execute an
-    /// xt addrtype predicate, including through a jump to a regular chain.
-    pub(crate) fn ipv6_hook_requires_local_destination(&self, hook: NftIpv4Hook) -> bool {
-        self.ipv6_local_destination_hooks[hook.index()]
+    /// IPv6 FIB or xt addrtype expression, including through a jump to a regular chain.
+    pub(crate) fn ipv6_hook_requires_route_lookup(&self, hook: NftIpv4Hook) -> bool {
+        self.ipv6_route_lookup_hooks[hook.index()]
     }
 
     pub(crate) fn has_output_hook(&self) -> bool {
@@ -1237,7 +1250,7 @@ impl RulesetSnapshot {
             self.ipv6_hooks[hook.index()] = self.compile_hook(hook, &[1, 10])?;
             self.ipv6_iface_name_hooks[hook.index()] =
                 self.ipv6_hooks[hook.index()].requires_iface_names();
-            self.ipv6_local_destination_hooks[hook.index()] =
+            self.ipv6_route_lookup_hooks[hook.index()] =
                 self.ipv6_hooks[hook.index()].requires_route_lookup();
         }
         self.requires_iface_names = self.iface_name_hooks.iter().any(|needed| *needed)

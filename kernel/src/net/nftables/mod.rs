@@ -38,7 +38,7 @@ pub(crate) use objects::{
     CreatedChain, CreatedRule, NftBaseChain, NftChain, NftChainType, NftIpv4Hook, NftSet,
     NftSetElement, NftSetElementInput, NftTable,
 };
-pub(crate) use packet::{NftDeviceNames, NftNatPacket, NftPacket};
+pub(crate) use packet::{NftDeviceNames, NftIpv6RouteLookup, NftNatPacket, NftPacket};
 pub(crate) use rule::{
     NftBitwiseOperation, NftByteorderOp, NftCmpOp, NftCounter, NftExpression, NftExpressionInput,
     NftMetaKey, NftNatAction, NftNatEvent, NftNatProgress, NftPayloadBase, NftRangeOp, NftRule,

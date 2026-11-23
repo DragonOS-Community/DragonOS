@@ -2,6 +2,13 @@ use super::*;
 
 pub(super) type RedirectAddressResolver<'a> = dyn Fn(&[u8]) -> Option<CtAddress> + 'a;
 
+/// Native FIB lookups use the device of the packet at this hook.
+#[derive(Clone, Copy)]
+pub(crate) struct NftIpv6RouteLookup<'a> {
+    pub(crate) resolve: &'a dyn Fn(Ipv6Address, Option<u32>) -> u8,
+    pub(crate) device: Option<u32>,
+}
+
 /// The packet path supplies its already-acquired routing view. Route-aware
 /// expressions must not acquire the FIB behind a smoltcp interface lock.
 pub(crate) struct NftPacket<'a> {
@@ -10,7 +17,7 @@ pub(crate) struct NftPacket<'a> {
     pub(super) mark: Option<&'a Cell<u32>>,
     pub(super) redirect_address: Option<&'a RedirectAddressResolver<'a>>,
     pub(super) ipv4_addr_type: Option<&'a dyn Fn(Ipv4Address) -> u8>,
-    pub(super) ipv6_local_destination: Option<&'a dyn Fn(Ipv6Address) -> bool>,
+    pub(super) ipv6_route_lookup: Option<NftIpv6RouteLookup<'a>>,
     pub(super) iifname: [u8; 16],
     pub(super) oifname: [u8; 16],
 }
@@ -26,7 +33,7 @@ pub(crate) struct NftNatPacket<'a> {
     pub(super) iifname: [u8; 16],
     pub(super) oifname: [u8; 16],
     pub(super) ipv4_addr_type: Option<&'a dyn Fn(Ipv4Address) -> u8>,
-    pub(super) ipv6_local_destination: Option<&'a dyn Fn(Ipv6Address) -> bool>,
+    pub(super) ipv6_route_lookup: Option<NftIpv6RouteLookup<'a>>,
 }
 
 impl<'a> NftNatPacket<'a> {
@@ -45,7 +52,7 @@ impl<'a> NftNatPacket<'a> {
             iifname,
             oifname,
             ipv4_addr_type: Some(addr_type),
-            ipv6_local_destination: None,
+            ipv6_route_lookup: None,
         }
     }
 
@@ -63,15 +70,12 @@ impl<'a> NftNatPacket<'a> {
             iifname,
             oifname,
             ipv4_addr_type: None,
-            ipv6_local_destination: None,
+            ipv6_route_lookup: None,
         }
     }
 
-    pub(crate) fn with_ipv6_local_destination(
-        mut self,
-        lookup: &'a dyn Fn(Ipv6Address) -> bool,
-    ) -> Self {
-        self.ipv6_local_destination = Some(lookup);
+    pub(crate) fn with_ipv6_route_lookup(mut self, lookup: NftIpv6RouteLookup<'a>) -> Self {
+        self.ipv6_route_lookup = Some(lookup);
         self
     }
 
@@ -97,7 +101,7 @@ impl<'a> NftPacket<'a> {
             mark: None,
             redirect_address: None,
             ipv4_addr_type: Some(ipv4_addr_type),
-            ipv6_local_destination: None,
+            ipv6_route_lookup: None,
             iifname: [0; 16],
             oifname: [0; 16],
         }
@@ -110,17 +114,14 @@ impl<'a> NftPacket<'a> {
             mark: None,
             redirect_address: None,
             ipv4_addr_type: None,
-            ipv6_local_destination: None,
+            ipv6_route_lookup: None,
             iifname: [0; 16],
             oifname: [0; 16],
         }
     }
 
-    pub(crate) fn with_ipv6_local_destination(
-        mut self,
-        lookup: &'a dyn Fn(Ipv6Address) -> bool,
-    ) -> Self {
-        self.ipv6_local_destination = Some(lookup);
+    pub(crate) fn with_ipv6_route_lookup(mut self, lookup: NftIpv6RouteLookup<'a>) -> Self {
+        self.ipv6_route_lookup = Some(lookup);
         self
     }
 

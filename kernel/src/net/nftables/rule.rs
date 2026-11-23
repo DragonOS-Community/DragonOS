@@ -237,14 +237,24 @@ impl NftRule {
                     ));
                 }
                 NftExpression::FibDaddrType { dreg } => {
-                    let Some(addr_type) = context.ipv4_addr_type else {
-                        return RuleResult::Verdict(NftRuleVerdict::Drop);
+                    let kind = if packet.first().is_some_and(|byte| byte >> 4 == 6) {
+                        let Some(lookup) = context.ipv6_route_lookup else {
+                            return RuleResult::Verdict(NftRuleVerdict::Drop);
+                        };
+                        let Ok(ipv6) = smoltcp::wire::Ipv6Packet::new_checked(packet) else {
+                            return RuleResult::Break;
+                        };
+                        (lookup.resolve)(ipv6.dst_addr(), lookup.device)
+                    } else {
+                        let Some(addr_type) = context.ipv4_addr_type else {
+                            return RuleResult::Verdict(NftRuleVerdict::Drop);
+                        };
+                        let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(packet) else {
+                            return RuleResult::Break;
+                        };
+                        addr_type(ipv4.dst_addr())
                     };
-                    let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(packet) else {
-                        return RuleResult::Break;
-                    };
-                    registers[*dreg..*dreg + 4]
-                        .copy_from_slice(&(addr_type(ipv4.dst_addr()) as u32).to_ne_bytes());
+                    registers[*dreg..*dreg + 4].copy_from_slice(&u32::from(kind).to_ne_bytes());
                 }
                 NftExpression::XtTcp(tcp) => match tcp.evaluate(packet) {
                     RuleResult::Continue => {}
@@ -1010,8 +1020,8 @@ impl NftXtAddrtype {
                 let Ok(packet) = smoltcp::wire::Ipv6Packet::new_checked(context.bytes) else {
                     return Some(false);
                 };
-                let is_local = context.ipv6_local_destination?;
-                Some(is_local(packet.dst_addr()))
+                let lookup = context.ipv6_route_lookup?;
+                Some((lookup.resolve)(packet.dst_addr(), None) == crate::net::route::RTN_LOCAL)
             }
             _ => Some(false),
         }

@@ -791,6 +791,7 @@ fn global_source_ns_reply_uses_ingress_link_without_source_route() {
     let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
         target_addr: local,
         lladdr: Some(remote_mac.into()),
+        nonce: None,
     });
     let ip = Ipv6Repr {
         src_addr: remote,
@@ -2006,6 +2007,7 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
     let solicit = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
         target_addr: local_ip_addr,
         lladdr: Some(remote_hw_addr.into()),
+        nonce: None,
     });
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr,
@@ -2138,6 +2140,7 @@ fn disabled_neighbor_discovery_rejects_invalid_ns_source_lladdr(
             NdiscRepr::NeighborSolicit {
                 target_addr: local_ip_addr,
                 lladdr: Some(source_lladdr),
+                nonce: None,
             },
             false,
         ),
@@ -2204,6 +2207,7 @@ fn dad_solicitation_uses_local_input_and_multicast_advertisement(
     let solicitation = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
         target_addr: target,
         lladdr: None,
+        nonce: Some([1, 2, 3, 4, 5, 6]),
     });
     let ip = Ipv6Repr {
         src_addr: src,
@@ -2212,13 +2216,18 @@ fn dad_solicitation_uses_local_input_and_multicast_advertisement(
         hop_limit: 255,
         payload_len: solicitation.buffer_len(),
     };
-    let mut bytes = [0; 64];
+    let mut bytes = [0; 72];
     ip.emit(&mut Ipv6Packet::new_unchecked(&mut bytes[..]));
     solicitation.emit(
         &src,
         &dst,
         &mut Icmpv6Packet::new_unchecked(&mut bytes[ip.buffer_len()..]),
         &ChecksumCapabilities::default(),
+    );
+    let message = Icmpv6Packet::new_checked(&bytes[ip.buffer_len()..]).unwrap();
+    assert_eq!(
+        Icmpv6Repr::parse(&src, &dst, &message, &ChecksumCapabilities::default()),
+        Ok(solicitation)
     );
     let mut filter = DadInput {
         router,

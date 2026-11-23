@@ -42,6 +42,7 @@ use transaction::{
     prepare_with_devices, prepare_with_devices_from, projection_for_iface, transact_single,
     transact_with_devices, PreparedTransaction, ProjectionPlan,
 };
+pub(in crate::net) use types::is_ipv6_link_local;
 pub(crate) use types::*;
 use validation::{validate_entry, validate_entry_on_iface, validate_gateway_iface};
 

@@ -10,10 +10,12 @@ use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::{types::InterfaceFlags, AddressMetadata, Iface},
+    driver::net::{types::InterfaceFlags, AddressMetadata, AddressState, Iface, LinkLocalState},
     net::rtnl::RtnlGuard,
     process::namespace::net_namespace::NetNamespace,
 };
+
+pub(crate) mod ipv6_autoconf;
 
 const IPV4_MIN_MTU: usize = 68;
 pub(crate) const IPV6_MIN_MTU: usize = 1280;
@@ -37,15 +39,16 @@ pub(in crate::net) struct AddressMutationCommit {
     pub route_changes: crate::net::route::RouteNotifications,
 }
 
-pub(crate) struct RemovedAddress {
+pub(crate) struct AddressInfo {
     pub cidr: IpCidr,
     pub label: CString,
     pub broadcast: Option<Ipv4Address>,
+    pub state: AddressState,
 }
 
 pub(in crate::net) struct PreparedLinkAddressChange {
     routes: crate::net::route::PreparedAddressRouteCommit,
-    removed: Vec<RemovedAddress>,
+    removed: Vec<AddressInfo>,
     changed_addresses: Vec<IpCidr>,
 }
 
@@ -53,9 +56,24 @@ fn prepare_address_removal(
     iface: &Arc<dyn Iface>,
     after: &mut Vec<IpCidr>,
     metadata: &mut Vec<AddressMetadata>,
-    matches: impl Fn(IpCidr) -> bool,
-) -> Result<(Vec<RemovedAddress>, Vec<IpAddress>), SystemError> {
-    let removal_count = after.iter().copied().filter(|cidr| matches(*cidr)).count();
+    matches: impl Fn(IpCidr, AddressState) -> bool,
+) -> Result<(Vec<AddressInfo>, Vec<IpAddress>), SystemError> {
+    let removal_count = after
+        .iter()
+        .copied()
+        .filter(|cidr| {
+            let state = metadata
+                .iter()
+                .find(|entry| entry.cidr == *cidr)
+                .map(|entry| entry.state)
+                .unwrap_or_default();
+            matches(*cidr, state)
+        })
+        .count()
+        + metadata
+            .iter()
+            .filter(|entry| !entry.state.is_usable() && matches(entry.cidr, entry.state))
+            .count();
     if removal_count == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -72,31 +90,55 @@ fn prepare_address_removal(
     let mut index = 0;
     while index < after.len() {
         let cidr = after[index];
-        if !matches(cidr) {
+        let metadata_index = metadata.iter().position(|entry| entry.cidr == cidr);
+        let state = metadata_index
+            .map(|index| metadata[index].state)
+            .unwrap_or_default();
+        if !matches(cidr, state) {
             index += 1;
             continue;
         }
         after.remove(index);
         deleted_addresses.push(cidr.address());
-        let (label, broadcast) =
-            if let Some(metadata_index) = metadata.iter().position(|entry| entry.cidr == cidr) {
-                let entry = metadata.remove(metadata_index);
-                let label = match entry.label {
-                    Some(label) => label,
-                    None => try_clone_cstring(&default_label)?,
-                };
-                (label, entry.broadcast)
-            } else {
-                (try_clone_cstring(&default_label)?, None)
-            };
-        removed.push(RemovedAddress {
-            cidr,
-            label,
-            broadcast,
-        });
+        let entry = metadata_index.map(|index| metadata.remove(index));
+        removed.push(removed_address_info(cidr, entry, &default_label)?);
+    }
+
+    let mut index = 0;
+    while index < metadata.len() {
+        let entry = &metadata[index];
+        if !entry.state.is_usable() && matches(entry.cidr, entry.state) {
+            let entry = metadata.remove(index);
+            removed.push(removed_address_info(
+                entry.cidr,
+                Some(entry),
+                &default_label,
+            )?);
+        } else {
+            index += 1;
+        }
     }
 
     Ok((removed, deleted_addresses))
+}
+
+fn removed_address_info(
+    cidr: IpCidr,
+    entry: Option<AddressMetadata>,
+    default_label: &CString,
+) -> Result<AddressInfo, SystemError> {
+    let (label, broadcast, state) = entry.map_or((None, None, AddressState::Configured), |entry| {
+        (entry.label, entry.broadcast, entry.state)
+    });
+    Ok(AddressInfo {
+        cidr,
+        label: match label {
+            Some(label) => label,
+            None => try_clone_cstring(default_label)?,
+        },
+        broadcast,
+        state,
+    })
 }
 
 pub(crate) fn set_device_ipv6_disabled(
@@ -123,7 +165,7 @@ pub(crate) fn set_device_ipv6_disabled(
 
     let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
     let (removed_addresses, deleted_addresses) =
-        prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
+        prepare_address_removal(iface, &mut after, &mut metadata, |cidr, _| {
             !enabled && matches!(cidr, IpCidr::Ipv6(_))
         })?;
     after.extend(restored);
@@ -163,7 +205,10 @@ pub(crate) fn set_device_ipv6_disabled(
         enabled,
     );
     if !enabled {
+        ipv6_autoconf::cancel(iface.common(), true);
         iface.common().fail_deferred_ipv6();
+    } else {
+        ipv6_autoconf::changed(iface.common());
     }
     let removed_neighbors = neighbors.map_or_else(Vec::new, |prepared| prepared.publish());
 
@@ -284,18 +329,54 @@ pub(in crate::net) fn address_label(
 pub(in crate::net) fn address_at(
     iface: &Arc<dyn Iface>,
     index: usize,
-) -> Result<Option<(IpCidr, CString, Option<Ipv4Address>)>, SystemError> {
+) -> Result<Option<AddressInfo>, SystemError> {
     let smol_iface = iface.smol_iface().lock();
-    let Some(&cidr) = smol_iface.ip_addrs().get(index) else {
-        return Ok(None);
-    };
+    let usable = smol_iface.ip_addrs();
     let metadata = iface.common().address_metadata().lock();
-    let entry = metadata.iter().find(|entry| entry.cidr == cidr);
+    let (cidr, entry) = if let Some(&cidr) = usable.get(index) {
+        (cidr, metadata.iter().find(|entry| entry.cidr == cidr))
+    } else {
+        let Some(entry) = metadata
+            .iter()
+            .filter(|entry| !entry.state.is_usable())
+            .nth(index - usable.len())
+        else {
+            return Ok(None);
+        };
+        (entry.cidr, Some(entry))
+    };
     let label = match entry.and_then(|entry| entry.label.as_ref()) {
         Some(label) => try_clone_cstring(label)?,
         None => try_default_label(iface)?,
     };
-    Ok(Some((cidr, label, entry.and_then(|entry| entry.broadcast))))
+    Ok(Some(AddressInfo {
+        cidr,
+        label,
+        broadcast: entry.and_then(|entry| entry.broadcast),
+        state: entry.map(|entry| entry.state).unwrap_or_default(),
+    }))
+}
+
+pub(in crate::net) fn address_state(iface: &Arc<dyn Iface>, cidr: IpCidr) -> AddressState {
+    iface
+        .common()
+        .address_metadata()
+        .lock()
+        .iter()
+        .find(|entry| entry.cidr == cidr)
+        .map(|entry| entry.state)
+        .unwrap_or_default()
+}
+
+pub(in crate::net) fn has_address_object(iface: &Arc<dyn Iface>, cidr: IpCidr) -> bool {
+    let smol_iface = iface.smol_iface().lock();
+    smol_iface.ip_addrs().contains(&cidr)
+        || iface
+            .common()
+            .address_metadata()
+            .lock()
+            .iter()
+            .any(|entry| entry.cidr == cidr && !entry.state.is_usable())
 }
 
 /// A fully allocated IPv4 address-label rename.
@@ -420,7 +501,15 @@ pub(in crate::net) fn prepare_link_address_change(
         && !was_up
         && iface.common().ipv6_enabled()
         && iface.flags().contains(InterfaceFlags::LOOPBACK);
-    if mtu.is_none() && !loopback_up {
+    let remove_auto = was_up
+        && !is_up
+        && iface
+            .common()
+            .address_metadata()
+            .lock()
+            .iter()
+            .any(|entry| matches!(entry.state, AddressState::AutoLinkLocal(_)));
+    if mtu.is_none() && !loopback_up && !remove_auto {
         return Ok(None);
     }
     let mirror = iface.router_common().ip_addrs.read();
@@ -429,7 +518,7 @@ pub(in crate::net) fn prepare_link_address_change(
     } else {
         None
     };
-    let needs_removal = |cidr| {
+    let mtu_removal = |cidr| {
         mtu.is_some_and(|mtu| match cidr {
             IpCidr::Ipv4(_) => mtu < IPV4_MIN_MTU,
             IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
@@ -437,7 +526,10 @@ pub(in crate::net) fn prepare_link_address_change(
     };
     let discard_learned_defaults =
         mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && iface.mtu() >= IPV6_MIN_MTU);
-    if !discard_learned_defaults && restored.is_none() && !mirror.iter().copied().any(needs_removal)
+    if !discard_learned_defaults
+        && !remove_auto
+        && restored.is_none()
+        && !mirror.iter().copied().any(mtu_removal)
     {
         return Ok(None);
     }
@@ -447,7 +539,9 @@ pub(in crate::net) fn prepare_link_address_change(
 
     let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
     let (removed, deleted_addresses) =
-        prepare_address_removal(iface, &mut after, &mut metadata, needs_removal)?;
+        prepare_address_removal(iface, &mut after, &mut metadata, |cidr, state| {
+            mtu_removal(cidr) || (remove_auto && matches!(state, AddressState::AutoLinkLocal(_)))
+        })?;
 
     let (metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {
         prepare_renamed_metadata(iface, new_name, metadata)?
@@ -494,7 +588,7 @@ impl PreparedLinkAddressChange {
         is_up: bool,
         publish_link_state: impl FnOnce(),
     ) -> (
-        Vec<RemovedAddress>,
+        Vec<AddressInfo>,
         Vec<IpCidr>,
         crate::net::route::RouteNotifications,
     ) {
@@ -612,6 +706,7 @@ fn commit_unpublished(
                 cidr,
                 label: requested_label,
                 broadcast: requested_broadcast,
+                state: AddressState::Configured,
             });
             outcome
         }
@@ -627,6 +722,7 @@ fn commit_unpublished(
                     cidr,
                     label: requested_label,
                     broadcast: requested_broadcast,
+                    state: AddressState::Configured,
                 });
             }
             outcome
@@ -648,15 +744,33 @@ fn commit_published(
 ) -> Result<AddressMutationCommit, SystemError> {
     validate_mutation(mutation)?;
     let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
+    let cancel_auto = match mutation {
+        CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
+            matches!(address_state(iface, cidr), AddressState::AutoLinkLocal(_))
+        }
+        _ => false,
+    };
     let AddressCandidates {
         before,
         mut after,
         mut metadata,
     } = AddressCandidates::prepare(iface, mutation)?;
+    let existing = |requested| {
+        after
+            .iter()
+            .copied()
+            .chain(
+                metadata
+                    .iter()
+                    .filter(|entry| !entry.state.is_usable())
+                    .map(|entry| entry.cidr),
+            )
+            .find(|configured| same_new_or_replace_identity(*configured, requested))
+    };
 
     let outcome = match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr)) => {
-            if find_for_new_or_replace(&after, cidr).is_some() {
+            if existing(cidr).is_some() {
                 return Err(SystemError::EEXIST);
             }
             validate_published_address_addition(iface, cidr)?;
@@ -665,18 +779,25 @@ fn commit_published(
                 cidr,
                 label: requested_label,
                 broadcast: requested_broadcast,
+                state: AddressState::Configured,
             });
             AddressMutationOutcome::Added(cidr)
         }
         CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
-            let index = find_for_delete(&after, cidr).ok_or(SystemError::EADDRNOTAVAIL)?;
-            let effective = after.remove(index);
-            metadata.retain(|entry| entry.cidr != effective);
-            AddressMutationOutcome::Deleted(effective)
+            if let Some(index) = find_for_delete(&after, cidr) {
+                after.remove(index);
+            } else if !metadata
+                .iter()
+                .any(|entry| entry.cidr == cidr && !entry.state.is_usable())
+            {
+                return Err(SystemError::EADDRNOTAVAIL);
+            }
+            metadata.retain(|entry| entry.cidr != cidr);
+            AddressMutationOutcome::Deleted(cidr)
         }
         CommitMutation::Plain(AddressMutation::Replace(cidr)) => {
-            if let Some(index) = find_for_new_or_replace(&after, cidr) {
-                AddressMutationOutcome::Replaced(after[index])
+            if let Some(existing) = existing(cidr) {
+                AddressMutationOutcome::Replaced(existing)
             } else {
                 validate_published_address_addition(iface, cidr)?;
                 insert_address_candidate(&mut after, cidr);
@@ -684,22 +805,70 @@ fn commit_published(
                     cidr,
                     label: requested_label,
                     broadcast: requested_broadcast,
+                    state: AddressState::Configured,
                 });
                 AddressMutationOutcome::Added(cidr)
             }
         }
     };
     let deleted = match outcome {
-        AddressMutationOutcome::Deleted(cidr) => Some(cidr.address()),
+        AddressMutationOutcome::Deleted(cidr) if before.contains(&cidr) => Some(cidr.address()),
         _ => None,
     };
     let route_changes = crate::net::route::commit_addresses(
         rtnl, &netns, iface, &before, &after, metadata, deleted,
     )?;
+    if cancel_auto {
+        ipv6_autoconf::cancel(iface.common(), false);
+    }
     Ok(AddressMutationCommit {
         outcome,
         route_changes,
     })
+}
+
+fn prepare_automatic_link_local(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    state: LinkLocalState,
+) -> Result<crate::net::route::PreparedAddressRouteCommit, SystemError> {
+    let AddressCandidates {
+        before,
+        mut after,
+        mut metadata,
+    } = AddressCandidates::prepare(iface, CommitMutation::Plain(AddressMutation::Add(cidr)))?;
+    if let Some(entry) = metadata.iter_mut().find(|entry| entry.cidr == cidr) {
+        if !matches!(entry.state, AddressState::AutoLinkLocal(_)) {
+            return Err(SystemError::EEXIST);
+        }
+        entry.state = AddressState::AutoLinkLocal(state);
+    } else {
+        metadata.push(AddressMetadata {
+            cidr,
+            label: None,
+            broadcast: None,
+            state: AddressState::AutoLinkLocal(state),
+        });
+    }
+    if state == LinkLocalState::Usable && !after.contains(&cidr) {
+        insert_address_candidate(&mut after, cidr);
+    }
+    let up = iface.flags().contains(InterfaceFlags::UP);
+    crate::net::route::prepare_address_link_change(
+        netns,
+        iface,
+        crate::net::route::AddressLinkChange {
+            before: &before,
+            after: &after,
+            metadata,
+            deleted_addresses: &[],
+            was_up: up,
+            is_up: up,
+            ipv6_enabled: None,
+            discard_learned_defaults: false,
+        },
+    )
 }
 
 fn validate_published_address_addition(
@@ -762,6 +931,7 @@ fn try_clone_metadata(
             cidr: entry.cidr,
             label,
             broadcast: entry.broadcast,
+            state: entry.state,
         });
     }
     Ok(result)

@@ -1,5 +1,5 @@
 use crate::{
-    driver::net::Iface,
+    driver::net::{AddressState, Iface, LinkLocalState},
     net::socket::{
         netlink::{
             message::segment::{
@@ -85,6 +85,7 @@ pub(super) fn do_del_addr(
     let cidr = resolve_delete_cidr(&iface, selector)?;
     let deleted_label = crate::net::address::address_label(&iface, cidr)?;
     let deleted_broadcast = crate::net::address::address_broadcast(&iface, cidr);
+    let deleted_state = crate::net::address::address_state(&iface, cidr);
     let commit = crate::net::address::mutate_address(rtnl, &iface, AddressMutation::Delete(cidr))?;
     notify_address_outcome_with_label(
         netns.clone(),
@@ -92,6 +93,7 @@ pub(super) fn do_del_addr(
         commit.outcome,
         Some(&deleted_label),
         deleted_broadcast,
+        deleted_state,
     );
     notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
@@ -216,6 +218,11 @@ fn resolve_delete_cidr(
     iface: &Arc<dyn Iface>,
     selector: DeleteSelector,
 ) -> Result<IpCidr, SystemError> {
+    if let DeleteMatch::Exact(cidr) = selector.match_ {
+        return crate::net::address::has_address_object(iface, cidr)
+            .then_some(cidr)
+            .ok_or(SystemError::EADDRNOTAVAIL);
+    }
     let smol_iface = iface.smol_iface().lock();
     smol_iface
         .ip_addrs()
@@ -354,6 +361,7 @@ pub(super) fn addr_to_segment(
     msg_type: CSegmentType,
     label_override: Option<&CString>,
     broadcast: Option<Ipv4Address>,
+    state: AddressState,
 ) -> Result<AddrSegment, SystemError> {
     let (family, octets): (i32, Vec<u8>) = match cidr.address() {
         IpAddress::Ipv4(addr) => (AddressFamily::INet as i32, addr.octets().to_vec()),
@@ -368,14 +376,29 @@ pub(super) fn addr_to_segment(
         pid: request_header.pid,
     };
 
+    let mut flags = AddrMessageFlags::PERMANENT;
+    match state {
+        AddressState::AutoLinkLocal(LinkLocalState::Tentative) => {
+            flags.insert(AddrMessageFlags::TENTATIVE);
+        }
+        AddressState::AutoLinkLocal(LinkLocalState::DadFailed) => {
+            flags.insert(AddrMessageFlags::TENTATIVE | AddrMessageFlags::DADFAILED);
+        }
+        _ => {}
+    }
     let addr_message = AddrSegmentBody {
         family,
         prefix_len: cidr.prefix_len(),
-        flags: AddrMessageFlags::PERMANENT,
-        scope: if iface.type_() == crate::driver::net::types::InterfaceType::LOOPBACK {
-            RtScope::HOST
-        } else {
-            RtScope::UNIVERSE
+        flags,
+        scope: match cidr.address() {
+            IpAddress::Ipv6(address) if address.is_loopback() => RtScope::HOST,
+            address if crate::net::route::is_ipv6_link_local(address) => RtScope::LINK,
+            IpAddress::Ipv4(_)
+                if iface.type_() == crate::driver::net::types::InterfaceType::LOOPBACK =>
+            {
+                RtScope::HOST
+            }
+            _ => RtScope::UNIVERSE,
         },
         index: NonZeroU32::new(iface.nic_id() as u32),
     };
@@ -405,7 +428,7 @@ pub(in crate::net::socket::netlink::route) fn notify_address_outcome(
     iface: &Arc<dyn Iface>,
     outcome: AddressMutationOutcome,
 ) {
-    notify_address_outcome_with_label(netns, iface, outcome, None, None)
+    notify_address_outcome_with_label(netns, iface, outcome, None, None, AddressState::Configured)
 }
 
 pub(super) fn notify_address_change(
@@ -413,7 +436,15 @@ pub(super) fn notify_address_change(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
 ) {
-    notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None, None);
+    notify_one(
+        netns,
+        iface,
+        cidr,
+        CSegmentType::NEWADDR,
+        None,
+        None,
+        crate::net::address::address_state(iface, cidr),
+    );
 }
 
 pub(super) fn notify_removed_address(
@@ -422,6 +453,7 @@ pub(super) fn notify_removed_address(
     cidr: IpCidr,
     label: &CString,
     broadcast: Option<Ipv4Address>,
+    state: AddressState,
 ) {
     notify_one(
         netns,
@@ -430,6 +462,7 @@ pub(super) fn notify_removed_address(
         CSegmentType::DELADDR,
         Some(label),
         broadcast,
+        state,
     );
 }
 
@@ -439,10 +472,13 @@ fn notify_address_outcome_with_label(
     outcome: AddressMutationOutcome,
     deleted_label: Option<&CString>,
     deleted_broadcast: Option<Ipv4Address>,
+    deleted_state: AddressState,
 ) {
     match outcome {
         AddressMutationOutcome::Added(cidr) | AddressMutationOutcome::Replaced(cidr) => {
-            notify_one(netns, iface, cidr, CSegmentType::NEWADDR, None, None)
+            if crate::net::address::address_state(iface, cidr).is_usable() {
+                notify_address_change(netns, iface, cidr);
+            }
         }
         AddressMutationOutcome::Deleted(cidr) => notify_one(
             netns,
@@ -451,6 +487,7 @@ fn notify_address_outcome_with_label(
             CSegmentType::DELADDR,
             deleted_label,
             deleted_broadcast,
+            deleted_state,
         ),
     }
 }
@@ -462,6 +499,7 @@ fn notify_one(
     msg_type: CSegmentType,
     label_override: Option<&CString>,
     broadcast_override: Option<Ipv4Address>,
+    state: AddressState,
 ) {
     let header = kernel_notify_header(msg_type);
     let broadcast = if msg_type == CSegmentType::DELADDR {
@@ -469,7 +507,15 @@ fn notify_one(
     } else {
         crate::net::address::address_broadcast(iface, cidr)
     };
-    let segment = match addr_to_segment(&header, iface, cidr, msg_type, label_override, broadcast) {
+    let segment = match addr_to_segment(
+        &header,
+        iface,
+        cidr,
+        msg_type,
+        label_override,
+        broadcast,
+        state,
+    ) {
         Ok(segment) => segment,
         Err(err) => {
             // Notification encoding is best effort after a successful commit;

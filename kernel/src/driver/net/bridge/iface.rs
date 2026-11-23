@@ -373,6 +373,7 @@ impl BridgeIface {
                     .set_ip_mtu(self.stack_mtu(candidate))
                     .expect("attached port MTU must fit the bridge interface");
                 self.common.set_mtu(candidate);
+                crate::net::address::ipv6_autoconf::changed(&self.common);
                 let iface = self
                     .driver
                     .local_iface()
@@ -421,6 +422,7 @@ impl BridgeIface {
     pub(super) fn publish_carrier(&self, port_carrier: Option<bool>) {
         let mut inner = self.inner();
         let device = &mut inner.netdevice_common;
+        let old = device.operstate;
         if let Some(carrier) = port_carrier {
             device
                 .state
@@ -437,6 +439,11 @@ impl BridgeIface {
         } else {
             Operstate::IF_OPER_UP
         };
+        let changed = old != device.operstate;
+        drop(inner);
+        if changed {
+            crate::net::address::ipv6_autoconf::changed(&self.common);
+        }
     }
 }
 

@@ -254,15 +254,14 @@ impl DumpSession {
                     position.index = 0;
                     return Ok(None);
                 }
-                let Some((cidr, label, broadcast)) =
-                    crate::net::address::address_at(&device, position.index)?
+                let Some(address) = crate::net::address::address_at(&device, position.index)?
                 else {
                     position.key = key.saturating_add(1);
                     position.index = 0;
                     return Ok(None);
                 };
                 position.index += 1;
-                let family = match cidr.address() {
+                let family = match address.cidr.address() {
                     IpAddress::Ipv4(_) => 2,
                     IpAddress::Ipv6(_) => 10,
                 };
@@ -277,10 +276,11 @@ impl DumpSession {
                 Ok(Some(RouteNlSegment::NewAddr(addr::addr_to_segment(
                     request.header(),
                     &device,
-                    cidr,
+                    address.cidr,
                     CSegmentType::NEWADDR,
-                    Some(&label),
-                    broadcast,
+                    Some(&address.label),
+                    address.broadcast,
+                    address.state,
                 )?)))
             }
             RouteNlSegment::GetRoute(request) => {

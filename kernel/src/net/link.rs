@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    address::{PreparedAddressLabelRename, PreparedLinkAddressChange, RemovedAddress},
+    address::{AddressInfo, PreparedAddressLabelRename, PreparedLinkAddressChange},
     neighbor::{self, NeighborEntry, PreparedConfiguredNeighborPurge},
     route::{self, FibTable, PreparedLinkStateChange, RouteNotifications},
     rtnl::RtnlGuard,
@@ -91,7 +91,7 @@ pub(crate) struct LinkMutationCommit {
     pub iface: Arc<dyn Iface>,
     pub changes: LinkChanges,
     pub changed_addresses: Vec<smoltcp::wire::IpCidr>,
-    pub removed_addresses: Vec<RemovedAddress>,
+    pub removed_addresses: Vec<AddressInfo>,
     pub route_changes: Option<RouteNotifications>,
     pub removed_neighbors: Vec<NeighborEntry>,
     pub rename_old_devpath: Option<String>,
@@ -445,6 +445,12 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         };
 
         let removed_neighbors = neighbors.map(|plan| plan.publish()).unwrap_or_default();
+
+        if link_down || mtu.is_some_and(|mtu| mtu < super::address::IPV6_MIN_MTU) {
+            super::address::ipv6_autoconf::cancel(iface.common(), true);
+        } else if was_up != is_up || mtu.is_some() || noarp_changed {
+            super::address::ipv6_autoconf::changed(iface.common());
+        }
 
         // A NOARP transition changes whether an unresolved destination can be
         // sent immediately. Wake the owner so packets waiting on the previous

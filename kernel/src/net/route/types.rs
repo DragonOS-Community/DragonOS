@@ -275,7 +275,7 @@ pub(super) fn is_ipv4(address: IpAddress) -> bool {
     matches!(address, IpAddress::Ipv4(_))
 }
 
-pub(super) fn is_ipv6_link_local(address: IpAddress) -> bool {
+pub(in crate::net) fn is_ipv6_link_local(address: IpAddress) -> bool {
     let IpAddress::Ipv6(address) = address else {
         return false;
     };

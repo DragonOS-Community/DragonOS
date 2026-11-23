@@ -93,7 +93,7 @@ impl PreparedNetnsDeviceAddition {
         self.netns
             .publish_ipv4_broadcast_count_change(0, added_broadcasts);
         drop(devices);
-        self.netns.notify_deadline_changed();
+        self.netns.notify_ipv6_autoconf();
     }
 }
 
@@ -775,6 +775,7 @@ struct NetnsPoller {
     defrag_enabled: AtomicBool,
     ipv6_defrag_enabled: AtomicBool,
     router_advertisements: SpinLock<PendingAdvertisements>,
+    ipv6_autoconf_pending: AtomicBool,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -791,6 +792,7 @@ impl NetnsPoller {
             defrag_enabled: AtomicBool::new(false),
             ipv6_defrag_enabled: AtomicBool::new(false),
             router_advertisements: SpinLock::new(PendingAdvertisements::default()),
+            ipv6_autoconf_pending: AtomicBool::new(false),
             thread: RwSem::new(None),
         })
     }
@@ -1060,6 +1062,7 @@ impl NetnsPoller {
         let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
         let mut cleanup_retry_at = None;
         let mut ra_deadline = None;
+        let mut ipv6_autoconf_deadline = None;
         // The namespace poller owns reassembly exclusively. Neither NAPI nor
         // the pending-ring spinlock performs fragment allocation or expiry.
         let mut ipv4_defrag = Ipv4Defragmenter::new();
@@ -1184,6 +1187,15 @@ impl NetnsPoller {
                 (Some(cleanup), Some(tcp)) => Some(core::cmp::min(cleanup, tcp)),
                 (cleanup, tcp) => cleanup.or(tcp),
             };
+            if self.ipv6_autoconf_pending.swap(false, Ordering::AcqRel)
+                || ipv6_autoconf_deadline.is_some_and(|due| due <= deadline_now_us)
+            {
+                ipv6_autoconf_deadline =
+                    crate::net::address::ipv6_autoconf::poll(&netns).map(|due| due.max(0) as u64);
+            }
+            if let Some(due) = ipv6_autoconf_deadline {
+                next_us = Some(next_us.map_or(due, |current| current.min(due)));
+            }
             if let Some(ct_deadline) = netns.conntrack.next_expiry() {
                 let ct_us = ct_deadline.total_micros().max(0) as u64;
                 next_us = Some(next_us.map_or(ct_us, |current| current.min(ct_us)));
@@ -2194,7 +2206,7 @@ impl NetNamespace {
             return Err(error);
         }
         drop(devices);
-        self.notify_deadline_changed();
+        self.notify_ipv6_autoconf();
 
         // log::info!(
         //     "Network device added to namespace count: {:?}",
@@ -2420,6 +2432,13 @@ impl NetNamespace {
     /// network I/O. Safe to call after dropping smoltcp and topology locks.
     pub fn notify_deadline_changed(&self) {
         self.poller.notify_deadline_changed();
+    }
+
+    pub(crate) fn notify_ipv6_autoconf(&self) {
+        self.poller
+            .ipv6_autoconf_pending
+            .store(true, Ordering::Release);
+        self.notify_deadline_changed();
     }
 
     fn create_polling_thread(netns: Arc<Self>, name: String) {

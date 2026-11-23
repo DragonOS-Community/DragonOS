@@ -486,11 +486,12 @@ std::vector<uint8_t> MetaMarkSetRule(uint32_t seq, const char* table,
   return RuleWithExpressions(seq, table, chain, expressions);
 }
 
-void AppendFibDestinationType(std::vector<uint8_t>* expressions, uint32_t address_type) {
+void AppendFibAddressType(std::vector<uint8_t>* expressions, uint32_t address_type,
+                          uint32_t address_field = NFTA_FIB_F_DADDR) {
   std::vector<uint8_t> fib;
   const uint32_t register_id = htonl(NFT_REG_1);
   const uint32_t result = htonl(NFT_FIB_RESULT_ADDRTYPE);
-  const uint32_t flags = htonl(NFTA_FIB_F_DADDR);
+  const uint32_t flags = htonl(address_field);
   AppendNla(&fib, NFTA_FIB_DREG,
             reinterpret_cast<const uint8_t*>(&register_id), 4);
   AppendNla(&fib, NFTA_FIB_RESULT,
@@ -509,14 +510,6 @@ void AppendFibDestinationType(std::vector<uint8_t>* expressions, uint32_t addres
             reinterpret_cast<const uint8_t*>(&address_type), sizeof(address_type));
   AppendNla(&comparison, NFTA_CMP_DATA | NLA_F_NESTED, data.data(), data.size());
   AppendExpr(expressions, "cmp", comparison);
-}
-
-std::vector<uint8_t> FibIpv4DestinationLocalCounterRule(uint32_t seq, const char* table,
-                                                        const char* chain) {
-  std::vector<uint8_t> expressions;
-  AppendFibDestinationType(&expressions, RTN_LOCAL);
-  AppendExpr(&expressions, "counter", {});
-  return RuleWithExpressions(seq, table, chain, expressions);
 }
 
 std::vector<uint8_t> NativeIpv4DnatRule(uint32_t seq, const char* table,
@@ -2781,7 +2774,7 @@ TEST(NetlinkNetfilter, NftOutputMarkPersistsAcrossLoopbackInputHook) {
   Ack(nft.get(), seq + 9, 0, kNftDeltable);
 }
 
-TEST(NetlinkNetfilter, NftFibDestinationAddrtypeMatchesRealLocalPacket) {
+static void CheckNftFibLocalAddress(uint32_t field) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   Fd receiver(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
@@ -2802,9 +2795,14 @@ TEST(NetlinkNetfilter, NftFibDestinationAddrtypeMatchesRealLocalPacket) {
   constexpr char table[] = "dkc035_fib_packet";
   auto create = TableBatch(kNftNewtable, seq, table);
   create.resize(create.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
-  auto input = NewChain(seq + 2, table, "input", true, NF_ACCEPT,
-                        NF_INET_LOCAL_IN);
-  auto rule = FibIpv4DestinationLocalCounterRule(seq + 3, table, "input");
+  const bool source = field == NFTA_FIB_F_SADDR;
+  const char* chain = source ? "postrouting" : "input";
+  auto input = NewChain(seq + 2, table, chain, true, NF_ACCEPT,
+                        source ? NF_INET_POST_ROUTING : NF_INET_LOCAL_IN);
+  std::vector<uint8_t> expressions;
+  AppendFibAddressType(&expressions, RTN_LOCAL, field);
+  AppendExpr(&expressions, "counter", {});
+  auto rule = RuleWithExpressions(seq + 3, table, chain, expressions);
   auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
   create.insert(create.end(), input.begin(), input.end());
   create.insert(create.end(), rule.begin(), rule.end());
@@ -2830,7 +2828,7 @@ TEST(NetlinkNetfilter, NftFibDestinationAddrtypeMatchesRealLocalPacket) {
   header.nlmsg_flags |= NLM_F_DUMP;
   std::memcpy(query.data(), &header, sizeof(header));
   AppendAttr(&query, NFTA_RULE_TABLE, table);
-  AppendAttr(&query, NFTA_RULE_CHAIN, "input");
+  AppendAttr(&query, NFTA_RULE_CHAIN, chain);
   ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
   const auto rules = ReceiveRuleDump(nft.get(), seq + 5);
   ASSERT_EQ(1u, rules.size());
@@ -2840,6 +2838,14 @@ TEST(NetlinkNetfilter, NftFibDestinationAddrtypeMatchesRealLocalPacket) {
   auto remove = TableBatch(kNftDeltable, seq + 6, table);
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
   Ack(nft.get(), seq + 7, 0, kNftDeltable);
+}
+
+TEST(NetlinkNetfilter, NftFibDestinationAddrtypeMatchesRealLocalPacket) {
+  CheckNftFibLocalAddress(NFTA_FIB_F_DADDR);
+}
+
+TEST(NetlinkNetfilter, NftFibSourceAddrtypeMatchesLocalPostrouting) {
+  CheckNftFibLocalAddress(NFTA_FIB_F_SADDR);
 }
 
 TEST(NetlinkNetfilter, NftIpv4DataMapValueFeedsRuleRegister) {
@@ -4542,13 +4548,13 @@ TEST(NetlinkNetfilter, NativeRuleAcceptsIptablesCompatMetadata) {
   }
 }
 
-TEST(NetlinkNetfilter, NftCompatTcpMatchRevisionQuery) {
+static void CheckNftCompatTcpRevision(uint8_t family) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   ASSERT_GE(nft.get(), 0);
   constexpr uint32_t seq = 928;
   auto query = Request(kNftCompatGet, seq);
-  query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+  query[NLMSG_HDRLEN] = family;
   nlmsghdr header{};
   std::memcpy(&header, query.data(), sizeof(header));
   header.nlmsg_flags &= ~NLM_F_ACK;
@@ -4578,7 +4584,7 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchRevisionQuery) {
   EXPECT_EQ(0u, Be32(type));
 
   auto missing_type = Request(kNftCompatGet, seq + 1);
-  missing_type[NLMSG_HDRLEN] = NFPROTO_IPV4;
+  missing_type[NLMSG_HDRLEN] = family;
   AppendAttr(&missing_type, NFTA_COMPAT_NAME, "tcp");
   AppendBe32(&missing_type, NFTA_COMPAT_REV, 0);
   ASSERT_EQ(static_cast<ssize_t>(missing_type.size()), Send(nft.get(), missing_type));
@@ -4593,7 +4599,15 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchRevisionQuery) {
   Ack(nft.get(), seq + 2, EINVAL, kNftCompatGet);
 }
 
-TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
+TEST(NetlinkNetfilter, NftCompatTcpMatchRevisionQuery) {
+  CheckNftCompatTcpRevision(NFPROTO_IPV4);
+}
+
+TEST(NetlinkNetfilter, NftCompatIpv6TcpMatchRevisionQuery) {
+  CheckNftCompatTcpRevision(NFPROTO_IPV6);
+}
+
+static void CheckNftCompatLocalAddrtype(bool source) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   Fd receiver(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
@@ -4644,7 +4658,11 @@ TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
   EXPECT_EQ(1u, Be32(FindNla(query_attrs, NFTA_COMPAT_REV)));
 
   xt_addrtype_info_v1 addrtype{};
-  addrtype.dest = XT_ADDRTYPE_LOCAL;
+  if (source) {
+    addrtype.source = XT_ADDRTYPE_LOCAL;
+  } else {
+    addrtype.dest = XT_ADDRTYPE_LOCAL;
+  }
   std::vector<uint8_t> match;
   AppendNla(&match, NFTA_MATCH_NAME,
             reinterpret_cast<const uint8_t*>("addrtype"), sizeof("addrtype"));
@@ -4668,7 +4686,8 @@ TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
             reinterpret_cast<const uint8_t*>(&verdict_reg), sizeof(verdict_reg));
   AppendNla(&immediate, NFTA_IMMEDIATE_DATA | NLA_F_NESTED, data.data(), data.size());
   AppendExpr(&expressions, "immediate", immediate);
-  auto rule = RuleWithExpressions(seq + 4, table.c_str(), "input", expressions);
+  const char* chain_name = source ? "postrouting" : "input";
+  auto rule = RuleWithExpressions(seq + 4, table.c_str(), chain_name, expressions);
   std::vector<uint8_t> compat;
   const uint32_t zero = 0;
   AppendNla(&compat, NFTA_RULE_COMPAT_PROTO,
@@ -4679,8 +4698,8 @@ TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
 
   auto batch = TableBatch(kNftNewtable, seq + 1, table.c_str());
   batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
-  auto chain = NewChain(seq + 3, table.c_str(), "input", true, NF_ACCEPT,
-                        NF_INET_LOCAL_IN);
+  auto chain = NewChain(seq + 3, table.c_str(), chain_name, true, NF_ACCEPT,
+                        source ? NF_INET_POST_ROUTING : NF_INET_LOCAL_IN);
   auto end = Request(NFNL_MSG_BATCH_END, seq + 5);
   batch.insert(batch.end(), chain.begin(), chain.end());
   batch.insert(batch.end(), rule.begin(), rule.end());
@@ -4703,7 +4722,7 @@ TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
     dump_header.nlmsg_flags |= NLM_F_DUMP;
     std::memcpy(dump.data(), &dump_header, sizeof(dump_header));
     AppendAttr(&dump, NFTA_RULE_TABLE, table.c_str());
-    AppendAttr(&dump, NFTA_RULE_CHAIN, "input");
+    AppendAttr(&dump, NFTA_RULE_CHAIN, chain_name);
     ASSERT_EQ(static_cast<ssize_t>(dump.size()), Send(nft.get(), dump));
     const auto rules = ReceiveRuleDump(nft.get(), seq + 8);
     ASSERT_EQ(1u, rules.size());
@@ -4719,6 +4738,14 @@ TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
     ASSERT_EQ(1, poll(&ready, 1, 2000));
     EXPECT_EQ(1, recv(receiver.get(), &received, sizeof(received), 0));
   }
+}
+
+TEST(NetlinkNetfilter, NftCompatAddrtypeLocalUsesFibAndDumps) {
+  CheckNftCompatLocalAddrtype(false);
+}
+
+TEST(NetlinkNetfilter, NftCompatAddrtypeSourceMatchesLocalPostrouting) {
+  CheckNftCompatLocalAddrtype(true);
 }
 
 TEST(NetlinkNetfilter, NftIpv6AddrtypeLocalMatchesRealLoopbackIngress) {
@@ -4895,34 +4922,52 @@ TEST(NetlinkNetfilter, NftCompatAddrtypeAllowsOmittedRuleCompat) {
   Ack(nft.get(), seq + 6, 0, kNftDeltable);
 }
 
-TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
+static void CheckNftCompatTcpMatchFiltersAndDumps(int family) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
-  Fd blocked_listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
-  Fd allowed_listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+  const uint8_t nfproto = family == AF_INET ? NFPROTO_IPV4 : NFPROTO_IPV6;
+  Fd blocked_listener(socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0));
+  Fd allowed_listener(socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0));
   ASSERT_GE(nft.get(), 0);
   ASSERT_GE(blocked_listener.get(), 0);
   ASSERT_GE(allowed_listener.get(), 0);
-  auto bind_listener = [](int fd) {
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        listen(fd, 2) != 0) return sockaddr_in{};
-    socklen_t length = sizeof(address);
-    if (getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0)
-      return sockaddr_in{};
+  struct ListenerAddress {
+    sockaddr_storage bytes = {};
+    socklen_t length = 0;
+    uint16_t port = 0;
+  };
+  auto bind_listener = [&](int fd) {
+    ListenerAddress address;
+    if (family == AF_INET) {
+      sockaddr_in ipv4{};
+      ipv4.sin_family = AF_INET;
+      ipv4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      address.length = sizeof(ipv4);
+      std::memcpy(&address.bytes, &ipv4, sizeof(ipv4));
+    } else {
+      sockaddr_in6 ipv6{};
+      ipv6.sin6_family = AF_INET6;
+      ipv6.sin6_addr = in6addr_loopback;
+      address.length = sizeof(ipv6);
+      std::memcpy(&address.bytes, &ipv6, sizeof(ipv6));
+    }
+    auto* socket_address = reinterpret_cast<sockaddr*>(&address.bytes);
+    if (bind(fd, socket_address, address.length) != 0 || listen(fd, 2) != 0 ||
+        getsockname(fd, socket_address, &address.length) != 0) return ListenerAddress{};
+    address.port = family == AF_INET
+        ? reinterpret_cast<sockaddr_in*>(socket_address)->sin_port
+        : reinterpret_cast<sockaddr_in6*>(socket_address)->sin6_port;
     return address;
   };
-  const sockaddr_in blocked = bind_listener(blocked_listener.get());
-  const sockaddr_in allowed = bind_listener(allowed_listener.get());
-  ASSERT_NE(0, blocked.sin_port);
-  ASSERT_NE(0, allowed.sin_port);
-  auto connect_to = [](const sockaddr_in& destination) {
-    const int client = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  const auto blocked = bind_listener(blocked_listener.get());
+  const auto allowed = bind_listener(allowed_listener.get());
+  ASSERT_NE(0, blocked.port);
+  ASSERT_NE(0, allowed.port);
+  auto connect_to = [&](const ListenerAddress& destination) {
+    const int client = socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (client < 0) return client;
-    const int result = connect(client, reinterpret_cast<const sockaddr*>(&destination),
-                               sizeof(destination));
+    const int result = connect(client, reinterpret_cast<const sockaddr*>(&destination.bytes),
+                               destination.length);
     if (result != 0 && errno != EINPROGRESS) { close(client); return -1; }
     return client;
   };
@@ -4937,7 +4982,7 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
 
   xt_tcp tcp{};
   tcp.spts[1] = UINT16_MAX;
-  tcp.dpts[0] = ntohs(blocked.sin_port);
+  tcp.dpts[0] = ntohs(blocked.port);
   tcp.dpts[1] = tcp.dpts[0];
   std::vector<uint8_t> match;
   AppendNla(&match, NFTA_MATCH_NAME,
@@ -4966,7 +5011,7 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
 
   const std::string table = "dkc035_xttcp_" + std::to_string(getpid());
   constexpr uint32_t seq = 930;
-  auto rule = RuleWithExpressions(seq + 3, table.c_str(), "input", expressions);
+  auto rule = RuleWithExpressions(seq + 3, table.c_str(), "input", expressions, nfproto);
   std::vector<uint8_t> compat;
   const uint32_t protocol = htonl(IPPROTO_TCP);
   const uint32_t flags = 0;
@@ -4976,10 +5021,10 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
             reinterpret_cast<const uint8_t*>(&flags), sizeof(flags));
   AppendRawAttr(&rule, NFTA_RULE_COMPAT | NLA_F_NESTED,
                 compat.data(), compat.size());
-  auto batch = TableBatch(kNftNewtable, seq, table.c_str());
+  auto batch = TableBatch(kNftNewtable, seq, table.c_str(), nfproto);
   batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
   auto chain = NewChain(seq + 2, table.c_str(), "input", true, NF_ACCEPT,
-                        NF_INET_LOCAL_IN);
+                        NF_INET_LOCAL_IN, nfproto);
   batch.insert(batch.end(), chain.begin(), chain.end());
   batch.insert(batch.end(), rule.begin(), rule.end());
   auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
@@ -4994,7 +5039,7 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
     Ack(nft.get(), seq + 3, 0, kNftNewrule);
 
     auto dump = Request(kNftGetrule, seq + 5);
-    dump[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    dump[NLMSG_HDRLEN] = nfproto;
     nlmsghdr header{};
     std::memcpy(&header, dump.data(), sizeof(header));
     header.nlmsg_flags |= NLM_F_DUMP;
@@ -5063,10 +5108,18 @@ TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
     EXPECT_EQ(0, poll(&blocked_ready, 1, 0));
   }();
   if (installed) {
-    auto remove = TableBatch(kNftDeltable, seq + 6, table.c_str());
+    auto remove = TableBatch(kNftDeltable, seq + 6, table.c_str(), nfproto);
     ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
     Ack(nft.get(), seq + 7, 0, kNftDeltable);
   }
+}
+
+TEST(NetlinkNetfilter, NftCompatTcpMatchFiltersAndDumps) {
+  CheckNftCompatTcpMatchFiltersAndDumps(AF_INET);
+}
+
+TEST(NetlinkNetfilter, NftCompatIpv6TcpMatchFiltersAndDumps) {
+  CheckNftCompatTcpMatchFiltersAndDumps(AF_INET6);
 }
 
 static void CheckMalformedTransportMatch(bool is_udp) {
@@ -6623,7 +6676,7 @@ TEST(NetlinkNetfilter, NftIpv6FibDestinationTypeTracksRoutesAndAddresses) {
     AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 6, &next_header, 1);
     AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 8,
                        probe_source, sizeof(probe_source));
-    AppendFibDestinationType(&expressions, type);
+    AppendFibAddressType(&expressions, type);
     AppendExpr(&expressions, "counter", {});
     auto rule = RuleWithExpressions(next_seq++, table, chain_name, expressions, NFPROTO_IPV6);
     batch.insert(batch.end(), rule.begin(), rule.end());

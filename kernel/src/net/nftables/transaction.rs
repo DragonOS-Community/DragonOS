@@ -934,7 +934,7 @@ impl NftTransaction<'_> {
         let mut initialized = 0u16;
         for (index, input) in inputs.iter().enumerate() {
             let expression = match input {
-                NftExpressionInput::XtTcp(info) if family == 2 => {
+                NftExpressionInput::XtTcp(info) if matches!(family, 2 | 10) => {
                     NftExpression::XtTcp(NftXtTcp::from_info(info)?)
                 }
                 NftExpressionInput::XtUdp(info) if family == 2 => {
@@ -1132,11 +1132,13 @@ impl NftTransaction<'_> {
                 NftExpressionInput::Fib {
                     dreg,
                     result: 3,
-                    flags: 2,
+                    flags,
                 } if matches!(family, 2 | 10) => {
+                    let field = NftAddressField::from_fib_flags(*flags)
+                        .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
                     let dreg = data_register(*dreg, 4)?;
                     initialized |= 1 << (dreg / 4);
-                    NftExpression::FibDaddrType { dreg }
+                    NftExpression::FibAddrType { dreg, field }
                 }
                 NftExpressionInput::Fib { .. } => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                 NftExpressionInput::ImmediateData { dreg, data } => {

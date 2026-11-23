@@ -801,9 +801,6 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if matches!(IpVersion::of_packet(packet.bytes()), Ok(IpVersion::Ipv6)) {
             return self.route_ipv6(packet, meta, source_hardware_addr);
         }
-        let Some(routes) = self.routes else {
-            return RouteInputVerdict::Pass;
-        };
         let ingress_ifindex = if meta.id != 0 {
             meta.id
         } else {
@@ -812,15 +809,25 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         let Ok(ipv4) = Ipv4Packet::new_checked(packet.bytes()) else {
             return RouteInputVerdict::Drop;
         };
-        let source = ipv4.src_addr().octets();
+        let source = ipv4.src_addr();
         let destination = ipv4.dst_addr();
-        // The smoltcp source check has already run. The ingress FIB additionally
-        // rejects martian sources that must not arrive from a veth link.
-        if ingress_ifindex != crate::net::LOOPBACK_IFINDEX as u32
-            && (source[0] == 127 || destination.octets()[0] == 127)
+        let routes = if ingress_ifindex != crate::net::LOOPBACK_IFINDEX as u32
+            && (source.is_loopback() || destination.is_loopback())
         {
-            return RouteInputVerdict::Drop;
-        }
+            let Some(routes) = self.fib_routes else {
+                return RouteInputVerdict::Drop;
+            };
+            if !routes.allows_ipv4_loopback_ingress(ingress_ifindex, source) {
+                return RouteInputVerdict::Drop;
+            }
+            routes
+        } else {
+            let Some(routes) = self.routes else {
+                return RouteInputVerdict::Pass;
+            };
+            routes
+        };
+        let source = source.octets();
         if source[0] == 0 && (source != [0; 4] || destination.octets() != [255; 4]) {
             return RouteInputVerdict::Drop;
         }

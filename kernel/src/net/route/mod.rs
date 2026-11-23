@@ -19,7 +19,7 @@ use system_error::SystemError;
 
 use crate::libs::rwsem::RwSemReadGuard;
 use crate::{
-    driver::net::Iface,
+    driver::net::{types::InterfaceFlags, Iface},
     net::{routing::Router, rtnl::RtnlGuard},
     process::namespace::net_namespace::NetNamespace,
 };
@@ -259,9 +259,47 @@ impl OutputRouteGuard<'_> {
         lookup_ingress_fib(&self.fib, destination, ingress_oif)
     }
 
+    pub(crate) fn allows_ipv4_loopback_ingress(&self, ifindex: u32, source: Ipv4Address) -> bool {
+        self.devices.get(&(ifindex as usize)).is_some_and(|iface| {
+            iface.common().route_localnet_value() != 0
+                && (!source.is_loopback()
+                    || !self.devices.values().any(|device| {
+                        device
+                            .common()
+                            .ip_addrs()
+                            .iter()
+                            .any(|cidr| cidr.address() == IpAddress::Ipv4(source))
+                    }))
+        })
+    }
+
+    pub(crate) fn validate_ipv4_output_source(
+        &self,
+        route: OutputRouteDecision,
+        source: Ipv4Address,
+    ) -> Result<(), SystemError> {
+        if route.kind != RTN_LOCAL && source.is_loopback() {
+            let device = self
+                .devices
+                .get(&(route.oif as usize))
+                .ok_or(SystemError::ENETUNREACH)?;
+            validate_ipv4_loopback_egress(device.as_ref())?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ingress_device(&self, ifindex: u32) -> Option<Arc<dyn Iface>> {
         self.devices.get(&(ifindex as usize)).cloned()
     }
+}
+
+fn validate_ipv4_loopback_egress(iface: &dyn Iface) -> Result<(), SystemError> {
+    if !iface.flags().contains(InterfaceFlags::LOOPBACK)
+        && iface.common().route_localnet_value() == 0
+    {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
 }
 
 fn select_ipv4_primary(addresses: &[IpCidr], next_hop: Ipv4Address) -> Option<Ipv4Address> {

@@ -681,6 +681,39 @@ mod hook_program_tests {
     }
 
     #[test]
+    fn ipv6_xt_masquerade_uses_range_layout() {
+        let mut info = [0xabu8; 40];
+        info[..4].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(
+            parse_xt_nat_target(10, b"MASQUERADE", 0, &info),
+            Ok(NftNatAction::Masquerade { ports: None })
+        );
+        info[..4].copy_from_slice(&2u32.to_ne_bytes());
+        info[36..38].copy_from_slice(&40100u16.to_be_bytes());
+        info[38..40].copy_from_slice(&40101u16.to_be_bytes());
+        assert_eq!(
+            parse_xt_nat_target(10, b"MASQUERADE", 0, &info),
+            Ok(NftNatAction::Masquerade {
+                ports: Some(CtNatPortRange::new(40100, 40101).unwrap()),
+            })
+        );
+        assert_eq!(
+            parse_xt_nat_target(10, b"MASQUERADE", 0, &info[..39]),
+            Err(SystemError::EINVAL)
+        );
+        info[..4].copy_from_slice(&1u32.to_ne_bytes());
+        assert_eq!(
+            parse_xt_nat_target(10, b"MASQUERADE", 0, &info),
+            Err(SystemError::EINVAL)
+        );
+        info[..4].copy_from_slice(&4u32.to_ne_bytes());
+        assert_eq!(
+            parse_xt_nat_target(10, b"MASQUERADE", 0, &info),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        );
+    }
+
+    #[test]
     fn ipv4_dnat_revision_two_uses_ipv4_addresses_in_range2() {
         let mut info = [0u8; 48];
         info[..4].copy_from_slice(&3u32.to_ne_bytes());

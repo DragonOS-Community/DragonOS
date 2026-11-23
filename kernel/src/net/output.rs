@@ -113,6 +113,9 @@ fn route_after_output(
             return Err(SystemError::ENETDOWN);
         }
     }
+    if let Some(IpAddress::Ipv4(source)) = source {
+        routes.validate_ipv4_output_source(route, source)?;
+    }
     let masquerade = if may_masquerade {
         routes.prepare_masquerade_addresses()?;
         let hook_oif = if route.kind == RTN_LOCAL {

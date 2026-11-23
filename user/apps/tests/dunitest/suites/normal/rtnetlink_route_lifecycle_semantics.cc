@@ -969,6 +969,105 @@ TEST(RtnetlinkRouteSemantics, Ipv6NormalizesDefaultMetricAndScopeForIdentity) {
               0);
 }
 
+TEST(RtnetlinkRouteSemantics, Ipv4RouteLocalnetUsesActualEgress) {
+    FdGuard fd(OpenRouteSocket());
+    FdGuard setting(open("/proc/sys/net/ipv4/conf/veth-host1/route_localnet", O_RDWR));
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    ASSERT_GE(setting.Get(), 0) << ErrnoString(errno);
+    const uint32_t iface = if_nametoindex("veth-host1");
+    ASSERT_NE(iface, 0u);
+    constexpr char target[] = "198.18.232.6";
+    RouteSpec route = MakeIpv4Route(target, 32, iface);
+    uint32_t seq = 7220;
+    char original[16] = {};
+    const ssize_t original_length = read(setting.Get(), original, sizeof(original));
+    ASSERT_GT(original_length, 0);
+
+    ASSERT_EQ(SendRouteRequest(fd.Get(), RTM_NEWROUTE,
+                               NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                               route, ++seq),
+              0);
+    const auto test = [&] {
+        const auto lookup = [&] {
+            return LookupIpv4Route(fd.Get(), target, ++seq, std::nullopt, Ipv4("127.0.0.1"));
+        };
+        ASSERT_EQ(pwrite(setting.Get(), "0\n", 2, 0), 2);
+        EXPECT_FALSE(lookup().has_value());
+        ASSERT_EQ(pwrite(setting.Get(), "1\n", 2, 0), 2);
+        const auto outbound = lookup();
+        ASSERT_TRUE(outbound.has_value());
+        EXPECT_EQ(outbound->oif, iface);
+        ASSERT_EQ(pwrite(setting.Get(), "0\n", 2, 0), 2);
+        EXPECT_FALSE(lookup().has_value());
+    };
+    test();
+    EXPECT_EQ(pwrite(setting.Get(), original, original_length, 0), original_length);
+    EXPECT_EQ(SendRouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK, route, ++seq), 0);
+}
+
+TEST(RtnetlinkRouteSemantics, Ipv6RouteLookupAcceptsLegacyLookupTableFlag) {
+    FdGuard fd(OpenRouteSocket());
+    ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+    const uint32_t iface = if_nametoindex("veth-host1");
+    ASSERT_NE(iface, 0u);
+    constexpr char prefix[] = "2001:db8:ffff:32::";
+    constexpr char target[] = "2001:db8:ffff:32::1";
+    uint32_t seq = 7230;
+    ASSERT_EQ(SendIpv6RouteRequest(fd.Get(), RTM_NEWROUTE,
+                                   NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                   prefix, 64, iface, RT_SCOPE_UNIVERSE, ++seq),
+              0);
+    const auto lookup = [&](uint32_t flags) {
+        alignas(nlmsghdr) char request[128] = {};
+        auto* header = reinterpret_cast<nlmsghdr*>(request);
+        header->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+        header->nlmsg_type = RTM_GETROUTE;
+        header->nlmsg_flags = NLM_F_REQUEST;
+        header->nlmsg_seq = ++seq;
+        auto* route = reinterpret_cast<rtmsg*>(NLMSG_DATA(header));
+        route->rtm_family = AF_INET6;
+        route->rtm_dst_len = 128;
+        route->rtm_flags = flags;
+        in6_addr destination = {};
+        ASSERT_EQ(inet_pton(AF_INET6, target, &destination), 1);
+        AddAttr(header, sizeof(request), RTA_DST, &destination, sizeof(destination));
+        ASSERT_EQ(send(fd.Get(), request, header->nlmsg_len, 0),
+                  static_cast<ssize_t>(header->nlmsg_len));
+
+        alignas(nlmsghdr) char reply[4096] = {};
+        ssize_t length = recv(fd.Get(), reply, sizeof(reply), 0);
+        const auto* response = reinterpret_cast<const nlmsghdr*>(reply);
+        ASSERT_TRUE(NLMSG_OK(response, length));
+        EXPECT_EQ(response->nlmsg_seq, seq);
+        ASSERT_EQ(response->nlmsg_type, RTM_NEWROUTE);
+        ASSERT_GE(response->nlmsg_len, NLMSG_LENGTH(sizeof(rtmsg)));
+        const auto* result = reinterpret_cast<const rtmsg*>(NLMSG_DATA(response));
+        EXPECT_EQ(result->rtm_family, AF_INET6);
+        EXPECT_EQ(result->rtm_dst_len, 128);
+
+        uint32_t output = 0;
+        bool found_destination = false;
+        int remaining = RTM_PAYLOAD(response);
+        for (const auto* attr = RTM_RTA(result); RTA_OK(attr, remaining);
+             attr = RTA_NEXT(attr, remaining)) {
+            if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) == sizeof(output)) {
+                std::memcpy(&output, RTA_DATA(attr), sizeof(output));
+            } else if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) == sizeof(destination)) {
+                found_destination = std::memcmp(RTA_DATA(attr), &destination,
+                                               sizeof(destination)) == 0;
+            }
+            EXPECT_NE(attr->rta_type, RTA_GATEWAY);
+        }
+        EXPECT_TRUE(found_destination);
+        EXPECT_EQ(output, iface);
+    };
+    lookup(0);
+    lookup(RTM_F_LOOKUP_TABLE);
+    EXPECT_EQ(SendIpv6RouteRequest(fd.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                                   prefix, 64, iface, RT_SCOPE_NOWHERE, ++seq),
+              0);
+}
+
 TEST(RtnetlinkRouteSemantics, Ipv6GatewayValidationPreservesAttributeSemantics) {
     FdGuard fd(OpenRouteSocket());
     ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);

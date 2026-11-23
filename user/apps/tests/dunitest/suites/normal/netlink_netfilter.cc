@@ -3717,6 +3717,48 @@ TEST(NetlinkNetfilter, NativeIpv4PostroutingSnatRewritesReplyDestination) {
   Ack(nft.get(), seq + 6, 0, kNftDeltable);
 }
 
+void CheckXtNatCompatRevision(int nft, uint32_t seq, uint8_t family, const char* name,
+                              uint32_t revision, uint32_t unsupported_revision) {
+  auto target_query = [&](uint32_t sequence, uint32_t version) {
+    auto query = Request(kNftCompatGet, sequence);
+    query[NLMSG_HDRLEN] = family;
+    nlmsghdr header{};
+    std::memcpy(&header, query.data(), sizeof(header));
+    header.nlmsg_flags &= ~NLM_F_ACK;
+    std::memcpy(query.data(), &header, sizeof(header));
+    AppendAttr(&query, NFTA_COMPAT_NAME, name);
+    AppendBe32(&query, NFTA_COMPAT_REV, version);
+    AppendBe32(&query, NFTA_COMPAT_TYPE, 1);
+    return query;
+  };
+  const auto query = target_query(seq, revision);
+  ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft, query));
+  pollfd pending{nft, POLLIN, 0};
+  ASSERT_EQ(1, poll(&pending, 1, 2000));
+  std::array<uint8_t, 512> bytes{};
+  const ssize_t count = recv(nft, bytes.data(), bytes.size(), 0);
+  constexpr size_t header_len = NLMSG_HDRLEN + sizeof(nfgenmsg);
+  ASSERT_GE(count, static_cast<ssize_t>(header_len));
+  nlmsghdr header{};
+  std::memcpy(&header, bytes.data(), sizeof(header));
+  ASSERT_EQ(kNftCompatGet, header.nlmsg_type);
+  ASSERT_GE(header.nlmsg_len, header_len);
+  ASSERT_LE(header.nlmsg_len, static_cast<uint32_t>(count));
+  EXPECT_EQ(seq, header.nlmsg_seq);
+  EXPECT_EQ(family, bytes[NLMSG_HDRLEN]);
+  const NlaSpan attrs{bytes.data() + header_len, header.nlmsg_len - header_len};
+  const auto wire_revision = FindNla(attrs, NFTA_COMPAT_REV);
+  ASSERT_EQ(sizeof(uint32_t), wire_revision.length);
+  EXPECT_EQ(revision, Be32(wire_revision));
+  const auto type = FindNla(attrs, NFTA_COMPAT_TYPE);
+  ASSERT_EQ(sizeof(uint32_t), type.length);
+  EXPECT_EQ(1u, Be32(type));
+  const auto unknown_revision = target_query(seq + 7, unsupported_revision);
+  ASSERT_EQ(static_cast<ssize_t>(unknown_revision.size()), Send(nft, unknown_revision));
+  Ack(nft, seq + 7, EPROTONOSUPPORT, kNftCompatGet);
+
+}
+
 void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
@@ -3727,43 +3769,8 @@ void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
   ASSERT_GE(server.get(), 0);
 
   constexpr uint32_t seq = 1470;
-  auto dnat_query = [](uint32_t sequence, uint32_t version) {
-    auto query = Request(kNftCompatGet, sequence);
-    query[NLMSG_HDRLEN] = NFPROTO_IPV4;
-    nlmsghdr header{};
-    std::memcpy(&header, query.data(), sizeof(header));
-    header.nlmsg_flags &= ~NLM_F_ACK;
-    std::memcpy(query.data(), &header, sizeof(header));
-    AppendAttr(&query, NFTA_COMPAT_NAME, "DNAT");
-    AppendBe32(&query, NFTA_COMPAT_REV, version);
-    AppendBe32(&query, NFTA_COMPAT_TYPE, 1);
-    return query;
-  };
-  const auto query = dnat_query(seq, revision);
-  ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
-  pollfd pending{nft.get(), POLLIN, 0};
-  ASSERT_EQ(1, poll(&pending, 1, 2000));
-  std::array<uint8_t, 512> bytes{};
-  const ssize_t count = recv(nft.get(), bytes.data(), bytes.size(), 0);
-  constexpr size_t header_len = NLMSG_HDRLEN + sizeof(nfgenmsg);
-  ASSERT_GE(count, static_cast<ssize_t>(header_len));
-  nlmsghdr header{};
-  std::memcpy(&header, bytes.data(), sizeof(header));
-  ASSERT_EQ(kNftCompatGet, header.nlmsg_type);
-  ASSERT_GE(header.nlmsg_len, header_len);
-  ASSERT_LE(header.nlmsg_len, static_cast<uint32_t>(count));
-  EXPECT_EQ(seq, header.nlmsg_seq);
-  EXPECT_EQ(NFPROTO_IPV4, bytes[NLMSG_HDRLEN]);
-  const NlaSpan attrs{bytes.data() + header_len, header.nlmsg_len - header_len};
-  const auto wire_revision = FindNla(attrs, NFTA_COMPAT_REV);
-  ASSERT_EQ(sizeof(uint32_t), wire_revision.length);
-  EXPECT_EQ(revision, Be32(wire_revision));
-  const auto type = FindNla(attrs, NFTA_COMPAT_TYPE);
-  ASSERT_EQ(sizeof(uint32_t), type.length);
-  EXPECT_EQ(1u, Be32(type));
-  const auto unknown_revision = dnat_query(seq + 7, 3);
-  ASSERT_EQ(static_cast<ssize_t>(unknown_revision.size()), Send(nft.get(), unknown_revision));
-  Ack(nft.get(), seq + 7, EPROTONOSUPPORT, kNftCompatGet);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckXtNatCompatRevision(nft.get(), seq, NFPROTO_IPV4, "DNAT", revision, 3));
 
   sockaddr_in client_address{}, server_address{}, original_address{};
   client_address.sin_family = server_address.sin_family = original_address.sin_family = AF_INET;
@@ -3822,6 +3829,13 @@ void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
   auto remove = TableBatch(kNftDeltable, seq + 5, table.c_str());
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
   Ack(nft.get(), seq + 6, 0, kNftDeltable);
+}
+
+TEST(NetlinkNetfilter, XtIpv6MasqueradeRevisionZeroIsAvailable) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  Fd nft(Open());
+  ASSERT_GE(nft.get(), 0);
+  CheckXtNatCompatRevision(nft.get(), 1490, NFPROTO_IPV6, "MASQUERADE", 0, 1);
 }
 
 TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {

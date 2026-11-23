@@ -350,7 +350,8 @@ std::vector<DumpedRoute> DumpRoutes(int fd, uint32_t seq, uint32_t route_flags =
 }
 
 std::optional<DumpedRoute> LookupIpv4Route(int fd, const char* destination, uint32_t seq,
-                                           std::optional<uint32_t> oif = std::nullopt) {
+                                           std::optional<uint32_t> oif = std::nullopt,
+                                           std::optional<uint32_t> source = std::nullopt) {
     alignas(nlmsghdr) char request_buf[256] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(request_buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -362,6 +363,10 @@ std::optional<DumpedRoute> LookupIpv4Route(int fd, const char* destination, uint
     rtm->rtm_dst_len = 32;
     uint32_t dst = Ipv4(destination);
     AddAttr(nlh, sizeof(request_buf), RTA_DST, &dst, sizeof(dst));
+    if (source.has_value()) {
+        rtm->rtm_src_len = 32;
+        AddAttr(nlh, sizeof(request_buf), RTA_SRC, &*source, sizeof(*source));
+    }
     if (oif.has_value()) {
         AddAttr(nlh, sizeof(request_buf), RTA_OIF, &*oif, sizeof(*oif));
     }

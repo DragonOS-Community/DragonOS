@@ -371,15 +371,10 @@ fn validate_get_request(request: &RouteSegment) -> Result<(), SystemError> {
     if request.body().flags.contains(RouteFlags::FIB_MATCH) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    match request.body().family {
-        AddressFamily::INet => {
-            if request.body().raw_flags & !RouteFlags::LOOKUP_TABLE.bits() != 0 {
-                return Err(SystemError::EINVAL);
-            }
-        }
-        AddressFamily::INet6 if request.body().raw_flags != 0 => return Err(SystemError::EINVAL),
-        AddressFamily::INet6 => {}
-        _ => unreachable!(),
+    // Legacy IPv6 clients also send LOOKUP_TABLE. Linux ignores it for
+    // IPv6 lookups unless strict checking is explicitly enabled.
+    if request.body().raw_flags & !RouteFlags::LOOKUP_TABLE.bits() != 0 {
+        return Err(SystemError::EINVAL);
     }
     Ok(())
 }

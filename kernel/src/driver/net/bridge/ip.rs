@@ -246,9 +246,24 @@ impl BridgeDriver {
         let Some(netns) = bridge.net_namespace() else {
             return;
         };
-        let Some(route) =
-            lookup_ingress(&netns, frame.destination(version), bridge.nic_id() as u32)
-        else {
+        let destination = frame.destination(version);
+        let ingress_ifindex = bridge.nic_id() as u32;
+        let route = if let IpAddress::Ipv4(destination) = destination {
+            let source = Ipv4Packet::new_unchecked(frame.ip()).src_addr();
+            if source.is_loopback() || destination.is_loopback() {
+                let router = netns.router();
+                let routes = crate::net::route::lock_output_routes(&router, netns.device_list());
+                if !routes.allows_ipv4_loopback_ingress(ingress_ifindex, source) {
+                    return;
+                }
+                routes.lookup_ingress(destination.into(), ingress_ifindex)
+            } else {
+                lookup_ingress(&netns, destination.into(), ingress_ifindex)
+            }
+        } else {
+            lookup_ingress(&netns, destination, ingress_ifindex)
+        };
+        let Some(route) = route else {
             return;
         };
         if matches!(route.matched.kind, RTN_LOCAL | RTN_BROADCAST)

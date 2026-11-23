@@ -253,6 +253,103 @@ struct CleanupLinks {
     }
 };
 
+TEST(RtnetlinkBridgeVethSemantics, Ipv6ForwardingDefaultAndAllHaveDistinctEffects) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd source;
+            ASSERT_GE(source.fd, 0);
+            const std::string prefix = "/proc/sys/net/ipv6/conf/";
+            const auto open_forwarding = [&](const std::string& name, int flags) {
+                return open((prefix + name + "/forwarding").c_str(), flags | O_CLOEXEC);
+            };
+            const auto read_fd = [](int fd) {
+                char value[24];
+                const ssize_t count = pread(fd, value, sizeof(value), 0);
+                return count > 0 ? std::string(value, count) : std::string{};
+            };
+            const auto read_value = [&](const std::string& name) {
+                const int fd = open_forwarding(name, O_RDONLY);
+                if (fd < 0) return std::string{};
+                const auto value = read_fd(fd);
+                close(fd);
+                return value;
+            };
+            const auto write_value = [&](const std::string& name, const std::string& value) {
+                const int fd = open_forwarding(name, O_WRONLY);
+                ASSERT_GE(fd, 0) << name << ": " << std::strerror(errno);
+                EXPECT_EQ(write(fd, value.data(), value.size()), static_cast<ssize_t>(value.size()));
+                close(fd);
+            };
+            const auto add_veth = [&](const std::string& name, uint32_t seq) {
+                LinkRequest add(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, seq);
+                ASSERT_TRUE(add.name(name));
+                AddKind(add, "veth");
+                ASSERT_EQ(SendAck(source.fd, add), 0);
+            };
+            ASSERT_EQ(read_value("default"), "0\n");
+            EXPECT_EQ(read_value("all"), "0\n");
+            add_veth("fwdexisting", 4920);
+            write_value("default", "2\n");
+            EXPECT_EQ(read_value("all"), "0\n");
+            EXPECT_EQ(read_value("fwdexisting"), "0\n");
+            add_veth("fwdnew", 4921);
+            EXPECT_EQ(read_value("fwdnew"), "2\n");
+
+            write_value("all", "1\n");
+            EXPECT_EQ(read_value("default"), "1\n");
+            EXPECT_EQ(read_value("fwdexisting"), "1\n");
+            write_value("fwdnew", "0\n");
+            write_value("default", "2\n");
+            EXPECT_EQ(read_value("fwdnew"), "0\n");
+            EXPECT_EQ(read_value("fwdexisting"), "1\n");
+            write_value("all", "1\n");
+            EXPECT_EQ(read_value("default"), "1\n");
+            EXPECT_EQ(read_value("fwdnew"), "1\n");
+
+            const int old_all = open_forwarding("all", O_RDWR);
+            const int old_default = open_forwarding("default", O_RDWR);
+            const int old_device = open_forwarding("fwdnew", O_RDONLY);
+            ASSERT_GE(old_all, 0);
+            ASSERT_GE(old_default, 0);
+            ASSERT_GE(old_device, 0);
+            const auto ifindex = if_nametoindex("fwdnew");
+            ASSERT_NE(ifindex, 0u);
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            EXPECT_EQ(read_value("all"), "0\n");
+            EXPECT_EQ(read_value("default"), "0\n");
+            EXPECT_EQ(read_fd(old_all), "1\n");
+            EXPECT_EQ(read_fd(old_default), "1\n");
+            EXPECT_EQ(pwrite(old_default, "2\n", 2, 0), 2);
+            EXPECT_EQ(read_fd(old_default), "2\n");
+            EXPECT_EQ(read_value("default"), "0\n");
+            write_value("default", "3\n");
+            const int target = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+            ASSERT_GE(target, 0);
+            LinkRequest move(RTM_SETLINK, 0, 4922);
+            move.body()->ifi_index = ifindex;
+            ASSERT_TRUE(move.add(IFLA_NET_NS_FD, &target, sizeof(target)));
+            ASSERT_EQ(SendAck(source.fd, move), 0);
+            close(target);
+            EXPECT_EQ(read_value("fwdnew"), "3\n");
+            char stale;
+            EXPECT_EQ(read(old_device, &stale, 1), -1);
+            EXPECT_EQ(errno, ENOENT);
+            close(old_device);
+            close(old_default);
+            close(old_all);
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);

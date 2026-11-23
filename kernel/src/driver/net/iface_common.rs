@@ -123,6 +123,7 @@ pub struct IfaceCommon {
     /// software qdisc queue, so this is distinct from hardware ring capacity.
     tx_queue_len: AtomicU32,
     ipv6_disabled: core::sync::atomic::AtomicI32,
+    ipv6_forwarding: core::sync::atomic::AtomicI32,
     pub(super) type_: InterfaceType,
     tx_admission: tx_admission::TxAdmission,
     pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
@@ -223,6 +224,9 @@ impl PreparedNetnsBinding {
         let socket_set = common.sockets.read().clone();
         let mut sockets = socket_set.lock();
         let mut namespace = common.net_namespace.write();
+        common
+            .ipv6_forwarding
+            .store(self.netns.ipv6_default_forwarding(), Ordering::Release);
         *namespace = Arc::downgrade(&self.netns);
         sockets.set_udp_ingress_handler(Some(self.ingress));
         sockets.set_tcp_ingress_handler(Some(self.netns.tcp_stack().clone()));
@@ -291,6 +295,7 @@ impl IfaceCommon {
             flags: AtomicU32::new(flags.bits()),
             mtu: AtomicUsize::new(mtu),
             ipv6_disabled: core::sync::atomic::AtomicI32::new(0),
+            ipv6_forwarding: core::sync::atomic::AtomicI32::new(0),
             tx_queue_len: AtomicU32::new(1000),
             type_,
             tx_admission: tx_admission::TxAdmission::new(flags.contains(InterfaceFlags::UP)),
@@ -2238,6 +2243,14 @@ impl IfaceCommon {
         if self.local_input_queue.fail_deferred_ipv6() {
             self.schedule_registered_local_output(crate::time::Instant::now().into());
         }
+    }
+
+    pub(crate) fn ipv6_forwarding(&self) -> i32 {
+        self.ipv6_forwarding.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_ipv6_forwarding(&self, _rtnl: &crate::net::rtnl::RtnlGuard, value: i32) {
+        self.ipv6_forwarding.store(value, Ordering::Release);
     }
 
     pub(crate) fn ipv6_disabled_value(&self) -> i32 {

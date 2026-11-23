@@ -9,10 +9,10 @@ use crate::filesystem::{
         template::{DirOps, FileOps, ProcDir, ProcDirBuilder, ProcFileBuilder},
         utils::proc_read,
     },
-    vfs::{FilePrivateData, IndexNode, InodeMode},
+    vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode, PrimaryWriteResult},
 };
 use crate::libs::mutex::MutexGuard;
-use crate::process::{cred::CAPFlags, ProcessManager};
+use crate::net::rtnl;
 use alloc::{
     format,
     string::ToString,
@@ -30,8 +30,27 @@ pub(super) struct Ipv6DirOps(SysctlNamespace);
 #[derive(Debug)]
 struct ConfDirOps(SysctlNamespace);
 
+#[derive(Debug, Clone, Copy)]
+enum NamespaceForwarding {
+    All,
+    Default,
+}
+
+impl NamespaceForwarding {
+    fn from_dir_name(name: &str) -> Option<Self> {
+        match name {
+            "all" => Some(Self::All),
+            "default" => Some(Self::Default),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
-struct AllDirOps;
+struct NamespaceConfDirOps {
+    namespace: SysctlNamespace,
+    target: NamespaceForwarding,
+}
 
 impl Ipv6DirOps {
     pub(super) fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
@@ -58,12 +77,19 @@ impl ConfDirOps {
     }
 }
 
-impl AllDirOps {
-    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
-            .parent(parent)
-            .build()
-            .unwrap()
+impl NamespaceConfDirOps {
+    fn new_inode(
+        parent: Weak<dyn IndexNode>,
+        namespace: SysctlNamespace,
+        target: NamespaceForwarding,
+    ) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(
+            Self { namespace, target },
+            InodeMode::from_bits_truncate(0o555),
+        )
+        .parent(parent)
+        .build()
+        .unwrap()
     }
 }
 
@@ -113,12 +139,18 @@ impl DirOps for ConfDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         let netns = self.0.upgrade()?;
-        if name == "all" {
+        if let Some(target) = NamespaceForwarding::from_dir_name(name) {
             return Ok(dir
                 .cached_children()
                 .write()
                 .entry(name.to_string())
-                .or_insert_with(|| AllDirOps::new_inode(dir.self_ref_weak().clone()))
+                .or_insert_with(|| {
+                    NamespaceConfDirOps::new_inode(
+                        dir.self_ref_weak().clone(),
+                        self.0.clone(),
+                        target,
+                    )
+                })
                 .clone());
         }
         let devices = netns.device_list();
@@ -137,10 +169,12 @@ impl DirOps for ConfDirOps {
         let Ok(netns) = self.0.upgrade() else {
             return;
         };
-        let _ = self.lookup_child(dir, "all");
+        for name in ["all", "default"] {
+            let _ = self.lookup_child(dir, name);
+        }
         for iface in netns.device_list().values() {
             iface.common().with_iface_name(|name| {
-                if name != "all" {
+                if NamespaceForwarding::from_dir_name(name).is_none() {
                     self.cache_device(dir, name, iface);
                 }
             });
@@ -175,51 +209,96 @@ impl ConfDirOps {
     }
 }
 
-impl DirOps for AllDirOps {
+impl DirOps for NamespaceConfDirOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.namespace.upgrade().map(|_| ())
+    }
+
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.validate_inode()
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        self.validate_inode()?;
         if name != "forwarding" {
             return Err(SystemError::ENOENT);
         }
-        let mut children = dir.cached_children().write();
-        Ok(children
+        Ok(dir
+            .cached_children()
+            .write()
             .entry(name.to_string())
-            .or_insert_with(|| ForwardingFileOps::new_inode(dir.self_ref_weak().clone()))
+            .or_insert_with(|| {
+                ProcFileBuilder::new(
+                    ForwardingFileOps {
+                        namespace: self.namespace.clone(),
+                        target: self.target,
+                    },
+                    InodeMode::from_bits_truncate(0o644),
+                )
+                .parent(dir.self_ref_weak().clone())
+                .sysctl_permissions()
+                .build()
+                .unwrap()
+            })
             .clone())
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        dir.cached_children()
-            .write()
-            .entry("forwarding".to_string())
-            .or_insert_with(|| ForwardingFileOps::new_inode(dir.self_ref_weak().clone()));
+        let _ = self.lookup_child(dir, "forwarding");
     }
 }
 
 #[derive(Debug)]
-struct ForwardingFileOps;
-
-impl ForwardingFileOps {
-    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcFileBuilder::new(Self, InodeMode::from_bits_truncate(0o644))
-            .parent(parent)
-            .sysctl_permissions()
-            .build()
-            .unwrap()
-    }
+struct ForwardingFileOps {
+    namespace: SysctlNamespace,
+    target: NamespaceForwarding,
 }
 
 impl FileOps for ForwardingFileOps {
     const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
         crate::filesystem::procfs::template::ProcfsSeekKind::Default;
 
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.namespace.upgrade().map(|_| ())
+    }
+
+    fn open(
+        &self,
+        _data: &mut MutexGuard<FilePrivateData>,
+        _flags: &FileFlags,
+    ) -> Result<(), SystemError> {
+        self.validate_inode()
+    }
+
+    fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
+        self.namespace.access_bits().map(Some)
+    }
+
+    fn owner(&self) -> Option<(usize, usize)> {
+        self.namespace.owner()
+    }
+
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
-        Some(|ops, offset, len, buf, data| {
-            ops.write_at(offset, len, buf, data)
-                .map(crate::filesystem::vfs::PrimaryWriteResult::new)
+        Some(|ops, offset, _, buf, _data| {
+            let netns = ops.namespace.upgrade()?;
+            if SysctlNamespace::access_bits_for(&netns) & 2 == 0 {
+                return Err(SystemError::EPERM);
+            }
+            if buf.is_empty() || offset != 0 {
+                return Ok(PrimaryWriteResult::new(buf.len()));
+            }
+            let (value, consumed) = parse_numeric_sysctl(buf)?;
+            let value = i32::try_from(value).map_err(|_| SystemError::EINVAL)?;
+            let rtnl = rtnl::lock();
+            match ops.target {
+                NamespaceForwarding::All => netns.set_ipv6_forwarding(&rtnl, value),
+                NamespaceForwarding::Default => netns.set_ipv6_default_forwarding(&rtnl, value),
+            }
+            Ok(PrimaryWriteResult::new(consumed))
         })
     }
 
@@ -234,37 +313,14 @@ impl FileOps for ForwardingFileOps {
         buf: &mut [u8],
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
+        let netns = self.namespace.upgrade()?;
         if offset != 0 {
             return Ok(0);
         }
-        let value = ProcessManager::current_netns().ipv6_forwarding_value();
+        let value = match self.target {
+            NamespaceForwarding::All => netns.ipv6_forwarding_value(),
+            NamespaceForwarding::Default => netns.ipv6_default_forwarding(),
+        };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
-    }
-}
-
-impl ForwardingFileOps {
-    fn write_at(
-        &self,
-        offset: usize,
-        _len: usize,
-        buf: &[u8],
-        _data: MutexGuard<FilePrivateData>,
-    ) -> Result<usize, SystemError> {
-        let netns = ProcessManager::current_netns();
-        if !ProcessManager::current_cred()
-            .has_capability_in_ns(netns.user_ns(), CAPFlags::CAP_NET_ADMIN)
-        {
-            return Err(SystemError::EPERM);
-        }
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if offset != 0 {
-            return Ok(buf.len());
-        }
-        let (value, consumed) = parse_numeric_sysctl(buf)?;
-        let value = i32::try_from(value).map_err(|_| SystemError::EINVAL)?;
-        netns.set_ipv6_forwarding(value);
-        Ok(consumed)
     }
 }

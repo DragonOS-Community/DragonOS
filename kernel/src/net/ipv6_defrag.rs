@@ -23,6 +23,7 @@ const REASSEMBLY_TIMEOUT_US: u64 = 30_000_000;
 const CT_IN_USER: u32 = 1;
 const CT_OUT_USER: u32 = CT_IN_USER + u16::MAX as u32 + 1;
 const LOCAL_IN_USER: u32 = CT_OUT_USER + u16::MAX as u32 + 1;
+const BRIDGE_IN_USER: u32 = LOCAL_IN_USER + u16::MAX as u32 + 1;
 
 /// The namespace is implicit in its owning reassembler. `ifindex` is part of
 /// the key only for link-local and multicast destinations, as on Linux.
@@ -30,6 +31,7 @@ const LOCAL_IN_USER: u32 = CT_OUT_USER + u16::MAX as u32 + 1;
 pub(crate) struct DefragDomain {
     user: u32,
     ifindex: u32,
+    bridge_generation: usize,
 }
 
 impl DefragDomain {
@@ -37,6 +39,7 @@ impl DefragDomain {
         Self {
             user: CT_IN_USER + zone as u32,
             ifindex,
+            bridge_generation: 0,
         }
     }
 
@@ -44,6 +47,7 @@ impl DefragDomain {
         Self {
             user: CT_OUT_USER + zone as u32,
             ifindex,
+            bridge_generation: 0,
         }
     }
 
@@ -51,6 +55,14 @@ impl DefragDomain {
         Self {
             user: LOCAL_IN_USER + zone as u32,
             ifindex,
+            bridge_generation: 0,
+        }
+    }
+    pub(crate) const fn bridge_ingress(bridge_ifindex: u32, generation: usize) -> Self {
+        Self {
+            user: BRIDGE_IN_USER,
+            ifindex: bridge_ifindex,
+            bridge_generation: generation,
         }
     }
 }
@@ -62,6 +74,7 @@ struct Key {
     identification: u32,
     user: u32,
     scoped_ifindex: u32,
+    bridge_generation: usize,
 }
 
 struct Fragment {
@@ -232,7 +245,12 @@ impl Parsed<'_> {
                     packet[offset + 4..offset + 8].try_into().unwrap(),
                 ),
                 user: domain.user,
-                scoped_ifindex: if scoped { domain.ifindex } else { 0 },
+                scoped_ifindex: if scoped || domain.user == BRIDGE_IN_USER {
+                    domain.ifindex
+                } else {
+                    0
+                },
+                bridge_generation: domain.bridge_generation,
             },
             base: packet[..IPV6_HEADER_LEN].try_into().unwrap(),
             prefix,

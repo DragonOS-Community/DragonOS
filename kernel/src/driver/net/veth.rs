@@ -990,6 +990,10 @@ impl Iface for VethInterface {
 }
 
 impl BridgeEnableDevice for VethInterface {
+    fn bridge_ingress_generation(&self) -> u64 {
+        self.driver.inner.lock().ingress_generation
+    }
+
     fn receive_from_bridge(&self, frame: &[u8]) {
         if self.common_bridge_data().is_some() {
             if let Some(_tx) = self.common.try_acquire_tx() {

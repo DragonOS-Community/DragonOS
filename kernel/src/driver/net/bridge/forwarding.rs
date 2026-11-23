@@ -36,6 +36,14 @@ pub struct BridgePort {
     // mac mtu信息
 }
 
+pub(super) struct PortActivity<'a>(&'a AtomicUsize);
+
+impl Drop for PortActivity<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl BridgePort {
     pub(super) fn new(
         id: BridgePortId,
@@ -54,14 +62,16 @@ impl BridgePort {
     }
 
     pub(super) fn transmit(&self, frame: &[u8]) {
-        // The admission increment, active check, detach store and final
-        // count check must share one global order; Acquire/Release alone
-        // permits both sides to observe the other's old value.
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        if self.can_forward() {
+        if let Some(_activity) = self.enter() {
             self.bridge_enable.receive_from_bridge(frame);
         }
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn enter(&self) -> Option<PortActivity<'_>> {
+        // A port detach closes admission before waiting for either direction.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let activity = PortActivity(&self.in_flight);
+        self.can_forward().then_some(activity)
     }
 
     pub(super) fn can_forward(&self) -> bool {
@@ -220,6 +230,15 @@ impl Bridge {
         self.retain_learned_order();
     }
 
+    pub(super) fn learn_source(&mut self, port_id: BridgePortId, source: EthernetAddress) -> bool {
+        if !self.ports.contains_key(&port_id) {
+            return false;
+        }
+        self.sweep_if_due();
+        self.insert_or_update_mac_entry(source, port_id);
+        true
+    }
+
     pub(super) fn select_egress(
         &mut self,
         ingress_port_id: BridgePortId,
@@ -246,7 +265,7 @@ impl Bridge {
                 });
             }
         };
-        if !self.ports.contains_key(&ingress_port_id) {
+        if !self.learn_source(ingress_port_id, ether_frame.src_addr()) {
             return Ok(BridgeDecision {
                 local: false,
                 local_stack_dst: None,
@@ -254,13 +273,7 @@ impl Bridge {
             });
         }
 
-        self.sweep_if_due();
-
         let dst_mac = ether_frame.dst_addr();
-        let src_mac = ether_frame.src_addr();
-
-        self.insert_or_update_mac_entry(src_mac, ingress_port_id);
-
         let port_local = self.port_local_macs.contains_key(&dst_mac);
         let local = dst_mac.is_broadcast()
             || dst_mac.as_bytes()[0] & 1 != 0

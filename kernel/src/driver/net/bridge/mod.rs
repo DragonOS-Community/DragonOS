@@ -41,10 +41,12 @@ use unified_init::macros::unified_init;
 
 mod forwarding;
 mod iface;
+mod ip;
 
 pub use self::forwarding::{Bridge, BridgePort, BridgePortId};
 use self::forwarding::{BridgeEgress, BRIDGE_MAX_LOCAL_FRAMES, BRIDGE_MTU};
 pub use self::iface::BridgeIface;
+pub(super) use self::ip::BridgeDnat;
 
 #[derive(Debug)]
 pub struct BridgeDriver {
@@ -57,6 +59,7 @@ pub struct BridgeDriver {
     in_flight: AtomicUsize,
     self_ref: Weak<BridgeDriver>,
     next_port_id: AtomicUsize,
+    ingress_generation: AtomicUsize,
 }
 
 impl BridgeDriver {
@@ -71,6 +74,7 @@ impl BridgeDriver {
             in_flight: AtomicUsize::new(0),
             self_ref: self_ref.clone(),
             next_port_id: AtomicUsize::new(0),
+            ingress_generation: AtomicUsize::new(0),
         })
     }
 
@@ -199,6 +203,9 @@ impl BridgeDriver {
         let Some(_activity) = self.enter_data_path() else {
             return;
         };
+        if self.handle_ip_frame(ingress_port_id, frame, None, None) {
+            return;
+        }
         let decision = self.inner.lock().select_egress(ingress_port_id, frame);
         let Ok(decision) = decision else {
             return;
@@ -361,6 +368,7 @@ impl Drop for BridgeActivity<'_> {
 
 /// 可供桥接设备应该实现的 trait
 pub trait BridgeEnableDevice: Iface {
+    fn bridge_ingress_generation(&self) -> u64;
     /// 接收来自桥的数据帧
     fn receive_from_bridge(&self, frame: &[u8]);
 

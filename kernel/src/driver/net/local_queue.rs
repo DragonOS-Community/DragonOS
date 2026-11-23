@@ -3,6 +3,7 @@ use super::deferred_queue::{DeferredRouteLimits, DeferredRouteQueue, JoinDeferre
 use super::*;
 use crate::libs::prepared_queue::{Node as PreparedNode, Queue as PreparedQueue};
 use crate::net::conntrack::CtPacketContext;
+use alloc::boxed::Box;
 use core::cell::RefCell;
 
 pub(super) const MAX_LOCAL_OUTPUT_FRAMES: usize = 1024;
@@ -371,6 +372,7 @@ pub(super) struct LocalOutputPacket {
     pub(super) prepared_ip: Option<PreparedIpProgress>,
     /// Only transit packets with a non-fragmentable PMTU boundary own this.
     pub(super) forward_mtu_feedback: Option<Arc<crate::net::forward_mtu::ForwardMtuFeedback>>,
+    pub(super) bridge_dnat: Option<Box<super::bridge::BridgeDnat>>,
     pub(super) _charge: Option<OutputCharge>,
 }
 
@@ -713,6 +715,7 @@ impl<'a> LocalOutputReservation<'a> {
             mark: 0,
             prepared_ip: None,
             forward_mtu_feedback: None,
+            bridge_dnat: None,
             _charge: None,
         });
     }
@@ -744,6 +747,7 @@ impl<'a> LocalOutputReservation<'a> {
                 max_fragment_len: None,
             }),
             forward_mtu_feedback: None,
+            bridge_dnat: None,
             _charge: charge,
         });
     }
@@ -775,6 +779,7 @@ impl<'a> LocalOutputReservation<'a> {
                 max_fragment_len: None,
             }),
             forward_mtu_feedback: None,
+            bridge_dnat: None,
             _charge: charge,
         });
     }
@@ -823,6 +828,7 @@ impl<'a> LocalOutputReservation<'a> {
                 mark: 0,
                 prepared_ip: None,
                 forward_mtu_feedback: None,
+                bridge_dnat: None,
                 _charge: None,
             },
             retry_at,
@@ -1020,6 +1026,22 @@ impl LocalInputQueue {
         state.bytes += node.value().resident_bytes();
         state.packets.push_node(node);
         Ok(())
+    }
+
+    pub(super) fn retire_bridge_input(&self) {
+        let mut retired = PreparedQueue::new();
+        let mut state = self.state.lock();
+        for _ in 0..state.packets.len() {
+            let packet = state.packets.pop_node().expect("queue length was observed");
+            if packet.value().ingress_stage == IngressStage::BridgePreRoutingDone {
+                state.bytes -= packet.value().resident_bytes();
+                retired.push_node(packet);
+            } else {
+                state.packets.push_node(packet);
+            }
+        }
+        drop(state);
+        drop(retired);
     }
 
     pub(super) fn pop(&self) -> Option<LocalInputPacket> {
@@ -1414,6 +1436,7 @@ mod output_ct_context_tests {
                             max_fragment_len: None,
                         }),
                         forward_mtu_feedback: None,
+                        bridge_dnat: None,
                         _charge: None,
                     },
                     now + smoltcp::time::Duration::from_millis(retry_ms),
@@ -1476,6 +1499,7 @@ mod output_ct_context_tests {
             mark: 0x1234_5678,
             prepared_ip: None,
             forward_mtu_feedback: None,
+            bridge_dnat: None,
             _charge: None,
         });
 

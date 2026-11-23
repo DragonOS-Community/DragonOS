@@ -41,6 +41,7 @@ mod queue_tests {
                 mark,
                 prepared_ip: None,
                 forward_mtu_feedback: None,
+                bridge_dnat: None,
                 _charge: None,
             }),
             retry_at: smoltcp::time::Instant::from_millis(0),

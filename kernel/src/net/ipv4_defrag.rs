@@ -21,6 +21,7 @@ const REASSEMBLY_TIMEOUT_US: u64 = 30_000_000;
 const CT_IN_USER: u32 = 2;
 const CT_OUT_USER: u32 = CT_IN_USER + u16::MAX as u32 + 1;
 const LOCAL_IN_USER: u32 = CT_OUT_USER + u16::MAX as u32 + 1;
+const BRIDGE_IN_USER: u32 = LOCAL_IN_USER + u16::MAX as u32 + 1;
 
 /// The namespace itself is implicit: each namespace owns one reassembler.
 /// `user` distinguishes PRE_ROUTING from LOCAL_OUT and carries the CT zone;
@@ -29,6 +30,7 @@ const LOCAL_IN_USER: u32 = CT_OUT_USER + u16::MAX as u32 + 1;
 pub(crate) struct DefragDomain {
     user: u32,
     vif: u32,
+    bridge_generation: usize,
 }
 
 impl DefragDomain {
@@ -36,6 +38,7 @@ impl DefragDomain {
         Self {
             user: CT_IN_USER + zone as u32,
             vif,
+            bridge_generation: 0,
         }
     }
 
@@ -43,6 +46,7 @@ impl DefragDomain {
         Self {
             user: CT_OUT_USER + zone as u32,
             vif,
+            bridge_generation: 0,
         }
     }
 
@@ -50,6 +54,14 @@ impl DefragDomain {
         Self {
             user: LOCAL_IN_USER + zone as u32,
             vif,
+            bridge_generation: 0,
+        }
+    }
+    pub(crate) const fn bridge_ingress(bridge_ifindex: u32, generation: usize) -> Self {
+        Self {
+            user: BRIDGE_IN_USER,
+            vif: bridge_ifindex,
+            bridge_generation: generation,
         }
     }
 }

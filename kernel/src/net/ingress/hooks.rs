@@ -20,10 +20,26 @@ use core::cell::{Cell, RefCell};
 use smoltcp::wire::{IpAddress, IpVersion, Ipv4Packet, Ipv6Packet};
 use system_error::SystemError;
 
+#[derive(Clone, Copy)]
+pub(super) enum HookDeviceNames<'a> {
+    Namespace(&'a NftDeviceNames),
+    Bridge(u32, [u8; 16]),
+}
+
+impl HookDeviceNames<'_> {
+    fn get(self, index: u32) -> Option<[u8; 16]> {
+        match self {
+            Self::Namespace(names) => names.get(index),
+            Self::Bridge(_, _) if index == 0 => Some([0; 16]),
+            Self::Bridge(ifindex, name) => (index == ifindex).then_some(name),
+        }
+    }
+}
+
 pub(super) struct IngressHooks<'a> {
     pub(super) ruleset: &'a RulesetSnapshot,
     pub(super) netns: &'a NetNamespace,
-    pub(super) device_names: &'a NftDeviceNames,
+    pub(super) device_names: HookDeviceNames<'a>,
     pub(super) stage: IngressStage,
     pub(super) mark: &'a Cell<u32>,
     pub(super) packet_context: &'a RefCell<Option<CtPacketContext>>,

@@ -15,6 +15,7 @@
 #include <linux/netfilter/xt_tcpudp.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/veth.h>
 #include <net/if.h>
 #include <poll.h>
 #include <sched.h>
@@ -6228,6 +6229,149 @@ TEST(NetlinkNetfilter, PacketLegacyReceiveWakesEpoll) {
   ASSERT_TRUE(WIFEXITED(child_status));
   ASSERT_EQ(0, WEXITSTATUS(child_status));
   EXPECT_TRUE(received_probe) << "queued AF_PACKET data must wake epoll";
+}
+
+void TestBridgeForwardingPolicy() {
+  ASSERT_TRUE(NetAdmin());
+  ASSERT_EQ(0, unshare(CLONE_NEWNET));
+  FdGuard rtnl(OpenRouteSocket());
+  ASSERT_GE(rtnl.Get(), 0);
+  uint32_t link_seq = 31000;
+  const auto link_request = [&](uint16_t type, unsigned index, const char* name,
+                                const char* kind, const char* peer, unsigned master) {
+    alignas(nlmsghdr) char buf[512]{};
+    auto* header = reinterpret_cast<nlmsghdr*>(buf);
+    header->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+    header->nlmsg_type = type;
+    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    header->nlmsg_seq = ++link_seq;
+    reinterpret_cast<ifinfomsg*>(NLMSG_DATA(header))->ifi_index = index;
+    if (name) {
+      header->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+      AddAttr(header, sizeof(buf), IFLA_IFNAME, name, std::strlen(name) + 1);
+      std::vector<uint8_t> info;
+      AppendNla(&info, IFLA_INFO_KIND, reinterpret_cast<const uint8_t*>(kind),
+                std::strlen(kind) + 1);
+      if (peer) {
+        std::vector<uint8_t> peer_link(sizeof(ifinfomsg), 0);
+        AppendNla(&peer_link, IFLA_IFNAME, reinterpret_cast<const uint8_t*>(peer),
+                  std::strlen(peer) + 1);
+        std::vector<uint8_t> data;
+        AppendNla(&data, VETH_INFO_PEER, peer_link.data(), peer_link.size());
+        AppendNla(&info, IFLA_INFO_DATA | NLA_F_NESTED, data.data(), data.size());
+      }
+      AddAttr(header, sizeof(buf), IFLA_LINKINFO | NLA_F_NESTED, info.data(), info.size());
+    } else {
+      AddAttr(header, sizeof(buf), IFLA_MASTER, &master, sizeof(master));
+    }
+    if (send(rtnl.Get(), buf, header->nlmsg_len, 0) < 0) return errno;
+    return RecvAck(rtnl.Get(), link_seq);
+  };
+  ASSERT_EQ(0, link_request(RTM_NEWLINK, 0, "br-hook", "bridge", nullptr, 0));
+  ASSERT_EQ(0, link_request(RTM_NEWLINK, 0, "from", "veth", "left", 0));
+  ASSERT_EQ(0, link_request(RTM_NEWLINK, 0, "to", "veth", "right", 0));
+  const unsigned master = if_nametoindex("br-hook");
+  ASSERT_NE(0u, master);
+  for (const auto* name : {"left", "right"}) {
+    const unsigned port = if_nametoindex(name);
+    ASSERT_NE(0u, port);
+    ASSERT_EQ(0, link_request(RTM_SETLINK, port, nullptr, nullptr, nullptr, master));
+  }
+  for (const auto* name : {"br-hook", "left", "right", "from", "to"}) {
+    const unsigned index = if_nametoindex(name);
+    ASSERT_NE(0u, index);
+    ASSERT_EQ(0, SetLinkUp(rtnl.Get(), index, true, ++link_seq));
+  }
+  const unsigned from = if_nametoindex("from");
+  const unsigned to = if_nametoindex("to");
+  Fd sender(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)));
+  Fd receiver(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)));
+  Fd sysctl(open("/proc/sys/net/bridge/bridge-nf-call-iptables", O_RDWR | O_CLOEXEC));
+  Fd nft(Open());
+  ASSERT_GE(sender.get(), 0);
+  ASSERT_GE(receiver.get(), 0);
+  ASSERT_GE(sysctl.get(), 0);
+  ASSERT_GE(nft.get(), 0);
+  sockaddr_ll endpoint{};
+  endpoint.sll_family = AF_PACKET;
+  endpoint.sll_protocol = htons(ETH_P_IP);
+  endpoint.sll_ifindex = static_cast<int>(to);
+  ASSERT_EQ(0, bind(receiver.get(), reinterpret_cast<sockaddr*>(&endpoint),
+                    sizeof(endpoint)));
+  char original[8]{};
+  const ssize_t original_len = pread(sysctl.get(), original, sizeof(original), 0);
+  ASSERT_GT(original_len, 0);
+
+  constexpr uint32_t seq = 21300;
+  const std::string table = "bridgegate_" + std::to_string(getpid());
+  auto batch = TableBatch(kNftNewtable, seq, table.c_str());
+  batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+  auto chain = NewChain(seq + 2, table.c_str(), "forward", true, NF_ACCEPT,
+                        NF_INET_FORWARD, NFPROTO_IPV4, -50);
+  std::array<uint8_t, IFNAMSIZ> bridge{};
+  std::memcpy(bridge.data(), "br-hook", sizeof("br-hook"));
+  std::vector<uint8_t> expressions;
+  AppendMetaEqual(&expressions, NFT_META_IIFNAME, bridge.data(), bridge.size());
+  AppendMetaEqual(&expressions, NFT_META_OIFNAME, bridge.data(), bridge.size());
+  AppendExpr(&expressions, "counter", {});
+  std::vector<uint8_t> verdict, data, immediate;
+  const uint32_t drop_code = htonl(NF_DROP);
+  AppendNla(&verdict, NFTA_VERDICT_CODE, reinterpret_cast<const uint8_t*>(&drop_code), sizeof(drop_code));
+  AppendNla(&data, NFTA_DATA_VERDICT | NLA_F_NESTED, verdict.data(), verdict.size());
+  const uint32_t verdict_register = htonl(NFT_REG_VERDICT);
+  AppendNla(&immediate, NFTA_IMMEDIATE_DREG, reinterpret_cast<const uint8_t*>(&verdict_register), sizeof(verdict_register));
+  AppendNla(&immediate, NFTA_IMMEDIATE_DATA | NLA_F_NESTED, data.data(), data.size());
+  AppendExpr(&expressions, "immediate", immediate);
+  auto drop = RuleWithExpressions(seq + 3, table.c_str(), "forward", expressions);
+  auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
+  for (const auto* entry : {&chain, &drop, &end}) {
+    batch.insert(batch.end(), entry->begin(), entry->end());
+  }
+
+  const auto probe = [&](uint16_t id, bool accepted) {
+    auto frame = Ipv4UdpProbe(inet_addr("198.18.0.1"), inet_addr("198.18.0.2"), id);
+    ASSERT_TRUE(InjectVethIpProbe(sender.get(), from, "to", frame));
+    pollfd pfd{receiver.get(), POLLIN, 0};
+    const int ready = poll(&pfd, 1, accepted ? 1500 : 200);
+    ASSERT_EQ(accepted ? 1 : 0, ready);
+    if (accepted) {
+      std::array<uint8_t, 128> received{};
+      ASSERT_EQ(static_cast<ssize_t>(frame.size()),
+                recv(receiver.get(), received.data(), received.size(), 0));
+      EXPECT_TRUE(std::equal(frame.begin(), frame.end(), received.begin()))
+          << "pure bridge forwarding preserves the original IP header";
+    }
+  };
+
+  const auto exercise = [&] {
+    ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
+    Ack(nft.get(), seq + 1, 0, kNftNewtable);
+    Ack(nft.get(), seq + 2, 0, kNftNewchain);
+    Ack(nft.get(), seq + 3, 0, kNftNewrule);
+    ASSERT_EQ(2, pwrite(sysctl.get(), "1\n", 2, 0));
+    ASSERT_NO_FATAL_FAILURE(probe(0x62a1, false));
+    ASSERT_EQ(2, pwrite(sysctl.get(), "0\n", 2, 0));
+    ASSERT_NO_FATAL_FAILURE(probe(0x62a2, true));
+  };
+  exercise();
+  auto remove = TableBatch(kNftDeltable, seq + 5, table.c_str());
+  if (Send(nft.get(), remove) == static_cast<ssize_t>(remove.size())) {
+    Ack(nft.get(), seq + 6, 0, kNftDeltable);
+  }
+  EXPECT_EQ(original_len, pwrite(sysctl.get(), original, original_len, 0));
+}
+
+TEST(NetlinkNetfilter, NftForwardDropGatesSameBridgeIngress) {
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    TestBridgeForwardingPolicy();
+    _exit(::testing::Test::HasFailure() ? 1 : 0);
+  }
+  int status = 0;
+  ASSERT_EQ(child, waitpid(child, &status, 0));
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 TEST(NetlinkNetfilter, NftForwardDropGatesActualRoutedIngress) {

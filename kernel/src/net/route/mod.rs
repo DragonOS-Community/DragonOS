@@ -69,14 +69,26 @@ impl OutputRouteGuard<'_> {
     /// from the same topology generation. PRE_ROUTING REDIRECT and
     /// POSTROUTING MASQUERADE share this read-only address view.
     pub(crate) fn prepare_masquerade_addresses(&mut self) -> Result<(), SystemError> {
+        self.prepare_addresses(None)
+    }
+
+    pub(crate) fn prepare_device_addresses(&mut self, ifindex: u32) -> Result<(), SystemError> {
+        self.prepare_addresses(Some(ifindex as usize))
+    }
+
+    fn prepare_addresses(&mut self, device: Option<usize>) -> Result<(), SystemError> {
         if self.masquerade_addresses.is_some() {
             return Ok(());
         }
         let mut addresses = Vec::new();
         addresses
-            .try_reserve_exact(self.devices.len())
+            .try_reserve_exact(device.map_or(self.devices.len(), |_| 1))
             .map_err(|_| SystemError::ENOMEM)?;
-        for (&index, iface) in self.devices.iter() {
+        let entries = device.map_or_else(
+            || self.devices.range(..),
+            |device| self.devices.range(device..=device),
+        );
+        for (&index, iface) in entries {
             let oif = u32::try_from(index).map_err(|_| SystemError::EINVAL)?;
             let mirror = iface.common().ip_addrs();
             let mut configured = Vec::new();

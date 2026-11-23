@@ -478,6 +478,7 @@ impl IfaceCommon {
                 mark: 0,
                 prepared_ip,
                 forward_mtu_feedback: feedback.map(|item| item.persist()).transpose()?,
+                bridge_dnat: None,
                 _charge: None,
             },
             reservation,

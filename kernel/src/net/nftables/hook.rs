@@ -668,6 +668,45 @@ mod hook_program_tests {
     }
 
     #[test]
+    fn ipv4_dnat_revision_two_uses_ipv4_addresses_in_range2() {
+        let mut info = [0u8; 48];
+        info[..4].copy_from_slice(&3u32.to_ne_bytes());
+        let address = [127, 0, 0, 2];
+        info[4..8].copy_from_slice(&address);
+        info[20..24].copy_from_slice(&address);
+        info[8] = 1; // Unused part of the IPv4 address union.
+        info[36..38].copy_from_slice(&8080u16.to_be_bytes());
+        info[38..40].copy_from_slice(&8081u16.to_be_bytes());
+        let ports = CtNatPortRange::new(8080, 8081).unwrap();
+        assert!(matches!(
+            parse_xt_nat_target(2, b"DNAT", 2, &info[..44]),
+            Ok(NftNatAction::Dnat(request))
+                if request == CtNatRequest::new(Some(CtAddress::V4(address)), Some(ports)).unwrap()
+        ));
+        assert!(matches!(
+            parse_xt_nat_target(2, b"DNAT", 2, &info[..43]),
+            Err(SystemError::EINVAL)
+        ));
+        info[20] = 126;
+        assert!(matches!(
+            parse_xt_nat_target(2, b"DNAT", 2, &info),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        ));
+        info[4..8].fill(0);
+        info[20..24].fill(0);
+        info[..4].copy_from_slice(&2u32.to_ne_bytes());
+        assert!(matches!(
+            parse_xt_nat_target(2, b"DNAT", 2, &info),
+            Ok(NftNatAction::Dnat(request)) if request == CtNatRequest::new(None, Some(ports)).unwrap()
+        ));
+        info[38..40].copy_from_slice(&8079u16.to_be_bytes());
+        assert!(matches!(
+            parse_xt_nat_target(2, b"DNAT", 2, &info),
+            Err(SystemError::EINVAL)
+        ));
+    }
+
+    #[test]
     fn nat_action_is_not_reachable_from_filter_base_chain() {
         let mut table = table_with_chain(2, 1, 0, 1, NftVerdict::Accept, None);
         Arc::get_mut(&mut Arc::get_mut(&mut table).unwrap().chains[0])

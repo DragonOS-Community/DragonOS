@@ -592,26 +592,36 @@ std::vector<uint8_t> NativeIpv4SnatRule(uint32_t seq, const char* table,
 std::vector<uint8_t> XtIpv4DnatRule(uint32_t seq, const char* table,
                                     const char* chain, in_addr original,
                                     uint16_t original_port, in_addr target,
-                                    uint16_t target_port) {
+                                   uint16_t target_port, uint32_t revision) {
   std::vector<uint8_t> expressions;
   const uint16_t original_port_be = htons(original_port);
   AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 16,
                      reinterpret_cast<const uint8_t*>(&original.s_addr), 4);
   AppendPayloadEqual(&expressions, NFT_PAYLOAD_TRANSPORT_HEADER, 2,
                      reinterpret_cast<const uint8_t*>(&original_port_be), 2);
-  nf_nat_ipv4_multi_range_compat range{};
-  range.rangesize = 1;
-  range.range[0].flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
-  range.range[0].min_ip = range.range[0].max_ip = target.s_addr;
-  range.range[0].min.tcp.port = range.range[0].max.tcp.port = htons(target_port);
   std::vector<uint8_t> xt;
   AppendNla(&xt, NFTA_TARGET_NAME,
             reinterpret_cast<const uint8_t*>("DNAT"), sizeof("DNAT"));
-  const uint32_t revision = htonl(0);
+  const uint32_t revision_be = htonl(revision);
   AppendNla(&xt, NFTA_TARGET_REV,
-            reinterpret_cast<const uint8_t*>(&revision), sizeof(revision));
-  AppendNla(&xt, NFTA_TARGET_INFO,
-            reinterpret_cast<const uint8_t*>(&range), sizeof(range));
+            reinterpret_cast<const uint8_t*>(&revision_be), sizeof(revision_be));
+  const unsigned int nat_flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
+  if (revision == 2) {
+    nf_nat_range2 range{};
+    range.flags = nat_flags;
+    range.min_addr.ip = range.max_addr.ip = target.s_addr;
+    range.min_proto.tcp.port = range.max_proto.tcp.port = htons(target_port);
+    AppendNla(&xt, NFTA_TARGET_INFO,
+              reinterpret_cast<const uint8_t*>(&range), sizeof(range));
+  } else {
+    nf_nat_ipv4_multi_range_compat range{};
+    range.rangesize = 1;
+    range.range[0].flags = nat_flags;
+    range.range[0].min_ip = range.range[0].max_ip = target.s_addr;
+    range.range[0].min.tcp.port = range.range[0].max.tcp.port = htons(target_port);
+    AppendNla(&xt, NFTA_TARGET_INFO,
+              reinterpret_cast<const uint8_t*>(&range), sizeof(range));
+  }
   AppendExpr(&expressions, "target", xt);
   auto rule = RuleWithExpressions(seq, table, chain, expressions);
   std::vector<uint8_t> compat;
@@ -3703,7 +3713,7 @@ TEST(NetlinkNetfilter, NativeIpv4PostroutingSnatRewritesReplyDestination) {
   Ack(nft.get(), seq + 6, 0, kNftDeltable);
 }
 
-TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {
+void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   Fd client(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
@@ -3712,11 +3722,50 @@ TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {
   ASSERT_GE(client.get(), 0);
   ASSERT_GE(server.get(), 0);
 
+  constexpr uint32_t seq = 1470;
+  auto dnat_query = [](uint32_t sequence, uint32_t version) {
+    auto query = Request(kNftCompatGet, sequence);
+    query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    nlmsghdr header{};
+    std::memcpy(&header, query.data(), sizeof(header));
+    header.nlmsg_flags &= ~NLM_F_ACK;
+    std::memcpy(query.data(), &header, sizeof(header));
+    AppendAttr(&query, NFTA_COMPAT_NAME, "DNAT");
+    AppendBe32(&query, NFTA_COMPAT_REV, version);
+    AppendBe32(&query, NFTA_COMPAT_TYPE, 1);
+    return query;
+  };
+  const auto query = dnat_query(seq, revision);
+  ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+  pollfd pending{nft.get(), POLLIN, 0};
+  ASSERT_EQ(1, poll(&pending, 1, 2000));
+  std::array<uint8_t, 512> bytes{};
+  const ssize_t count = recv(nft.get(), bytes.data(), bytes.size(), 0);
+  constexpr size_t header_len = NLMSG_HDRLEN + sizeof(nfgenmsg);
+  ASSERT_GE(count, static_cast<ssize_t>(header_len));
+  nlmsghdr header{};
+  std::memcpy(&header, bytes.data(), sizeof(header));
+  ASSERT_EQ(kNftCompatGet, header.nlmsg_type);
+  ASSERT_GE(header.nlmsg_len, header_len);
+  ASSERT_LE(header.nlmsg_len, static_cast<uint32_t>(count));
+  EXPECT_EQ(seq, header.nlmsg_seq);
+  EXPECT_EQ(NFPROTO_IPV4, bytes[NLMSG_HDRLEN]);
+  const NlaSpan attrs{bytes.data() + header_len, header.nlmsg_len - header_len};
+  const auto wire_revision = FindNla(attrs, NFTA_COMPAT_REV);
+  ASSERT_EQ(sizeof(uint32_t), wire_revision.length);
+  EXPECT_EQ(revision, Be32(wire_revision));
+  const auto type = FindNla(attrs, NFTA_COMPAT_TYPE);
+  ASSERT_EQ(sizeof(uint32_t), type.length);
+  EXPECT_EQ(1u, Be32(type));
+  const auto unknown_revision = dnat_query(seq + 7, 3);
+  ASSERT_EQ(static_cast<ssize_t>(unknown_revision.size()), Send(nft.get(), unknown_revision));
+  Ack(nft.get(), seq + 7, EPROTONOSUPPORT, kNftCompatGet);
+
   sockaddr_in client_address{}, server_address{}, original_address{};
   client_address.sin_family = server_address.sin_family = original_address.sin_family = AF_INET;
   client_address.sin_addr.s_addr = server_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   original_address.sin_addr.s_addr = inet_addr("127.0.0.2");
-  original_address.sin_port = htons(static_cast<uint16_t>(45000 + getpid() % 10000));
+  original_address.sin_port = htons(static_cast<uint16_t>(45000 + (getpid() + revision) % 10000));
   ASSERT_EQ(0, bind(client.get(), reinterpret_cast<sockaddr*>(&client_address),
                     sizeof(client_address)));
   ASSERT_EQ(0, bind(server.get(), reinterpret_cast<sockaddr*>(&server_address),
@@ -3727,14 +3776,13 @@ TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {
 
   // xt DNAT is valid only in a table literally named "nat" on Linux.
   const std::string table = "nat";
-  constexpr uint32_t seq = 1470;
   auto batch = TableBatch(kNftNewtable, seq, table.c_str());
   batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
   auto chain = NewChain(seq + 2, table.c_str(), "output", true, NF_ACCEPT,
                         NF_INET_LOCAL_OUT, NFPROTO_IPV4, -100, "nat");
   auto rule = XtIpv4DnatRule(seq + 3, table.c_str(), "output",
                              original_address.sin_addr, ntohs(original_address.sin_port),
-                             server_address.sin_addr, ntohs(server_address.sin_port));
+                             server_address.sin_addr, ntohs(server_address.sin_port), revision);
   batch.insert(batch.end(), chain.begin(), chain.end());
   batch.insert(batch.end(), rule.begin(), rule.end());
   auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
@@ -3770,6 +3818,14 @@ TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {
   auto remove = TableBatch(kNftDeltable, seq + 5, table.c_str());
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
   Ack(nft.get(), seq + 6, 0, kNftDeltable);
+}
+
+TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {
+  CheckIpv4XtDnatRequestAndReply(0);
+}
+
+TEST(NetlinkNetfilter, XtIpv4DnatRevisionTwoRewritesRequestAndReply) {
+  CheckIpv4XtDnatRequestAndReply(2);
 }
 
 TEST(NetlinkNetfilter, NftIpv6AndInetPreroutingInputReadSameLocalUdp) {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::driver::net::Operstate;
 
 pub(crate) fn do_get_link(
     request_segment: &LinkSegment,
@@ -150,11 +151,18 @@ pub(super) fn link_message_parts(
         pad: None,
     };
 
+    // Delete messages are prepared before shutdown to preserve old identity.
+    let operstate = if msg_type == CSegmentType::DELLINK {
+        Operstate::IF_OPER_DOWN
+    } else {
+        iface.user_visible_operstate()
+    };
     let attrs = vec![
         LinkAttr::Address(iface.mac().as_bytes().to_vec()),
         LinkAttr::Name(CString::new(iface.name()).map_err(|_| SystemError::EINVAL)?),
         LinkAttr::Mtu(iface.mtu() as u32),
         LinkAttr::TxqLen(iface.common().tx_queue_len()),
+        LinkAttr::OperState(operstate as u8),
         LinkAttr::Promiscuity(flags.promiscuity),
         LinkAttr::Allmulti(flags.allmulti),
     ];

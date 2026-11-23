@@ -121,6 +121,9 @@ impl NftNamespaceState {
 
 type UpdatedSetElement = Option<(Arc<NftTable>, Arc<NftSet>)>;
 
+const NFT_SET_ANONYMOUS: u32 = 1;
+const NFT_SET_CONSTANT: u32 = 2;
+
 impl NftTransaction<'_> {
     fn table_for_write(&mut self, index: usize) -> Result<&mut NftTable, SystemError> {
         if Arc::get_mut(&mut self.candidate.tables[index]).is_none() {
@@ -358,6 +361,64 @@ impl NftTransaction<'_> {
         Ok((self.candidate.tables[index].clone(), set))
     }
 
+    fn set_element_update_target(
+        &self,
+        family: u8,
+        table_name: &[u8],
+        name: &[u8],
+        named_only: bool,
+    ) -> Result<(usize, usize), SystemError> {
+        let index = self
+            .candidate
+            .tables
+            .iter()
+            .position(|table| table.family == family && table.name == table_name)
+            .ok_or(SystemError::ENOENT)?;
+        let table = &self.candidate.tables[index];
+        let set_index = table
+            .sets
+            .iter()
+            .position(|set| set.name == name)
+            .ok_or(SystemError::ENOENT)?;
+        let set = &table.sets[set_index];
+        if named_only && set.flags & NFT_SET_ANONYMOUS != 0 {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if set.flags & NFT_SET_CONSTANT != 0
+            && table
+                .chains
+                .iter()
+                .flat_map(|chain| chain.rules.iter())
+                .any(|rule| {
+                    rule.expressions.iter().any(|expression| {
+                        matches!(expression, NftExpression::Lookup { set_handle, .. }
+                            if *set_handle == set.handle)
+                    })
+                })
+        {
+            return Err(SystemError::EBUSY);
+        }
+        Ok((index, set_index))
+    }
+
+    pub(crate) fn flush_set_elements(
+        &mut self,
+        family: u8,
+        table_name: &[u8],
+        name: &[u8],
+    ) -> Result<UpdatedSetElement, SystemError> {
+        let (index, set_index) = self.set_element_update_target(family, table_name, name, true)?;
+        let set = &self.candidate.tables[index].sets[set_index];
+        if set.elements.is_empty() {
+            return Ok(None);
+        }
+        let empty = set.clone_with_elements(Vec::new())?;
+        let table = self.table_for_write(index)?;
+        let removed = core::mem::replace(&mut table.sets[set_index], empty);
+        self.changed = true;
+        Ok(Some((self.candidate.tables[index].clone(), removed)))
+    }
+
     pub(crate) fn update_set_elements(
         &mut self,
         family: u8,
@@ -366,32 +427,8 @@ impl NftTransaction<'_> {
         elements: &[NftSetElementInput<'_>],
         add: bool,
     ) -> Result<(Arc<NftTable>, Arc<NftSet>), SystemError> {
-        let index = self
-            .candidate
-            .tables
-            .iter()
-            .position(|table| table.family == family && table.name == table_name)
-            .ok_or(SystemError::ENOENT)?;
-        let set_index = self.candidate.tables[index]
-            .sets
-            .iter()
-            .position(|set| set.name == name)
-            .ok_or(SystemError::ENOENT)?;
-        let target_handle = self.candidate.tables[index].sets[set_index].handle;
-        if self.candidate.tables[index].sets[set_index].flags & 2 != 0
-            && self.candidate.tables[index]
-                .chains
-                .iter()
-                .flat_map(|chain| chain.rules.iter())
-                .any(|rule| {
-                    rule.expressions.iter().any(|expression| {
-                        matches!(expression, NftExpression::Lookup { set_handle, .. }
-                            if *set_handle == target_handle)
-                    })
-                })
-        {
-            return Err(SystemError::EBUSY);
-        }
+        let (index, set_index) =
+            self.set_element_update_target(family, table_name, name, !add && elements.is_empty())?;
         if let [element] = elements {
             if let Some(result) =
                 self.try_update_single_exact_element(index, set_index, element, add)?

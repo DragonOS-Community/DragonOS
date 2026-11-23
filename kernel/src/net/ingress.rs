@@ -823,12 +823,17 @@ impl<'a> NetIngressFilter<'a> {
                     self.allows_ipv6_nat(
                         NftIpv4Hook::PostRouting,
                         packet.as_mut_slice(),
-                        0,
+                        ingress_ifindex,
                         route.oif,
                         Some(route.next_hop),
                     )
                 } else {
-                    self.allows_ipv6(NftIpv4Hook::PostRouting, packet.as_slice(), 0, route.oif)
+                    self.allows_ipv6(
+                        NftIpv4Hook::PostRouting,
+                        packet.as_slice(),
+                        ingress_ifindex,
+                        route.oif,
+                    )
                 };
                 if !post_allowed {
                     return RouteInputVerdict::Drop;
@@ -1259,12 +1264,17 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     self.allows_ipv4_nat(
                         NftIpv4Hook::PostRouting,
                         packet.as_mut_slice(),
-                        0,
+                        ingress_ifindex,
                         route.oif,
                         Some(route.next_hop),
                     )
                 } else {
-                    self.allows_ipv4(NftIpv4Hook::PostRouting, packet.as_slice(), 0, route.oif)
+                    self.allows_ipv4(
+                        NftIpv4Hook::PostRouting,
+                        packet.as_slice(),
+                        ingress_ifindex,
+                        route.oif,
+                    )
                 };
                 if !post_allowed {
                     return RouteInputVerdict::Drop;

@@ -175,11 +175,8 @@ std::vector<uint8_t> RuleWithExpressions(uint32_t seq, const char* table,
   return rule;
 }
 
-std::vector<uint8_t> MetaCounterRule(uint32_t seq, const char* table,
-                                     const char* chain, uint32_t key,
-                                     const uint8_t* expected, size_t length,
-                                     uint8_t family = NFPROTO_IPV4) {
-  std::vector<uint8_t> expressions;
+void AppendMetaEqual(std::vector<uint8_t>* expressions, uint32_t key,
+                     const uint8_t* expected, size_t length) {
   std::vector<uint8_t> meta;
   const uint32_t be_register = htonl(NFT_REG_1);
   const uint32_t be_key = htonl(key);
@@ -187,7 +184,7 @@ std::vector<uint8_t> MetaCounterRule(uint32_t seq, const char* table,
             reinterpret_cast<const uint8_t*>(&be_register), 4);
   AppendNla(&meta, NFTA_META_KEY,
             reinterpret_cast<const uint8_t*>(&be_key), 4);
-  AppendExpr(&expressions, "meta", meta);
+  AppendExpr(expressions, "meta", meta);
   std::vector<uint8_t> comparison;
   const uint32_t equal = htonl(NFT_CMP_EQ);
   AppendNla(&comparison, NFTA_CMP_SREG,
@@ -198,7 +195,15 @@ std::vector<uint8_t> MetaCounterRule(uint32_t seq, const char* table,
   AppendNla(&value, NFTA_DATA_VALUE, expected, length);
   AppendNla(&comparison, NFTA_CMP_DATA | NLA_F_NESTED,
             value.data(), value.size());
-  AppendExpr(&expressions, "cmp", comparison);
+  AppendExpr(expressions, "cmp", comparison);
+}
+
+std::vector<uint8_t> MetaCounterRule(uint32_t seq, const char* table,
+                                     const char* chain, uint32_t key,
+                                     const uint8_t* expected, size_t length,
+                                     uint8_t family = NFPROTO_IPV4) {
+  std::vector<uint8_t> expressions;
+  AppendMetaEqual(&expressions, key, expected, length);
   AppendExpr(&expressions, "counter", {});
   return RuleWithExpressions(seq, table, chain, expressions, family);
 }
@@ -6124,10 +6129,27 @@ TEST(NetlinkNetfilter, NftForwardDropGatesActualRoutedIngress) {
   const in_addr source{inet_addr("111.111.11.99")};
   const in_addr destination{inet_addr("198.18.250.99")};
   auto inject = [&](uint16_t id) {
-    return InjectVethIpProbe(injector.get(), injector_ifindex, "veth2",
-                             Ipv4UdpProbe(source.s_addr, destination.s_addr, id));
+    auto packet = Ipv4UdpProbe(source.s_addr, destination.s_addr, id);
+    // Use a fresh UDP flow for each probe so NAT evaluates its first packet.
+    const uint16_t source_port = htons(id);
+    std::memcpy(packet.data() + 20, &source_port, sizeof(source_port));
+    return InjectVethIpProbe(injector.get(), injector_ifindex, "veth2", packet);
   };
   constexpr uint32_t seq = 930;
+  auto install = [&](uint32_t batch_seq, const std::vector<uint8_t>& chain,
+                     const std::vector<uint8_t>& rule) {
+    auto batch = TableBatch(kNftNewtable, batch_seq, table_name.c_str());
+    batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+    const auto end = Request(NFNL_MSG_BATCH_END, batch_seq + 4);
+    for (const auto* message : {&chain, &rule, &end}) {
+      batch.insert(batch.end(), message->begin(), message->end());
+    }
+    ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
+    table_maybe_added = true;
+    Ack(nft.get(), batch_seq + 1, 0, kNftNewtable);
+    Ack(nft.get(), batch_seq + 2, 0, kNftNewchain);
+    Ack(nft.get(), batch_seq + 3, 0, kNftNewrule);
+  };
   // ASSERT_* returns only from this lambda; cleanup below always runs.
   auto exercise = [&] {
     ASSERT_TRUE(set_forwarding("0\n", 2));
@@ -6140,11 +6162,8 @@ TEST(NetlinkNetfilter, NftForwardDropGatesActualRoutedIngress) {
         << "IPv4 forwarding must start disabled";
     ASSERT_TRUE(set_forwarding("1\n", 2));
 
-    auto batch = TableBatch(kNftNewtable, seq, table_name.c_str());
-    batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
     auto chain = NewChain(seq + 2, table_name.c_str(), "forward", true, NF_ACCEPT,
                           NF_INET_FORWARD);
-    batch.insert(batch.end(), chain.begin(), chain.end());
     // Linux decrements the IPv4 TTL before the FORWARD hook. A rule for the
     // original TTL (64) must not match this forwarded datagram; the rule for
     // 63 must drop it before neighbor discovery.
@@ -6152,14 +6171,7 @@ TEST(NetlinkNetfilter, NftForwardDropGatesActualRoutedIngress) {
         seq + 3, table_name.c_str(), "forward", NFT_CMP_EQ,
         NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1, 8, UINT32_MAX, false, 1,
         true, nullptr, 63);
-    batch.insert(batch.end(), ttl_rule.begin(), ttl_rule.end());
-    auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
-    batch.insert(batch.end(), end.begin(), end.end());
-    ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
-    table_maybe_added = true;
-    Ack(nft.get(), seq + 1, 0, kNftNewtable);
-    Ack(nft.get(), seq + 2, 0, kNftNewchain);
-    Ack(nft.get(), seq + 3, 0, kNftNewrule);
+    ASSERT_NO_FATAL_FAILURE(install(seq, chain, ttl_rule));
     ASSERT_TRUE(inject(0x3503));
     EXPECT_FALSE(SawArpTarget(observer.get(), destination.s_addr, 150))
         << "FORWARD DROP must run before neighbor resolution";
@@ -6168,15 +6180,43 @@ TEST(NetlinkNetfilter, NftForwardDropGatesActualRoutedIngress) {
     ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
     Ack(nft.get(), seq + 6, 0, kNftDeltable);
     table_maybe_added = false;
+
+    auto postrouting = NewChain(seq + 9, table_name.c_str(), "postrouting", true,
+                                NF_ACCEPT, NF_INET_POST_ROUTING, NFPROTO_IPV4,
+                                100, "nat");
+    std::array<uint8_t, IFNAMSIZ> iifname{};
+    std::memcpy(iifname.data(), "veth2", sizeof("veth2"));
+    std::vector<uint8_t> expressions;
+    AppendMetaEqual(&expressions, NFT_META_IIFNAME, iifname.data(), iifname.size());
+    AppendExpr(&expressions, "counter", {});
+    AppendExpr(&expressions, "masq", {});
+    auto iif_rule = RuleWithExpressions(seq + 10, table_name.c_str(),
+                                        "postrouting", expressions);
+    ASSERT_NO_FATAL_FAILURE(install(seq + 7, postrouting, iif_rule));
     ASSERT_TRUE(inject(0x3504));
     EXPECT_TRUE(SawArpTarget(observer.get(), destination.s_addr, 2000))
         << "forwarding enabled without DROP must reach the egress neighbor";
+
+    auto query = Request(kNftGetrule, seq + 12);
+    query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    nlmsghdr header{};
+    std::memcpy(&header, query.data(), sizeof(header));
+    header.nlmsg_flags |= NLM_F_DUMP;
+    std::memcpy(query.data(), &header, sizeof(header));
+    AppendAttr(&query, NFTA_RULE_TABLE, table_name.c_str());
+    AppendAttr(&query, NFTA_RULE_CHAIN, "postrouting");
+    ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+    const auto rules = ReceiveRuleDump(nft.get(), seq + 12);
+    ASSERT_EQ(1u, rules.size());
+    ASSERT_TRUE(rules.front().has_counter);
+    EXPECT_EQ(1u, rules.front().packets)
+        << "IPv4 NAT POSTROUTING must match the routed packet's ingress device";
   };
   exercise();
   if (table_maybe_added) {
-    auto remove = TableBatch(kNftDeltable, seq + 7, table_name.c_str());
+    auto remove = TableBatch(kNftDeltable, seq + 13, table_name.c_str());
     if (Send(nft.get(), remove) == static_cast<ssize_t>(remove.size())) {
-      Ack(nft.get(), seq + 8, 0, kNftDeltable);
+      Ack(nft.get(), seq + 14, 0, kNftDeltable);
     }
   }
   if (route_added) {
@@ -6297,21 +6337,35 @@ TEST(NetlinkNetfilter, NftIpv6AndInetForwardSeeDecrementedHopAndRealDevices) {
     return InjectVethIpProbe(injector.get(), injector_ifindex, "veth2",
                              Ipv6NoNextProbe("fd10:35::2", kDestination), ETH_P_IPV6);
   };
-  auto install = [&](uint8_t family, const std::string& table, int32_t priority,
-                     bool drop) {
+  auto install = [&](uint8_t family, const std::string& table, uint32_t hook,
+                     int32_t priority, bool drop) {
+    const char* chain_name = hook == NF_INET_FORWARD ? "forward" : "postrouting";
     auto batch = TableBatch(kNftNewtable, seq, table.c_str(), family);
     batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
-    auto chain = NewChain(seq + 2, table.c_str(), "forward", true, NF_ACCEPT,
-                          NF_INET_FORWARD, family, priority);
+    auto chain = NewChain(seq + 2, table.c_str(), chain_name, true, NF_ACCEPT,
+                          hook, family, priority);
     batch.insert(batch.end(), chain.begin(), chain.end());
     std::array<uint8_t, IFNAMSIZ> iifname{}, oifname{};
     std::memcpy(iifname.data(), "veth2", 5);
     std::memcpy(oifname.data(), "veth1", 5);
-    auto iif = MetaCounterRule(seq + 3, table.c_str(), "forward", NFT_META_IIFNAME,
-                               iifname.data(), iifname.size(), family);
-    auto oif = MetaCounterRule(seq + 4, table.c_str(), "forward", NFT_META_OIFNAME,
-                               oifname.data(), oifname.size(), family);
-    auto hop = ProtocolCounterRule(seq + 5, table.c_str(), "forward", NFT_CMP_EQ,
+    // Neighbor discovery and other local traffic can also reach POSTROUTING.
+    // Count interface matches only for the injected No Next Header probe.
+    auto interface_rule = [&](uint32_t rule_seq, uint32_t key,
+                              const std::array<uint8_t, IFNAMSIZ>& name) {
+      std::vector<uint8_t> expressions;
+      if (hook == NF_INET_POST_ROUTING) {
+        constexpr uint8_t next_header = IPPROTO_NONE;
+        AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 6,
+                           &next_header, 1);
+      }
+      AppendMetaEqual(&expressions, key, name.data(), name.size());
+      AppendExpr(&expressions, "counter", {});
+      return RuleWithExpressions(rule_seq, table.c_str(), chain_name,
+                                 expressions, family);
+    };
+    auto iif = interface_rule(seq + 3, NFT_META_IIFNAME, iifname);
+    auto oif = interface_rule(seq + 4, NFT_META_OIFNAME, oifname);
+    auto hop = ProtocolCounterRule(seq + 5, table.c_str(), chain_name, NFT_CMP_EQ,
                                    NFT_PAYLOAD_NETWORK_HEADER, NFT_REG_1, 7,
                                    UINT32_MAX, false, 1, drop, nullptr, 63, family);
     for (const auto* message : {&iif, &oif, &hop})
@@ -6325,6 +6379,24 @@ TEST(NetlinkNetfilter, NftIpv6AndInetForwardSeeDecrementedHopAndRealDevices) {
     Ack(nft.get(), seq + 4, 0, kNftNewrule);
     Ack(nft.get(), seq + 5, 0, kNftNewrule);
     return !testing::Test::HasFailure();
+  };
+  auto expect_counters = [&](uint8_t family, const char* table, const char* chain) {
+    SCOPED_TRACE(chain);
+    auto query = Request(kNftGetrule, ++route_seq);
+    query[NLMSG_HDRLEN] = family;
+    nlmsghdr header{};
+    std::memcpy(&header, query.data(), sizeof(header));
+    header.nlmsg_flags |= NLM_F_DUMP;
+    std::memcpy(query.data(), &header, sizeof(header));
+    AppendAttr(&query, NFTA_RULE_TABLE, table);
+    AppendAttr(&query, NFTA_RULE_CHAIN, chain);
+    ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+    const auto rules = ReceiveRuleDump(nft.get(), header.nlmsg_seq);
+    ASSERT_EQ(3u, rules.size());
+    for (size_t i = 0; i < rules.size(); ++i) {
+      EXPECT_TRUE(rules[i].has_counter);
+      EXPECT_EQ(1u, rules[i].packets) << "rule index " << i;
+    }
   };
   auto exercise = [&] {
     ASSERT_TRUE(set_forwarding("0\n"));
@@ -6341,9 +6413,9 @@ TEST(NetlinkNetfilter, NftIpv6AndInetForwardSeeDecrementedHopAndRealDevices) {
     EXPECT_FALSE(SawNeighborSolicitTarget(observer.get(), kDestination, 150))
         << "IPv6 forwarding must start disabled";
     ASSERT_TRUE(set_forwarding("1\n"));
-    ASSERT_TRUE(install(NFPROTO_INET, inet_table, -10, false));
+    ASSERT_TRUE(install(NFPROTO_INET, inet_table, NF_INET_FORWARD, -10, false));
     inet_table_added = true;
-    ASSERT_TRUE(install(NFPROTO_IPV6, ip6_table, 0, true));
+    ASSERT_TRUE(install(NFPROTO_IPV6, ip6_table, NF_INET_FORWARD, 0, true));
     ip6_table_added = true;
     ASSERT_TRUE(inject());
     EXPECT_FALSE(SawNeighborSolicitTarget(observer.get(), kDestination, 150))
@@ -6351,21 +6423,7 @@ TEST(NetlinkNetfilter, NftIpv6AndInetForwardSeeDecrementedHopAndRealDevices) {
     for (const auto& [family, table] : {
              std::pair<uint8_t, const char*>{NFPROTO_INET, inet_table.c_str()},
              {NFPROTO_IPV6, ip6_table.c_str()}}) {
-      auto query = Request(kNftGetrule, ++route_seq);
-      query[NLMSG_HDRLEN] = family;
-      nlmsghdr header{};
-      std::memcpy(&header, query.data(), sizeof(header));
-      header.nlmsg_flags |= NLM_F_DUMP;
-      std::memcpy(query.data(), &header, sizeof(header));
-      AppendAttr(&query, NFTA_RULE_TABLE, table);
-      AppendAttr(&query, NFTA_RULE_CHAIN, "forward");
-      ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
-      const auto rules = ReceiveRuleDump(nft.get(), header.nlmsg_seq);
-      ASSERT_EQ(3u, rules.size());
-      for (const auto& rule : rules) {
-        EXPECT_TRUE(rule.has_counter);
-        EXPECT_EQ(1u, rule.packets);
-      }
+      ASSERT_NO_FATAL_FAILURE(expect_counters(family, table, "forward"));
     }
     for (const auto& [family, table] : {
              std::pair<uint8_t, const char*>{NFPROTO_IPV6, ip6_table.c_str()},
@@ -6377,9 +6435,13 @@ TEST(NetlinkNetfilter, NftIpv6AndInetForwardSeeDecrementedHopAndRealDevices) {
       else inet_table_added = false;
       route_seq += 2;
     }
+    ASSERT_TRUE(install(NFPROTO_IPV6, ip6_table, NF_INET_POST_ROUTING, 0, false));
+    ip6_table_added = true;
     ASSERT_TRUE(inject());
     EXPECT_TRUE(SawNeighborSolicitTarget(observer.get(), kDestination, 5000))
         << "without a DROP rule, routed IPv6 must reach egress neighbor discovery";
+    ASSERT_NO_FATAL_FAILURE(
+        expect_counters(NFPROTO_IPV6, ip6_table.c_str(), "postrouting"));
   };
   exercise();
   for (const auto& [family, table, added] : {

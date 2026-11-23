@@ -24,10 +24,25 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 
-use super::{parse_numeric_sysctl, SysctlNamespace};
+use super::{super::numeric::parse_numeric_sysctl, namespace::SysctlNamespace};
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DeviceConfFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl DeviceConfFamily {
+    fn entries(self) -> &'static [&'static str] {
+        match self {
+            Self::Ipv4 => &["route_localnet"],
+            Self::Ipv6 => &["disable_ipv6", "forwarding"],
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
-pub(super) struct DeviceIdentity {
+struct DeviceIdentity {
     namespace: SysctlNamespace,
     iface: Weak<dyn Iface>,
     namespace_epoch: u64,
@@ -35,7 +50,7 @@ pub(super) struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    pub(super) fn new(namespace: SysctlNamespace, iface: &Arc<dyn Iface>) -> Self {
+    fn new(namespace: SysctlNamespace, iface: &Arc<dyn Iface>) -> Self {
         Self {
             namespace,
             iface: Arc::downgrade(iface),
@@ -61,29 +76,96 @@ impl DeviceIdentity {
 }
 
 #[derive(Debug)]
-pub(super) struct DeviceDirOps(DeviceIdentity);
+pub(super) struct DeviceDirOps {
+    identity: DeviceIdentity,
+    family: DeviceConfFamily,
+}
 
 impl DeviceDirOps {
-    pub(super) fn new_inode(
-        parent: Weak<dyn IndexNode>,
-        identity: DeviceIdentity,
-    ) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self(identity), InodeMode::from_bits_truncate(0o555))
-            .parent(parent)
-            .build()
-            .unwrap()
+    pub(super) fn lookup<T: DirOps + 'static>(
+        dir: &ProcDir<T>,
+        namespace: &SysctlNamespace,
+        family: DeviceConfFamily,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        let netns = namespace.upgrade()?;
+        for iface in netns.device_list().values() {
+            let child = iface.common().with_iface_name(|current_name| {
+                (current_name == name).then(|| Self::cache(dir, namespace, family, name, iface))
+            });
+            if let Some(child) = child {
+                return Ok(child);
+            }
+        }
+        Err(SystemError::ENOENT)
     }
 
-    pub(super) fn has_identity(&self, identity: &DeviceIdentity) -> bool {
-        Weak::ptr_eq(&self.0.iface, &identity.iface)
-            && self.0.namespace_epoch == identity.namespace_epoch
-            && self.0.name_generation == identity.name_generation
+    pub(super) fn populate<T: DirOps + 'static>(
+        dir: &ProcDir<T>,
+        namespace: &SysctlNamespace,
+        family: DeviceConfFamily,
+    ) {
+        let Ok(netns) = namespace.upgrade() else {
+            return;
+        };
+        for iface in netns.device_list().values() {
+            iface.common().with_iface_name(|name| {
+                if !matches!(name, "all" | "default") {
+                    Self::cache(dir, namespace, family, name, iface);
+                }
+            });
+        }
+        dir.cached_children()
+            .write()
+            .retain(|_, child| Self::valid_child(child.as_ref()));
+    }
+
+    pub(super) fn valid_child(child: &dyn IndexNode) -> bool {
+        child
+            .as_any_ref()
+            .downcast_ref::<ProcDir<Self>>()
+            .is_none_or(|inode| inode.ops().validate_inode().is_ok())
+    }
+
+    fn cache<T: DirOps + 'static>(
+        dir: &ProcDir<T>,
+        namespace: &SysctlNamespace,
+        family: DeviceConfFamily,
+        name: &str,
+        iface: &Arc<dyn Iface>,
+    ) -> Arc<dyn IndexNode> {
+        let mut children = dir.cached_children().write();
+        let identity = DeviceIdentity::new(namespace.clone(), iface);
+        if let Some(child) = children.get(name) {
+            if child
+                .as_any_ref()
+                .downcast_ref::<ProcDir<Self>>()
+                .is_some_and(|inode| inode.ops().has_identity(&identity))
+            {
+                return child.clone();
+            }
+        }
+        let inode = ProcDirBuilder::new(
+            Self { identity, family },
+            InodeMode::from_bits_truncate(0o555),
+        )
+        .parent(dir.self_ref_weak().clone())
+        .build()
+        .unwrap();
+        children.insert(name.to_string(), inode.clone());
+        inode
+    }
+
+    fn has_identity(&self, identity: &DeviceIdentity) -> bool {
+        Weak::ptr_eq(&self.identity.iface, &identity.iface)
+            && self.identity.namespace_epoch == identity.namespace_epoch
+            && self.identity.name_generation == identity.name_generation
     }
 }
 
 impl DirOps for DeviceDirOps {
     fn validate_inode(&self) -> Result<(), SystemError> {
-        self.0.resolve().map(|_| ())
+        self.identity.resolve().map(|_| ())
     }
 
     fn before_read_dir(&self) -> Result<(), SystemError> {
@@ -91,7 +173,7 @@ impl DirOps for DeviceDirOps {
     }
 
     fn owner(&self) -> Option<(usize, usize)> {
-        self.0.namespace.owner()
+        self.identity.namespace.owner()
     }
 
     fn lookup_child(
@@ -100,9 +182,10 @@ impl DirOps for DeviceDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.validate_inode()?;
-        let field = match name {
-            "disable_ipv6" => DeviceField::Disable,
-            "forwarding" => DeviceField::Forwarding,
+        let field = match (self.family, name) {
+            (DeviceConfFamily::Ipv4, "route_localnet") => DeviceField::RouteLocalnet,
+            (DeviceConfFamily::Ipv6, "disable_ipv6") => DeviceField::DisableIpv6,
+            (DeviceConfFamily::Ipv6, "forwarding") => DeviceField::Ipv6Forwarding,
             _ => return Err(SystemError::ENOENT),
         };
         Ok(dir
@@ -112,7 +195,7 @@ impl DirOps for DeviceDirOps {
             .or_insert_with(|| {
                 ProcFileBuilder::new(
                     DeviceFileOps {
-                        identity: self.0.clone(),
+                        identity: self.identity.clone(),
                         field,
                     },
                     InodeMode::from_bits_truncate(0o644),
@@ -126,7 +209,7 @@ impl DirOps for DeviceDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        for name in ["disable_ipv6", "forwarding"] {
+        for name in self.family.entries() {
             let _ = self.lookup_child(dir, name);
         }
     }
@@ -134,8 +217,9 @@ impl DirOps for DeviceDirOps {
 
 #[derive(Debug)]
 enum DeviceField {
-    Disable,
-    Forwarding,
+    RouteLocalnet,
+    DisableIpv6,
+    Ipv6Forwarding,
 }
 
 #[derive(Debug)]
@@ -186,8 +270,9 @@ impl FileOps for DeviceFileOps {
             let (value, consumed) = parse_numeric_sysctl(buf)?;
             let value = i32::try_from(value).map_err(|_| SystemError::EINVAL)?;
             match ops.field {
-                DeviceField::Disable => set_device_ipv6_disabled(&rtnl, &netns, &iface, value)?,
-                DeviceField::Forwarding => iface.common().set_ipv6_forwarding(&rtnl, value),
+                DeviceField::RouteLocalnet => iface.common().set_route_localnet(&rtnl, value),
+                DeviceField::DisableIpv6 => set_device_ipv6_disabled(&rtnl, &netns, &iface, value)?,
+                DeviceField::Ipv6Forwarding => iface.common().set_ipv6_forwarding(&rtnl, value),
             }
             Ok(PrimaryWriteResult::new(consumed))
         })
@@ -206,8 +291,9 @@ impl FileOps for DeviceFileOps {
             return Ok(0);
         }
         let value = match self.field {
-            DeviceField::Disable => iface.common().ipv6_disabled_value(),
-            DeviceField::Forwarding => iface.common().ipv6_forwarding(),
+            DeviceField::RouteLocalnet => iface.common().route_localnet_value(),
+            DeviceField::DisableIpv6 => iface.common().ipv6_disabled_value(),
+            DeviceField::Ipv6Forwarding => iface.common().ipv6_forwarding(),
         };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }

@@ -1,7 +1,5 @@
 //! Namespace and per-interface IPv6 sysctls.
 
-mod device;
-
 use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::filesystem::procfs::Builder;
 use crate::filesystem::{
@@ -21,8 +19,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::super::numeric::parse_numeric_sysctl;
+use super::device_conf::{DeviceConfFamily, DeviceDirOps};
 use super::namespace::SysctlNamespace;
-use device::DeviceDirOps;
 
 #[derive(Debug)]
 pub(super) struct Ipv6DirOps(SysctlNamespace);
@@ -127,10 +125,7 @@ impl DirOps for ConfDirOps {
     }
 
     fn validate_child(&self, child: &dyn IndexNode) -> bool {
-        child
-            .as_any_ref()
-            .downcast_ref::<ProcDir<DeviceDirOps>>()
-            .is_none_or(|inode| inode.ops().validate_inode().is_ok())
+        DeviceDirOps::valid_child(child)
     }
 
     fn lookup_child(
@@ -138,7 +133,7 @@ impl DirOps for ConfDirOps {
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        let netns = self.0.upgrade()?;
+        self.0.upgrade()?;
         if let Some(target) = NamespaceForwarding::from_dir_name(name) {
             return Ok(dir
                 .cached_children()
@@ -153,59 +148,14 @@ impl DirOps for ConfDirOps {
                 })
                 .clone());
         }
-        let devices = netns.device_list();
-        for iface in devices.values() {
-            let child = iface.common().with_iface_name(|current_name| {
-                (current_name == name).then(|| self.cache_device(dir, name, iface))
-            });
-            if let Some(child) = child {
-                return Ok(child);
-            }
-        }
-        Err(SystemError::ENOENT)
+        DeviceDirOps::lookup(dir, &self.0, DeviceConfFamily::Ipv6, name)
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let Ok(netns) = self.0.upgrade() else {
-            return;
-        };
         for name in ["all", "default"] {
             let _ = self.lookup_child(dir, name);
         }
-        for iface in netns.device_list().values() {
-            iface.common().with_iface_name(|name| {
-                if NamespaceForwarding::from_dir_name(name).is_none() {
-                    self.cache_device(dir, name, iface);
-                }
-            });
-        }
-        dir.cached_children()
-            .write()
-            .retain(|_, child| self.validate_child(child.as_ref()));
-    }
-}
-
-impl ConfDirOps {
-    fn cache_device(
-        &self,
-        dir: &ProcDir<Self>,
-        name: &str,
-        iface: &Arc<dyn crate::driver::net::Iface>,
-    ) -> Arc<dyn IndexNode> {
-        let mut children = dir.cached_children().write();
-        let identity = device::DeviceIdentity::new(self.0.clone(), iface);
-        if let Some(child) = children.get(name) {
-            if child
-                .as_any_ref()
-                .downcast_ref::<ProcDir<DeviceDirOps>>()
-                .is_some_and(|inode| inode.ops().has_identity(&identity))
-            {
-                return child.clone();
-            }
-        }
-        let inode = DeviceDirOps::new_inode(dir.self_ref_weak().clone(), identity);
-        children.insert(name.to_string(), inode.clone());
-        inode
+        DeviceDirOps::populate(dir, &self.0, DeviceConfFamily::Ipv6);
     }
 }
 

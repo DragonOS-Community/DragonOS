@@ -350,19 +350,20 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6ForwardingDefaultAndAllHaveDistinctEffect
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
-TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove) {
+static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& family,
+                                                          const std::string& setting) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
-        const auto run = [] {
+        const auto run = [&] {
             ASSERT_EQ(unshare(CLONE_NEWNET), 0);
             RouteFd source;
             ASSERT_GE(source.fd, 0);
 
-            const std::string name = "v6sysctl";
-            const std::string renamed = "v6renamed";
-            const std::string prefix = "/proc/sys/net/ipv6/conf/";
-            const std::string path = prefix + name + "/disable_ipv6";
+            const std::string name = "netsysctl";
+            const std::string renamed = "netrenamed";
+            const std::string prefix = "/proc/sys/net/" + family + "/conf/";
+            const std::string path = prefix + name + "/" + setting;
             const auto read_value = [](const std::string& path) {
                 const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
                 if (fd < 0) return std::string{};
@@ -392,7 +393,7 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove)
                 return SendAck(source.fd, request);
             };
             ASSERT_EQ(rename(renamed, 4901), 0);
-            EXPECT_EQ(read_value(prefix + renamed + "/disable_ipv6"), "2\n");
+            EXPECT_EQ(read_value(prefix + renamed + "/" + setting), "2\n");
             EXPECT_EQ(access(path.c_str(), F_OK), -1);
             EXPECT_EQ(errno, ENOENT);
             ASSERT_EQ(rename(name, 4902), 0);
@@ -425,6 +426,14 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove)
     ASSERT_EQ(waitpid(child, &status, 0), child);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove) {
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "disable_ipv6");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, Ipv4RouteLocalnetTracksRenameAndNamespaceMove) {
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv4", "route_localnet");
 }
 
 TEST(RtnetlinkBridgeVethSemantics, CreateAndUpBridgeWithNonemptyFibInSingleRequest) {

@@ -498,6 +498,28 @@ pub(super) fn parse_xt_nat_target(
         };
         return Ok(NftNatAction::Masquerade { ports });
     }
+    if family == 10 && name == b"MASQUERADE" && revision == 0 {
+        // IPv6 uses struct nf_nat_range, without the IPv4 range count or
+        // the base protocol field of nf_nat_range2.
+        let Ok(range) = <&[u8; 40]>::try_from(info) else {
+            return Err(SystemError::EINVAL);
+        };
+        let flags = u32::from_ne_bytes(range[..4].try_into().unwrap());
+        if flags & 1 != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        if flags & !2 != 0 {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let ports = if flags & 2 != 0 {
+            let first = u16::from_be_bytes(range[36..38].try_into().unwrap());
+            let last = u16::from_be_bytes(range[38..40].try_into().unwrap());
+            Some(CtNatPortRange::new(first, last).map_err(|_| SystemError::EINVAL)?)
+        } else {
+            None
+        };
+        return Ok(NftNatAction::Masquerade { ports });
+    }
     if matches!(family, 2 | 10) && name == b"DNAT" && revision == 2 {
         if !(44..=48).contains(&info.len()) || info[44..].iter().any(|byte| *byte != 0) {
             return Err(SystemError::EINVAL);

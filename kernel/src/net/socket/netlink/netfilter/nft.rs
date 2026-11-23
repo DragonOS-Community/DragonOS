@@ -1583,7 +1583,7 @@ pub(super) fn compat_match_reply(
         return Err(SystemError::EINVAL);
     }
     let wire_name: &[u8] = match name {
-        b"MASQUERADE" if kind == 1 && revision == 0 && family == 2 => b"MASQUERADE\0",
+        b"MASQUERADE" if kind == 1 && revision == 0 => b"MASQUERADE\0",
         b"DNAT" if kind == 1 && revision == 0 && family == 2 => b"DNAT\0",
         b"SNAT" if kind == 1 && revision == 0 && family == 2 => b"SNAT\0",
         b"DNAT" if kind == 1 && revision == 2 => b"DNAT\0",

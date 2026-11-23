@@ -1463,6 +1463,15 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 return Err(IpOutputError::NoRoute);
             }
         }
+        if ipv4 {
+            let source = Ipv4Packet::new_checked(&bytes[..])
+                .map_err(|_| IpOutputError::PolicyDrop)?
+                .src_addr();
+            self.backend_policy
+                .routes
+                .validate_ipv4_output_source(route, source)
+                .map_err(|_| IpOutputError::NoRoute)?;
+        }
         let disposition = if route.kind == crate::net::route::RTN_LOCAL {
             LocalOutputDisposition::Local {
                 oif: route.oif,

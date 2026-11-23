@@ -115,13 +115,10 @@ pub(crate) fn resolve_ipv4_route(
         }
     };
 
-    // route_localnet=0 applies to the *selected* output device even when the
-    // caller did not bind an OIF. Checking only required_oif lets a 127/8
-    // source escape through an ordinary physical default route.
-    if matches!(source, IpAddress::Ipv4(addr) if addr.is_loopback())
-        && !iface.flags().contains(InterfaceFlags::LOOPBACK)
+    if decision.matched.kind != RTN_LOCAL
+        && matches!(source, IpAddress::Ipv4(addr) if addr.is_loopback())
     {
-        return Err(SystemError::EINVAL);
+        super::validate_ipv4_loopback_egress(iface.as_ref())?;
     }
 
     Ok(ResolvedIpv4Route {

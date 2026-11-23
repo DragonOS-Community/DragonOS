@@ -17,6 +17,7 @@ use system_error::SystemError;
 
 use super::super::numeric::parse_numeric_sysctl;
 mod ports;
+use super::device_conf::{DeviceConfFamily, DeviceDirOps};
 use super::namespace::SysctlNamespace;
 use ports::{PortFileOps, PortSysctl};
 
@@ -59,7 +60,7 @@ impl DirOps for Ipv4DirOps {
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if PortSysctl::from_name(name).is_some() || name == "ip_forward" {
+        if PortSysctl::from_name(name).is_some() || matches!(name, "ip_forward" | "conf") {
             // A retained directory addresses its original table, never the
             // calling task's new namespace. Check liveness before cached leaves.
             let _target = self.namespace.upgrade()?;
@@ -70,6 +71,14 @@ impl DirOps for Ipv4DirOps {
 
             let inode = if name == "ip_forward" {
                 IpForwardFileOps::new_inode(dir.self_ref_weak().clone(), self.namespace.clone())
+            } else if name == "conf" {
+                ProcDirBuilder::new(
+                    ConfDirOps(self.namespace.clone()),
+                    InodeMode::from_bits_truncate(0o555),
+                )
+                .parent(dir.self_ref_weak().clone())
+                .build()
+                .unwrap()
             } else {
                 PortFileOps::new_inode(
                     PortSysctl::from_name(name).unwrap(),
@@ -89,9 +98,42 @@ impl DirOps for Ipv4DirOps {
             "ip_local_port_range",
             "ip_unprivileged_port_start",
             "ip_forward",
+            "conf",
         ] {
             let _ = self.lookup_child(dir, name);
         }
+    }
+}
+
+#[derive(Debug)]
+struct ConfDirOps(SysctlNamespace);
+
+impl DirOps for ConfDirOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.0.upgrade().map(|_| ())
+    }
+
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.validate_inode()
+    }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        DeviceDirOps::valid_child(child)
+    }
+
+    fn lookup_child(
+        &self,
+        dir: &ProcDir<Self>,
+        name: &str,
+    ) -> Result<Arc<dyn IndexNode>, SystemError> {
+        if matches!(name, "all" | "default") {
+            return Err(SystemError::ENOENT);
+        }
+        DeviceDirOps::lookup(dir, &self.0, DeviceConfFamily::Ipv4, name)
+    }
+
+    fn populate_children(&self, dir: &ProcDir<Self>) {
+        DeviceDirOps::populate(dir, &self.0, DeviceConfFamily::Ipv4);
     }
 }
 

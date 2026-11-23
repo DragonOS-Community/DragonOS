@@ -29,6 +29,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -223,22 +224,6 @@ void AppendIpv4SourcePayload(std::vector<uint8_t>* expressions) {
   AppendNla(&payload, NFTA_PAYLOAD_LEN,
             reinterpret_cast<const uint8_t*>(&length), 4);
   AppendExpr(expressions, "payload", payload);
-}
-
-std::vector<uint8_t> Ipv4SourceSetCounterRule(uint32_t seq, const char* table,
-                                              const char* chain, const char* set) {
-  std::vector<uint8_t> expressions;
-  AppendIpv4SourcePayload(&expressions);
-
-  std::vector<uint8_t> lookup;
-  const uint32_t register_id = htonl(NFT_REG_1);
-  AppendNla(&lookup, NFTA_LOOKUP_SET,
-            reinterpret_cast<const uint8_t*>(set), std::strlen(set) + 1);
-  AppendNla(&lookup, NFTA_LOOKUP_SREG,
-            reinterpret_cast<const uint8_t*>(&register_id), 4);
-  AppendExpr(&expressions, "lookup", lookup);
-  AppendExpr(&expressions, "counter", {});
-  return RuleWithExpressions(seq, table, chain, expressions);
 }
 
 std::vector<uint8_t> Ipv4SourceMapCounterRule(uint32_t seq, const char* table,
@@ -451,6 +436,27 @@ void AppendPayloadEqual(std::vector<uint8_t>* expressions, uint32_t base,
   AppendNla(&comparison, NFTA_CMP_DATA | NLA_F_NESTED,
             value.data(), value.size());
   AppendExpr(expressions, "cmp", comparison);
+}
+
+std::vector<uint8_t> Ipv4SourceSetCounterRule(uint32_t seq, const char* table,
+                                              const char* chain, const char* set,
+                                              uint16_t dest_port_be) {
+  std::vector<uint8_t> expressions;
+  const uint8_t udp_protocol = IPPROTO_UDP;
+  AppendMetaEqual(&expressions, NFT_META_L4PROTO, &udp_protocol, sizeof(udp_protocol));
+  AppendPayloadEqual(&expressions, NFT_PAYLOAD_TRANSPORT_HEADER, 2,
+                     reinterpret_cast<const uint8_t*>(&dest_port_be), sizeof(dest_port_be));
+  AppendIpv4SourcePayload(&expressions);
+
+  std::vector<uint8_t> lookup;
+  const uint32_t register_id = htonl(NFT_REG_1);
+  AppendNla(&lookup, NFTA_LOOKUP_SET,
+            reinterpret_cast<const uint8_t*>(set), std::strlen(set) + 1);
+  AppendNla(&lookup, NFTA_LOOKUP_SREG,
+            reinterpret_cast<const uint8_t*>(&register_id), 4);
+  AppendExpr(&expressions, "lookup", lookup);
+  AppendExpr(&expressions, "counter", {});
+  return RuleWithExpressions(seq, table, chain, expressions);
 }
 
 void AppendImmediateBytes(std::vector<uint8_t>* expressions, uint32_t register_id,
@@ -2248,6 +2254,9 @@ TEST(NetlinkNetfilter, NftNamedIpv4SetLookupTracksElementUpdates) {
   constexpr uint32_t seq = 19000;
   constexpr char table_name[] = "dkc035_named_set";
   constexpr char set_name[] = "sources";
+  ASSERT_EQ(0, Bind(nft.get()));
+  const uint32_t nft_port = Port(nft.get());
+  ASSERT_NE(0u, nft_port);
   in_addr additional_address{};
   ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.2", &additional_address));
   auto batch = TableBatch(kNftNewtable, seq, table_name);
@@ -2258,7 +2267,8 @@ TEST(NetlinkNetfilter, NftNamedIpv4SetLookupTracksElementUpdates) {
                                      &additional_address);
   auto chain = NewChain(seq + 4, table_name, "input", true, NF_ACCEPT,
                         NF_INET_LOCAL_IN);
-  auto rule = Ipv4SourceSetCounterRule(seq + 5, table_name, "input", set_name);
+  auto rule = Ipv4SourceSetCounterRule(seq + 5, table_name, "input", set_name,
+                                        address.sin_port);
   auto end = Request(NFNL_MSG_BATCH_END, seq + 6);
   batch.insert(batch.end(), set.begin(), set.end());
   batch.insert(batch.end(), element.begin(), element.end());
@@ -2322,10 +2332,11 @@ TEST(NetlinkNetfilter, NftNamedIpv4SetLookupTracksElementUpdates) {
     ready.revents = 0;
     ASSERT_EQ(1, poll(&ready, 1, 2000));
     ASSERT_EQ(1, recv(receiver.get(), &received, 1, 0));
-    header.nlmsg_seq = next_seq++;
-    std::memcpy(query.data(), &header, sizeof(header));
+    const uint32_t query_seq = next_seq++;
+    std::memcpy(query.data() + offsetof(nlmsghdr, nlmsg_seq), &query_seq,
+                sizeof(query_seq));
     ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
-    const auto rules = ReceiveRuleDump(nft.get(), header.nlmsg_seq);
+    const auto rules = ReceiveRuleDump(nft.get(), query_seq);
     ASSERT_EQ(1u, rules.size());
     ASSERT_TRUE(rules[0].has_counter);
     EXPECT_EQ(expected_packets, rules[0].packets);
@@ -2337,6 +2348,12 @@ TEST(NetlinkNetfilter, NftNamedIpv4SetLookupTracksElementUpdates) {
   AppendAttr(&id_only, NFTA_SET_ELEM_LIST_TABLE, table_name);
   AppendBe32(&id_only, NFTA_SET_ELEM_LIST_SET_ID, 1);
   update(id_only, kNftDelsetelem, false, EINVAL);
+  auto missing_table = Request(kNftDelsetelem, 0);
+  missing_table[NLMSG_HDRLEN] = NFPROTO_IPV4;
+  AppendAttr(&missing_table, NFTA_SET_ELEM_LIST_TABLE, "dkc035_missing_table");
+  update(missing_table, kNftDelsetelem, false, ENOENT);
+  AppendRawAttr(&missing_table, NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED, nullptr, 0);
+  update(missing_table, kNftDelsetelem, false, ENOENT);
   auto empty_list = flush;
   AppendRawAttr(&empty_list, NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED, nullptr, 0);
   update(empty_list, kNftDelsetelem);
@@ -2349,8 +2366,21 @@ TEST(NetlinkNetfilter, NftNamedIpv4SetLookupTracksElementUpdates) {
   ASSERT_EQ(0, setsockopt(listener.get(), SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
                            &group, sizeof(group)));
   update(flush, kNftDelsetelem, true);
-  pollfd notifications{listener.get(), POLLIN, 0};
-  EXPECT_EQ(0, poll(&notifications, 1, 0)) << "aborted flush must not notify";
+  alignas(nlmsghdr) std::array<uint8_t, 4096> notifications{};
+  for (;;) {
+    const ssize_t count =
+        recv(listener.get(), notifications.data(), notifications.size(), MSG_DONTWAIT);
+    if (count < 0) {
+      EXPECT_EQ(EAGAIN, errno);
+      break;
+    }
+    ASSERT_GT(count, 0);
+    int remaining = count;
+    for (auto* message = reinterpret_cast<nlmsghdr*>(notifications.data());
+         NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
+      EXPECT_NE(nft_port, message->nlmsg_pid) << "aborted flush must not notify";
+    }
+  }
   check_lookup(before[0].packets + 2);
 
   update(flush, kNftDelsetelem);

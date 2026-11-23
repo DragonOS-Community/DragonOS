@@ -770,10 +770,14 @@ impl NetfilterKernelSocket {
                         let sequence = u32::from_ne_bytes(request.bytes[8..12].try_into().unwrap());
                         let echo = request.flags() & NLM_F_ECHO != 0;
                         let elements = match elements {
-                            None => {
-                                let name = attrs.set.ok_or(SystemError::EINVAL)?;
-                                if let Some((table, old_set)) =
-                                    transaction.flush_set_elements(family, table_name, name)?
+                            None | Some([]) => {
+                                if let Some((table, old_set)) = transaction
+                                    .delete_unkeyed_set_elements(
+                                        family,
+                                        table_name,
+                                        attrs.set,
+                                        elements.is_none(),
+                                    )?
                                 {
                                     notifications
                                         .try_reserve(1)
@@ -786,17 +790,6 @@ impl NetfilterKernelSocket {
                                         echo,
                                     });
                                 }
-                                return Ok(());
-                            }
-                            Some([]) => {
-                                let name = attrs.set.ok_or(SystemError::EINVAL)?;
-                                transaction.update_set_elements(
-                                    family,
-                                    table_name,
-                                    name,
-                                    &[],
-                                    false,
-                                )?;
                                 return Ok(());
                             }
                             Some(elements) => elements,

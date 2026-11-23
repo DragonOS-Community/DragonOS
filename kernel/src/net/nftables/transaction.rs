@@ -365,7 +365,7 @@ impl NftTransaction<'_> {
         &self,
         family: u8,
         table_name: &[u8],
-        name: &[u8],
+        name: Option<&[u8]>,
         named_only: bool,
     ) -> Result<(usize, usize), SystemError> {
         let index = self
@@ -375,6 +375,7 @@ impl NftTransaction<'_> {
             .position(|table| table.family == family && table.name == table_name)
             .ok_or(SystemError::ENOENT)?;
         let table = &self.candidate.tables[index];
+        let name = name.ok_or(SystemError::EINVAL)?;
         let set_index = table
             .sets
             .iter()
@@ -401,15 +402,17 @@ impl NftTransaction<'_> {
         Ok((index, set_index))
     }
 
-    pub(crate) fn flush_set_elements(
+    pub(crate) fn delete_unkeyed_set_elements(
         &mut self,
         family: u8,
         table_name: &[u8],
-        name: &[u8],
+        name: Option<&[u8]>,
+        flush: bool,
     ) -> Result<UpdatedSetElement, SystemError> {
         let (index, set_index) = self.set_element_update_target(family, table_name, name, true)?;
         let set = &self.candidate.tables[index].sets[set_index];
-        if set.elements.is_empty() {
+        // A supplied empty list validates the target without deleting anything.
+        if !flush || set.elements.is_empty() {
             return Ok(None);
         }
         let empty = set.clone_with_elements(Vec::new())?;
@@ -428,7 +431,7 @@ impl NftTransaction<'_> {
         add: bool,
     ) -> Result<(Arc<NftTable>, Arc<NftSet>), SystemError> {
         let (index, set_index) =
-            self.set_element_update_target(family, table_name, name, !add && elements.is_empty())?;
+            self.set_element_update_target(family, table_name, Some(name), false)?;
         if let [element] = elements {
             if let Some(result) =
                 self.try_update_single_exact_element(index, set_index, element, add)?

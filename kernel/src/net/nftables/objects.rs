@@ -318,7 +318,7 @@ impl NftTable {
             rule.expressions.iter().any(|expression| {
                 matches!(
                     expression,
-                    NftExpression::XtAddrtype(_) | NftExpression::FibDaddrType { .. }
+                    NftExpression::XtAddrtype(_) | NftExpression::FibAddrType { .. }
                 )
             }) || self.rule_targets(rule).any(|target| {
                 self.chain_index(target).is_some_and(|index| {

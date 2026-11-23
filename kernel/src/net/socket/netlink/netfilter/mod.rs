@@ -558,7 +558,7 @@ impl NetfilterKernelSocket {
                         }
                         let expressions = attrs.expressions.ok_or(SystemError::EINVAL)?;
                         if expressions.iter().any(|expression| match expression {
-                            NftExpressionInput::XtTcp(_) => family != 2,
+                            NftExpressionInput::XtTcp(_) => !matches!(family, 2 | 10),
                             NftExpressionInput::XtUdp(_) => family != 2,
                             NftExpressionInput::XtAddrtype(_) => family == 1,
                             _ => false,

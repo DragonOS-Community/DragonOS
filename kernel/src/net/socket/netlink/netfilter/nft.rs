@@ -1589,11 +1589,10 @@ pub(super) fn compat_match_reply(
         b"DNAT" if kind == 1 && revision == 2 => b"DNAT\0",
         b"MASQUERADE" | b"DNAT" | b"SNAT" if kind == 1 => return Err(SystemError::EPROTONOSUPPORT),
         _ if kind == 1 => return Err(SystemError::ENOENT),
-        b"tcp" if revision == 0 && family == 2 => b"tcp\0",
+        b"tcp" if revision == 0 => b"tcp\0",
         b"udp" if revision == 0 && family == 2 => b"udp\0",
         b"addrtype" if revision == 1 => b"addrtype\0",
         b"conntrack" if (1..=3).contains(&revision) => b"conntrack\0",
-        b"tcp" if family == 10 => return Err(SystemError::ENOENT),
         b"udp" if family == 10 => return Err(SystemError::ENOENT),
         b"tcp" | b"udp" | b"addrtype" | b"conntrack" => {
             return Err(SystemError::EPROTONOSUPPORT);
@@ -2125,10 +2124,10 @@ pub(super) fn rule_message(
                 append_attr(&mut data, META_KEY, &NftMetaKey::Mark.uapi().to_be_bytes())?;
                 b"meta\0"
             }
-            NftExpression::FibDaddrType { dreg } => {
+            NftExpression::FibAddrType { dreg, field } => {
                 append_attr(&mut data, FIB_DREG, &uapi_register(*dreg).to_be_bytes())?;
                 append_attr(&mut data, FIB_RESULT, &3u32.to_be_bytes())?;
-                append_attr(&mut data, FIB_FLAGS, &2u32.to_be_bytes())?;
+                append_attr(&mut data, FIB_FLAGS, &field.fib_flags().to_be_bytes())?;
                 b"fib\0"
             }
             NftExpression::CtState { dreg } => {

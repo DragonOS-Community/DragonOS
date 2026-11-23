@@ -40,9 +40,10 @@ pub(crate) use objects::{
 };
 pub(crate) use packet::{NftDeviceNames, NftIpv6RouteLookup, NftNatPacket, NftPacket};
 pub(crate) use rule::{
-    NftBitwiseOperation, NftByteorderOp, NftCmpOp, NftCounter, NftExpression, NftExpressionInput,
-    NftMetaKey, NftNatAction, NftNatEvent, NftNatProgress, NftPayloadBase, NftRangeOp, NftRule,
-    NftRuleInput, NftRuleVerdict, NftVerdict, NftXtAddrtype, NftXtConntrack, NftXtTcp, NftXtUdp,
+    NftAddressField, NftBitwiseOperation, NftByteorderOp, NftCmpOp, NftCounter, NftExpression,
+    NftExpressionInput, NftMetaKey, NftNatAction, NftNatEvent, NftNatProgress, NftPayloadBase,
+    NftRangeOp, NftRule, NftRuleInput, NftRuleVerdict, NftVerdict, NftXtAddrtype, NftXtConntrack,
+    NftXtTcp, NftXtUdp,
 };
 pub(crate) use transaction::{NewRuleSpec, NewSetSpec, NftNamespaceState};
 

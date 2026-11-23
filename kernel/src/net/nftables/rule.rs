@@ -236,7 +236,7 @@ impl NftRule {
                         registers[*sreg..*sreg + 4].try_into().unwrap(),
                     ));
                 }
-                NftExpression::FibDaddrType { dreg } => {
+                NftExpression::FibAddrType { dreg, field } => {
                     let kind = if packet.first().is_some_and(|byte| byte >> 4 == 6) {
                         let Some(lookup) = context.ipv6_route_lookup else {
                             return RuleResult::Verdict(NftRuleVerdict::Drop);
@@ -244,7 +244,10 @@ impl NftRule {
                         let Ok(ipv6) = smoltcp::wire::Ipv6Packet::new_checked(packet) else {
                             return RuleResult::Break;
                         };
-                        (lookup.resolve)(ipv6.dst_addr(), lookup.device)
+                        (lookup.resolve)(
+                            field.select(ipv6.src_addr(), ipv6.dst_addr()),
+                            lookup.device,
+                        )
                     } else {
                         let Some(addr_type) = context.ipv4_addr_type else {
                             return RuleResult::Verdict(NftRuleVerdict::Drop);
@@ -252,7 +255,7 @@ impl NftRule {
                         let Ok(ipv4) = smoltcp::wire::Ipv4Packet::new_checked(packet) else {
                             return RuleResult::Break;
                         };
-                        addr_type(ipv4.dst_addr())
+                        addr_type(field.select(ipv4.src_addr(), ipv4.dst_addr()))
                     };
                     registers[*dreg..*dreg + 4].copy_from_slice(&u32::from(kind).to_ne_bytes());
                 }
@@ -644,7 +647,39 @@ fn ip_transport_offset(packet: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod ipv6_packet_info_tests {
-    use super::{ip_protocol, ip_transport_offset, ipv6_transport_info};
+    use super::{
+        ip_protocol, ip_transport_offset, ipv6_transport_info, NftRuleVerdict, NftXtTcp, RuleResult,
+    };
+
+    #[test]
+    fn ipv6_xt_tcp_honors_extension_headers_and_payload_length() {
+        let mut info = [0u8; 12];
+        info[2..4].copy_from_slice(&u16::MAX.to_ne_bytes());
+        info[4..6].copy_from_slice(&8080u16.to_ne_bytes());
+        info[6..8].copy_from_slice(&8080u16.to_ne_bytes());
+        let matcher = NftXtTcp::from_info(&info).unwrap();
+
+        let mut payload = [0u8; 28];
+        payload[0] = 6; // Extension header's next protocol.
+        payload[10..12].copy_from_slice(&8080u16.to_be_bytes());
+        payload[20] = 5 << 4;
+        assert!(matches!(
+            matcher.evaluate(&packet(60, &payload)),
+            RuleResult::Continue
+        ));
+        payload[3] = 8; // One fragment-offset unit, encoded in bytes.
+        assert!(matches!(
+            matcher.evaluate(&packet(44, &payload)),
+            RuleResult::Break
+        ));
+
+        let mut short = packet(60, &payload);
+        short[4..6].copy_from_slice(&27u16.to_be_bytes());
+        assert!(matches!(
+            matcher.evaluate(&short),
+            RuleResult::Verdict(NftRuleVerdict::Drop)
+        ));
+    }
 
     fn packet(next: u8, payload: &[u8]) -> alloc::vec::Vec<u8> {
         let mut bytes = alloc::vec![0; 40];
@@ -918,8 +953,9 @@ pub(crate) enum NftExpression {
     MetaSetMark {
         sreg: usize,
     },
-    FibDaddrType {
+    FibAddrType {
         dreg: usize,
+        field: NftAddressField,
     },
     Payload {
         base: NftPayloadBase,
@@ -996,54 +1032,107 @@ fn ip_protocol(packet: &[u8]) -> Option<u8> {
     }
 }
 
-/// iptables-nft's `addrtype --dst-type LOCAL` uses xt revision 1 on the
-/// wire, even though `nft list ruleset` prints a `fib` shorthand. Until the
-/// other addrtype masks and interface restrictions have routing-context tests,
-/// reject them instead of claiming a rule with different semantics works.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NftAddressField {
+    Source,
+    Destination,
+}
+
+impl NftAddressField {
+    pub(super) fn from_fib_flags(flags: u32) -> Option<Self> {
+        match flags {
+            1 => Some(Self::Source),
+            2 => Some(Self::Destination),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fib_flags(self) -> u32 {
+        match self {
+            Self::Source => 1,
+            Self::Destination => 2,
+        }
+    }
+
+    fn select<T>(self, source: T, destination: T) -> T {
+        match self {
+            Self::Source => source,
+            Self::Destination => destination,
+        }
+    }
+}
+
+/// The LOCAL subset of xt addrtype revision 1. Address masks, inversion,
+/// and interface restrictions outside this subset are rejected at install.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NftXtAddrtype {
-    destination_mask: u16,
+    source: bool,
+    destination: bool,
 }
 
 impl NftXtAddrtype {
+    const LOCAL_MASK: u16 = 1 << crate::net::route::RTN_LOCAL;
+
     pub(super) fn from_info(info: &[u8]) -> Result<Self, SystemError> {
         if info.len() != 8 {
             return Err(SystemError::EINVAL);
         }
-        let source_mask = u16::from_ne_bytes([info[0], info[1]]);
-        let destination_mask = u16::from_ne_bytes([info[2], info[3]]);
+        let source = u16::from_ne_bytes([info[0], info[1]]);
+        let destination = u16::from_ne_bytes([info[2], info[3]]);
         let flags = u32::from_ne_bytes(info[4..8].try_into().unwrap());
-        if source_mask != 0 || destination_mask != (1 << crate::net::route::RTN_LOCAL) || flags != 0
+        if flags != 0
+            || source & !Self::LOCAL_MASK != 0
+            || destination & !Self::LOCAL_MASK != 0
+            || (source == 0 && destination == 0)
         {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        Ok(Self { destination_mask })
+        Ok(Self {
+            source: source != 0,
+            destination: destination != 0,
+        })
     }
 
     pub(crate) fn info(&self) -> [u8; 8] {
         let mut bytes = [0u8; 8];
-        bytes[2..4].copy_from_slice(&self.destination_mask.to_ne_bytes());
+        if self.source {
+            bytes[..2].copy_from_slice(&Self::LOCAL_MASK.to_ne_bytes());
+        }
+        if self.destination {
+            bytes[2..4].copy_from_slice(&Self::LOCAL_MASK.to_ne_bytes());
+        }
         bytes
     }
 
-    /// `None` means the packet path omitted its protected routing view. That
-    /// is a hard drop, not a failed match that could bypass a firewall jump.
+    fn matches_local<T>(&self, source: T, destination: T, classify: impl Fn(T) -> u8) -> bool {
+        let local = crate::net::route::RTN_LOCAL;
+        (!self.source || classify(source) == local)
+            && (!self.destination || classify(destination) == local)
+    }
+
+    /// A missing protected route view is a hard drop.
     fn evaluate(&self, context: &NftPacket<'_>) -> Option<bool> {
         match context.bytes.first().map(|byte| byte >> 4) {
             Some(4) => {
                 let Ok(packet) = smoltcp::wire::Ipv4Packet::new_checked(context.bytes) else {
                     return Some(false);
                 };
-                let addr_type = context.ipv4_addr_type?;
-                let kind = addr_type(packet.dst_addr());
-                Some(self.destination_mask & (1u16 << kind.min(15)) != 0)
+                Some(self.matches_local(
+                    packet.src_addr(),
+                    packet.dst_addr(),
+                    context.ipv4_addr_type?,
+                ))
             }
             Some(6) => {
                 let Ok(packet) = smoltcp::wire::Ipv6Packet::new_checked(context.bytes) else {
                     return Some(false);
                 };
                 let lookup = context.ipv6_route_lookup?;
-                Some((lookup.resolve)(packet.dst_addr(), None) == crate::net::route::RTN_LOCAL)
+                Some(
+                    self.matches_local(packet.src_addr(), packet.dst_addr(), |addr| {
+                        (lookup.resolve)(addr, None)
+                    }),
+                )
             }
             _ => Some(false),
         }
@@ -1166,30 +1255,36 @@ impl NftXtTcp {
     }
 
     fn evaluate(&self, packet: &[u8]) -> RuleResult {
-        let Some(first) = packet.first() else {
-            return RuleResult::Break;
+        let transport = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                let header_len = usize::from(packet[0] & 0x0f) * 4;
+                if header_len < 20 || packet.len() < header_len {
+                    return RuleResult::Break;
+                }
+                let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+                if total_len < header_len || total_len > packet.len() {
+                    return RuleResult::Break;
+                }
+                let fragment = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff;
+                if fragment != 0 {
+                    return if fragment == 1 {
+                        RuleResult::Verdict(NftRuleVerdict::Drop)
+                    } else {
+                        RuleResult::Break
+                    };
+                }
+                &packet[header_len..total_len]
+            }
+            Some(6) => {
+                let Some((6, offset, false)) = ipv6_transport_info(packet) else {
+                    return RuleResult::Break;
+                };
+                let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+                &packet[offset..40 + payload_len]
+            }
+            _ => return RuleResult::Break,
         };
-        let header_len = usize::from(first & 0x0f) * 4;
-        if first >> 4 != 4 || header_len < 20 || packet.len() < header_len {
-            return RuleResult::Break;
-        }
-        let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-        if total_len < header_len || total_len > packet.len() {
-            return RuleResult::Break;
-        }
-        let packet = &packet[..total_len];
-        let Some(fragment_bytes) = packet.get(6..8) else {
-            return RuleResult::Break;
-        };
-        let fragment = u16::from_be_bytes(fragment_bytes.try_into().unwrap()) & 0x1fff;
-        if fragment != 0 {
-            return if fragment == 1 {
-                RuleResult::Verdict(NftRuleVerdict::Drop)
-            } else {
-                RuleResult::Break
-            };
-        }
-        let Some(tcp) = packet.get(header_len..header_len + 20) else {
+        let Some(tcp) = transport.get(..20) else {
             return RuleResult::Verdict(NftRuleVerdict::Drop);
         };
         for (offset, range, invert) in [
@@ -1209,7 +1304,7 @@ impl NftXtTcp {
             if tcp_header_len < 20 {
                 return RuleResult::Verdict(NftRuleVerdict::Drop);
             }
-            let Some(options) = packet.get(header_len + 20..header_len + tcp_header_len) else {
+            let Some(options) = transport.get(20..tcp_header_len) else {
                 return RuleResult::Verdict(NftRuleVerdict::Drop);
             };
             let mut cursor = 0;

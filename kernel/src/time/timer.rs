@@ -272,18 +272,19 @@ impl SoftirqVec for DoTimerSoftirq {
             return;
         }
         super::clocksource::run_due_watchdog();
-        // Round-robin all three domains. An empty ordinary queue must not
+        // Round-robin all four queues. An empty ordinary queue must not
         // suppress absolute timers, and one busy domain must not starve others.
         let mut completed = 0;
         let mut idle = 0;
         let mut domain = 0;
-        while completed < TIMER_RUN_CYCLE_THRESHOLD && idle < 3 {
+        while completed < TIMER_RUN_CYCLE_THRESHOLD && idle < 4 {
             let ran = match domain {
                 0 => run_one_jiffies_timer(),
                 1 => absolute_timer::run_one_due(AbsoluteClock::Monotonic),
-                _ => absolute_timer::run_one_due(AbsoluteClock::Realtime),
+                2 => absolute_timer::run_one_due(AbsoluteClock::Realtime),
+                _ => absolute_timer::run_one_due(AbsoluteClock::Boottime),
             };
-            domain = (domain + 1) % 3;
+            domain = (domain + 1) % 4;
             if ran {
                 completed += 1;
                 idle = 0;
@@ -415,11 +416,12 @@ pub fn timer_get_first_expire() -> Result<Option<u64>, SystemError> {
         first_expire_in(&TIMER_LIST),
         absolute_timer::first_expire(AbsoluteClock::Monotonic),
         absolute_timer::first_expire(AbsoluteClock::Realtime),
+        absolute_timer::first_expire(AbsoluteClock::Boottime),
     ])
 }
 
-fn earliest_expire(
-    candidates: [Result<Option<u64>, SystemError>; 3],
+fn earliest_expire<const N: usize>(
+    candidates: [Result<Option<u64>, SystemError>; N],
 ) -> Result<Option<u64>, SystemError> {
     let mut earliest: Option<u64> = None;
     let mut contended = false;

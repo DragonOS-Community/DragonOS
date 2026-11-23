@@ -22,15 +22,16 @@ use crate::{
     },
     libs::{
         mutex::{Mutex, MutexGuard},
-        spinlock::SpinLock,
+        spinlock::{SpinLock, SpinLockGuard},
         wait_queue::WaitQueue,
     },
     process::{posix_timer::PosixItimerspec, ProcessManager},
     syscall::user_buffer::UserBuffer,
     time::{
+        absolute_timer::{AbsoluteClock, AbsoluteTimer, PreparedAbsoluteTimer},
         syscall::PosixClockID,
-        timekeeping::{boottime_now, monotonic_now, realtime_now, realtime_now_with_clock_set_seq},
-        timer::{next_n_us_timer_jiffies, Timer, TimerFunction},
+        timekeeping::realtime_now_with_clock_set_seq,
+        timer::TimerFunction,
         PosixTimeSpec, NSEC_PER_SEC,
     },
 };
@@ -59,63 +60,27 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum DeadlineDomain {
-    Monotonic,
-    Realtime,
-    Boottime,
-}
-
-impl DeadlineDomain {
-    fn now_ns(self) -> u64 {
-        match self {
-            Self::Monotonic => monotonic_now(),
-            Self::Realtime => realtime_now(),
-            Self::Boottime => boottime_now(),
-        }
-        .to_ktime_ns()
-    }
-}
-
 #[derive(Debug)]
 struct TimerFdState {
     clock_id: PosixClockID,
     interval_ns: u64,
     next_expiry_ns: Option<u64>,
-    deadline_domain: DeadlineDomain,
-    timer: Option<Arc<Timer>>,
+    deadline_domain: AbsoluteClock,
+    timer: Option<Arc<AbsoluteTimer>>,
     ticks: u64,
     expired: bool,
     cancel_pending: bool,
     generation: u64,
-    settime_flags: TimerFdSettimeFlags,
     observed_clock_set_seq: Option<u64>,
-    registry_registered: bool,
     shutdown: bool,
 }
 
 impl TimerFdState {
-    fn configured_realtime_absolute(&self) -> bool {
-        matches!(
-            self.clock_id,
-            PosixClockID::Realtime | PosixClockID::RealtimeAlarm
-        ) && self
-            .settime_flags
-            .contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME)
-    }
-
-    fn cancel_on_set(&self) -> bool {
-        self.configured_realtime_absolute()
-            && self
-                .settime_flags
-                .contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET)
-    }
-
-    fn current_spec(&self) -> PosixItimerspec {
+    fn current_spec(&self, expired: bool) -> PosixItimerspec {
         let mut value = PosixTimeSpec::default();
         if let Some(mut deadline) = self.next_expiry_ns {
             let now = self.deadline_domain.now_ns();
-            if self.expired && self.interval_ns != 0 && now >= deadline {
+            if expired && self.interval_ns != 0 && now >= deadline {
                 let periods = (now - deadline) / self.interval_ns + 1;
                 deadline = deadline
                     .saturating_add(self.interval_ns.saturating_mul(periods))
@@ -153,9 +118,7 @@ impl TimerFdInode {
                 expired: false,
                 cancel_pending: false,
                 generation: 0,
-                settime_flags: TimerFdSettimeFlags::empty(),
                 observed_clock_set_seq: None,
-                registry_registered: false,
                 shutdown: false,
             }),
             operation: Mutex::new(()),
@@ -166,18 +129,18 @@ impl TimerFdInode {
         })
     }
 
-    fn absolute_domain(clock_id: PosixClockID) -> DeadlineDomain {
+    fn absolute_domain(clock_id: PosixClockID) -> AbsoluteClock {
         match clock_id {
-            PosixClockID::Realtime | PosixClockID::RealtimeAlarm => DeadlineDomain::Realtime,
-            PosixClockID::Boottime | PosixClockID::BoottimeAlarm => DeadlineDomain::Boottime,
-            _ => DeadlineDomain::Monotonic,
+            PosixClockID::Realtime | PosixClockID::RealtimeAlarm => AbsoluteClock::Realtime,
+            PosixClockID::Boottime | PosixClockID::BoottimeAlarm => AbsoluteClock::Boottime,
+            _ => AbsoluteClock::Monotonic,
         }
     }
 
-    fn relative_domain(clock_id: PosixClockID) -> DeadlineDomain {
+    fn relative_domain(clock_id: PosixClockID) -> AbsoluteClock {
         match clock_id {
-            PosixClockID::Boottime | PosixClockID::BoottimeAlarm => DeadlineDomain::Boottime,
-            _ => DeadlineDomain::Monotonic,
+            PosixClockID::Boottime | PosixClockID::BoottimeAlarm => AbsoluteClock::Boottime,
+            _ => AbsoluteClock::Monotonic,
         }
     }
 
@@ -216,26 +179,18 @@ impl TimerFdInode {
             .remove(&(self as *const Self as usize));
     }
 
-    fn new_backend(&self, deadline_ns: u64, domain: DeadlineDomain, generation: u64) -> Arc<Timer> {
-        let now = domain.now_ns();
-        let remaining_us = deadline_ns.saturating_sub(now).div_ceil(1000);
-        let expires = next_n_us_timer_jiffies(remaining_us);
-        Timer::new(
-            Box::new(TimerFdExpiry {
-                inode: self.self_weak.clone(),
-                generation,
-            }),
-            expires,
-        )
-    }
-
-    fn publish_backend(&self, backend: Arc<Timer>, generation: u64) -> bool {
-        let mut state = self.state.lock_irqsave();
-        if state.shutdown || state.generation != generation || state.next_expiry_ns.is_none() {
-            return false;
-        }
-        state.timer = Some(backend);
-        true
+    fn prepare_backend(
+        &self,
+        deadline_ns: u64,
+        domain: AbsoluteClock,
+        generation: u64,
+    ) -> Result<PreparedAbsoluteTimer, SystemError> {
+        let expiry = Box::try_new(TimerFdExpiry {
+            inode: self.self_weak.clone(),
+            generation,
+        })
+        .map_err(|_| SystemError::ENOMEM)?;
+        AbsoluteTimer::try_prepare(domain, PosixTimeSpec::from_ns(deadline_ns), expiry)
     }
 
     fn notify_readable(&self) {
@@ -260,129 +215,79 @@ impl TimerFdInode {
         }
     }
 
-    fn prepare_periodic_rearm(&self) -> Option<(u64, u64)> {
-        let needs_registration = {
-            let state = self.state.lock_irqsave();
-            state.expired
-                && state.interval_ns != 0
-                && state.configured_realtime_absolute()
-                && !state.registry_registered
+    /// The caller holds operation. An expired timer has no backend, so its
+    /// state is stable while the successor is prepared outside the spinlock.
+    fn prepare_periodic_rearm<'a>(
+        &'a self,
+        mut state: SpinLockGuard<'a, TimerFdState>,
+    ) -> Result<
+        (
+            SpinLockGuard<'a, TimerFdState>,
+            Option<PreparedAbsoluteTimer>,
+        ),
+        SystemError,
+    > {
+        let Some(deadline) = state.next_expiry_ns else {
+            return Ok((state, None));
         };
-        if !needs_registration {
-            return None;
-        }
-
-        // The caller holds operation. Register before observing realtime so a
-        // concurrent clock set is either included in this snapshot or finds
-        // this inode and waits for the rearm state to be published.
-        self.registry_add();
-        let (now, clock_set_seq) = realtime_now_with_clock_set_seq();
-        Some((now.to_ktime_ns(), clock_set_seq))
-    }
-
-    fn advance_periodic_locked(
-        state: &mut TimerFdState,
-        registration: Option<(u64, u64)>,
-    ) -> Option<(u64, DeadlineDomain, u64)> {
         if !state.expired || state.interval_ns == 0 {
-            return None;
+            return Ok((state, None));
         }
-        if let Some((_, clock_set_seq)) = registration {
-            debug_assert!(state.configured_realtime_absolute());
-            debug_assert!(!state.registry_registered);
-            state.registry_registered = true;
-            state.observed_clock_set_seq = Some(clock_set_seq);
-        }
-        let deadline = state.next_expiry_ns?;
-        let now = registration
-            .map(|(now, _)| now)
-            .unwrap_or_else(|| state.deadline_domain.now_ns());
-        let next = if now >= deadline {
-            let periods = (now - deadline) / state.interval_ns + 1;
-            state.ticks = state.ticks.wrapping_add(periods - 1);
-            deadline
-                .saturating_add(state.interval_ns.saturating_mul(periods))
-                .min(KTIME_MAX_NS)
-        } else {
-            // Match Linux hrtimer_forward_now(): after a realtime step back
-            // before the old expiry, it returns 0 and timerfd's unsigned
-            // `ticks += 0 - 1` retracts the lazy callback contribution before
-            // the original deadline is rearmed.
-            state.ticks = state.ticks.wrapping_sub(1);
-            deadline
-        };
+        let domain = state.deadline_domain;
+        let generation = state.generation;
+        let now = domain.now_ns();
+        let periods = now
+            .checked_sub(deadline)
+            .map_or(0, |elapsed| elapsed / state.interval_ns + 1);
+        let next = deadline
+            .saturating_add(state.interval_ns.saturating_mul(periods))
+            .min(KTIME_MAX_NS);
+        drop(state);
+        let backend = self.prepare_backend(next, domain, generation)?;
+        state = self.state.lock_irqsave();
+        // A realtime step back can give zero periods. Linux retracts the
+        // preceding callback's contribution before rearming the same deadline.
+        state.ticks = state.ticks.wrapping_add(periods.wrapping_sub(1));
         state.expired = false;
         state.next_expiry_ns = Some(next);
-        Some((next, state.deadline_domain, state.generation))
-    }
-
-    fn rearm_periodic(&self, rearm: Option<(u64, DeadlineDomain, u64)>) -> Result<(), SystemError> {
-        let Some((deadline, domain, generation)) = rearm else {
-            return Ok(());
-        };
-        let backend = self.new_backend(deadline, domain, generation);
-        if self.publish_backend(backend.clone(), generation) {
-            backend.activate();
-        }
-        Ok(())
+        state.timer = Some(backend.timer());
+        Ok((state, Some(backend)))
     }
 
     fn read_ticks(&self, nonblock: bool) -> Result<u64, SystemError> {
         loop {
-            if !self.has_ticks() {
-                if nonblock {
-                    let _operation = self.operation.lock();
-                    let mut state = self.state.lock_irqsave();
-                    if state.cancel_pending {
-                        Self::consume_cancel_locked(&mut state);
-                        return Err(SystemError::ECANCELED);
-                    }
-                    if state.ticks == 0 {
-                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-                    }
-                } else {
-                    if ProcessManager::current_pcb().has_pending_signal_fast() {
-                        return Err(SystemError::ERESTARTSYS);
-                    }
-                    wq_wait_event_interruptible!(self.wait_queue, self.has_ticks(), {})?;
+            if !nonblock && !self.has_ticks() {
+                if ProcessManager::current_pcb().has_pending_signal_fast() {
+                    return Err(SystemError::ERESTARTSYS);
                 }
+                wq_wait_event_interruptible!(self.wait_queue, self.has_ticks(), {})?;
             }
 
             let _operation = self.operation.lock();
-            let registration = self.prepare_periodic_rearm();
             let mut state = self.state.lock_irqsave();
             if state.cancel_pending {
                 Self::consume_cancel_locked(&mut state);
                 return Err(SystemError::ECANCELED);
             }
             if state.ticks == 0 {
+                if nonblock {
+                    return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                }
                 continue;
             }
-            let rearm = Self::advance_periodic_locked(&mut state, registration);
+
+            let (mut state, backend) = self.prepare_periodic_rearm(state)?;
             let ticks = state.ticks;
             state.ticks = 0;
             state.expired = false;
-            let unregister = state.interval_ns == 0
-                && state.registry_registered
-                && state.configured_realtime_absolute()
-                && !state.cancel_on_set();
             if state.interval_ns == 0 {
-                // A consumed one-shot is logically disarmed.  Keeping its old
-                // deadline would let a later wall-clock set fire it again.
                 state.next_expiry_ns = None;
-                if unregister {
-                    state.registry_registered = false;
-                }
             }
             drop(state);
-            if unregister {
-                self.registry_remove();
+            if let Some(backend) = backend {
+                backend.activate();
             }
-            self.rearm_periodic(rearm)?;
             if ticks == 0 && nonblock {
-                // Linux leaves the preinitialized nonblocking result at
-                // -EAGAIN when hrtimer_forward_now()==0 retracts the sole
-                // lazy expiration after a realtime step backwards.
                 return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
             }
             return Ok(ticks);
@@ -391,12 +296,12 @@ impl TimerFdInode {
 
     pub fn gettime(&self) -> Result<PosixItimerspec, SystemError> {
         let _operation = self.operation.lock();
-        let registration = self.prepare_periodic_rearm();
-        let mut state = self.state.lock_irqsave();
-        let rearm = Self::advance_periodic_locked(&mut state, registration);
-        let value = state.current_spec();
+        let (state, backend) = self.prepare_periodic_rearm(self.state.lock_irqsave())?;
+        let value = state.current_spec(state.expired);
         drop(state);
-        self.rearm_periodic(rearm)?;
+        if let Some(backend) = backend {
+            backend.activate();
+        }
         Ok(value)
     }
 
@@ -409,25 +314,30 @@ impl TimerFdInode {
         let initial_ns = Self::timespec_to_ktime_ns(value.it_value)?;
         let _operation = self.operation.lock();
 
-        let (clock_id, registry_registered) = {
+        let (clock_id, registered, generation) = {
             let state = self.state.lock_irqsave();
-            (state.clock_id, state.registry_registered)
+            (
+                state.clock_id,
+                state.observed_clock_set_seq.is_some(),
+                state.generation.wrapping_add(1),
+            )
         };
-        let realtime_absolute = Self::is_realtime_absolute(clock_id, flags);
-        let registry_candidate = realtime_absolute
-            && (initial_ns != 0 || flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET));
-        if registry_candidate && !registry_registered {
+        let cancel_on_set = Self::is_realtime_absolute(clock_id, flags)
+            && flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET);
+        let new_registration = cancel_on_set && !registered;
+        if new_registration {
+            // A clock step must either be in our snapshot or find this inode
+            // in the registry and wait for operation to finish publishing it.
             self.registry_add();
         }
 
-        let domain = if flags.contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME) {
+        let absolute = flags.contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME);
+        let domain = if absolute {
             Self::absolute_domain(clock_id)
         } else {
             Self::relative_domain(clock_id)
         };
-        let (now, observed_clock_set_seq) = if domain == DeadlineDomain::Realtime
-            && flags.contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME)
-        {
+        let (now, observed_clock_set_seq) = if cancel_on_set {
             let (now, seq) = realtime_now_with_clock_set_seq();
             (now.to_ktime_ns(), Some(seq))
         } else {
@@ -435,55 +345,58 @@ impl TimerFdInode {
         };
         let deadline = if initial_ns == 0 {
             None
-        } else if flags.contains(TimerFdSettimeFlags::TFD_TIMER_ABSTIME) {
+        } else if absolute {
             Some(initial_ns)
         } else {
             Some(now.saturating_add(initial_ns).min(KTIME_MAX_NS))
         };
         let immediate = deadline.is_some_and(|expiry| expiry <= now);
-        let registry_member = registry_candidate
-            && (!immediate || flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET));
+        let backend = if let Some(deadline) = deadline.filter(|_| !immediate) {
+            match self.prepare_backend(deadline, domain, generation) {
+                Ok(backend) => Some(backend),
+                Err(error) => {
+                    if new_registration {
+                        self.registry_remove();
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
 
-        let (old, old_backend, generation, report_canceled) = {
+        let (old, old_backend, report_canceled) = {
             let mut state = self.state.lock_irqsave();
-            let old = state.current_spec();
-            let old_backend = state.timer.take();
-            let old_cancel = state.cancel_pending;
-            state.generation = state.generation.wrapping_add(1);
-            let generation = state.generation;
+            let old_expired =
+                state.expired || state.timer.as_ref().is_some_and(|timer| timer.fired());
+            let old = state.current_spec(old_expired);
+            let old_backend = core::mem::replace(
+                &mut state.timer,
+                backend.as_ref().map(PreparedAbsoluteTimer::timer),
+            );
+            state.generation = generation;
             state.interval_ns = interval_ns;
             state.next_expiry_ns = deadline;
             state.deadline_domain = domain;
-            state.ticks = 0;
-            state.expired = false;
-            state.settime_flags = flags;
+            state.ticks = u64::from(immediate);
+            state.expired = immediate;
             state.observed_clock_set_seq = observed_clock_set_seq;
-            state.registry_registered = registry_member;
-            state.cancel_pending = old_cancel
-                && realtime_absolute
-                && flags.contains(TimerFdSettimeFlags::TFD_TIMER_CANCEL_ON_SET);
-            if immediate {
-                state.expired = true;
-                state.ticks = 1;
-            }
+            state.cancel_pending &= cancel_on_set;
             let report_canceled = initial_ns != 0 && state.cancel_pending;
             if report_canceled {
                 state.cancel_pending = false;
             }
-            (old, old_backend, generation, report_canceled)
+            (old, old_backend, report_canceled)
         };
 
         if let Some(old_backend) = old_backend {
             old_backend.cancel();
         }
-        if !registry_member && (registry_registered || registry_candidate) {
+        if registered && !cancel_on_set {
             self.registry_remove();
         }
-        if let Some(deadline) = deadline.filter(|_| !immediate) {
-            let backend = self.new_backend(deadline, domain, generation);
-            if self.publish_backend(backend.clone(), generation) {
-                backend.activate();
-            }
+        if let Some(backend) = backend {
+            backend.activate();
         }
         if immediate {
             self.notify_readable();
@@ -497,91 +410,19 @@ impl TimerFdInode {
 
     fn clock_was_set(&self) {
         let _operation = self.operation.lock();
-        let (realtime_now, clock_set_seq) = realtime_now_with_clock_set_seq();
-        let (old_backend, deadline, domain, generation, notify) = {
-            let mut state = self.state.lock_irqsave();
-            if !state.registry_registered {
-                return;
-            }
-            if state.shutdown || !state.configured_realtime_absolute() {
-                return;
-            }
-            if state.observed_clock_set_seq == Some(clock_set_seq) {
-                return;
-            }
-            state.observed_clock_set_seq = Some(clock_set_seq);
-            let notify = state.cancel_on_set();
-            if notify {
-                state.cancel_pending = true;
-                state.ticks = state.ticks.wrapping_add(1);
-            }
-            let Some(deadline) = state.next_expiry_ns else {
-                drop(state);
-                if notify {
-                    self.notify_readable();
-                }
-                return;
-            };
-            // A lazy periodic/one-shot expiry has already consumed its
-            // backend. read/gettime owns any subsequent periodic forward and
-            // rearm; installing another backend here would duplicate it.
-            if state.expired {
-                let unregister = state.registry_registered && !notify;
-                if unregister {
-                    state.registry_registered = false;
-                }
-                drop(state);
-                if unregister {
-                    self.registry_remove();
-                }
-                if notify {
-                    self.notify_readable();
-                }
-                return;
-            }
-            state.generation = state.generation.wrapping_add(1);
-            let generation = state.generation;
-            let old_backend = state.timer.take();
-            (
-                old_backend,
-                deadline,
-                state.deadline_domain,
-                generation,
-                notify,
-            )
-        };
-
-        if let Some(old_backend) = old_backend {
-            old_backend.cancel();
+        let (_, seq) = realtime_now_with_clock_set_seq();
+        let mut state = self.state.lock_irqsave();
+        if state
+            .observed_clock_set_seq
+            .is_none_or(|observed| observed == seq)
+        {
+            return;
         }
-        let now = realtime_now.to_ktime_ns();
-        if now >= deadline {
-            let mut state = self.state.lock_irqsave();
-            let unregister = if !state.shutdown && state.generation == generation {
-                state.expired = true;
-                state.ticks = state.ticks.wrapping_add(1);
-                let unregister = state.registry_registered && !notify;
-                if unregister {
-                    state.registry_registered = false;
-                }
-                unregister
-            } else {
-                false
-            };
-            drop(state);
-            if unregister {
-                self.registry_remove();
-            }
-            self.notify_readable();
-        } else {
-            let backend = self.new_backend(deadline, domain, generation);
-            if self.publish_backend(backend.clone(), generation) {
-                backend.activate();
-            }
-            if notify {
-                self.notify_readable();
-            }
-        }
+        state.observed_clock_set_seq = Some(seq);
+        state.cancel_pending = true;
+        state.ticks = state.ticks.wrapping_add(1);
+        drop(state);
+        self.notify_readable();
     }
 
     pub fn is_alarm(&self) -> bool {
@@ -607,12 +448,7 @@ impl TimerFunction for TimerFdExpiry {
         if state.shutdown || state.generation != self.generation || state.next_expiry_ns.is_none() {
             return Ok(());
         }
-        let deadline = state.next_expiry_ns.unwrap();
-        let now = state.deadline_domain.now_ns();
         state.timer = None;
-        if now < deadline {
-            return Ok(());
-        }
         state.expired = true;
         state.ticks = state.ticks.wrapping_add(1);
         drop(state);
@@ -678,8 +514,7 @@ impl IndexNode for TimerFdInode {
             state.shutdown = true;
             state.generation = state.generation.wrapping_add(1);
             state.next_expiry_ns = None;
-            let registry_registered = state.registry_registered;
-            state.registry_registered = false;
+            let registry_registered = state.observed_clock_set_seq.take().is_some();
             (state.timer.take(), registry_registered)
         };
         if registry_registered {
@@ -784,7 +619,7 @@ impl IndexNode for TimerFdInode {
     }
 }
 
-/// Notify all realtime-absolute timerfds after a discontinuous wall-clock set.
+/// Notify timerfds that requested cancellation after a discontinuous wall-clock set.
 /// The timekeeper write lock must not be held by the caller.
 pub fn timerfd_clock_was_set() {
     let snapshot = {

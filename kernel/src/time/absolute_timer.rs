@@ -32,6 +32,7 @@ type TimerNode = PreparedNode<Key, Arc<AbsoluteTimer>>;
 
 struct AbsoluteBase {
     monotonic: TimerTree,
+    boottime: TimerTree,
     realtime: TimerTree,
     // Installed once and never removed: event.cancel cannot retire its last Arc.
     driver: Option<Arc<DeadlineEvent>>,
@@ -41,6 +42,7 @@ impl AbsoluteBase {
     fn new() -> Self {
         Self {
             monotonic: RBTree::new(),
+            boottime: RBTree::new(),
             realtime: RBTree::new(),
             driver: None,
         }
@@ -49,6 +51,7 @@ impl AbsoluteBase {
     fn tree(&self, domain: AbsoluteClock) -> &TimerTree {
         match domain {
             AbsoluteClock::Monotonic => &self.monotonic,
+            AbsoluteClock::Boottime => &self.boottime,
             AbsoluteClock::Realtime => &self.realtime,
         }
     }
@@ -60,6 +63,7 @@ impl AbsoluteBase {
     fn tree_mut(&mut self, domain: AbsoluteClock) -> &mut TimerTree {
         match domain {
             AbsoluteClock::Monotonic => &mut self.monotonic,
+            AbsoluteClock::Boottime => &mut self.boottime,
             AbsoluteClock::Realtime => &mut self.realtime,
         }
     }
@@ -118,18 +122,20 @@ pub(crate) fn refresh_deadline_driver() {
 // reads TK. Never carry a TK guard into the deadline owner queue.
 fn refresh_locked(base: &AbsoluteBase) -> bool {
     let driver = &base.driver;
-    let mono_head = base.monotonic.get_first().map(|(key, _)| key.0);
-    let real_head = base.realtime.get_first().map(|(key, _)| key.0);
-    if mono_head.is_none() && real_head.is_none() {
+    let mono_head = base.head_deadline(AbsoluteClock::Monotonic);
+    let boot_head = base.head_deadline(AbsoluteClock::Boottime);
+    let real_head = base.head_deadline(AbsoluteClock::Realtime);
+    if mono_head.is_none() && boot_head.is_none() && real_head.is_none() {
         if let Some(event) = driver.as_ref() {
             event.cancel();
         }
         return false;
     }
 
-    let (mono_now, real_now) = timekeeping::timer_clock_snapshot();
-    let due = mono_head.is_some_and(|head| head <= mono_now)
-        || real_head.is_some_and(|head| i128::from(head) <= real_now);
+    let now = timekeeping::timer_clock_snapshot();
+    let due = mono_head.is_some_and(|head| head <= now.monotonic)
+        || boot_head.is_some_and(|head| head <= now.boottime)
+        || real_head.is_some_and(|head| i128::from(head) <= now.realtime);
     if due {
         // Never turn an expired frontier into a stream of 1ns hardware IRQs.
         // The softirq's running owner rechecks this frontier after releasing
@@ -147,15 +153,16 @@ fn refresh_locked(base: &AbsoluteBase) -> bool {
         event.cancel();
         return false;
     }
+    let boot_projected = boot_head.map(|head| now.monotonic.saturating_add(head - now.boottime));
     let real_projected = real_head.map(|head| {
-        let remaining = (i128::from(head) - real_now).min(i128::from(u64::MAX)) as u64;
-        mono_now.saturating_add(remaining)
+        let remaining = (i128::from(head) - now.realtime).min(i128::from(u64::MAX)) as u64;
+        now.monotonic.saturating_add(remaining)
     });
-    let next = match (mono_head, real_projected) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) | (None, Some(a)) => a,
-        (None, None) => unreachable!(),
-    };
+    let next = [mono_head, boot_projected, real_projected]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect("absolute timer queue has a deadline");
     // A capability/initialization transition can race admission. Keep the
     // original queue published and periodically serviced if arming fails.
     if event.arm(next).is_err() {
@@ -167,6 +174,7 @@ fn refresh_locked(base: &AbsoluteBase) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AbsoluteClock {
     Monotonic,
+    Boottime,
     Realtime,
 }
 
@@ -174,6 +182,7 @@ impl AbsoluteClock {
     pub(crate) fn now_ns(self) -> u64 {
         match self {
             Self::Monotonic => timekeeping::monotonic_now(),
+            Self::Boottime => timekeeping::boottime_now(),
             Self::Realtime => timekeeping::realtime_now(),
         }
         .to_ktime_ns()

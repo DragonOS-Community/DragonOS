@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -37,6 +38,7 @@
 #include <initializer_list>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -860,17 +862,8 @@ std::vector<uint8_t> AliasedBitwiseRule(uint32_t seq, const char* table,
   return RuleWithExpressions(seq, table, chain, expressions);
 }
 
-std::vector<uint8_t> ImmediateRule(uint32_t seq, const char* table,
-                                   const char* chain, uint32_t verdict,
-                                   bool append, const char* target = nullptr) {
-  auto rule = Request(kNftNewrule, seq);
-  rule[NLMSG_HDRLEN] = NFPROTO_IPV4;
-  nlmsghdr header{};
-  std::memcpy(&header, rule.data(), sizeof(header));
-  header.nlmsg_flags |= NLM_F_CREATE | (append ? NLM_F_APPEND : 0);
-  std::memcpy(rule.data(), &header, sizeof(header));
-  AppendAttr(&rule, NFTA_RULE_TABLE, table);
-  AppendAttr(&rule, NFTA_RULE_CHAIN, chain);
+void AppendVerdictExpression(std::vector<uint8_t>* expressions, uint32_t verdict,
+                             const char* target = nullptr) {
   std::vector<uint8_t> verdict_data;
   const uint32_t code = htonl(verdict);
   AppendNla(&verdict_data, NFTA_VERDICT_CODE,
@@ -888,37 +881,56 @@ std::vector<uint8_t> ImmediateRule(uint32_t seq, const char* table,
             reinterpret_cast<const uint8_t*>(&verdict_register), sizeof(verdict_register));
   AppendNla(&immediate, NFTA_IMMEDIATE_DATA | NLA_F_NESTED,
             data.data(), data.size());
-  std::vector<uint8_t> expression;
-  const char expr_name[] = "immediate";
-  AppendNla(&expression, NFTA_EXPR_NAME,
-            reinterpret_cast<const uint8_t*>(expr_name), sizeof(expr_name));
-  AppendNla(&expression, NFTA_EXPR_DATA | NLA_F_NESTED,
-            immediate.data(), immediate.size());
+  AppendExpr(expressions, "immediate", immediate);
+}
+
+std::vector<uint8_t> ImmediateRule(uint32_t seq, const char* table,
+                                   const char* chain, uint32_t verdict,
+                                   bool append, const char* target = nullptr) {
+  auto rule = Request(kNftNewrule, seq);
+  rule[NLMSG_HDRLEN] = NFPROTO_IPV4;
+  nlmsghdr header{};
+  std::memcpy(&header, rule.data(), sizeof(header));
+  header.nlmsg_flags |= NLM_F_CREATE | (append ? NLM_F_APPEND : 0);
+  std::memcpy(rule.data(), &header, sizeof(header));
+  AppendAttr(&rule, NFTA_RULE_TABLE, table);
+  AppendAttr(&rule, NFTA_RULE_CHAIN, chain);
   std::vector<uint8_t> expressions;
-  AppendNla(&expressions, NFTA_LIST_ELEM | NLA_F_NESTED,
-            expression.data(), expression.size());
+  AppendVerdictExpression(&expressions, verdict, target);
   AppendRawAttr(&rule, NFTA_RULE_EXPRESSIONS | NLA_F_NESTED,
                 expressions.data(), expressions.size());
   return rule;
 }
 
-std::vector<uint8_t> TableBatch(uint16_t mutation, uint32_t seq, const char* name,
-                                uint8_t family = NFPROTO_IPV4) {
-  auto begin = Request(NFNL_MSG_BATCH_BEGIN, seq);
-  nfgenmsg begin_gen{};
-  begin_gen.res_id = htons(NFNL_SUBSYS_NFTABLES);
-  std::memcpy(begin.data() + NLMSG_HDRLEN, &begin_gen, sizeof(begin_gen));
-  auto change = Request(mutation, seq + 1);
+std::vector<uint8_t> TableMutation(uint16_t mutation, uint32_t seq, const char* name,
+                                   uint8_t family) {
+  auto change = Request(mutation, seq);
   change[NLMSG_HDRLEN] = family;
   nlmsghdr header{};
   std::memcpy(&header, change.data(), sizeof(header));
   header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
   std::memcpy(change.data(), &header, sizeof(header));
   AppendAttr(&change, NFTA_TABLE_NAME, name);
-  auto end = Request(NFNL_MSG_BATCH_END, seq + 2);
-  begin.insert(begin.end(), change.begin(), change.end());
-  begin.insert(begin.end(), end.begin(), end.end());
-  return begin;
+  return change;
+}
+
+std::vector<uint8_t> MutationBatch(
+    uint32_t seq, std::initializer_list<std::vector<uint8_t>> operations) {
+  auto batch = Request(NFNL_MSG_BATCH_BEGIN, seq);
+  nfgenmsg gen{};
+  gen.res_id = htons(NFNL_SUBSYS_NFTABLES);
+  std::memcpy(batch.data() + NLMSG_HDRLEN, &gen, sizeof(gen));
+  for (const auto& operation : operations) {
+    batch.insert(batch.end(), operation.begin(), operation.end());
+  }
+  const auto end = Request(NFNL_MSG_BATCH_END, seq + 1 + operations.size());
+  batch.insert(batch.end(), end.begin(), end.end());
+  return batch;
+}
+
+std::vector<uint8_t> TableBatch(uint16_t mutation, uint32_t seq, const char* name,
+                                uint8_t family = NFPROTO_IPV4) {
+  return MutationBatch(seq, {TableMutation(mutation, seq + 1, name, family)});
 }
 
 std::vector<uint8_t> NewChain(uint32_t seq, const char* table,
@@ -7579,6 +7591,317 @@ TEST(NetlinkNetfilter, NftFailedBatchDoesNotPublishEarlierTable) {
   AppendAttr(&query, NFTA_TABLE_NAME, "dkc035_abort");
   ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(fd.get(), query));
   Ack(fd.get(), 214, ENOENT, kNftGettable);
+}
+
+constexpr char kAtomicTable[] = "dkc035_atomic_rule";
+
+struct LoopbackReceiver {
+  Fd fd{socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0)};
+  sockaddr_in address{};
+
+  bool Bind(uint16_t port = 0) {
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = port;
+    socklen_t size = sizeof(address);
+    return fd.get() >= 0 &&
+           bind(fd.get(), reinterpret_cast<const sockaddr*>(&address), size) == 0 &&
+           getsockname(fd.get(), reinterpret_cast<sockaddr*>(&address), &size) == 0;
+  }
+  ssize_t Send(int sender, uint8_t marker) const {
+    return sendto(sender, &marker, sizeof(marker), 0,
+                  reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+  }
+  void ExpectDelivery(uint8_t marker) const {
+    pollfd ready{fd.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 2000));
+    uint8_t actual = 0;
+    ASSERT_EQ(1, recv(fd.get(), &actual, sizeof(actual), 0));
+    EXPECT_EQ(marker, actual);
+  }
+};
+
+std::vector<uint8_t> AtomicDropRule(uint32_t seq, uint16_t port, uint8_t revision) {
+  std::vector<uint8_t> expressions;
+  const uint8_t udp = IPPROTO_UDP;
+  AppendMetaEqual(&expressions, NFT_META_L4PROTO, &udp, sizeof(udp));
+  AppendPayloadEqual(&expressions, NFT_PAYLOAD_TRANSPORT_HEADER, 2,
+                     reinterpret_cast<const uint8_t*>(&port), sizeof(port));
+  AppendExpr(&expressions, "counter", {});
+  AppendVerdictExpression(&expressions, NF_DROP);
+  auto rule = RuleWithExpressions(seq, kAtomicTable, "input", expressions);
+  AppendRawAttr(&rule, NFTA_RULE_USERDATA, &revision, sizeof(revision));
+  return rule;
+}
+
+std::vector<uint8_t> DeleteAtomicRule(uint32_t seq, uint64_t handle) {
+  auto request = Request(kNftDelrule, seq);
+  request[NLMSG_HDRLEN] = NFPROTO_IPV4;
+  AppendAttr(&request, NFTA_RULE_TABLE, kAtomicTable);
+  AppendAttr(&request, NFTA_RULE_CHAIN, "input");
+  const uint64_t wire_handle = htobe64(handle);
+  AppendRawAttr(&request, NFTA_RULE_HANDLE,
+                reinterpret_cast<const uint8_t*>(&wire_handle), sizeof(wire_handle));
+  return request;
+}
+
+std::vector<RuleInfo> AtomicRuleDump(int fd, uint32_t seq) {
+  auto query = Request(kNftGetrule, seq);
+  query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+  nlmsghdr header{};
+  std::memcpy(&header, query.data(), sizeof(header));
+  header.nlmsg_flags |= NLM_F_DUMP;
+  std::memcpy(query.data(), &header, sizeof(header));
+  AppendAttr(&query, NFTA_RULE_TABLE, kAtomicTable);
+  AppendAttr(&query, NFTA_RULE_CHAIN, "input");
+  if (Send(fd, query) != static_cast<ssize_t>(query.size())) {
+    ADD_FAILURE() << "send rule dump: " << errno;
+    return {};
+  }
+  return ReceiveRuleDump(fd, seq);
+}
+
+void InstallAtomicRule(int fd, uint32_t seq, uint16_t port) {
+  const auto install = MutationBatch(
+      seq, {TableMutation(kNftNewtable, seq + 1, kAtomicTable, NFPROTO_IPV4),
+            NewChain(seq + 2, kAtomicTable, "input", true, NF_ACCEPT, NF_INET_LOCAL_IN),
+            AtomicDropRule(seq + 3, port, 1)});
+  ASSERT_EQ(static_cast<ssize_t>(install.size()), Send(fd, install));
+  Ack(fd, seq + 1, 0, kNftNewtable);
+  Ack(fd, seq + 2, 0, kNftNewchain);
+  Ack(fd, seq + 3, 0, kNftNewrule);
+}
+
+void CheckAtomicPolicy(int sender, const LoopbackReceiver& denied,
+                       const LoopbackReceiver& allowed, uint8_t marker,
+                       int quiet_ms) {
+  const ssize_t sent = denied.Send(sender, marker);
+  EXPECT_TRUE(sent == 1 || (sent == -1 && errno == EPERM));
+  ASSERT_EQ(1, allowed.Send(sender, marker));
+  ASSERT_NO_FATAL_FAILURE(allowed.ExpectDelivery(marker));
+  pollfd blocked{denied.fd.get(), POLLIN, 0};
+  EXPECT_EQ(0, poll(&blocked, 1, quiet_ms));
+}
+
+void InAtomicRuleNetns(const std::function<void()>& exercise) {
+  Child([&] {
+    alarm(20);
+    if (unshare(CLONE_NEWNET) != 0) return 1;
+    Fd route(OpenRouteSocket());
+    const unsigned loopback = if_nametoindex("lo");
+    if (route.get() < 0 || loopback == 0 || SetLinkUp(route.get(), loopback, true, 1) != 0)
+      return 1;
+    exercise();
+    return ::testing::Test::HasFailure() ? 1 : 0;
+  });
+}
+
+void CheckAtomicRuleRollback() {
+  Fd nft(Open());
+  Fd sender(socket(AF_INET, SOCK_DGRAM, 0));
+  LoopbackReceiver denied, allowed;
+  ASSERT_GE(nft.get(), 0);
+  ASSERT_GE(sender.get(), 0);
+  ASSERT_TRUE(denied.Bind());
+  ASSERT_TRUE(allowed.Bind());
+  ASSERT_EQ(1, denied.Send(sender.get(), 0x10));
+  ASSERT_NO_FATAL_FAILURE(denied.ExpectDelivery(0x10));
+
+  constexpr uint32_t seq = 264700;
+  ASSERT_NO_FATAL_FAILURE(InstallAtomicRule(nft.get(), seq, denied.address.sin_port));
+  ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 0x20, 100));
+  const auto before = AtomicRuleDump(nft.get(), seq + 5);
+  ASSERT_EQ(1u, before.size());
+  ASSERT_NE(0u, before[0].handle);
+  ASSERT_TRUE(before[0].has_counter);
+  ASSERT_EQ(1u, before[0].packets);
+  ASSERT_GT(before[0].bytes, 0u);
+
+  // Re-creating the existing table with EXCL aborts the preceding deletion.
+  const auto failed = MutationBatch(
+      seq + 6, {DeleteAtomicRule(seq + 7, before[0].handle),
+                TableMutation(kNftNewtable, seq + 8, kAtomicTable, NFPROTO_IPV4)});
+  ASSERT_EQ(static_cast<ssize_t>(failed.size()), Send(nft.get(), failed));
+  Ack(nft.get(), seq + 7, 0, kNftDelrule);
+  Ack(nft.get(), seq + 8, EEXIST, kNftNewtable);
+
+  const auto rolled_back = AtomicRuleDump(nft.get(), seq + 10);
+  ASSERT_EQ(1u, rolled_back.size());
+  EXPECT_EQ(before[0].handle, rolled_back[0].handle);
+  EXPECT_EQ(before[0].generation, rolled_back[0].generation);
+  ASSERT_TRUE(rolled_back[0].has_counter);
+  EXPECT_EQ(before[0].packets, rolled_back[0].packets);
+  EXPECT_EQ(before[0].bytes, rolled_back[0].bytes);
+  ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 0x30, 100));
+  const auto counted = AtomicRuleDump(nft.get(), seq + 11);
+  ASSERT_EQ(1u, counted.size());
+  EXPECT_EQ(rolled_back[0].packets + 1, counted[0].packets);
+
+  const auto remove_table = TableBatch(kNftDeltable, seq + 12, kAtomicTable);
+  ASSERT_EQ(static_cast<ssize_t>(remove_table.size()), Send(nft.get(), remove_table));
+  Ack(nft.get(), seq + 13, 0, kNftDeltable);
+  ASSERT_EQ(1, denied.Send(sender.get(), 0x40));
+  ASSERT_NO_FATAL_FAILURE(denied.ExpectDelivery(0x40));
+}
+
+TEST(NetlinkNetfilter, NftFailedRuleDeletionKeepsLiveInputFilter) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  InAtomicRuleNetns(CheckAtomicRuleRollback);
+}
+
+TEST(NetlinkNetfilter, NftAtomicRuleReplacementKeepsLiveInputFilter) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  InAtomicRuleNetns([] {
+    Fd nft(Open());
+    Fd sender(socket(AF_INET, SOCK_DGRAM, 0));
+    LoopbackReceiver denied, allowed;
+    ASSERT_GE(nft.get(), 0);
+    ASSERT_GE(sender.get(), 0);
+    ASSERT_TRUE(denied.Bind());
+    ASSERT_TRUE(allowed.Bind());
+    constexpr uint32_t first = 265000;
+    ASSERT_NO_FATAL_FAILURE(InstallAtomicRule(nft.get(), first, denied.address.sin_port));
+    auto current = AtomicRuleDump(nft.get(), first + 5);
+    ASSERT_EQ(1u, current.size());
+
+    std::atomic<bool> finished{false};
+    std::atomic<unsigned> samples{0};
+    std::thread reader([&] {
+      for (uint8_t marker = 0; !finished; ++marker) {
+        CheckAtomicPolicy(sender.get(), denied, allowed, marker, 0);
+        if (::testing::Test::HasFailure()) break;
+        ++samples;
+      }
+    });
+    const auto progress_after = [&](unsigned last) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (samples <= last && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+      }
+      return samples > last;
+    };
+    [&] {
+      ASSERT_TRUE(progress_after(0)) << "reader did not deliver its positive control";
+      for (uint8_t revision = 2; revision <= 25; ++revision) {
+        const uint32_t seq = first + 10 + 5 * revision;
+        const unsigned delivered_before = samples;
+        const auto replace = MutationBatch(
+            seq, {DeleteAtomicRule(seq + 1, current[0].handle),
+                  AtomicDropRule(seq + 2, denied.address.sin_port, revision)});
+        ASSERT_EQ(static_cast<ssize_t>(replace.size()), Send(nft.get(), replace));
+        Ack(nft.get(), seq + 1, 0, kNftDelrule);
+        Ack(nft.get(), seq + 2, 0, kNftNewrule);
+        ASSERT_TRUE(progress_after(delivered_before)) << "no reader progress around replacement";
+
+        const auto updated = AtomicRuleDump(nft.get(), seq + 4);
+        ASSERT_EQ(1u, updated.size());
+        EXPECT_NE(current[0].generation, updated[0].generation);
+        ASSERT_TRUE(updated[0].userdata.has_value());
+        EXPECT_EQ(std::vector<uint8_t>{revision}, *updated[0].userdata);
+        current = updated;
+      }
+    }();
+    finished = true;
+    reader.join();
+    const auto before = AtomicRuleDump(nft.get(), 265200);
+    ASSERT_EQ(1u, before.size());
+    ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 0xa0, 100));
+    const auto after = AtomicRuleDump(nft.get(), 265201);
+    ASSERT_EQ(1u, after.size());
+    EXPECT_EQ(before[0].packets + 1, after[0].packets);
+  });
+}
+
+TEST(NetlinkNetfilter, NftConcurrentExclusiveWritersReportOneConflict) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  InAtomicRuleNetns([] {
+    Fd first(Open()), second(Open());
+    ASSERT_GE(first.get(), 0);
+    ASSERT_GE(second.get(), 0);
+    constexpr uint32_t first_seq = 265400;
+    constexpr uint32_t second_seq = 265410;
+    const auto first_batch = TableBatch(kNftNewtable, first_seq, kAtomicTable);
+    const auto second_batch = TableBatch(kNftNewtable, second_seq, kAtomicTable);
+    std::atomic<bool> ready{false}, begin{false};
+    ssize_t first_sent = 0;
+    std::thread writer([&] {
+      ready = true;
+      while (!begin) std::this_thread::yield();
+      first_sent = Send(first.get(), first_batch);
+    });
+    while (!ready) std::this_thread::yield();
+    begin = true;
+    const ssize_t second_sent = Send(second.get(), second_batch);
+    writer.join();
+    ASSERT_EQ(static_cast<ssize_t>(first_batch.size()), first_sent);
+    ASSERT_EQ(static_cast<ssize_t>(second_batch.size()), second_sent);
+    pollfd first_reply{first.get(), POLLIN, 0}, second_reply{second.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&first_reply, 1, 2000));
+    ASSERT_EQ(1, poll(&second_reply, 1, 2000));
+    const int first_result = RecvAck(first.get(), first_seq + 1);
+    const int second_result = RecvAck(second.get(), second_seq + 1);
+    EXPECT_TRUE((first_result == 0 && second_result == EEXIST) ||
+                (first_result == EEXIST && second_result == 0))
+        << "writer errors " << first_result << " and " << second_result;
+
+    auto query = Request(kNftGettable, first_seq + 3);
+    query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    AppendAttr(&query, NFTA_TABLE_NAME, kAtomicTable);
+    ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(first.get(), query));
+    ASSERT_EQ(1, poll(&first_reply, 1, 2000));
+    std::array<uint8_t, 512> reply{};
+    ASSERT_GE(recv(first.get(), reply.data(), reply.size(), 0),
+              static_cast<ssize_t>(NLMSG_LENGTH(sizeof(nfgenmsg))));
+    nlmsghdr header{};
+    std::memcpy(&header, reply.data(), sizeof(header));
+    EXPECT_EQ(kNftNewtable, header.nlmsg_type);
+    EXPECT_EQ(first_seq + 3, header.nlmsg_seq);
+  });
+}
+
+TEST(NetlinkNetfilter, NftExitedNamespaceRulesDoNotAffectPeerNamespaces) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  InAtomicRuleNetns([] {
+    Fd nft(Open());
+    Fd sender(socket(AF_INET, SOCK_DGRAM, 0));
+    LoopbackReceiver denied, allowed;
+    ASSERT_GE(nft.get(), 0);
+    ASSERT_GE(sender.get(), 0);
+    ASSERT_TRUE(denied.Bind());
+    ASSERT_TRUE(allowed.Bind());
+    ASSERT_NO_FATAL_FAILURE(InstallAtomicRule(nft.get(), 266000, denied.address.sin_port));
+
+    InAtomicRuleNetns([&] {
+      Fd nested_nft(Open());
+      Fd nested_sender(socket(AF_INET, SOCK_DGRAM, 0));
+      LoopbackReceiver nested_denied, nested_allowed;
+      ASSERT_GE(nested_nft.get(), 0);
+      ASSERT_GE(nested_sender.get(), 0);
+      ASSERT_TRUE(nested_denied.Bind(allowed.address.sin_port));
+      ASSERT_TRUE(nested_allowed.Bind(denied.address.sin_port));
+      ASSERT_NO_FATAL_FAILURE(InstallAtomicRule(nested_nft.get(), 267000,
+                                                nested_denied.address.sin_port));
+      ASSERT_NO_FATAL_FAILURE(
+          CheckAtomicPolicy(nested_sender.get(), nested_denied, nested_allowed, 1, 100));
+      // These inherited sockets still exercise the parent ruleset and its hook.
+      ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 6, 100));
+      // Let namespace teardown release the installed INPUT hook.
+    });
+    ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 2, 100));
+
+    InAtomicRuleNetns([&] {
+      Fd nested_sender(socket(AF_INET, SOCK_DGRAM, 0));
+      LoopbackReceiver first, second;
+      ASSERT_GE(nested_sender.get(), 0);
+      ASSERT_TRUE(first.Bind(allowed.address.sin_port));
+      ASSERT_TRUE(second.Bind(denied.address.sin_port));
+      ASSERT_EQ(1, first.Send(nested_sender.get(), 3));
+      ASSERT_NO_FATAL_FAILURE(first.ExpectDelivery(3));
+      ASSERT_EQ(1, second.Send(nested_sender.get(), 4));
+      ASSERT_NO_FATAL_FAILURE(second.ExpectDelivery(4));
+    });
+    ASSERT_NO_FATAL_FAILURE(CheckAtomicPolicy(sender.get(), denied, allowed, 5, 100));
+  });
 }
 
 TEST(NetlinkNetfilter, NftRuleUserdataRoundTripAndRollback) {

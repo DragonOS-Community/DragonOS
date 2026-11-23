@@ -514,6 +514,7 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6AutoconfSettingsTrackRenameAndNamespaceMo
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "addr_gen_mode", "0\n", "1\n");
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "accept_dad", "1\n", "0\n");
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "dad_transmits", "1\n");
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "router_solicitations", "-1\n");
 }
 
 TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDAD) {
@@ -540,6 +541,14 @@ TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDA
             const uint32_t right_index = if_nametoindex(right);
             ASSERT_NE(left_index, 0u);
             ASSERT_NE(right_index, 0u);
+            const int capture = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(ETH_P_IPV6));
+            ASSERT_GE(capture, 0);
+            sockaddr_ll peer_capture{};
+            peer_capture.sll_family = AF_PACKET;
+            peer_capture.sll_protocol = htons(ETH_P_IPV6);
+            peer_capture.sll_ifindex = right_index;
+            ASSERT_EQ(bind(capture, reinterpret_cast<sockaddr*>(&peer_capture),
+                           sizeof(peer_capture)), 0);
             ASSERT_EQ(SetLinkUp(route.fd, left_index, true, 4971), 0);
 
             sockaddr_in6 address{};
@@ -562,6 +571,27 @@ TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDA
                 usleep(25'000);
             }
             ASSERT_TRUE(assigned);
+
+            in6_addr all_routers{};
+            ASSERT_EQ(inet_pton(AF_INET6, "ff02::2", &all_routers), 1);
+            bool saw_solicitation = false;
+            for (int attempt = 0; attempt < 30 && !saw_solicitation; ++attempt) {
+                pollfd ready{capture, POLLIN, 0};
+                if (poll(&ready, 1, 100) <= 0) continue;
+                uint8_t packet[256];
+                const ssize_t size = recv(capture, packet, sizeof(packet), MSG_DONTWAIT);
+                if (size < 56 || packet[6] != IPPROTO_ICMPV6 || packet[40] != 133 ||
+                    std::memcmp(packet + 8, &address.sin6_addr, sizeof(in6_addr)) != 0) continue;
+                EXPECT_EQ(packet[7], 255);
+                EXPECT_EQ(packet[41], 0);
+                EXPECT_EQ(std::memcmp(packet + 24, &all_routers, sizeof(all_routers)), 0);
+                EXPECT_EQ(packet[48], 1);
+                EXPECT_EQ(packet[49], 1);
+                EXPECT_EQ(std::memcmp(packet + 50, mac, sizeof(mac)), 0);
+                saw_solicitation = true;
+            }
+            EXPECT_TRUE(saw_solicitation) << "peer did not receive an RS after DAD";
+            close(capture);
             ASSERT_EQ(SetLinkUp(route.fd, left_index, false, 4973), 0);
             EXPECT_FALSE(can_bind());
         };

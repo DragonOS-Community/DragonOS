@@ -16,12 +16,14 @@ use crate::driver::net::{
 };
 use crate::net::{
     ipv6_defrag::{fragment_offset, DefragDomain},
-    output::submit_prepared_ipv6_with_related,
+    output::submit_prepared_ipv6_before_enqueue,
     route::{OutputRouteDecision, RTN_MULTICAST, RT_TABLE_LOCAL},
     rtnl,
 };
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::time::Instant;
+
+use super::ipv6_router_solicitation as solicitation;
 
 const RETRANS_US: i64 = 1_000_000;
 const RETRY_US: i64 = 100_000;
@@ -40,10 +42,12 @@ pub(crate) enum Setting {
     AddrGenMode,
     AcceptDad,
     DadTransmits,
+    RouterSolicitations,
 }
 
 #[derive(Debug)]
 pub(crate) struct DeviceState {
+    pub(super) solicitation: solicitation::State,
     mode: i32,
     accept_dad: i32,
     dad_transmits: i32,
@@ -56,6 +60,7 @@ pub(crate) struct DeviceState {
 impl Default for DeviceState {
     fn default() -> Self {
         Self {
+            solicitation: solicitation::State::default(),
             mode: 0,
             accept_dad: 1,
             dad_transmits: 1,
@@ -74,6 +79,7 @@ impl Setting {
             Self::AddrGenMode => state.mode,
             Self::AcceptDad => state.accept_dad,
             Self::DadTransmits => state.dad_transmits,
+            Self::RouterSolicitations => state.solicitation.limit,
         }
     }
 
@@ -92,6 +98,7 @@ impl Setting {
             }
             Self::AcceptDad if (-1..=2).contains(&value) => state.accept_dad = value,
             Self::DadTransmits if value >= 0 => state.dad_transmits = value,
+            Self::RouterSolicitations if value >= -1 => state.solicitation.limit = value,
             _ => return Err(SystemError::EINVAL),
         }
         drop(state);
@@ -113,6 +120,7 @@ pub(crate) fn cancel(common: &IfaceCommon, restart: bool) {
         state.retry = None;
         if restart {
             state.ready_seen = false;
+            state.solicitation.link_reset();
         }
         state.group.take()
     };
@@ -131,7 +139,7 @@ pub(crate) fn reset_for_netns_move(common: &IfaceCommon) {
     *common.ipv6_autoconf.lock() = DeviceState::default();
 }
 
-fn carrier_ready(iface: &dyn Iface) -> bool {
+pub(super) fn carrier_ready(iface: &dyn Iface) -> bool {
     matches!(
         iface.operstate(),
         Operstate::IF_OPER_UP | Operstate::IF_OPER_UNKNOWN
@@ -180,7 +188,9 @@ pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
         if iface.type_() != InterfaceType::ETHER {
             continue;
         }
-        if let Some(due) = poll_device(&rtnl, netns, &iface, Instant::now().total_micros()) {
+        let dad_due = poll_device(&rtnl, netns, &iface, Instant::now().total_micros());
+        let solicitation_due = solicitation::poll(netns, &iface);
+        if let Some(due) = dad_due.into_iter().chain(solicitation_due).min() {
             next = Some(next.map_or(due, |current: i64| current.min(due)));
         }
     }
@@ -367,35 +377,51 @@ fn send_probe(
     iface: &dyn Iface,
     probe: Probe,
 ) -> Result<(), SystemError> {
-    let dst = probe.target.solicited_node();
-    let src = Ipv6Address::UNSPECIFIED;
-    let ns = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
-        target_addr: probe.target,
-        lladdr: None,
-        nonce: Some(probe.nonce),
-    });
+    send_ndisc(
+        netns,
+        iface,
+        Ipv6Address::UNSPECIFIED,
+        probe.target.solicited_node(),
+        NdiscRepr::NeighborSolicit {
+            target_addr: probe.target,
+            lladdr: None,
+            nonce: Some(probe.nonce),
+        },
+        || {},
+    )
+}
+
+pub(super) fn send_ndisc(
+    netns: &Arc<NetNamespace>,
+    iface: &dyn Iface,
+    src: Ipv6Address,
+    dst: Ipv6Address,
+    message: NdiscRepr<'_>,
+    before_enqueue: impl FnOnce(),
+) -> Result<(), SystemError> {
+    let message = Icmpv6Repr::Ndisc(message);
     let ip = Ipv6Repr {
         src_addr: src,
         dst_addr: dst,
         next_header: IpProtocol::Icmpv6,
         hop_limit: 255,
-        payload_len: ns.buffer_len(),
+        payload_len: message.buffer_len(),
     };
     let mut packet = reserve_prepared_ip_output(
         iface,
         netns,
-        ip.buffer_len() + ns.buffer_len(),
+        ip.buffer_len() + message.buffer_len(),
         IpVersion::Ipv6,
     )?;
     ip.emit(&mut Ipv6Packet::new_unchecked(packet.bytes_mut()));
-    ns.emit(
+    message.emit(
         &src,
         &dst,
         &mut Icmpv6Packet::new_unchecked(&mut packet.bytes_mut()[ip.buffer_len()..]),
         &ChecksumCapabilities::default(),
     );
     let oif = iface.nic_id() as u32;
-    submit_prepared_ipv6_with_related(
+    submit_prepared_ipv6_before_enqueue(
         netns,
         packet,
         OutputRouteDecision {
@@ -407,6 +433,7 @@ fn send_probe(
             table: RT_TABLE_LOCAL,
         },
         None,
+        before_enqueue,
     )
 }
 

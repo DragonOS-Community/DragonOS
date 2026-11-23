@@ -144,6 +144,7 @@ pub(crate) fn submit_prepared_ipv6_with_pmtu(
             may_fragment: true,
             hint: None,
         },
+        || {},
     )
     .map(|_| ())
 }
@@ -218,5 +219,6 @@ pub(crate) fn submit_prepared_ipv6_raw(
             may_fragment: !options.hdrincl,
             hint: Some(hint),
         },
+        || {},
     )
 }

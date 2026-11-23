@@ -450,6 +450,9 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             super::address::ipv6_autoconf::cancel(iface.common(), true);
         } else if was_up != is_up || mtu.is_some() || noarp_changed {
             super::address::ipv6_autoconf::changed(iface.common());
+            if !was_up && is_up {
+                super::address::ipv6_router_solicitation::link_up(iface.as_ref());
+            }
         }
 
         // A NOARP transition changes whether an unresolved destination can be

@@ -76,6 +76,8 @@ enum NotificationObject {
     /// Prebuilt with the element's value *at the operation*, not a retained
     /// full set/table snapshot for every update in a batch.
     SetElement(NetfilterMessage),
+    /// Serialize wholesale deletions at commit, only for listeners or echo.
+    FlushedSet(Arc<NftTable>, Arc<NftSet>),
     /// Keep a deleted subtree as one event until commit decides whether any
     /// listener or echo recipient needs its descendant notifications.
     DeletedTableTree(Arc<NftTable>),
@@ -120,10 +122,7 @@ fn set_element_events(
         events.push(set_elem_message(
             table,
             set,
-            &stored.key,
-            stored.value.as_deref(),
-            stored.verdict,
-            stored.flags,
+            stored,
             SetElementMessageMeta {
                 generation: 0,
                 sequence,
@@ -762,18 +761,45 @@ impl NetfilterKernelSocket {
                     .err(),
                 NFT_MSG_NEWSETELEM | NFT_MSG_DELSETELEM => set_elem_attrs(&request)
                     .and_then(|attrs| {
-                        if attrs.elements.is_empty() {
+                        let add = request.kind() == NFT_MSG_NEWSETELEM;
+                        let elements = attrs.elements.as_deref();
+                        if add && elements.is_none_or(<[_]>::is_empty) {
                             return Err(SystemError::EINVAL);
                         }
                         let table_name = attrs.table.ok_or(SystemError::EINVAL)?;
+                        let sequence = u32::from_ne_bytes(request.bytes[8..12].try_into().unwrap());
+                        let echo = request.flags() & NLM_F_ECHO != 0;
+                        let elements = match elements {
+                            None | Some([]) => {
+                                if let Some((table, old_set)) = transaction
+                                    .delete_unkeyed_set_elements(
+                                        family,
+                                        table_name,
+                                        attrs.set,
+                                        elements.is_none(),
+                                    )?
+                                {
+                                    notifications
+                                        .try_reserve(1)
+                                        .map_err(|_| SystemError::ENOMEM)?;
+                                    notifications.push(NftNotification {
+                                        object: NotificationObject::FlushedSet(table, old_set),
+                                        kind: NFT_MSG_DELSETELEM,
+                                        sequence,
+                                        flags: 0,
+                                        echo,
+                                    });
+                                }
+                                return Ok(());
+                            }
+                            Some(elements) => elements,
+                        };
                         let name = transaction.resolve_set_name(
                             family,
                             table_name,
                             attrs.set,
                             attrs.set_id,
                         )?;
-                        let add = request.kind() == NFT_MSG_NEWSETELEM;
-                        let sequence = u32::from_ne_bytes(request.bytes[8..12].try_into().unwrap());
                         let prior_events = if add {
                             Vec::new()
                         } else {
@@ -782,24 +808,19 @@ impl NetfilterKernelSocket {
                             set_element_events(
                                 &table,
                                 &set,
-                                &attrs.elements,
+                                elements,
                                 sequence,
                                 port,
                                 request.kind(),
                             )?
                         };
-                        let (table, set) = transaction.update_set_elements(
-                            family,
-                            table_name,
-                            &name,
-                            &attrs.elements,
-                            add,
-                        )?;
+                        let (table, set) = transaction
+                            .update_set_elements(family, table_name, &name, elements, add)?;
                         let events = if add {
                             set_element_events(
                                 &table,
                                 &set,
-                                &attrs.elements,
+                                elements,
                                 sequence,
                                 port,
                                 request.kind(),
@@ -816,7 +837,7 @@ impl NetfilterKernelSocket {
                                 kind: request.kind(),
                                 sequence,
                                 flags: 0,
-                                echo: request.flags() & NLM_F_ECHO != 0,
+                                echo,
                             });
                         }
                         Ok(())
@@ -1043,6 +1064,28 @@ impl NetfilterKernelSocket {
                             bytes[HEADER_LEN + 2..HEADER_LEN + NFGEN_LEN]
                                 .copy_from_slice(&(generation as u16).to_be_bytes());
                             NetfilterMessage::new(bytes)
+                        }
+                        NotificationObject::FlushedSet(table, old_set) => {
+                            for element in &old_set.elements {
+                                Self::send_notification_result(
+                                    set_elem_message(
+                                        table,
+                                        old_set,
+                                        element,
+                                        SetElementMessageMeta {
+                                            generation,
+                                            sequence: event.sequence,
+                                            port,
+                                            kind: event.kind,
+                                            flags: event.flags,
+                                        },
+                                    ),
+                                    event.echo,
+                                    port,
+                                    &netns,
+                                );
+                            }
+                            continue;
                         }
                         NotificationObject::DeletedTableTree(_) => unreachable!(),
                     };

@@ -10,7 +10,8 @@ use crate::{
         nftables::{
             NftBitwiseOperation, NftByteorderOp, NftChain, NftChainType, NftCmpOp, NftExpression,
             NftExpressionInput, NftMetaKey, NftPayloadBase, NftRangeOp, NftRule, NftRuleInput,
-            NftRuleVerdict, NftSet, NftSetElementInput, NftTable, NftVerdict, RulesetSnapshot,
+            NftRuleVerdict, NftSet, NftSetElement, NftSetElementInput, NftTable, NftVerdict,
+            RulesetSnapshot,
         },
         socket::netlink::{
             receiver::MessageQueue,
@@ -323,7 +324,7 @@ pub(super) struct SetElemAttrs<'a> {
     pub(super) table: Option<&'a [u8]>,
     pub(super) set: Option<&'a [u8]>,
     pub(super) set_id: Option<u32>,
-    pub(super) elements: Vec<NftSetElementInput<'a>>,
+    pub(super) elements: Option<Vec<NftSetElementInput<'a>>>,
 }
 
 pub(super) fn xt_tcp_compatible(compat: Option<&[u8]>) -> Result<(), SystemError> {
@@ -1437,9 +1438,10 @@ pub(super) fn set_elem_attrs<'a>(
             }
             SET_ELEM_SET_ID => {}
             SET_ELEM_ELEMENTS => {
-                if !attrs.elements.is_empty() {
+                if attrs.elements.is_some() {
                     return Err(SystemError::EINVAL);
                 }
+                let mut elements = Vec::new();
                 for item in NlaIter::new(nla.value) {
                     let item = item?;
                     // libnftnl numbers elements 1, 2, ... within one
@@ -1485,11 +1487,8 @@ pub(super) fn set_elem_attrs<'a>(
                             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
                         }
                     }
-                    attrs
-                        .elements
-                        .try_reserve(1)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    attrs.elements.push(NftSetElementInput {
+                    elements.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
+                    elements.push(NftSetElementInput {
                         key: key.ok_or(SystemError::EINVAL)?,
                         value,
                         verdict,
@@ -1497,6 +1496,7 @@ pub(super) fn set_elem_attrs<'a>(
                         key_end,
                     });
                 }
+                attrs.elements = Some(elements);
             }
             _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
@@ -1830,10 +1830,7 @@ pub(super) struct SetElementMessageMeta {
 pub(super) fn set_elem_message(
     table: &NftTable,
     set: &NftSet,
-    key: &[u8],
-    value: Option<&[u8]>,
-    verdict: Option<NftRuleVerdict>,
-    element_flags: u32,
+    stored: &NftSetElement,
     meta: SetElementMessageMeta,
 ) -> Result<NetfilterMessage, SystemError> {
     let mut bytes = Vec::new();
@@ -1855,15 +1852,15 @@ pub(super) fn set_elem_message(
     name.push(0);
     append_attr(&mut bytes, SET_ELEM_SET, &name)?;
     let mut key_data = Vec::new();
-    append_attr(&mut key_data, DATA_VALUE, key)?;
+    append_attr(&mut key_data, DATA_VALUE, &stored.key)?;
     let mut element = Vec::new();
     append_attr(&mut element, SET_ELEMENT_KEY, &key_data)?;
-    if let Some(mapped) = value {
+    if let Some(mapped) = stored.value.as_deref() {
         let mut data = Vec::new();
         append_attr(&mut data, DATA_VALUE, mapped)?;
         append_attr(&mut element, SET_ELEMENT_DATA, &data)?;
     }
-    if let Some(verdict) = verdict {
+    if let Some(verdict) = stored.verdict {
         let code = match verdict {
             NftRuleVerdict::Drop => 0,
             NftRuleVerdict::Accept => 1,
@@ -1891,12 +1888,8 @@ pub(super) fn set_elem_message(
         append_attr(&mut data, DATA_VERDICT, &verdict_data)?;
         append_attr(&mut element, SET_ELEMENT_DATA, &data)?;
     }
-    if element_flags != 0 {
-        append_attr(
-            &mut element,
-            SET_ELEMENT_FLAGS,
-            &element_flags.to_be_bytes(),
-        )?;
+    if stored.flags != 0 {
+        append_attr(&mut element, SET_ELEMENT_FLAGS, &stored.flags.to_be_bytes())?;
     }
     let mut elements = Vec::new();
     append_attr(&mut elements, LIST_ELEM, &element)?;
@@ -2605,10 +2598,7 @@ impl SetElementDumpSession {
                     set_elem_message(
                         table,
                         set,
-                        &element.key,
-                        element.value.as_deref(),
-                        element.verdict,
-                        element.flags,
+                        element,
                         SetElementMessageMeta {
                             generation: snapshot.generation,
                             sequence: self.sequence,
@@ -2841,6 +2831,7 @@ impl NftSocketState {
         netns: &Arc<NetNamespace>,
     ) -> Result<GetTableResult, SystemError> {
         let attrs = set_elem_attrs(request)?;
+        let elements = attrs.elements.as_deref().unwrap_or_default();
         let family = request.bytes[HEADER_LEN];
         let table_name = attrs.table.ok_or(SystemError::EINVAL)?;
         let set_name = attrs.set.ok_or(SystemError::EINVAL)?;
@@ -2857,12 +2848,11 @@ impl NftSocketState {
             .ok_or(SystemError::ENOENT)?;
         let sequence = u32::from_ne_bytes(request.bytes[8..12].try_into().unwrap());
         if request.flags() & NLM_F_DUMP == 0 {
-            if attrs.elements.len() != 1 {
+            let [element] = elements else {
                 return Err(SystemError::EINVAL);
-            }
-            let key = attrs.elements[0].key;
+            };
             let index = set
-                .get_element_index(key, attrs.elements[0].flags)
+                .get_element_index(element.key, element.flags)
                 .ok_or(SystemError::ENOENT)?;
             let element = &set.elements[index];
             NetlinkNetfilterProtocol::unicast(
@@ -2870,10 +2860,7 @@ impl NftSocketState {
                 set_elem_message(
                     table,
                     set,
-                    &element.key,
-                    element.value.as_deref(),
-                    element.verdict,
-                    element.flags,
+                    element,
                     SetElementMessageMeta {
                         generation: snapshot.generation,
                         sequence,
@@ -2886,7 +2873,7 @@ impl NftSocketState {
             )?;
             return Ok(GetTableResult::Replied);
         }
-        if !attrs.elements.is_empty() || attrs.set_id.is_some() {
+        if !elements.is_empty() || attrs.set_id.is_some() {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
         let mut slot = self.dump.lock();

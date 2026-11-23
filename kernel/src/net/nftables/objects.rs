@@ -107,6 +107,13 @@ impl NftSet {
                 flags: element.flags,
             });
         }
+        self.clone_with_elements(elements)
+    }
+
+    pub(super) fn clone_with_elements(
+        &self,
+        elements: Vec<NftSetElement>,
+    ) -> Result<Arc<Self>, SystemError> {
         Arc::try_new(Self {
             name: copy_bytes(&self.name)?,
             handle: self.handle,

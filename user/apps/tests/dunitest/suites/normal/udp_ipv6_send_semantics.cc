@@ -6,11 +6,14 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <linux/errqueue.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
@@ -404,15 +407,42 @@ TEST(UdpIpv6SendSemantics, GetaddrinfoNullNodeDoesNotAbort) {
 }
 
 TEST(UdpIpv6SendSemantics, UnreachableNativeIpv6DoesNotPanic) {
-    FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0));
-    ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_DGRAM) failed: " << ErrnoString(errno);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            // Keep the runner's interfaces and IPv6 default routes out of this test.
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard fd(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(fd.Get(), 0) << "socket(AF_INET6, SOCK_DGRAM) failed: " << ErrnoString(errno);
 
-    sockaddr_in6 dst = MakeIpv6Addr("2001:db8::1", 12345);
-    errno = 0;
-    ssize_t ret = sendto(fd.Get(), "test", 4, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+            // Linux needs a usable loopback address to reach the route error.
+            ifreq loopback{};
+            std::strcpy(loopback.ifr_name, "lo");
+            ASSERT_EQ(ioctl(fd.Get(), SIOCGIFFLAGS, &loopback), 0) << ErrnoString(errno);
+            loopback.ifr_flags |= IFF_UP;
+            ASSERT_EQ(ioctl(fd.Get(), SIOCSIFFLAGS, &loopback), 0) << ErrnoString(errno);
 
-    EXPECT_EQ(ret, -1);
-    EXPECT_EQ(errno, ENETUNREACH) << "unexpected errno: " << ErrnoString(errno);
+            sockaddr_in6 dst = MakeIpv6Addr("2001:db8::1", 12345);
+            errno = 0;
+            const ssize_t ret = sendto(fd.Get(), "test", 4, 0,
+                                       reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+            const int error = errno;
+            EXPECT_EQ(ret, -1);
+            EXPECT_EQ(error, ENETUNREACH) << "unexpected errno: " << ErrnoString(error);
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(waited, child);
+    ASSERT_TRUE(WIFEXITED(status)) << "child status: " << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(UdpIpv6SendSemantics, UnspecifiedIpv6DestinationUsesIpv6Loopback) {

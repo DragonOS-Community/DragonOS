@@ -13,7 +13,7 @@ use crate::{
         bridge::BridgeIface,
         types::{InterfaceFlags, InterfaceType},
         veth::VethInterface,
-        Iface,
+        Iface, NetDeivceState, Operstate,
     },
     net::link::{LinkFlagsUpdate, LinkMtuUpdate, LinkMutationCommit, LinkTarget, LinkUpdate},
     net::socket::{
@@ -211,23 +211,27 @@ struct PeerCarrierSnapshot {
     had_carrier: bool,
 }
 
-/// Bridge carrier follows its ports, but the bridge's RTM_NEWLINK is a
+/// Bridge link state follows its ports, but the bridge's RTM_NEWLINK is a
 /// separate notification from the changed veth's notification. Capture the
 /// before-state outside driver locks and publish only an actual transition.
 struct BridgeCarrierSnapshot {
     bridge: Arc<BridgeIface>,
-    had_carrier: bool,
+    state: (bool, Operstate),
 }
 
 impl BridgeCarrierSnapshot {
     fn capture(bridge: Arc<BridgeIface>) -> Self {
-        let had_carrier = !bridge
-            .net_state()
-            .contains(crate::driver::net::NetDeivceState::__LINK_STATE_NOCARRIER);
-        Self {
-            bridge,
-            had_carrier,
-        }
+        let state = Self::state(&bridge);
+        Self { bridge, state }
+    }
+
+    fn state(bridge: &BridgeIface) -> (bool, Operstate) {
+        (
+            !bridge
+                .net_state()
+                .contains(NetDeivceState::__LINK_STATE_NOCARRIER),
+            bridge.operstate(),
+        )
     }
 
     fn related_to(iface: &Arc<dyn Iface>) -> [Option<Self>; 2] {
@@ -245,11 +249,7 @@ impl BridgeCarrierSnapshot {
     }
 
     fn notify_if_changed(self) {
-        let has_carrier = !self
-            .bridge
-            .net_state()
-            .contains(crate::driver::net::NetDeivceState::__LINK_STATE_NOCARRIER);
-        if self.had_carrier != has_carrier {
+        if self.state != Self::state(&self.bridge) {
             let iface: Arc<dyn Iface> = self.bridge;
             notify_link_change(&iface);
         }

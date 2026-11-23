@@ -625,14 +625,16 @@ impl Attribute for AttrOperstate {
             error!("AttrOperstate::show() failed: kobj is not a Iface");
             SystemError::EINVAL
         })?;
-        if !net_device
+        let operstate = if net_device
             .net_state()
             .contains(NetDeivceState::__LINK_STATE_START)
         {
-            net_device.set_operstate(Operstate::IF_OPER_DOWN);
-        }
+            net_device.operstate()
+        } else {
+            Operstate::IF_OPER_DOWN
+        };
 
-        let operstate_str = match net_device.operstate() {
+        let operstate_str = match operstate {
             Operstate::IF_OPER_UP => "up",
             Operstate::IF_OPER_DOWN => "down",
             Operstate::IF_OPER_DORMANT => "dormant",

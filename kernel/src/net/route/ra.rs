@@ -1,12 +1,13 @@
-//! IPv6 default-router advertisements are received in the device poll and
+//! IPv6 Router Advertisements are received in the device poll and
 //! applied by the namespace poller in RTNL process context.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use smoltcp::{
     phy::ChecksumCapabilities,
     wire::{
         ipv6::{AddressExt, HEADER_LEN},
-        Icmpv6Message, Icmpv6Packet, Icmpv6Repr, IpCidr, Ipv6Address, Ipv6Packet, NdiscRepr,
+        Icmpv6Message, Icmpv6Packet, Icmpv6Repr, IpCidr, Ipv6Address, Ipv6Packet, NdiscOption,
+        NdiscOptionRepr, NdiscPrefixInfoFlags, NdiscRepr,
     },
 };
 use system_error::SystemError;
@@ -17,23 +18,29 @@ use crate::{
         address::ipv6_router_solicitation,
         ipv6_defrag::{fragment_offset, DefragDomain},
         rtnl::{self, RtnlGuard},
-        socket::netlink::notify_learned_default,
+        socket::netlink::notify_ra_route,
     },
     process::namespace::net_namespace::NetNamespace,
     time::Instant,
 };
 
 use super::{
+    canonical_cidr,
     fib::{FibEdit, PlannedFibMutation},
-    prepare_with_devices, transact_single, LearnedDefaultRoute, RouteEntry, RouterPreference,
-    RTN_UNICAST, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
+    is_ipv6_link_local, prepare_with_devices, transact_single, FibTable, LearnedDefaultRoute,
+    RaRoute, RouteEntry, RouterPreference, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_UNIVERSE,
+    RT_TABLE_MAIN,
 };
 
 const ROUTER_PROTOCOL: u8 = 9; // RTPROT_RA
 const DEFAULT_ROUTER_METRIC: u32 = 1024;
+const PREFIX_ROUTE_METRIC: u32 = 256;
+const ROUTER_ADVERTISEMENT_HEADER_LEN: usize = 16;
+const MAX_PREFIX_OPTIONS: usize = 256;
+const INFINITE_LIFETIME_US: u64 = u32::MAX as u64 * 1_000_000;
 pub(crate) const ADVERTISEMENT_BATCH: usize = 16;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct Advertisement {
     ifindex: u32,
     device_epoch: u64,
@@ -42,6 +49,14 @@ pub(crate) struct Advertisement {
     gateway: Ipv6Address,
     expires_at_us: i64,
     preference: RouterPreference,
+    withdraw: bool,
+    prefixes: Vec<PrefixAdvertisement>,
+}
+
+#[derive(Debug)]
+struct PrefixAdvertisement {
+    destination: IpCidr,
+    expires_at_us: Option<i64>,
     withdraw: bool,
 }
 
@@ -125,16 +140,48 @@ pub(crate) fn parse(
         _ => RouterPreference::Medium,
     };
     let lifetime_us = router_lifetime.total_micros() as i64;
+    let received_at_us = Instant::now().total_micros();
     Some(Advertisement {
         ifindex,
         device_epoch,
         ra_generation: generation,
         solicitation_generation,
         gateway: ip.src_addr(),
-        expires_at_us: Instant::now().total_micros().saturating_add(lifetime_us),
+        expires_at_us: received_at_us.saturating_add(lifetime_us),
         preference,
         withdraw: lifetime_us == 0,
+        prefixes: on_link_prefixes(&data[ROUTER_ADVERTISEMENT_HEADER_LEN..], received_at_us),
     })
+}
+
+fn on_link_prefixes(mut options: &[u8], received_at_us: i64) -> Vec<PrefixAdvertisement> {
+    let mut prefixes = Vec::new();
+    // The wire parser has already checked the option stream envelope.
+    while let Ok((option, rest)) = NdiscOption::split_first(options) {
+        options = rest;
+        let Ok(NdiscOptionRepr::PrefixInformation(prefix)) = NdiscOptionRepr::parse(&option) else {
+            continue;
+        };
+        if !prefix.flags.contains(NdiscPrefixInfoFlags::ON_LINK)
+            || prefix.prefix_len > 128
+            || prefix.prefix.is_multicast()
+            || is_ipv6_link_local(prefix.prefix.into())
+            || prefix.preferred_lifetime > prefix.valid_lifetime
+        {
+            continue;
+        }
+        if prefixes.len() == MAX_PREFIX_OPTIONS || prefixes.try_reserve(1).is_err() {
+            break;
+        }
+        let lifetime_us = prefix.valid_lifetime.total_micros();
+        prefixes.push(PrefixAdvertisement {
+            destination: canonical_cidr(IpCidr::new(prefix.prefix.into(), prefix.prefix_len)),
+            expires_at_us: (lifetime_us != INFINITE_LIFETIME_US)
+                .then(|| received_at_us.saturating_add(lifetime_us as i64)),
+            withdraw: lifetime_us == 0,
+        });
+    }
+    prefixes
 }
 
 pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
@@ -157,11 +204,53 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
     if let Some(generation) = advertisement.solicitation_generation {
         ipv6_router_solicitation::accept_advertisement(common, generation);
     }
+    let now_us = Instant::now().total_micros();
+    // RTNL serializes allocation of the remaining slots. Count once per
+    // advertisement, and update the allowance only after a committed edit.
+    let mut prefix_slots = if advertisement.prefixes.is_empty() {
+        0
+    } else {
+        netns.router().fib.read().learned_prefix_slots()
+    };
+    for prefix in advertisement.prefixes {
+        if !prefix.withdraw
+            && prefix
+                .expires_at_us
+                .is_some_and(|deadline| deadline <= now_us)
+        {
+            continue;
+        }
+        let route = RouteEntry {
+            destination: prefix.destination,
+            source: None,
+            preferred_source: None,
+            table: RT_TABLE_MAIN,
+            priority: PREFIX_ROUTE_METRIC,
+            tos: 0,
+            protocol: RTPROT_KERNEL,
+            scope: RT_SCOPE_UNIVERSE,
+            kind: RTN_UNICAST,
+            oif: advertisement.ifindex,
+            gateway: None,
+            nexthop_flags: 0,
+            ra_route: Some(RaRoute::OnLinkPrefix {
+                expires_at_us: prefix.expires_at_us,
+            }),
+        };
+        match update(&rtnl, netns, |fib| {
+            fib.plan_learned_prefix(route, prefix.withdraw, prefix_slots > 0)
+        }) {
+            Ok(FibEdit::Insert { .. }) => prefix_slots -= 1,
+            Ok(FibEdit::Delete { .. }) => prefix_slots += 1,
+            Ok(_) => {}
+            Err(error) => log::debug!("could not apply IPv6 on-link prefix: {:?}", error),
+        }
+    }
     if common
         .ip_addrs()
         .iter()
         .any(|cidr| cidr.address() == advertisement.gateway.into())
-        || (!advertisement.withdraw && advertisement.expires_at_us <= Instant::now().total_micros())
+        || (!advertisement.withdraw && advertisement.expires_at_us <= now_us)
     {
         return;
     }
@@ -179,12 +268,14 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
         oif: advertisement.ifindex,
         gateway: Some(advertisement.gateway.into()),
         nexthop_flags: 0,
-        learned_default: Some(LearnedDefaultRoute {
+        ra_route: Some(RaRoute::Default(LearnedDefaultRoute {
             expires_at_us: advertisement.expires_at_us,
             preference: advertisement.preference,
-        }),
+        })),
     };
-    if let Err(error) = update(&rtnl, netns, route, advertisement.withdraw) {
+    if let Err(error) = update(&rtnl, netns, |fib| {
+        fib.plan_learned_default(route, advertisement.withdraw)
+    }) {
         log::debug!("could not apply learned IPv6 default route: {:?}", error);
     }
 }
@@ -192,32 +283,25 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
 fn update(
     rtnl: &RtnlGuard,
     netns: &Arc<NetNamespace>,
-    route: RouteEntry,
-    withdraw: bool,
-) -> Result<(), SystemError> {
-    // RTNL keeps the edit stable while the transaction obtains the device
-    // references and prepares its projection. A rejected or duplicate
-    // advertisement needs neither a device snapshot nor a FIB writer.
-    let edit = netns
-        .router()
-        .fib
-        .read()
-        .plan_learned_default(route, withdraw);
+    plan: impl FnOnce(&FibTable) -> FibEdit,
+) -> Result<FibEdit, SystemError> {
+    // RTNL keeps the edit stable until projection and FIB publication.
+    let edit = plan(&netns.router().fib.read());
     if matches!(edit, FibEdit::None) {
-        return Ok(());
+        return Ok(edit);
     }
     transact_single(rtnl, netns, |_| {
         Ok(PlannedFibMutation { edit, outcome: () })
     })?;
     match edit {
-        FibEdit::Insert { route, .. } => notify_learned_default(netns, route, false, false),
-        FibEdit::Delete { route, .. } => notify_learned_default(netns, route, true, false),
+        FibEdit::Insert { route, .. } => notify_ra_route(netns, route, false, false),
+        FibEdit::Delete { route, .. } => notify_ra_route(netns, route, true, false),
         FibEdit::Replace { old, new, .. } if old.preference() != new.preference() => {
-            notify_learned_default(netns, new, false, true);
+            notify_ra_route(netns, new, false, true);
         }
         _ => {}
     }
-    Ok(())
+    Ok(edit)
 }
 
 pub(crate) fn next_deadline_us(netns: &NetNamespace) -> Option<i64> {
@@ -225,8 +309,8 @@ pub(crate) fn next_deadline_us(netns: &NetNamespace) -> Option<i64> {
         .router()
         .fib
         .read()
-        .learned_defaults()
-        .filter_map(|route| route.learned_default.map(|learned| learned.expires_at_us))
+        .expiring_ra_routes()
+        .filter_map(RouteEntry::expires_at_us)
         .min()
 }
 
@@ -243,7 +327,7 @@ pub(crate) fn set_forwarding(
     if value != 0 {
         let devices = netns.device_list();
         let should_purge = |route: RouteEntry| {
-            route.learned_default.is_some()
+            route.learned_default().is_some()
                 && devices
                     .get(&(route.oif as usize))
                     .is_none_or(|device| device.common().ipv6_accept_ra() != 2)
@@ -272,7 +356,7 @@ pub(crate) fn set_forwarding(
         None => netns.set_ipv6_forwarding(rtnl, value),
     }
     for route in removed {
-        notify_learned_default(netns, route, true, false);
+        notify_ra_route(netns, route, true, false);
     }
     Ok(())
 }
@@ -286,12 +370,20 @@ pub(crate) fn expire(netns: &Arc<NetNamespace>, now_us: i64) -> Option<i64> {
             .router()
             .fib
             .read()
-            .learned_defaults()
+            .expiring_ra_routes()
             .find(|route| !route.is_live_at(now_us));
         let Some(route) = route else {
             break;
         };
-        if update(&rtnl, netns, route, true).is_err() {
+        if update(&rtnl, netns, |fib| {
+            if route.is_ra_prefix() {
+                fib.plan_learned_prefix(route, true, false)
+            } else {
+                fib.plan_learned_default(route, true)
+            }
+        })
+        .is_err()
+        {
             return Some(now_us.saturating_add(10_000));
         }
     }

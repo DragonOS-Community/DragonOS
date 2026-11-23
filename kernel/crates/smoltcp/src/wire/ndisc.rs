@@ -242,9 +242,17 @@ impl<'a> Repr<'a> {
             mut nonce,
         ) = (None, None, None, None, None, None);
 
-        let mut offset = 0;
-        while packet.payload().len() > offset {
-            let pkt = NdiscOption::new_checked(&packet.payload()[offset..])?;
+        let mut options = packet.payload();
+        while !options.is_empty() {
+            let (pkt, rest) = NdiscOption::split_first(options)?;
+            options = rest;
+            // A short PIO has a valid envelope and may be ignored without
+            // losing the other options or a Router Advertisement's header.
+            if packet.msg_type() != Message::RouterAdvert
+                || pkt.option_type() != super::NdiscOptionType::PrefixInformation
+            {
+                pkt.check_len()?;
+            }
 
             // If an option doesn't parse, ignore it and still parse the others.
             if let Ok(opt) = NdiscOptionRepr::parse(&pkt) {
@@ -258,12 +266,6 @@ impl<'a> Repr<'a> {
                     _ => {}
                 }
             }
-
-            let len = pkt.data_len() as usize * 8;
-            if len == 0 {
-                return Err(Error);
-            }
-            offset += len;
         }
 
         match packet.msg_type() {
@@ -554,6 +556,28 @@ mod test {
             .unwrap(),
             create_repr()
         );
+    }
+
+    #[test]
+    fn test_router_advert_skips_short_prefix_option() {
+        let mut bytes = ROUTER_ADVERT_BYTES[..16].to_vec();
+        bytes.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&SOURCE_LINK_LAYER_OPT);
+        let packet = Packet::new_unchecked(bytes.as_slice());
+        assert!(matches!(
+            Repr::parse(&packet),
+            Ok(Repr::RouterAdvert {
+                lladdr: Some(_),
+                prefix_info: None,
+                ..
+            })
+        ));
+
+        // A missing envelope boundary still invalidates the advertisement.
+        for length in [0, 3] {
+            bytes[17] = length;
+            assert!(Repr::parse(&Packet::new_unchecked(bytes.as_slice())).is_err());
+        }
     }
 
     #[test]

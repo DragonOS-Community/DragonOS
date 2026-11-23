@@ -59,7 +59,7 @@ pub(crate) fn register_iface(
                 oif: route.oif,
                 gateway: route.gateway,
                 nexthop_flags: route.nexthop_flags,
-                learned_default: None,
+                ra_route: None,
             };
             validate_entry_on_iface(netns, iface, route)?;
             candidate.insert_derived(route)?;
@@ -344,7 +344,8 @@ impl PreparedAddressRouteCommit {
                 entry.oif == ifindex && !is_ipv4(entry.destination.address())
             })?;
         } else if discard_learned_defaults {
-            editor.remove_where(|entry| entry.oif == ifindex && entry.learned_default.is_some())?;
+            editor
+                .remove_where(|entry| entry.oif == ifindex && entry.learned_default().is_some())?;
         }
         let mut affected_oifs = editor.finish()?;
         let address_removed = if was_up && !is_up {
@@ -639,7 +640,7 @@ fn derived_address_entries_for_link_state(
             oif: iface.nic_id() as u32,
             gateway: None,
             nexthop_flags: 0,
-            learned_default: None,
+            ra_route: None,
         });
     }
     let addresses_with_state = addresses.iter().copied().map(|cidr| (cidr, true)).chain(
@@ -716,7 +717,7 @@ fn entries_for_address(
         oif: iface.nic_id() as u32,
         gateway: None,
         nexthop_flags: 0,
-        learned_default: None,
+        ra_route: None,
     };
     let add_connected = match cidr {
         IpCidr::Ipv4(cidr) => {

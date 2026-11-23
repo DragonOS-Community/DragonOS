@@ -219,6 +219,20 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
     }
 }
 
+impl<'a> NdiscOption<&'a [u8]> {
+    /// Split the first framed option from an option stream. The length field
+    /// must identify a whole nonempty option. Type-specific lengths are
+    /// checked by [`Self::check_len`] or [`Repr::parse`].
+    pub fn split_first(options: &'a [u8]) -> Result<(Self, &'a [u8])> {
+        let length = usize::from(*options.get(field::LENGTH).ok_or(Error)?) * 8;
+        if length == 0 {
+            return Err(Error);
+        }
+        let option = options.get(..length).ok_or(Error)?;
+        Ok((Self::new_unchecked(option), &options[length..]))
+    }
+}
+
 /// Getter methods only relevant for Source/Target Link-layer Address options.
 impl<T: AsRef<[u8]>> NdiscOption<T> {
     /// Return the Source/Target Link-layer Address.
@@ -456,7 +470,7 @@ impl<'a> Repr<'a> {
                 }
             }
             Type::PrefixInformation => {
-                if opt.data_len() == 4 {
+                if opt.data_len() >= 4 {
                     Ok(Repr::PrefixInformation(PrefixInformation {
                         prefix_len: opt.prefix_len(),
                         flags: opt.prefix_flags(),
@@ -757,6 +771,12 @@ mod test {
             Repr::parse(&NdiscOption::new_unchecked(&PREFIX_OPT_BYTES)),
             Ok(repr)
         );
+        let mut extended = [0; 40];
+        extended[..32].copy_from_slice(&PREFIX_OPT_BYTES);
+        extended[1] = 5;
+        let (option, rest) = NdiscOption::split_first(&extended).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(Repr::parse(&option), Ok(repr));
     }
 
     #[test]

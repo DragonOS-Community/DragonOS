@@ -604,7 +604,7 @@ TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDA
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
-TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDefault) {
+TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRoutes) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -648,12 +648,15 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDef
                 AF_PACKET, htons(ETH_P_IPV6), static_cast<int>(send_ifindex),
                 0, 0, ETH_ALEN, {0x33, 0x33, 0, 0, 0, 1},
             };
-            in6_addr router{}, all_nodes{};
+            in6_addr router{}, all_nodes{}, prefix{};
             ASSERT_EQ(inet_pton(AF_INET6, "fe80::1234", &router), 1);
             ASSERT_EQ(inet_pton(AF_INET6, "ff02::1", &all_nodes), 1);
-            const auto advertise = [&](uint16_t lifetime) {
-                constexpr size_t ip_header = 40, ra_length = 16;
-                std::array<uint8_t, ip_header + ra_length> packet{};
+            ASSERT_EQ(inet_pton(AF_INET6, "fd42:2324:47:77::", &prefix), 1);
+            const auto advertise = [&](uint16_t lifetime,
+                                       std::optional<uint32_t> prefix_lifetime = std::nullopt) {
+                constexpr size_t ip_header = 40, ra_header = 16, pio_length = 32;
+                const size_t ra_length = ra_header + (prefix_lifetime ? pio_length : 0);
+                std::vector<uint8_t> packet(ip_header + ra_length);
                 packet[0] = 0x60;
                 packet[5] = ra_length;
                 packet[6] = IPPROTO_ICMPV6;
@@ -664,6 +667,16 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDef
                 packet[ip_header + 5] = 0x08;  // High router preference.
                 packet[ip_header + 6] = lifetime >> 8;
                 packet[ip_header + 7] = lifetime & 0xff;
+                if (prefix_lifetime) {
+                    auto* pio = packet.data() + ip_header + ra_header;
+                    pio[0] = 3;
+                    pio[1] = pio_length / 8;
+                    pio[2] = 64;
+                    pio[3] = 0x80;  // On-link only.
+                    const uint32_t valid = htonl(*prefix_lifetime);
+                    std::memcpy(pio + 4, &valid, sizeof(valid));
+                    std::memcpy(pio + 16, &prefix, sizeof(prefix));
+                }
                 uint32_t sum = ra_length + IPPROTO_ICMPV6;
                 for (size_t offset = 8; offset < packet.size(); offset += 2)
                     sum += (static_cast<uint16_t>(packet[offset]) << 8) | packet[offset + 1];
@@ -675,7 +688,7 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDef
                                  reinterpret_cast<const sockaddr*>(&multicast), sizeof(multicast)),
                           static_cast<ssize_t>(packet.size()));
             };
-            const auto expect_route = [&](uint16_t kind) {
+            const auto expect_route = [&](uint16_t kind, bool on_link = false) {
                 for (int attempt = 0; attempt < 16; ++attempt) {
                     alignas(nlmsghdr) std::array<uint8_t, 4096> bytes{};
                     int remaining = recv(monitor.fd, bytes.data(), bytes.size(), 0);
@@ -685,12 +698,13 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDef
                         if (header->nlmsg_type != kind ||
                             header->nlmsg_len < NLMSG_LENGTH(sizeof(rtmsg))) continue;
                         const auto* body = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
-                        if (body->rtm_family != AF_INET6 || body->rtm_protocol != RTPROT_RA ||
-                            body->rtm_dst_len != 0) continue;
+                        if (body->rtm_family != AF_INET6 ||
+                            body->rtm_protocol != (on_link ? RTPROT_KERNEL : RTPROT_RA) ||
+                            body->rtm_dst_len != (on_link ? 64 : 0)) continue;
                         uint32_t oif = 0, metric = 0;
                         uint8_t preference = 0xff;
                         bool has_cache_info = false;
-                        in6_addr gateway{};
+                        in6_addr gateway{}, destination{};
                         int size = RTM_PAYLOAD(header);
                         for (auto* attr = RTM_RTA(body); RTA_OK(attr, size); attr = RTA_NEXT(attr, size)) {
                             if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) == sizeof(oif))
@@ -705,21 +719,33 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDef
                             }
                             if (attr->rta_type == RTA_GATEWAY && RTA_PAYLOAD(attr) == sizeof(gateway))
                                 std::memcpy(&gateway, RTA_DATA(attr), sizeof(gateway));
+                            if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) == sizeof(destination))
+                                std::memcpy(&destination, RTA_DATA(attr), sizeof(destination));
                         }
-                        if (oif != receive_ifindex || std::memcmp(&gateway, &router, sizeof(router)))
-                            continue;
-                        EXPECT_EQ(metric, 1024u);
-                        EXPECT_EQ(preference, 1u);
+                        if (oif != receive_ifindex) continue;
+                        if (on_link) {
+                            if (std::memcmp(&destination, &prefix, sizeof(prefix))) continue;
+                            EXPECT_TRUE(IN6_IS_ADDR_UNSPECIFIED(&gateway));
+                            EXPECT_EQ(metric, 256u);
+                        } else {
+                            if (std::memcmp(&gateway, &router, sizeof(router))) continue;
+                            EXPECT_EQ(metric, 1024u);
+                            EXPECT_EQ(preference, 1u);
+                        }
                         EXPECT_TRUE(has_cache_info);
                         return;
                     }
                 }
-                FAIL() << "missing learned default route notification " << kind;
+                FAIL() << "missing RA route notification " << kind << " on_link=" << on_link;
             };
             ASSERT_NO_FATAL_FAILURE(advertise(30));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE));
             ASSERT_NO_FATAL_FAILURE(advertise(0));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE));
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 30));
+            ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE, true));
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 0));
+            ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE, true));
             ASSERT_NO_FATAL_FAILURE(advertise(30));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE));
             LinkRequest lower_mtu(RTM_SETLINK, 0, seq++);

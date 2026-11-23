@@ -246,6 +246,12 @@ impl PacketRing {
         reserve: usize,
     ) -> Result<(Self, Arc<PageCache>), SystemError> {
         let pages_per_block = config.block_size / PAGE_SIZE;
+        // Every ring page needs resident backing. Reject an impossible ring
+        // before reserving its block vector, which can itself consume RAM.
+        let ring_pages = pages_per_block * config.block_nr;
+        if ring_pages > crate::mm::balloon::managed_usage().total().data() {
+            return Err(SystemError::ENOMEM);
+        }
         // PageCache::new already returns Arc<PageCache>.
         let page_cache: Arc<PageCache> = PageCache::new_unowned(None, None);
         let mut block_vaddrs = Vec::new();

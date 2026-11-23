@@ -737,6 +737,8 @@ TEST(AfPacketRing, HugeBlockVectorReturnsEnomemWithoutPanic) {
     errno = 0;
     EXPECT_EQ(Configure(fd.Get(), huge), -1);
     EXPECT_EQ(errno, ENOMEM) << Error();
+    ASSERT_EQ(Configure(fd.Get(), Request(page, 1)), 0) << Error();
+    EXPECT_EQ(Teardown(fd.Get()), 0) << Error();
 }
 
 int main(int argc, char** argv) {

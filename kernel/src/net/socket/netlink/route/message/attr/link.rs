@@ -110,6 +110,7 @@ pub enum LinkAttr {
     Promiscuity(u32),
     Allmulti(u32),
     TxqLen(u32),
+    OperState(u8),
     LinkMode(u8),
     ExtMask(RtExtFilter),
     /// Preserve unrecognized input so mutating requests cannot silently succeed.
@@ -133,6 +134,7 @@ impl LinkAttr {
             LinkAttr::Promiscuity(_) => LinkAttrClass::PROMISCUITY,
             LinkAttr::Allmulti(_) => LinkAttrClass::ALLMULTI,
             LinkAttr::TxqLen(_) => LinkAttrClass::TXQLEN,
+            LinkAttr::OperState(_) => LinkAttrClass::OPERSTATE,
             LinkAttr::LinkMode(_) => LinkAttrClass::LINKMODE,
             LinkAttr::ExtMask(_) => LinkAttrClass::EXT_MASK,
             LinkAttr::Unsupported(_, _) => LinkAttrClass::UNSPEC,
@@ -243,9 +245,7 @@ impl Attribute for LinkAttr {
             LinkAttr::TxqLen(txq_len) => unsafe {
                 core::slice::from_raw_parts(txq_len as *const u32 as *const u8, 4)
             },
-            LinkAttr::LinkMode(link_mode) => unsafe {
-                core::slice::from_raw_parts(link_mode as *const u8, 1)
-            },
+            LinkAttr::OperState(value) | LinkAttr::LinkMode(value) => core::slice::from_ref(value),
             LinkAttr::ExtMask(ext_filter) => {
                 const { assert!(size_of::<RtExtFilter>() == 4) };
                 unsafe {
@@ -302,6 +302,7 @@ impl Attribute for LinkAttr {
                 Self::Allmulti(u32::from_ne_bytes(buf.try_into().unwrap()))
             }
             (LinkAttrClass::TXQLEN, 4) => Self::TxqLen(u32::from_ne_bytes(buf.try_into().unwrap())),
+            (LinkAttrClass::OPERSTATE, 1) => Self::OperState(buf[0]),
             (LinkAttrClass::LINKMODE, 1) => Self::LinkMode(buf[0]),
             (LinkAttrClass::EXT_MASK, 4) => {
                 const { assert!(size_of::<RtExtFilter>() == 4) };

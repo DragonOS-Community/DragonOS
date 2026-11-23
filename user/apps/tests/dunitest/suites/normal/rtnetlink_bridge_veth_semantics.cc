@@ -24,6 +24,7 @@
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -114,10 +115,50 @@ struct LinkState {
     uint32_t master = 0;
     uint32_t mtu = 0;
     uint32_t tx_queue_len = 0;
+    std::optional<uint8_t> operstate;
     std::optional<std::array<uint8_t, ETH_ALEN>> mac;
     std::string kind;
     uint16_t linkinfo_type = 0;
 };
+
+std::optional<uint8_t> ReadOperstate(const nlmsghdr* message) {
+    const auto* body = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
+    int bytes = IFLA_PAYLOAD(message);
+    for (auto* attr = IFLA_RTA(body); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
+        if (attr->rta_type == IFLA_OPERSTATE && RTA_PAYLOAD(attr) == sizeof(uint8_t)) {
+            return *static_cast<const uint8_t*>(RTA_DATA(attr));
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<uint8_t> WaitForLinkOperstate(int fd, uint16_t kind, uint32_t index) {
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        const auto remaining_time = deadline - Clock::now();
+        if (remaining_time <= Clock::duration::zero()) return std::nullopt;
+        const auto timeout = std::chrono::ceil<std::chrono::milliseconds>(remaining_time);
+        pollfd ready{fd, POLLIN, 0};
+        const int polled = poll(&ready, 1, static_cast<int>(timeout.count()));
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled <= 0) return std::nullopt;
+
+        std::array<uint8_t, 4096> reply{};
+        const ssize_t count = recv(fd, reply.data(), reply.size(), MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count <= 0) return std::nullopt;
+        int remaining = static_cast<int>(count);
+        for (auto* message = reinterpret_cast<nlmsghdr*>(reply.data());
+             NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
+            if (message->nlmsg_type == NLMSG_DONE) return std::nullopt;
+            if (message->nlmsg_type != kind ||
+                message->nlmsg_len < NLMSG_LENGTH(sizeof(ifinfomsg))) continue;
+            const auto* body = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
+            if (body->ifi_index == static_cast<int>(index)) return ReadOperstate(message);
+        }
+    }
+}
 
 std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t seq) {
     if (send(fd, request.bytes.data(), request.header()->nlmsg_len, 0) < 0) return std::nullopt;
@@ -133,6 +174,7 @@ std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t
             LinkState state;
             state.index = body->ifi_index;
             state.flags = body->ifi_flags;
+            state.operstate = ReadOperstate(message);
             int bytes = IFLA_PAYLOAD(message);
             for (auto* attr = IFLA_RTA(body); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
                 if (attr->rta_type == IFLA_ADDRESS && RTA_PAYLOAD(attr) == ETH_ALEN) {
@@ -238,7 +280,8 @@ bool SawBridgeCarrierEvent(int fd, uint32_t index, bool carrier) {
                 message->nlmsg_len < NLMSG_LENGTH(sizeof(ifinfomsg))) continue;
             const auto* body = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
             if (body->ifi_index == static_cast<int>(index) &&
-                static_cast<bool>(body->ifi_flags & IFF_LOWER_UP) == carrier) return true;
+                static_cast<bool>(body->ifi_flags & IFF_LOWER_UP) == carrier &&
+                ReadOperstate(message) == (carrier ? IF_OPER_UP : IF_OPER_DOWN)) return true;
         }
     }
     return false;
@@ -1183,8 +1226,12 @@ TEST(RtnetlinkBridgeVethSemantics, BridgeCarrierChangesNotifyLinkSubscribers) {
     const auto initial_link = QueryLinkByIndex(route.fd, bridge_index, 4537);
     ASSERT_TRUE(initial_link.has_value());
     EXPECT_NE(initial_link->flags & IFF_LOWER_UP, 0u);
+    EXPECT_EQ(initial_link->operstate, IF_OPER_UNKNOWN);
     ASSERT_EQ(SetLinkUp(route.fd, bridge_index, false, 4562), 0);
     EXPECT_EQ(ReadBridgeOperstate(bridge), "down\n");
+    const auto down_link = QueryLinkByIndex(route.fd, bridge_index, 4564);
+    ASSERT_TRUE(down_link.has_value());
+    EXPECT_EQ(down_link->operstate, IF_OPER_DOWN);
     ASSERT_EQ(SetLinkUp(route.fd, bridge_index, true, 4538), 0);
     EXPECT_EQ(ReadBridgeOperstate(bridge), "unknown\n");
     ASSERT_EQ(SetLinkUp(route.fd, host_index, true, 4533), 0);
@@ -1194,6 +1241,16 @@ TEST(RtnetlinkBridgeVethSemantics, BridgeCarrierChangesNotifyLinkSubscribers) {
     ASSERT_EQ(SetLinkMaster(route.fd, host_index, bridge_index, 4535), 0);
     EXPECT_TRUE(SawBridgeCarrierEvent(monitor.fd, bridge_index, true));
     EXPECT_EQ(WaitForBridgeOperstate(bridge, "up\n"), "up\n");
+    const auto up_link = QueryLinkByIndex(route.fd, bridge_index, 4565);
+    ASSERT_TRUE(up_link.has_value());
+    EXPECT_EQ(up_link->operstate, IF_OPER_UP);
+    RouteFd dump;
+    ASSERT_GE(dump.fd, 0);
+    LinkRequest dump_links(RTM_GETLINK, NLM_F_DUMP, 4566);
+    dump_links.header()->nlmsg_flags &= ~NLM_F_ACK;
+    ASSERT_EQ(send(dump.fd, dump_links.bytes.data(), dump_links.header()->nlmsg_len, 0),
+              static_cast<ssize_t>(dump_links.header()->nlmsg_len));
+    EXPECT_EQ(WaitForLinkOperstate(dump.fd, RTM_NEWLINK, bridge_index), IF_OPER_UP);
 
     ASSERT_EQ(SetLinkUp(route.fd, peer_index, false, 4536), 0);
     EXPECT_TRUE(SawBridgeCarrierEvent(monitor.fd, bridge_index, false));
@@ -1208,6 +1265,19 @@ TEST(RtnetlinkBridgeVethSemantics, BridgeCarrierChangesNotifyLinkSubscribers) {
     ASSERT_EQ(SetLinkUp(route.fd, bridge_index, false, 4560), 0);
     ASSERT_EQ(SetLinkUp(route.fd, bridge_index, true, 4561), 0);
     EXPECT_EQ(ReadBridgeOperstate(bridge), "down\n");
+
+    struct utsname uts {};
+    if (uname(&uts) == 0 && std::strstr(uts.release, "dragonos") != nullptr) {
+        LinkRequest set_operstate(RTM_SETLINK, 0, 4567);
+        set_operstate.body()->ifi_index = bridge_index;
+        const uint8_t requested = IF_OPER_UP;
+        ASSERT_TRUE(set_operstate.add(IFLA_OPERSTATE, &requested, sizeof(requested)));
+        EXPECT_EQ(SendAck(route.fd, set_operstate), EOPNOTSUPP);
+    }
+    RouteFd deletion(RTMGRP_LINK);
+    ASSERT_GE(deletion.fd, 0);
+    ASSERT_EQ(DeleteByName(route.fd, host, 4568), 0);
+    EXPECT_EQ(WaitForLinkOperstate(deletion.fd, RTM_DELLINK, host_index), IF_OPER_DOWN);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, BridgeMacChangeRecomputesInitialCarrier) {
@@ -1325,6 +1395,7 @@ std::optional<uint8_t> ReadBridgePortMode(int fd, uint32_t index, uint32_t maste
                 }
             }
             EXPECT_EQ(reported_master, master);
+            EXPECT_EQ(ReadOperstate(message), IF_OPER_DOWN);
             if (!dump) return mode;
         }
     }

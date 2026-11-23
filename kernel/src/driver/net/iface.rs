@@ -745,6 +745,18 @@ pub trait Iface: crate::driver::base::device::Device {
         self.project_user_visible_flags(self.common().configured_flags())
     }
 
+    /// Linux reports a non-running device as operationally down.
+    fn user_visible_operstate(&self) -> Operstate {
+        if self
+            .net_state()
+            .contains(NetDeivceState::__LINK_STATE_START)
+        {
+            self.operstate()
+        } else {
+            Operstate::IF_OPER_DOWN
+        }
+    }
+
     /// Project one configured-flags snapshot into the Linux userspace view.
     fn project_user_visible_flags(&self, mut flags: InterfaceFlags) -> InterfaceFlags {
         flags.remove(InterfaceFlags::RUNNING | InterfaceFlags::LOWER_UP | InterfaceFlags::DORMANT);

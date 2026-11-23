@@ -267,6 +267,10 @@ impl NftRule {
                     RuleResult::Continue => {}
                     other => return other,
                 },
+                NftExpression::XtIcmp6(icmp) => match icmp.evaluate(packet) {
+                    RuleResult::Continue => {}
+                    other => return other,
+                },
                 NftExpression::XtAddrtype(matcher) => match matcher.evaluate(context) {
                     Some(true) => {}
                     Some(false) => return RuleResult::Break,
@@ -799,6 +803,7 @@ pub(crate) enum NftExpressionInput<'a> {
     },
     XtTcp(&'a [u8]),
     XtUdp(&'a [u8]),
+    XtIcmp6(&'a [u8]),
     XtAddrtype(&'a [u8]),
     XtConntrack {
         revision: u32,
@@ -918,6 +923,7 @@ pub(crate) enum NftExpression {
     },
     XtTcp(NftXtTcp),
     XtUdp(NftXtUdp),
+    XtIcmp6(NftXtIcmp6),
     XtAddrtype(NftXtAddrtype),
     XtConntrack(NftXtConntrack),
     CtState {
@@ -1402,6 +1408,104 @@ impl NftXtUdp {
             }
         }
         RuleResult::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NftXtIcmp6 {
+    kind: u8,
+    codes: [u8; 2],
+    invert: bool,
+}
+
+impl NftXtIcmp6 {
+    pub(super) fn from_info(info: &[u8]) -> Result<Self, SystemError> {
+        // ip6t_icmp is four bytes; the match data is aligned to eight.
+        if !(4..=8).contains(&info.len()) || info[3] & !1 != 0 {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(Self {
+            kind: info[0],
+            codes: [info[1], info[2]],
+            invert: info[3] != 0,
+        })
+    }
+
+    pub(crate) fn info(&self) -> [u8; 8] {
+        let [min, max] = self.codes;
+        [self.kind, min, max, u8::from(self.invert), 0, 0, 0, 0]
+    }
+
+    fn evaluate(&self, packet: &[u8]) -> RuleResult {
+        let Some((58, offset, false)) = ipv6_transport_info(packet) else {
+            return RuleResult::Break;
+        };
+        let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+        let Some(icmp) = packet[offset..40 + payload_len].get(..8) else {
+            return RuleResult::Verdict(NftRuleVerdict::Drop);
+        };
+        let [min, max] = self.codes;
+        if (icmp[0] == self.kind && (min..=max).contains(&icmp[1])) ^ self.invert {
+            RuleResult::Continue
+        } else {
+            RuleResult::Break
+        }
+    }
+}
+
+#[cfg(test)]
+mod xt_icmp6_tests {
+    use super::*;
+
+    #[test]
+    fn checks_type_code_and_inversion() {
+        let matcher = NftXtIcmp6::from_info(&[134, 1, 2, 0]).unwrap();
+        let inverse = NftXtIcmp6::from_info(&[134, 1, 2, 1]).unwrap();
+        let mut packet = [0; 48];
+        packet[0] = 0x60;
+        packet[5] = 8;
+        packet[6] = 58;
+        packet[40] = 134;
+        for code in [0, 1, 2, 3] {
+            packet[41] = code;
+            let matches = matches!(code, 1 | 2);
+            assert_eq!(
+                matches!(matcher.evaluate(&packet), RuleResult::Continue),
+                matches
+            );
+            assert_eq!(
+                matches!(inverse.evaluate(&packet), RuleResult::Continue),
+                !matches
+            );
+        }
+        packet[40] = 135;
+        packet[41] = 1;
+        assert!(matches!(matcher.evaluate(&packet), RuleResult::Break));
+        assert!(matches!(inverse.evaluate(&packet), RuleResult::Continue));
+    }
+
+    #[test]
+    fn only_inspects_the_fixed_header_of_the_first_fragment() {
+        let matcher = NftXtIcmp6::from_info(&[134, 0, 0, 0]).unwrap();
+        let mut packet = [0; 56];
+        packet[0] = 0x60;
+        packet[5] = 16;
+        packet[6] = 44;
+        packet[40] = 58;
+        packet[48] = 134;
+
+        assert!(matches!(matcher.evaluate(&packet), RuleResult::Continue));
+        packet[43] = 1;
+        assert!(matches!(matcher.evaluate(&packet), RuleResult::Continue));
+        packet[43] = 8;
+        assert!(matches!(matcher.evaluate(&packet), RuleResult::Break));
+
+        packet[43] = 0;
+        packet[5] = 15;
+        assert!(matches!(
+            matcher.evaluate(&packet),
+            RuleResult::Verdict(NftRuleVerdict::Drop)
+        ));
     }
 }
 

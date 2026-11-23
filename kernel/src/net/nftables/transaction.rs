@@ -941,6 +941,10 @@ impl NftTransaction<'_> {
                     NftExpression::XtUdp(NftXtUdp::from_info(info)?)
                 }
                 NftExpressionInput::XtUdp(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+                NftExpressionInput::XtIcmp6(info) if family == 10 => {
+                    NftExpression::XtIcmp6(NftXtIcmp6::from_info(info)?)
+                }
+                NftExpressionInput::XtIcmp6(_) => return Err(SystemError::ENOENT),
                 NftExpressionInput::XtAddrtype(info) => {
                     if !matches!(family, 2 | 10) {
                         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);

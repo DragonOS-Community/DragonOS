@@ -43,7 +43,7 @@ pub(crate) use rule::{
     NftAddressField, NftBitwiseOperation, NftByteorderOp, NftCmpOp, NftCounter, NftExpression,
     NftExpressionInput, NftMetaKey, NftNatAction, NftNatEvent, NftNatProgress, NftPayloadBase,
     NftRangeOp, NftRule, NftRuleInput, NftRuleVerdict, NftVerdict, NftXtAddrtype, NftXtConntrack,
-    NftXtTcp, NftXtUdp,
+    NftXtIcmp6, NftXtTcp, NftXtUdp,
 };
 pub(crate) use transaction::{NewRuleSpec, NewSetSpec, NftNamespaceState};
 

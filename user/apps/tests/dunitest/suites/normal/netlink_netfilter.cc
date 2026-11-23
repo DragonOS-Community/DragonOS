@@ -1163,6 +1163,7 @@ struct RuleInfo {
   bool valid_bitwise_dump = true;
   std::vector<uint32_t> meta_keys;
   bool valid_meta_dump = true;
+  std::vector<uint8_t> icmp6_match_info;
   uint16_t generation = 0;
   std::optional<std::vector<uint8_t>> userdata = std::nullopt;
 };
@@ -1252,6 +1253,17 @@ void ReadRuleExpressions(const nlmsghdr* message, RuleInfo* rule) {
         rule->valid_meta_dump &= key.length == 4 && dreg.length == 4 &&
                                  Be32(dreg) == NFT_REG_1;
         rule->meta_keys.push_back(Be32(key));
+      } else if (name.length == sizeof("match") &&
+                 std::memcmp(name.data, "match", name.length) == 0) {
+        auto data = FindNla(element, NFTA_EXPR_DATA);
+        auto match_name = FindNla(data, NFTA_MATCH_NAME);
+        auto revision = FindNla(data, NFTA_MATCH_REV);
+        auto info = FindNla(data, NFTA_MATCH_INFO);
+        if (match_name.length == sizeof("icmp6") &&
+            std::memcmp(match_name.data, "icmp6", match_name.length) == 0 &&
+            revision.length == 4 && Be32(revision) == 0 && info.length != 0) {
+          rule->icmp6_match_info.assign(info.data, info.data + info.length);
+        }
       }
     }
     offset += NLA_ALIGN(attr.nla_len);
@@ -4565,7 +4577,7 @@ TEST(NetlinkNetfilter, NativeRuleAcceptsIptablesCompatMetadata) {
   }
 }
 
-static void CheckNftCompatTcpRevision(uint8_t family) {
+static void CheckNftCompatMatchRevision(uint8_t family, const char* match_name) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   ASSERT_GE(nft.get(), 0);
@@ -4576,7 +4588,7 @@ static void CheckNftCompatTcpRevision(uint8_t family) {
   std::memcpy(&header, query.data(), sizeof(header));
   header.nlmsg_flags &= ~NLM_F_ACK;
   std::memcpy(query.data(), &header, sizeof(header));
-  AppendAttr(&query, NFTA_COMPAT_NAME, "tcp");
+  AppendAttr(&query, NFTA_COMPAT_NAME, match_name);
   AppendBe32(&query, NFTA_COMPAT_REV, 0);
   AppendBe32(&query, NFTA_COMPAT_TYPE, 0);  // Match, not target.
   ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
@@ -4595,21 +4607,21 @@ static void CheckNftCompatTcpRevision(uint8_t family) {
   const auto name = FindNla(attrs, NFTA_COMPAT_NAME);
   const auto revision = FindNla(attrs, NFTA_COMPAT_REV);
   const auto type = FindNla(attrs, NFTA_COMPAT_TYPE);
-  ASSERT_EQ(sizeof("tcp"), name.length);
-  EXPECT_EQ(0, std::memcmp(name.data, "tcp", name.length));
+  ASSERT_EQ(std::strlen(match_name) + 1, name.length);
+  EXPECT_EQ(0, std::memcmp(name.data, match_name, name.length));
   EXPECT_EQ(0u, Be32(revision));
   EXPECT_EQ(0u, Be32(type));
 
   auto missing_type = Request(kNftCompatGet, seq + 1);
   missing_type[NLMSG_HDRLEN] = family;
-  AppendAttr(&missing_type, NFTA_COMPAT_NAME, "tcp");
+  AppendAttr(&missing_type, NFTA_COMPAT_NAME, match_name);
   AppendBe32(&missing_type, NFTA_COMPAT_REV, 0);
   ASSERT_EQ(static_cast<ssize_t>(missing_type.size()), Send(nft.get(), missing_type));
   Ack(nft.get(), seq + 1, EINVAL, kNftCompatGet);
 
   auto wrong_family = Request(kNftCompatGet, seq + 2);
   wrong_family[NLMSG_HDRLEN] = NFPROTO_UNSPEC;
-  AppendAttr(&wrong_family, NFTA_COMPAT_NAME, "tcp");
+  AppendAttr(&wrong_family, NFTA_COMPAT_NAME, match_name);
   AppendBe32(&wrong_family, NFTA_COMPAT_REV, 0);
   AppendBe32(&wrong_family, NFTA_COMPAT_TYPE, 0);
   ASSERT_EQ(static_cast<ssize_t>(wrong_family.size()), Send(nft.get(), wrong_family));
@@ -4617,11 +4629,31 @@ static void CheckNftCompatTcpRevision(uint8_t family) {
 }
 
 TEST(NetlinkNetfilter, NftCompatTcpMatchRevisionQuery) {
-  CheckNftCompatTcpRevision(NFPROTO_IPV4);
+  CheckNftCompatMatchRevision(NFPROTO_IPV4, "tcp");
 }
 
 TEST(NetlinkNetfilter, NftCompatIpv6TcpMatchRevisionQuery) {
-  CheckNftCompatTcpRevision(NFPROTO_IPV6);
+  CheckNftCompatMatchRevision(NFPROTO_IPV6, "tcp");
+}
+
+TEST(NetlinkNetfilter, NftCompatIcmp6MatchRevisionQuery) {
+  CheckNftCompatMatchRevision(NFPROTO_IPV6, "icmp6");
+
+  Fd nft(Open());
+  ASSERT_GE(nft.get(), 0);
+  const auto reject = [&](uint32_t seq, uint8_t family, uint32_t revision,
+                          uint32_t type, int error) {
+    auto query = Request(kNftCompatGet, seq);
+    query[NLMSG_HDRLEN] = family;
+    AppendAttr(&query, NFTA_COMPAT_NAME, "icmp6");
+    AppendBe32(&query, NFTA_COMPAT_REV, revision);
+    AppendBe32(&query, NFTA_COMPAT_TYPE, type);
+    ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+    Ack(nft.get(), seq, error, kNftCompatGet);
+  };
+  reject(929, NFPROTO_IPV6, 1, 0, EPROTONOSUPPORT);
+  reject(930, NFPROTO_IPV4, 0, 0, ENOENT);
+  reject(931, NFPROTO_IPV6, 0, 1, ENOENT);
 }
 
 static void CheckNftCompatLocalAddrtype(bool source) {
@@ -5139,10 +5171,12 @@ TEST(NetlinkNetfilter, NftCompatIpv6TcpMatchFiltersAndDumps) {
   CheckNftCompatTcpMatchFiltersAndDumps(AF_INET6);
 }
 
-static void CheckMalformedTransportMatch(bool is_udp) {
+static void CheckMalformedTransportMatch(uint32_t protocol, uint8_t family) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   ASSERT_GE(nft.get(), 0);
+  const char* match_name = protocol == IPPROTO_TCP ? "tcp" :
+                           protocol == IPPROTO_UDP ? "udp" : "icmp6";
   enum class BadMatch {
     ShortInfo, LongInfo, WrongProtocol, MissingFlags, InvalidInverse,
     MissingName, MissingRevision, MissingInfo, UnknownName,
@@ -5159,16 +5193,27 @@ static void CheckMalformedTransportMatch(bool is_udp) {
     udp.spts[1] = UINT16_MAX;
     udp.dpts[1] = UINT16_MAX;
     udp.invflags = issue == BadMatch::InvalidInverse ? 0x80 : 0;
-    const size_t structure_size = is_udp ? sizeof(udp) : sizeof(tcp);
+    const std::array<uint8_t, 4> icmp6{
+        134, 0, UINT8_MAX, static_cast<uint8_t>(issue == BadMatch::InvalidInverse ? 0x80 : 0)};
+    const void* structure = &tcp;
+    size_t structure_size = sizeof(tcp);
+    size_t aligned_size = 16;
+    if (protocol == IPPROTO_UDP) {
+      structure = &udp;
+      structure_size = sizeof(udp);
+    } else if (protocol == IPPROTO_ICMPV6) {
+      structure = icmp6.data();
+      structure_size = icmp6.size();
+      aligned_size = 8;
+    }
     const size_t info_length = issue == BadMatch::ShortInfo ? structure_size - 1 :
-                               issue == BadMatch::LongInfo ? 17 : structure_size;
+                               issue == BadMatch::LongInfo ? aligned_size + 1 : structure_size;
     std::vector<uint8_t> info(info_length, 0);
-    const void* structure = is_udp ? static_cast<const void*>(&udp) : &tcp;
     std::memcpy(info.data(), structure, std::min(info_length, structure_size));
     std::vector<uint8_t> match;
     if (issue != BadMatch::MissingName) {
       const char* name = issue == BadMatch::UnknownName ? "no_such_xt" :
-                         is_udp ? "udp" : "tcp";
+                         match_name;
       AppendNla(&match, NFTA_MATCH_NAME,
                 reinterpret_cast<const uint8_t*>(name), std::strlen(name) + 1);
     }
@@ -5182,11 +5227,10 @@ static void CheckMalformedTransportMatch(bool is_udp) {
       AppendNla(&match, NFTA_MATCH_INFO, info.data(), info.size());
     std::vector<uint8_t> expressions;
     AppendExpr(&expressions, "match", match);
-    auto rule = RuleWithExpressions(seq + 3, table.c_str(), "input", expressions);
+    auto rule = RuleWithExpressions(seq + 3, table.c_str(), "input", expressions, family);
     std::vector<uint8_t> compat;
-    const int protocol = is_udp ? IPPROTO_UDP : IPPROTO_TCP;
     const uint32_t be_protocol = htonl(issue == BadMatch::WrongProtocol ?
-                                        (is_udp ? IPPROTO_TCP : IPPROTO_UDP) : protocol);
+                                        (protocol == IPPROTO_TCP ? IPPROTO_UDP : IPPROTO_TCP) : protocol);
     AppendNla(&compat, NFTA_RULE_COMPAT_PROTO,
               reinterpret_cast<const uint8_t*>(&be_protocol), sizeof(be_protocol));
     if (issue != BadMatch::MissingFlags) {
@@ -5197,10 +5241,10 @@ static void CheckMalformedTransportMatch(bool is_udp) {
     AppendRawAttr(&rule, NFTA_RULE_COMPAT | NLA_F_NESTED,
                   compat.data(), compat.size());
 
-    auto batch = TableBatch(kNftNewtable, seq, table.c_str());
+    auto batch = TableBatch(kNftNewtable, seq, table.c_str(), family);
     batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
     auto chain = NewChain(seq + 2, table.c_str(), "input", true, NF_ACCEPT,
-                          NF_INET_LOCAL_IN);
+                          NF_INET_LOCAL_IN, family);
     batch.insert(batch.end(), chain.begin(), chain.end());
     batch.insert(batch.end(), rule.begin(), rule.end());
     auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
@@ -5211,7 +5255,7 @@ static void CheckMalformedTransportMatch(bool is_udp) {
     Ack(nft.get(), seq + 3, expected_error, kNftNewrule);
 
     auto query = Request(kNftGettable, seq + 5);
-    query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    query[NLMSG_HDRLEN] = family;
     AppendAttr(&query, NFTA_TABLE_NAME, table.c_str());
     ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
     Ack(nft.get(), seq + 5, ENOENT, kNftGettable);
@@ -5231,11 +5275,72 @@ static void CheckMalformedTransportMatch(bool is_udp) {
 }
 
 TEST(NetlinkNetfilter, NftCompatTcpMatchRejectsMalformedInfoAndProtocol) {
-  CheckMalformedTransportMatch(false);
+  CheckMalformedTransportMatch(IPPROTO_TCP, NFPROTO_IPV4);
 }
 
 TEST(NetlinkNetfilter, NftCompatUdpMatchRejectsMalformedInfoAndProtocol) {
-  CheckMalformedTransportMatch(true);
+  CheckMalformedTransportMatch(IPPROTO_UDP, NFPROTO_IPV4);
+}
+
+TEST(NetlinkNetfilter, NftCompatIcmp6MatchRejectsMalformedInfoAndProtocol) {
+  CheckMalformedTransportMatch(IPPROTO_ICMPV6, NFPROTO_IPV6);
+}
+
+TEST(NetlinkNetfilter, NftCompatIcmp6MatchDumpsAlignedInfo) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  Fd nft(Open());
+  ASSERT_GE(nft.get(), 0);
+  constexpr uint32_t seq = 1080;
+  constexpr uint8_t family = NFPROTO_IPV6;
+  const std::string table = "dkc_icmp6_" + std::to_string(getpid());
+  const std::array<uint8_t, 8> input{134, 1, 3, 1, 0xff, 0xff, 0xff, 0xff};
+  std::vector<uint8_t> match;
+  AppendNla(&match, NFTA_MATCH_NAME,
+            reinterpret_cast<const uint8_t*>("icmp6"), sizeof("icmp6"));
+  const uint32_t revision = 0;
+  AppendNla(&match, NFTA_MATCH_REV, reinterpret_cast<const uint8_t*>(&revision), 4);
+  AppendNla(&match, NFTA_MATCH_INFO, input.data(), input.size());
+  std::vector<uint8_t> expressions;
+  AppendExpr(&expressions, "match", match);
+  AppendExpr(&expressions, "counter", {});
+  auto rule = RuleWithExpressions(seq + 3, table.c_str(), "match", expressions, family);
+  std::vector<uint8_t> compat;
+  const uint32_t protocol = htonl(IPPROTO_ICMPV6), flags = 0;
+  AppendNla(&compat, NFTA_RULE_COMPAT_PROTO, reinterpret_cast<const uint8_t*>(&protocol), 4);
+  AppendNla(&compat, NFTA_RULE_COMPAT_FLAGS, reinterpret_cast<const uint8_t*>(&flags), 4);
+  AppendRawAttr(&rule, NFTA_RULE_COMPAT | NLA_F_NESTED, compat.data(), compat.size());
+  auto batch = TableBatch(kNftNewtable, seq, table.c_str(), family);
+  batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+  auto chain = NewChain(seq + 2, table.c_str(), "match", false, NF_ACCEPT,
+                        NF_INET_LOCAL_IN, family);
+  auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
+  for (const auto* message : {&chain, &rule, &end})
+    batch.insert(batch.end(), message->begin(), message->end());
+  ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
+  Ack(nft.get(), seq + 1, 0, kNftNewtable);
+  Ack(nft.get(), seq + 2, 0, kNftNewchain);
+  Ack(nft.get(), seq + 3, 0, kNftNewrule);
+
+  auto dump = Request(kNftGetrule, seq + 5);
+  dump[NLMSG_HDRLEN] = family;
+  auto* header = reinterpret_cast<nlmsghdr*>(dump.data());
+  header->nlmsg_flags |= NLM_F_DUMP;
+  AppendAttr(&dump, NFTA_RULE_TABLE, table.c_str());
+  AppendAttr(&dump, NFTA_RULE_CHAIN, "match");
+  if (Send(nft.get(), dump) == static_cast<ssize_t>(dump.size())) {
+    const auto rules = ReceiveRuleDump(nft.get(), seq + 5);
+    EXPECT_EQ(1u, rules.size());
+    if (rules.size() == 1) {
+      const std::vector<uint8_t> expected{134, 1, 3, 1, 0, 0, 0, 0};
+      EXPECT_EQ(expected, rules[0].icmp6_match_info);
+    }
+  } else {
+    ADD_FAILURE() << "could not send rule dump request";
+  }
+
+  auto remove = TableBatch(kNftDeltable, seq + 6, table.c_str(), family);
+  ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
+  Ack(nft.get(), seq + 7, 0, kNftDeltable);
 }
 
 TEST(NetlinkNetfilter, NftCompatUdpMatchDnatProgramsInsideChildNetns) {

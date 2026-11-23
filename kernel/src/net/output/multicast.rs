@@ -4,22 +4,23 @@
 use super::*;
 use crate::driver::net::local_output::{ipv6_fragment, ipv6_fragment_boundary};
 
-fn post_clone(ct: &LocalOutputCt<'_>, bytes: &mut [u8], oifname: [u8; 16]) -> bool {
+fn post_clone(ct: &LocalOutputCt<'_>, bytes: &mut [u8], oifname: [u8; 16], oif: u32) -> bool {
     let router = ct.netns.router();
     let routes = ct
         .ruleset
-        .ipv6_hook_requires_local_destination(NftIpv4Hook::PostRouting)
+        .ipv6_hook_requires_route_lookup(NftIpv4Hook::PostRouting)
         .then(|| super::super::route::lock_output_routes(&router, ct.netns.device_list()));
-    let is_local = |address: Ipv6Address| {
-        routes.as_ref().is_some_and(|routes| {
-            routes
-                .lookup(IpAddress::Ipv6(address), None)
-                .is_some_and(|route| route.kind == RTN_LOCAL)
-        })
+    let resolve = |address, device| {
+        routes
+            .as_ref()
+            .map_or(super::super::route::RTN_UNREACHABLE, |routes| {
+                routes.ipv6_addr_type(address, device)
+            })
     };
-    let lookup = routes
-        .as_ref()
-        .map(|_| &is_local as &dyn Fn(Ipv6Address) -> bool);
+    let lookup = routes.as_ref().map(|_| NftIpv6RouteLookup {
+        resolve: &resolve,
+        device: Some(oif),
+    });
     if !ct
         .ruleset
         .hook_may_nat(IpVersion::Ipv6, NftIpv4Hook::PostRouting)
@@ -29,7 +30,7 @@ fn post_clone(ct: &LocalOutputCt<'_>, bytes: &mut [u8], oifname: [u8; 16]) -> bo
     let mut packet =
         NftNatPacket::new_ipv6(bytes, &ct.context, [0; 16], oifname).with_mark(&ct.mark);
     if let Some(lookup) = lookup {
-        packet = packet.with_ipv6_local_destination(lookup);
+        packet = packet.with_ipv6_route_lookup(lookup);
     }
     // Linux retains IPS_SRC_NAT_DONE on the clone. The original has already
     // rewritten these bytes; running its source rewrite again would reject
@@ -56,7 +57,7 @@ fn deliver_clone(
     oifname: [u8; 16],
 ) {
     let clone_ct = ct.fork();
-    if !post_clone(&clone_ct, &mut frame, oifname) {
+    if !post_clone(&clone_ct, &mut frame, oifname, route.oif) {
         return;
     }
     let mark = clone_ct.mark();

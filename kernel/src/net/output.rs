@@ -7,7 +7,7 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::cell::{Cell, RefCell};
 
-use smoltcp::wire::{IpAddress, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet};
+use smoltcp::wire::{IpAddress, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Packet};
 use system_error::SystemError;
 
 use crate::{
@@ -24,8 +24,8 @@ use super::{
         CtDirection, CtMatch, CtNatRequest, CtPacketContext, CtPacketState, NatManipSide,
     },
     nftables::{
-        NftIpv4Hook, NftNatAction, NftNatEvent, NftNatPacket, NftNatProgress, NftPacket,
-        RulesetSnapshot,
+        NftIpv4Hook, NftIpv6RouteLookup, NftNatAction, NftNatEvent, NftNatPacket, NftNatProgress,
+        NftPacket, RulesetSnapshot,
     },
     route::{OutputRouteDecision, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST},
 };
@@ -37,6 +37,14 @@ pub(crate) use pmtu::{
     submit_prepared_ipv4_raw, submit_prepared_ipv4_with_pmtu, submit_prepared_ipv6_raw,
     submit_prepared_ipv6_with_pmtu, PmtuOutputError, RawOutputPolicy, SocketRouteHint,
 };
+
+fn hook_oifindex(route: OutputRouteDecision) -> u32 {
+    if route.kind == RTN_LOCAL {
+        crate::net::LOOPBACK_IFINDEX as u32
+    } else {
+        route.oif
+    }
+}
 
 fn hook_oifname(
     netns: &NetNamespace,
@@ -52,14 +60,9 @@ fn hook_oifname(
     if !needed {
         return Ok([0; 16]);
     }
-    let hook_oif = if route.kind == RTN_LOCAL {
-        crate::net::LOOPBACK_IFINDEX
-    } else {
-        route.oif as usize
-    };
     let device = netns
         .device_list()
-        .get(&hook_oif)
+        .get(&(hook_oifindex(route) as usize))
         .cloned()
         .ok_or(SystemError::ENETUNREACH)?;
     let mut name = [0; 16];
@@ -334,11 +337,11 @@ impl<'a> LocalOutputCt<'a> {
         hook: NftIpv4Hook,
         bytes: &mut [u8],
         oifname: [u8; 16],
-        local_destination: Option<&dyn Fn(Ipv6Address) -> bool>,
+        route_lookup: Option<NftIpv6RouteLookup<'_>>,
         masquerade: Option<(CtAddress, u32)>,
     ) -> Result<bool, SystemError> {
         if !self.ruleset.hook_may_nat(IpVersion::Ipv6, hook) {
-            return Ok(self.allows_ipv6(hook, bytes, oifname, local_destination));
+            return Ok(self.allows_ipv6(hook, bytes, oifname, route_lookup));
         }
         let mut applied = false;
         let mut current_side = None;
@@ -353,8 +356,8 @@ impl<'a> LocalOutputCt<'a> {
         if hook == NftIpv4Hook::LocalOut {
             packet = packet.with_redirect_address(&redirect);
         }
-        if let Some(lookup) = local_destination {
-            packet = packet.with_ipv6_local_destination(lookup);
+        if let Some(lookup) = route_lookup {
+            packet = packet.with_ipv6_route_lookup(lookup);
         }
         self.ruleset.evaluate_ipv6_hook_with_nat(
             hook,
@@ -391,7 +394,7 @@ impl<'a> LocalOutputCt<'a> {
         hook: NftIpv4Hook,
         bytes: &[u8],
         oifname: [u8; 16],
-        local_destination: Option<&dyn Fn(Ipv6Address) -> bool>,
+        route_lookup: Option<NftIpv6RouteLookup<'_>>,
     ) -> bool {
         if !self.ruleset.has_ipv6_hook(hook) {
             return hook != NftIpv4Hook::LocalOut || self.classify(bytes);
@@ -400,8 +403,8 @@ impl<'a> LocalOutputCt<'a> {
             .with_interface_names([0; 16], oifname)
             .with_conntrack_cell(&self.context)
             .with_mark(&self.mark);
-        if let Some(lookup) = local_destination {
-            packet = packet.with_ipv6_local_destination(lookup);
+        if let Some(lookup) = route_lookup {
+            packet = packet.with_ipv6_route_lookup(lookup);
         }
         self.ruleset
             .allows_ipv6_hook_with_tracking(hook, &packet, || {
@@ -494,18 +497,19 @@ fn submit_ipv6(
     let ct = LocalOutputCt::new(netns, &ruleset, IpVersion::Ipv6).with_attached_related(related);
     let router = netns.router();
     let output_routes = ruleset
-        .ipv6_hook_requires_local_destination(NftIpv4Hook::LocalOut)
+        .ipv6_hook_requires_route_lookup(NftIpv4Hook::LocalOut)
         .then(|| super::route::lock_output_routes(&router, netns.device_list()));
-    let output_is_local = |address: Ipv6Address| {
-        output_routes.as_ref().is_some_and(|routes| {
-            routes
-                .lookup(IpAddress::Ipv6(address), None)
-                .is_some_and(|decision| decision.kind == RTN_LOCAL)
-        })
+    let resolve = |address, device| {
+        output_routes
+            .as_ref()
+            .map_or(super::route::RTN_UNREACHABLE, |routes| {
+                routes.ipv6_addr_type(address, device)
+            })
     };
-    let output_lookup = output_routes
-        .as_ref()
-        .map(|_| &output_is_local as &dyn Fn(Ipv6Address) -> bool);
+    let output_lookup = output_routes.as_ref().map(|_| NftIpv6RouteLookup {
+        resolve: &resolve,
+        device: None,
+    });
     if !ct.evaluate_ipv6(
         NftIpv4Hook::LocalOut,
         reservation.bytes_mut(),
@@ -553,18 +557,19 @@ fn submit_ipv6(
         route,
     )?;
     let post_routes = ruleset
-        .ipv6_hook_requires_local_destination(NftIpv4Hook::PostRouting)
+        .ipv6_hook_requires_route_lookup(NftIpv4Hook::PostRouting)
         .then(|| super::route::lock_output_routes(&router, netns.device_list()));
-    let post_is_local = |address: Ipv6Address| {
-        post_routes.as_ref().is_some_and(|routes| {
-            routes
-                .lookup(IpAddress::Ipv6(address), None)
-                .is_some_and(|decision| decision.kind == RTN_LOCAL)
-        })
+    let resolve = |address, device| {
+        post_routes
+            .as_ref()
+            .map_or(super::route::RTN_UNREACHABLE, |routes| {
+                routes.ipv6_addr_type(address, device)
+            })
     };
-    let post_lookup = post_routes
-        .as_ref()
-        .map(|_| &post_is_local as &dyn Fn(Ipv6Address) -> bool);
+    let post_lookup = post_routes.as_ref().map(|_| NftIpv6RouteLookup {
+        resolve: &resolve,
+        device: Some(hook_oifindex(route)),
+    });
     if !ct.evaluate_ipv6(
         NftIpv4Hook::PostRouting,
         reservation.bytes_mut(),

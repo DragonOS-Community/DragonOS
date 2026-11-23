@@ -14,7 +14,7 @@ mod validation;
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
-use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6AddressExt};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
 use system_error::SystemError;
 
 use crate::libs::rwsem::RwSemReadGuard;
@@ -175,6 +175,35 @@ impl OutputRouteGuard<'_> {
 
     pub(crate) fn ipv4_addr_type(&self, address: Ipv4Address) -> u8 {
         self.fib.ipv4_addr_type(address)
+    }
+
+    pub(crate) fn ipv6_addr_type(&self, address: Ipv6Address, device: Option<u32>) -> u8 {
+        let destination = IpAddress::Ipv6(address);
+        let multicast = address.is_multicast();
+        let link_scoped =
+            is_ipv6_link_local(destination) || (multicast && address.octets()[1] & 0x0f == 2);
+        let oif = device.filter(|_| link_scoped);
+        let Some(route) = lookup_output_fib(&self.fib, destination, oif) else {
+            return RTN_UNREACHABLE;
+        };
+        let route = route.matched;
+        // As in ipv6_anycast_destination(), an on-link subnet's router
+        // anycast address is its prefix address (except on /127 and /128).
+        if route.kind == RTN_UNICAST
+            && route.gateway.is_none()
+            && route.destination.prefix_len() < 127
+            && route.destination.address() == destination
+        {
+            RTN_ANYCAST
+        } else if route.kind == RTN_LOCAL {
+            RTN_LOCAL
+        } else if multicast {
+            RTN_MULTICAST
+        } else if address.is_unspecified() || address.to_ipv4_mapped().is_some() {
+            RTN_UNSPEC
+        } else {
+            RTN_UNICAST
+        }
     }
 
     pub(crate) fn lookup(

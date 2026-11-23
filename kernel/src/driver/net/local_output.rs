@@ -1323,7 +1323,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         F: FnOnce(&mut [u8]),
     {
         use smoltcp::phy::IpOutputError;
-        use smoltcp::wire::{IpAddress, IpVersion, Ipv4Packet, Ipv6Address, Ipv6Packet};
+        use smoltcp::wire::{IpAddress, IpVersion, Ipv4Packet, Ipv6Packet};
 
         if self
             .scratch
@@ -1393,12 +1393,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             )
             .ok_or(IpOutputError::PolicyDrop)?;
         let lookup = |address| self.backend_policy.routes.ipv4_addr_type(address);
-        let routes = self.backend_policy.routes;
-        let ipv6_is_local = |address: Ipv6Address| {
-            routes
-                .lookup(IpAddress::Ipv6(address), None)
-                .is_some_and(|decision| decision.kind == crate::net::route::RTN_LOCAL)
-        };
+        let resolve = |address, device| self.backend_policy.routes.ipv6_addr_type(address, device);
         let output_allowed = if ipv4 {
             ct.evaluate_ipv4(
                 crate::net::nftables::NftIpv4Hook::LocalOut,
@@ -1412,7 +1407,10 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 crate::net::nftables::NftIpv4Hook::LocalOut,
                 bytes,
                 output_name,
-                Some(&ipv6_is_local),
+                Some(crate::net::nftables::NftIpv6RouteLookup {
+                    resolve: &resolve,
+                    device: None,
+                }),
                 None,
             )
         }
@@ -1511,7 +1509,10 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 crate::net::nftables::NftIpv4Hook::PostRouting,
                 bytes,
                 post_name,
-                Some(&ipv6_is_local),
+                Some(crate::net::nftables::NftIpv6RouteLookup {
+                    resolve: &resolve,
+                    device: Some(hook_oif),
+                }),
                 masquerade,
             )
         }

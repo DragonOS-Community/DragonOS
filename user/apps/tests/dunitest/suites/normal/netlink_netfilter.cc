@@ -485,10 +485,8 @@ std::vector<uint8_t> MetaMarkSetRule(uint32_t seq, const char* table,
   return RuleWithExpressions(seq, table, chain, expressions);
 }
 
-std::vector<uint8_t> FibIpv4DestinationLocalCounterRule(uint32_t seq,
-                                                        const char* table,
-                                                        const char* chain) {
-  std::vector<uint8_t> expressions, fib;
+void AppendFibDestinationType(std::vector<uint8_t>* expressions, uint32_t address_type) {
+  std::vector<uint8_t> fib;
   const uint32_t register_id = htonl(NFT_REG_1);
   const uint32_t result = htonl(NFT_FIB_RESULT_ADDRTYPE);
   const uint32_t flags = htonl(NFTA_FIB_F_DADDR);
@@ -498,19 +496,24 @@ std::vector<uint8_t> FibIpv4DestinationLocalCounterRule(uint32_t seq,
             reinterpret_cast<const uint8_t*>(&result), 4);
   AppendNla(&fib, NFTA_FIB_FLAGS,
             reinterpret_cast<const uint8_t*>(&flags), 4);
-  AppendExpr(&expressions, "fib", fib);
-  const uint32_t local = RTN_LOCAL;
+  AppendExpr(expressions, "fib", fib);
+
+  std::vector<uint8_t> comparison, data;
   const uint32_t equal = htonl(NFT_CMP_EQ);
-  std::vector<uint8_t> value, comparison;
-  AppendNla(&value, NFTA_DATA_VALUE,
-            reinterpret_cast<const uint8_t*>(&local), sizeof(local));
   AppendNla(&comparison, NFTA_CMP_SREG,
             reinterpret_cast<const uint8_t*>(&register_id), 4);
   AppendNla(&comparison, NFTA_CMP_OP,
             reinterpret_cast<const uint8_t*>(&equal), 4);
-  AppendNla(&comparison, NFTA_CMP_DATA | NLA_F_NESTED,
-            value.data(), value.size());
-  AppendExpr(&expressions, "cmp", comparison);
+  AppendNla(&data, NFTA_DATA_VALUE,
+            reinterpret_cast<const uint8_t*>(&address_type), sizeof(address_type));
+  AppendNla(&comparison, NFTA_CMP_DATA | NLA_F_NESTED, data.data(), data.size());
+  AppendExpr(expressions, "cmp", comparison);
+}
+
+std::vector<uint8_t> FibIpv4DestinationLocalCounterRule(uint32_t seq, const char* table,
+                                                        const char* chain) {
+  std::vector<uint8_t> expressions;
+  AppendFibDestinationType(&expressions, RTN_LOCAL);
   AppendExpr(&expressions, "counter", {});
   return RuleWithExpressions(seq, table, chain, expressions);
 }
@@ -6427,6 +6430,107 @@ TEST(NetlinkNetfilter, StatelessIpv6LocalInputCountsFragmentsBeforeReassembly) {
     ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
     Ack(nft.get(), seq + 7, 0, kNftDeltable);
   }
+}
+
+TEST(NetlinkNetfilter, NftIpv6FibDestinationTypeTracksRoutesAndAddresses) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  const unsigned tx_ifindex = if_nametoindex("veth1");
+  const unsigned rx_ifindex = if_nametoindex("veth2");
+  ASSERT_NE(0u, tx_ifindex);
+  ASSERT_NE(0u, rx_ifindex);
+  Fd injector(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)));
+  FdGuard rtnl(OpenRouteSocket());
+  Fd nft(Open());
+  ASSERT_GE(injector.get(), 0);
+  ASSERT_GE(rtnl.Get(), 0);
+  ASSERT_GE(nft.get(), 0);
+
+  constexpr char table[] = "dkc035_fib6_types";
+  constexpr char chain_name[] = "prerouting";
+  constexpr char prefix_address[] = "fd10:65b1:35::1";
+  constexpr char destination[] = "fd10:65b1:35::99";
+  constexpr char anycast[] = "fd10:65b1:35::";
+  constexpr uint32_t seq = 19900;
+  auto batch = TableBatch(kNftNewtable, seq, table, NFPROTO_IPV6);
+  batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+  const auto chain = NewChain(seq + 2, table, chain_name, true, NF_ACCEPT,
+                              NF_INET_PRE_ROUTING, NFPROTO_IPV6);
+  batch.insert(batch.end(), chain.begin(), chain.end());
+  uint32_t next_seq = seq + 3;
+  for (const uint32_t type : {RTN_UNICAST, RTN_LOCAL, RTN_ANYCAST}) {
+    std::vector<uint8_t> expressions;
+    constexpr uint8_t next_header = IPPROTO_NONE;
+    constexpr uint8_t probe_source[] = {0xfd, 0x10, 0x65, 0xb1, 0, 0x35, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 2};
+    AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 6, &next_header, 1);
+    AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 8,
+                       probe_source, sizeof(probe_source));
+    AppendFibDestinationType(&expressions, type);
+    AppendExpr(&expressions, "counter", {});
+    auto rule = RuleWithExpressions(next_seq++, table, chain_name, expressions, NFPROTO_IPV6);
+    batch.insert(batch.end(), rule.begin(), rule.end());
+  }
+  auto end = Request(NFNL_MSG_BATCH_END, next_seq++);
+  batch.insert(batch.end(), end.begin(), end.end());
+  ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
+  Ack(nft.get(), seq + 1, 0, kNftNewtable);
+  Ack(nft.get(), seq + 2, 0, kNftNewchain);
+  for (uint32_t rule = seq + 3; rule < seq + 6; ++rule) {
+    Ack(nft.get(), rule, 0, kNftNewrule);
+  }
+  auto check_probe = [&](const char* target, const std::array<uint64_t, 3>& expected) {
+    ASSERT_TRUE(InjectVethIpProbe(injector.get(), tx_ifindex, "veth2",
+                                 Ipv6NoNextProbe("fd10:65b1:35::2", target), ETH_P_IPV6));
+    std::array<uint64_t, 3> observed{};
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      const uint32_t dump_seq = next_seq++;
+      auto query = Request(kNftGetrule, dump_seq);
+      query[NLMSG_HDRLEN] = NFPROTO_IPV6;
+      nlmsghdr header{};
+      std::memcpy(&header, query.data(), sizeof(header));
+      header.nlmsg_flags |= NLM_F_DUMP;
+      std::memcpy(query.data(), &header, sizeof(header));
+      AppendAttr(&query, NFTA_RULE_TABLE, table);
+      AppendAttr(&query, NFTA_RULE_CHAIN, chain_name);
+      ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+      const auto rules = ReceiveRuleDump(nft.get(), dump_seq);
+      ASSERT_EQ(observed.size(), rules.size());
+      for (size_t i = 0; i < observed.size(); ++i) {
+        ASSERT_TRUE(rules[i].has_counter);
+        observed[i] = rules[i].packets;
+      }
+      if (observed == expected) return;
+      usleep(20000);
+    }
+    EXPECT_EQ(expected, observed);
+  };
+  auto address = [&](uint16_t command, unsigned index, const char* ip, uint8_t length) {
+    const uint16_t flags = NLM_F_REQUEST | NLM_F_ACK |
+        (command == RTM_NEWADDR ? NLM_F_CREATE | NLM_F_EXCL : 0);
+    return SendIpv6AddrRequest(rtnl.Get(), command, flags, index, ip, length, next_seq++);
+  };
+  ASSERT_EQ(0, address(RTM_NEWADDR, tx_ifindex, prefix_address, 64));
+  check_probe(destination, {1, 0, 0});
+  check_probe(anycast, {1, 0, 1});
+  const int local_added = address(RTM_NEWADDR, rx_ifindex, destination, 128);
+  EXPECT_EQ(0, local_added);
+  if (local_added == 0) {
+    // Linux can finish IPv6 address setup asynchronously even with NODAD.
+    bool local_route = false;
+    for (int attempt = 0; attempt < 50 && !local_route; ++attempt) {
+      local_route = FindIpv6Route(rtnl.Get(), destination, 128, rx_ifindex,
+                                 next_seq++, RTN_LOCAL).has_value();
+      if (!local_route) usleep(20000);
+    }
+    EXPECT_TRUE(local_route);
+    if (local_route) check_probe(destination, {1, 1, 1});
+    EXPECT_EQ(0, address(RTM_DELADDR, rx_ifindex, destination, 128));
+    if (local_route) check_probe(destination, {2, 1, 1});
+  }
+  EXPECT_EQ(0, address(RTM_DELADDR, tx_ifindex, prefix_address, 64));
+  auto remove = TableBatch(kNftDeltable, next_seq, table, NFPROTO_IPV6);
+  ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
+  Ack(nft.get(), next_seq + 1, 0, kNftDeltable);
 }
 
 TEST(NetlinkNetfilter, NftIpv6AndInetForwardSeeDecrementedHopAndRealDevices) {

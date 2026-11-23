@@ -62,7 +62,7 @@ impl NftNamespaceState {
                 iface_name_hooks: [false; NftIpv4Hook::COUNT],
                 ipv4_route_lookup_hooks: [false; NftIpv4Hook::COUNT],
                 ipv6_iface_name_hooks: [false; NftIpv4Hook::COUNT],
-                ipv6_local_destination_hooks: [false; NftIpv4Hook::COUNT],
+                ipv6_route_lookup_hooks: [false; NftIpv4Hook::COUNT],
                 ipv4_hooks: core::array::from_fn(|_| HookProgram::empty()),
                 ipv6_hooks: core::array::from_fn(|_| HookProgram::empty()),
             })),
@@ -107,7 +107,7 @@ impl NftNamespaceState {
                 iface_name_hooks: [false; NftIpv4Hook::COUNT],
                 ipv4_route_lookup_hooks: [false; NftIpv4Hook::COUNT],
                 ipv6_iface_name_hooks: [false; NftIpv4Hook::COUNT],
-                ipv6_local_destination_hooks: [false; NftIpv4Hook::COUNT],
+                ipv6_route_lookup_hooks: [false; NftIpv4Hook::COUNT],
                 ipv4_hooks: core::array::from_fn(|_| HookProgram::empty()),
                 ipv6_hooks: core::array::from_fn(|_| HookProgram::empty()),
             },
@@ -1133,7 +1133,7 @@ impl NftTransaction<'_> {
                     dreg,
                     result: 3,
                     flags: 2,
-                } if family == 2 => {
+                } if matches!(family, 2 | 10) => {
                     let dreg = data_register(*dreg, 4)?;
                     initialized |= 1 << (dreg / 4);
                     NftExpression::FibDaddrType { dreg }

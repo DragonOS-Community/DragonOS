@@ -8,8 +8,8 @@ use super::{
     },
     ipv6_defrag::{fragment_offset as ipv6_fragment_offset, DefragDomain as Ipv6DefragDomain},
     nftables::{
-        NftDeviceNames, NftIpv4Hook, NftNatAction, NftNatEvent, NftNatPacket, NftNatProgress,
-        NftPacket, RulesetSnapshot,
+        NftDeviceNames, NftIpv4Hook, NftIpv6RouteLookup, NftNatAction, NftNatEvent, NftNatPacket,
+        NftNatProgress, NftPacket, RulesetSnapshot,
     },
     route::{OutputRouteGuard, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST},
     socket::inet::raw::{RawIngressBatch, RawIngressWork},
@@ -541,15 +541,23 @@ impl<'a> NetIngressFilter<'a> {
         {
             return true;
         }
-        if self.ruleset.ipv6_hook_requires_local_destination(hook) && self.fib_routes.is_none() {
+        if self.ruleset.ipv6_hook_requires_route_lookup(hook) && self.fib_routes.is_none() {
             return false;
         }
-        let is_local = |address| {
-            self.fib_routes.is_some_and(|routes| {
-                routes
-                    .lookup(IpAddress::Ipv6(address), None)
-                    .is_some_and(|decision| decision.kind == RTN_LOCAL)
+        let resolve = |address, device| {
+            self.fib_routes
+                .map_or(super::route::RTN_UNREACHABLE, |routes| {
+                    routes.ipv6_addr_type(address, device)
+                })
+        };
+        let lookup = NftIpv6RouteLookup {
+            resolve: &resolve,
+            device: Some(if hook == NftIpv4Hook::PostRouting {
+                oif
+            } else {
+                iif
             })
+            .filter(|index| *index != 0),
         };
         let (iifname, oifname) = if self.ruleset.ipv6_hook_requires_iface_names(hook) {
             let (Some(iifname), Some(oifname)) =
@@ -562,7 +570,7 @@ impl<'a> NetIngressFilter<'a> {
             ([0; 16], [0; 16])
         };
         let packet = NftPacket::new_ipv6(bytes)
-            .with_ipv6_local_destination(&is_local)
+            .with_ipv6_route_lookup(lookup)
             .with_interface_names(iifname, oifname)
             .with_conntrack_cell(self.packet_context)
             .with_mark(self.mark);
@@ -632,15 +640,23 @@ impl<'a> NetIngressFilter<'a> {
         oif: u32,
         next_hop: Option<IpAddress>,
     ) -> bool {
-        if self.ruleset.ipv6_hook_requires_local_destination(hook) && self.fib_routes.is_none() {
+        if self.ruleset.ipv6_hook_requires_route_lookup(hook) && self.fib_routes.is_none() {
             return false;
         }
-        let is_local = |address| {
-            self.fib_routes.is_some_and(|routes| {
-                routes
-                    .lookup(IpAddress::Ipv6(address), None)
-                    .is_some_and(|decision| decision.kind == RTN_LOCAL)
+        let resolve = |address, device| {
+            self.fib_routes
+                .map_or(super::route::RTN_UNREACHABLE, |routes| {
+                    routes.ipv6_addr_type(address, device)
+                })
+        };
+        let lookup = NftIpv6RouteLookup {
+            resolve: &resolve,
+            device: Some(if hook == NftIpv4Hook::PostRouting {
+                oif
+            } else {
+                iif
             })
+            .filter(|index| *index != 0),
         };
         let (iifname, oifname) = if self.ruleset.ipv6_hook_requires_iface_names(hook) {
             let (Some(iifname), Some(oifname)) =
@@ -667,7 +683,7 @@ impl<'a> NetIngressFilter<'a> {
             .evaluate_ipv6_hook_with_nat(
                 hook,
                 NftNatPacket::new_ipv6(bytes, self.packet_context, iifname, oifname)
-                    .with_ipv6_local_destination(&is_local)
+                    .with_ipv6_route_lookup(lookup)
                     .with_mark(self.mark)
                     .with_redirect_address(&redirect),
                 |bytes| {

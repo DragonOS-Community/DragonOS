@@ -15,6 +15,10 @@ use super::{
     RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
 
+// Router advertisements must not grow the namespace FIB without bound.
+// All learned defaults belong to the main table's IPv6 default prefix.
+const MAX_LEARNED_DEFAULT_ROUTES: usize = 64;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(in crate::net) struct FibTable {
     entries: Vec<RouteEntry>,
@@ -456,15 +460,18 @@ impl FibTable {
     pub(super) fn plan_learned_default(&self, route: RouteEntry, withdraw: bool) -> FibEdit {
         debug_assert!(route.learned_default.is_some());
         let mut learned = None;
+        let mut learned_count = 0;
         for &index in self.index.prefix_candidates(route) {
             let current = self.entries[index];
+            let is_learned = current.learned_default.is_some();
+            learned_count += usize::from(is_learned);
             if current.oif != route.oif
                 || current.gateway != route.gateway
                 || current.priority != route.priority
             {
                 continue;
             }
-            if current.learned_default.is_some() {
+            if is_learned {
                 learned = Some((index, current));
             } else if !withdraw && current.kind == route.kind && current.source.is_none() {
                 return FibEdit::None;
@@ -477,7 +484,7 @@ impl FibTable {
                 new: route,
             },
             (Some((index, route)), true) => FibEdit::Delete { index, route },
-            (None, false) => FibEdit::Insert {
+            (None, false) if learned_count < MAX_LEARNED_DEFAULT_ROUTES => FibEdit::Insert {
                 index: self.entries.len(),
                 route,
                 placement: self.index.append_placement(route),
@@ -1031,4 +1038,62 @@ fn delete_matches(route: RouteEntry, selector: RouteDeleteSelector) -> bool {
         && selector
             .preferred_source
             .is_none_or(|value| route.preferred_source == Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FibEdit, FibTable, RouteEntry, MAX_LEARNED_DEFAULT_ROUTES};
+    use crate::net::route::{LearnedDefaultRoute, RouterPreference, RTN_UNICAST, RT_TABLE_MAIN};
+    use smoltcp::wire::{IpCidr, Ipv6Address};
+
+    #[test]
+    fn learned_default_capacity_preserves_refresh_and_withdrawal() {
+        let route = |id: u16| RouteEntry {
+            destination: IpCidr::new(Ipv6Address::UNSPECIFIED.into(), 0),
+            source: None,
+            preferred_source: None,
+            table: RT_TABLE_MAIN,
+            priority: 1024,
+            tos: 0,
+            protocol: 9, // RTPROT_RA
+            scope: 0,
+            kind: RTN_UNICAST,
+            oif: u32::from(id % 2) + 1,
+            gateway: Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, id).into()),
+            nexthop_flags: 0,
+            learned_default: Some(LearnedDefaultRoute {
+                expires_at_us: 30_000_000,
+                preference: RouterPreference::Medium,
+            }),
+        };
+        let mut fib = FibTable::default();
+        for id in 1..=MAX_LEARNED_DEFAULT_ROUTES {
+            let edit = fib.plan_learned_default(route(id as u16), false);
+            assert!(matches!(edit, FibEdit::Insert { .. }));
+            fib.reserve_edit(edit).unwrap();
+            fib.apply_edit(edit);
+        }
+        let new_router = route(MAX_LEARNED_DEFAULT_ROUTES as u16 + 1);
+        assert!(matches!(
+            fib.plan_learned_default(new_router, false),
+            FibEdit::None
+        ));
+
+        let mut refreshed = route(1);
+        refreshed.learned_default.as_mut().unwrap().expires_at_us += 1_000_000;
+        let edit = fib.plan_learned_default(refreshed, false);
+        assert!(matches!(edit, FibEdit::Replace { .. }));
+        fib.reserve_edit(edit).unwrap();
+        fib.apply_edit(edit);
+        assert_eq!(fib.learned_defaults().count(), MAX_LEARNED_DEFAULT_ROUTES);
+        assert!(fib.learned_defaults().any(|entry| entry == refreshed));
+
+        let edit = fib.plan_learned_default(refreshed, true);
+        assert!(matches!(edit, FibEdit::Delete { .. }));
+        fib.apply_edit(edit);
+        assert!(matches!(
+            fib.plan_learned_default(new_router, false),
+            FibEdit::Insert { .. }
+        ));
+    }
 }

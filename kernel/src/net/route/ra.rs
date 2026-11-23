@@ -185,12 +185,19 @@ fn update(
     route: RouteEntry,
     withdraw: bool,
 ) -> Result<(), SystemError> {
-    let edit = transact_single(rtnl, netns, |fib| {
-        let edit = fib.plan_learned_default(route, withdraw);
-        Ok(PlannedFibMutation {
-            edit,
-            outcome: edit,
-        })
+    // RTNL keeps the edit stable while the transaction obtains the device
+    // references and prepares its projection. A rejected or duplicate
+    // advertisement needs neither a device snapshot nor a FIB writer.
+    let edit = netns
+        .router()
+        .fib
+        .read()
+        .plan_learned_default(route, withdraw);
+    if matches!(edit, FibEdit::None) {
+        return Ok(());
+    }
+    transact_single(rtnl, netns, |_| {
+        Ok(PlannedFibMutation { edit, outcome: () })
     })?;
     match edit {
         FibEdit::Insert { route, .. } => notify_learned_default(netns, route, false, false),

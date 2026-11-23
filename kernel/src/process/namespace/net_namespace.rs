@@ -303,6 +303,7 @@ pub struct NetNamespace {
     ipv4_forwarding: AtomicI32,
     /// Linux /proc/sys/net/ipv6/conf/all/forwarding. Never shares IPv4 state.
     ipv6_forwarding: AtomicI32,
+    ipv6_default_forwarding: AtomicI32,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -1330,6 +1331,7 @@ impl NetNamespace {
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
+            ipv6_default_forwarding: AtomicI32::new(0),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1387,6 +1389,7 @@ impl NetNamespace {
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
+            ipv6_default_forwarding: AtomicI32::new(0),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1906,7 +1909,23 @@ impl NetNamespace {
         self.ipv6_forwarding_value() != 0
     }
 
-    pub fn set_ipv6_forwarding(&self, value: i32) {
+    pub(crate) fn ipv6_default_forwarding(&self) -> i32 {
+        self.ipv6_default_forwarding.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_ipv6_default_forwarding(
+        &self,
+        _rtnl: &crate::net::rtnl::RtnlGuard,
+        value: i32,
+    ) {
+        self.ipv6_default_forwarding.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_ipv6_forwarding(&self, rtnl: &crate::net::rtnl::RtnlGuard, value: i32) {
+        self.set_ipv6_default_forwarding(rtnl, value);
+        for iface in self.device_list().values() {
+            iface.common().set_ipv6_forwarding(rtnl, value);
+        }
         self.ipv6_forwarding.store(value, Ordering::Release);
     }
 

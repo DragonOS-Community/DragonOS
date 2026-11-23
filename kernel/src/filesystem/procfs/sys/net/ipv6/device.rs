@@ -100,16 +100,21 @@ impl DirOps for DeviceDirOps {
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
         self.validate_inode()?;
-        if name != "disable_ipv6" {
-            return Err(SystemError::ENOENT);
-        }
+        let field = match name {
+            "disable_ipv6" => DeviceField::Disable,
+            "forwarding" => DeviceField::Forwarding,
+            _ => return Err(SystemError::ENOENT),
+        };
         Ok(dir
             .cached_children()
             .write()
             .entry(name.to_string())
             .or_insert_with(|| {
                 ProcFileBuilder::new(
-                    DisableFileOps(self.0.clone()),
+                    DeviceFileOps {
+                        identity: self.0.clone(),
+                        field,
+                    },
                     InodeMode::from_bits_truncate(0o644),
                 )
                 .parent(dir.self_ref_weak().clone())
@@ -121,19 +126,30 @@ impl DirOps for DeviceDirOps {
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        let _ = self.lookup_child(dir, "disable_ipv6");
+        for name in ["disable_ipv6", "forwarding"] {
+            let _ = self.lookup_child(dir, name);
+        }
     }
 }
 
 #[derive(Debug)]
-struct DisableFileOps(DeviceIdentity);
+enum DeviceField {
+    Disable,
+    Forwarding,
+}
 
-impl FileOps for DisableFileOps {
+#[derive(Debug)]
+struct DeviceFileOps {
+    identity: DeviceIdentity,
+    field: DeviceField,
+}
+
+impl FileOps for DeviceFileOps {
     const SEEK_KIND: crate::filesystem::procfs::template::ProcfsSeekKind =
         crate::filesystem::procfs::template::ProcfsSeekKind::Default;
 
     fn validate_inode(&self) -> Result<(), SystemError> {
-        self.0.resolve().map(|_| ())
+        self.identity.resolve().map(|_| ())
     }
 
     fn open(
@@ -145,12 +161,12 @@ impl FileOps for DisableFileOps {
     }
 
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
-        let (netns, _) = self.0.resolve()?;
+        let (netns, _) = self.identity.resolve()?;
         Ok(Some(SysctlNamespace::access_bits_for(&netns)))
     }
 
     fn owner(&self) -> Option<(usize, usize)> {
-        self.0.namespace.owner()
+        self.identity.namespace.owner()
     }
 
     fn supports_write_iter_flags(&self) -> bool {
@@ -160,7 +176,7 @@ impl FileOps for DisableFileOps {
     fn write_callback(&self) -> Option<ProcWriteCallback<Self>> {
         Some(|ops, offset, _, buf, _data| {
             let rtnl = rtnl::lock();
-            let (netns, iface) = ops.0.resolve()?;
+            let (netns, iface) = ops.identity.resolve()?;
             if SysctlNamespace::access_bits_for(&netns) & 2 == 0 {
                 return Err(SystemError::EPERM);
             }
@@ -169,7 +185,10 @@ impl FileOps for DisableFileOps {
             }
             let (value, consumed) = parse_numeric_sysctl(buf)?;
             let value = i32::try_from(value).map_err(|_| SystemError::EINVAL)?;
-            set_device_ipv6_disabled(&rtnl, &netns, &iface, value)?;
+            match ops.field {
+                DeviceField::Disable => set_device_ipv6_disabled(&rtnl, &netns, &iface, value)?,
+                DeviceField::Forwarding => iface.common().set_ipv6_forwarding(&rtnl, value),
+            }
             Ok(PrimaryWriteResult::new(consumed))
         })
     }
@@ -182,15 +201,14 @@ impl FileOps for DisableFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let _rtnl = rtnl::lock();
-        let (_, iface) = self.0.resolve()?;
+        let (_, iface) = self.identity.resolve()?;
         if offset != 0 {
             return Ok(0);
         }
-        proc_read(
-            0,
-            len,
-            buf,
-            format!("{}\n", iface.common().ipv6_disabled_value()).as_bytes(),
-        )
+        let value = match self.field {
+            DeviceField::Disable => iface.common().ipv6_disabled_value(),
+            DeviceField::Forwarding => iface.common().ipv6_forwarding(),
+        };
+        proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }
 }

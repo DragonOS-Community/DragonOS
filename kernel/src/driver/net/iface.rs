@@ -71,6 +71,30 @@ pub(crate) struct AddressMetadata {
     pub label: Option<CString>,
     /// The explicit IPv4 IFA_BROADCAST value, independent of the CIDR-derived broadcast.
     pub broadcast: Option<smoltcp::wire::Ipv4Address>,
+    pub state: AddressState,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressState {
+    #[default]
+    Configured,
+    AutoLinkLocal(LinkLocalState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkLocalState {
+    Tentative,
+    DadFailed,
+    Usable,
+}
+
+impl AddressState {
+    pub(crate) fn is_usable(self) -> bool {
+        matches!(
+            self,
+            Self::Configured | Self::AutoLinkLocal(LinkLocalState::Usable)
+        )
+    }
 }
 
 /// Lossless route state accumulated while an interface is being constructed.
@@ -944,6 +968,9 @@ impl PreparedNetdeviceRemoval<'_> {
     /// A namespace move preserves the netdevice and its sysfs inode. The
     /// prepared target addition publishes the new owner after this step.
     pub(crate) fn publish_moving(self) {
+        for dev in &self.devices {
+            crate::net::address::ipv6_autoconf::reset_for_netns_move(dev.common());
+        }
         self.namespace.publish();
         for dev in self.devices {
             dev.clear_net_namespace();

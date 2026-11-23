@@ -392,7 +392,11 @@ impl PreparedAddressRouteCommit {
         drop(device_list);
 
         let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
-        if after_addresses.len() > address_capacity {
+        let inactive_count = metadata
+            .iter()
+            .filter(|entry| !entry.state.is_usable())
+            .count();
+        if after_addresses.len() + inactive_count > address_capacity {
             return Err(SystemError::ENOSPC);
         }
 
@@ -447,7 +451,11 @@ impl PreparedAddressRouteCommit {
         })
     }
 
-    fn publish(self, netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>) -> RouteNotifications {
+    pub(in crate::net) fn publish(
+        self,
+        netns: &Arc<NetNamespace>,
+        iface: &Arc<dyn Iface>,
+    ) -> RouteNotifications {
         self.publish_link_change(netns, iface, None, || {}, || {}, false)
     }
 
@@ -487,7 +495,7 @@ impl PreparedAddressRouteCommit {
         let mut smol_iface = iface.smol_iface().lock();
         if let Some(enabled) = ipv6_enabled {
             smol_iface.set_ipv6_enabled(enabled, &after_addresses);
-        } else {
+        } else if smol_iface.ip_addrs() != after_addresses.as_slice() {
             smol_iface.update_ip_addrs(|addresses| {
                 addresses.clear();
                 addresses
@@ -622,7 +630,13 @@ fn derived_address_entries_for_link_state(
             learned_default: None,
         });
     }
-    for cidr in addresses.iter().copied() {
+    let addresses_with_state = addresses.iter().copied().map(|cidr| (cidr, true)).chain(
+        metadata
+            .iter()
+            .filter(|entry| !entry.state.is_usable())
+            .map(|entry| (entry.cidr, false)),
+    );
+    for (cidr, usable) in addresses_with_state {
         let broadcast = metadata
             .iter()
             .find(|entry| entry.cidr == cidr)
@@ -633,6 +647,7 @@ fn derived_address_entries_for_link_state(
             primary_for_prefix(addresses, cidr),
             broadcast,
             is_up,
+            usable,
         )? {
             if !result.contains(&entry) {
                 result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
@@ -654,6 +669,7 @@ fn entries_for_address(
     primary: Option<IpAddress>,
     broadcast: Option<smoltcp::wire::Ipv4Address>,
     is_up: bool,
+    usable: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let ipv4 = is_ipv4(cidr.address());
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
@@ -722,7 +738,7 @@ fn entries_for_address(
     // not yet model DAD), matching Linux IFA_F_NODAD semantics. Keep the host
     // route while down; unlike a connected route, it represents local
     // delivery and does not select the device for external output.
-    if !result.contains(&local) {
+    if usable && !result.contains(&local) {
         result.push(local);
     }
     if let IpCidr::Ipv4(cidr) = cidr {

@@ -114,6 +114,8 @@ impl<D: SmolDevice + ?Sized> SmolDevice for NftGenerationDevice<'_, D> {
 }
 
 pub struct IfaceCommon {
+    pub(crate) ipv6_autoconf:
+        crate::libs::spinlock::SpinLock<crate::net::address::ipv6_autoconf::DeviceState>,
     pub(super) iface_id: usize,
     pub(super) name: RwLock<String>,
     name_generation: AtomicU64,
@@ -281,10 +283,12 @@ impl IfaceCommon {
                 cidr: *cidr,
                 label: None,
                 broadcast: None,
+                state: Default::default(),
             })
             .collect();
         let sockets = smoltcp::iface::SocketSet::new(Vec::new());
         IfaceCommon {
+            ipv6_autoconf: crate::libs::spinlock::SpinLock::new(Default::default()),
             iface_id,
             name: RwLock::new(name),
             name_generation: AtomicU64::new(0),
@@ -2092,6 +2096,7 @@ impl IfaceCommon {
         self.begin_netns_move();
         self.wait_for_poll_before_netns_move();
         self.retire_queued_work_for_netns_move();
+        crate::net::address::ipv6_autoconf::cancel(self, true);
     }
 
     pub(crate) fn retire_queued_work_for_netns_move(&self) {

@@ -376,7 +376,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6ForwardingDefaultAndAllHaveDistinctEffect
 
 static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& family,
                                                           const std::string& setting,
-                                                          const char* initial = "0\n") {
+                                                          const char* initial = "0\n",
+                                                          const std::string& configured = "2\n") {
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -408,8 +409,9 @@ static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& fam
 
             const int original = open(path.c_str(), O_RDWR | O_CLOEXEC);
             ASSERT_GE(original, 0);
-            ASSERT_EQ(write(original, "2\n", 2), 2);
-            EXPECT_EQ(read_value(path), "2\n");
+            ASSERT_EQ(write(original, configured.data(), configured.size()),
+                      static_cast<ssize_t>(configured.size()));
+            EXPECT_EQ(read_value(path), configured);
 
             const auto rename = [&](const std::string& new_name, uint32_t seq) {
                 LinkRequest request(RTM_SETLINK, 0, seq);
@@ -418,14 +420,14 @@ static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& fam
                 return SendAck(source.fd, request);
             };
             ASSERT_EQ(rename(renamed, 4901), 0);
-            EXPECT_EQ(read_value(prefix + renamed + "/" + setting), "2\n");
+            EXPECT_EQ(read_value(prefix + renamed + "/" + setting), configured);
             EXPECT_EQ(access(path.c_str(), F_OK), -1);
             EXPECT_EQ(errno, ENOENT);
             ASSERT_EQ(rename(name, 4902), 0);
             EXPECT_EQ(pwrite(original, "0\n", 2, 0), -1);
             EXPECT_EQ(errno, ENOENT);
             close(original);
-            EXPECT_EQ(read_value(path), "2\n");
+            EXPECT_EQ(read_value(path), configured);
 
             const int before_move = open(path.c_str(), O_RDWR | O_CLOEXEC);
             ASSERT_GE(before_move, 0);
@@ -463,6 +465,70 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv4RouteLocalnetTracksRenameAndNamespaceMove
 
 TEST(RtnetlinkBridgeVethSemantics, Ipv6AcceptRaTracksRenameAndNamespaceMove) {
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "accept_ra", "1\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, Ipv6AutoconfSettingsTrackRenameAndNamespaceMove) {
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "addr_gen_mode", "0\n", "1\n");
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "accept_dad", "1\n", "0\n");
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "dad_transmits", "1\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDAD) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd route;
+            ASSERT_GE(route.fd, 0);
+            constexpr char left[] = "auto6-left";
+            constexpr char right[] = "auto6-right";
+            const uint8_t mac[] = {0x02, 0, 0, 0, 0x31, 0x01};
+            std::vector<uint8_t> peer(sizeof(ifinfomsg), 0);
+            AppendAttr(peer, IFLA_IFNAME, right, sizeof(right));
+            std::vector<uint8_t> veth;
+            AppendAttr(veth, VETH_INFO_PEER, peer.data(), peer.size());
+            LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4970);
+            ASSERT_TRUE(create.name(left));
+            ASSERT_TRUE(create.add(IFLA_ADDRESS, mac, sizeof(mac)));
+            AddKind(create, "veth", veth);
+            ASSERT_EQ(SendAck(route.fd, create), 0);
+            const uint32_t left_index = if_nametoindex(left);
+            const uint32_t right_index = if_nametoindex(right);
+            ASSERT_NE(left_index, 0u);
+            ASSERT_NE(right_index, 0u);
+            ASSERT_EQ(SetLinkUp(route.fd, left_index, true, 4971), 0);
+
+            sockaddr_in6 address{};
+            address.sin6_family = AF_INET6;
+            address.sin6_scope_id = left_index;
+            ASSERT_EQ(inet_pton(AF_INET6, "fe80::ff:fe00:3101", &address.sin6_addr), 1);
+            const auto can_bind = [&] {
+                const int socket_fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+                if (socket_fd < 0) return false;
+                const bool bound = bind(socket_fd, reinterpret_cast<const sockaddr*>(&address),
+                                        sizeof(address)) == 0;
+                close(socket_fd);
+                return bound;
+            };
+            EXPECT_FALSE(can_bind());
+            ASSERT_EQ(SetLinkUp(route.fd, right_index, true, 4972), 0);
+            bool assigned = false;
+            for (int attempt = 0; attempt < 120; ++attempt) {
+                if ((assigned = can_bind())) break;
+                usleep(25'000);
+            }
+            ASSERT_TRUE(assigned);
+            ASSERT_EQ(SetLinkUp(route.fd, left_index, false, 4973), 0);
+            EXPECT_FALSE(can_bind());
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDefault) {

@@ -208,6 +208,7 @@ pub enum Repr<'a> {
     NeighborSolicit {
         target_addr: Ipv6Address,
         lladdr: Option<RawHardwareAddress>,
+        nonce: Option<[u8; 6]>,
     },
     NeighborAdvert {
         flags: NeighborFlags,
@@ -232,8 +233,14 @@ impl<'a> Repr<'a> {
     {
         packet.check_len()?;
 
-        let (mut src_ll_addr, mut mtu, mut prefix_info, mut target_ll_addr, mut redirected_hdr) =
-            (None, None, None, None, None);
+        let (
+            mut src_ll_addr,
+            mut mtu,
+            mut prefix_info,
+            mut target_ll_addr,
+            mut redirected_hdr,
+            mut nonce,
+        ) = (None, None, None, None, None, None);
 
         let mut offset = 0;
         while packet.payload().len() > offset {
@@ -247,6 +254,7 @@ impl<'a> Repr<'a> {
                     NdiscOptionRepr::PrefixInformation(prefix) => prefix_info = Some(prefix),
                     NdiscOptionRepr::RedirectedHeader(redirect) => redirected_hdr = Some(redirect),
                     NdiscOptionRepr::Mtu(m) => mtu = Some(m),
+                    NdiscOptionRepr::Nonce(value) if nonce.is_none() => nonce = Some(value),
                     _ => {}
                 }
             }
@@ -275,6 +283,7 @@ impl<'a> Repr<'a> {
             Message::NeighborSolicit => Ok(Repr::NeighborSolicit {
                 target_addr: packet.target_addr(),
                 lladdr: src_ll_addr,
+                nonce,
             }),
             Message::NeighborAdvert => Ok(Repr::NeighborAdvert {
                 flags: packet.neighbor_flags(),
@@ -292,14 +301,14 @@ impl<'a> Repr<'a> {
     }
 
     pub const fn buffer_len(&self) -> usize {
-        match self {
-            &Repr::RouterSolicit { lladdr } => match lladdr {
+        match *self {
+            Repr::RouterSolicit { lladdr } => match lladdr {
                 Some(addr) => {
                     field::UNUSED.end + { NdiscOptionRepr::SourceLinkLayerAddr(addr).buffer_len() }
                 }
                 None => field::UNUSED.end,
             },
-            &Repr::RouterAdvert {
+            Repr::RouterAdvert {
                 lladdr,
                 mtu,
                 prefix_info,
@@ -317,14 +326,24 @@ impl<'a> Repr<'a> {
                 }
                 field::RETRANS_TM.end + offset
             }
-            &Repr::NeighborSolicit { lladdr, .. } | &Repr::NeighborAdvert { lladdr, .. } => {
+            Repr::NeighborSolicit { lladdr, nonce, .. } => {
+                let mut offset = field::TARGET_ADDR.end;
+                if let Some(lladdr) = lladdr {
+                    offset += NdiscOptionRepr::SourceLinkLayerAddr(lladdr).buffer_len();
+                }
+                if let Some(nonce) = nonce {
+                    offset += NdiscOptionRepr::Nonce(nonce).buffer_len();
+                }
+                offset
+            }
+            Repr::NeighborAdvert { lladdr, .. } => {
                 let mut offset = field::TARGET_ADDR.end;
                 if let Some(lladdr) = lladdr {
                     offset += NdiscOptionRepr::SourceLinkLayerAddr(lladdr).buffer_len();
                 }
                 offset
             }
-            &Repr::Redirect {
+            Repr::Redirect {
                 lladdr,
                 redirected_hdr,
                 ..
@@ -398,14 +417,21 @@ impl<'a> Repr<'a> {
             Repr::NeighborSolicit {
                 target_addr,
                 lladdr,
+                nonce,
             } => {
                 packet.set_msg_type(Message::NeighborSolicit);
                 packet.set_msg_code(0);
                 packet.clear_reserved();
                 packet.set_target_addr(target_addr);
+                let mut options = packet.payload_mut();
                 if let Some(lladdr) = lladdr {
-                    let mut opt_pkt = NdiscOption::new_unchecked(packet.payload_mut());
-                    NdiscOptionRepr::SourceLinkLayerAddr(lladdr).emit(&mut opt_pkt);
+                    let repr = NdiscOptionRepr::SourceLinkLayerAddr(lladdr);
+                    let (current, rest) = options.split_at_mut(repr.buffer_len());
+                    repr.emit(&mut NdiscOption::new_unchecked(current));
+                    options = rest;
+                }
+                if let Some(nonce) = nonce {
+                    NdiscOptionRepr::Nonce(nonce).emit(&mut NdiscOption::new_unchecked(options));
                 }
             }
 

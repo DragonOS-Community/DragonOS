@@ -1125,6 +1125,13 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             )
             && self.forward_fragment.get().is_none()
         {
+            super::address::ipv6_autoconf::receive(
+                self.owner,
+                self.netns,
+                packet,
+                transport_offset,
+                ingress_ifindex,
+            );
             if let Some(advertisement) = super::route::ra::parse(
                 packet,
                 transport_offset,

@@ -20,7 +20,9 @@ enum_with_unknown! {
         /// Redirected Header
         RedirectedHeader    = 0x4,
         /// MTU
-        Mtu                 = 0x5
+        Mtu                 = 0x5,
+        /// Nonce
+        Nonce               = 0xe
     }
 }
 
@@ -32,6 +34,7 @@ impl fmt::Display for Type {
             Type::PrefixInformation => write!(f, "prefix information"),
             Type::RedirectedHeader => write!(f, "redirected header"),
             Type::Mtu => write!(f, "mtu"),
+            Type::Nonce => write!(f, "nonce"),
             Type::Unknown(id) => write!(f, "{id}"),
         }
     }
@@ -183,7 +186,10 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
                 Err(Error)
             } else {
                 match self.option_type() {
-                    Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
+                    Type::SourceLinkLayerAddr
+                    | Type::TargetLinkLayerAddr
+                    | Type::Mtu
+                    | Type::Nonce => Ok(()),
                     Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
                     Type::Unknown(_) => Ok(()),
@@ -418,6 +424,7 @@ pub enum Repr<'a> {
     PrefixInformation(PrefixInformation),
     RedirectedHeader(RedirectedHeader<'a>),
     Mtu(u32),
+    Nonce([u8; 6]),
     Unknown {
         type_: u8,
         length: u8,
@@ -486,6 +493,7 @@ impl<'a> Repr<'a> {
                     Err(Error)
                 }
             }
+            Type::Nonce => Ok(Repr::Nonce(opt.data().try_into().map_err(|_| Error)?)),
             Type::Unknown(id) => {
                 // A length of 0 is invalid.
                 if opt.data_len() != 0 {
@@ -514,6 +522,7 @@ impl<'a> Repr<'a> {
                 (8 + header.buffer_len() + data.len() + 7) / 8 * 8
             }
             &Repr::Mtu(_) => field::MTU.end,
+            &Repr::Nonce(_) => 8,
             &Repr::Unknown { length, .. } => field::DATA(length).end,
         }
     }
@@ -568,6 +577,11 @@ impl<'a> Repr<'a> {
                 opt.set_data_len(1);
                 opt.set_mtu(mtu);
             }
+            Repr::Nonce(nonce) => {
+                opt.set_option_type(Type::Nonce);
+                opt.set_data_len(1);
+                opt.data_mut().copy_from_slice(&nonce);
+            }
             Repr::Unknown {
                 type_: id,
                 length,
@@ -602,6 +616,7 @@ impl<'a> fmt::Display for Repr<'a> {
             Repr::Mtu(mtu) => {
                 write!(f, "MTU mtu={mtu}")
             }
+            Repr::Nonce(_) => write!(f, "Nonce"),
             Repr::Unknown {
                 type_: id, length, ..
             } => {

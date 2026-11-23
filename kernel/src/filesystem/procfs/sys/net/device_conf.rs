@@ -20,7 +20,10 @@ use crate::{
         vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode, PrimaryWriteResult},
     },
     libs::mutex::MutexGuard,
-    net::{address::set_device_ipv6_disabled, rtnl},
+    net::{
+        address::{ipv6_autoconf::Setting, set_device_ipv6_disabled},
+        rtnl,
+    },
     process::namespace::net_namespace::NetNamespace,
 };
 
@@ -36,7 +39,14 @@ impl DeviceConfFamily {
     fn entries(self) -> &'static [&'static str] {
         match self {
             Self::Ipv4 => &["route_localnet"],
-            Self::Ipv6 => &["accept_ra", "disable_ipv6", "forwarding"],
+            Self::Ipv6 => &[
+                "accept_dad",
+                "accept_ra",
+                "addr_gen_mode",
+                "dad_transmits",
+                "disable_ipv6",
+                "forwarding",
+            ],
         }
     }
 }
@@ -187,6 +197,13 @@ impl DirOps for DeviceDirOps {
             (DeviceConfFamily::Ipv6, "disable_ipv6") => DeviceField::DisableIpv6,
             (DeviceConfFamily::Ipv6, "forwarding") => DeviceField::Ipv6Forwarding,
             (DeviceConfFamily::Ipv6, "accept_ra") => DeviceField::Ipv6AcceptRa,
+            (DeviceConfFamily::Ipv6, "accept_dad") => DeviceField::Ipv6Autoconf(Setting::AcceptDad),
+            (DeviceConfFamily::Ipv6, "addr_gen_mode") => {
+                DeviceField::Ipv6Autoconf(Setting::AddrGenMode)
+            }
+            (DeviceConfFamily::Ipv6, "dad_transmits") => {
+                DeviceField::Ipv6Autoconf(Setting::DadTransmits)
+            }
             _ => return Err(SystemError::ENOENT),
         };
         Ok(dir
@@ -222,6 +239,7 @@ enum DeviceField {
     DisableIpv6,
     Ipv6Forwarding,
     Ipv6AcceptRa,
+    Ipv6Autoconf(Setting),
 }
 
 #[derive(Debug)]
@@ -283,6 +301,7 @@ impl FileOps for DeviceFileOps {
                     )?;
                 }
                 DeviceField::Ipv6AcceptRa => iface.common().set_ipv6_accept_ra(&rtnl, value),
+                DeviceField::Ipv6Autoconf(setting) => setting.write(iface.common(), value)?,
             }
             Ok(PrimaryWriteResult::new(consumed))
         })
@@ -305,6 +324,7 @@ impl FileOps for DeviceFileOps {
             DeviceField::DisableIpv6 => iface.common().ipv6_disabled_value(),
             DeviceField::Ipv6Forwarding => iface.common().ipv6_forwarding(),
             DeviceField::Ipv6AcceptRa => iface.common().ipv6_accept_ra(),
+            DeviceField::Ipv6Autoconf(setting) => setting.read(iface.common()),
         };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }

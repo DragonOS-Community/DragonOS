@@ -1356,6 +1356,46 @@ TEST(UprobeTest, MremapDontUnmapReconcilesRetainedSourceAndDestination) {
     unlink(path);
 }
 
+template <typename Mutate>
+static void CheckRejectedMappingChanges(int (*target)(int), int argument, int expected_value,
+                                        int perf_fd, int expected_errno, Mutate mutate) {
+    constexpr int kIterations = 256;
+    std::atomic<bool> start{false};
+    std::atomic<bool> done{false};
+    int rejected = 0;
+    int result_errno = 0;
+    std::thread mutator([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (; rejected < kIterations; ++rejected) {
+            result_errno = mutate();
+            if (result_errno != expected_errno) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+        done.store(true, std::memory_order_release);
+    });
+    start.store(true, std::memory_order_release);
+    __u64 calls = 0;
+    do {
+        EXPECT_EQ(target(argument), expected_value);
+        ++calls;
+    } while (calls < kIterations || !done.load(std::memory_order_acquire));
+    mutator.join();
+    ASSERT_EQ(rejected, kIterations)
+        << "first unexpected mapping change: errno=" << result_errno;
+
+    // Also verify that the probe is armed after the final rejected mutation.
+    EXPECT_EQ(target(argument), expected_value);
+    ++calls;
+    __u64 count = 0;
+    ASSERT_EQ(read(perf_fd, &count, sizeof(count)), static_cast<ssize_t>(sizeof(count)));
+    EXPECT_EQ(count, calls)
+        << "rejected mapping changes must preserve every probe hit";
+}
+
 TEST(UprobeTest, RejectedMprotectDoesNotWithdrawProbe) {
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     char path[] = "/tmp/uprobe_mprotect_reject_XXXXXX";
@@ -1375,41 +1415,10 @@ TEST(UprobeTest, RejectedMprotectDoesNotWithdrawProbe) {
     ASSERT_EQ(munmap(static_cast<char*>(reservation) + page_size, page_size),
               0);
     auto target = reinterpret_cast<int (*)(int)>(executable);
-    std::atomic<bool> start{false};
-    std::atomic<bool> done{false};
-    std::atomic<int> syscall_failures{0};
-    std::atomic<__u64> calls{0};
-    std::thread mutator([&] {
-        while (!start.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-        // Keep issuing rejected mutations until the executing thread has
-        // completed a substantial number of calls. This prevents the test
-        // from passing with an empty overlap window on a fast scheduler.
-        while (calls.load(std::memory_order_acquire) < 256) {
-            errno = 0;
-            if (mprotect(executable, page_size * 2,
-                         PROT_READ | PROT_EXEC) == -1 && errno == ENOMEM) {
-                syscall_failures.fetch_add(1, std::memory_order_relaxed);
-            }
-            std::this_thread::yield();
-        }
-        done.store(true, std::memory_order_release);
+    CheckRejectedMappingChanges(target, 1, 3, event.get(), ENOMEM, [&] {
+        return mprotect(executable, page_size * 2, PROT_READ | PROT_EXEC) == -1
+            ? errno : 0;
     });
-    start.store(true, std::memory_order_release);
-    do {
-        EXPECT_EQ(target(1), 3);
-        calls.fetch_add(1, std::memory_order_relaxed);
-    } while (!done.load(std::memory_order_acquire));
-    mutator.join();
-    EXPECT_GT(syscall_failures.load(std::memory_order_relaxed), 0);
-    EXPECT_GE(calls.load(std::memory_order_relaxed), 256U);
-
-    __u64 count = 0;
-    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
-              static_cast<ssize_t>(sizeof(count)));
-    EXPECT_EQ(count, calls.load(std::memory_order_relaxed))
-        << "rejected mprotect must not create an unarmed execution window";
     munmap(executable, page_size);
     unlink(path);
 }
@@ -1430,38 +1439,10 @@ TEST(UprobeTest, RejectedMremapDoesNotWithdrawSourceProbe) {
     ASSERT_EQ(munmap(static_cast<char*>(reservation) + page_size, page_size),
               0);
     auto target = reinterpret_cast<int (*)(int)>(executable);
-    std::atomic<bool> start{false};
-    std::atomic<bool> done{false};
-    std::atomic<int> syscall_failures{0};
-    std::atomic<__u64> calls{0};
-    std::thread mutator([&] {
-        while (!start.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-        while (calls.load(std::memory_order_acquire) < 256) {
-            errno = 0;
-            if (mremap(executable, page_size * 2, page_size * 3,
-                       MREMAP_MAYMOVE) == MAP_FAILED && errno == EFAULT) {
-                syscall_failures.fetch_add(1, std::memory_order_relaxed);
-            }
-            std::this_thread::yield();
-        }
-        done.store(true, std::memory_order_release);
+    CheckRejectedMappingChanges(target, 2, 5, event.get(), EFAULT, [&] {
+        return mremap(executable, page_size * 2, page_size * 3, MREMAP_MAYMOVE) == MAP_FAILED
+            ? errno : 0;
     });
-    start.store(true, std::memory_order_release);
-    do {
-        EXPECT_EQ(target(2), 5);
-        calls.fetch_add(1, std::memory_order_relaxed);
-    } while (!done.load(std::memory_order_acquire));
-    mutator.join();
-    EXPECT_GT(syscall_failures.load(std::memory_order_relaxed), 0);
-    EXPECT_GE(calls.load(std::memory_order_relaxed), 256U);
-
-    __u64 count = 0;
-    ASSERT_EQ(read(event.get(), &count, sizeof(count)),
-              static_cast<ssize_t>(sizeof(count)));
-    EXPECT_EQ(count, calls.load(std::memory_order_relaxed))
-        << "rejected mremap must not create an unarmed source window";
     munmap(executable, page_size);
     unlink(path);
 }

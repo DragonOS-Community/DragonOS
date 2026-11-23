@@ -106,14 +106,12 @@ impl OutputRouteGuard<'_> {
             configured.extend_from_slice(&mirror);
             drop(mirror);
             let mut preferred_deadlines = Vec::new();
-            if device.is_none() {
-                let metadata = iface.common().address_metadata().lock();
-                for deadline in crate::net::address::preferred_ipv6_deadlines(&metadata) {
-                    preferred_deadlines
-                        .try_reserve(1)
-                        .map_err(|_| SystemError::ENOMEM)?;
-                    preferred_deadlines.push(deadline);
-                }
+            let metadata = iface.common().address_metadata().lock();
+            for deadline in crate::net::address::preferred_ipv6_deadlines(&metadata) {
+                preferred_deadlines
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+                preferred_deadlines.push(deadline);
             }
             addresses.push(NatDeviceAddresses {
                 ifindex: oif,

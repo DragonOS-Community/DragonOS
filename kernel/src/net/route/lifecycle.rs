@@ -7,7 +7,7 @@ use smoltcp::{
 use system_error::SystemError;
 
 use crate::{
-    driver::net::{types::InterfaceFlags, AddressMetadata, Iface},
+    driver::net::{types::InterfaceFlags, AddressMetadata, AddressState, Iface},
     net::address::CandidateAddressOwnership,
     net::rtnl::RtnlGuard,
     process::namespace::net_namespace::NetNamespace,
@@ -293,6 +293,15 @@ impl PreparedAddressRouteCommit {
         let was_ipv6_enabled = iface.common().ipv6_enabled();
         let is_ipv6_enabled = ipv6_enabled.unwrap_or(was_ipv6_enabled);
         let ifindex = iface.nic_id() as u32;
+        let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
+        let inactive_count = metadata
+            .iter()
+            .filter(|entry| !entry.state.is_usable())
+            .count();
+        if after_addresses.len() + inactive_count > address_capacity {
+            return Err(SystemError::ENOSPC);
+        }
+
         let before = match staged_before {
             Some(staged) => staged.try_clone()?,
             None => netns.router().fib.read().try_clone()?,
@@ -391,15 +400,6 @@ impl PreparedAddressRouteCommit {
             }
         }
         drop(device_list);
-
-        let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
-        let inactive_count = metadata
-            .iter()
-            .filter(|entry| !entry.state.is_usable())
-            .count();
-        if after_addresses.len() + inactive_count > address_capacity {
-            return Err(SystemError::ENOSPC);
-        }
 
         let projection = projection_for_iface(&candidate, ifindex)?;
         let mut other_oifs = Vec::new();
@@ -507,6 +507,7 @@ impl PreparedAddressRouteCommit {
         smol_iface.routes_mut().update(|routes| {
             core::mem::swap(routes, &mut projection);
         });
+        crate::net::address::publish_ipv6_preference(&mut smol_iface, &metadata);
         drop(smol_iface);
         other_projections.publish();
         if let Some(name) = renamed_to {
@@ -643,24 +644,26 @@ fn derived_address_entries_for_link_state(
             ra_route: None,
         });
     }
-    let addresses_with_state = addresses.iter().copied().map(|cidr| (cidr, true)).chain(
-        metadata
-            .iter()
-            .filter(|entry| !entry.state.is_usable())
-            .map(|entry| (entry.cidr, false)),
-    );
-    for (cidr, usable) in addresses_with_state {
-        let broadcast = metadata
-            .iter()
-            .find(|entry| entry.cidr == cidr)
-            .and_then(|entry| entry.broadcast);
+    let addresses_with_metadata = addresses
+        .iter()
+        .copied()
+        .map(|cidr| (cidr, metadata.iter().find(|entry| entry.cidr == cidr)))
+        .chain(
+            metadata
+                .iter()
+                .filter(|entry| !entry.state.is_usable())
+                .map(|entry| (entry.cidr, Some(entry))),
+        );
+    for (cidr, metadata) in addresses_with_metadata {
+        let state = metadata.map(|entry| entry.state).unwrap_or_default();
+        let broadcast = metadata.and_then(|entry| entry.broadcast);
         for entry in entries_for_address(
             iface,
             cidr,
             primary_for_prefix(addresses, cidr),
             broadcast,
             is_up,
-            usable,
+            state,
         )? {
             if !result.contains(&entry) {
                 result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
@@ -682,7 +685,7 @@ fn entries_for_address(
     primary: Option<IpAddress>,
     broadcast: Option<smoltcp::wire::Ipv4Address>,
     is_up: bool,
-    usable: bool,
+    state: AddressState,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let ipv4 = is_ipv4(cidr.address());
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
@@ -727,7 +730,7 @@ fn entries_for_address(
         }
         // Linux keeps the address object and its host-local route while the
         // device is down, but defers the IPv6 prefix route until NETDEV_UP.
-        IpCidr::Ipv6(_) => is_up,
+        IpCidr::Ipv6(_) => is_up && !matches!(state, AddressState::Slaac(_)),
     };
     if add_connected {
         result.push(connected);
@@ -747,11 +750,9 @@ fn entries_for_address(
         kind: RTN_LOCAL,
         ..connected
     };
-    // DragonOS addresses are immediately usable (the IPv6 address path does
-    // not yet model DAD), matching Linux IFA_F_NODAD semantics. Keep the host
-    // route while down; unlike a connected route, it represents local
-    // delivery and does not select the device for external output.
-    if usable && !result.contains(&local) {
+    // Keep the host route of a usable address while down. Unlike a
+    // connected route, it represents local delivery rather than egress.
+    if state.is_usable() && !result.contains(&local) {
         result.push(local);
     }
     if let IpCidr::Ipv4(cidr) = cidr {

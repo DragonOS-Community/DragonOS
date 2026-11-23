@@ -276,12 +276,9 @@ impl DumpSession {
                 Ok(Some(RouteNlSegment::NewAddr(addr::addr_to_segment(
                     request.header(),
                     &device,
-                    address.cidr,
+                    &address,
                     CSegmentType::NEWADDR,
-                    Some(&address.label),
-                    address.broadcast,
-                    address.state,
-                )?)))
+                ))))
             }
             RouteNlSegment::GetRoute(request) => {
                 if request.header().type_ == CSegmentType::GETRULE as u16 {

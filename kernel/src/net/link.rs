@@ -447,7 +447,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         let removed_neighbors = neighbors.map(|plan| plan.publish()).unwrap_or_default();
 
         if link_down || mtu.is_some_and(|mtu| mtu < super::address::IPV6_MIN_MTU) {
-            super::address::ipv6_autoconf::cancel(iface.common(), true);
+            super::address::ipv6_autoconf::cancel(iface.common());
         } else if was_up != is_up || mtu.is_some() || noarp_changed {
             super::address::ipv6_autoconf::changed(iface.common());
             if !was_up && is_up {

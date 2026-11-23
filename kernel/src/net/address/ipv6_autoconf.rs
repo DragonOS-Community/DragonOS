@@ -1,10 +1,10 @@
-//! Namespace-poller IPv6 link-local configuration. RTNL serializes address
+//! Namespace-poller IPv6 address configuration. RTNL serializes address
 //! changes. The receive path only latches a conflict against a live probe.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    Icmpv6Packet, Icmpv6Repr, IpCidr, IpProtocol, IpVersion, Ipv6Address, Ipv6AddressExt,
+    Icmpv6Packet, Icmpv6Repr, IpCidr, IpProtocol, IpVersion, Ipv6Address, Ipv6AddressExt, Ipv6Cidr,
     Ipv6Packet, Ipv6Repr, NdiscNeighborFlags, NdiscRepr,
 };
 use system_error::SystemError;
@@ -12,7 +12,7 @@ use system_error::SystemError;
 use crate::driver::net::{
     local_output::reserve_prepared_ip_output,
     types::{InterfaceFlags, InterfaceType},
-    Iface, IfaceCommon, LinkLocalState, Operstate,
+    AddressState, DadState, Iface, IfaceCommon, Operstate,
 };
 use crate::net::{
     ipv6_defrag::{fragment_offset, DefragDomain},
@@ -23,10 +23,10 @@ use crate::net::{
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::time::Instant;
 
-use super::ipv6_router_solicitation as solicitation;
+use super::{ipv6_router_solicitation as solicitation, ipv6_slaac};
 
 const RETRANS_US: i64 = 1_000_000;
-const RETRY_US: i64 = 100_000;
+pub(super) const RETRY_US: i64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
@@ -35,6 +35,7 @@ struct Probe {
     due: i64,
     remaining: u32,
     conflict: bool,
+    failed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,29 +46,66 @@ pub(crate) enum Setting {
     RouterSolicitations,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PrefixSetting {
+    AcceptRaPinfo,
+    Autoconf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefixSettings {
+    accept_ra_pinfo: i32,
+    autoconf: i32,
+}
+
+impl Default for PrefixSettings {
+    fn default() -> Self {
+        Self {
+            accept_ra_pinfo: 1,
+            autoconf: 1,
+        }
+    }
+}
+
+impl PrefixSettings {
+    pub(crate) fn get(self, setting: PrefixSetting) -> i32 {
+        match setting {
+            PrefixSetting::AcceptRaPinfo => self.accept_ra_pinfo,
+            PrefixSetting::Autoconf => self.autoconf,
+        }
+    }
+
+    pub(crate) fn set(&mut self, setting: PrefixSetting, value: i32) {
+        match setting {
+            PrefixSetting::AcceptRaPinfo => self.accept_ra_pinfo = value,
+            PrefixSetting::Autoconf => self.autoconf = value,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DeviceState {
+    pub(crate) prefixes: PrefixSettings,
     pub(super) solicitation: solicitation::State,
     mode: i32,
     accept_dad: i32,
     dad_transmits: i32,
     ready_seen: bool,
     retry: Option<i64>,
-    probe: Option<Probe>,
-    group: Option<Ipv6Address>,
+    probes: Vec<Probe>,
 }
 
 impl Default for DeviceState {
     fn default() -> Self {
         Self {
+            prefixes: PrefixSettings::default(),
             solicitation: solicitation::State::default(),
             mode: 0,
             accept_dad: 1,
             dad_transmits: 1,
             ready_seen: false,
             retry: None,
-            probe: None,
-            group: None,
+            probes: Vec::new(),
         }
     }
 }
@@ -113,29 +151,44 @@ pub(crate) fn changed(common: &IfaceCommon) {
     }
 }
 
-pub(crate) fn cancel(common: &IfaceCommon, restart: bool) {
-    let group = {
+pub(crate) fn cancel(common: &IfaceCommon) {
+    let probes = {
         let mut state = common.ipv6_autoconf.lock();
-        state.probe = None;
         state.retry = None;
-        if restart {
-            state.ready_seen = false;
-            state.solicitation.link_reset();
-        }
-        state.group.take()
+        state.ready_seen = false;
+        state.solicitation.link_reset();
+        core::mem::take(&mut state.probes)
     };
     if let Some(netns) = common.net_namespace() {
-        if let Some(group) = group {
-            let _ = common.multicast_leave_ref(&netns, group.into());
+        for target in probes.into_iter().map(|probe| probe.target) {
+            let _ = common.multicast_leave_ref(&netns, target.solicited_node().into());
         }
         netns.notify_ipv6_autoconf();
+    }
+}
+
+pub(super) fn cancel_target(common: &IfaceCommon, target: Ipv6Address) {
+    let joined = {
+        let mut state = common.ipv6_autoconf.lock();
+        if let Some(index) = state.probes.iter().position(|probe| probe.target == target) {
+            state.probes.remove(index);
+            true
+        } else {
+            false
+        }
+    };
+    if joined {
+        if let Some(netns) = common.net_namespace() {
+            let _ = common.multicast_leave_ref(&netns, target.solicited_node().into());
+            netns.notify_ipv6_autoconf();
+        }
     }
 }
 
 /// Moving a device discards its IPv6 configuration in the source namespace.
 /// Release the pending solicited-node membership before changing ownership.
 pub(crate) fn reset_for_netns_move(common: &IfaceCommon) {
-    cancel(common, true);
+    cancel(common);
     *common.ipv6_autoconf.lock() = DeviceState::default();
 }
 
@@ -146,20 +199,13 @@ pub(super) fn carrier_ready(iface: &dyn Iface) -> bool {
     )
 }
 
-fn link_local(iface: &dyn Iface) -> Option<Ipv6Address> {
+pub(super) fn address_from_mac(iface: &dyn Iface, prefix: Ipv6Address) -> Option<Ipv6Address> {
     let mac = iface.mac().0;
     if mac[0] & 1 != 0 || mac == [0; 6] {
         return None;
     }
-    Some(Ipv6Address::from([
-        0xfe,
-        0x80,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+    let mut address = prefix.octets();
+    address[8..].copy_from_slice(&[
         mac[0] ^ 2,
         mac[1],
         mac[2],
@@ -168,7 +214,8 @@ fn link_local(iface: &dyn Iface) -> Option<Ipv6Address> {
         mac[3],
         mac[4],
         mac[5],
-    ]))
+    ]);
+    Some(Ipv6Address::from(address))
 }
 
 pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
@@ -188,9 +235,16 @@ pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
         if iface.type_() != InterfaceType::ETHER {
             continue;
         }
-        let dad_due = poll_device(&rtnl, netns, &iface, Instant::now().total_micros());
+        let now = Instant::now().total_micros();
+        let lifetime_due = ipv6_slaac::poll(&rtnl, netns, &iface, now);
+        let dad_due = poll_device(&rtnl, netns, &iface, now);
         let solicitation_due = solicitation::poll(netns, &iface);
-        if let Some(due) = dad_due.into_iter().chain(solicitation_due).min() {
+        if let Some(due) = lifetime_due
+            .into_iter()
+            .chain(dad_due)
+            .chain(solicitation_due)
+            .min()
+        {
             next = Some(next.map_or(due, |current: i64| current.min(due)));
         }
     }
@@ -211,13 +265,13 @@ fn poll_device(
     }
     let carrier = carrier_ready(iface.as_ref());
     let common = iface.common();
-    let (start, probe, accept_dad) = {
+    let (start, accept_dad) = {
         let state = common.ipv6_autoconf.lock();
         let start = carrier
             && state.mode == 0
             && !state.ready_seen
             && state.retry.is_none_or(|due| due <= now);
-        (start, state.probe, state.accept_dad)
+        (start, state.accept_dad)
     };
     if start {
         let result = start_address(netns, iface, now);
@@ -228,37 +282,56 @@ fn poll_device(
             state.ready_seen = true;
             None
         };
-        return state.retry.or(state.probe.map(|probe| probe.due));
     }
 
-    if let Some(probe) = probe {
-        // accept_dad controls whether a new probe starts. A write during
-        // an active probe only changes the policy for a detected conflict.
-        let skip = iface.flags().contains(InterfaceFlags::NOARP);
+    let skip = iface.flags().contains(InterfaceFlags::NOARP);
+    let mut index = 0;
+    loop {
+        let probe = common.ipv6_autoconf.lock().probes.get(index).copied();
+        let Some(probe) = probe else { break };
+        if probe.failed || (!carrier && !probe.target.is_link_local() && !probe.conflict && !skip) {
+            index += 1;
+            continue;
+        }
+        // A write to accept_dad during an active probe only changes the
+        // interface-wide policy for a detected link-local conflict.
+        if probe.conflict && probe.target.is_link_local() && accept_dad == 2 {
+            return super::set_device_ipv6_disabled(rtnl, netns, iface, 1)
+                .err()
+                .map(|_| now.saturating_add(RETRY_US));
+        }
         if probe.conflict || skip || (probe.remaining == 0 && probe.due <= now) {
-            let result = if probe.conflict && accept_dad == 2 {
-                super::set_device_ipv6_disabled(rtnl, netns, iface, 1)
-            } else {
-                finish_address(netns, iface, probe)
-            };
-            if result.is_err() {
-                return Some(now.saturating_add(RETRY_US));
+            match finish_address(rtnl, netns, iface, index, probe) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => return Some(now.saturating_add(RETRY_US)),
             }
         } else if probe.due <= now {
             // DAD counts attempts. A local routing, queue or firewall
             // failure must not leave the address tentative indefinitely.
             let _ = send_probe(netns, iface.as_ref(), probe);
-            if let Some(current) = common.ipv6_autoconf.lock().probe.as_mut() {
-                current.remaining -= 1;
-                current.due = Instant::now().total_micros().saturating_add(RETRANS_US);
-            }
+            let mut state = common.ipv6_autoconf.lock();
+            let current = &mut state.probes[index];
+            current.remaining -= 1;
+            current.due = Instant::now().total_micros().saturating_add(RETRANS_US);
         }
+        index += 1;
     }
     let state = common.ipv6_autoconf.lock();
     let retry = if carrier { state.retry } else { None };
-    retry.or(state
-        .probe
-        .map(|probe| if probe.conflict { now } else { probe.due }))
+    retry
+        .into_iter()
+        .chain(
+            state
+                .probes
+                .iter()
+                .filter(|probe| {
+                    !probe.failed
+                        && (carrier || probe.target.is_link_local() || probe.conflict || skip)
+                })
+                .map(|probe| if probe.conflict { now } else { probe.due }),
+        )
+        .min()
 }
 
 fn start_address(
@@ -266,7 +339,10 @@ fn start_address(
     iface: &Arc<dyn Iface>,
     now: i64,
 ) -> Result<(), SystemError> {
-    let Some(target) = link_local(iface.as_ref()) else {
+    let Some(target) = address_from_mac(
+        iface.as_ref(),
+        Ipv6Address::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    ) else {
         return Ok(());
     };
     let cidr = IpCidr::new(target.into(), 64);
@@ -287,78 +363,143 @@ fn start_address(
         return Ok(());
     }
 
+    start_address_dad(netns, iface, Ipv6Cidr::new(target, 64), None, now)
+}
+
+pub(super) fn start_address_dad(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    address: Ipv6Cidr,
+    lifetimes: Option<ipv6_slaac::Lifetimes>,
+    now: i64,
+) -> Result<(), SystemError> {
+    let target = address.address();
+    let cidr = IpCidr::Ipv6(address);
     let (accept_dad, transmits) = {
         let state = iface.common().ipv6_autoconf.lock();
         (state.accept_dad, state.dad_transmits)
     };
     let no_dad = accept_dad <= 0 || transmits == 0 || iface.flags().contains(InterfaceFlags::NOARP);
     let state = if no_dad {
-        LinkLocalState::Usable
+        DadState::Usable
     } else {
-        LinkLocalState::Tentative
+        DadState::Tentative
     };
-    let prepared = super::prepare_automatic_link_local(netns, iface, cidr, state)?;
+    let address_state = if lifetimes.is_some() {
+        AddressState::Slaac(state)
+    } else {
+        AddressState::AutoLinkLocal(state)
+    };
+    let prepared = super::prepare_automatic_address(netns, iface, cidr, address_state, lifetimes)?;
+    if lifetimes.is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros())) {
+        return Ok(());
+    }
     if !no_dad {
-        let group = target.solicited_node();
-        iface.common().multicast_join_ref(netns, group.into())?;
-        let mut nonce = [0; 6];
-        while nonce == [0; 6] {
-            crate::libs::rand::fill_random_bytes(&mut nonce);
-        }
-        // Spread first probes when several ports become ready together.
-        let jitter =
-            i64::from(u32::from_be_bytes([nonce[0], nonce[1], nonce[2], nonce[3]])) % RETRANS_US;
-        let mut work = iface.common().ipv6_autoconf.lock();
-        work.group = Some(group);
-        work.probe = Some(Probe {
-            target,
-            nonce,
-            due: now.saturating_add(jitter),
-            remaining: transmits as u32,
-            conflict: false,
-        });
+        start_probe(netns, iface.common(), target, transmits as u32, now)?;
     }
     publish_address(netns, iface, cidr, state, prepared);
     Ok(())
 }
 
+fn start_probe(
+    netns: &Arc<NetNamespace>,
+    common: &IfaceCommon,
+    target: Ipv6Address,
+    transmits: u32,
+    now: i64,
+) -> Result<(), SystemError> {
+    common
+        .ipv6_autoconf
+        .lock()
+        .probes
+        .try_reserve(1)
+        .map_err(|_| SystemError::ENOMEM)?;
+    common.multicast_join_ref(netns, target.solicited_node().into())?;
+    let mut nonce = [0; 6];
+    while nonce == [0; 6] {
+        crate::libs::rand::fill_random_bytes(&mut nonce);
+    }
+    // Spread first probes when several addresses become ready together.
+    let jitter =
+        i64::from(u32::from_be_bytes([nonce[0], nonce[1], nonce[2], nonce[3]])) % RETRANS_US;
+    common.ipv6_autoconf.lock().probes.push(Probe {
+        target,
+        nonce,
+        due: now.saturating_add(jitter),
+        remaining: transmits,
+        conflict: false,
+        failed: false,
+    });
+    Ok(())
+}
+
 fn finish_address(
+    rtnl: &rtnl::RtnlGuard,
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
+    index: usize,
     observed: Probe,
-) -> Result<(), SystemError> {
+) -> Result<bool, SystemError> {
     let cidr = IpCidr::new(observed.target.into(), 64);
     let state = if observed.conflict {
-        LinkLocalState::DadFailed
+        DadState::DadFailed
     } else {
-        LinkLocalState::Usable
+        DadState::Usable
     };
-    let prepared = super::prepare_automatic_link_local(netns, iface, cidr, state)?;
-    let group = {
-        let mut work = iface.common().ipv6_autoconf.lock();
-        if work.probe != Some(observed) {
-            // A conflict arriving during transaction preparation wins.
-            return Ok(());
+    let (old_state, lifetimes) = iface
+        .common()
+        .address_metadata()
+        .lock()
+        .iter()
+        .find(|entry| entry.cidr == cidr)
+        .map(|entry| (entry.state, entry.lifetimes))
+        .ok_or(SystemError::EADDRNOTAVAIL)?;
+    let address_state = match old_state {
+        AddressState::Slaac(_) => {
+            if observed.conflict
+                || lifetimes
+                    .is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros()))
+            {
+                ipv6_slaac::remove(rtnl, netns, iface, cidr)?;
+                return Ok(true);
+            }
+            AddressState::Slaac(state)
         }
-        work.probe = None;
-        if state == LinkLocalState::Usable {
-            work.group.take()
-        } else {
-            None
-        }
+        AddressState::ManualDad(_) if state == DadState::Usable => AddressState::Configured,
+        AddressState::ManualDad(_) => AddressState::ManualDad(state),
+        _ => AddressState::AutoLinkLocal(state),
     };
-    publish_address(netns, iface, cidr, state, prepared);
-    if let Some(group) = group {
-        let _ = iface.common().multicast_leave_ref(netns, group.into());
+    let prepared = super::prepare_automatic_address(netns, iface, cidr, address_state, lifetimes)?;
+    if lifetimes.is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros())) {
+        ipv6_slaac::remove(rtnl, netns, iface, cidr)?;
+        return Ok(true);
     }
-    Ok(())
+    {
+        let mut work = iface.common().ipv6_autoconf.lock();
+        if work.probes.get(index) != Some(&observed) {
+            // A conflict arriving during transaction preparation wins.
+            return Ok(false);
+        }
+        if state == DadState::DadFailed {
+            work.probes[index].failed = true;
+        } else {
+            work.probes.remove(index);
+        }
+    }
+    publish_address(netns, iface, cidr, state, prepared);
+    if state == DadState::Usable {
+        let _ = iface
+            .common()
+            .multicast_leave_ref(netns, observed.target.solicited_node().into());
+    }
+    Ok(true)
 }
 
 fn publish_address(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
-    state: LinkLocalState,
+    state: DadState,
     prepared: crate::net::route::PreparedAddressRouteCommit,
 ) {
     let routes = prepared.publish(netns, iface);
@@ -366,7 +507,7 @@ fn publish_address(
         netns,
         iface,
         alloc::vec::Vec::new(),
-        (state != LinkLocalState::Tentative).then_some(cidr),
+        (state != DadState::Tentative).then_some(cidr),
         Some(routes),
         alloc::vec::Vec::new(),
     );
@@ -447,9 +588,15 @@ pub(crate) fn receive(
     if !matches!(bytes.get(offset), Some(135 | 136)) {
         return;
     }
-    let Some(probe) = common.ipv6_autoconf.lock().probe else {
+    if !common
+        .ipv6_autoconf
+        .lock()
+        .probes
+        .iter()
+        .any(|probe| !probe.failed)
+    {
         return;
-    };
+    }
     let Ok(ip) = Ipv6Packet::new_checked(bytes) else {
         return;
     };
@@ -468,6 +615,17 @@ pub(crate) fn receive(
         return;
     };
     let Ok(message) = Icmpv6Packet::new_checked(payload) else {
+        return;
+    };
+    let target = message.target_addr();
+    let Some(probe) = common
+        .ipv6_autoconf
+        .lock()
+        .probes
+        .iter()
+        .find(|probe| probe.target == target && !probe.failed)
+        .copied()
+    else {
         return;
     };
     let Ok(Icmpv6Repr::Ndisc(ndp)) = Icmpv6Repr::parse(
@@ -501,12 +659,15 @@ pub(crate) fn receive(
     };
     if conflict {
         let mut state = common.ipv6_autoconf.lock();
-        if let Some(current) = state.probe.as_mut() {
-            if current.target == probe.target && current.nonce == probe.nonce && !current.conflict {
-                current.conflict = true;
-                drop(state);
-                netns.notify_ipv6_autoconf();
-            }
+        if let Some(current) = state.probes.iter_mut().find(|current| {
+            current.target == probe.target
+                && current.nonce == probe.nonce
+                && !current.conflict
+                && !current.failed
+        }) {
+            current.conflict = true;
+            drop(state);
+            netns.notify_ipv6_autoconf();
         }
     }
 }

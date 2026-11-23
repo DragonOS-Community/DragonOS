@@ -9,6 +9,7 @@ use crate::libs::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::libs::rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 use crate::libs::spinlock::SpinLock;
 use crate::libs::wait_queue::WaitQueue;
+use crate::net::address::ipv6_autoconf::PrefixSettings;
 use crate::net::conntrack::{CtCandidate, CtConfirm, CtError, CtPacketContext, CtState};
 use crate::net::ipv4_defrag::{DefragDomain, Ipv4Defragmenter, ReassembledIpv4, ReassemblyResult};
 use crate::net::ipv6_defrag::{
@@ -309,6 +310,8 @@ pub struct NetNamespace {
     ipv6_default_forwarding: AtomicI32,
     ipv6_all_accept_ra: AtomicI32,
     ipv6_default_accept_ra: AtomicI32,
+    pub(crate) ipv6_all_prefixes: SpinLock<PrefixSettings>,
+    pub(crate) ipv6_default_prefixes: SpinLock<PrefixSettings>,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -1422,6 +1425,8 @@ impl NetNamespace {
             ipv6_default_forwarding: AtomicI32::new(0),
             ipv6_all_accept_ra: AtomicI32::new(1),
             ipv6_default_accept_ra: AtomicI32::new(1),
+            ipv6_all_prefixes: SpinLock::new(PrefixSettings::default()),
+            ipv6_default_prefixes: SpinLock::new(PrefixSettings::default()),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1484,6 +1489,8 @@ impl NetNamespace {
             ipv6_default_forwarding: AtomicI32::new(0),
             ipv6_all_accept_ra: AtomicI32::new(1),
             ipv6_default_accept_ra: AtomicI32::new(1),
+            ipv6_all_prefixes: SpinLock::new(PrefixSettings::default()),
+            ipv6_default_prefixes: SpinLock::new(PrefixSettings::default()),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });

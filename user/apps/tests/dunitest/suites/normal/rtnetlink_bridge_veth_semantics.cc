@@ -604,7 +604,7 @@ TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDA
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
-TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRoutes) {
+TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRoutesAndAddresses) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -642,6 +642,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
 
             RouteFd monitor(RTMGRP_IPV6_ROUTE);
             ASSERT_GE(monitor.fd, 0);
+            RouteFd address_monitor(RTMGRP_IPV6_IFADDR);
+            ASSERT_GE(address_monitor.fd, 0);
             const int injector = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(ETH_P_IPV6));
             ASSERT_GE(injector, 0);
             const sockaddr_ll multicast = {
@@ -653,7 +655,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_EQ(inet_pton(AF_INET6, "ff02::1", &all_nodes), 1);
             ASSERT_EQ(inet_pton(AF_INET6, "fd42:2324:47:77::", &prefix), 1);
             const auto advertise = [&](uint16_t lifetime,
-                                       std::optional<uint32_t> prefix_lifetime = std::nullopt) {
+                                       std::optional<uint32_t> prefix_lifetime = std::nullopt,
+                                       bool autonomous = false) {
                 constexpr size_t ip_header = 40, ra_header = 16, pio_length = 32;
                 const size_t ra_length = ra_header + (prefix_lifetime ? pio_length : 0);
                 std::vector<uint8_t> packet(ip_header + ra_length);
@@ -672,9 +675,10 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
                     pio[0] = 3;
                     pio[1] = pio_length / 8;
                     pio[2] = 64;
-                    pio[3] = 0x80;  // On-link only.
+                    pio[3] = autonomous ? 0x40 : 0x80;
                     const uint32_t valid = htonl(*prefix_lifetime);
                     std::memcpy(pio + 4, &valid, sizeof(valid));
+                    if (autonomous) std::memcpy(pio + 8, &valid, sizeof(valid));
                     std::memcpy(pio + 16, &prefix, sizeof(prefix));
                 }
                 uint32_t sum = ra_length + IPPROTO_ICMPV6;
@@ -746,6 +750,57 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE, true));
             ASSERT_NO_FATAL_FAILURE(advertise(0, 0));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE, true));
+            const auto expect_address = [&](uint16_t kind, bool deprecated) {
+                for (int attempt = 0; attempt < 16; ++attempt) {
+                    pollfd readable{address_monitor.fd, POLLIN, 0};
+                    ASSERT_EQ(poll(&readable, 1, 8000), 1);
+                    alignas(nlmsghdr) std::array<uint8_t, 4096> bytes{};
+                    int remaining = recv(address_monitor.fd, bytes.data(), bytes.size(), 0);
+                    ASSERT_GT(remaining, 0);
+                    for (auto* reply = reinterpret_cast<nlmsghdr*>(bytes.data());
+                         NLMSG_OK(reply, remaining); reply = NLMSG_NEXT(reply, remaining)) {
+                        if (reply->nlmsg_type != kind ||
+                            reply->nlmsg_len < NLMSG_LENGTH(sizeof(ifaddrmsg))) continue;
+                        const auto* address = reinterpret_cast<const ifaddrmsg*>(NLMSG_DATA(reply));
+                        if (address->ifa_family != AF_INET6 || address->ifa_index != receive_ifindex ||
+                            address->ifa_prefixlen != 64 ||
+                            (address->ifa_flags & IFA_F_TENTATIVE)) continue;
+                        uint8_t protocol = 0;
+                        ifa_cacheinfo cache{};
+                        bool has_cache = false;
+                        in6_addr value{};
+                        int size = IFA_PAYLOAD(reply);
+                        for (auto* attr = IFA_RTA(address); RTA_OK(attr, size);
+                             attr = RTA_NEXT(attr, size)) {
+                            if (attr->rta_type == IFA_ADDRESS && RTA_PAYLOAD(attr) == sizeof(value))
+                                std::memcpy(&value, RTA_DATA(attr), sizeof(value));
+                            if (attr->rta_type == IFA_CACHEINFO && RTA_PAYLOAD(attr) == sizeof(cache)) {
+                                std::memcpy(&cache, RTA_DATA(attr), sizeof(cache));
+                                has_cache = true;
+                            }
+                            if (attr->rta_type == IFA_PROTO && RTA_PAYLOAD(attr) == sizeof(protocol))
+                                std::memcpy(&protocol, RTA_DATA(attr), sizeof(protocol));
+                        }
+                        if (std::memcmp(&value, &prefix, 8)) continue;
+                        EXPECT_EQ(protocol, IFAPROT_KERNEL_RA);
+                        EXPECT_TRUE(has_cache);
+                        EXPECT_EQ((address->ifa_flags & IFA_F_DEPRECATED) != 0, deprecated);
+                        EXPECT_EQ(address->ifa_flags & IFA_F_PERMANENT, 0);
+                        if (kind == RTM_NEWADDR) {
+                            EXPECT_GT(cache.ifa_valid, 0u);
+                            EXPECT_EQ(cache.ifa_prefered == 0u, deprecated);
+                        }
+                        return;
+                    }
+                }
+                FAIL() << "missing SLAAC address notification " << kind;
+            };
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 8, true));
+            ASSERT_NO_FATAL_FAILURE(expect_address(RTM_NEWADDR, false));
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 0, true));
+            ASSERT_NO_FATAL_FAILURE(expect_address(RTM_NEWADDR, true));
+            ASSERT_NO_FATAL_FAILURE(expect_address(RTM_DELADDR, true));
+
             ASSERT_NO_FATAL_FAILURE(advertise(30));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE));
             LinkRequest lower_mtu(RTM_SETLINK, 0, seq++);

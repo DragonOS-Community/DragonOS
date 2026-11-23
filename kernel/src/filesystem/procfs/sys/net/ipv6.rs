@@ -10,7 +10,7 @@ use crate::filesystem::{
     vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode, PrimaryWriteResult},
 };
 use crate::libs::mutex::MutexGuard;
-use crate::net::rtnl;
+use crate::net::{address::ipv6_autoconf::PrefixSetting, rtnl};
 use alloc::{
     format,
     string::ToString,
@@ -177,6 +177,8 @@ impl DirOps for NamespaceConfDirOps {
         let field = match name {
             "forwarding" => NamespaceConfField::Forwarding,
             "accept_ra" => NamespaceConfField::AcceptRa,
+            "accept_ra_pinfo" => NamespaceConfField::Prefix(PrefixSetting::AcceptRaPinfo),
+            "autoconf" => NamespaceConfField::Prefix(PrefixSetting::Autoconf),
             _ => return Err(SystemError::ENOENT),
         };
         Ok(dir
@@ -203,6 +205,8 @@ impl DirOps for NamespaceConfDirOps {
     fn populate_children(&self, dir: &ProcDir<Self>) {
         let _ = self.lookup_child(dir, "forwarding");
         let _ = self.lookup_child(dir, "accept_ra");
+        let _ = self.lookup_child(dir, "accept_ra_pinfo");
+        let _ = self.lookup_child(dir, "autoconf");
     }
 }
 
@@ -210,6 +214,7 @@ impl DirOps for NamespaceConfDirOps {
 enum NamespaceConfField {
     Forwarding,
     AcceptRa,
+    Prefix(PrefixSetting),
 }
 
 #[derive(Debug)]
@@ -268,6 +273,12 @@ impl FileOps for NamespaceConfFileOps {
                 (NamespaceConfField::AcceptRa, NamespaceConfScope::Default) => {
                     netns.set_ipv6_default_accept_ra(&rtnl, value);
                 }
+                (NamespaceConfField::Prefix(setting), NamespaceConfScope::All) => {
+                    netns.ipv6_all_prefixes.lock().set(*setting, value);
+                }
+                (NamespaceConfField::Prefix(setting), NamespaceConfScope::Default) => {
+                    netns.ipv6_default_prefixes.lock().set(*setting, value);
+                }
             }
             Ok(PrimaryWriteResult::new(consumed))
         })
@@ -298,6 +309,12 @@ impl FileOps for NamespaceConfFileOps {
             (NamespaceConfField::AcceptRa, NamespaceConfScope::All) => netns.ipv6_all_accept_ra(),
             (NamespaceConfField::AcceptRa, NamespaceConfScope::Default) => {
                 netns.ipv6_default_accept_ra()
+            }
+            (NamespaceConfField::Prefix(setting), NamespaceConfScope::All) => {
+                netns.ipv6_all_prefixes.lock().get(*setting)
+            }
+            (NamespaceConfField::Prefix(setting), NamespaceConfScope::Default) => {
+                netns.ipv6_default_prefixes.lock().get(*setting)
             }
         };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())

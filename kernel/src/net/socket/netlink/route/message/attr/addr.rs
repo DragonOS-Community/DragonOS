@@ -18,6 +18,7 @@ enum AddrAttrClass {
     FLAGS = 8,
     RT_PRIORITY = 9,
     TARGET_NETNSID = 10,
+    PROTO = 11,
 }
 
 impl TryFrom<u16> for AddrAttrClass {
@@ -36,6 +37,7 @@ impl TryFrom<u16> for AddrAttrClass {
             8 => Ok(AddrAttrClass::FLAGS),
             9 => Ok(AddrAttrClass::RT_PRIORITY),
             10 => Ok(AddrAttrClass::TARGET_NETNSID),
+            11 => Ok(AddrAttrClass::PROTO),
             _ => Err(SystemError::EINVAL),
         }
     }
@@ -50,6 +52,9 @@ pub enum AddrAttr {
     Label(Vec<u8>),
     /// Raw payload: IPv4 and IPv6 apply different policies to this attribute.
     Broadcast(Vec<u8>),
+    CacheInfo([u8; 16]),
+    Flags([u8; 4]),
+    Proto([u8; 1]),
 }
 
 impl AddrAttr {
@@ -59,6 +64,9 @@ impl AddrAttr {
             AddrAttr::Local(_) => AddrAttrClass::LOCAL,
             AddrAttr::Label(_) => AddrAttrClass::LABEL,
             AddrAttr::Broadcast(_) => AddrAttrClass::BROADCAST,
+            AddrAttr::Proto(_) => AddrAttrClass::PROTO,
+            AddrAttr::Flags(_) => AddrAttrClass::FLAGS,
+            AddrAttr::CacheInfo(_) => AddrAttrClass::CACHEINFO,
         }
     }
 }
@@ -74,6 +82,9 @@ impl Attribute for AddrAttr {
             AddrAttr::Local(addr) => addr.as_ref(),
             AddrAttr::Label(label) => label.as_slice(),
             AddrAttr::Broadcast(value) => value.as_slice(),
+            AddrAttr::Proto(bytes) => bytes,
+            AddrAttr::Flags(bytes) => bytes,
+            AddrAttr::CacheInfo(bytes) => bytes,
         }
     }
 

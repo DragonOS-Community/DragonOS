@@ -235,6 +235,8 @@ impl PreparedNetnsBinding {
         common
             .ipv6_accept_ra
             .store(self.netns.ipv6_default_accept_ra(), Ordering::Release);
+        let prefixes = *self.netns.ipv6_default_prefixes.lock();
+        common.ipv6_autoconf.lock().prefixes = prefixes;
         common.route_localnet.store(0, Ordering::Release);
         *namespace = Arc::downgrade(&self.netns);
         sockets.set_udp_ingress_handler(Some(self.ingress));
@@ -284,6 +286,7 @@ impl IfaceCommon {
                 label: None,
                 broadcast: None,
                 state: Default::default(),
+                lifetimes: None,
             })
             .collect();
         let sockets = smoltcp::iface::SocketSet::new(Vec::new());
@@ -2096,7 +2099,7 @@ impl IfaceCommon {
         self.begin_netns_move();
         self.wait_for_poll_before_netns_move();
         self.retire_queued_work_for_netns_move();
-        crate::net::address::ipv6_autoconf::cancel(self, true);
+        crate::net::address::ipv6_autoconf::cancel(self);
     }
 
     pub(crate) fn retire_queued_work_for_netns_move(&self) {

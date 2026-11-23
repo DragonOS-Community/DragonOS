@@ -6,17 +6,18 @@
 
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 
-use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use system_error::SystemError;
 
 use crate::{
-    driver::net::{types::InterfaceFlags, AddressMetadata, AddressState, Iface, LinkLocalState},
+    driver::net::{types::InterfaceFlags, AddressMetadata, AddressState, DadState, Iface},
     net::rtnl::RtnlGuard,
     process::namespace::net_namespace::NetNamespace,
 };
 
 pub(crate) mod ipv6_autoconf;
 pub(in crate::net) mod ipv6_router_solicitation;
+pub(crate) mod ipv6_slaac;
 
 const IPV4_MIN_MTU: usize = 68;
 pub(crate) const IPV6_MIN_MTU: usize = 1280;
@@ -45,6 +46,7 @@ pub(crate) struct AddressInfo {
     pub label: CString,
     pub broadcast: Option<Ipv4Address>,
     pub state: AddressState,
+    pub lifetimes: Option<ipv6_slaac::Lifetimes>,
 }
 
 pub(in crate::net) struct PreparedLinkAddressChange {
@@ -128,9 +130,10 @@ fn removed_address_info(
     entry: Option<AddressMetadata>,
     default_label: &CString,
 ) -> Result<AddressInfo, SystemError> {
-    let (label, broadcast, state) = entry.map_or((None, None, AddressState::Configured), |entry| {
-        (entry.label, entry.broadcast, entry.state)
-    });
+    let (label, broadcast, state, lifetimes) = entry
+        .map_or((None, None, AddressState::Configured, None), |entry| {
+            (entry.label, entry.broadcast, entry.state, entry.lifetimes)
+        });
     Ok(AddressInfo {
         cidr,
         label: match label {
@@ -139,6 +142,7 @@ fn removed_address_info(
         },
         broadcast,
         state,
+        lifetimes,
     })
 }
 
@@ -206,7 +210,7 @@ pub(crate) fn set_device_ipv6_disabled(
         enabled,
     );
     if !enabled {
-        ipv6_autoconf::cancel(iface.common(), true);
+        ipv6_autoconf::cancel(iface.common());
         iface.common().fail_deferred_ipv6();
     } else {
         ipv6_autoconf::changed(iface.common());
@@ -297,19 +301,6 @@ pub(in crate::net) fn mutate_labeled_address(
     )
 }
 
-pub(in crate::net) fn address_broadcast(
-    iface: &Arc<dyn Iface>,
-    cidr: IpCidr,
-) -> Option<Ipv4Address> {
-    iface
-        .common()
-        .address_metadata()
-        .lock()
-        .iter()
-        .find(|entry| entry.cidr == cidr)
-        .and_then(|entry| entry.broadcast)
-}
-
 pub(in crate::net) fn address_label(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
@@ -355,7 +346,48 @@ pub(in crate::net) fn address_at(
         label,
         broadcast: entry.and_then(|entry| entry.broadcast),
         state: entry.map(|entry| entry.state).unwrap_or_default(),
+        lifetimes: entry.and_then(|entry| entry.lifetimes),
     }))
+}
+
+pub(in crate::net) fn preferred_ipv6_deadlines(
+    metadata: &[AddressMetadata],
+) -> impl Iterator<Item = (Ipv6Address, i64)> + '_ {
+    metadata.iter().filter_map(|entry| {
+        if !entry.state.is_usable() {
+            return None;
+        }
+        let IpAddress::Ipv6(address) = entry.cidr.address() else {
+            return None;
+        };
+        Some((address, entry.lifetimes?.preferred_until_us()?))
+    })
+}
+
+pub(in crate::net) fn publish_ipv6_preference(
+    iface: &mut smoltcp::iface::Interface,
+    metadata: &[AddressMetadata],
+) {
+    iface.set_ipv6_preferred_deadlines(
+        preferred_ipv6_deadlines(metadata)
+            .map(|(address, deadline)| (address, smoltcp::time::Instant::from_micros(deadline))),
+    );
+}
+
+pub(in crate::net) fn address_info(
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+) -> Result<AddressInfo, SystemError> {
+    let label = address_label(iface, cidr)?;
+    let metadata = iface.common().address_metadata().lock();
+    let entry = metadata.iter().find(|entry| entry.cidr == cidr);
+    Ok(AddressInfo {
+        cidr,
+        label,
+        broadcast: entry.and_then(|entry| entry.broadcast),
+        state: entry.map(|entry| entry.state).unwrap_or_default(),
+        lifetimes: entry.and_then(|entry| entry.lifetimes),
+    })
 }
 
 pub(in crate::net) fn address_state(iface: &Arc<dyn Iface>, cidr: IpCidr) -> AddressState {
@@ -502,15 +534,15 @@ pub(in crate::net) fn prepare_link_address_change(
         && !was_up
         && iface.common().ipv6_enabled()
         && iface.flags().contains(InterfaceFlags::LOOPBACK);
-    let remove_auto = was_up
+    let remove_dad_addresses = was_up
         && !is_up
         && iface
             .common()
             .address_metadata()
             .lock()
             .iter()
-            .any(|entry| matches!(entry.state, AddressState::AutoLinkLocal(_)));
-    if mtu.is_none() && !loopback_up && !remove_auto {
+            .any(|entry| entry.state.has_dad_state());
+    if mtu.is_none() && !loopback_up && !remove_dad_addresses {
         return Ok(None);
     }
     let mirror = iface.router_common().ip_addrs.read();
@@ -528,7 +560,7 @@ pub(in crate::net) fn prepare_link_address_change(
     let discard_learned_defaults =
         mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && iface.mtu() >= IPV6_MIN_MTU);
     if !discard_learned_defaults
-        && !remove_auto
+        && !remove_dad_addresses
         && restored.is_none()
         && !mirror.iter().copied().any(mtu_removal)
     {
@@ -541,7 +573,7 @@ pub(in crate::net) fn prepare_link_address_change(
     let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
     let (removed, deleted_addresses) =
         prepare_address_removal(iface, &mut after, &mut metadata, |cidr, state| {
-            mtu_removal(cidr) || (remove_auto && matches!(state, AddressState::AutoLinkLocal(_)))
+            mtu_removal(cidr) || (remove_dad_addresses && state.has_dad_state())
         })?;
 
     let (metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {
@@ -708,6 +740,7 @@ fn commit_unpublished(
                 label: requested_label,
                 broadcast: requested_broadcast,
                 state: AddressState::Configured,
+                lifetimes: None,
             });
             outcome
         }
@@ -724,6 +757,7 @@ fn commit_unpublished(
                     label: requested_label,
                     broadcast: requested_broadcast,
                     state: AddressState::Configured,
+                    lifetimes: None,
                 });
             }
             outcome
@@ -745,11 +779,12 @@ fn commit_published(
 ) -> Result<AddressMutationCommit, SystemError> {
     validate_mutation(mutation)?;
     let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
-    let cancel_auto = match mutation {
-        CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
-            matches!(address_state(iface, cidr), AddressState::AutoLinkLocal(_))
-        }
-        _ => false,
+    let cancel_dad = match mutation {
+        CommitMutation::Plain(AddressMutation::Delete(cidr)) => match cidr.address() {
+            IpAddress::Ipv6(target) if address_state(iface, cidr).has_dad_state() => Some(target),
+            _ => None,
+        },
+        _ => None,
     };
     let AddressCandidates {
         before,
@@ -781,6 +816,7 @@ fn commit_published(
                 label: requested_label,
                 broadcast: requested_broadcast,
                 state: AddressState::Configured,
+                lifetimes: None,
             });
             AddressMutationOutcome::Added(cidr)
         }
@@ -798,6 +834,16 @@ fn commit_published(
         }
         CommitMutation::Plain(AddressMutation::Replace(cidr)) => {
             if let Some(existing) = existing(cidr) {
+                if let Some(entry) = metadata.iter_mut().find(|entry| entry.cidr == existing) {
+                    match entry.state {
+                        AddressState::Slaac(DadState::Usable) => {
+                            entry.state = AddressState::Configured
+                        }
+                        AddressState::Slaac(state) => entry.state = AddressState::ManualDad(state),
+                        _ => {}
+                    }
+                    entry.lifetimes = None;
+                }
                 AddressMutationOutcome::Replaced(existing)
             } else {
                 validate_published_address_addition(iface, cidr)?;
@@ -807,6 +853,7 @@ fn commit_published(
                     label: requested_label,
                     broadcast: requested_broadcast,
                     state: AddressState::Configured,
+                    lifetimes: None,
                 });
                 AddressMutationOutcome::Added(cidr)
             }
@@ -819,8 +866,8 @@ fn commit_published(
     let route_changes = crate::net::route::commit_addresses(
         rtnl, &netns, iface, &before, &after, metadata, deleted,
     )?;
-    if cancel_auto {
-        ipv6_autoconf::cancel(iface.common(), false);
+    if let Some(target) = cancel_dad {
+        ipv6_autoconf::cancel_target(iface.common(), target);
     }
     Ok(AddressMutationCommit {
         outcome,
@@ -828,11 +875,12 @@ fn commit_published(
     })
 }
 
-fn prepare_automatic_link_local(
+fn prepare_automatic_address(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
-    state: LinkLocalState,
+    state: AddressState,
+    lifetimes: Option<ipv6_slaac::Lifetimes>,
 ) -> Result<crate::net::route::PreparedAddressRouteCommit, SystemError> {
     let AddressCandidates {
         before,
@@ -840,19 +888,31 @@ fn prepare_automatic_link_local(
         mut metadata,
     } = AddressCandidates::prepare(iface, CommitMutation::Plain(AddressMutation::Add(cidr)))?;
     if let Some(entry) = metadata.iter_mut().find(|entry| entry.cidr == cidr) {
-        if !matches!(entry.state, AddressState::AutoLinkLocal(_)) {
+        if !matches!(
+            (entry.state, state),
+            (
+                AddressState::AutoLinkLocal(_),
+                AddressState::AutoLinkLocal(_)
+            ) | (AddressState::Slaac(_), AddressState::Slaac(_))
+                | (
+                    AddressState::ManualDad(_),
+                    AddressState::ManualDad(_) | AddressState::Configured
+                )
+        ) {
             return Err(SystemError::EEXIST);
         }
-        entry.state = AddressState::AutoLinkLocal(state);
+        entry.state = state;
+        entry.lifetimes = lifetimes;
     } else {
         metadata.push(AddressMetadata {
             cidr,
             label: None,
             broadcast: None,
-            state: AddressState::AutoLinkLocal(state),
+            state,
+            lifetimes,
         });
     }
-    if state == LinkLocalState::Usable && !after.contains(&cidr) {
+    if state.is_usable() && !after.contains(&cidr) {
         insert_address_candidate(&mut after, cidr);
     }
     let up = iface.flags().contains(InterfaceFlags::UP);
@@ -933,6 +993,7 @@ fn try_clone_metadata(
             label,
             broadcast: entry.broadcast,
             state: entry.state,
+            lifetimes: entry.lifetimes,
         });
     }
     Ok(result)

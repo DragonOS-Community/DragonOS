@@ -392,6 +392,34 @@ pub struct BridgeCommonData {
     pub bridge_driver_ref: Weak<BridgeDriver>,
 }
 
+impl BridgeCommonData {
+    /// Return the bridge ifindex and mode for this membership.
+    pub(crate) fn hairpin_state(&self) -> Option<(u32, bool)> {
+        let driver = self.bridge_driver_ref.upgrade()?;
+        let master = driver.local_iface()?;
+        let hairpin = driver.inner.lock().ports.get(&self.id)?.hairpin;
+        Some((master.nic_id() as u32, hairpin))
+    }
+
+    pub(crate) fn set_hairpin(
+        &self,
+        _rtnl: &crate::net::rtnl::RtnlGuard,
+        enabled: bool,
+    ) -> Result<(), SystemError> {
+        let driver = self
+            .bridge_driver_ref
+            .upgrade()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        let mut bridge = driver.inner.lock();
+        let port = bridge
+            .ports
+            .get_mut(&self.id)
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+        port.hairpin = enabled;
+        Ok(())
+    }
+}
+
 fn bridge_probe() {
     let (iface1, iface2) = VethInterface::new_pair("veth_a", "veth_b");
     let (iface3, iface4) = VethInterface::new_pair("veth_c", "veth_d");

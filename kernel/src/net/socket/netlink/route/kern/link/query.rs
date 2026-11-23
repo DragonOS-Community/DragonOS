@@ -88,34 +88,7 @@ pub(in crate::net::socket::netlink::route::kern) fn iface_to_link_message(
     msg_type: CSegmentType,
     iface: &Arc<dyn Iface>,
 ) -> Result<LinkSegment, SystemError> {
-    let flags = iface.common().link_flags_snapshot()?;
-    let user_visible_flags = iface.project_user_visible_flags(flags.configured);
-    let header = CMsgSegHdr {
-        len: 0,
-        type_: msg_type as _,
-        flags: SegHdrCommonFlags::empty().bits(),
-        seq: request_header.seq,
-        pid: request_header.pid,
-    };
-
-    let link_message = LinkSegmentBody {
-        family: AddressFamily::Unspecified,
-        type_: iface.type_(),
-        index: NonZero::new(iface.nic_id() as u32),
-        flags: user_visible_flags,
-        change: LinkMessageFlags::empty(),
-        pad: None,
-    };
-
-    let mut attrs = vec![
-        LinkAttr::Address(iface.mac().as_bytes().to_vec()),
-        LinkAttr::Name(CString::new(iface.name()).map_err(|_| SystemError::EINVAL)?),
-        LinkAttr::Mtu(iface.mtu() as u32),
-        LinkAttr::TxqLen(iface.common().tx_queue_len()),
-        LinkAttr::Promiscuity(flags.promiscuity),
-        LinkAttr::Allmulti(flags.allmulti),
-    ];
-
+    let (header, link_message, mut attrs) = link_message_parts(request_header, msg_type, iface)?;
     let kind = if iface.as_any_ref().is::<BridgeIface>() {
         Some("bridge")
     } else if iface.as_any_ref().is::<VethInterface>() {
@@ -151,4 +124,40 @@ pub(in crate::net::socket::netlink::route::kern) fn iface_to_link_message(
     }
 
     Ok(LinkSegment::new(header, link_message, attrs))
+}
+
+pub(super) fn link_message_parts(
+    request_header: &CMsgSegHdr,
+    msg_type: CSegmentType,
+    iface: &Arc<dyn Iface>,
+) -> Result<(CMsgSegHdr, LinkSegmentBody, Vec<LinkAttr>), SystemError> {
+    let flags = iface.common().link_flags_snapshot()?;
+    let user_visible_flags = iface.project_user_visible_flags(flags.configured);
+    let header = CMsgSegHdr {
+        len: 0,
+        type_: msg_type as _,
+        flags: SegHdrCommonFlags::empty().bits(),
+        seq: request_header.seq,
+        pid: request_header.pid,
+    };
+
+    let link_message = LinkSegmentBody {
+        family: AddressFamily::Unspecified,
+        type_: iface.type_(),
+        index: NonZero::new(iface.nic_id() as u32),
+        flags: user_visible_flags,
+        change: LinkMessageFlags::empty(),
+        pad: None,
+    };
+
+    let attrs = vec![
+        LinkAttr::Address(iface.mac().as_bytes().to_vec()),
+        LinkAttr::Name(CString::new(iface.name()).map_err(|_| SystemError::EINVAL)?),
+        LinkAttr::Mtu(iface.mtu() as u32),
+        LinkAttr::TxqLen(iface.common().tx_queue_len()),
+        LinkAttr::Promiscuity(flags.promiscuity),
+        LinkAttr::Allmulti(flags.allmulti),
+    ];
+
+    Ok((header, link_message, attrs))
 }

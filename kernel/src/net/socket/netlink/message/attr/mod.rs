@@ -4,7 +4,7 @@ use crate::{libs::align::align_up, net::socket::netlink::message::NLMSG_ALIGN};
 use alloc::vec::Vec;
 use system_error::SystemError;
 
-const IS_NESTED_MASK: u16 = 1u16 << 15;
+pub(crate) const IS_NESTED_MASK: u16 = 1u16 << 15;
 const IS_NET_BYTEORDER_MASK: u16 = 1u16 << 14;
 const ATTRIBUTE_TYPE_MASK: u16 = !(IS_NESTED_MASK | IS_NET_BYTEORDER_MASK);
 

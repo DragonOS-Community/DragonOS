@@ -1,5 +1,5 @@
 use crate::net::socket::netlink::message::attr::Attribute;
-use crate::net::socket::netlink::message::attr::CAttrHeader;
+use crate::net::socket::netlink::message::attr::{CAttrHeader, IS_NESTED_MASK};
 use crate::net::socket::netlink::route::message::attr::IFNAME_SIZE;
 use alloc::ffi::CString;
 use alloc::vec::Vec;
@@ -99,6 +99,10 @@ pub enum LinkAttr {
     Link(u32),
     Master(u32),
     LinkInfo(Vec<u8>),
+    ProtInfo {
+        nested: bool,
+        data: Vec<u8>,
+    },
     NetNsPid(u32),
     NetNsFd(u32),
     LinkNetnsid(u32),
@@ -121,6 +125,7 @@ impl LinkAttr {
             LinkAttr::Link(_) => LinkAttrClass::LINK,
             LinkAttr::Master(_) => LinkAttrClass::MASTER,
             LinkAttr::LinkInfo(_) => LinkAttrClass::LINKINFO,
+            LinkAttr::ProtInfo { .. } => LinkAttrClass::PROTINFO,
             LinkAttr::NetNsPid(_) => LinkAttrClass::NET_NS_PID,
             LinkAttr::NetNsFd(_) => LinkAttrClass::NET_NS_FD,
             LinkAttr::LinkNetnsid(_) => LinkAttrClass::LINK_NETNSID,
@@ -209,6 +214,7 @@ impl Attribute for LinkAttr {
     fn type_(&self) -> u16 {
         match self {
             Self::Unsupported(kind, _) => *kind,
+            Self::ProtInfo { nested: true, .. } => self.class() as u16 | IS_NESTED_MASK,
             _ => self.class() as u16,
         }
     }
@@ -228,7 +234,9 @@ impl Attribute for LinkAttr {
             | LinkAttr::NewIfIndex(value) => unsafe {
                 core::slice::from_raw_parts(value as *const u32 as *const u8, 4)
             },
-            LinkAttr::LinkInfo(data) | LinkAttr::Unsupported(_, data) => data.as_slice(),
+            LinkAttr::LinkInfo(data)
+            | LinkAttr::ProtInfo { data, .. }
+            | LinkAttr::Unsupported(_, data) => data.as_slice(),
             LinkAttr::Promiscuity(count) | LinkAttr::Allmulti(count) => unsafe {
                 core::slice::from_raw_parts(count as *const u32 as *const u8, 4)
             },
@@ -253,7 +261,6 @@ impl Attribute for LinkAttr {
     {
         let payload_len = header.payload_len();
 
-        // TODO: Currently, `IS_NET_BYTEORDER_MASK` and `IS_NESTED_MASK` are ignored.
         let Ok(class) = LinkAttrClass::try_from(header.type_()) else {
             return Ok(Some(Self::Unsupported(header.type_(), copy_payload(buf)?)));
         };
@@ -271,6 +278,10 @@ impl Attribute for LinkAttr {
                 parse_nested_link_attrs(buf)?;
                 Self::LinkInfo(copy_payload(buf)?)
             }
+            (LinkAttrClass::PROTINFO, _) => Self::ProtInfo {
+                nested: header.is_nested(),
+                data: copy_payload(buf)?,
+            },
             (LinkAttrClass::NET_NS_FD, 4) => {
                 Self::NetNsFd(u32::from_ne_bytes(buf.try_into().unwrap()))
             }

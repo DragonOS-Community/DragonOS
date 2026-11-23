@@ -31,6 +31,7 @@ pub struct BridgePort {
     pub(super) bridge_enable: Arc<dyn BridgeEnableDevice>,
     pub(in crate::driver::net) bridge_driver_ref: Weak<BridgeDriver>,
     pub(super) active: Arc<AtomicBool>,
+    pub(super) hairpin: bool,
     in_flight: Arc<AtomicUsize>,
     // 当前接口状态？forwarding, learning, blocking?
     // mac mtu信息
@@ -55,6 +56,7 @@ impl BridgePort {
             bridge_enable: device.clone(),
             bridge_driver_ref: Arc::downgrade(bridge),
             active: Arc::new(AtomicBool::new(true)),
+            hairpin: false,
             in_flight: Arc::new(AtomicUsize::new(0)),
         };
 
@@ -65,6 +67,10 @@ impl BridgePort {
         if let Some(_activity) = self.enter() {
             self.bridge_enable.receive_from_bridge(frame);
         }
+    }
+
+    fn allows_egress(&self, ingress_port_id: Option<BridgePortId>) -> bool {
+        Some(self.id) != ingress_port_id || self.hairpin
     }
 
     pub(super) fn enter(&self) -> Option<PortActivity<'_>> {
@@ -285,15 +291,12 @@ impl Bridge {
             self.flood_ports(Some(ingress_port_id))
         } else {
             if let Some(entry) = self.mac_table.get(&dst_mac) {
-                let target_port = entry.port_id;
-                Ok(if target_port == ingress_port_id {
-                    BridgeEgress::None
-                } else {
-                    self.ports
-                        .get(&target_port)
-                        .cloned()
-                        .map_or(BridgeEgress::None, BridgeEgress::One)
-                })
+                Ok(self
+                    .ports
+                    .get(&entry.port_id)
+                    .filter(|port| port.allows_egress(Some(ingress_port_id)))
+                    .cloned()
+                    .map_or(BridgeEgress::None, BridgeEgress::One))
             } else {
                 self.flood_ports(Some(ingress_port_id))
             }
@@ -308,13 +311,12 @@ impl Bridge {
 
     pub(super) fn flood_ports(
         &self,
-        except_port_id: Option<BridgePortId>,
+        ingress_port_id: Option<BridgePortId>,
     ) -> Result<BridgeEgress, SystemError> {
         let mut eligible = self
             .ports
-            .iter()
-            .filter(|(id, _)| Some(**id) != except_port_id)
-            .map(|(_, port)| port);
+            .values()
+            .filter(|port| port.allows_egress(ingress_port_id));
         let Some(first) = eligible.next() else {
             return Ok(BridgeEgress::None);
         };

@@ -460,11 +460,11 @@ pub trait TxToken {
     /// itself uses Ethernet.
     fn egress_override(
         &mut self,
-        version: crate::wire::IpVersion,
+        source: crate::wire::IpAddress,
         destination: crate::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<Option<TxEgressOverride>, TxEgressError> {
-        let _ = (version, destination, meta);
+        let _ = (source, destination, meta);
         Ok(None)
     }
 
@@ -531,6 +531,7 @@ pub enum IpOutputError {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TxEgressError {
     Exhausted,
+    NoRoute,
 }
 
 /// Route-selected properties for a packet emitted through a transmit token.

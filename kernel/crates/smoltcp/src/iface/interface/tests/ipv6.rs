@@ -1011,7 +1011,7 @@ fn ipv6_rejects_oversized_route_before_consuming_token() {
     impl TxToken for SmallRoute {
         fn egress_override(
             &mut self,
-            _: IpVersion,
+            _: IpAddress,
             _: IpAddress,
             _: PacketMeta,
         ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {
@@ -1055,7 +1055,7 @@ fn ipv6_ndisc_does_not_query_external_egress() {
     impl TxToken for LinkOnly {
         fn egress_override(
             &mut self,
-            _: IpVersion,
+            _: IpAddress,
             _: IpAddress,
             _: PacketMeta,
         ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {

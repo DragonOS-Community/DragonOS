@@ -210,11 +210,11 @@ impl SmolTxToken for TcpTxToken<'_> {
 
     fn egress_override(
         &mut self,
-        version: smoltcp::wire::IpVersion,
+        source: smoltcp::wire::IpAddress,
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<Option<smoltcp::phy::TxEgressOverride>, smoltcp::phy::TxEgressError> {
-        self.0.egress_override(version, destination, meta)
+        self.0.egress_override(source, destination, meta)
     }
 
     fn apply_egress_override(

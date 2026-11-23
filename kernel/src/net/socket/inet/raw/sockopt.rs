@@ -208,6 +208,10 @@ impl RawSocket {
                 };
                 Ok(write_i32_getsockopt(value, v))
             }
+            Ok(PIPV6::MULTICAST_HOPS) => Ok(write_i32_getsockopt(
+                value,
+                self.options.read().ipv6_multicast_hops.into(),
+            )),
             Ok(PIPV6::UNICAST_HOPS) => Ok(write_i32_getsockopt(
                 value,
                 self.options.read().ip_ttl as i32,
@@ -506,6 +510,16 @@ impl RawSocket {
                     }
                 }
                 self.options.write().ipv6_checksum = v;
+                Ok(())
+            }
+            Ok(PIPV6::MULTICAST_HOPS) => {
+                let value = read_i32_opt(val).ok_or(SystemError::EINVAL)?;
+                let hops = if value == -1 {
+                    super::options::DEFAULT_IPV6_MULTICAST_HOPS
+                } else {
+                    u8::try_from(value).map_err(|_| SystemError::EINVAL)?
+                };
+                self.options.write().ipv6_multicast_hops = hops;
                 Ok(())
             }
             Ok(PIPV6::UNICAST_HOPS) => {

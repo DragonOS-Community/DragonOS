@@ -14,7 +14,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{pid::PidType, ProcessState, RawPid},
+    process::{pid::PidType, RawPid},
 };
 use alloc::{
     borrow::ToOwned,
@@ -83,12 +83,8 @@ impl StatusFileOps {
         // Name
         pdata.append(&mut format!("Name:\t{}", name).as_bytes().to_owned());
 
-        // State
-        if state == ProcessState::BlockedIdle {
-            pdata.extend_from_slice(b"\nState:\tI (idle)");
-        } else {
-            pdata.append(&mut format!("\nState:\t{:?}", state).as_bytes().to_owned());
-        }
+        pdata.extend_from_slice(b"\nState:\t");
+        pdata.extend_from_slice(super::linux_task_state(state).as_bytes());
 
         // Tgid
         //

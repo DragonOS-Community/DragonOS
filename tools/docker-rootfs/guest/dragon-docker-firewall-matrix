@@ -1,0 +1,234 @@
+#!/bin/sh
+# Run in a disposable guest with a host peer as described by run-firewall-matrix.py.
+set -eu
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+    echo "Usage: $0 {iptables|nftables} {4|6} {true|false} [nic]" >&2
+    exit 2
+fi
+backend=$1
+family=$2
+proxy=$3
+case "$backend" in iptables|nftables) ;; *) exit 2 ;; esac
+case "$proxy" in true|false) ;; *) exit 2 ;; esac
+case "$(uname -r)" in
+    *dragonos*) ;;
+    *)
+        if [ "${DRAGONOS_FIREWALL_LINUX_GUEST:-0}" != 1 ]; then
+            echo 'Use a disposable DragonOS guest, or opt in inside a disposable Linux guest.' >&2
+            exit 2
+        fi
+        ;;
+esac
+case "$family" in
+    4)
+        guest=10.232.70.1 peer=10.232.70.2 prefix=24
+        target=10.232.71.20 denied=10.232.72.20 gateway=10.232.71.1 loopback=127.0.0.1
+        ip_kind=ip ping=ping
+        ;;
+    6)
+        guest=fd42:2324:70::1 peer=fd42:2324:70::2 prefix=64
+        target=fd42:2324:71::20 denied=fd42:2324:72::20 gateway=fd42:2324:71::1 loopback=::1
+        ip_kind=ip6 ping=ping6
+        ;;
+    *) exit 2 ;;
+esac
+
+unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+daemon=
+status=0
+scratch=$(mktemp -d)
+finish() {
+    result=$?
+    if [ "$result" != 0 ] && [ -e "$scratch/dockerd.log" ]; then tail -30 "$scratch/dockerd.log"; fi
+    if [ -n "$daemon" ]; then kill "$daemon" 2>/dev/null || true; fi
+    rm -rf "$scratch"
+    printf 'FIREWALL DONE %s\n' "$result"
+}
+trap finish EXIT
+docker() { command docker --host=unix:///var/run/docker.sock "$@"; }
+report() { printf 'FIREWALL %s %s\n' "$1" "$2"; }
+require() {
+    step=$1
+    shift
+    if "$@"; then report "$step" PASS; else report "$step" FAIL; exit 1; fi
+}
+check() {
+    step=$1
+    shift
+    if "$@"; then report "$step" PASS; else report "$step" FAIL; status=1; fi
+}
+host_address() {
+    if [ "$family" = 6 ]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+confirm_peer() {
+    printf 'FIREWALL READY %s\n' "$1"
+    timeout --foreground 35 sh -c 'IFS= read -r message && [ "$message" = continue ]'
+}
+network() {
+    if [ "$family" = 6 ]; then
+        set -- "$1" "$2" "$3" --ipv6 --subnet "fd42:2324:$2::/64"
+    else
+        set -- "$1" "$2" "$3" --subnet "10.232.$2.0/24"
+    fi
+    name=$1
+    icc=$3
+    shift 3
+    docker network create "$@" --opt "com.docker.network.bridge.name=$name" \
+        --opt "com.docker.network.bridge.enable_icc=$icc" "$name"
+}
+container_http() {
+    docker exec "$1" /bin/busybox wget -T 2 -qO- "http://$(host_address "$2"):$3/"
+}
+content() {
+    result=$("$@") && [ "$result" = FIREWALL_HTTP_OK ]
+}
+denies_connection() {
+    # BusyBox nc runs the command as soon as connect() succeeds. No HTTP
+    # response is needed to detect an unexpected TCP connection.
+    rc=0
+    output=$(docker exec "$1" /bin/busybox nc -w 2 "$2" "$3" -e /bin/busybox true 2>&1) || rc=$?
+    printf '%s\n' "$output"
+    case "$output" in
+        *'nc: timed out'*) [ "$rc" -eq 1 ] ;;
+        *) return 1 ;;
+    esac
+}
+dns_query() {
+    type=A
+    if [ "$family" = 6 ]; then type=AAAA; fi
+    docker exec matrix-client /bin/busybox nslookup -type="$type" "$1" 127.0.0.11 \
+        >"$scratch/dns" || return
+    cat "$scratch/dns"
+    grep -F "$2" "$scratch/dns"
+}
+rules_match() {
+    # Match the printed tuple and counter even if nft cannot decode the xt target.
+    awk -v address="$1" -v text="$2" '
+        index($0, address) && index($0, text) && /counter packets [1-9]/ { print; found=1 }
+        END { exit !found }
+    ' "$scratch/active-rules"
+}
+direct_drop_packets() {
+    awk -v match_dest="daddr $target " '
+        index($0, match_dest) && / drop/ {
+            for (i=1; i<NF; i++) if ($i == "packets") total += $(i+1)
+        }
+        END { print total+0 }
+    ' "$1"
+}
+rules_removed() {
+    ! grep -F -e "$target" -e 12580 "$1"
+}
+networks_removed() {
+    ! grep -F -e fwallow -e fwdeny -e "$target" -e "$denied" -e 12580 "$1"
+}
+show_rules() {
+    printf 'FIREWALL RULESET %s\n' "$1"
+    nft -a list ruleset >"$scratch/$1"
+    cat "$scratch/$1"
+}
+
+for tool in docker dockerd ip iptables ip6tables nft nsenter timeout; do
+    command -v "$tool" >/dev/null
+done
+if docker info >/dev/null 2>&1 || [ -e /run/docker.pid ] || [ -S /run/docker.sock ]; then
+    echo 'The matrix requires a clean guest and an unused Docker socket.' >&2
+    exit 1
+fi
+nic=${4:-$(ip -o link | awk -F ': ' '$2 ~ /^eth/ { print $2; exit }')}
+test -n "$nic"
+ip link set "$nic" up
+if [ "$family" = 6 ]; then
+    ip -6 addr add "$guest/$prefix" dev "$nic" nodad
+    sysctl -w net.ipv6.conf.all.forwarding=1
+else
+    ip -4 addr add "$guest/$prefix" dev "$nic"
+fi
+sysctl -w net.ipv4.ip_forward=1
+if [ "$backend" = nftables ]; then
+    printf '{"firewall-backend":"nftables","userland-proxy":%s}\n' "$proxy"
+else
+    printf '{"userland-proxy":%s}\n' "$proxy"
+fi >"$scratch/daemon.json"
+dockerd --host=unix:///var/run/docker.sock --config-file "$scratch/daemon.json" \
+    </dev/null >"$scratch/dockerd.log" 2>&1 &
+daemon=$!
+for attempt in $(seq 1 60); do
+    kill -0 "$daemon"
+    if docker info --format '{{.FirewallBackend.Driver}}' >"$scratch/backend" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+require daemon-running kill -0 "$daemon"
+cat "$scratch/daemon.json" "$scratch/backend"
+require expected-backend test "$(cat "$scratch/backend")" = "$backend"
+require expected-docker test "$(docker version --format '{{.Server.Version}}')" = 29.1.3
+for tool in iptables ip6tables; do
+    readlink -f "$(command -v "$tool")"
+    "$tool" --version | grep -F '(nf_tables)'
+done
+nft --version
+tar -C /opt/tests/docker/bundle/rootfs -cf "$scratch/fixture.tar" .
+require fixture docker import "$scratch/fixture.tar" matrix:local
+
+require bridge-allowed network fwallow 71 true
+require bridge-denied network fwdeny 72 false
+address_flag=--ip
+if [ "$family" = 6 ]; then address_flag=--ip6; fi
+service='mkdir -p /www; echo FIREWALL_HTTP_OK >/www/index.html; /bin/busybox httpd -p 8081 -h /www; exec /bin/busybox httpd -f -p 8080 -h /www'
+require published-container docker run -d --name matrix-web --network fwallow \
+    "$address_flag" "$target" -p "$(host_address "$guest"):12580:8080" \
+    matrix:local /bin/busybox sh -c "$service"
+require normal-client docker run -d --name matrix-client --network fwallow --dns "$peer" \
+    matrix:local /bin/busybox sleep 300
+require denied-server docker run -d --name matrix-denied --network fwdeny \
+    "$address_flag" "$denied" matrix:local /bin/busybox sh -c "$service"
+require denied-client docker run -d --name matrix-blocked --network fwdeny \
+    matrix:local /bin/busybox sleep 300
+check server-listener content container_http matrix-web "$loopback" 8080
+check unpublished-listener content container_http matrix-web "$loopback" 8081
+check denied-listener content container_http matrix-denied "$loopback" 8080
+check gateway docker exec matrix-client /bin/busybox "$ping" -c 1 -W 2 "$gateway"
+check dns-peer dns_query matrix-web "$target"
+check dns-upstream dns_query firewall.test "$peer"
+check outbound content container_http matrix-client "$peer" 18080
+check same-bridge-allowed content container_http matrix-client "$target" 8080
+check same-bridge-unpublished content container_http matrix-client "$target" 8081
+check same-bridge-denied denies_connection matrix-blocked "$denied" 8080
+check cross-bridge-denied denies_connection matrix-blocked "$target" 8080
+check published-local content /bin/busybox wget -T 2 -qO- "http://$(host_address "$guest"):12580/"
+check self-published content container_http matrix-web "$guest" 12580
+
+show_rules before-external
+before=$(direct_drop_packets "$scratch/before-external")
+require external-peer confirm_peer external
+show_rules active-rules
+after=$(direct_drop_packets "$scratch/active-rules")
+printf 'FIREWALL DIRECT DROP packets before=%s after=%s\n' "$before" "$after"
+check direct-drop-counter test "$after" -gt "$before"
+if [ "$proxy" = false ]; then
+    check publish-dnat-counter rules_match "$guest" "tcp dport 12580 counter packets"
+    check hairpin-masquerade-counter rules_match "$target"         "saddr $target $ip_kind daddr $target tcp dport 8080 counter packets"
+fi
+pid=$(docker inspect --format '{{.State.Pid}}' matrix-client)
+printf 'FIREWALL DNS NAMESPACE %s\n' "$(readlink "/proc/$pid/ns/net")"
+nsenter -t "$pid" -n nft -a list ruleset
+
+check delete-endpoints docker rm -f matrix-client matrix-blocked matrix-denied matrix-web
+show_rules after-endpoints
+check endpoint-rules-removed rules_removed "$scratch/after-endpoints"
+check delete-networks docker network rm fwallow fwdeny
+show_rules after-networks
+check network-rules-removed networks_removed "$scratch/after-networks"
+require recreate-network network fwallow 71 true
+require reused-endpoint docker run -d --name matrix-reused --network fwallow \
+    "$address_flag" "$target" matrix:local /bin/busybox sh -c "$service"
+require reused-client docker run -d --name matrix-new-client --network fwallow \
+    matrix:local /bin/busybox sleep 60
+check reused-listener content container_http matrix-new-client "$target" 8080
+require external-reuse-peer confirm_peer reused
+check delete-recreated-endpoints docker rm -f matrix-new-client matrix-reused
+check delete-recreated-network docker network rm fwallow
+exit "$status"

@@ -8,7 +8,7 @@ ARG CONTAINERD_VERSION=2.2.0-2~ubuntu.24.04~noble
 # Use signed package repositories and the distribution's maintained CA bundle.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl iproute2 iptables busybox-static \
+        ca-certificates curl iproute2 iptables nftables busybox-static \
     && install -d -m 0755 /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         -o /etc/apt/keyrings/docker.asc \

@@ -283,6 +283,8 @@ pub struct NetNamespace {
     packet_sockets_need_cleanup: AtomicBool,
     ///当前网络命名空间下的桥接设备列表
     bridge_list: RwSem<BTreeMap<String, Arc<BridgeDriver>>>,
+    bridge_ipv4_netfilter: AtomicBool,
+    bridge_ipv6_netfilter: AtomicBool,
 
     // -- Netlink --
     /// # 当前网络命名空间下的 Netlink 套接字表
@@ -303,8 +305,6 @@ pub struct NetNamespace {
     ipv4_forwarding: AtomicI32,
     /// Linux /proc/sys/net/ipv6/conf/all/forwarding. Never shares IPv4 state.
     ipv6_forwarding: AtomicI32,
-    bridge_ipv4_netfilter: AtomicBool,
-    bridge_ipv6_netfilter: AtomicBool,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -1363,6 +1363,8 @@ impl NetNamespace {
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
+            bridge_ipv4_netfilter: AtomicBool::new(true),
+            bridge_ipv6_netfilter: AtomicBool::new(true),
             netlink_socket_table: NetlinkSocketTable::default(),
             nftables: Some(Box::new(NftNamespaceState::new())),
             raw_ingress: crate::libs::spinlock::SpinLock::new(
@@ -1373,8 +1375,6 @@ impl NetNamespace {
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
-            bridge_ipv4_netfilter: AtomicBool::new(true),
-            bridge_ipv6_netfilter: AtomicBool::new(true),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1422,6 +1422,8 @@ impl NetNamespace {
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
+            bridge_ipv4_netfilter: AtomicBool::new(true),
+            bridge_ipv6_netfilter: AtomicBool::new(true),
             netlink_socket_table: NetlinkSocketTable::default(),
             nftables: Some(Box::new(NftNamespaceState::new())),
             raw_ingress: crate::libs::spinlock::SpinLock::new(
@@ -1432,8 +1434,6 @@ impl NetNamespace {
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
-            bridge_ipv4_netfilter: AtomicBool::new(true),
-            bridge_ipv6_netfilter: AtomicBool::new(true),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1945,23 +1945,6 @@ impl NetNamespace {
         self.ipv4_forwarding.store(value, Ordering::Release);
     }
 
-    fn bridge_netfilter_control(&self, version: smoltcp::wire::IpVersion) -> &AtomicBool {
-        match version {
-            smoltcp::wire::IpVersion::Ipv4 => &self.bridge_ipv4_netfilter,
-            smoltcp::wire::IpVersion::Ipv6 => &self.bridge_ipv6_netfilter,
-        }
-    }
-
-    pub(crate) fn bridge_netfilter_enabled(&self, version: smoltcp::wire::IpVersion) -> bool {
-        self.bridge_netfilter_control(version)
-            .load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_bridge_netfilter(&self, version: smoltcp::wire::IpVersion, enabled: bool) {
-        self.bridge_netfilter_control(version)
-            .store(enabled, Ordering::Release);
-    }
-
     pub fn ipv6_forwarding_value(&self) -> i32 {
         self.ipv6_forwarding.load(Ordering::Acquire)
     }
@@ -2311,6 +2294,23 @@ impl NetNamespace {
                 .clear_if_deferred(|current| current.nic_id() == ifindex);
         }
         self.notify_deadline_changed();
+    }
+
+    fn bridge_netfilter_control(&self, version: smoltcp::wire::IpVersion) -> &AtomicBool {
+        match version {
+            smoltcp::wire::IpVersion::Ipv4 => &self.bridge_ipv4_netfilter,
+            smoltcp::wire::IpVersion::Ipv6 => &self.bridge_ipv6_netfilter,
+        }
+    }
+
+    pub(crate) fn bridge_netfilter_enabled(&self, version: smoltcp::wire::IpVersion) -> bool {
+        self.bridge_netfilter_control(version)
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_bridge_netfilter(&self, version: smoltcp::wire::IpVersion, enabled: bool) {
+        self.bridge_netfilter_control(version)
+            .store(enabled, Ordering::Release);
     }
 
     pub fn insert_bridge(&self, bridge: Arc<BridgeDriver>) {

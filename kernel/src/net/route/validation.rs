@@ -41,8 +41,13 @@ pub(super) fn validate_entry_on_iface(
     {
         return Err(SystemError::EINVAL);
     }
-    if !is_ipv4(route.destination.address()) && route.tos != 0 {
-        return Err(SystemError::EINVAL);
+    if !is_ipv4(route.destination.address()) {
+        if !iface.common().ipv6_enabled() {
+            return Err(SystemError::EACCES);
+        }
+        if route.tos != 0 {
+            return Err(SystemError::EINVAL);
+        }
     }
     let expected_oif = u32::try_from(iface.nic_id()).map_err(|_| SystemError::EOVERFLOW)?;
     if route.oif != expected_oif {

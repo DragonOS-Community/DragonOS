@@ -1,5 +1,6 @@
 mod ipv4;
 mod ipv6;
+mod namespace;
 
 use crate::filesystem::{
     procfs::template::{DirOps, ProcDir, ProcDirBuilder},
@@ -31,6 +32,10 @@ impl DirOps for NetDirOps {
             .as_any_ref()
             .downcast_ref::<ProcDir<Ipv4DirOps>>()
             .is_none_or(|inode| inode.ops().is_current())
+            && child
+                .as_any_ref()
+                .downcast_ref::<ProcDir<Ipv6DirOps>>()
+                .is_none_or(|inode| inode.ops().is_current())
     }
     fn lookup_child(
         &self,
@@ -53,7 +58,9 @@ impl DirOps for NetDirOps {
         if name == "ipv6" {
             let mut cached_children = dir.cached_children().write();
             if let Some(child) = cached_children.get(name) {
-                return Ok(child.clone());
+                if self.validate_child(child.as_ref()) {
+                    return Ok(child.clone());
+                }
             }
 
             let inode = Ipv6DirOps::new_inode(dir.self_ref_weak().clone());

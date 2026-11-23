@@ -481,11 +481,14 @@ fn submit_ipv6(
             mtu: Some(route.ip_mtu),
         })?;
     let initial_destination = destination(reservation.bytes(), IpVersion::Ipv6)?;
-    let _egress = netns
+    let initial_egress = netns
         .device_list()
         .get(&(route.oif as usize))
         .cloned()
         .ok_or(SystemError::ENETUNREACH)?;
+    if !initial_egress.common().ipv6_enabled() {
+        return Err(SystemError::ENETDOWN.into());
+    }
     let ruleset = netns.nftables().snapshot();
     let output_oifname = hook_oifname(
         netns,
@@ -535,6 +538,9 @@ fn submit_ipv6(
         .get(&(route.oif as usize))
         .cloned()
         .ok_or(SystemError::ENETUNREACH)?;
+    if !egress.common().ipv6_enabled() {
+        return Err(SystemError::ENETDOWN.into());
+    }
     let egress_epoch = egress.common().namespace_epoch();
     let physical_egress = !egress.flags().contains(InterfaceFlags::LOOPBACK);
     let multicast_destination = match destination(reservation.bytes(), IpVersion::Ipv6)? {

@@ -212,6 +212,23 @@ impl Cache {
         self.silent_until.clear();
     }
 
+    #[cfg(feature = "proto-ipv6")]
+    pub(crate) fn flush_ipv6(&mut self) {
+        fn flush<V>(map: &mut LinearMap<IpAddress, V, IFACE_NEIGHBOR_CACHE_COUNT>) {
+            let keys: heapless::Vec<_, IFACE_NEIGHBOR_CACHE_COUNT> = map
+                .keys()
+                .copied()
+                .filter(|address| matches!(address, IpAddress::Ipv6(_)))
+                .collect();
+            for key in keys {
+                map.remove(&key);
+            }
+        }
+
+        flush(&mut self.storage);
+        flush(&mut self.silent_until);
+    }
+
     /// Remove one cached mapping and its discovery rate-limit state.
     pub(crate) fn remove(&mut self, protocol_addr: &IpAddress) {
         self.storage.remove(protocol_addr);

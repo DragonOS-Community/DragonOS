@@ -455,7 +455,7 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
     let LinkMutationCommit {
         iface,
         changes,
-        renamed_ipv4,
+        changed_addresses,
         removed_addresses,
         route_changes,
         removed_neighbors,
@@ -468,26 +468,44 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
     if !changes.is_empty() {
         notify_link_change(&iface);
     }
+    notify_iface_protocol_change(
+        netns,
+        &iface,
+        removed_addresses,
+        changed_addresses,
+        route_changes,
+        removed_neighbors,
+    );
+    if let Some(related) = related {
+        notify_link_commit(netns, *related);
+    }
+}
+
+pub(crate) fn notify_iface_protocol_change(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    removed_addresses: Vec<crate::net::address::RemovedAddress>,
+    added_or_changed_addresses: impl IntoIterator<Item = smoltcp::wire::IpCidr>,
+    route_changes: Option<crate::net::route::RouteNotifications>,
+    removed_neighbors: Vec<crate::net::neighbor::NeighborEntry>,
+) {
     for removed in removed_addresses {
         super::addr::notify_removed_address(
             netns.clone(),
-            &iface,
+            iface,
             removed.cidr,
             &removed.label,
             removed.broadcast,
         );
     }
-    for cidr in renamed_ipv4 {
-        super::addr::notify_address_change(netns.clone(), &iface, cidr);
+    for cidr in added_or_changed_addresses {
+        super::addr::notify_address_change(netns.clone(), iface, cidr);
     }
     if let Some(changes) = route_changes {
         notify_link_route_changes(netns, changes);
     }
     for entry in removed_neighbors {
         super::neigh::notify_removed_entry(netns, entry);
-    }
-    if let Some(related) = related {
-        notify_link_commit(netns, *related);
     }
 }
 

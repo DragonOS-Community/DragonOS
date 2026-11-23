@@ -16,9 +16,8 @@ use alloc::{
 use system_error::SystemError;
 
 use super::super::numeric::parse_numeric_sysctl;
-mod namespace;
 mod ports;
-use namespace::SysctlNamespace;
+use super::namespace::SysctlNamespace;
 use ports::{PortFileOps, PortSysctl};
 
 #[derive(Debug)]

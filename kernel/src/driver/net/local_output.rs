@@ -180,6 +180,7 @@ pub(super) struct OutputBackendPolicy<'a> {
     pub(super) configured_neighbors: Option<&'a crate::net::neighbor::NeighborReadGuard<'a>>,
     pub(super) owner_ifindex: u32,
     pub(super) owner_is_up: bool,
+    pub(super) owner_ipv6_enabled: bool,
     pub(super) authoritative_output: bool,
 }
 
@@ -270,7 +271,11 @@ impl OutputBackendPolicy<'_> {
             && version == smoltcp::wire::IpVersion::Ipv6
             && destination.is_multicast()
         {
-            return OutputBackendDecision::NativeOwner;
+            return if self.owner_ipv6_enabled {
+                OutputBackendDecision::NativeOwner
+            } else {
+                OutputBackendDecision::Deferred(None)
+            };
         }
         let constrained_oif = (meta.id != 0).then_some(meta.id);
         match self.routes.lookup(destination, constrained_oif) {
@@ -280,6 +285,7 @@ impl OutputBackendPolicy<'_> {
             Some(route)
                 if route.oif == self.owner_ifindex
                     && self.owner_is_up
+                    && (version != smoltcp::wire::IpVersion::Ipv6 || self.owner_ipv6_enabled)
                     && !self.configured_neighbors.is_some_and(|neighbors| {
                         neighbors.lookup(route.oif, route.next_hop).is_some()
                     })
@@ -1348,7 +1354,11 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 && destination.is_multicast()
                 && self.backend_policy.owner_ifindex != 0
         {
-            if self.backend_policy.owner_ifindex == 0 || !self.backend_policy.owner_is_up {
+            if self.backend_policy.owner_ifindex == 0
+                || !self.backend_policy.owner_is_up
+                || (destination.version() == IpVersion::Ipv6
+                    && !self.backend_policy.owner_ipv6_enabled)
+            {
                 return Err(IpOutputError::NoRoute);
             }
             let ip_mtu = self
@@ -2014,7 +2024,9 @@ pub(super) fn transmit_routed_stack_output(
     {
         return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
     }
-    if !iface.flags().contains(InterfaceFlags::UP) {
+    if !iface.flags().contains(InterfaceFlags::UP)
+        || (next_hop.version() == smoltcp::wire::IpVersion::Ipv6 && !iface.common().ipv6_enabled())
+    {
         return LocalOutputTransmitResult::Drop(packet, SystemError::ENETDOWN);
     }
     let effective_mtu = ip_mtu.min(iface.mtu());
@@ -2139,7 +2151,7 @@ pub(super) fn transmit_admitted_routed_output(
 
 pub(super) fn transmit_local_stack_output<D>(
     netns: &Arc<NetNamespace>,
-    owner_is_up: bool,
+    owner: Option<&super::IfaceCommon>,
     device: &mut D,
     mut packet: LocalOutputPacket,
 ) -> LocalOutputTransmitResult
@@ -2148,7 +2160,13 @@ where
 {
     match packet.disposition {
         LocalOutputDisposition::NativeOwner => {
-            transmit_native_output_if_up(device, packet, owner_is_up)
+            if !owner.is_some_and(|owner| {
+                owner.flags().contains(InterfaceFlags::UP)
+                    && (owner.ipv6_enabled() || !is_ipv6_output_frame(&packet))
+            }) {
+                return LocalOutputTransmitResult::Drop(packet, SystemError::ENETDOWN);
+            }
+            transmit_native_output(device, packet)
         }
         LocalOutputDisposition::Drop => {
             LocalOutputTransmitResult::Drop(packet, SystemError::ENETUNREACH)
@@ -2168,14 +2186,14 @@ where
                 Ok(fragment) => fragment,
                 Err(error) => return fragment_transmit_error(packet, error),
             };
-            // IPv6 local delivery uses the address-owning device as its
-            // logical input interface even though the packet traverses lo.
-            // Linux ip6_rcv_core stores the route's device in IP6CB(skb)->iif;
-            // SO_BINDTODEVICE must observe that scoped interface.
+            // IPv6 loopback uses the address-owning interface for input scope.
             let ingress_ifindex = if matches!(
                 smoltcp::wire::IpVersion::of_packet(&packet.frame),
                 Ok(smoltcp::wire::IpVersion::Ipv6)
             ) {
+                if !iface.common().ipv6_enabled() {
+                    return LocalOutputTransmitResult::Drop(packet, SystemError::ENETDOWN);
+                }
                 oif
             } else {
                 crate::net::LOOPBACK_IFINDEX as u32
@@ -2215,18 +2233,14 @@ where
     }
 }
 
-pub(super) fn transmit_native_output_if_up<D>(
-    device: &mut D,
-    packet: LocalOutputPacket,
-    owner_is_up: bool,
-) -> LocalOutputTransmitResult
-where
-    D: SmolDevice + ?Sized,
-{
-    if !owner_is_up {
-        return LocalOutputTransmitResult::Drop(packet, SystemError::ENETDOWN);
+fn is_ipv6_output_frame(packet: &LocalOutputPacket) -> bool {
+    use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpVersion};
+
+    match packet.medium {
+        smoltcp::phy::Medium::Ip => IpVersion::of_packet(&packet.frame) == Ok(IpVersion::Ipv6),
+        smoltcp::phy::Medium::Ethernet => EthernetFrame::new_checked(packet.frame.as_slice())
+            .is_ok_and(|frame| frame.ethertype() == EthernetProtocol::Ipv6),
     }
-    transmit_native_output(device, packet)
 }
 
 pub(super) fn transmit_native_output<D>(

@@ -177,6 +177,7 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
                 &iface.common().ip_addrs(),
                 &metadata,
                 true,
+                iface.common().ipv6_enabled(),
             )? {
                 // insert_derived() is the lifecycle authority here: the first
                 // UP publishes every deferred constructor address route,
@@ -227,6 +228,7 @@ pub(crate) struct PreparedAddressRouteCommit {
     metadata: Vec<AddressMetadata>,
     deleted_addresses: Vec<IpAddress>,
     invalidate_masquerade_oif: bool,
+    ipv6_enabled: Option<bool>,
 }
 
 pub(crate) struct AddressLinkChange<'a> {
@@ -236,6 +238,7 @@ pub(crate) struct AddressLinkChange<'a> {
     pub deleted_addresses: &'a [IpAddress],
     pub was_up: bool,
     pub is_up: bool,
+    pub ipv6_enabled: Option<bool>,
 }
 
 impl PreparedAddressRouteCommit {
@@ -262,6 +265,7 @@ impl PreparedAddressRouteCommit {
                 deleted_addresses,
                 was_up: is_up,
                 is_up,
+                ipv6_enabled: None,
             },
             None,
         )
@@ -280,7 +284,10 @@ impl PreparedAddressRouteCommit {
             deleted_addresses,
             was_up,
             is_up,
+            ipv6_enabled,
         } = change;
+        let was_ipv6_enabled = iface.common().ipv6_enabled();
+        let is_ipv6_enabled = ipv6_enabled.unwrap_or(was_ipv6_enabled);
         let ifindex = iface.nic_id() as u32;
         let before = match staged_before {
             Some(staged) => staged.try_clone()?,
@@ -289,10 +296,21 @@ impl PreparedAddressRouteCommit {
         let mut candidate = before.try_clone()?;
         let before_routes = {
             let old_metadata = iface.common().address_metadata().lock();
-            derived_address_entries_for_link_state(iface, before_addresses, &old_metadata, was_up)?
+            derived_address_entries_for_link_state(
+                iface,
+                before_addresses,
+                &old_metadata,
+                was_up,
+                was_ipv6_enabled,
+            )?
         };
-        let after_address_routes =
-            derived_address_entries_for_link_state(iface, after_addresses, &metadata, was_up)?;
+        let after_address_routes = derived_address_entries_for_link_state(
+            iface,
+            after_addresses,
+            &metadata,
+            was_up,
+            is_ipv6_enabled,
+        )?;
         let device_list = netns.device_list();
         let mut devices = Vec::new();
         devices
@@ -317,6 +335,11 @@ impl PreparedAddressRouteCommit {
                 },
             )
         }?;
+        if was_ipv6_enabled && !is_ipv6_enabled {
+            editor.remove_where(|entry| {
+                entry.oif == ifindex && !is_ipv4(entry.destination.address())
+            })?;
+        }
         let mut affected_oifs = editor.finish()?;
         let address_removed = if was_up && !is_up {
             candidate.delta_from(&before)?.removed
@@ -342,9 +365,13 @@ impl PreparedAddressRouteCommit {
             }
         } else if !was_up && is_up {
             let mut state_editor = FibEditor::new(&mut candidate);
-            for entry in
-                derived_address_entries_for_link_state(iface, after_addresses, &metadata, true)?
-            {
+            for entry in derived_address_entries_for_link_state(
+                iface,
+                after_addresses,
+                &metadata,
+                true,
+                is_ipv6_enabled,
+            )? {
                 state_editor.insert_derived(entry)?;
             }
             for oif in state_editor.finish()? {
@@ -358,11 +385,7 @@ impl PreparedAddressRouteCommit {
         }
         drop(device_list);
 
-        let mut address_capacity = 0;
-        iface
-            .smol_iface()
-            .lock()
-            .update_ip_addrs(|addresses| address_capacity = addresses.capacity());
+        let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
         if after_addresses.len() > address_capacity {
             return Err(SystemError::ENOSPC);
         }
@@ -414,6 +437,7 @@ impl PreparedAddressRouteCommit {
             metadata,
             deleted_addresses: try_clone_slice(deleted_addresses)?,
             invalidate_masquerade_oif: was_up && !is_up,
+            ipv6_enabled,
         })
     }
 
@@ -440,6 +464,7 @@ impl PreparedAddressRouteCommit {
             metadata,
             deleted_addresses,
             invalidate_masquerade_oif,
+            ipv6_enabled,
         } = self;
         let router = netns.router();
         let mut current = router.fib_write();
@@ -454,14 +479,16 @@ impl PreparedAddressRouteCommit {
         }
         debug_assert_eq!(*current, before);
         let mut smol_iface = iface.smol_iface().lock();
-        smol_iface.update_ip_addrs(|addresses| {
-            addresses.clear();
-            for cidr in after_addresses.iter().copied() {
+        if let Some(enabled) = ipv6_enabled {
+            smol_iface.set_ipv6_enabled(enabled, &after_addresses);
+        } else {
+            smol_iface.update_ip_addrs(|addresses| {
+                addresses.clear();
                 addresses
-                    .push(cidr)
+                    .extend_from_slice(&after_addresses)
                     .expect("address candidate was capacity-checked");
-            }
-        });
+            });
+        }
         smol_iface.routes_mut().update(|routes| {
             core::mem::swap(routes, &mut projection);
         });
@@ -551,6 +578,7 @@ fn derived_address_entries(
         addresses,
         metadata,
         iface.flags().contains(InterfaceFlags::UP),
+        iface.common().ipv6_enabled(),
     )
 }
 
@@ -559,12 +587,13 @@ fn derived_address_entries_for_link_state(
     addresses: &[IpCidr],
     metadata: &[AddressMetadata],
     is_up: bool,
+    ipv6_enabled: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let mut result = Vec::new();
     // Linux addrconf_add_dev() installs this route when IPv6 is enabled on a
     // non-loopback device, even before it has a unicast address. The regular
     // device DOWN/UP transaction removes and restores it with other routes.
-    if is_up && !iface.flags().contains(InterfaceFlags::LOOPBACK) {
+    if is_up && ipv6_enabled && !iface.flags().contains(InterfaceFlags::LOOPBACK) {
         result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
         result.push(RouteEntry {
             destination: IpCidr::Ipv6(Ipv6Cidr::new(

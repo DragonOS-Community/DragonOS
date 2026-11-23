@@ -52,6 +52,9 @@ pub(crate) fn add(
     {
         return Err(SystemError::ENODEV);
     }
+    if matches!(update.destination, IpAddress::Ipv6(_)) && !iface.common().ipv6_enabled() {
+        return Err(SystemError::EINVAL);
+    }
     validate_iface_and_update(iface, update)?;
     let ethernet_output = iface.common().type_() == crate::driver::net::types::InterfaceType::ETHER;
     if !ethernet_output {
@@ -145,8 +148,11 @@ pub(crate) fn prepare_configured_iface_purge<'rtnl>(
     rtnl: &'rtnl RtnlGuard,
     netns: &Arc<NetNamespace>,
     ifindex: u32,
+    ipv6_only: bool,
 ) -> Result<PreparedConfiguredNeighborPurge<'rtnl>, SystemError> {
-    let prepared = netns.neighbor_table().prepare_iface_purge(rtnl, ifindex)?;
+    let prepared = netns
+        .neighbor_table()
+        .prepare_iface_purge(rtnl, ifindex, ipv6_only)?;
     Ok(PreparedConfiguredNeighborPurge {
         rtnl,
         netns: netns.clone(),

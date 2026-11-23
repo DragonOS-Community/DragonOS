@@ -196,6 +196,8 @@ pub struct InterfaceInner {
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     tag: u16,
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_enabled: bool,
     any_ip: bool,
     /// Whether connected prefixes are represented explicitly in `routes`.
     route_table_includes_connected_prefixes: bool,
@@ -313,6 +315,8 @@ impl Interface {
                 hardware_addr: config.hardware_addr,
                 is_loopback: config.is_loopback,
                 ip_addrs: Vec::new(),
+                #[cfg(feature = "proto-ipv6")]
+                ipv6_enabled: true,
                 any_ip: false,
                 route_table_includes_connected_prefixes: false,
                 routes: Routes::new(),
@@ -489,6 +493,27 @@ impl Interface {
     pub fn update_ip_addrs<F: FnOnce(&mut Vec<IpCidr, IFACE_MAX_ADDR_COUNT>)>(&mut self, f: F) {
         f(&mut self.inner.ip_addrs);
         InterfaceInner::flush_neighbor_cache(&mut self.inner);
+        self.finish_ip_addr_update();
+    }
+
+    pub fn ip_addr_capacity(&self) -> usize {
+        self.inner.ip_addrs.capacity()
+    }
+
+    #[cfg(feature = "proto-ipv6")]
+    pub fn set_ipv6_enabled(&mut self, enabled: bool, addresses: &[IpCidr]) {
+        self.inner.ipv6_enabled = enabled;
+        self.inner.ip_addrs.clear();
+        self.inner
+            .ip_addrs
+            .extend_from_slice(addresses)
+            .expect("too many IP addresses");
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        self.inner.neighbor_cache.flush_ipv6();
+        self.finish_ip_addr_update();
+    }
+
+    fn finish_ip_addr_update(&mut self) {
         InterfaceInner::check_ip_addrs(&self.inner.ip_addrs);
 
         #[cfg(all(feature = "proto-ipv6", feature = "multicast"))]
@@ -598,6 +623,10 @@ impl Interface {
     ) -> Result<(), IpPacketDispatchError> {
         let version =
             IpVersion::of_packet(ip_packet).map_err(|_| IpPacketDispatchError::Malformed)?;
+        #[cfg(feature = "proto-ipv6")]
+        if !self.inner.ipv6_enabled && version == IpVersion::Ipv6 {
+            return Err(IpPacketDispatchError::NoRoute);
+        }
         let (packet_len, packet_source) = match (version, next_hop) {
             #[cfg(feature = "proto-ipv4")]
             (IpVersion::Ipv4, IpAddress::Ipv4(_)) => {
@@ -1889,6 +1918,10 @@ impl InterfaceInner {
                 .egress_override(ip_repr.version(), ip_repr.dst_addr(), meta)
                 .map_err(|_| DispatchError::Exhausted)?
         };
+        #[cfg(feature = "proto-ipv6")]
+        if !self.ipv6_enabled && egress.is_none() && ip_repr.version() == IpVersion::Ipv6 {
+            return Err(DispatchError::NoRoute);
+        }
         let tx_medium = egress.map_or(self.caps.medium, |egress| egress.medium);
         let ip_mtu = egress.map_or(self.caps.ip_mtu(), |egress| egress.ip_mtu);
         let arp_source = self

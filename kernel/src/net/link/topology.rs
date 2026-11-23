@@ -472,6 +472,7 @@ pub(crate) fn move_veth(
     source_removal.publish_moving();
     let retired_sockets = sockets_move.publish(iface.common());
     detach_for_netns_move(&iface);
+    iface.common().publish_ipv6_disabled(0);
     veth.publish_stack_after_netns_move(stack_move);
     iface.common().set_name(destination_name_owned);
     target_addition.publish();

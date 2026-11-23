@@ -1207,6 +1207,16 @@ impl LocalInputQueue {
         !self.output.lock().deferred_routes.is_empty()
     }
 
+    pub(super) fn fail_deferred_ipv6(&self) -> bool {
+        let mut output = self.output.lock();
+        let LocalOutputQueueState {
+            packets,
+            deferred_routes,
+            ..
+        } = &mut *output;
+        deferred_routes.fail_ipv6(packets)
+    }
+
     pub(super) fn release_resolved_outputs(
         &self,
         mut is_resolved: impl FnMut(smoltcp::wire::IpAddress) -> bool,

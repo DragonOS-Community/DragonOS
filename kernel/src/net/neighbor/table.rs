@@ -52,7 +52,7 @@ pub(crate) struct NeighborSnapshot {
 /// `prepare_iface_purge` and `publish_iface_purge` while the caller retains the
 /// same guard.
 pub(super) struct PreparedNeighborPurge {
-    ifindex: u32,
+    range: core::ops::Range<usize>,
     removed: Vec<NeighborEntry>,
 }
 
@@ -206,15 +206,20 @@ impl NeighborTable {
         &self,
         _rtnl: &RtnlGuard,
         ifindex: u32,
+        ipv6_only: bool,
     ) -> Result<PreparedNeighborPurge, SystemError> {
         let entries = self.entries.read();
-        let range = iface_range(&entries, ifindex);
+        let mut range = iface_range(&entries, ifindex);
+        if ipv6_only {
+            range.start += entries[range.clone()]
+                .partition_point(|entry| matches!(entry.destination, IpAddress::Ipv4(_)));
+        }
         let mut removed = Vec::new();
         removed
             .try_reserve_exact(range.len())
             .map_err(|_| SystemError::ENOMEM)?;
-        removed.extend_from_slice(&entries[range]);
-        Ok(PreparedNeighborPurge { ifindex, removed })
+        removed.extend_from_slice(&entries[range.clone()]);
+        Ok(PreparedNeighborPurge { range, removed })
     }
 
     pub(super) fn publish_iface_purge(
@@ -222,13 +227,12 @@ impl NeighborTable {
         _rtnl: &RtnlGuard,
         prepared: PreparedNeighborPurge,
     ) -> Vec<NeighborEntry> {
-        let PreparedNeighborPurge { ifindex, removed } = prepared;
+        let PreparedNeighborPurge { range, removed } = prepared;
         if removed.is_empty() {
             return removed;
         }
 
         let mut entries = self.entries.write();
-        let range = iface_range(&entries, ifindex);
         debug_assert_eq!(&entries[range.clone()], removed.as_slice());
         self.remove_iface_entries(&mut entries, range);
         removed

@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    address::{PreparedAddressLabelRename, PreparedMtuAddressChange, RemovedAddress},
+    address::{PreparedAddressLabelRename, PreparedLinkAddressChange, RemovedAddress},
     neighbor::{self, NeighborEntry, PreparedConfiguredNeighborPurge},
     route::{self, FibTable, PreparedLinkStateChange, RouteNotifications},
     rtnl::RtnlGuard,
@@ -90,7 +90,7 @@ bitflags! {
 pub(crate) struct LinkMutationCommit {
     pub iface: Arc<dyn Iface>,
     pub changes: LinkChanges,
-    pub renamed_ipv4: Vec<smoltcp::wire::IpCidr>,
+    pub changed_addresses: Vec<smoltcp::wire::IpCidr>,
     pub removed_addresses: Vec<RemovedAddress>,
     pub route_changes: Option<RouteNotifications>,
     pub removed_neighbors: Vec<NeighborEntry>,
@@ -140,7 +140,7 @@ struct PreparedLinkMutation<'rtnl> {
     rename: Option<PreparedLinkRename>,
     flags: Option<PreparedConfiguredFlags>,
     routes: Option<PreparedLinkStateChange<'rtnl>>,
-    address_change: Option<PreparedMtuAddressChange>,
+    address_change: Option<PreparedLinkAddressChange>,
     neighbors: Option<PreparedConfiguredNeighborPurge<'rtnl>>,
     changes: LinkChanges,
     was_up: bool,
@@ -238,21 +238,15 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
 
         let (flags, was_up, is_up, noarp_changed) = prepare_flags(&iface, update.flags)?;
         let link_down = was_up && !is_up;
-        let address_change = mtu
-            .map(|mtu| {
-                let name = rename.as_ref().map(|rename| rename.name.as_str());
-                super::address::prepare_mtu_address_change(
-                    &netns,
-                    &iface,
-                    mtu,
-                    name,
-                    was_up,
-                    is_up,
-                    staged_before,
-                )
-            })
-            .transpose()?
-            .flatten();
+        let address_change = super::address::prepare_link_address_change(
+            &netns,
+            &iface,
+            mtu,
+            rename.as_ref().map(|rename| rename.name.as_str()),
+            was_up,
+            is_up,
+            staged_before,
+        )?;
         let mut rename = rename;
         if address_change.is_some() {
             if let Some(rename) = rename.as_mut() {
@@ -275,6 +269,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
                 rtnl,
                 &netns,
                 iface.nic_id() as u32,
+                false,
             )?)
         } else {
             None
@@ -361,10 +356,10 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         }
 
         let mut rename = rename;
-        let mut renamed_ipv4 = Vec::new();
+        let mut changed_addresses = Vec::new();
         if address_change.is_none() {
             if let Some((name, labels)) = rename.take() {
-                renamed_ipv4 = labels
+                changed_addresses = labels
                     .expect("rename without an address transaction owns its label plan")
                     .publish(&iface, name);
             }
@@ -400,19 +395,20 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
                 debug_assert!(labels.is_none());
                 name
             });
-            let (removed, renamed, route_changes) = address_change.publish(
+            let (removed, changed, route_changes) = address_change.publish(
                 &netns,
                 &iface,
                 renamed_to,
                 || {
-                    let mtu = mtu.expect("address teardown requires an MTU update");
-                    let stack_mtu = iface.stack_mtu(mtu);
-                    iface
-                        .smol_iface()
-                        .lock()
-                        .set_ip_mtu(stack_mtu)
-                        .expect("validated interface MTU must be representable by smoltcp");
-                    iface.common().set_mtu(mtu);
+                    if let Some(mtu) = mtu {
+                        let stack_mtu = iface.stack_mtu(mtu);
+                        iface
+                            .smol_iface()
+                            .lock()
+                            .set_ip_mtu(stack_mtu)
+                            .expect("validated interface MTU must be representable by smoltcp");
+                        iface.common().set_mtu(mtu);
+                    }
                 },
                 is_up,
                 || {
@@ -427,7 +423,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
                 },
             );
             removed_addresses = removed;
-            renamed_ipv4 = renamed;
+            changed_addresses = changed;
             Some(route_changes)
         } else if let Some(routes) = routes {
             Some(routes.publish(&netns, is_up, || {
@@ -478,7 +474,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         Ok(LinkMutationCommit {
             iface,
             changes,
-            renamed_ipv4,
+            changed_addresses,
             removed_addresses,
             route_changes,
             removed_neighbors,

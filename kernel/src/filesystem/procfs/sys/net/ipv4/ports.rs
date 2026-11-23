@@ -8,7 +8,7 @@ use alloc::{
 use system_error::SystemError;
 
 use super::super::super::numeric::parse_numeric_sysctl_values;
-use super::namespace::SysctlNamespace;
+use super::super::namespace::SysctlNamespace;
 use crate::{
     filesystem::{
         procfs::{

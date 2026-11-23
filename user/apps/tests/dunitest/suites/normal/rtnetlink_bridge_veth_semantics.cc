@@ -253,6 +253,83 @@ struct CleanupLinks {
     }
 };
 
+TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd source;
+            ASSERT_GE(source.fd, 0);
+
+            const std::string name = "v6sysctl";
+            const std::string renamed = "v6renamed";
+            const std::string prefix = "/proc/sys/net/ipv6/conf/";
+            const std::string path = prefix + name + "/disable_ipv6";
+            const auto read_value = [](const std::string& path) {
+                const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd < 0) return std::string{};
+                char value[16];
+                const ssize_t count = read(fd, value, sizeof(value));
+                close(fd);
+                return count > 0 ? std::string(value, count) : std::string{};
+            };
+
+            LinkRequest add(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4900);
+            ASSERT_TRUE(add.name(name));
+            AddKind(add, "veth");
+            ASSERT_EQ(SendAck(source.fd, add), 0);
+            const unsigned ifindex = if_nametoindex(name.c_str());
+            ASSERT_NE(ifindex, 0u);
+            ASSERT_EQ(read_value(path), "0\n");
+
+            const int original = open(path.c_str(), O_RDWR | O_CLOEXEC);
+            ASSERT_GE(original, 0);
+            ASSERT_EQ(write(original, "2\n", 2), 2);
+            EXPECT_EQ(read_value(path), "2\n");
+
+            const auto rename = [&](const std::string& new_name, uint32_t seq) {
+                LinkRequest request(RTM_SETLINK, 0, seq);
+                request.body()->ifi_index = ifindex;
+                if (!request.name(new_name)) return EINVAL;
+                return SendAck(source.fd, request);
+            };
+            ASSERT_EQ(rename(renamed, 4901), 0);
+            EXPECT_EQ(read_value(prefix + renamed + "/disable_ipv6"), "2\n");
+            EXPECT_EQ(access(path.c_str(), F_OK), -1);
+            EXPECT_EQ(errno, ENOENT);
+            ASSERT_EQ(rename(name, 4902), 0);
+            EXPECT_EQ(pwrite(original, "0\n", 2, 0), -1);
+            EXPECT_EQ(errno, ENOENT);
+            close(original);
+            EXPECT_EQ(read_value(path), "2\n");
+
+            const int before_move = open(path.c_str(), O_RDWR | O_CLOEXEC);
+            ASSERT_GE(before_move, 0);
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            EXPECT_EQ(access(path.c_str(), F_OK), -1);
+            EXPECT_EQ(errno, ENOENT);
+            const int target = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+            ASSERT_GE(target, 0);
+            LinkRequest move(RTM_SETLINK, 0, 4903);
+            move.body()->ifi_index = ifindex;
+            ASSERT_TRUE(move.add(IFLA_NET_NS_FD, &target, sizeof(target)));
+            ASSERT_EQ(SendAck(source.fd, move), 0);
+            close(target);
+            EXPECT_EQ(read_value(path), "0\n");
+            EXPECT_EQ(pwrite(before_move, "1\n", 2, 0), -1);
+            EXPECT_EQ(errno, ENOENT);
+            close(before_move);
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkBridgeVethSemantics, CreateAndUpBridgeWithNonemptyFibInSingleRequest) {
     const auto now_ms = []() -> int64_t {
         timespec now{};

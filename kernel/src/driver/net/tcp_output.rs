@@ -44,6 +44,7 @@ impl TcpOutputQueue {
                 // classified against the namespace FIB, including local IPs.
                 owner_ifindex: 0,
                 owner_is_up: false,
+                owner_ipv6_enabled: false,
                 authoritative_output: true,
             },
         }
@@ -118,7 +119,7 @@ impl TcpOutputQueue {
                     // The shared local-output path owns IPv4 fragmentation and
                     // advances the cursor only after each fragment is accepted.
                     let result =
-                        transmit_local_stack_output(netns, false, &mut TransportOnlyDevice, packet);
+                        transmit_local_stack_output(netns, None, &mut TransportOnlyDevice, packet);
                     match result {
                         LocalOutputTransmitResult::Continue(packet) => {
                             self.retry_backoff_us

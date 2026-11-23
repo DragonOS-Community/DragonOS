@@ -114,6 +114,7 @@ struct LinkState {
     uint32_t master = 0;
     uint32_t mtu = 0;
     uint32_t tx_queue_len = 0;
+    std::optional<std::array<uint8_t, ETH_ALEN>> mac;
     std::string kind;
     uint16_t linkinfo_type = 0;
 };
@@ -134,7 +135,9 @@ std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t
             state.flags = body->ifi_flags;
             int bytes = IFLA_PAYLOAD(message);
             for (auto* attr = IFLA_RTA(body); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
-                if (attr->rta_type == IFLA_LINK && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
+                if (attr->rta_type == IFLA_ADDRESS && RTA_PAYLOAD(attr) == ETH_ALEN) {
+                    std::memcpy(state.mac.emplace().data(), RTA_DATA(attr), ETH_ALEN);
+                } else if (attr->rta_type == IFLA_LINK && RTA_PAYLOAD(attr) == sizeof(uint32_t)) {
                     std::memcpy(&state.link, RTA_DATA(attr), sizeof(uint32_t));
                 } else if (attr->rta_type == IFLA_LINK_NETNSID &&
                            RTA_PAYLOAD(attr) == sizeof(int32_t)) {
@@ -224,7 +227,7 @@ int SetLinkUp(int fd, uint32_t index, bool up, uint32_t seq) {
 bool SawBridgeCarrierEvent(int fd, uint32_t index, bool carrier) {
     for (int attempt = 0; attempt < 24; ++attempt) {
         pollfd ready {fd, POLLIN, 0};
-        if (poll(&ready, 1, 1000) <= 0) return false;
+        if (poll(&ready, 1, 2000) <= 0) return false;
         std::array<uint8_t, 4096> bytes {};
         const ssize_t count = recv(fd, bytes.data(), bytes.size(), 0);
         if (count <= 0) return false;
@@ -239,6 +242,27 @@ bool SawBridgeCarrierEvent(int fd, uint32_t index, bool carrier) {
         }
     }
     return false;
+}
+
+std::string ReadBridgeOperstate(const std::string& bridge) {
+    const std::string path = "/sys/class/net/" + bridge + "/operstate";
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return {};
+    std::array<char, 32> state{};
+    const ssize_t length = read(fd, state.data(), state.size());
+    close(fd);
+    return length > 0 ? std::string(state.data(), static_cast<size_t>(length)) : std::string();
+}
+
+std::string WaitForBridgeOperstate(const std::string& bridge, const char* expected) {
+    // Linux linkwatch may publish the operational state after the SETLINK ACK.
+    std::string state;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        state = ReadBridgeOperstate(bridge);
+        if (state == expected) break;
+        usleep(10'000);
+    }
+    return state;
 }
 
 struct CleanupLinks {
@@ -1060,9 +1084,7 @@ TEST(RtnetlinkBridgeVethSemantics, SysfsPortMtuNotifiesBridgeAndTracksDeletedOrM
 
 TEST(RtnetlinkBridgeVethSemantics, BridgeCarrierChangesNotifyLinkSubscribers) {
     RouteFd route;
-    RouteFd monitor(RTMGRP_LINK);
     ASSERT_GE(route.fd, 0);
-    ASSERT_GE(monitor.fd, 0);
     const std::string bridge = UniqueName("cb");
     const std::string host = UniqueName("ch");
     const std::string peer = UniqueName("cp");
@@ -1091,20 +1113,76 @@ TEST(RtnetlinkBridgeVethSemantics, BridgeCarrierChangesNotifyLinkSubscribers) {
     ASSERT_NE(host_index, 0u);
     ASSERT_NE(peer_index, 0u);
     ASSERT_EQ(SetLinkUp(route.fd, bridge_index, true, 4532), 0);
+    EXPECT_EQ(ReadBridgeOperstate(bridge), "unknown\n");
+    const auto initial_link = QueryLinkByIndex(route.fd, bridge_index, 4537);
+    ASSERT_TRUE(initial_link.has_value());
+    EXPECT_NE(initial_link->flags & IFF_LOWER_UP, 0u);
+    ASSERT_EQ(SetLinkUp(route.fd, bridge_index, false, 4562), 0);
+    EXPECT_EQ(ReadBridgeOperstate(bridge), "down\n");
+    ASSERT_EQ(SetLinkUp(route.fd, bridge_index, true, 4538), 0);
+    EXPECT_EQ(ReadBridgeOperstate(bridge), "unknown\n");
     ASSERT_EQ(SetLinkUp(route.fd, host_index, true, 4533), 0);
     ASSERT_EQ(SetLinkUp(route.fd, peer_index, true, 4534), 0);
+    RouteFd monitor(RTMGRP_LINK);
+    ASSERT_GE(monitor.fd, 0);
     ASSERT_EQ(SetLinkMaster(route.fd, host_index, bridge_index, 4535), 0);
     EXPECT_TRUE(SawBridgeCarrierEvent(monitor.fd, bridge_index, true));
+    EXPECT_EQ(WaitForBridgeOperstate(bridge, "up\n"), "up\n");
 
     ASSERT_EQ(SetLinkUp(route.fd, peer_index, false, 4536), 0);
     EXPECT_TRUE(SawBridgeCarrierEvent(monitor.fd, bridge_index, false));
+    EXPECT_EQ(WaitForBridgeOperstate(bridge, "down\n"), "down\n");
+    ASSERT_EQ(SetLinkUp(route.fd, peer_index, true, 4563), 0);
+    ASSERT_EQ(WaitForBridgeOperstate(bridge, "up\n"), "up\n");
+    RouteFd detach_monitor(RTMGRP_LINK);
+    ASSERT_GE(detach_monitor.fd, 0);
+    ASSERT_EQ(SetLinkMaster(route.fd, host_index, 0, 4539), 0);
+    EXPECT_TRUE(SawBridgeCarrierEvent(detach_monitor.fd, bridge_index, false));
+    EXPECT_EQ(WaitForBridgeOperstate(bridge, "down\n"), "down\n");
+    ASSERT_EQ(SetLinkUp(route.fd, bridge_index, false, 4560), 0);
+    ASSERT_EQ(SetLinkUp(route.fd, bridge_index, true, 4561), 0);
+    EXPECT_EQ(ReadBridgeOperstate(bridge), "down\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, BridgeMacChangeRecomputesInitialCarrier) {
+    RouteFd route;
+    ASSERT_GE(route.fd, 0);
+    const std::string bridge = UniqueName("mb");
+    CleanupLinks cleanup{route.fd, bridge, {}};
+    LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4564);
+    ASSERT_TRUE(create.name(bridge));
+    AddKind(create, "bridge");
+    const int result = SendAck(route.fd, create);
+    if (result == EPERM) GTEST_SKIP() << "CAP_NET_ADMIN unavailable";
+    ASSERT_EQ(result, 0);
+    const uint32_t index = if_nametoindex(bridge.c_str());
+    ASSERT_NE(index, 0u);
+    ASSERT_EQ(SetLinkUp(route.fd, index, true, 4565), 0);
+    const auto initial = QueryLinkByIndex(route.fd, index, 4566);
+    ASSERT_TRUE(initial.has_value() && initial->mac.has_value());
+    ASSERT_NE(initial->flags & IFF_LOWER_UP, 0u);
+
+    auto mac = *initial->mac;
+    LinkRequest same(RTM_SETLINK, 0, 4567);
+    same.body()->ifi_index = index;
+    ASSERT_TRUE(same.add(IFLA_ADDRESS, mac.data(), mac.size()));
+    ASSERT_EQ(SendAck(route.fd, same), 0);
+    EXPECT_EQ(ReadBridgeOperstate(bridge), "unknown\n");
+
+    mac.back() ^= 1;
+    LinkRequest changed(RTM_SETLINK, 0, 4568);
+    changed.body()->ifi_index = index;
+    ASSERT_TRUE(changed.add(IFLA_ADDRESS, mac.data(), mac.size()));
+    ASSERT_EQ(SendAck(route.fd, changed), 0);
+    EXPECT_EQ(WaitForBridgeOperstate(bridge, "down\n"), "down\n");
+    const auto updated = QueryLinkByIndex(route.fd, index, 4569);
+    ASSERT_TRUE(updated.has_value());
+    EXPECT_EQ(updated->flags & IFF_LOWER_UP, 0u);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, CreateAttachedUpVethNotifiesBridgeCarrier) {
     RouteFd route;
-    RouteFd monitor(RTMGRP_LINK);
     ASSERT_GE(route.fd, 0);
-    ASSERT_GE(monitor.fd, 0);
     const std::string bridge = UniqueName("nb");
     const std::string host = UniqueName("nh");
     const std::string peer = UniqueName("np");
@@ -1135,6 +1213,8 @@ TEST(RtnetlinkBridgeVethSemantics, CreateAttachedUpVethNotifiesBridgeCarrier) {
     create_veth.body()->ifi_change = IFF_UP;
     ASSERT_TRUE(create_veth.add(IFLA_MASTER, &bridge_index, sizeof(bridge_index)));
     AddKind(create_veth, "veth", veth_data);
+    RouteFd monitor(RTMGRP_LINK);
+    ASSERT_GE(monitor.fd, 0);
     ASSERT_EQ(SendAck(route.fd, create_veth), 0);
     EXPECT_TRUE(SawBridgeCarrierEvent(monitor.fd, bridge_index, true));
 }

@@ -31,7 +31,7 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[allow(dead_code, non_camel_case_types)]
 pub enum Operstate {
     /// 网络接口的状态未知

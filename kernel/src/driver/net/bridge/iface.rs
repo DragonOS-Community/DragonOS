@@ -167,7 +167,6 @@ impl BridgeIface {
             inner: SpinLock::new(BridgeDeviceData::default()),
             locked_kobj_state: LockedKObjectState::default(),
         });
-        iface.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
         iface.set_operstate(Operstate::IF_OPER_DOWN);
         *iface.common.napi_struct.write() = Some(NapiStruct::new(iface.clone(), 10));
         *driver.local_iface.lock() = Arc::downgrade(&iface);
@@ -405,7 +404,10 @@ impl BridgeIface {
         bridge.local_mac = Some(mac);
         bridge.forget_macs(mac, mac);
         drop(bridge);
-        *self.mac_address.lock() = mac;
+        let old = core::mem::replace(&mut *self.mac_address.lock(), mac);
+        if old != mac {
+            self.driver.update_carrier_from_ports();
+        }
         if let Some(napi) = napi {
             crate::driver::net::napi::napi_resume(napi);
         }
@@ -414,6 +416,27 @@ impl BridgeIface {
 
     fn inner(&self) -> SpinLockGuard<'_, BridgeDeviceData> {
         self.inner.lock()
+    }
+
+    pub(super) fn publish_carrier(&self, port_carrier: Option<bool>) {
+        let mut inner = self.inner();
+        let device = &mut inner.netdevice_common;
+        if let Some(carrier) = port_carrier {
+            device
+                .state
+                .set(NetDeivceState::__LINK_STATE_NOCARRIER, !carrier);
+        }
+        device.operstate = if !device.state.contains(NetDeivceState::__LINK_STATE_START)
+            || device
+                .state
+                .contains(NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            Operstate::IF_OPER_DOWN
+        } else if port_carrier.is_none() {
+            Operstate::IF_OPER_UNKNOWN
+        } else {
+            Operstate::IF_OPER_UP
+        };
     }
 }
 
@@ -564,7 +587,7 @@ impl Iface for BridgeIface {
     fn set_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state |= state;
         if state.contains(NetDeivceState::__LINK_STATE_START) {
-            self.driver.update_carrier_from_ports();
+            self.driver.update_carrier_on_admin_change();
         }
     }
     fn clear_net_state(&self, state: NetDeivceState) {
@@ -608,6 +631,8 @@ impl Iface for BridgeIface {
     }
     fn publish_admin_state(&self, is_up: bool) {
         self.driver.active.store(is_up, Ordering::SeqCst);
-        self.driver.update_carrier_from_ports();
+        if !is_up {
+            self.driver.update_carrier_on_admin_change();
+        }
     }
 }

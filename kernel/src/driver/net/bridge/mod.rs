@@ -158,25 +158,30 @@ impl BridgeDriver {
         self.update_carrier_from_ports();
     }
 
-    /// The bridge has link carrier when at least one attached Ethernet port
-    /// has carrier. Its own administrative UP state is projected separately.
     pub(crate) fn update_carrier_from_ports(&self) {
+        self.update_carrier(false);
+    }
+
+    fn update_carrier_on_admin_change(&self) {
+        self.update_carrier(true);
+    }
+
+    fn update_carrier(&self, preserve_empty: bool) {
         let mut bridge = self.inner.lock();
         // A down or carrier-less port must not keep a learned unicast entry:
         // otherwise the lookup targets that port and the frame is discarded
         // instead of being flooded to a host that moved elsewhere.
         bridge.forget_inactive_ports();
-        let has_carrier = self.active.load(Ordering::Acquire)
-            && bridge.ports.values().any(BridgePort::can_forward);
+        // An administrative transition with no ports retains the carrier
+        // bit. Adding/removing a port or changing the MAC recalculates it,
+        // including when the last port has just been removed.
+        let port_carrier = (!(preserve_empty && bridge.ports.is_empty())).then(|| {
+            self.active.load(Ordering::Acquire)
+                && bridge.ports.values().any(BridgePort::can_forward)
+        });
         drop(bridge);
         if let Some(local) = self.local_iface() {
-            if has_carrier {
-                local.clear_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
-                local.set_operstate(Operstate::IF_OPER_UP);
-            } else {
-                local.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
-                local.set_operstate(Operstate::IF_OPER_DOWN);
-            }
+            local.publish_carrier(port_carrier);
         }
     }
 

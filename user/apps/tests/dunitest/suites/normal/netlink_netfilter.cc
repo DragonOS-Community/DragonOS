@@ -152,6 +152,11 @@ void AppendBe32(std::vector<uint8_t>* request, uint16_t type, uint32_t value) {
   AppendRawAttr(request, type, reinterpret_cast<const uint8_t*>(&be), sizeof(be));
 }
 
+void AppendBe32Nla(std::vector<uint8_t>* attrs, uint16_t type, uint32_t value) {
+  const uint32_t be = htonl(value);
+  AppendNla(attrs, type, reinterpret_cast<const uint8_t*>(&be), sizeof(be));
+}
+
 void AppendExpr(std::vector<uint8_t>* expressions, const char* name,
                 const std::vector<uint8_t>& data) {
   std::vector<uint8_t> expression;
@@ -7742,6 +7747,202 @@ void CheckAtomicRuleRollback() {
   Ack(nft.get(), seq + 13, 0, kNftDeltable);
   ASSERT_EQ(1, denied.Send(sender.get(), 0x40));
   ASSERT_NO_FATAL_FAILURE(denied.ExpectDelivery(0x40));
+}
+
+void CheckUdpMasqueradeLifecycle(bool ipv6, bool compat) {
+  constexpr char table[] = "nat", chain[] = "POSTROUTING";
+  const uint8_t family = ipv6 ? NFPROTO_IPV6 : NFPROTO_IPV4;
+  const int af = ipv6 ? AF_INET6 : AF_INET;
+  const char* addresses4[] = {"192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"};
+  const char* addresses6[] = {"::1", "fd00:2324::2", "fd00:2324::3", "fd00:2324::4"};
+  const auto* addresses = ipv6 ? addresses6 : addresses4;
+  Fd route(OpenRouteSocket());
+  ASSERT_GE(route.get(), 0);
+  const auto lo = if_nametoindex("lo");
+  ASSERT_NE(0u, lo);
+  constexpr uint16_t create = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+  if (ipv6) {
+    for (int i = 1; i <= 3; ++i) {
+      ASSERT_EQ(0, SendIpv6AddrRequest(route.get(), RTM_NEWADDR,
+                                       create, lo, addresses[i], 128, i));
+    }
+  } else {
+    // IPv4 MASQUERADE requires a universe-scope address, even on loopback.
+    for (int i = 0; i <= 3; ++i) {
+      ASSERT_EQ(0, SendAddrRequest(route.get(), RTM_NEWADDR, create, lo,
+                                   addresses[i], 32, i + 1, RT_SCOPE_UNIVERSE));
+    }
+  }
+  Fd nft(Open()), server(socket(af, SOCK_DGRAM, 0));
+  ASSERT_GE(nft.get(), 0);
+  ASSERT_GE(server.get(), 0);
+  auto endpoint = [&](const char* address, uint16_t port) {
+    sockaddr_storage storage{};
+    if (ipv6) {
+      auto* v6 = reinterpret_cast<sockaddr_in6*>(&storage);
+      v6->sin6_family = af;
+      v6->sin6_port = htons(port);
+      EXPECT_EQ(1, inet_pton(af, address, &v6->sin6_addr));
+    } else {
+      auto* v4 = reinterpret_cast<sockaddr_in*>(&storage);
+      v4->sin_family = af;
+      v4->sin_port = htons(port);
+      EXPECT_EQ(1, inet_pton(af, address, &v4->sin_addr));
+    }
+    return storage;
+  };
+  const socklen_t size = ipv6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+  const auto destination = endpoint(addresses[0], 44111);
+  ASSERT_EQ(0, bind(server.get(), reinterpret_cast<const sockaddr*>(&destination), size));
+  Fd a(socket(af, SOCK_DGRAM, 0)), b(socket(af, SOCK_DGRAM, 0)), c(socket(af, SOCK_DGRAM, 0));
+  const int clients[] = {a.get(), b.get(), c.get()};
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_GE(clients[i], 0);
+    const auto source = endpoint(addresses[i + 1], 44112);
+    ASSERT_EQ(0, bind(clients[i], reinterpret_cast<const sockaddr*>(&source), size));
+    ASSERT_EQ(0, connect(clients[i], reinterpret_cast<const sockaddr*>(&destination), size));
+  }
+
+  auto masq = [&](uint32_t seq, uint16_t first) {
+    std::vector<uint8_t> expressions, args;
+    const uint8_t udp = IPPROTO_UDP;
+    AppendMetaEqual(&expressions, NFT_META_L4PROTO, &udp, sizeof(udp));
+    const uint16_t destination_port = htons(44111);
+    AppendPayloadEqual(&expressions, NFT_PAYLOAD_TRANSPORT_HEADER, 2,
+                       reinterpret_cast<const uint8_t*>(&destination_port),
+                       sizeof(destination_port));
+    AppendExpr(&expressions, "counter", {});
+    const uint16_t min = htons(first), max = htons(first + 1);
+    if (compat) {
+      nf_nat_ipv4_multi_range_compat v4{};
+      nf_nat_range v6{};
+      v4.rangesize = 1;
+      v4.range[0].flags = v6.flags = NF_NAT_RANGE_PROTO_SPECIFIED;
+      v4.range[0].min.udp.port = v6.min_proto.udp.port = min;
+      v4.range[0].max.udp.port = v6.max_proto.udp.port = max;
+      AppendNla(&args, NFTA_TARGET_NAME,
+                reinterpret_cast<const uint8_t*>("MASQUERADE"), sizeof("MASQUERADE"));
+      AppendBe32Nla(&args, NFTA_TARGET_REV, 0);
+      AppendNla(&args, NFTA_TARGET_INFO,
+                ipv6 ? reinterpret_cast<const uint8_t*>(&v6) :
+                       reinterpret_cast<const uint8_t*>(&v4), ipv6 ? sizeof(v6) : sizeof(v4));
+      AppendExpr(&expressions, "target", args);
+    } else {
+      AppendImmediateBytes(&expressions, NFT_REG_1, reinterpret_cast<const uint8_t*>(&min), 2);
+      AppendImmediateBytes(&expressions, NFT_REG_2, reinterpret_cast<const uint8_t*>(&max), 2);
+      AppendBe32Nla(&args, NFTA_MASQ_FLAGS, NF_NAT_RANGE_PROTO_SPECIFIED);
+      AppendBe32Nla(&args, NFTA_MASQ_REG_PROTO_MIN, NFT_REG_1);
+      AppendBe32Nla(&args, NFTA_MASQ_REG_PROTO_MAX, NFT_REG_2);
+      AppendExpr(&expressions, "masq", args);
+    }
+    auto rule = RuleWithExpressions(seq, table, chain, expressions, family);
+    if (compat) {
+      std::vector<uint8_t> metadata;
+      AppendBe32Nla(&metadata, NFTA_RULE_COMPAT_PROTO, udp);
+      AppendBe32Nla(&metadata, NFTA_RULE_COMPAT_FLAGS, 0);
+      AppendRawAttr(&rule, NFTA_RULE_COMPAT | NLA_F_NESTED, metadata.data(), metadata.size());
+    }
+    return rule;
+  };
+
+  constexpr uint32_t seq = 268000;
+  const auto install = MutationBatch(
+      seq, {TableMutation(kNftNewtable, seq + 1, table, family),
+            NewChain(seq + 2, table, chain, true, NF_ACCEPT, NF_INET_POST_ROUTING,
+                     family, 100, "nat"), masq(seq + 3, 46000)});
+  ASSERT_EQ(static_cast<ssize_t>(install.size()), Send(nft.get(), install));
+  Ack(nft.get(), seq + 1, 0, kNftNewtable);
+  Ack(nft.get(), seq + 2, 0, kNftNewchain);
+  Ack(nft.get(), seq + 3, 0, kNftNewrule);
+
+  auto round_trip = [&](int client, uint8_t marker, uint16_t* port) {
+    ASSERT_EQ(1, send(client, &marker, 1, 0));
+    pollfd ready{server.get(), POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 2000));
+    uint8_t observed = 0;
+    sockaddr_storage peer{};
+    socklen_t length = sizeof(peer);
+    ASSERT_EQ(1, recvfrom(server.get(), &observed, 1, 0,
+                         reinterpret_cast<sockaddr*>(&peer), &length));
+    ASSERT_EQ(marker, observed);
+    ASSERT_EQ(af, peer.ss_family);
+    if (ipv6) {
+      const auto& v6 = reinterpret_cast<const sockaddr_in6&>(peer);
+      ASSERT_EQ(0, memcmp(&v6.sin6_addr, &in6addr_loopback, sizeof(in6_addr)));
+      *port = ntohs(v6.sin6_port);
+    } else {
+      const auto& v4 = reinterpret_cast<const sockaddr_in&>(peer);
+      ASSERT_EQ(Ipv4(addresses[0]), v4.sin_addr.s_addr);
+      *port = ntohs(v4.sin_port);
+    }
+    ASSERT_EQ(1, sendto(server.get(), &marker, 1, 0,
+                       reinterpret_cast<const sockaddr*>(&peer), length));
+    ready = {client, POLLIN, 0};
+    ASSERT_EQ(1, poll(&ready, 1, 2000));
+    ASSERT_EQ(1, recv(client, &observed, 1, 0));
+    EXPECT_EQ(marker, observed);
+  };
+  uint16_t first = 0, second = 0, current = 0;
+  ASSERT_NO_FATAL_FAILURE(round_trip(a.get(), 1, &first));
+  ASSERT_NO_FATAL_FAILURE(round_trip(b.get(), 2, &second));
+  EXPECT_EQ(46000, std::min(first, second));
+  EXPECT_EQ(46001, std::max(first, second));
+
+  auto rules = [&](uint32_t sequence) {
+    auto query = Request(kNftGetrule, sequence);
+    query[NLMSG_HDRLEN] = family;
+    reinterpret_cast<nlmsghdr*>(query.data())->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    AppendAttr(&query, NFTA_RULE_TABLE, table);
+    AppendAttr(&query, NFTA_RULE_CHAIN, chain);
+    EXPECT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+    return ReceiveRuleDump(nft.get(), sequence);
+  };
+  const auto original = rules(seq + 5);
+  ASSERT_EQ(1u, original.size());
+  EXPECT_EQ(2u, original[0].packets);
+
+  const uint8_t blocked = 3;
+  const auto sent = send(c.get(), &blocked, 1, 0);
+  ASSERT_TRUE(sent == 1 || (sent == -1 && errno == EPERM)) << strerror(errno);
+  pollfd ready{server.get(), POLLIN, 0};
+  ASSERT_EQ(0, poll(&ready, 1, 100));
+  const auto exhausted = rules(seq + 6);
+  ASSERT_EQ(1u, exhausted.size());
+  EXPECT_EQ(3u, exhausted[0].packets);
+  ASSERT_NO_FATAL_FAILURE(round_trip(a.get(), 4, &current));
+  EXPECT_EQ(first, current);
+  ASSERT_NO_FATAL_FAILURE(round_trip(b.get(), 5, &current));
+  EXPECT_EQ(second, current);
+
+  auto remove = Request(kNftDelrule, seq + 8);
+  remove[NLMSG_HDRLEN] = family;
+  AppendAttr(&remove, NFTA_RULE_TABLE, table);
+  AppendAttr(&remove, NFTA_RULE_CHAIN, chain);
+  const auto handle = htobe64(original[0].handle);
+  AppendRawAttr(&remove, NFTA_RULE_HANDLE, reinterpret_cast<const uint8_t*>(&handle), sizeof(handle));
+  const auto replace = MutationBatch(seq + 7, {remove, masq(seq + 9, 46010)});
+  ASSERT_EQ(static_cast<ssize_t>(replace.size()), Send(nft.get(), replace));
+  Ack(nft.get(), seq + 8, 0, kNftDelrule);
+  Ack(nft.get(), seq + 9, 0, kNftNewrule);
+  ASSERT_NO_FATAL_FAILURE(round_trip(a.get(), 6, &current));
+  EXPECT_EQ(first, current);
+  ASSERT_NO_FATAL_FAILURE(round_trip(b.get(), 7, &current));
+  EXPECT_EQ(second, current);
+  ASSERT_NO_FATAL_FAILURE(round_trip(c.get(), 8, &current));
+  EXPECT_TRUE(current == 46010 || current == 46011);
+  const auto updated = rules(seq + 11);
+  ASSERT_EQ(1u, updated.size());
+  EXPECT_EQ(1u, updated[0].packets);
+}
+
+TEST(NetlinkNetfilter, UdpMasqueradeCollisionAndRuleReplacement) {
+  ASSERT_TRUE(NetAdmin());
+  for (bool ipv6 : {false, true}) {
+    for (bool compat : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "ipv6=" << ipv6 << " compat=" << compat);
+      InAtomicRuleNetns([&] { CheckUdpMasqueradeLifecycle(ipv6, compat); });
+    }
+  }
 }
 
 TEST(NetlinkNetfilter, NftFailedRuleDeletionKeepsLiveInputFilter) {

@@ -235,7 +235,7 @@ int SendRouteRequest(int fd, uint16_t type, uint16_t flags, const RouteSpec& rou
 }
 
 int SendAddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex, const char* addr,
-                    uint8_t prefix_len, uint32_t seq) {
+                    uint8_t prefix_len, uint32_t seq, uint8_t scope = RT_SCOPE_HOST) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* ifa = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(nlh));
@@ -247,7 +247,7 @@ int SendAddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex, con
 
     ifa->ifa_family = AF_INET;
     ifa->ifa_prefixlen = prefix_len;
-    ifa->ifa_scope = RT_SCOPE_HOST;
+    ifa->ifa_scope = scope;
     ifa->ifa_index = ifindex;
 
     uint32_t ip = Ipv4(addr);

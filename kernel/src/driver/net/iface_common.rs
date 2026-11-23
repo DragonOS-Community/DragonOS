@@ -124,6 +124,8 @@ pub struct IfaceCommon {
     tx_queue_len: AtomicU32,
     ipv6_disabled: core::sync::atomic::AtomicI32,
     ipv6_forwarding: core::sync::atomic::AtomicI32,
+    ipv6_accept_ra: core::sync::atomic::AtomicI32,
+    ra_generation: AtomicU64,
     route_localnet: core::sync::atomic::AtomicI32,
     pub(super) type_: InterfaceType,
     tx_admission: tx_admission::TxAdmission,
@@ -228,6 +230,9 @@ impl PreparedNetnsBinding {
         common
             .ipv6_forwarding
             .store(self.netns.ipv6_default_forwarding(), Ordering::Release);
+        common
+            .ipv6_accept_ra
+            .store(self.netns.ipv6_default_accept_ra(), Ordering::Release);
         common.route_localnet.store(0, Ordering::Release);
         *namespace = Arc::downgrade(&self.netns);
         sockets.set_udp_ingress_handler(Some(self.ingress));
@@ -298,6 +303,8 @@ impl IfaceCommon {
             mtu: AtomicUsize::new(mtu),
             ipv6_disabled: core::sync::atomic::AtomicI32::new(0),
             ipv6_forwarding: core::sync::atomic::AtomicI32::new(0),
+            ipv6_accept_ra: core::sync::atomic::AtomicI32::new(1),
+            ra_generation: AtomicU64::new(0),
             route_localnet: core::sync::atomic::AtomicI32::new(0),
             tx_queue_len: AtomicU32::new(1000),
             type_,
@@ -955,6 +962,8 @@ impl IfaceCommon {
                     ruleset: nft_ruleset.as_ref().unwrap(),
                     netns,
                     owner_ifindex: self.iface_id as u32,
+                    owner_epoch: namespace_epoch,
+                    owner: self,
                     device_names: &nft_device_names,
                     stage: &ingress_stage,
                     handoff_broadcast: &handoff_broadcast,
@@ -1348,6 +1357,8 @@ impl IfaceCommon {
                         ruleset: nft_ruleset.as_ref().unwrap(),
                         netns,
                         owner_ifindex: self.iface_id as u32,
+                        owner_epoch: namespace_epoch,
+                        owner: self,
                         device_names: &nft_device_names,
                         stage: &ingress_stage,
                         handoff_broadcast: &handoff_broadcast,
@@ -2262,7 +2273,38 @@ impl IfaceCommon {
     }
 
     pub(crate) fn set_ipv6_forwarding(&self, _rtnl: &crate::net::rtnl::RtnlGuard, value: i32) {
-        self.ipv6_forwarding.store(value, Ordering::Release);
+        if self.ipv6_forwarding.swap(value, Ordering::AcqRel) != value {
+            self.invalidate_router_advertisements();
+        }
+    }
+
+    pub(crate) fn ipv6_accept_ra(&self) -> i32 {
+        self.ipv6_accept_ra.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_ipv6_accept_ra(&self, _rtnl: &crate::net::rtnl::RtnlGuard, value: i32) {
+        if self.ipv6_accept_ra.swap(value, Ordering::AcqRel) != value {
+            self.invalidate_router_advertisements();
+        }
+    }
+
+    pub(crate) fn ra_generation(&self) -> u64 {
+        self.ra_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate_router_advertisements(&self) {
+        self.ra_generation.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn accepts_router_advertisements(&self) -> bool {
+        let value = self.ipv6_accept_ra();
+        self.mtu() >= crate::net::address::IPV6_MIN_MTU
+            && self.ipv6_enabled()
+            && if self.ipv6_forwarding() == 0 {
+                value != 0
+            } else {
+                value == 2
+            }
     }
 
     pub(crate) fn ipv6_disabled_value(&self) -> i32 {
@@ -2274,11 +2316,17 @@ impl IfaceCommon {
     }
 
     pub(crate) fn publish_ipv6_disabled(&self, value: i32) {
-        self.ipv6_disabled.store(value, Ordering::Release);
+        if self.ipv6_disabled.swap(value, Ordering::AcqRel) != value {
+            self.invalidate_router_advertisements();
+        }
     }
 
     pub fn set_mtu(&self, mtu: usize) {
-        self.mtu.store(mtu, Ordering::Release);
+        let old = self.mtu.swap(mtu, Ordering::AcqRel);
+        let minimum = crate::net::address::IPV6_MIN_MTU;
+        if (old < minimum) != (mtu < minimum) {
+            self.invalidate_router_advertisements();
+        }
         if let Some(netns) = self.net_namespace() {
             netns.router().pmtu.lock().invalidate();
         }

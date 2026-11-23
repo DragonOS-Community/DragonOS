@@ -59,6 +59,7 @@ pub(crate) fn register_iface(
                 oif: route.oif,
                 gateway: route.gateway,
                 nexthop_flags: route.nexthop_flags,
+                learned_default: None,
             };
             validate_entry_on_iface(netns, iface, route)?;
             candidate.insert_derived(route)?;
@@ -239,6 +240,7 @@ pub(crate) struct AddressLinkChange<'a> {
     pub was_up: bool,
     pub is_up: bool,
     pub ipv6_enabled: Option<bool>,
+    pub discard_learned_defaults: bool,
 }
 
 impl PreparedAddressRouteCommit {
@@ -266,6 +268,7 @@ impl PreparedAddressRouteCommit {
                 was_up: is_up,
                 is_up,
                 ipv6_enabled: None,
+                discard_learned_defaults: false,
             },
             None,
         )
@@ -285,6 +288,7 @@ impl PreparedAddressRouteCommit {
             was_up,
             is_up,
             ipv6_enabled,
+            discard_learned_defaults,
         } = change;
         let was_ipv6_enabled = iface.common().ipv6_enabled();
         let is_ipv6_enabled = ipv6_enabled.unwrap_or(was_ipv6_enabled);
@@ -339,6 +343,8 @@ impl PreparedAddressRouteCommit {
             editor.remove_where(|entry| {
                 entry.oif == ifindex && !is_ipv4(entry.destination.address())
             })?;
+        } else if discard_learned_defaults {
+            editor.remove_where(|entry| entry.oif == ifindex && entry.learned_default.is_some())?;
         }
         let mut affected_oifs = editor.finish()?;
         let address_removed = if was_up && !is_up {
@@ -613,6 +619,7 @@ fn derived_address_entries_for_link_state(
             oif: iface.nic_id() as u32,
             gateway: None,
             nexthop_flags: 0,
+            learned_default: None,
         });
     }
     for cidr in addresses.iter().copied() {
@@ -681,6 +688,7 @@ fn entries_for_address(
         oif: iface.nic_id() as u32,
         gateway: None,
         nexthop_flags: 0,
+        learned_default: None,
     };
     let add_connected = match cidr {
         IpCidr::Ipv4(cidr) => {

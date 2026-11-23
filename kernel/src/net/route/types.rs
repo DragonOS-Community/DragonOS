@@ -19,6 +19,19 @@ pub(crate) const RTN_MULTICAST: u8 = 5;
 pub(crate) const RTN_UNREACHABLE: u8 = 7;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RouterPreference {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LearnedDefaultRoute {
+    pub expires_at_us: i64,
+    pub preference: RouterPreference,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RouteEntry {
     pub destination: IpCidr,
     pub source: Option<IpCidr>,
@@ -32,6 +45,19 @@ pub(crate) struct RouteEntry {
     pub oif: u32,
     pub gateway: Option<IpAddress>,
     pub nexthop_flags: u8,
+    pub learned_default: Option<LearnedDefaultRoute>,
+}
+
+impl RouteEntry {
+    pub(super) fn preference(self) -> RouterPreference {
+        self.learned_default
+            .map_or(RouterPreference::Medium, |learned| learned.preference)
+    }
+
+    pub(super) fn is_live_at(self, now_us: i64) -> bool {
+        self.learned_default
+            .is_none_or(|learned| learned.expires_at_us > now_us)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +156,7 @@ impl RouteLookupResult {
             oif,
             gateway: None,
             nexthop_flags: 0,
+            learned_default: None,
         };
         Self {
             oif,

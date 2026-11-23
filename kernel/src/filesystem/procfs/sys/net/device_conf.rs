@@ -36,7 +36,7 @@ impl DeviceConfFamily {
     fn entries(self) -> &'static [&'static str] {
         match self {
             Self::Ipv4 => &["route_localnet"],
-            Self::Ipv6 => &["disable_ipv6", "forwarding"],
+            Self::Ipv6 => &["accept_ra", "disable_ipv6", "forwarding"],
         }
     }
 }
@@ -186,6 +186,7 @@ impl DirOps for DeviceDirOps {
             (DeviceConfFamily::Ipv4, "route_localnet") => DeviceField::RouteLocalnet,
             (DeviceConfFamily::Ipv6, "disable_ipv6") => DeviceField::DisableIpv6,
             (DeviceConfFamily::Ipv6, "forwarding") => DeviceField::Ipv6Forwarding,
+            (DeviceConfFamily::Ipv6, "accept_ra") => DeviceField::Ipv6AcceptRa,
             _ => return Err(SystemError::ENOENT),
         };
         Ok(dir
@@ -220,6 +221,7 @@ enum DeviceField {
     RouteLocalnet,
     DisableIpv6,
     Ipv6Forwarding,
+    Ipv6AcceptRa,
 }
 
 #[derive(Debug)]
@@ -272,7 +274,15 @@ impl FileOps for DeviceFileOps {
             match ops.field {
                 DeviceField::RouteLocalnet => iface.common().set_route_localnet(&rtnl, value),
                 DeviceField::DisableIpv6 => set_device_ipv6_disabled(&rtnl, &netns, &iface, value)?,
-                DeviceField::Ipv6Forwarding => iface.common().set_ipv6_forwarding(&rtnl, value),
+                DeviceField::Ipv6Forwarding => {
+                    crate::net::route::ra::set_forwarding(
+                        &rtnl,
+                        &netns,
+                        Some(iface.as_ref()),
+                        value,
+                    )?;
+                }
+                DeviceField::Ipv6AcceptRa => iface.common().set_ipv6_accept_ra(&rtnl, value),
             }
             Ok(PrimaryWriteResult::new(consumed))
         })
@@ -294,6 +304,7 @@ impl FileOps for DeviceFileOps {
             DeviceField::RouteLocalnet => iface.common().route_localnet_value(),
             DeviceField::DisableIpv6 => iface.common().ipv6_disabled_value(),
             DeviceField::Ipv6Forwarding => iface.common().ipv6_forwarding(),
+            DeviceField::Ipv6AcceptRa => iface.common().ipv6_accept_ra(),
         };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }

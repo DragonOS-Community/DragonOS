@@ -351,7 +351,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6ForwardingDefaultAndAllHaveDistinctEffect
 }
 
 static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& family,
-                                                          const std::string& setting) {
+                                                          const std::string& setting,
+                                                          const char* initial = "0\n") {
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -379,7 +380,7 @@ static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& fam
             ASSERT_EQ(SendAck(source.fd, add), 0);
             const unsigned ifindex = if_nametoindex(name.c_str());
             ASSERT_NE(ifindex, 0u);
-            ASSERT_EQ(read_value(path), "0\n");
+            ASSERT_EQ(read_value(path), initial);
 
             const int original = open(path.c_str(), O_RDWR | O_CLOEXEC);
             ASSERT_GE(original, 0);
@@ -414,7 +415,7 @@ static void CheckDeviceSysctlTracksRenameAndNamespaceMove(const std::string& fam
             ASSERT_TRUE(move.add(IFLA_NET_NS_FD, &target, sizeof(target)));
             ASSERT_EQ(SendAck(source.fd, move), 0);
             close(target);
-            EXPECT_EQ(read_value(path), "0\n");
+            EXPECT_EQ(read_value(path), initial);
             EXPECT_EQ(pwrite(before_move, "1\n", 2, 0), -1);
             EXPECT_EQ(errno, ENOENT);
             close(before_move);
@@ -434,6 +435,145 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6DeviceSysctlTracksRenameAndNamespaceMove)
 
 TEST(RtnetlinkBridgeVethSemantics, Ipv4RouteLocalnetTracksRenameAndNamespaceMove) {
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv4", "route_localnet");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, Ipv6AcceptRaTracksRenameAndNamespaceMove) {
+    CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "accept_ra", "1\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsDefault) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd route;
+            ASSERT_GE(route.fd, 0);
+            constexpr char receiver[] = "ra-receiver";
+            constexpr char sender[] = "ra-sender";
+            std::vector<uint8_t> peer(sizeof(ifinfomsg), 0);
+            AppendAttr(peer, IFLA_IFNAME, sender, sizeof(sender));
+            std::vector<uint8_t> veth;
+            AppendAttr(veth, VETH_INFO_PEER, peer.data(), peer.size());
+            LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4960);
+            ASSERT_TRUE(create.name(receiver));
+            AddKind(create, "veth", veth);
+            ASSERT_EQ(SendAck(route.fd, create), 0);
+            const unsigned receive_ifindex = if_nametoindex(receiver);
+            const unsigned send_ifindex = if_nametoindex(sender);
+            ASSERT_NE(receive_ifindex, 0u);
+            ASSERT_NE(send_ifindex, 0u);
+            uint32_t seq = 4961;
+            for (unsigned ifindex : {receive_ifindex, send_ifindex}) {
+                LinkRequest up(RTM_SETLINK, 0, seq++);
+                up.body()->ifi_index = ifindex;
+                up.body()->ifi_flags = IFF_UP;
+                up.body()->ifi_change = IFF_UP;
+                ASSERT_EQ(SendAck(route.fd, up), 0);
+            }
+            const int setting = open("/proc/sys/net/ipv6/conf/ra-receiver/accept_ra",
+                                     O_WRONLY | O_CLOEXEC);
+            ASSERT_GE(setting, 0);
+            ASSERT_EQ(write(setting, "1\n", 2), 2);
+            close(setting);
+
+            RouteFd monitor(RTMGRP_IPV6_ROUTE);
+            ASSERT_GE(monitor.fd, 0);
+            const int injector = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(ETH_P_IPV6));
+            ASSERT_GE(injector, 0);
+            const sockaddr_ll multicast = {
+                AF_PACKET, htons(ETH_P_IPV6), static_cast<int>(send_ifindex),
+                0, 0, ETH_ALEN, {0x33, 0x33, 0, 0, 0, 1},
+            };
+            in6_addr router{}, all_nodes{};
+            ASSERT_EQ(inet_pton(AF_INET6, "fe80::1234", &router), 1);
+            ASSERT_EQ(inet_pton(AF_INET6, "ff02::1", &all_nodes), 1);
+            const auto advertise = [&](uint16_t lifetime) {
+                constexpr size_t ip_header = 40, ra_length = 16;
+                std::array<uint8_t, ip_header + ra_length> packet{};
+                packet[0] = 0x60;
+                packet[5] = ra_length;
+                packet[6] = IPPROTO_ICMPV6;
+                packet[7] = 255;
+                std::memcpy(packet.data() + 8, &router, sizeof(router));
+                std::memcpy(packet.data() + 24, &all_nodes, sizeof(all_nodes));
+                packet[ip_header] = 134;
+                packet[ip_header + 5] = 0x08;  // High router preference.
+                packet[ip_header + 6] = lifetime >> 8;
+                packet[ip_header + 7] = lifetime & 0xff;
+                uint32_t sum = ra_length + IPPROTO_ICMPV6;
+                for (size_t offset = 8; offset < packet.size(); offset += 2)
+                    sum += (static_cast<uint16_t>(packet[offset]) << 8) | packet[offset + 1];
+                while (sum > 0xffff) sum = (sum & 0xffff) + (sum >> 16);
+                const uint16_t checksum = static_cast<uint16_t>(~sum);
+                packet[ip_header + 2] = checksum >> 8;
+                packet[ip_header + 3] = checksum & 0xff;
+                ASSERT_EQ(sendto(injector, packet.data(), packet.size(), 0,
+                                 reinterpret_cast<const sockaddr*>(&multicast), sizeof(multicast)),
+                          static_cast<ssize_t>(packet.size()));
+            };
+            const auto expect_route = [&](uint16_t kind) {
+                for (int attempt = 0; attempt < 16; ++attempt) {
+                    alignas(nlmsghdr) std::array<uint8_t, 4096> bytes{};
+                    int remaining = recv(monitor.fd, bytes.data(), bytes.size(), 0);
+                    ASSERT_GT(remaining, 0) << std::strerror(errno);
+                    for (auto* header = reinterpret_cast<nlmsghdr*>(bytes.data());
+                         NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
+                        if (header->nlmsg_type != kind ||
+                            header->nlmsg_len < NLMSG_LENGTH(sizeof(rtmsg))) continue;
+                        const auto* body = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
+                        if (body->rtm_family != AF_INET6 || body->rtm_protocol != RTPROT_RA ||
+                            body->rtm_dst_len != 0) continue;
+                        uint32_t oif = 0, metric = 0;
+                        uint8_t preference = 0xff;
+                        bool has_cache_info = false;
+                        in6_addr gateway{};
+                        int size = RTM_PAYLOAD(header);
+                        for (auto* attr = RTM_RTA(body); RTA_OK(attr, size); attr = RTA_NEXT(attr, size)) {
+                            if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) == sizeof(oif))
+                                std::memcpy(&oif, RTA_DATA(attr), sizeof(oif));
+                            if (attr->rta_type == RTA_PRIORITY && RTA_PAYLOAD(attr) == sizeof(metric))
+                                std::memcpy(&metric, RTA_DATA(attr), sizeof(metric));
+                            if (attr->rta_type == RTA_PREF && RTA_PAYLOAD(attr) == sizeof(preference))
+                                std::memcpy(&preference, RTA_DATA(attr), sizeof(preference));
+                            if (attr->rta_type == RTA_CACHEINFO &&
+                                RTA_PAYLOAD(attr) == sizeof(rta_cacheinfo)) {
+                                has_cache_info = true;
+                            }
+                            if (attr->rta_type == RTA_GATEWAY && RTA_PAYLOAD(attr) == sizeof(gateway))
+                                std::memcpy(&gateway, RTA_DATA(attr), sizeof(gateway));
+                        }
+                        if (oif != receive_ifindex || std::memcmp(&gateway, &router, sizeof(router)))
+                            continue;
+                        EXPECT_EQ(metric, 1024u);
+                        EXPECT_EQ(preference, 1u);
+                        EXPECT_TRUE(has_cache_info);
+                        return;
+                    }
+                }
+                FAIL() << "missing learned default route notification " << kind;
+            };
+            ASSERT_NO_FATAL_FAILURE(advertise(30));
+            ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE));
+            ASSERT_NO_FATAL_FAILURE(advertise(0));
+            ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE));
+            ASSERT_NO_FATAL_FAILURE(advertise(30));
+            ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE));
+            LinkRequest lower_mtu(RTM_SETLINK, 0, seq++);
+            lower_mtu.body()->ifi_index = receive_ifindex;
+            const uint32_t below_ipv6_minimum = 1200;
+            ASSERT_TRUE(lower_mtu.add(IFLA_MTU, &below_ipv6_minimum, sizeof(below_ipv6_minimum)));
+            ASSERT_EQ(SendAck(route.fd, lower_mtu), 0);
+            ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE));
+            close(injector);
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, CreateAndUpBridgeWithNonemptyFibInSingleRequest) {

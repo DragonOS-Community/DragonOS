@@ -488,18 +488,35 @@ pub(super) fn parse_xt_nat_target(
         };
         return Ok(NftNatAction::Masquerade { ports });
     }
-    if family == 10 && name == b"DNAT" && revision == 2 {
+    if matches!(family, 2 | 10) && name == b"DNAT" && revision == 2 {
         if !(44..=48).contains(&info.len()) || info[44..].iter().any(|byte| *byte != 0) {
             return Err(SystemError::EINVAL);
         }
         let flags = u32::from_ne_bytes(info[..4].try_into().unwrap());
+        let map_ips = flags & 1 != 0;
+        // nf_nat_range2 reserves an nf_inet_addr for each address even for IPv4.
+        let address_len = if family == 2 { 4 } else { 16 };
+        let min_addr = &info[4..4 + address_len];
+        let max_addr = &info[20..20 + address_len];
         if flags & !3 != 0
-            || flags & 1 == 0
-            || info[4..20] != info[20..36]
+            || (!map_ips && family == 10)
+            || min_addr != max_addr
             || info[40..44].iter().any(|byte| *byte != 0)
         {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
+        let address = if map_ips {
+            Some(if family == 2 {
+                CtAddress::V4(min_addr.try_into().unwrap())
+            } else {
+                CtAddress::V6(min_addr.try_into().unwrap())
+            })
+        } else {
+            if min_addr.iter().any(|byte| *byte != 0) {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            None
+        };
         let ports = if flags & 2 != 0 {
             Some(
                 CtNatPortRange::new(
@@ -514,8 +531,7 @@ pub(super) fn parse_xt_nat_target(
             }
             None
         };
-        let address = CtAddress::V6(info[4..20].try_into().unwrap());
-        let request = CtNatRequest::new(Some(address), ports).map_err(|_| SystemError::EINVAL)?;
+        let request = CtNatRequest::new(address, ports).map_err(|_| SystemError::EINVAL)?;
         return Ok(NftNatAction::Dnat(request));
     }
     Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)

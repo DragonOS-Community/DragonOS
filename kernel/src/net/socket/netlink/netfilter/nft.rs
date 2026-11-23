@@ -1586,7 +1586,7 @@ pub(super) fn compat_match_reply(
         b"MASQUERADE" if kind == 1 && revision == 0 && family == 2 => b"MASQUERADE\0",
         b"DNAT" if kind == 1 && revision == 0 && family == 2 => b"DNAT\0",
         b"SNAT" if kind == 1 && revision == 0 && family == 2 => b"SNAT\0",
-        b"DNAT" if kind == 1 && revision == 2 && family == 10 => b"DNAT\0",
+        b"DNAT" if kind == 1 && revision == 2 => b"DNAT\0",
         b"MASQUERADE" | b"DNAT" | b"SNAT" if kind == 1 => return Err(SystemError::EPROTONOSUPPORT),
         _ if kind == 1 => return Err(SystemError::ENOENT),
         b"tcp" if revision == 0 && family == 2 => b"tcp\0",
@@ -1611,7 +1611,7 @@ pub(super) fn compat_match_reply(
     bytes.extend_from_slice(&0u16.to_be_bytes());
     append_attr(&mut bytes, COMPAT_NAME, wire_name)?;
     append_attr(&mut bytes, COMPAT_REV, &revision.to_be_bytes())?;
-    append_attr(&mut bytes, COMPAT_TYPE, &0u32.to_be_bytes())?;
+    append_attr(&mut bytes, COMPAT_TYPE, &kind.to_be_bytes())?;
     let message_len = bytes.len() as u32;
     bytes[0..4].copy_from_slice(&message_len.to_ne_bytes());
     bytes[4..6].copy_from_slice(&request.kind().to_ne_bytes());

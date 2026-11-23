@@ -762,10 +762,18 @@ fn prepared_ipv4_fragment(
     packet: &LocalOutputPacket,
     mtu: usize,
 ) -> Result<(PacketBuffer, usize), SystemError> {
-    let parsed = ParsedIpv4Output::parse(&packet.frame)?;
     let Some(PreparedIpProgress::Ipv4 { offset, .. }) = packet.prepared_ip else {
         return Err(SystemError::EINVAL);
     };
+    ipv4_fragment(&packet.frame, mtu, offset)
+}
+
+pub(super) fn ipv4_fragment(
+    bytes: &[u8],
+    mtu: usize,
+    offset: usize,
+) -> Result<(PacketBuffer, usize), SystemError> {
+    let parsed = ParsedIpv4Output::parse(bytes)?;
     if offset >= parsed.payload_len || mtu < parsed.header_len + 8 {
         return Err(SystemError::EMSGSIZE);
     }
@@ -787,9 +795,9 @@ fn prepared_ipv4_fragment(
     fragment
         .try_reserve_exact(parsed.header_len + chunk)
         .map_err(|_| SystemError::ENOMEM)?;
-    fragment.extend_from_slice(&packet.frame[..parsed.header_len])?;
+    fragment.extend_from_slice(&bytes[..parsed.header_len])?;
     fragment.extend_from_slice(
-        &packet.frame[parsed.header_len + offset..parsed.header_len + offset + chunk],
+        &bytes[parsed.header_len + offset..parsed.header_len + offset + chunk],
     )?;
     if offset != 0 {
         let mut option = 20;
@@ -1032,6 +1040,7 @@ mod prepared_ipv4_tests {
                 max_fragment_len: None,
             }),
             forward_mtu_feedback: None,
+            bridge_dnat: None,
             _charge: None,
         }
     }
@@ -1199,6 +1208,7 @@ mod prepared_ipv6_tests {
                 max_fragment_len: None,
             }),
             forward_mtu_feedback: None,
+            bridge_dnat: None,
             _charge: None,
         }
     }
@@ -2018,6 +2028,31 @@ pub(super) fn transmit_routed_stack_output(
     else {
         return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
     };
+    if let Some(resume) = packet.bridge_dnat.as_deref() {
+        let Some(bridge) = iface
+            .as_any_ref()
+            .downcast_ref::<super::bridge::BridgeIface>()
+        else {
+            return LocalOutputTransmitResult::Drop(packet, SystemError::ENODEV);
+        };
+        return match bridge.bridge_driver().resume_bridge_dnat(
+            bridge,
+            next_hop,
+            &packet.frame,
+            resume,
+        ) {
+            Ok(()) => LocalOutputTransmitResult::Sent(packet),
+            Err(RouteSendError::RetryAt {
+                retry_at,
+                probe_sent,
+            }) => LocalOutputTransmitResult::RetryAt {
+                packet,
+                retry_at,
+                probe_sent,
+            },
+            Err(RouteSendError::Failed(error)) => output_error(packet, error),
+        };
+    }
     if packet.medium != smoltcp::phy::Medium::Ip
         || (packet.prepared_ip.is_none() && packet.frame.len() > ip_mtu)
         || smoltcp::wire::IpVersion::of_packet(&packet.frame).ok() != Some(next_hop.version())
@@ -2286,6 +2321,7 @@ pub(super) fn native_output_selftest<D: SmolDevice + ?Sized>(
         mark: 0,
         prepared_ip: None,
         forward_mtu_feedback: None,
+        bridge_dnat: None,
         _charge: None,
     };
     let packet = match transmit_native_output(device, packet) {

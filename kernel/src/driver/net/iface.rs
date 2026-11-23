@@ -246,6 +246,14 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch_with_fragment<I: Iface + ?Si
         forward_fragment,
     };
 
+    enqueue_ip_input(iface, packet, expected_epoch)
+}
+
+pub(super) fn enqueue_ip_input<I: Iface + ?Sized>(
+    iface: &I,
+    packet: LocalInputPacket,
+    expected_epoch: Option<u64>,
+) -> Result<(), SystemError> {
     let napi = iface.napi_struct();
     let netns = napi.is_none().then(|| iface.net_namespace()).flatten();
     if napi.is_none() && netns.is_none() {
@@ -785,9 +793,9 @@ pub trait Iface: crate::driver::base::device::Device {
     }
 }
 
-struct PreparedFrameTxToken<'a> {
-    frame: &'a mut PacketBuffer,
-    prepared: &'a Cell<bool>,
+pub(super) struct PreparedFrameTxToken<'a> {
+    pub(super) frame: &'a mut PacketBuffer,
+    pub(super) prepared: &'a Cell<bool>,
 }
 
 impl SmolTxToken for PreparedFrameTxToken<'_> {

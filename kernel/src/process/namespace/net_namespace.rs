@@ -303,6 +303,8 @@ pub struct NetNamespace {
     ipv4_forwarding: AtomicI32,
     /// Linux /proc/sys/net/ipv6/conf/all/forwarding. Never shares IPv4 state.
     ipv6_forwarding: AtomicI32,
+    bridge_ipv4_netfilter: AtomicBool,
+    bridge_ipv6_netfilter: AtomicBool,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -380,11 +382,21 @@ const DEFRAG_PENDING_PACKETS: usize = 128;
 const DEFRAG_PENDING_BYTES: usize = 4 * 1024 * 1024;
 const DEFRAG_POLL_BATCH: usize = 32;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BridgeFragmentIngress {
+    pub(crate) bridge_ifindex: u32,
+    pub(crate) generation: usize,
+    pub(crate) port: usize,
+    pub(crate) port_generation: u64,
+    pub(crate) ethernet_header: [u8; 14],
+}
+
 /// Fragment queues at CT PRE_ROUTING, CT LOCAL_OUT, and stateless LOCAL_IN
 /// never merge even if their tuple and identification match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DefragSource {
     LinkIngress,
+    BridgeIngress(BridgeFragmentIngress),
     LocalOutput,
     LocalInput,
 }
@@ -393,6 +405,9 @@ impl DefragSource {
     fn domain(self) -> DefragDomain {
         match self {
             Self::LinkIngress => DefragDomain::pre_routing(0, 0),
+            Self::BridgeIngress(bridge) => {
+                DefragDomain::bridge_ingress(bridge.bridge_ifindex, bridge.generation)
+            }
             Self::LocalOutput => DefragDomain::local_out(0, 0),
             Self::LocalInput => DefragDomain::local_input(0, 0),
         }
@@ -401,6 +416,9 @@ impl DefragSource {
     fn packet_origin(self) -> crate::driver::net::LocalPacketOrigin {
         match self {
             Self::LinkIngress => crate::driver::net::LocalPacketOrigin::LinkIngressPending,
+            Self::BridgeIngress(_) => {
+                unreachable!("bridge fragments use their Ethernet continuation")
+            }
             Self::LocalOutput => crate::driver::net::LocalPacketOrigin::LocalOutput,
             Self::LocalInput => crate::driver::net::LocalPacketOrigin::LocalInputDone,
         }
@@ -409,6 +427,9 @@ impl DefragSource {
     fn ipv6_domain(self, ingress_ifindex: u32) -> Ipv6DefragDomain {
         match self {
             Self::LinkIngress => Ipv6DefragDomain::pre_routing(0, ingress_ifindex),
+            Self::BridgeIngress(bridge) => {
+                Ipv6DefragDomain::bridge_ingress(bridge.bridge_ifindex, bridge.generation)
+            }
             Self::LocalOutput => Ipv6DefragDomain::local_out(0, ingress_ifindex),
             Self::LocalInput => Ipv6DefragDomain::local_input(0, ingress_ifindex),
         }
@@ -838,6 +859,27 @@ impl NetnsPoller {
         broadcast: bool,
         max_original_fragment_len: usize,
     ) {
+        if let (DefragSource::BridgeIngress(first), DefragSource::BridgeIngress(completion)) =
+            (first_origin.source, completion.source)
+        {
+            let iface = netns
+                .device_list()
+                .get(&(completion.bridge_ifindex as usize))
+                .cloned();
+            if let Some(bridge) = iface.as_ref().and_then(|iface| {
+                iface
+                    .as_any_ref()
+                    .downcast_ref::<crate::driver::net::bridge::BridgeIface>()
+            }) {
+                bridge.bridge_driver().resume_reassembled_ip(
+                    first,
+                    completion,
+                    packet,
+                    max_original_fragment_len,
+                );
+            }
+            return;
+        }
         let source_mac = match first_origin.source_hardware_addr {
             HardwareAddress::Ethernet(mac) => mac,
             HardwareAddress::Ip
@@ -879,6 +921,7 @@ impl NetnsPoller {
             // a new flow or discard an otherwise valid local datagram.
             DefragSource::LocalInput => Some(CtPacketContext::Untracked),
             DefragSource::LinkIngress => None,
+            DefragSource::BridgeIngress(_) => return,
         };
         if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch_with_fragment(
             owner.as_ref(),
@@ -1330,6 +1373,8 @@ impl NetNamespace {
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
+            bridge_ipv4_netfilter: AtomicBool::new(true),
+            bridge_ipv6_netfilter: AtomicBool::new(true),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1387,6 +1432,8 @@ impl NetNamespace {
             port_policy: crate::net::socket::inet::common::port_policy::InetPortPolicy::new(),
             ipv4_forwarding: AtomicI32::new(0),
             ipv6_forwarding: AtomicI32::new(0),
+            bridge_ipv4_netfilter: AtomicBool::new(true),
+            bridge_ipv6_netfilter: AtomicBool::new(true),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1896,6 +1943,23 @@ impl NetNamespace {
 
     pub fn set_ipv4_forwarding(&self, value: i32) {
         self.ipv4_forwarding.store(value, Ordering::Release);
+    }
+
+    fn bridge_netfilter_control(&self, version: smoltcp::wire::IpVersion) -> &AtomicBool {
+        match version {
+            smoltcp::wire::IpVersion::Ipv4 => &self.bridge_ipv4_netfilter,
+            smoltcp::wire::IpVersion::Ipv6 => &self.bridge_ipv6_netfilter,
+        }
+    }
+
+    pub(crate) fn bridge_netfilter_enabled(&self, version: smoltcp::wire::IpVersion) -> bool {
+        self.bridge_netfilter_control(version)
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_bridge_netfilter(&self, version: smoltcp::wire::IpVersion, enabled: bool) {
+        self.bridge_netfilter_control(version)
+            .store(enabled, Ordering::Release);
     }
 
     pub fn ipv6_forwarding_value(&self) -> i32 {

@@ -361,6 +361,7 @@ mod tests {
                 mark: 0,
                 prepared_ip: None,
                 forward_mtu_feedback: None,
+                bridge_dnat: None,
                 _charge: None,
             },
             retry_at,

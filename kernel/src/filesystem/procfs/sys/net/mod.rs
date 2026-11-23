@@ -1,3 +1,4 @@
+mod bridge;
 mod ipv4;
 mod ipv6;
 mod namespace;
@@ -8,6 +9,7 @@ use crate::filesystem::{
 };
 use alloc::string::ToString;
 use alloc::sync::{Arc, Weak};
+use bridge::BridgeDirOps;
 use ipv4::Ipv4DirOps;
 use ipv6::Ipv6DirOps;
 use system_error::SystemError;
@@ -36,43 +38,35 @@ impl DirOps for NetDirOps {
                 .as_any_ref()
                 .downcast_ref::<ProcDir<Ipv6DirOps>>()
                 .is_none_or(|inode| inode.ops().is_current())
+            && child
+                .as_any_ref()
+                .downcast_ref::<ProcDir<BridgeDirOps>>()
+                .is_none_or(|inode| inode.ops().is_current())
     }
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name == "ipv4" {
-            let mut cached_children = dir.cached_children().write();
-            if let Some(child) = cached_children.get(name) {
-                if self.validate_child(child.as_ref()) {
-                    return Ok(child.clone());
-                }
+        let mut cached = dir.cached_children().write();
+        if let Some(child) = cached.get(name) {
+            if self.validate_child(child.as_ref()) {
+                return Ok(child.clone());
             }
-
-            let inode = Ipv4DirOps::new_inode(dir.self_ref_weak().clone());
-            cached_children.insert(name.to_string(), inode.clone());
-            return Ok(inode);
         }
-
-        if name == "ipv6" {
-            let mut cached_children = dir.cached_children().write();
-            if let Some(child) = cached_children.get(name) {
-                if self.validate_child(child.as_ref()) {
-                    return Ok(child.clone());
-                }
-            }
-
-            let inode = Ipv6DirOps::new_inode(dir.self_ref_weak().clone());
-            cached_children.insert(name.to_string(), inode.clone());
-            return Ok(inode);
-        }
-
-        Err(SystemError::ENOENT)
+        let parent = dir.self_ref_weak().clone();
+        let inode = match name {
+            "ipv4" => Ipv4DirOps::new_inode(parent),
+            "ipv6" => Ipv6DirOps::new_inode(parent),
+            "bridge" => BridgeDirOps::new_inode(parent),
+            _ => return Err(SystemError::ENOENT),
+        };
+        cached.insert(name.to_string(), inode.clone());
+        Ok(inode)
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
-        for name in ["ipv4", "ipv6"] {
+        for name in ["ipv4", "ipv6", "bridge"] {
             let _ = self.lookup_child(dir, name);
         }
     }

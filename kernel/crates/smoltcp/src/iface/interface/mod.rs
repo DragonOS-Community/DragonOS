@@ -689,6 +689,29 @@ impl Interface {
         }
     }
 
+    /// Resolve Ethernet encapsulation without transmitting the IP datagram.
+    /// The token is consumed only to emit a neighbor-discovery probe.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn probe_ethernet_next_hop(
+        &mut self,
+        timestamp: Instant,
+        token: impl TxToken,
+        next_hop: IpAddress,
+        configured_address: Option<HardwareAddress>,
+        arp_source: Option<IpAddress>,
+    ) -> Result<EthernetAddress, IpPacketDispatchError> {
+        if self.inner.caps.medium != Medium::Ethernet {
+            return Err(IpPacketDispatchError::NoRoute);
+        }
+        #[cfg(feature = "proto-ipv6")]
+        if next_hop.version() == IpVersion::Ipv6 && !self.inner.ipv6_enabled {
+            return Err(IpPacketDispatchError::NoRoute);
+        }
+        self.inner.now = timestamp;
+        self.resolve_ethernet_next_hop(token, next_hop, configured_address, arp_source)
+            .map(|(address, _)| address)
+    }
+
     /// Resolve a routed Ethernet next hop. On a cache miss, the token may
     /// emit a discovery frame. With a resolved MAC it is returned unconsumed,
     /// allowing the caller to choose how the original packet continues.

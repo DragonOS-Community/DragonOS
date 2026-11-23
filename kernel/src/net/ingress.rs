@@ -30,6 +30,7 @@ use smoltcp::{
 };
 use system_error::SystemError;
 
+pub(crate) mod bridge;
 mod hooks;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub(crate) enum IngressStage {
     #[default]
     Pending,
     PreRoutingDone,
+    BridgePreRoutingDone,
     LocalOutput,
     LocalInputDone,
 }
@@ -308,7 +310,7 @@ impl<'a> NetIngressFilter<'a> {
         hooks::IngressHooks {
             ruleset: self.ruleset,
             netns: self.netns,
-            device_names: self.device_names,
+            device_names: hooks::HookDeviceNames::Namespace(self.device_names),
             stage: self.stage.get(),
             mark: self.mark,
             packet_context: self.packet_context,
@@ -617,8 +619,10 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
     ) -> PreRoutingVerdict {
-        if self.stage.get() == IngressStage::LocalInputDone
-            || !self.hooks().ct_active_for(IpVersion::Ipv6)
+        if matches!(
+            self.stage.get(),
+            IngressStage::LocalInputDone | IngressStage::BridgePreRoutingDone
+        ) || !self.hooks().ct_active_for(IpVersion::Ipv6)
         {
             return PreRoutingVerdict::Pass;
         }
@@ -699,7 +703,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         };
         if matches!(
             self.stage.get(),
-            IngressStage::PreRoutingDone | IngressStage::LocalInputDone
+            IngressStage::PreRoutingDone
+                | IngressStage::LocalInputDone
+                | IngressStage::BridgePreRoutingDone
         ) {
             if !self.pre_routed_context_valid(version) {
                 return PreRoutingVerdict::Drop;
@@ -1182,6 +1188,13 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 RouteInputVerdict::Drop
             } else {
                 RouteInputVerdict::Pass
+            };
+        }
+        if self.stage.get() == IngressStage::BridgePreRoutingDone {
+            return if self.pre_routed_context_valid(IpVersion::Ipv4) {
+                self.route_input(packet, meta, source_hardware_addr)
+            } else {
+                RouteInputVerdict::Drop
             };
         }
         if self.hooks().ct_active_for(IpVersion::Ipv4) && !self.netns.ipv4_defrag_enabled() {

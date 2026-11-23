@@ -36,6 +36,14 @@ pub struct BridgePort {
     // mac mtu信息
 }
 
+pub(super) struct PortActivity<'a>(&'a AtomicUsize);
+
+impl Drop for PortActivity<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl BridgePort {
     pub(super) fn new(
         id: BridgePortId,
@@ -54,14 +62,16 @@ impl BridgePort {
     }
 
     pub(super) fn transmit(&self, frame: &[u8]) {
-        // The admission increment, active check, detach store and final
-        // count check must share one global order; Acquire/Release alone
-        // permits both sides to observe the other's old value.
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        if self.can_forward() {
+        if let Some(_activity) = self.enter() {
             self.bridge_enable.receive_from_bridge(frame);
         }
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn enter(&self) -> Option<PortActivity<'_>> {
+        // A port detach closes admission before waiting for either direction.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let activity = PortActivity(&self.in_flight);
+        self.can_forward().then_some(activity)
     }
 
     pub(super) fn can_forward(&self) -> bool {

@@ -599,8 +599,12 @@ impl Iface for BridgeIface {
     }
     fn quiesce_admin_down(&self) {
         self.driver.wait_idle();
+        self.driver
+            .ingress_generation
+            .fetch_add(1, Ordering::AcqRel);
         let retired = core::mem::take(&mut *self.driver.local_rx_queue.lock());
         drop(retired);
+        self.common.local_input_queue.retire_bridge_input();
     }
     fn publish_admin_state(&self, is_up: bool) {
         self.driver.active.store(is_up, Ordering::SeqCst);

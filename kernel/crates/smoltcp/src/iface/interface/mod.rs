@@ -664,41 +664,12 @@ impl Interface {
             }
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => {
-                let (destination_hardware_addr, tx_token) =
-                    if let Some(destination_hardware_addr) = destination_hardware_addr {
-                        if destination_hardware_addr.medium() != Medium::Ethernet {
-                            return Err(Ipv4PacketDispatchError::InvalidHardwareAddress);
-                        }
-                        (destination_hardware_addr.ethernet_or_panic(), tx_token)
-                    } else {
-                        let (hardware_addr, tx_token) =
-                            match self.inner.lookup_hardware_addr_for_next_hop(
-                                tx_token,
-                                &next_hop,
-                                arp_source,
-                                &mut self.fragmenter,
-                            ) {
-                                Ok(result) => result,
-                                Err(DispatchError::NeighborPending) => {
-                                    return Err(Ipv4PacketDispatchError::NeighborPending {
-                                        retry_at: self
-                                            .inner
-                                            .neighbor_cache
-                                            .discovery_retry_at(&next_hop, timestamp),
-                                    });
-                                }
-                                Err(DispatchError::NoRoute | DispatchError::MtuRetry(_)) => {
-                                    return Err(Ipv4PacketDispatchError::NoRoute);
-                                }
-                                Err(DispatchError::PolicyDrop) => {
-                                    return Err(Ipv4PacketDispatchError::NoRoute);
-                                }
-                                Err(DispatchError::Exhausted) => {
-                                    return Err(Ipv4PacketDispatchError::Exhausted);
-                                }
-                            };
-                        (hardware_addr.ethernet_or_panic(), tx_token)
-                    };
+                let (destination_hardware_addr, tx_token) = self.resolve_ethernet_next_hop(
+                    tx_token,
+                    next_hop,
+                    destination_hardware_addr,
+                    arp_source,
+                )?;
 
                 self.inner
                     .dispatch_ethernet(tx_token, packet_len, |mut frame| {
@@ -711,24 +682,60 @@ impl Interface {
                         });
                         frame.payload_mut().copy_from_slice(ip_packet);
                     })
-                    .map_err(|error| match error {
-                        DispatchError::NoRoute | DispatchError::MtuRetry(_) => {
-                            Ipv4PacketDispatchError::NoRoute
-                        }
-                        DispatchError::PolicyDrop => Ipv4PacketDispatchError::NoRoute,
-                        DispatchError::Exhausted => Ipv4PacketDispatchError::Exhausted,
-                        DispatchError::NeighborPending => {
-                            Ipv4PacketDispatchError::NeighborPending {
-                                retry_at: self
-                                    .inner
-                                    .neighbor_cache
-                                    .discovery_retry_at(&next_hop, timestamp),
-                            }
-                        }
-                    })
+                    .map_err(|error| self.routed_ethernet_error(next_hop, error))
             }
             #[allow(unreachable_patterns)]
             _ => Err(Ipv4PacketDispatchError::NoRoute),
+        }
+    }
+
+    /// Resolve a routed Ethernet next hop. On a cache miss, the token may
+    /// emit a discovery frame. With a resolved MAC it is returned unconsumed,
+    /// allowing the caller to choose how the original packet continues.
+    #[cfg(feature = "medium-ethernet")]
+    fn resolve_ethernet_next_hop<Tx: TxToken>(
+        &mut self,
+        tx_token: Tx,
+        next_hop: IpAddress,
+        configured_hardware_addr: Option<HardwareAddress>,
+        arp_source: Option<IpAddress>,
+    ) -> Result<(EthernetAddress, Tx), IpPacketDispatchError> {
+        if let Some(hardware_addr) = configured_hardware_addr {
+            if hardware_addr.medium() != Medium::Ethernet {
+                return Err(IpPacketDispatchError::InvalidHardwareAddress);
+            }
+            return Ok((hardware_addr.ethernet_or_panic(), tx_token));
+        }
+
+        let (hardware_addr, tx_token) = self
+            .inner
+            .lookup_hardware_addr_for_next_hop(
+                tx_token,
+                &next_hop,
+                arp_source,
+                &mut self.fragmenter,
+            )
+            .map_err(|error| self.routed_ethernet_error(next_hop, error))?;
+        Ok((hardware_addr.ethernet_or_panic(), tx_token))
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    fn routed_ethernet_error(
+        &self,
+        next_hop: IpAddress,
+        error: DispatchError,
+    ) -> IpPacketDispatchError {
+        match error {
+            DispatchError::NoRoute | DispatchError::MtuRetry(_) | DispatchError::PolicyDrop => {
+                IpPacketDispatchError::NoRoute
+            }
+            DispatchError::Exhausted => IpPacketDispatchError::Exhausted,
+            DispatchError::NeighborPending => IpPacketDispatchError::NeighborPending {
+                retry_at: self
+                    .inner
+                    .neighbor_cache
+                    .discovery_retry_at(&next_hop, self.inner.now),
+            },
         }
     }
 

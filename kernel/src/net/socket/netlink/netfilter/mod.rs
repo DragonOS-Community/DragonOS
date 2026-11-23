@@ -34,8 +34,8 @@ use core::any::Any;
 use nft::{
     chain_attrs, chain_message, compat_match_reply, rule_attrs, rule_message, set_attrs,
     set_elem_attrs, set_elem_message, set_message, table_attrs, table_message,
-    xt_addrtype_compatible, xt_conntrack_compatible, xt_tcp_compatible, xt_udp_compatible,
-    GetTableResult, NftSocketState, NlaIter, SetElementMessageMeta,
+    xt_addrtype_compatible, xt_conntrack_compatible, xt_protocol_compatible, GetTableResult,
+    NftSocketState, NlaIter, SetElementMessageMeta,
 };
 use system_error::SystemError;
 
@@ -572,17 +572,15 @@ impl NetfilterKernelSocket {
                         {
                             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
                         }
-                        if expressions
-                            .iter()
-                            .any(|expression| matches!(expression, NftExpressionInput::XtTcp(_)))
-                        {
-                            xt_tcp_compatible(attrs.compat)?;
-                        }
-                        if expressions
-                            .iter()
-                            .any(|expression| matches!(expression, NftExpressionInput::XtUdp(_)))
-                        {
-                            xt_udp_compatible(attrs.compat)?;
+                        for expression in expressions.iter() {
+                            let protocol = match expression {
+                                NftExpressionInput::XtTcp(_) => 6,
+                                NftExpressionInput::XtUdp(_) => 17,
+                                NftExpressionInput::XtIcmp6(_) if family == 10 => 58,
+                                NftExpressionInput::XtIcmp6(_) => return Err(SystemError::ENOENT),
+                                _ => continue,
+                            };
+                            xt_protocol_compatible(attrs.compat, protocol)?;
                         }
                         if expressions.iter().any(|expression| {
                             matches!(expression, NftExpressionInput::XtAddrtype(_))

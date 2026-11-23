@@ -327,19 +327,12 @@ pub(super) struct SetElemAttrs<'a> {
     pub(super) elements: Option<Vec<NftSetElementInput<'a>>>,
 }
 
-pub(super) fn xt_tcp_compatible(compat: Option<&[u8]>) -> Result<(), SystemError> {
+pub(super) fn xt_protocol_compatible(
+    compat: Option<&[u8]>,
+    expected_protocol: u32,
+) -> Result<(), SystemError> {
     let (proto, flags) = xt_compat_fields(compat)?;
-    if flags != 0 || proto != 6 {
-        return Err(SystemError::EINVAL);
-    }
-    Ok(())
-}
-
-pub(super) fn xt_udp_compatible(compat: Option<&[u8]>) -> Result<(), SystemError> {
-    // nft_compat pairs an l4 match with the rule's declared protocol; the
-    // udp match requires IPPROTO_UDP without inversion.
-    let (proto, flags) = xt_compat_fields(compat)?;
-    if flags != 0 || proto != 17 {
+    if flags != 0 || proto != expected_protocol {
         return Err(SystemError::EINVAL);
     }
     Ok(())
@@ -426,6 +419,7 @@ fn xt_match(bytes: &[u8]) -> Result<NftExpressionInput<'_>, SystemError> {
     match (name, revision) {
         (b"tcp", 0) => Ok(NftExpressionInput::XtTcp(info)),
         (b"udp", 0) => Ok(NftExpressionInput::XtUdp(info)),
+        (b"icmp6", 0) => Ok(NftExpressionInput::XtIcmp6(info)),
         (b"addrtype", 1) => Ok(NftExpressionInput::XtAddrtype(info)),
         (b"conntrack", 1..=3) => Ok(NftExpressionInput::XtConntrack { revision, info }),
         _ => Err(SystemError::ENOENT),
@@ -1591,6 +1585,8 @@ pub(super) fn compat_match_reply(
         _ if kind == 1 => return Err(SystemError::ENOENT),
         b"tcp" if revision == 0 => b"tcp\0",
         b"udp" if revision == 0 && family == 2 => b"udp\0",
+        b"icmp6" if revision == 0 && family == 10 => b"icmp6\0",
+        b"icmp6" if family == 10 => return Err(SystemError::EPROTONOSUPPORT),
         b"addrtype" if revision == 1 => b"addrtype\0",
         b"conntrack" if (1..=3).contains(&revision) => b"conntrack\0",
         b"udp" if family == 10 => return Err(SystemError::ENOENT),
@@ -2289,6 +2285,12 @@ pub(super) fn rule_message(
                 append_attr(&mut data, MATCH_NAME, b"udp\0")?;
                 append_attr(&mut data, MATCH_REV, &0u32.to_be_bytes())?;
                 append_attr(&mut data, MATCH_INFO, &udp.info())?;
+                b"match\0"
+            }
+            NftExpression::XtIcmp6(icmp) => {
+                append_attr(&mut data, MATCH_NAME, b"icmp6\0")?;
+                append_attr(&mut data, MATCH_REV, &0u32.to_be_bytes())?;
+                append_attr(&mut data, MATCH_INFO, &icmp.info())?;
                 b"match\0"
             }
             NftExpression::XtAddrtype(matcher) => {

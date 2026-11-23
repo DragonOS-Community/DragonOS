@@ -49,7 +49,13 @@ use validation::{validate_entry, validate_entry_on_iface, validate_gateway_iface
 pub(crate) struct OutputRouteGuard<'a> {
     fib: RwSemReadGuard<'a, FibTable>,
     devices: RwSemReadGuard<'a, BTreeMap<usize, Arc<dyn Iface>>>,
-    masquerade_addresses: Option<Vec<(u32, Vec<IpCidr>)>>,
+    masquerade_addresses: Option<Vec<NatDeviceAddresses>>,
+}
+
+struct NatDeviceAddresses {
+    ifindex: u32,
+    configured: Vec<IpCidr>,
+    preferred_deadlines: Vec<(Ipv6Address, i64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +104,22 @@ impl OutputRouteGuard<'_> {
                 .try_reserve_exact(mirror.len())
                 .map_err(|_| SystemError::ENOMEM)?;
             configured.extend_from_slice(&mirror);
-            addresses.push((oif, configured));
+            drop(mirror);
+            let mut preferred_deadlines = Vec::new();
+            if device.is_none() {
+                let metadata = iface.common().address_metadata().lock();
+                for deadline in crate::net::address::preferred_ipv6_deadlines(&metadata) {
+                    preferred_deadlines
+                        .try_reserve(1)
+                        .map_err(|_| SystemError::ENOMEM)?;
+                    preferred_deadlines.push(deadline);
+                }
+            }
+            addresses.push(NatDeviceAddresses {
+                ifindex: oif,
+                configured,
+                preferred_deadlines,
+            });
         }
         self.masquerade_addresses = Some(addresses);
         Ok(())
@@ -121,19 +142,18 @@ impl OutputRouteGuard<'_> {
         {
             return None;
         }
-        let addresses = &self
+        let addresses = self
             .masquerade_addresses
             .as_ref()?
             .iter()
-            .find(|(index, _)| *index == oif)?
-            .1;
+            .find(|addresses| addresses.ifindex == oif)?;
         match destination {
             IpAddress::Ipv4(_) => {
                 let next_hop = match next_hop {
                     IpAddress::Ipv4(address) => address,
                     _ => return None,
                 };
-                if let Some(source) = select_ipv4_primary(addresses, next_hop) {
+                if let Some(source) = select_ipv4_primary(&addresses.configured, next_hop) {
                     return Some(IpAddress::Ipv4(source));
                 }
                 // inet_select_addr() falls back to a primary on another
@@ -142,23 +162,32 @@ impl OutputRouteGuard<'_> {
                 self.masquerade_addresses
                     .as_ref()?
                     .iter()
-                    .find_map(|(index, configured)| {
-                        (*index != oif
-                            && self.devices.get(&(*index as usize)).is_some_and(|device| {
-                                device
-                                    .flags()
-                                    .contains(crate::driver::net::types::InterfaceFlags::UP)
-                                    && !device.flags().contains(
-                                        crate::driver::net::types::InterfaceFlags::LOOPBACK,
-                                    )
-                            }))
-                        .then(|| select_ipv4_primary(configured, next_hop))
+                    .find_map(|addresses| {
+                        (addresses.ifindex != oif
+                            && self.devices.get(&(addresses.ifindex as usize)).is_some_and(
+                                |device| {
+                                    device
+                                        .flags()
+                                        .contains(crate::driver::net::types::InterfaceFlags::UP)
+                                        && !device.flags().contains(
+                                            crate::driver::net::types::InterfaceFlags::LOOPBACK,
+                                        )
+                                },
+                            ))
+                        .then(|| select_ipv4_primary(&addresses.configured, next_hop))
                         .flatten()
                         .map(IpAddress::Ipv4)
                     })
             }
             IpAddress::Ipv6(destination) => {
-                select_ipv6_source(addresses, destination).map(IpAddress::Ipv6)
+                let now_us = crate::time::Instant::now().total_micros();
+                select_ipv6_source(&addresses.configured, destination, |source| {
+                    addresses
+                        .preferred_deadlines
+                        .iter()
+                        .any(|&(address, deadline)| address == source && deadline <= now_us)
+                })
+                .map(IpAddress::Ipv6)
             }
         }
     }
@@ -172,13 +201,12 @@ impl OutputRouteGuard<'_> {
         destination: IpAddress,
     ) -> Option<IpAddress> {
         self.devices.get(&(ingress_ifindex as usize))?;
-        let addresses = &self
+        let addresses = self
             .masquerade_addresses
             .as_ref()?
             .iter()
-            .find(|(ifindex, _)| *ifindex == ingress_ifindex)?
-            .1;
-        select_redirect_address(addresses, destination)
+            .find(|addresses| addresses.ifindex == ingress_ifindex)?;
+        select_redirect_address(&addresses.configured, destination)
     }
 
     pub(crate) fn device_mtu(&self, ifindex: u32) -> Option<usize> {
@@ -391,12 +419,13 @@ fn ipv6_redirect_scope(address: smoltcp::wire::Ipv6Address) -> u8 {
 
 fn select_ipv6_source(
     addresses: &[IpCidr],
-    destination: smoltcp::wire::Ipv6Address,
+    destination: Ipv6Address,
+    deprecated: impl Fn(Ipv6Address) -> bool,
 ) -> Option<smoltcp::wire::Ipv6Address> {
     let link_scope = destination.is_link_local()
         || destination.is_multicast() && destination.octets()[1] & 0x0f <= 2;
     let mut best = None;
-    let mut best_prefix = 0;
+    let mut best_score = (false, 0);
     for item in addresses {
         let IpCidr::Ipv6(cidr) = item else { continue };
         let source = cidr.address();
@@ -416,10 +445,10 @@ fn select_ipv6_source(
                 break;
             }
         }
-        let score = prefix.min(cidr.prefix_len() as usize);
-        if best.is_none() || score > best_prefix {
+        let score = (!deprecated(source), prefix.min(cidr.prefix_len() as usize));
+        if best.is_none() || score > best_score {
             best = Some(source);
-            best_prefix = score;
+            best_score = score;
         }
     }
     best
@@ -456,7 +485,18 @@ mod masquerade_source_tests {
             IpCidr::Ipv6(Ipv6Cidr::new(first, 64)),
             IpCidr::Ipv6(Ipv6Cidr::new(second, 64)),
         ];
-        assert_eq!(select_ipv6_source(&addresses, remote), Some(second));
+        assert_eq!(
+            select_ipv6_source(&addresses, remote, |_| false),
+            Some(second)
+        );
+        assert_eq!(
+            select_ipv6_source(&addresses, remote, |address| address == second),
+            Some(first)
+        );
+        assert_eq!(
+            select_ipv6_source(&addresses, second, |address| address == second),
+            Some(second)
+        );
     }
 
     #[test]

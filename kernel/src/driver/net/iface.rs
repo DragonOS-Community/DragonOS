@@ -72,27 +72,36 @@ pub(crate) struct AddressMetadata {
     /// The explicit IPv4 IFA_BROADCAST value, independent of the CIDR-derived broadcast.
     pub broadcast: Option<smoltcp::wire::Ipv4Address>,
     pub state: AddressState,
+    pub lifetimes: Option<crate::net::address::ipv6_slaac::Lifetimes>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddressState {
     #[default]
     Configured,
-    AutoLinkLocal(LinkLocalState),
+    AutoLinkLocal(DadState),
+    Slaac(DadState),
+    ManualDad(DadState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LinkLocalState {
+pub(crate) enum DadState {
     Tentative,
     DadFailed,
     Usable,
 }
 
 impl AddressState {
+    pub(crate) fn has_dad_state(self) -> bool {
+        !matches!(self, Self::Configured)
+    }
+
     pub(crate) fn is_usable(self) -> bool {
         matches!(
             self,
-            Self::Configured | Self::AutoLinkLocal(LinkLocalState::Usable)
+            Self::Configured
+                | Self::AutoLinkLocal(DadState::Usable)
+                | Self::Slaac(DadState::Usable)
         )
     }
 }

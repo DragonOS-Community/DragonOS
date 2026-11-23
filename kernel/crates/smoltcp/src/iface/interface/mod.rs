@@ -198,6 +198,8 @@ pub struct InterfaceInner {
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     #[cfg(feature = "proto-ipv6")]
     ipv6_enabled: bool,
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_preferred_until: Vec<(Ipv6Address, Instant), IFACE_MAX_ADDR_COUNT>,
     any_ip: bool,
     /// Whether connected prefixes are represented explicitly in `routes`.
     route_table_includes_connected_prefixes: bool,
@@ -317,6 +319,8 @@ impl Interface {
                 ip_addrs: Vec::new(),
                 #[cfg(feature = "proto-ipv6")]
                 ipv6_enabled: true,
+                #[cfg(feature = "proto-ipv6")]
+                ipv6_preferred_until: Vec::new(),
                 any_ip: false,
                 route_table_includes_connected_prefixes: false,
                 routes: Routes::new(),
@@ -484,6 +488,27 @@ impl Interface {
     #[cfg(feature = "proto-ipv6")]
     pub fn get_source_address_ipv6(&self, dst_addr: &Ipv6Address) -> Ipv6Address {
         self.inner.get_source_address_ipv6(dst_addr)
+    }
+
+    /// Select an IPv6 source for a caller outside the current device poll.
+    #[cfg(feature = "proto-ipv6")]
+    pub fn get_source_address_ipv6_at(&self, dst_addr: &Ipv6Address, now: Instant) -> Ipv6Address {
+        self.inner.get_source_address_ipv6_at(dst_addr, now)
+    }
+
+    /// Publish the finite preferred deadlines of the configured IPv6 addresses.
+    #[cfg(feature = "proto-ipv6")]
+    pub fn set_ipv6_preferred_deadlines(
+        &mut self,
+        deadlines: impl IntoIterator<Item = (Ipv6Address, Instant)>,
+    ) {
+        self.inner.ipv6_preferred_until.clear();
+        for entry in deadlines {
+            self.inner
+                .ipv6_preferred_until
+                .push(entry)
+                .expect("address capacity");
+        }
     }
 
     /// Update the IP addresses of the interface.

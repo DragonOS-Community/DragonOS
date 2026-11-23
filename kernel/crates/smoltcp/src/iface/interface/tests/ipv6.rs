@@ -3103,3 +3103,31 @@ fn test_solicited_node_multicast_autojoin(#[case] medium: Medium) {
     assert!(!iface.has_multicast_group(addr1.solicited_node()));
     assert!(!iface.has_multicast_group(addr2.solicited_node()));
 }
+
+#[cfg(feature = "medium-ip")]
+#[test]
+fn ipv6_source_ranks_scope_and_deprecation_before_prefix() {
+    let (mut iface, _, _) = setup(Medium::Ip);
+    let link = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    let near = Ipv6Address::new(0xfd00, 1, 0, 0, 0, 0, 0, 1);
+    let far = Ipv6Address::new(0xfd00, 2, 0, 0, 0, 0, 0, 1);
+    let remote = Ipv6Address::new(0xfd00, 1, 0, 0, 0, 0, 0, 2);
+    iface.update_ip_addrs(|addresses| {
+        addresses.clear();
+        for source in [link, near, far] {
+            addresses
+                .push(IpCidr::Ipv6(Ipv6Cidr::new(source, 64)))
+                .unwrap();
+        }
+    });
+    let deadline = Instant::from_millis(10);
+    iface.set_ipv6_preferred_deadlines([(near, deadline), (link, deadline)]);
+    assert_eq!(
+        iface.get_source_address_ipv6_at(&remote, Instant::from_millis(9)),
+        near
+    );
+    assert_eq!(iface.get_source_address_ipv6_at(&remote, deadline), far);
+    assert_eq!(iface.get_source_address_ipv6_at(&near, deadline), near);
+    let all_nodes = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    assert_eq!(iface.get_source_address_ipv6_at(&all_nodes, deadline), link);
+}

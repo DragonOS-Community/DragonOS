@@ -43,6 +43,14 @@ impl InterfaceInner {
     /// This function panics if the destination address is unspecified.
     #[allow(unused)]
     pub fn get_source_address_ipv6(&self, dst_addr: &Ipv6Address) -> Ipv6Address {
+        self.get_source_address_ipv6_at(dst_addr, self.now)
+    }
+
+    pub(super) fn get_source_address_ipv6_at(
+        &self,
+        dst_addr: &Ipv6Address,
+        now: Instant,
+    ) -> Ipv6Address {
         assert!(!dst_addr.is_unspecified());
 
         // See RFC 6724 Section 4: Candidate source address
@@ -89,72 +97,50 @@ impl InterfaceInner {
             bits as usize
         }
 
-        // If the destination address is a loopback address, or when there are no IPv6 addresses in
-        // the interface, then the loopback address is the only candidate source address.
-        if dst_addr.is_loopback()
-            || self
-                .ip_addrs
-                .iter()
-                .filter(|a| matches!(a, IpCidr::Ipv6(_)))
-                .count()
-                == 0
-        {
+        if dst_addr.is_loopback() {
             return Ipv6Address::LOCALHOST;
         }
 
-        let mut candidate = self
-            .ip_addrs
-            .iter()
-            .find_map(|a| match a {
-                #[cfg(feature = "proto-ipv4")]
-                IpCidr::Ipv4(_) => None,
-                IpCidr::Ipv6(a) => Some(a),
-            })
-            .unwrap(); // NOTE: we check above that there is at least one IPv6 address.
-
+        let mut fallback = None;
+        let mut best = None;
+        let dst_scope = dst_addr.x_multicast_scope() as u8;
         for addr in self.ip_addrs.iter().filter_map(|a| match a {
             #[cfg(feature = "proto-ipv4")]
             IpCidr::Ipv4(_) => None,
-            #[cfg(feature = "proto-ipv6")]
-            IpCidr::Ipv6(a) => Some(a),
+            IpCidr::Ipv6(addr) => Some(addr),
         }) {
-            if !is_candidate_source_address(dst_addr, &addr.address()) {
+            let source = addr.address();
+            fallback.get_or_insert(source);
+            if !is_candidate_source_address(dst_addr, &source) {
                 continue;
             }
-
-            // Rule 1: prefer the address that is the same as the output destination address.
-            if candidate.address() != *dst_addr && addr.address() == *dst_addr {
-                candidate = addr;
-            }
-
-            // Rule 2: prefer appropriate scope.
-            if (candidate.address().x_multicast_scope() as u8)
-                < (addr.address().x_multicast_scope() as u8)
-            {
-                if (candidate.address().x_multicast_scope() as u8)
-                    < (dst_addr.x_multicast_scope() as u8)
-                {
-                    candidate = addr;
-                }
-            } else if (addr.address().x_multicast_scope() as u8)
-                > (dst_addr.x_multicast_scope() as u8)
-            {
-                candidate = addr;
-            }
-
-            // Rule 3: avoid deprecated addresses (TODO)
-            // Rule 4: prefer home addresses (TODO)
-            // Rule 5: prefer outgoing interfaces (TODO)
-            // Rule 5.5: prefer addresses in a prefix advertises by the next-hop (TODO).
-            // Rule 6: prefer matching label (TODO)
-            // Rule 7: prefer temporary addresses (TODO)
-            // Rule 8: use longest matching prefix
-            if common_prefix_length(candidate, dst_addr) < common_prefix_length(addr, dst_addr) {
-                candidate = addr;
+            let scope = source.x_multicast_scope() as u8;
+            let adequate_scope = scope >= dst_scope;
+            let scope_score = if adequate_scope {
+                u8::MAX - scope
+            } else {
+                scope
+            };
+            let deprecated = self
+                .ipv6_preferred_until
+                .iter()
+                .any(|&(address, deadline)| address == source && deadline <= now);
+            // Rule 1 (same address), Rule 2 (scope), Rule 3 (deprecation),
+            // and Rule 8 (longest matching prefix), in that order.
+            let score = (
+                source == *dst_addr,
+                adequate_scope,
+                scope_score,
+                !deprecated,
+                common_prefix_length(addr, dst_addr),
+            );
+            if best.map_or(true, |(best_score, _)| score > best_score) {
+                best = Some((score, source));
             }
         }
-
-        candidate.address()
+        best.map(|(_, address)| address)
+            .or(fallback)
+            .unwrap_or(Ipv6Address::LOCALHOST)
     }
 
     /// Determine if the given `Ipv6Address` is the solicited node

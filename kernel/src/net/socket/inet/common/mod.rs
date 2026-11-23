@@ -569,7 +569,18 @@ pub(crate) fn pick_configured_source_addr(
         });
     }
 
-    let selected = smol_iface.get_source_address(remote_ip_addr);
+    let selected = match remote_ip_addr {
+        smoltcp::wire::IpAddress::Ipv4(_) => smol_iface.get_source_address(remote_ip_addr),
+        smoltcp::wire::IpAddress::Ipv6(destination) => {
+            let now =
+                smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
+            Some(
+                smol_iface
+                    .get_source_address_ipv6_at(destination, now)
+                    .into(),
+            )
+        }
+    };
     let selected_is_configured = selected
         .as_ref()
         .map(|addr| smol_iface.has_ip_addr(*addr))

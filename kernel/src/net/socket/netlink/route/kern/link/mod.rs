@@ -490,20 +490,13 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
 pub(crate) fn notify_iface_protocol_change(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
-    removed_addresses: Vec<crate::net::address::AddressInfo>,
+    removed_addresses: impl IntoIterator<Item = crate::net::address::AddressInfo>,
     added_or_changed_addresses: impl IntoIterator<Item = smoltcp::wire::IpCidr>,
     route_changes: Option<crate::net::route::RouteNotifications>,
     removed_neighbors: Vec<crate::net::neighbor::NeighborEntry>,
 ) {
     for removed in removed_addresses {
-        super::addr::notify_removed_address(
-            netns.clone(),
-            iface,
-            removed.cidr,
-            &removed.label,
-            removed.broadcast,
-            removed.state,
-        );
+        super::addr::notify_removed_address(netns.clone(), iface, &removed);
     }
     for cidr in added_or_changed_addresses {
         super::addr::notify_address_change(netns.clone(), iface, cidr);

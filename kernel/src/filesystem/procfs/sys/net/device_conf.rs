@@ -21,7 +21,10 @@ use crate::{
     },
     libs::mutex::MutexGuard,
     net::{
-        address::{ipv6_autoconf::Setting, set_device_ipv6_disabled},
+        address::{
+            ipv6_autoconf::{PrefixSetting, Setting},
+            set_device_ipv6_disabled,
+        },
         rtnl,
     },
     process::namespace::net_namespace::NetNamespace,
@@ -42,7 +45,9 @@ impl DeviceConfFamily {
             Self::Ipv6 => &[
                 "accept_dad",
                 "accept_ra",
+                "accept_ra_pinfo",
                 "addr_gen_mode",
+                "autoconf",
                 "dad_transmits",
                 "disable_ipv6",
                 "forwarding",
@@ -198,6 +203,12 @@ impl DirOps for DeviceDirOps {
             (DeviceConfFamily::Ipv6, "disable_ipv6") => DeviceField::DisableIpv6,
             (DeviceConfFamily::Ipv6, "forwarding") => DeviceField::Ipv6Forwarding,
             (DeviceConfFamily::Ipv6, "accept_ra") => DeviceField::Ipv6AcceptRa,
+            (DeviceConfFamily::Ipv6, "accept_ra_pinfo") => {
+                DeviceField::Ipv6Prefix(PrefixSetting::AcceptRaPinfo)
+            }
+            (DeviceConfFamily::Ipv6, "autoconf") => {
+                DeviceField::Ipv6Prefix(PrefixSetting::Autoconf)
+            }
             (DeviceConfFamily::Ipv6, "accept_dad") => DeviceField::Ipv6Autoconf(Setting::AcceptDad),
             (DeviceConfFamily::Ipv6, "addr_gen_mode") => {
                 DeviceField::Ipv6Autoconf(Setting::AddrGenMode)
@@ -244,6 +255,7 @@ enum DeviceField {
     Ipv6Forwarding,
     Ipv6AcceptRa,
     Ipv6Autoconf(Setting),
+    Ipv6Prefix(PrefixSetting),
 }
 
 #[derive(Debug)]
@@ -306,6 +318,14 @@ impl FileOps for DeviceFileOps {
                 }
                 DeviceField::Ipv6AcceptRa => iface.common().set_ipv6_accept_ra(&rtnl, value),
                 DeviceField::Ipv6Autoconf(setting) => setting.write(iface.common(), value)?,
+                DeviceField::Ipv6Prefix(setting) => {
+                    iface
+                        .common()
+                        .ipv6_autoconf
+                        .lock()
+                        .prefixes
+                        .set(setting, value);
+                }
             }
             Ok(PrimaryWriteResult::new(consumed))
         })
@@ -329,6 +349,9 @@ impl FileOps for DeviceFileOps {
             DeviceField::Ipv6Forwarding => iface.common().ipv6_forwarding(),
             DeviceField::Ipv6AcceptRa => iface.common().ipv6_accept_ra(),
             DeviceField::Ipv6Autoconf(setting) => setting.read(iface.common()),
+            DeviceField::Ipv6Prefix(setting) => {
+                iface.common().ipv6_autoconf.lock().prefixes.get(setting)
+            }
         };
         proc_read(0, len, buf, format!("{value}\n").as_bytes())
     }

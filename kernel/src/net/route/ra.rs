@@ -18,7 +18,7 @@ use crate::{
         address::{ipv6_autoconf::PrefixSetting, ipv6_router_solicitation, ipv6_slaac},
         ipv6_defrag::{fragment_offset, DefragDomain},
         rtnl::{self, RtnlGuard},
-        socket::netlink::notify_ra_route,
+        socket::netlink::{has_prefix_listeners, notify_ra_prefix, notify_ra_route},
     },
     process::namespace::net_namespace::NetNamespace,
     time::Instant,
@@ -51,7 +51,14 @@ pub(crate) struct Advertisement {
     preference: RouterPreference,
     withdraw: bool,
     received_at_us: i64,
-    prefixes: Vec<NdiscPrefixInformation>,
+    prefixes: Vec<PrefixOption>,
+}
+
+#[derive(Debug)]
+struct PrefixOption {
+    info: NdiscPrefixInformation,
+    raw_flags: u8,
+    notify: bool,
 }
 
 #[derive(Debug, Default)]
@@ -149,10 +156,11 @@ pub(crate) fn parse(
     })
 }
 
-fn prefix_information(mut options: &[u8]) -> Vec<NdiscPrefixInformation> {
+fn prefix_information(mut options: &[u8]) -> Vec<PrefixOption> {
     let mut prefixes = Vec::new();
     let mut on_link = 0;
     let mut autoconf = 0;
+    let mut notifications = 0;
     // The wire parser has already checked the option stream envelope.
     while let Ok((option, rest)) = NdiscOption::split_first(options) {
         options = rest;
@@ -174,7 +182,8 @@ fn prefix_information(mut options: &[u8]) -> Vec<NdiscPrefixInformation> {
         if autoconf == MAX_PREFIX_OPTIONS || prefix.prefix_len != 64 {
             prefix.flags.remove(NdiscPrefixInfoFlags::ADDRCONF);
         }
-        if prefix.flags.is_empty() {
+        let notify = notifications < MAX_PREFIX_OPTIONS;
+        if prefix.flags.is_empty() && !notify {
             continue;
         }
         if prefixes.try_reserve(1).is_err() {
@@ -182,8 +191,16 @@ fn prefix_information(mut options: &[u8]) -> Vec<NdiscPrefixInformation> {
         }
         on_link += usize::from(prefix.flags.contains(NdiscPrefixInfoFlags::ON_LINK));
         autoconf += usize::from(prefix.flags.contains(NdiscPrefixInfoFlags::ADDRCONF));
-        prefixes.push(prefix);
-        if on_link == MAX_PREFIX_OPTIONS && autoconf == MAX_PREFIX_OPTIONS {
+        notifications += usize::from(notify);
+        prefixes.push(PrefixOption {
+            info: prefix,
+            raw_flags: option.raw_prefix_flags(),
+            notify,
+        });
+        if on_link == MAX_PREFIX_OPTIONS
+            && autoconf == MAX_PREFIX_OPTIONS
+            && notifications == MAX_PREFIX_OPTIONS
+        {
             break;
         }
     }
@@ -213,20 +230,14 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
     let now_us = Instant::now().total_micros();
     let prefix_settings = common.ipv6_autoconf.lock().prefixes;
     if prefix_settings.get(PrefixSetting::AcceptRaPinfo) != 0 {
-        apply_prefix_information(&rtnl, netns, &advertisement, now_us);
-        if prefix_settings.get(PrefixSetting::Autoconf) != 0 {
-            for prefix in advertisement
-                .prefixes
-                .iter()
-                .filter(|prefix| prefix.flags.contains(NdiscPrefixInfoFlags::ADDRCONF))
-            {
-                if let Err(error) =
-                    ipv6_slaac::apply(&rtnl, netns, &iface, prefix, advertisement.received_at_us)
-                {
-                    log::debug!("could not apply IPv6 autonomous prefix: {:?}", error);
-                }
-            }
-        }
+        apply_prefix_information(
+            &rtnl,
+            netns,
+            &iface,
+            &advertisement,
+            now_us,
+            prefix_settings.get(PrefixSetting::Autoconf) != 0,
+        );
     }
     if common
         .ip_addrs()
@@ -265,55 +276,90 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
 fn apply_prefix_information(
     rtnl: &RtnlGuard,
     netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
     advertisement: &Advertisement,
     now_us: i64,
+    autoconf: bool,
 ) {
-    // RTNL serializes allocation of the remaining slots. Count once per
-    // advertisement, and update the allowance only after a committed edit.
-    let mut prefix_slots = if !advertisement
+    if advertisement.prefixes.is_empty() {
+        return;
+    }
+    let listeners = has_prefix_listeners(netns);
+    // RTNL keeps the remaining FIB slots stable across committed edits.
+    let mut prefix_slots = 0;
+    if advertisement
         .prefixes
         .iter()
-        .any(|prefix| prefix.flags.contains(NdiscPrefixInfoFlags::ON_LINK))
+        .any(|prefix| prefix.info.flags.contains(NdiscPrefixInfoFlags::ON_LINK))
     {
-        0
-    } else {
-        netns.router().fib.read().learned_prefix_slots()
-    };
-    for prefix in &advertisement.prefixes {
-        if !prefix.flags.contains(NdiscPrefixInfoFlags::ON_LINK) {
-            continue;
+        prefix_slots = netns.router().fib.read().learned_prefix_slots();
+    }
+
+    for option in &advertisement.prefixes {
+        let prefix = &option.info;
+        if prefix.flags.contains(NdiscPrefixInfoFlags::ON_LINK) {
+            match apply_on_link_prefix(rtnl, netns, advertisement, prefix, now_us, prefix_slots > 0)
+            {
+                Ok(FibEdit::Insert { .. }) => prefix_slots -= 1,
+                Ok(FibEdit::Delete { .. }) => prefix_slots += 1,
+                Ok(_) => {}
+                Err(error) => log::debug!("could not apply IPv6 on-link prefix: {:?}", error),
+            }
         }
-        let valid_us = prefix.valid_lifetime.total_micros();
-        let withdraw = valid_us == 0;
-        let expires_at_us = (valid_us != INFINITE_LIFETIME_US)
-            .then(|| advertisement.received_at_us.saturating_add(valid_us as i64));
-        if !withdraw && expires_at_us.is_some_and(|deadline| deadline <= now_us) {
-            continue;
+        if autoconf && option.raw_flags & NdiscPrefixInfoFlags::ADDRCONF.bits() != 0 {
+            if prefix.prefix_len != 64 {
+                continue;
+            }
+            if prefix.flags.contains(NdiscPrefixInfoFlags::ADDRCONF) {
+                match ipv6_slaac::apply(rtnl, netns, iface, prefix, advertisement.received_at_us) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        log::debug!("could not apply IPv6 autonomous prefix: {:?}", error);
+                        continue;
+                    }
+                }
+            }
         }
-        let route = RouteEntry {
-            destination: canonical_cidr(IpCidr::new(prefix.prefix.into(), prefix.prefix_len)),
-            source: None,
-            preferred_source: None,
-            table: RT_TABLE_MAIN,
-            priority: PREFIX_ROUTE_METRIC,
-            tos: 0,
-            protocol: RTPROT_KERNEL,
-            scope: RT_SCOPE_UNIVERSE,
-            kind: RTN_UNICAST,
-            oif: advertisement.ifindex,
-            gateway: None,
-            nexthop_flags: 0,
-            ra_route: Some(RaRoute::OnLinkPrefix { expires_at_us }),
-        };
-        match update(rtnl, netns, |fib| {
-            fib.plan_learned_prefix(route, withdraw, prefix_slots > 0)
-        }) {
-            Ok(FibEdit::Insert { .. }) => prefix_slots -= 1,
-            Ok(FibEdit::Delete { .. }) => prefix_slots += 1,
-            Ok(_) => {}
-            Err(error) => log::debug!("could not apply IPv6 on-link prefix: {:?}", error),
+        if listeners && option.notify {
+            notify_ra_prefix(netns, advertisement.ifindex, prefix, option.raw_flags);
         }
     }
+}
+
+fn apply_on_link_prefix(
+    rtnl: &RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    advertisement: &Advertisement,
+    prefix: &NdiscPrefixInformation,
+    now_us: i64,
+    has_slot: bool,
+) -> Result<FibEdit, SystemError> {
+    let valid_us = prefix.valid_lifetime.total_micros();
+    let withdraw = valid_us == 0;
+    let expires_at_us = (valid_us != INFINITE_LIFETIME_US)
+        .then(|| advertisement.received_at_us.saturating_add(valid_us as i64));
+    if !withdraw && expires_at_us.is_some_and(|deadline| deadline <= now_us) {
+        return Ok(FibEdit::None);
+    }
+    let route = RouteEntry {
+        destination: canonical_cidr(IpCidr::new(prefix.prefix.into(), prefix.prefix_len)),
+        source: None,
+        preferred_source: None,
+        table: RT_TABLE_MAIN,
+        priority: PREFIX_ROUTE_METRIC,
+        tos: 0,
+        protocol: RTPROT_KERNEL,
+        scope: RT_SCOPE_UNIVERSE,
+        kind: RTN_UNICAST,
+        oif: advertisement.ifindex,
+        gateway: None,
+        nexthop_flags: 0,
+        ra_route: Some(RaRoute::OnLinkPrefix { expires_at_us }),
+    };
+    update(rtnl, netns, |fib| {
+        fib.plan_learned_prefix(route, withdraw, has_slot)
+    })
 }
 
 fn update(

@@ -11,7 +11,7 @@ use crate::net::socket::netlink::{
     table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
 };
 use crate::process::namespace::net_namespace::NetNamespace;
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 pub const RTMGRP_LINK: u32 = 0x1;
 pub const RTMGRP_NEIGH: u32 = 0x4;
@@ -31,10 +31,19 @@ pub fn kernel_notify_header(type_: CSegmentType) -> CMsgSegHdr {
 }
 
 pub fn multicast_notify(netns: Arc<NetNamespace>, group_mask: u32, segment: RouteNlSegment) {
-    let message = Message::new(vec![segment]);
-    for group_index in GroupIdSet::new(group_mask).ids_iter() {
+    let groups = GroupIdSet::new(group_mask);
+    let mut segments = Vec::new();
+    if segments.try_reserve_exact(1).is_err() {
+        for group_index in groups.ids_iter() {
+            NetlinkRouteProtocol::report_group_overrun(group_index + 1, 0, netns.clone());
+        }
+        return;
+    }
+    segments.push(segment);
+    let message = Message::new(segments);
+    for group_index in groups.ids_iter() {
         let group_id = group_index + 1;
-        match RouteNlPacket::notification(message.clone(), 1 << group_index) {
+        match RouteNlPacket::notification(&message, 1 << group_index) {
             Ok(packet) => NetlinkRouteProtocol::notify_group(group_id, 0, packet, netns.clone()),
             Err(_) => NetlinkRouteProtocol::report_group_overrun(group_id, 0, netns.clone()),
         }

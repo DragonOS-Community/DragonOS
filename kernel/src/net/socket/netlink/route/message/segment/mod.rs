@@ -1,6 +1,7 @@
 pub mod addr;
 pub mod link;
 pub mod neigh;
+pub mod prefix;
 pub mod route;
 
 use crate::net::socket::netlink::{
@@ -18,6 +19,7 @@ use crate::net::socket::netlink::{
             addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, CIfaddrMsg, RtScope},
             link::{CIfinfoMsg, LinkMessageFlags, LinkSegment, LinkSegmentBody},
             neigh::{CNdMsg, NeighSegment, NeighSegmentBody},
+            prefix::PrefixSegment,
             route::{
                 CRtMsg, RouteFlags, RouteProtocol, RouteScope, RouteSegment, RouteSegmentBody,
                 RouteTable, RouteType,
@@ -49,6 +51,7 @@ pub enum RouteNlSegment {
     NewNeigh(NeighSegment),
     DelNeigh(NeighSegment),
     GetNeigh(NeighSegment),
+    NewPrefix(PrefixSegment),
 }
 
 impl ProtocolSegment for RouteNlSegment {
@@ -69,6 +72,7 @@ impl ProtocolSegment for RouteNlSegment {
             | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.header(),
             RouteNlSegment::Done(done_segment) => done_segment.header(),
             RouteNlSegment::Error(error_segment) => error_segment.header(),
+            RouteNlSegment::NewPrefix(prefix_segment) => prefix_segment.header(),
         }
     }
 
@@ -91,6 +95,7 @@ impl ProtocolSegment for RouteNlSegment {
             | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.header_mut(),
             RouteNlSegment::Done(done_segment) => done_segment.header_mut(),
             RouteNlSegment::Error(error_segment) => error_segment.header_mut(),
+            RouteNlSegment::NewPrefix(prefix_segment) => prefix_segment.header_mut(),
         }
     }
 
@@ -175,6 +180,7 @@ impl ProtocolSegment for RouteNlSegment {
                     RouteNlSegment::GetNeigh(NeighSegment::read_from_buf(header, payload_buf)?)
                 }
             }
+            CSegmentType::NEWPREFIX => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
             _ => return Err(SystemError::EINVAL),
         };
 
@@ -198,6 +204,7 @@ impl ProtocolSegment for RouteNlSegment {
             | RouteNlSegment::GetNeigh(neigh_segment) => neigh_segment.write_to_buf(buf)?,
             RouteNlSegment::Done(done_segment) => done_segment.write_to_buf(buf)?,
             RouteNlSegment::Error(error_segment) => error_segment.write_to_buf(buf)?,
+            RouteNlSegment::NewPrefix(prefix_segment) => prefix_segment.write_to_buf(buf)?,
             _ => {
                 log::warn!("write_to is not implemented for this segment type");
                 return Err(SystemError::ENOSYS);

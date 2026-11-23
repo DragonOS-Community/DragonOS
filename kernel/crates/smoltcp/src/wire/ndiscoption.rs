@@ -265,7 +265,13 @@ impl<T: AsRef<[u8]>> NdiscOption<T> {
     /// Return the prefix information flags.
     #[inline]
     pub fn prefix_flags(&self) -> PrefixInfoFlags {
-        PrefixInfoFlags::from_bits_truncate(self.buffer.as_ref()[field::FLAGS])
+        PrefixInfoFlags::from_bits_truncate(self.raw_prefix_flags())
+    }
+
+    /// Return the complete flags byte, including bits not used by smoltcp.
+    #[inline]
+    pub fn raw_prefix_flags(&self) -> u8 {
+        self.buffer.as_ref()[field::FLAGS]
     }
 
     /// Return the valid lifetime of the prefix.

@@ -20,10 +20,10 @@ pub struct RouteNlPacket {
 
 impl RouteNlPacket {
     pub fn kernel(message: RouteNlMessage) -> Result<Self, SystemError> {
-        Self::notification(message, 0)
+        Self::notification(&message, 0)
     }
 
-    pub fn notification(message: RouteNlMessage, group: u32) -> Result<Self, SystemError> {
+    pub fn notification(message: &RouteNlMessage, group: u32) -> Result<Self, SystemError> {
         let mut bytes = Vec::new();
         let length = message.total_len();
         bytes

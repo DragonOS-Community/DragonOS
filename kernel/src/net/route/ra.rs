@@ -14,6 +14,7 @@ use system_error::SystemError;
 use crate::{
     driver::net::{types::InterfaceFlags, Iface, IfaceCommon},
     net::{
+        address::ipv6_router_solicitation,
         ipv6_defrag::{fragment_offset, DefragDomain},
         rtnl::{self, RtnlGuard},
         socket::netlink::notify_learned_default,
@@ -37,6 +38,7 @@ pub(crate) struct Advertisement {
     ifindex: u32,
     device_epoch: u64,
     ra_generation: u64,
+    solicitation_generation: Option<u64>,
     gateway: Ipv6Address,
     expires_at_us: i64,
     preference: RouterPreference,
@@ -83,6 +85,7 @@ pub(crate) fn parse(
     if bytes.get(transport_offset).copied() != Some(u8::from(Icmpv6Message::RouterAdvert)) {
         return None;
     }
+    let solicitation_generation = ipv6_router_solicitation::sent_generation(owner);
     let generation = owner.ra_generation();
     if !owner.accepts_router_advertisements() {
         return None;
@@ -126,6 +129,7 @@ pub(crate) fn parse(
         ifindex,
         device_epoch,
         ra_generation: generation,
+        solicitation_generation,
         gateway: ip.src_addr(),
         expires_at_us: Instant::now().total_micros().saturating_add(lifetime_us),
         preference,
@@ -147,10 +151,16 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
         || common.ra_generation() != advertisement.ra_generation
         || !iface.flags().contains(InterfaceFlags::UP)
         || !common.accepts_router_advertisements()
-        || common
-            .ip_addrs()
-            .iter()
-            .any(|cidr| cidr.address() == advertisement.gateway.into())
+    {
+        return;
+    }
+    if let Some(generation) = advertisement.solicitation_generation {
+        ipv6_router_solicitation::accept_advertisement(common, generation);
+    }
+    if common
+        .ip_addrs()
+        .iter()
+        .any(|cidr| cidr.address() == advertisement.gateway.into())
         || (!advertisement.withdraw && advertisement.expires_at_us <= Instant::now().total_micros())
     {
         return;

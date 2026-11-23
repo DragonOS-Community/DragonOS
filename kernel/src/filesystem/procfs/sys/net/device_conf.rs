@@ -46,6 +46,7 @@ impl DeviceConfFamily {
                 "dad_transmits",
                 "disable_ipv6",
                 "forwarding",
+                "router_solicitations",
             ],
         }
     }
@@ -203,6 +204,9 @@ impl DirOps for DeviceDirOps {
             }
             (DeviceConfFamily::Ipv6, "dad_transmits") => {
                 DeviceField::Ipv6Autoconf(Setting::DadTransmits)
+            }
+            (DeviceConfFamily::Ipv6, "router_solicitations") => {
+                DeviceField::Ipv6Autoconf(Setting::RouterSolicitations)
             }
             _ => return Err(SystemError::ENOENT),
         };

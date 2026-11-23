@@ -516,6 +516,12 @@ impl PreparedAddressRouteCommit {
             *iface.common().address_metadata().lock() = metadata;
         }
         let mut mirror = iface.router_common().ip_addrs.write();
+        let had_link_local = mirror
+            .iter()
+            .any(|cidr| super::is_ipv6_link_local(cidr.address()));
+        let has_link_local = after_addresses
+            .iter()
+            .any(|cidr| super::is_ipv6_link_local(cidr.address()));
         *mirror = after_addresses;
         *current = candidate;
         netns.publish_ipv4_broadcast_count_change(before_broadcasts, after_broadcasts);
@@ -526,6 +532,12 @@ impl PreparedAddressRouteCommit {
         }
         drop(mirror);
         drop(current);
+        if had_link_local != has_link_local {
+            crate::net::address::ipv6_router_solicitation::address_changed(
+                iface.as_ref(),
+                has_link_local,
+            );
+        }
         let ifindex = iface.nic_id() as u32;
         if invalidate_masquerade_oif {
             netns.conntrack().invalidate_masquerade_oif(ifindex);

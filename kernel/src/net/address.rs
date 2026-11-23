@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub(crate) mod ipv6_autoconf;
+pub(in crate::net) mod ipv6_router_solicitation;
 
 const IPV4_MIN_MTU: usize = 68;
 pub(crate) const IPV6_MIN_MTU: usize = 1280;

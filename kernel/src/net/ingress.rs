@@ -554,6 +554,10 @@ fn is_ipv6_ndisc(packet: &Ipv6Packet<&[u8]>) -> bool {
 }
 
 impl IpIngressFilter for NetIngressFilter<'_> {
+    fn ipv6_ndisc_router(&self) -> bool {
+        self.owner.ipv6_forwarding() != 0
+    }
+
     fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
         // Linux's default Ethernet ARP policy does not expose loopback or
         // multicast targets. IP AnyIP admission is not proxy-ARP permission.
@@ -1097,6 +1101,20 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         }
 
         let packet = packet.bytes();
+        // Reassembly removes the IPv6 Fragment Header. A Neighbor
+        // Solicitation used for DAD must still arrive unfragmented.
+        if version == IpVersion::Ipv6
+            && protocol == IpProtocol::Icmpv6
+            && (self.forward_fragment.get().is_some()
+                || matches!(
+                    self.stage.get(),
+                    IngressStage::LocalInputDone | IngressStage::LocalOutput
+                ))
+            && Ipv6Packet::new_checked(packet)
+                .is_ok_and(|header| header.src_addr().is_unspecified())
+        {
+            return LocalInputVerdict::Drop;
+        }
         // RA is link control, so use the same device that delivered the
         // packet locally (the bridge master for bridged advertisements).
         if protocol == IpProtocol::Icmpv6

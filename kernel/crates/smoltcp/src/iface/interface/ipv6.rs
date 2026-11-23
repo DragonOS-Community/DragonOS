@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Default)]
+struct Ipv6ReceiveContext {
+    link_control: bool,
+    ndisc_router: bool,
+    #[cfg(all(feature = "alloc", feature = "socket-raw"))]
+    external_raw: Option<bool>,
+}
+
+fn accepts_ipv6_source(repr: Ipv6Repr, protocol: IpProtocol, payload: &[u8]) -> bool {
+    repr.src_addr.x_is_unicast()
+        || (repr.src_addr.is_unspecified()
+            && repr.dst_addr.is_solicited_node_multicast()
+            && repr.hop_limit == 255
+            && protocol == IpProtocol::Icmpv6
+            && payload.first().copied() == Some(u8::from(Icmpv6Message::NeighborSolicit)))
+}
+
 /// Enum used for the process_hopbyhop function. In some cases, when discarding a packet, an ICMP
 /// parameter problem message needs to be transmitted to the source of the address. In other cases,
 /// the processing of the IP packet can continue.
@@ -243,13 +260,16 @@ impl InterfaceInner {
         // post-PRE_ROUTING packet before handing it to that callback.
         let post = Ipv6Packet::new_checked(packet.bytes()).ok()?;
         let post_repr = Ipv6Repr::parse(&post).ok()?;
-        if !post_repr.src_addr.x_is_unicast() {
-            return None;
-        }
-        if post_repr.next_header == IpProtocol::HopByHop {
-            if let HopByHopResponse::Discard(_) = self.process_hopbyhop(post_repr, post.payload()) {
-                return None;
+        let (protocol, payload) = if post_repr.next_header == IpProtocol::HopByHop {
+            match self.process_hopbyhop(post_repr, post.payload()) {
+                HopByHopResponse::Discard(_) => return None,
+                HopByHopResponse::Continue(next) => next,
             }
+        } else {
+            (post_repr.next_header, post.payload())
+        };
+        if !accepts_ipv6_source(post_repr, protocol, payload) {
+            return None;
         }
         let link_control = match filter.route_input(
             &mut RoutedIngressPacket::new(&mut packet),
@@ -278,7 +298,7 @@ impl InterfaceInner {
             return None;
         }
         let transport_offset = 40 + post.payload().len() - ip_payload.len();
-        let external_raw = match filter.local_input(
+        let _raw_delivery = match filter.local_input(
             &mut packet,
             meta,
             source_hardware_addr,
@@ -295,8 +315,12 @@ impl InterfaceInner {
             meta,
             source_hardware_addr,
             &rewritten,
-            link_control,
-            external_raw,
+            Ipv6ReceiveContext {
+                link_control,
+                ndisc_router: rewritten.src_addr().is_unspecified() && filter.ipv6_ndisc_router(),
+                #[cfg(feature = "socket-raw")]
+                external_raw: _raw_delivery,
+            },
         )
     }
 
@@ -315,9 +339,7 @@ impl InterfaceInner {
             meta,
             source_hardware_addr,
             ipv6_packet,
-            false,
-            #[cfg(feature = "alloc")]
-            None,
+            Ipv6ReceiveContext::default(),
         )
     }
 
@@ -327,16 +349,9 @@ impl InterfaceInner {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
-        link_control: bool,
-        #[cfg(feature = "alloc")] external_raw: Option<bool>,
+        receive: Ipv6ReceiveContext,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
-
-        if !ipv6_repr.src_addr.x_is_unicast() {
-            // Discard packets with non-unicast source addresses.
-            net_debug!("non-unicast source address");
-            return None;
-        }
 
         let (next_header, ip_payload) = if ipv6_repr.next_header == IpProtocol::HopByHop {
             match self.process_hopbyhop(ipv6_repr, ipv6_packet.payload()) {
@@ -347,14 +362,21 @@ impl InterfaceInner {
             (ipv6_repr.next_header, ipv6_packet.payload())
         };
 
-        if !self.accepts_local_ipv6_destination(ipv6_repr, next_header, ip_payload, link_control) {
+        if !accepts_ipv6_source(ipv6_repr, next_header, ip_payload)
+            || !self.accepts_local_ipv6_destination(
+                ipv6_repr,
+                next_header,
+                ip_payload,
+                receive.link_control,
+            )
+        {
             return None;
         }
 
         #[cfg(feature = "socket-raw")]
         let handled_by_raw_socket = {
             #[cfg(feature = "alloc")]
-            if let Some(matched) = external_raw {
+            if let Some(matched) = receive.external_raw {
                 matched
             } else {
                 self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload)
@@ -378,9 +400,9 @@ impl InterfaceInner {
             sockets,
             meta,
             ipv6_repr,
-            next_header,
+            (next_header, ip_payload),
             handled_by_raw_socket,
-            ip_payload,
+            receive.ndisc_router,
         )
     }
 
@@ -479,12 +501,13 @@ impl InterfaceInner {
         sockets: &mut SocketSet,
         meta: PacketMeta,
         ipv6_repr: Ipv6Repr,
-        nxt_hdr: IpProtocol,
+        transport: (IpProtocol, &'frame [u8]),
         handled_by_raw_socket: bool,
-        ip_payload: &'frame [u8],
+        ndisc_router: bool,
     ) -> Option<Packet<'frame>> {
+        let (nxt_hdr, ip_payload) = transport;
         match nxt_hdr {
-            IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload),
+            IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload, ndisc_router),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => self.process_udp(sockets, meta, ipv6_repr.into(), ip_payload, false),
@@ -516,6 +539,7 @@ impl InterfaceInner {
         _sockets: &mut SocketSet,
         ip_repr: Ipv6Repr,
         ip_payload: &'frame [u8],
+        _ndisc_router: bool,
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv6Packet::new_checked(ip_payload));
         let icmp_repr = check!(Icmpv6Repr::parse(
@@ -564,9 +588,9 @@ impl InterfaceInner {
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             Icmpv6Repr::Ndisc(repr) if ip_repr.hop_limit == 0xff => match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
-                Medium::Ethernet => self.process_ndisc(ip_repr, repr),
+                Medium::Ethernet => self.process_ndisc(ip_repr, repr, _ndisc_router),
                 #[cfg(feature = "medium-ieee802154")]
-                Medium::Ieee802154 => self.process_ndisc(ip_repr, repr),
+                Medium::Ieee802154 => self.process_ndisc(ip_repr, repr, _ndisc_router),
                 #[cfg(feature = "medium-ip")]
                 Medium::Ip => None,
             },
@@ -596,6 +620,7 @@ impl InterfaceInner {
         &mut self,
         ip_repr: Ipv6Repr,
         repr: NdiscRepr<'frame>,
+        is_router: bool,
     ) -> Option<Packet<'frame>> {
         match repr {
             NdiscRepr::NeighborAdvert {
@@ -630,6 +655,11 @@ impl InterfaceInner {
                     return None;
                 }
 
+                let dad = ip_repr.src_addr.is_unspecified();
+                if dad && (lladdr.is_some() || ip_repr.dst_addr != target_addr.solicited_node()) {
+                    return None;
+                }
+
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
                     if !lladdr.is_unicast() {
@@ -642,15 +672,22 @@ impl InterfaceInner {
                 }
 
                 if self.has_solicited_node(ip_repr.dst_addr) && self.has_ip_addr(target_addr) {
+                    let (destination, flags) = if dad {
+                        let mut flags = NdiscNeighborFlags::OVERRIDE;
+                        flags.set(NdiscNeighborFlags::ROUTER, is_router);
+                        (IPV6_LINK_LOCAL_ALL_NODES, flags)
+                    } else {
+                        (ip_repr.src_addr, NdiscNeighborFlags::SOLICITED)
+                    };
                     let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
-                        flags: NdiscNeighborFlags::SOLICITED,
+                        flags,
                         target_addr,
                         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                         lladdr: Some(self.hardware_addr.into()),
                     });
                     let ip_repr = Ipv6Repr {
                         src_addr: target_addr,
-                        dst_addr: ip_repr.src_addr,
+                        dst_addr: destination,
                         next_header: IpProtocol::Icmpv6,
                         hop_limit: 0xff,
                         payload_len: advert.buffer_len(),
@@ -671,6 +708,9 @@ impl InterfaceInner {
     ) -> Option<Packet<'frame>> {
         let src_addr = ipv6_repr.dst_addr;
         let dst_addr = ipv6_repr.src_addr;
+        if !dst_addr.x_is_unicast() {
+            return None;
+        }
 
         let src_addr = if src_addr.x_is_unicast() {
             src_addr

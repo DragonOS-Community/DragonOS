@@ -83,12 +83,14 @@ container_http() {
 content() {
     result=$("$@") && [ "$result" = FIREWALL_HTTP_OK ]
 }
-denies() {
+denies_connection() {
+    # BusyBox nc runs the command as soon as connect() succeeds. No HTTP
+    # response is needed to detect an unexpected TCP connection.
     rc=0
-    output=$(container_http "$@" 2>&1) || rc=$?
+    output=$(docker exec "$1" /bin/busybox nc -w 2 "$2" "$3" -e /bin/busybox true 2>&1) || rc=$?
     printf '%s\n' "$output"
     case "$output" in
-        *'download timed out'*|*'Connection timed out'*) [ "$rc" -eq 1 ] ;;
+        *'nc: timed out'*) [ "$rc" -eq 1 ] ;;
         *) return 1 ;;
     esac
 }
@@ -194,8 +196,8 @@ check dns-upstream dns_query firewall.test "$peer"
 check outbound content container_http matrix-client "$peer" 18080
 check same-bridge-allowed content container_http matrix-client "$target" 8080
 check same-bridge-unpublished content container_http matrix-client "$target" 8081
-check same-bridge-denied denies matrix-blocked "$denied" 8080
-check cross-bridge-denied denies matrix-blocked "$target" 8080
+check same-bridge-denied denies_connection matrix-blocked "$denied" 8080
+check cross-bridge-denied denies_connection matrix-blocked "$target" 8080
 check published-local content /bin/busybox wget -T 2 -qO- "http://$(host_address "$guest"):12580/"
 check self-published content container_http matrix-web "$guest" 12580
 

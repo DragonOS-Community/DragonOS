@@ -16,7 +16,7 @@ use crate::driver::net::{
 };
 use crate::net::{
     ipv6_defrag::{fragment_offset, DefragDomain},
-    output::submit_prepared_ipv6_with_related,
+    output::submit_prepared_ipv6_before_enqueue,
     route::{OutputRouteDecision, RTN_MULTICAST, RT_TABLE_LOCAL},
     rtnl,
 };
@@ -387,6 +387,7 @@ fn send_probe(
             lladdr: None,
             nonce: Some(probe.nonce),
         },
+        || {},
     )
 }
 
@@ -396,6 +397,7 @@ pub(super) fn send_ndisc(
     src: Ipv6Address,
     dst: Ipv6Address,
     message: NdiscRepr<'_>,
+    before_enqueue: impl FnOnce(),
 ) -> Result<(), SystemError> {
     let message = Icmpv6Repr::Ndisc(message);
     let ip = Ipv6Repr {
@@ -419,7 +421,7 @@ pub(super) fn send_ndisc(
         &ChecksumCapabilities::default(),
     );
     let oif = iface.nic_id() as u32;
-    submit_prepared_ipv6_with_related(
+    submit_prepared_ipv6_before_enqueue(
         netns,
         packet,
         OutputRouteDecision {
@@ -431,6 +433,7 @@ pub(super) fn send_ndisc(
             table: RT_TABLE_LOCAL,
         },
         None,
+        before_enqueue,
     )
 }
 

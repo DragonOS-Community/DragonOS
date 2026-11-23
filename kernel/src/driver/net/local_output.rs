@@ -640,6 +640,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
         identification: u32,
         ct_context: OutputCtContext,
         mark: u32,
+        before_enqueue: impl FnOnce(),
     ) -> Result<(), SystemError> {
         self.check_owner()?;
         self.validate_for_ipv6_route(route)?;
@@ -655,6 +656,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
                 ip_mtu: route.ip_mtu,
             }
         };
+        before_enqueue();
         self.reservation.commit_prepared_ipv6(
             self.scratch.take().unwrap(),
             PacketMeta::default(),

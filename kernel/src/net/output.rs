@@ -448,6 +448,16 @@ pub(crate) fn submit_prepared_ipv6_with_related(
     route: OutputRouteDecision,
     related: Option<CtPacketContext>,
 ) -> Result<(), SystemError> {
+    submit_prepared_ipv6_before_enqueue(netns, reservation, route, related, || {})
+}
+
+pub(in crate::net) fn submit_prepared_ipv6_before_enqueue(
+    netns: &Arc<NetNamespace>,
+    reservation: PreparedIpOutputReservation<'_>,
+    route: OutputRouteDecision,
+    related: Option<CtPacketContext>,
+    before_enqueue: impl FnOnce(),
+) -> Result<(), SystemError> {
     submit_ipv6(
         netns,
         reservation,
@@ -459,6 +469,7 @@ pub(crate) fn submit_prepared_ipv6_with_related(
             may_fragment: true,
             hint: None,
         },
+        before_enqueue,
     )
     .map(|_| ())
     .map_err(|error| error.error)
@@ -470,6 +481,7 @@ fn submit_ipv6(
     mut route: OutputRouteDecision,
     related: Option<CtPacketContext>,
     options: SocketOutput<'_>,
+    before_enqueue: impl FnOnce(),
 ) -> Result<Option<Arc<dyn Iface>>, PmtuOutputError> {
     let SocketOutput {
         policy,
@@ -637,7 +649,7 @@ fn submit_ipv6(
         return Ok(clone_local.then_some(egress));
     }
     reservation
-        .commit_ipv6(route, identification, ct_context, mark)
+        .commit_ipv6(route, identification, ct_context, mark, before_enqueue)
         .map_err(|error| PmtuOutputError {
             error,
             mtu: Some(route.ip_mtu),

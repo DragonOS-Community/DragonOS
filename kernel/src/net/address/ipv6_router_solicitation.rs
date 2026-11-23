@@ -168,6 +168,12 @@ pub(super) fn poll(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>) -> Option<
         common.ipv6_autoconf.lock().solicitation.active = None;
         return None;
     };
+    if first {
+        let mut device = common.ipv6_autoconf.lock();
+        let state = &mut device.solicitation;
+        state.generation = state.generation.wrapping_add(1);
+        state.sent_on_link = false;
+    }
     let _ = send_ndisc(
         netns,
         iface.as_ref(),
@@ -176,15 +182,12 @@ pub(super) fn poll(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>) -> Option<
         NdiscRepr::RouterSolicit {
             lladdr: Some(RawHardwareAddress::from_bytes(iface.mac().as_bytes())),
         },
+        // Receive-side RA processing can observe the peer's reply before
+        // this call returns. Publish the generation at TX queue admission.
+        || common.ipv6_autoconf.lock().solicitation.sent_on_link = true,
     );
     next_series.deadline = Instant::now().total_micros().saturating_add(wait);
-    let mut device = common.ipv6_autoconf.lock();
-    let state = &mut device.solicitation;
-    if first {
-        state.generation = state.generation.wrapping_add(1);
-        state.sent_on_link = true;
-    }
-    state.active = Some(next_series);
+    common.ipv6_autoconf.lock().solicitation.active = Some(next_series);
     Some(next_series.deadline)
 }
 

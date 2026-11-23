@@ -1891,20 +1891,34 @@ impl InterfaceInner {
         assert!(!ip_repr.dst_addr().is_unspecified());
         // Neighbor discovery belongs to the current link, including unicast
         // advertisements. It must not follow an external namespace route.
-        let link_local_control = match &packet {
+        let class = match &packet {
             #[cfg(all(
                 feature = "proto-ipv6",
                 any(feature = "medium-ethernet", feature = "medium-ieee802154")
             ))]
-            Packet::Ipv6(packet) => matches!(
-                packet.payload,
-                IpPayload::Icmpv6(Icmpv6Repr::Ndisc(_))
-                    | IpPayload::HopByHopIcmpv6(_, Icmpv6Repr::Ndisc(_))
-            ),
+            Packet::Ipv6(packet)
+                if matches!(
+                    packet.payload,
+                    IpPayload::Icmpv6(Icmpv6Repr::Ndisc(_))
+                        | IpPayload::HopByHopIcmpv6(_, Icmpv6Repr::Ndisc(_))
+                ) =>
+            {
+                IpOutputClass::LinkLocalControl
+            }
+            #[cfg(feature = "proto-ipv6")]
+            Packet::Ipv6(packet)
+                if matches!(
+                    packet.payload,
+                    IpPayload::Icmpv6(Icmpv6Repr::EchoReply { .. })
+                ) =>
+            {
+                IpOutputClass::Ipv6EchoReply
+            }
             #[allow(unreachable_patterns)]
-            _ => false,
+            _ => IpOutputClass::Ordinary,
         };
-        if tx_token.deferred_ip_output(ip_repr.version()) {
+        let link_local_control = class == IpOutputClass::LinkLocalControl;
+        if tx_token.deferred_ip_output(ip_repr.version(), class) {
             let len = ip_repr.buffer_len();
             match ip_repr {
                 #[cfg(feature = "proto-ipv4")]
@@ -1917,11 +1931,6 @@ impl InterfaceInner {
                 }
                 _ => {}
             }
-            let class = if link_local_control {
-                IpOutputClass::LinkLocalControl
-            } else {
-                IpOutputClass::Ordinary
-            };
             #[cfg(feature = "proto-ipv4-fragmentation")]
             let ipv4_fragment_ident =
                 matches!(&ip_repr, IpRepr::Ipv4(_)).then(|| self.next_ipv4_frag_ident());

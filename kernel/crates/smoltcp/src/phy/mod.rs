@@ -428,7 +428,7 @@ pub trait TxToken {
     /// Whether this token hands a complete, serialized IP packet to its
     /// integration before smoltcp performs neighbor lookup or fragmentation.
     /// The default leaves all output ownership with smoltcp.
-    fn deferred_ip_output(&self, _version: crate::wire::IpVersion) -> bool {
+    fn deferred_ip_output(&self, _version: crate::wire::IpVersion, _class: IpOutputClass) -> bool {
         false
     }
 
@@ -500,11 +500,13 @@ pub trait TxToken {
     fn set_meta(&mut self, meta: PacketMeta) {}
 }
 
-/// Routing scope for an integration-owned, locally generated IP packet.
+/// Output policy for an integration-owned, locally generated IP packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum IpOutputClass {
     Ordinary,
+    /// A locally generated echo reply may need IPv6 source fragmentation.
+    Ipv6EchoReply,
     /// IPv6 neighbor discovery must use the current link, not a namespace
     /// route, but it still traverses the IPv6 LOCAL_OUT policy.
     LinkLocalControl,

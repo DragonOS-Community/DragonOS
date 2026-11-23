@@ -470,6 +470,8 @@ class Ipv6RoutedOutput : public testing::Test {
         ASSERT_NO_FATAL_FAILURE(Segment(0x14, kPeerSequence + 1 + sizeof(reply), client_next_));
     }
     void VerifyOversizeUdp(bool cold_neighbor);
+    void ReceiveFragments(const in6_addr& source, uint8_t protocol, bool cold_neighbor,
+                          std::vector<unsigned char>& reassembled);
 };
 
 TEST_F(Ipv6RoutedOutput, ExplicitSourceUsesFibEgressAndReceivesOnOwner) {
@@ -641,6 +643,19 @@ void Ipv6RoutedOutput::VerifyOversizeUdp(bool cold_neighbor) {
               static_cast<ssize_t>(payload.size())) << strerror(errno);
 
     std::vector<unsigned char> reassembled(payload.size() + 8);
+    ASSERT_NO_FATAL_FAILURE(ReceiveFragments(source_, IPPROTO_UDP, cold_neighbor, reassembled));
+    EXPECT_EQ(Get16(reassembled.data() + 2), kPeerPort);
+    EXPECT_EQ(Get16(reassembled.data() + 4), reassembled.size());
+    EXPECT_EQ(memcmp(reassembled.data() + 8, payload.data(), payload.size()), 0);
+    unsigned char pseudo_ip[40]{};
+    memcpy(pseudo_ip + 8, &source_, 16);
+    memcpy(pseudo_ip + 24, &peer_, 16);
+    EXPECT_EQ(Checksum(pseudo_ip, reassembled.data(), reassembled.size(), IPPROTO_UDP), 0);
+}
+
+void Ipv6RoutedOutput::ReceiveFragments(const in6_addr& source, uint8_t protocol,
+                                       bool cold_neighbor,
+                                       std::vector<unsigned char>& reassembled) {
     std::vector<bool> received(reassembled.size(), false);
     uint32_t fragment_id = 0;
     bool have_id = false, saw_last = false;
@@ -667,8 +682,8 @@ void Ipv6RoutedOutput::VerifyOversizeUdp(bool cold_neighbor) {
             answered_at = std::chrono::steady_clock::now();
             continue;
         }
-        if (ip[6] != IPPROTO_FRAGMENT || memcmp(ip + 8, &source_, 16) ||
-            memcmp(ip + 24, &peer_, 16) || ip[40] != IPPROTO_UDP) continue;
+        if (ip[6] != IPPROTO_FRAGMENT || memcmp(ip + 8, &source, 16) ||
+            memcmp(ip + 24, &peer_, 16) || ip[40] != protocol) continue;
         if (cold_neighbor) {
             ASSERT_TRUE(answered) << "fragments bypassed the cold neighbor probe";
         }
@@ -696,19 +711,63 @@ void Ipv6RoutedOutput::VerifyOversizeUdp(bool cold_neighbor) {
     }
     ASSERT_TRUE(have_id && saw_last);
     ASSERT_EQ(filled, reassembled.size());
-    EXPECT_EQ(Get16(reassembled.data() + 2), kPeerPort);
-    EXPECT_EQ(Get16(reassembled.data() + 4), reassembled.size());
-    EXPECT_EQ(memcmp(reassembled.data() + 8, payload.data(), payload.size()), 0);
-    unsigned char pseudo_ip[40]{};
-    memcpy(pseudo_ip + 8, &source_, 16);
-    memcpy(pseudo_ip + 24, &peer_, 16);
-    EXPECT_EQ(Checksum(pseudo_ip, reassembled.data(), reassembled.size(), IPPROTO_UDP), 0);
 }
 TEST_F(Ipv6RoutedOutput, OversizeUdpIsSourceFragmentedAfterOneSend) {
     ASSERT_NO_FATAL_FAILURE(VerifyOversizeUdp(false));
 }
 TEST_F(Ipv6RoutedOutput, ColdNeighborOversizeUdpIsSourceFragmentedAfterOneSend) {
     ASSERT_NO_FATAL_FAILURE(VerifyOversizeUdp(true));
+}
+
+TEST_F(Ipv6RoutedOutput, ReassembledEchoRequestGetsSourceFragmentedReply) {
+    constexpr size_t mtu = 1280;
+    constexpr size_t fragment_payload = mtu - 40 - 8;
+    constexpr uint16_t identifier = 0x2324;
+    ASSERT_EQ(SetMtu(mtu), 0) << strerror(errno);
+    std::vector<unsigned char> request(8 + 2000);
+    request[0] = 128;  // ICMPv6 Echo Request
+    Put16(request.data() + 4, identifier);
+    Put16(request.data() + 6, 1);
+    for (size_t index = 8; index < request.size(); ++index) {
+        request[index] = (index * 17 + 9) % 251;
+    }
+    unsigned char pseudo_ip[40]{};
+    memcpy(pseudo_ip + 8, &peer_, 16);
+    memcpy(pseudo_ip + 24, &egress_address_, 16);
+    Put16(request.data() + 2, Checksum(pseudo_ip, request.data(), request.size(), IPPROTO_ICMPV6));
+
+    for (size_t offset = 0; offset < request.size(); offset += fragment_payload) {
+        const size_t payload_size = std::min(fragment_payload, request.size() - offset);
+        const bool more = offset + payload_size < request.size();
+        std::vector<unsigned char> frame(14 + 40 + 8 + payload_size);
+        memcpy(frame.data(), egress_mac_.data(), 6);
+        memcpy(frame.data() + 6, peer_mac_.data(), 6);
+        Put16(frame.data() + 12, ETH_P_IPV6);
+        auto* ip = frame.data() + 14;
+        ip[0] = 0x60;
+        Put16(ip + 4, 8 + payload_size);
+        ip[6] = IPPROTO_FRAGMENT;
+        ip[7] = 64;
+        memcpy(ip + 8, &peer_, 16);
+        memcpy(ip + 24, &egress_address_, 16);
+        auto* fragment = ip + 40;
+        fragment[0] = IPPROTO_ICMPV6;
+        Put16(fragment + 2, offset | (more ? 1 : 0));
+        Put32(fragment + 4, 0x232434);
+        memcpy(fragment + 8, request.data() + offset, payload_size);
+        ASSERT_NO_FATAL_FAILURE(SendFrame(frame));
+    }
+
+    std::vector<unsigned char> reply(request.size());
+    ASSERT_NO_FATAL_FAILURE(ReceiveFragments(egress_address_, IPPROTO_ICMPV6, false, reply));
+    EXPECT_EQ(reply[0], 129);  // ICMPv6 Echo Reply
+    EXPECT_EQ(reply[1], 0);
+    EXPECT_EQ(Get16(reply.data() + 4), identifier);
+    EXPECT_EQ(Get16(reply.data() + 6), 1);
+    EXPECT_EQ(memcmp(reply.data() + 8, request.data() + 8, request.size() - 8), 0);
+    memcpy(pseudo_ip + 8, &egress_address_, 16);
+    memcpy(pseudo_ip + 24, &peer_, 16);
+    EXPECT_EQ(Checksum(pseudo_ip, reply.data(), reply.size(), IPPROTO_ICMPV6), 0);
 }
 TEST_F(Ipv6RoutedOutput, MissingBoundDeviceRouteDoesNotConsumeSocket) {
     client_.reset(socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0));

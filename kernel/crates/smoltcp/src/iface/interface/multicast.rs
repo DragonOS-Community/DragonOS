@@ -710,7 +710,7 @@ mod policy_tests {
     }
 
     impl TxToken for RejectToken<'_> {
-        fn deferred_ip_output(&self, _: IpVersion) -> bool {
+        fn deferred_ip_output(&self, _: IpVersion, _: crate::phy::IpOutputClass) -> bool {
             true
         }
 

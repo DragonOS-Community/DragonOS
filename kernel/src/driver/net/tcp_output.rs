@@ -181,7 +181,11 @@ impl SmolTxToken for TcpTxToken<'_> {
         self.0.prepare_buffer(len)
     }
 
-    fn deferred_ip_output(&self, _: smoltcp::wire::IpVersion) -> bool {
+    fn deferred_ip_output(
+        &self,
+        _: smoltcp::wire::IpVersion,
+        _: smoltcp::phy::IpOutputClass,
+    ) -> bool {
         true
     }
 

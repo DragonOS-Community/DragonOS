@@ -1,4 +1,5 @@
 use super::*;
+use smoltcp::phy::IpOutputClass;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum IfacePollScope {
@@ -215,9 +216,13 @@ impl OutputBackendPolicy<'_> {
             .is_some_and(|ruleset| ruleset.generation == self.netns.nftables().generation())
     }
 
-    fn requires_output_admission(self, version: smoltcp::wire::IpVersion) -> bool {
+    fn requires_output_admission(
+        self,
+        version: smoltcp::wire::IpVersion,
+        class: IpOutputClass,
+    ) -> bool {
         self.ruleset.is_some_and(|ruleset| {
-            if ruleset.conntrack_registered(version) {
+            if class == IpOutputClass::Ipv6EchoReply || ruleset.conntrack_registered(version) {
                 return true;
             }
             let has_hook = |hook| match version {
@@ -1345,15 +1350,16 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             .map_err(|_| smoltcp::phy::TxEgressError::Exhausted)
     }
 
-    fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion) -> bool {
-        self.backend_policy.requires_output_admission(version)
+    fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion, class: IpOutputClass) -> bool {
+        self.backend_policy
+            .requires_output_admission(version, class)
     }
 
     fn consume_full_ip<F>(
         mut self,
         len: usize,
         meta: PacketMeta,
-        class: smoltcp::phy::IpOutputClass,
+        class: IpOutputClass,
         ipv4_fragment_ident: Option<u16>,
         emit: F,
     ) -> Result<(), smoltcp::phy::IpOutputError>
@@ -1381,7 +1387,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 .map_err(|_| IpOutputError::NoRoute)?,
             Err(_) => return Err(IpOutputError::NoRoute),
         };
-        let mut route = if class == smoltcp::phy::IpOutputClass::LinkLocalControl
+        let mut route = if class == IpOutputClass::LinkLocalControl
             || destination.version() == IpVersion::Ipv6
                 && destination.is_multicast()
                 && self.backend_policy.owner_ifindex != 0
@@ -1494,27 +1500,18 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 .validate_ipv4_output_source(route, source)
                 .map_err(|_| IpOutputError::NoRoute)?;
         }
-        let disposition = if route.kind == crate::net::route::RTN_LOCAL {
-            LocalOutputDisposition::Local {
-                oif: route.oif,
-                ip_mtu: route.ip_mtu,
-            }
-        } else if matches!(
-            route.kind,
-            crate::net::route::RTN_UNICAST
-                | crate::net::route::RTN_BROADCAST
-                | crate::net::route::RTN_MULTICAST
-        ) {
-            LocalOutputDisposition::Routed {
-                oif: route.oif,
-                next_hop: route.next_hop,
-                ip_mtu: route.ip_mtu,
-            }
-        } else {
+        let local = route.kind == crate::net::route::RTN_LOCAL;
+        if !local
+            && !matches!(
+                route.kind,
+                crate::net::route::RTN_UNICAST
+                    | crate::net::route::RTN_BROADCAST
+                    | crate::net::route::RTN_MULTICAST
+            )
+        {
             return Err(IpOutputError::NoRoute);
-        };
-        let ip_mtu = route.ip_mtu;
-        let hook_oif = if route.kind == crate::net::route::RTN_LOCAL {
+        }
+        let hook_oif = if local {
             crate::net::LOOPBACK_IFINDEX as u32
         } else {
             route.oif
@@ -1574,7 +1571,9 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         let mark = ct.mark();
         let ct_context = ct.confirm().map_err(|_| IpOutputError::PolicyDrop)?;
         let tcp_packet = if ipv4 { bytes[9] == 6 } else { bytes[6] == 6 };
-        if tcp_packet {
+        let ipv6_echo_reply = class == IpOutputClass::Ipv6EchoReply;
+        let mut ip_mtu = route.ip_mtu;
+        if tcp_packet || ipv6_echo_reply {
             let (source, destination) = if ipv4 {
                 let ip =
                     Ipv4Packet::new_checked(&bytes[..]).map_err(|_| IpOutputError::MtuExceeded)?;
@@ -1597,17 +1596,32 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 destination,
             )
             .path;
-            if len > effective {
+            if tcp_packet && len > effective {
                 return Err(IpOutputError::MtuRetry(effective));
+            }
+            if ipv6_echo_reply {
+                ip_mtu = effective;
             }
         }
         let may_fragment = if ipv4 {
             prepare_deferred_ipv4_for_mtu(bytes, ip_mtu, ipv4_fragment_ident)?
         } else {
-            if len > ip_mtu {
+            if len > ip_mtu && !ipv6_echo_reply {
                 return Err(IpOutputError::MtuExceeded);
             }
             false
+        };
+        let disposition = if local {
+            LocalOutputDisposition::Local {
+                oif: route.oif,
+                ip_mtu,
+            }
+        } else {
+            LocalOutputDisposition::Routed {
+                oif: route.oif,
+                next_hop: route.next_hop,
+                ip_mtu,
+            }
         };
         if ipv4 {
             let frame = self.scratch.take().ok_or(IpOutputError::Exhausted)?;
@@ -1751,15 +1765,16 @@ impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
         }
     }
 
-    fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion) -> bool {
-        self.backend_policy.requires_output_admission(version)
+    fn deferred_ip_output(&self, version: smoltcp::wire::IpVersion, class: IpOutputClass) -> bool {
+        self.backend_policy
+            .requires_output_admission(version, class)
     }
 
     fn consume_full_ip<F>(
         self,
         len: usize,
         meta: PacketMeta,
-        class: smoltcp::phy::IpOutputClass,
+        class: IpOutputClass,
         ipv4_fragment_ident: Option<u16>,
         emit: F,
     ) -> Result<(), smoltcp::phy::IpOutputError>

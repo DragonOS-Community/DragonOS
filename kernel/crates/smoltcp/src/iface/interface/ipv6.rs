@@ -194,6 +194,9 @@ impl InterfaceInner {
         scratch: &'frame mut crate::storage::PacketBytes,
         filter: &mut dyn IpIngressFilter,
     ) -> Option<Packet<'frame>> {
+        if !self.ipv6_enabled {
+            return None;
+        }
         // The integration may retain a Forward packet before the local
         // protocol stack sees it. Apply the receive-core checks that precede
         // Linux PRE_ROUTING before exposing bytes to the filter.
@@ -304,6 +307,9 @@ impl InterfaceInner {
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
     ) -> Option<Packet<'frame>> {
+        if !self.ipv6_enabled {
+            return None;
+        }
         self.process_ipv6_inner(
             sockets,
             meta,

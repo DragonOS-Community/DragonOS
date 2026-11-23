@@ -38,6 +38,11 @@ use super::{Iface, IfaceCommon, MtuBounds};
 
 const DEVICE_NAME: &str = "loopback";
 /// Linux's userspace-visible loopback MTU and packet-buffer capacity.
+pub(crate) const LOOPBACK_IPV6_CIDR: IpCidr = IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(
+    smoltcp::wire::Ipv6Address::LOCALHOST,
+    128,
+));
+
 const LOOPBACK_MTU: usize = 64 * 1024;
 /// IPv4 requires room for its minimum header. smoltcp also uses this lower
 /// bound for its shared IPv4/IPv6 MTU, independently of Linux's administrative
@@ -410,14 +415,12 @@ impl LoopbackInterface {
         let addr = IpAddress::v4(127, 0, 0, 1);
         let cidr = IpCidr::new(addr, 8);
 
-        // IPv6 loopback address ::1/128 (Linux 默认在 lo 上配置)。
-        let addr6 = IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1);
-        let cidr6 = IpCidr::new(addr6, 128);
-
         //设置网卡地址为127.0.0.1
         iface.update_ip_addrs(|ip_addrs| {
             ip_addrs.push(cidr).expect("Push ipCidr failed: full");
-            ip_addrs.push(cidr6).expect("Push ipCidr failed: full");
+            ip_addrs
+                .push(LOOPBACK_IPV6_CIDR)
+                .expect("Push ipCidr failed: full");
         });
 
         // Like Linux's gen_lo_setup(), construction records only the
@@ -660,9 +663,12 @@ impl Iface for LoopbackInterface {
 
     fn route_and_send(
         &self,
-        _next_hop: &smoltcp::wire::IpAddress,
+        next_hop: &smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(), super::RouteSendError> {
+        if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 && !self.common().ipv6_enabled() {
+            return Err(SystemError::ENETDOWN.into());
+        }
         if ip_packet.len() > self.mtu() {
             return Err(SystemError::EMSGSIZE.into());
         }

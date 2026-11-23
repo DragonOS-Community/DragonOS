@@ -496,19 +496,45 @@ impl DeferredRouteQueue {
         mut is_resolved: impl FnMut(smoltcp::wire::IpAddress) -> bool,
         ready: &mut OutputQueue,
     ) {
+        self.retain_buckets(|bucket| {
+            if !is_resolved(bucket.key.next_hop) {
+                return true;
+            }
+            if bucket.probe_in_flight {
+                bucket.resolved = true;
+                true
+            } else {
+                ready.append(&mut bucket.packets);
+                false
+            }
+        });
+    }
+
+    pub(super) fn fail_ipv6(&mut self, ready: &mut OutputQueue) -> bool {
+        let mut failed = false;
+        self.retain_buckets(|bucket| {
+            if !matches!(bucket.key.next_hop, smoltcp::wire::IpAddress::Ipv6(_)) {
+                return true;
+            }
+            for queued in bucket.packets.iter_mut() {
+                queued.packet_mut().disposition = LocalOutputDisposition::Drop;
+            }
+            failed |= !bucket.packets.is_empty();
+            ready.append(&mut bucket.packets);
+            false
+        });
+        failed
+    }
+
+    fn retain_buckets(&mut self, mut retain: impl FnMut(&mut DeferredRouteBucket) -> bool) {
         let original_len = self.heap.len();
         let mut retained = 0;
         for current in 0..original_len {
             let bucket = &mut self.heap[current];
-            if is_resolved(bucket.key.next_hop) {
-                if bucket.probe_in_flight {
-                    bucket.resolved = true;
-                } else {
-                    ready.append(&mut bucket.packets);
-                    let removed_slot = self.index.remove(bucket.key.packed());
-                    debug_assert!(removed_slot.is_some());
-                    continue;
-                }
+            if !retain(bucket) {
+                let removed_slot = self.index.remove(bucket.key.packed());
+                debug_assert!(removed_slot.is_some());
+                continue;
             }
             // Stable in-place compaction: removed, now-empty buckets move to
             // the tail without allocating or changing any retained node IDs.

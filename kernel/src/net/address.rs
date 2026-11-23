@@ -43,13 +43,141 @@ pub(crate) struct RemovedAddress {
     pub broadcast: Option<Ipv4Address>,
 }
 
-pub(in crate::net) struct PreparedMtuAddressChange {
+pub(in crate::net) struct PreparedLinkAddressChange {
     routes: crate::net::route::PreparedAddressRouteCommit,
     removed: Vec<RemovedAddress>,
-    renamed_ipv4: Vec<IpCidr>,
+    changed_addresses: Vec<IpCidr>,
 }
 
-impl PreparedMtuAddressChange {
+fn prepare_address_removal(
+    iface: &Arc<dyn Iface>,
+    after: &mut Vec<IpCidr>,
+    metadata: &mut Vec<AddressMetadata>,
+    matches: impl Fn(IpCidr) -> bool,
+) -> Result<(Vec<RemovedAddress>, Vec<IpAddress>), SystemError> {
+    let removal_count = after.iter().copied().filter(|cidr| matches(*cidr)).count();
+    if removal_count == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let default_label = try_default_label(iface)?;
+    let mut removed = Vec::new();
+    removed
+        .try_reserve_exact(removal_count)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let mut deleted_addresses = Vec::new();
+    deleted_addresses
+        .try_reserve_exact(removal_count)
+        .map_err(|_| SystemError::ENOMEM)?;
+
+    let mut index = 0;
+    while index < after.len() {
+        let cidr = after[index];
+        if !matches(cidr) {
+            index += 1;
+            continue;
+        }
+        after.remove(index);
+        deleted_addresses.push(cidr.address());
+        let (label, broadcast) =
+            if let Some(metadata_index) = metadata.iter().position(|entry| entry.cidr == cidr) {
+                let entry = metadata.remove(metadata_index);
+                let label = match entry.label {
+                    Some(label) => label,
+                    None => try_clone_cstring(&default_label)?,
+                };
+                (label, entry.broadcast)
+            } else {
+                (try_clone_cstring(&default_label)?, None)
+            };
+        removed.push(RemovedAddress {
+            cidr,
+            label,
+            broadcast,
+        });
+    }
+
+    Ok((removed, deleted_addresses))
+}
+
+pub(crate) fn set_device_ipv6_disabled(
+    rtnl: &RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    value: i32,
+) -> Result<(), SystemError> {
+    let enabled = value == 0;
+    if iface.common().ipv6_enabled() == enabled {
+        iface.common().publish_ipv6_disabled(value);
+        return Ok(());
+    }
+
+    let flags = iface.common().flags();
+    let up = flags.contains(InterfaceFlags::UP);
+    let mirror = iface.router_common().ip_addrs.read();
+    let restored = (enabled && up)
+        .then(|| missing_loopback_ipv6_address(iface, iface.mtu(), &mirror))
+        .flatten();
+    let before = try_clone_copy_slice(&mirror, 0)?;
+    let mut after = try_clone_copy_slice(&mirror, usize::from(restored.is_some()))?;
+    drop(mirror);
+
+    let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
+    let (removed_addresses, deleted_addresses) =
+        prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
+            !enabled && matches!(cidr, IpCidr::Ipv6(_))
+        })?;
+    after.extend(restored);
+    let routes = crate::net::route::prepare_address_link_change(
+        netns,
+        iface,
+        crate::net::route::AddressLinkChange {
+            before: &before,
+            after: &after,
+            metadata,
+            deleted_addresses: &deleted_addresses,
+            was_up: up,
+            is_up: up,
+            ipv6_enabled: Some(enabled),
+        },
+    )?;
+    let neighbors = if enabled {
+        None
+    } else {
+        Some(crate::net::neighbor::prepare_configured_iface_purge(
+            rtnl,
+            netns,
+            iface.nic_id() as u32,
+            true,
+        )?)
+    };
+
+    // Block IPv6 ingress before withdrawing its state. When enabling,
+    // publish the state before opening ingress.
+    let route_changes = routes.publish_link_change(
+        netns,
+        iface,
+        None,
+        || {},
+        || iface.common().publish_ipv6_disabled(value),
+        enabled,
+    );
+    if !enabled {
+        iface.common().fail_deferred_ipv6();
+    }
+    let removed_neighbors = neighbors.map_or_else(Vec::new, |prepared| prepared.publish());
+
+    crate::net::socket::netlink::notify_iface_protocol_change(
+        netns,
+        iface,
+        removed_addresses,
+        restored,
+        Some(route_changes),
+        removed_neighbors,
+    );
+    Ok(())
+}
+
+impl PreparedLinkAddressChange {
     pub(in crate::net) fn candidate(&self) -> &crate::net::route::FibTable {
         self.routes.candidate()
     }
@@ -263,81 +391,72 @@ fn prepare_renamed_metadata(
     Ok((metadata, renamed_ipv4))
 }
 
-/// The caller holds RTNL while preparing and publishing the adjacent link
-/// mutation; a staged FIB is used when another link update in this transaction
-/// has already prepared a route change.
-pub(in crate::net) fn prepare_mtu_address_change(
-    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+fn missing_loopback_ipv6_address(
     iface: &Arc<dyn Iface>,
     mtu: usize,
+    addresses: &[IpCidr],
+) -> Option<IpCidr> {
+    let default = crate::driver::net::loopback::LOOPBACK_IPV6_CIDR;
+    (mtu >= IPV6_MIN_MTU
+        && iface.flags().contains(InterfaceFlags::LOOPBACK)
+        && !addresses
+            .iter()
+            .any(|cidr| cidr.address() == default.address()))
+    .then_some(default)
+}
+
+/// Prepare address changes caused by an MTU change or a loopback link-up.
+pub(in crate::net) fn prepare_link_address_change(
+    netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    mtu: Option<usize>,
     renamed_to: Option<&str>,
     was_up: bool,
     is_up: bool,
     staged_before: Option<&crate::net::route::FibTable>,
-) -> Result<Option<PreparedMtuAddressChange>, SystemError> {
+) -> Result<Option<PreparedLinkAddressChange>, SystemError> {
+    let loopback_up = is_up
+        && !was_up
+        && iface.common().ipv6_enabled()
+        && iface.flags().contains(InterfaceFlags::LOOPBACK);
+    if mtu.is_none() && !loopback_up {
+        return Ok(None);
+    }
     let mirror = iface.router_common().ip_addrs.read();
-    let before = try_clone_copy_slice(&mirror, 0)?;
-    let mut after = try_clone_copy_slice(&mirror, 0)?;
-    drop(mirror);
-
-    let removal_count = after
-        .iter()
-        .filter(|cidr| match cidr {
+    let restored = if loopback_up {
+        missing_loopback_ipv6_address(iface, mtu.unwrap_or_else(|| iface.mtu()), &mirror)
+    } else {
+        None
+    };
+    let needs_removal = |cidr| {
+        mtu.is_some_and(|mtu| match cidr {
             IpCidr::Ipv4(_) => mtu < IPV4_MIN_MTU,
             IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
         })
-        .count();
-    if removal_count == 0 {
+    };
+    if restored.is_none() && !mirror.iter().copied().any(needs_removal) {
         return Ok(None);
     }
+    let before = try_clone_copy_slice(&mirror, 0)?;
+    let mut after = try_clone_copy_slice(&mirror, usize::from(restored.is_some()))?;
+    drop(mirror);
 
     let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
-    let default_label = try_default_label(iface)?;
-    let mut removed = Vec::new();
-    removed
-        .try_reserve_exact(removal_count)
-        .map_err(|_| SystemError::ENOMEM)?;
-    let mut deleted_addresses = Vec::new();
-    deleted_addresses
-        .try_reserve_exact(removal_count)
-        .map_err(|_| SystemError::ENOMEM)?;
+    let (removed, deleted_addresses) =
+        prepare_address_removal(iface, &mut after, &mut metadata, needs_removal)?;
 
-    let mut index = 0;
-    while index < after.len() {
-        let cidr = after[index];
-        let remove = match cidr {
-            IpCidr::Ipv4(_) => mtu < IPV4_MIN_MTU,
-            IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
-        };
-        if !remove {
-            index += 1;
-            continue;
-        }
-        after.remove(index);
-        deleted_addresses.push(cidr.address());
-        let (label, broadcast) =
-            if let Some(metadata_index) = metadata.iter().position(|entry| entry.cidr == cidr) {
-                let entry = metadata.remove(metadata_index);
-                let label = match entry.label {
-                    Some(label) => label,
-                    None => try_clone_cstring(&default_label)?,
-                };
-                (label, entry.broadcast)
-            } else {
-                (try_clone_cstring(&default_label)?, None)
-            };
-        removed.push(RemovedAddress {
-            cidr,
-            label,
-            broadcast,
-        });
-    }
-
-    let (metadata, renamed_ipv4) = if let Some(new_name) = renamed_to {
+    let (metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {
         prepare_renamed_metadata(iface, new_name, metadata)?
     } else {
         (metadata, Vec::new())
     };
+    if let Some(cidr) = restored {
+        after.push(cidr);
+        changed_addresses
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        changed_addresses.push(cidr);
+    }
     let change = crate::net::route::AddressLinkChange {
         before: &before,
         after: &after,
@@ -345,6 +464,7 @@ pub(in crate::net) fn prepare_mtu_address_change(
         deleted_addresses: &deleted_addresses,
         was_up,
         is_up,
+        ipv6_enabled: None,
     };
     let routes = match staged_before {
         Some(staged) => {
@@ -352,14 +472,14 @@ pub(in crate::net) fn prepare_mtu_address_change(
         }
         None => crate::net::route::prepare_address_link_change(netns, iface, change)?,
     };
-    Ok(Some(PreparedMtuAddressChange {
+    Ok(Some(PreparedLinkAddressChange {
         routes,
         removed,
-        renamed_ipv4,
+        changed_addresses,
     }))
 }
 
-impl PreparedMtuAddressChange {
+impl PreparedLinkAddressChange {
     pub(in crate::net) fn publish(
         self,
         netns: &Arc<crate::process::namespace::net_namespace::NetNamespace>,
@@ -376,7 +496,7 @@ impl PreparedMtuAddressChange {
         let Self {
             routes,
             removed,
-            renamed_ipv4,
+            changed_addresses,
         } = self;
         let route_changes = routes.publish_link_change(
             netns,
@@ -386,7 +506,7 @@ impl PreparedMtuAddressChange {
             publish_link_state,
             is_up,
         );
-        (removed, renamed_ipv4, route_changes)
+        (removed, changed_addresses, route_changes)
     }
 }
 
@@ -581,6 +701,9 @@ fn validate_published_address_addition(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
 ) -> Result<(), SystemError> {
+    if matches!(cidr, IpCidr::Ipv6(_)) && !iface.common().ipv6_enabled() {
+        return Err(SystemError::EACCES);
+    }
     // Linux destroys the IPv4 in_device once MTU drops below the protocol
     // minimum. A later address add cannot recreate it until the MTU is valid.
     // IPv6 differs: Linux permits an explicit add below 1280, so keep this

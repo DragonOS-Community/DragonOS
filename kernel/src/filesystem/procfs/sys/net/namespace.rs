@@ -1,4 +1,4 @@
-//! Namespace identity shared by an IPv4 sysctl directory and its files.
+//! Namespace identity shared by a network sysctl directory and its files.
 
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;

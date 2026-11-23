@@ -116,11 +116,13 @@ impl<D: SmolDevice + ?Sized> SmolDevice for NftGenerationDevice<'_, D> {
 pub struct IfaceCommon {
     pub(super) iface_id: usize,
     pub(super) name: RwLock<String>,
+    name_generation: AtomicU64,
     pub(super) flags: AtomicU32,
     pub(super) mtu: AtomicUsize,
     /// Linux-visible transmit queue length. The current devices do not have a
     /// software qdisc queue, so this is distinct from hardware ring capacity.
     tx_queue_len: AtomicU32,
+    ipv6_disabled: core::sync::atomic::AtomicI32,
     pub(super) type_: InterfaceType,
     tx_admission: tx_admission::TxAdmission,
     pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
@@ -274,6 +276,7 @@ impl IfaceCommon {
         IfaceCommon {
             iface_id,
             name: RwLock::new(name),
+            name_generation: AtomicU64::new(0),
             smol_iface: Mutex::new(iface),
             sockets: RwLock::new(Arc::new(Mutex::new(sockets))),
             bounds: RwLock::new(Arc::new(crate::net::tcp_bounds::BoundRegistry::new())),
@@ -287,6 +290,7 @@ impl IfaceCommon {
             router_common_data,
             flags: AtomicU32::new(flags.bits()),
             mtu: AtomicUsize::new(mtu),
+            ipv6_disabled: core::sync::atomic::AtomicI32::new(0),
             tx_queue_len: AtomicU32::new(1000),
             type_,
             tx_admission: tx_admission::TxAdmission::new(flags.contains(InterfaceFlags::UP)),
@@ -920,6 +924,7 @@ impl IfaceCommon {
                         configured_neighbors: configured_neighbors.as_ref(),
                         owner_ifindex: self.iface_id as u32,
                         owner_is_up,
+                        owner_ipv6_enabled: self.ipv6_enabled(),
                         authoritative_output,
                     });
 
@@ -1311,6 +1316,7 @@ impl IfaceCommon {
                         configured_neighbors: configured_neighbors.as_ref(),
                         owner_ifindex: self.iface_id as u32,
                         owner_is_up,
+                        owner_ipv6_enabled: self.ipv6_enabled(),
                         authoritative_output,
                     });
 
@@ -1753,12 +1759,7 @@ impl IfaceCommon {
                 }
             }
             let tx_generation = self.tx_completion_generation();
-            match transmit_local_stack_output(
-                &netns,
-                self.flags().contains(InterfaceFlags::UP),
-                device,
-                output,
-            ) {
+            match transmit_local_stack_output(&netns, Some(self), device, output) {
                 LocalOutputTransmitResult::Continue(output) => {
                     debug_assert!(output.prepared_ip.is_some());
                     in_flight.requeue_ready(output);
@@ -2111,7 +2112,15 @@ impl IfaceCommon {
     }
 
     pub fn set_name(&self, name: String) {
-        *self.name.write() = name;
+        let mut current = self.name.write();
+        if *current != name {
+            *current = name;
+            self.name_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn name_generation(&self) -> u64 {
+        self.name_generation.load(Ordering::Acquire)
     }
 
     /// Publish one prepared interface-name/address-label generation.
@@ -2127,7 +2136,10 @@ impl IfaceCommon {
         let mut current_metadata = self.address_metadata.lock();
         let mut current_name = self.name.write();
         *current_metadata = metadata;
-        *current_name = name;
+        if *current_name != name {
+            *current_name = name;
+            self.name_generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     pub fn flags(&self) -> InterfaceFlags {
@@ -2220,6 +2232,24 @@ impl IfaceCommon {
 
     pub(crate) fn open_tx(&self) {
         self.tx_admission.open();
+    }
+
+    pub(crate) fn fail_deferred_ipv6(&self) {
+        if self.local_input_queue.fail_deferred_ipv6() {
+            self.schedule_registered_local_output(crate::time::Instant::now().into());
+        }
+    }
+
+    pub(crate) fn ipv6_disabled_value(&self) -> i32 {
+        self.ipv6_disabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ipv6_enabled(&self) -> bool {
+        self.ipv6_disabled_value() == 0
+    }
+
+    pub(crate) fn publish_ipv6_disabled(&self, value: i32) {
+        self.ipv6_disabled.store(value, Ordering::Release);
     }
 
     pub fn set_mtu(&self, mtu: usize) {

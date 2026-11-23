@@ -1,4 +1,6 @@
-//! Namespace-scoped IPv6 forwarding control.
+//! Namespace and per-interface IPv6 sysctls.
+
+mod device;
 
 use crate::filesystem::procfs::template::ProcWriteCallback;
 use crate::filesystem::procfs::Builder;
@@ -19,28 +21,37 @@ use alloc::{
 use system_error::SystemError;
 
 use super::super::numeric::parse_numeric_sysctl;
+use super::namespace::SysctlNamespace;
+use device::DeviceDirOps;
 
 #[derive(Debug)]
-pub(super) struct Ipv6DirOps;
+pub(super) struct Ipv6DirOps(SysctlNamespace);
 
 #[derive(Debug)]
-struct ConfDirOps;
+struct ConfDirOps(SysctlNamespace);
 
 #[derive(Debug)]
 struct AllDirOps;
 
 impl Ipv6DirOps {
     pub(super) fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
-            .parent(parent)
-            .build()
-            .unwrap()
+        ProcDirBuilder::new(
+            Self(SysctlNamespace::current()),
+            InodeMode::from_bits_truncate(0o555),
+        )
+        .parent(parent)
+        .build()
+        .unwrap()
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        self.0.is_current()
     }
 }
 
 impl ConfDirOps {
-    fn new_inode(parent: Weak<dyn IndexNode>) -> Arc<dyn IndexNode> {
-        ProcDirBuilder::new(Self, InodeMode::from_bits_truncate(0o555))
+    fn new_inode(parent: Weak<dyn IndexNode>, namespace: SysctlNamespace) -> Arc<dyn IndexNode> {
+        ProcDirBuilder::new(Self(namespace), InodeMode::from_bits_truncate(0o555))
             .parent(parent)
             .build()
             .unwrap()
@@ -68,7 +79,7 @@ impl DirOps for Ipv6DirOps {
         let mut children = dir.cached_children().write();
         Ok(children
             .entry(name.to_string())
-            .or_insert_with(|| ConfDirOps::new_inode(dir.self_ref_weak().clone()))
+            .or_insert_with(|| ConfDirOps::new_inode(dir.self_ref_weak().clone(), self.0.clone()))
             .clone())
     }
 
@@ -76,31 +87,91 @@ impl DirOps for Ipv6DirOps {
         dir.cached_children()
             .write()
             .entry("conf".to_string())
-            .or_insert_with(|| ConfDirOps::new_inode(dir.self_ref_weak().clone()));
+            .or_insert_with(|| ConfDirOps::new_inode(dir.self_ref_weak().clone(), self.0.clone()));
     }
 }
 
 impl DirOps for ConfDirOps {
+    fn validate_inode(&self) -> Result<(), SystemError> {
+        self.0.upgrade().map(|_| ())
+    }
+
+    fn before_read_dir(&self) -> Result<(), SystemError> {
+        self.validate_inode()
+    }
+
+    fn validate_child(&self, child: &dyn IndexNode) -> bool {
+        child
+            .as_any_ref()
+            .downcast_ref::<ProcDir<DeviceDirOps>>()
+            .is_none_or(|inode| inode.ops().validate_inode().is_ok())
+    }
+
     fn lookup_child(
         &self,
         dir: &ProcDir<Self>,
         name: &str,
     ) -> Result<Arc<dyn IndexNode>, SystemError> {
-        if name != "all" {
-            return Err(SystemError::ENOENT);
+        let netns = self.0.upgrade()?;
+        if name == "all" {
+            return Ok(dir
+                .cached_children()
+                .write()
+                .entry(name.to_string())
+                .or_insert_with(|| AllDirOps::new_inode(dir.self_ref_weak().clone()))
+                .clone());
         }
-        let mut children = dir.cached_children().write();
-        Ok(children
-            .entry(name.to_string())
-            .or_insert_with(|| AllDirOps::new_inode(dir.self_ref_weak().clone()))
-            .clone())
+        let devices = netns.device_list();
+        for iface in devices.values() {
+            let child = iface.common().with_iface_name(|current_name| {
+                (current_name == name).then(|| self.cache_device(dir, name, iface))
+            });
+            if let Some(child) = child {
+                return Ok(child);
+            }
+        }
+        Err(SystemError::ENOENT)
     }
 
     fn populate_children(&self, dir: &ProcDir<Self>) {
+        let Ok(netns) = self.0.upgrade() else {
+            return;
+        };
+        let _ = self.lookup_child(dir, "all");
+        for iface in netns.device_list().values() {
+            iface.common().with_iface_name(|name| {
+                if name != "all" {
+                    self.cache_device(dir, name, iface);
+                }
+            });
+        }
         dir.cached_children()
             .write()
-            .entry("all".to_string())
-            .or_insert_with(|| AllDirOps::new_inode(dir.self_ref_weak().clone()));
+            .retain(|_, child| self.validate_child(child.as_ref()));
+    }
+}
+
+impl ConfDirOps {
+    fn cache_device(
+        &self,
+        dir: &ProcDir<Self>,
+        name: &str,
+        iface: &Arc<dyn crate::driver::net::Iface>,
+    ) -> Arc<dyn IndexNode> {
+        let mut children = dir.cached_children().write();
+        let identity = device::DeviceIdentity::new(self.0.clone(), iface);
+        if let Some(child) = children.get(name) {
+            if child
+                .as_any_ref()
+                .downcast_ref::<ProcDir<DeviceDirOps>>()
+                .is_some_and(|inode| inode.ops().has_identity(&identity))
+            {
+                return child.clone();
+            }
+        }
+        let inode = DeviceDirOps::new_inode(dir.self_ref_weak().clone(), identity);
+        children.insert(name.to_string(), inode.clone());
+        inode
     }
 }
 

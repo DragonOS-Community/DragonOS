@@ -32,8 +32,8 @@ mod route;
 mod utils;
 
 pub(crate) use link::{
-    notify_link_change, notify_link_commit, notify_link_delete, prepare_link_delete,
-    PreparedLinkDelete,
+    notify_iface_protocol_change, notify_link_change, notify_link_commit, notify_link_delete,
+    prepare_link_delete, PreparedLinkDelete,
 };
 
 /// Per-send authorization and routing state for userspace rtnetlink requests.

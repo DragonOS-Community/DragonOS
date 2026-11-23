@@ -400,6 +400,9 @@ pub trait Iface: crate::driver::base::device::Device {
         next_hop: &smoltcp::wire::IpAddress,
         ip_packet: &[u8],
     ) -> Result<(), RouteSendError> {
+        if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 && !self.common().ipv6_enabled() {
+            return Err(SystemError::ENETDOWN.into());
+        }
         // A short original packet may instead emit an ARP request or an
         // IPv6 Neighbor Solicitation (Ethernet + IPv6 + NS with SLLAO).
         let frame_capacity = ip_packet
@@ -501,7 +504,9 @@ pub trait Iface: crate::driver::base::device::Device {
         feedback: Option<&crate::net::forward_mtu::ForwardMtuFeedback>,
     ) -> Result<(), SystemError> {
         let next_hop = *next_hop;
-        if next_hop.version() == smoltcp::wire::IpVersion::Ipv6 && self.mtu() < 1280 {
+        if next_hop.version() == smoltcp::wire::IpVersion::Ipv6
+            && (self.mtu() < 1280 || !self.common().ipv6_enabled())
+        {
             // A static route can survive an MTU change which disabled IPv6
             // addresses on this link. It must not forward over that link.
             return Err(SystemError::ENETDOWN);

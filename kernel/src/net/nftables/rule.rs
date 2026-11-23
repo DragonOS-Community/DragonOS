@@ -1,12 +1,18 @@
 use super::*;
+use alloc::boxed::Box;
 
 #[derive(Debug)]
 pub(crate) struct NftRule {
     pub(crate) handle: u64,
     pub(super) expressions: Vec<NftExpression>,
+    pub(super) userdata: Box<[u8]>,
 }
 
 impl NftRule {
+    pub(crate) fn userdata(&self) -> &[u8] {
+        &self.userdata
+    }
+
     pub(super) fn requires_conntrack(&self) -> bool {
         self.expressions.iter().any(|expression| {
             matches!(

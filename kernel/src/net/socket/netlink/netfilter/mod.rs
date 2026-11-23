@@ -20,7 +20,7 @@ use super::{
 use crate::{
     libs::rwsem::RwSem,
     net::nftables::{
-        NewSetSpec, NftChain, NftChainType, NftExpressionInput, NftRule, NftSet,
+        NewRuleSpec, NewSetSpec, NftChain, NftChainType, NftExpressionInput, NftRule, NftSet,
         NftSetElementInput, NftTable, NftVerdict,
     },
     process::{
@@ -595,14 +595,15 @@ impl NetfilterKernelSocket {
                         }) {
                             xt_conntrack_compatible(attrs.compat)?;
                         }
-                        let (table, chain, rule) = transaction.new_ip_rule(
+                        let (table, chain, rule) = transaction.new_ip_rule(NewRuleSpec {
                             family,
-                            attrs.table.ok_or(SystemError::EINVAL)?,
-                            attrs.chain.ok_or(SystemError::EINVAL)?,
-                            &expressions,
-                            request.flags() & 0x800 != 0,
-                            attrs.position,
-                        )?;
+                            table_name: attrs.table.ok_or(SystemError::EINVAL)?,
+                            chain_name: attrs.chain.ok_or(SystemError::EINVAL)?,
+                            expressions: &expressions,
+                            userdata: attrs.userdata,
+                            append: request.flags() & 0x800 != 0,
+                            position: attrs.position,
+                        })?;
                         notifications
                             .try_reserve(1)
                             .map_err(|_| SystemError::ENOMEM)?;

@@ -198,6 +198,7 @@ mod hook_program_tests {
         assert_eq!(matcher.evaluate(&NftPacket::new_ipv6(&bytes)), None);
         let rule = NftRule {
             handle: 1,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::XtAddrtype(matcher)],
         };
         assert!(matches!(
@@ -224,6 +225,7 @@ mod hook_program_tests {
         info[2..4].copy_from_slice(&(1u16 << crate::net::route::RTN_LOCAL).to_ne_bytes());
         chain.rules.push(Arc::new(NftRule {
             handle: 2,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::XtAddrtype(
                 NftXtAddrtype::from_info(&info).unwrap(),
             )],
@@ -244,6 +246,7 @@ mod hook_program_tests {
         base.base.as_mut().unwrap().hook = NftIpv4Hook::LocalIn;
         base.rules.push(Arc::new(NftRule {
             handle: 3,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::Immediate(NftRuleVerdict::Jump(2))],
         }));
         let mut info = [0u8; 8];
@@ -254,6 +257,7 @@ mod hook_program_tests {
             base: None,
             rules: alloc::vec![Arc::new(NftRule {
                 handle: 4,
+                userdata: Default::default(),
                 expressions: alloc::vec![NftExpression::XtAddrtype(
                     NftXtAddrtype::from_info(&info).unwrap(),
                 )],
@@ -278,6 +282,7 @@ mod hook_program_tests {
         let rules = rule.map_or_else(Vec::new, |verdict| {
             alloc::vec![Arc::new(NftRule {
                 handle: 1,
+                userdata: Default::default(),
                 expressions: alloc::vec![NftExpression::Immediate(verdict)],
             })]
         });
@@ -331,6 +336,7 @@ mod hook_program_tests {
         let chain = Arc::get_mut(&mut table.chains[0]).unwrap();
         chain.rules.push(Arc::new(NftRule {
             handle: 2,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::CtState { dreg: 0 }],
         }));
         let mut candidate = snapshot(alloc::vec![ipv4]);
@@ -341,6 +347,7 @@ mod hook_program_tests {
         let chain = Arc::get_mut(&mut table.chains[0]).unwrap();
         chain.rules.push(Arc::new(NftRule {
             handle: 2,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::CtState { dreg: 0 }],
         }));
         candidate.tables.push(inet);
@@ -433,6 +440,7 @@ mod hook_program_tests {
         nat_chain.base.as_mut().unwrap().chain_type = NftChainType::Nat;
         nat_chain.rules.push(Arc::new(NftRule {
             handle: 2,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::XtNatTarget {
                 name: b"DNAT",
                 revision: 2,
@@ -480,6 +488,7 @@ mod hook_program_tests {
     fn redirect_requires_a_real_address_and_runs_as_dnat() {
         let rule = NftRule {
             handle: 1,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::Redirect {
                 flags: 0,
                 port_min: None,
@@ -525,48 +534,51 @@ mod hook_program_tests {
             )
             .unwrap();
         assert!(matches!(
-            transaction.new_ip_rule(
-                2,
-                b"nat",
-                b"pre",
-                &[NftExpressionInput::Redirect {
+            transaction.new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"nat",
+                chain_name: b"pre",
+                expressions: &[NftExpressionInput::Redirect {
                     flags: Some(4),
                     proto_min_reg: None,
                     proto_max_reg: None,
                 }],
-                true,
-                None,
-            ),
+                userdata: &[],
+                append: true,
+                position: None,
+            }),
             Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
         ));
         assert!(matches!(
-            transaction.new_ip_rule(
-                2,
-                b"nat",
-                b"pre",
-                &[NftExpressionInput::Redirect {
+            transaction.new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"nat",
+                chain_name: b"pre",
+                expressions: &[NftExpressionInput::Redirect {
                     flags: Some(2),
                     proto_min_reg: Some(8),
                     proto_max_reg: None,
                 }],
-                true,
-                None,
-            ),
+                userdata: &[],
+                append: true,
+                position: None,
+            }),
             Err(SystemError::ENODATA)
         ));
         transaction
-            .new_ip_rule(
-                2,
-                b"nat",
-                b"pre",
-                &[NftExpressionInput::Redirect {
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"nat",
+                chain_name: b"pre",
+                expressions: &[NftExpressionInput::Redirect {
                     flags: None,
                     proto_min_reg: None,
                     proto_max_reg: None,
                 }],
-                true,
-                None,
-            )
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         transaction.candidate.tables[0]
             .validate_reachable_chains()
@@ -587,18 +599,19 @@ mod hook_program_tests {
             )
             .unwrap();
         transaction
-            .new_ip_rule(
-                2,
-                b"nat",
-                b"post",
-                &[NftExpressionInput::Redirect {
+            .new_ip_rule(NewRuleSpec {
+                family: 2,
+                table_name: b"nat",
+                chain_name: b"post",
+                expressions: &[NftExpressionInput::Redirect {
                     flags: None,
                     proto_min_reg: None,
                     proto_max_reg: None,
                 }],
-                true,
-                None,
-            )
+                userdata: &[],
+                append: true,
+                position: None,
+            })
             .unwrap();
         assert!(matches!(
             transaction.candidate.tables[0].validate_reachable_chains(),
@@ -662,6 +675,7 @@ mod hook_program_tests {
             .rules
             .push(Arc::new(NftRule {
                 handle: 2,
+                userdata: Default::default(),
                 expressions: alloc::vec![NftExpression::Masquerade {
                     port_min: None,
                     port_max: None,
@@ -690,6 +704,7 @@ mod hook_program_tests {
         base.hook = NftIpv4Hook::PostRouting;
         chain.rules.push(Arc::new(NftRule {
             handle: 2,
+            userdata: Default::default(),
             expressions: alloc::vec![expression],
         }));
         assert!(table.validate_reachable_chains().is_ok());
@@ -753,6 +768,7 @@ mod hook_program_tests {
         base.base.as_mut().unwrap().hook = NftIpv4Hook::PostRouting;
         base.rules.push(Arc::new(NftRule {
             handle: 2,
+            userdata: Default::default(),
             expressions: alloc::vec![NftExpression::Immediate(NftRuleVerdict::Jump(3))],
         }));
         inner.chains.push(Arc::new(NftChain {
@@ -761,6 +777,7 @@ mod hook_program_tests {
             base: None,
             rules: alloc::vec![Arc::new(NftRule {
                 handle: 4,
+                userdata: Default::default(),
                 expressions: alloc::vec![NftExpression::XtNatTarget {
                     name: b"MASQUERADE",
                     revision: 0,

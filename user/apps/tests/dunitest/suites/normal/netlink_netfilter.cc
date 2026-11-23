@@ -33,6 +33,7 @@
 #include <cstring>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -1121,6 +1122,8 @@ struct RuleInfo {
   bool valid_bitwise_dump = true;
   std::vector<uint32_t> meta_keys;
   bool valid_meta_dump = true;
+  uint16_t generation = 0;
+  std::optional<std::vector<uint8_t>> userdata = std::nullopt;
 };
 
 struct NlaSpan {
@@ -1259,6 +1262,21 @@ std::vector<RuleInfo> ReceiveRuleDump(int fd, uint32_t seq) {
       }
       RuleInfo info{RuleU64Attr(reply, NFTA_RULE_HANDLE),
                     RuleU64Attr(reply, NFTA_RULE_POSITION), reply->nlmsg_flags};
+      constexpr size_t header_len = NLMSG_HDRLEN + sizeof(nfgenmsg);
+      if (reply->nlmsg_len < header_len) {
+        ADD_FAILURE() << "short rule dump message";
+        return rules;
+      }
+      const auto* raw = reinterpret_cast<const uint8_t*>(reply);
+      nfgenmsg gen{};
+      std::memcpy(&gen, raw + NLMSG_HDRLEN, sizeof(gen));
+      info.generation = ntohs(gen.res_id);
+      const auto userdata =
+          FindNla({raw + header_len, reply->nlmsg_len - header_len},
+                  NFTA_RULE_USERDATA);
+      if (userdata.data != nullptr) {
+        info.userdata.emplace(userdata.data, userdata.data + userdata.length);
+      }
       ReadRuleExpressions(reply, &info);
       rules.push_back(info);
     }
@@ -6898,11 +6916,13 @@ TEST(NetlinkNetfilter, NftDeletingTableNotifiesExistingRulesAndChains) {
   ASSERT_EQ(0, Bind(listener.get()));
 
   constexpr uint32_t seq = 294;
-  auto create = TableBatch(kNftNewtable, seq, "dkc035_delete_tree");
+  constexpr char table[] = "dkc035_delete_tree";
+  auto create = TableBatch(kNftNewtable, seq, table);
   create.resize(create.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
-  auto chain = NewChain(seq + 2, "dkc035_delete_tree", "regular");
-  auto rule = ImmediateRule(seq + 3, "dkc035_delete_tree", "regular",
-                            NF_ACCEPT, true);
+  auto chain = NewChain(seq + 2, table, "regular");
+  auto rule = ImmediateRule(seq + 3, table, "regular", NF_ACCEPT, true);
+  constexpr std::array<uint8_t, 3> userdata{0x00, 0xff, 0x41};
+  AppendRawAttr(&rule, NFTA_RULE_USERDATA, userdata.data(), userdata.size());
   create.insert(create.end(), chain.begin(), chain.end());
   create.insert(create.end(), rule.begin(), rule.end());
   auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
@@ -6915,7 +6935,7 @@ TEST(NetlinkNetfilter, NftDeletingTableNotifiesExistingRulesAndChains) {
   int group = NFNLGRP_NFTABLES;
   ASSERT_EQ(0, setsockopt(listener.get(), SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
                            &group, sizeof(group)));
-  auto remove = TableBatch(kNftDeltable, seq + 5, "dkc035_delete_tree");
+  auto remove = TableBatch(kNftDeltable, seq + 5, table);
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(writer.get(), remove));
   Ack(writer.get(), seq + 6, 0, kNftDeltable);
 
@@ -6931,7 +6951,21 @@ TEST(NetlinkNetfilter, NftDeletingTableNotifiesExistingRulesAndChains) {
     int remaining = count;
     for (auto* message = reinterpret_cast<nlmsghdr*>(bytes.data());
          NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
-      saw_rule |= message->nlmsg_type == kNftDelrule;
+      if (message->nlmsg_type == kNftDelrule) {
+        constexpr size_t header_len = NLMSG_HDRLEN + sizeof(nfgenmsg);
+        ASSERT_GE(message->nlmsg_len, header_len);
+        const auto* raw = reinterpret_cast<const uint8_t*>(message);
+        const NlaSpan attrs{raw + header_len, message->nlmsg_len - header_len};
+        const auto owner = FindNla(attrs, NFTA_RULE_TABLE);
+        if (owner.length != sizeof(table) ||
+            std::memcmp(owner.data, table, sizeof(table)) != 0) {
+          continue;
+        }
+        const auto data = FindNla(attrs, NFTA_RULE_USERDATA);
+        ASSERT_EQ(userdata.size(), data.length);
+        EXPECT_TRUE(std::equal(userdata.begin(), userdata.end(), data.data));
+        saw_rule = true;
+      }
       saw_chain |= message->nlmsg_type == kNftDelchain;
       saw_table |= message->nlmsg_type == kNftDeltable;
       saw_generation |= message->nlmsg_type == kNftNewgen;
@@ -7020,6 +7054,100 @@ TEST(NetlinkNetfilter, NftFailedBatchDoesNotPublishEarlierTable) {
   AppendAttr(&query, NFTA_TABLE_NAME, "dkc035_abort");
   ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(fd.get(), query));
   Ack(fd.get(), 214, ENOENT, kNftGettable);
+}
+
+TEST(NetlinkNetfilter, NftRuleUserdataRoundTripAndRollback) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  Fd nft(Open());
+  ASSERT_GE(nft.get(), 0);
+
+  constexpr char table[] = "dunit_rule_userdata";
+  constexpr char chain_name[] = "test";
+  constexpr uint32_t seq = 27000;
+  const std::vector<uint8_t> opaque{0x00, 0xff, 0x41};
+  std::vector<uint8_t> maximum(NFT_USERDATA_MAXLEN);
+  for (size_t i = 0; i < maximum.size(); ++i) {
+    maximum[i] = static_cast<uint8_t>(i);
+  }
+
+  auto batch = TableBatch(kNftNewtable, seq, table);
+  batch.resize(batch.size() - NLMSG_SPACE(sizeof(nfgenmsg)));
+  auto chain = NewChain(seq + 2, table, chain_name);
+  auto absent = ImmediateRule(seq + 3, table, chain_name, NF_ACCEPT, true);
+  auto empty = ImmediateRule(seq + 4, table, chain_name, NF_ACCEPT, true);
+  AppendRawAttr(&empty, NFTA_RULE_USERDATA, opaque.data(), opaque.size());
+  AppendRawAttr(&empty, NFTA_RULE_USERDATA, nullptr, 0);
+  auto binary = ImmediateRule(seq + 5, table, chain_name, NF_ACCEPT, true);
+  AppendRawAttr(&binary, NFTA_RULE_USERDATA, opaque.data(), opaque.size());
+  auto boundary = ImmediateRule(seq + 6, table, chain_name, NF_ACCEPT, true);
+  AppendRawAttr(&boundary, NFTA_RULE_USERDATA, opaque.data(), opaque.size());
+  AppendRawAttr(&boundary, NFTA_RULE_USERDATA, maximum.data(), maximum.size());
+  auto end = Request(NFNL_MSG_BATCH_END, seq + 7);
+  for (const auto* message : {&chain, &absent, &empty, &binary, &boundary, &end}) {
+    batch.insert(batch.end(), message->begin(), message->end());
+  }
+  ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(nft.get(), batch));
+  [&] {
+    Ack(nft.get(), seq + 1, 0, kNftNewtable);
+    Ack(nft.get(), seq + 2, 0, kNftNewchain);
+    for (uint32_t id = seq + 3; id <= seq + 6; ++id) {
+      Ack(nft.get(), id, 0, kNftNewrule);
+    }
+    if (::testing::Test::HasFailure()) return;
+
+    auto query = Request(kNftGetrule, seq + 8);
+    query[NLMSG_HDRLEN] = NFPROTO_IPV4;
+    nlmsghdr header{};
+    std::memcpy(&header, query.data(), sizeof(header));
+    header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    std::memcpy(query.data(), &header, sizeof(header));
+    AppendAttr(&query, NFTA_RULE_TABLE, table);
+    AppendAttr(&query, NFTA_RULE_CHAIN, chain_name);
+    ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+    const auto before = ReceiveRuleDump(nft.get(), seq + 8);
+    ASSERT_EQ(4u, before.size());
+    EXPECT_FALSE(before[0].userdata.has_value());
+    EXPECT_FALSE(before[1].userdata.has_value());
+    EXPECT_EQ(opaque, before[2].userdata);
+    EXPECT_EQ(maximum, before[3].userdata);
+
+    auto failed = Request(NFNL_MSG_BATCH_BEGIN, seq + 9);
+    nfgenmsg gen{};
+    gen.res_id = htons(NFNL_SUBSYS_NFTABLES);
+    std::memcpy(failed.data() + NLMSG_HDRLEN, &gen, sizeof(gen));
+    auto candidate = ImmediateRule(seq + 10, table, chain_name, NF_DROP, true);
+    AppendRawAttr(&candidate, NFTA_RULE_USERDATA, opaque.data(), opaque.size());
+    auto invalid = ImmediateRule(seq + 11, table, chain_name, NF_DROP, true);
+    const std::vector<uint8_t> oversized(NFT_USERDATA_MAXLEN + 1, 0x41);
+    AppendRawAttr(&invalid, NFTA_RULE_USERDATA, oversized.data(), oversized.size());
+    // The last attribute is valid, but every occurrence must pass policy.
+    AppendRawAttr(&invalid, NFTA_RULE_USERDATA, opaque.data(), opaque.size());
+    auto failed_end = Request(NFNL_MSG_BATCH_END, seq + 12);
+    for (const auto* message : {&candidate, &invalid, &failed_end}) {
+      failed.insert(failed.end(), message->begin(), message->end());
+    }
+    ASSERT_EQ(static_cast<ssize_t>(failed.size()), Send(nft.get(), failed));
+    Ack(nft.get(), seq + 10, 0, kNftNewrule);
+    Ack(nft.get(), seq + 11, ERANGE, kNftNewrule);
+
+    std::memcpy(&header, query.data(), sizeof(header));
+    header.nlmsg_seq = seq + 13;
+    std::memcpy(query.data(), &header, sizeof(header));
+    ASSERT_EQ(static_cast<ssize_t>(query.size()), Send(nft.get(), query));
+    const auto after = ReceiveRuleDump(nft.get(), seq + 13);
+    ASSERT_EQ(before.size(), after.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+      EXPECT_EQ(before[i].handle, after[i].handle);
+      EXPECT_EQ(before[i].userdata, after[i].userdata);
+      EXPECT_EQ(before[i].generation, after[i].generation);
+    }
+  }();
+  auto remove = TableBatch(kNftDeltable, seq + 14, table);
+  ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(nft.get(), remove));
+  // If creation aborted, the table is already absent.
+  if (!::testing::Test::HasFailure()) {
+    Ack(nft.get(), seq + 15, 0, kNftDeltable);
+  }
 }
 
 TEST(NetlinkNetfilter, NftShortBatchEndCannotCommitTable) {

@@ -44,7 +44,7 @@ pub(crate) use rule::{
     NftMetaKey, NftNatAction, NftNatEvent, NftNatProgress, NftPayloadBase, NftRangeOp, NftRule,
     NftRuleInput, NftRuleVerdict, NftVerdict, NftXtAddrtype, NftXtConntrack, NftXtTcp, NftXtUdp,
 };
-pub(crate) use transaction::{NewSetSpec, NftNamespaceState};
+pub(crate) use transaction::{NewRuleSpec, NewSetSpec, NftNamespaceState};
 
 use hook::HookProgram;
 use objects::{allocated_set_name, copy_bytes};

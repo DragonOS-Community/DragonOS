@@ -476,8 +476,8 @@ TEST(ProcTaskStatus, NonLeaderThreadStatusDescribesThread) {
     std::string proc_after;
     ASSERT_TRUE(ReadProcSnapshot(ProcessStatusPath(pid), &proc_after, &err)) << "errno=" << err;
     const auto proc_fields = ParseStatus(proc_after);
-    EXPECT_NE(Field(proc_fields, "State"), Field(fields, "State"))
-        << "the thread state must not be copied from the thread group leader";
+    EXPECT_EQ("R (running)", Field(proc_fields, "State")) << Escape(proc_after);
+    EXPECT_EQ("S (sleeping)", Field(fields, "State")) << Escape(text);
 
     // Reverse direction: naming a thread must not rename the process.
     EXPECT_EQ(main_comm, Field(proc_fields, "Name"));

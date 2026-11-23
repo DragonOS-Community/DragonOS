@@ -14,7 +14,7 @@ use crate::{
     process::{
         namespace::pid_namespace::PidNamespace,
         pid::{Pid, PidType},
-        ProcessControlBlock, RawPid,
+        ProcessControlBlock, ProcessState, RawPid,
     },
 };
 use alloc::sync::{Arc, Weak};
@@ -52,6 +52,19 @@ use stat::StatFileOps;
 use statm::StatmFileOps;
 use status::StatusFileOps;
 use task::TaskDirOps;
+
+// Linux 6.6 fs/proc/array.c uses the full label in status and its
+// first character in stat. Keep both ABI fields on the same mapping.
+fn linux_task_state(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Runnable => "R (running)",
+        ProcessState::Blocked(true) => "S (sleeping)",
+        ProcessState::Blocked(false) | ProcessState::BlockedKillable => "D (disk sleep)",
+        ProcessState::BlockedIdle => "I (idle)",
+        ProcessState::Stopped => "T (stopped)",
+        ProcessState::Exited(_) => "Z (zombie)",
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ProcPidTarget {

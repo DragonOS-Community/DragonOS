@@ -1239,13 +1239,13 @@ TEST(ProcfsTaskSemantics, TaskSubtreeSurvivesLeaderExit) {
         std::string text;
         int err = 0;
         if (ReadWholePath(StatusPath(mid), &text, &err)) {
-            leader_exited = Field(ParseStatus(text), "State").find("Exited") != std::string::npos;
+            leader_exited = Field(ParseStatus(text), "State") == "Z (zombie)";
         }
         if (!leader_exited) {
             usleep(10000);
         }
     }
-    ASSERT_TRUE(leader_exited) << "the group leader never exited";
+    EXPECT_TRUE(leader_exited) << "the group leader never reported Z (zombie)";
 
     const std::vector<std::string> tids = ListDir(StatusPath(mid, "task"));
     EXPECT_EQ(2u, tids.size()) << "the task subtree must list the zombie leader and the worker";

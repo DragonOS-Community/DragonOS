@@ -14,7 +14,7 @@ use crate::{
         },
         vfs::{FilePrivateData, IndexNode, InodeMode},
     },
-    process::{pid::PidType, ProcessState, RawPid},
+    process::{pid::PidType, RawPid},
 };
 use alloc::{
     borrow::ToOwned,
@@ -83,22 +83,8 @@ impl StatusFileOps {
         // Name
         pdata.append(&mut format!("Name:\t{}", name).as_bytes().to_owned());
 
-        // State
-        //
-        // Linux 6.6 `fs/proc/array.c::proc_pid_status()` renders this with
-        // `task_state_array[]`, i.e. "<char> (<description>)". Printing the Rust
-        // `Debug` representation here leaked `Runnable` / `Blocked(true)` to
-        // user space, which no Linux tool can parse.
-        let state_str = match state {
-            ProcessState::Runnable => "R (running)",
-            ProcessState::Blocked(true) => "S (sleeping)",
-            ProcessState::Blocked(false) => "D (disk sleep)",
-            ProcessState::BlockedKillable => "D (disk sleep)",
-            ProcessState::BlockedIdle => "I (idle)",
-            ProcessState::Stopped => "T (stopped)",
-            ProcessState::Exited(_) => "Z (zombie)",
-        };
-        pdata.append(&mut format!("\nState:\t{}", state_str).into());
+        pdata.extend_from_slice(b"\nState:\t");
+        pdata.extend_from_slice(super::linux_task_state(state).as_bytes());
 
         // Tgid
         //

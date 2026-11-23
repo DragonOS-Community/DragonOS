@@ -56,18 +56,6 @@ impl StatFileOps {
     }
 }
 
-/// 将进程状态转换为 Linux 风格的字符
-fn state_to_linux_char(state: ProcessState) -> char {
-    match state {
-        ProcessState::Runnable => 'R',
-        ProcessState::Blocked(true) => 'S',
-        ProcessState::Blocked(false) | ProcessState::BlockedKillable => 'D',
-        ProcessState::BlockedIdle => 'I',
-        ProcessState::Stopped => 'T',
-        ProcessState::Exited(_) => 'Z',
-    }
-}
-
 /// Linux 6.6 include/linux/sched.h defines the PF_* bits exported by stat.
 fn linux_task_flags(flags: ProcessFlags) -> u32 {
     const PF_EXITING: u32 = 0x0000_0004;
@@ -185,7 +173,7 @@ fn generate_linux_proc_stat_line(snapshot: &ProcStatSnapshot) -> String {
     let mut line = StatLine::new();
 
     line.push_pid_comm(snapshot.pid, &comm); // 1 pid, 2 comm
-    line.push_state(state_to_linux_char(snapshot.state)); // 3 state
+    line.push_state(super::linux_task_state(snapshot.state).as_bytes()[0] as char); // 3 state
     line.push_ll(snapshot.ppid.data() as i64); // 4 ppid
     line.push_ll(0); // 5 pgrp
     line.push_ll(0); // 6 session

@@ -1629,26 +1629,33 @@ fn explicit_ipv4_dispatch_preserves_packet_on_ip_medium() {
     assert_eq!(frames.borrow().as_slice(), &[packet]);
 }
 
-#[test]
+#[rstest]
 #[cfg(all(feature = "proto-ipv4", feature = "medium-ip", feature = "socket-raw"))]
-fn egress_admission_failure_does_not_consume_token() {
-    struct ExhaustedTxToken;
+#[case(crate::phy::TxEgressError::Exhausted, DispatchError::Exhausted)]
+#[case(crate::phy::TxEgressError::NoRoute, DispatchError::NoRoute)]
+fn egress_admission_failure_does_not_consume_token(
+    #[case] backend_error: crate::phy::TxEgressError,
+    #[case] dispatch_error: DispatchError,
+) {
+    struct RejectedTxToken(crate::phy::TxEgressError);
 
-    impl TxToken for ExhaustedTxToken {
+    impl TxToken for RejectedTxToken {
         fn egress_override(
             &mut self,
-            _version: IpVersion,
-            _destination: IpAddress,
+            source: IpAddress,
+            destination: IpAddress,
             _meta: PacketMeta,
         ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {
-            Err(crate::phy::TxEgressError::Exhausted)
+            assert_eq!(source, IpAddress::v4(192, 0, 2, 1));
+            assert_eq!(destination, IpAddress::v4(198, 51, 100, 7));
+            Err(self.0)
         }
 
         fn consume<R, F>(self, _len: usize, _f: F) -> R
         where
             F: FnOnce(&mut [u8]) -> R,
         {
-            panic!("an exhausted backend must not consume its token")
+            panic!("a rejecting backend must not consume its token")
         }
     }
 
@@ -1667,12 +1674,12 @@ fn egress_admission_failure_does_not_consume_token() {
 
     assert_eq!(
         iface.inner.dispatch_ip(
-            ExhaustedTxToken,
+            RejectedTxToken(backend_error),
             PacketMeta::default(),
             packet,
             &mut iface.fragmenter,
         ),
-        Err(DispatchError::Exhausted)
+        Err(dispatch_error)
     );
 }
 
@@ -2855,7 +2862,7 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
     impl TxToken for RoutedTxToken {
         fn egress_override(
             &mut self,
-            _version: IpVersion,
+            _source: IpAddress,
             _destination: IpAddress,
             _meta: PacketMeta,
         ) -> Result<Option<crate::phy::TxEgressOverride>, crate::phy::TxEgressError> {

@@ -1945,8 +1945,11 @@ impl InterfaceInner {
             None
         } else {
             tx_token
-                .egress_override(ip_repr.version(), ip_repr.dst_addr(), meta)
-                .map_err(|_| DispatchError::Exhausted)?
+                .egress_override(ip_repr.src_addr(), ip_repr.dst_addr(), meta)
+                .map_err(|error| match error {
+                    crate::phy::TxEgressError::Exhausted => DispatchError::Exhausted,
+                    crate::phy::TxEgressError::NoRoute => DispatchError::NoRoute,
+                })?
         };
         #[cfg(feature = "proto-ipv6")]
         if !self.ipv6_enabled && egress.is_none() && ip_repr.version() == IpVersion::Ipv6 {

@@ -261,6 +261,28 @@ impl OutputBackendPolicy<'_> {
         }
     }
 
+    fn select_egress(
+        self,
+        source: smoltcp::wire::IpAddress,
+        destination: smoltcp::wire::IpAddress,
+        meta: PacketMeta,
+    ) -> Result<OutputBackendDecision, smoltcp::phy::TxEgressError> {
+        let decision = self.classify(destination.version(), destination, meta);
+        if let smoltcp::wire::IpAddress::Ipv4(source) = source {
+            match decision {
+                OutputBackendDecision::NativeOwner => self
+                    .routes
+                    .validate_ipv4_egress_source(self.owner_ifindex, source),
+                OutputBackendDecision::Deferred(Some(route)) => {
+                    self.routes.validate_ipv4_output_source(route, source)
+                }
+                OutputBackendDecision::Deferred(None) => Ok(()),
+            }
+            .map_err(|_| smoltcp::phy::TxEgressError::NoRoute)?;
+        }
+        Ok(decision)
+    }
+
     pub(super) fn classify(
         self,
         version: smoltcp::wire::IpVersion,
@@ -1617,11 +1639,13 @@ impl SmolTxToken for LocalInputTxToken<'_> {
 
     fn egress_override(
         &mut self,
-        version: smoltcp::wire::IpVersion,
+        source: smoltcp::wire::IpAddress,
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<Option<smoltcp::phy::TxEgressOverride>, smoltcp::phy::TxEgressError> {
-        let decision = self.backend_policy.classify(version, destination, meta);
+        let decision = self
+            .backend_policy
+            .select_egress(source, destination, meta)?;
         self.apply_backend_decision(decision)
     }
 
@@ -1749,11 +1773,13 @@ impl<T: SmolTxToken> SmolTxToken for RoutedTxToken<'_, T> {
 
     fn egress_override(
         &mut self,
-        version: smoltcp::wire::IpVersion,
+        source: smoltcp::wire::IpAddress,
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<Option<smoltcp::phy::TxEgressOverride>, smoltcp::phy::TxEgressError> {
-        let decision = self.backend_policy.classify(version, destination, meta);
+        let decision = self
+            .backend_policy
+            .select_egress(source, destination, meta)?;
         if matches!(decision, OutputBackendDecision::NativeOwner) {
             if self.physical.is_none() {
                 return Err(smoltcp::phy::TxEgressError::Exhausted);
@@ -2302,6 +2328,9 @@ where
         Ok(()) => {}
         Err(smoltcp::phy::TxEgressError::Exhausted) => {
             return LocalOutputTransmitResult::RetrySoon(packet);
+        }
+        Err(smoltcp::phy::TxEgressError::NoRoute) => {
+            return output_error(packet, SystemError::ENETUNREACH);
         }
     }
     token.consume(packet.frame.len(), |buffer| {

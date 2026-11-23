@@ -262,14 +262,13 @@ impl OutputRouteGuard<'_> {
     pub(crate) fn allows_ipv4_loopback_ingress(&self, ifindex: u32, source: Ipv4Address) -> bool {
         self.devices.get(&(ifindex as usize)).is_some_and(|iface| {
             iface.common().route_localnet_value() != 0
-                && (!source.is_loopback()
-                    || !self.devices.values().any(|device| {
-                        device
-                            .common()
-                            .ip_addrs()
-                            .iter()
-                            .any(|cidr| cidr.address() == IpAddress::Ipv4(source))
-                    }))
+                && !self.devices.values().any(|device| {
+                    device
+                        .common()
+                        .ip_addrs()
+                        .iter()
+                        .any(|cidr| cidr.address() == IpAddress::Ipv4(source))
+                })
         })
     }
 
@@ -278,14 +277,25 @@ impl OutputRouteGuard<'_> {
         route: OutputRouteDecision,
         source: Ipv4Address,
     ) -> Result<(), SystemError> {
-        if route.kind != RTN_LOCAL && source.is_loopback() {
-            let device = self
-                .devices
-                .get(&(route.oif as usize))
-                .ok_or(SystemError::ENETUNREACH)?;
-            validate_ipv4_loopback_egress(device.as_ref())?;
+        if route.kind == RTN_LOCAL {
+            return Ok(());
         }
-        Ok(())
+        self.validate_ipv4_egress_source(route.oif, source)
+    }
+
+    pub(crate) fn validate_ipv4_egress_source(
+        &self,
+        oif: u32,
+        source: Ipv4Address,
+    ) -> Result<(), SystemError> {
+        if !source.is_loopback() {
+            return Ok(());
+        }
+        let device = self
+            .devices
+            .get(&(oif as usize))
+            .ok_or(SystemError::ENETUNREACH)?;
+        validate_ipv4_loopback_egress(device.as_ref())
     }
 
     pub(crate) fn ingress_device(&self, ifindex: u32) -> Option<Arc<dyn Iface>> {

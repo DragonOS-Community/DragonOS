@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -362,19 +363,29 @@ void* WriterThread(void* arg) {
     return nullptr;
 }
 
-void* ResetDuringCloseWorker(void*) {
+constexpr intptr_t kPollDuringCloseFailed = 7;
+constexpr intptr_t kCloseAfterPollFailed = 8;
+
+struct ResetDuringCloseArgs {
+    bool (*init_pair)(TcpPair*);
+    int poll_result = 0;
+    int poll_errno = 0;
+    short poll_revents = 0;
+    std::chrono::milliseconds poll_elapsed{};
+};
+
+void* ResetDuringCloseWorker(void* arg) {
+    auto& worker = *static_cast<ResetDuringCloseArgs*>(arg);
     TcpPair pair;
-    if (!InitTcpPair(&pair)) {
+    if (!worker.init_pair(&pair)) {
         return reinterpret_cast<void*>(1);
     }
 
     struct PollCloseArgs {
-        int fd = -1;
-        int result = 0;
-    } poll_args {
-        .fd = pair.client_fd.Get(),
-        .result = 0,
-    };
+        int fd;
+        ResetDuringCloseArgs& worker;
+        intptr_t result = 0;
+    } poll_args{pair.client_fd.Get(), worker};
 
     auto poll_and_close = [](void* arg) -> void* {
         auto* args = reinterpret_cast<PollCloseArgs*>(arg);
@@ -383,13 +394,20 @@ void* ResetDuringCloseWorker(void*) {
             .events = POLLIN | POLLHUP,
             .revents = 0,
         };
+        const auto start = std::chrono::steady_clock::now();
         const int poll_ret = poll(&pfd, 1, 5000);
         if (poll_ret != 1) {
-            args->result = 1;
+            auto& observation = args->worker;
+            observation.poll_errno = poll_ret < 0 ? errno : 0;
+            observation.poll_result = poll_ret;
+            observation.poll_revents = pfd.revents;
+            observation.poll_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+            args->result = kPollDuringCloseFailed;
             return nullptr;
         }
         if (close(args->fd) != 0) {
-            args->result = 2;
+            args->result = kCloseAfterPollFailed;
             return nullptr;
         }
         args->fd = -1;
@@ -418,69 +436,7 @@ void* ResetDuringCloseWorker(void*) {
         return reinterpret_cast<void*>(5);
     }
     if (poll_args.result != 0) {
-        return reinterpret_cast<void*>(6 + poll_args.result);
-    }
-    pair.client_fd.Release();
-    return nullptr;
-}
-
-void* ReversedDualStackResetDuringCloseWorker(void*) {
-    TcpPair pair;
-    if (!InitDualStackTcpPair(&pair)) {
-        return reinterpret_cast<void*>(1);
-    }
-
-    struct PollCloseArgs {
-        int fd = -1;
-        int result = 0;
-    } poll_args {
-        .fd = pair.client_fd.Get(),
-        .result = 0,
-    };
-
-    auto poll_and_close = [](void* arg) -> void* {
-        auto* args = reinterpret_cast<PollCloseArgs*>(arg);
-        pollfd pfd {
-            .fd = args->fd,
-            .events = POLLIN | POLLHUP,
-            .revents = 0,
-        };
-        const int poll_ret = poll(&pfd, 1, 5000);
-        if (poll_ret != 1) {
-            args->result = 1;
-            return nullptr;
-        }
-        if (close(args->fd) != 0) {
-            args->result = 2;
-            return nullptr;
-        }
-        args->fd = -1;
-        return nullptr;
-    };
-
-    pthread_t closer {};
-    if (pthread_create(&closer, nullptr, poll_and_close, &poll_args) != 0) {
-        return reinterpret_cast<void*>(2);
-    }
-
-    constexpr char kData[] = "abc";
-    if (write(pair.server_fd.Get(), kData, 3) != 3) {
-        pthread_join(closer, nullptr);
-        return reinterpret_cast<void*>(3);
-    }
-
-    usleep(10000);
-
-    if (close(pair.server_fd.Release()) != 0) {
-        pthread_join(closer, nullptr);
-        return reinterpret_cast<void*>(4);
-    }
-
-    if (pthread_join(closer, nullptr) != 0) {
-        return reinterpret_cast<void*>(5);
-    }
-    if (poll_args.result != 0) {
-        return reinterpret_cast<void*>(6 + poll_args.result);
+        return reinterpret_cast<void*>(poll_args.result);
     }
     pair.client_fd.Release();
     return nullptr;
@@ -654,48 +610,51 @@ TEST(TcpCloseSemantics, ShutdownWrThenUnreadDataCloseAborts) {
         << "expected EPIPE/ECONNRESET, got " << ErrnoString(saved_errno);
 }
 
-TEST(TcpCloseSemantics, ConcurrentResetDuringCloseDoesNotStall) {
+void ExpectConcurrentResetDuringClose(bool (*init_pair)(TcpPair*)) {
     signal(SIGPIPE, SIG_IGN);
 
     constexpr int kThreadCount = 100;
     std::vector<pthread_t> threads(kThreadCount);
-
-    for (int i = 0; i < kThreadCount; ++i) {
-        ASSERT_EQ(0, pthread_create(&threads[i], nullptr, ResetDuringCloseWorker, nullptr))
-            << "pthread_create failed: " << ErrnoString(errno);
+    std::vector<ResetDuringCloseArgs> args(kThreadCount, ResetDuringCloseArgs{init_pair});
+    int started = 0;
+    for (; started < kThreadCount; ++started) {
+        const int error = pthread_create(&threads[started], nullptr, ResetDuringCloseWorker,
+                                         &args[started]);
+        if (error != 0) {
+            ADD_FAILURE() << "pthread_create failed: " << ErrnoString(error);
+            break;
+        }
     }
 
-    for (int i = 0; i < kThreadCount; ++i) {
+    for (int i = 0; i < started; ++i) {
         void* result = nullptr;
-        ASSERT_EQ(0, pthread_join(threads[i], &result))
-            << "pthread_join failed: " << ErrnoString(errno);
-        EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
+        const int error = pthread_join(threads[i], &result);
+        EXPECT_EQ(0, error) << "pthread_join failed: " << ErrnoString(error);
+        if (error != 0) {
+            continue;
+        }
+        if (result == reinterpret_cast<void*>(kPollDuringCloseFailed)) {
+            const auto& observation = args[i];
+            ADD_FAILURE() << "worker " << i << ": poll returned " << observation.poll_result
+                          << ", errno=" << observation.poll_errno
+                          << ", revents=" << observation.poll_revents
+                          << ", elapsed_ms=" << observation.poll_elapsed.count();
+        } else {
+            EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
+        }
     }
 
-    ExpectMmSignalPathResponsiveAfterTcpStorm();
+    if (started == kThreadCount) {
+        ExpectMmSignalPathResponsiveAfterTcpStorm();
+    }
+}
+
+TEST(TcpCloseSemantics, ConcurrentResetDuringCloseDoesNotStall) {
+    ExpectConcurrentResetDuringClose(InitTcpPair);
 }
 
 TEST(TcpCloseSemantics, ReversedDualStackResetDuringCloseDoesNotStall) {
-    signal(SIGPIPE, SIG_IGN);
-
-    constexpr int kThreadCount = 100;
-    std::vector<pthread_t> threads(kThreadCount);
-
-    for (int i = 0; i < kThreadCount; ++i) {
-        ASSERT_EQ(0,
-                  pthread_create(
-                      &threads[i], nullptr, ReversedDualStackResetDuringCloseWorker, nullptr))
-            << "pthread_create failed: " << ErrnoString(errno);
-    }
-
-    for (int i = 0; i < kThreadCount; ++i) {
-        void* result = nullptr;
-        ASSERT_EQ(0, pthread_join(threads[i], &result))
-            << "pthread_join failed: " << ErrnoString(errno);
-        EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
-    }
-
-    ExpectMmSignalPathResponsiveAfterTcpStorm();
+    ExpectConcurrentResetDuringClose(InitDualStackTcpPair);
 }
 
 TEST(TcpCloseSemantics, ColdNamespaceConcurrentBindAndConnectAdmission) {

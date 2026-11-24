@@ -584,7 +584,7 @@ pub(in crate::net) fn prepare_address_link_change_from(
     PreparedAddressRouteCommit::prepare_for_link(netns, iface, change, Some(staged_before))
 }
 
-pub(crate) fn commit_addresses(
+pub(crate) fn prepare_address_update(
     _rtnl: &RtnlGuard,
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
@@ -592,17 +592,15 @@ pub(crate) fn commit_addresses(
     after: &[IpCidr],
     metadata: Vec<AddressMetadata>,
     deleted_address: Option<IpAddress>,
-) -> Result<RouteNotifications, SystemError> {
-    let deleted_addresses = deleted_address.as_slice();
-    let prepared = PreparedAddressRouteCommit::prepare(
+) -> Result<PreparedAddressRouteCommit, SystemError> {
+    PreparedAddressRouteCommit::prepare(
         netns,
         iface,
         before,
         after,
         metadata,
-        deleted_addresses,
-    )?;
-    Ok(prepared.publish(netns, iface))
+        deleted_address.as_slice(),
+    )
 }
 
 fn derived_address_entries(

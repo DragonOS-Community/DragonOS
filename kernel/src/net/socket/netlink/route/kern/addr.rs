@@ -22,7 +22,9 @@ use crate::{
         AddressFamily,
     },
     net::{
-        address::{address_info, AddressInfo, AddressMutation, AddressMutationOutcome},
+        address::{
+            address_info, AddressInfo, AddressMutation, AddressMutationOutcome, AddressOptions,
+        },
         rtnl::RtnlGuard,
     },
     process::namespace::net_namespace::NetNamespace,
@@ -43,6 +45,9 @@ pub(super) fn do_new_addr(
     // special-case validation. Preserve that errno priority here.
     let broadcast = parse_request_broadcast(request_segment)?;
     let label = parse_request_label(request_segment)?;
+    let ipv6_nodad = (request_segment.body().family == AddressFamily::INet6 as i32)
+        .then(|| request_ipv6_nodad(request_segment))
+        .transpose()?;
     let cidr = parse_new_cidr(request_segment)?;
     let iface = lookup_iface_by_index(request_segment, &netns)?;
 
@@ -64,17 +69,38 @@ pub(super) fn do_new_addr(
         } else {
             AddressMutation::Add(cidr)
         };
-    let commit =
-        crate::net::address::mutate_labeled_address(rtnl, &iface, mutation, label, broadcast)?;
-    if let AddressMutationOutcome::Added(cidr) | AddressMutationOutcome::Replaced(cidr) =
-        commit.outcome
-    {
-        if crate::net::address::address_state(&iface, cidr).is_usable() {
+    let commit = crate::net::address::mutate_address_with_options(
+        rtnl,
+        &iface,
+        mutation,
+        AddressOptions {
+            label,
+            broadcast,
+            ipv6_nodad,
+        },
+    )?;
+    match commit.outcome {
+        AddressMutationOutcome::Added(cidr) => notify_address_change(netns.clone(), &iface, cidr),
+        AddressMutationOutcome::Replaced(cidr)
+            if crate::net::address::address_state(&iface, cidr).is_usable() =>
+        {
             notify_address_change(netns.clone(), &iface, cidr);
         }
+        _ => {}
     }
     notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
+}
+
+fn request_ipv6_nodad(request: &AddrSegment) -> Result<bool, SystemError> {
+    let mut flags = request.body().flags;
+    for attr in request.attrs() {
+        if let AddrAttr::Flags(bytes) = attr {
+            let raw = bytes.first_chunk::<4>().ok_or(SystemError::ERANGE)?;
+            flags = AddrMessageFlags::from_bits_truncate(u32::from_ne_bytes(*raw));
+        }
+    }
+    Ok(flags.contains(AddrMessageFlags::NODAD))
 }
 
 pub(super) fn do_del_addr(
@@ -377,6 +403,9 @@ pub(super) fn addr_to_segment(
     } else {
         AddrMessageFlags::PERMANENT
     };
+    if address.ipv6_nodad {
+        flags.insert(AddrMessageFlags::NODAD);
+    }
     match address.state {
         AddressState::AutoLinkLocal(DadState::Tentative)
         | AddressState::Slaac(DadState::Tentative)
@@ -434,9 +463,11 @@ pub(super) fn addr_to_segment(
             }
             attrs.push(AddrAttr::CacheInfo(cache));
         }
+        if slaac || address.ipv6_nodad {
+            attrs.push(AddrAttr::Flags(flags.bits().to_ne_bytes().to_vec()));
+        }
         if slaac {
             const IFAPROT_KERNEL_RA: u8 = 2;
-            attrs.push(AddrAttr::Flags(flags.bits().to_ne_bytes()));
             attrs.push(AddrAttr::Proto([IFAPROT_KERNEL_RA]));
         }
     }

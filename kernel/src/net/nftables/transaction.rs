@@ -431,7 +431,33 @@ impl NftTransaction<'_> {
         add: bool,
     ) -> Result<(Arc<NftTable>, Arc<NftSet>), SystemError> {
         let (index, set_index) =
-            self.set_element_update_target(family, table_name, Some(name), false)?;
+            self.set_element_update_target(family, table_name, Some(name), !add)?;
+        self.update_set_elements_at(index, set_index, elements, add)
+    }
+
+    pub(crate) fn delete_keyed_set_elements<T>(
+        &mut self,
+        family: u8,
+        table_name: &[u8],
+        name: Option<&[u8]>,
+        elements: &[NftSetElementInput<'_>],
+        before_delete: impl FnOnce(&NftTable, &NftSet) -> Result<T, SystemError>,
+    ) -> Result<T, SystemError> {
+        let (index, set_index) = self.set_element_update_target(family, table_name, name, true)?;
+        let table = &self.candidate.tables[index];
+        // Borrow the old state so a notification does not force an extra COW.
+        let notification = before_delete(table, &table.sets[set_index])?;
+        self.update_set_elements_at(index, set_index, elements, false)?;
+        Ok(notification)
+    }
+
+    fn update_set_elements_at(
+        &mut self,
+        index: usize,
+        set_index: usize,
+        elements: &[NftSetElementInput<'_>],
+        add: bool,
+    ) -> Result<(Arc<NftTable>, Arc<NftSet>), SystemError> {
         if let [element] = elements {
             if let Some(result) =
                 self.try_update_single_exact_element(index, set_index, element, add)?
@@ -610,26 +636,6 @@ impl NftTransaction<'_> {
         };
         self.changed = true;
         Ok((self.candidate.tables[index].clone(), updated))
-    }
-
-    pub(crate) fn set_for_notification(
-        &self,
-        family: u8,
-        table_name: &[u8],
-        name: &[u8],
-    ) -> Result<(Arc<NftTable>, Arc<NftSet>), SystemError> {
-        let table = self
-            .candidate
-            .tables
-            .iter()
-            .find(|table| table.family == family && table.name == table_name)
-            .ok_or(SystemError::ENOENT)?;
-        let set = table
-            .sets
-            .iter()
-            .find(|set| set.name == name)
-            .ok_or(SystemError::ENOENT)?;
-        Ok((table.clone(), set.clone()))
     }
 
     pub(crate) fn resolve_set_name(

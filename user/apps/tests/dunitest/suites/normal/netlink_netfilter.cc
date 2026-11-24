@@ -357,7 +357,7 @@ std::vector<uint8_t> Ipv4SetElementsRequest(uint16_t type, uint32_t seq,
     std::memcpy(request.data(), &header, sizeof(header));
   }
   AppendAttr(&request, NFTA_SET_ELEM_LIST_TABLE, table);
-  AppendAttr(&request, NFTA_SET_ELEM_LIST_SET, set);
+  if (set != nullptr) AppendAttr(&request, NFTA_SET_ELEM_LIST_SET, set);
   return request;
 }
 
@@ -7462,6 +7462,94 @@ TEST(NetlinkNetfilter, NftTableCommitNotifiesSubscribersAndGeneration) {
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(writer.get(), remove));
   Ack(writer.get(), 284, 0, kNftDeltable);
   receive_events(kNftDeltable);
+}
+
+TEST(NetlinkNetfilter, NftKeyedSetDeletionUsesNameAndChecksEligibility) {
+  ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
+  Fd fd(Open());
+  ASSERT_GE(fd.get(), 0);
+  ASSERT_EQ(0, Bind(fd.get()));
+
+  constexpr char table[] = "dkc035_keyed_delete";
+  constexpr char primary[] = "primary";
+  constexpr char pending[] = "pending";
+  constexpr char chain[] = "filter";
+  uint32_t seq = 19200;
+  in_addr first{}, second{};
+  ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &first));
+  ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.2", &second));
+  auto begin = MutationBatch(seq, {
+      TableMutation(kNftNewtable, seq + 1, table, NFPROTO_IPV4),
+      NewChain(seq + 2, table, chain),
+      Ipv4SourceSet(seq + 3, table, primary),
+      Ipv4SourceSetElement(kNftNewsetelem, seq + 4, table, primary, first),
+  });
+  ASSERT_EQ(static_cast<ssize_t>(begin.size()), Send(fd.get(), begin));
+  Ack(fd.get(), seq + 1, 0, kNftNewtable);
+  Ack(fd.get(), seq + 2, 0, kNftNewchain);
+  Ack(fd.get(), seq + 3, 0, kNftNewset);
+  Ack(fd.get(), seq + 4, 0, kNftNewsetelem);
+  seq += 6;
+
+  auto delete_with_id = [&](const char* name, const char* id_target,
+                            in_addr key, int error) {
+    SCOPED_TRACE(name == nullptr ? "ID only" : name);
+    auto add = Ipv4SourceSetElement(kNftNewsetelem, seq + 2, table, nullptr, second);
+    AppendBe32(&add, NFTA_SET_ELEM_LIST_SET_ID, 1);
+    auto remove = Ipv4SourceSetElement(kNftDelsetelem, seq + 3, table, name, key);
+    AppendBe32(&remove, NFTA_SET_ELEM_LIST_SET_ID, 1);
+    auto batch = MutationBatch(seq, {
+        Ipv4SourceSet(seq + 1, table, id_target),
+        add,
+        remove,
+    });
+    ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(fd.get(), batch));
+    Ack(fd.get(), seq + 1, 0, kNftNewset);
+    Ack(fd.get(), seq + 2, 0, kNftNewsetelem);
+    Ack(fd.get(), seq + 3, error, kNftDelsetelem);
+    seq += 5;
+  };
+  delete_with_id(nullptr, "id_only_candidate", second, EINVAL);
+  delete_with_id("unknown", "unknown_name_candidate", second, ENOENT);
+  delete_with_id(primary, pending, first, 0);
+
+  for (const char* set : {primary, pending}) {
+    SCOPED_TRACE(set);
+    auto dump = Ipv4SetElementsRequest(kNftGetsetelem, seq, table, set);
+    nlmsghdr header{};
+    std::memcpy(&header, dump.data(), sizeof(header));
+    header.nlmsg_flags |= NLM_F_DUMP;
+    std::memcpy(dump.data(), &header, sizeof(header));
+    ASSERT_EQ(static_cast<ssize_t>(dump.size()), Send(fd.get(), dump));
+    EXPECT_EQ(set == primary ? 0u : 1u, ReceiveSetElementDumpCount(fd.get(), seq++));
+  }
+
+  for (bool anonymous : {false, true}) {
+    SCOPED_TRACE(anonymous ? "anonymous constant" : "named constant");
+    const char* name = anonymous ? "anonymous" : "constant";
+    const uint32_t flags = NFT_SET_CONSTANT | (anonymous ? NFT_SET_ANONYMOUS : 0);
+    auto create = MutationBatch(seq, {
+        Ipv4SourceSet(seq + 1, table, name, flags),
+        Ipv4SourceSetElement(kNftNewsetelem, seq + 2, table, name, first),
+        Ipv4SourceSetCounterRule(seq + 3, table, chain, name, htons(12345)),
+    });
+    ASSERT_EQ(static_cast<ssize_t>(create.size()), Send(fd.get(), create));
+    Ack(fd.get(), seq + 1, 0, kNftNewset);
+    Ack(fd.get(), seq + 2, 0, kNftNewsetelem);
+    Ack(fd.get(), seq + 3, 0, kNftNewrule);
+    seq += 5;
+
+    auto remove = MutationBatch(seq, {
+        Ipv4SourceSetElement(kNftDelsetelem, seq + 1, table, name, second),
+    });
+    ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(fd.get(), remove));
+    Ack(fd.get(), seq + 1, anonymous ? EOPNOTSUPP : EBUSY, kNftDelsetelem);
+    seq += 3;
+  }
+
+  auto remove = TableBatch(kNftDeltable, seq, table);
+  ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(fd.get(), remove));
+  Ack(fd.get(), seq + 1, 0, kNftDeltable);
 }
 
 TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {

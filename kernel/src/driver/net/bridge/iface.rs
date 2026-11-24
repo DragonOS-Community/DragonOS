@@ -234,6 +234,9 @@ impl BridgeIface {
         netns: &Arc<NetNamespace>,
         device: Arc<VethInterface>,
     ) -> Result<Option<crate::net::link::LinkMutationCommit>, SystemError> {
+        if device.common_bridge_data().is_some() {
+            return Err(SystemError::EBUSY);
+        }
         let candidate = self
             .driver
             .inner
@@ -245,8 +248,12 @@ impl BridgeIface {
             .min()
             .unwrap_or(BRIDGE_MTU);
         let mtu = self.prepare_auto_mtu(rtnl, netns, candidate)?;
-        self.driver
-            .try_add_device(device as Arc<dyn BridgeEnableDevice>)?;
+        let projection = sysfs::BridgePortSysfs::create(self, &device)?;
+        if let Err(error) = self.driver.try_add_device(device.clone()) {
+            projection.remove();
+            return Err(error);
+        }
+        device.set_bridge_port_sysfs(projection);
         Ok(mtu.map(|plan| plan.commit()))
     }
 
@@ -493,6 +500,12 @@ impl KObject for BridgeIface {
 }
 
 impl device::Device for BridgeIface {
+    fn attribute_groups(
+        &self,
+    ) -> Option<&'static [&'static dyn crate::filesystem::sysfs::AttributeGroup]> {
+        Some(&sysfs::BRIDGE_GROUPS)
+    }
+
     fn dev_type(&self) -> DeviceType {
         DeviceType::Net
     }

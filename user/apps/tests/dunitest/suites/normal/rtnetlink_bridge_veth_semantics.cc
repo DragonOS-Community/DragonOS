@@ -16,6 +16,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -1420,6 +1421,110 @@ TEST(RtnetlinkBridgeVethSemantics, SysfsPortMtuNotifiesBridgeAndTracksDeletedOrM
             }
         }
         _exit(result);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    struct utsname uts {};
+    const bool dragonos = uname(&uts) == 0 && std::strstr(uts.release, "dragonos") != nullptr;
+    if (WEXITSTATUS(status) == 77 && !dragonos) GTEST_SKIP() << "host cannot mount private netns sysfs";
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+void CheckBridgePortSysfs() {
+    RouteFd route;
+    ASSERT_GE(route.fd, 0);
+    LinkRequest bridge(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4620);
+    ASSERT_TRUE(bridge.name("stbr"));
+    AddKind(bridge, "bridge");
+    ASSERT_EQ(SendAck(route.fd, bridge), 0);
+    LinkRequest veth(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4621);
+    ASSERT_TRUE(veth.name("stport"));
+    AddKind(veth, "veth");
+    ASSERT_EQ(SendAck(route.fd, veth), 0);
+    const auto port = QueryLink(route.fd, "stport", 4622);
+    ASSERT_TRUE(port);
+    ASSERT_NE(port->link, 0u);
+    const uint32_t bridge_index = if_nametoindex("stbr");
+    ASSERT_NE(bridge_index, 0u);
+
+    const auto read_state = [](const char* path) {
+        const int fd = open(path, O_RDONLY);
+        if (fd < 0) return std::string{};
+        char text[8];
+        const ssize_t bytes = read(fd, text, sizeof(text));
+        close(fd);
+        return bytes > 0 ? std::string(text, bytes) : std::string{};
+    };
+    const char* link_path = "/sys/class/net/stbr/brif/stport";
+    const char* state = "/sys/class/net/stbr/brif/stport/state";
+    EXPECT_EQ(read_state("/sys/class/net/stbr/bridge/stp_state"), "0\n");
+    ASSERT_EQ(SetLinkMaster(route.fd, port->index, bridge_index, 4623), 0);
+    struct stat link_stat {};
+    ASSERT_EQ(lstat(link_path, &link_stat), 0);
+    EXPECT_TRUE(S_ISLNK(link_stat.st_mode));
+    char link_target[256];
+    ASSERT_GT(readlink(link_path, link_target, sizeof(link_target)), 0);
+    EXPECT_NE(link_target[0], '/');
+    EXPECT_EQ(read_state(state), "0\n");
+    ASSERT_EQ(SetLinkUp(route.fd, bridge_index, true, 4624), 0);
+    ASSERT_EQ(SetLinkUp(route.fd, port->index, true, 4625), 0);
+    EXPECT_EQ(read_state(state), "0\n");
+    ASSERT_EQ(SetLinkUp(route.fd, port->link, true, 4626), 0);
+    for (int i = 0; i < 100 && read_state(state) != "3\n"; ++i) usleep(10000);
+    EXPECT_EQ(read_state(state), "3\n");
+
+    const int old_state = open(state, O_RDONLY);
+    ASSERT_GE(old_state, 0);
+    struct stat before {};
+    ASSERT_EQ(fstat(old_state, &before), 0);
+    ASSERT_EQ(SetLinkUp(route.fd, port->index, false, 4627), 0);
+    LinkRequest rename(RTM_SETLINK, 0, 4628);
+    rename.body()->ifi_index = port->index;
+    ASSERT_TRUE(rename.name("stnew"));
+    ASSERT_EQ(SendAck(route.fd, rename), 0);
+    EXPECT_EQ(lstat(link_path, &link_stat), -1);
+    const char* renamed_state = "/sys/class/net/stbr/brif/stnew/state";
+    struct stat direct {}, projected {};
+    ASSERT_EQ(stat("/sys/class/net/stnew/brport/state", &direct), 0);
+    ASSERT_EQ(stat(renamed_state, &projected), 0);
+    EXPECT_EQ(projected.st_ino, before.st_ino);
+    EXPECT_EQ(projected.st_ino, direct.st_ino);
+    EXPECT_EQ(read_state(renamed_state), "0\n");
+
+    ASSERT_EQ(SetLinkMaster(route.fd, port->index, 0, 4629), 0);
+    EXPECT_EQ(stat(renamed_state, &projected), -1);
+    EXPECT_EQ(stat("/sys/class/net/stnew/brport", &direct), -1);
+    ASSERT_EQ(SetLinkMaster(route.fd, port->index, bridge_index, 4630), 0);
+    EXPECT_EQ(read_state(renamed_state), "0\n");
+    char byte;
+    EXPECT_EQ(pread(old_state, &byte, 1, 0), -1);
+    EXPECT_EQ(errno, ENODEV);
+    close(old_state);
+    ASSERT_EQ(DeleteByName(route.fd, "stbr", 4631), 0);
+    EXPECT_EQ(stat("/sys/class/net/stnew/brport", &direct), -1);
+
+    bridge.header()->nlmsg_seq = 4632;
+    ASSERT_EQ(SendAck(route.fd, bridge), 0);
+    const uint32_t replacement = if_nametoindex("stbr");
+    ASSERT_NE(replacement, 0u);
+    ASSERT_EQ(SetLinkMaster(route.fd, port->index, replacement, 4633), 0);
+    LinkRequest delete_peer(RTM_DELLINK, 0, 4634);
+    delete_peer.body()->ifi_index = port->link;
+    ASSERT_EQ(SendAck(route.fd, delete_peer), 0);
+    EXPECT_EQ(stat(renamed_state, &projected), -1);
+}
+
+TEST(RtnetlinkBridgeVethSemantics, SysfsBridgePortStateFollowsMembershipAndRename) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        if (unshare(CLONE_NEWNET | CLONE_NEWNS) != 0 ||
+            mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0 ||
+            mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0)
+            _exit(errno == EPERM ? 77 : 1);
+        CheckBridgePortSysfs();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
     }
     int status = 0;
     ASSERT_EQ(waitpid(child, &status, 0), child);

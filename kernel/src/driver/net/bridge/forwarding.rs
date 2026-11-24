@@ -46,21 +46,19 @@ impl Drop for PortActivity<'_> {
 }
 
 impl BridgePort {
-    pub(super) fn new(
+    pub(super) fn try_new(
         id: BridgePortId,
         device: Arc<dyn BridgeEnableDevice>,
         bridge: &Arc<BridgeDriver>,
-    ) -> Self {
-        let port = BridgePort {
+    ) -> Result<Self, SystemError> {
+        Ok(BridgePort {
             id,
             bridge_enable: device.clone(),
             bridge_driver_ref: Arc::downgrade(bridge),
-            active: Arc::new(AtomicBool::new(true)),
+            active: Arc::try_new(AtomicBool::new(true)).map_err(|_| SystemError::ENOMEM)?,
             hairpin: false,
-            in_flight: Arc::new(AtomicUsize::new(0)),
-        };
-
-        port
+            in_flight: Arc::try_new(AtomicUsize::new(0)).map_err(|_| SystemError::ENOMEM)?,
+        })
     }
 
     pub(super) fn transmit(&self, frame: &[u8]) {

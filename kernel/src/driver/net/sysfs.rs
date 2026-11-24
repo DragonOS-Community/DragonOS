@@ -21,7 +21,12 @@ use intertrait::cast::CastArc;
 use log::{error, warn};
 use system_error::SystemError;
 
-use super::{class::sys_class_net_instance, Iface, NetDeivceState, Operstate};
+use super::{
+    bridge::{self, BridgeIface},
+    class::sys_class_net_instance,
+    veth::VethInterface,
+    Iface, NetDeivceState, Operstate,
+};
 use crate::process::namespace::{net_namespace::NetNamespace, NamespaceOps};
 
 /// 将设备注册到`/sys/class/net`目录下
@@ -54,6 +59,12 @@ pub fn netdev_register_kobject(
         }
         return Err(error);
     }
+    if let Some(bridge) = dev.as_any_ref().downcast_ref::<BridgeIface>() {
+        if let Err(error) = bridge::sysfs::add_port_index(bridge) {
+            device_manager().remove(&device);
+            return Err(error);
+        }
+    }
 
     Ok(())
 }
@@ -65,6 +76,9 @@ pub fn netdev_register_kobject(
 /// notification construction must never stand between a failed transaction
 /// and structural teardown.
 pub fn netdev_unregister_kobject(dev: Arc<dyn Iface>) {
+    if let Some(bridge) = dev.as_any_ref().downcast_ref::<BridgeIface>() {
+        bridge::sysfs::remove_port_index(bridge);
+    }
     device_manager().remove(&(dev as Arc<dyn Device>));
 }
 
@@ -75,7 +89,18 @@ pub(crate) fn prepare_netdev_sysfs_rename(
     dev: &Arc<dyn Iface>,
     new_name: String,
 ) -> Result<PreparedDeviceSysfsRename, SystemError> {
-    prepare_class_device_sysfs_rename(&(dev.clone() as Arc<dyn Device>), new_name)
+    let related = dev
+        .as_any_ref()
+        .downcast_ref::<VethInterface>()
+        .and_then(VethInterface::bridge_port_sysfs)
+        .map(|projection| projection.prepare_rename(&new_name))
+        .transpose()?;
+    let rename = prepare_class_device_sysfs_rename(&(dev.clone() as Arc<dyn Device>), new_name)?;
+    if let Some(related) = related {
+        rename.with_related_link(related)
+    } else {
+        Ok(rename)
+    }
 }
 
 pub(crate) fn prepare_netdev_sysfs_move(

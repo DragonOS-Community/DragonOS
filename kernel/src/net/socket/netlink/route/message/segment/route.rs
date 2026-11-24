@@ -144,6 +144,7 @@ pub enum RouteType {
     Blackhole = 6,
     Unreachable = 7,
     Prohibit = 8,
+    Throw = 9,
 }
 
 impl TryFrom<u8> for RouteType {
@@ -160,6 +161,7 @@ impl TryFrom<u8> for RouteType {
             6 => Ok(RouteType::Blackhole),
             7 => Ok(RouteType::Unreachable),
             8 => Ok(RouteType::Prohibit),
+            9 => Ok(RouteType::Throw),
             _ => Err(SystemError::EINVAL),
         }
     }

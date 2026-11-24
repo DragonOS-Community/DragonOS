@@ -513,7 +513,8 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
                          uint8_t prefix_len, uint32_t oif, uint8_t scope, uint32_t seq,
                          const char* gateway = nullptr, uint32_t route_flags = 0,
                          const char* preferred_source = nullptr,
-                         std::optional<Ipv6SourcePrefix> source_prefix = std::nullopt) {
+                         std::optional<Ipv6SourcePrefix> source_prefix = std::nullopt,
+                         uint8_t kind = RTN_UNICAST, uint8_t table = RT_TABLE_UNSPEC) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -525,7 +526,8 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
     rtm->rtm_dst_len = prefix_len;
     rtm->rtm_protocol = RTPROT_STATIC;
     rtm->rtm_scope = scope;
-    rtm->rtm_type = RTN_UNICAST;
+    rtm->rtm_type = kind;
+    rtm->rtm_table = table;
     rtm->rtm_flags = route_flags;
 
     in6_addr dst = {};
@@ -533,7 +535,9 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
         return EINVAL;
     }
     AddAttr(nlh, sizeof(buf), RTA_DST, &dst, sizeof(dst));
-    AddAttr(nlh, sizeof(buf), RTA_OIF, &oif, sizeof(oif));
+    if (oif != 0) {
+        AddAttr(nlh, sizeof(buf), RTA_OIF, &oif, sizeof(oif));
+    }
     if (source_prefix.has_value()) {
         in6_addr source = {};
         if (inet_pton(AF_INET6, source_prefix->address, &source) != 1) {

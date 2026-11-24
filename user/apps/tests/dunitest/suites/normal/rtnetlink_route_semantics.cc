@@ -530,6 +530,68 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
               0);
 }
 
+TEST(RtnetlinkRouteSemantics, Ipv6RejectTerminatesLookupAndThrowSkipsTheTable) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto run = []() {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            const unsigned lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            uint32_t seq = 1;
+            constexpr auto request = NLM_F_REQUEST | NLM_F_ACK;
+            constexpr auto add = request | NLM_F_CREATE | NLM_F_EXCL;
+            constexpr auto prefix = "2001:db8:29:aa::";
+            auto mutate = [&](uint16_t operation, uint16_t flags, uint8_t kind,
+                              uint8_t table = RT_TABLE_MAIN) {
+                return SendIpv6RouteRequest(route.Get(), operation, flags, prefix, 64, 0,
+                                            RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                            std::nullopt, kind, table);
+            };
+            auto connect_error = []() {
+                FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+                if (sender.Get() < 0) return errno;
+                sockaddr_in6 peer{};
+                peer.sin6_family = AF_INET6;
+                peer.sin6_port = htons(23029);
+                if (inet_pton(AF_INET6, "2001:db8:29:aa::9", &peer.sin6_addr) != 1) return EINVAL;
+                return connect(sender.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0
+                    ? 0 : errno;
+            };
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, false, ++seq), 0);
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add, RTN_UNREACHABLE), 0);
+            EXPECT_TRUE(FindIpv6Route(route.Get(), prefix, 64, lo, ++seq, RTN_UNREACHABLE));
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, ++seq), 0);
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, lo, "fd29:aa::1", 64, ++seq), 0);
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "2001:db8:29::", 48,
+                                          lo, RT_SCOPE_UNIVERSE, ++seq), 0);
+            EXPECT_EQ(connect_error(), EHOSTUNREACH);
+            EXPECT_EQ(mutate(RTM_DELROUTE, request, RTN_UNREACHABLE), 0);
+
+            for (const auto [kind, error] :
+                 {std::pair{RTN_PROHIBIT, EACCES}, std::pair{RTN_BLACKHOLE, EINVAL}}) {
+                ASSERT_EQ(mutate(RTM_NEWROUTE, add, kind), 0);
+                EXPECT_TRUE(FindIpv6Route(route.Get(), prefix, 64, lo, ++seq, kind));
+                EXPECT_EQ(connect_error(), error);
+                EXPECT_EQ(mutate(RTM_DELROUTE, request, kind), 0);
+            }
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add, RTN_THROW, RT_TABLE_LOCAL), 0);
+            EXPECT_TRUE(FindIpv6Route(route.Get(), prefix, 64, lo, ++seq, RTN_THROW));
+            EXPECT_EQ(connect_error(), 0);
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add, RTN_THROW), 0);
+            EXPECT_EQ(connect_error(), ENETUNREACH);
+        };
+        run();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkRouteSemantics, RouteProjectionScalesBeyondFormerFixedCapacity) {
     FdGuard fd(OpenRouteSocket());
     ASSERT_GE(fd.Get(), 0) << "socket(AF_NETLINK, NETLINK_ROUTE) failed: " << ErrnoString(errno);

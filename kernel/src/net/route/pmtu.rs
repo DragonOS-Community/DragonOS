@@ -181,7 +181,10 @@ pub(crate) fn lookup_output_route(
         } else {
             0
         };
-        routes.lookup_socket_output(wire.1, required_oif, Some(original.0), cookie)
+        routes
+            .lookup_socket_output(wire.1, required_oif, Some(original.0), cookie)?
+            .require_reachable()
+            .ok()
     } else {
         routes.lookup(wire.1, required_oif)
     }

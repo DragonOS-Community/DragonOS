@@ -187,15 +187,20 @@ pub(crate) fn send_ipv4_frag_needed(
     Ok(())
 }
 
-/// A router may report Packet Too Big for a multicast destination, unlike
-/// most other ICMPv6 errors. The source must still be a routable unicast and
-/// an ICMPv6 error must not cause another ICMPv6 error.
-pub(crate) fn ipv6_ptb_eligible(bytes: &[u8]) -> bool {
+pub(crate) enum Ipv6ForwardError {
+    PacketTooBig(usize),
+    Unreachable { code: u8, ingress_ifindex: u32 },
+}
+
+fn ipv6_error_eligible(bytes: &[u8], error: &Ipv6ForwardError) -> bool {
     let Ok(ip) = Ipv6Packet::new_checked(bytes) else {
         return false;
     };
     let source = ip.src_addr();
     if source.is_unspecified() || source.is_multicast() || source.is_loopback() {
+        return false;
+    }
+    if ip.dst_addr().is_multicast() && !matches!(error, Ipv6ForwardError::PacketTooBig(_)) {
         return false;
     }
     // Walk extension headers before testing the final protocol. Truncated
@@ -231,12 +236,52 @@ pub(crate) fn send_ipv6_packet_too_big(
     mtu: usize,
     trigger_context: Option<&CtPacketContext>,
 ) -> Result<(), SystemError> {
-    if !ipv6_ptb_eligible(trigger) {
+    send_ipv6_forward_error(
+        netns,
+        trigger,
+        Ipv6ForwardError::PacketTooBig(mtu),
+        trigger_context,
+    )
+}
+
+pub(crate) fn send_ipv6_forward_error(
+    netns: &Arc<NetNamespace>,
+    trigger: &[u8],
+    error: Ipv6ForwardError,
+    trigger_context: Option<&CtPacketContext>,
+) -> Result<(), SystemError> {
+    if !ipv6_error_eligible(trigger, &error) {
         return Ok(());
+    }
+    if let Ipv6ForwardError::Unreachable {
+        ingress_ifindex, ..
+    } = error
+    {
+        if ingress_ifindex != crate::net::LOOPBACK_IFINDEX as u32
+            && !netns.router().admit_ipv6_reject_reply()
+        {
+            return Ok(());
+        }
     }
     let ip = Ipv6Packet::new_checked(trigger).map_err(|_| SystemError::EINVAL)?;
     let destination = IpAddress::Ipv6(ip.src_addr());
-    let resolved = super::route::resolve_ipv6_send_route(netns, destination, None, None)?;
+    let (message_type, code, info, required_oif) = match error {
+        Ipv6ForwardError::PacketTooBig(mtu) => {
+            (2, 0, mtu.max(1280).min(u32::MAX as usize) as u32, None)
+        }
+        Ipv6ForwardError::Unreachable {
+            code,
+            ingress_ifindex,
+        } => (
+            1,
+            code,
+            0,
+            ip.src_addr()
+                .is_unicast_link_local()
+                .then_some(ingress_ifindex),
+        ),
+    };
+    let resolved = super::route::resolve_ipv6_send_route(netns, destination, required_oif, None)?;
     let route = resolved.decision;
     let quote_len = min(trigger.len(), min(1232, route.ip_mtu.saturating_sub(48)));
     if quote_len < 40 {
@@ -256,8 +301,9 @@ pub(crate) fn send_ipv6_packet_too_big(
     bytes[7] = 64;
     bytes[8..24].copy_from_slice(&resolved.source.octets());
     bytes[24..40].copy_from_slice(&ip.src_addr().octets());
-    bytes[40] = 2;
-    bytes[44..48].copy_from_slice(&(mtu.max(1280).min(u32::MAX as usize) as u32).to_be_bytes());
+    bytes[40] = message_type;
+    bytes[41] = code;
+    bytes[44..48].copy_from_slice(&info.to_be_bytes());
     bytes[48..].copy_from_slice(&trigger[..quote_len]);
     Icmpv6Packet::new_unchecked(&mut bytes[40..]).fill_checksum(&resolved.source, &ip.src_addr());
     let related = trigger_context

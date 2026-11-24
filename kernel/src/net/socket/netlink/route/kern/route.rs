@@ -66,27 +66,44 @@ pub(super) fn do_new_route(
     let parsed = ParsedRouteRequest::from_segment(request)?;
     let table = effective_route_table(request.body().table, parsed.table);
     let onlink = request.body().flags.contains(RouteFlags::ONLINK);
-    if request.body().family == AddressFamily::INet6
+    let reject = request.body().family == AddressFamily::INet6
+        && route::is_ipv6_reject_or_throw(request.body().type_);
+    if !reject
+        && request.body().family == AddressFamily::INet6
         && parsed
             .gateway
             .is_some_and(|gateway| gateway.is_unspecified())
     {
         return Err(SystemError::EINVAL);
     }
-    let gateway = normalize_ip(parsed.gateway);
+    let gateway = if reject {
+        None
+    } else {
+        normalize_ip(parsed.gateway)
+    };
+    let requested_oif = parsed.oif.filter(|oif| *oif != 0);
     let oif = match gateway {
         Some(gateway) => route::resolve_gateway_oif(
             &netns,
             gateway,
             table,
-            parsed.oif.filter(|oif| *oif != 0),
+            requested_oif,
             onlink,
             request.body().scope,
         )?,
-        None => parsed
-            .oif
-            .filter(|oif| *oif != 0)
-            .ok_or(SystemError::EINVAL)?,
+        None if reject => {
+            if let Some(oif) = requested_oif {
+                let devices = netns.device_list();
+                let iface = devices.get(&(oif as usize)).ok_or(SystemError::ENODEV)?;
+                if onlink && !iface.flags().contains(InterfaceFlags::UP) {
+                    return Err(SystemError::ENETDOWN);
+                }
+            } else if onlink {
+                return Err(SystemError::EINVAL);
+            }
+            crate::net::LOOPBACK_IFINDEX as u32
+        }
+        None => requested_oif.ok_or(SystemError::EINVAL)?,
     };
     let entry = RouteEntry {
         destination: route::canonical_cidr(parsed.destination),
@@ -277,9 +294,9 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
     if request.body().type_ > RTN_MAX {
         return Err(SystemError::EINVAL);
     }
-    if request.body().type_ != RouteType::Unspec as u8
-        && request.body().type_ != RouteType::Unicast as u8
-    {
+    let reject = request.body().family == AddressFamily::INet6
+        && route::is_ipv6_reject_or_throw(request.body().type_);
+    if !reject && !matches!(request.body().type_, route::RTN_UNSPEC | RTN_UNICAST) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     let gateway = request.attrs().iter().find_map(|attr| match attr {
@@ -304,7 +321,7 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
     }
     validate_prefix_lengths(request)?;
 
-    if request.body().flags.contains(RouteFlags::ONLINK) {
+    if !reject && request.body().flags.contains(RouteFlags::ONLINK) {
         let oif = request.attrs().iter().find_map(|attr| match attr {
             RouteAttr::Oif(oif) => Some(*oif),
             _ => None,
@@ -451,7 +468,7 @@ fn lookup_route(
     if parsed.iif.is_some_and(|iif| iif != 0) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
-    if let Some(oif) = requested_oif {
+    if let (IpAddress::Ipv4(_), Some(oif)) = (destination, requested_oif) {
         ensure_iface_up(&netns, oif)?;
     }
     let requested_source = parsed
@@ -488,8 +505,16 @@ fn lookup_route(
             Some(IpAddress::Ipv6(source)) => Some(source),
             _ => None,
         };
-        let decision = route::lookup_ipv6_output(&netns, destination_v6, requested_oif, source)
-            .ok_or(SystemError::ENETUNREACH)?;
+        let decision = route::lookup_ipv6_output(&netns, destination_v6, requested_oif, source);
+        if let Some(rejection) =
+            decision.and_then(|decision| route::ipv6_route_rejection(decision.matched.kind))
+        {
+            return Err(rejection.error);
+        }
+        if let Some(oif) = requested_oif {
+            ensure_iface_up(&netns, oif)?;
+        }
+        let decision = decision.ok_or(SystemError::ENETUNREACH)?;
         let iface = netns
             .device_list()
             .get(&(decision.oif as usize))

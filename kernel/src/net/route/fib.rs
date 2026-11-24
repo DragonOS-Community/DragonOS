@@ -813,9 +813,10 @@ impl FibTable {
         destination: IpAddress,
         mut key: impl FnMut(u32) -> FibLookupKey,
     ) -> Option<RouteLookupResult> {
-        builtin_rule_tables(destination)
-            .iter()
-            .find_map(|table| self.lookup_key(key(*table)))
+        builtin_rule_tables(destination).iter().find_map(|table| {
+            self.lookup_key(key(*table))
+                .filter(|route| route.matched.kind != super::RTN_THROW)
+        })
     }
 
     pub(super) fn lookup_output(&self, destination: IpAddress) -> Option<RouteLookupResult> {
@@ -962,6 +963,7 @@ impl FibTable {
         self.index.has_ipv4_routes(RT_TABLE_DEFAULT)
             || self.index.has_ipv6_routes(RT_TABLE_MAIN)
             || self.has_ipv6_source_routes()
+            || self.index.has_ipv6_special_routes()
     }
 
     pub(super) fn has_ipv6_source_routes(&self) -> bool {
@@ -981,7 +983,12 @@ impl FibTable {
             required_oif,
             minimum_scope,
         ))?;
+        Self::gateway_device(winner, destination)
+    }
+
+    fn gateway_device(winner: RouteLookupResult, destination: IpAddress) -> Option<u32> {
         if winner.matched.gateway.is_some()
+            || super::is_ipv6_reject_or_throw(winner.matched.kind)
             || (is_ipv4(destination) && winner.matched.scope < RT_SCOPE_LINK)
         {
             return None;
@@ -989,10 +996,9 @@ impl FibTable {
         Some(winner.oif)
     }
 
-    /// Resolve a gateway using Linux's table-validation order: a non-main
-    /// route first consults its own table, then falls back to the built-in
-    /// family rule chain. The chain is shared with packet lookup so IPv4's
-    /// default-table fallback and IPv6's lack of one cannot diverge.
+    /// Resolve a gateway using the built-in table order after checking the
+    /// route's own table. IPv4 only needs the precheck for non-main routes.
+    /// IPv6 validates the first raw winner of the fallback.
     pub(super) fn resolve_gateway_with_builtin_rules(
         &self,
         destination: IpAddress,
@@ -1000,6 +1006,24 @@ impl FibTable {
         required_oif: Option<u32>,
         minimum_scope: Option<u8>,
     ) -> Option<u32> {
+        if !is_ipv4(destination) {
+            return self
+                .resolve_gateway(destination, route_table, required_oif, minimum_scope)
+                .or_else(|| {
+                    // Linux nexthop validation examines the first raw FIB
+                    // winner. A throw can skip a table for normal traffic,
+                    // but is not a usable route to the gateway.
+                    let winner = builtin_rule_tables(destination).iter().find_map(|&table| {
+                        self.lookup_key(FibLookupKey::gateway(
+                            destination,
+                            table,
+                            required_oif,
+                            minimum_scope,
+                        ))
+                    })?;
+                    Self::gateway_device(winner, destination)
+                });
+        }
         let in_route_table = (route_table != super::RT_TABLE_MAIN)
             .then(|| self.resolve_gateway(destination, route_table, required_oif, minimum_scope))
             .flatten();

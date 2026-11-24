@@ -16,7 +16,33 @@ pub(crate) const RTN_LOCAL: u8 = 2;
 pub(crate) const RTN_BROADCAST: u8 = 3;
 pub(crate) const RTN_ANYCAST: u8 = 4;
 pub(crate) const RTN_MULTICAST: u8 = 5;
+pub(crate) const RTN_BLACKHOLE: u8 = 6;
 pub(crate) const RTN_UNREACHABLE: u8 = 7;
+pub(crate) const RTN_PROHIBIT: u8 = 8;
+pub(crate) const RTN_THROW: u8 = 9;
+
+pub(crate) struct Ipv6RouteRejection {
+    pub(crate) error: system_error::SystemError,
+    pub(crate) icmp_code: Option<u8>,
+}
+
+pub(crate) const fn ipv6_route_rejection(kind: u8) -> Option<Ipv6RouteRejection> {
+    use system_error::SystemError;
+    let (error, icmp_code) = match kind {
+        RTN_UNREACHABLE => (SystemError::EHOSTUNREACH, Some(0)),
+        RTN_PROHIBIT => (SystemError::EACCES, Some(1)),
+        RTN_BLACKHOLE => (SystemError::EINVAL, None),
+        _ => return None,
+    };
+    Some(Ipv6RouteRejection { error, icmp_code })
+}
+
+pub(crate) const fn is_ipv6_reject_or_throw(kind: u8) -> bool {
+    matches!(
+        kind,
+        RTN_BLACKHOLE | RTN_UNREACHABLE | RTN_PROHIBIT | RTN_THROW
+    )
+}
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RouterPreference {

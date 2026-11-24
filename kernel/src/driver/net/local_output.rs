@@ -318,6 +318,9 @@ impl OutputBackendPolicy<'_> {
             source,
             meta.route_cookie,
         ) {
+            Some(route) if crate::net::route::ipv6_route_rejection(route.kind).is_some() => {
+                OutputBackendDecision::Deferred(None)
+            }
             Some(route) if route.kind == crate::net::route::RTN_LOCAL => {
                 OutputBackendDecision::Deferred(Some(route))
             }
@@ -1402,7 +1405,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 .map_err(|_| IpOutputError::NoRoute)?,
             Err(_) => return Err(IpOutputError::NoRoute),
         };
-        let mut route = if class == IpOutputClass::LinkLocalControl
+        let route = if class == IpOutputClass::LinkLocalControl
             || destination.version() == IpVersion::Ipv6
                 && destination.is_multicast()
                 && self.backend_policy.owner_ifindex != 0
@@ -1434,6 +1437,9 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 .lookup_socket_output(destination, required_oif, source_v6, meta.route_cookie)
                 .ok_or(IpOutputError::NoRoute)?
         };
+        let mut route = route
+            .require_reachable()
+            .map_err(|_| IpOutputError::NoRoute)?;
         let version = destination.version();
         let ipv4 = version == IpVersion::Ipv4;
         let ruleset = self
@@ -1498,7 +1504,9 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 .backend_policy
                 .routes
                 .lookup_with_source(new_destination, route.required_oif, source_v6)
-                .ok_or(IpOutputError::NoRoute)?;
+                .ok_or(IpOutputError::NoRoute)?
+                .require_reachable()
+                .map_err(|_| IpOutputError::NoRoute)?;
             let egress = self
                 .backend_policy
                 .routes

@@ -352,6 +352,7 @@ impl RawSocket {
                         Some(hint.actual.source),
                     )
                     .ok_or(SystemError::ENETUNREACH)?
+                    .require_reachable()?
             };
             return Ok(crate::net::route::pmtu::path_mtu(
                 &self.netns,

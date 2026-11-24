@@ -72,6 +72,15 @@ pub(crate) struct OutputRouteDecision {
     pub(crate) table: u32,
 }
 
+impl OutputRouteDecision {
+    pub(crate) fn require_reachable(self) -> Result<Self, SystemError> {
+        match ipv6_route_rejection(self.kind) {
+            Some(rejection) => Err(rejection.error),
+            None => Ok(self),
+        }
+    }
+}
+
 impl OutputRouteGuard<'_> {
     /// Capture the configured address order while the FIB read view is held,
     /// before entering any smoltcp interface/socket lock. Address commits
@@ -238,6 +247,9 @@ impl OutputRouteGuard<'_> {
             return RTN_UNREACHABLE;
         };
         let route = route.matched;
+        if ipv6_route_rejection(route.kind).is_some() {
+            return route.kind;
+        }
         // As in ipv6_anycast_destination(), an on-link subnet's router
         // anycast address is its prefix address (except on /127 and /128).
         if route.kind == RTN_UNICAST

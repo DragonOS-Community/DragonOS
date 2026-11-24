@@ -1407,7 +1407,8 @@ impl UdpSocket {
         };
         let route = routes
             .lookup_with_source(destination, route.required_oif, Some(lookup_source))
-            .ok_or(SystemError::ENETUNREACH)?;
+            .ok_or(SystemError::ENETUNREACH)?
+            .require_reachable()?;
         Ok(crate::net::route::pmtu::path_mtu(
             &self.netns,
             route,

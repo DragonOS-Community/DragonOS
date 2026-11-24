@@ -42,6 +42,7 @@ use unified_init::macros::unified_init;
 mod forwarding;
 mod iface;
 mod ip;
+pub(super) mod sysfs;
 
 pub use self::forwarding::{Bridge, BridgePort, BridgePortId};
 use self::forwarding::{BridgeEgress, BRIDGE_MAX_LOCAL_FRAMES, BRIDGE_MTU};
@@ -106,11 +107,11 @@ impl BridgeDriver {
         if device.common_bridge_data().is_some() {
             return Err(SystemError::EBUSY);
         }
-        let port = BridgePort::new(
+        let port = BridgePort::try_new(
             self.next_port_id(),
             device.clone(),
             &self.self_ref.upgrade().unwrap(),
-        );
+        )?;
         self.inner.lock().add_port(port.id, port.clone())?;
         device.set_common_bridge_data(&port);
         self.update_carrier_from_ports();
@@ -398,6 +399,13 @@ pub struct BridgeCommonData {
 }
 
 impl BridgeCommonData {
+    fn is_forwarding(&self) -> Option<bool> {
+        let driver = self.bridge_driver_ref.upgrade()?;
+        let bridge = driver.inner.lock();
+        let port = bridge.ports.get(&self.id)?;
+        Some(driver.active.load(Ordering::Acquire) && port.can_forward())
+    }
+
     /// Return the bridge ifindex and mode for this membership.
     pub(crate) fn hairpin_state(&self) -> Option<(u32, bool)> {
         let driver = self.bridge_driver_ref.upgrade()?;

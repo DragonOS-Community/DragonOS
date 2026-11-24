@@ -21,6 +21,17 @@ pub(crate) struct PreparedDeviceSysfsRename {
 }
 
 impl PreparedDeviceSysfsRename {
+    pub(crate) fn with_related_link(self, link: KernFSRenameSpec) -> Result<Self, SystemError> {
+        let rename = self
+            .rename
+            .ok_or(SystemError::EIO)?
+            .with_related_link(link)?;
+        Ok(Self {
+            rename: Some(rename),
+            old_devpath: self.old_devpath,
+        })
+    }
+
     pub(crate) fn commit(self) -> Result<Option<String>, SystemError> {
         if let Some(rename) = self.rename {
             rename.commit()?;

@@ -8,7 +8,7 @@ use super::{
     KernFSNamespaceTag, KernInodeType,
 };
 
-/// One inode re-key requested as part of a two-node kernfs rename.
+/// One inode re-key requested as part of a kernfs rename.
 ///
 /// All strings are owned before commit so publication never allocates.
 pub struct KernFSRenameSpec {
@@ -107,20 +107,22 @@ impl PreparedRenameEntry {
         children: &mut KernFSChildren,
         additions: usize,
     ) -> Result<bool, SystemError> {
-        if self.old_key.namespace == self.new_key.namespace {
+        if self.old_key == self.new_key {
             return Ok(false);
         }
-        children.reserve_rekey_destination(self.new_key.namespace, additions)
+        children.reserve_children(self.new_key.namespace, additions)
     }
 
     fn publish(self, children: &mut KernFSChildren) {
         let new_namespace = self.new_key.namespace;
-        children
-            .rekey(
-                &KernFSChildKeyRef::new(&self.old_key.name, self.old_key.namespace),
-                self.new_key,
-            )
-            .expect("prepared kernfs rename source disappeared under mutation gate");
+        if self.old_key != self.new_key {
+            children
+                .rekey(
+                    &KernFSChildKeyRef::new(&self.old_key.name, self.old_key.namespace),
+                    self.new_key,
+                )
+                .expect("prepared kernfs rename source disappeared under mutation gate");
+        }
 
         let mut inner = self.inode.inner.write();
         inner.name = self.new_inode_name;
@@ -131,10 +133,10 @@ impl PreparedRenameEntry {
     }
 }
 
-/// A bounded transaction that re-keys two existing kernfs inodes without
-/// replacing either inode object.
+/// Re-key a device and its class link without replacing either inode.
 pub struct PreparedKernFSRename {
     entries: [PreparedRenameEntry; 2],
+    related: Option<PreparedRenameEntry>,
     #[cfg(test)]
     fail_second_reservation: bool,
 }
@@ -153,9 +155,27 @@ impl PreparedKernFSRename {
         }
         Ok(Self {
             entries,
+            related: None,
             #[cfg(test)]
             fail_second_reservation: false,
         })
+    }
+
+    /// A bridge's port link adds one parent to a same-namespace device rename.
+    pub(crate) fn with_related_link(mut self, spec: KernFSRenameSpec) -> Result<Self, SystemError> {
+        let related = PreparedRenameEntry::prepare(spec)?;
+        let [first, second] = &self.entries;
+        if Arc::ptr_eq(&first.parent, &second.parent)
+            || self.entries.iter().any(|entry| {
+                Arc::ptr_eq(&entry.parent, &related.parent)
+                    || entry.old_key.namespace != entry.new_key.namespace
+            })
+            || related.old_key.namespace != related.new_key.namespace
+        {
+            return Err(SystemError::EINVAL);
+        }
+        self.related = Some(related);
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -176,11 +196,13 @@ impl PreparedKernFSRename {
     }
 
     /// Revalidates both parent maps before changing either one. Publication is
-    /// allocation-free because each re-key removes and inserts one entry in the
-    /// same existing namespace bucket.
+    /// allocation-free after reserving the destination for each modified key.
     pub fn commit(self) -> Result<(), SystemError> {
         let fail_second_reservation = self.fail_second_reservation();
         let [first, second] = self.entries;
+        if let Some(related) = self.related {
+            return commit_distinct_same_bucket([first, second, related]);
+        }
         if Arc::ptr_eq(&first.parent, &second.parent) {
             return commit_same_parent(first, second, fail_second_reservation);
         }
@@ -220,6 +242,25 @@ impl PreparedKernFSRename {
     }
 }
 
+fn commit_distinct_same_bucket(mut entries: [PreparedRenameEntry; 3]) -> Result<(), SystemError> {
+    entries.sort_unstable_by_key(PreparedRenameEntry::parent_id);
+    let parents = entries.each_ref().map(|entry| entry.parent.clone());
+    let _gates = parents
+        .each_ref()
+        .map(|parent| parent.child_mutation.lock());
+    let mut children = parents.each_ref().map(|parent| parent.children.lock());
+    for (index, entry) in entries.iter().enumerate() {
+        entry.validate(&children[index], &parents[index].lazy_list.lock())?;
+    }
+    for (entry, children) in entries.iter().zip(&mut children) {
+        entry.reserve_destination(children, 1)?;
+    }
+    for (entry, children) in entries.into_iter().zip(&mut children) {
+        entry.publish(children);
+    }
+    Ok(())
+}
+
 fn commit_same_parent(
     first: PreparedRenameEntry,
     second: PreparedRenameEntry,
@@ -235,17 +276,14 @@ fn commit_same_parent(
     first.validate(&children, &lazy)?;
     second.validate(&children, &lazy)?;
     drop(lazy);
-    let first_crosses = first.old_key.namespace != first.new_key.namespace;
-    let second_crosses = second.old_key.namespace != second.new_key.namespace;
-    let first_bucket_created = if first_crosses {
-        children.reserve_rekey_destination(
-            first.new_key.namespace,
-            1 + usize::from(second_crosses && first.new_key.namespace == second.new_key.namespace),
-        )?
-    } else {
-        false
-    };
-    if second_crosses && (!first_crosses || first.new_key.namespace != second.new_key.namespace) {
+    let first_changes = first.old_key != first.new_key;
+    let second_changes = second.old_key != second.new_key;
+    let shared_destination = first.new_key.namespace == second.new_key.namespace;
+    let first_bucket_created = first.reserve_destination(
+        &mut children,
+        1 + usize::from(second_changes && shared_destination),
+    )?;
+    if second_changes && (!first_changes || !shared_destination) {
         let second_reservation = if fail_second_reservation {
             Err(SystemError::ENOMEM)
         } else {

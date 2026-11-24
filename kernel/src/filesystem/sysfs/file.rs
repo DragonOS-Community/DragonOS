@@ -2,7 +2,6 @@ use core::{intrinsics::unlikely, ops::BitAnd};
 
 use alloc::{
     boxed::Box,
-    string::ToString,
     sync::{Arc, Weak},
 };
 use log::warn;
@@ -14,7 +13,7 @@ use crate::{
     filesystem::{
         kernfs::{
             callback::{KernCallbackData, KernFSCallback, KernInodePrivateData},
-            KernFSInode,
+            copy_name, KernFSInode,
         },
         sysfs::{SysFSOps, SysFSOpsSupport},
         vfs::{InodeMode, PollStatus},
@@ -167,7 +166,7 @@ impl SysFS {
 
         let sys_priv = SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, Some(attr), None));
         let r = parent.add_file(
-            attr.name().to_string(),
+            copy_name(attr.name())?,
             mode.bitand(InodeMode::S_IRWXUGO),
             Some(4096),
             Some(KernInodePrivateData::SysFS(sys_priv)),
@@ -279,7 +278,7 @@ impl SysFS {
         let sys_priv =
             SysFSKernPrivateData::File(SysKernFilePriv::new(&kobj, None, Some(attr.clone())));
         let r = parent.add_file(
-            attr.name().to_string(),
+            copy_name(attr.name())?,
             mode.bitand(InodeMode::S_IRWXUGO),
             Some(attr.size()),
             Some(KernInodePrivateData::SysFS(sys_priv)),

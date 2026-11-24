@@ -11,7 +11,9 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::net::bridge::{BridgeCommonData, BridgePort, BridgePortId};
+use crate::driver::net::bridge::{
+    sysfs::BridgePortSysfs, BridgeCommonData, BridgePort, BridgePortId,
+};
 use crate::driver::net::napi::{napi_schedule, NapiStruct};
 use crate::driver::net::register_netdevice;
 use crate::driver::net::types::InterfaceFlags;
@@ -500,9 +502,18 @@ pub struct VethCommonData {
     peer_veth: Weak<VethInterface>,
 
     bridge_common_data: Option<BridgeCommonData>,
+    bridge_port_sysfs: Option<BridgePortSysfs>,
 }
 
 impl VethInterface {
+    pub(super) fn set_bridge_port_sysfs(&self, projection: BridgePortSysfs) {
+        self.inner.lock().bridge_port_sysfs = Some(projection);
+    }
+
+    pub(super) fn bridge_port_sysfs(&self) -> Option<BridgePortSysfs> {
+        self.inner.lock().bridge_port_sysfs.clone()
+    }
+
     /// A netns move must not carry protocol reassembly, fragments, neighbors,
     /// or multicast state across the namespace boundary. Prepare a fresh
     /// smoltcp interface before the move's irreversible sysfs transaction.
@@ -1028,6 +1039,11 @@ impl BridgeEnableDevice for VethInterface {
             .is_some_and(|data| data.id == bridge_id)
         {
             inner.bridge_common_data = None;
+            let projection = inner.bridge_port_sysfs.take();
+            drop(inner);
+            if let Some(projection) = projection {
+                projection.remove();
+            }
         }
     }
 }

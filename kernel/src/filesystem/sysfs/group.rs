@@ -1,13 +1,13 @@
 use core::intrinsics::unlikely;
 
-use alloc::{string::ToString, sync::Arc};
+use alloc::sync::Arc;
 use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
     driver::base::kobject::KObject,
     filesystem::{
-        kernfs::{callback::KernInodePrivateData, KernFSInode},
+        kernfs::{callback::KernInodePrivateData, copy_name, KernFSInode},
         sysfs::{dir::SysKernDirPriv, sysfs_instance, SysFSKernPrivateData},
         vfs::{IndexNode, InodeMode},
     },
@@ -42,7 +42,7 @@ impl SysFS {
                     "Failed to create group '{}', err={e:?}",
                     group.name().unwrap_or("")
                 );
-                for j in (0..=i).rev() {
+                for j in (0..i).rev() {
                     self.remove_group(kobj, groups[j]).ok();
                 }
                 return Err(e);
@@ -79,7 +79,7 @@ impl SysFS {
                 ));
                 parent_inode = kobj_inode
                     .add_dir(
-                        group.name().unwrap().to_string(),
+                        copy_name(group.name().unwrap())?,
                         InodeMode::S_IRWXU | InodeMode::S_IRUGO | InodeMode::S_IXUGO,
                         Some(private_data),
                         None,
@@ -96,8 +96,8 @@ impl SysFS {
         }
 
         if let Err(e) = self.group_create_files(parent_inode.clone(), kobj, group, update) {
-            if group.name().is_some() {
-                parent_inode.remove_inode_include_self();
+            if let Some(name) = group.name() {
+                kobj_inode.remove(name).ok();
             }
             return Err(e);
         }

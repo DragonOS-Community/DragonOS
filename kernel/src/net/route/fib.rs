@@ -963,7 +963,11 @@ impl FibTable {
         self.index.has_ipv4_routes(RT_TABLE_DEFAULT)
             || self.index.has_ipv6_routes(RT_TABLE_MAIN)
             || self.has_ipv6_source_routes()
-            || self.index.has_ipv6_special_routes()
+            || self.has_ipv6_special_routes()
+    }
+
+    pub(super) fn has_ipv6_special_routes(&self) -> bool {
+        self.index.has_ipv6_special_routes()
     }
 
     pub(super) fn has_ipv6_source_routes(&self) -> bool {

@@ -467,12 +467,12 @@ fn sig_stop(sig: Signal) {
     // Ordinary members join the same generation/count transaction as ptraced
     // members, and report to the real parent only once every participant stops.
     let fresh_stop = crate::process::ptrace::stop_group_at_user_boundary(&pcb, sig);
-    drop(guard);
-    // Completion is already committed. Notify before a subsequent ptrace
-    // attach can park this receiver waiting for its tracer to resume it.
+    // Notify before IRQ preemption or a subsequent ptrace attach can park
+    // the stopped task.
     if fresh_stop {
         pcb.notify_natural_group_stop(sig);
     }
+    drop(guard);
     pcb.handle_pending_group_stop();
     // attach may convert this task to ptraced during the schedule inside mark_stop()
     // and queue a trap. The STOPPED→TRACED transition must complete immediately before

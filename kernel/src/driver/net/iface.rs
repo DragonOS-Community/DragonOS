@@ -151,6 +151,8 @@ impl From<SystemError> for RouteSendError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalPacketOrigin {
     LinkIngressPending,
+    /// A reassembled link-ingress packet originally arrived at a group MAC.
+    LinkGroupIngressPending,
     LinkIngressPreRouted,
     LocalOutput,
     LocalInputDone,
@@ -255,19 +257,26 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch_with_fragment<I: Iface + ?Si
     expected_epoch: Option<u64>,
     forward_fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
 ) -> Result<(), SystemError> {
-    if ct_context.is_some() && origin == LocalPacketOrigin::LinkIngressPending {
+    if ct_context.is_some()
+        && matches!(
+            origin,
+            LocalPacketOrigin::LinkIngressPending | LocalPacketOrigin::LinkGroupIngressPending
+        )
+    {
         return Err(SystemError::EINVAL);
     }
     let packet = LocalInputPacket {
         ingress_ifindex,
         ingress_stage: match origin {
-            LocalPacketOrigin::LinkIngressPending => IngressStage::Pending,
+            LocalPacketOrigin::LinkIngressPending | LocalPacketOrigin::LinkGroupIngressPending => {
+                IngressStage::Pending
+            }
             LocalPacketOrigin::LinkIngressPreRouted => IngressStage::PreRoutingDone,
             LocalPacketOrigin::LocalOutput => IngressStage::LocalOutput,
             LocalPacketOrigin::LocalInputDone => IngressStage::LocalInputDone,
         },
         broadcast,
-        destination_mac: if broadcast {
+        destination_mac: if broadcast || origin == LocalPacketOrigin::LinkGroupIngressPending {
             smoltcp::wire::EthernetAddress::BROADCAST
         } else {
             iface.mac()

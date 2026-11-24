@@ -133,10 +133,10 @@ pub(crate) enum RoutedIngressWork {
         mtu: usize,
         ct_context: Option<CtPacketContext>,
     },
-    MtuErrorIpv6 {
+    ErrorIpv6 {
         netns: Arc<NetNamespace>,
         packet: PacketBuffer,
-        mtu: usize,
+        error: super::forward_mtu::Ipv6ForwardError,
         ct_context: Option<CtPacketContext>,
     },
 }
@@ -187,19 +187,19 @@ impl RoutedIngressWork {
                 }
                 return;
             }
-            Self::MtuErrorIpv6 {
+            Self::ErrorIpv6 {
                 netns,
                 packet,
-                mtu,
+                error,
                 ct_context,
             } => {
-                if let Err(error) = super::forward_mtu::send_ipv6_packet_too_big(
+                if let Err(error) = super::forward_mtu::send_ipv6_forward_error(
                     &netns,
                     &packet,
-                    mtu,
+                    error,
                     ct_context.as_ref(),
                 ) {
-                    log::debug!("forward MTU feedback discarded: {:?}", error);
+                    log::debug!("IPv6 forwarding feedback discarded: {:?}", error);
                 }
                 return;
             }
@@ -444,8 +444,7 @@ impl<'a> NetIngressFilter<'a> {
                 let Some(target) = routes.ingress_device(route.oif) else {
                     return RouteInputVerdict::Drop;
                 };
-                if !target.flags().contains(InterfaceFlags::UP) || self.work.try_reserve(1).is_err()
-                {
+                if !target.flags().contains(InterfaceFlags::UP) {
                     return RouteInputVerdict::Drop;
                 }
                 let mtu = target.mtu();
@@ -462,18 +461,13 @@ impl<'a> NetIngressFilter<'a> {
                         .get()
                         .is_some_and(|info| info.may_refragment(mtu))
                 {
-                    let Ok(packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
-                        crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
-                    }) else {
-                        return RouteInputVerdict::Drop;
-                    };
-                    self.work.push(RoutedIngressWork::MtuErrorIpv6 {
-                        netns: self.netns.clone(),
+                    return self.defer_ipv6_error(
                         packet,
-                        mtu,
-                        ct_context: self.packet_context.borrow().clone(),
-                    });
-                    return RouteInputVerdict::Forward;
+                        super::forward_mtu::Ipv6ForwardError::PacketTooBig(mtu),
+                    );
+                }
+                if self.work.try_reserve(1).is_err() {
+                    return RouteInputVerdict::Drop;
                 }
                 let Ok(mut packet) = packet.take_owned().map_err(|_| ()).and_then(|bytes| {
                     crate::driver::net::packet_storage::take(bytes).map_err(|_| ())
@@ -532,8 +526,50 @@ impl<'a> NetIngressFilter<'a> {
                 });
                 RouteInputVerdict::Forward
             }
-            _ => RouteInputVerdict::Drop,
+            kind => {
+                // RFC 4443 suppresses non-PTB errors for packets received
+                // over a link-layer group, even with a unicast IPv6 header.
+                if meta.link_group {
+                    return RouteInputVerdict::Drop;
+                }
+                let Some(code) = crate::net::route::ipv6_route_rejection(kind)
+                    .and_then(|rejection| rejection.icmp_code)
+                else {
+                    return RouteInputVerdict::Drop;
+                };
+                self.defer_ipv6_error(
+                    packet,
+                    super::forward_mtu::Ipv6ForwardError::Unreachable {
+                        code,
+                        ingress_ifindex,
+                    },
+                )
+            }
         }
+    }
+
+    fn defer_ipv6_error(
+        &mut self,
+        packet: &mut RoutedIngressPacket<'_, '_>,
+        error: super::forward_mtu::Ipv6ForwardError,
+    ) -> RouteInputVerdict {
+        if self.work.try_reserve(1).is_err() {
+            return RouteInputVerdict::Drop;
+        }
+        let Ok(packet) = packet
+            .take_owned()
+            .map_err(|_| ())
+            .and_then(|bytes| crate::driver::net::packet_storage::take(bytes).map_err(|_| ()))
+        else {
+            return RouteInputVerdict::Drop;
+        };
+        self.work.push(RoutedIngressWork::ErrorIpv6 {
+            netns: self.netns.clone(),
+            packet,
+            error,
+            ct_context: self.packet_context.borrow().clone(),
+        });
+        RouteInputVerdict::Forward
     }
 }
 
@@ -711,6 +747,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 source,
                 ct_context,
                 mark: self.mark.get(),
+                link_group: meta.link_group,
             }),
         });
         PreRoutingVerdict::Drop
@@ -1093,6 +1130,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                                 source: DefragSource::LocalInput,
                                 ct_context: None,
                                 mark: self.mark.get(),
+                                link_group: meta.link_group,
                             }),
                         });
                         return LocalInputVerdict::Drop;

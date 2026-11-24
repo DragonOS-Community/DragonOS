@@ -440,6 +440,7 @@ pub(super) struct FibIndex {
     projection_winners: HashMap<ProjectionKey, usize>,
     prefix_counts: HashMap<PrefixDomain, Vec<PrefixLengthCount>>,
     source_route_count: usize,
+    ipv6_special_route_count: usize,
     ipv6_serial: u64,
 }
 
@@ -465,12 +466,29 @@ impl FibIndex {
             projection_winners: try_clone_map(&self.projection_winners)?,
             prefix_counts: try_clone_prefix_counts(&self.prefix_counts)?,
             source_route_count: self.source_route_count,
+            ipv6_special_route_count: self.ipv6_special_route_count,
             ipv6_serial: self.ipv6_serial,
         })
     }
 
     pub(super) fn has_source_routes(&self) -> bool {
         self.source_route_count != 0
+    }
+
+    pub(super) fn has_ipv6_special_routes(&self) -> bool {
+        self.ipv6_special_route_count != 0
+    }
+
+    fn update_route_counts(&mut self, route: RouteEntry, insert: bool) {
+        let source = usize::from(route.source.is_some());
+        let special = usize::from(ipv6_special(route));
+        if insert {
+            self.source_route_count += source;
+            self.ipv6_special_route_count += special;
+        } else {
+            self.source_route_count -= source;
+            self.ipv6_special_route_count -= special;
+        }
     }
 
     pub(super) fn ipv6_serial(&self, route: RouteEntry) -> u64 {
@@ -596,7 +614,7 @@ impl FibIndex {
         self.alias.commit_insert(route_index, route, placement);
         insert_reserved_bucket(&mut self.all, prefix, route_index, None);
         if indexable(route) {
-            self.source_route_count += usize::from(route.source.is_some());
+            self.update_route_counts(route, true);
             update_prefix_count(&mut self.prefix_counts, route, true);
             self.touch_ipv6_prefix(prefix);
             // Existing winners remain valid across insertion: relative order
@@ -653,7 +671,7 @@ impl FibIndex {
         );
         if indexable(route) {
             self.touch_ipv6_prefix(prefix);
-            self.source_route_count -= usize::from(route.source.is_some());
+            self.update_route_counts(route, false);
             update_prefix_count(&mut self.prefix_counts, route, false);
             remove_empty_prefix_domain(&mut self.prefix_counts, route);
         }
@@ -700,8 +718,9 @@ impl FibIndex {
             counts.clear();
         }
         self.source_route_count = 0;
+        self.ipv6_special_route_count = 0;
         for route in routes.iter().copied().filter(|route| indexable(*route)) {
-            self.source_route_count += usize::from(route.source.is_some());
+            self.update_route_counts(route, true);
             update_prefix_count(&mut self.prefix_counts, route, true);
         }
         self.prefix_counts.retain(|_, counts| !counts.is_empty());
@@ -722,8 +741,12 @@ impl FibIndex {
 
         let old_indexable = indexable(old);
         let new_indexable = indexable(new);
-        self.source_route_count -= usize::from(old_indexable && old.source.is_some());
-        self.source_route_count += usize::from(new_indexable && new.source.is_some());
+        if old_indexable {
+            self.update_route_counts(old, false);
+        }
+        if new_indexable {
+            self.update_route_counts(new, true);
+        }
         let old_was_winner = self
             .winners
             .get(&old_prefix)
@@ -1515,6 +1538,10 @@ pub(super) fn projection_key(route: RouteEntry) -> Option<ProjectionKey> {
     projectable.then(|| ProjectionKey::new(route.oif, route.destination))
 }
 
+fn ipv6_special(route: RouteEntry) -> bool {
+    matches!(route.destination, IpCidr::Ipv6(_)) && super::is_ipv6_reject_or_throw(route.kind)
+}
+
 fn indexable(route: RouteEntry) -> bool {
     if let Some(source) = route.source {
         return matches!(
@@ -1522,11 +1549,12 @@ fn indexable(route: RouteEntry) -> bool {
             (IpCidr::Ipv6(_), IpCidr::Ipv6(_))
         ) && source.prefix_len() != 0
             && route.tos == 0
-            && route.kind == RTN_UNICAST;
+            && (route.kind == RTN_UNICAST || ipv6_special(route));
     }
     route.tos == 0
         && (matches!(route.kind, RTN_UNICAST | RTN_LOCAL | RTN_BROADCAST)
-            || matches!(route.destination, IpCidr::Ipv6(_)) && route.kind == RTN_MULTICAST)
+            || matches!(route.destination, IpCidr::Ipv6(_)) && route.kind == RTN_MULTICAST
+            || ipv6_special(route))
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@ pub struct Router {
     /// smoltcp projections, making the complete control-plane transaction the
     /// only observable generation.
     authoritative_output: AtomicBool,
+    ipv6_reject_deadline_us: crate::libs::spinlock::SpinLock<i64>,
     pub(crate) pmtu: crate::libs::spinlock::SpinLock<crate::net::route::pmtu::PmtuCache>,
 }
 
@@ -91,6 +92,7 @@ impl Router {
             nat_tracker: Arc::new(ConnTracker::default()),
             ns: RwSem::new(Weak::default()),
             authoritative_output: AtomicBool::new(false),
+            ipv6_reject_deadline_us: crate::libs::spinlock::SpinLock::new(0),
             pmtu: crate::libs::spinlock::SpinLock::new(
                 crate::net::route::pmtu::PmtuCache::default(),
             ),
@@ -105,6 +107,7 @@ impl Router {
             ns: RwSem::new(Weak::default()),
             nat_tracker: Arc::new(ConnTracker::default()),
             authoritative_output: AtomicBool::new(false),
+            ipv6_reject_deadline_us: crate::libs::spinlock::SpinLock::new(0),
             pmtu: crate::libs::spinlock::SpinLock::new(
                 crate::net::route::pmtu::PmtuCache::default(),
             ),
@@ -129,6 +132,20 @@ impl Router {
 
     pub(crate) fn requires_authoritative_output(&self) -> bool {
         self.authoritative_output.load(Ordering::Acquire)
+    }
+
+    /// Bound route-generated ICMPv6 errors per namespace. The virtual
+    /// deadline allows a burst of 50 and replenishes one slot per millisecond.
+    pub(in crate::net) fn admit_ipv6_reject_reply(&self) -> bool {
+        const INTERVAL_US: i64 = 1_000;
+        const BURST: i64 = 50;
+        let now = crate::time::Instant::now().total_micros();
+        let mut deadline = self.ipv6_reject_deadline_us.lock();
+        if *deadline > now + (BURST - 1) * INTERVAL_US {
+            return false;
+        }
+        *deadline = (*deadline).max(now) + INTERVAL_US;
+        true
     }
 
     pub fn lookup_ingress_route(

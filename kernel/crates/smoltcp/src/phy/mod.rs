@@ -165,6 +165,9 @@ pub use self::tuntap_interface::TunTapInterface;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
+    /// The incoming link frame was addressed to a multicast or broadcast group.
+    #[cfg(feature = "proto-ipv6")]
+    pub link_group: bool,
     /// Opaque route state supplied by the caller for socket output.
     #[cfg(feature = "packetmeta-id")]
     pub route_cookie: u64,
@@ -175,6 +178,8 @@ impl PacketMeta {
     pub(crate) const fn with_id(id: u32) -> Self {
         Self {
             id,
+            #[cfg(feature = "proto-ipv6")]
+            link_group: false,
             route_cookie: 0,
         }
     }

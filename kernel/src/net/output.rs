@@ -105,7 +105,8 @@ fn route_after_output(
     if initial_destination != new_destination {
         route = routes
             .lookup_with_source(new_destination, route.required_oif, source)
-            .ok_or(SystemError::ENETUNREACH)?;
+            .ok_or(SystemError::ENETUNREACH)?
+            .require_reachable()?;
         let egress = routes
             .ingress_device(route.oif)
             .ok_or(SystemError::ENETUNREACH)?;

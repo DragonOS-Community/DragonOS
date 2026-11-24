@@ -95,6 +95,8 @@ impl InterfaceInner {
                 if let Some((scratch, filter)) = filter.filter(|(_, filter)| {
                     filter.applies_to_packet(IpVersion::Ipv6, ipv6_packet.as_ref())
                 }) {
+                    let mut meta = meta;
+                    meta.link_group = !eth_frame.dst_addr().is_unicast();
                     return self
                         .process_ipv6_filtered(
                             sockets,

@@ -33,7 +33,9 @@ pub(super) fn validate_entry_on_iface(
     // Linux's IPv4 inet_rtm_newroute does not reject RTA_SRC selectors; an
     // unhandled attribute is ignored and the route is still created. Accept
     // and store it rather than failing with EOPNOTSUPP.
-    if route.kind != RTN_UNICAST {
+    let reject =
+        !is_ipv4(route.destination.address()) && super::is_ipv6_reject_or_throw(route.kind);
+    if route.kind != RTN_UNICAST && !reject {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     if !same_family_option(route.destination.address(), route.gateway)
@@ -42,7 +44,7 @@ pub(super) fn validate_entry_on_iface(
         return Err(SystemError::EINVAL);
     }
     if !is_ipv4(route.destination.address()) {
-        if !iface.common().ipv6_enabled() {
+        if !reject && !iface.common().ipv6_enabled() {
             return Err(SystemError::EACCES);
         }
         if route.tos != 0 {
@@ -53,11 +55,16 @@ pub(super) fn validate_entry_on_iface(
     if route.oif != expected_oif {
         return Err(SystemError::ENODEV);
     }
-    if !iface.flags().contains(InterfaceFlags::UP) {
+    if !reject && !iface.flags().contains(InterfaceFlags::UP) {
         return Err(SystemError::ENETDOWN);
     }
     if let Some(source) = route.preferred_source {
-        if !source_address_usable_on_iface(netns, iface, source) {
+        let valid = if reject && !preferred_source_requires_iface(route, source) {
+            netns_has_address(netns, source)
+        } else {
+            source_address_usable_on_iface(netns, iface, source)
+        };
+        if !valid {
             return Err(SystemError::EINVAL);
         }
     }
@@ -68,6 +75,17 @@ pub(super) fn validate_entry_on_iface(
         return Err(SystemError::EINVAL);
     }
     Ok(())
+}
+
+/// A reject route's loopback nexthop does not own a configured global
+/// preferred source. Link-local and host-scoped sources still need the device.
+pub(super) fn preferred_source_requires_iface(route: RouteEntry, source: IpAddress) -> bool {
+    let IpAddress::Ipv6(source) = source else {
+        return false;
+    };
+    !super::is_ipv6_reject_or_throw(route.kind)
+        || source.is_unicast_link_local()
+        || source.is_loopback()
 }
 
 pub(super) fn validate_gateway_iface(

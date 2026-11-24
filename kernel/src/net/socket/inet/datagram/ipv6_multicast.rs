@@ -93,6 +93,7 @@ impl UdpSocket {
             let routes = crate::net::route::lock_output_routes(&router, self.netns.device_list());
             routes
                 .lookup(IpAddress::Ipv6(group), None)
+                .and_then(|route| route.require_reachable().ok())
                 .ok_or(SystemError::ENODEV)?
                 .oif
         } else {

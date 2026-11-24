@@ -165,7 +165,8 @@ pub(crate) fn resolve_ipv6_output_route(
     let routes = super::lock_output_routes(&router, devices);
     let route = routes
         .lookup_with_source(destination, required_oif, fixed_source)
-        .ok_or(SystemError::ENETUNREACH)?;
+        .ok_or(SystemError::ENETUNREACH)?
+        .require_reachable()?;
     let iface = routes
         .devices
         .get(&(route.oif as usize))
@@ -229,16 +230,20 @@ pub(crate) fn resolve_ipv6_socket_route(
         Ipv6RouteIntent::Send(cookie) => cookie,
     };
     let mut selected = fib.lookup_ipv6_socket_output(destination_v6, required_oif, source, cookie);
-    let route_cookie = if fixed_source.is_none() && matches!(intent, Ipv6RouteIntent::Connect) {
+    let first_rejected =
+        selected.is_some_and(|route| super::ipv6_route_rejection(route.matched.kind).is_some());
+    let route_cookie = if !first_rejected
+        && fixed_source.is_none()
+        && matches!(intent, Ipv6RouteIntent::Connect)
+    {
         selected.map_or(0, |route| {
             fib.ipv6_route_cookie(route, destination_v6, required_oif)
         })
     } else {
         0
     };
-    if selected.is_none()
-        && source.is_none()
-        && fib.has_ipv6_source_routes()
+    if source.is_none()
+        && (first_rejected || selected.is_none() && fib.has_ipv6_source_routes())
         && !destination_v6.is_unspecified()
     {
         // Without an initial route there is no egress or preferred source.
@@ -280,6 +285,9 @@ pub(crate) fn resolve_ipv6_socket_route(
             SystemError::ENETUNREACH
         }
     })?;
+    if let Some(rejection) = super::ipv6_route_rejection(selected.matched.kind) {
+        return Err(rejection.error);
+    }
     let egress = devices
         .get(&(selected.oif as usize))
         .ok_or(SystemError::ENETUNREACH)?;

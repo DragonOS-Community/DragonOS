@@ -452,6 +452,7 @@ struct FragmentOrigin {
     ct_context: Option<Arc<CtPacketContext>>,
     mark: u32,
     broadcast: bool,
+    link_group: bool,
 }
 
 /// Owned by the receive callback only until the source interface locks have
@@ -478,6 +479,7 @@ impl PendingIpv4Fragment {
             ct_context: self.ct_context.clone(),
             mark: self.mark,
             broadcast: self.broadcast,
+            link_group: false,
         }
     }
 }
@@ -491,6 +493,7 @@ pub(crate) struct PendingIpv6Fragment {
     pub(crate) source: DefragSource,
     pub(crate) ct_context: Option<Arc<CtPacketContext>>,
     pub(crate) mark: u32,
+    pub(crate) link_group: bool,
 }
 
 impl PendingIpv6Fragment {
@@ -503,6 +506,7 @@ impl PendingIpv6Fragment {
             ct_context: self.ct_context.clone(),
             mark: self.mark,
             broadcast: false,
+            link_group: self.link_group,
         }
     }
 }
@@ -934,13 +938,18 @@ impl NetnsPoller {
             DefragSource::LinkIngress => None,
             DefragSource::BridgeIngress(_) => return,
         };
+        let origin = if first_origin.link_group && completion.source == DefragSource::LinkIngress {
+            crate::driver::net::LocalPacketOrigin::LinkGroupIngressPending
+        } else {
+            completion.source.packet_origin()
+        };
         if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch_with_fragment(
             owner.as_ref(),
             completion.ingress_ifindex,
             source_mac,
             packet,
             broadcast,
-            completion.source.packet_origin(),
+            origin,
             ct_context,
             first_origin.mark,
             Some(owner_epoch),

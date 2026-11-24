@@ -339,11 +339,13 @@ impl PreparedAddressRouteCommit {
                 ifindex,
                 deleted_addresses,
                 |entry| {
+                    let source = entry
+                        .preferred_source
+                        .expect("preferred-source filter only calls this predicate for a match");
                     ownership.source_usable_on_oif(
                         entry.oif,
-                        entry.preferred_source.expect(
-                            "preferred-source filter only calls this predicate for a match",
-                        ),
+                        source,
+                        super::validation::preferred_source_requires_iface(entry, source),
                     )
                 },
             )

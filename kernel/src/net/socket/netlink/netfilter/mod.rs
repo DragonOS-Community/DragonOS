@@ -106,7 +106,6 @@ fn set_element_events(
     table: &NftTable,
     set: &NftSet,
     inputs: &[NftSetElementInput<'_>],
-    sequence: u32,
     port: u32,
     kind: u16,
 ) -> Result<Vec<NetfilterMessage>, SystemError> {
@@ -125,7 +124,7 @@ fn set_element_events(
             stored,
             SetElementMessageMeta {
                 generation: 0,
-                sequence,
+                sequence: 0,
                 port,
                 kind,
                 flags: 0,
@@ -765,7 +764,6 @@ impl NetfilterKernelSocket {
                             return Err(SystemError::EINVAL);
                         }
                         let table_name = attrs.table.ok_or(SystemError::EINVAL)?;
-                        let sequence = u32::from_ne_bytes(request.bytes[8..12].try_into().unwrap());
                         let echo = request.flags() & NLM_F_ECHO != 0;
                         let elements = match elements {
                             None | Some([]) => {
@@ -783,7 +781,7 @@ impl NetfilterKernelSocket {
                                     notifications.push(NftNotification {
                                         object: NotificationObject::FlushedSet(table, old_set),
                                         kind: NFT_MSG_DELSETELEM,
-                                        sequence,
+                                        sequence: 0,
                                         flags: 0,
                                         echo,
                                     });
@@ -803,26 +801,12 @@ impl NetfilterKernelSocket {
                         } else {
                             let (table, set) =
                                 transaction.set_for_notification(family, table_name, &name)?;
-                            set_element_events(
-                                &table,
-                                &set,
-                                elements,
-                                sequence,
-                                port,
-                                request.kind(),
-                            )?
+                            set_element_events(&table, &set, elements, port, request.kind())?
                         };
                         let (table, set) = transaction
                             .update_set_elements(family, table_name, &name, elements, add)?;
                         let events = if add {
-                            set_element_events(
-                                &table,
-                                &set,
-                                elements,
-                                sequence,
-                                port,
-                                request.kind(),
-                            )?
+                            set_element_events(&table, &set, elements, port, request.kind())?
                         } else {
                             prior_events
                         };
@@ -833,7 +817,7 @@ impl NetfilterKernelSocket {
                             notifications.push(NftNotification {
                                 object: NotificationObject::SetElement(message),
                                 kind: request.kind(),
-                                sequence,
+                                sequence: 0,
                                 flags: 0,
                                 echo,
                             });

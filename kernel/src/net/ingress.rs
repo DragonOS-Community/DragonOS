@@ -360,13 +360,20 @@ impl<'a> NetIngressFilter<'a> {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
     ) -> RouteInputVerdict {
-        if !self.netns.ipv6_forwarding_enabled() && self.routes.is_none() {
-            return RouteInputVerdict::Pass;
-        }
-        let Some(routes) = self.routes else {
-            // A routing-enabled namespace must never deliver a transit packet
-            // locally merely because its protected FIB snapshot was absent.
-            return RouteInputVerdict::Drop;
+        let routes = match self.routes {
+            Some(routes) => routes,
+            // A forwarding namespace must not accept transit as local when
+            // its full route view is unavailable.
+            None if self.netns.ipv6_forwarding_enabled() => return RouteInputVerdict::Drop,
+            // Physical NAPI also holds a FIB view in host mode. Reject
+            // routes still apply there, without enabling ordinary routing.
+            None => match self
+                .fib_routes
+                .filter(|routes| routes.has_ipv6_special_routes())
+            {
+                Some(routes) => routes,
+                None => return RouteInputVerdict::Pass,
+            },
         };
         let ingress_ifindex = if meta.id != 0 {
             meta.id
@@ -385,6 +392,9 @@ impl<'a> NetIngressFilter<'a> {
         else {
             return RouteInputVerdict::Pass;
         };
+        if self.routes.is_none() && !super::route::is_ipv6_reject_or_throw(route.matched.kind) {
+            return RouteInputVerdict::Pass;
+        }
         match route.matched.kind {
             // IPv6 link-local unicast is scoped to its ingress link. A local
             // address on another interface must not be weak-host delivered.

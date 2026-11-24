@@ -228,6 +228,10 @@ impl OutputRouteGuard<'_> {
         self.fib.has_ipv6_source_routes()
     }
 
+    pub(crate) fn has_ipv6_special_routes(&self) -> bool {
+        self.fib.has_ipv6_special_routes()
+    }
+
     pub(crate) fn ipv4_addr_type(&self, address: Ipv4Address) -> u8 {
         self.fib.ipv4_addr_type(address)
     }

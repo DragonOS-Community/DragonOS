@@ -1143,9 +1143,7 @@ impl FibTable {
                         continue;
                     }
                     // Linux IPv6 keeps the route and silently drops a stale
-                    // preferred source. DragonOS additionally requires IPv6
-                    // preferred sources to stay on the route's egress iface
-                    // until namespace-level IPv6 local delivery exists.
+                    // preferred source.
                     let old = self.entries[index];
                     let new = RouteEntry {
                         preferred_source: None,

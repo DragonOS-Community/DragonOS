@@ -527,6 +527,11 @@ impl<'a> NetIngressFilter<'a> {
                 RouteInputVerdict::Forward
             }
             kind => {
+                // RFC 4443 suppresses non-PTB errors for packets received
+                // over a link-layer group, even with a unicast IPv6 header.
+                if meta.link_group {
+                    return RouteInputVerdict::Drop;
+                }
                 let Some(code) = crate::net::route::ipv6_route_rejection(kind)
                     .and_then(|rejection| rejection.icmp_code)
                 else {
@@ -742,6 +747,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 source,
                 ct_context,
                 mark: self.mark.get(),
+                link_group: meta.link_group,
             }),
         });
         PreRoutingVerdict::Drop
@@ -1124,6 +1130,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                                 source: DefragSource::LocalInput,
                                 ct_context: None,
                                 mark: self.mark.get(),
+                                link_group: meta.link_group,
                             }),
                         });
                         return LocalInputVerdict::Drop;

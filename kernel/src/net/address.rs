@@ -1276,11 +1276,16 @@ impl<'a> CandidateAddressOwnership<'a> {
         iface_accepts_local_address_from(iface, addresses, address)
     }
 
-    pub(crate) fn source_usable_on_oif(&self, oif: u32, address: IpAddress) -> bool {
+    pub(crate) fn source_usable_on_oif(
+        &self,
+        oif: u32,
+        address: IpAddress,
+        require_iface: bool,
+    ) -> bool {
         let Some(egress_iface) = self.devices.get(&(oif as usize)) else {
             return false;
         };
-        if source_address_requires_iface(address) {
+        if require_iface {
             self.iface_accepts_local_address(egress_iface, address)
         } else {
             self.devices

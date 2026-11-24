@@ -193,6 +193,7 @@ impl BridgeDriver {
                 source,
                 ct_context: None,
                 mark: 0,
+                link_group: !ethernet.dst_addr().is_unicast(),
             }),
         };
         let _ = netns.queue_ip_fragment(fragment);

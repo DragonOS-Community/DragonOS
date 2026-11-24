@@ -31,6 +31,22 @@ impl Address {
     /// The broadcast address.
     pub const BROADCAST: Address = Address([0xff; 6]);
 
+    pub(crate) fn from_multicast_ip(address: super::IpAddress) -> Self {
+        debug_assert!(address.is_multicast());
+        match address {
+            #[cfg(feature = "proto-ipv4")]
+            super::IpAddress::Ipv4(address) => {
+                let bytes = address.octets();
+                Self([0x01, 0x00, 0x5e, bytes[1] & 0x7f, bytes[2], bytes[3]])
+            }
+            #[cfg(feature = "proto-ipv6")]
+            super::IpAddress::Ipv6(address) => {
+                let bytes = address.octets();
+                Self([0x33, 0x33, bytes[12], bytes[13], bytes[14], bytes[15]])
+            }
+        }
+    }
+
     /// Construct an Ethernet address from a sequence of octets, in big-endian.
     ///
     /// # Panics

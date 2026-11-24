@@ -496,8 +496,9 @@ impl PreparedAddressRouteCommit {
         }
         debug_assert_eq!(*current, before);
         let mut smol_iface = iface.smol_iface().lock();
-        if let Some(enabled) = ipv6_enabled {
+        let receive_filter_changed = if let Some(enabled) = ipv6_enabled {
             smol_iface.set_ipv6_enabled(enabled, &after_addresses);
+            true
         } else if smol_iface.ip_addrs() != after_addresses.as_slice() {
             smol_iface.update_ip_addrs(|addresses| {
                 addresses.clear();
@@ -505,6 +506,12 @@ impl PreparedAddressRouteCommit {
                     .extend_from_slice(&after_addresses)
                     .expect("address candidate was capacity-checked");
             });
+            true
+        } else {
+            false
+        };
+        if receive_filter_changed {
+            iface.common().sync_receive_filter(&smol_iface);
         }
         smol_iface.routes_mut().update(|routes| {
             core::mem::swap(routes, &mut projection);

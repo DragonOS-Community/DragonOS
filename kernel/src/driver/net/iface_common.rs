@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
 
 pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>>;
+type ReceiveFilter = dyn Fn(&smoltcp::iface::Interface, InterfaceFlags) + Send + Sync;
 
 fn poll_smol<D: SmolDevice + ?Sized>(
     interface: &mut smoltcp::iface::Interface,
@@ -132,6 +133,7 @@ pub struct IfaceCommon {
     pub(super) type_: InterfaceType,
     tx_admission: tx_admission::TxAdmission,
     pub(super) smol_iface: Mutex<smoltcp::iface::Interface>,
+    receive_filter: Option<Box<ReceiveFilter>>,
     /// 存smoltcp网卡的套接字集
     /// SocketSet ownership follows a device's namespace epoch. On a netns
     /// move the active set is replaced; old sockets retain the retired set
@@ -296,6 +298,7 @@ impl IfaceCommon {
             name: RwLock::new(name),
             name_generation: AtomicU64::new(0),
             smol_iface: Mutex::new(iface),
+            receive_filter: None,
             sockets: RwLock::new(Arc::new(Mutex::new(sockets))),
             bounds: RwLock::new(Arc::new(crate::net::tcp_bounds::BoundRegistry::new())),
             namespace_routed_stack: AtomicBool::new(false),
@@ -329,6 +332,20 @@ impl IfaceCommon {
         }
     }
 
+    pub(super) fn with_receive_filter(mut self, filter: Box<ReceiveFilter>) -> Self {
+        self.receive_filter = Some(filter);
+        self.sync_receive_filter(&self.smol_iface.lock());
+        self
+    }
+
+    /// The caller holds the smoltcp interface guard. Use that same state to
+    /// serialize hardware projection with address and membership updates.
+    pub(crate) fn sync_receive_filter(&self, iface: &smoltcp::iface::Interface) {
+        if let Some(filter) = &self.receive_filter {
+            filter(iface, self.flags());
+        }
+    }
+
     pub fn ipv4_multicast_join_ref(
         &self,
         netns: &Arc<NetNamespace>,
@@ -356,14 +373,16 @@ impl IfaceCommon {
             return Ok(());
         }
         guard.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
-        self.smol_iface
-            .lock()
+        let mut iface = self.smol_iface.lock();
+        iface
             .join_multicast_group(group)
             .map_err(|error| match error {
                 smoltcp::iface::MulticastError::GroupTableFull => SystemError::ENOBUFS,
                 smoltcp::iface::MulticastError::Unaddressable => SystemError::EINVAL,
             })?;
         guard.push((group, 1));
+        drop(guard);
+        self.sync_receive_filter(&iface);
         Ok(())
     }
 
@@ -397,7 +416,10 @@ impl IfaceCommon {
             return Ok(());
         }
         guard.swap_remove(pos);
-        let _ = self.smol_iface.lock().leave_multicast_group(group);
+        let mut iface = self.smol_iface.lock();
+        let _ = iface.leave_multicast_group(group);
+        drop(guard);
+        self.sync_receive_filter(&iface);
         Ok(())
     }
 
@@ -2210,7 +2232,11 @@ impl IfaceCommon {
             prepared.old_flags()
         );
         state.configured_flags = prepared.new_flags().bits();
-        self.publish_effective_flags(&state);
+        let filter_changed = self.publish_effective_flags(&state);
+        drop(state);
+        if filter_changed {
+            self.sync_receive_filter(&self.smol_iface.lock());
+        }
     }
 
     pub fn link_flags_snapshot(&self) -> Result<LinkFlagsSnapshot, SystemError> {
@@ -2441,7 +2467,11 @@ impl IfaceCommon {
         } else {
             state.packet_allmulti = new;
         }
-        self.publish_effective_flags(&state);
+        let filter_changed = self.publish_effective_flags(&state);
+        drop(state);
+        if filter_changed {
+            self.sync_receive_filter(&self.smol_iface.lock());
+        }
         Ok(())
     }
 
@@ -2454,7 +2484,7 @@ impl IfaceCommon {
             .ok_or(SystemError::EOVERFLOW)
     }
 
-    pub(super) fn publish_effective_flags(&self, state: &ReceiveModeState) {
+    fn publish_effective_flags(&self, state: &ReceiveModeState) -> bool {
         let mut effective = state.configured_flags;
         if state.packet_promiscuity != 0 {
             effective |= InterfaceFlags::PROMISC.bits();
@@ -2462,6 +2492,8 @@ impl IfaceCommon {
         if state.packet_allmulti != 0 {
             effective |= InterfaceFlags::ALLMULTI.bits();
         }
-        self.flags.store(effective, Ordering::Release);
+        let previous = self.flags.swap(effective, Ordering::AcqRel);
+        let receive_mode = (InterfaceFlags::PROMISC | InterfaceFlags::ALLMULTI).bits();
+        self.receive_filter.is_some() && (previous ^ effective) & receive_mode != 0
     }
 }

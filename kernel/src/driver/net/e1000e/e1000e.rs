@@ -5,6 +5,7 @@ use super::e1000e_driver::e1000e_driver_init;
 use super::irq::DefaultE1000EIrqHandler;
 use crate::driver::base::device::DeviceId;
 use crate::driver::net::dma::{dma_alloc, dma_dealloc};
+use crate::driver::net::types::InterfaceFlags;
 use crate::driver::pci::pci::{
     get_pci_device_structure_mut, PciDeviceStructure, PciDeviceStructureGeneralDevice, PciError,
     PCI_DEVICE_LINKEDLIST,
@@ -183,6 +184,7 @@ pub struct E1000EDevice {
     interrupt_regs: NonNull<InterruptRegs>,
     rctl_regs: NonNull<ReceiveCtrlRegs>,
     receive_regs: NonNull<ReceiveRegs>,
+    multicast_regs: NonNull<MTARegs>,
     tctl_regs: NonNull<TransmitCtrlRegs>,
     transimit_regs: NonNull<TransimitRegs>,
     pcie_regs: NonNull<PCIeRegs>,
@@ -301,6 +303,7 @@ impl E1000EDevice {
         let pcie_regs: NonNull<PCIeRegs> = get_register_ptr(vaddress, E1000E_PCIE_REGS_OFFSET);
         let ra_regs: NonNull<ReceiveAddressRegs> =
             get_register_ptr(vaddress, E1000E_RECEIVE_ADDRESS_REGS_OFFSET);
+        let multicast_regs = get_register_ptr(vaddress, E1000E_MTA_REGS_START_OFFSET);
         // 开始设备初始化 14.3
         // Initialization Sequence
         unsafe {
@@ -379,13 +382,7 @@ impl E1000EDevice {
 
         // Receive Initialization 14.6
         // Initialzie mutlicast table array to 0b
-        // 初始化MTA，遍历0x05200-0x053FC中每个寄存器，写入0b，一共128个寄存器
-        let mut mta_adress = vaddress + E1000E_MTA_REGS_START_OFFSET;
-        while mta_adress != vaddress + E1000E_MTA_REGS_END_OFFSET {
-            let mta: NonNull<MTARegs> = get_register_ptr(mta_adress, 0);
-            unsafe { volwrite!(mta, mta, 0) };
-            mta_adress += 4;
-        }
+        write_multicast_table(multicast_regs, &[0; E1000E_MTA_WORDS]);
         // 连续的寄存器读-写操作，放在同一个unsafe块中
         unsafe {
             // 设置descriptor环形队列的基地址
@@ -457,6 +454,7 @@ impl E1000EDevice {
             interrupt_regs,
             rctl_regs,
             receive_regs,
+            multicast_regs,
             tctl_regs,
             transimit_regs,
             pcie_regs,
@@ -529,6 +527,34 @@ impl E1000EDevice {
         buffer.set_length(packet_len);
         // debug!("e1000e: receive packet");
         return Some(buffer);
+    }
+
+    pub(super) fn sync_receive_filter(
+        &mut self,
+        interface: &smoltcp::iface::Interface,
+        flags: InterfaceFlags,
+    ) {
+        if !self.active {
+            return;
+        }
+        let mut table = [0; E1000E_MTA_WORDS];
+        interface.for_each_multicast_ethernet_address(|address| {
+            // RCTL.MO is initialized to zero and retained by runtime changes.
+            let bytes = address.as_bytes();
+            let index = (usize::from(bytes[5]) << 4) | (usize::from(bytes[4]) >> 4);
+            table[index / 32] |= 1 << (index % 32);
+        });
+        write_multicast_table(self.multicast_regs, &table);
+        unsafe {
+            let mut rctl = volread!(self.rctl_regs, rctl) & !(E1000E_RCTL_UPE | E1000E_RCTL_MPE);
+            if flags.contains(InterfaceFlags::PROMISC) {
+                rctl |= E1000E_RCTL_UPE | E1000E_RCTL_MPE;
+            } else if flags.contains(InterfaceFlags::ALLMULTI) {
+                rctl |= E1000E_RCTL_MPE;
+            }
+            volwrite!(self.rctl_regs, rctl, rctl);
+            let _ = volread!(self.general_regs, status);
+        }
     }
 
     /// Stop runtime RX production before NAPI is quiesced. Descriptor memory
@@ -906,6 +932,15 @@ struct MTARegs {
     mta: Volatile<u32>,
 }
 
+fn write_multicast_table(registers: NonNull<MTARegs>, words: &[u32; E1000E_MTA_WORDS]) {
+    let base = registers.as_ptr() as u64;
+    for (index, &word) in words.iter().enumerate() {
+        let register: NonNull<MTARegs> =
+            get_register_ptr(base, (index * size_of::<MTARegs>()) as u64);
+        unsafe { volwrite!(register, mta, word) };
+    }
+}
+
 const E1000E_GENERAL_REGS_OFFSET: u64 = 0x00000;
 const E1000E_INTERRRUPT_REGS_OFFSET: u64 = 0x000c0;
 const E1000E_RECEIVE_CTRL_REG_OFFSET: u64 = 0x00100;
@@ -915,7 +950,7 @@ const E1000E_TRANSMIT_REGS_OFFSET: u64 = 0x03800;
 const E1000E_RECEIVE_ADDRESS_REGS_OFFSET: u64 = 0x05400;
 const E1000E_PCIE_REGS_OFFSET: u64 = 0x05b00;
 const E1000E_MTA_REGS_START_OFFSET: u64 = 0x05200;
-const E1000E_MTA_REGS_END_OFFSET: u64 = 0x053fc;
+const E1000E_MTA_WORDS: usize = 128;
 // 寄存器的特定位
 //CTRL
 const E1000E_CTRL_SLU: u32 = 1 << 6;
@@ -944,6 +979,8 @@ const E1000E_IMC_CLEAR: u32 = 0xffffffff;
 
 // RCTL
 const E1000E_RCTL_EN: u32 = 1 << 1;
+const E1000E_RCTL_UPE: u32 = 1 << 3;
+const E1000E_RCTL_MPE: u32 = 1 << 4;
 const E1000E_RCTL_BAM: u32 = 1 << 15;
 const E1000E_RCTL_BSIZE_4K: u32 = 3 << 16;
 const E1000E_RCTL_BSEX: u32 = 1 << 25;

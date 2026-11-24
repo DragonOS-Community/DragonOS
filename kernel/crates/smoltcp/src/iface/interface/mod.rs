@@ -1784,15 +1784,7 @@ impl InterfaceInner {
                 IpAddress::Ipv4(addr) => match self.caps.medium {
                     #[cfg(feature = "medium-ethernet")]
                     Medium::Ethernet => {
-                        let b = addr.octets();
-                        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
-                            0x01,
-                            0x00,
-                            0x5e,
-                            b[1] & 0x7F,
-                            b[2],
-                            b[3],
-                        ]))
+                        HardwareAddress::Ethernet(EthernetAddress::from_multicast_ip(addr.into()))
                     }
                     #[cfg(feature = "medium-ieee802154")]
                     Medium::Ieee802154 => unreachable!(),
@@ -1803,10 +1795,7 @@ impl InterfaceInner {
                 IpAddress::Ipv6(addr) => match self.caps.medium {
                     #[cfg(feature = "medium-ethernet")]
                     Medium::Ethernet => {
-                        let b = addr.octets();
-                        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
-                            0x33, 0x33, b[12], b[13], b[14], b[15],
-                        ]))
+                        HardwareAddress::Ethernet(EthernetAddress::from_multicast_ip(addr.into()))
                     }
                     #[cfg(feature = "medium-ieee802154")]
                     Medium::Ieee802154 => {

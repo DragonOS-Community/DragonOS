@@ -20,6 +20,40 @@ mod ownership_tests {
     }
 
     #[test]
+    fn ethernet_filter_tracks_configured_and_explicit_groups() {
+        let (mut iface, _, _) = crate::tests::setup(Medium::Ethernet);
+        let local = address(0x1234);
+        let other = {
+            let mut octets = local.octets();
+            octets[13] ^= 1;
+            Ipv6Address::from(octets)
+        };
+        let explicit = address(0x5678).solicited_node();
+        iface.update_ip_addrs(|addresses| {
+            addresses.clear();
+            addresses.push(IpCidr::new(local.into(), 64)).unwrap();
+            addresses.push(IpCidr::new(other.into(), 64)).unwrap();
+        });
+        iface.join_multicast_group(explicit).unwrap();
+        let projected = |iface: &Interface, group: Ipv6Address| {
+            let expected = EthernetAddress::from_multicast_ip(group.into());
+            let mut found = false;
+            iface.for_each_multicast_ethernet_address(|address| found |= address == expected);
+            found
+        };
+
+        assert!(projected(&iface, IPV6_LINK_LOCAL_ALL_NODES));
+        assert!(projected(&iface, local.solicited_node()));
+        assert!(projected(&iface, other.solicited_node()));
+        assert!(projected(&iface, explicit));
+        iface.leave_multicast_group(explicit).unwrap();
+        iface.update_ip_addrs(|addresses| addresses.retain(|cidr| cidr.address() != local.into()));
+        assert!(!projected(&iface, local.solicited_node()));
+        assert!(projected(&iface, other.solicited_node()));
+        assert!(!projected(&iface, explicit));
+    }
+
+    #[test]
     fn explicit_unrelated_solicited_group_survives_address_update() {
         let (mut iface, _, _) = crate::tests::setup(Medium::Ethernet);
         let group = address(0x1234).solicited_node();
@@ -202,6 +236,39 @@ impl core::fmt::Display for MulticastError {
 impl std::error::Error for MulticastError {}
 
 impl Interface {
+    /// Visit the Ethernet groups admitted by the configured IP memberships.
+    /// Addresses may repeat when distinct memberships map to the same MAC.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn for_each_multicast_ethernet_address(&self, mut visit: impl FnMut(EthernetAddress)) {
+        let mut visit_group = |address| visit(EthernetAddress::from_multicast_ip(address));
+        #[cfg(feature = "proto-ipv4")]
+        visit_group(IPV4_MULTICAST_ALL_SYSTEMS.into());
+        #[cfg(feature = "proto-ipv6")]
+        if self.inner.ipv6_enabled {
+            visit_group(IPV6_LINK_LOCAL_ALL_NODES.into());
+            #[cfg(feature = "proto-rpl")]
+            visit_group(IPV6_LINK_LOCAL_ALL_RPL_NODES.into());
+            // An address retains its solicited-node membership even when the
+            // finite table used for generating membership reports is full.
+            for address in self.inner.ip_addrs.iter().map(IpCidr::address) {
+                if let IpAddress::Ipv6(address) = address {
+                    if address.x_is_unicast() && !address.is_loopback() {
+                        visit_group(address.solicited_node().into());
+                    }
+                }
+            }
+        }
+        for (address, membership) in self.inner.multicast.groups.iter() {
+            #[cfg(feature = "proto-ipv6")]
+            if matches!(address, IpAddress::Ipv6(_)) && !self.inner.ipv6_enabled {
+                continue;
+            }
+            if membership.owners != 0 {
+                visit_group(*address);
+            }
+        }
+    }
+
     /// Add an address to a list of subscribed multicast IP addresses.
     pub fn join_multicast_group<T: Into<IpAddress>>(
         &mut self,

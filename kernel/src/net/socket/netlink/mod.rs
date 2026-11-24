@@ -70,6 +70,7 @@ pub(crate) fn notify_link_change(iface: &Arc<dyn crate::driver::net::Iface>) {
 }
 
 pub(crate) use route::kern::notify_ra_route;
+pub(crate) use route::kern::{has_prefix_listeners, notify_ra_prefix};
 pub(crate) use route::kern::{notify_iface_protocol_change, PreparedLinkDelete};
 
 pub(crate) fn prepare_link_delete(

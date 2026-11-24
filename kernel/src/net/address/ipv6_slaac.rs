@@ -97,16 +97,17 @@ use crate::{
 
 use super::{ipv6_autoconf, AddressMutation};
 
+/// Returns false when the device cannot generate an interface identifier.
 pub(crate) fn apply(
     rtnl: &RtnlGuard,
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     prefix: &NdiscPrefixInformation,
     received_at_us: i64,
-) -> Result<(), SystemError> {
+) -> Result<bool, SystemError> {
     let now_us = Instant::now().total_micros();
     let Some(target) = ipv6_autoconf::address_from_mac(iface.as_ref(), prefix.prefix) else {
-        return Ok(());
+        return Ok(false);
     };
     let offered = Lifetimes::from_option(
         received_at_us,
@@ -145,7 +146,7 @@ pub(crate) fn apply(
                 notify_iface_protocol_change(netns, iface, Vec::new(), [cidr], None, Vec::new());
             }
             ipv6_autoconf::changed(iface.common());
-            return Ok(());
+            return Ok(true);
         }
     }
     if !offered.expired(now_us) {
@@ -153,7 +154,7 @@ pub(crate) fn apply(
         ipv6_autoconf::start_address_dad(netns, iface, address, Some(offered), now_us)?;
         ipv6_autoconf::changed(iface.common());
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn remove(

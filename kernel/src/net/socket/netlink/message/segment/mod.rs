@@ -37,6 +37,7 @@ pub enum CSegmentType {
     NEWRULE = 32,
     DELRULE = 33,
     GETRULE = 34,
+    NEWPREFIX = 52,
 }
 
 impl TryFrom<u16> for CSegmentType {
@@ -64,6 +65,7 @@ impl TryFrom<u16> for CSegmentType {
             32 => Ok(CSegmentType::NEWRULE),
             33 => Ok(CSegmentType::DELRULE),
             34 => Ok(CSegmentType::GETRULE),
+            52 => Ok(CSegmentType::NEWPREFIX),
             _ => Err(SystemError::EINVAL),
         }
     }

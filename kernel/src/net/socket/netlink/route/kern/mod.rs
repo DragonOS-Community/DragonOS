@@ -28,7 +28,9 @@ pub(super) mod addr;
 pub(in crate::net::socket::netlink) mod dump;
 mod link;
 mod neigh;
+mod prefix;
 mod route;
+pub(crate) use prefix::{has_prefix_listeners, notify_ra_prefix};
 pub(crate) use route::notify_ra_route;
 mod utils;
 

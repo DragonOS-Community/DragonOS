@@ -89,8 +89,8 @@ void AppendAttr(std::vector<uint8_t>& bytes, uint16_t type, const void* data, si
     if (len) std::memcpy(RTA_DATA(attr), data, len);
 }
 
-int SendAck(int fd, LinkRequest& request) {
-    if (send(fd, request.bytes.data(), request.header()->nlmsg_len, 0) < 0) return errno;
+int SendAck(int fd, const nlmsghdr* request) {
+    if (send(fd, request, request->nlmsg_len, 0) < 0) return errno;
     std::array<uint8_t, 4096> reply {};
     for (int tries = 0; tries < 32; ++tries) {
         const ssize_t count = recv(fd, reply.data(), reply.size(), 0);
@@ -98,7 +98,7 @@ int SendAck(int fd, LinkRequest& request) {
         int remaining = static_cast<int>(count);
         for (auto* message = reinterpret_cast<nlmsghdr*>(reply.data());
              NLMSG_OK(message, remaining); message = NLMSG_NEXT(message, remaining)) {
-            if (message->nlmsg_seq != request.header()->nlmsg_seq ||
+            if (message->nlmsg_seq != request->nlmsg_seq ||
                 message->nlmsg_type != NLMSG_ERROR) continue;
             const auto* error = reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(message));
             return error->error == 0 ? 0 : -error->error;
@@ -107,6 +107,9 @@ int SendAck(int fd, LinkRequest& request) {
     return ETIMEDOUT;
 }
 
+int SendAck(int fd, LinkRequest& request) {
+    return SendAck(fd, request.header());
+}
 struct LinkState {
     uint32_t index = 0;
     uint32_t flags = 0;
@@ -609,6 +612,11 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
     ASSERT_GE(child, 0);
     if (child == 0) {
         const auto run = [] {
+            // An empty namespace keeps unrelated Router Advertisements out
+            // of the control listener's isolation check.
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd other_namespace(RTMGRP_IPV6_PREFIX);
+            ASSERT_GE(other_namespace.fd, 0);
             ASSERT_EQ(unshare(CLONE_NEWNET), 0);
             RouteFd route;
             ASSERT_GE(route.fd, 0);
@@ -644,6 +652,19 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_GE(monitor.fd, 0);
             RouteFd address_monitor(RTMGRP_IPV6_IFADDR);
             ASSERT_GE(address_monitor.fd, 0);
+            RouteFd prefix_monitor(RTMGRP_IPV6_PREFIX);
+            ASSERT_GE(prefix_monitor.fd, 0);
+            struct {
+                nlmsghdr header;
+                prefixmsg body;
+            } unsupported{};
+            unsupported.header.nlmsg_len = NLMSG_LENGTH(sizeof(prefixmsg));
+            unsupported.header.nlmsg_type = RTM_NEWPREFIX;
+            unsupported.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+            unsupported.header.nlmsg_seq = seq++;
+            unsupported.body.prefix_family = AF_INET6;
+            unsupported.body.prefix_ifindex = receive_ifindex;
+            ASSERT_EQ(SendAck(route.fd, &unsupported.header), EOPNOTSUPP);
             const int injector = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, htons(ETH_P_IPV6));
             ASSERT_GE(injector, 0);
             const sockaddr_ll multicast = {
@@ -656,7 +677,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_EQ(inet_pton(AF_INET6, "fd42:2324:47:77::", &prefix), 1);
             const auto advertise = [&](uint16_t lifetime,
                                        std::optional<uint32_t> prefix_lifetime = std::nullopt,
-                                       bool autonomous = false) {
+                                       uint8_t prefix_flags = 0x80,
+                                       uint32_t preferred = 0, uint8_t prefix_len = 64) {
                 constexpr size_t ip_header = 40, ra_header = 16, pio_length = 32;
                 const size_t ra_length = ra_header + (prefix_lifetime ? pio_length : 0);
                 std::vector<uint8_t> packet(ip_header + ra_length);
@@ -674,11 +696,12 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
                     auto* pio = packet.data() + ip_header + ra_header;
                     pio[0] = 3;
                     pio[1] = pio_length / 8;
-                    pio[2] = 64;
-                    pio[3] = autonomous ? 0x40 : 0x80;
+                    pio[2] = prefix_len;
+                    pio[3] = prefix_flags;
                     const uint32_t valid = htonl(*prefix_lifetime);
+                    const uint32_t preferred_lifetime = htonl(preferred);
                     std::memcpy(pio + 4, &valid, sizeof(valid));
-                    if (autonomous) std::memcpy(pio + 8, &valid, sizeof(valid));
+                    std::memcpy(pio + 8, &preferred_lifetime, sizeof(preferred_lifetime));
                     std::memcpy(pio + 16, &prefix, sizeof(prefix));
                 }
                 uint32_t sum = ra_length + IPPROTO_ICMPV6;
@@ -691,6 +714,36 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
                 ASSERT_EQ(sendto(injector, packet.data(), packet.size(), 0,
                                  reinterpret_cast<const sockaddr*>(&multicast), sizeof(multicast)),
                           static_cast<ssize_t>(packet.size()));
+            };
+            const auto expect_prefix = [&](uint8_t flags, uint32_t valid, uint32_t preferred) {
+                struct Notification {
+                    nlmsghdr header;
+                    prefixmsg body;
+                    rtattr address_attr;
+                    in6_addr address;
+                    rtattr cache_attr;
+                    prefix_cacheinfo cache;
+                } reply{};
+                static_assert(sizeof(Notification) == 60);
+                ASSERT_EQ(recv(prefix_monitor.fd, &reply, sizeof(reply), 0),
+                          static_cast<ssize_t>(sizeof(reply)));
+                EXPECT_EQ(reply.header.nlmsg_len, sizeof(reply));
+                EXPECT_EQ(reply.header.nlmsg_type, RTM_NEWPREFIX);
+                EXPECT_EQ(reply.header.nlmsg_pid, 0u);
+                EXPECT_EQ(reply.header.nlmsg_seq, 0u);
+                EXPECT_EQ(reply.header.nlmsg_flags, 0u);
+                EXPECT_EQ(reply.body.prefix_family, AF_INET6);
+                EXPECT_EQ(reply.body.prefix_ifindex, static_cast<int>(receive_ifindex));
+                EXPECT_EQ(reply.body.prefix_type, 3u);
+                EXPECT_EQ(reply.body.prefix_len, 64u);
+                EXPECT_EQ(reply.body.prefix_flags, flags);
+                EXPECT_EQ(reply.address_attr.rta_type, PREFIX_ADDRESS);
+                EXPECT_EQ(reply.address_attr.rta_len, RTA_LENGTH(sizeof(in6_addr)));
+                EXPECT_EQ(std::memcmp(&reply.address, &prefix, sizeof(prefix)), 0);
+                EXPECT_EQ(reply.cache_attr.rta_type, PREFIX_CACHEINFO);
+                EXPECT_EQ(reply.cache_attr.rta_len, RTA_LENGTH(sizeof(prefix_cacheinfo)));
+                EXPECT_EQ(reply.cache.valid_time, valid);
+                EXPECT_EQ(reply.cache.preferred_time, preferred);
             };
             const auto expect_route = [&](uint16_t kind, bool on_link = false) {
                 for (int attempt = 0; attempt < 16; ++attempt) {
@@ -748,8 +801,18 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE));
             ASSERT_NO_FATAL_FAILURE(advertise(0, 30));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_NEWROUTE, true));
+            ASSERT_NO_FATAL_FAILURE(expect_prefix(0x80, 30, 0));
             ASSERT_NO_FATAL_FAILURE(advertise(0, 0));
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE, true));
+            ASSERT_NO_FATAL_FAILURE(expect_prefix(0x80, 0, 0));
+            prefix.s6_addr[15] = 9;  // The notification carries the original address bytes.
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 0, 1));
+            ASSERT_NO_FATAL_FAILURE(expect_prefix(1, 0, 0));
+            prefix.s6_addr[15] = 0;
+
+            // These invalid PIOs must not precede the next valid notification.
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 20, 0x40, 10, 56));
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 10, 0x80, 20));
             const auto expect_address = [&](uint16_t kind, bool deprecated) {
                 for (int attempt = 0; attempt < 16; ++attempt) {
                     pollfd readable{address_monitor.fd, POLLIN, 0};
@@ -795,9 +858,11 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
                 }
                 FAIL() << "missing SLAAC address notification " << kind;
             };
-            ASSERT_NO_FATAL_FAILURE(advertise(0, 8, true));
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 8, 0x40, 8));
+            ASSERT_NO_FATAL_FAILURE(expect_prefix(0x40, 8, 8));
             ASSERT_NO_FATAL_FAILURE(expect_address(RTM_NEWADDR, false));
-            ASSERT_NO_FATAL_FAILURE(advertise(0, 0, true));
+            ASSERT_NO_FATAL_FAILURE(advertise(0, 0, 0x40));
+            ASSERT_NO_FATAL_FAILURE(expect_prefix(0x40, 0, 0));
             ASSERT_NO_FATAL_FAILURE(expect_address(RTM_NEWADDR, true));
             ASSERT_NO_FATAL_FAILURE(expect_address(RTM_DELADDR, true));
 
@@ -810,6 +875,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_EQ(SendAck(route.fd, lower_mtu), 0);
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE));
             close(injector);
+            pollfd unrelated{other_namespace.fd, POLLIN, 0};
+            EXPECT_EQ(poll(&unrelated, 1, 0), 0);
         };
         run();
         _exit(::testing::Test::HasFailure() ? 1 : 0);

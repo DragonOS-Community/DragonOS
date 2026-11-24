@@ -790,25 +790,26 @@ impl NetfilterKernelSocket {
                             }
                             Some(elements) => elements,
                         };
-                        let name = transaction.resolve_set_name(
-                            family,
-                            table_name,
-                            attrs.set,
-                            attrs.set_id,
-                        )?;
-                        let prior_events = if add {
-                            Vec::new()
-                        } else {
-                            let (table, set) =
-                                transaction.set_for_notification(family, table_name, &name)?;
-                            set_element_events(&table, &set, elements, port, request.kind())?
-                        };
-                        let (table, set) = transaction
-                            .update_set_elements(family, table_name, &name, elements, add)?;
                         let events = if add {
+                            let name = transaction.resolve_set_name(
+                                family,
+                                table_name,
+                                attrs.set,
+                                attrs.set_id,
+                            )?;
+                            let (table, set) = transaction
+                                .update_set_elements(family, table_name, &name, elements, true)?;
                             set_element_events(&table, &set, elements, port, request.kind())?
                         } else {
-                            prior_events
+                            transaction.delete_keyed_set_elements(
+                                family,
+                                table_name,
+                                attrs.set,
+                                elements,
+                                |table, set| {
+                                    set_element_events(table, set, elements, port, request.kind())
+                                },
+                            )?
                         };
                         notifications
                             .try_reserve(events.len())

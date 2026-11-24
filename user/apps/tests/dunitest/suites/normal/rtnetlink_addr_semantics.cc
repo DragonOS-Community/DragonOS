@@ -928,7 +928,7 @@ int RunManualIpv6Lifetimes() {
     }
     constexpr ifa_cacheinfo deprecated{0, 9, UINT32_MAX, UINT32_MAX};
     if (configure(finite, kAdd, &deprecated) != 0) return 120;
-    if (configure(finite, kAdd, &invalid_order) != EEXIST ||
+    if (configure(finite, kAdd, &deprecated) != EEXIST ||
         configure(finite, kReplace, &invalid_order) != EINVAL) {
         return 130;
     }

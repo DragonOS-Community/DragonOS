@@ -7552,7 +7552,7 @@ TEST(NetlinkNetfilter, NftKeyedSetDeletionUsesNameAndChecksEligibility) {
   Ack(fd.get(), seq + 1, 0, kNftDeltable);
 }
 
-TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {
+TEST(NetlinkNetfilter, NftSetElementNotificationHeadersMatchLinux) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd writer(Open());
   Fd listener(Open());
@@ -7582,7 +7582,7 @@ TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {
                           &group, sizeof(group)));
 
   auto expect_notification = [&](int fd, uint16_t kind, in_addr expected_key,
-                                 uint32_t ack_seq) {
+                                 uint32_t ack_seq, uint16_t expected_flags) {
     bool saw_notification = false;
     bool saw_ack = ack_seq == 0;
     for (int attempt = 0; attempt < 8 && !(saw_notification && saw_ack); ++attempt) {
@@ -7618,6 +7618,7 @@ TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {
               std::memcmp(key_attr.data, &expected_key.s_addr, sizeof(expected_key.s_addr)) != 0)
             continue;
           EXPECT_EQ(0u, message->nlmsg_seq);
+          EXPECT_EQ(expected_flags, message->nlmsg_flags);
           saw_notification = true;
         }
       }
@@ -7627,7 +7628,7 @@ TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {
   };
 
   auto mutate = [&](uint16_t kind, uint32_t change_seq, in_addr element_key,
-                    bool flush = false) {
+                    uint16_t flags, bool flush = false) {
     SCOPED_TRACE(change_seq);
     auto batch = Request(NFNL_MSG_BATCH_BEGIN, change_seq - 1);
     nfgenmsg gen{};
@@ -7637,17 +7638,17 @@ TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {
                         : Ipv4SourceSetElement(kind, change_seq, table, set, element_key);
     nlmsghdr header{};
     std::memcpy(&header, change.data(), sizeof(header));
-    header.nlmsg_flags |= NLM_F_ECHO;
+    header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO | flags;
     std::memcpy(change.data(), &header, sizeof(header));
     auto batch_end = Request(NFNL_MSG_BATCH_END, change_seq + 1);
     batch.insert(batch.end(), change.begin(), change.end());
     batch.insert(batch.end(), batch_end.begin(), batch_end.end());
     ASSERT_EQ(static_cast<ssize_t>(batch.size()), Send(writer.get(), batch));
-    expect_notification(writer.get(), kind, element_key, change_seq);
-    expect_notification(listener.get(), kind, element_key, 0);
+    expect_notification(writer.get(), kind, element_key, change_seq, flags);
+    expect_notification(listener.get(), kind, element_key, 0, flags);
   };
 
-  mutate(kNftNewsetelem, seq + 5, key);
+  mutate(kNftNewsetelem, seq + 5, key, NLM_F_CREATE | NLM_F_EXCL);
   auto dump = Ipv4SetElementsRequest(kNftGetsetelem, seq + 7, table, set);
   nlmsghdr dump_header{};
   std::memcpy(&dump_header, dump.data(), sizeof(dump_header));
@@ -7655,9 +7656,9 @@ TEST(NetlinkNetfilter, NftSetElementNotificationsUseZeroSequence) {
   std::memcpy(dump.data(), &dump_header, sizeof(dump_header));
   ASSERT_EQ(static_cast<ssize_t>(dump.size()), Send(writer.get(), dump));
   EXPECT_EQ(1u, ReceiveSetElementDumpCount(writer.get(), seq + 7));
-  mutate(kNftDelsetelem, seq + 9, key);
-  mutate(kNftNewsetelem, seq + 12, flush_key);
-  mutate(kNftDelsetelem, seq + 15, flush_key, true);
+  mutate(kNftDelsetelem, seq + 9, key, NLM_F_EXCL);
+  mutate(kNftNewsetelem, seq + 12, flush_key, 0);
+  mutate(kNftDelsetelem, seq + 15, flush_key, NLM_F_CREATE, true);
 
   auto remove = TableBatch(kNftDeltable, seq + 17, table);
   ASSERT_EQ(static_cast<ssize_t>(remove.size()), Send(writer.get(), remove));

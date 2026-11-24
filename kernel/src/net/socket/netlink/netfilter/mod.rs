@@ -10,6 +10,7 @@ mod nft;
 use super::{
     addr::NetlinkSocketAddr,
     common::NetlinkSocket,
+    message::segment::header::NewRequestFlags,
     receiver::MessageQueue,
     table::MulticastMessage,
     table::{
@@ -106,8 +107,7 @@ fn set_element_events(
     table: &NftTable,
     set: &NftSet,
     inputs: &[NftSetElementInput<'_>],
-    port: u32,
-    kind: u16,
+    meta: SetElementMessageMeta,
 ) -> Result<Vec<NetfilterMessage>, SystemError> {
     let mut events = Vec::new();
     events
@@ -118,18 +118,7 @@ fn set_element_events(
             .element_index(input.key, input.flags)
             .ok_or(SystemError::ENOENT)?;
         let stored = &set.elements[index];
-        events.push(set_elem_message(
-            table,
-            set,
-            stored,
-            SetElementMessageMeta {
-                generation: 0,
-                sequence: 0,
-                port,
-                kind,
-                flags: 0,
-            },
-        )?);
+        events.push(set_elem_message(table, set, stored, meta)?);
     }
     Ok(events)
 }
@@ -765,6 +754,8 @@ impl NetfilterKernelSocket {
                         }
                         let table_name = attrs.table.ok_or(SystemError::EINVAL)?;
                         let echo = request.flags() & NLM_F_ECHO != 0;
+                        let flags = request.flags()
+                            & (NewRequestFlags::CREATE | NewRequestFlags::EXCL).bits();
                         let elements = match elements {
                             None | Some([]) => {
                                 if let Some((table, old_set)) = transaction
@@ -782,13 +773,20 @@ impl NetfilterKernelSocket {
                                         object: NotificationObject::FlushedSet(table, old_set),
                                         kind: NFT_MSG_DELSETELEM,
                                         sequence: 0,
-                                        flags: 0,
+                                        flags,
                                         echo,
                                     });
                                 }
                                 return Ok(());
                             }
                             Some(elements) => elements,
+                        };
+                        let meta = SetElementMessageMeta {
+                            generation: 0,
+                            sequence: 0,
+                            port,
+                            kind: request.kind(),
+                            flags,
                         };
                         let events = if add {
                             let name = transaction.resolve_set_name(
@@ -799,16 +797,14 @@ impl NetfilterKernelSocket {
                             )?;
                             let (table, set) = transaction
                                 .update_set_elements(family, table_name, &name, elements, true)?;
-                            set_element_events(&table, &set, elements, port, request.kind())?
+                            set_element_events(&table, &set, elements, meta)?
                         } else {
                             transaction.delete_keyed_set_elements(
                                 family,
                                 table_name,
                                 attrs.set,
                                 elements,
-                                |table, set| {
-                                    set_element_events(table, set, elements, port, request.kind())
-                                },
+                                |table, set| set_element_events(table, set, elements, meta),
                             )?
                         };
                         notifications
@@ -819,7 +815,7 @@ impl NetfilterKernelSocket {
                                 object: NotificationObject::SetElement(message),
                                 kind: request.kind(),
                                 sequence: 0,
-                                flags: 0,
+                                flags,
                                 echo,
                             });
                         }

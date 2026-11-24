@@ -525,22 +525,15 @@ fn lookup_route(
             Some(IpAddress::Ipv6(source)) => Some(source),
             _ => None,
         };
-        let decision = route::lookup_ipv6_output(&netns, destination_v6, requested_oif, source);
-        if let Some(rejection) =
-            decision.and_then(|decision| route::ipv6_route_rejection(decision.matched.kind))
-        {
-            return Err(rejection.error);
-        }
-        if let Some(oif) = requested_oif {
-            ensure_iface_up(&netns, oif)?;
-        }
-        let decision = decision.ok_or(SystemError::ENETUNREACH)?;
-        let iface = netns
-            .device_list()
-            .get(&(decision.oif as usize))
-            .cloned()
-            .ok_or(SystemError::ENODEV)?;
-        if request.body().flags.contains(RouteFlags::FIB_MATCH) {
+        let fib_match = request.body().flags.contains(RouteFlags::FIB_MATCH);
+        let (decision, selected) = route::resolve_ipv6_route_query(
+            &netns,
+            destination_v6,
+            requested_oif,
+            source,
+            fib_match,
+        )?;
+        if fib_match {
             return Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
                 request.header(),
                 CSegmentType::NEWROUTE,
@@ -550,13 +543,6 @@ fn lookup_route(
                 None,
             )?)]);
         }
-        let selected = if requested_source.is_some() {
-            None
-        } else {
-            decision.source.preferred().or_else(|| {
-                crate::net::socket::inet::common::pick_configured_source_addr(&iface, &destination)
-            })
-        };
         (decision, selected)
     };
     let host = host_cidr(destination);

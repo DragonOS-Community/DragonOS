@@ -3,7 +3,7 @@
 //! Socket and rtnetlink callers consume this module's result instead of
 //! independently interpreting FIB source policy.
 
-use alloc::sync::Arc;
+use alloc::{collections::BTreeMap, sync::Arc};
 use core::cmp::Reverse;
 
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
@@ -250,6 +250,89 @@ pub(crate) fn resolve_ipv4_output_flow(
     })
 }
 
+fn uses_ranked_ipv6_sources(route: RouteLookupResult) -> bool {
+    route.matched.is_explicit_ipv6_local() || route.matched.kind == super::RTN_UNICAST
+}
+
+fn ipv6_destination_is_scoped(destination: Ipv6Address) -> bool {
+    destination.is_loopback() || destination.is_unicast_link_local() || destination.is_multicast()
+}
+
+fn select_ranked_ipv6_source(
+    devices: &BTreeMap<usize, Arc<dyn Iface>>,
+    destination: Ipv6Address,
+    oif: u32,
+) -> Option<(Ipv6Address, &Arc<dyn Iface>)> {
+    let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
+    let candidate_on = |iface: &Arc<dyn Iface>| {
+        let index = iface.nic_id();
+        let (score, source) = iface.smol_iface().lock().ipv6_source_candidate_at(
+            &destination,
+            now,
+            Some(index == oif as usize),
+        )?;
+        Some((score, source, index))
+    };
+    let candidate = if ipv6_destination_is_scoped(destination) {
+        candidate_on(devices.get(&(oif as usize))?)
+    } else {
+        devices
+            .values()
+            .filter_map(candidate_on)
+            .max_by(|left, right| left.0.cmp(&right.0))
+    };
+    let (_, source, index) = candidate?;
+    Some((source, devices.get(&index)?))
+}
+
+/// Resolve an IPv6 RTM_GETROUTE output lookup. The reply's preferred source
+/// describes the matched route and does not participate in the FIB lookup.
+pub(crate) fn resolve_ipv6_route_query(
+    netns: &Arc<NetNamespace>,
+    destination: Ipv6Address,
+    oif: Option<u32>,
+    source: Option<Ipv6Address>,
+    fib_match: bool,
+) -> Result<(RouteLookupResult, Option<IpAddress>), SystemError> {
+    let devices = netns.device_list();
+    let router = netns.router();
+    let fib = router.fib.read();
+    let decision = fib.lookup_ipv6_output(destination, oif, source);
+    if let Some(rejection) =
+        decision.and_then(|route| super::ipv6_route_rejection(route.matched.kind))
+    {
+        return Err(rejection.error);
+    }
+    if let Some(oif) = oif {
+        let iface = devices.get(&(oif as usize)).ok_or(SystemError::ENODEV)?;
+        if !iface.flags().contains(InterfaceFlags::UP) {
+            return Err(SystemError::ENETUNREACH);
+        }
+    }
+    let decision = decision.ok_or(SystemError::ENETUNREACH)?;
+    let iface = devices
+        .get(&(decision.oif as usize))
+        .ok_or(SystemError::ENODEV)?;
+    let preferred = if fib_match || source.is_some() {
+        None
+    } else {
+        match decision.source {
+            RouteSourcePolicy::Preferred(source) => Some(source),
+            RouteSourcePolicy::SelectConfigured
+                if uses_ranked_ipv6_sources(decision) && !destination.is_unspecified() =>
+            {
+                select_ranked_ipv6_source(&devices, destination, decision.oif)
+                    .map(|(source, _)| source.into())
+            }
+            _ => crate::net::socket::inet::common::pick_configured_source_addr(
+                iface,
+                &destination.into(),
+            ),
+        }
+    };
+    Ok((decision, preferred))
+}
+
 /// Validate an already selected native IPv6 source against the output route.
 /// Source selection itself remains in the existing socket source policy.
 /// In particular, IPv6 never uses IPv4's explicit-device on-link fallback.
@@ -402,40 +485,27 @@ pub(crate) fn resolve_ipv6_socket_route(
         SystemError::ENETUNREACH
     };
     let explicit_local = selected.matched.is_explicit_ipv6_local();
-    let scoped_destination = destination_v6.is_loopback()
-        || destination_v6.is_unicast_link_local()
-        || destination_v6.is_multicast();
+    let uses_routed_source_selection = uses_ranked_ipv6_sources(selected);
+    let scoped_destination = ipv6_destination_is_scoped(destination_v6);
     let (source, selected_owner) = if let Some(source) = source {
         let local = devices.values().any(|candidate| {
             crate::net::address::iface_accepts_local_address(candidate, source.into())
         });
         if !local
             || super::is_ipv6_link_local(source.into())
-                && (!explicit_local || scoped_destination)
+                && (!uses_routed_source_selection || scoped_destination)
                 && !crate::net::address::iface_accepts_local_address(egress, source.into())
         {
             return Err(SystemError::EADDRNOTAVAIL);
         }
         (source, None)
-    } else if explicit_local && matches!(selected.source, RouteSourcePolicy::SelectConfigured) {
-        let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
-        let (_, source, owner) = devices
-            .values()
-            .filter_map(|iface| {
-                let on_route_device = iface.nic_id() == selected.oif as usize;
-                if scoped_destination && !on_route_device {
-                    return None;
-                }
-                let (score, source) = iface.smol_iface().lock().ipv6_source_candidate_at(
-                    &destination_v6,
-                    now,
-                    Some(on_route_device),
-                )?;
-                Some((score, source, iface))
-            })
-            .max_by(|left, right| left.0.cmp(&right.0))
+    } else if uses_routed_source_selection
+        && !destination_v6.is_unspecified()
+        && matches!(selected.source, RouteSourcePolicy::SelectConfigured)
+    {
+        let (source, owner) = select_ranked_ipv6_source(&devices, destination_v6, selected.oif)
             .ok_or(SystemError::EADDRNOTAVAIL)?;
-        (source, Some(Arc::clone(owner)))
+        (source, Some(owner.clone()))
     } else {
         let candidate = match selected.source {
             super::RouteSourcePolicy::Preferred(source) => Some(source),

@@ -293,6 +293,23 @@ impl PreparedAddressRouteCommit {
         let was_ipv6_enabled = iface.common().ipv6_enabled();
         let is_ipv6_enabled = ipv6_enabled.unwrap_or(was_ipv6_enabled);
         let ifindex = iface.nic_id() as u32;
+        let link_down = was_up && !is_up;
+        let disable_ipv6 = was_ipv6_enabled && !is_ipv6_enabled;
+        let remove_on_down = |entry: RouteEntry| {
+            entry.oif == ifindex
+                && !(is_ipv4(entry.destination.address())
+                    && entry.table == RT_TABLE_LOCAL
+                    && entry.kind == RTN_LOCAL
+                    && entry.scope == RT_SCOPE_HOST)
+        };
+        let remove_for_ipv6 = |entry: RouteEntry| {
+            entry.oif == ifindex
+                && if disable_ipv6 {
+                    !is_ipv4(entry.destination.address())
+                } else {
+                    discard_learned_defaults && entry.learned_default().is_some()
+                }
+        };
         let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
         let inactive_count = metadata
             .iter()
@@ -339,6 +356,13 @@ impl PreparedAddressRouteCommit {
                 ifindex,
                 deleted_addresses,
                 |entry| {
+                    // Only surviving IPv6 routes need a silent prefsrc edit.
+                    // Keep the separate IPv4 address-removal phase intact.
+                    if !is_ipv4(entry.destination.address())
+                        && ((link_down && remove_on_down(entry)) || remove_for_ipv6(entry))
+                    {
+                        return true;
+                    }
                     let source = entry
                         .preferred_source
                         .expect("preferred-source filter only calls this predicate for a match");
@@ -350,29 +374,18 @@ impl PreparedAddressRouteCommit {
                 },
             )
         }?;
-        if was_ipv6_enabled && !is_ipv6_enabled {
-            editor.remove_where(|entry| {
-                entry.oif == ifindex && !is_ipv4(entry.destination.address())
-            })?;
-        } else if discard_learned_defaults {
-            editor
-                .remove_where(|entry| entry.oif == ifindex && entry.learned_default().is_some())?;
+        if disable_ipv6 || discard_learned_defaults {
+            editor.remove_where(remove_for_ipv6)?;
         }
         let mut affected_oifs = editor.finish()?;
-        let address_removed = if was_up && !is_up {
+        let address_removed = if link_down {
             candidate.delta_from(&before)?.removed
         } else {
             Vec::new()
         };
-        if was_up && !is_up {
+        if link_down {
             let mut state_editor = FibEditor::new(&mut candidate);
-            state_editor.remove_where(|entry| {
-                entry.oif == ifindex
-                    && !(is_ipv4(entry.destination.address())
-                        && entry.table == RT_TABLE_LOCAL
-                        && entry.kind == RTN_LOCAL
-                        && entry.scope == RT_SCOPE_HOST)
-            })?;
+            state_editor.remove_where(remove_on_down)?;
             for oif in state_editor.finish()? {
                 if !affected_oifs.contains(&oif) {
                     affected_oifs
@@ -424,7 +437,7 @@ impl PreparedAddressRouteCommit {
             &devices,
         )?;
         let mut notifications = candidate.delta_from(&before)?.into_notifications();
-        if was_up && !is_up {
+        if link_down {
             // NETDEV_DOWN silently flushes ordinary IPv4 routes. Routes
             // removed by the preceding MTU address teardown retain their
             // normal address-lifecycle notifications.
@@ -449,7 +462,7 @@ impl PreparedAddressRouteCommit {
             after_addresses: try_clone_slice(after_addresses)?,
             metadata,
             deleted_addresses: try_clone_slice(deleted_addresses)?,
-            invalidate_masquerade_oif: was_up && !is_up,
+            invalidate_masquerade_oif: link_down,
             ipv6_enabled,
         })
     }

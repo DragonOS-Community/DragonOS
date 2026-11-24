@@ -496,9 +496,12 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
                                kDestination, 64, veth, RT_SCOPE_NOWHERE, ++seq);
     ASSERT_EQ(SendIpv6RouteRequest(sender.Get(), RTM_NEWROUTE,
                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-                                   kDestination, 64, veth, RT_SCOPE_LINK, ++seq),
+                                   kDestination, 64, veth, RT_SCOPE_LINK, ++seq,
+                                   nullptr, 0, kAddress),
               0);
-    ASSERT_TRUE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
+    const auto configured = FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq);
+    ASSERT_TRUE(configured.has_value());
+    EXPECT_TRUE(configured->has_preferred_source);
 
     FdGuard listener(OpenRouteListener(RTMGRP_IPV6_ROUTE));
     ASSERT_GE(listener.Get(), 0) << ErrnoString(errno);

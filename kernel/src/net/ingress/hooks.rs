@@ -61,7 +61,7 @@ impl IngressHooks<'_> {
         if !self.ct_active_for(version) {
             return true;
         }
-        if self.stage == IngressStage::LocalOutput {
+        if self.stage.is_local_output() {
             return self.packet_context.borrow().is_some();
         }
         let parsed = match version {
@@ -122,7 +122,7 @@ impl IngressHooks<'_> {
         next_hop: Option<IpAddress>,
         active_side: &Cell<Option<NatManipSide>>,
     ) -> Result<NftNatProgress, SystemError> {
-        let mode = if self.stage == IngressStage::LocalOutput {
+        let mode = if self.stage.is_local_output() {
             CtChecksumMode::Skip
         } else {
             CtChecksumMode::Verify
@@ -134,7 +134,7 @@ impl IngressHooks<'_> {
                 // The loopback receive copy has already traversed OUTPUT and
                 // POSTROUTING with this same CT identity. PRE/IN filter chains
                 // still run, but neither direction may bind or rewrite again.
-                if self.stage == IngressStage::LocalOutput {
+                if self.stage.is_local_output() {
                     return Ok(NftNatProgress::SkipRules);
                 }
                 match context {

@@ -597,6 +597,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
             LocalOutputDisposition::Local {
                 oif: route.oif,
                 ip_mtu: route.ip_mtu,
+                explicit_ipv6_local: route.explicit_ipv6_local,
             }
         } else {
             LocalOutputDisposition::Routed {
@@ -672,6 +673,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
             LocalOutputDisposition::Local {
                 oif: route.oif,
                 ip_mtu: route.ip_mtu,
+                explicit_ipv6_local: route.explicit_ipv6_local,
             }
         } else {
             LocalOutputDisposition::Routed {
@@ -1437,6 +1439,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 ip_mtu,
                 kind: crate::net::route::RTN_MULTICAST,
                 loopback_anycast: false,
+                explicit_ipv6_local: false,
                 table: crate::net::route::RT_TABLE_LOCAL,
             }
         } else {
@@ -1667,6 +1670,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             LocalOutputDisposition::Local {
                 oif: route.oif,
                 ip_mtu,
+                explicit_ipv6_local: route.explicit_ipv6_local,
             }
         } else {
             LocalOutputDisposition::Routed {
@@ -1780,11 +1784,15 @@ impl LocalInputTxToken<'_> {
                 self.disposition = LocalOutputDisposition::Local {
                     oif: route.oif,
                     ip_mtu,
+                    explicit_ipv6_local: route.explicit_ipv6_local,
                 };
                 return Ok(Some(smoltcp::phy::TxEgressOverride {
                     medium: smoltcp::phy::Medium::Ip,
                     ip_mtu,
-                    context: LocalOutputDisposition::local_context(route.oif),
+                    context: LocalOutputDisposition::local_context(
+                        route.oif,
+                        route.explicit_ipv6_local,
+                    ),
                 }));
             }
             let next_hop = route.next_hop;
@@ -2328,7 +2336,11 @@ where
             );
             LocalOutputTransmitResult::Sent(packet)
         }
-        LocalOutputDisposition::Local { oif, ip_mtu } => {
+        LocalOutputDisposition::Local {
+            oif,
+            ip_mtu,
+            explicit_ipv6_local,
+        } => {
             if packet.medium != smoltcp::phy::Medium::Ip
                 || (packet.prepared_ip.is_none() && packet.frame.len() > ip_mtu)
                 || smoltcp::wire::IpVersion::of_packet(&packet.frame).is_err()
@@ -2338,12 +2350,20 @@ where
             let Some(iface) = netns.device_list().get(&(oif as usize)).cloned() else {
                 return LocalOutputTransmitResult::Drop(packet, SystemError::ENODEV);
             };
-            let effective_mtu = ip_mtu.min(iface.mtu());
+            let link_mtu = if explicit_ipv6_local {
+                let Some(loopback) = netns.loopback_iface() else {
+                    return LocalOutputTransmitResult::Drop(packet, SystemError::ENODEV);
+                };
+                loopback.mtu()
+            } else {
+                iface.mtu()
+            };
+            let effective_mtu = ip_mtu.min(link_mtu);
             let fragment = match next_output_fragment(&packet, effective_mtu) {
                 Ok(fragment) => fragment,
                 Err(error) => return fragment_transmit_error(packet, error),
             };
-            // IPv6 loopback uses the address-owning interface for input scope.
+            // Keep the configured interface as the IPv6 socket input scope.
             let ingress_ifindex = if matches!(
                 smoltcp::wire::IpVersion::of_packet(&packet.frame),
                 Ok(smoltcp::wire::IpVersion::Ipv6)
@@ -2358,13 +2378,21 @@ where
             let wire_packet = fragment
                 .as_ref()
                 .map_or(packet.frame.as_slice(), |(frame, _)| frame.as_slice());
+            let origin = if explicit_ipv6_local {
+                let Ok(ipv6) = smoltcp::wire::Ipv6Packet::new_checked(wire_packet) else {
+                    return LocalOutputTransmitResult::Drop(packet, SystemError::EINVAL);
+                };
+                LocalPacketOrigin::ExplicitIpv6LocalOutput(ipv6.dst_addr())
+            } else {
+                LocalPacketOrigin::LocalOutput
+            };
             match crate::driver::net::inject_local_ip_packet_with_context_and_mark(
                 iface.as_ref(),
                 ingress_ifindex,
                 iface.mac(),
                 wire_packet,
                 false,
-                LocalPacketOrigin::LocalOutput,
+                origin,
                 Some(packet.ct_context.for_ingress()),
                 packet.mark,
             ) {

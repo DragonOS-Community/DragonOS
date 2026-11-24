@@ -1,9 +1,19 @@
 use super::*;
 
+// Only the alloc-backed filtered receive path produces non-default variants.
+#[cfg_attr(not(feature = "alloc"), allow(dead_code))]
+#[derive(Clone, Copy, Default)]
+enum Ipv6Admission {
+    #[default]
+    Interface,
+    NeighborDiscovery,
+    Anycast(Ipv6Address),
+    Local(Ipv6Address),
+}
+
 #[derive(Default)]
 struct Ipv6ReceiveContext {
-    link_control: bool,
-    anycast_destination: Option<Ipv6Address>,
+    admission: Ipv6Admission,
     ndisc_router: bool,
     #[cfg(all(feature = "alloc", feature = "socket-raw"))]
     external_raw: Option<bool>,
@@ -266,14 +276,15 @@ impl InterfaceInner {
         if !accepts_ipv6_source(post_repr, protocol, payload) {
             return None;
         }
-        let (link_control, anycast_destination) = match filter.route_input(
+        let admission = match filter.route_input(
             &mut RoutedIngressPacket::new(&mut packet),
             meta,
             source_hardware_addr,
         ) {
-            RouteInputVerdict::Pass => (false, None),
-            RouteInputVerdict::NeighborDiscovery => (true, None),
-            RouteInputVerdict::Ipv6Anycast => (false, Some(post_repr.dst_addr)),
+            RouteInputVerdict::Pass => Ipv6Admission::Interface,
+            RouteInputVerdict::NeighborDiscovery => Ipv6Admission::NeighborDiscovery,
+            RouteInputVerdict::Ipv6Anycast => Ipv6Admission::Anycast(post_repr.dst_addr),
+            RouteInputVerdict::Ipv6Local => Ipv6Admission::Local(post_repr.dst_addr),
             RouteInputVerdict::Drop | RouteInputVerdict::Forward => return None,
         };
         // LOCAL_IN is after the route/local-address decision. Inspect the
@@ -290,13 +301,7 @@ impl InterfaceInner {
         } else {
             (post_repr.next_header, post.payload())
         };
-        if !self.accepts_local_ipv6_destination(
-            post_repr,
-            next_header,
-            ip_payload,
-            link_control,
-            anycast_destination,
-        ) {
+        if !self.accepts_local_ipv6_destination(post_repr, next_header, ip_payload, admission) {
             return None;
         }
         let transport_offset = 40 + post.payload().len() - ip_payload.len();
@@ -318,32 +323,41 @@ impl InterfaceInner {
             source_hardware_addr,
             &rewritten,
             Ipv6ReceiveContext {
-                link_control,
-                anycast_destination,
+                admission,
                 ndisc_router: rewritten.src_addr().is_unspecified() && filter.ipv6_ndisc_router(),
                 #[cfg(feature = "socket-raw")]
                 external_raw: _raw_delivery,
             },
         )?;
-        if anycast_destination.is_some() {
+        let anycast = matches!(admission, Ipv6Admission::Anycast(_));
+        if anycast || matches!(admission, Ipv6Admission::Local(_)) {
             #[allow(irrefutable_let_patterns)]
             if let Packet::Ipv6(packet) = &mut reply {
                 if let IpPayload::Icmpv6(message) = &packet.payload {
                     let echo = matches!(message, Icmpv6Repr::EchoReply { .. });
-                    if echo
-                        || matches!(
-                            message,
-                            Icmpv6Repr::DstUnreachable { .. } | Icmpv6Repr::ParamProblem { .. }
-                        )
+                    let error = matches!(
+                        message,
+                        Icmpv6Repr::DstUnreachable { .. } | Icmpv6Repr::ParamProblem { .. }
+                    );
+                    let remote = packet.header.dst_addr;
+                    if (echo && anycast) || error {
+                        let local_destination = match admission {
+                            Ipv6Admission::Local(destination) => Some(destination),
+                            _ => None,
+                        };
+                        packet.header.src_addr = filter.ipv6_routed_icmp_reply_source(
+                            remote,
+                            meta,
+                            echo,
+                            local_destination,
+                        )?;
+                    }
+                    #[cfg(feature = "packetmeta-id")]
+                    // Match fe80::/10 using the minimum Rust version.
+                    if (echo && anycast)
+                        || ((echo || error) && (remote.segments()[0] & 0xffc0) == 0xfe80)
                     {
-                        let remote = packet.header.dst_addr;
-                        packet.header.src_addr =
-                            filter.ipv6_anycast_reply_source(remote, meta, echo)?;
-                        #[cfg(feature = "packetmeta-id")]
-                        // Match fe80::/10 using the minimum Rust version.
-                        if echo || (remote.segments()[0] & 0xffc0) == 0xfe80 {
-                            packet.tx_meta.id = meta.id;
-                        }
+                        packet.tx_meta.id = meta.id;
                     }
                 }
             }
@@ -394,13 +408,12 @@ impl InterfaceInner {
                 ipv6_repr,
                 next_header,
                 ip_payload,
-                receive.link_control,
-                receive.anycast_destination,
+                receive.admission,
             )
         {
             return None;
         }
-        meta.ipv6_anycast = receive.anycast_destination.is_some();
+        meta.ipv6_anycast = matches!(receive.admission, Ipv6Admission::Anycast(_));
 
         #[cfg(feature = "socket-raw")]
         let handled_by_raw_socket = {
@@ -440,16 +453,14 @@ impl InterfaceInner {
         ipv6_repr: Ipv6Repr,
         next_header: IpProtocol,
         ip_payload: &[u8],
-        link_control: bool,
-        anycast_destination: Option<Ipv6Address>,
+        admission: Ipv6Admission,
     ) -> bool {
-        if let Some(destination) = anycast_destination {
+        if let Ipv6Admission::Local(destination) | Ipv6Admission::Anycast(destination) = admission {
             return ipv6_repr.dst_addr == destination && destination.x_is_unicast();
         }
-        // The route integration may keep NDISC on its physical ingress link
-        // even when weak-host local routing selected an address owned by a
-        // different interface. Never extend that exception to another packet.
-        let ingress_ndisc = link_control
+        // Keep NDISC scoped to the physical link for a destination whose
+        // local address belongs to another interface.
+        let ingress_ndisc = matches!(admission, Ipv6Admission::NeighborDiscovery)
             && ipv6_repr.hop_limit == 0xff
             && next_header == IpProtocol::Icmpv6
             && Icmpv6Packet::new_checked(ip_payload)

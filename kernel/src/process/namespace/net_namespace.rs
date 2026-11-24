@@ -405,18 +405,23 @@ pub(crate) enum DefragSource {
     LinkIngress,
     BridgeIngress(BridgeFragmentIngress),
     LocalOutput,
-    LocalInput,
+    ExplicitIpv6LocalOutput(smoltcp::wire::Ipv6Address),
+    LocalInput(Option<smoltcp::wire::Ipv6Address>),
 }
 
 impl DefragSource {
+    pub(crate) fn is_local_output(self) -> bool {
+        matches!(self, Self::LocalOutput | Self::ExplicitIpv6LocalOutput(_))
+    }
+
     fn domain(self) -> DefragDomain {
         match self {
             Self::LinkIngress => DefragDomain::pre_routing(0, 0),
             Self::BridgeIngress(bridge) => {
                 DefragDomain::bridge_ingress(bridge.bridge_ifindex, bridge.generation)
             }
-            Self::LocalOutput => DefragDomain::local_out(0, 0),
-            Self::LocalInput => DefragDomain::local_input(0, 0),
+            Self::LocalOutput | Self::ExplicitIpv6LocalOutput(_) => DefragDomain::local_out(0, 0),
+            Self::LocalInput(_) => DefragDomain::local_input(0, 0),
         }
     }
 
@@ -427,7 +432,12 @@ impl DefragSource {
                 unreachable!("bridge fragments use their Ethernet continuation")
             }
             Self::LocalOutput => crate::driver::net::LocalPacketOrigin::LocalOutput,
-            Self::LocalInput => crate::driver::net::LocalPacketOrigin::LocalInputDone,
+            Self::ExplicitIpv6LocalOutput(destination) => {
+                crate::driver::net::LocalPacketOrigin::ExplicitIpv6LocalOutput(destination)
+            }
+            Self::LocalInput(destination) => {
+                crate::driver::net::LocalPacketOrigin::LocalInputDone(destination)
+            }
         }
     }
 
@@ -437,8 +447,10 @@ impl DefragSource {
             Self::BridgeIngress(bridge) => {
                 Ipv6DefragDomain::bridge_ingress(bridge.bridge_ifindex, bridge.generation)
             }
-            Self::LocalOutput => Ipv6DefragDomain::local_out(0, ingress_ifindex),
-            Self::LocalInput => Ipv6DefragDomain::local_input(0, ingress_ifindex),
+            Self::LocalOutput | Self::ExplicitIpv6LocalOutput(_) => {
+                Ipv6DefragDomain::local_out(0, ingress_ifindex)
+            }
+            Self::LocalInput(_) => Ipv6DefragDomain::local_input(0, ingress_ifindex),
         }
     }
 }
@@ -924,7 +936,7 @@ impl NetnsPoller {
             return;
         }
         let ct_context = match completion.source {
-            DefragSource::LocalOutput => Some(
+            DefragSource::LocalOutput | DefragSource::ExplicitIpv6LocalOutput(_) => Some(
                 first_origin
                     .ct_context
                     .as_deref()
@@ -934,14 +946,17 @@ impl NetnsPoller {
             // LOCAL_IN already accepted every fragment before assembly.
             // A later ruleset must not classify the completed old packet as
             // a new flow or discard an otherwise valid local datagram.
-            DefragSource::LocalInput => Some(CtPacketContext::Untracked),
+            DefragSource::LocalInput(_) => Some(CtPacketContext::Untracked),
             DefragSource::LinkIngress => None,
             DefragSource::BridgeIngress(_) => return,
         };
-        let origin = if first_origin.link_group && completion.source == DefragSource::LinkIngress {
+        // The offset-zero fragment supplies the reassembled header and any
+        // corresponding exact-destination admission.
+        let origin = if first_origin.link_group && first_origin.source == DefragSource::LinkIngress
+        {
             crate::driver::net::LocalPacketOrigin::LinkGroupIngressPending
         } else {
-            completion.source.packet_origin()
+            first_origin.source.packet_origin()
         };
         if let Err(error) = crate::driver::net::inject_owned_local_ip_packet_if_epoch_with_fragment(
             owner.as_ref(),

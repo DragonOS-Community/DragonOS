@@ -156,7 +156,8 @@ pub enum LocalPacketOrigin {
     LinkGroupIngressPending,
     LinkIngressPreRouted,
     LocalOutput,
-    LocalInputDone,
+    ExplicitIpv6LocalOutput(smoltcp::wire::Ipv6Address),
+    LocalInputDone(Option<smoltcp::wire::Ipv6Address>),
 }
 
 /// Internal handoff keeps an unconfirmed connection identity with its packet
@@ -274,7 +275,12 @@ pub(crate) fn inject_owned_local_ip_packet_if_epoch_with_fragment<I: Iface + ?Si
             }
             LocalPacketOrigin::LinkIngressPreRouted => IngressStage::PreRoutingDone,
             LocalPacketOrigin::LocalOutput => IngressStage::LocalOutput,
-            LocalPacketOrigin::LocalInputDone => IngressStage::LocalInputDone,
+            LocalPacketOrigin::ExplicitIpv6LocalOutput(destination) => {
+                IngressStage::ExplicitIpv6LocalOutput(destination)
+            }
+            LocalPacketOrigin::LocalInputDone(destination) => {
+                IngressStage::LocalInputDone(destination)
+            }
         },
         broadcast,
         destination_mac: if broadcast || origin == LocalPacketOrigin::LinkGroupIngressPending {

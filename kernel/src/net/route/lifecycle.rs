@@ -59,6 +59,7 @@ pub(crate) fn register_iface(
                 oif: route.oif,
                 gateway: route.gateway,
                 nexthop_flags: route.nexthop_flags,
+                address_local: false,
                 ra_route: None,
             };
             validate_entry_on_iface(netns, iface, route)?;
@@ -661,6 +662,7 @@ fn derived_address_entries_for_link_state(
             oif: iface.nic_id() as u32,
             gateway: None,
             nexthop_flags: 0,
+            address_local: false,
             ra_route: None,
         });
     }
@@ -740,6 +742,7 @@ fn entries_for_address(
         oif: iface.nic_id() as u32,
         gateway: None,
         nexthop_flags: 0,
+        address_local: false,
         ra_route: None,
     };
     let add_connected = match cidr {
@@ -768,6 +771,7 @@ fn entries_for_address(
             RT_SCOPE_UNIVERSE
         },
         kind: RTN_LOCAL,
+        address_local: true,
         ..connected
     };
     // Keep the host route of a usable address while down. Unlike a

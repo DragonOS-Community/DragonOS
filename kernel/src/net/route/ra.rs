@@ -261,6 +261,7 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
         oif: advertisement.ifindex,
         gateway: Some(advertisement.gateway.into()),
         nexthop_flags: 0,
+        address_local: false,
         ra_route: Some(RaRoute::Default(LearnedDefaultRoute {
             expires_at_us: advertisement.expires_at_us,
             preference: advertisement.preference,
@@ -355,6 +356,7 @@ fn apply_on_link_prefix(
         oif: advertisement.ifindex,
         gateway: None,
         nexthop_flags: 0,
+        address_local: false,
         ra_route: Some(RaRoute::OnLinkPrefix { expires_at_us }),
     };
     update(rtnl, netns, |fib| {

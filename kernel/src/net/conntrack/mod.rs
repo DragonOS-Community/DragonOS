@@ -301,12 +301,81 @@ impl CtNatPortRange {
     }
 }
 
-/// A single destination/source address or a port-only mapping. Address ranges
-/// and unsupported NAT flags must be rejected by the caller before this API.
+/// A validated, inclusive NAT address interval in one address family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CtNatAddressRange {
+    first: CtAddress,
+    last: CtAddress,
+}
+
+impl CtNatAddressRange {
+    pub(crate) fn new(first: CtAddress, last: CtAddress) -> Result<Self, CtError> {
+        let ordered = match (first, last) {
+            (CtAddress::V4(first), CtAddress::V4(last)) => first <= last,
+            (CtAddress::V6(first), CtAddress::V6(last)) => first <= last,
+            _ => false,
+        };
+        if !ordered {
+            return Err(CtError::Invalid);
+        }
+        Ok(Self { first, last })
+    }
+
+    fn single(address: CtAddress) -> Self {
+        Self {
+            first: address,
+            last: address,
+        }
+    }
+
+    fn select(self, tuple: CtTuple) -> CtAddress {
+        if self.first == self.last {
+            return self.first;
+        }
+
+        // Keep the chosen address stable across transport connections between
+        // the same endpoints. Ports and time only affect tuple collision probes.
+        let mut words = [0u32; 8];
+        for (part, address) in words.chunks_exact_mut(4).zip([tuple.src, tuple.dst]) {
+            let address: &[u8] = match &address {
+                CtAddress::V4(bytes) => bytes,
+                CtAddress::V6(bytes) => bytes,
+            };
+            for (word, bytes) in part.iter_mut().zip(address.chunks_exact(4)) {
+                *word = u32::from_be_bytes(bytes.try_into().unwrap());
+            }
+        }
+        let hash = jhash::jhash2(&words, 0);
+        match (self.first, self.last) {
+            (CtAddress::V4(first), CtAddress::V4(last)) => {
+                let first = u32::from_be_bytes(first);
+                let width = u64::from(u32::from_be_bytes(last) - first) + 1;
+                let offset = ((width * u64::from(hash)) >> 32) as u32;
+                CtAddress::V4((first + offset).to_be_bytes())
+            }
+            (CtAddress::V6(first), CtAddress::V6(last)) => {
+                let first = u128::from_be_bytes(first);
+                let span = u128::from_be_bytes(last) - first;
+                let hash = u128::from(hash);
+                let offset = if span == u128::MAX {
+                    hash << 96
+                } else {
+                    // Scale the inclusive width without overflowing u128.
+                    let width = span + 1;
+                    (width >> 32) * hash + (((width & u128::from(u32::MAX)) * hash) >> 32)
+                };
+                CtAddress::V6((first + offset).to_be_bytes())
+            }
+            _ => unreachable!("validated NAT address interval"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CtNatRequest {
-    address: Option<CtAddress>,
+    addresses: Option<CtNatAddressRange>,
     ports: Option<CtNatPortRange>,
+    destination_port_base: Option<u16>,
     /// Linux records the MASQUERADE egress ifindex even when it selects an
     /// address configured on another interface in the same L3 domain.
     masquerade_ifindex: Option<u32>,
@@ -317,12 +386,21 @@ impl CtNatRequest {
         address: Option<CtAddress>,
         ports: Option<CtNatPortRange>,
     ) -> Result<Self, CtError> {
-        if address.is_none() && ports.is_none() {
+        Self::with_range(address.map(CtNatAddressRange::single), ports, None)
+    }
+
+    pub(crate) fn with_range(
+        addresses: Option<CtNatAddressRange>,
+        ports: Option<CtNatPortRange>,
+        port_base: Option<u16>,
+    ) -> Result<Self, CtError> {
+        if ports.is_none() && (addresses.is_none() || port_base.is_some()) {
             return Err(CtError::Invalid);
         }
         Ok(Self {
-            address,
+            addresses,
             ports,
+            destination_port_base: port_base,
             masquerade_ifindex: None,
         })
     }
@@ -336,8 +414,9 @@ impl CtNatRequest {
             return Err(CtError::Invalid);
         }
         Ok(Self {
-            address: Some(address),
+            addresses: Some(CtNatAddressRange::single(address)),
             ports,
+            destination_port_base: None,
             masquerade_ifindex: Some(ifindex),
         })
     }
@@ -1280,8 +1359,9 @@ impl CtState {
         if candidate.nat_initialized(side)
             || (request.masquerade_ifindex.is_some() && side != NatManipSide::Source)
             || request.masquerade_ifindex == Some(0)
-            || request.address.is_some_and(|address| {
-                core::mem::discriminant(&address)
+            || (request.destination_port_base.is_some() && side != NatManipSide::Destination)
+            || request.addresses.is_some_and(|range| {
+                core::mem::discriminant(&range.first)
                     != core::mem::discriminant(&candidate.original.src)
             })
             || (request.ports.is_some() && nat_port(candidate.translated, side).is_none())
@@ -1290,7 +1370,8 @@ impl CtState {
         }
 
         let mut base = candidate.translated;
-        if let Some(address) = request.address {
+        if let Some(addresses) = request.addresses {
+            let address = addresses.select(candidate.translated);
             match side {
                 NatManipSide::Destination => base.dst = address,
                 NatManipSide::Source => base.src = address,
@@ -1309,10 +1390,15 @@ impl CtState {
             (Some(_), None) => true,
             _ => false,
         };
-        let mut selected = (original_port_in_range || prior_port.is_none())
-            .then(|| table.nat_tuple_available(candidate.original, base, now))
-            .filter(|available| *available)
-            .map(|_| base);
+        let preferred_offset = request
+            .destination_port_base
+            .zip(prior_port)
+            .map(|(base, port)| port.wrapping_sub(base));
+        let mut selected = (preferred_offset.is_none()
+            && (original_port_in_range || prior_port.is_none()))
+        .then(|| table.nat_tuple_available(candidate.original, base, now))
+        .filter(|available| *available)
+        .map(|_| base);
         if selected.is_none() {
             if let Some(range) = range {
                 let count = u32::from(range.last) - u32::from(range.first) + 1;
@@ -1323,8 +1409,12 @@ impl CtState {
                     } else {
                         seed.wrapping_add((round as u32).wrapping_mul(0x9e3779b9)) % count
                     };
+                    let preferred = (round == 0).then_some(preferred_offset).flatten();
                     for attempt in 0..attempts.min(count) {
-                        let port = u32::from(range.first) + (offset + attempt) % count;
+                        let probe = preferred.map_or(offset + attempt, |start| {
+                            u32::from(start.wrapping_add(attempt as u16))
+                        });
+                        let port = u32::from(range.first) + probe % count;
                         let proposed = with_nat_port(base, side, port as u16);
                         if table.nat_tuple_available(candidate.original, proposed, now) {
                             selected = Some(proposed);
@@ -2461,6 +2551,81 @@ mod tests {
             panic!()
         };
         found.flow.translated()
+    }
+
+    #[test]
+    fn destination_port_offset_overrides_retention_and_wraps_on_collision() {
+        let table = CtState::new();
+        table.activate(4).unwrap();
+        let request = CtNatRequest::with_range(
+            Some(CtNatAddressRange::single([192, 0, 2, 1].into())),
+            Some(CtNatPortRange::new(100, 105).unwrap()),
+            Some(101),
+        )
+        .unwrap();
+        // Both original ports would be retained without the offset rule.
+        // Their first candidate is port 103. The second flow starts the probe
+        // at u16::MAX and wraps to offset zero on the occupied reply tuple.
+        for (original_port, expected) in [(104, 103), (100, 100)] {
+            let original = CtTuple {
+                src: [10, 0, 0, 2].into(),
+                dst: [203, 0, 113, 1].into(),
+                l4: CtL4::Udp {
+                    src_port: 1234,
+                    dst_port: original_port,
+                },
+            };
+            let mut candidate = CtCandidate::new(original, CtPacketKind::Udp).unwrap();
+            table
+                .select_nat_mapping(
+                    &mut candidate,
+                    NatManipSide::Destination,
+                    request,
+                    Instant::ZERO,
+                )
+                .unwrap();
+            assert_eq!(
+                nat_port(candidate.translated(), NatManipSide::Destination),
+                Some(expected)
+            );
+            table.confirm(candidate, Instant::ZERO).unwrap();
+        }
+    }
+
+    #[test]
+    fn ipv6_nat_address_interval_is_bounded_and_stable() {
+        let first = u128::from(u32::MAX) - 1;
+        let last = first + 5;
+        let v6 = |address: u128| CtAddress::V6(address.to_be_bytes());
+        let tuple = CtTuple {
+            src: v6(1),
+            dst: v6(2),
+            l4: CtL4::Udp {
+                src_port: 200,
+                dst_port: 430,
+            },
+        };
+        let interval = CtNatAddressRange::new(v6(first), v6(last)).unwrap();
+        let CtAddress::V6(bytes) = interval.select(tuple) else {
+            panic!()
+        };
+        assert!((first..=last).contains(&u128::from_be_bytes(bytes)));
+        assert_eq!(
+            CtAddress::V6(bytes),
+            interval.select(with_nat_port(tuple, NatManipSide::Source, 300))
+        );
+        assert_eq!(
+            v6(first),
+            CtNatAddressRange::single(v6(first)).select(tuple)
+        );
+        assert!(matches!(
+            CtNatAddressRange::new(v6(0), v6(u128::MAX))
+                .unwrap()
+                .select(tuple),
+            CtAddress::V6(_)
+        ));
+        assert!(CtNatAddressRange::new(v6(last), v6(first)).is_err());
+        assert!(CtNatAddressRange::new(v6(first), [1, 2, 3, 4].into()).is_err());
     }
 
     #[test]

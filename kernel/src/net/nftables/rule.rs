@@ -426,9 +426,55 @@ fn nat_ports(
     CtNatPortRange::new(first, last).ok().map(Some)
 }
 
-/// Accept only the xt target layouts and range semantics represented by
-/// CtNatRequest. In particular random, persistent and address ranges are
-/// never silently converted to a single-address mapping.
+const XT_NAT_MAP_IPS: u32 = 1;
+const XT_NAT_PROTO_SPECIFIED: u32 = 2;
+const XT_NAT_PROTO_OFFSET: u32 = 1 << 5;
+
+fn xt_nat_ports(flags: u32, bytes: &[u8]) -> Result<Option<CtNatPortRange>, SystemError> {
+    if flags & XT_NAT_PROTO_SPECIFIED == 0 {
+        return if bytes.iter().any(|&byte| byte != 0) {
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        } else {
+            Ok(None)
+        };
+    }
+    let first = u16::from_be_bytes(bytes[..2].try_into().unwrap());
+    let last = u16::from_be_bytes(bytes[2..].try_into().unwrap());
+    CtNatPortRange::new(first, last)
+        .map(Some)
+        .map_err(|_| SystemError::EINVAL)
+}
+
+fn xt_dnat_addresses(
+    family: u8,
+    flags: u32,
+    first: &[u8],
+    last: &[u8],
+) -> Result<Option<CtNatAddressRange>, SystemError> {
+    if flags & XT_NAT_MAP_IPS == 0 {
+        return if first.iter().chain(last).any(|&byte| byte != 0) {
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        } else {
+            Ok(None)
+        };
+    }
+    let (first, last) = if family == 2 {
+        (
+            CtAddress::V4(first.try_into().unwrap()),
+            CtAddress::V4(last.try_into().unwrap()),
+        )
+    } else {
+        (
+            CtAddress::V6(first.try_into().unwrap()),
+            CtAddress::V6(last.try_into().unwrap()),
+        )
+    };
+    CtNatAddressRange::new(first, last)
+        .map(Some)
+        .map_err(|_| SystemError::EINVAL)
+}
+
+/// Decode and validate the ranges before accepting the xt rule transaction.
 pub(super) fn parse_xt_nat_target(
     family: u8,
     name: &[u8],
@@ -443,40 +489,27 @@ pub(super) fn parse_xt_nat_target(
             return Err(SystemError::EINVAL);
         }
         let flags = u32::from_ne_bytes(info[4..8].try_into().unwrap());
-        if flags & !3 != 0 {
+        if flags & !(XT_NAT_MAP_IPS | XT_NAT_PROTO_SPECIFIED) != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        let address = if flags & 1 != 0 {
-            if info[8..12] != info[12..16] {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
-            Some(CtAddress::V4(info[8..12].try_into().unwrap()))
-        } else {
-            if info[8..16].iter().any(|byte| *byte != 0) {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
-            None
-        };
-        let ports = if flags & 2 != 0 {
-            Some(
-                CtNatPortRange::new(
-                    u16::from_be_bytes(info[16..18].try_into().unwrap()),
-                    u16::from_be_bytes(info[18..20].try_into().unwrap()),
-                )
-                .map_err(|_| SystemError::EINVAL)?,
-            )
-        } else {
-            if info[16..20].iter().any(|byte| *byte != 0) {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
-            None
-        };
+        let first = &info[8..12];
+        let last = &info[12..16];
+        if name == b"DNAT" {
+            let addresses = xt_dnat_addresses(family, flags, first, last)?;
+            let ports = xt_nat_ports(flags, &info[16..20])?;
+            let request = CtNatRequest::with_range(addresses, ports, None)
+                .map_err(|_| SystemError::EINVAL)?;
+            return Ok(NftNatAction::Dnat(request));
+        }
+
+        if first != last || (flags & XT_NAT_MAP_IPS == 0 && first.iter().any(|&byte| byte != 0)) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        let address =
+            (flags & XT_NAT_MAP_IPS != 0).then(|| CtAddress::V4(first.try_into().unwrap()));
+        let ports = xt_nat_ports(flags, &info[16..20])?;
         let request = CtNatRequest::new(address, ports).map_err(|_| SystemError::EINVAL)?;
-        return Ok(if name == b"DNAT" {
-            NftNatAction::Dnat(request)
-        } else {
-            NftNatAction::Snat(request)
-        });
+        return Ok(NftNatAction::Snat(request));
     }
     if family == 2 && name == b"MASQUERADE" && revision == 0 {
         if !(20..=24).contains(&info.len()) || info[20..].iter().any(|byte| *byte != 0) {
@@ -527,50 +560,46 @@ pub(super) fn parse_xt_nat_target(
         };
         return Ok(NftNatAction::Masquerade { ports });
     }
-    if matches!(family, 2 | 10) && name == b"DNAT" && revision == 2 {
-        if !(44..=48).contains(&info.len()) || info[44..].iter().any(|byte| *byte != 0) {
+    if matches!(family, 2 | 10) && name == b"DNAT" && matches!(revision, 1 | 2) {
+        // Revision 1 ends before base_proto. Revision 2 has trailing UAPI
+        // padding and can also be zero-padded to XT_ALIGN.
+        let (minimum, maximum) = if revision == 1 { (40, 40) } else { (44, 48) };
+        if !(minimum..=maximum).contains(&info.len())
+            || info[minimum..].iter().any(|&byte| byte != 0)
+        {
             return Err(SystemError::EINVAL);
         }
         let flags = u32::from_ne_bytes(info[..4].try_into().unwrap());
-        let map_ips = flags & 1 != 0;
-        // nf_nat_range2 reserves an nf_inet_addr for each address even for IPv4.
-        let address_len = if family == 2 { 4 } else { 16 };
-        let min_addr = &info[4..4 + address_len];
-        let max_addr = &info[20..20 + address_len];
-        if flags & !3 != 0
-            || (!map_ips && family == 10)
-            || min_addr != max_addr
-            || info[40..44].iter().any(|byte| *byte != 0)
-        {
+        let offset_flag = if revision == 2 {
+            XT_NAT_PROTO_OFFSET
+        } else {
+            0
+        };
+        if flags & !(XT_NAT_MAP_IPS | XT_NAT_PROTO_SPECIFIED | offset_flag) != 0 {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
-        let address = if map_ips {
-            Some(if family == 2 {
-                CtAddress::V4(min_addr.try_into().unwrap())
-            } else {
-                CtAddress::V6(min_addr.try_into().unwrap())
-            })
+        let port_base = if flags & XT_NAT_PROTO_OFFSET != 0 {
+            Some(u16::from_be_bytes(info[40..42].try_into().unwrap()))
         } else {
-            if min_addr.iter().any(|byte| *byte != 0) {
+            if revision == 2 && info[40..44].iter().any(|&byte| byte != 0) {
                 return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
             }
             None
         };
-        let ports = if flags & 2 != 0 {
-            Some(
-                CtNatPortRange::new(
-                    u16::from_be_bytes(info[36..38].try_into().unwrap()),
-                    u16::from_be_bytes(info[38..40].try_into().unwrap()),
-                )
-                .map_err(|_| SystemError::EINVAL)?,
-            )
-        } else {
-            if info[36..40].iter().any(|byte| *byte != 0) {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
-            None
-        };
-        let request = CtNatRequest::new(address, ports).map_err(|_| SystemError::EINVAL)?;
+        if revision == 2 && info[42..44].iter().any(|&byte| byte != 0) {
+            return Err(SystemError::EINVAL);
+        }
+        // Both revisions reserve an nf_inet_addr per endpoint even for IPv4.
+        let address_len = if family == 2 { 4 } else { 16 };
+        let addresses = xt_dnat_addresses(
+            family,
+            flags,
+            &info[4..4 + address_len],
+            &info[20..20 + address_len],
+        )?;
+        let ports = xt_nat_ports(flags, &info[36..40])?;
+        let request = CtNatRequest::with_range(addresses, ports, port_base)
+            .map_err(|_| SystemError::EINVAL)?;
         return Ok(NftNatAction::Dnat(request));
     }
     Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)

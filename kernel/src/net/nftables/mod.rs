@@ -21,8 +21,8 @@ use smoltcp::wire::{IpVersion, Ipv4Address, Ipv6Address};
 use system_error::SystemError;
 
 use super::conntrack::{
-    CtAddress, CtError, CtNatPortRange, CtNatRequest, CtPacketContext, CtPacketState, CtState,
-    NatManipSide,
+    CtAddress, CtError, CtNatAddressRange, CtNatPortRange, CtNatRequest, CtPacketContext,
+    CtPacketState, CtState, NatManipSide,
 };
 
 mod hook;

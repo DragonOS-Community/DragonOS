@@ -190,6 +190,15 @@ impl<'a> LocalOutputCt<'a> {
         self.mark.get()
     }
 
+    pub(crate) fn into_rejected(self) -> Result<OutputCtContext, SystemError> {
+        match self.context.into_inner() {
+            Some(context) => Ok(OutputCtContext::Tracked(
+                Box::try_new(context).map_err(|_| SystemError::ENOMEM)?,
+            )),
+            None => Ok(OutputCtContext::Untracked),
+        }
+    }
+
     /// A multicast/broadcast local clone shares one conntrack identity with
     /// its original. If the clone reaches POST and confirms first, the
     /// original must reuse that same NAT binding at its own POST hook.
@@ -550,6 +559,11 @@ fn submit_ipv6(
         route,
     )?;
     route = selected;
+    if route.loopback_anycast {
+        let mark = ct.mark();
+        reservation.commit_ipv6(route, 0, ct.into_rejected()?, mark, before_enqueue)?;
+        return Ok(None);
+    }
     let egress = netns
         .device_list()
         .get(&(route.oif as usize))

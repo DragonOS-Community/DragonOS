@@ -168,6 +168,9 @@ pub struct PacketMeta {
     /// The incoming link frame was addressed to a multicast or broadcast group.
     #[cfg(feature = "proto-ipv6")]
     pub link_group: bool,
+    /// The IPv6 FIB admitted this packet as local anycast.
+    #[cfg(feature = "proto-ipv6")]
+    pub ipv6_anycast: bool,
     /// Opaque route state supplied by the caller for socket output.
     #[cfg(feature = "packetmeta-id")]
     pub route_cookie: u64,
@@ -180,6 +183,8 @@ impl PacketMeta {
             id,
             #[cfg(feature = "proto-ipv6")]
             link_group: false,
+            #[cfg(feature = "proto-ipv6")]
+            ipv6_anycast: false,
             route_cookie: 0,
         }
     }

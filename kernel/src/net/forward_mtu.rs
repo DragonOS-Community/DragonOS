@@ -190,6 +190,7 @@ pub(crate) fn send_ipv4_frag_needed(
 pub(crate) enum Ipv6ForwardError {
     PacketTooBig(usize),
     Unreachable { code: u8, ingress_ifindex: u32 },
+    LocalNoRoute,
 }
 
 fn ipv6_error_eligible(bytes: &[u8], error: &Ipv6ForwardError) -> bool {
@@ -197,7 +198,10 @@ fn ipv6_error_eligible(bytes: &[u8], error: &Ipv6ForwardError) -> bool {
         return false;
     };
     let source = ip.src_addr();
-    if source.is_unspecified() || source.is_multicast() || source.is_loopback() {
+    if source.is_unspecified()
+        || source.is_multicast()
+        || (source.is_loopback() && !matches!(error, Ipv6ForwardError::LocalNoRoute))
+    {
         return false;
     }
     if ip.dst_addr().is_multicast() && !matches!(error, Ipv6ForwardError::PacketTooBig(_)) {
@@ -280,6 +284,7 @@ pub(crate) fn send_ipv6_forward_error(
                 .is_unicast_link_local()
                 .then_some(ingress_ifindex),
         ),
+        Ipv6ForwardError::LocalNoRoute => (1, 0, 0, None),
     };
     let resolved = super::route::resolve_ipv6_send_route(netns, destination, required_oif, None)?;
     let route = resolved.decision;

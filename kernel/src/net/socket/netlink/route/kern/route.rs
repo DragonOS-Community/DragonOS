@@ -294,9 +294,13 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
     if request.body().type_ > RTN_MAX {
         return Err(SystemError::EINVAL);
     }
-    let reject = request.body().family == AddressFamily::INet6
-        && route::is_ipv6_reject_or_throw(request.body().type_);
-    if !reject && !matches!(request.body().type_, route::RTN_UNSPEC | RTN_UNICAST) {
+    let kind = request.body().type_;
+    let ipv6 = request.body().family == AddressFamily::INet6;
+    let reject = ipv6 && route::is_ipv6_reject_or_throw(kind);
+    let supported = matches!(kind, route::RTN_UNSPEC | RTN_UNICAST)
+        || reject
+        || ipv6 && kind == route::RTN_ANYCAST;
+    if !supported {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     let gateway = request.attrs().iter().find_map(|attr| match attr {

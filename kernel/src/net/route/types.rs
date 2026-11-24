@@ -81,6 +81,12 @@ pub(crate) struct RouteEntry {
 }
 
 impl RouteEntry {
+    pub(crate) fn is_loopback_anycast(self) -> bool {
+        self.kind == RTN_ANYCAST
+            && self.oif == crate::net::LOOPBACK_IFINDEX as u32
+            && matches!(self.destination.address(), IpAddress::Ipv6(address) if !address.is_loopback())
+    }
+
     pub(crate) fn learned_default(self) -> Option<LearnedDefaultRoute> {
         match self.ra_route {
             Some(RaRoute::Default(default)) => Some(default),

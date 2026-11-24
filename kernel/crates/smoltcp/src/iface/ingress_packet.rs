@@ -29,6 +29,8 @@ pub enum RouteInputVerdict {
     /// bypasses the address-owner check for a candidate NDISC message. The
     /// ordinary ICMPv6 parser still validates the complete packet afterward.
     NeighborDiscovery,
+    /// The IPv6 FIB admits this destination for local anycast reception.
+    Ipv6Anycast,
 }
 
 /// The local-delivery hook runs after routing and before raw and transport

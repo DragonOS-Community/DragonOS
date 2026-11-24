@@ -425,12 +425,14 @@ pub(super) enum LocalOutputDisposition {
         next_hop: smoltcp::wire::IpAddress,
         ip_mtu: usize,
     },
+    Ipv6LoopbackReject,
     Drop,
 }
 
 impl LocalOutputDisposition {
     pub(super) const DROP_CONTEXT: [u64; 3] = [0; 3];
     pub(super) const NATIVE_CONTEXT: [u64; 3] = [1, 0, 0];
+    pub(super) const IPV6_LOOPBACK_REJECT_CONTEXT: [u64; 3] = [7, 0, 0];
     const LOCAL_TAG: u64 = 2;
     const IPV4_TAG: u64 = 4;
     const IPV6_TAG: u64 = 6;
@@ -462,6 +464,9 @@ impl LocalOutputDisposition {
     pub(super) fn from_context(context: [u64; 3], ip_mtu: usize) -> Self {
         if context == Self::NATIVE_CONTEXT {
             return Self::NativeOwner;
+        }
+        if context == Self::IPV6_LOOPBACK_REJECT_CONTEXT {
+            return Self::Ipv6LoopbackReject;
         }
         let oif = (context[0] >> 32) as u32;
         if oif == 0 {

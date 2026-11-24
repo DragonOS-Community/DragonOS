@@ -48,6 +48,7 @@ impl ResolvedIpv4Route {
             next_hop: self.decision.next_hop,
             ip_mtu: self.ip_mtu,
             kind: self.decision.matched.kind,
+            loopback_anycast: false,
             table: self.decision.table,
         }
     }
@@ -343,6 +344,7 @@ pub(crate) fn resolve_ipv6_socket_route(
             next_hop: selected.next_hop,
             ip_mtu: egress.mtu(),
             kind: selected.matched.kind,
+            loopback_anycast: selected.matched.is_loopback_anycast(),
             table: selected.table,
         },
         source,

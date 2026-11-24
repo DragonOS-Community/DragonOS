@@ -240,7 +240,9 @@ impl BridgeDriver {
         context: BridgePacketContext,
         fragment: Option<crate::net::forward_mtu::ReassembledForwardInfo>,
     ) {
-        use crate::net::route::{lookup_ingress, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST};
+        use crate::net::route::{
+            lookup_ingress, RTN_ANYCAST, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
+        };
 
         let version = hooks.version();
 
@@ -268,8 +270,9 @@ impl BridgeDriver {
         let Some(route) = route else {
             return;
         };
+        let via_neighbor = matches!(route.matched.kind, RTN_UNICAST | RTN_ANYCAST);
         if matches!(route.matched.kind, RTN_LOCAL | RTN_BROADCAST)
-            || (route.matched.kind == RTN_UNICAST && route.oif != bridge.nic_id() as u32)
+            || (via_neighbor && route.oif != bridge.nic_id() as u32)
         {
             if frame.set_destination_mac(bridge.mac()).is_err() {
                 return;
@@ -279,7 +282,7 @@ impl BridgeDriver {
                 return;
             }
             self.enqueue_bridge_ip(bridge, &frame, None, context, fragment);
-        } else if route.matched.kind == RTN_UNICAST {
+        } else if via_neighbor {
             match probe_next_hop(bridge.as_ref(), &netns, route.next_hop, frame.ip()) {
                 Ok(mac) => {
                     if frame.set_destination_mac(mac).is_ok() {
@@ -414,7 +417,10 @@ impl BridgeDriver {
         .ok_or(SystemError::ENETUNREACH)?;
         if route.oif != bridge.nic_id() as u32
             || route.next_hop != next_hop
-            || route.matched.kind != crate::net::route::RTN_UNICAST
+            || !matches!(
+                route.matched.kind,
+                crate::net::route::RTN_UNICAST | crate::net::route::RTN_ANYCAST
+            )
         {
             return Err(SystemError::ENETUNREACH.into());
         }

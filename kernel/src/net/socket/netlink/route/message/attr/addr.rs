@@ -53,7 +53,8 @@ pub enum AddrAttr {
     /// Raw payload: IPv4 and IPv6 apply different policies to this attribute.
     Broadcast(Vec<u8>),
     CacheInfo([u8; 16]),
-    Flags([u8; 4]),
+    /// Raw IFA_FLAGS payload for family-specific validation.
+    Flags(Vec<u8>),
     Proto([u8; 1]),
 }
 
@@ -119,6 +120,7 @@ impl Attribute for AddrAttr {
             }
             (AddrAttrClass::LABEL, _) => AddrAttr::Label(buf.to_vec()),
             (AddrAttrClass::BROADCAST, _) => AddrAttr::Broadcast(buf.to_vec()),
+            (AddrAttrClass::FLAGS, _) => AddrAttr::Flags(buf.to_vec()),
             (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL, _) => {
                 log::warn!(
                     "address attribute `{:?}` contains invalid payload",

@@ -61,6 +61,7 @@ struct AddressSpec {
     IpBytes local;
     uint8_t prefix_len;
     uint32_t ifindex;
+    uint8_t ipv6_flags = IFA_F_NODAD;
 };
 
 struct DumpedAddress {
@@ -68,6 +69,7 @@ struct DumpedAddress {
     IpBytes local;
     uint8_t prefix_len = 0;
     uint32_t ifindex = 0;
+    uint32_t flags = 0;
     bool has_label = false;
     std::string label;
     bool has_broadcast = false;
@@ -245,14 +247,15 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
                   bool include_local, bool include_address, uint32_t sequence,
                   const char* label = nullptr,
                   std::optional<size_t> label_length = std::nullopt,
-                  const std::vector<uint8_t>* broadcast = nullptr) {
+                  const std::vector<uint8_t>* broadcast = nullptr,
+                  std::optional<uint32_t> ipv6_flags = std::nullopt) {
     auto request = NewRequest<ifaddrmsg>(type, flags, sequence);
     auto* message = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(request.data()));
     message->ifa_family = address.family;
     message->ifa_prefixlen = address.prefix_len;
     message->ifa_scope = address.family == AF_INET6 ? RT_SCOPE_UNIVERSE : RT_SCOPE_HOST;
     message->ifa_index = address.ifindex;
-    if (address.family == AF_INET6) message->ifa_flags = IFA_F_NODAD;
+    if (address.family == AF_INET6) message->ifa_flags = address.ipv6_flags;
     if (include_local) {
         AddAttr(&request, IFA_LOCAL, address.local.bytes.data(), address.local.length);
     }
@@ -264,6 +267,9 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
     }
     if (broadcast != nullptr) {
         AddAttr(&request, IFA_BROADCAST, broadcast->data(), broadcast->size());
+    }
+    if (ipv6_flags.has_value()) {
+        AddAttr(&request, IFA_FLAGS, &*ipv6_flags, sizeof(*ipv6_flags));
     }
     return SendAndReceiveAck(fd, request);
 }
@@ -310,12 +316,17 @@ int DumpAddresses(int fd, int family, uint32_t sequence, std::vector<DumpedAddre
             address.family = message->ifa_family;
             address.prefix_len = message->ifa_prefixlen;
             address.ifindex = message->ifa_index;
+            address.flags = message->ifa_flags;
             address.local.length = message->ifa_family == AF_INET ? sizeof(in_addr)
                                                                   : sizeof(in6_addr);
             std::optional<IpBytes> fallback;
             int attr_length = IFA_PAYLOAD(header);
             for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
                  attr = RTA_NEXT(attr, attr_length)) {
+                if (attr->rta_type == IFA_FLAGS && RTA_PAYLOAD(attr) >= sizeof(address.flags)) {
+                    std::memcpy(&address.flags, RTA_DATA(attr), sizeof(address.flags));
+                    continue;
+                }
                 if (attr->rta_type == IFA_LABEL) {
                     address.has_label = true;
                     if (RTA_PAYLOAD(attr) > 0) {
@@ -658,6 +669,99 @@ int PrepareNamespace(FdGuard* netlink, uint32_t* ifindex, uint32_t* sequence) {
 
 AddressSpec MakeAddress(int family, const char* text, uint8_t prefix_len, uint32_t ifindex) {
     return {family, ParseAddress(family, text), prefix_len, ifindex};
+}
+
+int RunManualIpv6Dad() {
+    FdGuard fd;
+    uint32_t lo = 0;
+    uint32_t sequence = 5000;
+    if (const int error = PrepareNamespace(&fd, &lo, &sequence); error != 0) return error;
+
+    constexpr uint16_t kRequest = NLM_F_REQUEST | NLM_F_ACK;
+    constexpr uint16_t kCreate = kRequest | NLM_F_CREATE | NLM_F_EXCL;
+    auto request = NewRequest<ifinfomsg>(RTM_NEWLINK, kCreate, ++sequence);
+    constexpr char link_name[] = "dad50";
+    const struct {
+        rtattr header;
+        char kind[RTA_ALIGN(sizeof("veth"))];
+    } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+    AddAttr(&request, IFLA_IFNAME, link_name, sizeof(link_name));
+    AddAttr(&request, IFLA_LINKINFO, &link_info, sizeof(link_info));
+    if (const int error = SendAndReceiveAck(fd.Get(), request); error != 0) return 100 + error;
+    const auto edge = if_nametoindex(link_name);
+    const auto peer = if_nametoindex("veth0");
+    if (edge == 0 || peer == 0 || edge == peer) return 200;
+
+    const auto ordinary = MakeAddress(AF_INET6, "fd50:2324::1", 80, edge);
+    auto nodad = MakeAddress(AF_INET6, "fd50:2324::2", 80, edge);
+    nodad.ipv6_flags = 0;
+    const auto cancelled = MakeAddress(AF_INET6, "fd50:2324::3", 80, edge);
+    const auto duplicate_peer = MakeAddress(AF_INET6, "fd50:2324::4", 80, peer);
+    auto duplicate = duplicate_peer;
+    duplicate.ifindex = edge;
+    duplicate.ipv6_flags = 0;
+    auto add = [&](const AddressSpec& address, std::optional<uint32_t> flags = std::nullopt) {
+        return ChangeAddress(fd.Get(), RTM_NEWADDR, kCreate, address, true, true, ++sequence,
+                             nullptr, std::nullopt, nullptr, flags);
+    };
+    auto flags_for = [&](const AddressSpec& expected) -> std::optional<uint32_t> {
+        std::vector<DumpedAddress> addresses;
+        if (DumpAddresses(fd.Get(), AF_INET6, ++sequence, &addresses) != 0) return std::nullopt;
+        for (const auto& address : addresses) {
+            if (address.ifindex == expected.ifindex && address.prefix_len == expected.prefix_len &&
+                SameAddress(address.local, expected.local)) {
+                return address.flags;
+            }
+        }
+        return std::nullopt;
+    };
+
+    FdGuard notifications(OpenRouteSocket(RTMGRP_IPV6_IFADDR));
+    if (notifications.Get() < 0) return 250 + errno;
+    if (const int error = add(ordinary, 0); error != 0) return 300 + error;
+    if (CountAddressNotifications(notifications.Get(), RTM_NEWADDR, ordinary) != 1) return 399;
+    if (const int error = add(nodad, IFA_F_NODAD); error != 0) return 400 + error;
+    if (const int error = add(cancelled, 0); error != 0) return 500 + error;
+    const auto ordinary_flags = flags_for(ordinary);
+    const auto nodad_flags = flags_for(nodad);
+    if (!ordinary_flags || (*ordinary_flags & (IFA_F_NODAD | IFA_F_TENTATIVE)) != IFA_F_TENTATIVE)
+        return 600;
+    if (!nodad_flags || (*nodad_flags & (IFA_F_NODAD | IFA_F_TENTATIVE)) != IFA_F_NODAD)
+        return 601;
+    if (BindUdp(ordinary, 0) != EADDRNOTAVAIL || BindUdp(nodad, 0) != 0) return 602;
+
+    if (const int error = ChangeAddress(fd.Get(), RTM_NEWADDR, kRequest | NLM_F_REPLACE,
+                                         cancelled, true, true, ++sequence);
+        error != 0) return 700 + error;
+    const auto cancelled_flags = flags_for(cancelled);
+    if (!cancelled_flags ||
+        (*cancelled_flags & (IFA_F_NODAD | IFA_F_TENTATIVE)) != (IFA_F_NODAD | IFA_F_TENTATIVE))
+        return 800;
+    if (const int error = ChangeAddress(fd.Get(), RTM_DELADDR, kRequest, cancelled, true, true,
+                                        ++sequence);
+        error != 0) return 900 + error;
+
+    if (const int error = add(duplicate_peer); error != 0) return 1000 + error;
+    if (const int error = add(duplicate); error != 0) return 1200 + error;
+    if (const int error = SetLinkUp(fd.Get(), peer, ++sequence); error != 0) return 1400 + error;
+    if (const int error = SetLinkUp(fd.Get(), edge, ++sequence); error != 0) return 1600 + error;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto completed = flags_for(ordinary);
+        const auto failed = flags_for(duplicate);
+        if (!completed || !failed) return 1800;
+        if (!(*completed & IFA_F_TENTATIVE) && (*failed & IFA_F_DADFAILED)) {
+            if (BindUdp(ordinary, 0) != 0) return 1801;
+            if (CountAddressNotifications(notifications.Get(), RTM_NEWADDR, ordinary) != 1) return 1805;
+            if (const int error = ChangeAddress(fd.Get(), RTM_DELADDR, kRequest, duplicate_peer,
+                                                true, true, ++sequence);
+                error != 0) return 1900 + error;
+            if (BindUdp(duplicate, 0) != EADDRNOTAVAIL) return 1802;
+            return flags_for(cancelled).has_value() ? 1803 : 0;
+        }
+        usleep(20 * 1000);
+    }
+    return 1804;
 }
 
 int RunMultipleAddressConsistency() {
@@ -1460,6 +1564,11 @@ void ExpectSuccessfulChild(const ChildOutcome& outcome, const char* timeout_mess
     }
     EXPECT_EQ(outcome.stage, 0) << "encoded stage/error=" << outcome.stage;
     EXPECT_EQ(WEXITSTATUS(outcome.wait_status), 0);
+}
+
+TEST(RtnetlinkAddressSemantics, ManualIpv6DadHonorsFlagsAndLinkReadiness) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunManualIpv6Dad),
+                          "manual IPv6 duplicate address detection hung");
 }
 
 TEST(RtnetlinkAddressSemantics, MultipleAddressesStayConsistentAcrossAddrRouteAndDataPlane) {

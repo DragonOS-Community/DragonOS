@@ -6,7 +6,7 @@
 
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 
-use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
 use system_error::SystemError;
 
 use crate::{
@@ -41,11 +41,19 @@ pub(in crate::net) struct AddressMutationCommit {
     pub route_changes: crate::net::route::RouteNotifications,
 }
 
+#[derive(Default)]
+pub(in crate::net) struct AddressOptions {
+    pub label: Option<CString>,
+    pub broadcast: Option<Ipv4Address>,
+    pub ipv6_nodad: Option<bool>,
+}
+
 pub(crate) struct AddressInfo {
     pub cidr: IpCidr,
     pub label: CString,
     pub broadcast: Option<Ipv4Address>,
     pub state: AddressState,
+    pub ipv6_nodad: bool,
     pub lifetimes: Option<ipv6_slaac::Lifetimes>,
 }
 
@@ -130,10 +138,18 @@ fn removed_address_info(
     entry: Option<AddressMetadata>,
     default_label: &CString,
 ) -> Result<AddressInfo, SystemError> {
-    let (label, broadcast, state, lifetimes) = entry
-        .map_or((None, None, AddressState::Configured, None), |entry| {
-            (entry.label, entry.broadcast, entry.state, entry.lifetimes)
-        });
+    let (label, broadcast, state, ipv6_nodad, lifetimes) = entry.map_or(
+        (None, None, AddressState::Configured, false, None),
+        |entry| {
+            (
+                entry.label,
+                entry.broadcast,
+                entry.state,
+                entry.ipv6_nodad,
+                entry.lifetimes,
+            )
+        },
+    );
     Ok(AddressInfo {
         cidr,
         label: match label {
@@ -142,6 +158,7 @@ fn removed_address_info(
         },
         broadcast,
         state,
+        ipv6_nodad,
         lifetimes,
     })
 }
@@ -282,23 +299,16 @@ pub(in crate::net) fn mutate_address(
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
 ) -> Result<AddressMutationCommit, SystemError> {
-    commit_published(rtnl, iface, CommitMutation::Plain(mutation), None, None)
+    mutate_address_with_options(rtnl, iface, mutation, AddressOptions::default())
 }
 
-pub(in crate::net) fn mutate_labeled_address(
+pub(in crate::net) fn mutate_address_with_options(
     rtnl: &RtnlGuard,
     iface: &Arc<dyn Iface>,
     mutation: AddressMutation,
-    label: Option<CString>,
-    broadcast: Option<Ipv4Address>,
+    options: AddressOptions,
 ) -> Result<AddressMutationCommit, SystemError> {
-    commit_published(
-        rtnl,
-        iface,
-        CommitMutation::Plain(mutation),
-        label,
-        broadcast,
-    )
+    commit_published(rtnl, iface, CommitMutation::Plain(mutation), options)
 }
 
 pub(in crate::net) fn address_label(
@@ -346,6 +356,7 @@ pub(in crate::net) fn address_at(
         label,
         broadcast: entry.and_then(|entry| entry.broadcast),
         state: entry.map(|entry| entry.state).unwrap_or_default(),
+        ipv6_nodad: entry.is_some_and(|entry| entry.ipv6_nodad),
         lifetimes: entry.and_then(|entry| entry.lifetimes),
     }))
 }
@@ -386,6 +397,7 @@ pub(in crate::net) fn address_info(
         label,
         broadcast: entry.and_then(|entry| entry.broadcast),
         state: entry.map(|entry| entry.state).unwrap_or_default(),
+        ipv6_nodad: entry.is_some_and(|entry| entry.ipv6_nodad),
         lifetimes: entry.and_then(|entry| entry.lifetimes),
     })
 }
@@ -740,6 +752,7 @@ fn commit_unpublished(
                 label: requested_label,
                 broadcast: requested_broadcast,
                 state: AddressState::Configured,
+                ipv6_nodad: false,
                 lifetimes: None,
             });
             outcome
@@ -757,6 +770,7 @@ fn commit_unpublished(
                     label: requested_label,
                     broadcast: requested_broadcast,
                     state: AddressState::Configured,
+                    ipv6_nodad: false,
                     lifetimes: None,
                 });
             }
@@ -774,8 +788,7 @@ fn commit_published(
     rtnl: &RtnlGuard,
     iface: &Arc<dyn Iface>,
     mutation: CommitMutation,
-    requested_label: Option<CString>,
-    requested_broadcast: Option<Ipv4Address>,
+    options: AddressOptions,
 ) -> Result<AddressMutationCommit, SystemError> {
     validate_mutation(mutation)?;
     let netns = iface.net_namespace().ok_or(SystemError::ENODEV)?;
@@ -804,21 +817,51 @@ fn commit_published(
             .find(|configured| same_new_or_replace_identity(*configured, requested))
     };
 
+    let mut manual_probe = None;
     let outcome = match mutation {
-        CommitMutation::Plain(AddressMutation::Add(cidr)) => {
-            if existing(cidr).is_some() {
-                return Err(SystemError::EEXIST);
+        CommitMutation::Plain(AddressMutation::Add(cidr) | AddressMutation::Replace(cidr)) => {
+            if let Some(existing) = existing(cidr) {
+                if matches!(mutation, CommitMutation::Plain(AddressMutation::Add(_))) {
+                    return Err(SystemError::EEXIST);
+                }
+                if let Some(entry) = metadata.iter_mut().find(|entry| entry.cidr == existing) {
+                    match entry.state {
+                        AddressState::Slaac(DadState::Usable) => {
+                            entry.state = AddressState::Configured
+                        }
+                        AddressState::Slaac(state) => entry.state = AddressState::ManualDad(state),
+                        _ => {}
+                    }
+                    entry.lifetimes = None;
+                    if let Some(nodad) = options.ipv6_nodad {
+                        entry.ipv6_nodad = nodad;
+                    }
+                }
+                AddressMutationOutcome::Replaced(existing)
+            } else {
+                validate_published_address_addition(iface, cidr)?;
+                if let (IpCidr::Ipv6(ipv6), Some(false)) = (cidr, options.ipv6_nodad) {
+                    if ipv6.address().x_is_unicast() {
+                        manual_probe = ipv6_autoconf::manual_dad_transmits(iface.as_ref())
+                            .map(|transmits| (ipv6, transmits));
+                    }
+                }
+                let state = if manual_probe.is_some() {
+                    AddressState::ManualDad(DadState::Tentative)
+                } else {
+                    insert_address_candidate(&mut after, cidr);
+                    AddressState::Configured
+                };
+                metadata.push(AddressMetadata {
+                    cidr,
+                    label: options.label,
+                    broadcast: options.broadcast,
+                    state,
+                    ipv6_nodad: options.ipv6_nodad.unwrap_or(false),
+                    lifetimes: None,
+                });
+                AddressMutationOutcome::Added(cidr)
             }
-            validate_published_address_addition(iface, cidr)?;
-            insert_address_candidate(&mut after, cidr);
-            metadata.push(AddressMetadata {
-                cidr,
-                label: requested_label,
-                broadcast: requested_broadcast,
-                state: AddressState::Configured,
-                lifetimes: None,
-            });
-            AddressMutationOutcome::Added(cidr)
         }
         CommitMutation::Plain(AddressMutation::Delete(cidr)) => {
             if let Some(index) = find_for_delete(&after, cidr) {
@@ -832,40 +875,21 @@ fn commit_published(
             metadata.retain(|entry| entry.cidr != cidr);
             AddressMutationOutcome::Deleted(cidr)
         }
-        CommitMutation::Plain(AddressMutation::Replace(cidr)) => {
-            if let Some(existing) = existing(cidr) {
-                if let Some(entry) = metadata.iter_mut().find(|entry| entry.cidr == existing) {
-                    match entry.state {
-                        AddressState::Slaac(DadState::Usable) => {
-                            entry.state = AddressState::Configured
-                        }
-                        AddressState::Slaac(state) => entry.state = AddressState::ManualDad(state),
-                        _ => {}
-                    }
-                    entry.lifetimes = None;
-                }
-                AddressMutationOutcome::Replaced(existing)
-            } else {
-                validate_published_address_addition(iface, cidr)?;
-                insert_address_candidate(&mut after, cidr);
-                metadata.push(AddressMetadata {
-                    cidr,
-                    label: requested_label,
-                    broadcast: requested_broadcast,
-                    state: AddressState::Configured,
-                    lifetimes: None,
-                });
-                AddressMutationOutcome::Added(cidr)
-            }
-        }
     };
     let deleted = match outcome {
         AddressMutationOutcome::Deleted(cidr) if before.contains(&cidr) => Some(cidr.address()),
         _ => None,
     };
-    let route_changes = crate::net::route::commit_addresses(
+    let prepared = crate::net::route::prepare_address_update(
         rtnl, &netns, iface, &before, &after, metadata, deleted,
     )?;
+    if let Some((address, transmits)) = manual_probe {
+        ipv6_autoconf::start_manual_probe(&netns, iface.common(), address, transmits)?;
+    }
+    let route_changes = prepared.publish(&netns, iface);
+    if manual_probe.is_some() {
+        ipv6_autoconf::changed(iface.common());
+    }
     if let Some(target) = cancel_dad {
         ipv6_autoconf::cancel_target(iface.common(), target);
     }
@@ -909,6 +933,7 @@ fn prepare_automatic_address(
             label: None,
             broadcast: None,
             state,
+            ipv6_nodad: false,
             lifetimes,
         });
     }
@@ -993,6 +1018,7 @@ fn try_clone_metadata(
             label,
             broadcast: entry.broadcast,
             state: entry.state,
+            ipv6_nodad: entry.ipv6_nodad,
             lifetimes: entry.lifetimes,
         });
     }

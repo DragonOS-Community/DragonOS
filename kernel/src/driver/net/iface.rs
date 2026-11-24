@@ -72,6 +72,7 @@ pub(crate) struct AddressMetadata {
     /// The explicit IPv4 IFA_BROADCAST value, independent of the CIDR-derived broadcast.
     pub broadcast: Option<smoltcp::wire::Ipv4Address>,
     pub state: AddressState,
+    pub ipv6_nodad: bool,
     pub lifetimes: Option<crate::net::address::ipv6_slaac::Lifetimes>,
 }
 

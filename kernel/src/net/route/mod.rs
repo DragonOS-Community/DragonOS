@@ -29,7 +29,7 @@ use fib::FibEditor;
 pub(in crate::net) use fib::FibTable;
 pub(in crate::net) use lifecycle::prepare_address_link_change_from;
 pub(crate) use lifecycle::{
-    commit_addresses, prepare_address_link_change, prepare_link_state_change,
+    prepare_address_link_change, prepare_address_update, prepare_link_state_change,
     prepare_unregister_ifaces_from, purge_iface_for_netns_teardown, register_iface,
     AddressLinkChange, PreparedAddressRouteCommit, PreparedIfaceUnregister,
     PreparedLinkStateChange,

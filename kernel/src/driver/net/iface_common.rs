@@ -288,6 +288,7 @@ impl IfaceCommon {
                 label: None,
                 broadcast: None,
                 state: Default::default(),
+                ipv6_nodad: false,
                 lifetimes: None,
             })
             .collect();

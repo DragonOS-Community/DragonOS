@@ -3,6 +3,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/if_addr.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
@@ -193,12 +195,12 @@ int SendAndReceiveAck(int fd, const std::vector<uint8_t>& request) {
     return ReceiveAck(fd, reinterpret_cast<const nlmsghdr*>(request.data())->nlmsg_seq);
 }
 
-int SetLinkUp(int fd, uint32_t ifindex, uint32_t sequence) {
+int SetLinkUp(int fd, uint32_t ifindex, uint32_t sequence, bool up = true) {
     auto request = NewRequest<ifinfomsg>(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, sequence);
     auto* message = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(request.data()));
     message->ifi_family = AF_UNSPEC;
     message->ifi_index = static_cast<int>(ifindex);
-    message->ifi_flags = IFF_UP;
+    message->ifi_flags = up ? IFF_UP : 0;
     message->ifi_change = IFF_UP;
     return SendAndReceiveAck(fd, request);
 }
@@ -671,6 +673,24 @@ AddressSpec MakeAddress(int family, const char* text, uint8_t prefix_len, uint32
     return {family, ParseAddress(family, text), prefix_len, ifindex};
 }
 
+bool WaitForDadSolicitation(int fd, const IpBytes& target) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    constexpr std::array<uint8_t, 16> unspecified{};
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd readable{fd, POLLIN, 0};
+        if (poll(&readable, 1, 100) <= 0) continue;
+        std::array<uint8_t, 256> packet{};
+        const ssize_t received = recv(fd, packet.data(), packet.size(), MSG_DONTWAIT);
+        // SOCK_DGRAM starts at the IPv6 header. A DAD NS has an unspecified
+        // source, ICMPv6 next header and a target address at byte 48.
+        if (received >= 64 && packet[6] == IPPROTO_ICMPV6 && packet[40] == 135 &&
+            std::memcmp(packet.data() + 8, unspecified.data(), unspecified.size()) == 0 &&
+            std::memcmp(packet.data() + 48, target.bytes.data(), target.length) == 0)
+            return true;
+    }
+    return false;
+}
+
 int RunManualIpv6Dad() {
     FdGuard fd;
     uint32_t lo = 0;
@@ -685,7 +705,9 @@ int RunManualIpv6Dad() {
         rtattr header;
         char kind[RTA_ALIGN(sizeof("veth"))];
     } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+    constexpr uint8_t mac[] = {0x02, 0, 0, 0, 0x50, 0x91};
     AddAttr(&request, IFLA_IFNAME, link_name, sizeof(link_name));
+    AddAttr(&request, IFLA_ADDRESS, mac, sizeof(mac));
     AddAttr(&request, IFLA_LINKINFO, &link_info, sizeof(link_info));
     if (const int error = SendAndReceiveAck(fd.Get(), request); error != 0) return 100 + error;
     const auto edge = if_nametoindex(link_name);
@@ -697,6 +719,8 @@ int RunManualIpv6Dad() {
     nodad.ipv6_flags = 0;
     const auto cancelled = MakeAddress(AF_INET6, "fd50:2324::3", 80, edge);
     const auto duplicate_peer = MakeAddress(AF_INET6, "fd50:2324::4", 80, peer);
+    auto generated = MakeAddress(AF_INET6, "fe80::ff:fe00:5091", 80, edge);
+    generated.ipv6_flags = 0;
     auto duplicate = duplicate_peer;
     duplicate.ifindex = edge;
     duplicate.ipv6_flags = 0;
@@ -743,9 +767,11 @@ int RunManualIpv6Dad() {
 
     if (const int error = add(duplicate_peer); error != 0) return 1000 + error;
     if (const int error = add(duplicate); error != 0) return 1200 + error;
+    if (const int error = add(generated); error != 0) return 1300 + error;
     if (const int error = SetLinkUp(fd.Get(), peer, ++sequence); error != 0) return 1400 + error;
     if (const int error = SetLinkUp(fd.Get(), edge, ++sequence); error != 0) return 1600 + error;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    bool completed_dad = false;
     while (std::chrono::steady_clock::now() < deadline) {
         const auto completed = flags_for(ordinary);
         const auto failed = flags_for(duplicate);
@@ -757,11 +783,49 @@ int RunManualIpv6Dad() {
                                                 true, true, ++sequence);
                 error != 0) return 1900 + error;
             if (BindUdp(duplicate, 0) != EADDRNOTAVAIL) return 1802;
-            return flags_for(cancelled).has_value() ? 1803 : 0;
+            if (flags_for(cancelled).has_value()) return 1803;
+            completed_dad = true;
+            break;
         }
         usleep(20 * 1000);
     }
-    return 1804;
+    if (!completed_dad) return 1804;
+
+    auto count_generated = [&]() {
+        std::vector<DumpedAddress> addresses;
+        if (DumpAddresses(fd.Get(), AF_INET6, ++sequence, &addresses) != 0) return -1;
+        return static_cast<int>(std::count_if(addresses.begin(), addresses.end(), [&](const auto& item) {
+            return item.ifindex == edge && SameAddress(item.local, generated.local);
+        }));
+    };
+    if (!flags_for(generated) || count_generated() != 1) return 2010;
+    if (const int error = ChangeAddress(fd.Get(), RTM_DELADDR, kRequest, generated, true, true,
+                                        ++sequence);
+        error != 0) return 2100 + error;
+    if (count_generated() != 0) return 2210;
+
+    auto carrier_loss = MakeAddress(AF_INET6, "fd50:2324::5", 80, edge);
+    carrier_loss.ipv6_flags = 0;
+    FdGuard packets(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)));
+    if (packets.Get() < 0) return 2300 + errno;
+    sockaddr_ll peer_link{};
+    peer_link.sll_family = AF_PACKET;
+    peer_link.sll_protocol = htons(ETH_P_IPV6);
+    peer_link.sll_ifindex = static_cast<int>(peer);
+    if (bind(packets.Get(), reinterpret_cast<sockaddr*>(&peer_link), sizeof(peer_link)) != 0)
+        return 2400 + errno;
+    if (const int error = add(carrier_loss); error != 0) return 2500 + error;
+    if (!WaitForDadSolicitation(packets.Get(), carrier_loss.local)) return 2600;
+    if (const int error = SetLinkUp(fd.Get(), peer, ++sequence, false); error != 0) return 2700 + error;
+    const auto carrier_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < carrier_deadline) {
+        const auto state = flags_for(carrier_loss);
+        if (!state) return 2810;
+        if (!(*state & IFA_F_TENTATIVE))
+            return BindUdp(carrier_loss, 0) == 0 ? 0 : 2811;
+        usleep(20 * 1000);
+    }
+    return 2812;
 }
 
 int RunMultipleAddressConsistency() {

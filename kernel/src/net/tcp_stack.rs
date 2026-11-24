@@ -446,7 +446,7 @@ impl TcpStack {
             // Reserve listener capacity outside protocol/router locks, using
             // the same inner -> SocketSet order as listen/accept/shutdown.
             if let Ok(tcp) = smoltcp::wire::TcpPacket::new_checked(&packet.segment[..]) {
-                if tcp.syn() && !tcp.ack() && !tcp.rst() {
+                if !packet.meta.ipv6_anycast && tcp.syn() && !tcp.ack() && !tcp.rst() {
                     let local =
                         smoltcp::wire::IpEndpoint::new(packet.ip.dst_addr(), tcp.dst_port());
                     // Keep admission and dispatch serialized: another poller

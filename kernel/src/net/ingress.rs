@@ -5,7 +5,7 @@ use super::{
     conntrack::CtPacketContext,
     ipv6_defrag::{fragment_offset as ipv6_fragment_offset, DefragDomain as Ipv6DefragDomain},
     nftables::{NftDeviceNames, NftIpv4Hook, RulesetSnapshot},
-    route::{OutputRouteGuard, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST},
+    route::{OutputRouteGuard, RTN_ANYCAST, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST},
     socket::inet::raw::{RawIngressBatch, RawIngressWork},
 };
 use crate::driver::net::{
@@ -354,6 +354,11 @@ impl<'a> NetIngressFilter<'a> {
         }
     }
 
+    fn ipv6_special_route_view(&self) -> Option<&OutputRouteGuard<'_>> {
+        self.fib_routes
+            .filter(|routes| routes.has_ipv6_special_routes())
+    }
+
     fn route_ipv6(
         &mut self,
         packet: &mut RoutedIngressPacket<'_, '_>,
@@ -365,12 +370,9 @@ impl<'a> NetIngressFilter<'a> {
             // A forwarding namespace must not accept transit as local when
             // its full route view is unavailable.
             None if self.netns.ipv6_forwarding_enabled() => return RouteInputVerdict::Drop,
-            // Physical NAPI also holds a FIB view in host mode. Reject
-            // routes still apply there, without enabling ordinary routing.
-            None => match self
-                .fib_routes
-                .filter(|routes| routes.has_ipv6_special_routes())
-            {
+            // Physical NAPI also holds a FIB view in host mode. Apply
+            // special routes there without enabling ordinary routing.
+            None => match self.ipv6_special_route_view() {
                 Some(routes) => routes,
                 None => return RouteInputVerdict::Pass,
             },
@@ -392,10 +394,15 @@ impl<'a> NetIngressFilter<'a> {
         else {
             return RouteInputVerdict::Pass;
         };
-        if self.routes.is_none() && !super::route::is_ipv6_reject_or_throw(route.matched.kind) {
+        let kind = route.matched.kind;
+        if self.routes.is_none()
+            && kind != RTN_ANYCAST
+            && !super::route::is_ipv6_reject_or_throw(kind)
+        {
             return RouteInputVerdict::Pass;
         }
-        match route.matched.kind {
+        match kind {
+            RTN_ANYCAST if !route.matched.is_loopback_anycast() => RouteInputVerdict::Ipv6Anycast,
             // IPv6 link-local unicast is scoped to its ingress link. A local
             // address on another interface must not be weak-host delivered.
             RTN_LOCAL if destination.is_link_local() && route.oif != ingress_ifindex => {
@@ -542,9 +549,12 @@ impl<'a> NetIngressFilter<'a> {
                 if meta.link_group {
                     return RouteInputVerdict::Drop;
                 }
-                let Some(code) = crate::net::route::ipv6_route_rejection(kind)
-                    .and_then(|rejection| rejection.icmp_code)
-                else {
+                let Some(code) = (if route.matched.is_loopback_anycast() {
+                    Some(0)
+                } else {
+                    crate::net::route::ipv6_route_rejection(kind)
+                        .and_then(|rejection| rejection.icmp_code)
+                }) else {
                     return RouteInputVerdict::Drop;
                 };
                 self.defer_ipv6_error(
@@ -603,6 +613,21 @@ fn is_ipv6_ndisc(packet: &Ipv6Packet<&[u8]>) -> bool {
 impl IpIngressFilter for NetIngressFilter<'_> {
     fn ipv6_ndisc_router(&self) -> bool {
         self.owner.ipv6_forwarding() != 0
+    }
+
+    fn ipv6_anycast_reply_source(
+        &self,
+        remote: smoltcp::wire::Ipv6Address,
+        ingress: PacketMeta,
+        echo: bool,
+    ) -> Option<smoltcp::wire::Ipv6Address> {
+        let ifindex = if ingress.id != 0 {
+            ingress.id
+        } else {
+            self.owner_ifindex
+        };
+        self.fib_routes?
+            .ipv6_anycast_reply_source(remote, ifindex, echo)
     }
 
     fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
@@ -857,10 +882,40 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
     ) -> RouteInputVerdict {
-        if matches!(
-            self.stage.get(),
-            IngressStage::PreRoutingDone | IngressStage::LocalInputDone
-        ) {
+        if self.stage.get() == IngressStage::LocalInputDone {
+            // LOCAL_IN reassembly may recover anycast admission, but must
+            // never run forward or rejection hooks a second time.
+            if let (Some(routes), Ok(IpVersion::Ipv6)) = (
+                self.ipv6_special_route_view(),
+                IpVersion::of_packet(packet.bytes()),
+            ) {
+                let Ok(ipv6) = Ipv6Packet::new_checked(packet.bytes()) else {
+                    return RouteInputVerdict::Drop;
+                };
+                if ipv6.dst_addr().is_multicast() {
+                    return RouteInputVerdict::Pass;
+                }
+                let ingress_ifindex = if meta.id != 0 {
+                    meta.id
+                } else {
+                    self.owner_ifindex
+                };
+                if routes
+                    .lookup_ingress(
+                        ipv6.dst_addr().into(),
+                        ingress_ifindex,
+                        Some(ipv6.src_addr()),
+                    )
+                    .is_some_and(|route| {
+                        route.matched.kind == RTN_ANYCAST && !route.matched.is_loopback_anycast()
+                    })
+                {
+                    return RouteInputVerdict::Ipv6Anycast;
+                }
+            }
+            return RouteInputVerdict::Pass;
+        }
+        if self.stage.get() == IngressStage::PreRoutingDone {
             return RouteInputVerdict::Pass;
         }
         // The local-output route already selected this socket owner. Linux

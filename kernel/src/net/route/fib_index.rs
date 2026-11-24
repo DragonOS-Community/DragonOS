@@ -1539,7 +1539,8 @@ pub(super) fn projection_key(route: RouteEntry) -> Option<ProjectionKey> {
 }
 
 fn ipv6_special(route: RouteEntry) -> bool {
-    matches!(route.destination, IpCidr::Ipv6(_)) && super::is_ipv6_reject_or_throw(route.kind)
+    matches!(route.destination, IpCidr::Ipv6(_))
+        && (route.kind == super::RTN_ANYCAST || super::is_ipv6_reject_or_throw(route.kind))
 }
 
 fn indexable(route: RouteEntry) -> bool {

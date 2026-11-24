@@ -115,7 +115,8 @@ impl TcpOutputQueue {
                         }
                     };
                 }
-                LocalOutputDisposition::Local { .. } => {
+                LocalOutputDisposition::Local { .. }
+                | LocalOutputDisposition::Ipv6LoopbackReject => {
                     // The shared local-output path owns IPv4 fragmentation and
                     // advances the cursor only after each fragment is accepted.
                     let result =

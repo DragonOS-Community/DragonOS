@@ -4,8 +4,9 @@
 //! independently interpreting FIB source policy.
 
 use alloc::sync::Arc;
+use core::cmp::Reverse;
 
-use smoltcp::wire::{IpAddress, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
 use system_error::SystemError;
 
 use crate::{
@@ -13,7 +14,85 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 
-use super::{lookup_output_fib_with_source, RouteLookupResult, RouteSourcePolicy, RTN_LOCAL};
+use super::{
+    lookup_output_fib_with_source, OutputRouteGuard, RouteLookupResult, RouteSourcePolicy,
+    RTN_LOCAL,
+};
+
+impl OutputRouteGuard<'_> {
+    /// Choose a source for a generated ICMPv6 reply using the pinned FIB
+    /// and committed address metadata. Ingress holds the smoltcp locks.
+    pub(crate) fn ipv6_anycast_reply_source(
+        &self,
+        remote: Ipv6Address,
+        ingress: u32,
+        echo: bool,
+    ) -> Option<Ipv6Address> {
+        let scoped = remote.is_unicast_link_local() || remote.is_loopback();
+        let output_device = (scoped || echo).then_some(ingress);
+        let preferred_source = self
+            .fib
+            .lookup_ipv6_output(remote, output_device, None)
+            .filter(|route| super::ipv6_route_rejection(route.matched.kind).is_none())
+            .and_then(|route| route.matched.preferred_source);
+        let now = crate::time::Instant::now().total_micros();
+        let remote_scope = ipv6_unicast_scope(remote);
+        let mut best = None;
+        for (&index, iface) in self.devices.iter() {
+            if (scoped && index != ingress as usize)
+                || !iface.flags().contains(InterfaceFlags::UP)
+                || !iface.common().ipv6_enabled()
+            {
+                continue;
+            }
+            for entry in iface.common().address_metadata().lock().iter() {
+                let IpCidr::Ipv6(cidr) = entry.cidr else {
+                    continue;
+                };
+                let address = cidr.address();
+                let scope = ipv6_unicast_scope(address);
+                if !entry.state.is_usable() || !address.x_is_unicast() || scope < remote_scope {
+                    continue;
+                }
+                if preferred_source == Some(address.into()) {
+                    return Some(address);
+                }
+                let preferred = entry
+                    .lifetimes
+                    .and_then(|lifetime| lifetime.preferred_until_us())
+                    .is_none_or(|deadline| deadline > now);
+                let score = (
+                    address == remote,
+                    Reverse(scope),
+                    preferred,
+                    index == ingress as usize,
+                    ipv6_common_prefix(address, remote).min(u32::from(cidr.prefix_len())),
+                );
+                if best.is_none_or(|(_, previous)| score > previous) {
+                    best = Some((address, score));
+                }
+            }
+        }
+        best.map(|(address, _)| address)
+    }
+}
+
+fn ipv6_unicast_scope(address: Ipv6Address) -> u8 {
+    let octets = address.octets();
+    if address.is_loopback() {
+        1
+    } else if address.is_unicast_link_local() {
+        2
+    } else if octets[0] == 0xfe && octets[1] & 0xc0 == 0xc0 {
+        5
+    } else {
+        14
+    }
+}
+
+pub(super) fn ipv6_common_prefix(left: Ipv6Address, right: Ipv6Address) -> u32 {
+    (u128::from_be_bytes(left.octets()) ^ u128::from_be_bytes(right.octets())).leading_zeros()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedIpv4Route {
@@ -48,6 +127,7 @@ impl ResolvedIpv4Route {
             next_hop: self.decision.next_hop,
             ip_mtu: self.ip_mtu,
             kind: self.decision.matched.kind,
+            loopback_anycast: false,
             table: self.decision.table,
         }
     }
@@ -343,6 +423,7 @@ pub(crate) fn resolve_ipv6_socket_route(
             next_hop: selected.next_hop,
             ip_mtu: egress.mtu(),
             kind: selected.matched.kind,
+            loopback_anycast: selected.matched.is_loopback_anycast(),
             table: selected.table,
         },
         source,

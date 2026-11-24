@@ -32,7 +32,7 @@ use super::{
 
 mod multicast;
 mod pmtu;
-use pmtu::{apply_socket_mtu, save_route_hint, SocketOutput};
+use pmtu::{apply_ipv6_output_mtu, apply_socket_mtu, save_route_hint, SocketOutput};
 pub(crate) use pmtu::{
     submit_prepared_ipv4_raw, submit_prepared_ipv4_with_pmtu, submit_prepared_ipv6_raw,
     submit_prepared_ipv6_with_pmtu, PmtuOutputError, RawOutputPolicy, SocketRouteHint,
@@ -188,6 +188,15 @@ impl<'a> LocalOutputCt<'a> {
 
     pub(crate) fn mark(&self) -> u32 {
         self.mark.get()
+    }
+
+    pub(crate) fn into_rejected(self) -> Result<OutputCtContext, SystemError> {
+        match self.context.into_inner() {
+            Some(context) => Ok(OutputCtContext::Tracked(
+                Box::try_new(context).map_err(|_| SystemError::ENOMEM)?,
+            )),
+            None => Ok(OutputCtContext::Untracked),
+        }
     }
 
     /// A multicast/broadcast local clone shares one conntrack identity with
@@ -505,6 +514,12 @@ fn submit_ipv6(
     if !initial_egress.common().ipv6_enabled() {
         return Err(SystemError::ENETDOWN.into());
     }
+    let initial_loopback_anycast = route.loopback_anycast;
+    if initial_loopback_anycast {
+        // Socket-local size errors precede LOCAL_OUT when the initial route
+        // already selects the loopback reject output.
+        route = apply_ipv6_output_mtu(netns, &mut reservation, route, policy, may_fragment)?;
+    }
     let ruleset = netns.nftables().snapshot();
     let output_oifname = hook_oifname(
         netns,
@@ -540,16 +555,25 @@ fn submit_ipv6(
     }
     drop(output_routes);
     let packet = Ipv6Packet::new_checked(reservation.bytes()).map_err(|_| SystemError::EINVAL)?;
+    let new_destination = packet.dst_addr().into();
     let (selected, masquerade) = route_after_output(
         netns,
         &ruleset,
         IpVersion::Ipv6,
         initial_destination,
-        packet.dst_addr().into(),
+        new_destination,
         Some(packet.src_addr().into()),
         route,
     )?;
     route = selected;
+    if route.loopback_anycast {
+        if !initial_loopback_anycast || initial_destination != new_destination {
+            route = apply_ipv6_output_mtu(netns, &mut reservation, route, policy, may_fragment)?;
+        }
+        let mark = ct.mark();
+        reservation.commit_ipv6(route, 0, ct.into_rejected()?, mark, before_enqueue)?;
+        return Ok(None);
+    }
     let egress = netns
         .device_list()
         .get(&(route.oif as usize))
@@ -614,15 +638,7 @@ fn submit_ipv6(
         ruleset.generation,
         hint,
     )?;
-    if !may_fragment && reservation.bytes().len() > route.ip_mtu {
-        return Err(PmtuOutputError {
-            error: SystemError::EMSGSIZE,
-            mtu: Some(route.ip_mtu),
-        });
-    }
-    if let Some(policy) = policy {
-        route = apply_socket_mtu(netns, &mut reservation, route, policy, IpVersion::Ipv6)?;
-    }
+    route = apply_ipv6_output_mtu(netns, &mut reservation, route, policy, may_fragment)?;
     reservation
         .validate_for_ipv6_route(route)
         .map_err(|error| PmtuOutputError {

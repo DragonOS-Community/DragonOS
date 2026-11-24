@@ -571,6 +571,7 @@ pub(super) fn send_ndisc(
             next_hop: dst.into(),
             ip_mtu: iface.mtu(),
             kind: RTN_MULTICAST,
+            loopback_anycast: false,
             table: RT_TABLE_LOCAL,
         },
         None,

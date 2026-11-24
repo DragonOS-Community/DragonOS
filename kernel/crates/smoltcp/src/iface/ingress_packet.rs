@@ -29,6 +29,8 @@ pub enum RouteInputVerdict {
     /// bypasses the address-owner check for a candidate NDISC message. The
     /// ordinary ICMPv6 parser still validates the complete packet afterward.
     NeighborDiscovery,
+    /// The IPv6 FIB admits this destination for local anycast reception.
+    Ipv6Anycast,
 }
 
 /// The local-delivery hook runs after routing and before raw and transport
@@ -46,6 +48,18 @@ pub trait IpIngressFilter {
     #[cfg(feature = "proto-ipv6")]
     fn ipv6_ndisc_router(&self) -> bool {
         false
+    }
+
+    /// Select the outer source for a generated ICMPv6 reply to anycast input.
+    /// The callback runs before the reply is serialized.
+    #[cfg(feature = "proto-ipv6")]
+    fn ipv6_anycast_reply_source(
+        &self,
+        _remote: crate::wire::Ipv6Address,
+        _ingress: PacketMeta,
+        _echo: bool,
+    ) -> Option<crate::wire::Ipv6Address> {
+        None
     }
 
     /// Override ARP reply authorization with the integration's address policy.

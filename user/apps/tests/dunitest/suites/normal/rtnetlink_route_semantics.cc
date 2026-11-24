@@ -1,5 +1,8 @@
 #include "rtnetlink_route_test_support.h"
 
+#include <linux/errqueue.h>
+#include <poll.h>
+
 TEST(RtnetlinkRouteSemantics, Ipv4BuiltinRulesFallBackFromMainToDefaultTable) {
     const pid_t child = fork();
     ASSERT_GE(child, 0) << ErrnoString(errno);
@@ -582,6 +585,95 @@ TEST(RtnetlinkRouteSemantics, Ipv6RejectTerminatesLookupAndThrowSkipsTheTable) {
             EXPECT_EQ(connect_error(), 0);
             ASSERT_EQ(mutate(RTM_NEWROUTE, add, RTN_THROW), 0);
             EXPECT_EQ(connect_error(), ENETUNREACH);
+        };
+        run();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RtnetlinkRouteSemantics, Ipv6LoopbackAnycastRejectsDeliveryWithoutOwningAnAddress) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto run = []() {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            const unsigned lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            uint32_t seq = 1;
+            constexpr auto request = NLM_F_REQUEST | NLM_F_ACK;
+            constexpr auto add = request | NLM_F_CREATE | NLM_F_EXCL;
+            constexpr auto destination = "fd29:82::9";
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, ++seq), 0);
+            auto mutate = [&](uint16_t operation, uint16_t flags) {
+                return SendIpv6RouteRequest(route.Get(), operation, flags, destination, 128, lo,
+                                            RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                            std::nullopt, RTN_ANYCAST, RT_TABLE_LOCAL);
+            };
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add), 0);
+            ASSERT_TRUE(FindIpv6Route(route.Get(), destination, 128, lo, ++seq, RTN_ANYCAST));
+
+            sockaddr_in6 peer{};
+            peer.sin6_family = AF_INET6;
+            peer.sin6_port = htons(23029);
+            ASSERT_EQ(inet_pton(AF_INET6, destination, &peer.sin6_addr), 1);
+            FdGuard listener(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(listener.Get(), 0);
+            ASSERT_EQ(bind(listener.Get(), reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), -1);
+            ASSERT_EQ(errno, EADDRNOTAVAIL);
+            sockaddr_in6 wildcard = peer;
+            wildcard.sin6_addr = in6addr_any;
+            ASSERT_EQ(bind(listener.Get(), reinterpret_cast<sockaddr*>(&wildcard), sizeof(wildcard)), 0);
+
+            FdGuard oversized(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(oversized.Get(), 0);
+            int mtu = 1280;
+            int discover = IPV6_PMTUDISC_DO;
+            ASSERT_EQ(setsockopt(oversized.Get(), IPPROTO_IPV6, IPV6_MTU, &mtu, sizeof(mtu)), 0);
+            ASSERT_EQ(setsockopt(oversized.Get(), IPPROTO_IPV6, IPV6_MTU_DISCOVER,
+                                 &discover, sizeof(discover)), 0);
+            char datagram[2000] = {};
+            ASSERT_EQ(sendto(oversized.Get(), datagram, sizeof(datagram), 0,
+                             reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), -1);
+            EXPECT_EQ(errno, EMSGSIZE);
+
+            FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(sender.Get(), 0);
+            int enabled = 1;
+            ASSERT_EQ(setsockopt(sender.Get(), IPPROTO_IPV6, IPV6_RECVERR, &enabled, sizeof(enabled)), 0);
+            ASSERT_EQ(sendto(sender.Get(), "a", 1, 0, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), 1);
+            pollfd pending{sender.Get(), POLLERR, 0};
+            ASSERT_EQ(poll(&pending, 1, 2000), 1);
+            ASSERT_TRUE(pending.revents & POLLERR);
+            alignas(cmsghdr) char control[128] = {};
+            char payload = 0;
+            iovec iov{&payload, sizeof(payload)};
+            msghdr msg{};
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control;
+            msg.msg_controllen = sizeof(control);
+            ASSERT_EQ(recvmsg(sender.Get(), &msg, MSG_ERRQUEUE), 1);
+            auto* cmsg = CMSG_FIRSTHDR(&msg);
+            ASSERT_NE(cmsg, nullptr);
+            ASSERT_GE(cmsg->cmsg_len, CMSG_LEN(sizeof(sock_extended_err)));
+            EXPECT_EQ(cmsg->cmsg_level, IPPROTO_IPV6);
+            EXPECT_EQ(cmsg->cmsg_type, IPV6_RECVERR);
+            sock_extended_err error{};
+            std::memcpy(&error, CMSG_DATA(cmsg), sizeof(error));
+            EXPECT_EQ(error.ee_origin, SO_EE_ORIGIN_ICMP6);
+            EXPECT_EQ(error.ee_type, 1);
+            EXPECT_EQ(error.ee_code, 0);
+            EXPECT_EQ(error.ee_errno, ENETUNREACH);
+            EXPECT_EQ(recv(listener.Get(), &payload, 1, MSG_DONTWAIT), -1);
+            EXPECT_EQ(errno, EAGAIN);
+            ASSERT_EQ(mutate(RTM_DELROUTE, request), 0);
+            EXPECT_FALSE(FindIpv6Route(route.Get(), destination, 128, lo, ++seq, RTN_ANYCAST));
         };
         run();
         _exit(testing::Test::HasFailure() ? 1 : 0);

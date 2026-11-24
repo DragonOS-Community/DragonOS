@@ -69,6 +69,7 @@ pub(crate) struct OutputRouteDecision {
     pub(crate) next_hop: IpAddress,
     pub(crate) ip_mtu: usize,
     pub(crate) kind: u8,
+    pub(crate) loopback_anycast: bool,
     pub(crate) table: u32,
 }
 
@@ -251,12 +252,15 @@ impl OutputRouteGuard<'_> {
             return RTN_UNREACHABLE;
         };
         let route = route.matched;
+        if route.is_loopback_anycast() {
+            return RTN_UNREACHABLE;
+        }
         if ipv6_route_rejection(route.kind).is_some() {
             return route.kind;
         }
         // As in ipv6_anycast_destination(), an on-link subnet's router
         // anycast address is its prefix address (except on /127 and /128).
-        if route.kind == RTN_UNICAST
+        if matches!(route.kind, RTN_UNICAST | RTN_ANYCAST)
             && route.gateway.is_none()
             && route.destination.prefix_len() < 127
             && route.destination.address() == destination
@@ -319,6 +323,7 @@ impl OutputRouteGuard<'_> {
             next_hop: route.next_hop,
             ip_mtu: iface.mtu(),
             kind: route.matched.kind,
+            loopback_anycast: route.matched.is_loopback_anycast(),
             table: route.table,
         })
     }
@@ -484,14 +489,11 @@ fn select_ipv6_source(
         if source.is_link_local() != link_scope || source.is_loopback() {
             continue;
         }
-        let mut prefix = 0;
-        for (left, right) in source.octets().iter().zip(destination.octets().iter()) {
-            prefix += (*left ^ *right).leading_zeros() as usize;
-            if left != right {
-                break;
-            }
-        }
-        let score = (!deprecated(source), prefix.min(cidr.prefix_len() as usize));
+        let prefix = self::source::ipv6_common_prefix(source, destination);
+        let score = (
+            !deprecated(source),
+            prefix.min(u32::from(cidr.prefix_len())),
+        );
         if best.is_none() || score > best_score {
             best = Some(source);
             best_score = score;

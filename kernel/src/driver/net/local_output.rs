@@ -321,7 +321,12 @@ impl OutputBackendPolicy<'_> {
             Some(route) if crate::net::route::ipv6_route_rejection(route.kind).is_some() => {
                 OutputBackendDecision::Deferred(None)
             }
-            Some(route) if route.kind == crate::net::route::RTN_LOCAL => {
+            Some(route)
+                if matches!(
+                    route.kind,
+                    crate::net::route::RTN_LOCAL | crate::net::route::RTN_ANYCAST
+                ) =>
+            {
                 OutputBackendDecision::Deferred(Some(route))
             }
             Some(route)
@@ -630,6 +635,7 @@ impl<'a> PreparedIpOutputReservation<'a> {
             crate::net::route::RTN_LOCAL
                 | crate::net::route::RTN_UNICAST
                 | crate::net::route::RTN_MULTICAST
+                | crate::net::route::RTN_ANYCAST
         ) {
             return Err(SystemError::ENETUNREACH);
         }
@@ -660,7 +666,9 @@ impl<'a> PreparedIpOutputReservation<'a> {
     ) -> Result<(), SystemError> {
         self.check_owner()?;
         self.validate_for_ipv6_route(route)?;
-        let disposition = if route.kind == crate::net::route::RTN_LOCAL {
+        let disposition = if route.loopback_anycast {
+            LocalOutputDisposition::Ipv6LoopbackReject
+        } else if route.kind == crate::net::route::RTN_LOCAL {
             LocalOutputDisposition::Local {
                 oif: route.oif,
                 ip_mtu: route.ip_mtu,
@@ -1428,6 +1436,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 next_hop: destination,
                 ip_mtu,
                 kind: crate::net::route::RTN_MULTICAST,
+                loopback_anycast: false,
                 table: crate::net::route::RT_TABLE_LOCAL,
             }
         } else {
@@ -1527,6 +1536,21 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 .validate_ipv4_output_source(route, source)
                 .map_err(|_| IpOutputError::NoRoute)?;
         }
+        if route.loopback_anycast {
+            let mark = ct.mark();
+            let context = ct.into_rejected().map_err(|_| IpOutputError::Exhausted)?;
+            let frame = self.scratch.take().ok_or(IpOutputError::Exhausted)?;
+            self.reservation.commit_prepared_ipv6(
+                frame,
+                meta,
+                LocalOutputDisposition::Ipv6LoopbackReject,
+                0,
+                None,
+                context,
+                mark,
+            );
+            return Ok(());
+        }
         let local = route.kind == crate::net::route::RTN_LOCAL;
         if !local
             && !matches!(
@@ -1534,6 +1558,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
                 crate::net::route::RTN_UNICAST
                     | crate::net::route::RTN_BROADCAST
                     | crate::net::route::RTN_MULTICAST
+                    | crate::net::route::RTN_ANYCAST
             )
         {
             return Err(IpOutputError::NoRoute);
@@ -1739,6 +1764,15 @@ impl LocalInputTxToken<'_> {
             }));
         };
         if let Some(route) = route {
+            if route.loopback_anycast {
+                self.medium = smoltcp::phy::Medium::Ip;
+                self.disposition = LocalOutputDisposition::Ipv6LoopbackReject;
+                return Ok(Some(smoltcp::phy::TxEgressOverride {
+                    medium: smoltcp::phy::Medium::Ip,
+                    ip_mtu: route.ip_mtu.min(u16::MAX as usize),
+                    context: LocalOutputDisposition::IPV6_LOOPBACK_REJECT_CONTEXT,
+                }));
+            }
             if route.kind == crate::net::route::RTN_LOCAL {
                 let route_ip_mtu = core::cmp::min(route.ip_mtu, u16::MAX as usize);
                 let ip_mtu = route_ip_mtu;
@@ -2282,6 +2316,17 @@ where
         }
         LocalOutputDisposition::Drop => {
             LocalOutputTransmitResult::Drop(packet, SystemError::ENETUNREACH)
+        }
+        LocalOutputDisposition::Ipv6LoopbackReject => {
+            use crate::net::forward_mtu::{send_ipv6_forward_error, Ipv6ForwardError};
+            let context = packet.ct_context.for_ingress();
+            let _ = send_ipv6_forward_error(
+                netns,
+                &packet.frame,
+                Ipv6ForwardError::LocalNoRoute,
+                Some(&context),
+            );
+            LocalOutputTransmitResult::Sent(packet)
         }
         LocalOutputDisposition::Local { oif, ip_mtu } => {
             if packet.medium != smoltcp::phy::Medium::Ip

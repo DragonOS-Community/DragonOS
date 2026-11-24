@@ -33,9 +33,9 @@ pub(super) fn validate_entry_on_iface(
     // Linux's IPv4 inet_rtm_newroute does not reject RTA_SRC selectors; an
     // unhandled attribute is ignored and the route is still created. Accept
     // and store it rather than failing with EOPNOTSUPP.
-    let reject =
-        !is_ipv4(route.destination.address()) && super::is_ipv6_reject_or_throw(route.kind);
-    if route.kind != RTN_UNICAST && !reject {
+    let ipv6 = !is_ipv4(route.destination.address());
+    let reject = ipv6 && super::is_ipv6_reject_or_throw(route.kind);
+    if route.kind != RTN_UNICAST && !reject && !(ipv6 && route.kind == super::RTN_ANYCAST) {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     if !same_family_option(route.destination.address(), route.gateway)
@@ -43,7 +43,7 @@ pub(super) fn validate_entry_on_iface(
     {
         return Err(SystemError::EINVAL);
     }
-    if !is_ipv4(route.destination.address()) {
+    if ipv6 {
         if !reject && !iface.common().ipv6_enabled() {
             return Err(SystemError::EACCES);
         }

@@ -45,6 +45,10 @@ impl InterfaceInner {
         }
 
         for listening in [false, true] {
+            #[cfg(feature = "proto-ipv6")]
+            if listening && meta.ipv6_anycast {
+                return None;
+            }
             for tcp_socket in sockets
                 .items_mut()
                 .filter_map(|i| Socket::downcast_mut(&mut i.socket))

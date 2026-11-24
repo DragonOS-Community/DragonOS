@@ -278,7 +278,11 @@ impl<'storage, 'a: 'storage> SocketSet<'storage, 'a> {
         };
         if let Some((mut state, identity)) = old {
             let action = state.process(cx.now(), tcp);
-            if action == TimeWaitAction::Reopen && tcp.max_seg_size != Some(0) {
+            #[cfg(feature = "proto-ipv6")]
+            let can_listen = !meta.ipv6_anycast;
+            #[cfg(not(feature = "proto-ipv6"))]
+            let can_listen = true;
+            if can_listen && action == TimeWaitAction::Reopen && tcp.max_seg_size != Some(0) {
                 let listener = self.iter().find_map(|(h, s)| {
                     let s = tcp::Socket::downcast(s)?;
                     (s.is_listening()

@@ -704,7 +704,11 @@ impl InterfaceInner {
                     }
                 }
 
-                if self.has_solicited_node(ip_repr.dst_addr) && self.has_ip_addr(target_addr) {
+                // Neighbor unreachability detection also sends unicast solicitations.
+                if self.has_ip_addr(target_addr)
+                    && (ip_repr.dst_addr == target_addr
+                        || self.has_solicited_node(ip_repr.dst_addr))
+                {
                     let (destination, flags) = if dad {
                         let mut flags = NdiscNeighborFlags::OVERRIDE;
                         flags.set(NdiscNeighborFlags::ROUTER, is_router);

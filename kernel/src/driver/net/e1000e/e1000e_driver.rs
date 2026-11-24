@@ -22,6 +22,7 @@ use crate::{
     time::Instant,
 };
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     sync::{Arc, Weak},
 };
@@ -236,6 +237,12 @@ impl E1000EDriver {
         self.iface.lock().upgrade()
     }
 
+    fn sync_receive_filter(&self, interface: &smoltcp::iface::Interface, flags: InterfaceFlags) {
+        self.inner
+            .lock_irqsave()
+            .sync_receive_filter(interface, flags);
+    }
+
     fn try_reserve_tx(&self) -> bool {
         self.tx_reserved
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -388,6 +395,7 @@ impl E1000EInterface {
             | InterfaceFlags::LOWER_UP;
         let name = format!("eth{}", iface_id);
         let mtu = E1000E_IP_MTU;
+        let filter_driver = driver.clone();
 
         let iface = Arc::new(E1000EInterface {
             driver,
@@ -398,7 +406,10 @@ impl E1000EInterface {
                 mtu,
                 flags,
                 iface,
-            ),
+            )
+            .with_receive_filter(Box::new(move |interface, flags| {
+                filter_driver.sync_receive_filter(interface, flags);
+            })),
             inner: SpinLock::new(InnerE1000EInterface {
                 netdevice_common: NetDeviceCommonData::default(),
                 device_common: DeviceCommonData::default(),

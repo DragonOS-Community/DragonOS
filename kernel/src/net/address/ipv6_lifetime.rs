@@ -131,8 +131,14 @@ pub(super) fn remove(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
+    removal_state: Option<AddressState>,
 ) -> Result<(), SystemError> {
-    let removed = super::address_info(iface, cidr).ok();
+    let removed = super::address_info(iface, cidr).ok().map(|mut info| {
+        if let Some(state) = removal_state {
+            info.state = state;
+        }
+        info
+    });
     let change = super::mutate_address(rtnl, iface, AddressMutation::Delete(cidr))?;
     notify_iface_protocol_change(
         netns,
@@ -175,7 +181,7 @@ pub(super) fn poll(
         drop(metadata);
 
         if expired {
-            if remove(rtnl, netns, iface, cidr).is_err() {
+            if remove(rtnl, netns, iface, cidr, None).is_err() {
                 return Some(now_us.saturating_add(ipv6_autoconf::RETRY_US));
             }
         } else if notify_deprecation {

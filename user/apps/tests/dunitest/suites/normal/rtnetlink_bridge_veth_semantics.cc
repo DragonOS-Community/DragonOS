@@ -119,6 +119,7 @@ struct LinkState {
     uint32_t mtu = 0;
     uint32_t tx_queue_len = 0;
     std::optional<uint8_t> operstate;
+    std::optional<uint32_t> bridge_stp_state;
     std::optional<std::array<uint8_t, ETH_ALEN>> mac;
     std::string kind;
     uint16_t linkinfo_type = 0;
@@ -199,11 +200,25 @@ std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t
                 } else if ((attr->rta_type & NLA_TYPE_MASK) == IFLA_LINKINFO) {
                     state.linkinfo_type = attr->rta_type;
                     int info_bytes = RTA_PAYLOAD(attr);
+                    const rtattr* info_data = nullptr;
                     for (auto* info = reinterpret_cast<rtattr*>(RTA_DATA(attr));
                          RTA_OK(info, info_bytes); info = RTA_NEXT(info, info_bytes)) {
                         if ((info->rta_type & NLA_TYPE_MASK) == IFLA_INFO_KIND) {
                             const char* value = static_cast<const char*>(RTA_DATA(info));
                             state.kind.assign(value, strnlen(value, RTA_PAYLOAD(info)));
+                        } else if ((info->rta_type & NLA_TYPE_MASK) == IFLA_INFO_DATA) {
+                            info_data = info;
+                        }
+                    }
+                    if (state.kind == "bridge" && info_data) {
+                        int data_bytes = RTA_PAYLOAD(info_data);
+                        for (auto* field = static_cast<const rtattr*>(RTA_DATA(info_data));
+                             RTA_OK(field, data_bytes); field = RTA_NEXT(field, data_bytes)) {
+                            if ((field->rta_type & NLA_TYPE_MASK) == IFLA_BR_STP_STATE &&
+                                RTA_PAYLOAD(field) == sizeof(uint32_t)) {
+                                std::memcpy(&state.bridge_stp_state.emplace(), RTA_DATA(field),
+                                            sizeof(uint32_t));
+                            }
                         }
                     }
                 }
@@ -885,6 +900,52 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
     ASSERT_EQ(waitpid(child, &status, 0), child);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RtnetlinkBridgeVethSemantics, ExplicitDisabledStpRoundTrips) {
+    RouteFd route;
+    ASSERT_GE(route.fd, 0);
+    const std::string name = UniqueName("stp");
+    const uint32_t disabled = 0;
+    std::vector<uint8_t> data;
+    AppendAttr(data, IFLA_BR_STP_STATE, &disabled, sizeof(disabled));
+    LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4920);
+    ASSERT_TRUE(create.name(name));
+    AddKind(create, "bridge", data);
+    ASSERT_EQ(SendAck(route.fd, create), 0);
+    CleanupLinks cleanup{route.fd, name, {}, {}};
+    const auto before = QueryLink(route.fd, name, 4921);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->bridge_stp_state, disabled);
+    ASSERT_EQ(SetLinkUp(route.fd, before->index, true, 4925), 0);
+    RouteFd listener(RTMGRP_LINK);
+    ASSERT_GE(listener.fd, 0);
+
+    const uint32_t enabled = 1;
+    const std::array<uint32_t, 2> disabled_with_padding{0, 0};
+    data.clear();
+    AppendAttr(data, IFLA_BR_STP_STATE, &enabled, sizeof(enabled));
+    AppendAttr(data, IFLA_BR_STP_STATE, disabled_with_padding.data(),
+               sizeof(disabled_with_padding));
+    LinkRequest update(RTM_NEWLINK, 0, 4922);
+    update.body()->ifi_index = before->index;
+    AddKind(update, "bridge", data);
+    ASSERT_EQ(SendAck(route.fd, update), 0);
+    EXPECT_TRUE(WaitForLinkOperstate(listener.fd, RTM_NEWLINK, before->index).has_value());
+
+    data.clear();
+    const uint8_t short_state = 0;
+    AppendAttr(data, IFLA_BR_STP_STATE, &short_state, sizeof(short_state));
+    LinkRequest invalid(RTM_NEWLINK, 0, 4923);
+    invalid.body()->ifi_index = before->index;
+    const uint32_t new_mtu = before->mtu + 1;
+    ASSERT_TRUE(invalid.add(IFLA_MTU, &new_mtu, sizeof(new_mtu)));
+    AddKind(invalid, "bridge", data);
+    EXPECT_EQ(SendAck(route.fd, invalid), ERANGE);
+    const auto after = QueryLink(route.fd, name, 4924);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->bridge_stp_state, disabled);
+    EXPECT_EQ(after->mtu, before->mtu);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, CreateAndUpBridgeWithNonemptyFibInSingleRequest) {

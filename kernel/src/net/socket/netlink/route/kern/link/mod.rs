@@ -1,3 +1,4 @@
+mod bridge_info;
 mod bridge_port;
 mod create;
 mod query;
@@ -190,10 +191,14 @@ fn find_iface_for_link(
             .cloned()
             .ok_or(SystemError::ENODEV);
     }
-    let name = request_segment.attrs().iter().find_map(|attr| match attr {
-        LinkAttr::Name(name) => name.to_str().ok(),
-        _ => None,
-    });
+    let name = request_segment
+        .attrs()
+        .iter()
+        .rev()
+        .find_map(|attr| match attr {
+            LinkAttr::Name(name) => name.to_str().ok(),
+            _ => None,
+        });
     let name = name.ok_or(SystemError::EINVAL)?;
     netns
         .device_list()
@@ -296,6 +301,7 @@ pub(super) fn do_set_link(
         bridge_port::set_hairpin(rtnl, request_segment, source_netns)?;
         return Ok(Vec::new());
     }
+    let mut notify_stp = false;
     if request_segment
         .attrs()
         .iter()
@@ -303,13 +309,17 @@ pub(super) fn do_set_link(
     {
         let iface = find_iface_for_link(request_segment, &source_netns)?;
         let (kind, data) = linkinfo(request_segment)?;
-        let matches_kind = match kind {
-            "bridge" => iface.as_any_ref().is::<BridgeIface>(),
-            "veth" => iface.as_any_ref().is::<VethInterface>(),
-            _ => false,
-        };
-        if !matches_kind || data.is_some_and(|data| !data.is_empty()) {
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        match kind {
+            "bridge" if iface.as_any_ref().is::<BridgeIface>() => {
+                if let Some(data) = data {
+                    notify_stp = bridge_info::validate_settings(data)?
+                        && request_segment.header().type_ == CSegmentType::NEWLINK as u16;
+                }
+            }
+            "veth"
+                if iface.as_any_ref().is::<VethInterface>()
+                    && data.is_none_or(<[u8]>::is_empty) => {}
+            _ => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
         }
     }
     let netns_fd = request_segment
@@ -421,13 +431,14 @@ pub(super) fn do_set_link(
         }
     };
     let iface = committed.iface.clone();
-    let notify_mac = mac_changed && committed.changes.is_empty();
+    let notify_settings = committed.changes.is_empty()
+        && (mac_changed || (notify_stp && iface.flags().contains(InterfaceFlags::UP)));
     notify_link_commit(&target_netns, committed);
     if let Some(peer_carrier) = peer_carrier {
         peer_carrier.notify_if_changed();
     }
     BridgeCarrierSnapshot::notify_related(bridge_carriers);
-    if notify_mac {
+    if notify_settings {
         notify_link_change(&iface);
     }
     if let Some(master_index) = master_index {
@@ -577,13 +588,8 @@ fn parse_setlink_attrs(
             LinkAttr::Master(_)
             | LinkAttr::NetNsFd(_)
             | LinkAttr::NetNsPid(_)
-            | LinkAttr::Address(_) => {}
-            LinkAttr::LinkInfo(_) => {
-                let (_, data) = linkinfo(request_segment)?;
-                if data.is_some_and(|data| !data.is_empty()) {
-                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-                }
-            }
+            | LinkAttr::Address(_)
+            | LinkAttr::LinkInfo(_) => {}
             LinkAttr::NewIfIndex(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
             LinkAttr::Allmulti(_) => return Err(SystemError::EINVAL),
             LinkAttr::Promiscuity(_) | LinkAttr::LinkMode(_) | LinkAttr::ExtMask(_) => {}

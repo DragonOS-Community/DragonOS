@@ -193,27 +193,12 @@ pub(crate) fn do_new_link(
                 .cloned()
         })
     };
-    if let Some(existing) = existing {
+    if existing.is_some() {
         if flags.contains(NewRequestFlags::EXCL) {
             return Err(SystemError::EEXIST);
         }
         if flags.contains(NewRequestFlags::REPLACE) {
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-        }
-        if request
-            .attrs()
-            .iter()
-            .any(|attr| matches!(attr, LinkAttr::LinkInfo(_)))
-        {
-            let (kind, data) = linkinfo(request)?;
-            let matching_kind = match kind {
-                "bridge" => existing.as_any_ref().is::<BridgeIface>(),
-                "veth" => existing.as_any_ref().is::<VethInterface>(),
-                _ => false,
-            };
-            if !matching_kind || data.is_some_and(|data| !data.is_empty()) {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-            }
         }
         return do_set_link(rtnl, request, context);
     }
@@ -254,8 +239,8 @@ pub(crate) fn do_new_link(
     };
     let (iface, mut peer) = match kind {
         "bridge" => {
-            if info_data.is_some_and(|data| !data.is_empty()) {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            if let Some(data) = info_data {
+                bridge_info::validate_settings(data)?;
             }
             (
                 crate::net::link::topology::create_bridge(rtnl, &target_netns, &name)?,

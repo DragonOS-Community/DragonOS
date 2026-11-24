@@ -303,6 +303,7 @@ impl DumpSession {
                     entry,
                     route::RouteReply::Configuration,
                     0,
+                    None,
                 )?)))
             }
             RouteNlSegment::GetNeigh(request) => {

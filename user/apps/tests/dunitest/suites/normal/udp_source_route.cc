@@ -191,6 +191,155 @@ TEST(UdpIpv6SourcePrefix, ExplicitAndAutomaticSourcesUseTheSameRoute) {
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
+TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            uint32_t seq = 1;
+            const unsigned lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, ++seq), 0);
+
+            constexpr uint16_t request = NLM_F_REQUEST | NLM_F_ACK;
+            constexpr uint16_t add = request | NLM_F_CREATE | NLM_F_EXCL;
+            constexpr char egress_name[] = "out89";
+            constexpr char peer_name[] = "veth0";
+            const struct {
+                rtattr header;
+                char kind[RTA_ALIGN(sizeof("veth"))];
+            } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+            alignas(nlmsghdr) char link_request[128] = {};
+            auto* link = reinterpret_cast<nlmsghdr*>(link_request);
+            link->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+            link->nlmsg_type = RTM_NEWLINK;
+            link->nlmsg_flags = add;
+            link->nlmsg_seq = ++seq;
+            AddAttr(link, sizeof(link_request), IFLA_IFNAME, egress_name, sizeof(egress_name));
+            AddAttr(link, sizeof(link_request), IFLA_LINKINFO, &link_info, sizeof(link_info));
+            ASSERT_EQ(send(route.Get(), link, link->nlmsg_len, 0),
+                      static_cast<ssize_t>(link->nlmsg_len));
+            ASSERT_EQ(RecvAck(route.Get(), seq), 0);
+            const unsigned egress = if_nametoindex(egress_name);
+            const unsigned peer = if_nametoindex(peer_name);
+            ASSERT_NE(egress, 0u);
+            ASSERT_NE(peer, 0u);
+            for (const char* name : {egress_name, peer_name}) {
+                const auto path = std::string("/proc/sys/net/ipv6/conf/") + name + "/addr_gen_mode";
+                FdGuard mode(open(path.c_str(), O_WRONLY));
+                ASSERT_GE(mode.Get(), 0) << ErrnoString(errno);
+                ASSERT_EQ(write(mode.Get(), "1\n", 2), 2);
+            }
+            ASSERT_EQ(SetLinkUp(route.Get(), peer, true, ++seq), 0);
+            ASSERT_EQ(SetLinkUp(route.Get(), egress, true, ++seq), 0);
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fd89:2::", 64,
+                                           egress, RT_SCOPE_UNIVERSE, ++seq), 0);
+
+            sockaddr_in6 destination{};
+            destination.sin6_family = AF_INET6;
+            destination.sin6_port = htons(23089);
+            ASSERT_EQ(inet_pton(AF_INET6, "fd89:2::2", &destination.sin6_addr), 1);
+
+            FdGuard packets(socket(AF_PACKET, SOCK_DGRAM | SOCK_NONBLOCK, htons(ETH_P_IPV6)));
+            FdGuard control(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(packets.Get(), 0);
+            ASSERT_GE(control.Get(), 0);
+            sockaddr_ll link_peer{};
+            link_peer.sll_family = AF_PACKET;
+            link_peer.sll_protocol = htons(ETH_P_IPV6);
+            link_peer.sll_ifindex = peer;
+            ASSERT_EQ(bind(packets.Get(), reinterpret_cast<sockaddr*>(&link_peer),
+                           sizeof(link_peer)), 0);
+            ifreq hardware{};
+            std::memcpy(hardware.ifr_name, peer_name, sizeof(peer_name));
+            ASSERT_EQ(ioctl(control.Get(), SIOCGIFHWADDR, &hardware), 0);
+            alignas(nlmsghdr) char neighbor_request[128] = {};
+            auto* neighbor = reinterpret_cast<nlmsghdr*>(neighbor_request);
+            neighbor->nlmsg_len = NLMSG_LENGTH(sizeof(ndmsg));
+            neighbor->nlmsg_type = RTM_NEWNEIGH;
+            neighbor->nlmsg_flags = add;
+            neighbor->nlmsg_seq = ++seq;
+            auto* entry = reinterpret_cast<ndmsg*>(NLMSG_DATA(neighbor));
+            entry->ndm_family = AF_INET6;
+            entry->ndm_ifindex = egress;
+            entry->ndm_state = NUD_PERMANENT;
+            AddAttr(neighbor, sizeof(neighbor_request), NDA_DST, &destination.sin6_addr,
+                    sizeof(destination.sin6_addr));
+            AddAttr(neighbor, sizeof(neighbor_request), NDA_LLADDR, hardware.ifr_hwaddr.sa_data,
+                    ETH_ALEN);
+            ASSERT_EQ(send(route.Get(), neighbor, neighbor->nlmsg_len, 0),
+                      static_cast<ssize_t>(neighbor->nlmsg_len));
+            ASSERT_EQ(RecvAck(route.Get(), seq), 0);
+
+            auto address = [&](uint16_t type, const char* text, unsigned device, uint8_t scope) {
+                return SendIpv6AddrRequest(route.Get(), type, type == RTM_NEWADDR ? add : request,
+                                           device, text, 64, ++seq, scope);
+            };
+            auto exercise = [&](const char* expected_text) {
+                SCOPED_TRACE(expected_text);
+                in6_addr expected{};
+                ASSERT_EQ(inet_pton(AF_INET6, expected_text, &expected), 1);
+                FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+                ASSERT_GE(sender.Get(), 0);
+                ASSERT_EQ(setsockopt(sender.Get(), SOL_SOCKET, SO_BINDTODEVICE, egress_name,
+                                     sizeof(egress_name)), 0) << ErrnoString(errno);
+                ASSERT_EQ(connect(sender.Get(), reinterpret_cast<sockaddr*>(&destination),
+                                  sizeof(destination)), 0) << ErrnoString(errno);
+                sockaddr_in6 source{};
+                socklen_t len = sizeof(source);
+                ASSERT_EQ(getsockname(sender.Get(), reinterpret_cast<sockaddr*>(&source), &len), 0);
+                EXPECT_EQ(std::memcmp(&source.sin6_addr, &expected, sizeof(expected)), 0);
+
+                constexpr ssize_t kUdpPayloadOffset = 48;
+                for (const char byte : {'a', 'b'}) {
+                    ASSERT_EQ(send(sender.Get(), &byte, 1, 0), 1) << ErrnoString(errno);
+                    bool observed = false;
+                    for (int attempt = 0; attempt < 20 && !observed; ++attempt) {
+                        pollfd ready{packets.Get(), POLLIN, 0};
+                        if (poll(&ready, 1, 100) != 1) continue;
+                        char packet[256];
+                        const ssize_t received = recv(packets.Get(), packet, sizeof(packet), 0);
+                        if (received == kUdpPayloadOffset + 1 && packet[6] == IPPROTO_UDP &&
+                            packet[kUdpPayloadOffset] == byte) {
+                            EXPECT_EQ(std::memcmp(packet + 8, &expected, sizeof(expected)), 0);
+                            observed = true;
+                        }
+                    }
+                    ASSERT_TRUE(observed);
+                }
+            };
+
+            ASSERT_NO_FATAL_FAILURE(exercise("::1"));
+            ASSERT_EQ(address(RTM_NEWADDR, "fd89:1::1", lo, RT_SCOPE_UNIVERSE), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, "fe80::89", egress, RT_SCOPE_LINK), 0);
+            ASSERT_NO_FATAL_FAILURE(exercise("fd89:1::1"));
+            ASSERT_EQ(address(RTM_DELADDR, "fd89:1::1", lo, RT_SCOPE_UNIVERSE), 0);
+            ASSERT_EQ(address(RTM_DELADDR, "fe80::89", egress, RT_SCOPE_LINK), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, "fe80::89", lo, RT_SCOPE_LINK), 0);
+            ASSERT_NO_FATAL_FAILURE(exercise("fe80::89"));
+
+            FdGuard scoped(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(scoped.Get(), 0);
+            sockaddr_in6 fixed{};
+            fixed.sin6_family = AF_INET6;
+            fixed.sin6_scope_id = lo;
+            ASSERT_EQ(inet_pton(AF_INET6, "fe80::89", &fixed.sin6_addr), 1);
+            ASSERT_EQ(bind(scoped.Get(), reinterpret_cast<sockaddr*>(&fixed), sizeof(fixed)), 0);
+            ASSERT_EQ(connect(scoped.Get(), reinterpret_cast<sockaddr*>(&destination),
+                              sizeof(destination)), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+        }();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 // Match ip6_dst_lookup_tail: automatic source selection can fail before a
 // missing route is reported. Keep missing-source and missing-route errors apart.
 class UdpIpv6MissingSource : public testing::TestWithParam<bool> {};

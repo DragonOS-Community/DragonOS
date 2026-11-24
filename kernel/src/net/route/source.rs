@@ -402,6 +402,8 @@ pub(crate) fn resolve_ipv6_socket_route(
         SystemError::ENETUNREACH
     };
     let explicit_local = selected.matched.is_explicit_ipv6_local();
+    let uses_routed_source_selection =
+        explicit_local || selected.matched.kind == super::RTN_UNICAST;
     let scoped_destination = destination_v6.is_loopback()
         || destination_v6.is_unicast_link_local()
         || destination_v6.is_multicast();
@@ -411,31 +413,36 @@ pub(crate) fn resolve_ipv6_socket_route(
         });
         if !local
             || super::is_ipv6_link_local(source.into())
-                && (!explicit_local || scoped_destination)
+                && (!uses_routed_source_selection || scoped_destination)
                 && !crate::net::address::iface_accepts_local_address(egress, source.into())
         {
             return Err(SystemError::EADDRNOTAVAIL);
         }
         (source, None)
-    } else if explicit_local && matches!(selected.source, RouteSourcePolicy::SelectConfigured) {
+    } else if uses_routed_source_selection
+        && !destination_v6.is_unspecified()
+        && matches!(selected.source, RouteSourcePolicy::SelectConfigured)
+    {
         let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
-        let (_, source, owner) = devices
-            .values()
-            .filter_map(|iface| {
-                let on_route_device = iface.nic_id() == selected.oif as usize;
-                if scoped_destination && !on_route_device {
-                    return None;
-                }
-                let (score, source) = iface.smol_iface().lock().ipv6_source_candidate_at(
-                    &destination_v6,
-                    now,
-                    Some(on_route_device),
-                )?;
-                Some((score, source, iface))
-            })
-            .max_by(|left, right| left.0.cmp(&right.0))
-            .ok_or(SystemError::EADDRNOTAVAIL)?;
-        (source, Some(Arc::clone(owner)))
+        let candidate_on = |iface: &Arc<dyn Iface>| {
+            let index = iface.nic_id();
+            let (score, source) = iface.smol_iface().lock().ipv6_source_candidate_at(
+                &destination_v6,
+                now,
+                Some(index == selected.oif as usize),
+            )?;
+            Some((score, source, index))
+        };
+        let candidate = if scoped_destination {
+            candidate_on(egress)
+        } else {
+            devices
+                .values()
+                .filter_map(candidate_on)
+                .max_by(|left, right| left.0.cmp(&right.0))
+        };
+        let (_, source, index) = candidate.ok_or(SystemError::EADDRNOTAVAIL)?;
+        (source, devices.get(&index).cloned())
     } else {
         let candidate = match selected.source {
             super::RouteSourcePolicy::Preferred(source) => Some(source),

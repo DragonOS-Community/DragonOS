@@ -121,7 +121,12 @@ impl Attribute for AddrAttr {
             (AddrAttrClass::LABEL, _) => AddrAttr::Label(buf.to_vec()),
             (AddrAttrClass::BROADCAST, _) => AddrAttr::Broadcast(buf.to_vec()),
             (AddrAttrClass::FLAGS, _) => AddrAttr::Flags(buf.to_vec()),
-            (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL, _) => {
+            (AddrAttrClass::CACHEINFO, 16..) => {
+                let mut cache = [0; 16];
+                cache.copy_from_slice(&buf[..16]);
+                AddrAttr::CacheInfo(cache)
+            }
+            (AddrAttrClass::ADDRESS | AddrAttrClass::LOCAL | AddrAttrClass::CACHEINFO, _) => {
                 log::warn!(
                     "address attribute `{:?}` contains invalid payload",
                     addr_class

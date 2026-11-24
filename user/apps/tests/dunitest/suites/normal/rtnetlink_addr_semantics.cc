@@ -72,6 +72,7 @@ struct DumpedAddress {
     uint8_t prefix_len = 0;
     uint32_t ifindex = 0;
     uint32_t flags = 0;
+    std::optional<ifa_cacheinfo> cache_info;
     bool has_label = false;
     std::string label;
     bool has_broadcast = false;
@@ -250,7 +251,8 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
                   const char* label = nullptr,
                   std::optional<size_t> label_length = std::nullopt,
                   const std::vector<uint8_t>* broadcast = nullptr,
-                  std::optional<uint32_t> ipv6_flags = std::nullopt) {
+                  std::optional<uint32_t> ipv6_flags = std::nullopt,
+                  const ifa_cacheinfo* cache_info = nullptr) {
     auto request = NewRequest<ifaddrmsg>(type, flags, sequence);
     auto* message = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(request.data()));
     message->ifa_family = address.family;
@@ -272,6 +274,9 @@ int ChangeAddress(int fd, uint16_t type, uint16_t flags, const AddressSpec& addr
     }
     if (ipv6_flags.has_value()) {
         AddAttr(&request, IFA_FLAGS, &*ipv6_flags, sizeof(*ipv6_flags));
+    }
+    if (cache_info != nullptr) {
+        AddAttr(&request, IFA_CACHEINFO, cache_info, sizeof(*cache_info));
     }
     return SendAndReceiveAck(fd, request);
 }
@@ -327,6 +332,11 @@ int DumpAddresses(int fd, int family, uint32_t sequence, std::vector<DumpedAddre
                  attr = RTA_NEXT(attr, attr_length)) {
                 if (attr->rta_type == IFA_FLAGS && RTA_PAYLOAD(attr) >= sizeof(address.flags)) {
                     std::memcpy(&address.flags, RTA_DATA(attr), sizeof(address.flags));
+                    continue;
+                }
+                if (attr->rta_type == IFA_CACHEINFO && RTA_PAYLOAD(attr) >= sizeof(ifa_cacheinfo)) {
+                    auto& cache = address.cache_info.emplace();
+                    std::memcpy(&cache, RTA_DATA(attr), sizeof(cache));
                     continue;
                 }
                 if (attr->rta_type == IFA_LABEL) {
@@ -724,9 +734,10 @@ int RunManualIpv6Dad() {
     auto duplicate = duplicate_peer;
     duplicate.ifindex = edge;
     duplicate.ipv6_flags = 0;
-    auto add = [&](const AddressSpec& address, std::optional<uint32_t> flags = std::nullopt) {
+    auto add = [&](const AddressSpec& address, std::optional<uint32_t> flags = std::nullopt,
+                   const ifa_cacheinfo* cache = nullptr) {
         return ChangeAddress(fd.Get(), RTM_NEWADDR, kCreate, address, true, true, ++sequence,
-                             nullptr, std::nullopt, nullptr, flags);
+                             nullptr, std::nullopt, nullptr, flags, cache);
     };
     auto flags_for = [&](const AddressSpec& expected) -> std::optional<uint32_t> {
         std::vector<DumpedAddress> addresses;
@@ -770,13 +781,24 @@ int RunManualIpv6Dad() {
     if (const int error = add(generated); error != 0) return 1300 + error;
     if (const int error = SetLinkUp(fd.Get(), peer, ++sequence); error != 0) return 1400 + error;
     if (const int error = SetLinkUp(fd.Get(), edge, ++sequence); error != 0) return 1600 + error;
+    const auto temporary_peer = MakeAddress(AF_INET6, "fd50:2324::8", 80, peer);
+    auto temporary_duplicate = temporary_peer;
+    temporary_duplicate.ifindex = edge;
+    temporary_duplicate.ipv6_flags = 0;
+    constexpr ifa_cacheinfo finite_dad{10, 12, 0, 0};
+    if (add(temporary_peer) != 0 || add(temporary_duplicate, std::nullopt, &finite_dad) != 0) {
+        return 1750;
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
     bool completed_dad = false;
     while (std::chrono::steady_clock::now() < deadline) {
         const auto completed = flags_for(ordinary);
         const auto failed = flags_for(duplicate);
         if (!completed || !failed) return 1800;
-        if (!(*completed & IFA_F_TENTATIVE) && (*failed & IFA_F_DADFAILED)) {
+        const int temporary_count = CountAddress(fd.Get(), temporary_duplicate, ++sequence);
+        if (temporary_count < 0) return 1806;
+        if (!(*completed & IFA_F_TENTATIVE) && (*failed & IFA_F_DADFAILED) &&
+            temporary_count == 0) {
             if (BindUdp(ordinary, 0) != 0) return 1801;
             if (CountAddressNotifications(notifications.Get(), RTM_NEWADDR, ordinary) != 1) return 1805;
             if (const int error = ChangeAddress(fd.Get(), RTM_DELADDR, kRequest, duplicate_peer,
@@ -850,7 +872,123 @@ int RunManualIpv6Dad() {
     if (!pending || !(*pending & IFA_F_TENTATIVE) ||
         BindUdp(after_admin_down, 0) != EADDRNOTAVAIL)
         return 3410;
-    return 0;
+
+    auto expires_without_carrier = MakeAddress(AF_INET6, "fd50:2324::9", 80, edge);
+    expires_without_carrier.ipv6_flags = 0;
+    constexpr ifa_cacheinfo expires_tentative{1, 2, 0, 0};
+    if (add(expires_without_carrier, std::nullopt, &expires_tentative) != 0) return 3420;
+    const auto initially_pending = flags_for(expires_without_carrier);
+    if (!initially_pending || !(*initially_pending & IFA_F_TENTATIVE)) return 3430;
+    const auto expires_limit = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < expires_limit) {
+        const int count = CountAddress(fd.Get(), expires_without_carrier, ++sequence);
+        if (count < 0) return 3440;
+        if (count == 0) {
+            return CountAddressNotifications(notifications.Get(), RTM_DELADDR,
+                                             expires_without_carrier) == 1 ? 0 : 3450;
+        }
+        usleep(20 * 1000);
+    }
+    return 3460;
+}
+
+int RunManualIpv6Lifetimes() {
+    FdGuard fd;
+    uint32_t lo = 0;
+    uint32_t sequence = 6000;
+    if (const int error = PrepareNamespace(&fd, &lo, &sequence); error != 0) return error;
+    FdGuard notifications(OpenRouteSocket(RTMGRP_IPV6_IFADDR));
+    if (notifications.Get() < 0) return 100;
+
+    const auto stable = MakeAddress(AF_INET6, "fd81:2324::1", 64, lo);
+    const auto finite = MakeAddress(AF_INET6, "fd81:2324::2", 64, lo);
+    const auto absent = MakeAddress(AF_INET6, "fd81:2324::3", 64, lo);
+    constexpr uint16_t kRequest = NLM_F_REQUEST | NLM_F_ACK;
+    constexpr uint16_t kAdd = kRequest | NLM_F_CREATE | NLM_F_EXCL;
+    constexpr uint16_t kReplace = kRequest | NLM_F_REPLACE;
+    auto configure = [&](const AddressSpec& addr, uint16_t action, const ifa_cacheinfo* cache) {
+        return ChangeAddress(fd.Get(), RTM_NEWADDR, action, addr, true, true, ++sequence,
+                             nullptr, std::nullopt, nullptr, std::nullopt, cache);
+    };
+    auto read_finite = [&]() -> std::optional<DumpedAddress> {
+        std::vector<DumpedAddress> addresses;
+        if (DumpAddresses(fd.Get(), AF_INET6, ++sequence, &addresses) != 0) return std::nullopt;
+        for (const auto& entry : addresses) {
+            if (entry.ifindex == lo && SameAddress(entry.local, finite.local)) return entry;
+        }
+        return std::nullopt;
+    };
+
+    constexpr ifa_cacheinfo invalid_order{4, 3, 0, 0};
+    constexpr ifa_cacheinfo invalid_zero{0, 0, 0, 0};
+    if (configure(stable, kAdd, nullptr) != 0 ||
+        configure(absent, kAdd, &invalid_order) != EINVAL ||
+        configure(absent, kAdd, &invalid_zero) != EINVAL) {
+        return 110;
+    }
+    constexpr ifa_cacheinfo deprecated{0, 9, UINT32_MAX, UINT32_MAX};
+    if (configure(finite, kAdd, &deprecated) != 0) return 120;
+    if (configure(finite, kAdd, &deprecated) != EEXIST ||
+        configure(finite, kReplace, &invalid_order) != EINVAL) {
+        return 130;
+    }
+    const auto before = read_finite();
+    if (!before || !before->cache_info ||
+        before->cache_info->ifa_prefered != 0 ||
+        before->cache_info->ifa_valid == 0 || before->cache_info->ifa_valid > 9 ||
+        before->cache_info->cstamp == UINT32_MAX ||
+        !(before->flags & IFA_F_DEPRECATED) || (before->flags & IFA_F_PERMANENT) ||
+        BindUdp(finite, 0) != 0) {
+        return 140;
+    }
+
+    if (configure(finite, kReplace, nullptr) != 0) return 150;
+    const auto forever = read_finite();
+    if (!forever || !forever->cache_info ||
+        forever->cache_info->ifa_prefered != UINT32_MAX ||
+        forever->cache_info->ifa_valid != UINT32_MAX ||
+        forever->cache_info->cstamp != before->cache_info->cstamp ||
+        !(forever->flags & IFA_F_PERMANENT) || (forever->flags & IFA_F_DEPRECATED)) {
+        return 160;
+    }
+    constexpr ifa_cacheinfo preferred_only{0, UINT32_MAX, 0, 0};
+    if (configure(finite, kReplace, &preferred_only) != 0) return 170;
+    const auto permanent_deprecated = read_finite();
+    if (!permanent_deprecated ||
+        !(permanent_deprecated->flags & IFA_F_PERMANENT) ||
+        !(permanent_deprecated->flags & IFA_F_DEPRECATED)) {
+        return 180;
+    }
+
+    constexpr ifa_cacheinfo short_lived{1, 4, 0, 0};
+    if (configure(finite, kReplace, &short_lived) != 0) return 190;
+    DrainNotifications(notifications.Get());
+    const auto deprecation_limit = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    int deprecations = 0;
+    while (deprecations == 0 && std::chrono::steady_clock::now() < deprecation_limit) {
+        deprecations = CountAddressNotifications(notifications.Get(), RTM_NEWADDR, finite);
+    }
+    const auto after_preferred = read_finite();
+    if (deprecations != 1 || !after_preferred || !after_preferred->cache_info ||
+        after_preferred->cache_info->ifa_prefered != 0 ||
+        !(after_preferred->flags & IFA_F_DEPRECATED) || BindUdp(finite, 0) != 0) {
+        return 195;
+    }
+
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < limit) {
+        const int count = CountAddress(fd.Get(), finite, ++sequence);
+        if (count < 0) return 200;
+        if (count == 0) {
+            if (CountAddressNotifications(notifications.Get(), RTM_DELADDR, finite) != 1 ||
+                BindUdp(finite, 0) != EADDRNOTAVAIL || BindUdp(stable, 0) != 0) {
+                return 210;
+            }
+            return 0;
+        }
+        usleep(20 * 1000);
+    }
+    return 220;
 }
 
 int RunMultipleAddressConsistency() {
@@ -1677,6 +1815,11 @@ void ExpectSuccessfulChild(const ChildOutcome& outcome, const char* timeout_mess
 TEST(RtnetlinkAddressSemantics, ManualIpv6DadHonorsFlagsAndLinkReadiness) {
     ExpectSuccessfulChild(RunWithWatchdog(RunManualIpv6Dad),
                           "manual IPv6 duplicate address detection hung");
+}
+
+TEST(RtnetlinkAddressSemantics, ManualIpv6LifetimesReplaceDeprecateAndExpire) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunManualIpv6Lifetimes),
+                          "manual IPv6 address lifetime processing hung");
 }
 
 TEST(RtnetlinkAddressSemantics, MultipleAddressesStayConsistentAcrossAddrRouteAndDataPlane) {

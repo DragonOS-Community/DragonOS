@@ -23,7 +23,7 @@ use crate::net::{
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::time::Instant;
 
-use super::{ipv6_router_solicitation as solicitation, ipv6_slaac};
+use super::{ipv6_lifetime, ipv6_router_solicitation as solicitation};
 
 const RETRANS_US: i64 = 1_000_000;
 pub(super) const RETRY_US: i64 = 100_000;
@@ -273,13 +273,16 @@ pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
             break;
         };
         cursor = index + 1;
-        if iface.type_() != InterfaceType::ETHER {
-            continue;
-        }
         let now = Instant::now().total_micros();
-        let lifetime_due = ipv6_slaac::poll(&rtnl, netns, &iface, now);
-        let dad_due = poll_device(&rtnl, netns, &iface, now);
-        let solicitation_due = solicitation::poll(netns, &iface);
+        let lifetime_due = ipv6_lifetime::poll(&rtnl, netns, &iface, now);
+        let (dad_due, solicitation_due) = if iface.type_() == InterfaceType::ETHER {
+            (
+                poll_device(&rtnl, netns, &iface, now),
+                solicitation::poll(netns, &iface),
+            )
+        } else {
+            (None, None)
+        };
         if let Some(due) = lifetime_due
             .into_iter()
             .chain(dad_due)
@@ -409,7 +412,7 @@ pub(super) fn start_address_dad(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
     address: Ipv6Cidr,
-    lifetimes: Option<ipv6_slaac::Lifetimes>,
+    lifetimes: Option<ipv6_lifetime::Lifetimes>,
     now: i64,
 ) -> Result<(), SystemError> {
     let cidr = IpCidr::Ipv6(address);
@@ -510,13 +513,13 @@ fn finish_address(
     } else {
         DadState::Usable
     };
-    let (old_state, lifetimes) = iface
+    let (old_state, lifetimes, permanent) = iface
         .common()
         .address_metadata()
         .lock()
         .iter()
         .find(|entry| entry.cidr == cidr)
-        .map(|entry| (entry.state, entry.lifetimes))
+        .map(|entry| (entry.state, entry.lifetimes, entry.ipv6_permanent))
         .ok_or(SystemError::EADDRNOTAVAIL)?;
     let address_state = match old_state {
         AddressState::Slaac(_) => {
@@ -524,10 +527,14 @@ fn finish_address(
                 || lifetimes
                     .is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros()))
             {
-                ipv6_slaac::remove(rtnl, netns, iface, cidr)?;
+                ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
                 return Ok(true);
             }
             AddressState::Slaac(state)
+        }
+        AddressState::ManualDad(_) if observed.conflict && !permanent => {
+            ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
+            return Ok(true);
         }
         AddressState::ManualDad(_) if state == DadState::Usable => AddressState::Configured,
         AddressState::ManualDad(_) => AddressState::ManualDad(state),
@@ -535,7 +542,7 @@ fn finish_address(
     };
     let prepared = super::prepare_automatic_address(netns, iface, cidr, address_state, lifetimes)?;
     if lifetimes.is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros())) {
-        ipv6_slaac::remove(rtnl, netns, iface, cidr)?;
+        ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
         return Ok(true);
     }
     {

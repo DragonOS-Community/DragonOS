@@ -449,7 +449,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         if link_down || mtu.is_some_and(|mtu| mtu < super::address::IPV6_MIN_MTU) {
             super::address::ipv6_autoconf::cancel(iface.common());
         } else if was_up != is_up || mtu.is_some() || noarp_changed {
-            super::address::ipv6_autoconf::changed(iface.common());
+            super::address::ipv6_autoconf::link_changed(iface.common(), iface.operstate());
             if !was_up && is_up {
                 super::address::ipv6_router_solicitation::link_up(iface.as_ref());
             }

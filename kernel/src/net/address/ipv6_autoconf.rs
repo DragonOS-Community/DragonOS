@@ -29,16 +29,9 @@ const RETRANS_US: i64 = 1_000_000;
 pub(super) const RETRY_US: i64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeCarrier {
-    Automatic,
-    ManualWaiting,
-    ManualStarted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     address: Ipv6Cidr,
-    carrier: ProbeCarrier,
+    manual: bool,
     nonce: [u8; 6],
     due: i64,
     remaining: u32,
@@ -51,16 +44,13 @@ impl Probe {
         self.address.address()
     }
 
-    fn can_progress(&self, carrier: bool, skip: bool) -> bool {
-        !self.failed
-            && (carrier
-                || self.conflict
-                || skip
-                || match self.carrier {
-                    ProbeCarrier::Automatic => self.target().is_link_local(),
-                    ProbeCarrier::ManualWaiting => false,
-                    ProbeCarrier::ManualStarted => true,
-                })
+    fn can_progress(&self, carrier: bool, dad_ready: bool, skip: bool) -> bool {
+        let link_ready = if self.manual {
+            dad_ready
+        } else {
+            carrier || self.target().is_link_local()
+        };
+        !self.failed && (link_ready || self.conflict || skip)
     }
 }
 
@@ -117,6 +107,7 @@ pub(crate) struct DeviceState {
     accept_dad: i32,
     dad_transmits: i32,
     ready_seen: bool,
+    dad_ready: bool,
     retry: Option<i64>,
     probes: Vec<Probe>,
 }
@@ -130,6 +121,7 @@ impl Default for DeviceState {
             accept_dad: 1,
             dad_transmits: 1,
             ready_seen: false,
+            dad_ready: false,
             retry: None,
             probes: Vec::new(),
         }
@@ -177,11 +169,30 @@ pub(crate) fn changed(common: &IfaceCommon) {
     }
 }
 
+/// Publish IPv6 readiness on link events so a brief carrier-up interval
+/// counts even if the DAD worker has not yet polled the device.
+pub(crate) fn link_changed(common: &IfaceCommon, operstate: Operstate) {
+    if matches!(
+        operstate,
+        Operstate::IF_OPER_UP | Operstate::IF_OPER_UNKNOWN
+    ) {
+        let mut state = common.ipv6_autoconf.lock();
+        if common.flags().contains(InterfaceFlags::UP)
+            && common.ipv6_enabled()
+            && common.mtu() >= super::IPV6_MIN_MTU
+        {
+            state.dad_ready = true;
+        }
+    }
+    changed(common);
+}
+
 pub(crate) fn cancel(common: &IfaceCommon) {
     let probes = {
         let mut state = common.ipv6_autoconf.lock();
         state.retry = None;
         state.ready_seen = false;
+        state.dad_ready = false;
         state.solicitation.link_reset();
         core::mem::take(&mut state.probes)
     };
@@ -295,13 +306,14 @@ fn poll_device(
     }
     let carrier = carrier_ready(iface.as_ref());
     let common = iface.common();
-    let (start, accept_dad) = {
-        let state = common.ipv6_autoconf.lock();
+    let (start, accept_dad, dad_ready) = {
+        let mut state = common.ipv6_autoconf.lock();
+        state.dad_ready |= carrier;
         let start = carrier
             && state.mode == 0
             && !state.ready_seen
             && state.retry.is_none_or(|due| due <= now);
-        (start, state.accept_dad)
+        (start, state.accept_dad, state.dad_ready)
     };
     if start {
         let result = start_address(netns, iface, now);
@@ -317,21 +329,9 @@ fn poll_device(
     let skip = iface.flags().contains(InterfaceFlags::NOARP);
     let mut index = 0;
     loop {
-        let probe = common
-            .ipv6_autoconf
-            .lock()
-            .probes
-            .get_mut(index)
-            .map(|probe| {
-                // A carrier change after DAD has started does not reset IPv6
-                // readiness. Administrative down still cancels the probe.
-                if carrier && probe.carrier == ProbeCarrier::ManualWaiting {
-                    probe.carrier = ProbeCarrier::ManualStarted;
-                }
-                *probe
-            });
+        let probe = common.ipv6_autoconf.lock().probes.get(index).copied();
         let Some(probe) = probe else { break };
-        if !probe.can_progress(carrier, skip) {
+        if !probe.can_progress(carrier, dad_ready, skip) {
             index += 1;
             continue;
         }
@@ -370,7 +370,7 @@ fn poll_device(
             state
                 .probes
                 .iter()
-                .filter(|probe| probe.can_progress(carrier, skip))
+                .filter(|probe| probe.can_progress(carrier, dad_ready, skip))
                 .map(|probe| if probe.conflict { now } else { probe.due }),
         )
         .min()
@@ -433,14 +433,7 @@ pub(super) fn start_address_dad(
         return Ok(());
     }
     if !no_dad {
-        start_probe(
-            netns,
-            iface.common(),
-            address,
-            transmits as u32,
-            now,
-            ProbeCarrier::Automatic,
-        )?;
+        start_probe(netns, iface.common(), address, transmits as u32, now, false)?;
     }
     publish_address(netns, iface, cidr, state, prepared);
     Ok(())
@@ -466,7 +459,7 @@ pub(super) fn start_manual_probe(
         address,
         transmits,
         Instant::now().total_micros(),
-        ProbeCarrier::ManualWaiting,
+        true,
     )
 }
 
@@ -476,7 +469,7 @@ fn start_probe(
     address: Ipv6Cidr,
     transmits: u32,
     now: i64,
-    carrier: ProbeCarrier,
+    manual: bool,
 ) -> Result<(), SystemError> {
     common
         .ipv6_autoconf
@@ -494,7 +487,7 @@ fn start_probe(
         i64::from(u32::from_be_bytes([nonce[0], nonce[1], nonce[2], nonce[3]])) % RETRANS_US;
     common.ipv6_autoconf.lock().probes.push(Probe {
         address,
-        carrier,
+        manual,
         nonce,
         due: now.saturating_add(jitter),
         remaining: transmits,

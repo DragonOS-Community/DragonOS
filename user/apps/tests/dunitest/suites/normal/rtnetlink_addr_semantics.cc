@@ -817,15 +817,34 @@ int RunManualIpv6Dad() {
     if (const int error = add(carrier_loss); error != 0) return 2500 + error;
     if (!WaitForDadSolicitation(packets.Get(), carrier_loss.local)) return 2600;
     if (const int error = SetLinkUp(fd.Get(), peer, ++sequence, false); error != 0) return 2700 + error;
-    const auto carrier_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
-    while (std::chrono::steady_clock::now() < carrier_deadline) {
-        const auto state = flags_for(carrier_loss);
-        if (!state) return 2810;
-        if (!(*state & IFA_F_TENTATIVE))
-            return BindUdp(carrier_loss, 0) == 0 ? 0 : 2811;
-        usleep(20 * 1000);
-    }
-    return 2812;
+    auto wait_for_usable = [&](const AddressSpec& address) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (std::chrono::steady_clock::now() < until) {
+            const auto state = flags_for(address);
+            if (!state) return false;
+            if (!(*state & IFA_F_TENTATIVE)) return BindUdp(address, 0) == 0;
+            usleep(20 * 1000);
+        }
+        return false;
+    };
+    if (!wait_for_usable(carrier_loss)) return 2812;
+
+    auto after_carrier_loss = MakeAddress(AF_INET6, "fd50:2324::6", 80, edge);
+    after_carrier_loss.ipv6_flags = 0;
+    if (const int error = add(after_carrier_loss); error != 0) return 2900 + error;
+    if (!wait_for_usable(after_carrier_loss)) return 3010;
+
+    if (const int error = SetLinkUp(fd.Get(), edge, ++sequence, false); error != 0) return 3100 + error;
+    if (const int error = SetLinkUp(fd.Get(), edge, ++sequence); error != 0) return 3200 + error;
+    auto after_admin_down = MakeAddress(AF_INET6, "fd50:2324::7", 80, edge);
+    after_admin_down.ipv6_flags = 0;
+    if (const int error = add(after_admin_down); error != 0) return 3300 + error;
+    usleep(2300 * 1000);
+    const auto pending = flags_for(after_admin_down);
+    if (!pending || !(*pending & IFA_F_TENTATIVE) ||
+        BindUdp(after_admin_down, 0) != EADDRNOTAVAIL)
+        return 3410;
+    return 0;
 }
 
 int RunMultipleAddressConsistency() {

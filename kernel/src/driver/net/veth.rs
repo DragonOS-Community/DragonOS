@@ -687,17 +687,21 @@ impl VethInterface {
                     .contains(NetDeivceState::__LINK_STATE_START)
         });
         let carrier = self_up && peer_up;
+        let operstate = if carrier {
+            Operstate::IF_OPER_UP
+        } else {
+            Operstate::IF_OPER_DOWN
+        };
         for endpoint in core::iter::once(self).chain(peer.as_deref()) {
             let was_up = endpoint.operstate() == Operstate::IF_OPER_UP;
             if carrier {
                 endpoint.clear_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
-                endpoint.set_operstate(Operstate::IF_OPER_UP);
             } else {
                 endpoint.set_net_state(NetDeivceState::__LINK_STATE_NOCARRIER);
-                endpoint.set_operstate(Operstate::IF_OPER_DOWN);
             }
+            endpoint.set_operstate(operstate);
             if was_up != carrier {
-                crate::net::address::ipv6_autoconf::changed(&endpoint.common);
+                crate::net::address::ipv6_autoconf::link_changed(&endpoint.common, operstate);
             }
         }
     }

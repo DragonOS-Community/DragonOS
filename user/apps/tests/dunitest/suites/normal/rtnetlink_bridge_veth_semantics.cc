@@ -608,12 +608,15 @@ TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDA
 }
 
 TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRoutesAndAddresses) {
-    RouteFd other_namespace(RTMGRP_IPV6_PREFIX);
-    ASSERT_GE(other_namespace.fd, 0);
     const pid_t child = fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
         const auto run = [] {
+            // An empty namespace keeps unrelated Router Advertisements out
+            // of the control listener's isolation check.
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd other_namespace(RTMGRP_IPV6_PREFIX);
+            ASSERT_GE(other_namespace.fd, 0);
             ASSERT_EQ(unshare(CLONE_NEWNET), 0);
             RouteFd route;
             ASSERT_GE(route.fd, 0);
@@ -872,6 +875,8 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
             ASSERT_EQ(SendAck(route.fd, lower_mtu), 0);
             ASSERT_NO_FATAL_FAILURE(expect_route(RTM_DELROUTE));
             close(injector);
+            pollfd unrelated{other_namespace.fd, POLLIN, 0};
+            EXPECT_EQ(poll(&unrelated, 1, 0), 0);
         };
         run();
         _exit(::testing::Test::HasFailure() ? 1 : 0);
@@ -880,8 +885,6 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6RouterAdvertisementCreatesAndWithdrawsRou
     ASSERT_EQ(waitpid(child, &status, 0), child);
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
-    pollfd unrelated{other_namespace.fd, POLLIN, 0};
-    EXPECT_EQ(poll(&unrelated, 1, 0), 0);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, CreateAndUpBridgeWithNonemptyFibInSingleRequest) {

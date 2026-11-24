@@ -87,6 +87,7 @@ struct ProcStatSnapshot {
     comm: String,
     state: ProcessState,
     ppid: RawPid,
+    pgrp: RawPid,
     tty_nr: i32,
     flags: u32,
     priority: i64,
@@ -175,7 +176,7 @@ fn generate_linux_proc_stat_line(snapshot: &ProcStatSnapshot) -> String {
     line.push_pid_comm(snapshot.pid, &comm); // 1 pid, 2 comm
     line.push_state(super::linux_task_state(snapshot.state).as_bytes()[0] as char); // 3 state
     line.push_ll(snapshot.ppid.data() as i64); // 4 ppid
-    line.push_ll(0); // 5 pgrp
+    line.push_ll(snapshot.pgrp.data() as i64); // 5 pgrp
     line.push_ll(0); // 6 session
     line.push_ll(snapshot.tty_nr as i64); // 7 tty_nr
     line.push_ll(0); // 8 tpgid
@@ -329,11 +330,17 @@ impl StatFileOps {
             .map(|pid| pid.pid_nr_ns(self.target.view_pid_ns()))
             .unwrap_or(RawPid::new(0));
 
+        let pgrp = pcb
+            .task_pgrp()
+            .map(|pid| pid.pid_nr_ns(self.target.view_pid_ns()))
+            .unwrap_or(RawPid::new(0));
+
         let content = generate_linux_proc_stat_line(&ProcStatSnapshot {
             pid: self.target.vpid(),
             comm,
             state,
             ppid,
+            pgrp,
             tty_nr,
             flags,
             priority,

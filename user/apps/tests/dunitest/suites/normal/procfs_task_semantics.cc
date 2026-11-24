@@ -1670,6 +1670,38 @@ long StatFieldOf(const std::string& path, size_t index) {
     return strtol(fields[index - 1].c_str(), nullptr, 10);
 }
 
+TEST(ProcfsTaskSemantics, StatReportsProcessGroupAfterLeaderIsReaped) {
+    const pid_t leader = fork();
+    ASSERT_GE(leader, 0);
+    if (leader == 0) {
+        for (;;) pause();
+    }
+    ReapedChild leader_guard(leader);
+    const std::string leader_stat = StatusPath(leader, "stat");
+    const pid_t inherited_group = getpgrp();
+    ASSERT_GT(inherited_group, 0);
+    EXPECT_EQ(inherited_group, StatFieldOf(leader_stat, 5));
+
+    ASSERT_EQ(0, setpgid(leader, leader)) << strerror(errno);
+    EXPECT_EQ(leader, StatFieldOf(leader_stat, 5));
+
+    const pid_t member = fork();
+    ASSERT_GE(member, 0);
+    if (member == 0) {
+        for (;;) pause();
+    }
+    ReapedChild member_guard(member);
+    ASSERT_EQ(0, setpgid(member, leader)) << strerror(errno);
+    const std::string member_stat = StatusPath(member, "stat");
+    EXPECT_EQ(leader, StatFieldOf(member_stat, 5));
+
+    ASSERT_EQ(0, kill(leader, SIGKILL)) << strerror(errno);
+    ASSERT_TRUE(WaitForExit(leader));
+    leader_guard.Disarm();
+    EXPECT_EQ(leader, getpgid(member));
+    EXPECT_EQ(leader, StatFieldOf(member_stat, 5));
+}
+
 /// Gives the calling thread a files table of its own with one descriptor
 /// punched out of it. Only close_range(CLOSE_RANGE_UNSHARE) hands a single
 /// thread a private table, so this is the setup the hidden-tid fd paths have to

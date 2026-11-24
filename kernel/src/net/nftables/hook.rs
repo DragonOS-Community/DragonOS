@@ -633,7 +633,7 @@ mod hook_program_tests {
     }
 
     #[test]
-    fn xt_nat_targets_reject_ranges_and_unsupported_flags() {
+    fn xt_nat_targets_validate_ranges_and_unsupported_flags() {
         let mut dnat4 = [0u8; 24];
         dnat4[..4].copy_from_slice(&1u32.to_ne_bytes());
         dnat4[4..8].copy_from_slice(&1u32.to_ne_bytes());
@@ -647,9 +647,13 @@ mod hook_program_tests {
             parse_xt_nat_target(2, b"SNAT", 0, &dnat4),
             Ok(NftNatAction::Snat(_))
         ));
-        dnat4[12] = 2;
+        dnat4[15] = 2;
         assert!(matches!(
             parse_xt_nat_target(2, b"DNAT", 0, &dnat4),
+            Ok(NftNatAction::Dnat(_))
+        ));
+        assert!(matches!(
+            parse_xt_nat_target(2, b"SNAT", 0, &dnat4),
             Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
         ));
 
@@ -676,7 +680,12 @@ mod hook_program_tests {
         dnat[20] = 2;
         assert!(matches!(
             parse_xt_nat_target(10, b"DNAT", 2, &dnat),
-            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            Ok(NftNatAction::Dnat(_))
+        ));
+        dnat[20] = 0;
+        assert!(matches!(
+            parse_xt_nat_target(10, b"DNAT", 2, &dnat),
+            Err(SystemError::EINVAL)
         ));
     }
 
@@ -736,7 +745,7 @@ mod hook_program_tests {
         info[20] = 126;
         assert!(matches!(
             parse_xt_nat_target(2, b"DNAT", 2, &info),
-            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+            Err(SystemError::EINVAL)
         ));
         info[4..8].fill(0);
         info[20..24].fill(0);
@@ -748,6 +757,44 @@ mod hook_program_tests {
         info[38..40].copy_from_slice(&8079u16.to_be_bytes());
         assert!(matches!(
             parse_xt_nat_target(2, b"DNAT", 2, &info),
+            Err(SystemError::EINVAL)
+        ));
+    }
+
+    #[test]
+    fn xt_dnat_revisions_validate_port_offset_layout() {
+        let mut info = [0u8; 44];
+        info[..4].copy_from_slice(&2u32.to_ne_bytes());
+        info[36..38].copy_from_slice(&100u16.to_be_bytes());
+        info[38..40].copy_from_slice(&105u16.to_be_bytes());
+        assert!(matches!(
+            parse_xt_nat_target(10, b"DNAT", 1, &info[..40]),
+            Ok(NftNatAction::Dnat(_))
+        ));
+        for length in [39, 41] {
+            assert!(matches!(
+                parse_xt_nat_target(10, b"DNAT", 1, &info[..length]),
+                Err(SystemError::EINVAL)
+            ));
+        }
+
+        info[..4].copy_from_slice(&(2u32 | (1 << 5)).to_ne_bytes());
+        info[40..42].copy_from_slice(&101u16.to_be_bytes());
+        assert!(matches!(
+            parse_xt_nat_target(10, b"DNAT", 1, &info[..40]),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        ));
+        let ports = CtNatPortRange::new(100, 105).unwrap();
+        assert!(matches!(
+            parse_xt_nat_target(10, b"DNAT", 2, &info),
+            Ok(NftNatAction::Dnat(request))
+                if request == CtNatRequest::with_range(None, Some(ports), Some(101)).unwrap()
+        ));
+
+        info[..4].copy_from_slice(&(1u32 | (1 << 5)).to_ne_bytes());
+        info[36..40].fill(0);
+        assert!(matches!(
+            parse_xt_nat_target(10, b"DNAT", 2, &info),
             Err(SystemError::EINVAL)
         ));
     }

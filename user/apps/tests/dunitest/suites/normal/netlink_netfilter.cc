@@ -596,7 +596,8 @@ std::vector<uint8_t> NativeIpv4SnatRule(uint32_t seq, const char* table,
 std::vector<uint8_t> XtIpv4DnatRule(uint32_t seq, const char* table,
                                     const char* chain, in_addr original,
                                     uint16_t original_port, in_addr target,
-                                   uint16_t target_port, uint32_t revision) {
+                                   uint16_t target_port, uint32_t revision,
+                                   std::optional<uint16_t> port_base) {
   std::vector<uint8_t> expressions;
   const uint16_t original_port_be = htons(original_port);
   AppendPayloadEqual(&expressions, NFT_PAYLOAD_NETWORK_HEADER, 16,
@@ -612,6 +613,19 @@ std::vector<uint8_t> XtIpv4DnatRule(uint32_t seq, const char* table,
   const unsigned int nat_flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
   if (revision == 2) {
     nf_nat_range2 range{};
+    range.flags = nat_flags;
+    range.min_addr.ip = range.max_addr.ip = target.s_addr;
+    range.min_proto.tcp.port = range.max_proto.tcp.port = htons(target_port);
+    if (port_base.has_value()) {
+      range.flags |= NF_NAT_RANGE_PROTO_OFFSET;
+      range.min_proto.tcp.port = htons(target_port - 2);
+      range.max_proto.tcp.port = htons(target_port + 2);
+      range.base_proto.tcp.port = htons(*port_base);
+    }
+    AppendNla(&xt, NFTA_TARGET_INFO,
+              reinterpret_cast<const uint8_t*>(&range), sizeof(range));
+  } else if (revision == 1) {
+    nf_nat_range range{};
     range.flags = nat_flags;
     range.min_addr.ip = range.max_addr.ip = target.s_addr;
     range.min_proto.tcp.port = range.max_proto.tcp.port = htons(target_port);
@@ -3784,7 +3798,8 @@ void CheckXtNatCompatRevision(int nft, uint32_t seq, uint8_t family, const char*
   const NlaSpan attrs{bytes.data() + header_len, header.nlmsg_len - header_len};
   const auto wire_revision = FindNla(attrs, NFTA_COMPAT_REV);
   ASSERT_EQ(sizeof(uint32_t), wire_revision.length);
-  EXPECT_EQ(revision, Be32(wire_revision));
+  const uint32_t reply_revision = revision == 1 && strcmp(name, "DNAT") == 0 ? 2 : revision;
+  EXPECT_EQ(reply_revision, Be32(wire_revision));
   const auto type = FindNla(attrs, NFTA_COMPAT_TYPE);
   ASSERT_EQ(sizeof(uint32_t), type.length);
   EXPECT_EQ(1u, Be32(type));
@@ -3794,7 +3809,7 @@ void CheckXtNatCompatRevision(int nft, uint32_t seq, uint8_t family, const char*
 
 }
 
-void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
+void CheckIpv4XtDnatRequestAndReply(uint32_t revision, bool offset = false) {
   ASSERT_TRUE(NetAdmin()) << "requires CAP_NET_ADMIN";
   Fd nft(Open());
   Fd client(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
@@ -3820,6 +3835,15 @@ void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
   ASSERT_EQ(0, getsockname(server.get(), reinterpret_cast<sockaddr*>(&server_address),
                            &server_len));
 
+  std::optional<uint16_t> port_base;
+  if (offset) {
+    const uint16_t target_port = ntohs(server_address.sin_port);
+    ASSERT_GT(target_port, 2u);
+    ASSERT_LT(target_port, UINT16_MAX - 2);
+    original_address.sin_port = htons(target_port + 1);
+    port_base = target_port - 1;
+  }
+
   // xt DNAT is valid only in a table literally named "nat" on Linux.
   const std::string table = "nat";
   auto batch = TableBatch(kNftNewtable, seq, table.c_str());
@@ -3828,7 +3852,7 @@ void CheckIpv4XtDnatRequestAndReply(uint32_t revision) {
                         NF_INET_LOCAL_OUT, NFPROTO_IPV4, -100, "nat");
   auto rule = XtIpv4DnatRule(seq + 3, table.c_str(), "output",
                              original_address.sin_addr, ntohs(original_address.sin_port),
-                             server_address.sin_addr, ntohs(server_address.sin_port), revision);
+                             server_address.sin_addr, ntohs(server_address.sin_port), revision, port_base);
   batch.insert(batch.end(), chain.begin(), chain.end());
   batch.insert(batch.end(), rule.begin(), rule.end());
   auto end = Request(NFNL_MSG_BATCH_END, seq + 4);
@@ -3877,8 +3901,16 @@ TEST(NetlinkNetfilter, XtIpv4DnatRevisionZeroRewritesRequestAndReply) {
   CheckIpv4XtDnatRequestAndReply(0);
 }
 
+TEST(NetlinkNetfilter, XtIpv4DnatRevisionOneRewritesRequestAndReply) {
+  CheckIpv4XtDnatRequestAndReply(1);
+}
+
 TEST(NetlinkNetfilter, XtIpv4DnatRevisionTwoRewritesRequestAndReply) {
   CheckIpv4XtDnatRequestAndReply(2);
+}
+
+TEST(NetlinkNetfilter, XtIpv4DnatPortOffsetOverridesOriginalPortInRange) {
+  CheckIpv4XtDnatRequestAndReply(2, true);
 }
 
 TEST(NetlinkNetfilter, NftIpv6AndInetPreroutingInputReadSameLocalUdp) {

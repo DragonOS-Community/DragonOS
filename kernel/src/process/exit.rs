@@ -603,7 +603,7 @@ fn report_wait_event(
 
             let pid = wait_visible_pid(child_pcb);
             let (status, cause) = wstatus_to_waitid_exit_info(raw_wstatus);
-            fill_wait_rusage(child_pcb, kwo);
+            let rusage = fill_wait_rusage(child_pcb, kwo);
             kwo.no_task_error = None;
             kwo.ret_status = raw_wstatus;
             kwo.ret_info = Some(waitid_info(child_pcb, status, cause));
@@ -613,12 +613,12 @@ fn report_wait_event(
                 // keep the zombie so real_parent can reap it again via the Natural branch.
                 complete_ptrace_claim_after_ack(child_pcb);
             } else {
-                // ptracer == real_parent (strace fork-then-trace case): reap + release
-                // immediately, report only once, and do not keep the zombie to avoid a
-                // second Natural reap.
+                // Nonleaders and leaders traced by their parent are released
+                // after the tracer consumes their exit.
                 child_pcb.finish_trace_zombie_claim();
-                let rusage = fill_wait_rusage(child_pcb, kwo);
-                account_reaped_child_rusage(&rusage);
+                if child_pcb.is_thread_group_leader() {
+                    account_reaped_child_rusage(&rusage);
+                }
                 unsafe { ProcessManager::release(child_pcb.raw_pid()) };
             }
             return CandidateDecision::Ready(Ok(pid.into()));

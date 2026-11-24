@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -790,6 +791,114 @@ TEST(PtraceRelationLifecycle, ConcurrentTracerWaitersCascadeZombieExactlyOnce) {
     ASSERT_TRUE(WIFEXITED(natural_status));
     ASSERT_EQ(0, WEXITSTATUS(natural_status));
     tracer_guard.Release();
+}
+
+struct NonleaderReapIds {
+    pid_t leader;
+    pid_t worker;
+};
+
+struct NonleaderReapWorkerArgs {
+    int ready_fd;
+    int release_fd;
+};
+
+void* NonleaderReapWorker(void* opaque) {
+    auto* args = static_cast<NonleaderReapWorkerArgs*>(opaque);
+    NonleaderReapIds ids = {getpid(), static_cast<pid_t>(syscall(SYS_gettid))};
+    char token = 0;
+    if (!WriteExact(args->ready_fd, &ids, sizeof(ids)) ||
+        !ReadExactUntil(args->release_fd, &token, sizeof(token))) {
+        _exit(121);
+    }
+    return nullptr;
+}
+
+TEST(PtraceRelationLifecycle, ExternalTracerReapsNonleaderBeforeParentWaits) {
+    int ready[2] = {-1, -1};
+    int release_worker[2] = {-1, -1};
+    int release_leader[2] = {-1, -1};
+    struct PipeGuard {
+        int* ready;
+        int* worker;
+        int* leader;
+        ~PipeGuard() {
+            for (int fd : {ready[0], ready[1], worker[0], worker[1],
+                           leader[0], leader[1]}) {
+                if (fd >= 0) close(fd);
+            }
+        }
+    } pipes{ready, release_worker, release_leader};
+    ASSERT_EQ(0, pipe(ready));
+    ASSERT_EQ(0, pipe(release_worker));
+    ASSERT_EQ(0, pipe(release_leader));
+
+    const pid_t parent = fork();
+    ASSERT_GE(parent, 0);
+    if (parent == 0) {
+        if (setpgid(0, 0) != 0) _exit(122);
+        const pid_t leader = fork();
+        if (leader < 0) _exit(123);
+        if (leader == 0) {
+            NonleaderReapWorkerArgs args = {ready[1], release_worker[0]};
+            pthread_t thread;
+            char token = 0;
+            if (pthread_create(&thread, nullptr, NonleaderReapWorker, &args) != 0 ||
+                pthread_join(thread, nullptr) != 0 ||
+                !ReadExactUntil(release_leader[0], &token, sizeof(token))) {
+                _exit(124);
+            }
+            _exit(44);
+        }
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(leader, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != leader || !WIFEXITED(status) || WEXITSTATUS(status) != 44) {
+            _exit(125);
+        }
+        _exit(0);
+    }
+
+    // The child creates its own process group before publishing the worker ID.
+    // Always clean up the complete group if an assertion or wait fails.
+    struct GroupGuard {
+        pid_t parent;
+        ~GroupGuard() {
+            if (parent > 0) {
+                kill(-parent, SIGKILL);
+                kill(parent, SIGKILL);
+                int status = 0;
+                WaitPidUntil(parent, &status);
+            }
+        }
+    } guard{parent};
+
+    NonleaderReapIds ids = {};
+    ASSERT_TRUE(ReadExactUntil(ready[0], &ids, sizeof(ids)));
+    ASSERT_NE(ids.leader, ids.worker);
+    ASSERT_EQ(0, ptrace_call(PTRACE_SEIZE, ids.worker, 0, 0)) << errno;
+    const char token = 'x';
+    ASSERT_TRUE(WriteExact(release_worker[1], &token, sizeof(token)));
+    int status = 0;
+    ASSERT_TRUE(WaitPidUntil(ids.worker, &status, __WALL)) << errno;
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+
+    char path[96];
+    ASSERT_GT(snprintf(path, sizeof(path), "/proc/%d/task/%d", ids.leader,
+                       ids.worker), 0);
+    struct stat info = {};
+    errno = 0;
+    EXPECT_EQ(-1, stat(path, &info));
+    EXPECT_EQ(ENOENT, errno);
+
+    ASSERT_TRUE(WriteExact(release_leader[1], &token, sizeof(token)));
+    ASSERT_TRUE(WaitPidUntil(parent, &status)) << errno;
+    guard.parent = -1;
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
 }
 
 }  // namespace

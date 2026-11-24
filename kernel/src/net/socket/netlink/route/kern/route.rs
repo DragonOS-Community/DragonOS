@@ -408,12 +408,16 @@ fn validate_get_request(request: &RouteSegment) -> Result<(), SystemError> {
         return Err(SystemError::EINVAL);
     }
 
-    if request.body().flags.contains(RouteFlags::FIB_MATCH) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
-    }
-    // Legacy IPv6 clients also send LOOKUP_TABLE. Linux ignores it for
-    // IPv6 lookups unless strict checking is explicitly enabled.
-    if request.body().raw_flags & !RouteFlags::LOOKUP_TABLE.bits() != 0 {
+    let supported_flags = if request.body().family == AddressFamily::INet6 {
+        // Linux ignores LOOKUP_TABLE on non-strict IPv6 requests.
+        RouteFlags::LOOKUP_TABLE | RouteFlags::FIB_MATCH
+    } else {
+        if request.body().flags.contains(RouteFlags::FIB_MATCH) {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        RouteFlags::LOOKUP_TABLE
+    };
+    if request.body().raw_flags & !supported_flags.bits() != 0 {
         return Err(SystemError::EINVAL);
     }
     Ok(())
@@ -524,6 +528,15 @@ fn lookup_route(
             .get(&(decision.oif as usize))
             .cloned()
             .ok_or(SystemError::ENODEV)?;
+        if request.body().flags.contains(RouteFlags::FIB_MATCH) {
+            return Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
+                request.header(),
+                CSegmentType::NEWROUTE,
+                decision.matched,
+                RouteReply::FibMatch,
+                0,
+            )?)]);
+        }
         let selected = if requested_source.is_some() {
             None
         } else {
@@ -551,8 +564,7 @@ fn lookup_route(
         request.header(),
         CSegmentType::NEWROUTE,
         output,
-        RouteFlags::CLONED,
-        true,
+        RouteReply::Resolved,
         0,
     )?)])
 }
@@ -595,8 +607,7 @@ fn notify_route_with_flags(
         &kernel_notify_header(kind),
         kind,
         route,
-        RouteFlags::empty(),
-        false,
+        RouteReply::Configuration,
         nlmsg_flags,
     ) {
         Ok(segment) => segment,
@@ -619,18 +630,25 @@ fn notify_route_with_flags(
     );
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RouteReply {
+    Configuration,
+    Resolved,
+    FibMatch,
+}
+
 pub(super) fn route_to_segment(
     request_header: &CMsgSegHdr,
     msg_type: CSegmentType,
     route: RouteEntry,
-    flags: RouteFlags,
-    output: bool,
+    reply: RouteReply,
     nlmsg_flags: u16,
 ) -> Result<RouteSegment, SystemError> {
-    let body_flags = if output {
-        flags
-    } else {
-        flags | RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
+    let body_flags = match reply {
+        RouteReply::Resolved => RouteFlags::CLONED,
+        RouteReply::Configuration | RouteReply::FibMatch => {
+            RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
+        }
     };
     let body = RouteSegmentBody {
         family: family_of_ip(route.destination.address()),
@@ -643,7 +661,11 @@ pub(super) fn route_to_segment(
             RouteTable::Compat as u8
         },
         protocol: route.protocol,
-        scope: route.scope,
+        scope: if reply == RouteReply::FibMatch {
+            RouteScope::Universe as u8
+        } else {
+            route.scope
+        },
         type_: route.kind,
         raw_flags: body_flags.bits(),
         flags: body_flags,
@@ -670,25 +692,33 @@ pub(super) fn route_to_segment(
     if let Some(gateway) = route.gateway {
         attrs.push(RouteAttr::Gateway(ip_to_bytes(gateway)?))?;
     }
-    if route.priority != 0 && (!output || matches!(route.destination.address(), IpAddress::Ipv6(_)))
+    if reply == RouteReply::FibMatch
+        || (route.priority != 0
+            && (reply != RouteReply::Resolved
+                || matches!(route.destination.address(), IpAddress::Ipv6(_))))
     {
         attrs.push(RouteAttr::Priority(route.priority))?;
     }
-    if let Some(deadline) = route.expires_at_us() {
-        // Linux rta_cacheinfo stores signed remaining time in USER_HZ ticks.
-        let now = crate::time::Instant::now().total_micros();
-        let ticks = deadline.saturating_sub(now) / 10_000;
-        let expires = ticks.clamp(-(i32::MAX as i64), i32::MAX as i64) as i32;
+    let deadline = route.expires_at_us();
+    if deadline.is_some() || reply == RouteReply::FibMatch {
         let mut cache_info = [0; 32];
-        cache_info[8..12].copy_from_slice(&expires.to_ne_bytes());
+        if let Some(deadline) = deadline {
+            // Linux rta_cacheinfo stores signed remaining time in USER_HZ ticks.
+            let now = crate::time::Instant::now().total_micros();
+            let ticks = deadline.saturating_sub(now) / 10_000;
+            let expires = ticks.clamp(-(i32::MAX as i64), i32::MAX as i64) as i32;
+            cache_info[8..12].copy_from_slice(&expires.to_ne_bytes());
+        }
         attrs.push(RouteAttr::CacheInfo(cache_info))?;
     }
-    if let Some(learned) = route.learned_default() {
-        let preference = match learned.preference {
-            route::RouterPreference::High => 1,
-            route::RouterPreference::Medium => 0,
-            route::RouterPreference::Low => 3,
-        };
+    let preference = match route.learned_default().map(|route| route.preference) {
+        Some(route::RouterPreference::High) => Some(1),
+        Some(route::RouterPreference::Medium) => Some(0),
+        Some(route::RouterPreference::Low) => Some(3),
+        None if reply == RouteReply::FibMatch => Some(0),
+        None => None,
+    };
+    if let Some(preference) = preference {
         attrs.push(RouteAttr::Preference(preference))?;
     }
     Ok(RouteSegment::new(header, body, attrs.into_inner()))

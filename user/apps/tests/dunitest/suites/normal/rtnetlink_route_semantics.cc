@@ -533,6 +533,114 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
               0);
 }
 
+TEST(RtnetlinkRouteSemantics, Ipv6FibMatchReturnsTheConfiguredRoute) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            FdGuard fd(OpenRouteSocket());
+            ASSERT_GE(fd.Get(), 0);
+            timeval timeout{2, 0};
+            ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+            const uint32_t lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            uint32_t seq = 1;
+            ASSERT_EQ(SetLinkUp(fd.Get(), lo, true, ++seq), 0);
+            constexpr auto add = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+            ASSERT_EQ(SendIpv6AddrRequest(fd.Get(), RTM_NEWADDR, add, lo, "fd74:29::1", 64, ++seq), 0);
+            bool published = false;
+            for (int attempt = 0; attempt < 100; ++attempt) {
+                published = FindIpv6Route(fd.Get(), "fd74:29::", 64, lo, ++seq).has_value();
+                if (published) break;
+                usleep(10000);
+            }
+            ASSERT_TRUE(published);
+            ASSERT_EQ(SendIpv6RouteRequest(fd.Get(), RTM_NEWROUTE, add, "fd74:30::", 64, 0,
+                                          RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                          std::nullopt, RTN_PROHIBIT),
+                      0);
+
+            alignas(nlmsghdr) char response[1024] = {};
+            auto* reply = reinterpret_cast<nlmsghdr*>(response);
+            auto query = [&](const char* address, uint32_t flags) {
+                alignas(nlmsghdr) char request[128] = {};
+                auto* nlh = reinterpret_cast<nlmsghdr*>(request);
+                nlh->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+                nlh->nlmsg_type = RTM_GETROUTE;
+                nlh->nlmsg_flags = NLM_F_REQUEST;
+                nlh->nlmsg_seq = ++seq;
+                auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
+                rtm->rtm_family = AF_INET6;
+                rtm->rtm_dst_len = 128;
+                rtm->rtm_flags = flags;
+                in6_addr destination{};
+                ASSERT_EQ(inet_pton(AF_INET6, address, &destination), 1);
+                AddAttr(nlh, sizeof(request), RTA_DST, &destination, sizeof(destination));
+                ASSERT_EQ(send(fd.Get(), nlh, nlh->nlmsg_len, 0),
+                          static_cast<ssize_t>(nlh->nlmsg_len));
+                const ssize_t len = recv(fd.Get(), response, sizeof(response), 0);
+                ASSERT_TRUE(NLMSG_OK(reply, len)) << ErrnoString(errno);
+                ASSERT_EQ(reply->nlmsg_seq, seq);
+            };
+            auto* route = reinterpret_cast<rtmsg*>(NLMSG_DATA(reply));
+            auto attribute = [&](uint16_t type) -> const rtattr* {
+                int len = RTM_PAYLOAD(reply);
+                for (auto* attr = RTM_RTA(route); RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+                    if (attr->rta_type == type) return attr;
+                }
+                return nullptr;
+            };
+            auto expect_attr = [&](uint16_t type, const auto& value) {
+                const auto* attr = attribute(type);
+                ASSERT_NE(attr, nullptr) << type;
+                ASSERT_EQ(RTA_PAYLOAD(attr), sizeof(value)) << type;
+                EXPECT_EQ(std::memcmp(RTA_DATA(attr), &value, sizeof(value)), 0) << type;
+            };
+
+            ASSERT_NO_FATAL_FAILURE(query("fd74:29::9", RTM_F_FIB_MATCH | RTM_F_LOOKUP_TABLE));
+            ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
+            EXPECT_EQ(route->rtm_dst_len, 64);
+            EXPECT_EQ(route->rtm_type, RTN_UNICAST);
+            EXPECT_EQ(route->rtm_protocol, RTPROT_KERNEL);
+            EXPECT_EQ(route->rtm_flags & RTM_F_CLONED, 0u);
+            in6_addr prefix{};
+            ASSERT_EQ(inet_pton(AF_INET6, "fd74:29::", &prefix), 1);
+            expect_attr(RTA_DST, prefix);
+            expect_attr(RTA_OIF, lo);
+            expect_attr(RTA_TABLE, uint32_t{RT_TABLE_MAIN});
+            EXPECT_EQ(attribute(RTA_PREFSRC), nullptr);
+
+            ASSERT_NO_FATAL_FAILURE(query("::1", RTM_F_FIB_MATCH));
+            ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
+            EXPECT_EQ(route->rtm_dst_len, 128);
+            expect_attr(RTA_PRIORITY, uint32_t{0});
+            expect_attr(RTA_PREF, uint8_t{0});
+            expect_attr(RTA_CACHEINFO, rta_cacheinfo{});
+
+            ASSERT_NO_FATAL_FAILURE(query("fd74:29::9", 0));
+            ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
+            EXPECT_EQ(route->rtm_dst_len, 128);
+
+            ASSERT_NO_FATAL_FAILURE(query("fd74:30::9", RTM_F_FIB_MATCH));
+            ASSERT_EQ(reply->nlmsg_type, NLMSG_ERROR);
+            ASSERT_GE(reply->nlmsg_len, NLMSG_LENGTH(sizeof(nlmsgerr)));
+            EXPECT_EQ(reinterpret_cast<nlmsgerr*>(NLMSG_DATA(reply))->error, -EACCES);
+
+            ASSERT_NO_FATAL_FAILURE(query("fd74:31::9", RTM_F_FIB_MATCH));
+            ASSERT_EQ(reply->nlmsg_type, NLMSG_ERROR);
+            ASSERT_GE(reply->nlmsg_len, NLMSG_LENGTH(sizeof(nlmsgerr)));
+            EXPECT_EQ(reinterpret_cast<nlmsgerr*>(NLMSG_DATA(reply))->error, -ENETUNREACH);
+        }();
+        _exit(HasFailure() ? 1 : 0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkRouteSemantics, Ipv6RejectTerminatesLookupAndThrowSkipsTheTable) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);

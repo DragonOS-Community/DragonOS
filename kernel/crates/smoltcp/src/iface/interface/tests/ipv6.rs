@@ -1992,10 +1992,11 @@ fn ndisc_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ethernet)]
+#[case::solicited_node(false)]
+#[case::unicast(true)]
 #[cfg(feature = "medium-ethernet")]
-fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
-    let (mut iface, mut sockets, _device) = setup(medium);
+fn test_handle_valid_ndisc_request(#[case] unicast: bool) {
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
 
     let mut eth_bytes = vec![0u8; 86];
 
@@ -2009,22 +2010,28 @@ fn test_handle_valid_ndisc_request(#[case] medium: Medium) {
         lladdr: Some(remote_hw_addr.into()),
         nonce: None,
     });
+    let (destination, destination_mac) = if unicast {
+        (local_ip_addr, local_hw_addr)
+    } else {
+        let group = local_ip_addr.solicited_node();
+        (group, EthernetAddress::from_multicast_ip(group.into()))
+    };
     let ip_repr = IpRepr::Ipv6(Ipv6Repr {
         src_addr: remote_ip_addr,
-        dst_addr: local_ip_addr.solicited_node(),
+        dst_addr: destination,
         next_header: IpProtocol::Icmpv6,
         hop_limit: 0xff,
         payload_len: solicit.buffer_len(),
     });
 
     let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
-    frame.set_dst_addr(EthernetAddress([0x33, 0x33, 0x00, 0x00, 0x00, 0x00]));
+    frame.set_dst_addr(destination_mac);
     frame.set_src_addr(remote_hw_addr);
     frame.set_ethertype(EthernetProtocol::Ipv6);
     ip_repr.emit(frame.payload_mut(), &ChecksumCapabilities::default());
     solicit.emit(
         &remote_ip_addr,
-        &local_ip_addr.solicited_node(),
+        &destination,
         &mut Icmpv6Packet::new_unchecked(&mut frame.payload_mut()[ip_repr.header_len()..]),
         &ChecksumCapabilities::default(),
     );

@@ -13,117 +13,19 @@ use crate::{
 
 #[derive(Debug)]
 enum MmReportCallback {
-    #[cfg(feature = "mm_selftest")]
-    DmaSelftest,
-    AllocationStats,
-    #[cfg(feature = "mm_selftest")]
-    AllocationSelftest,
-    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-    PlacementSelftest,
-    #[cfg(feature = "mm_selftest")]
-    PageAccessSelftest,
-    #[cfg(feature = "mm_selftest")]
-    PageRetirementSelftest,
-    #[cfg(all(
-        feature = "mm_selftest",
-        any(target_arch = "x86_64", target_arch = "riscv64")
-    ))]
-    PageReportingSelftest,
-    #[cfg(feature = "mm_selftest")]
-    VirtioBalloonStatus,
-    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-    TlbTeardownSelftest,
-    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-    PageMigrationSelftest,
-    #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-    PageCompactionSelftest,
+    Snapshot(fn() -> Result<String, SystemError>),
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     PageMigrationCommand,
-    #[cfg(feature = "mm_selftest")]
-    VmallocSelftest,
-    #[cfg(all(
-        feature = "mm_selftest",
-        any(target_arch = "x86_64", target_arch = "riscv64")
-    ))]
-    KernelBufferSelftest,
-    #[cfg(all(
-        feature = "mm_selftest",
-        any(target_arch = "x86_64", target_arch = "riscv64")
-    ))]
-    OverlayXattrSelftest,
-    #[cfg(all(
-        feature = "mm_selftest",
-        any(target_arch = "x86_64", target_arch = "riscv64")
-    ))]
-    XattrSyscallSelftest,
-    #[cfg(all(
-        feature = "mm_selftest",
-        any(target_arch = "x86_64", target_arch = "riscv64")
-    ))]
-    ReadBufferSelftest,
 }
 
 impl KernFSCallback for MmReportCallback {
     fn open(&self, mut data: KernCallbackData) -> Result<(), SystemError> {
         let report = match self {
-            #[cfg(feature = "mm_selftest")]
-            Self::PageAccessSelftest => crate::mm::page::access::selftest_report(),
-            #[cfg(feature = "mm_selftest")]
-            Self::PageRetirementSelftest => crate::mm::page::retirement::selftest::report(),
-            #[cfg(all(
-                feature = "mm_selftest",
-                any(target_arch = "x86_64", target_arch = "riscv64")
-            ))]
-            Self::PageReportingSelftest => crate::mm::page_reporting::selftest_report(),
-            #[cfg(feature = "mm_selftest")]
-            Self::VirtioBalloonStatus => crate::driver::virtio::virtio_balloon::selftest_report(),
-            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-            Self::TlbTeardownSelftest => crate::mm::tlb::teardown_selftest_report(),
-            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-            Self::PageMigrationSelftest => crate::mm::page::migration::selftest::report(),
-            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-            Self::PageCompactionSelftest => crate::mm::page::compaction_selftest::report(),
+            // A report is bound at registration so this shared frame does
+            // not reserve stack space for unrelated report generators.
+            Self::Snapshot(build) => build()?,
             #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
             Self::PageMigrationCommand => String::new(),
-            #[cfg(feature = "mm_selftest")]
-            Self::DmaSelftest => crate::mm::dma::dma_allocator_selftest_report(),
-            Self::AllocationStats => {
-                let snapshot = crate::arch::mm::LockedFrameAllocator::diagnostic_snapshot()
-                    .ok_or(SystemError::ENODEV)?;
-                crate::mm::allocator::buddy::allocation_stats_report(snapshot)
-            }
-            #[cfg(feature = "mm_selftest")]
-            Self::AllocationSelftest => {
-                crate::mm::allocator::buddy::allocation_diagnostics_selftest_report()
-            }
-            #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
-            Self::PlacementSelftest => crate::mm::allocator::buddy::placement_selftest_report(),
-            #[cfg(feature = "mm_selftest")]
-            Self::VmallocSelftest => crate::mm::vmalloc::selftest_report(),
-            #[cfg(all(
-                feature = "mm_selftest",
-                any(target_arch = "x86_64", target_arch = "riscv64")
-            ))]
-            Self::KernelBufferSelftest => crate::mm::kernel_buffer::selftest_report(),
-            #[cfg(all(
-                feature = "mm_selftest",
-                any(target_arch = "x86_64", target_arch = "riscv64")
-            ))]
-            Self::OverlayXattrSelftest => crate::filesystem::overlayfs::xattr_selftest_report(),
-            #[cfg(all(
-                feature = "mm_selftest",
-                any(target_arch = "x86_64", target_arch = "riscv64")
-            ))]
-            Self::XattrSyscallSelftest => {
-                crate::filesystem::vfs::syscall::xattr_syscall_selftest_report()
-            }
-            #[cfg(all(
-                feature = "mm_selftest",
-                any(target_arch = "x86_64", target_arch = "riscv64")
-            ))]
-            Self::ReadBufferSelftest => {
-                crate::filesystem::vfs::syscall::read_buffer_selftest_report()
-            }
         };
         data.file_private_data_mut()
             .replace(KernFilePrivateData::DebugTextSnapshot(report));
@@ -192,14 +94,22 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::DmaSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::dma::dma_allocator_selftest_report())
+        })),
     )?;
     mm.add_file(
         "allocation_stats".to_string(),
         InodeMode::S_IRUSR,
         Some(16384),
         None,
-        Some(&MmReportCallback::AllocationStats),
+        Some(&MmReportCallback::Snapshot(|| {
+            let snapshot = crate::arch::mm::LockedFrameAllocator::diagnostic_snapshot()
+                .ok_or(SystemError::ENODEV)?;
+            Ok(crate::mm::allocator::buddy::allocation_stats_report(
+                snapshot,
+            ))
+        })),
     )?;
     #[cfg(feature = "mm_selftest")]
     mm.add_file(
@@ -207,7 +117,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::AllocationSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::allocator::buddy::allocation_diagnostics_selftest_report())
+        })),
     )?;
     #[cfg(feature = "mm_selftest")]
     mm.add_file(
@@ -215,7 +127,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::PageAccessSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::page::access::selftest_report())
+        })),
     )?;
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     mm.add_file(
@@ -223,7 +137,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::PlacementSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::allocator::buddy::placement_selftest_report())
+        })),
     )?;
     #[cfg(feature = "mm_selftest")]
     mm.add_file(
@@ -231,7 +147,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::PageRetirementSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::page::retirement::selftest::report())
+        })),
     )?;
     #[cfg(all(
         feature = "mm_selftest",
@@ -242,7 +160,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::PageReportingSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::page_reporting::selftest_report())
+        })),
     )?;
     #[cfg(feature = "mm_selftest")]
     mm.add_file(
@@ -250,7 +170,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::VirtioBalloonStatus),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::driver::virtio::virtio_balloon::selftest_report())
+        })),
     )?;
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     mm.add_file(
@@ -258,7 +180,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::TlbTeardownSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::tlb::teardown_selftest_report())
+        })),
     )?;
     #[cfg(all(feature = "mm_selftest", target_arch = "x86_64"))]
     {
@@ -267,14 +191,18 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
             InodeMode::S_IRUSR,
             Some(4096),
             None,
-            Some(&MmReportCallback::PageCompactionSelftest),
+            Some(&MmReportCallback::Snapshot(|| {
+                Ok(crate::mm::page::compaction_selftest::report())
+            })),
         )?;
         mm.add_file(
             "page_migration_selftest".to_string(),
             InodeMode::S_IRUSR,
             Some(4096),
             None,
-            Some(&MmReportCallback::PageMigrationSelftest),
+            Some(&MmReportCallback::Snapshot(|| {
+                Ok(crate::mm::page::migration::selftest::report())
+            })),
         )?;
         mm.add_file(
             "page_migration".to_string(),
@@ -290,7 +218,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::VmallocSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::vmalloc::selftest_report())
+        })),
     )?;
     #[cfg(all(
         feature = "mm_selftest",
@@ -301,7 +231,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::KernelBufferSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::mm::kernel_buffer::selftest_report())
+        })),
     )?;
     #[cfg(all(
         feature = "mm_selftest",
@@ -312,7 +244,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::OverlayXattrSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::filesystem::overlayfs::xattr_selftest_report())
+        })),
     )?;
     #[cfg(all(
         feature = "mm_selftest",
@@ -323,7 +257,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::XattrSyscallSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::filesystem::vfs::syscall::xattr_syscall_selftest_report())
+        })),
     )?;
     #[cfg(all(
         feature = "mm_selftest",
@@ -334,7 +270,9 @@ pub fn init_debugfs_mm() -> Result<(), SystemError> {
         InodeMode::S_IRUSR,
         Some(4096),
         None,
-        Some(&MmReportCallback::ReadBufferSelftest),
+        Some(&MmReportCallback::Snapshot(|| {
+            Ok(crate::filesystem::vfs::syscall::read_buffer_selftest_report())
+        })),
     )?;
     Ok(())
 }

@@ -182,6 +182,21 @@ impl CandidateWinners {
         .and_then(|winners| winners.get(requirement))
     }
 
+    fn get_for_query(
+        &self,
+        routes: &[RouteEntry],
+        required_oif: Option<u32>,
+        preferred_oif: Option<u32>,
+        requirement: ScopeRequirement,
+    ) -> Option<usize> {
+        let winner = self.get(required_oif, requirement)?;
+        let preferred = preferred_oif
+            .filter(|&oif| routes[winner].oif != oif)
+            .and_then(|oif| self.get(Some(oif), requirement))
+            .filter(|&candidate| route_rank(routes[candidate]) == route_rank(routes[winner]));
+        Some(preferred.unwrap_or(winner))
+    }
+
     fn consider(
         &mut self,
         route_index: usize,
@@ -215,7 +230,9 @@ impl SourceWinners {
     fn lookup(
         &self,
         source: Ipv6Address,
+        routes: &[RouteEntry],
         required_oif: Option<u32>,
+        preferred_oif: Option<u32>,
         scope: ScopeRequirement,
     ) -> SourceLookup {
         let mut lengths = self.lengths;
@@ -228,7 +245,9 @@ impl SourceWinners {
                 continue;
             };
             matched = true;
-            if let Some(route) = candidates.get(required_oif, scope) {
+            if let Some(route) =
+                candidates.get_for_query(routes, required_oif, preferred_oif, scope)
+            {
                 return SourceLookup::Found(route);
             }
         }
@@ -514,7 +533,7 @@ impl FibIndex {
         }
         let scope = ScopeRequirement::Any;
         if let Some(source) = &winners.source {
-            match source.lookup(Ipv6Address::UNSPECIFIED, oif, scope) {
+            match source.lookup(Ipv6Address::UNSPECIFIED, routes, oif, None, scope) {
                 SourceLookup::Found(route) => return Some(route),
                 SourceLookup::NoMatch => return None,
                 SourceLookup::NoEligibleRoute => {}
@@ -920,6 +939,7 @@ impl FibIndex {
                 source: None,
                 table,
                 required_oif,
+                preferred_oif: None,
                 minimum_scope,
                 broadcast,
             },
@@ -932,6 +952,7 @@ impl FibIndex {
             source,
             table,
             required_oif,
+            preferred_oif,
             minimum_scope,
             broadcast,
         } = query;
@@ -949,7 +970,9 @@ impl FibIndex {
             if let Some(sources) = &winners.source {
                 match sources.lookup(
                     source.unwrap_or(Ipv6Address::UNSPECIFIED),
+                    routes,
                     required_oif,
+                    preferred_oif,
                     scope,
                 ) {
                     SourceLookup::Found(route) => return Some(route),
@@ -957,7 +980,10 @@ impl FibIndex {
                     SourceLookup::NoEligibleRoute => {}
                 }
             }
-            let mut standard = winners.standard.get(required_oif, scope);
+            let mut standard =
+                winners
+                    .standard
+                    .get_for_query(routes, required_oif, preferred_oif, scope);
             if standard.is_some_and(|index| routes[index].expires_at_us().is_some()) {
                 let now_us = crate::time::Instant::now().total_micros();
                 if standard.is_some_and(|index| !routes[index].is_live_at(now_us)) {
@@ -973,7 +999,14 @@ impl FibIndex {
                                 && scope.matches(route.scope)
                                 && route.is_live_at(now_us)
                         })
-                        .min_by_key(|&index| route_order(routes[index], self.alias.order(index)));
+                        .min_by_key(|&index| {
+                            let route = routes[index];
+                            (
+                                route_rank(route),
+                                preferred_oif.is_some_and(|oif| oif != route.oif),
+                                self.alias.order(index),
+                            )
+                        });
                 }
             }
             let broadcast = match broadcast {
@@ -1366,8 +1399,13 @@ fn route_precedes(
         < route_order(routes[current], alias_order[current])
 }
 
+fn route_rank(route: RouteEntry) -> (u32, RouterPreference) {
+    (route.priority, route.preference())
+}
+
 fn route_order(route: RouteEntry, order: AliasOrder) -> (u32, RouterPreference, AliasOrder) {
-    (route.priority, route.preference(), order)
+    let (metric, preference) = route_rank(route);
+    (metric, preference, order)
 }
 
 pub(super) fn smol_route(route: RouteEntry) -> SmolRoute {
@@ -1647,9 +1685,10 @@ mod tests {
             priority: 100,
             ..ordinary
         };
-        let routes = [parent, ordinary, specific, broad];
+        let on_preferred_interface = RouteEntry { oif: 3, ..specific };
+        let routes = [parent, ordinary, specific, broad, on_preferred_interface];
         let index = FibIndex::build(&routes).unwrap();
-        let lookup = |source, required_oif| {
+        let lookup = |source, required_oif, preferred_oif| {
             index.lookup_key(
                 &routes,
                 FibLookupKey {
@@ -1657,14 +1696,74 @@ mod tests {
                     source,
                     table: RT_TABLE_MAIN,
                     required_oif,
+                    preferred_oif,
                     minimum_scope: None,
                     broadcast: BroadcastLookup::Exclude,
                 },
             )
         };
-        assert_eq!(lookup(None, None), Some(0));
-        assert_eq!(lookup(Some(source), None), Some(2));
-        assert_eq!(lookup(Some(source), Some(1)), Some(3));
+        assert_eq!(lookup(None, None, None), Some(0));
+        assert_eq!(lookup(Some(source), None, None), Some(2));
+        assert_eq!(lookup(Some(source), Some(1), None), Some(3));
+        assert_eq!(lookup(Some(source), None, Some(1)), Some(2));
+        assert_eq!(lookup(Some(source), None, Some(3)), Some(4));
+    }
+
+    #[test]
+    fn ipv6_ingress_preference_keeps_route_rank_and_skips_expired_candidates() {
+        let gateway = |suffix| Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, suffix).into();
+        let ordinary = RouteEntry {
+            destination: IpCidr::new(Ipv6Address::UNSPECIFIED.into(), 0),
+            gateway: Some(gateway(1)),
+            ..route([0; 4], 0, 1024, RTN_UNICAST)
+        };
+        let learned = |preference, expires_at_us| {
+            Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
+                expires_at_us,
+                preference,
+            }))
+        };
+        let expired = RouteEntry {
+            oif: 2,
+            gateway: Some(gateway(2)),
+            ra_route: learned(RouterPreference::Medium, 0),
+            ..ordinary
+        };
+        let on_ingress = RouteEntry {
+            oif: 2,
+            gateway: Some(gateway(3)),
+            ..ordinary
+        };
+        let lower_rank = RouteEntry {
+            oif: 2,
+            priority: 2048,
+            gateway: Some(gateway(4)),
+            ..ordinary
+        };
+        let higher_preference = RouteEntry {
+            gateway: Some(gateway(5)),
+            ra_route: learned(RouterPreference::High, i64::MAX),
+            ..ordinary
+        };
+        let lookup = |routes: &[RouteEntry], preferred_oif| {
+            FibIndex::build(routes).unwrap().lookup_key(
+                routes,
+                FibLookupKey {
+                    destination: Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42).into(),
+                    source: None,
+                    table: RT_TABLE_MAIN,
+                    required_oif: None,
+                    preferred_oif,
+                    minimum_scope: None,
+                    broadcast: BroadcastLookup::Exclude,
+                },
+            )
+        };
+        assert_eq!(lookup(&[ordinary, on_ingress], None), Some(0));
+        assert_eq!(lookup(&[ordinary, on_ingress], Some(2)), Some(1));
+        assert_eq!(lookup(&[ordinary, expired, on_ingress], Some(2)), Some(2));
+        assert_eq!(lookup(&[ordinary, expired, lower_rank], Some(2)), Some(0));
+        assert_eq!(lookup(&[higher_preference, on_ingress], Some(2)), Some(0));
     }
 
     #[test]

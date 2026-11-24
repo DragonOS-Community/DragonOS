@@ -241,6 +241,7 @@ pub(super) struct FibLookupKey {
     pub(super) source: Option<Ipv6Address>,
     pub(super) table: u32,
     pub(super) required_oif: Option<u32>,
+    pub(super) preferred_oif: Option<u32>,
     pub(super) minimum_scope: Option<u8>,
     pub(super) broadcast: BroadcastLookup,
 }
@@ -252,6 +253,7 @@ impl FibLookupKey {
             source: None,
             table,
             required_oif: None,
+            preferred_oif: None,
             minimum_scope: None,
             broadcast: if table == super::RT_TABLE_LOCAL {
                 BroadcastLookup::Any
@@ -284,6 +286,7 @@ impl FibLookupKey {
             source: None,
             table,
             required_oif,
+            preferred_oif: None,
             minimum_scope,
             broadcast: BroadcastLookup::Exclude,
         }
@@ -926,16 +929,19 @@ impl FibTable {
         ingress_oif: u32,
         source: Option<Ipv6Address>,
     ) -> Option<RouteLookupResult> {
-        // Multicast, link-local unicast and loopback require the input device. Global
-        // IPv6 destinations retain weak-host lookup across interfaces.
+        // Multicast, link-local unicast and loopback require the input device.
+        // Other IPv6 destinations prefer it among routes with the same rank.
         let required_oif = matches!(
             destination,
             IpAddress::Ipv6(address) if address.is_multicast() || address.is_unicast_link_local() || address.is_loopback()
         )
         .then_some(ingress_oif);
+        let preferred_oif = (matches!(destination, IpAddress::Ipv6(_)) && required_oif.is_none())
+            .then_some(ingress_oif);
         self.lookup_builtin_rules(destination, |table| FibLookupKey {
             source,
             required_oif,
+            preferred_oif,
             ..FibLookupKey::output(destination, table)
         })
     }

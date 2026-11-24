@@ -709,6 +709,19 @@ TEST(RtnetlinkRouteSemantics, Ipv6FibMatchReturnsTheConfiguredRoute) {
                 EXPECT_EQ(reinterpret_cast<nlmsgerr*>(NLMSG_DATA(reply))->error, -ENETUNREACH);
             }
 
+            ASSERT_EQ(SendIpv6AddrRequest(fd.Get(), RTM_NEWADDR, add, veth, "fd85:1::1", 64,
+                                          ++seq), 0);
+            ASSERT_EQ(SendIpv6AddrRequest(fd.Get(), RTM_NEWADDR, add, peer, "fd85:1::2", 64,
+                                          ++seq), 0);
+            for (const uint32_t flags : {0u, uint32_t{RTM_F_FIB_MATCH}}) {
+                for (const uint32_t input : {veth, peer}) {
+                    ASSERT_NO_FATAL_FAILURE(query("fd85:1::9", flags, input, "fd85:1::3"));
+                    ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
+                    expect_attr(RTA_IIF, input);
+                    expect_attr(RTA_OIF, input);
+                }
+            }
+
             const uint32_t unknown = UINT32_MAX;
             ASSERT_NO_FATAL_FAILURE(
                 query("fd74:29::9", RTM_F_FIB_MATCH, lo, "fd74:40::2", unknown));

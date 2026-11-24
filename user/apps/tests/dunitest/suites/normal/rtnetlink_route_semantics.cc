@@ -877,15 +877,89 @@ TEST(RtnetlinkRouteSemantics, Ipv6ExplicitLocalRouteDeliversWithoutOwningAnAddre
                               sizeof(destination));
             };
             ASSERT_EQ(send_byte(), 1);
-            pollfd readable{listener.Get(), POLLIN, 0};
-            ASSERT_EQ(poll(&readable, 1, 2000), 1);
-            char byte = 0;
+            auto receive_byte = [&](const char* expected_source, char expected_byte) {
+                pollfd readable{listener.Get(), POLLIN, 0};
+                ASSERT_EQ(poll(&readable, 1, 2000), 1);
+                char byte = 0;
+                sockaddr_in6 peer{};
+                socklen_t peer_len = sizeof(peer);
+                ASSERT_EQ(recvfrom(listener.Get(), &byte, 1, MSG_DONTWAIT,
+                                   reinterpret_cast<sockaddr*>(&peer), &peer_len), 1);
+                EXPECT_EQ(byte, expected_byte);
+                in6_addr expected{};
+                ASSERT_EQ(inet_pton(AF_INET6, expected_source, &expected), 1);
+                EXPECT_EQ(std::memcmp(&peer.sin6_addr, &expected, sizeof(expected)), 0);
+            };
+            ASSERT_NO_FATAL_FAILURE(receive_byte("::1", 'a'));
+
+            FdGuard automatic(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(automatic.Get(), 0);
+            ASSERT_EQ(sendto(automatic.Get(), "b", 1, 0, reinterpret_cast<sockaddr*>(&destination),
+                             sizeof(destination)), 1) << ErrnoString(errno);
+            ASSERT_NO_FATAL_FAILURE(receive_byte("::1", 'b'));
+
+            auto connected_udp = [&](const char* expected_source) {
+                FdGuard connected(socket(AF_INET6, SOCK_DGRAM, 0));
+                ASSERT_GE(connected.Get(), 0);
+                ASSERT_EQ(connect(connected.Get(), reinterpret_cast<sockaddr*>(&destination),
+                                  sizeof(destination)), 0) << ErrnoString(errno);
+                for (const char byte : {'c', 'd'}) {
+                    ASSERT_EQ(send(connected.Get(), &byte, 1, 0), 1) << ErrnoString(errno);
+                    ASSERT_NO_FATAL_FAILURE(receive_byte(expected_source, byte));
+                }
+            };
+            ASSERT_NO_FATAL_FAILURE(connected_udp("::1"));
+
+            FdGuard tcp_listener(socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0));
+            FdGuard tcp_sender(socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0));
+            ASSERT_GE(tcp_listener.Get(), 0);
+            ASSERT_GE(tcp_sender.Get(), 0);
+            ASSERT_EQ(bind(tcp_listener.Get(), reinterpret_cast<sockaddr*>(&wildcard),
+                           sizeof(wildcard)), 0);
+            ASSERT_EQ(listen(tcp_listener.Get(), 1), 0);
+            if (connect(tcp_sender.Get(), reinterpret_cast<sockaddr*>(&destination),
+                        sizeof(destination)) < 0) {
+                ASSERT_EQ(errno, EINPROGRESS) << ErrnoString(errno);
+                pollfd ready{tcp_sender.Get(), POLLOUT, 0};
+                ASSERT_EQ(poll(&ready, 1, 2000), 1);
+                int error = 0;
+                socklen_t len = sizeof(error);
+                ASSERT_EQ(getsockopt(tcp_sender.Get(), SOL_SOCKET, SO_ERROR, &error, &len), 0);
+                ASSERT_EQ(error, 0) << ErrnoString(error);
+            }
             sockaddr_in6 peer{};
             socklen_t peer_len = sizeof(peer);
-            ASSERT_EQ(recvfrom(listener.Get(), &byte, 1, MSG_DONTWAIT,
-                               reinterpret_cast<sockaddr*>(&peer), &peer_len), 1);
-            EXPECT_EQ(byte, 'a');
+            pollfd incoming{tcp_listener.Get(), POLLIN, 0};
+            ASSERT_EQ(poll(&incoming, 1, 2000), 1);
+            FdGuard accepted(accept(tcp_listener.Get(), reinterpret_cast<sockaddr*>(&peer),
+                                    &peer_len));
+            ASSERT_GE(accepted.Get(), 0) << ErrnoString(errno);
             EXPECT_TRUE(IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
+
+            constexpr char configured_source[] = "fd76:90::1";
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, lo, "fd76:80::1",
+                                          128, ++seq), 0);
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, veth, configured_source,
+                                          64, ++seq), 0);
+            ASSERT_NO_FATAL_FAILURE(connected_udp(configured_source));
+
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fe80::88", 128,
+                                          veth, RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                          std::nullopt, RTN_LOCAL, RT_TABLE_LOCAL), 0);
+            const auto global_destination = destination;
+            ASSERT_EQ(inet_pton(AF_INET6, "fe80::88", &destination.sin6_addr), 1);
+            destination.sin6_scope_id = veth;
+            ASSERT_NO_FATAL_FAILURE(connected_udp(configured_source));
+            destination = global_destination;
+
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_DELADDR, request, lo, "fd76:80::1",
+                                          128, ++seq), 0);
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_DELADDR, request, veth, configured_source,
+                                          64, ++seq), 0);
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, lo, "fe80::85",
+                                          128, ++seq, RT_SCOPE_LINK), 0);
+            ASSERT_NO_FATAL_FAILURE(connected_udp("fe80::85"));
+
 
             ASSERT_EQ(mutate(RTM_DELROUTE, request), 0);
             EXPECT_FALSE(FindIpv6Route(route.Get(), "fd76:80::", 80, veth, ++seq, RTN_LOCAL));

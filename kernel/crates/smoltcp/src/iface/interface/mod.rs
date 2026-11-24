@@ -498,13 +498,18 @@ impl Interface {
 
     /// Returns the best configured IPv6 source and its rank, which can also
     /// be compared with candidates from other interfaces for this destination.
+    /// For route-based selection, the caller restricts the candidate interfaces
+    /// and passes whether this interface owns the selected route. Passing
+    /// `None` retains single-interface candidate eligibility and ranking.
     #[cfg(feature = "proto-ipv6")]
     pub fn ipv6_source_candidate_at(
         &self,
         dst_addr: &Ipv6Address,
         now: Instant,
+        on_route_device: Option<bool>,
     ) -> Option<(impl Ord, Ipv6Address)> {
-        self.inner.ipv6_source_candidate_at(dst_addr, now)
+        self.inner
+            .ipv6_source_candidate_at(dst_addr, now, on_route_device)
     }
 
     /// Publish the finite preferred deadlines of the configured IPv6 addresses.

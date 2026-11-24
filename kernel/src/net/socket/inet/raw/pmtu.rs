@@ -150,7 +150,7 @@ impl RawSocket {
                 0 => None,
                 index => Some(index as u32),
             };
-            let _ = crate::net::route::pmtu::learn(&self.netns, feedback, required_oif);
+            let _ = crate::net::route::pmtu::learn(&self.netns, feedback, required_oif, 0);
         }
         if !connected && !recverr {
             return;

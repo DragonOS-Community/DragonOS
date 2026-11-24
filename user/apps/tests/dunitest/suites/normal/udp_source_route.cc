@@ -119,6 +119,78 @@ TEST_P(UdpSourceRoute, BoundSourceSurvivesSendAndConnectedMtuLookup) {
 
 INSTANTIATE_TEST_SUITE_P(Destinations, UdpSourceRoute, testing::Bool());
 
+TEST(UdpIpv6SourcePrefix, ExplicitAndAutomaticSourcesUseTheSameRoute) {
+    pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto run = [&]() {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            const unsigned lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, 1), 0);
+            constexpr auto add = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+            constexpr char source[] = "fd00:29::1";
+            constexpr char network[] = "2001:db8:29:4::";
+            const Ipv6SourcePrefix prefix{"fd00:29::", 64};
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, lo, source, 64, 2), 0);
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, network, 64,
+                                           lo, RT_SCOPE_UNIVERSE, 3, nullptr, 0, nullptr,
+                                           prefix), 0);
+
+            sockaddr_in6 destination{};
+            destination.sin6_family = AF_INET6;
+            destination.sin6_port = htons(23029);
+            ASSERT_EQ(inet_pton(AF_INET6, "2001:db8:29:4::9", &destination.sin6_addr), 1);
+            sockaddr_in6 expected{};
+            expected.sin6_family = AF_INET6;
+            ASSERT_EQ(inet_pton(AF_INET6, source, &expected.sin6_addr), 1);
+            auto connect_to_destination = [&](int fd) {
+                return connect(fd, reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+            };
+
+            for (bool explicit_source : {false, true}) {
+                SCOPED_TRACE(explicit_source);
+                FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+                ASSERT_GE(sender.Get(), 0);
+                if (explicit_source) {
+                    ASSERT_EQ(bind(sender.Get(), reinterpret_cast<sockaddr*>(&expected),
+                                   sizeof(expected)), 0) << ErrnoString(errno);
+                }
+                ASSERT_EQ(connect_to_destination(sender.Get()), 0) << ErrnoString(errno);
+                sockaddr_in6 selected{};
+                socklen_t length = sizeof(selected);
+                ASSERT_EQ(getsockname(sender.Get(), reinterpret_cast<sockaddr*>(&selected), &length), 0);
+                EXPECT_EQ(memcmp(&selected.sin6_addr, &expected.sin6_addr, sizeof(in6_addr)), 0);
+            }
+
+            FdGuard unmatched(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(unmatched.Get(), 0);
+            sockaddr_in6 loopback = expected;
+            loopback.sin6_addr = in6addr_loopback;
+            ASSERT_EQ(bind(unmatched.Get(), reinterpret_cast<sockaddr*>(&loopback),
+                           sizeof(loopback)), 0) << ErrnoString(errno);
+            ASSERT_EQ(connect_to_destination(unmatched.Get()), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK,
+                                           network, 64, lo, RT_SCOPE_UNIVERSE, 4, nullptr, 0,
+                                           nullptr, prefix), 0);
+            FdGuard after_delete(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(after_delete.Get(), 0);
+            ASSERT_EQ(connect_to_destination(after_delete.Get()), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+        };
+        run();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 // Match ip6_dst_lookup_tail: automatic source selection can fail before a
 // missing route is reported. Keep missing-source and missing-route errors apart.
 class UdpIpv6MissingSource : public testing::TestWithParam<bool> {};

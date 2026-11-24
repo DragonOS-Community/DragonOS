@@ -76,12 +76,12 @@ impl TcpBound {
         remote: IpAddress,
         netns: Arc<NetNamespace>,
         device: Option<Arc<dyn Iface>>,
-    ) -> Result<(Self, IpAddress), (tcp::Socket<'static>, SystemError)> {
+    ) -> Result<(Self, IpAddress, u64), (tcp::Socket<'static>, SystemError)> {
         let target = match common::tcp_connect_target(&remote, &netns, device) {
             Ok(target) => target,
             Err(error) => return Err((socket, error)),
         };
-        Self::new(socket, netns).map(|bound| (bound, target.local_addr))
+        Self::new(socket, netns).map(|bound| (bound, target.local_addr, target.route_cookie))
     }
 
     pub fn with_mut<T: smoltcp::socket::AnySocket<'static>, R, F: FnMut(&mut T) -> R>(

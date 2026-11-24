@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use smoltcp::wire::{EthernetFrame, IpAddress, IpCidr, Ipv4Packet};
+use smoltcp::wire::{EthernetFrame, IpAddress, IpCidr, Ipv4Packet, Ipv6Address};
 use system_error::SystemError;
 
 mod nat;
@@ -135,9 +135,10 @@ impl Router {
         &self,
         dest_ip: IpAddress,
         ingress_oif: u32,
+        source: Option<Ipv6Address>,
     ) -> Option<IngressRouteDecision> {
         let netns = self.ns.read().upgrade()?;
-        let decision = crate::net::route::lookup_ingress(&netns, dest_ip, ingress_oif)?;
+        let decision = crate::net::route::lookup_ingress(&netns, dest_ip, ingress_oif, source)?;
         let interface = netns.device_list().get(&(decision.oif as usize)).cloned()?;
         match decision.matched.kind {
             crate::net::route::RTN_LOCAL => Some(IngressRouteDecision::Local(interface)),
@@ -208,7 +209,7 @@ pub trait RouterEnableDevice: Iface {
                 let router = self.netns_router();
 
                 let decision =
-                    match router.lookup_ingress_route(dst_ip.into(), self.nic_id() as u32) {
+                    match router.lookup_ingress_route(dst_ip.into(), self.nic_id() as u32, None) {
                         Some(d) => d,
                         None => {
                             log::warn!("No route to {}", dst_ip);
@@ -313,9 +314,12 @@ pub trait RouterEnableDevice: Iface {
                 {
                     return Err(None);
                 }
-                let Some(IngressRouteDecision::Local(interface)) = self
-                    .netns_router()
-                    .lookup_ingress_route(repr.dst_addr.into(), self.nic_id() as u32)
+                let Some(IngressRouteDecision::Local(interface)) =
+                    self.netns_router().lookup_ingress_route(
+                        repr.dst_addr.into(),
+                        self.nic_id() as u32,
+                        Some(repr.src_addr),
+                    )
                 else {
                     // This path implements host delivery only, not IPv6
                     // forwarding. Let the physical stack reject other input.

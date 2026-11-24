@@ -535,9 +535,9 @@ mod tests {
         let mut l = listener();
         l.listen_bound_device = NonZeroU32::new(3);
         let l = sockets.add(l);
-        sockets.process_tcp_sockets(&mut cx, PacketMeta { id: 2 }, &ip(), &syn(2100, 3001));
+        sockets.process_tcp_sockets(&mut cx, PacketMeta::with_id(2), &ip(), &syn(2100, 3001));
         assert_eq!(sockets.get::<Socket>(l).state(), State::Listen);
-        sockets.process_tcp_sockets(&mut cx, PacketMeta { id: 3 }, &ip(), &syn(2100, 3001));
+        sockets.process_tcp_sockets(&mut cx, PacketMeta::with_id(3), &ip(), &syn(2100, 3001));
         assert_eq!(sockets.get::<Socket>(l).state(), State::SynReceived);
         assert!(sockets.has_tcp_time_wait()); // device 2 remains protected
     }

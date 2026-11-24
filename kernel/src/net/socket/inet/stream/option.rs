@@ -147,7 +147,7 @@ impl super::TcpSocket {
     /// Snapshot transport identity first, then resolve the current path after
     /// dropping protocol locks. Route lookup must never follow SocketSet locks.
     fn socket_path_mtu(&self) -> Result<usize, SystemError> {
-        let (local, remote) = {
+        let (local, remote, required_oif, route_cookie) = {
             let guard = self.inner.read();
             let state = guard.as_ref().ok_or(SystemError::ENOTCONN)?;
             if !matches!(
@@ -156,11 +156,16 @@ impl super::TcpSocket {
             ) {
                 return Err(SystemError::ENOTCONN);
             }
+            let (oif, cookie) = state
+                .with_socket(|socket| (socket.bound_device(), socket.tx_route_cookie()))
+                .ok_or(SystemError::ENOTCONN)?;
             (
                 state.local_endpoint(),
                 state
                     .transport_remote_endpoint()
                     .ok_or(SystemError::ENOTCONN)?,
+                oif.map(core::num::NonZeroU32::get),
+                cookie,
             )
         };
         let netns = self.netns();
@@ -172,11 +177,14 @@ impl super::TcpSocket {
         );
         let router = netns.router();
         let routes = crate::net::route::lock_output_routes(&router, netns.device_list());
-        let required_oif =
-            u32::try_from(self.device_binding.ifindex()).map_err(|_| SystemError::ENODEV)?;
-        let route = routes
-            .lookup(destination, (required_oif != 0).then_some(required_oif))
-            .ok_or(SystemError::ENOTCONN)?;
+        let route = crate::net::route::pmtu::lookup_output_route(
+            &routes,
+            required_oif,
+            (local.addr, remote.addr),
+            (source, destination),
+            route_cookie,
+        )
+        .ok_or(SystemError::ENOTCONN)?;
         Ok(crate::net::route::pmtu::path_mtu(&netns, route, source, destination).path)
     }
 

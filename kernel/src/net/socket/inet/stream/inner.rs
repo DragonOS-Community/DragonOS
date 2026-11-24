@@ -352,6 +352,7 @@ impl Init {
             super::bound::TcpBound,
             smoltcp::wire::IpEndpoint,
             TcpPortReservation,
+            u64,
         ),
         (Self, SystemError),
     > {
@@ -362,7 +363,7 @@ impl Init {
                     Err(err) => return Err((Self::Unbound((socket, ver)), err)),
                 };
                 socket.set_bound_device(NonZeroU32::new(device_binding.ifindex() as u32));
-                let (bound, address) =
+                let (bound, address, route_cookie) =
                     match super::bound::TcpBound::bind_ephemeral_recoverable_on_device(
                         socket,
                         remote_endpoint.addr,
@@ -386,7 +387,7 @@ impl Init {
                     }
                 };
                 let endpoint = smoltcp::wire::IpEndpoint::new(address, reservation.port);
-                Ok((bound, endpoint, reservation))
+                Ok((bound, endpoint, reservation, route_cookie))
             }
             Init::Bound(_) => Err((self, SystemError::EINVAL)),
         }
@@ -454,14 +455,14 @@ impl Init {
         automatic: bool,
     ) -> Result<Connecting, (Self, SystemError)> {
         let device_binding = owner.device_binding();
-        let (inner, mut local, mut reservation) = match self {
+        let (inner, mut local, mut reservation, mut route_cookie) = match self {
             Init::Unbound(_) => self.bind_to_ephemeral(
                 remote_endpoint,
                 netns.clone(),
                 device_binding.clone(),
                 owner,
             )?,
-            Init::Bound(inner) => inner,
+            Init::Bound((inner, local, reservation)) => (inner, local, reservation, 0),
         };
         if let Err(err) = socket::inet::common::ensure_bound_dual_stack_remote_compatible(
             local.addr,
@@ -479,6 +480,7 @@ impl Init {
                 Err(err) => return Err((Init::Bound((inner, local, reservation)), err)),
             };
             local.addr = target.local_addr;
+            route_cookie = target.route_cookie;
         }
         // Publish before taking the SocketSet lock and making the first SYN
         // visible to poll. The RAII reservation survives until Connecting is
@@ -512,6 +514,11 @@ impl Init {
             context.now = crate::time::Instant::now().into();
             sockets
                 .connect_tcp(inner.handle(), context, remote_endpoint, local, policy)
+                .map(|()| {
+                    sockets
+                        .get_mut::<tcp::Socket>(inner.handle())
+                        .set_tx_route_cookie(route_cookie);
+                })
                 .map_err(|err| match err {
                     tcp::ConnectError::AddressInUse => SystemError::EADDRNOTAVAIL,
                     tcp::ConnectError::InvalidState => SystemError::EINVAL,

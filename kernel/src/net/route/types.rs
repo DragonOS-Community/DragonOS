@@ -250,6 +250,9 @@ pub(crate) struct RouteNotifications {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RouteDeleteSelector {
     pub destination: IpCidr,
+    /// Exact IPv6 source selector. Absent selects the ordinary destination
+    /// route. IPv4 does not interpret this field.
+    pub source: Option<IpCidr>,
     pub table: u32,
     pub priority: Option<u32>,
     pub tos: Option<u8>,

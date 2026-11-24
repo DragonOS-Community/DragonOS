@@ -180,6 +180,7 @@ pub(super) fn do_del_route(
         &netns,
         RouteDeleteSelector {
             destination: route::canonical_cidr(parsed.destination),
+            source: parsed.source,
             table,
             priority: parsed.priority.filter(|priority| *priority != 0),
             tos: ipv4.then_some(request.body().tos).filter(|tos| *tos != 0),
@@ -247,6 +248,20 @@ impl ParsedRouteRequest {
                 | RouteAttr::CacheInfo(_)
                 | RouteAttr::Preference(_) => {}
             }
+        }
+        if family == AddressFamily::INet6 {
+            // Linux identifies an IPv6 route by its source prefix, with /0
+            // representing the destination-only route. An omitted attribute
+            // leaves the address zero even when the header specifies a prefix.
+            parsed.source = if segment.body().src_len == 0 {
+                None
+            } else {
+                let source = match parsed.source {
+                    Some(source) => source,
+                    None => default_cidr(family, segment.body().src_len)?,
+                };
+                Some(route::canonical_cidr(source))
+            };
         }
         Ok(parsed)
     }
@@ -446,18 +461,18 @@ fn lookup_route(
     if requested_source.is_some_and(|source| !source.is_unicast()) {
         return Err(SystemError::EINVAL);
     }
-    if requested_source.is_some_and(|source| {
-        !netns.device_list().values().any(|candidate| {
-            candidate
-                .common()
-                .ip_addrs()
-                .iter()
-                .any(|cidr| cidr.address() == source)
-        })
-    }) {
-        return Err(SystemError::ENETUNREACH);
-    }
     let (decision, selected_source) = if matches!(destination, IpAddress::Ipv4(_)) {
+        if requested_source.is_some_and(|source| {
+            !netns.device_list().values().any(|candidate| {
+                candidate
+                    .common()
+                    .ip_addrs()
+                    .iter()
+                    .any(|cidr| cidr.address() == source)
+            })
+        }) {
+            return Err(SystemError::ENETUNREACH);
+        }
         let resolved =
             route::resolve_ipv4_route(&netns, destination, requested_oif, requested_source)?;
         let selected = requested_source
@@ -466,11 +481,15 @@ fn lookup_route(
             .filter(|source| !source.is_unspecified());
         (resolved.decision, selected)
     } else {
-        let decision = match requested_oif {
-            Some(oif) => route::lookup_on_iface(&netns, destination, oif),
-            None => route::lookup(&netns, destination),
-        }
-        .ok_or(SystemError::ENETUNREACH)?;
+        let IpAddress::Ipv6(destination_v6) = destination else {
+            unreachable!()
+        };
+        let source = match requested_source {
+            Some(IpAddress::Ipv6(source)) => Some(source),
+            _ => None,
+        };
+        let decision = route::lookup_ipv6_output(&netns, destination_v6, requested_oif, source)
+            .ok_or(SystemError::ENETUNREACH)?;
         let iface = netns
             .device_list()
             .get(&(decision.oif as usize))

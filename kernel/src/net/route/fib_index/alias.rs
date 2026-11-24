@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
-use smoltcp::wire::IpAddress;
+use smoltcp::wire::{IpAddress, IpCidr};
 use system_error::SystemError;
 
 use super::PrefixKey;
@@ -11,6 +11,7 @@ use crate::net::route::RouteEntry;
 struct ConflictKey {
     prefix: PrefixKey,
     priority: u32,
+    ipv6_source: Option<IpCidr>,
     ipv4_tos: Option<u8>,
 }
 
@@ -19,6 +20,11 @@ impl ConflictKey {
         Self {
             prefix: PrefixKey::new(route.table, route.destination),
             priority: route.priority,
+            ipv6_source: if matches!(route.destination, IpCidr::Ipv6(_)) {
+                route.source
+            } else {
+                None
+            },
             ipv4_tos: matches!(route.destination.address(), IpAddress::Ipv4(_))
                 .then_some(route.tos),
         }
@@ -55,7 +61,7 @@ pub(in crate::net::route) struct AliasInsertAnalysis {
     pub(in crate::net::route) placement: AliasPlacement,
 }
 
-/// Write-side metadata for Linux-style aliases sharing one destination prefix.
+/// Write-side metadata for aliases sharing a destination and IPv6 source prefix.
 ///
 /// The authoritative route vector remains unchanged. Hash lookups answer the
 /// exact/conflict questions used by insertion planning, while a compact order

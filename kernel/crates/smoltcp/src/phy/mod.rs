@@ -165,6 +165,19 @@ pub use self::tuntap_interface::TunTapInterface;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
+    /// Opaque route state supplied by the caller for socket output.
+    #[cfg(feature = "packetmeta-id")]
+    pub route_cookie: u64,
+}
+
+#[cfg(all(test, feature = "packetmeta-id"))]
+impl PacketMeta {
+    pub(crate) const fn with_id(id: u32) -> Self {
+        Self {
+            id,
+            route_cookie: 0,
+        }
+    }
 }
 
 /// A description of checksum behavior for a particular protocol.

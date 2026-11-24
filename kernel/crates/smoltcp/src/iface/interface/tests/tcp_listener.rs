@@ -327,7 +327,7 @@ mod device_binding {
         }
 
         fn meta(&self) -> PacketMeta {
-            PacketMeta { id: self.id }
+            PacketMeta::with_id(self.id)
         }
     }
 
@@ -435,7 +435,7 @@ mod device_binding {
                 for id in [0, 8] {
                     iface.inner.process_tcp(
                         &mut sockets,
-                        PacketMeta { id },
+                        PacketMeta::with_id(id),
                         ip.clone(),
                         &emit(&ip, &syn()),
                     );
@@ -469,7 +469,7 @@ mod device_binding {
             if bound.is_some() {
                 iface.inner.process_tcp(
                     &mut sockets,
-                    PacketMeta { id: 8 },
+                    PacketMeta::with_id(8),
                     ip.clone(),
                     &emit(&ip, &ack),
                 );
@@ -512,11 +512,11 @@ mod device_binding {
         let bytes = emit(&ip, &syn());
         assert!(iface
             .inner
-            .process_tcp(&mut sockets, PacketMeta { id: 7 }, ip.clone(), &bytes)
+            .process_tcp(&mut sockets, PacketMeta::with_id(7), ip.clone(), &bytes)
             .is_none());
         let reset = iface
             .inner
-            .process_tcp(&mut sockets, PacketMeta { id: 8 }, ip.clone(), &bytes)
+            .process_tcp(&mut sockets, PacketMeta::with_id(8), ip.clone(), &bytes)
             .unwrap();
         assert_eq!(reset.tx_meta().id, 0);
     }
@@ -540,7 +540,7 @@ mod device_binding {
             },
             IpPayload::Tcp(syn()),
         )
-        .with_tx_meta(PacketMeta { id: 7 });
+        .with_tx_meta(PacketMeta::with_id(7));
         iface
             .inner
             .dispatch_ip(

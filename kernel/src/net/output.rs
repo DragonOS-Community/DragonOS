@@ -517,11 +517,11 @@ fn submit_ipv6(
     let output_routes = ruleset
         .ipv6_hook_requires_route_lookup(NftIpv4Hook::LocalOut)
         .then(|| super::route::lock_output_routes(&router, netns.device_list()));
-    let resolve = |address, device| {
+    let resolve = |address, source, device| {
         output_routes
             .as_ref()
             .map_or(super::route::RTN_UNREACHABLE, |routes| {
-                routes.ipv6_addr_type(address, device)
+                routes.ipv6_addr_type(address, source, device)
             })
     };
     let output_lookup = output_routes.as_ref().map(|_| NftIpv6RouteLookup {
@@ -538,13 +538,14 @@ fn submit_ipv6(
         return Err(SystemError::EPERM.into());
     }
     drop(output_routes);
+    let packet = Ipv6Packet::new_checked(reservation.bytes()).map_err(|_| SystemError::EINVAL)?;
     let (selected, masquerade) = route_after_output(
         netns,
         &ruleset,
         IpVersion::Ipv6,
         initial_destination,
-        destination(reservation.bytes(), IpVersion::Ipv6)?,
-        None,
+        packet.dst_addr().into(),
+        Some(packet.src_addr().into()),
         route,
     )?;
     route = selected;
@@ -580,11 +581,11 @@ fn submit_ipv6(
     let post_routes = ruleset
         .ipv6_hook_requires_route_lookup(NftIpv4Hook::PostRouting)
         .then(|| super::route::lock_output_routes(&router, netns.device_list()));
-    let resolve = |address, device| {
+    let resolve = |address, source, device| {
         post_routes
             .as_ref()
             .map_or(super::route::RTN_UNREACHABLE, |routes| {
-                routes.ipv6_addr_type(address, device)
+                routes.ipv6_addr_type(address, source, device)
             })
     };
     let post_lookup = post_routes.as_ref().map(|_| NftIpv6RouteLookup {

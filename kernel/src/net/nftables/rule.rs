@@ -246,6 +246,7 @@ impl NftRule {
                         };
                         (lookup.resolve)(
                             field.select(ipv6.src_addr(), ipv6.dst_addr()),
+                            Some(field.select(ipv6.dst_addr(), ipv6.src_addr())),
                             lookup.device,
                         )
                     } else {
@@ -1165,7 +1166,7 @@ impl NftXtAddrtype {
                 let lookup = context.ipv6_route_lookup?;
                 Some(
                     self.matches_local(packet.src_addr(), packet.dst_addr(), |addr| {
-                        (lookup.resolve)(addr, None)
+                        (lookup.resolve)(addr, None, None)
                     }),
                 )
             }

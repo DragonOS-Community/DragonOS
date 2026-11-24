@@ -1411,7 +1411,7 @@ mod test {
             &REMOTE_UDP_REPR,
             PAYLOAD,
         );
-        let meta = PacketMeta { id: 9 };
+        let meta = PacketMeta::with_id(9);
         socket.process(cx, meta, &REMOTE_IP_REPR, &REMOTE_UDP_REPR, &[]);
         socket.unbind();
         assert_eq!(socket.recv().unwrap().1.meta.id, 7);

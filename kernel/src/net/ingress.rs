@@ -381,7 +381,8 @@ impl<'a> NetIngressFilter<'a> {
         if destination.is_multicast() {
             return RouteInputVerdict::Pass;
         }
-        let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex) else {
+        let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex, Some(source))
+        else {
             return RouteInputVerdict::Pass;
         };
         match route.matched.kind {
@@ -570,7 +571,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             && target != Ipv4Address::BROADCAST
             && self.fib_routes.is_some_and(|routes| {
                 routes
-                    .lookup_ingress(target.into(), self.owner_ifindex)
+                    .lookup_ingress(target.into(), self.owner_ifindex, None)
                     .is_some_and(|route| route.matched.kind == RTN_LOCAL)
             });
         // Never fall back to smoltcp's AnyIP ARP replies when this integration
@@ -859,7 +860,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         // authority for that address, so it cannot be accepted as a unicast
         // source merely because its octets have an ordinary host shape.
         if routes
-            .lookup_ingress(IpAddress::Ipv4(ipv4.src_addr()), ingress_ifindex)
+            .lookup_ingress(IpAddress::Ipv4(ipv4.src_addr()), ingress_ifindex, None)
             .is_some_and(|route| route.matched.kind == RTN_BROADCAST)
         {
             return RouteInputVerdict::Drop;
@@ -869,7 +870,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if destination.is_multicast() {
             return RouteInputVerdict::Pass;
         }
-        let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex) else {
+        let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex, None) else {
             return RouteInputVerdict::Pass;
         };
         match route.matched.kind {
@@ -1373,7 +1374,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         } else {
             self.owner_ifindex
         };
-        let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex) else {
+        let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex, None) else {
             return RouteInputVerdict::Pass;
         };
         if route.matched.kind != RTN_UNICAST {

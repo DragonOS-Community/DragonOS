@@ -205,7 +205,7 @@ mod hook_program_tests {
             rule.evaluate(&NftPacket::new_ipv6(&bytes), &[]),
             RuleResult::Verdict(NftRuleVerdict::Drop)
         ));
-        let local = |address, _| {
+        let local = |address, _, _| {
             if address == Ipv6Address::LOCALHOST {
                 crate::net::route::RTN_LOCAL
             } else {
@@ -219,7 +219,7 @@ mod hook_program_tests {
         let view = NftPacket::new_ipv6(&bytes).with_ipv6_route_lookup(local);
         assert_eq!(matcher.evaluate(&view), Some(true));
         let nonlocal = NftIpv6RouteLookup {
-            resolve: &|_, _| crate::net::route::RTN_UNREACHABLE,
+            resolve: &|_, _, _| crate::net::route::RTN_UNREACHABLE,
             device: None,
         };
         let view = NftPacket::new_ipv6(&bytes).with_ipv6_route_lookup(nonlocal);

@@ -87,32 +87,21 @@ impl RawSocket {
                 .resolve_iface(&self.netns)?
                 .map(|iface| iface.nic_id() as u32),
         };
-        let (route, owner, source) = if options.ip_hdrincl {
-            let route = crate::net::route::resolve_ipv6_output_route(
-                &self.netns,
-                destination,
-                required_oif,
-                None,
-            )?;
-            let owner = self
-                .netns
+        let resolved = crate::net::route::resolve_ipv6_send_route(
+            &self.netns,
+            destination,
+            required_oif,
+            fixed_source,
+        )?;
+        let route = resolved.decision;
+        let owner = if options.ip_hdrincl {
+            self.netns
                 .device_list()
                 .get(&(route.oif as usize))
                 .cloned()
-                .ok_or(SystemError::ENETUNREACH)?;
-            (route, owner, None)
+                .ok_or(SystemError::ENETUNREACH)?
         } else {
-            let resolved = crate::net::route::resolve_ipv6_send_route(
-                &self.netns,
-                destination,
-                required_oif,
-                fixed_source,
-            )?;
-            (
-                resolved.decision,
-                resolved.source_owner,
-                Some(resolved.source),
-            )
+            resolved.source_owner
         };
         if !self.is_bound() {
             // Attachment is receive inventory, not a permanent output source.
@@ -138,7 +127,7 @@ impl RawSocket {
         } else {
             let params = IpPacketParams {
                 payload: buf,
-                src: source.expect("non-HDRINCL output selected a source").into(),
+                src: resolved.source.into(),
                 dst: destination,
                 protocol: self.protocol,
                 ttl: hop_limit.unwrap_or(if destination.is_multicast() {
@@ -156,7 +145,7 @@ impl RawSocket {
             let mtu = crate::net::route::pmtu::path_mtu(
                 &self.netns,
                 route,
-                source.expect("selected IPv6 source").into(),
+                resolved.source.into(),
                 destination,
             );
             let mut effective = options.ipv6_pmtu.effective_mtu(mtu.interface, mtu.path);

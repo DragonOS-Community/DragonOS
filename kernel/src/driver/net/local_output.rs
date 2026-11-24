@@ -198,11 +198,16 @@ impl OutputBackendPolicy<'_> {
             remote,
             smoltcp::wire::IpProtocol::Tcp,
         );
-        self.routes
-            .lookup(destination, (meta.id != 0).then_some(meta.id))
-            .map_or(u16::MAX as usize, |route| {
-                crate::net::route::pmtu::path_mtu(self.netns, route, source, destination).path
-            })
+        crate::net::route::pmtu::lookup_output_route(
+            self.routes,
+            (meta.id != 0).then_some(meta.id),
+            (local.addr, remote.addr),
+            (source, destination),
+            meta.route_cookie,
+        )
+        .map_or(u16::MAX as usize, |route| {
+            crate::net::route::pmtu::path_mtu(self.netns, route, source, destination).path
+        })
     }
 
     pub(super) fn outbound_tcp_mtu_generation(self) -> u64 {
@@ -258,7 +263,7 @@ impl OutputBackendPolicy<'_> {
         meta: PacketMeta,
         native_mtu: usize,
     ) -> usize {
-        match self.classify(destination.version(), destination, meta) {
+        match self.classify(destination, None, meta) {
             OutputBackendDecision::Deferred(Some(route)) => route.ip_mtu.min(u16::MAX as usize),
             // A missing route must not prevent TCP from advancing its timers.
             // Actual packet dispatch still rejects the missing route.
@@ -272,7 +277,8 @@ impl OutputBackendPolicy<'_> {
         destination: smoltcp::wire::IpAddress,
         meta: PacketMeta,
     ) -> Result<OutputBackendDecision, smoltcp::phy::TxEgressError> {
-        let decision = self.classify(destination.version(), destination, meta);
+        let source_v6 = matches!(source, smoltcp::wire::IpAddress::Ipv6(_)).then_some(source);
+        let decision = self.classify(destination, source_v6, meta);
         if let smoltcp::wire::IpAddress::Ipv4(source) = source {
             match decision {
                 OutputBackendDecision::NativeOwner => self
@@ -288,12 +294,13 @@ impl OutputBackendPolicy<'_> {
         Ok(decision)
     }
 
-    pub(super) fn classify(
+    fn classify(
         self,
-        version: smoltcp::wire::IpVersion,
         destination: smoltcp::wire::IpAddress,
+        source: Option<smoltcp::wire::IpAddress>,
         meta: PacketMeta,
     ) -> OutputBackendDecision {
+        let version = destination.version();
         if self.owner_ifindex != 0
             && version == smoltcp::wire::IpVersion::Ipv6
             && destination.is_multicast()
@@ -305,14 +312,20 @@ impl OutputBackendPolicy<'_> {
             };
         }
         let constrained_oif = (meta.id != 0).then_some(meta.id);
-        match self.routes.lookup(destination, constrained_oif) {
+        match self.routes.lookup_socket_output(
+            destination,
+            constrained_oif,
+            source,
+            meta.route_cookie,
+        ) {
             Some(route) if route.kind == crate::net::route::RTN_LOCAL => {
                 OutputBackendDecision::Deferred(Some(route))
             }
             Some(route)
                 if route.oif == self.owner_ifindex
                     && self.owner_is_up
-                    && (version != smoltcp::wire::IpVersion::Ipv6 || self.owner_ipv6_enabled)
+                    && (version != smoltcp::wire::IpVersion::Ipv6
+                        || self.owner_ipv6_enabled && !self.routes.has_ipv6_source_routes())
                     && !self.configured_neighbors.is_some_and(|neighbors| {
                         neighbors.lookup(route.oif, route.next_hop).is_some()
                     })
@@ -1380,12 +1393,12 @@ impl SmolTxToken for LocalInputTxToken<'_> {
         }
         let bytes = self.scratch.resize(len);
         emit(bytes);
-        let destination = match IpVersion::of_packet(bytes) {
+        let (destination, source_v6) = match IpVersion::of_packet(bytes) {
             Ok(IpVersion::Ipv4) => Ipv4Packet::new_checked(&bytes[..])
-                .map(|packet| IpAddress::Ipv4(packet.dst_addr()))
+                .map(|packet| (IpAddress::Ipv4(packet.dst_addr()), None))
                 .map_err(|_| IpOutputError::NoRoute)?,
             Ok(IpVersion::Ipv6) => Ipv6Packet::new_checked(&bytes[..])
-                .map(|packet| IpAddress::Ipv6(packet.dst_addr()))
+                .map(|packet| (packet.dst_addr().into(), Some(packet.src_addr().into())))
                 .map_err(|_| IpOutputError::NoRoute)?,
             Err(_) => return Err(IpOutputError::NoRoute),
         };
@@ -1418,7 +1431,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             let required_oif = (meta.id != 0).then_some(meta.id);
             self.backend_policy
                 .routes
-                .lookup(destination, required_oif)
+                .lookup_socket_output(destination, required_oif, source_v6, meta.route_cookie)
                 .ok_or(IpOutputError::NoRoute)?
         };
         let version = destination.version();
@@ -1443,7 +1456,11 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             )
             .ok_or(IpOutputError::PolicyDrop)?;
         let lookup = |address| self.backend_policy.routes.ipv4_addr_type(address);
-        let resolve = |address, device| self.backend_policy.routes.ipv6_addr_type(address, device);
+        let resolve = |address, source, device| {
+            self.backend_policy
+                .routes
+                .ipv6_addr_type(address, source, device)
+        };
         let output_allowed = if ipv4 {
             ct.evaluate_ipv4(
                 crate::net::nftables::NftIpv4Hook::LocalOut,
@@ -1480,7 +1497,7 @@ impl SmolTxToken for LocalInputTxToken<'_> {
             route = self
                 .backend_policy
                 .routes
-                .lookup(new_destination, route.required_oif)
+                .lookup_with_source(new_destination, route.required_oif, source_v6)
                 .ok_or(IpOutputError::NoRoute)?;
             let egress = self
                 .backend_policy

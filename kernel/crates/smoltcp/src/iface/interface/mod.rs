@@ -496,6 +496,17 @@ impl Interface {
         self.inner.get_source_address_ipv6_at(dst_addr, now)
     }
 
+    /// Returns the best configured IPv6 source and its rank, which can also
+    /// be compared with candidates from other interfaces for this destination.
+    #[cfg(feature = "proto-ipv6")]
+    pub fn ipv6_source_candidate_at(
+        &self,
+        dst_addr: &Ipv6Address,
+        now: Instant,
+    ) -> Option<(impl Ord, Ipv6Address)> {
+        self.inner.ipv6_source_candidate_at(dst_addr, now)
+    }
+
     /// Publish the finite preferred deadlines of the configured IPv6 addresses.
     #[cfg(feature = "proto-ipv6")]
     pub fn set_ipv6_preferred_deadlines(

@@ -37,7 +37,9 @@ pub(crate) use lifecycle::{
 pub(crate) use source::{
     resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow, ResolvedIpv4Route,
 };
-pub(crate) use source::{resolve_ipv6_output_route, resolve_ipv6_send_route};
+pub(crate) use source::{
+    resolve_ipv6_output_route, resolve_ipv6_send_route, resolve_ipv6_socket_route, Ipv6RouteIntent,
+};
 use transaction::{
     prepare_with_devices, prepare_with_devices_from, projection_for_iface, transact_single,
     transact_with_devices, PreparedTransaction, ProjectionPlan,
@@ -213,17 +215,26 @@ impl OutputRouteGuard<'_> {
             .map(|iface| iface.mtu())
     }
 
+    pub(crate) fn has_ipv6_source_routes(&self) -> bool {
+        self.fib.has_ipv6_source_routes()
+    }
+
     pub(crate) fn ipv4_addr_type(&self, address: Ipv4Address) -> u8 {
         self.fib.ipv4_addr_type(address)
     }
 
-    pub(crate) fn ipv6_addr_type(&self, address: Ipv6Address, device: Option<u32>) -> u8 {
+    pub(crate) fn ipv6_addr_type(
+        &self,
+        address: Ipv6Address,
+        source: Option<Ipv6Address>,
+        device: Option<u32>,
+    ) -> u8 {
         let destination = IpAddress::Ipv6(address);
         let multicast = address.is_multicast();
         let link_scoped =
             is_ipv6_link_local(destination) || (multicast && address.octets()[1] & 0x0f == 2);
         let oif = device.filter(|_| link_scoped);
-        let Some(route) = lookup_output_fib(&self.fib, destination, oif) else {
+        let Some(route) = self.fib.lookup_ipv6_output(address, oif, source) else {
             return RTN_UNREACHABLE;
         };
         let route = route.matched;
@@ -263,8 +274,28 @@ impl OutputRouteGuard<'_> {
         oif: Option<u32>,
         source: Option<IpAddress>,
     ) -> Option<OutputRouteDecision> {
-        let route =
-            lookup_output_fib_with_source(&self.fib, &self.devices, destination, oif, source)?;
+        self.lookup_socket_output(destination, oif, source, 0)
+    }
+
+    pub(crate) fn lookup_socket_output(
+        &self,
+        destination: IpAddress,
+        oif: Option<u32>,
+        source: Option<IpAddress>,
+        route_cookie: u64,
+    ) -> Option<OutputRouteDecision> {
+        let route = if let (IpAddress::Ipv6(destination), Some(IpAddress::Ipv6(source))) =
+            (destination, source)
+        {
+            self.fib.lookup_ipv6_socket_output(
+                destination,
+                oif,
+                (!source.is_unspecified()).then_some(source),
+                route_cookie,
+            )
+        } else {
+            lookup_output_fib_with_source(&self.fib, &self.devices, destination, oif, source)
+        }?;
         let iface = self.devices.get(&(route.oif as usize))?;
         Some(OutputRouteDecision {
             oif: route.oif,
@@ -283,8 +314,9 @@ impl OutputRouteGuard<'_> {
         &self,
         destination: IpAddress,
         ingress_oif: u32,
+        source: Option<Ipv6Address>,
     ) -> Option<RouteLookupResult> {
-        lookup_ingress_fib(&self.fib, destination, ingress_oif)
+        lookup_ingress_fib(&self.fib, destination, ingress_oif, source)
     }
 
     pub(crate) fn allows_ipv4_loopback_ingress(&self, ifindex: u32, source: Ipv4Address) -> bool {
@@ -571,6 +603,19 @@ pub(crate) fn lookup(
     lookup_output_fib(&netns.router().fib.read(), destination, None)
 }
 
+pub(crate) fn lookup_ipv6_output(
+    netns: &Arc<NetNamespace>,
+    destination: Ipv6Address,
+    oif: Option<u32>,
+    source: Option<Ipv6Address>,
+) -> Option<RouteLookupResult> {
+    netns
+        .router()
+        .fib
+        .read()
+        .lookup_ipv6_output(destination, oif, source)
+}
+
 pub(crate) fn ipv4_addr_type(netns: &Arc<NetNamespace>, address: Ipv4Address) -> u8 {
     netns.router().fib.read().ipv4_addr_type(address)
 }
@@ -582,27 +627,21 @@ pub(crate) fn lookup_ingress(
     netns: &Arc<NetNamespace>,
     destination: IpAddress,
     ingress_oif: u32,
+    source: Option<Ipv6Address>,
 ) -> Option<RouteLookupResult> {
-    lookup_ingress_fib(&netns.router().fib.read(), destination, ingress_oif)
+    lookup_ingress_fib(&netns.router().fib.read(), destination, ingress_oif, source)
 }
 
 fn lookup_ingress_fib(
     fib: &FibTable,
     destination: IpAddress,
     ingress_oif: u32,
+    source: Option<Ipv6Address>,
 ) -> Option<RouteLookupResult> {
     if is_limited_broadcast(destination) {
         return Some(RouteLookupResult::limited_broadcast(ingress_oif));
     }
-    fib.lookup_ingress(destination, ingress_oif)
-}
-
-pub(crate) fn lookup_on_iface(
-    netns: &Arc<NetNamespace>,
-    destination: IpAddress,
-    oif: u32,
-) -> Option<RouteLookupResult> {
-    lookup_output_fib(&netns.router().fib.read(), destination, Some(oif))
+    fib.lookup_ingress(destination, ingress_oif, source)
 }
 
 /// Resolves the protocol-stack owner that receives packets for an exact local
@@ -634,6 +673,13 @@ fn lookup_output_fib_with_source(
     oif: Option<u32>,
     source: Option<IpAddress>,
 ) -> Option<RouteLookupResult> {
+    if let IpAddress::Ipv6(destination) = destination {
+        let source = match source {
+            Some(IpAddress::Ipv6(source)) if !source.is_unspecified() => Some(source),
+            _ => None,
+        };
+        return fib.lookup_ipv6_output(destination, oif, source);
+    }
     // Linux ip_route_output_key_hash_rcu() uses a fixed local source to
     // select multicast/lbcast output only when there is no explicit OIF.
     // Ordinary unicast keeps weak-host routing independent of source owner.

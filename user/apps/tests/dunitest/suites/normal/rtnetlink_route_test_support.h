@@ -504,10 +504,16 @@ RouteSpec MakeIpv4Route(const char* dst, uint8_t prefix_len, uint32_t oif) {
     return route;
 }
 
+struct Ipv6SourcePrefix {
+    const char* address;
+    uint8_t length;
+};
+
 int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* destination,
                          uint8_t prefix_len, uint32_t oif, uint8_t scope, uint32_t seq,
                          const char* gateway = nullptr, uint32_t route_flags = 0,
-                         const char* preferred_source = nullptr) {
+                         const char* preferred_source = nullptr,
+                         std::optional<Ipv6SourcePrefix> source_prefix = std::nullopt) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -528,6 +534,14 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
     }
     AddAttr(nlh, sizeof(buf), RTA_DST, &dst, sizeof(dst));
     AddAttr(nlh, sizeof(buf), RTA_OIF, &oif, sizeof(oif));
+    if (source_prefix.has_value()) {
+        in6_addr source = {};
+        if (inet_pton(AF_INET6, source_prefix->address, &source) != 1) {
+            return EINVAL;
+        }
+        rtm->rtm_src_len = source_prefix->length;
+        AddAttr(nlh, sizeof(buf), RTA_SRC, &source, sizeof(source));
+    }
     if (gateway != nullptr) {
         in6_addr gw = {};
         if (inet_pton(AF_INET6, gateway, &gw) != 1) {
@@ -605,7 +619,9 @@ struct Ipv6RouteMetadata {
 
 std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
                                                uint8_t prefix_len, uint32_t oif, uint32_t seq,
-                                               uint8_t kind = RTN_UNSPEC) {
+                                               uint8_t kind = RTN_UNSPEC,
+                                               std::optional<Ipv6SourcePrefix> source_prefix =
+                                                   std::nullopt) {
     alignas(nlmsghdr) char req_buf[NLMSG_LENGTH(sizeof(rtmsg))] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(req_buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -620,6 +636,11 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
 
     in6_addr expected = {};
     if (inet_pton(AF_INET6, destination, &expected) != 1) {
+        return std::nullopt;
+    }
+    in6_addr expected_source = {};
+    if (source_prefix.has_value() &&
+        inet_pton(AF_INET6, source_prefix->address, &expected_source) != 1) {
         return std::nullopt;
     }
     std::optional<Ipv6RouteMetadata> found;
@@ -649,7 +670,11 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
             if (kind != RTN_UNSPEC && route_msg->rtm_type != kind) {
                 continue;
             }
+            if (source_prefix.has_value() && route_msg->rtm_src_len != source_prefix->length) {
+                continue;
+            }
             in6_addr actual = {};
+            in6_addr actual_source = {};
             uint32_t actual_oif = 0;
             uint32_t priority = 0;
             bool has_preferred_source = false;
@@ -658,6 +683,8 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
                  attr = RTA_NEXT(attr, attr_len)) {
                 if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) >= sizeof(actual)) {
                     std::memcpy(&actual, RTA_DATA(attr), sizeof(actual));
+                } else if (attr->rta_type == RTA_SRC && RTA_PAYLOAD(attr) >= sizeof(actual_source)) {
+                    std::memcpy(&actual_source, RTA_DATA(attr), sizeof(actual_source));
                 } else if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) >= sizeof(actual_oif)) {
                     std::memcpy(&actual_oif, RTA_DATA(attr), sizeof(actual_oif));
                 } else if (attr->rta_type == RTA_PRIORITY &&
@@ -666,6 +693,10 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
                 } else if (attr->rta_type == RTA_PREFSRC) {
                     has_preferred_source = true;
                 }
+            }
+            if (source_prefix.has_value() &&
+                std::memcmp(&actual_source, &expected_source, sizeof(actual_source)) != 0) {
+                continue;
             }
             if (actual_oif == oif && std::memcmp(&actual, &expected, sizeof(actual)) == 0) {
                 found = Ipv6RouteMetadata{priority, route_msg->rtm_scope,

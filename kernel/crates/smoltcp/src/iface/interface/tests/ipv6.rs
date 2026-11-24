@@ -113,7 +113,7 @@ fn ipv6_pre_routing_receives_rx_token_metadata() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     device.rx_queue.push_back(routed_ipv6_bytes());
     let mut filter = CaptureMeta(None);
-    let meta = PacketMeta { id: 72 };
+    let meta = PacketMeta::with_id(72);
     device.rx_meta = meta;
     assert_eq!(
         iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),

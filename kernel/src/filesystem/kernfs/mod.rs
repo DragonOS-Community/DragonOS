@@ -945,6 +945,7 @@ impl KernFSInode {
                 callback,
             },
             Some(namespace),
+            None,
         )
     }
 
@@ -1071,6 +1072,7 @@ impl KernFSInode {
                 callback,
             },
             None,
+            None,
         )
     }
 
@@ -1079,6 +1081,7 @@ impl KernFSInode {
         name: String,
         args: KernFSInodeArgs,
         namespace: Option<KernFSNamespaceTag>,
+        link: Option<(&Arc<KernFSInode>, String)>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
         let _mutation = self.child_mutation.lock();
         if self.namespace_children.load(Ordering::Acquire) != namespace.is_some() {
@@ -1092,6 +1095,12 @@ impl KernFSInode {
         }
 
         let new_inode = self.new_child_inode(name.clone(), args, namespace);
+        if let Some((target, path)) = link {
+            // Populate the link before directory lookup can find the inode.
+            let mut inner = new_inode.inner.write();
+            inner.symlink_target = Some(Arc::downgrade(target));
+            inner.symlink_target_absolute_path = Some(path);
+        }
 
         children.insert(KernFSChildKey::new(name, namespace), new_inode.clone());
 
@@ -1222,7 +1231,7 @@ impl KernFSInode {
         target_absolute_path: String,
         namespace: Option<KernFSNamespaceTag>,
     ) -> Result<Arc<KernFSInode>, SystemError> {
-        let inode = self.inner_create_ns(
+        self.inner_create_ns(
             name,
             KernFSInodeArgs {
                 mode: InodeMode::S_IFLNK | InodeMode::S_IRWXUGO,
@@ -1232,11 +1241,8 @@ impl KernFSInode {
                 callback: None,
             },
             namespace,
-        )?;
-
-        inode.inner.write().symlink_target = Some(Arc::downgrade(target));
-        inode.inner.write().symlink_target_absolute_path = Some(target_absolute_path);
-        return Ok(inode);
+            Some((target, target_absolute_path)),
+        )
     }
 
     pub fn name(&self) -> String {

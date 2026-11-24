@@ -368,10 +368,11 @@ pub(crate) fn claim_and_unlink_wait_zombie(
         _ => return PtraceZombieClaim::Lost,
     }
 
-    let need_cascade = tracee
-        .real_parent_pcb()
-        .map(|real_parent| tracer.raw_tgid() != real_parent.raw_tgid())
-        .unwrap_or(false);
+    let need_cascade = tracee.is_thread_group_leader()
+        && tracee
+            .real_parent_pcb()
+            .map(|real_parent| tracer.raw_tgid() != real_parent.raw_tgid())
+            .unwrap_or(false);
     let owner = unlink_relation_locked(tracee);
     debug_assert!(
         owner

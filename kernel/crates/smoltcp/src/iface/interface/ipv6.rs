@@ -337,7 +337,8 @@ impl InterfaceInner {
                         packet.header.src_addr =
                             filter.ipv6_anycast_reply_source(remote, meta, echo)?;
                         #[cfg(feature = "packetmeta-id")]
-                        if echo || remote.is_unicast_link_local() {
+                        // Match fe80::/10 using the minimum Rust version.
+                        if echo || (remote.segments()[0] & 0xffc0) == 0xfe80 {
                             packet.tx_meta.id = meta.id;
                         }
                     }

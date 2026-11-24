@@ -5,7 +5,7 @@ pub(super) type RedirectAddressResolver<'a> = dyn Fn(&[u8]) -> Option<CtAddress>
 /// Native FIB lookups use the device of the packet at this hook.
 #[derive(Clone, Copy)]
 pub(crate) struct NftIpv6RouteLookup<'a> {
-    pub(crate) resolve: &'a dyn Fn(Ipv6Address, Option<u32>) -> u8,
+    pub(crate) resolve: &'a dyn Fn(Ipv6Address, Option<Ipv6Address>, Option<u32>) -> u8,
     pub(crate) device: Option<u32>,
 }
 

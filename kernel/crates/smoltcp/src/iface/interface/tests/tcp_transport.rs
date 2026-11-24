@@ -175,7 +175,7 @@ fn tcp_transport_preserves_device_constraint() {
         socket.set_bound_device(core::num::NonZeroU32::new(7));
         let handle = sockets.add(socket);
         let bytes = segment(&mut ip);
-        let mut meta = PacketMeta { id: 8 };
+        let mut meta = PacketMeta::with_id(8);
         assert!(iface.process_tcp_ingress(
             Instant::ZERO,
             &mut device,

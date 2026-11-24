@@ -25,7 +25,7 @@ use crate::{
 use alloc::{boxed::Box, sync::Arc};
 use core::{cell::Cell, sync::atomic::Ordering};
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress, IpVersion, Ipv4Packet,
+    EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress, IpVersion, Ipv4Packet, Ipv6Packet,
 };
 use system_error::SystemError;
 
@@ -256,12 +256,13 @@ impl BridgeDriver {
                 if !routes.allows_ipv4_loopback_ingress(ingress_ifindex, source) {
                     return;
                 }
-                routes.lookup_ingress(destination.into(), ingress_ifindex)
+                routes.lookup_ingress(destination.into(), ingress_ifindex, None)
             } else {
-                lookup_ingress(&netns, destination.into(), ingress_ifindex)
+                lookup_ingress(&netns, destination.into(), ingress_ifindex, None)
             }
         } else {
-            lookup_ingress(&netns, destination, ingress_ifindex)
+            let source = Ipv6Packet::new_unchecked(frame.ip()).src_addr();
+            lookup_ingress(&netns, destination, ingress_ifindex, Some(source))
         };
         let Some(route) = route else {
             return;
@@ -406,6 +407,8 @@ impl BridgeDriver {
             &netns,
             frame.destination(pending.version),
             bridge.nic_id() as u32,
+            (pending.version == IpVersion::Ipv6)
+                .then(|| Ipv6Packet::new_unchecked(frame.ip()).src_addr()),
         )
         .ok_or(SystemError::ENETUNREACH)?;
         if route.oif != bridge.nic_id() as u32

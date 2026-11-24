@@ -52,7 +52,20 @@ impl InterfaceInner {
         now: Instant,
     ) -> Ipv6Address {
         assert!(!dst_addr.is_unspecified());
+        if dst_addr.is_loopback() {
+            return Ipv6Address::LOCALHOST;
+        }
+        self.ipv6_source_candidate_at(dst_addr, now)
+            .map(|(_, address)| address)
+            .or_else(|| self.ipv6_addr())
+            .unwrap_or(Ipv6Address::LOCALHOST)
+    }
 
+    pub(super) fn ipv6_source_candidate_at(
+        &self,
+        dst_addr: &Ipv6Address,
+        now: Instant,
+    ) -> Option<(impl Ord, Ipv6Address)> {
         // See RFC 6724 Section 4: Candidate source address
         fn is_candidate_source_address(dst_addr: &Ipv6Address, src_addr: &Ipv6Address) -> bool {
             // For all multicast and link-local destination addresses, the candidate address MUST
@@ -97,11 +110,6 @@ impl InterfaceInner {
             bits as usize
         }
 
-        if dst_addr.is_loopback() {
-            return Ipv6Address::LOCALHOST;
-        }
-
-        let mut fallback = None;
         let mut best = None;
         let dst_scope = dst_addr.x_multicast_scope() as u8;
         for addr in self.ip_addrs.iter().filter_map(|a| match a {
@@ -110,7 +118,6 @@ impl InterfaceInner {
             IpCidr::Ipv6(addr) => Some(addr),
         }) {
             let source = addr.address();
-            fallback.get_or_insert(source);
             if !is_candidate_source_address(dst_addr, &source) {
                 continue;
             }
@@ -138,9 +145,7 @@ impl InterfaceInner {
                 best = Some((score, source));
             }
         }
-        best.map(|(_, address)| address)
-            .or(fallback)
-            .unwrap_or(Ipv6Address::LOCALHOST)
+        best
     }
 
     /// Determine if the given `Ipv6Address` is the solicited node

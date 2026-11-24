@@ -411,6 +411,64 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     ASSERT_EQ(restore_error, 0);
 }
 
+TEST(RtnetlinkRouteSemantics, Ipv6RouteMutationsSelectTheExactSourcePrefix) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard fd(OpenRouteSocket());
+            ASSERT_GE(fd.Get(), 0) << ErrnoString(errno);
+            const uint32_t lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            uint32_t seq = 2900;
+            ASSERT_EQ(SetLinkUp(fd.Get(), lo, true, ++seq), 0);
+            constexpr const char* destination = "2001:db8:ffff:229::";
+            constexpr Ipv6SourcePrefix ordinary{"::", 0};
+            constexpr Ipv6SourcePrefix first{"fd00:29:1::", 64};
+            constexpr Ipv6SourcePrefix second{"fd00:29:2::", 64};
+            auto mutate = [&](uint16_t type, uint16_t flags,
+                              std::optional<Ipv6SourcePrefix> source, const char* preferred = nullptr) {
+                return SendIpv6RouteRequest(fd.Get(), type, NLM_F_REQUEST | NLM_F_ACK | flags,
+                                            destination, 64, lo, RT_SCOPE_UNIVERSE, ++seq,
+                                            nullptr, 0, preferred, source);
+            };
+            auto find = [&](Ipv6SourcePrefix source) {
+                return FindIpv6Route(fd.Get(), destination, 64, lo, ++seq, RTN_UNICAST, source);
+            };
+            constexpr uint16_t add = NLM_F_CREATE | NLM_F_EXCL;
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add, std::nullopt), 0);
+            EXPECT_EQ(mutate(RTM_NEWROUTE, add, Ipv6SourcePrefix{"fd00:29::1", 0}), EEXIST);
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add, Ipv6SourcePrefix{"fd00:29:1::1", 64}), 0);
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add, second), 0);
+            ASSERT_EQ(mutate(RTM_NEWROUTE, NLM_F_REPLACE, first, "::1"), 0);
+            const auto default_route = find(ordinary);
+            const auto replaced = find(first);
+            const auto untouched = find(second);
+            ASSERT_TRUE(default_route.has_value());
+            ASSERT_TRUE(replaced.has_value());
+            ASSERT_TRUE(untouched.has_value());
+            EXPECT_FALSE(default_route->has_preferred_source);
+            EXPECT_TRUE(replaced->has_preferred_source);
+            EXPECT_FALSE(untouched->has_preferred_source);
+
+            ASSERT_EQ(mutate(RTM_DELROUTE, 0, std::nullopt), 0);
+            EXPECT_FALSE(find(ordinary).has_value());
+            EXPECT_TRUE(find(first).has_value());
+            EXPECT_TRUE(find(second).has_value());
+            ASSERT_EQ(mutate(RTM_DELROUTE, 0, Ipv6SourcePrefix{"fd00:29:1::2", 64}), 0);
+            EXPECT_FALSE(find(first).has_value());
+            EXPECT_TRUE(find(second).has_value());
+        }();
+        _exit(HasFailure() ? 1 : 0);
+    }
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
     FdGuard sender(OpenRouteSocket());
     ASSERT_GE(sender.Get(), 0) << ErrnoString(errno);

@@ -201,8 +201,13 @@ impl TcpStack {
                 continue;
             }
             let required_oif = socket.bound_device();
-            let Some(route) = routes.lookup(destination, required_oif.map(|index| index.get()))
-            else {
+            let Some(route) = crate::net::route::pmtu::lookup_output_route(
+                &routes,
+                required_oif.map(|index| index.get()),
+                (feedback.source, feedback.destination),
+                (source, destination),
+                socket.tx_route_cookie(),
+            ) else {
                 continue;
             };
             let learned =

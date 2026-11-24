@@ -266,9 +266,25 @@ pub struct BoundUdp {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct UdpConnection {
-    remote: smoltcp::wire::IpEndpoint,
-    source: Option<smoltcp::wire::IpAddress>,
+pub(super) struct UdpConnection {
+    pub(super) remote: smoltcp::wire::IpEndpoint,
+    pub(super) source: Option<smoltcp::wire::IpAddress>,
+    pub(super) required_oif: Option<u32>,
+    pub(super) route_cookie: u64,
+}
+
+impl UdpConnection {
+    pub(super) fn route_cookie_for(
+        self,
+        destination: smoltcp::wire::IpAddress,
+        required_oif: Option<u32>,
+    ) -> u64 {
+        if self.remote.addr == destination && self.required_oif == required_oif {
+            self.route_cookie
+        } else {
+            0
+        }
+    }
 }
 
 impl BoundUdp {
@@ -306,25 +322,22 @@ impl BoundUdp {
             .ok_or(SystemError::ENOTCONN)
     }
 
-    pub fn connect(
-        &self,
-        remote: smoltcp::wire::IpEndpoint,
-        source: Option<smoltcp::wire::IpAddress>,
-    ) {
-        // let _local = self.endpoint();
-        // log::debug!(
-        //     "BoundUdp::connect: local={:?}, connecting to remote={:?}",
-        //     _local,
-        //     remote
-        // );
+    pub(super) fn connect(&self, connection: UdpConnection) {
+        self.connection.lock().replace(connection);
+    }
 
-        self.connection
-            .lock()
-            .replace(UdpConnection { remote, source });
+    pub(super) fn connection(&self) -> Option<UdpConnection> {
+        *self.connection.lock()
+    }
+
+    pub(super) fn reset_route_cookie(&self) {
+        if let Some(connection) = self.connection.lock().as_mut() {
+            connection.route_cookie = 0;
+        }
     }
 
     pub fn connected_source(&self) -> Option<smoltcp::wire::IpAddress> {
-        (*self.connection.lock()).and_then(|connection| connection.source)
+        self.connection().and_then(|connection| connection.source)
     }
 
     pub fn disconnect(&self) {

@@ -266,9 +266,9 @@ impl IngressHooks<'_> {
         if self.ruleset.ipv6_hook_requires_route_lookup(hook) && self.fib_routes.is_none() {
             return false;
         }
-        let resolve = |address, device| {
+        let resolve = |address, source, device| {
             self.fib_routes.map_or(RTN_UNREACHABLE, |routes| {
-                routes.ipv6_addr_type(address, device)
+                routes.ipv6_addr_type(address, source, device)
             })
         };
         let lookup = NftIpv6RouteLookup {
@@ -362,9 +362,9 @@ impl IngressHooks<'_> {
         if self.ruleset.ipv6_hook_requires_route_lookup(hook) && self.fib_routes.is_none() {
             return false;
         }
-        let resolve = |address, device| {
+        let resolve = |address, source, device| {
             self.fib_routes.map_or(RTN_UNREACHABLE, |routes| {
-                routes.ipv6_addr_type(address, device)
+                routes.ipv6_addr_type(address, source, device)
             })
         };
         let lookup = NftIpv6RouteLookup {

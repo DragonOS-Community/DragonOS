@@ -1,13 +1,13 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use hashbrown::HashMap;
 use smoltcp::iface::Route as SmolRoute;
-use smoltcp::wire::{IpAddress, IpCidr};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address};
 use system_error::SystemError;
 
 use super::{
-    canonical_cidr, RouteEntry, RouterPreference, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST,
-    RTN_UNICAST, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_LOCAL,
+    canonical_cidr, fib::FibLookupKey, RouteEntry, RouterPreference, RTN_BROADCAST, RTN_LOCAL,
+    RTN_MULTICAST, RTN_UNICAST, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_LOCAL,
 };
 
 mod alias;
@@ -150,6 +150,10 @@ struct CandidateWinners {
 }
 
 impl CandidateWinners {
+    fn is_empty(&self) -> bool {
+        self.any_oif == ScopeWinners::default() && self.by_oif.is_empty()
+    }
+
     fn clear(&mut self) {
         self.any_oif = ScopeWinners::default();
         self.by_oif.clear();
@@ -195,39 +199,178 @@ impl CandidateWinners {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
+struct SourceWinners {
+    // Bit n denotes a committed IPv6 source prefix of length n + 1.
+    lengths: u128,
+    by_prefix: HashMap<IpCidr, CandidateWinners>,
+}
+
+enum SourceLookup {
+    NoMatch,
+    NoEligibleRoute,
+    Found(usize),
+}
+
+impl SourceWinners {
+    fn lookup(
+        &self,
+        source: Ipv6Address,
+        required_oif: Option<u32>,
+        scope: ScopeRequirement,
+    ) -> SourceLookup {
+        let mut lengths = self.lengths;
+        let mut matched = false;
+        while lengths != 0 {
+            let length = (u128::BITS - lengths.leading_zeros()) as u8;
+            lengths &= !(1 << (length - 1));
+            let key = canonical_cidr(IpCidr::new(source.into(), length));
+            let Some(candidates) = self.by_prefix.get(&key) else {
+                continue;
+            };
+            matched = true;
+            if let Some(route) = candidates.get(required_oif, scope) {
+                return SourceLookup::Found(route);
+            }
+        }
+        if matched {
+            SourceLookup::NoEligibleRoute
+        } else {
+            SourceLookup::NoMatch
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 struct PrefixWinners {
     standard: CandidateWinners,
     broadcast: CandidateWinners,
+    source: Option<Box<SourceWinners>>,
+    ipv6_serial: u64,
 }
 
 impl PrefixWinners {
     fn clear(&mut self) {
         self.standard.clear();
         self.broadcast.clear();
+        if let Some(source) = &mut self.source {
+            source.lengths = 0;
+            for candidates in source.by_prefix.values_mut() {
+                candidates.clear();
+            }
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.standard.any_oif == ScopeWinners::default()
-            && self.standard.by_oif.is_empty()
-            && self.broadcast.any_oif == ScopeWinners::default()
-            && self.broadcast.by_oif.is_empty()
+        self.standard.is_empty() && self.broadcast.is_empty() && self.source.is_none()
     }
 
-    fn references(&self, route_index: usize) -> bool {
-        self.standard.references(route_index) || self.broadcast.references(route_index)
+    fn remove_empty_sources(&mut self) {
+        if let Some(source) = &mut self.source {
+            source
+                .by_prefix
+                .retain(|_, candidates| !candidates.is_empty());
+            if source.by_prefix.is_empty() {
+                self.source = None;
+            }
+        }
     }
 
-    fn replace_index(&mut self, old_index: usize, new_index: usize) {
-        self.standard.replace_index(old_index, new_index);
-        self.broadcast.replace_index(old_index, new_index);
+    fn cancel_source_reservation(&mut self, route: RouteEntry) {
+        if let (Some(prefix), Some(source)) = (route.source, &mut self.source) {
+            if source
+                .by_prefix
+                .get(&prefix)
+                .is_some_and(CandidateWinners::is_empty)
+            {
+                source.by_prefix.remove(&prefix);
+            }
+            if source.by_prefix.is_empty() {
+                self.source = None;
+            }
+        }
     }
 
-    fn candidates_mut(&mut self, route: RouteEntry) -> &mut CandidateWinners {
+    fn references(&self, route: RouteEntry, route_index: usize) -> bool {
+        if let Some(prefix) = route.source {
+            self.source
+                .as_ref()
+                .and_then(|source| source.by_prefix.get(&prefix))
+                .is_some_and(|candidates| candidates.references(route_index))
+        } else if route.kind == RTN_BROADCAST {
+            self.broadcast.references(route_index)
+        } else {
+            self.standard.references(route_index)
+        }
+    }
+
+    fn replace_index(&mut self, route: RouteEntry, old_index: usize, new_index: usize) {
+        if let Some(prefix) = route.source {
+            if let Some(candidates) = self
+                .source
+                .as_mut()
+                .and_then(|source| source.by_prefix.get_mut(&prefix))
+            {
+                candidates.replace_index(old_index, new_index);
+            }
+        } else if route.kind == RTN_BROADCAST {
+            self.broadcast.replace_index(old_index, new_index);
+        } else {
+            self.standard.replace_index(old_index, new_index);
+        }
+    }
+
+    fn destination_candidates_mut(&mut self, route: RouteEntry) -> &mut CandidateWinners {
         if route.kind == RTN_BROADCAST {
             &mut self.broadcast
         } else {
             &mut self.standard
         }
+    }
+
+    fn reserve_candidate(&mut self, route: RouteEntry) -> Result<(), SystemError> {
+        let candidates = if let Some(prefix) = route.source {
+            if self.source.is_none() {
+                self.source =
+                    Some(Box::try_new(SourceWinners::default()).map_err(|_| SystemError::ENOMEM)?);
+            }
+            let source = self.source.as_mut().unwrap();
+            if !source.by_prefix.contains_key(&prefix) {
+                source
+                    .by_prefix
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOMEM)?;
+            }
+            source.by_prefix.entry(prefix).or_default()
+        } else {
+            self.destination_candidates_mut(route)
+        };
+        candidates
+            .by_oif
+            .try_reserve(1)
+            .map_err(|_| SystemError::ENOMEM)
+    }
+
+    fn consider(
+        &mut self,
+        index: usize,
+        route: RouteEntry,
+        routes: &[RouteEntry],
+        orders: &[AliasOrder],
+    ) {
+        let candidates = if let Some(prefix) = route.source {
+            let source = self
+                .source
+                .as_mut()
+                .expect("source index must be reserved before commit");
+            source.lengths |= 1 << (prefix.prefix_len() - 1);
+            source
+                .by_prefix
+                .get_mut(&prefix)
+                .expect("source prefix must be reserved before commit")
+        } else {
+            self.destination_candidates_mut(route)
+        };
+        candidates.consider(index, route, routes, orders);
     }
 }
 
@@ -296,6 +439,8 @@ pub(super) struct FibIndex {
     projection: HashMap<ProjectionKey, Vec<usize>>,
     projection_winners: HashMap<ProjectionKey, usize>,
     prefix_counts: HashMap<PrefixDomain, Vec<PrefixLengthCount>>,
+    source_route_count: usize,
+    ipv6_serial: u64,
 }
 
 impl FibIndex {
@@ -319,7 +464,64 @@ impl FibIndex {
             projection: try_clone_buckets(&self.projection)?,
             projection_winners: try_clone_map(&self.projection_winners)?,
             prefix_counts: try_clone_prefix_counts(&self.prefix_counts)?,
+            source_route_count: self.source_route_count,
+            ipv6_serial: self.ipv6_serial,
         })
+    }
+
+    pub(super) fn has_source_routes(&self) -> bool {
+        self.source_route_count != 0
+    }
+
+    pub(super) fn ipv6_serial(&self, route: RouteEntry) -> u64 {
+        let key = PrefixKey::new(route.table, route.destination);
+        self.winners
+            .get(&key)
+            .map_or(0, |winners| winners.ipv6_serial)
+    }
+
+    pub(super) fn ipv6_cookie_winner(
+        &self,
+        routes: &[RouteEntry],
+        destination: IpAddress,
+        table: u32,
+        prefix_len: u8,
+        serial: u64,
+        oif: Option<u32>,
+    ) -> Option<usize> {
+        let key = PrefixKey::for_lookup(table, destination, prefix_len);
+        let winners = self.winners.get(&key)?;
+        if winners.ipv6_serial != serial {
+            return None;
+        }
+        let scope = ScopeRequirement::Any;
+        if let Some(source) = &winners.source {
+            match source.lookup(Ipv6Address::UNSPECIFIED, oif, scope) {
+                SourceLookup::Found(route) => return Some(route),
+                SourceLookup::NoMatch => return None,
+                SourceLookup::NoEligibleRoute => {}
+            }
+        }
+        let route = winners.standard.get(oif, scope)?;
+        // Do not substitute another alias under a cookie for an expired
+        // route. The normal lookup after this miss uses the actual source.
+        routes[route]
+            .expires_at_us()
+            .is_none_or(|expires| expires > crate::time::Instant::now().total_micros())
+            .then_some(route)
+    }
+
+    fn touch_ipv6_prefix(&mut self, key: PrefixKey) {
+        if key.family != AddressFamily::Ipv6 {
+            return;
+        }
+        self.ipv6_serial += 1;
+        set_ipv6_prefix_serial(
+            &mut self.winners,
+            &self.prefix_counts,
+            key,
+            self.ipv6_serial,
+        );
     }
 
     pub(super) fn has_ipv4_routes(&self, table: u32) -> bool {
@@ -371,10 +573,11 @@ impl FibIndex {
             &PrefixKey::new(route.table, route.destination),
         );
         if indexable(route) {
-            remove_empty_winner(
-                &mut self.winners,
-                &PrefixKey::new(route.table, route.destination),
-            );
+            let key = PrefixKey::new(route.table, route.destination);
+            if let Some(winners) = self.winners.get_mut(&key) {
+                winners.cancel_source_reservation(route);
+            }
+            remove_empty_winner(&mut self.winners, &key);
         }
         if let Some(key) = projection_key(route) {
             remove_empty_bucket(&mut self.projection, &key);
@@ -393,7 +596,9 @@ impl FibIndex {
         self.alias.commit_insert(route_index, route, placement);
         insert_reserved_bucket(&mut self.all, prefix, route_index, None);
         if indexable(route) {
+            self.source_route_count += usize::from(route.source.is_some());
             update_prefix_count(&mut self.prefix_counts, route, true);
+            self.touch_ipv6_prefix(prefix);
             // Existing winners remain valid across insertion: relative order
             // between existing aliases is unchanged, so only the new route
             // can displace them. Deletion/replacement still rebuilds when a
@@ -401,7 +606,6 @@ impl FibIndex {
             self.winners
                 .get_mut(&prefix)
                 .expect("winner prefix must be reserved before commit")
-                .candidates_mut(route)
                 .consider(route_index, route, routes, self.alias.orders());
         }
         if let Some(key) = projection_key(route) {
@@ -430,7 +634,7 @@ impl FibIndex {
         let removed_was_winner = self
             .winners
             .get(&prefix)
-            .is_some_and(|winners| winners.references(route_index));
+            .is_some_and(|winners| winners.references(route, route_index));
         let projection = projection_key(route);
         let removed_was_projection_winner =
             projection.is_some_and(|key| self.projection_winners.get(&key) == Some(&route_index));
@@ -448,6 +652,8 @@ impl FibIndex {
             self.all.get(&prefix).map(Vec::as_slice).unwrap_or_default(),
         );
         if indexable(route) {
+            self.touch_ipv6_prefix(prefix);
+            self.source_route_count -= usize::from(route.source.is_some());
             update_prefix_count(&mut self.prefix_counts, route, false);
             remove_empty_prefix_domain(&mut self.prefix_counts, route);
         }
@@ -474,6 +680,17 @@ impl FibIndex {
             routes.len()
         );
 
+        // Inspect the old buckets before their route indices are remapped.
+        // All affected IPv6 prefixes in this transaction share one serial.
+        let serial = self.ipv6_serial + 1;
+        for (&key, indices) in &self.all {
+            if key.family == AddressFamily::Ipv6
+                && indices.iter().any(|&index| old_to_new[index].is_none())
+            {
+                set_ipv6_prefix_serial(&mut self.winners, &self.prefix_counts, key, serial);
+                self.ipv6_serial = serial;
+            }
+        }
         remap_retained_indices(&mut self.all, old_to_new);
         remap_retained_indices(&mut self.projection, old_to_new);
 
@@ -482,7 +699,9 @@ impl FibIndex {
         for counts in self.prefix_counts.values_mut() {
             counts.clear();
         }
+        self.source_route_count = 0;
         for route in routes.iter().copied().filter(|route| indexable(*route)) {
+            self.source_route_count += usize::from(route.source.is_some());
             update_prefix_count(&mut self.prefix_counts, route, true);
         }
         self.prefix_counts.retain(|_, counts| !counts.is_empty());
@@ -503,10 +722,12 @@ impl FibIndex {
 
         let old_indexable = indexable(old);
         let new_indexable = indexable(new);
+        self.source_route_count -= usize::from(old_indexable && old.source.is_some());
+        self.source_route_count += usize::from(new_indexable && new.source.is_some());
         let old_was_winner = self
             .winners
             .get(&old_prefix)
-            .is_some_and(|winners| winners.references(route_index));
+            .is_some_and(|winners| winners.references(old, route_index));
         if old_indexable != new_indexable {
             update_prefix_count(
                 &mut self.prefix_counts,
@@ -514,6 +735,9 @@ impl FibIndex {
                 new_indexable,
             );
             remove_empty_prefix_domain(&mut self.prefix_counts, old);
+        }
+        if old_indexable || new_indexable {
+            self.touch_ipv6_prefix(new_prefix);
         }
 
         let old_projection = projection_key(old);
@@ -535,7 +759,6 @@ impl FibIndex {
             self.winners
                 .get_mut(&new_prefix)
                 .expect("winner prefix must be reserved before replace")
-                .candidates_mut(new)
                 .consider(route_index, new, routes, self.alias.orders());
         }
         if old_projection != new_projection {
@@ -657,7 +880,8 @@ impl FibIndex {
 
     /// Visits exact-prefix buckets from longest to shortest. Work is bounded
     /// by the address-family prefix width rather than by route-table size.
-    pub(super) fn lookup(
+    #[cfg(test)]
+    fn lookup(
         &self,
         routes: &[RouteEntry],
         destination: IpAddress,
@@ -666,6 +890,28 @@ impl FibIndex {
         minimum_scope: Option<u8>,
         broadcast: BroadcastLookup,
     ) -> Option<usize> {
+        self.lookup_key(
+            routes,
+            FibLookupKey {
+                destination,
+                source: None,
+                table,
+                required_oif,
+                minimum_scope,
+                broadcast,
+            },
+        )
+    }
+
+    pub(super) fn lookup_key(&self, routes: &[RouteEntry], query: FibLookupKey) -> Option<usize> {
+        let FibLookupKey {
+            destination,
+            source,
+            table,
+            required_oif,
+            minimum_scope,
+            broadcast,
+        } = query;
         let domain = PrefixDomain {
             table,
             family: AddressFamily::of(destination),
@@ -677,6 +923,17 @@ impl FibIndex {
             let Some(winners) = self.winners.get(&key) else {
                 continue;
             };
+            if let Some(sources) = &winners.source {
+                match sources.lookup(
+                    source.unwrap_or(Ipv6Address::UNSPECIFIED),
+                    required_oif,
+                    scope,
+                ) {
+                    SourceLookup::Found(route) => return Some(route),
+                    SourceLookup::NoMatch => continue,
+                    SourceLookup::NoEligibleRoute => {}
+                }
+            }
             let mut standard = winners.standard.get(required_oif, scope);
             if standard.is_some_and(|index| routes[index].expires_at_us().is_some()) {
                 let now_us = crate::time::Instant::now().total_micros();
@@ -687,6 +944,7 @@ impl FibIndex {
                         .filter(|&index| {
                             let route = routes[index];
                             indexable(route)
+                                && route.source.is_none()
                                 && route.kind != RTN_BROADCAST
                                 && required_oif.is_none_or(|oif| oif == route.oif)
                                 && scope.matches(route.scope)
@@ -746,7 +1004,7 @@ impl FibIndex {
             .winners
             .get_mut(&PrefixKey::new(route.table, route.destination))
         {
-            winners.replace_index(old_index, new_index);
+            winners.replace_index(route, old_index, new_index);
         }
     }
 
@@ -795,15 +1053,11 @@ impl FibIndex {
             for route_index in indices.iter().copied() {
                 let route = routes[route_index];
                 if indexable(route) {
-                    winners.candidates_mut(route).consider(
-                        route_index,
-                        route,
-                        routes,
-                        self.alias.orders(),
-                    );
+                    winners.consider(route_index, route, routes, self.alias.orders());
                 }
             }
         }
+        winners.remove_empty_sources();
         if winners.is_empty() {
             self.winners.remove(&prefix);
         }
@@ -821,16 +1075,14 @@ impl FibIndex {
             for route_index in indices.iter().copied() {
                 let route = routes[route_index];
                 if indexable(route) {
-                    winners.candidates_mut(route).consider(
-                        route_index,
-                        route,
-                        routes,
-                        self.alias.orders(),
-                    );
+                    winners.consider(route_index, route, routes, self.alias.orders());
                 }
             }
         }
-        self.winners.retain(|_, winners| !winners.is_empty());
+        self.winners.retain(|_, winners| {
+            winners.remove_empty_sources();
+            !winners.is_empty()
+        });
     }
 }
 
@@ -868,6 +1120,32 @@ where
     Ok(cloned)
 }
 
+/// Linux IPv6 invalidates cached routes through the changed node's ancestors.
+/// Only buckets that can currently supply a route need a serial.
+fn set_ipv6_prefix_serial(
+    winners: &mut HashMap<PrefixKey, PrefixWinners>,
+    prefix_counts: &HashMap<PrefixDomain, Vec<PrefixLengthCount>>,
+    changed: PrefixKey,
+    serial: u64,
+) {
+    let domain = PrefixDomain {
+        table: changed.table,
+        family: AddressFamily::Ipv6,
+    };
+    let Some(prefixes) = prefix_counts.get(&domain) else {
+        return;
+    };
+    for length in prefixes
+        .iter()
+        .filter_map(|entry| (entry.prefix_len <= changed.prefix_len).then_some(entry.prefix_len))
+    {
+        let key = PrefixKey::for_lookup(changed.table, changed.destination, length);
+        if let Some(winner) = winners.get_mut(&key) {
+            winner.ipv6_serial = serial;
+        }
+    }
+}
+
 fn try_clone_winners(
     source: &HashMap<PrefixKey, PrefixWinners>,
 ) -> Result<HashMap<PrefixKey, PrefixWinners>, SystemError> {
@@ -881,10 +1159,31 @@ fn try_clone_winners(
             PrefixWinners {
                 standard: try_clone_candidate_winners(&winners.standard)?,
                 broadcast: try_clone_candidate_winners(&winners.broadcast)?,
+                source: winners
+                    .source
+                    .as_deref()
+                    .map(try_clone_source_winners)
+                    .transpose()?,
+                ipv6_serial: winners.ipv6_serial,
             },
         );
     }
     Ok(cloned)
+}
+
+fn try_clone_source_winners(source: &SourceWinners) -> Result<Box<SourceWinners>, SystemError> {
+    let mut by_prefix = HashMap::new();
+    by_prefix
+        .try_reserve(source.by_prefix.len())
+        .map_err(|_| SystemError::ENOMEM)?;
+    for (prefix, candidates) in &source.by_prefix {
+        by_prefix.insert(*prefix, try_clone_candidate_winners(candidates)?);
+    }
+    Box::try_new(SourceWinners {
+        lengths: source.lengths,
+        by_prefix,
+    })
+    .map_err(|_| SystemError::ENOMEM)
 }
 
 fn try_clone_candidate_winners(source: &CandidateWinners) -> Result<CandidateWinners, SystemError> {
@@ -945,10 +1244,7 @@ fn reserve_winner(
     winners
         .get_mut(&prefix)
         .expect("winner prefix was just reserved")
-        .candidates_mut(route)
-        .by_oif
-        .try_reserve(1)
-        .map_err(|_| SystemError::ENOMEM)
+        .reserve_candidate(route)
 }
 
 fn remove_empty_winner(winners: &mut HashMap<PrefixKey, PrefixWinners>, prefix: &PrefixKey) {
@@ -1220,8 +1516,15 @@ pub(super) fn projection_key(route: RouteEntry) -> Option<ProjectionKey> {
 }
 
 fn indexable(route: RouteEntry) -> bool {
-    route.source.is_none()
-        && route.tos == 0
+    if let Some(source) = route.source {
+        return matches!(
+            (route.destination, source),
+            (IpCidr::Ipv6(_), IpCidr::Ipv6(_))
+        ) && source.prefix_len() != 0
+            && route.tos == 0
+            && route.kind == RTN_UNICAST;
+    }
+    route.tos == 0
         && (matches!(route.kind, RTN_UNICAST | RTN_LOCAL | RTN_BROADCAST)
             || matches!(route.destination, IpCidr::Ipv6(_)) && route.kind == RTN_MULTICAST)
 }
@@ -1232,7 +1535,7 @@ mod tests {
 
     use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 
-    use super::{AliasPlacement, BroadcastLookup, FibIndex};
+    use super::{AliasPlacement, BroadcastLookup, FibIndex, FibLookupKey};
     use crate::net::route::{
         LearnedDefaultRoute, RouteEntry, RouterPreference, RTN_BROADCAST, RTN_UNICAST,
         RT_SCOPE_HOST, RT_SCOPE_LINK, RT_TABLE_MAIN,
@@ -1283,6 +1586,53 @@ mod tests {
             ),
             Some(2)
         );
+    }
+
+    #[test]
+    fn ipv6_source_lookup_backtracks_at_the_matching_level() {
+        let destination = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into();
+        let network = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into();
+        let source = Ipv6Address::new(0xfd29, 0, 0, 0, 0, 0, 0, 1);
+        let ordinary = RouteEntry {
+            destination: IpCidr::new(network, 64),
+            ..route([0; 4], 0, 10, RTN_UNICAST)
+        };
+        let parent = RouteEntry {
+            destination: IpCidr::new(network, 32),
+            ..ordinary
+        };
+        let specific = RouteEntry {
+            source: Some(IpCidr::new(source.into(), 128)),
+            oif: 2,
+            priority: 200,
+            ..ordinary
+        };
+        let broad = RouteEntry {
+            source: Some(IpCidr::new(
+                Ipv6Address::new(0xfd29, 0, 0, 0, 0, 0, 0, 0).into(),
+                64,
+            )),
+            priority: 100,
+            ..ordinary
+        };
+        let routes = [parent, ordinary, specific, broad];
+        let index = FibIndex::build(&routes).unwrap();
+        let lookup = |source, required_oif| {
+            index.lookup_key(
+                &routes,
+                FibLookupKey {
+                    destination,
+                    source,
+                    table: RT_TABLE_MAIN,
+                    required_oif,
+                    minimum_scope: None,
+                    broadcast: BroadcastLookup::Exclude,
+                },
+            )
+        };
+        assert_eq!(lookup(None, None), Some(0));
+        assert_eq!(lookup(Some(source), None), Some(2));
+        assert_eq!(lookup(Some(source), Some(1)), Some(3));
     }
 
     #[test]

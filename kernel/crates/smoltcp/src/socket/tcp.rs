@@ -584,6 +584,8 @@ pub struct Socket<'a> {
     listen_bound_device: Option<NonZeroU32>,
     #[cfg(feature = "packetmeta-id")]
     connection_bound_device: Option<NonZeroU32>,
+    #[cfg(feature = "packetmeta-id")]
+    tx_route_cookie: u64,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -814,6 +816,8 @@ impl<'a> Socket<'a> {
             listen_bound_device: None,
             #[cfg(feature = "packetmeta-id")]
             connection_bound_device: None,
+            #[cfg(feature = "packetmeta-id")]
+            tx_route_cookie: 0,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -1688,6 +1692,10 @@ impl<'a> Socket<'a> {
         self.tsval_generator = self.configured_tsval_generator;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
+        #[cfg(feature = "packetmeta-id")]
+        {
+            self.tx_route_cookie = 0;
+        }
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
@@ -2539,8 +2547,21 @@ impl<'a> Socket<'a> {
     /// this device ID, or zero when unconstrained.
     #[cfg(feature = "packetmeta-id")]
     pub fn set_bound_device(&mut self, device: Option<NonZeroU32>) {
+        self.tx_route_cookie = 0;
         self.listen_bound_device = device;
         self.connection_bound_device = device;
+    }
+
+    /// Publish the caller's routing state for the active connection.
+    #[cfg(feature = "packetmeta-id")]
+    pub fn set_tx_route_cookie(&mut self, cookie: u64) {
+        self.tx_route_cookie = cookie;
+    }
+
+    /// Read the same routing state used by packet and MTU dispatch.
+    #[cfg(feature = "packetmeta-id")]
+    pub fn tx_route_cookie(&self) -> u64 {
+        self.tx_route_cookie
     }
 
     /// Return the device constraint currently used for input and output.
@@ -2567,6 +2588,7 @@ impl<'a> Socket<'a> {
         #[cfg(feature = "packetmeta-id")]
         {
             meta.id = self.bound_device().map_or(0, NonZeroU32::get);
+            meta.route_cookie = self.tx_route_cookie;
         }
         meta
     }
@@ -5529,8 +5551,8 @@ mod test {
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.bound_device(), b);
         assert_eq!(s.lifecycle_device(), 8);
-        assert!(!s.accepts_ingress(PacketMeta { id: 7 }));
-        assert!(s.accepts_ingress(PacketMeta { id: 8 }));
+        assert!(!s.accepts_ingress(PacketMeta::with_id(7)));
+        assert!(s.accepts_ingress(PacketMeta::with_id(8)));
         send!(
             s,
             TcpRepr {
@@ -5564,7 +5586,7 @@ mod test {
             hop_limit: 64,
         });
         s.socket
-            .process_with_meta(&mut s.cx, PacketMeta { id: 7 }, &ip, &syn);
+            .process_with_meta(&mut s.cx, PacketMeta::with_id(7), &ip, &syn);
         assert_eq!(s.state, State::SynReceived);
         assert_eq!(s.lifecycle_device(), 7);
         assert_eq!(s.egress_meta().id, 7);
@@ -5576,11 +5598,11 @@ mod test {
             ..SEND_TEMPL
         };
         s.socket
-            .process_with_meta(&mut s.cx, PacketMeta { id: 7 }, &ip, &rst);
+            .process_with_meta(&mut s.cx, PacketMeta::with_id(7), &ip, &rst);
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.lifecycle_device(), 0);
         s.socket
-            .process_with_meta(&mut s.cx, PacketMeta { id: 8 }, &ip, &syn);
+            .process_with_meta(&mut s.cx, PacketMeta::with_id(8), &ip, &syn);
         assert_eq!(s.state, State::SynReceived);
         assert_eq!(s.lifecycle_device(), 8);
         assert_eq!(s.egress_meta().id, 8);
@@ -5607,12 +5629,10 @@ mod test {
                 payload_len: syn.buffer_len(),
                 hop_limit: 64,
             });
-            let meta = PacketMeta {
-                id: if explicit != 0 { explicit } else { 7 },
-            };
+            let meta = PacketMeta::with_id(if explicit != 0 { explicit } else { 7 });
             assert!(s.accepts_ingress(meta));
             if explicit != 0 {
-                assert!(!s.accepts_ingress(PacketMeta { id: 7 }));
+                assert!(!s.accepts_ingress(PacketMeta::with_id(7)));
             }
             s.socket.process_with_meta(&mut s.cx, meta, &ip, &syn);
             assert_eq!(s.lifecycle_device(), expected);
@@ -5677,7 +5697,7 @@ mod test {
             hop_limit: 64,
         });
         s.socket
-            .process_with_meta(&mut s.cx, PacketMeta { id: 7 }, &ip, &syn);
+            .process_with_meta(&mut s.cx, PacketMeta::with_id(7), &ip, &syn);
         assert_eq!(observer.prepared.load(Ordering::Relaxed), 7);
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.lifecycle_device(), 0);
@@ -5689,12 +5709,12 @@ mod test {
             ..syn
         };
         s.socket
-            .process_with_meta(&mut s.cx, PacketMeta { id: 8 }, &ip, &invalid);
+            .process_with_meta(&mut s.cx, PacketMeta::with_id(8), &ip, &invalid);
         assert_eq!(observer.prepared.load(Ordering::Relaxed), 99);
         assert_eq!(s.state, State::Listen);
         assert_eq!(s.lifecycle_device(), 0);
         s.socket
-            .process_with_meta(&mut s.cx, PacketMeta { id: 8 }, &ip, &syn);
+            .process_with_meta(&mut s.cx, PacketMeta::with_id(8), &ip, &syn);
         assert_eq!(observer.prepared.load(Ordering::Relaxed), 8);
         assert_eq!(observer.published.load(Ordering::Relaxed), 8);
         assert_eq!(s.lifecycle_device(), 8);
@@ -5713,8 +5733,8 @@ mod test {
         assert_eq!(s.bound_device(), NonZeroU32::new(8));
         s.set_bound_device(None);
         assert_eq!(s.egress_meta().id, 0);
-        assert!(s.accepts_ingress(PacketMeta { id: 0 }));
-        assert!(s.accepts_ingress(PacketMeta { id: 7 }));
+        assert!(s.accepts_ingress(PacketMeta::with_id(0)));
+        assert!(s.accepts_ingress(PacketMeta::with_id(7)));
     }
 
     #[test]

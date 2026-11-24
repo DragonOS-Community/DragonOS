@@ -30,6 +30,12 @@ pub(crate) struct ResolvedIpv6SendRoute {
     pub(crate) decision: super::OutputRouteDecision,
     pub(crate) source: Ipv6Address,
     pub(crate) source_owner: Arc<dyn Iface>,
+    pub(crate) route_cookie: u64,
+}
+
+pub(crate) enum Ipv6RouteIntent {
+    Connect,
+    Send(u64),
 }
 
 impl ResolvedIpv4Route {
@@ -158,7 +164,7 @@ pub(crate) fn resolve_ipv6_output_route(
     let router = netns.router();
     let routes = super::lock_output_routes(&router, devices);
     let route = routes
-        .lookup(destination, required_oif)
+        .lookup_with_source(destination, required_oif, fixed_source)
         .ok_or(SystemError::ENETUNREACH)?;
     let iface = routes
         .devices
@@ -190,17 +196,78 @@ pub(crate) fn resolve_ipv6_send_route(
     required_oif: Option<u32>,
     fixed_source: Option<IpAddress>,
 ) -> Result<ResolvedIpv6SendRoute, SystemError> {
+    resolve_ipv6_socket_route(
+        netns,
+        destination,
+        required_oif,
+        fixed_source,
+        Ipv6RouteIntent::Send(0),
+    )
+}
+
+pub(crate) fn resolve_ipv6_socket_route(
+    netns: &Arc<NetNamespace>,
+    destination: IpAddress,
+    required_oif: Option<u32>,
+    fixed_source: Option<IpAddress>,
+    intent: Ipv6RouteIntent,
+) -> Result<ResolvedIpv6SendRoute, SystemError> {
     let IpAddress::Ipv6(destination_v6) = destination else {
         return Err(SystemError::EAFNOSUPPORT);
     };
     let devices = netns.device_list();
     let router = netns.router();
     let fib = router.fib.read();
-    let selected = super::lookup_output_fib(&fib, destination, required_oif).ok_or_else(|| {
+    let fixed_source = match fixed_source {
+        Some(IpAddress::Ipv6(source)) if !source.is_unspecified() => Some(source),
+        Some(IpAddress::Ipv4(_)) => return Err(SystemError::EADDRNOTAVAIL),
+        _ => None,
+    };
+    let mut source = fixed_source;
+    let cookie = match intent {
+        Ipv6RouteIntent::Connect => 0,
+        Ipv6RouteIntent::Send(cookie) => cookie,
+    };
+    let mut selected = fib.lookup_ipv6_socket_output(destination_v6, required_oif, source, cookie);
+    let route_cookie = if fixed_source.is_none() && matches!(intent, Ipv6RouteIntent::Connect) {
+        selected.map_or(0, |route| {
+            fib.ipv6_route_cookie(route, destination_v6, required_oif)
+        })
+    } else {
+        0
+    };
+    if selected.is_none()
+        && source.is_none()
+        && fib.has_ipv6_source_routes()
+        && !destination_v6.is_unspecified()
+    {
+        // Without an initial route there is no egress or preferred source.
+        // Rank addresses once and retry with the selected address, without
+        // testing a route for each possible source.
+        let scoped_oif = destination_v6
+            .is_unicast_link_local()
+            .then_some(required_oif)
+            .flatten();
+        let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
+        let (_, candidate) = devices
+            .values()
+            .filter(|iface| scoped_oif.is_none_or(|oif| iface.nic_id() == oif as usize))
+            .filter_map(|iface| {
+                iface
+                    .smol_iface()
+                    .lock()
+                    .ipv6_source_candidate_at(&destination_v6, now)
+            })
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .ok_or(SystemError::EADDRNOTAVAIL)?;
+        source = Some(candidate);
+        selected = fib.lookup_ipv6_output(destination_v6, required_oif, source);
+    }
+    let selected = selected.ok_or_else(|| {
         // ip6_dst_lookup_tail still attempts automatic source selection
         // after an initial route miss. No candidate takes precedence over
         // that route error; an explicit or available source does not.
-        if fixed_source.is_none()
+        if source.is_none()
             && !devices.values().any(|iface| {
                 iface.common().ip_addrs().iter().any(|cidr| {
                     matches!(cidr.address(), IpAddress::Ipv6(source)
@@ -224,10 +291,7 @@ pub(crate) fn resolve_ipv6_send_route(
     } else {
         SystemError::ENETUNREACH
     };
-    let source = if let Some(source) = fixed_source {
-        let IpAddress::Ipv6(source) = source else {
-            return Err(SystemError::EADDRNOTAVAIL);
-        };
+    let source = if let Some(source) = source {
         let local = devices.values().any(|candidate| {
             crate::net::address::iface_accepts_local_address(candidate, source.into())
         });
@@ -275,5 +339,6 @@ pub(crate) fn resolve_ipv6_send_route(
         },
         source,
         source_owner,
+        route_cookie,
     })
 }

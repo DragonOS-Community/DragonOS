@@ -199,29 +199,37 @@ impl Socket for UdpSocket {
                                 error
                             }
                         })?;
-                    let connected_source = match remote.addr {
-                        Ipv4(_) => output_flow::resolve_ipv4_send_flow(
-                            &self.netns,
-                            local,
-                            remote.addr,
-                            required_oif,
-                            multicast_source,
-                        )?
-                        .map(|flow| flow.source),
-                        Ipv6(_) => Some(
-                            crate::net::route::resolve_ipv6_send_route(
+                    let (connected_source, route_cookie) = match remote.addr {
+                        Ipv4(_) => (
+                            output_flow::resolve_ipv4_send_flow(
+                                &self.netns,
+                                local,
+                                remote.addr,
+                                required_oif,
+                                multicast_source,
+                            )?
+                            .map(|flow| flow.source),
+                            0,
+                        ),
+                        Ipv6(_) => {
+                            let resolved = crate::net::route::resolve_ipv6_socket_route(
                                 &self.netns,
                                 remote.addr,
                                 required_oif,
                                 output_flow::bound_source_constraint(&self.netns, local),
-                            )?
-                            .source
-                            .into(),
-                        ),
+                                crate::net::route::Ipv6RouteIntent::Connect,
+                            )?;
+                            (Some(resolved.source.into()), resolved.route_cookie)
+                        }
                     };
                     return match self.inner.read().as_ref() {
                         Some(UdpInner::Bound(inner)) => {
-                            inner.connect(remote, connected_source);
+                            inner.connect(super::inner::UdpConnection {
+                                remote,
+                                source: connected_source,
+                                required_oif,
+                                route_cookie,
+                            });
                             let receive_local = local
                                 .addr
                                 .filter(|address| !address.is_unspecified())

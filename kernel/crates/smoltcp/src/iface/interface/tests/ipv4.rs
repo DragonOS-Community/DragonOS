@@ -681,7 +681,7 @@ fn ipv4_pre_routing_receives_rx_token_metadata() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     device.rx_queue.push_back(icmp_request_for_rewrite());
     let mut filter = CaptureMeta(None);
-    let meta = PacketMeta { id: 71 };
+    let meta = PacketMeta::with_id(71);
     device.rx_meta = meta;
     assert_eq!(
         iface.poll_ingress_single_filtered(Instant::ZERO, &mut device, &mut sockets, &mut filter),
@@ -2907,7 +2907,7 @@ fn routed_egress_override_controls_fragment_mtu_and_metadata() {
 
     let (mut iface, _, _) = setup(Medium::Ethernet);
     let observed = Rc::new(RefCell::new(Vec::new()));
-    let meta = PacketMeta { id: META_ID };
+    let meta = PacketMeta::with_id(META_ID);
     let ip_repr = Ipv4Repr {
         src_addr: Ipv4Address::new(192, 0, 2, 1),
         dst_addr: Ipv4Address::new(198, 51, 100, 1),

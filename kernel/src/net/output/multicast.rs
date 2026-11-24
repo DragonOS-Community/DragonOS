@@ -10,11 +10,11 @@ fn post_clone(ct: &LocalOutputCt<'_>, bytes: &mut [u8], oifname: [u8; 16], oif: 
         .ruleset
         .ipv6_hook_requires_route_lookup(NftIpv4Hook::PostRouting)
         .then(|| super::super::route::lock_output_routes(&router, ct.netns.device_list()));
-    let resolve = |address, device| {
+    let resolve = |address, source, device| {
         routes
             .as_ref()
             .map_or(super::super::route::RTN_UNREACHABLE, |routes| {
-                routes.ipv6_addr_type(address, device)
+                routes.ipv6_addr_type(address, source, device)
             })
     };
     let lookup = routes.as_ref().map(|_| NftIpv6RouteLookup {

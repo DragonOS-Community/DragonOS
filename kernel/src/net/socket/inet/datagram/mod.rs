@@ -369,6 +369,7 @@ impl UdpSocket {
                 };
                 update.commit();
                 if let Some(UdpInner::Bound(bound)) = inner.as_ref() {
+                    bound.reset_route_cookie();
                     bound.update_receive_filter(self.bound_device_ifindex());
                 }
             }
@@ -664,6 +665,7 @@ impl UdpSocket {
                 // Keep an explicit address lock retained across disconnect.
                 local_addr: fixed_address
                     .unwrap_or(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)),
+                route_cookie: 0,
             });
         }
         let fixed_target = fixed_address
@@ -676,6 +678,7 @@ impl UdpSocket {
                 .map(|stack_owner| EphemeralBindTarget {
                     stack_owner,
                     local_addr: address,
+                    route_cookie: 0,
                 })
             })
             .transpose()?;
@@ -1214,11 +1217,21 @@ impl UdpSocket {
             }
             if policy.accepts_updates() {
                 let oif = self.bound_device_ifindex();
-                let _ = crate::net::route::pmtu::learn(
-                    &self.netns,
-                    feedback,
-                    (oif != 0).then_some(oif as u32),
-                );
+                let oif = (oif != 0).then_some(oif as u32);
+                let cookie = if connected && version == IpVersion::Ipv6 {
+                    match self.inner.read().as_ref() {
+                        Some(UdpInner::Bound(bound)) => bound
+                            .connection()
+                            .filter(|connection| connection.source == Some(feedback.source))
+                            .map_or(0, |connection| {
+                                connection.route_cookie_for(remote.addr, oif)
+                            }),
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                let _ = crate::net::route::pmtu::learn(&self.netns, feedback, oif, cookie);
             }
             if version == IpVersion::Ipv4 && policy == PmtuPolicy::Dont {
                 return;
@@ -1326,31 +1339,33 @@ impl UdpSocket {
                 )?
                 .path);
         }
-        let (remote, local, connected_source) = {
+        let (connection, local) = {
             let inner = self.inner.read();
             let Some(UdpInner::Bound(bound)) = inner.as_ref() else {
                 return Err(SystemError::ENOTCONN);
             };
             (
-                bound.remote_endpoint()?,
+                bound.connection().ok_or(SystemError::ENOTCONN)?,
                 bound.endpoint(),
-                bound.connected_source(),
             )
         };
+        let remote = connection.remote;
         if remote.addr.version() == IpVersion::Ipv4 {
             // An IPv6 socket connected to a mapped peer has an IPv4 dst;
             // Linux IPV6_MTU reports that connected route's MTU as well.
             return self.connected_path_mtu(IpVersion::Ipv4);
         }
         let oif = self.bound_device_ifindex();
-        let resolved = crate::net::route::resolve_ipv6_send_route(
+        let oif = (oif != 0).then_some(oif as u32);
+        let resolved = crate::net::route::resolve_ipv6_socket_route(
             &self.netns,
             remote.addr,
-            (oif != 0).then_some(oif as u32),
+            oif,
             local
                 .addr
                 .filter(|addr| !addr.is_unspecified())
-                .or(connected_source),
+                .or(connection.source),
+            crate::net::route::Ipv6RouteIntent::Send(connection.route_cookie_for(remote.addr, oif)),
         )?;
         Ok(self
             .output_path_mtu(
@@ -1375,10 +1390,23 @@ impl UdpSocket {
             remote,
             smoltcp::wire::IpProtocol::Udp,
         );
+        if matches!(source, Ipv6(_)) && destination == remote.addr {
+            return Ok(crate::net::route::pmtu::path_mtu(
+                &self.netns,
+                route,
+                source,
+                destination,
+            ));
+        }
         let router = self.netns.router();
         let routes = crate::net::route::lock_output_routes(&router, self.netns.device_list());
+        let lookup_source = if matches!(source, Ipv6(_)) {
+            local.addr
+        } else {
+            source
+        };
         let route = routes
-            .lookup_with_source(destination, route.required_oif, Some(source))
+            .lookup_with_source(destination, route.required_oif, Some(lookup_source))
             .ok_or(SystemError::ENETUNREACH)?;
         Ok(crate::net::route::pmtu::path_mtu(
             &self.netns,
@@ -1677,7 +1705,7 @@ impl UdpSocket {
                 destination_port: destination.port,
             }
         } else {
-            let (destination, local, connected_source) = {
+            let (destination, local, connection) = {
                 let inner = self.inner.read();
                 let bound = match inner.as_ref() {
                     Some(UdpInner::Bound(bound)) => bound,
@@ -1689,7 +1717,7 @@ impl UdpSocket {
                         .ok_or(SystemError::EDESTADDRREQ)?,
                 );
                 self.validate_bound_send_dest(bound, destination)?;
-                (destination, bound.endpoint(), bound.connected_source())
+                (destination, bound.endpoint(), bound.connection())
             };
             let Ipv6(destination_addr) = destination.addr else {
                 return Err(SystemError::EAFNOSUPPORT);
@@ -1698,13 +1726,17 @@ impl UdpSocket {
                 Some(index) => Some(index),
                 None => output_flow::socket_constraints(self, destination.addr)?.0,
             };
-            let fixed_source =
-                output_flow::bound_source_constraint(&self.netns, local).or(connected_source);
-            let resolved = crate::net::route::resolve_ipv6_send_route(
+            let fixed_source = output_flow::bound_source_constraint(&self.netns, local)
+                .or(connection.and_then(|connection| connection.source));
+            let route_cookie = connection.map_or(0, |connection| {
+                connection.route_cookie_for(destination.addr, required_oif)
+            });
+            let resolved = crate::net::route::resolve_ipv6_socket_route(
                 &self.netns,
                 destination.addr,
                 required_oif,
                 fixed_source,
+                crate::net::route::Ipv6RouteIntent::Send(route_cookie),
             )?;
             drop(placement);
             Ipv6SendSnapshot {

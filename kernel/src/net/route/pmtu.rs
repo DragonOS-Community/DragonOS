@@ -164,17 +164,47 @@ pub(crate) fn path_mtu(
         .lookup(Key::new(route, source, destination), Instant::now())
 }
 
+/// Resolve the egress that owns the PMTU exception. IPv6 POSTROUTING can
+/// change the wire source after selecting the route and therefore cannot
+/// choose a different source-prefix route. The caller still keys the
+/// exception by the translated addresses on the wire.
+pub(crate) fn lookup_output_route(
+    routes: &super::OutputRouteGuard<'_>,
+    required_oif: Option<u32>,
+    original: (IpAddress, IpAddress),
+    wire: (IpAddress, IpAddress),
+    route_cookie: u64,
+) -> Option<OutputRouteDecision> {
+    if matches!(original.0, IpAddress::Ipv6(_)) {
+        let cookie = if original.1 == wire.1 {
+            route_cookie
+        } else {
+            0
+        };
+        routes.lookup_socket_output(wire.1, required_oif, Some(original.0), cookie)
+    } else {
+        routes.lookup(wire.1, required_oif)
+    }
+}
+
 /// Called only after the quoted flow has matched a live transport socket.
 pub(crate) fn learn(
     netns: &Arc<NetNamespace>,
     feedback: &crate::net::icmp_error::IcmpErrorFeedback,
     required_oif: Option<u32>,
+    route_cookie: u64,
 ) -> Option<PathMtu> {
     let mtu = feedback.mtu()?;
     let (source, destination) = crate::net::icmp_error::routed_quote_flow(netns, feedback);
     let router = netns.router();
     let routes = super::lock_output_routes(&router, netns.device_list());
-    let route = routes.lookup(destination, required_oif)?;
+    let route = lookup_output_route(
+        &routes,
+        required_oif,
+        (feedback.source, feedback.destination),
+        (source, destination),
+        route_cookie,
+    )?;
     // An unrelated external source must not create a local route exception.
     if routes
         .lookup(feedback.source, None)

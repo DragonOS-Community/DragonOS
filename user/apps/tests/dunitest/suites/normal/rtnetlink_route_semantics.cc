@@ -949,7 +949,7 @@ TEST(RtnetlinkRouteSemantics, Ipv6ExplicitLocalRouteDeliversWithoutOwningAnAddre
             ASSERT_GE(accepted.Get(), 0) << ErrnoString(errno);
             EXPECT_TRUE(IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
 
-            constexpr char configured_source[] = "fd76:90::1";
+            constexpr char configured_source[] = "2001:db8:76::1";
             ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, lo, "fd76:80::1",
                                           128, ++seq), 0);
             ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, veth, configured_source,
@@ -959,11 +959,16 @@ TEST(RtnetlinkRouteSemantics, Ipv6ExplicitLocalRouteDeliversWithoutOwningAnAddre
             ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fe80::88", 128,
                                           veth, RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
                                           std::nullopt, RTN_LOCAL, RT_TABLE_LOCAL), 0);
+            constexpr char ula_source[] = "fd76:90::1";
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_NEWADDR, add, veth, ula_source,
+                                          64, ++seq), 0);
             const auto global_destination = destination;
             ASSERT_EQ(inet_pton(AF_INET6, "fe80::88", &destination.sin6_addr), 1);
             destination.sin6_scope_id = veth;
             ASSERT_NO_FATAL_FAILURE(connected_udp(configured_source));
             destination = global_destination;
+            ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_DELADDR, request, veth, ula_source,
+                                          64, ++seq), 0);
 
             ASSERT_EQ(SendIpv6AddrRequest(route.Get(), RTM_DELADDR, request, lo, "fd76:80::1",
                                           128, ++seq), 0);

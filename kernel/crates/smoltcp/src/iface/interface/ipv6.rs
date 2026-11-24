@@ -46,6 +46,30 @@ impl Default for HopByHopResponse<'_> {
     }
 }
 
+// Linux's built-in IPv6 address-label policy, in longest-prefix order for
+// overlapping entries. The policy labels are compared for equality.
+fn routed_address_label(address: Ipv6Address) -> u8 {
+    let bytes = address.octets();
+    if address.is_loopback() {
+        return 0; // ::1/128
+    }
+    if bytes[..12] == [0; 12] {
+        return 3; // ::/96
+    }
+    if bytes[..10] == [0; 10] && bytes[10..12] == [0xff; 2] {
+        return 4; // ::ffff:0:0/96
+    }
+    match (bytes[0], bytes[1]) {
+        (0x20, 0x02) => 2,                                             // 2002::/16
+        (0xfc | 0xfd, _) => 5,                                         // fc00::/7
+        (0x20, 0x01) if bytes[2] == 0 && bytes[3] == 0 => 6,           // 2001::/32
+        (0x20, 0x01) if bytes[2] == 0 && bytes[3] & 0xf0 == 0x10 => 7, // 2001:10::/28
+        (0xfe, second) if second & 0xc0 == 0xc0 => 11,                 // fec0::/10
+        (0x3f, 0xfe) => 12,                                            // 3ffe::/16
+        _ => 1,                                                        // ::/0
+    }
+}
+
 impl InterfaceInner {
     /// Return the IPv6 address that is a candidate source address for the given destination
     /// address, based on RFC 6724.
@@ -137,6 +161,7 @@ impl InterfaceInner {
         };
         let mut best = None;
         let dst_scope = scope(*dst_addr);
+        let dst_label = on_route_device.map(|_| routed_address_label(*dst_addr));
         for addr in self.ip_addrs.iter().filter_map(|a| match a {
             #[cfg(feature = "proto-ipv4")]
             IpCidr::Ipv4(_) => None,
@@ -163,13 +188,14 @@ impl InterfaceInner {
                 .iter()
                 .any(|&(address, deadline)| address == source && deadline <= now);
             // Rule 1 (same address), Rule 2 (scope), Rule 3 (deprecation),
-            // Rule 5 (outgoing interface), and Rule 8 (longest matching prefix).
+            // Rule 5 (outgoing interface), Rule 6 (matching label), then Rule 8 (prefix).
             let score = (
                 source == *dst_addr,
                 adequate_scope,
                 scope_score,
                 !deprecated,
                 on_route_device.unwrap_or(false),
+                dst_label.is_some_and(|label| label == routed_address_label(source)),
                 common_prefix_length(addr, dst_addr),
             );
             if best.map_or(true, |(best_score, _)| score > best_score) {
@@ -849,5 +875,39 @@ impl InterfaceInner {
             },
             IpPayload::HopByHopIcmpv6(hbh_repr, Icmpv6Repr::Mld(mld_repr)),
         ))
+    }
+}
+
+#[cfg(test)]
+mod source_label_tests {
+    use super::routed_address_label;
+
+    #[test]
+    fn routed_address_labels_match_default_linux_policy() {
+        for (address, label) in [
+            ("::1", 0),
+            ("::", 3),
+            ("::192.0.2.1", 3),
+            ("::ffff:192.0.2.1", 4),
+            ("fc00::1", 5),
+            ("fdff::1", 5),
+            ("fe80::1", 1),
+            ("febf::1", 1),
+            ("fec0::1", 11),
+            ("feff::1", 11),
+            ("2002::1", 2),
+            ("2001::1", 6),
+            ("2001:10::1", 7),
+            ("2001:1f::1", 7),
+            ("2001:20::1", 1),
+            ("2001:db8::1", 1),
+            ("3ffe::1", 12),
+        ] {
+            assert_eq!(
+                routed_address_label(address.parse().unwrap()),
+                label,
+                "{address}"
+            );
+        }
     }
 }

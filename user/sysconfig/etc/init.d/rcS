@@ -3,6 +3,18 @@
 export PATH=/bin:/usr/bin:/usr/local/bin
 
 echo "[rcS] Running system init script..."
+
+# Provide the standard stream paths before starting user-space services.
+for stream in stdin:0 stdout:1 stderr:2; do
+    path="/dev/${stream%:*}"
+    if [ -L "$path" ] || [ -e "$path" ]; then
+        continue
+    fi
+    if ! /bin/busybox ln -sT "/proc/self/fd/${stream#*:}" "$path"; then
+        echo "[rcS] Warning: failed to create $path" >&2
+    fi
+done
+
 /bin/about.elf
 
 # 挂载tmpfs到/tmp目录

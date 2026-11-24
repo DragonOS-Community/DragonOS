@@ -354,6 +354,11 @@ impl<'a> NetIngressFilter<'a> {
         }
     }
 
+    fn ipv6_special_route_view(&self) -> Option<&OutputRouteGuard<'_>> {
+        self.fib_routes
+            .filter(|routes| routes.has_ipv6_special_routes())
+    }
+
     fn route_ipv6(
         &mut self,
         packet: &mut RoutedIngressPacket<'_, '_>,
@@ -365,12 +370,9 @@ impl<'a> NetIngressFilter<'a> {
             // A forwarding namespace must not accept transit as local when
             // its full route view is unavailable.
             None if self.netns.ipv6_forwarding_enabled() => return RouteInputVerdict::Drop,
-            // Physical NAPI also holds a FIB view in host mode. Reject
-            // routes still apply there, without enabling ordinary routing.
-            None => match self
-                .fib_routes
-                .filter(|routes| routes.has_ipv6_special_routes())
-            {
+            // Physical NAPI also holds a FIB view in host mode. Apply
+            // special routes there without enabling ordinary routing.
+            None => match self.ipv6_special_route_view() {
                 Some(routes) => routes,
                 None => return RouteInputVerdict::Pass,
             },
@@ -392,10 +394,14 @@ impl<'a> NetIngressFilter<'a> {
         else {
             return RouteInputVerdict::Pass;
         };
-        if self.routes.is_none() && !super::route::is_ipv6_reject_or_throw(route.matched.kind) {
+        let kind = route.matched.kind;
+        if self.routes.is_none()
+            && kind != RTN_ANYCAST
+            && !super::route::is_ipv6_reject_or_throw(kind)
+        {
             return RouteInputVerdict::Pass;
         }
-        match route.matched.kind {
+        match kind {
             RTN_ANYCAST if !route.matched.is_loopback_anycast() => RouteInputVerdict::Ipv6Anycast,
             // IPv6 link-local unicast is scoped to its ingress link. A local
             // address on another interface must not be weak-host delivered.
@@ -864,12 +870,16 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if self.stage.get() == IngressStage::LocalInputDone {
             // LOCAL_IN reassembly may recover anycast admission, but must
             // never run forward or rejection hooks a second time.
-            if let (Some(routes), Ok(IpVersion::Ipv6)) =
-                (self.routes, IpVersion::of_packet(packet.bytes()))
-            {
+            if let (Some(routes), Ok(IpVersion::Ipv6)) = (
+                self.ipv6_special_route_view(),
+                IpVersion::of_packet(packet.bytes()),
+            ) {
                 let Ok(ipv6) = Ipv6Packet::new_checked(packet.bytes()) else {
                     return RouteInputVerdict::Drop;
                 };
+                if ipv6.dst_addr().is_multicast() {
+                    return RouteInputVerdict::Pass;
+                }
                 let ingress_ifindex = if meta.id != 0 {
                     meta.id
                 } else {

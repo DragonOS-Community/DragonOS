@@ -273,25 +273,6 @@ impl FibLookupKey {
         }
     }
 
-    fn ingress_local(destination: IpAddress, ingress_oif: u32) -> Self {
-        Self {
-            destination,
-            source: None,
-            table: super::RT_TABLE_LOCAL,
-            // Link-local unicast belongs to the arriving link, unlike the
-            // weak-host IPv4/global IPv6 local-table lookup below.
-            required_oif:
-                matches!(destination, IpAddress::Ipv6(address) if address.is_unicast_link_local())
-                    .then_some(ingress_oif),
-            minimum_scope: None,
-            // Linux's local table is weak-host: a directed broadcast remains
-            // local even when it arrived through another interface. Limited
-            // broadcast is handled as a transient ingress decision by the
-            // route facade and never reaches this FIB lookup.
-            broadcast: BroadcastLookup::Any,
-        }
-    }
-
     fn gateway(
         destination: IpAddress,
         table: u32,
@@ -944,13 +925,15 @@ impl FibTable {
         ingress_oif: u32,
         source: Option<Ipv6Address>,
     ) -> Option<RouteLookupResult> {
+        // IPv6 link-local unicast is scoped to the arriving link in every
+        // table. Other destinations keep the weak-host local-table lookup.
+        let required_oif =
+            matches!(destination, IpAddress::Ipv6(address) if address.is_unicast_link_local())
+                .then_some(ingress_oif);
         self.lookup_builtin_rules(destination, |table| FibLookupKey {
             source,
-            ..if table == RT_TABLE_LOCAL {
-                FibLookupKey::ingress_local(destination, ingress_oif)
-            } else {
-                FibLookupKey::output(destination, table)
-            }
+            required_oif,
+            ..FibLookupKey::output(destination, table)
         })
     }
 

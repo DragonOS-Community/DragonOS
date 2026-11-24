@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/if_addr.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
@@ -478,7 +479,8 @@ int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
 
 bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
                                 const AddressSpec& expected, const char* label,
-                                bool require_label_absent);
+                                bool require_label_absent,
+                                std::optional<uint32_t> dad_flags = std::nullopt);
 
 int CountExplicitBroadcast(int fd, const AddressSpec& expected, uint32_t broadcast,
                            uint32_t sequence) {
@@ -531,8 +533,9 @@ int CountBroadcastNotification(int fd, uint16_t type, const AddressSpec& expecte
 }
 
 bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
-                                const AddressSpec& expected, const char* label = nullptr,
-                                bool require_label_absent = false) {
+                                const AddressSpec& expected, const char* label,
+                                bool require_label_absent,
+                                std::optional<uint32_t> dad_flags) {
     if (header->nlmsg_type != type) return false;
     const auto* message = reinterpret_cast<const ifaddrmsg*>(NLMSG_DATA(header));
     if (message->ifa_family != expected.family || message->ifa_index != expected.ifindex ||
@@ -543,9 +546,12 @@ bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
     bool address_matches = false;
     bool label_matches = label == nullptr;
     bool has_label = false;
+    uint32_t flags = message->ifa_flags;
     for (auto* attr = IFA_RTA(message); RTA_OK(attr, attr_length);
          attr = RTA_NEXT(attr, attr_length)) {
-        if ((attr->rta_type == IFA_LOCAL || attr->rta_type == IFA_ADDRESS) &&
+        if (attr->rta_type == IFA_FLAGS && RTA_PAYLOAD(attr) >= sizeof(flags)) {
+            std::memcpy(&flags, RTA_DATA(attr), sizeof(flags));
+        } else if ((attr->rta_type == IFA_LOCAL || attr->rta_type == IFA_ADDRESS) &&
             RTA_PAYLOAD(attr) >= expected.local.length &&
             std::memcmp(RTA_DATA(attr), expected.local.bytes.data(), expected.local.length) == 0) {
             address_matches = true;
@@ -558,7 +564,9 @@ bool NotificationMatchesAddress(const nlmsghdr* header, uint16_t type,
             has_label = true;
         }
     }
-    return address_matches && label_matches && (!require_label_absent || !has_label);
+    constexpr uint32_t kDadFlags = IFA_F_TENTATIVE | IFA_F_DADFAILED;
+    return address_matches && label_matches && (!require_label_absent || !has_label) &&
+           (!dad_flags || (flags & kDadFlags) == *dad_flags);
 }
 
 void DrainNotifications(int fd) {
@@ -572,7 +580,8 @@ void DrainNotifications(int fd) {
 }
 
 int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address,
-                              const char* label = nullptr, bool require_label_absent = false) {
+                              const char* label = nullptr, bool require_label_absent = false,
+                              std::optional<uint32_t> dad_flags = std::nullopt) {
     std::array<uint8_t, 16384> buffer{};
     int count = 0;
     bool received_any = false;
@@ -588,7 +597,8 @@ int CountAddressNotifications(int fd, uint16_t type, const AddressSpec& address,
         int remaining = static_cast<int>(received);
         for (auto* header = reinterpret_cast<nlmsghdr*>(buffer.data());
              NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
-            if (NotificationMatchesAddress(header, type, address, label, require_label_absent)) {
+            if (NotificationMatchesAddress(header, type, address, label, require_label_absent,
+                                           dad_flags)) {
                 ++count;
             }
         }
@@ -701,6 +711,19 @@ bool WaitForDadSolicitation(int fd, const IpBytes& target) {
     return false;
 }
 
+int CreateDadVeth(int fd, const char* name, const uint8_t (&mac)[6], uint32_t sequence) {
+    constexpr uint16_t kCreate = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    auto request = NewRequest<ifinfomsg>(RTM_NEWLINK, kCreate, sequence);
+    const struct {
+        rtattr header;
+        char kind[RTA_ALIGN(sizeof("veth"))];
+    } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+    AddAttr(&request, IFLA_IFNAME, name, std::strlen(name) + 1);
+    AddAttr(&request, IFLA_ADDRESS, mac, sizeof(mac));
+    AddAttr(&request, IFLA_LINKINFO, &link_info, sizeof(link_info));
+    return SendAndReceiveAck(fd, request);
+}
+
 int RunManualIpv6Dad() {
     FdGuard fd;
     uint32_t lo = 0;
@@ -709,17 +732,10 @@ int RunManualIpv6Dad() {
 
     constexpr uint16_t kRequest = NLM_F_REQUEST | NLM_F_ACK;
     constexpr uint16_t kCreate = kRequest | NLM_F_CREATE | NLM_F_EXCL;
-    auto request = NewRequest<ifinfomsg>(RTM_NEWLINK, kCreate, ++sequence);
     constexpr char link_name[] = "dad50";
-    const struct {
-        rtattr header;
-        char kind[RTA_ALIGN(sizeof("veth"))];
-    } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
     constexpr uint8_t mac[] = {0x02, 0, 0, 0, 0x50, 0x91};
-    AddAttr(&request, IFLA_IFNAME, link_name, sizeof(link_name));
-    AddAttr(&request, IFLA_ADDRESS, mac, sizeof(mac));
-    AddAttr(&request, IFLA_LINKINFO, &link_info, sizeof(link_info));
-    if (const int error = SendAndReceiveAck(fd.Get(), request); error != 0) return 100 + error;
+    if (const int error = CreateDadVeth(fd.Get(), link_name, mac, ++sequence); error != 0)
+        return 100 + error;
     const auto edge = if_nametoindex(link_name);
     const auto peer = if_nametoindex("veth0");
     if (edge == 0 || peer == 0 || edge == peer) return 200;
@@ -885,11 +901,92 @@ int RunManualIpv6Dad() {
         if (count < 0) return 3440;
         if (count == 0) {
             return CountAddressNotifications(notifications.Get(), RTM_DELADDR,
-                                             expires_without_carrier) == 1 ? 0 : 3450;
+                                             expires_without_carrier, nullptr, false,
+                                             IFA_F_TENTATIVE) == 1 ? 0 : 3450;
         }
         usleep(20 * 1000);
     }
     return 3460;
+}
+
+int RunFiniteIpv6DadFailure() {
+    FdGuard fd;
+    uint32_t lo = 0;
+    uint32_t sequence = 8700;
+    if (const int error = PrepareNamespace(&fd, &lo, &sequence); error != 0) return error;
+
+    constexpr char name[] = "dad87";
+    constexpr uint8_t mac[] = {0x02, 0, 0, 0, 0x87, 0x01};
+    if (const int error = CreateDadVeth(fd.Get(), name, mac, ++sequence); error != 0)
+        return 100 + error;
+    const auto edge = if_nametoindex(name);
+    const auto peer = if_nametoindex("veth0");
+    if (edge == 0 || peer == 0 || edge == peer) return 200;
+
+    auto write_setting = [](const char* path, const char (&value)[3]) {
+        FdGuard setting(open(path, O_WRONLY));
+        return setting.Get() >= 0 && write(setting.Get(), value, 2) == 2;
+    };
+    if (!write_setting("/proc/sys/net/ipv6/conf/dad87/accept_dad", "1\n") ||
+        !write_setting("/proc/sys/net/ipv6/conf/dad87/dad_transmits", "4\n")) {
+        return 210;
+    }
+    FdGuard auto_notifications(OpenRouteSocket(RTMGRP_IPV6_IFADDR));
+    FdGuard manual_notifications(OpenRouteSocket(RTMGRP_IPV6_IFADDR));
+    if (auto_notifications.Get() < 0 || manual_notifications.Get() < 0) return 220;
+    if (SetLinkUp(fd.Get(), peer, ++sequence) != 0 ||
+        SetLinkUp(fd.Get(), edge, ++sequence) != 0) {
+        return 230;
+    }
+
+    auto automatic = MakeAddress(AF_INET6, "fe80::ff:fe00:8701", 64, edge);
+    auto manual = MakeAddress(AF_INET6, "fd87:2324::1", 64, edge);
+    automatic.ipv6_flags = 0;
+    manual.ipv6_flags = 0;
+    const auto publish_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool tentative = false;
+    while (!tentative && std::chrono::steady_clock::now() < publish_deadline) {
+        std::vector<DumpedAddress> addresses;
+        if (DumpAddresses(fd.Get(), AF_INET6, ++sequence, &addresses) != 0) return 240;
+        tentative = std::any_of(addresses.begin(), addresses.end(), [&](const auto& address) {
+            return address.ifindex == edge && SameAddress(address.local, automatic.local) &&
+                   (address.flags & IFA_F_TENTATIVE);
+        });
+        if (!tentative) usleep(20 * 1000);
+    }
+    if (!tentative) return 240;
+
+    constexpr uint16_t kRequest = NLM_F_REQUEST | NLM_F_ACK;
+    constexpr uint16_t kCreate = kRequest | NLM_F_CREATE | NLM_F_EXCL;
+    constexpr ifa_cacheinfo finite{50, 60, 0, 0};
+    auto change = [&](const AddressSpec& address, uint16_t action, const ifa_cacheinfo* cache) {
+        return ChangeAddress(fd.Get(), RTM_NEWADDR, action, address, true, true, ++sequence,
+                             nullptr, std::nullopt, nullptr, std::nullopt, cache);
+    };
+    if (change(automatic, kRequest | NLM_F_REPLACE, &finite) != 0) return 250;
+    for (auto duplicate : {automatic, manual}) {
+        duplicate.ifindex = peer;
+        duplicate.ipv6_flags = IFA_F_NODAD;
+        if (change(duplicate, kCreate, nullptr) != 0) return 260;
+    }
+    if (change(manual, kCreate, &finite) != 0) return 270;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int remaining_auto = CountAddress(fd.Get(), automatic, ++sequence);
+        const int remaining_manual = CountAddress(fd.Get(), manual, ++sequence);
+        if (remaining_auto < 0 || remaining_manual < 0) return 280;
+        if (remaining_auto == 0 && remaining_manual == 0) {
+            constexpr uint32_t kDadFailure = IFA_F_TENTATIVE | IFA_F_DADFAILED;
+            if (CountAddressNotifications(auto_notifications.Get(), RTM_DELADDR, automatic,
+                                          nullptr, false, kDadFailure) != 1) return 290;
+            if (CountAddressNotifications(manual_notifications.Get(), RTM_DELADDR, manual,
+                                          nullptr, false, kDadFailure) != 1) return 300;
+            return 0;
+        }
+        usleep(20 * 1000);
+    }
+    return 310;
 }
 
 int RunManualIpv6Lifetimes() {
@@ -1815,6 +1912,11 @@ void ExpectSuccessfulChild(const ChildOutcome& outcome, const char* timeout_mess
 TEST(RtnetlinkAddressSemantics, ManualIpv6DadHonorsFlagsAndLinkReadiness) {
     ExpectSuccessfulChild(RunWithWatchdog(RunManualIpv6Dad),
                           "manual IPv6 duplicate address detection hung");
+}
+
+TEST(RtnetlinkAddressSemantics, FiniteIpv6DadFailureDeletesAddressWithFailureFlags) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunFiniteIpv6DadFailure),
+                          "finite IPv6 address DAD failure processing hung");
 }
 
 TEST(RtnetlinkAddressSemantics, ManualIpv6LifetimesReplaceDeprecateAndExpire) {

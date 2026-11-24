@@ -522,27 +522,18 @@ fn finish_address(
         .map(|entry| (entry.state, entry.lifetimes, entry.ipv6_permanent))
         .ok_or(SystemError::EADDRNOTAVAIL)?;
     let address_state = match old_state {
-        AddressState::Slaac(_) => {
-            if observed.conflict
-                || lifetimes
-                    .is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros()))
-            {
-                ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
-                return Ok(true);
-            }
-            AddressState::Slaac(state)
-        }
-        AddressState::ManualDad(_) if observed.conflict && !permanent => {
-            ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
-            return Ok(true);
-        }
+        AddressState::Slaac(_) => AddressState::Slaac(state),
         AddressState::ManualDad(_) if state == DadState::Usable => AddressState::Configured,
         AddressState::ManualDad(_) => AddressState::ManualDad(state),
         _ => AddressState::AutoLinkLocal(state),
     };
+    if observed.conflict && !permanent {
+        ipv6_lifetime::remove(rtnl, netns, iface, cidr, Some(address_state))?;
+        return Ok(true);
+    }
     let prepared = super::prepare_automatic_address(netns, iface, cidr, address_state, lifetimes)?;
     if lifetimes.is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros())) {
-        ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
+        ipv6_lifetime::remove(rtnl, netns, iface, cidr, None)?;
         return Ok(true);
     }
     {

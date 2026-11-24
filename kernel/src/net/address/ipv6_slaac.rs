@@ -39,7 +39,7 @@ pub(crate) fn apply(
         .map(|entry| (entry.cidr, entry.state, entry.lifetimes));
     if let Some((cidr, state, lifetimes)) = existing {
         if lifetimes.is_some_and(|current| current.expired(now_us)) {
-            ipv6_lifetime::remove(rtnl, netns, iface, cidr)?;
+            ipv6_lifetime::remove(rtnl, netns, iface, cidr, None)?;
         } else {
             let mut refreshed = offered.refresh_from_ra(lifetimes);
             if refreshed.deprecated(now_us) {

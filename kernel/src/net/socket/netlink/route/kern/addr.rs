@@ -435,6 +435,7 @@ pub(super) fn addr_to_segment(
             flags.insert(AddrMessageFlags::TENTATIVE);
         }
         AddressState::AutoLinkLocal(DadState::DadFailed)
+        | AddressState::Slaac(DadState::DadFailed)
         | AddressState::ManualDad(DadState::DadFailed) => {
             flags.insert(AddrMessageFlags::TENTATIVE | AddrMessageFlags::DADFAILED);
         }

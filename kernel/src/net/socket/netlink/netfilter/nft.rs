@@ -1814,6 +1814,7 @@ pub(super) fn set_message(
     finish_nft_message(bytes, sequence, port, kind, flags)
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct SetElementMessageMeta {
     pub(super) generation: u32,
     pub(super) sequence: u32,

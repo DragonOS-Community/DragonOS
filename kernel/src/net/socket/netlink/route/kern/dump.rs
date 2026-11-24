@@ -301,9 +301,7 @@ impl DumpSession {
                     request.header(),
                     CSegmentType::NEWROUTE,
                     entry,
-                    crate::net::socket::netlink::route::message::segment::route::RouteFlags::empty(
-                    ),
-                    false,
+                    route::RouteReply::Configuration,
                     0,
                 )?)))
             }

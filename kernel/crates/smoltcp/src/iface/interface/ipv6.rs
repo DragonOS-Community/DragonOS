@@ -66,7 +66,7 @@ impl InterfaceInner {
         if dst_addr.is_loopback() {
             return Ipv6Address::LOCALHOST;
         }
-        self.ipv6_source_candidate_at(dst_addr, now)
+        self.ipv6_source_candidate_at(dst_addr, now, None)
             .map(|(_, address)| address)
             .or_else(|| self.ipv6_addr())
             .unwrap_or(Ipv6Address::LOCALHOST)
@@ -76,6 +76,7 @@ impl InterfaceInner {
         &self,
         dst_addr: &Ipv6Address,
         now: Instant,
+        on_route_device: Option<bool>,
     ) -> Option<(impl Ord, Ipv6Address)> {
         // See RFC 6724 Section 4: Candidate source address
         fn is_candidate_source_address(dst_addr: &Ipv6Address, src_addr: &Ipv6Address) -> bool {
@@ -121,35 +122,54 @@ impl InterfaceInner {
             bits as usize
         }
 
+        let scope = |address: Ipv6Address| {
+            if on_route_device.is_none() || address.is_multicast() {
+                address.x_multicast_scope() as u8
+            } else if address.is_loopback()
+                || address.octets()[0] == 0xfe && address.octets()[1] & 0xc0 == 0x80
+            {
+                Ipv6MulticastScope::LinkLocal as u8
+            } else if address.octets()[0] == 0xfe && address.octets()[1] & 0xc0 == 0xc0 {
+                Ipv6MulticastScope::SiteLocal as u8
+            } else {
+                Ipv6MulticastScope::Global as u8
+            }
+        };
         let mut best = None;
-        let dst_scope = dst_addr.x_multicast_scope() as u8;
+        let dst_scope = scope(*dst_addr);
         for addr in self.ip_addrs.iter().filter_map(|a| match a {
             #[cfg(feature = "proto-ipv4")]
             IpCidr::Ipv4(_) => None,
             IpCidr::Ipv6(addr) => Some(addr),
         }) {
             let source = addr.address();
-            if !is_candidate_source_address(dst_addr, &source) {
+            let eligible = if on_route_device.is_some() {
+                source.x_is_unicast()
+            } else {
+                is_candidate_source_address(dst_addr, &source)
+            };
+            if !eligible {
                 continue;
             }
-            let scope = source.x_multicast_scope() as u8;
-            let adequate_scope = scope >= dst_scope;
+            let source_scope = scope(source);
+            let adequate_scope = source_scope >= dst_scope;
             let scope_score = if adequate_scope {
-                u8::MAX - scope
+                u8::MAX - source_scope
             } else {
-                scope
+                source_scope
             };
             let deprecated = self
                 .ipv6_preferred_until
                 .iter()
                 .any(|&(address, deadline)| address == source && deadline <= now);
             // Rule 1 (same address), Rule 2 (scope), Rule 3 (deprecation),
-            // and Rule 8 (longest matching prefix), in that order.
+            // Rule 5 (outgoing interface), and Rule 8 (longest matching prefix).
             let score = (
                 source == *dst_addr,
                 adequate_scope,
                 scope_score,
                 !deprecated,
+                on_route_device.unwrap_or(false),
                 common_prefix_length(addr, dst_addr),
             );
             if best.map_or(true, |(best_score, _)| score > best_score) {

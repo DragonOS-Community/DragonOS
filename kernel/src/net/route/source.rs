@@ -363,7 +363,7 @@ pub(crate) fn resolve_ipv6_socket_route(
                 iface
                     .smol_iface()
                     .lock()
-                    .ipv6_source_candidate_at(&destination_v6, now)
+                    .ipv6_source_candidate_at(&destination_v6, now, None)
             })
             .max_by(|left, right| left.0.cmp(&right.0))
             .ok_or(SystemError::EADDRNOTAVAIL)?;
@@ -401,17 +401,41 @@ pub(crate) fn resolve_ipv6_socket_route(
     } else {
         SystemError::ENETUNREACH
     };
-    let source = if let Some(source) = source {
+    let explicit_local = selected.matched.is_explicit_ipv6_local();
+    let scoped_destination = destination_v6.is_loopback()
+        || destination_v6.is_unicast_link_local()
+        || destination_v6.is_multicast();
+    let (source, selected_owner) = if let Some(source) = source {
         let local = devices.values().any(|candidate| {
             crate::net::address::iface_accepts_local_address(candidate, source.into())
         });
         if !local
             || super::is_ipv6_link_local(source.into())
+                && (!explicit_local || scoped_destination)
                 && !crate::net::address::iface_accepts_local_address(egress, source.into())
         {
             return Err(SystemError::EADDRNOTAVAIL);
         }
-        source
+        (source, None)
+    } else if explicit_local && matches!(selected.source, RouteSourcePolicy::SelectConfigured) {
+        let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
+        let (_, source, owner) = devices
+            .values()
+            .filter_map(|iface| {
+                let on_route_device = iface.nic_id() == selected.oif as usize;
+                if scoped_destination && !on_route_device {
+                    return None;
+                }
+                let (score, source) = iface.smol_iface().lock().ipv6_source_candidate_at(
+                    &destination_v6,
+                    now,
+                    Some(on_route_device),
+                )?;
+                Some((score, source, iface))
+            })
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .ok_or(SystemError::EADDRNOTAVAIL)?;
+        (source, Some(Arc::clone(owner)))
     } else {
         let candidate = match selected.source {
             super::RouteSourcePolicy::Preferred(source) => Some(source),
@@ -429,14 +453,17 @@ pub(crate) fn resolve_ipv6_socket_route(
         {
             return Err(no_source);
         }
-        candidate
+        (candidate, None)
     };
-    let source_owner = devices
-        .values()
-        .find(|candidate| {
-            crate::net::address::iface_accepts_local_address(candidate, source.into())
+    let source_owner = selected_owner
+        .or_else(|| {
+            devices
+                .values()
+                .find(|candidate| {
+                    crate::net::address::iface_accepts_local_address(candidate, source.into())
+                })
+                .cloned()
         })
-        .cloned()
         .ok_or(no_source)?;
     let mtu_oif = selected.output_mtu_oif();
     let ip_mtu = if mtu_oif == selected.oif {
@@ -455,7 +482,7 @@ pub(crate) fn resolve_ipv6_socket_route(
             ip_mtu,
             kind: selected.matched.kind,
             loopback_anycast: selected.matched.is_loopback_anycast(),
-            explicit_ipv6_local: selected.matched.is_explicit_ipv6_local(),
+            explicit_ipv6_local: explicit_local,
             table: selected.table,
         },
         source,

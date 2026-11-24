@@ -230,7 +230,7 @@ pub(crate) fn set_device_ipv6_disabled(
         ipv6_autoconf::cancel(iface.common());
         iface.common().fail_deferred_ipv6();
     } else {
-        ipv6_autoconf::changed(iface.common());
+        ipv6_autoconf::link_changed(iface.common(), iface.operstate());
     }
     let removed_neighbors = neighbors.map_or_else(Vec::new, |prepared| prepared.publish());
 

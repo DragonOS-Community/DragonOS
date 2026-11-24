@@ -380,7 +380,7 @@ impl BridgeIface {
                     .set_ip_mtu(self.stack_mtu(candidate))
                     .expect("attached port MTU must fit the bridge interface");
                 self.common.set_mtu(candidate);
-                crate::net::address::ipv6_autoconf::changed(&self.common);
+                crate::net::address::ipv6_autoconf::link_changed(&self.common, self.operstate());
                 let iface = self
                     .driver
                     .local_iface()
@@ -447,9 +447,10 @@ impl BridgeIface {
             Operstate::IF_OPER_UP
         };
         let changed = old != device.operstate;
+        let operstate = device.operstate;
         drop(inner);
         if changed {
-            crate::net::address::ipv6_autoconf::changed(&self.common);
+            crate::net::address::ipv6_autoconf::link_changed(&self.common, operstate);
         }
     }
 }

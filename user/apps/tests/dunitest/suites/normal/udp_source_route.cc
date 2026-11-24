@@ -243,6 +243,46 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
             destination.sin6_port = htons(23089);
             ASSERT_EQ(inet_pton(AF_INET6, "fd89:2::2", &destination.sin6_addr), 1);
 
+            auto expect_route_source = [&](uint32_t flags, const char* expected) {
+                alignas(nlmsghdr) char query[128] = {};
+                auto* header = reinterpret_cast<nlmsghdr*>(query);
+                header->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
+                header->nlmsg_type = RTM_GETROUTE;
+                header->nlmsg_flags = NLM_F_REQUEST;
+                header->nlmsg_seq = ++seq;
+                auto* message = reinterpret_cast<rtmsg*>(NLMSG_DATA(header));
+                message->rtm_family = AF_INET6;
+                message->rtm_dst_len = 128;
+                message->rtm_flags = flags;
+                AddAttr(header, sizeof(query), RTA_DST, &destination.sin6_addr,
+                        sizeof(destination.sin6_addr));
+                AddAttr(header, sizeof(query), RTA_OIF, &egress, sizeof(egress));
+                ASSERT_EQ(send(route.Get(), header, header->nlmsg_len, 0),
+                          static_cast<ssize_t>(header->nlmsg_len));
+                pollfd ready{route.Get(), POLLIN, 0};
+                ASSERT_EQ(poll(&ready, 1, 2000), 1);
+                alignas(nlmsghdr) char response[1024] = {};
+                const ssize_t len = recv(route.Get(), response, sizeof(response), 0);
+                const auto* reply = reinterpret_cast<const nlmsghdr*>(response);
+                ASSERT_TRUE(NLMSG_OK(reply, len));
+                ASSERT_EQ(reply->nlmsg_seq, seq);
+                ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
+                ASSERT_GE(reply->nlmsg_len, NLMSG_LENGTH(sizeof(rtmsg)));
+                const auto* resolved = reinterpret_cast<const rtmsg*>(NLMSG_DATA(reply));
+                int remaining = RTM_PAYLOAD(reply);
+                for (auto* attr = RTM_RTA(resolved); RTA_OK(attr, remaining);
+                     attr = RTA_NEXT(attr, remaining)) {
+                    if (attr->rta_type != RTA_PREFSRC) continue;
+                    ASSERT_NE(expected, nullptr);
+                    in6_addr source{};
+                    ASSERT_EQ(inet_pton(AF_INET6, expected, &source), 1);
+                    ASSERT_EQ(RTA_PAYLOAD(attr), sizeof(source));
+                    EXPECT_EQ(std::memcmp(RTA_DATA(attr), &source, sizeof(source)), 0);
+                    return;
+                }
+                EXPECT_EQ(expected, nullptr);
+            };
+
             FdGuard packets(socket(AF_PACKET, SOCK_DGRAM | SOCK_NONBLOCK, htons(ETH_P_IPV6)));
             FdGuard control(socket(AF_INET6, SOCK_DGRAM, 0));
             ASSERT_GE(packets.Get(), 0);
@@ -315,6 +355,8 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
             ASSERT_NO_FATAL_FAILURE(exercise("::1"));
             ASSERT_EQ(address(RTM_NEWADDR, "fd89:1::1", lo, RT_SCOPE_UNIVERSE), 0);
             ASSERT_EQ(address(RTM_NEWADDR, "fe80::89", egress, RT_SCOPE_LINK), 0);
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(0, "fd89:1::1"));
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(RTM_F_FIB_MATCH, nullptr));
             ASSERT_NO_FATAL_FAILURE(exercise("fd89:1::1"));
             ASSERT_EQ(address(RTM_DELADDR, "fd89:1::1", lo, RT_SCOPE_UNIVERSE), 0);
             ASSERT_EQ(address(RTM_DELADDR, "fe80::89", egress, RT_SCOPE_LINK), 0);
@@ -331,6 +373,9 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
             ASSERT_EQ(connect(scoped.Get(), reinterpret_cast<sockaddr*>(&destination),
                               sizeof(destination)), -1);
             EXPECT_EQ(errno, ENETUNREACH);
+
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, false, ++seq), 0);
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(0, nullptr));
         }();
         _exit(testing::Test::HasFailure() ? 1 : 0);
     }

@@ -38,7 +38,8 @@ pub(crate) use source::{
     resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow, ResolvedIpv4Route,
 };
 pub(crate) use source::{
-    resolve_ipv6_output_route, resolve_ipv6_send_route, resolve_ipv6_socket_route, Ipv6RouteIntent,
+    resolve_ipv6_output_route, resolve_ipv6_route_query, resolve_ipv6_send_route,
+    resolve_ipv6_socket_route, Ipv6RouteIntent,
 };
 use transaction::{
     prepare_with_devices, prepare_with_devices_from, projection_for_iface, transact_single,
@@ -621,19 +622,6 @@ pub(crate) fn lookup(
     destination: IpAddress,
 ) -> Option<RouteLookupResult> {
     lookup_output_fib(&netns.router().fib.read(), destination, None)
-}
-
-pub(crate) fn lookup_ipv6_output(
-    netns: &Arc<NetNamespace>,
-    destination: Ipv6Address,
-    oif: Option<u32>,
-    source: Option<Ipv6Address>,
-) -> Option<RouteLookupResult> {
-    netns
-        .router()
-        .fib
-        .read()
-        .lookup_ipv6_output(destination, oif, source)
 }
 
 pub(crate) fn ipv4_addr_type(netns: &Arc<NetNamespace>, address: Ipv4Address) -> u8 {

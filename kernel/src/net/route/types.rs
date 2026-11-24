@@ -145,15 +145,6 @@ pub(crate) enum RouteSourcePolicy {
     AllowUnspecified,
 }
 
-impl RouteSourcePolicy {
-    pub(crate) fn preferred(self) -> Option<IpAddress> {
-        match self {
-            Self::Preferred(source) => Some(source),
-            Self::SelectConfigured | Self::AllowUnspecified => None,
-        }
-    }
-}
-
 impl RouteLookupResult {
     pub(super) fn output_mtu_oif(self) -> u32 {
         if self.matched.is_explicit_ipv6_local() {

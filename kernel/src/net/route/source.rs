@@ -22,12 +22,33 @@ use super::{
 impl OutputRouteGuard<'_> {
     /// Choose a source for a generated ICMPv6 reply using the pinned FIB
     /// and committed address metadata. Ingress holds the smoltcp locks.
-    pub(crate) fn ipv6_anycast_reply_source(
+    pub(crate) fn ipv6_routed_icmp_reply_source(
         &self,
         remote: Ipv6Address,
         ingress: u32,
         echo: bool,
+        local_destination: Option<Ipv6Address>,
     ) -> Option<Ipv6Address> {
+        // A source-specific local route can win for an address configured
+        // on another device. Preserve that original destination as the error source.
+        if let Some(destination) = local_destination {
+            let local_scope = destination.is_unicast_link_local() || destination.is_loopback();
+            let owned = self.devices.iter().any(|(&ifindex, iface)| {
+                (!local_scope || ifindex == ingress as usize)
+                    && iface.common().ipv6_enabled()
+                    && iface
+                        .common()
+                        .address_metadata()
+                        .lock()
+                        .iter()
+                        .any(|entry| {
+                            entry.state.is_usable() && entry.cidr.address() == destination.into()
+                        })
+            });
+            if owned {
+                return Some(destination);
+            }
+        }
         let scoped = remote.is_unicast_link_local() || remote.is_loopback();
         let output_device = (scoped || echo).then_some(ingress);
         let preferred_source = self
@@ -128,6 +149,7 @@ impl ResolvedIpv4Route {
             ip_mtu: self.ip_mtu,
             kind: self.decision.matched.kind,
             loopback_anycast: false,
+            explicit_ipv6_local: false,
             table: self.decision.table,
         }
     }
@@ -416,14 +438,24 @@ pub(crate) fn resolve_ipv6_socket_route(
         })
         .cloned()
         .ok_or(no_source)?;
+    let mtu_oif = selected.output_mtu_oif();
+    let ip_mtu = if mtu_oif == selected.oif {
+        egress.mtu()
+    } else {
+        devices
+            .get(&(mtu_oif as usize))
+            .ok_or(SystemError::ENETUNREACH)?
+            .mtu()
+    };
     Ok(ResolvedIpv6SendRoute {
         decision: super::OutputRouteDecision {
             oif: selected.oif,
             required_oif,
             next_hop: selected.next_hop,
-            ip_mtu: egress.mtu(),
+            ip_mtu,
             kind: selected.matched.kind,
             loopback_anycast: selected.matched.is_loopback_anycast(),
+            explicit_ipv6_local: selected.matched.is_explicit_ipv6_local(),
             table: selected.table,
         },
         source,

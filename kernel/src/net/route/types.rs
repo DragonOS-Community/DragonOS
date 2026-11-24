@@ -44,6 +44,10 @@ pub(crate) const fn is_ipv6_reject_or_throw(kind: u8) -> bool {
     )
 }
 
+pub(crate) const fn is_ipv6_configurable_kind(kind: u8) -> bool {
+    matches!(kind, RTN_UNICAST | RTN_LOCAL | RTN_ANYCAST) || is_ipv6_reject_or_throw(kind)
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RouterPreference {
     High,
@@ -77,10 +81,18 @@ pub(crate) struct RouteEntry {
     pub oif: u32,
     pub gateway: Option<IpAddress>,
     pub nexthop_flags: u8,
+    /// Whether a configured IPv6 address supplied this local route.
+    pub ipv6_address_local: bool,
     pub ra_route: Option<RaRoute>,
 }
 
 impl RouteEntry {
+    pub(crate) fn is_explicit_ipv6_local(self) -> bool {
+        self.kind == RTN_LOCAL
+            && !self.ipv6_address_local
+            && matches!(self.destination, IpCidr::Ipv6(_))
+    }
+
     pub(crate) fn is_loopback_anycast(self) -> bool {
         self.kind == RTN_ANYCAST
             && self.oif == crate::net::LOOPBACK_IFINDEX as u32
@@ -143,6 +155,14 @@ impl RouteSourcePolicy {
 }
 
 impl RouteLookupResult {
+    pub(super) fn output_mtu_oif(self) -> u32 {
+        if self.matched.is_explicit_ipv6_local() {
+            crate::net::LOOPBACK_IFINDEX as u32
+        } else {
+            self.oif
+        }
+    }
+
     /// Constructs Linux's ephemeral IPv4 output decision for a caller that
     /// supplied an OIF but whose normal FIB lookup found no route. This value
     /// is never inserted into the authoritative FIB.
@@ -213,6 +233,7 @@ impl RouteLookupResult {
             oif,
             gateway: None,
             nexthop_flags: 0,
+            ipv6_address_local: false,
             ra_route: None,
         };
         Self {

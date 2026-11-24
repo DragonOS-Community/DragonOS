@@ -70,6 +70,7 @@ pub(crate) struct OutputRouteDecision {
     pub(crate) ip_mtu: usize,
     pub(crate) kind: u8,
     pub(crate) loopback_anycast: bool,
+    pub(crate) explicit_ipv6_local: bool,
     pub(crate) table: u32,
 }
 
@@ -316,7 +317,7 @@ impl OutputRouteGuard<'_> {
         } else {
             lookup_output_fib_with_source(&self.fib, &self.devices, destination, oif, source)
         }?;
-        let iface = self.devices.get(&(route.oif as usize))?;
+        let iface = self.devices.get(&(route.output_mtu_oif() as usize))?;
         Some(OutputRouteDecision {
             oif: route.oif,
             required_oif: oif,
@@ -324,6 +325,7 @@ impl OutputRouteGuard<'_> {
             ip_mtu: iface.mtu(),
             kind: route.matched.kind,
             loopback_anycast: route.matched.is_loopback_anycast(),
+            explicit_ipv6_local: route.matched.is_explicit_ipv6_local(),
             table: route.table,
         })
     }

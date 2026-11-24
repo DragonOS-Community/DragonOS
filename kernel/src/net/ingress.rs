@@ -40,7 +40,21 @@ pub(crate) enum IngressStage {
     PreRoutingDone,
     BridgePreRoutingDone,
     LocalOutput,
-    LocalInputDone,
+    ExplicitIpv6LocalOutput(smoltcp::wire::Ipv6Address),
+    LocalInputDone(Option<smoltcp::wire::Ipv6Address>),
+}
+
+impl IngressStage {
+    fn is_local_output(self) -> bool {
+        matches!(self, Self::LocalOutput | Self::ExplicitIpv6LocalOutput(_))
+    }
+
+    fn is_ipv6_loopback_input(self) -> bool {
+        matches!(
+            self,
+            Self::ExplicitIpv6LocalOutput(_) | Self::LocalInputDone(Some(_))
+        )
+    }
 }
 
 /// The stage cell is private to one synchronous smoltcp poll. A local RX
@@ -359,6 +373,51 @@ impl<'a> NetIngressFilter<'a> {
             .filter(|routes| routes.has_ipv6_special_routes())
     }
 
+    fn hook_ingress_ifindex(&self, socket_ifindex: u32) -> u32 {
+        // Local IPv6 output traverses lo but keeps the route's configured
+        // interface for transport demultiplexing.
+        if self.stage.get().is_ipv6_loopback_input() {
+            crate::net::LOOPBACK_IFINDEX as u32
+        } else {
+            socket_ifindex
+        }
+    }
+
+    /// Restore local admission after handoff or reassembly without choosing
+    /// a new socket owner or running forwarding and rejection hooks again.
+    fn ipv6_completed_admission(&self, bytes: &[u8], meta: PacketMeta) -> RouteInputVerdict {
+        let Some(routes) = self.ipv6_special_route_view() else {
+            return RouteInputVerdict::Pass;
+        };
+        if !matches!(IpVersion::of_packet(bytes), Ok(IpVersion::Ipv6)) {
+            return RouteInputVerdict::Pass;
+        }
+        let Ok(ipv6) = Ipv6Packet::new_checked(bytes) else {
+            return RouteInputVerdict::Drop;
+        };
+        let destination = ipv6.dst_addr();
+        if destination.is_multicast() {
+            return RouteInputVerdict::Pass;
+        }
+        let ingress_ifindex = if meta.id != 0 {
+            meta.id
+        } else {
+            self.owner_ifindex
+        };
+        let Some(route) =
+            routes.lookup_ingress(destination.into(), ingress_ifindex, Some(ipv6.src_addr()))
+        else {
+            return RouteInputVerdict::Pass;
+        };
+        if route.matched.is_explicit_ipv6_local() {
+            RouteInputVerdict::Ipv6Local
+        } else if route.matched.kind == RTN_ANYCAST && !route.matched.is_loopback_anycast() {
+            RouteInputVerdict::Ipv6Anycast
+        } else {
+            RouteInputVerdict::Pass
+        }
+    }
+
     fn route_ipv6(
         &mut self,
         packet: &mut RoutedIngressPacket<'_, '_>,
@@ -397,6 +456,7 @@ impl<'a> NetIngressFilter<'a> {
         let kind = route.matched.kind;
         if self.routes.is_none()
             && kind != RTN_ANYCAST
+            && !route.matched.is_explicit_ipv6_local()
             && !super::route::is_ipv6_reject_or_throw(kind)
         {
             return RouteInputVerdict::Pass;
@@ -408,6 +468,7 @@ impl<'a> NetIngressFilter<'a> {
             RTN_LOCAL if destination.is_link_local() && route.oif != ingress_ifindex => {
                 RouteInputVerdict::Drop
             }
+            RTN_LOCAL if route.matched.is_explicit_ipv6_local() => RouteInputVerdict::Ipv6Local,
             // Neighbor discovery is link control, not a transport datagram.
             // A weak-host global destination can be owned by another iface,
             // but Linux still updates the neighbor table of the actual
@@ -615,19 +676,35 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         self.owner.ipv6_forwarding() != 0
     }
 
-    fn ipv6_anycast_reply_source(
+    fn ipv6_loopback_input(&self) -> bool {
+        self.stage.get().is_ipv6_loopback_input()
+    }
+
+    fn ipv6_routed_icmp_reply_source(
         &self,
         remote: smoltcp::wire::Ipv6Address,
         ingress: PacketMeta,
         echo: bool,
+        local_destination: Option<smoltcp::wire::Ipv6Address>,
     ) -> Option<smoltcp::wire::Ipv6Address> {
         let ifindex = if ingress.id != 0 {
             ingress.id
         } else {
             self.owner_ifindex
         };
-        self.fib_routes?
-            .ipv6_anycast_reply_source(remote, ifindex, echo)
+        let routes = self.fib_routes?;
+        let source = routes.ipv6_routed_icmp_reply_source(remote, ifindex, echo, local_destination);
+        let loopback = crate::net::LOOPBACK_IFINDEX as u32;
+        if source.is_none()
+            && ifindex != loopback
+            && remote.is_loopback()
+            && self.stage.get().is_ipv6_loopback_input()
+        {
+            // Prefer the configured input scope, then use the loopback source
+            // if that interface has no usable address for a local error.
+            return routes.ipv6_routed_icmp_reply_source(remote, loopback, echo, local_destination);
+        }
+        source
     }
 
     fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
@@ -682,7 +759,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
     }
 
     fn local_route_selected(&self) -> bool {
-        self.stage.get() == IngressStage::LocalOutput
+        self.stage.get().is_local_output()
             || (self.stage.get() == IngressStage::PreRoutingDone && self.handoff_broadcast.get())
             || self.local_route_selected.get()
     }
@@ -716,7 +793,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
     ) -> PreRoutingVerdict {
         if matches!(
             self.stage.get(),
-            IngressStage::LocalInputDone | IngressStage::BridgePreRoutingDone
+            IngressStage::LocalInputDone(_) | IngressStage::BridgePreRoutingDone
         ) || !self.hooks().ct_active_for(IpVersion::Ipv6)
         {
             return PreRoutingVerdict::Pass;
@@ -729,12 +806,14 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if ingress_ifindex == 0 {
             return PreRoutingVerdict::Drop;
         }
-        let source = if self.stage.get() == IngressStage::LocalOutput {
-            DefragSource::LocalOutput
-        } else {
-            DefragSource::LinkIngress
+        let source = match self.stage.get() {
+            IngressStage::ExplicitIpv6LocalOutput(destination) => {
+                DefragSource::ExplicitIpv6LocalOutput(destination)
+            }
+            IngressStage::LocalOutput => DefragSource::LocalOutput,
+            _ => DefragSource::LinkIngress,
         };
-        let domain = if source == DefragSource::LocalOutput {
+        let domain = if source.is_local_output() {
             Ipv6DefragDomain::local_out(0, ingress_ifindex)
         } else {
             Ipv6DefragDomain::pre_routing(0, ingress_ifindex)
@@ -746,13 +825,13 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         };
         if matches!(
             self.stage.get(),
-            IngressStage::PreRoutingDone | IngressStage::LocalInputDone
+            IngressStage::PreRoutingDone | IngressStage::LocalInputDone(_)
         ) || self.work.try_reserve(1).is_err()
         {
             return PreRoutingVerdict::Drop;
         }
         let ct_context = if self.hooks().ct_active_for(IpVersion::Ipv6)
-            && source == DefragSource::LocalOutput
+            && source.is_local_output()
             && first_fragment
         {
             let Some(context) = self.packet_context.borrow_mut().take() else {
@@ -800,7 +879,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if matches!(
             self.stage.get(),
             IngressStage::PreRoutingDone
-                | IngressStage::LocalInputDone
+                | IngressStage::LocalInputDone(_)
                 | IngressStage::BridgePreRoutingDone
         ) {
             if !self.pre_routed_context_valid(version) {
@@ -810,7 +889,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         }
         debug_assert!(matches!(
             self.stage.get(),
-            IngressStage::Pending | IngressStage::LocalOutput
+            IngressStage::Pending
+                | IngressStage::LocalOutput
+                | IngressStage::ExplicitIpv6LocalOutput(_)
         ));
         // RX token metadata is trusted; a zero id means a direct device
         // token, whose owner interface is the ingress device.
@@ -822,6 +903,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if ingress_ifindex == 0 {
             return PreRoutingVerdict::Drop;
         }
+        let ingress_ifindex = self.hook_ingress_ifindex(ingress_ifindex);
         match version {
             IpVersion::Ipv4 => {
                 let allowed = if self.ruleset.hook_may_nat(version, NftIpv4Hook::PreRouting) {
@@ -882,46 +964,33 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
     ) -> RouteInputVerdict {
-        if self.stage.get() == IngressStage::LocalInputDone {
-            // LOCAL_IN reassembly may recover anycast admission, but must
-            // never run forward or rejection hooks a second time.
-            if let (Some(routes), Ok(IpVersion::Ipv6)) = (
-                self.ipv6_special_route_view(),
-                IpVersion::of_packet(packet.bytes()),
-            ) {
-                let Ok(ipv6) = Ipv6Packet::new_checked(packet.bytes()) else {
-                    return RouteInputVerdict::Drop;
-                };
-                if ipv6.dst_addr().is_multicast() {
-                    return RouteInputVerdict::Pass;
-                }
-                let ingress_ifindex = if meta.id != 0 {
-                    meta.id
-                } else {
-                    self.owner_ifindex
-                };
-                if routes
-                    .lookup_ingress(
-                        ipv6.dst_addr().into(),
-                        ingress_ifindex,
-                        Some(ipv6.src_addr()),
-                    )
-                    .is_some_and(|route| {
-                        route.matched.kind == RTN_ANYCAST && !route.matched.is_loopback_anycast()
-                    })
+        match self.stage.get() {
+            IngressStage::LocalInputDone(Some(destination)) => {
+                return if Ipv6Packet::new_checked(packet.bytes())
+                    .is_ok_and(|header| header.dst_addr() == destination)
                 {
-                    return RouteInputVerdict::Ipv6Anycast;
-                }
+                    RouteInputVerdict::Ipv6Local
+                } else {
+                    RouteInputVerdict::Drop
+                };
             }
-            return RouteInputVerdict::Pass;
-        }
-        if self.stage.get() == IngressStage::PreRoutingDone {
-            return RouteInputVerdict::Pass;
+            IngressStage::LocalInputDone(None) => {
+                return self.ipv6_completed_admission(packet.bytes(), meta);
+            }
+            IngressStage::PreRoutingDone => return RouteInputVerdict::Pass,
+            _ => {}
         }
         // The local-output route already selected this socket owner. Linux
         // receives the packet through lo and runs PRE_ROUTING, but must not
         // choose a second owner from the ingress FIB (notably for broadcast).
-        if self.stage.get() == IngressStage::LocalOutput {
+        if let IngressStage::ExplicitIpv6LocalOutput(destination) = self.stage.get() {
+            if Ipv6Packet::new_checked(packet.bytes())
+                .is_ok_and(|header| header.dst_addr() == destination)
+            {
+                return RouteInputVerdict::Ipv6Local;
+            }
+        }
+        if self.stage.get().is_local_output() {
             return RouteInputVerdict::Pass;
         }
         if matches!(IpVersion::of_packet(packet.bytes()), Ok(IpVersion::Ipv6)) {
@@ -1128,14 +1197,15 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         if ingress_ifindex == 0 {
             return LocalInputVerdict::Drop;
         }
-        if self.stage.get() != IngressStage::LocalInputDone {
+        if !matches!(self.stage.get(), IngressStage::LocalInputDone(_)) {
+            let hook_ifindex = self.hook_ingress_ifindex(ingress_ifindex);
             let allowed = match version {
                 IpVersion::Ipv4 if self.ruleset.hook_may_nat(version, NftIpv4Hook::LocalIn) => {
                     packet.writable().is_ok_and(|bytes| {
                         self.hooks().allows_ipv4_nat(
                             NftIpv4Hook::LocalIn,
                             bytes,
-                            ingress_ifindex,
+                            hook_ifindex,
                             0,
                             None,
                         )
@@ -1146,24 +1216,20 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                         self.hooks().allows_ipv6_nat(
                             NftIpv4Hook::LocalIn,
                             bytes,
-                            ingress_ifindex,
+                            hook_ifindex,
                             0,
                             None,
                         )
                     })
                 }
-                IpVersion::Ipv4 => self.hooks().allows_ipv4(
-                    NftIpv4Hook::LocalIn,
-                    packet.bytes(),
-                    ingress_ifindex,
-                    0,
-                ),
-                IpVersion::Ipv6 => self.hooks().allows_ipv6(
-                    NftIpv4Hook::LocalIn,
-                    packet.bytes(),
-                    ingress_ifindex,
-                    0,
-                ),
+                IpVersion::Ipv4 => {
+                    self.hooks()
+                        .allows_ipv4(NftIpv4Hook::LocalIn, packet.bytes(), hook_ifindex, 0)
+                }
+                IpVersion::Ipv6 => {
+                    self.hooks()
+                        .allows_ipv6(NftIpv4Hook::LocalIn, packet.bytes(), hook_ifindex, 0)
+                }
             };
             if !allowed || !self.hooks().confirm_accepted_packet(version) {
                 return LocalInputVerdict::Drop;
@@ -1185,6 +1251,14 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                         let Ok(bytes) = PacketBuffer::try_from_slice(packet.bytes()) else {
                             return LocalInputVerdict::Drop;
                         };
+                        let admitted_destination = match self.stage.get() {
+                            IngressStage::ExplicitIpv6LocalOutput(destination) => {
+                                Ipv6Packet::new_checked(packet.bytes())
+                                    .is_ok_and(|header| header.dst_addr() == destination)
+                                    .then_some(destination)
+                            }
+                            _ => None,
+                        };
                         self.work.push(RoutedIngressWork::Defrag {
                             netns: self.netns.clone(),
                             fragment: PendingIpFragment::Ipv6(PendingIpv6Fragment {
@@ -1192,7 +1266,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                                 ingress_ifindex,
                                 owner_ifindex: self.owner_ifindex,
                                 source_hardware_addr,
-                                source: DefragSource::LocalInput,
+                                source: DefragSource::LocalInput(admitted_destination),
                                 ct_context: None,
                                 mark: self.mark.get(),
                                 link_group: meta.link_group,
@@ -1212,7 +1286,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             && (self.forward_fragment.get().is_some()
                 || matches!(
                     self.stage.get(),
-                    IngressStage::LocalInputDone | IngressStage::LocalOutput
+                    IngressStage::LocalInputDone(_)
+                        | IngressStage::LocalOutput
+                        | IngressStage::ExplicitIpv6LocalOutput(_)
                 ))
             && Ipv6Packet::new_checked(packet)
                 .is_ok_and(|header| header.src_addr().is_unspecified())
@@ -1225,7 +1301,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             && ingress_ifindex == self.owner_ifindex
             && !matches!(
                 self.stage.get(),
-                IngressStage::LocalInputDone | IngressStage::LocalOutput
+                IngressStage::LocalInputDone(_)
+                    | IngressStage::LocalOutput
+                    | IngressStage::ExplicitIpv6LocalOutput(_)
             )
             && self.forward_fragment.get().is_none()
         {
@@ -1386,7 +1464,9 @@ impl IpIngressFilter for NetIngressFilter<'_> {
             && self.netns.ipv4_defrag_enabled()
             && matches!(
                 self.stage.get(),
-                IngressStage::Pending | IngressStage::LocalOutput
+                IngressStage::Pending
+                    | IngressStage::LocalOutput
+                    | IngressStage::ExplicitIpv6LocalOutput(_)
             )
         {
             let ingress_ifindex = if meta.id != 0 {
@@ -1405,7 +1485,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                 .get(6..8)
                 .is_some_and(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]) & 0x1fff == 0);
             let ct_context = if self.hooks().ct_active_for(IpVersion::Ipv4)
-                && self.stage.get() == IngressStage::LocalOutput
+                && self.stage.get().is_local_output()
                 && first_fragment
             {
                 let Some(context) = self.packet_context.borrow_mut().take() else {
@@ -1432,7 +1512,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
                     ingress_ifindex,
                     owner_ifindex: self.owner_ifindex,
                     source_hardware_addr,
-                    source: if self.stage.get() == IngressStage::LocalOutput {
+                    source: if self.stage.get().is_local_output() {
                         DefragSource::LocalOutput
                     } else {
                         DefragSource::LinkIngress
@@ -1459,7 +1539,7 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         {
             return RouteInputVerdict::Drop;
         }
-        if self.stage.get() == IngressStage::LocalOutput {
+        if self.stage.get().is_local_output() {
             return RouteInputVerdict::Pass;
         }
         let Some(routes) = self.routes else {

@@ -103,6 +103,11 @@ pub(super) fn do_new_route(
             }
             crate::net::LOOPBACK_IFINDEX as u32
         }
+        None if request.body().family == AddressFamily::INet6
+            && request.body().type_ == route::RTN_LOCAL =>
+        {
+            requested_oif.ok_or(SystemError::ENODEV)?
+        }
         None => requested_oif.ok_or(SystemError::EINVAL)?,
     };
     let entry = RouteEntry {
@@ -141,6 +146,7 @@ pub(super) fn do_new_route(
         } else {
             0
         },
+        ipv6_address_local: false,
         ra_route: None,
     };
     let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);
@@ -298,8 +304,7 @@ fn validate_new_request(request: &RouteSegment) -> Result<(), SystemError> {
     let ipv6 = request.body().family == AddressFamily::INet6;
     let reject = ipv6 && route::is_ipv6_reject_or_throw(kind);
     let supported = matches!(kind, route::RTN_UNSPEC | RTN_UNICAST)
-        || reject
-        || ipv6 && kind == route::RTN_ANYCAST;
+        || (ipv6 && route::is_ipv6_configurable_kind(kind));
     if !supported {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
@@ -552,7 +557,14 @@ fn lookup_route(
         source: requested_source.map(host_cidr),
         preferred_source: selected_source,
         table: decision.table,
-        protocol: if decision.matched.ra_route.is_some() {
+        oif: if decision.matched.is_explicit_ipv6_local() {
+            crate::net::LOOPBACK_IFINDEX as u32
+        } else {
+            decision.matched.oif
+        },
+        protocol: if decision.matched.ra_route.is_some()
+            || decision.matched.is_explicit_ipv6_local()
+        {
             decision.matched.protocol
         } else {
             RouteProtocol::Unspec as u8

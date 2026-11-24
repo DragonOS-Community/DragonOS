@@ -360,6 +360,7 @@ mod tests {
                 disposition: LocalOutputDisposition::Local {
                     oif: 1,
                     ip_mtu: 1500,
+                    explicit_ipv6_local: false,
                 },
                 frame,
                 ct_context: OutputCtContext::Untracked,

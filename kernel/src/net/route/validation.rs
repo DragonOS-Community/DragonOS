@@ -35,7 +35,12 @@ pub(super) fn validate_entry_on_iface(
     // and store it rather than failing with EOPNOTSUPP.
     let ipv6 = !is_ipv4(route.destination.address());
     let reject = ipv6 && super::is_ipv6_reject_or_throw(route.kind);
-    if route.kind != RTN_UNICAST && !reject && !(ipv6 && route.kind == super::RTN_ANYCAST) {
+    let supported = if ipv6 {
+        super::is_ipv6_configurable_kind(route.kind)
+    } else {
+        route.kind == RTN_UNICAST
+    };
+    if !supported {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
     if !same_family_option(route.destination.address(), route.gateway)

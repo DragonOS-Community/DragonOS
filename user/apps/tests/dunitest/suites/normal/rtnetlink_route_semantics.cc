@@ -709,6 +709,95 @@ TEST(RtnetlinkRouteSemantics, Ipv6RejectTerminatesLookupAndThrowSkipsTheTable) {
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
+TEST(RtnetlinkRouteSemantics, Ipv6ExplicitLocalRouteDeliversWithoutOwningAnAddress) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            const uint32_t lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            uint32_t seq = 1;
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, ++seq), 0);
+            constexpr auto request = NLM_F_REQUEST | NLM_F_ACK;
+            constexpr auto add = request | NLM_F_CREATE | NLM_F_EXCL;
+            constexpr char link_name[] = "local76";
+            const struct {
+                rtattr header;
+                char kind[RTA_ALIGN(sizeof("veth"))];
+            } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+            alignas(nlmsghdr) char link_request[128] = {};
+            auto* link = reinterpret_cast<nlmsghdr*>(link_request);
+            link->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+            link->nlmsg_type = RTM_NEWLINK;
+            link->nlmsg_flags = add;
+            link->nlmsg_seq = ++seq;
+            AddAttr(link, sizeof(link_request), IFLA_IFNAME, link_name, sizeof(link_name));
+            AddAttr(link, sizeof(link_request), IFLA_LINKINFO, &link_info, sizeof(link_info));
+            ASSERT_EQ(send(route.Get(), link, link->nlmsg_len, 0),
+                      static_cast<ssize_t>(link->nlmsg_len));
+            ASSERT_EQ(RecvAck(route.Get(), seq), 0);
+            const uint32_t veth = if_nametoindex(link_name);
+            ASSERT_NE(veth, 0u);
+            ASSERT_EQ(SetLinkUp(route.Get(), veth, true, ++seq), 0);
+
+            auto mutate = [&](uint16_t operation, uint16_t flags) {
+                return SendIpv6RouteRequest(route.Get(), operation, flags, "fd76:80::", 80, veth,
+                                            RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                            std::nullopt, RTN_LOCAL, RT_TABLE_LOCAL);
+            };
+            ASSERT_EQ(mutate(RTM_NEWROUTE, add), 0);
+            ASSERT_TRUE(FindIpv6Route(route.Get(), "fd76:80::", 80, veth, ++seq, RTN_LOCAL));
+
+            sockaddr_in6 destination{};
+            destination.sin6_family = AF_INET6;
+            destination.sin6_port = htons(23076);
+            ASSERT_EQ(inet_pton(AF_INET6, "fd76:80::9", &destination.sin6_addr), 1);
+            FdGuard listener(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(listener.Get(), 0);
+            ASSERT_EQ(bind(listener.Get(), reinterpret_cast<sockaddr*>(&destination),
+                           sizeof(destination)), -1);
+            EXPECT_EQ(errno, EADDRNOTAVAIL);
+            sockaddr_in6 wildcard = destination;
+            wildcard.sin6_addr = in6addr_any;
+            ASSERT_EQ(bind(listener.Get(), reinterpret_cast<sockaddr*>(&wildcard), sizeof(wildcard)), 0);
+
+            FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(sender.Get(), 0);
+            sockaddr_in6 source{};
+            source.sin6_family = AF_INET6;
+            source.sin6_addr = in6addr_loopback;
+            ASSERT_EQ(bind(sender.Get(), reinterpret_cast<sockaddr*>(&source), sizeof(source)), 0);
+            auto send_byte = [&] {
+                return sendto(sender.Get(), "a", 1, 0, reinterpret_cast<sockaddr*>(&destination),
+                              sizeof(destination));
+            };
+            ASSERT_EQ(send_byte(), 1);
+            pollfd readable{listener.Get(), POLLIN, 0};
+            ASSERT_EQ(poll(&readable, 1, 2000), 1);
+            char byte = 0;
+            sockaddr_in6 peer{};
+            socklen_t peer_len = sizeof(peer);
+            ASSERT_EQ(recvfrom(listener.Get(), &byte, 1, MSG_DONTWAIT,
+                               reinterpret_cast<sockaddr*>(&peer), &peer_len), 1);
+            EXPECT_EQ(byte, 'a');
+            EXPECT_TRUE(IN6_IS_ADDR_LOOPBACK(&peer.sin6_addr));
+
+            ASSERT_EQ(mutate(RTM_DELROUTE, request), 0);
+            EXPECT_FALSE(FindIpv6Route(route.Get(), "fd76:80::", 80, veth, ++seq, RTN_LOCAL));
+            ASSERT_EQ(send_byte(), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+        }();
+        _exit(HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkRouteSemantics, Ipv6LoopbackAnycastRejectsDeliveryWithoutOwningAnAddress) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);

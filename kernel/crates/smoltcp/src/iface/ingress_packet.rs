@@ -31,6 +31,8 @@ pub enum RouteInputVerdict {
     NeighborDiscovery,
     /// The IPv6 FIB admits this destination for local anycast reception.
     Ipv6Anycast,
+    /// The IPv6 FIB admits this destination for explicit local reception.
+    Ipv6Local,
 }
 
 /// The local-delivery hook runs after routing and before raw and transport
@@ -50,14 +52,22 @@ pub trait IpIngressFilter {
         false
     }
 
-    /// Select the outer source for a generated ICMPv6 reply to anycast input.
+    /// Whether this packet was reinjected by the local IPv6 output path.
+    /// An integration may receive it on a stack owned by another interface.
+    #[cfg(feature = "proto-ipv6")]
+    fn ipv6_loopback_input(&self) -> bool {
+        false
+    }
+
+    /// Select the outer source for a generated ICMPv6 reply to routed local input.
     /// The callback runs before the reply is serialized.
     #[cfg(feature = "proto-ipv6")]
-    fn ipv6_anycast_reply_source(
+    fn ipv6_routed_icmp_reply_source(
         &self,
         _remote: crate::wire::Ipv6Address,
         _ingress: PacketMeta,
         _echo: bool,
+        _local_destination: Option<crate::wire::Ipv6Address>,
     ) -> Option<crate::wire::Ipv6Address> {
         None
     }

@@ -419,6 +419,7 @@ pub(super) enum LocalOutputDisposition {
     Local {
         oif: u32,
         ip_mtu: usize,
+        explicit_ipv6_local: bool,
     },
     Routed {
         oif: u32,
@@ -436,6 +437,7 @@ impl LocalOutputDisposition {
     const LOCAL_TAG: u64 = 2;
     const IPV4_TAG: u64 = 4;
     const IPV6_TAG: u64 = 6;
+    const EXPLICIT_IPV6_LOCAL_TAG: u64 = 8;
 
     pub(super) fn routed_context(oif: u32, next_hop: smoltcp::wire::IpAddress) -> [u64; 3] {
         debug_assert_ne!(oif, 0);
@@ -456,9 +458,14 @@ impl LocalOutputDisposition {
         }
     }
 
-    pub(super) fn local_context(oif: u32) -> [u64; 3] {
+    pub(super) fn local_context(oif: u32, explicit_ipv6_local: bool) -> [u64; 3] {
         debug_assert_ne!(oif, 0);
-        [((oif as u64) << 32) | Self::LOCAL_TAG, 0, 0]
+        let tag = if explicit_ipv6_local {
+            Self::EXPLICIT_IPV6_LOCAL_TAG
+        } else {
+            Self::LOCAL_TAG
+        };
+        [((oif as u64) << 32) | tag, 0, 0]
     }
 
     pub(super) fn from_context(context: [u64; 3], ip_mtu: usize) -> Self {
@@ -472,8 +479,15 @@ impl LocalOutputDisposition {
         if oif == 0 {
             return Self::Drop;
         }
-        let next_hop = match context[0] & u32::MAX as u64 {
-            Self::LOCAL_TAG if context[1..] == [0, 0] => return Self::Local { oif, ip_mtu },
+        let tag = context[0] & u32::MAX as u64;
+        let next_hop = match tag {
+            Self::LOCAL_TAG | Self::EXPLICIT_IPV6_LOCAL_TAG if context[1..] == [0, 0] => {
+                return Self::Local {
+                    oif,
+                    ip_mtu,
+                    explicit_ipv6_local: tag == Self::EXPLICIT_IPV6_LOCAL_TAG,
+                }
+            }
             Self::IPV4_TAG if context[1] == 0 && context[2] <= u32::MAX as u64 => {
                 smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(
                     (context[2] as u32).to_be_bytes(),
@@ -523,13 +537,19 @@ mod context_tests {
                 assert_eq!((oif, next_hop, ip_mtu), (ifindex, address, 1280));
             }
         }
-        assert!(matches!(
-            LocalOutputDisposition::from_context(LocalOutputDisposition::local_context(42), 1500),
-            LocalOutputDisposition::Local {
-                oif: 42,
-                ip_mtu: 1500
-            }
-        ));
+        for explicit_ipv6_local in [false, true] {
+            assert!(matches!(
+                LocalOutputDisposition::from_context(
+                    LocalOutputDisposition::local_context(42, explicit_ipv6_local),
+                    1500
+                ),
+                LocalOutputDisposition::Local {
+                    oif: 42,
+                    ip_mtu: 1500,
+                    explicit_ipv6_local: decoded,
+                } if decoded == explicit_ipv6_local
+            ));
+        }
         assert!(matches!(
             LocalOutputDisposition::from_context(LocalOutputDisposition::NATIVE_CONTEXT, 1500),
             LocalOutputDisposition::NativeOwner
@@ -1498,6 +1518,7 @@ mod output_ct_context_tests {
             disposition: LocalOutputDisposition::Local {
                 oif: 1,
                 ip_mtu: 1500,
+                explicit_ipv6_local: false,
             },
             frame,
             ct_context: OutputCtContext::Tracked(alloc::boxed::Box::new(CtPacketContext::Invalid)),
@@ -1548,6 +1569,7 @@ mod output_ct_context_tests {
             LocalOutputDisposition::Local {
                 oif: 1,
                 ip_mtu: 1500,
+                explicit_ipv6_local: false,
             },
             42,
             None,

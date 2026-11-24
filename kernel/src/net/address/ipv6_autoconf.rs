@@ -636,6 +636,7 @@ pub(super) fn send_ndisc(
             ip_mtu: iface.mtu(),
             kind: RTN_MULTICAST,
             loopback_anycast: false,
+            explicit_ipv6_local: false,
             table: RT_TABLE_LOCAL,
         },
         None,

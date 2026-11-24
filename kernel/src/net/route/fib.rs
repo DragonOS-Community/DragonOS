@@ -573,6 +573,7 @@ impl FibTable {
             oif: 0,
             gateway: None,
             nexthop_flags: 0,
+            ipv6_address_local: false,
             ra_route: None,
         };
         let index = self
@@ -1249,6 +1250,7 @@ mod tests {
             oif: u32::from(id % 2) + 1,
             gateway: Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, id).into()),
             nexthop_flags: 0,
+            ipv6_address_local: false,
             ra_route: Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
                 expires_at_us: 30_000_000,
                 preference: RouterPreference::Medium,

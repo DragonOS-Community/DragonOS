@@ -236,7 +236,8 @@ impl InterfaceInner {
                 RouteInputVerdict::Drop
                 | RouteInputVerdict::Forward
                 | RouteInputVerdict::NeighborDiscovery
-                | RouteInputVerdict::Ipv6Anycast => return None,
+                | RouteInputVerdict::Ipv6Anycast
+                | RouteInputVerdict::Ipv6Local => return None,
             }
         }
         #[cfg(feature = "proto-ipv4-fragmentation")]
@@ -428,7 +429,8 @@ impl InterfaceInner {
                 RouteInputVerdict::Drop
                 | RouteInputVerdict::Forward
                 | RouteInputVerdict::NeighborDiscovery
-                | RouteInputVerdict::Ipv6Anycast => return None,
+                | RouteInputVerdict::Ipv6Anycast
+                | RouteInputVerdict::Ipv6Local => return None,
             }
             // Route selection precedes LOCAL_IN. The hook may rewrite only
             // after this packet has qualified for local delivery; its final

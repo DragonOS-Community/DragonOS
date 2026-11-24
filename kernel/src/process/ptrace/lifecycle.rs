@@ -195,8 +195,10 @@ impl ProcessControlBlock {
         let Some(task) = self.self_ref.upgrade() else {
             return;
         };
+        // Once marked Stopped, an interrupt could dequeue this task before
+        // it wakes its parent's waiters. Keep IRQs disabled through notification.
+        let irq = unsafe { crate::arch::CurrentIrqArch::save_and_disable_irq() };
         let (stopped, completion) = {
-            let _irq = unsafe { crate::arch::CurrentIrqArch::save_and_disable_irq() };
             let _relation = PTRACE_RELATION_LOCK.lock_irqsave();
             self.process_signal().with_group_stop_state(|group| {
                 let generation = self.pending_group_stop_generation.swap(0, Ordering::AcqRel);
@@ -245,6 +247,7 @@ impl ProcessControlBlock {
         if let Some(signal) = completion {
             self.notify_natural_group_stop(signal);
         }
+        drop(irq);
         if stopped {
             crate::sched::schedule(crate::sched::SchedMode::SM_NONE);
         }

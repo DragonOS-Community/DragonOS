@@ -73,7 +73,8 @@ pub(crate) struct AddressMetadata {
     pub broadcast: Option<smoltcp::wire::Ipv4Address>,
     pub state: AddressState,
     pub ipv6_nodad: bool,
-    pub lifetimes: Option<crate::net::address::ipv6_slaac::Lifetimes>,
+    pub ipv6_permanent: bool,
+    pub lifetimes: Option<crate::net::address::ipv6_lifetime::Lifetimes>,
 }
 
 impl AddressMetadata {
@@ -84,6 +85,7 @@ impl AddressMetadata {
             broadcast: None,
             state: AddressState::Configured,
             ipv6_nodad: false,
+            ipv6_permanent: true,
             lifetimes: None,
         }
     }

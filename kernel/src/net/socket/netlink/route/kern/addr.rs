@@ -23,7 +23,8 @@ use crate::{
     },
     net::{
         address::{
-            address_info, AddressInfo, AddressMutation, AddressMutationOutcome, AddressOptions,
+            address_info, ipv6_lifetime::ConfiguredLifetimes, AddressInfo, AddressMutation,
+            AddressMutationOutcome, AddressOptions,
         },
         rtnl::RtnlGuard,
     },
@@ -62,6 +63,8 @@ pub(super) fn do_new_addr(
         _ => {}
     }
 
+    let ipv6_lifetimes =
+        matches!(cidr, IpCidr::Ipv6(_)).then(|| request_ipv6_lifetimes(request_segment));
     let flags = NewRequestFlags::from_bits_truncate(request_segment.header().flags);
     let mutation =
         if flags.contains(NewRequestFlags::REPLACE) && !flags.contains(NewRequestFlags::EXCL) {
@@ -77,6 +80,7 @@ pub(super) fn do_new_addr(
             label,
             broadcast,
             ipv6_nodad,
+            ipv6_lifetimes,
         },
     )?;
     match commit.outcome {
@@ -90,6 +94,26 @@ pub(super) fn do_new_addr(
     }
     notify_route_changes(&netns, commit.route_changes);
     Ok(Vec::new())
+}
+
+fn request_ipv6_lifetimes(segment: &AddrSegment) -> ConfiguredLifetimes {
+    let (preferred_secs, valid_secs) = segment
+        .attrs()
+        .iter()
+        .rev()
+        .find_map(|attr| match attr {
+            AddrAttr::CacheInfo(cache) => {
+                let preferred = u32::from_ne_bytes(cache[..4].try_into().unwrap());
+                let valid = u32::from_ne_bytes(cache[4..8].try_into().unwrap());
+                Some((preferred, valid))
+            }
+            _ => None,
+        })
+        .unwrap_or((u32::MAX, u32::MAX));
+    ConfiguredLifetimes {
+        preferred_secs,
+        valid_secs,
+    }
 }
 
 fn request_ipv6_nodad(request: &AddrSegment) -> Result<bool, SystemError> {
@@ -398,11 +422,9 @@ pub(super) fn addr_to_segment(
     };
 
     let slaac = matches!(address.state, AddressState::Slaac(_));
-    let mut flags = if slaac {
-        AddrMessageFlags::MANAGETEMPADDR
-    } else {
-        AddrMessageFlags::PERMANENT
-    };
+    let mut flags = AddrMessageFlags::empty();
+    flags.set(AddrMessageFlags::MANAGETEMPADDR, slaac);
+    flags.set(AddrMessageFlags::PERMANENT, address.ipv6_permanent);
     if address.ipv6_nodad {
         flags.insert(AddrMessageFlags::NODAD);
     }
@@ -463,7 +485,7 @@ pub(super) fn addr_to_segment(
             }
             attrs.push(AddrAttr::CacheInfo(cache));
         }
-        if slaac || address.ipv6_nodad {
+        if slaac || address.ipv6_nodad || address.lifetimes.is_some() {
             attrs.push(AddrAttr::Flags(flags.bits().to_ne_bytes().to_vec()));
         }
         if slaac {

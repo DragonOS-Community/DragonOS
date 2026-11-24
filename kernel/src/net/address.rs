@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub(crate) mod ipv6_autoconf;
+pub(crate) mod ipv6_lifetime;
 pub(in crate::net) mod ipv6_router_solicitation;
 pub(crate) mod ipv6_slaac;
 
@@ -46,6 +47,7 @@ pub(in crate::net) struct AddressOptions {
     pub label: Option<CString>,
     pub broadcast: Option<Ipv4Address>,
     pub ipv6_nodad: Option<bool>,
+    pub ipv6_lifetimes: Option<ipv6_lifetime::ConfiguredLifetimes>,
 }
 
 pub(crate) struct AddressInfo {
@@ -54,7 +56,8 @@ pub(crate) struct AddressInfo {
     pub broadcast: Option<Ipv4Address>,
     pub state: AddressState,
     pub ipv6_nodad: bool,
-    pub lifetimes: Option<ipv6_slaac::Lifetimes>,
+    pub ipv6_permanent: bool,
+    pub lifetimes: Option<ipv6_lifetime::Lifetimes>,
 }
 
 pub(in crate::net) struct PreparedLinkAddressChange {
@@ -126,28 +129,18 @@ fn removed_address_info(
     entry: Option<AddressMetadata>,
     default_label: &CString,
 ) -> Result<AddressInfo, SystemError> {
-    let (label, broadcast, state, ipv6_nodad, lifetimes) = entry.map_or(
-        (None, None, AddressState::Configured, false, None),
-        |entry| {
-            (
-                entry.label,
-                entry.broadcast,
-                entry.state,
-                entry.ipv6_nodad,
-                entry.lifetimes,
-            )
-        },
-    );
+    let entry = entry.unwrap_or_else(|| AddressMetadata::configured(cidr));
     Ok(AddressInfo {
         cidr,
-        label: match label {
+        label: match entry.label {
             Some(label) => label,
             None => try_clone_cstring(default_label)?,
         },
-        broadcast,
-        state,
-        ipv6_nodad,
-        lifetimes,
+        broadcast: entry.broadcast,
+        state: entry.state,
+        ipv6_nodad: entry.ipv6_nodad,
+        ipv6_permanent: entry.ipv6_permanent,
+        lifetimes: entry.lifetimes,
     })
 }
 
@@ -349,6 +342,7 @@ pub(in crate::net) fn address_at(
         broadcast: entry.and_then(|entry| entry.broadcast),
         state: entry.map(|entry| entry.state).unwrap_or_default(),
         ipv6_nodad: entry.is_some_and(|entry| entry.ipv6_nodad),
+        ipv6_permanent: entry.is_none_or(|entry| entry.ipv6_permanent),
         lifetimes: entry.and_then(|entry| entry.lifetimes),
     }))
 }
@@ -390,6 +384,7 @@ pub(in crate::net) fn address_info(
         broadcast: entry.and_then(|entry| entry.broadcast),
         state: entry.map(|entry| entry.state).unwrap_or_default(),
         ipv6_nodad: entry.is_some_and(|entry| entry.ipv6_nodad),
+        ipv6_permanent: entry.is_none_or(|entry| entry.ipv6_permanent),
         lifetimes: entry.and_then(|entry| entry.lifetimes),
     })
 }
@@ -751,6 +746,7 @@ fn commit_unpublished(
                 broadcast: requested_broadcast,
                 state: AddressState::Configured,
                 ipv6_nodad: false,
+                ipv6_permanent: true,
                 lifetimes: None,
             });
             outcome
@@ -769,6 +765,7 @@ fn commit_unpublished(
                     broadcast: requested_broadcast,
                     state: AddressState::Configured,
                     ipv6_nodad: false,
+                    ipv6_permanent: true,
                     lifetimes: None,
                 });
             }
@@ -815,25 +812,43 @@ fn commit_published(
             .find(|configured| same_new_or_replace_identity(*configured, requested))
     };
 
+    let mut lifetime_deadline_changed = false;
     let mut manual_probe = None;
     let outcome = match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr) | AddressMutation::Replace(cidr)) => {
-            if let Some(existing) = existing(cidr) {
-                if matches!(mutation, CommitMutation::Plain(AddressMutation::Add(_))) {
-                    return Err(SystemError::EEXIST);
+            let existing = existing(cidr);
+            if existing.is_some()
+                && matches!(mutation, CommitMutation::Plain(AddressMutation::Add(_)))
+            {
+                return Err(SystemError::EEXIST);
+            }
+            let ipv6_lifetimes = options
+                .ipv6_lifetimes
+                .map(ipv6_lifetime::ConfiguredLifetimes::into_deadlines)
+                .transpose()?;
+            let ipv6_permanent =
+                ipv6_lifetimes.is_none_or(ipv6_lifetime::Lifetimes::valid_indefinitely);
+            lifetime_deadline_changed = ipv6_lifetimes
+                .and_then(ipv6_lifetime::Lifetimes::next_deadline)
+                .is_some();
+            if let Some(existing) = existing {
+                let index = metadata
+                    .iter()
+                    .position(|entry| entry.cidr == existing)
+                    .unwrap_or_else(|| {
+                        metadata.push(AddressMetadata::configured(existing));
+                        metadata.len() - 1
+                    });
+                let entry = &mut metadata[index];
+                match entry.state {
+                    AddressState::Slaac(DadState::Usable) => entry.state = AddressState::Configured,
+                    AddressState::Slaac(state) => entry.state = AddressState::ManualDad(state),
+                    _ => {}
                 }
-                if let Some(entry) = metadata.iter_mut().find(|entry| entry.cidr == existing) {
-                    match entry.state {
-                        AddressState::Slaac(DadState::Usable) => {
-                            entry.state = AddressState::Configured
-                        }
-                        AddressState::Slaac(state) => entry.state = AddressState::ManualDad(state),
-                        _ => {}
-                    }
-                    entry.lifetimes = None;
-                    if let Some(nodad) = options.ipv6_nodad {
-                        entry.ipv6_nodad = nodad;
-                    }
+                entry.lifetimes = ipv6_lifetimes.map(|updated| updated.replacing(entry.lifetimes));
+                entry.ipv6_permanent = ipv6_permanent;
+                if let Some(nodad) = options.ipv6_nodad {
+                    entry.ipv6_nodad = nodad;
                 }
                 AddressMutationOutcome::Replaced(existing)
             } else {
@@ -856,7 +871,8 @@ fn commit_published(
                     broadcast: options.broadcast,
                     state,
                     ipv6_nodad: options.ipv6_nodad.unwrap_or(false),
-                    lifetimes: None,
+                    ipv6_permanent,
+                    lifetimes: ipv6_lifetimes,
                 });
                 AddressMutationOutcome::Added(cidr)
             }
@@ -885,7 +901,7 @@ fn commit_published(
         ipv6_autoconf::start_manual_probe(&netns, iface.common(), address, transmits)?;
     }
     let route_changes = prepared.publish(&netns, iface);
-    if manual_probe.is_some() {
+    if manual_probe.is_some() || lifetime_deadline_changed {
         ipv6_autoconf::changed(iface.common());
     }
     if let Some(target) = cancel_dad {
@@ -902,7 +918,7 @@ fn prepare_automatic_address(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
     state: AddressState,
-    lifetimes: Option<ipv6_slaac::Lifetimes>,
+    lifetimes: Option<ipv6_lifetime::Lifetimes>,
 ) -> Result<crate::net::route::PreparedAddressRouteCommit, SystemError> {
     let AddressCandidates {
         before,
@@ -932,6 +948,7 @@ fn prepare_automatic_address(
             broadcast: None,
             state,
             ipv6_nodad: false,
+            ipv6_permanent: !matches!(state, AddressState::Slaac(_)),
             lifetimes,
         });
     }
@@ -1017,6 +1034,7 @@ fn try_clone_metadata(
             broadcast: entry.broadcast,
             state: entry.state,
             ipv6_nodad: entry.ipv6_nodad,
+            ipv6_permanent: entry.ipv6_permanent,
             lifetimes: entry.lifetimes,
         });
     }

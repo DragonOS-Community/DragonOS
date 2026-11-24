@@ -139,6 +139,7 @@ impl TimerFdInode {
 
     fn relative_domain(clock_id: PosixClockID) -> AbsoluteClock {
         match clock_id {
+            PosixClockID::RealtimeAlarm => AbsoluteClock::Realtime,
             PosixClockID::Boottime | PosixClockID::BoottimeAlarm => AbsoluteClock::Boottime,
             _ => AbsoluteClock::Monotonic,
         }

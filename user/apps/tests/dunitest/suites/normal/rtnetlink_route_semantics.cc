@@ -655,6 +655,60 @@ TEST(RtnetlinkRouteSemantics, Ipv6FibMatchReturnsTheConfiguredRoute) {
             expect_attr(RTA_IIF, lo);
             EXPECT_NE(attribute(RTA_CACHEINFO), nullptr);
 
+            constexpr char link_name[] = "iif80";
+            const struct {
+                rtattr header;
+                char kind[RTA_ALIGN(sizeof("veth"))];
+            } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+            alignas(nlmsghdr) char link_request[128] = {};
+            auto* link = reinterpret_cast<nlmsghdr*>(link_request);
+            link->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+            link->nlmsg_type = RTM_NEWLINK;
+            link->nlmsg_flags = add;
+            link->nlmsg_seq = ++seq;
+            AddAttr(link, sizeof(link_request), IFLA_IFNAME, link_name, sizeof(link_name));
+            AddAttr(link, sizeof(link_request), IFLA_LINKINFO, &link_info, sizeof(link_info));
+            ASSERT_EQ(send(fd.Get(), link, link->nlmsg_len, 0),
+                      static_cast<ssize_t>(link->nlmsg_len));
+            ASSERT_EQ(RecvAck(fd.Get(), seq), 0);
+            const uint32_t veth = if_nametoindex(link_name);
+            ASSERT_NE(veth, 0u);
+            ASSERT_EQ(SetLinkUp(fd.Get(), veth, true, ++seq), 0);
+
+            const uint32_t peer = if_nametoindex("veth0");
+            ASSERT_NE(peer, 0u);
+            ASSERT_NE(peer, veth);
+            ASSERT_EQ(SetLinkUp(fd.Get(), peer, true, ++seq), 0);
+            for (const uint32_t input : {veth, peer}) {
+                bool multicast_ready = false;
+                for (int attempt = 0; attempt < 100 && !multicast_ready; ++attempt) {
+                    multicast_ready = FindIpv6Route(fd.Get(), "ff00::", 8, input, ++seq,
+                                                    RTN_MULTICAST).has_value();
+                    if (!multicast_ready) usleep(10000);
+                }
+                ASSERT_TRUE(multicast_ready) << input;
+            }
+            for (const uint32_t flags : {0u, uint32_t{RTM_F_FIB_MATCH}}) {
+                for (const uint32_t input : {veth, peer}) {
+                    ASSERT_NO_FATAL_FAILURE(query("ff02::1", flags, input, "fe80::2"));
+                    if (reply->nlmsg_type == NLMSG_ERROR) {
+                        // Linux with IPv6 multicast routing enabled can resolve the
+                        // interface but cannot serialize a reply without an MFC entry.
+                        ASSERT_GE(reply->nlmsg_len, NLMSG_LENGTH(sizeof(nlmsgerr)));
+                        EXPECT_EQ(reinterpret_cast<nlmsgerr*>(NLMSG_DATA(reply))->error, -EMSGSIZE)
+                            << "input=" << input << " flags=" << flags;
+                    } else {
+                        ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
+                        expect_attr(RTA_IIF, input);
+                        expect_attr(RTA_OIF, input);
+                    }
+                }
+                ASSERT_NO_FATAL_FAILURE(query("ff02::1", flags, lo, "fe80::2"));
+                ASSERT_EQ(reply->nlmsg_type, NLMSG_ERROR);
+                ASSERT_GE(reply->nlmsg_len, NLMSG_LENGTH(sizeof(nlmsgerr)));
+                EXPECT_EQ(reinterpret_cast<nlmsgerr*>(NLMSG_DATA(reply))->error, -ENETUNREACH);
+            }
+
             const uint32_t unknown = UINT32_MAX;
             ASSERT_NO_FATAL_FAILURE(
                 query("fd74:29::9", RTM_F_FIB_MATCH, lo, "fd74:40::2", unknown));

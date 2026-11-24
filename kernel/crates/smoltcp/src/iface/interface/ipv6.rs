@@ -226,14 +226,18 @@ impl InterfaceInner {
         if ipv6_repr.src_addr.is_multicast() {
             return None;
         }
-        if ipv6_repr.dst_addr.is_multicast() {
-            let scope = ipv6_repr.dst_addr.octets()[1] & 0x0f;
-            if scope == 0 || (scope == 1 && !self.is_loopback) {
-                return None;
-            }
+        let multicast_scope = ipv6_repr
+            .dst_addr
+            .is_multicast()
+            .then(|| ipv6_repr.dst_addr.octets()[1] & 0x0f);
+        if multicast_scope == Some(0) {
+            return None;
         }
         if !self.is_loopback
-            && (ipv6_repr.src_addr.is_loopback() || ipv6_repr.dst_addr.is_loopback())
+            && (multicast_scope == Some(1)
+                || ipv6_repr.src_addr.is_loopback()
+                || ipv6_repr.dst_addr.is_loopback())
+            && !filter.ipv6_loopback_input()
         {
             return None;
         }

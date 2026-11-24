@@ -283,14 +283,8 @@ impl IfaceCommon {
         let address_metadata = iface
             .ip_addrs()
             .iter()
-            .map(|cidr| AddressMetadata {
-                cidr: *cidr,
-                label: None,
-                broadcast: None,
-                state: Default::default(),
-                ipv6_nodad: false,
-                lifetimes: None,
-            })
+            .copied()
+            .map(AddressMetadata::configured)
             .collect();
         let sockets = smoltcp::iface::SocketSet::new(Vec::new());
         IfaceCommon {

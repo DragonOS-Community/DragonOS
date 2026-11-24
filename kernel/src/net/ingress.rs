@@ -48,6 +48,13 @@ impl IngressStage {
     fn is_local_output(self) -> bool {
         matches!(self, Self::LocalOutput | Self::ExplicitIpv6LocalOutput(_))
     }
+
+    fn is_ipv6_loopback_input(self) -> bool {
+        matches!(
+            self,
+            Self::ExplicitIpv6LocalOutput(_) | Self::LocalInputDone(Some(_))
+        )
+    }
 }
 
 /// The stage cell is private to one synchronous smoltcp poll. A local RX
@@ -369,7 +376,7 @@ impl<'a> NetIngressFilter<'a> {
     fn hook_ingress_ifindex(&self, socket_ifindex: u32) -> u32 {
         // Local IPv6 output traverses lo but keeps the route's configured
         // interface for transport demultiplexing.
-        if matches!(self.stage.get(), IngressStage::ExplicitIpv6LocalOutput(_)) {
+        if self.stage.get().is_ipv6_loopback_input() {
             crate::net::LOOPBACK_IFINDEX as u32
         } else {
             socket_ifindex
@@ -669,6 +676,10 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         self.owner.ipv6_forwarding() != 0
     }
 
+    fn ipv6_loopback_input(&self) -> bool {
+        self.stage.get().is_ipv6_loopback_input()
+    }
+
     fn ipv6_routed_icmp_reply_source(
         &self,
         remote: smoltcp::wire::Ipv6Address,
@@ -681,8 +692,19 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         } else {
             self.owner_ifindex
         };
-        self.fib_routes?
-            .ipv6_routed_icmp_reply_source(remote, ifindex, echo, local_destination)
+        let routes = self.fib_routes?;
+        let source = routes.ipv6_routed_icmp_reply_source(remote, ifindex, echo, local_destination);
+        let loopback = crate::net::LOOPBACK_IFINDEX as u32;
+        if source.is_none()
+            && ifindex != loopback
+            && remote.is_loopback()
+            && self.stage.get().is_ipv6_loopback_input()
+        {
+            // Prefer the configured input scope, then use the loopback source
+            // if that interface has no usable address for a local error.
+            return routes.ipv6_routed_icmp_reply_source(remote, loopback, echo, local_destination);
+        }
+        source
     }
 
     fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {

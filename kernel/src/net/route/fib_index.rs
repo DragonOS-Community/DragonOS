@@ -1591,7 +1591,7 @@ mod tests {
             oif: 1,
             gateway: None,
             nexthop_flags: 0,
-            address_local: false,
+            ipv6_address_local: false,
             ra_route: None,
         }
     }
@@ -1678,7 +1678,7 @@ mod tests {
         };
         let learned = RouteEntry {
             gateway: Some(learned_gateway),
-            address_local: false,
+            ipv6_address_local: false,
             ra_route: Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
                 expires_at_us: 10,
                 preference: RouterPreference::High,
@@ -1753,7 +1753,7 @@ mod tests {
         let learned = RouteEntry {
             priority: 256,
             gateway: None,
-            address_local: false,
+            ipv6_address_local: false,
             ra_route: Some(crate::net::route::RaRoute::OnLinkPrefix {
                 expires_at_us: Some(10),
             }),

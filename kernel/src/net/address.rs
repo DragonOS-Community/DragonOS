@@ -173,12 +173,16 @@ pub(crate) fn set_device_ipv6_disabled(
     let mut after = try_clone_copy_slice(&mirror, usize::from(restored.is_some()))?;
     drop(mirror);
 
-    let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
+    let mut metadata = try_clone_metadata(
+        &iface.common().address_metadata().lock(),
+        usize::from(restored.is_some()),
+    )?;
     let (removed_addresses, deleted_addresses) =
         prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
             !enabled && matches!(cidr, IpCidr::Ipv6(_))
         })?;
     after.extend(restored);
+    metadata.extend(restored.map(AddressMetadata::configured));
     let routes = crate::net::route::prepare_address_link_change(
         netns,
         iface,
@@ -572,12 +576,16 @@ pub(in crate::net) fn prepare_link_address_change(
     let mut after = try_clone_copy_slice(&mirror, usize::from(restored.is_some()))?;
     drop(mirror);
 
-    let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
+    let mut metadata = try_clone_metadata(
+        &iface.common().address_metadata().lock(),
+        usize::from(restored.is_some()),
+    )?;
     let (removed, deleted_addresses) =
         prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
             mtu_removal(cidr) || (remove_ipv6_addresses && matches!(cidr, IpCidr::Ipv6(_)))
         })?;
 
+    metadata.extend(restored.map(AddressMetadata::configured));
     let (metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {
         prepare_renamed_metadata(iface, new_name, metadata)?
     } else {

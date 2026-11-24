@@ -146,7 +146,7 @@ pub(super) fn do_new_route(
         } else {
             0
         },
-        address_local: false,
+        ipv6_address_local: false,
         ra_route: None,
     };
     let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);

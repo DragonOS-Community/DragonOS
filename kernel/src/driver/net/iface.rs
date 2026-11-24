@@ -76,6 +76,19 @@ pub(crate) struct AddressMetadata {
     pub lifetimes: Option<crate::net::address::ipv6_slaac::Lifetimes>,
 }
 
+impl AddressMetadata {
+    pub(crate) fn configured(cidr: smoltcp::wire::IpCidr) -> Self {
+        Self {
+            cidr,
+            label: None,
+            broadcast: None,
+            state: AddressState::Configured,
+            ipv6_nodad: false,
+            lifetimes: None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddressState {
     #[default]

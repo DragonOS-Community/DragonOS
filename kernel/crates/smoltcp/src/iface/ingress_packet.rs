@@ -52,6 +52,13 @@ pub trait IpIngressFilter {
         false
     }
 
+    /// Whether this packet was reinjected by the local IPv6 output path.
+    /// An integration may receive it on a stack owned by another interface.
+    #[cfg(feature = "proto-ipv6")]
+    fn ipv6_loopback_input(&self) -> bool {
+        false
+    }
+
     /// Select the outer source for a generated ICMPv6 reply to routed local input.
     /// The callback runs before the reply is serialized.
     #[cfg(feature = "proto-ipv6")]

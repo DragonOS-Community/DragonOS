@@ -81,14 +81,16 @@ pub(crate) struct RouteEntry {
     pub oif: u32,
     pub gateway: Option<IpAddress>,
     pub nexthop_flags: u8,
-    /// Whether a configured interface address supplied this local route.
-    pub address_local: bool,
+    /// Whether a configured IPv6 address supplied this local route.
+    pub ipv6_address_local: bool,
     pub ra_route: Option<RaRoute>,
 }
 
 impl RouteEntry {
     pub(crate) fn is_explicit_ipv6_local(self) -> bool {
-        self.kind == RTN_LOCAL && !self.address_local && matches!(self.destination, IpCidr::Ipv6(_))
+        self.kind == RTN_LOCAL
+            && !self.ipv6_address_local
+            && matches!(self.destination, IpCidr::Ipv6(_))
     }
 
     pub(crate) fn is_loopback_anycast(self) -> bool {
@@ -231,7 +233,7 @@ impl RouteLookupResult {
             oif,
             gateway: None,
             nexthop_flags: 0,
-            address_local: false,
+            ipv6_address_local: false,
             ra_route: None,
         };
         Self {

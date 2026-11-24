@@ -496,9 +496,12 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
                                kDestination, 64, veth, RT_SCOPE_NOWHERE, ++seq);
     ASSERT_EQ(SendIpv6RouteRequest(sender.Get(), RTM_NEWROUTE,
                                    NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-                                   kDestination, 64, veth, RT_SCOPE_LINK, ++seq),
+                                   kDestination, 64, veth, RT_SCOPE_LINK, ++seq,
+                                   nullptr, 0, kAddress),
               0);
-    ASSERT_TRUE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
+    const auto configured = FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq);
+    ASSERT_TRUE(configured.has_value());
+    EXPECT_TRUE(configured->has_preferred_source);
 
     FdGuard listener(OpenRouteListener(RTMGRP_IPV6_ROUTE));
     ASSERT_GE(listener.Get(), 0) << ErrnoString(errno);
@@ -506,11 +509,11 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
 
     EXPECT_FALSE(FindIpv6Route(sender.Get(), kDestination, 64, veth, ++seq).has_value());
     EXPECT_FALSE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kAddress, 128, veth, ++seq).has_value());
     EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kDestination, 64, RTM_DELROUTE));
 
-    // This request carries IFA_F_NODAD. Linux installs its host-local route
-    // immediately while the veth is down, but defers the connected prefix
-    // until NETDEV_UP.
+    // IFA_F_NODAD allows the host-local route to appear while the device
+    // is down. The connected prefix still waits for NETDEV_UP.
     (void)SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
                               kDownAddress, 64, ++seq);
     ASSERT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_NEWADDR,
@@ -518,16 +521,19 @@ TEST(RtnetlinkRouteSemantics, LinkDownWithdrawsIpv6RoutesAndNotifiesListeners) {
                                   kDownAddress, 64, ++seq),
               0);
     EXPECT_FALSE(FindIpv6Route(sender.Get(), kDownConnected, 64, veth, ++seq).has_value());
-    EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq).has_value());
+    auto host = FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq);
+    for (int attempt = 0; !host && attempt < 50; ++attempt) {
+        usleep(10 * 1000);
+        host = FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq);
+    }
+    EXPECT_TRUE(host.has_value());
 
     ASSERT_EQ(SetLinkUp(sender.Get(), veth, true, ++seq), 0);
-    EXPECT_TRUE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kConnected, 64, veth, ++seq).has_value());
+    EXPECT_FALSE(FindIpv6Route(sender.Get(), kAddress, 128, veth, ++seq).has_value());
     EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownConnected, 64, veth, ++seq).has_value());
     EXPECT_TRUE(FindIpv6Route(sender.Get(), kDownAddress, 128, veth, ++seq).has_value());
-    EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kConnected, 64, RTM_NEWROUTE));
-    EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
-                                  kAddress, 64, ++seq),
-              0);
+    EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), kDownConnected, 64, RTM_NEWROUTE));
     EXPECT_EQ(SendIpv6AddrRequest(sender.Get(), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, veth,
                                   kDownAddress, 64, ++seq),
               0);

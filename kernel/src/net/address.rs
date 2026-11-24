@@ -67,23 +67,12 @@ fn prepare_address_removal(
     iface: &Arc<dyn Iface>,
     after: &mut Vec<IpCidr>,
     metadata: &mut Vec<AddressMetadata>,
-    matches: impl Fn(IpCidr, AddressState) -> bool,
+    matches: impl Fn(IpCidr) -> bool,
 ) -> Result<(Vec<AddressInfo>, Vec<IpAddress>), SystemError> {
-    let removal_count = after
-        .iter()
-        .copied()
-        .filter(|cidr| {
-            let state = metadata
-                .iter()
-                .find(|entry| entry.cidr == *cidr)
-                .map(|entry| entry.state)
-                .unwrap_or_default();
-            matches(*cidr, state)
-        })
-        .count()
+    let removal_count = after.iter().filter(|&&cidr| matches(cidr)).count()
         + metadata
             .iter()
-            .filter(|entry| !entry.state.is_usable() && matches(entry.cidr, entry.state))
+            .filter(|entry| !entry.state.is_usable() && matches(entry.cidr))
             .count();
     if removal_count == 0 {
         return Ok((Vec::new(), Vec::new()));
@@ -101,24 +90,23 @@ fn prepare_address_removal(
     let mut index = 0;
     while index < after.len() {
         let cidr = after[index];
-        let metadata_index = metadata.iter().position(|entry| entry.cidr == cidr);
-        let state = metadata_index
-            .map(|index| metadata[index].state)
-            .unwrap_or_default();
-        if !matches(cidr, state) {
+        if !matches(cidr) {
             index += 1;
             continue;
         }
         after.remove(index);
         deleted_addresses.push(cidr.address());
-        let entry = metadata_index.map(|index| metadata.remove(index));
+        let entry = metadata
+            .iter()
+            .position(|entry| entry.cidr == cidr)
+            .map(|index| metadata.remove(index));
         removed.push(removed_address_info(cidr, entry, &default_label)?);
     }
 
     let mut index = 0;
     while index < metadata.len() {
         let entry = &metadata[index];
-        if !entry.state.is_usable() && matches(entry.cidr, entry.state) {
+        if !entry.state.is_usable() && matches(entry.cidr) {
             let entry = metadata.remove(index);
             removed.push(removed_address_info(
                 entry.cidr,
@@ -187,7 +175,7 @@ pub(crate) fn set_device_ipv6_disabled(
 
     let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
     let (removed_addresses, deleted_addresses) =
-        prepare_address_removal(iface, &mut after, &mut metadata, |cidr, _| {
+        prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
             !enabled && matches!(cidr, IpCidr::Ipv6(_))
         })?;
     after.extend(restored);
@@ -546,18 +534,20 @@ pub(in crate::net) fn prepare_link_address_change(
         && !was_up
         && iface.common().ipv6_enabled()
         && iface.flags().contains(InterfaceFlags::LOOPBACK);
-    let remove_dad_addresses = was_up
-        && !is_up
+    let link_down = was_up && !is_up;
+    if mtu.is_none() && !loopback_up && !link_down {
+        return Ok(None);
+    }
+    let has_ipv6_metadata = link_down
         && iface
             .common()
             .address_metadata()
             .lock()
             .iter()
-            .any(|entry| entry.state.has_dad_state());
-    if mtu.is_none() && !loopback_up && !remove_dad_addresses {
-        return Ok(None);
-    }
+            .any(|entry| matches!(entry.cidr, IpCidr::Ipv6(_)));
     let mirror = iface.router_common().ip_addrs.read();
+    let remove_ipv6_addresses = link_down
+        && (has_ipv6_metadata || mirror.iter().any(|cidr| matches!(cidr, IpCidr::Ipv6(_))));
     let restored = if loopback_up {
         missing_loopback_ipv6_address(iface, mtu.unwrap_or_else(|| iface.mtu()), &mirror)
     } else {
@@ -572,7 +562,7 @@ pub(in crate::net) fn prepare_link_address_change(
     let discard_learned_defaults =
         mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && iface.mtu() >= IPV6_MIN_MTU);
     if !discard_learned_defaults
-        && !remove_dad_addresses
+        && !remove_ipv6_addresses
         && restored.is_none()
         && !mirror.iter().copied().any(mtu_removal)
     {
@@ -584,8 +574,8 @@ pub(in crate::net) fn prepare_link_address_change(
 
     let mut metadata = try_clone_metadata(&iface.common().address_metadata().lock(), 0)?;
     let (removed, deleted_addresses) =
-        prepare_address_removal(iface, &mut after, &mut metadata, |cidr, state| {
-            mtu_removal(cidr) || (remove_dad_addresses && state.has_dad_state())
+        prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
+            mtu_removal(cidr) || (remove_ipv6_addresses && matches!(cidr, IpCidr::Ipv6(_)))
         })?;
 
     let (metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {

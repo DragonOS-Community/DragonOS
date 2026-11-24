@@ -835,6 +835,12 @@ int RunManualIpv6Dad() {
     if (!wait_for_usable(after_carrier_loss)) return 3010;
 
     if (const int error = SetLinkUp(fd.Get(), edge, ++sequence, false); error != 0) return 3100 + error;
+    for (const auto& address : {ordinary, nodad, duplicate, carrier_loss, after_carrier_loss}) {
+        if (CountAddress(fd.Get(), address, ++sequence) != 0 ||
+            BindUdp(address, 0) != EADDRNOTAVAIL)
+            return 3197;
+    }
+    if (CountAddressNotifications(notifications.Get(), RTM_DELADDR, nodad) != 1) return 3198;
     if (const int error = SetLinkUp(fd.Get(), edge, ++sequence); error != 0) return 3200 + error;
     auto after_admin_down = MakeAddress(AF_INET6, "fd50:2324::7", 80, edge);
     after_admin_down.ipv6_flags = 0;
@@ -892,6 +898,25 @@ int RunMultipleAddressConsistency() {
     // with the separate implicit-source selection policy for non-127/8
     // addresses assigned to a loopback device.
     if (const int error = VerifyBoundUdpDelivery(first); error != 0) return 2700 + error;
+
+    const auto loopback = MakeAddress(AF_INET6, "::1", 128, ifindex);
+    if (const int error = SetLinkUp(fd.Get(), ifindex, ++sequence, false); error != 0)
+        return 2900 + error;
+    if (CountAddress(fd.Get(), first, ++sequence) != 1 ||
+        CountAddress(fd.Get(), ipv6, ++sequence) != 0 ||
+        CountAddress(fd.Get(), loopback, ++sequence) != 0 ||
+        BindUdp(ipv6, 0) != EADDRNOTAVAIL)
+        return 3000;
+    if (const int error = SetLinkUp(fd.Get(), ifindex, ++sequence); error != 0) return 3100 + error;
+    if (CountAddress(fd.Get(), first, ++sequence) != 1 ||
+        CountAddress(fd.Get(), ipv6, ++sequence) != 0 ||
+        CountAddress(fd.Get(), loopback, ++sequence) != 1)
+        return 3200;
+    if (const int error = SetLinkUp(fd.Get(), ifindex, ++sequence, false); error != 0)
+        return 3300 + error;
+    if (CountAddress(fd.Get(), first, ++sequence) != 1 ||
+        CountAddress(fd.Get(), loopback, ++sequence) != 0)
+        return 3400;
     return 0;
 }
 

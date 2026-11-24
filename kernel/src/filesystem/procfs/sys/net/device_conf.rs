@@ -51,6 +51,7 @@ impl DeviceConfFamily {
                 "dad_transmits",
                 "disable_ipv6",
                 "forwarding",
+                "keep_addr_on_down",
                 "router_solicitations",
             ],
         }
@@ -215,6 +216,9 @@ impl DirOps for DeviceDirOps {
             }
             (DeviceConfFamily::Ipv6, "dad_transmits") => {
                 DeviceField::Ipv6Autoconf(Setting::DadTransmits)
+            }
+            (DeviceConfFamily::Ipv6, "keep_addr_on_down") => {
+                DeviceField::Ipv6Autoconf(Setting::KeepAddrOnDown)
             }
             (DeviceConfFamily::Ipv6, "router_solicitations") => {
                 DeviceField::Ipv6Autoconf(Setting::RouterSolicitations)

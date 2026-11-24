@@ -501,15 +501,18 @@ impl Interface {
     /// For route-based selection, the caller restricts the candidate interfaces
     /// and passes whether this interface owns the selected route. Passing
     /// `None` retains single-interface candidate eligibility and ranking.
+    /// Extra sources provide a CIDR and its current deprecation flag. They
+    /// participate in the same ranking without entering the receive address list.
     #[cfg(feature = "proto-ipv6")]
     pub fn ipv6_source_candidate_at(
         &self,
         dst_addr: &Ipv6Address,
         now: Instant,
         on_route_device: Option<bool>,
+        extra_sources: Option<&mut dyn Iterator<Item = (Ipv6Cidr, bool)>>,
     ) -> Option<(impl Ord, Ipv6Address)> {
         self.inner
-            .ipv6_source_candidate_at(dst_addr, now, on_route_device)
+            .ipv6_source_candidate_at(dst_addr, now, on_route_device, extra_sources)
     }
 
     /// Publish the finite preferred deadlines of the configured IPv6 addresses.

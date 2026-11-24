@@ -90,7 +90,7 @@ impl InterfaceInner {
         if dst_addr.is_loopback() {
             return Ipv6Address::LOCALHOST;
         }
-        self.ipv6_source_candidate_at(dst_addr, now, None)
+        self.ipv6_source_candidate_at(dst_addr, now, None, None)
             .map(|(_, address)| address)
             .or_else(|| self.ipv6_addr())
             .unwrap_or(Ipv6Address::LOCALHOST)
@@ -101,6 +101,7 @@ impl InterfaceInner {
         dst_addr: &Ipv6Address,
         now: Instant,
         on_route_device: Option<bool>,
+        extra_sources: Option<&mut dyn Iterator<Item = (Ipv6Cidr, bool)>>,
     ) -> Option<(impl Ord, Ipv6Address)> {
         // See RFC 6724 Section 4: Candidate source address
         fn is_candidate_source_address(dst_addr: &Ipv6Address, src_addr: &Ipv6Address) -> bool {
@@ -162,11 +163,19 @@ impl InterfaceInner {
         let mut best = None;
         let dst_scope = scope(*dst_addr);
         let dst_label = on_route_device.map(|_| routed_address_label(*dst_addr));
-        for addr in self.ip_addrs.iter().filter_map(|a| match a {
-            #[cfg(feature = "proto-ipv4")]
-            IpCidr::Ipv4(_) => None,
-            IpCidr::Ipv6(addr) => Some(addr),
-        }) {
+        let configured_sources = self.ip_addrs.iter().filter_map(|a| {
+            let addr = match a {
+                #[cfg(feature = "proto-ipv4")]
+                IpCidr::Ipv4(_) => return None,
+                IpCidr::Ipv6(addr) => *addr,
+            };
+            let deprecated = self
+                .ipv6_preferred_until
+                .iter()
+                .any(|&(address, deadline)| address == addr.address() && deadline <= now);
+            Some((addr, deprecated))
+        });
+        for (addr, deprecated) in configured_sources.chain(extra_sources.into_iter().flatten()) {
             let source = addr.address();
             let eligible = if on_route_device.is_some() {
                 source.x_is_unicast()
@@ -183,10 +192,6 @@ impl InterfaceInner {
             } else {
                 source_scope
             };
-            let deprecated = self
-                .ipv6_preferred_until
-                .iter()
-                .any(|&(address, deadline)| address == source && deadline <= now);
             // Rule 1 (same address), Rule 2 (scope), Rule 3 (deprecation),
             // Rule 5 (outgoing interface), Rule 6 (matching label), then Rule 8 (prefix).
             let score = (
@@ -196,7 +201,7 @@ impl InterfaceInner {
                 !deprecated,
                 on_route_device.unwrap_or(false),
                 dst_label.is_some_and(|label| label == routed_address_label(source)),
-                common_prefix_length(addr, dst_addr),
+                common_prefix_length(&addr, dst_addr),
             );
             if best.map_or(true, |(best_score, _)| score > best_score) {
                 best = Some((score, source));

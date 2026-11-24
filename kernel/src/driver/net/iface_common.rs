@@ -238,7 +238,11 @@ impl PreparedNetnsBinding {
             .ipv6_accept_ra
             .store(self.netns.ipv6_default_accept_ra(), Ordering::Release);
         let prefixes = *self.netns.ipv6_default_prefixes.lock();
-        common.ipv6_autoconf.lock().prefixes = prefixes;
+        {
+            let mut autoconf = common.ipv6_autoconf.lock();
+            autoconf.prefixes = prefixes;
+            autoconf.keep_addr_on_down = self.netns.ipv6_default_keep_addr_on_down();
+        }
         common.route_localnet.store(0, Ordering::Release);
         *namespace = Arc::downgrade(&self.netns);
         sockets.set_udp_ingress_handler(Some(self.ingress));

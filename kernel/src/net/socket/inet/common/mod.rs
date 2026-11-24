@@ -264,6 +264,14 @@ pub(crate) fn get_iface_for_local_bind(
         return Some(iface);
     }
 
+    if let smoltcp::wire::IpAddress::Ipv6(address) = *ip_addr {
+        return netns
+            .device_list()
+            .values()
+            .find(|iface| crate::net::address::iface_retains_ipv6_source(iface, address))
+            .cloned();
+    }
+
     // Linux treats IPv4 addresses in a loopback interface's configured subnet
     // as local for bind(2). IPv6 does not have this loopback-subnet exception:
     // binding to an unassigned IPv6 address in an on-link prefix fails with

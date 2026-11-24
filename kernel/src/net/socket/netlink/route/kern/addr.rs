@@ -86,7 +86,7 @@ pub(super) fn do_new_addr(
     match commit.outcome {
         AddressMutationOutcome::Added(cidr) => notify_address_change(netns.clone(), &iface, cidr),
         AddressMutationOutcome::Replaced(cidr)
-            if crate::net::address::address_state(&iface, cidr).is_usable() =>
+            if crate::net::address::address_state(&iface, cidr).is_bindable() =>
         {
             notify_address_change(netns.clone(), &iface, cidr);
         }
@@ -431,12 +431,14 @@ pub(super) fn addr_to_segment(
     match address.state {
         AddressState::AutoLinkLocal(DadState::Tentative)
         | AddressState::Slaac(DadState::Tentative)
-        | AddressState::ManualDad(DadState::Tentative) => {
+        | AddressState::ManualDad(DadState::Tentative)
+        | AddressState::Retained(DadState::Tentative) => {
             flags.insert(AddrMessageFlags::TENTATIVE);
         }
         AddressState::AutoLinkLocal(DadState::DadFailed)
         | AddressState::Slaac(DadState::DadFailed)
-        | AddressState::ManualDad(DadState::DadFailed) => {
+        | AddressState::ManualDad(DadState::DadFailed)
+        | AddressState::Retained(DadState::DadFailed) => {
             flags.insert(AddrMessageFlags::TENTATIVE | AddrMessageFlags::DADFAILED);
         }
         _ => {}

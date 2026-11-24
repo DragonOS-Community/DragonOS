@@ -26,6 +26,16 @@ pub const IPI_NUM_STOP_CPU: IrqNumber = IrqNumber::new(202);
 pub const IPI_NUM_LOADED_VMCS_CLEAR: IrqNumber = IrqNumber::new(203);
 pub const IPI_NUM_TEXT_PATCH: IrqNumber = IrqNumber::new(204);
 pub const IPI_NUM_CLOCKEVENT: IrqNumber = IrqNumber::new(205);
+
+/// These vectors are owned by the local APIC, including during IOAPIC setup.
+pub(crate) const LOCAL_IPI_IRQS: &[IrqNumber] = &[
+    IPI_NUM_KICK_CPU,
+    IPI_NUM_FLUSH_TLB,
+    IPI_NUM_STOP_CPU,
+    IPI_NUM_LOADED_VMCS_CLEAR,
+    IPI_NUM_TEXT_PATCH,
+    IPI_NUM_CLOCKEVENT,
+];
 /// IPI的种类(架构相关，指定了向量号)
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
@@ -273,12 +283,9 @@ pub fn ipi_send_smp_startup(target_cpu: ProcessorId) -> Result<(), SystemError> 
 
 /// 初始化IPI处理函数
 pub fn arch_ipi_handler_init() {
-    do_init_irq_handler(IPI_NUM_KICK_CPU);
-    do_init_irq_handler(IPI_NUM_FLUSH_TLB);
-    do_init_irq_handler(IPI_NUM_STOP_CPU);
-    do_init_irq_handler(IPI_NUM_LOADED_VMCS_CLEAR);
-    do_init_irq_handler(IPI_NUM_TEXT_PATCH);
-    do_init_irq_handler(IPI_NUM_CLOCKEVENT);
+    for &irq in LOCAL_IPI_IRQS {
+        do_init_irq_handler(irq);
+    }
 }
 
 fn do_init_irq_handler(irq: IrqNumber) {

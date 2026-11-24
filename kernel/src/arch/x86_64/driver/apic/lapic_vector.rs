@@ -13,10 +13,7 @@ use crate::{
         },
         interrupt::{
             entry::arch_setup_interrupt_gate,
-            ipi::{
-                arch_ipi_handler_init, send_ipi, IPI_NUM_FLUSH_TLB, IPI_NUM_KICK_CPU,
-                IPI_NUM_LOADED_VMCS_CLEAR, IPI_NUM_STOP_CPU, IPI_NUM_TEXT_PATCH,
-            },
+            ipi::{arch_ipi_handler_init, send_ipi, LOCAL_IPI_IRQS},
             msi::{X86MsiAddrHi, X86MsiAddrLoNormal, X86MsiDataNormal, X86_MSI_BASE_ADDRESS_LOW},
         },
     },
@@ -263,14 +260,7 @@ pub fn arch_early_irq_init() -> Result<(), SystemError> {
     CurrentApic.init_current_cpu();
     if smp_get_processor_id().data() == 0 {
         unsafe { arch_setup_interrupt_gate() };
-        ioapic_init(&[
-            APIC_TIMER_IRQ_NUM,
-            IPI_NUM_KICK_CPU,
-            IPI_NUM_FLUSH_TLB,
-            IPI_NUM_STOP_CPU,
-            IPI_NUM_LOADED_VMCS_CLEAR,
-            IPI_NUM_TEXT_PATCH,
-        ]);
+        ioapic_init(|irq| irq == APIC_TIMER_IRQ_NUM || LOCAL_IPI_IRQS.contains(&irq));
     }
     return Ok(());
 }

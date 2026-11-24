@@ -393,7 +393,7 @@ impl InnerIoApicChipData {
 }
 
 #[inline(never)]
-pub fn ioapic_init(ignore: &'static [IrqNumber]) {
+pub fn ioapic_init(is_local_irq: fn(IrqNumber) -> bool) {
     info!("Initializing ioapic...");
     let ioapic = unsafe { IoApic::new() };
     unsafe {
@@ -407,7 +407,7 @@ pub fn ioapic_init(ignore: &'static [IrqNumber]) {
     for i in IoApic::VECTOR_BASE as u32..256 {
         let irq = IrqNumber::new(i);
 
-        if ignore.contains(&irq) {
+        if is_local_irq(irq) {
             continue;
         }
 

@@ -615,6 +615,21 @@ impl IpIngressFilter for NetIngressFilter<'_> {
         self.owner.ipv6_forwarding() != 0
     }
 
+    fn ipv6_anycast_reply_source(
+        &self,
+        remote: smoltcp::wire::Ipv6Address,
+        ingress: PacketMeta,
+        echo: bool,
+    ) -> Option<smoltcp::wire::Ipv6Address> {
+        let ifindex = if ingress.id != 0 {
+            ingress.id
+        } else {
+            self.owner_ifindex
+        };
+        self.fib_routes?
+            .ipv6_anycast_reply_source(remote, ifindex, echo)
+    }
+
     fn arp_reply_allowed(&self, source: Ipv4Address, target: Ipv4Address) -> Option<bool> {
         // Linux's default Ethernet ARP policy does not expose loopback or
         // multicast targets. IP AnyIP admission is not proxy-ARP permission.

@@ -630,6 +630,18 @@ TEST(RtnetlinkRouteSemantics, Ipv6LoopbackAnycastRejectsDeliveryWithoutOwningAnA
             wildcard.sin6_addr = in6addr_any;
             ASSERT_EQ(bind(listener.Get(), reinterpret_cast<sockaddr*>(&wildcard), sizeof(wildcard)), 0);
 
+            FdGuard oversized(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(oversized.Get(), 0);
+            int mtu = 1280;
+            int discover = IPV6_PMTUDISC_DO;
+            ASSERT_EQ(setsockopt(oversized.Get(), IPPROTO_IPV6, IPV6_MTU, &mtu, sizeof(mtu)), 0);
+            ASSERT_EQ(setsockopt(oversized.Get(), IPPROTO_IPV6, IPV6_MTU_DISCOVER,
+                                 &discover, sizeof(discover)), 0);
+            char datagram[2000] = {};
+            ASSERT_EQ(sendto(oversized.Get(), datagram, sizeof(datagram), 0,
+                             reinterpret_cast<sockaddr*>(&peer), sizeof(peer)), -1);
+            EXPECT_EQ(errno, EMSGSIZE);
+
             FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
             ASSERT_GE(sender.Get(), 0);
             int enabled = 1;

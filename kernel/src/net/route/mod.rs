@@ -489,14 +489,11 @@ fn select_ipv6_source(
         if source.is_link_local() != link_scope || source.is_loopback() {
             continue;
         }
-        let mut prefix = 0;
-        for (left, right) in source.octets().iter().zip(destination.octets().iter()) {
-            prefix += (*left ^ *right).leading_zeros() as usize;
-            if left != right {
-                break;
-            }
-        }
-        let score = (!deprecated(source), prefix.min(cidr.prefix_len() as usize));
+        let prefix = self::source::ipv6_common_prefix(source, destination);
+        let score = (
+            !deprecated(source),
+            prefix.min(u32::from(cidr.prefix_len())),
+        );
         if best.is_none() || score > best_score {
             best = Some(source);
             best_score = score;

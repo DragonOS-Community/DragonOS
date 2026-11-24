@@ -73,6 +73,25 @@ pub(crate) struct RawOutputPolicy {
     pub(crate) hdrincl: bool,
 }
 
+pub(super) fn apply_ipv6_output_mtu(
+    netns: &Arc<NetNamespace>,
+    reservation: &mut PreparedIpOutputReservation<'_>,
+    route: OutputRouteDecision,
+    policy: Option<SocketMtuPolicy>,
+    may_fragment: bool,
+) -> Result<OutputRouteDecision, PmtuOutputError> {
+    if !may_fragment && reservation.bytes().len() > route.ip_mtu {
+        return Err(PmtuOutputError {
+            error: SystemError::EMSGSIZE,
+            mtu: Some(route.ip_mtu),
+        });
+    }
+    match policy {
+        Some(policy) => apply_socket_mtu(netns, reservation, route, policy, IpVersion::Ipv6),
+        None => Ok(route),
+    }
+}
+
 pub(super) fn apply_socket_mtu(
     netns: &Arc<NetNamespace>,
     reservation: &mut PreparedIpOutputReservation<'_>,

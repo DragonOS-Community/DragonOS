@@ -309,7 +309,7 @@ impl InterfaceInner {
             LocalInputVerdict::ExternalRaw { matched } => Some(matched),
         };
         let rewritten = Ipv6Packet::new_checked(packet.into_bytes().ok()?).ok()?;
-        self.process_ipv6_inner(
+        let mut reply = self.process_ipv6_inner(
             sockets,
             meta,
             source_hardware_addr,
@@ -321,7 +321,30 @@ impl InterfaceInner {
                 #[cfg(feature = "socket-raw")]
                 external_raw: _raw_delivery,
             },
-        )
+        )?;
+        if anycast_destination.is_some() {
+            #[allow(irrefutable_let_patterns)]
+            if let Packet::Ipv6(packet) = &mut reply {
+                if let IpPayload::Icmpv6(message) = &packet.payload {
+                    let echo = matches!(message, Icmpv6Repr::EchoReply { .. });
+                    if echo
+                        || matches!(
+                            message,
+                            Icmpv6Repr::DstUnreachable { .. } | Icmpv6Repr::ParamProblem { .. }
+                        )
+                    {
+                        let remote = packet.header.dst_addr;
+                        packet.header.src_addr =
+                            filter.ipv6_anycast_reply_source(remote, meta, echo)?;
+                        #[cfg(feature = "packetmeta-id")]
+                        if echo || remote.is_unicast_link_local() {
+                            packet.tx_meta.id = meta.id;
+                        }
+                    }
+                }
+            }
+        }
+        Some(reply)
     }
 
     pub(super) fn process_ipv6<'frame>(
@@ -458,7 +481,6 @@ impl InterfaceInner {
                     header: ipv6_repr,
                     data: &ip_payload[0..payload_len],
                 },
-                false,
             )
         };
 
@@ -514,9 +536,7 @@ impl InterfaceInner {
     ) -> Option<Packet<'frame>> {
         let (nxt_hdr, ip_payload) = transport;
         match nxt_hdr {
-            IpProtocol::Icmpv6 => {
-                self.process_icmpv6(sockets, meta, ipv6_repr, ip_payload, ndisc_router)
-            }
+            IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload, ndisc_router),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => self.process_udp(sockets, meta, ipv6_repr.into(), ip_payload, false),
@@ -538,7 +558,7 @@ impl InterfaceInner {
                     header: ipv6_repr,
                     data: &ip_payload[0..payload_len],
                 };
-                self.icmpv6_reply(ipv6_repr, icmp_reply_repr, meta.ipv6_anycast)
+                self.icmpv6_reply(ipv6_repr, icmp_reply_repr)
             }
         }
     }
@@ -546,7 +566,6 @@ impl InterfaceInner {
     pub(super) fn process_icmpv6<'frame>(
         &mut self,
         _sockets: &mut SocketSet,
-        meta: PacketMeta,
         ip_repr: Ipv6Repr,
         ip_payload: &'frame [u8],
         _ndisc_router: bool,
@@ -588,7 +607,7 @@ impl InterfaceInner {
                     seq_no,
                     data,
                 };
-                self.icmpv6_reply(ip_repr, icmp_reply_repr, meta.ipv6_anycast)
+                self.icmpv6_reply(ip_repr, icmp_reply_repr)
             }
 
             // Ignore any echo replies.
@@ -715,7 +734,6 @@ impl InterfaceInner {
         &self,
         ipv6_repr: Ipv6Repr,
         icmp_repr: Icmpv6Repr<'icmp>,
-        anycast_destination: bool,
     ) -> Option<Packet<'frame>> {
         let src_addr = ipv6_repr.dst_addr;
         let dst_addr = ipv6_repr.src_addr;
@@ -723,7 +741,7 @@ impl InterfaceInner {
             return None;
         }
 
-        let src_addr = if src_addr.x_is_unicast() && !anycast_destination {
+        let src_addr = if src_addr.x_is_unicast() {
             src_addr
         } else {
             self.get_source_address_ipv6(&dst_addr)

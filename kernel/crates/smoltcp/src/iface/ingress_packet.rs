@@ -50,6 +50,18 @@ pub trait IpIngressFilter {
         false
     }
 
+    /// Select the outer source for a generated ICMPv6 reply to anycast input.
+    /// The callback runs before the reply is serialized.
+    #[cfg(feature = "proto-ipv6")]
+    fn ipv6_anycast_reply_source(
+        &self,
+        _remote: crate::wire::Ipv6Address,
+        _ingress: PacketMeta,
+        _echo: bool,
+    ) -> Option<crate::wire::Ipv6Address> {
+        None
+    }
+
     /// Override ARP reply authorization with the integration's address policy.
     /// `None` preserves the interface's standalone `any_ip` behavior. This
     /// decision controls replies only, not neighbor-cache learning. A local

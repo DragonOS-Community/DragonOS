@@ -478,8 +478,15 @@ fn lookup_route(
     let parsed = ParsedRouteRequest::from_segment(request)?;
     let destination = parsed.destination.address();
     let requested_oif = parsed.oif.filter(|oif| *oif != 0);
-    if parsed.iif.is_some_and(|iif| iif != 0) {
-        return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+    if let Some(iif) = parsed.iif.filter(|iif| *iif != 0) {
+        let IpAddress::Ipv6(destination) = destination else {
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        };
+        let source = match parsed.source.map(|source| source.address()) {
+            Some(IpAddress::Ipv6(source)) => source,
+            _ => Ipv6Address::UNSPECIFIED,
+        };
+        return lookup_ipv6_input_route(request, &netns, destination, source, iif);
     }
     if let (IpAddress::Ipv4(_), Some(oif)) = (destination, requested_oif) {
         ensure_iface_up(&netns, oif)?;
@@ -540,6 +547,7 @@ fn lookup_route(
                 decision.matched,
                 RouteReply::FibMatch,
                 0,
+                None,
             )?)]);
         }
         let selected = if requested_source.is_some() {
@@ -578,6 +586,58 @@ fn lookup_route(
         output,
         RouteReply::Resolved,
         0,
+        None,
+    )?)])
+}
+
+fn lookup_ipv6_input_route(
+    request: &RouteSegment,
+    netns: &NetNamespace,
+    destination: Ipv6Address,
+    source: Ipv6Address,
+    iif: u32,
+) -> Result<Vec<RouteNlSegment>, SystemError> {
+    let decision = {
+        let router = netns.router();
+        let routes = route::lock_output_routes(&router, netns.device_list());
+        if routes.ingress_device(iif).is_none() {
+            return Err(SystemError::ENODEV);
+        }
+        routes.lookup_ingress(
+            destination.into(),
+            iif,
+            (!source.is_unspecified()).then_some(source),
+        )
+    }
+    .ok_or(SystemError::ENETUNREACH)?;
+    let matched = decision.matched;
+    if let Some(rejection) = route::ipv6_route_rejection(matched.kind) {
+        return Err(rejection.error);
+    }
+
+    let (entry, reply) = if request.body().flags.contains(RouteFlags::FIB_MATCH) {
+        (matched, RouteReply::FibMatch)
+    } else {
+        let resolved = RouteEntry {
+            destination: host_cidr(destination.into()),
+            source: Some(host_cidr(source.into())),
+            oif: if matched.kind == route::RTN_LOCAL {
+                crate::net::LOOPBACK_IFINDEX as u32
+            } else {
+                decision.oif
+            },
+            scope: RouteScope::Universe as u8,
+            ..matched
+        };
+        (resolved, RouteReply::Resolved)
+    };
+    Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
+        request.header(),
+        CSegmentType::NEWROUTE,
+        entry,
+        reply,
+        0,
+        Some(iif),
     )?)])
 }
 
@@ -621,6 +681,7 @@ fn notify_route_with_flags(
         route,
         RouteReply::Configuration,
         nlmsg_flags,
+        None,
     ) {
         Ok(segment) => segment,
         Err(error) => {
@@ -655,9 +716,11 @@ pub(super) fn route_to_segment(
     route: RouteEntry,
     reply: RouteReply,
     nlmsg_flags: u16,
+    input_ifindex: Option<u32>,
 ) -> Result<RouteSegment, SystemError> {
     let body_flags = match reply {
-        RouteReply::Resolved => RouteFlags::CLONED,
+        RouteReply::Resolved if input_ifindex.is_none() => RouteFlags::CLONED,
+        RouteReply::Resolved => RouteFlags::empty(),
         RouteReply::Configuration | RouteReply::FibMatch => {
             RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
         }
@@ -694,6 +757,9 @@ pub(super) fn route_to_segment(
         attrs.push(RouteAttr::Dst(ip_to_bytes(route.destination.address())?))?;
     }
     attrs.push(RouteAttr::Oif(route.oif))?;
+    if let Some(index) = input_ifindex {
+        attrs.push(RouteAttr::Iif(index))?;
+    }
     attrs.push(RouteAttr::Table(route.table))?;
     if let Some(source) = route.source {
         attrs.push(RouteAttr::Src(ip_to_bytes(source.address())?))?;
@@ -705,6 +771,7 @@ pub(super) fn route_to_segment(
         attrs.push(RouteAttr::Gateway(ip_to_bytes(gateway)?))?;
     }
     if reply == RouteReply::FibMatch
+        || input_ifindex.is_some()
         || (route.priority != 0
             && (reply != RouteReply::Resolved
                 || matches!(route.destination.address(), IpAddress::Ipv6(_))))
@@ -712,7 +779,7 @@ pub(super) fn route_to_segment(
         attrs.push(RouteAttr::Priority(route.priority))?;
     }
     let deadline = route.expires_at_us();
-    if deadline.is_some() || reply == RouteReply::FibMatch {
+    if deadline.is_some() || reply == RouteReply::FibMatch || input_ifindex.is_some() {
         let mut cache_info = [0; 32];
         if let Some(deadline) = deadline {
             // Linux rta_cacheinfo stores signed remaining time in USER_HZ ticks.
@@ -727,7 +794,7 @@ pub(super) fn route_to_segment(
         Some(route::RouterPreference::High) => Some(1),
         Some(route::RouterPreference::Medium) => Some(0),
         Some(route::RouterPreference::Low) => Some(3),
-        None if reply == RouteReply::FibMatch => Some(0),
+        None if reply == RouteReply::FibMatch || input_ifindex.is_some() => Some(0),
         None => None,
     };
     if let Some(preference) = preference {

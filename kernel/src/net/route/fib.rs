@@ -926,11 +926,13 @@ impl FibTable {
         ingress_oif: u32,
         source: Option<Ipv6Address>,
     ) -> Option<RouteLookupResult> {
-        // IPv6 link-local unicast is scoped to the arriving link in every
-        // table. Other destinations keep the weak-host local-table lookup.
-        let required_oif =
-            matches!(destination, IpAddress::Ipv6(address) if address.is_unicast_link_local())
-                .then_some(ingress_oif);
+        // Link-local unicast and loopback require the input device. Global
+        // IPv6 destinations retain weak-host lookup across interfaces.
+        let required_oif = matches!(
+            destination,
+            IpAddress::Ipv6(address) if address.is_unicast_link_local() || address.is_loopback()
+        )
+        .then_some(ingress_oif);
         self.lookup_builtin_rules(destination, |table| FibLookupKey {
             source,
             required_oif,

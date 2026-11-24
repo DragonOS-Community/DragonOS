@@ -91,21 +91,18 @@ pub(in crate::net::socket::netlink::route::kern) fn iface_to_link_message(
 ) -> Result<LinkSegment, SystemError> {
     let (header, link_message, mut attrs) = link_message_parts(request_header, msg_type, iface)?;
     let kind = if iface.as_any_ref().is::<BridgeIface>() {
-        Some("bridge")
+        Some(b"bridge\0".as_slice())
     } else if iface.as_any_ref().is::<VethInterface>() {
-        Some("veth")
+        Some(b"veth\0".as_slice())
     } else {
         None
     };
     if let Some(kind) = kind {
         let mut info = Vec::new();
-        let mut kind_bytes = Vec::new();
-        kind_bytes
-            .try_reserve_exact(kind.len() + 1)
-            .map_err(|_| SystemError::ENOMEM)?;
-        kind_bytes.extend_from_slice(kind.as_bytes());
-        kind_bytes.push(0);
-        append_nested_link_attr(&mut info, 1, &kind_bytes)?;
+        append_nested_link_attr(&mut info, 1, kind)?;
+        if kind == b"bridge\0" {
+            bridge_info::append_settings(&mut info)?;
+        }
         attrs.push(LinkAttr::LinkInfo(info));
     }
     if let Some(veth) = iface.as_any_ref().downcast_ref::<VethInterface>() {

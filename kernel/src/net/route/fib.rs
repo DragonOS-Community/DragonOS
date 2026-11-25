@@ -181,7 +181,11 @@ impl<'a> FibEditor<'a> {
         route: RouteEntry,
         remaining_deadline: Option<i64>,
     ) -> Result<Option<(RouteEntry, RouteEntry)>, SystemError> {
-        let Some(index) = self.fib.address_prefix_slot(route) else {
+        let Some(index) = self
+            .fib
+            .address_prefix_slot(route)
+            .or_else(|| self.fib.address_prefix_alias(route))
+        else {
             return Ok(None);
         };
         let old = self.fib.entries[index];

@@ -530,7 +530,7 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
                                       "fd83:4::"), EEXIST);
             ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd83:5::"), 0);
             ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:5::1"), 0);
-            ASSERT_EQ(explicit_prefix(RTM_DELROUTE, request, "fd83:5::"), 0);
+            ASSERT_EQ(address(RTM_DELADDR, request, "fd83:5::1"), 0);
             EXPECT_FALSE(prefix("fd83:5::"));
 
             std::memset(link_request, 0, sizeof(link_request));

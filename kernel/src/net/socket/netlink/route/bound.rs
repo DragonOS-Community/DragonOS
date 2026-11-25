@@ -8,7 +8,7 @@ use crate::{
             message::{
                 segment::{
                     ack::ErrorSegment,
-                    header::{CMsgSegHdr, SegHdrCommonFlags},
+                    header::{CMsgSegHdr, DeleteRequestFlags, SegHdrCommonFlags},
                     CSegmentType,
                 },
                 ProtocolSegment, NLMSG_ALIGN,
@@ -160,7 +160,12 @@ impl datagram_common::Bound for BoundNetlink<NetlinkRouteProtocol> {
                 }
             }
 
-            if CSegmentType::try_from(header.type_).is_err() {
+            // Linux rejects unsupported bulk deletion before decoding the
+            // typed body. On RTM_NEWRULE this bit instead means NLM_F_EXCL.
+            let bulk_rule_delete = header.type_ == CSegmentType::DELRULE as u16
+                && DeleteRequestFlags::from_bits_truncate(header.flags)
+                    .contains(DeleteRequestFlags::BULK);
+            if bulk_rule_delete || CSegmentType::try_from(header.type_).is_err() {
                 send_route_ack(
                     &header,
                     Some(SystemError::EOPNOTSUPP_OR_ENOTSUP),

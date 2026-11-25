@@ -22,7 +22,7 @@ use crate::{
     libs::mutex::MutexGuard,
     net::{
         address::{
-            ipv6_autoconf::{AddressSetting, PrefixSetting, Setting},
+            ipv6_autoconf::{self, AddressSetting, PrefixSetting, Setting},
             set_device_ipv6_disabled,
         },
         rtnl,
@@ -30,7 +30,7 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 
-use super::{super::numeric::parse_numeric_sysctl, namespace::SysctlNamespace};
+use super::{super::numeric::parse_numeric_sysctl, ipv6_stable_secret, namespace::SysctlNamespace};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DeviceConfFamily {
@@ -53,6 +53,7 @@ impl DeviceConfFamily {
                 "forwarding",
                 "keep_addr_on_down",
                 "router_solicitations",
+                "stable_secret",
             ],
         }
     }
@@ -231,6 +232,7 @@ impl DirOps for DeviceDirOps {
             (DeviceConfFamily::Ipv6, "accept_dad") => {
                 DeviceField::Ipv6Autoconf(Setting::Address(AddressSetting::AcceptDad))
             }
+            (DeviceConfFamily::Ipv6, "stable_secret") => DeviceField::StableSecret,
             (DeviceConfFamily::Ipv6, "addr_gen_mode") => {
                 DeviceField::Ipv6Autoconf(Setting::Address(AddressSetting::AddrGenMode))
             }
@@ -245,6 +247,7 @@ impl DirOps for DeviceDirOps {
             }
             _ => return Err(SystemError::ENOENT),
         };
+        let mode = field.mode();
         Ok(dir
             .cached_children()
             .write()
@@ -255,7 +258,7 @@ impl DirOps for DeviceDirOps {
                         identity: self.identity.clone(),
                         field,
                     },
-                    InodeMode::from_bits_truncate(0o644),
+                    InodeMode::from_bits_truncate(mode),
                 )
                 .parent(dir.self_ref_weak().clone())
                 .sysctl_permissions()
@@ -280,6 +283,17 @@ enum DeviceField {
     Ipv6AcceptRa,
     Ipv6Autoconf(Setting),
     Ipv6Prefix(PrefixSetting),
+    StableSecret,
+}
+
+impl DeviceField {
+    fn mode(&self) -> u32 {
+        if matches!(self, Self::StableSecret) {
+            ipv6_stable_secret::MODE
+        } else {
+            0o644
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -306,7 +320,10 @@ impl FileOps for DeviceFileOps {
 
     fn sysctl_access_bits(&self) -> Result<Option<u32>, SystemError> {
         let (netns, _) = self.identity.resolve()?;
-        Ok(Some(SysctlNamespace::access_bits_for(&netns)))
+        Ok(Some(SysctlNamespace::access_bits_for_mode(
+            &netns,
+            self.field.mode(),
+        )))
     }
 
     fn owner(&self) -> Option<(usize, usize)> {
@@ -321,8 +338,15 @@ impl FileOps for DeviceFileOps {
         Some(|ops, offset, _, buf, _data| {
             let rtnl = rtnl::lock();
             let (netns, iface) = ops.identity.resolve()?;
-            if SysctlNamespace::access_bits_for(&netns) & 2 == 0 {
+            if SysctlNamespace::access_bits_for_mode(&netns, ops.field.mode()) & 2 == 0 {
                 return Err(SystemError::EPERM);
+            }
+            if matches!(ops.field, DeviceField::StableSecret) {
+                let current = ipv6_autoconf::device_stable_secret(iface.common());
+                if let Some(secret) = ipv6_stable_secret::parse_write(current, offset, buf)? {
+                    ipv6_autoconf::set_device_stable_secret(&rtnl, iface.common(), secret);
+                }
+                return Ok(PrimaryWriteResult::new(buf.len()));
             }
             if buf.is_empty() || offset != 0 {
                 return Ok(PrimaryWriteResult::new(buf.len()));
@@ -330,6 +354,7 @@ impl FileOps for DeviceFileOps {
             let (value, consumed) = parse_numeric_sysctl(buf)?;
             let value = i32::try_from(value).map_err(|_| SystemError::EINVAL)?;
             match ops.field {
+                DeviceField::StableSecret => unreachable!(),
                 DeviceField::RouteLocalnet => iface.common().set_route_localnet(&rtnl, value),
                 DeviceField::DisableIpv6 => set_device_ipv6_disabled(&rtnl, &netns, &iface, value)?,
                 DeviceField::Ipv6Forwarding => {
@@ -365,11 +390,23 @@ impl FileOps for DeviceFileOps {
         _data: MutexGuard<FilePrivateData>,
     ) -> Result<usize, SystemError> {
         let _rtnl = rtnl::lock();
-        let (_, iface) = self.identity.resolve()?;
+        let (netns, iface) = self.identity.resolve()?;
+        if matches!(self.field, DeviceField::StableSecret) {
+            if SysctlNamespace::access_bits_for_mode(&netns, self.field.mode()) & 4 == 0 {
+                return Err(SystemError::EPERM);
+            }
+            return ipv6_stable_secret::read(
+                ipv6_autoconf::device_stable_secret(iface.common()),
+                offset,
+                len,
+                buf,
+            );
+        }
         if offset != 0 {
             return Ok(0);
         }
         let value = match self.field {
+            DeviceField::StableSecret => unreachable!(),
             DeviceField::RouteLocalnet => iface.common().route_localnet_value(),
             DeviceField::DisableIpv6 => iface.common().ipv6_disabled_value(),
             DeviceField::Ipv6Forwarding => iface.common().ipv6_forwarding(),

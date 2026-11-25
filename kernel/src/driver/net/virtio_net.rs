@@ -1433,6 +1433,11 @@ impl Iface for VirtioInterface {
         return wire::EthernetAddress::from_bytes(&mac);
     }
 
+    fn permanent_mac(&self) -> [u8; 6] {
+        // Virtio requires a device-provided MAC at probe time.
+        self.mac().0
+    }
+
     #[inline]
     fn iface_name(&self) -> String {
         return self.iface_common.name();

@@ -435,6 +435,7 @@ pub(super) fn addr_to_segment(
     let slaac = matches!(address.state, AddressState::Slaac(_));
     let mut flags = AddrMessageFlags::empty();
     flags.set(AddrMessageFlags::MANAGETEMPADDR, slaac);
+    flags.set(AddrMessageFlags::STABLE_PRIVACY, address.ipv6_stable);
     flags.set(AddrMessageFlags::PERMANENT, address.ipv6_permanent);
     if address.ipv6_nodad {
         flags.insert(AddrMessageFlags::NODAD);
@@ -499,7 +500,7 @@ pub(super) fn addr_to_segment(
             }
             attrs.push(AddrAttr::CacheInfo(cache));
         }
-        if slaac || address.ipv6_nodad || address.lifetimes.is_some() {
+        if slaac || address.ipv6_stable || address.ipv6_nodad || address.lifetimes.is_some() {
             attrs.push(AddrAttr::Flags(flags.bits().to_ne_bytes().to_vec()));
         }
         if slaac {

@@ -308,15 +308,17 @@ fn link_af_spec(request: &LinkSegment) -> Option<&[u8]> {
 
 fn ipv6_addr_gen_mode(
     data: &[u8],
-    common: Option<&IfaceCommon>,
+    device: Option<(&NetNamespace, &IfaceCommon)>,
 ) -> Result<Option<u8>, SystemError> {
     let mut mode = None;
     for family in parse_nested_link_attrs(data)? {
-        if family.kind != AddressFamily::INet6 as u16
-            || !common.is_some_and(IfaceCommon::ipv6_device_present)
-        {
+        if family.kind != AddressFamily::INet6 as u16 {
             return Err(SystemError::EAFNOSUPPORT);
         }
+        let Some((netns, common)) = device.filter(|(_, common)| common.ipv6_device_present())
+        else {
+            return Err(SystemError::EAFNOSUPPORT);
+        };
         let mut value = None;
         for attr in parse_nested_link_attrs(family.payload)? {
             if attr.kind != IFLA_INET6_ADDR_GEN_MODE {
@@ -326,6 +328,7 @@ fn ipv6_addr_gen_mode(
         }
         let value = value.ok_or(SystemError::EINVAL)?;
         AddressSetting::AddrGenMode.validate(i32::from(value))?;
+        ipv6_autoconf::validate_stable_mode(netns, common, i32::from(value))?;
         mode = Some(value);
     }
     Ok(mode)
@@ -343,7 +346,7 @@ pub(super) fn do_set_link(
     }
     let addr_gen_mode = if let Some(data) = link_af_spec(request_segment) {
         let iface = find_iface_for_link(request_segment, &source_netns)?;
-        ipv6_addr_gen_mode(data, Some(iface.common()))?
+        ipv6_addr_gen_mode(data, Some((&source_netns, iface.common())))?
     } else {
         None
     };

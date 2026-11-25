@@ -12,6 +12,7 @@
 #include <linux/veth.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <sched.h>
 #include <signal.h>
 #include <poll.h>
@@ -567,6 +568,46 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6AutoconfSettingsTrackRenameAndNamespaceMo
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "accept_dad", "1\n", "0\n");
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "dad_transmits", "1\n");
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "router_solicitations", "-1\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, StableSecretRequiresCurrentCredentials) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            const char path[] = "/proc/sys/net/ipv6/conf/default/stable_secret";
+            const char secret[] = "fd00::6\n";
+            const int input = open(path, O_RDONLY | O_CLOEXEC);
+            const int output = open(path, O_WRONLY | O_CLOEXEC);
+            ASSERT_GE(input, 0);
+            ASSERT_GE(output, 0);
+            ASSERT_EQ(write(output, secret, sizeof(secret) - 1),
+                      static_cast<ssize_t>(sizeof(secret) - 1));
+            struct stat metadata{};
+            ASSERT_EQ(stat(path, &metadata), 0);
+            EXPECT_EQ(metadata.st_mode & 0777, 0600u);
+
+            ASSERT_EQ(setgroups(0, nullptr), 0);
+            ASSERT_EQ(setgid(65534), 0);
+            ASSERT_EQ(setuid(65534), 0);
+            EXPECT_EQ(open(path, O_RDONLY | O_CLOEXEC), -1);
+            EXPECT_EQ(errno, EACCES);
+            EXPECT_EQ(open(path, O_WRONLY | O_CLOEXEC), -1);
+            EXPECT_EQ(errno, EACCES);
+            char data[64];
+            EXPECT_EQ(read(input, data, sizeof(data)), -1);
+            EXPECT_EQ(errno, EPERM);
+            EXPECT_EQ(write(output, secret, sizeof(secret) - 1), -1);
+            EXPECT_EQ(errno, EPERM);
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, Ipv6AddrGenModeRoundTripsAndRespectsMtu) {

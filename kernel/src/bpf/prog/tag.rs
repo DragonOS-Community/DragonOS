@@ -5,6 +5,8 @@
 
 use rbpf::ebpf;
 
+use crate::libs::sha1;
+
 fn tag_byte(bytes: &[u8], index: usize) -> u8 {
     if index % 8 < 4 {
         return bytes[index];
@@ -24,21 +26,15 @@ fn tag_byte(bytes: &[u8], index: usize) -> u8 {
 }
 
 pub(super) fn tag(bytes: &[u8]) -> [u8; 8] {
-    let mut state = [
-        0x6745_2301u32,
-        0xefcd_ab89,
-        0x98ba_dcfe,
-        0x1032_5476,
-        0xc3d2_e1f0,
-    ];
+    let mut state = sha1::INITIAL_STATE;
     let bit_len = (bytes.len() as u64).wrapping_mul(8);
     let total = (bytes.len() + 9).div_ceil(64) * 64;
 
     for base in (0..total).step_by(64) {
-        let mut words = [0u32; 80];
-        for i in 0..64 {
+        let mut block = [0u8; 64];
+        for (i, slot) in block.iter_mut().enumerate() {
             let index = base + i;
-            let byte = if index < bytes.len() {
+            *slot = if index < bytes.len() {
                 tag_byte(bytes, index)
             } else if index == bytes.len() {
                 0x80
@@ -47,35 +43,8 @@ pub(super) fn tag(bytes: &[u8]) -> [u8; 8] {
             } else {
                 0
             };
-            words[i / 4] |= (byte as u32) << (24 - (i % 4) * 8);
         }
-        for i in 16..80 {
-            words[i] = (words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16]).rotate_left(1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e] = state;
-        for (i, word) in words.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
-                _ => (b ^ c ^ d, 0xca62_c1d6),
-            };
-            let next = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = next;
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e]) {
-            *slot = slot.wrapping_add(value);
-        }
+        sha1::compress(&mut state, &block);
     }
 
     let mut result = [0u8; 8];

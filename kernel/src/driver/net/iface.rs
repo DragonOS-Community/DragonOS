@@ -74,6 +74,7 @@ pub(crate) struct AddressMetadata {
     pub state: AddressState,
     pub ipv6_nodad: bool,
     pub ipv6_permanent: bool,
+    pub ipv6_stable_dad_count: Option<u8>,
     pub lifetimes: Option<crate::net::address::ipv6_lifetime::Lifetimes>,
 }
 
@@ -86,6 +87,7 @@ impl AddressMetadata {
             state: AddressState::Configured,
             ipv6_nodad: false,
             ipv6_permanent: true,
+            ipv6_stable_dad_count: None,
             lifetimes: None,
         }
     }
@@ -413,6 +415,11 @@ pub trait Iface: crate::driver::base::device::Device {
     /// hold [`IfaceCommon::smol_iface`]. Implementations must therefore read
     /// device metadata directly and must not acquire `smol_iface` again.
     fn mac(&self) -> smoltcp::wire::EthernetAddress;
+
+    /// Hardware-provided address used by IPv6 stable address generation.
+    fn permanent_mac(&self) -> [u8; 6] {
+        [0; 6]
+    }
 
     /// # `name`
     /// 获取网卡名

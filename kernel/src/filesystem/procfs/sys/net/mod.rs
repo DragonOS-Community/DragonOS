@@ -2,6 +2,7 @@ mod bridge;
 mod device_conf;
 mod ipv4;
 mod ipv6;
+mod ipv6_stable_secret;
 mod namespace;
 
 use crate::filesystem::{

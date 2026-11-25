@@ -37,12 +37,16 @@ impl SysctlNamespace {
     }
 
     pub(super) fn access_bits_for(ns: &Arc<NetNamespace>) -> u32 {
+        Self::access_bits_for_mode(ns, 0o644)
+    }
+
+    pub(super) fn access_bits_for_mode(ns: &Arc<NetNamespace>, mode: u32) -> u32 {
         if ProcessManager::current_cred().euid.data() == 0
             || ns_capable(ns.user_ns(), CAPFlags::CAP_NET_ADMIN)
         {
-            6
+            (mode >> 6) & 7
         } else {
-            4
+            mode & 7
         }
     }
 

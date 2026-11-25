@@ -19,6 +19,7 @@ pub(crate) mod ipv6_autoconf;
 pub(crate) mod ipv6_lifetime;
 pub(in crate::net) mod ipv6_router_solicitation;
 pub(crate) mod ipv6_slaac;
+mod ipv6_stable_id;
 
 const IPV4_MIN_MTU: usize = 68;
 pub(crate) const IPV6_MIN_MTU: usize = 1280;
@@ -57,6 +58,7 @@ pub(crate) struct AddressInfo {
     pub state: AddressState,
     pub ipv6_nodad: bool,
     pub ipv6_permanent: bool,
+    pub ipv6_stable: bool,
     pub lifetimes: Option<ipv6_lifetime::Lifetimes>,
 }
 
@@ -150,6 +152,7 @@ fn removed_address_info(
         state: entry.state,
         ipv6_nodad: entry.ipv6_nodad,
         ipv6_permanent: entry.ipv6_permanent,
+        ipv6_stable: entry.ipv6_stable_dad_count.is_some(),
         lifetimes: entry.lifetimes,
     })
 }
@@ -363,6 +366,7 @@ pub(in crate::net) fn address_at(
         state: entry.map(|entry| entry.state).unwrap_or_default(),
         ipv6_nodad: entry.is_some_and(|entry| entry.ipv6_nodad),
         ipv6_permanent: entry.is_none_or(|entry| entry.ipv6_permanent),
+        ipv6_stable: entry.is_some_and(|entry| entry.ipv6_stable_dad_count.is_some()),
         lifetimes: entry.and_then(|entry| entry.lifetimes),
     }))
 }
@@ -405,6 +409,7 @@ pub(in crate::net) fn address_info(
         state: entry.map(|entry| entry.state).unwrap_or_default(),
         ipv6_nodad: entry.is_some_and(|entry| entry.ipv6_nodad),
         ipv6_permanent: entry.is_none_or(|entry| entry.ipv6_permanent),
+        ipv6_stable: entry.is_some_and(|entry| entry.ipv6_stable_dad_count.is_some()),
         lifetimes: entry.and_then(|entry| entry.lifetimes),
     })
 }
@@ -846,6 +851,7 @@ fn commit_unpublished(
                 state: AddressState::Configured,
                 ipv6_nodad: false,
                 ipv6_permanent: true,
+                ipv6_stable_dad_count: None,
                 lifetimes: None,
             });
             outcome
@@ -865,6 +871,7 @@ fn commit_unpublished(
                     state: AddressState::Configured,
                     ipv6_nodad: false,
                     ipv6_permanent: true,
+                    ipv6_stable_dad_count: None,
                     lifetimes: None,
                 });
             }
@@ -989,6 +996,7 @@ fn commit_published(
                     state,
                     ipv6_nodad: options.ipv6_nodad.unwrap_or(false),
                     ipv6_permanent,
+                    ipv6_stable_dad_count: None,
                     lifetimes: ipv6_lifetimes,
                 });
                 AddressMutationOutcome::Added(cidr)
@@ -1070,6 +1078,7 @@ fn prepare_automatic_address(
     cidr: IpCidr,
     state: AddressState,
     lifetimes: Option<ipv6_lifetime::Lifetimes>,
+    stable_dad_count: Option<u8>,
 ) -> Result<crate::net::route::PreparedAddressRouteCommit, SystemError> {
     let AddressCandidates {
         before,
@@ -1092,6 +1101,7 @@ fn prepare_automatic_address(
         }
         entry.state = state;
         entry.lifetimes = lifetimes;
+        entry.ipv6_stable_dad_count = stable_dad_count;
     } else {
         metadata.push(AddressMetadata {
             cidr,
@@ -1100,6 +1110,7 @@ fn prepare_automatic_address(
             state,
             ipv6_nodad: false,
             ipv6_permanent: !matches!(state, AddressState::Slaac(_)),
+            ipv6_stable_dad_count: stable_dad_count,
             lifetimes,
         });
     }
@@ -1190,6 +1201,7 @@ fn try_clone_metadata(
             state: entry.state,
             ipv6_nodad: entry.ipv6_nodad,
             ipv6_permanent: entry.ipv6_permanent,
+            ipv6_stable_dad_count: entry.ipv6_stable_dad_count,
             lifetimes: entry.lifetimes,
         });
     }

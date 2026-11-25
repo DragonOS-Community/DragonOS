@@ -4,13 +4,14 @@
 //! lifecycle and keeps driver-specific bookkeeping out of the ABI parser.
 
 use alloc::sync::Arc;
+use intertrait::cast::CastArc;
 use system_error::SystemError;
 
 use crate::{
     driver::{
         base::kobject::KObject,
         net::{
-            bridge::BridgeIface,
+            bridge::{BridgeEnableDevice, BridgeIface},
             napi::{napi_enable, napi_resume},
             prepare_unregister_netdevices_from_locked, prepare_unregister_netdevices_locked,
             register_netdevice_locked,
@@ -217,9 +218,19 @@ pub(crate) fn delete_link(
     let first_bridge = if let Some(master) = first_master.as_ref() {
         if shared_master {
             let peer = peer.as_ref().ok_or(SystemError::ENODEV)?;
-            Some(master.prepare_remove_ports(rtnl, netns, &[veth.clone(), peer.clone()], None)?)
+            Some(master.prepare_remove_ports(
+                rtnl,
+                netns,
+                [veth.clone() as Arc<dyn BridgeEnableDevice>, peer.clone()].into_iter(),
+                None,
+            )?)
         } else {
-            Some(master.prepare_remove_ports(rtnl, netns, core::slice::from_ref(&veth), None)?)
+            Some(master.prepare_remove_ports(
+                rtnl,
+                netns,
+                core::iter::once(veth.clone() as Arc<dyn BridgeEnableDevice>),
+                None,
+            )?)
         }
     } else {
         None
@@ -234,7 +245,12 @@ pub(crate) fn delete_link(
         } else {
             None
         };
-        Some(master.prepare_remove_ports(rtnl, owner, core::slice::from_ref(peer), staged)?)
+        Some(master.prepare_remove_ports(
+            rtnl,
+            owner,
+            core::iter::once(peer.clone() as Arc<dyn BridgeEnableDevice>),
+            staged,
+        )?)
     } else {
         None
     };
@@ -373,8 +389,11 @@ pub(crate) fn set_master(
     iface: Arc<dyn Iface>,
     master: Option<Arc<dyn Iface>>,
 ) -> Result<(), SystemError> {
-    let veth = as_veth(iface).ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
-    if !veth
+    let kobject: Arc<dyn KObject> = iface;
+    let port = kobject
+        .cast::<dyn BridgeEnableDevice>()
+        .map_err(|_| SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
+    if !port
         .net_namespace()
         .is_some_and(|owner| Arc::ptr_eq(&owner, netns))
     {
@@ -389,14 +408,14 @@ pub(crate) fn set_master(
             {
                 return Err(SystemError::EINVAL);
             }
-            if let Some(commit) = bridge.add_port(rtnl, netns, veth)? {
+            if let Some(commit) = bridge.add_port(rtnl, netns, port)? {
                 crate::net::socket::netlink::notify_link_commit(netns, commit);
             }
             Ok(())
         }
         None => {
-            let bridge = veth.bridge_master().ok_or(SystemError::EINVAL)?;
-            if let Some(commit) = bridge.remove_port(rtnl, netns, veth)? {
+            let bridge = port.bridge_master().ok_or(SystemError::EINVAL)?;
+            if let Some(commit) = bridge.remove_port(rtnl, netns, port)? {
                 crate::net::socket::netlink::notify_link_commit(netns, commit);
             }
             Ok(())

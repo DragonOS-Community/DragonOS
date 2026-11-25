@@ -86,17 +86,32 @@ impl super::PacketSocket {
     }
 
     pub(super) fn revert_all_memberships(&self, _rtnl_guard: &crate::net::rtnl::RtnlGuard) {
-        let entries = {
+        let mut entries = {
             let mut state = self.memberships.lock();
             state.closed = true;
             core::mem::take(&mut state.entries)
         };
 
-        for entry in entries {
-            if let Ok(iface) = self.find_iface(entry.mreq.mr_ifindex as u32) {
+        // Close may retire many individual addresses. Apply all references
+        // before waiting for the hardware projection once per interface.
+        entries.sort_unstable_by_key(|entry| entry.mreq.mr_ifindex);
+        for group in entries.chunk_by(|a, b| a.mreq.mr_ifindex == b.mreq.mr_ifindex) {
+            let Ok(iface) = self.find_iface(group[0].mreq.mr_ifindex as u32) else {
+                continue;
+            };
+            let mut filter_changed = false;
+            let mut flags_changed = false;
+            for entry in group {
                 if apply_membership(&iface, &entry.mreq, -1).is_ok() {
-                    notify_membership_change(&iface, &entry.mreq);
+                    filter_changed |= changes_filter(&entry.mreq);
+                    flags_changed |= changes_flags(&entry.mreq);
                 }
+            }
+            if filter_changed {
+                iface.sync_receive_filter_after_link_change();
+            }
+            if flags_changed {
+                crate::net::socket::netlink::notify_link_change(&iface);
             }
         }
     }
@@ -144,15 +159,40 @@ fn apply_membership(
     match mreq.mr_type {
         packet_mreq_type::PACKET_MR_PROMISC => common.adjust_promiscuity(inc),
         packet_mreq_type::PACKET_MR_ALLMULTI => common.adjust_allmulti(inc),
+        packet_mreq_type::PACKET_MR_MULTICAST | packet_mreq_type::PACKET_MR_UNICAST
+            if iface.supports_packet_mac_filter() =>
+        {
+            let address = smoltcp::wire::EthernetAddress::from_bytes(&mreq.mr_address[..6]);
+            common.adjust_packet_mac(
+                address,
+                mreq.mr_type == packet_mreq_type::PACKET_MR_MULTICAST,
+                inc,
+            )
+        }
         _ => Ok(()),
     }
 }
 
-fn notify_membership_change(iface: &Arc<dyn Iface>, mreq: &PacketMreq) {
-    if matches!(
+fn changes_flags(mreq: &PacketMreq) -> bool {
+    matches!(
         mreq.mr_type,
         packet_mreq_type::PACKET_MR_PROMISC | packet_mreq_type::PACKET_MR_ALLMULTI
-    ) {
+    )
+}
+
+fn changes_filter(mreq: &PacketMreq) -> bool {
+    changes_flags(mreq)
+        || matches!(
+            mreq.mr_type,
+            packet_mreq_type::PACKET_MR_MULTICAST | packet_mreq_type::PACKET_MR_UNICAST
+        )
+}
+
+fn notify_membership_change(iface: &Arc<dyn Iface>, mreq: &PacketMreq) {
+    if changes_filter(mreq) {
+        iface.sync_receive_filter_after_link_change();
+    }
+    if changes_flags(mreq) {
         crate::net::socket::netlink::notify_link_change(iface);
     }
 }

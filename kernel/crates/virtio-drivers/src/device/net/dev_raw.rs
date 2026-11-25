@@ -1,3 +1,4 @@
+use super::control::{ControlQueue, RxFilterCommand, QUEUE_CONTROL};
 use super::{
     Config, EthernetAddress, Features, HeaderLayout, ReceiveMetadata, ReceiveParser, RxOffloads,
     MIN_GSO_RX_BUFFER_LEN,
@@ -29,6 +30,7 @@ pub struct VirtIONetRaw<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
     guest_csum: bool,
     rx_offloads: RxOffloads,
     stopped: bool,
+    control: Option<ControlQueue<H>>,
     #[cfg(feature = "alloc")]
     recv_queue: Box<VirtQueue<H, QUEUE_SIZE>>,
     #[cfg(not(feature = "alloc"))]
@@ -57,14 +59,33 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
 
     /// Enable only receive segmentation formats the caller can consume through
     /// ReceiveParser metadata. Ordinary packet APIs continue to reject GSO.
-    pub fn new_with_rx_offloads(mut transport: T, offloads: RxOffloads) -> Result<Self> {
+    pub fn new_with_rx_offloads(transport: T, offloads: RxOffloads) -> Result<Self> {
+        Self::new_with_features(transport, offloads, false)
+    }
+
+    /// Also negotiate the receive-filter control queue on modern transports.
+    /// Devices without this optional feature still expose the data queues.
+    pub fn new_with_rx_filter(transport: T, offloads: RxOffloads) -> Result<Self> {
+        Self::new_with_features(transport, offloads, true)
+    }
+
+    fn new_with_features(mut transport: T, offloads: RxOffloads, rx_filter: bool) -> Result<Self> {
         if offloads.contains(RxOffloads::ECN)
             && !offloads.intersects(RxOffloads::TCPV4 | RxOffloads::TCPV6)
         {
             return Err(Error::InvalidParam);
         }
-        let negotiated_features =
-            transport.try_begin_init(SUPPORTED_FEATURES | offloads.features())?;
+        let mut features = SUPPORTED_FEATURES | offloads.features();
+        if rx_filter && !transport.requires_legacy_layout() {
+            features |= Features::CTRL_VQ | Features::CTRL_RX;
+        }
+        let negotiated_features = transport.try_begin_init(features)?;
+        if negotiated_features.contains(Features::CTRL_RX)
+            && !negotiated_features.contains(Features::CTRL_VQ)
+        {
+            Self::stop_transport(&mut transport);
+            return Err(Error::Unsupported);
+        }
         let rx_offloads = RxOffloads::negotiated(negotiated_features);
         if (!rx_offloads.is_empty() && !negotiated_features.contains(Features::GUEST_CSUM))
             || (rx_offloads.contains(RxOffloads::ECN)
@@ -132,6 +153,22 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
             }
         };
 
+        let control = if negotiated_features.contains(Features::CTRL_VQ) {
+            match ControlQueue::new(
+                &mut transport,
+                negotiated_features.contains(Features::RING_EVENT_IDX),
+                negotiated_features.contains(Features::CTRL_RX),
+            ) {
+                Ok(queue) => Some(queue),
+                Err(error) => {
+                    Self::stop_transport(&mut transport);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
         transport.set_status(transport.get_status() | crate::transport::DeviceStatus::DRIVER_OK);
 
         Ok(VirtIONetRaw {
@@ -141,6 +178,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
             guest_csum: negotiated_features.contains(Features::GUEST_CSUM),
             rx_offloads,
             stopped: false,
+            control,
             recv_queue,
             send_queue,
         })
@@ -172,6 +210,29 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
         } else {
             Ok(())
         }
+    }
+
+    /// Whether this device accepted receive-filter control commands.
+    pub fn supports_rx_filter(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(ControlQueue::supports_rx_filter)
+    }
+
+    /// Begin one receive-filter command. Only one command may be in flight.
+    pub fn start_rx_filter(&mut self, command: RxFilterCommand<'_>) -> Result<()> {
+        self.ensure_active()?;
+        self.control
+            .as_mut()
+            .ok_or(Error::Unsupported)?
+            .start(&mut self.transport, command)
+    }
+
+    /// Poll the pending command. An explicit refusal is a completed command.
+    /// On a completion error the owner must stop issuing control commands.
+    pub fn poll_rx_filter(&mut self) -> Result<Option<bool>> {
+        self.ensure_active()?;
+        self.control.as_mut().ok_or(Error::Unsupported)?.poll()
     }
 
     /// Acknowledge interrupt.
@@ -512,5 +573,10 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> Drop for VirtIONetRaw<H, T, 
         self.stop_dma();
         self.transport.queue_unset(QUEUE_RECEIVE);
         self.transport.queue_unset(QUEUE_TRANSMIT);
+        if let Some(control) = self.control.as_mut() {
+            // stop_dma has confirmed that no descriptor can still be in use.
+            unsafe { control.detach_after_reset() };
+            self.transport.queue_unset(QUEUE_CONTROL);
+        }
     }
 }

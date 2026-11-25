@@ -1,5 +1,5 @@
 use super::*;
-use crate::{driver::net::bridge::BridgeEnableDevice, net::rtnl::RtnlGuard};
+use crate::net::rtnl::RtnlGuard;
 
 const IFLA_BRPORT_MODE: u16 = 4;
 
@@ -15,9 +15,7 @@ pub(super) fn set_hairpin(
         .cloned()
         .ok_or(SystemError::ENODEV)?;
     let membership = iface
-        .as_any_ref()
-        .downcast_ref::<VethInterface>()
-        .and_then(BridgeEnableDevice::common_bridge_data)
+        .bridge_port_data()
         .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?;
 
     let mut protinfo = None;
@@ -63,9 +61,7 @@ pub(in crate::net::socket::netlink::route::kern) fn port_to_link_message(
     iface: &Arc<dyn Iface>,
 ) -> Result<Option<LinkSegment>, SystemError> {
     let Some((master, hairpin)) = iface
-        .as_any_ref()
-        .downcast_ref::<VethInterface>()
-        .and_then(BridgeEnableDevice::common_bridge_data)
+        .bridge_port_data()
         .and_then(|membership| membership.hairpin_state())
     else {
         return Ok(None);

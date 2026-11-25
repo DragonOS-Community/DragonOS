@@ -140,7 +140,7 @@ impl Bridge {
         }
     }
 
-    pub fn add_port(&mut self, id: BridgePortId, port: BridgePort) -> Result<(), SystemError> {
+    pub(super) fn reserve_port(&mut self) -> Result<(), SystemError> {
         self.ports.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
         // Reserve for the worst case where every attached port later gets a
         // distinct MAC. MAC changes can then update this map without an OOM
@@ -154,10 +154,13 @@ impl Bridge {
         self.port_local_macs
             .try_reserve(extra_local_macs)
             .map_err(|_| SystemError::ENOMEM)?;
+        Ok(())
+    }
+
+    pub(super) fn add_port(&mut self, port: BridgePort) {
         let mac = port.bridge_enable.mac();
         *self.port_local_macs.entry(mac).or_insert(0) += 1;
-        self.ports.insert(id, port);
-        Ok(())
+        self.ports.insert(port.id, port);
     }
 
     pub fn remove_port(&mut self, port_id: BridgePortId) -> Option<BridgePort> {

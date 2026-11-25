@@ -5,7 +5,8 @@ use alloc::boxed::Box;
 use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
 
 pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>>;
-type ReceiveFilter = dyn Fn(&smoltcp::iface::Interface, InterfaceFlags) + Send + Sync;
+pub(super) type ReceiveFilter =
+    dyn Fn(&smoltcp::iface::Interface, InterfaceFlags, &[(PacketMacMembership, u32)]) + Send + Sync;
 
 fn poll_smol<D: SmolDevice + ?Sized>(
     interface: &mut smoltcp::iface::Interface,
@@ -318,6 +319,8 @@ impl IfaceCommon {
                 configured_flags: flags.bits(),
                 packet_promiscuity: 0,
                 packet_allmulti: 0,
+                bridge_receive: false,
+                packet_macs: Vec::new(),
             }),
         }
     }
@@ -332,7 +335,8 @@ impl IfaceCommon {
     /// serialize hardware projection with address and membership updates.
     pub(crate) fn sync_receive_filter(&self, iface: &smoltcp::iface::Interface) {
         if let Some(filter) = &self.receive_filter {
-            filter(iface, self.flags());
+            let mode = self.receive_mode.lock();
+            filter(iface, self.flags(), &mode.packet_macs);
         }
     }
 
@@ -719,6 +723,10 @@ impl IfaceCommon {
             return false;
         }
         self.local_input_queue.release_neighbor(oif, next_hop)
+    }
+
+    pub(super) fn has_ready_local_work(&self, now: smoltcp::time::Instant) -> bool {
+        self.has_local_input() || self.local_input_queue.has_ready_output(now)
     }
 
     pub(super) fn has_local_work(&self) -> bool {
@@ -2199,10 +2207,12 @@ impl IfaceCommon {
         Self::total_receive_mode_count(
             state.packet_promiscuity,
             configured & InterfaceFlags::PROMISC.bits() != 0,
+            state.bridge_receive,
         )?;
         Self::total_receive_mode_count(
             state.packet_allmulti,
             configured & InterfaceFlags::ALLMULTI.bits() != 0,
+            state.bridge_receive,
         )?;
 
         Ok(PreparedConfiguredFlags {
@@ -2237,10 +2247,12 @@ impl IfaceCommon {
             promiscuity: Self::total_receive_mode_count(
                 state.packet_promiscuity,
                 configured.contains(InterfaceFlags::PROMISC),
+                state.bridge_receive,
             )?,
             allmulti: Self::total_receive_mode_count(
                 state.packet_allmulti,
                 configured.contains(InterfaceFlags::ALLMULTI),
+                state.bridge_receive,
             )?,
         })
     }
@@ -2455,6 +2467,48 @@ impl IfaceCommon {
         }
     }
 
+    pub(crate) fn adjust_packet_mac(
+        &self,
+        address: smoltcp::wire::EthernetAddress,
+        multicast: bool,
+        inc: i32,
+    ) -> Result<(), SystemError> {
+        if self.receive_filter.is_none() {
+            return Ok(());
+        }
+        let mut mode = self.receive_mode.lock();
+        let membership = PacketMacMembership { address, multicast };
+        let existing = mode
+            .packet_macs
+            .iter()
+            .position(|(key, _)| *key == membership);
+        match (inc, existing) {
+            (1, Some(index)) => {
+                let count = &mut mode.packet_macs[index].1;
+                *count = count.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+                return Ok(());
+            }
+            (1, None) => {
+                mode.packet_macs
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOBUFS)?;
+                mode.packet_macs.push((membership, 1));
+            }
+            (-1, Some(index)) => {
+                let count = &mut mode.packet_macs[index].1;
+                *count -= 1;
+                if *count != 0 {
+                    return Ok(());
+                }
+                mode.packet_macs.remove(index);
+            }
+            _ => return Err(SystemError::EINVAL),
+        }
+        drop(mode);
+        self.sync_receive_filter(&self.smol_iface.lock());
+        Ok(())
+    }
+
     pub fn adjust_promiscuity(&self, inc: i32) -> Result<(), SystemError> {
         self.adjust_receive_mode(InterfaceFlags::PROMISC, inc)
     }
@@ -2482,7 +2536,7 @@ impl IfaceCommon {
             _ => return Err(SystemError::EINVAL),
         };
         let configured = state.configured_flags & flag.bits() != 0;
-        Self::total_receive_mode_count(new, configured)?;
+        Self::total_receive_mode_count(new, configured, state.bridge_receive)?;
 
         if flag == InterfaceFlags::PROMISC {
             state.packet_promiscuity = new;
@@ -2500,18 +2554,42 @@ impl IfaceCommon {
     pub(super) fn total_receive_mode_count(
         packet: u32,
         configured: bool,
+        bridge_receive: bool,
     ) -> Result<u32, SystemError> {
         packet
-            .checked_add(u32::from(configured))
+            .checked_add(u32::from(configured) + u32::from(bridge_receive))
             .ok_or(SystemError::EOVERFLOW)
+    }
+
+    /// Hold one receive-mode reference for a physical bridge port.
+    pub(super) fn set_bridge_receive_mode(&self, enabled: bool) -> Result<(), SystemError> {
+        let mut state = self.receive_mode.lock();
+        let configured = InterfaceFlags::from_bits_truncate(state.configured_flags);
+        Self::total_receive_mode_count(
+            state.packet_promiscuity,
+            configured.contains(InterfaceFlags::PROMISC),
+            enabled,
+        )?;
+        Self::total_receive_mode_count(
+            state.packet_allmulti,
+            configured.contains(InterfaceFlags::ALLMULTI),
+            enabled,
+        )?;
+        state.bridge_receive = enabled;
+        let changed = self.publish_effective_flags(&state);
+        drop(state);
+        if changed {
+            self.sync_receive_filter(&self.smol_iface.lock());
+        }
+        Ok(())
     }
 
     fn publish_effective_flags(&self, state: &ReceiveModeState) -> bool {
         let mut effective = state.configured_flags;
-        if state.packet_promiscuity != 0 {
+        if state.packet_promiscuity != 0 || state.bridge_receive {
             effective |= InterfaceFlags::PROMISC.bits();
         }
-        if state.packet_allmulti != 0 {
+        if state.packet_allmulti != 0 || state.bridge_receive {
             effective |= InterfaceFlags::ALLMULTI.bits();
         }
         let previous = self.flags.swap(effective, Ordering::AcqRel);

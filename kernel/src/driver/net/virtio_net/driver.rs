@@ -70,7 +70,7 @@ impl VirtIODriver for VirtIONetDriver {
             })?;
 
         let iface: Arc<VirtioInterface> =
-            VirtioInterface::new(virtio_net_device.device_inner.clone());
+            VirtioInterface::new(virtio_net_device.device_inner.clone())?;
         // 标识网络设备已经启动
         iface.set_net_state(NetDeivceState::__LINK_STATE_START);
         // 设置iface的父设备为virtio_net_device

@@ -49,8 +49,18 @@ fn overwrite_completion(
     id: Option<u32>,
     len: Option<u32>,
 ) {
+    overwrite_completion_slot(state, queue, 0, id, len);
+}
+
+fn overwrite_completion_slot(
+    state: &Arc<Mutex<State>>,
+    queue: usize,
+    slot: usize,
+    id: Option<u32>,
+    len: Option<u32>,
+) {
     let state = state.lock().unwrap();
-    let used = state.queues[queue].device_area as *mut u8;
+    let used = (state.queues[queue].device_area + slot * 8) as *mut u8;
     unsafe {
         if let Some(id) = id {
             used.add(4).cast::<u32>().write_volatile(id);
@@ -956,4 +966,102 @@ fn metadata_api_queue_error_keeps_dma_ownership_until_real_reclamation() {
         .is_some());
     drop(net);
     assert_no_dma_owners();
+}
+
+#[test]
+fn rx_filter_control_preserves_data_only_devices() {
+    for (legacy, features, expected_queues, rx_filter) in [
+        (false, Features::empty(), 2, false),
+        (false, Features::CTRL_VQ, 3, false),
+        (false, Features::CTRL_VQ | Features::CTRL_RX, 3, true),
+        (true, Features::CTRL_VQ | Features::CTRL_RX, 2, false),
+    ] {
+        let mut config = config();
+        let (mut transport, state) = transport(&mut config, legacy);
+        transport.device_features |= features.bits();
+        state.lock().unwrap().queues.push(QueueStatus::default());
+        let mut net = Raw::new_with_rx_filter(transport, RxOffloads::empty()).unwrap();
+        assert_eq!(state.lock().unwrap().queue_sets, expected_queues);
+        assert_eq!(net.supports_rx_filter(), rx_filter);
+        if !rx_filter {
+            assert_eq!(
+                net.start_rx_filter(RxFilterCommand::Promiscuous(true)),
+                Err(Error::Unsupported)
+            );
+        }
+    }
+}
+
+#[test]
+fn rx_filter_serializes_commands_and_reports_device_refusal() {
+    let mut config = config();
+    let (mut transport, state) = transport(&mut config, false);
+    transport.device_features |= (Features::CTRL_VQ | Features::CTRL_RX).bits();
+    state.lock().unwrap().queues.push(QueueStatus::default());
+    let mut net = Raw::new_with_rx_filter(transport, RxOffloads::empty()).unwrap();
+    net.start_rx_filter(RxFilterCommand::Promiscuous(true))
+        .unwrap();
+    assert_eq!(net.poll_rx_filter(), Ok(None));
+    assert_eq!(
+        net.start_rx_filter(RxFilterCommand::AllMulticast(true)),
+        Err(Error::AlreadyUsed)
+    );
+    state.lock().unwrap().read_write_queue::<2>(2, |request| {
+        assert_eq!(request, [0, 0, 1]);
+        vec![1]
+    });
+    // The fake helper includes bytes read in used.len. The device should
+    // report only the status byte written to this modern queue.
+    overwrite_completion_slot(&state, 2, 0, None, Some(1));
+    assert_eq!(net.poll_rx_filter(), Ok(Some(false)));
+
+    let unicast = [[0x02, 0, 0, 0, 0, 2]];
+    let multicast = [[0x33, 0x33, 0, 0, 0, 1]];
+    net.start_rx_filter(RxFilterCommand::MacTable {
+        unicast: &unicast,
+        multicast: &multicast,
+    })
+    .unwrap();
+    state.lock().unwrap().read_write_queue::<2>(2, |request| {
+        assert_eq!(
+            request,
+            [1, 0, 1, 0, 0, 0, 0x02, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0x33, 0x33, 0, 0, 0, 1]
+        );
+        vec![0]
+    });
+    overwrite_completion_slot(&state, 2, 1, None, Some(1));
+    assert_eq!(net.poll_rx_filter(), Ok(Some(true)));
+}
+
+#[test]
+fn pending_control_command_keeps_dma_until_reset() {
+    let mut config = config();
+    let (mut transport, state) = transport(&mut config, false);
+    transport.device_features |= (Features::CTRL_VQ | Features::CTRL_RX).bits();
+    state.lock().unwrap().queues.push(QueueStatus::default());
+    state.lock().unwrap().reset_delay = Some(4);
+    OWNERSHIP.with(|owner| {
+        *owner.borrow_mut() = Ownership {
+            require_reset_for_unshare: true,
+            state: Some(state.clone()),
+            ..Default::default()
+        }
+    });
+    let mut net =
+        VirtIONetRaw::<TrackingHal, _, SIZE>::new_with_rx_filter(transport, RxOffloads::empty())
+            .unwrap();
+    net.start_rx_filter(RxFilterCommand::AllMulticast(true))
+        .unwrap();
+    assert_eq!(net.poll_rx_filter(), Ok(None));
+    state.lock().unwrap().read_write_queue::<2>(2, |_| vec![0]);
+    overwrite_completion(&state, 2, Some(u32::MAX), Some(1));
+    assert_eq!(net.poll_rx_filter(), Err(Error::IoError));
+    assert_eq!(
+        net.start_rx_filter(RxFilterCommand::Promiscuous(true)),
+        Err(Error::AlreadyUsed)
+    );
+    assert_eq!(OWNERSHIP.with(|owner| owner.borrow().shares), 2);
+    drop(net);
+    assert_no_dma_owners();
+    assert_eq!(state.lock().unwrap().reset_acks, 1);
 }

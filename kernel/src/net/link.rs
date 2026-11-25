@@ -18,7 +18,6 @@ use crate::{
             napi::{napi_pause_and_wait, napi_resume, napi_schedule},
             sysfs::prepare_netdev_sysfs_rename,
             types::InterfaceFlags,
-            veth::VethInterface,
             Iface, NetDeivceState, Operstate, PreparedConfiguredFlags,
         },
     },
@@ -189,19 +188,16 @@ pub(crate) fn mutate_link(
 ) -> Result<LinkMutationCommit, SystemError> {
     let iface = resolve_iface(netns, target)?;
     let prepared = PreparedLinkMutation::prepare(rtnl, netns.clone(), iface, update, None)?;
-    let bridge_update = if let Some(mtu) = prepared.mtu {
-        if let Some(veth) = prepared.iface.as_any_ref().downcast_ref::<VethInterface>() {
-            if let Some(bridge) = veth.bridge_master() {
-                bridge.prepare_port_mtu_change(rtnl, netns, veth, mtu, prepared.staged_fib())?
+    let bridge_update =
+        if let Some((mtu, port)) = prepared.mtu.zip(prepared.iface.bridge_port_data()) {
+            if let Some(bridge) = port.master() {
+                bridge.prepare_port_mtu_change(rtnl, netns, port.id, mtu, prepared.staged_fib())?
             } else {
                 None
             }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
     // Reserve storage for the one possible master-bridge notification before
     // publishing either device. Allocation must not follow the first commit.
     let related_slot = if bridge_update.is_some() {
@@ -483,6 +479,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         };
 
         let removed_neighbors = neighbors.map(|plan| plan.publish()).unwrap_or_default();
+        iface.sync_receive_filter_after_link_change();
 
         if link_down || mtu.is_some_and(|mtu| mtu < super::address::IPV6_MIN_MTU) {
             super::address::ipv6_autoconf::cancel(iface.common());

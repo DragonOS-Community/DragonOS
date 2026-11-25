@@ -200,7 +200,6 @@ pub(crate) fn set_device_ipv6_disabled(
             was_up: up,
             is_up: up,
             ipv6_enabled: Some(enabled),
-            discard_learned_defaults: false,
             withdraw_ipv6_routes: false,
         },
     )?;
@@ -546,11 +545,10 @@ pub(in crate::net) fn prepare_link_address_change(
     let link_up = is_up && !was_up;
     let link_down = was_up && !is_up;
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
-    let current_mtu = iface.mtu();
-    let effective_mtu = mtu.unwrap_or(current_mtu);
+    let effective_mtu = mtu.unwrap_or_else(|| iface.mtu());
     let restore_ipv6_addresses = link_up && effective_mtu >= IPV6_MIN_MTU;
     let withdraw_ipv6_routes =
-        loopback && effective_mtu < IPV6_MIN_MTU && (mtu.is_some() || link_up);
+        effective_mtu < IPV6_MIN_MTU && (mtu.is_some() || (loopback && link_up));
     let reset_ipv6_addresses = link_down || withdraw_ipv6_routes;
     if mtu.is_none() && !link_up && !link_down {
         return Ok(None);
@@ -586,10 +584,7 @@ pub(in crate::net) fn prepare_link_address_change(
             IpCidr::Ipv6(_) => mtu < IPV6_MIN_MTU,
         })
     };
-    let discard_learned_defaults =
-        mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && current_mtu >= IPV6_MIN_MTU);
-    if !discard_learned_defaults
-        && !withdraw_ipv6_routes
+    if !withdraw_ipv6_routes
         && !remove_ipv6_addresses
         && restored.is_none()
         && retained_count == 0
@@ -690,7 +685,6 @@ pub(in crate::net) fn prepare_link_address_change(
         was_up,
         is_up,
         ipv6_enabled: None,
-        discard_learned_defaults,
         withdraw_ipv6_routes,
     };
     let routes = match staged_before {
@@ -1032,7 +1026,6 @@ fn commit_published(
             was_up: is_up,
             is_up,
             ipv6_enabled: None,
-            discard_learned_defaults: false,
             withdraw_ipv6_routes: false,
         },
     )?;
@@ -1110,7 +1103,6 @@ fn prepare_automatic_address(
             was_up: up,
             is_up: up,
             ipv6_enabled: None,
-            discard_learned_defaults: false,
             withdraw_ipv6_routes: false,
         },
     )

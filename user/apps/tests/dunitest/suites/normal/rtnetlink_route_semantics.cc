@@ -533,6 +533,21 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
             ASSERT_EQ(address(RTM_DELADDR, request, "fd83:5::1"), 0);
             EXPECT_FALSE(prefix("fd83:5::"));
 
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd95:1::"), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd95:1::1"), 0);
+            ASSERT_TRUE(prefix("fd95:1::"));
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fd95:2::",
+                                           80, edge, RT_SCOPE_UNIVERSE, ++seq),
+                      0);
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fd95:3::",
+                                           80, peer, RT_SCOPE_UNIVERSE, ++seq),
+                      0);
+            const auto ipv4 = MakeIpv4Route("198.18.95.0", 24, edge);
+            ASSERT_EQ(SendRouteRequest(route.Get(), RTM_NEWROUTE, add, ipv4, ++seq), 0);
+            ASSERT_TRUE(FindRoute(route.Get(), ipv4, ++seq));
+            FdGuard listener(OpenRouteListener(RTMGRP_IPV6_ROUTE));
+            ASSERT_GE(listener.Get(), 0) << ErrnoString(errno);
+
             std::memset(link_request, 0, sizeof(link_request));
             link->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
             link->nlmsg_type = RTM_NEWLINK;
@@ -548,6 +563,11 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
             ASSERT_EQ(RecvAck(route.Get(), seq), 0);
             EXPECT_FALSE(prefix("fd83:2::"));
             EXPECT_FALSE(prefix("fd83:3::"));
+            EXPECT_FALSE(prefix("fd95:1::"));
+            EXPECT_FALSE(prefix("fd95:2::"));
+            EXPECT_TRUE(FindIpv6Route(route.Get(), "fd95:3::", 80, peer, ++seq));
+            EXPECT_TRUE(FindRoute(route.Get(), ipv4, ++seq));
+            EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), "fd95:1::", 80, RTM_DELROUTE));
         }();
         _exit(testing::Test::HasFailure() ? 1 : 0);
     }

@@ -265,7 +265,6 @@ pub(crate) struct AddressLinkChange<'a> {
     pub was_up: bool,
     pub is_up: bool,
     pub ipv6_enabled: Option<bool>,
-    pub discard_learned_defaults: bool,
     pub withdraw_ipv6_routes: bool,
 }
 
@@ -289,7 +288,6 @@ impl PreparedAddressRouteCommit {
             was_up,
             is_up,
             ipv6_enabled,
-            discard_learned_defaults,
             withdraw_ipv6_routes,
         } = change;
         let was_ipv6_enabled = iface.common().ipv6_enabled();
@@ -304,14 +302,9 @@ impl PreparedAddressRouteCommit {
                     && entry.kind == RTN_LOCAL
                     && entry.scope == RT_SCOPE_HOST)
         };
+        let withdraw_ipv6_routes = disable_ipv6 || withdraw_ipv6_routes;
         let remove_for_ipv6 = |entry: RouteEntry| {
-            entry.oif == ifindex
-                && if disable_ipv6 || withdraw_ipv6_routes {
-                    !is_ipv4(entry.destination.address())
-                } else {
-                    discard_learned_defaults
-                        && (entry.learned_default().is_some() || entry.is_address_prefix())
-                }
+            withdraw_ipv6_routes && entry.oif == ifindex && !is_ipv4(entry.destination.address())
         };
         let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
         let inactive_count = metadata
@@ -415,7 +408,7 @@ impl PreparedAddressRouteCommit {
             }
             None => None,
         };
-        if disable_ipv6 || discard_learned_defaults || withdraw_ipv6_routes {
+        if withdraw_ipv6_routes {
             editor.remove_where(remove_for_ipv6)?;
         }
         let mut affected_oifs = editor.finish()?;

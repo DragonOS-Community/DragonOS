@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <net/if.h>
 #include <pthread.h>
 #include <poll.h>
@@ -20,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -372,6 +374,11 @@ struct ResetDuringCloseArgs {
     int poll_errno = 0;
     short poll_revents = 0;
     std::chrono::milliseconds poll_elapsed{};
+    int queued_bytes = -1;
+    int fionread_errno = 0;
+    int tcp_state = -1;
+    socklen_t tcp_info_length = 0;
+    int tcp_info_errno = 0;
 };
 
 void* ResetDuringCloseWorker(void* arg) {
@@ -403,6 +410,22 @@ void* ResetDuringCloseWorker(void* arg) {
             observation.poll_revents = pfd.revents;
             observation.poll_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start);
+            int queued_bytes = 0;
+            if (ioctl(args->fd, FIONREAD, &queued_bytes) == 0) {
+                observation.queued_bytes = queued_bytes;
+            } else {
+                observation.fionread_errno = errno;
+            }
+            tcp_info info{};
+            socklen_t length = sizeof(info);
+            if (getsockopt(args->fd, IPPROTO_TCP, TCP_INFO, &info, &length) == 0) {
+                observation.tcp_info_length = length;
+                if (length >= offsetof(tcp_info, tcpi_state) + sizeof(info.tcpi_state)) {
+                    observation.tcp_state = info.tcpi_state;
+                }
+            } else {
+                observation.tcp_info_errno = errno;
+            }
             args->result = kPollDuringCloseFailed;
             return nullptr;
         }
@@ -638,7 +661,12 @@ void ExpectConcurrentResetDuringClose(bool (*init_pair)(TcpPair*)) {
             ADD_FAILURE() << "worker " << i << ": poll returned " << observation.poll_result
                           << ", errno=" << observation.poll_errno
                           << ", revents=" << observation.poll_revents
-                          << ", elapsed_ms=" << observation.poll_elapsed.count();
+                          << ", elapsed_ms=" << observation.poll_elapsed.count()
+                          << ", queued_bytes=" << observation.queued_bytes
+                          << ", fionread_errno=" << observation.fionread_errno
+                          << ", tcp_state=" << observation.tcp_state
+                          << ", tcp_info_length=" << observation.tcp_info_length
+                          << ", tcp_info_errno=" << observation.tcp_info_errno;
         } else {
             EXPECT_EQ(nullptr, result) << "worker " << i << " failed";
         }

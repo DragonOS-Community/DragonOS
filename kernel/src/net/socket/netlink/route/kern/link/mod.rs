@@ -240,11 +240,12 @@ impl BridgeCarrierSnapshot {
     }
 
     fn related_to(iface: &Arc<dyn Iface>) -> [Option<Self>; 2] {
-        let Some(veth) = iface.as_any_ref().downcast_ref::<VethInterface>() else {
-            return [None, None];
-        };
-        let first = veth.bridge_master();
-        let second = veth.peer_veth_opt().and_then(|peer| peer.bridge_master());
+        let first = iface.bridge_master();
+        let second = iface
+            .as_any_ref()
+            .downcast_ref::<VethInterface>()
+            .and_then(VethInterface::peer_veth_opt)
+            .and_then(|peer| peer.bridge_master());
         let second = second.filter(|bridge| {
             first
                 .as_ref()

@@ -11,9 +11,7 @@ use crate::driver::base::kobject::{
     KObjType, KObject, KObjectCommonData, KObjectState, LockedKObjectState,
 };
 use crate::driver::base::kset::KSet;
-use crate::driver::net::bridge::{
-    sysfs::BridgePortSysfs, BridgeCommonData, BridgePort, BridgePortId,
-};
+use crate::driver::net::bridge::BridgePortState;
 use crate::driver::net::napi::{napi_schedule, NapiStruct};
 use crate::driver::net::register_netdevice;
 use crate::driver::net::types::InterfaceFlags;
@@ -82,15 +80,6 @@ impl Veth {
 
     pub fn set_peer_iface(&mut self, peer: &Arc<VethInterface>) {
         self.peer = Arc::downgrade(peer);
-    }
-
-    fn to_bridge(bridge_data: &BridgeCommonData, data: &[u8]) {
-        // log::info!("Veth {} sending data to bridge", self.name);
-        let Some(bridge) = bridge_data.bridge_driver_ref.upgrade() else {
-            log::warn!("Bridge has been dropped");
-            return;
-        };
-        bridge.handle_frame(bridge_data.id, data);
     }
 
     fn recv_local(&mut self) -> Option<PacketBuffer> {
@@ -183,7 +172,7 @@ impl VethDriver {
         crate::net::socket::packet::deliver_to_packet_sockets(&packet_iface, data, pkt_type);
 
         if let Some(bridge_data) = iface.common_bridge_data() {
-            Veth::to_bridge(&bridge_data, data);
+            bridge_data.receive(data);
             return IngressDisposition::Consumed;
         }
 
@@ -484,12 +473,14 @@ impl phy::Device for VethDriver {
 }
 
 #[cast_to([sync] Iface)]
+#[cast_to([sync] BridgeEnableDevice)]
 #[cast_to([sync] device::Device)]
 #[derive(Debug)]
 pub struct VethInterface {
     driver: VethDriver,
     common: IfaceCommon,
     mac_address: SpinLock<EthernetAddress>,
+    bridge_port: BridgePortState,
     inner: SpinLock<VethCommonData>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -500,20 +491,9 @@ pub struct VethCommonData {
     device_common: DeviceCommonData,
     kobj_common: KObjectCommonData,
     peer_veth: Weak<VethInterface>,
-
-    bridge_common_data: Option<BridgeCommonData>,
-    bridge_port_sysfs: Option<BridgePortSysfs>,
 }
 
 impl VethInterface {
-    pub(super) fn set_bridge_port_sysfs(&self, projection: BridgePortSysfs) {
-        self.inner.lock().bridge_port_sysfs = Some(projection);
-    }
-
-    pub(super) fn bridge_port_sysfs(&self) -> Option<BridgePortSysfs> {
-        self.inner.lock().bridge_port_sysfs.clone()
-    }
-
     /// A netns move must not carry protocol reassembly, fragments, neighbors,
     /// or multicast state across the namespace boundary. Prepare a fresh
     /// smoltcp interface before the move's irreversible sysfs transaction.
@@ -586,6 +566,7 @@ impl VethInterface {
                 iface,
             ),
             mac_address: SpinLock::new(mac_address),
+            bridge_port: BridgePortState::new(),
             inner: SpinLock::new(VethCommonData::default()),
             locked_kobj_state: LockedKObjectState::default(),
         });
@@ -636,13 +617,6 @@ impl VethInterface {
         iface2.set_peer_iface(&iface1);
 
         (iface1, iface2)
-    }
-
-    pub fn bridge_master(&self) -> Option<Arc<super::bridge::BridgeIface>> {
-        self.common_bridge_data()?
-            .bridge_driver_ref
-            .upgrade()?
-            .local_iface()
     }
 
     fn update_bridge_carrier(&self) {
@@ -1000,6 +974,10 @@ impl Iface for VethInterface {
         drop(local);
     }
 
+    fn bridge_port_state(&self) -> Option<&BridgePortState> {
+        Some(&self.bridge_port)
+    }
+
     fn publish_admin_state(&self, is_up: bool) {
         if is_up {
             self.driver.inner.lock().peer_ingress_enabled = true;
@@ -1017,36 +995,6 @@ impl BridgeEnableDevice for VethInterface {
         if self.common_bridge_data().is_some() {
             if let Some(_tx) = self.common.try_acquire_tx() {
                 let _ = self.driver.try_raw_transmit(frame);
-            }
-        }
-    }
-
-    fn set_common_bridge_data(&self, port: &BridgePort) {
-        // log::info!("Now set bridge port data for {}", self.name);
-        let mut inner = self.inner.lock();
-        let data = BridgeCommonData {
-            id: port.id,
-            bridge_driver_ref: port.bridge_driver_ref.clone(),
-        };
-        inner.bridge_common_data = Some(data);
-    }
-
-    fn common_bridge_data(&self) -> Option<BridgeCommonData> {
-        self.inner().bridge_common_data.clone()
-    }
-
-    fn clear_common_bridge_data(&self, bridge_id: BridgePortId) {
-        let mut inner = self.inner.lock();
-        if inner
-            .bridge_common_data
-            .as_ref()
-            .is_some_and(|data| data.id == bridge_id)
-        {
-            inner.bridge_common_data = None;
-            let projection = inner.bridge_port_sysfs.take();
-            drop(inner);
-            if let Some(projection) = projection {
-                projection.remove();
             }
         }
     }

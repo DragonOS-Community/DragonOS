@@ -200,14 +200,13 @@ impl BridgeIface {
         &self,
         rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
         netns: &Arc<NetNamespace>,
-        device: &VethInterface,
+        port_id: BridgePortId,
         new_mtu: usize,
         staged_before: Option<crate::net::link::StagedLinkFib<'_>>,
     ) -> Result<Option<crate::net::link::PreparedAutoMtu<'rtnl>>, SystemError> {
         if self.driver.mtu_set_by_user() {
             return Ok(None);
         }
-        let port_id = device.common_bridge_data().ok_or(SystemError::ENODEV)?.id;
         let bridge = self.driver.inner.lock();
         if !bridge.ports.contains_key(&port_id) {
             return Err(SystemError::ENODEV);
@@ -232,7 +231,7 @@ impl BridgeIface {
         &self,
         rtnl: &crate::net::rtnl::RtnlGuard,
         netns: &Arc<NetNamespace>,
-        device: Arc<VethInterface>,
+        device: Arc<dyn BridgeEnableDevice>,
     ) -> Result<Option<crate::net::link::LinkMutationCommit>, SystemError> {
         if device.common_bridge_data().is_some() {
             return Err(SystemError::EBUSY);
@@ -253,7 +252,10 @@ impl BridgeIface {
             projection.remove();
             return Err(error);
         }
-        device.set_bridge_port_sysfs(projection);
+        device
+            .bridge_port_state()
+            .expect("bridge device owns port state")
+            .set_projection(projection);
         Ok(mtu.map(|plan| plan.commit()))
     }
 
@@ -261,10 +263,10 @@ impl BridgeIface {
         &self,
         rtnl: &crate::net::rtnl::RtnlGuard,
         netns: &Arc<NetNamespace>,
-        device: Arc<VethInterface>,
+        device: Arc<dyn BridgeEnableDevice>,
     ) -> Result<Option<crate::net::link::LinkMutationCommit>, SystemError> {
         Ok(self
-            .prepare_remove_ports(rtnl, netns, core::slice::from_ref(&device), None)?
+            .prepare_remove_ports(rtnl, netns, core::iter::once(device), None)?
             .commit())
     }
 
@@ -275,7 +277,7 @@ impl BridgeIface {
         &self,
         rtnl: &'rtnl crate::net::rtnl::RtnlGuard,
         netns: &Arc<NetNamespace>,
-        devices: &[Arc<VethInterface>],
+        devices: impl ExactSizeIterator<Item = Arc<dyn BridgeEnableDevice>>,
         staged_before: Option<crate::net::link::StagedLinkFib<'_>>,
     ) -> Result<PreparedBridgePortRemoval<'rtnl>, SystemError> {
         let mut prepared = Vec::new();
@@ -291,10 +293,9 @@ impl BridgeIface {
             if !Arc::ptr_eq(&self.driver, &owner) || prepared.iter().any(|(id, _)| *id == data.id) {
                 return Err(SystemError::EINVAL);
             }
-            let port_device: Arc<dyn BridgeEnableDevice> = device.clone();
-            prepared.push((data.id, port_device));
+            prepared.push((data.id, device));
         }
-        // Query veth bridge data before taking the bridge lock: ingress can
+        // Query port bridge data before taking the bridge lock: ingress can
         // obtain the veth lock and then enter the bridge/FDB lock.
         let bridge = self.driver.inner.lock();
         for (id, device) in &prepared {

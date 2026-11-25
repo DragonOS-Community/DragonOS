@@ -864,6 +864,23 @@ pub trait Iface: crate::driver::base::device::Device {
     /// shared link core rather than by this driver hook.
     fn publish_admin_state(&self, _is_up: bool) {}
 
+    /// Driver-owned state for Ethernet devices which can join a bridge.
+    fn bridge_port_state(&self) -> Option<&super::bridge::BridgePortState> {
+        None
+    }
+
+    fn bridge_port_data(&self) -> Option<super::bridge::BridgeCommonData> {
+        self.bridge_port_state()?.data()
+    }
+
+    fn bridge_master(&self) -> Option<Arc<super::bridge::BridgeIface>> {
+        self.bridge_port_data()?.master()
+    }
+
+    /// Complete hardware receive-filter updates after link publication has
+    /// released FIB, smoltcp and data-path locks.
+    fn sync_receive_filter_after_link_change(&self) {}
+
     /// # 获取当前iface的napi结构体
     /// 默认返回None，表示不支持napi
     fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
@@ -1075,6 +1092,7 @@ pub(super) struct ReceiveModeState {
     pub(super) configured_flags: u32,
     pub(super) packet_promiscuity: u32,
     pub(super) packet_allmulti: u32,
+    pub(super) bridge_receive: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

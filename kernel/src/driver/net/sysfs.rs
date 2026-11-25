@@ -24,7 +24,6 @@ use system_error::SystemError;
 use super::{
     bridge::{self, BridgeIface},
     class::sys_class_net_instance,
-    veth::VethInterface,
     Iface, NetDeivceState, Operstate,
 };
 use crate::process::namespace::{net_namespace::NetNamespace, NamespaceOps};
@@ -90,9 +89,8 @@ pub(crate) fn prepare_netdev_sysfs_rename(
     new_name: String,
 ) -> Result<PreparedDeviceSysfsRename, SystemError> {
     let related = dev
-        .as_any_ref()
-        .downcast_ref::<VethInterface>()
-        .and_then(VethInterface::bridge_port_sysfs)
+        .bridge_port_state()
+        .and_then(bridge::BridgePortState::projection)
         .map(|projection| projection.prepare_rename(&new_name))
         .transpose()?;
     let rename = prepare_class_device_sysfs_rename(&(dev.clone() as Arc<dyn Device>), new_name)?;

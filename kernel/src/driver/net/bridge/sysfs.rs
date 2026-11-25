@@ -1,4 +1,4 @@
-use super::{BridgeEnableDevice, BridgeIface, VethInterface};
+use super::{BridgeEnableDevice, BridgeIface, Iface};
 use crate::{
     driver::base::kobject::KObject,
     filesystem::{
@@ -12,6 +12,7 @@ use crate::{
     libs::casting::DowncastArc,
 };
 use alloc::sync::Arc;
+use intertrait::cast::CastArc;
 use system_error::SystemError;
 
 const BRIDGE_PORTS: &str = "brif";
@@ -55,11 +56,11 @@ pub(in crate::driver::net) struct BridgePortSysfs {
 impl BridgePortSysfs {
     pub(super) fn create(
         bridge: &BridgeIface,
-        veth: &Arc<VethInterface>,
+        port_device: &Arc<dyn BridgeEnableDevice>,
     ) -> Result<Self, SystemError> {
         let sysfs = sysfs_instance();
         let bridge_inode = bridge.inode().ok_or(SystemError::ENODEV)?;
-        let device = veth.inode().ok_or(SystemError::ENODEV)?;
+        let device = port_device.inode().ok_or(SystemError::ENODEV)?;
         if bridge_inode.namespace() != device.namespace() {
             return Err(SystemError::EINVAL);
         }
@@ -69,7 +70,7 @@ impl BridgePortSysfs {
             .ok_or(SystemError::EIO)?;
         let link_name = device.try_name()?;
         let path = sysfs.child_relative_path(&links, &device, PORT_GROUP)?;
-        let kobj: Arc<dyn KObject> = veth.clone();
+        let kobj: Arc<dyn KObject> = port_device.clone();
         sysfs.create_groups(&kobj, &[&PortAttributes])?;
         let created = (|| {
             let port = device
@@ -184,9 +185,9 @@ impl Attribute for PortState {
 
     fn show(&self, kobj: Arc<dyn KObject>, buf: &mut [u8]) -> Result<usize, SystemError> {
         let membership = kobj
-            .as_any_ref()
-            .downcast_ref::<VethInterface>()
-            .and_then(BridgeEnableDevice::common_bridge_data)
+            .cast::<dyn Iface>()
+            .ok()
+            .and_then(|iface| iface.bridge_port_data())
             .ok_or(SystemError::ENODEV)?;
         let forwarding = membership.is_forwarding().ok_or(SystemError::ENODEV)?;
         sysfs_emit_str(buf, if forwarding { "3\n" } else { "0\n" })

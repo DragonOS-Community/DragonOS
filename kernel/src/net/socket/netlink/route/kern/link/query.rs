@@ -105,10 +105,10 @@ pub(in crate::net::socket::netlink::route::kern) fn iface_to_link_message(
         }
         attrs.push(LinkAttr::LinkInfo(info));
     }
+    if let Some(master) = iface.bridge_master() {
+        attrs.push(LinkAttr::Master(master.nic_id() as u32));
+    }
     if let Some(veth) = iface.as_any_ref().downcast_ref::<VethInterface>() {
-        if let Some(master) = veth.bridge_master() {
-            attrs.push(LinkAttr::Master(master.nic_id() as u32));
-        }
         if let Some(peer) = veth.peer_veth_opt() {
             if let (Some(owner), Some(peer_owner)) = (iface.net_namespace(), peer.net_namespace()) {
                 if !Arc::ptr_eq(&owner, &peer_owner) {

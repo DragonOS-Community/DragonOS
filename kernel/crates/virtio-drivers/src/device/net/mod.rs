@@ -1,12 +1,13 @@
 //! Driver for VirtIO network devices.
 
+mod control;
 #[cfg(feature = "alloc")]
 mod dev;
 mod dev_raw;
 #[cfg(feature = "alloc")]
 mod net_buf;
 
-pub use self::dev_raw::VirtIONetRaw;
+pub use self::{control::RxFilterCommand, dev_raw::VirtIONetRaw};
 #[cfg(feature = "alloc")]
 pub use self::{dev::VirtIONet, net_buf::RxBuffer, net_buf::TxBuffer};
 

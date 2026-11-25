@@ -18,7 +18,10 @@ use virtio_drivers::{
     PhysAddr,
 };
 
-use super::{Iface, MtuBounds, NetDeivceState, NetDeviceCommonData, Operstate};
+use super::{
+    bridge::{BridgeCommonData, BridgeEnableDevice, BridgePortState},
+    Iface, IfacePollScope, MtuBounds, NetDeivceState, NetDeviceCommonData, Operstate,
+};
 use crate::{
     arch::rand::rand,
     driver::{
@@ -65,6 +68,7 @@ use crate::{
 use system_error::SystemError;
 
 mod driver;
+mod rx_filter;
 
 const VIRTIO_NET_BASENAME: &str = "virtio_net";
 const VIRTIO_NET_QUEUE_SIZE: usize = 64;
@@ -78,6 +82,12 @@ const VIRTIO_NET_IP_MTU: usize = 1500;
 const VIRTIO_NET_MAX_FRAME_SIZE: usize = VIRTIO_NET_IP_MTU + 14;
 const VIRTIO_NET_RX_QUEUE: u16 = 0;
 const VIRTIO_NET_TX_QUEUE: u16 = 1;
+
+fn ethernet_frame_limit(frame: &[u8], ip_mtu: usize) -> usize {
+    let vlan =
+        frame.len() >= 18 && matches!(u16::from_be_bytes([frame[12], frame[13]]), 0x8100 | 0x88a8);
+    ip_mtu + if vlan { 18 } else { 14 }
+}
 
 /// Network-only transport wrapper which resets the device before its DMA
 /// buffers are released.
@@ -489,6 +499,7 @@ struct RxDmaBuffer {
     packet_len: usize,
     used_len: usize,
     gso: Option<net_gso::Cursor>,
+    ingress_generation: u64,
 }
 
 impl RxDmaBuffer {
@@ -552,6 +563,7 @@ impl VirtIoNetImpl {
                 packet_len: 0,
                 used_len: 0,
                 gso: None,
+                ingress_generation: 0,
             });
             tx_free.push(TxDmaBuffer {
                 dma: Self::dma_buffer(DmaDirection::ToDevice, VIRTIO_NET_BUFFER_SIZE)?,
@@ -564,7 +576,7 @@ impl VirtIoNetImpl {
         let mut rx_quarantine = Vec::new();
         // Declared last so an initialization error drops/resets the raw device
         // before any buffer already submitted to it is released.
-        let mut inner = RawVirtioNet::new_with_rx_offloads(
+        let mut inner = RawVirtioNet::new_with_rx_filter(
             transport,
             RxOffloads::TCPV4 | RxOffloads::TCPV6 | RxOffloads::ECN,
         )
@@ -831,6 +843,8 @@ pub struct VirtIONicDeviceInner {
     pub inner: Arc<SpinLock<VirtIoNetImpl>>,
     /// 指向所属网络接口的弱引用，用于 packet socket 分发
     iface: Arc<SpinLock<Weak<dyn super::Iface>>>,
+    rx_generation: u64,
+    bridge_rx: bool,
 }
 
 impl Debug for VirtIONicDeviceInner {
@@ -840,11 +854,14 @@ impl Debug for VirtIONicDeviceInner {
 }
 
 #[cast_to([sync] Iface)]
+#[cast_to([sync] BridgeEnableDevice)]
 #[cast_to([sync] Device)]
 #[derive(Debug)]
 pub struct VirtioInterface {
     device_inner: VirtIONicDeviceInner,
     iface_common: super::IfaceCommon,
+    rx_filter: Option<Arc<rx_filter::RxFilter>>,
+    bridge_port: BridgePortState,
     inner: SpinLock<InnerVirtIOInterface>,
     locked_kobj_state: LockedKObjectState,
 }
@@ -857,7 +874,7 @@ struct InnerVirtIOInterface {
 }
 
 impl VirtioInterface {
-    pub fn new(mut device_inner: VirtIONicDeviceInner) -> Arc<Self> {
+    pub fn new(mut device_inner: VirtIONicDeviceInner) -> Result<Arc<Self>, SystemError> {
         let iface_id = generate_iface_id();
         let mut iface_config = iface::Config::new(wire::HardwareAddress::Ethernet(
             wire::EthernetAddress(device_inner.inner.lock_irqsave().mac_address()),
@@ -876,17 +893,27 @@ impl VirtioInterface {
         // Linux and confuses clients that re-apply dumped flags.
         let flags = InterfaceFlags::BROADCAST | InterfaceFlags::MULTICAST;
         let iface_name = format!("eth{}", iface_id);
+        let mut iface_common = super::IfaceCommon::new(
+            iface_id,
+            crate::driver::net::types::InterfaceType::ETHER,
+            iface_name,
+            VIRTIO_NET_IP_MTU,
+            flags,
+            iface,
+        );
+        let rx_filter = if device_inner.inner.lock_irqsave().inner.supports_rx_filter() {
+            let filter = rx_filter::RxFilter::new(device_inner.clone())?;
+            iface_common = iface_common.with_receive_filter(filter.projector()?);
+            Some(filter)
+        } else {
+            None
+        };
         let iface = Arc::new(VirtioInterface {
             device_inner,
             locked_kobj_state: LockedKObjectState::default(),
-            iface_common: super::IfaceCommon::new(
-                iface_id,
-                crate::driver::net::types::InterfaceType::ETHER,
-                iface_name,
-                VIRTIO_NET_IP_MTU,
-                flags,
-                iface,
-            ),
+            iface_common,
+            rx_filter,
+            bridge_port: BridgePortState::new(),
             inner: SpinLock::new(InnerVirtIOInterface {
                 kobj_common: KObjectCommonData::default(),
                 device_common: DeviceCommonData::default(),
@@ -903,7 +930,42 @@ impl VirtioInterface {
         let napi_struct = NapiStruct::new(iface.clone(), 64);
         *iface.common().napi_struct.write() = Some(napi_struct);
 
-        iface
+        Ok(iface)
+    }
+
+    fn update_bridge_carrier(&self) {
+        if let Some(bridge) = self
+            .bridge_port
+            .data()
+            .and_then(|data| data.bridge_driver_ref.upgrade())
+        {
+            bridge.update_carrier_from_ports();
+        }
+    }
+
+    fn poll_bridge_ingress(
+        &self,
+        device: &VirtIONicDeviceInner,
+        port: &BridgeCommonData,
+        budget: usize,
+    ) -> usize {
+        let mut work = 0;
+        for _ in 0..budget {
+            let buffer = match device.receive() {
+                Ok(Some(buffer)) => buffer,
+                Ok(None) => break,
+                Err(error) => {
+                    error!("virtio-net bridge receive failed: {error:?}");
+                    break;
+                }
+            };
+            // Use the same AF_PACKET tap and DMA retirement as stack RX.
+            phy::RxToken::consume(VirtioNetRxToken::new(device.clone(), buffer), |frame| {
+                port.receive(frame);
+            });
+            work += 1;
+        }
+        work
     }
 
     fn inner(&self) -> SpinLockGuard<'_, InnerVirtIOInterface> {
@@ -995,6 +1057,8 @@ impl VirtIONicDeviceInner {
         VirtIONicDeviceInner {
             inner,
             iface: Arc::new(SpinLock::new(Weak::<VirtioInterface>::new())),
+            rx_generation: 0,
+            bridge_rx: false,
         }
     }
 
@@ -1017,7 +1081,17 @@ impl VirtIONicDeviceInner {
         let Some((mut buffer, parser)) = candidate else {
             return Ok(None);
         };
+        if buffer.gso.is_some() && buffer.ingress_generation != self.rx_generation {
+            // An aggregate started before an administrative or bridge
+            // transition cannot contribute later segments to the new path.
+            let mut driver = self.inner.lock_irqsave();
+            driver.rx_inflight = false;
+            buffer.gso = None;
+            driver.recycle_rx(buffer)?;
+            return Ok(None);
+        }
         if buffer.gso.is_none() {
+            buffer.ingress_generation = self.rx_generation;
             let prepared = parser.prepare(buffer.dma.as_mut_slice(), buffer.used_len);
             let Ok((header_len, packet_len, metadata)) = prepared else {
                 // Reclaimed ownership is known: a bad protocol frame is a
@@ -1121,7 +1195,7 @@ impl VirtIONicDeviceInner {
     }
 
     pub fn try_raw_transmit(&self, frame: &[u8]) -> Result<(), SystemError> {
-        if frame.len() > VIRTIO_NET_MAX_FRAME_SIZE {
+        if frame.len() > ethernet_frame_limit(frame, VIRTIO_NET_IP_MTU) {
             return Err(SystemError::EMSGSIZE);
         }
         let buffer = self
@@ -1202,6 +1276,9 @@ impl phy::Device for VirtIONicDeviceInner {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.bridge_rx {
+            return None;
+        }
         match VirtIONicDeviceInner::receive(self) {
             Ok(Some(rx_buffer)) => Some((
                 VirtioNetRxToken::new(self.clone(), rx_buffer),
@@ -1393,6 +1470,24 @@ impl Iface for VirtioInterface {
             // packets runnable without scheduling a redundant cycle.
             self.common().release_tx_backpressure();
         }
+        let (generation, port) = self.bridge_port.ingress_snapshot();
+        device.rx_generation = generation;
+        if let Some(port) = port.filter(|_| self.common().poll_scope() == IfacePollScope::Full) {
+            device.bridge_rx = true;
+            // Give namespace-local input and ready output a share of the
+            // same packet budget even while the bridge RX ring stays full.
+            let rx_budget = if self.common().has_ready_local_work(Instant::now().into()) {
+                budget / 2
+            } else {
+                budget
+            };
+            let bridged = self.poll_bridge_ingress(&device, &port, rx_budget);
+            let stack = self.iface_common.poll_napi(&mut device, budget - bridged);
+            return super::napi::NapiPollResult::new(
+                bridged + stack.work_done,
+                stack.poll_again || (rx_budget != 0 && bridged == rx_budget),
+            );
+        }
         self.iface_common.poll_napi(&mut device, budget)
     }
 
@@ -1508,10 +1603,20 @@ impl Iface for VirtioInterface {
 
     fn set_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state |= state;
+        if state
+            .intersects(NetDeivceState::__LINK_STATE_START | NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            self.update_bridge_carrier();
+        }
     }
 
     fn clear_net_state(&self, state: NetDeivceState) {
         self.inner().netdevice_common.state &= !state;
+        if state
+            .intersects(NetDeivceState::__LINK_STATE_START | NetDeivceState::__LINK_STATE_NOCARRIER)
+        {
+            self.update_bridge_carrier();
+        }
     }
 
     fn operstate(&self) -> Operstate {
@@ -1533,12 +1638,55 @@ impl Iface for VirtioInterface {
         }
     }
 
+    fn bridge_port_state(&self) -> Option<&BridgePortState> {
+        Some(&self.bridge_port)
+    }
+
+    fn quiesce_admin_down(&self) {
+        self.bridge_port.advance_generation();
+    }
+
+    fn sync_receive_filter_after_link_change(&self) {
+        if let Some(filter) = &self.rx_filter {
+            filter.synchronize_link(self.flags().contains(InterfaceFlags::UP));
+        }
+    }
+
     fn begin_admin_down(&self) {
         self.device_inner
             .inner
             .lock_irqsave()
             .inner
             .disable_interrupts();
+    }
+}
+
+impl BridgeEnableDevice for VirtioInterface {
+    fn bridge_ingress_generation(&self) -> u64 {
+        self.bridge_port.generation()
+    }
+
+    fn receive_from_bridge(&self, frame: &[u8]) {
+        if frame.len() <= ethernet_frame_limit(frame, self.mtu()) {
+            if let Some(_tx) = self.common().try_acquire_tx() {
+                let _ = self.raw_transmit(frame);
+            }
+        }
+    }
+
+    fn enable_bridge_receive(&self) -> Result<(), SystemError> {
+        self.rx_filter
+            .as_ref()
+            .ok_or(SystemError::EOPNOTSUPP_OR_ENOTSUP)?
+            .set_bridge_mode(self.common(), true)
+    }
+
+    fn disable_bridge_receive(&self) {
+        if let Some(filter) = &self.rx_filter {
+            if let Err(error) = filter.set_bridge_mode(self.common(), false) {
+                log::warn!("virtio-net could not disable bridge receive mode: {error:?}");
+            }
+        }
     }
 }
 

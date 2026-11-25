@@ -112,7 +112,9 @@ impl BridgeDriver {
             device.clone(),
             &self.self_ref.upgrade().unwrap(),
         )?;
-        self.inner.lock().add_port(port.id, port.clone())?;
+        self.inner.lock().reserve_port()?;
+        device.enable_bridge_receive()?;
+        self.inner.lock().add_port(port.clone());
         device.set_common_bridge_data(&port);
         self.update_carrier_from_ports();
         Ok(())
@@ -141,6 +143,7 @@ impl BridgeDriver {
         // enters this lock while its own ingress barrier is held.
         port.wait_idle();
         device.clear_common_bridge_data(data.id);
+        device.disable_bridge_receive();
         self.update_carrier_from_ports();
         Ok(())
     }
@@ -155,6 +158,7 @@ impl BridgeDriver {
                 .expect("prepared bridge port must still exist");
             port.wait_idle();
             device.clear_common_bridge_data(port_id);
+            device.disable_bridge_receive();
         }
         self.update_carrier_from_ports();
     }
@@ -212,7 +216,13 @@ impl BridgeDriver {
         if self.handle_ip_frame(ingress_port_id, frame, None, None) {
             return;
         }
-        let decision = self.inner.lock().select_egress(ingress_port_id, frame);
+        let mut bridge = self.inner.lock();
+        let ingress = bridge.ports.get(&ingress_port_id).cloned();
+        let Some(_ingress_activity) = ingress.as_ref().and_then(BridgePort::enter) else {
+            return;
+        };
+        let decision = bridge.select_egress(ingress_port_id, frame);
+        drop(bridge);
         let Ok(decision) = decision else {
             return;
         };
@@ -378,18 +388,98 @@ pub trait BridgeEnableDevice: Iface {
     /// 接收来自桥的数据帧
     fn receive_from_bridge(&self, frame: &[u8]);
 
-    /// 设置桥接相关的公共数据
-    fn set_common_bridge_data(&self, _port: &BridgePort);
+    /// Required hardware reception is configured before member publication.
+    fn enable_bridge_receive(&self) -> Result<(), SystemError> {
+        Ok(())
+    }
 
-    /// 获取桥接相关的公共数据
-    fn common_bridge_data(&self) -> Option<BridgeCommonData>;
-    fn clear_common_bridge_data(&self, bridge_id: BridgePortId);
-    // fn bridge(&self) -> Weak<BridgeIface> {
-    //     let Some(data) = self.common_bridge_data() else {
-    //         return Weak::default();
-    //     };
-    //     data.bridge_driver
-    // }
+    /// The port has already stopped forwarding when this is called.
+    fn disable_bridge_receive(&self) {}
+
+    fn set_common_bridge_data(&self, port: &BridgePort) {
+        self.bridge_port_state()
+            .expect("bridge device owns port state")
+            .set(port);
+    }
+
+    fn common_bridge_data(&self) -> Option<BridgeCommonData> {
+        self.bridge_port_state()?.data()
+    }
+
+    fn clear_common_bridge_data(&self, bridge_id: BridgePortId) {
+        self.bridge_port_state()
+            .expect("bridge device owns port state")
+            .clear(bridge_id);
+    }
+}
+
+/// An Ethernet device's bridge membership and its sysfs projection.
+#[derive(Debug)]
+pub struct BridgePortState {
+    inner: SpinLock<BridgePortStateInner>,
+}
+
+#[derive(Debug, Default)]
+struct BridgePortStateInner {
+    data: Option<BridgeCommonData>,
+    generation: u64,
+    sysfs: Option<sysfs::BridgePortSysfs>,
+}
+
+impl BridgePortState {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: SpinLock::new(BridgePortStateInner::default()),
+        }
+    }
+
+    pub(super) fn data(&self) -> Option<BridgeCommonData> {
+        self.inner.lock_irqsave().data.clone()
+    }
+
+    pub(super) fn projection(&self) -> Option<sysfs::BridgePortSysfs> {
+        self.inner.lock_irqsave().sysfs.clone()
+    }
+
+    pub(super) fn ingress_snapshot(&self) -> (u64, Option<BridgeCommonData>) {
+        let state = self.inner.lock_irqsave();
+        (state.generation, state.data.clone())
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.inner.lock_irqsave().generation
+    }
+
+    pub(super) fn advance_generation(&self) {
+        let mut state = self.inner.lock_irqsave();
+        state.generation = state.generation.wrapping_add(1);
+    }
+
+    fn set(&self, port: &BridgePort) {
+        let mut state = self.inner.lock_irqsave();
+        state.generation = state.generation.wrapping_add(1);
+        state.data = Some(BridgeCommonData {
+            id: port.id,
+            bridge_driver_ref: port.bridge_driver_ref.clone(),
+        });
+    }
+
+    fn set_projection(&self, projection: sysfs::BridgePortSysfs) {
+        self.inner.lock_irqsave().sysfs = Some(projection);
+    }
+
+    fn clear(&self, id: BridgePortId) {
+        let mut state = self.inner.lock_irqsave();
+        if state.data.as_ref().is_some_and(|data| data.id == id) {
+            state.data = None;
+            state.generation = state.generation.wrapping_add(1);
+            let projection = state.sysfs.take();
+            drop(state);
+            if let Some(projection) = projection {
+                projection.remove();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -399,6 +489,16 @@ pub struct BridgeCommonData {
 }
 
 impl BridgeCommonData {
+    pub(super) fn receive(&self, frame: &[u8]) {
+        if let Some(bridge) = self.bridge_driver_ref.upgrade() {
+            bridge.handle_frame(self.id, frame);
+        }
+    }
+
+    pub(crate) fn master(&self) -> Option<Arc<BridgeIface>> {
+        self.bridge_driver_ref.upgrade()?.local_iface()
+    }
+
     fn is_forwarding(&self) -> Option<bool> {
         let driver = self.bridge_driver_ref.upgrade()?;
         let bridge = driver.inner.lock();

@@ -414,6 +414,10 @@ impl BridgeIface {
         Ok(())
     }
 
+    pub(crate) fn has_ports(&self) -> bool {
+        !self.driver.inner.lock().ports.is_empty()
+    }
+
     pub fn bridge_driver(&self) -> Arc<BridgeDriver> {
         self.driver.clone()
     }

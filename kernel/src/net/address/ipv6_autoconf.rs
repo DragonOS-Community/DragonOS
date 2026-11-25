@@ -462,14 +462,17 @@ pub(crate) fn evaluate_ipv6_after_link_change(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
 ) {
-    // Software link carrier follows peers or member ports and is evaluated
-    // by the worker after the administrative transaction.
+    if iface.type_() != InterfaceType::ETHER || !ipv6_link_ready(iface.as_ref()) {
+        return;
+    }
+    // Peer- and port-derived carrier is evaluated after the transaction.
+    // An empty bridge instead retains its current carrier across admin up.
     let device = iface.as_any_ref();
-    if iface.type_() == InterfaceType::ETHER
-        && !device.is::<crate::driver::net::veth::VethInterface>()
-        && !device.is::<crate::driver::net::bridge::BridgeIface>()
-        && ipv6_link_ready(iface.as_ref())
-    {
+    let deferred_carrier = device.is::<crate::driver::net::veth::VethInterface>()
+        || device
+            .downcast_ref::<crate::driver::net::bridge::BridgeIface>()
+            .is_some_and(crate::driver::net::bridge::BridgeIface::has_ports);
+    if !deferred_carrier {
         evaluate_ready_link_local(netns, iface, Instant::now().total_micros());
     }
 }

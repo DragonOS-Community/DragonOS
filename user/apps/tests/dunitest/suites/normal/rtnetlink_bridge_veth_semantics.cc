@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <net/if.h>
+#include <ifaddrs.h>
 #include <linux/if_link.h>
 #include <linux/if.h>
 #include <linux/if_addr.h>
@@ -88,6 +89,14 @@ void AppendAttr(std::vector<uint8_t>& bytes, uint16_t type, const void* data, si
     attr->rta_type = type;
     attr->rta_len = RTA_LENGTH(len);
     if (len) std::memcpy(RTA_DATA(attr), data, len);
+}
+
+bool AddIpv6AddrGenMode(LinkRequest& request, uint8_t mode) {
+    std::vector<uint8_t> ipv6;
+    AppendAttr(ipv6, IFLA_INET6_ADDR_GEN_MODE, &mode, sizeof(mode));
+    std::vector<uint8_t> families;
+    AppendAttr(families, AF_INET6, ipv6.data(), ipv6.size());
+    return request.add(IFLA_AF_SPEC, families.data(), families.size());
 }
 
 int SendAck(int fd, const nlmsghdr* request) {
@@ -578,17 +587,13 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6AddrGenModeRoundTripsAndRespectsMtu) {
 
             const auto set_mode = [&](uint16_t type, uint8_t mode, uint32_t seq,
                                       uint32_t mtu = 0, bool up = false) {
-                std::vector<uint8_t> ipv6;
-                AppendAttr(ipv6, IFLA_INET6_ADDR_GEN_MODE, &mode, sizeof(mode));
-                std::vector<uint8_t> families;
-                AppendAttr(families, AF_INET6, ipv6.data(), ipv6.size());
                 LinkRequest request(type, 0, seq);
                 request.body()->ifi_index = index;
                 if (up) {
                     request.body()->ifi_flags = IFF_UP;
                     request.body()->ifi_change = IFF_UP;
                 }
-                if (!request.add(IFLA_AF_SPEC, families.data(), families.size()) ||
+                if (!AddIpv6AddrGenMode(request, mode) ||
                     (mtu != 0 && !request.add(IFLA_MTU, &mtu, sizeof(mtu)))) return EINVAL;
                 return SendAck(route.fd, request);
             };
@@ -628,6 +633,59 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6AddrGenModeRoundTripsAndRespectsMtu) {
             ASSERT_TRUE(state.has_value());
             EXPECT_EQ(state->mtu, 1279u);
             EXPECT_FALSE(state->ipv6_addr_gen_mode.has_value());
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RtnetlinkBridgeVethSemantics, EmptyBridgeUsesPreviousIpv6AddrGenModeOnUp) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd route;
+            ASSERT_GE(route.fd, 0);
+            const auto check = [&](const char* name, uint8_t old_mode, uint8_t new_mode,
+                                   uint32_t seq) {
+                LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, seq);
+                ASSERT_TRUE(create.name(name));
+                AddKind(create, "bridge");
+                ASSERT_EQ(SendAck(route.fd, create), 0);
+                const int index = if_nametoindex(name);
+                ASSERT_GT(index, 0);
+                LinkRequest set_mode(RTM_SETLINK, 0, seq + 1);
+                set_mode.body()->ifi_index = index;
+                ASSERT_TRUE(AddIpv6AddrGenMode(set_mode, old_mode));
+                ASSERT_EQ(SendAck(route.fd, set_mode), 0);
+
+                LinkRequest up(RTM_NEWLINK, 0, seq + 2);
+                up.body()->ifi_index = index;
+                up.body()->ifi_flags = IFF_UP;
+                up.body()->ifi_change = IFF_UP;
+                ASSERT_TRUE(AddIpv6AddrGenMode(up, new_mode));
+                ASSERT_EQ(SendAck(route.fd, up), 0);
+
+                if (old_mode == IN6_ADDR_GEN_MODE_NONE) usleep(200'000);
+                ifaddrs* interfaces = nullptr;
+                ASSERT_EQ(getifaddrs(&interfaces), 0);
+                bool found = false;
+                for (auto* entry = interfaces; entry; entry = entry->ifa_next) {
+                    if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET6 ||
+                        std::strcmp(entry->ifa_name, name) != 0) continue;
+                    const auto* address = reinterpret_cast<const sockaddr_in6*>(entry->ifa_addr);
+                    found |= IN6_IS_ADDR_LINKLOCAL(&address->sin6_addr);
+                }
+                freeifaddrs(interfaces);
+                EXPECT_EQ(found, old_mode == IN6_ADDR_GEN_MODE_EUI64);
+            };
+            check("empty-eui", IN6_ADDR_GEN_MODE_EUI64, IN6_ADDR_GEN_MODE_NONE, 6120);
+            check("empty-none", IN6_ADDR_GEN_MODE_NONE, IN6_ADDR_GEN_MODE_EUI64, 6130);
         };
         run();
         _exit(::testing::Test::HasFailure() ? 1 : 0);

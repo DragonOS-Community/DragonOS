@@ -1172,6 +1172,14 @@ impl FibTable {
         }
     }
 
+    pub(super) fn plan_multicast_route(&self, route: RouteEntry) -> FibEdit {
+        if self.index.analyze_insert(route).exact.is_some() {
+            FibEdit::None
+        } else {
+            self.plan_derived_append(route)
+        }
+    }
+
     fn plan_derived_append(&self, route: RouteEntry) -> FibEdit {
         // Linux appends address routes after existing equal-metric aliases.
         FibEdit::Insert {

@@ -29,10 +29,10 @@ use fib::FibEditor;
 pub(in crate::net) use fib::FibTable;
 pub(in crate::net) use lifecycle::prepare_address_link_change_from;
 pub(crate) use lifecycle::{
-    expire_ipv6_routes, next_ipv6_route_deadline_us, prepare_address_link_change,
-    prepare_link_state_change, prepare_unregister_ifaces_from, purge_iface_for_netns_teardown,
-    register_iface, AddressLinkChange, Ipv6PrefixChange, PreparedAddressRouteCommit,
-    PreparedIfaceUnregister, PreparedLinkStateChange,
+    ensure_ipv6_multicast_route, expire_ipv6_routes, next_ipv6_route_deadline_us,
+    prepare_address_link_change, prepare_link_state_change, prepare_unregister_ifaces_from,
+    purge_iface_for_netns_teardown, register_iface, AddressLinkChange, Ipv6PrefixChange,
+    PreparedAddressRouteCommit, PreparedIfaceUnregister, PreparedLinkStateChange,
 };
 pub(crate) use source::{
     resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow, ResolvedIpv4Route,

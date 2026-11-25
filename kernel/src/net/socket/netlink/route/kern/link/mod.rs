@@ -475,6 +475,7 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
         changed_addresses,
         removed_addresses,
         route_changes,
+        multicast_route,
         removed_neighbors,
         rename_old_devpath,
         related,
@@ -484,6 +485,9 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
     }
     if !changes.is_empty() {
         notify_link_change(&iface);
+    }
+    if let Some(route) = multicast_route {
+        super::route::notify_automatic_ipv6_route(netns, route, false, false);
     }
     notify_iface_protocol_change(
         netns,

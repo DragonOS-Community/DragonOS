@@ -44,10 +44,10 @@ fn apply_initial_link_settings(
         }
     }
     if settings.mtu.is_some() || settings.tx_queue_len.is_some() || settings.flags.is_some() {
-        crate::net::link::mutate_link(
+        crate::net::link::configure_new_link(
             rtnl,
             netns,
-            LinkTarget::Index(iface.nic_id() as u32),
+            iface,
             LinkUpdate {
                 new_name: None,
                 mtu: settings.mtu.map(LinkMtuUpdate::Rtnetlink),

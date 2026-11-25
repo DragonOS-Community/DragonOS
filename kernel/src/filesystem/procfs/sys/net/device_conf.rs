@@ -339,7 +339,9 @@ impl FileOps for DeviceFileOps {
                     )?;
                 }
                 DeviceField::Ipv6AcceptRa => iface.common().set_ipv6_accept_ra(&rtnl, value),
-                DeviceField::Ipv6Autoconf(setting) => setting.write(iface.common(), value)?,
+                DeviceField::Ipv6Autoconf(setting) => {
+                    setting.write(&rtnl, &netns, iface.as_ref(), value)?
+                }
                 DeviceField::Ipv6Prefix(setting) => {
                     iface
                         .common()

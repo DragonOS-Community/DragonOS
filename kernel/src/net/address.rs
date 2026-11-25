@@ -198,6 +198,7 @@ pub(crate) fn set_device_ipv6_disabled(
             metadata,
             deleted_addresses: &deleted_addresses,
             ipv6_prefix_change: None,
+            ensure_mroute: false,
             was_up: up,
             is_up: up,
             ipv6_enabled: Some(enabled),
@@ -230,6 +231,11 @@ pub(crate) fn set_device_ipv6_disabled(
         iface.common().fail_deferred_ipv6();
     } else {
         ipv6_autoconf::link_changed(iface.common(), iface.operstate());
+        if let Some(route) =
+            ipv6_autoconf::initialize_ready_multicast_route(rtnl, netns, iface.as_ref())
+        {
+            crate::net::socket::netlink::notify_automatic_ipv6_route(netns, route, false, false);
+        }
     }
     let removed_neighbors = neighbors.map_or_else(Vec::new, |prepared| prepared.publish());
 
@@ -688,6 +694,7 @@ pub(in crate::net) fn prepare_link_address_change(
         metadata,
         deleted_addresses: &deleted_addresses,
         ipv6_prefix_change: None,
+        ensure_mroute: false,
         was_up,
         is_up,
         ipv6_enabled,
@@ -1031,6 +1038,7 @@ fn commit_published(
             metadata,
             deleted_addresses: deleted.as_slice(),
             ipv6_prefix_change,
+            ensure_mroute: matches!(outcome, AddressMutationOutcome::Added(IpCidr::Ipv6(_))),
             was_up: is_up,
             is_up,
             ipv6_enabled: None,
@@ -1108,6 +1116,7 @@ fn prepare_automatic_address(
             metadata,
             deleted_addresses: &[],
             ipv6_prefix_change: None,
+            ensure_mroute: false,
             was_up: up,
             is_up: up,
             ipv6_enabled: None,

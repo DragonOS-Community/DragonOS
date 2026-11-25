@@ -171,6 +171,7 @@ bitflags::bitflags! {
     pub struct RouteFlags: u32 {
         /// Single-path nexthop is explicitly on-link.
         const ONLINK = 0x4;
+        const LINKDOWN = 0x10;
         const NOTIFY = 0x100;
         const CLONED = 0x200;
         const EQUALIZE = 0x400;

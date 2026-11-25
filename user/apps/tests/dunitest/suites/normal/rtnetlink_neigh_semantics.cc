@@ -843,6 +843,113 @@ TEST_F(RtnetlinkNeighborSemantics, NotificationsDescribeCommittedChangesAndLinux
     EXPECT_FALSE(removed->spec.lladdr.has_value());
 }
 
+TEST(RtnetlinkNeighborMtu, WithdrawsIpv6NeighborsOnLoopbackPortAndBridge) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard fd(OpenRouteSocket());
+            ASSERT_GE(fd.Get(), 0);
+            uint32_t seq = 9400;
+            auto update_link = [&](uint32_t index, uint16_t attr, uint32_t value) {
+                alignas(nlmsghdr) char buffer[128]{};
+                auto* header = reinterpret_cast<nlmsghdr*>(buffer);
+                auto* message = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(header));
+                header->nlmsg_len = NLMSG_LENGTH(sizeof(*message));
+                header->nlmsg_type = RTM_NEWLINK;
+                header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+                header->nlmsg_seq = ++seq;
+                message->ifi_index = index;
+                AddAttr(header, sizeof(buffer), attr, &value, sizeof(value));
+                if (send(fd.Get(), header, header->nlmsg_len, 0) < 0) return errno;
+                return RecvAck(fd.Get(), seq);
+            };
+            auto create_link = [&](const char* name, const char* kind) {
+                alignas(nlmsghdr) char buffer[128]{};
+                auto* header = reinterpret_cast<nlmsghdr*>(buffer);
+                header->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+                header->nlmsg_type = RTM_NEWLINK;
+                header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+                header->nlmsg_seq = ++seq;
+                alignas(rtattr) char link_info[32]{};
+                auto* attribute = reinterpret_cast<rtattr*>(link_info);
+                attribute->rta_type = IFLA_INFO_KIND;
+                attribute->rta_len = RTA_LENGTH(std::strlen(kind) + 1);
+                std::memcpy(RTA_DATA(attribute), kind, std::strlen(kind) + 1);
+                AddAttr(header, sizeof(buffer), IFLA_IFNAME, name, std::strlen(name) + 1);
+                AddAttr(header, sizeof(buffer), IFLA_LINKINFO, link_info,
+                        RTA_ALIGN(attribute->rta_len));
+                if (send(fd.Get(), header, header->nlmsg_len, 0) < 0) return errno;
+                return RecvAck(fd.Get(), seq);
+            };
+
+            ASSERT_EQ(create_link("v94", "veth"), 0);
+            ASSERT_EQ(create_link("br94", "bridge"), 0);
+            const uint32_t lo = if_nametoindex("lo");
+            const uint32_t port = if_nametoindex("v94");
+            const uint32_t peer = if_nametoindex("veth0");
+            const uint32_t bridge = if_nametoindex("br94");
+            ASSERT_NE(lo, 0u);
+            ASSERT_NE(port, 0u);
+            ASSERT_NE(peer, 0u);
+            ASSERT_GT(bridge, port);
+            ASSERT_EQ(update_link(port, IFLA_MASTER, bridge), 0);
+            for (uint32_t index : {lo, port, peer, bridge}) {
+                ASSERT_EQ(SetLinkUp(fd.Get(), index, true, ++seq), 0);
+            }
+
+            auto lo6 = MakeNeighbor(AF_INET6, "fd94::1", lo);
+            lo6.lladdr.reset();
+            const auto port6 = MakeNeighbor(AF_INET6, "fd94::2", port);
+            const auto bridge6 = MakeNeighbor(AF_INET6, "fd94::3", bridge);
+            const auto peer6 = MakeNeighbor(AF_INET6, "fd94::4", peer);
+            const auto port4 = MakeNeighbor(AF_INET, "198.18.94.2", port);
+            for (const auto& spec : {lo6, port6, bridge6, peer6, port4}) {
+                ASSERT_EQ(SendNeighborRequest(fd.Get(), RTM_NEWNEIGH,
+                                              NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE |
+                                                  NLM_F_EXCL,
+                                              spec, ++seq),
+                          0);
+                ASSERT_TRUE(FindNeighbor(fd.Get(), spec, ++seq));
+            }
+
+            FdGuard listener(OpenRouteListener(RTMGRP_NEIGH));
+            ASSERT_GE(listener.Get(), 0);
+            EXPECT_EQ(update_link(lo, IFLA_MTU, 1279), 0);
+            EXPECT_FALSE(FindNeighbor(fd.Get(), lo6, ++seq));
+            const auto removed = ReceiveNeighborEvent(listener.Get(), lo6.destination,
+                                                      RTM_DELNEIGH);
+            ASSERT_TRUE(removed);
+            EXPECT_EQ(removed->spec.ifindex, lo);
+            ASSERT_EQ(SendNeighborRequest(fd.Get(), RTM_NEWNEIGH,
+                                          NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                                          lo6, ++seq),
+                      0);
+            ASSERT_EQ(update_link(lo, IFLA_MTU, 1279), 0);
+            EXPECT_TRUE(FindNeighbor(fd.Get(), lo6, ++seq));
+
+            ASSERT_EQ(update_link(port, IFLA_MTU, 1279), 0);
+            const auto remaining = DumpNeighbors(fd.Get(), AF_INET6, ++seq);
+            const auto contains = [&](const NeighborSpec& spec) {
+                return std::any_of(remaining.begin(), remaining.end(), [&](const auto& entry) {
+                    return entry.spec.ifindex == spec.ifindex &&
+                           SameAddress(entry.spec.destination, spec.destination);
+                });
+            };
+            EXPECT_TRUE(contains(peer6));
+            EXPECT_FALSE(contains(port6));
+            EXPECT_FALSE(contains(bridge6));
+            EXPECT_TRUE(FindNeighbor(fd.Get(), port4, ++seq));
+        }();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 size_t CountArpRows(const char* ip) {
     std::ifstream input("/proc/net/arp");
     size_t matches = 0;

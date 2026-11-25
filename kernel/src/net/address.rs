@@ -62,6 +62,7 @@ pub(crate) struct AddressInfo {
 
 pub(in crate::net) struct PreparedLinkAddressChange {
     routes: crate::net::route::PreparedAddressRouteCommit,
+    pub(in crate::net) withdraws_ipv6: bool,
     removed: Vec<AddressInfo>,
     changed_addresses: Vec<IpCidr>,
 }
@@ -695,6 +696,7 @@ pub(in crate::net) fn prepare_link_address_change(
     };
     Ok(Some(PreparedLinkAddressChange {
         routes,
+        withdraws_ipv6: withdraw_ipv6_routes,
         removed,
         changed_addresses,
     }))
@@ -718,6 +720,7 @@ impl PreparedLinkAddressChange {
             routes,
             removed,
             changed_addresses,
+            ..
         } = self;
         let route_changes = routes.publish_link_change(
             netns,

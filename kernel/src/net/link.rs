@@ -264,12 +264,16 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         } else {
             None
         };
-        let neighbors = if link_down || (noarp_changed && is_up) {
+        let purge_all_neighbors = link_down || (noarp_changed && is_up);
+        let purge_ipv6_neighbors = address_change
+            .as_ref()
+            .is_some_and(|change| change.withdraws_ipv6);
+        let neighbors = if purge_all_neighbors || purge_ipv6_neighbors {
             Some(neighbor::prepare_configured_iface_purge(
                 rtnl,
                 &netns,
                 iface.nic_id() as u32,
-                false,
+                !purge_all_neighbors,
             )?)
         } else {
             None
@@ -373,7 +377,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
         }
 
         let link_down = was_up && !is_up;
-        if neighbors.is_some() && !link_down {
+        if noarp_changed && is_up {
             iface.smol_iface().lock().flush_neighbor_cache();
         }
 

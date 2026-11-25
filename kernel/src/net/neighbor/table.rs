@@ -46,13 +46,11 @@ pub(crate) struct NeighborSnapshot {
 /// An RTNL-serialized, allocation-complete purge of one interface's configured
 /// neighbors.
 ///
-/// The copied entries are both the eventual notification payload and proof of
-/// the table generation prepared for publication. Configured-neighbor writers
-/// all require RTNL, so the matching table range cannot change between
-/// `prepare_iface_purge` and `publish_iface_purge` while the caller retains the
-/// same guard.
+/// The copied entries are the notification payload. A single RTNL operation
+/// can purge multiple devices, so their positions may move before publication.
 pub(super) struct PreparedNeighborPurge {
-    range: core::ops::Range<usize>,
+    ifindex: u32,
+    ipv6_only: bool,
     removed: Vec<NeighborEntry>,
 }
 
@@ -209,17 +207,17 @@ impl NeighborTable {
         ipv6_only: bool,
     ) -> Result<PreparedNeighborPurge, SystemError> {
         let entries = self.entries.read();
-        let mut range = iface_range(&entries, ifindex);
-        if ipv6_only {
-            range.start += entries[range.clone()]
-                .partition_point(|entry| matches!(entry.destination, IpAddress::Ipv4(_)));
-        }
+        let range = iface_purge_range(&entries, ifindex, ipv6_only);
         let mut removed = Vec::new();
         removed
             .try_reserve_exact(range.len())
             .map_err(|_| SystemError::ENOMEM)?;
-        removed.extend_from_slice(&entries[range.clone()]);
-        Ok(PreparedNeighborPurge { range, removed })
+        removed.extend_from_slice(&entries[range]);
+        Ok(PreparedNeighborPurge {
+            ifindex,
+            ipv6_only,
+            removed,
+        })
     }
 
     pub(super) fn publish_iface_purge(
@@ -227,12 +225,17 @@ impl NeighborTable {
         _rtnl: &RtnlGuard,
         prepared: PreparedNeighborPurge,
     ) -> Vec<NeighborEntry> {
-        let PreparedNeighborPurge { range, removed } = prepared;
+        let PreparedNeighborPurge {
+            ifindex,
+            ipv6_only,
+            removed,
+        } = prepared;
         if removed.is_empty() {
             return removed;
         }
 
         let mut entries = self.entries.write();
+        let range = iface_purge_range(&entries, ifindex, ipv6_only);
         debug_assert_eq!(&entries[range.clone()], removed.as_slice());
         self.remove_iface_entries(&mut entries, range);
         removed
@@ -287,6 +290,19 @@ fn iface_range(entries: &[NeighborEntry], ifindex: u32) -> core::ops::Range<usiz
     let start = entries.partition_point(|entry| entry.ifindex < ifindex);
     let end = entries.partition_point(|entry| entry.ifindex <= ifindex);
     start..end
+}
+
+fn iface_purge_range(
+    entries: &[NeighborEntry],
+    ifindex: u32,
+    ipv6_only: bool,
+) -> core::ops::Range<usize> {
+    let mut range = iface_range(entries, ifindex);
+    if ipv6_only {
+        range.start += entries[range.clone()]
+            .partition_point(|entry| matches!(entry.destination, IpAddress::Ipv4(_)));
+    }
+    range
 }
 
 fn compare_key(entry: &NeighborEntry, ifindex: u32, destination: IpAddress) -> Ordering {

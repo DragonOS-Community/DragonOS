@@ -769,7 +769,7 @@ impl Attribute for AttrMtu {
                 ..Default::default()
             },
         )?;
-        crate::net::socket::netlink::notify_link_commit(&netns, committed);
+        crate::net::socket::netlink::notify_link_commit(&rtnl, &netns, committed);
         Ok(buf.len())
     }
 }

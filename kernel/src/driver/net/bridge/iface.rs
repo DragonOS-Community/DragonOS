@@ -395,7 +395,7 @@ impl BridgeIface {
         }
         if !self.common.ipv6_device_present() && self.common.ipv6_device_present_at(candidate) {
             if let Some(mtu) = self.prepare_auto_mtu(rtnl, netns, candidate)? {
-                crate::net::socket::netlink::notify_link_commit(netns, mtu.commit());
+                crate::net::socket::netlink::notify_link_commit(rtnl, netns, mtu.commit());
             }
             return Ok(());
         }
@@ -412,6 +412,10 @@ impl BridgeIface {
             .expect("live bridge has a local iface");
         crate::net::socket::netlink::notify_link_change(&(iface as Arc<dyn Iface>));
         Ok(())
+    }
+
+    pub(crate) fn has_ports(&self) -> bool {
+        !self.driver.inner.lock().ports.is_empty()
     }
 
     pub fn bridge_driver(&self) -> Arc<BridgeDriver> {

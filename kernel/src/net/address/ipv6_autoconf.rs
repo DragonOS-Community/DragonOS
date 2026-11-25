@@ -110,7 +110,7 @@ impl AddressSettings {
 }
 
 impl AddressSetting {
-    fn validate(self, value: i32) -> Result<(), SystemError> {
+    pub(crate) fn validate(self, value: i32) -> Result<(), SystemError> {
         match (self, value) {
             (Self::AddrGenMode, 0 | 1) => Ok(()),
             (Self::AddrGenMode, 2 | 3) => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
@@ -269,6 +269,24 @@ impl Setting {
     }
 }
 
+pub(crate) fn rtnl_addr_gen_mode(common: &IfaceCommon) -> Option<u8> {
+    common
+        .ipv6_device_present()
+        .then(|| Setting::Address(AddressSetting::AddrGenMode).read(common) as u8)
+}
+
+pub(crate) fn set_rtnl_addr_gen_mode(
+    _rtnl: &rtnl::RtnlGuard,
+    common: &IfaceCommon,
+    mode: u8,
+) -> Result<(), SystemError> {
+    if !common.ipv6_device_present() {
+        return Err(SystemError::EAFNOSUPPORT);
+    }
+    common.ipv6_autoconf.lock().address_settings.mode = i32::from(mode);
+    Ok(())
+}
+
 pub(crate) fn changed(common: &IfaceCommon) {
     if let Some(netns) = common.net_namespace() {
         netns.notify_ipv6_autoconf();
@@ -420,20 +438,43 @@ pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
     next
 }
 
-/// Finish the synchronous part of a ready administrative link transition.
+fn ipv6_link_ready(iface: &dyn Iface) -> bool {
+    iface.flags().contains(InterfaceFlags::UP)
+        && iface.common().ipv6_device_present()
+        && iface.common().ipv6_enabled()
+        && carrier_ready(iface)
+}
+
 pub(crate) fn initialize_ready_multicast_route(
     rtnl: &rtnl::RtnlGuard,
     netns: &Arc<NetNamespace>,
     iface: &dyn Iface,
 ) -> Option<RouteEntry> {
-    if iface.flags().contains(InterfaceFlags::UP)
-        && iface.common().ipv6_device_present()
-        && iface.common().ipv6_enabled()
-        && carrier_ready(iface)
-    {
-        return initialize_multicast_route(rtnl, netns, iface, Instant::now().total_micros());
+    if !ipv6_link_ready(iface) {
+        return None;
     }
-    None
+    initialize_multicast_route(rtnl, netns, iface, Instant::now().total_micros())
+}
+
+/// Complete synchronous IPv6 address evaluation after the link notification.
+pub(crate) fn evaluate_ipv6_after_link_change(
+    _rtnl: &rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+) {
+    if iface.type_() != InterfaceType::ETHER || !ipv6_link_ready(iface.as_ref()) {
+        return;
+    }
+    // Peer- and port-derived carrier is evaluated after the transaction.
+    // An empty bridge instead retains its current carrier across admin up.
+    let device = iface.as_any_ref();
+    let deferred_carrier = device.is::<crate::driver::net::veth::VethInterface>()
+        || device
+            .downcast_ref::<crate::driver::net::bridge::BridgeIface>()
+            .is_some_and(crate::driver::net::bridge::BridgeIface::has_ports);
+    if !deferred_carrier {
+        evaluate_ready_link_local(netns, iface, Instant::now().total_micros());
+    }
 }
 
 fn initialize_multicast_route(
@@ -481,21 +522,13 @@ fn poll_device(
             notify_automatic_ipv6_route(netns, route, false, false);
         }
     }
-    let (start, accept_dad) = {
-        let state = common.ipv6_autoconf.lock();
-        let start = carrier
-            && state.multicast_initialized
-            && state.address_settings.mode == 0
-            && !state.ready_seen
-            && state.retry.is_none_or(|due| due <= now);
-        (
-            start,
-            effective_accept_dad(netns, state.address_settings.accept_dad),
-        )
-    };
-    if start {
-        initialize_link_local(netns, iface, now);
+    if carrier {
+        evaluate_ready_link_local(netns, iface, now);
     }
+    let accept_dad = effective_accept_dad(
+        netns,
+        common.ipv6_autoconf.lock().address_settings.accept_dad,
+    );
 
     let resume_due = resume_retained_addresses(rtnl, netns, iface, link_ready, now)
         .err()
@@ -600,6 +633,21 @@ fn resume_retained_addresses(
 
 fn generated_link_local(iface: &dyn Iface) -> Option<Ipv6Address> {
     address_from_mac(iface, Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0))
+}
+
+fn evaluate_ready_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, now: i64) {
+    let mut state = iface.common().ipv6_autoconf.lock();
+    if !state.multicast_initialized || state.ready_seen || state.retry.is_some_and(|due| due > now)
+    {
+        return;
+    }
+    if state.address_settings.mode != 0 {
+        state.ready_seen = true;
+        state.retry = None;
+        return;
+    }
+    drop(state);
+    initialize_link_local(netns, iface, now);
 }
 
 fn initialize_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, now: i64) {

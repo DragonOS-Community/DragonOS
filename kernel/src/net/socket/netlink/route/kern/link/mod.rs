@@ -14,9 +14,8 @@ use crate::{
         bridge::BridgeIface,
         types::{InterfaceFlags, InterfaceType},
         veth::VethInterface,
-        Iface, NetDeivceState, Operstate,
+        Iface, IfaceCommon, NetDeivceState, Operstate,
     },
-    net::link::{LinkFlagsUpdate, LinkMtuUpdate, LinkMutationCommit, LinkTarget, LinkUpdate},
     net::socket::{
         netlink::{
             message::segment::{
@@ -26,7 +25,9 @@ use crate::{
             route::{
                 kern::utils::{kernel_notify_header, multicast_notify, RTMGRP_LINK},
                 message::{
-                    attr::link::{append_nested_link_attr, parse_nested_link_attrs, LinkAttr},
+                    attr::link::{
+                        append_nested_link_attr, parse_nested_link_attrs, LinkAttr, IFLA_AF_SPEC,
+                    },
                     segment::{
                         link::{CIfinfoMsg, LinkMessageFlags, LinkSegment, LinkSegmentBody},
                         RouteNlSegment,
@@ -35,6 +36,10 @@ use crate::{
             },
         },
         AddressFamily,
+    },
+    net::{
+        address::ipv6_autoconf::{self, AddressSetting},
+        link::{LinkFlagsUpdate, LinkMtuUpdate, LinkMutationCommit, LinkTarget, LinkUpdate},
     },
     process::namespace::net_namespace::NetNamespace,
 };
@@ -292,6 +297,40 @@ impl PeerCarrierSnapshot {
     }
 }
 
+const IFLA_INET6_ADDR_GEN_MODE: u16 = 8;
+
+fn link_af_spec(request: &LinkSegment) -> Option<&[u8]> {
+    request.attrs().iter().rev().find_map(|attr| match attr {
+        LinkAttr::AfSpec(data) => Some(data.as_slice()),
+        _ => None,
+    })
+}
+
+fn ipv6_addr_gen_mode(
+    data: &[u8],
+    common: Option<&IfaceCommon>,
+) -> Result<Option<u8>, SystemError> {
+    let mut mode = None;
+    for family in parse_nested_link_attrs(data)? {
+        if family.kind != AddressFamily::INet6 as u16
+            || !common.is_some_and(IfaceCommon::ipv6_device_present)
+        {
+            return Err(SystemError::EAFNOSUPPORT);
+        }
+        let mut value = None;
+        for attr in parse_nested_link_attrs(family.payload)? {
+            if attr.kind != IFLA_INET6_ADDR_GEN_MODE {
+                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            }
+            value = Some(*attr.payload.first().ok_or(SystemError::ERANGE)?);
+        }
+        let value = value.ok_or(SystemError::EINVAL)?;
+        AddressSetting::AddrGenMode.validate(i32::from(value))?;
+        mode = Some(value);
+    }
+    Ok(mode)
+}
+
 pub(super) fn do_set_link(
     rtnl: &crate::net::rtnl::RtnlGuard,
     request_segment: &LinkSegment,
@@ -302,6 +341,12 @@ pub(super) fn do_set_link(
         bridge_port::set_hairpin(rtnl, request_segment, source_netns)?;
         return Ok(Vec::new());
     }
+    let addr_gen_mode = if let Some(data) = link_af_spec(request_segment) {
+        let iface = find_iface_for_link(request_segment, &source_netns)?;
+        ipv6_addr_gen_mode(data, Some(iface.common()))?
+    } else {
+        None
+    };
     let mut notify_stp = false;
     if request_segment
         .attrs()
@@ -434,7 +479,7 @@ pub(super) fn do_set_link(
     let iface = committed.iface.clone();
     let notify_settings = committed.changes.is_empty()
         && (mac_changed || (notify_stp && iface.flags().contains(InterfaceFlags::UP)));
-    notify_link_commit(&target_netns, committed);
+    notify_link_commit(rtnl, &target_netns, committed);
     if let Some(peer_carrier) = peer_carrier {
         peer_carrier.notify_if_changed();
     }
@@ -466,10 +511,20 @@ pub(super) fn do_set_link(
             new_bridge.notify_if_changed();
         }
     }
+    if let Some(mode) = addr_gen_mode {
+        ipv6_autoconf::set_rtnl_addr_gen_mode(rtnl, iface.common(), mode)?;
+        if iface.flags().contains(InterfaceFlags::UP) {
+            notify_link_change(&iface);
+        }
+    }
     Ok(Vec::new())
 }
 
-pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutationCommit) {
+pub(crate) fn notify_link_commit(
+    rtnl: &crate::net::rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    committed: LinkMutationCommit,
+) {
     let LinkMutationCommit {
         iface,
         changes,
@@ -477,6 +532,7 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
         removed_addresses,
         route_changes,
         multicast_route,
+        evaluate_ipv6_after_notify,
         removed_neighbors,
         rename_old_devpath,
         related,
@@ -499,7 +555,10 @@ pub(crate) fn notify_link_commit(netns: &Arc<NetNamespace>, committed: LinkMutat
         removed_neighbors,
     );
     if let Some(related) = related {
-        notify_link_commit(netns, *related);
+        notify_link_commit(rtnl, netns, *related);
+    }
+    if evaluate_ipv6_after_notify {
+        ipv6_autoconf::evaluate_ipv6_after_link_change(rtnl, netns, &iface);
     }
 }
 
@@ -594,7 +653,8 @@ fn parse_setlink_attrs(
             | LinkAttr::NetNsFd(_)
             | LinkAttr::NetNsPid(_)
             | LinkAttr::Address(_)
-            | LinkAttr::LinkInfo(_) => {}
+            | LinkAttr::LinkInfo(_)
+            | LinkAttr::AfSpec(_) => {}
             LinkAttr::NewIfIndex(_) => return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
             LinkAttr::Allmulti(_) => return Err(SystemError::EINVAL),
             LinkAttr::Promiscuity(_) | LinkAttr::LinkMode(_) | LinkAttr::ExtMask(_) => {}

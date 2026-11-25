@@ -295,13 +295,13 @@ pub(crate) fn delete_link(
     };
     if let Some(plan) = first_bridge {
         if let Some(commit) = plan.commit() {
-            crate::net::socket::netlink::notify_link_commit(netns, commit);
+            crate::net::socket::netlink::notify_link_commit(rtnl, netns, commit);
         }
     }
     if let Some(plan) = peer_bridge {
         let owner = peer_owner.as_ref().ok_or(SystemError::ENODEV)?;
         if let Some(commit) = plan.commit() {
-            crate::net::socket::netlink::notify_link_commit(owner, commit);
+            crate::net::socket::netlink::notify_link_commit(rtnl, owner, commit);
         }
     }
     veth.shutdown_pair();
@@ -409,14 +409,14 @@ pub(crate) fn set_master(
                 return Err(SystemError::EINVAL);
             }
             if let Some(commit) = bridge.add_port(rtnl, netns, port)? {
-                crate::net::socket::netlink::notify_link_commit(netns, commit);
+                crate::net::socket::netlink::notify_link_commit(rtnl, netns, commit);
             }
             Ok(())
         }
         None => {
             let bridge = port.bridge_master().ok_or(SystemError::EINVAL)?;
             if let Some(commit) = bridge.remove_port(rtnl, netns, port)? {
-                crate::net::socket::netlink::notify_link_commit(netns, commit);
+                crate::net::socket::netlink::notify_link_commit(rtnl, netns, commit);
             }
             Ok(())
         }

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <net/if.h>
+#include <ifaddrs.h>
 #include <linux/if_link.h>
 #include <linux/if.h>
 #include <linux/if_addr.h>
@@ -90,6 +91,14 @@ void AppendAttr(std::vector<uint8_t>& bytes, uint16_t type, const void* data, si
     if (len) std::memcpy(RTA_DATA(attr), data, len);
 }
 
+bool AddIpv6AddrGenMode(LinkRequest& request, uint8_t mode) {
+    std::vector<uint8_t> ipv6;
+    AppendAttr(ipv6, IFLA_INET6_ADDR_GEN_MODE, &mode, sizeof(mode));
+    std::vector<uint8_t> families;
+    AppendAttr(families, AF_INET6, ipv6.data(), ipv6.size());
+    return request.add(IFLA_AF_SPEC, families.data(), families.size());
+}
+
 int SendAck(int fd, const nlmsghdr* request) {
     if (send(fd, request, request->nlmsg_len, 0) < 0) return errno;
     std::array<uint8_t, 4096> reply {};
@@ -120,6 +129,7 @@ struct LinkState {
     uint32_t mtu = 0;
     uint32_t tx_queue_len = 0;
     std::optional<uint8_t> operstate;
+    std::optional<uint8_t> ipv6_addr_gen_mode;
     std::optional<uint32_t> bridge_stp_state;
     std::optional<std::array<uint8_t, ETH_ALEN>> mac;
     std::string kind;
@@ -165,6 +175,28 @@ std::optional<uint8_t> WaitForLinkOperstate(int fd, uint16_t kind, uint32_t inde
     }
 }
 
+std::optional<uint8_t> ReadIpv6AddrGenMode(const nlmsghdr* message) {
+    const auto* info = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
+    int bytes = IFLA_PAYLOAD(message);
+    for (auto* attr = IFLA_RTA(info); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
+        if ((attr->rta_type & NLA_TYPE_MASK) != IFLA_AF_SPEC) continue;
+        int families = RTA_PAYLOAD(attr);
+        for (auto* family = static_cast<rtattr*>(RTA_DATA(attr));
+             RTA_OK(family, families); family = RTA_NEXT(family, families)) {
+            if ((family->rta_type & NLA_TYPE_MASK) != AF_INET6) continue;
+            int options = RTA_PAYLOAD(family);
+            for (auto* option = static_cast<rtattr*>(RTA_DATA(family));
+                 RTA_OK(option, options); option = RTA_NEXT(option, options)) {
+                if ((option->rta_type & NLA_TYPE_MASK) == IFLA_INET6_ADDR_GEN_MODE &&
+                    RTA_PAYLOAD(option) == sizeof(uint8_t)) {
+                    return *static_cast<const uint8_t*>(RTA_DATA(option));
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t seq) {
     if (send(fd, request.bytes.data(), request.header()->nlmsg_len, 0) < 0) return std::nullopt;
     std::array<uint8_t, 4096> reply {};
@@ -180,6 +212,7 @@ std::optional<LinkState> QueryLinkRequest(int fd, LinkRequest& request, uint32_t
             state.index = body->ifi_index;
             state.flags = body->ifi_flags;
             state.operstate = ReadOperstate(message);
+            state.ipv6_addr_gen_mode = ReadIpv6AddrGenMode(message);
             int bytes = IFLA_PAYLOAD(message);
             for (auto* attr = IFLA_RTA(body); RTA_OK(attr, bytes); attr = RTA_NEXT(attr, bytes)) {
                 if (attr->rta_type == IFLA_ADDRESS && RTA_PAYLOAD(attr) == ETH_ALEN) {
@@ -534,6 +567,133 @@ TEST(RtnetlinkBridgeVethSemantics, Ipv6AutoconfSettingsTrackRenameAndNamespaceMo
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "accept_dad", "1\n", "0\n");
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "dad_transmits", "1\n");
     CheckDeviceSysctlTracksRenameAndNamespaceMove("ipv6", "router_solicitations", "-1\n");
+}
+
+TEST(RtnetlinkBridgeVethSemantics, Ipv6AddrGenModeRoundTripsAndRespectsMtu) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd route;
+            ASSERT_GE(route.fd, 0);
+            const char device[] = "addrgen0";
+            LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 6100);
+            ASSERT_TRUE(create.name(device));
+            AddKind(create, "veth", {});
+            ASSERT_EQ(SendAck(route.fd, create), 0);
+            const int index = if_nametoindex(device);
+            ASSERT_GT(index, 0);
+
+            const auto set_mode = [&](uint16_t type, uint8_t mode, uint32_t seq,
+                                      uint32_t mtu = 0, bool up = false) {
+                LinkRequest request(type, 0, seq);
+                request.body()->ifi_index = index;
+                if (up) {
+                    request.body()->ifi_flags = IFF_UP;
+                    request.body()->ifi_change = IFF_UP;
+                }
+                if (!AddIpv6AddrGenMode(request, mode) ||
+                    (mtu != 0 && !request.add(IFLA_MTU, &mtu, sizeof(mtu)))) return EINVAL;
+                return SendAck(route.fd, request);
+            };
+
+            ASSERT_EQ(set_mode(RTM_SETLINK, IN6_ADDR_GEN_MODE_NONE, 6101), 0);
+            auto state = QueryLink(route.fd, device, 6102);
+            ASSERT_TRUE(state.has_value());
+            EXPECT_EQ(state->ipv6_addr_gen_mode, IN6_ADDR_GEN_MODE_NONE);
+            EXPECT_EQ(set_mode(RTM_NEWLINK, 255, 6103, 0, true), EINVAL);
+            state = QueryLink(route.fd, device, 6104);
+            ASSERT_TRUE(state.has_value());
+            EXPECT_EQ(state->flags & IFF_UP, 0u);
+            EXPECT_EQ(state->ipv6_addr_gen_mode, IN6_ADDR_GEN_MODE_NONE);
+
+            ASSERT_EQ(SetLinkUp(route.fd, index, true, 6110), 0);
+            RouteFd notifications(RTMGRP_LINK);
+            ASSERT_GE(notifications.fd, 0);
+            for (uint32_t seq : {6111u, 6112u}) {
+                ASSERT_EQ(set_mode(RTM_NEWLINK, IN6_ADDR_GEN_MODE_EUI64, seq), 0);
+                bool observed = false;
+                for (int attempt = 0; attempt < 8 && !observed; ++attempt) {
+                    std::array<uint8_t, 4096> reply{};
+                    const ssize_t count = recv(notifications.fd, reply.data(), reply.size(), 0);
+                    ASSERT_GE(count, static_cast<ssize_t>(NLMSG_LENGTH(sizeof(ifinfomsg))));
+                    const auto* event = reinterpret_cast<const nlmsghdr*>(reply.data());
+                    if (event->nlmsg_type != RTM_NEWLINK) continue;
+                    const auto* info = static_cast<const ifinfomsg*>(NLMSG_DATA(event));
+                    observed = info->ifi_index == index &&
+                        ReadIpv6AddrGenMode(event) == IN6_ADDR_GEN_MODE_EUI64;
+                }
+                EXPECT_TRUE(observed);
+            }
+
+            ASSERT_EQ(set_mode(RTM_SETLINK, IN6_ADDR_GEN_MODE_NONE, 6105, 1279), EAFNOSUPPORT);
+            ASSERT_EQ(set_mode(RTM_NEWLINK, IN6_ADDR_GEN_MODE_NONE, 6106, 1280), EAFNOSUPPORT);
+            state = QueryLink(route.fd, device, 6107);
+            ASSERT_TRUE(state.has_value());
+            EXPECT_EQ(state->mtu, 1279u);
+            EXPECT_FALSE(state->ipv6_addr_gen_mode.has_value());
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RtnetlinkBridgeVethSemantics, EmptyBridgeUsesPreviousIpv6AddrGenModeOnUp) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const auto run = [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0);
+            RouteFd route;
+            ASSERT_GE(route.fd, 0);
+            const auto check = [&](const char* name, uint8_t old_mode, uint8_t new_mode,
+                                   uint32_t seq) {
+                LinkRequest create(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, seq);
+                ASSERT_TRUE(create.name(name));
+                AddKind(create, "bridge");
+                ASSERT_EQ(SendAck(route.fd, create), 0);
+                const int index = if_nametoindex(name);
+                ASSERT_GT(index, 0);
+                LinkRequest set_mode(RTM_SETLINK, 0, seq + 1);
+                set_mode.body()->ifi_index = index;
+                ASSERT_TRUE(AddIpv6AddrGenMode(set_mode, old_mode));
+                ASSERT_EQ(SendAck(route.fd, set_mode), 0);
+
+                LinkRequest up(RTM_NEWLINK, 0, seq + 2);
+                up.body()->ifi_index = index;
+                up.body()->ifi_flags = IFF_UP;
+                up.body()->ifi_change = IFF_UP;
+                ASSERT_TRUE(AddIpv6AddrGenMode(up, new_mode));
+                ASSERT_EQ(SendAck(route.fd, up), 0);
+
+                if (old_mode == IN6_ADDR_GEN_MODE_NONE) usleep(200'000);
+                ifaddrs* interfaces = nullptr;
+                ASSERT_EQ(getifaddrs(&interfaces), 0);
+                bool found = false;
+                for (auto* entry = interfaces; entry; entry = entry->ifa_next) {
+                    if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET6 ||
+                        std::strcmp(entry->ifa_name, name) != 0) continue;
+                    const auto* address = reinterpret_cast<const sockaddr_in6*>(entry->ifa_addr);
+                    found |= IN6_IS_ADDR_LINKLOCAL(&address->sin6_addr);
+                }
+                freeifaddrs(interfaces);
+                EXPECT_EQ(found, old_mode == IN6_ADDR_GEN_MODE_EUI64);
+            };
+            check("empty-eui", IN6_ADDR_GEN_MODE_EUI64, IN6_ADDR_GEN_MODE_NONE, 6120);
+            check("empty-none", IN6_ADDR_GEN_MODE_NONE, IN6_ADDR_GEN_MODE_EUI64, 6130);
+        };
+        run();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST(RtnetlinkBridgeVethSemantics, AutomaticIpv6LinkLocalFollowsVethCarrierAndDAD) {

@@ -125,6 +125,9 @@ fn veth_peer(
                             Some(u32::from_ne_bytes(peer_attr.payload.try_into().unwrap()));
                     }
                     13 => return Err(SystemError::EINVAL),
+                    IFLA_AF_SPEC => {
+                        ipv6_addr_gen_mode(peer_attr.payload, None)?;
+                    }
                     28 if peer_attr.payload.len() == 4 => {
                         peer_fd = Some(u32::from_ne_bytes(peer_attr.payload.try_into().unwrap()));
                     }
@@ -211,6 +214,9 @@ pub(crate) fn do_new_link(
     if request.body().index.is_some() {
         return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
     }
+    if let Some(data) = link_af_spec(request) {
+        ipv6_addr_gen_mode(data, None)?;
+    }
     let mut target_fd = None;
     let mut target_pid = None;
     let mut master_index = None;
@@ -220,7 +226,7 @@ pub(crate) fn do_new_link(
     };
     for attr in request.attrs() {
         match attr {
-            LinkAttr::Name(_) | LinkAttr::LinkInfo(_) => {}
+            LinkAttr::Name(_) | LinkAttr::LinkInfo(_) | LinkAttr::AfSpec(_) => {}
             LinkAttr::NetNsFd(fd) => target_fd = Some(*fd),
             LinkAttr::NetNsPid(pid) => target_pid = Some(*pid),
             LinkAttr::Master(index) => master_index = Some(*index),

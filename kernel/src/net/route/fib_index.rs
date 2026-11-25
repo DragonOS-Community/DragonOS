@@ -1630,7 +1630,7 @@ mod tests {
             gateway: None,
             nexthop_flags: 0,
             ipv6_address_local: false,
-            ra_route: None,
+            ipv6_metadata: None,
         }
     }
 
@@ -1718,15 +1718,17 @@ mod tests {
             ..route([0; 4], 0, 1024, RTN_UNICAST)
         };
         let learned = |preference, expires_at_us| {
-            Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
-                expires_at_us,
-                preference,
-            }))
+            Some(crate::net::route::Ipv6RouteMetadata::RaDefault(
+                LearnedDefaultRoute {
+                    expires_at_us,
+                    preference,
+                },
+            ))
         };
         let expired = RouteEntry {
             oif: 2,
             gateway: Some(gateway(2)),
-            ra_route: learned(RouterPreference::Medium, 0),
+            ipv6_metadata: learned(RouterPreference::Medium, 0),
             ..ordinary
         };
         let on_ingress = RouteEntry {
@@ -1742,7 +1744,7 @@ mod tests {
         };
         let higher_preference = RouteEntry {
             gateway: Some(gateway(5)),
-            ra_route: learned(RouterPreference::High, i64::MAX),
+            ipv6_metadata: learned(RouterPreference::High, i64::MAX),
             ..ordinary
         };
         let lookup = |routes: &[RouteEntry], preferred_oif| {
@@ -1778,10 +1780,12 @@ mod tests {
         let learned = RouteEntry {
             gateway: Some(learned_gateway),
             ipv6_address_local: false,
-            ra_route: Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
-                expires_at_us: 10,
-                preference: RouterPreference::High,
-            })),
+            ipv6_metadata: Some(crate::net::route::Ipv6RouteMetadata::RaDefault(
+                LearnedDefaultRoute {
+                    expires_at_us: 10,
+                    preference: RouterPreference::High,
+                },
+            )),
             ..default
         };
         let entries = [default, learned];
@@ -1802,7 +1806,8 @@ mod tests {
         let mut expired_entries = entries;
         let mut default = learned.learned_default().unwrap();
         default.expires_at_us = 0;
-        expired_entries[1].ra_route = Some(crate::net::route::RaRoute::Default(default));
+        expired_entries[1].ipv6_metadata =
+            Some(crate::net::route::Ipv6RouteMetadata::RaDefault(default));
         assert_eq!(
             fib.lookup(
                 &expired_entries,
@@ -1817,7 +1822,7 @@ mod tests {
 
         let mut refreshed = entries;
         default.expires_at_us = i64::MAX;
-        refreshed[1].ra_route = Some(crate::net::route::RaRoute::Default(default));
+        refreshed[1].ipv6_metadata = Some(crate::net::route::Ipv6RouteMetadata::RaDefault(default));
         fib.prepare_insert(refreshed[1]).unwrap();
         fib.commit_replace(1, learned, refreshed[1], &refreshed);
         let selected = |fib: &FibIndex, entries: &[RouteEntry]| {
@@ -1833,7 +1838,7 @@ mod tests {
         assert_eq!(selected(&fib, &refreshed), Some(1));
         let old = refreshed[1];
         default.preference = RouterPreference::Low;
-        refreshed[1].ra_route = Some(crate::net::route::RaRoute::Default(default));
+        refreshed[1].ipv6_metadata = Some(crate::net::route::Ipv6RouteMetadata::RaDefault(default));
         fib.prepare_insert(refreshed[1]).unwrap();
         fib.commit_replace(1, old, refreshed[1], &refreshed);
         assert_eq!(selected(&fib, &refreshed), Some(0));
@@ -1853,7 +1858,7 @@ mod tests {
             priority: 256,
             gateway: None,
             ipv6_address_local: false,
-            ra_route: Some(crate::net::route::RaRoute::OnLinkPrefix {
+            ipv6_metadata: Some(crate::net::route::Ipv6RouteMetadata::RaOnLinkPrefix {
                 expires_at_us: Some(10),
             }),
             ..fallback
@@ -1873,7 +1878,7 @@ mod tests {
         );
 
         // Leave the stale entry published so lookup must resolve its alias.
-        entries[1].ra_route = Some(crate::net::route::RaRoute::OnLinkPrefix {
+        entries[1].ipv6_metadata = Some(crate::net::route::Ipv6RouteMetadata::RaOnLinkPrefix {
             expires_at_us: Some(i64::MIN),
         });
         assert_eq!(

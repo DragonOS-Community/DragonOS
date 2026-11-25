@@ -9,16 +9,21 @@ use system_error::SystemError;
 use crate::{
     driver::net::{types::InterfaceFlags, AddressMetadata, AddressState, Iface},
     net::address::CandidateAddressOwnership,
-    net::rtnl::RtnlGuard,
+    net::{
+        rtnl::{self, RtnlGuard},
+        socket::netlink::notify_automatic_ipv6_route,
+    },
     process::namespace::net_namespace::NetNamespace,
 };
 
 use super::{
-    canonical_cidr, is_ipv4, prepare_with_devices, prepare_with_devices_from, projection_for_iface,
-    transact_with_devices, validate_entry_on_iface, FibEditor, FibTable, PreparedTransaction,
-    ProjectionPlan, RouteEntry, RouteNotifications, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST,
-    RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL,
-    RT_TABLE_MAIN,
+    canonical_cidr,
+    fib::{FibEdit, PlannedFibMutation},
+    is_ipv4, prepare_with_devices, prepare_with_devices_from, projection_for_iface,
+    transact_single, transact_with_devices, validate_entry_on_iface, FibEditor, FibTable,
+    PreparedTransaction, ProjectionPlan, RouteEntry, RouteNotifications, RTN_BROADCAST, RTN_LOCAL,
+    RTN_MULTICAST, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE,
+    RT_TABLE_LOCAL, RT_TABLE_MAIN,
 };
 
 pub(crate) fn register_iface(
@@ -60,7 +65,7 @@ pub(crate) fn register_iface(
                 gateway: route.gateway,
                 nexthop_flags: route.nexthop_flags,
                 ipv6_address_local: false,
-                ra_route: None,
+                ipv6_metadata: None,
             };
             validate_entry_on_iface(netns, iface, route)?;
             candidate.insert_derived(route)?;
@@ -233,11 +238,30 @@ pub(crate) struct PreparedAddressRouteCommit {
     ipv6_enabled: Option<bool>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Ipv6PrefixChange {
+    Upsert {
+        address: Ipv6Cidr,
+        expires_at_us: Option<i64>,
+        replace_permanent: bool,
+    },
+    RemovePermanent(Ipv6Cidr),
+}
+
+impl Ipv6PrefixChange {
+    fn address(self) -> Ipv6Cidr {
+        match self {
+            Self::Upsert { address, .. } | Self::RemovePermanent(address) => address,
+        }
+    }
+}
+
 pub(crate) struct AddressLinkChange<'a> {
     pub before: &'a [IpCidr],
     pub after: &'a [IpCidr],
     pub metadata: Vec<AddressMetadata>,
     pub deleted_addresses: &'a [IpAddress],
+    pub ipv6_prefix_change: Option<Ipv6PrefixChange>,
     pub was_up: bool,
     pub is_up: bool,
     pub ipv6_enabled: Option<bool>,
@@ -247,32 +271,6 @@ pub(crate) struct AddressLinkChange<'a> {
 impl PreparedAddressRouteCommit {
     pub(in crate::net) fn candidate(&self) -> &FibTable {
         &self.candidate
-    }
-
-    fn prepare(
-        netns: &Arc<NetNamespace>,
-        iface: &Arc<dyn Iface>,
-        before_addresses: &[IpCidr],
-        after_addresses: &[IpCidr],
-        metadata: Vec<AddressMetadata>,
-        deleted_addresses: &[IpAddress],
-    ) -> Result<Self, SystemError> {
-        let is_up = iface.flags().contains(InterfaceFlags::UP);
-        Self::prepare_for_link(
-            netns,
-            iface,
-            AddressLinkChange {
-                before: before_addresses,
-                after: after_addresses,
-                metadata,
-                deleted_addresses,
-                was_up: is_up,
-                is_up,
-                ipv6_enabled: None,
-                discard_learned_defaults: false,
-            },
-            None,
-        )
     }
 
     fn prepare_for_link(
@@ -286,6 +284,7 @@ impl PreparedAddressRouteCommit {
             after: after_addresses,
             metadata,
             deleted_addresses,
+            ipv6_prefix_change,
             was_up,
             is_up,
             ipv6_enabled,
@@ -308,7 +307,8 @@ impl PreparedAddressRouteCommit {
                 && if disable_ipv6 {
                     !is_ipv4(entry.destination.address())
                 } else {
-                    discard_learned_defaults && entry.learned_default().is_some()
+                    discard_learned_defaults
+                        && (entry.learned_default().is_some() || entry.is_address_prefix())
                 }
         };
         let address_capacity = iface.smol_iface().lock().ip_addr_capacity();
@@ -325,7 +325,7 @@ impl PreparedAddressRouteCommit {
             None => netns.router().fib.read().try_clone()?,
         };
         let mut candidate = before.try_clone()?;
-        let before_routes = {
+        let mut before_routes = {
             let old_metadata = iface.common().address_metadata().lock();
             derived_address_entries_for_link_state(
                 iface,
@@ -335,13 +335,24 @@ impl PreparedAddressRouteCommit {
                 was_ipv6_enabled,
             )?
         };
-        let after_address_routes = derived_address_entries_for_link_state(
+        let mut after_address_routes = derived_address_entries_for_link_state(
             iface,
             after_addresses,
             &metadata,
             was_up,
             is_ipv6_enabled,
         )?;
+        let prefix_change = ipv6_prefix_change
+            .filter(|_| is_up && !iface.flags().contains(InterfaceFlags::LOOPBACK))
+            .map(|change| {
+                let route = connected_address_route(iface, IpCidr::Ipv6(change.address()), None);
+                let projected_elsewhere = |entry: &RouteEntry| {
+                    !entry.is_address_prefix() || entry.destination != route.destination
+                };
+                before_routes.retain(projected_elsewhere);
+                after_address_routes.retain(projected_elsewhere);
+                (change, route)
+            });
         let device_list = netns.device_list();
         let mut devices = Vec::new();
         devices
@@ -375,6 +386,33 @@ impl PreparedAddressRouteCommit {
                 },
             )
         }?;
+        let prefix_replacement = match prefix_change {
+            Some((
+                Ipv6PrefixChange::Upsert {
+                    expires_at_us,
+                    replace_permanent,
+                    ..
+                },
+                route,
+            )) => editor.update_address_prefix(
+                route.with_address_prefix_deadline(expires_at_us),
+                replace_permanent,
+            )?,
+            Some((Ipv6PrefixChange::RemovePermanent(_), route)) => {
+                let siblings = metadata
+                    .iter()
+                    .filter(|entry| canonical_cidr(entry.cidr) == route.destination);
+                if siblings.clone().any(|entry| entry.ipv6_permanent) {
+                    None
+                } else {
+                    let deadline = siblings
+                        .filter_map(|entry| entry.lifetimes?.valid_until_us())
+                        .max();
+                    editor.remove_permanent_address_prefix(route, deadline)?
+                }
+            }
+            None => None,
+        };
         if disable_ipv6 || discard_learned_defaults {
             editor.remove_where(remove_for_ipv6)?;
         }
@@ -445,6 +483,10 @@ impl PreparedAddressRouteCommit {
             notifications.removed.retain(|entry| {
                 !is_ipv4(entry.destination.address()) || address_removed.contains(entry)
             });
+        }
+        if let Some((old, new)) = prefix_replacement {
+            notifications.removed.retain(|entry| *entry != old);
+            notifications.added.retain(|entry| *entry != new);
         }
         silent.removed.sort_unstable();
         silent.added.sort_unstable();
@@ -598,25 +640,6 @@ pub(in crate::net) fn prepare_address_link_change_from(
     PreparedAddressRouteCommit::prepare_for_link(netns, iface, change, Some(staged_before))
 }
 
-pub(crate) fn prepare_address_update(
-    _rtnl: &RtnlGuard,
-    netns: &Arc<NetNamespace>,
-    iface: &Arc<dyn Iface>,
-    before: &[IpCidr],
-    after: &[IpCidr],
-    metadata: Vec<AddressMetadata>,
-    deleted_address: Option<IpAddress>,
-) -> Result<PreparedAddressRouteCommit, SystemError> {
-    PreparedAddressRouteCommit::prepare(
-        netns,
-        iface,
-        before,
-        after,
-        metadata,
-        deleted_address.as_slice(),
-    )
-}
-
 fn derived_address_entries(
     iface: &Arc<dyn Iface>,
     addresses: &[IpCidr],
@@ -663,7 +686,7 @@ fn derived_address_entries_for_link_state(
             gateway: None,
             nexthop_flags: 0,
             ipv6_address_local: false,
-            ra_route: None,
+            ipv6_metadata: None,
         });
     }
     let addresses_with_metadata = addresses
@@ -686,6 +709,7 @@ fn derived_address_entries_for_link_state(
             broadcast,
             is_up,
             state,
+            metadata.is_none_or(|entry| entry.ipv6_permanent),
         )? {
             if !result.contains(&entry) {
                 result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
@@ -701,20 +725,13 @@ fn ipv4_prefix_is_zeronet(cidr: smoltcp::wire::Ipv4Cidr) -> bool {
     cidr.network().address().is_unspecified()
 }
 
-fn entries_for_address(
+fn connected_address_route(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
     primary: Option<IpAddress>,
-    broadcast: Option<smoltcp::wire::Ipv4Address>,
-    is_up: bool,
-    state: AddressState,
-) -> Result<Vec<RouteEntry>, SystemError> {
+) -> RouteEntry {
     let ipv4 = is_ipv4(cidr.address());
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
-    let mut result = Vec::new();
-    result
-        .try_reserve_exact(4)
-        .map_err(|_| SystemError::ENOMEM)?;
     let connected = RouteEntry {
         destination: canonical_cidr(cidr),
         source: None,
@@ -743,17 +760,42 @@ fn entries_for_address(
         gateway: None,
         nexthop_flags: 0,
         ipv6_address_local: false,
-        ra_route: None,
+        ipv6_metadata: None,
     };
+    if ipv4 || loopback {
+        connected
+    } else {
+        connected.with_address_prefix_deadline(None)
+    }
+}
+
+fn entries_for_address(
+    iface: &Arc<dyn Iface>,
+    cidr: IpCidr,
+    primary: Option<IpAddress>,
+    broadcast: Option<smoltcp::wire::Ipv4Address>,
+    is_up: bool,
+    state: AddressState,
+    ipv6_permanent: bool,
+) -> Result<Vec<RouteEntry>, SystemError> {
+    let ipv4 = is_ipv4(cidr.address());
+    let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(4)
+        .map_err(|_| SystemError::ENOMEM)?;
+    let connected = connected_address_route(iface, cidr, primary);
     let add_connected = match cidr {
         IpCidr::Ipv4(cidr) => {
             (loopback || cidr.prefix_len() < 32)
                 && !ipv4_prefix_is_zeronet(cidr)
                 && (loopback || is_up)
         }
-        // Linux keeps the address object and its host-local route while the
-        // device is down, but defers the IPv6 prefix route until NETDEV_UP.
-        IpCidr::Ipv6(_) => is_up && !matches!(state, AddressState::Slaac(_)),
+        // Finite IPv6 prefix routes have an independent lifetime and are
+        // changed only by the explicit address prefix operation.
+        IpCidr::Ipv6(_) => {
+            is_up && (loopback || ipv6_permanent) && !matches!(state, AddressState::Slaac(_))
+        }
     };
     if add_connected {
         result.push(connected);
@@ -772,6 +814,7 @@ fn entries_for_address(
         },
         kind: RTN_LOCAL,
         ipv6_address_local: !ipv4,
+        ipv6_metadata: None,
         ..connected
     };
     // Keep the host route of a usable address while down. Unlike a
@@ -839,4 +882,61 @@ fn primary_for_prefix(addresses: &[IpCidr], cidr: IpCidr) -> Option<IpAddress> {
         .iter()
         .find(|candidate| canonical_cidr(**candidate) == prefix)
         .map(|candidate| candidate.address())
+}
+
+pub(super) fn apply_automatic_ipv6_route_edit(
+    rtnl: &RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    plan: impl FnOnce(&FibTable) -> FibEdit,
+) -> Result<FibEdit, SystemError> {
+    // RTNL keeps the edit stable until projection and FIB publication.
+    let edit = plan(&netns.router().fib.read());
+    if matches!(edit, FibEdit::None) {
+        return Ok(edit);
+    }
+    transact_single(rtnl, netns, |_| {
+        Ok(PlannedFibMutation { edit, outcome: () })
+    })?;
+    match edit {
+        FibEdit::Insert { route, .. } => notify_automatic_ipv6_route(netns, route, false, false),
+        FibEdit::Delete { route, .. } => notify_automatic_ipv6_route(netns, route, true, false),
+        FibEdit::Replace { old, new, .. } if old.preference() != new.preference() => {
+            notify_automatic_ipv6_route(netns, new, false, true);
+        }
+        _ => {}
+    }
+    Ok(edit)
+}
+
+pub(crate) fn next_ipv6_route_deadline_us(netns: &NetNamespace) -> Option<i64> {
+    netns
+        .router()
+        .fib
+        .read()
+        .expiring_ipv6_routes()
+        .filter_map(RouteEntry::expires_at_us)
+        .min()
+}
+
+/// Remove in bounded batches, retaining an earlier retry if projection
+/// preparation fails. The FIB and smoltcp already ignore overdue routes.
+pub(crate) fn expire_ipv6_routes(netns: &Arc<NetNamespace>, now_us: i64) -> Option<i64> {
+    let rtnl = rtnl::lock();
+    for _ in 0..16 {
+        let route = netns
+            .router()
+            .fib
+            .read()
+            .expiring_ipv6_routes()
+            .find(|route| !route.is_live_at(now_us));
+        let Some(route) = route else {
+            break;
+        };
+        if apply_automatic_ipv6_route_edit(&rtnl, netns, |fib| fib.plan_expired_route(route))
+            .is_err()
+        {
+            return Some(now_us.saturating_add(10_000));
+        }
+    }
+    next_ipv6_route_deadline_us(netns)
 }

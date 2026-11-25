@@ -11,7 +11,7 @@ use system_error::SystemError;
 
 use crate::{
     driver::net::{types::InterfaceFlags, AddressMetadata, AddressState, DadState, Iface},
-    net::rtnl::RtnlGuard,
+    net::{route::Ipv6PrefixChange, rtnl::RtnlGuard},
     process::namespace::net_namespace::NetNamespace,
 };
 
@@ -196,6 +196,7 @@ pub(crate) fn set_device_ipv6_disabled(
             after: &after,
             metadata,
             deleted_addresses: &deleted_addresses,
+            ipv6_prefix_change: None,
             was_up: up,
             is_up: up,
             ipv6_enabled: Some(enabled),
@@ -683,6 +684,7 @@ pub(in crate::net) fn prepare_link_address_change(
         after: &after,
         metadata,
         deleted_addresses: &deleted_addresses,
+        ipv6_prefix_change: None,
         was_up,
         is_up,
         ipv6_enabled: None,
@@ -865,7 +867,7 @@ fn commit_unpublished(
 }
 
 fn commit_published(
-    rtnl: &RtnlGuard,
+    _rtnl: &RtnlGuard,
     iface: &Arc<dyn Iface>,
     mutation: CommitMutation,
     options: AddressOptions,
@@ -900,6 +902,7 @@ fn commit_published(
     let mut lifetime_deadline_changed = false;
     let mut manual_probe = None;
     let mut deleted_retained = false;
+    let mut ipv6_prefix_change = None;
     let outcome = match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr) | AddressMutation::Replace(cidr)) => {
             let existing = existing(cidr);
@@ -926,6 +929,14 @@ fn commit_published(
                         metadata.len() - 1
                     });
                 let entry = &mut metadata[index];
+                if let IpCidr::Ipv6(address) = existing {
+                    ipv6_prefix_change = Some(Ipv6PrefixChange::Upsert {
+                        address,
+                        expires_at_us: ipv6_lifetimes
+                            .and_then(ipv6_lifetime::Lifetimes::valid_until_us),
+                        replace_permanent: entry.ipv6_permanent,
+                    });
+                }
                 match entry.state {
                     AddressState::Slaac(DadState::Usable) => entry.state = AddressState::Configured,
                     AddressState::Slaac(state) => entry.state = AddressState::ManualDad(state),
@@ -939,6 +950,14 @@ fn commit_published(
                 AddressMutationOutcome::Replaced(existing)
             } else {
                 validate_published_address_addition(iface, cidr)?;
+                if let IpCidr::Ipv6(address) = cidr {
+                    ipv6_prefix_change = Some(Ipv6PrefixChange::Upsert {
+                        address,
+                        expires_at_us: ipv6_lifetimes
+                            .and_then(ipv6_lifetime::Lifetimes::valid_until_us),
+                        replace_permanent: false,
+                    });
+                }
                 if let (IpCidr::Ipv6(ipv6), Some(false)) = (cidr, options.ipv6_nodad) {
                     if ipv6.address().x_is_unicast() {
                         manual_probe = ipv6_autoconf::manual_dad_transmits(iface.as_ref())
@@ -972,6 +991,15 @@ fn commit_published(
             {
                 return Err(SystemError::EADDRNOTAVAIL);
             }
+            if let IpCidr::Ipv6(address) = cidr {
+                if metadata
+                    .iter()
+                    .find(|entry| entry.cidr == cidr)
+                    .is_none_or(|entry| entry.ipv6_permanent)
+                {
+                    ipv6_prefix_change = Some(Ipv6PrefixChange::RemovePermanent(address));
+                }
+            }
             metadata.retain(|entry| {
                 if entry.cidr != cidr {
                     return true;
@@ -988,13 +1016,29 @@ fn commit_published(
         }
         _ => None,
     };
-    let prepared = crate::net::route::prepare_address_update(
-        rtnl, &netns, iface, &before, &after, metadata, deleted,
+    let is_up = iface.flags().contains(InterfaceFlags::UP);
+    let prepared = crate::net::route::prepare_address_link_change(
+        &netns,
+        iface,
+        crate::net::route::AddressLinkChange {
+            before: &before,
+            after: &after,
+            metadata,
+            deleted_addresses: deleted.as_slice(),
+            ipv6_prefix_change,
+            was_up: is_up,
+            is_up,
+            ipv6_enabled: None,
+            discard_learned_defaults: false,
+        },
     )?;
     if let Some((address, transmits)) = manual_probe {
         ipv6_autoconf::start_manual_probe(&netns, iface.common(), address, transmits)?;
     }
     let route_changes = prepared.publish(&netns, iface);
+    if ipv6_prefix_change.is_some() && is_up {
+        netns.notify_ipv6_route_deadline();
+    }
     if manual_probe.is_some() || lifetime_deadline_changed {
         ipv6_autoconf::changed(iface.common());
     }
@@ -1058,6 +1102,7 @@ fn prepare_automatic_address(
             after: &after,
             metadata,
             deleted_addresses: &[],
+            ipv6_prefix_change: None,
             was_up: up,
             is_up: up,
             ipv6_enabled: None,

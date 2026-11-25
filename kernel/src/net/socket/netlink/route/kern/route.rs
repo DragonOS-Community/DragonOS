@@ -147,7 +147,7 @@ pub(super) fn do_new_route(
             0
         },
         ipv6_address_local: false,
-        ra_route: None,
+        ipv6_metadata: None,
     };
     let nl_flags = NewRequestFlags::from_bits_truncate(request.header().flags);
     let outcome = route::add_route(
@@ -556,9 +556,7 @@ fn lookup_route(
         } else {
             decision.matched.oif
         },
-        protocol: if decision.matched.ra_route.is_some()
-            || decision.matched.is_explicit_ipv6_local()
-        {
+        protocol: if decision.matched.is_ra_managed() || decision.matched.is_explicit_ipv6_local() {
             decision.matched.protocol
         } else {
             RouteProtocol::Unspec as u8
@@ -636,7 +634,7 @@ pub(super) fn notify_route(netns: &Arc<NetNamespace>, kind: CSegmentType, route:
     notify_route_with_flags(netns, kind, route, flags)
 }
 
-pub(crate) fn notify_ra_route(
+pub(crate) fn notify_automatic_ipv6_route(
     netns: &Arc<NetNamespace>,
     route: RouteEntry,
     removed: bool,

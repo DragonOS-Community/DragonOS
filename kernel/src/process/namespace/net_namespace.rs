@@ -19,6 +19,7 @@ use crate::net::ipv6_defrag::{
 use crate::net::neighbor::NeighborTable;
 use crate::net::nftables::NftNamespaceState;
 use crate::net::route::ra::{self, Advertisement, PendingAdvertisements, ADVERTISEMENT_BATCH};
+use crate::net::route::{expire_ipv6_routes, next_ipv6_route_deadline_us};
 use crate::net::routing::Router;
 use crate::net::socket::inet::datagram::udp_bindings::UdpBindingTable;
 use crate::net::socket::netlink::table::{
@@ -797,6 +798,7 @@ struct NetnsPoller {
     ipv6_defrag_enabled: AtomicBool,
     router_advertisements: SpinLock<PendingAdvertisements>,
     ipv6_autoconf_pending: AtomicBool,
+    ipv6_route_deadline_dirty: AtomicBool,
     /// # 轮询线程的 PCB（用于 stop）
     thread: RwSem<Option<Arc<ProcessControlBlock>>>,
 }
@@ -814,6 +816,7 @@ impl NetnsPoller {
             ipv6_defrag_enabled: AtomicBool::new(false),
             router_advertisements: SpinLock::new(PendingAdvertisements::default()),
             ipv6_autoconf_pending: AtomicBool::new(false),
+            ipv6_route_deadline_dirty: AtomicBool::new(false),
             thread: RwSem::new(None),
         })
     }
@@ -1090,7 +1093,7 @@ impl NetnsPoller {
     fn polling(&self) {
         let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
         let mut cleanup_retry_at = None;
-        let mut ra_deadline = None;
+        let mut ipv6_route_deadline = None;
         let mut ipv6_autoconf_deadline = None;
         // The namespace poller owns reassembly exclusively. Neither NAPI nor
         // the pending-ring spinlock performs fragment allocation or expiry.
@@ -1149,13 +1152,15 @@ impl NetnsPoller {
                 ra::apply(&netns, advertisement);
                 processed_advertisement = true;
             }
-            if processed_advertisement {
-                ra_deadline = ra::next_deadline_us(&netns);
+            let route_deadline_changed =
+                self.ipv6_route_deadline_dirty.swap(false, Ordering::AcqRel);
+            if processed_advertisement || route_deadline_changed {
+                ipv6_route_deadline = next_ipv6_route_deadline_us(&netns);
             }
-            if let Some(deadline) = ra_deadline {
+            if let Some(deadline) = ipv6_route_deadline {
                 let now_us = Instant::now().total_micros();
                 if deadline <= now_us {
-                    ra_deadline = ra::expire(&netns, now_us);
+                    ipv6_route_deadline = expire_ipv6_routes(&netns, now_us);
                 }
             }
             if ipv4_defrag
@@ -1240,7 +1245,7 @@ impl NetnsPoller {
             if self.has_pending_ip_fragments() {
                 next_us = Some(deadline_now_us);
             }
-            if let Some(deadline) = ra_deadline {
+            if let Some(deadline) = ipv6_route_deadline {
                 let deadline = deadline.max(0) as u64;
                 next_us = Some(next_us.map_or(deadline, |current| current.min(deadline)));
             }
@@ -2495,6 +2500,13 @@ impl NetNamespace {
     /// network I/O. Safe to call after dropping smoltcp and topology locks.
     pub fn notify_deadline_changed(&self) {
         self.poller.notify_deadline_changed();
+    }
+
+    pub(crate) fn notify_ipv6_route_deadline(&self) {
+        self.poller
+            .ipv6_route_deadline_dirty
+            .store(true, Ordering::Release);
+        self.notify_deadline_changed();
     }
 
     pub(crate) fn notify_ipv6_autoconf(&self) {

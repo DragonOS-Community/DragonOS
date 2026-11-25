@@ -414,6 +414,149 @@ TEST(RtnetlinkRouteSemantics, LinkDownPurgesRoutesAndRejectsNewNexthops) {
     ASSERT_EQ(restore_error, 0);
 }
 
+TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObjects) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard route(OpenRouteSocket());
+            ASSERT_GE(route.Get(), 0);
+            uint32_t seq = 8300;
+            const unsigned lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, ++seq), 0);
+            constexpr uint16_t request = NLM_F_REQUEST | NLM_F_ACK;
+            constexpr uint16_t add = request | NLM_F_CREATE | NLM_F_EXCL;
+            constexpr uint16_t replace = request | NLM_F_REPLACE;
+            constexpr char name[] = "edge83";
+            const struct {
+                rtattr header;
+                char kind[RTA_ALIGN(sizeof("veth"))];
+            } link_info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+            alignas(nlmsghdr) char link_request[128] = {};
+            auto* link = reinterpret_cast<nlmsghdr*>(link_request);
+            link->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+            link->nlmsg_type = RTM_NEWLINK;
+            link->nlmsg_flags = add;
+            link->nlmsg_seq = ++seq;
+            AddAttr(link, sizeof(link_request), IFLA_IFNAME, name, sizeof(name));
+            AddAttr(link, sizeof(link_request), IFLA_LINKINFO, &link_info, sizeof(link_info));
+            ASSERT_EQ(send(route.Get(), link, link->nlmsg_len, 0),
+                      static_cast<ssize_t>(link->nlmsg_len));
+            ASSERT_EQ(RecvAck(route.Get(), seq), 0);
+            const unsigned edge = if_nametoindex(name);
+            const unsigned peer = if_nametoindex("veth0");
+            ASSERT_NE(edge, 0u);
+            ASSERT_NE(peer, 0u);
+            ASSERT_EQ(SetLinkUp(route.Get(), peer, true, ++seq), 0);
+            ASSERT_EQ(SetLinkUp(route.Get(), edge, true, ++seq), 0);
+            constexpr ifa_cacheinfo long_lifetime{50, 60, 0, 0};
+            constexpr ifa_cacheinfo short_lifetime{5, 6, 0, 0};
+            auto address = [&](uint16_t type, uint16_t flags, const char* addr,
+                               const ifa_cacheinfo* lifetime = nullptr) {
+                return SendIpv6AddrRequest(route.Get(), type, flags, edge, addr, 80, ++seq,
+                                           RT_SCOPE_UNIVERSE, lifetime);
+            };
+            auto prefix = [&](const char* addr) {
+                return FindIpv6Route(route.Get(), addr, 80, edge, ++seq, RTN_UNICAST);
+            };
+
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:1::1", &long_lifetime), 0);
+            const auto first = prefix("fd83:1::");
+            ASSERT_TRUE(first && first->expires);
+            EXPECT_GT(*first->expires, 1000);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:1::2", &short_lifetime), 0);
+            const auto shortened = prefix("fd83:1::");
+            ASSERT_TRUE(shortened && shortened->expires);
+            EXPECT_GT(*shortened->expires, 0);
+            EXPECT_LE(*shortened->expires, 600);
+            ASSERT_EQ(address(RTM_DELADDR, request, "fd83:1::2"), 0);
+            const auto after_delete = prefix("fd83:1::");
+            ASSERT_TRUE(after_delete && after_delete->expires);
+            EXPECT_GT(*after_delete->expires, 0);
+            EXPECT_LE(*after_delete->expires, *shortened->expires);
+
+            FdGuard sender(socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+            ASSERT_GE(sender.Get(), 0);
+            sockaddr_in6 destination{};
+            destination.sin6_family = AF_INET6;
+            destination.sin6_port = htons(83);
+            ASSERT_EQ(inet_pton(AF_INET6, "fd83:1::3", &destination.sin6_addr), 1);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(9);
+            bool expired = false;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (connect(sender.Get(), reinterpret_cast<sockaddr*>(&destination),
+                            sizeof(destination)) == -1) {
+                    EXPECT_EQ(errno, ENETUNREACH);
+                    expired = true;
+                    break;
+                }
+                usleep(100000);
+            }
+            ASSERT_TRUE(expired);
+            FdGuard source(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(source.Get(), 0);
+            sockaddr_in6 local{};
+            local.sin6_family = AF_INET6;
+            ASSERT_EQ(inet_pton(AF_INET6, "fd83:1::1", &local.sin6_addr), 1);
+            EXPECT_EQ(bind(source.Get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:2::1", &long_lifetime), 0);
+            ASSERT_EQ(address(RTM_DELADDR, request, "fd83:2::1"), 0);
+            const auto last_finite_deleted = prefix("fd83:2::");
+            ASSERT_TRUE(last_finite_deleted && last_finite_deleted->expires);
+            EXPECT_GT(*last_finite_deleted->expires, 0);
+
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:3::1", &long_lifetime), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:3::2"), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, replace, "fd83:3::1", &long_lifetime), 0);
+            const auto permanent = prefix("fd83:3::");
+            ASSERT_TRUE(permanent);
+            EXPECT_EQ(permanent->expires.value_or(0), 0);
+            ASSERT_EQ(address(RTM_DELADDR, request, "fd83:3::2"), 0);
+            const auto restored = prefix("fd83:3::");
+            ASSERT_TRUE(restored && restored->expires);
+            EXPECT_GT(*restored->expires, 1000);
+
+            auto explicit_prefix = [&](uint16_t type, uint16_t flags, const char* addr) {
+                return SendIpv6RouteRequest(route.Get(), type, flags, addr, 80, edge,
+                                           RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                           std::nullopt, RTN_UNICAST, RT_TABLE_MAIN,
+                                           RTPROT_KERNEL, 256);
+            };
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:4::1"), 0);
+            EXPECT_EQ(explicit_prefix(RTM_NEWROUTE, request | NLM_F_CREATE | NLM_F_APPEND,
+                                      "fd83:4::"), EEXIST);
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd83:5::"), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:5::1"), 0);
+            ASSERT_EQ(explicit_prefix(RTM_DELROUTE, request, "fd83:5::"), 0);
+            EXPECT_FALSE(prefix("fd83:5::"));
+
+            std::memset(link_request, 0, sizeof(link_request));
+            link->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+            link->nlmsg_type = RTM_NEWLINK;
+            link->nlmsg_flags = request;
+            link->nlmsg_seq = ++seq;
+            auto* device = reinterpret_cast<ifinfomsg*>(NLMSG_DATA(link));
+            device->ifi_index = edge;
+            constexpr uint32_t mtu_below_ipv6_minimum = 1279;
+            AddAttr(link, sizeof(link_request), IFLA_MTU, &mtu_below_ipv6_minimum,
+                    sizeof(mtu_below_ipv6_minimum));
+            ASSERT_EQ(send(route.Get(), link, link->nlmsg_len, 0),
+                      static_cast<ssize_t>(link->nlmsg_len));
+            ASSERT_EQ(RecvAck(route.Get(), seq), 0);
+            EXPECT_FALSE(prefix("fd83:2::"));
+            EXPECT_FALSE(prefix("fd83:3::"));
+        }();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkRouteSemantics, Ipv6RouteMutationsSelectTheExactSourcePrefix) {
     const pid_t child = fork();
     ASSERT_GE(child, 0) << ErrnoString(errno);

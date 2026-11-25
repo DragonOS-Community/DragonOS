@@ -140,6 +140,82 @@ impl<'a> FibEditor<'a> {
         Ok(inserted)
     }
 
+    pub(super) fn update_address_prefix(
+        &mut self,
+        route: RouteEntry,
+        replace_permanent: bool,
+    ) -> Result<Option<(RouteEntry, RouteEntry)>, SystemError> {
+        if let Some(index) = self.fib.address_prefix_slot(route) {
+            let old = self.fib.entries[index];
+            if replace_permanent || old.expires_at_us().is_some() {
+                return self.replace_address_prefix(index, old, route);
+            }
+            return Ok(None);
+        }
+        if route.expires_at_us().is_some() {
+            let occupied = self
+                .fib
+                .index
+                .prefix_candidates(route)
+                .iter()
+                .any(|&index| {
+                    let current = self.fib.entries[index];
+                    !current.is_ra_managed() && same_on_link_alias(current, route)
+                });
+            if occupied {
+                return Ok(None);
+            }
+            if let Some(index) = self.fib.prefix_route_slot(route) {
+                let old = self.fib.entries[index];
+                if old.expires_at_us().is_some() {
+                    return self.replace_address_prefix(index, old, route);
+                }
+            }
+        }
+        self.insert_derived(route)?;
+        Ok(None)
+    }
+
+    pub(super) fn remove_permanent_address_prefix(
+        &mut self,
+        route: RouteEntry,
+        remaining_deadline: Option<i64>,
+    ) -> Result<Option<(RouteEntry, RouteEntry)>, SystemError> {
+        let Some(index) = self.fib.address_prefix_slot(route) else {
+            return Ok(None);
+        };
+        let old = self.fib.entries[index];
+        if let Some(deadline) = remaining_deadline {
+            if old.expires_at_us().is_none() {
+                return self.replace_address_prefix(
+                    index,
+                    old,
+                    old.with_address_prefix_deadline(Some(deadline)),
+                );
+            }
+        } else {
+            self.record(old.oif)?;
+            self.fib.apply_edit(FibEdit::Delete { index, route: old });
+        }
+        Ok(None)
+    }
+
+    fn replace_address_prefix(
+        &mut self,
+        index: usize,
+        old: RouteEntry,
+        new: RouteEntry,
+    ) -> Result<Option<(RouteEntry, RouteEntry)>, SystemError> {
+        if old == new {
+            return Ok(None);
+        }
+        self.record(old.oif)?;
+        let edit = FibEdit::Replace { index, old, new };
+        self.fib.reserve_edit(edit)?;
+        self.fib.apply_edit(edit);
+        Ok(Some((old, new)))
+    }
+
     pub(super) fn remove_where(
         &mut self,
         predicate: impl Fn(RouteEntry) -> bool,
@@ -338,7 +414,7 @@ impl FibTable {
         let analysis = self.index.analyze_insert(route);
         let pio_slot = self.prefix_route_slot(route);
         let first = pio_slot.or(analysis.first);
-        let exact = analysis.exact;
+        let exact = analysis.exact.or_else(|| self.address_prefix_alias(route));
         let matching_metric = || {
             self.index
                 .prefix_candidates(route)
@@ -497,11 +573,31 @@ impl FibTable {
             .filter(|route| route.learned_default().is_some())
     }
 
-    pub(super) fn expiring_ra_routes(&self) -> impl Iterator<Item = RouteEntry> + '_ {
+    pub(super) fn expiring_ipv6_routes(&self) -> impl Iterator<Item = RouteEntry> + '_ {
         self.entries
             .iter()
             .copied()
             .filter(|route| route.expires_at_us().is_some())
+    }
+
+    pub(super) fn plan_expired_route(&self, route: RouteEntry) -> FibEdit {
+        self.index
+            .prefix_candidates(route)
+            .iter()
+            .copied()
+            .find(|&index| self.entries[index] == route)
+            .map_or(FibEdit::None, |index| FibEdit::Delete { index, route })
+    }
+
+    fn address_prefix_slot(&self, route: RouteEntry) -> Option<usize> {
+        self.index
+            .prefix_candidates(route)
+            .iter()
+            .copied()
+            .find(|&index| {
+                let current = self.entries[index];
+                current.is_address_prefix() && same_on_link_alias(current, route)
+            })
     }
 
     fn prefix_route_slot(&self, route: RouteEntry) -> Option<usize> {
@@ -539,7 +635,20 @@ impl FibTable {
             }
             if current.is_ra_prefix() {
                 existing = Some((index, current));
-            } else if !withdraw && current.ra_route.is_none() {
+            } else if !withdraw && !current.is_ra_managed() {
+                // A nonzero PIO can refresh the expiration of an existing
+                // finite on-link address route. Withdrawal still only removes
+                // RA-owned routes.
+                if current.is_address_prefix() && current.expires_at_us().is_some() {
+                    let new = current.with_address_prefix_deadline(route.expires_at_us());
+                    if new != current {
+                        return FibEdit::Replace {
+                            index,
+                            old: current,
+                            new,
+                        };
+                    }
+                }
                 return FibEdit::None;
             }
         }
@@ -577,7 +686,7 @@ impl FibTable {
             gateway: None,
             nexthop_flags: 0,
             ipv6_address_local: false,
-            ra_route: None,
+            ipv6_metadata: None,
         };
         let index = self
             .index
@@ -1036,7 +1145,7 @@ impl FibTable {
 
     fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
         let analysis = self.index.analyze_insert(route);
-        if analysis.exact.is_some() {
+        if analysis.exact.is_some() || self.address_prefix_alias(route).is_some() {
             return Ok(false);
         }
         if let Some(index) = self.prefix_route_slot(route) {
@@ -1071,6 +1180,29 @@ impl FibTable {
             placement,
         });
         Ok(true)
+    }
+
+    /// An administrator can submit the same public route as an address
+    /// prefix. Its internal ownership and deadline do not create a new alias.
+    fn address_prefix_alias(&self, route: RouteEntry) -> Option<usize> {
+        if is_ipv4(route.destination.address()) {
+            return None;
+        }
+        self.index
+            .prefix_candidates(route)
+            .iter()
+            .copied()
+            .find(|&index| {
+                let current = self.entries[index];
+                let differs_by_origin = (current.is_address_prefix()
+                    && route.ipv6_metadata.is_none())
+                    || (route.is_address_prefix() && current.ipv6_metadata.is_none());
+                differs_by_origin
+                    && RouteEntry {
+                        ipv6_metadata: route.ipv6_metadata,
+                        ..current
+                    } == route
+            })
     }
 
     pub(super) fn delta_from(&self, before: &Self) -> Result<FibDelta, SystemError> {
@@ -1259,10 +1391,12 @@ mod tests {
             gateway: Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, id).into()),
             nexthop_flags: 0,
             ipv6_address_local: false,
-            ra_route: Some(crate::net::route::RaRoute::Default(LearnedDefaultRoute {
-                expires_at_us: 30_000_000,
-                preference: RouterPreference::Medium,
-            })),
+            ipv6_metadata: Some(crate::net::route::Ipv6RouteMetadata::RaDefault(
+                LearnedDefaultRoute {
+                    expires_at_us: 30_000_000,
+                    preference: RouterPreference::Medium,
+                },
+            )),
         };
         let mut fib = FibTable::default();
         for id in 1..=MAX_LEARNED_DEFAULT_ROUTES {
@@ -1280,7 +1414,7 @@ mod tests {
         let mut refreshed = route(1);
         let mut default = refreshed.learned_default().unwrap();
         default.expires_at_us += 1_000_000;
-        refreshed.ra_route = Some(crate::net::route::RaRoute::Default(default));
+        refreshed.ipv6_metadata = Some(crate::net::route::Ipv6RouteMetadata::RaDefault(default));
         let edit = fib.plan_learned_default(refreshed, false);
         assert!(matches!(edit, FibEdit::Replace { .. }));
         fib.reserve_edit(edit).unwrap();

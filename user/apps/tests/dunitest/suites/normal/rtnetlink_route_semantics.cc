@@ -1448,13 +1448,13 @@ struct Ipv6RuleRecord {
 
 int ChangeIpv6Rule(int fd, uint16_t kind, uint32_t sequence, uint32_t priority,
                    uint32_t table, const char* source = nullptr, uint8_t source_length = 0,
-                   uint32_t* echo_group = nullptr) {
+                   uint32_t* echo_group = nullptr, uint16_t flags = 0) {
     alignas(nlmsghdr) char buffer[128]{};
     auto* header = reinterpret_cast<nlmsghdr*>(buffer);
     header->nlmsg_len = NLMSG_LENGTH(sizeof(fib_rule_hdr));
     header->nlmsg_type = kind;
     header->nlmsg_seq = sequence;
-    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | flags;
     if (echo_group != nullptr) header->nlmsg_flags |= NLM_F_ECHO;
     if (kind == RTM_NEWRULE) header->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
     auto* body = static_cast<fib_rule_hdr*>(NLMSG_DATA(header));
@@ -1608,6 +1608,57 @@ TEST(RtnetlinkRouteSemantics, Ipv6PolicyRulesKeepStableOrderAndNotify) {
         }();
         _exit(testing::Test::HasFailure() ? 1 : 0);
     }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+
+TEST(RtnetlinkRouteSemantics, Ipv6PolicyBulkDeleteRejectsBeforeMutating) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard fd(OpenRouteSocket());
+            ASSERT_GE(fd.Get(), 0);
+            const timeval timeout{2, 0};
+            ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+            constexpr uint16_t bulk = 0x200;  // NLM_F_BULK may be missing in older UAPI headers.
+            uint32_t sequence = 9900;
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 99, 101), 0);
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 99, 102), 0);
+            EXPECT_EQ(ChangeIpv6Rule(fd.Get(), RTM_DELRULE, ++sequence, 99, 0, nullptr, 0,
+                                     nullptr, bulk), EOPNOTSUPP);
+
+            struct {
+                nlmsghdr header;
+                rtgenmsg body;
+            } short_request{};
+            short_request.header.nlmsg_len = NLMSG_LENGTH(sizeof(short_request.body));
+            short_request.header.nlmsg_type = RTM_DELRULE;
+            short_request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | bulk;
+            short_request.header.nlmsg_seq = ++sequence;
+            short_request.body.rtgen_family = AF_INET6;
+            ASSERT_EQ(send(fd.Get(), &short_request, short_request.header.nlmsg_len, 0),
+                      static_cast<ssize_t>(short_request.header.nlmsg_len));
+            EXPECT_EQ(RecvAck(fd.Get(), sequence), EOPNOTSUPP);
+
+            auto rules = DumpIpv6Rules(fd.Get(), ++sequence);
+            ASSERT_TRUE(rules);
+            ASSERT_EQ(rules->size(), 4u);
+            EXPECT_EQ((*rules)[1].table, 101u);
+            EXPECT_EQ((*rules)[2].table, 102u);
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_DELRULE, ++sequence, 99, 101), 0);
+            rules = DumpIpv6Rules(fd.Get(), ++sequence);
+            ASSERT_TRUE(rules);
+            ASSERT_EQ(rules->size(), 3u);
+            EXPECT_EQ((*rules)[1].table, 102u);
+        }();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+
     int status = 0;
     ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
     ASSERT_TRUE(WIFEXITED(status));

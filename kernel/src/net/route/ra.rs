@@ -18,18 +18,16 @@ use crate::{
         address::{ipv6_autoconf::PrefixSetting, ipv6_router_solicitation, ipv6_slaac},
         ipv6_defrag::{fragment_offset, DefragDomain},
         rtnl::{self, RtnlGuard},
-        socket::netlink::{has_prefix_listeners, notify_ra_prefix, notify_ra_route},
+        socket::netlink::{has_prefix_listeners, notify_automatic_ipv6_route, notify_ra_prefix},
     },
     process::namespace::net_namespace::NetNamespace,
     time::Instant,
 };
 
 use super::{
-    canonical_cidr,
-    fib::{FibEdit, PlannedFibMutation},
-    is_ipv6_link_local, prepare_with_devices, transact_single, FibTable, LearnedDefaultRoute,
-    RaRoute, RouteEntry, RouterPreference, RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_UNIVERSE,
-    RT_TABLE_MAIN,
+    canonical_cidr, fib::FibEdit, is_ipv6_link_local, lifecycle::apply_automatic_ipv6_route_edit,
+    prepare_with_devices, Ipv6RouteMetadata, LearnedDefaultRoute, RouteEntry, RouterPreference,
+    RTN_UNICAST, RTPROT_KERNEL, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN,
 };
 
 const ROUTER_PROTOCOL: u8 = 9; // RTPROT_RA
@@ -262,12 +260,12 @@ pub(crate) fn apply(netns: &Arc<NetNamespace>, advertisement: Advertisement) {
         gateway: Some(advertisement.gateway.into()),
         nexthop_flags: 0,
         ipv6_address_local: false,
-        ra_route: Some(RaRoute::Default(LearnedDefaultRoute {
+        ipv6_metadata: Some(Ipv6RouteMetadata::RaDefault(LearnedDefaultRoute {
             expires_at_us: advertisement.expires_at_us,
             preference: advertisement.preference,
         })),
     };
-    if let Err(error) = update(&rtnl, netns, |fib| {
+    if let Err(error) = apply_automatic_ipv6_route_edit(&rtnl, netns, |fib| {
         fib.plan_learned_default(route, advertisement.withdraw)
     }) {
         log::debug!("could not apply learned IPv6 default route: {:?}", error);
@@ -357,45 +355,11 @@ fn apply_on_link_prefix(
         gateway: None,
         nexthop_flags: 0,
         ipv6_address_local: false,
-        ra_route: Some(RaRoute::OnLinkPrefix { expires_at_us }),
+        ipv6_metadata: Some(Ipv6RouteMetadata::RaOnLinkPrefix { expires_at_us }),
     };
-    update(rtnl, netns, |fib| {
+    apply_automatic_ipv6_route_edit(rtnl, netns, |fib| {
         fib.plan_learned_prefix(route, withdraw, has_slot)
     })
-}
-
-fn update(
-    rtnl: &RtnlGuard,
-    netns: &Arc<NetNamespace>,
-    plan: impl FnOnce(&FibTable) -> FibEdit,
-) -> Result<FibEdit, SystemError> {
-    // RTNL keeps the edit stable until projection and FIB publication.
-    let edit = plan(&netns.router().fib.read());
-    if matches!(edit, FibEdit::None) {
-        return Ok(edit);
-    }
-    transact_single(rtnl, netns, |_| {
-        Ok(PlannedFibMutation { edit, outcome: () })
-    })?;
-    match edit {
-        FibEdit::Insert { route, .. } => notify_ra_route(netns, route, false, false),
-        FibEdit::Delete { route, .. } => notify_ra_route(netns, route, true, false),
-        FibEdit::Replace { old, new, .. } if old.preference() != new.preference() => {
-            notify_ra_route(netns, new, false, true);
-        }
-        _ => {}
-    }
-    Ok(edit)
-}
-
-pub(crate) fn next_deadline_us(netns: &NetNamespace) -> Option<i64> {
-    netns
-        .router()
-        .fib
-        .read()
-        .expiring_ra_routes()
-        .filter_map(RouteEntry::expires_at_us)
-        .min()
 }
 
 /// Linux purges learned defaults across the namespace on a nonzero write to
@@ -440,36 +404,7 @@ pub(crate) fn set_forwarding(
         None => netns.set_ipv6_forwarding(rtnl, value),
     }
     for route in removed {
-        notify_ra_route(netns, route, true, false);
+        notify_automatic_ipv6_route(netns, route, true, false);
     }
     Ok(())
-}
-
-/// Remove in bounded batches, retaining an earlier retry if projection
-/// preparation fails. The FIB and smoltcp already ignore overdue routes.
-pub(crate) fn expire(netns: &Arc<NetNamespace>, now_us: i64) -> Option<i64> {
-    let rtnl = rtnl::lock();
-    for _ in 0..16 {
-        let route = netns
-            .router()
-            .fib
-            .read()
-            .expiring_ra_routes()
-            .find(|route| !route.is_live_at(now_us));
-        let Some(route) = route else {
-            break;
-        };
-        if update(&rtnl, netns, |fib| {
-            if route.is_ra_prefix() {
-                fib.plan_learned_prefix(route, true, false)
-            } else {
-                fib.plan_learned_default(route, true)
-            }
-        })
-        .is_err()
-        {
-            return Some(now_us.saturating_add(10_000));
-        }
-    }
-    next_deadline_us(netns)
 }

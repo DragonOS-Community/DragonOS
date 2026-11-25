@@ -514,7 +514,9 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
                          const char* gateway = nullptr, uint32_t route_flags = 0,
                          const char* preferred_source = nullptr,
                          std::optional<Ipv6SourcePrefix> source_prefix = std::nullopt,
-                         uint8_t kind = RTN_UNICAST, uint8_t table = RT_TABLE_UNSPEC) {
+                         uint8_t kind = RTN_UNICAST, uint8_t table = RT_TABLE_UNSPEC,
+                         uint8_t protocol = RTPROT_STATIC,
+                         std::optional<uint32_t> priority = std::nullopt) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -524,7 +526,7 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
     nlh->nlmsg_seq = seq;
     rtm->rtm_family = AF_INET6;
     rtm->rtm_dst_len = prefix_len;
-    rtm->rtm_protocol = RTPROT_STATIC;
+    rtm->rtm_protocol = protocol;
     rtm->rtm_scope = scope;
     rtm->rtm_type = kind;
     rtm->rtm_table = table;
@@ -537,6 +539,9 @@ int SendIpv6RouteRequest(int fd, uint16_t type, uint16_t flags, const char* dest
     AddAttr(nlh, sizeof(buf), RTA_DST, &dst, sizeof(dst));
     if (oif != 0) {
         AddAttr(nlh, sizeof(buf), RTA_OIF, &oif, sizeof(oif));
+    }
+    if (priority.has_value()) {
+        AddAttr(nlh, sizeof(buf), RTA_PRIORITY, &*priority, sizeof(*priority));
     }
     if (source_prefix.has_value()) {
         in6_addr source = {};
@@ -619,6 +624,7 @@ struct Ipv6RouteMetadata {
     uint32_t priority = 0;
     uint8_t scope = RT_SCOPE_NOWHERE;
     bool has_preferred_source = false;
+    std::optional<int32_t> expires;
 };
 
 std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
@@ -682,6 +688,7 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
             uint32_t actual_oif = 0;
             uint32_t priority = 0;
             bool has_preferred_source = false;
+            std::optional<int32_t> expires;
             int attr_len = msg->nlmsg_len - NLMSG_LENGTH(sizeof(rtmsg));
             for (auto* attr = RTM_RTA(route_msg); RTA_OK(attr, attr_len);
                  attr = RTA_NEXT(attr, attr_len)) {
@@ -696,6 +703,11 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
                     std::memcpy(&priority, RTA_DATA(attr), sizeof(priority));
                 } else if (attr->rta_type == RTA_PREFSRC) {
                     has_preferred_source = true;
+                } else if (attr->rta_type == RTA_CACHEINFO &&
+                           RTA_PAYLOAD(attr) >= sizeof(rta_cacheinfo)) {
+                    rta_cacheinfo info{};
+                    std::memcpy(&info, RTA_DATA(attr), sizeof(info));
+                    expires = info.rta_expires;
                 }
             }
             if (source_prefix.has_value() &&
@@ -704,7 +716,7 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
             }
             if (actual_oif == oif && std::memcmp(&actual, &expected, sizeof(actual)) == 0) {
                 found = Ipv6RouteMetadata{priority, route_msg->rtm_scope,
-                                          has_preferred_source};
+                                          has_preferred_source, expires};
             }
         }
     }
@@ -713,7 +725,8 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
 
 int SendIpv6AddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex,
                         const char* address, uint8_t prefix_len, uint32_t seq,
-                        uint8_t scope = RT_SCOPE_UNIVERSE) {
+                        uint8_t scope = RT_SCOPE_UNIVERSE,
+                        const ifa_cacheinfo* lifetimes = nullptr) {
     alignas(nlmsghdr) char buf[512] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
     auto* ifa = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(nlh));
@@ -731,6 +744,9 @@ int SendIpv6AddrRequest(int fd, uint16_t type, uint16_t flags, uint32_t ifindex,
     if (inet_pton(AF_INET6, address, &ip) != 1) return EINVAL;
     AddAttr(nlh, sizeof(buf), IFA_LOCAL, &ip, sizeof(ip));
     AddAttr(nlh, sizeof(buf), IFA_ADDRESS, &ip, sizeof(ip));
+    if (lifetimes != nullptr) {
+        AddAttr(nlh, sizeof(buf), IFA_CACHEINFO, lifetimes, sizeof(*lifetimes));
+    }
     if (send(fd, nlh, nlh->nlmsg_len, 0) != static_cast<ssize_t>(nlh->nlmsg_len)) return errno;
     return RecvAck(fd, seq);
 }

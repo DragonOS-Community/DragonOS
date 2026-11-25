@@ -82,6 +82,10 @@ impl Lifetimes {
         self.valid_until_us.is_none()
     }
 
+    pub(in crate::net) fn valid_until_us(self) -> Option<i64> {
+        self.valid_until_us
+    }
+
     pub(crate) fn preferred_until_us(self) -> Option<i64> {
         self.preferred_until_us
     }

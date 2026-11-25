@@ -62,9 +62,10 @@ pub(crate) struct LearnedDefaultRoute {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum RaRoute {
-    Default(LearnedDefaultRoute),
-    OnLinkPrefix { expires_at_us: Option<i64> },
+pub(crate) enum Ipv6RouteMetadata {
+    RaDefault(LearnedDefaultRoute),
+    RaOnLinkPrefix { expires_at_us: Option<i64> },
+    AddressPrefix { expires_at_us: Option<i64> },
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,7 +84,7 @@ pub(crate) struct RouteEntry {
     pub nexthop_flags: u8,
     /// Whether a configured IPv6 address supplied this local route.
     pub ipv6_address_local: bool,
-    pub ra_route: Option<RaRoute>,
+    pub ipv6_metadata: Option<Ipv6RouteMetadata>,
 }
 
 impl RouteEntry {
@@ -100,20 +101,42 @@ impl RouteEntry {
     }
 
     pub(crate) fn learned_default(self) -> Option<LearnedDefaultRoute> {
-        match self.ra_route {
-            Some(RaRoute::Default(default)) => Some(default),
+        match self.ipv6_metadata {
+            Some(Ipv6RouteMetadata::RaDefault(default)) => Some(default),
             _ => None,
         }
     }
 
     pub(super) fn is_ra_prefix(self) -> bool {
-        matches!(self.ra_route, Some(RaRoute::OnLinkPrefix { .. }))
+        matches!(
+            self.ipv6_metadata,
+            Some(Ipv6RouteMetadata::RaOnLinkPrefix { .. })
+        )
+    }
+
+    pub(crate) fn is_ra_managed(self) -> bool {
+        self.learned_default().is_some() || self.is_ra_prefix()
+    }
+
+    pub(super) fn is_address_prefix(self) -> bool {
+        matches!(
+            self.ipv6_metadata,
+            Some(Ipv6RouteMetadata::AddressPrefix { .. })
+        )
+    }
+
+    pub(super) fn with_address_prefix_deadline(mut self, expires_at_us: Option<i64>) -> Self {
+        self.ipv6_metadata = Some(Ipv6RouteMetadata::AddressPrefix { expires_at_us });
+        self
     }
 
     pub(crate) fn expires_at_us(self) -> Option<i64> {
-        match self.ra_route {
-            Some(RaRoute::Default(default)) => Some(default.expires_at_us),
-            Some(RaRoute::OnLinkPrefix { expires_at_us }) => expires_at_us,
+        match self.ipv6_metadata {
+            Some(Ipv6RouteMetadata::RaDefault(default)) => Some(default.expires_at_us),
+            Some(
+                Ipv6RouteMetadata::RaOnLinkPrefix { expires_at_us }
+                | Ipv6RouteMetadata::AddressPrefix { expires_at_us },
+            ) => expires_at_us,
             None => None,
         }
     }
@@ -225,7 +248,7 @@ impl RouteLookupResult {
             gateway: None,
             nexthop_flags: 0,
             ipv6_address_local: false,
-            ra_route: None,
+            ipv6_metadata: None,
         };
         Self {
             oif,

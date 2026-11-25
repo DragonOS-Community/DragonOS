@@ -31,7 +31,7 @@ mod neigh;
 mod prefix;
 mod route;
 pub(crate) use prefix::{has_prefix_listeners, notify_ra_prefix};
-pub(crate) use route::notify_ra_route;
+pub(crate) use route::notify_automatic_ipv6_route;
 mod utils;
 
 pub(crate) use link::{

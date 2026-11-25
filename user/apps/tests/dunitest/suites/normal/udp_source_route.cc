@@ -243,7 +243,8 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
             destination.sin6_port = htons(23089);
             ASSERT_EQ(inet_pton(AF_INET6, "fd89:2::2", &destination.sin6_addr), 1);
 
-            auto expect_route_source = [&](uint32_t flags, const char* expected) {
+            auto expect_route_source = [&](uint32_t flags, const char* expected,
+                                           const char* requested = nullptr) {
                 alignas(nlmsghdr) char query[128] = {};
                 auto* header = reinterpret_cast<nlmsghdr*>(query);
                 header->nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg));
@@ -257,6 +258,12 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
                 AddAttr(header, sizeof(query), RTA_DST, &destination.sin6_addr,
                         sizeof(destination.sin6_addr));
                 AddAttr(header, sizeof(query), RTA_OIF, &egress, sizeof(egress));
+                in6_addr input_source{};
+                if (requested != nullptr) {
+                    ASSERT_EQ(inet_pton(AF_INET6, requested, &input_source), 1);
+                    message->rtm_src_len = 128;
+                    AddAttr(header, sizeof(query), RTA_SRC, &input_source, sizeof(input_source));
+                }
                 ASSERT_EQ(send(route.Get(), header, header->nlmsg_len, 0),
                           static_cast<ssize_t>(header->nlmsg_len));
                 pollfd ready{route.Get(), POLLIN, 0};
@@ -269,18 +276,32 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
                 ASSERT_EQ(reply->nlmsg_type, RTM_NEWROUTE);
                 ASSERT_GE(reply->nlmsg_len, NLMSG_LENGTH(sizeof(rtmsg)));
                 const auto* resolved = reinterpret_cast<const rtmsg*>(NLMSG_DATA(reply));
+                const rtattr* actual_source = nullptr;
+                const rtattr* preferred_source = nullptr;
                 int remaining = RTM_PAYLOAD(reply);
                 for (auto* attr = RTM_RTA(resolved); RTA_OK(attr, remaining);
                      attr = RTA_NEXT(attr, remaining)) {
-                    if (attr->rta_type != RTA_PREFSRC) continue;
-                    ASSERT_NE(expected, nullptr);
+                    if (attr->rta_type == RTA_SRC) actual_source = attr;
+                    if (attr->rta_type == RTA_PREFSRC) preferred_source = attr;
+                }
+                if (flags & RTM_F_FIB_MATCH) {
+                    EXPECT_EQ(resolved->rtm_src_len, 0);
+                    EXPECT_EQ(actual_source, nullptr);
+                } else if (requested != nullptr) {
+                    ASSERT_NE(actual_source, nullptr);
+                    ASSERT_EQ(RTA_PAYLOAD(actual_source), sizeof(input_source));
+                    EXPECT_EQ(std::memcmp(RTA_DATA(actual_source), &input_source,
+                                          sizeof(input_source)), 0);
+                }
+                if (expected == nullptr) {
+                    EXPECT_EQ(preferred_source, nullptr);
+                } else {
+                    ASSERT_NE(preferred_source, nullptr);
                     in6_addr source{};
                     ASSERT_EQ(inet_pton(AF_INET6, expected, &source), 1);
-                    ASSERT_EQ(RTA_PAYLOAD(attr), sizeof(source));
-                    EXPECT_EQ(std::memcmp(RTA_DATA(attr), &source, sizeof(source)), 0);
-                    return;
+                    ASSERT_EQ(RTA_PAYLOAD(preferred_source), sizeof(source));
+                    EXPECT_EQ(std::memcmp(RTA_DATA(preferred_source), &source, sizeof(source)), 0);
                 }
-                EXPECT_EQ(expected, nullptr);
             };
 
             FdGuard packets(socket(AF_PACKET, SOCK_DGRAM | SOCK_NONBLOCK, htons(ETH_P_IPV6)));
@@ -365,7 +386,19 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
             ASSERT_EQ(address(RTM_NEWADDR, "fe80::89", egress, RT_SCOPE_LINK), 0);
             ASSERT_NO_FATAL_FAILURE(expect_route_source(0, "fd89:1::1"));
             ASSERT_NO_FATAL_FAILURE(expect_route_source(RTM_F_FIB_MATCH, nullptr));
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(0, "fd89:1::1", "fe80::89"));
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(RTM_F_FIB_MATCH, nullptr, "fe80::89"));
             ASSERT_NO_FATAL_FAILURE(exercise("fd89:1::1"));
+
+            constexpr uint16_t replace = request | NLM_F_REPLACE;
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, replace, "fd89:2::", 64,
+                                           egress, RT_SCOPE_UNIVERSE, ++seq, nullptr, 0,
+                                           "fe80::89"), 0);
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(0, "fe80::89", "fd89:1::1"));
+            ASSERT_NO_FATAL_FAILURE(
+                expect_route_source(RTM_F_FIB_MATCH, "fe80::89", "fd89:1::1"));
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, replace, "fd89:2::", 64,
+                                           egress, RT_SCOPE_UNIVERSE, ++seq), 0);
 
             // Keep the only global source while its address-owning device
             // is down. Both automatic and explicitly bound sends use it.

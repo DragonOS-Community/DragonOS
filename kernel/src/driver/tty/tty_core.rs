@@ -868,7 +868,15 @@ impl TtyCoreData {
         {
             return Err(SystemError::ENOTTY);
         }
+        drop(flags);
+        let file = item.file_weak().clone();
         self.fasync_items.add(item);
+        // tty_vhangup bumps the generation before clearing fasync_items, so a
+        // hangup that cleared the list before this add is visible here.
+        if self.hangup_generation.load(Ordering::Acquire) != file_hangup_generation {
+            self.fasync_items.remove(&file);
+            return Err(SystemError::ENOTTY);
+        }
         Ok(())
     }
 
